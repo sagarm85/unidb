@@ -134,6 +134,12 @@ impl Catalog {
             .ok_or_else(|| DbError::TableNotFound(name.to_string()))
     }
 
+    /// All tables, in no particular order — used by the M2 index-rebuild
+    /// rescan to find every indexed column across the whole catalog.
+    pub fn tables(&self) -> impl Iterator<Item = &TableDef> {
+        self.tables.values()
+    }
+
     pub fn create_table(&mut self, def: TableDef, ctx: &mut CatalogCtx) -> Result<()> {
         if self.tables.contains_key(&def.name) {
             return Err(DbError::TableAlreadyExists(def.name));
@@ -153,6 +159,33 @@ impl Catalog {
             .get_mut(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
         t.rls_policy = Some(policy);
+        self.persist(ctx)
+    }
+
+    /// Attach (or clear) a secondary-index kind on one column. `CREATE
+    /// INDEX`'s SQL surface lands in M2.c and will call this same method
+    /// after its own type-compatibility validation — this is just the
+    /// catalog-persistence primitive, reused rather than duplicated.
+    pub fn set_column_index(
+        &mut self,
+        table: &str,
+        column: &str,
+        kind: Option<IndexKind>,
+        ctx: &mut CatalogCtx,
+    ) -> Result<()> {
+        let t = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
+        let col = t
+            .columns
+            .iter_mut()
+            .find(|c| c.name == column)
+            .ok_or_else(|| DbError::ColumnNotFound {
+                table: table.to_string(),
+                column: column.to_string(),
+            })?;
+        col.index = kind;
         self.persist(ctx)
     }
 

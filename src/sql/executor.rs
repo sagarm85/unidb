@@ -24,11 +24,12 @@ use serde_json::Value as JsonValue;
 
 use crate::{
     bufferpool::BufferPool,
-    catalog::{Catalog, CatalogCtx, ColumnDef, ColumnType, TableDef},
+    catalog::{Catalog, CatalogCtx, ColumnDef, ColumnType, IndexKind, TableDef},
     control::ControlData,
     error::{DbError, Result},
     format::{PageId, Xid},
     heap::{Heap, RowId},
+    index_worker::{IndexHandle, IndexMsg, IndexedColumn},
     lockmgr::LockManager,
     txn::{TransactionManager, UndoAction},
     wal::Wal,
@@ -47,6 +48,37 @@ pub struct ExecCtx<'a> {
     pub control: &'a mut ControlData,
     pub page_size: usize,
     pub xid: Xid,
+    /// `None` in contexts with no live worker (e.g. rebuild-on-open, which
+    /// talks to the worker directly rather than through the executor).
+    pub index_worker: Option<&'a IndexHandle>,
+}
+
+/// If `table` has any indexed `VECTOR` columns, send their values from
+/// `row` to the background worker keyed by `row_id`. Checked once per
+/// statement row, not once per column globally, so tables with no indexed
+/// column pay zero overhead (CLAUDE.md's M2 "row write is the only
+/// synchronous cost" goal) — this function only *sends*, the worker does
+/// all the actual index work off this thread.
+fn send_vector_upserts(table_def: &TableDef, row_id: RowId, row: &[Literal], ctx: &ExecCtx) {
+    let Some(handle) = ctx.index_worker else {
+        return;
+    };
+    let mut indexed_cols = Vec::new();
+    for (col, val) in table_def.columns.iter().zip(row) {
+        if let (Some(IndexKind::Hnsw), Literal::Vector(v)) = (&col.index, val) {
+            indexed_cols.push(IndexedColumn::Vector {
+                column: col.name.clone(),
+                data: v.clone(),
+            });
+        }
+    }
+    if !indexed_cols.is_empty() {
+        handle.send(IndexMsg::Upsert {
+            table: table_def.name.clone(),
+            record: row_id,
+            indexed_cols,
+        });
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -149,6 +181,7 @@ fn exec_insert(
                 slot: row_id.slot,
             },
         )?;
+        send_vector_upserts(&table_def, row_id, &coerced, ctx);
         count += 1;
     }
 
@@ -211,6 +244,7 @@ fn exec_update(
                 slot: new_row_id.slot,
             },
         )?;
+        send_vector_upserts(&table_def, new_row_id, &coerced, ctx);
         count += 1;
     }
 
@@ -686,6 +720,7 @@ mod tests {
                 control: &mut self.control,
                 page_size: self.page_size,
                 xid,
+                index_worker: None,
             };
             execute(plan, &mut ctx)
         }

@@ -9,6 +9,7 @@ pub mod control;
 pub mod error;
 pub mod format;
 pub mod heap;
+pub mod index_worker;
 pub mod lockmgr;
 pub mod mmap;
 pub mod mvcc;
@@ -16,21 +17,23 @@ pub mod page;
 pub mod recovery;
 pub mod sql;
 pub mod txn;
+pub mod vector;
 pub mod wal;
 
 use std::path::{Path, PathBuf};
 
 use crate::{
     bufferpool::BufferPool,
-    catalog::Catalog,
+    catalog::{Catalog, ColumnDef, IndexKind, TableDef},
     control::ControlData,
     error::Result,
     format::{Xid, DEFAULT_PAGE_SIZE},
     heap::Heap,
+    index_worker::{IndexHandle, IndexMsg, IndexedColumn},
     lockmgr::LockManager,
     sql::{
         executor::{self, ExecCtx, ExecResult},
-        logical::{apply_rls, Expr},
+        logical::{apply_rls, Expr, Literal},
         parser::parse_sql,
     },
     txn::{IsolationLevel, TransactionManager, UndoAction},
@@ -54,6 +57,13 @@ pub struct Engine {
     catalog: Catalog,
     control_path: PathBuf,
     _wal_path: PathBuf,
+    index_worker: IndexHandle,
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.index_worker.shutdown();
+    }
 }
 
 impl Engine {
@@ -79,7 +89,7 @@ impl Engine {
 
         let mut pool = BufferPool::open(&data_p, page_size_usize, POOL_CAPACITY)?;
         let wal_tail = control.wal_tail_lsn;
-        let wal = Wal::open(&wal_p, wal_tail)?;
+        let mut wal = Wal::open(&wal_p, wal_tail)?;
         let heap = Heap::new(page_size_usize);
 
         // Resume the xid counter past the highest xid that ever began —
@@ -91,9 +101,21 @@ impl Engine {
             Vec::new()
         };
         let next_xid = TransactionManager::recover_next_xid(&existing_records);
-        let txn_mgr = TransactionManager::with_next_xid(next_xid);
+        let mut txn_mgr = TransactionManager::with_next_xid(next_xid);
+        let mut lock_mgr = LockManager::new();
 
         let catalog = Catalog::load(&control, &mut pool)?;
+
+        let index_worker = IndexHandle::spawn();
+        rebuild_vector_indexes(
+            &catalog,
+            &mut txn_mgr,
+            &mut pool,
+            &mut wal,
+            &mut lock_mgr,
+            page_size_usize,
+            &index_worker,
+        )?;
 
         tracing::info!(dir = %dir.display(), page_size = control.page_size, next_xid, "engine opened");
         Ok(Self {
@@ -102,10 +124,11 @@ impl Engine {
             wal,
             heap,
             txn_mgr,
-            lock_mgr: LockManager::new(),
+            lock_mgr,
             catalog,
             control_path: ctrl_p,
             _wal_path: wal_p,
+            index_worker,
         })
     }
 
@@ -128,6 +151,7 @@ impl Engine {
                 control: &mut self.control,
                 page_size,
                 xid,
+                index_worker: Some(&self.index_worker),
             };
             results.push(executor::execute(plan, &mut ctx)?);
         }
@@ -146,6 +170,35 @@ impl Engine {
             page_size,
         };
         self.catalog.set_rls_policy(table, policy, &mut ctx)
+    }
+
+    /// Attach (or clear) a secondary index on one column (M2: Rust API
+    /// only — `CREATE INDEX` SQL surface lands in M2.c). No backfill of
+    /// already-committed rows happens here; those get indexed on the next
+    /// `Engine::open`'s rebuild-on-open rescan. M2.c's `CREATE INDEX`
+    /// backfills immediately instead, reusing this same catalog primitive.
+    pub fn set_column_index(
+        &mut self,
+        table: &str,
+        column: &str,
+        kind: Option<IndexKind>,
+    ) -> Result<()> {
+        let page_size = self.control.page_size as usize;
+        let mut ctx = crate::catalog::CatalogCtx {
+            pool: &mut self.pool,
+            wal: &mut self.wal,
+            control_path: &self.control_path,
+            control: &mut self.control,
+            page_size,
+        };
+        self.catalog.set_column_index(table, column, kind, &mut ctx)
+    }
+
+    /// Current build status of a secondary index, or `None` if no index has
+    /// ever been built for `(table, column)` (never indexed, or not yet
+    /// reached by the worker).
+    pub fn index_status(&self, table: &str, column: &str) -> Option<index_worker::IndexStatus> {
+        self.index_worker.status(table, column)
     }
 
     /// Begin a new transaction under READ COMMITTED (the default, D10).
@@ -247,6 +300,82 @@ impl Engine {
     /// Flush all dirty pages without a full checkpoint (used in tests).
     pub fn flush(&mut self) -> Result<()> {
         self.pool.flush_all(self.wal.durable_lsn)
+    }
+}
+
+/// Scan every table's currently-committed rows for any `VECTOR` column
+/// carrying `IndexKind::Hnsw` and enqueue them to the (already-spawned)
+/// background worker, so a fresh `Engine::open` ends up with a rebuilt
+/// index rather than an empty one. Runs entirely on the foreground thread
+/// against the engine's own `pool`/`heap`/`catalog` — the worker thread
+/// itself never gets a `BufferPool` handle (see `index_worker.rs`'s module
+/// doc). Uses an ordinary begin/scan/commit read-only transaction, exactly
+/// like a `SELECT`, to get MVCC-correct visibility of committed rows.
+fn rebuild_vector_indexes(
+    catalog: &Catalog,
+    txn_mgr: &mut TransactionManager,
+    pool: &mut BufferPool,
+    wal: &mut Wal,
+    lock_mgr: &mut LockManager,
+    page_size: usize,
+    handle: &IndexHandle,
+) -> Result<()> {
+    for table in catalog.tables() {
+        let vector_cols: Vec<&ColumnDef> = table
+            .columns
+            .iter()
+            .filter(|c| matches!(c.index, Some(IndexKind::Hnsw)))
+            .collect();
+        if vector_cols.is_empty() {
+            continue;
+        }
+
+        let heap = Heap::from_pages(page_size, table.pages.clone());
+        let xid = txn_mgr.begin(IsolationLevel::ReadCommitted, wal)?;
+        let snapshot = txn_mgr.snapshot_for_statement(xid)?;
+        for (row_id, bytes) in heap.scan(&snapshot, xid, pool)? {
+            let row = executor::decode_row(&bytes, &table.columns)?;
+            send_vector_upserts_for_rebuild(table, &vector_cols, row_id, &row, handle);
+        }
+        txn_mgr.commit(xid, wal, lock_mgr)?;
+
+        for col in &vector_cols {
+            handle.send(IndexMsg::MarkReady {
+                table: table.name.clone(),
+                column: col.name.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn send_vector_upserts_for_rebuild(
+    table: &TableDef,
+    vector_cols: &[&ColumnDef],
+    row_id: RowId,
+    row: &[Literal],
+    handle: &IndexHandle,
+) {
+    let mut indexed_cols = Vec::new();
+    for col in vector_cols {
+        let idx = table
+            .columns
+            .iter()
+            .position(|c| c.name == col.name)
+            .expect("vector_cols is drawn from table.columns");
+        if let Literal::Vector(v) = &row[idx] {
+            indexed_cols.push(IndexedColumn::Vector {
+                column: col.name.clone(),
+                data: v.clone(),
+            });
+        }
+    }
+    if !indexed_cols.is_empty() {
+        handle.send(IndexMsg::Upsert {
+            table: table.name.clone(),
+            record: row_id,
+            indexed_cols,
+        });
     }
 }
 
@@ -567,6 +696,104 @@ mod tests {
             .execute_sql(xid, "INSERT INTO t (id, embedding) VALUES (1, [0.1, 0.2])")
             .unwrap_err();
         assert!(matches!(err, DbError::SqlPlan(_)));
+    }
+
+    // ── M2.b: background index worker ───────────────────────────────────────
+
+    fn wait_for_status(
+        engine: &Engine,
+        table: &str,
+        column: &str,
+        want: index_worker::IndexStatus,
+    ) {
+        let start = std::time::Instant::now();
+        loop {
+            if engine.index_status(table, column) == Some(want) {
+                return;
+            }
+            if start.elapsed() > std::time::Duration::from_secs(2) {
+                panic!(
+                    "index status for {table}.{column} never reached {want:?}, last seen {:?}",
+                    engine.index_status(table, column)
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn live_insert_into_indexed_column_enqueues_upsert() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, embedding VECTOR(2))")
+            .unwrap();
+        engine
+            .set_column_index("t", "embedding", Some(crate::catalog::IndexKind::Hnsw))
+            .unwrap();
+        engine
+            .execute_sql(xid, "INSERT INTO t (id, embedding) VALUES (1, [0.1, 0.2])")
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        wait_for_status(
+            &engine,
+            "t",
+            "embedding",
+            index_worker::IndexStatus::Building { rows_done: 1 },
+        );
+
+        let guard = engine.index_worker.indexes.read().unwrap();
+        let entry = guard
+            .get(&("t".to_string(), "embedding".to_string()))
+            .unwrap();
+        let index_worker::SecondaryIndex::Vector(v) = &entry.index;
+        assert_eq!(v.len(), 1);
+    }
+
+    #[test]
+    fn reopen_rebuilds_index_from_committed_rows() {
+        let dir = tempdir().unwrap();
+        {
+            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let xid = engine.begin().unwrap();
+            engine
+                .execute_sql(xid, "CREATE TABLE t (id INT, embedding VECTOR(2))")
+                .unwrap();
+            engine
+                .execute_sql(xid, "INSERT INTO t (id, embedding) VALUES (1, [1.0, 1.0])")
+                .unwrap();
+            engine
+                .execute_sql(xid, "INSERT INTO t (id, embedding) VALUES (2, [2.0, 2.0])")
+                .unwrap();
+            engine.commit(xid).unwrap();
+            // Index attached *after* the rows were committed with no live
+            // worker watching — proves rebuild-on-open, not live upsert,
+            // is what populates the index this time.
+            engine
+                .set_column_index("t", "embedding", Some(crate::catalog::IndexKind::Hnsw))
+                .unwrap();
+            engine.flush().unwrap();
+        }
+
+        let engine2 = Engine::open(dir.path(), 0).unwrap();
+        wait_for_status(&engine2, "t", "embedding", index_worker::IndexStatus::Ready);
+
+        let guard = engine2.index_worker.indexes.read().unwrap();
+        let entry = guard
+            .get(&("t".to_string(), "embedding".to_string()))
+            .unwrap();
+        let index_worker::SecondaryIndex::Vector(v) = &entry.index;
+        assert_eq!(v.len(), 2);
+    }
+
+    #[test]
+    fn engine_drop_shuts_down_worker_without_hanging() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        drop(engine); // must return promptly, not hang on the worker thread
     }
 
     #[test]

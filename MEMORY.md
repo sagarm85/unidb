@@ -13,18 +13,22 @@
 ## Current status
 
 - **Milestone:** M1 is DONE. **M2 (vector & text search) is underway —
-  checkpoint M2.a (`VECTOR(n)` foundation) is complete.** The approved plan
-  lives at `/Users/sagarmahamuni/.claude/plans/misty-hugging-brook.md` (four
+  checkpoints M2.a (`VECTOR(n)` foundation) and M2.b (background indexing
+  worker) are both complete.** The approved plan lives at
+  `/Users/sagarmahamuni/.claude/plans/misty-hugging-brook.md` (four
   checkpoints, M2.a–d).
-- **State:** 121 unit tests + 10 crash-harness tests all green, `cargo
+- **State:** 131 unit tests + 10 crash-harness tests all green, `cargo
   clippy --all-targets -- -D warnings` clean, `cargo fmt --all --check`
-  clean, release build succeeds. `VECTOR(n)` round-trips end-to-end through
-  the SQL layer (`CREATE TABLE` → `INSERT [..]` → `SELECT`), dimension
-  mismatches rejected with a clear `DbError::SqlPlan`, not a panic.
-- **Immediate next task:** Checkpoint M2.b — the background indexing worker
-  (`src/index_worker.rs`, `src/vector.rs` wrapping `instant-distance`),
-  M2's highest-risk piece since it's the engine's first background thread.
-  See the plan file for the full task breakdown (tasks 6–12).
+  clean, release build succeeds. The engine now has its first background
+  thread (`index_worker.rs`): it rebuilds a `VectorIndex` from committed
+  rows on every `Engine::open` and applies live upserts from
+  `exec_insert`/`exec_update`, all without the worker ever touching
+  `BufferPool`/`Wal`/`Heap`.
+- **Immediate next task:** Checkpoint M2.c — the full-text index
+  (`src/fulltext.rs`) and the explicit `CREATE INDEX ... USING HNSW|
+  FULLTEXT` SQL surface (`Engine::create_index`, generalizing the
+  `Catalog::set_column_index` primitive already built in M2.b). See the
+  plan file's tasks 13–16.
 - **Last updated:** 2026-07-06
 
 ### Design note: read-only transactions pay an unnecessary commit fsync (found in M1.d)
@@ -162,6 +166,74 @@ every read) rather than trusting any single point — cheap, and each guards
 a different failure mode (bad DDL, bad INSERT, corrupted/mismatched stored
 bytes).
 
+### Design note: instant-distance has no incremental insert — plan corrected (M2.b)
+
+The approved M2 plan chose `instant-distance` partly on the assumption of
+"native incremental insertion." That turned out to be wrong: checked against
+the vendored 0.6.1 source, `Builder::build`/`Hnsw::new` only construct an
+`HnswMap`/`Hnsw` from a full `Vec<P>`/`Vec<V>` at once — there is no public
+method to add a single point to an already-built graph. Corrected design
+(`src/vector.rs`): `VectorIndex` buffers every live point in a
+`HashMap<RowId, Vec<f32>>` and rebuilds the whole HNSW graph from scratch on
+every `upsert`/`remove`. This still satisfies CLAUDE.md's M2 goal ("row
+write is the only synchronous cost") because the rebuild happens entirely on
+the background worker thread — the foreground write path only ever sends a
+channel message, same as the original plan intended. The tradeoff is
+real, though: rebuild-per-upsert is O(n log n) per insert at the index
+structure level, not O(log n) amortized the way true incremental HNSW
+insertion would be. Not a correctness issue, and M2.d's benchmark table
+(§6, "report honestly if it doesn't show negligible overhead") is exactly
+where this gets evidence-based scrutiny rather than being assumed fine.
+Distance metric: squared-root Euclidean (`pgvector`'s `<->` default), chosen
+for the later benchmark comparison to be apples-to-apples.
+
+### Design note: background worker never touches storage-layer types (M2.b)
+
+`index_worker.rs`'s worker thread owns exactly one thing:
+`Arc<RwLock<HashMap<(table, column), IndexEntry>>>`, built purely from
+`IndexMsg` channel messages. It never receives a `BufferPool`, `Wal`, or
+`Heap` handle — confirming the plan's core risk-mitigation choice held up
+in practice. Two flows funnel through the *same* channel:
+- **Rebuild-on-open**: `Engine::open` runs an ordinary begin/scan/commit
+  read-only transaction (identical MVCC machinery to a `SELECT`) on the
+  foreground thread, decodes each row via the existing `executor::decode_row`,
+  and sends one `IndexMsg::Upsert` per row with a non-empty vector column,
+  followed by one `IndexMsg::MarkReady` per indexed column once the scan
+  finishes. This is what lets `IndexStatus` distinguish `Building` (worker
+  still draining a backlog) from `Ready` (drained) — `MarkReady` is
+  processed strictly after every `Upsert` sent before it, since it's the
+  same FIFO channel.
+- **Live upserts**: `sql/executor.rs`'s new `send_vector_upserts` runs once
+  per inserted/updated row (not once globally), checking `ColumnDef.index`
+  directly — zero cost for tables with no indexed column, satisfying "row
+  write is the only synchronous cost."
+
+**A new general catalog primitive was added ahead of its originally-planned
+checkpoint**: `Catalog::set_column_index`/`Engine::set_column_index` (M2.b),
+even though the plan placed "persist `ColumnDef.index`" under M2.c's
+`CREATE INDEX` task. Justified narrowly: M2.b's own tests needed *some* way
+to mark a column indexed to prove the worker pipeline end-to-end, and this
+is exactly the catalog-persistence primitive M2.c's `CREATE INDEX` executor
+code was always going to call internally (mirrors `set_rls_policy`'s
+existing pattern) — M2.c only adds the SQL parsing, `LogicalPlan::CreateIndex`,
+and immediate backfill-on-existing-rows on top of this, not a competing
+mechanism. What M2.b's `set_column_index` deliberately does *not* do:
+backfill already-committed rows immediately — an already-populated table
+only gets indexed on the next `Engine::open`'s rebuild-on-open rescan.
+`CREATE INDEX` (M2.c) will call `set_column_index` and *then* run its own
+backfill scan, using the exact same rebuild logic factored out for reuse
+(`send_vector_upserts_for_rebuild` in `lib.rs`).
+
+**Known, accepted tech debt from this checkpoint** (parallel to M1's
+"no vacuum" gap): `VectorIndex` has no removal-on-obsolescence path for
+UPDATE. Since M1 UPDATE always creates a new `RowId` (never in-place), a
+row's old vector value stays in the index forever, keyed by a `RowId` whose
+tuple is now permanently dead. This is a correctness non-issue — a stale
+candidate resolves to `NoVisibleVersion` at read time and gets filtered out,
+exactly like MVCC's existing "no vacuum" story for the heap itself — but it
+is an unbounded space leak under update-heavy workloads on indexed columns.
+Tracked below, not silently dropped.
+
 ### Design note: no cross-statement RowId stability
 
 Initially built `Heap::get` to walk the `prev_page`/`prev_slot` chain
@@ -210,14 +282,24 @@ src/
     logical.rs        — (new, M1.c) LogicalPlan/Expr/Literal/CmpOp + apply_rls (the entire
                          RLS mechanism is this one AND-rewrite function)
     parser.rs         — (new, M1.c) wraps `sqlparser`'s GenericDialect AST -> LogicalPlan
-    executor.rs        — (new, M1.c; extended M2.a) row-at-a-time executor; hand-rolled
+    executor.rs        — (new, M1.c; extended M2.a, M2.b) row-at-a-time executor; hand-rolled
                          row encoding (tag+value per column, tag 5 = Vector, M2.a);
-                         no separate physical-plan IR (folded in)
+                         no separate physical-plan IR (folded in); exec_insert/exec_update
+                         send IndexMsg::Upsert for indexed VECTOR columns (M2.b)
+  index_worker.rs     — (new, M2.b) the engine's first background thread: IndexMsg/
+                         IndexHandle/IndexStatus/SecondaryIndex, owns Arc<RwLock<HashMap
+                         <(table,column), IndexEntry>>>, never touches BufferPool/Wal/Heap
+  vector.rs           — (new, M2.b) VectorIndex wrapper around `instant-distance`;
+                         buffers points, rebuilds the HNSW graph on every upsert/remove
+                         (no incremental insert in instant-distance's public API — see
+                         design note above)
   checkpoint.rs       — flush dirty → checkpoint WAL record → update control → truncate WAL
   recovery.rs         — (extended, M1.a) mini-txn redo/undo (unchanged) +
                          incomplete-user-txn undo pass (decodes ownership from WAL redo bytes)
   lib.rs              — Engine API: begin/commit/abort + insert/get/update/delete take an xid;
-                         + execute_sql/set_rls_policy (M1.c); owns LockManager + Catalog
+                         + execute_sql/set_rls_policy (M1.c); owns LockManager + Catalog;
+                         + index_worker: IndexHandle field, Drop impl shuts it down, spawned
+                         and rebuilt-from-committed-rows in open() (M2.b)
 tests/
   crash/main.rs       — 9 crash-injection tests: P1–P5 (M0) + P6/P7 (M1.a) + P9 (M1.b)
 benches/
@@ -256,8 +338,8 @@ Key design decisions confirmed in implementation (M0 + M1.a + M1.b + M1.c):
 
 ## In progress
 
-Nothing — M2.a checkpoint fully verified. Ready to start M2.b (background
-indexing worker + threading model, the highest-risk checkpoint in M2).
+Nothing — M2.a and M2.b checkpoints both fully verified. Ready to start
+M2.c (full-text index + `CREATE INDEX` SQL surface).
 
 ---
 
@@ -397,6 +479,50 @@ correctly through the actual SQL layer ✅, dimension mismatches rejected
 with a clear `DbError::SqlPlan` ✅, all tests green ✅. No index/worker yet
 — that's M2.b.
 
+## M2.b task breakdown (ordered — all complete)
+
+1. ✅ `src/vector.rs` (new): `VectorIndex` wrapper around `instant-distance`.
+   Corrected the plan's "native incremental insertion" assumption after
+   checking the vendored source (see design note above) — buffers points,
+   rebuilds the HNSW graph on every `upsert`/`remove`.
+2. ✅ `src/index_worker.rs` (new): the engine's first background thread.
+   `IndexMsg{Upsert,MarkReady,Shutdown}`, `IndexedColumn::Vector`,
+   `SecondaryIndex::Vector` (only variant so far — `FullText` lands in
+   M2.c), `IndexStatus{Building{rows_done},Ready}`, `IndexHandle` with a
+   bounded (5s) `shutdown()`. Worker owns only
+   `Arc<RwLock<HashMap<(table,column), IndexEntry>>>`, never
+   `BufferPool`/`Wal`/`Heap`.
+3. ✅ Rebuild-on-open (`lib.rs::rebuild_vector_indexes`): runs on the
+   foreground thread via an ordinary begin/scan/commit read-only
+   transaction (same MVCC path as `SELECT`), pipes results through the same
+   channel live upserts use.
+4. ✅ Live upserts (`sql/executor.rs::send_vector_upserts`): checked once
+   per inserted/updated row via `ColumnDef.index`, zero cost for
+   non-indexed tables.
+5. ✅ `Arc<RwLock<>>` shared index access — built directly into
+   `index_worker.rs`'s `SharedIndexes` type from the start (not a
+   follow-up), ready for M2.d's `NEAR` queries to take a read lock.
+6. ✅ `Engine` gains an `index_worker: IndexHandle` field + `Drop` impl
+   calling `shutdown()`.
+7. ✅ Added `Catalog::set_column_index`/`Engine::set_column_index` ahead of
+   its originally-planned M2.c slot, narrowly justified as the same
+   primitive `CREATE INDEX` will call internally (see design note above) —
+   needed now so M2.b's own tests could prove the worker pipeline
+   end-to-end without waiting for the full `CREATE INDEX` SQL surface.
+8. ✅ Tests: `index_worker.rs`'s own unit tests (send/status/shutdown in
+   isolation) + three `lib.rs` integration tests exercising the real
+   `Engine`: live-insert-enqueues-upsert, reopen-rebuilds-from-committed-rows,
+   and drop-doesn't-hang.
+9. ✅ M2.b checkpoint verification: 131 unit tests + 10 crash tests green,
+   clippy/fmt clean, release build OK.
+
+**M2.b done when:** the worker spawns on `Engine::open` ✅, correctly
+rebuilds a `VectorIndex` from committed rows ✅
+(`reopen_rebuilds_index_from_committed_rows`), live inserts/updates enqueue
+upsert messages ✅ (`live_insert_into_indexed_column_enqueues_upsert`),
+shutdown is clean and tested ✅ (`engine_drop_shuts_down_worker_without_hanging`),
+`IndexStatus` reports `Building`/`Ready` correctly ✅, all tests green ✅.
+
 ---
 
 ## Open questions / pending human input
@@ -464,10 +590,61 @@ with a clear `DbError::SqlPlan` ✅, all tests green ✅. No index/worker yet
 - SQL grammar gaps, all deliberate per the agreed M1 scope: no joins, no
   aggregates, no subqueries, no `ORDER BY`/`LIMIT`, `WHERE` is AND-only (no
   `OR`), no `@>` JSON containment, no binary JSONB storage, no JSON index.
+- **`instant-distance` has no incremental insert** (see M2.b design note
+  above) — `VectorIndex` rebuilds the whole HNSW graph from scratch on
+  every `upsert`/`remove`, O(n log n) per insert rather than the O(log n)
+  amortized a true incremental HNSW would give. Not a correctness issue;
+  flagged for M2.d's benchmark table to quantify honestly at realistic row
+  counts, since CLAUDE.md's §6 explicitly wants this evidence-based rather
+  than assumed fine.
+- **No vector-index cleanup on UPDATE** (see M2.b design note above) — a
+  row's old vector value stays indexed forever under its now-dead `RowId`
+  after an UPDATE (which always creates a new `RowId` in M1's MVCC design).
+  Correctness is unaffected (stale candidates resolve to `NoVisibleVersion`
+  and get filtered at read time), but it's an unbounded space leak under
+  update-heavy workloads on indexed columns — the same shape of gap as M1's
+  "no vacuum" tech debt, just for the secondary index instead of the heap.
 
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-06 — M2.b checkpoint complete (background indexing worker)
+
+- Implemented all of M2.b per the approved plan
+  (`/Users/sagarmahamuni/.claude/plans/misty-hugging-brook.md`): `src/vector.rs`
+  (`VectorIndex` wrapping `instant-distance`), `src/index_worker.rs` (the
+  engine's first background thread), rebuild-on-open + live-upsert wiring
+  through `lib.rs`/`sql/executor.rs`, `Engine`'s `Drop` impl.
+- **One real design correction found and fixed, not silently absorbed**:
+  the plan assumed `instant-distance` supports native incremental insertion.
+  Checked against the vendored 0.6.1 source before writing any code against
+  it — it doesn't; `Builder::build` only does full-rebuild construction.
+  Corrected `VectorIndex` to buffer points and rebuild the whole graph per
+  upsert, documented as a design note and a tracked tech-debt item (M2.d's
+  benchmark table is where this gets quantified honestly, not assumed away).
+- Pulled one small primitive (`Catalog::set_column_index`/
+  `Engine::set_column_index`) forward from its originally-planned M2.c slot,
+  narrowly justified: M2.b's own tests needed a way to mark a column
+  indexed to prove the worker pipeline end-to-end, and this is exactly the
+  catalog-persistence call `CREATE INDEX` was always going to make
+  internally — not a competing mechanism, and it deliberately does *not*
+  backfill (that's still M2.c's job).
+- Confirmed the plan's core risk-mitigation choice held up in practice: the
+  worker thread's only state is `Arc<RwLock<HashMap<(table,column),
+  IndexEntry>>>`, built purely from channel messages — it never received a
+  `BufferPool`/`Wal`/`Heap` handle anywhere in the implementation.
+- Flagged one new tech-debt item, parallel to M1's "no vacuum" gap: no
+  index cleanup on UPDATE (old vector values under dead `RowId`s
+  accumulate forever) — a space leak, not a correctness bug, since stale
+  candidates resolve to `NoVisibleVersion` at read time.
+- **Final state:** 131 unit tests + 10 crash-harness tests green, `cargo
+  clippy --all-targets -- -D warnings` clean, `cargo fmt --all --check`
+  clean, `cargo build --release` succeeds.
+- **Next:** M2.c — full-text index (`src/fulltext.rs`) + explicit
+  `CREATE INDEX ... USING HNSW|FULLTEXT` SQL surface, generalizing the
+  worker's `SecondaryIndex` enum to a second variant and reusing
+  `set_column_index` from the executor side this time.
 
 ### 2026-07-06 — M2.a checkpoint complete (VECTOR(n) foundation)
 
