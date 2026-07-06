@@ -31,6 +31,7 @@ use crate::{
     heap::{Heap, RowId},
     index_worker::{IndexHandle, IndexMsg, IndexedColumn, SecondaryIndex},
     lockmgr::LockManager,
+    queue::{self, EVENTS_TABLE},
     txn::{TransactionManager, UndoAction},
     wal::Wal,
 };
@@ -51,6 +52,14 @@ pub struct ExecCtx<'a> {
     /// `None` in contexts with no live worker (e.g. rebuild-on-open, which
     /// talks to the worker directly rather than through the executor).
     pub index_worker: Option<&'a IndexHandle>,
+    /// Next `seq` to assign in `__events__` (M4). Lives here rather than as
+    /// an extra function argument threaded through `execute()` — unlike
+    /// M3.c's `edge_index` (needed by exactly one top-level entry point,
+    /// `graph_executor::execute`), event capture must reach the deeply
+    /// nested private `exec_insert`/`exec_update`/`exec_delete`, the same
+    /// shape `index_worker` above already has. Incremented in place by
+    /// `send_event_capture` on every captured event.
+    pub next_event_seq: &'a mut u64,
 }
 
 /// Build the `IndexedColumn` list for one decoded `row`, from the subset of
@@ -112,6 +121,54 @@ fn send_index_upserts(table_def: &TableDef, row_id: RowId, row: &[Literal], ctx:
             indexed_cols,
         });
     }
+}
+
+/// If `table_def` has events enabled, durably capture one event row in
+/// `__events__` under `ctx.xid` — a synchronous `heap.insert` followed
+/// immediately by `record_undo`, exactly the two-line shape every other
+/// write path in this file already uses. This is the call that makes M4's
+/// "zero new abort-path code" claim true: the event row's fate is tied to
+/// the surrounding transaction via the same MVCC/abort machinery as any
+/// other row, with nothing new added to `txn.rs`. Checked once per
+/// statement row, mirroring `send_index_upserts`'s "zero cost if not
+/// opted in" shape — but unlike that function, this write is synchronous
+/// and durable, not sent to a background worker, since the event must
+/// commit atomically with the triggering write (see queue/mod.rs's module
+/// doc for why a WAL-tailing design was rejected).
+fn send_event_capture(
+    table_def: &TableDef,
+    op: &str,
+    row: &[Literal],
+    ctx: &mut ExecCtx,
+) -> Result<()> {
+    if !table_def.events_enabled {
+        return Ok(());
+    }
+    let payload = queue::payload::row_to_json(row, &table_def.columns);
+    let events_def = ctx.catalog.lookup(EVENTS_TABLE)?.clone();
+    let mut heap = Heap::from_pages(ctx.page_size, events_def.pages.clone());
+
+    let seq = *ctx.next_event_seq;
+    *ctx.next_event_seq += 1;
+
+    let encoded = encode_row(&queue::event_row(
+        seq as i64,
+        ctx.xid as i64,
+        &table_def.name,
+        op,
+        &payload,
+    ));
+    let row_id = heap.insert(&encoded, ctx.xid, ctx.pool, ctx.wal)?;
+    ctx.txn_mgr.record_undo(
+        ctx.xid,
+        UndoAction::Insert {
+            page_id: row_id.page_id,
+            slot: row_id.slot,
+        },
+    )?;
+
+    persist_pages_if_changed(EVENTS_TABLE, &heap, &events_def.pages, ctx)?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -176,6 +233,7 @@ fn exec_create_table(
         columns,
         pages: Vec::new(),
         rls_policy: None,
+        events_enabled: false,
     };
     let mut cctx = catalog_ctx!(ctx);
     ctx.catalog.create_table(def, &mut cctx)?;
@@ -285,6 +343,7 @@ fn exec_insert(
             },
         )?;
         send_index_upserts(&table_def, row_id, &coerced, ctx);
+        send_event_capture(&table_def, "insert", &coerced, ctx)?;
         count += 1;
     }
 
@@ -445,6 +504,7 @@ fn exec_update(
             },
         )?;
         send_index_upserts(&table_def, new_row_id, &coerced, ctx);
+        send_event_capture(&table_def, "update", &coerced, ctx)?;
         count += 1;
     }
 
@@ -460,7 +520,10 @@ fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Resu
     let matching = matching_rows(&heap, &snapshot, ctx, &table_def, predicate)?;
 
     let mut count = 0;
-    for (row_id, _) in matching {
+    for (row_id, row) in matching {
+        // Captured before `heap.delete` runs — once the row is deleted
+        // there is nothing left to build a payload from.
+        send_event_capture(&table_def, "delete", &row, ctx)?;
         heap.delete(row_id, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr)?;
         ctx.txn_mgr.record_undo(
             ctx.xid,
@@ -894,6 +957,7 @@ mod tests {
         control: ControlData,
         control_path: std::path::PathBuf,
         page_size: usize,
+        next_event_seq: u64,
     }
 
     impl Harness {
@@ -912,6 +976,7 @@ mod tests {
                 control,
                 control_path,
                 page_size: DEFAULT_PAGE_SIZE as usize,
+                next_event_seq: 1,
             }
         }
 
@@ -930,6 +995,7 @@ mod tests {
                 page_size: self.page_size,
                 xid,
                 index_worker: None,
+                next_event_seq: &mut self.next_event_seq,
             };
             execute(plan, &mut ctx)
         }
@@ -1216,6 +1282,7 @@ mod tests {
             }],
             pages: vec![],
             rls_policy: None,
+            events_enabled: false,
         };
         let err = coerce_and_validate_row(&table, vec![Literal::Vector(vec![0.1, 0.2, 0.3])]);
         assert!(matches!(err, Err(DbError::SqlPlan(_))));

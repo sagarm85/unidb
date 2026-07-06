@@ -179,6 +179,7 @@ mod tests {
             }],
             pages: vec![],
             rls_policy: policy,
+            events_enabled: false,
         });
         catalog
     }

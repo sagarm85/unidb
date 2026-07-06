@@ -59,6 +59,7 @@ pub fn edges_table_def() -> TableDef {
         ],
         pages: Vec::new(),
         rls_policy: None,
+        events_enabled: false,
     }
 }
 

@@ -16,6 +16,7 @@ pub mod lockmgr;
 pub mod mmap;
 pub mod mvcc;
 pub mod page;
+pub mod queue;
 pub mod recovery;
 pub mod sql;
 pub mod txn;
@@ -39,6 +40,7 @@ use crate::{
     heap::Heap,
     index_worker::{IndexHandle, IndexMsg},
     lockmgr::LockManager,
+    queue::{CONSUMERS_TABLE, EVENTS_TABLE},
     sql::{
         executor::{self, ExecCtx, ExecResult},
         logical::{apply_rls, Expr, Literal},
@@ -67,6 +69,7 @@ pub struct Engine {
     _wal_path: PathBuf,
     index_worker: IndexHandle,
     edge_index: EdgeIndex,
+    next_event_seq: u64,
 }
 
 impl Drop for Engine {
@@ -128,8 +131,17 @@ impl Engine {
                 page_size: page_size_usize,
             };
             edges::ensure_edges_table(&mut catalog, &mut cctx)?;
+            queue::ensure_queue_tables(&mut catalog, &mut cctx)?;
         }
         let edge_index = rebuild_edge_index(
+            &catalog,
+            &mut txn_mgr,
+            &mut pool,
+            &mut wal,
+            &mut lock_mgr,
+            page_size_usize,
+        )?;
+        let next_event_seq = derive_next_event_seq(
             &catalog,
             &mut txn_mgr,
             &mut pool,
@@ -162,6 +174,7 @@ impl Engine {
             _wal_path: wal_p,
             index_worker,
             edge_index,
+            next_event_seq,
         })
     }
 
@@ -185,6 +198,7 @@ impl Engine {
                 page_size,
                 xid,
                 index_worker: Some(&self.index_worker),
+                next_event_seq: &mut self.next_event_seq,
             };
             results.push(executor::execute(plan, &mut ctx)?);
         }
@@ -210,6 +224,7 @@ impl Engine {
             page_size,
             xid,
             index_worker: Some(&self.index_worker),
+            next_event_seq: &mut self.next_event_seq,
         };
         let result = graph_executor::execute(parsed, &mut ctx, &self.edge_index)?;
         Ok(vec![result])
@@ -256,6 +271,32 @@ impl Engine {
     /// reached by the worker).
     pub fn index_status(&self, table: &str, column: &str) -> Option<index_worker::IndexStatus> {
         self.index_worker.status(table, column)
+    }
+
+    // ── M4.a: event capture opt-in ──────────────────────────────────────────
+
+    /// Opt a table into event capture (M4): from this point on, every
+    /// INSERT/UPDATE/DELETE on `table` also durably writes a row to
+    /// `__events__` under the same transaction (see
+    /// `sql/executor.rs::send_event_capture`). Rejects `__events__`/
+    /// `__consumers__` themselves as targets — defense in depth alongside
+    /// the same guard in `send_event_capture`, following M2.a's
+    /// "validate in more than one place" precedent for `VECTOR(n)`.
+    pub fn enable_events(&mut self, table: &str) -> Result<()> {
+        if table == EVENTS_TABLE || table == CONSUMERS_TABLE {
+            return Err(DbError::SqlPlan(format!(
+                "cannot enable events on the system table '{table}' itself"
+            )));
+        }
+        let page_size = self.control.page_size as usize;
+        let mut ctx = crate::catalog::CatalogCtx {
+            pool: &mut self.pool,
+            wal: &mut self.wal,
+            control_path: &self.control_path,
+            control: &mut self.control,
+            page_size,
+        };
+        self.catalog.set_events_enabled(table, true, &mut ctx)
     }
 
     // ── M3.a: graph edges ───────────────────────────────────────────────────
@@ -511,6 +552,34 @@ fn rebuild_edge_index(
     }
     txn_mgr.commit(xid, wal, lock_mgr)?;
     Ok(index)
+}
+
+/// Derive the next `seq` to assign in `__events__`, from its own
+/// currently-committed rows — mirrors `TransactionManager::
+/// recover_next_xid`'s "resume past the highest ever seen" approach and
+/// `rebuild_edge_index`'s exact begin/scan/commit read-only transaction
+/// template. Returns 1 if `__events__` is empty.
+fn derive_next_event_seq(
+    catalog: &Catalog,
+    txn_mgr: &mut TransactionManager,
+    pool: &mut BufferPool,
+    wal: &mut Wal,
+    lock_mgr: &mut LockManager,
+    page_size: usize,
+) -> Result<u64> {
+    let table = catalog.lookup(EVENTS_TABLE)?;
+    let heap = Heap::from_pages(page_size, table.pages.clone());
+    let xid = txn_mgr.begin(IsolationLevel::ReadCommitted, wal)?;
+    let snapshot = txn_mgr.snapshot_for_statement(xid)?;
+    let mut max_seq: u64 = 0;
+    for (_, bytes) in heap.scan(&snapshot, xid, pool)? {
+        let row = executor::decode_row(&bytes, &table.columns)?;
+        if let Literal::Int(seq) = row[0] {
+            max_seq = max_seq.max(seq as u64);
+        }
+    }
+    txn_mgr.commit(xid, wal, lock_mgr)?;
+    Ok(max_seq + 1)
 }
 
 /// Scan every table's currently-committed rows for any column carrying an
@@ -1396,5 +1465,225 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, DbError::SqlUnsupported(_)));
+    }
+
+    // ── M4.a: event capture foundation ──────────────────────────────────────
+
+    fn events_for_table(engine: &mut Engine, table: &str) -> Vec<Vec<Literal>> {
+        let xid = engine.begin().unwrap();
+        let results = engine
+            .execute_sql(
+                xid,
+                &format!("SELECT * FROM __events__ WHERE table_name = '{table}'"),
+            )
+            .unwrap();
+        match &results[0] {
+            SqlResult::Rows(rows) => rows.clone(),
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn queue_tables_exist_and_are_ordinary_sql_queryable() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        let events = engine.execute_sql(xid, "SELECT * FROM __events__").unwrap();
+        assert_eq!(events, vec![SqlResult::Rows(vec![])]);
+        let consumers = engine
+            .execute_sql(xid, "SELECT * FROM __consumers__")
+            .unwrap();
+        assert_eq!(consumers, vec![SqlResult::Rows(vec![])]);
+    }
+
+    #[test]
+    fn events_disabled_by_default_produces_no_event_rows() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, name TEXT)")
+            .unwrap();
+        engine
+            .execute_sql(xid, "INSERT INTO t (id, name) VALUES (1, 'a')")
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        assert!(events_for_table(&mut engine, "t").is_empty());
+    }
+
+    #[test]
+    fn enable_events_rejects_system_tables() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        assert!(matches!(
+            engine.enable_events(queue::EVENTS_TABLE),
+            Err(DbError::SqlPlan(_))
+        ));
+        assert!(matches!(
+            engine.enable_events(queue::CONSUMERS_TABLE),
+            Err(DbError::SqlPlan(_))
+        ));
+    }
+
+    #[test]
+    fn insert_on_events_enabled_table_captures_one_tagged_event() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, name TEXT)")
+            .unwrap();
+        engine.commit(xid).unwrap();
+        engine.enable_events("t").unwrap();
+
+        let xid2 = engine.begin().unwrap();
+        engine
+            .execute_sql(xid2, "INSERT INTO t (id, name) VALUES (1, 'alice')")
+            .unwrap();
+        engine.commit(xid2).unwrap();
+
+        let rows = events_for_table(&mut engine, "t");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][3], Literal::Text("insert".to_string()));
+        let Literal::Json(payload) = &rows[0][4] else {
+            panic!("expected Json payload, got {:?}", rows[0][4]);
+        };
+        let parsed: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(parsed["id"], serde_json::json!(1));
+        assert_eq!(parsed["name"], serde_json::json!("alice"));
+    }
+
+    #[test]
+    fn update_on_events_enabled_table_captures_new_value() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, balance INT)")
+            .unwrap();
+        engine
+            .execute_sql(xid, "INSERT INTO t (id, balance) VALUES (1, 100)")
+            .unwrap();
+        engine.commit(xid).unwrap();
+        engine.enable_events("t").unwrap();
+
+        let xid2 = engine.begin().unwrap();
+        engine
+            .execute_sql(xid2, "UPDATE t SET balance = 200 WHERE id = 1")
+            .unwrap();
+        engine.commit(xid2).unwrap();
+
+        let rows = events_for_table(&mut engine, "t");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][3], Literal::Text("update".to_string()));
+        let Literal::Json(payload) = &rows[0][4] else {
+            panic!("expected Json payload");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(parsed["balance"], serde_json::json!(200));
+    }
+
+    #[test]
+    fn delete_on_events_enabled_table_captures_pre_delete_row() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, name TEXT)")
+            .unwrap();
+        engine
+            .execute_sql(xid, "INSERT INTO t (id, name) VALUES (1, 'alice')")
+            .unwrap();
+        engine.commit(xid).unwrap();
+        engine.enable_events("t").unwrap();
+
+        let xid2 = engine.begin().unwrap();
+        engine
+            .execute_sql(xid2, "DELETE FROM t WHERE id = 1")
+            .unwrap();
+        engine.commit(xid2).unwrap();
+
+        let rows = events_for_table(&mut engine, "t");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][3], Literal::Text("delete".to_string()));
+        let Literal::Json(payload) = &rows[0][4] else {
+            panic!("expected Json payload");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(parsed["name"], serde_json::json!("alice"));
+    }
+
+    #[test]
+    fn aborted_transaction_event_is_self_visible_then_invisible_to_fresh_txn() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        engine.execute_sql(xid, "CREATE TABLE t (id INT)").unwrap();
+        engine.commit(xid).unwrap();
+        engine.enable_events("t").unwrap();
+
+        let doomed = engine.begin().unwrap();
+        engine
+            .execute_sql(doomed, "INSERT INTO t (id) VALUES (1)")
+            .unwrap();
+        let self_view = engine
+            .execute_sql(doomed, "SELECT * FROM __events__ WHERE table_name = 't'")
+            .unwrap();
+        match &self_view[0] {
+            SqlResult::Rows(rows) => assert_eq!(
+                rows.len(),
+                1,
+                "inserting transaction must see its own uncommitted event"
+            ),
+            other => panic!("expected Rows, got {other:?}"),
+        }
+
+        engine.abort(doomed).unwrap();
+
+        assert!(
+            events_for_table(&mut engine, "t").is_empty(),
+            "aborted transaction's event leaked into a fresh transaction's view"
+        );
+    }
+
+    #[test]
+    fn event_seq_derivation_resumes_past_highest_seen_after_reopen() {
+        let dir = tempdir().unwrap();
+        {
+            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let xid = engine.begin().unwrap();
+            engine.execute_sql(xid, "CREATE TABLE t (id INT)").unwrap();
+            engine.commit(xid).unwrap();
+            engine.enable_events("t").unwrap();
+
+            let xid2 = engine.begin().unwrap();
+            engine
+                .execute_sql(xid2, "INSERT INTO t (id) VALUES (1)")
+                .unwrap();
+            engine
+                .execute_sql(xid2, "INSERT INTO t (id) VALUES (2)")
+                .unwrap();
+            engine.commit(xid2).unwrap();
+            engine.flush().unwrap();
+        }
+
+        let mut engine2 = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine2.begin().unwrap();
+        engine2
+            .execute_sql(xid, "INSERT INTO t (id) VALUES (3)")
+            .unwrap();
+        engine2.commit(xid).unwrap();
+
+        let rows = events_for_table(&mut engine2, "t");
+        let mut seqs: Vec<i64> = rows
+            .iter()
+            .map(|r| match r[0] {
+                Literal::Int(n) => n,
+                ref other => panic!("expected Int seq, got {other:?}"),
+            })
+            .collect();
+        seqs.sort();
+        assert_eq!(seqs, vec![1, 2, 3], "seq must not reuse after reopen");
     }
 }

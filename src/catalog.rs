@@ -85,6 +85,12 @@ pub struct TableDef {
     /// table's existing pages across restarts).
     pub pages: Vec<PageId>,
     pub rls_policy: Option<Expr>,
+    /// Whether INSERT/UPDATE/DELETE on this table also durably capture a
+    /// row in `__events__` (M4). `false` by default — event capture is
+    /// always an explicit opt-in via `Engine::enable_events`, never
+    /// automatic, mirroring M2's "indexing is always explicit" precedent.
+    #[serde(default)]
+    pub events_enabled: bool,
 }
 
 /// Everything `Catalog` needs to durably persist itself, bundled so
@@ -159,6 +165,24 @@ impl Catalog {
             .get_mut(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
         t.rls_policy = Some(policy);
+        self.persist(ctx)
+    }
+
+    /// Enable or disable event capture on a table (M4). `Engine::
+    /// enable_events` is the validated entry point (rejects `__events__`/
+    /// `__consumers__` themselves); this is just the catalog-persistence
+    /// primitive, mirroring `set_rls_policy`'s exact shape.
+    pub fn set_events_enabled(
+        &mut self,
+        table: &str,
+        enabled: bool,
+        ctx: &mut CatalogCtx,
+    ) -> Result<()> {
+        let t = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
+        t.events_enabled = enabled;
         self.persist(ctx)
     }
 
@@ -267,6 +291,7 @@ mod tests {
             }],
             pages: vec![],
             rls_policy: None,
+            events_enabled: false,
         };
         let mut ctx = CatalogCtx {
             pool: &mut pool,
@@ -290,6 +315,7 @@ mod tests {
             columns: vec![],
             pages: vec![],
             rls_policy: None,
+            events_enabled: false,
         };
         let mut ctx = CatalogCtx {
             pool: &mut pool,
@@ -324,6 +350,7 @@ mod tests {
             ],
             pages: vec![7],
             rls_policy: None,
+            events_enabled: false,
         };
         {
             let mut ctx = CatalogCtx {
@@ -364,6 +391,7 @@ mod tests {
             ],
             pages: vec![],
             rls_policy: None,
+            events_enabled: false,
         };
         {
             let mut ctx = CatalogCtx {
@@ -393,6 +421,7 @@ mod tests {
             columns: vec![],
             pages: vec![],
             rls_policy: None,
+            events_enabled: false,
         };
         let policy = Expr::BinOp {
             op: CmpOp::Eq,
