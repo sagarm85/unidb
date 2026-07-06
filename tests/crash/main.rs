@@ -317,6 +317,55 @@ fn p9_crash_mid_undo_still_converges_to_fully_undone() {
     );
 }
 
+// ── M4.d: two-table crash (no new P-number) ──────────────────────────────────
+//
+// Event rows (M4) are ordinary WAL-backed heap rows using the exact same
+// mini-txn/user-txn machinery every other row already uses — `send_event_
+// capture` performs its own independent `heap.insert` (its own mini-txn,
+// D2) into `__events__`, recorded in the *same* user transaction's undo
+// log as the triggering row's insert. This is the first crash test that
+// spans two tables within one incomplete user transaction: it proves
+// recovery's incomplete-user-txn undo pass doesn't stop after undoing the
+// first table's mini-txn, but walks the whole undo log regardless of which
+// table each entry belongs to.
+
+#[test]
+fn incomplete_user_txn_leaves_no_trace_across_two_tables() {
+    let dir = tempdir().unwrap();
+    {
+        let mut engine = open(dir.path());
+        let xid = engine.begin().unwrap();
+        engine.execute_sql(xid, "CREATE TABLE t (id INT)").unwrap();
+        engine.commit(xid).unwrap();
+        engine.enable_events("t").unwrap();
+
+        let xid2 = engine.begin().unwrap();
+        engine
+            .execute_sql(xid2, "INSERT INTO t (id) VALUES (1)")
+            .unwrap();
+        // Both t's row and its __events__ row are durably mini-txn-logged
+        // (D2) at this point — but xid2 never reaches WAL_TXN_COMMIT.
+        engine.flush().unwrap();
+        drop(engine); // "crash"
+    }
+
+    let mut engine = open(dir.path());
+    let xid = engine.begin().unwrap();
+    let rows = engine.execute_sql(xid, "SELECT * FROM t").unwrap();
+    match &rows[0] {
+        unidb::sql::executor::ExecResult::Rows(r) => assert!(
+            r.is_empty(),
+            "incomplete txn's row in the triggering table must leave no trace"
+        ),
+        other => panic!("expected Rows, got {other:?}"),
+    }
+    let events = engine.poll_events(xid, "any", 10).unwrap();
+    assert!(
+        events.is_empty(),
+        "incomplete txn's __events__ row must leave no trace either"
+    );
+}
+
 // ── property: committed set is a prefix of operations ────────────────────────
 
 #[test]

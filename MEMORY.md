@@ -12,24 +12,126 @@
 
 ## Current status
 
-- **Milestone:** M1, M2, and **M3 (graph) are all DONE** — all four
-  checkpoints (M3.a edge storage, M3.b locking + batch-latch, M3.c Cypher
-  subset, M3.d MVCC test + benchmarks) complete, benchmarked, and
-  committed. The approved plan lives at
-  `/Users/sagarmahamuni/.claude/plans/misty-hugging-brook.md`.
-- **State:** 182 unit tests + 10 crash-harness tests + 4 `graph_locking` +
+- **Milestone:** M1, M2, M3, and **M4 (event queue) are all DONE** — all
+  four M4 checkpoints (M4.a event capture foundation, M4.b poll/ack, M4.c
+  vacuum + durability-contract proof, M4.d MVCC/crash correctness +
+  benchmarks) complete, benchmarked, and committed directly to `main` (no
+  feature branch — the one-off M3.a PR-branch experiment was not repeated,
+  per the user's explicit "switch to main and continue" instruction from
+  that session). The former M4 plan lived at
+  `/Users/sagarmahamuni/.claude/plans/misty-hugging-brook.md` (plan file is
+  reused/overwritten per milestone — its content is not a durable record;
+  this file and `PROGRESS.md` are).
+- **State:** 203 unit tests + 11 crash-harness tests + 4 `graph_locking` +
   3 `graph_rebuild` + 2 `graph_mvcc` + 3 `index_rebuild` + 1 `vector_mvcc`
-  (205 total) all green, `cargo clippy --all-targets -- -D warnings`
-  clean, `cargo fmt --all --check` clean, release build succeeds.
-  `Engine::execute_cypher` and `Engine::create_edge`/`delete_edge`/
-  `edges_from` are all MVCC-correct (proven by the aborted-edge test) and
-  benchmarked against Postgres with an indexed adjacency-list table — the
-  batch-latch adjacency scan lands within ~1.6x of Postgres, a genuinely
-  competitive result.
-- **Immediate next task:** M4 planning (event queue: WAL-derived event
-  stream, durable consumer offsets, replay) has not started. Open questions
-  carried forward from M1/M2/M3 remain (see Open questions below).
+  + 4 `queue_vacuum` + 2 `queue_mvcc` (233 total) all green, `cargo clippy
+  --all-targets -- -D warnings` clean, `cargo fmt --all --check` clean,
+  release build succeeds. `Engine::poll_events`/`ack_events`/
+  `vacuum_events` are all MVCC-correct (proven by `tests/queue_mvcc.rs`,
+  including the aborted-`ack_events` case) and the milestone's central
+  claim — a slow consumer cannot block WAL truncation — is proven by a
+  concrete test (`tests/queue_vacuum.rs::wal_truncation_is_unaffected_by_
+  consumer_lag`), not just inferred from code review.
+- **Immediate next task:** No milestone is actively in progress. Two
+  explicitly deferred follow-ups exist, not yet started: (1) the full
+  CLAUDE.md §6 cross-domain "replaced stack" benchmark (Postgres +
+  pgvector + a graph DB + a message queue, one unidb transaction vs.
+  dual/triple-write with no shared transaction) — now possible for the
+  first time since all four data models exist, but a materially bigger
+  lift than any single-milestone benchmark session and was explicitly
+  deferred by the user rather than folded into M4; (2) M5 (API/server)
+  planning has not started. See Open questions below for what's still
+  unresolved from M1–M4.
 - **Last updated:** 2026-07-06
+
+### Design note: WAL-tailing is a dead end for the event queue — copy events into an ordinary table instead (M4.a)
+
+The M4 plan's central finding, confirmed by reading source before
+committing to a design, not assumed: a queue built by tailing the live WAL
+directly cannot work. Two independent reasons. First, `checkpoint.rs::
+run()` truncates the WAL unconditionally once dirty pages are flushed —
+there is no registry of readers, no lag concept, nothing that would let a
+slow consumer hold truncation back (which would be D5-adjacent bad news
+anyway — WAL retention and page-flush timing are not supposed to depend on
+external readers). Second, WAL records don't even carry a table
+identifier (only `page_id`/`slot`), so a consumer reading raw WAL couldn't
+tell which table's row it's looking at without also consulting the
+catalog's page-list-to-table mapping at read time — fragile, and still
+wouldn't solve the truncation problem.
+
+The resolution: `sql::executor::send_event_capture` copies the row into an
+ordinary, durable `__events__` heap table **at write time**, synchronously,
+under the writing transaction's own xid — the same "just an ordinary
+system table" trick M3's `__edges__` used, for the same reason (`TableDef`
+has no "kind" field distinguishing system vs. user tables, so
+`__events__`/`__consumers__` get full MVCC versioning, WAL durability, and
+`SELECT * FROM __events__` queryability for free). Once this copy exists,
+`checkpoint.rs` needs zero changes and D5 is untouched — WAL truncation is
+*structurally* incapable of caring how far behind a consumer is, because
+the event no longer lives only in the WAL. Consumer lag's only consequence
+is `__events__` growing until `Engine::vacuum_events()` (M4.c) reclaims
+what every registered consumer has acknowledged past.
+
+### Design note: event capture must be inline, not a commit-time hook — and the risk that surfaces from that choice (M4.a)
+
+A commit-time hook reading `TransactionManager`'s accumulated `undo_log`
+was considered and rejected before implementation, not after finding a
+bug. The trap: capturing events either before or after `TransactionManager
+::commit()`'s own WAL fsync creates a window where the event and the
+underlying data-commit could disagree about whether the transaction
+actually committed — exactly the kind of subtle ordering bug this
+project's WAL-before-page discipline (D5) exists to prevent elsewhere.
+Capturing inline, under the same xid, as an ordinary `heap.insert` into
+`__events__` sidesteps this entirely: confirmed against source (not
+assumed) that `Heap::insert`/`update`/`delete` never call `record_undo`
+themselves — every existing call site (`exec_insert`, `exec_update`,
+`exec_delete`, `create_edge`, `delete_edge`, `ack_events`) does so
+explicitly right after the `heap` call, and `TransactionManager::abort`
+replays `UndoAction::Insert`/`XmaxStamp` purely by physical `(page_id,
+slot)`, with zero knowledge of which table or purpose they belong to. So
+`send_event_capture` needed nothing new in `txn.rs` at all — just the same
+`heap.insert(...)?; ctx.txn_mgr.record_undo(...)?;` two-line shape every
+other write path already uses. This is what makes the "zero new
+abort-path code" claim in `PROGRESS.md` literally true, not aspirational.
+
+**The risk this surfaces, worth stating plainly:** forgetting the event
+row's `record_undo` call would be a *silent* correctness bug, not a
+compile error — `mvcc::is_visible` doesn't distinguish "aborted but never
+undone" from "committed" (per M1.a's own design note), so a missed call
+would make an aborted transaction's event durably *visible* to every
+future consumer, forever, with no test failure anywhere near the bug's
+actual location. This is why the abort-visibility test
+(`aborted_transaction_event_is_self_visible_then_invisible_to_fresh_txn`)
+was written in M4.a itself, immediately alongside `send_event_capture`,
+rather than deferred to M4.d's milestone-level MVCC test — the same
+"catch it close to the code" discipline M2/M3's MVCC tests already
+established, applied one checkpoint earlier than usual specifically
+because of how easy this particular mistake would have been to miss.
+
+### Design note: `next_event_seq` lives on `ExecCtx` as a field, not threaded through as an extra argument (M4.a) — a deliberate deviation from the approved plan
+
+The approved M4 plan explicitly favored mirroring M3.c's `edge_index`
+precedent: pass `next_event_seq` as an extra function argument, keep
+`ExecCtx` "pure storage/txn infra." Implementation found this doesn't fit
+the actual call graph and deviated, for a concrete reason: `edge_index`
+only ever needed to reach *one* top-level entry point
+(`graph_executor::execute`, called directly from `Engine::execute_cypher`)
+— an extra argument there is a one-line, one-call-site change. Event
+capture, by contrast, must reach the *deeply nested private* `exec_insert`
+/`exec_update`/`exec_delete` functions, which are only reachable through
+`sql::executor::execute(plan, ctx)`. Threading an extra argument through
+would mean changing `execute()`'s own signature and therefore every one of
+its call sites (`Engine::execute_sql`, `Engine::execute_cypher`, and the
+test `Harness::exec_as`) — strictly more invasive than the plan's stated
+goal of minimizing touch points. `ExecCtx` already has exactly this shape
+of exception: `index_worker: Option<&IndexHandle>` exists on `ExecCtx`
+for the identical reason (`send_index_upserts` is called from the same
+nested private functions). Adding `next_event_seq: &'a mut u64` alongside
+it follows the *existing* precedent on this exact struct rather than
+inventing a new, harder-to-thread mechanism to preserve a purity goal the
+struct had already given up on for the same underlying reason. Recorded
+here as a real-time design correction against a written, approved plan —
+not a silent divergence.
 
 ### Design note: per-edge locking needed zero new code (M3.b)
 
@@ -564,8 +666,10 @@ Key design decisions confirmed in implementation (M0 + M1.a + M1.b + M1.c):
 
 ## In progress
 
-Nothing — M2 milestone fully closed out (all four checkpoints verified,
-benchmarked, committed). Ready to start M3 planning (graph).
+Nothing — M4 milestone fully closed out (all four checkpoints verified,
+benchmarked, committed). M1–M4 are all DONE. Ready for M5 (API/server)
+planning, or the deferred cross-domain "replaced stack" benchmark
+follow-up (see Current status above) if that's picked up first.
 
 ---
 
@@ -954,6 +1058,111 @@ docs updated ✅, all tests green ✅ — closing out M3 as a whole.
 
 ---
 
+## M4.a task breakdown (ordered — all complete)
+
+1. ✅ `src/queue/mod.rs` (new): `EVENTS_TABLE`/`CONSUMERS_TABLE` consts,
+   `events_table_def()`/`consumers_table_def()`, `Event` struct,
+   `event_row()`/`consumer_row()`, `ensure_queue_tables()` (mirrors
+   `graph::edges::ensure_edges_table` line-for-line).
+2. ✅ `src/queue/payload.rs` (new): `row_to_json` — the one place a
+   `Vec<Literal>` becomes a `serde_json::Value`, unit-tested per `Literal`
+   variant plus a mixed-column row.
+3. ✅ `TableDef.events_enabled: bool` (`#[serde(default)]`, mirroring
+   `ColumnDef.index`'s M2.a introduction) + `Catalog::set_events_enabled`.
+4. ✅ `Engine::enable_events` (rejects `__events__`/`__consumers__` as
+   targets) + `queue::ensure_queue_tables` called from `Engine::open()`.
+5. ✅ `next_event_seq: u64` field on `Engine` + `derive_next_event_seq`
+   (copies `rebuild_edge_index`'s exact begin/scan/commit template).
+6. ✅ `sql::executor::send_event_capture` + wired into `exec_insert`/
+   `exec_update`/`exec_delete` (delete's payload captured *before*
+   `heap.delete` runs). See design notes above for the inline-not-hook
+   decision and the `ExecCtx`-field deviation from the original plan.
+7. ✅ Tests: opt-in gating, correct per-op tagging + JSON payloads,
+   abort-visibility (self-visible then invisible to a fresh transaction —
+   written now, not deferred to M4.d), `seq` resumption across reopen.
+
+**M4.a done when:** an events-enabled table's INSERT/UPDATE/DELETE each
+produce exactly one correctly-tagged, JSON-payloaded row in `__events__`
+under the same xid ✅; a non-events-enabled table produces zero
+`__events__` rows ✅; an aborted transaction's event row is provably
+invisible to a fresh transaction ✅; `seq` derivation correct fresh and
+after reopen ✅; all tests green ✅.
+
+## M4.b task breakdown (ordered — all complete)
+
+1. ✅ `queue::find_consumer_offset` — scans `__consumers__` for a durable
+   offset; `None` means never-acked, treated as offset 0 by the caller,
+   purely in-memory.
+2. ✅ `Engine::poll_events` — pure read, ascending by `seq`, truncated to
+   `limit`; never writes to `__consumers__` even for an unregistered
+   consumer (that only happens on first `ack_events`).
+3. ✅ `Engine::ack_events` — the only write path to `__consumers__`;
+   `heap.insert` (first ack, durable auto-registration) or `heap.update`
+   (subsequent acks), using the same two-`record_undo`-call shape
+   `exec_update` already uses.
+4. ✅ Tests: no-auto-advance on poll, ack advancing what a fresh
+   transaction sees, offset persistence across reopen, independent
+   consumers not interfering, unregistered polls not writing.
+
+**M4.b done when:** `poll_events` never advances state on its own ✅;
+`ack_events` durably advances the offset and that survives an `Engine`
+reopen ✅; independent consumers demonstrably don't share or clobber
+state ✅; all tests green ✅.
+
+## M4.c task breakdown (ordered — all complete)
+
+1. ✅ `Engine::vacuum_events` — no-op with zero registered consumers
+   (a not-yet-registered consumer might need full history); otherwise
+   reclaims every `__events__` row with `seq <= min(all registered
+   consumers' offsets)` via the ordinary `lock_mgr`/`record_undo` path.
+   Confirmed by reading `Engine::checkpoint`'s actual call site that it
+   is never invoked automatically.
+2. ✅ `tests/queue_vacuum.rs` (new): the milestone's central-claim proof,
+   `wal_truncation_is_unaffected_by_consumer_lag` (a never-acking consumer
+   doesn't block five consecutive `checkpoint()` calls), plus
+   `slow_consumer_survives_vacuum_fast_consumer_does_not_block_it`,
+   `vacuum_is_noop_with_zero_registered_consumers`,
+   `vacuum_reclaims_up_to_min_offset_when_consumers_advance`.
+
+**M4.c done when:** `vacuum_events` is a no-op with zero consumers ✅,
+correctly bounds reclaim to `min(offsets)` across multiple consumers ✅, a
+slow consumer's un-acked events demonstrably survive vacuum without
+blocking a fast consumer's independent progress ✅, WAL truncation is
+proven via a concrete test to proceed unaffected by consumer lag ✅,
+`vacuum_events` confirmed never called automatically ✅, all tests
+green ✅.
+
+## M4.d task breakdown (ordered — all complete)
+
+1. ✅ `tests/queue_mvcc.rs` (new) — self-visibility then invisibility for
+   an aborted event insert; a second test proving an aborted `ack_events`
+   call does not durably advance the offset a fresh transaction sees.
+2. ✅ New two-table crash-recovery test in `tests/crash/main.rs` (no new
+   P-number): `incomplete_user_txn_leaves_no_trace_across_two_tables` — a
+   transaction that inserts into both a triggering table and `__events__`,
+   then never reaches `WAL_TXN_COMMIT`, leaves no trace in *either* table
+   after reopen. First crash test to span two tables in one incomplete
+   user transaction.
+3. ✅ `benches/queue.rs` (new): event-capture overhead (events on vs.
+   off), `poll_events` latency vs. `__events__` size, `vacuum_events` cost
+   vs. reclaimed-row count, plus a real, non-mocked Postgres SKIP LOCKED
+   comparison (isolated `unidb_queue_bench` database, dropped after
+   recording numbers).
+4. ✅ `PROGRESS.md`'s `## M4 — Event queue [DONE]` entry + this file's
+   closeout.
+5. ✅ M4.d / M4 milestone checkpoint verification: 203 unit + 11 crash + 4
+   `graph_locking` + 3 `graph_rebuild` + 2 `graph_mvcc` + 3
+   `index_rebuild` + 1 `vector_mvcc` + 4 `queue_vacuum` + 2 `queue_mvcc`
+   (233 total) green, clippy/fmt clean, release build OK.
+
+**M4.d done when:** the aborted-event MVCC test passes (including the
+`ack_events`-abort case) ✅; the two-table crash-recovery test passes ✅;
+the queue-scoped benchmark table (with the Postgres SKIP LOCKED
+comparison) is recorded ✅; `PROGRESS.md`/`MEMORY.md` closeout complete ✅;
+all tests green ✅ — closing out M4 as a whole.
+
+---
+
 ## Open questions / pending human input
 
 - **Decide: fix the read-only-transaction fsync now, or carry it into M2?**
@@ -965,11 +1174,17 @@ docs updated ✅, all tests green ✅ — closing out M3 as a whole.
   just fixing it.
 - **Decide: is catalog DDL's lack of transactionality acceptable to carry
   into M2, or does it need addressing first?** (See below.)
-- Deferred-but-flagged for later milestones: slow-consumer-vs-vacuum durability
-  contract (M4); filtered-HNSW vs over-fetch for RLS on `NEAR` (M2); SSI
-  activation (post-M1, seam built in M1.a per D11, still all no-ops — M1.b's
-  lock manager has no wait queue/deadlock detection, deliberately deferred to
-  that future SSI effort).
+- **The slow-consumer-vs-vacuum durability contract is now resolved (M4)** —
+  see `PROGRESS.md`'s M4 entry and the M4.a design notes above. No longer
+  an open question; removed from this list, kept as a crossed-off
+  reference so a future reader doesn't wonder where it went.
+- Still deferred-but-flagged for later milestones: filtered-HNSW vs
+  over-fetch for RLS on `NEAR` (M2); SSI activation (post-M1, seam built in
+  M1.a per D11, still all no-ops — M1.b's lock manager has no wait
+  queue/deadlock detection, deliberately deferred to that future SSI
+  effort); the full cross-domain "replaced stack" benchmark (now possible
+  since M4 shipped, but explicitly deferred as a separate follow-up rather
+  than folded into M4 — see Current status above).
 - RC's EvalPlanQual-style re-evaluation path (D12, sequenced after SI) is
   designed but **still not implemented** even though M1.c's executor now
   exists (the thing it was waiting on) — UPDATE/DELETE conflicts propagate
@@ -1067,10 +1282,92 @@ docs updated ✅, all tests green ✅ — closing out M3 as a whole.
   `OPTIONAL MATCH`, no variable-length paths (`*1..3`), no aggregation, no
   `ORDER BY`/`LIMIT`. Deliberate "practical subset" scope, matching the
   SQL layer's own precedent of excluding joins/aggregates/subqueries.
+- **`poll_events` has no predicate pushdown** (M4.b) — cost scales with
+  `__events__`'s total row count, not consumer lag or `limit`, quantified
+  in `PROGRESS.md`'s M4 benchmark table (linear: 100→1,000→5,000 rows is
+  ~10x→~4.8x time increases matching the size increases almost exactly).
+  `vacuum_events` (M4.c) is the only current lever that bounds this cost —
+  a `seq`-ordered secondary index is the natural future fix once this
+  becomes a real bottleneck in practice, not before.
+- **`__consumers__`'s `ack_events`-driven `heap.update` accumulates dead
+  tuple versions with no cleanup** (M4.b) — the same "no vacuum" shape
+  already accepted for the heap itself (M1), `VectorIndex`/`InvertedIndex`
+  (M2), and `EdgeIndex` (M3), just for a new structure.
+  `Engine::vacuum_events` (M4.c) reclaims `__events__` rows only; it does
+  not touch `__consumers__`'s own dead versions — an asymmetry worth
+  tracking explicitly since a future reader might otherwise assume
+  `vacuum_events` cleans up both tables.
+- **`apply_rls` is bypassed by `poll_events`/`ack_events`/`vacuum_events`
+  entirely, by construction** (M4) — they are bespoke `Engine` methods,
+  not `execute_sql`-routed plans, exactly like `edges_from` (M3).
+  Consistent with existing precedent, not a new gap.
+- **`vacuum_events`'s per-row cost is fsync-dominated, same root cause as
+  every other multi-row mutation path** (M4.c/M4.d) — quantified in
+  `PROGRESS.md`'s M4 benchmark table at a remarkably consistent ~3.06–3.10
+  ms/row regardless of how many rows are reclaimed (100 vs. 5,000),
+  because each reclaimed row's `heap.delete` is its own WAL-bracketed
+  mini-txn (D2) that fsyncs independently. Not queue-specific; the same
+  gap M1/M2/M3 already found and documented for every other per-row write
+  path in this codebase — `vacuum_events` simply inherits it rather than
+  introducing a new instance of it.
 
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-06 — M4 complete (all four checkpoints); M4 milestone DONE
+
+- Planned M4 via the same rigorous process as M2/M3: three parallel
+  research passes (WAL/checkpoint truncation logic, transaction-to-event
+  boundary options, durable-offset-storage patterns), a Plan agent
+  independently verifying the design against source, two
+  user-confirmed decisions (queue-scoped benchmarks; Postgres-as-queue via
+  `SELECT ... FOR UPDATE SKIP LOCKED` baseline), then implementation.
+- **M4.a** — `src/queue/mod.rs`/`payload.rs` (new), `TableDef.
+  events_enabled` + `Catalog::set_events_enabled`, `Engine::enable_events`,
+  `next_event_seq` + `derive_next_event_seq`, `sql::executor::
+  send_event_capture` wired into `exec_insert`/`exec_update`/
+  `exec_delete`. Central finding: WAL-tailing is a dead end (no table
+  identifier in WAL records, unconditional truncation) — events are
+  copied into an ordinary `__events__` heap table at write time instead,
+  exactly like `__edges__`. `ExecCtx` gained `next_event_seq: &'a mut u64`
+  as a field — a deliberate, documented deviation from the approved plan
+  (which favored an extra function argument) once the actual call graph
+  (deeply nested private `exec_*` functions, not one top-level entry
+  point) made the field approach clearly the better fit, matching
+  `index_worker`'s existing precedent on the same struct.
+- **M4.b** — `queue::find_consumer_offset`, `Engine::poll_events` (pure
+  read, never writes), `Engine::ack_events` (the only write path to
+  `__consumers__`, Kafka-style manual-commit split from `poll_events`).
+- **M4.c** — `Engine::vacuum_events` (no-op with zero consumers; else
+  reclaims `seq <= min(offsets)`; never called automatically) +
+  `tests/queue_vacuum.rs`, including the milestone's central-claim proof
+  (`wal_truncation_is_unaffected_by_consumer_lag`: a never-acking consumer
+  survives five consecutive `checkpoint()` calls with zero data loss).
+- **M4.d** — `tests/queue_mvcc.rs` (aborted event insert + aborted
+  `ack_events`, both proven self-visible-then-invisible), a new two-table
+  crash-recovery test in `tests/crash/main.rs` (first crash test spanning
+  two tables in one incomplete user transaction — no new P-number needed),
+  `benches/queue.rs` + a real Postgres SKIP LOCKED comparison (isolated
+  `unidb_queue_bench` database, dropped after recording numbers).
+  Benchmark headline: `poll_events`'s cost scales almost exactly linearly
+  with `__events__`'s total size (confirmed, not assumed) since it has no
+  predicate pushdown, while Postgres's partial index keeps its SKIP LOCKED
+  dequeue flat regardless of table size — the clearest concrete argument
+  yet for why `vacuum_events` matters as a latency lever, not just a
+  storage one.
+- Final state: 203 unit + 11 crash + 4 `graph_locking` + 3 `graph_rebuild`
+  + 2 `graph_mvcc` + 3 `index_rebuild` + 1 `vector_mvcc` + 4
+  `queue_vacuum` + 2 `queue_mvcc` (233 total) tests green, clippy/fmt
+  clean, release build OK. Committed directly to `main` across four
+  checkpoint commits (no feature branch — the M3.a PR-branch experiment
+  was not repeated this milestone, per the user's earlier "switch to main
+  and continue" instruction), each pushed immediately after its own
+  test/clippy/fmt pass. `PROGRESS.md`'s M4 entry and this file both
+  updated in the final (M4.d) commit.
+- M1, M2, M3, and M4 are now all DONE. Nothing is actively in progress —
+  see "In progress" above for the two explicitly deferred next efforts
+  (M5 planning; the cross-domain "replaced stack" benchmark).
 
 ### 2026-07-06 — M3.d complete; M3 milestone DONE
 
