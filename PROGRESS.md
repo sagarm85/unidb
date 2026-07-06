@@ -658,5 +658,164 @@ committed transactions resumes strictly past the highest one used. Full
 suite (unit + crash + all integration tests) green both with and without
 `--features server` before and after.
 
-## M5 — API / server   [PLANNED]
-_Embedded crate stabilized; optional REST + JWT auth + subscribe + `/metrics`._
+## M5 — API / server   [DONE]   2026-07-07
+
+**PR:** _pending (not yet opened; benchmarks recorded ahead of PR per session workflow)_
+**Summary:** The embedded crate stabilized (a compiler-enforced `Engine:
+Send` assertion, a crate-level doc audit, transaction-boundary doc
+comments, and an unwrap/expect audit confirming CLAUDE.md's "no unwrap/
+expect outside tests" rule holds) plus an optional REST/JWT/SSE/metrics
+server built entirely behind a new `server` Cargo feature, so a default
+`cargo build`/`cargo test` of the embedded crate never depends on an
+async runtime — "the engine stays sync" is literally true for a default
+consumer, not just true when a flag happens to be off (verified via
+`cargo tree --no-default-features --edges normal`, empty of tokio/axum/
+jsonwebtoken throughout). Shipped as four internal checkpoints (M5.a
+stabilization + writer-thread bridge, M5.b REST core, M5.c JWT/SSE/
+metrics, M5.d hardening + tests + benchmarks + this closeout).
+
+**The core architectural decision:** async HTTP handlers never touch
+`Engine` directly. One dedicated OS thread (`EngineHandle`,
+`src/server/engine_handle.rs`) owns the `Engine` for its entire life,
+mirroring `index_worker.rs`'s spawn/channel/bounded-shutdown precedent
+exactly — chosen over a shared `Mutex<Engine>` specifically to preserve
+the engine's real invariant (single-thread ownership) rather than
+introduce a "never `.await` while holding the lock" discipline every
+future call site would have to remember. `/sql` and `/cypher` get atomic
+multi-statement transactions over HTTP for free, since `execute_sql`
+already accepts a full `;`-separated statement string executed under one
+`xid` — zero new engine code needed for that.
+
+**Critical bug found and fixed mid-milestone, not part of M5's own
+feature scope:** manually smoke-testing the new server surfaced a real,
+pre-existing (M1-era) xid-reuse-after-checkpoint bug — see the dedicated
+"Bug fix (found during M5)" entry above. Flagged to the user immediately
+given its severity (silent MVCC-visibility corruption), fixed as its own
+commit with explicit sign-off before continuing M5's feature work, not
+folded silently into an M5 commit or deferred.
+
+**Benchmarks** (release build, Apple Silicon macOS, `cargo bench --bench
+server --features server`, `--sample-size 10`; scope confirmed with the
+user ahead of implementation — see the note below):
+
+| Workload                                                  | Result |
+|------------------------------------------------------------|--------|
+| Direct `Engine::insert` (own txn per op)                    | ~6.30 ms |
+| `POST /rows` (same op, over HTTP + writer-thread channel)   | ~6.69 ms |
+| HTTP+writer-thread overhead vs. direct call                | **~1.06x** (~6%) |
+| JWT verification alone (`jsonwebtoken::decode`, HS256)      | ~817 ns |
+| SSE `/events/subscribe`, 1 concurrent subscriber            | ~5.22 ms |
+| SSE `/events/subscribe`, 10 concurrent subscribers          | ~33.87 ms |
+| SSE `/events/subscribe`, 50 concurrent subscribers          | ~162.60 ms |
+| `POST /sql` throughput, 1 concurrent client                 | ~7.40 ms/op → ~135 ops/s |
+| `POST /sql` throughput, 10 concurrent clients                | ~63.88 ms/10 ops → ~157 ops/s aggregate |
+| `POST /sql` throughput, 50 concurrent clients                | ~316.36 ms/50 ops → ~158 ops/s aggregate |
+
+**Benchmark scope note (§6):** per the decision confirmed with the user
+ahead of implementation, M5's own benchmarks stay server-overhead-focused
+— there is no external "REST+JWT+SSE embedded database server" incumbent
+this project is trying to beat, so the only meaningful comparison is
+"how much does wrapping the already-measured engine in HTTP cost." The
+full CLAUDE.md §6 cross-domain "replaced stack" showcase (Postgres +
+pgvector + a graph DB + a message queue, one unidb transaction vs.
+dual/triple-write with no shared transaction) is now possible for the
+first time since all four data models exist, but remains a separate,
+dedicated future effort, not folded into M5 — standing up a graph DB
+and/or message queue for a fair comparison is a materially bigger lift
+than reusing the Postgres instance already running locally, which is all
+M1-M5's own benchmarks needed.
+
+**Honest read of these numbers:**
+- **The HTTP/writer-thread layer itself is nearly free (~6% overhead)** —
+  almost the entire per-request cost is the same fsync-per-statement
+  round-trip M1-M4 already measured and documented, not anything new M5
+  introduces. This is the single most reassuring number in this table:
+  the architectural choice to bridge sync `Engine` into async handlers via
+  a dedicated writer thread (rather than, say, `spawn_blocking` per
+  request or a lock-contended `Mutex<Engine>`) costs almost nothing extra.
+- **Concurrent `POST /sql` throughput is flat (~135 -> ~157 -> ~158 ops/s)
+  across 1, 10, and 50 concurrent clients — not scaling with concurrency
+  at all.** This is exactly the single-writer-thread design's actual
+  throughput ceiling, made concrete rather than assumed: every write
+  serializes through the one channel to the one writer thread, and every
+  commit pays its own WAL fsync (D2's per-statement mini-txn, the same
+  root cause M1-M4 already found), so adding more concurrent HTTP clients
+  just queues more work behind the same bottleneck instead of unlocking
+  more throughput. The ~135-158 ops/s figures land squarely in the same
+  range M1's own `benches/load.rs` already recorded for single-table
+  INSERT (~155-162 elem/s, own txn per op) — confirming this is the
+  identical, already-documented bottleneck surfacing through a new
+  interface, not a new one.
+- **SSE polling overhead scales worse than linearly with subscriber count
+  (1 -> 10 -> 50 is ~5.2ms -> ~33.9ms -> ~162.6ms, roughly a 6.5x and then
+  ~31x increase for 10x and 50x more subscribers)** — quantifying the
+  "N subscribers x poll interval x `poll_events`'s own linear-in-table-size
+  cost" concern `sse.rs`'s module doc already flagged qualitatively.
+  Every subscriber's poll tick contends for the same single writer thread
+  as every other request, so this is the same bottleneck as the
+  concurrent-throughput finding above, viewed from the subscribe side —
+  not a separate SSE-specific inefficiency.
+- **JWT verification (~817 ns) is genuinely negligible** next to
+  millisecond-scale request costs — confirms rather than merely assumes
+  that the auth layer isn't where any meaningful cost lives.
+
+**Crash correctness:** no new crash-injection P-number — event rows and
+every other row the server ever writes are ordinary WAL-backed heap rows
+using the exact same mini-txn/user-txn machinery `tests/crash/main.rs`'s
+P1-P9 already cover. `tests/server_shutdown.rs` proves the HTTP/
+writer-thread layer itself introduces no *additional* way to lose
+committed data or hang: several writes committed over HTTP, one more
+request fired with its reply intentionally never awaited, then graceful
+shutdown triggered immediately — shutdown completes within its bound and
+a fresh `Engine::open` afterward sees every write committed before the
+signal.
+
+**What changed:** `src/server/` (new: `engine_handle.rs`, `error.rs`,
+`dto.rs`, `handlers.rs`, `router.rs`, `auth.rs`, `sse.rs`, `mod.rs`),
+`src/bin/unidb-server.rs` (new binary), a new `server` Cargo feature
+gating `tokio`/`axum`/`tower`/`tower-http`/`jsonwebtoken`/`metrics`/
+`metrics-exporter-prometheus`/`axum-prometheus`/`async-stream`/
+`futures-util` as optional dependencies. `Engine: Send` compile-time
+assertion + crate-level doc comment + transaction-boundary doc comments
+on `insert`/`get`/`delete`/`checkpoint`/`begin_with_isolation`/`commit`/
+`abort` (`src/lib.rs`). Plain `serde::Serialize` derives (unconditional —
+`serde` is already a core dependency via `Literal`) added to `RowId`,
+`Edge`, `Event`, `IndexStatus`. New `DbError::EngineUnavailable` variant
+(the writer thread's channel closed — only ever produced by the server
+layer). Control file format bump v2->v3 (`next_xid` field) — see the
+dedicated bug-fix entry above, not part of M5's own feature scope but
+landed during this milestone.
+
+**Known limitations / tech debt (new in M5, on top of M1-M4's
+carried-forward list):**
+- **No explicit multi-request transaction *sessions*** — every route is
+  one complete, self-contained transaction; multi-statement atomicity is
+  available today via one `;`-separated `/sql` body, not via separate
+  `/begin`-then-later-`/commit` calls across requests.
+- **No REST surface for RLS** — `Expr` has no serde/SQL surface, and
+  accepting an arbitrary predicate AST from an untrusted HTTP body is a
+  real security question, not just a serialization gap. RLS stays
+  Rust-API-only, exactly as it has been since M1.
+- **REST only, no gRPC** — never confirmed in-scope beyond the
+  architecture diagram's aspirational "REST/gRPC" label.
+- **No TLS termination** — the server binds plain HTTP; production
+  deployments are assumed to sit behind a reverse proxy that terminates
+  TLS, a standard pattern for embedded/internal services, stated as an
+  assumption rather than silently implied.
+- **No login/token-issuing endpoint** — verify-only, stateless JWT per
+  the locked decision; the server never issues tokens, has no user or
+  credential database, and no session state.
+- **No connection pooling/sharding** — single-primary, single writer
+  thread, by design (CLAUDE.md §1's non-goals). Quantified directly above:
+  concurrent `POST /sql` throughput is flat regardless of client count.
+- **SSE `/events/subscribe` is "server polls, pushes to client," not
+  WAL-level push** — `poll_events` has no wake primitive; cost scales with
+  subscriber count as quantified above.
+- **No writer-thread crash recovery/restart-in-place** — a panicked
+  writer thread takes `Engine` down with it; the expected recovery is a
+  process-level restart (systemd/k8s), not in-process self-healing.
+- **Read-only routes still pay a full commit fsync**, inheriting M1's
+  already-documented tech debt — now directly visible as REST-read
+  latency rather than a Rust-API-only concern.
+- **No admin-scope JWT claim distinction** — any validly-signed,
+  unexpired token can hit `/checkpoint` and every other route alike.

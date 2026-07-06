@@ -12,22 +12,12 @@
 
 ## Current status
 
-- **Milestone:** M1-M4 are all DONE. **M5 (API/server) is IN PROGRESS** —
-  M5.a (stabilize embedded crate + writer-thread bridge), M5.b (REST core:
-  CRUD/SQL/Cypher/graph/indexing), and M5.c (JWT auth, SSE subscribe,
-  `/metrics`) are complete; M5.d (hardening, tests, benchmarks, closeout)
-  remains. The approved plan lives at
+- **Milestone: M0-M5 are ALL DONE.** Every milestone on CLAUDE.md's
+  original roadmap has shipped. M5 (API/server) closed out across four
+  checkpoints (M5.a stabilization + writer-thread bridge, M5.b REST core,
+  M5.c JWT/SSE/metrics, M5.d hardening + full test suite + benchmarks +
+  this closeout). The (now-historical) plan lived at
   `/Users/sagarmahamuni/.claude/plans/misty-hugging-brook.md`.
-- **M5.c manually verified end-to-end** (automated tests land in M5.d per
-  plan): missing/malformed bearer tokens get 401 on data routes; `GET
-  /metrics` needs no auth and returns real Prometheus text including both
-  `axum-prometheus`'s auto-instrumented HTTP metrics and unidb-specific
-  ones (`unidb_jwt_verify_seconds`, `unidb_sse_poll_cycles_total`,
-  `unidb_sse_events_delivered_total`); `GET /events/subscribe` streamed a
-  committed `/sql` INSERT on an events-enabled table within one polling
-  interval, redelivered it on every subsequent tick (expected — polling
-  never advances state), then stopped redelivering it immediately after
-  `POST /events/ack`.
 - **Critical fix landed mid-M5 (2026-07-06), its own commit, not part of
   M5's feature work:** a real xid-reuse-after-checkpoint bug was found by
   manually smoke-testing the new REST server (commit several transactions,
@@ -37,19 +27,35 @@
   confirmed with the user before implementing. This predates M5 entirely
   (an M1-era gap) but was only surfaced by M5's checkpoint+reopen usage
   pattern, which no prior test exercised.
+- **M5.d benchmark headline (full table in `PROGRESS.md`'s M5 entry)**:
+  the HTTP/writer-thread layer adds only ~6% overhead over a direct
+  `Engine::insert` call, and concurrent `POST /sql` throughput is *flat*
+  (~135 -> ~157 -> ~158 ops/s) across 1/10/50 concurrent clients — the
+  single-writer-thread design's real throughput ceiling, made concrete
+  rather than assumed, and landing in the same range M1's own
+  `benches/load.rs` already found for single-table INSERT.
 - **State:** 205 unit tests (208 with `--features server`) + 11
   crash-harness tests + 4 `graph_locking` + 3 `graph_rebuild` + 2
   `graph_mvcc` + 3 `index_rebuild` + 1 `vector_mvcc` + 4 `queue_vacuum` + 2
-  `queue_mvcc` all green, both with and without `--features server`;
-  `cargo clippy --all-targets -- -D warnings` and `cargo fmt --all --check`
-  clean in both configurations; `cargo tree --no-default-features | grep -i
-  tokio` confirmed empty (the "engine stays sync" claim is literally true
-  for the default build).
-- **Immediate next task:** M5.c (JWT auth, SSE subscribe, `/metrics`).
-  Still explicitly deferred, not started: the full CLAUDE.md §6
-  cross-domain "replaced stack" benchmark — a separate future effort, not
-  folded into M5. See Open questions below for what's still unresolved
-  from M1-M4.
+  `queue_mvcc` + 25 `server_*` integration tests, all green both with and
+  without `--features server`; `cargo clippy --all-targets -- -D warnings`
+  and `cargo fmt --all --check` clean in both configurations; `cargo tree
+  --no-default-features --edges normal` confirmed empty of tokio/axum/
+  jsonwebtoken (the "engine stays sync" claim is literally true for the
+  default build's actual library/binary artifact — note `--edges normal`
+  is required to exclude dev-dependencies, which now legitimately include
+  `jsonwebtoken`/`tokio` for the test suite; the plain `cargo tree
+  --no-default-features` picks those up and is *not* the right check
+  here, a methodology correction worth remembering for future sessions).
+- **Immediate next task:** none — no milestone is in progress. Two
+  explicitly deferred follow-ups remain, neither started: (1) the full
+  CLAUDE.md §6 cross-domain "replaced stack" benchmark (now possible for
+  the first time since all four data models + the server exist, but a
+  separate, dedicated future effort per the user's confirmed decision,
+  not folded into any single milestone); (2) whatever comes after M5,
+  since CLAUDE.md's roadmap ends here — a future session should ask the
+  user directly rather than assume. See Open questions below for what's
+  still unresolved from M1-M5.
 - **Last updated:** 2026-07-06
 
 ### Design note: xid reuse after checkpoint — a real M1-era bug, found and fixed during M5
@@ -725,10 +731,12 @@ Key design decisions confirmed in implementation (M0 + M1.a + M1.b + M1.c):
 
 ## In progress
 
-Nothing — M4 milestone fully closed out (all four checkpoints verified,
-benchmarked, committed). M1–M4 are all DONE. Ready for M5 (API/server)
-planning, or the deferred cross-domain "replaced stack" benchmark
-follow-up (see Current status above) if that's picked up first.
+Nothing — M5 milestone fully closed out (all four checkpoints verified,
+benchmarked, committed). M0-M5 are all DONE — every milestone on
+CLAUDE.md's original roadmap has shipped. The only remaining known-and-
+deferred work is the cross-domain "replaced stack" benchmark follow-up
+(see Current status above); anything beyond that is unplanned and should
+be raised with the user directly, not assumed.
 
 ---
 
@@ -1222,6 +1230,118 @@ all tests green ✅ — closing out M4 as a whole.
 
 ---
 
+## M5.a task breakdown (ordered — all complete)
+
+1. ✅ Compile-time `Engine: Send` assertion near the `Engine` struct in
+   `lib.rs` — turns "believed true" into "compiler-enforced" ahead of
+   moving `Engine` into a dedicated writer thread.
+2. ✅ Crate-level `//!` doc comment on `lib.rs` (previously had none) +
+   transaction-boundary doc comments on `insert`/`get`/`delete`/
+   `checkpoint`/`begin_with_isolation`/`commit`/`abort`.
+3. ✅ `unwrap`/`expect` audit — confirmed every non-test occurrence is
+   either infallible-by-construction (bounds-checked slice-to-array
+   conversions), an internal invariant proven by preceding code, or an
+   already-accepted RwLock-poisoning/thread-spawn-failure exception. See
+   design note above.
+4. ✅ `src/server/` (`engine_handle.rs`, `error.rs`, `mod.rs`) behind a new
+   `server` Cargo feature; `EngineHandle` mirrors `index_worker.rs`'s
+   spawn/channel/bounded-shutdown shape exactly.
+
+**M5.a done when:** `Engine: Send` compiler-verified ✅; `EngineHandle`
+round-trips a request and shuts down within its bound, with a fresh
+`Engine::open` succeeding immediately after ✅; default `cargo build`/
+`cargo test` unaffected, `cargo tree --no-default-features --edges normal`
+empty of tokio ✅; clippy/fmt clean both with and without `--features
+server` ✅.
+
+## M5.b task breakdown (ordered — all complete)
+
+1. ✅ axum/tokio brought in behind `server`; `src/server/dto.rs`,
+   `handlers.rs`, `router.rs`, `src/bin/unidb-server.rs`.
+2. ✅ Every mutating route wraps one `begin -> execute -> commit-or-abort`
+   cycle; `/sql`/`/cypher` get atomic multi-statement transactions over
+   HTTP for free via `execute_sql`'s existing `;`-separated-string support.
+3. ✅ `RowId`/`Edge`/`Event`/`IndexStatus` gained plain `serde::Serialize`
+   derives (unconditional, not feature-gated — `serde` is already a core
+   dependency via `Literal`). Deliberately did **not** derive `Serialize`
+   on `Literal`/`ExecResult` themselves — see design note above;
+   `server::dto::literal_to_json`/`exec_result_to_json` do the REST-facing
+   conversion explicitly instead.
+4. ✅ Manually smoke-tested end-to-end against a running `unidb-server`.
+
+**M5.b done when:** every route serves against real `curl`/`reqwest`
+calls ✅; a multi-statement `/sql` body's failing last statement leaves no
+prior statement's row data committed ✅; default build still excludes
+tokio/axum entirely ✅; clippy/fmt clean both ways ✅.
+
+## M5.c task breakdown (ordered — all complete)
+
+1. ✅ `src/server/auth.rs` — verify-only HS256 JWT via `jsonwebtoken`'s
+   `aws_lc_rs` backend, secret from `UNIDB_JWT_SECRET`. No login endpoint,
+   no user database, no session state.
+2. ✅ `src/server/sse.rs` — `GET /events/subscribe`, an `async-stream` loop
+   polling `poll_events` on an interval, explicitly documented as "server
+   polls, pushes to client," not WAL-level push.
+3. ✅ `POST /tables/{table}/events` (new — M5.b never exposed
+   `Engine::enable_events` over HTTP).
+4. ✅ `GET /metrics` via `axum-prometheus`'s `PrometheusMetricLayer`;
+   `router.rs` restructured into a `protected` sub-router (JWT-wrapped)
+   merged with a `public` one (`/metrics` only, no auth layer).
+5. ✅ Manually verified end-to-end: auth rejection matrix, SSE delivery +
+   redelivery-until-ack, custom + auto-instrumented Prometheus metrics.
+
+**M5.c done when:** missing/malformed tokens rejected with 401 on data
+routes ✅; a valid token succeeds ✅; `/metrics` needs no auth and returns
+real Prometheus text ✅; SSE delivers a committed mutation within one poll
+interval and stops redelivering after ack ✅.
+
+## M5.d task breakdown (ordered — all complete)
+
+1. ✅ `tests/server_common/mod.rs` (new, shared scaffolding, not its own
+   test binary) — `TestServer` + JWT token helpers. Required restructuring
+   `build_router` to accept an already-obtained `PrometheusMetricLayer`/
+   `PrometheusHandle` pair as an argument rather than calling `pair()`
+   internally: that call installs a process-global `metrics` recorder,
+   and multiple test functions spawning independent servers within one
+   test binary process would otherwise panic on the second call.
+   Production code (`unidb-server`'s `main()`) is unaffected — it already
+   only calls `build_router` once.
+2. ✅ `tests/server_crud.rs`, `server_sql.rs` (the central transaction-
+   model proof + `Literal::Json`-as-real-JSON proof), `server_cypher.rs`,
+   `server_graph.rs`, `server_auth.rs` (5-case matrix), `server_events.rs`
+   (SSE delivery + ack-prevents-replay), `server_shutdown.rs` (graceful
+   shutdown drains in-flight requests, preserves committed data — no new
+   crash-injection P-number needed), `server_metrics.rs` — each gated via
+   its own `[[test]] required-features = ["server"]` entry in Cargo.toml,
+   mirroring the `unidb-server` binary's own gating.
+3. ✅ `benches/server.rs` (`[[bench]] required-features = ["server"]`):
+   direct-vs-HTTP insert overhead, JWT verification cost, SSE polling
+   overhead at 1/10/50 subscribers, concurrent `POST /sql` throughput at
+   1/10/50 clients. Server-overhead-focused only, per the confirmed
+   decision not to fold the deferred cross-domain benchmark into M5.
+4. ✅ `PROGRESS.md`'s `## M5 — API / server [DONE]` entry + this file's
+   closeout.
+5. ✅ M5.d / M5 milestone checkpoint verification: 205 unit (208 with
+   `--features server`) + 11 crash + 4 `graph_locking` + 3 `graph_rebuild`
+   + 2 `graph_mvcc` + 3 `index_rebuild` + 1 `vector_mvcc` + 4
+   `queue_vacuum` + 2 `queue_mvcc` + 25 new `server_*` tests, all green
+   both with and without `--features server`; clippy/fmt clean; `cargo
+   tree --no-default-features --edges normal` confirmed empty of tokio/
+   axum/jsonwebtoken (the plain `cargo tree --no-default-features`,
+   *without* `--edges normal`, now shows them since they're dev-
+   dependencies for the test suite — a testing-methodology correction
+   worth recording, not a regression of the "engine stays sync" claim,
+   which is about the production library/binary build graph only).
+
+**M5.d done when:** every test file green including the shutdown-safety
+and full 5-case auth matrix ✅; `cargo build`/`test`/`clippy --all-targets`
+pass both with and without `--features server` ✅; `benches/server.rs`
+numbers recorded in `PROGRESS.md` ✅; `PROGRESS.md`/`MEMORY.md` closeout
+complete ✅ — closing out M5 as a whole, and with it, every milestone on
+CLAUDE.md's original roadmap (M0-M5).
+
+---
+
 ## Open questions / pending human input
 
 - **Decide: fix the read-only-transaction fsync now, or carry it into M2?**
@@ -1373,6 +1493,65 @@ all tests green ✅ — closing out M4 as a whole.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-07 — M5.d complete; M5 milestone DONE; M0-M5 all shipped
+
+- **M5.d**: full server integration test suite —
+  `tests/server_common/mod.rs` (shared scaffolding: `TestServer`, JWT
+  token helpers, `metrics_pair()`'s `OnceLock` memoization),
+  `tests/server_crud.rs`, `server_sql.rs` (multi-statement abort-rolls-
+  back-row-data, `Literal::Json`-as-real-nested-JSON), `server_cypher.rs`,
+  `server_graph.rs`, `server_auth.rs` (5-case matrix), `server_events.rs`
+  (SSE delivery + ack-stops-redelivery), `server_shutdown.rs` (graceful
+  shutdown drains an in-flight request, preserves committed data),
+  `server_metrics.rs` — 25 new tests total, each gated via its own
+  `[[test]] required-features = ["server"]` Cargo.toml entry.
+- **Required a real mid-checkpoint architecture fix**: `PrometheusMetricLayer::
+  pair()` installs a process-global `metrics` recorder — calling it more
+  than once in one process panics. Multiple test functions in one test
+  binary each spawning an independent `TestServer` hit this immediately.
+  Fixed by restructuring `build_router` to accept an already-obtained
+  `(PrometheusMetricLayer, PrometheusHandle)` pair as an explicit argument
+  rather than calling `pair()` internally — `unidb-server`'s own `main()`
+  now calls `pair()` once at startup and passes it in, and the test
+  helper/benchmark each memoize their own single pair via `OnceLock`.
+  Production behavior is unchanged; this was purely a test-process
+  concern that the original M5.c design hadn't needed to consider.
+- **`benches/server.rs`** (new): direct `Engine::insert` (~6.30ms) vs.
+  `POST /rows` (~6.69ms) — only ~6% HTTP/writer-thread overhead; JWT
+  verification alone (~817ns, negligible); SSE polling at 1/10/50
+  subscribers (~5.2ms/~33.9ms/~162.6ms — worse than linear, the concrete
+  number behind `sse.rs`'s qualitative "N subscribers x poll interval x
+  poll_events cost" warning); concurrent `POST /sql` throughput at
+  1/10/50 clients (~135/~157/~158 ops/s — **flat**, not scaling with
+  concurrency at all, landing in the same range M1's `benches/load.rs`
+  already found for single-table INSERT). The flat-throughput number is
+  the clearest possible evidence that the single writer thread — not the
+  HTTP layer — is the real bottleneck, exactly as the architecture always
+  implied but had never been measured directly until now.
+- **Testing-methodology correction recorded, not a regression**: `cargo
+  tree --no-default-features` now shows tokio/axum/jsonwebtoken because
+  they're legitimate dev-dependencies for the test suite (`jsonwebtoken`
+  and `futures-util` were added to `[dev-dependencies]` alongside the
+  already-present `reqwest`), and `cargo tree` includes dev-dependency
+  edges by default. The correct check for "does the default *library*
+  build depend on tokio" is `cargo tree --no-default-features --edges
+  normal`, confirmed empty throughout. Recorded here so a future session
+  doesn't mistake the unfiltered `cargo tree` output for a real problem.
+- `PROGRESS.md`'s `## M5 — API / server [DONE]` entry (full benchmark
+  table + honest read) and this file's M5.a-d task-breakdown sections +
+  Current status update, both written in this same session.
+- Final verification: 205 unit (208 with `--features server`) + 11 crash
+  + 4 `graph_locking` + 3 `graph_rebuild` + 2 `graph_mvcc` + 3
+  `index_rebuild` + 1 `vector_mvcc` + 4 `queue_vacuum` + 2 `queue_mvcc` +
+  25 `server_*` tests green, both with and without `--features server`;
+  clippy/fmt clean both ways.
+- **M0 through M5 — every milestone on CLAUDE.md's original roadmap — are
+  now all DONE.** Nothing is in progress. The only explicitly deferred,
+  not-yet-started work is the cross-domain "replaced stack" benchmark
+  (CLAUDE.md §6) as its own separate future effort; anything beyond that
+  is genuinely open and should be raised with the user directly in a
+  future session, not assumed.
 
 ### 2026-07-06 — M5.a, M5.b, M5.c complete; xid-reuse-after-checkpoint bug found and fixed
 
