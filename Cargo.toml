@@ -26,3 +26,7 @@ harness = false
 [[bench]]
 name = "vector"
 harness = false
+
+[[bench]]
+name = "graph"
+harness = false

@@ -25,14 +25,74 @@
   (`from_id -> [RowId]`) rebuilt on every open. `Engine::create_edge`/
   `delete_edge`/`edges_from` round-trip correctly and `__edges__` is
   immediately ordinary-SQL-queryable with zero graph-specific code.
-- **Immediate next task:** Checkpoint M3.b — per-edge locking verification
-  (tests proving the existing `LockManager` already handles it correctly,
-  no new code) and the batch-latch adjacency-scan optimization (already
-  implemented in M3.a's `resolve_candidates_batched`, per the plan's
-  "build this batched from the start" — M3.b's remaining work is the
-  locking tests, the design note, and the before/after benchmark). See the
-  plan file's Checkpoint M3.b.
+- **Immediate next task:** M3.b is DONE (locking verification + batch-latch
+  benchmark). Next: M3.c — the Cypher subset (hand-rolled parser,
+  `Engine::execute_cypher`, reusing `sql::executor::predicate_matches`/
+  `eval_expr` after promoting them to `pub(crate)`).
 - **Last updated:** 2026-07-06
+
+### Design note: per-edge locking needed zero new code (M3.b)
+
+The M3 plan flagged a real risk to check before assuming it: does graph
+edges' shared use of `Heap`/`LockManager` alongside ordinary tables need a
+new `RecordKind` variant (e.g. `GraphEdge`) so edge locks can't collide
+with row locks in unrelated tables? Verified false. `RecordId::row(page_id,
+slot)` (`lockmgr.rs`) packs `(page_id << 16) | slot` into a `u64` lock key.
+`PageId` is allocated once, globally, from a single shared `BufferPool`
+(`pool.alloc_page()` — see `bufferpool.rs`), **not per-table** — every
+table in the database, including `__edges__`, draws its pages from the
+same counter. So two rows can only ever produce the same lock key if
+they're the literal same physical tuple version; there is no cross-table
+collision possible even in principle, and adding a `GraphEdge` `RecordKind`
+variant would have been solving a problem that doesn't exist.
+
+`Heap::update`/`delete` already call `LockManager::try_acquire_write`
+before any mutation, unconditionally, regardless of which table's `Heap`
+handle is calling — since `create_edge`/`delete_edge` (M3.a) reconstruct an
+ordinary `Heap::from_pages` against `__edges__`'s catalog page list and
+call the same `heap.insert`/`delete` every SQL statement uses, they
+automatically inherit the exact same conflict detection, first-committer-
+wins semantics, and lock release-on-commit/abort behavior M1.b already
+built and tested for ordinary rows. `tests/graph_locking.rs` proves this
+end-to-end rather than just asserting it from code inspection: concurrent
+edge deletes conflict immediately (D12, no blocking), an edge lock and an
+unrelated table's row lock never collide, and locks release correctly on
+both commit and abort.
+
+One test-writing gotcha worth recording: `heap.rs::delete`'s two distinct
+conflict checks (an active lock from another current transaction, vs. an
+already-dead row whose deleting transaction has since committed and
+released its lock) **both** return the same `DbError::WriteConflict`
+variant — there is no way to distinguish "blocked by a live lock" from
+"row already gone" from the error shape alone (by design, per `heap.rs`'s
+own doc comment; see M1.b's design note above for why a separate
+commit-time recheck was found to be unnecessary in the first place). A
+test asserting "must not be a lock conflict" after the original lock
+holder already committed is wrong — it's still correctly a
+`WriteConflict`, just for the other reason. Fixed by asserting
+`holder_xid` matches the *expected* xid instead of trying to distinguish
+error variants that were never meant to be distinguishable.
+
+### Design note: the batch-latch adjacency scan is a real, large win (M3.b)
+
+Measured, not assumed, per CLAUDE.md §6: `benches/graph.rs`'s
+`adjacency_scan` group compares one-`fetch_page`-per-candidate resolution
+(`resolve_naive`, kept only in the benchmark for comparison) against the
+shipped `resolve_candidates_batched` (M3.a) on a synthetic hot hub. Edge
+rows are small enough that ~128 fit per 8 KiB page (1,000 edges → 8 distinct
+pages; 10,000 edges → 78), so grouping candidates by `page_id` collapses
+roughly 128 redundant `fetch_page` calls into one:
+
+| Hot hub size | naive | batched | speedup |
+|---|---|---|---|
+| 1,000 edges (8 pages) | 879 µs | 94.3 µs | ~9.3x |
+| 10,000 edges (78 pages) | 9.06 ms | 930 µs | ~9.7x |
+
+This confirms `BufferPool::fetch_page`'s per-call page copy (see M3's plan
+research) is a real, non-negligible cost at hot-hub scale, and that
+grouping by page — not some more elaborate scheme — already captures
+nearly all of the available win, since the speedup closely tracks the
+edges-per-page ratio.
 
 ### Design note: read-only transactions pay an unnecessary commit fsync (found in M1.d)
 
@@ -705,6 +765,59 @@ test passes ✅; rebuild-after-restart and mid-rebuild-staleness tests pass
 
 ---
 
+## M3.a task breakdown (ordered — all complete)
+
+1. ✅ `src/graph/mod.rs` (new) + `pub mod graph;` in `lib.rs`.
+2. ✅ `src/graph/edges.rs` (new): `EDGES_TABLE`, `edges_table_def()`,
+   `edge_row()`, `ensure_edges_table()` (idempotent, called from
+   `Engine::open()`). Reuses `sql::executor::encode_row`/`decode_row`
+   verbatim — no new tag byte.
+3. ✅ `src/graph/index.rs` (new): `EdgeIndex` (plain `HashMap<i64,
+   Vec<RowId>>`, synchronous — no background worker, unlike M2) +
+   `resolve_candidates_batched` (built batched from the start, per the
+   plan, rather than shipping a naive version first).
+4. ✅ `Engine::create_edge`/`delete_edge` (`lib.rs`): reconstruct their own
+   `Heap::from_pages` against `__edges__`'s catalog page list — deliberately
+   not `self.heap`, which has no table concept.
+5. ✅ `rebuild_edge_index` (`lib.rs`): synchronous rebuild-on-open, mirroring
+   `rebuild_secondary_indexes`'s shape but with no channel/worker/status.
+6. ✅ `Engine::edges_from` (`lib.rs`): MVCC-filtered traversal via
+   `resolve_candidates_batched`.
+7. ✅ Tests: idempotent table creation, create/delete/traversal round-trip,
+   index rebuild-on-reopen, empty-`from_id` returns empty,
+   `__edges__` ordinary-SQL-queryable.
+8. ✅ M3.a checkpoint verification: 168 unit + 10 crash + 3 `index_rebuild`
+   + 1 `vector_mvcc` (182 total) green, clippy/fmt clean, release build OK.
+
+**M3.a done when:** `create_edge`/`delete_edge`/`edges_from` round-trip
+correctly ✅, the index rebuilds on reopen from committed rows ✅, deleted
+edges are absent from both the index and traversal results ✅, all tests
+green ✅.
+
+## M3.b task breakdown (ordered — all complete)
+
+1. ✅ `tests/graph_locking.rs` (new): confirmed per-edge locking needs zero
+   new code — concurrent edge deletes conflict immediately (D12), an edge
+   lock and an unrelated table's row lock never collide, locks release
+   correctly on both commit and abort. See the design note above for the
+   `WriteConflict`-shares-one-shape gotcha found while writing these.
+2. ✅ `MEMORY.md` design note (see above) on why no `RecordKind::GraphEdge`
+   variant was needed — `RecordId::row`'s lock key is already globally
+   unique across every table.
+3. ✅ `benches/graph.rs` (new): `adjacency_scan` before/after benchmark
+   (naive vs. `resolve_candidates_batched`) — a real ~9.3–9.7x win at
+   1,000/10,000-edge hot hubs, not assumed (see design note above);
+   `edge_insert` uncontended throughput.
+4. ✅ M3.b checkpoint verification: 168 unit + 10 crash + 4 `graph_locking`
+   + 3 `index_rebuild` + 1 `vector_mvcc` (186 total) green, clippy/fmt
+   clean, release build OK.
+
+**M3.b done when:** locking tests pass proving zero new locking code was
+needed ✅, `edges_from` is wired to the batched resolver ✅ (done in M3.a),
+a recorded before/after benchmark number exists for a hot-hub workload ✅.
+
+---
+
 ## Open questions / pending human input
 
 - **Decide: fix the read-only-transaction fsync now, or carry it into M2?**
@@ -803,6 +916,46 @@ test passes ✅; rebuild-after-restart and mid-rebuild-staleness tests pass
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-06 — M3.a and M3.b complete
+
+- M3 (graph) planning: three parallel research passes (lockmgr/catalog/heap
+  reuse, SQL-layer extension points, Cypher-parser crate landscape) plus a
+  Plan agent, confirmed against the actual source rather than assumed.
+  Two decisions confirmed with the user: opaque `i64` node IDs only (no
+  property-graph joins), and Postgres with an indexed adjacency-list table
+  as the M3 benchmark baseline (mirroring M2's pgvector precedent).
+- **M3.a — edge storage foundation**: graph edges stored as ordinary rows
+  in a synthetic `__edges__` system table, auto-created at `Engine::open()`
+  — zero new storage-layer code, full MVCC/WAL/crash-recovery/SQL-query
+  ability for free. Synchronous in-memory edge-list index (no async worker
+  — unlike M2, a `HashMap` insert doesn't need one). Committed as PR #1
+  (`m3-graph-edge-storage` branch, merged via GitHub).
+- **M3.b — locking verification + batch-latch**: confirmed, via tests not
+  just code inspection, that per-edge locking needs zero new code
+  (`RecordId::row`'s lock key is already globally unique across every
+  table — no `RecordKind::GraphEdge` variant needed). Found and fixed a
+  test-writing mistake along the way: `heap.rs::delete`'s two distinct
+  conflict checks intentionally share one `WriteConflict` error shape, so
+  a test trying to distinguish them by variant was wrong, not the code.
+  Benchmarked the batch-latch adjacency scan honestly (not assumed) and
+  found a real, large win: ~9.3–9.7x faster than naive per-candidate
+  resolution at 1,000/10,000-edge hot hubs, tracking the measured
+  edges-per-page ratio closely.
+- **Workflow note**: this session's PR request surfaced that `main` had no
+  feature-branch workflow all session (M0–M2 were committed directly to
+  `main`). Resolved by creating `m3-graph-edge-storage` off `main` for
+  M3.a, which the user reviewed and merged via GitHub's UI (PR #1) — local
+  `main` was then fast-forwarded to match. M3.b continued as a direct
+  commit to `main`, per explicit user instruction to resume the established
+  pattern.
+- **Final state:** 168 unit tests + 10 crash-harness tests + 4
+  `graph_locking` + 3 `index_rebuild` + 1 `vector_mvcc` (186 total) green,
+  `cargo clippy --all-targets -- -D warnings` clean, `cargo fmt --all
+  --check` clean, `cargo build --release` succeeds.
+- **Next:** M3.c — the Cypher subset (hand-rolled parser, `Engine::
+  execute_cypher`, reusing `predicate_matches`/`eval_expr` after promoting
+  them to `pub(crate)`).
 
 ### 2026-07-06 — M2.d complete; M2 milestone DONE
 
