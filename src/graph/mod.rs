@@ -4,4 +4,7 @@
 // in M3.c.
 
 pub mod edges;
+pub mod executor;
 pub mod index;
+pub mod logical;
+pub mod parser;

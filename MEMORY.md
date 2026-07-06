@@ -12,23 +12,23 @@
 
 ## Current status
 
-- **Milestone:** M1 and M2 are DONE. **M3 (graph) is underway — checkpoint
-  M3.a (edge storage foundation) is complete.** The approved plan lives at
+- **Milestone:** M1 and M2 are DONE. **M3 (graph) is underway — checkpoints
+  M3.a (edge storage), M3.b (locking + batch-latch), and M3.c (Cypher
+  subset) are all complete.** The approved plan lives at
   `/Users/sagarmahamuni/.claude/plans/misty-hugging-brook.md` (four
   checkpoints, M3.a–d).
-- **State:** 168 unit tests + 10 crash-harness tests + 3 `tests/
-  index_rebuild.rs` tests + 1 `tests/vector_mvcc.rs` test (182 total) all
-  green, `cargo clippy --all-targets -- -D warnings` clean, `cargo fmt
-  --all --check` clean, release build succeeds. Graph edges are stored as
-  ordinary rows in a synthetic `__edges__` system table (auto-created at
-  `Engine::open()`), with a synchronous in-memory edge-list index
-  (`from_id -> [RowId]`) rebuilt on every open. `Engine::create_edge`/
-  `delete_edge`/`edges_from` round-trip correctly and `__edges__` is
-  immediately ordinary-SQL-queryable with zero graph-specific code.
-- **Immediate next task:** M3.b is DONE (locking verification + batch-latch
-  benchmark). Next: M3.c — the Cypher subset (hand-rolled parser,
-  `Engine::execute_cypher`, reusing `sql::executor::predicate_matches`/
-  `eval_expr` after promoting them to `pub(crate)`).
+- **State:** 182 unit tests + 10 crash-harness tests + 4 `graph_locking` +
+  3 `index_rebuild` + 1 `vector_mvcc` (200 total) all green, `cargo clippy
+  --all-targets -- -D warnings` clean, `cargo fmt --all --check` clean,
+  release build succeeds. `Engine::execute_cypher(xid, "MATCH (a)-[:TYPE]
+  ->(b) WHERE ... RETURN ...")` works end-to-end: a `from_id = <literal>`
+  predicate routes through the edge-list index + batch-latch resolver, any
+  other query falls back to a full `__edges__` scan, and both paths reuse
+  `sql::executor::predicate_matches`/`eval_expr` verbatim.
+- **Immediate next task:** M3.d — `tests/graph_rebuild.rs`,
+  `tests/graph_mvcc.rs` (the aborted-edge MVCC-correctness test, this
+  milestone's single most important test), the Postgres adjacency-table
+  benchmark comparison, and milestone closeout in `PROGRESS.md`/`MEMORY.md`.
 - **Last updated:** 2026-07-06
 
 ### Design note: per-edge locking needed zero new code (M3.b)
@@ -93,6 +93,38 @@ research) is a real, non-negligible cost at hot-hub scale, and that
 grouping by page — not some more elaborate scheme — already captures
 nearly all of the available win, since the speedup closely tracks the
 edges-per-page ratio.
+
+### Design note: the Cypher subset reuses ExecCtx via an extra argument, not a new field (M3.c)
+
+The plan's original sketch had `graph::executor::execute` take just
+`(query, ctx: &mut ExecCtx)`, matching `sql::executor::execute`'s shape
+exactly. In practice, the index fast path needs read access to `EdgeIndex`,
+which `ExecCtx` (defined in `sql/executor.rs`) has no field for. Two
+options were considered: (a) add an `edge_index: Option<&EdgeIndex>` field
+to `ExecCtx` itself, mirroring how `index_worker: Option<&IndexHandle>` was
+added there in M2; or (b) pass `edge_index` as a separate explicit
+parameter to `graph::executor::execute` alongside `ctx`. Went with (b):
+it keeps `sql::executor::ExecCtx`'s definition exactly what M1/M2 already
+built (pure storage/transaction infra, no graph-specific field), and the
+borrow checker is fine with it — `ExecCtx`'s fields are constructed as
+individual `&mut self.foo` borrows in `Engine::execute_cypher`, none of
+which touch `self.edge_index`, so a separate `&self.edge_index` borrow
+coexists with the `&mut ExecCtx` cleanly (Rust's field-level disjoint
+borrows, not `&mut self` as a whole).
+
+One real, planned-for cross-module touch was needed to make the reuse
+work: `predicate_matches`/`eval_expr` were private `fn`s in
+`sql/executor.rs` (confirmed during planning, not assumed) and were
+promoted to `pub(crate) fn` — the only change made to the SQL module for
+all of M3.c. Everything else (`ExecCtx`, `ExecResult`, `decode_row`,
+`Expr`/`CmpOp`/`Literal`) was already `pub`.
+
+The `:TYPE` filter from the `MATCH` pattern and the parsed `WHERE`
+predicate are AND'd together into one `full_predicate` before either
+execution path runs — so both the index fast path and the full-scan
+fallback apply type filtering and `WHERE` filtering through the exact same
+`predicate_matches` call on every candidate, with no special-casing for
+which source (index vs. scan) a row came from.
 
 ### Design note: read-only transactions pay an unnecessary commit fsync (found in M1.d)
 
@@ -816,6 +848,46 @@ green ✅.
 needed ✅, `edges_from` is wired to the batched resolver ✅ (done in M3.a),
 a recorded before/after benchmark number exists for a hot-hub workload ✅.
 
+## M3.c task breakdown (ordered — all complete)
+
+1. ✅ `src/graph/logical.rs` (new): `CypherQuery{from_var,to_var,edge_type,
+   predicate,returns}`, `ReturnItem{FromVar,ToVar,EdgeColumn}`.
+2. ✅ `src/graph/parser.rs` (new): hand-rolled tokenizer + recursive-descent
+   parser for `MATCH (a)-[:TYPE]->(b) WHERE <predicate> RETURN <items>` —
+   no external crate (see M3's planning notes: no viable Cypher-parsing
+   crate exists on crates.io). `-[]->` (empty brackets) matches any edge
+   type. `a.x`/`b.x` property access rejected with a clear error at parse
+   time, enforcing the opaque-node-IDs decision at the boundary rather than
+   leaving it to the executor to notice.
+3. ✅ `predicate_matches`/`eval_expr` promoted from private to `pub(crate)`
+   in `sql/executor.rs` — the one deliberate cross-module touch needed for
+   reuse (see design note above).
+4. ✅ `src/graph/executor.rs` (new): `execute(query, ctx, edge_index)`
+   reuses `sql::executor::ExecCtx`/`ExecResult`/`predicate_matches`
+   verbatim; `edge_index` passed as an extra argument rather than a new
+   `ExecCtx` field (see design note above for why). `find_from_id_eq`
+   (mirrors `sql/executor.rs`'s `find_near`) detects the index fast-path
+   opportunity; falls back to a full `__edges__` scan otherwise. The
+   `:TYPE` pattern filter and the `WHERE` predicate are AND'd into one
+   `full_predicate` before either path runs.
+5. ✅ `Engine::execute_cypher` (`lib.rs`): mirrors `execute_sql`'s exact
+   `ExecCtx` construction shape.
+6. ✅ Tests: parser (valid single-hop, empty-bracket wildcard type, AND'd
+   WHERE, edge-column RETURN, property-access rejection, case-insensitive
+   keywords, missing RETURN rejected) + `lib.rs` integration tests via the
+   real `Engine::execute_cypher` (index fast path, edge-type filtering,
+   full-scan fallback when no `from_id` equality is present, `RETURN
+   type, props`, property-access rejection end-to-end).
+7. ✅ M3.c checkpoint verification: 182 unit + 10 crash + 4
+   `graph_locking` + 3 `index_rebuild` + 1 `vector_mvcc` (200 total)
+   green, clippy/fmt clean, release build OK.
+
+**M3.c done when:** a `MATCH`/`WHERE`/`RETURN` query round-trips
+end-to-end through `Engine::execute_cypher` ✅, reuses `predicate_matches`/
+`eval_expr` with no duplicate evaluator ✅, the equality fast path is
+proven to hit the edge index ✅ (and the full-scan fallback is proven to
+work when it doesn't apply ✅), all tests green ✅.
+
 ---
 
 ## Open questions / pending human input
@@ -916,6 +988,33 @@ a recorded before/after benchmark number exists for a hot-hub workload ✅.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-06 — M3.c complete (Cypher subset)
+
+- Implemented all of M3.c: `src/graph/logical.rs` (`CypherQuery`,
+  `ReturnItem`), `src/graph/parser.rs` (hand-rolled tokenizer +
+  recursive-descent parser, no external crate — confirmed none exists
+  during M3 planning), `src/graph/executor.rs` (reuses
+  `sql::executor::predicate_matches`/`eval_expr` verbatim after promoting
+  them to `pub(crate)`), `Engine::execute_cypher`.
+- One real design deviation from the plan's literal sketch, resolved
+  deliberately: `graph::executor::execute` takes `edge_index` as an
+  explicit extra argument rather than a new `ExecCtx` field, keeping
+  `sql::executor::ExecCtx` exactly the storage/transaction infra M1/M2
+  already built — see the design note above.
+- `MATCH (a)-[:TYPE]->(b) WHERE ... RETURN ...` round-trips end-to-end:
+  a `from_id = <literal>` predicate routes through the M3.a/M3.b edge-list
+  index + batch-latch resolver, everything else falls back to a full
+  `__edges__` scan, and both paths apply the identical `:TYPE`+`WHERE`
+  predicate through one shared `predicate_matches` call — no special
+  casing for which path a candidate came from.
+- **Final state:** 182 unit tests + 10 crash-harness tests + 4
+  `graph_locking` + 3 `index_rebuild` + 1 `vector_mvcc` (200 total) green,
+  `cargo clippy --all-targets -- -D warnings` clean, `cargo fmt --all
+  --check` clean, `cargo build --release` succeeds.
+- **Next:** M3.d — `tests/graph_rebuild.rs`, `tests/graph_mvcc.rs` (the
+  aborted-edge MVCC-correctness test), the Postgres adjacency-table
+  benchmark comparison, and M3 milestone closeout.
 
 ### 2026-07-06 — M3.a and M3.b complete
 

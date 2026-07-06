@@ -625,7 +625,7 @@ fn set_column(
 
 // ── expression evaluation ────────────────────────────────────────────────────
 
-fn predicate_matches(
+pub(crate) fn predicate_matches(
     predicate: &Option<Expr>,
     columns: &[ColumnDef],
     row: &[Literal],
@@ -636,7 +636,7 @@ fn predicate_matches(
     }
 }
 
-fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Literal]) -> Result<Literal> {
+pub(crate) fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Literal]) -> Result<Literal> {
     match expr {
         Expr::Column(name) => {
             let idx = columns

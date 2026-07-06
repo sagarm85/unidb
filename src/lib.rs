@@ -32,7 +32,9 @@ use crate::{
     format::{Xid, DEFAULT_PAGE_SIZE},
     graph::{
         edges::{self, Edge},
+        executor as graph_executor,
         index::{resolve_candidates_batched, EdgeIndex},
+        parser::parse_cypher,
     },
     heap::Heap,
     index_worker::{IndexHandle, IndexMsg},
@@ -187,6 +189,30 @@ impl Engine {
             results.push(executor::execute(plan, &mut ctx)?);
         }
         Ok(results)
+    }
+
+    /// Parse and execute one Cypher query (M3.c): `MATCH (a)-[:TYPE]->(b)
+    /// WHERE <predicate> RETURN <items>`. Mirrors `execute_sql`'s exact
+    /// `ExecCtx` construction — single-statement only in v1, but returns
+    /// `Vec<ExecResult>` for API symmetry and future multi-statement
+    /// headroom.
+    pub fn execute_cypher(&mut self, xid: Xid, query: &str) -> Result<Vec<ExecResult>> {
+        let page_size = self.control.page_size as usize;
+        let parsed = parse_cypher(query)?;
+        let mut ctx = ExecCtx {
+            catalog: &mut self.catalog,
+            txn_mgr: &mut self.txn_mgr,
+            pool: &mut self.pool,
+            wal: &mut self.wal,
+            lock_mgr: &mut self.lock_mgr,
+            control_path: &self.control_path,
+            control: &mut self.control,
+            page_size,
+            xid,
+            index_worker: Some(&self.index_worker),
+        };
+        let result = graph_executor::execute(parsed, &mut ctx, &self.edge_index)?;
+        Ok(vec![result])
     }
 
     /// Attach a row-level-security policy to a table (M1: Rust API only,
@@ -1253,5 +1279,122 @@ mod tests {
         let xid = engine2.begin().unwrap();
         let edges = engine2.edges_from(xid, 1).unwrap();
         assert_eq!(edges.len(), 2);
+    }
+
+    // ── M3.c: Cypher subset ──────────────────────────────────────────────────
+
+    #[test]
+    fn execute_cypher_match_where_return_uses_index_fast_path() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        engine.create_edge(xid, 1, 2, "KNOWS", "{}").unwrap();
+        engine.create_edge(xid, 1, 3, "KNOWS", "{}").unwrap();
+        engine.create_edge(xid, 99, 100, "KNOWS", "{}").unwrap();
+        engine.commit(xid).unwrap();
+
+        let xid2 = engine.begin().unwrap();
+        let results = engine
+            .execute_cypher(xid2, "MATCH (a)-[:KNOWS]->(b) WHERE a = 1 RETURN b")
+            .unwrap();
+        match &results[0] {
+            SqlResult::Rows(rows) => {
+                let mut to_ids: Vec<i64> = rows
+                    .iter()
+                    .map(|r| match &r[0] {
+                        Literal::Int(n) => *n,
+                        other => panic!("expected Int, got {other:?}"),
+                    })
+                    .collect();
+                to_ids.sort();
+                assert_eq!(to_ids, vec![2, 3]);
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_cypher_filters_by_edge_type() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        engine.create_edge(xid, 1, 2, "KNOWS", "{}").unwrap();
+        engine.create_edge(xid, 1, 3, "LIKES", "{}").unwrap();
+        engine.commit(xid).unwrap();
+
+        let xid2 = engine.begin().unwrap();
+        let results = engine
+            .execute_cypher(xid2, "MATCH (a)-[:LIKES]->(b) WHERE a = 1 RETURN b")
+            .unwrap();
+        match &results[0] {
+            SqlResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Literal::Int(3));
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_cypher_without_from_id_predicate_falls_back_to_full_scan() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        engine.create_edge(xid, 1, 2, "KNOWS", "{}").unwrap();
+        engine.create_edge(xid, 5, 6, "KNOWS", "{}").unwrap();
+        engine.commit(xid).unwrap();
+
+        // No `a = ...` equality anywhere — `find_from_id_eq` finds nothing,
+        // so this must go through the full-`__edges__`-scan fallback path,
+        // not the index fast path, and still return every matching edge.
+        let xid2 = engine.begin().unwrap();
+        let results = engine
+            .execute_cypher(xid2, "MATCH (a)-[:KNOWS]->(b) RETURN a, b")
+            .unwrap();
+        match &results[0] {
+            SqlResult::Rows(rows) => assert_eq!(rows.len(), 2),
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_cypher_returns_edge_type_and_props() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        engine
+            .create_edge(xid, 1, 2, "KNOWS", "{\"since\":2020}")
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        let xid2 = engine.begin().unwrap();
+        let results = engine
+            .execute_cypher(
+                xid2,
+                "MATCH (a)-[:KNOWS]->(b) WHERE a = 1 RETURN b, type, props",
+            )
+            .unwrap();
+        match &results[0] {
+            SqlResult::Rows(rows) => {
+                assert_eq!(rows[0][0], Literal::Int(2));
+                assert_eq!(rows[0][1], Literal::Text("KNOWS".to_string()));
+                assert_eq!(rows[0][2], Literal::Json("{\"since\":2020}".to_string()));
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_cypher_rejects_property_access() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        let err = engine
+            .execute_cypher(
+                xid,
+                "MATCH (a)-[:KNOWS]->(b) WHERE a.name = 'alice' RETURN b",
+            )
+            .unwrap_err();
+        assert!(matches!(err, DbError::SqlUnsupported(_)));
     }
 }
