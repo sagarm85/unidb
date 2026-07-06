@@ -76,6 +76,15 @@ pub enum DbError {
 
     #[error("catalog is corrupt: {0}")]
     CatalogCorrupt(String),
+
+    /// Only ever produced by the optional M5 server layer
+    /// (`src/server/engine_handle.rs`): the dedicated writer thread that
+    /// owns the `Engine` has stopped responding (its channel is closed —
+    /// most likely it panicked). There is no in-process recovery from this;
+    /// per M5's design notes, the expected remedy is a process-level
+    /// restart, not retrying against the same `EngineHandle`.
+    #[error("engine is unavailable: the writer thread has stopped responding")]
+    EngineUnavailable,
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;

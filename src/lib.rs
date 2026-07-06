@@ -1,3 +1,39 @@
+//! unidb: a single embedded storage/transaction engine that unifies
+//! relational CRUD, vector search (HNSW), graph edges, and a WAL-derived
+//! event queue over **one** page store, one WAL, one buffer pool, and one
+//! transaction manager. A single transaction can touch all four data
+//! models atomically, because there is only one node and one log — see
+//! `CLAUDE.md` for the full design rationale and locked decisions.
+//!
+//! [`Engine`] is the sole entry point. Every operation takes an explicit
+//! `Xid` obtained from [`Engine::begin`] (or [`Engine::begin_with_isolation`])
+//! and must be finished with [`Engine::commit`] or [`Engine::abort`] — there
+//! is no implicit transaction anywhere in this crate. The public API groups
+//! into:
+//! - **Lifecycle**: [`Engine::open`], [`Engine::checkpoint`], [`Engine::flush`].
+//! - **Transactions**: [`Engine::begin`], [`Engine::begin_with_isolation`],
+//!   [`Engine::commit`], [`Engine::abort`].
+//! - **Raw CRUD**: [`Engine::insert`], [`Engine::get`], [`Engine::update`],
+//!   [`Engine::delete`] — untyped byte-slice rows, the lowest-level API.
+//! - **SQL**: [`Engine::execute_sql`] (a practical subset — see `CLAUDE.md`
+//!   §1's non-goals; not full ANSI SQL). Accepts a full `;`-separated
+//!   multi-statement string executed atomically under one `xid`.
+//! - **Graph**: [`Engine::execute_cypher`] (a Cypher subset), plus the
+//!   lower-level [`Engine::create_edge`]/[`Engine::delete_edge`]/
+//!   [`Engine::edges_from`].
+//! - **Event queue**: [`Engine::enable_events`], [`Engine::poll_events`]/
+//!   [`Engine::ack_events`] (Kafka-style manual-commit consumer offsets),
+//!   [`Engine::vacuum_events`].
+//! - **Secondary indexing**: [`Engine::set_column_index`],
+//!   [`Engine::index_status`].
+//! - **Row-level security**: [`Engine::set_rls_policy`] (Rust-API only, no
+//!   SQL `CREATE POLICY` surface — see the module doc on `catalog.rs`).
+//!
+//! An optional REST/JWT/SSE/metrics server built on top of this crate lives
+//! behind the `server` Cargo feature (`src/server/`, `src/bin/
+//! unidb-server.rs`) — the engine itself never depends on an async runtime;
+//! see `CLAUDE.md`'s "tokio (M5 server only — the engine stays sync)" note.
+
 // unsafe_code is denied crate-wide; mmap.rs is the sole exception (CLAUDE.md §4).
 #![deny(unsafe_code)]
 
@@ -18,6 +54,8 @@ pub mod mvcc;
 pub mod page;
 pub mod queue;
 pub mod recovery;
+#[cfg(feature = "server")]
+pub mod server;
 pub mod sql;
 pub mod txn;
 pub mod vector;
@@ -71,6 +109,23 @@ pub struct Engine {
     edge_index: EdgeIndex,
     next_event_seq: u64,
 }
+
+/// `Engine` must be movable into another thread's ownership (M5: the
+/// optional server's writer thread takes exclusive, lifelong ownership of
+/// one `Engine` — see `src/server/engine_handle.rs`). This is a
+/// compiler-enforced fact, not an assumption: every field is owned data or
+/// a standard-library/`memmap2` type with no `Rc`/`RefCell`/raw pointer, so
+/// `Send` already holds automatically — this line just turns "believed
+/// true" into "verified at every compile," so a future field addition that
+/// broke it would fail to build immediately rather than silently. `Engine`
+/// deliberately does *not* need (and is not asserted) `Sync` — the
+/// writer-thread design gives exactly one thread ownership for the whole
+/// lifetime of the value, so concurrent access from multiple threads is
+/// never required.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<Engine>();
+};
 
 impl Drop for Engine {
     fn drop(&mut self) {
@@ -617,14 +672,21 @@ impl Engine {
         self.begin_with_isolation(IsolationLevel::ReadCommitted)
     }
 
+    /// Begin a new transaction under an explicit isolation level (RC or RR,
+    /// D10). The returned `xid` must eventually reach [`Self::commit`] or
+    /// [`Self::abort`] — there is no timeout or automatic cleanup.
     pub fn begin_with_isolation(&mut self, isolation: IsolationLevel) -> Result<Xid> {
         self.txn_mgr.begin(isolation, &mut self.wal)
     }
 
+    /// Commit `xid`, releasing every lock it held. `xid` is finished after
+    /// this call and must not be reused.
     pub fn commit(&mut self, xid: Xid) -> Result<()> {
         self.txn_mgr.commit(xid, &mut self.wal, &mut self.lock_mgr)
     }
 
+    /// Abort `xid`, physically undoing its writes and releasing every lock
+    /// it held. `xid` is finished after this call and must not be reused.
     pub fn abort(&mut self, xid: Xid) -> Result<()> {
         self.txn_mgr.abort(
             xid,
@@ -635,6 +697,11 @@ impl Engine {
         )
     }
 
+    /// Insert one untyped byte-slice row, the lowest-level write primitive
+    /// in this crate. Requires an already-open `xid` (from [`Self::begin`]
+    /// or [`Self::begin_with_isolation`]); does not itself begin, commit,
+    /// or abort anything — the caller owns the transaction's whole
+    /// lifetime, exactly like every other method taking an `xid` parameter.
     pub fn insert(&mut self, xid: Xid, data: &[u8]) -> Result<RowId> {
         let rid = self.heap.insert(data, xid, &mut self.pool, &mut self.wal)?;
         self.txn_mgr.record_undo(
@@ -647,6 +714,11 @@ impl Engine {
         Ok(rid)
     }
 
+    /// Read one row by `RowId`, MVCC-filtered against `xid`'s snapshot.
+    /// Requires an already-open `xid`; a purely-read call still needs one
+    /// (there is no snapshot without a transaction) — the caller is
+    /// responsible for eventually calling [`Self::commit`] or
+    /// [`Self::abort`] on it, even for a read-only `xid`.
     pub fn get(&mut self, xid: Xid, row_id: RowId) -> Result<Vec<u8>> {
         let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
         self.heap.get(row_id, &snapshot, xid, &mut self.pool)
@@ -681,6 +753,8 @@ impl Engine {
         Ok(new_rid)
     }
 
+    /// Delete one row by `RowId`. Requires an already-open `xid`; does not
+    /// commit or abort it.
     pub fn delete(&mut self, xid: Xid, row_id: RowId) -> Result<()> {
         self.heap.delete(
             row_id,
@@ -699,6 +773,10 @@ impl Engine {
         Ok(())
     }
 
+    /// Flush dirty pages, write a checkpoint WAL record, update the control
+    /// file, and truncate the WAL. Operational/administrative — takes no
+    /// `xid`, is not part of any user transaction's lifecycle, and is safe
+    /// to call at any time (it only touches already-committed state).
     pub fn checkpoint(&mut self) -> Result<()> {
         checkpoint::run(
             &mut self.pool,

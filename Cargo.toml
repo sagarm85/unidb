@@ -15,6 +15,16 @@ serde_json = "1.0.150"
 serde = { version = "1.0.228", features = ["derive"] }
 instant-distance = "0.6.1"
 
+# M5: optional server (src/server/, src/bin/unidb-server.rs). All gated
+# behind the `server` feature so a default `cargo build`/`cargo test` never
+# pulls in an async runtime — "the engine stays sync" (CLAUDE.md) is
+# literally true for the default embedded build, not just true when the
+# feature happens to be off.
+tokio = { version = "1.52", optional = true, features = ["sync", "rt", "macros"] }
+
+[features]
+server = ["dep:tokio"]
+
 [dev-dependencies]
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
