@@ -93,8 +93,83 @@ _Baseline note: SQLite is the honest M0/M1 comparison (both embedded, single-fil
 
 ---
 
-## M1 — MVCC + CRUD   [PLANNED]
-_Transactions; READ COMMITTED default / REPEATABLE READ available; `on_read`/`on_write` seam (no-op) for future SSI; catalog; SQL subset. JSON columns + RLS folded in. Baseline: SQLite._
+## M1 — MVCC + CRUD   [DONE]   2026-07-06
+
+**PR:** _pending (not yet opened; benchmarks recorded ahead of PR per session workflow)_
+**Summary:** Transactional MVCC on top of M0's storage core — READ COMMITTED
+default / REPEATABLE READ available (D10), SI's abort-on-conflict conflict
+handling (D12), the `on_read`/`on_write` seam for future SSI (D11), a
+catalog, and a SQL subset (`CREATE TABLE`/`INSERT`/`SELECT`/`UPDATE`/
+`DELETE`) with RLS folded in as a planner rewrite and JSON columns
+supporting `->`/`->>` path extraction. Shipped as four internal checkpoints
+(M1.a MVCC core, M1.b conflict handling, M1.c catalog+SQL, M1.d hardening).
+
+**Benchmarks** (release build, Apple Silicon macOS, single-threaded, real fsync per commit, 10 samples):
+
+| Workload                                | Throughput (ops/s) | p50 (ms/op) | Peak RSS | M0 comparison       | Baseline (SQLite) |
+|------------------------------------------|--------------------|-------------|----------|----------------------|-------------------|
+| single-table INSERT (own txn per op)    | ~155–162 elem/s    | ~6.2–6.5    | ~27.0 MB | ~2.0x slower than M0 | ~4,600–4,970 elem/s |
+| point SELECT by key (own txn per op)    | ~328 elem/s        | 3.05        | ~27.0 MB | ~3,570x slower¹      | ~330K elem/s (Python driver) |
+| UPDATE by key (own txn per op)          | ~154 elem/s        | 6.38        | ~27.0 MB | ~2.1x slower than M0 | ~4,970 elem/s |
+| contention: conflict + abort + retry²   | ~65 elem/s         | 15.44       | ~27.0 MB | n/a (new in M1)      | n/a (new in M1) |
+
+¹ **This is the headline finding of M1's benchmark pass, not a red flag to
+  paper over.** M0's point SELECT was a pure in-memory read (855ns). M1's
+  wraps the same read in `begin()`/`commit()` — and `commit()` unconditionally
+  calls `wal.commit_user_txn()`, which fsyncs, even though a read-only
+  transaction wrote nothing that needs to become durable. That single
+  unnecessary fsync (~3ms) is the entire regression. **Tracked as a real,
+  fixable inefficiency** (see Known limitations below), not fixed in M1
+  since it wasn't part of the agreed M1 scope.
+² New in M1: two "concurrent" (interleaved, single-threaded) transactions
+  race for one row; the second aborts immediately per SI (D12) and retries
+  against the now-current version. Cost is dominated by 5 fsyncs per cycle
+  (2 mini-txn commits + 3 user-txn commits/aborts) — consistent with the
+  ~3ms-per-fsync cost observed elsewhere in this table.
+
+**Why INSERT/UPDATE are ~2x slower than M0, not more:** each benchmark
+iteration is a *single-statement transaction* (`begin()` → one op →
+`commit()`), which is the worst case for M1's overhead — it pays both the
+existing per-statement mini-txn fsync (D2, unchanged from M0) **and** a new
+per-transaction `WAL_TXN_COMMIT` fsync (M1) on every single operation. A
+transaction batching multiple statements before one commit would amortize
+the second fsync across all of them and approach M0's original per-op cost
+— this benchmark deliberately does not do that, to measure the worst case
+honestly rather than flatter the number.
+
+**Crash harness:** P1–P5 (M0), P6/P7 (M1.a, user-txn boundaries), P9 (M1.b,
+crash mid-undo) — all 10 crash tests green, plus a new combined crash+MVCC
+property test (`property_crash_recovery_reflects_only_committed_transactions`)
+running random `BEGIN`/`INSERT`/`COMMIT`/`ROLLBACK` sequences with random
+crash points across 6 seeds; recovered state exactly matches the transactions
+that reached `WAL_TXN_COMMIT` in every case.
+
+**What changed:** tuple versioning (xmin/xmax/prev-chain), transaction
+manager, lock manager, catalog, SQL parser/planner/executor — see `MEMORY.md`
+for the full module-by-module breakdown across all four checkpoints.
+
+**Known limitations / tech debt:**
+- **Read-only transactions pay a full commit fsync for nothing** (see
+  footnote 1) — the fix is straightforward (skip `WAL_TXN_COMMIT`/fsync in
+  `TransactionManager::commit` when the transaction's undo log is empty,
+  i.e., it never wrote anything) but wasn't in M1's agreed scope. Flagged
+  here explicitly so it doesn't get lost.
+- No vacuum/GC (dead tuple versions accumulate); no wait queue/deadlock
+  detection in the lock manager (deliberate, D12); RC's EvalPlanQual-style
+  re-evaluation path is unimplemented; catalog DDL is not transactional.
+  See `MEMORY.md`'s "Known issues / tech debt" for the complete, current list.
+**Deferred to later milestones:** vector/text search (M2), graph (M3), event
+queue (M4), API/server (M5). Group-commit/WAL-batching and the read-only-txn
+fsync fix are both real, identified throughput opportunities not scheduled
+against a specific milestone yet.
+**Locked-decision changes (if any):** none. (`FORMAT_VERSION` 1→2 for the
+tuple header extension is a version bump under D9's own rules, not a
+re-litigation of a locked decision — no migration path needed since M0 never
+shipped externally.)
+
+_Baseline note: SQLite remains the honest M1 comparison (both embedded, single-file). The replaced-stack benchmark (Postgres + vector + graph + queue) becomes the headline from M2, when cross-domain transactions exist — see `CLAUDE.md` §6._
+
+---
 
 ## M2 — Vector & Text search   [PLANNED]
 _`VECTOR(n)` + async background HNSW; `NEAR`; full-text inverted index. **Headline baseline switches to the replaced stack.**_

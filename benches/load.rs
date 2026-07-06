@@ -85,5 +85,46 @@ fn bench_update(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_insert, bench_select, bench_update);
+/// M1.d: transactional contention workload — measures the cost of SI's
+/// abort-on-conflict + retry pattern (D12), not just uncontended CRUD. The
+/// engine is single-threaded (sync-only per CLAUDE.md), so "contention"
+/// here means interleaved sessions on one thread, not real parallelism:
+/// xid_a and xid_b both hold open transactions; xid_a updates a row, xid_b's
+/// attempt on the same row hits the lock and aborts immediately (no
+/// blocking, per D12), then retries against the now-current version.
+fn bench_contention(c: &mut Criterion) {
+    let mut group = c.benchmark_group("contention");
+    let dir = tempdir().unwrap();
+    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let setup_xid = engine.begin().unwrap();
+    let mut rid = engine.insert(setup_xid, b"initial").unwrap();
+    engine.commit(setup_xid).unwrap();
+
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("update_conflict_abort_retry", |b| {
+        b.iter(|| {
+            let xid_a = engine.begin().unwrap();
+            let xid_b = engine.begin().unwrap(); // concurrent session, already open
+            let new_rid = engine.update(xid_a, rid, b"a-wins").unwrap();
+            if engine.update(xid_b, rid, b"b-loses").is_err() {
+                engine.abort(xid_b).unwrap();
+            }
+            engine.commit(xid_a).unwrap();
+
+            let xid_b2 = engine.begin().unwrap();
+            let final_rid = engine.update(xid_b2, new_rid, b"b-retry-wins").unwrap();
+            engine.commit(xid_b2).unwrap();
+            rid = final_rid;
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_insert,
+    bench_select,
+    bench_update,
+    bench_contention
+);
 criterion_main!(benches);

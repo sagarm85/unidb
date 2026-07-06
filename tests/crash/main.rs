@@ -341,3 +341,111 @@ fn committed_rows_survive_after_reopen() {
         assert_eq!(data, expected.to_le_bytes());
     }
 }
+
+// ── property: crash+MVCC — recovered DB reflects exactly the transactions
+// that reached WAL_TXN_COMMIT (M1.d) ─────────────────────────────────────────
+//
+// Random BEGIN/INSERT/COMMIT/ROLLBACK sequences (a self-contained LCG, no
+// new dependency, since this is test-only and reproducibility only needs a
+// fixed seed) up to a random "crash point," simulated by simply stopping —
+// sometimes mid-transaction (no commit/abort call at all, exercising the
+// same incomplete-user-txn path as P6/P9), sometimes right after a
+// transaction finishes (exercising ordinary redo). After reopening
+// (recovery runs), every row from a transaction we know committed must be
+// present with the correct bytes; every row from a transaction that was
+// explicitly rolled back, or never got a chance to reach WAL_TXN_COMMIT
+// before the simulated crash, must be permanently invisible.
+
+struct Lcg(u64);
+
+impl Lcg {
+    fn next_u64(&mut self) -> u64 {
+        // Numerical Recipes LCG constants — good enough for test-only
+        // pseudo-randomness, not for anything security-sensitive.
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0
+    }
+
+    fn next_range(&mut self, n: u64) -> u64 {
+        self.next_u64() % n
+    }
+}
+
+fn run_property_case(seed: u64) {
+    let dir = tempdir().unwrap();
+    let mut rng = Lcg(seed);
+
+    let mut committed: Vec<(RowId, Vec<u8>)> = Vec::new();
+    let mut rejected: Vec<RowId> = Vec::new();
+
+    {
+        let mut engine = open(dir.path());
+        let num_txns = 5 + rng.next_range(5) as usize; // 5..=9
+        let crash_after = rng.next_range(num_txns as u64) as usize;
+
+        'txns: for txn_idx in 0..num_txns {
+            let xid = engine.begin().unwrap();
+            let mut local: Vec<(RowId, Vec<u8>)> = Vec::new();
+            let num_ops = 1 + rng.next_range(3) as usize; // 1..=3
+            for op_idx in 0..num_ops {
+                let data = format!("seed{seed}-txn{txn_idx}-op{op_idx}").into_bytes();
+                let rid = engine.insert(xid, &data).unwrap();
+                local.push((rid, data));
+            }
+
+            if txn_idx == crash_after && rng.next_range(2) == 0 {
+                // Crash mid-transaction: no commit, no abort call at all.
+                // Its mini-txns are durably logged (D2), but WAL_TXN_COMMIT
+                // never gets written — recovery must undo it entirely.
+                for (rid, _) in local {
+                    rejected.push(rid);
+                }
+                break 'txns;
+            }
+
+            if rng.next_range(10) < 8 {
+                engine.commit(xid).unwrap();
+                committed.extend(local);
+            } else {
+                engine.abort(xid).unwrap();
+                for (rid, _) in local {
+                    rejected.push(rid);
+                }
+            }
+
+            if txn_idx == crash_after {
+                break 'txns; // crash right after this transaction finished
+            }
+        }
+        // "Crash": drop without an explicit flush, so recovery must redo
+        // from the WAL, not just read already-flushed pages.
+    }
+
+    let mut engine = open(dir.path());
+    let xid = engine.begin().unwrap();
+    for (rid, expected) in &committed {
+        let data = engine
+            .get(xid, *rid)
+            .unwrap_or_else(|e| panic!("seed {seed}: committed row {rid:?} missing: {e}"));
+        assert_eq!(
+            &data, expected,
+            "seed {seed}: committed row {rid:?} has wrong data"
+        );
+    }
+    for rid in &rejected {
+        assert!(
+            engine.get(xid, *rid).is_err(),
+            "seed {seed}: rolled-back/incomplete row {rid:?} must not be visible"
+        );
+    }
+}
+
+#[test]
+fn property_crash_recovery_reflects_only_committed_transactions() {
+    for seed in [1u64, 42, 12345, 999_999, 7, 2024] {
+        run_property_case(seed);
+    }
+}

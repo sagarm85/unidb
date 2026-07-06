@@ -12,26 +12,40 @@
 
 ## Current status
 
-- **Milestone:** M0 done. M1 — MVCC + CRUD in progress. **Checkpoints M1.a
-  (MVCC core), M1.b (SI abort-on-conflict), and M1.c (catalog + SQL subset)
-  are all DONE.** The project is SQL-queryable for the first time. Next up:
-  checkpoint M1.d (RLS hardening already done as part of M1.c; remaining
-  M1.d scope is the full combined crash+MVCC property test and closing out
-  M1's own benchmark table). Staged per the approved plan at
-  `/Users/sagarmahamuni/.claude/plans/misty-hugging-brook.md`.
-- **State:** All M1.a + M1.b + M1.c tasks complete. 112 unit tests + 9
-  crash-harness tests (P1–P9) all green, `cargo clippy --all-targets -- -D
-  warnings` clean, `cargo fmt --all --check` clean, release build succeeds.
-- **Immediate next task:** M1.d — the combined crash+MVCC property test
-  (random `BEGIN/INSERT/UPDATE/DELETE/COMMIT/ROLLBACK` sequences with random
-  crash points), then extend `benches/load.rs` with transactional
-  contention workloads and fill in M1's benchmark table in `PROGRESS.md`
-  before declaring the whole M1 milestone done. RC's EvalPlanQual-style
-  re-evaluation path (D12) remains a documented, tracked gap — see the
-  design note below — not required before M1.d closes out, since it's a
-  correctness refinement for a specific concurrency pattern, not a blocker
-  for "SQL works end-to-end."
+- **Milestone:** **M1 — MVCC + CRUD is DONE** (all four checkpoints: M1.a
+  MVCC core, M1.b SI abort-on-conflict, M1.c catalog + SQL subset, M1.d
+  hardening + benchmarks). The project is SQL-queryable, transactional, and
+  benchmarked end-to-end. M2 (vector & text search) has not been started.
+- **State:** 112 unit tests + 10 crash-harness tests (P1–P9 plus the
+  combined crash+MVCC property test) all green, `cargo clippy --all-targets
+  -- -D warnings` clean, `cargo fmt --all --check` clean, release build
+  succeeds. M1's benchmark table recorded in `PROGRESS.md`.
+- **Immediate next task:** Start M2 planning (vector search: `VECTOR(n)`
+  type, async background HNSW index, `NEAR` operator, full-text inverted
+  index) — no M2 work has begun. Before that, two identified-but-deferred
+  M1 items are worth a deliberate decision (fix now vs. carry forward, see
+  Open questions below): the read-only-transaction fsync inefficiency found
+  during M1.d's benchmark pass, and RC's EvalPlanQual re-evaluation path
+  (D12), which remains unimplemented.
 - **Last updated:** 2026-07-06
+
+### Design note: read-only transactions pay an unnecessary commit fsync (found in M1.d)
+
+Running M1's benchmarks (`benches/load.rs`) turned up a real, previously
+unnoticed inefficiency: point `SELECT` (a pure read, no writes at all) went
+from 855ns in M0 to 3.05ms in M1 — a ~3,570x regression, far more than the
+~2x expected from adding a transaction wrapper. Root cause:
+`TransactionManager::commit()` unconditionally calls `wal.commit_user_txn()`,
+which fsyncs, regardless of whether the transaction ever wrote anything. A
+read-only transaction has nothing that needs to become durable, so this
+fsync is pure waste — real databases (Postgres, SQLite) specifically avoid
+writing WAL records for read-only transaction commits for exactly this
+reason. **Not fixed in M1** (wasn't in the agreed scope, and fixing it
+properly means checking `Transaction.undo_log.is_empty()` at commit time
+and skipping `wal.commit_user_txn()`'s fsync — or the call entirely — when
+true, which touches `txn.rs`'s commit path CLAUDE.md would want reviewed
+rather than slipped in as a drive-by). Recorded in `PROGRESS.md`'s M1 entry
+and flagged in Open questions below so it doesn't get lost before M2.
 
 ### Design note: no separate "commit-time recheck" needed for SI conflict detection (M1.b)
 
@@ -307,11 +321,44 @@ rows end-to-end ✅ (`rls_policy_filters_rows` in `lib.rs`), data survives
 reopen via the catalog's persisted page list ✅ (`sql_survives_reopen`), all
 tests green ✅.
 
+## M1.d task breakdown (ordered — all complete)
+
+1. ✅ Combined crash+MVCC property test (`tests/crash/main.rs`, new): a
+   self-contained LCG (no new dependency) drives random `BEGIN`/`INSERT`/
+   `COMMIT`/`ROLLBACK` sequences across 6 seeds, crashing (just stopping)
+   at a random point — sometimes mid-transaction with no commit/abort call
+   at all, sometimes right after one finishes. Added `Hash` to `RowId`'s
+   derive to track expected rows in a `Vec`. Passed on the first run.
+2. ✅ Extended `benches/load.rs` with a `contention` benchmark group:
+   interleaved transactions racing for one row, second aborts immediately
+   (D12) and retries — measures the real cost of SI's conflict path, not
+   just uncontended CRUD.
+3. ✅ Ran the full benchmark suite (`--sample-size 10`, reduced from the
+   default 100 to keep wall-clock reasonable given fsync-dominated cost)
+   and recorded M1's metrics table in `PROGRESS.md`, including an M0
+   comparison. **Found a real bug in the process** — see the read-only-txn
+   fsync design note above — rather than just reporting the raw numbers.
+4. ✅ M1.d checkpoint verification: 112 unit tests + 10 crash tests (P1–P9
+   plus the new property test) green, clippy/fmt clean, release build OK.
+
+**M1.d done when:** the combined crash+MVCC property test passes ✅, M1's
+benchmark table is recorded with an honest M0 comparison ✅ (including
+reporting, not hiding, the read-only-txn regression found along the way),
+all tests green ✅ — closing out the M1 milestone as a whole.
+
 ---
 
 ## Open questions / pending human input
 
-- None blocking M1.d start.
+- **Decide: fix the read-only-transaction fsync now, or carry it into M2?**
+  (See the design note above and `PROGRESS.md`'s M1 entry.) It's a small,
+  well-understood fix (skip `wal.commit_user_txn()`'s fsync in
+  `TransactionManager::commit` when `Transaction.undo_log.is_empty()`), but
+  touches the commit path CLAUDE.md's conventions would want treated as a
+  deliberate change, not a drive-by — hence surfacing it here rather than
+  just fixing it.
+- **Decide: is catalog DDL's lack of transactionality acceptable to carry
+  into M2, or does it need addressing first?** (See below.)
 - Deferred-but-flagged for later milestones: slow-consumer-vs-vacuum durability
   contract (M4); filtered-HNSW vs over-fetch for RLS on `NEAR` (M2); SSI
   activation (post-M1, seam built in M1.a per D11, still all no-ops — M1.b's
@@ -333,6 +380,10 @@ tests green ✅.
 
 ## Known issues / tech debt
 
+- **Read-only transactions pay a full commit fsync for nothing** (found in
+  M1.d's benchmark pass — see design note above). ~3,570x regression on
+  point SELECT vs. M0, isolated entirely to this one unnecessary fsync.
+  Straightforward fix identified, not applied — see Open questions above.
 - FSM is a linear scan over all heap pages — fine for M0/M1, revisit if insert
   throughput regresses.
 - WAL truncation rewrites the entire file — acceptable for now, needs a proper
@@ -345,12 +396,11 @@ tests green ✅.
   effective free space per page). Catalog pages have the exact same
   accumulate-garbage-on-rewrite property (M1.c) — every `CREATE TABLE`/RLS
   policy change leaves the previous catalog blob's page behind.
-- `benches/load.rs` was updated to compile against the new transactional API
-  (`begin`/`insert`/`commit` per op) but has not been *re-run* — M0's recorded
-  numbers in `PROGRESS.md` predate the transactional wrapping and will need a
-  fresh run once M1 closes out, to see the (likely small, since xid bookkeeping
-  is in-memory-only) overhead of the transaction manager on top of the
-  already-fsync-dominated cost. Also does not yet cover the SQL layer at all.
+- **INSERT/UPDATE are ~2x slower than M0** when each statement is its own
+  transaction (the worst case — see `PROGRESS.md`'s M1 entry for why this is
+  expected and how batching multiple statements per transaction amortizes
+  it away). Not a bug, but worth remembering when reading raw throughput
+  numbers out of context.
 - **No wait queue / deadlock detection in `LockManager`** (M1.b) — deliberate
   per D12, since SI's conflict handling is "abort immediately," not
   "block and wait." A future SERIALIZABLE/SSI effort would need to add this,
@@ -367,6 +417,45 @@ tests green ✅.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-06 — M1.d complete; M1 milestone DONE
+
+- Added the combined crash+MVCC property test (`tests/crash/main.rs`): a
+  small self-contained LCG (deliberately not a new `rand` dependency, since
+  this is test-only and reproducibility just needs a fixed seed) drives
+  random transaction sequences across 6 seeds with random crash points,
+  including true mid-transaction crashes (no commit/abort call at all).
+  Passed first try — no bugs found by this specific test, a genuine "the
+  invariant holds" result, not just "test not written yet."
+- Extended `benches/load.rs` with a `contention` benchmark group measuring
+  SI's abort-on-conflict + retry cost, not just uncontended CRUD.
+- Ran the full M1 benchmark suite (`--sample-size 10`, not the default 100,
+  since each sample involves real fsyncs and the default would have taken
+  well over an hour based on M0's timing) and recorded the table in
+  `PROGRESS.md`.
+- **Found a real, previously-unnoticed bug while benchmarking, not a
+  pre-planned test**: point `SELECT`'s cost went from 855ns (M0) to 3.05ms
+  (M1) — far more than the ~2x expected from transaction-wrapper overhead.
+  Root cause: `TransactionManager::commit()` fsyncs unconditionally, even
+  for read-only transactions that wrote nothing. Documented as a design
+  note, recorded in `PROGRESS.md`, and left as an open question for
+  deliberate fix-now-vs-defer decision rather than silently patched in
+  passing — this touches a path CLAUDE.md's own conventions would want
+  reviewed as a real change, not folded into an unrelated commit.
+- INSERT/UPDATE landed at ~2x M0's cost, exactly as expected (each
+  single-statement-per-transaction op now pays both the existing
+  per-statement mini-txn fsync and a new per-transaction commit fsync) —
+  confirmed this is inherent to the benchmark's "worst case: no batching"
+  design, not a surprise regression.
+- **Final state:** 112 unit tests + 10 crash-harness tests (P1–P9 + the
+  new property test) green, `cargo clippy --all-targets -- -D warnings`
+  clean, `cargo fmt --all --check` clean, `cargo build --release` succeeds.
+- **M1 milestone is DONE.** All four checkpoints (M1.a/b/c/d) complete,
+  benchmarked, and committed. Two open, human-decidable items carried
+  forward rather than resolved unilaterally: the read-only-txn fsync fix,
+  and whether catalog DDL needs transactionality before M2.
+- **Next:** M2 planning (vector search) has not started — this session
+  ended with M1 fully closed out, no M2 work begun.
 
 ### 2026-07-06 — M1.c checkpoint complete (catalog + SQL subset)
 

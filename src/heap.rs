@@ -42,7 +42,7 @@ use crate::{
 /// current version of this row" re-resolve via a fresh scan/lookup rather
 /// than dereferencing a RowId across statements (no cross-statement cursor
 /// stability in M1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RowId {
     pub page_id: PageId,
     pub slot: u16,
