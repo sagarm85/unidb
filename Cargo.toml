@@ -1,0 +1,20 @@
+[package]
+name = "unidb"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+memmap2 = "0.9"
+crc32fast = "1.4"
+zerocopy = { version = "0.7", features = ["derive"] }
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "load"
+harness = false
