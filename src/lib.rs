@@ -8,6 +8,7 @@ pub mod concurrency_hooks;
 pub mod control;
 pub mod error;
 pub mod format;
+pub mod fulltext;
 pub mod heap;
 pub mod index_worker;
 pub mod lockmgr;
@@ -24,16 +25,16 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     bufferpool::BufferPool,
-    catalog::{Catalog, ColumnDef, IndexKind, TableDef},
+    catalog::{Catalog, ColumnDef, IndexKind},
     control::ControlData,
     error::Result,
     format::{Xid, DEFAULT_PAGE_SIZE},
     heap::Heap,
-    index_worker::{IndexHandle, IndexMsg, IndexedColumn},
+    index_worker::{IndexHandle, IndexMsg},
     lockmgr::LockManager,
     sql::{
         executor::{self, ExecCtx, ExecResult},
-        logical::{apply_rls, Expr, Literal},
+        logical::{apply_rls, Expr},
         parser::parse_sql,
     },
     txn::{IsolationLevel, TransactionManager, UndoAction},
@@ -107,7 +108,7 @@ impl Engine {
         let catalog = Catalog::load(&control, &mut pool)?;
 
         let index_worker = IndexHandle::spawn();
-        rebuild_vector_indexes(
+        rebuild_secondary_indexes(
             &catalog,
             &mut txn_mgr,
             &mut pool,
@@ -303,15 +304,18 @@ impl Engine {
     }
 }
 
-/// Scan every table's currently-committed rows for any `VECTOR` column
-/// carrying `IndexKind::Hnsw` and enqueue them to the (already-spawned)
-/// background worker, so a fresh `Engine::open` ends up with a rebuilt
-/// index rather than an empty one. Runs entirely on the foreground thread
-/// against the engine's own `pool`/`heap`/`catalog` — the worker thread
-/// itself never gets a `BufferPool` handle (see `index_worker.rs`'s module
-/// doc). Uses an ordinary begin/scan/commit read-only transaction, exactly
-/// like a `SELECT`, to get MVCC-correct visibility of committed rows.
-fn rebuild_vector_indexes(
+/// Scan every table's currently-committed rows for any column carrying an
+/// `IndexKind` (`Hnsw` or `FullText`) and enqueue them to the
+/// (already-spawned) background worker, so a fresh `Engine::open` ends up
+/// with rebuilt indexes rather than empty ones. Runs entirely on the
+/// foreground thread against the engine's own `pool`/`heap`/`catalog` — the
+/// worker thread itself never gets a `BufferPool` handle (see
+/// `index_worker.rs`'s module doc). Uses an ordinary begin/scan/commit
+/// read-only transaction, exactly like a `SELECT`, to get MVCC-correct
+/// visibility of committed rows. Shares `executor::build_indexed_columns`
+/// with `exec_create_index`'s own backfill rather than duplicating the
+/// column-type-to-`IndexedColumn` mapping.
+fn rebuild_secondary_indexes(
     catalog: &Catalog,
     txn_mgr: &mut TransactionManager,
     pool: &mut BufferPool,
@@ -321,12 +325,9 @@ fn rebuild_vector_indexes(
     handle: &IndexHandle,
 ) -> Result<()> {
     for table in catalog.tables() {
-        let vector_cols: Vec<&ColumnDef> = table
-            .columns
-            .iter()
-            .filter(|c| matches!(c.index, Some(IndexKind::Hnsw)))
-            .collect();
-        if vector_cols.is_empty() {
+        let indexed_cols: Vec<&ColumnDef> =
+            table.columns.iter().filter(|c| c.index.is_some()).collect();
+        if indexed_cols.is_empty() {
             continue;
         }
 
@@ -335,11 +336,18 @@ fn rebuild_vector_indexes(
         let snapshot = txn_mgr.snapshot_for_statement(xid)?;
         for (row_id, bytes) in heap.scan(&snapshot, xid, pool)? {
             let row = executor::decode_row(&bytes, &table.columns)?;
-            send_vector_upserts_for_rebuild(table, &vector_cols, row_id, &row, handle);
+            let cols = executor::build_indexed_columns(table, &indexed_cols, &row);
+            if !cols.is_empty() {
+                handle.send(IndexMsg::Upsert {
+                    table: table.name.clone(),
+                    record: row_id,
+                    indexed_cols: cols,
+                });
+            }
         }
         txn_mgr.commit(xid, wal, lock_mgr)?;
 
-        for col in &vector_cols {
+        for col in &indexed_cols {
             handle.send(IndexMsg::MarkReady {
                 table: table.name.clone(),
                 column: col.name.clone(),
@@ -347,36 +355,6 @@ fn rebuild_vector_indexes(
         }
     }
     Ok(())
-}
-
-fn send_vector_upserts_for_rebuild(
-    table: &TableDef,
-    vector_cols: &[&ColumnDef],
-    row_id: RowId,
-    row: &[Literal],
-    handle: &IndexHandle,
-) {
-    let mut indexed_cols = Vec::new();
-    for col in vector_cols {
-        let idx = table
-            .columns
-            .iter()
-            .position(|c| c.name == col.name)
-            .expect("vector_cols is drawn from table.columns");
-        if let Literal::Vector(v) = &row[idx] {
-            indexed_cols.push(IndexedColumn::Vector {
-                column: col.name.clone(),
-                data: v.clone(),
-            });
-        }
-    }
-    if !indexed_cols.is_empty() {
-        handle.send(IndexMsg::Upsert {
-            table: table.name.clone(),
-            record: row_id,
-            indexed_cols,
-        });
-    }
 }
 
 /// Initialize a `tracing_subscriber` with `RUST_LOG` env filter.
@@ -749,7 +727,9 @@ mod tests {
         let entry = guard
             .get(&("t".to_string(), "embedding".to_string()))
             .unwrap();
-        let index_worker::SecondaryIndex::Vector(v) = &entry.index;
+        let index_worker::SecondaryIndex::Vector(v) = &entry.index else {
+            panic!("expected a vector index");
+        };
         assert_eq!(v.len(), 1);
     }
 
@@ -785,7 +765,9 @@ mod tests {
         let entry = guard
             .get(&("t".to_string(), "embedding".to_string()))
             .unwrap();
-        let index_worker::SecondaryIndex::Vector(v) = &entry.index;
+        let index_worker::SecondaryIndex::Vector(v) = &entry.index else {
+            panic!("expected a vector index");
+        };
         assert_eq!(v.len(), 2);
     }
 
@@ -794,6 +776,70 @@ mod tests {
         let dir = tempdir().unwrap();
         let engine = Engine::open(dir.path(), 0).unwrap();
         drop(engine); // must return promptly, not hang on the worker thread
+    }
+
+    // ── M2.c: CREATE INDEX (full-text) ──────────────────────────────────────
+
+    #[test]
+    fn create_index_fulltext_backfills_immediately_and_is_queryable() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, body TEXT)")
+            .unwrap();
+        engine
+            .execute_sql(
+                xid,
+                "INSERT INTO t (id, body) VALUES (1, 'rust database engine')",
+            )
+            .unwrap();
+        engine
+            .execute_sql(
+                xid,
+                "INSERT INTO t (id, body) VALUES (2, 'python web framework')",
+            )
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        let xid2 = engine.begin().unwrap();
+        let result = engine
+            .execute_sql(xid2, "CREATE INDEX idx ON t USING FULLTEXT (body)")
+            .unwrap();
+        assert_eq!(result[0], SqlResult::CreatedIndex);
+        engine.commit(xid2).unwrap();
+
+        // Backfill happens immediately (unlike set_column_index's Rust-API
+        // path), so this should reach Ready without needing a reopen.
+        wait_for_status(&engine, "t", "body", index_worker::IndexStatus::Ready);
+
+        let guard = engine.index_worker.indexes.read().unwrap();
+        let entry = guard.get(&("t".to_string(), "body".to_string())).unwrap();
+        let index_worker::SecondaryIndex::FullText(idx) = &entry.index else {
+            panic!("expected a full-text index");
+        };
+        let rust_hits = idx.search("rust");
+        let python_hits = idx.search("python");
+        assert_eq!(rust_hits.len(), 1);
+        assert_eq!(python_hits.len(), 1);
+        assert_ne!(rust_hits, python_hits);
+        assert!(idx.search("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn create_index_rejects_type_mismatch_via_sql() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, body TEXT)")
+            .unwrap();
+        let err = engine
+            .execute_sql(xid, "CREATE INDEX idx ON t USING HNSW (body)")
+            .unwrap_err();
+        assert!(matches!(err, DbError::SqlPlan(_)));
     }
 
     #[test]

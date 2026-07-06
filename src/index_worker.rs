@@ -11,22 +11,23 @@
 // M2 scope): losing it on crash just means rebuilding on next open, so there
 // is no new durability contract here, only an eventual-consistency one.
 //
-// `SecondaryIndex` only has a `Vector` variant for now — `FullText` lands in
-// M2.c alongside `fulltext.rs`. The message/status plumbing below (keyed by
-// `(table, column)`, not by index kind) already generalizes to a second kind
-// without changes.
+// `SecondaryIndex` has `Vector` (M2.b) and `FullText` (M2.c) variants. The
+// message/status plumbing below is keyed by `(table, column)`, not by index
+// kind, so it generalized to the second kind with no changes to its shape.
 
 use std::collections::HashMap;
 use std::sync::{mpsc, Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crate::fulltext::InvertedIndex;
 use crate::heap::RowId;
 use crate::vector::VectorIndex;
 
 #[derive(Debug, Clone)]
 pub enum IndexedColumn {
     Vector { column: String, data: Vec<f32> },
+    Text { column: String, data: String },
 }
 
 pub enum IndexMsg {
@@ -49,6 +50,7 @@ pub enum IndexMsg {
 
 pub enum SecondaryIndex {
     Vector(VectorIndex),
+    FullText(InvertedIndex),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,8 +160,26 @@ fn worker_loop(rx: mpsc::Receiver<IndexMsg>, indexes: SharedIndexes) {
                             if let IndexStatus::Building { rows_done } = &mut entry.status {
                                 *rows_done += 1;
                             }
-                            let SecondaryIndex::Vector(v) = &mut entry.index;
+                            let SecondaryIndex::Vector(v) = &mut entry.index else {
+                                continue;
+                            };
                             v.upsert(record, data);
+                        }
+                        IndexedColumn::Text { column, data } => {
+                            let mut guard = indexes.write().unwrap();
+                            let entry = guard.entry((table.clone(), column)).or_insert_with(|| {
+                                IndexEntry {
+                                    status: IndexStatus::Building { rows_done: 0 },
+                                    index: SecondaryIndex::FullText(InvertedIndex::new()),
+                                }
+                            });
+                            if let IndexStatus::Building { rows_done } = &mut entry.status {
+                                *rows_done += 1;
+                            }
+                            let SecondaryIndex::FullText(t) = &mut entry.index else {
+                                continue;
+                            };
+                            t.upsert(record, &data);
                         }
                     }
                 }
@@ -221,7 +241,9 @@ mod tests {
             let entry = guard
                 .get(&("t".to_string(), "embedding".to_string()))
                 .unwrap();
-            let SecondaryIndex::Vector(v) = &entry.index;
+            let SecondaryIndex::Vector(v) = &entry.index else {
+                panic!("expected a vector index");
+            };
             assert_eq!(v.len(), 1);
         }
 

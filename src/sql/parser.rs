@@ -6,14 +6,14 @@
 // is the actual point of this milestone, not parser plumbing.
 
 use sqlparser::ast::{
-    self, Array as SqlArray, BinaryOperator, DataType, Expr as SqlExpr, FromTable, SelectItem,
-    SetExpr, Statement, TableFactor, TableObject, Value,
+    self, Array as SqlArray, BinaryOperator, DataType, Expr as SqlExpr, FromTable, IndexType,
+    SelectItem, SetExpr, Statement, TableFactor, TableObject, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser as SqlParser;
 
 use crate::{
-    catalog::{ColumnDef, ColumnType},
+    catalog::{ColumnDef, ColumnType, IndexKind},
     error::{DbError, Result},
 };
 
@@ -35,6 +35,7 @@ fn convert_statement(stmt: Statement) -> Result<LogicalPlan> {
         Statement::Query(q) => convert_query(*q),
         Statement::Update(u) => convert_update(u),
         Statement::Delete(d) => convert_delete(d),
+        Statement::CreateIndex(ci) => convert_create_index(ci),
         other => Err(DbError::SqlUnsupported(format!(
             "unsupported statement: {other}"
         ))),
@@ -89,6 +90,50 @@ fn convert_data_type(dt: &DataType) -> Result<ColumnType> {
             "unsupported column type: {other}"
         ))),
     }
+}
+
+/// `CREATE INDEX ... ON table USING HNSW|FULLTEXT (column)`. Note `USING`
+/// comes *before* the column list — confirmed against `sqlparser`'s own
+/// `parse_create_index` (it only looks for an optional `USING` clause
+/// immediately after the table name, not after the column list; a
+/// trailing-`USING` MySQL variant exists but isn't what this matches
+/// against). `HNSW`/`FULLTEXT` aren't built-in `sqlparser` index types, so
+/// they arrive as `IndexType::Custom` — matched case-insensitively, same
+/// pattern as `VECTOR(n)`'s `DataType::Custom` fallback. Exactly one
+/// column, matching M2's "no composite secondary indexes" scope.
+fn convert_create_index(ci: ast::CreateIndex) -> Result<LogicalPlan> {
+    let table = ci.table_name.to_string();
+    let kind = match &ci.using {
+        Some(IndexType::Custom(ident)) if ident.value.eq_ignore_ascii_case("hnsw") => {
+            IndexKind::Hnsw
+        }
+        Some(IndexType::Custom(ident)) if ident.value.eq_ignore_ascii_case("fulltext") => {
+            IndexKind::FullText
+        }
+        other => {
+            return Err(DbError::SqlUnsupported(format!(
+                "unsupported index type: {other:?} (expected USING HNSW or USING FULLTEXT)"
+            )))
+        }
+    };
+    if ci.columns.len() != 1 {
+        return Err(DbError::SqlUnsupported(
+            "CREATE INDEX supports exactly one column in M2".into(),
+        ));
+    }
+    let column = match &ci.columns[0].column.expr {
+        SqlExpr::Identifier(ident) => ident.value.clone(),
+        other => {
+            return Err(DbError::SqlUnsupported(format!(
+                "unsupported index column expression: {other:?}"
+            )))
+        }
+    };
+    Ok(LogicalPlan::CreateIndex {
+        table,
+        column,
+        kind,
+    })
 }
 
 fn convert_insert(ins: ast::Insert) -> Result<LogicalPlan> {
@@ -445,6 +490,41 @@ mod tests {
             }
             _ => panic!("expected Insert"),
         }
+    }
+
+    #[test]
+    fn parses_create_index_hnsw() {
+        let plan = parse_one("CREATE INDEX idx ON t USING HNSW (embedding)");
+        match plan {
+            LogicalPlan::CreateIndex {
+                table,
+                column,
+                kind,
+            } => {
+                assert_eq!(table, "t");
+                assert_eq!(column, "embedding");
+                assert_eq!(kind, IndexKind::Hnsw);
+            }
+            _ => panic!("expected CreateIndex"),
+        }
+    }
+
+    #[test]
+    fn parses_create_index_fulltext_case_insensitive() {
+        let plan = parse_one("CREATE INDEX idx ON t USING fulltext (body)");
+        match plan {
+            LogicalPlan::CreateIndex { column, kind, .. } => {
+                assert_eq!(column, "body");
+                assert_eq!(kind, IndexKind::FullText);
+            }
+            _ => panic!("expected CreateIndex"),
+        }
+    }
+
+    #[test]
+    fn rejects_create_index_with_unsupported_using() {
+        let err = parse_sql("CREATE INDEX idx ON t USING BTREE (id)");
+        assert!(matches!(err, Err(DbError::SqlUnsupported(_))));
     }
 
     #[test]

@@ -13,22 +13,22 @@
 ## Current status
 
 - **Milestone:** M1 is DONE. **M2 (vector & text search) is underway —
-  checkpoints M2.a (`VECTOR(n)` foundation) and M2.b (background indexing
-  worker) are both complete.** The approved plan lives at
+  checkpoints M2.a (`VECTOR(n)` foundation), M2.b (background indexing
+  worker), and M2.c (full-text index + `CREATE INDEX` SQL surface) are all
+  complete.** The approved plan lives at
   `/Users/sagarmahamuni/.claude/plans/misty-hugging-brook.md` (four
   checkpoints, M2.a–d).
-- **State:** 131 unit tests + 10 crash-harness tests all green, `cargo
+- **State:** 148 unit tests + 10 crash-harness tests all green, `cargo
   clippy --all-targets -- -D warnings` clean, `cargo fmt --all --check`
-  clean, release build succeeds. The engine now has its first background
-  thread (`index_worker.rs`): it rebuilds a `VectorIndex` from committed
-  rows on every `Engine::open` and applies live upserts from
-  `exec_insert`/`exec_update`, all without the worker ever touching
-  `BufferPool`/`Wal`/`Heap`.
-- **Immediate next task:** Checkpoint M2.c — the full-text index
-  (`src/fulltext.rs`) and the explicit `CREATE INDEX ... USING HNSW|
-  FULLTEXT` SQL surface (`Engine::create_index`, generalizing the
-  `Catalog::set_column_index` primitive already built in M2.b). See the
-  plan file's tasks 13–16.
+  clean, release build succeeds. `CREATE INDEX idx ON t USING HNSW|FULLTEXT
+  (column)` works end-to-end through SQL: validates column-type
+  compatibility, persists the catalog flag, and backfills the worker
+  immediately from every committed row (unlike the M2.b-era
+  `set_column_index` Rust API, which only populates on next reopen).
+- **Immediate next task:** Checkpoint M2.d — the `NEAR` operator,
+  integration tests (including the MVCC-rollback-correctness test), and
+  benchmarks with the Postgres+pgvector comparison. See the plan file's
+  tasks 17–22.
 - **Last updated:** 2026-07-06
 
 ### Design note: read-only transactions pay an unnecessary commit fsync (found in M1.d)
@@ -234,6 +234,44 @@ exactly like MVCC's existing "no vacuum" story for the heap itself — but it
 is an unbounded space leak under update-heavy workloads on indexed columns.
 Tracked below, not silently dropped.
 
+### Design note: CREATE INDEX's USING clause must precede the column list (M2.c)
+
+`sqlparser` 0.62.0's `parse_create_index` only looks for an optional
+`USING <type>` clause immediately after the table name — *before* the
+`(column)` list, not after (confirmed by reading `parse_create_index`
+directly, not guessed). So the SQL surface is
+`CREATE INDEX idx ON t USING HNSW (embedding)`, not
+`CREATE INDEX idx ON t (embedding) USING HNSW` (the latter is a
+different, MySQL-specific trailing-options grammar path this project
+doesn't hook into). `HNSW`/`FULLTEXT` arrive as `IndexType::Custom(Ident)`
+since neither is a real SQL index type — matched case-insensitively, same
+pattern as `VECTOR(n)`'s `DataType::Custom` fallback from M2.a.
+
+### Design note: CREATE INDEX generalizes M2.b's rebuild/upsert plumbing, doesn't duplicate it (M2.c)
+
+`exec_create_index` (`sql/executor.rs`) and `lib.rs`'s rebuild-on-open both
+need the same "decode a row, pick out its indexed columns, build the right
+`IndexedColumn` variant per column type" logic. Factored into one shared
+function, `executor::build_indexed_columns`, so the
+`ColumnType`/`IndexKind` → `IndexedColumn::{Vector,Text}` mapping exists in
+exactly one place. `lib.rs`'s `rebuild_vector_indexes` was renamed
+`rebuild_secondary_indexes` and generalized from "only scan `Hnsw` columns"
+to "scan any indexed column" — necessary because a table with only a
+`FullText` index would otherwise have silently lost its index on every
+reopen (M2.b's version only ever looked for `Hnsw`). Caught and fixed in
+the same pass as building `CREATE INDEX`, not left as a latent gap.
+
+The one behavioral difference between the two entry points, by design:
+`CREATE INDEX` (M2.c) backfills *immediately* (scans currently-committed
+rows synchronously-enqueued, right there in the executor), while
+`Engine::set_column_index` (M2.b's Rust-only API, kept for programmatic use)
+still defers population to the next `Engine::open`'s rebuild. `CREATE
+INDEX`'s validation (`IndexKind::Hnsw` only on `ColumnType::Vector`,
+`IndexKind::FullText` only on `ColumnType::Text`) reuses the exact
+`DbError::SqlPlan` error shape already established for vector-dimension
+mismatches in M2.a — one consistent "bad plan for this schema" error
+family, not a new one per feature.
+
 ### Design note: no cross-statement RowId stability
 
 Initially built `Heap::get` to walk the `prev_page`/`prev_slot` chain
@@ -279,20 +317,30 @@ src/
                          + page list, persisted as a serde_json blob, not MVCC-versioned
   sql/
     mod.rs            — (new, M1.c) module registration
-    logical.rs        — (new, M1.c) LogicalPlan/Expr/Literal/CmpOp + apply_rls (the entire
-                         RLS mechanism is this one AND-rewrite function)
-    parser.rs         — (new, M1.c) wraps `sqlparser`'s GenericDialect AST -> LogicalPlan
-    executor.rs        — (new, M1.c; extended M2.a, M2.b) row-at-a-time executor; hand-rolled
-                         row encoding (tag+value per column, tag 5 = Vector, M2.a);
-                         no separate physical-plan IR (folded in); exec_insert/exec_update
-                         send IndexMsg::Upsert for indexed VECTOR columns (M2.b)
-  index_worker.rs     — (new, M2.b) the engine's first background thread: IndexMsg/
-                         IndexHandle/IndexStatus/SecondaryIndex, owns Arc<RwLock<HashMap
-                         <(table,column), IndexEntry>>>, never touches BufferPool/Wal/Heap
+    logical.rs        — (new, M1.c; extended M2.a, M2.c) LogicalPlan/Expr/Literal/CmpOp +
+                         apply_rls (the entire RLS mechanism is this one AND-rewrite
+                         function); LogicalPlan::CreateIndex{table,column,kind} (M2.c)
+    parser.rs         — (new, M1.c; extended M2.a, M2.c) wraps `sqlparser`'s GenericDialect
+                         AST -> LogicalPlan; CREATE INDEX ... USING HNSW|FULLTEXT (M2.c,
+                         note USING precedes the column list — see design note above)
+    executor.rs        — (new, M1.c; extended M2.a, M2.b, M2.c) row-at-a-time executor;
+                         hand-rolled row encoding (tag+value per column, tag 5 = Vector,
+                         M2.a); no separate physical-plan IR (folded in); exec_insert/
+                         exec_update send IndexMsg::Upsert for any indexed column (M2.b);
+                         exec_create_index validates + persists + immediately backfills
+                         (M2.c); build_indexed_columns is the one shared column-type-to-
+                         IndexedColumn mapping used by both live upserts and every backfill
+  index_worker.rs     — (new, M2.b; extended M2.c) the engine's first background thread:
+                         IndexMsg/IndexHandle/IndexStatus/SecondaryIndex{Vector,FullText},
+                         owns Arc<RwLock<HashMap<(table,column), IndexEntry>>>, never
+                         touches BufferPool/Wal/Heap
   vector.rs           — (new, M2.b) VectorIndex wrapper around `instant-distance`;
                          buffers points, rebuilds the HNSW graph on every upsert/remove
                          (no incremental insert in instant-distance's public API — see
                          design note above)
+  fulltext.rs         — (new, M2.c) InvertedIndex: whitespace+lowercase tokenization,
+                         AND-only multi-term intersection search, HashMap<String,Vec<RowId>>
+                         postings
   checkpoint.rs       — flush dirty → checkpoint WAL record → update control → truncate WAL
   recovery.rs         — (extended, M1.a) mini-txn redo/undo (unchanged) +
                          incomplete-user-txn undo pass (decodes ownership from WAL redo bytes)
@@ -338,8 +386,8 @@ Key design decisions confirmed in implementation (M0 + M1.a + M1.b + M1.c):
 
 ## In progress
 
-Nothing — M2.a and M2.b checkpoints both fully verified. Ready to start
-M2.c (full-text index + `CREATE INDEX` SQL surface).
+Nothing — M2.a, M2.b, and M2.c checkpoints all fully verified. Ready to
+start M2.d (`NEAR` operator, integration tests, benchmarks).
 
 ---
 
@@ -523,6 +571,46 @@ upsert messages ✅ (`live_insert_into_indexed_column_enqueues_upsert`),
 shutdown is clean and tested ✅ (`engine_drop_shuts_down_worker_without_hanging`),
 `IndexStatus` reports `Building`/`Ready` correctly ✅, all tests green ✅.
 
+## M2.c task breakdown (ordered — all complete)
+
+1. ✅ `src/fulltext.rs` (new): `InvertedIndex` — whitespace+lowercase
+   tokenization, `HashMap<String, Vec<RowId>>` postings, AND-only
+   multi-term intersection search, `upsert`/`remove` mirroring
+   `VectorIndex`'s API shape.
+2. ✅ Generalized `index_worker.rs`: `SecondaryIndex::FullText(InvertedIndex)`,
+   `IndexedColumn::Text{column,data}`, extended `worker_loop`'s match arm —
+   confirmed the message/status plumbing needed zero shape changes, exactly
+   as M2.b's design note predicted.
+3. ✅ `LogicalPlan::CreateIndex{table,column,kind}` (`sql/logical.rs`) +
+   parser support (`sql/parser.rs`) for `CREATE INDEX ... ON t USING
+   HNSW|FULLTEXT (column)`. Found and documented a real grammar detail:
+   `USING` must precede the column list, not follow it (see design note
+   above) — caught before shipping broken tests, not after.
+4. ✅ `exec_create_index` (`sql/executor.rs`): validates column-type
+   compatibility, persists via `Catalog::set_column_index` (built ahead of
+   schedule in M2.b), immediately backfills every committed row through the
+   worker channel, sends `MarkReady`. Factored `build_indexed_columns` out
+   as the one shared column-type-to-`IndexedColumn` mapping, used by both
+   live upserts and every backfill path.
+5. ✅ **Found and fixed a latent gap while building this**: `lib.rs`'s
+   rebuild-on-open only ever scanned `IndexKind::Hnsw` columns — a
+   `FullText`-indexed table would have silently lost its index on every
+   reopen. Generalized (`rebuild_vector_indexes` → `rebuild_secondary_indexes`)
+   to scan any indexed column, using the same shared `build_indexed_columns`
+   helper from task 4.
+6. ✅ Tests: executor-level validation (rejects `Hnsw` on `Text`, rejects
+   `FullText` on `Vector`, rejects unknown column, persists correctly for
+   both valid combinations) + two `lib.rs` integration tests through the
+   real `Engine`: immediate-backfill-and-queryable, and
+   type-mismatch-rejected-via-SQL.
+7. ✅ M2.c checkpoint verification: 148 unit tests + 10 crash tests green,
+   clippy/fmt clean, release build OK.
+
+**M2.c done when:** `CREATE INDEX ... USING FULLTEXT` builds and maintains
+an `InvertedIndex` via the shared worker ✅, term search returns correct
+intersections ✅, tokenization tests pass ✅, `CREATE INDEX` validation
+rejects type-kind mismatches ✅, all tests green ✅.
+
 ---
 
 ## Open questions / pending human input
@@ -604,10 +692,49 @@ shutdown is clean and tested ✅ (`engine_drop_shuts_down_worker_without_hanging
   and get filtered at read time), but it's an unbounded space leak under
   update-heavy workloads on indexed columns — the same shape of gap as M1's
   "no vacuum" tech debt, just for the secondary index instead of the heap.
+  The same applies to `InvertedIndex` (M2.c) for the identical reason.
+- **No full-text query SQL surface yet** — `InvertedIndex::search` exists
+  and is tested directly, but there's no SQL-level way to call it (the
+  `NEAR` operator planned for M2.d is vector-only per the plan; a text
+  equivalent isn't scoped for M2 at all). Not a bug — flagged so it isn't
+  mistaken for an oversight later.
 
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-06 — M2.c checkpoint complete (full-text index + CREATE INDEX)
+
+- Implemented all of M2.c per the approved plan
+  (`/Users/sagarmahamuni/.claude/plans/misty-hugging-brook.md`): `src/fulltext.rs`
+  (`InvertedIndex`), generalized `index_worker.rs` to a `FullText` variant,
+  `LogicalPlan::CreateIndex` + parser support, `exec_create_index` in
+  `sql/executor.rs` with immediate backfill.
+- **One real grammar detail found and documented, not guessed**: `sqlparser`
+  0.62.0's `CREATE INDEX` only recognizes `USING <type>` *before* the
+  column list, not after — the initial test SQL (`... (col) USING HNSW`)
+  failed with `using: None` until read directly from `parse_create_index`'s
+  source and corrected to `... USING HNSW (col)`.
+- **One real latent gap found and fixed while building this, not left
+  behind**: M2.b's rebuild-on-open only ever scanned `IndexKind::Hnsw`
+  columns, so a `FullText`-indexed table would have silently lost its index
+  on every engine reopen. Generalized the rebuild function
+  (`rebuild_vector_indexes` → `rebuild_secondary_indexes`) to scan any
+  indexed column, sharing the same `build_indexed_columns` helper newly
+  factored out of the executor for exactly this purpose.
+- Confirmed by design, not by accident: `CREATE INDEX` backfills
+  immediately (scans and enqueues right there in the executor), while
+  M2.b's `Engine::set_column_index` Rust API still only populates on next
+  reopen — two different entry points with two different eagerness
+  contracts, both intentional and both documented.
+- **Final state:** 148 unit tests + 10 crash-harness tests green, `cargo
+  clippy --all-targets -- -D warnings` clean, `cargo fmt --all --check`
+  clean, `cargo build --release` succeeds.
+- **Next:** M2.d — `NEAR` operator (`Expr::Near`, over-fetch-then-filter in
+  `exec_select`), `tests/index_rebuild.rs` and `tests/vector_mvcc.rs` (the
+  MVCC-rollback-correctness test — the single most important test in M2 per
+  the plan), benchmarks with the Postgres+pgvector comparison, M2 milestone
+  closeout in `PROGRESS.md`.
 
 ### 2026-07-06 — M2.b checkpoint complete (background indexing worker)
 

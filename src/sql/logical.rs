@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::{Catalog, ColumnDef};
+use crate::catalog::{Catalog, ColumnDef, IndexKind};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Literal {
@@ -87,6 +87,13 @@ pub enum LogicalPlan {
         table: String,
         predicate: Option<Expr>,
     },
+    /// `CREATE INDEX ... ON table (column) USING HNSW|FULLTEXT` (M2.c). One
+    /// column only in M2 — no composite secondary indexes.
+    CreateIndex {
+        table: String,
+        column: String,
+        kind: IndexKind,
+    },
 }
 
 /// AND the table's RLS policy (if any) into the plan's predicate. This is
@@ -122,7 +129,9 @@ pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog) -> LogicalPlan {
             let predicate = and_policy(predicate, policy_for(catalog, &table));
             LogicalPlan::Delete { table, predicate }
         }
-        other @ (LogicalPlan::CreateTable { .. } | LogicalPlan::Insert { .. }) => other,
+        other @ (LogicalPlan::CreateTable { .. }
+        | LogicalPlan::Insert { .. }
+        | LogicalPlan::CreateIndex { .. }) => other,
     }
 }
 

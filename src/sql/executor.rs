@@ -53,25 +53,58 @@ pub struct ExecCtx<'a> {
     pub index_worker: Option<&'a IndexHandle>,
 }
 
-/// If `table` has any indexed `VECTOR` columns, send their values from
-/// `row` to the background worker keyed by `row_id`. Checked once per
-/// statement row, not once per column globally, so tables with no indexed
-/// column pay zero overhead (CLAUDE.md's M2 "row write is the only
-/// synchronous cost" goal) — this function only *sends*, the worker does
-/// all the actual index work off this thread.
-fn send_vector_upserts(table_def: &TableDef, row_id: RowId, row: &[Literal], ctx: &ExecCtx) {
+/// Build the `IndexedColumn` list for one decoded `row`, from the subset of
+/// `table_def`'s columns that are actually indexed. Shared between live
+/// upserts (`send_index_upserts`, below) and every backfill/rebuild path
+/// (`exec_create_index` here, and `lib.rs`'s rebuild-on-open) so the
+/// column-type-to-`IndexedColumn`-variant mapping exists in exactly one
+/// place.
+pub fn build_indexed_columns(
+    table_def: &TableDef,
+    indexed: &[&ColumnDef],
+    row: &[Literal],
+) -> Vec<IndexedColumn> {
+    let mut out = Vec::new();
+    for col in indexed {
+        let idx = table_def
+            .columns
+            .iter()
+            .position(|c| c.name == col.name)
+            .expect("indexed column is drawn from table_def.columns");
+        match (&col.index, &row[idx]) {
+            (Some(IndexKind::Hnsw), Literal::Vector(v)) => out.push(IndexedColumn::Vector {
+                column: col.name.clone(),
+                data: v.clone(),
+            }),
+            (Some(IndexKind::FullText), Literal::Text(t)) => out.push(IndexedColumn::Text {
+                column: col.name.clone(),
+                data: t.clone(),
+            }),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// If `table` has any indexed columns, send their values from `row` to the
+/// background worker keyed by `row_id`. Checked once per statement row, not
+/// once per column globally, so tables with no indexed column pay zero
+/// overhead (CLAUDE.md's M2 "row write is the only synchronous cost" goal)
+/// — this function only *sends*, the worker does all the actual index work
+/// off this thread.
+fn send_index_upserts(table_def: &TableDef, row_id: RowId, row: &[Literal], ctx: &ExecCtx) {
     let Some(handle) = ctx.index_worker else {
         return;
     };
-    let mut indexed_cols = Vec::new();
-    for (col, val) in table_def.columns.iter().zip(row) {
-        if let (Some(IndexKind::Hnsw), Literal::Vector(v)) = (&col.index, val) {
-            indexed_cols.push(IndexedColumn::Vector {
-                column: col.name.clone(),
-                data: v.clone(),
-            });
-        }
+    let indexed: Vec<&ColumnDef> = table_def
+        .columns
+        .iter()
+        .filter(|c| c.index.is_some())
+        .collect();
+    if indexed.is_empty() {
+        return;
     }
+    let indexed_cols = build_indexed_columns(table_def, &indexed, row);
     if !indexed_cols.is_empty() {
         handle.send(IndexMsg::Upsert {
             table: table_def.name.clone(),
@@ -84,6 +117,7 @@ fn send_vector_upserts(table_def: &TableDef, row_id: RowId, row: &[Literal], ctx
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExecResult {
     CreatedTable,
+    CreatedIndex,
     Inserted { count: usize },
     Rows(Vec<Vec<Literal>>),
     Updated { count: usize },
@@ -109,6 +143,11 @@ pub fn execute(plan: LogicalPlan, ctx: &mut ExecCtx) -> Result<ExecResult> {
             predicate,
         } => exec_update(&table, &assignments, &predicate, ctx),
         LogicalPlan::Delete { table, predicate } => exec_delete(&table, &predicate, ctx),
+        LogicalPlan::CreateIndex {
+            table,
+            column,
+            kind,
+        } => exec_create_index(&table, &column, kind, ctx),
     }
 }
 
@@ -141,6 +180,69 @@ fn exec_create_table(
     let mut cctx = catalog_ctx!(ctx);
     ctx.catalog.create_table(def, &mut cctx)?;
     Ok(ExecResult::CreatedTable)
+}
+
+/// `CREATE INDEX ... ON table USING HNSW|FULLTEXT (column)`: validate the
+/// column's type is compatible with the requested index kind, persist the
+/// catalog flag, then immediately backfill the worker from every
+/// currently-committed row (unlike `Engine::set_column_index`'s Rust-API
+/// path from M2.b, which defers population to the next rebuild-on-open).
+fn exec_create_index(
+    table: &str,
+    column: &str,
+    kind: IndexKind,
+    ctx: &mut ExecCtx,
+) -> Result<ExecResult> {
+    let table_def = ctx.catalog.lookup(table)?.clone();
+    let col = table_def
+        .columns
+        .iter()
+        .find(|c| c.name == column)
+        .ok_or_else(|| DbError::ColumnNotFound {
+            table: table.to_string(),
+            column: column.to_string(),
+        })?;
+    match (&kind, &col.ty) {
+        (IndexKind::Hnsw, ColumnType::Vector(_)) => {}
+        (IndexKind::FullText, ColumnType::Text) => {}
+        (kind, ty) => {
+            return Err(DbError::SqlPlan(format!(
+                "{kind:?} index is not valid on column {column} of type {ty:?}"
+            )))
+        }
+    }
+
+    let mut cctx = catalog_ctx!(ctx);
+    ctx.catalog
+        .set_column_index(table, column, Some(kind), &mut cctx)?;
+    let table_def = ctx.catalog.lookup(table)?.clone();
+
+    if let Some(handle) = ctx.index_worker {
+        let col = table_def
+            .columns
+            .iter()
+            .find(|c| c.name == column)
+            .expect("column just validated above");
+        let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+        let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+        for (row_id, bytes) in heap.scan(&snapshot, ctx.xid, ctx.pool)? {
+            let row = decode_row(&bytes, &table_def.columns)?;
+            let indexed_cols = build_indexed_columns(&table_def, &[col], &row);
+            if !indexed_cols.is_empty() {
+                handle.send(IndexMsg::Upsert {
+                    table: table_def.name.clone(),
+                    record: row_id,
+                    indexed_cols,
+                });
+            }
+        }
+        handle.send(IndexMsg::MarkReady {
+            table: table_def.name.clone(),
+            column: column.to_string(),
+        });
+    }
+
+    Ok(ExecResult::CreatedIndex)
 }
 
 /// Persist a table's page list back to the catalog if the heap grew during
@@ -181,7 +283,7 @@ fn exec_insert(
                 slot: row_id.slot,
             },
         )?;
-        send_vector_upserts(&table_def, row_id, &coerced, ctx);
+        send_index_upserts(&table_def, row_id, &coerced, ctx);
         count += 1;
     }
 
@@ -244,7 +346,7 @@ fn exec_update(
                 slot: new_row_id.slot,
             },
         )?;
-        send_vector_upserts(&table_def, new_row_id, &coerced, ctx);
+        send_index_upserts(&table_def, new_row_id, &coerced, ctx);
         count += 1;
     }
 
@@ -1010,5 +1112,79 @@ mod tests {
         };
         let err = coerce_and_validate_row(&table, vec![Literal::Vector(vec![0.1, 0.2, 0.3])]);
         assert!(matches!(err, Err(DbError::SqlPlan(_))));
+    }
+
+    // ── M2.c: CREATE INDEX ───────────────────────────────────────────────────
+
+    #[test]
+    fn create_index_persists_hnsw_on_vector_column() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, embedding VECTOR(2))")
+            .unwrap();
+        let result = h
+            .exec_as(xid, "CREATE INDEX idx ON t USING HNSW (embedding)")
+            .unwrap();
+        assert_eq!(result, ExecResult::CreatedIndex);
+        assert_eq!(
+            h.catalog.lookup("t").unwrap().columns[1].index,
+            Some(IndexKind::Hnsw)
+        );
+    }
+
+    #[test]
+    fn create_index_persists_fulltext_on_text_column() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, body TEXT)")
+            .unwrap();
+        let result = h
+            .exec_as(xid, "CREATE INDEX idx ON t USING FULLTEXT (body)")
+            .unwrap();
+        assert_eq!(result, ExecResult::CreatedIndex);
+        assert_eq!(
+            h.catalog.lookup("t").unwrap().columns[1].index,
+            Some(IndexKind::FullText)
+        );
+    }
+
+    #[test]
+    fn create_index_rejects_hnsw_on_text_column() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, body TEXT)")
+            .unwrap();
+        let err = h
+            .exec_as(xid, "CREATE INDEX idx ON t USING HNSW (body)")
+            .unwrap_err();
+        assert!(matches!(err, DbError::SqlPlan(_)));
+    }
+
+    #[test]
+    fn create_index_rejects_fulltext_on_vector_column() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, embedding VECTOR(2))")
+            .unwrap();
+        let err = h
+            .exec_as(xid, "CREATE INDEX idx ON t USING FULLTEXT (embedding)")
+            .unwrap_err();
+        assert!(matches!(err, DbError::SqlPlan(_)));
+    }
+
+    #[test]
+    fn create_index_rejects_unknown_column() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT)").unwrap();
+        let err = h
+            .exec_as(xid, "CREATE INDEX idx ON t USING HNSW (nope)")
+            .unwrap_err();
+        assert!(matches!(err, DbError::ColumnNotFound { .. }));
     }
 }
