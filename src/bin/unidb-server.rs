@@ -19,6 +19,7 @@
 
 use std::sync::Arc;
 
+use axum_prometheus::PrometheusMetricLayer;
 use unidb::server::{auth::JwtConfig, engine_handle::EngineHandle, router::build_router, AppState};
 
 #[tokio::main]
@@ -41,8 +42,9 @@ async fn main() {
         engine: Arc::new(engine),
     };
     let jwt_config = JwtConfig::new(&jwt_secret);
+    let (prometheus_layer, metric_handle) = PrometheusMetricLayer::pair();
 
-    let router = build_router(state, jwt_config);
+    let router = build_router(state, jwt_config, prometheus_layer, metric_handle);
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .unwrap_or_else(|e| panic!("failed to bind {bind_addr}: {e}"));

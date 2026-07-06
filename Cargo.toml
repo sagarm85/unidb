@@ -41,7 +41,9 @@ server = [
 [dev-dependencies]
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs"] }
+futures-util = "0.3"
 
 [[bin]]
 name = "unidb-server"
@@ -63,3 +65,51 @@ harness = false
 [[bench]]
 name = "queue"
 harness = false
+
+[[bench]]
+name = "server"
+harness = false
+required-features = ["server"]
+
+# M5.d: server integration tests, gated the same way as the unidb-server
+# binary — `tests/server_common/mod.rs` is a shared helper module, not its
+# own test binary (Cargo doesn't auto-discover files in tests/ subdirectories).
+[[test]]
+name = "server_crud"
+path = "tests/server_crud.rs"
+required-features = ["server"]
+
+[[test]]
+name = "server_sql"
+path = "tests/server_sql.rs"
+required-features = ["server"]
+
+[[test]]
+name = "server_cypher"
+path = "tests/server_cypher.rs"
+required-features = ["server"]
+
+[[test]]
+name = "server_graph"
+path = "tests/server_graph.rs"
+required-features = ["server"]
+
+[[test]]
+name = "server_auth"
+path = "tests/server_auth.rs"
+required-features = ["server"]
+
+[[test]]
+name = "server_events"
+path = "tests/server_events.rs"
+required-features = ["server"]
+
+[[test]]
+name = "server_shutdown"
+path = "tests/server_shutdown.rs"
+required-features = ["server"]
+
+[[test]]
+name = "server_metrics"
+path = "tests/server_metrics.rs"
+required-features = ["server"]
