@@ -24,9 +24,19 @@ tokio = { version = "1.52", optional = true, features = ["sync", "rt", "rt-multi
 axum = { version = "0.8", optional = true }
 tower = { version = "0.5", optional = true }
 tower-http = { version = "0.7", optional = true, features = ["trace", "cors", "timeout"] }
+jsonwebtoken = { version = "10", optional = true, default-features = false, features = ["aws_lc_rs"] }
+metrics = { version = "0.24", optional = true }
+metrics-exporter-prometheus = { version = "0.18", optional = true, default-features = false }
+axum-prometheus = { version = "0.10", optional = true }
+async-stream = { version = "0.3", optional = true }
+futures-util = { version = "0.3", optional = true }
 
 [features]
-server = ["dep:tokio", "dep:axum", "dep:tower", "dep:tower-http"]
+server = [
+    "dep:tokio", "dep:axum", "dep:tower", "dep:tower-http",
+    "dep:jsonwebtoken", "dep:metrics", "dep:metrics-exporter-prometheus",
+    "dep:axum-prometheus", "dep:async-stream", "dep:futures-util",
+]
 
 [dev-dependencies]
 tempfile = "3"

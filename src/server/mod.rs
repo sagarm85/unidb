@@ -19,13 +19,18 @@
 //! Submodules: [`engine_handle`] (the writer-thread bridge), [`error`]
 //! (`DbError` → HTTP status mapping), [`dto`] (wire-format request/response
 //! shapes), [`handlers`] (one `async fn` per route), [`router`]
-//! (`build_router`). Later checkpoints (M5.c) add `auth`, `sse`, `metrics`.
+//! (`build_router`), [`auth`] (verify-only JWT middleware), [`sse`]
+//! (`GET /events/subscribe`). `/metrics` (Prometheus, via `axum-prometheus`)
+//! is wired directly in `router.rs` rather than its own module — there's no
+//! reusable logic beyond one `PrometheusMetricLayer::pair()` call.
 
+pub mod auth;
 pub mod dto;
 pub mod engine_handle;
 pub mod error;
 pub mod handlers;
 pub mod router;
+pub mod sse;
 
 use std::sync::Arc;
 

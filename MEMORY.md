@@ -13,11 +13,21 @@
 ## Current status
 
 - **Milestone:** M1-M4 are all DONE. **M5 (API/server) is IN PROGRESS** —
-  M5.a (stabilize embedded crate + writer-thread bridge) and M5.b (REST
-  core: CRUD/SQL/Cypher/graph/indexing) are complete; M5.c (JWT auth, SSE
-  subscribe, `/metrics`) and M5.d (hardening, tests, benchmarks, closeout)
-  remain. The approved plan lives at
+  M5.a (stabilize embedded crate + writer-thread bridge), M5.b (REST core:
+  CRUD/SQL/Cypher/graph/indexing), and M5.c (JWT auth, SSE subscribe,
+  `/metrics`) are complete; M5.d (hardening, tests, benchmarks, closeout)
+  remains. The approved plan lives at
   `/Users/sagarmahamuni/.claude/plans/misty-hugging-brook.md`.
+- **M5.c manually verified end-to-end** (automated tests land in M5.d per
+  plan): missing/malformed bearer tokens get 401 on data routes; `GET
+  /metrics` needs no auth and returns real Prometheus text including both
+  `axum-prometheus`'s auto-instrumented HTTP metrics and unidb-specific
+  ones (`unidb_jwt_verify_seconds`, `unidb_sse_poll_cycles_total`,
+  `unidb_sse_events_delivered_total`); `GET /events/subscribe` streamed a
+  committed `/sql` INSERT on an events-enabled table within one polling
+  interval, redelivered it on every subsequent tick (expected — polling
+  never advances state), then stopped redelivering it immediately after
+  `POST /events/ack`.
 - **Critical fix landed mid-M5 (2026-07-06), its own commit, not part of
   M5's feature work:** a real xid-reuse-after-checkpoint bug was found by
   manually smoke-testing the new REST server (commit several transactions,
@@ -1364,7 +1374,7 @@ all tests green ✅ — closing out M4 as a whole.
 
 ## Session log (append newest at top; use the real current date)
 
-### 2026-07-06 — M5.a and M5.b complete; xid-reuse-after-checkpoint bug found and fixed
+### 2026-07-06 — M5.a, M5.b, M5.c complete; xid-reuse-after-checkpoint bug found and fixed
 
 - Planned M5 via the same process as M2-M4: three parallel research passes
   (Engine's full public API surface + `Send`/error shape; codebase
@@ -1413,12 +1423,34 @@ all tests green ✅ — closing out M4 as a whole.
   human sign-off confirmed before implementing) and resuming at
   `max(WAL-scan, control.next_xid)` on open. Regression test:
   `lib.rs::xid_counter_survives_reopen_after_checkpoint`.
+- **M5.c** — `src/server/auth.rs` (verify-only HS256 JWT via
+  `jsonwebtoken`'s `aws_lc_rs` backend, secret from `UNIDB_JWT_SECRET`;
+  `require_jwt` middleware records `unidb_jwt_verify_seconds`),
+  `src/server/sse.rs` (`GET /events/subscribe` — an `async-stream` loop
+  polling `poll_events` on an interval and forwarding new events as SSE
+  frames; explicit module-doc caveat that this is "server polls, pushes to
+  client," not WAL-level push), `POST /tables/{table}/events` (new
+  `handlers::post_enable_events`, needed since M5.b never exposed
+  `Engine::enable_events` over HTTP), `GET /metrics` via `axum-prometheus`'s
+  `PrometheusMetricLayer::pair()`. `router.rs` restructured into a
+  `protected` sub-router (every data route, wrapped with
+  `middleware::from_fn_with_state(jwt_config, auth::require_jwt)`) merged
+  with a `public` sub-router (`/metrics` only, no auth layer), both under
+  one top-level `PrometheusMetricLayer` so `/metrics` requests are counted
+  too. `JwtConfig` is **not** part of `AppState` — `from_fn_with_state`
+  accepts any `Clone + Send + Sync + 'static` state independent of the
+  router's own state type, so passing `JwtConfig` directly to the auth
+  layer (rather than threading it through `AppState`) keeps `AppState`
+  focused on what every handler actually needs. Manually verified
+  end-to-end (see Current status above): auth rejection matrix, SSE
+  delivery + redelivery-until-ack, custom + auto-instrumented Prometheus
+  metrics all real and correct against a running `unidb-server`.
 - Verified throughout: `cargo build`/`test`/`clippy --all-targets -- -D
   warnings`/`fmt --all --check`, all clean **both** with and without
   `--features server`; `cargo tree --no-default-features | grep -i tokio`
   confirmed empty.
-- Next: M5.c (JWT auth, SSE subscribe, `/metrics`), then M5.d (hardening,
-  tests, benchmarks, closeout).
+- Next: M5.d (hardening, automated test suite for M5.b/c, benchmarks,
+  closeout).
 
 ### 2026-07-06 — M4 complete (all four checkpoints); M4 milestone DONE
 

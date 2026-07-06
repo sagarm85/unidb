@@ -194,6 +194,18 @@ pub async fn get_index_status(
 
 // ── events ───────────────────────────────────────────────────────────────
 
+/// Opt a table into event capture (`Engine::enable_events`) — no `xid`,
+/// mirrors `post_index`'s shape (a catalog-only operation, not a
+/// transaction). Needed before `GET /events/subscribe` or `POST
+/// /events/ack` return anything meaningful for a given table.
+pub async fn post_enable_events(
+    State(state): State<AppState>,
+    Path(table): Path<String>,
+) -> std::result::Result<StatusCode, ApiError> {
+    state.engine.enable_events(table).await.map_err(ApiError)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn post_events_ack(
     State(state): State<AppState>,
     Json(body): Json<AckEventsRequest>,

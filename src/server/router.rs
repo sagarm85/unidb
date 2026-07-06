@@ -1,18 +1,24 @@
-//! `build_router` assembles every route onto one `axum::Router`, layered
-//! with `tower-http`'s trace/CORS/timeout middleware. Auth (M5.c) and
-//! metrics (M5.c) layers attach here too once they exist.
+//! `build_router` assembles every route onto one `axum::Router`. Data-plane
+//! routes live in a `protected` sub-router wrapped with the verify-only JWT
+//! middleware (`auth::require_jwt`); `GET /metrics` lives in a separate
+//! `public` sub-router that never sees that layer — Prometheus scrapers
+//! don't carry app-level bearer tokens (see `auth.rs`'s module doc). Both
+//! merge under one top-level `PrometheusMetricLayer` (so `/metrics`
+//! requests themselves are counted too) plus `tower-http`'s trace/CORS/
+//! timeout middleware.
 
 use axum::{
     http::StatusCode,
     routing::{delete, get, post},
     Router,
 };
+use axum_prometheus::PrometheusMetricLayer;
 use tower_http::{cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer};
 
-use crate::server::{handlers, AppState};
+use crate::server::{auth::JwtConfig, handlers, sse, AppState};
 
-pub fn build_router(state: AppState) -> Router {
-    Router::new()
+pub fn build_router(state: AppState, jwt_config: JwtConfig) -> Router {
+    let protected = Router::new()
         .route("/txn/begin", post(handlers::post_txn_begin))
         .route("/sql", post(handlers::post_sql))
         .route("/cypher", post(handlers::post_cypher))
@@ -31,13 +37,33 @@ pub fn build_router(state: AppState) -> Router {
             "/indexes/{table}/{column}/status",
             get(handlers::get_index_status),
         )
+        .route("/tables/{table}/events", post(handlers::post_enable_events))
+        .route("/events/subscribe", get(sse::get_events_subscribe))
         .route("/events/ack", post(handlers::post_events_ack))
         .route("/checkpoint", post(handlers::post_checkpoint))
+        .route_layer(axum::middleware::from_fn_with_state(
+            jwt_config,
+            crate::server::auth::require_jwt,
+        ))
+        .with_state(state);
+
+    let (prometheus_layer, metric_handle) = PrometheusMetricLayer::pair();
+    let public = Router::new().route(
+        "/metrics",
+        get(move || {
+            let handle = metric_handle.clone();
+            async move { handle.render() }
+        }),
+    );
+
+    Router::new()
+        .merge(protected)
+        .merge(public)
+        .layer(prometheus_layer)
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             std::time::Duration::from_secs(30),
         ))
-        .with_state(state)
 }
