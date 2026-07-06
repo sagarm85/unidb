@@ -161,13 +161,21 @@ impl Engine {
 
         // Resume the xid counter past the highest xid that ever began —
         // reusing an xid would corrupt MVCC visibility for existing tuples
-        // (see MEMORY.md's design note).
+        // (see MEMORY.md's design note). The WAL scan alone is not
+        // sufficient: a checkpoint truncates every WAL_TXN_BEGIN record
+        // before its LSN (ordinarily *all* of them, since a checkpoint only
+        // runs after everything has committed), so after any checkpoint the
+        // WAL has nothing left to scan. `control.next_xid` (persisted at
+        // every checkpoint, M5 fix — see format.rs's v2->v3 note) is the
+        // other half of this max: whichever source has seen a higher xid
+        // wins, so this is correct whether or not a checkpoint ever ran.
         let existing_records = if wal_p.exists() {
             Wal::scan_file(&wal_p)?
         } else {
             Vec::new()
         };
-        let next_xid = TransactionManager::recover_next_xid(&existing_records);
+        let next_xid =
+            TransactionManager::recover_next_xid(&existing_records).max(control.next_xid);
         let mut txn_mgr = TransactionManager::with_next_xid(next_xid);
         let mut lock_mgr = LockManager::new();
 
@@ -783,6 +791,7 @@ impl Engine {
             &mut self.wal,
             &self.control_path,
             &mut self.control,
+            self.txn_mgr.next_xid(),
         )
     }
 
@@ -1037,6 +1046,44 @@ mod tests {
         let mut engine2 = Engine::open(dir.path(), 0).unwrap();
         let next_xid = engine2.begin().unwrap();
         assert!(next_xid > first_xid, "reopened engine must not reuse xids");
+    }
+
+    // ── M5: xid continuity survives a checkpoint (WAL truncation), not just
+    // an ordinary flush — regression test for a real bug found during M5's
+    // manual server testing: `checkpoint::run` truncates every WAL record
+    // before the checkpoint LSN, which in ordinary use is *every* prior
+    // transaction's WAL_TXN_BEGIN record (a checkpoint only runs after
+    // they've all committed). `recover_next_xid`'s WAL-scan-only approach
+    // therefore has nothing left to find on the next open unless the
+    // control file's own `next_xid` (persisted at checkpoint time, see
+    // control.rs's module doc) also participates in the resume decision —
+    // exactly the gap `xid_counter_survives_reopen` above never exercised,
+    // since it calls `flush()` (no truncation), not `checkpoint()`.
+    #[test]
+    fn xid_counter_survives_reopen_after_checkpoint() {
+        let dir = tempdir().unwrap();
+        let last_xid_before_checkpoint = {
+            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let mut last = 0;
+            for i in 0..5u32 {
+                let xid = engine.begin().unwrap();
+                engine.insert(xid, &i.to_le_bytes()).unwrap();
+                engine.commit(xid).unwrap();
+                last = xid;
+            }
+            // Checkpoint truncates the WAL — every WAL_TXN_BEGIN record
+            // above is now gone from the WAL file.
+            engine.checkpoint().unwrap();
+            last
+        };
+
+        let mut engine2 = Engine::open(dir.path(), 0).unwrap();
+        let resumed_xid = engine2.begin().unwrap();
+        assert!(
+            resumed_xid > last_xid_before_checkpoint,
+            "reopening after a checkpoint must not reuse an already-committed xid: \
+             resumed at {resumed_xid}, but xid {last_xid_before_checkpoint} was already used"
+        );
     }
 
     // ── M1.b: SI abort-on-conflict (D12) ────────────────────────────────────

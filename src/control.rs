@@ -1,6 +1,6 @@
 // Control file (D3): single meta-page/file holding magic, version, page_size,
-// catalog root, last-checkpoint LSN, and WAL tail pointer. Recovery starts by
-// reading this.
+// catalog root, last-checkpoint LSN, WAL tail pointer, and the transaction
+// manager's next xid. Recovery starts by reading this.
 //
 // Layout (all little-endian, D9):
 //   [0..4]   magic          u32
@@ -10,8 +10,19 @@
 //   [12..16] catalog_root   u32   (PageId; INVALID_PAGE_ID = no catalog yet, M1)
 //   [16..24] checkpoint_lsn u64
 //   [24..32] wal_tail_lsn   u64
-//   [32..36] crc32          u32   (over bytes [0..32])
-// Total: 36 bytes
+//   [32..40] next_xid       u64   (M5 fix — see format.rs's v2->v3 note)
+//   [40..44] crc32          u32   (over bytes [0..40])
+// Total: 44 bytes
+//
+// `next_xid` closes a real gap: `TransactionManager::recover_next_xid`
+// derives the resumed xid purely from `WAL_TXN_BEGIN` records still
+// present in the WAL, but `checkpoint::run` truncates every record before
+// the checkpoint LSN — in ordinary use, *every* prior transaction's begin
+// record, since a checkpoint only runs after they've all committed.
+// Without persisting `next_xid` here, committing transactions, checkpointing,
+// then reopening would silently reset the xid counter to 1, reissuing
+// already-used xids (`Engine::open` now resumes at
+// `max(WAL-scan result, control.next_xid)` — see `lib.rs`).
 
 use std::{
     fs::{File, OpenOptions},
@@ -28,8 +39,8 @@ use crate::{
     },
 };
 
-const CONTROL_SIZE: usize = 36;
-const CRC_PAYLOAD_LEN: usize = 32;
+const CONTROL_SIZE: usize = 44;
+const CRC_PAYLOAD_LEN: usize = 40;
 
 #[derive(Debug, Clone)]
 pub struct ControlData {
@@ -37,6 +48,12 @@ pub struct ControlData {
     pub catalog_root: PageId,
     pub checkpoint_lsn: u64,
     pub wal_tail_lsn: u64,
+    /// The transaction manager's next-xid-to-issue, as of the last
+    /// checkpoint (`checkpoint::run` persists it; `Engine::open` resumes
+    /// at `max(WAL-scan result, this field)`). `1` on a fresh database —
+    /// matches `TransactionManager::recover_next_xid`'s own empty-WAL
+    /// default.
+    pub next_xid: u64,
 }
 
 impl ControlData {
@@ -46,6 +63,7 @@ impl ControlData {
             catalog_root: INVALID_PAGE_ID,
             checkpoint_lsn: INVALID_LSN,
             wal_tail_lsn: INVALID_LSN,
+            next_xid: 1,
         }
     }
 }
@@ -59,13 +77,14 @@ fn encode(cd: &ControlData) -> [u8; CONTROL_SIZE] {
     buf[12..16].copy_from_slice(&u32_to_le(cd.catalog_root));
     buf[16..24].copy_from_slice(&u64_to_le(cd.checkpoint_lsn));
     buf[24..32].copy_from_slice(&u64_to_le(cd.wal_tail_lsn));
+    buf[32..40].copy_from_slice(&u64_to_le(cd.next_xid));
     let crc = crc32fast::hash(&buf[..CRC_PAYLOAD_LEN]);
-    buf[32..36].copy_from_slice(&u32_to_le(crc));
+    buf[40..44].copy_from_slice(&u32_to_le(crc));
     buf
 }
 
 fn decode(buf: &[u8; CONTROL_SIZE]) -> Result<ControlData> {
-    let stored_crc = u32_from_le(buf[32..36].try_into().unwrap());
+    let stored_crc = u32_from_le(buf[40..44].try_into().unwrap());
     let computed_crc = crc32fast::hash(&buf[..CRC_PAYLOAD_LEN]);
     if stored_crc != computed_crc {
         return Err(DbError::ControlFileCorrupt(format!(
@@ -90,11 +109,13 @@ fn decode(buf: &[u8; CONTROL_SIZE]) -> Result<ControlData> {
     let catalog_root = u32_from_le(buf[12..16].try_into().unwrap());
     let checkpoint_lsn = u64_from_le(buf[16..24].try_into().unwrap());
     let wal_tail_lsn = u64_from_le(buf[24..32].try_into().unwrap());
+    let next_xid = u64_from_le(buf[32..40].try_into().unwrap());
     Ok(ControlData {
         page_size,
         catalog_root,
         checkpoint_lsn,
         wal_tail_lsn,
+        next_xid,
     })
 }
 
@@ -184,6 +205,19 @@ mod tests {
         let cd2 = read(&p).unwrap();
         assert_eq!(cd2.checkpoint_lsn, 42);
         assert_eq!(cd2.wal_tail_lsn, 99);
+    }
+
+    #[test]
+    fn next_xid_defaults_to_one_and_round_trips() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("control");
+        let mut cd = create(&p, DEFAULT_PAGE_SIZE).unwrap();
+        assert_eq!(cd.next_xid, 1);
+
+        cd.next_xid = 4242;
+        write(&p, &cd).unwrap();
+        let cd2 = read(&p).unwrap();
+        assert_eq!(cd2.next_xid, 4242);
     }
 
     #[test]

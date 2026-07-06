@@ -7,14 +7,22 @@ use crate::{
     bufferpool::BufferPool,
     control::{self, ControlData},
     error::Result,
+    format::Xid,
     wal::Wal,
 };
 
+/// `next_xid` is the transaction manager's current next-xid-to-issue
+/// (`TransactionManager::next_xid()`), persisted into the control file
+/// here — **must** be captured before truncation, since after this call
+/// the WAL may no longer contain any `WAL_TXN_BEGIN` record for
+/// `Engine::open`'s recovery scan to find. See `format.rs`'s v2->v3 note
+/// and `control.rs`'s module doc for the bug this closes.
 pub fn run(
     pool: &mut BufferPool,
     wal: &mut Wal,
     control_path: &Path,
     control: &mut ControlData,
+    next_xid: Xid,
 ) -> Result<()> {
     tracing::info!("checkpoint started");
 
@@ -24,9 +32,10 @@ pub fn run(
     // 2. Write checkpoint record to WAL and fsync.
     let ckpt_lsn = wal.log_checkpoint()?;
 
-    // 3. Update control file with new checkpoint LSN and WAL tail.
+    // 3. Update control file with new checkpoint LSN, WAL tail, and xid.
     control.checkpoint_lsn = ckpt_lsn;
     control.wal_tail_lsn = wal.current_lsn();
+    control.next_xid = next_xid;
     control::write(control_path, control)?;
 
     // 4. Truncate WAL: records before ckpt_lsn are now redundant.
@@ -59,11 +68,12 @@ mod tests {
         heap.insert(b"checkpoint_test", 1, &mut pool, &mut wal)
             .unwrap();
 
-        run(&mut pool, &mut wal, &ctrl_path, &mut ctrl).unwrap();
+        run(&mut pool, &mut wal, &ctrl_path, &mut ctrl, 7).unwrap();
         assert!(ctrl.checkpoint_lsn > INVALID_LSN);
 
         // Verify control file on disk matches.
         let on_disk = control::read(&ctrl_path).unwrap();
         assert_eq!(on_disk.checkpoint_lsn, ctrl.checkpoint_lsn);
+        assert_eq!(on_disk.next_xid, 7);
     }
 }

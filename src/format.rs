@@ -2,7 +2,20 @@
 // All on-disk integers are little-endian (D9).
 
 pub const MAGIC: u32 = 0x556E4442; // "UnDB"
-pub const FORMAT_VERSION: u16 = 2;
+
+// v2 -> v3: control file gained `next_xid` (8 bytes), persisted at every
+// checkpoint alongside checkpoint_lsn/wal_tail_lsn. Fixes a real bug found
+// during M5 manual testing: `TransactionManager::recover_next_xid` derives
+// the resumed xid purely from WAL_TXN_BEGIN records still present in the
+// WAL, but `checkpoint::run` truncates every record before the checkpoint
+// LSN — which, in ordinary use, is *every* prior transaction's begin
+// record, since a checkpoint only runs after they've all committed.
+// Without this fix, committing transactions, checkpointing, then reopening
+// resets the xid counter to 1, silently reissuing already-used xids (MVCC
+// visibility corruption). No migration path — no prior version of this
+// database has shipped externally (same precedent as v1->v2's tuple-header
+// change, M1.a).
+pub const FORMAT_VERSION: u16 = 3;
 
 /// Default page size: 8 KiB (D8). Baked into the control file at DB init.
 pub const DEFAULT_PAGE_SIZE: u32 = 8192;

@@ -91,6 +91,14 @@ impl TransactionManager {
         }
     }
 
+    /// The next xid that will be issued by [`Self::begin`]. Persisted into
+    /// the control file at every checkpoint (`checkpoint::run`) so
+    /// `Engine::open` can resume correctly even after the WAL has been
+    /// truncated and no longer has any `WAL_TXN_BEGIN` record to scan.
+    pub fn next_xid(&self) -> Xid {
+        self.next_xid
+    }
+
     /// Determine the xid counter to resume from after a crash: one past the
     /// highest xid that ever began, per the WAL's `WAL_TXN_BEGIN` records.
     pub fn recover_next_xid(records: &[WalRecord]) -> Xid {
