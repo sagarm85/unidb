@@ -42,7 +42,12 @@ use crate::{
 /// current version of this row" re-resolve via a fresh scan/lookup rather
 /// than dereferencing a RowId across statements (no cross-statement cursor
 /// stability in M1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+// `serde::Serialize` (not gated behind the `server` feature — `serde` is
+// already an unconditional core dependency, used by `Literal`/`CmpOp` etc.
+// for the catalog's on-disk JSON blob; this is just a plain, harmless
+// additive derive) so the M5 REST server can return a `RowId` directly as
+// a JSON response body without a separate wrapper type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct RowId {
     pub page_id: PageId,
     pub slot: u16,

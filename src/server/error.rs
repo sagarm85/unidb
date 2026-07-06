@@ -1,11 +1,10 @@
-//! `DbError` -> HTTP mapping (M5.b wires this to axum's `IntoResponse`;
-//! this file defines the shape now so `EngineHandle`'s reply types
-//! (`crate::error::Result<T>`) stay stable across the M5.a/M5.b boundary
-//! without pulling `axum` into M5.a's still axum-free dependency set).
-//!
-//! `ApiError` is a newtype, not an `impl IntoResponse for DbError` directly
-//! on `crate::error::DbError` — `error.rs` is used by the default,
-//! non-`server` build too and must stay completely axum-agnostic.
+//! `DbError` -> HTTP mapping. `ApiError` is a newtype, not an
+//! `impl IntoResponse for DbError` directly on `crate::error::DbError` —
+//! `error.rs` is used by the default, non-`server` build too and must stay
+//! completely axum-agnostic.
+
+use axum::{http::StatusCode, response::IntoResponse, Json};
+use serde::Serialize;
 
 use crate::error::DbError;
 
@@ -14,5 +13,64 @@ pub struct ApiError(pub DbError);
 impl From<DbError> for ApiError {
     fn from(err: DbError) -> Self {
         ApiError(err)
+    }
+}
+
+#[derive(Serialize)]
+struct ErrorBody {
+    error: String,
+    code: &'static str,
+}
+
+/// Maps a `DbError` to `(HTTP status, machine-readable code)`. Client-facing
+/// variants are listed individually and exhaustively; everything else
+/// (low-level storage/recovery errors a well-formed request should never
+/// trigger) falls into one grouped `_` catch-all mapped to 500 — documented
+/// here explicitly so a future `DbError` addition that *should* get its own
+/// 4xx status doesn't silently default to 500 unnoticed.
+fn map_status(err: &DbError) -> (StatusCode, &'static str) {
+    match err {
+        DbError::TableNotFound(_) => (StatusCode::NOT_FOUND, "TABLE_NOT_FOUND"),
+        DbError::ColumnNotFound { .. } => (StatusCode::NOT_FOUND, "COLUMN_NOT_FOUND"),
+        DbError::NoVisibleVersion { .. } => (StatusCode::NOT_FOUND, "NOT_FOUND"),
+
+        DbError::TableAlreadyExists(_) => (StatusCode::CONFLICT, "TABLE_ALREADY_EXISTS"),
+        DbError::WriteConflict { .. } => (StatusCode::CONFLICT, "WRITE_CONFLICT"),
+        DbError::SerializationFailure { .. } => (StatusCode::CONFLICT, "SERIALIZATION_FAILURE"),
+
+        DbError::SqlParse(_) => (StatusCode::BAD_REQUEST, "SQL_PARSE_ERROR"),
+        DbError::SqlPlan(_) => (StatusCode::BAD_REQUEST, "SQL_PLAN_ERROR"),
+        DbError::SqlUnsupported(_) => (StatusCode::BAD_REQUEST, "SQL_UNSUPPORTED"),
+        DbError::TxnNotActive { .. } => (StatusCode::BAD_REQUEST, "TXN_NOT_ACTIVE"),
+        DbError::TxnAlreadyFinished { .. } => (StatusCode::BAD_REQUEST, "TXN_ALREADY_FINISHED"),
+        DbError::BadPageSize(_) => (StatusCode::BAD_REQUEST, "BAD_PAGE_SIZE"),
+
+        // Low-level storage/recovery/transport errors a well-formed client
+        // request should never trigger.
+        DbError::Io(_)
+        | DbError::BadMagic { .. }
+        | DbError::BadVersion(_)
+        | DbError::ChecksumMismatch { .. }
+        | DbError::WalCorrupt { .. }
+        | DbError::BufferPoolFull
+        | DbError::PageNotFound { .. }
+        | DbError::HeapFull { .. }
+        | DbError::SlotOutOfRange { .. }
+        | DbError::TupleDeleted { .. }
+        | DbError::Recovery(_)
+        | DbError::ControlFileCorrupt(_)
+        | DbError::CatalogCorrupt(_)
+        | DbError::EngineUnavailable => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        let (status, code) = map_status(&self.0);
+        let body = ErrorBody {
+            error: self.0.to_string(),
+            code,
+        };
+        (status, Json(body)).into_response()
     }
 }

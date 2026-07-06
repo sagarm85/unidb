@@ -57,7 +57,10 @@ pub enum SecondaryIndex {
     FullText(InvertedIndex),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// `serde::Serialize` for the M5 REST server (`GET /indexes/:table/:column/
+// status`) — see `heap::RowId`'s doc comment for why this isn't
+// feature-gated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum IndexStatus {
     Building { rows_done: u64 },
     Ready,

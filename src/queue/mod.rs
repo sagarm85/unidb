@@ -31,7 +31,9 @@ pub const EVENTS_TABLE: &str = "__events__";
 pub const CONSUMERS_TABLE: &str = "__consumers__";
 
 /// One event, as returned by `Engine::poll_events`.
-#[derive(Debug, Clone, PartialEq)]
+// `serde::Serialize` for the M5 REST/SSE server — see `heap::RowId`'s doc
+// comment for why this isn't feature-gated.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Event {
     pub seq: i64,
     pub xid: i64,

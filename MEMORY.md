@@ -12,37 +12,86 @@
 
 ## Current status
 
-- **Milestone:** M1, M2, M3, and **M4 (event queue) are all DONE** — all
-  four M4 checkpoints (M4.a event capture foundation, M4.b poll/ack, M4.c
-  vacuum + durability-contract proof, M4.d MVCC/crash correctness +
-  benchmarks) complete, benchmarked, and committed directly to `main` (no
-  feature branch — the one-off M3.a PR-branch experiment was not repeated,
-  per the user's explicit "switch to main and continue" instruction from
-  that session). The former M4 plan lived at
-  `/Users/sagarmahamuni/.claude/plans/misty-hugging-brook.md` (plan file is
-  reused/overwritten per milestone — its content is not a durable record;
-  this file and `PROGRESS.md` are).
-- **State:** 203 unit tests + 11 crash-harness tests + 4 `graph_locking` +
-  3 `graph_rebuild` + 2 `graph_mvcc` + 3 `index_rebuild` + 1 `vector_mvcc`
-  + 4 `queue_vacuum` + 2 `queue_mvcc` (233 total) all green, `cargo clippy
-  --all-targets -- -D warnings` clean, `cargo fmt --all --check` clean,
-  release build succeeds. `Engine::poll_events`/`ack_events`/
-  `vacuum_events` are all MVCC-correct (proven by `tests/queue_mvcc.rs`,
-  including the aborted-`ack_events` case) and the milestone's central
-  claim — a slow consumer cannot block WAL truncation — is proven by a
-  concrete test (`tests/queue_vacuum.rs::wal_truncation_is_unaffected_by_
-  consumer_lag`), not just inferred from code review.
-- **Immediate next task:** No milestone is actively in progress. Two
-  explicitly deferred follow-ups exist, not yet started: (1) the full
-  CLAUDE.md §6 cross-domain "replaced stack" benchmark (Postgres +
-  pgvector + a graph DB + a message queue, one unidb transaction vs.
-  dual/triple-write with no shared transaction) — now possible for the
-  first time since all four data models exist, but a materially bigger
-  lift than any single-milestone benchmark session and was explicitly
-  deferred by the user rather than folded into M4; (2) M5 (API/server)
-  planning has not started. See Open questions below for what's still
-  unresolved from M1–M4.
+- **Milestone:** M1-M4 are all DONE. **M5 (API/server) is IN PROGRESS** —
+  M5.a (stabilize embedded crate + writer-thread bridge) and M5.b (REST
+  core: CRUD/SQL/Cypher/graph/indexing) are complete; M5.c (JWT auth, SSE
+  subscribe, `/metrics`) and M5.d (hardening, tests, benchmarks, closeout)
+  remain. The approved plan lives at
+  `/Users/sagarmahamuni/.claude/plans/misty-hugging-brook.md`.
+- **Critical fix landed mid-M5 (2026-07-06), its own commit, not part of
+  M5's feature work:** a real xid-reuse-after-checkpoint bug was found by
+  manually smoke-testing the new REST server (commit several transactions,
+  `checkpoint()`, reopen — the xid counter incorrectly reset to 1). Root
+  cause and fix are in the design note below and `PROGRESS.md`'s dedicated
+  entry; control file format bumped v2->v3 (D3/D9), human sign-off
+  confirmed with the user before implementing. This predates M5 entirely
+  (an M1-era gap) but was only surfaced by M5's checkpoint+reopen usage
+  pattern, which no prior test exercised.
+- **State:** 205 unit tests (208 with `--features server`) + 11
+  crash-harness tests + 4 `graph_locking` + 3 `graph_rebuild` + 2
+  `graph_mvcc` + 3 `index_rebuild` + 1 `vector_mvcc` + 4 `queue_vacuum` + 2
+  `queue_mvcc` all green, both with and without `--features server`;
+  `cargo clippy --all-targets -- -D warnings` and `cargo fmt --all --check`
+  clean in both configurations; `cargo tree --no-default-features | grep -i
+  tokio` confirmed empty (the "engine stays sync" claim is literally true
+  for the default build).
+- **Immediate next task:** M5.c (JWT auth, SSE subscribe, `/metrics`).
+  Still explicitly deferred, not started: the full CLAUDE.md §6
+  cross-domain "replaced stack" benchmark — a separate future effort, not
+  folded into M5. See Open questions below for what's still unresolved
+  from M1-M4.
 - **Last updated:** 2026-07-06
+
+### Design note: xid reuse after checkpoint — a real M1-era bug, found and fixed during M5
+
+Found by manually smoke-testing the new REST server (M5.b), not by any
+automated test: `curl` through `/sql` to commit several transactions
+(observed xids up to 15), `POST /checkpoint`, restart the server, and the
+very first new transaction was issued `xid=1` — already used. Root cause:
+`TransactionManager::recover_next_xid` (`txn.rs`) resumes the xid counter
+by scanning the WAL for `WAL_TXN_BEGIN` records and taking `max + 1` — a
+correct approach *only* if those records are still in the WAL.
+`checkpoint::run` (`checkpoint.rs`) truncates every WAL record before the
+checkpoint LSN, and in ordinary use that's *every* prior transaction's
+begin record, since a checkpoint only ever runs after they've all
+committed. So the very first `Engine::open` after any checkpoint had
+nothing left to scan and silently defaulted to `1`.
+
+**Why no existing test caught this:** `lib.rs::xid_counter_survives_reopen`
+(M1.a) commits a transaction, calls `flush()`, then reopens — `flush()`
+only flushes dirty pages, it never truncates the WAL, so the
+`WAL_TXN_BEGIN` record was always still there for that test's `recover_
+next_xid` call. No test in M1-M4 ever combined "commit, checkpoint,
+reopen" — the crash-injection harness's own checkpoint tests (P2/P4)
+check that *committed data* survives, not that *xid continuity* survives,
+and M2-M4's own reopen tests all use `flush()` for the same "just persist
+dirty pages" reason, never `checkpoint()`. M5's REST server was the first
+code path in this project's history to actually call `checkpoint()`
+against real traffic and then get reopened — an honest example of a gap
+that a new *usage pattern* surfaces even when every individual piece
+(`checkpoint`, `recover_next_xid`, WAL truncation) was independently
+correct and independently tested.
+
+**Fix:** persist `TransactionManager`'s current `next_xid` (new `pub fn
+next_xid(&self) -> Xid` accessor) into the control file at every
+checkpoint, captured *before* `wal.truncate_before` runs. Control file
+grew from 36 to 44 bytes (`next_xid: u64` at `[32..40]`, crc moved to
+`[40..44]`), `FORMAT_VERSION` bumped 2->3 — a D3/D9-locked-decision
+change, confirmed with the user before implementing (they chose "fix now,
+as its own commit" over "note it and keep going with M5"). `Engine::open`
+now resumes at `max(WAL-scan result, control.next_xid)`: correct whether
+or not a checkpoint ever ran, and correct even if a future scenario
+somehow has the WAL know about a *higher* xid than the last checkpoint
+recorded (e.g. transactions active on the WAL side after the last
+checkpoint but not yet checkpointed themselves).
+
+**Severity note, stated plainly for a future reader:** this was silent
+data-corruption-class, not a panic or an error return — a reissued xid
+could collide with or be misordered relative to a prior committed xid
+still referenced by existing tuples' `xmin`/`xmax`, producing wrong query
+results with no error anywhere. Fixed immediately given that severity,
+not deferred as "M5 tech debt," even though it isn't part of M5's actual
+feature scope.
 
 ### Design note: WAL-tailing is a dead end for the event queue — copy events into an ordinary table instead (M4.a)
 
@@ -1314,6 +1363,62 @@ all tests green ✅ — closing out M4 as a whole.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-06 — M5.a and M5.b complete; xid-reuse-after-checkpoint bug found and fixed
+
+- Planned M5 via the same process as M2-M4: three parallel research passes
+  (Engine's full public API surface + `Send`/error shape; codebase
+  module/error/test/bench conventions; external crate landscape for REST/
+  JWT/metrics/sync-to-async bridging), a Plan agent producing a concrete
+  checkpoint design, three confirmed decisions (writer-thread bridge over
+  `Mutex<Engine>`; SSE over WebSockets for subscribe; verify-only stateless
+  JWT, no login endpoint).
+- **M5.a** — `Engine: Send` compile-time assertion, crate-level doc
+  comment, transaction-boundary doc comments on `insert`/`get`/`delete`/
+  `checkpoint`/`begin_with_isolation`/`commit`/`abort`, an unwrap/expect
+  audit (confirmed clean — every non-test occurrence is either
+  infallible-by-construction, an internal invariant, or an already-accepted
+  RwLock-poisoning/thread-spawn-failure exception). `src/server/`
+  (`engine_handle.rs`, `error.rs`, `mod.rs`) behind a new `server` Cargo
+  feature — `EngineHandle` mirrors `index_worker.rs`'s spawn/channel/
+  bounded-shutdown shape exactly, one dedicated OS thread owning `Engine`
+  for its whole life.
+- **M5.b** — axum/tokio brought in behind `server`; `src/server/`
+  (`dto.rs`, `handlers.rs`, `router.rs`) plus `src/bin/unidb-server.rs`.
+  Every mutating route wraps one `begin -> execute -> commit-or-abort`
+  cycle; `/sql`/`/cypher` get atomic multi-statement transactions over
+  HTTP for free via `execute_sql`'s existing `;`-separated-string support
+  — no new engine code needed for that. `RowId`/`Edge`/`Event`/
+  `IndexStatus` gained plain `serde::Serialize` derives (not feature-gated
+  — `serde` is already an unconditional core dependency via `Literal`).
+  Deliberately did **not** derive `Serialize` on `Literal`/`ExecResult`
+  themselves: `Literal` already derives `Serialize`/`Deserialize`
+  unconditionally for the catalog's on-disk RLS-policy blob, and changing
+  that representation would be a breaking change to on-disk data — instead
+  `server::dto::literal_to_json`/`exec_result_to_json` do the REST-facing
+  conversion explicitly, reusing M4's `queue::payload::row_to_json`
+  per-variant mapping. Manually smoke-tested end-to-end against a running
+  `unidb-server`: SQL, raw CRUD, edges, index status, checkpoint, error
+  mapping (404/409/400/500), multi-statement abort-rolls-back-the-row-data
+  (though not the `CREATE TABLE` DDL itself — inherits M1's already-
+  documented catalog-non-transactional gap), and graceful shutdown via
+  real `SIGINT` (confirmed `EngineHandle::shutdown()` drains and joins,
+  and a fresh `Engine::open` afterward sees everything committed).
+- **Critical bug found via that same manual testing, fixed immediately as
+  its own commit** (see the design note above and `PROGRESS.md`'s
+  dedicated entry): checkpointing then reopening reset the xid counter to
+  1 because `checkpoint::run`'s WAL truncation removes the very
+  `WAL_TXN_BEGIN` records `recover_next_xid` depends on. Fixed by
+  persisting `next_xid` in the control file (v2->v3 format bump, D3/D9,
+  human sign-off confirmed before implementing) and resuming at
+  `max(WAL-scan, control.next_xid)` on open. Regression test:
+  `lib.rs::xid_counter_survives_reopen_after_checkpoint`.
+- Verified throughout: `cargo build`/`test`/`clippy --all-targets -- -D
+  warnings`/`fmt --all --check`, all clean **both** with and without
+  `--features server`; `cargo tree --no-default-features | grep -i tokio`
+  confirmed empty.
+- Next: M5.c (JWT auth, SSE subscribe, `/metrics`), then M5.d (hardening,
+  tests, benchmarks, closeout).
 
 ### 2026-07-06 — M4 complete (all four checkpoints); M4 milestone DONE
 

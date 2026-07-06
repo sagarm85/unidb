@@ -17,8 +17,26 @@
 //! future call site to remember a new locking discipline forever.
 //!
 //! Submodules: [`engine_handle`] (the writer-thread bridge), [`error`]
-//! (`DbError` → HTTP status mapping). Later checkpoints add `handlers`,
-//! `router`, `dto` (M5.b), `auth`, `sse`, `metrics` (M5.c).
+//! (`DbError` → HTTP status mapping), [`dto`] (wire-format request/response
+//! shapes), [`handlers`] (one `async fn` per route), [`router`]
+//! (`build_router`). Later checkpoints (M5.c) add `auth`, `sse`, `metrics`.
 
+pub mod dto;
 pub mod engine_handle;
 pub mod error;
+pub mod handlers;
+pub mod router;
+
+use std::sync::Arc;
+
+use engine_handle::EngineHandle;
+
+/// Shared state threaded through every handler via axum's `State`
+/// extractor. `EngineHandle` is wrapped in `Arc` purely so cloning
+/// `AppState` per-request is cheap — this is not a second writer thread or
+/// a pool, just N concurrent request-handling tasks each holding a cheap
+/// handle to the *one* channel `Sender` inside `EngineHandle`.
+#[derive(Clone)]
+pub struct AppState {
+    pub engine: Arc<EngineHandle>,
+}

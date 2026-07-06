@@ -604,7 +604,59 @@ carried-forward list):**
   zero-automatic-vacuum precedent exactly; confirmed by reading `Engine::
   checkpoint`'s call site, not assumed.
 
-## M5 — API / server   [PLANNED]
+## Bug fix (found during M5): xid reuse after checkpoint   2026-07-06
+
+**Locked-decision change:** D3 (control file) and D9 (fixed on-disk
+format) — control file format bumped v2 -> v3. **Human sign-off:**
+confirmed with the user before implementation (asked directly whether to
+fix immediately as its own commit vs. defer past M5; user chose to fix
+immediately).
+
+**What was found:** while manually smoke-testing the new M5 REST server
+(`POST /sql` end-to-end against a running `unidb-server`), reopening the
+engine after an explicit `checkpoint()` call reset the transaction
+manager's xid counter back to 1, even though xids up to 15 had already
+been committed in the same database. Root cause:
+`TransactionManager::recover_next_xid` determines the xid to resume from
+purely by scanning the WAL for `WAL_TXN_BEGIN` records and taking `max +
+1` — but `checkpoint::run` truncates every WAL record before the
+checkpoint LSN, which in ordinary use is *every* prior transaction's begin
+record, since a checkpoint only ever runs after they've all committed.
+The existing `xid_counter_survives_reopen` test never caught this because
+it calls `flush()` (no truncation) before reopening, not `checkpoint()` —
+no existing test combined "commit several transactions, checkpoint,
+reopen" until M5's manual server testing exercised exactly that sequence.
+
+**Impact if left unfixed:** silent MVCC visibility corruption — a reissued
+xid could collide with, or be misordered relative to, a prior committed
+xid still referenced by existing tuples' `xmin`/`xmax`, producing wrong
+query results with no error raised. This affects every milestone (M1-M4),
+not just M5 — flagged and fixed immediately given the severity, rather
+than deferred as "M5 tech debt."
+
+**Fix:** the control file gained a `next_xid: u64` field (44 bytes total,
+up from 36; `FORMAT_VERSION` 2 -> 3), persisted by `checkpoint::run`
+alongside `checkpoint_lsn`/`wal_tail_lsn` — captured *before* WAL
+truncation, using a new `TransactionManager::next_xid()` accessor.
+`Engine::open` now resumes at `max(WAL-scan result, control.next_xid)`,
+correct whether or not a checkpoint ever ran. No migration path — no
+prior version of this database has shipped externally (same precedent as
+M1.a's v1->v2 tuple-header change).
+
+**What changed:** `src/format.rs` (`FORMAT_VERSION` 3, documented
+rationale), `src/control.rs` (`ControlData.next_xid`, updated
+encode/decode, layout doc), `src/txn.rs` (`TransactionManager::
+next_xid()`), `src/checkpoint.rs` (`run` takes an explicit `next_xid`
+parameter), `src/lib.rs` (`Engine::open`'s resume logic, `Engine::
+checkpoint()`'s call site).
+
+**Tests added:** `control.rs::next_xid_defaults_to_one_and_round_trips`;
+`checkpoint.rs`'s existing test extended to assert the persisted
+`next_xid`; `lib.rs::xid_counter_survives_reopen_after_checkpoint` — the
+actual regression test, proving a fresh open after checkpointing several
+committed transactions resumes strictly past the highest one used. Full
+suite (unit + crash + all integration tests) green both with and without
+`--features server` before and after.
 
 ## M5 — API / server   [PLANNED]
 _Embedded crate stabilized; optional REST + JWT auth + subscribe + `/metrics`._

@@ -23,7 +23,9 @@ use crate::{
 pub const EDGES_TABLE: &str = "__edges__";
 
 /// One resolved edge, returned by traversal (`Engine::edges_from`).
-#[derive(Debug, Clone, PartialEq)]
+// `serde::Serialize` for the M5 REST server (`GET /edges/from/:id`) — see
+// `heap::RowId`'s doc comment for why this isn't feature-gated.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Edge {
     pub row_id: RowId,
     pub to_id: i64,
