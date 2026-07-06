@@ -12,21 +12,19 @@
 
 ## Current status
 
-- **Milestone:** **M1 — MVCC + CRUD is DONE** (all four checkpoints: M1.a
-  MVCC core, M1.b SI abort-on-conflict, M1.c catalog + SQL subset, M1.d
-  hardening + benchmarks). The project is SQL-queryable, transactional, and
-  benchmarked end-to-end. M2 (vector & text search) has not been started.
-- **State:** 112 unit tests + 10 crash-harness tests (P1–P9 plus the
-  combined crash+MVCC property test) all green, `cargo clippy --all-targets
-  -- -D warnings` clean, `cargo fmt --all --check` clean, release build
-  succeeds. M1's benchmark table recorded in `PROGRESS.md`.
-- **Immediate next task:** Start M2 planning (vector search: `VECTOR(n)`
-  type, async background HNSW index, `NEAR` operator, full-text inverted
-  index) — no M2 work has begun. Before that, two identified-but-deferred
-  M1 items are worth a deliberate decision (fix now vs. carry forward, see
-  Open questions below): the read-only-transaction fsync inefficiency found
-  during M1.d's benchmark pass, and RC's EvalPlanQual re-evaluation path
-  (D12), which remains unimplemented.
+- **Milestone:** M1 is DONE. **M2 (vector & text search) is underway —
+  checkpoint M2.a (`VECTOR(n)` foundation) is complete.** The approved plan
+  lives at `/Users/sagarmahamuni/.claude/plans/misty-hugging-brook.md` (four
+  checkpoints, M2.a–d).
+- **State:** 121 unit tests + 10 crash-harness tests all green, `cargo
+  clippy --all-targets -- -D warnings` clean, `cargo fmt --all --check`
+  clean, release build succeeds. `VECTOR(n)` round-trips end-to-end through
+  the SQL layer (`CREATE TABLE` → `INSERT [..]` → `SELECT`), dimension
+  mismatches rejected with a clear `DbError::SqlPlan`, not a panic.
+- **Immediate next task:** Checkpoint M2.b — the background indexing worker
+  (`src/index_worker.rs`, `src/vector.rs` wrapping `instant-distance`),
+  M2's highest-risk piece since it's the engine's first background thread.
+  See the plan file for the full task breakdown (tasks 6–12).
 - **Last updated:** 2026-07-06
 
 ### Design note: read-only transactions pay an unnecessary commit fsync (found in M1.d)
@@ -134,6 +132,36 @@ same idempotent recovery pass is what makes crash-mid-abort safe too (P9,
 partway through its own undo_log, recovery re-derives the same "incomplete
 user txn" verdict from the WAL and re-applies the same idempotent undo.
 
+### Design note: VECTOR(n) row encoding and parser plumbing (M2.a)
+
+`ColumnType::Vector(u32)` carries a fixed dimension `n`, validated `> 0` at
+both `CREATE TABLE` time (parser) and every INSERT/UPDATE (executor's
+`coerce_value`/`decode_row`). Row encoding uses a new tag byte `5`:
+`[dim:4 LE][f32 * dim, 4 bytes LE each]` — dimension-prefixed (not just
+relying on the column's declared `n`) so `decode_row` can cross-check the
+stored dimension against the schema and return a `DbError::SqlPlan` on
+mismatch rather than silently misreading bytes or panicking. `f32`, not
+`f64`: matches real embedding models' native precision and halves row size,
+and matches `pgvector`/FAISS convention for the later Postgres+pgvector
+benchmark comparison.
+
+Parser plumbing required two `sqlparser` 0.62.0 specifics, both confirmed
+against the vendored source before use (see plan file): `VECTOR(n)` has no
+built-in AST type, so it arrives as `DataType::Custom(ObjectName,
+Vec<String>)` — matched case-insensitively on the name, first modifier
+parsed as `u32`. Bare `[0.1, 0.2, ...]` array literals parse unconditionally
+under `GenericDialect` as `SqlExpr::Array`, unrelated to `VECTOR` — handled
+by a new `convert_array_literal` that parses each element as `f32` (a
+narrow fallback scoped to array-literal elements only; `convert_value`'s
+general numeric path stays `i64`-only, unchanged).
+
+Dimension validation is deliberately enforced in three independent places
+(parser rejects `VECTOR(0)`; executor's `coerce_value` checks the literal's
+length against the column at plan-execution time; `decode_row` re-checks on
+every read) rather than trusting any single point — cheap, and each guards
+a different failure mode (bad DDL, bad INSERT, corrupted/mismatched stored
+bytes).
+
 ### Design note: no cross-statement RowId stability
 
 Initially built `Heap::get` to walk the `prev_page`/`prev_slot` chain
@@ -182,8 +210,9 @@ src/
     logical.rs        — (new, M1.c) LogicalPlan/Expr/Literal/CmpOp + apply_rls (the entire
                          RLS mechanism is this one AND-rewrite function)
     parser.rs         — (new, M1.c) wraps `sqlparser`'s GenericDialect AST -> LogicalPlan
-    executor.rs        — (new, M1.c) row-at-a-time executor; hand-rolled row encoding
-                         (tag+value per column); no separate physical-plan IR (folded in)
+    executor.rs        — (new, M1.c; extended M2.a) row-at-a-time executor; hand-rolled
+                         row encoding (tag+value per column, tag 5 = Vector, M2.a);
+                         no separate physical-plan IR (folded in)
   checkpoint.rs       — flush dirty → checkpoint WAL record → update control → truncate WAL
   recovery.rs         — (extended, M1.a) mini-txn redo/undo (unchanged) +
                          incomplete-user-txn undo pass (decodes ownership from WAL redo bytes)
@@ -227,9 +256,8 @@ Key design decisions confirmed in implementation (M0 + M1.a + M1.b + M1.c):
 
 ## In progress
 
-Nothing — M1.a, M1.b, and M1.c checkpoints all fully verified. Ready to
-start M1.d (closing out the rest of M1's stated scope: combined crash+MVCC
-property test, M1 benchmark table).
+Nothing — M2.a checkpoint fully verified. Ready to start M2.b (background
+indexing worker + threading model, the highest-risk checkpoint in M2).
 
 ---
 
@@ -346,6 +374,29 @@ benchmark table is recorded with an honest M0 comparison ✅ (including
 reporting, not hiding, the read-only-txn regression found along the way),
 all tests green ✅ — closing out the M1 milestone as a whole.
 
+## M2.a task breakdown (ordered — all complete)
+
+1. ✅ `ColumnType::Vector(u32)` + `IndexKind{Hnsw,FullText}` +
+   `ColumnDef.index: Option<IndexKind>` (`catalog.rs`). Mechanical fix-up of
+   every existing `ColumnDef` literal across `catalog.rs`/`sql/*.rs` tests
+   to add the new field.
+2. ✅ Vector row encoding tag 5 (`sql/executor.rs`): `coerce_value`,
+   `encode_row`, `decode_row` all handle `Literal::Vector`/
+   `ColumnType::Vector(n)`, dimension-checked, no panics.
+3. ✅ `Literal::Vector(Vec<f32>)` (`sql/logical.rs`).
+4. ✅ Parser support (`sql/parser.rs`): `VECTOR(n)` via `DataType::Custom`
+   fallback, `[..]` array literals via `SqlExpr::Array` → `f32` elements.
+5. ✅ M2.a checkpoint verification: end-to-end SQL round-trip
+   (`execute_sql_vector_round_trip`, `execute_sql_vector_dimension_mismatch_rejected`
+   in `lib.rs`) plus parser/executor unit tests; 121 unit tests + 10 crash
+   tests green, clippy/fmt clean.
+
+**M2.a done when:** `CREATE TABLE t (id INT, embedding VECTOR(4))` →
+`INSERT ... VALUES (1, [0.1, 0.2, 0.3, 0.4])` → `SELECT` round-trips
+correctly through the actual SQL layer ✅, dimension mismatches rejected
+with a clear `DbError::SqlPlan` ✅, all tests green ✅. No index/worker yet
+— that's M2.b.
+
 ---
 
 ## Open questions / pending human input
@@ -417,6 +468,36 @@ all tests green ✅ — closing out the M1 milestone as a whole.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-06 — M2.a checkpoint complete (VECTOR(n) foundation)
+
+- Implemented all of M2.a per the approved plan
+  (`/Users/sagarmahamuni/.claude/plans/misty-hugging-brook.md`):
+  `ColumnType::Vector(u32)` + `IndexKind` in `catalog.rs`; row encoding tag
+  5 (`[dim:4 LE][f32*dim]`) in `sql/executor.rs`'s `coerce_value`/
+  `encode_row`/`decode_row`; `Literal::Vector(Vec<f32>)` in
+  `sql/logical.rs`; parser support for `VECTOR(n)` (via `DataType::Custom`)
+  and `[..]` array literals (via `SqlExpr::Array`) in `sql/parser.rs`.
+- No design deviations from the plan — both `sqlparser` internals
+  (`DataType::Custom` fallback, unconditional `SqlExpr::Array` parsing under
+  `GenericDialect`) were confirmed against the vendored 0.62.0 source ahead
+  of time in the plan, and held up exactly as expected during
+  implementation.
+- Dimension validation is deliberately redundant across three layers
+  (parser rejects `n=0`, executor's `coerce_value` checks INSERT/UPDATE
+  literals, `decode_row` re-checks stored bytes on every read) — see design
+  note above for why each guards a distinct failure mode.
+- Added end-to-end SQL-level tests (`execute_sql_vector_round_trip`,
+  `execute_sql_vector_dimension_mismatch_rejected` in `lib.rs`) on top of
+  the parser/executor unit tests, confirming the feature works through the
+  real `Engine::execute_sql` path, not just in isolated unit tests.
+- **Final state:** 121 unit tests + 10 crash-harness tests green, `cargo
+  clippy --all-targets -- -D warnings` clean, `cargo fmt --all --check`
+  clean.
+- **Next:** M2.b — the background indexing worker (`src/index_worker.rs`,
+  `src/vector.rs` wrapping `instant-distance`). This is M2's highest-risk
+  checkpoint: the engine's first background thread, which must never touch
+  `BufferPool`/`Wal`/`Heap`. See the plan file's tasks 6–12.
 
 ### 2026-07-06 — M1.d complete; M1 milestone DONE
 

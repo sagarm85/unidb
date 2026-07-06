@@ -48,12 +48,29 @@ pub enum ColumnType {
     /// containment (`@>`), no binary JSONB encoding, no index — those are
     /// disproportionate until something actually indexes into JSON.
     Json,
+    /// Fixed-dimension `f32` embedding (M2). `n` is the dimension, validated
+    /// `> 0` at `CREATE TABLE` time; every inserted vector must match it
+    /// exactly (checked in `sql/executor.rs::coerce_and_validate_row`).
+    Vector(u32),
+}
+
+/// Which secondary index (if any) a column has. `None` by default — indexing
+/// is always an explicit `CREATE INDEX` opt-in, never automatic, since
+/// indexing every column by default would silently impose background-worker
+/// overhead on tables that never query it (M2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IndexKind {
+    /// Only valid on `ColumnType::Vector(_)`.
+    Hnsw,
+    /// Only valid on `ColumnType::Text`.
+    FullText,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnDef {
     pub name: String,
     pub ty: ColumnType,
+    pub index: Option<IndexKind>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,6 +229,7 @@ mod tests {
             name: "accounts".to_string(),
             columns: vec![ColumnDef {
                 name: "id".to_string(),
+                index: None,
                 ty: ColumnType::Int64,
             }],
             pages: vec![],
@@ -262,10 +280,12 @@ mod tests {
             columns: vec![
                 ColumnDef {
                     name: "id".to_string(),
+                    index: None,
                     ty: ColumnType::Int64,
                 },
                 ColumnDef {
                     name: "data".to_string(),
+                    index: None,
                     ty: ColumnType::Json,
                 },
             ],
@@ -288,6 +308,45 @@ mod tests {
         let t = reloaded.lookup("widgets").unwrap();
         assert_eq!(t.columns.len(), 2);
         assert_eq!(t.pages, vec![7]);
+    }
+
+    #[test]
+    fn vector_column_and_index_kind_survive_reload() {
+        let dir = tempdir().unwrap();
+        let (mut pool, mut wal, cp, mut control) = setup(dir.path());
+        let mut catalog = Catalog::new();
+        let def = TableDef {
+            name: "embeddings".to_string(),
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    ty: ColumnType::Int64,
+                    index: None,
+                },
+                ColumnDef {
+                    name: "vec".to_string(),
+                    ty: ColumnType::Vector(384),
+                    index: Some(IndexKind::Hnsw),
+                },
+            ],
+            pages: vec![],
+            rls_policy: None,
+        };
+        {
+            let mut ctx = CatalogCtx {
+                pool: &mut pool,
+                wal: &mut wal,
+                control_path: &cp,
+                control: &mut control,
+                page_size: DEFAULT_PAGE_SIZE as usize,
+            };
+            catalog.create_table(def, &mut ctx).unwrap();
+        }
+
+        let reloaded = Catalog::load(&control, &mut pool).unwrap();
+        let t = reloaded.lookup("embeddings").unwrap();
+        assert_eq!(t.columns[1].ty, ColumnType::Vector(384));
+        assert_eq!(t.columns[1].index, Some(IndexKind::Hnsw));
     }
 
     #[test]

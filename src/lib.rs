@@ -520,6 +520,55 @@ mod tests {
         assert!(matches!(&remaining[0], SqlResult::Rows(rows) if rows.len() == 1));
     }
 
+    // ── M2.a: VECTOR(n) end-to-end ──────────────────────────────────────────
+
+    #[test]
+    fn execute_sql_vector_round_trip() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, embedding VECTOR(4))")
+            .unwrap();
+        engine
+            .execute_sql(
+                xid,
+                "INSERT INTO t (id, embedding) VALUES (1, [0.1, 0.2, 0.3, 0.4])",
+            )
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        let xid2 = engine.begin().unwrap();
+        let results = engine
+            .execute_sql(xid2, "SELECT * FROM t WHERE id = 1")
+            .unwrap();
+        match &results[0] {
+            SqlResult::Rows(rows) => {
+                assert_eq!(
+                    rows[0][1],
+                    crate::sql::logical::Literal::Vector(vec![0.1, 0.2, 0.3, 0.4])
+                );
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn execute_sql_vector_dimension_mismatch_rejected() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, embedding VECTOR(4))")
+            .unwrap();
+        let err = engine
+            .execute_sql(xid, "INSERT INTO t (id, embedding) VALUES (1, [0.1, 0.2])")
+            .unwrap_err();
+        assert!(matches!(err, DbError::SqlPlan(_)));
+    }
+
     #[test]
     fn sql_survives_reopen() {
         let dir = tempdir().unwrap();

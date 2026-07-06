@@ -6,8 +6,8 @@
 // is the actual point of this milestone, not parser plumbing.
 
 use sqlparser::ast::{
-    self, BinaryOperator, DataType, Expr as SqlExpr, FromTable, SelectItem, SetExpr, Statement,
-    TableFactor, TableObject, Value,
+    self, Array as SqlArray, BinaryOperator, DataType, Expr as SqlExpr, FromTable, SelectItem,
+    SetExpr, Statement, TableFactor, TableObject, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser as SqlParser;
@@ -50,6 +50,7 @@ fn convert_create_table(ct: ast::CreateTable) -> Result<LogicalPlan> {
             Ok(ColumnDef {
                 name: c.name.value,
                 ty: convert_data_type(&c.data_type)?,
+                index: None,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -66,6 +67,24 @@ fn convert_data_type(dt: &DataType) -> Result<ColumnType> {
         }
         DataType::Bool | DataType::Boolean => Ok(ColumnType::Bool),
         DataType::JSON => Ok(ColumnType::Json),
+        // `VECTOR(n)` has no built-in sqlparser type; it falls through to
+        // `DataType::Custom(name, modifiers)` (confirmed against sqlparser
+        // 0.62.0's own AST — see the M2 plan's checkpoint M2.a notes).
+        DataType::Custom(name, modifiers) if name.to_string().eq_ignore_ascii_case("vector") => {
+            let dim = modifiers
+                .first()
+                .ok_or_else(|| DbError::SqlUnsupported("VECTOR requires a dimension".into()))?
+                .parse::<u32>()
+                .map_err(|_| {
+                    DbError::SqlUnsupported("VECTOR dimension must be a positive integer".into())
+                })?;
+            if dim == 0 {
+                return Err(DbError::SqlUnsupported(
+                    "VECTOR dimension must be greater than 0".into(),
+                ));
+            }
+            Ok(ColumnType::Vector(dim))
+        }
         other => Err(DbError::SqlUnsupported(format!(
             "unsupported column type: {other}"
         ))),
@@ -126,10 +145,52 @@ fn convert_value_expr(e: &SqlExpr) -> Result<Literal> {
                 "unary minus not supported on {other:?}"
             ))),
         },
+        SqlExpr::Array(arr) => convert_array_literal(arr),
         other => Err(DbError::SqlUnsupported(format!(
             "unsupported literal in VALUES: {other:?}"
         ))),
     }
+}
+
+/// `[0.1, 0.2, ...]` array literals are only meaningful as `VECTOR(n)`
+/// values in M2 — parse every element as `f32`. This is a narrow
+/// float-parsing fallback scoped to array-literal elements only;
+/// `convert_value`'s general numeric path stays `i64`-only.
+fn convert_array_literal(arr: &SqlArray) -> Result<Literal> {
+    let values = arr
+        .elem
+        .iter()
+        .map(|e| match e {
+            SqlExpr::Value(vws) => match &vws.value {
+                Value::Number(s, _) => s
+                    .parse::<f32>()
+                    .map_err(|_| DbError::SqlUnsupported(format!("invalid vector element: {s}"))),
+                other => Err(DbError::SqlUnsupported(format!(
+                    "unsupported vector element: {other:?}"
+                ))),
+            },
+            SqlExpr::UnaryOp {
+                op: ast::UnaryOperator::Minus,
+                expr,
+            } => match expr.as_ref() {
+                SqlExpr::Value(vws) => match &vws.value {
+                    Value::Number(s, _) => s.parse::<f32>().map(|v| -v).map_err(|_| {
+                        DbError::SqlUnsupported(format!("invalid vector element: {s}"))
+                    }),
+                    other => Err(DbError::SqlUnsupported(format!(
+                        "unsupported vector element: {other:?}"
+                    ))),
+                },
+                other => Err(DbError::SqlUnsupported(format!(
+                    "unsupported vector element: {other:?}"
+                ))),
+            },
+            other => Err(DbError::SqlUnsupported(format!(
+                "unsupported vector element: {other:?}"
+            ))),
+        })
+        .collect::<Result<Vec<f32>>>()?;
+    Ok(Literal::Vector(values))
 }
 
 fn convert_value(v: &Value) -> Result<Literal> {
@@ -349,6 +410,40 @@ mod tests {
                 assert_eq!(columns[1].ty, ColumnType::Json);
             }
             _ => panic!("expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn parses_create_table_with_vector_column() {
+        let plan = parse_one("CREATE TABLE t (id INT, embedding VECTOR(4))");
+        match plan {
+            LogicalPlan::CreateTable { columns, .. } => {
+                assert_eq!(columns[1].ty, ColumnType::Vector(4));
+            }
+            _ => panic!("expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn rejects_zero_dimension_vector() {
+        let err = parse_sql("CREATE TABLE t (embedding VECTOR(0))");
+        assert!(matches!(err, Err(DbError::SqlUnsupported(_))));
+    }
+
+    #[test]
+    fn parses_insert_with_vector_literal() {
+        let plan = parse_one("INSERT INTO t VALUES (1, [0.1, 0.2, -0.3, 0.4])");
+        match plan {
+            LogicalPlan::Insert { values, .. } => {
+                assert_eq!(
+                    values,
+                    vec![vec![
+                        Literal::Int(1),
+                        Literal::Vector(vec![0.1, 0.2, -0.3, 0.4])
+                    ]]
+                );
+            }
+            _ => panic!("expected Insert"),
         }
     }
 

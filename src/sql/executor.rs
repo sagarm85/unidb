@@ -331,6 +331,16 @@ fn coerce_value(table_name: &str, col: &ColumnDef, val: Literal) -> Result<Liter
             })?;
             Ok(Literal::Json(s))
         }
+        (ColumnType::Vector(n), Literal::Vector(v)) => {
+            if v.len() != *n as usize {
+                return Err(DbError::SqlPlan(format!(
+                    "table '{table_name}' column '{}': expected a {n}-dimension vector, got {}",
+                    col.name,
+                    v.len()
+                )));
+            }
+            Ok(Literal::Vector(v))
+        }
         (expected, got) => Err(DbError::SqlPlan(format!(
             "table '{table_name}' column '{}': expected {expected:?}, got {got:?}",
             col.name
@@ -491,7 +501,8 @@ fn apply_cmp(op: CmpOp, ord: std::cmp::Ordering) -> bool {
 
 // ── row encoding: [tag:1][value...] per column, in table-column order ──────
 // Tags: 0=Null, 1=Int64 (8 bytes LE), 2=Text (4-byte LE len + UTF8),
-// 3=Bool (1 byte), 4=Json (4-byte LE len + UTF8 text).
+// 3=Bool (1 byte), 4=Json (4-byte LE len + UTF8 text), 5=Vector
+// (4-byte LE dimension + dimension * 4-byte LE f32).
 
 pub fn encode_row(values: &[Literal]) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -516,6 +527,13 @@ pub fn encode_row(values: &[Literal]) -> Vec<u8> {
                 buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
                 buf.extend_from_slice(s.as_bytes());
             }
+            Literal::Vector(v) => {
+                buf.push(5);
+                buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                for f in v {
+                    buf.extend_from_slice(&f.to_le_bytes());
+                }
+            }
         }
     }
     buf
@@ -524,7 +542,7 @@ pub fn encode_row(values: &[Literal]) -> Vec<u8> {
 pub fn decode_row(bytes: &[u8], columns: &[ColumnDef]) -> Result<Vec<Literal>> {
     let mut out = Vec::with_capacity(columns.len());
     let mut pos = 0usize;
-    for _ in columns {
+    for col in columns {
         let tag = *bytes
             .get(pos)
             .ok_or_else(|| DbError::SqlPlan("row decode error: truncated tag".into()))?;
@@ -570,6 +588,40 @@ pub fn decode_row(bytes: &[u8], columns: &[ColumnDef]) -> Result<Vec<Literal>> {
                     .ok_or_else(|| DbError::SqlPlan("row decode error: truncated bool".into()))?;
                 pos += 1;
                 Literal::Bool(b != 0)
+            }
+            5 => {
+                let dim_end = pos + 4;
+                let dim_raw: [u8; 4] = bytes
+                    .get(pos..dim_end)
+                    .ok_or_else(|| {
+                        DbError::SqlPlan("row decode error: truncated vector dim".into())
+                    })?
+                    .try_into()
+                    .unwrap();
+                let dim = u32::from_le_bytes(dim_raw) as usize;
+                pos = dim_end;
+                if let ColumnType::Vector(n) = col.ty {
+                    if dim != n as usize {
+                        return Err(DbError::SqlPlan(format!(
+                            "row decode error: column '{}' declares dimension {n}, but stored data has dimension {dim}",
+                            col.name
+                        )));
+                    }
+                }
+                let mut values = Vec::with_capacity(dim);
+                for _ in 0..dim {
+                    let f_end = pos + 4;
+                    let f_raw: [u8; 4] = bytes
+                        .get(pos..f_end)
+                        .ok_or_else(|| {
+                            DbError::SqlPlan("row decode error: truncated vector element".into())
+                        })?
+                        .try_into()
+                        .unwrap();
+                    values.push(f32::from_le_bytes(f_raw));
+                    pos = f_end;
+                }
+                Literal::Vector(values)
             }
             other => {
                 return Err(DbError::SqlPlan(format!(
@@ -841,18 +893,22 @@ mod tests {
         let columns = vec![
             ColumnDef {
                 name: "a".to_string(),
+                index: None,
                 ty: ColumnType::Int64,
             },
             ColumnDef {
                 name: "b".to_string(),
+                index: None,
                 ty: ColumnType::Text,
             },
             ColumnDef {
                 name: "c".to_string(),
+                index: None,
                 ty: ColumnType::Bool,
             },
             ColumnDef {
                 name: "d".to_string(),
+                index: None,
                 ty: ColumnType::Json,
             },
         ];
@@ -871,10 +927,53 @@ mod tests {
     fn row_encode_decode_handles_null() {
         let columns = vec![ColumnDef {
             name: "a".to_string(),
+            index: None,
             ty: ColumnType::Int64,
         }];
         let encoded = encode_row(&[Literal::Null]);
         let decoded = decode_row(&encoded, &columns).unwrap();
         assert_eq!(decoded, vec![Literal::Null]);
+    }
+
+    #[test]
+    fn row_encode_decode_vector_round_trip() {
+        let columns = vec![ColumnDef {
+            name: "embedding".to_string(),
+            index: None,
+            ty: ColumnType::Vector(4),
+        }];
+        let values = vec![Literal::Vector(vec![0.1, -0.2, 0.3, 0.4])];
+        let encoded = encode_row(&values);
+        let decoded = decode_row(&encoded, &columns).unwrap();
+        assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn row_decode_rejects_vector_dimension_mismatch() {
+        let columns = vec![ColumnDef {
+            name: "embedding".to_string(),
+            index: None,
+            ty: ColumnType::Vector(4),
+        }];
+        // Encode a 3-dimension vector but declare the column as 4.
+        let encoded = encode_row(&[Literal::Vector(vec![0.1, 0.2, 0.3])]);
+        let err = decode_row(&encoded, &columns);
+        assert!(matches!(err, Err(DbError::SqlPlan(_))));
+    }
+
+    #[test]
+    fn coerce_vector_rejects_dimension_mismatch() {
+        let table = TableDef {
+            name: "t".to_string(),
+            columns: vec![ColumnDef {
+                name: "embedding".to_string(),
+                index: None,
+                ty: ColumnType::Vector(4),
+            }],
+            pages: vec![],
+            rls_policy: None,
+        };
+        let err = coerce_and_validate_row(&table, vec![Literal::Vector(vec![0.1, 0.2, 0.3])]);
+        assert!(matches!(err, Err(DbError::SqlPlan(_))));
     }
 }

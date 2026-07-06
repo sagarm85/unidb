@@ -21,6 +21,10 @@ pub enum Literal {
     /// Raw JSON text (validated well-formed at INSERT/UPDATE time by the
     /// executor, not here).
     Json(String),
+    /// Fixed-dimension `f32` embedding (M2). Dimension is validated against
+    /// the column's declared `n` at INSERT/UPDATE time by the executor, not
+    /// here — this type just carries the parsed values.
+    Vector(Vec<f32>),
     Null,
 }
 
@@ -149,6 +153,7 @@ mod tests {
             name: table.to_string(),
             columns: vec![ColumnDef {
                 name: "id".to_string(),
+                index: None,
                 ty: ColumnType::Int64,
             }],
             pages: vec![],
