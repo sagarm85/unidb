@@ -58,6 +58,18 @@ pub enum Expr {
         expr: Box<Expr>,
         path: String,
     },
+    /// `NEAR(column, [0.1, 0.2, ...], k)` (M2.d): a predicate-shaped
+    /// construct, not a separate `LogicalPlan` variant, so it lives inside
+    /// `Select.predicate` and `apply_rls`'s existing AND-rewrite keeps
+    /// working unmodified — `WHERE NEAR(...) AND <rls policy>` composes for
+    /// free. `OR` is already rejected everywhere else in the AND-only
+    /// `WHERE` subset, so `NEAR(...) OR x` is rejected too, with no special
+    /// case needed here.
+    Near {
+        column: String,
+        query: Vec<f32>,
+        k: usize,
+    },
 }
 
 #[derive(Debug, Clone)]

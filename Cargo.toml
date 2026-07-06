@@ -22,3 +22,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "load"
 harness = false
+
+[[bench]]
+name = "vector"
+harness = false

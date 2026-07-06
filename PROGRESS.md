@@ -171,8 +171,123 @@ _Baseline note: SQLite remains the honest M1 comparison (both embedded, single-f
 
 ---
 
-## M2 — Vector & Text search   [PLANNED]
-_`VECTOR(n)` + async background HNSW; `NEAR`; full-text inverted index. **Headline baseline switches to the replaced stack.**_
+## M2 — Vector & Text search   [DONE]   2026-07-06
+
+**PR:** _pending (not yet opened; benchmarks recorded ahead of PR per session workflow)_
+**Summary:** `VECTOR(n)` column type, an asynchronous background indexing
+worker (the engine's first background thread — `src/index_worker.rs`), an
+HNSW vector index (`src/vector.rs`, wrapping `instant-distance`) and a
+full-text inverted index (`src/fulltext.rs`), an explicit `CREATE INDEX
+... USING HNSW|FULLTEXT` SQL surface, and a `NEAR(column, [...], k)` query
+operator with over-fetch-then-filter execution that stays fully
+MVCC/RLS-correct. Shipped as four internal checkpoints (M2.a `VECTOR(n)`
+foundation, M2.b background worker, M2.c full-text + `CREATE INDEX`, M2.d
+`NEAR` + benchmarks).
+
+**Benchmark scope note (§6):** the full four-system "replaced stack"
+comparison (Postgres + vector store + graph DB + queue, one cross-domain
+transaction touching all four) isn't achievable until M4 completes and all
+four data models exist. This entry uses **Postgres 18 + pgvector 0.8.4 as
+an interim proxy**, covering just the vector-search slice M2 actually
+competes on — confirmed with the user ahead of implementation, not a
+silent scope narrowing.
+
+**Benchmarks** (release build, Apple Silicon macOS, single-threaded caller,
+128-dim embeddings, `--sample-size 10`; Postgres numbers are server-side
+`EXPLAIN ANALYZE`/summed `\timing` execution time, excluding `psql` client
+process overhead, for an apples-to-apples comparison against unidb's
+in-process cost):
+
+| Workload                                          | unidb            | Postgres 18 + pgvector 0.8.4 |
+|----------------------------------------------------|------------------|-------------------------------|
+| INSERT 200 rows, 1 txn, **no** vector index         | ~234–241 elem/s (~4.2 ms/row) | ~10,668 elem/s (~0.094 ms/row) |
+| INSERT 200 rows, 1 txn, **with** HNSW index active  | ~83–86 elem/s (~11.8 ms/row)  | ~1,916 elem/s (~0.52 ms/row) |
+| Index-active overhead vs. no-index                  | ~2.8x slower     | ~5.6x slower |
+| `NEAR`/`ORDER BY <->` query, k=5, 300 rows indexed  | ~4.0–5.0 ms      | ~0.43 ms (planner chose seq scan + sort over HNSW at this row count — realistic at small scale) |
+| Raw `VectorIndex` upsert, building to 100 points¹   | ~7.7–7.9 ms/point (cumulative) | n/a (internal primitive, no Postgres equivalent) |
+| Raw `InvertedIndex` term search, 300 docs           | ~14.2 µs         | n/a (internal primitive) |
+
+¹ `index_primitives/vector_index_upsert_100`: 100 sequential upserts,
+  each rebuilding the whole HNSW graph from scratch (see the design note
+  below) — the ~781ms total reported by `cargo bench` divided across 100
+  points, not a per-op cost at steady state.
+
+**Honest read of these numbers, not a flattering one:**
+- unidb's absolute INSERT throughput is far behind pgvector's in both
+  configurations. Most of that gap **predates M2 and isn't vector-specific**:
+  M1's benchmark pass already found and documented that every statement
+  pays a WAL fsync (D2's per-statement mini-txn, unchanged since M0) —
+  Postgres's group-commit and OS-level write batching amortize this in a
+  way unidb's single-threaded, no-group-commit M0/M1 storage layer does not
+  yet. This is tracked, known tech debt (see `MEMORY.md`), not something
+  M2 introduced.
+- **The vector-specific overhead is real and worth stating plainly**:
+  `instant-distance` (the chosen HNSW crate) has no incremental single-point
+  insert in its public API — confirmed by reading the vendored source before
+  committing to the design, not assumed. `VectorIndex` therefore rebuilds
+  its entire graph from scratch on every upsert (M2.b's design note in
+  `MEMORY.md`), which is why unidb's index-active INSERT overhead (2.8x)
+  doesn't scale to larger datasets the way an incremental HNSW's would —
+  this is flagged as real tech debt, not hidden behind the "row write is
+  the only synchronous cost" claim, since at 200 rows the cost is already
+  measurable even though the rebuild happens off the foreground thread
+  (CPU contention between the foreground and worker threads on a
+  finite-core machine is the actual mechanism, not a blocking call).
+- unidb's `NEAR` latency (~4ms) is dominated by transactional overhead, not
+  the vector search itself: every `SELECT` still pays a full
+  begin-snapshot/commit round trip (the same read-only-transaction fsync
+  inefficiency M1 already found and deferred), while the raw index-search
+  primitive underneath resolves in microseconds once that wrapper is
+  stripped away (see `index_primitives/fulltext_search`'s ~14µs as a proxy
+  for how fast the underlying data structures actually are).
+- pgvector's planner chose a sequential scan over its own HNSW index for
+  the 300-row `NEAR`-equivalent query — expected, correct behavior at this
+  small scale, and left as-is rather than forcing index usage to produce a
+  more flattering number.
+
+**MVCC correctness (the single most important test in M2):**
+`tests/vector_mvcc.rs::aborted_insert_never_surfaces_in_near_results` —
+inserts a row, polls (deterministically, not via a timing guess) until the
+background worker has demonstrably indexed it, aborts instead of
+committing, then proves a fresh transaction's `NEAR` query never returns
+that row. This is the concrete proof that "the index has no concept of
+transactions" never leaks into a correctness bug, since `exec_select_near`
+re-checks every index-sourced candidate against MVCC visibility through the
+same `predicate_matches` path an ordinary scan uses.
+
+**Crash/rebuild correctness:** `tests/index_rebuild.rs` — engine restart
+correctly rebuilds both index kinds from committed rows and `NEAR` still
+works afterward; a `NEAR` query issued before the worker reports `Ready`
+returns a partial (never incorrect, never erroring) result set. No new
+crash-injection P-number was added (`tests/crash/main.rs` stays at P1–P9):
+the index is derived, rebuildable state with zero WAL footprint by design,
+so losing it on crash is expected, not a durability violation.
+
+**What changed:** `ColumnType::Vector(u32)` + hand-rolled row encoding
+(tag 5); `src/index_worker.rs` (new, the engine's first background
+thread); `src/vector.rs`/`src/fulltext.rs` (new); `LogicalPlan::CreateIndex`
++ `Expr::Near`; `Catalog::set_column_index` (a primitive shared by both the
+M2.b Rust API and M2.c's `CREATE INDEX`); `exec_select_near`'s
+over-fetch-then-filter execution. See `MEMORY.md` for the full
+module-by-module breakdown across all four checkpoints, including two
+design corrections found and fixed during implementation (the
+`instant-distance` incremental-insert assumption, and a rebuild-on-open gap
+that would have silently dropped `FullText` indexes on reopen).
+
+**Known limitations / tech debt (new in M2, on top of M1's carried-forward list):**
+- `VectorIndex`/`InvertedIndex` never reclaim entries for rows superseded
+  by UPDATE — the same shape of gap as M1's "no vacuum," just for the
+  secondary index instead of the heap (correctness is unaffected; it's an
+  unbounded space leak under update-heavy workloads on indexed columns).
+- No SQL-level full-text query surface — `InvertedIndex::search` exists and
+  is tested directly, but only `NEAR` (vector) has a `WHERE`-clause operator
+  in M2's scope.
+- `instant-distance`'s full-rebuild-per-upsert cost (see benchmark
+  discussion above) means unidb's vector-index-active INSERT overhead will
+  grow with dataset size in a way a true incremental HNSW would not —
+  flagged for a future milestone to revisit if it becomes a real blocker.
+
+---
 
 ## M3 — Graph   [PLANNED]
 _Edge records + edge-list index; Cypher subset; per-edge locking with batched adjacency latching._

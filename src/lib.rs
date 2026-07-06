@@ -351,6 +351,7 @@ fn rebuild_secondary_indexes(
             handle.send(IndexMsg::MarkReady {
                 table: table.name.clone(),
                 column: col.name.clone(),
+                kind: col.index.expect("indexed_cols is filtered to Some(_)"),
             });
         }
     }
@@ -840,6 +841,100 @@ mod tests {
             .execute_sql(xid, "CREATE INDEX idx ON t USING HNSW (body)")
             .unwrap_err();
         assert!(matches!(err, DbError::SqlPlan(_)));
+    }
+
+    // ── M2.d: NEAR ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn near_query_returns_nearest_neighbors_in_order() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, embedding VECTOR(2))")
+            .unwrap();
+        engine
+            .execute_sql(xid, "CREATE INDEX idx ON t USING HNSW (embedding)")
+            .unwrap();
+        engine
+            .execute_sql(xid, "INSERT INTO t (id, embedding) VALUES (1, [0.0, 0.0])")
+            .unwrap();
+        engine
+            .execute_sql(
+                xid,
+                "INSERT INTO t (id, embedding) VALUES (2, [100.0, 100.0])",
+            )
+            .unwrap();
+        engine
+            .execute_sql(xid, "INSERT INTO t (id, embedding) VALUES (3, [0.1, 0.1])")
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        wait_for_status(&engine, "t", "embedding", index_worker::IndexStatus::Ready);
+
+        let xid2 = engine.begin().unwrap();
+        let results = engine
+            .execute_sql(
+                xid2,
+                "SELECT id FROM t WHERE NEAR(embedding, [0.0, 0.0], 2)",
+            )
+            .unwrap();
+        match &results[0] {
+            SqlResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0][0], crate::sql::logical::Literal::Int(1));
+                assert_eq!(rows[1][0], crate::sql::logical::Literal::Int(3));
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn near_composes_with_ordinary_where_predicate() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(
+                xid,
+                "CREATE TABLE t (id INT, tag TEXT, embedding VECTOR(2))",
+            )
+            .unwrap();
+        engine
+            .execute_sql(xid, "CREATE INDEX idx ON t USING HNSW (embedding)")
+            .unwrap();
+        engine
+            .execute_sql(
+                xid,
+                "INSERT INTO t (id, tag, embedding) VALUES (1, 'a', [0.0, 0.0])",
+            )
+            .unwrap();
+        engine
+            .execute_sql(
+                xid,
+                "INSERT INTO t (id, tag, embedding) VALUES (2, 'b', [0.1, 0.1])",
+            )
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        wait_for_status(&engine, "t", "embedding", index_worker::IndexStatus::Ready);
+
+        let xid2 = engine.begin().unwrap();
+        let results = engine
+            .execute_sql(
+                xid2,
+                "SELECT id FROM t WHERE NEAR(embedding, [0.0, 0.0], 5) AND tag = 'b'",
+            )
+            .unwrap();
+        match &results[0] {
+            SqlResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], crate::sql::logical::Literal::Int(2));
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
     }
 
     #[test]

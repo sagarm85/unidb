@@ -355,10 +355,80 @@ fn convert_expr(e: &SqlExpr) -> Result<Expr> {
         SqlExpr::Value(vws) => convert_value(&vws.value).map(Expr::Literal),
         SqlExpr::BinaryOp { left, op, right } => convert_binary_op(left, op, right),
         SqlExpr::Nested(inner) => convert_expr(inner),
+        SqlExpr::Function(func) if func.name.to_string().eq_ignore_ascii_case("near") => {
+            convert_near(func)
+        }
         other => Err(DbError::SqlUnsupported(format!(
             "unsupported expression: {other:?}"
         ))),
     }
+}
+
+/// `NEAR(column, [0.1, 0.2, ...], k)` parses today, unmodified, as an
+/// ordinary `SqlExpr::Function` — no grammar changes needed (same "spend
+/// the budget on the executor, not the parser" logic that motivated using
+/// `sqlparser` in the first place).
+fn convert_near(func: &ast::Function) -> Result<Expr> {
+    let args = match &func.args {
+        ast::FunctionArguments::List(list) => &list.args,
+        _ => {
+            return Err(DbError::SqlUnsupported(
+                "NEAR requires (column, vector, k) arguments".into(),
+            ))
+        }
+    };
+    if args.len() != 3 {
+        return Err(DbError::SqlUnsupported(
+            "NEAR requires exactly 3 arguments: (column, vector, k)".into(),
+        ));
+    }
+
+    let column = match &args[0] {
+        ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(SqlExpr::Identifier(ident))) => {
+            ident.value.clone()
+        }
+        other => {
+            return Err(DbError::SqlUnsupported(format!(
+                "NEAR's first argument must be a column name, got {other:?}"
+            )))
+        }
+    };
+
+    let query = match &args[1] {
+        ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(SqlExpr::Array(arr))) => {
+            match convert_array_literal(arr)? {
+                Literal::Vector(v) => v,
+                _ => unreachable!("convert_array_literal always returns Literal::Vector"),
+            }
+        }
+        other => {
+            return Err(DbError::SqlUnsupported(format!(
+                "NEAR's second argument must be a vector literal, got {other:?}"
+            )))
+        }
+    };
+
+    let k = match &args[2] {
+        ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(SqlExpr::Value(vws))) => {
+            match &vws.value {
+                Value::Number(s, _) => s.parse::<usize>().map_err(|_| {
+                    DbError::SqlUnsupported(format!("NEAR's k must be a non-negative integer: {s}"))
+                })?,
+                other => {
+                    return Err(DbError::SqlUnsupported(format!(
+                        "NEAR's third argument must be an integer k, got {other:?}"
+                    )))
+                }
+            }
+        }
+        other => {
+            return Err(DbError::SqlUnsupported(format!(
+                "NEAR's third argument must be an integer k, got {other:?}"
+            )))
+        }
+    };
+
+    Ok(Expr::Near { column, query, k })
 }
 
 fn convert_binary_op(left: &SqlExpr, op: &BinaryOperator, right: &SqlExpr) -> Result<Expr> {
@@ -524,6 +594,47 @@ mod tests {
     #[test]
     fn rejects_create_index_with_unsupported_using() {
         let err = parse_sql("CREATE INDEX idx ON t USING BTREE (id)");
+        assert!(matches!(err, Err(DbError::SqlUnsupported(_))));
+    }
+
+    #[test]
+    fn parses_near_in_where_clause() {
+        let plan = parse_one("SELECT * FROM t WHERE NEAR(embedding, [0.1, 0.2], 5)");
+        match plan {
+            LogicalPlan::Select { predicate, .. } => {
+                assert_eq!(
+                    predicate,
+                    Some(Expr::Near {
+                        column: "embedding".to_string(),
+                        query: vec![0.1, 0.2],
+                        k: 5,
+                    })
+                );
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn parses_near_anded_with_other_predicate() {
+        let plan = parse_one("SELECT * FROM t WHERE NEAR(embedding, [1.0], 3) AND active = true");
+        match plan {
+            LogicalPlan::Select { predicate, .. } => {
+                assert!(matches!(predicate, Some(Expr::And(_, _))));
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn rejects_near_with_wrong_arg_count() {
+        let err = parse_sql("SELECT * FROM t WHERE NEAR(embedding, [1.0])");
+        assert!(matches!(err, Err(DbError::SqlUnsupported(_))));
+    }
+
+    #[test]
+    fn rejects_near_with_non_column_first_arg() {
+        let err = parse_sql("SELECT * FROM t WHERE NEAR('x', [1.0], 3)");
         assert!(matches!(err, Err(DbError::SqlUnsupported(_))));
     }
 

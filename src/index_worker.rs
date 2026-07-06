@@ -20,6 +20,7 @@ use std::sync::{mpsc, Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use crate::catalog::IndexKind;
 use crate::fulltext::InvertedIndex;
 use crate::heap::RowId;
 use crate::vector::VectorIndex;
@@ -40,10 +41,13 @@ pub enum IndexMsg {
     /// backfill has been enqueued, so the worker can flip `Building` to
     /// `Ready` at the point it has actually drained the backlog rather than
     /// the point the foreground finished *sending* it (those differ since
-    /// processing is asynchronous).
+    /// processing is asynchronous). Carries `kind` because a backfill over
+    /// zero currently-committed rows never sends a single `Upsert` — this
+    /// message alone must be able to create the (empty, `Ready`) entry.
     MarkReady {
         table: String,
         column: String,
+        kind: IndexKind,
     },
     Shutdown,
 }
@@ -132,15 +136,28 @@ impl IndexHandle {
     }
 }
 
+fn new_index_for_kind(kind: IndexKind) -> SecondaryIndex {
+    match kind {
+        IndexKind::Hnsw => SecondaryIndex::Vector(VectorIndex::new()),
+        IndexKind::FullText => SecondaryIndex::FullText(InvertedIndex::new()),
+    }
+}
+
 fn worker_loop(rx: mpsc::Receiver<IndexMsg>, indexes: SharedIndexes) {
     for msg in rx {
         match msg {
             IndexMsg::Shutdown => break,
-            IndexMsg::MarkReady { table, column } => {
+            IndexMsg::MarkReady {
+                table,
+                column,
+                kind,
+            } => {
                 let mut guard = indexes.write().unwrap();
-                if let Some(entry) = guard.get_mut(&(table, column)) {
-                    entry.status = IndexStatus::Ready;
-                }
+                let entry = guard.entry((table, column)).or_insert_with(|| IndexEntry {
+                    status: IndexStatus::Building { rows_done: 0 },
+                    index: new_index_for_kind(kind),
+                });
+                entry.status = IndexStatus::Ready;
             }
             IndexMsg::Upsert {
                 table,
@@ -154,7 +171,7 @@ fn worker_loop(rx: mpsc::Receiver<IndexMsg>, indexes: SharedIndexes) {
                             let entry = guard.entry((table.clone(), column)).or_insert_with(|| {
                                 IndexEntry {
                                     status: IndexStatus::Building { rows_done: 0 },
-                                    index: SecondaryIndex::Vector(VectorIndex::new()),
+                                    index: new_index_for_kind(IndexKind::Hnsw),
                                 }
                             });
                             if let IndexStatus::Building { rows_done } = &mut entry.status {
@@ -170,7 +187,7 @@ fn worker_loop(rx: mpsc::Receiver<IndexMsg>, indexes: SharedIndexes) {
                             let entry = guard.entry((table.clone(), column)).or_insert_with(|| {
                                 IndexEntry {
                                     status: IndexStatus::Building { rows_done: 0 },
-                                    index: SecondaryIndex::FullText(InvertedIndex::new()),
+                                    index: new_index_for_kind(IndexKind::FullText),
                                 }
                             });
                             if let IndexStatus::Building { rows_done } = &mut entry.status {
@@ -233,6 +250,7 @@ mod tests {
         handle.send(IndexMsg::MarkReady {
             table: "t".into(),
             column: "embedding".into(),
+            kind: IndexKind::Hnsw,
         });
         wait_for(|| handle.status("t", "embedding") == Some(IndexStatus::Ready));
 
@@ -263,6 +281,42 @@ mod tests {
         handle.shutdown();
         // After shutdown, the join handle is consumed; a second call is a
         // no-op rather than a panic.
+        handle.shutdown();
+    }
+
+    /// Regression test: a `MarkReady` for a column with zero rows at
+    /// index-creation time (e.g. `CREATE INDEX` on an empty table) must
+    /// still create a `Ready` entry — previously it silently no-opped
+    /// because no `Upsert` had ever created the entry, and a later live
+    /// upsert would re-create it stuck in `Building` forever.
+    #[test]
+    fn mark_ready_on_never_upserted_column_creates_ready_entry() {
+        let mut handle = IndexHandle::spawn();
+        handle.send(IndexMsg::MarkReady {
+            table: "t".into(),
+            column: "embedding".into(),
+            kind: IndexKind::Hnsw,
+        });
+        wait_for(|| handle.status("t", "embedding") == Some(IndexStatus::Ready));
+
+        // A live upsert after that must not regress status back to Building.
+        handle.send(IndexMsg::Upsert {
+            table: "t".into(),
+            record: rid(1, 0),
+            indexed_cols: vec![IndexedColumn::Vector {
+                column: "embedding".into(),
+                data: vec![0.1, 0.2],
+            }],
+        });
+        wait_for(|| {
+            let guard = handle.indexes.read().unwrap();
+            guard
+                .get(&("t".to_string(), "embedding".to_string()))
+                .map(|e| matches!(e.index, SecondaryIndex::Vector(ref v) if v.len() == 1))
+                .unwrap_or(false)
+        });
+        assert_eq!(handle.status("t", "embedding"), Some(IndexStatus::Ready));
+
         handle.shutdown();
     }
 }

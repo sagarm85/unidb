@@ -12,23 +12,23 @@
 
 ## Current status
 
-- **Milestone:** M1 is DONE. **M2 (vector & text search) is underway —
-  checkpoints M2.a (`VECTOR(n)` foundation), M2.b (background indexing
-  worker), and M2.c (full-text index + `CREATE INDEX` SQL surface) are all
-  complete.** The approved plan lives at
-  `/Users/sagarmahamuni/.claude/plans/misty-hugging-brook.md` (four
-  checkpoints, M2.a–d).
-- **State:** 148 unit tests + 10 crash-harness tests all green, `cargo
-  clippy --all-targets -- -D warnings` clean, `cargo fmt --all --check`
-  clean, release build succeeds. `CREATE INDEX idx ON t USING HNSW|FULLTEXT
-  (column)` works end-to-end through SQL: validates column-type
-  compatibility, persists the catalog flag, and backfills the worker
-  immediately from every committed row (unlike the M2.b-era
-  `set_column_index` Rust API, which only populates on next reopen).
-- **Immediate next task:** Checkpoint M2.d — the `NEAR` operator,
-  integration tests (including the MVCC-rollback-correctness test), and
-  benchmarks with the Postgres+pgvector comparison. See the plan file's
-  tasks 17–22.
+- **Milestone:** M1 is DONE. **M2 (vector & text search) is DONE** — all
+  four checkpoints (M2.a `VECTOR(n)` foundation, M2.b background worker,
+  M2.c full-text + `CREATE INDEX`, M2.d `NEAR` + benchmarks) complete,
+  benchmarked, and committed. The approved plan lives at
+  `/Users/sagarmahamuni/.claude/plans/misty-hugging-brook.md`.
+- **State:** 158 unit tests + 10 crash-harness tests + 3 `tests/
+  index_rebuild.rs` tests + 1 `tests/vector_mvcc.rs` test (172 total) all
+  green, `cargo clippy --all-targets -- -D warnings` clean, `cargo fmt
+  --all --check` clean, release build succeeds. `SELECT ... WHERE
+  NEAR(column, [...], k)` works end-to-end: MVCC-correct (proven by the
+  aborted-insert test), RLS/WHERE-composable, and benchmarked against
+  Postgres 18 + pgvector 0.8.4.
+- **Immediate next task:** M3 planning (graph: edge records, edge-list
+  index, Cypher subset, per-edge locking) has not started. Two open
+  questions carried forward from M1 remain unresolved (see Open questions
+  below), plus new M2 tech debt (no secondary-index cleanup on UPDATE,
+  `instant-distance`'s full-rebuild-per-upsert cost).
 - **Last updated:** 2026-07-06
 
 ### Design note: read-only transactions pay an unnecessary commit fsync (found in M1.d)
@@ -272,6 +272,45 @@ INDEX`'s validation (`IndexKind::Hnsw` only on `ColumnType::Vector`,
 mismatches in M2.a — one consistent "bad plan for this schema" error
 family, not a new one per feature.
 
+### Design note: NEAR's over-fetch-then-filter execution and the MVCC re-check (M2.d)
+
+`Expr::Near { column, query, k }` lives inside `Select.predicate: Option<Expr>`
+— a predicate-shaped construct, not a new `LogicalPlan` variant — so
+`apply_rls`'s existing AND-rewrite needed zero changes: `WHERE NEAR(...) AND
+<rls policy>` composes for free, and `NEAR(...) OR x` is already rejected by
+the existing AND-only `WHERE` grammar with no special case needed.
+
+`exec_select` detects a top-level (or top-level-AND'd) `Near` via a small
+`find_near` walk and dispatches to `exec_select_near`, which: (1) validates
+the column actually has `IndexKind::Hnsw` on a `Vector` column — a clear
+`DbError::SqlPlan`, not a silent full-scan fallback, for both "no index"
+and "wrong index kind" cases; (2) takes a read lock on the worker's shared
+`indexes` map and asks `VectorIndex::search` for `4x k` (or `k+20`,
+whichever larger) candidates; (3) resolves each candidate `RowId` back to a
+row via the *same* `Heap::get` + MVCC snapshot every other read path uses,
+silently dropping any `NoVisibleVersion` result (superseded row, or a row
+whose insert never committed); (4) runs the row through the *same*
+`predicate_matches` a full scan uses, so any AND'd RLS/WHERE terms apply
+identically. `eval_expr`'s `Expr::Near` arm always returns `true` when
+re-evaluating a candidate that already came from the index — it does not
+recompute distance — since proximity was already established by step 2;
+that arm is *only* ever reached from this recheck path, never from a full
+scan (which never dispatches into `exec_select_near` in the first place).
+
+An index entry absent from the worker's map (e.g. `CREATE INDEX` just
+enqueued its backfill and the worker hasn't processed the first message
+yet) yields zero candidates, not an error — this is what
+`IndexStatus::Building` is for. A genuinely bad `MarkReady` bug was found
+and fixed in this pass: sending `MarkReady` for a column that had never
+received a single `Upsert` (e.g. `CREATE INDEX` on an empty table) used to
+silently no-op, since the handler only updated an *existing* map entry.
+That left the column's status permanently stuck in `Building` once the
+first live row finally arrived (its `Upsert` would create a fresh
+`Building` entry that no later message ever flipped to `Ready`). Fixed by
+having `MarkReady` carry the `IndexKind` and create an empty, already-`Ready`
+entry if none exists — see `index_worker.rs`'s
+`mark_ready_on_never_upserted_column_creates_ready_entry` regression test.
+
 ### Design note: no cross-statement RowId stability
 
 Initially built `Heap::get` to walk the `prev_page`/`prev_slot` chain
@@ -317,19 +356,26 @@ src/
                          + page list, persisted as a serde_json blob, not MVCC-versioned
   sql/
     mod.rs            — (new, M1.c) module registration
-    logical.rs        — (new, M1.c; extended M2.a, M2.c) LogicalPlan/Expr/Literal/CmpOp +
-                         apply_rls (the entire RLS mechanism is this one AND-rewrite
-                         function); LogicalPlan::CreateIndex{table,column,kind} (M2.c)
-    parser.rs         — (new, M1.c; extended M2.a, M2.c) wraps `sqlparser`'s GenericDialect
-                         AST -> LogicalPlan; CREATE INDEX ... USING HNSW|FULLTEXT (M2.c,
-                         note USING precedes the column list — see design note above)
-    executor.rs        — (new, M1.c; extended M2.a, M2.b, M2.c) row-at-a-time executor;
-                         hand-rolled row encoding (tag+value per column, tag 5 = Vector,
-                         M2.a); no separate physical-plan IR (folded in); exec_insert/
-                         exec_update send IndexMsg::Upsert for any indexed column (M2.b);
-                         exec_create_index validates + persists + immediately backfills
-                         (M2.c); build_indexed_columns is the one shared column-type-to-
-                         IndexedColumn mapping used by both live upserts and every backfill
+    logical.rs        — (new, M1.c; extended M2.a, M2.c, M2.d) LogicalPlan/Expr/Literal/
+                         CmpOp + apply_rls (the entire RLS mechanism is this one AND-rewrite
+                         function); LogicalPlan::CreateIndex{table,column,kind} (M2.c);
+                         Expr::Near{column,query,k} (M2.d, lives inside Select.predicate,
+                         not a new LogicalPlan variant)
+    parser.rs         — (new, M1.c; extended M2.a, M2.c, M2.d) wraps `sqlparser`'s
+                         GenericDialect AST -> LogicalPlan; CREATE INDEX ... USING
+                         HNSW|FULLTEXT (M2.c, note USING precedes the column list — see
+                         design note above); NEAR(column,[...],k) parses unmodified as an
+                         ordinary SqlExpr::Function (M2.d, zero grammar changes needed)
+    executor.rs        — (new, M1.c; extended M2.a, M2.b, M2.c, M2.d) row-at-a-time
+                         executor; hand-rolled row encoding (tag+value per column, tag 5 =
+                         Vector, M2.a); no separate physical-plan IR (folded in);
+                         exec_insert/exec_update send IndexMsg::Upsert for any indexed
+                         column (M2.b); exec_create_index validates + persists +
+                         immediately backfills (M2.c); build_indexed_columns is the one
+                         shared column-type-to-IndexedColumn mapping used by both live
+                         upserts and every backfill; exec_select_near (M2.d) over-fetch-
+                         then-filter execution, reusing predicate_matches so MVCC/RLS/WHERE
+                         all apply to NEAR results for free
   index_worker.rs     — (new, M2.b; extended M2.c) the engine's first background thread:
                          IndexMsg/IndexHandle/IndexStatus/SecondaryIndex{Vector,FullText},
                          owns Arc<RwLock<HashMap<(table,column), IndexEntry>>>, never
@@ -386,8 +432,8 @@ Key design decisions confirmed in implementation (M0 + M1.a + M1.b + M1.c):
 
 ## In progress
 
-Nothing — M2.a, M2.b, and M2.c checkpoints all fully verified. Ready to
-start M2.d (`NEAR` operator, integration tests, benchmarks).
+Nothing — M2 milestone fully closed out (all four checkpoints verified,
+benchmarked, committed). Ready to start M3 planning (graph).
 
 ---
 
@@ -611,6 +657,49 @@ an `InvertedIndex` via the shared worker ✅, term search returns correct
 intersections ✅, tokenization tests pass ✅, `CREATE INDEX` validation
 rejects type-kind mismatches ✅, all tests green ✅.
 
+## M2.d task breakdown (ordered — all complete)
+
+1. ✅ `Expr::Near{column,query,k}` (`sql/logical.rs`) + parser support
+   (`sql/parser.rs`): `NEAR(...)` parses unmodified as `SqlExpr::Function`,
+   confirmed against `sqlparser`'s AST before writing the conversion code.
+2. ✅ `exec_select_near` (`sql/executor.rs`): over-fetch-then-filter
+   execution — validates the column is `Hnsw`-indexed on a `Vector` column,
+   over-fetches from `VectorIndex::search`, resolves candidates via
+   `Heap::get` + the ordinary MVCC snapshot, re-runs the full predicate
+   through `predicate_matches`. `eval_expr`'s new `Expr::Near` arm always
+   returns `true` on recheck (proximity already established).
+3. ✅ **Found and fixed a real bug while wiring this up**: `MarkReady` on a
+   column that had never received an `Upsert` (e.g. `CREATE INDEX` on an
+   empty table) silently no-opped, permanently stranding the column in
+   `Building` once a later live insert finally arrived. Fixed by having
+   `MarkReady` carry `IndexKind` and create an already-`Ready` empty entry
+   when none exists yet — caught by two failing `lib.rs` NEAR tests before
+   it could ship, then covered by a dedicated regression test in
+   `index_worker.rs`.
+4. ✅ `tests/index_rebuild.rs` (new): engine-restart rebuild correctness for
+   both index kinds, `NEAR`-while-`Building` returns a valid (possibly
+   partial) result set without erroring.
+5. ✅ `tests/vector_mvcc.rs` (new) — **the single most important test in
+   M2**: inserts a row, deterministically polls (via the inserting
+   transaction's own self-visible `NEAR` query, not a timing guess) until
+   the worker has demonstrably indexed it, aborts instead of committing,
+   then proves a fresh transaction's `NEAR` query never returns that row.
+6. ✅ `benches/vector.rs` (new) + a real, no-mocking Postgres 18 + pgvector
+   0.8.4 comparison run locally (`brew install pgvector`, isolated
+   `unidb_bench` database, dropped after recording numbers). Recorded
+   honestly in `PROGRESS.md`, including where unidb is far behind and why
+   (pre-existing per-statement fsync cost from M1, `instant-distance`'s
+   full-rebuild-per-upsert cost) — not flattered.
+7. ✅ M2.d / M2 milestone checkpoint verification: 158 unit + 10 crash + 3
+   `index_rebuild` + 1 `vector_mvcc` tests (172 total) green, clippy/fmt
+   clean, release build OK.
+
+**M2.d done when:** `SELECT ... WHERE NEAR(col, [...], k)` returns
+MVCC-correct, RLS-respecting results end-to-end ✅; the rollback-correctness
+test passes ✅; rebuild-after-restart and mid-rebuild-staleness tests pass
+✅; M2's benchmark table is recorded with the Postgres+pgvector comparison
+✅; all tests green ✅ — closing out the M2 milestone as a whole.
+
 ---
 
 ## Open questions / pending human input
@@ -693,15 +782,66 @@ rejects type-kind mismatches ✅, all tests green ✅.
   update-heavy workloads on indexed columns — the same shape of gap as M1's
   "no vacuum" tech debt, just for the secondary index instead of the heap.
   The same applies to `InvertedIndex` (M2.c) for the identical reason.
-- **No full-text query SQL surface yet** — `InvertedIndex::search` exists
-  and is tested directly, but there's no SQL-level way to call it (the
-  `NEAR` operator planned for M2.d is vector-only per the plan; a text
-  equivalent isn't scoped for M2 at all). Not a bug — flagged so it isn't
-  mistaken for an oversight later.
+- **No full-text query SQL surface** — `InvertedIndex::search` exists and
+  is tested directly, but there's no SQL-level way to call it; only `NEAR`
+  (vector) has a `WHERE`-clause operator in M2's scope. Not a bug — flagged
+  so it isn't mistaken for an oversight later.
+- **`instant-distance`'s full-rebuild-per-upsert cost is measurable, not
+  just theoretical** (see M2.d's benchmark table in `PROGRESS.md`):
+  vector-index-active INSERT throughput was ~2.8x slower than without an
+  index at just 200 rows in this milestone's benchmark. Not a correctness
+  issue, and still off the foreground's *blocking* path (the mechanism is
+  CPU contention between the foreground and worker threads, not a
+  synchronous wait) — but real enough that "row write is the only
+  synchronous cost" needs the asterisk "...but the worker's own cost isn't
+  free, and it scales worse than a true incremental HNSW would." Flagged
+  for a future milestone to revisit if it becomes a real blocker.
 
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-06 — M2.d complete; M2 milestone DONE
+
+- Implemented all of M2.d: `Expr::Near` + parser support (zero grammar
+  changes needed — `NEAR(...)` parses as an ordinary `SqlExpr::Function`),
+  `exec_select_near`'s over-fetch-then-filter execution, `tests/
+  index_rebuild.rs`, `tests/vector_mvcc.rs`, `benches/vector.rs`.
+- **Found and fixed a real bug while wiring up `NEAR`, caught by the
+  benchmark/integration tests themselves failing, not by inspection**:
+  `MarkReady` on a column that had never received a single `Upsert` (the
+  common case — `CREATE INDEX` on a table, then insert afterward) used to
+  silently no-op, permanently stranding the index in `Building`. Root
+  cause: the handler only updated an *existing* map entry; `Upsert`-driven
+  entry creation always starts `Building` and nothing ever flipped a
+  never-backfilled column to `Ready`. Fixed by giving `MarkReady` the
+  `IndexKind` it needs to create an already-`Ready` empty entry.
+- Ran the M2.d plan's explicitly-called-out "single most important test in
+  M2": `tests/vector_mvcc.rs`'s aborted-insert test, using a deterministic
+  poll-until-confirmed pattern (the inserting transaction's own
+  self-visible `NEAR` query) rather than a timing-dependent sleep, per the
+  plan's own caution against exactly that kind of flakiness.
+- **Ran a real, non-mocked Postgres + pgvector benchmark**, not an
+  estimate: `brew install pgvector` locally, an isolated `unidb_bench`
+  database (dropped after recording numbers, no artifacts left behind),
+  matching INSERT/`NEAR`-equivalent methodology against unidb's own
+  `benches/vector.rs`. Recorded honestly in `PROGRESS.md`: unidb is far
+  behind pgvector in absolute terms, and the writeup explains why (M1's
+  already-known per-statement fsync cost, plus `instant-distance`'s
+  full-rebuild-per-upsert cost measurably showing up even at 200 rows) —
+  not flattered, per CLAUDE.md §6.
+- **Final state:** 158 unit tests + 10 crash-harness tests + 3
+  `index_rebuild` tests + 1 `vector_mvcc` test (172 total) green, `cargo
+  clippy --all-targets -- -D warnings` clean, `cargo fmt --all --check`
+  clean, `cargo build --release` succeeds.
+- **M2 milestone is DONE.** All four checkpoints (M2.a/b/c/d) complete,
+  benchmarked, and committed. Two design corrections were found and fixed
+  during implementation rather than silently worked around: the
+  `instant-distance` incremental-insert assumption (M2.b) and this
+  session's `MarkReady` bug (M2.d) — both documented as design notes, not
+  swept under the rug.
+- **Next:** M3 planning (graph) has not started — this session ended with
+  M2 fully closed out, no M3 work begun.
 
 ### 2026-07-06 — M2.c checkpoint complete (full-text index + CREATE INDEX)
 

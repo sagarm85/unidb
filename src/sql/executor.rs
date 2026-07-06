@@ -29,7 +29,7 @@ use crate::{
     error::{DbError, Result},
     format::{PageId, Xid},
     heap::{Heap, RowId},
-    index_worker::{IndexHandle, IndexMsg, IndexedColumn},
+    index_worker::{IndexHandle, IndexMsg, IndexedColumn, SecondaryIndex},
     lockmgr::LockManager,
     txn::{TransactionManager, UndoAction},
     wal::Wal,
@@ -239,6 +239,7 @@ fn exec_create_index(
         handle.send(IndexMsg::MarkReady {
             table: table_def.name.clone(),
             column: column.to_string(),
+            kind,
         });
     }
 
@@ -298,6 +299,11 @@ fn exec_select(
     ctx: &mut ExecCtx,
 ) -> Result<ExecResult> {
     let table_def = ctx.catalog.lookup(table)?.clone();
+
+    if let Some(near) = predicate.as_ref().and_then(find_near) {
+        return exec_select_near(&table_def, projection, predicate, near, ctx);
+    }
+
     let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
 
@@ -308,6 +314,98 @@ fn exec_select(
             out.push(project_row(projection, &table_def.columns, &row)?);
         }
     }
+    Ok(ExecResult::Rows(out))
+}
+
+/// Find a top-level (or top-level-AND'd) `Expr::Near` in a predicate.
+/// Recurses only through `And`, matching the AND-only `WHERE` grammar — an
+/// exhaustive search given there's no `OR`/nesting construct that could
+/// hide a `Near` from this walk.
+fn find_near(expr: &Expr) -> Option<(&str, &[f32], usize)> {
+    match expr {
+        Expr::Near { column, query, k } => Some((column.as_str(), query.as_slice(), *k)),
+        Expr::And(lhs, rhs) => find_near(lhs).or_else(|| find_near(rhs)),
+        _ => None,
+    }
+}
+
+/// `NEAR`'s over-fetch-then-filter execution: look up the column's
+/// `VectorIndex`, over-fetch `k`-ish candidates, resolve each back to a
+/// heap row, and run the row through the *same* `predicate_matches` every
+/// ordinary scan uses. This is what makes MVCC visibility, RLS, and any
+/// AND'd `WHERE` terms apply to `NEAR` results for free — every candidate
+/// goes through the identical per-row check a full scan already uses (see
+/// `eval_expr`'s `Expr::Near` arm for the other half of this story).
+fn exec_select_near(
+    table_def: &TableDef,
+    projection: &[String],
+    predicate: &Option<Expr>,
+    near: (&str, &[f32], usize),
+    ctx: &mut ExecCtx,
+) -> Result<ExecResult> {
+    let (column, query, k) = near;
+    let col = table_def
+        .columns
+        .iter()
+        .find(|c| c.name == column)
+        .ok_or_else(|| DbError::ColumnNotFound {
+            table: table_def.name.clone(),
+            column: column.to_string(),
+        })?;
+    if !matches!(col.index, Some(IndexKind::Hnsw)) || !matches!(col.ty, ColumnType::Vector(_)) {
+        return Err(DbError::SqlPlan(format!(
+            "column {column} has no HNSW index; see CREATE INDEX ... USING HNSW"
+        )));
+    }
+    let handle = ctx
+        .index_worker
+        .ok_or_else(|| DbError::SqlPlan("NEAR requires a live index worker".into()))?;
+
+    // Over-fetch: candidates get re-filtered by the full predicate below
+    // (MVCC visibility, RLS, any AND'd WHERE terms), so asking the index for
+    // more than `k` raw nearest neighbors compensates for some being
+    // filtered out. `4x k` or `k+20`, whichever is larger — a tunable
+    // constant, not a locked decision.
+    let over_fetch = (k.saturating_mul(4)).max(k + 20);
+    let candidate_ids: Vec<RowId> = {
+        let guard = handle.indexes.read().unwrap();
+        match guard.get(&(table_def.name.clone(), column.to_string())) {
+            // Not yet built (e.g. CREATE INDEX just enqueued its backfill,
+            // worker hasn't processed the first message yet) — zero
+            // candidates so far, not an error; see IndexStatus::Building.
+            None => Vec::new(),
+            Some(entry) => {
+                let SecondaryIndex::Vector(v) = &entry.index else {
+                    return Err(DbError::SqlPlan(format!(
+                        "column {column}'s index is not a vector index"
+                    )));
+                };
+                v.search(query, over_fetch)
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect()
+            }
+        }
+    };
+
+    let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+    let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+    let mut out = Vec::new();
+    for row_id in candidate_ids {
+        let bytes = match heap.get(row_id, &snapshot, ctx.xid, ctx.pool) {
+            Ok(b) => b,
+            // Not visible to this snapshot (superseded, or never committed
+            // — e.g. an aborted insert the worker indexed before the
+            // abort). Filtered out here, not an index-maintenance bug.
+            Err(DbError::NoVisibleVersion { .. }) => continue,
+            Err(e) => return Err(e),
+        };
+        let row = decode_row(&bytes, &table_def.columns)?;
+        if predicate_matches(predicate, &table_def.columns, &row)? {
+            out.push(project_row(projection, &table_def.columns, &row)?);
+        }
+    }
+    out.truncate(k);
     Ok(ExecResult::Rows(out))
 }
 
@@ -574,6 +672,15 @@ fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Literal]) -> Result<Lite
                 None => Ok(Literal::Null),
             }
         }
+        // `Expr::Near` only ever reaches `eval_expr` as part of re-checking
+        // a candidate `exec_select_near` already fetched *from* the vector
+        // index — the row was already filtered by proximity there. Treating
+        // it as trivially satisfied here (rather than erroring or
+        // re-evaluating distance against the whole table) is what lets the
+        // *other* AND'd conditions (RLS, ordinary WHERE terms) still apply
+        // through the exact same `predicate_matches` path a normal scan
+        // uses — see `exec_select_near`.
+        Expr::Near { .. } => Ok(Literal::Bool(true)),
     }
 }
 
@@ -1186,5 +1293,51 @@ mod tests {
             .exec_as(xid, "CREATE INDEX idx ON t USING HNSW (nope)")
             .unwrap_err();
         assert!(matches!(err, DbError::ColumnNotFound { .. }));
+    }
+
+    // ── M2.d: NEAR ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn near_on_unindexed_column_is_rejected() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, embedding VECTOR(2))")
+            .unwrap();
+        let err = h
+            .exec_as(xid, "SELECT * FROM t WHERE NEAR(embedding, [0.0, 0.0], 3)")
+            .unwrap_err();
+        assert!(matches!(err, DbError::SqlPlan(_)));
+    }
+
+    #[test]
+    fn near_on_indexed_column_without_live_worker_is_rejected() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, embedding VECTOR(2))")
+            .unwrap();
+        h.exec_as(xid, "CREATE INDEX idx ON t USING HNSW (embedding)")
+            .unwrap();
+        // Harness never supplies an index_worker (index_worker: None), so
+        // even though the column is now validly indexed, there's no live
+        // worker to query against.
+        let err = h
+            .exec_as(xid, "SELECT * FROM t WHERE NEAR(embedding, [0.0, 0.0], 3)")
+            .unwrap_err();
+        assert!(matches!(err, DbError::SqlPlan(_)));
+    }
+
+    #[test]
+    fn near_on_wrong_column_type_is_rejected() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, name TEXT)")
+            .unwrap();
+        let err = h
+            .exec_as(xid, "SELECT * FROM t WHERE NEAR(name, [0.0, 0.0], 3)")
+            .unwrap_err();
+        assert!(matches!(err, DbError::SqlPlan(_)));
     }
 }
