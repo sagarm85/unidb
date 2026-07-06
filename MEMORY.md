@@ -12,98 +12,333 @@
 
 ## Current status
 
-- **Milestone:** M0 — Storage core
-- **State:** Implementation complete. All code compiles clippy-clean. 30 unit
-  tests + 6 crash-harness tests all pass. Benchmarks not yet recorded.
-- **Immediate next task:** Run `cargo bench` (release build) to fill in the M0
-  benchmark table in `PROGRESS.md`, then close out M0.
+- **Milestone:** M0 done. M1 — MVCC + CRUD in progress. **Checkpoints M1.a
+  (MVCC core) and M1.b (SI abort-on-conflict) are both DONE.** Next up:
+  checkpoint M1.c (catalog + SQL subset) — but RC's EvalPlanQual-style
+  re-evaluation path is *not* part of M1.c's start; per D12 it's already
+  unblocked (M1.b is done) and lands inside the executor once M1.c's
+  UPDATE/DELETE physical operators exist (see task 14 in the plan). Staged
+  per the approved plan at
+  `/Users/sagarmahamuni/.claude/plans/misty-hugging-brook.md`.
+- **State:** All M1.a + M1.b tasks complete. 80 unit tests + 9 crash-harness
+  tests (P1–P9) all green, `cargo clippy --all-targets -- -D warnings` clean,
+  `cargo fmt --all --check` clean, release build succeeds.
+- **Immediate next task:** Start M1.c — `src/catalog.rs` (table schema,
+  heap-backed, bootstrap-without-a-catalog handling via `control.catalog_root`),
+  add `sqlparser`/`serde_json` to `Cargo.toml`, then `src/sql/` module
+  directory (parser → logical → physical → executor) implementing the agreed
+  grammar subset (CREATE TABLE/INSERT/SELECT/UPDATE/DELETE, `AND`-only
+  predicates), with RC's re-evaluation path landing inside the UPDATE/DELETE
+  physical operators and RLS's AND-rewrite landing in the logical planner.
 - **Last updated:** 2026-07-06
+
+### Design note: no separate "commit-time recheck" needed for SI conflict detection (M1.b)
+
+The plan called for two distinct conflict checks: an immediate lock-acquire-time
+check, and a "commit-time first-committer-wins recheck" guarding the case where
+the previous lock holder released via abort and something else slipped in
+before this transaction's commit. Implemented `LockManager` (`lockmgr.rs`,
+`RecordKind`/`RecordId` generic over future M2+ kinds, write-write only — no
+read locks under MVCC) and wired `try_acquire_write` into `Heap::update`/
+`delete` before the mini-txn begins. But because a lock is held for the
+*entire* transaction lifetime (released only in `TransactionManager::commit`/
+`abort`, never in between), no other transaction can successfully write to a
+row this transaction touched until this one finishes — there is no race
+window between "write" and "commit" for a separate recheck to catch in this
+single-threaded engine. `Heap::update`/`delete` already run two checks that
+together *are* the complete conflict detection: (1) `try_acquire_write`
+catches another *currently active* xid (immediate abort, no waiting, D12);
+(2) the existing `xmax != 0` check catches a row already superseded by a
+transaction that has *since committed and released its lock* — a distinct
+failure mode the lock table alone can't see once the holder is gone. Verified
+by `lib.rs`'s `concurrent_update_aborts_second_writer_immediately`,
+`commit_releases_lock_for_next_writer`, `abort_releases_lock_for_next_writer`.
+
+### Design note: abort requires physical undo even in M1.a (not deferred to M1.b)
+
+While implementing `txn.rs`, found that `mvcc::is_visible`'s snapshot check
+(`is_committed_at_snapshot`: not-in-active-set-and-in-range ⇒ committed) has
+no separate "aborted" concept — so a naive `TransactionManager::abort()` that
+just flips txn state without reversing the tuple bytes would make an aborted
+insert look committed to any snapshot taken after the abort. Fix: abort must
+physically neutralize its own writes immediately, by self-stamping xmax on
+any tuple it inserted (`xmax = its own xmin`, making it permanently
+invisible — same code path as a normal delete-then-committed row) and
+reverting any xmax stamp it applied back to 0. This reuses `is_visible`'s
+existing committed/active distinction instead of adding a third state.
+Implemented via `Heap::undo_insert`/`undo_xmax_stamp`, driven by an in-memory
+`Vec<UndoAction>` on each `Transaction` (built up as `Heap` calls happen —
+cheap, no WAL-decoding needed at runtime since the process is still alive).
+Recovery's crash-time undo of an *incomplete* user transaction (no in-memory
+state survives a crash) instead reconstructs ownership by decoding
+`xmin`/xmax straight out of the WAL's redo bytes — see `recovery.rs`'s
+two-phase pass (revert xmax-stamps first, then force-self-stamp inserts last,
+so a row both inserted and re-superseded by the same aborted transaction
+correctly ends up permanently dead rather than accidentally revived). This
+same idempotent recovery pass is what makes crash-mid-abort safe too (P9,
+`tests/crash/main.rs`): whether runtime abort never started, or crashed
+partway through its own undo_log, recovery re-derives the same "incomplete
+user txn" verdict from the WAL and re-applies the same idempotent undo.
+
+### Design note: no cross-statement RowId stability
+
+Initially built `Heap::get` to walk the `prev_page`/`prev_slot` chain
+backward looking for a visible version when the given `RowId` itself wasn't
+visible. This doesn't work: the chain only points to *older* versions, so it
+can never find a *newer* one, and two unit tests written against that
+assumption failed for good reason. Removed the walk — `get` now does a
+single direct visibility check against the exact given `RowId` and returns
+`NoVisibleVersion` otherwise. This matches the M1 plan's explicit
+simplification: **no stable row handles across statements**, even within the
+same transaction that just updated the row. Callers (including the
+transaction that just called `update`) must use the returned `RowId` or
+re-scan, never reuse a pre-update one. `prev_page`/`prev_slot` still exists
+and is populated — its purpose is version-history bookkeeping (recovery's
+undo-ownership decoding, future vacuum), not reader traversal.
+
+---
+
+### Design note: abort requires physical undo even in M1.a (not deferred to M1.b)
+
+While implementing `txn.rs`, found that `mvcc::is_visible`'s snapshot check
+(`is_committed_at_snapshot`: not-in-active-set-and-in-range ⇒ committed) has
+no separate "aborted" concept — so a naive `TransactionManager::abort()` that
+just flips txn state without reversing the tuple bytes would make an aborted
+insert look committed to any snapshot taken after the abort. Fix: abort must
+physically neutralize its own writes immediately, by self-stamping xmax on
+any tuple it inserted (`xmax = its own xmin`, making it permanently
+invisible — same code path as a normal delete-then-committed row) and
+reverting any xmax stamp it applied back to 0. This reuses `is_visible`'s
+existing committed/active distinction instead of adding a third state.
+Implemented via `Heap::undo_insert`/`undo_xmax_stamp`, driven by an in-memory
+`Vec<UndoAction>` on each `Transaction` (built up as `Heap` calls happen —
+cheap, no WAL-decoding needed at runtime since the process is still alive).
+Recovery's crash-time undo of an *incomplete* user transaction (no in-memory
+state survives a crash) instead reconstructs ownership by decoding
+`xmin`/xmax straight out of the WAL's redo bytes — see `recovery.rs`'s
+two-phase pass (revert xmax-stamps first, then force-self-stamp inserts last,
+so a row both inserted and re-superseded by the same aborted transaction
+correctly ends up permanently dead rather than accidentally revived).
+
+### Design note: no cross-statement RowId stability
+
+Initially built `Heap::get` to walk the `prev_page`/`prev_slot` chain
+backward looking for a visible version when the given `RowId` itself wasn't
+visible. This doesn't work: the chain only points to *older* versions, so it
+can never find a *newer* one, and two unit tests written against that
+assumption failed for good reason. Removed the walk — `get` now does a
+single direct visibility check against the exact given `RowId` and returns
+`NoVisibleVersion` otherwise. This matches the M1 plan's explicit
+simplification: **no stable row handles across statements**, even within the
+same transaction that just updated the row. Callers (including the
+transaction that just called `update`) must use the returned `RowId` or
+re-scan, never reuse a pre-update one. `prev_page`/`prev_slot` still exists
+and is populated — its purpose is version-history bookkeeping (recovery's
+undo-ownership decoding, future vacuum), not reader traversal.
 
 ---
 
 ## What exists now
 
-All M0 source modules are implemented and passing tests:
+M0 modules, unchanged in location but several rewritten for MVCC in M1:
 
 ```
 src/
-  format.rs      — magic, version, constants, endian helpers
-  error.rs       — DbError + Result type (thiserror)
-  control.rs     — control file: create/read/write, CRC, magic/version check (D3)
-  mmap.rs        — ONLY unsafe module: PageFileMmap wrapper around memmap2
-  page.rs        — slotted-page body, tuple header w/ reserved xmin/xmax (D4), CRC (D9)
-  bufferpool.rs  — frames, pin/unpin, clock eviction, D5 enforced at flush/evict (D5)
-  wal.rs         — append-only log, redo+undo payloads, LSN, mini-txn bracketing (D1/D2/D13)
-  heap.rs        — insert/read/update/delete, in-place update for M0, linear-scan FSM
-  checkpoint.rs  — flush dirty → checkpoint WAL record → update control → truncate WAL
-  recovery.rs    — control → redo committed → undo incomplete mini-txns (D1, ARIES-style)
-  lib.rs         — Engine API (open/insert/get/update/delete/checkpoint/flush), init_tracing()
+  format.rs           — constants, endian helpers, WAL_TXN_* tags, Xid type (M1)
+  error.rs            — DbError + Result type (thiserror); +12 M1 variants
+  control.rs          — control file, now with catalog_root field (M1, unused until catalog lands)
+  mmap.rs             — ONLY unsafe module: PageFileMmap wrapper around memmap2
+  page.rs             — slotted-page body; tuple header now 24 bytes (xmin/xmax/prev_page/prev_slot, M1)
+  bufferpool.rs        — frames, pin/unpin, clock eviction, D5 enforced at flush/evict
+  wal.rs              — mini-txn WAL (D2, unchanged) + user-txn WAL_TXN_BEGIN/COMMIT/ABORT (M1)
+  mvcc.rs             — (new, M1.a) Snapshot + is_visible: pure MVCC visibility logic
+  txn.rs              — (new, M1.a; extended M1.b) TransactionManager: begin/commit/abort
+                         (now also releases locks), RC vs RR snapshot lifetime
+  lockmgr.rs          — (new, M1.b) RecordKind/RecordId/LockManager: write-write conflict
+                         tracking, no wait queue (D12 — SI aborts immediately, doesn't block)
+  concurrency_hooks.rs — (new, M1.a) on_read/on_write no-op seam (D11)
+  heap.rs             — (rewritten M1.a; extended M1.b) MVCC-versioned insert/update/delete/
+                         get/scan; update/delete now call LockManager::try_acquire_write first
+  checkpoint.rs       — flush dirty → checkpoint WAL record → update control → truncate WAL
+  recovery.rs         — (extended, M1.a) mini-txn redo/undo (unchanged) +
+                         incomplete-user-txn undo pass (decodes ownership from WAL redo bytes)
+  lib.rs              — Engine API: begin/commit/abort + insert/get/update/delete take an xid;
+                         Engine now also owns a LockManager (M1.b)
 tests/
-  crash/main.rs  — 6 crash-injection tests covering P1–P5 (D7)
+  crash/main.rs       — 9 crash-injection tests: P1–P5 (M0) + P6/P7 (M1.a) + P9 (M1.b)
 benches/
-  load.rs        — INSERT / point-SELECT / UPDATE criterion benchmarks (not yet run)
+  load.rs             — INSERT / point-SELECT / UPDATE criterion benchmarks; M0 numbers recorded,
+                        not yet re-run against M1's transactional API
 ```
 
-Key design decisions confirmed in implementation:
+Key design decisions confirmed in implementation (M0 + M1.a + M1.b):
 - D5 enforced: checked at `flush_page()` and in `find_victim()` eviction path only
-  (write_page is in-memory; checking there would block valid WAL-then-write ordering)
 - WAL uses length-prefix framing (u32 LE) + per-record CRC32; scan stops at corruption
 - `mmap.rs` is the sole `#![allow(unsafe_code)]` module; rest of crate uses `#![deny]`
-- All page/WAL integers are little-endian (D9)
-- Tuple header reserves 16 bytes (xmin+xmax) for MVCC forward-compat (D4)
+- All page/WAL integers are little-endian (D9); `FORMAT_VERSION` bumped 1→2 for the
+  tuple header change (no migration path — M0 never shipped externally)
+- Mini-txns (D2, per-statement) and user-txns (M1, multi-statement) are two
+  independent ID spaces sharing one WAL wire format — `mini_txn_id`'s u64 slot
+  doubles as the xid for `WAL_TXN_*` records
+- `Heap::get`/`scan` do a single direct visibility check, no version-chain
+  walk (see design note above — the chain only points backward, useless for
+  finding a newer version; no cross-statement RowId stability by design)
+- Abort/rollback works by physically self-stamping/reverting xmax, not by a
+  separate "aborted" transaction-status check in the visibility path (see
+  design note above)
+- Locks are in-memory only, held for a transaction's full lifetime, released
+  only at commit/abort — this is what makes a separate "commit-time recheck"
+  unnecessary (see design note above)
 
 ---
 
 ## In progress
 
-Nothing — awaiting bench run.
+Nothing — M1.a and M1.b checkpoints both fully verified. Ready to start M1.c.
 
 ---
 
-## M0 task breakdown (ordered — this is the plan of record)
+## M1.a task breakdown (ordered — all complete)
 
-1. ✅ **Scaffold.** Cargo project (edition 2021), module layout, deps, tracing init.
-2. ✅ **On-disk format constants (`format.rs`).**
-3. ✅ **Control file (`control.rs`) — D3.**
-4. ✅ **Page + slotted body (`page.rs`) — D4, D9.**
-5. ✅ **Buffer pool (`bufferpool.rs`) — D5.**
-6. ✅ **WAL (`wal.rs`) — D1, D2, D13.**
-7. ✅ **Heap access (`heap.rs`).**
-8. ✅ **Checkpoint (`checkpoint.rs`).**
-9. ✅ **Recovery (`recovery.rs`) — D1.**
-10. ✅ **Crash-injection harness (`tests/crash/`) — D7.** All 6 injection points green.
-11. ⏳ **Load test (`benches/`).** Criterion bench exists; benchmarks not yet executed.
-    Run `cargo bench` (release build) and record results in `PROGRESS.md`.
+1. ✅ Error variants (`error.rs`): `WriteConflict`, `SerializationFailure`,
+   `TxnNotActive`, `TxnAlreadyFinished`, `NoVisibleVersion`, SQL/catalog
+   placeholders for later checkpoints.
+2. ✅ Tuple header 16→24 bytes + `FORMAT_VERSION` 1→2 (`page.rs`/`format.rs`).
+3. ✅ Control file `catalog_root` field (`control.rs`).
+4. ✅ WAL user-txn record types + `begin/commit/abort_user_txn` (`wal.rs`/`format.rs`).
+5. ✅ MVCC visibility logic (`mvcc.rs`, new).
+6. ✅ Transaction manager (`txn.rs`, new) — built together with heap rewrite
+   (task 7) since they're tightly coupled; see design notes above.
+7. ✅ Heap MVCC rewrite (`heap.rs`).
+8. ✅ User-txn recovery undo pass (`recovery.rs`).
+9. ✅ `on_read`/`on_write` seam (`concurrency_hooks.rs`, new), threaded
+   through every `Heap` read/write path.
+10. ✅ Crash tests P6/P7 (`tests/crash/main.rs`).
+11. ✅ M1.a checkpoint verification: `Engine::begin/commit/abort` wired,
+    71 unit tests + 8 crash tests green, clippy/fmt clean, release build OK.
 
-**M0 done when:** durable single-table CRUD survives all crash-harness points ✅,
-recovery is verified ✅, benchmark table is recorded ⏳, and no locked decision is
-violated ✅.
+**M1.a done when:** transactional `Engine::begin/commit/abort` works around
+insert/get/update/delete ✅, RC vs RR visibility distinction verified by a
+hand-written interleaved-transaction test ✅ (`repeatable_read_does_not_see_write_committed_after_begin`
+in `lib.rs`), all tests green ✅.
+
+## M1.b task breakdown (ordered — all complete)
+
+1. ✅ Lock manager (`lockmgr.rs`, new): `RecordKind`/`RecordId`/`LockManager`,
+   write-write only, no wait queue (D12).
+2. ✅ Wired `try_acquire_write` into `Heap::update`/`delete`, before the
+   mini-txn begins; `Engine`/`TransactionManager` now own/thread a
+   `LockManager` alongside `pool`/`wal`/`heap`.
+3. ✅ Investigated the planned "commit-time first-committer-wins recheck" and
+   found it subsumed by lock-held-until-commit — documented as a design note
+   rather than building redundant code; verified with 3 hand-written
+   interleaved-transaction tests in `lib.rs`.
+4. ✅ Crash test P9 (`tests/crash/main.rs`): crash mid-undo of an
+   already-aborting transaction; recovery converges to fully-undone via the
+   same idempotent pass built in M1.a task 8.
+5. ✅ M1.b checkpoint verification: 80 unit tests + 9 crash tests green,
+   clippy/fmt clean, release build OK.
+
+**M1.b done when:** SI's abort-on-conflict path works end-to-end (a second
+concurrent writer aborts immediately, no blocking) ✅, locks correctly
+release on both commit and abort so a later writer can proceed ✅, crash
+safety extended to the new abort/undo machinery (P9) ✅, all tests green ✅.
 
 ---
 
 ## Open questions / pending human input
 
-- None blocking M0 completion. Benchmarks are the only remaining step.
+- None blocking M1.c start.
 - Deferred-but-flagged for later milestones: slow-consumer-vs-vacuum durability
   contract (M4); filtered-HNSW vs over-fetch for RLS on `NEAR` (M2); SSI
-  activation (post-M1, seam built in M1 per D11).
+  activation (post-M1, seam built in M1.a per D11, still all no-ops — M1.b's
+  lock manager has no wait queue/deadlock detection, deliberately deferred to
+  that future SSI effort).
+- RC's EvalPlanQual-style re-evaluation path (D12, sequenced after SI) is
+  designed but not yet implemented — it needs the SQL executor's predicate
+  evaluation to exist first (M1.c), so it lands inside the UPDATE/DELETE
+  physical operators there, not as a standalone M1.b deliverable.
 
 ---
 
 ## Known issues / tech debt
 
-- FSM is a linear scan over all heap pages — fine for M0, revisit if insert
-  throughput regresses in M1.
-- `Heap` stores page list in-memory only; after reopen, the Engine creates a new
-  `Heap` with an empty page list. `fetch_page` still works because the buffer pool
-  re-reads pages from the mmap, but `find_or_alloc_page` will always allocate a
-  fresh page on the first insert after reopen. In M1 the catalog will fix this.
-- WAL truncation rewrites the entire file — acceptable for M0, needs a proper
+- FSM is a linear scan over all heap pages — fine for M0/M1, revisit if insert
+  throughput regresses.
+- `Heap` stores page list in-memory only; lost across reopen (rebuilt lazily).
+  In M1.c the catalog will fix this properly.
+- WAL truncation rewrites the entire file — acceptable for now, needs a proper
   log-segment scheme in later milestones.
+- **No vacuum/GC in M1.** Dead tuple versions (`xmax` set, no snapshot can see
+  them, or self-stamped-dead by an abort) are never reclaimed. Heap pages only
+  grow. Safe (no correctness issue) but a real throughput/storage regression
+  for update-heavy workloads — tracked for a post-M1 vacuum milestone. This
+  compounds with the FSM linear-scan tech debt above (dead tuples reduce
+  effective free space per page).
+- `benches/load.rs` was updated to compile against the new transactional API
+  (`begin`/`insert`/`commit` per op) but has not been *re-run* — M0's recorded
+  numbers in `PROGRESS.md` predate the transactional wrapping and will need a
+  fresh run once M1 closes out, to see the (likely small, since xid bookkeeping
+  is in-memory-only) overhead of the transaction manager on top of the
+  already-fsync-dominated cost.
+- **No wait queue / deadlock detection in `LockManager`** (M1.b) — deliberate
+  per D12, since SI's conflict handling is "abort immediately," not
+  "block and wait." A future SERIALIZABLE/SSI effort would need to add this,
+  which is exactly what the D11 seam exists to make possible without a
+  lock-manager rewrite.
 
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-06 — M1.b checkpoint complete (SI abort-on-conflict)
+
+- Implemented all of M1.b: `lockmgr.rs` (write-write conflict tracking, no
+  wait queue per D12), wired into `Heap::update`/`delete`, `Engine`/
+  `TransactionManager` now own and thread a `LockManager` alongside
+  `pool`/`wal`/`heap`, crash test P9 (crash mid-undo of an already-aborting
+  transaction).
+- One planned mechanism turned out to be unnecessary: the "commit-time
+  first-committer-wins recheck" is subsumed by holding locks for a
+  transaction's entire lifetime (released only at commit/abort) — analyzed
+  and documented as a design note rather than building redundant code that
+  would never actually fire in this single-threaded engine.
+- Added 3 hand-written interleaved-transaction tests demonstrating SI
+  abort-on-conflict end-to-end: immediate abort on write-write conflict,
+  lock release on commit, lock release on abort.
+- **Final state:** 80 unit tests + 9 crash-harness tests (P1–P9) green,
+  `cargo clippy --all-targets -- -D warnings` clean, `cargo fmt --all --check`
+  clean, `cargo build --release` succeeds.
+- **Next:** M1.c — catalog (`catalog.rs`) + SQL subset (`src/sql/`), with
+  RC's re-evaluation path landing inside the UPDATE/DELETE executor and
+  RLS's AND-rewrite landing in the logical planner.
+
+### 2026-07-06 — M1.a checkpoint complete (MVCC core)
+
+- Implemented all of M1.a per the approved plan
+  (`/Users/sagarmahamuni/.claude/plans/misty-hugging-brook.md`): tuple header
+  extension, control-file catalog_root field, WAL user-txn records, MVCC
+  visibility logic, transaction manager, MVCC-aware heap rewrite, recovery's
+  user-txn undo pass, on_read/on_write seam, P6/P7 crash tests.
+- Two design deviations from the original plan discovered during
+  implementation and corrected (see design notes above): (1) abort requires
+  immediate physical undo, not something deferrable to M1.b; (2) no
+  version-chain walk in `Heap::get` — no cross-statement RowId stability.
+- Fixed a real bug introduced mid-session: `recovery.rs`'s `redo_record`/
+  `undo_record` still assumed M0's WAL_INSERT/WAL_UPDATE payload semantics
+  (bare payload / full replacement) after `heap.rs` changed what those
+  records actually carry (versioned-insert encoding / bare xmax value).
+  Fixed by decoding the new payload shapes explicitly.
+- Also closed out M0 in this session: ran `cargo bench --release` (some
+  benchmarks took several minutes each due to per-op fsync), recorded the
+  metrics table in `PROGRESS.md` with a lightweight SQLite CLI/Python-driver
+  baseline comparison, and fixed pre-existing repo-wide `cargo fmt` drift
+  that predated this session (confirmed via `git stash` before touching it).
+- **Final state:** 71 unit tests + 8 crash-harness tests (P1–P7) green,
+  `cargo clippy --all-targets -- -D warnings` clean, `cargo fmt --all --check`
+  clean, `cargo build --release` succeeds.
+- **Next:** M1.b — lock manager, SI abort-on-conflict (built and tested
+  before RC's re-evaluation path, per D12), crash test P9.
 
 ### 2026-07-06 — M0 implementation (Tasks 1–10)
 

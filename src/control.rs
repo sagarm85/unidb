@@ -1,12 +1,13 @@
 // Control file (D3): single meta-page/file holding magic, version, page_size,
-// last-checkpoint LSN, and WAL tail pointer. Recovery starts by reading this.
+// catalog root, last-checkpoint LSN, and WAL tail pointer. Recovery starts by
+// reading this.
 //
 // Layout (all little-endian, D9):
 //   [0..4]   magic          u32
 //   [4..6]   format_version u16
 //   [6..8]   _pad           u16
 //   [8..12]  page_size      u32
-//   [12..16] _pad           u32
+//   [12..16] catalog_root   u32   (PageId; INVALID_PAGE_ID = no catalog yet, M1)
 //   [16..24] checkpoint_lsn u64
 //   [24..32] wal_tail_lsn   u64
 //   [32..36] crc32          u32   (over bytes [0..32])
@@ -21,8 +22,9 @@ use std::{
 use crate::{
     error::{DbError, Result},
     format::{
-        u16_from_le, u16_to_le, u32_from_le, u32_to_le, u64_from_le, u64_to_le, DEFAULT_PAGE_SIZE,
-        FORMAT_VERSION, INVALID_LSN, MAGIC, MAX_PAGE_SIZE, MIN_PAGE_SIZE,
+        u16_from_le, u16_to_le, u32_from_le, u32_to_le, u64_from_le, u64_to_le, PageId,
+        DEFAULT_PAGE_SIZE, FORMAT_VERSION, INVALID_LSN, INVALID_PAGE_ID, MAGIC, MAX_PAGE_SIZE,
+        MIN_PAGE_SIZE,
     },
 };
 
@@ -32,6 +34,7 @@ const CRC_PAYLOAD_LEN: usize = 32;
 #[derive(Debug, Clone)]
 pub struct ControlData {
     pub page_size: u32,
+    pub catalog_root: PageId,
     pub checkpoint_lsn: u64,
     pub wal_tail_lsn: u64,
 }
@@ -40,6 +43,7 @@ impl ControlData {
     pub fn new(page_size: u32) -> Self {
         Self {
             page_size,
+            catalog_root: INVALID_PAGE_ID,
             checkpoint_lsn: INVALID_LSN,
             wal_tail_lsn: INVALID_LSN,
         }
@@ -52,7 +56,7 @@ fn encode(cd: &ControlData) -> [u8; CONTROL_SIZE] {
     buf[4..6].copy_from_slice(&u16_to_le(FORMAT_VERSION));
     // [6..8] pad
     buf[8..12].copy_from_slice(&u32_to_le(cd.page_size));
-    // [12..16] pad
+    buf[12..16].copy_from_slice(&u32_to_le(cd.catalog_root));
     buf[16..24].copy_from_slice(&u64_to_le(cd.checkpoint_lsn));
     buf[24..32].copy_from_slice(&u64_to_le(cd.wal_tail_lsn));
     let crc = crc32fast::hash(&buf[..CRC_PAYLOAD_LEN]);
@@ -83,10 +87,12 @@ fn decode(buf: &[u8; CONTROL_SIZE]) -> Result<ControlData> {
     if !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&page_size) || !page_size.is_power_of_two() {
         return Err(DbError::BadPageSize(page_size));
     }
+    let catalog_root = u32_from_le(buf[12..16].try_into().unwrap());
     let checkpoint_lsn = u64_from_le(buf[16..24].try_into().unwrap());
     let wal_tail_lsn = u64_from_le(buf[24..32].try_into().unwrap());
     Ok(ControlData {
         page_size,
+        catalog_root,
         checkpoint_lsn,
         wal_tail_lsn,
     })
@@ -141,7 +147,11 @@ pub fn open_or_create(path: &Path, page_size: u32) -> Result<ControlData> {
     if path.exists() {
         read(path)
     } else {
-        let ps = if page_size == 0 { DEFAULT_PAGE_SIZE } else { page_size };
+        let ps = if page_size == 0 {
+            DEFAULT_PAGE_SIZE
+        } else {
+            page_size
+        };
         create(path, ps)
     }
 }
@@ -174,6 +184,19 @@ mod tests {
         let cd2 = read(&p).unwrap();
         assert_eq!(cd2.checkpoint_lsn, 42);
         assert_eq!(cd2.wal_tail_lsn, 99);
+    }
+
+    #[test]
+    fn catalog_root_defaults_invalid_and_round_trips() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("control");
+        let mut cd = create(&p, DEFAULT_PAGE_SIZE).unwrap();
+        assert_eq!(cd.catalog_root, crate::format::INVALID_PAGE_ID);
+
+        cd.catalog_root = 7;
+        write(&p, &cd).unwrap();
+        let cd2 = read(&p).unwrap();
+        assert_eq!(cd2.catalog_root, 7);
     }
 
     #[test]

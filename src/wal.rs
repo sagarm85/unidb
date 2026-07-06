@@ -27,9 +27,9 @@ use std::{
 use crate::{
     error::{DbError, Result},
     format::{
-        u16_from_le, u16_to_le, u32_from_le, u32_to_le, u64_from_le, u64_to_le, Lsn, PageId,
-        WAL_ABORT, WAL_BEGIN, WAL_CHECKPOINT, WAL_COMMIT, WAL_DELETE, WAL_INSERT, WAL_UPDATE,
-        INVALID_LSN,
+        u16_from_le, u16_to_le, u32_from_le, u32_to_le, u64_from_le, u64_to_le, Lsn, PageId, Xid,
+        INVALID_LSN, WAL_ABORT, WAL_BEGIN, WAL_CHECKPOINT, WAL_COMMIT, WAL_DELETE, WAL_INSERT,
+        WAL_TXN_ABORT, WAL_TXN_BEGIN, WAL_TXN_COMMIT, WAL_UPDATE,
     },
 };
 
@@ -117,7 +117,11 @@ pub struct Wal {
 impl Wal {
     pub fn open(path: &Path, start_lsn: Lsn) -> Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
-        let next_lsn = if start_lsn == INVALID_LSN { 1 } else { start_lsn + 1 };
+        let next_lsn = if start_lsn == INVALID_LSN {
+            1
+        } else {
+            start_lsn + 1
+        };
         tracing::info!(path = %path.display(), next_lsn, "WAL opened");
         Ok(Self {
             writer: BufWriter::new(file),
@@ -187,6 +191,31 @@ impl Wal {
     ) -> Result<Lsn> {
         let lsn = self.append_raw(txn_id, prev_lsn, WAL_DELETE, page_id, slot, &[], undo)?;
         tracing::trace!(mini_txn_id = txn_id, lsn, page_id, slot, "WAL DELETE");
+        Ok(lsn)
+    }
+
+    // ── user transactions (M1) ──────────────────────────────────────────────
+    // Independent ID space from mini-txns above: `xid` rides in the same
+    // wire-format `mini_txn_id` field, so the on-disk record shape is
+    // unchanged. Recovery distinguishes the two by `rec_type`.
+
+    pub fn begin_user_txn(&mut self, xid: Xid) -> Result<Lsn> {
+        let lsn = self.append_raw(xid, INVALID_LSN, WAL_TXN_BEGIN, 0, 0, &[], &[])?;
+        tracing::debug!(xid, lsn, "WAL TXN_BEGIN");
+        Ok(lsn)
+    }
+
+    pub fn commit_user_txn(&mut self, xid: Xid, prev_lsn: Lsn) -> Result<Lsn> {
+        let lsn = self.append_raw(xid, prev_lsn, WAL_TXN_COMMIT, 0, 0, &[], &[])?;
+        self.fsync()?;
+        tracing::debug!(xid, lsn, "WAL TXN_COMMIT (fsynced)");
+        Ok(lsn)
+    }
+
+    pub fn abort_user_txn(&mut self, xid: Xid, prev_lsn: Lsn) -> Result<Lsn> {
+        let lsn = self.append_raw(xid, prev_lsn, WAL_TXN_ABORT, 0, 0, &[], &[])?;
+        self.fsync()?;
+        tracing::debug!(xid, lsn, "WAL TXN_ABORT (fsynced)");
         Ok(lsn)
     }
 
@@ -312,7 +341,9 @@ mod tests {
         let p = dir.path().join("test.wal");
         let mut wal = Wal::open(&p, INVALID_LSN).unwrap();
         let (txn_id, begin_lsn) = wal.begin_mini_txn().unwrap();
-        let _ins_lsn = wal.log_insert(txn_id, begin_lsn, 1, 0, b"row_data").unwrap();
+        let _ins_lsn = wal
+            .log_insert(txn_id, begin_lsn, 1, 0, b"row_data")
+            .unwrap();
         wal.commit_mini_txn(txn_id, _ins_lsn).unwrap();
         let records = Wal::scan_file(&p).unwrap();
         assert_eq!(records.len(), 3);
@@ -327,13 +358,65 @@ mod tests {
         let p = dir.path().join("test.wal");
         let mut wal = Wal::open(&p, INVALID_LSN).unwrap();
         let (txn_id, begin_lsn) = wal.begin_mini_txn().unwrap();
-        let ins_lsn = wal.log_insert(txn_id, begin_lsn, 5, 3, b"hello world").unwrap();
+        let ins_lsn = wal
+            .log_insert(txn_id, begin_lsn, 5, 3, b"hello world")
+            .unwrap();
         wal.commit_mini_txn(txn_id, ins_lsn).unwrap(); // fsync so scan_file sees the records
         let records = Wal::scan_file(&p).unwrap();
         let ins = records.iter().find(|r| r.rec_type == WAL_INSERT).unwrap();
         assert_eq!(ins.redo, b"hello world");
         assert_eq!(ins.page_id, 5);
         assert_eq!(ins.slot, 3);
+    }
+
+    #[test]
+    fn user_txn_records_round_trip() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("test.wal");
+        let mut wal = Wal::open(&p, INVALID_LSN).unwrap();
+        let xid: Xid = 7;
+        let begin_lsn = wal.begin_user_txn(xid).unwrap();
+        wal.commit_user_txn(xid, begin_lsn).unwrap();
+        let records = Wal::scan_file(&p).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].rec_type, WAL_TXN_BEGIN);
+        assert_eq!(records[0].mini_txn_id, xid);
+        assert_eq!(records[1].rec_type, WAL_TXN_COMMIT);
+        assert_eq!(records[1].mini_txn_id, xid);
+    }
+
+    #[test]
+    fn user_txn_abort_records_round_trip() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("test.wal");
+        let mut wal = Wal::open(&p, INVALID_LSN).unwrap();
+        let xid: Xid = 3;
+        let begin_lsn = wal.begin_user_txn(xid).unwrap();
+        wal.abort_user_txn(xid, begin_lsn).unwrap();
+        let records = Wal::scan_file(&p).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].rec_type, WAL_TXN_ABORT);
+        assert_eq!(records[1].mini_txn_id, xid);
+    }
+
+    #[test]
+    fn mini_txn_and_user_txn_ids_are_independent_spaces() {
+        // A mini-txn (statement) nested inside a user-txn shares the wire
+        // format but not the ID space: mini_txn_id counters and xids can
+        // collide numerically without meaning the same thing.
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("test.wal");
+        let mut wal = Wal::open(&p, INVALID_LSN).unwrap();
+        let xid: Xid = 1;
+        wal.begin_user_txn(xid).unwrap();
+        let (mini_id, begin_lsn) = wal.begin_mini_txn().unwrap();
+        wal.commit_mini_txn(mini_id, begin_lsn).unwrap();
+        wal.commit_user_txn(xid, begin_lsn).unwrap();
+        let records = Wal::scan_file(&p).unwrap();
+        assert_eq!(records[0].rec_type, WAL_TXN_BEGIN);
+        assert_eq!(records[1].rec_type, WAL_BEGIN);
+        assert_eq!(records[2].rec_type, WAL_COMMIT);
+        assert_eq!(records[3].rec_type, WAL_TXN_COMMIT);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 // All on-disk integers are little-endian (D9).
 
 pub const MAGIC: u32 = 0x556E4442; // "UnDB"
-pub const FORMAT_VERSION: u16 = 1;
+pub const FORMAT_VERSION: u16 = 2;
 
 /// Default page size: 8 KiB (D8). Baked into the control file at DB init.
 pub const DEFAULT_PAGE_SIZE: u32 = 8192;
@@ -19,8 +19,12 @@ pub type Lsn = u64;
 /// Page identifier — 0-based index into the page file.
 pub type PageId = u32;
 
+/// Transaction identifier — monotonically increasing u64, 0 means "no transaction" (M1).
+pub type Xid = u64;
+
 pub const INVALID_LSN: Lsn = 0;
 pub const INVALID_PAGE_ID: PageId = u32::MAX;
+pub const INVALID_XID: Xid = 0;
 
 // Page type tags stored in PageHeader.page_type.
 pub const PAGE_TYPE_HEAP: u8 = 1;
@@ -35,6 +39,15 @@ pub const WAL_INSERT: u8 = 4;
 pub const WAL_UPDATE: u8 = 5;
 pub const WAL_DELETE: u8 = 6;
 pub const WAL_CHECKPOINT: u8 = 7;
+
+// WAL user-transaction record types (M1). Distinct from the mini-txn
+// WAL_BEGIN/COMMIT/ABORT tags above: a mini-txn is D2's per-statement atomic
+// unit, a user-txn is M1's multi-statement unit. Both share the WalRecord
+// wire format — the `mini_txn_id` field doubles as the xid for these tags,
+// so no format change is needed, just a second independent ID space.
+pub const WAL_TXN_BEGIN: u8 = 8;
+pub const WAL_TXN_COMMIT: u8 = 9;
+pub const WAL_TXN_ABORT: u8 = 10;
 
 // ── little-endian helpers ────────────────────────────────────────────────────
 
@@ -80,8 +93,8 @@ mod tests {
 
     #[test]
     fn page_size_valid() {
-        assert!(DEFAULT_PAGE_SIZE >= MIN_PAGE_SIZE);
-        assert!(DEFAULT_PAGE_SIZE <= MAX_PAGE_SIZE);
+        const { assert!(DEFAULT_PAGE_SIZE >= MIN_PAGE_SIZE) };
+        const { assert!(DEFAULT_PAGE_SIZE <= MAX_PAGE_SIZE) };
         assert!(DEFAULT_PAGE_SIZE.is_power_of_two());
     }
 }

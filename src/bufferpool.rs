@@ -265,7 +265,10 @@ mod tests {
         page.set_lsn(100);
         pool.write_page(&page).unwrap(); // in-memory write is fine
         let result = pool.flush_page(pid, 50); // flush with durable WAL only at 50
-        assert!(result.is_err(), "D5: flush must be rejected when page LSN > durable WAL LSN");
+        assert!(
+            result.is_err(),
+            "D5: flush must be rejected when page LSN > durable WAL LSN"
+        );
     }
 
     #[test]

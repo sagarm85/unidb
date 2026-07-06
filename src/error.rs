@@ -40,6 +40,42 @@ pub enum DbError {
 
     #[error("control file corrupt: {0}")]
     ControlFileCorrupt(String),
+
+    #[error("write conflict: record already locked by transaction {holder_xid}")]
+    WriteConflict { holder_xid: u64 },
+
+    #[error("could not serialize access due to concurrent update (xid {xid})")]
+    SerializationFailure { xid: u64 },
+
+    #[error("transaction {xid} is not active")]
+    TxnNotActive { xid: u64 },
+
+    #[error("transaction {xid} already committed or aborted")]
+    TxnAlreadyFinished { xid: u64 },
+
+    #[error("no visible version of row ({page_id}, {slot}) under current snapshot")]
+    NoVisibleVersion { page_id: u32, slot: u16 },
+
+    #[error("SQL parse error: {0}")]
+    SqlParse(String),
+
+    #[error("SQL planning error: {0}")]
+    SqlPlan(String),
+
+    #[error("unsupported SQL feature: {0}")]
+    SqlUnsupported(String),
+
+    #[error("table '{0}' not found")]
+    TableNotFound(String),
+
+    #[error("table '{0}' already exists")]
+    TableAlreadyExists(String),
+
+    #[error("column '{column}' not found on table '{table}'")]
+    ColumnNotFound { table: String, column: String },
+
+    #[error("catalog is corrupt: {0}")]
+    CatalogCorrupt(String),
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;

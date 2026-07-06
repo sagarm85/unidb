@@ -20,20 +20,40 @@
 //   [0..2] offset  u16   (byte offset of tuple data from page start; 0 = deleted)
 //   [2..4] length  u16   (byte length of the stored record)
 //
-// Tuple header prepended to every stored record:
-//   [0..8]  xmin   u64   (reserved for MVCC, zero in M0)
-//   [8..16] xmax   u64   (reserved for MVCC, zero in M0)
-// Tuple header size: 16 bytes
+// Tuple header prepended to every stored record (M1, D4):
+//   [0..8]   xmin        u64   (inserting transaction's xid; 0 in M0-era rows)
+//   [8..16]  xmax        u64   (deleting/superseding transaction's xid; 0 = live)
+//   [16..20] prev_page   u32   (page_id of prior version; INVALID_PAGE_ID = none)
+//   [20..22] prev_slot   u16   (slot of prior version)
+//   [22..24] _pad        u16
+// Tuple header size: 24 bytes
 
 use crate::{
     error::{DbError, Result},
-    format::{u16_from_le, u16_to_le, u32_from_le, u32_to_le, u64_from_le, u64_to_le, Lsn, PageId},
+    format::{
+        u16_from_le, u16_to_le, u32_from_le, u32_to_le, u64_from_le, u64_to_le, Lsn, PageId, Xid,
+        INVALID_PAGE_ID,
+    },
 };
 
 pub const PAGE_HEADER_SIZE: usize = 28;
 pub const SLOT_SIZE: usize = 4;
-pub const TUPLE_HEADER_SIZE: usize = 16;
+pub const TUPLE_HEADER_SIZE: usize = 24;
 const CRC_FIELD_OFFSET: usize = 8;
+
+const TH_XMIN: usize = 0;
+const TH_XMAX: usize = 8;
+const TH_PREV_PAGE: usize = 16;
+const TH_PREV_SLOT: usize = 20;
+
+/// MVCC version-chain metadata read from a tuple header (M1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TupleHeader {
+    pub xmin: Xid,
+    pub xmax: Xid,
+    pub prev_page: PageId,
+    pub prev_slot: u16,
+}
 
 #[derive(Debug, Clone)]
 pub struct SlottedPage {
@@ -151,18 +171,40 @@ impl SlottedPage {
     // ── insert / read / delete ───────────────────────────────────────────────
 
     /// Insert `payload` (raw user bytes, no tuple header — we prepend it).
+    /// Tuple header is zeroed (xmin/xmax = 0, no prior version) — M0 compat.
     /// Returns the slot index allocated.
     pub fn insert(&mut self, payload: &[u8]) -> Result<u16> {
+        self.insert_versioned(payload, 0, 0, None)
+    }
+
+    /// Insert `payload` with explicit MVCC tuple-header fields (M1, D4).
+    /// `prev` chains to the prior version of this logical row, if any.
+    /// Returns the slot index allocated.
+    pub fn insert_versioned(
+        &mut self,
+        payload: &[u8],
+        xmin: Xid,
+        xmax: Xid,
+        prev: Option<(PageId, u16)>,
+    ) -> Result<u16> {
         let stored_len = TUPLE_HEADER_SIZE + payload.len();
         let needed = SLOT_SIZE + stored_len;
         if needed > self.free_space() {
-            return Err(DbError::HeapFull { size: payload.len() });
+            return Err(DbError::HeapFull {
+                size: payload.len(),
+            });
         }
         // carve space from the top
         let new_fe = self.free_end() as usize - stored_len;
-        // write tuple header (xmin/xmax = 0 in M0, D4)
         let th_end = new_fe + TUPLE_HEADER_SIZE;
         self.data[new_fe..th_end].fill(0);
+        self.data[new_fe + TH_XMIN..new_fe + TH_XMIN + 8].copy_from_slice(&u64_to_le(xmin));
+        self.data[new_fe + TH_XMAX..new_fe + TH_XMAX + 8].copy_from_slice(&u64_to_le(xmax));
+        let (prev_page, prev_slot) = prev.unwrap_or((INVALID_PAGE_ID, 0));
+        self.data[new_fe + TH_PREV_PAGE..new_fe + TH_PREV_PAGE + 4]
+            .copy_from_slice(&u32_to_le(prev_page));
+        self.data[new_fe + TH_PREV_SLOT..new_fe + TH_PREV_SLOT + 2]
+            .copy_from_slice(&u16_to_le(prev_slot));
         // write payload
         self.data[th_end..th_end + payload.len()].copy_from_slice(payload);
 
@@ -173,6 +215,70 @@ impl SlottedPage {
         self.set_free_start(self.free_start() + SLOT_SIZE as u16);
         self.write_crc();
         Ok(sc)
+    }
+
+    /// Read the MVCC tuple-header fields at `slot` (M1).
+    pub fn tuple_header(&self, slot: u16) -> Result<TupleHeader> {
+        let sc = self.slot_count();
+        if slot >= sc {
+            return Err(DbError::SlotOutOfRange {
+                page_id: self.page_id(),
+                slot,
+            });
+        }
+        let (offset, _) = self.read_slot(slot);
+        if offset == 0 {
+            return Err(DbError::TupleDeleted {
+                page_id: self.page_id(),
+                slot,
+            });
+        }
+        let base = offset as usize;
+        Ok(TupleHeader {
+            xmin: u64_from_le(
+                self.data[base + TH_XMIN..base + TH_XMIN + 8]
+                    .try_into()
+                    .unwrap(),
+            ),
+            xmax: u64_from_le(
+                self.data[base + TH_XMAX..base + TH_XMAX + 8]
+                    .try_into()
+                    .unwrap(),
+            ),
+            prev_page: u32_from_le(
+                self.data[base + TH_PREV_PAGE..base + TH_PREV_PAGE + 4]
+                    .try_into()
+                    .unwrap(),
+            ),
+            prev_slot: u16_from_le(
+                self.data[base + TH_PREV_SLOT..base + TH_PREV_SLOT + 2]
+                    .try_into()
+                    .unwrap(),
+            ),
+        })
+    }
+
+    /// Stamp `xmax` on the tuple at `slot` in place (M1 DELETE / UPDATE
+    /// superseding a version). Always fits — it's a fixed-size header field.
+    pub fn set_xmax(&mut self, slot: u16, xmax: Xid) -> Result<()> {
+        let sc = self.slot_count();
+        if slot >= sc {
+            return Err(DbError::SlotOutOfRange {
+                page_id: self.page_id(),
+                slot,
+            });
+        }
+        let (offset, _) = self.read_slot(slot);
+        if offset == 0 {
+            return Err(DbError::TupleDeleted {
+                page_id: self.page_id(),
+                slot,
+            });
+        }
+        let base = offset as usize;
+        self.data[base + TH_XMAX..base + TH_XMAX + 8].copy_from_slice(&u64_to_le(xmax));
+        self.write_crc();
+        Ok(())
     }
 
     /// Read the payload at `slot` (strips tuple header).
@@ -239,7 +345,9 @@ impl SlottedPage {
             // Payload grew — delete old and insert new (may change slot).
             // For M0 in-place is fine when size fits; if not, caller must
             // handle by delete+insert on a potentially different slot.
-            return Err(DbError::HeapFull { size: payload.len() });
+            return Err(DbError::HeapFull {
+                size: payload.len(),
+            });
         }
         let payload_start = offset as usize + TUPLE_HEADER_SIZE;
         self.data[payload_start..payload_start + payload.len()].copy_from_slice(payload);
@@ -267,7 +375,11 @@ impl SlottedPage {
     }
 
     pub fn verify_crc(&self) -> Result<()> {
-        let stored = u32_from_le(self.data[CRC_FIELD_OFFSET..CRC_FIELD_OFFSET + 4].try_into().unwrap());
+        let stored = u32_from_le(
+            self.data[CRC_FIELD_OFFSET..CRC_FIELD_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
         let computed = self.compute_crc();
         if stored != computed {
             Err(DbError::ChecksumMismatch {
@@ -342,5 +454,50 @@ mod tests {
         let before = p.free_space();
         p.insert(b"payload").unwrap();
         assert!(p.free_space() < before);
+    }
+
+    #[test]
+    fn insert_zeroes_header_by_default() {
+        let mut p = make_page();
+        let s = p.insert(b"data").unwrap();
+        let th = p.tuple_header(s).unwrap();
+        assert_eq!(th.xmin, 0);
+        assert_eq!(th.xmax, 0);
+        assert_eq!(th.prev_page, crate::format::INVALID_PAGE_ID);
+        assert_eq!(th.prev_slot, 0);
+    }
+
+    #[test]
+    fn insert_versioned_round_trip() {
+        let mut p = make_page();
+        let s = p.insert_versioned(b"row-v1", 42, 0, None).unwrap();
+        let th = p.tuple_header(s).unwrap();
+        assert_eq!(th.xmin, 42);
+        assert_eq!(th.xmax, 0);
+        assert_eq!(th.prev_page, crate::format::INVALID_PAGE_ID);
+        assert_eq!(p.get(s).unwrap(), b"row-v1");
+
+        let s2 = p.insert_versioned(b"row-v2", 43, 0, Some((1, s))).unwrap();
+        let th2 = p.tuple_header(s2).unwrap();
+        assert_eq!(th2.xmin, 43);
+        assert_eq!(th2.prev_page, 1);
+        assert_eq!(th2.prev_slot, s);
+    }
+
+    #[test]
+    fn set_xmax_stamps_in_place() {
+        let mut p = make_page();
+        let s = p.insert_versioned(b"data", 1, 0, None).unwrap();
+        p.set_xmax(s, 7).unwrap();
+        let th = p.tuple_header(s).unwrap();
+        assert_eq!(th.xmin, 1);
+        assert_eq!(th.xmax, 7);
+        // payload untouched
+        assert_eq!(p.get(s).unwrap(), b"data");
+    }
+
+    #[test]
+    fn tuple_header_size_is_24_bytes() {
+        assert_eq!(TUPLE_HEADER_SIZE, 24);
     }
 }

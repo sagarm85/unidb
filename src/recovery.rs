@@ -6,17 +6,17 @@
 // Never panics on a bad page or corrupt WAL record — detects and reports (D1).
 // Structured logging throughout (D13).
 
-use std::{
-    collections::HashSet,
-    path::Path,
-};
+use std::{collections::HashSet, path::Path};
 
 use crate::{
     bufferpool::BufferPool,
     control::{self, ControlData},
     error::{DbError, Result},
-    format::{INVALID_LSN, WAL_ABORT, WAL_BEGIN, WAL_CHECKPOINT, WAL_COMMIT, WAL_DELETE,
-             WAL_INSERT, WAL_UPDATE},
+    format::{
+        u64_from_le, Xid, INVALID_LSN, WAL_ABORT, WAL_BEGIN, WAL_CHECKPOINT, WAL_COMMIT,
+        WAL_DELETE, WAL_INSERT, WAL_TXN_ABORT, WAL_TXN_BEGIN, WAL_TXN_COMMIT, WAL_UPDATE,
+    },
+    heap::decode_insert_redo,
     page::SlottedPage,
     wal::{Wal, WalRecord},
 };
@@ -26,6 +26,11 @@ pub struct RecoveryStats {
     pub records_redone: usize,
     pub records_undone: usize,
     pub incomplete_txns: usize,
+    /// User transactions (M1) that began but never reached `WAL_TXN_COMMIT`
+    /// — undone even though their individual statements' mini-txns may have
+    /// each committed durably (D2's per-statement unit vs. M1's
+    /// multi-statement unit are tracked independently; see txn.rs).
+    pub incomplete_user_txns: usize,
 }
 
 pub fn recover(
@@ -57,9 +62,15 @@ pub fn recover(
 
     for r in &relevant {
         match r.rec_type {
-            WAL_BEGIN => { started.insert(r.mini_txn_id); }
-            WAL_COMMIT => { committed.insert(r.mini_txn_id); }
-            WAL_ABORT => { aborted.insert(r.mini_txn_id); }
+            WAL_BEGIN => {
+                started.insert(r.mini_txn_id);
+            }
+            WAL_COMMIT => {
+                committed.insert(r.mini_txn_id);
+            }
+            WAL_ABORT => {
+                aborted.insert(r.mini_txn_id);
+            }
             WAL_CHECKPOINT => {}
             _ => {}
         }
@@ -83,6 +94,7 @@ pub fn recover(
         records_redone: 0,
         records_undone: 0,
         incomplete_txns: incomplete.len(),
+        incomplete_user_txns: 0,
     };
 
     // ── redo pass: replay committed mutations ────────────────────────────────
@@ -127,6 +139,77 @@ pub fn recover(
         }
     }
 
+    // ── M1: undo incomplete user transactions ─────────────────────────────
+    // A user transaction (xid) is a sequence of mini-txns tied together by
+    // WAL_TXN_BEGIN/COMMIT/ABORT (txn.rs). Its individual statements may
+    // each have already committed (and been redone above) — but if the
+    // transaction as a whole never reached WAL_TXN_COMMIT, all of its
+    // effects must be undone regardless. Ownership of a mutation is
+    // recovered from the tuple bytes themselves (xmin for INSERT, the new
+    // xmax value for an xmax-stamp UPDATE — see heap.rs), not a separate
+    // xid field in the WAL wire format.
+    let mut user_started: HashSet<Xid> = HashSet::new();
+    let mut user_committed: HashSet<Xid> = HashSet::new();
+    let mut user_aborted: HashSet<Xid> = HashSet::new();
+    for r in &relevant {
+        match r.rec_type {
+            WAL_TXN_BEGIN => {
+                user_started.insert(r.mini_txn_id);
+            }
+            WAL_TXN_COMMIT => {
+                user_committed.insert(r.mini_txn_id);
+            }
+            WAL_TXN_ABORT => {
+                user_aborted.insert(r.mini_txn_id);
+            }
+            _ => {}
+        }
+    }
+    let incomplete_user_txns: HashSet<Xid> = user_started
+        .difference(&user_committed)
+        .filter(|xid| !user_aborted.contains(xid))
+        .copied()
+        .collect();
+    stats.incomplete_user_txns = incomplete_user_txns.len();
+
+    if !incomplete_user_txns.is_empty() {
+        // Phase 1: revert xmax stamps this xid applied to pre-existing rows
+        // (DELETE, or an UPDATE's old-version half) back to 0 (live).
+        for r in relevant
+            .iter()
+            .filter(|r| r.rec_type == WAL_UPDATE && committed.contains(&r.mini_txn_id))
+        {
+            if let Ok(new_xmax) = decode_xmax(&r.redo) {
+                if incomplete_user_txns.contains(&new_xmax) {
+                    let mut page = fetch_or_create(&mut pool, r.page_id, page_size)?;
+                    page.set_xmax(r.slot, 0)?;
+                    pool.write_page(&page)?;
+                    pool.unpin(r.page_id);
+                    stats.records_undone += 1;
+                }
+            }
+        }
+        // Phase 2: force-self-stamp every row this xid inserted (INSERT, or
+        // an UPDATE's new-version half) so it is permanently invisible.
+        // Runs *after* phase 1 so that a row this xid both inserted and
+        // later re-superseded within its own transaction ends up dead
+        // (self-stamped) rather than incorrectly live (reverted to 0 by an
+        // earlier phase-1 stamp targeting the same slot).
+        for r in relevant.iter().filter(|r| {
+            r.rec_type == WAL_INSERT && r.slot != u16::MAX && committed.contains(&r.mini_txn_id)
+        }) {
+            if let Ok((xmin, _, _)) = decode_insert_redo(&r.redo) {
+                if incomplete_user_txns.contains(&xmin) {
+                    let mut page = fetch_or_create(&mut pool, r.page_id, page_size)?;
+                    page.set_xmax(r.slot, xmin)?;
+                    pool.write_page(&page)?;
+                    pool.unpin(r.page_id);
+                    stats.records_undone += 1;
+                }
+            }
+        }
+    }
+
     // Flush all recovered pages to disk.
     pool.flush_all(INVALID_LSN)?;
 
@@ -134,6 +217,7 @@ pub fn recover(
         redone = stats.records_redone,
         undone = stats.records_undone,
         incomplete_txns = stats.incomplete_txns,
+        incomplete_user_txns = stats.incomplete_user_txns,
         "recovery: complete"
     );
 
@@ -152,7 +236,10 @@ fn redo_record(r: &WalRecord, pool: &mut BufferPool, page_size: usize) -> Result
             if r.slot < page.slot_count_pub() {
                 return Ok(()); // already applied
             }
-            page.insert(&r.redo)?;
+            // M1: redo payload is [xmin:8][prev_page:4][prev_slot:2][payload]
+            // (heap.rs::encode_insert_redo), not bare payload bytes.
+            let (xmin, prev, payload) = decode_insert_redo(&r.redo)?;
+            page.insert_versioned(payload, xmin, 0, prev)?;
             page.set_lsn(r.lsn);
             pool.write_page(&page)?;
             pool.unpin(r.page_id);
@@ -163,7 +250,11 @@ fn redo_record(r: &WalRecord, pool: &mut BufferPool, page_size: usize) -> Result
                 pool.unpin(r.page_id);
                 return Ok(()); // already at or past this LSN
             }
-            page.update(r.slot, &r.redo)?;
+            // M1: WAL_UPDATE is now only ever an xmax stamp (DELETE, or an
+            // UPDATE's old-version half) — the redo payload IS the new xmax
+            // value (8 bytes), not a full replacement payload.
+            let xmax = decode_xmax(&r.redo)?;
+            page.set_xmax(r.slot, xmax)?;
             page.set_lsn(r.lsn);
             pool.write_page(&page)?;
             pool.unpin(r.page_id);
@@ -200,9 +291,10 @@ fn undo_record(r: &WalRecord, pool: &mut BufferPool, page_size: usize) -> Result
             pool.unpin(r.page_id);
         }
         WAL_UPDATE => {
-            // Undo an update = restore old value (stored in undo payload).
+            // Undo an xmax stamp = restore the old xmax (stored in undo payload).
             let mut page = fetch_or_create(pool, r.page_id, page_size)?;
-            match page.update(r.slot, &r.undo) {
+            let old_xmax = decode_xmax(&r.undo)?;
+            match page.set_xmax(r.slot, old_xmax) {
                 Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
                 Err(e) => return Err(e),
             }
@@ -220,6 +312,13 @@ fn undo_record(r: &WalRecord, pool: &mut BufferPool, page_size: usize) -> Result
         _ => {}
     }
     Ok(())
+}
+
+/// Decode an xmax-stamp WAL redo/undo payload (8 bytes LE): the value *is*
+/// the xmax to apply, since a stamp's payload is nothing but the new xmax.
+fn decode_xmax(buf: &[u8]) -> Result<u64> {
+    let arr: [u8; 8] = buf.try_into().map_err(|_| DbError::WalCorrupt { lsn: 0 })?;
+    Ok(u64_from_le(arr))
 }
 
 fn fetch_or_create(pool: &mut BufferPool, page_id: u32, page_size: usize) -> Result<SlottedPage> {
@@ -244,11 +343,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn paths(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
-        (
-            dir.join("control"),
-            dir.join("data.db"),
-            dir.join("db.wal"),
-        )
+        (dir.join("control"), dir.join("data.db"), dir.join("db.wal"))
     }
 
     #[test]
@@ -257,21 +352,86 @@ mod tests {
         let (ctrl_p, data_p, wal_p) = paths(dir.path());
 
         control::create(&ctrl_p, DEFAULT_PAGE_SIZE).unwrap();
-        let mut pool =
-            BufferPool::open(&data_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
+        let mut pool = BufferPool::open(&data_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
         let mut wal = Wal::open(&wal_p, INVALID_LSN).unwrap();
         let mut heap = Heap::new(DEFAULT_PAGE_SIZE as usize);
 
-        let rid = heap.insert(b"persistent", &mut pool, &mut wal).unwrap();
+        let rid = heap.insert(b"persistent", 1, &mut pool, &mut wal).unwrap();
         pool.flush_all(wal.durable_lsn).unwrap();
         drop(pool);
         drop(wal);
 
-        let (_, stats) =
-            recover(&ctrl_p, &data_p, &wal_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
+        let (_, stats) = recover(&ctrl_p, &data_p, &wal_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
         assert_eq!(stats.incomplete_txns, 0);
         assert_eq!(stats.records_undone, 0);
         let _ = rid;
+    }
+
+    #[test]
+    fn incomplete_user_txn_detected_and_undone() {
+        let dir = tempdir().unwrap();
+        let (ctrl_p, data_p, wal_p) = paths(dir.path());
+        control::create(&ctrl_p, DEFAULT_PAGE_SIZE).unwrap();
+
+        let rid = {
+            let mut pool = BufferPool::open(&data_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
+            let mut wal = Wal::open(&wal_p, INVALID_LSN).unwrap();
+            let mut heap = Heap::new(DEFAULT_PAGE_SIZE as usize);
+            let xid = 7;
+            wal.begin_user_txn(xid).unwrap();
+            let rid = heap
+                .insert(b"never_committed", xid, &mut pool, &mut wal)
+                .unwrap();
+            // No WAL_TXN_COMMIT — simulates a crash mid-user-transaction.
+            // The statement's own mini-txn is already durably committed
+            // (D2), but the user transaction as a whole never finished.
+            pool.flush_all(wal.durable_lsn).unwrap();
+            drop(pool);
+            drop(wal);
+            rid
+        };
+
+        let (_, stats) = recover(&ctrl_p, &data_p, &wal_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
+        assert_eq!(
+            stats.incomplete_user_txns, 1,
+            "must detect the incomplete user txn"
+        );
+        assert!(stats.records_undone > 0, "must undo the orphaned insert");
+
+        // After recovery, the row must be permanently invisible.
+        let mut pool = BufferPool::open(&data_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
+        let heap = Heap::new(DEFAULT_PAGE_SIZE as usize);
+        let snap = crate::mvcc::Snapshot::new(100, 100, vec![]);
+        assert!(heap.get(rid, &snap, 100, &mut pool).is_err());
+    }
+
+    #[test]
+    fn committed_user_txn_is_not_undone() {
+        let dir = tempdir().unwrap();
+        let (ctrl_p, data_p, wal_p) = paths(dir.path());
+        control::create(&ctrl_p, DEFAULT_PAGE_SIZE).unwrap();
+
+        let rid = {
+            let mut pool = BufferPool::open(&data_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
+            let mut wal = Wal::open(&wal_p, INVALID_LSN).unwrap();
+            let mut heap = Heap::new(DEFAULT_PAGE_SIZE as usize);
+            let xid = 7;
+            let begin_lsn = wal.begin_user_txn(xid).unwrap();
+            let rid = heap.insert(b"survives", xid, &mut pool, &mut wal).unwrap();
+            wal.commit_user_txn(xid, begin_lsn).unwrap();
+            pool.flush_all(wal.durable_lsn).unwrap();
+            drop(pool);
+            drop(wal);
+            rid
+        };
+
+        let (_, stats) = recover(&ctrl_p, &data_p, &wal_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
+        assert_eq!(stats.incomplete_user_txns, 0);
+
+        let mut pool = BufferPool::open(&data_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
+        let heap = Heap::new(DEFAULT_PAGE_SIZE as usize);
+        let snap = crate::mvcc::Snapshot::new(100, 100, vec![]);
+        assert_eq!(heap.get(rid, &snap, 100, &mut pool).unwrap(), b"survives");
     }
 
     #[test]
@@ -281,19 +441,17 @@ mod tests {
 
         control::create(&ctrl_p, DEFAULT_PAGE_SIZE).unwrap();
         {
-            let mut pool =
-                BufferPool::open(&data_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
+            let mut pool = BufferPool::open(&data_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
             let mut wal = Wal::open(&wal_p, INVALID_LSN).unwrap();
             let mut heap = Heap::new(DEFAULT_PAGE_SIZE as usize);
-            heap.insert(b"survived", &mut pool, &mut wal).unwrap();
+            heap.insert(b"survived", 1, &mut pool, &mut wal).unwrap();
             // Simulate crash: do NOT flush page to disk.
             drop(wal);
             drop(pool);
         }
 
         // Recovery should redo the committed insert.
-        let (_, stats) =
-            recover(&ctrl_p, &data_p, &wal_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
+        let (_, stats) = recover(&ctrl_p, &data_p, &wal_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
         assert!(stats.records_redone > 0);
     }
 }
