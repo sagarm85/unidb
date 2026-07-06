@@ -299,6 +299,132 @@ impl Engine {
         self.catalog.set_events_enabled(table, true, &mut ctx)
     }
 
+    /// Fetch up to `limit` events with `seq` greater than `consumer`'s
+    /// durable offset, ascending by `seq`. A pure read: an unregistered
+    /// consumer is treated as offset 0 in-memory only — no
+    /// `__consumers__` row is written here. Only `ack_events` durably
+    /// advances a consumer's progress (M4.b), mirroring Kafka's manual-
+    /// commit model: if offsets advanced on fetch, a crash between fetch
+    /// and the caller actually processing the batch would silently skip
+    /// events. No predicate pushdown exists — cost scales with
+    /// `__events__`'s total row count, not with consumer lag or `limit`
+    /// (see queue/mod.rs's module doc and `Engine::vacuum_events`, M4.c,
+    /// which is the actual lever for this cost).
+    pub fn poll_events(
+        &mut self,
+        xid: Xid,
+        consumer: &str,
+        limit: usize,
+    ) -> Result<Vec<queue::Event>> {
+        let page_size = self.control.page_size as usize;
+        let events_def = self.catalog.lookup(EVENTS_TABLE)?.clone();
+        let consumers_def = self.catalog.lookup(CONSUMERS_TABLE)?.clone();
+        let events_heap = Heap::from_pages(page_size, events_def.pages.clone());
+        let consumers_heap = Heap::from_pages(page_size, consumers_def.pages.clone());
+        let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
+
+        let offset =
+            queue::find_consumer_offset(&consumers_heap, &snapshot, xid, &mut self.pool, consumer)?
+                .map(|(_, offset)| offset)
+                .unwrap_or(0);
+
+        let mut events = Vec::new();
+        for (_, bytes) in events_heap.scan(&snapshot, xid, &mut self.pool)? {
+            let row = executor::decode_row(&bytes, &events_def.columns)?;
+            let (
+                Literal::Int(seq),
+                Literal::Int(row_xid),
+                Literal::Text(table_name),
+                Literal::Text(op),
+            ) = (&row[0], &row[1], &row[2], &row[3])
+            else {
+                continue;
+            };
+            if *seq <= offset {
+                continue;
+            }
+            let payload = match &row[4] {
+                Literal::Json(s) => serde_json::from_str(s).unwrap_or(serde_json::Value::Null),
+                _ => serde_json::Value::Null,
+            };
+            events.push(queue::Event {
+                seq: *seq,
+                xid: *row_xid,
+                table_name: table_name.clone(),
+                op: op.clone(),
+                payload,
+            });
+        }
+        events.sort_by_key(|e| e.seq);
+        events.truncate(limit);
+        Ok(events)
+    }
+
+    /// Durably advance `consumer`'s offset to `up_to_seq` — the only
+    /// operation in M4.b that writes to `__consumers__`. If the consumer
+    /// has never acked before, this is where its row is created
+    /// (auto-registration becomes durable on first ack, not on first
+    /// poll).
+    pub fn ack_events(&mut self, xid: Xid, consumer: &str, up_to_seq: i64) -> Result<()> {
+        let page_size = self.control.page_size as usize;
+        let consumers_def = self.catalog.lookup(CONSUMERS_TABLE)?.clone();
+        let mut heap = Heap::from_pages(page_size, consumers_def.pages.clone());
+        let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
+        let existing =
+            queue::find_consumer_offset(&heap, &snapshot, xid, &mut self.pool, consumer)?;
+
+        let encoded = executor::encode_row(&queue::consumer_row(consumer, up_to_seq));
+        match existing {
+            Some((row_id, _)) => {
+                let new_row_id = heap.update(
+                    row_id,
+                    &encoded,
+                    xid,
+                    &mut self.pool,
+                    &mut self.wal,
+                    &mut self.lock_mgr,
+                )?;
+                self.txn_mgr.record_undo(
+                    xid,
+                    UndoAction::XmaxStamp {
+                        page_id: row_id.page_id,
+                        slot: row_id.slot,
+                    },
+                )?;
+                self.txn_mgr.record_undo(
+                    xid,
+                    UndoAction::Insert {
+                        page_id: new_row_id.page_id,
+                        slot: new_row_id.slot,
+                    },
+                )?;
+            }
+            None => {
+                let row_id = heap.insert(&encoded, xid, &mut self.pool, &mut self.wal)?;
+                self.txn_mgr.record_undo(
+                    xid,
+                    UndoAction::Insert {
+                        page_id: row_id.page_id,
+                        slot: row_id.slot,
+                    },
+                )?;
+            }
+        }
+
+        if heap.page_ids() != consumers_def.pages.as_slice() {
+            let mut cctx = CatalogCtx {
+                pool: &mut self.pool,
+                wal: &mut self.wal,
+                control_path: &self.control_path,
+                control: &mut self.control,
+                page_size,
+            };
+            self.catalog
+                .set_pages(CONSUMERS_TABLE, heap.page_ids().to_vec(), &mut cctx)?;
+        }
+        Ok(())
+    }
+
     // ── M3.a: graph edges ───────────────────────────────────────────────────
 
     /// Insert one edge record into `__edges__`. Reconstructs its own `Heap`
@@ -1685,5 +1811,114 @@ mod tests {
             .collect();
         seqs.sort();
         assert_eq!(seqs, vec![1, 2, 3], "seq must not reuse after reopen");
+    }
+
+    // ── M4.b: poll/ack, consumer offsets ────────────────────────────────────
+
+    fn setup_events_table(engine: &mut Engine, n: i64) {
+        let xid = engine.begin().unwrap();
+        engine.execute_sql(xid, "CREATE TABLE t (id INT)").unwrap();
+        engine.commit(xid).unwrap();
+        engine.enable_events("t").unwrap();
+
+        let xid2 = engine.begin().unwrap();
+        for i in 1..=n {
+            engine
+                .execute_sql(xid2, &format!("INSERT INTO t (id) VALUES ({i})"))
+                .unwrap();
+        }
+        engine.commit(xid2).unwrap();
+    }
+
+    #[test]
+    fn poll_events_does_not_advance_offset() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        setup_events_table(&mut engine, 3);
+
+        let xid = engine.begin().unwrap();
+        let first = engine.poll_events(xid, "c1", 10).unwrap();
+        let second = engine.poll_events(xid, "c1", 10).unwrap();
+        assert_eq!(first.len(), 3);
+        assert_eq!(second.len(), 3);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn ack_events_advances_offset_so_next_poll_only_returns_newer() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        setup_events_table(&mut engine, 3);
+
+        let xid = engine.begin().unwrap();
+        let batch = engine.poll_events(xid, "c1", 10).unwrap();
+        assert_eq!(batch.len(), 3);
+        let up_to = batch[0].seq;
+        engine.ack_events(xid, "c1", up_to).unwrap();
+        engine.commit(xid).unwrap();
+
+        let xid2 = engine.begin().unwrap();
+        let remaining = engine.poll_events(xid2, "c1", 10).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().all(|e| e.seq > up_to));
+    }
+
+    #[test]
+    fn consumer_offsets_persist_across_reopen() {
+        let dir = tempdir().unwrap();
+        {
+            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            setup_events_table(&mut engine, 3);
+            let xid = engine.begin().unwrap();
+            let batch = engine.poll_events(xid, "c1", 10).unwrap();
+            engine.ack_events(xid, "c1", batch[1].seq).unwrap();
+            engine.commit(xid).unwrap();
+            engine.flush().unwrap();
+        }
+
+        let mut engine2 = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine2.begin().unwrap();
+        let remaining = engine2.poll_events(xid, "c1", 10).unwrap();
+        assert_eq!(remaining.len(), 1);
+    }
+
+    #[test]
+    fn independent_consumers_do_not_interfere() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        setup_events_table(&mut engine, 3);
+
+        let xid = engine.begin().unwrap();
+        let batch = engine.poll_events(xid, "c1", 10).unwrap();
+        engine.ack_events(xid, "c1", batch[2].seq).unwrap();
+        engine.commit(xid).unwrap();
+
+        let xid2 = engine.begin().unwrap();
+        let c1_remaining = engine.poll_events(xid2, "c1", 10).unwrap();
+        let c2_remaining = engine.poll_events(xid2, "c2", 10).unwrap();
+        assert!(c1_remaining.is_empty());
+        assert_eq!(c2_remaining.len(), 3);
+    }
+
+    #[test]
+    fn poll_events_for_unregistered_consumer_starts_at_offset_zero_without_writing() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        setup_events_table(&mut engine, 2);
+
+        let xid = engine.begin().unwrap();
+        let batch = engine.poll_events(xid, "never-registered", 10).unwrap();
+        assert_eq!(batch.len(), 2);
+
+        let consumers = engine
+            .execute_sql(xid, "SELECT * FROM __consumers__")
+            .unwrap();
+        match &consumers[0] {
+            SqlResult::Rows(rows) => assert!(
+                rows.is_empty(),
+                "poll_events must not write a __consumers__ row"
+            ),
+            other => panic!("expected Rows, got {other:?}"),
+        }
     }
 }

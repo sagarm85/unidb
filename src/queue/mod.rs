@@ -18,9 +18,13 @@
 pub mod payload;
 
 use crate::{
+    bufferpool::BufferPool,
     catalog::{Catalog, CatalogCtx, ColumnDef, ColumnType, TableDef},
     error::{DbError, Result},
-    sql::logical::Literal,
+    format::Xid,
+    heap::{Heap, RowId},
+    mvcc::Snapshot,
+    sql::{executor, logical::Literal},
 };
 
 pub const EVENTS_TABLE: &str = "__events__";
@@ -130,6 +134,29 @@ pub fn ensure_queue_tables(catalog: &mut Catalog, ctx: &mut CatalogCtx) -> Resul
         Err(DbError::TableNotFound(_)) => catalog.create_table(consumers_table_def(), ctx),
         Err(e) => Err(e),
     }
+}
+
+/// Find `consumer`'s durable offset row in `__consumers__`, if it has ever
+/// acked. `None` means the consumer has never called `ack_events` — treated
+/// as offset 0 by the caller (`Engine::poll_events`), purely in-memory, not
+/// written here.
+pub fn find_consumer_offset(
+    heap: &Heap,
+    snapshot: &Snapshot,
+    xid: Xid,
+    pool: &mut BufferPool,
+    consumer: &str,
+) -> Result<Option<(RowId, i64)>> {
+    let columns = &consumers_table_def().columns;
+    for (row_id, bytes) in heap.scan(snapshot, xid, pool)? {
+        let row = executor::decode_row(&bytes, columns)?;
+        if let (Literal::Text(name), Literal::Int(offset)) = (&row[0], &row[1]) {
+            if name == consumer {
+                return Ok(Some((row_id, *offset)));
+            }
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
