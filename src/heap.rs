@@ -62,6 +62,20 @@ impl Heap {
         }
     }
 
+    /// Reconstruct a `Heap` handle over an already-populated set of pages
+    /// (M1.c: the catalog persists each table's page list so `scan`/FSM
+    /// work correctly after a reopen, rather than starting from an empty
+    /// page list every time — see catalog.rs's `TableDef.pages`).
+    pub fn from_pages(page_size: usize, pages: Vec<PageId>) -> Self {
+        Self { page_size, pages }
+    }
+
+    /// The heap's current page list, so callers (the SQL executor) can
+    /// detect growth and persist the updated list back to the catalog.
+    pub fn page_ids(&self) -> &[PageId] {
+        &self.pages
+    }
+
     /// INSERT: create a brand-new live row, owned by `xid`.
     pub fn insert(
         &mut self,
