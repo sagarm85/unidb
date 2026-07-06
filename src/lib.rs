@@ -9,6 +9,7 @@ pub mod control;
 pub mod error;
 pub mod format;
 pub mod fulltext;
+pub mod graph;
 pub mod heap;
 pub mod index_worker;
 pub mod lockmgr;
@@ -25,16 +26,20 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     bufferpool::BufferPool,
-    catalog::{Catalog, ColumnDef, IndexKind},
+    catalog::{Catalog, CatalogCtx, ColumnDef, IndexKind},
     control::ControlData,
     error::Result,
     format::{Xid, DEFAULT_PAGE_SIZE},
+    graph::{
+        edges::{self, Edge},
+        index::{resolve_candidates_batched, EdgeIndex},
+    },
     heap::Heap,
     index_worker::{IndexHandle, IndexMsg},
     lockmgr::LockManager,
     sql::{
         executor::{self, ExecCtx, ExecResult},
-        logical::{apply_rls, Expr},
+        logical::{apply_rls, Expr, Literal},
         parser::parse_sql,
     },
     txn::{IsolationLevel, TransactionManager, UndoAction},
@@ -59,6 +64,7 @@ pub struct Engine {
     control_path: PathBuf,
     _wal_path: PathBuf,
     index_worker: IndexHandle,
+    edge_index: EdgeIndex,
 }
 
 impl Drop for Engine {
@@ -80,7 +86,7 @@ impl Engine {
         } else {
             page_size
         };
-        let control = control::open_or_create(&ctrl_p, ps)?;
+        let mut control = control::open_or_create(&ctrl_p, ps)?;
         let page_size_usize = control.page_size as usize;
 
         // Run recovery before opening normal operation.
@@ -105,7 +111,30 @@ impl Engine {
         let mut txn_mgr = TransactionManager::with_next_xid(next_xid);
         let mut lock_mgr = LockManager::new();
 
-        let catalog = Catalog::load(&control, &mut pool)?;
+        let mut catalog = Catalog::load(&control, &mut pool)?;
+
+        // `__edges__` always exists after open — before any user transaction
+        // begins, so unlike ordinary `CREATE TABLE` there's no "ran inside a
+        // transaction that later aborted" gap here (see MEMORY.md's M3.a
+        // design note).
+        {
+            let mut cctx = CatalogCtx {
+                pool: &mut pool,
+                wal: &mut wal,
+                control_path: &ctrl_p,
+                control: &mut control,
+                page_size: page_size_usize,
+            };
+            edges::ensure_edges_table(&mut catalog, &mut cctx)?;
+        }
+        let edge_index = rebuild_edge_index(
+            &catalog,
+            &mut txn_mgr,
+            &mut pool,
+            &mut wal,
+            &mut lock_mgr,
+            page_size_usize,
+        )?;
 
         let index_worker = IndexHandle::spawn();
         rebuild_secondary_indexes(
@@ -130,6 +159,7 @@ impl Engine {
             control_path: ctrl_p,
             _wal_path: wal_p,
             index_worker,
+            edge_index,
         })
     }
 
@@ -200,6 +230,130 @@ impl Engine {
     /// reached by the worker).
     pub fn index_status(&self, table: &str, column: &str) -> Option<index_worker::IndexStatus> {
         self.index_worker.status(table, column)
+    }
+
+    // ── M3.a: graph edges ───────────────────────────────────────────────────
+
+    /// Insert one edge record into `__edges__`. Reconstructs its own `Heap`
+    /// handle from the catalog's persisted page list — deliberately not
+    /// `self.heap`, which has no table concept and backs only the raw
+    /// `insert`/`get`/`update`/`delete` API above.
+    pub fn create_edge(
+        &mut self,
+        xid: Xid,
+        from_id: i64,
+        to_id: i64,
+        edge_type: &str,
+        props: &str,
+    ) -> Result<RowId> {
+        let page_size = self.control.page_size as usize;
+        let table_def = self.catalog.lookup(edges::EDGES_TABLE)?.clone();
+        let mut heap = Heap::from_pages(page_size, table_def.pages.clone());
+
+        let encoded = executor::encode_row(&edges::edge_row(from_id, to_id, edge_type, props));
+        let row_id = heap.insert(&encoded, xid, &mut self.pool, &mut self.wal)?;
+        self.txn_mgr.record_undo(
+            xid,
+            UndoAction::Insert {
+                page_id: row_id.page_id,
+                slot: row_id.slot,
+            },
+        )?;
+
+        if heap.page_ids() != table_def.pages.as_slice() {
+            let mut cctx = CatalogCtx {
+                pool: &mut self.pool,
+                wal: &mut self.wal,
+                control_path: &self.control_path,
+                control: &mut self.control,
+                page_size,
+            };
+            self.catalog
+                .set_pages(edges::EDGES_TABLE, heap.page_ids().to_vec(), &mut cctx)?;
+        }
+
+        self.edge_index.insert(from_id, row_id);
+        Ok(row_id)
+    }
+
+    /// Delete one edge record. `from_id` is taken as an explicit parameter
+    /// (the caller already has it from whatever scan/`edges_from` call
+    /// located the row) to avoid a redundant `Heap::get` just to find it.
+    pub fn delete_edge(&mut self, xid: Xid, row_id: RowId, from_id: i64) -> Result<()> {
+        let page_size = self.control.page_size as usize;
+        let table_def = self.catalog.lookup(edges::EDGES_TABLE)?.clone();
+        let mut heap = Heap::from_pages(page_size, table_def.pages.clone());
+
+        heap.delete(
+            row_id,
+            xid,
+            &mut self.pool,
+            &mut self.wal,
+            &mut self.lock_mgr,
+        )?;
+        self.txn_mgr.record_undo(
+            xid,
+            UndoAction::XmaxStamp {
+                page_id: row_id.page_id,
+                slot: row_id.slot,
+            },
+        )?;
+        self.edge_index.remove(from_id, row_id);
+        Ok(())
+    }
+
+    /// Traverse every edge out of `from_id`, MVCC-filtered against `xid`'s
+    /// snapshot. `edge_index` is a candidate-fetcher, not a source of
+    /// truth — every candidate `RowId` is re-resolved through the ordinary
+    /// MVCC snapshot check (`resolve_candidates_batched`), so an edge whose
+    /// creating transaction aborted never surfaces here even though the
+    /// index may still reference it.
+    pub fn edges_from(&mut self, xid: Xid, from_id: i64) -> Result<Vec<Edge>> {
+        let table_def = self.catalog.lookup(edges::EDGES_TABLE)?.clone();
+        let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
+        let candidates = self.edge_index.candidates(from_id).to_vec();
+        let resolved = resolve_candidates_batched(
+            &candidates,
+            &snapshot,
+            xid,
+            &mut self.pool,
+            &table_def.columns,
+        )?;
+
+        let mut out = Vec::with_capacity(resolved.len());
+        for (row_id, row) in resolved {
+            let to_id = match &row[1] {
+                Literal::Int(n) => *n,
+                other => {
+                    return Err(DbError::SqlPlan(format!(
+                        "__edges__.to_id decoded as non-Int: {other:?}"
+                    )))
+                }
+            };
+            let edge_type = match &row[2] {
+                Literal::Text(s) => s.clone(),
+                other => {
+                    return Err(DbError::SqlPlan(format!(
+                        "__edges__.edge_type decoded as non-Text: {other:?}"
+                    )))
+                }
+            };
+            let props = match &row[3] {
+                Literal::Json(s) => s.clone(),
+                other => {
+                    return Err(DbError::SqlPlan(format!(
+                        "__edges__.props decoded as non-Json: {other:?}"
+                    )))
+                }
+            };
+            out.push(Edge {
+                row_id,
+                to_id,
+                edge_type,
+                props,
+            });
+        }
+        Ok(out)
     }
 
     /// Begin a new transaction under READ COMMITTED (the default, D10).
@@ -302,6 +456,35 @@ impl Engine {
     pub fn flush(&mut self) -> Result<()> {
         self.pool.flush_all(self.wal.durable_lsn)
     }
+}
+
+/// Rebuild the edge-list index from `__edges__`'s currently-committed rows.
+/// Unlike `rebuild_secondary_indexes`, this is entirely synchronous — no
+/// worker, no channel — since a `HashMap` insert is O(1) amortized, not
+/// M2's O(n log n)-per-upsert HNSW rebuild cost. Uses the same ordinary
+/// begin/scan/commit read-only transaction pattern for MVCC-correct
+/// visibility of committed rows.
+fn rebuild_edge_index(
+    catalog: &Catalog,
+    txn_mgr: &mut TransactionManager,
+    pool: &mut BufferPool,
+    wal: &mut Wal,
+    lock_mgr: &mut LockManager,
+    page_size: usize,
+) -> Result<EdgeIndex> {
+    let mut index = EdgeIndex::new();
+    let table = catalog.lookup(edges::EDGES_TABLE)?;
+    let heap = Heap::from_pages(page_size, table.pages.clone());
+    let xid = txn_mgr.begin(IsolationLevel::ReadCommitted, wal)?;
+    let snapshot = txn_mgr.snapshot_for_statement(xid)?;
+    for (row_id, bytes) in heap.scan(&snapshot, xid, pool)? {
+        let row = executor::decode_row(&bytes, &table.columns)?;
+        if let Literal::Int(from_id) = row[0] {
+            index.insert(from_id, row_id);
+        }
+    }
+    txn_mgr.commit(xid, wal, lock_mgr)?;
+    Ok(index)
 }
 
 /// Scan every table's currently-committed rows for any column carrying an
@@ -990,5 +1173,85 @@ mod tests {
             SqlResult::Rows(rows) => assert_eq!(rows.len(), 1),
             other => panic!("expected Rows, got {other:?}"),
         }
+    }
+
+    // ── M3.a: graph edges ────────────────────────────────────────────────────
+
+    #[test]
+    fn edges_table_exists_and_is_ordinary_sql_queryable() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        engine.create_edge(xid, 1, 2, "KNOWS", "{}").unwrap();
+        engine.commit(xid).unwrap();
+
+        let xid2 = engine.begin().unwrap();
+        let result = engine
+            .execute_sql(xid2, "SELECT * FROM __edges__ WHERE from_id = 1")
+            .unwrap();
+        match &result[0] {
+            SqlResult::Rows(rows) => assert_eq!(rows.len(), 1),
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_edge_then_edges_from_returns_it() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        engine.create_edge(xid, 1, 2, "KNOWS", "{}").unwrap();
+        engine.create_edge(xid, 1, 3, "KNOWS", "{}").unwrap();
+        engine.commit(xid).unwrap();
+
+        let xid2 = engine.begin().unwrap();
+        let mut edges = engine.edges_from(xid2, 1).unwrap();
+        edges.sort_by_key(|e| e.to_id);
+        assert_eq!(edges.len(), 2);
+        assert_eq!(edges[0].to_id, 2);
+        assert_eq!(edges[0].edge_type, "KNOWS");
+        assert_eq!(edges[1].to_id, 3);
+    }
+
+    #[test]
+    fn delete_edge_removes_from_index_and_traversal() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        let row_id = engine.create_edge(xid, 1, 2, "KNOWS", "{}").unwrap();
+        engine.commit(xid).unwrap();
+
+        let xid2 = engine.begin().unwrap();
+        engine.delete_edge(xid2, row_id, 1).unwrap();
+        engine.commit(xid2).unwrap();
+
+        let xid3 = engine.begin().unwrap();
+        assert!(engine.edges_from(xid3, 1).unwrap().is_empty());
+    }
+
+    #[test]
+    fn edges_from_on_from_id_with_no_edges_returns_empty() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        assert!(engine.edges_from(xid, 999).unwrap().is_empty());
+    }
+
+    #[test]
+    fn edge_index_rebuilds_on_reopen() {
+        let dir = tempdir().unwrap();
+        {
+            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let xid = engine.begin().unwrap();
+            engine.create_edge(xid, 1, 2, "KNOWS", "{}").unwrap();
+            engine.create_edge(xid, 1, 3, "LIKES", "{}").unwrap();
+            engine.commit(xid).unwrap();
+            engine.flush().unwrap();
+        }
+
+        let mut engine2 = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine2.begin().unwrap();
+        let edges = engine2.edges_from(xid, 1).unwrap();
+        assert_eq!(edges.len(), 2);
     }
 }

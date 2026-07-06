@@ -12,23 +12,26 @@
 
 ## Current status
 
-- **Milestone:** M1 is DONE. **M2 (vector & text search) is DONE** — all
-  four checkpoints (M2.a `VECTOR(n)` foundation, M2.b background worker,
-  M2.c full-text + `CREATE INDEX`, M2.d `NEAR` + benchmarks) complete,
-  benchmarked, and committed. The approved plan lives at
-  `/Users/sagarmahamuni/.claude/plans/misty-hugging-brook.md`.
-- **State:** 158 unit tests + 10 crash-harness tests + 3 `tests/
-  index_rebuild.rs` tests + 1 `tests/vector_mvcc.rs` test (172 total) all
+- **Milestone:** M1 and M2 are DONE. **M3 (graph) is underway — checkpoint
+  M3.a (edge storage foundation) is complete.** The approved plan lives at
+  `/Users/sagarmahamuni/.claude/plans/misty-hugging-brook.md` (four
+  checkpoints, M3.a–d).
+- **State:** 168 unit tests + 10 crash-harness tests + 3 `tests/
+  index_rebuild.rs` tests + 1 `tests/vector_mvcc.rs` test (182 total) all
   green, `cargo clippy --all-targets -- -D warnings` clean, `cargo fmt
-  --all --check` clean, release build succeeds. `SELECT ... WHERE
-  NEAR(column, [...], k)` works end-to-end: MVCC-correct (proven by the
-  aborted-insert test), RLS/WHERE-composable, and benchmarked against
-  Postgres 18 + pgvector 0.8.4.
-- **Immediate next task:** M3 planning (graph: edge records, edge-list
-  index, Cypher subset, per-edge locking) has not started. Two open
-  questions carried forward from M1 remain unresolved (see Open questions
-  below), plus new M2 tech debt (no secondary-index cleanup on UPDATE,
-  `instant-distance`'s full-rebuild-per-upsert cost).
+  --all --check` clean, release build succeeds. Graph edges are stored as
+  ordinary rows in a synthetic `__edges__` system table (auto-created at
+  `Engine::open()`), with a synchronous in-memory edge-list index
+  (`from_id -> [RowId]`) rebuilt on every open. `Engine::create_edge`/
+  `delete_edge`/`edges_from` round-trip correctly and `__edges__` is
+  immediately ordinary-SQL-queryable with zero graph-specific code.
+- **Immediate next task:** Checkpoint M3.b — per-edge locking verification
+  (tests proving the existing `LockManager` already handles it correctly,
+  no new code) and the batch-latch adjacency-scan optimization (already
+  implemented in M3.a's `resolve_candidates_batched`, per the plan's
+  "build this batched from the start" — M3.b's remaining work is the
+  locking tests, the design note, and the before/after benchmark). See the
+  plan file's Checkpoint M3.b.
 - **Last updated:** 2026-07-06
 
 ### Design note: read-only transactions pay an unnecessary commit fsync (found in M1.d)
