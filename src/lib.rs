@@ -425,6 +425,69 @@ impl Engine {
         Ok(())
     }
 
+    /// Reclaim every `__events__` row every registered consumer has
+    /// already acknowledged past — the actual resolution of the
+    /// slow-consumer-vs-vacuum durability contract (see queue/mod.rs's
+    /// module doc): a slow consumer's un-acked events simply accumulate in
+    /// `__events__` rather than blocking WAL truncation, and this is the
+    /// explicit, never-automatic lever for reclaiming them once every
+    /// consumer has moved past. With zero registered consumers, this is a
+    /// no-op that reclaims nothing — a not-yet-registered consumer might
+    /// need full history. Deliberately **not** called from `Engine::
+    /// checkpoint()` or any other automatic path, matching M1's
+    /// zero-automatic-vacuum precedent.
+    pub fn vacuum_events(&mut self, xid: Xid) -> Result<usize> {
+        let page_size = self.control.page_size as usize;
+        let consumers_def = self.catalog.lookup(CONSUMERS_TABLE)?.clone();
+        let consumers_heap = Heap::from_pages(page_size, consumers_def.pages.clone());
+        let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
+
+        let mut min_offset: Option<i64> = None;
+        for (_, bytes) in consumers_heap.scan(&snapshot, xid, &mut self.pool)? {
+            let row = executor::decode_row(&bytes, &consumers_def.columns)?;
+            if let Literal::Int(offset) = row[1] {
+                min_offset = Some(min_offset.map_or(offset, |m: i64| m.min(offset)));
+            }
+        }
+        let Some(min_offset) = min_offset else {
+            return Ok(0);
+        };
+
+        let events_def = self.catalog.lookup(EVENTS_TABLE)?.clone();
+        let mut events_heap = Heap::from_pages(page_size, events_def.pages.clone());
+        let to_reclaim: Vec<RowId> = events_heap
+            .scan(&snapshot, xid, &mut self.pool)?
+            .into_iter()
+            .filter_map(|(row_id, bytes)| {
+                let row = executor::decode_row(&bytes, &events_def.columns).ok()?;
+                match row[0] {
+                    Literal::Int(seq) if seq <= min_offset => Some(row_id),
+                    _ => None,
+                }
+            })
+            .collect();
+
+        let mut reclaimed = 0usize;
+        for row_id in to_reclaim {
+            events_heap.delete(
+                row_id,
+                xid,
+                &mut self.pool,
+                &mut self.wal,
+                &mut self.lock_mgr,
+            )?;
+            self.txn_mgr.record_undo(
+                xid,
+                UndoAction::XmaxStamp {
+                    page_id: row_id.page_id,
+                    slot: row_id.slot,
+                },
+            )?;
+            reclaimed += 1;
+        }
+        Ok(reclaimed)
+    }
+
     // ── M3.a: graph edges ───────────────────────────────────────────────────
 
     /// Insert one edge record into `__edges__`. Reconstructs its own `Heap`
