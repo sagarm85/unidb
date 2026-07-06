@@ -289,8 +289,133 @@ that would have silently dropped `FullText` indexes on reopen).
 
 ---
 
-## M3 — Graph   [PLANNED]
-_Edge records + edge-list index; Cypher subset; per-edge locking with batched adjacency latching._
+## M3 — Graph   [DONE]   2026-07-06
+
+**PR:** _pending (not yet opened; benchmarks recorded ahead of PR per session workflow)_
+**Summary:** Graph edges — `(from_id, to_id, edge_type, props)` — an
+edge-list index by `from_id`, a hand-rolled Cypher subset (`MATCH
+(a)-[:TYPE]->(b) WHERE ... RETURN ...`), per-edge write locking, and a
+batch-latch adjacency-scan optimization. Shipped as four internal
+checkpoints (M3.a edge storage foundation, M3.b locking verification +
+batch-latch, M3.c Cypher subset, M3.d MVCC-correctness test + benchmarks).
+The headline architectural finding: graph edges needed **zero new
+storage-layer or locking code** — they're stored as ordinary rows in a
+synthetic `__edges__` system table, and `RecordId::row`'s lock key was
+already globally unique across every table in the database. Confirmed
+with tests, not just code inspection.
+
+**Benchmark scope note (§6):** as with M2, the full four-system "replaced
+stack" comparison isn't achievable until M4 (queue) exists. This entry
+uses **Postgres with an indexed adjacency-list table** as the interim
+proxy (`CREATE TABLE edges(from_id, to_id, edge_type, props jsonb);
+CREATE INDEX ON edges(from_id);`) — the direct "what would you do without
+a graph DB" comparison, confirmed with the user ahead of implementation. A
+dedicated embedded-graph-engine comparison is deliberately deferred: M3's
+actual competitive claim is "one transaction across relational + vector +
+graph," not "our traversal beats a purpose-built graph DB's traversal."
+
+**Benchmarks** (release build, Apple Silicon macOS, single-threaded
+caller, `--sample-size 10`; Postgres numbers are server-side `EXPLAIN
+ANALYZE`/summed `\timing` execution time, excluding `psql` client process
+overhead):
+
+| Workload                                          | unidb            | Postgres (indexed adjacency table) |
+|----------------------------------------------------|------------------|-------------------------------------|
+| INSERT 100 edges, 1 txn                            | ~335.8 ms (~3.36 ms/edge) | ~9.6 ms (~0.096 ms/edge) |
+| Adjacency scan, 1,000-edge hot hub — **naive**¹      | ~879 µs          | n/a (comparison baseline is unidb-internal) |
+| Adjacency scan, 1,000-edge hot hub — **batched**    | ~94.3 µs         | ~98 µs (Seq Scan — 100% of rows match, planner skips the index) |
+| Adjacency scan, 10,000-edge hot hub — **naive**¹     | ~9.06 ms         | n/a |
+| Adjacency scan, 10,000-edge hot hub — **batched**   | ~930 µs          | ~568 µs |
+
+¹ "naive" = one `BufferPool::fetch_page` call per candidate `RowId`, the
+  pre-M3.b resolution strategy — kept only in `benches/graph.rs` for
+  comparison; the shipped path is always the batched resolver.
+
+**Honest read of these numbers:**
+- **INSERT lags Postgres by ~35x, and this is not graph-specific.** It's
+  the same root cause M1/M2 already found and documented: every statement
+  pays a WAL fsync (D2's per-statement mini-txn), and Postgres's
+  group-commit amortizes this in a way unidb's current single-threaded,
+  no-group-commit storage layer does not yet. Tracked, known tech debt,
+  not something M3 introduced.
+- **The batch-latch adjacency scan is a genuine, competitive result, not
+  just "better than before."** At 1,000 edges, unidb's batched scan
+  (94.3 µs) is essentially even with Postgres's Seq Scan (98 µs); at
+  10,000 edges it's within ~1.6x (930 µs vs 568 µs). The *naive*
+  pre-optimization scan would have lost badly (9x and 16x slower,
+  respectively) — so M3.b's batching work is what closes nearly the
+  entire read-side gap with a mature, heavily-optimized database, not a
+  marginal tweak. This is the clearest evidence yet in this project that a
+  measured, targeted optimization (not a rewrite) can make the young
+  engine competitive on the workload it's actually built for.
+- Postgres's planner chose a sequential scan over its own `from_id` index
+  in both cases — expected and correct: every row in the benchmark table
+  has the same `from_id` (a single hot hub with no other data), so the
+  index has nothing to discriminate. Left as-is rather than forcing index
+  usage to manufacture a more flattering number — the same honesty
+  standard M2.d's pgvector comparison used.
+
+**MVCC correctness (the single most important test in M3):**
+`tests/graph_mvcc.rs` — `EdgeIndex` has no concept of transactions and no
+abort-time cleanup hook, so an aborted `create_edge` leaves a permanently
+stale entry in the index. The test creates an edge, confirms
+self-visibility from the *same* transaction (proving the index really
+does have the entry, not a vacuous check), aborts instead of committing,
+then proves a fresh transaction's `edges_from` *and* an equivalent Cypher
+`MATCH` query both never return it. Unlike M2's `vector_mvcc.rs`, no
+poll-before-abort dance is needed: `EdgeIndex` is synchronous (M3.a/M3.b —
+no background worker to race), so there's no "did it catch up yet"
+question to resolve first.
+
+**Crash/rebuild correctness:** `tests/graph_rebuild.rs` — engine restart
+correctly rebuilds the edge-list index from committed rows (no
+`wait_for_ready` polling needed, unlike M2's async-worker-backed indexes —
+a real simplification of the test itself, not just the implementation);
+deletes are correctly reflected after reopen; Cypher queries work
+immediately post-rebuild. No new crash-injection P-number: edges are
+ordinary WAL-backed heap rows already covered by `tests/crash/main.rs`'s
+P1–P9; only the edge-list index is derived/rebuildable state.
+
+**Locking correctness:** `tests/graph_locking.rs` confirms — with tests,
+not just code review — that per-edge write locking needed **zero new
+code**. `RecordId::row(page_id, slot)` already produces a globally-unique
+lock key across every table in the database, since `PageId` is allocated
+from one shared `BufferPool`, not per-table. No `RecordKind::GraphEdge`
+variant was added.
+
+**What changed:** `src/graph/` (new module: `edges.rs`, `index.rs`,
+`logical.rs`, `parser.rs`, `executor.rs`); `Engine::create_edge`/
+`delete_edge`/`edges_from`/`execute_cypher`; `Catalog`/`Heap`/`LockManager`
+reused entirely as-is (zero changes); `sql::executor::predicate_matches`/
+`eval_expr` promoted from private to `pub(crate)` — the one deliberate
+cross-module touch, enabling the Cypher executor to reuse the SQL layer's
+expression evaluator verbatim instead of duplicating it. See `MEMORY.md`
+for the full module-by-module breakdown across all four checkpoints,
+including the two design corrections found and confirmed during
+implementation (no `RecordKind::GraphEdge` needed; `ExecCtx` stays
+untouched, with `edge_index` passed as an explicit extra argument instead).
+
+**Known limitations / tech debt (new in M3, on top of M1/M2's
+carried-forward list):**
+- **`EdgeIndex` has no abort-time (or update-time) cleanup** — an aborted
+  or logically-superseded edge's index entry is never retracted, an
+  unbounded space leak under abort/update-heavy workloads on indexed
+  `from_id`s. Correctness is unaffected (proven by `tests/graph_mvcc.rs`);
+  this is the same shape of gap as M2's `VectorIndex`/`InvertedIndex`
+  "no cleanup" tech debt, and M1's "no vacuum" gap before that.
+- **No Cypher `CREATE`/`DELETE` mutation surface** — the locked v1 grammar
+  (`MATCH ... WHERE ... RETURN`) is read-only; `create_edge`/`delete_edge`
+  are Rust-API-only, mirroring M1's `set_rls_policy` and M2's
+  `set_column_index` precedent of "Rust API now, SQL/query surface later
+  if needed."
+- **Nodes are opaque `i64` IDs only** — no `:label` node-type declarations,
+  no property-graph joins to a backing table (`a.name` is rejected with a
+  clear parse-time error). Confirmed scope decision, not an oversight; a
+  property-graph join model is a natural future extension once a real
+  workload demands it.
+- **Composite/multi-hop Cypher patterns are out of scope** — v1 supports
+  exactly one fixed-length directed hop; no `OPTIONAL MATCH`, no
+  variable-length paths (`*1..3`), no aggregation, no `ORDER BY`/`LIMIT`.
 
 ## M4 — Event queue   [PLANNED]
 _WAL-derived stream; durable consumer offsets; replay; slow-consumer durability contract resolved._

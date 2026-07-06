@@ -12,23 +12,23 @@
 
 ## Current status
 
-- **Milestone:** M1 and M2 are DONE. **M3 (graph) is underway — checkpoints
-  M3.a (edge storage), M3.b (locking + batch-latch), and M3.c (Cypher
-  subset) are all complete.** The approved plan lives at
-  `/Users/sagarmahamuni/.claude/plans/misty-hugging-brook.md` (four
-  checkpoints, M3.a–d).
+- **Milestone:** M1, M2, and **M3 (graph) are all DONE** — all four
+  checkpoints (M3.a edge storage, M3.b locking + batch-latch, M3.c Cypher
+  subset, M3.d MVCC test + benchmarks) complete, benchmarked, and
+  committed. The approved plan lives at
+  `/Users/sagarmahamuni/.claude/plans/misty-hugging-brook.md`.
 - **State:** 182 unit tests + 10 crash-harness tests + 4 `graph_locking` +
-  3 `index_rebuild` + 1 `vector_mvcc` (200 total) all green, `cargo clippy
-  --all-targets -- -D warnings` clean, `cargo fmt --all --check` clean,
-  release build succeeds. `Engine::execute_cypher(xid, "MATCH (a)-[:TYPE]
-  ->(b) WHERE ... RETURN ...")` works end-to-end: a `from_id = <literal>`
-  predicate routes through the edge-list index + batch-latch resolver, any
-  other query falls back to a full `__edges__` scan, and both paths reuse
-  `sql::executor::predicate_matches`/`eval_expr` verbatim.
-- **Immediate next task:** M3.d — `tests/graph_rebuild.rs`,
-  `tests/graph_mvcc.rs` (the aborted-edge MVCC-correctness test, this
-  milestone's single most important test), the Postgres adjacency-table
-  benchmark comparison, and milestone closeout in `PROGRESS.md`/`MEMORY.md`.
+  3 `graph_rebuild` + 2 `graph_mvcc` + 3 `index_rebuild` + 1 `vector_mvcc`
+  (205 total) all green, `cargo clippy --all-targets -- -D warnings`
+  clean, `cargo fmt --all --check` clean, release build succeeds.
+  `Engine::execute_cypher` and `Engine::create_edge`/`delete_edge`/
+  `edges_from` are all MVCC-correct (proven by the aborted-edge test) and
+  benchmarked against Postgres with an indexed adjacency-list table — the
+  batch-latch adjacency scan lands within ~1.6x of Postgres, a genuinely
+  competitive result.
+- **Immediate next task:** M4 planning (event queue: WAL-derived event
+  stream, durable consumer offsets, replay) has not started. Open questions
+  carried forward from M1/M2/M3 remain (see Open questions below).
 - **Last updated:** 2026-07-06
 
 ### Design note: per-edge locking needed zero new code (M3.b)
@@ -125,6 +125,43 @@ execution path runs — so both the index fast path and the full-scan
 fallback apply type filtering and `WHERE` filtering through the exact same
 `predicate_matches` call on every candidate, with no special-casing for
 which source (index vs. scan) a row came from.
+
+### Design note: M3's benchmark comparison — batch-latch closes almost the whole read-side gap with Postgres (M3.d)
+
+Measured, not assumed, per CLAUDE.md §6: `benches/graph.rs`'s adjacency
+scan against a real, isolated Postgres benchmark database (indexed
+adjacency-list table, dropped after recording numbers — same discipline as
+M2.d's pgvector run). The headline result: unidb's *batched* adjacency
+scan (M3.b) is within ~1.6x of Postgres at 10,000 edges (930µs vs 568µs)
+and effectively tied at 1,000 edges (94.3µs vs 98µs) — while the *naive*
+pre-optimization scan would have lost by 9–16x. This is the clearest
+evidence in the project so far that a targeted, measured optimization (not
+a rewrite) can make the engine genuinely competitive on the workload it's
+built for, not just "less bad than before." INSERT throughput still lags
+Postgres by ~35x, but that gap is the same pre-existing per-statement
+fsync cost M1/M2 already found — not something M3 introduced, and not
+fixed here since it's out of this milestone's scope (see Open questions).
+
+### Design note: EdgeIndex has no abort-time cleanup — proven safe, not swept under the rug (M3.d)
+
+`tests/graph_mvcc.rs` (this milestone's single most important test, per
+the plan) confirms a real, load-bearing property: `Engine::abort` undoes
+the heap-level effects of a transaction (self-stamping xmax, per M1's
+mechanism) but has no hook into `EdgeIndex` at all — `create_edge`/
+`delete_edge` are the only two places that ever touch it, and neither is
+wired into the generic commit/abort path. So an aborted `create_edge`
+leaves a permanently stale entry in the index, forever, pointing at a
+`RowId` whose tuple is now permanently dead. The test proves this is safe
+(not just assumed safe): it confirms the inserting transaction sees its
+own uncommitted edge via `edges_from` (proving the stale entry really
+exists), aborts, then proves a fresh transaction's `edges_from` *and* an
+equivalent Cypher query both correctly exclude it — because every
+candidate is re-checked against the caller's MVCC snapshot before ever
+becoming a result, regardless of what the index says. Notably simpler to
+test than M2's equivalent (`vector_mvcc.rs`): `EdgeIndex` is synchronous,
+so there's no "did the background worker catch up yet" race to poll for
+before aborting — the index is guaranteed current the instant
+`create_edge` returns.
 
 ### Design note: read-only transactions pay an unnecessary commit fsync (found in M1.d)
 
@@ -888,6 +925,33 @@ end-to-end through `Engine::execute_cypher` ✅, reuses `predicate_matches`/
 proven to hit the edge index ✅ (and the full-scan fallback is proven to
 work when it doesn't apply ✅), all tests green ✅.
 
+## M3.d task breakdown (ordered — all complete)
+
+1. ✅ `tests/graph_rebuild.rs` (new): engine restart rebuilds the edge
+   index and traversal/Cypher queries both still work — no polling needed,
+   unlike M2's async-worker-backed indexes; deletes correctly reflected
+   after reopen.
+2. ✅ `tests/graph_mvcc.rs` (new) — the single most important test in M3:
+   create an edge, confirm self-visibility via `edges_from` (proving the
+   index really has the stale-entry-to-be), abort, then prove both
+   `edges_from` and an equivalent Cypher query never return it from a
+   fresh transaction. See design note above.
+3. ✅ `benches/graph.rs` extended with a real, non-mocked Postgres
+   comparison (isolated `unidb_graph_bench` database, dropped after
+   recording numbers): INSERT throughput and indexed adjacency-scan
+   latency. Recorded honestly in `PROGRESS.md` — including the strong,
+   unexpected-in-a-good-way result that batch-latch brings adjacency-scan
+   performance within ~1.6x of Postgres. See design note above.
+4. ✅ `PROGRESS.md`'s `## M3 — Graph [DONE]` entry + this file's closeout.
+5. ✅ M3.d / M3 milestone checkpoint verification: 182 unit + 10 crash + 4
+   `graph_locking` + 3 `graph_rebuild` + 2 `graph_mvcc` + 3
+   `index_rebuild` + 1 `vector_mvcc` (205 total) green, clippy/fmt clean,
+   release build OK.
+
+**M3.d done when:** both new test files pass ✅, `benches/graph.rs` runs
+with a recorded Postgres-adjacency-table comparison in `PROGRESS.md` ✅,
+docs updated ✅, all tests green ✅ — closing out M3 as a whole.
+
 ---
 
 ## Open questions / pending human input
@@ -984,10 +1048,66 @@ work when it doesn't apply ✅), all tests green ✅.
   synchronous cost" needs the asterisk "...but the worker's own cost isn't
   free, and it scales worse than a true incremental HNSW would." Flagged
   for a future milestone to revisit if it becomes a real blocker.
+- **`EdgeIndex` has no abort-time (or update-time) cleanup** (M3.d design
+  note above) — an aborted or logically-superseded edge's index entry is
+  never retracted, an unbounded space leak under abort/update-heavy
+  workloads on indexed `from_id`s. Correctness is unaffected (proven by
+  `tests/graph_mvcc.rs`); the same shape of gap as M2's secondary-index
+  cleanup gap and M1's "no vacuum" gap before that.
+- **No Cypher `CREATE`/`DELETE` mutation surface** (M3.c) — the locked v1
+  grammar is read-only (`MATCH ... WHERE ... RETURN`); `create_edge`/
+  `delete_edge` are Rust-API-only, mirroring M1's `set_rls_policy`/M2's
+  `set_column_index` precedent.
+- **Graph nodes are opaque `i64` IDs only** (M3 confirmed scope decision)
+  — no `:label` node-type declarations, no property-graph joins to a
+  backing table. `a.name`/`b.name` are rejected with a clear parse-time
+  error, not silently mis-parsed. A property-graph join model is a future
+  extension once a real workload demands it.
+- **Cypher v1 supports exactly one fixed-length directed hop** — no
+  `OPTIONAL MATCH`, no variable-length paths (`*1..3`), no aggregation, no
+  `ORDER BY`/`LIMIT`. Deliberate "practical subset" scope, matching the
+  SQL layer's own precedent of excluding joins/aggregates/subqueries.
 
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-06 — M3.d complete; M3 milestone DONE
+
+- Implemented all of M3.d: `tests/graph_rebuild.rs`, `tests/graph_mvcc.rs`
+  (the single most important test in M3, per the plan), a real Postgres
+  benchmark comparison (`unidb_graph_bench`, an isolated database created,
+  measured, and dropped — no artifacts left behind), and the `PROGRESS.md`/
+  `MEMORY.md` closeout.
+- Ran the MVCC-correctness test with the same discipline M2.d established:
+  confirmed the inserting transaction's self-visible view *before*
+  aborting (proving the index really did have the stale entry, not a
+  vacuous pass), then proved a fresh transaction's traversal *and* an
+  equivalent Cypher query both correctly exclude the aborted edge. Simpler
+  than M2's equivalent test: no poll-before-abort dance needed since
+  `EdgeIndex` is synchronous.
+- **Ran a real, non-mocked Postgres benchmark** and found a genuinely
+  strong, honest result worth highlighting: the batch-latch adjacency
+  scan (M3.b) lands within ~1.6x of Postgres at 10,000 edges (930µs vs
+  568µs) and is essentially tied at 1,000 edges (94.3µs vs 98µs) — while
+  the pre-optimization naive scan would have lost by 9–16x. INSERT
+  throughput still lags Postgres by ~35x, but that's the same pre-existing
+  per-statement fsync gap M1/M2 already documented, not anything
+  graph-specific — reported honestly rather than either hidden or
+  conflated with a graph-specific weakness.
+- **Final state:** 182 unit tests + 10 crash-harness tests + 4
+  `graph_locking` + 3 `graph_rebuild` + 2 `graph_mvcc` + 3 `index_rebuild`
+  + 1 `vector_mvcc` (205 total) green, `cargo clippy --all-targets -- -D
+  warnings` clean, `cargo fmt --all --check` clean, `cargo build --release`
+  succeeds.
+- **M3 milestone is DONE.** All four checkpoints (M3.a/b/c/d) complete,
+  benchmarked, and committed. Two things were found and confirmed *not* to
+  need new code during implementation (no `RecordKind::GraphEdge` variant,
+  no `ExecCtx` field for `edge_index`) rather than being built speculatively
+  and left unused — both documented as design notes with the reasoning
+  that ruled them out, not just asserted.
+- **Next:** M4 planning (event queue) has not started — this session ended
+  with M3 fully closed out, no M4 work begun.
 
 ### 2026-07-06 — M3.c complete (Cypher subset)
 
