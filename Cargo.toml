@@ -1,3 +1,7 @@
+[workspace]
+members = ["unidb-attach"]
+resolver = "2"
+
 [package]
 name = "unidb"
 version = "0.1.0"

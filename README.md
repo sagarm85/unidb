@@ -4,7 +4,7 @@ A single embedded storage/transaction engine in Rust that unifies relational CRU
 
 The competitive edge is eliminating the multi-system dual-write tax. "Save row + embedding + graph edge + event" is one WAL append and one commit here, versus 3–4 network round-trips with no shared transaction across Postgres + a vector store + a graph DB + Kafka.
 
-**Status: M0–M5 all shipped.** Single-file storage core, MVCC transactions + SQL subset, vector/full-text search, a graph layer with a Cypher subset, a WAL-derived event queue, and an optional REST/JWT/SSE/metrics server are all implemented, tested, and benchmarked. See `PROGRESS.md` for milestone-by-milestone benchmark tables and `MEMORY.md` for current implementation state and known tech debt.
+**Status: M0–M8 all shipped.** Single-file storage core, MVCC transactions + SQL subset, vector/full-text search, a graph layer with a Cypher subset, a WAL-derived event queue, an optional REST/JWT/SSE/metrics server, a B-Tree secondary index, a CSR graph index, and a Rust attach client (`unidb-attach`) are all implemented, tested, and benchmarked. See `PROGRESS.md` for milestone-by-milestone benchmark tables and `MEMORY.md` for current implementation state and known tech debt.
 
 ---
 
@@ -200,6 +200,45 @@ cargo bench --bench server --features server
 UNIDB_JWT_SECRET=dev-secret ./scripts/bench_server.sh
 ```
 
+### Rust attach client (`unidb-attach`, M8)
+
+A third deployment mode, alongside embedding `unidb::Engine` directly in
+your process or running the REST server standalone: attach to an
+already-running server from a separate Rust process, with one call per
+operation (no explicit `begin`/`commit` — every REST route already wraps
+its own transaction server-side; use `;`-separated SQL in `execute_sql`
+for multi-statement atomicity).
+
+```toml
+[dependencies]
+unidb-attach = { path = "unidb-attach" }
+```
+
+```rust
+use unidb_attach::AttachClient;
+
+let client = AttachClient::new("http://127.0.0.1:8080", &token)?;
+client.execute_sql("CREATE TABLE t (id INT, name TEXT)")?;
+let rows = client.execute_sql("SELECT * FROM t")?;
+```
+
+It is Rust-only in v1 (other languages tracked in `docs/backlog/`), uses a
+blocking `reqwest` client (no tokio runtime, no background thread), and
+covers CRUD, SQL, Cypher, graph edges, indexing, and events — the full
+REST surface except `vacuum_events`/`set_rls_policy`/`flush`, which have
+no REST route to call (also tracked in `docs/backlog/`). See
+[`unidb-attach/src/lib.rs`](unidb-attach/src/lib.rs) for the full method
+list and [`docs/REST_API.md`](docs/REST_API.md) for the underlying wire
+contract.
+
+```bash
+# Attach-client tests spin up a real unidb-server test instance
+cargo test -p unidb-attach
+
+# Attach-client call overhead vs. direct embedded Engine calls
+cargo bench -p unidb-attach
+```
+
 ### Tracing / structured logging
 
 Call once at startup to activate `RUST_LOG`-controlled output:
@@ -217,6 +256,8 @@ RUST_LOG=trace ./myapp   # every WAL record written
 ---
 
 ## Project layout
+
+The repo root is a Cargo workspace with two members: `unidb` (the embedded engine — everything below stays at the repo root, unaffected by the workspace split) and `unidb-attach` (the REST attach client, M8).
 
 ```
 src/
@@ -236,7 +277,9 @@ src/
   sql/             — parser.rs, logical.rs (plan + RLS rewrite), executor.rs
   vector.rs        — HNSW wrapper (instant-distance) for VECTOR(n) columns
   fulltext.rs      — inverted index for full-text search
-  index_worker.rs  — background thread building HNSW/full-text indexes asynchronously
+  btree_index.rs   — BTreeMap-backed secondary index for equality/range WHERE predicates
+  csr_index.rs     — Compressed Sparse Row adjacency structure for the graph layer
+  index_worker.rs  — background thread building HNSW/full-text/B-Tree/CSR indexes asynchronously, debounced
   graph/           — edges.rs, index.rs, logical.rs, parser.rs, executor.rs (Cypher subset)
   queue/           — mod.rs (event capture, poll/ack/vacuum), payload.rs
   checkpoint.rs    — flush dirty pages → checkpoint record (+ next_xid) → truncate WAL
@@ -247,15 +290,19 @@ src/
 tests/
   crash/           — crash-injection harness (5+ injection points)
   server_*.rs      — REST server integration tests (feature = "server")
-  graph_*.rs, vector_mvcc.rs, queue_*.rs, index_rebuild.rs — per-milestone integration tests
+  graph_*.rs, vector_mvcc.rs, queue_*.rs, index_rebuild.rs, btree_mvcc.rs — per-milestone integration tests
 benches/
-  load.rs, vector.rs, graph.rs, queue.rs, server.rs — criterion benchmarks per milestone
+  load.rs, vector.rs, graph.rs, queue.rs, server.rs, btree.rs — criterion benchmarks per milestone
 scripts/
   bench_server.sh  — plain-shell perf smoke test against a running server (no Rust toolchain)
   gen_jwt.sh       — generate a verify-only HS256 JWT (bash + openssl, no Python/PyJWT)
 docs/
   REST_API.md      — full HTTP route reference (payloads, responses, error codes)
   backlog/         — saved plans for not-yet-started future work (e.g. Phase 2 SQL expansion)
+unidb-attach/
+  src/lib.rs       — AttachClient: blocking reqwest client over the REST API (M8), Rust-only v1
+  tests/           — attach_crud.rs, attach_sql.rs, attach_graph.rs, attach_extras.rs
+  benches/attach.rs — attach-client call overhead vs. direct embedded Engine calls
 ```
 
 ---
@@ -272,6 +319,9 @@ All milestones below are **shipped, tested, and benchmarked**. Metrics tables ar
 | M3 — Graph | done | Edge records, edge-list index, Cypher subset |
 | M4 — Event queue | done | WAL-derived stream, durable consumer offsets, `vacuum_events` |
 | M5 — API / server | done | Optional REST server (`docs/REST_API.md`) + verify-only JWT auth + SSE subscribe + `/metrics` |
+| M6 — B-Tree index | done | General-purpose secondary index for equality/range `WHERE` predicates, index-assisted `SELECT` |
+| M7 — CSR graph index | done | Compressed Sparse Row adjacency structure, debounced/coalesced async rebuild |
+| M8 — Attach client | done | `unidb-attach`: Rust blocking-`reqwest` client over the REST API, no new protocol |
 
 ---
 

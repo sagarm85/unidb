@@ -74,7 +74,7 @@ use crate::{
     graph::{
         edges::{self, Edge},
         executor as graph_executor,
-        index::{graph_candidates, resolve_candidates_batched, EdgeIndex},
+        index::{resolve_candidates_batched, EdgeIndex},
         parser::parse_cypher,
     },
     heap::Heap,
@@ -300,8 +300,7 @@ impl Engine {
             index_worker: Some(&self.index_worker),
             next_event_seq: &mut self.next_event_seq,
         };
-        let result =
-            graph_executor::execute(parsed, &mut ctx, &self.edge_index, &self.index_worker)?;
+        let result = graph_executor::execute(parsed, &mut ctx, &self.edge_index)?;
         Ok(vec![result])
     }
 
@@ -656,7 +655,7 @@ impl Engine {
     pub fn edges_from(&mut self, xid: Xid, from_id: i64) -> Result<Vec<Edge>> {
         let table_def = self.catalog.lookup(edges::EDGES_TABLE)?.clone();
         let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
-        let candidates = graph_candidates(from_id, &self.edge_index, &self.index_worker);
+        let candidates = self.edge_index.candidates(from_id).to_vec();
         let resolved = resolve_candidates_batched(
             &candidates,
             &snapshot,

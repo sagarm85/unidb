@@ -951,6 +951,28 @@ discovered when a pre-existing test asserting `USING BTREE` was
 
 ## M7 — CSR (Compressed Sparse Row) graph index   [DONE]   2026-07-07
 
+> **Correction (2026-07-07, during M8 merge verification):** the original
+> ship of this milestone wired CSR directly into the `edges_from`/Cypher
+> traversal path with a "prefer CSR once `Ready`" policy (see the original
+> design-decision bullet below, kept for the record). That was a real
+> correctness bug, not a shipped tradeoff: `Ready` means "the initial
+> backfill completed," not "every edge write since then is reflected in a
+> rebuild" (CSR's rebuild is debounced/async). A transaction could create
+> an edge and immediately fail to see it via `edges_from`/Cypher, breaking
+> a guarantee M3 shipped with (`tests/graph_mvcc.rs::
+> aborted_edge_creation_never_surfaces_in_traversal`, which has no retry
+> loop, failed consistently once reproduced in isolation via `cargo test -p
+> unidb --test graph_mvcc`, run repeatedly outside the full workspace test
+> suite — the bug was invisible in `cargo test --workspace` runs). Fixed by
+> reverting `edges_from`/the Cypher executor to consult `EdgeIndex`
+> unconditionally again, exactly as before this milestone. `CsrIndex`
+> itself, its debounced rebuild, and its being kept warm on every live edge
+> write all remain correct, tested, and benchmarked — only the "prefer it
+> for traversal" wiring was removed. See `src/graph/index.rs`'s module
+> comment for the full writeup. The sections below are left as originally
+> written (for an accurate history of what shipped and when) except where
+> explicitly marked corrected.
+
 **PR:** _pending (not yet opened; benchmarks recorded ahead of PR per session workflow)_
 **Summary:** A read-optimized adjacency structure for graph traversal, built
 asynchronously (like M2's HNSW index) on top of the existing background
@@ -990,15 +1012,24 @@ Phase 2 SQL work in `docs/backlog/phase2_sql_capability_expansion.md`.
   rebuild count observed to be far below 200 (`CsrIndex::rebuild_count()`,
   a test-only counter), not asserted at exactly 1 since the sender/worker
   race can't be pinned down more precisely than "coalesced, not absent."
-- **`EdgeIndex` stays the default, always-current tier; CSR is preferred
-  only once `Ready`** (`graph::index::graph_candidates`, consulted by both
-  `Engine::edges_from` and the Cypher executor's fast path). Reasoning
-  worked through explicitly, not assumed: CSR's async lag can only cause a
-  *missed* very-recent edge (a false negative), never a phantom one, since
-  every candidate — from either index — is still re-validated against MVCC
+- **[ORIGINAL, CORRECTED — see the correction note above] `EdgeIndex` stays
+  the default, always-current tier; CSR is preferred only once `Ready`**
+  (`graph::index::graph_candidates`, consulted by both `Engine::edges_from`
+  and the Cypher executor's fast path). Reasoning worked through
+  explicitly, not assumed: CSR's async lag can only cause a *missed*
+  very-recent edge (a false negative), never a phantom one, since every
+  candidate — from either index — is still re-validated against MVCC
   visibility downstream (`resolve_candidates_batched`). That's the same
   staleness characteristic every other async secondary index already has
   once `Ready`; no "only use CSR above N candidates" heuristic was needed.
+  **This reasoning was wrong**: it correctly rules out a *phantom* edge but
+  misses that a debounced rebuild can also cause a false negative for an
+  edge created *by the current transaction, moments ago* — which violates
+  self-visibility, a stronger guarantee than "eventually consistent
+  candidate source" that `edges_from` had always provided pre-M7 and that
+  `NEAR`/full-text's "may return fewer results while `Building`" contract
+  does not have to meet. `graph_candidates` was removed; `edges_from`/
+  Cypher now call `EdgeIndex` directly and unconditionally.
 - No live-delete message for CSR (`delete_edge` sends nothing) — matches
   the existing "deletion is implicit, filtered out by MVCC re-validation at
   read time" convention every other secondary index already has.
@@ -1028,28 +1059,37 @@ per CLAUDE.md §6.
 **Crash correctness:** no new crash-injection P-number — `CsrIndex` is
 purely derived, non-durable state exactly like `EdgeIndex`/`VectorIndex`/
 `BTreeIndex` (rebuilt from `__edges__`'s committed rows on next open).
-`tests/graph_rebuild.rs` gained `engine_restart_rebuilds_csr_index_and_
-traversal_still_works` and `engine_restart_csr_reflects_deletes_from_
-before_close` (both explicitly wait for CSR `Ready` before asserting, to
-provably exercise the CSR-preferring path rather than an ambient
-"might have used EdgeIndex" outcome). `tests/graph_mvcc.rs` gained
-`aborted_edge_creation_never_surfaces_via_csr_path_once_ready`, the CSR
-analogue of M3's "single most important test" — proving an edge whose
-creating transaction aborts never surfaces via the CSR path either, even
-though the worker staged it into CSR unconditionally before the abort.
+**[ORIGINAL, CORRECTED]** `tests/graph_rebuild.rs` originally gained
+`engine_restart_rebuilds_csr_index_and_traversal_still_works` and
+`engine_restart_csr_reflects_deletes_from_before_close` (both explicitly
+waited for CSR `Ready` before asserting, to provably exercise the
+CSR-preferring path); `tests/graph_mvcc.rs` originally gained
+`aborted_edge_creation_never_surfaces_via_csr_path_once_ready`. All three
+were removed during the M8 merge correction: `edges_from`/Cypher no longer
+ever consult CSR, so a test asserting "the CSR path is safe" would just be
+re-testing `EdgeIndex` under a misleading name. The pre-existing
+`aborted_edge_creation_never_surfaces_in_traversal`/`..._in_cypher_query`
+(M3) and `engine_restart_rebuilds_edge_index_and_traversal_still_works`/
+`engine_restart_reflects_deletes_from_before_close` (M3.d) remain and are
+what actually cover this path now — no coverage was lost, since those
+never depended on CSR's involvement.
 
 **What changed:** `src/catalog.rs` (`IndexKind::Csr`, engine-managed-only),
 new `src/csr_index.rs` (`CsrIndex`), `src/index_worker.rs`
 (`IndexedColumn::Edge`, `SecondaryIndex::Csr`, `worker_loop` restructured
-into `apply_msg`/`rebuild_dirty` for debouncing), `src/graph/index.rs`
-(new `graph_candidates` — the CSR-preferring, `EdgeIndex`-falling-back
-selection logic), `src/graph/executor.rs` (`execute` takes an additional
-`index_worker: &IndexHandle` parameter), `src/lib.rs` (`create_edge` sends
-a live CSR upsert alongside its existing synchronous `EdgeIndex.insert`;
-`edges_from` and `execute_cypher`'s call site route through
-`graph_candidates`; new `rebuild_csr_index` backfill function, called
-during `Engine::open` alongside `rebuild_secondary_indexes`). Extended
-`benches/graph.rs`, `tests/graph_rebuild.rs`, `tests/graph_mvcc.rs`.
+into `apply_msg`/`rebuild_dirty` for debouncing). `src/lib.rs`
+(`create_edge` sends a live CSR upsert alongside its existing synchronous
+`EdgeIndex.insert`; new `rebuild_csr_index` backfill function, called
+during `Engine::open` alongside `rebuild_secondary_indexes`) — these parts
+shipped as originally designed and remain unchanged. **[CORRECTED during
+M8 merge]** `src/graph/index.rs`'s `graph_candidates` (the CSR-preferring
+selection function) and `src/graph/executor.rs`'s extra `index_worker`
+parameter were both added, found buggy, and then removed —
+`edges_from`/`execute_cypher` route through `EdgeIndex` directly again,
+and `graph_executor::execute`'s signature is back to its pre-M7 3
+arguments. Extended `benches/graph.rs` (unaffected by the correction — it
+builds `CsrIndex` and calls `candidates()` directly, not through
+`graph_candidates`).
 
 **Known limitations / tech debt (new in M7):**
 - **CSR indexes only `from_id` adjacency** (forward traversal) — no
@@ -1063,6 +1103,110 @@ during `Engine::open` alongside `rebuild_secondary_indexes`). Extended
   debounce-triggered pass** — debouncing reduces *frequency*, not the
   fundamental non-incremental nature of the structure. Acceptable for now,
   same category of tech debt as HNSW's, just less severe.
+- **CSR is not currently consulted by any query path** (post-correction) —
+  it is built, kept warm, and benchmarked in isolation, but `edges_from`/
+  Cypher always use `EdgeIndex`. A future fix needs a staleness/generation
+  marker proving CSR has incorporated every write up to a specific point
+  before it can be safely preferred again; not attempted here since it's
+  new design work, not a bug fix.
 - **Deferred to `docs/backlog/`:** none new from M7 itself; Phase 2's SQL
   capability plan remains the standing deferred item, now one milestone
   closer (M8 attach client is next).
+
+---
+
+## M8 — Attach client (Rust, blocking `reqwest`)   [DONE]   2026-07-07
+
+**PR:** _pending_
+**Summary:** A third deployment mode alongside embedding `unidb::Engine`
+directly or running the standalone REST server: `unidb-attach`, a Rust
+crate giving one-shot, `Engine`-like method calls to a process that isn't
+running its own `Engine`, built entirely on the existing REST API
+(`docs/REST_API.md`) — no new protocol, no new server-side capability.
+Third and last of the three follow-on milestones prompted by the FFS/ffsdb
+comparison (M6 B-Tree, M7 CSR, M8 attach client); the parked Phase 2 SQL
+plan (`docs/backlog/phase2_sql_capability_expansion.md`) is next up.
+
+This milestone was developed in a separate git worktree
+(`m8-attach-client` branch) in parallel with M6/M7 landing on `main`, then
+merged onto `main` after independent verification (build, full test suite,
+clippy, fmt, and a check that the embedded `unidb` crate's dependency
+graph stays free of `reqwest`/tokio — confirmed via `cargo tree -p unidb
+--no-default-features --edges normal`). The merge verification pass is
+also what surfaced and fixed the M7 CSR-traversal bug documented above —
+not something M8 introduced, but found while independently re-verifying
+the tree before combining the two milestones' work.
+
+**Design decisions:**
+- **Workspace, not a nested subdirectory move.** The root `Cargo.toml` does
+  double duty as both `[workspace] members = ["unidb-attach"]` and
+  `[package] name = "unidb"` in the same file — `src/`, `tests/`,
+  `benches/` all stay exactly where they were. This keeps `reqwest` and its
+  dependency tree completely out of the embedded `unidb` crate (it's a
+  `unidb-attach` dependency only), while avoiding a disruptive file-move
+  migration for a change that a virtual-workspace-plus-nested-crate layout
+  would otherwise require.
+- **One call = one complete operation**, not a mirror of embedded
+  `Engine`'s explicit `begin`/op/`commit` shape. There is no multi-request
+  transaction session over HTTP — every mutating REST route already does
+  its own internal begin→execute→commit. Multi-statement atomicity is
+  available via `;`-separated SQL passed to `execute_sql`, exactly as REST
+  already documents. This is a deliberate, documented API-shape difference
+  from embedded `Engine`, not an oversight (`unidb-attach/src/lib.rs`'s
+  module doc says so explicitly).
+- **`AttachError`, not `DbError`, is the client's error type.** `DbError`'s
+  variants are storage-internal (`PageNotFound`, `ChecksumMismatch`, ...)
+  with no meaningful mapping from an HTTP response. `AttachError` instead
+  mirrors the server's documented `code` field 1:1 (`TableNotFound`,
+  `ColumnNotFound`, `NotFound`, `TableAlreadyExists`, `WriteConflict`,
+  `SerializationFailure`, `SqlParse`, `SqlPlan`, `SqlUnsupported`) plus
+  transport-level variants (`Http`, `Json`, `InvalidToken`) and a generic
+  `Api { status, code, message }` catch-all for anything unmapped.
+- **Blocking `reqwest`, no tokio runtime, no background thread** — matches
+  the confirmed decision that a synchronous call blocking its calling
+  thread for one HTTP round-trip is acceptable; there's no stated
+  concurrency requirement that would justify the complexity of a
+  sync-to-async bridge.
+- **`unidb-attach` depends on `unidb` only as a `dev-dependency`** (for
+  shared DTO shapes used by its integration tests, which spin up a real
+  `unidb-server`), not a production dependency — it defines its own
+  independent wire-format types (`RowId`, `ExecResult`, `IndexKind`,
+  `EdgeResult`) matching the server's JSON shapes. A production consumer of
+  `unidb-attach` never pulls in the embedded engine's dependency graph.
+  `IndexKind` here deliberately excludes `Csr` (M7) — that variant is
+  engine-managed only, never settable via `CREATE INDEX`/`POST /indexes`,
+  so there's nothing for a REST client to ever send or receive for it.
+
+**Benchmarks** (release build, Apple Silicon macOS, `cargo bench -p
+unidb-attach --bench attach`): compares `direct_engine` (embedded `Engine`
+call), `raw_reqwest` (hand-rolled HTTP call, no client wrapper), and
+`attach_client` (`AttachClient::execute_sql`) for the same `execute_sql`
+call — isolating whether the client wrapper adds overhead beyond what HTTP
+itself already costs.
+
+**Honest read:** `attach_client` tracks `raw_reqwest` closely (the wrapper
+is a thin, direct pass-through — one JSON serialize, one HTTP call, one
+JSON deserialize, no extra buffering or indirection), both an order of
+magnitude slower than `direct_engine`, as expected for anything crossing a
+network/loopback boundary. This is the same finding M5's server benchmarks
+already established for HTTP-vs-embedded overhead — M8 doesn't change that
+tradeoff, it just gives Rust callers ergonomic access to the same REST
+surface without hand-rolling JSON+HTTP themselves.
+
+**What changed:** new `unidb-attach/` crate (`Cargo.toml`, `src/lib.rs`,
+`tests/attach_{crud,sql,graph,extras}.rs`, `tests/attach_common/mod.rs`,
+`benches/attach.rs`); root `Cargo.toml` gains a `[workspace]` table;
+`docs/REST_API.md` and `README.md` gain a "Rust attach client" section and
+project-layout entry; `docs/backlog/m8_attach_client_plan.md` records the
+original planning document for this milestone.
+
+**Known limitations / tech debt (new in M8):**
+- **No multi-request transaction sessions** (by design — matches REST's
+  own limitation, not a client-side gap).
+- **`vacuum_events`, `set_rls_policy`, and `flush` are not exposed** — the
+  server has no REST route for any of the three; tracked in
+  `docs/backlog/` alongside future multi-language (Python/Node) client
+  bindings, not silently dropped.
+- **Rust-only in v1** — no other language bindings.
+- **Blocking I/O** — one attach-client call blocks its calling thread for
+  the HTTP round-trip; acceptable given no stated concurrency requirement.

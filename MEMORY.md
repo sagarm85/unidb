@@ -12,20 +12,36 @@
 
 ## Current status
 
-- **Milestone: M0-M7 are ALL DONE; M8 (attach client) in progress.**
-  Every milestone on CLAUDE.md's original roadmap (M0-M5) shipped; M6-M8
-  are a user-approved follow-on set (B-Tree indexing, CSR graph, an
-  "attach" Rust client over REST) prompted by a comparison against a
-  competing project (FFS/ffsdb). M6 (B-Tree secondary index) and M7 (CSR
-  graph index) are both closed out — M6 across three checkpoints (M6.a
-  type + worker wiring, M6.b index-assisted `exec_select`, M6.c
-  benchmarks + hardening), M7 across three checkpoints (M7.a `CsrIndex` +
-  debounced rebuild, M7.b wiring into traversal with prefer-when-ready
-  fallback, M7.c benchmarks + hardening). The current plan lives at
+- **Milestone: M0-M8 are ALL DONE.** Every milestone on CLAUDE.md's
+  original roadmap (M0-M5) shipped; M6-M8 are a user-approved follow-on
+  set (B-Tree indexing, CSR graph, an "attach" Rust client over REST)
+  prompted by a comparison against a competing project (FFS/ffsdb). M6
+  (B-Tree secondary index), M7 (CSR graph index), and M8 (attach client)
+  are all closed out. The approved plan lived at
   `/Users/sagarmahamuni/.claude/plans/misty-hugging-brook.md` (M6/M7/M8
   plan, approved 2026-07-07); the still-parked Phase 2 SQL capability plan
   (OR/ORDER BY/LIMIT/aggregates/JOIN) is durably saved at `docs/backlog/
-  phase2_sql_capability_expansion.md`, explicitly sequenced *behind* M8.
+  phase2_sql_capability_expansion.md`, explicitly sequenced *behind* M8 —
+  it is the standing next item if this project continues.
+- **M8 was developed in a separate git worktree in parallel with M6/M7
+  landing on `main`, then merged after independent re-verification — that
+  re-verification is what found a real M7 bug**, not something M8 broke.
+  See the corrected M7 design note below and `PROGRESS.md`'s M7 entry
+  (which carries a correction block, not a rewrite of history): M7
+  originally wired `edges_from`/Cypher to prefer the CSR graph index once
+  `IndexStatus::Ready`, but `Ready` only means "initial backfill done," not
+  "every write since is reflected in the debounced rebuild" — a
+  transaction's own just-created edge could fail to appear in its own
+  traversal, breaking a self-visibility guarantee M3 shipped with. Fixed
+  by reverting `edges_from`/`execute_cypher` to consult `EdgeIndex`
+  unconditionally, exactly as before M7. `CsrIndex` itself (construction,
+  debounced rebuild, being kept warm by every live edge write) is
+  untouched and still correct — only the "prefer it for traversal" wiring
+  was removed. The bug reliably reproduced via `cargo test -p unidb --test
+  graph_mvcc` run repeatedly *outside* the full workspace test suite, but
+  was invisible in `cargo test --workspace` — worth remembering that
+  workspace-level feature unification can change test binary composition/
+  timing enough to mask a real, deterministically-reproducible race.
 - **Critical fix landed mid-M5 (2026-07-06), its own commit, not part of
   M5's feature work:** a real xid-reuse-after-checkpoint bug was found by
   manually smoke-testing the new REST server (commit several transactions,
@@ -42,38 +58,40 @@
   single-writer-thread design's real throughput ceiling, made concrete
   rather than assumed, and landing in the same range M1's own
   `benches/load.rs` already found for single-table INSERT.
-- **State:** 225 unit tests (228 with `--features server`) + 11
-  crash-harness tests + 4 `graph_locking` + 5 `graph_rebuild` (was 3; +2
-  for CSR restart-rebuild/delete-reflection) + 3 `graph_mvcc` (was 2; +1
-  CSR-path MVCC proof) + 5 `index_rebuild` (was 3; +2 for BTree
-  rebuild/pre-Ready correctness) + 1 `vector_mvcc` + 1 `btree_mvcc` + 4
-  `queue_vacuum` + 2 `queue_mvcc` + 25 `server_*` integration tests, all
-  green both with and without `--features server`; `cargo clippy
-  --all-targets -- -D warnings` and `cargo fmt --all --check` clean in
-  both configurations; `cargo tree --no-default-features --edges normal`
-  confirmed empty of tokio/axum/jsonwebtoken (the "engine stays sync"
-  claim is literally true for the default build's actual library/binary
-  artifact — note `--edges normal` is required to exclude
-  dev-dependencies, which now legitimately include `jsonwebtoken`/`tokio`
-  for the test suite; the plain `cargo tree --no-default-features` picks
-  those up and is *not* the right check here, a methodology correction
-  worth remembering for future sessions).
-- **Immediate next task: M8.a — workspace restructure + `unidb-attach`
-  crate skeleton.** Per the approved M6/M7/M8 plan: convert the repo's
-  single `Cargo.toml` into a Cargo workspace (root becomes a virtual
-  manifest, the existing crate moves to `unidb/`), so a new `unidb-attach`
-  crate can depend on `reqwest` (real, non-dev dependency) without
-  polluting the embedded `unidb` crate's own dependency graph. Get
-  `cargo build`/`cargo test` green from the restructured root *before* any
-  attach-client code — a clean, isolated, independently-verifiable first
-  step. Full checkpoint breakdown in the plan file.
+- **State:** repo root is now a Cargo workspace (`unidb` + `unidb-attach`
+  members). `cargo test -p unidb` (default features): 225 unit tests + 11
+  crash-harness + 4 `graph_locking` + 3 `graph_rebuild` + 2 `graph_mvcc`
+  (both back to their pre-M7 counts after the CSR-path tests were added
+  and then removed during the M7 correction — no coverage was lost, since
+  the underlying `EdgeIndex` path was already covered by these) + 5
+  `index_rebuild` + 1 `vector_mvcc` + 1 `btree_mvcc` + 4 `queue_vacuum` +
+  2 `queue_mvcc` = 258 total. `cargo test -p unidb --features server` adds
+  25 `server_*` integration tests plus 3 more feature-gated unit tests
+  (228 unit, matching the `--workspace` run's unidb portion). `cargo test
+  --workspace` also runs `unidb-attach`'s 19 integration tests (3 CRUD + 6
+  extras + 4 graph + 6 SQL) + 1 doctest, all green. `cargo clippy
+  --workspace --all-targets -- -D warnings` and `cargo fmt --all --check`
+  clean. `cargo tree -p unidb --no-default-features --edges normal`
+  confirmed empty of tokio/axum/jsonwebtoken/reqwest (the "engine stays
+  sync" claim holds for the default build's actual library/binary
+  artifact even inside a workspace containing a crate that *does* depend
+  on `reqwest` — note `-p unidb --edges normal` is required: plain `cargo
+  tree --no-default-features` from a workspace root shows the whole
+  workspace's dependency union, which is *not* the right check here).
+- **Immediate next task: none — M0-M8 all shipped.** If continuing, the
+  standing next item is the parked Phase 2 SQL capability plan
+  (`docs/backlog/phase2_sql_capability_expansion.md`, OR/ORDER BY/LIMIT/
+  aggregates/JOIN). A CSR-preferring traversal fix (staleness/generation
+  marker design) is documented as known tech debt below but was
+  deliberately not attempted as part of the M7 bug fix — that's new design
+  work, not a regression fix.
 - Two explicitly deferred follow-ups remain, neither started: (1) the
   full CLAUDE.md §6 cross-domain "replaced stack" benchmark (possible
   since all four data models + the server exist, but a separate,
   dedicated future effort per the user's confirmed decision); (2) the
   parked Phase 2 SQL capability plan (`docs/backlog/
-  phase2_sql_capability_expansion.md`), sequenced behind M8. See Open
-  questions below for what's still unresolved from M1-M5.
+  phase2_sql_capability_expansion.md`). See Open questions below for
+  what's still unresolved from M1-M5.
 - **Last updated:** 2026-07-07
 
 ### Design note: xid reuse after checkpoint — a real M1-era bug, found and fixed during M5
@@ -1443,19 +1461,43 @@ instead of 1). "Meaningfully less than N" is the honest, provable claim;
 "exactly 1" would be an unprovable, occasionally-flaky one.
 
 **The `EdgeIndex`-vs-CSR selection question was worked through explicitly
-during planning, not left as an open design question to resolve later**:
-`graph::index::graph_candidates` prefers CSR whenever `Ready`, falling
-back to `EdgeIndex` (always current, zero lag) otherwise — no "only use
-CSR above N candidates" heuristic. The reasoning: CSR's async rebuild lag
-can only ever cause a *missed* very-recent edge (a false negative, since
-the edge hasn't been staged-and-rebuilt into CSR yet), never a phantom one
-returned that shouldn't be — every candidate from either index still goes
-through `resolve_candidates_batched`'s MVCC re-validation before ever
-reaching a caller. That is exactly the same staleness class HNSW/FullText/
-BTree already have once `Ready` (a live upsert can lag slightly behind a
-commit for any of them) — CSR doesn't introduce a new risk category, so
-there was no principled reason to add complexity distinguishing "small
-hub, use EdgeIndex" from "large hub, use CSR."
+during planning — and the conclusion was wrong, corrected during M8 merge
+verification.** Originally: `graph::index::graph_candidates` preferred CSR
+whenever `Ready`, falling back to `EdgeIndex` (always current, zero lag)
+otherwise — no "only use CSR above N candidates" heuristic. The reasoning
+at the time: CSR's async rebuild lag can only ever cause a *missed*
+very-recent edge (a false negative, since the edge hasn't been
+staged-and-rebuilt into CSR yet), never a phantom one returned that
+shouldn't be — every candidate from either index still goes through
+`resolve_candidates_batched`'s MVCC re-validation before ever reaching a
+caller. That's exactly the same staleness class HNSW/FullText/BTree
+already have once `Ready`.
+
+**What that reasoning missed**: it correctly rules out phantom edges, but
+doesn't rule out the specific case of the *current transaction's own
+just-created edge*. `edges_from` had always given self-visibility —
+`create_edge` followed immediately by `edges_from` in the same
+transaction (or even a later one, once committed) reliably saw the edge,
+because `EdgeIndex` is synchronous. CSR's rebuild is debounced/async, so
+`Ready` (true almost instantly for a fresh/empty table) does not imply
+"this specific edge, written a moment ago, has been staged and
+rebuilt-in." Preferring CSR broke that guarantee — not a "slight
+staleness," a same-transaction miss. Found via `cargo test -p unidb --test
+graph_mvcc aborted_edge_creation_never_surfaces_in_traversal` run
+repeatedly (30/30 reproductions) in isolation from the rest of the test
+suite; the same test passed reliably under `cargo test --workspace`,
+because workspace-wide feature unification (`unidb-attach`'s
+`dev-dependencies` pulling in `unidb`'s `server` feature) changed enough
+about test binary composition/timing to mask the race. **Fix**:
+`graph_candidates` was deleted; `edges_from`/`execute_cypher` now call
+`EdgeIndex::candidates` directly and unconditionally, exactly as before
+M7. `CsrIndex` remains built, kept warm on every live edge write
+(`create_edge`), and rebuilt on open (`rebuild_csr_index`) — it's simply
+not consulted by any query path right now. A correct fix (a staleness/
+generation marker CSR could expose, proving it has incorporated every
+write up to a specific point before a caller can trust it) is real future
+work, not attempted here since this session's job was reverting a bug,
+not designing new correctness machinery.
 
 **Benchmark honesty note**: extending `benches/graph.rs`'s
 `adjacency_scan` group with a `csr` variant found CSR performs at parity
@@ -1633,6 +1675,61 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-07 — M8 (attach client) merged from worktree; M7 CSR-traversal bug found and fixed; M0-M8 all shipped
+
+- User had M6/M7 landing on `main` while a separate `m8-attach-client` git
+  worktree (`/Users/sagarmahamuni/Development/AI_World/unidb-m8-attach`)
+  independently completed M8. Asked to verify it was safe to merge and
+  commit. Confirmed it built, tested, clippy/fmt-clean, and preserved the
+  "engine stays sync" invariant on its own branch before touching `main`.
+- Merged by hand (not a literal `git merge`) since `MEMORY.md`/
+  `PROGRESS.md` had diverged significantly on both branches: copied
+  `unidb-attach/` and `docs/backlog/m8_attach_client_plan.md` wholesale,
+  edited the root `Cargo.toml` to add the `[workspace]` table (their
+  design — a mixed manifest, no file-moving needed — is better than my own
+  earlier, reverted plan to move `src/`/`tests/`/`benches/` into a nested
+  `unidb/` directory), and added the one missing `IndexKind::BTree` variant
+  to `unidb-attach`'s local copy of that enum (the M8 branch predates M6).
+- **Merge verification surfaced a real M7 bug**, not an M8 problem: running
+  `cargo test -p unidb` in isolation (specifically to confirm the
+  sync-invariant check wasn't accidentally relying on workspace-wide
+  feature unification) intermittently failed. Isolating further
+  (`cargo test -p unidb --test graph_mvcc
+  aborted_edge_creation_never_surfaces_in_traversal`, repeated 30 times)
+  reproduced the failure 100% of the time. Root cause and fix are in the
+  corrected M7 design note above and `PROGRESS.md`'s M7 entry (which
+  carries a correction block rather than being silently rewritten): M7's
+  `graph_candidates` preferred the CSR graph index once `Ready`, but
+  `Ready` doesn't mean "every write since is incorporated into the
+  debounced rebuild" — a transaction's own just-created edge could be
+  invisible to its own immediate `edges_from` call. Fixed by reverting
+  `edges_from`/`execute_cypher` to call `EdgeIndex` directly and
+  unconditionally (`src/graph/index.rs`, `src/lib.rs`,
+  `src/graph/executor.rs`); removed the now-misleading CSR-preferring
+  tests (`tests/graph_mvcc.rs`, `tests/graph_rebuild.rs`) since
+  `edges_from`/Cypher no longer exercise that path at all. `CsrIndex`
+  itself is unaffected — still built, live-upserted, rebuilt-on-open, and
+  benchmarked; it's just not consulted for correctness-critical traversal
+  right now.
+- Full re-verification after the fix: `cargo build --workspace` clean;
+  `cargo test --workspace` 228 unidb tests + 19 `unidb-attach` tests + 1
+  doctest, all green; `cargo test -p unidb --test graph_mvcc` run 15x in a
+  row, all green (race confirmed gone); `cargo test -p unidb` (225) and
+  `cargo test -p unidb --features server` (228) both green; `cargo clippy
+  --workspace --all-targets -- -D warnings` clean; `cargo fmt --all --
+  check` clean (one formatting fix needed in `src/graph/executor.rs` after
+  the signature revert).
+- Updated `README.md` (status line, project layout — workspace + `unidb-
+  attach/` tree, milestone table through M8, new "Rust attach client"
+  section) and `docs/REST_API.md` (pointer section to the attach client).
+  Confirmed `cargo bench -p unidb-attach --bench attach -- --test` runs
+  successfully (attach-client overhead vs. direct `Engine` calls vs. raw
+  `reqwest`, tracking M5's already-established HTTP-overhead finding, no
+  new surprise).
+- Result: **M0-M8 all shipped.** Standing next item, if this project
+  continues, is the parked Phase 2 SQL capability plan (`docs/backlog/
+  phase2_sql_capability_expansion.md`).
 
 ### 2026-07-07 — M7 (CSR graph index) complete; M7 milestone DONE
 

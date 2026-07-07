@@ -22,12 +22,9 @@ use crate::{
     error::Result,
     format::{PageId, Xid},
     heap::RowId,
-    index_worker::{IndexHandle, IndexStatus, SecondaryIndex},
     mvcc::{is_visible, Snapshot},
     sql::{executor::decode_row, logical::Literal},
 };
-
-use super::edges::EDGES_TABLE;
 
 #[derive(Default)]
 pub struct EdgeIndex {
@@ -65,34 +62,29 @@ impl EdgeIndex {
     }
 }
 
-/// Prefer the CSR graph index (M7) once `Ready`, falling back to
-/// `EdgeIndex` (always current, always available) otherwise. Correctness
-/// reasoning: CSR's async rebuild can only ever lag behind the most recent
-/// commits — that risks a *missed* very-recent edge (a false negative),
-/// never a phantom one, since every candidate this returns is still
-/// re-validated against MVCC visibility downstream regardless of which
-/// index sourced it (`resolve_candidates_batched`, below). That's the same
-/// staleness characteristic every other async secondary index in this
-/// codebase already has once `Ready` (HNSW/FullText/BTree can all lag
-/// slightly behind a just-committed write) — not a new risk class, so
-/// there's no reason to prefer the always-current `EdgeIndex` once CSR is
-/// available; simplicity wins over a "only use CSR above N candidates"
-/// heuristic that would need its own justification and tests.
-pub fn graph_candidates(
-    from_id: i64,
-    edge_index: &EdgeIndex,
-    index_worker: &IndexHandle,
-) -> Vec<RowId> {
-    if index_worker.status(EDGES_TABLE, "from_id") == Some(IndexStatus::Ready) {
-        let guard = index_worker.indexes.read().unwrap();
-        if let Some(entry) = guard.get(&(EDGES_TABLE.to_string(), "from_id".to_string())) {
-            if let SecondaryIndex::Csr(csr) = &entry.index {
-                return csr.candidates(from_id).to_vec();
-            }
-        }
-    }
-    edge_index.candidates(from_id).to_vec()
-}
+// M7 originally added `graph_candidates`, preferring the CSR graph index
+// once `IndexStatus::Ready` and falling back to `EdgeIndex` otherwise. That
+// was a real correctness bug, found during M8 merge verification, not
+// shipped as-is: `Ready` only means "the initial backfill completed" (for
+// a fresh/empty table that's true almost instantly) — it does NOT mean
+// "every edge written since then has been incorporated into a rebuild,"
+// since CSR's rebuild is debounced/async (see `index_worker.rs`'s module
+// doc). A query immediately after `create_edge` could observe `Ready` with
+// a CSR structure that hasn't yet staged *that very edge*, silently
+// returning fewer edges than actually exist — a real regression against
+// the pre-M7 guarantee that `edges_from` sees a just-created edge
+// immediately (`tests/graph_mvcc.rs::
+// aborted_edge_creation_never_surfaces_in_traversal`, an M3 test with no
+// retry loop, failed consistently once this was wired in and tested in
+// isolation from the rest of the suite). `EdgeIndex` is synchronous and
+// always current, so `edges_from`/the Cypher executor now use it directly
+// again, unconditionally. `CsrIndex` itself remains correct, tested, and
+// benchmarked (`src/csr_index.rs`, `benches/graph.rs`) and is still kept
+// warm by every live edge write (`Engine::create_edge`) and rebuilt on
+// open (`rebuild_csr_index` in `lib.rs`) — it just isn't safely
+// consultable from this path yet. A future fix would need a staleness/
+// generation marker proving CSR has incorporated every write up to a
+// specific point before it can be trusted here.
 
 /// Resolve a batch of candidate `RowId`s to their decoded rows, filtered by
 /// MVCC visibility. Groups candidates by `page_id` so each distinct page is

@@ -15,7 +15,6 @@
 use crate::{
     error::{DbError, Result},
     heap::Heap,
-    index_worker::IndexHandle,
     sql::{
         executor::{decode_row, predicate_matches, ExecCtx, ExecResult},
         logical::{CmpOp, Expr, Literal},
@@ -24,7 +23,7 @@ use crate::{
 
 use super::{
     edges::{edges_table_def, EDGES_TABLE},
-    index::{graph_candidates, resolve_candidates_batched, EdgeIndex},
+    index::{resolve_candidates_batched, EdgeIndex},
     logical::{CypherQuery, ReturnItem},
 };
 
@@ -52,7 +51,6 @@ pub fn execute(
     query: CypherQuery,
     ctx: &mut ExecCtx,
     edge_index: &EdgeIndex,
-    index_worker: &IndexHandle,
 ) -> Result<ExecResult> {
     let table_def = edges_table_def();
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
@@ -74,7 +72,7 @@ pub fn execute(
 
     let rows: Vec<Vec<Literal>> =
         if let Some(from_id) = full_predicate.as_ref().and_then(find_from_id_eq) {
-            let candidates = graph_candidates(from_id, edge_index, index_worker);
+            let candidates = edge_index.candidates(from_id).to_vec();
             let resolved = resolve_candidates_batched(
                 &candidates,
                 &snapshot,

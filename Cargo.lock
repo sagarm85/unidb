@@ -514,6 +514,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07bbe89c50d7a535e539b8c17bc0b49bdb77747034daa8087407d655f3f7cc1d"
 dependencies = [
  "futures-core",
+ "futures-sink",
 ]
 
 [[package]]
@@ -1594,6 +1595,7 @@ dependencies = [
  "base64",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
@@ -2325,6 +2327,23 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "zerocopy 0.7.35",
+]
+
+[[package]]
+name = "unidb-attach"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "axum-prometheus",
+ "criterion",
+ "jsonwebtoken",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "unidb",
 ]
 
 [[package]]
