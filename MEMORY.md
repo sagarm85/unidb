@@ -12,12 +12,20 @@
 
 ## Current status
 
-- **Milestone: M0-M5 are ALL DONE.** Every milestone on CLAUDE.md's
-  original roadmap has shipped. M5 (API/server) closed out across four
-  checkpoints (M5.a stabilization + writer-thread bridge, M5.b REST core,
-  M5.c JWT/SSE/metrics, M5.d hardening + full test suite + benchmarks +
-  this closeout). The (now-historical) plan lived at
-  `/Users/sagarmahamuni/.claude/plans/misty-hugging-brook.md`.
+- **Milestone: M0-M7 are ALL DONE; M8 (attach client) in progress.**
+  Every milestone on CLAUDE.md's original roadmap (M0-M5) shipped; M6-M8
+  are a user-approved follow-on set (B-Tree indexing, CSR graph, an
+  "attach" Rust client over REST) prompted by a comparison against a
+  competing project (FFS/ffsdb). M6 (B-Tree secondary index) and M7 (CSR
+  graph index) are both closed out — M6 across three checkpoints (M6.a
+  type + worker wiring, M6.b index-assisted `exec_select`, M6.c
+  benchmarks + hardening), M7 across three checkpoints (M7.a `CsrIndex` +
+  debounced rebuild, M7.b wiring into traversal with prefer-when-ready
+  fallback, M7.c benchmarks + hardening). The current plan lives at
+  `/Users/sagarmahamuni/.claude/plans/misty-hugging-brook.md` (M6/M7/M8
+  plan, approved 2026-07-07); the still-parked Phase 2 SQL capability plan
+  (OR/ORDER BY/LIMIT/aggregates/JOIN) is durably saved at `docs/backlog/
+  phase2_sql_capability_expansion.md`, explicitly sequenced *behind* M8.
 - **Critical fix landed mid-M5 (2026-07-06), its own commit, not part of
   M5's feature work:** a real xid-reuse-after-checkpoint bug was found by
   manually smoke-testing the new REST server (commit several transactions,
@@ -34,29 +42,39 @@
   single-writer-thread design's real throughput ceiling, made concrete
   rather than assumed, and landing in the same range M1's own
   `benches/load.rs` already found for single-table INSERT.
-- **State:** 205 unit tests (208 with `--features server`) + 11
-  crash-harness tests + 4 `graph_locking` + 3 `graph_rebuild` + 2
-  `graph_mvcc` + 3 `index_rebuild` + 1 `vector_mvcc` + 4 `queue_vacuum` + 2
-  `queue_mvcc` + 25 `server_*` integration tests, all green both with and
-  without `--features server`; `cargo clippy --all-targets -- -D warnings`
-  and `cargo fmt --all --check` clean in both configurations; `cargo tree
-  --no-default-features --edges normal` confirmed empty of tokio/axum/
-  jsonwebtoken (the "engine stays sync" claim is literally true for the
-  default build's actual library/binary artifact — note `--edges normal`
-  is required to exclude dev-dependencies, which now legitimately include
-  `jsonwebtoken`/`tokio` for the test suite; the plain `cargo tree
-  --no-default-features` picks those up and is *not* the right check
-  here, a methodology correction worth remembering for future sessions).
-- **Immediate next task:** none — no milestone is in progress. Two
-  explicitly deferred follow-ups remain, neither started: (1) the full
-  CLAUDE.md §6 cross-domain "replaced stack" benchmark (now possible for
-  the first time since all four data models + the server exist, but a
-  separate, dedicated future effort per the user's confirmed decision,
-  not folded into any single milestone); (2) whatever comes after M5,
-  since CLAUDE.md's roadmap ends here — a future session should ask the
-  user directly rather than assume. See Open questions below for what's
-  still unresolved from M1-M5.
-- **Last updated:** 2026-07-06
+- **State:** 225 unit tests (228 with `--features server`) + 11
+  crash-harness tests + 4 `graph_locking` + 5 `graph_rebuild` (was 3; +2
+  for CSR restart-rebuild/delete-reflection) + 3 `graph_mvcc` (was 2; +1
+  CSR-path MVCC proof) + 5 `index_rebuild` (was 3; +2 for BTree
+  rebuild/pre-Ready correctness) + 1 `vector_mvcc` + 1 `btree_mvcc` + 4
+  `queue_vacuum` + 2 `queue_mvcc` + 25 `server_*` integration tests, all
+  green both with and without `--features server`; `cargo clippy
+  --all-targets -- -D warnings` and `cargo fmt --all --check` clean in
+  both configurations; `cargo tree --no-default-features --edges normal`
+  confirmed empty of tokio/axum/jsonwebtoken (the "engine stays sync"
+  claim is literally true for the default build's actual library/binary
+  artifact — note `--edges normal` is required to exclude
+  dev-dependencies, which now legitimately include `jsonwebtoken`/`tokio`
+  for the test suite; the plain `cargo tree --no-default-features` picks
+  those up and is *not* the right check here, a methodology correction
+  worth remembering for future sessions).
+- **Immediate next task: M8.a — workspace restructure + `unidb-attach`
+  crate skeleton.** Per the approved M6/M7/M8 plan: convert the repo's
+  single `Cargo.toml` into a Cargo workspace (root becomes a virtual
+  manifest, the existing crate moves to `unidb/`), so a new `unidb-attach`
+  crate can depend on `reqwest` (real, non-dev dependency) without
+  polluting the embedded `unidb` crate's own dependency graph. Get
+  `cargo build`/`cargo test` green from the restructured root *before* any
+  attach-client code — a clean, isolated, independently-verifiable first
+  step. Full checkpoint breakdown in the plan file.
+- Two explicitly deferred follow-ups remain, neither started: (1) the
+  full CLAUDE.md §6 cross-domain "replaced stack" benchmark (possible
+  since all four data models + the server exist, but a separate,
+  dedicated future effort per the user's confirmed decision); (2) the
+  parked Phase 2 SQL capability plan (`docs/backlog/
+  phase2_sql_capability_expansion.md`), sequenced behind M8. See Open
+  questions below for what's still unresolved from M1-M5.
+- **Last updated:** 2026-07-07
 
 ### Design note: xid reuse after checkpoint — a real M1-era bug, found and fixed during M5
 
@@ -1340,6 +1358,116 @@ numbers recorded in `PROGRESS.md` ✅; `PROGRESS.md`/`MEMORY.md` closeout
 complete ✅ — closing out M5 as a whole, and with it, every milestone on
 CLAUDE.md's original roadmap (M0-M5).
 
+### Design note: M6 B-Tree — a real query-planning addition, not just a new IndexKind variant
+
+Adding `HNSW`/`FullText` in M2 only ever needed a new `IndexKind` variant
+plus a new `IndexedColumn`/`SecondaryIndex` case — every call site
+(`send_index_upserts`, rebuild-on-open, `CREATE INDEX` backfill) was
+already index-kind-agnostic. `BTree` needed all of that *plus* new logic
+in `exec_select` itself, because `exec_select` previously had no concept
+of "should I consult an index instead of scanning" at all — `NEAR` was
+the only predicate ever routed to an index, and only because `NEAR` is an
+explicit SQL operator with no non-indexed execution strategy. `BTree`
+acceleration is invisible at the SQL surface (an ordinary `WHERE id = 5`)
+so `find_indexable_btree_predicate`/`try_exec_select_btree` had to be
+built as a genuine (if narrow) query-planning step: detect an indexable
+top-level/AND'd `Column <op> Literal` comparison, check the column's index
+status, and only then divert from the full-scan path — falling straight
+back to it on any doubt (index missing, still `Building`, or the literal
+isn't orderable).
+
+**The `IndexStatus::Ready` gate matters more here than it did for `NEAR`.**
+`NEAR`'s top-k is inherently approximate — returning fewer than `k`
+results while a backfill races the query is expected and already
+documented. An equality/range query has no such slack: trusting a
+`Building` `BTreeIndex` (which has only indexed *some* rows so far) would
+silently return an incomplete, *wrong* result set. `try_exec_select_btree`
+therefore only uses the index once `Ready`, proven directly by
+`btree_select_before_index_ready_still_returns_correct_full_result`
+(inserts 50 rows without waiting for `Ready`, asserts the query still
+finds the exact row via full-scan fallback).
+
+**A `sqlparser` gotcha worth remembering:** a pre-existing test asserted
+`CREATE INDEX ... USING BTREE (id)` was unsupported (it was used as the
+"this should fail" example when the M2 plan wrote `rejects_create_index_
+with_unsupported_using`). Implementing `IndexKind::BTree` broke that test
+immediately — not because of a bug, but because `sqlparser`'s own
+`ast::IndexType` enum already has a **native** `BTree` variant (`BTREE`
+is a real, common index type name across Postgres/MySQL), unlike `HNSW`/
+`FULLTEXT` which arrive as `IndexType::Custom`. The fix was matching
+`Some(IndexType::BTree)` directly rather than `Custom(ident) if ident..
+eq_ignore_ascii_case("btree")` — worth checking `sqlparser`'s `IndexType`
+enum before assuming a new index-type keyword needs the `Custom` fallback
+path M2's `HNSW`/`FULLTEXT` needed.
+
+**A genuine, unrelated discovery made while writing `benches/btree.rs`:**
+setting up two 100,000-row tables in one engine hit `DbError::
+BufferPoolFull`, even after switching the benchmark's setup from one
+giant transaction to one commit per 500-row batch (per-transaction pinned
+pages were the first suspect, given the fixed 256-frame `POOL_CAPACITY`
+in `lib.rs` — but per-batch commits alone didn't fully resolve it). This
+points at a heap/FSM (free-space-map) page-allocation interaction that
+grows pinned-page pressure as a table's *total* page count grows into the
+hundreds, independent of any single transaction's size — not investigated
+further (out of M6's scope), but real and worth a dedicated look before
+any future benchmark or workload pushes a single table past roughly
+10,000-50,000 rows in one engine. See `PROGRESS.md`'s M6 entry and the
+"Known issues" list below.
+
+### Design note: M7 CSR — debouncing a worker that previously applied every message immediately
+
+`index_worker.rs`'s `worker_loop` had been a straightforward `for msg in
+rx { match msg { ... } }` since M2.b — every message (Vector/Text/Ordered
+upserts, MarkReady, Shutdown) applied immediately and completely, one at a
+time. CSR's debounce requirement (a user-approved decision: coalesce a
+burst of edge writes into one rebuild pass, rather than repeating HNSW's
+"rebuild on every single upsert" mistake) needed a genuine restructure,
+not just a new match arm: the loop was split into `apply_msg` (apply one
+message; for CSR, just `stage` the edge and record its key as dirty — no
+rebuild) and an explicit drain phase using `try_recv()` in a tight loop
+after every `recv()`, only calling `rebuild_dirty` once the channel is
+momentarily empty. This is a purely additive change in behavior — every
+non-CSR message still applies exactly as before, immediately, no
+debouncing — verified by the fact that zero existing `index_worker.rs`
+tests needed changes, only new ones were added.
+
+**How the debounce is actually proven, not just asserted**: `CsrIndex`
+gained a test-only `rebuild_count()` counter. `index_worker.rs`'s
+`burst_of_edge_upserts_coalesces_into_far_fewer_rebuilds_than_messages`
+sends 200 `Upsert` messages back-to-back (no gap for the worker to drain
+between sends), waits for `Ready`, then asserts `rebuild_count() < 200` —
+deliberately not asserting exactly 1, since the sender and worker threads
+race in ways a test can't fully pin down (the worker might wake and start
+draining before all 200 sends complete, producing 2-3 rebuild passes
+instead of 1). "Meaningfully less than N" is the honest, provable claim;
+"exactly 1" would be an unprovable, occasionally-flaky one.
+
+**The `EdgeIndex`-vs-CSR selection question was worked through explicitly
+during planning, not left as an open design question to resolve later**:
+`graph::index::graph_candidates` prefers CSR whenever `Ready`, falling
+back to `EdgeIndex` (always current, zero lag) otherwise — no "only use
+CSR above N candidates" heuristic. The reasoning: CSR's async rebuild lag
+can only ever cause a *missed* very-recent edge (a false negative, since
+the edge hasn't been staged-and-rebuilt into CSR yet), never a phantom one
+returned that shouldn't be — every candidate from either index still goes
+through `resolve_candidates_batched`'s MVCC re-validation before ever
+reaching a caller. That is exactly the same staleness class HNSW/FullText/
+BTree already have once `Ready` (a live upsert can lag slightly behind a
+commit for any of them) — CSR doesn't introduce a new risk category, so
+there was no principled reason to add complexity distinguishing "small
+hub, use EdgeIndex" from "large hub, use CSR."
+
+**Benchmark honesty note**: extending `benches/graph.rs`'s
+`adjacency_scan` group with a `csr` variant found CSR performs at parity
+with the already-fast `batched` (`EdgeIndex`) variant — no measurable win.
+This was reported as the actual finding (`PROGRESS.md`'s M7 entry
+explains why: the batched-resolve step already dominates cost for a
+single-hop workload, and CSR's real advantage — contiguous, cache-friendly
+adjacency for *multi-hop* traversal — has no way to show up until Cypher
+supports multi-hop patterns, which it doesn't yet). Not massaged into a
+flattering number; CLAUDE.md §6 explicitly wants exactly this kind of
+plain reporting.
+
 ---
 
 ## Open questions / pending human input
@@ -1386,6 +1514,18 @@ CLAUDE.md's original roadmap (M0-M5).
   Straightforward fix identified, not applied — see Open questions above.
 - FSM is a linear scan over all heap pages — fine for M0/M1, revisit if insert
   throughput regresses.
+- **`DbError::BufferPoolFull` at large single-table scale (discovered M6,
+  not fixed):** a table growing into the hundreds of pages can exhaust the
+  fixed 256-frame buffer pool (`POOL_CAPACITY` in `lib.rs`) even with
+  small, individually-committed transactions — found while benchmarking
+  `benches/btree.rs` at 100,000 rows across two tables. Per-transaction
+  pinned-page accumulation was the first suspect but switching to one
+  commit per 500-row batch didn't fully resolve it, pointing at the FSM
+  linear-scan issue above compounding with page-count growth rather than a
+  purely per-transaction pinning bug. Not investigated further — `benches/
+  btree.rs` scopes its largest tier down to 10,000 rows instead. Revisit
+  alongside the FSM item above if a real workload needs single tables
+  larger than this.
 - WAL truncation rewrites the entire file — acceptable for now, needs a proper
   log-segment scheme in later milestones.
 - **No vacuum/GC in M1.** Dead tuple versions (`xmax` set, no snapshot can see
@@ -1493,6 +1633,101 @@ CLAUDE.md's original roadmap (M0-M5).
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-07 — M7 (CSR graph index) complete; M7 milestone DONE
+
+- **M7.a**: `IndexKind::Csr` (engine-managed only, no SQL keyword — exists
+  purely to reuse `index_worker.rs`'s `(table, column)`-keyed machinery
+  for `__edges__`'s `from_id`); new `src/csr_index.rs` (`CsrIndex`,
+  classic sorted-offset-array CSR layout, `stage`/`rebuild` split so
+  raw accumulation and the queryable structure are separate); restructured
+  `index_worker.rs::worker_loop` from a plain `for msg in rx` into
+  `apply_msg` + an explicit `try_recv()` drain loop, coalescing a burst of
+  queued edge messages into one `rebuild_dirty` pass — the user-approved
+  fix for HNSW's still-unfixed "rebuild on every single upsert" pattern.
+  Debounce proven via a test-only `CsrIndex::rebuild_count()` counter:
+  200 back-to-back messages produce far fewer than 200 rebuilds (see
+  design note above for why "far fewer" is the honest, provable claim,
+  not "exactly 1").
+- **M7.b**: `graph::index::graph_candidates` — prefers CSR once `Ready`,
+  falls back to the always-current `EdgeIndex` otherwise, with the
+  correctness reasoning worked through explicitly (CSR's lag can only
+  cause a missed very-recent edge, never a phantom one, since every
+  candidate is re-validated against MVCC visibility regardless of source).
+  Wired into `Engine::edges_from` and the Cypher executor's fast path
+  (`execute` gained an `index_worker: &IndexHandle` parameter);
+  `create_edge` sends a live CSR upsert alongside its existing synchronous
+  `EdgeIndex.insert`; new `rebuild_csr_index` backfill function runs
+  during `Engine::open`. `tests/graph_mvcc.rs` gained an explicit
+  CSR-path MVCC proof (waits for `Ready`, mirrors M3's "single most
+  important test" for the CSR-preferring path specifically).
+- **M7.c**: extended `benches/graph.rs`'s `adjacency_scan` group with a
+  `csr` variant — found CSR at parity with the already-fast `batched`
+  (`EdgeIndex`) path (97.4µs vs 97.7µs at 1k edges, 998µs vs 972µs at
+  10k), an honest non-win explained by the benchmark's single-hop shape
+  not exercising CSR's actual advantage (multi-hop traversal, which
+  Cypher doesn't support yet). Extended `tests/graph_rebuild.rs` with
+  CSR restart-rebuild and delete-reflection tests (both explicitly wait
+  for `Ready` to provably exercise the CSR path).
+- Full verification: 225 unit tests (228 with `--features server`), all
+  integration suites green (`graph_rebuild` 3->5, `graph_mvcc` 2->3),
+  `cargo clippy --all-targets -- -D warnings` and `cargo fmt --all --check`
+  clean both with and without `--features server`, `cargo tree
+  --no-default-features --edges normal` still empty of server-only deps.
+- `PROGRESS.md`'s M7 entry and this file's Current status/design
+  notes/known-issues sections updated. Next: M8.a (Cargo workspace
+  restructure + `unidb-attach` crate skeleton), per the approved plan.
+
+### 2026-07-07 — M6 (B-Tree secondary index) complete; M6 milestone DONE
+
+- Prompted by a comparison against a competing project (FFS/ffsdb) that
+  publishes B-Tree/HNSW/CSR-graph benchmarks and embedded/standalone/
+  attach deployment modes — user approved a 3-milestone follow-on plan
+  (M6 B-Tree, M7 CSR graph, M8 attach client), researched via three
+  parallel Explore agents plus direct synthesis (two Plan-agent dispatches
+  hit a transient "529 Overloaded" error with zero output; the plan was
+  written directly from the completed Explore-agent research instead of a
+  third retry).
+- **M6.a**: `IndexKind::BTree` (additive, `src/catalog.rs`); new
+  `src/btree_index.rs` (`BTreeIndex`, `OrderedValue`, `RangeOp`) backed by
+  `std::collections::BTreeMap` — zero new dependencies; `by_id: HashMap<
+  RowId, OrderedValue>` bookkeeping so `upsert` can remove a stale bucket
+  entry when a row's indexed value changes (new relative to `VectorIndex`/
+  `InvertedIndex`, since a `BTreeMap` is keyed by value, not id);
+  `index_worker.rs` wiring (`IndexedColumn::Ordered`, `SecondaryIndex::
+  BTree`) into the existing generic worker machinery; `exec_create_index`
+  validation extended (`Int64`/`Text`/`Bool` valid, `Vector`/`Json`
+  rejected); parser `USING BTREE` support — discovered `sqlparser`'s
+  `IndexType::BTree` is a *native* variant (not `Custom`, unlike `HNSW`/
+  `FULLTEXT`), which broke a pre-existing "BTREE is unsupported" test
+  immediately upon implementing (see design note above).
+- **M6.b**: index-assisted `exec_select` — `find_indexable_btree_predicate`
+  + `try_exec_select_btree`, reusing `exec_select_near`'s exact
+  resolve-then-refilter template. Unlike M2's `HNSW`/`FullText` additions,
+  this needed genuine new query-planning logic, not just wiring (see
+  design note above) — including a stricter `IndexStatus::Ready` gate than
+  `NEAR` needs, since an equality/range query can't tolerate an
+  incomplete-but-silent result the way `NEAR`'s approximate top-k can.
+  Differential test proves indexed and full-scan paths return identical
+  rows; `tests/btree_mvcc.rs` proves an aborted insert never leaks through
+  the index-assisted path; `btree_assisted_select_still_respects_rls`
+  proves RLS still applies to every index-sourced candidate.
+- **M6.c**: `benches/btree.rs` (point/range SELECT, indexed vs. full-scan,
+  1,000/10,000 rows) — headline: indexed stays flat (~3.1 ms) while
+  full-scan grows with table size (3.60->4.95 ms point, 3.66->4.54 ms
+  range). Discovered and worked around a real, unrelated `BufferPoolFull`
+  scaling limit at 100,000-row scale while building the benchmark (see
+  design note above and the new "Known issues" entry) — not fixed, flagged
+  for later. Extended `tests/index_rebuild.rs` with BTree restart-rebuild
+  and pre-`Ready` fallback-correctness tests.
+- Full verification: 222 unit tests (225 with `--features server`), all
+  integration suites green, `cargo clippy --all-targets -- -D warnings`
+  and `cargo fmt --all --check` clean both with and without `--features
+  server`, `cargo tree --no-default-features --edges normal` still empty
+  of server-only deps.
+- `PROGRESS.md`'s M6 entry and this file's Current status/design
+  notes/known-issues sections updated. Next: M7.a (`CsrIndex` +
+  debounced/coalesced rebuild), per the approved plan.
 
 ### 2026-07-07 — M5.d complete; M5 milestone DONE; M0-M5 all shipped
 

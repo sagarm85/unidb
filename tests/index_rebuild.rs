@@ -101,6 +101,89 @@ fn engine_restart_rebuilds_fulltext_index_and_search_still_works() {
 }
 
 #[test]
+fn engine_restart_rebuilds_btree_index_and_select_still_works() {
+    let dir = tempdir().unwrap();
+    {
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, name TEXT)")
+            .unwrap();
+        engine
+            .execute_sql(xid, "CREATE INDEX idx ON t USING BTREE (id)")
+            .unwrap();
+        engine
+            .execute_sql(xid, "INSERT INTO t (id, name) VALUES (1, 'alice')")
+            .unwrap();
+        engine
+            .execute_sql(xid, "INSERT INTO t (id, name) VALUES (2, 'bob')")
+            .unwrap();
+        engine.commit(xid).unwrap();
+        engine.flush().unwrap();
+    }
+
+    // Fresh process-equivalent open: the in-memory worker/index from the
+    // first `Engine` is gone. Only the catalog's `index: Some(BTree)` flag
+    // and the heap's committed rows survived — rebuild-on-open must
+    // reconstruct the index from those alone.
+    let mut engine2 = Engine::open(dir.path(), 0).unwrap();
+    wait_for_ready(&engine2, "t", "id");
+
+    let xid = engine2.begin().unwrap();
+    let results = engine2
+        .execute_sql(xid, "SELECT name FROM t WHERE id = 2")
+        .unwrap();
+    match &results[0] {
+        SqlResult::Rows(rows) => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], Literal::Text("bob".into()));
+        }
+        other => panic!("expected Rows, got {other:?}"),
+    }
+}
+
+#[test]
+fn btree_select_before_index_ready_still_returns_correct_full_result() {
+    let dir = tempdir().unwrap();
+    let mut engine = Engine::open(dir.path(), 0).unwrap();
+
+    let xid = engine.begin().unwrap();
+    engine
+        .execute_sql(xid, "CREATE TABLE t (id INT, name TEXT)")
+        .unwrap();
+    engine
+        .execute_sql(xid, "CREATE INDEX idx ON t USING BTREE (id)")
+        .unwrap();
+    for i in 0..50 {
+        engine
+            .execute_sql(
+                xid,
+                &format!("INSERT INTO t (id, name) VALUES ({i}, 'row{i}')"),
+            )
+            .unwrap();
+    }
+    engine.commit(xid).unwrap();
+
+    // Deliberately not waiting for `IndexStatus::Ready` — unlike `NEAR`'s
+    // inherently approximate top-k, an equality/range query must never
+    // return an *incomplete* result just because the index backfill is
+    // still in progress. `try_exec_select_btree` only trusts the index once
+    // `Ready`; before that it falls back to the ordinary full scan, so the
+    // result here must be exactly correct, not "possibly fewer rows."
+    let xid2 = engine.begin().unwrap();
+    let results = engine
+        .execute_sql(xid2, "SELECT name FROM t WHERE id = 17")
+        .unwrap();
+    match &results[0] {
+        SqlResult::Rows(rows) => {
+            assert_eq!(rows.len(), 1, "must find the exact match even pre-Ready");
+            assert_eq!(rows[0][0], Literal::Text("row17".into()));
+        }
+        other => panic!("expected Rows, got {other:?}"),
+    }
+}
+
+#[test]
 fn near_query_before_index_ready_does_not_error() {
     let dir = tempdir().unwrap();
     let mut engine = Engine::open(dir.path(), 0).unwrap();

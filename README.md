@@ -151,11 +151,29 @@ UNIDB_BIND_ADDR=127.0.0.1:8080 \
 cargo run --bin unidb-server --features server
 ```
 
+**Config (env vars, no config file in v1):**
+
+| Var | Default | Purpose |
+|---|---|---|
+| `UNIDB_JWT_SECRET` | — (**required**) | HMAC secret for verify-only JWT auth. No default — the server refuses to start without one. |
+| `UNIDB_DATA_DIR` | `./unidb-data` | Storage directory — holds `control`/`data.db`/`db.wal`, nothing else. |
+| `UNIDB_LOG_DIR` | `<UNIDB_DATA_DIR>/logs` | Rolling daily log files (`unidb.log.YYYY-MM-DD`). Independently overridable so logs can live on a different volume than data. |
+| `UNIDB_BIND_ADDR` | `127.0.0.1:8080` | Listen address. |
+| `UNIDB_PAGE_SIZE` | `0` (engine default) | Page size, fixed at first open (D8). |
+
+For a real deployment, set `UNIDB_DATA_DIR`/`UNIDB_LOG_DIR` to explicit
+absolute paths rather than relying on the relative defaults, which resolve
+against whatever directory the process happens to be started from.
+Logging goes to **both** stdout (so `docker logs`/systemd journal capture
+still works) and the rolling file under `UNIDB_LOG_DIR`.
+
 Full route reference (payloads, responses, error codes, auth model) is in
-[`Doc/REST_API.md`](Doc/REST_API.md). Quick smoke test:
+[`docs/REST_API.md`](docs/REST_API.md). Quick smoke test — token generation
+uses [`scripts/gen_jwt.sh`](scripts/gen_jwt.sh) (pure bash + `openssl`, no
+Python/PyJWT dependency to install):
 
 ```bash
-TOKEN=$(python3 -c "import jwt,time; print(jwt.encode({'sub':'dev','exp':int(time.time())+3600}, 'dev-secret', algorithm='HS256'))")
+TOKEN=$(UNIDB_JWT_SECRET=dev-secret ./scripts/gen_jwt.sh)
 curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8080/sql \
   -d '{"sql":"CREATE TABLE t (id INT)"}'
 curl http://127.0.0.1:8080/metrics   # no auth required
@@ -234,8 +252,10 @@ benches/
   load.rs, vector.rs, graph.rs, queue.rs, server.rs — criterion benchmarks per milestone
 scripts/
   bench_server.sh  — plain-shell perf smoke test against a running server (no Rust toolchain)
-Doc/
+  gen_jwt.sh       — generate a verify-only HS256 JWT (bash + openssl, no Python/PyJWT)
+docs/
   REST_API.md      — full HTTP route reference (payloads, responses, error codes)
+  backlog/         — saved plans for not-yet-started future work (e.g. Phase 2 SQL expansion)
 ```
 
 ---
@@ -251,7 +271,7 @@ All milestones below are **shipped, tested, and benchmarked**. Metrics tables ar
 | M2 — Vector & Text search | done | `VECTOR(n)` type, async HNSW index, `NEAR` operator, full-text inverted index |
 | M3 — Graph | done | Edge records, edge-list index, Cypher subset |
 | M4 — Event queue | done | WAL-derived stream, durable consumer offsets, `vacuum_events` |
-| M5 — API / server | done | Optional REST server (`Doc/REST_API.md`) + verify-only JWT auth + SSE subscribe + `/metrics` |
+| M5 — API / server | done | Optional REST server (`docs/REST_API.md`) + verify-only JWT auth + SSE subscribe + `/metrics` |
 
 ---
 

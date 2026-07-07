@@ -23,13 +23,14 @@ use std::path::Path;
 use serde_json::Value as JsonValue;
 
 use crate::{
+    btree_index::OrderedValue,
     bufferpool::BufferPool,
     catalog::{Catalog, CatalogCtx, ColumnDef, ColumnType, IndexKind, TableDef},
     control::ControlData,
     error::{DbError, Result},
     format::{PageId, Xid},
     heap::{Heap, RowId},
-    index_worker::{IndexHandle, IndexMsg, IndexedColumn, SecondaryIndex},
+    index_worker::{IndexHandle, IndexMsg, IndexStatus, IndexedColumn, SecondaryIndex},
     lockmgr::LockManager,
     queue::{self, EVENTS_TABLE},
     txn::{TransactionManager, UndoAction},
@@ -89,6 +90,19 @@ pub fn build_indexed_columns(
                 column: col.name.clone(),
                 data: t.clone(),
             }),
+            // `Literal::Null` (and any other non-orderable value that
+            // shouldn't occur given `exec_create_index`'s type validation)
+            // is silently skipped rather than erroring the write — a NULL
+            // indexed column just means that row never appears as a BTree
+            // candidate, matching ordinary SQL index semantics.
+            (Some(IndexKind::BTree), lit) => {
+                if let Ok(value) = OrderedValue::try_from(lit) {
+                    out.push(IndexedColumn::Ordered {
+                        column: col.name.clone(),
+                        data: value,
+                    });
+                }
+            }
             _ => {}
         }
     }
@@ -263,6 +277,7 @@ fn exec_create_index(
     match (&kind, &col.ty) {
         (IndexKind::Hnsw, ColumnType::Vector(_)) => {}
         (IndexKind::FullText, ColumnType::Text) => {}
+        (IndexKind::BTree, ColumnType::Int64 | ColumnType::Text | ColumnType::Bool) => {}
         (kind, ty) => {
             return Err(DbError::SqlPlan(format!(
                 "{kind:?} index is not valid on column {column} of type {ty:?}"
@@ -363,6 +378,15 @@ fn exec_select(
         return exec_select_near(&table_def, projection, predicate, near, ctx);
     }
 
+    if let Some(hit) = predicate
+        .as_ref()
+        .and_then(|e| find_indexable_btree_predicate(e, &table_def))
+    {
+        if let Some(result) = try_exec_select_btree(&table_def, projection, predicate, hit, ctx)? {
+            return Ok(result);
+        }
+    }
+
     let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
 
@@ -386,6 +410,107 @@ fn find_near(expr: &Expr) -> Option<(&str, &[f32], usize)> {
         Expr::And(lhs, rhs) => find_near(lhs).or_else(|| find_near(rhs)),
         _ => None,
     }
+}
+
+/// Find a top-level (or top-level-AND'd) `Column <op> Literal` comparison
+/// (in either operand order) whose column has a `BTree` index (M6). Purely
+/// an optimization hint, unlike `find_near`/`NEAR`: there is no explicit SQL
+/// syntax to opt in, and returning `None` here — or `try_exec_select_btree`
+/// later declining to use it — just means `exec_select` falls back to its
+/// unchanged full-scan path, never an error.
+fn find_indexable_btree_predicate<'a>(
+    expr: &'a Expr,
+    table_def: &TableDef,
+) -> Option<(&'a str, CmpOp, &'a Literal)> {
+    match expr {
+        Expr::BinOp { op, lhs, rhs } => {
+            let (column, op, literal) = match (lhs.as_ref(), rhs.as_ref()) {
+                (Expr::Column(c), Expr::Literal(l)) => (c.as_str(), *op, l),
+                (Expr::Literal(l), Expr::Column(c)) => (c.as_str(), flip_cmp_op(*op), l),
+                _ => return None,
+            };
+            table_def
+                .columns
+                .iter()
+                .find(|c| c.name == column && matches!(c.index, Some(IndexKind::BTree)))
+                .map(|_| (column, op, literal))
+        }
+        Expr::And(lhs, rhs) => find_indexable_btree_predicate(lhs, table_def)
+            .or_else(|| find_indexable_btree_predicate(rhs, table_def)),
+        _ => None,
+    }
+}
+
+/// Mirror a comparator when the column/literal appear swapped
+/// (`5 < col` means the same thing as `col > 5`).
+fn flip_cmp_op(op: CmpOp) -> CmpOp {
+    match op {
+        CmpOp::Lt => CmpOp::Gt,
+        CmpOp::Le => CmpOp::Ge,
+        CmpOp::Gt => CmpOp::Lt,
+        CmpOp::Ge => CmpOp::Le,
+        CmpOp::Eq => CmpOp::Eq,
+        CmpOp::Ne => CmpOp::Ne,
+    }
+}
+
+/// `BTree`-index-assisted execution, following `exec_select_near`'s exact
+/// resolve-then-refilter template (candidate RowIds -> `heap.get` -> full
+/// `predicate_matches`, so MVCC visibility/RLS/any remaining AND'd WHERE
+/// terms all still apply). Returns `Ok(None)` whenever the index can't
+/// safely serve this query right now — not yet `Ready` (an in-progress
+/// backfill has only seen *some* rows, and treating that as complete would
+/// silently return an incomplete result set, unlike `NEAR`'s inherently
+/// approximate top-k), the entry's kind mismatches, or the literal being
+/// compared isn't orderable — the caller falls back to a full scan in every
+/// such case, never an error.
+fn try_exec_select_btree(
+    table_def: &TableDef,
+    projection: &[String],
+    predicate: &Option<Expr>,
+    hit: (&str, CmpOp, &Literal),
+    ctx: &mut ExecCtx,
+) -> Result<Option<ExecResult>> {
+    let (column, op, literal) = hit;
+    let Some(handle) = ctx.index_worker else {
+        return Ok(None);
+    };
+    let Ok(value) = OrderedValue::try_from(literal) else {
+        return Ok(None);
+    };
+
+    let candidate_ids: Vec<RowId> = {
+        let guard = handle.indexes.read().unwrap();
+        let Some(entry) = guard.get(&(table_def.name.clone(), column.to_string())) else {
+            return Ok(None);
+        };
+        if entry.status != IndexStatus::Ready {
+            return Ok(None);
+        }
+        let SecondaryIndex::BTree(b) = &entry.index else {
+            return Ok(None);
+        };
+        match b.search(op, &value) {
+            Some(ids) => ids,
+            None => return Ok(None),
+        }
+    };
+
+    let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+    let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+    let mut out = Vec::new();
+    for row_id in candidate_ids {
+        let bytes = match heap.get(row_id, &snapshot, ctx.xid, ctx.pool) {
+            Ok(b) => b,
+            Err(DbError::NoVisibleVersion { .. }) => continue,
+            Err(e) => return Err(e),
+        };
+        let row = decode_row(&bytes, &table_def.columns)?;
+        if predicate_matches(predicate, &table_def.columns, &row)? {
+            out.push(project_row(projection, &table_def.columns, &row)?);
+        }
+    }
+    Ok(Some(ExecResult::Rows(out)))
 }
 
 /// `NEAR`'s over-fetch-then-filter execution: look up the column's
@@ -1346,6 +1471,82 @@ mod tests {
             .unwrap();
         let err = h
             .exec_as(xid, "CREATE INDEX idx ON t USING FULLTEXT (embedding)")
+            .unwrap_err();
+        assert!(matches!(err, DbError::SqlPlan(_)));
+    }
+
+    #[test]
+    fn create_index_accepts_btree_on_int64_column() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT)").unwrap();
+        let result = h
+            .exec_as(xid, "CREATE INDEX idx ON t USING BTREE (id)")
+            .unwrap();
+        assert_eq!(result, ExecResult::CreatedIndex);
+        assert_eq!(
+            h.catalog.lookup("t").unwrap().columns[0].index,
+            Some(IndexKind::BTree)
+        );
+    }
+
+    #[test]
+    fn create_index_accepts_btree_on_text_column() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, name TEXT)")
+            .unwrap();
+        let result = h
+            .exec_as(xid, "CREATE INDEX idx ON t USING BTREE (name)")
+            .unwrap();
+        assert_eq!(result, ExecResult::CreatedIndex);
+        assert_eq!(
+            h.catalog.lookup("t").unwrap().columns[1].index,
+            Some(IndexKind::BTree)
+        );
+    }
+
+    #[test]
+    fn create_index_accepts_btree_on_bool_column() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, active BOOL)")
+            .unwrap();
+        let result = h
+            .exec_as(xid, "CREATE INDEX idx ON t USING BTREE (active)")
+            .unwrap();
+        assert_eq!(result, ExecResult::CreatedIndex);
+        assert_eq!(
+            h.catalog.lookup("t").unwrap().columns[1].index,
+            Some(IndexKind::BTree)
+        );
+    }
+
+    #[test]
+    fn create_index_rejects_btree_on_vector_column() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, embedding VECTOR(2))")
+            .unwrap();
+        let err = h
+            .exec_as(xid, "CREATE INDEX idx ON t USING BTREE (embedding)")
+            .unwrap_err();
+        assert!(matches!(err, DbError::SqlPlan(_)));
+    }
+
+    #[test]
+    fn create_index_rejects_btree_on_json_column() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, data JSON)")
+            .unwrap();
+        let err = h
+            .exec_as(xid, "CREATE INDEX idx ON t USING BTREE (data)")
             .unwrap_err();
         assert!(matches!(err, DbError::SqlPlan(_)));
     }

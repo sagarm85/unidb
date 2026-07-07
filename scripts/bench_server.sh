@@ -27,21 +27,13 @@ BASE_URL="${BASE_URL:-http://127.0.0.1:8080}"
 SECRET="${UNIDB_JWT_SECRET:?set UNIDB_JWT_SECRET to match the server configuration}"
 REQUESTS="${REQUESTS:-200}"
 CONCURRENCY="${CONCURRENCY:-10}"
-
-b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Verify-only JWT (HS256) matching src/server/auth.rs — signed locally with
 # the shared secret, exactly like any real client of this API would.
-make_jwt() {
-    local header payload signing_input signature
-    header=$(printf '{"alg":"HS256","typ":"JWT"}' | b64url)
-    payload=$(printf '{"sub":"bench","exp":%d}' "$(($(date +%s) + 3600))" | b64url)
-    signing_input="${header}.${payload}"
-    signature=$(printf '%s' "$signing_input" | openssl dgst -sha256 -hmac "$SECRET" -binary | b64url)
-    printf '%s.%s' "$signing_input" "$signature"
-}
-
-TOKEN=$(make_jwt)
+# Shared with README's quick-start snippet via scripts/gen_jwt.sh (kept as
+# one implementation, not duplicated).
+TOKEN=$(UNIDB_JWT_SECRET="${SECRET}" "${SCRIPT_DIR}/gen_jwt.sh" bench 3600)
 AUTH_HEADER="Authorization: Bearer ${TOKEN}"
 TMP_LAT="$(mktemp)"
 trap 'rm -f "$TMP_LAT"' EXIT

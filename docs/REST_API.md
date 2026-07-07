@@ -49,6 +49,12 @@ this project's scope.
 Authorization: Bearer <jwt signed with UNIDB_JWT_SECRET, HS256>
 ```
 
+For local testing, generate a token with `scripts/gen_jwt.sh` (pure bash +
+`openssl`, no Python/PyJWT install required):
+```bash
+TOKEN=$(UNIDB_JWT_SECRET=dev-secret ./scripts/gen_jwt.sh)
+```
+
 Any validly-signed, unexpired token grants access to **every** data-plane
 route alike — there is no role/scope claim distinction in v1. Missing,
 malformed, wrong-signature, or expired tokens all return:

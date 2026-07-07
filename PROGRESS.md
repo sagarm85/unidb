@@ -819,3 +819,250 @@ carried-forward list):**
   latency rather than a Rust-API-only concern.
 - **No admin-scope JWT claim distinction** — any validly-signed,
   unexpired token can hit `/checkpoint` and every other route alike.
+
+---
+
+## M6 — B-Tree secondary index   [DONE]   2026-07-07
+
+**PR:** _pending (not yet opened; benchmarks recorded ahead of PR per session workflow)_
+**Summary:** A general-purpose `IndexKind::BTree` secondary index
+accelerating equality/range `WHERE` predicates on `Int64`/`Text`/`Bool`
+columns, closing a real gap: `exec_select` previously always did a full
+heap scan regardless of any index — `NEAR` was the only predicate that
+ever consulted one. Backed by `std::collections::BTreeMap` (zero new
+dependencies), reusing M2's existing async index-worker machinery
+(`index_worker.rs`) unchanged in shape. Shipped as three internal
+checkpoints (M6.a type + worker wiring, M6.b index-assisted `exec_select`,
+M6.c benchmarks + hardening). Prompted by a comparison against a
+competing project (FFS/ffsdb) that publishes B-Tree/HNSW/CSR benchmarks —
+this is the first of three follow-on milestones (M6 B-Tree, M7 CSR graph,
+M8 attach client) maturing unidb along the same axes; see
+`docs/backlog/phase2_sql_capability_expansion.md` for the still-parked SQL
+capability work this continues to defer.
+
+**Design decisions:**
+- `BTreeIndex` (`src/btree_index.rs`) tracks each `RowId`'s current
+  indexed value internally (`by_id: HashMap<RowId, OrderedValue>`)
+  alongside the value-sorted `BTreeMap<OrderedValue, Vec<RowId>>`, so
+  `upsert` can safely remove a stale bucket entry when a row's indexed
+  value changes — unlike `VectorIndex`/`InvertedIndex`, a `BTreeMap` is
+  keyed by value, not by id, so this bookkeeping is new, not copied.
+- Using the index in `exec_select` is a query-planning decision, not just
+  a wiring exercise (unlike adding `FullText`/`Hnsw` in M2, which only
+  needed a new `IndexKind` variant): `find_indexable_btree_predicate`
+  detects a top-level (or AND'd) `Column <op> Literal` comparison whose
+  column has a `BTree` index, and `try_exec_select_btree` reuses
+  `exec_select_near`'s exact resolve-then-refilter template (candidate
+  `RowId`s -> `heap.get` -> full `predicate_matches`), so MVCC visibility/
+  RLS/remaining `AND`ed terms all still apply for free.
+- **Correctness-critical difference from `NEAR`**: the index is only
+  trusted once `IndexStatus::Ready` — an in-progress backfill has only
+  indexed *some* rows, and an equality/range query silently returning an
+  incomplete result set would be a real bug (unlike `NEAR`'s inherently
+  approximate top-k, where fewer-than-`k` results during a backfill race
+  is expected and documented). `try_exec_select_btree` falls back to the
+  unchanged full scan whenever the index isn't `Ready`, can't be found, or
+  the compared `Literal` isn't orderable — proven directly by
+  `btree_select_before_index_ready_still_returns_correct_full_result`.
+
+**Benchmarks** (release build, Apple Silicon macOS, `cargo bench --bench
+btree`, 10 samples, indexed vs. unindexed full-scan on identical data):
+
+| Workload | 1,000 rows | 10,000 rows |
+|---|---|---|
+| Point SELECT (`WHERE id = target`), indexed | ~3.12 ms | ~3.10 ms |
+| Point SELECT, full scan | ~3.60 ms | ~4.95 ms |
+| Range SELECT (`WHERE id > lo`, ~10 rows), indexed | ~3.18 ms | ~3.17 ms |
+| Range SELECT, full scan | ~3.66 ms | ~4.54 ms |
+
+**Honest read of these numbers:** the *scaling* difference is the real
+finding, not the absolute latency — both paths still pay the same
+per-statement `begin`/`commit` fsync overhead documented since M1 (a
+read-only statement's `commit()` unconditionally fsyncs), which dominates
+the absolute numbers at this row-count range. The indexed path stays flat
+(~3.1 ms regardless of table size) while the full-scan path grows with row
+count (3.60 ms -> 4.95 ms point, 3.66 ms -> 4.54 ms range, 1k -> 10k rows)
+exactly as expected — the index avoids the growing scan cost, it doesn't
+(and can't, at this scale) avoid the fixed fsync cost.
+
+**A genuine discovery made while building this benchmark, unrelated to
+B-Tree itself:** two 100,000-row tables in one engine hit
+`DbError::BufferPoolFull` during setup, even after switching from one
+giant transaction to one commit per 500-row batch. Root cause: the
+fixed-capacity (256-frame) buffer pool (`POOL_CAPACITY` in `lib.rs`) keeps
+every page a still-open transaction has touched pinned until commit, but
+per-batch commits alone didn't fully resolve it at this scale — pointing
+at a heap/FSM (free-space-map) page-allocation interaction that grows
+pinned-page pressure as a table's total page count grows into the hundreds,
+independent of any single transaction's size. **Not investigated further
+or fixed here** — out of M6's scope (a B-Tree index, not the buffer
+pool/FSM), but a real, previously-undocumented scaling constraint worth
+tracking. `benches/btree.rs` scopes its row-count tiers to 1,000/10,000
+accordingly, with the reasoning left in a code comment rather than
+silently dropping the 100,000 tier.
+
+**Crash correctness:** no new crash-injection P-number — `BTreeIndex` is
+purely derived, non-durable state exactly like `VectorIndex`/
+`InvertedIndex` (rebuilt from the heap's committed rows on next open, per
+M2's already-established "index loss on crash is expected, not a new
+durability contract" precedent). `tests/index_rebuild.rs` gained
+`engine_restart_rebuilds_btree_index_and_select_still_works` (mirrors the
+existing HNSW/FullText restart tests) and
+`btree_select_before_index_ready_still_returns_correct_full_result` (the
+correctness-critical pre-`Ready` fallback proof above).
+`tests/btree_mvcc.rs::aborted_insert_never_surfaces_in_btree_assisted_results`
+mirrors `tests/vector_mvcc.rs`'s single-most-important-test shape exactly:
+the worker has no transaction concept, so an aborted insert's stale
+`BTreeIndex` entry must never leak into a query result — proven by
+polling until the worker has indexed the doomed row (a confirmed
+precondition, not a timing guess), then asserting a fresh transaction
+never sees it.
+
+**What changed:** `src/catalog.rs` (`IndexKind::BTree`, additive), new
+`src/btree_index.rs` (`BTreeIndex`, `OrderedValue`, `RangeOp`),
+`src/index_worker.rs` (`IndexedColumn::Ordered`, `SecondaryIndex::BTree`,
+one new `worker_loop` match arm — index-kind-agnostic call sites
+unchanged), `src/sql/executor.rs` (`exec_create_index`'s validation match
+extended; new `find_indexable_btree_predicate`/`flip_cmp_op`/
+`try_exec_select_btree` in `exec_select`'s path), `src/sql/parser.rs`
+(`USING BTREE` — note `sqlparser`'s `IndexType::BTree` is a *native*
+built-in variant, unlike `HNSW`/`FULLTEXT`'s `IndexType::Custom` fallback,
+discovered when a pre-existing test asserting `USING BTREE` was
+"unsupported" broke immediately upon implementing this). New
+`benches/btree.rs`, new `tests/btree_mvcc.rs`, extended
+`tests/index_rebuild.rs`.
+
+**Known limitations / tech debt (new in M6):**
+- **Single-column indexes only** — no composite/multi-column `BTree`
+  index, matching M2's identical single-column scope for `HNSW`/`FullText`.
+- **No `IN (...)` list-predicate support** — the parser doesn't produce
+  that `Expr` shape yet, so `find_indexable_btree_predicate` has nothing
+  to detect even if it wanted to.
+- **No cost-based index selection** — `exec_select` uses the first
+  indexable top-level (or AND'd) predicate term it finds; if a query has
+  multiple indexed columns in its `WHERE` clause, there is no comparison
+  of which index would be more selective.
+- **The `BufferPoolFull`-at-scale discovery above** — a real, separately
+  trackable buffer-pool/FSM scaling limit, not fixed here.
+- **Deferred to `docs/backlog/`:** none new from M6 itself; the Phase 2
+  SQL capability plan remains the standing deferred item.
+
+---
+
+## M7 — CSR (Compressed Sparse Row) graph index   [DONE]   2026-07-07
+
+**PR:** _pending (not yet opened; benchmarks recorded ahead of PR per session workflow)_
+**Summary:** A read-optimized adjacency structure for graph traversal, built
+asynchronously (like M2's HNSW index) on top of the existing background
+worker, sitting alongside — never replacing — the synchronous `EdgeIndex`
+`create_edge`/`delete_edge` already maintain inline. Unlike HNSW's
+still-unfixed "rebuild the whole structure on every single upsert"
+pattern, CSR's rebuild is **debounced**: the worker drains every
+currently-queued edge message before rebuilding, coalescing a burst of
+writes into one rebuild pass. Shipped as three internal checkpoints (M7.a
+`CsrIndex` type + debounced rebuild, M7.b wiring into `edges_from`/Cypher
+traversal, M7.c benchmarks + hardening). Second of the three follow-on
+milestones (M6 B-Tree, M7 CSR, M8 attach client) prompted by a comparison
+against a competing project (FFS/ffsdb); M8 is next, then the parked
+Phase 2 SQL work in `docs/backlog/phase2_sql_capability_expansion.md`.
+
+**Design decisions:**
+- `IndexKind::Csr` (`src/catalog.rs`) is **engine-managed only** — there is
+  no SQL keyword for it and no way to set it via `CREATE INDEX`/`ColumnDef.
+  index`. It exists purely so CSR can reuse `index_worker.rs`'s generic
+  `(table, column)`-keyed machinery for `__edges__`'s `from_id`, registered
+  as `("__edges__", "from_id")`, the same way a real column index would be.
+- `CsrIndex` (`src/csr_index.rs`) splits raw accumulation from the
+  queryable structure: `stage(from_id, row_id)` appends to a plain `Vec`,
+  and only `rebuild()` recomputes the sorted `from_ids_sorted`/`row_ptr`/
+  `col_ind` CSR arrays — the classic layout, O(n log n) per rebuild, not
+  incrementally patchable (directly analogous to `instant-distance`'s HNSW
+  having no incremental insert, per M2.b's design note).
+- **The debounce mechanism**: `index_worker.rs`'s `worker_loop` was
+  restructured from a plain `for msg in rx` into `apply_msg` (applies one
+  message, staging CSR edges without rebuilding) plus an explicit
+  drain-via-`try_recv()` loop that coalesces every currently-queued message
+  into one `rebuild_dirty` pass before returning to a blocking `recv()`.
+  Every non-CSR variant (`Vector`/`Text`/`Ordered`) behaves identically to
+  before — this only changes CSR's timing, not its correctness contract.
+  Proven by `burst_of_edge_upserts_coalesces_into_far_fewer_rebuilds_than_
+  messages` (`index_worker.rs`): 200 messages sent back-to-back, real
+  rebuild count observed to be far below 200 (`CsrIndex::rebuild_count()`,
+  a test-only counter), not asserted at exactly 1 since the sender/worker
+  race can't be pinned down more precisely than "coalesced, not absent."
+- **`EdgeIndex` stays the default, always-current tier; CSR is preferred
+  only once `Ready`** (`graph::index::graph_candidates`, consulted by both
+  `Engine::edges_from` and the Cypher executor's fast path). Reasoning
+  worked through explicitly, not assumed: CSR's async lag can only cause a
+  *missed* very-recent edge (a false negative), never a phantom one, since
+  every candidate — from either index — is still re-validated against MVCC
+  visibility downstream (`resolve_candidates_batched`). That's the same
+  staleness characteristic every other async secondary index already has
+  once `Ready`; no "only use CSR above N candidates" heuristic was needed.
+- No live-delete message for CSR (`delete_edge` sends nothing) — matches
+  the existing "deletion is implicit, filtered out by MVCC re-validation at
+  read time" convention every other secondary index already has.
+
+**Benchmarks** (release build, Apple Silicon macOS, `cargo bench --bench
+graph`, 10 samples, extending the existing `adjacency_scan` group with a
+CSR variant):
+
+| Hot hub size | naive | batched (EdgeIndex) | csr |
+|---|---|---|---|
+| 1,000 edges (8 pages) | 899 µs | 97.7 µs | 97.4 µs |
+| 10,000 edges (78 pages) | 9.15 ms | 972 µs | 998 µs |
+
+**Honest read of these numbers:** CSR is at parity with the already-fast
+`EdgeIndex`+batched-resolve path — no meaningful win or loss (differences
+are within noise). This is the expected, honest result, not a
+disappointment: for this single-hop workload, the batched-resolve step
+(grouping candidates by page, M3.b) already dominates cost, and a binary
+search into a sorted array (CSR) costs about the same as an O(1) HashMap
+lookup (`EdgeIndex`) once that's the bottleneck. CSR's actual value
+proposition — cache-friendly, contiguous adjacency for repeated lookups in
+multi-hop traversal — isn't exercised here because Cypher itself only
+supports single-hop patterns today (see Known limitations). Reporting this
+plainly rather than searching for a workload that flatters the number,
+per CLAUDE.md §6.
+
+**Crash correctness:** no new crash-injection P-number — `CsrIndex` is
+purely derived, non-durable state exactly like `EdgeIndex`/`VectorIndex`/
+`BTreeIndex` (rebuilt from `__edges__`'s committed rows on next open).
+`tests/graph_rebuild.rs` gained `engine_restart_rebuilds_csr_index_and_
+traversal_still_works` and `engine_restart_csr_reflects_deletes_from_
+before_close` (both explicitly wait for CSR `Ready` before asserting, to
+provably exercise the CSR-preferring path rather than an ambient
+"might have used EdgeIndex" outcome). `tests/graph_mvcc.rs` gained
+`aborted_edge_creation_never_surfaces_via_csr_path_once_ready`, the CSR
+analogue of M3's "single most important test" — proving an edge whose
+creating transaction aborts never surfaces via the CSR path either, even
+though the worker staged it into CSR unconditionally before the abort.
+
+**What changed:** `src/catalog.rs` (`IndexKind::Csr`, engine-managed-only),
+new `src/csr_index.rs` (`CsrIndex`), `src/index_worker.rs`
+(`IndexedColumn::Edge`, `SecondaryIndex::Csr`, `worker_loop` restructured
+into `apply_msg`/`rebuild_dirty` for debouncing), `src/graph/index.rs`
+(new `graph_candidates` — the CSR-preferring, `EdgeIndex`-falling-back
+selection logic), `src/graph/executor.rs` (`execute` takes an additional
+`index_worker: &IndexHandle` parameter), `src/lib.rs` (`create_edge` sends
+a live CSR upsert alongside its existing synchronous `EdgeIndex.insert`;
+`edges_from` and `execute_cypher`'s call site route through
+`graph_candidates`; new `rebuild_csr_index` backfill function, called
+during `Engine::open` alongside `rebuild_secondary_indexes`). Extended
+`benches/graph.rs`, `tests/graph_rebuild.rs`, `tests/graph_mvcc.rs`.
+
+**Known limitations / tech debt (new in M7):**
+- **CSR indexes only `from_id` adjacency** (forward traversal) — no
+  `to_id`/reverse-traversal CSR structure.
+- **No multi-hop CSR-accelerated BFS** — Cypher itself only supports
+  single-hop `(a)-[:TYPE]->(b)` patterns today, so this isn't a regression,
+  just headroom CSR doesn't yet get to fill. The benchmark parity finding
+  above is a direct consequence of this: CSR's real advantage only shows up
+  once multi-hop traversal exists to exploit its contiguous layout.
+- **Rebuild is still O(n log n) over the *entire* edge set per
+  debounce-triggered pass** — debouncing reduces *frequency*, not the
+  fundamental non-incremental nature of the structure. Acceptable for now,
+  same category of tech debt as HNSW's, just less severe.
+- **Deferred to `docs/backlog/`:** none new from M7 itself; Phase 2's SQL
+  capability plan remains the standing deferred item, now one milestone
+  closer (M8 attach client is next).

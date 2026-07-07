@@ -37,11 +37,13 @@
 // unsafe_code is denied crate-wide; mmap.rs is the sole exception (CLAUDE.md §4).
 #![deny(unsafe_code)]
 
+pub mod btree_index;
 pub mod bufferpool;
 pub mod catalog;
 pub mod checkpoint;
 pub mod concurrency_hooks;
 pub mod control;
+pub mod csr_index;
 pub mod error;
 pub mod format;
 pub mod fulltext;
@@ -72,11 +74,11 @@ use crate::{
     graph::{
         edges::{self, Edge},
         executor as graph_executor,
-        index::{resolve_candidates_batched, EdgeIndex},
+        index::{graph_candidates, resolve_candidates_batched, EdgeIndex},
         parser::parse_cypher,
     },
     heap::Heap,
-    index_worker::{IndexHandle, IndexMsg},
+    index_worker::{IndexHandle, IndexMsg, IndexedColumn},
     lockmgr::LockManager,
     queue::{CONSUMERS_TABLE, EVENTS_TABLE},
     sql::{
@@ -223,6 +225,15 @@ impl Engine {
             page_size_usize,
             &index_worker,
         )?;
+        rebuild_csr_index(
+            &catalog,
+            &mut txn_mgr,
+            &mut pool,
+            &mut wal,
+            &mut lock_mgr,
+            page_size_usize,
+            &index_worker,
+        )?;
 
         tracing::info!(dir = %dir.display(), page_size = control.page_size, next_xid, "engine opened");
         Ok(Self {
@@ -289,7 +300,8 @@ impl Engine {
             index_worker: Some(&self.index_worker),
             next_event_seq: &mut self.next_event_seq,
         };
-        let result = graph_executor::execute(parsed, &mut ctx, &self.edge_index)?;
+        let result =
+            graph_executor::execute(parsed, &mut ctx, &self.edge_index, &self.index_worker)?;
         Ok(vec![result])
     }
 
@@ -592,6 +604,20 @@ impl Engine {
         }
 
         self.edge_index.insert(from_id, row_id);
+        // Live upsert into the CSR graph index (M7) — a plain channel
+        // send, same as any other secondary index; the worker debounces
+        // the actual rebuild (see index_worker.rs's module doc). No
+        // corresponding message on delete_edge, matching the existing
+        // "deletion is implicit, filtered out by MVCC re-validation at
+        // read time" convention every other secondary index already has.
+        self.index_worker.send(IndexMsg::Upsert {
+            table: edges::EDGES_TABLE.to_string(),
+            record: row_id,
+            indexed_cols: vec![IndexedColumn::Edge {
+                column: "from_id".to_string(),
+                from_id,
+            }],
+        });
         Ok(row_id)
     }
 
@@ -630,7 +656,7 @@ impl Engine {
     pub fn edges_from(&mut self, xid: Xid, from_id: i64) -> Result<Vec<Edge>> {
         let table_def = self.catalog.lookup(edges::EDGES_TABLE)?.clone();
         let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
-        let candidates = self.edge_index.candidates(from_id).to_vec();
+        let candidates = graph_candidates(from_id, &self.edge_index, &self.index_worker);
         let resolved = resolve_candidates_batched(
             &candidates,
             &snapshot,
@@ -828,6 +854,49 @@ fn rebuild_edge_index(
     }
     txn_mgr.commit(xid, wal, lock_mgr)?;
     Ok(index)
+}
+
+/// Backfill the CSR graph index (M7) from `__edges__`'s currently
+/// committed rows, mirroring `rebuild_secondary_indexes`'s exact
+/// backfill-then-`MarkReady` shape. Kept separate from that function
+/// because `__edges__`'s CSR index is engine-managed — never a
+/// `ColumnDef.index` a user sets via `CREATE INDEX` — so
+/// `rebuild_secondary_indexes`'s `columns.iter().filter(|c| c.index.
+/// is_some())` scan naturally never touches it.
+fn rebuild_csr_index(
+    catalog: &Catalog,
+    txn_mgr: &mut TransactionManager,
+    pool: &mut BufferPool,
+    wal: &mut Wal,
+    lock_mgr: &mut LockManager,
+    page_size: usize,
+    handle: &IndexHandle,
+) -> Result<()> {
+    let table = catalog.lookup(edges::EDGES_TABLE)?.clone();
+    let heap = Heap::from_pages(page_size, table.pages.clone());
+    let xid = txn_mgr.begin(IsolationLevel::ReadCommitted, wal)?;
+    let snapshot = txn_mgr.snapshot_for_statement(xid)?;
+    for (row_id, bytes) in heap.scan(&snapshot, xid, pool)? {
+        let row = executor::decode_row(&bytes, &table.columns)?;
+        if let Literal::Int(from_id) = row[0] {
+            handle.send(IndexMsg::Upsert {
+                table: edges::EDGES_TABLE.to_string(),
+                record: row_id,
+                indexed_cols: vec![IndexedColumn::Edge {
+                    column: "from_id".to_string(),
+                    from_id,
+                }],
+            });
+        }
+    }
+    txn_mgr.commit(xid, wal, lock_mgr)?;
+
+    handle.send(IndexMsg::MarkReady {
+        table: edges::EDGES_TABLE.to_string(),
+        column: "from_id".to_string(),
+        kind: IndexKind::Csr,
+    });
+    Ok(())
 }
 
 /// Derive the next `seq` to assign in `__events__`, from its own
@@ -1580,6 +1649,163 @@ mod tests {
         let result = engine.execute_sql(xid2, "SELECT * FROM t").unwrap();
         match &result[0] {
             SqlResult::Rows(rows) => assert_eq!(rows.len(), 1),
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    fn sorted_names(result: &SqlResult) -> Vec<String> {
+        match result {
+            SqlResult::Rows(rows) => {
+                let mut names: Vec<String> = rows
+                    .iter()
+                    .map(|r| match &r[0] {
+                        crate::sql::logical::Literal::Text(s) => s.clone(),
+                        other => panic!("expected Text, got {other:?}"),
+                    })
+                    .collect();
+                names.sort();
+                names
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    /// M6 differential proof: an index-assisted equality/range `SELECT`
+    /// must return exactly the same rows as an unindexed full scan of
+    /// identical data — the index is purely a performance optimization,
+    /// invisible in the result set.
+    #[test]
+    fn btree_assisted_select_matches_full_scan_equality_and_range() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE indexed (id INT, name TEXT)")
+            .unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE plain (id INT, name TEXT)")
+            .unwrap();
+        engine
+            .execute_sql(xid, "CREATE INDEX idx ON indexed USING BTREE (id)")
+            .unwrap();
+        for (id, name) in [(1, "a"), (2, "b"), (3, "c"), (2, "d"), (4, "e")] {
+            engine
+                .execute_sql(
+                    xid,
+                    &format!("INSERT INTO indexed (id, name) VALUES ({id}, '{name}')"),
+                )
+                .unwrap();
+            engine
+                .execute_sql(
+                    xid,
+                    &format!("INSERT INTO plain (id, name) VALUES ({id}, '{name}')"),
+                )
+                .unwrap();
+        }
+        engine.commit(xid).unwrap();
+
+        let start = std::time::Instant::now();
+        loop {
+            if engine.index_status("indexed", "id") == Some(index_worker::IndexStatus::Ready) {
+                break;
+            }
+            if start.elapsed() > std::time::Duration::from_secs(5) {
+                panic!("index never reached Ready within timeout");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        let xid2 = engine.begin().unwrap();
+
+        // Equality.
+        let indexed_eq = engine
+            .execute_sql(xid2, "SELECT name FROM indexed WHERE id = 2")
+            .unwrap();
+        let plain_eq = engine
+            .execute_sql(xid2, "SELECT name FROM plain WHERE id = 2")
+            .unwrap();
+        assert_eq!(sorted_names(&indexed_eq[0]), sorted_names(&plain_eq[0]));
+        assert_eq!(sorted_names(&indexed_eq[0]), vec!["b", "d"]);
+
+        // Range (>).
+        let indexed_gt = engine
+            .execute_sql(xid2, "SELECT name FROM indexed WHERE id > 2")
+            .unwrap();
+        let plain_gt = engine
+            .execute_sql(xid2, "SELECT name FROM plain WHERE id > 2")
+            .unwrap();
+        assert_eq!(sorted_names(&indexed_gt[0]), sorted_names(&plain_gt[0]));
+        assert_eq!(sorted_names(&indexed_gt[0]), vec!["c", "e"]);
+
+        // Range (<=).
+        let indexed_le = engine
+            .execute_sql(xid2, "SELECT name FROM indexed WHERE id <= 2")
+            .unwrap();
+        let plain_le = engine
+            .execute_sql(xid2, "SELECT name FROM plain WHERE id <= 2")
+            .unwrap();
+        assert_eq!(sorted_names(&indexed_le[0]), sorted_names(&plain_le[0]));
+        assert_eq!(sorted_names(&indexed_le[0]), vec!["a", "b", "d"]);
+    }
+
+    /// M6: the index-assisted `exec_select` path must still respect RLS.
+    /// Both rows share `id = 1` (so a BTree lookup on `id` returns both as
+    /// raw candidates), but only one has `owner = 'alice'` — proving the
+    /// RLS-AND'd predicate is still applied to every index-sourced
+    /// candidate, not bypassed by the index shortcut.
+    #[test]
+    fn btree_assisted_select_still_respects_rls() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, owner TEXT)")
+            .unwrap();
+        engine
+            .execute_sql(xid, "CREATE INDEX idx ON t USING BTREE (id)")
+            .unwrap();
+        engine
+            .execute_sql(xid, "INSERT INTO t (id, owner) VALUES (1, 'alice')")
+            .unwrap();
+        engine
+            .execute_sql(xid, "INSERT INTO t (id, owner) VALUES (1, 'bob')")
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        // Confirm the index reached Ready before relying on it, so this
+        // test actually exercises the index-assisted path.
+        let start = std::time::Instant::now();
+        loop {
+            if engine.index_status("t", "id") == Some(index_worker::IndexStatus::Ready) {
+                break;
+            }
+            if start.elapsed() > std::time::Duration::from_secs(5) {
+                panic!("index never reached Ready within timeout");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        let policy = crate::sql::logical::Expr::BinOp {
+            op: crate::sql::logical::CmpOp::Eq,
+            lhs: Box::new(crate::sql::logical::Expr::Column("owner".to_string())),
+            rhs: Box::new(crate::sql::logical::Expr::Literal(
+                crate::sql::logical::Literal::Text("alice".to_string()),
+            )),
+        };
+        engine.set_rls_policy("t", policy).unwrap();
+
+        let xid2 = engine.begin().unwrap();
+        let result = engine
+            .execute_sql(xid2, "SELECT owner FROM t WHERE id = 1")
+            .unwrap();
+        match &result[0] {
+            SqlResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1, "RLS must filter out bob's row: {rows:?}");
+                assert_eq!(
+                    rows[0][0],
+                    crate::sql::logical::Literal::Text("alice".into())
+                );
+            }
             other => panic!("expected Rows, got {other:?}"),
         }
     }

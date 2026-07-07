@@ -92,15 +92,15 @@ fn convert_data_type(dt: &DataType) -> Result<ColumnType> {
     }
 }
 
-/// `CREATE INDEX ... ON table USING HNSW|FULLTEXT (column)`. Note `USING`
-/// comes *before* the column list — confirmed against `sqlparser`'s own
-/// `parse_create_index` (it only looks for an optional `USING` clause
+/// `CREATE INDEX ... ON table USING HNSW|FULLTEXT|BTREE (column)`. Note
+/// `USING` comes *before* the column list — confirmed against `sqlparser`'s
+/// own `parse_create_index` (it only looks for an optional `USING` clause
 /// immediately after the table name, not after the column list; a
 /// trailing-`USING` MySQL variant exists but isn't what this matches
-/// against). `HNSW`/`FULLTEXT` aren't built-in `sqlparser` index types, so
-/// they arrive as `IndexType::Custom` — matched case-insensitively, same
-/// pattern as `VECTOR(n)`'s `DataType::Custom` fallback. Exactly one
-/// column, matching M2's "no composite secondary indexes" scope.
+/// against). None of these are built-in `sqlparser` index types, so they
+/// arrive as `IndexType::Custom` — matched case-insensitively, same pattern
+/// as `VECTOR(n)`'s `DataType::Custom` fallback. Exactly one column,
+/// matching M2/M6's "no composite secondary indexes" scope.
 fn convert_create_index(ci: ast::CreateIndex) -> Result<LogicalPlan> {
     let table = ci.table_name.to_string();
     let kind = match &ci.using {
@@ -110,9 +110,14 @@ fn convert_create_index(ci: ast::CreateIndex) -> Result<LogicalPlan> {
         Some(IndexType::Custom(ident)) if ident.value.eq_ignore_ascii_case("fulltext") => {
             IndexKind::FullText
         }
+        // Unlike HNSW/FULLTEXT, `BTREE` is one of `sqlparser`'s own built-in
+        // `IndexType` variants (it's a real, common index type name across
+        // Postgres/MySQL) — it arrives as `IndexType::BTree` directly, not
+        // `IndexType::Custom`.
+        Some(IndexType::BTree) => IndexKind::BTree,
         other => {
             return Err(DbError::SqlUnsupported(format!(
-                "unsupported index type: {other:?} (expected USING HNSW or USING FULLTEXT)"
+                "unsupported index type: {other:?} (expected USING HNSW, FULLTEXT, or BTREE)"
             )))
         }
     };
@@ -592,8 +597,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_create_index_btree_case_insensitive() {
+        let plan = parse_one("CREATE INDEX idx ON t USING btree (id)");
+        match plan {
+            LogicalPlan::CreateIndex { column, kind, .. } => {
+                assert_eq!(column, "id");
+                assert_eq!(kind, IndexKind::BTree);
+            }
+            _ => panic!("expected CreateIndex"),
+        }
+    }
+
+    #[test]
     fn rejects_create_index_with_unsupported_using() {
-        let err = parse_sql("CREATE INDEX idx ON t USING BTREE (id)");
+        let err = parse_sql("CREATE INDEX idx ON t USING GIST (id)");
         assert!(matches!(err, Err(DbError::SqlUnsupported(_))));
     }
 

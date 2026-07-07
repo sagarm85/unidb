@@ -7,6 +7,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use tempfile::tempdir;
 use unidb::bufferpool::BufferPool;
+use unidb::csr_index::CsrIndex;
 use unidb::format::{DEFAULT_PAGE_SIZE, INVALID_LSN};
 use unidb::graph::edges::{edge_row, edges_table_def};
 use unidb::graph::index::resolve_candidates_batched;
@@ -71,6 +72,25 @@ fn bench_adjacency_scan(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::new("batched", n), &n, |b, _| {
             b.iter(|| resolve_candidates_batched(&ids, &snapshot, 2, &mut pool, &columns).unwrap());
+        });
+
+        // M7: CSR-backed candidate fetch + the same batched resolve/
+        // revalidate step the other two variants pay — isolates whether
+        // CSR's binary-search candidate lookup adds/removes anything
+        // measurable over EdgeIndex's O(1) HashMap lookup for this
+        // single-hop workload (expected: no meaningful difference, since
+        // the batched resolve step dominates either way — CSR's real
+        // value is future multi-hop traversal, not this shape).
+        let mut csr = CsrIndex::new();
+        for &id in &ids {
+            csr.stage(1, id);
+        }
+        csr.rebuild();
+        group.bench_with_input(BenchmarkId::new("csr", n), &n, |b, _| {
+            b.iter(|| {
+                let candidates = csr.candidates(1).to_vec();
+                resolve_candidates_batched(&candidates, &snapshot, 2, &mut pool, &columns).unwrap()
+            });
         });
     }
     group.finish();

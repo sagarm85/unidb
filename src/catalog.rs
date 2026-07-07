@@ -64,6 +64,15 @@ pub enum IndexKind {
     Hnsw,
     /// Only valid on `ColumnType::Text`.
     FullText,
+    /// Valid on `Int64`/`Text`/`Bool` — anything `Ord` (M6). Accelerates
+    /// equality/range `WHERE` predicates; see `sql/executor.rs::exec_select`.
+    BTree,
+    /// Engine-managed only (M7) — never set via `ColumnDef.index`/`CREATE
+    /// INDEX`; there is no SQL keyword for it. Exists purely so the CSR
+    /// graph adjacency index (`src/csr_index.rs`) can reuse `index_worker
+    /// .rs`'s generic `(table, column)`-keyed machinery for `__edges__`'s
+    /// `from_id` the same way a real column index would.
+    Csr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

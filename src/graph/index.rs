@@ -22,9 +22,12 @@ use crate::{
     error::Result,
     format::{PageId, Xid},
     heap::RowId,
+    index_worker::{IndexHandle, IndexStatus, SecondaryIndex},
     mvcc::{is_visible, Snapshot},
     sql::{executor::decode_row, logical::Literal},
 };
+
+use super::edges::EDGES_TABLE;
 
 #[derive(Default)]
 pub struct EdgeIndex {
@@ -60,6 +63,35 @@ impl EdgeIndex {
     pub fn is_empty(&self) -> bool {
         self.by_from.is_empty()
     }
+}
+
+/// Prefer the CSR graph index (M7) once `Ready`, falling back to
+/// `EdgeIndex` (always current, always available) otherwise. Correctness
+/// reasoning: CSR's async rebuild can only ever lag behind the most recent
+/// commits — that risks a *missed* very-recent edge (a false negative),
+/// never a phantom one, since every candidate this returns is still
+/// re-validated against MVCC visibility downstream regardless of which
+/// index sourced it (`resolve_candidates_batched`, below). That's the same
+/// staleness characteristic every other async secondary index in this
+/// codebase already has once `Ready` (HNSW/FullText/BTree can all lag
+/// slightly behind a just-committed write) — not a new risk class, so
+/// there's no reason to prefer the always-current `EdgeIndex` once CSR is
+/// available; simplicity wins over a "only use CSR above N candidates"
+/// heuristic that would need its own justification and tests.
+pub fn graph_candidates(
+    from_id: i64,
+    edge_index: &EdgeIndex,
+    index_worker: &IndexHandle,
+) -> Vec<RowId> {
+    if index_worker.status(EDGES_TABLE, "from_id") == Some(IndexStatus::Ready) {
+        let guard = index_worker.indexes.read().unwrap();
+        if let Some(entry) = guard.get(&(EDGES_TABLE.to_string(), "from_id".to_string())) {
+            if let SecondaryIndex::Csr(csr) = &entry.index {
+                return csr.candidates(from_id).to_vec();
+            }
+        }
+    }
+    edge_index.candidates(from_id).to_vec()
 }
 
 /// Resolve a batch of candidate `RowId`s to their decoded rows, filtered by

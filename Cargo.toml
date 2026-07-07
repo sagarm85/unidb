@@ -30,12 +30,14 @@ metrics-exporter-prometheus = { version = "0.18", optional = true, default-featu
 axum-prometheus = { version = "0.10", optional = true }
 async-stream = { version = "0.3", optional = true }
 futures-util = { version = "0.3", optional = true }
+tracing-appender = { version = "0.2", optional = true }
 
 [features]
 server = [
     "dep:tokio", "dep:axum", "dep:tower", "dep:tower-http",
     "dep:jsonwebtoken", "dep:metrics", "dep:metrics-exporter-prometheus",
     "dep:axum-prometheus", "dep:async-stream", "dep:futures-util",
+    "dep:tracing-appender",
 ]
 
 [dev-dependencies]
@@ -64,6 +66,10 @@ harness = false
 
 [[bench]]
 name = "queue"
+harness = false
+
+[[bench]]
+name = "btree"
 harness = false
 
 [[bench]]
