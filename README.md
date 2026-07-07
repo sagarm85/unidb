@@ -1,10 +1,10 @@
 # unidb
 
-A single embedded storage engine in Rust that unifies relational CRUD, vector search (HNSW), graph edges, and a WAL-derived event queue over one page store, one WAL, one buffer pool, and one transaction manager.
+A single embedded storage/transaction engine in Rust that unifies relational CRUD, vector search (HNSW), graph edges, and a WAL-derived event queue over one page store, one WAL, one buffer pool, and one transaction manager.
 
 The competitive edge is eliminating the multi-system dual-write tax. "Save row + embedding + graph edge + event" is one WAL append and one commit here, versus 3–4 network round-trips with no shared transaction across Postgres + a vector store + a graph DB + Kafka.
 
-**Current milestone: M0 — Storage core** (single-file page store, buffer pool, WAL, control file, crash recovery, durable single-table CRUD).
+**Status: M0–M5 all shipped.** Single-file storage core, MVCC transactions + SQL subset, vector/full-text search, a graph layer with a Cypher subset, a WAL-derived event queue, and an optional REST/JWT/SSE/metrics server are all implemented, tested, and benchmarked. See `PROGRESS.md` for milestone-by-milestone benchmark tables and `MEMORY.md` for current implementation state and known tech debt.
 
 ---
 
@@ -37,11 +37,14 @@ cargo build --release
 ## Run the test suite
 
 ```bash
-# All unit tests + integration tests
+# All unit tests + integration tests (embedded crate, default features)
 cargo test
 
 # Crash-injection harness only (D7 — 5 injection points)
 cargo test --test crash
+
+# Server tests (REST/JWT/SSE/metrics) — requires the `server` feature
+cargo test --features server
 
 # Run a specific test by name
 cargo test insert_and_get
@@ -57,18 +60,20 @@ RUST_LOG=debug cargo test -- --nocapture
 Benchmarks require a release build. Results are written to `target/criterion/`.
 
 ```bash
-cargo bench
+cargo bench                          # load/vector/graph/queue benches
+cargo bench --features server        # + server-overhead benches
 ```
 
-This runs three workloads against the engine and reports throughput (ops/s) and latency (p50/p99):
+| Bench file | Workload |
+|---|---|
+| `benches/load.rs` | Single-table INSERT/SELECT/UPDATE + transactional contention |
+| `benches/vector.rs` | Vector INSERT/NEAR vs. Postgres+pgvector |
+| `benches/graph.rs` | Edge CRUD + adjacency-scan batch-latching |
+| `benches/queue.rs` | Event capture/poll/ack vs. Postgres `FOR UPDATE SKIP LOCKED` |
+| `benches/server.rs` | HTTP+writer-thread overhead, JWT verification, SSE polling, concurrent throughput ceiling |
 
-| Workload | Description |
-|----------|-------------|
-| `insert` | Single-table INSERT at 100 / 1 000 / 10 000 rows |
-| `select_point` | Point GET by RowId |
-| `update_in_place` | In-place UPDATE by RowId |
-
-Open `target/criterion/report/index.html` to view the HTML report.
+Full metrics tables for every milestone are in `PROGRESS.md`. Open
+`target/criterion/report/index.html` for the HTML report.
 
 ---
 
@@ -98,18 +103,33 @@ use unidb::Engine;
 let mut engine = Engine::open(std::path::Path::new("./mydb"), 0)?;
 //                                                              ^ 0 = use default 8 KiB page size
 
-// Insert a row — returns a stable RowId.
-let row_id = engine.insert(b"hello world")?;
+// Everything runs under an explicit MVCC transaction (M1+).
+let xid = engine.begin()?; // default isolation: READ COMMITTED (D10)
+// engine.begin_with_isolation(IsolationLevel::RepeatableRead)? for SI
 
-// Read it back.
-let data = engine.get(row_id)?;
-assert_eq!(data, b"hello world");
+// SQL: relational, vector, and graph-adjacent DDL/DML all go through one
+// execute_sql call; a `;`-separated body runs atomically under one xid.
+engine.execute_sql(
+    xid,
+    "CREATE TABLE docs (id INT, body TEXT, embedding VECTOR(3))",
+)?;
+engine.execute_sql(
+    xid,
+    "INSERT INTO docs (id, body, embedding) VALUES (1, 'hello', [0.1, 0.2, 0.3])",
+)?;
 
-// Update in-place (new payload must fit in existing slot for M0).
-engine.update(row_id, b"updated")?;
+// Graph edges and Cypher share the same transaction/WAL.
+let row_id = engine.create_edge(xid, 1, 2, "LINKS_TO", "{}")?;
+engine.execute_cypher(xid, "MATCH (a)-[:LINKS_TO]->(b) WHERE a.id = 1 RETURN b.id")?;
 
-// Delete.
-engine.delete(row_id)?;
+engine.commit(xid)?;
+
+// Raw row CRUD (bypasses SQL) is still available directly on Engine.
+let xid = engine.begin()?;
+let raw_id = engine.insert(xid, b"raw bytes")?;
+let data = engine.get(xid, raw_id)?;
+assert_eq!(data, b"raw bytes");
+engine.commit(xid)?;
 
 // Checkpoint: flush dirty pages + write checkpoint WAL record + truncate WAL.
 engine.checkpoint()?;
@@ -120,6 +140,25 @@ Add to `Cargo.toml`:
 ```toml
 [dependencies]
 unidb = { path = "../unidb" }
+```
+
+### Run the REST server (optional, `server` feature)
+
+```bash
+UNIDB_JWT_SECRET=dev-secret \
+UNIDB_DATA_DIR=./unidb-data \
+UNIDB_BIND_ADDR=127.0.0.1:8080 \
+cargo run --bin unidb-server --features server
+```
+
+Full route reference (payloads, responses, error codes, auth model) is in
+[`Doc/REST_API.md`](Doc/REST_API.md). Quick smoke test:
+
+```bash
+TOKEN=$(python3 -c "import jwt,time; print(jwt.encode({'sub':'dev','exp':int(time.time())+3600}, 'dev-secret', algorithm='HS256'))")
+curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8080/sql \
+  -d '{"sql":"CREATE TABLE t (id INT)"}'
+curl http://127.0.0.1:8080/metrics   # no auth required
 ```
 
 ### Tracing / structured logging
@@ -142,35 +181,54 @@ RUST_LOG=trace ./myapp   # every WAL record written
 
 ```
 src/
-  format.rs      — magic number, version, constants, little-endian helpers
-  error.rs       — DbError enum + Result alias
-  control.rs     — control file (single source of recovery truth)
-  mmap.rs        — sole unsafe module: memory-mapped file wrapper
-  page.rs        — slotted-page layout, tuple header, CRC32 on every read
-  bufferpool.rs  — fixed frames, clock eviction, WAL-before-page invariant (D5)
-  wal.rs         — append-only log, redo+undo payloads, mini-transaction bracketing
-  heap.rs        — single-table heap: insert / get / update / delete
-  checkpoint.rs  — flush dirty pages → checkpoint record → truncate WAL
-  recovery.rs    — ARIES-style redo + undo on open
-  lib.rs         — Engine public API, init_tracing()
+  format.rs        — magic number, version, constants, little-endian helpers
+  error.rs         — DbError enum + Result alias
+  control.rs       — control file (single source of recovery truth; holds next_xid too)
+  mmap.rs          — sole unsafe module: memory-mapped file wrapper
+  page.rs          — slotted-page layout, tuple header (xmin/xmax), CRC32 on every read
+  bufferpool.rs    — fixed frames, clock eviction, WAL-before-page invariant (D5)
+  wal.rs           — append-only log, redo+undo payloads, mini-transaction bracketing
+  heap.rs          — MVCC-versioned heap: insert / get / update / delete
+  mvcc.rs          — snapshot visibility rules (RC / RR)
+  txn.rs           — transaction manager: begin/commit/abort, xid allocation
+  lockmgr.rs       — lock manager keyed by (record_kind, record_id), SI abort-on-conflict
+  concurrency_hooks.rs — on_read/on_write seam (no-op today, SSI landing point later)
+  catalog.rs       — table/column/index definitions, RLS policies, serde_json-persisted
+  sql/             — parser.rs, logical.rs (plan + RLS rewrite), executor.rs
+  vector.rs        — HNSW wrapper (instant-distance) for VECTOR(n) columns
+  fulltext.rs      — inverted index for full-text search
+  index_worker.rs  — background thread building HNSW/full-text indexes asynchronously
+  graph/           — edges.rs, index.rs, logical.rs, parser.rs, executor.rs (Cypher subset)
+  queue/           — mod.rs (event capture, poll/ack/vacuum), payload.rs
+  checkpoint.rs    — flush dirty pages → checkpoint record (+ next_xid) → truncate WAL
+  recovery.rs      — ARIES-style redo + undo on open
+  server/          — optional REST/JWT/SSE/metrics server (feature = "server")
+  bin/unidb-server.rs — the server binary (required-features = ["server"])
+  lib.rs           — Engine public API, init_tracing()
 tests/
-  crash/         — crash-injection harness (5 injection points)
+  crash/           — crash-injection harness (5+ injection points)
+  server_*.rs      — REST server integration tests (feature = "server")
+  graph_*.rs, vector_mvcc.rs, queue_*.rs, index_rebuild.rs — per-milestone integration tests
 benches/
-  load.rs        — throughput + latency benchmarks (criterion)
+  load.rs, vector.rs, graph.rs, queue.rs, server.rs — criterion benchmarks per milestone
+Doc/
+  REST_API.md      — full HTTP route reference (payloads, responses, error codes)
 ```
 
 ---
 
 ## Milestone roadmap
 
+All milestones below are **shipped, tested, and benchmarked**. Metrics tables are in `PROGRESS.md`; current implementation state and known tech debt are in `MEMORY.md`.
+
 | Milestone | Status | Summary |
 |-----------|--------|---------|
-| **M0 — Storage core** | in progress | Single-file page store, buffer pool, WAL, control file, crash recovery, single-table CRUD |
-| M1 — MVCC + CRUD | planned | Transactions, READ COMMITTED / REPEATABLE READ, SQL subset, JSON columns, RLS |
-| M2 — Vector & Text search | planned | `VECTOR(n)` type, async HNSW index, `NEAR` operator, full-text inverted index |
-| M3 — Graph | planned | Edge records, edge-list index, Cypher subset |
-| M4 — Event queue | planned | WAL-derived stream, durable consumer offsets, replay |
-| M5 — API / server | planned | Optional REST server + JWT auth + subscribe + `/metrics` |
+| M0 — Storage core | done | Single-file page store, buffer pool, WAL, control file, crash recovery, single-table CRUD |
+| M1 — MVCC + CRUD | done | Transactions, READ COMMITTED / REPEATABLE READ, SQL subset, JSON columns, RLS |
+| M2 — Vector & Text search | done | `VECTOR(n)` type, async HNSW index, `NEAR` operator, full-text inverted index |
+| M3 — Graph | done | Edge records, edge-list index, Cypher subset |
+| M4 — Event queue | done | WAL-derived stream, durable consumer offsets, `vacuum_events` |
+| M5 — API / server | done | Optional REST server (`Doc/REST_API.md`) + verify-only JWT auth + SSE subscribe + `/metrics` |
 
 ---
 
@@ -180,7 +238,7 @@ benches/
 |----|----------|
 | D1 | Buffer policy: steal + no-force, ARIES-style (both redo and undo logging) |
 | D2 | Atomic unit is a mini-transaction (WAL-bracketed group of page writes) |
-| D3 | Control file holds magic, version, page_size, checkpoint LSN, WAL tail |
+| D3 | Control file holds magic, version, page_size, checkpoint LSN, WAL tail, next_xid |
 | D4 | Tuple header reserves xmin/xmax now; in-place UPDATE in M0, MVCC in M1 |
 | D5 | WAL-before-page invariant: no dirty page flushed while page.LSN > durable WAL LSN |
 | D6 | Single-file storage for M0 (WAL may be a separate file) |
