@@ -1,0 +1,651 @@
+# unidb Engine Design — M0 through M7
+
+> Consolidated design document for the engine as shipped through M7
+> (2026-07-07). Distilled from `CLAUDE.md` (locked decisions D1–D13),
+> `MEMORY.md` (per-checkpoint design notes), `PROGRESS.md` (milestone
+> entries + measured benchmarks), and the module doc comments in `src/`.
+> M8 (attach client) will be appended as its own section once it ships.
+>
+> Rules of the road: locked decisions live in `CLAUDE.md` §3 and require
+> human sign-off to change; this document *describes*, it does not
+> *authorize*.
+
+---
+
+## 1. Overview & design thesis
+
+unidb is a single embedded storage/transaction engine in Rust that unifies
+four data models over **one page store, one WAL, one buffer pool, one
+transaction manager**:
+
+1. **Relational CRUD** — SQL subset over MVCC-versioned heap tables.
+2. **Vector search** — `VECTOR(n)` columns, HNSW index, `NEAR` operator.
+3. **Graph** — edges with a Cypher read subset, adjacency indexes.
+4. **Event queue** — durable event stream with Kafka-style consumer offsets.
+
+A single transaction can touch all four atomically because there is one
+node and one log. That is the competitive thesis: **eliminating the
+multi-system dual-write tax**. "Save row + embedding + graph edge + event"
+is one WAL append and one commit here, versus 3–4 network round-trips with
+no shared transaction for Postgres + vector store + graph DB + Kafka.
+
+**Explicit non-goals** (CLAUDE.md §1): no distributed consensus
+(single-primary only), not full ANSI SQL (practical subset), no cloud
+control plane. On single-model benchmarks against a specialized incumbent
+the engine is expected to lose, and that is accepted — the benchmark that
+matters is the cross-domain transactional workload against the replaced
+stack (§10 below records what has actually been measured so far).
+
+---
+
+## 2. Architecture layer stack
+
+```
+API layer (M5)                REST + JWT(verify-only) + SSE + /metrics; embedded crate is primary
+Query & execution (M1+)       SQL parser -> logical plan -> executor; Cypher subset (M3)
+Logical record layer (M1+)    rows / vector records / graph edges / queue events
+Transaction & concurrency     MVCC snapshots; write-write lock manager (abort-on-conflict)
+Storage layer (M0)            single-file paged store; buffer pool; WAL; control file; recovery
+```
+
+Module map (what each layer became in code):
+
+| Layer | Modules |
+|---|---|
+| Storage core (M0) | `format.rs`, `control.rs`, `mmap.rs`, `page.rs`, `bufferpool.rs`, `wal.rs`, `heap.rs`, `checkpoint.rs`, `recovery.rs` |
+| Transactions (M1) | `mvcc.rs`, `txn.rs`, `lockmgr.rs`, `concurrency_hooks.rs` |
+| Catalog & SQL (M1) | `catalog.rs`, `sql/{parser,logical,executor}.rs` |
+| Secondary indexes (M2, M6, M7) | `index_worker.rs`, `vector.rs`, `fulltext.rs`, `btree_index.rs`, `csr_index.rs` |
+| Graph (M3, M7) | `graph/{edges,index,logical,parser,executor}.rs` |
+| Event queue (M4) | `queue/{mod,payload}.rs` |
+| Server (M5, feature-gated) | `server/{engine_handle,error,dto,handlers,router,auth,sse}.rs`, `bin/unidb-server.rs` |
+| Engine facade | `lib.rs` (`Engine` — the sole entry point) |
+
+Two invariants shape everything above the storage layer:
+
+- **The engine is synchronous and single-threaded by design.** The only
+  background threads are the secondary-index worker (M2) and, when the
+  `server` feature is on, the server's writer thread (M5) — and the writer
+  thread *owns* the `Engine`, it does not share it. A default build has
+  zero async dependencies (verified via
+  `cargo tree --no-default-features --edges normal`).
+- **Every operation takes an explicit `Xid`** from `Engine::begin` /
+  `begin_with_isolation` and ends with `commit`/`abort`. There is no
+  implicit transaction anywhere in the crate.
+
+---
+
+## 3. Storage core (M0)
+
+### 3.1 On-disk format (D6, D8, D9)
+
+- **Single data file** of fixed-size pages; the WAL is a separate file.
+  Multi-file storage was deliberately rejected for now (D6) — it forces
+  per-file LSN tracking into recovery for benefits (file placement,
+  parallel backup) not yet needed.
+- **Page size 8 KiB** by default, config-overridable at init only, baked
+  into the control file (D8). Not changeable after files exist.
+- **Everything on disk is little-endian** (D9). Every page carries a CRC32
+  checksum and an LSN. No `serde` on the page/WAL hot path — page and WAL
+  records are hand-rolled / `zerocopy`-style byte encodings for exact byte
+  control (`serde_json` is used only for control-plane data; see §4.6).
+- `FORMAT_VERSION` is currently **3**: v1→v2 for M1's tuple-header
+  extension, v2→v3 for the `next_xid` control-file field (§4.7). No
+  migration paths — no earlier version ever shipped externally.
+- Pages use a **slotted-page** layout; tuples carry a 24-byte header with
+  `xmin`/`xmax`/`prev_page`/`prev_slot` (reserved in M0 per D4, in active
+  MVCC use since M1).
+- `mmap.rs` (a thin `memmap2` wrapper) is the **only** module allowed
+  `unsafe`; the rest of the crate denies it.
+
+### 3.2 Control file (D3)
+
+The recovery root — unidb's `pg_control`. 44 bytes: magic, format version,
+`page_size`, last-checkpoint LSN, WAL tail pointer, `catalog_root` (page id
+of the current catalog blob, M1), `next_xid` (bytes `[32..40]`, added in
+the v3 bump), CRC32 (`[40..44]`). Created at DB init; **recovery always
+starts here** — it is the single source of recovery truth.
+
+### 3.3 WAL & mini-transactions (D1, D2, D5)
+
+- **Buffer policy is steal + no-force, ARIES-style (D1)** — so the WAL
+  carries both **redo and undo** information per record.
+- **The atomic unit for a single statement is a mini-transaction (D2)**: a
+  WAL-bracketed group of page writes (begin/commit records) that redo/undo
+  treat as one. Every statement — including each statement inside a larger
+  user transaction — is its own mini-txn with its own commit fsync. (This
+  is the single largest measured performance cost in the engine; see §10.)
+- WAL records use length-prefix framing (`u32` LE) plus a per-record CRC32;
+  a recovery scan stops cleanly at the first corrupt/truncated record.
+- **D5 — the invariant that must never break**: a dirty page may not be
+  flushed or evicted while `page.LSN > durable_WAL_LSN`. Enforced in
+  exactly two places: `bufferpool.rs::flush_page()` and the clock
+  eviction's `find_victim()` path. This is a tested invariant (debug
+  assertions + crash harness), not folklore.
+- User transactions (M1) add `WAL_TXN_BEGIN`/`COMMIT`/`ABORT` record types
+  sharing the mini-txn wire format — the `mini_txn_id` u64 slot doubles as
+  the `Xid`. Mini-txn ids and xids are two independent ID spaces on one
+  format.
+
+### 3.4 Buffer pool
+
+Fixed capacity of **256 frames** (`POOL_CAPACITY` in `lib.rs`), pin/unpin,
+clock eviction, dirty tracking, D5 enforcement on flush/evict.
+`fetch_page` returns a per-call page copy — cheap for point access,
+measurably expensive for hot-hub scans, which is what motivated the graph
+layer's batch-latch optimization (§7.2). A real scaling limit was
+discovered in M6: tables growing into the hundreds of pages can exhaust
+the pool (`DbError::BufferPoolFull`) even with small individually-committed
+transactions — tracked tech debt (§11), interacting with the linear-scan
+FSM.
+
+### 3.5 Checkpoint & recovery
+
+`checkpoint::run`: flush all dirty pages → write a checkpoint WAL record →
+persist control file (checkpoint LSN, WAL tail, `catalog_root`,
+`next_xid` captured *before* truncation) → truncate the WAL before the
+checkpoint LSN (currently by rewriting the whole file — tracked debt).
+
+`recovery.rs` on open: read control file → **redo** from the checkpoint
+LSN → **undo** incomplete mini-txns → undo incomplete *user* transactions.
+The user-txn undo pass reconstructs write ownership by decoding
+`xmin`/`xmax` straight out of the WAL's redo bytes (no in-memory state
+survives a crash), in two phases: revert xmax-stamps first, then
+force-self-stamp inserts last — so a row both inserted and superseded by
+the same aborted transaction ends up dead, not revived. The pass is
+idempotent, which is what makes crash-*during*-abort safe.
+
+### 3.6 Crash-injection harness (D7)
+
+`tests/crash/main.rs` — kill at defined points, reopen, assert the
+recovered state equals the expected committed set. Points P1–P5 (M0:
+post-WAL/pre-flush, mid-checkpoint, post-mutation/pre-commit, during WAL
+truncation, post-commit-fsync), P6/P7 (M1: user-txn boundaries), P9 (M1:
+crash mid-undo of an aborting transaction), plus a property test running
+random `BEGIN`/`INSERT`/`COMMIT`/`ROLLBACK` sequences with random crash
+points — recovered state must be exactly the set of transactions that
+reached `WAL_TXN_COMMIT`. 11 crash tests as of M7. Deliberately *not* a
+deterministic simulator (no TigerBeetle/FoundationDB-grade sim).
+
+Later milestones added **zero** new crash points — a deliberate pattern:
+edges, events, and consumer offsets are all ordinary WAL-backed heap rows
+covered by the existing machinery, and every secondary index is derived,
+rebuildable, WAL-free state whose loss on crash is expected (§9).
+
+---
+
+## 4. Transactions & MVCC (M1)
+
+### 4.1 Visibility
+
+`mvcc.rs` holds pure snapshot logic: a `Snapshot` (active-xid set + range)
+and `is_visible(tuple, snapshot)`. There is deliberately **no "aborted"
+state** in visibility: `is_committed_at_snapshot` treats
+not-in-active-set-and-in-range as committed. Abort therefore requires
+**physical undo** (§4.3).
+
+### 4.2 Isolation levels (D10, D12)
+
+- **READ COMMITTED** (default) and **REPEATABLE READ** (= snapshot
+  isolation) differ *only* in snapshot lifetime: per-statement vs
+  per-transaction. Same MVCC machinery.
+- **Conflict handling is SI's abort-on-conflict path (D12)**: a
+  write-write conflict aborts the second writer immediately — no blocking,
+  no wait queue, no deadlock detection (deliberately). RC's
+  EvalPlanQual-style re-evaluation path is designed but **unimplemented**;
+  UPDATE/DELETE conflicts surface as `WriteConflict` at every isolation
+  level (tracked gap, §11).
+- **The `on_read()`/`on_write()` seam (D11)** exists in every scan and
+  lookup path (`concurrency_hooks.rs`), all no-ops — so a future
+  SERIALIZABLE/SSI is an *addition* (read-set tracking behind the seam),
+  not an executor rewrite.
+
+### 4.3 Writes, locks, abort
+
+- `Heap` insert/update/delete write MVCC versions: UPDATE always creates a
+  new `RowId` and stamps the old version's `xmax` (never in-place);
+  `prev_page`/`prev_slot` record version history for recovery/vacuum
+  bookkeeping only — **readers never walk the chain**. There is **no
+  cross-statement `RowId` stability**: callers must use returned `RowId`s
+  or re-scan; `Heap::get` does a single direct visibility check.
+- `lockmgr.rs`: write-write locks only (no read locks under MVCC), keyed
+  by `RecordId::row(page_id, slot)` packed into a u64. Because `PageId` is
+  allocated from one global `BufferPool` counter (not per-table), lock keys
+  are globally unique across all tables — this is why graph edges (M3)
+  needed zero new locking code. Locks are held for the whole transaction,
+  released only at commit/abort — which is also why no separate
+  "commit-time recheck" is needed: there is no window between write and
+  commit for another writer to slip through. `Heap::update`/`delete` run
+  two checks that together are the complete conflict detection: (1)
+  `try_acquire_write` catches a *currently active* competing xid;
+  (2) the `xmax != 0` check catches a row superseded by a since-committed
+  transaction. Both return `WriteConflict` by design.
+- **Abort = physical self-neutralization**: self-stamp `xmax := own xmin`
+  on every tuple the transaction inserted, revert every xmax-stamp it
+  applied, driven by an in-memory `Vec<UndoAction>` per transaction.
+  `Heap` never records undo itself — every call site pairs the heap call
+  with an explicit `txn_mgr.record_undo(...)`, which is what let later
+  milestones (edges, events) inherit correct abort behavior with zero new
+  abort-path code. The corresponding risk (a forgotten `record_undo` is a
+  *silent* visibility bug) is guarded by per-feature abort-visibility
+  tests (§9).
+
+### 4.4 Transaction manager
+
+`txn.rs`: begin/commit/abort, RC-vs-RR snapshot lifetime, lock release,
+xid issuance. `commit()` currently fsyncs unconditionally — **including
+for read-only transactions**, the single most visible latency bug in the
+benchmarks (point SELECT went 855 ns in M0 → 3.05 ms in M1 from this one
+fsync). Known, fix identified, deliberately not slipped in as a drive-by
+(§11).
+
+### 4.5 The xid-reuse-after-checkpoint bug (fixed, control file v3)
+
+`recover_next_xid` resumed the xid counter by scanning the WAL for
+`WAL_TXN_BEGIN` — correct only while those records still exist, but
+checkpointing truncates them, so the first open after any checkpoint
+silently reset the counter to 1. **Silent-corruption class**: a reissued
+xid can collide with `xmin`/`xmax` values on existing tuples, producing
+wrong query results with no error. Found by manually smoke-testing M5's
+REST server (the first code path ever to combine commit → `checkpoint()`
+→ reopen). Fix: persist `next_xid` in the control file at every
+checkpoint (captured before truncation); `Engine::open` resumes at
+`max(WAL-scan, control.next_xid)`. D3/D9 change with explicit human
+sign-off, recorded in `PROGRESS.md`.
+
+### 4.6 Catalog
+
+`catalog.rs`: `TableDef`/`ColumnDef`/`ColumnType`
+(`Int64`/`Text`/`Bool`/`Json`/`Vector(n)`), persisted as a single
+`serde_json` blob rewritten to a fresh page on every change, pointed at by
+`control.catalog_root`. Using `serde` here is deliberate — schema is
+infrequent control-plane data, not the hot path D9 protects.
+`TableDef.pages: Vec<PageId>` persists each table's page list; the
+executor reconstructs a `Heap` handle per statement via
+`Heap::from_pages` (cheap; avoids a cache-invalidation story).
+
+**Catalog is not MVCC-versioned**: DDL takes effect immediately and
+globally; `CREATE TABLE` inside a transaction that later aborts is *not*
+rolled back. A real, narrow, tracked correctness gap (§11). Each catalog
+rewrite also leaves the previous blob's page behind (same
+no-vacuum story as the heap).
+
+### 4.7 SQL subset
+
+`sql/parser.rs` wraps `sqlparser` 0.62 (`GenericDialect`) into a
+`LogicalPlan`; `sql/executor.rs` executes row-at-a-time (no separate
+physical-plan IR — the grammar maps 1:1). Supported: `CREATE TABLE`,
+`INSERT`, `SELECT` (star/named projection, **AND-only** `WHERE`),
+`UPDATE`, `DELETE`, `CREATE INDEX ... USING HNSW|FULLTEXT|BTREE` (the
+`USING` clause precedes the column list — a `sqlparser` grammar fact),
+`NEAR(column, [..], k)` inside `WHERE`. JSON columns support `->`/`->>`
+(note: they bind looser than `=` under `GenericDialect`; parens required).
+Not supported (deliberate scope, parked in
+`docs/backlog/phase2_sql_capability_expansion.md`): `OR`, `ORDER BY`,
+`LIMIT`, aggregates, joins, subqueries, `IN (...)`.
+
+**RLS is a planner rewrite**: `apply_rls` ANDs the stored policy predicate
+onto `Select.predicate`. That one function is the whole mechanism; it
+composes for free with `NEAR` and index-assisted paths because they all
+filter through the same `predicate_matches`. RLS is Rust-API-only
+(`set_rls_policy`) — no SQL or REST surface, since `Expr` has no untrusted
+serialization design.
+
+Row encoding is hand-rolled tag+value per column (that *is* the hot path);
+tag 5 = `Vector`: `[dim: u32 LE][f32 LE × dim]` — dimension-prefixed so
+`decode_row` can cross-check against the schema. Vector dimension is
+validated in three independent places (DDL, INSERT/UPDATE coercion, every
+decode), each guarding a different failure mode.
+
+---
+
+## 5. Secondary indexing framework (M2 + M6)
+
+### 5.1 The async index worker
+
+`index_worker.rs` — the engine's first background thread. It owns exactly
+one thing: `Arc<RwLock<HashMap<(table, column), IndexEntry>>>`, built
+purely from `IndexMsg` channel messages. **It never receives a
+`BufferPool`, `Wal`, or `Heap` handle** — the load-bearing isolation
+decision. Two flows share one FIFO channel:
+
+- **Rebuild-on-open**: `Engine::open` runs an ordinary read-only MVCC scan
+  of committed rows, sends one `Upsert` per indexed value, then one
+  `MarkReady` per column. FIFO ordering is what makes
+  `IndexStatus::Building` → `Ready` meaningful. (`MarkReady` on a
+  never-upserted column creates an empty *Ready* entry — a real stuck-in-
+  `Building` bug found and regression-tested in M2.d.)
+- **Live upserts**: the SQL executor sends per-row messages from
+  `exec_insert`/`exec_update` for indexed columns only — zero cost for
+  unindexed tables. "Row write is the only synchronous cost" (with the
+  honest asterisk that the worker's CPU isn't free; §10).
+
+`CREATE INDEX` validates kind-vs-column-type, persists via
+`Catalog::set_column_index`, and backfills committed rows immediately;
+the shared `build_indexed_columns` is the single place mapping
+`ColumnType`/`IndexKind` → indexed value, used by DDL backfill, live
+upserts, and rebuild-on-open alike.
+
+### 5.2 Index kinds
+
+| Kind | Structure | Notes |
+|---|---|---|
+| `Hnsw` (M2) | `vector.rs` wrapping `instant-distance` | **No incremental insert exists in the crate's public API** (verified against vendored source), so `VectorIndex` buffers all points and rebuilds the whole graph per upsert — O(n log n) per insert, off the foreground thread but real CPU (§10, §11). f32, Euclidean (pgvector `<->` convention). |
+| `FullText` (M2) | `fulltext.rs` `InvertedIndex` | Whitespace+lowercase tokens, AND-only multi-term intersection. **No SQL query surface** — only the Rust API; `NEAR` is vector-only. |
+| `BTree` (M6) | `btree_index.rs`, `std::BTreeMap<OrderedValue, Vec<RowId>>` + `by_id: HashMap<RowId, OrderedValue>` | The `by_id` reverse map is what lets `upsert` remove a stale value-bucket entry — new bookkeeping the value-keyed structure needs that the id-keyed M2 indexes didn't. Zero new dependencies. |
+| `Csr` (M7) | `csr_index.rs` | **Engine-managed only** — no SQL surface; registered as `("__edges__", "from_id")` purely to reuse the worker machinery. See §7.3. |
+
+### 5.3 Query execution against indexes
+
+Both index-assisted paths use the same **resolve-then-refilter template**:
+index → candidate `RowId`s → `Heap::get` under the caller's snapshot
+(drops `NoVisibleVersion`) → full `predicate_matches` (so remaining AND
+terms + RLS apply identically to a full scan).
+
+- **`NEAR` (M2.d)**: over-fetch `max(4k, k+20)` candidates, then filter.
+  Requires an HNSW index (clear `SqlPlan` error otherwise — no silent
+  full-scan fallback, because approximate top-k has no correct fallback).
+  An index still `Building` yields a *partial* (never wrong) result set —
+  acceptable for inherently approximate top-k.
+- **B-Tree (M6.b)**: `find_indexable_btree_predicate` detects a top-level
+  or AND'd `Column <op> Literal` on a BTree-indexed column. **Correctness-
+  critical difference from `NEAR`**: the index is only trusted once
+  `Ready` — an equality/range query silently missing rows during backfill
+  would be a real bug — so anything short of `Ready` falls back to the
+  unchanged full scan. First indexable term wins; there is no cost-based
+  selection (§11).
+
+---
+
+## 6. Event queue (M4)
+
+### 6.1 Why not tail the WAL
+
+The obvious design — a consumer tailing the live WAL — is a dead end for
+two independent, source-verified reasons: (1) `checkpoint::run` truncates
+the WAL unconditionally, with no reader registry, and making WAL retention
+depend on external readers would be D5-adjacent bad news; (2) WAL records
+carry no table identifier (only `page_id`/`slot`), so a raw-WAL consumer
+couldn't even tell whose row it's reading.
+
+### 6.2 The actual design: events are ordinary rows
+
+`send_event_capture` (SQL executor) copies each triggering row into a
+durable `__events__` heap table **inline, at write time, under the writing
+transaction's own xid** — the same "just an ordinary system table" trick
+as `__edges__`. Consequences, all structural rather than promised:
+
+- WAL truncation *cannot* care about consumer lag — the event no longer
+  lives only in the WAL. Proven by a test that checkpoints five times
+  under a never-acking consumer and still polls every event.
+- Events get MVCC, WAL durability, abort semantics, and
+  `SELECT * FROM __events__` queryability for free. An aborted
+  transaction's events vanish with it (the capture is inline under the
+  same xid — a commit-time hook was explicitly rejected because it creates
+  a window where event and data-commit can disagree).
+- Consumer offsets live in `__consumers__`, updated by `ack_events` under
+  the caller's transaction — an aborted ack does not advance the offset
+  (tested).
+
+`poll_events`/`ack_events` are Kafka-style manual-commit;
+`vacuum_events()` reclaims rows acknowledged by **every** registered
+consumer (`min(offsets)`), and is the only current lever bounding
+`poll_events`'s cost, which scales linearly with `__events__`'s total size
+(no predicate pushdown / no `seq` index yet — measured, §10). Nothing
+calls vacuum automatically.
+
+---
+
+## 7. Graph (M3 + M7)
+
+### 7.1 Edges are ordinary rows
+
+Edge records `(from_id, to_id, edge_type, props)` live in a synthetic
+`__edges__` system table. The headline M3 finding: this needed **zero new
+storage-layer or locking code** — lock keys are already globally unique
+across tables (§4.3), so per-edge locking, first-committer-wins, and
+release-on-commit/abort were all inherited and then proven by
+`tests/graph_locking.rs` rather than assumed. Nodes are opaque `i64` IDs
+— no labels, no property-graph joins (rejected at parse time, not
+mis-parsed).
+
+### 7.2 Read path: EdgeIndex + batch-latch resolution
+
+`EdgeIndex` (by `from_id`) is maintained **synchronously** inside
+`create_edge`/`delete_edge` — always current the instant a call returns.
+It has no abort-time cleanup; stale entries are permanently safe because
+every candidate is re-validated against the caller's snapshot (§9).
+
+`resolve_candidates_batched` groups candidate `RowId`s by `page_id` so a
+hot hub costs one `fetch_page` per page instead of one per edge (~128
+edges/page): measured ~9.3–9.7x over naive resolution, and it closes
+almost the whole read-side gap with Postgres (94.3 µs vs 98 µs at 1k
+edges; 930 µs vs 568 µs at 10k).
+
+### 7.3 CSR index (M7)
+
+A read-optimized adjacency structure built asynchronously on the existing
+index worker, sitting **alongside — never replacing —** the synchronous
+`EdgeIndex`. `CsrIndex` splits `stage()` (append to a raw `Vec`) from
+`rebuild()` (recompute sorted `from_ids_sorted`/`row_ptr`/`col_ind` — the
+classic CSR arrays, O(n log n), not incrementally patchable). Unlike
+HNSW's rebuild-per-upsert, CSR's rebuild is **debounced**: the worker
+drains every queued message via `try_recv()` before one `rebuild_dirty`
+pass, coalescing write bursts (tested: 200 messages → far fewer rebuilds).
+
+Tier selection (`graph::index::graph_candidates`, used by `edges_from` and
+Cypher): **prefer CSR once `Ready`, otherwise EdgeIndex**. Safe because
+CSR's async lag can only cause a *false negative* (missed very-recent
+edge), never a phantom — MVCC re-validation downstream catches everything
+else, the same staleness contract every async index already has.
+`delete_edge` sends no CSR message; deletion is implicit via MVCC
+filtering.
+
+Measured result, reported plainly: CSR is at **parity** with
+EdgeIndex+batched-resolve on today's single-hop workloads — batched page
+resolution dominates, and binary search ≈ HashMap lookup at that point.
+CSR's real payoff (cache-friendly contiguous adjacency for multi-hop
+traversal) is headroom Cypher can't exercise yet.
+
+### 7.4 Cypher subset
+
+`MATCH (a)-[:TYPE]->(b) WHERE ... RETURN ...` — exactly one fixed-length
+directed hop, read-only (no `CREATE`/`DELETE`; mutations are Rust-API
+`create_edge`/`delete_edge`). The `:TYPE` filter and `WHERE` predicate are
+AND'd into one predicate applied through the SQL layer's own
+`predicate_matches`/`eval_expr` (promoted to `pub(crate)` — the only SQL
+change M3 needed), so index fast path and full-scan fallback filter
+identically. `ExecCtx` stays graph-free; graph state is passed as extra
+arguments (Rust's disjoint field borrows make this clean).
+
+---
+
+## 8. Server (M5)
+
+Everything server-side is behind the `server` Cargo feature; a default
+build has zero tokio/axum/jsonwebtoken in its dependency graph — "the
+engine stays sync" is literally true for the shipped artifact.
+
+**The core decision: async handlers never touch `Engine`.** One dedicated
+OS thread (`server/engine_handle.rs`) owns the `Engine` for its whole
+life; handlers send typed requests over an mpsc channel and await a
+per-request oneshot reply. Chosen over `Mutex<Engine>` to preserve the
+engine's real invariant (single-thread ownership) instead of imposing a
+"never `.await` while holding the lock" discipline on every future call
+site. `EngineHandle::spawn` opens the `Engine` synchronously on the
+caller's thread so open failures surface as an immediate `Err`.
+
+Surface (see `docs/REST_API.md` for contracts): `POST /sql` (atomic
+`;`-separated multi-statement transactions — free, since `execute_sql`
+already runs a whole string under one xid), `POST /cypher`, raw row CRUD
+(`/rows...`), graph routes (`/edges...`), indexing
+(`POST /indexes`, status), events (`POST /tables/{t}/events`,
+`GET /events/subscribe` SSE, `POST /events/ack`), `POST /checkpoint`,
+`GET /metrics` (Prometheus), `POST /txn/begin` (introspection only — no
+multi-request transaction sessions exist). Auth is **verify-only JWT**
+(HS256 Bearer; the server never issues tokens, has no user store). SSE is
+**server-polls-then-pushes** (`poll_events` has no wake primitive), which
+is why subscriber cost scales badly (§10). No TLS (assumed behind a
+reverse proxy); no admin-scope claims; no RLS surface.
+
+---
+
+## 9. Correctness strategy (the recurring pattern)
+
+Three rules repeat across every milestone and are worth stating once:
+
+1. **Secondary indexes are non-transactional, non-durable, derived
+   state.** None of them (HNSW, inverted, B-Tree, EdgeIndex, CSR) has
+   abort-time cleanup or WAL presence. Correctness rests entirely on:
+   *every candidate an index produces is re-checked against the caller's
+   MVCC snapshot (and full predicate) before becoming a result.* Stale or
+   phantom entries are therefore space leaks, never wrong answers. Each
+   milestone lands a dedicated proof-of-abort-invisibility test
+   (`vector_mvcc`, `graph_mvcc` ×2, `btree_mvcc`, `queue_mvcc`) written
+   *next to* the feature, not deferred — because the failure mode (a
+   forgotten `record_undo`, a worker with no transaction concept) is
+   silent.
+2. **New durable state is always ordinary heap rows** (`__edges__`,
+   `__events__`, `__consumers__`) — inheriting MVCC, locking, WAL, crash
+   recovery, and abort handling with zero new mechanism. This is why M3–M5
+   added no new crash-injection points: there was no new durability
+   machinery to crash.
+3. **Completeness-sensitive vs approximate readers gate differently on
+   index readiness.** B-Tree (exact results) falls back to a full scan
+   unless `Ready`; `NEAR` (approximate top-k) accepts partial results
+   while `Building`; CSR (graph) prefers-when-`Ready` with the synchronous
+   EdgeIndex as the always-current fallback.
+
+Test inventory at M7 close: 225 unit tests (228 with `--features
+server`), 11 crash-harness tests, 25 `server_*` integration tests, plus
+per-domain integration suites (`graph_locking` 4, `graph_rebuild` 5,
+`graph_mvcc` 3, `index_rebuild` 5, `vector_mvcc` 1, `btree_mvcc` 1,
+`queue_vacuum` 4, `queue_mvcc` 2) — clippy `-D warnings` and fmt clean in
+both feature configurations.
+
+---
+
+## 10. Performance profile (measured, not aspirational)
+
+All numbers from `PROGRESS.md` (release builds, Apple Silicon macOS, real
+fsync). Baselines per CLAUDE.md §6: SQLite for M0/M1 (honest embedded
+analog), Postgres+extension proxies from M2 on. The full four-system
+"replaced stack" benchmark is possible since M4 but remains a deferred,
+dedicated follow-up.
+
+### 10.1 The one bottleneck that explains almost everything
+
+**Every statement pays its own WAL fsync (~3 ms on this hardware)** —
+D2's per-statement mini-txn, unchanged since M0, with a second
+per-transaction commit fsync on top since M1. Consequences observed
+independently in every milestone:
+
+- Single-statement-transaction INSERT/UPDATE: ~155–165 ops/s (M1) — ~30x
+  behind SQLite, ~35x behind Postgres, and *flat* ever since.
+- Read-only transactions pay a commit fsync **for nothing**: point SELECT
+  855 ns (M0) → 3.05 ms (M1). Fix identified (skip the commit fsync when
+  `undo_log.is_empty()`), deliberately awaiting a reviewed change.
+- Server throughput ceiling: `POST /sql` is flat ~135→157→158 ops/s
+  across 1/10/50 concurrent clients — the single-writer thread + per-op
+  fsync, not HTTP (the HTTP/writer-thread layer itself costs only ~6%).
+- `vacuum_events`: ~3.06–3.10 ms/row *regardless of batch size* — each
+  reclaimed row is its own fsyncing mini-txn.
+- Batching statements inside one user transaction amortizes the
+  *user-commit* fsync but not the per-statement one: 100-row single-txn
+  INSERT still ~3.45 ms/row (M4) vs Postgres ~0.062 ms/row.
+
+Group commit / WAL batching has never been scheduled — it contradicts
+§1's "don't chase single-model throughput" only superficially; it is the
+prerequisite for the cross-domain workload being fast too, and is the top
+candidate for any performance-focused milestone.
+
+### 10.2 Where the engine is genuinely competitive
+
+- **Graph adjacency reads**: batched scan 94.3 µs vs Postgres 98 µs (1k
+  hot hub); 930 µs vs 568 µs (10k) — the batch-latch optimization closed
+  a 9–16x gap to ~1x–1.6x.
+- **`poll_events`**: 20.8 µs–983.7 µs (100–5,000 rows) vs Postgres
+  SKIP-LOCKED cycle ~2.6–3.1 ms — though unidb's cost grows linearly with
+  table size while Postgres's partial index stays flat; `vacuum_events`
+  is currently the only lever.
+- **B-Tree-assisted SELECT scales flat** (~3.1 ms at 1k and 10k rows)
+  while full scans grow — the absolute number is fsync-dominated, the
+  scaling win is real.
+- **JWT verification ~817 ns** — auth is nowhere near the cost.
+
+### 10.3 Known performance liabilities (beyond the fsync)
+
+- **HNSW rebuild-per-upsert** (no incremental insert in
+  `instant-distance`): index-active INSERT already 2.8x slower at 200
+  rows; scales as O(n log n) per insert. CSR has the same non-incremental
+  shape but debounced (frequency reduced, structure cost unchanged).
+- **SSE subscriber scaling**: 1→10→50 subscribers is 5.2→33.9→162.6 ms —
+  N pollers × poll interval × linear `poll_events`, all serialized
+  through the one writer thread.
+- **`NEAR` latency (~4–5 ms)** is transactional overhead, not vector
+  search — the raw structures answer in microseconds (fulltext search
+  ~14.2 µs).
+- **`BufferPoolFull` at ~100k rows/table** (M6 discovery): fixed 256-frame
+  pool + linear-scan FSM interaction; untriaged.
+- Peak RSS has stayed ~27–28 MB across M0/M1 measurement points.
+
+---
+
+## 11. Known limitations & tech debt registry (consolidated)
+
+The "no vacuum, anywhere" family — all safe (MVCC re-checks make stale
+entries invisible), all unbounded space growth:
+
+| Structure | Leak | Since |
+|---|---|---|
+| Heap tuples | dead versions never reclaimed; pages only grow | M1 |
+| Catalog pages | every DDL/RLS change strands the previous blob's page | M1 |
+| `VectorIndex` / `InvertedIndex` | old values of UPDATEd rows indexed forever | M2 |
+| `EdgeIndex` / `CsrIndex` | aborted/superseded edges never retracted | M3/M7 |
+| `__consumers__` | every ack leaves a dead offset version; `vacuum_events` does **not** touch it | M4 |
+
+Performance debt: per-statement fsync / no group commit (§10.1);
+read-only-txn commit fsync (fix identified); WAL truncation rewrites the
+whole file (needs log segments); FSM is a linear scan; 256-frame buffer
+pool + `BufferPoolFull` at scale; HNSW full rebuild per upsert; CSR full
+rebuild per debounce pass; `poll_events` full-scan (needs a `seq` index);
+SSE poll-per-subscriber.
+
+Functional gaps (deliberate scope, tracked): RC re-evaluation
+(EvalPlanQual) unimplemented — `WriteConflict` at all isolation levels;
+SSI is a no-op seam; no wait queue/deadlock detection (by design, D12);
+catalog DDL not transactional; SQL grammar gaps (no OR/ORDER
+BY/LIMIT/aggregates/joins/subqueries/`IN` — parked as Phase 2); no
+full-text SQL operator; single-column indexes only; no cost-based index
+selection; Cypher is single-hop read-only, nodes are opaque i64s; no CSR
+reverse (`to_id`) traversal; RLS is Rust-API-only; no automatic vacuum.
+
+Server gaps: no multi-request transaction sessions; no TLS (reverse-proxy
+assumption); verify-only JWT with no scopes (any valid token can hit
+`/checkpoint`); no gRPC; no writer-thread self-healing (process restart is
+the recovery model); read routes inherit the read-only fsync.
+
+---
+
+## 12. Locked decisions index (D1–D13)
+
+| # | Decision | Where it lives / is enforced |
+|---|---|---|
+| D1 | Steal + no-force (ARIES): redo **and** undo logging | `wal.rs` record format; `recovery.rs` both passes |
+| D2 | Per-statement mini-transaction is the M0 atomic unit | `wal.rs` mini-txn bracketing; every `heap.rs` mutation |
+| D3 | Control file is the recovery root | `control.rs`; `recovery.rs` starts there; extended (not re-litigated) with `catalog_root` (M1) and `next_xid` (v3, signed off) |
+| D4 | Tuple header reserves MVCC bytes up front | `page.rs` 24-byte header; used since M1 with format bump v1→v2 |
+| D5 | No dirty page flushes ahead of durable WAL | `bufferpool.rs::flush_page()` + `find_victim()`; debug assertions + crash harness |
+| D6 | Single-file storage (WAL separate) | unchanged; revisit was gated post-M4, not yet re-opened |
+| D7 | Crash-injection harness, simple by design | `tests/crash/main.rs` P1–P9 + property test |
+| D8 | 8 KiB pages, init-time config, immutable after | `format.rs`; baked into control file |
+| D9 | Little-endian, CRC32+LSN per page, magic+version | `format.rs`/`page.rs`/`wal.rs`; `FORMAT_VERSION = 3` |
+| D10 | RC default, RR available, same snapshots | `txn.rs` snapshot lifetime |
+| D11 | `on_read`/`on_write` no-op seam for future SSI | `concurrency_hooks.rs`, threaded through all heap paths |
+| D12 | SI abort-on-conflict before RC re-evaluation | `lockmgr.rs` (no wait queue); RC path still pending |
+| D13 | Structured logging from day one | `tracing` on WAL/checkpoint/recovery; `/metrics` shipped with M5 |
+
+---
+
+*Document version: covers commit `25cfd44` (M0–M7 complete, M8 not
+started). Update alongside the M8 closeout.*
