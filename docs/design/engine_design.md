@@ -1,10 +1,12 @@
-# unidb Engine Design — M0 through M7
+# unidb Engine Design — M0 through M8
 
-> Consolidated design document for the engine as shipped through M7
-> (2026-07-07). Distilled from `CLAUDE.md` (locked decisions D1–D13),
+> Consolidated design document for the engine as shipped through M8
+> (2026-07-08). Distilled from `CLAUDE.md` (locked decisions D1–D13),
 > `MEMORY.md` (per-checkpoint design notes), `PROGRESS.md` (milestone
 > entries + measured benchmarks), and the module doc comments in `src/`.
-> M8 (attach client) will be appended as its own section once it ships.
+> M8 (attach client, §9) is included; see that section's note on how it
+> was merged from a separate worktree, and §7.3's correction for a real
+> M7 bug that merge verification found and fixed.
 >
 > Rules of the road: locked decisions live in `CLAUDE.md` §3 and require
 > human sign-off to change; this document *describes*, it does not
@@ -34,7 +36,7 @@ no shared transaction for Postgres + vector store + graph DB + Kafka.
 control plane. On single-model benchmarks against a specialized incumbent
 the engine is expected to lose, and that is accepted — the benchmark that
 matters is the cross-domain transactional workload against the replaced
-stack (§10 below records what has actually been measured so far).
+stack (§11 below records what has actually been measured so far).
 
 ---
 
@@ -60,6 +62,7 @@ Module map (what each layer became in code):
 | Event queue (M4) | `queue/{mod,payload}.rs` |
 | Server (M5, feature-gated) | `server/{engine_handle,error,dto,handlers,router,auth,sse}.rs`, `bin/unidb-server.rs` |
 | Engine facade | `lib.rs` (`Engine` — the sole entry point) |
+| Attach client (M8, separate workspace crate) | `unidb-attach/src/lib.rs` (`AttachClient`, `AttachError`) |
 
 Two invariants shape everything above the storage layer:
 
@@ -114,7 +117,7 @@ starts here** — it is the single source of recovery truth.
   WAL-bracketed group of page writes (begin/commit records) that redo/undo
   treat as one. Every statement — including each statement inside a larger
   user transaction — is its own mini-txn with its own commit fsync. (This
-  is the single largest measured performance cost in the engine; see §10.)
+  is the single largest measured performance cost in the engine; see §11.)
 - WAL records use length-prefix framing (`u32` LE) plus a per-record CRC32;
   a recovery scan stops cleanly at the first corrupt/truncated record.
 - **D5 — the invariant that must never break**: a dirty page may not be
@@ -136,7 +139,7 @@ measurably expensive for hot-hub scans, which is what motivated the graph
 layer's batch-latch optimization (§7.2). A real scaling limit was
 discovered in M6: tables growing into the hundreds of pages can exhaust
 the pool (`DbError::BufferPoolFull`) even with small individually-committed
-transactions — tracked tech debt (§11), interacting with the linear-scan
+transactions — tracked tech debt (§12), interacting with the linear-scan
 FSM.
 
 ### 3.5 Checkpoint & recovery
@@ -170,7 +173,7 @@ deterministic simulator (no TigerBeetle/FoundationDB-grade sim).
 Later milestones added **zero** new crash points — a deliberate pattern:
 edges, events, and consumer offsets are all ordinary WAL-backed heap rows
 covered by the existing machinery, and every secondary index is derived,
-rebuildable, WAL-free state whose loss on crash is expected (§9).
+rebuildable, WAL-free state whose loss on crash is expected (§10).
 
 ---
 
@@ -194,7 +197,7 @@ not-in-active-set-and-in-range as committed. Abort therefore requires
   no wait queue, no deadlock detection (deliberately). RC's
   EvalPlanQual-style re-evaluation path is designed but **unimplemented**;
   UPDATE/DELETE conflicts surface as `WriteConflict` at every isolation
-  level (tracked gap, §11).
+  level (tracked gap, §12).
 - **The `on_read()`/`on_write()` seam (D11)** exists in every scan and
   lookup path (`concurrency_hooks.rs`), all no-ops — so a future
   SERIALIZABLE/SSI is an *addition* (read-set tracking behind the seam),
@@ -228,7 +231,7 @@ not-in-active-set-and-in-range as committed. Abort therefore requires
   milestones (edges, events) inherit correct abort behavior with zero new
   abort-path code. The corresponding risk (a forgotten `record_undo` is a
   *silent* visibility bug) is guarded by per-feature abort-visibility
-  tests (§9).
+  tests (§10).
 
 ### 4.4 Transaction manager
 
@@ -237,7 +240,7 @@ xid issuance. `commit()` currently fsyncs unconditionally — **including
 for read-only transactions**, the single most visible latency bug in the
 benchmarks (point SELECT went 855 ns in M0 → 3.05 ms in M1 from this one
 fsync). Known, fix identified, deliberately not slipped in as a drive-by
-(§11).
+(§12).
 
 ### 4.5 The xid-reuse-after-checkpoint bug (fixed, control file v3)
 
@@ -266,7 +269,7 @@ executor reconstructs a `Heap` handle per statement via
 
 **Catalog is not MVCC-versioned**: DDL takes effect immediately and
 globally; `CREATE TABLE` inside a transaction that later aborts is *not*
-rolled back. A real, narrow, tracked correctness gap (§11). Each catalog
+rolled back. A real, narrow, tracked correctness gap (§12). Each catalog
 rewrite also leaves the previous blob's page behind (same
 no-vacuum story as the heap).
 
@@ -318,7 +321,7 @@ decision. Two flows share one FIFO channel:
 - **Live upserts**: the SQL executor sends per-row messages from
   `exec_insert`/`exec_update` for indexed columns only — zero cost for
   unindexed tables. "Row write is the only synchronous cost" (with the
-  honest asterisk that the worker's CPU isn't free; §10).
+  honest asterisk that the worker's CPU isn't free; §11).
 
 `CREATE INDEX` validates kind-vs-column-type, persists via
 `Catalog::set_column_index`, and backfills committed rows immediately;
@@ -330,7 +333,7 @@ upserts, and rebuild-on-open alike.
 
 | Kind | Structure | Notes |
 |---|---|---|
-| `Hnsw` (M2) | `vector.rs` wrapping `instant-distance` | **No incremental insert exists in the crate's public API** (verified against vendored source), so `VectorIndex` buffers all points and rebuilds the whole graph per upsert — O(n log n) per insert, off the foreground thread but real CPU (§10, §11). f32, Euclidean (pgvector `<->` convention). |
+| `Hnsw` (M2) | `vector.rs` wrapping `instant-distance` | **No incremental insert exists in the crate's public API** (verified against vendored source), so `VectorIndex` buffers all points and rebuilds the whole graph per upsert — O(n log n) per insert, off the foreground thread but real CPU (§11, §12). f32, Euclidean (pgvector `<->` convention). |
 | `FullText` (M2) | `fulltext.rs` `InvertedIndex` | Whitespace+lowercase tokens, AND-only multi-term intersection. **No SQL query surface** — only the Rust API; `NEAR` is vector-only. |
 | `BTree` (M6) | `btree_index.rs`, `std::BTreeMap<OrderedValue, Vec<RowId>>` + `by_id: HashMap<RowId, OrderedValue>` | The `by_id` reverse map is what lets `upsert` remove a stale value-bucket entry — new bookkeeping the value-keyed structure needs that the id-keyed M2 indexes didn't. Zero new dependencies. |
 | `Csr` (M7) | `csr_index.rs` | **Engine-managed only** — no SQL surface; registered as `("__edges__", "from_id")` purely to reuse the worker machinery. See §7.3. |
@@ -353,7 +356,7 @@ terms + RLS apply identically to a full scan).
   `Ready` — an equality/range query silently missing rows during backfill
   would be a real bug — so anything short of `Ready` falls back to the
   unchanged full scan. First indexable term wins; there is no cost-based
-  selection (§11).
+  selection (§12).
 
 ---
 
@@ -391,7 +394,7 @@ as `__edges__`. Consequences, all structural rather than promised:
 `vacuum_events()` reclaims rows acknowledged by **every** registered
 consumer (`min(offsets)`), and is the only current lever bounding
 `poll_events`'s cost, which scales linearly with `__events__`'s total size
-(no predicate pushdown / no `seq` index yet — measured, §10). Nothing
+(no predicate pushdown / no `seq` index yet — measured, §11). Nothing
 calls vacuum automatically.
 
 ---
@@ -414,7 +417,7 @@ mis-parsed).
 `EdgeIndex` (by `from_id`) is maintained **synchronously** inside
 `create_edge`/`delete_edge` — always current the instant a call returns.
 It has no abort-time cleanup; stale entries are permanently safe because
-every candidate is re-validated against the caller's snapshot (§9).
+every candidate is re-validated against the caller's snapshot (§10).
 
 `resolve_candidates_batched` groups candidate `RowId`s by `page_id` so a
 hot hub costs one `fetch_page` per page instead of one per edge (~128
@@ -433,19 +436,37 @@ HNSW's rebuild-per-upsert, CSR's rebuild is **debounced**: the worker
 drains every queued message via `try_recv()` before one `rebuild_dirty`
 pass, coalescing write bursts (tested: 200 messages → far fewer rebuilds).
 
-Tier selection (`graph::index::graph_candidates`, used by `edges_from` and
-Cypher): **prefer CSR once `Ready`, otherwise EdgeIndex**. Safe because
-CSR's async lag can only cause a *false negative* (missed very-recent
-edge), never a phantom — MVCC re-validation downstream catches everything
-else, the same staleness contract every async index already has.
-`delete_edge` sends no CSR message; deletion is implicit via MVCC
-filtering.
+**Tier selection — corrected during M8 merge verification, not shipped as
+originally designed.** The original design had `edges_from`/Cypher prefer
+CSR once `Ready`, falling back to `EdgeIndex` otherwise, on the reasoning
+that CSR's async lag can only cause a *false negative* (missed
+very-recent edge), never a phantom — safe, since MVCC re-validation
+downstream catches everything else. **That reasoning missed a specific
+case**: `Ready` means "the initial backfill completed" (true almost
+instantly for a fresh/empty table), not "every edge write since then is
+reflected in the debounced rebuild." A transaction's own just-created edge
+could therefore be invisible to its own immediate `edges_from` call —
+a same-transaction self-visibility miss, not a merely-stale read, and a
+real regression against the guarantee `edges_from` had always given since
+M3. Found via `cargo test -p unidb --test graph_mvcc
+aborted_edge_creation_never_surfaces_in_traversal`, reproduced 30/30 times
+in isolation (masked when run as part of the full workspace test suite).
+**Fixed**: `edges_from`/Cypher now call `EdgeIndex::candidates` directly
+and unconditionally, exactly as before M7. `CsrIndex` itself is
+unaffected — still built, kept warm by every live edge write, and
+rebuilt on open — it simply isn't consulted by any query path today. A
+correct fix would need a staleness/generation marker proving CSR has
+incorporated every write up to a specific point before a caller can trust
+it; not attempted, since reverting the bug was the scope, not designing
+new correctness machinery. `delete_edge` sends no CSR message; deletion
+would be implicit via MVCC filtering if CSR were ever consulted again.
 
-Measured result, reported plainly: CSR is at **parity** with
-EdgeIndex+batched-resolve on today's single-hop workloads — batched page
-resolution dominates, and binary search ≈ HashMap lookup at that point.
-CSR's real payoff (cache-friendly contiguous adjacency for multi-hop
-traversal) is headroom Cypher can't exercise yet.
+Measured result, reported plainly: even when it was wired in, CSR was at
+**parity** with EdgeIndex+batched-resolve on today's single-hop
+workloads — batched page resolution dominates, and binary search ≈
+HashMap lookup at that point. CSR's real payoff (cache-friendly contiguous
+adjacency for multi-hop traversal) is headroom Cypher can't exercise yet,
+independent of the tier-selection bug above.
 
 ### 7.4 Cypher subset
 
@@ -485,12 +506,65 @@ already runs a whole string under one xid), `POST /cypher`, raw row CRUD
 multi-request transaction sessions exist). Auth is **verify-only JWT**
 (HS256 Bearer; the server never issues tokens, has no user store). SSE is
 **server-polls-then-pushes** (`poll_events` has no wake primitive), which
-is why subscriber cost scales badly (§10). No TLS (assumed behind a
+is why subscriber cost scales badly (§11). No TLS (assumed behind a
 reverse proxy); no admin-scope claims; no RLS surface.
 
 ---
 
-## 9. Correctness strategy (the recurring pattern)
+## 9. Attach client (M8)
+
+A third deployment mode alongside embedding `Engine` directly or running
+the standalone REST server: `unidb-attach`, a Rust crate giving one-shot,
+`Engine`-like method calls to a process that isn't running its own
+`Engine`, built entirely on the REST surface described in §8 — no new
+protocol, no new server-side capability.
+
+**Workspace, not a nested subdirectory move.** The repo root `Cargo.toml`
+does double duty as both `[workspace] members = ["unidb-attach"]` and
+`[package] name = "unidb"` in the same file — `src/`, `tests/`, `benches/`
+all stay exactly where they were pre-M8. This keeps `reqwest` and its
+dependency tree completely out of the embedded `unidb` crate (it's a
+`unidb-attach` dependency only, confirmed via `cargo tree -p unidb
+--no-default-features --edges normal`), while avoiding a disruptive
+file-move migration.
+
+**One call = one complete operation**, not a mirror of embedded `Engine`'s
+explicit `begin`/op/`commit` shape. There is no multi-request transaction
+session over HTTP — every mutating REST route already does its own
+internal begin→execute→commit (§8). Multi-statement atomicity is
+available via `;`-separated SQL passed to `execute_sql`, exactly as REST
+already supports. This is a deliberate, documented API-shape difference
+from embedded `Engine`, not an oversight.
+
+`AttachError`, not `DbError`, is the client's error type — `DbError`'s
+variants are storage-internal (`PageNotFound`, `ChecksumMismatch`, ...)
+with no meaningful mapping from an HTTP response. `AttachError` instead
+mirrors the server's documented `code` field 1:1 (`TableNotFound`,
+`ColumnNotFound`, `NotFound`, `TableAlreadyExists`, `WriteConflict`,
+`SerializationFailure`, `SqlParse`, `SqlPlan`, `SqlUnsupported`) plus
+transport-level variants (`Http`, `Json`, `InvalidToken`) and a generic
+`Api { status, code, message }` catch-all.
+
+Blocking `reqwest::blocking::Client`, no tokio runtime, no background
+thread — one call blocks its calling thread for one HTTP round-trip; the
+crate depends on `unidb` only as a `dev-dependency` (shared DTO shapes for
+its own integration tests, which spin up a real `unidb-server`), so a
+production consumer of `unidb-attach` never pulls in the embedded engine's
+dependency graph. Rust-only in v1; `vacuum_events`/`set_rls_policy`/`flush`
+are not exposed since the server itself has no REST route for any of the
+three (§8) — tracked in `docs/backlog/`, not silently dropped.
+
+Benchmarked (`unidb-attach/benches/attach.rs`) against a hand-rolled raw
+`reqwest` call and a direct embedded `Engine` call for the same
+`execute_sql` operation: the client wrapper tracks raw `reqwest` closely
+(no meaningful overhead beyond what HTTP itself costs), both an order of
+magnitude slower than the embedded call — the same HTTP-vs-embedded
+finding §11 already establishes for the server, not a new tradeoff M8
+introduces.
+
+---
+
+## 10. Correctness strategy (the recurring pattern)
 
 Three rules repeat across every milestone and are worth stating once:
 
@@ -510,22 +584,40 @@ Three rules repeat across every milestone and are worth stating once:
    recovery, and abort handling with zero new mechanism. This is why M3–M5
    added no new crash-injection points: there was no new durability
    machinery to crash.
-3. **Completeness-sensitive vs approximate readers gate differently on
-   index readiness.** B-Tree (exact results) falls back to a full scan
-   unless `Ready`; `NEAR` (approximate top-k) accepts partial results
-   while `Building`; CSR (graph) prefers-when-`Ready` with the synchronous
-   EdgeIndex as the always-current fallback.
+3. **Completeness-sensitive vs approximate readers must gate on index
+   readiness *and* on how current the index can ever promise to be.**
+   B-Tree (exact results) falls back to a full scan unless `Ready`; `NEAR`
+   (approximate top-k) accepts partial results while `Building` — both
+   correct because their contracts already permit "may return fewer
+   results while not yet caught up." **CSR (graph) was originally given
+   the same treatment (prefer-once-`Ready`) and that was wrong** — see
+   §7.3's correction. `edges_from`/Cypher have never had a "may return
+   fewer results" contract; they've always guaranteed immediate
+   self-visibility of a just-created edge, which `Ready`-gating alone
+   cannot preserve for a debounced-rebuild structure. The lesson: rule 3
+   only holds for readers whose *contract* already tolerates staleness,
+   not for every reader that happens to sit behind an async index. Rule 1
+   above (MVCC re-validates every candidate) rules out *wrong* answers;
+   it does not by itself rule out *missing an answer the caller was
+   promised*, which is a distinct, contract-specific question rule 3 must
+   answer for each reader individually.
 
-Test inventory at M7 close: 225 unit tests (228 with `--features
-server`), 11 crash-harness tests, 25 `server_*` integration tests, plus
-per-domain integration suites (`graph_locking` 4, `graph_rebuild` 5,
-`graph_mvcc` 3, `index_rebuild` 5, `vector_mvcc` 1, `btree_mvcc` 1,
-`queue_vacuum` 4, `queue_mvcc` 2) — clippy `-D warnings` and fmt clean in
-both feature configurations.
+Test inventory (post-M8, `-p unidb` default features): 225 unit tests, 11
+crash-harness tests, plus per-domain integration suites (`graph_locking`
+4, `graph_rebuild` 3, `graph_mvcc` 2, `index_rebuild` 5, `vector_mvcc` 1,
+`btree_mvcc` 1, `queue_vacuum` 4, `queue_mvcc` 2) = 258 total; add 25
+`server_*` integration tests with `--features server` (228 unit tests, 3
+of them feature-gated). `unidb-attach` adds 19 integration tests (3 CRUD +
+6 extras + 4 graph + 6 SQL) + 1 doctest. Clippy `-D warnings` and fmt
+clean across the whole workspace. `graph_rebuild`/`graph_mvcc` counts
+dropped from M7's peak (5/3) back to their pre-M7 levels (3/2) when the
+CSR-preferring tests were removed alongside the bug fix — no coverage was
+lost, since the underlying `EdgeIndex` path was already covered by the
+tests that remain.
 
 ---
 
-## 10. Performance profile (measured, not aspirational)
+## 11. Performance profile (measured, not aspirational)
 
 All numbers from `PROGRESS.md` (release builds, Apple Silicon macOS, real
 fsync). Baselines per CLAUDE.md §6: SQLite for M0/M1 (honest embedded
@@ -591,7 +683,7 @@ candidate for any performance-focused milestone.
 
 ---
 
-## 11. Known limitations & tech debt registry (consolidated)
+## 12. Known limitations & tech debt registry (consolidated)
 
 The "no vacuum, anywhere" family — all safe (MVCC re-checks make stale
 entries invisible), all unbounded space growth:
@@ -604,12 +696,20 @@ entries invisible), all unbounded space growth:
 | `EdgeIndex` / `CsrIndex` | aborted/superseded edges never retracted | M3/M7 |
 | `__consumers__` | every ack leaves a dead offset version; `vacuum_events` does **not** touch it | M4 |
 
-Performance debt: per-statement fsync / no group commit (§10.1);
+**CSR is not currently consulted by any query path** (added post-M7,
+corrected during M8 merge) — it is built, kept warm on every live edge
+write, rebuilt on open, and benchmarked in isolation, but `edges_from`/
+Cypher always use `EdgeIndex` (see §7.3). A future fix needs a
+staleness/generation marker proving CSR has incorporated every write up to
+a specific point before it can be safely preferred again.
+
+Performance debt: per-statement fsync / no group commit (§11.1);
 read-only-txn commit fsync (fix identified); WAL truncation rewrites the
 whole file (needs log segments); FSM is a linear scan; 256-frame buffer
 pool + `BufferPoolFull` at scale; HNSW full rebuild per upsert; CSR full
-rebuild per debounce pass; `poll_events` full-scan (needs a `seq` index);
-SSE poll-per-subscriber.
+rebuild per debounce pass (currently moot — CSR isn't consulted, see
+above); `poll_events` full-scan (needs a `seq` index); SSE
+poll-per-subscriber.
 
 Functional gaps (deliberate scope, tracked): RC re-evaluation
 (EvalPlanQual) unimplemented — `WriteConflict` at all isolation levels;
@@ -627,7 +727,7 @@ the recovery model); read routes inherit the read-only fsync.
 
 ---
 
-## 12. Locked decisions index (D1–D13)
+## 13. Locked decisions index (D1–D13)
 
 | # | Decision | Where it lives / is enforced |
 |---|---|---|
@@ -647,5 +747,6 @@ the recovery model); read routes inherit the read-only fsync.
 
 ---
 
-*Document version: covers commit `25cfd44` (M0–M7 complete, M8 not
-started). Update alongside the M8 closeout.*
+*Document version: covers commit `af5601b` (M0–M8 complete, including the
+M7 CSR-traversal correction found during M8 merge verification). Update
+alongside the next milestone's closeout.*

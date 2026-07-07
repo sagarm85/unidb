@@ -11,7 +11,7 @@
 1. **Read `MEMORY.md` first.** It holds the current implementation state and the ordered next tasks. Never start work without it.
 2. Read this file for the rules and locked decisions below.
 3. Do the work for the **current milestone only** (see §5). Do not pull features forward from the backlog.
-4. **At session end, update `MEMORY.md`** (current state + session log entry) and, if a milestone shipped, `PROGRESS.md`.
+4. **At session end, update `MEMORY.md`** (current state + session log entry) and, if a milestone shipped, `PROGRESS.md`. **Before pushing or raising a PR, also check `README.md` and `docs/` for staleness** (see §9) — these do not update themselves the way `PROGRESS.md` does as part of the per-milestone habit.
 5. **Dates:** always stamp entries with the *actual current system date*. Never copy a date from an earlier session or from this file. If unsure of the date, get it from the system, not from context.
 
 ---
@@ -100,7 +100,7 @@ Changing any of these requires explicit human sign-off, recorded in `PROGRESS.md
 
 Current milestone is tracked in `MEMORY.md`. Each milestone is independently demoable and benchmarkable.
 
-- **M0 — Storage core (current).** Single-file page store, buffer pool, WAL, control file, crash recovery, durable single-table CRUD, single-threaded, **no MVCC**. Plus crash harness (D7) + structured logging (D13).
+- **M0 — Storage core.** Single-file page store, buffer pool, WAL, control file, crash recovery, durable single-table CRUD, single-threaded, **no MVCC**. Plus crash harness (D7) + structured logging (D13).
 - **M1 — MVCC + CRUD.** Transactions, RC default / RR available (D10–D12), `on_read` seam, catalog, SQL subset. Fold in JSON columns and RLS here (they are a column-type + index-type and a planner rewrite, respectively — same machinery).
 - **M2 — Vector & Text search.** `VECTOR(n)` type, HNSW secondary index built **asynchronously** in a background worker (row write is the only synchronous cost), `NEAR` operator; full-text (inverted index) built alongside since both are over-fetch-then-filter secondary indexes.
 - **M3 — Graph.** Edge records `(from_id, to_id, edge_type, props)`, edge-list index by `from_id`, Cypher subset. Per-edge locking; batch-latch the adjacency scan on hot hubs.
@@ -146,9 +146,15 @@ cargo fmt --all             # format gate
 - Conventional commits (`feat:`, `fix:`, `test:`, `bench:`, `docs:`, `refactor:`).
 - Every PR: `cargo fmt` clean, `clippy -D warnings` clean, all tests + crash harness green, benchmarks recorded.
 - Update `PROGRESS.md` (milestone entry with metrics + PR link) and `MEMORY.md` (current state) in the same PR.
+- **Before every push or PR, check `README.md` and every file under `docs/` for staleness — not just `PROGRESS.md`/`MEMORY.md`.** `PROGRESS.md` gets updated reliably because it's part of the per-milestone habit; `README.md` and `docs/` (`docs/design/engine_design.md`, `docs/REST_API.md`, `docs/backlog/*.md`) do not update themselves and have gone stale in the past (e.g. a design doc left claiming a shipped milestone was "not started," and once documenting a policy that had since been reverted as a bug fix). Concretely, for any change that touches the public surface (new/changed API, new module, new deployment mode, a reverted design decision, a milestone opened or closed):
+  - `README.md`: status line, milestone table, project-layout tree, any usage section the change affects.
+  - `docs/design/engine_design.md` (if it exists): the section covering the affected area, the module map, the tech-debt registry, and the document-version footer.
+  - `docs/REST_API.md`: any new/changed/removed route or error code.
+  - `docs/backlog/*.md`: flip a plan's status line to done/shipped (pointing at its `PROGRESS.md` entry) once the work it describes lands, rather than leaving it claiming "not started."
+  - If a design decision documented in one of these files is found to be wrong (a bug, not a tradeoff), correct it explicitly with an inline correction note, not a silent rewrite — the same evidence-based ethos §0.5 and §6 already apply to `PROGRESS.md` extends to every doc.
 
 ### Definition of done (per milestone)
-Feature works end-to-end · crash harness green (where storage is touched) · benchmark table recorded in `PROGRESS.md` · `MEMORY.md` updated · demoable in isolation · no locked decision (§3) violated.
+Feature works end-to-end · crash harness green (where storage is touched) · benchmark table recorded in `PROGRESS.md` · `MEMORY.md` updated · `README.md` and affected `docs/` files updated (see above) · demoable in isolation · no locked decision (§3) violated.
 
 ---
 

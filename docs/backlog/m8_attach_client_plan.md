@@ -1,6 +1,13 @@
 # M8 — Attach Client (Rust-only v1)
 
-## Status as of 2026-07-07: NOT STARTED.
+## Status as of 2026-07-08: SHIPPED.
+
+M8 shipped and merged into `main` (commit `af5601b`) on 2026-07-07. This
+document is kept as the original planning record; for current state,
+benchmarks, and the M7 CSR-traversal correction found during merge
+verification, see `PROGRESS.md`'s M8 entry, `MEMORY.md`, and
+`docs/design/engine_design.md` §9. The plan below was carried out as
+written except where those sources note a deviation.
 
 ## Context
 User-confirmed scope: Rust-only client for v1 (multi-language bindings
