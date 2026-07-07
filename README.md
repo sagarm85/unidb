@@ -161,6 +161,27 @@ curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8080/sql \
 curl http://127.0.0.1:8080/metrics   # no auth required
 ```
 
+### Checking server performance
+
+Two ways, depending on whether you have the Rust toolchain and want
+rigorous, statistically-sampled numbers, or just a quick check against a
+running instance:
+
+```bash
+# Rigorous: criterion benchmarks (HTTP+writer-thread overhead vs. direct
+# Engine calls, JWT verification cost, SSE polling cost, concurrent
+# throughput ceiling). Results in target/criterion/; also recorded in
+# PROGRESS.md's M5 entry.
+cargo bench --bench server --features server
+
+# Quick: a plain-shell smoke test against any running server (local or
+# deployed) — no Rust toolchain needed, just curl/openssl/awk. Reports
+# sequential p50/p99 latency, concurrent throughput, and a /metrics
+# snapshot. See scripts/bench_server.sh for env vars (BASE_URL, REQUESTS,
+# CONCURRENCY).
+UNIDB_JWT_SECRET=dev-secret ./scripts/bench_server.sh
+```
+
 ### Tracing / structured logging
 
 Call once at startup to activate `RUST_LOG`-controlled output:
@@ -211,6 +232,8 @@ tests/
   graph_*.rs, vector_mvcc.rs, queue_*.rs, index_rebuild.rs — per-milestone integration tests
 benches/
   load.rs, vector.rs, graph.rs, queue.rs, server.rs — criterion benchmarks per milestone
+scripts/
+  bench_server.sh  — plain-shell perf smoke test against a running server (no Rust toolchain)
 Doc/
   REST_API.md      — full HTTP route reference (payloads, responses, error codes)
 ```
