@@ -1533,7 +1533,7 @@ silent correctness holes before any scale/feature work. One PR per checkpoint.
 
 ### P1.a — Full-page-writes (WAL_FPI, torn-page protection)   [shipped]   2026-07-08
 
-**PR:** _(pending — Core lane, branch `acid-hardening`)_
+**PR:** #6 — https://github.com/sagarm85/unidb/pull/6 (Core lane, branch `acid-hardening`)
 **Summary:** Closes the #1 silent data-loss hole (roadmap Tier 0). An 8 KiB
 page write is not atomic; a crash mid-write leaves a half-old/half-new page
 that CRC detects but cannot repair. Now, on the **first modification of a page
