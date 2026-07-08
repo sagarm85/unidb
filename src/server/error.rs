@@ -41,6 +41,12 @@ fn map_status(err: &DbError) -> (StatusCode, &'static str) {
         DbError::SqlParse(_) => (StatusCode::BAD_REQUEST, "SQL_PARSE_ERROR"),
         DbError::SqlPlan(_) => (StatusCode::BAD_REQUEST, "SQL_PLAN_ERROR"),
         DbError::SqlUnsupported(_) => (StatusCode::BAD_REQUEST, "SQL_UNSUPPORTED"),
+        // Constraint violations (M11) are client errors — the request asked
+        // to write data the schema forbids.
+        DbError::NotNullViolation { .. } => (StatusCode::BAD_REQUEST, "NOT_NULL_VIOLATION"),
+        DbError::UniqueViolation { .. } => (StatusCode::CONFLICT, "UNIQUE_VIOLATION"),
+        DbError::CheckViolation { .. } => (StatusCode::BAD_REQUEST, "CHECK_VIOLATION"),
+        DbError::ForeignKeyViolation { .. } => (StatusCode::BAD_REQUEST, "FOREIGN_KEY_VIOLATION"),
         DbError::TxnNotActive { .. } => (StatusCode::BAD_REQUEST, "TXN_NOT_ACTIVE"),
         DbError::TxnAlreadyFinished { .. } => (StatusCode::BAD_REQUEST, "TXN_ALREADY_FINISHED"),
         DbError::BadPageSize(_) => (StatusCode::BAD_REQUEST, "BAD_PAGE_SIZE"),

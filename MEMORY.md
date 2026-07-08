@@ -1721,6 +1721,45 @@ plain reporting.
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-07-08 — M11 SQL constraints (SQL lane, branch `sql-constraints`)
+
+- **New milestone proposed and implemented: M11 — SQL Constraints**
+  (PK/FK/UNIQUE/NOT NULL/CHECK/DEFAULT), both column-level and table-level.
+  Developed in the SQL-lane worktree (`../unidb-constraints`), disjoint from
+  the Core lane (M10 vacuum) and Surface lane — no storage-core files
+  (`heap`/`bufferpool`/`wal`/`txn`/`mvcc`/`recovery`/`read_handle`) touched and
+  `lib.rs` untouched, per the roadmap's parallel-lane rules. Full entry with
+  design rationale in `PROGRESS.md`'s M11 section.
+- **Root gap closed:** `sql/parser.rs::convert_create_table` previously read
+  only a column's name + data type and **dropped `c.options` entirely** — all
+  constraint clauses were silently ignored. It now maps every column option
+  and table constraint into new catalog fields.
+- **Catalog model:** `ColumnConstraints` (grouped into one `#[serde(default)]`
+  field on `ColumnDef`) + `TableConstraints` (one field on `TableDef`), plus
+  `ForeignKeyRef`/`ForeignKey`. All `#[serde(default)]` → pre-M11 catalog blobs
+  deserialize unchanged (no `FORMAT_VERSION` bump). Dropped `ColumnDef`'s `Eq`
+  derive (now carries `Expr`/`Literal`, not `Eq`); nothing depended on it.
+- **Enforcement** (in `exec_insert`/`exec_update`, all reusing existing
+  machinery): DEFAULT fill (INSERT only) → NOT NULL → CHECK (via `eval_expr`)
+  → UNIQUE (synchronous heap scan) → FK referenced-table existence.
+- **Deliberate deviation from the prompt, for correctness:** UNIQUE is a
+  **synchronous heap scan**, NOT the M6 async B-Tree index. `IndexStatus::Ready`
+  ≠ "reflects every write" (the M7 CSR-traversal bug); a stale index entry is a
+  false "no conflict" that would admit duplicates. The heap scan is guaranteed
+  current for the writer and sees its own uncommitted rows (so a dup *within one
+  multi-row INSERT* is caught). B-Tree index stays a read accelerator only.
+- **Scope calls:** FK = referenced-table existence only (no row-level RI /
+  cascades; no `DROP TABLE` exists yet). CHECK inherits two-valued NULL
+  semantics. Constraints apply to writes after `CREATE TABLE`, not retro-
+  validated (no `ALTER TABLE ADD CONSTRAINT`).
+- **Tests:** new `tests/constraints.rs` (12 tests). `cargo test -p unidb`
+  (226 unit + 12 constraints + 11 crash + rest) and `--features server` both
+  green; clippy `-D warnings` + fmt clean.
+- Not merged to `main` this session; on branch `sql-constraints` pending
+  hand-merge/PR. `server/error.rs` gained additive 4xx arms for the new error
+  variants (needed for the all-features clippy gate) — flag at merge as a small
+  cross-lane touch.
+
 ### 2026-07-08 — Track D: semantic search (cosine metric + `unidb-embed` CLI, branch `surface-embed`)
 
 - **Surface lane, worktree `../unidb-embed`.** Disjoint from Core/SQL: the only

@@ -324,6 +324,7 @@ All milestones below are **shipped, tested, and benchmarked**. Metrics tables ar
 | M6 — B-Tree index | done | General-purpose secondary index for equality/range `WHERE` predicates, index-assisted `SELECT` |
 | M7 — CSR graph index | done | Compressed Sparse Row adjacency structure, debounced/coalesced async rebuild |
 | M8 — Attach client | done | `unidb-attach`: Rust blocking-`reqwest` client over the REST API, no new protocol |
+| M11 — SQL constraints | branch `sql-constraints` (pending merge) | `PRIMARY KEY` / `FOREIGN KEY` / `UNIQUE` / `NOT NULL` / `CHECK` / `DEFAULT` on `CREATE TABLE`, enforced on INSERT/UPDATE |
 
 ---
 

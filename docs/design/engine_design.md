@@ -310,6 +310,16 @@ Not supported (deliberate scope, parked in
 `docs/backlog/phase2_sql_capability_expansion.md`): `OR`, `ORDER BY`,
 `LIMIT`, aggregates, joins, subqueries, `IN (...)`.
 
+**Constraints (M11, `sql-constraints` branch — pending merge):** `CREATE
+TABLE` column options and table constraints — `PRIMARY KEY`, `FOREIGN KEY` /
+`REFERENCES`, `UNIQUE`, `NOT NULL`, `CHECK`, `DEFAULT` — are parsed into
+`ColumnConstraints`/`TableConstraints` on the catalog and enforced on
+INSERT/UPDATE. DEFAULT fills a NULL at INSERT; NOT NULL / CHECK are per-row
+checks (CHECK reuses `eval_expr`, so it inherits two-valued NULL semantics);
+UNIQUE is a **synchronous heap scan** under the writer's snapshot (not the
+async B-Tree index, which can be stale — the M7 lesson); FK enforces
+referenced-table existence only. See `PROGRESS.md`'s M11 entry.
+
 **RLS is a planner rewrite**: `apply_rls` ANDs the stored policy predicate
 onto `Select.predicate`. That one function is the whole mechanism; it
 composes for free with `NEAR` and index-assisted paths because they all

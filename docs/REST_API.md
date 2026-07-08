@@ -408,6 +408,10 @@ trigger) falls into one grouped 500.
 | 400 | `SQL_PARSE_ERROR` | Malformed SQL |
 | 400 | `SQL_PLAN_ERROR` | SQL that parses but doesn't plan (e.g. bad rewrite) |
 | 400 | `SQL_UNSUPPORTED` | Valid SQL outside unidb's supported subset |
+| 400 | `NOT_NULL_VIOLATION` | Write left a `NOT NULL`/PK column NULL (M11) |
+| 409 | `UNIQUE_VIOLATION` | Write duplicated a `UNIQUE`/`PRIMARY KEY` value (M11) |
+| 400 | `CHECK_VIOLATION` | Write failed a `CHECK` constraint (M11) |
+| 400 | `FOREIGN_KEY_VIOLATION` | `FOREIGN KEY` references a table that doesn't exist (M11) |
 | 400 | `TXN_NOT_ACTIVE` | Operation on a transaction that isn't active |
 | 400 | `TXN_ALREADY_FINISHED` | Operation on an already committed/aborted txn |
 | 400 | `BAD_PAGE_SIZE` | Invalid page size at open |

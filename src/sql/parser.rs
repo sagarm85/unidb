@@ -13,7 +13,10 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser as SqlParser;
 
 use crate::{
-    catalog::{ColumnDef, ColumnType, IndexKind},
+    catalog::{
+        ColumnConstraints, ColumnDef, ColumnType, ForeignKey, ForeignKeyRef, IndexKind,
+        TableConstraints,
+    },
     error::{DbError, Result},
 };
 
@@ -44,18 +47,111 @@ fn convert_statement(stmt: Statement) -> Result<LogicalPlan> {
 
 fn convert_create_table(ct: ast::CreateTable) -> Result<LogicalPlan> {
     let name = ct.name.to_string();
-    let columns = ct
+    let mut columns = ct
         .columns
         .into_iter()
-        .map(|c| {
-            Ok(ColumnDef {
-                name: c.name.value,
-                ty: convert_data_type(&c.data_type)?,
-                index: None,
-            })
-        })
+        .map(convert_column_def)
         .collect::<Result<Vec<_>>>()?;
-    Ok(LogicalPlan::CreateTable { name, columns })
+    let constraints = convert_table_constraints(&ct.constraints)?;
+    // A table-level `PRIMARY KEY (a, b)` makes each named column `NOT NULL`
+    // (SQL requires PK columns to be non-null); fold that into the column's
+    // own constraint flags so NOT-NULL enforcement has a single source.
+    for pk_col in &constraints.primary_key {
+        if let Some(c) = columns.iter_mut().find(|c| &c.name == pk_col) {
+            c.constraints.not_null = true;
+        }
+    }
+    Ok(LogicalPlan::CreateTable {
+        name,
+        columns,
+        constraints,
+    })
+}
+
+/// Map one `sqlparser` `ColumnDef` — name, data type, and the per-column
+/// `options` list that `convert_create_table` used to drop entirely — into
+/// our [`ColumnDef`] with its [`ColumnConstraints`] populated (M11).
+fn convert_column_def(c: ast::ColumnDef) -> Result<ColumnDef> {
+    let mut cons = ColumnConstraints::default();
+    for opt in &c.options {
+        match &opt.option {
+            ast::ColumnOption::NotNull => cons.not_null = true,
+            // An explicit `NULL` marker is the default; nothing to record.
+            ast::ColumnOption::Null => {}
+            ast::ColumnOption::Default(expr) => cons.default = Some(convert_value_expr(expr)?),
+            ast::ColumnOption::Unique(_) => cons.unique = true,
+            ast::ColumnOption::PrimaryKey(_) => cons.primary_key = true,
+            ast::ColumnOption::ForeignKey(fk) => {
+                cons.references = Some(ForeignKeyRef {
+                    table: fk.foreign_table.to_string(),
+                    column: fk.referred_columns.first().map(|i| i.value.clone()),
+                });
+            }
+            ast::ColumnOption::Check(cc) => cons.check = Some(convert_expr(&cc.expr)?),
+            other => {
+                return Err(DbError::SqlUnsupported(format!(
+                    "unsupported column option: {other:?}"
+                )))
+            }
+        }
+    }
+    Ok(ColumnDef {
+        name: c.name.value,
+        ty: convert_data_type(&c.data_type)?,
+        index: None,
+        constraints: cons,
+    })
+}
+
+/// Map the table-level `constraints` list (`PRIMARY KEY (..)`, `UNIQUE (..)`,
+/// `FOREIGN KEY (..) REFERENCES ..`, table `CHECK (..)`) into
+/// [`TableConstraints`] (M11).
+fn convert_table_constraints(constraints: &[ast::TableConstraint]) -> Result<TableConstraints> {
+    let mut tc = TableConstraints::default();
+    for c in constraints {
+        match c {
+            ast::TableConstraint::PrimaryKey(pk) => {
+                tc.primary_key = index_columns_to_names(&pk.columns)?;
+            }
+            ast::TableConstraint::Unique(u) => {
+                tc.unique.push(index_columns_to_names(&u.columns)?);
+            }
+            ast::TableConstraint::ForeignKey(fk) => {
+                tc.foreign_keys.push(ForeignKey {
+                    columns: fk.columns.iter().map(|i| i.value.clone()).collect(),
+                    ref_table: fk.foreign_table.to_string(),
+                    ref_columns: fk
+                        .referred_columns
+                        .iter()
+                        .map(|i| i.value.clone())
+                        .collect(),
+                });
+            }
+            ast::TableConstraint::Check(cc) => {
+                tc.checks.push(convert_expr(&cc.expr)?);
+            }
+            other => {
+                return Err(DbError::SqlUnsupported(format!(
+                    "unsupported table constraint: {other:?}"
+                )))
+            }
+        }
+    }
+    Ok(tc)
+}
+
+/// Extract plain column names from a constraint's `IndexColumn` list, which
+/// wraps each column in an `OrderByExpr`; only bare identifiers are
+/// supported (no expressions / ordering in a constraint column list).
+fn index_columns_to_names(cols: &[ast::IndexColumn]) -> Result<Vec<String>> {
+    cols.iter()
+        .map(|ic| match &ic.column.expr {
+            SqlExpr::Identifier(ident) => Ok(ident.value.clone()),
+            other => Err(DbError::SqlUnsupported(format!(
+                "unsupported constraint column expression: {other:?}"
+            ))),
+        })
+        .collect()
 }
 
 fn convert_data_type(dt: &DataType) -> Result<ColumnType> {
@@ -511,7 +607,7 @@ mod tests {
     fn parses_create_table() {
         let plan = parse_one("CREATE TABLE accounts (id INT, name TEXT, active BOOLEAN)");
         match plan {
-            LogicalPlan::CreateTable { name, columns } => {
+            LogicalPlan::CreateTable { name, columns, .. } => {
                 assert_eq!(name, "accounts");
                 assert_eq!(columns.len(), 3);
                 assert_eq!(columns[0].ty, ColumnType::Int64);

@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::catalog::{Catalog, ColumnDef, IndexKind};
+use crate::catalog::{Catalog, ColumnDef, IndexKind, TableConstraints};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Literal {
@@ -77,6 +77,10 @@ pub enum LogicalPlan {
     CreateTable {
         name: String,
         columns: Vec<ColumnDef>,
+        /// Table-level constraints (M11): `PRIMARY KEY (cols)`, `UNIQUE
+        /// (cols)`, `FOREIGN KEY (...)`, table `CHECK`. Column-level
+        /// constraints ride on each [`ColumnDef`] instead.
+        constraints: TableConstraints,
     },
     Insert {
         table: String,
@@ -176,10 +180,12 @@ mod tests {
                 name: "id".to_string(),
                 index: None,
                 ty: ColumnType::Int64,
+                constraints: Default::default(),
             }],
             pages: vec![],
             rls_policy: policy,
             events_enabled: false,
+            constraints: Default::default(),
         });
         catalog
     }
@@ -254,6 +260,7 @@ mod tests {
         let plan = LogicalPlan::CreateTable {
             name: "t".to_string(),
             columns: vec![],
+            constraints: Default::default(),
         };
         assert!(matches!(
             apply_rls(plan, &catalog),

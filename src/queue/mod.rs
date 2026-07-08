@@ -50,31 +50,37 @@ pub fn events_table_def() -> TableDef {
                 name: "seq".to_string(),
                 ty: ColumnType::Int64,
                 index: None,
+                constraints: Default::default(),
             },
             ColumnDef {
                 name: "xid".to_string(),
                 ty: ColumnType::Int64,
                 index: None,
+                constraints: Default::default(),
             },
             ColumnDef {
                 name: "table_name".to_string(),
                 ty: ColumnType::Text,
                 index: None,
+                constraints: Default::default(),
             },
             ColumnDef {
                 name: "op".to_string(),
                 ty: ColumnType::Text,
                 index: None,
+                constraints: Default::default(),
             },
             ColumnDef {
                 name: "payload".to_string(),
                 ty: ColumnType::Json,
                 index: None,
+                constraints: Default::default(),
             },
         ],
         pages: Vec::new(),
         rls_policy: None,
         events_enabled: false,
+        constraints: Default::default(),
     }
 }
 
@@ -86,16 +92,19 @@ pub fn consumers_table_def() -> TableDef {
                 name: "consumer_name".to_string(),
                 ty: ColumnType::Text,
                 index: None,
+                constraints: Default::default(),
             },
             ColumnDef {
                 name: "offset".to_string(),
                 ty: ColumnType::Int64,
                 index: None,
+                constraints: Default::default(),
             },
         ],
         pages: Vec::new(),
         rls_policy: None,
         events_enabled: false,
+        constraints: Default::default(),
     }
 }
 

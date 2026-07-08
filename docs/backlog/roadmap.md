@@ -44,6 +44,8 @@ maximum-difficulty path.
 | M5 | REST server + verify-only JWT + SSE subscribe + `/metrics` |
 | M6 / M7 / M8 | B-Tree index + index-assisted SELECT · CSR graph index · Rust attach client |
 | M9 (perf) | **Group commit + read-only fsync skip + concurrent reads (ReadHandle)** — merged via PRs #2–#4 to `main`, 2026-07-08 |
+| Track D | Semantic search: per-index cosine metric (`Metric::{Euclidean,Cosine}`) + `unidb-embed` CLI (embed/search over REST) — `main`, 2026-07-08 |
+| M11 | SQL constraints: PK / FK / UNIQUE / NOT NULL / CHECK / DEFAULT — parsed, persisted, enforced on write — landing 2026-07-08 |
 
 ---
 
@@ -51,10 +53,10 @@ maximum-difficulty path.
 
 | Track | Deliverables | Achieves | Effort* | Phase |
 |---|---|---|---|---|
-| **A — Engine maturity** | Constraints (PK/FK/UNIQUE/NN/CHECK/DEFAULT) · GC/vacuum (M10) · ~~group commit + concurrent reads~~ ✅ done · buffer pool + real FSM · Phase 2 SQL (joins/agg/ORDER BY) + cost-based optimizer · async replication + PITR/backup | Postgres-**class** correctness, durability, standard SQL, HA; no space leak | ~9–11 remaining | P1→P3 |
+| **A — Engine maturity** | ~~Constraints (PK/FK/UNIQUE/NN/CHECK/DEFAULT)~~ ✅ done (M11) · GC/vacuum (M10) · ~~group commit + concurrent reads~~ ✅ done · buffer pool + real FSM · Phase 2 SQL (joins/agg/ORDER BY) + cost-based optimizer · async replication + PITR/backup | Postgres-**class** correctness, durability, standard SQL, HA; no space leak | ~8–10 remaining | P1→P3 |
 | **B — Studio UI** | SQL + Table editor · realtime changes feed · graph explorer ★ · vector playground ★ · metrics/logs · (file upload ⚙, auth ⚙ after engine work) | Visual test/admin console; showcases the multi-model thesis | ~3–4 (+engine deps) | P1→P2 |
 | **C — GraphQL** | Catalog-auto-generated schema + edge-traversal resolvers | Typed graph API; framework/AI-friendly | ~2 (after Phase 2 SQL) | P2→P3 |
-| **D — Semantic search** | Embedding CLI/client · cosine metric · filtered vector search · (optional search UI) | End-to-end AI semantic search on the shipped vector engine | ~1 (mostly client) | P1→P2 |
+| **D — Semantic search** | ~~Embedding CLI/client · cosine metric~~ ✅ done · filtered vector search · (optional search UI) | End-to-end AI semantic search on the shipped vector engine | ~0.5 remaining | P1→P2 |
 | **E — Columnar / HTAP** *(parked, gated on demand)* | Columnar segment store + vectorized executor — **only if analytics demand appears** | OLAP scan performance; true HTAP | ~5–7 (rewrite/team-scale) | Deferred |
 
 *Effort in rough milestone-units, where 1 unit ≈ what M6/M7/M8 each were.
@@ -129,10 +131,15 @@ git worktree add -b surface-embed   ../unidb-embed        main   # Surface lane 
   **Next: M10 heap vacuum / GC** — plan in [`m10_heap_vacuum_gc.md`](m10_heap_vacuum_gc.md).
   The vacuum horizon must include active `ReadHandle` readers, not just the
   writer's active transactions (build on top of the concurrent-read model).
-- **SQL lane:** constraints (PK/FK/UNIQUE/NOT NULL/CHECK/DEFAULT) — not started.
-  Entry points: `catalog.rs` `ColumnDef`/`TableDef`; `sql/parser.rs`
-  `convert_create_table` (currently drops per-column `options`);
-  `sql/executor.rs` `exec_insert`/`coerce_and_validate_row`/`exec_update`.
+- **SQL lane:** constraints (PK/FK/UNIQUE/NOT NULL/CHECK/DEFAULT) —
+  **implemented as M11 on branch `sql-constraints`, pending hand-merge to
+  `main`** (see `PROGRESS.md`'s M11 entry). Parser now maps column options +
+  table constraints into new `ColumnConstraints`/`TableConstraints` catalog
+  fields; enforced on INSERT/UPDATE. UNIQUE uses a synchronous heap scan, not
+  the async B-Tree index (correctness — `Ready` ≠ current, the M7 lesson); FK
+  is referenced-table existence only. **Next in the SQL lane: Phase 2 SQL**
+  (OR/ORDER BY/LIMIT/aggregates/JOIN) + cost-based optimizer
+  (`phase2_sql_capability_expansion.md`).
 - **Surface lane:** embedding CLI + cosine (**Track D**) — **DONE**
   (branch `surface-embed`, 2026-07-08; see `PROGRESS.md`'s Track D entry).
   `vector.rs` gained a per-index `Metric::{Euclidean,Cosine}` (cosine =
@@ -147,6 +154,21 @@ git worktree add -b surface-embed   ../unidb-embed        main   # Surface lane 
 ---
 
 ## 7. Decision & session log (newest first)
+
+### 2026-07-08 — M11 SQL constraints landed (SQL lane, branch `sql-constraints`)
+- Constraints (PK/FK/UNIQUE/NOT NULL/CHECK/DEFAULT), column- and table-level,
+  now parsed off `CREATE TABLE` (previously `convert_create_table` dropped
+  `c.options`), persisted on the catalog (`ColumnConstraints`/`TableConstraints`,
+  all `#[serde(default)]` — no `FORMAT_VERSION` bump), and enforced on
+  INSERT/UPDATE (DEFAULT → NOT NULL → CHECK → UNIQUE → FK).
+- **UNIQUE uses a synchronous heap scan, deliberately NOT the async B-Tree
+  index** — `IndexStatus::Ready` ≠ "reflects every write" (the M7 CSR lesson);
+  a stale index entry is a false "no conflict." FK is referenced-table
+  existence only (no row-level RI / cascades).
+- Disjoint from Core/Surface lanes: no storage-core or `lib.rs` changes;
+  `server/error.rs` got additive 4xx arms (small cross-lane touch). Rebased
+  onto the Track D merge — narrative-doc conflicts (MEMORY/PROGRESS/roadmap)
+  resolved keep-both. Full record in `PROGRESS.md`'s M11 entry + `MEMORY.md`.
 
 ### 2026-07-08 — Track D shipped (semantic search: cosine metric + embedding CLI)
 - Surface lane, worktree `../unidb-embed`, branch `surface-embed`. Only engine

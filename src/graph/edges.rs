@@ -42,26 +42,31 @@ pub fn edges_table_def() -> TableDef {
                 name: "from_id".to_string(),
                 ty: ColumnType::Int64,
                 index: None,
+                constraints: Default::default(),
             },
             ColumnDef {
                 name: "to_id".to_string(),
                 ty: ColumnType::Int64,
                 index: None,
+                constraints: Default::default(),
             },
             ColumnDef {
                 name: "edge_type".to_string(),
                 ty: ColumnType::Text,
                 index: None,
+                constraints: Default::default(),
             },
             ColumnDef {
                 name: "props".to_string(),
                 ty: ColumnType::Json,
                 index: None,
+                constraints: Default::default(),
             },
         ],
         pages: Vec::new(),
         rls_policy: None,
         events_enabled: false,
+        constraints: Default::default(),
     }
 }
 

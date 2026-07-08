@@ -25,7 +25,7 @@ use serde_json::Value as JsonValue;
 use crate::{
     btree_index::OrderedValue,
     bufferpool::{BufferPool, PageReader},
-    catalog::{Catalog, CatalogCtx, ColumnDef, ColumnType, IndexKind, TableDef},
+    catalog::{Catalog, CatalogCtx, ColumnDef, ColumnType, IndexKind, TableConstraints, TableDef},
     control::ControlData,
     error::{DbError, Result},
     format::{PageId, Xid},
@@ -198,7 +198,11 @@ pub enum ExecResult {
 
 pub fn execute(plan: LogicalPlan, ctx: &mut ExecCtx) -> Result<ExecResult> {
     match plan {
-        LogicalPlan::CreateTable { name, columns } => exec_create_table(name, columns, ctx),
+        LogicalPlan::CreateTable {
+            name,
+            columns,
+            constraints,
+        } => exec_create_table(name, columns, constraints, ctx),
         LogicalPlan::Insert {
             table,
             columns,
@@ -241,6 +245,7 @@ macro_rules! catalog_ctx {
 fn exec_create_table(
     name: String,
     columns: Vec<ColumnDef>,
+    constraints: TableConstraints,
     ctx: &mut ExecCtx,
 ) -> Result<ExecResult> {
     let def = TableDef {
@@ -249,6 +254,7 @@ fn exec_create_table(
         pages: Vec::new(),
         rls_policy: None,
         events_enabled: false,
+        constraints,
     };
     let mut cctx = catalog_ctx!(ctx);
     ctx.catalog.create_table(def, &mut cctx)?;
@@ -343,12 +349,27 @@ fn exec_insert(
     ctx: &mut ExecCtx,
 ) -> Result<ExecResult> {
     let table_def = ctx.catalog.lookup(table)?.clone();
+    // FK (M11): only referenced-table existence is enforced, and it's a
+    // schema-level property — check it once per statement, not per row.
+    enforce_referenced_tables_exist(&table_def, ctx.catalog)?;
     let mut heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
 
     let mut count = 0;
     for row_values in values {
         let ordered = order_values_by_columns(&table_def, &columns, row_values)?;
-        let coerced = coerce_and_validate_row(&table_def, ordered)?;
+        // DEFAULT fill happens on INSERT only (never UPDATE), before NOT
+        // NULL / CHECK / coercion see the row.
+        let filled = apply_defaults(&table_def, ordered);
+        let coerced = coerce_and_validate_row(&table_def, filled)?;
+        enforce_not_null(&table_def, &coerced)?;
+        enforce_checks(&table_def, &coerced)?;
+        // UNIQUE (M11): scan under a fresh per-row snapshot so earlier rows
+        // inserted by *this same statement* (own writes, visible to own xid)
+        // are counted — a duplicate within one multi-row INSERT is caught.
+        let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+        enforce_unique(
+            &table_def, &coerced, &heap, &snapshot, ctx.xid, ctx.pool, None,
+        )?;
         let encoded = encode_row(&coerced);
         let row_id = heap.insert(&encoded, ctx.xid, ctx.pool, ctx.wal)?;
         ctx.txn_mgr.record_undo(
@@ -639,6 +660,7 @@ fn exec_update(
     ctx: &mut ExecCtx,
 ) -> Result<ExecResult> {
     let table_def = ctx.catalog.lookup(table)?.clone();
+    enforce_referenced_tables_exist(&table_def, ctx.catalog)?;
     let mut heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
 
@@ -651,6 +673,22 @@ fn exec_update(
             set_column(&table_def.columns, &mut row, col, new_val)?;
         }
         let coerced = coerce_and_validate_row(&table_def, row)?;
+        enforce_not_null(&table_def, &coerced)?;
+        enforce_checks(&table_def, &coerced)?;
+        // UNIQUE (M11): exclude the row's *current* version — the old tuple
+        // is still visible to this snapshot until `heap.update` supersedes
+        // it, so without the exclusion an unchanged unique value would
+        // collide with itself.
+        let usnap = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+        enforce_unique(
+            &table_def,
+            &coerced,
+            &heap,
+            &usnap,
+            ctx.xid,
+            ctx.pool,
+            Some(row_id),
+        )?;
         let encoded = encode_row(&coerced);
         let new_row_id = heap.update(row_id, &encoded, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr)?;
         ctx.txn_mgr.record_undo(
@@ -807,6 +845,196 @@ fn coerce_value(table_name: &str, col: &ColumnDef, val: Literal) -> Result<Liter
             col.name
         ))),
     }
+}
+
+// ── constraint enforcement (M11) ─────────────────────────────────────────────
+//
+// Reuses machinery that already exists rather than adding new subsystems:
+// UNIQUE scans the heap under the caller's MVCC snapshot (so it sees the
+// transaction's own uncommitted writes, exactly like any read); CHECK runs
+// through the same `eval_expr` predicate evaluator SELECT/WHERE use; DEFAULT
+// fill and NOT NULL are plain per-column value checks.
+//
+// UNIQUE deliberately does NOT consult the M6 B-Tree index, even when one
+// exists on the column: that index is maintained by the async background
+// worker, and `IndexStatus::Ready` only means "initial backfill drained,"
+// not "every write since is reflected" — the exact staleness that caused the
+// M7 CSR-traversal bug (see MEMORY.md). Trusting it for a *correctness*
+// check could miss a just-inserted duplicate (a stale/absent index entry is
+// a false "no conflict"). A synchronous heap scan is the only source that is
+// guaranteed current for the writing transaction, so uniqueness is enforced
+// against the heap; the B-Tree index stays a read-side query accelerator only.
+
+/// Fill any NULL column value that has a `DEFAULT` with that default
+/// (INSERT-only). We can't distinguish an explicitly-supplied `NULL` from an
+/// omitted column once values are positionally ordered, so DEFAULT applies to
+/// any NULL — a minor, documented divergence from strict SQL (`INSERT ...
+/// VALUES (NULL)` into a defaulted column fills the default here).
+fn apply_defaults(table_def: &TableDef, mut row: Vec<Literal>) -> Vec<Literal> {
+    for (i, col) in table_def.columns.iter().enumerate() {
+        if matches!(row[i], Literal::Null) {
+            if let Some(default) = &col.constraints.default {
+                row[i] = default.clone();
+            }
+        }
+    }
+    row
+}
+
+/// NOT NULL (and the NOT-NULL half of PRIMARY KEY).
+fn enforce_not_null(table_def: &TableDef, row: &[Literal]) -> Result<()> {
+    for (i, col) in table_def.columns.iter().enumerate() {
+        let required = col.constraints.not_null || col.constraints.primary_key;
+        if required && matches!(row[i], Literal::Null) {
+            return Err(DbError::NotNullViolation {
+                table: table_def.name.clone(),
+                column: col.name.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Column-level and table-level CHECK constraints.
+///
+/// CHECK inherits the engine's two-valued NULL semantics (see `compare`): a
+/// comparison with a NULL operand evaluates to a non-true result and so
+/// fails the check, which is stricter than standard SQL's "NULL ⇒ unknown ⇒
+/// passes." Pair a CHECK with NOT NULL / DEFAULT if a nullable column must be
+/// allowed to skip it. Documented limitation, consistent with WHERE/RLS.
+fn enforce_checks(table_def: &TableDef, row: &[Literal]) -> Result<()> {
+    let columns = &table_def.columns;
+    let check_one = |expr: &Expr| -> Result<()> {
+        if check_passes(expr, columns, row)? {
+            Ok(())
+        } else {
+            Err(DbError::CheckViolation {
+                table: table_def.name.clone(),
+            })
+        }
+    };
+    for col in columns {
+        if let Some(check) = &col.constraints.check {
+            check_one(check)?;
+        }
+    }
+    for check in &table_def.constraints.checks {
+        check_one(check)?;
+    }
+    Ok(())
+}
+
+fn check_passes(expr: &Expr, columns: &[ColumnDef], row: &[Literal]) -> Result<bool> {
+    match eval_expr(expr, columns, row)? {
+        Literal::Bool(b) => Ok(b),
+        // A NULL-valued CHECK expression is treated as passing (the closest
+        // this two-valued evaluator gets to SQL's "unknown ⇒ pass").
+        Literal::Null => Ok(true),
+        other => Err(DbError::SqlPlan(format!(
+            "CHECK expression must be boolean, got {other:?}"
+        ))),
+    }
+}
+
+/// Foreign-key enforcement (M11): referenced-table existence only — see
+/// [`crate::catalog::ForeignKeyRef`]'s doc for the scope rationale.
+fn enforce_referenced_tables_exist(table_def: &TableDef, catalog: &Catalog) -> Result<()> {
+    let check = |ref_table: &str| -> Result<()> {
+        if catalog.lookup(ref_table).is_err() {
+            return Err(DbError::ForeignKeyViolation {
+                table: table_def.name.clone(),
+                ref_table: ref_table.to_string(),
+            });
+        }
+        Ok(())
+    };
+    for col in &table_def.columns {
+        if let Some(fk) = &col.constraints.references {
+            check(&fk.table)?;
+        }
+    }
+    for fk in &table_def.constraints.foreign_keys {
+        check(&fk.ref_table)?;
+    }
+    Ok(())
+}
+
+/// Every UNIQUE column-set on the table: each column-level UNIQUE/PRIMARY KEY
+/// as a one-column set, the table-level PRIMARY KEY as one set, and each
+/// table-level UNIQUE(..) as its own set. Column names resolve to indices via
+/// `column_index` so an unknown constraint column surfaces as an error rather
+/// than a silently-dropped constraint.
+fn unique_column_sets(table_def: &TableDef) -> Result<Vec<Vec<usize>>> {
+    let mut sets: Vec<Vec<usize>> = Vec::new();
+    for (i, col) in table_def.columns.iter().enumerate() {
+        if col.constraints.unique || col.constraints.primary_key {
+            sets.push(vec![i]);
+        }
+    }
+    if !table_def.constraints.primary_key.is_empty() {
+        sets.push(names_to_indices(
+            table_def,
+            &table_def.constraints.primary_key,
+        )?);
+    }
+    for cols in &table_def.constraints.unique {
+        sets.push(names_to_indices(table_def, cols)?);
+    }
+    Ok(sets)
+}
+
+fn names_to_indices(table_def: &TableDef, names: &[String]) -> Result<Vec<usize>> {
+    names.iter().map(|n| column_index(table_def, n)).collect()
+}
+
+/// Enforce every UNIQUE/PRIMARY KEY set by scanning the heap under `snapshot`.
+/// A set with any NULL component in the new row is skipped (SQL treats NULLs
+/// as distinct, so such a row never conflicts). `exclude` is the row being
+/// updated in place, whose still-visible old version must not count as a
+/// conflict with itself.
+#[allow(clippy::too_many_arguments)]
+fn enforce_unique(
+    table_def: &TableDef,
+    new_row: &[Literal],
+    heap: &Heap,
+    snapshot: &Snapshot,
+    xid: Xid,
+    pool: &mut BufferPool,
+    exclude: Option<RowId>,
+) -> Result<()> {
+    let sets = unique_column_sets(table_def)?;
+    // Only sets with no NULL component in the new row are active.
+    let active: Vec<&Vec<usize>> = sets
+        .iter()
+        .filter(|set| set.iter().all(|&i| !matches!(new_row[i], Literal::Null)))
+        .collect();
+    if active.is_empty() {
+        return Ok(());
+    }
+
+    for (row_id, bytes) in heap.scan(snapshot, xid, pool)? {
+        if Some(row_id) == exclude {
+            continue;
+        }
+        let existing = decode_row(&bytes, &table_def.columns)?;
+        for set in &active {
+            // `existing[i] == new_row[i]` is false whenever `existing[i]` is
+            // NULL (different `Literal` variant), so existing NULLs never
+            // conflict — no special-casing needed.
+            if set.iter().all(|&i| existing[i] == new_row[i]) {
+                let columns = set
+                    .iter()
+                    .map(|&i| table_def.columns[i].name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(DbError::UniqueViolation {
+                    table: table_def.name.clone(),
+                    columns,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn project_row(
@@ -1368,21 +1596,25 @@ mod tests {
             ColumnDef {
                 name: "a".to_string(),
                 index: None,
+                constraints: Default::default(),
                 ty: ColumnType::Int64,
             },
             ColumnDef {
                 name: "b".to_string(),
                 index: None,
+                constraints: Default::default(),
                 ty: ColumnType::Text,
             },
             ColumnDef {
                 name: "c".to_string(),
                 index: None,
+                constraints: Default::default(),
                 ty: ColumnType::Bool,
             },
             ColumnDef {
                 name: "d".to_string(),
                 index: None,
+                constraints: Default::default(),
                 ty: ColumnType::Json,
             },
         ];
@@ -1402,6 +1634,7 @@ mod tests {
         let columns = vec![ColumnDef {
             name: "a".to_string(),
             index: None,
+            constraints: Default::default(),
             ty: ColumnType::Int64,
         }];
         let encoded = encode_row(&[Literal::Null]);
@@ -1414,6 +1647,7 @@ mod tests {
         let columns = vec![ColumnDef {
             name: "embedding".to_string(),
             index: None,
+            constraints: Default::default(),
             ty: ColumnType::Vector(4),
         }];
         let values = vec![Literal::Vector(vec![0.1, -0.2, 0.3, 0.4])];
@@ -1427,6 +1661,7 @@ mod tests {
         let columns = vec![ColumnDef {
             name: "embedding".to_string(),
             index: None,
+            constraints: Default::default(),
             ty: ColumnType::Vector(4),
         }];
         // Encode a 3-dimension vector but declare the column as 4.
@@ -1442,11 +1677,13 @@ mod tests {
             columns: vec![ColumnDef {
                 name: "embedding".to_string(),
                 index: None,
+                constraints: Default::default(),
                 ty: ColumnType::Vector(4),
             }],
             pages: vec![],
             rls_policy: None,
             events_enabled: false,
+            constraints: Default::default(),
         };
         let err = coerce_and_validate_row(&table, vec![Literal::Vector(vec![0.1, 0.2, 0.3])]);
         assert!(matches!(err, Err(DbError::SqlPlan(_))));

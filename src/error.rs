@@ -77,6 +77,20 @@ pub enum DbError {
     #[error("catalog is corrupt: {0}")]
     CatalogCorrupt(String),
 
+    #[error("NOT NULL constraint violated: column '{column}' on table '{table}' cannot be NULL")]
+    NotNullViolation { table: String, column: String },
+
+    #[error("UNIQUE constraint violated on table '{table}' column(s) [{columns}]")]
+    UniqueViolation { table: String, columns: String },
+
+    #[error("CHECK constraint violated on table '{table}'")]
+    CheckViolation { table: String },
+
+    #[error(
+        "FOREIGN KEY constraint violated on table '{table}': referenced table '{ref_table}' does not exist"
+    )]
+    ForeignKeyViolation { table: String, ref_table: String },
+
     /// Only ever produced by the optional M5 server layer
     /// (`src/server/engine_handle.rs`): the dedicated writer thread that
     /// owns the `Engine` has stopped responding (its channel is closed —

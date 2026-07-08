@@ -1292,6 +1292,100 @@ additive on the same foundation if a workload needs them concurrent.
 
 ---
 
+## M11 — SQL Constraints   [SQL lane — landing]   2026-07-08
+
+**Branch:** `sql-constraints` (SQL lane worktree; hand-merged to `main` at land-time per the roadmap's parallel-lane operating rules).
+**Summary:** PRIMARY KEY / FOREIGN KEY / UNIQUE / NOT NULL / CHECK / DEFAULT,
+both as column-level options and table-level constraints, are now parsed off
+`CREATE TABLE`, persisted on the catalog, and enforced on the INSERT/UPDATE
+write path. Before this, `convert_create_table` read only a column's name +
+data type and **dropped its `options` entirely** — every constraint clause
+was silently ignored. Delivered without touching any storage-core file
+(`heap`/`bufferpool`/`wal`/`txn`/`mvcc`/`recovery`/`read_handle`) and with
+`lib.rs` untouched — enforcement reuses the existing heap scan, MVCC
+snapshot, and predicate evaluator.
+
+**What changed:**
+- `catalog.rs`: new `ColumnConstraints` (not_null / unique / primary_key /
+  default / check / references) grouped into one `#[serde(default)]` field on
+  `ColumnDef`, and `TableConstraints` (table-level PK / UNIQUE sets / CHECKs /
+  FKs) as one `#[serde(default)]` field on `TableDef`; plus `ForeignKeyRef` /
+  `ForeignKey`. All `#[serde(default)]`, so pre-M11 catalog blobs deserialize
+  unchanged (same forward-compat discipline as M4's `events_enabled`). Dropped
+  the now-incompatible `Eq` derive from `ColumnDef` (it carries `Expr`/`Literal`,
+  which aren't `Eq`); nothing depended on it.
+- `sql/parser.rs`: `convert_create_table` now maps every column option
+  (`NotNull`/`Null`/`Default`/`Unique`/`PrimaryKey`/`ForeignKey`/`Check`) and
+  every table constraint (`PrimaryKey`/`Unique`/`ForeignKey`/`Check`) into the
+  new fields. Table-level PK columns are folded to `NOT NULL` at parse time so
+  enforcement has one source of truth. (sqlparser 0.62 shapes confirmed
+  against the vendored AST before coding.)
+- `sql/logical.rs`: `LogicalPlan::CreateTable` carries `constraints:
+  TableConstraints`.
+- `sql/executor.rs`: `exec_create_table` persists table constraints;
+  `exec_insert`/`exec_update` run DEFAULT fill (INSERT only), NOT NULL, CHECK,
+  UNIQUE, and FK-referenced-table existence.
+- `error.rs`: `NotNullViolation` / `UniqueViolation` / `CheckViolation` /
+  `ForeignKeyViolation`. `server/error.rs` maps them to 4xx (UNIQUE → 409,
+  the rest → 400) — an additive arm on the existing exhaustive match.
+
+**Key design decisions (evidence-based, recorded honestly):**
+- **UNIQUE is enforced by a synchronous heap scan under the writer's own MVCC
+  snapshot — deliberately NOT via the M6 B-Tree index**, despite the task
+  prompt's suggestion to reuse it. The B-Tree index is maintained by the async
+  background worker, and `IndexStatus::Ready` only means "initial backfill
+  drained," not "every write since is reflected" — the exact staleness that
+  caused the documented M7 CSR-traversal bug (`MEMORY.md`). A stale/absent
+  index entry is a *false* "no conflict," which for a correctness check would
+  silently admit duplicates. A heap scan is the only source guaranteed current
+  for the writing transaction; it also sees the transaction's own uncommitted
+  writes, so a duplicate *within a single multi-row INSERT* is caught. The
+  B-Tree index stays a read-side query accelerator only. This is the one
+  deliberate deviation from the prompt, made for correctness and flagged here.
+- **FK enforcement is referenced-table-existence only** (M11 scope, as
+  prompted). Referenced-*row* existence and `ON DELETE`/`ON UPDATE` actions are
+  out of scope — there is no `DROP TABLE` yet and row-level FK is a materially
+  bigger lift. `CREATE TABLE` with a forward reference is allowed; the check
+  fires on write.
+- **CHECK reuses the SELECT/WHERE `eval_expr` evaluator** and inherits its
+  documented two-valued NULL semantics: a comparison with a NULL operand is
+  non-true and so fails the check (stricter than SQL's "NULL ⇒ unknown ⇒
+  pass"). Pair CHECK with NOT NULL/DEFAULT if a nullable column must skip it.
+- **DEFAULT fills any NULL-valued column at INSERT** (never UPDATE). Positional
+  ordering can't distinguish an explicit `NULL` from an omitted column, so
+  `INSERT ... VALUES (NULL)` into a defaulted column fills the default — a
+  minor, documented divergence.
+
+**Tests:** new `tests/constraints.rs` — 12 integration tests covering each
+kind, its violation rejection, DEFAULT fill, self-update-not-a-conflict,
+NULLs-are-distinct, table-level composite UNIQUE/CHECK/FK, and
+survive-reopen. Full suite green: `cargo test -p unidb` (226 unit + 12
+constraints + 11 crash + all other integration) and `cargo test -p unidb
+--features server` both pass; `cargo clippy --workspace --all-targets -- -D
+warnings` and `cargo fmt --all --check` clean.
+
+**Benchmark note (§6):** constraints are correctness features, not a
+throughput workload; no new benchmark table. The added per-row cost is a
+UNIQUE heap scan *only when a UNIQUE/PK constraint exists* (O(rows) per
+inserted row — a known, documented cost that a future secondary-index-backed
+uniqueness check could reduce once the index is made synchronously
+authoritative). Tables with no UNIQUE/PK pay near-zero extra (a few per-column
+flag checks).
+
+**Locked-decision changes:** none. (`ColumnDef` losing its `Eq` derive is an
+internal type change, not a §3 locked decision; on-disk format stays
+forward-compatible via `#[serde(default)]`, so no `FORMAT_VERSION` bump.)
+
+**Known limitations / tech debt (new in M11):**
+- UNIQUE scan is O(rows)/insert; no index-backed fast path yet (see design
+  note for why the async B-Tree index can't be trusted for this).
+- FK is existence-only (no row-level referential integrity, no cascade).
+- CHECK inherits two-valued NULL semantics.
+- Constraints are not retro-validated against pre-existing rows (there is no
+  `ALTER TABLE ADD CONSTRAINT`); they apply to writes after `CREATE TABLE`.
+
+---
+
 ## Track D — Semantic search (cosine metric + embedding CLI) — 2026-07-08
 
 **Lane:** Surface (worktree `../unidb-embed`, branch `surface-embed`). Disjoint

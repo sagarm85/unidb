@@ -35,7 +35,7 @@ use crate::{
     format::{PageId, INVALID_PAGE_ID, PAGE_TYPE_META},
     heap::encode_insert_redo,
     page::SlottedPage,
-    sql::logical::Expr,
+    sql::logical::{Expr, Literal},
     wal::Wal,
 };
 
@@ -75,11 +75,92 @@ pub enum IndexKind {
     Csr,
 }
 
+/// A foreign-key reference recorded on a column (`REFERENCES table(column)`)
+/// or, for the table-level form, inside [`ForeignKey`] (M11). Enforcement in
+/// M11 is deliberately limited to **referenced-table existence** (see
+/// `sql/executor.rs::enforce_referenced_tables_exist` and this milestone's
+/// `PROGRESS.md` entry) — full referential integrity (referenced *row*
+/// existence, `ON DELETE`/`ON UPDATE` actions) is out of scope, since there
+/// is no `DROP TABLE` yet and row-level FK checks are a materially larger
+/// lift than the "you can't reference a table that isn't there" guard this
+/// milestone commits to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForeignKeyRef {
+    /// Referenced table name.
+    pub table: String,
+    /// Referenced column (informational in M11 — recorded for a future
+    /// row-existence check, but only the `table` is enforced today).
+    pub column: Option<String>,
+}
+
+/// Column-level constraints (M11), grouped into one struct so adding them to
+/// [`ColumnDef`] is a single new field rather than six — and so every
+/// existing `ColumnDef { .. }` literal only needs `constraints:
+/// Default::default()`. Every field is `#[serde(default)]` so catalog blobs
+/// written before M11 deserialize unchanged (forward-compatible on-disk
+/// format, same discipline as `TableDef.events_enabled` in M4).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ColumnConstraints {
+    /// `NOT NULL`. `primary_key` implies this too (see enforcement).
+    #[serde(default)]
+    pub not_null: bool,
+    /// Column-level `UNIQUE`. `primary_key` implies this too.
+    #[serde(default)]
+    pub unique: bool,
+    /// Column-level `PRIMARY KEY` (implies `NOT NULL` + `UNIQUE`).
+    #[serde(default)]
+    pub primary_key: bool,
+    /// `DEFAULT <literal>` — filled in for a NULL/omitted value at INSERT
+    /// time (never on UPDATE), before NOT NULL / CHECK / type coercion run.
+    #[serde(default)]
+    pub default: Option<Literal>,
+    /// Column-level `CHECK (<expr>)`. Reuses the executor's predicate
+    /// evaluator; violation only on a definite `false` (NULL/true pass, per
+    /// SQL three-valued logic).
+    #[serde(default)]
+    pub check: Option<Expr>,
+    /// Column-level `REFERENCES <table>(<column>)`.
+    #[serde(default)]
+    pub references: Option<ForeignKeyRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ColumnDef {
     pub name: String,
     pub ty: ColumnType,
     pub index: Option<IndexKind>,
+    #[serde(default)]
+    pub constraints: ColumnConstraints,
+}
+
+/// A table-level `FOREIGN KEY (cols) REFERENCES table(cols)` (M11). As with
+/// [`ForeignKeyRef`], only referenced-table existence is enforced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForeignKey {
+    pub columns: Vec<String>,
+    pub ref_table: String,
+    pub ref_columns: Vec<String>,
+}
+
+/// Table-level constraints (M11), grouped for the same reason as
+/// [`ColumnConstraints`]. Column-level `PRIMARY KEY`/`UNIQUE`/`REFERENCES`
+/// stay on the column; these carry the *table-level* forms
+/// (`PRIMARY KEY (a, b)`, `UNIQUE (a, b)`, `FOREIGN KEY (...)`, table `CHECK`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TableConstraints {
+    /// Table-level `PRIMARY KEY (cols)`. Its columns are also treated as
+    /// `NOT NULL` (set at parse time) and, together, as a UNIQUE set.
+    #[serde(default)]
+    pub primary_key: Vec<String>,
+    /// Each entry is one `UNIQUE (cols)` column set.
+    #[serde(default)]
+    pub unique: Vec<Vec<String>>,
+    /// Table-level `CHECK (<expr>)` expressions.
+    #[serde(default)]
+    pub checks: Vec<Expr>,
+    /// Table-level foreign keys.
+    #[serde(default)]
+    pub foreign_keys: Vec<ForeignKey>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +181,10 @@ pub struct TableDef {
     /// automatic, mirroring M2's "indexing is always explicit" precedent.
     #[serde(default)]
     pub events_enabled: bool,
+    /// Table-level constraints (M11). `#[serde(default)]` so pre-M11 catalog
+    /// blobs deserialize with an empty set.
+    #[serde(default)]
+    pub constraints: TableConstraints,
 }
 
 /// Everything `Catalog` needs to durably persist itself, bundled so
@@ -296,11 +381,13 @@ mod tests {
             columns: vec![ColumnDef {
                 name: "id".to_string(),
                 index: None,
+                constraints: Default::default(),
                 ty: ColumnType::Int64,
             }],
             pages: vec![],
             rls_policy: None,
             events_enabled: false,
+            constraints: Default::default(),
         };
         let mut ctx = CatalogCtx {
             pool: &mut pool,
@@ -325,6 +412,7 @@ mod tests {
             pages: vec![],
             rls_policy: None,
             events_enabled: false,
+            constraints: Default::default(),
         };
         let mut ctx = CatalogCtx {
             pool: &mut pool,
@@ -349,17 +437,20 @@ mod tests {
                 ColumnDef {
                     name: "id".to_string(),
                     index: None,
+                    constraints: Default::default(),
                     ty: ColumnType::Int64,
                 },
                 ColumnDef {
                     name: "data".to_string(),
                     index: None,
+                    constraints: Default::default(),
                     ty: ColumnType::Json,
                 },
             ],
             pages: vec![7],
             rls_policy: None,
             events_enabled: false,
+            constraints: Default::default(),
         };
         {
             let mut ctx = CatalogCtx {
@@ -391,16 +482,19 @@ mod tests {
                     name: "id".to_string(),
                     ty: ColumnType::Int64,
                     index: None,
+                    constraints: Default::default(),
                 },
                 ColumnDef {
                     name: "vec".to_string(),
                     ty: ColumnType::Vector(384),
                     index: Some(IndexKind::Hnsw),
+                    constraints: Default::default(),
                 },
             ],
             pages: vec![],
             rls_policy: None,
             events_enabled: false,
+            constraints: Default::default(),
         };
         {
             let mut ctx = CatalogCtx {
@@ -431,6 +525,7 @@ mod tests {
             pages: vec![],
             rls_policy: None,
             events_enabled: false,
+            constraints: Default::default(),
         };
         let policy = Expr::BinOp {
             op: CmpOp::Eq,
