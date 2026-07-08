@@ -83,20 +83,14 @@ pub fn build_indexed_columns(
             .iter()
             .position(|c| c.name == col.name)
             .expect("indexed column is drawn from table_def.columns");
-        match (&col.index, &row[idx]) {
-            (Some(IndexKind::Hnsw), Literal::Vector(v)) => out.push(IndexedColumn::Vector {
+        // Only the async worker's vector (Hnsw) kind is emitted here. BTree
+        // (P3.a) and FullText (P3.b) are durable, WAL-logged on-disk B+trees
+        // written via `apply_durable_index_writes`, not sent to the worker.
+        if let (Some(IndexKind::Hnsw), Literal::Vector(v)) = (&col.index, &row[idx]) {
+            out.push(IndexedColumn::Vector {
                 column: col.name.clone(),
                 data: v.clone(),
-            }),
-            (Some(IndexKind::FullText), Literal::Text(t)) => out.push(IndexedColumn::Text {
-                column: col.name.clone(),
-                data: t.clone(),
-            }),
-            // `IndexKind::BTree` is deliberately absent: since P3.a the B-Tree
-            // is a durable, synchronous, WAL-logged on-disk structure written
-            // via `apply_durable_btree_writes`, not sent to the async worker
-            // that serves the still-in-memory Hnsw/FullText/Csr kinds.
-            _ => {}
+            });
         }
     }
     out
@@ -130,35 +124,48 @@ fn send_index_upserts(table_def: &TableDef, row_id: RowId, row: &[Literal], ctx:
     }
 }
 
-/// Insert `row`'s durable-B-Tree-indexed column values into their on-disk
-/// B+trees (P3.a). Synchronous, durable, WAL-logged on the writer thread —
-/// unlike the async `send_index_upserts` (which now serves only the still-
-/// in-memory Hnsw/FullText/Csr kinds). Called on every INSERT and on the new
-/// row version each UPDATE creates. The old version's entry is intentionally
-/// left in place: it points at a now-superseded (MVCC-invisible) tuple, so it
-/// is a harmless stale hint that vacuum later scrubs — exactly how the heap
-/// keeps the old version until vacuum. A NULL / non-orderable value is skipped
-/// (that row simply never appears as a B-Tree candidate). A BTree column with
-/// no `index_root` yet (index flagged but never built via `CREATE INDEX`) is
-/// also skipped — queries fall back to a full scan, never a wrong answer.
-fn apply_durable_btree_writes(
+/// Insert `row`'s durable-index column values into their on-disk B+trees
+/// (P3.a/P3.b). Synchronous, durable, WAL-logged on the writer thread — unlike
+/// the async `send_index_upserts` (which now serves only the still-in-memory
+/// Hnsw vector kind). Handles both durable index kinds, which share one
+/// `DiskBTree` structure and differ only in how a row maps to keys — **BTree**
+/// (P3.a) uses one key (the column's orderable value); **FullText** (P3.b) uses
+/// one key per token of the tokenized text.
+/// Called on every INSERT and on the new row version each UPDATE creates. The
+/// old version's entries are left in place: they point at a now-superseded
+/// (MVCC-invisible) tuple, so they are harmless stale hints that vacuum later
+/// scrubs — exactly how the heap keeps the old version until vacuum. A NULL /
+/// non-orderable value is skipped. A column flagged but never built (no
+/// `index_root`) is skipped — queries fall back to a full scan, never wrong.
+fn apply_durable_index_writes(
     table_def: &TableDef,
     row_id: RowId,
     row: &[Literal],
     ctx: &mut ExecCtx,
 ) -> Result<()> {
     for (idx, col) in table_def.columns.iter().enumerate() {
-        if col.dropped || col.index != Some(IndexKind::BTree) {
+        if col.dropped {
             continue;
         }
         let Some(meta_page) = col.index_root else {
             continue;
         };
-        let Ok(value) = OrderedValue::try_from(&row[idx]) else {
-            continue;
-        };
         let tree = DiskBTree::new(meta_page, ctx.page_size);
-        tree.insert(value, row_id, ctx.pool, ctx.wal)?;
+        match col.index {
+            Some(IndexKind::BTree) => {
+                if let Ok(value) = OrderedValue::try_from(&row[idx]) {
+                    tree.insert(value, row_id, ctx.pool, ctx.wal)?;
+                }
+            }
+            Some(IndexKind::FullText) => {
+                if let Literal::Text(text) = &row[idx] {
+                    for token in crate::fulltext::tokenize(text) {
+                        tree.insert(OrderedValue::Text(token), row_id, ctx.pool, ctx.wal)?;
+                    }
+                }
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -417,12 +424,12 @@ fn exec_create_index(
     ctx.catalog
         .set_column_index(table, column, Some(kind), &mut cctx)?;
 
-    // P3.a: a durable B-Tree is built synchronously on the writer thread —
-    // allocate its stable meta page, backfill every committed row into the
-    // on-disk tree, then record the meta page id in the catalog. Everything is
-    // WAL-logged, so `Engine::open` never rebuilds it. The other (still
-    // in-memory) kinds keep the async-worker backfill below.
-    if kind == IndexKind::BTree {
+    // P3.a/P3.b: a durable BTree/FullText index is built synchronously on the
+    // writer thread — allocate its stable meta page, backfill every committed
+    // row into the on-disk B+tree, then record the meta page id in the catalog.
+    // Everything is WAL-logged, so `Engine::open` never rebuilds it. The
+    // remaining in-memory kind (Hnsw) keeps the async-worker backfill below.
+    if matches!(kind, IndexKind::BTree | IndexKind::FullText) {
         let tree = DiskBTree::create(ctx.pool, ctx.wal)?;
         let table_def = ctx.catalog.lookup(table)?.clone();
         let col_idx = table_def
@@ -434,8 +441,20 @@ fn exec_create_index(
         let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
         for (row_id, bytes) in heap.scan(&snapshot, ctx.xid, ctx.pool)? {
             let row = decode_row(&bytes, &table_def.columns)?;
-            if let Ok(value) = OrderedValue::try_from(&row[col_idx]) {
-                tree.insert(value, row_id, ctx.pool, ctx.wal)?;
+            match kind {
+                IndexKind::BTree => {
+                    if let Ok(value) = OrderedValue::try_from(&row[col_idx]) {
+                        tree.insert(value, row_id, ctx.pool, ctx.wal)?;
+                    }
+                }
+                IndexKind::FullText => {
+                    if let Literal::Text(text) = &row[col_idx] {
+                        for token in crate::fulltext::tokenize(text) {
+                            tree.insert(OrderedValue::Text(token), row_id, ctx.pool, ctx.wal)?;
+                        }
+                    }
+                }
+                _ => unreachable!(),
             }
         }
         let mut cctx = catalog_ctx!(ctx);
@@ -531,7 +550,7 @@ fn exec_insert(
             },
         )?;
         send_index_upserts(&table_def, row_id, &coerced, ctx);
-        apply_durable_btree_writes(&table_def, row_id, &coerced, ctx)?;
+        apply_durable_index_writes(&table_def, row_id, &coerced, ctx)?;
         send_event_capture(&table_def, "insert", &coerced, ctx)?;
         count += 1;
     }
@@ -773,11 +792,9 @@ fn exec_select_near(
             // candidates so far, not an error; see IndexStatus::Building.
             None => Vec::new(),
             Some(entry) => {
-                let SecondaryIndex::Vector(v) = &entry.index else {
-                    return Err(DbError::SqlPlan(format!(
-                        "column {column}'s index is not a vector index"
-                    )));
-                };
+                // The async worker holds only the vector (Hnsw) index since
+                // Phase 3; every other kind is durable/on-disk.
+                let SecondaryIndex::Vector(v) = &entry.index;
                 v.search(query, over_fetch)
                     .into_iter()
                     .map(|(id, _)| id)
@@ -870,7 +887,7 @@ fn exec_update(
             },
         )?;
         send_index_upserts(&table_def, new_row_id, &coerced, ctx);
-        apply_durable_btree_writes(&table_def, new_row_id, &coerced, ctx)?;
+        apply_durable_index_writes(&table_def, new_row_id, &coerced, ctx)?;
         send_event_capture(&table_def, "update", &coerced, ctx)?;
         count += 1;
     }

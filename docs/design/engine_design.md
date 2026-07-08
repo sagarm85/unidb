@@ -434,13 +434,16 @@ guarding a different failure mode.
 
 ## 5. Secondary indexing framework (M2 + M6; B-Tree durable since P3.a)
 
-> **Phase 3 note (P3.a):** the B-Tree is no longer part of the async worker
-> framework described in §5.1. It is a **durable, synchronous, WAL-logged
-> on-disk B+tree** (`DiskBTree`) — node pages in the shared page store,
+> **Phase 3 note (P3.a + P3.b):** the B-Tree (P3.a), full-text/inverted (P3.b),
+> and edge-adjacency (P3.b) indexes are all **durable, synchronous, WAL-logged
+> on-disk B+trees** (`DiskBTree`) — node pages in the shared page store,
 > crash-recovered, **never rebuilt on open** — updated inline on the writer
-> thread (`apply_durable_btree_writes`) and read via `DiskBTree::search`. See
-> §5.2's `BTree` row and §5.4. The worker below now serves only the still
-> in-memory `Hnsw`/`FullText`/`Csr` kinds.
+> thread (`apply_durable_index_writes`, `graph/edges::ensure_edge_index`) and
+> read via `DiskBTree::search` (full-text also via `Engine::search_fulltext`).
+> The M7 **CSR index was retired** in P3.b (consulted by no read path after the
+> M7 traversal revert; adjacency now served durably by the edge index). So the
+> async worker described in §5.1 now serves **only the `Hnsw` vector kind**; P3.c
+> will make that durable too and retire the worker. See §5.2 and §5.4.
 
 ### 5.1 The async index worker
 
@@ -472,9 +475,9 @@ upserts, and rebuild-on-open alike.
 | Kind | Structure | Notes |
 |---|---|---|
 | `Hnsw` (M2) | `vector.rs` wrapping `instant-distance` | **No incremental insert exists in the crate's public API** (verified against vendored source), so `VectorIndex` buffers all points and rebuilds the whole graph per upsert — O(n log n) per insert, off the foreground thread but real CPU (§11, §12). f32, Euclidean (pgvector `<->` convention). |
-| `FullText` (M2) | `fulltext.rs` `InvertedIndex` | Whitespace+lowercase tokens, AND-only multi-term intersection. **No SQL query surface** — only the Rust API; `NEAR` is vector-only. |
+| `FullText` (M2; **durable since P3.b**) | durable `DiskBTree` keyed on tokens (`fulltext::tokenize`), one `(token, RowId)` entry per token | **Durable, WAL-logged, not rebuilt on open** — same `DiskBTree`/`WAL_INDEX` machinery as `BTree`. Now has a real read path: `Engine::search_fulltext` (tokenize → intersect per-token `search_eq` posting lists, AND-only → MVCC-resolve). |
 | `BTree` (M6; **durable since P3.a**) | `btree_index.rs`, `DiskBTree` — on-disk B+tree of buffer-pool-managed pages | **Durable, WAL-logged, crash-recovered, not rebuilt on open** (§5.4). Node pages carry the standard page header + a body-tag; a stable meta page (id in `ColumnDef.index_root`) points at the root so a root split never rewrites the catalog. Mutations log full node-page images (`WAL_INDEX`, redo-only) in one mini-txn each. No undo (entries are MVCC-validated hints). Written synchronously on the writer thread — **not** via the async worker. |
-| `Csr` (M7) | `csr_index.rs` | **Engine-managed only** — no SQL surface; registered as `("__edges__", "from_id")` purely to reuse the worker machinery. See §7.3. |
+| `Csr` (M7) | `csr_index.rs` | **Retired in P3.b** — consulted by no read path after the M7 traversal revert (§7.3); adjacency is now served by the durable edge index. The module + its benchmark remain but are unwired from the runtime. |
 
 ### 5.3 Query execution against indexes
 
@@ -570,12 +573,17 @@ release-on-commit/abort were all inherited and then proven by
 — no labels, no property-graph joins (rejected at parse time, not
 mis-parsed).
 
-### 7.2 Read path: EdgeIndex + batch-latch resolution
+### 7.2 Read path: durable edge index + batch-latch resolution
 
-`EdgeIndex` (by `from_id`) is maintained **synchronously** inside
-`create_edge`/`delete_edge` — always current the instant a call returns.
-It has no abort-time cleanup; stale entries are permanently safe because
-every candidate is re-validated against the caller's snapshot (§10).
+The edge index (by `from_id`) became a **durable `DiskBTree`** over
+`__edges__.from_id` in P3.b (was an in-memory `HashMap` rebuilt on open).
+`create_edge`/`delete_edge` maintain it synchronously and WAL-logged via
+`DiskBTree::insert`/`remove(OrderedValue::Int(from_id), rid)`; `edges_from`
+and the Cypher executor read it via `search_eq`. Its meta page is cached on
+the `Engine` (`edge_index_meta`), created/loaded once by
+`graph::edges::ensure_edge_index` at open — **not rebuilt**. It still has no
+abort-time cleanup; stale entries are permanently safe because every candidate
+is re-validated against the caller's snapshot (§10).
 
 `resolve_candidates_batched` groups candidate `RowId`s by `page_id` so a
 hot hub costs one `fetch_page` per page instead of one per edge (~128
@@ -583,11 +591,18 @@ edges/page): measured ~9.3–9.7x over naive resolution, and it closes
 almost the whole read-side gap with Postgres (94.3 µs vs 98 µs at 1k
 edges; 930 µs vs 568 µs at 10k).
 
-### 7.3 CSR index (M7)
+### 7.3 CSR index (M7 — retired in P3.b)
+
+> **Retired (P3.b):** the CSR index below was consulted by no read path after
+> the M8-era correction described here, and P3.b's durable edge index (§7.2)
+> now serves adjacency durably — so its rebuild-on-open + warm-keeping were
+> removed. `csr_index.rs` and its `benches/graph.rs` measurement remain but are
+> unwired from the runtime. The history below is retained because it is the
+> reason CSR was never trusted for traversal in the first place.
 
 A read-optimized adjacency structure built asynchronously on the existing
 index worker, sitting **alongside — never replacing —** the synchronous
-`EdgeIndex`. `CsrIndex` splits `stage()` (append to a raw `Vec`) from
+edge index. `CsrIndex` splits `stage()` (append to a raw `Vec`) from
 `rebuild()` (recompute sorted `from_ids_sorted`/`row_ptr`/`col_ind` — the
 classic CSR arrays, O(n log n), not incrementally patchable). Unlike
 HNSW's rebuild-per-upsert, CSR's rebuild is **debounced**: the worker
@@ -1017,7 +1032,13 @@ surface. All additive/forward-compatible; no `FORMAT_VERSION` bump.
 durable storage.** P3.a **durable paged WAL-logged B-Tree** (`DiskBTree`, §5.2/§5.4):
 node pages in the page store, WAL-logged full node-page images (`WAL_INDEX`),
 crash-recovered, **not rebuilt on open**; moved off the async worker; vacuum
-scrubs it directly. Crash harness **14→15** (P13: total data-file loss recovered
-from the WAL), `FORMAT_VERSION` **4→5**, no locked decision reversed. P3.b–d
-pending. See `docs/backlog/phase3_durable_storage.md` + `PROGRESS.md`'s P3.a entry.
-Update alongside the next milestone's closeout.*
+scrubs it directly. `FORMAT_VERSION` **4→5**. P3.b **durable full-text + edge
+index; CSR retired** (§5.2, §7.2): full-text (keyed on tokens, new
+`Engine::search_fulltext` read path) and the edge-adjacency index
+(`__edges__.from_id`) reuse the same `DiskBTree`/`WAL_INDEX` machinery (no format
+bump); `rebuild_edge_index`/full-text rebuild removed; CSR retired (unwired from
+the runtime); the async worker now serves only the vector index. Crash harness
+**14→17** (P13 B-Tree total-data-loss, P14 durable full-text, P15 durable edge),
+no locked decision reversed. P3.c (on-disk vector) + P3.d (large objects)
+pending. See `docs/backlog/phase3_durable_storage.md` + `PROGRESS.md`'s P3.a/P3.b
+entries. Update alongside the next milestone's closeout.*

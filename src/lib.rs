@@ -78,11 +78,11 @@ use crate::{
     graph::{
         edges::{self, Edge},
         executor as graph_executor,
-        index::{resolve_candidates_batched, EdgeIndex},
+        index::resolve_candidates_batched,
         parser::parse_cypher,
     },
     heap::Heap,
-    index_worker::{IndexHandle, IndexMsg, IndexedColumn},
+    index_worker::{IndexHandle, IndexMsg},
     lockmgr::LockManager,
     queue::{CONSUMERS_TABLE, EVENTS_TABLE},
     sql::{
@@ -199,7 +199,11 @@ pub struct Engine {
     control_path: PathBuf,
     _wal_path: PathBuf,
     index_worker: IndexHandle,
-    edge_index: EdgeIndex,
+    /// Meta page id of the durable edge-adjacency index (P3.b) — a `DiskBTree`
+    /// over `__edges__.from_id`. Cached here so `create_edge`/`delete_edge`/
+    /// `edges_from`/Cypher reconstruct the tree without a catalog lookup on
+    /// every call. Crash-recovered, never rebuilt on open.
+    edge_index_meta: PageId,
     next_event_seq: u64,
     /// Auto-checkpoint policy + state (P1.e).
     auto_checkpoint: AutoCheckpointConfig,
@@ -320,12 +324,14 @@ impl Engine {
             edges::ensure_edges_table(&mut catalog, &mut cctx)?;
             queue::ensure_queue_tables(&mut catalog, &mut cctx)?;
         }
-        let edge_index = rebuild_edge_index(
-            &catalog,
+        let edge_index_meta = ensure_edge_index(
+            &mut catalog,
             &mut txn_mgr,
             &mut pool,
             &mut wal,
             &mut lock_mgr,
+            &ctrl_p,
+            &mut control,
             page_size_usize,
         )?;
         let next_event_seq = derive_next_event_seq(
@@ -347,15 +353,6 @@ impl Engine {
             page_size_usize,
             &index_worker,
         )?;
-        rebuild_csr_index(
-            &catalog,
-            &mut txn_mgr,
-            &mut pool,
-            &mut wal,
-            &mut lock_mgr,
-            page_size_usize,
-            &index_worker,
-        )?;
 
         tracing::info!(dir = %dir.display(), page_size = control.page_size, next_xid, "engine opened");
         Ok(Self {
@@ -369,7 +366,7 @@ impl Engine {
             control_path: ctrl_p,
             _wal_path: wal_p,
             index_worker,
-            edge_index,
+            edge_index_meta,
             next_event_seq,
             auto_checkpoint: AutoCheckpointConfig::default(),
             last_checkpoint: Instant::now(),
@@ -539,7 +536,7 @@ impl Engine {
             index_worker: Some(&self.index_worker),
             next_event_seq: &mut self.next_event_seq,
         };
-        let result = graph_executor::execute(parsed, &mut ctx, &self.edge_index)?;
+        let result = graph_executor::execute(parsed, &mut ctx, self.edge_index_meta)?;
         Ok(vec![result])
     }
 
@@ -847,21 +844,18 @@ impl Engine {
             )?;
         }
 
-        self.edge_index.insert(from_id, row_id);
-        // Live upsert into the CSR graph index (M7) — a plain channel
-        // send, same as any other secondary index; the worker debounces
-        // the actual rebuild (see index_worker.rs's module doc). No
-        // corresponding message on delete_edge, matching the existing
-        // "deletion is implicit, filtered out by MVCC re-validation at
-        // read time" convention every other secondary index already has.
-        self.index_worker.send(IndexMsg::Upsert {
-            table: edges::EDGES_TABLE.to_string(),
-            record: row_id,
-            indexed_cols: vec![IndexedColumn::Edge {
-                column: "from_id".to_string(),
-                from_id,
-            }],
-        });
+        // P3.b: maintain the durable edge-adjacency index (a `DiskBTree` over
+        // `__edges__.from_id`) synchronously and WAL-logged — the same durable
+        // path a `BTree` column INSERT takes, so it is crash-recovered and
+        // never rebuilt on open. (The M7 CSR index is retired — it was consulted
+        // by no read path since the M7 traversal-uses-CSR revert, and adjacency
+        // is now served durably here.)
+        DiskBTree::new(self.edge_index_meta, page_size).insert(
+            OrderedValue::Int(from_id),
+            row_id,
+            &mut self.pool,
+            &mut self.wal,
+        )?;
         Ok(row_id)
     }
 
@@ -887,7 +881,12 @@ impl Engine {
                 slot: row_id.slot,
             },
         )?;
-        self.edge_index.remove(from_id, row_id);
+        DiskBTree::new(self.edge_index_meta, page_size).remove(
+            &OrderedValue::Int(from_id),
+            row_id,
+            &mut self.pool,
+            &mut self.wal,
+        )?;
         Ok(())
     }
 
@@ -898,9 +897,11 @@ impl Engine {
     /// creating transaction aborted never surfaces here even though the
     /// index may still reference it.
     pub fn edges_from(&mut self, xid: Xid, from_id: i64) -> Result<Vec<Edge>> {
+        let page_size = self.control.page_size as usize;
         let table_def = cat_read(&self.catalog).lookup(edges::EDGES_TABLE)?.clone();
         let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
-        let candidates = self.edge_index.candidates(from_id).to_vec();
+        let candidates = DiskBTree::new(self.edge_index_meta, page_size)
+            .search_eq(&OrderedValue::Int(from_id), &mut self.pool)?;
         let resolved = resolve_candidates_batched(
             &candidates,
             &snapshot,
@@ -941,6 +942,74 @@ impl Engine {
                 edge_type,
                 props,
             });
+        }
+        Ok(out)
+    }
+
+    /// Full-text search over a durable `FULLTEXT`-indexed column (P3.b): return
+    /// every row of `table` whose `column` text contains **all** of `query`'s
+    /// tokens (AND-only, matching the M2.c inverted-index semantics). Reads the
+    /// durable on-disk B+tree — no rebuild, always crash-consistent. Every
+    /// candidate is re-validated against `xid`'s MVCC snapshot, so an aborted or
+    /// superseded row never surfaces even though the index may still reference
+    /// it. Errors if the column has no built full-text index (Rust API only —
+    /// there is still no `WHERE MATCH(...)` SQL surface).
+    pub fn search_fulltext(
+        &mut self,
+        xid: Xid,
+        table: &str,
+        column: &str,
+        query: &str,
+    ) -> Result<Vec<Vec<Literal>>> {
+        let page_size = self.control.page_size as usize;
+        let table_def = cat_read(&self.catalog).lookup(table)?.clone();
+        let col = table_def
+            .columns
+            .iter()
+            .find(|c| c.name == column && !c.dropped)
+            .ok_or_else(|| DbError::ColumnNotFound {
+                table: table.to_string(),
+                column: column.to_string(),
+            })?;
+        let meta = match (col.index, col.index_root) {
+            (Some(IndexKind::FullText), Some(m)) => m,
+            _ => {
+                return Err(DbError::SqlPlan(format!(
+                    "column {column} has no full-text index"
+                )))
+            }
+        };
+        let tokens = fulltext::tokenize(query);
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        // AND-only: intersect each token's posting list. Start from the shortest
+        // list so the intersection shrinks fastest.
+        let tree = DiskBTree::new(meta, page_size);
+        let mut posting_lists: Vec<Vec<RowId>> = Vec::with_capacity(tokens.len());
+        for token in &tokens {
+            posting_lists.push(tree.search_eq(&OrderedValue::Text(token.clone()), &mut self.pool)?);
+        }
+        posting_lists.sort_by_key(|l| l.len());
+        let mut candidates: std::collections::HashSet<RowId> =
+            posting_lists[0].iter().copied().collect();
+        for list in &posting_lists[1..] {
+            let set: std::collections::HashSet<RowId> = list.iter().copied().collect();
+            candidates.retain(|r| set.contains(r));
+            if candidates.is_empty() {
+                break;
+            }
+        }
+
+        let heap = Heap::from_pages(page_size, table_def.pages.clone());
+        let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
+        let mut out = Vec::new();
+        for rid in candidates {
+            match heap.get(rid, &snapshot, xid, &self.pool) {
+                Ok(bytes) => out.push(executor::decode_row(&bytes, &table_def.columns)?),
+                Err(DbError::NoVisibleVersion { .. }) => continue,
+                Err(e) => return Err(e),
+            }
         }
         Ok(out)
     }
@@ -1216,29 +1285,47 @@ impl Engine {
                 continue;
             }
 
-            // P3.a: gather each reclaimable version's durable-BTree key(s)
+            // P3.a/P3.b: gather each reclaimable version's durable-index key(s)
             // *before* marking it DEAD — the tuple body is only readable while
-            // the slot is still LIVE. These `(meta_page, value, rid)` triples
-            // are scrubbed from the on-disk B+trees in the aliasing gate below.
-            let btree_cols: Vec<(usize, PageId)> = table
+            // the slot is still LIVE. These `(meta_page, key, rid)` triples are
+            // scrubbed from the on-disk B+trees in the aliasing gate below. Both
+            // durable kinds are covered: BTree (one key, the value) and FullText
+            // (one key per token). The durable edge index (P3.b) is scrubbed the
+            // same way — `__edges__.from_id`'s `index_root` is a BTree over
+            // `from_id`, so it falls out of this same loop.
+            let mut durable_removals: Vec<(PageId, OrderedValue, RowId)> = Vec::new();
+            let has_durable = table
                 .columns
                 .iter()
-                .enumerate()
-                .filter_map(|(i, c)| match (c.index, c.index_root) {
-                    (Some(IndexKind::BTree), Some(root)) if !c.dropped => Some((i, root)),
-                    _ => None,
-                })
-                .collect();
-            let mut btree_removals: Vec<(PageId, OrderedValue, RowId)> = Vec::new();
-            if clean_indexes && !btree_cols.is_empty() {
+                .any(|c| !c.dropped && c.index_root.is_some());
+            if clean_indexes && has_durable {
                 for rid in &reclaimable {
                     let Ok(bytes) = heap.get_raw(*rid, &self.pool) else {
                         continue;
                     };
                     let row = executor::decode_row(&bytes, &table.columns)?;
-                    for (i, root) in &btree_cols {
-                        if let Ok(v) = OrderedValue::try_from(&row[*i]) {
-                            btree_removals.push((*root, v, *rid));
+                    for (i, col) in table.columns.iter().enumerate() {
+                        let Some(root) = (if col.dropped { None } else { col.index_root }) else {
+                            continue;
+                        };
+                        match col.index {
+                            Some(IndexKind::BTree) => {
+                                if let Ok(v) = OrderedValue::try_from(&row[i]) {
+                                    durable_removals.push((root, v, *rid));
+                                }
+                            }
+                            Some(IndexKind::FullText) => {
+                                if let Literal::Text(text) = &row[i] {
+                                    for token in fulltext::tokenize(text) {
+                                        durable_removals.push((
+                                            root,
+                                            OrderedValue::Text(token),
+                                            *rid,
+                                        ));
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -1253,15 +1340,10 @@ impl Engine {
             // secondary index BEFORE their slots can be reused. Skipped only
             // when a test deliberately reproduces the hazard.
             if clean_indexes {
-                if table.name == edges::EDGES_TABLE {
-                    for rid in &reclaimable {
-                        self.edge_index.remove_rowid(*rid);
-                    }
-                }
                 self.index_worker.remove_rows(&table.name, &reclaimable);
-                // P3.a: scrub the durable on-disk B+trees too (synchronous,
+                // P3.a/P3.b: scrub the durable on-disk B+trees too (synchronous,
                 // WAL-logged), so a reused slot can't surface a stale candidate.
-                for (root, value, rid) in &btree_removals {
+                for (root, value, rid) in &durable_removals {
                     let tree = DiskBTree::new(*root, page_size);
                     tree.remove(value, *rid, &mut self.pool, &mut self.wal)?;
                 }
@@ -1329,51 +1411,38 @@ fn count_live_slots(heap: &Heap, pool: &BufferPool) -> Result<usize> {
     Ok(n)
 }
 
-/// Rebuild the edge-list index from `__edges__`'s currently-committed rows.
-/// Unlike `rebuild_secondary_indexes`, this is entirely synchronous — no
-/// worker, no channel — since a `HashMap` insert is O(1) amortized, not
-/// M2's O(n log n)-per-upsert HNSW rebuild cost. Uses the same ordinary
-/// begin/scan/commit read-only transaction pattern for MVCC-correct
-/// visibility of committed rows.
-fn rebuild_edge_index(
-    catalog: &Catalog,
+/// Ensure the durable edge-adjacency index exists and return its meta page id
+/// (P3.b). The edge index is a `DiskBTree` over `__edges__.from_id`, stored in
+/// that column's `ColumnDef.index_root`. If it already exists (the normal case
+/// on every reopen), this just returns the stored meta page — **no rebuild**,
+/// the Phase-3 win. It is created (and any pre-existing committed edges
+/// backfilled once) only the first time, e.g. on a database created before
+/// P3.b or a freshly-created `__edges__` table. Idempotent.
+#[allow(clippy::too_many_arguments)] // open-time wiring, mirrors rebuild_* helpers
+fn ensure_edge_index(
+    catalog: &mut Catalog,
     txn_mgr: &mut TransactionManager,
     pool: &mut BufferPool,
     wal: &mut Wal,
     lock_mgr: &mut LockManager,
+    control_path: &Path,
+    control: &mut ControlData,
     page_size: usize,
-) -> Result<EdgeIndex> {
-    let mut index = EdgeIndex::new();
-    let table = catalog.lookup(edges::EDGES_TABLE)?;
-    let heap = Heap::from_pages(page_size, table.pages.clone());
-    let xid = txn_mgr.begin(IsolationLevel::ReadCommitted, wal)?;
-    let snapshot = txn_mgr.snapshot_for_statement(xid)?;
-    for (row_id, bytes) in heap.scan(&snapshot, xid, pool)? {
-        let row = executor::decode_row(&bytes, &table.columns)?;
-        if let Literal::Int(from_id) = row[0] {
-            index.insert(from_id, row_id);
-        }
+) -> Result<PageId> {
+    // Already built? Reuse it — this is the no-rebuild-on-open fast path.
+    let existing = catalog
+        .lookup(edges::EDGES_TABLE)?
+        .columns
+        .iter()
+        .find(|c| c.name == "from_id")
+        .and_then(|c| c.index_root);
+    if let Some(meta) = existing {
+        return Ok(meta);
     }
-    txn_mgr.commit(xid, wal, lock_mgr)?;
-    Ok(index)
-}
 
-/// Backfill the CSR graph index (M7) from `__edges__`'s currently
-/// committed rows, mirroring `rebuild_secondary_indexes`'s exact
-/// backfill-then-`MarkReady` shape. Kept separate from that function
-/// because `__edges__`'s CSR index is engine-managed — never a
-/// `ColumnDef.index` a user sets via `CREATE INDEX` — so
-/// `rebuild_secondary_indexes`'s `columns.iter().filter(|c| c.index.
-/// is_some())` scan naturally never touches it.
-fn rebuild_csr_index(
-    catalog: &Catalog,
-    txn_mgr: &mut TransactionManager,
-    pool: &mut BufferPool,
-    wal: &mut Wal,
-    lock_mgr: &mut LockManager,
-    page_size: usize,
-    handle: &IndexHandle,
-) -> Result<()> {
+    // First-time creation: build the tree and backfill committed edges (empty
+    // on a fresh database; non-empty only when upgrading a pre-P3.b `__edges__`).
+    let tree = DiskBTree::create(pool, wal)?;
     let table = catalog.lookup(edges::EDGES_TABLE)?.clone();
     let heap = Heap::from_pages(page_size, table.pages.clone());
     let xid = txn_mgr.begin(IsolationLevel::ReadCommitted, wal)?;
@@ -1381,24 +1450,35 @@ fn rebuild_csr_index(
     for (row_id, bytes) in heap.scan(&snapshot, xid, pool)? {
         let row = executor::decode_row(&bytes, &table.columns)?;
         if let Literal::Int(from_id) = row[0] {
-            handle.send(IndexMsg::Upsert {
-                table: edges::EDGES_TABLE.to_string(),
-                record: row_id,
-                indexed_cols: vec![IndexedColumn::Edge {
-                    column: "from_id".to_string(),
-                    from_id,
-                }],
-            });
+            tree.insert(OrderedValue::Int(from_id), row_id, pool, wal)?;
         }
     }
     txn_mgr.commit(xid, wal, lock_mgr)?;
 
-    handle.send(IndexMsg::MarkReady {
-        table: edges::EDGES_TABLE.to_string(),
-        column: "from_id".to_string(),
-        kind: IndexKind::Csr,
-    });
-    Ok(())
+    // Persist `from_id`'s index = BTree + its meta page. Marking the column a
+    // real BTree index means vacuum scrubs it via the generic durable-index
+    // path and `SELECT * FROM __edges__ WHERE from_id = ?` is index-assisted for
+    // free — `create_edge`/`delete_edge` keep it current via the same tree.
+    let mut cctx = CatalogCtx {
+        pool,
+        wal,
+        control_path,
+        control,
+        page_size,
+    };
+    catalog.set_column_index(
+        edges::EDGES_TABLE,
+        "from_id",
+        Some(IndexKind::BTree),
+        &mut cctx,
+    )?;
+    catalog.set_column_index_root(
+        edges::EDGES_TABLE,
+        "from_id",
+        Some(tree.meta_page()),
+        &mut cctx,
+    )?;
+    Ok(tree.meta_page())
 }
 
 /// Derive the next `seq` to assign in `__events__`, from its own
@@ -1450,14 +1530,14 @@ fn rebuild_secondary_indexes(
     handle: &IndexHandle,
 ) -> Result<()> {
     for table in catalog.tables() {
-        // P3.a: BTree indexes are durable (paged, WAL-logged, crash-recovered),
-        // so they are NOT rebuilt on open — that is the whole point of Phase 3.
-        // Only the still-in-memory kinds (Hnsw/FullText, plus Csr via the
-        // separate `rebuild_csr_index`) are reconstructed here.
+        // Phase 3: BTree (P3.a) and FullText (P3.b) indexes are durable (paged,
+        // WAL-logged, crash-recovered) and the edge index is durable too — none
+        // are rebuilt on open. Only the still-in-memory vector (Hnsw) index is
+        // reconstructed here; P3.c will make it durable and retire this worker.
         let indexed_cols: Vec<&ColumnDef> = table
             .columns
             .iter()
-            .filter(|c| matches!(c.index, Some(IndexKind::Hnsw | IndexKind::FullText)))
+            .filter(|c| matches!(c.index, Some(IndexKind::Hnsw)))
             .collect();
         if indexed_cols.is_empty() {
             continue;
@@ -2106,9 +2186,7 @@ mod tests {
         let entry = guard
             .get(&("t".to_string(), "embedding".to_string()))
             .unwrap();
-        let index_worker::SecondaryIndex::Vector(v) = &entry.index else {
-            panic!("expected a vector index");
-        };
+        let index_worker::SecondaryIndex::Vector(v) = &entry.index;
         assert_eq!(v.len(), 1);
     }
 
@@ -2144,9 +2222,7 @@ mod tests {
         let entry = guard
             .get(&("t".to_string(), "embedding".to_string()))
             .unwrap();
-        let index_worker::SecondaryIndex::Vector(v) = &entry.index else {
-            panic!("expected a vector index");
-        };
+        let index_worker::SecondaryIndex::Vector(v) = &entry.index;
         assert_eq!(v.len(), 2);
     }
 
@@ -2189,21 +2265,26 @@ mod tests {
         assert_eq!(result[0], SqlResult::CreatedIndex);
         engine.commit(xid2).unwrap();
 
-        // Backfill happens immediately (unlike set_column_index's Rust-API
-        // path), so this should reach Ready without needing a reopen.
-        wait_for_status(&engine, "t", "body", index_worker::IndexStatus::Ready);
-
-        let guard = engine.index_worker.indexes.read().unwrap();
-        let entry = guard.get(&("t".to_string(), "body".to_string())).unwrap();
-        let index_worker::SecondaryIndex::FullText(idx) = &entry.index else {
-            panic!("expected a full-text index");
-        };
-        let rust_hits = idx.search("rust");
-        let python_hits = idx.search("python");
+        // P3.b: the full-text index is durable and synchronous — no `Ready`
+        // wait — and now has a real read path (`Engine::search_fulltext`).
+        let xid3 = engine.begin().unwrap();
+        let rust_hits = engine.search_fulltext(xid3, "t", "body", "rust").unwrap();
+        let python_hits = engine.search_fulltext(xid3, "t", "body", "python").unwrap();
         assert_eq!(rust_hits.len(), 1);
         assert_eq!(python_hits.len(), 1);
         assert_ne!(rust_hits, python_hits);
-        assert!(idx.search("nonexistent").is_empty());
+        assert!(engine
+            .search_fulltext(xid3, "t", "body", "nonexistent")
+            .unwrap()
+            .is_empty());
+        // AND-only intersection: only row 1 has both "rust" and "database".
+        assert_eq!(
+            engine
+                .search_fulltext(xid3, "t", "body", "rust database")
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

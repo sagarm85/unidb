@@ -97,7 +97,11 @@ impl InvertedIndex {
     }
 }
 
-fn tokenize(text: &str) -> HashSet<String> {
+/// Whitespace split, strip non-alphanumeric edges, lowercase — no stemming,
+/// stopwords, or ranking (M2.c scope). `pub(crate)` since P3.b so the durable
+/// full-text path (`sql/executor.rs`) derives the same token set a row's
+/// on-disk B+tree entries are keyed by.
+pub(crate) fn tokenize(text: &str) -> HashSet<String> {
     text.split_whitespace()
         .map(|w| {
             w.trim_matches(|c: char| !c.is_alphanumeric())

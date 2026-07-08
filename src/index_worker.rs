@@ -1,48 +1,38 @@
-// Background secondary-index worker (M2.b): the engine's first background
-// thread. It owns only in-memory index structures, built purely from
-// channel messages sent by the foreground thread — it never touches
-// `BufferPool`/`Wal`/`Heap`, none of which have synchronization primitives
-// or are designed for concurrent access. Both the rebuild-on-open rescan
-// (run on the foreground thread against the already-owned `Heap`/`Catalog`)
-// and every live INSERT/UPDATE funnel through the same `IndexMsg::Upsert`
-// channel, so the worker thread's job is uniformly "apply whatever arrives."
+// Background secondary-index worker (M2.b): the engine's async index thread.
+// It owns only in-memory index structures, built purely from channel messages
+// sent by the foreground thread — it never touches `BufferPool`/`Wal`/`Heap`,
+// none of which have synchronization primitives or are designed for concurrent
+// access. Both the rebuild-on-open rescan and every live INSERT/UPDATE funnel
+// through the same `IndexMsg::Upsert` channel, so the worker's job is uniformly
+// "apply whatever arrives."
 //
-// The index is derived, rebuildable data with zero WAL footprint (CLAUDE.md
-// M2 scope): losing it on crash just means rebuilding on next open, so there
-// is no new durability contract here, only an eventual-consistency one.
+// **Since Phase 3 this worker serves only the vector (HNSW) index.** The B-Tree
+// (P3.a), full-text/inverted (P3.b), and edge-adjacency (P3.b) indexes all
+// became durable, synchronous, WAL-logged on-disk B+trees written on the writer
+// thread (`sql/executor.rs::apply_durable_index_writes`, `graph/edges.rs`), so
+// they no longer flow through here. The CSR graph index (M7) was retired in
+// P3.b — it was consulted by no read path after the M7 traversal-uses-CSR
+// revert, and adjacency is now served durably by the edge index. HNSW remains
+// here because its graph construction is O(n log n) per upsert and genuinely
+// benefits from running off the write path; it is still rebuilt on open (P3.c
+// will make it durable too, at which point this worker can be removed).
 //
-// `SecondaryIndex` has `Vector` (M2.b), `FullText` (M2.c), `BTree` (M6),
-// and `Csr` (M7) variants. The message/status plumbing below is keyed by
-// `(table, column)`, not by index kind, so it generalized to each new kind
-// with no changes to its shape.
-//
-// `Csr` is the one variant that doesn't apply its `Upsert` immediately —
-// `CsrIndex::stage` just records the edge, and `worker_loop` debounces the
-// actual `CsrIndex::rebuild()` call: it drains every currently-queued
-// message (via `try_recv`) before rebuilding any CSR entry touched during
-// that burst, coalescing N queued edge writes into one rebuild pass
-// instead of one per message. This is a deliberate improvement over
-// `VectorIndex`'s still-unfixed "rebuild on every single upsert" pattern
-// (see `vector.rs`'s module doc) — CSR's rebuild cost is a function of the
-// *entire* edge set, and edges are typically written far more frequently
-// than vector upserts, so debouncing matters more here.
+// The index is derived, rebuildable data with zero WAL footprint: losing it on
+// crash just means rebuilding on next open — an eventual-consistency contract,
+// not a durability one.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{mpsc, Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::catalog::IndexKind;
-use crate::csr_index::CsrIndex;
-use crate::fulltext::InvertedIndex;
 use crate::heap::RowId;
 use crate::vector::VectorIndex;
 
 #[derive(Debug, Clone)]
 pub enum IndexedColumn {
     Vector { column: String, data: Vec<f32> },
-    Text { column: String, data: String },
-    Edge { column: String, from_id: i64 },
 }
 
 pub enum IndexMsg {
@@ -52,12 +42,10 @@ pub enum IndexMsg {
         indexed_cols: Vec<IndexedColumn>,
     },
     /// Sent once, after every row from a rebuild-on-open or `CREATE INDEX`
-    /// backfill has been enqueued, so the worker can flip `Building` to
-    /// `Ready` at the point it has actually drained the backlog rather than
-    /// the point the foreground finished *sending* it (those differ since
-    /// processing is asynchronous). Carries `kind` because a backfill over
-    /// zero currently-committed rows never sends a single `Upsert` — this
-    /// message alone must be able to create the (empty, `Ready`) entry.
+    /// backfill has been enqueued, so the worker can flip `Building` to `Ready`
+    /// at the point it has actually drained the backlog. Carries `kind` because
+    /// a backfill over zero rows never sends a single `Upsert` — this message
+    /// alone must be able to create the (empty, `Ready`) entry.
     MarkReady {
         table: String,
         column: String,
@@ -68,13 +56,10 @@ pub enum IndexMsg {
 
 pub enum SecondaryIndex {
     Vector(VectorIndex),
-    FullText(InvertedIndex),
-    Csr(CsrIndex),
 }
 
 // `serde::Serialize` for the M5 REST server (`GET /indexes/:table/:column/
-// status`) — see `heap::RowId`'s doc comment for why this isn't
-// feature-gated.
+// status`) — see `heap::RowId`'s doc comment for why this isn't feature-gated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum IndexStatus {
     Building { rows_done: u64 },
@@ -86,10 +71,9 @@ pub struct IndexEntry {
     pub index: SecondaryIndex,
 }
 
-/// Keyed by `(table, column)`. Shared with the foreground thread — the one
-/// narrow, explicit exception to "the worker owns its structures alone"
-/// (CLAUDE.md's M2 plan): a read lock lets future `NEAR` queries (M2.d) see
-/// the current index without touching `BufferPool`/`Wal`/`Heap`.
+/// Keyed by `(table, column)`. Shared with the foreground thread so `NEAR`
+/// queries can read the current index without touching `BufferPool`/`Wal`/
+/// `Heap` (the one narrow exception to "the worker owns its structures alone").
 pub type SharedIndexes = Arc<RwLock<HashMap<(String, String), IndexEntry>>>;
 
 pub struct IndexHandle {
@@ -115,28 +99,21 @@ impl IndexHandle {
     }
 
     /// A channel-send failure means the worker thread already exited (e.g.
-    /// panicked). A stale/missing secondary index is a correctness
-    /// non-issue — it's rebuilt on next open — not a durability one, so this
-    /// logs and drops rather than propagating an error to the SQL caller.
+    /// panicked). A stale/missing secondary index is a correctness non-issue —
+    /// it's rebuilt on next open — so this logs and drops rather than
+    /// propagating an error to the SQL caller.
     pub fn send(&self, msg: IndexMsg) {
         if self.tx.send(msg).is_err() {
             tracing::warn!("index worker channel closed; dropping message");
         }
     }
 
-    /// Synchronously scrub every reclaimed `RowId` from all in-memory
-    /// secondary indexes for `table` (M10.c index vacuum). Runs on the
-    /// caller's (writer) thread under the shared write lock — vacuum needs the
-    /// removal to have *completed* before it hands the freed slot out for
-    /// reuse, so this deliberately is not an async channel message.
-    ///
-    /// `Vector`/`FullText` support removal by `RowId`. `BTree` is no longer
-    /// here (P3.a — it is durable; vacuum scrubs it directly via `DiskBTree::
-    /// remove`, see `lib.rs`). `Csr`
-    /// entries are intentionally left untouched: the CSR index is rebuilt from
-    /// committed rows on every open and — since M7's traversal-uses-CSR wiring
-    /// was reverted — is not consulted by any read path, so a stale CSR
-    /// candidate can never surface a wrong answer (see `graph/index.rs`).
+    /// Synchronously scrub every reclaimed `RowId` from the in-memory vector
+    /// index for `table` (M10.c index vacuum). Runs on the caller's (writer)
+    /// thread under the shared write lock — vacuum needs the removal to have
+    /// *completed* before it hands the freed slot out for reuse. The durable
+    /// indexes (BTree/FullText/edge) are scrubbed separately, directly on disk
+    /// (`lib.rs::vacuum_inner`).
     pub fn remove_rows(&self, table: &str, rows: &[RowId]) {
         if rows.is_empty() {
             return;
@@ -149,8 +126,6 @@ impl IndexHandle {
             for &rid in rows {
                 match &mut entry.index {
                     SecondaryIndex::Vector(v) => v.remove(rid),
-                    SecondaryIndex::FullText(ft) => ft.remove(rid),
-                    SecondaryIndex::Csr(_) => {}
                 }
             }
         }
@@ -173,9 +148,7 @@ impl IndexHandle {
         };
         let (done_tx, done_rx) = mpsc::channel();
         // `std::thread::JoinHandle::join` has no timeout in std; run it on a
-        // throwaway watcher thread and bound *our* wait via `recv_timeout`
-        // instead. If the worker never finishes, the watcher just leaks
-        // (harmless — the process is shutting down this engine either way).
+        // throwaway watcher thread and bound *our* wait via `recv_timeout`.
         let _ = thread::Builder::new().spawn(move || {
             let _ = join.join();
             let _ = done_tx.send(());
@@ -189,28 +162,19 @@ impl IndexHandle {
 fn new_index_for_kind(kind: IndexKind) -> SecondaryIndex {
     match kind {
         IndexKind::Hnsw => SecondaryIndex::Vector(VectorIndex::new()),
-        IndexKind::FullText => SecondaryIndex::FullText(InvertedIndex::new()),
-        // BTree is durable since P3.a and never handled by this worker — the
-        // executor writes it synchronously and never sends it an Upsert/
-        // MarkReady, so this arm is unreachable by construction.
-        IndexKind::BTree => {
-            unreachable!("BTree indexes are durable (P3.a), not managed by the async worker")
+        // BTree (P3.a), FullText (P3.b), and Csr (retired in P3.b) are never
+        // handled by this worker — the executor/graph layer write them durably,
+        // so these arms are unreachable by construction.
+        other => {
+            unreachable!(
+                "{other:?} is a durable/retired index kind, not managed by the async worker"
+            )
         }
-        IndexKind::Csr => SecondaryIndex::Csr(CsrIndex::new()),
     }
 }
 
-/// One `(table, column)` key touched by a CSR-backed `Upsert` during the
-/// current drain cycle — collected by `apply_msg`, rebuilt exactly once by
-/// `rebuild_dirty` after the burst has been fully applied.
-type DirtyCsrKeys = HashSet<(String, String)>;
-
-/// Apply one message, returning `false` iff it was `Shutdown` (the caller
-/// must stop the loop). Every non-CSR variant behaves exactly as before —
-/// applied immediately, no debouncing. CSR's `Upsert` handling only
-/// stages the edge and records the key in `dirty`; the actual
-/// `CsrIndex::rebuild()` happens in `rebuild_dirty`, once per drain cycle.
-fn apply_msg(msg: IndexMsg, indexes: &SharedIndexes, dirty: &mut DirtyCsrKeys) -> bool {
+/// Apply one message, returning `false` iff it was `Shutdown`.
+fn apply_msg(msg: IndexMsg, indexes: &SharedIndexes) -> bool {
     match msg {
         IndexMsg::Shutdown => return false,
         IndexMsg::MarkReady {
@@ -244,43 +208,8 @@ fn apply_msg(msg: IndexMsg, indexes: &SharedIndexes, dirty: &mut DirtyCsrKeys) -
                         if let IndexStatus::Building { rows_done } = &mut entry.status {
                             *rows_done += 1;
                         }
-                        let SecondaryIndex::Vector(v) = &mut entry.index else {
-                            continue;
-                        };
+                        let SecondaryIndex::Vector(v) = &mut entry.index;
                         v.upsert(record, data);
-                    }
-                    IndexedColumn::Text { column, data } => {
-                        let mut guard = indexes.write().unwrap();
-                        let entry =
-                            guard
-                                .entry((table.clone(), column))
-                                .or_insert_with(|| IndexEntry {
-                                    status: IndexStatus::Building { rows_done: 0 },
-                                    index: new_index_for_kind(IndexKind::FullText),
-                                });
-                        if let IndexStatus::Building { rows_done } = &mut entry.status {
-                            *rows_done += 1;
-                        }
-                        let SecondaryIndex::FullText(t) = &mut entry.index else {
-                            continue;
-                        };
-                        t.upsert(record, &data);
-                    }
-                    IndexedColumn::Edge { column, from_id } => {
-                        let mut guard = indexes.write().unwrap();
-                        let key = (table.clone(), column);
-                        let entry = guard.entry(key.clone()).or_insert_with(|| IndexEntry {
-                            status: IndexStatus::Building { rows_done: 0 },
-                            index: new_index_for_kind(IndexKind::Csr),
-                        });
-                        if let IndexStatus::Building { rows_done } = &mut entry.status {
-                            *rows_done += 1;
-                        }
-                        let SecondaryIndex::Csr(csr) = &mut entry.index else {
-                            continue;
-                        };
-                        csr.stage(from_id, record);
-                        dirty.insert(key);
                     }
                 }
             }
@@ -289,54 +218,14 @@ fn apply_msg(msg: IndexMsg, indexes: &SharedIndexes, dirty: &mut DirtyCsrKeys) -
     true
 }
 
-/// Rebuild every CSR entry touched during the current drain cycle exactly
-/// once, then clear the dirty set.
-fn rebuild_dirty(indexes: &SharedIndexes, dirty: &mut DirtyCsrKeys) {
-    if dirty.is_empty() {
-        return;
-    }
-    let mut guard = indexes.write().unwrap();
-    for key in dirty.iter() {
-        if let Some(entry) = guard.get_mut(key) {
-            if let SecondaryIndex::Csr(csr) = &mut entry.index {
-                csr.rebuild();
-            }
-        }
-    }
-    dirty.clear();
-}
-
 fn worker_loop(rx: mpsc::Receiver<IndexMsg>, indexes: SharedIndexes) {
     loop {
         let Ok(msg) = rx.recv() else {
             return; // sender dropped
         };
-        let mut dirty: DirtyCsrKeys = HashSet::new();
-        if !apply_msg(msg, &indexes, &mut dirty) {
+        if !apply_msg(msg, &indexes) {
             return; // Shutdown
         }
-
-        // Drain every currently-queued message before rebuilding any dirty
-        // CSR index — coalesces a burst of edge writes arriving together
-        // into one rebuild pass instead of one per message (see module
-        // doc). Falls back to the blocking `recv()` above once the channel
-        // is momentarily empty.
-        loop {
-            match rx.try_recv() {
-                Ok(msg) => {
-                    if !apply_msg(msg, &indexes, &mut dirty) {
-                        rebuild_dirty(&indexes, &mut dirty);
-                        return;
-                    }
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    rebuild_dirty(&indexes, &mut dirty);
-                    return;
-                }
-            }
-        }
-        rebuild_dirty(&indexes, &mut dirty);
     }
 }
 
@@ -353,8 +242,8 @@ mod tests {
     }
 
     /// Block until `f()` returns true or ~1s elapses — the worker applies
-    /// messages asynchronously, so tests must poll rather than assume
-    /// immediate application.
+    /// messages asynchronously, so tests must poll rather than assume immediate
+    /// application.
     fn wait_for(mut f: impl FnMut() -> bool) {
         let start = Instant::now();
         while !f() {
@@ -394,107 +283,10 @@ mod tests {
             let entry = guard
                 .get(&("t".to_string(), "embedding".to_string()))
                 .unwrap();
-            let SecondaryIndex::Vector(v) = &entry.index else {
-                panic!("expected a vector index");
-            };
+            let SecondaryIndex::Vector(v) = &entry.index;
             assert_eq!(v.len(), 1);
         }
 
-        handle.shutdown();
-    }
-
-    #[test]
-    fn edge_upserts_eventually_produce_correct_csr_candidates() {
-        let mut handle = IndexHandle::spawn();
-        handle.send(IndexMsg::Upsert {
-            table: "__edges__".into(),
-            record: rid(1, 0),
-            indexed_cols: vec![IndexedColumn::Edge {
-                column: "from_id".into(),
-                from_id: 42,
-            }],
-        });
-        handle.send(IndexMsg::Upsert {
-            table: "__edges__".into(),
-            record: rid(1, 1),
-            indexed_cols: vec![IndexedColumn::Edge {
-                column: "from_id".into(),
-                from_id: 42,
-            }],
-        });
-        handle.send(IndexMsg::MarkReady {
-            table: "__edges__".into(),
-            column: "from_id".into(),
-            kind: IndexKind::Csr,
-        });
-        wait_for(|| handle.status("__edges__", "from_id") == Some(IndexStatus::Ready));
-
-        let guard = handle.indexes.read().unwrap();
-        let entry = guard
-            .get(&("__edges__".to_string(), "from_id".to_string()))
-            .unwrap();
-        let SecondaryIndex::Csr(csr) = &entry.index else {
-            panic!("expected a CSR index");
-        };
-        let mut candidates = csr.candidates(42).to_vec();
-        candidates.sort_by_key(|r| r.slot);
-        assert_eq!(candidates, vec![rid(1, 0), rid(1, 1)]);
-        drop(guard);
-        handle.shutdown();
-    }
-
-    /// M7's debounce proof: a burst of `Upsert` messages sent back-to-back
-    /// (no gap for the worker to drain between sends) must coalesce into
-    /// far fewer `CsrIndex::rebuild()` calls than messages sent — not
-    /// exactly one, since the sender and worker threads race in ways a
-    /// test can't fully pin down, but meaningfully less than N, proving
-    /// real coalescing rather than "did nothing."
-    #[test]
-    fn burst_of_edge_upserts_coalesces_into_far_fewer_rebuilds_than_messages() {
-        let mut handle = IndexHandle::spawn();
-        const N: i64 = 200;
-        for i in 0..N {
-            handle.send(IndexMsg::Upsert {
-                table: "__edges__".into(),
-                record: rid(1, (i % 1000) as u16),
-                indexed_cols: vec![IndexedColumn::Edge {
-                    column: "from_id".into(),
-                    from_id: i,
-                }],
-            });
-        }
-        handle.send(IndexMsg::MarkReady {
-            table: "__edges__".into(),
-            column: "from_id".into(),
-            kind: IndexKind::Csr,
-        });
-        wait_for(|| handle.status("__edges__", "from_id") == Some(IndexStatus::Ready));
-        // The Ready flip and the final rebuild can race by one message, so
-        // give the last rebuild a brief moment to land before reading the
-        // count.
-        std::thread::sleep(Duration::from_millis(20));
-
-        let guard = handle.indexes.read().unwrap();
-        let entry = guard
-            .get(&("__edges__".to_string(), "from_id".to_string()))
-            .unwrap();
-        let SecondaryIndex::Csr(csr) = &entry.index else {
-            panic!("expected a CSR index");
-        };
-        // Every from_id (0..N) must be findable regardless of how many
-        // rebuild passes it took.
-        for i in 0..N {
-            assert!(
-                !csr.candidates(i).is_empty(),
-                "from_id {i} missing from CSR after settling"
-            );
-        }
-        let rebuilds = csr.rebuild_count();
-        assert!(
-            rebuilds < N as usize,
-            "expected debouncing to coalesce {N} messages into far fewer than {N} rebuilds, got {rebuilds}"
-        );
-        drop(guard);
         handle.shutdown();
     }
 
@@ -505,48 +297,48 @@ mod tests {
         handle.shutdown();
     }
 
-    /// M10.c: `remove_rows` synchronously scrubs reclaimed RowIds from a
-    /// table's in-memory secondary indexes (here a full-text index), so a
-    /// vacuumed slot can be reused without a stale candidate surviving. (The
-    /// BTree is durable since P3.a and scrubbed directly via `DiskBTree::
-    /// remove`, tested in `btree_index.rs`, not through this worker.)
+    /// M10.c: `remove_rows` synchronously scrubs reclaimed RowIds from the
+    /// in-memory vector index, so a vacuumed slot can be reused without a stale
+    /// candidate surviving. (BTree/FullText/edge are durable since P3.a/P3.b and
+    /// scrubbed directly on disk, tested in `btree_index.rs`/`lib.rs`.)
     #[test]
-    fn remove_rows_scrubs_reclaimed_rowids_from_secondary_indexes() {
+    fn remove_rows_scrubs_reclaimed_rowids_from_vector_index() {
         let mut handle = IndexHandle::spawn();
         handle.send(IndexMsg::Upsert {
             table: "t".into(),
             record: rid(4, 0),
-            indexed_cols: vec![IndexedColumn::Text {
-                column: "body".into(),
-                data: "hello world".into(),
+            indexed_cols: vec![IndexedColumn::Vector {
+                column: "embedding".into(),
+                data: vec![1.0, 2.0],
             }],
         });
         handle.send(IndexMsg::MarkReady {
             table: "t".into(),
-            column: "body".into(),
-            kind: IndexKind::FullText,
+            column: "embedding".into(),
+            kind: IndexKind::Hnsw,
         });
-        wait_for(|| handle.status("t", "body") == Some(IndexStatus::Ready));
+        wait_for(|| handle.status("t", "embedding") == Some(IndexStatus::Ready));
         wait_for(|| {
             let guard = handle.indexes.read().unwrap();
             matches!(
-                &guard.get(&("t".to_string(), "body".to_string())).unwrap().index,
-                SecondaryIndex::FullText(ft) if !ft.search("hello").is_empty()
+                &guard
+                    .get(&("t".to_string(), "embedding".to_string()))
+                    .unwrap()
+                    .index,
+                SecondaryIndex::Vector(v) if v.len() == 1
             )
         });
 
         handle.remove_rows("t", &[rid(4, 0)]);
 
         let guard = handle.indexes.read().unwrap();
-        let SecondaryIndex::FullText(ft) = &guard
-            .get(&("t".to_string(), "body".to_string()))
+        let SecondaryIndex::Vector(v) = &guard
+            .get(&("t".to_string(), "embedding".to_string()))
             .unwrap()
-            .index
-        else {
-            panic!("expected a full-text index");
-        };
-        assert!(
-            ft.search("hello").is_empty(),
+            .index;
+        assert_eq!(
+            v.len(),
+            0,
             "the reclaimed RowId must be gone from the index"
         );
         drop(guard);
@@ -557,16 +349,12 @@ mod tests {
     fn shutdown_actually_joins_worker_thread() {
         let mut handle = IndexHandle::spawn();
         handle.shutdown();
-        // After shutdown, the join handle is consumed; a second call is a
-        // no-op rather than a panic.
         handle.shutdown();
     }
 
     /// Regression test: a `MarkReady` for a column with zero rows at
-    /// index-creation time (e.g. `CREATE INDEX` on an empty table) must
-    /// still create a `Ready` entry — previously it silently no-opped
-    /// because no `Upsert` had ever created the entry, and a later live
-    /// upsert would re-create it stuck in `Building` forever.
+    /// index-creation time (e.g. `CREATE INDEX` on an empty table) must still
+    /// create a `Ready` entry — previously it silently no-opped.
     #[test]
     fn mark_ready_on_never_upserted_column_creates_ready_entry() {
         let mut handle = IndexHandle::spawn();
@@ -577,7 +365,6 @@ mod tests {
         });
         wait_for(|| handle.status("t", "embedding") == Some(IndexStatus::Ready));
 
-        // A live upsert after that must not regress status back to Building.
         handle.send(IndexMsg::Upsert {
             table: "t".into(),
             record: rid(1, 0),

@@ -2217,3 +2217,77 @@ workspace.
 WAL-logged + crash-recovered; tuple format unchanged; new record kind + page
 type; `FORMAT_VERSION` **4 → 5**). No decision reversed.
 **PR:** _pending._
+
+---
+
+### P3.b — Durable inverted (full-text) + edge index; CSR retired   [Core lane — Phase 3 — shipped]   2026-07-08
+
+**Branch:** `durable-storage`. Second Phase 3 checkpoint — the remaining
+rebuilt-on-open indexes that map a key to a posting list of `RowId`s become
+durable, **reusing P3.a's `DiskBTree` + `WAL_INDEX` machinery wholesale** (no new
+record kind, page type, or `FORMAT_VERSION` bump).
+**Summary:** full-text (inverted) and the edge-adjacency index are now durable
+on-disk B+trees, read from disk on open; the M7 CSR index is retired.
+
+**Design (the reuse insight):** both a full-text index (token → docs) and an
+edge index (from_id → edge rows) are the same shape a `DiskBTree` already is —
+a key mapped to many `RowId`s. So neither needed a new structure:
+- **Full-text** (`sql/executor.rs`, `fulltext.rs`): on write, `apply_durable_
+  index_writes` tokenizes the text (`fulltext::tokenize`, now `pub(crate)`) and
+  inserts one `(OrderedValue::Text(token), RowId)` entry per token; `CREATE
+  INDEX ... USING FULLTEXT` builds + backfills the tree the same way BTree does.
+  New read path **`Engine::search_fulltext`** tokenizes the query, intersects
+  each token's `search_eq` posting list (AND-only, M2.c semantics), and
+  MVCC-resolves survivors — the durable index previously had *no* query surface.
+- **Edge index** (`lib.rs`, `graph/edges.rs`, `graph/executor.rs`,
+  `graph/index.rs`): `__edges__.from_id` becomes a real durable `BTree` index
+  (`ensure_edge_index` at open creates/loads it, caching the meta page on the
+  `Engine` as `edge_index_meta`). `create_edge`/`delete_edge` maintain it via
+  `DiskBTree::insert`/`remove(OrderedValue::Int(from_id), rid)`; `edges_from`
+  and the Cypher executor read it via `search_eq`. The in-memory `EdgeIndex`
+  struct and `rebuild_edge_index` are gone. Vacuum scrubs it through the same
+  generic durable-index path (from_id is now `IndexKind::BTree`).
+
+**CSR retired (recorded decision, evidence-based):** `csr_index.rs` was
+consulted by no read path after M7's own "prefer CSR for traversal" wiring was
+reverted (a self-visibility bug found during M8 merge verification — see the M7
+entry's correction), and adjacency is now served durably by the edge index. So
+its rebuild-on-open (`rebuild_csr_index`) and warm-keeping (`IndexedColumn::
+Edge` sends) were removed. The module + `benches/graph.rs` remain (the CSR-vs-
+naive adjacency benchmark is still a valid measurement) but are no longer wired
+into the runtime. This is a dead-code retirement, not a §3-locked reversal.
+
+**The async index worker now serves only the vector (Hnsw) index** — B-Tree
+(P3.a), full-text, and edge indexes are all durable/synchronous. `index_worker.
+rs` shed its `FullText`/`Csr`/`Edge`/`Text`/`Ordered` variants and the CSR
+debounce machinery; `SecondaryIndex`/`IndexedColumn` are single-variant. (P3.c
+will make vector durable too and retire the worker.)
+
+**Benchmark (`benches/durable_index.rs`, edge-index reopen cost vs. committed
+edge count; Apple Silicon, real fsync):**
+
+| edges | edge-index open (ms) |
+|-------|----------------------|
+| 500   | 2.373 |
+| 2,000 | 2.346 |
+| 5,000 | 2.038 |
+
+Flat reopen time (≈2.0–2.4 ms, independent of edge count) ⇒ the durable edge
+index is not rebuilt on open (before P3.b it was an O(edges) synchronous heap
+scan on every `Engine::open`).
+
+**Crash safety:** new crash points **P14** (durable full-text: committed rows +
+their FULLTEXT index survive a crash, `search_fulltext` works on reopen) and
+**P15** (durable edge index: committed edges survive, `edges_from` works on
+reopen) — both proving no rebuild + WAL recovery through the real Engine API.
+Crash harness **15 → 17**.
+
+**Tests:** `search_fulltext` (single/multi-term AND, reopen), durable full-text
+reopen (`tests/index_rebuild.rs`), edge-index reopen + traversal
+(`tests/graph_rebuild.rs`, `graph_mvcc`), P14/P15. Worker tests trimmed to the
+vector kind. All default-feature + server + workspace suites green; clippy
+`-D warnings` + fmt clean.
+
+**Locked-decision impact:** none new beyond P3.a (same `WAL_INDEX`/D5/D9). No
+`FORMAT_VERSION` bump. No decision reversed (CSR retirement is not a §3 item).
+**PR:** _pending._

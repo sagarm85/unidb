@@ -6,14 +6,17 @@
 // Cypher-variable-to-column mapping happened in `parser.rs`), so this file
 // never needs to know Cypher variable names existed.
 //
-// `edge_index` is passed as an explicit extra argument rather than folded
-// into `ExecCtx` — keeps `sql::executor::ExecCtx` untouched (still exactly
-// the storage/transaction infra M1–M2 built it as) while still letting a
-// `from_id = <literal>` predicate route through the edge-list index
-// instead of a full `__edges__` scan.
+// The durable edge index's meta page id (P3.b) is passed as an explicit extra
+// argument rather than folded into `ExecCtx` — keeps `sql::executor::ExecCtx`
+// untouched (still exactly the storage/transaction infra M1–M2 built it as)
+// while still letting a `from_id = <literal>` predicate route through the
+// durable edge-adjacency `DiskBTree` instead of a full `__edges__` scan. It is
+// a `PageId` (a `Copy` value), so it coexists cleanly with `&mut ctx.pool`.
 
 use crate::{
+    btree_index::{DiskBTree, OrderedValue},
     error::{DbError, Result},
+    format::PageId,
     heap::Heap,
     sql::{
         executor::{decode_row, predicate_matches, ExecCtx, ExecResult},
@@ -23,7 +26,7 @@ use crate::{
 
 use super::{
     edges::{edges_table_def, EDGES_TABLE},
-    index::{resolve_candidates_batched, EdgeIndex},
+    index::resolve_candidates_batched,
     logical::{CypherQuery, ReturnItem},
 };
 
@@ -50,7 +53,7 @@ fn find_from_id_eq(expr: &Expr) -> Option<i64> {
 pub fn execute(
     query: CypherQuery,
     ctx: &mut ExecCtx,
-    edge_index: &EdgeIndex,
+    edge_index_meta: PageId,
 ) -> Result<ExecResult> {
     let table_def = edges_table_def();
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
@@ -72,7 +75,8 @@ pub fn execute(
 
     let rows: Vec<Vec<Literal>> =
         if let Some(from_id) = full_predicate.as_ref().and_then(find_from_id_eq) {
-            let candidates = edge_index.candidates(from_id).to_vec();
+            let candidates = DiskBTree::new(edge_index_meta, ctx.page_size)
+                .search_eq(&OrderedValue::Int(from_id), ctx.pool)?;
             let resolved = resolve_candidates_batched(
                 &candidates,
                 &snapshot,

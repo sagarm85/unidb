@@ -80,17 +80,25 @@
   workspace's dependency union, which is *not* the right check here).
 - **Current work (Core lane): Phase 3 — Multi-model durable storage** (the moat,
   `docs/backlog/phase3_durable_storage.md`), on branch `durable-storage`. **P3.a
-  (durable paged WAL-logged B-Tree) is SHIPPED** — the M6 in-memory `BTreeMap`
-  is replaced by an on-disk B+tree (`DiskBTree`): node pages in the shared page
-  store, buffer-pool-managed, WAL-logged as full node-page images (new redo-only
-  `WAL_INDEX`), crash-recovered, and **no longer rebuilt on open** (removed from
-  `rebuild_secondary_indexes`; moved off the async worker to the synchronous
-  write/read path). A stable per-index meta page (id in `ColumnDef.index_root`)
-  points at the root, so a root split never rewrites the catalog. Crash harness
-  **14 → 15** (P13: total data-file loss recovered from the WAL). `FORMAT_VERSION`
-  **4 → 5**. Dated subsection below; full entry in `PROGRESS.md`. P3.b (durable
-  inverted/CSR/edge), P3.c (on-disk vector — spike first), P3.d (large objects)
-  are next, one PR each.
+  + P3.b are SHIPPED.** All three key→postings secondary indexes are now durable
+  on-disk `DiskBTree`s (node pages in the shared page store, WAL-logged as full
+  node-page images via the redo-only `WAL_INDEX`, crash-recovered, **not rebuilt
+  on open**):
+  - **P3.a** — the M6 B-Tree (`DiskBTree`, stable meta page id in
+    `ColumnDef.index_root`, moved off the async worker). `FORMAT_VERSION` **4→5**.
+  - **P3.b** — **full-text** (inverted; keys on tokens, new read path
+    `Engine::search_fulltext`) and the **edge-adjacency index** (`__edges__.
+    from_id` as a durable BTree, `edge_index_meta` cached on the Engine) become
+    durable too, reusing P3.a's machinery (**no new format version**). Removed
+    `rebuild_edge_index` + the full-text rebuild. **CSR retired** (consulted by
+    no read path since the M7 revert; adjacency now served durably by the edge
+    index) — `rebuild_csr_index` + warm-keeping gone; `csr_index.rs` module kept
+    only for its benchmark. The async index worker now serves **only the vector
+    (Hnsw) index**.
+  Crash harness **14 → 17** (P13 B-Tree total-data-loss recovery, P14 durable
+  full-text, P15 durable edge index). Dated subsections below; full entries in
+  `PROGRESS.md`. **Next: P3.c (on-disk vector — spike first, research-grade),
+  P3.d (large objects)**, one PR each.
 - **Prior Core-lane work: Phase 1 — ACID & storage foundation** (the feature-freeze
   gate, `docs/backlog/phase1_acid_hardening.md`), on Core lane branch
   `acid-hardening`. **Phase 1 is COMPLETE — all five checkpoints shipped:** P1.a
@@ -450,6 +458,50 @@ benchmark in `PROGRESS.md`'s P3.a section. What a future reader most needs:
   obsolete `IndexStatus::Ready` polling for BTree (durable ⇒ always consistent,
   no async status), and `index_worker.rs`'s `remove_rows` test switched from the
   removed BTree variant to FullText.
+
+### P3.b — durable full-text + edge index; CSR retired (Core lane, branch `durable-storage`, 2026-07-08)
+
+Second Phase 3 checkpoint. Full entry + benchmark in `PROGRESS.md`'s P3.b
+section. The load-bearing insight and what a future reader most needs:
+
+- **A full-text index and an edge index are both "key → many RowIds" — exactly
+  what `DiskBTree` already is.** So P3.b added *no* new structure: it reuses
+  P3.a's `DiskBTree` + `WAL_INDEX` machinery verbatim (**no new record kind /
+  page type / `FORMAT_VERSION` bump**).
+- **Full-text durable.** `apply_durable_index_writes` (renamed from
+  `apply_durable_btree_writes`, now handling BTree *and* FullText) tokenizes the
+  text (`fulltext::tokenize`, made `pub(crate)`) and inserts one
+  `(OrderedValue::Text(token), RowId)` entry per token. `CREATE INDEX ... USING
+  FULLTEXT` builds/backfills the tree like BTree. New **`Engine::search_fulltext`**
+  read path (tokenize query → intersect each token's `search_eq` posting list,
+  AND-only → MVCC-resolve). The durable full-text index previously had *no* query
+  surface at all — this is the first one.
+- **Edge index durable.** `__edges__.from_id` is now a real durable `BTree`
+  index. `ensure_edge_index` (replaces `rebuild_edge_index`) at open
+  creates-or-loads it and returns the meta page, cached on the Engine as
+  `edge_index_meta`. `create_edge`/`delete_edge` maintain it via `DiskBTree::
+  insert`/`remove(OrderedValue::Int(from_id), rid)`; `edges_from` + the Cypher
+  executor read via `search_eq` (`graph/executor::execute` now takes a
+  `PageId`, not `&EdgeIndex` — a `Copy` value, so no borrow clash with
+  `&mut ctx.pool`). The in-memory `EdgeIndex` struct is deleted;
+  `graph/index.rs` keeps only `resolve_candidates_batched`. Vacuum scrubs the
+  edge index through the generic durable-index path (from_id is now
+  `IndexKind::BTree`, so the `remove_rowid`-by-physical-RowId special case is
+  gone — vacuum re-derives from_id from the dead row via `get_raw`).
+- **CSR retired (evidence-based, not a §3 reversal).** `csr_index.rs` was
+  consulted by *no* read path after M7's traversal-uses-CSR wiring was reverted,
+  and adjacency is now durable via the edge index — so `rebuild_csr_index` +
+  the `IndexedColumn::Edge` warm-keeping sends were removed. The module + its
+  `benches/graph.rs` measurement stay (still a valid CSR-vs-naive benchmark) but
+  are unwired from the runtime.
+- **The async index worker now serves only the vector (Hnsw) index.**
+  `index_worker.rs` shed `FullText`/`Csr`/`Edge`/`Text`/`Ordered` and the CSR
+  debounce machinery; `SecondaryIndex`/`IndexedColumn` are single-variant now
+  (their `let ... else`/`match` sites simplified to irrefutable binds). P3.c will
+  make vector durable too and retire the worker entirely.
+- **Crash points P14 (full-text) + P15 (edge index)** at the Engine level:
+  commit, "crash" (drop, no checkpoint), reopen, query works with no rebuild.
+  Harness **15 → 17**. No `FORMAT_VERSION` change.
 
 ### Design note: xid reuse after checkpoint — a real M1-era bug, found and fixed during M5
 

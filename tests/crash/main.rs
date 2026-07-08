@@ -24,6 +24,12 @@
 //         WAL-logged (WAL_INDEX full-page images); after total loss of the
 //         data file, recovery reconstructs the whole tree from the WAL, so
 //         every indexed key is still findable — never rebuilt on open
+//   P14 – durable full-text index (P3.b): committed rows + their FULLTEXT
+//         index survive a crash (no checkpoint) and `search_fulltext` works on
+//         reopen with no heap rescan/rebuild
+//   P15 – durable edge-adjacency index (P3.b): committed edges + their durable
+//         `__edges__.from_id` index survive a crash and `edges_from` traversal
+//         works on reopen with no rebuild
 
 use tempfile::tempdir;
 use unidb::{Engine, RowId};
@@ -746,6 +752,98 @@ fn property_crash_recovery_reflects_only_committed_transactions() {
     for seed in [1u64, 42, 12345, 999_999, 7, 2024] {
         run_property_case(seed);
     }
+}
+
+// ── P14: durable full-text index survives a crash (P3.b) ─────────────────────
+//
+// The FULLTEXT index is a durable on-disk B+tree (P3.b) written under the same
+// WAL_INDEX machinery P13 already proves recovers. This is the end-to-end
+// Engine-level proof: commit rows + their full-text entries, "crash" without a
+// checkpoint (so the pages live only in the WAL), reopen, and confirm
+// `search_fulltext` returns the committed rows — with no heap rescan to rebuild
+// the index on open.
+#[test]
+fn p14_durable_fulltext_survives_crash_and_is_searchable_on_reopen() {
+    let dir = tempdir().unwrap();
+    {
+        let mut engine = open(dir.path());
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE docs (id INT, body TEXT)")
+            .unwrap();
+        engine
+            .execute_sql(xid, "CREATE INDEX idx ON docs USING FULLTEXT (body)")
+            .unwrap();
+        engine
+            .execute_sql(
+                xid,
+                "INSERT INTO docs (id, body) VALUES (1, 'durable rust engine')",
+            )
+            .unwrap();
+        engine
+            .execute_sql(
+                xid,
+                "INSERT INTO docs (id, body) VALUES (2, 'python data tool')",
+            )
+            .unwrap();
+        engine.commit(xid).unwrap();
+        // "Crash": drop without a checkpoint. Every mini-txn (heap + index) is
+        // WAL-fsynced; no page flush is forced.
+        drop(engine);
+    }
+
+    let mut engine = open(dir.path());
+    let xid = engine.begin().unwrap();
+    let rust_hits = engine.search_fulltext(xid, "docs", "body", "rust").unwrap();
+    assert_eq!(
+        rust_hits.len(),
+        1,
+        "P14: committed full-text row must survive"
+    );
+    let py_hits = engine
+        .search_fulltext(xid, "docs", "body", "python")
+        .unwrap();
+    assert_eq!(py_hits.len(), 1, "P14: second full-text row must survive");
+    assert!(
+        engine
+            .search_fulltext(xid, "docs", "body", "rust python")
+            .unwrap()
+            .is_empty(),
+        "P14: AND-only intersection across recovered postings"
+    );
+}
+
+// ── P15: durable edge-adjacency index survives a crash (P3.b) ────────────────
+//
+// `__edges__.from_id`'s adjacency index is a durable B+tree (P3.b) — no longer
+// rebuilt on open. Commit edges, "crash" without a checkpoint, reopen, and
+// confirm `edges_from` still resolves every committed edge from the durable
+// index (which was recovered from the WAL, not rebuilt from a heap rescan).
+#[test]
+fn p15_durable_edge_index_survives_crash_and_traversal_works_on_reopen() {
+    let dir = tempdir().unwrap();
+    let hub = 100i64;
+    {
+        let mut engine = open(dir.path());
+        let xid = engine.begin().unwrap();
+        for to in 0..5i64 {
+            engine.create_edge(xid, hub, to, "LINKS", "{}").unwrap();
+        }
+        engine.commit(xid).unwrap();
+        drop(engine); // "crash" — no checkpoint
+    }
+
+    let mut engine = open(dir.path());
+    let xid = engine.begin().unwrap();
+    let edges = engine.edges_from(xid, hub).unwrap();
+    assert_eq!(
+        edges.len(),
+        5,
+        "P15: all committed edges must resolve from the recovered durable index"
+    );
+    let mut tos: Vec<i64> = edges.iter().map(|e| e.to_id).collect();
+    tos.sort();
+    assert_eq!(tos, vec![0, 1, 2, 3, 4]);
 }
 
 // ── P13: durable B-Tree survives total data-file loss (P3.a) ─────────────────

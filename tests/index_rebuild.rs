@@ -74,8 +74,11 @@ fn engine_restart_rebuilds_vector_index_and_near_still_works() {
     }
 }
 
+/// P3.b made full-text durable: reopening does NOT rebuild it from the heap —
+/// it reads the on-disk B+tree — and `Engine::search_fulltext` (the new read
+/// path) works after restart with no `Ready` wait.
 #[test]
-fn engine_restart_rebuilds_fulltext_index_and_search_still_works() {
+fn fulltext_index_is_durable_and_searchable_after_reopen() {
     let dir = tempdir().unwrap();
     {
         let mut engine = Engine::open(dir.path(), 0).unwrap();
@@ -90,14 +93,23 @@ fn engine_restart_rebuilds_fulltext_index_and_search_still_works() {
             .execute_sql(xid, "INSERT INTO t (id, body) VALUES (1, 'rust engine')")
             .unwrap();
         engine.commit(xid).unwrap();
-        engine.flush().unwrap();
+        engine.checkpoint().unwrap();
     }
 
-    let engine2 = Engine::open(dir.path(), 0).unwrap();
-    wait_for_ready(&engine2, "t", "body");
-    // No SQL-level full-text query surface exists in M2 (only `NEAR` for
-    // vectors) — asserting `Ready` after reopen is the correctness bar for
-    // this index kind's rebuild, matching the scope note in MEMORY.md.
+    // Reopen: no heap rescan to rebuild the index, no `Ready` to wait on.
+    let mut engine2 = Engine::open(dir.path(), 0).unwrap();
+    let xid = engine2.begin().unwrap();
+    let hits = engine2.search_fulltext(xid, "t", "body", "rust").unwrap();
+    assert_eq!(
+        hits.len(),
+        1,
+        "durable full-text must find the row after reopen"
+    );
+    assert!(engine2
+        .search_fulltext(xid, "t", "body", "absent")
+        .unwrap()
+        .is_empty());
+    engine2.commit(xid).unwrap();
 }
 
 /// P3.a changed the B-Tree from a rebuilt-on-open in-memory index to a

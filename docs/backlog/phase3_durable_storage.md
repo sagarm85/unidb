@@ -6,8 +6,17 @@
   buffer-pool-managed, WAL-logged (`WAL_INDEX`), crash-recovered, and **no
   longer rebuilt on open** — removed from `rebuild_secondary_indexes`. Crash
   harness grew 14 → 15 (new point P13). `FORMAT_VERSION` 4 → 5.
-- P3.b (inverted + CSR + EdgeIndex), P3.c (on-disk vector), P3.d (large
-  objects): not started.
+- **P3.b — Durable inverted (full-text) + edge index; CSR retired: SHIPPED**.
+  Both full-text and the edge-adjacency index are now durable `DiskBTree`s
+  (reusing all of P3.a's `WAL_INDEX` machinery — no new format version): the
+  full-text index keys on tokens, the edge index keys on `__edges__.from_id`.
+  Removed `rebuild_edge_index` + full-text rebuild from `rebuild_secondary_
+  indexes`. **CSR was retired** (removed `rebuild_csr_index` + its warm-keeping
+  writes) — it was consulted by no read path since the M7 traversal-uses-CSR
+  revert, and adjacency is now served durably by the edge index. The async
+  worker now serves only the vector (Hnsw) index. New Rust-API read path
+  `Engine::search_fulltext`. Crash harness 15 → 17 (P14 full-text, P15 edge).
+- P3.c (on-disk vector), P3.d (large objects): not started.
 
 Kills rebuild-on-open + the RAM ceiling, and owns the AI/big-file story
 Postgres doesn't have. Companion to [`roadmap.md`](roadmap.md) §4. **Depends on
@@ -52,12 +61,25 @@ which is the differentiator.
   insert never surfaces via the index (MVCC re-check); durable reopen without
   rebuild; module-level split/range/reopen tests.
 
-### P3.b — Durable inverted + CSR + EdgeIndex
-- Same treatment for `fulltext.rs` (inverted), `csr_index.rs` / `graph/index.rs`
-  (CSR/EdgeIndex): persist as pages, WAL-logged, no rebuild. Removes
-  `rebuild_edge_index` / `rebuild_csr_index` and the full-text rebuild.
-- Tests: reopen with no rebuild; crash-recovery of each; graph traversal +
-  full-text query unchanged.
+### P3.b — Durable inverted + edge index; CSR retired — SHIPPED (2026-07-08)
+- **Full-text (inverted)** and the **edge-adjacency index** are now durable
+  `DiskBTree`s — reusing P3.a's `WAL_INDEX` machinery, no new format version.
+  Full-text keys on tokens (`fulltext::tokenize`), one `(token, RowId)` entry
+  per token; the edge index keys on `__edges__.from_id` (`OrderedValue::Int`).
+  Both are read from disk on open — no rebuild. Removed `rebuild_edge_index` and
+  the full-text branch of `rebuild_secondary_indexes`.
+- **CSR retired.** `csr_index.rs` was consulted by no read path after M7's
+  traversal-uses-CSR revert, and adjacency is now served durably by the edge
+  index, so its rebuild-on-open + warm-keeping were removed (`rebuild_csr_index`
+  deleted; no `IndexedColumn::Edge` sent). The module + its benchmark remain but
+  are no longer wired into the runtime. The async worker now serves only Hnsw.
+- New read path `Engine::search_fulltext` (Rust API) — the durable full-text
+  index previously had no query surface at all.
+- Tests: durable reopen without rebuild (`tests/btree_mvcc.rs`,
+  `tests/index_rebuild.rs`, `tests/graph_rebuild.rs`); crash-recovery of each
+  (crash points P14 full-text, P15 edge); graph traversal + full-text query
+  unchanged. `search_fulltext` unit tests. `benches/durable_index.rs` gains an
+  edge-index reopen-cost table.
 
 ### P3.c — Durable on-disk vector index (the frontier item)
 - HNSW (a RAM graph) doesn't page cleanly. Adopt an **on-disk ANN**: a

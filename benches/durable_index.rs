@@ -118,4 +118,39 @@ fn main() {
         "\nRead the *scaling*: the durable B-Tree column stays flat (O(1) open,\n\
          no heap rescan); the rebuilt-on-open HNSW column rises with row count."
     );
+
+    // P3.b: the durable edge-adjacency index (`__edges__.from_id`) is likewise
+    // read from disk on open, never rebuilt from a heap rescan. Reopen time
+    // stays flat as the edge count grows (before P3.b it was an O(edges)
+    // synchronous scan on every open).
+    println!("\nP3.b — Engine::open cost vs. committed edge count\n");
+    println!("{:>8}  {:>22}", "edges", "edge-index open (ms)");
+    for &n in &[500u64, 2_000, 5_000] {
+        let dir = tempdir().unwrap();
+        build_edges(dir.path(), n);
+        let ms = median_reopen_ms(dir.path());
+        println!("{n:>8}  {ms:>22.3}");
+    }
+    println!("\nFlat ⇒ the durable edge index is not rebuilt on open (P3.b).");
+}
+
+/// Build `n` committed edges out of one hub node, batched by committing every
+/// 500 edges (bounding pinned-page pressure), then checkpoint.
+fn build_edges(dir: &std::path::Path, n: u64) {
+    let mut engine = Engine::open(dir, 0).unwrap();
+    const BATCH: u64 = 500;
+    let mut i = 0;
+    while i < n {
+        let end = (i + BATCH).min(n);
+        let xid = engine.begin().unwrap();
+        for to in i..end {
+            engine
+                .create_edge(xid, 1, to as i64, "LINKS", "{}")
+                .unwrap();
+        }
+        engine.commit(xid).unwrap();
+        i = end;
+    }
+    engine.checkpoint().unwrap();
+    drop(engine);
 }
