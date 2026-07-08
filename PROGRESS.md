@@ -1750,7 +1750,7 @@ invisible on disk).
 
 ### P1.d — isolation correctness (RC re-evaluation + SSI)   [shipped]   2026-07-08
 
-**PR:** _(pending — Core lane, branch `acid-hardening`)_
+**PR:** #10 — https://github.com/sagarm85/unidb/pull/10 (Core lane, branch `acid-hardening`)
 **Summary:** Closes the isolation Tier-0 hole (D10–D12): conflicts previously
 propagated as raw `WriteConflict` regardless of isolation level, and
 `SERIALIZABLE` was an unimplemented no-op seam (write-skew possible). Now: (1)
