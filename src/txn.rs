@@ -530,6 +530,13 @@ impl TransactionManager {
         self.lock().active.contains_key(&xid)
     }
 
+    /// Number of transactions currently open (P1.e). Auto-checkpoint fires only
+    /// when this is zero — a quiescent point — so a checkpoint's WAL truncation
+    /// can never discard an in-flight transaction's undo records.
+    pub fn active_count(&self) -> usize {
+        self.lock().active.len()
+    }
+
     pub fn is_committed(&self, xid: Xid) -> bool {
         self.lock().committed.contains(&xid)
     }

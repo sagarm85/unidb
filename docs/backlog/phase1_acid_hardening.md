@@ -1,15 +1,17 @@
 # Phase 1 — ACID & storage foundation (Core lane, `acid-hardening`)
 
-## Status as of 2026-07-08: IN PROGRESS — P1.a–P1.d shipped; only P1.e (auto-checkpoint) left.
+## Status as of 2026-07-08: COMPLETE — all five checkpoints (P1.a–P1.e) shipped.
 
-**P1.a (full-page-writes / `WAL_FPI`)**, **P1.b (fsync-failure handling /
-fsyncgate)**, **P1.c (`alloc_page` chunked growth + configurable buffer pool +
-real free-space map)**, and **P1.d (isolation correctness — RC re-evaluation +
-RR/SER `SerializationFailure` + true SERIALIZABLE via SSI)** are shipped — see
-`PROGRESS.md`'s "Phase 1 → P1.a / P1.b / P1.c / P1.d" entries (crash points P11 +
-P12 added, `FORMAT_VERSION` 3→4, benchmarks recorded incl. `benches/scale.rs`).
-**P1.e (auto-checkpoint — time + WAL-size triggers) is the last remaining
-checkpoint.**
+**Phase 1 is done — the feature-freeze gate is closed.** All five checkpoints
+shipped, each its own PR: **P1.a** full-page-writes / `WAL_FPI` (#6), **P1.b**
+fsync-failure handling / fsyncgate (#7), **P1.c** `alloc_page` chunked growth +
+configurable buffer pool + real free-space map (#8), **P1.d** isolation
+correctness — RC re-evaluation + RR/SER `SerializationFailure` + true
+SERIALIZABLE via SSI (#10), **P1.e** auto-checkpoint — time + WAL-size triggers
+(this PR). Crash harness grew 11→**14** (P11 torn-page, P12 fsync-failure),
+`FORMAT_VERSION` 3→4, no locked decision reversed. Full per-checkpoint entries
++ benchmarks in `PROGRESS.md`'s Phase 1 section. Next per `roadmap.md`: Phases
+2/3/4.
 
 The **feature-freeze gate**: no Phase-4+ engine feature lands until Tier-0
 correctness is closed. Companion to [`roadmap.md`](roadmap.md) §4/§6 — this is

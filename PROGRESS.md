@@ -1823,3 +1823,90 @@ read sets — paid only by workloads that opt into SERIALIZABLE.
 **Locked-decision changes:** none reversed; **D10–D12 completed as originally
 designed** (RC re-evaluation + the SSI addition the `on_read`/`on_write` seam
 was built for). No format change.
+
+### P1.e — auto-checkpoint (time + WAL-size triggers)   [shipped]   2026-07-08
+
+**PR:** _(pending — Core lane, branch `acid-hardening`)_
+**Summary:** Closes the last Phase-1 item and bounds WAL growth (roadmap Tier
+3). Checkpoint was manual-only, so the WAL — and the P1.a full-page-image volume
+it now carries — grew unbounded for the life of a session. The engine now runs
+the existing checkpoint path **inline on the writer thread** when either a
+**time** trigger (`checkpoint_timeout`, default 60 s) or a **WAL-size** trigger
+(`max_wal_size`, default 64 MiB) fires — but only at a **quiescent point** (no
+open transaction), so a checkpoint's WAL truncation can never discard an
+in-flight transaction's undo records.
+
+**What landed:**
+- `wal.rs`: `wal_bytes` running counter (framed bytes since the last
+  truncation) + `wal_bytes()` accessor; seeded from the file at open, reset to
+  the kept size on `truncate_before`.
+- `txn.rs`: `active_count()` (the quiescence gate).
+- `lib.rs`: `AutoCheckpointConfig { enabled, timeout, max_wal_size }` (env:
+  `UNIDB_AUTO_CHECKPOINT`, `UNIDB_CHECKPOINT_TIMEOUT_SECS`,
+  `UNIDB_MAX_WAL_SIZE_BYTES`); `Engine::maybe_auto_checkpoint` called from
+  `commit` — checks the gate + triggers, syncs the WAL (so a deferred-sync
+  session's pages are durable before `flush_all`, D5), runs `checkpoint()`, and
+  bumps a counter. `set_auto_checkpoint_config` / `auto_checkpoint_config` /
+  `checkpoints_triggered` API.
+- The server writer thread (`server/engine_handle.rs`) owns the `Engine` and
+  drives `commit`, so it gets auto-checkpoint for free — no server change.
+
+**Design notes:**
+- **Quiescence gate.** `checkpoint::run` truncates *all* WAL before the
+  checkpoint LSN; if it ran mid-transaction, an in-flight txn's flushed-but-
+  uncommitted pages would lose their undo records and wrongly persist on
+  recovery. Gating on `active_count() == 0` makes auto-checkpoint
+  unconditionally safe with the existing checkpoint. Cost: a permanently
+  open long-lived transaction blocks auto-checkpoint (the same operational
+  footgun as a long-lived txn holding back Postgres's checkpointing / vacuum) —
+  documented, not silent.
+- **Default on** with 60 s / 64 MiB — high enough that no existing unit/crash
+  test or short bench trips it (they run in well under 60 s and far under
+  64 MiB of WAL), so behavior is unchanged for them; real long-running or
+  high-volume sessions get bounded WAL.
+- **Throttle.** The checkpoint cadence is itself the throttle: bounded to one
+  checkpoint per `max_wal_size` of WAL (which resets on truncation) or per
+  `checkpoint_timeout`, and each checkpoint flushes only *dirty* pages (bounded
+  by pool size). Intra-checkpoint I/O smoothing is deferred.
+
+**Crash harness:** unchanged at **14** (P1–P12). Auto-checkpoint reuses the
+existing (already crash-tested) checkpoint + recovery path (P2/P4) — it changes
+*when* a checkpoint runs, not *how* — so it adds no new durability mechanism and
+no crash point. The new `auto_checkpoint_fires_on_wal_size_and_data_survives`
+test drops + reopens after auto-checkpoints truncated the WAL and asserts all
+rows survive (recovery from the checkpointed pages);
+`auto_checkpoint_does_not_fire_mid_transaction` proves the quiescence gate.
+
+**Benchmark** (`benches/checkpoint.rs`, release; 3,000 autocommit inserts):
+
+| config | final WAL bytes | checkpoints | rows/s |
+|---|---|---|---|
+| auto OFF     | 1,169,711 | 0  | 160 |
+| auto 64 KiB  | 50,448    | 19 | 160 |
+| auto 256 KiB | 154,204   | 4  | 161 |
+
+With auto-checkpoint off the WAL grows with the whole workload (1.17 MB for
+3,000 rows, unbounded); with it on the final WAL stays near `max_wal_size` (~50
+KB / ~154 KB) regardless of row count — a **~8–23× smaller** WAL, bounded by
+config, not data. Throughput is unchanged (~160 rows/s across all three — the
+write floor is the per-statement fsync; a checkpoint's flush I/O is amortized
+across the ~many commits between triggers). **Peak memory:** unchanged (one
+`u64` counter + a `Copy` config struct).
+
+**Locked-decision changes:** none. Extends the existing D3 checkpoint path with
+a trigger; no format change. (Segmented WAL — replacing the whole-file rewrite
+truncation — is explicitly Phase 6, not this checkpoint.)
+
+---
+
+## Phase 1 complete
+
+All five checkpoints (P1.a–P1.e) shipped. The feature-freeze gate is closed:
+torn-page protection (P1.a), fsync-failure handling (P1.b), the `alloc_page`
+remap fix + configurable pool + real FSM (P1.c), isolation correctness — RC
+re-evaluation + SSI (P1.d), and auto-checkpoint (P1.e). Crash harness grew from
+11 to **14** (P11 torn-page, P12 fsync-failure); `FORMAT_VERSION` 3→4;
+`clippy -D warnings` + `fmt` clean throughout; no locked decision reversed
+(D1/D5/D9/D10–D12/D3 all completed or strengthened). Next per
+`docs/backlog/roadmap.md`: Phases 2/3/4 (data model, durable storage, query
+power) build on a correctness-solid core.

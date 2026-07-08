@@ -212,10 +212,26 @@ inserts rebuild it lazily; a durable on-disk FSM fork is a later item (§12).
 
 ### 3.5 Checkpoint & recovery
 
-`checkpoint::run`: flush all dirty pages → write a checkpoint WAL record →
-persist control file (checkpoint LSN, WAL tail, `catalog_root`,
-`next_xid` captured *before* truncation) → truncate the WAL before the
-checkpoint LSN (currently by rewriting the whole file — tracked debt).
+`checkpoint::run`: flush all dirty pages → reset FPI tracking (P1.a) → write a
+checkpoint WAL record → persist control file (checkpoint LSN, WAL tail,
+`catalog_root`, `next_xid` captured *before* truncation) → truncate the WAL
+before the checkpoint LSN (currently by rewriting the whole file — tracked
+debt; segmented WAL is Phase 6).
+
+**Auto-checkpoint (P1.e).** Checkpoint was manual-only, so the WAL (and the
+P1.a full-page-image volume) grew unbounded. `Engine::maybe_auto_checkpoint`
+(called from `commit`) now runs the existing path inline when a **time**
+trigger (`checkpoint_timeout`, default 60 s) or a **WAL-size** trigger
+(`max_wal_size`, default 64 MiB — `Wal::wal_bytes` is a running counter reset on
+truncation) fires — but only at a **quiescent point** (`TransactionManager::
+active_count() == 0`), because `checkpoint::run` truncates *all* WAL before the
+checkpoint LSN and would otherwise discard an in-flight transaction's undo
+records. Config: `AutoCheckpointConfig` (env `UNIDB_AUTO_CHECKPOINT` /
+`UNIDB_CHECKPOINT_TIMEOUT_SECS` / `UNIDB_MAX_WAL_SIZE_BYTES`). Benchmarked WAL
+bounded (~50–154 KB vs 1.17 MB unbounded) at flat throughput
+(`benches/checkpoint.rs`). Reuses the P2/P4-tested checkpoint+recovery path, so
+no new crash point. Caveat: a permanently-open long-lived transaction blocks
+auto-checkpoint (documented footgun, like Postgres).
 
 `recovery.rs` on open: read control file → **redo** from the checkpoint
 LSN → **undo** incomplete mini-txns → undo incomplete *user* transactions.
@@ -935,6 +951,12 @@ buffer pool (4096-frame default), and a real free-space map (§3.4,
 isolation correctness shipped** — RC re-evaluation (via fresh-snapshot
 re-scan), RR/SERIALIZABLE write-write conflicts as `SerializationFailure`, and
 true SERIALIZABLE via SSI pivot detection preventing write-skew (§4.2; no crash
-point — an SSI abort is an ordinary rollback). **P1.e (auto-checkpoint) is the
-last remaining checkpoint.** See `docs/backlog/phase1_acid_hardening.md` and
-`PROGRESS.md`'s Phase 1 entry. Update alongside the next checkpoint's closeout.*
+point — an SSI abort is an ordinary rollback). **P1.e auto-checkpoint shipped**
+— time + WAL-size triggers run the existing checkpoint path inline at a
+quiescent point, bounding WAL growth (§3.5, `benches/checkpoint.rs`; no crash
+point — reuses the P2/P4 checkpoint path). **Phase 1 is COMPLETE — all five
+checkpoints (P1.a–P1.e) shipped; the feature-freeze gate is closed** (crash
+harness 11→14, `FORMAT_VERSION` 3→4, no locked decision reversed). Next per
+`docs/backlog/roadmap.md`: Phases 2/3/4. See
+`docs/backlog/phase1_acid_hardening.md` and `PROGRESS.md`'s Phase 1 entries.
+Update alongside the next milestone's closeout.*

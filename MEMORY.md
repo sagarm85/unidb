@@ -80,10 +80,11 @@
   workspace's dependency union, which is *not* the right check here).
 - **Current work: Phase 1 — ACID & storage foundation** (the feature-freeze
   gate, `docs/backlog/phase1_acid_hardening.md`), on Core lane branch
-  `acid-hardening`. **P1.a (full-page-writes), P1.b (fsync-failure handling),
-  P1.c (alloc_page remap + configurable pool + real FSM), and P1.d (isolation
-  correctness — RC re-eval + SSI) are shipped**; **P1.e (auto-checkpoint) is the
-  last remaining checkpoint**. See the
+  `acid-hardening`. **Phase 1 is COMPLETE — all five checkpoints shipped:** P1.a
+  (full-page-writes), P1.b (fsync-failure handling), P1.c (alloc_page remap +
+  configurable pool + real FSM), P1.d (isolation correctness — RC re-eval +
+  SSI), and P1.e (auto-checkpoint). The feature-freeze gate is closed; next per
+  `docs/backlog/roadmap.md` is Phase 2/3/4. See the
   Phase 1 section below. The roadmap is now `docs/backlog/roadmap.md` (6-phase
   plan); the older per-milestone backlog docs were retired. A CSR-preferring
   traversal fix (staleness/generation marker design) remains documented tech
@@ -202,7 +203,21 @@ one PR per checkpoint (P1.a → P1.e). **In progress as of 2026-07-08.**
   lone serializable commits). **No new crash point** (an SSI abort is an
   ordinary rollback — harness stays 14). No format change. See `PROGRESS.md`'s
   Phase 1 → P1.d entry.
-- **P1.e — not started.** auto-checkpoint (time + WAL-size triggers). One PR.
+- **P1.e — auto-checkpoint — SHIPPED (2026-07-08). Phase 1 is COMPLETE.**
+  Bounds WAL growth (was manual-only → unbounded). `Engine::maybe_auto_checkpoint`
+  (called from `commit`) runs the existing checkpoint path inline when a **time**
+  (`checkpoint_timeout`, default 60 s) or **WAL-size** (`max_wal_size`, default
+  64 MiB) trigger fires — but only at a **quiescent point** (`txn_mgr.active_
+  count() == 0`), so truncation can't discard an in-flight txn's undo (a
+  permanently-open long-lived txn blocks it — documented footgun). `wal.rs`
+  tracks `wal_bytes` (reset on truncate); `AutoCheckpointConfig` (env
+  `UNIDB_AUTO_CHECKPOINT` / `_CHECKPOINT_TIMEOUT_SECS` / `_MAX_WAL_SIZE_BYTES`),
+  `set_auto_checkpoint_config` / `checkpoints_triggered`. Default-on thresholds
+  are high enough not to trip existing tests. **No new crash point** (reuses the
+  P2/P4-tested checkpoint path — changes *when*, not *how*; harness stays 14).
+  Bench `benches/checkpoint.rs`: WAL bounded ~50 KB/154 KB vs 1.17 MB unbounded
+  (~8–23× smaller), throughput unchanged (~160 rows/s). No format change. See
+  `PROGRESS.md`'s Phase 1 → P1.e entry + "Phase 1 complete".
 
 ### M10 — heap vacuum / MVCC GC (Core lane, branch `core-vacuum`, 2026-07-08)
 

@@ -36,6 +36,7 @@
 | Track D | Semantic search: per-index cosine metric + `unidb-embed` CLI |
 | M10 | Heap vacuum / MVCC GC (`Engine::vacuum()`) |
 | M11 | SQL constraints (PK / FK / UNIQUE / NOT NULL / CHECK / DEFAULT) |
+| **Phase 1** | **ACID hardening (complete):** full-page-writes (torn-page) · fsync-failure handling · `alloc_page` chunked growth + configurable pool + real FSM · isolation correctness (RC re-eval + SSI) · auto-checkpoint |
 
 The core is architecturally correct — it is not a toy. But it is the **small
 version**; §3 is the honest gap to production.
@@ -178,6 +179,18 @@ status, same discipline as M10.
 ---
 
 ## 8. Decision & session log (newest first)
+
+### 2026-07-08 — Phase 1 (ACID & storage foundation) COMPLETE
+- All five checkpoints shipped on the `acid-hardening` Core lane, one PR each:
+  P1.a full-page-writes (#6), P1.b fsync-failure handling (#7), P1.c
+  `alloc_page` chunked growth + configurable pool + real FSM (#8), P1.d
+  isolation correctness — RC re-evaluation + SSI (#10), P1.e auto-checkpoint.
+- Closed every Tier-0 correctness hole (torn-page, fsync, isolation) plus the
+  Tier-3 `alloc_page`/pool/FSM growth blocker and manual-checkpoint WAL-bloat.
+  Crash harness 11→**14** (P11 torn-page, P12 fsync-failure); `FORMAT_VERSION`
+  3→4; no locked decision reversed (D1/D5/D9/D10–D12/D3 completed/strengthened).
+  Per-checkpoint benchmarks in `PROGRESS.md`. The feature-freeze gate is closed;
+  Phases 2/3/4 may proceed.
 
 ### 2026-07-08 — adopted the ACID-first phased scaling plan; backlog cleaned
 - Ran an expert gap analysis: the user's 4 flags (joins, index durability,

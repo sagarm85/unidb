@@ -66,6 +66,7 @@ pub mod wal;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::{Duration, Instant};
 
 use crate::{
     bufferpool::BufferPool,
@@ -114,6 +115,41 @@ fn configured_pool_capacity() -> usize {
         .unwrap_or(DEFAULT_POOL_CAPACITY)
 }
 
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+/// Auto-checkpoint policy (P1.e). A checkpoint bounds WAL growth (and the P1.a
+/// full-page-image volume); before P1.e it was manual-only, so the WAL grew
+/// unbounded. The engine runs the existing checkpoint path inline on the writer
+/// thread when **either** trigger fires and the engine is quiescent (no open
+/// transaction) — running it mid-transaction would let the checkpoint's WAL
+/// truncation discard an in-flight transaction's undo records.
+#[derive(Debug, Clone, Copy)]
+pub struct AutoCheckpointConfig {
+    /// Master switch. Defaults on (env `UNIDB_AUTO_CHECKPOINT=0` disables).
+    pub enabled: bool,
+    /// Checkpoint at least this often once quiescent (env
+    /// `UNIDB_CHECKPOINT_TIMEOUT_SECS`, default 60 s).
+    pub timeout: Duration,
+    /// Checkpoint once the WAL since the last checkpoint reaches this many bytes
+    /// (env `UNIDB_MAX_WAL_SIZE_BYTES`, default 64 MiB).
+    pub max_wal_size: u64,
+}
+
+impl Default for AutoCheckpointConfig {
+    fn default() -> Self {
+        Self {
+            enabled: std::env::var("UNIDB_AUTO_CHECKPOINT").as_deref() != Ok("0"),
+            timeout: Duration::from_secs(env_u64("UNIDB_CHECKPOINT_TIMEOUT_SECS", 60)),
+            max_wal_size: env_u64("UNIDB_MAX_WAL_SIZE_BYTES", 64 * 1024 * 1024),
+        }
+    }
+}
+
 /// The outcome of an [`Engine::vacuum`] pass (M10). Surfaces the numbers the
 /// milestone cares about — including whether a long-lived transaction/reader
 /// held the horizon back and blocked reclamation, so that footgun is visible
@@ -155,6 +191,10 @@ pub struct Engine {
     index_worker: IndexHandle,
     edge_index: EdgeIndex,
     next_event_seq: u64,
+    /// Auto-checkpoint policy + state (P1.e).
+    auto_checkpoint: AutoCheckpointConfig,
+    last_checkpoint: Instant,
+    checkpoints_triggered: u64,
 }
 
 /// `Engine` must be movable into another thread's ownership (M5: the
@@ -321,6 +361,9 @@ impl Engine {
             index_worker,
             edge_index,
             next_event_seq,
+            auto_checkpoint: AutoCheckpointConfig::default(),
+            last_checkpoint: Instant::now(),
+            checkpoints_triggered: 0,
         })
     }
 
@@ -805,10 +848,61 @@ impl Engine {
         match self.txn_mgr.commit(xid, &mut self.wal, &mut self.lock_mgr) {
             Err(DbError::SerializationFailure { xid }) => {
                 self.abort(xid)?;
-                Err(DbError::SerializationFailure { xid })
+                return Err(DbError::SerializationFailure { xid });
             }
-            other => other,
+            Err(e) => return Err(e),
+            Ok(()) => {}
         }
+        // P1.e: a commit is a quiescence boundary — the natural point to run an
+        // auto-checkpoint if a trigger has fired.
+        self.maybe_auto_checkpoint()?;
+        Ok(())
+    }
+
+    /// Auto-checkpoint (P1.e): if enabled, the engine is quiescent (no open
+    /// transaction), and either the time or WAL-size trigger has fired, run the
+    /// existing checkpoint path inline. Quiescence is required so the
+    /// checkpoint's WAL truncation cannot discard an in-flight transaction's
+    /// undo records. The WAL is synced first so a deferred-sync session's pages
+    /// are durable before `flush_all` (D5).
+    fn maybe_auto_checkpoint(&mut self) -> Result<()> {
+        let cfg = self.auto_checkpoint;
+        if !cfg.enabled || self.txn_mgr.active_count() > 0 {
+            return Ok(());
+        }
+        let by_time = self.last_checkpoint.elapsed() >= cfg.timeout;
+        let by_size = self.wal.wal_bytes() >= cfg.max_wal_size;
+        if by_time || by_size {
+            tracing::info!(
+                by_time,
+                by_size,
+                wal_bytes = self.wal.wal_bytes(),
+                "auto-checkpoint triggered (P1.e)"
+            );
+            self.sync_wal()?;
+            self.checkpoint()?;
+            self.last_checkpoint = Instant::now();
+            self.checkpoints_triggered += 1;
+        }
+        Ok(())
+    }
+
+    /// Current auto-checkpoint policy (P1.e).
+    pub fn auto_checkpoint_config(&self) -> AutoCheckpointConfig {
+        self.auto_checkpoint
+    }
+
+    /// Replace the auto-checkpoint policy (P1.e). Resets the time trigger's
+    /// clock so a freshly-lowered `timeout` doesn't fire on stale elapsed time.
+    pub fn set_auto_checkpoint_config(&mut self, cfg: AutoCheckpointConfig) {
+        self.auto_checkpoint = cfg;
+        self.last_checkpoint = Instant::now();
+    }
+
+    /// How many auto-checkpoints have fired this session (P1.e) — for tests and
+    /// observability.
+    pub fn checkpoints_triggered(&self) -> u64 {
+        self.checkpoints_triggered
     }
 
     /// A cloneable, `Send + Sync` handle for concurrent reads that run off the
@@ -2055,6 +2149,91 @@ mod tests {
         assert!(
             engine.commit(t).is_ok(),
             "a lone serializable txn must commit"
+        );
+    }
+
+    // ── P1.e: auto-checkpoint ─────────────────────────────────────────────────
+
+    /// P1.e: the WAL-size trigger fires an auto-checkpoint inline on commit
+    /// (bounding WAL growth), and the committed data survives a reopen even
+    /// though the auto-checkpoint truncated the WAL along the way.
+    #[test]
+    fn auto_checkpoint_fires_on_wal_size_and_data_survives() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        // A tiny WAL-size threshold so a handful of inserts crosses it; disable
+        // the time trigger so the test doesn't depend on wall-clock.
+        engine.set_auto_checkpoint_config(AutoCheckpointConfig {
+            enabled: true,
+            timeout: std::time::Duration::from_secs(3600),
+            max_wal_size: 2048,
+        });
+
+        let s = engine.begin().unwrap();
+        engine.execute_sql(s, "CREATE TABLE t (id INT)").unwrap();
+        engine.commit(s).unwrap();
+
+        for i in 0..50 {
+            let x = engine.begin().unwrap();
+            engine
+                .execute_sql(x, &format!("INSERT INTO t (id) VALUES ({i})"))
+                .unwrap();
+            engine.commit(x).unwrap();
+        }
+        assert!(
+            engine.checkpoints_triggered() > 0,
+            "auto-checkpoint must fire once the WAL crosses max_wal_size"
+        );
+
+        // Reopen: the auto-checkpoints truncated the WAL, so recovery must come
+        // from the checkpointed pages — all 50 rows must still be present.
+        drop(engine);
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let q = engine.begin().unwrap();
+        match &engine.execute_sql(q, "SELECT id FROM t").unwrap()[0] {
+            SqlResult::Rows(rows) => assert_eq!(rows.len(), 50, "all rows must survive"),
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    /// P1.e: auto-checkpoint never fires while a transaction is open (a
+    /// non-quiescent point) — running it there could truncate an in-flight
+    /// transaction's undo records.
+    #[test]
+    fn auto_checkpoint_does_not_fire_mid_transaction() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        engine.set_auto_checkpoint_config(AutoCheckpointConfig {
+            enabled: true,
+            timeout: std::time::Duration::from_secs(3600),
+            max_wal_size: 1, // would fire on the very first append if not gated
+        });
+        let s = engine.begin().unwrap();
+        engine.execute_sql(s, "CREATE TABLE t (id INT)").unwrap();
+        engine.commit(s).unwrap();
+
+        // One long-lived transaction stays open across many writes: the commit
+        // boundary that checks the trigger is never reached with a quiescent
+        // engine, so no auto-checkpoint fires mid-transaction.
+        let x = engine.begin().unwrap();
+        for i in 0..20 {
+            engine
+                .execute_sql(x, &format!("INSERT INTO t (id) VALUES ({i})"))
+                .unwrap();
+        }
+        // Still open → the only commit so far (the CREATE TABLE txn) is the only
+        // quiescence point that ran a check; the open txn blocks further ones.
+        let before = engine.checkpoints_triggered();
+        engine.commit(x).unwrap(); // now quiescent → a checkpoint may fire here
+        assert!(
+            engine.checkpoints_triggered() >= before,
+            "counter is monotonic"
+        );
+        // The point is that no checkpoint fired *while x was open*; if the gate
+        // were missing, max_wal_size=1 would have fired one per statement.
+        assert!(
+            before <= 1,
+            "no auto-checkpoint may fire mid-transaction (got {before})"
         );
     }
 

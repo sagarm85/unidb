@@ -110,6 +110,11 @@ pub struct Wal {
     path: std::path::PathBuf,
     next_lsn: Lsn,
     next_mini_txn: u64,
+    /// Framed bytes currently in the WAL file (P1.e). Grows on every append,
+    /// reset to the kept size after `truncate_before` — so it is the WAL size
+    /// since the last checkpoint, the signal the `max_wal_size` auto-checkpoint
+    /// trigger watches. A running counter (no `stat` syscall on the hot path).
+    wal_bytes: u64,
     /// LSN of the last fsync'd record (the durable WAL frontier).
     pub durable_lsn: Lsn,
     /// Group-commit mode (M9). When `true`, `commit_mini_txn`/`abort_mini_txn`
@@ -142,17 +147,27 @@ impl Wal {
         } else {
             start_lsn + 1
         };
+        // Seed the WAL-size counter from the existing file (P1.e), so a reopen
+        // with a large pre-existing WAL still triggers `max_wal_size` promptly.
+        let wal_bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
         tracing::info!(path = %path.display(), next_lsn, "WAL opened");
         Ok(Self {
             writer: BufWriter::new(file),
             path: path.to_path_buf(),
             next_lsn,
             next_mini_txn: 1,
+            wal_bytes,
             durable_lsn: INVALID_LSN,
             deferred_sync: false,
             poisoned: false,
             fsync_fault_armed: false,
         })
+    }
+
+    /// Framed bytes in the WAL since the last checkpoint truncation (P1.e) —
+    /// the signal the `max_wal_size` auto-checkpoint trigger watches.
+    pub fn wal_bytes(&self) -> u64 {
+        self.wal_bytes
     }
 
     /// Arm a one-shot fsync fault (P1.b fault injection). The next `fsync`
@@ -362,6 +377,7 @@ impl Wal {
         let len = encoded.len() as u32;
         self.writer.write_all(&u32_to_le(len))?;
         self.writer.write_all(&encoded)?;
+        self.wal_bytes += 4 + encoded.len() as u64; // P1.e: track WAL size
         Ok(lsn)
     }
 
@@ -422,6 +438,8 @@ impl Wal {
         }
         std::fs::rename(&tmp, &self.path)?;
         let file = OpenOptions::new().append(true).open(&self.path)?;
+        // P1.e: the WAL-size counter now reflects only the kept records.
+        self.wal_bytes = kept.iter().map(|r| 4 + encode_record(r).len() as u64).sum();
         self.writer = BufWriter::new(file);
         tracing::info!(keep_from_lsn, "WAL truncated");
         Ok(())
