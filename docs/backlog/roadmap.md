@@ -133,14 +133,30 @@ git worktree add -b surface-embed   ../unidb-embed        main   # Surface lane 
   Entry points: `catalog.rs` `ColumnDef`/`TableDef`; `sql/parser.rs`
   `convert_create_table` (currently drops per-column `options`);
   `sql/executor.rs` `exec_insert`/`coerce_and_validate_row`/`exec_update`.
-- **Surface lane:** embedding CLI + cosine (**Track D**) — not started. Engine touch is
-  `vector.rs` cosine metric only; the CLI is a new crate reusing the
-  `unidb-attach` client. Embedding *generation* stays client-side (no model
-  deps in the engine). Also holds Track B (Studio UI) and Track C (GraphQL).
+- **Surface lane:** embedding CLI + cosine (**Track D**) — **DONE**
+  (branch `surface-embed`, 2026-07-08; see `PROGRESS.md`'s Track D entry).
+  `vector.rs` gained a per-index `Metric::{Euclidean,Cosine}` (cosine =
+  `1 - cos`, rebuild on metric change); new `unidb-embed/` crate is a CLI
+  (`embed-insert`/`search`) that embeds text via a pluggable HTTP endpoint and
+  stores/searches via the `unidb-attach` client. Embedding generation stayed
+  client-side (no model deps in the engine). Remaining Track D polish: expose the
+  metric through `CREATE INDEX ... USING HNSW <metric>` (SQL lane) and an
+  optional search UI (Track B). Still holds Track B (Studio UI) and Track C
+  (GraphQL).
 
 ---
 
 ## 7. Decision & session log (newest first)
+
+### 2026-07-08 — Track D shipped (semantic search: cosine metric + embedding CLI)
+- Surface lane, worktree `../unidb-embed`, branch `surface-embed`. Only engine
+  file touched: `src/vector.rs` (added per-index `Metric::{Euclidean,Cosine}`,
+  cosine = `1 - cos`, `set_metric` rebuilds the HNSW graph). New workspace crate
+  `unidb-embed/` (CLI: `embed-insert`/`search`) reuses the `unidb-attach` client;
+  embedding generation is client-side via a pluggable HTTP endpoint (key via env
+  var) — no model/network dep in the engine. `cargo test --workspace` + clippy
+  `-D warnings` + fmt clean. Full record in `PROGRESS.md`'s Track D entry.
+- Deferred: `CREATE INDEX ... USING HNSW <metric>` wiring is SQL-lane work.
 
 ### 2026-07-08 — roadmap consolidation + parallelization
 - **Positioning decided (the blend):** AI-native multi-model identity;

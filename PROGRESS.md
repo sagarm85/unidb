@@ -1289,3 +1289,56 @@ rows (every `name` pairs with its `id` — no torn reads) while the writer
 inserts 500 rows. Lock order is consistent (catalog → txn → mmap), so no
 deadlock. `NEAR`/graph/queue reads remain on the writer thread by design —
 additive on the same foundation if a workload needs them concurrent.
+
+---
+
+## Track D — Semantic search (cosine metric + embedding CLI) — 2026-07-08
+
+**Lane:** Surface (worktree `../unidb-embed`, branch `surface-embed`). Disjoint
+from Core/SQL: the *only* engine file touched is `src/vector.rs`; everything
+else is a new workspace-member crate. Proposed as its own milestone per the
+roadmap (§3 Track D, ~1 unit, "mostly client").
+
+**What shipped (two independent deliverables):**
+
+1. **Cosine distance in the vector index** (`src/vector.rs`, small & contained).
+   New `pub enum Metric { Euclidean, Cosine }` (Euclidean is `#[default]`, so
+   `VectorIndex::new()` and the `index_worker.rs` construction site are
+   byte-for-byte unchanged — backward compatible). Added
+   `VectorIndex::with_metric`, `metric()`, and `set_metric()`. The metric is a
+   **per-index** choice carried on every `VectorPoint`, applied identically
+   during HNSW build and search. Cosine is `1 - cos(a,b)` (`pgvector`'s `<=>`),
+   with a zero-norm guard returning max distance. `set_metric` **handles the
+   rebuild**: because the graph's edges were chosen *by* the old metric, a
+   metric change re-runs `rebuild()` over the buffered point set (no-op if
+   unchanged). 9 new unit tests (cosine ranks by direction not magnitude;
+   Euclidean vs cosine provably disagree on the same points; set_metric
+   re-ranks; zero-vector guard) — engine lib tests 225 → 234, all green.
+   *Not done here (out of the Surface lane's file scope):* wiring a
+   `USING HNSW <metric>` choice through `CREATE INDEX`/catalog/executor — that
+   is SQL-lane work; the engine API supports cosine today.
+
+2. **New crate `unidb-embed/`** (workspace member, like `unidb-attach`): a CLI
+   that turns text into vectors via a **pluggable HTTP embedding endpoint**
+   (OpenAI-compatible; API key via `UNIDB_EMBED_API_KEY` env var), then stores
+   and searches them through the UniDB REST server using the `unidb-attach`
+   client. Commands: `embed-insert` (embed text → `INSERT ... VALUES (id,
+   'text', [vec])`) and `search` (embed query → `SELECT ... WHERE NEAR(col,
+   [vec], k)`). Column names default to `id`/`content`/`embedding`, overridable.
+   Modules: `embed.rs` (HTTP embedding client, parses OpenAI `data[0].embedding`
+   or a flat `embedding` shape), `sql.rs` (pure, tested SQL builders with
+   single-quote escaping), `main.rs` (clap CLI + result printer). 11 unit tests.
+   Short `README.md` with an end-to-end worked example (create table + HNSW
+   index, embed-insert three docs, semantic `search`).
+
+**Deliberate constraint honored:** embedding *generation* is client-side ONLY.
+`unidb-embed` depends on `reqwest` + `unidb-attach`; **no model/network dep
+reaches the `unidb` engine crate** — verified by it not being added to the
+engine's `[dependencies]`.
+
+**Gates:** `cargo test --workspace` green (234 engine lib + 11 `unidb-embed` +
+all server/attach/crash/concurrency suites); `cargo clippy --workspace
+--all-targets -- -D warnings` clean; `cargo fmt --all` clean. No benchmark
+table: this milestone adds no hot-path change to measure (cosine is an
+alternate metric on the existing index; the CLI is a thin client). No locked
+decision (§3) touched.

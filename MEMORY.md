@@ -1721,6 +1721,34 @@ plain reporting.
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-07-08 — Track D: semantic search (cosine metric + `unidb-embed` CLI, branch `surface-embed`)
+
+- **Surface lane, worktree `../unidb-embed`.** Disjoint from Core/SQL: the only
+  engine file touched is `src/vector.rs`; everything else is a new
+  workspace-member crate. Full write-up in `PROGRESS.md`'s Track D entry.
+- **`src/vector.rs` — cosine metric (kept small):** new `pub enum Metric {
+  Euclidean (#[default]), Cosine }`; `VectorIndex::with_metric`/`metric()`/
+  `set_metric()`. Metric is per-index, carried on every `VectorPoint`, applied
+  in both HNSW build and search. Cosine = `1 - cos` (`pgvector` `<=>`), zero-norm
+  guarded. `set_metric` triggers a full `rebuild()` (graph edges were chosen by
+  the old metric) — the "changing metric implies a rebuild" requirement.
+  `VectorIndex::new()` still defaults Euclidean, so the `index_worker.rs:162`
+  construction site is untouched (I did **not** edit index_worker/executor/
+  catalog). 9 new unit tests; engine lib 225 → 234.
+- **`unidb-embed/` crate:** CLI (`embed-insert`, `search`) that embeds text via a
+  pluggable OpenAI-compatible HTTP endpoint (key via `UNIDB_EMBED_API_KEY`) and
+  stores/searches through the REST server via `unidb-attach`. `embed.rs` (HTTP +
+  response parse), `sql.rs` (pure tested SQL builders), `main.rs` (clap). 11
+  tests. `README.md` has a worked example. Added to root `[workspace] members`.
+- **Constraint honored:** embedding *generation* is client-side only — no model/
+  network dep added to the `unidb` engine crate (`unidb-embed` pulls `reqwest` +
+  `unidb-attach`, engine `[dependencies]` unchanged).
+- **Gates:** `cargo test --workspace` green (234 engine lib + 11 embed + all
+  server/attach/crash/concurrency); clippy `-D warnings` + fmt clean.
+- **Follow-up (SQL lane, not this lane):** expose the metric through `CREATE
+  INDEX ... USING HNSW <metric>` (catalog + executor); the engine API supports
+  cosine today but nothing wires a per-`CREATE INDEX` metric choice yet.
+
 ### 2026-07-08 — 6b concurrent SQL SELECT (branch `m9-concurrent-select`)
 
 - Extended 6b from point reads to **read-only SQL `SELECT`** on the

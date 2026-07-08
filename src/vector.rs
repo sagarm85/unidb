@@ -20,26 +20,73 @@ use instant_distance::{Builder, HnswMap, Search};
 
 use crate::heap::RowId;
 
+/// Distance metric a `VectorIndex` uses to rank neighbors.
+///
+/// This is a **per-index** choice (Track D): a given `VectorIndex` computes
+/// every distance — both while building the HNSW graph and while searching —
+/// with a single metric. Switching the metric on an existing index is not a
+/// cheap relabel: the graph's edges were chosen *by* the old metric, so a
+/// change forces a full rebuild from the buffered point set (handled by
+/// [`VectorIndex::set_metric`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Metric {
+    /// Straight-line L2 distance. Matches `pgvector`'s `<->` operator, the
+    /// default kept for backward compatibility with M2's index.
+    #[default]
+    Euclidean,
+    /// Cosine *distance* (`1 - cosine_similarity`), in `[0, 2]`. Direction-only
+    /// similarity — the natural metric for text embeddings, where magnitude
+    /// carries little meaning. Matches `pgvector`'s `<=>` operator.
+    Cosine,
+}
+
+fn euclidean(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y) * (x - y))
+        .sum::<f32>()
+        .sqrt()
+}
+
+/// `1 - cos(a, b)`, guarding against a zero-length vector (undefined cosine),
+/// which is treated as maximally distant so it never wins a nearest-neighbor
+/// race.
+fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot = 0.0f32;
+    let mut norm_a = 0.0f32;
+    let mut norm_b = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 1.0;
+    }
+    1.0 - dot / (norm_a.sqrt() * norm_b.sqrt())
+}
+
 #[derive(Clone)]
-struct VectorPoint(Vec<f32>);
+struct VectorPoint {
+    coords: Vec<f32>,
+    metric: Metric,
+}
 
 impl instant_distance::Point for VectorPoint {
-    /// Euclidean distance — the common default for embedding similarity and
-    /// matches `pgvector`'s `<->` operator, keeping the later benchmark
-    /// comparison apples-to-apples.
+    /// Distance under this point's metric. Every point in one index carries the
+    /// same metric (set at build time), so both operands always agree.
     fn distance(&self, other: &Self) -> f32 {
-        self.0
-            .iter()
-            .zip(other.0.iter())
-            .map(|(a, b)| (a - b) * (a - b))
-            .sum::<f32>()
-            .sqrt()
+        match self.metric {
+            Metric::Euclidean => euclidean(&self.coords, &other.coords),
+            Metric::Cosine => cosine_distance(&self.coords, &other.coords),
+        }
     }
 }
 
 pub struct VectorIndex {
     points: HashMap<RowId, Vec<f32>>,
     map: Option<HnswMap<VectorPoint, RowId>>,
+    metric: Metric,
 }
 
 impl Default for VectorIndex {
@@ -49,11 +96,35 @@ impl Default for VectorIndex {
 }
 
 impl VectorIndex {
+    /// A new, empty index using the default [`Metric::Euclidean`] — kept as the
+    /// zero-argument constructor so existing M2 callers are unaffected.
     pub fn new() -> Self {
+        Self::with_metric(Metric::Euclidean)
+    }
+
+    /// A new, empty index using an explicit metric.
+    pub fn with_metric(metric: Metric) -> Self {
         Self {
             points: HashMap::new(),
             map: None,
+            metric,
         }
+    }
+
+    /// The metric this index ranks with.
+    pub fn metric(&self) -> Metric {
+        self.metric
+    }
+
+    /// Change the metric. Because the HNSW graph's edges were chosen by the old
+    /// metric, this rebuilds the whole graph from the buffered points so future
+    /// searches are consistent. A no-op (no rebuild) if the metric is unchanged.
+    pub fn set_metric(&mut self, metric: Metric) {
+        if self.metric == metric {
+            return;
+        }
+        self.metric = metric;
+        self.rebuild();
     }
 
     /// Insert or overwrite the vector for `id`, then rebuild the HNSW graph
@@ -74,20 +145,34 @@ impl VectorIndex {
             self.map = None;
             return;
         }
+        let metric = self.metric;
         let (points, ids): (Vec<VectorPoint>, Vec<RowId>) = self
             .points
             .iter()
-            .map(|(id, v)| (VectorPoint(v.clone()), *id))
+            .map(|(id, v)| {
+                (
+                    VectorPoint {
+                        coords: v.clone(),
+                        metric,
+                    },
+                    *id,
+                )
+            })
             .unzip();
         self.map = Some(Builder::default().build(points, ids));
     }
 
-    /// Up to `k` nearest neighbors to `query`, nearest first.
+    /// Up to `k` nearest neighbors to `query`, nearest first. The returned
+    /// distance is in this index's metric (L2 for Euclidean, `1 - cos` for
+    /// Cosine).
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(RowId, f32)> {
         let Some(map) = &self.map else {
             return Vec::new();
         };
-        let point = VectorPoint(query.to_vec());
+        let point = VectorPoint {
+            coords: query.to_vec(),
+            metric: self.metric,
+        };
         let mut search = Search::default();
         map.search(&point, &mut search)
             .take(k)
@@ -156,5 +241,61 @@ mod tests {
         let results = idx.search(&[0.0, 0.0], 5);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, rid(2, 0));
+    }
+
+    #[test]
+    fn default_metric_is_euclidean() {
+        assert_eq!(VectorIndex::new().metric(), Metric::Euclidean);
+        assert_eq!(
+            VectorIndex::with_metric(Metric::Cosine).metric(),
+            Metric::Cosine
+        );
+    }
+
+    #[test]
+    fn cosine_ranks_by_direction_not_magnitude() {
+        // Two candidates: one points the same *direction* as the query but is
+        // far away in magnitude; the other is close in Euclidean terms but
+        // points elsewhere. Cosine must prefer the same-direction one.
+        let mut idx = VectorIndex::with_metric(Metric::Cosine);
+        idx.upsert(rid(1, 0), vec![100.0, 0.0]); // same direction as query, big
+        idx.upsert(rid(2, 0), vec![1.0, 1.0]); // 45° off, but Euclidean-closer
+
+        let results = idx.search(&[1.0, 0.0], 2);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, rid(1, 0));
+        // Same-direction vector has cosine distance ~0.
+        assert!(results[0].1 < 1e-4, "distance was {}", results[0].1);
+    }
+
+    #[test]
+    fn euclidean_and_cosine_can_disagree() {
+        let build = |metric| {
+            let mut idx = VectorIndex::with_metric(metric);
+            idx.upsert(rid(1, 0), vec![100.0, 0.0]);
+            idx.upsert(rid(2, 0), vec![1.0, 1.0]);
+            idx.search(&[1.0, 0.0], 1)[0].0
+        };
+        // Euclidean prefers the physically nearer point; cosine the aligned one.
+        assert_eq!(build(Metric::Euclidean), rid(2, 0));
+        assert_eq!(build(Metric::Cosine), rid(1, 0));
+    }
+
+    #[test]
+    fn set_metric_rebuilds_and_changes_ranking() {
+        let mut idx = VectorIndex::new(); // Euclidean
+        idx.upsert(rid(1, 0), vec![100.0, 0.0]);
+        idx.upsert(rid(2, 0), vec![1.0, 1.0]);
+        assert_eq!(idx.search(&[1.0, 0.0], 1)[0].0, rid(2, 0));
+
+        idx.set_metric(Metric::Cosine);
+        assert_eq!(idx.metric(), Metric::Cosine);
+        assert_eq!(idx.search(&[1.0, 0.0], 1)[0].0, rid(1, 0));
+    }
+
+    #[test]
+    fn zero_vector_is_maximally_distant_under_cosine() {
+        assert_eq!(cosine_distance(&[0.0, 0.0], &[1.0, 1.0]), 1.0);
+        assert_eq!(cosine_distance(&[1.0, 0.0], &[1.0, 0.0]), 0.0);
     }
 }

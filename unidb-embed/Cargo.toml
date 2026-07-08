@@ -1,0 +1,21 @@
+[package]
+name = "unidb-embed"
+version = "0.1.0"
+edition = "2021"
+description = "Client-side semantic-search CLI for UniDB: turn text into vectors via a pluggable HTTP embedding endpoint, then store/search them over the UniDB REST server."
+
+# Embedding *generation* is deliberately client-side only: this crate calls an
+# external HTTP embedding endpoint and talks to the engine exclusively through
+# `unidb-attach`'s REST client. No model or network dependency ever reaches the
+# `unidb` engine crate (CLAUDE.md / roadmap Track D).
+[dependencies]
+unidb-attach = { path = "../unidb-attach" }
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1.0"
+
+[[bin]]
+name = "unidb-embed"
+path = "src/main.rs"
