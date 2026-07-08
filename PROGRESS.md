@@ -2542,3 +2542,25 @@ tokio/reqwest/axum (rusqlite is a dev-dep, outside the normal graph).
 
 **Locked-decision changes:** none. This is CLAUDE.md §1's "practical subset" growing; the catalog gained statistics storage (additive). No §3 decision reversed; no `FORMAT_VERSION` bump.
 **PR:** _pending._
+
+---
+
+## Phase 5 — Concurrency & performance   [IN PROGRESS]   2026-07-09
+
+**Branch:** `phase5-concurrency` (one branch, one PR for the whole phase).
+**PR:** _pending._
+
+**Locked-decision sign-off (CLAUDE.md §3, required before any work):** Phase 5
+reverses the M5 "single writer thread, `Engine` is `!Sync`" simplification —
+the single-writer design was an implicit locked decision. **The user explicitly
+authorized reversing the single-writer design on 2026-07-09.** This entry, in
+the first commit of the branch, records that sign-off per §3. D5 (WAL-before-
+page) and D10–D12 (isolation) remain in force and are *strengthened* under
+concurrency (D5 preserved by page latching; D11/D12 completed by real wait
+queues + deadlock detection replacing abort-only). No other §3 decision is
+touched.
+
+**Summary:** _in progress — checkpoints P5.a→P5.f. Metrics table (write
+throughput scaling with cores) + peak-memory note recorded at phase close._
+
+**Checkpoint status:** _updated as each lands._
