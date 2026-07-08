@@ -2345,3 +2345,54 @@ bounded by nlist not corpus) + the DiskBTree duplicate regression. All suites
 green; clippy `-D warnings` + fmt clean.
 **Locked-decision impact:** none. No `FORMAT_VERSION` bump.
 **PR:** _pending (spike; production PR is the follow-up)._
+
+---
+
+### P3.d — Large-object (big-file) storage   [Core lane — Phase 3 — shipped]   2026-07-08
+
+**Branch:** `durable-storage`. The "big file" differentiator: store values too
+large for an 8 KiB tuple **out of line, chunked, and streamed** — never loading a
+whole multi-GB value into RAM.
+**Summary:** a large object is a sequence of ~7 KiB **chunk rows** in a `__lobs__`
+system heap table, indexed by a durable `DiskBTree` on `lob_id`.
+
+**Design (maximal reuse, zero new format):** the key decision was to *not* invent
+a bespoke overflow-page format. A large object's chunks are **ordinary MVCC/WAL
+heap rows** (like `__edges__`/`__events__`), so:
+- **Atomic with the transaction** — chunks are written under the caller's `xid`,
+  so a blob and its owning row commit or abort together, with zero new txn code.
+- **Crash-recovered for free** — chunk rows ride the heap+WAL recovery path
+  (crash point **P16**: commit a blob, crash without a checkpoint, reopen, stream
+  it back byte-for-byte).
+- **Vacuum-reclaimable** — a deleted/orphaned blob's chunk rows are physically
+  reclaimed by the ordinary heap vacuum (M10).
+- **O(chunks-of-this-blob) locate** — a durable `DiskBTree` on `lob_id` (reuses
+  P3.a) maps a blob to its chunk `RowId`s; itself crash-recovered, never rebuilt.
+
+**Streaming (the "without OOM" gate):** `Engine::put_large_object(xid, impl
+Read)` pulls one ~7 KiB chunk from the reader and inserts it, repeat;
+`read_large_object(xid, lob_id, impl Write)` fetches one chunk row at a time and
+writes it to the sink. **One chunk is resident at a time on both paths** — a
+multi-GB value never loads whole. `lob_id` is allocated from a counter derived at
+open from `__lobs__`'s max (crash-safe, like `next_event_seq`).
+
+**Files:** new `src/large_object.rs` (`LobStore`, `__lobs__` table def,
+`ensure_lobs_table`); `lib.rs` (Engine API + open wiring + `derive_next_lob_id`);
+`tests/large_object.rs`; `tests/crash` (P16).
+
+**Tests:** 5 MiB store→stream round-trip verified by an O(1)-memory checksum sink
+(≈750 chunks over many heap pages); atomicity (an aborted blob is MVCC-invisible,
+a committed one fully readable); vacuum reclaims a deleted 400 KiB blob's chunks;
+crash-recovery (P16). Crash harness **17 → 18**. All default + server + workspace
+suites green; clippy `-D warnings` + fmt clean.
+
+**Deferred (documented, not silent):** transparently toasting a large inline
+`BYTEA` column value to this store (this is the explicit large-object API that
+path would call); streaming REST upload/download routes — server-side streaming
+through the single writer thread needs a chunked command path, a real design
+piece rather than buffering a whole blob in the writer.
+
+**Locked-decision impact:** D4 (tuple stays forward-compatible — large objects
+are separate `__lobs__` rows, no tuple format change). No `FORMAT_VERSION` bump.
+No decision reversed.
+**PR:** _pending._

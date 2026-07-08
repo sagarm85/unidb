@@ -53,6 +53,8 @@ pub mod fulltext;
 pub mod graph;
 pub mod heap;
 pub mod index_worker;
+/// P3.d — chunked, streamed, out-of-line large-object storage.
+pub mod large_object;
 pub mod lockmgr;
 pub mod mmap;
 pub mod mvcc;
@@ -86,6 +88,7 @@ use crate::{
     },
     heap::Heap,
     index_worker::{IndexHandle, IndexMsg},
+    large_object::LobStore,
     lockmgr::LockManager,
     queue::{CONSUMERS_TABLE, EVENTS_TABLE},
     sql::{
@@ -207,6 +210,12 @@ pub struct Engine {
     /// `edges_from`/Cypher reconstruct the tree without a catalog lookup on
     /// every call. Crash-recovered, never rebuilt on open.
     edge_index_meta: PageId,
+    /// Meta page id of the `__lobs__` large-object chunk index (P3.d) — a durable
+    /// `DiskBTree` on `lob_id`, cached like `edge_index_meta`.
+    lob_index_meta: PageId,
+    /// Next large-object id to hand out (P3.d), derived at open from the highest
+    /// committed `lob_id` in `__lobs__` (mirrors `next_event_seq`).
+    next_lob_id: i64,
     next_event_seq: u64,
     /// Auto-checkpoint policy + state (P1.e).
     auto_checkpoint: AutoCheckpointConfig,
@@ -337,6 +346,24 @@ impl Engine {
             &mut control,
             page_size_usize,
         )?;
+        let lob_index_meta = large_object::ensure_lobs_table(
+            &mut catalog,
+            &mut txn_mgr,
+            &mut pool,
+            &mut wal,
+            &mut lock_mgr,
+            &ctrl_p,
+            &mut control,
+            page_size_usize,
+        )?;
+        let next_lob_id = derive_next_lob_id(
+            &catalog,
+            &mut txn_mgr,
+            &mut pool,
+            &mut wal,
+            &mut lock_mgr,
+            page_size_usize,
+        )?;
         let next_event_seq = derive_next_event_seq(
             &catalog,
             &mut txn_mgr,
@@ -370,6 +397,8 @@ impl Engine {
             _wal_path: wal_p,
             index_worker,
             edge_index_meta,
+            lob_index_meta,
+            next_lob_id,
             next_event_seq,
             auto_checkpoint: AutoCheckpointConfig::default(),
             last_checkpoint: Instant::now(),
@@ -1017,6 +1046,98 @@ impl Engine {
         Ok(out)
     }
 
+    // ── Large objects (P3.d) ────────────────────────────────────────────────
+
+    /// Stream a large object into out-of-line chunked storage under `xid`,
+    /// returning its `lob_id`. The chunks commit/abort **atomically with `xid`**
+    /// (they are ordinary `__lobs__` rows written under the same transaction),
+    /// so a caller can store a big value and its owning row in one transaction.
+    /// Resident memory is one ~7 KiB chunk at a time — a multi-GB value never
+    /// loads whole (the "without OOM" gate).
+    pub fn put_large_object<R: std::io::Read>(&mut self, xid: Xid, reader: R) -> Result<i64> {
+        let page_size = self.control.page_size as usize;
+        let lob_id = self.next_lob_id;
+        self.next_lob_id += 1;
+        let table_def = cat_read(&self.catalog)
+            .lookup(large_object::LOBS_TABLE)?
+            .clone();
+        let mut heap = Heap::from_pages(page_size, table_def.pages.clone());
+        let store = LobStore::new(self.lob_index_meta, page_size);
+        store.write_stream(
+            xid,
+            lob_id,
+            reader,
+            &table_def,
+            &mut heap,
+            &mut self.pool,
+            &mut self.wal,
+            &mut self.txn_mgr,
+        )?;
+        self.persist_lobs_pages(&heap, &table_def.pages)?;
+        Ok(lob_id)
+    }
+
+    /// Stream a large object out into `sink` one chunk at a time (never holding
+    /// more than a chunk in memory), MVCC-filtered against `xid`. Returns bytes
+    /// written; a `lob_id` with no visible chunks writes nothing.
+    pub fn read_large_object<W: std::io::Write>(
+        &mut self,
+        xid: Xid,
+        lob_id: i64,
+        sink: W,
+    ) -> Result<u64> {
+        let page_size = self.control.page_size as usize;
+        let table_def = cat_read(&self.catalog)
+            .lookup(large_object::LOBS_TABLE)?
+            .clone();
+        let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
+        let store = LobStore::new(self.lob_index_meta, page_size);
+        store.read_stream(lob_id, &table_def, &snapshot, xid, &mut self.pool, sink)
+    }
+
+    /// Delete every chunk of `lob_id` under `xid` (MVCC delete; the heap vacuum
+    /// reclaims the dead chunk rows later). Returns the number of chunks removed.
+    pub fn delete_large_object(&mut self, xid: Xid, lob_id: i64) -> Result<usize> {
+        let page_size = self.control.page_size as usize;
+        let table_def = cat_read(&self.catalog)
+            .lookup(large_object::LOBS_TABLE)?
+            .clone();
+        let mut heap = Heap::from_pages(page_size, table_def.pages.clone());
+        let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
+        let store = LobStore::new(self.lob_index_meta, page_size);
+        store.delete(
+            xid,
+            lob_id,
+            &table_def,
+            &mut heap,
+            &mut self.pool,
+            &mut self.wal,
+            &mut self.lock_mgr,
+            &mut self.txn_mgr,
+            &snapshot,
+        )
+    }
+
+    /// Persist `__lobs__`'s page list back to the catalog if the heap grew.
+    fn persist_lobs_pages(&mut self, heap: &Heap, original: &[PageId]) -> Result<()> {
+        if heap.page_ids() != original {
+            let page_size = self.control.page_size as usize;
+            let mut cctx = CatalogCtx {
+                pool: &mut self.pool,
+                wal: &mut self.wal,
+                control_path: &self.control_path,
+                control: &mut self.control,
+                page_size,
+            };
+            cat_write(&self.catalog).set_pages(
+                large_object::LOBS_TABLE,
+                heap.page_ids().to_vec(),
+                &mut cctx,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Begin a new transaction under READ COMMITTED (the default, D10).
     pub fn begin(&mut self) -> Result<Xid> {
         self.begin_with_isolation(IsolationLevel::ReadCommitted)
@@ -1489,6 +1610,31 @@ fn ensure_edge_index(
 /// recover_next_xid`'s "resume past the highest ever seen" approach and
 /// `rebuild_edge_index`'s exact begin/scan/commit read-only transaction
 /// template. Returns 1 if `__events__` is empty.
+/// Derive the next `lob_id` (P3.d) from `__lobs__`'s highest committed `lob_id`
+/// — mirrors `derive_next_event_seq`. Crash-safe (persisted as ordinary rows).
+fn derive_next_lob_id(
+    catalog: &Catalog,
+    txn_mgr: &mut TransactionManager,
+    pool: &mut BufferPool,
+    wal: &mut Wal,
+    lock_mgr: &mut LockManager,
+    page_size: usize,
+) -> Result<i64> {
+    let table = catalog.lookup(large_object::LOBS_TABLE)?;
+    let heap = Heap::from_pages(page_size, table.pages.clone());
+    let xid = txn_mgr.begin(IsolationLevel::ReadCommitted, wal)?;
+    let snapshot = txn_mgr.snapshot_for_statement(xid)?;
+    let mut max_id: i64 = 0;
+    for (_, bytes) in heap.scan(&snapshot, xid, pool)? {
+        let row = executor::decode_row(&bytes, &table.columns)?;
+        if let Literal::Int(lob_id) = row[0] {
+            max_id = max_id.max(lob_id);
+        }
+    }
+    txn_mgr.commit(xid, wal, lock_mgr)?;
+    Ok(max_id + 1)
+}
+
 fn derive_next_event_seq(
     catalog: &Catalog,
     txn_mgr: &mut TransactionManager,

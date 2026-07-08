@@ -30,6 +30,9 @@
 //   P15 – durable edge-adjacency index (P3.b): committed edges + their durable
 //         `__edges__.from_id` index survive a crash and `edges_from` traversal
 //         works on reopen with no rebuild
+//   P16 – large object (P3.d): a committed out-of-line chunked blob + its
+//         `__lobs__` index survive a crash (no checkpoint) and stream back
+//         intact on reopen
 
 use tempfile::tempdir;
 use unidb::{Engine, RowId};
@@ -844,6 +847,63 @@ fn p15_durable_edge_index_survives_crash_and_traversal_works_on_reopen() {
     let mut tos: Vec<i64> = edges.iter().map(|e| e.to_id).collect();
     tos.sort();
     assert_eq!(tos, vec![0, 1, 2, 3, 4]);
+}
+
+// ── P16: large object survives a crash (P3.d) ────────────────────────────────
+//
+// A large object is stored as chunk rows in `__lobs__` under the caller's xid,
+// indexed by a durable `DiskBTree` — so a committed blob is durable via the
+// ordinary heap+WAL path, and its index is crash-recovered (P3.a machinery).
+// Commit a multi-chunk blob, "crash" without a checkpoint, reopen, and stream
+// it back byte-for-byte.
+#[test]
+fn p16_large_object_survives_crash_and_streams_back_intact() {
+    let dir = tempdir().unwrap();
+    let n = 300 * 1024usize; // dozens of chunks across several heap pages
+
+    let blob_byte = |i: usize| -> u8 { ((i * 2654435761) >> 13) as u8 };
+    struct R<'a> {
+        pos: usize,
+        n: usize,
+        f: &'a dyn Fn(usize) -> u8,
+    }
+    impl std::io::Read for R<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let take = (self.n - self.pos).min(buf.len());
+            for (j, s) in buf[..take].iter_mut().enumerate() {
+                *s = (self.f)(self.pos + j);
+            }
+            self.pos += take;
+            Ok(take)
+        }
+    }
+
+    let lob_id = {
+        let mut engine = open(dir.path());
+        let xid = engine.begin().unwrap();
+        let id = engine
+            .put_large_object(
+                xid,
+                R {
+                    pos: 0,
+                    n,
+                    f: &blob_byte,
+                },
+            )
+            .unwrap();
+        engine.commit(xid).unwrap();
+        drop(engine); // "crash" — no checkpoint
+        id
+    };
+
+    let mut engine = open(dir.path());
+    let xid = engine.begin().unwrap();
+    let mut out: Vec<u8> = Vec::new();
+    let written = engine.read_large_object(xid, lob_id, &mut out).unwrap();
+    assert_eq!(written, n as u64, "P16: whole blob must survive the crash");
+    for (i, b) in out.iter().enumerate() {
+        assert_eq!(*b, blob_byte(i), "P16: byte {i} corrupted after recovery");
+    }
 }
 
 // ── P13: durable B-Tree survives total data-file loss (P3.a) ─────────────────

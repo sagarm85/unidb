@@ -84,7 +84,8 @@ RAM is bounded, and the on-disk structure is already crash-safe.**
 - Wire `CREATE INDEX … USING HNSW` (or a new `USING IVF`) to build a
   `DiskIvfIndex`, store its meta page in `ColumnDef.index_root`, and route
   `NEAR` through it; retire the async index worker (its last user).
-- A crash-injection point (P16) for the durable vector index.
+- A crash-injection point (P17) for the durable vector index. (P16 is taken by
+  P3.d large objects.)
 - `nlist`/`nprobe` as index parameters; a larger-corpus recall/latency sweep.
 
 ## Bottom line

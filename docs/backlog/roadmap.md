@@ -38,7 +38,7 @@
 | M11 | SQL constraints (PK / FK / UNIQUE / NOT NULL / CHECK / DEFAULT) |
 | **Phase 1** | **ACID hardening (complete):** full-page-writes (torn-page) · fsync-failure handling · `alloc_page` chunked growth + configurable pool + real FSM · isolation correctness (RC re-eval + SSI) · auto-checkpoint |
 | **Phase 2** | **Real data model (complete):** DECIMAL/TIMESTAMP/FLOAT/UUID/BYTEA/DATE/TIME · ALTER/DROP/TRUNCATE + request-level DDL rollback · SERIAL · prepared statements + `$n` bind params |
-| **Phase 3** | **Multi-model durable storage (in progress):** P3.a durable B-Tree · P3.b durable full-text + edge index (CSR retired) — shipped (no rebuild on open). P3.c on-disk vector — **spike complete** (IVF-Flat, recall@10=1.0 at nprobe=4; production PR pending). P3.d (large objects) in progress. |
+| **Phase 3** | **Multi-model durable storage:** P3.a durable B-Tree · P3.b durable full-text + edge index (CSR retired) · P3.d chunked/streamed large objects — all shipped (no rebuild on open; big files without OOM). P3.c on-disk vector — spike complete (IVF-Flat, recall@10=1.0 at nprobe=4; **production wiring is the one remaining follow-up PR**). |
 
 The core is architecturally correct — it is not a toy. But it is the **small
 version**; §3 is the honest gap to production.
@@ -181,6 +181,17 @@ status, same discipline as M10.
 ---
 
 ## 8. Decision & session log (newest first)
+
+### 2026-07-08 — Phase 3 P3.d (large-object storage) shipped
+- Large objects are stored **out-of-line, chunked (~7 KiB), and streamed**: a
+  blob is a sequence of chunk rows in a `__lobs__` system table indexed by a
+  durable `DiskBTree` on `lob_id` (reuses P3.a) — so it is atomic with the
+  caller's transaction, crash-recovered, and vacuum-reclaimable with **zero new
+  storage format**. `Engine::put_large_object`/`read_large_object`/
+  `delete_large_object` hold one chunk at a time (multi-GB without OOM). Crash
+  point **P16** (harness 17→18). Deferred: transparent BYTEA-toast + streaming
+  REST routes. **Phase 3 is effectively complete** — the only remaining item is
+  the P3.c on-disk-vector *production* wiring (the spike is done).
 
 ### 2026-07-08 — Phase 3 P3.c (on-disk vector) spike complete
 - Spiked the durable on-disk vector index (blueprint mandates "spike first,

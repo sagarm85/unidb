@@ -103,8 +103,15 @@
   `docs/design/p3c_vector_spike.md`) — the production wiring is a follow-up PR
   (not rushed, per the blueprint). The spike also **found + fixed a real
   `DiskBTree` duplicate-key-spanning-leaves bug** affecting P3.a/P3.b (see
-  subsection). Dated subsections below; full entries in `PROGRESS.md`. **In
-  progress: P3.d (large objects).**
+  subsection). **P3.d (large objects) is SHIPPED:** values stored **out-of-line,
+  chunked (~7 KiB), and streamed** as ordinary MVCC/WAL chunk rows in a `__lobs__`
+  system table indexed by a durable `DiskBTree` on `lob_id` — atomic with the
+  txn, crash-recovered (crash point **P16**), vacuum-reclaimable, and streamed
+  one chunk at a time (multi-GB without OOM). `Engine::put/read/delete_large_
+  object` (`src/large_object.rs`). Crash harness **14 → 18**. Dated subsections
+  below; full entries in `PROGRESS.md`. **Phase 3 is effectively complete — the
+  only remaining item is the P3.c on-disk-vector *production* wiring (the spike
+  is done and validated).**
 - **Prior Core-lane work: Phase 1 — ACID & storage foundation** (the feature-freeze
   gate, `docs/backlog/phase1_acid_hardening.md`), on Core lane branch
   `acid-hardening`. **Phase 1 is COMPLETE — all five checkpoints shipped:** P1.a
@@ -524,7 +531,7 @@ Third Phase 3 checkpoint, delivered as the **spike** the blueprint mandates
   vs. brute-force ground truth (`benches/vector_recall.rs`), 4 KB RAM, 24 ms
   build — vs. the in-RAM HNSW's 30 s build for 1,200 vectors (the M2
   rebuild-per-upsert pathology, quantified). **Production wiring (CREATE INDEX →
-  durable, NEAR reads it, centroid persistence, crash point P16) is the
+  durable, NEAR reads it, centroid persistence, a new crash point P17) is the
   follow-up PR.**
 - **The spike found + fixed a real `DiskBTree` bug that also affected P3.a/P3.b.**
   IVF recall capped at 0.912 even probing all cells → a duplicate-key run
@@ -539,6 +546,33 @@ Third Phase 3 checkpoint, delivered as the **spike** the blueprint mandates
   graph hub with many edges, or a BTree value on many rows would have silently
   returned an incomplete set. (The insert path keeps `<` routing so new
   duplicates append after existing ones — only reads needed leftmost descent.)
+
+### P3.d — large-object (big-file) storage (Core lane, branch `durable-storage`, 2026-07-08)
+
+Fourth Phase 3 checkpoint. Full entry in `PROGRESS.md`'s P3.d section. Key points:
+
+- **The design decision: large objects are ordinary heap rows, not a bespoke
+  overflow format.** A blob is a sequence of ~7 KiB **chunk rows** in a `__lobs__`
+  system heap table (`lob_id, chunk_no, data BYTEA`), indexed by a durable
+  `DiskBTree` on `lob_id` (reuses P3.a). Because chunks are ordinary MVCC/WAL
+  rows written under the caller's `xid`, the blob is **atomic with the
+  transaction**, **crash-recovered**, and **vacuum-reclaimable** with *zero new
+  storage format* — the same "new durable state is always ordinary heap rows"
+  pattern M3/M4 used for `__edges__`/`__events__`.
+- **Streaming (the "without OOM" gate):** `Engine::put_large_object(xid, impl
+  Read)` inserts one chunk at a time pulled from the reader;
+  `read_large_object(xid, lob_id, impl Write)` fetches one chunk row at a time
+  into the sink. One ~7 KiB chunk resident at a time on both paths — a multi-GB
+  value never loads whole. `lob_id` from a counter derived at open from
+  `__lobs__`'s max (`derive_next_lob_id`, mirrors `next_event_seq`).
+- **Files:** `src/large_object.rs` (`LobStore` + `ensure_lobs_table`), `lib.rs`
+  (Engine API + open wiring + fields `lob_index_meta`/`next_lob_id`),
+  `tests/large_object.rs`, crash point **P16** (harness 17→18). No
+  `FORMAT_VERSION` bump; D4 tuple format unchanged.
+- **Deferred (documented):** transparent BYTEA-toast of a large inline column
+  value; streaming REST upload/download routes (server-side streaming through
+  the single writer thread needs a chunked-command path — real design work, not
+  buffering a whole blob in the writer).
 
 ### Design note: xid reuse after checkpoint — a real M1-era bug, found and fixed during M5
 

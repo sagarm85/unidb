@@ -25,7 +25,14 @@
   (a run straddling a leaf boundary under-returned) affecting P3.a/P3.b.
   Production wiring (CREATE INDEX → durable, NEAR reads it, crash point, centroid
   persistence) is the follow-up PR — deliberately not rushed per the blueprint.
-- P3.d (large objects): in progress.
+- **P3.d — Large-object storage: SHIPPED** (embedded API). Values are stored
+  **out-of-line, chunked (~7 KiB), and streamed** — a large object is a sequence
+  of chunk rows in a `__lobs__` system table indexed by a durable `DiskBTree` on
+  `lob_id` (reuses P3.a). `Engine::put_large_object`/`read_large_object`/
+  `delete_large_object` stream one chunk at a time (multi-GB without OOM), are
+  **atomic with the caller's transaction** (chunks are ordinary MVCC/WAL rows),
+  crash-recovered (crash point **P16**), and vacuum reclaims deleted/orphaned
+  chunks. Follow-up (documented): transparent BYTEA-toast + streaming REST routes.
 
 Kills rebuild-on-open + the RAM ceiling, and owns the AI/big-file story
 Postgres doesn't have. Companion to [`roadmap.md`](roadmap.md) §4. **Depends on
@@ -106,19 +113,29 @@ which is the differentiator.
   `docs/design/p3c_vector_spike.md`.
 - **Production follow-up (its own PR):** persist centroids in a meta page; wire
   `CREATE INDEX ... USING HNSW`/`IVF` → `DiskIvfIndex`, route `NEAR` through it,
-  retire the async worker; crash point P16; larger-corpus recall/latency sweep.
+  retire the async worker; a new crash point (P17); larger-corpus recall/latency
+  sweep. (P16 is taken by P3.d large objects.)
 
-### P3.d — Big-file / large-object storage (the "big file" differentiator)
-- Values above a threshold stored **out-of-line** (TOAST-like): chunked into
-  overflow pages / a large-object area, referenced by an out-of-line pointer in
-  the tuple, and **streamed** — never load a whole multi-GB value into RAM.
-- New streaming upload/download REST routes; the write is transactional (the
-  blob + its row commit atomically); vacuum reclaims orphaned chunks.
-- Files: new `large_object` module, `heap.rs` (out-of-line pointer form),
-  `page.rs`, `catalog.rs` (large-object/BYTEA-toasted), `server/*` (streaming
-  routes), `docs/REST_API.md`.
-- Tests: store + stream a multi-GB blob without OOM; atomicity with the row;
-  vacuum reclaims orphans; crash-recovery.
+### P3.d — Big-file / large-object storage — SHIPPED (2026-07-08, embedded API)
+- Values are stored **out-of-line, chunked (~7 KiB/chunk), and streamed** — a
+  large object is a sequence of chunk rows in a `__lobs__` system heap table,
+  indexed by a durable `DiskBTree` on `lob_id` (reuses P3.a). Because chunks are
+  ordinary MVCC/WAL rows written under the caller's `xid`, the blob is **atomic
+  with the transaction** and crash-recovered with **zero new storage format** —
+  the deliberate design choice over a bespoke overflow-page format.
+- API (`src/large_object.rs` + `Engine`): `put_large_object(xid, impl Read) ->
+  lob_id`, `read_large_object(xid, lob_id, impl Write)`, `delete_large_object`.
+  Both paths hold **one ~7 KiB chunk at a time** — a multi-GB value never loads
+  whole (the "without OOM" gate). Deleted/orphaned chunks are reclaimed by the
+  ordinary heap vacuum (M10).
+- Files: new `src/large_object.rs`, `lib.rs` (Engine API + open wiring +
+  `derive_next_lob_id`), `tests/large_object.rs`, `tests/crash` (P16).
+- Tests: 5 MiB store→stream round-trip (checksum, O(1) memory); atomicity
+  (aborted blob invisible); vacuum reclaims deleted chunks; crash-recovery (P16).
+- **Deferred follow-ups (documented, not silent):** transparently toasting a
+  large inline `BYTEA` column value to this store; streaming REST upload/download
+  routes (server-side streaming through the single writer thread needs a chunked
+  command path — a real design piece, not buffering a whole blob in the writer).
 
 ## Locked decisions touched
 
