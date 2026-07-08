@@ -53,6 +53,13 @@ pub enum PlanNode {
         qualifier: String,
         output: Vec<ColumnRef>,
     },
+    /// Scan of a materialized CTE (P4.c): the executor reads its rows from the
+    /// once-computed CTE batch rather than a heap.
+    CteScan {
+        name: String,
+        qualifier: String,
+        output: Vec<ColumnRef>,
+    },
     /// Block nested-loop join (cross joins and non-equi conditions).
     NestedLoopJoin {
         left: Box<PlanNode>,
@@ -159,6 +166,7 @@ impl PlanNode {
     pub fn output(&self) -> &[ColumnRef] {
         match self {
             PlanNode::Scan { output, .. }
+            | PlanNode::CteScan { output, .. }
             | PlanNode::NestedLoopJoin { output, .. }
             | PlanNode::HashJoin { output, .. }
             | PlanNode::MergeJoin { output, .. }
@@ -173,13 +181,18 @@ impl PlanNode {
     }
 }
 
-/// Build the physical plan for a [`QuerySpec`] against the catalog. Pure (no
-/// storage access): scans are placeholders the executor fills by reading heaps.
+/// Output schemas of the CTEs visible to a query, keyed by CTE name. Column
+/// names carry an empty qualifier; a [`PlanNode::CteScan`] requalifies them.
+pub type CteSchemas = std::collections::HashMap<String, Vec<ColumnRef>>;
+
+/// Build the physical plan for a [`QuerySpec`] against the catalog and the
+/// visible CTEs. Pure (no storage access): scans are placeholders the executor
+/// fills by reading heaps (or the materialized CTE batch for a `CteScan`).
 ///
 /// Pipeline (SQL logical order): FROM → WHERE → [Aggregate → HAVING] →
 /// Projection → DISTINCT → ORDER BY → LIMIT/OFFSET.
-pub fn plan_query(spec: &QuerySpec, catalog: &Catalog) -> Result<PlanNode> {
-    let mut node = plan_from(&spec.from, catalog)?;
+pub fn plan_query(spec: &QuerySpec, catalog: &Catalog, ctes: &CteSchemas) -> Result<PlanNode> {
+    let mut node = plan_from(&spec.from, catalog, ctes)?;
     if let Some(sel) = &spec.selection {
         let output = node.output().to_vec();
         node = PlanNode::Filter {
@@ -327,6 +340,15 @@ fn collect_aggs(expr: &QExpr, out: &mut Vec<AggCall>) {
             collect_aggs(rhs, out);
         }
         QExpr::Not(e) | QExpr::IsNull { expr: e, .. } => collect_aggs(e, out),
+        QExpr::InList { expr, list, .. } => {
+            collect_aggs(expr, out);
+            for e in list {
+                collect_aggs(e, out);
+            }
+        }
+        QExpr::InSubquery { expr, .. } => collect_aggs(expr, out),
+        // Aggregates within a subquery belong to that subquery's own scope.
+        QExpr::Exists { .. } | QExpr::ScalarSubquery(_) => {}
     }
 }
 
@@ -393,6 +415,23 @@ fn rewrite_over_agg(expr: &QExpr, group_exprs: &[QExpr], aggs: &[AggCall]) -> Re
             expr: Box::new(rewrite_over_agg(expr, group_exprs, aggs)?),
             negated: *negated,
         }),
+        QExpr::InList {
+            expr,
+            list,
+            negated,
+        } => Ok(QExpr::InList {
+            expr: Box::new(rewrite_over_agg(expr, group_exprs, aggs)?),
+            list: list
+                .iter()
+                .map(|e| rewrite_over_agg(e, group_exprs, aggs))
+                .collect::<Result<_>>()?,
+            negated: *negated,
+        }),
+        // Subqueries carry their own scope; leave them intact. (A subquery
+        // correlated on a group key is a documented v1 gap.)
+        QExpr::Exists { .. } | QExpr::InSubquery { .. } | QExpr::ScalarSubquery(_) => {
+            Ok(expr.clone())
+        }
     }
 }
 
@@ -472,11 +511,37 @@ fn resolve_order_by(order_by: &[OrderKey], output: &[ColumnRef]) -> Result<Vec<S
     Ok(keys)
 }
 
-fn plan_from(node: &FromNode, catalog: &Catalog) -> Result<PlanNode> {
+/// The output schema a FROM tree produces — used by subquery correlation
+/// binding to tell which column references are inner vs. outer (P4.c).
+pub fn plan_from_schema(
+    from: &FromNode,
+    catalog: &Catalog,
+    ctes: &CteSchemas,
+) -> Result<Vec<ColumnRef>> {
+    Ok(plan_from(from, catalog, ctes)?.output().to_vec())
+}
+
+fn plan_from(node: &FromNode, catalog: &Catalog, ctes: &CteSchemas) -> Result<PlanNode> {
     match node {
         FromNode::Table(tref) => {
-            let def = catalog.lookup(&tref.table)?;
             let qualifier = tref.qualifier().to_string();
+            // A FROM name matching a CTE resolves to the CTE, not a base table.
+            if let Some(cte_cols) = ctes.get(&tref.table) {
+                let output = cte_cols
+                    .iter()
+                    .map(|c| ColumnRef {
+                        qualifier: qualifier.clone(),
+                        name: c.name.clone(),
+                        ty: c.ty,
+                    })
+                    .collect();
+                return Ok(PlanNode::CteScan {
+                    name: tref.table.clone(),
+                    qualifier,
+                    output,
+                });
+            }
+            let def = catalog.lookup(&tref.table)?;
             let output = def
                 .columns
                 .iter()
@@ -499,8 +564,8 @@ fn plan_from(node: &FromNode, catalog: &Catalog) -> Result<PlanNode> {
             join_type,
             on,
         } => {
-            let left = plan_from(left, catalog)?;
-            let right = plan_from(right, catalog)?;
+            let left = plan_from(left, catalog, ctes)?;
+            let right = plan_from(right, catalog, ctes)?;
             plan_join(left, right, *join_type, on.clone(), catalog)
         }
     }
@@ -752,6 +817,18 @@ fn validate_expr(expr: &QExpr, schema: &[ColumnRef]) -> Result<()> {
         QExpr::Aggregate { .. } => Err(DbError::SqlPlan(
             "aggregate functions are only allowed in an aggregated query".into(),
         )),
+        QExpr::InList { expr, list, .. } => {
+            validate_expr(expr, schema)?;
+            for e in list {
+                validate_expr(e, schema)?;
+            }
+            Ok(())
+        }
+        // A subquery has its own scope; its correlated outer refs are checked
+        // when it is planned at execution time. Only the outer `expr` of an
+        // `IN (subquery)` resolves against this schema.
+        QExpr::InSubquery { expr, .. } => validate_expr(expr, schema),
+        QExpr::Exists { .. } | QExpr::ScalarSubquery(_) => Ok(()),
     }
 }
 
@@ -805,6 +882,31 @@ pub fn eval_qexpr(expr: &QExpr, schema: &[ColumnRef], row: &[Literal]) -> Result
         QExpr::Aggregate { .. } => Err(DbError::SqlPlan(
             "internal: aggregate reached row-level evaluation".into(),
         )),
+        // `IN (v1, v2, ...)` over a literal list needs no execution context.
+        QExpr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let needle = eval_qexpr(expr, schema, row)?;
+            if matches!(needle, Literal::Null) {
+                return Ok(Literal::Null);
+            }
+            let mut any = false;
+            for item in list {
+                let v = eval_qexpr(item, schema, row)?;
+                if executor::compare(crate::sql::logical::CmpOp::Eq, &needle, &v)? {
+                    any = true;
+                    break;
+                }
+            }
+            Ok(Literal::Bool(any != *negated))
+        }
+        // Subqueries require storage access; the ctx-aware evaluator in
+        // `query_exec` intercepts them before the pure evaluator is reached.
+        QExpr::Exists { .. } | QExpr::InSubquery { .. } | QExpr::ScalarSubquery(_) => Err(
+            DbError::SqlPlan("internal: subquery reached the pure evaluator".into()),
+        ),
     }
 }
 
@@ -882,6 +984,7 @@ mod tests {
 
     fn join_spec() -> QuerySpec {
         QuerySpec {
+            with: vec![],
             from: FromNode::Join {
                 left: Box::new(FromNode::Table(TableRef {
                     table: "customers".into(),
@@ -916,7 +1019,7 @@ mod tests {
     }
 
     fn inner_join_node(catalog: &Catalog) -> PlanNode {
-        match plan_query(&join_spec(), catalog).unwrap() {
+        match plan_query(&join_spec(), catalog, &CteSchemas::new()).unwrap() {
             PlanNode::Projection { input, .. } => *input,
             other => panic!("expected Projection root, got {other:?}"),
         }

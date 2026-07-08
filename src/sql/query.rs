@@ -28,6 +28,10 @@ use crate::sql::logical::{CmpOp, Expr, Literal};
 /// ever written-but-unread (which would trip `clippy -D warnings`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuerySpec {
+    /// `WITH name AS (subquery)` common table expressions (P4.c). Materialized
+    /// once and referenced by name in FROM. Non-recursive in v1.
+    #[serde(default)]
+    pub with: Vec<(String, QuerySpec)>,
     /// FROM clause: a left-deep tree of base tables and joins.
     pub from: FromNode,
     /// WHERE predicate applied after the joins (residual). Base-table-only
@@ -156,6 +160,29 @@ pub enum QExpr {
         arg: Option<Box<QExpr>>,
         distinct: bool,
     },
+    /// `[NOT] EXISTS (subquery)` (P4.c). The executor runs the subquery
+    /// (correlated: once per outer row with outer columns bound) and tests
+    /// whether it returned any row.
+    Exists {
+        subquery: Box<QuerySpec>,
+        negated: bool,
+    },
+    /// `expr [NOT] IN (subquery)` (P4.c). True when `expr` equals some value in
+    /// the subquery's (single-column) result.
+    InSubquery {
+        expr: Box<QExpr>,
+        subquery: Box<QuerySpec>,
+        negated: bool,
+    },
+    /// `expr [NOT] IN (v1, v2, ...)` — a literal value list (P4.c).
+    InList {
+        expr: Box<QExpr>,
+        list: Vec<QExpr>,
+        negated: bool,
+    },
+    /// A scalar subquery used as a value (P4.c): must return at most one row /
+    /// one column; yields that value or NULL when empty.
+    ScalarSubquery(Box<QuerySpec>),
 }
 
 impl QExpr {
@@ -219,10 +246,25 @@ impl QExpr {
                 }
                 Ok(())
             }
+            QExpr::Exists { subquery, .. } | QExpr::ScalarSubquery(subquery) => {
+                subquery.bind_params(params)
+            }
+            QExpr::InSubquery { expr, subquery, .. } => {
+                expr.bind_params(params)?;
+                subquery.bind_params(params)
+            }
+            QExpr::InList { expr, list, .. } => {
+                expr.bind_params(params)?;
+                for e in list {
+                    e.bind_params(params)?;
+                }
+                Ok(())
+            }
         }
     }
 
-    /// Whether this expression contains an aggregate call anywhere within it.
+    /// Whether this expression contains an aggregate call at *this* query level.
+    /// A subquery has its own aggregate scope, so we do not descend into one.
     pub fn has_aggregate(&self) -> bool {
         match self {
             QExpr::Aggregate { .. } => true,
@@ -231,6 +273,11 @@ impl QExpr {
                 lhs.has_aggregate() || rhs.has_aggregate()
             }
             QExpr::Not(e) | QExpr::IsNull { expr: e, .. } => e.has_aggregate(),
+            QExpr::InSubquery { expr, .. } => expr.has_aggregate(),
+            QExpr::InList { expr, list, .. } => {
+                expr.has_aggregate() || list.iter().any(|e| e.has_aggregate())
+            }
+            QExpr::Exists { .. } | QExpr::ScalarSubquery(_) => false,
         }
     }
 }
@@ -256,11 +303,21 @@ impl QuerySpec {
         }
     }
 
-    /// Bind `$n` parameters across the whole spec.
+    /// Bind `$n` parameters across the whole spec (including CTEs, HAVING,
+    /// join conditions, and nested subqueries via [`QExpr::bind_params`]).
     pub fn bind_params(&mut self, params: &[Literal]) -> crate::error::Result<()> {
+        for (_, cte) in &mut self.with {
+            cte.bind_params(params)?;
+        }
         bind_from(&mut self.from, params)?;
         if let Some(sel) = &mut self.selection {
             sel.bind_params(params)?;
+        }
+        for g in &mut self.group_by {
+            g.bind_params(params)?;
+        }
+        if let Some(h) = &mut self.having {
+            h.bind_params(params)?;
         }
         for proj in &mut self.projection {
             if let Projection::Expr { expr, .. } = proj {

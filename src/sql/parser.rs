@@ -611,13 +611,17 @@ fn convert_query(q: ast::Query) -> Result<LogicalPlan> {
         ast::GroupByExpr::All(_) => true,
     };
     let projection_has_agg = select.projection.iter().any(select_item_has_aggregate);
+    let has_subquery = select.selection.as_ref().is_some_and(expr_has_subquery)
+        || select.projection.iter().any(select_item_has_subquery);
     let needs_query = has_join
         || group_by_present
         || select.having.is_some()
         || select.distinct.is_some()
         || order_by.is_some()
         || limit_clause.is_some()
-        || projection_has_agg;
+        || with.is_some()
+        || projection_has_agg
+        || has_subquery;
     if needs_query {
         return convert_query_spec(select, with, order_by, limit_clause);
     }
@@ -637,16 +641,62 @@ fn convert_query(q: ast::Query) -> Result<LogicalPlan> {
 }
 
 /// Build a [`LogicalPlan::Query`] for a Phase-4 SELECT: joins, aggregates,
-/// grouping, sort, distinct, limit. Only `WITH`/CTEs (P4.c) are still rejected.
+/// grouping, sort, distinct, limit, subqueries, CTEs.
 fn convert_query_spec(
     select: ast::Select,
     with: Option<ast::With>,
     order_by: Option<ast::OrderBy>,
     limit_clause: Option<ast::LimitClause>,
 ) -> Result<LogicalPlan> {
-    if with.is_some() {
-        return Err(DbError::SqlUnsupported("WITH / CTEs arrive in P4.c".into()));
-    }
+    Ok(LogicalPlan::Query(build_query_spec(
+        select,
+        with,
+        order_by,
+        limit_clause,
+    )?))
+}
+
+/// Convert a whole `sqlparser` [`ast::Query`] into a [`QuerySpec`] (always the
+/// Phase-4 form). Used for CTE bodies and scalar/IN/EXISTS subqueries.
+fn query_to_spec(q: ast::Query) -> Result<QuerySpec> {
+    let ast::Query {
+        with,
+        body,
+        order_by,
+        limit_clause,
+        ..
+    } = q;
+    let select = match *body {
+        SetExpr::Select(s) => *s,
+        other => {
+            return Err(DbError::SqlUnsupported(format!(
+                "unsupported subquery body: {other:?}"
+            )))
+        }
+    };
+    build_query_spec(select, with, order_by, limit_clause)
+}
+
+fn build_query_spec(
+    select: ast::Select,
+    with: Option<ast::With>,
+    order_by: Option<ast::OrderBy>,
+    limit_clause: Option<ast::LimitClause>,
+) -> Result<QuerySpec> {
+    let with_ctes = match with {
+        None => Vec::new(),
+        Some(w) => {
+            if w.recursive {
+                return Err(DbError::SqlUnsupported(
+                    "recursive CTEs (WITH RECURSIVE) are not supported in v1".into(),
+                ));
+            }
+            w.cte_tables
+                .into_iter()
+                .map(|cte| Ok((cte.alias.name.value.clone(), query_to_spec(*cte.query)?)))
+                .collect::<Result<Vec<_>>>()?
+        }
+    };
 
     let group_by = match select.group_by {
         ast::GroupByExpr::Expressions(exprs, _) => exprs
@@ -675,7 +725,8 @@ fn convert_query_spec(
     let from = convert_from(&select.from)?;
     let selection = select.selection.as_ref().map(convert_qexpr).transpose()?;
     let projection = convert_query_projection(select.projection)?;
-    Ok(LogicalPlan::Query(QuerySpec {
+    Ok(QuerySpec {
+        with: with_ctes,
         from,
         selection,
         projection,
@@ -685,7 +736,7 @@ fn convert_query_spec(
         order_by,
         limit,
         offset,
-    }))
+    })
 }
 
 /// Map an aggregate function name to its [`AggFunc`], or `None` if it isn't one.
@@ -704,6 +755,32 @@ fn select_item_has_aggregate(item: &SelectItem) -> bool {
     match item {
         SelectItem::UnnamedExpr(e) => expr_has_aggregate(e),
         SelectItem::ExprWithAlias { expr, .. } => expr_has_aggregate(expr),
+        _ => false,
+    }
+}
+
+fn select_item_has_subquery(item: &SelectItem) -> bool {
+    match item {
+        SelectItem::UnnamedExpr(e) => expr_has_subquery(e),
+        SelectItem::ExprWithAlias { expr, .. } => expr_has_subquery(expr),
+        _ => false,
+    }
+}
+
+/// Whether a `sqlparser` expression needs the Phase-4 query path — a subquery
+/// (scalar/IN/EXISTS) or an IN-list (the single-table Select path handles
+/// neither).
+fn expr_has_subquery(e: &SqlExpr) -> bool {
+    match e {
+        SqlExpr::Subquery(_)
+        | SqlExpr::Exists { .. }
+        | SqlExpr::InSubquery { .. }
+        | SqlExpr::InList { .. } => true,
+        SqlExpr::BinaryOp { left, right, .. } => {
+            expr_has_subquery(left) || expr_has_subquery(right)
+        }
+        SqlExpr::UnaryOp { expr, .. } | SqlExpr::Nested(expr) => expr_has_subquery(expr),
+        SqlExpr::IsNull(e) | SqlExpr::IsNotNull(e) => expr_has_subquery(e),
         _ => false,
     }
 }
@@ -926,6 +1003,31 @@ fn convert_qexpr(e: &SqlExpr) -> Result<QExpr> {
         } => Ok(QExpr::Not(Box::new(convert_qexpr(expr)?))),
         SqlExpr::BinaryOp { left, op, right } => convert_qbinary_op(left, op, right),
         SqlExpr::Function(f) => convert_aggregate(f),
+        SqlExpr::Exists { subquery, negated } => Ok(QExpr::Exists {
+            subquery: Box::new(query_to_spec((**subquery).clone())?),
+            negated: *negated,
+        }),
+        SqlExpr::Subquery(q) => Ok(QExpr::ScalarSubquery(Box::new(query_to_spec(
+            (**q).clone(),
+        )?))),
+        SqlExpr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => Ok(QExpr::InSubquery {
+            expr: Box::new(convert_qexpr(expr)?),
+            subquery: Box::new(query_to_spec((**subquery).clone())?),
+            negated: *negated,
+        }),
+        SqlExpr::InList {
+            expr,
+            list,
+            negated,
+        } => Ok(QExpr::InList {
+            expr: Box::new(convert_qexpr(expr)?),
+            list: list.iter().map(convert_qexpr).collect::<Result<Vec<_>>>()?,
+            negated: *negated,
+        }),
         other => Err(DbError::SqlUnsupported(format!(
             "unsupported expression in query: {other:?}"
         ))),
