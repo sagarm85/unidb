@@ -1,6 +1,6 @@
 # Phase 2 — Real data model (SQL lane, `sql-types`)
 
-## Status as of 2026-07-08: NOT STARTED.
+## Status as of 2026-07-08: COMPLETE — P2.a–P2.e all shipped on branch `sql-types` (see `PROGRESS.md` entries P2.a–P2.e). Next SQL-lane phase: Phase 4 (query power).
 
 Runs **in parallel with Phase 1** (disjoint files). Companion to
 [`roadmap.md`](roadmap.md) §4/§5 — this is the detailed spec the `sql-types`

@@ -47,6 +47,22 @@ pub fn literal_to_json(lit: &Literal) -> Json {
                 })
                 .collect(),
         ),
+        // Exact types serialize as strings so JSON's f64 numbers never lose
+        // precision (P2.a) — decimal text and canonical UTC timestamp text.
+        Literal::Decimal(value, scale) => {
+            Json::String(crate::sql::logical::format_decimal(*value, *scale))
+        }
+        Literal::Timestamp(micros) => Json::String(crate::sql::datetime::format_timestamp(*micros)),
+        // P2.b scalar types: floats as JSON numbers; uuid/bytea/date/time as
+        // canonical strings.
+        Literal::Float(f) => Number::from_f64(*f).map(Json::Number).unwrap_or(Json::Null),
+        Literal::Uuid(b) => Json::String(crate::sql::executor::format_uuid(b)),
+        Literal::Bytea(b) => Json::String(crate::sql::executor::format_bytea(b)),
+        Literal::Date(d) => Json::String(crate::sql::datetime::format_date(*d)),
+        Literal::Time(t) => Json::String(crate::sql::datetime::format_time(*t)),
+        // Bind placeholders are substituted before execution (P2.e); a result
+        // row can never contain one.
+        Literal::Param(_) => Json::Null,
     }
 }
 
@@ -81,6 +97,16 @@ pub fn exec_result_to_json(result: &ExecResult) -> Json {
                 .collect();
             obj.insert("rows".into(), Json::Array(json_rows));
         }
+        ExecResult::AlteredTable => {
+            obj.insert("type".into(), Json::String("altered_table".into()));
+        }
+        ExecResult::DroppedTable => {
+            obj.insert("type".into(), Json::String("dropped_table".into()));
+        }
+        ExecResult::Truncated { count } => {
+            obj.insert("type".into(), Json::String("truncated".into()));
+            obj.insert("count".into(), Json::Number(Number::from(*count)));
+        }
     }
     Json::Object(obj)
 }
@@ -88,6 +114,40 @@ pub fn exec_result_to_json(result: &ExecResult) -> Json {
 #[derive(Debug, Deserialize)]
 pub struct SqlRequest {
     pub sql: String,
+    /// Optional positional bind parameters for `$1`, `$2`, ... in `sql`
+    /// (P2.e). Absent/empty means the SQL is executed as-is. Supplying params
+    /// is the injection-safe way to pass user data.
+    #[serde(default)]
+    pub params: Vec<Json>,
+}
+
+/// Convert a REST JSON bind-parameter value to a [`Literal`] (P2.e). The value
+/// is always treated as *data*: a JSON string becomes `Literal::Text` (later
+/// coerced to the target column's type — UUID, TIMESTAMP, etc.), a number
+/// becomes `Int` or `Float`, and so on. Objects/arrays are passed through as
+/// `Json`/`Vector` for JSON and vector columns respectively.
+pub fn json_to_literal(v: &Json) -> Literal {
+    match v {
+        Json::Null => Literal::Null,
+        Json::Bool(b) => Literal::Bool(*b),
+        Json::String(s) => Literal::Text(s.clone()),
+        Json::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Literal::Int(i)
+            } else {
+                Literal::Float(n.as_f64().unwrap_or(0.0))
+            }
+        }
+        // A JSON array of numbers is a vector literal; anything else round-trips
+        // as a JSON-typed value.
+        Json::Array(items) if items.iter().all(|x| x.is_number()) => Literal::Vector(
+            items
+                .iter()
+                .map(|x| x.as_f64().unwrap_or(0.0) as f32)
+                .collect(),
+        ),
+        other => Literal::Json(other.to_string()),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -132,4 +192,37 @@ pub struct SetIndexRequest {
 pub struct AckEventsRequest {
     pub consumer: String,
     pub up_to_seq: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn json_to_literal_maps_scalars_as_data() {
+        assert_eq!(json_to_literal(&Json::Null), Literal::Null);
+        assert_eq!(json_to_literal(&json!(true)), Literal::Bool(true));
+        assert_eq!(json_to_literal(&json!(42)), Literal::Int(42));
+        assert_eq!(json_to_literal(&json!(1.5)), Literal::Float(1.5));
+        // A string — including one that looks like SQL — is plain text data.
+        assert_eq!(
+            json_to_literal(&json!("'; DROP TABLE t; --")),
+            Literal::Text("'; DROP TABLE t; --".to_string())
+        );
+        // A numeric array is a vector literal.
+        assert_eq!(
+            json_to_literal(&json!([0.1, 0.2])),
+            Literal::Vector(vec![0.1, 0.2])
+        );
+    }
+
+    #[test]
+    fn sql_request_params_default_to_empty() {
+        let req: SqlRequest = serde_json::from_value(json!({"sql": "SELECT 1"})).unwrap();
+        assert!(req.params.is_empty());
+        let req2: SqlRequest =
+            serde_json::from_value(json!({"sql": "SELECT $1", "params": [7]})).unwrap();
+        assert_eq!(req2.params.len(), 1);
+    }
 }

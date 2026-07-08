@@ -90,14 +90,29 @@ request flow (see [Conventions](#conventions)).
 
 Execute one or more `;`-separated SQL statements atomically under a single
 transaction. If any statement fails, the entire request is rolled back —
-including earlier statements in the same body — except catalog DDL
-(`CREATE TABLE`) which is never rolled back (inherited from M1; DDL isn't
-transactional).
+including earlier statements in the same body.
+
+> **Correction (P2.c, 2026-07-08):** an earlier version of this doc said
+> catalog DDL is "never rolled back." That is no longer true — P2.c added
+> **request-level DDL rollback**: DDL (`CREATE`/`ALTER`/`DROP`/`TRUNCATE`)
+> persisted by earlier statements of a failed multi-statement request is now
+> restored. (Full crash-safe, user-transaction-scoped catalog undo through
+> recovery is still a follow-up; see `PROGRESS.md`'s P2.c entry.)
 
 **Payload**:
 ```json
 { "sql": "CREATE TABLE t (id INT, name TEXT); INSERT INTO t (id, name) VALUES (1, 'alice')" }
 ```
+
+**Bind parameters (P2.e)** — the injection-safe form. Supply `$n` placeholders
+in `sql` and a positional `params` array; each value is bound as **data**,
+never re-parsed as SQL:
+```json
+{ "sql": "INSERT INTO t (id, name) VALUES ($1, $2)", "params": [1, "alice"] }
+```
+A JSON string binds as text (later coerced to the column's type — UUID,
+TIMESTAMP, etc.), a number as int/float, a numeric array as a vector. Omitting
+`params` (or an empty array) runs the SQL as-is.
 
 **Response** `200 OK` — one result object per statement, in order:
 ```json
@@ -114,6 +129,9 @@ Other `ExecResult` shapes:
 { "type": "created_index" }
 { "type": "updated", "count": 3 }
 { "type": "deleted", "count": 1 }
+{ "type": "altered_table" }
+{ "type": "dropped_table" }
+{ "type": "truncated", "count": 5 }
 {
   "type": "rows",
   "rows": [
@@ -123,7 +141,10 @@ Other `ExecResult` shapes:
 ```
 `rows` is an array of arrays (one array per row, positional column order).
 A `JSON` column re-parses into a real nested JSON value on the wire — never
-a JSON-encoded string (see `dto.rs`'s module doc for why).
+a JSON-encoded string (see `dto.rs`'s module doc for why). A `DECIMAL` column
+serializes as a **decimal string** (e.g. `"9.90"`) and a `TIMESTAMP` as a UTC
+string (`"2024-01-01 12:00:00"`) so no precision is lost through JSON's `f64`
+numbers.
 
 **Response on failure** — e.g. a later statement references a nonexistent
 table, rolling back the whole request:

@@ -29,6 +29,26 @@ pub fn row_to_json(row: &[Literal], columns: &[ColumnDef]) -> JsonValue {
                     })
                     .collect(),
             ),
+            // Exact types render as strings so no precision is lost crossing
+            // into JSON (P2.a): a `DECIMAL` as its canonical decimal text, a
+            // `TIMESTAMP` as canonical UTC `YYYY-MM-DD HH:MM:SS[.ffffff]`.
+            Literal::Decimal(value, scale) => {
+                JsonValue::String(crate::sql::logical::format_decimal(*value, *scale))
+            }
+            Literal::Timestamp(micros) => {
+                JsonValue::String(crate::sql::datetime::format_timestamp(*micros))
+            }
+            // P2.b scalar types.
+            Literal::Float(f) => Number::from_f64(*f)
+                .map(JsonValue::Number)
+                .unwrap_or(JsonValue::Null),
+            Literal::Uuid(b) => JsonValue::String(crate::sql::executor::format_uuid(b)),
+            Literal::Bytea(b) => JsonValue::String(crate::sql::executor::format_bytea(b)),
+            Literal::Date(d) => JsonValue::String(crate::sql::datetime::format_date(*d)),
+            Literal::Time(t) => JsonValue::String(crate::sql::datetime::format_time(*t)),
+            // Bind placeholders are substituted before execution (P2.e); a
+            // stored row can never contain one.
+            Literal::Param(_) => JsonValue::Null,
         };
         map.insert(col.name.clone(), json_val);
     }
@@ -45,6 +65,7 @@ mod tests {
             name: name.to_string(),
             ty,
             index: None,
+            dropped: false,
             constraints: Default::default(),
         }
     }

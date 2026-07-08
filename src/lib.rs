@@ -86,7 +86,7 @@ use crate::{
     queue::{CONSUMERS_TABLE, EVENTS_TABLE},
     sql::{
         executor::{self, ExecCtx, ExecResult},
-        logical::{apply_rls, Expr, Literal},
+        logical::{apply_rls, bind_params, Expr, Literal, LogicalPlan},
         parser::parse_sql,
     },
     txn::{IsolationLevel, TransactionManager, UndoAction},
@@ -148,6 +148,15 @@ impl Default for AutoCheckpointConfig {
             max_wal_size: env_u64("UNIDB_MAX_WAL_SIZE_BYTES", 64 * 1024 * 1024),
         }
     }
+}
+
+/// A parsed-but-not-yet-bound statement (P2.e), produced by
+/// [`Engine::prepare`] and run with [`Engine::execute_prepared`]. Holds the
+/// logical plans so a query is parsed once and executed many times with
+/// different bind parameters.
+#[derive(Debug, Clone)]
+pub struct Prepared {
+    plans: Vec<LogicalPlan>,
 }
 
 /// The outcome of an [`Engine::vacuum`] pass (M10). Surfaces the numbers the
@@ -373,6 +382,12 @@ impl Engine {
     pub fn execute_sql(&mut self, xid: Xid, sql: &str) -> Result<Vec<ExecResult>> {
         let page_size = self.control.page_size as usize;
         let plans = parse_sql(sql)?;
+        // Snapshot the catalog root so DDL (which the catalog persists
+        // immediately, not on user-txn commit) from earlier statements of a
+        // multi-statement request can be rolled back if a later one fails
+        // (P2.c). Heap writes are undone by the caller's transaction abort; the
+        // catalog, being non-MVCC, needs this explicit restore.
+        let saved_catalog_root = self.control.catalog_root;
         let mut results = Vec::with_capacity(plans.len());
         for plan in plans {
             let plan = apply_rls(plan, &cat_read(&self.catalog));
@@ -390,7 +405,113 @@ impl Engine {
                 index_worker: Some(&self.index_worker),
                 next_event_seq: &mut self.next_event_seq,
             };
-            results.push(executor::execute(plan, &mut ctx)?);
+            match executor::execute(plan, &mut ctx) {
+                Ok(result) => results.push(result),
+                Err(e) => {
+                    drop(catalog);
+                    self.restore_catalog_root(saved_catalog_root)?;
+                    return Err(e);
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Roll the catalog back to a previously captured root page (P2.c). Used by
+    /// `execute_sql` to undo DDL that earlier statements of a now-failed
+    /// multi-statement request already persisted: the catalog is not
+    /// user-transaction-scoped (a documented M1 limitation), so this manual
+    /// restore is what makes a failed request leave the schema untouched. It
+    /// rewrites the control file to the saved root and reloads the in-memory
+    /// catalog from it. (Crash-safe, user-txn-scoped catalog redo/undo through
+    /// recovery is a larger, Core-lane-coordinated follow-up — see PROGRESS.)
+    fn restore_catalog_root(&mut self, root: crate::format::PageId) -> Result<()> {
+        if self.control.catalog_root == root {
+            return Ok(());
+        }
+        self.control.catalog_root = root;
+        control::write(&self.control_path, &self.control)?;
+        let reloaded = Catalog::load(&self.control, &mut self.pool)?;
+        *cat_write(&self.catalog) = reloaded;
+        Ok(())
+    }
+
+    /// Parameterized SQL (P2.e): the same as [`Engine::execute_sql`], but `$n`
+    /// placeholders are filled from `params` **as data, never re-parsed as
+    /// SQL** — this is the injection-safe entry point. A value that would be
+    /// malicious inside an interpolated string (e.g. `"'; DROP TABLE t; --"`)
+    /// is bound as a plain `Literal::Text` and can only ever match/insert that
+    /// literal string.
+    pub fn execute_sql_params(
+        &mut self,
+        xid: Xid,
+        sql: &str,
+        params: &[Literal],
+    ) -> Result<Vec<ExecResult>> {
+        let plans = parse_sql(sql)?;
+        self.run_bound_plans(xid, plans, params)
+    }
+
+    /// Parse a statement once into a reusable [`Prepared`] plan (P2.e). Parsing
+    /// is separated from binding so the same plan can be executed many times
+    /// with different `params` via [`Engine::execute_prepared`] — parse once,
+    /// execute many.
+    pub fn prepare(&self, sql: &str) -> Result<Prepared> {
+        Ok(Prepared {
+            plans: parse_sql(sql)?,
+        })
+    }
+
+    /// Execute a previously [`prepare`](Engine::prepare)d plan with `params`
+    /// bound by position (P2.e).
+    pub fn execute_prepared(
+        &mut self,
+        xid: Xid,
+        prepared: &Prepared,
+        params: &[Literal],
+    ) -> Result<Vec<ExecResult>> {
+        self.run_bound_plans(xid, prepared.plans.clone(), params)
+    }
+
+    /// Shared execution loop for the parameterized entry points: bind `$n`
+    /// placeholders, apply RLS, execute, and roll DDL back on failure (the same
+    /// request-level catalog rollback [`Engine::execute_sql`] performs).
+    fn run_bound_plans(
+        &mut self,
+        xid: Xid,
+        plans: Vec<LogicalPlan>,
+        params: &[Literal],
+    ) -> Result<Vec<ExecResult>> {
+        let page_size = self.control.page_size as usize;
+        let saved_catalog_root = self.control.catalog_root;
+        let mut results = Vec::with_capacity(plans.len());
+        for mut plan in plans {
+            // Bind before RLS/execute so a placeholder value can never be
+            // interpreted as SQL structure.
+            bind_params(&mut plan, params)?;
+            let plan = apply_rls(plan, &cat_read(&self.catalog));
+            let mut catalog = cat_write(&self.catalog);
+            let mut ctx = ExecCtx {
+                catalog: &mut catalog,
+                txn_mgr: &mut self.txn_mgr,
+                pool: &mut self.pool,
+                wal: &mut self.wal,
+                lock_mgr: &mut self.lock_mgr,
+                control_path: &self.control_path,
+                control: &mut self.control,
+                page_size,
+                xid,
+                index_worker: Some(&self.index_worker),
+                next_event_seq: &mut self.next_event_seq,
+            };
+            match executor::execute(plan, &mut ctx) {
+                Ok(result) => results.push(result),
+                Err(e) => {
+                    drop(catalog);
+                    self.restore_catalog_root(saved_catalog_root)?;
+                    return Err(e);
+                }
+            }
         }
         Ok(results)
     }
@@ -1633,6 +1754,214 @@ mod tests {
         let xid3 = engine.begin().unwrap();
         let remaining = engine.execute_sql(xid3, "SELECT * FROM accounts").unwrap();
         assert!(matches!(&remaining[0], SqlResult::Rows(rows) if rows.len() == 1));
+    }
+
+    #[test]
+    fn failed_multi_statement_request_rolls_back_ddl() {
+        // P2.c: a `;`-separated request whose first statement is DDL and whose
+        // second statement fails must leave the schema untouched — the catalog
+        // change is rolled back even though the catalog persists eagerly.
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        let res = engine.execute_sql(
+            xid,
+            "CREATE TABLE t (id INT); INSERT INTO missing_table (id) VALUES (1)",
+        );
+        assert!(res.is_err());
+        engine.abort(xid).unwrap();
+
+        // `t` must not exist — the CREATE TABLE was rolled back.
+        let xid2 = engine.begin().unwrap();
+        assert!(matches!(
+            engine.execute_sql(xid2, "SELECT * FROM t"),
+            Err(DbError::TableNotFound(_))
+        ));
+        engine.abort(xid2).unwrap();
+
+        // And the catalog is still usable afterwards.
+        let xid3 = engine.begin().unwrap();
+        engine
+            .execute_sql(xid3, "CREATE TABLE ok (id INT)")
+            .unwrap();
+        engine.commit(xid3).unwrap();
+    }
+
+    #[test]
+    fn alter_and_drop_survive_reopen() {
+        // P2.c: schema changes persist across an engine reopen.
+        let dir = tempdir().unwrap();
+        {
+            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let xid = engine.begin().unwrap();
+            engine
+                .execute_sql(xid, "CREATE TABLE t (a INT, b INT)")
+                .unwrap();
+            engine
+                .execute_sql(xid, "INSERT INTO t (a, b) VALUES (1, 2)")
+                .unwrap();
+            engine
+                .execute_sql(xid, "ALTER TABLE t ADD COLUMN c TEXT DEFAULT 'x'")
+                .unwrap();
+            engine
+                .execute_sql(xid, "ALTER TABLE t DROP COLUMN b")
+                .unwrap();
+            engine.commit(xid).unwrap();
+            engine.checkpoint().unwrap();
+        }
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        let rows = engine.execute_sql(xid, "SELECT a, c FROM t").unwrap();
+        match &rows[0] {
+            SqlResult::Rows(r) => assert_eq!(
+                r,
+                &vec![vec![
+                    crate::sql::logical::Literal::Int(1),
+                    crate::sql::logical::Literal::Text("x".to_string())
+                ]]
+            ),
+            other => panic!("expected Rows, got {other:?}"),
+        }
+        // Dropped column stays gone after reopen.
+        assert!(matches!(
+            engine.execute_sql(xid, "SELECT b FROM t"),
+            Err(DbError::ColumnNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn serial_sequence_survives_reopen() {
+        // P2.d: the SERIAL counter is durable — after a reopen it continues
+        // past the last-handed-out value, never reusing an id.
+        let dir = tempdir().unwrap();
+        {
+            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let xid = engine.begin().unwrap();
+            engine
+                .execute_sql(xid, "CREATE TABLE t (id SERIAL, v INT)")
+                .unwrap();
+            engine
+                .execute_sql(xid, "INSERT INTO t (v) VALUES (10)")
+                .unwrap();
+            engine
+                .execute_sql(xid, "INSERT INTO t (v) VALUES (20)")
+                .unwrap();
+            engine.commit(xid).unwrap();
+            engine.checkpoint().unwrap();
+        }
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "INSERT INTO t (v) VALUES (30)")
+            .unwrap();
+        engine.commit(xid).unwrap();
+        let xid2 = engine.begin().unwrap();
+        let rows = engine
+            .execute_sql(xid2, "SELECT id FROM t WHERE v = 30")
+            .unwrap();
+        match &rows[0] {
+            SqlResult::Rows(r) => {
+                // Must be 3, not a reused 1 — the sequence resumed after reopen.
+                assert_eq!(r, &vec![vec![crate::sql::logical::Literal::Int(3)]]);
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_params_treats_malicious_value_as_data() {
+        // P2.e: a bound value that would be catastrophic as an interpolated
+        // string literal is treated purely as data — no SQL is re-parsed.
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, name TEXT)")
+            .unwrap();
+        engine
+            .execute_sql(xid, "INSERT INTO t (id, name) VALUES (1, 'alice')")
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        let attack = Literal::Text("'; DROP TABLE t; --".to_string());
+        let xid2 = engine.begin().unwrap();
+        // The malicious string matches no row and executes no injected SQL.
+        let rows = engine
+            .execute_sql_params(
+                xid2,
+                "SELECT * FROM t WHERE name = $1",
+                std::slice::from_ref(&attack),
+            )
+            .unwrap();
+        assert!(matches!(&rows[0], SqlResult::Rows(r) if r.is_empty()));
+        engine.commit(xid2).unwrap();
+
+        // The table still exists and its row is intact — nothing was dropped.
+        let xid3 = engine.begin().unwrap();
+        let all = engine.execute_sql(xid3, "SELECT * FROM t").unwrap();
+        assert!(matches!(&all[0], SqlResult::Rows(r) if r.len() == 1));
+
+        // Binding that exact string as an INSERT value stores it verbatim.
+        engine
+            .execute_sql_params(
+                xid3,
+                "INSERT INTO t (id, name) VALUES ($1, $2)",
+                &[Literal::Int(2), attack.clone()],
+            )
+            .unwrap();
+        let found = engine
+            .execute_sql_params(xid3, "SELECT id FROM t WHERE name = $1", &[attack])
+            .unwrap();
+        match &found[0] {
+            SqlResult::Rows(r) => assert_eq!(r, &vec![vec![Literal::Int(2)]]),
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_params_out_of_range_errors() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        engine.execute_sql(xid, "CREATE TABLE t (id INT)").unwrap();
+        // `$2` referenced but only one value supplied.
+        let res =
+            engine.execute_sql_params(xid, "SELECT * FROM t WHERE id = $2", &[Literal::Int(1)]);
+        assert!(matches!(res, Err(DbError::SqlPlan(_))));
+    }
+
+    #[test]
+    fn prepared_plan_reused_across_executions() {
+        // P2.e: parse once, execute many with different bind values.
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, name TEXT)")
+            .unwrap();
+        engine
+            .execute_sql(xid, "INSERT INTO t (id, name) VALUES (1, 'a')")
+            .unwrap();
+        engine
+            .execute_sql(xid, "INSERT INTO t (id, name) VALUES (2, 'b')")
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        let stmt = engine.prepare("SELECT name FROM t WHERE id = $1").unwrap();
+        let xid2 = engine.begin().unwrap();
+        let r1 = engine
+            .execute_prepared(xid2, &stmt, &[Literal::Int(1)])
+            .unwrap();
+        let r2 = engine
+            .execute_prepared(xid2, &stmt, &[Literal::Int(2)])
+            .unwrap();
+        match (&r1[0], &r2[0]) {
+            (SqlResult::Rows(a), SqlResult::Rows(b)) => {
+                assert_eq!(a, &vec![vec![Literal::Text("a".to_string())]]);
+                assert_eq!(b, &vec![vec![Literal::Text("b".to_string())]]);
+            }
+            _ => panic!("expected Rows"),
+        }
     }
 
     // ── M2.a: VECTOR(n) end-to-end ──────────────────────────────────────────

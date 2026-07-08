@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::{Catalog, ColumnDef, IndexKind, TableConstraints};
+use crate::error::{DbError, Result};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Literal {
@@ -25,7 +26,124 @@ pub enum Literal {
     /// the column's declared `n` at INSERT/UPDATE time by the executor, not
     /// here — this type just carries the parsed values.
     Vector(Vec<f32>),
+    /// Exact fixed-point decimal (P2.a): `(unscaled_value, scale)`, i.e. the
+    /// numeric value is `unscaled_value / 10^scale`. The parser produces this
+    /// with the scale exactly as written (`9.90` -> `(990, 2)`); the executor
+    /// rescales it to the target column's declared scale at coercion time.
+    /// `i128` bounds precision to ~38 significant digits.
+    Decimal(i128, u8),
+    /// Timestamp (P2.a): microseconds since the Unix epoch, UTC. The parser
+    /// leaves a timestamp *string* as [`Literal::Text`] (it has no schema to
+    /// know the column is temporal); the executor converts Text -> Timestamp
+    /// at coercion time and `compare` parses a Text operand on demand.
+    Timestamp(i64),
+    /// IEEE-754 double (P2.b). Numeric literals stay `Int`/`Decimal` at parse
+    /// time and coerce to `Float` against a `FLOAT` column.
+    Float(f64),
+    /// UUID as 16 raw bytes (P2.b). Arrives as text, parsed at coercion.
+    Uuid([u8; 16]),
+    /// Opaque bytes (P2.b). Arrives as text, decoded at coercion.
+    Bytea(Vec<u8>),
+    /// Calendar date as days since the Unix epoch (P2.b). Arrives as text.
+    Date(i32),
+    /// Time of day as micros since midnight (P2.b). Arrives as text.
+    Time(i64),
+    /// A `$n` bind-parameter placeholder (P2.e), 1-based. Produced by the
+    /// parser; every occurrence is replaced with the caller-supplied value by
+    /// [`bind_params`] *before* the plan reaches the executor — a `Param` never
+    /// survives into encoding, comparison, or the wire. This is what makes
+    /// parameterized queries injection-proof: the value is always data, never
+    /// re-parsed as SQL.
+    Param(usize),
     Null,
+}
+
+/// Substitute every `$n` placeholder in `plan` with the corresponding value
+/// from `params` (1-based: `$1` -> `params[0]`) (P2.e). Errors on an
+/// out-of-range index. After this runs, no [`Literal::Param`] remains, so the
+/// executor only ever sees concrete values.
+pub fn bind_params(plan: &mut LogicalPlan, params: &[Literal]) -> Result<()> {
+    match plan {
+        LogicalPlan::Insert { values, .. } => {
+            for row in values {
+                for lit in row {
+                    bind_literal(lit, params)?;
+                }
+            }
+        }
+        LogicalPlan::Update {
+            assignments,
+            predicate,
+            ..
+        } => {
+            for (_, expr) in assignments {
+                bind_expr(expr, params)?;
+            }
+            if let Some(expr) = predicate {
+                bind_expr(expr, params)?;
+            }
+        }
+        LogicalPlan::Select { predicate, .. } | LogicalPlan::Delete { predicate, .. } => {
+            if let Some(expr) = predicate {
+                bind_expr(expr, params)?;
+            }
+        }
+        // DDL / CREATE INDEX carry no bind parameters.
+        LogicalPlan::CreateTable { .. }
+        | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::AlterTableAddColumn { .. }
+        | LogicalPlan::AlterTableDropColumn { .. }
+        | LogicalPlan::DropTable { .. }
+        | LogicalPlan::Truncate { .. } => {}
+    }
+    Ok(())
+}
+
+fn bind_literal(lit: &mut Literal, params: &[Literal]) -> Result<()> {
+    if let Literal::Param(n) = *lit {
+        *lit = params.get(n - 1).cloned().ok_or_else(|| {
+            DbError::SqlPlan(format!(
+                "bind parameter ${n} has no value ({} supplied)",
+                params.len()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn bind_expr(expr: &mut Expr, params: &[Literal]) -> Result<()> {
+    match expr {
+        Expr::Literal(lit) => bind_literal(lit, params),
+        Expr::BinOp { lhs, rhs, .. } | Expr::And(lhs, rhs) => {
+            bind_expr(lhs, params)?;
+            bind_expr(rhs, params)
+        }
+        Expr::JsonExtract { expr, .. } | Expr::JsonExtractText { expr, .. } => {
+            bind_expr(expr, params)
+        }
+        Expr::Column(_) | Expr::Near { .. } => Ok(()),
+    }
+}
+
+/// Render an exact decimal `(unscaled_value, scale)` as canonical decimal
+/// text (`(990, 2)` -> `"9.90"`, `(-5, 0)` -> `"-5"`). Used by the JSON/DTO
+/// boundary layers so a `DECIMAL` crosses into JSON as a string, never an
+/// `f64`. Preserves trailing zeros implied by the scale (money stays `9.90`).
+pub fn format_decimal(value: i128, scale: u8) -> String {
+    if scale == 0 {
+        return value.to_string();
+    }
+    let neg = value < 0;
+    let digits = value.unsigned_abs().to_string();
+    let scale = scale as usize;
+    let (int_part, frac_part) = if digits.len() > scale {
+        let split = digits.len() - scale;
+        (digits[..split].to_string(), digits[split..].to_string())
+    } else {
+        ("0".to_string(), format!("{digits:0>scale$}"))
+    };
+    let sign = if neg { "-" } else { "" };
+    format!("{sign}{int_part}.{frac_part}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +228,18 @@ pub enum LogicalPlan {
         column: String,
         kind: IndexKind,
     },
+    /// `ALTER TABLE t ADD COLUMN c <type> [constraints]` (P2.c).
+    AlterTableAddColumn { table: String, column: ColumnDef },
+    /// `ALTER TABLE t DROP COLUMN [IF EXISTS] c` (P2.c).
+    AlterTableDropColumn {
+        table: String,
+        column: String,
+        if_exists: bool,
+    },
+    /// `DROP TABLE [IF EXISTS] t` (P2.c).
+    DropTable { table: String, if_exists: bool },
+    /// `TRUNCATE [TABLE] t` (P2.c).
+    Truncate { table: String },
 }
 
 /// AND the table's RLS policy (if any) into the plan's predicate. This is
@@ -147,7 +277,11 @@ pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog) -> LogicalPlan {
         }
         other @ (LogicalPlan::CreateTable { .. }
         | LogicalPlan::Insert { .. }
-        | LogicalPlan::CreateIndex { .. }) => other,
+        | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::AlterTableAddColumn { .. }
+        | LogicalPlan::AlterTableDropColumn { .. }
+        | LogicalPlan::DropTable { .. }
+        | LogicalPlan::Truncate { .. }) => other,
     }
 }
 
@@ -179,12 +313,14 @@ mod tests {
             columns: vec![ColumnDef {
                 name: "id".to_string(),
                 index: None,
+                dropped: false,
                 ty: ColumnType::Int64,
                 constraints: Default::default(),
             }],
             pages: vec![],
             rls_policy: policy,
             events_enabled: false,
+            serial_next: Default::default(),
             constraints: Default::default(),
         });
         catalog
@@ -252,6 +388,50 @@ mod tests {
             LogicalPlan::Select { predicate, .. } => assert_eq!(predicate, None),
             _ => panic!("expected Select"),
         }
+    }
+
+    #[test]
+    fn bind_params_substitutes_placeholders_in_predicate() {
+        let mut plan = LogicalPlan::Select {
+            table: "t".to_string(),
+            projection: vec![],
+            predicate: Some(Expr::BinOp {
+                op: CmpOp::Eq,
+                lhs: Box::new(Expr::Column("id".to_string())),
+                rhs: Box::new(Expr::Literal(Literal::Param(1))),
+            }),
+        };
+        bind_params(&mut plan, &[Literal::Int(7)]).unwrap();
+        match plan {
+            LogicalPlan::Select { predicate, .. } => match predicate {
+                Some(Expr::BinOp { rhs, .. }) => {
+                    assert_eq!(*rhs, Expr::Literal(Literal::Int(7)));
+                }
+                _ => panic!("expected BinOp"),
+            },
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn bind_params_errors_on_missing_value() {
+        let mut plan = LogicalPlan::Insert {
+            table: "t".to_string(),
+            columns: None,
+            values: vec![vec![Literal::Param(2)]],
+        };
+        assert!(bind_params(&mut plan, &[Literal::Int(1)]).is_err());
+    }
+
+    #[test]
+    fn format_decimal_renders_canonical_text() {
+        assert_eq!(format_decimal(990, 2), "9.90");
+        assert_eq!(format_decimal(-5, 2), "-0.05");
+        assert_eq!(format_decimal(10000, 2), "100.00");
+        assert_eq!(format_decimal(-12345, 2), "-123.45");
+        assert_eq!(format_decimal(42, 0), "42");
+        assert_eq!(format_decimal(0, 2), "0.00");
+        assert_eq!(format_decimal(7, 3), "0.007");
     }
 
     #[test]

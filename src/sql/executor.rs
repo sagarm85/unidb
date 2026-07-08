@@ -38,6 +38,7 @@ use crate::{
     wal::Wal,
 };
 
+use super::datetime;
 use super::logical::{CmpOp, Expr, Literal, LogicalPlan};
 
 /// Everything the executor needs, bundled to avoid a long parameter list.
@@ -190,10 +191,39 @@ fn send_event_capture(
 pub enum ExecResult {
     CreatedTable,
     CreatedIndex,
-    Inserted { count: usize },
+    Inserted {
+        count: usize,
+    },
     Rows(Vec<Vec<Literal>>),
-    Updated { count: usize },
-    Deleted { count: usize },
+    Updated {
+        count: usize,
+    },
+    Deleted {
+        count: usize,
+    },
+    /// `ALTER TABLE` succeeded (P2.c).
+    AlteredTable,
+    /// `DROP TABLE` succeeded (P2.c).
+    DroppedTable,
+    /// `TRUNCATE` succeeded (P2.c); `count` = rows removed.
+    Truncated {
+        count: usize,
+    },
+}
+
+/// Build a `CatalogCtx` from `ExecCtx`'s individual fields (not from `&mut
+/// ExecCtx` as a whole) so the borrow checker sees disjoint field borrows —
+/// this lets `ctx.catalog` stay independently borrowable at each call site.
+macro_rules! catalog_ctx {
+    ($ctx:expr) => {
+        CatalogCtx {
+            pool: $ctx.pool,
+            wal: $ctx.wal,
+            control_path: $ctx.control_path,
+            control: $ctx.control,
+            page_size: $ctx.page_size,
+        }
+    };
 }
 
 pub fn execute(plan: LogicalPlan, ctx: &mut ExecCtx) -> Result<ExecResult> {
@@ -224,22 +254,74 @@ pub fn execute(plan: LogicalPlan, ctx: &mut ExecCtx) -> Result<ExecResult> {
             column,
             kind,
         } => exec_create_index(&table, &column, kind, ctx),
+        LogicalPlan::AlterTableAddColumn { table, column } => {
+            exec_alter_add_column(&table, column, ctx)
+        }
+        LogicalPlan::AlterTableDropColumn {
+            table,
+            column,
+            if_exists,
+        } => exec_alter_drop_column(&table, &column, if_exists, ctx),
+        LogicalPlan::DropTable { table, if_exists } => exec_drop_table(&table, if_exists, ctx),
+        LogicalPlan::Truncate { table } => exec_truncate(&table, ctx),
     }
 }
 
-/// Build a `CatalogCtx` from `ExecCtx`'s individual fields (not from `&mut
-/// ExecCtx` as a whole) so the borrow checker sees disjoint field borrows —
-/// this lets `ctx.catalog` stay independently borrowable at each call site.
-macro_rules! catalog_ctx {
-    ($ctx:expr) => {
-        CatalogCtx {
-            pool: $ctx.pool,
-            wal: $ctx.wal,
-            control_path: $ctx.control_path,
-            control: $ctx.control,
-            page_size: $ctx.page_size,
-        }
-    };
+/// Reject DDL against the engine-managed system tables (`__events__`,
+/// `__consumers__`, `__edges__`) — they have no user-facing schema surface.
+fn reject_system_table(table: &str) -> Result<()> {
+    if table.starts_with("__") {
+        return Err(DbError::SqlPlan(format!(
+            "'{table}' is an engine-managed system table and cannot be altered or dropped"
+        )));
+    }
+    Ok(())
+}
+
+fn exec_alter_add_column(table: &str, column: ColumnDef, ctx: &mut ExecCtx) -> Result<ExecResult> {
+    reject_system_table(table)?;
+    let mut cctx = catalog_ctx!(ctx);
+    ctx.catalog.add_column(table, column, &mut cctx)?;
+    Ok(ExecResult::AlteredTable)
+}
+
+fn exec_alter_drop_column(
+    table: &str,
+    column: &str,
+    if_exists: bool,
+    ctx: &mut ExecCtx,
+) -> Result<ExecResult> {
+    reject_system_table(table)?;
+    let mut cctx = catalog_ctx!(ctx);
+    match ctx.catalog.drop_column(table, column, &mut cctx) {
+        Ok(()) => Ok(ExecResult::AlteredTable),
+        // `IF EXISTS`: a missing column is not an error.
+        Err(DbError::ColumnNotFound { .. }) if if_exists => Ok(ExecResult::AlteredTable),
+        Err(e) => Err(e),
+    }
+}
+
+fn exec_drop_table(table: &str, if_exists: bool, ctx: &mut ExecCtx) -> Result<ExecResult> {
+    reject_system_table(table)?;
+    let mut cctx = catalog_ctx!(ctx);
+    match ctx.catalog.drop_table(table, &mut cctx) {
+        Ok(()) => Ok(ExecResult::DroppedTable),
+        Err(DbError::TableNotFound(_)) if if_exists => Ok(ExecResult::DroppedTable),
+        Err(e) => Err(e),
+    }
+}
+
+fn exec_truncate(table: &str, ctx: &mut ExecCtx) -> Result<ExecResult> {
+    reject_system_table(table)?;
+    let table_def = ctx.catalog.lookup(table)?.clone();
+    // Count the live rows removed (under this statement's snapshot) for the
+    // result, before the page list is cleared.
+    let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+    let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+    let count = heap.scan(&snapshot, ctx.xid, ctx.pool)?.len();
+    let mut cctx = catalog_ctx!(ctx);
+    ctx.catalog.truncate(table, &mut cctx)?;
+    Ok(ExecResult::Truncated { count })
 }
 
 fn exec_create_table(
@@ -248,12 +330,27 @@ fn exec_create_table(
     constraints: TableConstraints,
     ctx: &mut ExecCtx,
 ) -> Result<ExecResult> {
+    // Identity/SERIAL columns (P2.d) must be Int64, and start their counter
+    // at 1. Validate + seed here so `create_table` stays a pure catalog op.
+    let mut serial_next = std::collections::HashMap::new();
+    for col in &columns {
+        if col.constraints.identity {
+            if col.ty != ColumnType::Int64 {
+                return Err(DbError::SqlPlan(format!(
+                    "SERIAL/identity column '{}' must be an integer type",
+                    col.name
+                )));
+            }
+            serial_next.insert(col.name.clone(), 1);
+        }
+    }
     let def = TableDef {
         name,
         columns,
         pages: Vec::new(),
         rls_policy: None,
         events_enabled: false,
+        serial_next,
         constraints,
     };
     let mut cctx = catalog_ctx!(ctx);
@@ -357,9 +454,12 @@ fn exec_insert(
     let mut count = 0;
     for row_values in values {
         let ordered = order_values_by_columns(&table_def, &columns, row_values)?;
+        // SERIAL/identity fill (P2.d): allocate the next counter value for any
+        // identity column whose value was omitted/NULL, before DEFAULT fill.
+        let seeded = fill_serials(table, &table_def, ordered, ctx)?;
         // DEFAULT fill happens on INSERT only (never UPDATE), before NOT
         // NULL / CHECK / coercion see the row.
-        let filled = apply_defaults(&table_def, ordered);
+        let filled = apply_defaults(&table_def, seeded);
         let coerced = coerce_and_validate_row(&table_def, filled)?;
         enforce_not_null(&table_def, &coerced)?;
         enforce_checks(&table_def, &coerced)?;
@@ -812,16 +912,27 @@ fn order_values_by_columns(
     values: Vec<Literal>,
 ) -> Result<Vec<Literal>> {
     match columns {
+        // `INSERT INTO t VALUES (...)` — one value per *visible* column, in
+        // declaration order. Dropped columns (P2.c tombstones) hold their slot
+        // in the physical row but are always written NULL.
         None => {
-            if values.len() != table.columns.len() {
+            let visible = table.columns.iter().filter(|c| !c.dropped).count();
+            if values.len() != visible {
                 return Err(DbError::SqlPlan(format!(
                     "table '{}' has {} columns, but {} values were supplied",
                     table.name,
-                    table.columns.len(),
+                    visible,
                     values.len()
                 )));
             }
-            Ok(values)
+            let mut ordered = vec![Literal::Null; table.columns.len()];
+            let mut vals = values.into_iter();
+            for (slot, col) in ordered.iter_mut().zip(&table.columns) {
+                if !col.dropped {
+                    *slot = vals.next().expect("visible count checked above");
+                }
+            }
+            Ok(ordered)
         }
         Some(cols) => {
             if cols.len() != values.len() {
@@ -843,7 +954,7 @@ fn column_index(table: &TableDef, name: &str) -> Result<usize> {
     table
         .columns
         .iter()
-        .position(|c| c.name == name)
+        .position(|c| c.name == name && !c.dropped)
         .ok_or_else(|| DbError::ColumnNotFound {
             table: table.name.clone(),
             column: name.to_string(),
@@ -881,11 +992,168 @@ fn coerce_value(table_name: &str, col: &ColumnDef, val: Literal) -> Result<Liter
             }
             Ok(Literal::Vector(v))
         }
+        // Exact decimal (P2.a): rescale the literal to the column's declared
+        // scale and precision. A plain integer literal is treated as a
+        // scale-0 decimal so `INSERT ... VALUES (100)` fills a money column.
+        (ColumnType::Decimal(p, s), Literal::Decimal(value, from_scale)) => {
+            rescale_decimal(table_name, col, value, from_scale, *p, *s)
+        }
+        (ColumnType::Decimal(p, s), Literal::Int(n)) => {
+            rescale_decimal(table_name, col, n as i128, 0, *p, *s)
+        }
+        (ColumnType::Timestamp, Literal::Timestamp(t)) => Ok(Literal::Timestamp(t)),
+        // A timestamp arrives from SQL as a string literal — the parser has no
+        // schema to know it is temporal, so it is coerced here.
+        (ColumnType::Timestamp, Literal::Text(s)) => {
+            Ok(Literal::Timestamp(datetime::parse_timestamp(&s)?))
+        }
+        // Float (P2.b): accept a float, an integer, or an exact decimal literal
+        // — the last two widen into IEEE-754 (money literals in a FLOAT column).
+        (ColumnType::Float, Literal::Float(f)) => Ok(Literal::Float(f)),
+        (ColumnType::Float, Literal::Int(n)) => Ok(Literal::Float(n as f64)),
+        (ColumnType::Float, Literal::Decimal(v, s)) => {
+            Ok(Literal::Float(v as f64 / 10f64.powi(s as i32)))
+        }
+        // UUID / BYTEA / DATE / TIME arrive as string literals, parsed here.
+        (ColumnType::Uuid, Literal::Uuid(b)) => Ok(Literal::Uuid(b)),
+        (ColumnType::Uuid, Literal::Text(s)) => Ok(Literal::Uuid(parse_uuid(&s)?)),
+        (ColumnType::Bytea, Literal::Bytea(b)) => Ok(Literal::Bytea(b)),
+        (ColumnType::Bytea, Literal::Text(s)) => Ok(Literal::Bytea(parse_bytea(&s))),
+        (ColumnType::Date, Literal::Date(d)) => Ok(Literal::Date(d)),
+        (ColumnType::Date, Literal::Text(s)) => Ok(Literal::Date(datetime::parse_date(&s)?)),
+        (ColumnType::Time, Literal::Time(t)) => Ok(Literal::Time(t)),
+        (ColumnType::Time, Literal::Text(s)) => Ok(Literal::Time(datetime::parse_time(&s)?)),
         (expected, got) => Err(DbError::SqlPlan(format!(
             "table '{table_name}' column '{}': expected {expected:?}, got {got:?}",
             col.name
         ))),
     }
+}
+
+/// Parse UUID text — canonical hyphenated `8-4-4-4-12` or a bare 32 hex
+/// digits — into 16 raw bytes (P2.b). Case-insensitive; rejects anything else.
+fn parse_uuid(s: &str) -> Result<[u8; 16]> {
+    let hex: String = s.chars().filter(|&c| c != '-').collect();
+    if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(DbError::SqlPlan(format!("invalid UUID literal: {s:?}")));
+    }
+    let mut out = [0u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .map_err(|_| DbError::SqlPlan(format!("invalid UUID literal: {s:?}")))?;
+    }
+    Ok(out)
+}
+
+/// Render 16 bytes as canonical lowercase hyphenated UUID text (P2.b).
+pub fn format_uuid(b: &[u8; 16]) -> String {
+    let h: String = b.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
+}
+
+/// Interpret a BYTEA string literal (P2.b): a `\x`-prefixed hex string decodes
+/// to those bytes (Postgres hex format); anything else is taken as the
+/// string's raw UTF-8 bytes. A malformed `\x` body falls back to raw bytes
+/// rather than erroring — BYTEA input is deliberately permissive.
+fn parse_bytea(s: &str) -> Vec<u8> {
+    if let Some(hex) = s.strip_prefix("\\x").or_else(|| s.strip_prefix("\\X")) {
+        if hex.len() % 2 == 0 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            if let Some(bytes) = (0..hex.len() / 2)
+                .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
+                .collect::<Option<Vec<u8>>>()
+            {
+                return bytes;
+            }
+        }
+    }
+    s.as_bytes().to_vec()
+}
+
+/// Render bytes as a Postgres-style `\x`-prefixed hex string (P2.b) for the
+/// JSON/DTO boundary.
+pub fn format_bytea(b: &[u8]) -> String {
+    let mut out = String::with_capacity(2 + b.len() * 2);
+    out.push_str("\\x");
+    for byte in b {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// `10^n` as an `i128`, or `None` on overflow (n up to 38 fits; beyond does
+/// not). Small, exact, and dependency-free — the DECIMAL scaling primitive.
+fn pow10(n: u8) -> Option<i128> {
+    let mut acc: i128 = 1;
+    for _ in 0..n {
+        acc = acc.checked_mul(10)?;
+    }
+    Some(acc)
+}
+
+/// Number of significant decimal digits in `|value|` (0 has 1 digit here,
+/// which is fine: a scale-`s` zero always fits any `precision >= s`).
+fn digit_count(value: i128) -> u32 {
+    let mut v = value.unsigned_abs();
+    if v == 0 {
+        return 1;
+    }
+    let mut n = 0;
+    while v > 0 {
+        v /= 10;
+        n += 1;
+    }
+    n
+}
+
+/// Rescale a decimal literal `(value, from_scale)` to the column's declared
+/// `(precision, scale)`, exactly — never rounding. Widening the scale
+/// multiplies; narrowing is allowed only when the dropped digits are all zero
+/// (`9.90` -> scale 1 = `9.9`, but `9.99` -> scale 1 is rejected). Enforces
+/// the precision cap after rescaling so an out-of-range value fails the write
+/// rather than being silently stored.
+fn rescale_decimal(
+    table_name: &str,
+    col: &ColumnDef,
+    value: i128,
+    from_scale: u8,
+    precision: u8,
+    scale: u8,
+) -> Result<Literal> {
+    let overflow = || {
+        DbError::SqlPlan(format!(
+            "table '{table_name}' column '{}': decimal value out of range",
+            col.name
+        ))
+    };
+    let scaled = if from_scale == scale {
+        value
+    } else if from_scale < scale {
+        let factor = pow10(scale - from_scale).ok_or_else(overflow)?;
+        value.checked_mul(factor).ok_or_else(overflow)?
+    } else {
+        let factor = pow10(from_scale - scale).ok_or_else(overflow)?;
+        if value % factor != 0 {
+            return Err(DbError::SqlPlan(format!(
+                "table '{table_name}' column '{}': value has more fractional digits than the column's scale {scale} allows",
+                col.name
+            )));
+        }
+        value / factor
+    };
+    if digit_count(scaled) > precision as u32 {
+        return Err(DbError::SqlPlan(format!(
+            "table '{table_name}' column '{}': value exceeds DECIMAL({precision}, {scale}) precision",
+            col.name
+        )));
+    }
+    Ok(Literal::Decimal(scaled, scale))
 }
 
 // ── constraint enforcement (M11) ─────────────────────────────────────────────
@@ -911,8 +1179,32 @@ fn coerce_value(table_name: &str, col: &ColumnDef, val: Literal) -> Result<Liter
 /// omitted column once values are positionally ordered, so DEFAULT applies to
 /// any NULL — a minor, documented divergence from strict SQL (`INSERT ...
 /// VALUES (NULL)` into a defaulted column fills the default here).
+/// Fill any identity/SERIAL column whose value is NULL (omitted) with the next
+/// value from the table's durable counter (P2.d). An explicitly-supplied value
+/// is left as-is (the counter is not advanced past it — matching Postgres
+/// `SERIAL`, a documented sharp edge). Allocation persists the catalog, so the
+/// sequence survives a crash/reopen at the last-handed-out value.
+fn fill_serials(
+    table: &str,
+    table_def: &TableDef,
+    mut row: Vec<Literal>,
+    ctx: &mut ExecCtx,
+) -> Result<Vec<Literal>> {
+    for (i, col) in table_def.columns.iter().enumerate() {
+        if col.constraints.identity && !col.dropped && matches!(row[i], Literal::Null) {
+            let mut cctx = catalog_ctx!(ctx);
+            let value = ctx.catalog.alloc_serial(table, &col.name, &mut cctx)?;
+            row[i] = Literal::Int(value);
+        }
+    }
+    Ok(row)
+}
+
 fn apply_defaults(table_def: &TableDef, mut row: Vec<Literal>) -> Vec<Literal> {
     for (i, col) in table_def.columns.iter().enumerate() {
+        if col.dropped {
+            continue;
+        }
         if matches!(row[i], Literal::Null) {
             if let Some(default) = &col.constraints.default {
                 row[i] = default.clone();
@@ -925,6 +1217,9 @@ fn apply_defaults(table_def: &TableDef, mut row: Vec<Literal>) -> Vec<Literal> {
 /// NOT NULL (and the NOT-NULL half of PRIMARY KEY).
 fn enforce_not_null(table_def: &TableDef, row: &[Literal]) -> Result<()> {
     for (i, col) in table_def.columns.iter().enumerate() {
+        if col.dropped {
+            continue;
+        }
         let required = col.constraints.not_null || col.constraints.primary_key;
         if required && matches!(row[i], Literal::Null) {
             return Err(DbError::NotNullViolation {
@@ -955,6 +1250,9 @@ fn enforce_checks(table_def: &TableDef, row: &[Literal]) -> Result<()> {
         }
     };
     for col in columns {
+        if col.dropped {
+            continue;
+        }
         if let Some(check) = &col.constraints.check {
             check_one(check)?;
         }
@@ -1008,7 +1306,7 @@ fn enforce_referenced_tables_exist(table_def: &TableDef, catalog: &Catalog) -> R
 fn unique_column_sets(table_def: &TableDef) -> Result<Vec<Vec<usize>>> {
     let mut sets: Vec<Vec<usize>> = Vec::new();
     for (i, col) in table_def.columns.iter().enumerate() {
-        if col.constraints.unique || col.constraints.primary_key {
+        if !col.dropped && (col.constraints.unique || col.constraints.primary_key) {
             sets.push(vec![i]);
         }
     }
@@ -1083,15 +1381,22 @@ pub(crate) fn project_row(
     columns: &[ColumnDef],
     row: &[Literal],
 ) -> Result<Vec<Literal>> {
+    // `SELECT *` returns every *visible* column — dropped columns (P2.c) keep
+    // their physical slot but never surface to the client.
     if projection.is_empty() {
-        return Ok(row.to_vec());
+        return Ok(row
+            .iter()
+            .zip(columns)
+            .filter(|(_, c)| !c.dropped)
+            .map(|(v, _)| v.clone())
+            .collect());
     }
     projection
         .iter()
         .map(|name| {
             let idx = columns
                 .iter()
-                .position(|c| &c.name == name)
+                .position(|c| &c.name == name && !c.dropped)
                 .ok_or_else(|| DbError::ColumnNotFound {
                     table: String::new(),
                     column: name.clone(),
@@ -1137,7 +1442,7 @@ pub(crate) fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Literal]) -> 
         Expr::Column(name) => {
             let idx = columns
                 .iter()
-                .position(|c| &c.name == name)
+                .position(|c| &c.name == name && !c.dropped)
                 .ok_or_else(|| DbError::ColumnNotFound {
                     table: String::new(),
                     column: name.clone(),
@@ -1219,10 +1524,90 @@ fn compare(op: CmpOp, l: &Literal, r: &Literal) -> Result<bool> {
                 "ordering comparisons are not supported on booleans".into(),
             )),
         },
+        // Exact decimal ordering (P2.a). Integers compare as scale-0 decimals,
+        // so `WHERE price > 10` works against a `DECIMAL` column.
+        (Literal::Decimal(a, sa), Literal::Decimal(b, sb)) => {
+            Ok(apply_cmp(op, decimal_cmp(*a, *sa, *b, *sb)?))
+        }
+        (Literal::Decimal(a, sa), Literal::Int(b)) => {
+            Ok(apply_cmp(op, decimal_cmp(*a, *sa, *b as i128, 0)?))
+        }
+        (Literal::Int(a), Literal::Decimal(b, sb)) => {
+            Ok(apply_cmp(op, decimal_cmp(*a as i128, 0, *b, *sb)?))
+        }
+        // Timestamp ordering (P2.a). A string operand (`ts > '2024-01-01'`) is
+        // parsed on demand so predicates read naturally in SQL.
+        (Literal::Timestamp(a), Literal::Timestamp(b)) => Ok(apply_cmp(op, a.cmp(b))),
+        (Literal::Timestamp(a), Literal::Text(b)) => {
+            Ok(apply_cmp(op, a.cmp(&datetime::parse_timestamp(b)?)))
+        }
+        (Literal::Text(a), Literal::Timestamp(b)) => {
+            Ok(apply_cmp(op, datetime::parse_timestamp(a)?.cmp(b)))
+        }
+        // Float ordering (P2.b), mixing with Int/Decimal via f64. A NaN
+        // operand makes every comparison false (IEEE-754 unordered), matching
+        // the NULL-operand convention above.
+        (Literal::Float(_), _) | (_, Literal::Float(_)) => match (float_of(l), float_of(r)) {
+            (Some(a), Some(b)) => Ok(match a.partial_cmp(&b) {
+                Some(ord) => apply_cmp(op, ord),
+                None => false,
+            }),
+            _ => Err(DbError::SqlUnsupported(format!(
+                "cannot compare {l:?} with {r:?}"
+            ))),
+        },
+        // UUID / DATE / TIME: equality + ordering by their natural key; a Text
+        // operand is parsed on demand so `WHERE d > '2024-01-01'` reads well.
+        (Literal::Uuid(a), Literal::Uuid(b)) => Ok(apply_cmp(op, a.cmp(b))),
+        (Literal::Uuid(a), Literal::Text(b)) => Ok(apply_cmp(op, a.cmp(&parse_uuid(b)?))),
+        (Literal::Text(a), Literal::Uuid(b)) => Ok(apply_cmp(op, parse_uuid(a)?.cmp(b))),
+        (Literal::Bytea(a), Literal::Bytea(b)) => Ok(apply_cmp(op, a.cmp(b))),
+        (Literal::Bytea(a), Literal::Text(b)) => Ok(apply_cmp(op, a.cmp(&parse_bytea(b)))),
+        (Literal::Text(a), Literal::Bytea(b)) => Ok(apply_cmp(op, parse_bytea(a).cmp(b))),
+        (Literal::Date(a), Literal::Date(b)) => Ok(apply_cmp(op, a.cmp(b))),
+        (Literal::Date(a), Literal::Text(b)) => Ok(apply_cmp(op, a.cmp(&datetime::parse_date(b)?))),
+        (Literal::Text(a), Literal::Date(b)) => Ok(apply_cmp(op, datetime::parse_date(a)?.cmp(b))),
+        (Literal::Time(a), Literal::Time(b)) => Ok(apply_cmp(op, a.cmp(b))),
+        (Literal::Time(a), Literal::Text(b)) => Ok(apply_cmp(op, a.cmp(&datetime::parse_time(b)?))),
+        (Literal::Text(a), Literal::Time(b)) => Ok(apply_cmp(op, datetime::parse_time(a)?.cmp(b))),
         (a, b) => Err(DbError::SqlUnsupported(format!(
             "cannot compare {a:?} with {b:?}"
         ))),
     }
+}
+
+/// Coerce a numeric literal to `f64` for float comparisons (`Int`/`Decimal`/
+/// `Float`), or `None` for non-numeric operands.
+fn float_of(lit: &Literal) -> Option<f64> {
+    match lit {
+        Literal::Float(f) => Some(*f),
+        Literal::Int(n) => Some(*n as f64),
+        Literal::Decimal(v, s) => Some(*v as f64 / 10f64.powi(*s as i32)),
+        _ => None,
+    }
+}
+
+/// Compare two exact decimals of possibly different scales by aligning both to
+/// the larger scale via cross-multiplication. Returns an error rather than a
+/// wrong answer if either side overflows `i128` at the common scale.
+fn decimal_cmp(a: i128, sa: u8, b: i128, sb: u8) -> Result<std::cmp::Ordering> {
+    let overflow = || DbError::SqlUnsupported("decimal comparison overflowed i128".into());
+    let (la, lb) = if sa == sb {
+        (a, b)
+    } else if sa < sb {
+        (
+            a.checked_mul(pow10(sb - sa).ok_or_else(overflow)?)
+                .ok_or_else(overflow)?,
+            b,
+        )
+    } else {
+        (
+            a,
+            b.checked_mul(pow10(sa - sb).ok_or_else(overflow)?)
+                .ok_or_else(overflow)?,
+        )
+    };
+    Ok(la.cmp(&lb))
 }
 
 fn apply_cmp(op: CmpOp, ord: std::cmp::Ordering) -> bool {
@@ -1241,7 +1626,18 @@ fn apply_cmp(op: CmpOp, ord: std::cmp::Ordering) -> bool {
 // ── row encoding: [tag:1][value...] per column, in table-column order ──────
 // Tags: 0=Null, 1=Int64 (8 bytes LE), 2=Text (4-byte LE len + UTF8),
 // 3=Bool (1 byte), 4=Json (4-byte LE len + UTF8 text), 5=Vector
-// (4-byte LE dimension + dimension * 4-byte LE f32).
+// (4-byte LE dimension + dimension * 4-byte LE f32), 6=Decimal (16-byte LE
+// i128 unscaled value + 1-byte scale), 7=Timestamp (8-byte LE i64 micros),
+// 8=Float (8-byte LE f64), 9=Uuid (16 raw bytes), 10=Bytea (4-byte LE len +
+// bytes), 11=Date (4-byte LE i32 days), 12=Time (8-byte LE i64 micros).
+//
+// New tags are purely additive (D4, forward-compatible): a row written before
+// P2.a never carries tag 6/7, so old rows still decode unchanged, and there is
+// no `FORMAT_VERSION` bump — the tag set only *grows*. An older binary reading
+// a tag-6/7 row fails safe with a "unknown tag" `DbError`, never a silent
+// misread. (The `FORMAT_VERSION` gate is reserved for changes that make old
+// files genuinely unreadable; a bump here would needlessly reject pre-P2.a
+// databases and collide with the parallel Core lane's own version work.)
 
 pub fn encode_row(values: &[Literal]) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -1273,6 +1669,44 @@ pub fn encode_row(values: &[Literal]) -> Vec<u8> {
                     buf.extend_from_slice(&f.to_le_bytes());
                 }
             }
+            Literal::Decimal(value, scale) => {
+                buf.push(6);
+                buf.extend_from_slice(&value.to_le_bytes());
+                buf.push(*scale);
+            }
+            Literal::Timestamp(micros) => {
+                buf.push(7);
+                buf.extend_from_slice(&micros.to_le_bytes());
+            }
+            Literal::Float(f) => {
+                buf.push(8);
+                buf.extend_from_slice(&f.to_le_bytes());
+            }
+            Literal::Uuid(bytes) => {
+                buf.push(9);
+                buf.extend_from_slice(bytes);
+            }
+            Literal::Bytea(b) => {
+                buf.push(10);
+                buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                buf.extend_from_slice(b);
+            }
+            Literal::Date(days) => {
+                buf.push(11);
+                buf.extend_from_slice(&days.to_le_bytes());
+            }
+            Literal::Time(micros) => {
+                buf.push(12);
+                buf.extend_from_slice(&micros.to_le_bytes());
+            }
+            // Unreachable: `bind_params` (P2.e) replaces every placeholder with
+            // a concrete value, and `coerce_value` would reject any leftover
+            // `Param` long before encoding. Encoded as NULL as a benign
+            // no-panic fallback for the theoretically-impossible case.
+            Literal::Param(_) => {
+                debug_assert!(false, "unbound bind parameter reached encode_row");
+                buf.push(0);
+            }
         }
     }
     buf
@@ -1282,6 +1716,18 @@ pub fn decode_row(bytes: &[u8], columns: &[ColumnDef]) -> Result<Vec<Literal>> {
     let mut out = Vec::with_capacity(columns.len());
     let mut pos = 0usize;
     for col in columns {
+        // A row written before an `ALTER TABLE ADD COLUMN` (P2.c) has no bytes
+        // for the trailing new column(s). Fill each such column with its
+        // coerced DEFAULT (so `ADD COLUMN ... DEFAULT x` shows `x` for old
+        // rows) or NULL — no heap rewrite needed.
+        if pos >= bytes.len() {
+            let lit = match &col.constraints.default {
+                Some(default) => coerce_value("", col, default.clone()).unwrap_or(Literal::Null),
+                None => Literal::Null,
+            };
+            out.push(lit);
+            continue;
+        }
         let tag = *bytes
             .get(pos)
             .ok_or_else(|| DbError::SqlPlan("row decode error: truncated tag".into()))?;
@@ -1361,6 +1807,98 @@ pub fn decode_row(bytes: &[u8], columns: &[ColumnDef]) -> Result<Vec<Literal>> {
                     pos = f_end;
                 }
                 Literal::Vector(values)
+            }
+            6 => {
+                let val_end = pos + 16;
+                let raw: [u8; 16] = bytes
+                    .get(pos..val_end)
+                    .ok_or_else(|| DbError::SqlPlan("row decode error: truncated decimal".into()))?
+                    .try_into()
+                    .unwrap();
+                pos = val_end;
+                let scale = *bytes.get(pos).ok_or_else(|| {
+                    DbError::SqlPlan("row decode error: truncated decimal scale".into())
+                })?;
+                pos += 1;
+                if let ColumnType::Decimal(_, col_scale) = col.ty {
+                    if scale != col_scale {
+                        return Err(DbError::SqlPlan(format!(
+                            "row decode error: column '{}' declares scale {col_scale}, but stored data has scale {scale}",
+                            col.name
+                        )));
+                    }
+                }
+                Literal::Decimal(i128::from_le_bytes(raw), scale)
+            }
+            7 => {
+                let end = pos + 8;
+                let raw: [u8; 8] = bytes
+                    .get(pos..end)
+                    .ok_or_else(|| {
+                        DbError::SqlPlan("row decode error: truncated timestamp".into())
+                    })?
+                    .try_into()
+                    .unwrap();
+                pos = end;
+                Literal::Timestamp(i64::from_le_bytes(raw))
+            }
+            8 => {
+                let end = pos + 8;
+                let raw: [u8; 8] = bytes
+                    .get(pos..end)
+                    .ok_or_else(|| DbError::SqlPlan("row decode error: truncated float".into()))?
+                    .try_into()
+                    .unwrap();
+                pos = end;
+                Literal::Float(f64::from_le_bytes(raw))
+            }
+            9 => {
+                let end = pos + 16;
+                let raw: [u8; 16] = bytes
+                    .get(pos..end)
+                    .ok_or_else(|| DbError::SqlPlan("row decode error: truncated uuid".into()))?
+                    .try_into()
+                    .unwrap();
+                pos = end;
+                Literal::Uuid(raw)
+            }
+            10 => {
+                let len_end = pos + 4;
+                let len_raw: [u8; 4] = bytes
+                    .get(pos..len_end)
+                    .ok_or_else(|| {
+                        DbError::SqlPlan("row decode error: truncated bytea length".into())
+                    })?
+                    .try_into()
+                    .unwrap();
+                let len = u32::from_le_bytes(len_raw) as usize;
+                pos = len_end;
+                let end = pos + len;
+                let raw = bytes
+                    .get(pos..end)
+                    .ok_or_else(|| DbError::SqlPlan("row decode error: truncated bytea".into()))?;
+                pos = end;
+                Literal::Bytea(raw.to_vec())
+            }
+            11 => {
+                let end = pos + 4;
+                let raw: [u8; 4] = bytes
+                    .get(pos..end)
+                    .ok_or_else(|| DbError::SqlPlan("row decode error: truncated date".into()))?
+                    .try_into()
+                    .unwrap();
+                pos = end;
+                Literal::Date(i32::from_le_bytes(raw))
+            }
+            12 => {
+                let end = pos + 8;
+                let raw: [u8; 8] = bytes
+                    .get(pos..end)
+                    .ok_or_else(|| DbError::SqlPlan("row decode error: truncated time".into()))?
+                    .try_into()
+                    .unwrap();
+                pos = end;
+                Literal::Time(i64::from_le_bytes(raw))
             }
             other => {
                 return Err(DbError::SqlPlan(format!(
@@ -1637,24 +2175,28 @@ mod tests {
             ColumnDef {
                 name: "a".to_string(),
                 index: None,
+                dropped: false,
                 constraints: Default::default(),
                 ty: ColumnType::Int64,
             },
             ColumnDef {
                 name: "b".to_string(),
                 index: None,
+                dropped: false,
                 constraints: Default::default(),
                 ty: ColumnType::Text,
             },
             ColumnDef {
                 name: "c".to_string(),
                 index: None,
+                dropped: false,
                 constraints: Default::default(),
                 ty: ColumnType::Bool,
             },
             ColumnDef {
                 name: "d".to_string(),
                 index: None,
+                dropped: false,
                 constraints: Default::default(),
                 ty: ColumnType::Json,
             },
@@ -1675,6 +2217,7 @@ mod tests {
         let columns = vec![ColumnDef {
             name: "a".to_string(),
             index: None,
+            dropped: false,
             constraints: Default::default(),
             ty: ColumnType::Int64,
         }];
@@ -1688,6 +2231,7 @@ mod tests {
         let columns = vec![ColumnDef {
             name: "embedding".to_string(),
             index: None,
+            dropped: false,
             constraints: Default::default(),
             ty: ColumnType::Vector(4),
         }];
@@ -1702,6 +2246,7 @@ mod tests {
         let columns = vec![ColumnDef {
             name: "embedding".to_string(),
             index: None,
+            dropped: false,
             constraints: Default::default(),
             ty: ColumnType::Vector(4),
         }];
@@ -1718,15 +2263,682 @@ mod tests {
             columns: vec![ColumnDef {
                 name: "embedding".to_string(),
                 index: None,
+                dropped: false,
                 constraints: Default::default(),
                 ty: ColumnType::Vector(4),
             }],
             pages: vec![],
             rls_policy: None,
             events_enabled: false,
+            serial_next: Default::default(),
             constraints: Default::default(),
         };
         let err = coerce_and_validate_row(&table, vec![Literal::Vector(vec![0.1, 0.2, 0.3])]);
+        assert!(matches!(err, Err(DbError::SqlPlan(_))));
+    }
+
+    // ── P2.a: DECIMAL + TIMESTAMP ────────────────────────────────────────────
+
+    fn col(name: &str, ty: ColumnType) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            index: None,
+            dropped: false,
+            constraints: Default::default(),
+            ty,
+        }
+    }
+
+    #[test]
+    fn row_encode_decode_decimal_and_timestamp_round_trip() {
+        let columns = vec![
+            col("price", ColumnType::Decimal(10, 2)),
+            col("created", ColumnType::Timestamp),
+        ];
+        let values = vec![
+            Literal::Decimal(-12345, 2),
+            Literal::Timestamp(1_700_000_000_000_000),
+        ];
+        let encoded = encode_row(&values);
+        let decoded = decode_row(&encoded, &columns).unwrap();
+        assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn row_decode_rejects_decimal_scale_mismatch() {
+        let columns = vec![col("price", ColumnType::Decimal(10, 2))];
+        // Stored scale 3 but column declares scale 2.
+        let encoded = encode_row(&[Literal::Decimal(1234, 3)]);
+        let err = decode_row(&encoded, &columns);
+        assert!(matches!(err, Err(DbError::SqlPlan(_))));
+    }
+
+    #[test]
+    fn decimal_column_round_trips_exactly() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, price DECIMAL(10, 2))")
+            .unwrap();
+        // Literal 9.5 widens to scale 2 => 9.50; integer 100 => 100.00.
+        h.exec_as(xid, "INSERT INTO t (id, price) VALUES (1, 9.5)")
+            .unwrap();
+        h.exec_as(xid, "INSERT INTO t (id, price) VALUES (2, 100)")
+            .unwrap();
+        h.commit(xid);
+
+        let xid2 = h.begin();
+        let rows = match h.exec_as(xid2, "SELECT price FROM t WHERE id = 1").unwrap() {
+            ExecResult::Rows(r) => r,
+            other => panic!("expected Rows, got {other:?}"),
+        };
+        assert_eq!(rows, vec![vec![Literal::Decimal(950, 2)]]);
+        let rows2 = match h.exec_as(xid2, "SELECT price FROM t WHERE id = 2").unwrap() {
+            ExecResult::Rows(r) => r,
+            other => panic!("expected Rows, got {other:?}"),
+        };
+        assert_eq!(rows2, vec![vec![Literal::Decimal(10000, 2)]]);
+    }
+
+    #[test]
+    fn decimal_rejects_excess_fractional_digits() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (price DECIMAL(10, 2))")
+            .unwrap();
+        // 9.999 has scale 3; column allows scale 2 and the extra digit is
+        // nonzero -> exact rescale impossible, reject rather than round.
+        let err = h.exec_as(xid, "INSERT INTO t (price) VALUES (9.999)");
+        assert!(matches!(err, Err(DbError::SqlPlan(_))));
+        // 9.990 narrows exactly to 9.99 -> accepted.
+        h.exec_as(xid, "INSERT INTO t (price) VALUES (9.990)")
+            .unwrap();
+    }
+
+    #[test]
+    fn decimal_rejects_precision_overflow() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (price DECIMAL(4, 2))")
+            .unwrap();
+        // 999.99 needs 5 significant digits; DECIMAL(4,2) caps at 4.
+        let err = h.exec_as(xid, "INSERT INTO t (price) VALUES (999.99)");
+        assert!(matches!(err, Err(DbError::SqlPlan(_))));
+    }
+
+    #[test]
+    fn decimal_range_and_equality_predicates() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, price DECIMAL(10, 2))")
+            .unwrap();
+        for (id, p) in [(1, "5.00"), (2, "9.99"), (3, "10.00"), (4, "10.50")] {
+            h.exec_as(
+                xid,
+                &format!("INSERT INTO t (id, price) VALUES ({id}, {p})"),
+            )
+            .unwrap();
+        }
+        h.commit(xid);
+
+        let xid2 = h.begin();
+        // Range predicate against a decimal literal of a *different* scale.
+        let rows = match h
+            .exec_as(xid2, "SELECT id FROM t WHERE price > 9.9")
+            .unwrap()
+        {
+            ExecResult::Rows(r) => r,
+            other => panic!("expected Rows, got {other:?}"),
+        };
+        assert_eq!(rows.len(), 3); // 9.99, 10.00, 10.50
+                                   // Equality against an integer literal (scale 0 vs stored scale 2).
+        let eq = match h
+            .exec_as(xid2, "SELECT id FROM t WHERE price = 10")
+            .unwrap()
+        {
+            ExecResult::Rows(r) => r,
+            other => panic!("expected Rows, got {other:?}"),
+        };
+        assert_eq!(eq, vec![vec![Literal::Int(3)]]);
+    }
+
+    #[test]
+    fn decimal_default_check_and_unique_constraints() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(
+            xid,
+            "CREATE TABLE t (id INT, price DECIMAL(10, 2) DEFAULT 1.00 CHECK (price > 0) UNIQUE)",
+        )
+        .unwrap();
+        // DEFAULT fills 1.00 when omitted.
+        h.exec_as(xid, "INSERT INTO t (id) VALUES (1)").unwrap();
+        // CHECK rejects a non-positive price.
+        let bad = h.exec_as(xid, "INSERT INTO t (id, price) VALUES (2, -3.00)");
+        assert!(matches!(bad, Err(DbError::CheckViolation { .. })));
+        // UNIQUE rejects a duplicate decimal (1.00 already present via default).
+        let dup = h.exec_as(xid, "INSERT INTO t (id, price) VALUES (3, 1.00)");
+        assert!(matches!(dup, Err(DbError::UniqueViolation { .. })));
+        // A distinct decimal is accepted.
+        h.exec_as(xid, "INSERT INTO t (id, price) VALUES (4, 2.50)")
+            .unwrap();
+    }
+
+    #[test]
+    fn timestamp_column_round_trips_and_orders() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, created TIMESTAMP)")
+            .unwrap();
+        h.exec_as(
+            xid,
+            "INSERT INTO t (id, created) VALUES (1, '2023-12-31 23:59:59')",
+        )
+        .unwrap();
+        h.exec_as(
+            xid,
+            "INSERT INTO t (id, created) VALUES (2, '2024-06-01 12:00:00')",
+        )
+        .unwrap();
+        h.commit(xid);
+
+        let xid2 = h.begin();
+        let created = crate::sql::datetime::parse_timestamp("2023-12-31 23:59:59").unwrap();
+        let rows = match h
+            .exec_as(xid2, "SELECT created FROM t WHERE id = 1")
+            .unwrap()
+        {
+            ExecResult::Rows(r) => r,
+            other => panic!("expected Rows, got {other:?}"),
+        };
+        assert_eq!(rows, vec![vec![Literal::Timestamp(created)]]);
+
+        // Range predicate with a string literal on the right-hand side.
+        let after = match h
+            .exec_as(
+                xid2,
+                "SELECT id FROM t WHERE created > '2024-01-01 00:00:00'",
+            )
+            .unwrap()
+        {
+            ExecResult::Rows(r) => r,
+            other => panic!("expected Rows, got {other:?}"),
+        };
+        assert_eq!(after, vec![vec![Literal::Int(2)]]);
+    }
+
+    #[test]
+    fn timestamp_as_primary_key_enforces_uniqueness() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (created TIMESTAMP PRIMARY KEY)")
+            .unwrap();
+        h.exec_as(
+            xid,
+            "INSERT INTO t (created) VALUES ('2024-01-01 00:00:00')",
+        )
+        .unwrap();
+        // Same instant expressed with a 'T' separator — must still collide.
+        let dup = h.exec_as(
+            xid,
+            "INSERT INTO t (created) VALUES ('2024-01-01T00:00:00')",
+        );
+        assert!(matches!(dup, Err(DbError::UniqueViolation { .. })));
+    }
+
+    #[test]
+    fn invalid_timestamp_literal_is_rejected() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (created TIMESTAMP)")
+            .unwrap();
+        let err = h.exec_as(
+            xid,
+            "INSERT INTO t (created) VALUES ('2024-13-40 99:99:99')",
+        );
+        assert!(matches!(err, Err(DbError::SqlPlan(_))));
+    }
+
+    #[test]
+    fn decimal_and_timestamp_survive_reopen() {
+        let dir = tempdir().unwrap();
+        {
+            let mut h = Harness::new(dir.path());
+            let xid = h.begin();
+            h.exec_as(
+                xid,
+                "CREATE TABLE t (price DECIMAL(10, 2), created TIMESTAMP)",
+            )
+            .unwrap();
+            h.exec_as(
+                xid,
+                "INSERT INTO t (price, created) VALUES (19.95, '2024-03-14 09:26:53')",
+            )
+            .unwrap();
+            h.commit(xid);
+            h.pool.flush_all(h.wal.durable_lsn).unwrap();
+        }
+
+        let mut pool =
+            BufferPool::open(&dir.path().join("data.db"), DEFAULT_PAGE_SIZE as usize, 64).unwrap();
+        let control = crate::control::read(&dir.path().join("control")).unwrap();
+        let catalog = Catalog::load(&control, &mut pool).unwrap();
+        let table_def = catalog.lookup("t").unwrap();
+        assert_eq!(table_def.columns[0].ty, ColumnType::Decimal(10, 2));
+        assert_eq!(table_def.columns[1].ty, ColumnType::Timestamp);
+        let heap = Heap::from_pages(DEFAULT_PAGE_SIZE as usize, table_def.pages.clone());
+        let snap = crate::mvcc::Snapshot::new(1000, 1000, vec![]);
+        let rows = heap.scan(&snap, 1000, &pool).unwrap();
+        let decoded = decode_row(&rows[0].1, &table_def.columns).unwrap();
+        assert_eq!(
+            decoded,
+            vec![
+                Literal::Decimal(1995, 2),
+                Literal::Timestamp(
+                    crate::sql::datetime::parse_timestamp("2024-03-14 09:26:53").unwrap()
+                ),
+            ]
+        );
+    }
+
+    // ── P2.b: FLOAT / UUID / BYTEA / DATE / TIME ─────────────────────────────
+
+    #[test]
+    fn row_encode_decode_p2b_round_trip() {
+        let columns = vec![
+            col("f", ColumnType::Float),
+            col("u", ColumnType::Uuid),
+            col("b", ColumnType::Bytea),
+            col("d", ColumnType::Date),
+            col("t", ColumnType::Time),
+        ];
+        let values = vec![
+            Literal::Float(-3.5),
+            Literal::Uuid([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
+            Literal::Bytea(vec![0xde, 0xad, 0xbe, 0xef]),
+            Literal::Date(19_000),
+            Literal::Time(45_296_000_000),
+        ];
+        let encoded = encode_row(&values);
+        assert_eq!(decode_row(&encoded, &columns).unwrap(), values);
+    }
+
+    #[test]
+    fn float_column_round_trips_and_orders() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, x FLOAT)").unwrap();
+        h.exec_as(xid, "INSERT INTO t (id, x) VALUES (1, 1.5)")
+            .unwrap();
+        h.exec_as(xid, "INSERT INTO t (id, x) VALUES (2, 10)")
+            .unwrap();
+        h.commit(xid);
+        let xid2 = h.begin();
+        let rows = match h.exec_as(xid2, "SELECT x FROM t WHERE id = 1").unwrap() {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(rows, vec![vec![Literal::Float(1.5)]]);
+        let gt = match h.exec_as(xid2, "SELECT id FROM t WHERE x > 2").unwrap() {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(gt, vec![vec![Literal::Int(2)]]);
+    }
+
+    #[test]
+    fn uuid_round_trip_equality_and_pk() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id UUID PRIMARY KEY)")
+            .unwrap();
+        h.exec_as(
+            xid,
+            "INSERT INTO t (id) VALUES ('550e8400-e29b-41d4-a716-446655440000')",
+        )
+        .unwrap();
+        // Same UUID without hyphens must collide under PRIMARY KEY.
+        let dup = h.exec_as(
+            xid,
+            "INSERT INTO t (id) VALUES ('550e8400e29b41d4a716446655440000')",
+        );
+        assert!(matches!(dup, Err(DbError::UniqueViolation { .. })));
+        // Round-trip: canonical lowercase hyphenated form comes back.
+        let rows = match h
+            .exec_as(
+                xid,
+                "SELECT id FROM t WHERE id = '550E8400-E29B-41D4-A716-446655440000'",
+            )
+            .unwrap()
+        {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0][0],
+            Literal::Uuid(parse_uuid("550e8400-e29b-41d4-a716-446655440000").unwrap())
+        );
+        let bad = h.exec_as(xid, "INSERT INTO t (id) VALUES ('not-a-uuid')");
+        assert!(matches!(bad, Err(DbError::SqlPlan(_))));
+    }
+
+    #[test]
+    fn bytea_round_trip_hex_and_raw() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, b BYTEA)").unwrap();
+        h.exec_as(xid, r"INSERT INTO t (id, b) VALUES (1, '\xDEADBEEF')")
+            .unwrap();
+        h.exec_as(xid, "INSERT INTO t (id, b) VALUES (2, 'hi')")
+            .unwrap();
+        h.commit(xid);
+        let xid2 = h.begin();
+        let r1 = match h.exec_as(xid2, "SELECT b FROM t WHERE id = 1").unwrap() {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(r1, vec![vec![Literal::Bytea(vec![0xde, 0xad, 0xbe, 0xef])]]);
+        let r2 = match h.exec_as(xid2, "SELECT b FROM t WHERE id = 2").unwrap() {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(r2, vec![vec![Literal::Bytea(b"hi".to_vec())]]);
+    }
+
+    #[test]
+    fn date_and_time_round_trip_and_order() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, d DATE, tm TIME)")
+            .unwrap();
+        h.exec_as(
+            xid,
+            "INSERT INTO t (id, d, tm) VALUES (1, '2024-01-15', '09:30:00')",
+        )
+        .unwrap();
+        h.exec_as(
+            xid,
+            "INSERT INTO t (id, d, tm) VALUES (2, '2024-06-01', '18:00:00')",
+        )
+        .unwrap();
+        h.commit(xid);
+        let xid2 = h.begin();
+        let rows = match h.exec_as(xid2, "SELECT d, tm FROM t WHERE id = 1").unwrap() {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(
+            rows,
+            vec![vec![
+                Literal::Date(crate::sql::datetime::parse_date("2024-01-15").unwrap()),
+                Literal::Time(crate::sql::datetime::parse_time("09:30:00").unwrap()),
+            ]]
+        );
+        let after = match h
+            .exec_as(
+                xid2,
+                "SELECT id FROM t WHERE d > '2024-03-01' AND tm > '12:00:00'",
+            )
+            .unwrap()
+        {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(after, vec![vec![Literal::Int(2)]]);
+    }
+
+    // ── P2.c: ALTER / DROP / TRUNCATE ────────────────────────────────────────
+
+    #[test]
+    fn alter_add_column_shows_default_for_old_rows() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT)").unwrap();
+        h.exec_as(xid, "INSERT INTO t (id) VALUES (1)").unwrap();
+        // Add a column with a DEFAULT: the pre-existing row must show it.
+        let r = h
+            .exec_as(xid, "ALTER TABLE t ADD COLUMN status TEXT DEFAULT 'new'")
+            .unwrap();
+        assert_eq!(r, ExecResult::AlteredTable);
+        h.exec_as(xid, "INSERT INTO t (id, status) VALUES (2, 'live')")
+            .unwrap();
+        h.commit(xid);
+
+        let xid2 = h.begin();
+        let old = match h
+            .exec_as(xid2, "SELECT status FROM t WHERE id = 1")
+            .unwrap()
+        {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(old, vec![vec![Literal::Text("new".to_string())]]);
+        let new = match h
+            .exec_as(xid2, "SELECT status FROM t WHERE id = 2")
+            .unwrap()
+        {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(new, vec![vec![Literal::Text("live".to_string())]]);
+    }
+
+    #[test]
+    fn alter_add_not_null_column_without_default_rejected() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT)").unwrap();
+        let err = h.exec_as(xid, "ALTER TABLE t ADD COLUMN x INT NOT NULL");
+        assert!(matches!(err, Err(DbError::SqlPlan(_))));
+    }
+
+    #[test]
+    fn drop_middle_column_preserves_old_row_alignment() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (a INT, b INT, c INT)")
+            .unwrap();
+        h.exec_as(xid, "INSERT INTO t (a, b, c) VALUES (1, 2, 3)")
+            .unwrap();
+        h.exec_as(xid, "ALTER TABLE t DROP COLUMN b").unwrap();
+        h.commit(xid);
+
+        let xid2 = h.begin();
+        // The tombstone hazard: the pre-drop row's `c` must still decode as 3,
+        // not be misread from `b`'s old bytes.
+        let rows = match h.exec_as(xid2, "SELECT a, c FROM t").unwrap() {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(rows, vec![vec![Literal::Int(1), Literal::Int(3)]]);
+        // SELECT * returns only the two visible columns.
+        let star = match h.exec_as(xid2, "SELECT * FROM t").unwrap() {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(star, vec![vec![Literal::Int(1), Literal::Int(3)]]);
+        // The dropped column is no longer referenceable.
+        assert!(matches!(
+            h.exec_as(xid2, "SELECT b FROM t"),
+            Err(DbError::ColumnNotFound { .. })
+        ));
+        // A new insert over the visible columns still aligns.
+        let xid3 = h.begin();
+        h.exec_as(xid3, "INSERT INTO t (a, c) VALUES (4, 6)")
+            .unwrap();
+        h.commit(xid3);
+        let xid4 = h.begin();
+        let after = match h.exec_as(xid4, "SELECT a, c FROM t WHERE a = 4").unwrap() {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(after, vec![vec![Literal::Int(4), Literal::Int(6)]]);
+    }
+
+    #[test]
+    fn drop_column_if_exists_is_noop() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (a INT, b INT)").unwrap();
+        assert_eq!(
+            h.exec_as(xid, "ALTER TABLE t DROP COLUMN IF EXISTS nope")
+                .unwrap(),
+            ExecResult::AlteredTable
+        );
+        assert!(matches!(
+            h.exec_as(xid, "ALTER TABLE t DROP COLUMN nope"),
+            Err(DbError::ColumnNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn drop_table_then_recreate() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT)").unwrap();
+        h.exec_as(xid, "INSERT INTO t (id) VALUES (1)").unwrap();
+        assert_eq!(
+            h.exec_as(xid, "DROP TABLE t").unwrap(),
+            ExecResult::DroppedTable
+        );
+        assert!(matches!(
+            h.exec_as(xid, "SELECT * FROM t"),
+            Err(DbError::TableNotFound(_))
+        ));
+        // Re-create with a fresh schema; the old rows are gone.
+        h.exec_as(xid, "CREATE TABLE t (name TEXT)").unwrap();
+        h.commit(xid);
+        let xid2 = h.begin();
+        assert_eq!(
+            h.exec_as(xid2, "SELECT * FROM t").unwrap(),
+            ExecResult::Rows(vec![])
+        );
+    }
+
+    #[test]
+    fn truncate_removes_all_rows_keeps_schema() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT)").unwrap();
+        h.exec_as(xid, "INSERT INTO t (id) VALUES (1)").unwrap();
+        h.exec_as(xid, "INSERT INTO t (id) VALUES (2)").unwrap();
+        h.commit(xid);
+        let xid2 = h.begin();
+        assert_eq!(
+            h.exec_as(xid2, "TRUNCATE TABLE t").unwrap(),
+            ExecResult::Truncated { count: 2 }
+        );
+        h.commit(xid2);
+        let xid3 = h.begin();
+        assert_eq!(
+            h.exec_as(xid3, "SELECT * FROM t").unwrap(),
+            ExecResult::Rows(vec![])
+        );
+        // Schema intact: can still insert.
+        h.exec_as(xid3, "INSERT INTO t (id) VALUES (9)").unwrap();
+    }
+
+    #[test]
+    fn ddl_on_system_table_rejected() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        assert!(matches!(
+            h.exec_as(xid, "DROP TABLE __events__"),
+            Err(DbError::SqlPlan(_))
+        ));
+    }
+
+    // ── P2.d: SERIAL / sequences ─────────────────────────────────────────────
+
+    #[test]
+    fn serial_auto_increments_monotonically() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id SERIAL, name TEXT)")
+            .unwrap();
+        h.exec_as(xid, "INSERT INTO t (name) VALUES ('a')").unwrap();
+        h.exec_as(xid, "INSERT INTO t (name) VALUES ('b')").unwrap();
+        h.exec_as(xid, "INSERT INTO t (name) VALUES ('c')").unwrap();
+        h.commit(xid);
+        let xid2 = h.begin();
+        let rows = match h.exec_as(xid2, "SELECT id, name FROM t").unwrap() {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        let mut ids: Vec<i64> = rows
+            .iter()
+            .map(|r| match r[0] {
+                Literal::Int(n) => n,
+                _ => panic!("id not int"),
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn serial_respects_explicit_value_and_is_the_pk() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id SERIAL PRIMARY KEY, name TEXT)")
+            .unwrap();
+        h.exec_as(xid, "INSERT INTO t (name) VALUES ('a')").unwrap(); // id=1
+                                                                      // Explicit value is honored as-is.
+        h.exec_as(xid, "INSERT INTO t (id, name) VALUES (100, 'b')")
+            .unwrap();
+        h.exec_as(xid, "INSERT INTO t (name) VALUES ('c')").unwrap(); // id=2
+        let xid_dup = xid;
+        // id=1 already used -> PRIMARY KEY conflict on an explicit dup.
+        let dup = h.exec_as(xid_dup, "INSERT INTO t (id, name) VALUES (1, 'x')");
+        assert!(matches!(dup, Err(DbError::UniqueViolation { .. })));
+    }
+
+    #[test]
+    fn generated_as_identity_auto_fills() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(
+            xid,
+            "CREATE TABLE t (id INT GENERATED ALWAYS AS IDENTITY, name TEXT)",
+        )
+        .unwrap();
+        h.exec_as(xid, "INSERT INTO t (name) VALUES ('a')").unwrap();
+        let rows = match h.exec_as(xid, "SELECT id FROM t").unwrap() {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(rows, vec![vec![Literal::Int(1)]]);
+    }
+
+    #[test]
+    fn serial_on_non_integer_rejected() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        // GENERATED AS IDENTITY on a TEXT column must be rejected.
+        let err = h.exec_as(xid, "CREATE TABLE t (id TEXT GENERATED ALWAYS AS IDENTITY)");
         assert!(matches!(err, Err(DbError::SqlPlan(_))));
     }
 

@@ -64,10 +64,21 @@ pub async fn post_sql(
     State(state): State<AppState>,
     Json(body): Json<SqlRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, ApiError> {
-    // Read-only SELECTs run on the concurrent read path (6b), off the single
-    // writer thread — no begin/commit round-trips. Everything else (writes,
-    // DDL, NEAR) goes through the writer thread as before.
-    let results = if crate::read_handle::is_concurrent_read_sql(&body.sql) {
+    // Parameterized requests (P2.e) always go through the writer thread with
+    // the values bound as data — the injection-safe path.
+    let results = if !body.params.is_empty() {
+        let params: Vec<_> = body
+            .params
+            .iter()
+            .map(crate::server::dto::json_to_literal)
+            .collect();
+        let xid = state.engine.begin(None).await?;
+        let result = state.engine.execute_sql_params(xid, body.sql, params).await;
+        finish(&state.engine, xid, result).await?
+    } else if crate::read_handle::is_concurrent_read_sql(&body.sql) {
+        // Read-only SELECTs run on the concurrent read path (6b), off the single
+        // writer thread — no begin/commit round-trips. Everything else (writes,
+        // DDL, NEAR) goes through the writer thread as before.
         state.engine.execute_sql_read(body.sql).await?
     } else {
         let xid = state.engine.begin(None).await?;

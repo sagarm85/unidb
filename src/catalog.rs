@@ -52,6 +52,33 @@ pub enum ColumnType {
     /// `> 0` at `CREATE TABLE` time; every inserted vector must match it
     /// exactly (checked in `sql/executor.rs::coerce_and_validate_row`).
     Vector(u32),
+    /// Exact fixed-point decimal (P2.a): `Decimal(precision, scale)`. Stored
+    /// as an `i128` scaled by `10^scale` — exact arithmetic, no float error.
+    /// `precision` is the maximum number of significant decimal digits and
+    /// `scale` the number of fractional digits (`scale <= precision`, both
+    /// validated at `CREATE TABLE` time). The `i128` backing bounds the usable
+    /// precision to ~38 digits; larger `NUMERIC` is out of scope (see the
+    /// Phase 2 spec's "known limitations").
+    Decimal(u8, u8),
+    /// Timestamp (P2.a): microseconds since the Unix epoch, UTC, stored as an
+    /// `i64` (8 bytes LE). `TIMESTAMPTZ` normalizes to UTC on input; v1 only
+    /// stores UTC and does not track the original zone.
+    Timestamp,
+    /// IEEE-754 double (P2.b): `f64`, 8 bytes LE. `FLOAT`/`REAL`/`DOUBLE
+    /// PRECISION` all map here — inexact by nature (use `Decimal` for money).
+    Float,
+    /// UUID (P2.b): 16 raw bytes. Accepts canonical hyphenated or 32-hex-digit
+    /// text on input; renders canonical lowercase hyphenated on output.
+    Uuid,
+    /// Opaque binary blob (P2.b): variable-length bytes, same length-prefixed
+    /// on-disk shape as `Text`/`Json`. Text input is hex (`\xDEADBEEF`) or the
+    /// string's raw UTF-8 bytes.
+    Bytea,
+    /// Calendar date (P2.b): days since the Unix epoch, `i32`, 4 bytes LE.
+    Date,
+    /// Time of day (P2.b): microseconds since midnight, `i64`, 8 bytes LE. No
+    /// zone.
+    Time,
 }
 
 /// Which secondary index (if any) a column has. `None` by default — indexing
@@ -122,6 +149,11 @@ pub struct ColumnConstraints {
     /// Column-level `REFERENCES <table>(<column>)`.
     #[serde(default)]
     pub references: Option<ForeignKeyRef>,
+    /// `SERIAL` / `GENERATED ... AS IDENTITY` (P2.d): the column auto-fills
+    /// from the table's monotonic counter (`TableDef.serial_next`) when its
+    /// value is omitted/NULL on INSERT. Only valid on `Int64`.
+    #[serde(default)]
+    pub identity: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -131,6 +163,14 @@ pub struct ColumnDef {
     pub index: Option<IndexKind>,
     #[serde(default)]
     pub constraints: ColumnConstraints,
+    /// Logically dropped by `ALTER TABLE DROP COLUMN` (P2.c). A dropped column
+    /// keeps its physical slot in the row layout (so rows written before the
+    /// drop still decode positionally) but is invisible to `SELECT *`, cannot
+    /// be referenced by name, and is always written as NULL on new inserts.
+    /// This is the standard "tombstone" approach (cf. Postgres
+    /// `pg_attribute.attisdropped`) — dropping a column never rewrites the heap.
+    #[serde(default)]
+    pub dropped: bool,
 }
 
 /// A table-level `FOREIGN KEY (cols) REFERENCES table(cols)` (M11). As with
@@ -185,6 +225,11 @@ pub struct TableDef {
     /// blobs deserialize with an empty set.
     #[serde(default)]
     pub constraints: TableConstraints,
+    /// Next value to hand out for each `SERIAL`/identity column, keyed by
+    /// column name (P2.d). Durable (persisted in the catalog blob, crash-safe
+    /// via the same WAL-logged page write as any catalog change) and monotonic.
+    #[serde(default)]
+    pub serial_next: HashMap<String, i64>,
 }
 
 /// Everything `Catalog` needs to durably persist itself, bundled so
@@ -323,6 +368,116 @@ impl Catalog {
         self.persist(ctx)
     }
 
+    /// Allocate and durably persist the next value for a `SERIAL`/identity
+    /// column (P2.d). Monotonic; the counter starts at 1. Persisting on every
+    /// allocation keeps the sequence crash-safe (it survives reopen at the
+    /// last-handed-out value) at the cost of a catalog rewrite per serial
+    /// INSERT — acceptable for v1 correctness; batching is a later optimization.
+    pub fn alloc_serial(&mut self, table: &str, column: &str, ctx: &mut CatalogCtx) -> Result<i64> {
+        let t = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
+        let next = t.serial_next.entry(column.to_string()).or_insert(1);
+        let value = *next;
+        *next = value.checked_add(1).ok_or_else(|| {
+            DbError::SqlPlan(format!("sequence for '{table}.{column}' exhausted i64"))
+        })?;
+        self.persist(ctx)?;
+        Ok(value)
+    }
+
+    /// `ALTER TABLE ADD COLUMN` (P2.c). The new column is appended physically
+    /// (so existing rows still decode positionally — they simply lack bytes for
+    /// it, and `decode_row` fills the DEFAULT/NULL). A `NOT NULL` column with no
+    /// `DEFAULT` is rejected: old rows can't satisfy it without a backfill,
+    /// which this tombstone-based scheme deliberately does not do.
+    pub fn add_column(&mut self, table: &str, col: ColumnDef, ctx: &mut CatalogCtx) -> Result<()> {
+        let t = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
+        if t.columns.iter().any(|c| !c.dropped && c.name == col.name) {
+            return Err(DbError::SqlPlan(format!(
+                "column '{}' already exists on table '{table}'",
+                col.name
+            )));
+        }
+        if (col.constraints.not_null || col.constraints.primary_key)
+            && col.constraints.default.is_none()
+        {
+            return Err(DbError::SqlPlan(format!(
+                "ADD COLUMN '{}' is NOT NULL but has no DEFAULT (existing rows would violate it)",
+                col.name
+            )));
+        }
+        t.columns.push(col);
+        self.persist(ctx)
+    }
+
+    /// `ALTER TABLE DROP COLUMN` (P2.c). Logical tombstone: the column keeps its
+    /// physical slot (so rows written before the drop still decode) but is
+    /// marked `dropped`, its constraints/index cleared. Dropping a column that
+    /// participates in a *table-level* constraint is rejected (drop the
+    /// constraint first); dropping the last visible column is rejected.
+    pub fn drop_column(&mut self, table: &str, column: &str, ctx: &mut CatalogCtx) -> Result<()> {
+        let t = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
+        let referenced = t.constraints.primary_key.iter().any(|c| c == column)
+            || t.constraints.unique.iter().flatten().any(|c| c == column)
+            || t.constraints
+                .foreign_keys
+                .iter()
+                .any(|fk| fk.columns.iter().any(|c| c == column));
+        if referenced {
+            return Err(DbError::SqlPlan(format!(
+                "cannot drop column '{column}': it participates in a table-level constraint"
+            )));
+        }
+        if t.columns.iter().filter(|c| !c.dropped).count() <= 1 {
+            return Err(DbError::SqlPlan(
+                "cannot drop the table's only remaining column".into(),
+            ));
+        }
+        let col = t
+            .columns
+            .iter_mut()
+            .find(|c| !c.dropped && c.name == column)
+            .ok_or_else(|| DbError::ColumnNotFound {
+                table: table.to_string(),
+                column: column.to_string(),
+            })?;
+        col.dropped = true;
+        col.index = None;
+        col.constraints = ColumnConstraints::default();
+        self.persist(ctx)
+    }
+
+    /// `DROP TABLE` (P2.c). Removes the table from the catalog. Its heap pages
+    /// are orphaned (reclaimed once Phase 1's free-space map / free-page list
+    /// lands — until then, dropped-table space is not reused, same accepted
+    /// tradeoff as pre-vacuum heap bloat).
+    pub fn drop_table(&mut self, table: &str, ctx: &mut CatalogCtx) -> Result<()> {
+        if self.tables.remove(table).is_none() {
+            return Err(DbError::TableNotFound(table.to_string()));
+        }
+        self.persist(ctx)
+    }
+
+    /// `TRUNCATE` (P2.c). Drops every row by clearing the table's page list; the
+    /// orphaned pages are reclaimed once Phase 1's FSM lands (as with
+    /// `DROP TABLE`). The schema (columns/constraints) is unchanged.
+    pub fn truncate(&mut self, table: &str, ctx: &mut CatalogCtx) -> Result<()> {
+        let t = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
+        t.pages.clear();
+        self.persist(ctx)
+    }
+
     fn persist(&self, ctx: &mut CatalogCtx) -> Result<()> {
         let encoded =
             serde_json::to_vec(&self.tables).map_err(|e| DbError::CatalogCorrupt(e.to_string()))?;
@@ -381,12 +536,14 @@ mod tests {
             columns: vec![ColumnDef {
                 name: "id".to_string(),
                 index: None,
+                dropped: false,
                 constraints: Default::default(),
                 ty: ColumnType::Int64,
             }],
             pages: vec![],
             rls_policy: None,
             events_enabled: false,
+            serial_next: Default::default(),
             constraints: Default::default(),
         };
         let mut ctx = CatalogCtx {
@@ -412,6 +569,7 @@ mod tests {
             pages: vec![],
             rls_policy: None,
             events_enabled: false,
+            serial_next: Default::default(),
             constraints: Default::default(),
         };
         let mut ctx = CatalogCtx {
@@ -437,12 +595,14 @@ mod tests {
                 ColumnDef {
                     name: "id".to_string(),
                     index: None,
+                    dropped: false,
                     constraints: Default::default(),
                     ty: ColumnType::Int64,
                 },
                 ColumnDef {
                     name: "data".to_string(),
                     index: None,
+                    dropped: false,
                     constraints: Default::default(),
                     ty: ColumnType::Json,
                 },
@@ -450,6 +610,7 @@ mod tests {
             pages: vec![7],
             rls_policy: None,
             events_enabled: false,
+            serial_next: Default::default(),
             constraints: Default::default(),
         };
         {
@@ -482,18 +643,21 @@ mod tests {
                     name: "id".to_string(),
                     ty: ColumnType::Int64,
                     index: None,
+                    dropped: false,
                     constraints: Default::default(),
                 },
                 ColumnDef {
                     name: "vec".to_string(),
                     ty: ColumnType::Vector(384),
                     index: Some(IndexKind::Hnsw),
+                    dropped: false,
                     constraints: Default::default(),
                 },
             ],
             pages: vec![],
             rls_policy: None,
             events_enabled: false,
+            serial_next: Default::default(),
             constraints: Default::default(),
         };
         {
@@ -525,6 +689,7 @@ mod tests {
             pages: vec![],
             rls_policy: None,
             events_enabled: false,
+            serial_next: Default::default(),
             constraints: Default::default(),
         };
         let policy = Expr::BinOp {
