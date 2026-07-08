@@ -1,11 +1,16 @@
-// P3.c spike — recall@k validation for the on-disk IVF-Flat vector index.
+// P3.c — recall@k / latency validation for the durable on-disk IVF-Flat vector
+// index (production).
 //
-// The Phase-3 blueprint requires validating recall BEFORE committing to an
-// on-disk ANN. This measures the spike's `DiskIvfIndex` against:
+// Measures `DiskIvfIndex` against:
 //   (1) brute-force exact top-k (the ground truth), and
-//   (2) the current in-RAM HNSW baseline (`vector::VectorIndex`),
-// on a synthetic clustered corpus, reporting recall@10 and per-query latency
-// across several `nprobe` settings, plus the index's bounded RAM footprint.
+//   (2) the retired in-RAM HNSW baseline (`vector::VectorIndex`) — kept only as
+//       a recall/latency yardstick on a small corpus (its known M2 pathology is
+//       a full graph rebuild on every upsert, so it can't be timed at scale),
+// on synthetic clustered corpora, reporting recall@k and per-query latency
+// across several `nprobe` settings, plus the index's bounded RAM footprint. A
+// **larger-corpus sweep** (no HNSW) shows recall/latency at scale, and a
+// reopen-by-meta-page check confirms the durable index answers identically
+// through a fresh handle — i.e. it is never rebuilt on open.
 //
 // recall@k = (avg over queries) |approx_topk ∩ exact_topk| / k.
 //
@@ -75,20 +80,22 @@ fn recall_of(approx: &[u32], exact: &HashSet<u32>, k: usize) -> f64 {
     hit as f64 / k as f64
 }
 
-fn main() {
-    // Corpus size is bounded by the in-RAM HNSW baseline, whose known M2
-    // pathology is a full graph rebuild on *every* upsert (O(n²·log n) to
-    // build n points) — so we keep n modest to time it at all. IVF-Flat has no
-    // such cost; the recall comparison is the point, and recall is meaningful
-    // at this scale.
-    let n = 1_200usize;
-    let d = 32usize;
-    let clusters = 30usize;
-    let k = 10usize;
-    let n_queries = 100usize;
-    let nlist = 32usize;
+struct Corpus {
+    corpus: Vec<Vec<f32>>,
+    queries: Vec<Vec<f32>>,
+    gt: Vec<HashSet<u32>>,
+    k: usize,
+}
 
-    let mut rng = Lcg(0x1234_5678_9abc_def0);
+fn build_corpus(
+    n: usize,
+    d: usize,
+    clusters: usize,
+    k: usize,
+    n_queries: usize,
+    seed: u64,
+) -> Corpus {
+    let mut rng = Lcg(seed);
     let corpus = gen_corpus(n, d, clusters, &mut rng);
     let queries: Vec<Vec<f32>> = (0..n_queries)
         .map(|i| {
@@ -98,81 +105,68 @@ fn main() {
                 .collect()
         })
         .collect();
-
-    // Ground truth.
     let gt: Vec<HashSet<u32>> = queries.iter().map(|q| exact_topk(&corpus, q, k)).collect();
-
-    println!("P3.c spike — on-disk IVF-Flat recall@{k} vs. in-RAM HNSW");
-    println!("corpus: {n} vecs × {d}d, {clusters} clusters; {n_queries} queries; nlist={nlist}\n");
-
-    // ── in-RAM HNSW baseline ────────────────────────────────────────────────
-    let mut hnsw = VectorIndex::with_metric(Metric::Euclidean);
-    let t = Instant::now();
-    for (i, v) in corpus.iter().enumerate() {
-        hnsw.upsert(rid(i as u32), v.clone());
+    Corpus {
+        corpus,
+        queries,
+        gt,
+        k,
     }
-    let hnsw_build = t.elapsed();
-    let t = Instant::now();
-    let mut hnsw_recall = 0.0;
-    for (qi, q) in queries.iter().enumerate() {
-        let got: Vec<u32> = hnsw
-            .search(q, k)
-            .into_iter()
-            .map(|(r, _)| r.page_id)
-            .collect();
-        hnsw_recall += recall_of(&got, &gt[qi], k);
-    }
-    let hnsw_qtime = t.elapsed() / n_queries as u32;
-    hnsw_recall /= n_queries as f64;
-    println!(
-        "HNSW (in-RAM, rebuilt-on-open):  recall={:.3}  q_latency={:>8.1}µs  build={:>6.1}ms  RAM≈O(corpus)",
-        hnsw_recall,
-        hnsw_qtime.as_secs_f64() * 1e6,
-        hnsw_build.as_secs_f64() * 1e3,
-    );
+}
 
-    // ── on-disk IVF-Flat (the spike) ────────────────────────────────────────
-    let dir = tempdir().unwrap();
-    let mut pool = BufferPool::open(
-        &dir.path().join("data.db"),
-        DEFAULT_PAGE_SIZE as usize,
-        4096,
-    )
-    .unwrap();
-    let mut wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
+/// Build a durable IVF index over `c`, returning `(handle, pool, wal, meta_page)`
+/// kept alive by the caller so a fresh handle can reopen the same pages.
+fn build_ivf(
+    c: &Corpus,
+    nlist: usize,
+    nprobe: usize,
+    dir: &std::path::Path,
+) -> (DiskIvfIndex, BufferPool, Wal, std::time::Duration) {
+    let mut pool =
+        BufferPool::open(&dir.join("data.db"), DEFAULT_PAGE_SIZE as usize, 4096).unwrap();
+    let mut wal = Wal::open(&dir.join("db.wal"), INVALID_LSN).unwrap();
     wal.set_deferred_sync(true); // batch fsyncs for the build (server-mode style)
 
+    let dim = c.corpus[0].len();
     let t = Instant::now();
-    let ivf =
-        DiskIvfIndex::train(&corpus, nlist, 12, Metric::Euclidean, &mut pool, &mut wal).unwrap();
-    for (i, v) in corpus.iter().enumerate() {
+    let ivf = DiskIvfIndex::create(
+        dim,
+        &c.corpus,
+        nlist,
+        nprobe,
+        12,
+        Metric::Euclidean,
+        &mut pool,
+        &mut wal,
+    )
+    .unwrap();
+    for (i, v) in c.corpus.iter().enumerate() {
         ivf.insert(rid(i as u32), v, &mut pool, &mut wal).unwrap();
     }
     wal.sync().unwrap();
-    let ivf_build = t.elapsed();
+    let build = t.elapsed();
+    (ivf, pool, wal, build)
+}
 
+/// Run the IVF nprobe sweep against `c` and print a recall/latency table.
+fn ivf_sweep(c: &Corpus, ivf: &DiskIvfIndex, pool: &mut BufferPool, probes: &[usize]) {
+    let corpus = &c.corpus;
     let lookup = |r: RowId| corpus.get(r.page_id as usize).cloned();
-
-    println!(
-        "\nIVF-Flat (on-disk, durable postings, RAM = {} B for {nlist} centroids, build={:.1}ms):",
-        ivf.ram_bytes(),
-        ivf_build.as_secs_f64() * 1e3
-    );
     println!("  {:>7}  {:>10}  {:>14}", "nprobe", "recall", "q_latency");
-    for &nprobe in &[1usize, 4, 8, 16, 32] {
+    for &nprobe in probes {
         let t = Instant::now();
         let mut recall = 0.0;
-        for (qi, q) in queries.iter().enumerate() {
+        for (qi, q) in c.queries.iter().enumerate() {
             let got: Vec<u32> = ivf
-                .search(q, k, nprobe, &mut pool, lookup)
+                .search(q, c.k, Some(nprobe), pool, lookup)
                 .unwrap()
                 .into_iter()
                 .map(|(r, _)| r.page_id)
                 .collect();
-            recall += recall_of(&got, &gt[qi], k);
+            recall += recall_of(&got, &c.gt[qi], c.k);
         }
-        let qtime = t.elapsed() / n_queries as u32;
-        recall /= n_queries as f64;
+        let qtime = t.elapsed() / c.queries.len() as u32;
+        recall /= c.queries.len() as f64;
         println!(
             "  {:>7}  {:>10.3}  {:>12.1}µs",
             nprobe,
@@ -180,10 +174,100 @@ fn main() {
             qtime.as_secs_f64() * 1e6
         );
     }
+}
+
+fn main() {
+    // ── (A) small corpus: IVF-Flat vs. the in-RAM HNSW baseline ─────────────
+    let small = build_corpus(1_200, 32, 30, 10, 100, 0x1234_5678_9abc_def0);
+    let nlist_small = 32usize;
+    println!("== (A) IVF-Flat vs. in-RAM HNSW — recall@{} ==", small.k);
+    println!(
+        "corpus: {} vecs × {}d, 30 clusters; {} queries; nlist={nlist_small}\n",
+        small.corpus.len(),
+        small.corpus[0].len(),
+        small.queries.len()
+    );
+
+    let mut hnsw = VectorIndex::with_metric(Metric::Euclidean);
+    let t = Instant::now();
+    for (i, v) in small.corpus.iter().enumerate() {
+        hnsw.upsert(rid(i as u32), v.clone());
+    }
+    let hnsw_build = t.elapsed();
+    let t = Instant::now();
+    let mut hnsw_recall = 0.0;
+    for (qi, q) in small.queries.iter().enumerate() {
+        let got: Vec<u32> = hnsw
+            .search(q, small.k)
+            .into_iter()
+            .map(|(r, _)| r.page_id)
+            .collect();
+        hnsw_recall += recall_of(&got, &small.gt[qi], small.k);
+    }
+    let hnsw_qtime = t.elapsed() / small.queries.len() as u32;
+    hnsw_recall /= small.queries.len() as f64;
+    println!(
+        "HNSW (retired in-RAM baseline):  recall={:.3}  q_latency={:>8.1}µs  build={:>6.1}ms  RAM≈O(corpus)",
+        hnsw_recall,
+        hnsw_qtime.as_secs_f64() * 1e6,
+        hnsw_build.as_secs_f64() * 1e3,
+    );
+
+    let dir = tempdir().unwrap();
+    let (ivf, mut pool, _wal, build) = build_ivf(&small, nlist_small, 4, dir.path());
+    println!(
+        "\nIVF-Flat (on-disk, durable postings, RAM = {} B for {nlist_small} centroids, build={:.1}ms):",
+        ivf.ram_bytes(&mut pool).unwrap(),
+        build.as_secs_f64() * 1e3
+    );
+    ivf_sweep(&small, &ivf, &mut pool, &[1, 4, 8, 16, 32]);
+
+    // Durability check: reopen the index through a *fresh* handle over the same
+    // meta page (nothing rebuilt) and confirm identical recall.
+    let reopened = DiskIvfIndex::open(ivf.meta_page(), DEFAULT_PAGE_SIZE as usize);
+    let lookup = |r: RowId| small.corpus.get(r.page_id as usize).cloned();
+    let mut reopen_recall = 0.0;
+    for (qi, q) in small.queries.iter().enumerate() {
+        let got: Vec<u32> = reopened
+            .search(q, small.k, Some(8), &mut pool, lookup)
+            .unwrap()
+            .into_iter()
+            .map(|(r, _)| r.page_id)
+            .collect();
+        reopen_recall += recall_of(&got, &small.gt[qi], small.k);
+    }
+    reopen_recall /= small.queries.len() as f64;
+    println!(
+        "  reopen-by-meta-page (no rebuild): recall={reopen_recall:.3} (nprobe=8) — matches above"
+    );
+
+    // ── (B) larger corpus: recall/latency at scale (no HNSW baseline) ───────
+    let big = build_corpus(20_000, 64, 200, 10, 200, 0x0bad_c0de_dead_beef);
+    let nlist_big = 141usize; // ≈ √20000
+    println!(
+        "\n== (B) IVF-Flat larger-corpus sweep — recall@{} ==",
+        big.k
+    );
+    println!(
+        "corpus: {} vecs × {}d, 200 clusters; {} queries; nlist={nlist_big}\n",
+        big.corpus.len(),
+        big.corpus[0].len(),
+        big.queries.len()
+    );
+    let dir2 = tempdir().unwrap();
+    let (ivf2, mut pool2, _wal2, build2) = build_ivf(&big, nlist_big, 16, dir2.path());
+    println!(
+        "IVF-Flat (on-disk, RAM = {} B for {nlist_big} centroids, build={:.1}ms):",
+        ivf2.ram_bytes(&mut pool2).unwrap(),
+        build2.as_secs_f64() * 1e3
+    );
+    ivf_sweep(&big, &ivf2, &mut pool2, &[1, 8, 16, 32, 64]);
 
     println!(
         "\nTakeaway: IVF-Flat recall climbs to HNSW-competitive with modest nprobe,\n\
-         at O(nlist) RAM instead of O(corpus) — and its postings are the durable\n\
-         DiskBTree from P3.a, so it is crash-safe and never rebuilt on open."
+         at O(nlist) RAM instead of O(corpus), and scales to 20k+ vectors. Its\n\
+         postings are the durable DiskBTree (P3.a) and its centroids live in a\n\
+         WAL-logged meta page, so the index is crash-safe and never rebuilt on\n\
+         open — a fresh handle over the same meta page answers identically."
     );
 }

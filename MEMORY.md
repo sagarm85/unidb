@@ -78,8 +78,13 @@
   on `reqwest` — note `-p unidb --edges normal` is required: plain `cargo
   tree --no-default-features` from a workspace root shows the whole
   workspace's dependency union, which is *not* the right check here).
-- **Current work (Core lane): Phase 3 — Multi-model durable storage** (the moat,
-  `docs/backlog/phase3_durable_storage.md`), on branch `durable-storage`. **P3.a
+- **Current work (Core lane): Phase 3 — Multi-model durable storage — COMPLETE**
+  (the moat, `docs/backlog/phase3_durable_storage.md`). **P3.c PRODUCTION shipped
+  on branch `p3c-vector-production` (2026-07-09)** — the spike's `DiskIvfIndex` is
+  now the live vector index, the async index worker is retired, and **`Engine::open`
+  does ZERO index rebuilding for every index type (the O(1)-open moat is real).**
+  Crash harness 18 → **19** (P17). See the P3.c-production subsection below. Prior
+  Phase 3 work (branch `durable-storage`): **P3.a
   + P3.b are SHIPPED.** All three key→postings secondary indexes are now durable
   on-disk `DiskBTree`s (node pages in the shared page store, WAL-logged as full
   node-page images via the redo-only `WAL_INDEX`, crash-recovered, **not rebuilt
@@ -93,25 +98,23 @@
     `rebuild_edge_index` + the full-text rebuild. **CSR retired** (consulted by
     no read path since the M7 revert; adjacency now served durably by the edge
     index) — `rebuild_csr_index` + warm-keeping gone; `csr_index.rs` module kept
-    only for its benchmark. The async index worker now serves **only the vector
-    (Hnsw) index**.
+    only for its benchmark. The async index worker (at P3.b) served only the
+    vector (Hnsw) index — **retired entirely in P3.c-production**.
   Crash harness **14 → 17** (P13 B-Tree total-data-loss recovery, P14 durable
-  full-text, P15 durable edge index). **P3.c (on-disk vector) SPIKE is COMPLETE:**
-  chose on-disk **IVF-Flat** (cell posting lists = a durable `DiskBTree`,
-  centroids in bounded RAM), recall@10 = **1.000 at nprobe=4** validated vs.
-  ground truth (`src/disk_vector.rs`, `benches/vector_recall.rs`,
-  `docs/design/p3c_vector_spike.md`) — the production wiring is a follow-up PR
-  (not rushed, per the blueprint). The spike also **found + fixed a real
-  `DiskBTree` duplicate-key-spanning-leaves bug** affecting P3.a/P3.b (see
-  subsection). **P3.d (large objects) is SHIPPED:** values stored **out-of-line,
-  chunked (~7 KiB), and streamed** as ordinary MVCC/WAL chunk rows in a `__lobs__`
-  system table indexed by a durable `DiskBTree` on `lob_id` — atomic with the
-  txn, crash-recovered (crash point **P16**), vacuum-reclaimable, and streamed
-  one chunk at a time (multi-GB without OOM). `Engine::put/read/delete_large_
-  object` (`src/large_object.rs`). Crash harness **14 → 18**. Dated subsections
-  below; full entries in `PROGRESS.md`. **Phase 3 is effectively complete — the
-  only remaining item is the P3.c on-disk-vector *production* wiring (the spike
-  is done and validated).**
+  full-text, P15 durable edge index). **P3.c (on-disk vector) SPIKE is COMPLETE
+  and PRODUCTION is SHIPPED** (see subsection): chose on-disk **IVF-Flat** (cell
+  posting lists = a durable `DiskBTree`, centroids in a WAL-logged meta page),
+  recall@10 = **1.000** matching the HNSW baseline (`src/disk_vector.rs`,
+  `benches/vector_recall.rs`, `docs/design/p3c_vector_spike.md`). The spike also
+  **found + fixed a real `DiskBTree` duplicate-key-spanning-leaves bug** affecting
+  P3.a/P3.b (see subsection). **P3.d (large objects) is SHIPPED:** values stored
+  **out-of-line, chunked (~7 KiB), and streamed** as ordinary MVCC/WAL chunk rows
+  in a `__lobs__` system table indexed by a durable `DiskBTree` on `lob_id` —
+  atomic with the txn, crash-recovered (crash point **P16**), vacuum-reclaimable,
+  and streamed one chunk at a time (multi-GB without OOM). `Engine::put/read/
+  delete_large_object` (`src/large_object.rs`). Crash harness **14 → 18**, then
+  **→ 19** at P3.c-production (P17). Dated subsections below; full entries in
+  `PROGRESS.md`. **Phase 3 is COMPLETE.**
 - **Prior Core-lane work: Phase 1 — ACID & storage foundation** (the feature-freeze
   gate, `docs/backlog/phase1_acid_hardening.md`), on Core lane branch
   `acid-hardening`. **Phase 1 is COMPLETE — all five checkpoints shipped:** P1.a
@@ -170,7 +173,7 @@
   parked Phase 2 SQL capability plan (`docs/backlog/
   phase2_sql_capability_expansion.md`). See Open questions below for
   what's still unresolved from M1-M5.
-- **Last updated:** 2026-07-08
+- **Last updated:** 2026-07-09
 
 ### Phase 1 — ACID & storage foundation (Core lane, branch `acid-hardening`)
 
@@ -546,6 +549,52 @@ Third Phase 3 checkpoint, delivered as the **spike** the blueprint mandates
   graph hub with many edges, or a BTree value on many rows would have silently
   returned an incomplete set. (The insert path keeps `<` routing so new
   duplicates append after existing ones — only reads needed leftmost descent.)
+
+### P3.c (production) — durable vector index live; async worker retired (Core lane, branch `p3c-vector-production`, 2026-07-09)
+
+Promotes the spike's `DiskIvfIndex` into the live vector index — **closing Phase 3**.
+Full entry in `PROGRESS.md`'s "P3.c (production)" section. What a future reader
+most needs:
+
+- **`DiskIvfIndex` is now a stateless handle over a stable meta page** (id in
+  `ColumnDef.index_root`), *exactly* mirroring `DiskBTree`. The meta page (a
+  distinct `IVF_META_MAGIC` body on a `PAGE_TYPE_BTREE` page) stores
+  metric/dim/nlist/nprobe + the postings tree's meta page + the head of a
+  **WAL-logged centroid page chain**. Every op reloads the bounded (`O(nlist·dim)`)
+  centroid table from the buffer pool — so **centroids are crash-recovered, never
+  recomputed**, and open is O(1). All pages use `WAL_INDEX` full-page images, so
+  recovery is identical to `DiskBTree` — **no new record kind / page type /
+  `FORMAT_VERSION` bump** (same reuse pattern as P3.b/P3.d).
+- **`CREATE INDEX ... USING HNSW` (+ a new `USING IVF` parser alias) builds it.**
+  `Hnsw` now *denotes* the durable IVF-Flat index (HNSW-the-graph retired); the
+  catalog/SQL keyword is kept for compatibility. `exec_create_index` trains
+  centroids from the committed rows (`ivf_params`: `nlist ≈ √rows` capped at 256,
+  `nprobe` recall-favoring), persists, inserts each row. **Empty-table create →
+  one origin cell (nlist=1)** = correct-but-flat brute force until re-created
+  (documented; re-train-as-maintenance is a follow-up).
+- **`NEAR` routes through it** (`exec_select_near`): `DiskIvfIndex::candidates`
+  probes the nearest cells' posting lists → fetch rows from the heap → **exact
+  re-rank** by the index metric → same MVCC/RLS/AND'd-predicate re-check
+  (unchanged over-fetch-then-filter contract). `apply_durable_index_writes`
+  maintains it on INSERT/UPDATE; vacuum's aliasing gate scrubs it via
+  `DiskIvfIndex::remove`.
+- **The async index worker is fully retired** — its last user was the in-RAM
+  HNSW. `rebuild_secondary_indexes` deleted; `src/index_worker.rs` removed;
+  `IndexHandle`/`IndexMsg`/`SecondaryIndex`/`IndexedColumn`/`build_indexed_columns`/
+  `send_index_upserts` gone; `ExecCtx` lost its `index_worker` field; `Engine`
+  lost its worker field + `Drop`. **`IndexStatus` moved to `catalog.rs`** and
+  `Engine::index_status` now computes it from the catalog (a durable index is
+  always `Ready`) — the REST `GET /indexes/:table/:column/status` route and DTOs
+  are unchanged.
+- **Recall parity proven** (`benches/vector_recall.rs`, extended with a
+  20,000×64d sweep + a reopen-by-meta-page check): recall@10 = **1.000** matching
+  the HNSW baseline's 1.000, bounded RAM (4 KB / 36 KB), and a fresh handle over
+  the same meta page answers identically → no rebuild on open. Crash point **P17**
+  (harness 18 → **19**): multi-cell index survives a crash, exact nearest + top-5
+  recovered.
+- **Gate met:** `Engine::open` is O(1) for **all** index types (B-Tree/full-text/
+  edge as `DiskBTree`, vector as `DiskIvfIndex`) — zero rebuilding. The moat is
+  durable.
 
 ### P3.d — large-object (big-file) storage (Core lane, branch `durable-storage`, 2026-07-08)
 

@@ -21,7 +21,7 @@ four data models over **one page store, one WAL, one buffer pool, one
 transaction manager**:
 
 1. **Relational CRUD** — SQL subset over MVCC-versioned heap tables.
-2. **Vector search** — `VECTOR(n)` columns, HNSW index, `NEAR` operator.
+2. **Vector search** — `VECTOR(n)` columns, durable on-disk IVF-Flat index, `NEAR` operator.
 3. **Graph** — edges with a Cypher read subset, adjacency indexes.
 4. **Event queue** — durable event stream with Kafka-style consumer offsets.
 
@@ -57,7 +57,7 @@ Module map (what each layer became in code):
 | Storage core (M0) | `format.rs`, `control.rs`, `mmap.rs`, `page.rs`, `bufferpool.rs`, `wal.rs`, `heap.rs`, `checkpoint.rs`, `recovery.rs` |
 | Transactions (M1) | `mvcc.rs`, `txn.rs`, `lockmgr.rs`, `concurrency_hooks.rs` |
 | Catalog & SQL (M1) | `catalog.rs`, `sql/{parser,logical,executor}.rs` |
-| Secondary indexes (M2, M6, M7; B-Tree durable since P3.a) | `index_worker.rs`, `vector.rs`, `fulltext.rs`, `btree_index.rs` (durable `DiskBTree`), `csr_index.rs` |
+| Secondary indexes (M2, M6, M7; all durable since Phase 3) | `btree_index.rs` (durable `DiskBTree`, also backs full-text + edge), `disk_vector.rs` (durable IVF-Flat `DiskIvfIndex`), `fulltext.rs` (tokenizer), `vector.rs` (retired in-RAM HNSW baseline), `csr_index.rs` (retired) |
 | Graph (M3, M7) | `graph/{edges,index,logical,parser,executor}.rs` |
 | Event queue (M4) | `queue/{mod,payload}.rs` |
 | Server (M5, feature-gated) | `server/{engine_handle,error,dto,handlers,router,auth,sse}.rs`, `bin/unidb-server.rs` |
@@ -432,49 +432,41 @@ guarding a different failure mode.
 
 ---
 
-## 5. Secondary indexing framework (M2 + M6; B-Tree durable since P3.a)
+## 5. Secondary indexing framework (M2 + M6; all indexes durable since Phase 3)
 
-> **Phase 3 note (P3.a + P3.b):** the B-Tree (P3.a), full-text/inverted (P3.b),
-> and edge-adjacency (P3.b) indexes are all **durable, synchronous, WAL-logged
-> on-disk B+trees** (`DiskBTree`) — node pages in the shared page store,
-> crash-recovered, **never rebuilt on open** — updated inline on the writer
-> thread (`apply_durable_index_writes`, `graph/edges::ensure_edge_index`) and
-> read via `DiskBTree::search` (full-text also via `Engine::search_fulltext`).
-> The M7 **CSR index was retired** in P3.b (consulted by no read path after the
-> M7 traversal revert; adjacency now served durably by the edge index). So the
-> async worker described in §5.1 now serves **only the `Hnsw` vector kind**; P3.c
-> will make that durable too and retire the worker. See §5.2 and §5.4.
+> **Phase 3 note (P3.a + P3.b + P3.c — Phase 3 complete):** **every** secondary
+> index is now **durable, synchronous, WAL-logged, and crash-recovered — never
+> rebuilt on open.** The B-Tree (P3.a), full-text/inverted (P3.b), and
+> edge-adjacency (P3.b) indexes are on-disk B+trees (`DiskBTree`); the vector
+> index (P3.c) is an on-disk IVF-Flat (`DiskIvfIndex`) whose cell posting lists
+> are themselves a `DiskBTree` and whose centroids live in a WAL-logged meta
+> page. All are updated inline on the writer thread
+> (`apply_durable_index_writes`, `graph/edges::ensure_edge_index`) and read from
+> their stable meta pages. The M7 **CSR index was retired** in P3.b; the
+> **async index worker was retired entirely** in P3.c (its last user was the
+> in-RAM HNSW). So §5.1 below is historical — there is no background index
+> thread anymore. See §5.2 and §5.4.
 
-### 5.1 The async index worker
+### 5.1 The async index worker (RETIRED in P3.c — historical)
 
-`index_worker.rs` — the engine's first background thread. It owns exactly
-one thing: `Arc<RwLock<HashMap<(table, column), IndexEntry>>>`, built
-purely from `IndexMsg` channel messages. **It never receives a
-`BufferPool`, `Wal`, or `Heap` handle** — the load-bearing isolation
-decision. Two flows share one FIFO channel:
-
-- **Rebuild-on-open**: `Engine::open` runs an ordinary read-only MVCC scan
-  of committed rows, sends one `Upsert` per indexed value, then one
-  `MarkReady` per column. FIFO ordering is what makes
-  `IndexStatus::Building` → `Ready` meaningful. (`MarkReady` on a
-  never-upserted column creates an empty *Ready* entry — a real stuck-in-
-  `Building` bug found and regression-tested in M2.d.)
-- **Live upserts**: the SQL executor sends per-row messages from
-  `exec_insert`/`exec_update` for indexed columns only — zero cost for
-  unindexed tables. "Row write is the only synchronous cost" (with the
-  honest asterisk that the worker's CPU isn't free; §11).
-
-`CREATE INDEX` validates kind-vs-column-type, persists via
-`Catalog::set_column_index`, and backfills committed rows immediately;
-the shared `build_indexed_columns` is the single place mapping
-`ColumnType`/`IndexKind` → indexed value, used by DDL backfill, live
-upserts, and rebuild-on-open alike.
+Through P3.b the engine had a background index thread (`index_worker.rs`) that
+owned an `Arc<RwLock<HashMap<(table, column), IndexEntry>>>` built from channel
+messages and never received a `BufferPool`/`Wal`/`Heap` handle. It rebuilt the
+in-RAM vector index on open and applied live upserts off the write path.
+**P3.c made the vector index durable (`DiskIvfIndex`), removing the worker's last
+user, so the module was deleted.** `Engine::open` now does **zero index
+rebuilding** for every index kind — it reads each index from its stable meta
+page. `IndexStatus` (moved to `catalog.rs`) is retained for the REST status
+route; a durable index is always `Ready` (computed from the catalog). `CREATE
+INDEX` validates kind-vs-column-type, persists via `Catalog::set_column_index`,
+and builds the durable index synchronously from committed rows, recording its
+meta page id in `ColumnDef.index_root`.
 
 ### 5.2 Index kinds
 
 | Kind | Structure | Notes |
 |---|---|---|
-| `Hnsw` (M2) | `vector.rs` wrapping `instant-distance` | **No incremental insert exists in the crate's public API** (verified against vendored source), so `VectorIndex` buffers all points and rebuilds the whole graph per upsert — O(n log n) per insert, off the foreground thread but real CPU (§11, §12). f32, Euclidean (pgvector `<->` convention). |
+| `Hnsw` (M2; **durable IVF-Flat since P3.c**) | `disk_vector.rs`, `DiskIvfIndex` — on-disk IVF-Flat; cell posting lists = durable `DiskBTree`, centroids in a WAL-logged meta page | **Durable, WAL-logged, crash-recovered, not rebuilt on open.** The `Hnsw` keyword now *denotes* the IVF-Flat index (the in-RAM HNSW graph in `vector.rs` is retired — kept only as a benchmark baseline). `CREATE INDEX ... USING HNSW`/`IVF` trains centroids from committed rows (`nlist ≈ √rows`, recall-favoring `nprobe`), stored in the meta page (id in `ColumnDef.index_root`). `NEAR` probes the nearest cells' posting lists → exact re-rank from the heap → MVCC re-check. f32, Euclidean (pgvector `<->` convention). |
 | `FullText` (M2; **durable since P3.b**) | durable `DiskBTree` keyed on tokens (`fulltext::tokenize`), one `(token, RowId)` entry per token | **Durable, WAL-logged, not rebuilt on open** — same `DiskBTree`/`WAL_INDEX` machinery as `BTree`. Now has a real read path: `Engine::search_fulltext` (tokenize → intersect per-token `search_eq` posting lists, AND-only → MVCC-resolve). |
 | `BTree` (M6; **durable since P3.a**) | `btree_index.rs`, `DiskBTree` — on-disk B+tree of buffer-pool-managed pages | **Durable, WAL-logged, crash-recovered, not rebuilt on open** (§5.4). Node pages carry the standard page header + a body-tag; a stable meta page (id in `ColumnDef.index_root`) points at the root so a root split never rewrites the catalog. Mutations log full node-page images (`WAL_INDEX`, redo-only) in one mini-txn each. No undo (entries are MVCC-validated hints). Written synchronously on the writer thread — **not** via the async worker. |
 | `Csr` (M7) | `csr_index.rs` | **Retired in P3.b** — consulted by no read path after the M7 traversal revert (§7.3); adjacency is now served by the durable edge index. The module + its benchmark remain but are unwired from the runtime. |
@@ -489,8 +481,9 @@ terms + RLS apply identically to a full scan).
 - **`NEAR` (M2.d)**: over-fetch `max(4k, k+20)` candidates, then filter.
   Requires an HNSW index (clear `SqlPlan` error otherwise — no silent
   full-scan fallback, because approximate top-k has no correct fallback).
-  An index still `Building` yields a *partial* (never wrong) result set —
-  acceptable for inherently approximate top-k.
+  Served by the durable IVF-Flat index (`DiskIvfIndex`, P3.c) — no `Ready`
+  status any more (the index is always crash-consistent with committed data); a
+  column flagged `Hnsw` but never built (no `index_root`) yields zero candidates.
 - **B-Tree (M6.b; durable since P3.a)**: `find_indexable_btree_predicate`
   detects a top-level or AND'd `Column <op> Literal` on a BTree-indexed column,
   then `try_exec_select_btree` reconstructs the `DiskBTree` from the column's
@@ -518,6 +511,37 @@ from its meta page in O(1) — the durability win benchmarked in `PROGRESS.md`'s
 P3.a entry. Vacuum scrubs it directly (`DiskBTree::remove`, reading each dead
 row's key via `Heap::get_raw` before the slot is reused). v1 leaves underfull
 nodes un-merged (tree only grows) and pays one fsync per key insert.
+
+### 5.5 Durable vector index — on-disk IVF-Flat (P3.c)
+
+`DiskIvfIndex` (`disk_vector.rs`) is the durable vector index, chosen (over
+DiskANN/Vamana) because its only on-disk state is a cell posting list
+`cell_id → [RowId]`, which *is* a `DiskBTree` (§5.4). It is a stateless handle
+over a **stable meta page** (id in `ColumnDef.index_root`, exactly like
+`DiskBTree`): the meta page (an `IVF_META_MAGIC` body on a `PAGE_TYPE_BTREE`
+page) records metric/dim/nlist/nprobe + the postings tree's meta page + the head
+of a **WAL-logged centroid page chain**. Every operation reloads the bounded
+(`O(nlist·dim)`) centroid table from the buffer pool, so **centroids are
+crash-recovered, never recomputed**, and open is O(1). All pages use `WAL_INDEX`
+full-page images — recovered identically to `DiskBTree` nodes, **no new record
+kind / page type / `FORMAT_VERSION` bump**.
+
+- **Build** (`CREATE INDEX ... USING HNSW`/`IVF`): train `nlist ≈ √rows` (capped
+  256) centroids from the committed rows via mini-batch Lloyd's k-means, persist
+  meta + centroids, insert each `(cell, RowId)` into the postings tree. An
+  empty-table create trains one origin cell (correct-but-flat until re-created).
+- **Search** (`NEAR`): rank centroids by distance, probe the `nprobe` nearest
+  cells' posting lists (recall-favoring default), fetch candidate vectors from the
+  heap for an **exact re-rank** (IVF-Flat has no quantization error), then the
+  same MVCC/RLS/predicate re-check as every other index path.
+- **Maintenance**: `apply_durable_index_writes` inserts on INSERT/UPDATE; vacuum's
+  aliasing gate scrubs it via `DiskIvfIndex::remove` before a reclaimed slot is
+  reused (re-deriving the cell from the dead row's vector).
+
+Recall@10 = 1.000 matches the retired in-RAM HNSW baseline at bounded RAM
+(`benches/vector_recall.rs`); crash point **P17** proves recovery with recall
+intact. Re-training as a maintenance op (so a table that grew after an empty-table
+create re-clusters) is a documented follow-up.
 
 ---
 
@@ -742,12 +766,13 @@ introduces.
 Three rules repeat across every milestone and are worth stating once:
 
 1. **Secondary indexes are non-transactional derived state whose entries
-   are hints, re-validated against MVCC.** The still-in-memory kinds (HNSW,
-   inverted, EdgeIndex, CSR) additionally have no WAL presence and are rebuilt
-   on open; **the B-Tree is now durable and WAL-logged (P3.a)** but still has
-   *no undo* — its entries remain hints, not transactional state. What every
-   kind shares is the load-bearing invariant: *every candidate an index
-   produces is re-checked against the caller's MVCC snapshot (and full
+   are hints, re-validated against MVCC.** Since Phase 3 **every** index kind is
+   durable and WAL-logged — B-Tree/full-text/edge as `DiskBTree` (P3.a/P3.b), the
+   vector index as `DiskIvfIndex` (P3.c) — yet all still have *no undo*: their
+   entries remain hints, not transactional state (a redo-only `WAL_INDEX` entry
+   from an aborted txn is a harmless stale hint). What every kind shares is the
+   load-bearing invariant: *every candidate an index produces is re-checked
+   against the caller's MVCC snapshot (and full
    predicate) before becoming a result.* Stale or phantom entries are therefore
    space leaks, never wrong answers — whether they came from an aborted async
    upsert or an aborted durable-B-Tree mini-txn. Each milestone lands a
@@ -861,10 +886,11 @@ the single writer thread).
 
 ### 10.3 Known performance liabilities (beyond the fsync)
 
-- **HNSW rebuild-per-upsert** (no incremental insert in
-  `instant-distance`): index-active INSERT already 2.8x slower at 200
-  rows; scales as O(n log n) per insert. CSR has the same non-incremental
-  shape but debounced (frequency reduced, structure cost unchanged).
+- **~~HNSW rebuild-per-upsert~~ (resolved in P3.c)**: the in-RAM HNSW's
+  full-graph-rebuild-per-upsert (no incremental insert in `instant-distance`) is
+  gone — the vector index is now the durable IVF-Flat `DiskIvfIndex`, whose
+  per-insert cost is a single posting-list `DiskBTree` insert (O(log n)) and whose
+  open cost is O(1). CSR (also non-incremental, debounced) is likewise retired.
 - **SSE subscriber scaling**: 1→10→50 subscribers is 5.2→33.9→162.6 ms —
   N pollers × poll interval × linear `poll_events`, all serialized
   through the one writer thread.
@@ -930,10 +956,9 @@ the whole file (needs log segments); ~~FSM is a linear scan~~ (**fixed P1.c**:
 `Heap::free_map`); ~~256-frame buffer pool + `BufferPoolFull` at scale~~
 (**fixed** — configurable 4096-frame default + chunked file growth, P1.c);
 ~~`alloc_page` remaps the whole file per page~~ (**fixed P1.c**: chunked
-growth); HNSW full rebuild per upsert; CSR full
-rebuild per debounce pass (currently moot — CSR isn't consulted, see
-above); `poll_events` full-scan (needs a `seq` index); SSE
-poll-per-subscriber.
+growth); ~~HNSW full rebuild per upsert~~ (**fixed P3.c**: durable IVF-Flat, O(1)
+open); ~~CSR full rebuild per debounce pass~~ (retired in P3.b); `poll_events`
+full-scan (needs a `seq` index); SSE poll-per-subscriber.
 
 Functional gaps (deliberate scope, tracked): ~~RC re-evaluation
 (EvalPlanQual) unimplemented~~ and ~~SSI is a no-op seam~~ (**both fixed P1.d**
@@ -1028,17 +1053,19 @@ undo through recovery is a deferred Core-lane follow-up) · P2.d **SERIAL**
 bind parameters** (`Literal::Param` + `bind_params`, `Engine::execute_sql_params`
 /`prepare`/`execute_prepared`, `POST /sql` `params`) — closes the SQL-injection
 surface. All additive/forward-compatible; no `FORMAT_VERSION` bump.
-**Phase 3 in progress (2026-07-08, Core lane, branch `durable-storage`): multi-model
-durable storage.** P3.a **durable paged WAL-logged B-Tree** (`DiskBTree`, §5.2/§5.4):
-node pages in the page store, WAL-logged full node-page images (`WAL_INDEX`),
-crash-recovered, **not rebuilt on open**; moved off the async worker; vacuum
-scrubs it directly. `FORMAT_VERSION` **4→5**. P3.b **durable full-text + edge
-index; CSR retired** (§5.2, §7.2): full-text (keyed on tokens, new
-`Engine::search_fulltext` read path) and the edge-adjacency index
-(`__edges__.from_id`) reuse the same `DiskBTree`/`WAL_INDEX` machinery (no format
-bump); `rebuild_edge_index`/full-text rebuild removed; CSR retired (unwired from
-the runtime); the async worker now serves only the vector index. Crash harness
-**14→17** (P13 B-Tree total-data-loss, P14 durable full-text, P15 durable edge),
-no locked decision reversed. P3.c (on-disk vector) + P3.d (large objects)
-pending. See `docs/backlog/phase3_durable_storage.md` + `PROGRESS.md`'s P3.a/P3.b
-entries. Update alongside the next milestone's closeout.*
+**Phase 3 COMPLETE (2026-07-09, Core lane): multi-model durable storage — the
+moat.** P3.a **durable paged WAL-logged B-Tree** (`DiskBTree`, §5.2/§5.4):
+crash-recovered, **not rebuilt on open**; `FORMAT_VERSION` **4→5**. P3.b **durable
+full-text + edge index; CSR retired** (§5.2, §7.2): both reuse the
+`DiskBTree`/`WAL_INDEX` machinery (no format bump), new `Engine::search_fulltext`
+read path. P3.c **durable on-disk vector index** (`DiskIvfIndex`, §5.5, branch
+`p3c-vector-production`): on-disk IVF-Flat — cell posting lists = durable
+`DiskBTree`, centroids in a WAL-logged meta page; `CREATE INDEX ... USING
+HNSW`/`IVF` builds it, `NEAR` reads it, **the async index worker is retired**
+(`index_worker.rs` deleted, `IndexStatus` moved to `catalog.rs`), no format bump.
+P3.d **large objects** (§ P3.d): out-of-line chunked + streamed `__lobs__` rows.
+**`Engine::open` is now O(1) for every index type — zero rebuilding.** Crash
+harness **14→19** (P13 B-Tree total-data-loss, P14 full-text, P15 edge, P16 large
+object, P17 durable vector index recall-intact), no locked decision reversed. See
+`docs/backlog/phase3_durable_storage.md` + `PROGRESS.md`'s P3.a–P3.d entries.
+Update alongside the next milestone's closeout.*

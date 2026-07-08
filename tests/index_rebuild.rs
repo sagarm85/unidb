@@ -1,36 +1,19 @@
-// Secondary-index rebuild/staleness correctness tests (M2.d).
+// Secondary-index durability correctness tests.
 //
-// Separate from `tests/crash/main.rs`'s durability-focused P-numbering
-// because this tests *derived, intentionally-not-durable* state (the
-// background worker's `VectorIndex`/`InvertedIndex`), not WAL-durable
-// state. Losing a secondary index on crash is expected and fine — it
-// rebuilds on next open — so there's no new crash-injection point here,
-// just correctness of that rebuild and of querying while it's in progress.
+// Since Phase 3 every secondary index is durable (WAL-logged, crash-recovered):
+// the B-Tree/full-text/edge indexes as `DiskBTree`s (P3.a/P3.b) and the vector
+// index as an on-disk IVF-Flat (P3.c). Reopening rebuilds NOTHING — each index
+// is read straight from its stable meta page. These tests confirm an
+// index-assisted query works after reopen with no rebuild and no `Ready` wait.
+// (The async rebuild worker was retired in P3.c.)
 
 use tempfile::tempdir;
-use unidb::index_worker::IndexStatus;
 use unidb::sql::executor::ExecResult as SqlResult;
 use unidb::sql::logical::Literal;
 use unidb::Engine;
 
-fn wait_for_ready(engine: &Engine, table: &str, column: &str) {
-    let start = std::time::Instant::now();
-    loop {
-        if engine.index_status(table, column) == Some(IndexStatus::Ready) {
-            return;
-        }
-        if start.elapsed() > std::time::Duration::from_secs(5) {
-            panic!(
-                "index status for {table}.{column} never reached Ready, last seen {:?}",
-                engine.index_status(table, column)
-            );
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-}
-
 #[test]
-fn engine_restart_rebuilds_vector_index_and_near_still_works() {
+fn engine_restart_vector_index_is_durable_no_rebuild() {
     let dir = tempdir().unwrap();
     {
         let mut engine = Engine::open(dir.path(), 0).unwrap();
@@ -54,13 +37,9 @@ fn engine_restart_rebuilds_vector_index_and_near_still_works() {
         engine.flush().unwrap();
     }
 
-    // Fresh process-equivalent open: the in-memory worker/index from the
-    // first `Engine` is gone. Only the catalog's `index: Some(Hnsw)` flag
-    // and the heap's committed rows survived — rebuild-on-open must
-    // reconstruct the index from those alone.
+    // Fresh process-equivalent open: the durable IVF index is read from its
+    // meta/centroid pages — no heap rescan, no `Ready` wait — and NEAR works.
     let mut engine2 = Engine::open(dir.path(), 0).unwrap();
-    wait_for_ready(&engine2, "t", "embedding");
-
     let xid = engine2.begin().unwrap();
     let results = engine2
         .execute_sql(xid, "SELECT id FROM t WHERE NEAR(embedding, [0.0, 0.0], 1)")
@@ -195,7 +174,10 @@ fn btree_select_before_index_ready_still_returns_correct_full_result() {
 }
 
 #[test]
-fn near_query_before_index_ready_does_not_error() {
+fn near_on_index_built_over_empty_table_returns_exact_topk() {
+    // CREATE INDEX on an empty table trains a single origin cell (nlist=1);
+    // rows inserted afterward all land in it and are exact-re-ranked, so NEAR is
+    // correct-but-flat. The durable index is synchronous — no `Ready` to wait on.
     let dir = tempdir().unwrap();
     let mut engine = Engine::open(dir.path(), 0).unwrap();
 
@@ -216,10 +198,6 @@ fn near_query_before_index_ready_does_not_error() {
     }
     engine.commit(xid).unwrap();
 
-    // Deliberately not waiting for `IndexStatus::Ready` — a `NEAR` query
-    // racing the worker must not error, and must return only entries the
-    // worker has processed so far (possibly fewer than `k`, never a panic
-    // or `Err`).
     let xid2 = engine.begin().unwrap();
     let results = engine
         .execute_sql(
@@ -228,7 +206,12 @@ fn near_query_before_index_ready_does_not_error() {
         )
         .unwrap();
     match &results[0] {
-        SqlResult::Rows(rows) => assert!(rows.len() <= 3),
+        SqlResult::Rows(rows) => {
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[0][0], Literal::Int(0));
+            assert_eq!(rows[1][0], Literal::Int(1));
+            assert_eq!(rows[2][0], Literal::Int(2));
+        }
         other => panic!("expected Rows, got {other:?}"),
     }
 }

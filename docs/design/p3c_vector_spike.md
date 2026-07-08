@@ -1,11 +1,13 @@
 # P3.c spike — on-disk vector index: approach selection & recall validation
 
-> **Status: SPIKE COMPLETE (2026-07-08).** This document records the spike the
-> Phase-3 blueprint mandates ("SPIKE FIRST … validate recall@k before
-> committing") for the durable on-disk vector index. The production wiring
-> (`CREATE INDEX … USING HNSW` → durable index, `NEAR` reading it, crash point)
-> is the **follow-up PR**, deliberately not rushed. Prototype:
-> `src/disk_vector.rs`; validation harness: `benches/vector_recall.rs`.
+> **Status: SHIPPED — spike 2026-07-08, production 2026-07-09.** This document
+> records the spike the Phase-3 blueprint mandates ("SPIKE FIRST … validate
+> recall@k before committing") for the durable on-disk vector index. **The
+> production wiring is now shipped** (see "What the production follow-up PR adds"
+> below, all done): `CREATE INDEX … USING HNSW`/`IVF` builds a durable
+> `DiskIvfIndex`, `NEAR` routes through it, centroids persist in a WAL-logged meta
+> page, the async worker is retired, and crash point P17 covers it. Prototype →
+> production: `src/disk_vector.rs`; validation harness: `benches/vector_recall.rs`.
 
 ## Problem
 
@@ -77,16 +79,20 @@ centroid table only (bytes, not O(corpus)) and its postings live in the durable
 `DiskBTree`. This validates the approach: **recall is acceptable and tunable,
 RAM is bounded, and the on-disk structure is already crash-safe.**
 
-## What the production follow-up PR adds (not in this spike)
+## What the production PR added (all shipped 2026-07-09)
 
-- Persist centroids in a meta page (spike keeps them in RAM); re-train as a
-  maintenance op (like vacuum), not on every open.
-- Wire `CREATE INDEX … USING HNSW` (or a new `USING IVF`) to build a
-  `DiskIvfIndex`, store its meta page in `ColumnDef.index_root`, and route
-  `NEAR` through it; retire the async index worker (its last user).
-- A crash-injection point (P17) for the durable vector index. (P16 is taken by
-  P3.d large objects.)
-- `nlist`/`nprobe` as index parameters; a larger-corpus recall/latency sweep.
+- ✅ Persist centroids + config in a WAL-logged **meta page** (id in
+  `ColumnDef.index_root`) + a centroid page chain — crash-recovered, not
+  recomputed. Re-training as a maintenance op remains a documented follow-up
+  (an index built on an empty table stays single-cell until re-created).
+- ✅ Wire `CREATE INDEX … USING HNSW` (and a new `USING IVF` alias) to build a
+  `DiskIvfIndex`, store its meta page in `ColumnDef.index_root`, and route `NEAR`
+  through it (probe → heap exact re-rank → MVCC/RLS/predicate re-check). The async
+  index worker (its last user) is **retired**; `Engine::open` does zero rebuilds.
+- ✅ Crash-injection point **P17** for the durable vector index (harness 18 → 19).
+- ✅ `nlist`/`nprobe` derived at build (`nlist ≈ √rows` capped, `nprobe` recall-
+  favoring), stored in the meta page; a larger-corpus (20k × 64d) recall/latency
+  sweep added to `benches/vector_recall.rs` (recall@10 = 1.000, bounded RAM).
 
 ## Bottom line
 

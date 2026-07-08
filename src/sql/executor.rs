@@ -27,16 +27,31 @@ use crate::{
     bufferpool::{BufferPool, PageReader},
     catalog::{Catalog, CatalogCtx, ColumnDef, ColumnType, IndexKind, TableConstraints, TableDef},
     control::ControlData,
+    disk_vector::DiskIvfIndex,
     error::{DbError, Result},
     format::{PageId, Xid},
     heap::{Heap, RowId},
-    index_worker::{IndexHandle, IndexMsg, IndexedColumn, SecondaryIndex},
     lockmgr::LockManager,
     mvcc::Snapshot,
     queue::{self, EVENTS_TABLE},
     txn::{IsolationLevel, TransactionManager, UndoAction},
     wal::Wal,
 };
+
+/// IVF tuning derived at `CREATE INDEX` time. `nlist` ≈ √rows (capped) trades
+/// cell granularity against centroid RAM; `nprobe` favors recall (the Phase-3
+/// gate) while staying sublinear. Both are stored in the index meta page.
+fn ivf_params(nrows: usize) -> (usize, usize) {
+    let nlist = ((nrows as f64).sqrt().round() as usize).clamp(1, 256);
+    // Probe ~1/8 of the cells, floored so small indexes probe (almost) all cells
+    // — i.e. degrade to exact search rather than risk missing the true top-k.
+    let nprobe = (nlist / 8).max(8).min(nlist);
+    (nlist, nprobe)
+}
+
+/// Lloyd's iterations for centroid training at `CREATE INDEX` — a handful
+/// suffices for a stable partition (validated in the P3.c recall sweep).
+const IVF_TRAIN_ITERS: usize = 8;
 
 use super::datetime;
 use super::logical::{CmpOp, Expr, Literal, LogicalPlan};
@@ -52,85 +67,23 @@ pub struct ExecCtx<'a> {
     pub control: &'a mut ControlData,
     pub page_size: usize,
     pub xid: Xid,
-    /// `None` in contexts with no live worker (e.g. rebuild-on-open, which
-    /// talks to the worker directly rather than through the executor).
-    pub index_worker: Option<&'a IndexHandle>,
     /// Next `seq` to assign in `__events__` (M4). Lives here rather than as
     /// an extra function argument threaded through `execute()` — unlike
     /// M3.c's `edge_index` (needed by exactly one top-level entry point,
     /// `graph_executor::execute`), event capture must reach the deeply
-    /// nested private `exec_insert`/`exec_update`/`exec_delete`, the same
-    /// shape `index_worker` above already has. Incremented in place by
-    /// `send_event_capture` on every captured event.
+    /// nested private `exec_insert`/`exec_update`/`exec_delete`. Incremented in
+    /// place by `send_event_capture` on every captured event.
     pub next_event_seq: &'a mut u64,
 }
 
-/// Build the `IndexedColumn` list for one decoded `row`, from the subset of
-/// `table_def`'s columns that are actually indexed. Shared between live
-/// upserts (`send_index_upserts`, below) and every backfill/rebuild path
-/// (`exec_create_index` here, and `lib.rs`'s rebuild-on-open) so the
-/// column-type-to-`IndexedColumn`-variant mapping exists in exactly one
-/// place.
-pub fn build_indexed_columns(
-    table_def: &TableDef,
-    indexed: &[&ColumnDef],
-    row: &[Literal],
-) -> Vec<IndexedColumn> {
-    let mut out = Vec::new();
-    for col in indexed {
-        let idx = table_def
-            .columns
-            .iter()
-            .position(|c| c.name == col.name)
-            .expect("indexed column is drawn from table_def.columns");
-        // Only the async worker's vector (Hnsw) kind is emitted here. BTree
-        // (P3.a) and FullText (P3.b) are durable, WAL-logged on-disk B+trees
-        // written via `apply_durable_index_writes`, not sent to the worker.
-        if let (Some(IndexKind::Hnsw), Literal::Vector(v)) = (&col.index, &row[idx]) {
-            out.push(IndexedColumn::Vector {
-                column: col.name.clone(),
-                data: v.clone(),
-            });
-        }
-    }
-    out
-}
-
-/// If `table` has any indexed columns, send their values from `row` to the
-/// background worker keyed by `row_id`. Checked once per statement row, not
-/// once per column globally, so tables with no indexed column pay zero
-/// overhead (CLAUDE.md's M2 "row write is the only synchronous cost" goal)
-/// — this function only *sends*, the worker does all the actual index work
-/// off this thread.
-fn send_index_upserts(table_def: &TableDef, row_id: RowId, row: &[Literal], ctx: &ExecCtx) {
-    let Some(handle) = ctx.index_worker else {
-        return;
-    };
-    let indexed: Vec<&ColumnDef> = table_def
-        .columns
-        .iter()
-        .filter(|c| c.index.is_some())
-        .collect();
-    if indexed.is_empty() {
-        return;
-    }
-    let indexed_cols = build_indexed_columns(table_def, &indexed, row);
-    if !indexed_cols.is_empty() {
-        handle.send(IndexMsg::Upsert {
-            table: table_def.name.clone(),
-            record: row_id,
-            indexed_cols,
-        });
-    }
-}
-
-/// Insert `row`'s durable-index column values into their on-disk B+trees
-/// (P3.a/P3.b). Synchronous, durable, WAL-logged on the writer thread — unlike
-/// the async `send_index_upserts` (which now serves only the still-in-memory
-/// Hnsw vector kind). Handles both durable index kinds, which share one
-/// `DiskBTree` structure and differ only in how a row maps to keys — **BTree**
-/// (P3.a) uses one key (the column's orderable value); **FullText** (P3.b) uses
-/// one key per token of the tokenized text.
+/// Insert `row`'s durable-index column values into their on-disk structures
+/// (P3.a/P3.b/P3.c). Synchronous, durable, WAL-logged on the writer thread —
+/// every secondary index is now durable, so this is the single index-maintenance
+/// path (the async worker is retired). The kinds differ only in how a row maps to
+/// keys — **BTree** (P3.a) uses one key (the column's orderable value);
+/// **FullText** (P3.b) uses one key per token of the tokenized text; **Hnsw**
+/// (P3.c, the durable on-disk IVF-Flat index) assigns the vector to its nearest
+/// cell and inserts `(cell, RowId)` into the cell posting list.
 /// Called on every INSERT and on the new row version each UPDATE creates. The
 /// old version's entries are left in place: they point at a now-superseded
 /// (MVCC-invisible) tuple, so they are harmless stale hints that vacuum later
@@ -150,18 +103,25 @@ fn apply_durable_index_writes(
         let Some(meta_page) = col.index_root else {
             continue;
         };
-        let tree = DiskBTree::new(meta_page, ctx.page_size);
         match col.index {
             Some(IndexKind::BTree) => {
                 if let Ok(value) = OrderedValue::try_from(&row[idx]) {
-                    tree.insert(value, row_id, ctx.pool, ctx.wal)?;
+                    DiskBTree::new(meta_page, ctx.page_size)
+                        .insert(value, row_id, ctx.pool, ctx.wal)?;
                 }
             }
             Some(IndexKind::FullText) => {
                 if let Literal::Text(text) = &row[idx] {
+                    let tree = DiskBTree::new(meta_page, ctx.page_size);
                     for token in crate::fulltext::tokenize(text) {
                         tree.insert(OrderedValue::Text(token), row_id, ctx.pool, ctx.wal)?;
                     }
+                }
+            }
+            Some(IndexKind::Hnsw) => {
+                if let Literal::Vector(v) = &row[idx] {
+                    DiskIvfIndex::open(meta_page, ctx.page_size)
+                        .insert(row_id, v, ctx.pool, ctx.wal)?;
                 }
             }
             _ => {}
@@ -177,11 +137,9 @@ fn apply_durable_index_writes(
 /// "zero new abort-path code" claim true: the event row's fate is tied to
 /// the surrounding transaction via the same MVCC/abort machinery as any
 /// other row, with nothing new added to `txn.rs`. Checked once per
-/// statement row, mirroring `send_index_upserts`'s "zero cost if not
-/// opted in" shape — but unlike that function, this write is synchronous
-/// and durable, not sent to a background worker, since the event must
-/// commit atomically with the triggering write (see queue/mod.rs's module
-/// doc for why a WAL-tailing design was rejected).
+/// statement row, "zero cost if not opted in": this write is synchronous and
+/// durable, since the event must commit atomically with the triggering write
+/// (see queue/mod.rs's module doc for why a WAL-tailing design was rejected).
 fn send_event_capture(
     table_def: &TableDef,
     op: &str,
@@ -389,11 +347,12 @@ fn exec_create_table(
     Ok(ExecResult::CreatedTable)
 }
 
-/// `CREATE INDEX ... ON table USING HNSW|FULLTEXT (column)`: validate the
-/// column's type is compatible with the requested index kind, persist the
-/// catalog flag, then immediately backfill the worker from every
-/// currently-committed row (unlike `Engine::set_column_index`'s Rust-API
-/// path from M2.b, which defers population to the next rebuild-on-open).
+/// `CREATE INDEX ... ON table USING HNSW|IVF|FULLTEXT|BTREE (column)`: validate
+/// the column's type is compatible with the requested index kind, persist the
+/// catalog flag, then build a **durable** on-disk index synchronously from every
+/// currently-committed row and record its stable meta page id in the catalog.
+/// Since P3.c every index kind is durable and WAL-logged, so `Engine::open`
+/// never rebuilds it (the O(1)-open moat).
 fn exec_create_index(
     table: &str,
     column: &str,
@@ -409,36 +368,63 @@ fn exec_create_index(
             table: table.to_string(),
             column: column.to_string(),
         })?;
-    match (&kind, &col.ty) {
-        (IndexKind::Hnsw, ColumnType::Vector(_)) => {}
-        (IndexKind::FullText, ColumnType::Text) => {}
-        (IndexKind::BTree, ColumnType::Int64 | ColumnType::Text | ColumnType::Bool) => {}
+    let vec_dim = match (&kind, &col.ty) {
+        (IndexKind::Hnsw, ColumnType::Vector(d)) => *d,
+        (IndexKind::FullText, ColumnType::Text) => 0,
+        (IndexKind::BTree, ColumnType::Int64 | ColumnType::Text | ColumnType::Bool) => 0,
         (kind, ty) => {
             return Err(DbError::SqlPlan(format!(
                 "{kind:?} index is not valid on column {column} of type {ty:?}"
             )))
         }
-    }
+    };
 
     let mut cctx = catalog_ctx!(ctx);
     ctx.catalog
         .set_column_index(table, column, Some(kind), &mut cctx)?;
 
-    // P3.a/P3.b: a durable BTree/FullText index is built synchronously on the
-    // writer thread — allocate its stable meta page, backfill every committed
-    // row into the on-disk B+tree, then record the meta page id in the catalog.
-    // Everything is WAL-logged, so `Engine::open` never rebuilds it. The
-    // remaining in-memory kind (Hnsw) keeps the async-worker backfill below.
-    if matches!(kind, IndexKind::BTree | IndexKind::FullText) {
-        let tree = DiskBTree::create(ctx.pool, ctx.wal)?;
-        let table_def = ctx.catalog.lookup(table)?.clone();
-        let col_idx = table_def
-            .columns
-            .iter()
-            .position(|c| c.name == column)
-            .expect("column just validated above");
+    let table_def = ctx.catalog.lookup(table)?.clone();
+    let col_idx = table_def
+        .columns
+        .iter()
+        .position(|c| c.name == column)
+        .expect("column just validated above");
+    let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+
+    let meta_page = if matches!(kind, IndexKind::Hnsw) {
+        // P3.c: the durable on-disk IVF-Flat vector index. Collect the committed
+        // vectors as the training sample, train centroids, then insert each row
+        // into its cell. Training holds the sample in RAM transiently (one-time
+        // build cost); the persisted index is bounded (centroids only).
         let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
-        let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+        let mut sample: Vec<(RowId, Vec<f32>)> = Vec::new();
+        for (row_id, bytes) in heap.scan(&snapshot, ctx.xid, ctx.pool)? {
+            let row = decode_row(&bytes, &table_def.columns)?;
+            if let Literal::Vector(v) = &row[col_idx] {
+                sample.push((row_id, v.clone()));
+            }
+        }
+        let (nlist, nprobe) = ivf_params(sample.len());
+        let sample_vecs: Vec<Vec<f32>> = sample.iter().map(|(_, v)| v.clone()).collect();
+        let ivf = DiskIvfIndex::create(
+            vec_dim as usize,
+            &sample_vecs,
+            nlist,
+            nprobe,
+            IVF_TRAIN_ITERS,
+            crate::vector::Metric::Euclidean,
+            ctx.pool,
+            ctx.wal,
+        )?;
+        for (row_id, v) in &sample {
+            ivf.insert(*row_id, v, ctx.pool, ctx.wal)?;
+        }
+        ivf.meta_page()
+    } else {
+        // P3.a/P3.b: a durable BTree/FullText index — a `DiskBTree` backfilled
+        // from every committed row.
+        let tree = DiskBTree::create(ctx.pool, ctx.wal)?;
+        let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
         for (row_id, bytes) in heap.scan(&snapshot, ctx.xid, ctx.pool)? {
             let row = decode_row(&bytes, &table_def.columns)?;
             match kind {
@@ -457,39 +443,12 @@ fn exec_create_index(
                 _ => unreachable!(),
             }
         }
-        let mut cctx = catalog_ctx!(ctx);
-        ctx.catalog
-            .set_column_index_root(table, column, Some(tree.meta_page()), &mut cctx)?;
-        return Ok(ExecResult::CreatedIndex);
-    }
+        tree.meta_page()
+    };
 
-    let table_def = ctx.catalog.lookup(table)?.clone();
-    if let Some(handle) = ctx.index_worker {
-        let col = table_def
-            .columns
-            .iter()
-            .find(|c| c.name == column)
-            .expect("column just validated above");
-        let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
-        let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
-        for (row_id, bytes) in heap.scan(&snapshot, ctx.xid, ctx.pool)? {
-            let row = decode_row(&bytes, &table_def.columns)?;
-            let indexed_cols = build_indexed_columns(&table_def, &[col], &row);
-            if !indexed_cols.is_empty() {
-                handle.send(IndexMsg::Upsert {
-                    table: table_def.name.clone(),
-                    record: row_id,
-                    indexed_cols,
-                });
-            }
-        }
-        handle.send(IndexMsg::MarkReady {
-            table: table_def.name.clone(),
-            column: column.to_string(),
-            kind,
-        });
-    }
-
+    let mut cctx = catalog_ctx!(ctx);
+    ctx.catalog
+        .set_column_index_root(table, column, Some(meta_page), &mut cctx)?;
     Ok(ExecResult::CreatedIndex)
 }
 
@@ -549,7 +508,6 @@ fn exec_insert(
                 slot: row_id.slot,
             },
         )?;
-        send_index_upserts(&table_def, row_id, &coerced, ctx);
         apply_durable_index_writes(&table_def, row_id, &coerced, ctx)?;
         send_event_capture(&table_def, "insert", &coerced, ctx)?;
         count += 1;
@@ -746,8 +704,8 @@ fn try_exec_select_btree(
     Ok(Some(ExecResult::Rows(out)))
 }
 
-/// `NEAR`'s over-fetch-then-filter execution: look up the column's
-/// `VectorIndex`, over-fetch `k`-ish candidates, resolve each back to a
+/// `NEAR`'s over-fetch-then-filter execution: probe the durable IVF-Flat
+/// index's nearest-cell posting lists for candidates, resolve each back to a
 /// heap row, and run the row through the *same* `predicate_matches` every
 /// ordinary scan uses. This is what makes MVCC visibility, RLS, and any
 /// AND'd `WHERE` terms apply to `NEAR` results for free — every candidate
@@ -761,67 +719,94 @@ fn exec_select_near(
     ctx: &mut ExecCtx,
 ) -> Result<ExecResult> {
     let (column, query, k) = near;
-    let col = table_def
+    let col_idx = table_def
         .columns
         .iter()
-        .find(|c| c.name == column)
+        .position(|c| c.name == column)
         .ok_or_else(|| DbError::ColumnNotFound {
             table: table_def.name.clone(),
             column: column.to_string(),
         })?;
+    let col = &table_def.columns[col_idx];
     if !matches!(col.index, Some(IndexKind::Hnsw)) || !matches!(col.ty, ColumnType::Vector(_)) {
         return Err(DbError::SqlPlan(format!(
-            "column {column} has no HNSW index; see CREATE INDEX ... USING HNSW"
+            "column {column} has no vector index; see CREATE INDEX ... USING HNSW"
         )));
     }
-    let handle = ctx
-        .index_worker
-        .ok_or_else(|| DbError::SqlPlan("NEAR requires a live index worker".into()))?;
-
-    // Over-fetch: candidates get re-filtered by the full predicate below
-    // (MVCC visibility, RLS, any AND'd WHERE terms), so asking the index for
-    // more than `k` raw nearest neighbors compensates for some being
-    // filtered out. `4x k` or `k+20`, whichever is larger — a tunable
-    // constant, not a locked decision.
-    let over_fetch = (k.saturating_mul(4)).max(k + 20);
-    let candidate_ids: Vec<RowId> = {
-        let guard = handle.indexes.read().unwrap();
-        match guard.get(&(table_def.name.clone(), column.to_string())) {
-            // Not yet built (e.g. CREATE INDEX just enqueued its backfill,
-            // worker hasn't processed the first message yet) — zero
-            // candidates so far, not an error; see IndexStatus::Building.
-            None => Vec::new(),
-            Some(entry) => {
-                // The async worker holds only the vector (Hnsw) index since
-                // Phase 3; every other kind is durable/on-disk.
-                let SecondaryIndex::Vector(v) = &entry.index;
-                v.search(query, over_fetch)
-                    .into_iter()
-                    .map(|(id, _)| id)
-                    .collect()
-            }
-        }
+    // P3.c: the durable on-disk IVF-Flat index, reconstructed from the column's
+    // stable meta page id — no rebuild, no `Ready` status to wait on (the index
+    // is always crash-consistent with committed data). A column flagged but never
+    // built (no `index_root`) has zero candidates, not an error.
+    let Some(meta_page) = col.index_root else {
+        return Ok(ExecResult::Rows(Vec::new()));
     };
+
+    // Probe the nearest cells' posting lists for candidate RowIds. Candidates are
+    // then re-checked against the full predicate below (MVCC visibility, RLS, any
+    // AND'd WHERE terms) and exact-re-ranked from the heap's stored vectors, so
+    // the over-fetch-then-filter contract is identical to a full scan's per-row
+    // check (see `eval_expr`'s `Expr::Near` arm for the other half).
+    let ivf = DiskIvfIndex::open(meta_page, ctx.page_size);
+    let (metric, candidate_ids) = ivf.candidates(query, None, ctx.pool)?;
 
     let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
-    let mut out = Vec::new();
+    let mut scored: Vec<(f32, Vec<Literal>)> = Vec::new();
     for row_id in candidate_ids {
         let bytes = match heap.get(row_id, &snapshot, ctx.xid, ctx.pool) {
             Ok(b) => b,
-            // Not visible to this snapshot (superseded, or never committed
-            // — e.g. an aborted insert the worker indexed before the
+            // Not visible to this snapshot (superseded, or never committed —
+            // e.g. an aborted insert whose durable index entry survives the
             // abort). Filtered out here, not an index-maintenance bug.
             Err(DbError::NoVisibleVersion { .. }) => continue,
             Err(e) => return Err(e),
         };
         let row = decode_row(&bytes, &table_def.columns)?;
-        if predicate_matches(predicate, &table_def.columns, &row)? {
-            out.push(project_row(projection, &table_def.columns, &row)?);
+        if !predicate_matches(predicate, &table_def.columns, &row)? {
+            continue;
+        }
+        // Exact re-rank distance from the heap's stored vector (IVF-Flat has no
+        // quantization error).
+        let dist = match &row[col_idx] {
+            Literal::Vector(v) => ivf_exact_distance(metric, query, v),
+            _ => continue,
+        };
+        scored.push((dist, project_row(projection, &table_def.columns, &row)?));
+    }
+    scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(k);
+    Ok(ExecResult::Rows(
+        scored.into_iter().map(|(_, r)| r).collect(),
+    ))
+}
+
+/// Exact distance for NEAR re-ranking, matching the index's `Metric` (must agree
+/// with `disk_vector`'s internal distance so the re-rank is consistent with cell
+/// assignment).
+fn ivf_exact_distance(metric: crate::vector::Metric, a: &[f32], b: &[f32]) -> f32 {
+    use crate::vector::Metric;
+    match metric {
+        Metric::Euclidean => a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| (x - y) * (x - y))
+            .sum::<f32>()
+            .sqrt(),
+        Metric::Cosine => {
+            let mut dot = 0.0f32;
+            let mut na = 0.0f32;
+            let mut nb = 0.0f32;
+            for (x, y) in a.iter().zip(b) {
+                dot += x * y;
+                na += x * x;
+                nb += y * y;
+            }
+            if na == 0.0 || nb == 0.0 {
+                return 1.0;
+            }
+            1.0 - dot / (na.sqrt() * nb.sqrt())
         }
     }
-    out.truncate(k);
-    Ok(ExecResult::Rows(out))
 }
 
 fn exec_update(
@@ -886,7 +871,6 @@ fn exec_update(
                 slot: new_row_id.slot,
             },
         )?;
-        send_index_upserts(&table_def, new_row_id, &coerced, ctx);
         apply_durable_index_writes(&table_def, new_row_id, &coerced, ctx)?;
         send_event_capture(&table_def, "update", &coerced, ctx)?;
         count += 1;
@@ -1231,13 +1215,12 @@ fn rescale_decimal(
 // through the same `eval_expr` predicate evaluator SELECT/WHERE use; DEFAULT
 // fill and NOT NULL are plain per-column value checks.
 //
-// UNIQUE deliberately does NOT consult the M6 B-Tree index, even when one
-// exists on the column: that index is maintained by the async background
-// worker, and `IndexStatus::Ready` only means "initial backfill drained,"
-// not "every write since is reflected" — the exact staleness that caused the
-// M7 CSR-traversal bug (see MEMORY.md). Trusting it for a *correctness*
-// check could miss a just-inserted duplicate (a stale/absent index entry is
-// a false "no conflict"). A synchronous heap scan is the only source that is
+// UNIQUE deliberately does NOT consult the B-Tree index, even when one exists on
+// the column. A secondary-index entry is only ever a *hint* re-validated against
+// MVCC downstream (it carries no visibility, and stale entries from aborted/
+// superseded versions persist until vacuum), so trusting it for a *correctness*
+// check could both miss a just-inserted duplicate and false-positive on a stale
+// entry. A synchronous heap scan under the caller's snapshot is the only source
 // guaranteed current for the writing transaction, so uniqueness is enforced
 // against the heap; the B-Tree index stays a read-side query accelerator only.
 
@@ -2032,7 +2015,6 @@ mod tests {
                 control: &mut self.control,
                 page_size: self.page_size,
                 xid,
-                index_worker: None,
                 next_event_seq: &mut self.next_event_seq,
             };
             execute(plan, &mut ctx)
@@ -3184,7 +3166,9 @@ mod tests {
     }
 
     #[test]
-    fn near_on_indexed_column_without_live_worker_is_rejected() {
+    fn near_on_durable_index_returns_nearest_no_worker() {
+        // P3.c: NEAR is served by the durable on-disk IVF-Flat index — no async
+        // worker anywhere. The Harness has none, yet NEAR works end-to-end.
         let dir = tempdir().unwrap();
         let mut h = Harness::new(dir.path());
         let xid = h.begin();
@@ -3192,13 +3176,23 @@ mod tests {
             .unwrap();
         h.exec_as(xid, "CREATE INDEX idx ON t USING HNSW (embedding)")
             .unwrap();
-        // Harness never supplies an index_worker (index_worker: None), so
-        // even though the column is now validly indexed, there's no live
-        // worker to query against.
-        let err = h
-            .exec_as(xid, "SELECT * FROM t WHERE NEAR(embedding, [0.0, 0.0], 3)")
-            .unwrap_err();
-        assert!(matches!(err, DbError::SqlPlan(_)));
+        h.exec_as(xid, "INSERT INTO t (id, embedding) VALUES (1, [0.0, 0.0])")
+            .unwrap();
+        h.exec_as(xid, "INSERT INTO t (id, embedding) VALUES (2, [9.0, 9.0])")
+            .unwrap();
+        h.exec_as(xid, "INSERT INTO t (id, embedding) VALUES (3, [0.2, 0.2])")
+            .unwrap();
+        let res = h
+            .exec_as(xid, "SELECT id FROM t WHERE NEAR(embedding, [0.0, 0.0], 2)")
+            .unwrap();
+        match res {
+            ExecResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0][0], Literal::Int(1));
+                assert_eq!(rows[1][0], Literal::Int(3));
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
     }
 
     #[test]

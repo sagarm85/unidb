@@ -1,20 +1,14 @@
-// The single most important test in M2 (per the approved plan): the
-// background index worker has no concept of transactions — it indexes
-// whatever `IndexMsg::Upsert` the executor sends it the moment a row is
-// inserted, whether or not that row's transaction ever commits. This test
-// proves that fact never leaks into a correctness bug: `NEAR`'s
-// over-fetch-then-filter execution re-checks every index-sourced candidate
-// against MVCC visibility (`exec_select_near` in `sql/executor.rs`), so an
-// aborted insert must never surface in a `NEAR` result even if the worker
-// indexed it before the abort happened.
-//
-// Determinism note: rather than sleeping and hoping the worker has caught
-// up (a timing-dependent race the approved plan explicitly calls out to
-// avoid), this test polls the *inserting transaction's own* `NEAR` query
-// (visible to it via ordinary MVCC self-visibility of its own uncommitted
-// write) until the worker demonstrably has indexed the row, before
-// aborting. That turns "did the worker index it before the abort" from a
-// race into a confirmed precondition.
+// The single most important vector-index correctness test: the durable IVF
+// index (P3.c) has no concept of transactions — its posting-list entry is
+// WAL-logged the moment a row is inserted (redo-only, never undone), whether or
+// not that row's transaction ever commits. This test proves that fact never
+// leaks into a correctness bug: `NEAR`'s over-fetch-then-filter execution
+// re-checks every index-sourced candidate against MVCC visibility
+// (`exec_select_near` in `sql/executor.rs`), so an aborted insert must never
+// surface in a `NEAR` result even though its durable index entry survives the
+// abort. The insert indexes synchronously, so the inserting transaction sees its
+// own uncommitted row via NEAR immediately (MVCC self-visibility) before it
+// aborts — a confirmed precondition, not a timing race.
 
 use tempfile::tempdir;
 use unidb::sql::executor::ExecResult as SqlResult;
@@ -59,24 +53,17 @@ fn aborted_insert_never_surfaces_in_near_results() {
         )
         .unwrap();
 
-    // Poll the inserting transaction's own view (MVCC self-visibility of an
-    // uncommitted write) until the background worker has demonstrably
-    // indexed row 999 — a confirmed precondition, not a timing guess.
-    let start = std::time::Instant::now();
-    loop {
-        if near_result_ids(&mut engine, doomed_xid).contains(&999) {
-            break;
-        }
-        if start.elapsed() > std::time::Duration::from_secs(5) {
-            panic!("worker never indexed the doomed row within timeout");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
+    // The durable index is maintained synchronously, so the inserting
+    // transaction sees its own uncommitted row 999 via NEAR immediately (MVCC
+    // self-visibility) — a confirmed precondition that it was indexed.
+    assert!(
+        near_result_ids(&mut engine, doomed_xid).contains(&999),
+        "the doomed row should be self-visible via NEAR before abort"
+    );
 
-    // Now abort instead of commit. The row is undone in the heap (M1's
-    // abort self-stamps xmax), but the background worker's `VectorIndex`
-    // has no concept of transactions — its stale entry for row 999 is not
-    // retracted (a known, documented tech-debt item; see MEMORY.md).
+    // Now abort instead of commit. The row is undone in the heap (M1's abort
+    // self-stamps xmax), but the durable IVF entry for row 999 is redo-only and
+    // is NOT retracted by the abort — exactly the stale hint NEAR must filter.
     engine.abort(doomed_xid).unwrap();
 
     // A fresh transaction sees only committed data. If `exec_select_near`

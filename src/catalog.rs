@@ -87,19 +87,36 @@ pub enum ColumnType {
 /// overhead on tables that never query it (M2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IndexKind {
-    /// Only valid on `ColumnType::Vector(_)`.
+    /// Vector similarity index, valid on `ColumnType::Vector(_)`. **Since P3.c
+    /// (production) this denotes the durable on-disk IVF-Flat index**
+    /// (`src/disk_vector.rs`) — the in-RAM HNSW graph and its async rebuild
+    /// worker were retired. `CREATE INDEX ... USING HNSW`/`USING IVF` both build
+    /// it; the `Hnsw` name is kept for on-disk catalog and SQL compatibility.
     Hnsw,
     /// Only valid on `ColumnType::Text`.
     FullText,
     /// Valid on `Int64`/`Text`/`Bool` — anything `Ord` (M6). Accelerates
     /// equality/range `WHERE` predicates; see `sql/executor.rs::exec_select`.
     BTree,
-    /// Engine-managed only (M7) — never set via `ColumnDef.index`/`CREATE
-    /// INDEX`; there is no SQL keyword for it. Exists purely so the CSR
-    /// graph adjacency index (`src/csr_index.rs`) can reuse `index_worker
-    /// .rs`'s generic `(table, column)`-keyed machinery for `__edges__`'s
-    /// `from_id` the same way a real column index would.
+    /// Engine-managed only (M7), retired in P3.b — never set via
+    /// `ColumnDef.index`/`CREATE INDEX`; there is no SQL keyword for it. Kept as
+    /// a catalog-format variant so pre-P3.b blobs still deserialize; adjacency is
+    /// now served by the durable edge `BTree`, not the CSR index.
     Csr,
+}
+
+/// Build status of a secondary index, surfaced by the REST server's
+/// `GET /indexes/:table/:column/status`. **Since P3.c every secondary index is
+/// durable and built synchronously** (B-Tree/full-text/edge as `DiskBTree`,
+/// vector as the on-disk IVF-Flat index), so a live index is always `Ready` the
+/// moment `CREATE INDEX` returns — there is no async backfill window anymore.
+/// The `Building` variant is retained for wire/format compatibility but is no
+/// longer produced. (Historically this lived in the now-removed async
+/// `index_worker` module.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum IndexStatus {
+    Building { rows_done: u64 },
+    Ready,
 }
 
 /// A foreign-key reference recorded on a column (`REFERENCES table(column)`)

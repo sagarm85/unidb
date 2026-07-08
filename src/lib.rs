@@ -44,15 +44,15 @@ pub mod checkpoint;
 pub mod concurrency_hooks;
 pub mod control;
 pub mod csr_index;
-/// P3.c spike — on-disk IVF-Flat vector index (recall validation, not yet wired
-/// into the Engine). See the module doc and `docs/design/p3c_vector_spike.md`.
+/// P3.c — durable on-disk IVF-Flat vector index (production). Wired into
+/// `CREATE INDEX ... USING HNSW|IVF` and `NEAR`. See the module doc and
+/// `docs/design/p3c_vector_spike.md`.
 pub mod disk_vector;
 pub mod error;
 pub mod format;
 pub mod fulltext;
 pub mod graph;
 pub mod heap;
-pub mod index_worker;
 /// P3.d — chunked, streamed, out-of-line large-object storage.
 pub mod large_object;
 pub mod lockmgr;
@@ -76,8 +76,9 @@ use std::time::{Duration, Instant};
 use crate::{
     btree_index::{DiskBTree, OrderedValue},
     bufferpool::BufferPool,
-    catalog::{Catalog, CatalogCtx, ColumnDef, IndexKind, TableDef},
+    catalog::{Catalog, CatalogCtx, IndexKind, IndexStatus, TableDef},
     control::ControlData,
+    disk_vector::DiskIvfIndex,
     error::Result,
     format::{PageId, Xid, DEFAULT_PAGE_SIZE},
     graph::{
@@ -87,7 +88,6 @@ use crate::{
         parser::parse_cypher,
     },
     heap::Heap,
-    index_worker::{IndexHandle, IndexMsg},
     large_object::LobStore,
     lockmgr::LockManager,
     queue::{CONSUMERS_TABLE, EVENTS_TABLE},
@@ -204,7 +204,6 @@ pub struct Engine {
     catalog: Arc<RwLock<Catalog>>,
     control_path: PathBuf,
     _wal_path: PathBuf,
-    index_worker: IndexHandle,
     /// Meta page id of the durable edge-adjacency index (P3.b) — a `DiskBTree`
     /// over `__edges__.from_id`. Cached here so `create_edge`/`delete_edge`/
     /// `edges_from`/Cypher reconstruct the tree without a catalog lookup on
@@ -239,12 +238,6 @@ const _: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<Engine>();
 };
-
-impl Drop for Engine {
-    fn drop(&mut self) {
-        self.index_worker.shutdown();
-    }
-}
 
 /// Read/write-lock a shared catalog, recovering from poisoning rather than
 /// panicking (a poisoned catalog means a prior panic-while-locked; proceeding
@@ -373,17 +366,11 @@ impl Engine {
             page_size_usize,
         )?;
 
-        let index_worker = IndexHandle::spawn();
-        rebuild_secondary_indexes(
-            &catalog,
-            &mut txn_mgr,
-            &mut pool,
-            &mut wal,
-            &mut lock_mgr,
-            page_size_usize,
-            &index_worker,
-        )?;
-
+        // Phase 3: every secondary index is durable and crash-recovered — the
+        // B-Tree/full-text/edge indexes as `DiskBTree`s (P3.a/P3.b), the vector
+        // index as an on-disk IVF-Flat (P3.c). `Engine::open` does ZERO index
+        // rebuilding: it reads each index straight from its stable meta page.
+        // This is the O(1)-open moat; the async rebuild worker is retired.
         tracing::info!(dir = %dir.display(), page_size = control.page_size, next_xid, "engine opened");
         Ok(Self {
             control,
@@ -395,7 +382,6 @@ impl Engine {
             catalog: Arc::new(RwLock::new(catalog)),
             control_path: ctrl_p,
             _wal_path: wal_p,
-            index_worker,
             edge_index_meta,
             lob_index_meta,
             next_lob_id,
@@ -432,7 +418,6 @@ impl Engine {
                 control: &mut self.control,
                 page_size,
                 xid,
-                index_worker: Some(&self.index_worker),
                 next_event_seq: &mut self.next_event_seq,
             };
             match executor::execute(plan, &mut ctx) {
@@ -531,7 +516,6 @@ impl Engine {
                 control: &mut self.control,
                 page_size,
                 xid,
-                index_worker: Some(&self.index_worker),
                 next_event_seq: &mut self.next_event_seq,
             };
             match executor::execute(plan, &mut ctx) {
@@ -565,7 +549,6 @@ impl Engine {
             control: &mut self.control,
             page_size,
             xid,
-            index_worker: Some(&self.index_worker),
             next_event_seq: &mut self.next_event_seq,
         };
         let result = graph_executor::execute(parsed, &mut ctx, self.edge_index_meta)?;
@@ -608,11 +591,16 @@ impl Engine {
         cat_write(&self.catalog).set_column_index(table, column, kind, &mut ctx)
     }
 
-    /// Current build status of a secondary index, or `None` if no index has
-    /// ever been built for `(table, column)` (never indexed, or not yet
-    /// reached by the worker).
-    pub fn index_status(&self, table: &str, column: &str) -> Option<index_worker::IndexStatus> {
-        self.index_worker.status(table, column)
+    /// Build status of a secondary index, or `None` if the column has no index.
+    /// Since P3.c every index is durable and built synchronously as part of
+    /// `CREATE INDEX`, so a present index is always [`IndexStatus::Ready`] — the
+    /// async backfill window (and the `Building` state) no longer exist. Computed
+    /// straight from the catalog; kept for the REST `GET /indexes/.../status`.
+    pub fn index_status(&self, table: &str, column: &str) -> Option<IndexStatus> {
+        let catalog = cat_read(&self.catalog);
+        let table_def = catalog.lookup(table).ok()?;
+        let col = table_def.columns.iter().find(|c| c.name == column)?;
+        col.index.map(|_| IndexStatus::Ready)
     }
 
     // ── M4.a: event capture opt-in ──────────────────────────────────────────
@@ -1409,15 +1397,16 @@ impl Engine {
                 continue;
             }
 
-            // P3.a/P3.b: gather each reclaimable version's durable-index key(s)
-            // *before* marking it DEAD — the tuple body is only readable while
-            // the slot is still LIVE. These `(meta_page, key, rid)` triples are
-            // scrubbed from the on-disk B+trees in the aliasing gate below. Both
-            // durable kinds are covered: BTree (one key, the value) and FullText
-            // (one key per token). The durable edge index (P3.b) is scrubbed the
-            // same way — `__edges__.from_id`'s `index_root` is a BTree over
-            // `from_id`, so it falls out of this same loop.
+            // P3.a/P3.b/P3.c: gather each reclaimable version's durable-index
+            // key(s) *before* marking it DEAD — the tuple body is only readable
+            // while the slot is still LIVE. These are scrubbed from the on-disk
+            // structures in the aliasing gate below. BTree (one key, the value),
+            // FullText (one key per token), and the durable edge index all become
+            // `(meta_page, key, rid)` triples over a `DiskBTree`; the vector
+            // (Hnsw/IVF) index instead records `(meta_page, vector, rid)` so the
+            // IVF can re-derive the cell from the vector.
             let mut durable_removals: Vec<(PageId, OrderedValue, RowId)> = Vec::new();
+            let mut ivf_removals: Vec<(PageId, Vec<f32>, RowId)> = Vec::new();
             let has_durable = table
                 .columns
                 .iter()
@@ -1449,6 +1438,11 @@ impl Engine {
                                     }
                                 }
                             }
+                            Some(IndexKind::Hnsw) => {
+                                if let Literal::Vector(v) = &row[i] {
+                                    ivf_removals.push((root, v.clone(), *rid));
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -1462,14 +1456,17 @@ impl Engine {
 
             // (c) The aliasing gate: scrub the reclaimed RowIds from every
             // secondary index BEFORE their slots can be reused. Skipped only
-            // when a test deliberately reproduces the hazard.
+            // when a test deliberately reproduces the hazard. All indexes are
+            // durable now (synchronous, WAL-logged), so a reused slot can't
+            // surface a stale candidate.
             if clean_indexes {
-                self.index_worker.remove_rows(&table.name, &reclaimable);
-                // P3.a/P3.b: scrub the durable on-disk B+trees too (synchronous,
-                // WAL-logged), so a reused slot can't surface a stale candidate.
                 for (root, value, rid) in &durable_removals {
                     let tree = DiskBTree::new(*root, page_size);
                     tree.remove(value, *rid, &mut self.pool, &mut self.wal)?;
+                }
+                for (root, vector, rid) in &ivf_removals {
+                    let ivf = DiskIvfIndex::open(*root, page_size);
+                    ivf.remove(*rid, vector, &mut self.pool, &mut self.wal)?;
                 }
             }
 
@@ -1656,67 +1653,6 @@ fn derive_next_event_seq(
     }
     txn_mgr.commit(xid, wal, lock_mgr)?;
     Ok(max_seq + 1)
-}
-
-/// Scan every table's currently-committed rows for any column carrying an
-/// `IndexKind` (`Hnsw` or `FullText`) and enqueue them to the
-/// (already-spawned) background worker, so a fresh `Engine::open` ends up
-/// with rebuilt indexes rather than empty ones. Runs entirely on the
-/// foreground thread against the engine's own `pool`/`heap`/`catalog` — the
-/// worker thread itself never gets a `BufferPool` handle (see
-/// `index_worker.rs`'s module doc). Uses an ordinary begin/scan/commit
-/// read-only transaction, exactly like a `SELECT`, to get MVCC-correct
-/// visibility of committed rows. Shares `executor::build_indexed_columns`
-/// with `exec_create_index`'s own backfill rather than duplicating the
-/// column-type-to-`IndexedColumn` mapping.
-fn rebuild_secondary_indexes(
-    catalog: &Catalog,
-    txn_mgr: &mut TransactionManager,
-    pool: &mut BufferPool,
-    wal: &mut Wal,
-    lock_mgr: &mut LockManager,
-    page_size: usize,
-    handle: &IndexHandle,
-) -> Result<()> {
-    for table in catalog.tables() {
-        // Phase 3: BTree (P3.a) and FullText (P3.b) indexes are durable (paged,
-        // WAL-logged, crash-recovered) and the edge index is durable too — none
-        // are rebuilt on open. Only the still-in-memory vector (Hnsw) index is
-        // reconstructed here; P3.c will make it durable and retire this worker.
-        let indexed_cols: Vec<&ColumnDef> = table
-            .columns
-            .iter()
-            .filter(|c| matches!(c.index, Some(IndexKind::Hnsw)))
-            .collect();
-        if indexed_cols.is_empty() {
-            continue;
-        }
-
-        let heap = Heap::from_pages(page_size, table.pages.clone());
-        let xid = txn_mgr.begin(IsolationLevel::ReadCommitted, wal)?;
-        let snapshot = txn_mgr.snapshot_for_statement(xid)?;
-        for (row_id, bytes) in heap.scan(&snapshot, xid, pool)? {
-            let row = executor::decode_row(&bytes, &table.columns)?;
-            let cols = executor::build_indexed_columns(table, &indexed_cols, &row);
-            if !cols.is_empty() {
-                handle.send(IndexMsg::Upsert {
-                    table: table.name.clone(),
-                    record: row_id,
-                    indexed_cols: cols,
-                });
-            }
-        }
-        txn_mgr.commit(xid, wal, lock_mgr)?;
-
-        for col in &indexed_cols {
-            handle.send(IndexMsg::MarkReady {
-                table: table.name.clone(),
-                column: col.name.clone(),
-                kind: col.index.expect("indexed_cols is filtered to Some(_)"),
-            });
-        }
-    }
-    Ok(())
 }
 
 /// Initialize a `tracing_subscriber` with `RUST_LOG` env filter.
@@ -2284,31 +2220,26 @@ mod tests {
         assert!(matches!(err, DbError::SqlPlan(_)));
     }
 
-    // ── M2.b: background index worker ───────────────────────────────────────
+    // ── P3.c: durable vector index (IVF-Flat) ───────────────────────────────
 
-    fn wait_for_status(
-        engine: &Engine,
-        table: &str,
-        column: &str,
-        want: index_worker::IndexStatus,
-    ) {
-        let start = std::time::Instant::now();
-        loop {
-            if engine.index_status(table, column) == Some(want) {
-                return;
-            }
-            if start.elapsed() > std::time::Duration::from_secs(2) {
-                panic!(
-                    "index status for {table}.{column} never reached {want:?}, last seen {:?}",
-                    engine.index_status(table, column)
-                );
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+    /// Collect the integer `id`s a NEAR query returns, in order.
+    fn near_ids(engine: &mut Engine, xid: Xid, sql: &str) -> Vec<i64> {
+        match &engine.execute_sql(xid, sql).unwrap()[0] {
+            SqlResult::Rows(rows) => rows
+                .iter()
+                .map(|r| match r[0] {
+                    crate::sql::logical::Literal::Int(n) => n,
+                    ref other => panic!("expected Int id, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected Rows, got {other:?}"),
         }
     }
 
     #[test]
-    fn live_insert_into_indexed_column_enqueues_upsert() {
+    fn live_insert_into_durable_vector_index_is_queryable() {
+        // A row inserted after CREATE INDEX is maintained synchronously in the
+        // durable IVF index (no async worker) and immediately queryable by NEAR.
         let dir = tempdir().unwrap();
         let mut engine = Engine::open(dir.path(), 0).unwrap();
 
@@ -2317,30 +2248,27 @@ mod tests {
             .execute_sql(xid, "CREATE TABLE t (id INT, embedding VECTOR(2))")
             .unwrap();
         engine
-            .set_column_index("t", "embedding", Some(crate::catalog::IndexKind::Hnsw))
+            .execute_sql(xid, "CREATE INDEX idx ON t USING HNSW (embedding)")
             .unwrap();
         engine
             .execute_sql(xid, "INSERT INTO t (id, embedding) VALUES (1, [0.1, 0.2])")
             .unwrap();
         engine.commit(xid).unwrap();
 
-        wait_for_status(
-            &engine,
-            "t",
-            "embedding",
-            index_worker::IndexStatus::Building { rows_done: 1 },
+        let xid2 = engine.begin().unwrap();
+        let ids = near_ids(
+            &mut engine,
+            xid2,
+            "SELECT id FROM t WHERE NEAR(embedding, [0.1, 0.2], 1)",
         );
-
-        let guard = engine.index_worker.indexes.read().unwrap();
-        let entry = guard
-            .get(&("t".to_string(), "embedding".to_string()))
-            .unwrap();
-        let index_worker::SecondaryIndex::Vector(v) = &entry.index;
-        assert_eq!(v.len(), 1);
+        assert_eq!(ids, vec![1]);
     }
 
     #[test]
-    fn reopen_rebuilds_index_from_committed_rows() {
+    fn vector_index_is_durable_no_rebuild_on_reopen() {
+        // P3.c moat: the vector index is durable, so a fresh open reconstructs
+        // nothing from the heap — it reads the IVF meta/centroid pages straight
+        // from disk — and NEAR still returns the right nearest neighbor.
         let dir = tempdir().unwrap();
         {
             let mut engine = Engine::open(dir.path(), 0).unwrap();
@@ -2349,37 +2277,57 @@ mod tests {
                 .execute_sql(xid, "CREATE TABLE t (id INT, embedding VECTOR(2))")
                 .unwrap();
             engine
+                .execute_sql(xid, "CREATE INDEX idx ON t USING HNSW (embedding)")
+                .unwrap();
+            engine
                 .execute_sql(xid, "INSERT INTO t (id, embedding) VALUES (1, [1.0, 1.0])")
                 .unwrap();
             engine
-                .execute_sql(xid, "INSERT INTO t (id, embedding) VALUES (2, [2.0, 2.0])")
+                .execute_sql(
+                    xid,
+                    "INSERT INTO t (id, embedding) VALUES (2, [50.0, 50.0])",
+                )
                 .unwrap();
             engine.commit(xid).unwrap();
-            // Index attached *after* the rows were committed with no live
-            // worker watching — proves rebuild-on-open, not live upsert,
-            // is what populates the index this time.
-            engine
-                .set_column_index("t", "embedding", Some(crate::catalog::IndexKind::Hnsw))
-                .unwrap();
             engine.flush().unwrap();
         }
 
-        let engine2 = Engine::open(dir.path(), 0).unwrap();
-        wait_for_status(&engine2, "t", "embedding", index_worker::IndexStatus::Ready);
-
-        let guard = engine2.index_worker.indexes.read().unwrap();
-        let entry = guard
-            .get(&("t".to_string(), "embedding".to_string()))
-            .unwrap();
-        let index_worker::SecondaryIndex::Vector(v) = &entry.index;
-        assert_eq!(v.len(), 2);
+        let mut engine2 = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine2.begin().unwrap();
+        let ids = near_ids(
+            &mut engine2,
+            xid,
+            "SELECT id FROM t WHERE NEAR(embedding, [0.0, 0.0], 1)",
+        );
+        assert_eq!(ids, vec![1]);
     }
 
     #[test]
-    fn engine_drop_shuts_down_worker_without_hanging() {
+    fn engine_drop_returns_promptly() {
+        // The async worker is retired; Drop is trivial. This just guards against
+        // a future field re-introducing a blocking teardown.
         let dir = tempdir().unwrap();
         let engine = Engine::open(dir.path(), 0).unwrap();
-        drop(engine); // must return promptly, not hang on the worker thread
+        drop(engine);
+    }
+
+    #[test]
+    fn index_status_is_ready_for_durable_index() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, embedding VECTOR(2))")
+            .unwrap();
+        assert_eq!(engine.index_status("t", "embedding"), None);
+        engine
+            .execute_sql(xid, "CREATE INDEX idx ON t USING HNSW (embedding)")
+            .unwrap();
+        engine.commit(xid).unwrap();
+        assert_eq!(
+            engine.index_status("t", "embedding"),
+            Some(IndexStatus::Ready)
+        );
     }
 
     // ── M2.c: CREATE INDEX (full-text) ──────────────────────────────────────
@@ -2478,9 +2426,6 @@ mod tests {
             .execute_sql(xid, "INSERT INTO t (id, embedding) VALUES (3, [0.1, 0.1])")
             .unwrap();
         engine.commit(xid).unwrap();
-
-        wait_for_status(&engine, "t", "embedding", index_worker::IndexStatus::Ready);
-
         let xid2 = engine.begin().unwrap();
         let results = engine
             .execute_sql(
@@ -2526,9 +2471,6 @@ mod tests {
             )
             .unwrap();
         engine.commit(xid).unwrap();
-
-        wait_for_status(&engine, "t", "embedding", index_worker::IndexStatus::Ready);
-
         let xid2 = engine.begin().unwrap();
         let results = engine
             .execute_sql(
