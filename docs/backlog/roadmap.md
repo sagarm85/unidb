@@ -135,6 +135,9 @@ git worktree add -b sql-types      ../unidb-types  main   # SQL   — Phase 2
 # git worktree add -b ops-tls      ../unidb-ops    main
 ```
 
+The Core lane's full blueprint is [`phase1_acid_hardening.md`](phase1_acid_hardening.md)
+(all five P1 checkpoints, crash-injection points, and locked-decision impact).
+
 **First checkpoint per lane:**
 - **Core / `acid-hardening` → P1.a Full-page-writes** — log the whole page image
   into the WAL on first modification after a checkpoint; recovery uses it as the
