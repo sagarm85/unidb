@@ -5,7 +5,7 @@
 //!
 //! **The core architectural decision: async HTTP handlers never touch
 //! `Engine` directly.** One dedicated OS thread ([`engine_handle::spawn`])
-//! owns the `Engine` for its entire life, exactly as `index_worker.rs`'s
+//! owns the `Engine` for its entire life, the same single-owner-thread shape the (now retired) async index worker used
 //! background thread owns its secondary-index structures. Handlers send an
 //! [`engine_handle::EngineRequest`] over an `mpsc` channel and `.await` a
 //! per-request `oneshot` reply. This was chosen over a shared

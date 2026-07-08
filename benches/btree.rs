@@ -10,7 +10,7 @@
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use tempfile::tempdir;
-use unidb::index_worker::IndexStatus;
+use unidb::catalog::IndexStatus;
 use unidb::Engine;
 
 /// Set up one table with `n` rows and (optionally) a BTree index on `id`,

@@ -33,6 +33,11 @@
 //   P16 – large object (P3.d): a committed out-of-line chunked blob + its
 //         `__lobs__` index survive a crash (no checkpoint) and stream back
 //         intact on reopen
+//   P17 – durable vector index (P3.c): a committed `CREATE INDEX ... USING HNSW`
+//         (durable on-disk IVF-Flat) + its inserted vectors survive a crash (no
+//         checkpoint), and after reopen `NEAR` returns the correct nearest
+//         neighbor with recall intact — the index is read from its WAL-recovered
+//         meta/centroid/posting pages, never rebuilt on open
 
 use tempfile::tempdir;
 use unidb::{Engine, RowId};
@@ -997,5 +1002,101 @@ fn p13_durable_btree_recovered_from_wal_after_total_data_loss() {
             }],
             "P13: key {i} must survive total data loss via WAL recovery"
         );
+    }
+}
+
+// ── P17: durable vector index survives a crash (P3.c) ────────────────────────
+//
+// The vector index is a durable on-disk IVF-Flat (P3.c): its centroid/meta pages
+// and cell posting lists are all WAL-logged (`WAL_INDEX`), so a committed
+// `CREATE INDEX ... USING HNSW` plus its inserted vectors survive a crash with no
+// checkpoint, and after reopen `NEAR` reads the WAL-recovered index — never
+// rebuilding from a heap rescan. This checks recall is intact: for a clustered
+// corpus, the exact nearest neighbor (and the exact top-k) come back for every
+// probe, matching the brute-force ground truth.
+#[test]
+fn p17_durable_vector_index_survives_crash_recall_intact() {
+    let dir = tempdir().unwrap();
+    let n = 120i64;
+    // Deterministic corpus in 2D: point i = (i, i). The index is built *after*
+    // the rows exist, so training produces a real multi-cell partition
+    // (nlist ≈ √120) — this exercises crash recovery of the persisted centroid
+    // table + multiple cell posting lists, not just a single origin cell.
+    {
+        let mut engine = open(dir.path());
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, embedding VECTOR(2))")
+            .unwrap();
+        for i in 0..n {
+            engine
+                .execute_sql(
+                    xid,
+                    &format!("INSERT INTO t (id, embedding) VALUES ({i}, [{i}.0, {i}.0])"),
+                )
+                .unwrap();
+        }
+        engine.commit(xid).unwrap();
+        let xid2 = engine.begin().unwrap();
+        engine
+            .execute_sql(xid2, "CREATE INDEX idx ON t USING HNSW (embedding)")
+            .unwrap();
+        engine.commit(xid2).unwrap();
+        // "Crash": drop without a checkpoint. Every mini-txn (heap + IVF index)
+        // was WAL-fsynced; no page flush is forced.
+        drop(engine);
+    }
+
+    // Reopen: the durable IVF index is read from its recovered meta/centroid/
+    // posting pages — no heap rescan, no rebuild.
+    let mut engine = open(dir.path());
+    let near_one = |engine: &mut Engine, q: i64| -> i64 {
+        let xid = engine.begin().unwrap();
+        let sql = format!("SELECT id FROM t WHERE NEAR(embedding, [{q}.0, {q}.0], 1)");
+        let res = engine.execute_sql(xid, &sql).unwrap();
+        engine.commit(xid).unwrap();
+        match &res[0] {
+            unidb::sql::executor::ExecResult::Rows(rows) => match rows[0][0] {
+                unidb::sql::logical::Literal::Int(v) => v,
+                ref other => panic!("expected Int, got {other:?}"),
+            },
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    };
+    // recall@1 = 1.0: the exact nearest (brute force = the query's own id) is
+    // returned for every probe across the corpus.
+    for q in [0i64, 1, 17, 60, 99, 119] {
+        assert_eq!(
+            near_one(&mut engine, q),
+            q,
+            "P17: NEAR must return the exact nearest neighbor after crash recovery"
+        );
+    }
+
+    // Exact top-k also intact: the 5 nearest to point 50 are 48..=52.
+    let xid = engine.begin().unwrap();
+    let res = engine
+        .execute_sql(
+            xid,
+            "SELECT id FROM t WHERE NEAR(embedding, [50.0, 50.0], 5)",
+        )
+        .unwrap();
+    match &res[0] {
+        unidb::sql::executor::ExecResult::Rows(rows) => {
+            let mut ids: Vec<i64> = rows
+                .iter()
+                .map(|r| match r[0] {
+                    unidb::sql::logical::Literal::Int(v) => v,
+                    ref other => panic!("expected Int, got {other:?}"),
+                })
+                .collect();
+            ids.sort();
+            assert_eq!(
+                ids,
+                vec![48, 49, 50, 51, 52],
+                "P17: exact top-5 recall must survive the crash"
+            );
+        }
+        other => panic!("expected Rows, got {other:?}"),
     }
 }

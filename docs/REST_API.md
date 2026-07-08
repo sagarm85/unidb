@@ -306,14 +306,13 @@ to drop an existing index on that column.
 
 ### `GET /indexes/{table}/{column}/status`
 
-Poll index build progress. HNSW/full-text indexes build asynchronously in
-a background worker — a row write is never blocked on index completion.
+Report a column's index status. Since Phase 3 (P3.c) **every** secondary index is
+durable and built synchronously as part of `CREATE INDEX` (B-Tree/full-text/edge
+as on-disk `DiskBTree`s, the vector index as an on-disk IVF-Flat), so a present
+index is always `"Ready"` — there is no async backfill window. The `Building`
+variant is retained for wire compatibility but is no longer produced.
 
-**Response** `200 OK`:
-```json
-{ "status": { "Building": { "rows_done": 4200 } } }
-```
-or
+**Response** `200 OK`, if an index exists on that column:
 ```json
 { "status": "Ready" }
 ```

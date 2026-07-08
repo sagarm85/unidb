@@ -8,7 +8,7 @@
 //! itself never runs inside a tokio runtime — it loops on
 //! `Receiver::blocking_recv()`, calling straight into `Engine`'s ordinary
 //! synchronous API and replying on each request's oneshot sender. This
-//! mirrors `index_worker.rs`'s spawn/channel/bounded-shutdown shape
+//! mirrors the writer-thread spawn/channel/bounded-shutdown shape
 //! exactly, generalized from "one background thread owning secondary
 //! indexes" to "one background thread owning the whole `Engine`".
 //!
@@ -31,12 +31,11 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    catalog::IndexKind,
+    catalog::{IndexKind, IndexStatus},
     error::{DbError, Result},
     format::Xid,
     graph::edges::Edge,
     heap::RowId,
-    index_worker::IndexStatus,
     queue::Event,
     read_handle::ReadHandle,
     sql::executor::ExecResult,
@@ -160,9 +159,8 @@ pub enum EngineRequest {
     },
 
     /// No reply — the worker loop breaks out and the thread ends. Sent
-    /// explicitly by `shutdown()` rather than relying on dropping the
-    /// sender, mirroring `IndexMsg::Shutdown`'s precedent in
-    /// `index_worker.rs`.
+    /// explicitly by `shutdown()` rather than relying on dropping the sender,
+    /// so shutdown is deterministic rather than drop-order dependent.
     Shutdown,
 }
 
@@ -405,8 +403,7 @@ impl EngineHandle {
     }
 
     /// Send `Shutdown` and join the writer thread, bounded so a stuck
-    /// writer can never block server shutdown forever. Mirrors
-    /// `IndexHandle::shutdown` (`index_worker.rs`) line-for-line.
+    /// writer can never block server shutdown forever.
     pub fn shutdown(&mut self) {
         let _ = self.tx.send(EngineRequest::Shutdown);
         let Some(join) = self.join.take() else {

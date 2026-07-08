@@ -6,9 +6,9 @@
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use tempfile::tempdir;
+use unidb::catalog::IndexStatus;
 use unidb::fulltext::InvertedIndex;
 use unidb::heap::RowId;
-use unidb::index_worker::IndexStatus;
 use unidb::vector::VectorIndex;
 use unidb::Engine;
 
@@ -31,13 +31,11 @@ fn wait_ready(engine: &Engine, table: &str, column: &str) {
     }
 }
 
-/// INSERT throughput into a `VECTOR(128)` column, with vs without an active
-/// HNSW index — the point is to check CLAUDE.md's M2 claim that "row write
-/// is the only synchronous cost" actually holds (the index rebuild happens
-/// off-thread in the background worker, not on this INSERT's critical
-/// path). Modest row counts (`VectorIndex` rebuilds its whole graph per
-/// upsert — see MEMORY.md's M2.b design note — so this isn't testing HNSW
-/// build cost at scale, just foreground overhead).
+/// INSERT throughput into a `VECTOR(128)` column, with vs without a vector
+/// index — measures the synchronous per-INSERT cost of maintaining the durable
+/// IVF-Flat index (P3.c) inline (one posting-list `DiskBTree` insert per row),
+/// versus the no-index baseline. See `benches/vector_recall.rs` for the recall/
+/// latency sweep and the HNSW-baseline comparison.
 fn bench_vector_insert(c: &mut Criterion) {
     let mut group = c.benchmark_group("vector_insert");
     for rows in [50u64, 200] {

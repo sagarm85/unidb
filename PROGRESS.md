@@ -2296,6 +2296,11 @@ vector kind. All default-feature + server + workspace suites green; clippy
 
 ### P3.c — On-disk vector index (SPIKE)   [Core lane — Phase 3 — spike complete]   2026-07-08
 
+> **Superseded by the production entry below (2026-07-09):** the spike's
+> `DiskIvfIndex` is now the live vector index — durable centroids, `CREATE INDEX`/
+> `NEAR` wired, async worker retired, crash point P17. This spike record is kept
+> for the approach-selection rationale and the recall-validation numbers.
+
 **Branch:** `durable-storage`. The blueprint marks this **research-grade** and
 mandates a **spike that validates recall@k before committing** — so the P3.c
 deliverable is the spike + recommendation; the production wiring is a separate
@@ -2344,7 +2349,72 @@ P16; larger-corpus sweep. Recommendation + numbers: `docs/design/p3c_vector_spik
 bounded by nlist not corpus) + the DiskBTree duplicate regression. All suites
 green; clippy `-D warnings` + fmt clean.
 **Locked-decision impact:** none. No `FORMAT_VERSION` bump.
-**PR:** _pending (spike; production PR is the follow-up)._
+**PR:** _spike; superseded by the production entry below._
+
+---
+
+### P3.c (production) — Durable vector index live; async worker retired   [Core lane — Phase 3 — shipped]   2026-07-09
+
+**Branch:** `p3c-vector-production`. Promotes the P3.c spike's `DiskIvfIndex` into
+the live vector index, closing Phase 3: **`Engine::open` now does ZERO index
+rebuilding for every index type — the O(1)-open moat is real, and the async index
+worker is gone.**
+
+**What shipped:**
+- **Durable, crash-recovered centroids.** `DiskIvfIndex` is now a stateless handle
+  over a **stable meta page** (id in `ColumnDef.index_root`, exactly like
+  `DiskBTree`). The meta page records metric/dim/nlist/nprobe + the postings
+  tree's meta page + the head of a **WAL-logged centroid page chain**; every
+  operation reloads the bounded (`O(nlist·dim)`) centroid table from disk. All
+  pages use `PAGE_TYPE_BTREE` + `WAL_INDEX` full-page images, so they are
+  crash-recovered identically to `DiskBTree` nodes — **no new record kind, page
+  type, or `FORMAT_VERSION` bump.**
+- **`CREATE INDEX ... USING HNSW` (and a new `USING IVF` alias) → durable index.**
+  Trains centroids from the committed rows (`nlist ≈ √rows` capped at 256, a
+  recall-favoring `nprobe`), persists meta + centroids, inserts each row into its
+  cell. Empty-table create → one origin cell (correct-but-flat until re-created,
+  documented). `Hnsw` now *denotes* the durable IVF-Flat index (HNSW-the-graph
+  retired); the catalog/SQL keyword is unchanged for compatibility.
+- **`NEAR` routes through the durable index.** Probe the `nprobe` nearest cells'
+  posting lists → fetch candidate rows from the heap → **exact re-rank** by the
+  index metric → the same MVCC-visibility / RLS / AND'd-predicate re-check as
+  before (identical over-fetch-then-filter contract).
+- **Maintenance + vacuum.** `apply_durable_index_writes` inserts into the IVF on
+  every INSERT/UPDATE; vacuum's aliasing gate scrubs it via `DiskIvfIndex::remove`
+  before a reclaimed slot can be reused.
+- **Async worker retired.** `rebuild_secondary_indexes` deleted; `index_worker.rs`
+  removed; `IndexHandle`/`IndexMsg`/`SecondaryIndex`/`build_indexed_columns`/
+  `send_index_upserts` gone. `IndexStatus` moved to `catalog.rs`; a durable index
+  is always `Ready` (computed from the catalog — the REST `GET
+  /indexes/.../status` route is unchanged). `Engine` lost its worker field + Drop
+  shutdown.
+
+**Recall / latency (`benches/vector_recall.rs`, extended):**
+
+| corpus | index | recall@10 | q-latency | build | RAM |
+|---|---|---|---|---|---|
+| 1,200×32d | HNSW (retired baseline) | 1.000 | ~25 µs | 30,374 ms | O(corpus) |
+| 1,200×32d | IVF-Flat nprobe=4 | **1.000** | ~36 µs | ~34 ms | **4,096 B** |
+| 1,200×32d | IVF-Flat reopen-by-meta-page (no rebuild) | 1.000 | — | — | 4,096 B |
+| 20,000×64d | IVF-Flat nprobe=16 | **1.000** | ~400 µs | ~983 ms | **36,096 B** |
+
+IVF-Flat **matches HNSW's recall (1.000)** at bounded RAM, and a fresh handle over
+the same meta page answers identically — proving no rebuild on open.
+
+**Crash harness 18 → 19.** New point **P17**: build a durable vector index over a
+multi-cell corpus, "crash" without a checkpoint, reopen, and confirm NEAR returns
+the exact nearest neighbor and exact top-5 (recall intact) from the WAL-recovered
+meta/centroid/posting pages — never rebuilt.
+
+**Tests:** `disk_vector` module (create/insert/search, reopen-by-meta-page,
+empty-table flat-but-correct, remove); rewritten vector durability tests
+(`tests/index_rebuild.rs`, `lib.rs`); `tests/vector_mvcc.rs` (aborted insert never
+surfaces via NEAR — now synchronous); executor NEAR tests. `cargo test -p unidb`
+(319 unit + 19 crash + integration), `--features server`, and `--workspace` all
+green; clippy `-D warnings` + fmt clean.
+**Locked-decision impact:** none new (D1/D5/D9 already covered durable WAL-logged
+indexes in P3.a). No `FORMAT_VERSION` bump.
+**PR:** _this PR — Phase 3 complete._
 
 ---
 
