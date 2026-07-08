@@ -69,10 +69,10 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::{
     bufferpool::BufferPool,
-    catalog::{Catalog, CatalogCtx, ColumnDef, IndexKind},
+    catalog::{Catalog, CatalogCtx, ColumnDef, IndexKind, TableDef},
     control::ControlData,
     error::Result,
-    format::{Xid, DEFAULT_PAGE_SIZE},
+    format::{PageId, Xid, DEFAULT_PAGE_SIZE},
     graph::{
         edges::{self, Edge},
         executor as graph_executor,
@@ -99,6 +99,30 @@ pub use crate::sql::executor::ExecResult as SqlResult;
 pub use crate::txn::IsolationLevel as Isolation;
 
 const POOL_CAPACITY: usize = 256;
+
+/// The outcome of an [`Engine::vacuum`] pass (M10). Surfaces the numbers the
+/// milestone cares about — including whether a long-lived transaction/reader
+/// held the horizon back and blocked reclamation, so that footgun is visible
+/// rather than silently swallowed (same as Postgres surfacing `oldest_xmin`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VacuumReport {
+    /// The visibility horizon used (`OldestXmin`) — see
+    /// [`crate::txn::TransactionManager::vacuum_horizon`].
+    pub horizon: Xid,
+    /// LIVE tuple slots examined across every table's heap.
+    pub rows_scanned: usize,
+    /// Dead versions physically removed (line pointers marked DEAD then freed).
+    pub versions_reclaimed: usize,
+    /// Slots promoted DEAD→UNUSED (now reusable). Equals `versions_reclaimed`
+    /// in v1 (whole-page compaction promotes every reclaimed slot).
+    pub slots_freed: usize,
+    /// Tuple-body bytes reclaimed by intra-page compaction.
+    pub bytes_reclaimed: usize,
+    /// `true` if the horizon was held below `next_xid` by a live transaction
+    /// or concurrent reader — reclamation may have been more conservative than
+    /// a quiescent database would allow.
+    pub horizon_blocked: bool,
+}
 
 pub struct Engine {
     control: ControlData,
@@ -888,6 +912,130 @@ impl Engine {
     pub fn flush(&mut self) -> Result<()> {
         self.pool.flush_all(self.wal.durable_lsn)
     }
+
+    /// Reclaim physical space held by dead tuple versions (M10) — the explicit,
+    /// manually-triggered GC pass (there is no autovacuum in v1; this mirrors
+    /// `vacuum_events`'s explicit-call model). For every table it: (a) computes
+    /// the conservative visibility horizon over all live transactions **and**
+    /// concurrent readers; (b) marks reclaimable versions' line pointers DEAD
+    /// (redo-only `WAL_VACUUM`, D5); (c) scrubs every reclaimed `RowId` from
+    /// the secondary indexes **before** any slot becomes reusable (the aliasing
+    /// gate — see [`VacuumReport`] and MEMORY.md's M10.c note); then (d)
+    /// compacts each touched page, promoting DEAD→UNUSED so the freed space can
+    /// be handed to new tuples.
+    ///
+    /// Safe to call at any time — it only touches already-committed, dead-to-
+    /// everyone state — and crash-safe: a crash mid-vacuum leaves either the
+    /// pre- or post-mark state, never a lost committed row (its WAL records are
+    /// idempotent redo, no undo).
+    pub fn vacuum(&mut self) -> Result<VacuumReport> {
+        self.vacuum_inner(true)
+    }
+
+    /// Vacuum with an explicit choice of whether to run the secondary-index
+    /// clean pass (M10.c). `clean_indexes = true` is the only correct value for
+    /// production (`Engine::vacuum`); `false` exists solely to *reproduce* the
+    /// index-aliasing hazard in tests (skipping the gate lets a reused slot
+    /// alias a stale index entry — see `lib.rs`'s M10.c regression test).
+    fn vacuum_inner(&mut self, clean_indexes: bool) -> Result<VacuumReport> {
+        let horizon = self.txn_mgr.vacuum_horizon();
+        let page_size = self.control.page_size as usize;
+        let mut report = VacuumReport {
+            horizon,
+            horizon_blocked: horizon < self.txn_mgr.next_xid(),
+            ..Default::default()
+        };
+
+        // Every catalog table (user tables + the system __edges__/__events__/
+        // __consumers__ heaps). The raw byte-slice CRUD heap (`self.heap`,
+        // untracked in the catalog and never secondary-indexed) is vacuumed
+        // separately below.
+        let table_defs: Vec<TableDef> = cat_read(&self.catalog).tables().cloned().collect();
+        for table in &table_defs {
+            let mut heap = Heap::from_pages(page_size, table.pages.clone());
+            report.rows_scanned += count_live_slots(&heap, &self.pool)?;
+            let reclaimable = heap.collect_reclaimable(horizon, &self.pool)?;
+            if reclaimable.is_empty() {
+                continue;
+            }
+
+            // (b) Mark every reclaimable version DEAD (not yet reusable).
+            for rid in &reclaimable {
+                heap.mark_dead(*rid, &mut self.pool, &mut self.wal)?;
+            }
+
+            // (c) The aliasing gate: scrub the reclaimed RowIds from every
+            // secondary index BEFORE their slots can be reused. Skipped only
+            // when a test deliberately reproduces the hazard.
+            if clean_indexes {
+                if table.name == edges::EDGES_TABLE {
+                    for rid in &reclaimable {
+                        self.edge_index.remove_rowid(*rid);
+                    }
+                }
+                self.index_worker.remove_rows(&table.name, &reclaimable);
+            }
+
+            // (d) Compact each touched page: drop dead bodies, coalesce free
+            // space, promote DEAD→UNUSED.
+            for pid in unique_pages(&reclaimable) {
+                report.bytes_reclaimed += heap.compact_page(pid, &mut self.pool, &mut self.wal)?;
+            }
+            report.versions_reclaimed += reclaimable.len();
+            report.slots_freed += reclaimable.len();
+        }
+
+        // The raw-CRUD heap: no secondary indexes reference it, so no index
+        // gate is needed — pure physical reclamation.
+        report.rows_scanned += count_live_slots(&self.heap, &self.pool)?;
+        let raw_reclaimable = self.heap.collect_reclaimable(horizon, &self.pool)?;
+        if !raw_reclaimable.is_empty() {
+            for rid in &raw_reclaimable {
+                self.heap.mark_dead(*rid, &mut self.pool, &mut self.wal)?;
+            }
+            for pid in unique_pages(&raw_reclaimable) {
+                report.bytes_reclaimed +=
+                    self.heap.compact_page(pid, &mut self.pool, &mut self.wal)?;
+            }
+            report.versions_reclaimed += raw_reclaimable.len();
+            report.slots_freed += raw_reclaimable.len();
+        }
+
+        tracing::info!(
+            horizon,
+            versions_reclaimed = report.versions_reclaimed,
+            bytes_reclaimed = report.bytes_reclaimed,
+            horizon_blocked = report.horizon_blocked,
+            "vacuum complete"
+        );
+        Ok(report)
+    }
+}
+
+/// The distinct pages touched by a set of reclaimed `RowId`s, so each is
+/// compacted exactly once (M10.d).
+fn unique_pages(rows: &[RowId]) -> Vec<PageId> {
+    let mut seen = std::collections::HashSet::new();
+    rows.iter()
+        .map(|r| r.page_id)
+        .filter(|&p| seen.insert(p))
+        .collect()
+}
+
+/// Count LIVE slots across a heap's pages (for the vacuum report's
+/// `rows_scanned`), tolerating reclaimed (DEAD/UNUSED) slots.
+fn count_live_slots(heap: &Heap, pool: &BufferPool) -> Result<usize> {
+    let mut n = 0;
+    for &page_id in heap.page_ids() {
+        let page = pool.read_page(page_id)?;
+        let sc = page.slot_count_pub();
+        for slot in 0..sc {
+            if matches!(page.slot_state(slot), Ok(crate::page::SlotState::Live)) {
+                n += 1;
+            }
+        }
+    }
+    Ok(n)
 }
 
 /// Rebuild the edge-list index from `__edges__`'s currently-committed rows.
@@ -2397,5 +2545,168 @@ mod tests {
             ),
             other => panic!("expected Rows, got {other:?}"),
         }
+    }
+
+    // ── M10: heap vacuum / GC ────────────────────────────────────────────────
+
+    /// The M10 analogue of `graph_mvcc.rs`'s "single most important test":
+    /// reproduce the slot-reuse index-aliasing hazard with the index-clean
+    /// pass disabled (a wrong-but-visible row surfaces), then prove the real
+    /// `Engine::vacuum` (index-clean pass on) makes that wrong answer
+    /// impossible.
+    #[test]
+    fn vacuum_index_aliasing_hazard_reproduced_then_fixed() {
+        // (1) With the index-clean gate DISABLED, a reused slot aliases a
+        // stale EdgeIndex entry left by an aborted create_edge.
+        {
+            let dir = tempdir().unwrap();
+            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let t1 = engine.begin().unwrap();
+            let stale = engine.create_edge(t1, 100, 999, "T", "{}").unwrap();
+            engine.abort(t1).unwrap(); // row dead; EdgeIndex[100]->stale lingers
+
+            let report = engine.vacuum_inner(false).unwrap();
+            assert!(
+                report.versions_reclaimed >= 1,
+                "the dead edge must be reclaimed: {report:?}"
+            );
+
+            let t2 = engine.begin().unwrap();
+            let reused = engine.create_edge(t2, 200, 888, "T", "{}").unwrap();
+            engine.commit(t2).unwrap();
+            assert_eq!(reused, stale, "vacuum must have freed the slot for reuse");
+
+            let q = engine.begin().unwrap();
+            let wrong = engine.edges_from(q, 100).unwrap();
+            assert!(
+                !wrong.is_empty(),
+                "hazard must reproduce: stale index entry aliases the reused live edge"
+            );
+        }
+
+        // (2) The real Engine::vacuum scrubs the stale entry before the slot is
+        // reusable — the wrong answer can no longer occur.
+        {
+            let dir = tempdir().unwrap();
+            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let t1 = engine.begin().unwrap();
+            let stale = engine.create_edge(t1, 100, 999, "T", "{}").unwrap();
+            engine.abort(t1).unwrap();
+
+            engine.vacuum().unwrap();
+
+            let t2 = engine.begin().unwrap();
+            let reused = engine.create_edge(t2, 200, 888, "T", "{}").unwrap();
+            engine.commit(t2).unwrap();
+            assert_eq!(reused, stale, "slot is still reused");
+
+            let q = engine.begin().unwrap();
+            assert!(
+                engine.edges_from(q, 100).unwrap().is_empty(),
+                "index vacuum must scrub the stale entry"
+            );
+            assert_eq!(
+                engine.edges_from(q, 200).unwrap().len(),
+                1,
+                "the genuine edge from 200 is intact"
+            );
+        }
+    }
+
+    #[test]
+    fn vacuum_reclaims_dead_update_versions() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let x = engine.begin().unwrap();
+        let mut rid = engine.insert(x, b"v0").unwrap();
+        engine.commit(x).unwrap();
+        for i in 0..20 {
+            let x = engine.begin().unwrap();
+            rid = engine.update(x, rid, format!("v{i}").as_bytes()).unwrap();
+            engine.commit(x).unwrap();
+        }
+        let report = engine.vacuum().unwrap();
+        assert!(
+            report.versions_reclaimed >= 15,
+            "dead update versions must be reclaimed: {report:?}"
+        );
+        assert!(report.bytes_reclaimed > 0);
+        // The current version still reads correctly after compaction.
+        let x = engine.begin().unwrap();
+        assert_eq!(engine.get(x, rid).unwrap(), b"v19");
+    }
+
+    #[test]
+    fn vacuum_horizon_blocked_flag_tracks_open_transactions() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let open = engine.begin().unwrap();
+        // Advance next_xid past `open`'s snapshot so it genuinely holds the
+        // horizon below where a quiescent database would sit.
+        let bump = engine.begin().unwrap();
+        engine.commit(bump).unwrap();
+        let report = engine.vacuum().unwrap();
+        assert!(
+            report.horizon_blocked,
+            "an open txn must hold the horizon back"
+        );
+        engine.commit(open).unwrap();
+        let report2 = engine.vacuum().unwrap();
+        assert!(
+            !report2.horizon_blocked,
+            "a quiescent database must not report the horizon blocked"
+        );
+    }
+
+    #[test]
+    fn vacuum_does_not_reclaim_versions_a_live_reader_still_needs() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let x = engine.begin().unwrap();
+        let rid = engine.insert(x, b"v0").unwrap();
+        engine.commit(x).unwrap();
+
+        // A long-lived RR reader fixes its snapshot on v0.
+        let reader = engine
+            .begin_with_isolation(Isolation::RepeatableRead)
+            .unwrap();
+        assert_eq!(engine.get(reader, rid).unwrap(), b"v0");
+
+        // A newer transaction supersedes v0 with v1 and commits.
+        let w = engine.begin().unwrap();
+        engine.update(w, rid, b"v1").unwrap();
+        engine.commit(w).unwrap();
+
+        // Vacuum must NOT reclaim v0 — `reader` still needs it.
+        let report = engine.vacuum().unwrap();
+        assert!(report.horizon_blocked);
+        assert_eq!(
+            engine.get(reader, rid).unwrap(),
+            b"v0",
+            "the reader's version must survive vacuum while it is live"
+        );
+        engine.commit(reader).unwrap();
+    }
+
+    #[test]
+    fn vacuumed_database_survives_reopen() {
+        let dir = tempdir().unwrap();
+        let keep = {
+            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let x = engine.begin().unwrap();
+            let keep = engine.insert(x, b"keep").unwrap();
+            let drop_it = engine.insert(x, b"drop").unwrap();
+            engine.commit(x).unwrap();
+            let x2 = engine.begin().unwrap();
+            engine.delete(x2, drop_it).unwrap();
+            engine.commit(x2).unwrap();
+            engine.vacuum().unwrap();
+            engine.flush().unwrap();
+            keep
+        };
+        // Reopen runs recovery (which must idempotently redo the vacuum).
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let x = engine.begin().unwrap();
+        assert_eq!(engine.get(x, keep).unwrap(), b"keep");
     }
 }

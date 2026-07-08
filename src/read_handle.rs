@@ -90,7 +90,11 @@ impl ReadHandle {
             else {
                 unreachable!("plan_is_concurrent_read guarantees a Select");
             };
-            let (snapshot, self_xid) = txn::read_snapshot(&self.txn);
+            // The `_reg` guard holds the vacuum horizon back (M10.a) for the
+            // whole scan, so a concurrent writer-thread vacuum can't reclaim a
+            // version this read still needs. Dropped at the end of each
+            // statement's scan.
+            let (snapshot, self_xid, _reg) = txn::read_snapshot(&self.txn);
             out.push(exec_select_readonly(
                 table,
                 projection,
@@ -114,7 +118,8 @@ impl ReadHandle {
     /// visible to that snapshot (superseded, deleted, or never committed) —
     /// exactly the same visibility rule the writer-side `Engine::get` applies.
     pub fn get(&self, row_id: RowId) -> Result<Vec<u8>> {
-        let (snapshot, self_xid) = txn::read_snapshot(&self.txn);
+        // `_reg` holds the vacuum horizon back (M10.a) until this read returns.
+        let (snapshot, self_xid, _reg) = txn::read_snapshot(&self.txn);
         let page = self.reader.read_page(row_id.page_id)?;
         let th = page.tuple_header(row_id.slot)?;
         if is_visible(th.xmin, th.xmax, &snapshot, self_xid) {

@@ -71,6 +71,28 @@ pub fn is_visible(tuple_xmin: Xid, tuple_xmax: Xid, snapshot: &Snapshot, self_xi
     !deleter_visible
 }
 
+/// Is a tuple version with the given `xmax` reclaimable by vacuum under
+/// `horizon` (M10)? This is the deliberate inverse of [`is_visible`] for the
+/// "dead to everyone" case: a version is reclaimable iff it has been
+/// superseded/deleted (`xmax != 0`) by a transaction that every current and
+/// future snapshot must see as committed (`xmax < horizon`, where `horizon` is
+/// the oldest live snapshot's `xmin` — see `TransactionManager::
+/// vacuum_horizon`).
+///
+/// Two facts make this sound with only `xmax`:
+/// - A non-zero on-disk `xmax` always denotes a *committed* deleter: aborts
+///   are physically undone (`Heap::undo_xmax_stamp` reverts xmax to 0), so an
+///   aborted delete never leaves a lingering xmax (see this module's header).
+/// - `xmax < horizon` means `xmax` is below every live transaction's xid
+///   (each live xid `>= horizon`), so no live transaction *is* the deleter and
+///   every snapshot treats it as committed-in-the-past.
+///
+/// A live tip (`xmax == 0`) is never reclaimable. Cross-checked against
+/// `is_visible` in this module's tests.
+pub fn is_reclaimable(tuple_xmax: Xid, horizon: Xid) -> bool {
+    tuple_xmax != 0 && tuple_xmax < horizon
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +170,50 @@ mod tests {
         assert!(!is_visible(5, 5, &snap, 5));
         // ...and invisible to everyone else too (insert not yet committed).
         assert!(!is_visible(5, 5, &snap, 6));
+    }
+
+    // ── M10.a: reclaimable is the inverse of is_visible below the horizon ────
+
+    #[test]
+    fn live_tip_is_never_reclaimable() {
+        assert!(!is_reclaimable(0, 100));
+    }
+
+    #[test]
+    fn deleted_below_horizon_is_reclaimable() {
+        assert!(is_reclaimable(7, 100));
+    }
+
+    #[test]
+    fn deleted_at_or_above_horizon_is_not_reclaimable() {
+        // xmax == horizon: a snapshot taken exactly at the horizon might still
+        // be that deleting transaction's own, so it is not yet safe.
+        assert!(!is_reclaimable(100, 100));
+        assert!(!is_reclaimable(150, 100));
+    }
+
+    /// The load-bearing cross-check the M10 plan asks for: whenever a version
+    /// is reclaimable under `horizon`, the snapshot that sees the *most* rows
+    /// as live at the horizon (`xmin == xmax == horizon`, no active txns —
+    /// the boundary a future reader could hold) must agree it is invisible.
+    /// And a live tip must be visible to that same snapshot.
+    #[test]
+    fn reclaimable_implies_invisible_at_horizon_snapshot() {
+        let horizon = 100;
+        let at_horizon = Snapshot::new(horizon, horizon, vec![]);
+        for xmin in [1u64, 5, 50, 99] {
+            for xmax in [0u64, 1, 50, 99, 100, 200] {
+                if is_reclaimable(xmax, horizon) {
+                    assert!(
+                        !is_visible(xmin, xmax, &at_horizon, 0),
+                        "reclaimable ({xmin},{xmax}) must be invisible at horizon"
+                    );
+                }
+            }
+            // A live version (xmax == 0) inserted below the horizon is visible
+            // and never reclaimable.
+            assert!(is_visible(xmin, 0, &at_horizon, 0));
+            assert!(!is_reclaimable(0, horizon));
+        }
     }
 }

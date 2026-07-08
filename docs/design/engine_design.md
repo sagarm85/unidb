@@ -746,6 +746,20 @@ entries invisible), all unbounded space growth:
 | `EdgeIndex` / `CsrIndex` | aborted/superseded edges never retracted | M3/M7 |
 | `__consumers__` | every ack leaves a dead offset version; `vacuum_events` does **not** touch it | M4 |
 
+**Correction (M10, 2026-07-08, branch `core-vacuum`):** the *heap tuples* row
+above is now addressed — `Engine::vacuum()` physically reclaims dead heap
+versions (reader-aware horizon, crash-safe redo-only `WAL_VACUUM`, page
+compaction + slot reuse). Its index-vacuum pass also scrubs the reclaimed
+`RowId`s from `VectorIndex`/`InvertedIndex`/`BTreeIndex`/`EdgeIndex`, so those
+"indexed forever" / "never retracted" leaks are bounded for a vacuumed table
+too — and, more importantly, must be scrubbed *before* a slot is reused, or a
+stale entry would alias a live, wrong row (the M10.c aliasing hazard).
+`CsrIndex` is deliberately left un-scrubbed (no incremental remove; not
+consulted by any read path; rebuilt on open). Still open: this is **manual**
+vacuum only (no autovacuum), catalog-page and cross-page/`VACUUM FULL`
+reclamation are not done, and index structures shrink only by entry removal,
+not physical rebuild — see `docs/backlog/m10_heap_vacuum_gc.md`.
+
 **CSR is not currently consulted by any query path** (added post-M7,
 corrected during M8 merge) — it is built, kept warm on every live edge
 write, rebuilt on open, and benchmarked in isolation, but `edges_from`/
@@ -774,7 +788,8 @@ catalog DDL not transactional; SQL grammar gaps (no OR/ORDER
 BY/LIMIT/aggregates/joins/subqueries/`IN` — parked as Phase 2); no
 full-text SQL operator; single-column indexes only; no cost-based index
 selection; Cypher is single-hop read-only, nodes are opaque i64s; no CSR
-reverse (`to_id`) traversal; RLS is Rust-API-only; no automatic vacuum.
+reverse (`to_id`) traversal; RLS is Rust-API-only; manual heap vacuum only
+(`Engine::vacuum()`, M10) — no *automatic*/threshold-driven autovacuum.
 
 Server gaps: no multi-request transaction sessions; no TLS (reverse-proxy
 assumption); verify-only JWT with no scopes (any valid token can hit
@@ -807,7 +822,7 @@ bound). `NEAR`/graph/queue reads remain writer-side for now (additive).
 | D4 | Tuple header reserves MVCC bytes up front | `page.rs` 24-byte header; used since M1 with format bump v1→v2 |
 | D5 | No dirty page flushes ahead of durable WAL | `bufferpool.rs::flush_page()` + `find_victim()`; debug assertions + crash harness |
 | D6 | Single-file storage (WAL separate) | unchanged; revisit was gated post-M4, not yet re-opened |
-| D7 | Crash-injection harness, simple by design | `tests/crash/main.rs` P1–P9 + property test |
+| D7 | Crash-injection harness, simple by design | `tests/crash/main.rs` P1–P10 (P10 = mid-vacuum, M10) + property test |
 | D8 | 8 KiB pages, init-time config, immutable after | `format.rs`; baked into control file |
 | D9 | Little-endian, CRC32+LSN per page, magic+version | `format.rs`/`page.rs`/`wal.rs`; `FORMAT_VERSION = 3` |
 | D10 | RC default, RR available, same snapshots | `txn.rs` snapshot lifetime |
@@ -825,4 +840,9 @@ branch `m9-group-commit`, and the concurrent read path (shared
 `ReadHandle`) — point reads on branch `m9-concurrent-reads` and read-only SQL
 `SELECT` on `m9-concurrent-select` — see §3.3, §3.4, §4.4, §8, §11.1, §12 and
 `docs/backlog/group_commit_and_read_concurrency.md`. `NEAR`/graph/queue reads
-remain writer-side. Update alongside the next milestone's closeout.*
+remain writer-side. **M10 (2026-07-08, branch `core-vacuum`): heap vacuum / MVCC
+GC** — `Engine::vacuum()` with a reader-aware horizon, crash-safe redo-only
+`WAL_VACUUM`, the secondary-index vacuum gate, and page compaction + slot reuse;
+adds crash point P10 and retires the "heap tuples never reclaimed" tech-debt
+item (see §12's correction note and `docs/backlog/m10_heap_vacuum_gc.md`).
+Update alongside the next milestone's closeout.*

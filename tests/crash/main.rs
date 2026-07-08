@@ -14,6 +14,8 @@
 //   P6 – mid-user-transaction (M1): statements' mini-txns durably
 //        committed, but the user transaction never reaches WAL_TXN_COMMIT
 //   P7 – immediately after WAL_TXN_COMMIT fsync (M1), before page flush
+//   P9 – crash mid-undo of an already-aborting transaction (M1.b)
+//   P10 – crash mid-vacuum (M10): WAL_VACUUM durable, page not flushed
 
 use tempfile::tempdir;
 use unidb::{Engine, RowId};
@@ -314,6 +316,75 @@ fn p9_crash_mid_undo_still_converges_to_fully_undone() {
     assert!(
         heap.get(r2, &snap, 100, &pool).is_err(),
         "P9: row already undone before the crash must remain undone (idempotent)"
+    );
+}
+
+// ── P10: crash mid-vacuum (M10) ──────────────────────────────────────────────
+//
+// Vacuum marks a reclaimable version's line pointer DEAD via a redo-only,
+// idempotent WAL_VACUUM mini-txn (D2/D5). Simulate a crash *after* that record
+// is durable but *before* the page is flushed (pages left dirty, dropped):
+// recovery must redo the mark cleanly, lose no committed-visible row, and leave
+// re-running vacuum a no-op (idempotent — the version is already reclaimed).
+
+#[test]
+fn p10_crash_mid_vacuum_redoes_cleanly_and_loses_no_committed_row() {
+    use unidb::bufferpool::BufferPool;
+    use unidb::control;
+    use unidb::format::{DEFAULT_PAGE_SIZE, INVALID_LSN};
+    use unidb::heap::Heap;
+    use unidb::lockmgr::LockManager;
+    use unidb::mvcc::Snapshot;
+    use unidb::wal::Wal;
+
+    let dir = tempdir().unwrap();
+    let ctrl_p = dir.path().join("control");
+    let data_p = dir.path().join("data.db");
+    let wal_p = dir.path().join("db.wal");
+    control::create(&ctrl_p, DEFAULT_PAGE_SIZE).unwrap();
+
+    let (keep, dead) = {
+        let mut pool = BufferPool::open(&data_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
+        let mut wal = Wal::open(&wal_p, INVALID_LSN).unwrap();
+        let mut heap = Heap::new(DEFAULT_PAGE_SIZE as usize);
+        let mut lock = LockManager::new();
+
+        // Two committed rows (each insert/delete is its own durably-fsynced
+        // mini-txn), one of which is then deleted so it becomes reclaimable.
+        let keep = heap.insert(b"keep", 1, &mut pool, &mut wal).unwrap();
+        let dead = heap.insert(b"dead", 1, &mut pool, &mut wal).unwrap();
+        heap.delete(dead, 1, &mut pool, &mut wal, &mut lock)
+            .unwrap();
+
+        // Vacuum marks `dead` DEAD (WAL_VACUUM durable). "Crash" here: do NOT
+        // flush pages, drop — recovery must redo the mark from the WAL.
+        heap.mark_dead(dead, &mut pool, &mut wal).unwrap();
+        drop(pool);
+        drop(wal);
+        (keep, dead)
+    };
+
+    let (_, _stats) =
+        unidb::recovery::recover(&ctrl_p, &data_p, &wal_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
+
+    let pool = BufferPool::open(&data_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
+    let snap = Snapshot::new(100, 100, vec![]);
+    // (i) the committed-visible row survives; (ii) its version chain is intact.
+    let heap = Heap::from_pages(DEFAULT_PAGE_SIZE as usize, vec![keep.page_id]);
+    assert_eq!(
+        heap.get(keep, &snap, 100, &pool).unwrap(),
+        b"keep",
+        "P10: a committed-visible row must survive a mid-vacuum crash"
+    );
+    // The vacuumed version is gone (its DEAD mark was redone).
+    assert!(
+        heap.get(dead, &snap, 100, &pool).is_err(),
+        "P10: the reclaimed version must stay reclaimed after recovery"
+    );
+    // (iii) redo re-applied cleanly and re-running vacuum finds nothing new.
+    assert!(
+        heap.collect_reclaimable(100, &pool).unwrap().is_empty(),
+        "P10: re-running vacuum after recovery must be a no-op (idempotent)"
     );
 }
 

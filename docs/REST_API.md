@@ -434,7 +434,7 @@ pooling — all explicitly out of scope for v1, not oversights).
 one-shot, blocking method call (`AttachClient::execute_sql`, `insert`,
 `create_edge`, `edges_from`, `set_column_index`, `enable_events`, etc.) —
 no new wire format, just `reqwest::blocking` + the same JSON shapes
-documented in this file. It does not expose `vacuum_events`,
-`set_rls_policy`, or `flush`, since none of those have a REST route to
-call. See the repo root [`README.md`](../README.md#rust-attach-client-unidb-attach-m8)
+documented in this file. It does not expose `vacuum_events`, `vacuum`
+(M10 heap GC), `set_rls_policy`, or `flush`, since none of those have a
+REST route to call. See the repo root [`README.md`](../README.md#rust-attach-client-unidb-attach-m8)
 and [`unidb-attach/src/lib.rs`](../unidb-attach/src/lib.rs).

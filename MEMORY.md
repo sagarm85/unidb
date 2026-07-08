@@ -121,6 +121,76 @@
   what's still unresolved from M1-M5.
 - **Last updated:** 2026-07-08
 
+### M10 — heap vacuum / MVCC GC (Core lane, branch `core-vacuum`, 2026-07-08)
+
+Shipped the first physical space-reclamation path in the engine — the one
+place the project previously stood *in* the MVCC bloat trap rather than
+sidestepping it. Built on top of the already-merged concurrent-read model
+(PRs #2–#4), so the horizon includes live `ReadHandle` readers, not just the
+writer's active transactions. Checkpoints M10.a→M10.d all landed; full metrics
+table in `PROGRESS.md`'s M10 entry. Key points a future reader needs:
+
+- **Horizon (M10.a).** `TransactionManager::vacuum_horizon()` = `min`
+  `snapshot.xmin` over all live writer txns **and** live concurrent readers.
+  Readers register via a `ReadRegistration` RAII guard returned by
+  `txn::read_snapshot` and held for the whole read in `read_handle.rs` — a
+  concurrent reader now genuinely holds the horizon back, closing the window
+  where the writer could reclaim a version an in-flight off-thread scan still
+  needs. `mvcc::is_reclaimable(xmax, horizon)` (`xmax != 0 && xmax < horizon`)
+  is the deliberate inverse of `is_visible`, cross-checked against it in a
+  table-driven test. A non-zero on-disk `xmax` always means a *committed*
+  deleter (aborts are physically undone), which is what makes the `xmax`-only
+  check sound — see the `is_reclaimable` doc comment.
+- **Slot lifecycle (M10.b/d).** New `SlotState` `LIVE → DEAD → UNUSED`, encoded
+  in the existing `(offset,length)` slot pair with **no format change**: DEAD =
+  `(0, SLOT_DEAD_LEN=1)`, UNUSED = `(0,0)`. A real tuple length is always
+  `>= 24`, so `1` can't collide. `insert_versioned` now reuses the lowest
+  UNUSED slot (never a DEAD one — that's the aliasing gate). `scan`/`get`/
+  `resolve_candidates_batched` skip non-live slots (this also *fixes* a
+  pre-existing latent fragility: a recovery-undone incomplete-insert slot
+  `(0,0)` would previously have errored a later table scan).
+- **Crash-safe WAL (M10.b).** New `WAL_VACUUM` (redo-only, no undo — re-freeing
+  already-dead-and-committed space is idempotent). Two shapes by `slot`:
+  `slot != u16::MAX` marks one line pointer DEAD (M10.b); `slot == u16::MAX`
+  carries a full compacted page image (M10.d), replayed by reconstructing the
+  page and re-stamping the record LSN. Both idempotent via the page-LSN gate.
+  New D7 crash point **P10** (kill mid-vacuum → reopen → committed row
+  survives, reclaimed version stays reclaimed, re-running vacuum is a no-op).
+- **The aliasing hazard (M10.c) — the "single most important test."** Stale
+  secondary-index entries are harmless *only* while slots are never reused;
+  the moment vacuum reuses a slot, a stale entry can resolve to a *live,
+  MVCC-visible, semantically-wrong* row. So `Engine::vacuum` scrubs every
+  reclaimed `RowId` from all secondary indexes **before** any slot becomes
+  UNUSED (`EdgeIndex::remove_rowid`, `IndexHandle::remove_rows` for
+  BTree/FullText/Vector). Reproduced deterministically via the `EdgeIndex`
+  traversal path — `edges_from` trusts index candidates without re-checking
+  `from_id`, so an aborted `create_edge` (which leaves a stale
+  `from_id→RowId` entry, abort having no index hook) plus slot reuse yields a
+  wrong-but-visible edge with the gate off; the real `Engine::vacuum` makes it
+  impossible. `vacuum_inner(clean_indexes: bool)` exists solely so the test can
+  toggle the gate.
+- **Resolved plan decisions.** (1) The M10 plan assumed `VectorIndex` has no
+  incremental remove; it *does* have `remove` (rebuild-based), so
+  vector-indexed tables are cleaned rather than excluded from slot reuse.
+  (2) `CsrIndex` is intentionally left un-scrubbed by `remove_rows`: it has no
+  incremental remove, is rebuilt from committed rows on open, and — since M7's
+  "prefer CSR for traversal" wiring was reverted — is consulted by no read
+  path, so a stale CSR candidate can never surface.
+- **Scope / known limits (documented, not silent).** Manual only (no
+  autovacuum); long-lived RR txns / readers hold the horizon back (surfaced in
+  `VacuumReport.horizon_blocked`, not swallowed); intra-page compaction only
+  (no cross-page/`VACUUM FULL` high-water-mark shrink); index structures shrink
+  logically (entry removal) but aren't physically rebuilt. All parked in the
+  M10 plan's backlog. `Engine::vacuum()` is embedded-API only in v1 — no REST
+  route (matching `vacuum_events`'s explicit-call precedent). **Cost is
+  fsync-bound** (~4.3 ms per reclaimed version, benchmarked): each `mark_dead`/
+  `compact_page` is its own fsyncing mini-txn, so vacuum pays ~N fsyncs for N
+  versions — the same per-statement floor M1/M3 already hit. Batching them
+  behind one fsync (the M9 `deferred_sync` mechanism) is the obvious future
+  speedup, deliberately not done here. Leak-closed proof: under 200-key ×
+  30-round update churn, periodic vacuum keeps the heap file at 73,728 B vs
+  606,208 B un-vacuumed (**8.2× smaller**).
+
 ### Design note: xid reuse after checkpoint — a real M1-era bug, found and fixed during M5
 
 Found by manually smoke-testing the new REST server (M5.b), not by any

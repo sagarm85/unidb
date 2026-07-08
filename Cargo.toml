@@ -77,6 +77,10 @@ name = "btree"
 harness = false
 
 [[bench]]
+name = "vacuum"
+harness = false
+
+[[bench]]
 name = "server"
 harness = false
 required-features = ["server"]

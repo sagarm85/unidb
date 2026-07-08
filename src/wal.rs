@@ -29,7 +29,7 @@ use crate::{
     format::{
         u16_from_le, u16_to_le, u32_from_le, u32_to_le, u64_from_le, u64_to_le, Lsn, PageId, Xid,
         INVALID_LSN, WAL_ABORT, WAL_BEGIN, WAL_CHECKPOINT, WAL_COMMIT, WAL_DELETE, WAL_INSERT,
-        WAL_TXN_ABORT, WAL_TXN_BEGIN, WAL_TXN_COMMIT, WAL_UPDATE,
+        WAL_TXN_ABORT, WAL_TXN_BEGIN, WAL_TXN_COMMIT, WAL_UPDATE, WAL_VACUUM,
     },
 };
 
@@ -214,6 +214,24 @@ impl Wal {
     ) -> Result<Lsn> {
         let lsn = self.append_raw(txn_id, prev_lsn, WAL_DELETE, page_id, slot, &[], undo)?;
         tracing::trace!(mini_txn_id = txn_id, lsn, page_id, slot, "WAL DELETE");
+        Ok(lsn)
+    }
+
+    /// Log a vacuum mutation (M10), redo-only (no undo payload — reclaiming
+    /// already-dead-and-committed space is idempotent on replay). `slot !=
+    /// u16::MAX` with an empty `redo` marks that one line pointer DEAD (M10.b);
+    /// `slot == u16::MAX` with `redo` = a full compacted page image restores
+    /// the page on replay (M10.d). See `format::WAL_VACUUM`.
+    pub fn log_vacuum(
+        &mut self,
+        txn_id: u64,
+        prev_lsn: Lsn,
+        page_id: PageId,
+        slot: u16,
+        redo: &[u8],
+    ) -> Result<Lsn> {
+        let lsn = self.append_raw(txn_id, prev_lsn, WAL_VACUUM, page_id, slot, redo, &[])?;
+        tracing::trace!(mini_txn_id = txn_id, lsn, page_id, slot, "WAL VACUUM");
         Ok(lsn)
     }
 

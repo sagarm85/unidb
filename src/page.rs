@@ -41,6 +41,31 @@ pub const SLOT_SIZE: usize = 4;
 pub const TUPLE_HEADER_SIZE: usize = 24;
 const CRC_FIELD_OFFSET: usize = 8;
 
+/// Line-pointer (slot) lifecycle for MVCC vacuum (M10), encoded in the slot's
+/// `(offset, length)` pair without any format change:
+///   - `Live`   : `offset != 0` — points at a real tuple body; resolvable.
+///   - `Dead`   : `offset == 0, length == SLOT_DEAD_LEN` — tuple body logically
+///     dropped, pointer *retained* and **not** reusable yet (a secondary index
+///     may still reference this `(page, slot)`; see M10.c). This is the
+///     Postgres-style intermediate state that keeps `RowId`s stable across the
+///     dangerous window.
+///   - `Unused` : `offset == 0, length == 0` — reusable; a new tuple may be
+///     handed this slot index (M10.d). Only reached after every secondary
+///     index has been proven free of any entry referencing it.
+///
+/// A real tuple's stored length is always `>= TUPLE_HEADER_SIZE` (24), so
+/// `SLOT_DEAD_LEN == 1` can never collide with a live length. The legacy
+/// `Page::delete` (offset 0, length 0) produces `Unused`, matching its
+/// "reusable, never committed" origin (recovery undo of an incomplete insert).
+pub const SLOT_DEAD_LEN: u16 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotState {
+    Live,
+    Dead,
+    Unused,
+}
+
 const TH_XMIN: usize = 0;
 const TH_XMAX: usize = 8;
 const TH_PREV_PAGE: usize = 16;
@@ -188,7 +213,17 @@ impl SlottedPage {
         prev: Option<(PageId, u16)>,
     ) -> Result<u16> {
         let stored_len = TUPLE_HEADER_SIZE + payload.len();
-        let needed = SLOT_SIZE + stored_len;
+        // Prefer reusing an UNUSED slot index (M10.d) over appending a new one:
+        // a reused slot needs no extra slot-array entry, so it costs only the
+        // tuple body's bytes. DEAD slots are deliberately NOT reused — a stale
+        // secondary-index entry may still point at them until vacuum's index
+        // pass (M10.c) has promoted them to UNUSED.
+        let reuse = self.first_unused_slot();
+        let needed = if reuse.is_some() {
+            stored_len
+        } else {
+            SLOT_SIZE + stored_len
+        };
         if needed > self.free_space() {
             return Err(DbError::HeapFull {
                 size: payload.len(),
@@ -208,13 +243,106 @@ impl SlottedPage {
         // write payload
         self.data[th_end..th_end + payload.len()].copy_from_slice(payload);
 
-        let sc = self.slot_count();
-        self.write_slot(sc, new_fe as u16, stored_len as u16);
-        self.set_slot_count(sc + 1);
-        self.set_free_end(new_fe as u16);
-        self.set_free_start(self.free_start() + SLOT_SIZE as u16);
+        let slot = match reuse {
+            Some(s) => {
+                self.write_slot(s, new_fe as u16, stored_len as u16);
+                self.set_free_end(new_fe as u16);
+                s
+            }
+            None => {
+                let sc = self.slot_count();
+                self.write_slot(sc, new_fe as u16, stored_len as u16);
+                self.set_slot_count(sc + 1);
+                self.set_free_end(new_fe as u16);
+                self.set_free_start(self.free_start() + SLOT_SIZE as u16);
+                sc
+            }
+        };
         self.write_crc();
-        Ok(sc)
+        Ok(slot)
+    }
+
+    /// The lowest UNUSED (reusable) slot index, if any (M10.d slot reuse).
+    fn first_unused_slot(&self) -> Option<u16> {
+        (0..self.slot_count()).find(|&s| {
+            let (offset, length) = self.read_slot(s);
+            offset == 0 && length == 0
+        })
+    }
+
+    /// The MVCC-vacuum lifecycle state of `slot` (M10). See [`SlotState`].
+    pub fn slot_state(&self, slot: u16) -> Result<SlotState> {
+        if slot >= self.slot_count() {
+            return Err(DbError::SlotOutOfRange {
+                page_id: self.page_id(),
+                slot,
+            });
+        }
+        let (offset, length) = self.read_slot(slot);
+        Ok(if offset != 0 {
+            SlotState::Live
+        } else if length == SLOT_DEAD_LEN {
+            SlotState::Dead
+        } else {
+            SlotState::Unused
+        })
+    }
+
+    /// Mark a LIVE line pointer DEAD (M10.b): drop the tuple body logically
+    /// (the slot stops resolving) but retain the pointer as non-reusable. A
+    /// no-op if the slot is already non-live, which keeps redo idempotent
+    /// (see recovery.rs's `WAL_VACUUM` handling). The freed body bytes are not
+    /// physically reclaimed until [`Self::compact`] (M10.d).
+    pub fn mark_dead(&mut self, slot: u16) -> Result<()> {
+        if slot >= self.slot_count() {
+            return Err(DbError::SlotOutOfRange {
+                page_id: self.page_id(),
+                slot,
+            });
+        }
+        let (offset, _) = self.read_slot(slot);
+        if offset == 0 {
+            return Ok(()); // already Dead or Unused — idempotent
+        }
+        self.write_slot(slot, 0, SLOT_DEAD_LEN);
+        self.write_crc();
+        Ok(())
+    }
+
+    /// Intra-page compaction (M10.d): rebuild the tuple-data region keeping
+    /// only LIVE slots — their bodies are copied into a fresh contiguous block
+    /// and their slot offsets updated — while every non-live slot (DEAD or
+    /// UNUSED) is left as a reusable UNUSED line pointer. `slot_count` is
+    /// unchanged so LIVE slot indices stay stable; the DEAD→UNUSED promotion
+    /// here is the reuse-gating step, safe only because vacuum has already
+    /// cleaned every secondary index of the reclaimed `RowId`s (M10.c).
+    /// Returns the number of tuple-body bytes reclaimed.
+    pub fn compact(&mut self) -> usize {
+        let before = self.free_space();
+        let sc = self.slot_count();
+        // Snapshot every live slot's body (owned copies, so the rewrite below
+        // never reads bytes it has already overwritten).
+        let mut live: Vec<(u16, Vec<u8>)> = Vec::new();
+        for slot in 0..sc {
+            let (offset, length) = self.read_slot(slot);
+            if offset != 0 {
+                let start = offset as usize;
+                live.push((slot, self.data[start..start + length as usize].to_vec()));
+            }
+        }
+        // Reset all slots to UNUSED, then re-lay live bodies down from the top.
+        for slot in 0..sc {
+            self.write_slot(slot, 0, 0);
+        }
+        let mut fe = self.data.len();
+        for (slot, body) in live {
+            fe -= body.len();
+            self.data[fe..fe + body.len()].copy_from_slice(&body);
+            self.write_slot(slot, fe as u16, body.len() as u16);
+        }
+        self.set_free_end(fe as u16);
+        self.write_crc();
+        self.free_space() - before
     }
 
     /// Read the MVCC tuple-header fields at `slot` (M1).
@@ -499,5 +627,65 @@ mod tests {
     #[test]
     fn tuple_header_size_is_24_bytes() {
         assert_eq!(TUPLE_HEADER_SIZE, 24);
+    }
+
+    // ── M10: slot lifecycle (LIVE → DEAD → UNUSED), compaction, reuse ─────────
+
+    #[test]
+    fn fresh_slot_is_live_and_mark_dead_transitions() {
+        let mut p = make_page();
+        let s = p.insert_versioned(b"row", 1, 0, None).unwrap();
+        assert_eq!(p.slot_state(s).unwrap(), SlotState::Live);
+        p.mark_dead(s).unwrap();
+        assert_eq!(p.slot_state(s).unwrap(), SlotState::Dead);
+        // A DEAD slot no longer resolves.
+        assert!(matches!(p.get(s), Err(DbError::TupleDeleted { .. })));
+        // mark_dead is idempotent.
+        p.mark_dead(s).unwrap();
+        assert_eq!(p.slot_state(s).unwrap(), SlotState::Dead);
+    }
+
+    #[test]
+    fn legacy_delete_produces_unused_slot() {
+        let mut p = make_page();
+        let s = p.insert(b"row").unwrap();
+        p.delete(s).unwrap();
+        assert_eq!(p.slot_state(s).unwrap(), SlotState::Unused);
+    }
+
+    #[test]
+    fn dead_slots_are_not_reused_but_unused_slots_are() {
+        let mut p = make_page();
+        let s0 = p.insert_versioned(b"a", 1, 0, None).unwrap();
+        let s1 = p.insert_versioned(b"b", 1, 0, None).unwrap();
+        assert_eq!((s0, s1), (0, 1));
+        // Mark s0 DEAD: a new insert must NOT reuse it (it may still be
+        // index-referenced), so it appends a fresh slot instead.
+        p.mark_dead(s0).unwrap();
+        let s2 = p.insert_versioned(b"c", 1, 0, None).unwrap();
+        assert_eq!(s2, 2, "DEAD slot must not be reused");
+        // Now compaction promotes DEAD→UNUSED; the next insert reuses slot 0.
+        p.compact();
+        assert_eq!(p.slot_state(s0).unwrap(), SlotState::Unused);
+        let s3 = p.insert_versioned(b"d", 1, 0, None).unwrap();
+        assert_eq!(s3, 0, "UNUSED slot must be reused");
+        assert_eq!(p.get(s3).unwrap(), b"d");
+    }
+
+    #[test]
+    fn compact_reclaims_dead_body_space_and_keeps_live_rows() {
+        let mut p = make_page();
+        let big = vec![b'x'; 500];
+        let s0 = p.insert_versioned(&big, 1, 0, None).unwrap();
+        let s1 = p.insert_versioned(b"keep", 1, 0, None).unwrap();
+        let free_before = p.free_space();
+        p.mark_dead(s0).unwrap();
+        let reclaimed = p.compact();
+        assert!(reclaimed >= 500, "must reclaim the big dead body");
+        assert!(p.free_space() > free_before);
+        // The surviving row is intact and still at its stable slot index.
+        assert_eq!(p.slot_state(s1).unwrap(), SlotState::Live);
+        assert_eq!(p.get(s1).unwrap(), b"keep");
+        assert_eq!(p.slot_state(s0).unwrap(), SlotState::Unused);
     }
 }
