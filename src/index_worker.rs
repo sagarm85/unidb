@@ -127,6 +127,37 @@ impl IndexHandle {
         }
     }
 
+    /// Synchronously scrub every reclaimed `RowId` from all in-memory
+    /// secondary indexes for `table` (M10.c index vacuum). Runs on the
+    /// caller's (writer) thread under the shared write lock — vacuum needs the
+    /// removal to have *completed* before it hands the freed slot out for
+    /// reuse, so this deliberately is not an async channel message.
+    ///
+    /// `Vector`/`FullText`/`BTree` all support removal by `RowId`. `Csr`
+    /// entries are intentionally left untouched: the CSR index is rebuilt from
+    /// committed rows on every open and — since M7's traversal-uses-CSR wiring
+    /// was reverted — is not consulted by any read path, so a stale CSR
+    /// candidate can never surface a wrong answer (see `graph/index.rs`).
+    pub fn remove_rows(&self, table: &str, rows: &[RowId]) {
+        if rows.is_empty() {
+            return;
+        }
+        let mut guard = self.indexes.write().unwrap();
+        for ((t, _col), entry) in guard.iter_mut() {
+            if t != table {
+                continue;
+            }
+            for &rid in rows {
+                match &mut entry.index {
+                    SecondaryIndex::Vector(v) => v.remove(rid),
+                    SecondaryIndex::FullText(ft) => ft.remove(rid),
+                    SecondaryIndex::BTree(b) => b.remove(rid),
+                    SecondaryIndex::Csr(_) => {}
+                }
+            }
+        }
+    }
+
     pub fn status(&self, table: &str, column: &str) -> Option<IndexStatus> {
         self.indexes
             .read()
@@ -485,6 +516,52 @@ mod tests {
     fn unrelated_index_status_is_none() {
         let mut handle = IndexHandle::spawn();
         assert_eq!(handle.status("nope", "nope"), None);
+        handle.shutdown();
+    }
+
+    /// M10.c: `remove_rows` synchronously scrubs reclaimed RowIds from a
+    /// table's in-memory secondary indexes (here a BTree), so a vacuumed slot
+    /// can be reused without a stale candidate surviving.
+    #[test]
+    fn remove_rows_scrubs_reclaimed_rowids_from_secondary_indexes() {
+        let mut handle = IndexHandle::spawn();
+        handle.send(IndexMsg::Upsert {
+            table: "t".into(),
+            record: rid(4, 0),
+            indexed_cols: vec![IndexedColumn::Ordered {
+                column: "id".into(),
+                data: OrderedValue::Int(7),
+            }],
+        });
+        handle.send(IndexMsg::MarkReady {
+            table: "t".into(),
+            column: "id".into(),
+            kind: IndexKind::BTree,
+        });
+        wait_for(|| handle.status("t", "id") == Some(IndexStatus::Ready));
+        wait_for(|| {
+            let guard = handle.indexes.read().unwrap();
+            matches!(
+                &guard.get(&("t".to_string(), "id".to_string())).unwrap().index,
+                SecondaryIndex::BTree(b) if !b.search_eq(&OrderedValue::Int(7)).is_empty()
+            )
+        });
+
+        handle.remove_rows("t", &[rid(4, 0)]);
+
+        let guard = handle.indexes.read().unwrap();
+        let SecondaryIndex::BTree(b) = &guard
+            .get(&("t".to_string(), "id".to_string()))
+            .unwrap()
+            .index
+        else {
+            panic!("expected a BTree index");
+        };
+        assert!(
+            b.search_eq(&OrderedValue::Int(7)).is_empty(),
+            "the reclaimed RowId must be gone from the index"
+        );
+        drop(guard);
         handle.shutdown();
     }
 

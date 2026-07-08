@@ -1,12 +1,16 @@
 # M10 — Heap vacuum / MVCC garbage collection
 
-## Status as of 2026-07-08: NOT STARTED (backlog).
+## Status as of 2026-07-08: SHIPPED (branch `core-vacuum`).
 
-Parked here as a durable reference. Do not begin implementing until
-explicitly told to resume. Post-M8 backlog numbers (M9 Python, M10 vacuum,
-the `m9-group-commit` branch, `group_commit_and_read_concurrency.md`) are
-independent proposals, **not** a committed sequence — pick the order at
-resume time.
+Checkpoints M10.a–M10.d all landed; see `PROGRESS.md`'s M10 entry for the
+metrics table and design notes, and `MEMORY.md`'s M10 session log. The plan
+below is kept as the durable design reference; the "proposed — confirm before
+building" decisions were all adopted as written, with two concrete
+resolutions recorded in `PROGRESS.md`: (1) `VectorIndex` *does* have a (rebuild-
+based) `remove`, so vector-indexed tables are cleaned rather than excluded
+from slot reuse; (2) the aliasing hazard is reproduced/fixed via the
+`EdgeIndex` traversal path (which trusts candidates without re-checking
+`from_id`), the sharpest deterministic demonstrator in the codebase.
 
 ## Context
 

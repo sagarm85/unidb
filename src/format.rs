@@ -62,6 +62,17 @@ pub const WAL_TXN_BEGIN: u8 = 8;
 pub const WAL_TXN_COMMIT: u8 = 9;
 pub const WAL_TXN_ABORT: u8 = 10;
 
+// WAL vacuum record (M10). Redo-only, idempotent: freeing already-dead,
+// already-committed space is a no-op if replayed on recovery, so it carries
+// no undo payload (unlike WAL_UPDATE/WAL_DELETE). Used two ways, distinguished
+// by the record's `slot`:
+//   - slot != u16::MAX : mark that one line-pointer DEAD (M10.b — tuple body
+//     dropped, pointer retained, not yet reusable). No redo payload.
+//   - slot == u16::MAX : the redo payload is a full compacted page image
+//     (M10.d — intra-page compaction + DEAD→UNUSED promotion); redo restores
+//     the exact page bytes. Idempotent via the page LSN check in recovery.
+pub const WAL_VACUUM: u8 = 11;
+
 // ── little-endian helpers ────────────────────────────────────────────────────
 
 #[inline]

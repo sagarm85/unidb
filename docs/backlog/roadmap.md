@@ -46,6 +46,7 @@ maximum-difficulty path.
 | M9 (perf) | **Group commit + read-only fsync skip + concurrent reads (ReadHandle)** — merged via PRs #2–#4 to `main`, 2026-07-08 |
 | Track D | Semantic search: per-index cosine metric (`Metric::{Euclidean,Cosine}`) + `unidb-embed` CLI (embed/search over REST) — `main`, 2026-07-08 |
 | M11 | SQL constraints: PK / FK / UNIQUE / NOT NULL / CHECK / DEFAULT — parsed, persisted, enforced on write — landing 2026-07-08 |
+| M10 | Heap vacuum / MVCC GC: `Engine::vacuum()` — reader-aware horizon, crash-safe `WAL_VACUUM`, secondary-index vacuum gate, page compaction + slot reuse — landing 2026-07-08 |
 
 ---
 
@@ -53,7 +54,7 @@ maximum-difficulty path.
 
 | Track | Deliverables | Achieves | Effort* | Phase |
 |---|---|---|---|---|
-| **A — Engine maturity** | ~~Constraints (PK/FK/UNIQUE/NN/CHECK/DEFAULT)~~ ✅ done (M11) · GC/vacuum (M10) · ~~group commit + concurrent reads~~ ✅ done · buffer pool + real FSM · Phase 2 SQL (joins/agg/ORDER BY) + cost-based optimizer · async replication + PITR/backup | Postgres-**class** correctness, durability, standard SQL, HA; no space leak | ~8–10 remaining | P1→P3 |
+| **A — Engine maturity** | ~~Constraints (PK/FK/UNIQUE/NN/CHECK/DEFAULT)~~ ✅ done (M11) · ~~GC/vacuum (M10)~~ ✅ done · ~~group commit + concurrent reads~~ ✅ done · buffer pool + real FSM · Phase 2 SQL (joins/agg/ORDER BY) + cost-based optimizer · async replication + PITR/backup | Postgres-**class** correctness, durability, standard SQL, HA; no space leak | ~6–8 remaining | P1→P3 |
 | **B — Studio UI** | SQL + Table editor · realtime changes feed · graph explorer ★ · vector playground ★ · metrics/logs · (file upload ⚙, auth ⚙ after engine work) | Visual test/admin console; showcases the multi-model thesis | ~3–4 (+engine deps) | P1→P2 |
 | **C — GraphQL** | Catalog-auto-generated schema + edge-traversal resolvers | Typed graph API; framework/AI-friendly | ~2 (after Phase 2 SQL) | P2→P3 |
 | **D — Semantic search** | ~~Embedding CLI/client · cosine metric~~ ✅ done · filtered vector search · (optional search UI) | End-to-end AI semantic search on the shipped vector engine | ~0.5 remaining | P1→P2 |
@@ -127,13 +128,17 @@ git worktree add -b surface-embed   ../unidb-embed        main   # Surface lane 
 
 ## 6. Current status & next actions
 
-- **Core lane:** group-commit / concurrent-reads **DONE** (PRs #2–#4, on `main`).
-  **Next: M10 heap vacuum / GC** — plan in [`m10_heap_vacuum_gc.md`](m10_heap_vacuum_gc.md).
-  The vacuum horizon must include active `ReadHandle` readers, not just the
-  writer's active transactions (build on top of the concurrent-read model).
+- **Core lane:** group-commit / concurrent-reads **DONE** (PRs #2–#4, on `main`);
+  **M10 heap vacuum / GC DONE** (branch `core-vacuum`, 2026-07-08) — reader-aware
+  horizon, crash-safe redo-only `WAL_VACUUM`, secondary-index vacuum gate, page
+  compaction + slot reuse, `Engine::vacuum()`; see `PROGRESS.md`'s M10 entry and
+  [`m10_heap_vacuum_gc.md`](m10_heap_vacuum_gc.md) (now marked SHIPPED). The
+  horizon includes live `ReadHandle` readers as required.
+  **Next: buffer pool + real FSM** (the other half of the Core Track A storage
+  slice), then Phase 2 SQL / optimizer.
 - **SQL lane:** constraints (PK/FK/UNIQUE/NOT NULL/CHECK/DEFAULT) —
-  **implemented as M11 on branch `sql-constraints`, pending hand-merge to
-  `main`** (see `PROGRESS.md`'s M11 entry). Parser now maps column options +
+  **implemented as M11 (branch `sql-constraints`, merged to `main`)**
+  (see `PROGRESS.md`'s M11 entry). Parser now maps column options +
   table constraints into new `ColumnConstraints`/`TableConstraints` catalog
   fields; enforced on INSERT/UPDATE. UNIQUE uses a synchronous heap scan, not
   the async B-Tree index (correctness — `Ready` ≠ current, the M7 lesson); FK
@@ -154,6 +159,19 @@ git worktree add -b surface-embed   ../unidb-embed        main   # Surface lane 
 ---
 
 ## 7. Decision & session log (newest first)
+
+### 2026-07-08 — M10 heap vacuum / MVCC GC landed (Core lane, branch `core-vacuum`)
+- First physical space reclamation in the engine — `Engine::vacuum()`. Dead
+  versions (committed `xmax` < a reader-aware horizon = `min(snapshot.xmin)`
+  across live txns **and** `ReadHandle` readers) are physically removed;
+  line-pointers go DEAD → UNUSED only after a secondary-index vacuum pass
+  clears the aliasing hazard (EdgeIndex/CsrIndex/BTree/InvertedIndex/Vector).
+- Crash-safe: redo-only idempotent `WAL_VACUUM`, new D7 crash-injection point;
+  page compaction + free-space map enable slot reuse. `benches/vacuum.rs` +
+  before/after space measurement. 247 unit + 12 crash-harness green.
+- Storage-core lane, disjoint from SQL/Surface — no code conflicts on rebase,
+  only narrative-doc conflicts (resolved). Full record in `PROGRESS.md`'s M10
+  entry; plan `m10_heap_vacuum_gc.md` marked SHIPPED.
 
 ### 2026-07-08 — M11 SQL constraints landed (SQL lane, branch `sql-constraints`)
 - Constraints (PK/FK/UNIQUE/NOT NULL/CHECK/DEFAULT), column- and table-level,

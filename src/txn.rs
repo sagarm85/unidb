@@ -75,6 +75,15 @@ pub struct TxnInner {
     active: HashMap<Xid, Transaction>,
     committed: HashSet<Xid>,
     aborted: HashSet<Xid>,
+    /// Live concurrent-reader snapshots (M10.a). A `ReadHandle` read allocates
+    /// no xid and never enters `active`, so without this a long-running
+    /// off-writer-thread reader would be invisible to `vacuum_horizon` — and
+    /// the writer could reclaim a tuple version that reader's in-flight scan
+    /// still needs. Each entry is a live read snapshot's `xmin`, keyed by a
+    /// registration id so it can be dropped when the read finishes (see
+    /// [`ReadRegistration`]). Held only for the duration of one read call.
+    read_registrations: HashMap<u64, Xid>,
+    next_reg_id: u64,
 }
 
 impl TxnInner {
@@ -82,6 +91,21 @@ impl TxnInner {
         let active_xids: Vec<Xid> = self.active.keys().copied().collect();
         let xmin = active_xids.iter().copied().min().unwrap_or(self.next_xid);
         Snapshot::new(xmin, self.next_xid, active_xids)
+    }
+
+    /// The vacuum horizon (`OldestXmin`, M10.a): the minimum `snapshot.xmin`
+    /// across every live writer transaction **and** every live concurrent
+    /// reader (6b). A tuple version whose committed `xmax` is strictly below
+    /// this can never again be seen as live by any current or future snapshot,
+    /// so it is safe to physically reclaim. Conservative on purpose: a
+    /// long-lived `REPEATABLE READ` transaction (or a slow reader) legitimately
+    /// holds the horizon back and blocks reclamation — the same behavior, and
+    /// the same operational footgun, as Postgres. Falls back to `next_xid`
+    /// when nothing is live (everything below it is then reclaimable).
+    fn vacuum_horizon(&self) -> Xid {
+        let writers = self.active.values().map(|t| t.snapshot.xmin);
+        let readers = self.read_registrations.values().copied();
+        writers.chain(readers).min().unwrap_or(self.next_xid)
     }
 
     /// The snapshot a statement inside `xid` should read under: fresh for
@@ -115,15 +139,48 @@ pub fn snapshot_for_statement(shared: &SharedTxn, xid: Xid) -> Result<Snapshot> 
     lock_txn(shared).snapshot_for_statement(xid)
 }
 
+/// A live-reader registration (M10.a). While one of these is alive, the
+/// reader's snapshot `xmin` is included in [`TransactionManager::
+/// vacuum_horizon`], so the writer thread cannot reclaim a tuple version this
+/// concurrent read still needs. Dropped (deregistered) automatically when the
+/// read finishes — the [`Drop`] impl is the whole point, so callers must hold
+/// it for the entire duration of the read, not discard it eagerly.
+#[must_use = "hold the registration for the whole read; dropping it early lets vacuum reclaim rows the read still needs"]
+pub struct ReadRegistration {
+    shared: SharedTxn,
+    id: u64,
+}
+
+impl Drop for ReadRegistration {
+    fn drop(&mut self) {
+        lock_txn(&self.shared).read_registrations.remove(&self.id);
+    }
+}
+
 /// A self-contained READ COMMITTED snapshot for a **read-only** statement that
 /// never enters the writer thread (6b): no xid is allocated, no `WAL_TXN_BEGIN`
 /// is written. Returns the snapshot plus a sentinel `self_xid` (the current
 /// `next_xid`, which no committed or active transaction can equal), so
 /// `mvcc::is_visible`'s "my own uncommitted write" branch is never taken — a
-/// read-only reader has no writes of its own to see.
-pub fn read_snapshot(shared: &SharedTxn) -> (Snapshot, Xid) {
-    let inner = lock_txn(shared);
-    (inner.compute_snapshot(), inner.next_xid)
+/// read-only reader has no writes of its own to see — plus a
+/// [`ReadRegistration`] that holds the vacuum horizon back for the life of the
+/// read (M10.a). The registration must be kept alive until the read's pages
+/// have all been consumed.
+pub fn read_snapshot(shared: &SharedTxn) -> (Snapshot, Xid, ReadRegistration) {
+    let mut inner = lock_txn(shared);
+    let snapshot = inner.compute_snapshot();
+    let self_xid = inner.next_xid;
+    let id = inner.next_reg_id;
+    inner.next_reg_id += 1;
+    inner.read_registrations.insert(id, snapshot.xmin);
+    (
+        snapshot,
+        self_xid,
+        ReadRegistration {
+            shared: Arc::clone(shared),
+            id,
+        },
+    )
 }
 
 fn lock_txn(shared: &SharedTxn) -> MutexGuard<'_, TxnInner> {
@@ -154,6 +211,8 @@ impl TransactionManager {
                 active: HashMap::new(),
                 committed: HashSet::new(),
                 aborted: HashSet::new(),
+                read_registrations: HashMap::new(),
+                next_reg_id: 1,
             })),
         }
     }
@@ -215,6 +274,13 @@ impl TransactionManager {
     /// READ COMMITTED, the fixed BEGIN-time snapshot for REPEATABLE READ/SI.
     pub fn snapshot_for_statement(&self, xid: Xid) -> Result<Snapshot> {
         self.lock().snapshot_for_statement(xid)
+    }
+
+    /// The vacuum horizon (`OldestXmin`, M10.a) — see [`TxnInner::
+    /// vacuum_horizon`]. Includes both live writer transactions and live
+    /// concurrent readers (6b `ReadHandle`s).
+    pub fn vacuum_horizon(&self) -> Xid {
+        self.lock().vacuum_horizon()
     }
 
     /// Record a mutation for possible later rollback. Called by the Engine
@@ -428,5 +494,64 @@ mod tests {
     #[test]
     fn recover_next_xid_defaults_to_one_with_no_txns() {
         assert_eq!(TransactionManager::recover_next_xid(&[]), 1);
+    }
+
+    // ── M10.a: vacuum horizon ────────────────────────────────────────────────
+
+    #[test]
+    fn horizon_is_next_xid_when_nothing_live() {
+        let mgr = TransactionManager::with_next_xid(42);
+        assert_eq!(mgr.vacuum_horizon(), 42);
+    }
+
+    #[test]
+    fn long_lived_rr_txn_pins_the_horizon() {
+        let dir = tempdir().unwrap();
+        let (_pool, _heap, mut wal) = setup(dir.path());
+        let mgr = TransactionManager::new();
+        let mut lock_mgr = LockManager::new();
+
+        // A long-lived RR reader takes its snapshot early and never finishes.
+        let rr = mgr.begin(IsolationLevel::RepeatableRead, &mut wal).unwrap();
+        // Later transactions come and go.
+        for _ in 0..5 {
+            let x = mgr.begin(IsolationLevel::ReadCommitted, &mut wal).unwrap();
+            mgr.commit(x, &mut wal, &mut lock_mgr).unwrap();
+        }
+        // The horizon is still pinned to rr's fixed snapshot xmin — a version
+        // a later transaction deleted is NOT yet reclaimable while rr lives.
+        let pinned = mgr.snapshot_for_statement(rr).unwrap().xmin;
+        assert_eq!(mgr.vacuum_horizon(), pinned);
+
+        mgr.commit(rr, &mut wal, &mut lock_mgr).unwrap();
+        // Once rr finishes, the horizon advances past where rr held it.
+        assert!(mgr.vacuum_horizon() > pinned);
+    }
+
+    #[test]
+    fn concurrent_reader_registration_holds_horizon_back() {
+        let dir = tempdir().unwrap();
+        let (_pool, _heap, mut wal) = setup(dir.path());
+        let mgr = TransactionManager::new();
+        let mut lock_mgr = LockManager::new();
+
+        // Advance next_xid past 1 by running a couple of transactions.
+        for _ in 0..3 {
+            let x = mgr.begin(IsolationLevel::ReadCommitted, &mut wal).unwrap();
+            mgr.commit(x, &mut wal, &mut lock_mgr).unwrap();
+        }
+        let shared = mgr.shared();
+        // With nothing live, the horizon is next_xid.
+        let free_horizon = mgr.vacuum_horizon();
+
+        // A concurrent reader takes a snapshot: its registration holds the
+        // horizon at that snapshot's xmin for as long as the guard lives.
+        let (snap, _self_xid, reg) = super::read_snapshot(&shared);
+        assert_eq!(mgr.vacuum_horizon(), snap.xmin);
+        assert!(mgr.vacuum_horizon() <= free_horizon);
+
+        // Dropping the registration releases the hold.
+        drop(reg);
+        assert_eq!(mgr.vacuum_horizon(), free_horizon);
     }
 }

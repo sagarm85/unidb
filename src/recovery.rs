@@ -15,6 +15,7 @@ use crate::{
     format::{
         u64_from_le, Xid, INVALID_LSN, WAL_ABORT, WAL_BEGIN, WAL_CHECKPOINT, WAL_COMMIT,
         WAL_DELETE, WAL_INSERT, WAL_TXN_ABORT, WAL_TXN_BEGIN, WAL_TXN_COMMIT, WAL_UPDATE,
+        WAL_VACUUM,
     },
     heap::decode_insert_redo,
     page::SlottedPage,
@@ -268,6 +269,29 @@ fn redo_record(r: &WalRecord, pool: &mut BufferPool, page_size: usize) -> Result
             page.delete(r.slot)?;
             page.set_lsn(r.lsn);
             pool.write_page(&page)?;
+            pool.unpin(r.page_id);
+        }
+        WAL_VACUUM => {
+            // M10, redo-only + idempotent. Two shapes, distinguished by slot:
+            //   slot == u16::MAX : redo payload is a full compacted page image
+            //     (M10.d) — reconstruct it and re-stamp this record's LSN.
+            //   otherwise        : mark that one line pointer DEAD (M10.b).
+            // The page-LSN check makes both a no-op once already applied (e.g.
+            // a later reuse of the slot bumped the page past this record).
+            let mut page = fetch_or_create(pool, r.page_id, page_size)?;
+            if page.lsn() >= r.lsn {
+                pool.unpin(r.page_id);
+                return Ok(());
+            }
+            if r.slot == u16::MAX {
+                let mut img = SlottedPage::from_bytes_unchecked(r.redo.clone());
+                img.set_lsn(r.lsn);
+                pool.write_page(&img)?;
+            } else {
+                page.mark_dead(r.slot)?;
+                page.set_lsn(r.lsn);
+                pool.write_page(&page)?;
+            }
             pool.unpin(r.page_id);
         }
         _ => {}

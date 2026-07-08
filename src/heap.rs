@@ -32,8 +32,8 @@ use crate::{
         INVALID_PAGE_ID, PAGE_TYPE_HEAP,
     },
     lockmgr::{LockManager, RecordId},
-    mvcc::{is_visible, Snapshot},
-    page::SlottedPage,
+    mvcc::{is_reclaimable, is_visible, Snapshot},
+    page::{SlotState, SlottedPage},
     wal::Wal,
 };
 
@@ -132,6 +132,16 @@ impl Heap {
         reader: &P,
     ) -> Result<Vec<u8>> {
         let page = reader.read_page(row_id.page_id)?;
+        // A slot vacuum has reclaimed (DEAD/UNUSED, M10) resolves to "no
+        // visible version" under any snapshot, not a hard error — a stale
+        // secondary-index candidate pointing at a reclaimed slot is filtered
+        // out here exactly like a superseded version.
+        if !matches!(page.slot_state(row_id.slot), Ok(SlotState::Live)) {
+            return Err(DbError::NoVisibleVersion {
+                page_id: row_id.page_id,
+                slot: row_id.slot,
+            });
+        }
         let th = page.tuple_header(row_id.slot)?;
         if is_visible(th.xmin, th.xmax, snapshot, self_xid) {
             on_read(self_xid, row_id);
@@ -328,6 +338,11 @@ impl Heap {
             let page = reader.read_page(page_id)?;
             let sc = page.slot_count_pub();
             for slot in 0..sc {
+                // Skip line pointers a vacuum has reclaimed (DEAD/UNUSED,
+                // M10) — they carry no resolvable tuple body.
+                if !matches!(page.slot_state(slot), Ok(SlotState::Live)) {
+                    continue;
+                }
                 let th = page.tuple_header(slot)?;
                 if is_visible(th.xmin, th.xmax, snapshot, self_xid) {
                     let row_id = RowId { page_id, slot };
@@ -370,6 +385,79 @@ impl Heap {
         self.pages.push(pid);
         tracing::debug!(page_id = pid, "heap page allocated");
         Ok(pid)
+    }
+
+    // ── M10: vacuum / garbage collection ─────────────────────────────────────
+
+    /// Every reclaimable tuple version in this heap under `horizon` (M10.b): a
+    /// raw *physical* scan (not MVCC-filtered) of every LIVE slot, keeping the
+    /// ones whose committed `xmax` is below the horizon (`mvcc::is_reclaimable`
+    /// — the inverse of `is_visible`). These are the versions no live or future
+    /// snapshot can ever see again.
+    pub fn collect_reclaimable<P: PageReader>(
+        &self,
+        horizon: Xid,
+        reader: &P,
+    ) -> Result<Vec<RowId>> {
+        let mut out = Vec::new();
+        for &page_id in &self.pages {
+            let page = reader.read_page(page_id)?;
+            let sc = page.slot_count_pub();
+            for slot in 0..sc {
+                if !matches!(page.slot_state(slot), Ok(SlotState::Live)) {
+                    continue;
+                }
+                let th = page.tuple_header(slot)?;
+                if is_reclaimable(th.xmax, horizon) {
+                    out.push(RowId { page_id, slot });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Mark one reclaimable version's line pointer DEAD (M10.b): the slot stops
+    /// resolving, but its pointer is retained and NOT reusable — a stale
+    /// secondary-index entry may still reference `(page, slot)` until vacuum's
+    /// index pass promotes it (M10.c/d). WAL-logged as a redo-only, idempotent
+    /// mini-txn (D2/D5); no undo, since re-freeing already-dead space on
+    /// recovery replay is a no-op.
+    pub fn mark_dead(&mut self, row_id: RowId, pool: &mut BufferPool, wal: &mut Wal) -> Result<()> {
+        let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
+        let mut page = pool.fetch_page_for_write(row_id.page_id, wal)?;
+        let lsn = wal.log_vacuum(txn_id, begin_lsn, row_id.page_id, row_id.slot, &[])?;
+        page.mark_dead(row_id.slot)?;
+        page.set_lsn(lsn);
+        pool.write_page(&page)?;
+        pool.unpin(row_id.page_id);
+        wal.commit_mini_txn(txn_id, lsn)?;
+        Ok(())
+    }
+
+    /// Compact one page (M10.d): physically drop the bodies of DEAD/UNUSED
+    /// slots, coalesce the freed space, and promote every reclaimed slot to
+    /// UNUSED (reusable). WAL-logged redo-only as a full compacted page image
+    /// (`slot == u16::MAX`), idempotent on replay via the page LSN check.
+    /// Returns the number of bytes reclaimed. **Only** call this after the
+    /// index-clean pass (M10.c), since it makes reclaimed slots reusable.
+    pub fn compact_page(
+        &mut self,
+        page_id: PageId,
+        pool: &mut BufferPool,
+        wal: &mut Wal,
+    ) -> Result<usize> {
+        let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
+        let mut page = pool.fetch_page_for_write(page_id, wal)?;
+        let reclaimed = page.compact();
+        // Log the compacted bytes *before* stamping the record's LSN — recovery
+        // reconstructs the image and re-stamps `r.lsn` itself (see recovery.rs).
+        let image = page.as_bytes().to_vec();
+        let lsn = wal.log_vacuum(txn_id, begin_lsn, page_id, u16::MAX, &image)?;
+        page.set_lsn(lsn);
+        pool.write_page(&page)?;
+        pool.unpin(page_id);
+        wal.commit_mini_txn(txn_id, lsn)?;
+        Ok(reclaimed)
     }
 }
 
@@ -605,6 +693,79 @@ mod tests {
         assert_eq!(heap.get(r1, &snap, xid, &pool).unwrap(), b"row1");
         assert_eq!(heap.get(r2, &snap, xid, &pool).unwrap(), b"row2");
         assert_eq!(heap.get(r3, &snap, xid, &pool).unwrap(), b"row3");
+    }
+
+    // ── M10: vacuum ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn collect_reclaimable_finds_only_committed_deleted_below_horizon() {
+        let dir = tempdir().unwrap();
+        let (mut heap, mut pool, mut wal, mut lock_mgr) = setup(dir.path());
+        let xid = 1;
+        let live = heap.insert(b"live", xid, &mut pool, &mut wal).unwrap();
+        let dead = heap.insert(b"dead", xid, &mut pool, &mut wal).unwrap();
+        heap.delete(dead, xid, &mut pool, &mut wal, &mut lock_mgr)
+            .unwrap();
+
+        // Horizon below the deleter (xid=1): nothing reclaimable yet.
+        assert!(heap.collect_reclaimable(1, &pool).unwrap().is_empty());
+        // Horizon above the deleter: the deleted version is reclaimable, the
+        // live one is not.
+        let reclaimable = heap.collect_reclaimable(5, &pool).unwrap();
+        assert_eq!(reclaimable, vec![dead]);
+        assert!(!reclaimable.contains(&live));
+    }
+
+    #[test]
+    fn mark_dead_removes_version_and_survives_visibility() {
+        let dir = tempdir().unwrap();
+        let (mut heap, mut pool, mut wal, mut lock_mgr) = setup(dir.path());
+        let xid = 1;
+        let keep = heap.insert(b"keep", xid, &mut pool, &mut wal).unwrap();
+        let gone = heap.insert(b"gone", xid, &mut pool, &mut wal).unwrap();
+        heap.delete(gone, xid, &mut pool, &mut wal, &mut lock_mgr)
+            .unwrap();
+
+        for rid in heap.collect_reclaimable(5, &pool).unwrap() {
+            heap.mark_dead(rid, &mut pool, &mut wal).unwrap();
+        }
+        // The kept row is still visible; the vacuumed one is gone from scan.
+        let snap = Snapshot::new(5, 5, vec![]);
+        let rows: Vec<Vec<u8>> = heap
+            .scan(&snap, 5, &pool)
+            .unwrap()
+            .into_iter()
+            .map(|(_, d)| d)
+            .collect();
+        assert_eq!(rows, vec![b"keep".to_vec()]);
+        assert_eq!(heap.get(keep, &snap, 5, &pool).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn compact_page_reclaims_space() {
+        let dir = tempdir().unwrap();
+        let (mut heap, mut pool, mut wal, mut lock_mgr) = setup(dir.path());
+        let xid = 1;
+        let big = vec![b'z'; 400];
+        let dead = heap.insert(&big, xid, &mut pool, &mut wal).unwrap();
+        heap.insert(b"survivor", xid, &mut pool, &mut wal).unwrap();
+        heap.delete(dead, xid, &mut pool, &mut wal, &mut lock_mgr)
+            .unwrap();
+        heap.mark_dead(dead, &mut pool, &mut wal).unwrap();
+
+        let reclaimed = heap
+            .compact_page(dead.page_id, &mut pool, &mut wal)
+            .unwrap();
+        assert!(reclaimed >= 400, "compaction must reclaim the dead body");
+
+        let snap = Snapshot::new(5, 5, vec![]);
+        let rows: Vec<Vec<u8>> = heap
+            .scan(&snap, 5, &pool)
+            .unwrap()
+            .into_iter()
+            .map(|(_, d)| d)
+            .collect();
+        assert_eq!(rows, vec![b"survivor".to_vec()]);
     }
 
     #[test]

@@ -49,6 +49,25 @@ impl EdgeIndex {
         }
     }
 
+    /// Remove every entry pointing at `row_id`, regardless of which `from_id`
+    /// bucket holds it (M10.c index vacuum). Unlike `remove`, the caller need
+    /// not know the edge's `from_id` — vacuum only has the physical `RowId` of
+    /// a reclaimed tuple. This is the load-bearing fix for the vacuum aliasing
+    /// hazard: an aborted `create_edge` leaves a stale `from_id -> RowId` entry
+    /// (abort has no index hook), which becomes a *wrong-but-visible* result
+    /// the moment that slot is reused, unless it is scrubbed here first.
+    /// Returns `true` if any entry was removed.
+    pub fn remove_rowid(&mut self, row_id: RowId) -> bool {
+        let mut removed = false;
+        self.by_from.retain(|_, list| {
+            let before = list.len();
+            list.retain(|&existing| existing != row_id);
+            removed |= list.len() != before;
+            !list.is_empty()
+        });
+        removed
+    }
+
     pub fn candidates(&self, from_id: i64) -> &[RowId] {
         self.by_from.get(&from_id).map_or(&[], |v| v.as_slice())
     }
@@ -110,6 +129,13 @@ pub fn resolve_candidates_batched(
     for (page_id, slots) in by_page {
         let page = pool.fetch_page(page_id)?;
         for slot in slots {
+            // Skip line pointers a vacuum has reclaimed (DEAD/UNUSED, M10): a
+            // stale index candidate pointing at one carries no tuple to
+            // resolve. (Correctly reused slots are handled by the index-vacuum
+            // pass having removed such stale entries — see M10.c.)
+            if !matches!(page.slot_state(slot), Ok(crate::page::SlotState::Live)) {
+                continue;
+            }
             let th = page.tuple_header(slot)?;
             if is_visible(th.xmin, th.xmax, snapshot, self_xid) {
                 let bytes = page.get(slot)?.to_vec();
@@ -167,5 +193,18 @@ mod tests {
         let mut idx = EdgeIndex::new();
         idx.remove(999, rid(0, 0));
         assert!(idx.is_empty());
+    }
+
+    #[test]
+    fn remove_rowid_scrubs_entry_without_knowing_from_id() {
+        let mut idx = EdgeIndex::new();
+        idx.insert(100, rid(3, 0));
+        idx.insert(200, rid(3, 1));
+        // Vacuum only has the physical RowId of the reclaimed tuple.
+        assert!(idx.remove_rowid(rid(3, 0)));
+        assert!(idx.candidates(100).is_empty());
+        assert_eq!(idx.candidates(200), &[rid(3, 1)]);
+        // Removing a RowId that isn't present returns false.
+        assert!(!idx.remove_rowid(rid(9, 9)));
     }
 }
