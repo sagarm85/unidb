@@ -254,6 +254,7 @@ pub fn execute(plan: LogicalPlan, ctx: &mut ExecCtx) -> Result<ExecResult> {
         } => exec_alter_drop_column(&table, &column, if_exists, ctx),
         LogicalPlan::DropTable { table, if_exists } => exec_drop_table(&table, if_exists, ctx),
         LogicalPlan::Truncate { table } => exec_truncate(&table, ctx),
+        LogicalPlan::Analyze { table } => exec_analyze(&table, ctx),
     }
 }
 
@@ -299,6 +300,23 @@ fn exec_drop_table(table: &str, if_exists: bool, ctx: &mut ExecCtx) -> Result<Ex
         Err(DbError::TableNotFound(_)) if if_exists => Ok(ExecResult::DroppedTable),
         Err(e) => Err(e),
     }
+}
+
+/// `ANALYZE` (P4.d): scan the table's live rows under the statement snapshot,
+/// compute statistics, and persist them on the catalog (durable — never
+/// recomputed on open). Returns an empty result set.
+fn exec_analyze(table: &str, ctx: &mut ExecCtx) -> Result<ExecResult> {
+    let table_def = ctx.catalog.lookup(table)?.clone();
+    let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+    let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+    let mut rows = Vec::new();
+    for (_, bytes) in heap.scan(&snapshot, ctx.xid, ctx.pool)? {
+        rows.push(decode_row(&bytes, &table_def.columns)?);
+    }
+    let stats = crate::sql::statistics::compute(&rows, &table_def.columns);
+    let mut cctx = catalog_ctx!(ctx);
+    ctx.catalog.set_table_stats(table, stats, &mut cctx)?;
+    Ok(ExecResult::Rows(Vec::new()))
 }
 
 fn exec_truncate(table: &str, ctx: &mut ExecCtx) -> Result<ExecResult> {

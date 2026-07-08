@@ -49,6 +49,15 @@ fn convert_statement(stmt: Statement) -> Result<LogicalPlan> {
             ..
         } => convert_drop(object_type, names, if_exists),
         Statement::Truncate(t) => convert_truncate(t),
+        Statement::Analyze(a) => {
+            let table = a
+                .table_name
+                .ok_or_else(|| {
+                    DbError::SqlUnsupported("ANALYZE requires a table name in v1".into())
+                })?
+                .to_string();
+            Ok(LogicalPlan::Analyze { table })
+        }
         other => Err(DbError::SqlUnsupported(format!(
             "unsupported statement: {other}"
         ))),

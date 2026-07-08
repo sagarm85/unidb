@@ -96,7 +96,8 @@ pub fn bind_params(plan: &mut LogicalPlan, params: &[Literal]) -> Result<()> {
         | LogicalPlan::AlterTableAddColumn { .. }
         | LogicalPlan::AlterTableDropColumn { .. }
         | LogicalPlan::DropTable { .. }
-        | LogicalPlan::Truncate { .. } => {}
+        | LogicalPlan::Truncate { .. }
+        | LogicalPlan::Analyze { .. } => {}
     }
     Ok(())
 }
@@ -248,6 +249,8 @@ pub enum LogicalPlan {
     DropTable { table: String, if_exists: bool },
     /// `TRUNCATE [TABLE] t` (P2.c).
     Truncate { table: String },
+    /// `ANALYZE [TABLE] t` (P4.d): gather + persist optimizer statistics.
+    Analyze { table: String },
 }
 
 /// AND the table's RLS policy (if any) into the plan's predicate. This is
@@ -296,7 +299,8 @@ pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog) -> LogicalPlan {
         | LogicalPlan::AlterTableAddColumn { .. }
         | LogicalPlan::AlterTableDropColumn { .. }
         | LogicalPlan::DropTable { .. }
-        | LogicalPlan::Truncate { .. }) => other,
+        | LogicalPlan::Truncate { .. }
+        | LogicalPlan::Analyze { .. }) => other,
     }
 }
 

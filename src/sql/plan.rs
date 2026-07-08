@@ -60,6 +60,17 @@ pub enum PlanNode {
         qualifier: String,
         output: Vec<ColumnRef>,
     },
+    /// Index scan (P4.d): probe a base table's durable B-Tree for the rows
+    /// matching `column <op> value`, then fetch them. Chosen by the cost-based
+    /// optimizer when the predicate is estimated selective.
+    IndexScan {
+        table: String,
+        qualifier: String,
+        column: String,
+        op: crate::sql::logical::CmpOp,
+        value: Literal,
+        output: Vec<ColumnRef>,
+    },
     /// Block nested-loop join (cross joins and non-equi conditions).
     NestedLoopJoin {
         left: Box<PlanNode>,
@@ -167,6 +178,7 @@ impl PlanNode {
         match self {
             PlanNode::Scan { output, .. }
             | PlanNode::CteScan { output, .. }
+            | PlanNode::IndexScan { output, .. }
             | PlanNode::NestedLoopJoin { output, .. }
             | PlanNode::HashJoin { output, .. }
             | PlanNode::MergeJoin { output, .. }
@@ -192,15 +204,11 @@ pub type CteSchemas = std::collections::HashMap<String, Vec<ColumnRef>>;
 /// Pipeline (SQL logical order): FROM → WHERE → [Aggregate → HAVING] →
 /// Projection → DISTINCT → ORDER BY → LIMIT/OFFSET.
 pub fn plan_query(spec: &QuerySpec, catalog: &Catalog, ctes: &CteSchemas) -> Result<PlanNode> {
-    let mut node = plan_from(&spec.from, catalog, ctes)?;
-    if let Some(sel) = &spec.selection {
-        let output = node.output().to_vec();
-        node = PlanNode::Filter {
-            input: Box::new(node),
-            predicate: sel.clone(),
-            output,
-        };
-    }
+    // The cost-based optimizer (P4.d) builds the join + base-access + WHERE
+    // subtree: join order + algorithm from statistics, and index-vs-scan for
+    // base access. It falls back to the rule-based `plan_from` + `Filter`
+    // whenever it can't improve (no stats, outer joins, CTE relations).
+    let mut node = crate::sql::optimizer::plan_access(&spec.from, &spec.selection, catalog, ctes)?;
 
     // Does this query aggregate? Either an explicit GROUP BY, or an aggregate
     // anywhere in the SELECT list / HAVING / ORDER BY.
@@ -521,7 +529,7 @@ pub fn plan_from_schema(
     Ok(plan_from(from, catalog, ctes)?.output().to_vec())
 }
 
-fn plan_from(node: &FromNode, catalog: &Catalog, ctes: &CteSchemas) -> Result<PlanNode> {
+pub(crate) fn plan_from(node: &FromNode, catalog: &Catalog, ctes: &CteSchemas) -> Result<PlanNode> {
     match node {
         FromNode::Table(tref) => {
             let qualifier = tref.qualifier().to_string();

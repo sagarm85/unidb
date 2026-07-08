@@ -268,6 +268,10 @@ pub struct CatalogCtx<'a> {
 
 pub struct Catalog {
     tables: HashMap<String, TableDef>,
+    /// `ANALYZE`-computed per-table statistics (P4.d). Kept in a side map
+    /// rather than on [`TableDef`] so adding it touched only this file — no
+    /// storage-core or other-lane `TableDef` constructor needed a new field.
+    stats: HashMap<String, crate::sql::statistics::TableStats>,
 }
 
 impl Default for Catalog {
@@ -276,10 +280,27 @@ impl Default for Catalog {
     }
 }
 
+/// Owned catalog blob for deserialization (P4.d format: `{tables, stats}`).
+#[derive(serde::Deserialize)]
+struct PersistedCatalog {
+    #[serde(default)]
+    tables: HashMap<String, TableDef>,
+    #[serde(default)]
+    stats: HashMap<String, crate::sql::statistics::TableStats>,
+}
+
+/// Borrowed catalog blob for serialization.
+#[derive(serde::Serialize)]
+struct PersistedCatalogRef<'a> {
+    tables: &'a HashMap<String, TableDef>,
+    stats: &'a HashMap<String, crate::sql::statistics::TableStats>,
+}
+
 impl Catalog {
     pub fn new() -> Self {
         Self {
             tables: HashMap::new(),
+            stats: HashMap::new(),
         }
     }
 
@@ -292,9 +313,22 @@ impl Catalog {
         let page = pool.fetch_page(control.catalog_root)?;
         let payload = page.get(0)?.to_vec();
         pool.unpin(control.catalog_root);
-        let tables: HashMap<String, TableDef> =
+        // Backward compatible: a pre-P4.d catalog is a bare `{name: TableDef}`
+        // map; the P4.d format wraps it as `{tables, stats}`. Try the old shape
+        // first (it fails to parse the new one, since "tables"/"stats" aren't
+        // TableDefs), then the new one.
+        if let Ok(tables) = serde_json::from_slice::<HashMap<String, TableDef>>(&payload) {
+            return Ok(Self {
+                tables,
+                stats: HashMap::new(),
+            });
+        }
+        let p: PersistedCatalog =
             serde_json::from_slice(&payload).map_err(|e| DbError::CatalogCorrupt(e.to_string()))?;
-        Ok(Self { tables })
+        Ok(Self {
+            tables: p.tables,
+            stats: p.stats,
+        })
     }
 
     pub fn lookup(&self, name: &str) -> Result<&TableDef> {
@@ -418,6 +452,27 @@ impl Catalog {
         self.persist(ctx)
     }
 
+    /// Store `ANALYZE`-computed statistics for a table and durably persist the
+    /// catalog (P4.d). Stats ride the catalog's own WAL-logged page write, so
+    /// they survive reopen without recomputation.
+    pub fn set_table_stats(
+        &mut self,
+        table: &str,
+        stats: crate::sql::statistics::TableStats,
+        ctx: &mut CatalogCtx,
+    ) -> Result<()> {
+        if !self.tables.contains_key(table) {
+            return Err(DbError::TableNotFound(table.to_string()));
+        }
+        self.stats.insert(table.to_string(), stats);
+        self.persist(ctx)
+    }
+
+    /// The stored statistics for a table, if it has been `ANALYZE`d (P4.d).
+    pub fn table_stats(&self, table: &str) -> Option<&crate::sql::statistics::TableStats> {
+        self.stats.get(table)
+    }
+
     /// Allocate and durably persist the next value for a `SERIAL`/identity
     /// column (P2.d). Monotonic; the counter starts at 1. Persisting on every
     /// allocation keeps the sequence crash-safe (it survives reopen at the
@@ -513,6 +568,7 @@ impl Catalog {
         if self.tables.remove(table).is_none() {
             return Err(DbError::TableNotFound(table.to_string()));
         }
+        self.stats.remove(table);
         self.persist(ctx)
     }
 
@@ -525,12 +581,18 @@ impl Catalog {
             .get_mut(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
         t.pages.clear();
+        // Row set is now empty; previously gathered stats are stale.
+        self.stats.remove(table);
         self.persist(ctx)
     }
 
     fn persist(&self, ctx: &mut CatalogCtx) -> Result<()> {
+        let blob = PersistedCatalogRef {
+            tables: &self.tables,
+            stats: &self.stats,
+        };
         let encoded =
-            serde_json::to_vec(&self.tables).map_err(|e| DbError::CatalogCorrupt(e.to_string()))?;
+            serde_json::to_vec(&blob).map_err(|e| DbError::CatalogCorrupt(e.to_string()))?;
         let page_id = ctx.pool.alloc_page()?;
         let (txn_id, begin_lsn) = ctx.wal.begin_mini_txn()?;
         let mut page = SlottedPage::new(page_id, PAGE_TYPE_META, ctx.page_size);
@@ -551,6 +613,15 @@ impl Catalog {
     #[cfg(test)]
     pub fn insert_for_test(&mut self, def: TableDef) {
         self.tables.insert(def.name.clone(), def);
+    }
+
+    #[cfg(test)]
+    pub fn insert_stats_for_test(
+        &mut self,
+        table: &str,
+        stats: crate::sql::statistics::TableStats,
+    ) {
+        self.stats.insert(table.to_string(), stats);
     }
 }
 

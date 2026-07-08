@@ -69,6 +69,15 @@ impl Runner<'_, '_> {
         match node {
             PlanNode::Scan { table, output, .. } => self.scan(table, output),
 
+            PlanNode::IndexScan {
+                table,
+                column,
+                op,
+                value,
+                output,
+                ..
+            } => self.index_scan(table, column, *op, value, output),
+
             PlanNode::CteScan { name, output, .. } => {
                 let base = self
                     .cte_batches
@@ -255,6 +264,50 @@ impl Runner<'_, '_> {
         for (_, bytes) in heap.scan(&self.snapshot, self.ctx.xid, self.ctx.pool)? {
             let full = decode_row(&bytes, &table_def.columns)?;
             rows.push(visible_row(&full, &table_def));
+        }
+        Ok(Batch {
+            schema: output.to_vec(),
+            rows,
+        })
+    }
+
+    /// Index scan (P4.d): probe the column's durable B-Tree for `column <op>
+    /// value`, fetch the matching rows under the snapshot, project to visible
+    /// columns. Falls back to a full scan if the index isn't usable.
+    fn index_scan(
+        &mut self,
+        table: &str,
+        column: &str,
+        op: CmpOp,
+        value: &Literal,
+        output: &[ColumnRef],
+    ) -> Result<Batch> {
+        let table_def = self.ctx.catalog.lookup(table)?.clone();
+        let meta_page = table_def
+            .columns
+            .iter()
+            .find(|c| c.name == column && !c.dropped)
+            .and_then(|c| c.index_root);
+        let ordered = OrderedValue::try_from(value).ok();
+        let (Some(meta_page), Some(ordered)) = (meta_page, ordered) else {
+            // Can't use the index — fall back to a full scan (still correct).
+            return self.scan(table, output);
+        };
+        let tree = DiskBTree::new(meta_page, self.ctx.page_size);
+        let Some(candidate_ids) = tree.search(op, &ordered, self.ctx.pool)? else {
+            return self.scan(table, output);
+        };
+        let heap = Heap::from_pages(self.ctx.page_size, table_def.pages.clone());
+        let mut rows = Vec::new();
+        for row_id in candidate_ids {
+            match heap.get(row_id, &self.snapshot, self.ctx.xid, self.ctx.pool) {
+                Ok(bytes) => rows.push(visible_row(
+                    &decode_row(&bytes, &table_def.columns)?,
+                    &table_def,
+                )),
+                Err(DbError::NoVisibleVersion { .. }) => continue,
+                Err(e) => return Err(e),
+            }
         }
         Ok(Batch {
             schema: output.to_vec(),
