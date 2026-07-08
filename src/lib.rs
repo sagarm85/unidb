@@ -718,6 +718,25 @@ impl Engine {
         self.txn_mgr.commit(xid, &mut self.wal, &mut self.lock_mgr)
     }
 
+    /// Enable/disable WAL group-commit deferral (M9). When enabled, per-
+    /// statement and per-commit fsyncs are skipped; the caller becomes
+    /// responsible for calling [`Self::sync_wal`] to force durability before
+    /// acknowledging any commit to a client. This is intended for a single
+    /// owner of the `Engine` that serializes all access (the server writer
+    /// thread) — see `server::engine_handle`. Off by default. See
+    /// [`crate::wal::Wal::set_deferred_sync`] for the durability contract and
+    /// the current buffer-pool caveat (a working set exceeding the pool while
+    /// in deferred mode is not yet supported — tracked for M9 hardening).
+    pub fn set_deferred_sync(&mut self, deferred: bool) {
+        self.wal.set_deferred_sync(deferred);
+    }
+
+    /// Force the WAL to durable storage — the single fsync a group-commit
+    /// batch issues after appending many transactions' commit records.
+    pub fn sync_wal(&mut self) -> Result<()> {
+        self.wal.sync()
+    }
+
     /// Abort `xid`, physically undoing its writes and releasing every lock
     /// it held. `xid` is finished after this call and must not be reused.
     pub fn abort(&mut self, xid: Xid) -> Result<()> {

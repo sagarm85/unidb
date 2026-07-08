@@ -85,6 +85,24 @@
   marker design) is documented as known tech debt below but was
   deliberately not attempted as part of the M7 bug fix — that's new design
   work, not a regression fix.
+- **In-flight performance work (branch `m9-group-commit`, 2026-07-08, not
+  yet merged):** group commit + read-only fsync skip. The diagnosis (see
+  `docs/performance/fssdb/`) was that the ~3–4 ms floor on every durable op
+  is per-statement fsync (two per autocommit statement: the mini-txn commit
+  *and* the user-txn commit), compounded by the server's single writer
+  thread serializing everything (flat ~131→149→153 ops/s at 1/10/50
+  concurrent clients). Prototype landed two of three fixes: (1) read-only
+  txns skip `commit_user_txn` entirely (`txn.rs`) — point SELECT ~3.05 ms →
+  **1.09 µs**; (2) a `Wal::deferred_sync` mode + the server writer thread
+  batching all queued requests behind **one fsync per batch**
+  (`server/engine_handle.rs`) — concurrent INSERT throughput went from flat
+  to **scaling**: ~242 / ~756 / **~4,780 ops/s** at 1/10/50 clients (31× at
+  50). Full plan, numbers, correctness analysis, and the two remaining
+  items (buffer-pool force-WAL-on-evict hardening; concurrent read path) are
+  in `docs/backlog/group_commit_and_read_concurrency.md`. All 228 unit + 25
+  server + 11 crash-harness tests green; clippy/fmt clean. Default
+  (embedded, non-deferred) path and the crash harness are unchanged —
+  deferred mode is server-writer-thread-only.
 - Two explicitly deferred follow-ups remain, neither started: (1) the
   full CLAUDE.md §6 cross-domain "replaced stack" benchmark (possible
   since all four data models + the server exist, but a separate,
@@ -92,7 +110,7 @@
   parked Phase 2 SQL capability plan (`docs/backlog/
   phase2_sql_capability_expansion.md`). See Open questions below for
   what's still unresolved from M1-M5.
-- **Last updated:** 2026-07-07
+- **Last updated:** 2026-07-08
 
 ### Design note: xid reuse after checkpoint — a real M1-era bug, found and fixed during M5
 
@@ -1514,13 +1532,13 @@ plain reporting.
 
 ## Open questions / pending human input
 
-- **Decide: fix the read-only-transaction fsync now, or carry it into M2?**
-  (See the design note above and `PROGRESS.md`'s M1 entry.) It's a small,
-  well-understood fix (skip `wal.commit_user_txn()`'s fsync in
-  `TransactionManager::commit` when `Transaction.undo_log.is_empty()`), but
-  touches the commit path CLAUDE.md's conventions would want treated as a
-  deliberate change, not a drive-by — hence surfacing it here rather than
-  just fixing it.
+- ~~**Decide: fix the read-only-transaction fsync now, or carry it into
+  M2?**~~ **RESOLVED 2026-07-08** (branch `m9-group-commit`): fixed exactly
+  as proposed — `TransactionManager::commit` now skips `commit_user_txn`
+  (record + fsync) when `undo_log.is_empty()`. Treated as the deliberate
+  commit-path change CLAUDE.md wanted, with the user's go-ahead. Point
+  SELECT ~3.05 ms → 1.09 µs. Kept crossed off here so a future reader sees
+  where it went. See `docs/backlog/group_commit_and_read_concurrency.md`.
 - **Decide: is catalog DDL's lack of transactionality acceptable to carry
   into M2, or does it need addressing first?** (See below.)
 - **The slow-consumer-vs-vacuum durability contract is now resolved (M4)** —
@@ -1550,10 +1568,19 @@ plain reporting.
 
 ## Known issues / tech debt
 
-- **Read-only transactions pay a full commit fsync for nothing** (found in
-  M1.d's benchmark pass — see design note above). ~3,570x regression on
-  point SELECT vs. M0, isolated entirely to this one unnecessary fsync.
-  Straightforward fix identified, not applied — see Open questions above.
+- ~~**Read-only transactions pay a full commit fsync for nothing**~~
+  **FIXED 2026-07-08** (branch `m9-group-commit`): `TransactionManager::
+  commit` skips `commit_user_txn` when `undo_log.is_empty()`. Point SELECT
+  ~3.05 ms → 1.09 µs. See `docs/backlog/group_commit_and_read_concurrency.md`.
+- **Deferred-sync (group-commit) mode has no buffer-pool force-WAL-on-evict
+  yet** (new, branch `m9-group-commit`, 2026-07-08): while the server
+  writer thread runs in `Wal::deferred_sync` mode, `durable_lsn` lags within
+  a batch, so if a batch's working set exceeds the buffer pool the D5
+  eviction path (`find_victim`, which *skips* pages ahead of `durable_lsn`)
+  can fail to find a victim — a failed insert, **not corruption**. Never
+  triggers at test/bench scale (small working sets); the hardening (force
+  the WAL on eviction, proper ARIES no-force) is item 6a of the design doc.
+  The default embedded path is unaffected (it never enables deferred mode).
 - FSM is a linear scan over all heap pages — fine for M0/M1, revisit if insert
   throughput regresses.
 - **`DbError::BufferPoolFull` at large single-table scale (discovered M6,
@@ -1675,6 +1702,79 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-08 — Group commit + read-only fsync skip (prototype, branch `m9-group-commit`)
+
+- User goal: improve unidb's parallel/durable performance. Diagnosis (from
+  the prior FFSDB-eval session) confirmed against source: the ~3–4 ms floor
+  on every durable op is per-statement fsync, and the server serializes
+  everything through one writer thread (flat throughput under concurrency).
+- **Key source finding before touching anything:** an autocommit statement
+  does **two** fsyncs, not one — the mini-txn commit (`wal.rs::
+  commit_mini_txn`, D2, fires on *every* mutation) *and* the user-txn
+  commit (`commit_user_txn`, M1). So group-committing only the user-txn
+  level would have left the bigger per-statement floor untouched; the real
+  win required deferring the mini-txn fsync too. Verified `recovery.rs`
+  handles a read-only txn that writes no `WAL_TXN_COMMIT` (orphan BEGIN →
+  incomplete-user-txn undo pass finds no mutations to reverse → harmless).
+- **Implemented (default path + crash harness unchanged):**
+  1. `txn.rs` — read-only skip: `commit` skips `commit_user_txn` when
+     `undo_log.is_empty()`. Resolves the M1.d open question.
+  2. `wal.rs` — `deferred_sync` flag gating fsync in all four commit/abort
+     paths + public `sync()`. Off by default.
+  3. `lib.rs` — `Engine::set_deferred_sync` / `sync_wal`.
+  4. `server/engine_handle.rs` — `worker_loop` now drains all queued
+     requests into a batch, runs in deferred mode, and issues **one fsync
+     per batch** (`flush_pending`); commit/abort replies withheld until that
+     fsync so a client never sees a non-durable commit. Reads/inserts reply
+     immediately. Checkpoint forces a flush first.
+- **Numbers (M5 Pro, measured this session):** concurrent `POST /sql`
+  INSERT throughput ~131 / ~149 / ~153 → **~242 / ~756 / ~4,780 ops/s** at
+  1/10/50 clients (flat → scaling; 31× at 50). Embedded point SELECT
+  ~3.05 ms → **1.09 µs**.
+- **Verification:** 228 unit + 25 server + 11 crash-harness tests green;
+  clippy `-D warnings` + fmt clean. No §3 locked decision re-opened (D1/D2/
+  D5 upheld — deferring the commit fsync only delays when `durable_lsn`
+  advances; no page flushes ahead of the durable WAL).
+- **Not done (tracked in `docs/backlog/group_commit_and_read_concurrency.md`):**
+  6a buffer-pool force-WAL-on-evict (makes deferred mode unconditionally
+  safe for working sets > pool — see tech-debt entry); 6b concurrent read
+  path (readers off the single writer thread — the one real architectural
+  change, an addition to existing MVCC). "M9" filename is taken by the
+  parked Python-bindings doc, so this track is documented descriptively.
+- Not merged to `main` this session; on branch pending PR.
+
+### 2026-07-08 — FFSDB eval comparison doc (no code change)
+
+- User asked to eval <https://ffsdb.com/evals> against unidb and put the
+  comparison under `docs/performance/fssdb` (and Postgres "whatever is
+  possible"). FFS is the same competing project that prompted M6–M8.
+- Fetched FFS's published evals (FFS `2.0.0-alpha.1`, Apple M-series):
+  raw embedded index-primitive microbenchmarks (`ffs::BTree` vs sled,
+  `ffs::Hnsw` vs instant-distance, `ffs::Csr` vs petgraph, plus
+  Postgres+pgvector / LanceDB / Kùzu / Neo4j). **Central framing of the
+  writeup: FFS benchmarks raw non-durable index structures (ns–µs); unidb
+  benchmarks the full durable MVCC/WAL/SQL engine path (µs–ms). Direct
+  ns-vs-ms ratios measure durability, not index quality, and are
+  deliberately not headlined.**
+- Re-ran unidb's own benches fresh on this box (**Apple M5 Pro**, Rust
+  1.95, release): `graph` (adjacency 1k batched 75µs / 10k 744µs; edge
+  insert 3.41ms), `btree` (indexed point/range ~3.1ms flat vs full-scan
+  growing to ~4.5–4.9ms at 10k), `vector` (NEAR k=5 3.93ms; indexed insert
+  11.75ms/row; fulltext primitive 13.86µs). Ran a fresh **Postgres 18.4 +
+  pgvector 0.8.4** HNSW bench matching FFS's setup (10k×dim128, m=16/ef200):
+  build 770ms, HNSW query 43.5µs server-side, brute 1556µs.
+- **The one clean apples-to-apples: unidb's vector index *is*
+  `instant-distance`** (it wraps the crate), and instant-distance is one of
+  FFS's baselines — so FFS's "2.64× faster on query" is transitively a
+  direct statement about unidb's vector core. That's the most meaningful
+  single comparison and is called out as a real FFS win.
+- Deliverables (docs-only, no code touched): `docs/performance/fssdb/`
+  `README.md` (comparison + §5 Postgres head-to-heads, reusing M2/M3/M4
+  recorded PG numbers incl. the ~100× queue-poll win), `raw-results.md`
+  (provenance), `pgvector_bench.sql` (reproducer). Added a `performance/`
+  pointer to `docs/README.md`. No milestone opened/closed; `PROGRESS.md`
+  untouched (no feature shipped).
 
 ### 2026-07-07 — M8 (attach client) merged from worktree; M7 CSR-traversal bug found and fixed; M0-M8 all shipped
 

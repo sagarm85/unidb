@@ -118,6 +118,11 @@ starts here** — it is the single source of recovery truth.
   treat as one. Every statement — including each statement inside a larger
   user transaction — is its own mini-txn with its own commit fsync. (This
   is the single largest measured performance cost in the engine; see §11.)
+  **Update (2026-07-08, branch `m9-group-commit`):** a default-off
+  `Wal::deferred_sync` mode lets a single serialized owner (the server
+  writer thread) *append* mini-txn/user-txn commit records without fsyncing
+  and force durability once per request batch (group commit) — see §11.1.
+  The embedded path and the crash harness keep the per-statement fsync.
 - WAL records use length-prefix framing (`u32` LE) plus a per-record CRC32;
   a recovery scan stops cleanly at the first corrupt/truncated record.
 - **D5 — the invariant that must never break**: a dirty page may not be
@@ -236,11 +241,14 @@ not-in-active-set-and-in-range as committed. Abort therefore requires
 ### 4.4 Transaction manager
 
 `txn.rs`: begin/commit/abort, RC-vs-RR snapshot lifetime, lock release,
-xid issuance. `commit()` currently fsyncs unconditionally — **including
-for read-only transactions**, the single most visible latency bug in the
+xid issuance. **Correction (2026-07-08, branch `m9-group-commit`):**
+`commit()` previously fsynced unconditionally — *including for read-only
+transactions*, which was the single most visible latency bug in the
 benchmarks (point SELECT went 855 ns in M0 → 3.05 ms in M1 from this one
-fsync). Known, fix identified, deliberately not slipped in as a drive-by
-(§12).
+fsync). **Now fixed:** `commit()` skips `commit_user_txn` (WAL record +
+fsync) entirely when `undo_log.is_empty()`. Point SELECT is back to
+~1.09 µs. Safe because recovery treats the orphan `WAL_TXN_BEGIN` as an
+incomplete user txn whose undo pass finds no mutations to reverse.
 
 ### 4.5 The xid-reuse-after-checkpoint bug (fixed, control file v3)
 
@@ -634,22 +642,33 @@ independently in every milestone:
 
 - Single-statement-transaction INSERT/UPDATE: ~155–165 ops/s (M1) — ~30x
   behind SQLite, ~35x behind Postgres, and *flat* ever since.
-- Read-only transactions pay a commit fsync **for nothing**: point SELECT
-  855 ns (M0) → 3.05 ms (M1). Fix identified (skip the commit fsync when
-  `undo_log.is_empty()`), deliberately awaiting a reviewed change.
-- Server throughput ceiling: `POST /sql` is flat ~135→157→158 ops/s
+- Read-only transactions ~~pay a commit fsync **for nothing**~~ **— FIXED
+  2026-07-08 (branch `m9-group-commit`)**: point SELECT 855 ns (M0) →
+  3.05 ms (M1) → **~1.09 µs** now that `commit()` skips the fsync when
+  `undo_log.is_empty()`.
+- Server throughput ceiling: `POST /sql` was flat ~135→157→158 ops/s
   across 1/10/50 concurrent clients — the single-writer thread + per-op
   fsync, not HTTP (the HTTP/writer-thread layer itself costs only ~6%).
+  **Update 2026-07-08 (branch `m9-group-commit`):** group commit (below)
+  lifts this to **~242 → ~756 → ~4,780 ops/s** at 1/10/50 clients —
+  throughput now *scales* with concurrency instead of being flat.
 - `vacuum_events`: ~3.06–3.10 ms/row *regardless of batch size* — each
-  reclaimed row is its own fsyncing mini-txn.
+  reclaimed row is its own fsyncing mini-txn. (Not yet run under group
+  commit; the mini-txn fsync it pays is now deferrable in the same way.)
 - Batching statements inside one user transaction amortizes the
   *user-commit* fsync but not the per-statement one: 100-row single-txn
   INSERT still ~3.45 ms/row (M4) vs Postgres ~0.062 ms/row.
 
-Group commit / WAL batching has never been scheduled — it contradicts
-§1's "don't chase single-model throughput" only superficially; it is the
-prerequisite for the cross-domain workload being fast too, and is the top
-candidate for any performance-focused milestone.
+~~Group commit / WAL batching has never been scheduled~~ **Group commit
+landed 2026-07-08 (branch `m9-group-commit`, server writer thread) — see
+`docs/backlog/group_commit_and_read_concurrency.md`.** A default-off
+`Wal::deferred_sync` mode lets the single-owner server writer thread append
+all commit records for a drained request batch and force durability with a
+single fsync, withholding each commit's reply until that fsync so no client
+observes a non-durable commit. This is the prerequisite for the
+cross-domain workload being fast too. Two follow-ups remain: buffer-pool
+force-WAL-on-evict (hardening for working sets > pool in deferred mode) and
+a concurrent read path (readers off the single writer thread).
 
 ### 10.2 Where the engine is genuinely competitive
 
@@ -703,9 +722,13 @@ Cypher always use `EdgeIndex` (see §7.3). A future fix needs a
 staleness/generation marker proving CSR has incorporated every write up to
 a specific point before it can be safely preferred again.
 
-Performance debt: per-statement fsync / no group commit (§11.1);
-read-only-txn commit fsync (fix identified); WAL truncation rewrites the
-whole file (needs log segments); FSM is a linear scan; 256-frame buffer
+Performance debt: per-statement fsync — **group commit landed on the server
+writer thread 2026-07-08 (branch `m9-group-commit`), read-only-txn commit
+fsync fixed** (§11.1); its follow-ups are buffer-pool force-WAL-on-evict
+(needed for deferred-mode working sets > pool) and a concurrent read path
+(readers off the single writer thread) — see
+`docs/backlog/group_commit_and_read_concurrency.md`. WAL truncation rewrites
+the whole file (needs log segments); FSM is a linear scan; 256-frame buffer
 pool + `BufferPoolFull` at scale; HNSW full rebuild per upsert; CSR full
 rebuild per debounce pass (currently moot — CSR isn't consulted, see
 above); `poll_events` full-scan (needs a `seq` index); SSE
@@ -723,7 +746,10 @@ reverse (`to_id`) traversal; RLS is Rust-API-only; no automatic vacuum.
 Server gaps: no multi-request transaction sessions; no TLS (reverse-proxy
 assumption); verify-only JWT with no scopes (any valid token can hit
 `/checkpoint`); no gRPC; no writer-thread self-healing (process restart is
-the recovery model); read routes inherit the read-only fsync.
+the recovery model); ~~read routes inherit the read-only fsync~~ (fixed
+2026-07-08 — read-only commits no longer fsync); all requests still
+serialize through the single writer thread until the §11.1 concurrent-read
+follow-up lands.
 
 ---
 
@@ -747,6 +773,9 @@ the recovery model); read routes inherit the read-only fsync.
 
 ---
 
-*Document version: covers commit `af5601b` (M0–M8 complete, including the
-M7 CSR-traversal correction found during M8 merge verification). Update
+*Document version: covers M0–M8 complete (through commit `af5601b`,
+including the M7 CSR-traversal correction found during M8 merge
+verification), plus the post-M8 group-commit + read-only-fsync-skip
+performance work on branch `m9-group-commit` (2026-07-08) — see §3.3, §4.4,
+§11.1, §12 and `docs/backlog/group_commit_and_read_concurrency.md`. Update
 alongside the next milestone's closeout.*
