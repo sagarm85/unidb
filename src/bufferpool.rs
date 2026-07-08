@@ -131,6 +131,18 @@ pub struct BufferPool {
     /// single interval-opening image plus all of the page's subsequent redo
     /// records fully reconstruct it regardless of any torn on-disk state.
     fpi_logged: HashSet<PageId>,
+    /// Set once a data-file flush (`msync`) has failed (or a fault was
+    /// injected) — P1.b (fsyncgate). Like the WAL's poison, this is fatal for
+    /// the session: a failed `msync` may leave the OS having dropped the dirty
+    /// page while clearing its dirty bit, so the frame must **not** be marked
+    /// clean and no later flush may report success. Once poisoned, every
+    /// `flush_page` returns [`DbError::DurabilityFailure`].
+    flush_poisoned: bool,
+    /// Test/fault-injection hook (P1.b): when armed, the next `flush_page`
+    /// fails (and poisons the pool) *without* touching the real mmap, and
+    /// without marking the frame clean — so a test can prove the engine
+    /// refuses to report a page durable on a failed flush.
+    flush_fault_armed: bool,
 }
 
 impl BufferPool {
@@ -172,7 +184,22 @@ impl BufferPool {
             file_page_count,
             durable_wal_lsn: INVALID_LSN,
             fpi_logged: HashSet::new(),
+            flush_poisoned: false,
+            flush_fault_armed: false,
         })
+    }
+
+    /// Arm a one-shot data-file flush fault (P1.b fault injection). The next
+    /// `flush_page` fails and poisons the pool, without touching the real mmap
+    /// and without marking the frame clean — for tests that assert the engine
+    /// never reports a page durable on a failed flush.
+    pub fn arm_flush_fault(&mut self) {
+        self.flush_fault_armed = true;
+    }
+
+    /// Whether the pool has latched into the poisoned state (a flush failed).
+    pub fn is_flush_poisoned(&self) -> bool {
+        self.flush_poisoned
     }
 
     /// Log a full-page image (`WAL_FPI`) for `page_id` if one has not yet been
@@ -350,8 +377,18 @@ impl BufferPool {
 
     /// Flush a specific dirty page to disk. D5 checked again here.
     pub fn flush_page(&mut self, page_id: PageId, durable_wal_lsn: Lsn) -> Result<()> {
+        // P1.b: once a data-file flush has failed, never report success again.
+        if self.flush_poisoned {
+            return Err(DbError::DurabilityFailure(format!(
+                "buffer pool is poisoned by an earlier flush failure; page {page_id} cannot be reported durable"
+            )));
+        }
+
         let page = self.read_page_from_mmap(page_id)?;
 
+        // D5 (the invariant that must never break): a dirty page may not reach
+        // disk while its LSN is ahead of the durable WAL frontier — otherwise a
+        // crash would leave un-recoverable state (redo can't reach page.LSN).
         if durable_wal_lsn != INVALID_LSN && page.lsn() > durable_wal_lsn {
             return Err(DbError::Recovery(format!(
                 "D5 violation on flush: page {page_id} LSN {} > durable WAL LSN {durable_wal_lsn}",
@@ -359,11 +396,33 @@ impl BufferPool {
             )));
         }
 
+        // Fault injection (P1.b): fail before touching the mmap, poison the
+        // pool, and — critically — do NOT mark the frame clean.
+        if self.flush_fault_armed {
+            self.flush_fault_armed = false;
+            self.flush_poisoned = true;
+            tracing::error!(
+                page_id,
+                "data-file flush fault injected — poisoning pool (P1.b)"
+            );
+            return Err(DbError::DurabilityFailure(format!(
+                "injected data-file flush failure on page {page_id}"
+            )));
+        }
+
         let start = page_id as usize * self.page_size;
         let end = start + self.page_size;
         {
             let guard = self.mmap.read().map_err(|_| lock_poisoned())?;
-            guard.flush_range(start, end - start)?;
+            // On msync failure, poison and surface a fatal error *without*
+            // marking the frame clean — the OS may have dropped the dirty page.
+            if let Err(e) = guard.flush_range(start, end - start) {
+                drop(guard);
+                self.flush_poisoned = true;
+                return Err(DbError::DurabilityFailure(format!(
+                    "data-file msync failed on page {page_id}: {e}"
+                )));
+            }
         }
 
         if let Some(&frame_idx) = self.frame_index.get(&page_id) {
@@ -383,6 +442,14 @@ impl BufferPool {
     }
 
     pub fn flush_all(&mut self, durable_wal_lsn: Lsn) -> Result<()> {
+        // P1.b: a poisoned pool must never claim a successful flush, even with
+        // no currently-dirty frames — an earlier flush failure was lost.
+        if self.flush_poisoned {
+            return Err(DbError::DurabilityFailure(
+                "buffer pool is poisoned by an earlier flush failure; flush_all cannot succeed"
+                    .into(),
+            ));
+        }
         let dirty_pages: Vec<PageId> = self
             .frames
             .iter()
@@ -436,6 +503,15 @@ impl BufferPool {
                     continue;
                 }
                 // Durable: write it back before reusing the frame (ARIES steal).
+                // D5 tripwire (P1.b): we only reach here for a page whose LSN is
+                // at or behind the durable WAL frontier — assert it, so a future
+                // logic change to the filter above can't silently steal a page
+                // ahead of the WAL.
+                debug_assert!(
+                    self.durable_wal_lsn != INVALID_LSN && page_lsn <= self.durable_wal_lsn,
+                    "D5 violation at steal point: page {pid} LSN {page_lsn} > durable WAL {}",
+                    self.durable_wal_lsn
+                );
                 self.flush_page(pid, self.durable_wal_lsn)?;
             }
             return Ok(idx);
@@ -596,6 +672,42 @@ mod tests {
 
         // A wrong-sized image is rejected rather than silently misapplied.
         assert!(pool.restore_page_image(far_pid, &image[..ps - 1]).is_err());
+    }
+
+    /// P1.b: an injected data-file flush failure poisons the pool — the flush
+    /// returns a `DurabilityFailure`, the frame stays **dirty** (not marked
+    /// clean), and every later flush keeps failing (never falsely durable).
+    #[test]
+    fn flush_failure_poisons_and_keeps_page_dirty() {
+        let dir = tempdir().unwrap();
+        let mut pool = open_pool(dir.path(), 16);
+        let pid = pool.alloc_page().unwrap();
+        let _ = pool.fetch_page(pid).unwrap(); // bring pid into a frame
+        let mut page = SlottedPage::new(pid, PAGE_TYPE_HEAP, DEFAULT_PAGE_SIZE as usize);
+        page.set_lsn(5);
+        pool.write_page(&page).unwrap(); // marks the frame dirty
+
+        pool.arm_flush_fault();
+        let res = pool.flush_page(pid, 5);
+        assert!(
+            matches!(res, Err(DbError::DurabilityFailure(_))),
+            "a failed data-file flush must surface a fatal DurabilityFailure, got {res:?}"
+        );
+        assert!(pool.is_flush_poisoned(), "pool must latch poisoned");
+        // The frame must still be dirty — a poisoned flush cannot claim durable.
+        assert!(
+            pool.frames[pool.frame_index[&pid]].dirty,
+            "frame must remain dirty after a failed flush"
+        );
+        // Later flushes keep failing (poisoned), never a false success.
+        assert!(matches!(
+            pool.flush_page(pid, 5),
+            Err(DbError::DurabilityFailure(_))
+        ));
+        assert!(matches!(
+            pool.flush_all(5),
+            Err(DbError::DurabilityFailure(_))
+        ));
     }
 
     #[test]

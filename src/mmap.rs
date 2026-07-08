@@ -29,6 +29,12 @@ impl PageFileMmap {
         Ok(Self { inner })
     }
 
+    /// `msync` the given byte range to the backing file. An `Err` here is a
+    /// durability failure: the caller (`BufferPool::flush_page`) treats it as
+    /// fatal for the session (P1.b) — it does not mark the page clean and
+    /// poisons the pool, because a failed `msync` may leave the OS having
+    /// dropped the dirty page while clearing its dirty bit, so a retry could
+    /// falsely succeed.
     pub fn flush_range(&self, offset: usize, len: usize) -> Result<()> {
         self.inner.flush_range(offset, len)?;
         Ok(())

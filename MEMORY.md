@@ -80,9 +80,10 @@
   workspace's dependency union, which is *not* the right check here).
 - **Current work: Phase 1 — ACID & storage foundation** (the feature-freeze
   gate, `docs/backlog/phase1_acid_hardening.md`), on Core lane branch
-  `acid-hardening`. **P1.a (full-page-writes) is shipped**; P1.b–P1.e (fsync
-  hardening, alloc_page remap + configurable pool + real FSM, isolation
-  correctness, auto-checkpoint) are next, in that order, one PR each. See the
+  `acid-hardening`. **P1.a (full-page-writes) and P1.b (fsync-failure handling)
+  are shipped**; P1.c–P1.e (alloc_page remap + configurable pool + real FSM,
+  isolation correctness, auto-checkpoint) are next, in that order, one PR each.
+  See the
   Phase 1 section below. The roadmap is now `docs/backlog/roadmap.md` (6-phase
   plan); the older per-milestone backlog docs were retired. A CSR-preferring
   traversal fix (staleness/generation marker design) remains documented tech
@@ -152,9 +153,22 @@ one PR per checkpoint (P1.a → P1.e). **In progress as of 2026-07-08.**
   See `PROGRESS.md`'s Phase 1 entry for the full table + the documented
   fresh-page/catalog limitation (fresh un-referenced pages aren't FPI-covered —
   no committed-data loss, tracked for a later pass).
-- **P1.b–P1.e — not started.** fsync-failure handling; alloc_page remap fix +
-  configurable pool + real FSM; isolation correctness (RC re-eval + SSI);
-  auto-checkpoint. In that order, one PR each.
+- **P1.b — fsync-failure handling (fsyncgate) — SHIPPED (2026-07-08).** A
+  failed `fsync`/`msync` may leave the OS having dropped the dirty data while
+  clearing its dirty bit, so a retry can falsely succeed. Both durability
+  components now latch **poisoned** on failure and return the new
+  `DbError::DurabilityFailure` forever after — `Wal::fsync` doesn't advance
+  `durable_lsn`; `BufferPool::flush_page` doesn't mark the frame clean and
+  `flush_all` fails up-front when poisoned. Deterministic fault injection via
+  `Wal::arm_fsync_fault` / `BufferPool::arm_flush_fault` (+ `is_poisoned` /
+  `is_flush_poisoned`). D5 re-verified end-to-end with a new `debug_assert!`
+  tripwire at the `find_victim` steal point. New crash point **P12**
+  (`p12_fsync_failure_refuses_to_report_success`) injects a fault at both the
+  WAL-commit and data-file-flush boundaries; crash harness now 14 tests. No
+  format change. See `PROGRESS.md`'s Phase 1 → P1.b entry.
+- **P1.c–P1.e — not started.** alloc_page remap fix + configurable pool + real
+  FSM; isolation correctness (RC re-eval + SSI); auto-checkpoint. In that
+  order, one PR each.
 
 ### M10 — heap vacuum / MVCC GC (Core lane, branch `core-vacuum`, 2026-07-08)
 

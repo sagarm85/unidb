@@ -51,6 +51,13 @@ fn map_status(err: &DbError) -> (StatusCode, &'static str) {
         DbError::TxnAlreadyFinished { .. } => (StatusCode::BAD_REQUEST, "TXN_ALREADY_FINISHED"),
         DbError::BadPageSize(_) => (StatusCode::BAD_REQUEST, "BAD_PAGE_SIZE"),
 
+        // Durability failure (P1.b, fsyncgate) is fatal for the session — the
+        // engine can no longer guarantee writes reach disk and must be
+        // restarted. 503 signals the service is (temporarily) unable to handle
+        // the request, distinct from a generic 500, and mirrors how
+        // EngineUnavailable is a process-restart condition.
+        DbError::DurabilityFailure(_) => (StatusCode::SERVICE_UNAVAILABLE, "DURABILITY_FAILURE"),
+
         // Low-level storage/recovery/transport errors a well-formed client
         // request should never trigger.
         DbError::Io(_)

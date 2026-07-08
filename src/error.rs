@@ -38,6 +38,18 @@ pub enum DbError {
     #[error("recovery error: {0}")]
     Recovery(String),
 
+    /// A durability primitive (WAL `fsync` or data-file `msync`) failed
+    /// (P1.b — fsyncgate). This is **fatal for the session**: on many
+    /// platforms a failed `fsync`/`msync` may leave the OS having dropped the
+    /// dirty page while clearing its dirty bit, so a later retry can return
+    /// success without the data ever reaching disk. Rather than risk silently
+    /// reporting durable when it is not, the failing component (`Wal` /
+    /// `BufferPool`) latches into a poisoned state and returns this error for
+    /// every subsequent durability request. The correct remedy is a
+    /// process-level restart + recovery, not retrying in the same session.
+    #[error("durability failure (fatal for this session): {0}")]
+    DurabilityFailure(String),
+
     #[error("control file corrupt: {0}")]
     ControlFileCorrupt(String),
 
