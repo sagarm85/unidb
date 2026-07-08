@@ -770,9 +770,16 @@ Server gaps: no multi-request transaction sessions; no TLS (reverse-proxy
 assumption); verify-only JWT with no scopes (any valid token can hit
 `/checkpoint`); no gRPC; no writer-thread self-healing (process restart is
 the recovery model); ~~read routes inherit the read-only fsync~~ (fixed
-2026-07-08 — read-only commits no longer fsync); all requests still
-serialize through the single writer thread until the §11.1 concurrent-read
-follow-up lands.
+2026-07-08 — read-only commits no longer fsync). **Concurrent reads (6b,
+2026-07-08):** point reads (`GET /rows/:id`) now run off the single writer
+thread on a `Send + Sync` `ReadHandle` — a frame-free `SharedPageReader` over
+the buffer pool's `Arc<RwLock<PageFileMmap>>` plus the shared `Arc<Mutex>`
+txn snapshot state — so a read allocates no xid, writes no WAL, and never
+touches the writer's request channel. `Engine` itself stays deliberately
+non-`Sync`; `ReadHandle` is the shared-reader type (asserted `Send + Sync`).
+*Writes* still serialize through the single writer thread (by design — they
+are fsync-/group-commit-bound); concurrent SQL `SELECT` is the remaining 6b
+slice (needs a shared catalog + a read-only executor path).
 
 ---
 
@@ -798,8 +805,10 @@ follow-up lands.
 
 *Document version: covers M0–M8 complete (through commit `af5601b`,
 including the M7 CSR-traversal correction found during M8 merge
-verification), plus the post-M8 group-commit + read-only-fsync-skip
-+ buffer-pool force-WAL-on-evict performance work on branch
-`m9-group-commit` (2026-07-08) — see §3.3, §3.4, §4.4, §11.1, §12 and
-`docs/backlog/group_commit_and_read_concurrency.md`. Update alongside the
-next milestone's closeout.*
+verification), plus the post-M8 performance track (2026-07-08):
+group commit + read-only-fsync-skip + buffer-pool force-WAL-on-evict on
+branch `m9-group-commit`, and the concurrent-read-path *point-read* slice
+(shared `ReadHandle`) on branch `m9-concurrent-reads` — see §3.3, §3.4,
+§4.4, §8, §11.1, §12 and `docs/backlog/group_commit_and_read_concurrency.md`.
+Concurrent SQL `SELECT` remains. Update alongside the next milestone's
+closeout.*

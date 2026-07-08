@@ -55,6 +55,7 @@ pub mod mmap;
 pub mod mvcc;
 pub mod page;
 pub mod queue;
+pub mod read_handle;
 pub mod recovery;
 #[cfg(feature = "server")]
 pub mod server;
@@ -92,6 +93,7 @@ use crate::{
 
 pub use crate::error::DbError;
 pub use crate::heap::RowId;
+pub use crate::read_handle::ReadHandle;
 pub use crate::sql::executor::ExecResult as SqlResult;
 pub use crate::txn::IsolationLevel as Isolation;
 
@@ -716,6 +718,15 @@ impl Engine {
     /// this call and must not be reused.
     pub fn commit(&mut self, xid: Xid) -> Result<()> {
         self.txn_mgr.commit(xid, &mut self.wal, &mut self.lock_mgr)
+    }
+
+    /// A cloneable, `Send + Sync` handle for concurrent reads that run off the
+    /// single writer thread (6b). Derived from the buffer pool's shared mmap
+    /// and the shared transaction snapshot state, so many readers execute in
+    /// parallel with each other and with the writer, coordinating only through
+    /// MVCC snapshots. See [`crate::read_handle::ReadHandle`].
+    pub fn read_handle(&self) -> ReadHandle {
+        ReadHandle::new(self.pool.shared_reader(), self.txn_mgr.shared())
     }
 
     /// Enable/disable WAL group-commit deferral (M9). When enabled, per-

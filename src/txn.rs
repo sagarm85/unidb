@@ -115,6 +115,17 @@ pub fn snapshot_for_statement(shared: &SharedTxn, xid: Xid) -> Result<Snapshot> 
     lock_txn(shared).snapshot_for_statement(xid)
 }
 
+/// A self-contained READ COMMITTED snapshot for a **read-only** statement that
+/// never enters the writer thread (6b): no xid is allocated, no `WAL_TXN_BEGIN`
+/// is written. Returns the snapshot plus a sentinel `self_xid` (the current
+/// `next_xid`, which no committed or active transaction can equal), so
+/// `mvcc::is_visible`'s "my own uncommitted write" branch is never taken — a
+/// read-only reader has no writes of its own to see.
+pub fn read_snapshot(shared: &SharedTxn) -> (Snapshot, Xid) {
+    let inner = lock_txn(shared);
+    (inner.compute_snapshot(), inner.next_xid)
+}
+
 fn lock_txn(shared: &SharedTxn) -> MutexGuard<'_, TxnInner> {
     // Recover from a poisoned lock rather than panicking (a poisoned txn map
     // means a prior panic-while-locked; proceed with the state as-is).

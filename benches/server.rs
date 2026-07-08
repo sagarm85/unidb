@@ -264,10 +264,71 @@ fn bench_concurrent_http_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+/// (5) Concurrent read throughput (6b) — N clients each `GET /rows/{id}` the
+/// same row. Reads run on the shared `ReadHandle`, off the single writer
+/// thread, so unlike the write throughput above this should *scale* with
+/// concurrency rather than sit at the single-writer ceiling.
+fn bench_concurrent_read_throughput(c: &mut Criterion) {
+    let mut group = c.benchmark_group("concurrent_read_throughput");
+    let rt = tokio_rt();
+    let base_url = spawn_bench_server(&rt);
+    let auth = format!("Bearer {}", bench_token());
+
+    // Insert one row and learn its RowId, then read it concurrently.
+    let path = rt.block_on(async {
+        let client = reqwest::Client::new();
+        let resp: serde_json::Value = client
+            .post(format!("{base_url}/rows"))
+            .header("Authorization", &auth)
+            .body("concurrent-read-row")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let page_id = resp["row_id"]["page_id"].as_u64().unwrap();
+        let slot = resp["row_id"]["slot"].as_u64().unwrap();
+        format!("{base_url}/rows/{page_id}/{slot}")
+    });
+
+    for concurrency in [1usize, 10, 50] {
+        group.bench_with_input(
+            BenchmarkId::new("concurrent_clients", concurrency),
+            &concurrency,
+            |b, &n| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let mut handles = Vec::new();
+                        for _ in 0..n {
+                            let path = path.clone();
+                            let auth = auth.clone();
+                            handles.push(tokio::spawn(async move {
+                                let client = reqwest::Client::new();
+                                client
+                                    .get(&path)
+                                    .header("Authorization", auth)
+                                    .send()
+                                    .await
+                                    .unwrap();
+                            }));
+                        }
+                        for h in handles {
+                            let _ = h.await;
+                        }
+                    });
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(10);
     targets = bench_insert_direct_vs_http, bench_jwt_verification,
-              bench_sse_polling_overhead, bench_concurrent_http_throughput
+              bench_sse_polling_overhead, bench_concurrent_http_throughput,
+              bench_concurrent_read_throughput
 }
 criterion_main!(benches);

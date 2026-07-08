@@ -101,12 +101,17 @@
   (`bufferpool.rs` — `durable_wal_lsn` tracking + `fetch_page_for_write`),
   making deferred mode unconditionally safe for working sets larger than the
   pool and largely fixing the pre-existing M6 `BufferPoolFull`-at-scale
-  limitation. Only item 6b (concurrent read path) remains. Full plan,
-  numbers, and correctness analysis are in
-  `docs/backlog/group_commit_and_read_concurrency.md`. All 229 unit + 25
-  server + 11 crash-harness tests green; clippy/fmt clean. Default
-  (embedded, non-deferred) path keeps per-statement durability; the crash
-  harness is green (the new write-back-on-evict path preserves recovery).
+  limitation. **Item 6b then landed in part on branch `m9-concurrent-reads`
+  (stacked): concurrent point reads** — a `Send + Sync` `ReadHandle` lets
+  `get`/`GET /rows/:id` run off the writer thread (shared `Arc<RwLock>` mmap +
+  `Arc<Mutex>` txn snapshot); concurrent SQL `SELECT` is the remaining slice
+  (needs shared catalog + a read-only executor path). Full plan, numbers, and
+  correctness analysis are in
+  `docs/backlog/group_commit_and_read_concurrency.md`. All 229 (group-commit
+  branch) / 230 (concurrent-reads branch) unit + 25 server + 11 crash-harness
+  + concurrency tests green; clippy/fmt clean. Default (embedded,
+  non-deferred) path keeps per-statement durability; the crash harness is
+  green (the new write-back-on-evict path preserves recovery).
 - Two explicitly deferred follow-ups remain, neither started: (1) the
   full CLAUDE.md §6 cross-domain "replaced stack" benchmark (possible
   since all four data models + the server exist, but a separate,
@@ -1715,6 +1720,42 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-08 — 6b concurrent read path: point reads (branch `m9-concurrent-reads`)
+
+- Continued the concurrency track (item 6b of
+  `docs/backlog/group_commit_and_read_concurrency.md`): take reads off the
+  single writer thread. **Structure chosen with the user: a shared read
+  handle**, not full interior-mutability of the engine (rejected because it
+  would put a `Mutex` on the buffer-pool frames, and `find_victim`-must-flush
+  while holding it is a reentrancy/deadlock trap). Writer keeps owning
+  `Engine` with `&mut self` writes **unchanged**; only read-relevant state is
+  shared.
+- **Landed (stacked on `m9-group-commit`):**
+  - `bufferpool.rs`: `mmap` → `Arc<RwLock<PageFileMmap>>` (guards against a
+    reader seeing a torn/remapped-away page); `PageReader` trait (read seam)
+    + `SharedPageReader` (frame-free reader). Writer methods stay `&mut self`,
+    locking the mmap internally. Committed separately as "Phase 1a".
+  - `heap.rs`: `get`/`scan` generic over `PageReader` (reads copy pages out,
+    no pin/unpin).
+  - `txn.rs`: `TransactionManager` state behind `Arc<Mutex<TxnInner>>`
+    (`SharedTxn`); methods `&self`; `read_snapshot()` gives a self-contained
+    RC snapshot for a read that allocates **no xid and writes no WAL**.
+  - `read_handle.rs` (new): `ReadHandle` (`Send + Sync + Clone`) with
+    `get(row_id)`; `Engine::read_handle()`. Server `GET /rows/:id` now
+    dispatches to it via `spawn_blocking`, bypassing the writer channel.
+- **Verification:** `tests/concurrent_reads.rs` (4 readers hammering
+  committed rows while the writer inserts 1000 — exact bytes, no tears);
+  `benches/server.rs::concurrent_read_throughput` shows reads scale (~3.0k →
+  ~4.3k → ~4.5k reads/s at 1/10/50 clients; HTTP-client-bound microbench) vs
+  the old flat writer-serialized path. 230 unit + 25 server + 11 crash + 1
+  concurrent_reads + unidb-attach all green; clippy/fmt clean. `Engine` stays
+  deliberately non-`Sync`; `ReadHandle` is the `Send + Sync` shared reader.
+- **Remaining 6b slice:** concurrent SQL `SELECT`/`NEAR`/`edges_from`/`poll`
+  — same pattern, needs `Engine.catalog` → `Arc<RwLock<Catalog>>` (readers
+  need live `TableDef.pages`), a read-only executor path, and
+  `ReadHandle::execute_sql`. Foundation (`PageReader`/`SharedTxn`) makes it
+  additive. Documented in the design doc.
 
 ### 2026-07-08 — Group commit + read-only fsync skip (prototype, branch `m9-group-commit`)
 

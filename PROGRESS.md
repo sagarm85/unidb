@@ -1266,6 +1266,16 @@ green; clippy `-D warnings` + fmt clean. No §3 locked decision re-opened
 (D1/D2/D5 upheld — the new write-back-on-evict path only writes pages whose
 WAL is already durable, and the crash harness confirms recovery is intact).
 
-**Not done (tracked in the design doc):** 6b concurrent read path (readers
-off the single writer thread — the one remaining architectural change, an
-addition to existing MVCC).
+**6b concurrent read path — point reads landed** (branch
+`m9-concurrent-reads`, stacked): a `Send + Sync` `ReadHandle` (over an
+`Arc<RwLock>` page-file mmap + `Arc<Mutex>` txn snapshot state) lets `get` /
+`GET /rows/:id` run off the single writer thread — reads take no xid, write
+no WAL, and never touch the writer's request channel. `tests/
+concurrent_reads.rs` proves 4 concurrent readers see exact committed bytes
+(no torn pages) while the writer inserts 1000 rows; `benches/server.rs`'s
+`concurrent_read_throughput` shows reads scale with concurrency (~3.0k →
+~4.3k → ~4.5k reads/s at 1/10/50, HTTP-client-bound in the microbench)
+rather than the flat writer-serialized ceiling. `Engine` stays non-`Sync`;
+`ReadHandle` is the shared reader. **Remaining:** concurrent SQL `SELECT`
+(shared catalog + a read-only executor path — additive on the same
+foundation), tracked in the design doc.
