@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::catalog::{Catalog, ColumnDef, IndexKind, TableConstraints};
 use crate::error::{DbError, Result};
+use crate::sql::query::QuerySpec;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Literal {
@@ -88,6 +89,7 @@ pub fn bind_params(plan: &mut LogicalPlan, params: &[Literal]) -> Result<()> {
                 bind_expr(expr, params)?;
             }
         }
+        LogicalPlan::Query(spec) => spec.bind_params(params)?,
         // DDL / CREATE INDEX carry no bind parameters.
         LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateIndex { .. }
@@ -212,6 +214,12 @@ pub enum LogicalPlan {
         projection: Vec<String>,
         predicate: Option<Expr>,
     },
+    /// A multi-relation / advanced query (Phase 4): joins, and in later
+    /// checkpoints aggregates, grouping, sort, subqueries, CTEs. The parser
+    /// routes here only when the query uses a Phase-4 construct; the trivial
+    /// single-table filter/project stays a [`LogicalPlan::Select`] (preserving
+    /// the concurrent-read fast path and every pre-P4 test).
+    Query(QuerySpec),
     Update {
         table: String,
         assignments: Vec<(String, Expr)>,
@@ -274,6 +282,13 @@ pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog) -> LogicalPlan {
         LogicalPlan::Delete { table, predicate } => {
             let predicate = and_policy(predicate, policy_for(catalog, &table));
             LogicalPlan::Delete { table, predicate }
+        }
+        LogicalPlan::Query(mut spec) => {
+            // RLS for joins is the same planner rewrite: AND each base
+            // relation's policy into the query's residual selection, qualified
+            // to that relation. The executor never learns RLS exists.
+            spec.apply_rls_from(&|table| policy_for(catalog, table));
+            LogicalPlan::Query(spec)
         }
         other @ (LogicalPlan::CreateTable { .. }
         | LogicalPlan::Insert { .. }

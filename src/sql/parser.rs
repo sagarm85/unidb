@@ -7,8 +7,8 @@
 
 use sqlparser::ast::{
     self, AlterTableOperation, Array as SqlArray, BinaryOperator, DataType, ExactNumberInfo,
-    Expr as SqlExpr, FromTable, IndexType, ObjectType, SelectItem, SetExpr, Statement, TableFactor,
-    TableObject, Value,
+    Expr as SqlExpr, FromTable, IndexType, JoinConstraint, JoinOperator, ObjectType, SelectItem,
+    SetExpr, Statement, TableFactor, TableObject, TableWithJoins, UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser as SqlParser;
@@ -22,6 +22,7 @@ use crate::{
 };
 
 use super::logical::{CmpOp, Expr, Literal, LogicalPlan};
+use super::query::{FromNode, JoinType, Projection, QExpr, QuerySpec, TableRef};
 
 /// Parse a SQL string (possibly multiple `;`-separated statements) into
 /// logical plans, one per statement.
@@ -580,7 +581,16 @@ fn parse_decimal_literal(s: &str) -> Result<Literal> {
 }
 
 fn convert_query(q: ast::Query) -> Result<LogicalPlan> {
-    let select = match *q.body {
+    // Destructure up front so `select` (moved out of `*body`) doesn't leave `q`
+    // partially moved when the Phase-4 path needs the clause flags.
+    let ast::Query {
+        with,
+        body,
+        order_by,
+        limit_clause,
+        ..
+    } = q;
+    let select = match *body {
         SetExpr::Select(s) => *s,
         other => {
             return Err(DbError::SqlUnsupported(format!(
@@ -588,6 +598,22 @@ fn convert_query(q: ast::Query) -> Result<LogicalPlan> {
             )))
         }
     };
+
+    // Route to the Phase-4 multi-relation path when the query has more than one
+    // FROM item or any explicit JOIN. A trivial single-table filter/project
+    // stays a `LogicalPlan::Select` (its concurrent-read fast path + every
+    // pre-P4 test are unchanged).
+    let has_join =
+        select.from.len() > 1 || select.from.first().is_some_and(|t| !t.joins.is_empty());
+    if has_join {
+        return convert_query_spec(
+            select,
+            with.is_some(),
+            order_by.is_some(),
+            limit_clause.is_some(),
+        );
+    }
+
     let table = select
         .from
         .first()
@@ -600,6 +626,221 @@ fn convert_query(q: ast::Query) -> Result<LogicalPlan> {
         projection,
         predicate,
     })
+}
+
+/// Build a [`LogicalPlan::Query`] for a multi-relation SELECT (P4.a). Rejects
+/// the constructs later checkpoints add (GROUP BY/HAVING/DISTINCT/ORDER BY/
+/// LIMIT/OFFSET/CTEs) with a clear message, so a query that would silently drop
+/// a clause errors instead.
+fn convert_query_spec(
+    select: ast::Select,
+    has_with: bool,
+    has_order_by: bool,
+    has_limit: bool,
+) -> Result<LogicalPlan> {
+    let group_by_present = match &select.group_by {
+        ast::GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
+        ast::GroupByExpr::All(_) => true,
+    };
+    if group_by_present || select.having.is_some() {
+        return Err(DbError::SqlUnsupported(
+            "GROUP BY / HAVING on a join arrives in P4.b".into(),
+        ));
+    }
+    if select.distinct.is_some() {
+        return Err(DbError::SqlUnsupported("DISTINCT arrives in P4.b".into()));
+    }
+    if has_order_by {
+        return Err(DbError::SqlUnsupported(
+            "ORDER BY on a join arrives in P4.b".into(),
+        ));
+    }
+    if has_limit {
+        return Err(DbError::SqlUnsupported(
+            "LIMIT / OFFSET on a join arrives in P4.b".into(),
+        ));
+    }
+    if has_with {
+        return Err(DbError::SqlUnsupported("WITH / CTEs arrive in P4.c".into()));
+    }
+
+    let from = convert_from(&select.from)?;
+    let selection = select.selection.as_ref().map(convert_qexpr).transpose()?;
+    let projection = convert_query_projection(select.projection)?;
+    Ok(LogicalPlan::Query(QuerySpec {
+        from,
+        selection,
+        projection,
+    }))
+}
+
+/// Fold the FROM list into a left-deep [`FromNode`] tree. Comma-separated FROM
+/// items become `CROSS JOIN`s; each item's own `joins` are folded left-deep.
+fn convert_from(items: &[TableWithJoins]) -> Result<FromNode> {
+    let mut iter = items.iter();
+    let first = iter
+        .next()
+        .ok_or_else(|| DbError::SqlUnsupported("SELECT without FROM is not supported".into()))?;
+    let mut node = convert_table_with_joins(first)?;
+    for twj in iter {
+        let right = convert_table_with_joins(twj)?;
+        node = FromNode::Join {
+            left: Box::new(node),
+            right: Box::new(right),
+            join_type: JoinType::Cross,
+            on: None,
+        };
+    }
+    Ok(node)
+}
+
+fn convert_table_with_joins(twj: &TableWithJoins) -> Result<FromNode> {
+    let mut node = FromNode::Table(table_ref_from_factor(&twj.relation)?);
+    for join in &twj.joins {
+        let right = FromNode::Table(table_ref_from_factor(&join.relation)?);
+        let (join_type, on) = convert_join_operator(&join.join_operator)?;
+        node = FromNode::Join {
+            left: Box::new(node),
+            right: Box::new(right),
+            join_type,
+            on,
+        };
+    }
+    Ok(node)
+}
+
+fn table_ref_from_factor(rel: &TableFactor) -> Result<TableRef> {
+    match rel {
+        TableFactor::Table { name, alias, .. } => Ok(TableRef {
+            table: name.to_string(),
+            alias: alias.as_ref().map(|a| a.name.value.clone()),
+        }),
+        other => Err(DbError::SqlUnsupported(format!(
+            "unsupported table reference in join: {other:?}"
+        ))),
+    }
+}
+
+fn convert_join_operator(op: &JoinOperator) -> Result<(JoinType, Option<QExpr>)> {
+    let (ty, constraint) = match op {
+        JoinOperator::Inner(c) | JoinOperator::Join(c) => (JoinType::Inner, Some(c)),
+        JoinOperator::LeftOuter(c) | JoinOperator::Left(c) => (JoinType::Left, Some(c)),
+        JoinOperator::RightOuter(c) | JoinOperator::Right(c) => (JoinType::Right, Some(c)),
+        JoinOperator::CrossJoin(_) => (JoinType::Cross, None),
+        other => {
+            return Err(DbError::SqlUnsupported(format!(
+                "unsupported join type: {other:?} (FULL OUTER / USING / NATURAL arrive later)"
+            )))
+        }
+    };
+    let on = match constraint {
+        None => None,
+        Some(JoinConstraint::On(expr)) => Some(convert_qexpr(expr)?),
+        Some(JoinConstraint::None) => None,
+        Some(other) => {
+            return Err(DbError::SqlUnsupported(format!(
+                "unsupported join constraint: {other:?} (only ON <expr> in P4.a)"
+            )))
+        }
+    };
+    Ok((ty, on))
+}
+
+fn convert_query_projection(items: Vec<SelectItem>) -> Result<Vec<Projection>> {
+    let mut out = Vec::new();
+    for item in items {
+        match item {
+            SelectItem::Wildcard(_) => out.push(Projection::Wildcard),
+            SelectItem::QualifiedWildcard(kind, _) => {
+                let name = match kind {
+                    ast::SelectItemQualifiedWildcardKind::ObjectName(n) => n.to_string(),
+                    other => {
+                        return Err(DbError::SqlUnsupported(format!(
+                            "unsupported qualified wildcard: {other:?}"
+                        )))
+                    }
+                };
+                out.push(Projection::QualifiedWildcard(name));
+            }
+            SelectItem::UnnamedExpr(e) => out.push(Projection::Expr {
+                expr: convert_qexpr(&e)?,
+                alias: None,
+            }),
+            SelectItem::ExprWithAlias { expr, alias } => out.push(Projection::Expr {
+                expr: convert_qexpr(&expr)?,
+                alias: Some(alias.value),
+            }),
+            other => {
+                return Err(DbError::SqlUnsupported(format!(
+                    "unsupported SELECT item: {other:?}"
+                )))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Convert a `sqlparser` expression into a [`QExpr`] (the Phase-4 query
+/// expression, which keeps column qualifiers and supports `OR`/`NOT`/`IS NULL`).
+fn convert_qexpr(e: &SqlExpr) -> Result<QExpr> {
+    match e {
+        SqlExpr::Identifier(ident) => Ok(QExpr::Column {
+            qualifier: None,
+            name: ident.value.clone(),
+        }),
+        SqlExpr::CompoundIdentifier(parts) => {
+            let name = parts.last().map(|i| i.value.clone()).unwrap_or_default();
+            let qualifier = if parts.len() >= 2 {
+                Some(parts[parts.len() - 2].value.clone())
+            } else {
+                None
+            };
+            Ok(QExpr::Column { qualifier, name })
+        }
+        SqlExpr::Value(vws) => convert_value(&vws.value).map(QExpr::Literal),
+        SqlExpr::Nested(inner) => convert_qexpr(inner),
+        SqlExpr::IsNull(inner) => Ok(QExpr::IsNull {
+            expr: Box::new(convert_qexpr(inner)?),
+            negated: false,
+        }),
+        SqlExpr::IsNotNull(inner) => Ok(QExpr::IsNull {
+            expr: Box::new(convert_qexpr(inner)?),
+            negated: true,
+        }),
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr,
+        } => Ok(QExpr::Not(Box::new(convert_qexpr(expr)?))),
+        SqlExpr::BinaryOp { left, op, right } => convert_qbinary_op(left, op, right),
+        other => Err(DbError::SqlUnsupported(format!(
+            "unsupported expression in join query: {other:?}"
+        ))),
+    }
+}
+
+fn convert_qbinary_op(left: &SqlExpr, op: &BinaryOperator, right: &SqlExpr) -> Result<QExpr> {
+    let lhs = Box::new(convert_qexpr(left)?);
+    let rhs = Box::new(convert_qexpr(right)?);
+    let cmp = |op| {
+        Ok(QExpr::Compare {
+            op,
+            lhs: lhs.clone(),
+            rhs: rhs.clone(),
+        })
+    };
+    match op {
+        BinaryOperator::And => Ok(QExpr::And(lhs, rhs)),
+        BinaryOperator::Or => Ok(QExpr::Or(lhs, rhs)),
+        BinaryOperator::Eq => cmp(CmpOp::Eq),
+        BinaryOperator::NotEq => cmp(CmpOp::Ne),
+        BinaryOperator::Lt => cmp(CmpOp::Lt),
+        BinaryOperator::Gt => cmp(CmpOp::Gt),
+        BinaryOperator::LtEq => cmp(CmpOp::Le),
+        BinaryOperator::GtEq => cmp(CmpOp::Ge),
+        other => Err(DbError::SqlUnsupported(format!(
+            "unsupported operator in join query: {other}"
+        ))),
+    }
 }
 
 fn convert_projection(items: Vec<SelectItem>) -> Result<Vec<String>> {

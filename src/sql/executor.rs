@@ -238,6 +238,7 @@ pub fn execute(plan: LogicalPlan, ctx: &mut ExecCtx) -> Result<ExecResult> {
             predicate,
         } => exec_update(&table, &assignments, &predicate, ctx),
         LogicalPlan::Delete { table, predicate } => exec_delete(&table, &predicate, ctx),
+        LogicalPlan::Query(spec) => crate::sql::query_exec::exec_query(&spec, ctx),
         LogicalPlan::CreateIndex {
             table,
             column,
@@ -1547,7 +1548,7 @@ fn json_of(lit: Literal) -> Result<JsonValue> {
     serde_json::from_str(&text).map_err(|e| DbError::SqlPlan(format!("invalid JSON: {e}")))
 }
 
-fn as_bool(lit: &Literal) -> Result<bool> {
+pub(crate) fn as_bool(lit: &Literal) -> Result<bool> {
     match lit {
         Literal::Bool(b) => Ok(*b),
         Literal::Null => Ok(false),
@@ -1557,7 +1558,27 @@ fn as_bool(lit: &Literal) -> Result<bool> {
     }
 }
 
-fn compare(op: CmpOp, l: &Literal, r: &Literal) -> Result<bool> {
+/// Total-ish ordering between two literals for the Phase-4 sort / merge-join /
+/// aggregate paths, built on the same type rules as [`compare`]. Returns `None`
+/// for genuinely unorderable pairs (NULL operand, NaN float, or a type mismatch
+/// `compare` itself rejects) — callers decide how to place those (NULLs sort
+/// last, unmatched merge-join keys are skipped).
+pub(crate) fn literal_ord(l: &Literal, r: &Literal) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    if matches!(l, Literal::Null) || matches!(r, Literal::Null) {
+        return None;
+    }
+    // Reuse `compare`: a == b, then a < b disambiguates Less/Greater. Any pair
+    // `compare` errors on (incomparable types) yields `None`.
+    match (compare(CmpOp::Eq, l, r), compare(CmpOp::Lt, l, r)) {
+        (Ok(true), _) => Some(Ordering::Equal),
+        (Ok(false), Ok(true)) => Some(Ordering::Less),
+        (Ok(false), Ok(false)) => Some(Ordering::Greater),
+        _ => None,
+    }
+}
+
+pub(crate) fn compare(op: CmpOp, l: &Literal, r: &Literal) -> Result<bool> {
     if matches!(l, Literal::Null) || matches!(r, Literal::Null) {
         // Simplified NULL semantics: any comparison involving NULL is not
         // true. Real three-valued SQL logic (NULL propagation through
