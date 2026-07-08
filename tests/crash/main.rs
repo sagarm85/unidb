@@ -139,7 +139,7 @@ fn p3_mutation_before_commit() {
 
     // Write an incomplete mini-txn directly to the WAL.
     {
-        let mut wal = Wal::open(&wal_p, INVALID_LSN).unwrap();
+        let wal = Wal::open(&wal_p, INVALID_LSN).unwrap();
         let (txn_id, begin_lsn) = wal.begin_mini_txn().unwrap();
         wal.log_insert(txn_id, begin_lsn, 99, 0, b"incomplete")
             .unwrap();
@@ -311,7 +311,7 @@ fn p9_crash_mid_undo_still_converges_to_fully_undone() {
         heap.undo_insert(r2.page_id, r2.slot, xid, &mut pool, &mut wal)
             .unwrap();
 
-        pool.flush_all(wal.durable_lsn).unwrap();
+        pool.flush_all(wal.durable_lsn()).unwrap();
         drop(pool);
         drop(wal);
         (r1, r2)
@@ -449,7 +449,7 @@ fn p11_torn_page_restored_from_full_page_image() {
         let r1 = heap
             .insert(b"r1_committed", 1, &mut pool, &mut wal)
             .unwrap();
-        pool.flush_all(wal.durable_lsn).unwrap();
+        pool.flush_all(wal.durable_lsn()).unwrap();
         checkpoint::run(&mut pool, &mut wal, &ctrl_p, &mut control, 2).unwrap();
 
         // R2 lands on the SAME page (small rows share a page): the insert logs
@@ -539,7 +539,7 @@ fn p12_fsync_failure_refuses_to_report_success() {
         let mut heap = Heap::new(page_size);
         // First insert commits normally (durable frontier advances).
         heap.insert(b"durable", 1, &mut pool, &mut wal).unwrap();
-        let durable_before = wal.durable_lsn;
+        let durable_before = wal.durable_lsn();
         // Arm a fault: the *next* fsync (this insert's mini-txn commit) fails.
         wal.arm_fsync_fault();
         let res = heap.insert(b"never_durable", 1, &mut pool, &mut wal);
@@ -549,7 +549,8 @@ fn p12_fsync_failure_refuses_to_report_success() {
         );
         assert!(wal.is_poisoned(), "P12: WAL must latch poisoned");
         assert_eq!(
-            wal.durable_lsn, durable_before,
+            wal.durable_lsn(),
+            durable_before,
             "P12: durable frontier must not advance on a failed fsync"
         );
         assert!(
@@ -561,7 +562,7 @@ fn p12_fsync_failure_refuses_to_report_success() {
     // (b) Data-file msync fails → the page flush is fatal, the frame stays
     //     dirty (not claimed durable), and the pool stays poisoned.
     {
-        let mut pool = BufferPool::open(&dir.path().join("b.db"), page_size, 64).unwrap();
+        let pool = BufferPool::open(&dir.path().join("b.db"), page_size, 64).unwrap();
         let pid = pool.alloc_page().unwrap();
         let mut page = SlottedPage::new(pid, unidb::format::PAGE_TYPE_HEAP, page_size);
         page.set_lsn(3);

@@ -1240,7 +1240,7 @@ impl Engine {
     /// steal any now-durable dirty page.
     pub fn sync_wal(&mut self) -> Result<()> {
         self.wal.sync()?;
-        self.pool.set_durable_wal_lsn(self.wal.durable_lsn);
+        self.pool.set_durable_wal_lsn(self.wal.durable_lsn());
         Ok(())
     }
 
@@ -1348,7 +1348,7 @@ impl Engine {
 
     /// Flush all dirty pages without a full checkpoint (used in tests).
     pub fn flush(&mut self) -> Result<()> {
-        self.pool.flush_all(self.wal.durable_lsn)
+        self.pool.flush_all(self.wal.durable_lsn())
     }
 
     /// Reclaim physical space held by dead tuple versions (M10) — the explicit,

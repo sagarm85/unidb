@@ -33,7 +33,7 @@ fn bench_alloc_page() {
     println!("{:>10}  {:>12}  {:>14}", "pages", "secs", "pages/sec");
     for &n in &[10_000u32, 50_000, 100_000] {
         let dir = tempdir().unwrap();
-        let mut pool =
+        let pool =
             BufferPool::open(&dir.path().join("data.db"), DEFAULT_PAGE_SIZE as usize, 256).unwrap();
         let start = Instant::now();
         for _ in 0..n {

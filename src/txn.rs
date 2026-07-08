@@ -653,7 +653,7 @@ mod tests {
     fn recover_next_xid_resumes_past_highest_seen() {
         let dir = tempdir().unwrap();
         let p = dir.path().join("test.wal");
-        let mut wal = Wal::open(&p, INVALID_LSN).unwrap();
+        let wal = Wal::open(&p, INVALID_LSN).unwrap();
         let lsn = wal.begin_user_txn(5).unwrap();
         wal.begin_user_txn(2).unwrap();
         wal.commit_user_txn(5, lsn).unwrap(); // fsync so scan_file sees the records
