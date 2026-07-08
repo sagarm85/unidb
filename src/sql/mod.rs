@@ -1,4 +1,13 @@
+pub mod aggregate;
 pub mod datetime;
 pub mod executor;
+pub mod explain;
+pub mod join;
 pub mod logical;
+pub mod optimizer;
 pub mod parser;
+pub mod plan;
+pub mod query;
+pub mod query_exec;
+pub mod sort;
+pub mod statistics;

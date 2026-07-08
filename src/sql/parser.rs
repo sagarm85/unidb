@@ -7,8 +7,8 @@
 
 use sqlparser::ast::{
     self, AlterTableOperation, Array as SqlArray, BinaryOperator, DataType, ExactNumberInfo,
-    Expr as SqlExpr, FromTable, IndexType, ObjectType, SelectItem, SetExpr, Statement, TableFactor,
-    TableObject, Value,
+    Expr as SqlExpr, FromTable, IndexType, JoinConstraint, JoinOperator, ObjectType, SelectItem,
+    SetExpr, Statement, TableFactor, TableObject, TableWithJoins, UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser as SqlParser;
@@ -22,6 +22,7 @@ use crate::{
 };
 
 use super::logical::{CmpOp, Expr, Literal, LogicalPlan};
+use super::query::{AggFunc, FromNode, JoinType, OrderKey, Projection, QExpr, QuerySpec, TableRef};
 
 /// Parse a SQL string (possibly multiple `;`-separated statements) into
 /// logical plans, one per statement.
@@ -48,6 +49,26 @@ fn convert_statement(stmt: Statement) -> Result<LogicalPlan> {
             ..
         } => convert_drop(object_type, names, if_exists),
         Statement::Truncate(t) => convert_truncate(t),
+        Statement::Explain {
+            analyze, statement, ..
+        } => match *statement {
+            Statement::Query(q) => Ok(LogicalPlan::Explain {
+                analyze,
+                spec: query_to_spec(*q)?,
+            }),
+            other => Err(DbError::SqlUnsupported(format!(
+                "EXPLAIN is only supported for SELECT queries in v1, got: {other}"
+            ))),
+        },
+        Statement::Analyze(a) => {
+            let table = a
+                .table_name
+                .ok_or_else(|| {
+                    DbError::SqlUnsupported("ANALYZE requires a table name in v1".into())
+                })?
+                .to_string();
+            Ok(LogicalPlan::Analyze { table })
+        }
         other => Err(DbError::SqlUnsupported(format!(
             "unsupported statement: {other}"
         ))),
@@ -580,7 +601,16 @@ fn parse_decimal_literal(s: &str) -> Result<Literal> {
 }
 
 fn convert_query(q: ast::Query) -> Result<LogicalPlan> {
-    let select = match *q.body {
+    // Destructure up front so `select` (moved out of `*body`) doesn't leave `q`
+    // partially moved when the Phase-4 path needs the clause flags.
+    let ast::Query {
+        with,
+        body,
+        order_by,
+        limit_clause,
+        ..
+    } = q;
+    let select = match *body {
         SetExpr::Select(s) => *s,
         other => {
             return Err(DbError::SqlUnsupported(format!(
@@ -588,6 +618,34 @@ fn convert_query(q: ast::Query) -> Result<LogicalPlan> {
             )))
         }
     };
+
+    // Route to the Phase-4 query path when the query uses any construct beyond a
+    // trivial single-table filter/project: a join, GROUP BY / HAVING, DISTINCT,
+    // ORDER BY, LIMIT/OFFSET, or an aggregate in the SELECT list. Everything
+    // else stays a `LogicalPlan::Select` (its concurrent-read fast path + every
+    // pre-P4 test are unchanged).
+    let has_join =
+        select.from.len() > 1 || select.from.first().is_some_and(|t| !t.joins.is_empty());
+    let group_by_present = match &select.group_by {
+        ast::GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
+        ast::GroupByExpr::All(_) => true,
+    };
+    let projection_has_agg = select.projection.iter().any(select_item_has_aggregate);
+    let has_subquery = select.selection.as_ref().is_some_and(expr_has_subquery)
+        || select.projection.iter().any(select_item_has_subquery);
+    let needs_query = has_join
+        || group_by_present
+        || select.having.is_some()
+        || select.distinct.is_some()
+        || order_by.is_some()
+        || limit_clause.is_some()
+        || with.is_some()
+        || projection_has_agg
+        || has_subquery;
+    if needs_query {
+        return convert_query_spec(select, with, order_by, limit_clause);
+    }
+
     let table = select
         .from
         .first()
@@ -600,6 +658,492 @@ fn convert_query(q: ast::Query) -> Result<LogicalPlan> {
         projection,
         predicate,
     })
+}
+
+/// Build a [`LogicalPlan::Query`] for a Phase-4 SELECT: joins, aggregates,
+/// grouping, sort, distinct, limit, subqueries, CTEs.
+fn convert_query_spec(
+    select: ast::Select,
+    with: Option<ast::With>,
+    order_by: Option<ast::OrderBy>,
+    limit_clause: Option<ast::LimitClause>,
+) -> Result<LogicalPlan> {
+    Ok(LogicalPlan::Query(build_query_spec(
+        select,
+        with,
+        order_by,
+        limit_clause,
+    )?))
+}
+
+/// Convert a whole `sqlparser` [`ast::Query`] into a [`QuerySpec`] (always the
+/// Phase-4 form). Used for CTE bodies and scalar/IN/EXISTS subqueries.
+fn query_to_spec(q: ast::Query) -> Result<QuerySpec> {
+    let ast::Query {
+        with,
+        body,
+        order_by,
+        limit_clause,
+        ..
+    } = q;
+    let select = match *body {
+        SetExpr::Select(s) => *s,
+        other => {
+            return Err(DbError::SqlUnsupported(format!(
+                "unsupported subquery body: {other:?}"
+            )))
+        }
+    };
+    build_query_spec(select, with, order_by, limit_clause)
+}
+
+fn build_query_spec(
+    select: ast::Select,
+    with: Option<ast::With>,
+    order_by: Option<ast::OrderBy>,
+    limit_clause: Option<ast::LimitClause>,
+) -> Result<QuerySpec> {
+    let with_ctes = match with {
+        None => Vec::new(),
+        Some(w) => {
+            if w.recursive {
+                return Err(DbError::SqlUnsupported(
+                    "recursive CTEs (WITH RECURSIVE) are not supported in v1".into(),
+                ));
+            }
+            w.cte_tables
+                .into_iter()
+                .map(|cte| Ok((cte.alias.name.value.clone(), query_to_spec(*cte.query)?)))
+                .collect::<Result<Vec<_>>>()?
+        }
+    };
+
+    let group_by = match select.group_by {
+        ast::GroupByExpr::Expressions(exprs, _) => exprs
+            .iter()
+            .map(convert_qexpr)
+            .collect::<Result<Vec<_>>>()?,
+        ast::GroupByExpr::All(_) => {
+            return Err(DbError::SqlUnsupported(
+                "GROUP BY ALL is not supported".into(),
+            ))
+        }
+    };
+    let having = select.having.as_ref().map(convert_qexpr).transpose()?;
+    let distinct = match &select.distinct {
+        None => false,
+        Some(ast::Distinct::Distinct) => true,
+        Some(other) => {
+            return Err(DbError::SqlUnsupported(format!(
+                "unsupported DISTINCT form: {other:?}"
+            )))
+        }
+    };
+    let order_by = convert_order_by(order_by)?;
+    let (limit, offset) = convert_limit(limit_clause)?;
+
+    let from = convert_from(&select.from)?;
+    let selection = select.selection.as_ref().map(convert_qexpr).transpose()?;
+    let projection = convert_query_projection(select.projection)?;
+    Ok(QuerySpec {
+        with: with_ctes,
+        from,
+        selection,
+        projection,
+        group_by,
+        having,
+        distinct,
+        order_by,
+        limit,
+        offset,
+    })
+}
+
+/// Map an aggregate function name to its [`AggFunc`], or `None` if it isn't one.
+fn agg_func_from_name(name: &str) -> Option<AggFunc> {
+    match name.to_ascii_uppercase().as_str() {
+        "COUNT" => Some(AggFunc::Count),
+        "SUM" => Some(AggFunc::Sum),
+        "AVG" => Some(AggFunc::Avg),
+        "MIN" => Some(AggFunc::Min),
+        "MAX" => Some(AggFunc::Max),
+        _ => None,
+    }
+}
+
+fn select_item_has_aggregate(item: &SelectItem) -> bool {
+    match item {
+        SelectItem::UnnamedExpr(e) => expr_has_aggregate(e),
+        SelectItem::ExprWithAlias { expr, .. } => expr_has_aggregate(expr),
+        _ => false,
+    }
+}
+
+fn select_item_has_subquery(item: &SelectItem) -> bool {
+    match item {
+        SelectItem::UnnamedExpr(e) => expr_has_subquery(e),
+        SelectItem::ExprWithAlias { expr, .. } => expr_has_subquery(expr),
+        _ => false,
+    }
+}
+
+/// Whether a `sqlparser` expression needs the Phase-4 query path — a subquery
+/// (scalar/IN/EXISTS) or an IN-list (the single-table Select path handles
+/// neither).
+fn expr_has_subquery(e: &SqlExpr) -> bool {
+    match e {
+        SqlExpr::Subquery(_)
+        | SqlExpr::Exists { .. }
+        | SqlExpr::InSubquery { .. }
+        | SqlExpr::InList { .. } => true,
+        SqlExpr::BinaryOp { left, right, .. } => {
+            expr_has_subquery(left) || expr_has_subquery(right)
+        }
+        SqlExpr::UnaryOp { expr, .. } | SqlExpr::Nested(expr) => expr_has_subquery(expr),
+        SqlExpr::IsNull(e) | SqlExpr::IsNotNull(e) => expr_has_subquery(e),
+        _ => false,
+    }
+}
+
+/// Whether a `sqlparser` expression contains an aggregate function call.
+fn expr_has_aggregate(e: &SqlExpr) -> bool {
+    match e {
+        SqlExpr::Function(f) => agg_func_from_name(&f.name.to_string()).is_some(),
+        SqlExpr::BinaryOp { left, right, .. } => {
+            expr_has_aggregate(left) || expr_has_aggregate(right)
+        }
+        SqlExpr::UnaryOp { expr, .. } | SqlExpr::Nested(expr) => expr_has_aggregate(expr),
+        SqlExpr::IsNull(e) | SqlExpr::IsNotNull(e) => expr_has_aggregate(e),
+        _ => false,
+    }
+}
+
+fn convert_order_by(order_by: Option<ast::OrderBy>) -> Result<Vec<OrderKey>> {
+    let Some(ob) = order_by else {
+        return Ok(Vec::new());
+    };
+    let exprs = match ob.kind {
+        ast::OrderByKind::Expressions(v) => v,
+        ast::OrderByKind::All(_) => {
+            return Err(DbError::SqlUnsupported(
+                "ORDER BY ALL is not supported".into(),
+            ))
+        }
+    };
+    exprs
+        .iter()
+        .map(|e| {
+            Ok(OrderKey {
+                expr: convert_qexpr(&e.expr)?,
+                asc: e.options.asc.unwrap_or(true),
+            })
+        })
+        .collect()
+}
+
+fn convert_limit(limit_clause: Option<ast::LimitClause>) -> Result<(Option<usize>, usize)> {
+    match limit_clause {
+        None => Ok((None, 0)),
+        Some(ast::LimitClause::LimitOffset {
+            limit,
+            offset,
+            limit_by,
+        }) => {
+            if !limit_by.is_empty() {
+                return Err(DbError::SqlUnsupported(
+                    "LIMIT ... BY is not supported".into(),
+                ));
+            }
+            let limit = limit.as_ref().map(expr_to_usize).transpose()?;
+            let offset = offset
+                .as_ref()
+                .map(|o| expr_to_usize(&o.value))
+                .transpose()?
+                .unwrap_or(0);
+            Ok((limit, offset))
+        }
+        Some(ast::LimitClause::OffsetCommaLimit { offset, limit }) => {
+            Ok((Some(expr_to_usize(&limit)?), expr_to_usize(&offset)?))
+        }
+    }
+}
+
+fn expr_to_usize(e: &SqlExpr) -> Result<usize> {
+    match e {
+        SqlExpr::Value(vws) => match &vws.value {
+            Value::Number(s, _) => s.parse::<usize>().map_err(|_| {
+                DbError::SqlUnsupported(format!("expected a non-negative integer: {s}"))
+            }),
+            other => Err(DbError::SqlUnsupported(format!(
+                "LIMIT/OFFSET must be an integer, got {other:?}"
+            ))),
+        },
+        other => Err(DbError::SqlUnsupported(format!(
+            "LIMIT/OFFSET must be an integer literal, got {other:?}"
+        ))),
+    }
+}
+
+/// Fold the FROM list into a left-deep [`FromNode`] tree. Comma-separated FROM
+/// items become `CROSS JOIN`s; each item's own `joins` are folded left-deep.
+fn convert_from(items: &[TableWithJoins]) -> Result<FromNode> {
+    let mut iter = items.iter();
+    let first = iter
+        .next()
+        .ok_or_else(|| DbError::SqlUnsupported("SELECT without FROM is not supported".into()))?;
+    let mut node = convert_table_with_joins(first)?;
+    for twj in iter {
+        let right = convert_table_with_joins(twj)?;
+        node = FromNode::Join {
+            left: Box::new(node),
+            right: Box::new(right),
+            join_type: JoinType::Cross,
+            on: None,
+        };
+    }
+    Ok(node)
+}
+
+fn convert_table_with_joins(twj: &TableWithJoins) -> Result<FromNode> {
+    let mut node = FromNode::Table(table_ref_from_factor(&twj.relation)?);
+    for join in &twj.joins {
+        let right = FromNode::Table(table_ref_from_factor(&join.relation)?);
+        let (join_type, on) = convert_join_operator(&join.join_operator)?;
+        node = FromNode::Join {
+            left: Box::new(node),
+            right: Box::new(right),
+            join_type,
+            on,
+        };
+    }
+    Ok(node)
+}
+
+fn table_ref_from_factor(rel: &TableFactor) -> Result<TableRef> {
+    match rel {
+        TableFactor::Table { name, alias, .. } => Ok(TableRef {
+            table: name.to_string(),
+            alias: alias.as_ref().map(|a| a.name.value.clone()),
+        }),
+        other => Err(DbError::SqlUnsupported(format!(
+            "unsupported table reference in join: {other:?}"
+        ))),
+    }
+}
+
+fn convert_join_operator(op: &JoinOperator) -> Result<(JoinType, Option<QExpr>)> {
+    let (ty, constraint) = match op {
+        JoinOperator::Inner(c) | JoinOperator::Join(c) => (JoinType::Inner, Some(c)),
+        JoinOperator::LeftOuter(c) | JoinOperator::Left(c) => (JoinType::Left, Some(c)),
+        JoinOperator::RightOuter(c) | JoinOperator::Right(c) => (JoinType::Right, Some(c)),
+        JoinOperator::CrossJoin(_) => (JoinType::Cross, None),
+        other => {
+            return Err(DbError::SqlUnsupported(format!(
+                "unsupported join type: {other:?} (FULL OUTER / USING / NATURAL arrive later)"
+            )))
+        }
+    };
+    let on = match constraint {
+        None => None,
+        Some(JoinConstraint::On(expr)) => Some(convert_qexpr(expr)?),
+        Some(JoinConstraint::None) => None,
+        Some(other) => {
+            return Err(DbError::SqlUnsupported(format!(
+                "unsupported join constraint: {other:?} (only ON <expr> in P4.a)"
+            )))
+        }
+    };
+    Ok((ty, on))
+}
+
+fn convert_query_projection(items: Vec<SelectItem>) -> Result<Vec<Projection>> {
+    let mut out = Vec::new();
+    for item in items {
+        match item {
+            SelectItem::Wildcard(_) => out.push(Projection::Wildcard),
+            SelectItem::QualifiedWildcard(kind, _) => {
+                let name = match kind {
+                    ast::SelectItemQualifiedWildcardKind::ObjectName(n) => n.to_string(),
+                    other => {
+                        return Err(DbError::SqlUnsupported(format!(
+                            "unsupported qualified wildcard: {other:?}"
+                        )))
+                    }
+                };
+                out.push(Projection::QualifiedWildcard(name));
+            }
+            SelectItem::UnnamedExpr(e) => out.push(Projection::Expr {
+                expr: convert_qexpr(&e)?,
+                alias: None,
+            }),
+            SelectItem::ExprWithAlias { expr, alias } => out.push(Projection::Expr {
+                expr: convert_qexpr(&expr)?,
+                alias: Some(alias.value),
+            }),
+            other => {
+                return Err(DbError::SqlUnsupported(format!(
+                    "unsupported SELECT item: {other:?}"
+                )))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Convert a `sqlparser` expression into a [`QExpr`] (the Phase-4 query
+/// expression, which keeps column qualifiers and supports `OR`/`NOT`/`IS NULL`).
+fn convert_qexpr(e: &SqlExpr) -> Result<QExpr> {
+    match e {
+        SqlExpr::Identifier(ident) => Ok(QExpr::Column {
+            qualifier: None,
+            name: ident.value.clone(),
+        }),
+        SqlExpr::CompoundIdentifier(parts) => {
+            let name = parts.last().map(|i| i.value.clone()).unwrap_or_default();
+            let qualifier = if parts.len() >= 2 {
+                Some(parts[parts.len() - 2].value.clone())
+            } else {
+                None
+            };
+            Ok(QExpr::Column { qualifier, name })
+        }
+        SqlExpr::Value(vws) => convert_value(&vws.value).map(QExpr::Literal),
+        SqlExpr::Nested(inner) => convert_qexpr(inner),
+        SqlExpr::IsNull(inner) => Ok(QExpr::IsNull {
+            expr: Box::new(convert_qexpr(inner)?),
+            negated: false,
+        }),
+        SqlExpr::IsNotNull(inner) => Ok(QExpr::IsNull {
+            expr: Box::new(convert_qexpr(inner)?),
+            negated: true,
+        }),
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr,
+        } => Ok(QExpr::Not(Box::new(convert_qexpr(expr)?))),
+        SqlExpr::BinaryOp { left, op, right } => convert_qbinary_op(left, op, right),
+        SqlExpr::Function(f) => convert_aggregate(f),
+        SqlExpr::Exists { subquery, negated } => Ok(QExpr::Exists {
+            subquery: Box::new(query_to_spec((**subquery).clone())?),
+            negated: *negated,
+        }),
+        SqlExpr::Subquery(q) => Ok(QExpr::ScalarSubquery(Box::new(query_to_spec(
+            (**q).clone(),
+        )?))),
+        SqlExpr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => Ok(QExpr::InSubquery {
+            expr: Box::new(convert_qexpr(expr)?),
+            subquery: Box::new(query_to_spec((**subquery).clone())?),
+            negated: *negated,
+        }),
+        SqlExpr::InList {
+            expr,
+            list,
+            negated,
+        } => Ok(QExpr::InList {
+            expr: Box::new(convert_qexpr(expr)?),
+            list: list.iter().map(convert_qexpr).collect::<Result<Vec<_>>>()?,
+            negated: *negated,
+        }),
+        other => Err(DbError::SqlUnsupported(format!(
+            "unsupported expression in query: {other:?}"
+        ))),
+    }
+}
+
+/// Convert an aggregate function call (`COUNT(*)`, `SUM(x)`, `AVG(DISTINCT x)`,
+/// ...) into a [`QExpr::Aggregate`]. Only the five standard aggregates are
+/// supported; window/filter clauses are rejected.
+fn convert_aggregate(f: &ast::Function) -> Result<QExpr> {
+    let func = agg_func_from_name(&f.name.to_string()).ok_or_else(|| {
+        DbError::SqlUnsupported(format!("unsupported function in query: {}", f.name))
+    })?;
+    if f.over.is_some() || f.filter.is_some() || !f.within_group.is_empty() {
+        return Err(DbError::SqlUnsupported(
+            "window / FILTER / WITHIN GROUP aggregates are not supported".into(),
+        ));
+    }
+    let list = match &f.args {
+        ast::FunctionArguments::List(list) => list,
+        ast::FunctionArguments::None => {
+            return Err(DbError::SqlUnsupported(format!(
+                "{} requires arguments",
+                f.name
+            )))
+        }
+        other => {
+            return Err(DbError::SqlUnsupported(format!(
+                "unsupported aggregate arguments: {other:?}"
+            )))
+        }
+    };
+    let distinct = matches!(
+        list.duplicate_treatment,
+        Some(ast::DuplicateTreatment::Distinct)
+    );
+    // `COUNT(*)` has a single wildcard arg -> no argument expression.
+    if list.args.len() == 1 {
+        if let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard) = &list.args[0] {
+            if func != AggFunc::Count {
+                return Err(DbError::SqlUnsupported(format!(
+                    "{} does not support the * argument",
+                    f.name
+                )));
+            }
+            return Ok(QExpr::Aggregate {
+                func,
+                arg: None,
+                distinct,
+            });
+        }
+    }
+    if list.args.len() != 1 {
+        return Err(DbError::SqlUnsupported(format!(
+            "{} takes exactly one argument",
+            f.name
+        )));
+    }
+    let arg = match &list.args[0] {
+        ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => convert_qexpr(e)?,
+        other => {
+            return Err(DbError::SqlUnsupported(format!(
+                "unsupported aggregate argument: {other:?}"
+            )))
+        }
+    };
+    Ok(QExpr::Aggregate {
+        func,
+        arg: Some(Box::new(arg)),
+        distinct,
+    })
+}
+
+fn convert_qbinary_op(left: &SqlExpr, op: &BinaryOperator, right: &SqlExpr) -> Result<QExpr> {
+    let lhs = Box::new(convert_qexpr(left)?);
+    let rhs = Box::new(convert_qexpr(right)?);
+    let cmp = |op| {
+        Ok(QExpr::Compare {
+            op,
+            lhs: lhs.clone(),
+            rhs: rhs.clone(),
+        })
+    };
+    match op {
+        BinaryOperator::And => Ok(QExpr::And(lhs, rhs)),
+        BinaryOperator::Or => Ok(QExpr::Or(lhs, rhs)),
+        BinaryOperator::Eq => cmp(CmpOp::Eq),
+        BinaryOperator::NotEq => cmp(CmpOp::Ne),
+        BinaryOperator::Lt => cmp(CmpOp::Lt),
+        BinaryOperator::Gt => cmp(CmpOp::Gt),
+        BinaryOperator::LtEq => cmp(CmpOp::Le),
+        BinaryOperator::GtEq => cmp(CmpOp::Ge),
+        other => Err(DbError::SqlUnsupported(format!(
+            "unsupported operator in join query: {other}"
+        ))),
+    }
 }
 
 fn convert_projection(items: Vec<SelectItem>) -> Result<Vec<String>> {

@@ -146,6 +146,15 @@ serializes as a **decimal string** (e.g. `"9.90"`) and a `TIMESTAMP` as a UTC
 string (`"2024-01-01 12:00:00"`) so no precision is lost through JSON's `f64`
 numbers.
 
+**Phase 4 query power (P4.a–P4.e).** `POST /sql` gained joins, aggregates /
+`GROUP BY` / `HAVING`, `ORDER BY` / `DISTINCT` / `LIMIT` / `OFFSET`, subqueries
+and `WITH` CTEs, `ANALYZE <table>` (gather optimizer statistics), and
+`EXPLAIN [ANALYZE] <query>` — all through this same route with **no new routes
+or error codes**. A `SELECT`/join/aggregate query returns the `rows` shape
+above; `ANALYZE` returns an empty `rows` result; `EXPLAIN [ANALYZE]` returns
+the plan as a `rows` result with one single-string column per plan line (and,
+under `ANALYZE`, trailing `actual_rows=…` / `execution_time_ms=…` lines).
+
 **Response on failure** — e.g. a later statement references a nonexistent
 table, rolling back the whole request:
 ```

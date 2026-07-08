@@ -50,6 +50,12 @@ criterion = { version = "0.5", features = ["html_reports"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs"] }
 futures-util = "0.3"
+# Phase 4 differential correctness: join/aggregate/subquery results are checked
+# against SQLite on the same data. `bundled` compiles its own SQLite C library
+# so the tests are self-contained and reproducible in CI. Dev-dependency only —
+# it never enters the engine's own dependency graph, so the "engine stays sync"
+# invariant (`cargo tree -p unidb --no-default-features --edges normal`) holds.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [[bin]]
 name = "unidb-server"
@@ -104,6 +110,10 @@ harness = false
 name = "server"
 harness = false
 required-features = ["server"]
+
+[[bench]]
+name = "tpch"
+harness = false
 
 # M5.d: server integration tests, gated the same way as the unidb-server
 # binary — `tests/server_common/mod.rs` is a shared helper module, not its

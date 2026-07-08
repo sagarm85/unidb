@@ -44,7 +44,8 @@ stack (§11 below records what has actually been measured so far).
 
 ```
 API layer (M5)                REST + JWT(verify-only) + SSE + /metrics; embedded crate is primary
-Query & execution (M1+)       SQL parser -> logical plan -> executor; Cypher subset (M3)
+Query & execution (M1+)       SQL parser -> logical plan -> executor; Cypher subset (M3);
+                              joins/aggregates/subqueries/CTEs + cost-based optimizer + EXPLAIN (Phase 4)
 Logical record layer (M1+)    rows / vector records / graph edges / queue events
 Transaction & concurrency     MVCC snapshots; write-write lock manager (abort-on-conflict)
 Storage layer (M0)            single-file paged store; buffer pool; WAL; control file; recovery
@@ -57,6 +58,7 @@ Module map (what each layer became in code):
 | Storage core (M0) | `format.rs`, `control.rs`, `mmap.rs`, `page.rs`, `bufferpool.rs`, `wal.rs`, `heap.rs`, `checkpoint.rs`, `recovery.rs` |
 | Transactions (M1) | `mvcc.rs`, `txn.rs`, `lockmgr.rs`, `concurrency_hooks.rs` |
 | Catalog & SQL (M1) | `catalog.rs`, `sql/{parser,logical,executor}.rs` |
+| Query power (Phase 4) | `sql/{query,plan,query_exec,join,aggregate,sort,optimizer,statistics,explain}.rs` — joins (hash+Grace-spill / sort-merge / index-nested-loop), aggregation + sort, subqueries/CTEs, `ANALYZE` + cost-based optimizer, `EXPLAIN` |
 | Secondary indexes (M2, M6, M7; all durable since Phase 3) | `btree_index.rs` (durable `DiskBTree`, also backs full-text + edge), `disk_vector.rs` (durable IVF-Flat `DiskIvfIndex`), `fulltext.rs` (tokenizer), `vector.rs` (retired in-RAM HNSW baseline), `csr_index.rs` (retired) |
 | Graph (M3, M7) | `graph/{edges,index,logical,parser,executor}.rs` |
 | Event queue (M4) | `queue/{mod,payload}.rs` |
@@ -397,9 +399,18 @@ physical-plan IR — the grammar maps 1:1). Supported: `CREATE TABLE`,
 `USING` clause precedes the column list — a `sqlparser` grammar fact),
 `NEAR(column, [..], k)` inside `WHERE`. JSON columns support `->`/`->>`
 (note: they bind looser than `=` under `GenericDialect`; parens required).
-Not supported (deliberate scope, parked in
-`docs/backlog/phase2_sql_capability_expansion.md`): `OR`, `ORDER BY`,
-`LIMIT`, aggregates, joins, subqueries, `IN (...)`.
+**Phase 4 lifted the old single-table scope** (this paragraph's earlier "not
+supported: `OR`/`ORDER BY`/`LIMIT`/aggregates/joins/subqueries/`IN`" list is
+**superseded** — those all ship now). Anything beyond a trivial single-table
+filter/project is routed by the parser into a new `LogicalPlan::Query`
+(carrying a `QuerySpec`) that the Phase-4 planner turns into a physical
+operator tree; the flat single-table `SELECT` path is unchanged (it still
+feeds the concurrent-read fast path). Supported: inner/left/right/cross joins,
+`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`/`HAVING`, `ORDER BY`/`DISTINCT`/
+`LIMIT`/`OFFSET`, scalar/`IN`/`EXISTS` subqueries (correlated + uncorrelated),
+`IN (list)`, non-recursive `WITH` CTEs, `ANALYZE`, and `EXPLAIN [ANALYZE]`.
+Still out of scope (documented Phase-4 limits): window functions, recursive
+CTEs, `FULL OUTER`/`USING`/`NATURAL` joins, and columnar/vectorized execution.
 
 **Constraints (M11, `sql-constraints` branch — pending merge):** `CREATE
 TABLE` column options and table constraints — `PRIMARY KEY`, `FOREIGN KEY` /
@@ -1068,4 +1079,21 @@ P3.d **large objects** (§ P3.d): out-of-line chunked + streamed `__lobs__` rows
 harness **14→19** (P13 B-Tree total-data-loss, P14 full-text, P15 edge, P16 large
 object, P17 durable vector index recall-intact), no locked decision reversed. See
 `docs/backlog/phase3_durable_storage.md` + `PROGRESS.md`'s P3.a–P3.d entries.
+**Phase 4 COMPLETE (2026-07-09, SQL lane, branch `query-power`): query power.**
+P4.a joins (hash + Grace spill / sort-merge / index-nested-loop over the durable
+B-Tree) · P4.b aggregates + `GROUP BY`/`HAVING` + `ORDER BY` (external merge-sort
+spill) + `DISTINCT` + `LIMIT`/`OFFSET` · P4.c scalar/`IN`/`EXISTS` subqueries
+(correlated + uncorrelated) + `WITH` CTEs · P4.d `ANALYZE` (durable per-table
+statistics, never recomputed on open) + cost-based optimizer (Selinger left-deep
+DP join order + index-vs-scan) · P4.e `EXPLAIN [ANALYZE]`. Additive only: a
+trivial single-table `SELECT` keeps its fast path; richer queries route through
+a new `LogicalPlan::Query`/physical operator tree (`sql/{query,plan,query_exec,
+join,aggregate,sort,optimizer,statistics,explain}.rs`). Correctness checked
+differentially against SQLite. No `FORMAT_VERSION` bump, no new crash point
+(no new storage mechanism — stats ride the existing catalog page), no locked
+decision reversed. Known limits: window functions / recursive CTEs / `FULL
+OUTER`+`USING`+`NATURAL` joins unsupported; the catalog (all TableDefs + stats)
+is still a single ~8 KiB page blob, so a very wide analyzed schema can overflow
+it (multi-page catalog is tracked tech debt). See `docs/backlog/
+phase4_query_power.md` + `PROGRESS.md`'s Phase 4 entry.
 Update alongside the next milestone's closeout.*

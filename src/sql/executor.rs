@@ -238,6 +238,7 @@ pub fn execute(plan: LogicalPlan, ctx: &mut ExecCtx) -> Result<ExecResult> {
             predicate,
         } => exec_update(&table, &assignments, &predicate, ctx),
         LogicalPlan::Delete { table, predicate } => exec_delete(&table, &predicate, ctx),
+        LogicalPlan::Query(spec) => crate::sql::query_exec::exec_query(&spec, ctx),
         LogicalPlan::CreateIndex {
             table,
             column,
@@ -253,6 +254,10 @@ pub fn execute(plan: LogicalPlan, ctx: &mut ExecCtx) -> Result<ExecResult> {
         } => exec_alter_drop_column(&table, &column, if_exists, ctx),
         LogicalPlan::DropTable { table, if_exists } => exec_drop_table(&table, if_exists, ctx),
         LogicalPlan::Truncate { table } => exec_truncate(&table, ctx),
+        LogicalPlan::Analyze { table } => exec_analyze(&table, ctx),
+        LogicalPlan::Explain { analyze, spec } => {
+            crate::sql::query_exec::exec_explain(&spec, analyze, ctx)
+        }
     }
 }
 
@@ -298,6 +303,23 @@ fn exec_drop_table(table: &str, if_exists: bool, ctx: &mut ExecCtx) -> Result<Ex
         Err(DbError::TableNotFound(_)) if if_exists => Ok(ExecResult::DroppedTable),
         Err(e) => Err(e),
     }
+}
+
+/// `ANALYZE` (P4.d): scan the table's live rows under the statement snapshot,
+/// compute statistics, and persist them on the catalog (durable — never
+/// recomputed on open). Returns an empty result set.
+fn exec_analyze(table: &str, ctx: &mut ExecCtx) -> Result<ExecResult> {
+    let table_def = ctx.catalog.lookup(table)?.clone();
+    let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+    let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+    let mut rows = Vec::new();
+    for (_, bytes) in heap.scan(&snapshot, ctx.xid, ctx.pool)? {
+        rows.push(decode_row(&bytes, &table_def.columns)?);
+    }
+    let stats = crate::sql::statistics::compute(&rows, &table_def.columns);
+    let mut cctx = catalog_ctx!(ctx);
+    ctx.catalog.set_table_stats(table, stats, &mut cctx)?;
+    Ok(ExecResult::Rows(Vec::new()))
 }
 
 fn exec_truncate(table: &str, ctx: &mut ExecCtx) -> Result<ExecResult> {
@@ -1547,7 +1569,7 @@ fn json_of(lit: Literal) -> Result<JsonValue> {
     serde_json::from_str(&text).map_err(|e| DbError::SqlPlan(format!("invalid JSON: {e}")))
 }
 
-fn as_bool(lit: &Literal) -> Result<bool> {
+pub(crate) fn as_bool(lit: &Literal) -> Result<bool> {
     match lit {
         Literal::Bool(b) => Ok(*b),
         Literal::Null => Ok(false),
@@ -1557,7 +1579,27 @@ fn as_bool(lit: &Literal) -> Result<bool> {
     }
 }
 
-fn compare(op: CmpOp, l: &Literal, r: &Literal) -> Result<bool> {
+/// Total-ish ordering between two literals for the Phase-4 sort / merge-join /
+/// aggregate paths, built on the same type rules as [`compare`]. Returns `None`
+/// for genuinely unorderable pairs (NULL operand, NaN float, or a type mismatch
+/// `compare` itself rejects) — callers decide how to place those (NULLs sort
+/// last, unmatched merge-join keys are skipped).
+pub(crate) fn literal_ord(l: &Literal, r: &Literal) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    if matches!(l, Literal::Null) || matches!(r, Literal::Null) {
+        return None;
+    }
+    // Reuse `compare`: a == b, then a < b disambiguates Less/Greater. Any pair
+    // `compare` errors on (incomparable types) yields `None`.
+    match (compare(CmpOp::Eq, l, r), compare(CmpOp::Lt, l, r)) {
+        (Ok(true), _) => Some(Ordering::Equal),
+        (Ok(false), Ok(true)) => Some(Ordering::Less),
+        (Ok(false), Ok(false)) => Some(Ordering::Greater),
+        _ => None,
+    }
+}
+
+pub(crate) fn compare(op: CmpOp, l: &Literal, r: &Literal) -> Result<bool> {
     if matches!(l, Literal::Null) || matches!(r, Literal::Null) {
         // Simplified NULL semantics: any comparison involving NULL is not
         // true. Real three-valued SQL logic (NULL propagation through

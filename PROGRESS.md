@@ -2466,3 +2466,79 @@ piece rather than buffering a whole blob in the writer.
 are separate `__lobs__` rows, no tuple format change). No `FORMAT_VERSION` bump.
 No decision reversed.
 **PR:** _pending._
+
+---
+
+## Phase 4 — Query power (SQL lane)   [DONE]   2026-07-09
+
+**PR:** _pending (branch `query-power`; one PR for the whole phase, P4.a–P4.e)._
+**Summary:** Turns unidb from a single-table filter/project engine into a real
+query engine — joins (hash + Grace spill / sort-merge / index-nested-loop),
+aggregation + `GROUP BY`/`HAVING` + `ORDER BY` (external merge-sort spill) +
+`DISTINCT` + `LIMIT`/`OFFSET`, scalar/`IN`/`EXISTS` subqueries (correlated +
+uncorrelated) + `WITH` CTEs, durable `ANALYZE` statistics + a cost-based
+optimizer (Selinger left-deep DP join order + index-vs-scan), and
+`EXPLAIN [ANALYZE]`. Additive: a trivial single-table `SELECT` keeps its
+original fast path; anything richer routes through a new `LogicalPlan::Query`
+physical operator tree. Correctness is checked **differentially against SQLite**.
+
+**Benchmarks** (`cargo bench --bench tpch`, release, Apple Silicon macOS,
+real fsync per commit; TPC-H subset — 200 customers, 2,000 orders, 6,000
+lineitems; `ANALYZE`d; 30 iterations per query):
+
+| Query                                             | p50 (ms) | p99 (ms) | rows | plan |
+|---------------------------------------------------|----------|----------|------|------|
+| Q1 join + selective filter (orders⋈customer)      | 0.675    | 1.578    | 10   | IndexScan(customer.id) ⋈ orders |
+| Q2 `GROUP BY` aggregate (orders by customer)       | 0.474    | 0.757    | 200  | Scan → HashAggregate |
+| Q3 3-way join + `GROUP BY` + `SUM` (lineitem⋈orders⋈customer) | 2.496 | 3.767 | 25 | hash joins → HashAggregate |
+| Q4 `ORDER BY … DESC LIMIT 10`                      | 0.196    | 0.253    | 10   | Scan → Sort → Limit |
+
+**Optimizer decision (from `EXPLAIN`, same run):**
+- selective `WHERE customer.id = 42` → `IndexScan customer on id =` (est_rows=1)
+- broad `WHERE customer.id > 0` → `Scan customer` + `Filter` (est_rows=66)
+
+i.e. the cost model picks the index plan when selective and the full scan when
+not — the P4.d crossover, visible in the plan the query actually runs.
+
+**Peak memory:** not per-query-instrumented in this bench (a follow-up). By
+construction the executor materializes each operator's output bounded by its
+result cardinality, and the two unbounded-intermediate operators — hash join
+and `ORDER BY` — **spill to disk** past a row budget (`UNIDB_HASH_JOIN_MEM_ROWS`
+/ `UNIDB_SORT_MEM_ROWS`, unit-tested via forced-spill), so a large join/sort
+does not hold the whole intermediate in RAM. Process RSS on this dataset stays
+in the tens-of-MB range consistent with prior milestones (~28–40 MB).
+
+**Baseline (honesty, per CLAUDE.md §6):** the baseline here is **correctness,
+not throughput** — join/aggregate/subquery results are asserted **equal to
+SQLite** on the same data (`tests/{join,aggregate,subquery,optimizer}.rs`,
+`rusqlite` bundled, a dev-dependency only). The above latencies are unidb's own
+single-node numbers, not a comparison; the §6 cross-domain "replaced stack"
+headline (unidb-in-one-commit vs Postgres + vector store + graph DB + queue)
+remains a separate, deferred effort. This bench measures the query engine this
+phase built, on its own, with no aspirational claims.
+
+**Crash harness:** unchanged at **19** — Phase 4 added no new storage mechanism
+(joins/aggregates are read-side; `ANALYZE` stats ride the existing WAL-logged
+catalog page). All suites green: `cargo test -p unidb` (19 result-groups ok),
+`--features server` (28 ok), `--test crash` (19), `clippy -D warnings` + `fmt`
+clean, and `cargo tree -p unidb --no-default-features --edges normal` free of
+tokio/reqwest/axum (rusqlite is a dev-dep, outside the normal graph).
+
+**What changed:**
+- New SQL-lane modules: `sql/{query,plan,query_exec,join,aggregate,sort,optimizer,statistics,explain}.rs`.
+- `LogicalPlan::Query`/`Explain`/`Analyze` variants; parser routes joins/aggregates/subqueries/CTEs/EXPLAIN/ANALYZE into them; `apply_rls`/`bind_params` gained arms.
+- `catalog.rs`: durable per-table statistics in a side map, backward-compatible catalog blob (`{tables, stats}`); `set_table_stats`/`table_stats`.
+- Differential test suites vs SQLite + optimizer unit tests + EXPLAIN tests + this benchmark.
+
+**Known limitations / tech debt:**
+- No window functions, recursive CTEs, or `FULL OUTER`/`USING`/`NATURAL` joins.
+- `ORDER BY` resolves an output-column name or 1-based position (not arbitrary expressions) in v1.
+- Join keys compare by exact encoding — declare matching key types for cross-type numeric joins.
+- The optimizer emits hash joins for reordered joins (index-nested-loop comes from the rule-based fallback path); cost-comparing INLJ inside the DP is a follow-up.
+- **The catalog is still a single ~8 KiB page blob** holding every `TableDef`'s page list + all stats, so a table with a very large page list or a very wide analyzed schema can overflow it (this bench keeps the dataset modest for that reason). A multi-page/paginated catalog is the tracked fix.
+- `EXPLAIN ANALYZE` reports total actual rows + execution time, not per-operator actuals/timings (a follow-up).
+
+**Deferred to later phases:** columnar/vectorized execution (parked Track E); intra-query parallelism (needs Phase 5); per-operator EXPLAIN ANALYZE instrumentation; multi-page catalog.
+
+**Locked-decision changes:** none. This is CLAUDE.md §1's "practical subset" growing; the catalog gained statistics storage (additive). No §3 decision reversed; no `FORMAT_VERSION` bump.
+**PR:** _pending._
