@@ -794,8 +794,21 @@ impl Engine {
 
     /// Commit `xid`, releasing every lock it held. `xid` is finished after
     /// this call and must not be reused.
+    ///
+    /// Under `SERIALIZABLE` (P1.d) the commit can be refused: if `xid` turned
+    /// out to be a pivot in a dangerous rw-antidependency structure (e.g.
+    /// write-skew), `TransactionManager::commit` returns `SerializationFailure`
+    /// with `xid` still live, and this method rolls it back before returning
+    /// the error — so the caller just sees `SerializationFailure` on a fully
+    /// cleaned-up transaction, and should retry.
     pub fn commit(&mut self, xid: Xid) -> Result<()> {
-        self.txn_mgr.commit(xid, &mut self.wal, &mut self.lock_mgr)
+        match self.txn_mgr.commit(xid, &mut self.wal, &mut self.lock_mgr) {
+            Err(DbError::SerializationFailure { xid }) => {
+                self.abort(xid)?;
+                Err(DbError::SerializationFailure { xid })
+            }
+            other => other,
+        }
     }
 
     /// A cloneable, `Send + Sync` handle for concurrent reads that run off the
@@ -1857,6 +1870,192 @@ mod tests {
             SqlResult::Rows(rows) => assert_eq!(rows.len(), 1),
             other => panic!("expected Rows, got {other:?}"),
         }
+    }
+
+    // ── P1.d: isolation correctness ──────────────────────────────────────────
+
+    /// The canonical SSI test (P1.d): a write-skew schedule commits under
+    /// REPEATABLE READ / snapshot isolation (the anomaly SI permits) but is
+    /// aborted under SERIALIZABLE. Two transactions each read the on-call set
+    /// then take a *different* doctor off call; row-disjoint writes, so neither
+    /// blocks the other, yet together they violate the "at least one on call"
+    /// invariant — exactly what SSI's rw-antidependency (pivot) detection stops.
+    #[test]
+    fn write_skew_commits_under_rr_but_aborts_under_serializable() {
+        fn run(iso: Isolation) -> (Result<()>, Result<()>) {
+            let dir = tempdir().unwrap();
+            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let s = engine.begin().unwrap();
+            engine
+                .execute_sql(s, "CREATE TABLE doctors (id INT, on_call INT)")
+                .unwrap();
+            engine
+                .execute_sql(s, "INSERT INTO doctors (id, on_call) VALUES (1, 1)")
+                .unwrap();
+            engine
+                .execute_sql(s, "INSERT INTO doctors (id, on_call) VALUES (2, 1)")
+                .unwrap();
+            engine.commit(s).unwrap();
+
+            let t1 = engine.begin_with_isolation(iso).unwrap();
+            let t2 = engine.begin_with_isolation(iso).unwrap();
+            // Each reads the whole on-call set (the overlapping read set).
+            engine
+                .execute_sql(t1, "SELECT id FROM doctors WHERE on_call = 1")
+                .unwrap();
+            engine
+                .execute_sql(t2, "SELECT id FROM doctors WHERE on_call = 1")
+                .unwrap();
+            // Each takes a *different* doctor off call (row-disjoint writes).
+            engine
+                .execute_sql(t1, "UPDATE doctors SET on_call = 0 WHERE id = 1")
+                .unwrap();
+            engine
+                .execute_sql(t2, "UPDATE doctors SET on_call = 0 WHERE id = 2")
+                .unwrap();
+            let c1 = engine.commit(t1);
+            let c2 = engine.commit(t2);
+            (c1, c2)
+        }
+
+        // RR/SI permits write-skew: both commit.
+        let (c1, c2) = run(Isolation::RepeatableRead);
+        assert!(
+            c1.is_ok() && c2.is_ok(),
+            "RR must permit write-skew (both commit): {c1:?} {c2:?}"
+        );
+
+        // SERIALIZABLE catches the pivot: at least one transaction aborts with
+        // a SerializationFailure.
+        let (c1, c2) = run(Isolation::Serializable);
+        assert!(
+            c1.is_err() || c2.is_err(),
+            "SERIALIZABLE must abort a write-skew transaction"
+        );
+        for c in [c1, c2] {
+            if let Err(e) = c {
+                assert!(
+                    matches!(e, DbError::SerializationFailure { .. }),
+                    "SSI abort must be a SerializationFailure, got {e:?}"
+                );
+            }
+        }
+    }
+
+    /// P1.d: under READ COMMITTED, updating a row another transaction already
+    /// updated-and-committed must NOT spuriously abort — RC's fresh
+    /// per-statement snapshot re-reads the latest committed version and applies
+    /// to it (EvalPlanQual via re-scan).
+    #[test]
+    fn read_committed_concurrent_update_does_not_spuriously_abort() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let s = engine.begin().unwrap();
+        engine
+            .execute_sql(s, "CREATE TABLE t (id INT, v INT)")
+            .unwrap();
+        engine
+            .execute_sql(s, "INSERT INTO t (id, v) VALUES (1, 10)")
+            .unwrap();
+        engine.commit(s).unwrap();
+
+        // A commits an update first.
+        let a = engine.begin().unwrap();
+        engine
+            .execute_sql(a, "UPDATE t SET v = 20 WHERE id = 1")
+            .unwrap();
+        engine.commit(a).unwrap();
+
+        // B (RC) updates the same row afterward — no spurious conflict.
+        let b = engine.begin().unwrap();
+        let r = engine.execute_sql(b, "UPDATE t SET v = 30 WHERE id = 1");
+        assert!(
+            r.is_ok(),
+            "RC update after a committed concurrent update must not abort: {r:?}"
+        );
+        engine.commit(b).unwrap();
+
+        let q = engine.begin().unwrap();
+        match &engine
+            .execute_sql(q, "SELECT v FROM t WHERE id = 1")
+            .unwrap()[0]
+        {
+            SqlResult::Rows(rows) => assert_eq!(rows.len(), 1),
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    /// P1.d: under REPEATABLE READ, writing a row a concurrent transaction
+    /// has updated-and-committed since this txn's snapshot is a genuine
+    /// serialization anomaly — surfaced as `SerializationFailure`, not a raw
+    /// `WriteConflict` (the M1.c "conflicts propagate regardless of isolation"
+    /// gap, now closed).
+    #[test]
+    fn repeatable_read_write_over_committed_update_is_serialization_failure() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let s = engine.begin().unwrap();
+        engine
+            .execute_sql(s, "CREATE TABLE t (id INT, v INT)")
+            .unwrap();
+        engine
+            .execute_sql(s, "INSERT INTO t (id, v) VALUES (1, 10)")
+            .unwrap();
+        engine.commit(s).unwrap();
+
+        // B fixes its snapshot (RR) by reading before A commits.
+        let b = engine
+            .begin_with_isolation(Isolation::RepeatableRead)
+            .unwrap();
+        engine
+            .execute_sql(b, "SELECT v FROM t WHERE id = 1")
+            .unwrap();
+
+        // A updates and commits after B's snapshot.
+        let a = engine.begin().unwrap();
+        engine
+            .execute_sql(a, "UPDATE t SET v = 20 WHERE id = 1")
+            .unwrap();
+        engine.commit(a).unwrap();
+
+        // B writes the version it still sees — a lost-update conflict.
+        let r = engine.execute_sql(b, "UPDATE t SET v = 30 WHERE id = 1");
+        assert!(
+            matches!(r, Err(DbError::SerializationFailure { .. })),
+            "RR write over a committed concurrent update must be SerializationFailure: {r:?}"
+        );
+        engine.abort(b).unwrap();
+    }
+
+    /// P1.d: a serializable transaction with no rw-conflict (touches rows
+    /// nobody else reads/writes) commits normally — SSI must not over-abort the
+    /// common case.
+    #[test]
+    fn serializable_non_conflicting_transaction_commits() {
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let s = engine.begin().unwrap();
+        engine
+            .execute_sql(s, "CREATE TABLE t (id INT, v INT)")
+            .unwrap();
+        engine
+            .execute_sql(s, "INSERT INTO t (id, v) VALUES (1, 1)")
+            .unwrap();
+        engine.commit(s).unwrap();
+
+        let t = engine
+            .begin_with_isolation(Isolation::Serializable)
+            .unwrap();
+        engine
+            .execute_sql(t, "SELECT v FROM t WHERE id = 1")
+            .unwrap();
+        engine
+            .execute_sql(t, "UPDATE t SET v = 2 WHERE id = 1")
+            .unwrap();
+        assert!(
+            engine.commit(t).is_ok(),
+            "a lone serializable txn must commit"
+        );
     }
 
     #[test]

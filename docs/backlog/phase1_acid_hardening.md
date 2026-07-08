@@ -1,14 +1,15 @@
 # Phase 1 — ACID & storage foundation (Core lane, `acid-hardening`)
 
-## Status as of 2026-07-08: IN PROGRESS — P1.a + P1.b + P1.c shipped; P1.d–P1.e next.
+## Status as of 2026-07-08: IN PROGRESS — P1.a–P1.d shipped; only P1.e (auto-checkpoint) left.
 
 **P1.a (full-page-writes / `WAL_FPI`)**, **P1.b (fsync-failure handling /
-fsyncgate)**, and **P1.c (`alloc_page` chunked growth + configurable buffer
-pool + real free-space map)** are shipped — see `PROGRESS.md`'s "Phase 1 → P1.a
-/ P1.b / P1.c" entries (crash points P11 + P12 added, `FORMAT_VERSION` 3→4,
-benchmarks recorded incl. `benches/scale.rs`). P1.d (isolation correctness —
-RC re-evaluation + true SERIALIZABLE/SSI) is the next checkpoint. Remaining:
-P1.d → P1.e, one PR each, in order.
+fsyncgate)**, **P1.c (`alloc_page` chunked growth + configurable buffer pool +
+real free-space map)**, and **P1.d (isolation correctness — RC re-evaluation +
+RR/SER `SerializationFailure` + true SERIALIZABLE via SSI)** are shipped — see
+`PROGRESS.md`'s "Phase 1 → P1.a / P1.b / P1.c / P1.d" entries (crash points P11 +
+P12 added, `FORMAT_VERSION` 3→4, benchmarks recorded incl. `benches/scale.rs`).
+**P1.e (auto-checkpoint — time + WAL-size triggers) is the last remaining
+checkpoint.**
 
 The **feature-freeze gate**: no Phase-4+ engine feature lands until Tier-0
 correctness is closed. Companion to [`roadmap.md`](roadmap.md) §4/§6 — this is
