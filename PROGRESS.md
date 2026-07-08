@@ -2127,3 +2127,93 @@ placeholders, `bind_params` unit, `json_to_literal` + `SqlRequest` param
 defaults. 303 → 309 unit tests (+2 server-feature).
 **Docs:** `docs/REST_API.md` documents the `params` field on `POST /sql`.
 **Locked-decision changes:** none.
+
+---
+
+## Phase 3 — Multi-model durable storage (Core lane, `durable-storage`)
+
+The moat: kill the "rebuild every secondary index on open" tax (O(all data)
+startup, RAM-bound) by making the indexes durable on disk, and own the AI /
+big-file story. Blueprint: `docs/backlog/phase3_durable_storage.md`. Serial Core
+lane; one PR per checkpoint (P3.a → P3.d).
+
+### P3.a — Durable paged WAL-logged B-Tree   [Core lane — Phase 3 — shipped]   2026-07-08
+
+**Branch:** `durable-storage`. First Phase 3 checkpoint — the B-Tree becomes the
+first **durable, crash-recovered, never-rebuilt-on-open** secondary index.
+**Summary:** the M6 in-memory `BTreeMap` is replaced by an on-disk B+tree
+(`DiskBTree`) whose nodes are pages in the shared page store, buffer-pool-managed,
+and WAL-logged as full node-page images. `Engine::open` reads it straight from a
+stable meta page — no heap rescan, no rebuild.
+
+**Design (the load-bearing choices):**
+- **Node pages ride the existing page machinery.** Each node/meta page carries
+  the standard 28-byte page header (page_id / type / crc / lsn), so the buffer
+  pool's CRC + D5 (WAL-before-page) discipline applies unchanged; the B+tree
+  payload lives in the body. New `PAGE_TYPE_BTREE`.
+- **Full node-page-image WAL logging** (new redo-only `WAL_INDEX`, same proven
+  shape as `WAL_FPI` / `WAL_VACUUM` full-image). Each `insert`/`remove` is **one
+  mini-transaction** bracketing every page it touches (a leaf write, or a
+  split-chain + root-repoint). Recovery redoes all pages of a committed index
+  mini-txn or none — atomic. Idempotent, LSN-stamped, last-writer-in-LSN-order
+  wins; index pages never overlap heap pages, so no LSN gate is needed.
+- **No undo, proven safe.** A secondary-index entry is only ever a *hint*,
+  re-validated against MVCC visibility in `try_exec_select_btree`, so a stale /
+  extra entry (from an aborted or incomplete write) is harmless. The one
+  dangerous case — a committed, MVCC-visible heap row with no index entry (a
+  false negative) — cannot happen: the index mini-txn fsyncs during statement
+  execution, *before* the user txn reaches `WAL_TXN_COMMIT`, so any committed
+  row's index entry is already durable.
+- **Stable meta page.** A per-index meta page (id stored once in the catalog as
+  `ColumnDef.index_root`, never changes) points at the current root, so a root
+  split repoints the meta page in place — never a catalog rewrite. `Engine::open`
+  is O(1): read catalog → meta → root.
+- **Moved off the async worker** onto the synchronous writer/read path (like
+  `EdgeIndex`): the executor inserts durable entries inline
+  (`apply_durable_btree_writes`) and reads via `DiskBTree::search`; vacuum
+  scrubs the tree directly (`DiskBTree::remove`, reading each dead row's key via
+  the new `Heap::get_raw` before the slot is reused). Removed from
+  `rebuild_secondary_indexes`; `IndexKind::BTree` no longer reaches
+  `index_worker.rs`.
+
+**v1 simplifications (documented, not silent):** deletes don't merge/rebalance
+underfull nodes (an emptied leaf stays linked — wastes space, never wrong; the
+tree only grows); one fsync per key insert, so an indexed INSERT pays the heap
+fsync **plus** one index fsync (batched behind a single fsync in the server's
+group-commit deferred-sync mode); `DROP INDEX` pages leak until the FSM reclaims
+them, exactly like `DROP TABLE` heap pages.
+
+**Benchmark — the Phase-3 gate (`benches/durable_index.rs`, `Engine::open` cost
+vs. indexed-row count; Apple Silicon, real fsync):**
+
+| rows | B-Tree open (ms) — durable, P3.a | HNSW open (ms) — rebuilt on open |
+|------|----------------------------------|----------------------------------|
+| 1,000 | 2.862 | 2.941 |
+| 3,000 | 2.395 | 3.217 |
+| 6,000 | 2.299 | 3.416 |
+
+The number to read is the **scaling**: the durable B-Tree column is flat
+(≈constant, O(1) open — no heap rescan), while the still-rebuilt-on-open HNSW
+column rises with row count (the synchronous heap rescan that re-enqueues every
+row on open — exactly the O(data) startup Phase 3 kills). Peak RSS is unchanged
+(same fixed-size, mmap-backed buffer pool; a point lookup touches only a
+root→leaf path, not O(data)).
+
+**Crash safety:** new crash point **P13** builds a durable tree past several
+splits, then **wipes the entire data file** and proves recovery reconstructs the
+whole tree from the WAL alone — every key still findable. Crash harness **14 →
+15**.
+
+**Tests:** module-level insert/search/range/split/text-key/remove +
+reconstruct-from-meta-page (`btree_index.rs`); aborted insert never surfaces via
+the index and durable reopen without rebuild (`tests/btree_mvcc.rs`);
+`engine_restart_btree_index_is_durable_no_rebuild` + pre-Ready equality
+correctness (`tests/index_rebuild.rs`); differential index-vs-full-scan and
+RLS-respecting index path (`lib.rs`). 316 → 324 default-feature unit tests + the
+new crash point; all green, clippy `-D warnings` + fmt clean across the
+workspace.
+
+**Locked-decision impact:** D1 / D4 / D5 / D9 strengthened (indexes are now
+WAL-logged + crash-recovered; tuple format unchanged; new record kind + page
+type; `FORMAT_VERSION` **4 → 5**). No decision reversed.
+**PR:** _pending._

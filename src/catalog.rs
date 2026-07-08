@@ -161,6 +161,13 @@ pub struct ColumnDef {
     pub name: String,
     pub ty: ColumnType,
     pub index: Option<IndexKind>,
+    /// For a durable `BTree` index (P3.a): the stable meta page id of its
+    /// on-disk B+tree. Set once at `CREATE INDEX`, never changes (a root split
+    /// repoints the meta page in place, not this pointer), so `Engine::open`
+    /// reconstructs the tree from it with no heap rescan. `None` for the
+    /// still-rebuilt-on-open kinds (Hnsw/FullText/Csr) and un-indexed columns.
+    #[serde(default)]
+    pub index_root: Option<PageId>,
     #[serde(default)]
     pub constraints: ColumnConstraints,
     /// Logically dropped by `ALTER TABLE DROP COLUMN` (P2.c). A dropped column
@@ -352,6 +359,32 @@ impl Catalog {
         self.persist(ctx)
     }
 
+    /// Record the stable meta page id of a column's durable B-Tree (P3.a). Set
+    /// once at `CREATE INDEX` and persisted in the catalog blob so
+    /// `Engine::open` can reconstruct the tree with no heap rescan.
+    pub fn set_column_index_root(
+        &mut self,
+        table: &str,
+        column: &str,
+        index_root: Option<PageId>,
+        ctx: &mut CatalogCtx,
+    ) -> Result<()> {
+        let t = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
+        let col = t
+            .columns
+            .iter_mut()
+            .find(|c| c.name == column)
+            .ok_or_else(|| DbError::ColumnNotFound {
+                table: table.to_string(),
+                column: column.to_string(),
+            })?;
+        col.index_root = index_root;
+        self.persist(ctx)
+    }
+
     /// Update a table's stored page list (called by the executor after an
     /// INSERT/UPDATE allocates a new heap page for that table's data).
     pub fn set_pages(
@@ -536,6 +569,7 @@ mod tests {
             columns: vec![ColumnDef {
                 name: "id".to_string(),
                 index: None,
+                index_root: None,
                 dropped: false,
                 constraints: Default::default(),
                 ty: ColumnType::Int64,
@@ -595,6 +629,7 @@ mod tests {
                 ColumnDef {
                     name: "id".to_string(),
                     index: None,
+                    index_root: None,
                     dropped: false,
                     constraints: Default::default(),
                     ty: ColumnType::Int64,
@@ -602,6 +637,7 @@ mod tests {
                 ColumnDef {
                     name: "data".to_string(),
                     index: None,
+                    index_root: None,
                     dropped: false,
                     constraints: Default::default(),
                     ty: ColumnType::Json,
@@ -643,6 +679,7 @@ mod tests {
                     name: "id".to_string(),
                     ty: ColumnType::Int64,
                     index: None,
+                    index_root: None,
                     dropped: false,
                     constraints: Default::default(),
                 },
@@ -650,6 +687,7 @@ mod tests {
                     name: "vec".to_string(),
                     ty: ColumnType::Vector(384),
                     index: Some(IndexKind::Hnsw),
+                    index_root: None,
                     dropped: false,
                     constraints: Default::default(),
                 },

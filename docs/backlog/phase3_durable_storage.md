@@ -1,6 +1,13 @@
 # Phase 3 — Multi-model durable storage (the moat)
 
-## Status as of 2026-07-08: NOT STARTED.
+## Status as of 2026-07-08: IN PROGRESS.
+- **P3.a — Durable paged WAL-logged B-Tree: SHIPPED** (branch `durable-storage`).
+  See `PROGRESS.md` → "P3.a" and `MEMORY.md`. The B-Tree is now on-disk,
+  buffer-pool-managed, WAL-logged (`WAL_INDEX`), crash-recovered, and **no
+  longer rebuilt on open** — removed from `rebuild_secondary_indexes`. Crash
+  harness grew 14 → 15 (new point P13). `FORMAT_VERSION` 4 → 5.
+- P3.b (inverted + CSR + EdgeIndex), P3.c (on-disk vector), P3.d (large
+  objects): not started.
 
 Kills rebuild-on-open + the RAM ceiling, and owns the AI/big-file story
 Postgres doesn't have. Companion to [`roadmap.md`](roadmap.md) §4. **Depends on
@@ -25,15 +32,25 @@ which is the differentiator.
 
 ## Checkpoints
 
-### P3.a — Durable B-Tree index
-- Replace the in-memory `BTreeIndex` with an on-disk B-tree: nodes are pages in
-  the page store, buffer-pool-managed, mutations **WAL-logged** and
-  crash-recovered — **no rebuild on open**.
-- Files: `btree_index.rs` (disk impl), `page.rs`/`bufferpool.rs`/`wal.rs`/
-  `recovery.rs`, `index_worker.rs` (stop rebuilding B-Tree), `lib.rs` (drop
-  B-Tree from `rebuild_secondary_indexes`).
-- Tests: open-time independent of table size; crash mid-node-split recovers;
-  index-assisted `SELECT` unchanged in behavior.
+### P3.a — Durable B-Tree index — SHIPPED (2026-07-08)
+- Replaced the in-memory `BTreeIndex` with an on-disk B+tree (`DiskBTree`):
+  nodes are pages in the page store, buffer-pool-managed, mutations **WAL-logged**
+  as full node-page images (new redo-only `WAL_INDEX`) and crash-recovered —
+  **no rebuild on open**. A stable per-index meta page (id stored in the catalog
+  as `ColumnDef.index_root`) points at the current root, so a root split never
+  rewrites the catalog. Moved off the async worker onto the synchronous
+  writer/read path (like `EdgeIndex`).
+- Files touched: `btree_index.rs` (disk impl), `format.rs` (`WAL_INDEX`,
+  `PAGE_TYPE_BTREE`, `FORMAT_VERSION` 4→5), `wal.rs` (`log_index`),
+  `bufferpool.rs` (`page_size()` accessor), `recovery.rs` (`WAL_INDEX` redo),
+  `catalog.rs` (`index_root` + `set_column_index_root`), `heap.rs` (`get_raw`
+  for vacuum), `index_worker.rs` (BTree removed), `sql/executor.rs` (durable
+  write + read path), `lib.rs` (dropped from `rebuild_secondary_indexes`;
+  vacuum scrubs the durable tree), `tests/crash` (P13), `benches/durable_index.rs`.
+- Tests: open independent of table size (`benches/durable_index.rs`); crash mid
+  node-split / total data-file loss recovers from the WAL (crash P13); aborted
+  insert never surfaces via the index (MVCC re-check); durable reopen without
+  rebuild; module-level split/range/reopen tests.
 
 ### P3.b — Durable inverted + CSR + EdgeIndex
 - Same treatment for `fulltext.rs` (inverted), `csr_index.rs` / `graph/index.rs`

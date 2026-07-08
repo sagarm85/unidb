@@ -77,6 +77,10 @@ name = "btree"
 harness = false
 
 [[bench]]
+name = "durable_index"
+harness = false
+
+[[bench]]
 name = "vacuum"
 harness = false
 

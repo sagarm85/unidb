@@ -313,6 +313,7 @@ mod tests {
             columns: vec![ColumnDef {
                 name: "id".to_string(),
                 index: None,
+                index_root: None,
                 dropped: false,
                 ty: ColumnType::Int64,
                 constraints: Default::default(),

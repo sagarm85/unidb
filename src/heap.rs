@@ -173,6 +173,16 @@ impl Heap {
         }
     }
 
+    /// Read a version's raw payload bytes ignoring MVCC visibility, as long as
+    /// the slot is still `Live` (M10 vacuum / P3.a durable-index scrub: a
+    /// reclaimable version is still physically present — slot `Live`, body
+    /// intact — until `mark_dead`, so this recovers its indexed values in that
+    /// window to scrub durable secondary indexes before the slot is reused).
+    pub fn get_raw<P: PageReader>(&self, row_id: RowId, reader: &P) -> Result<Vec<u8>> {
+        let page = reader.read_page(row_id.page_id)?;
+        Ok(page.get(row_id.slot)?.to_vec())
+    }
+
     /// UPDATE: insert a new version chained to `row_id`, then stamp the old
     /// version's xmax = `xid`. Both mutations happen under one mini-txn
     /// bracket, so the update remains a single atomic redo/undo unit (D2).

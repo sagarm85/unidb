@@ -38,6 +38,7 @@
 | M11 | SQL constraints (PK / FK / UNIQUE / NOT NULL / CHECK / DEFAULT) |
 | **Phase 1** | **ACID hardening (complete):** full-page-writes (torn-page) · fsync-failure handling · `alloc_page` chunked growth + configurable pool + real FSM · isolation correctness (RC re-eval + SSI) · auto-checkpoint |
 | **Phase 2** | **Real data model (complete):** DECIMAL/TIMESTAMP/FLOAT/UUID/BYTEA/DATE/TIME · ALTER/DROP/TRUNCATE + request-level DDL rollback · SERIAL · prepared statements + `$n` bind params |
+| **Phase 3** | **Multi-model durable storage (in progress):** P3.a durable paged WAL-logged B-Tree (no rebuild on open) — shipped. P3.b–d pending. |
 
 The core is architecturally correct — it is not a toy. But it is the **small
 version**; §3 is the honest gap to production.
@@ -180,6 +181,19 @@ status, same discipline as M10.
 ---
 
 ## 8. Decision & session log (newest first)
+
+### 2026-07-08 — Phase 3 P3.a (durable B-Tree) shipped
+- Started Phase 3 (the moat) on the Core lane branch `durable-storage`. First
+  checkpoint P3.a: the B-Tree secondary index is now a durable on-disk B+tree
+  (`DiskBTree`) — node pages in the shared page store, buffer-pool-managed,
+  WAL-logged as full node-page images (new redo-only `WAL_INDEX`), crash-
+  recovered, and **no longer rebuilt on `Engine::open`** (removed from
+  `rebuild_secondary_indexes`; moved off the async worker to the synchronous
+  write/read path). A stable per-index meta page (id in `ColumnDef.index_root`)
+  points at the root, so a root split never rewrites the catalog. Crash harness
+  14 → **15** (P13: total data-file loss recovered from the WAL). `FORMAT_VERSION`
+  4 → **5** (D9). No locked decision reversed (D1/D4/D5/D9 strengthened). See
+  `PROGRESS.md` → P3.a for the open-cost benchmark. P3.b–d pending.
 
 ### 2026-07-08 — Phase 1 (ACID & storage foundation) COMPLETE
 - All five checkpoints shipped on the `acid-hardening` Core lane, one PR each:

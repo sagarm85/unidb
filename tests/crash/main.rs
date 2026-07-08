@@ -20,6 +20,10 @@
 //         full-page image (WAL_FPI) + incremental redo
 //   P12 – fsync/msync failure (P1.b): the WAL and buffer pool refuse to
 //         report durability on a failed flush, and latch poisoned
+//   P13 – crash mid-durable-B-Tree-split (P3.a): the index's node pages are
+//         WAL-logged (WAL_INDEX full-page images); after total loss of the
+//         data file, recovery reconstructs the whole tree from the WAL, so
+//         every indexed key is still findable — never rebuilt on open
 
 use tempfile::tempdir;
 use unidb::{Engine, RowId};
@@ -741,5 +745,99 @@ fn run_property_case(seed: u64) {
 fn property_crash_recovery_reflects_only_committed_transactions() {
     for seed in [1u64, 42, 12345, 999_999, 7, 2024] {
         run_property_case(seed);
+    }
+}
+
+// ── P13: durable B-Tree survives total data-file loss (P3.a) ─────────────────
+//
+// The Phase-3 durability contract for the on-disk B+tree: because every node
+// mutation is WAL-logged as a full node-page image (`WAL_INDEX`), a crash that
+// loses the *entire* data file must still leave every committed key findable
+// after recovery reconstructs the tree from the WAL alone — and reopening never
+// rescans a heap to rebuild the index. This is the strongest form of the
+// "no rebuild on open" gate: there is nothing on disk to rebuild *from* except
+// the log. The inserts below force several node splits (so the recovered set
+// spans multiple leaves + at least one internal level, exercising split-chain
+// and root-repoint records), and the split's node pages are deliberately never
+// checkpointed, so they live only in the WAL when the "crash" happens.
+#[test]
+fn p13_durable_btree_recovered_from_wal_after_total_data_loss() {
+    use unidb::btree_index::{DiskBTree, OrderedValue};
+    use unidb::bufferpool::BufferPool;
+    use unidb::control;
+    use unidb::format::{DEFAULT_PAGE_SIZE, INVALID_LSN};
+    use unidb::wal::Wal;
+
+    let dir = tempdir().unwrap();
+    let ctrl_p = dir.path().join("control");
+    let data_p = dir.path().join("data.db");
+    let wal_p = dir.path().join("db.wal");
+    control::create(&ctrl_p, DEFAULT_PAGE_SIZE).unwrap();
+    let page_size = DEFAULT_PAGE_SIZE as usize;
+
+    // Long keys (~130 bytes) so a leaf holds only ~60 entries — a modest number
+    // of inserts forces splits (and a fsync-per-insert crash test stays quick).
+    let key = |i: i64| OrderedValue::Text(format!("{i:04}{}", "p".repeat(126)));
+    let n = 150i64;
+
+    let meta = {
+        let mut pool = BufferPool::open(&data_p, page_size, 64).unwrap();
+        let mut wal = Wal::open(&wal_p, INVALID_LSN).unwrap();
+        let tree = DiskBTree::create(&mut pool, &mut wal).unwrap();
+        for i in 0..n {
+            let rid = RowId {
+                page_id: i as u32,
+                slot: 0,
+            };
+            tree.insert(key(i), rid, &mut pool, &mut wal).unwrap();
+        }
+        // Sanity: the tree really did grow past a single leaf (a split happened).
+        assert!(
+            pool.page_count() > 3,
+            "P13: inserts must have forced a split"
+        );
+        let meta = tree.meta_page();
+        // "Crash": drop without any checkpoint/flush_all — the node pages live
+        // only in the WAL (their fsync happened at each insert's mini-txn commit).
+        drop(pool);
+        drop(wal);
+        meta
+    };
+
+    // Total data-file loss: wipe data.db entirely. The only surviving record of
+    // the index is the WAL.
+    std::fs::remove_file(&data_p).unwrap();
+
+    // Precondition: with the data file gone, the tree is unreadable.
+    {
+        let mut pool = BufferPool::open(&data_p, page_size, 64).unwrap();
+        let tree = DiskBTree::new(meta, page_size);
+        assert!(
+            tree.search_eq(&key(0), &mut pool).is_err()
+                || tree.search_eq(&key(0), &mut pool).unwrap().is_empty(),
+            "P13: precondition — a wiped data file must not resolve any key"
+        );
+    }
+
+    // Recovery replays every committed WAL_INDEX image, rebuilding the tree.
+    let (_, stats) = unidb::recovery::recover(&ctrl_p, &data_p, &wal_p, page_size, 64).unwrap();
+    assert!(
+        stats.records_redone > 0,
+        "P13: the index's WAL_INDEX records must be redone"
+    );
+
+    // Every committed key is findable again, from the WAL-reconstructed tree.
+    let mut pool = BufferPool::open(&data_p, page_size, 64).unwrap();
+    let tree = DiskBTree::new(meta, page_size);
+    for i in 0..n {
+        let got = tree.search_eq(&key(i), &mut pool).unwrap();
+        assert_eq!(
+            got,
+            vec![RowId {
+                page_id: i as u32,
+                slot: 0
+            }],
+            "P13: key {i} must survive total data loss via WAL recovery"
+        );
     }
 }

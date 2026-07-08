@@ -57,7 +57,7 @@ Module map (what each layer became in code):
 | Storage core (M0) | `format.rs`, `control.rs`, `mmap.rs`, `page.rs`, `bufferpool.rs`, `wal.rs`, `heap.rs`, `checkpoint.rs`, `recovery.rs` |
 | Transactions (M1) | `mvcc.rs`, `txn.rs`, `lockmgr.rs`, `concurrency_hooks.rs` |
 | Catalog & SQL (M1) | `catalog.rs`, `sql/{parser,logical,executor}.rs` |
-| Secondary indexes (M2, M6, M7) | `index_worker.rs`, `vector.rs`, `fulltext.rs`, `btree_index.rs`, `csr_index.rs` |
+| Secondary indexes (M2, M6, M7; B-Tree durable since P3.a) | `index_worker.rs`, `vector.rs`, `fulltext.rs`, `btree_index.rs` (durable `DiskBTree`), `csr_index.rs` |
 | Graph (M3, M7) | `graph/{edges,index,logical,parser,executor}.rs` |
 | Event queue (M4) | `queue/{mod,payload}.rs` |
 | Server (M5, feature-gated) | `server/{engine_handle,error,dto,handlers,router,auth,sse}.rs`, `bin/unidb-server.rs` |
@@ -92,10 +92,12 @@ Two invariants shape everything above the storage layer:
   checksum and an LSN. No `serde` on the page/WAL hot path — page and WAL
   records are hand-rolled / `zerocopy`-style byte encodings for exact byte
   control (`serde_json` is used only for control-plane data; see §4.6).
-- `FORMAT_VERSION` is currently **4**: v1→v2 for M1's tuple-header
+- `FORMAT_VERSION` is currently **5**: v1→v2 for M1's tuple-header
   extension, v2→v3 for the `next_xid` control-file field (§4.7), v3→v4 for
-  the `WAL_FPI` full-page-image record (P1.a torn-page protection, §3.3). No
-  migration paths — no earlier version ever shipped externally.
+  the `WAL_FPI` full-page-image record (P1.a torn-page protection, §3.3), v4→v5
+  for the durable B-Tree's `WAL_INDEX` record + `PAGE_TYPE_BTREE` node pages +
+  the per-column `index_root` catalog pointer (P3.a, §5.2). No migration paths —
+  no earlier version ever shipped externally.
 - Pages use a **slotted-page** layout; tuples carry a 24-byte header with
   `xmin`/`xmax`/`prev_page`/`prev_slot` (reserved in M0 per D4, in active
   MVCC use since M1).
@@ -430,7 +432,15 @@ guarding a different failure mode.
 
 ---
 
-## 5. Secondary indexing framework (M2 + M6)
+## 5. Secondary indexing framework (M2 + M6; B-Tree durable since P3.a)
+
+> **Phase 3 note (P3.a):** the B-Tree is no longer part of the async worker
+> framework described in §5.1. It is a **durable, synchronous, WAL-logged
+> on-disk B+tree** (`DiskBTree`) — node pages in the shared page store,
+> crash-recovered, **never rebuilt on open** — updated inline on the writer
+> thread (`apply_durable_btree_writes`) and read via `DiskBTree::search`. See
+> §5.2's `BTree` row and §5.4. The worker below now serves only the still
+> in-memory `Hnsw`/`FullText`/`Csr` kinds.
 
 ### 5.1 The async index worker
 
@@ -463,7 +473,7 @@ upserts, and rebuild-on-open alike.
 |---|---|---|
 | `Hnsw` (M2) | `vector.rs` wrapping `instant-distance` | **No incremental insert exists in the crate's public API** (verified against vendored source), so `VectorIndex` buffers all points and rebuilds the whole graph per upsert — O(n log n) per insert, off the foreground thread but real CPU (§11, §12). f32, Euclidean (pgvector `<->` convention). |
 | `FullText` (M2) | `fulltext.rs` `InvertedIndex` | Whitespace+lowercase tokens, AND-only multi-term intersection. **No SQL query surface** — only the Rust API; `NEAR` is vector-only. |
-| `BTree` (M6) | `btree_index.rs`, `std::BTreeMap<OrderedValue, Vec<RowId>>` + `by_id: HashMap<RowId, OrderedValue>` | The `by_id` reverse map is what lets `upsert` remove a stale value-bucket entry — new bookkeeping the value-keyed structure needs that the id-keyed M2 indexes didn't. Zero new dependencies. |
+| `BTree` (M6; **durable since P3.a**) | `btree_index.rs`, `DiskBTree` — on-disk B+tree of buffer-pool-managed pages | **Durable, WAL-logged, crash-recovered, not rebuilt on open** (§5.4). Node pages carry the standard page header + a body-tag; a stable meta page (id in `ColumnDef.index_root`) points at the root so a root split never rewrites the catalog. Mutations log full node-page images (`WAL_INDEX`, redo-only) in one mini-txn each. No undo (entries are MVCC-validated hints). Written synchronously on the writer thread — **not** via the async worker. |
 | `Csr` (M7) | `csr_index.rs` | **Engine-managed only** — no SQL surface; registered as `("__edges__", "from_id")` purely to reuse the worker machinery. See §7.3. |
 
 ### 5.3 Query execution against indexes
@@ -478,13 +488,33 @@ terms + RLS apply identically to a full scan).
   full-scan fallback, because approximate top-k has no correct fallback).
   An index still `Building` yields a *partial* (never wrong) result set —
   acceptable for inherently approximate top-k.
-- **B-Tree (M6.b)**: `find_indexable_btree_predicate` detects a top-level
-  or AND'd `Column <op> Literal` on a BTree-indexed column. **Correctness-
-  critical difference from `NEAR`**: the index is only trusted once
-  `Ready` — an equality/range query silently missing rows during backfill
-  would be a real bug — so anything short of `Ready` falls back to the
-  unchanged full scan. First indexable term wins; there is no cost-based
-  selection (§12).
+- **B-Tree (M6.b; durable since P3.a)**: `find_indexable_btree_predicate`
+  detects a top-level or AND'd `Column <op> Literal` on a BTree-indexed column,
+  then `try_exec_select_btree` reconstructs the `DiskBTree` from the column's
+  `index_root` and calls `DiskBTree::search`. **No `Ready` status any more** —
+  the durable tree is always crash-consistent with committed data, so there is
+  no backfill window; a column flagged BTree but never built (no `index_root`)
+  simply falls back to a full scan. First indexable term wins; there is no
+  cost-based selection (§12).
+
+### 5.4 Durable B-Tree (P3.a)
+
+`DiskBTree` (`btree_index.rs`) is the first durable secondary index and the
+Phase-3 template. Nodes are pages in the shared page store carrying the standard
+28-byte header (so the buffer pool's CRC + D5 discipline applies unchanged); a
+body tag distinguishes meta / internal / leaf, leaves are right-linked for range
++ duplicate walks. Every `insert`/`remove` is **one WAL mini-transaction**
+bracketing each page it touches (a leaf write, or a split-chain + root-repoint +
+meta-page update), logged as full node-page images (`WAL_INDEX`, redo-only,
+`slot == u16::MAX`); recovery redoes all pages of a committed index mini-txn or
+none. **There is no undo** — an index entry is a hint re-validated against MVCC
+visibility, so a stale/extra entry is harmless, and the only dangerous case (a
+committed visible row lacking its entry) is prevented by the index mini-txn
+fsyncing before the user txn's `WAL_TXN_COMMIT`. `Engine::open` reads the tree
+from its meta page in O(1) — the durability win benchmarked in `PROGRESS.md`'s
+P3.a entry. Vacuum scrubs it directly (`DiskBTree::remove`, reading each dead
+row's key via `Heap::get_raw` before the slot is reused). v1 leaves underfull
+nodes un-merged (tree only grows) and pays one fsync per key insert.
 
 ---
 
@@ -696,17 +726,23 @@ introduces.
 
 Three rules repeat across every milestone and are worth stating once:
 
-1. **Secondary indexes are non-transactional, non-durable, derived
-   state.** None of them (HNSW, inverted, B-Tree, EdgeIndex, CSR) has
-   abort-time cleanup or WAL presence. Correctness rests entirely on:
-   *every candidate an index produces is re-checked against the caller's
-   MVCC snapshot (and full predicate) before becoming a result.* Stale or
-   phantom entries are therefore space leaks, never wrong answers. Each
-   milestone lands a dedicated proof-of-abort-invisibility test
-   (`vector_mvcc`, `graph_mvcc` ×2, `btree_mvcc`, `queue_mvcc`) written
-   *next to* the feature, not deferred — because the failure mode (a
-   forgotten `record_undo`, a worker with no transaction concept) is
-   silent.
+1. **Secondary indexes are non-transactional derived state whose entries
+   are hints, re-validated against MVCC.** The still-in-memory kinds (HNSW,
+   inverted, EdgeIndex, CSR) additionally have no WAL presence and are rebuilt
+   on open; **the B-Tree is now durable and WAL-logged (P3.a)** but still has
+   *no undo* — its entries remain hints, not transactional state. What every
+   kind shares is the load-bearing invariant: *every candidate an index
+   produces is re-checked against the caller's MVCC snapshot (and full
+   predicate) before becoming a result.* Stale or phantom entries are therefore
+   space leaks, never wrong answers — whether they came from an aborted async
+   upsert or an aborted durable-B-Tree mini-txn. Each milestone lands a
+   dedicated proof-of-abort-invisibility test (`vector_mvcc`, `graph_mvcc` ×2,
+   `btree_mvcc`, `queue_mvcc`) written *next to* the feature, not deferred —
+   because the failure mode (a forgotten `record_undo`, a worker with no
+   transaction concept) is silent. The one danger unique to a durable index — a
+   committed visible row lacking its entry (a false negative, not a false
+   positive that rule 1 catches) — is closed for the B-Tree by ordering: the
+   index mini-txn fsyncs before the user txn commits (§5.4).
 2. **New durable state is always ordinary heap rows** (`__edges__`,
    `__events__`, `__consumers__`) — inheriting MVCC, locking, WAL, crash
    recovery, and abort handling with zero new mechanism. This is why M3–M5
@@ -714,10 +750,12 @@ Three rules repeat across every milestone and are worth stating once:
    machinery to crash.
 3. **Completeness-sensitive vs approximate readers must gate on index
    readiness *and* on how current the index can ever promise to be.**
-   B-Tree (exact results) falls back to a full scan unless `Ready`; `NEAR`
-   (approximate top-k) accepts partial results while `Building` — both
-   correct because their contracts already permit "may return fewer
-   results while not yet caught up." **CSR (graph) was originally given
+   Since P3.a the durable B-Tree (exact results) needs no such gate — it is
+   always crash-consistent with committed data, so there is no `Building`
+   window; a column with no built tree simply falls back to a full scan. `NEAR`
+   (approximate top-k) still accepts partial results while `Building` — correct
+   because its contract already permits "may return fewer results while not yet
+   caught up." **CSR (graph) was originally given
    the same treatment (prefer-once-`Ready`) and that was wrong** — see
    §7.3's correction. `edges_from`/Cypher have never had a "may return
    fewer results" contract; they've always guaranteed immediate
@@ -974,7 +1012,12 @@ undo through recovery is a deferred Core-lane follow-up) · P2.d **SERIAL**
 (durable `TableDef.serial_next` counter) · P2.e **prepared statements + `$n`
 bind parameters** (`Literal::Param` + `bind_params`, `Engine::execute_sql_params`
 /`prepare`/`execute_prepared`, `POST /sql` `params`) — closes the SQL-injection
-surface. All additive/forward-compatible; no `FORMAT_VERSION` bump. Next per
-`docs/backlog/roadmap.md`: Phases 3/4. See `docs/backlog/phase1_acid_hardening.md`,
-`docs/backlog/phase2_data_model.md`, and `PROGRESS.md`'s Phase 1 + P2.a–P2.e entries.
+surface. All additive/forward-compatible; no `FORMAT_VERSION` bump.
+**Phase 3 in progress (2026-07-08, Core lane, branch `durable-storage`): multi-model
+durable storage.** P3.a **durable paged WAL-logged B-Tree** (`DiskBTree`, §5.2/§5.4):
+node pages in the page store, WAL-logged full node-page images (`WAL_INDEX`),
+crash-recovered, **not rebuilt on open**; moved off the async worker; vacuum
+scrubs it directly. Crash harness **14→15** (P13: total data-file loss recovered
+from the WAL), `FORMAT_VERSION` **4→5**, no locked decision reversed. P3.b–d
+pending. See `docs/backlog/phase3_durable_storage.md` + `PROGRESS.md`'s P3.a entry.
 Update alongside the next milestone's closeout.*

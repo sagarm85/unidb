@@ -29,7 +29,8 @@ use crate::{
     format::{
         u16_from_le, u16_to_le, u32_from_le, u32_to_le, u64_from_le, u64_to_le, Lsn, PageId, Xid,
         INVALID_LSN, WAL_ABORT, WAL_BEGIN, WAL_CHECKPOINT, WAL_COMMIT, WAL_DELETE, WAL_FPI,
-        WAL_INSERT, WAL_TXN_ABORT, WAL_TXN_BEGIN, WAL_TXN_COMMIT, WAL_UPDATE, WAL_VACUUM,
+        WAL_INDEX, WAL_INSERT, WAL_TXN_ABORT, WAL_TXN_BEGIN, WAL_TXN_COMMIT, WAL_UPDATE,
+        WAL_VACUUM,
     },
 };
 
@@ -291,6 +292,21 @@ impl Wal {
     ) -> Result<Lsn> {
         let lsn = self.append_raw(txn_id, prev_lsn, WAL_FPI, page_id, u16::MAX, image, &[])?;
         tracing::trace!(mini_txn_id = txn_id, lsn, page_id, "WAL FPI");
+        Ok(lsn)
+    }
+
+    /// Log a full B-Tree node/meta page image (P3.a — durable B-Tree).
+    /// Redo-only (no undo — see `format::WAL_INDEX`). `image` is the entire node
+    /// page (`page_size` bytes); `slot` is `u16::MAX` (a whole-page record).
+    pub fn log_index(
+        &mut self,
+        txn_id: u64,
+        prev_lsn: Lsn,
+        page_id: PageId,
+        image: &[u8],
+    ) -> Result<Lsn> {
+        let lsn = self.append_raw(txn_id, prev_lsn, WAL_INDEX, page_id, u16::MAX, image, &[])?;
+        tracing::trace!(mini_txn_id = txn_id, lsn, page_id, "WAL INDEX");
         Ok(lsn)
     }
 

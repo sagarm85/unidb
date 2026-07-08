@@ -100,8 +100,13 @@ fn engine_restart_rebuilds_fulltext_index_and_search_still_works() {
     // this index kind's rebuild, matching the scope note in MEMORY.md.
 }
 
+/// P3.a changed the B-Tree from a rebuilt-on-open in-memory index to a
+/// **durable** one: reopening does NOT rescan the heap to reconstruct it — it
+/// reads the tree straight from its meta page — and there is no `Ready` status
+/// to wait on. This test confirms an index-assisted query works after reopen
+/// with no rebuild (was `engine_restart_rebuilds_btree_index_and_select_...`).
 #[test]
-fn engine_restart_rebuilds_btree_index_and_select_still_works() {
+fn engine_restart_btree_index_is_durable_no_rebuild() {
     let dir = tempdir().unwrap();
     {
         let mut engine = Engine::open(dir.path(), 0).unwrap();
@@ -122,13 +127,9 @@ fn engine_restart_rebuilds_btree_index_and_select_still_works() {
         engine.flush().unwrap();
     }
 
-    // Fresh process-equivalent open: the in-memory worker/index from the
-    // first `Engine` is gone. Only the catalog's `index: Some(BTree)` flag
-    // and the heap's committed rows survived — rebuild-on-open must
-    // reconstruct the index from those alone.
+    // Fresh process-equivalent open: the durable tree is read from its meta
+    // page — no heap rescan, no `Ready` wait — and the query still works.
     let mut engine2 = Engine::open(dir.path(), 0).unwrap();
-    wait_for_ready(&engine2, "t", "id");
-
     let xid = engine2.begin().unwrap();
     let results = engine2
         .execute_sql(xid, "SELECT name FROM t WHERE id = 2")
@@ -164,12 +165,10 @@ fn btree_select_before_index_ready_still_returns_correct_full_result() {
     }
     engine.commit(xid).unwrap();
 
-    // Deliberately not waiting for `IndexStatus::Ready` — unlike `NEAR`'s
-    // inherently approximate top-k, an equality/range query must never
-    // return an *incomplete* result just because the index backfill is
-    // still in progress. `try_exec_select_btree` only trusts the index once
-    // `Ready`; before that it falls back to the ordinary full scan, so the
-    // result here must be exactly correct, not "possibly fewer rows."
+    // The durable B-Tree (P3.a) is built synchronously as part of each INSERT,
+    // so it is always crash-consistent with committed data — there is no
+    // backfill window to race. An equality query must return the exact match,
+    // whether served by the index or (if the column had no index) a full scan.
     let xid2 = engine.begin().unwrap();
     let results = engine
         .execute_sql(xid2, "SELECT name FROM t WHERE id = 17")

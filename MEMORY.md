@@ -78,7 +78,20 @@
   on `reqwest` — note `-p unidb --edges normal` is required: plain `cargo
   tree --no-default-features` from a workspace root shows the whole
   workspace's dependency union, which is *not* the right check here).
-- **Current work: Phase 1 — ACID & storage foundation** (the feature-freeze
+- **Current work (Core lane): Phase 3 — Multi-model durable storage** (the moat,
+  `docs/backlog/phase3_durable_storage.md`), on branch `durable-storage`. **P3.a
+  (durable paged WAL-logged B-Tree) is SHIPPED** — the M6 in-memory `BTreeMap`
+  is replaced by an on-disk B+tree (`DiskBTree`): node pages in the shared page
+  store, buffer-pool-managed, WAL-logged as full node-page images (new redo-only
+  `WAL_INDEX`), crash-recovered, and **no longer rebuilt on open** (removed from
+  `rebuild_secondary_indexes`; moved off the async worker to the synchronous
+  write/read path). A stable per-index meta page (id in `ColumnDef.index_root`)
+  points at the root, so a root split never rewrites the catalog. Crash harness
+  **14 → 15** (P13: total data-file loss recovered from the WAL). `FORMAT_VERSION`
+  **4 → 5**. Dated subsection below; full entry in `PROGRESS.md`. P3.b (durable
+  inverted/CSR/edge), P3.c (on-disk vector — spike first), P3.d (large objects)
+  are next, one PR each.
+- **Prior Core-lane work: Phase 1 — ACID & storage foundation** (the feature-freeze
   gate, `docs/backlog/phase1_acid_hardening.md`), on Core lane branch
   `acid-hardening`. **Phase 1 is COMPLETE — all five checkpoints shipped:** P1.a
   (full-page-writes), P1.b (fsync-failure handling), P1.c (alloc_page remap +
@@ -386,6 +399,57 @@ Full entries in `PROGRESS.md`. What a future reader most needs:
   `EngineHandle::execute_sql_params` (writer-thread command); `POST /sql`
   documents `params`. **All parameterized paths bind before RLS/execute**, so a
   value is always data.
+
+### P3.a — durable paged WAL-logged B-Tree (Core lane, branch `durable-storage`, 2026-07-08)
+
+First checkpoint of **Phase 3** (`docs/backlog/phase3_durable_storage.md`), the
+Core-lane worktree that begins the durable-index / big-file work. Full entry +
+benchmark in `PROGRESS.md`'s P3.a section. What a future reader most needs:
+
+- **`DiskBTree` replaces the in-memory `BTreeIndex`.** Nodes are pages in the
+  shared page store carrying the standard 28-byte page header (so the buffer
+  pool's CRC + D5 machinery applies unchanged); the B+tree payload lives in the
+  body. New `PAGE_TYPE_BTREE`. Leaf/internal/meta node kinds tagged in `body[0]`;
+  keys are `OrderedValue` (compared in memory after decode, so the byte encoding
+  need not be order-preserving). Leaves are right-linked (`next_leaf`) for range
+  + duplicate-key walks.
+- **WAL model: new redo-only `WAL_INDEX`** (full node-page image, `slot ==
+  u16::MAX`, same shape as `WAL_FPI`/`WAL_VACUUM` full-image). Each
+  `insert`/`remove` is **one mini-txn** bracketing every page it touches (leaf
+  write, or split-chain + root-repoint + meta-page update). Recovery redoes all
+  pages of a committed index mini-txn or none — atomic, idempotent, LSN-stamped;
+  recovery uses `restore_page_image` (ensures the file is sized, no CRC/LSN gate
+  — last-writer-in-LSN-order wins, and index pages never overlap heap pages).
+- **No undo — proven safe, not swept under the rug.** An index entry is a *hint*
+  re-validated against MVCC in `try_exec_select_btree`, so stale/extra entries
+  are harmless. The only dangerous case (a committed, visible heap row lacking
+  its index entry — a false negative) can't happen because the index mini-txn
+  fsyncs during statement execution, *before* the user txn's `WAL_TXN_COMMIT`.
+  `tests/btree_mvcc.rs` proves an aborted insert never surfaces via the index.
+- **Stable meta page ⇒ O(1) open.** A per-index meta page (id stored once in
+  `ColumnDef.index_root`, never changes) holds the current root; a root split
+  repoints it in place — never a catalog rewrite. `Engine::open` reads catalog →
+  meta → root; **no heap rescan.** Benchmark (`benches/durable_index.rs`) shows
+  B-Tree reopen flat vs. a still-rebuilt HNSW rising with rows.
+- **Moved off the async worker** (`index_worker.rs` — `IndexKind::BTree` now
+  `unreachable!` there). Executor writes durable entries inline
+  (`apply_durable_btree_writes`, called from `exec_insert`/`exec_update`); reads
+  via `DiskBTree::search`. **Vacuum scrubs the durable tree directly**
+  (`DiskBTree::remove`) — it reads each dead row's indexed value via the new
+  `Heap::get_raw` **before** `mark_dead`, since the slot must still be LIVE to
+  read the body, then removes before compaction promotes the slot to reusable
+  (the same M10.c aliasing gate, extended to the on-disk index).
+- **v1 limits (documented):** deletes don't merge/rebalance underfull nodes (an
+  emptied leaf stays linked — never wrong, tree only grows); one fsync per key
+  insert (indexed INSERT pays heap fsync + one index fsync; batched in the
+  server's deferred-sync mode); `DROP INDEX` pages leak like `DROP TABLE` pages.
+- **New crash point P13** (`tests/crash/main.rs`): build past several splits,
+  wipe the entire data file, recover the whole tree from the WAL. Harness 14→15.
+  **Test count: 316 → 324** default-feature unit tests (+ P13). Only-mechanical
+  test updates elsewhere: `btree_mvcc`/`index_rebuild`/`lib.rs` dropped the now-
+  obsolete `IndexStatus::Ready` polling for BTree (durable ⇒ always consistent,
+  no async status), and `index_worker.rs`'s `remove_rows` test switched from the
+  removed BTree variant to FullText.
 
 ### Design note: xid reuse after checkpoint — a real M1-era bug, found and fixed during M5
 

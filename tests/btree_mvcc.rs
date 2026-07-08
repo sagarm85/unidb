@@ -1,25 +1,24 @@
-// The BTree analogue of vector_mvcc.rs's proof (M6): the background index
-// worker has no concept of transactions — it applies whatever `IndexMsg::
-// Upsert` the executor sends it the moment a row is inserted, whether or
-// not that row's transaction ever commits. This test proves that fact
-// never leaks into a correctness bug for the new index-assisted `exec_select`
-// path (`try_exec_select_btree` in `sql/executor.rs`): every candidate
-// RowId the `BTreeIndex` returns is re-checked against MVCC visibility via
-// `heap.get` before being included, exactly like `exec_select_near` already
-// does for vector search.
+// The durable-B-Tree analogue of vector_mvcc.rs's proof (M6, reworked for
+// P3.a): the on-disk B+tree has no concept of transactions — `apply_durable_
+// btree_writes` inserts a `(value, rowid)` entry the moment a row is inserted,
+// as its own committed WAL mini-txn, whether or not the surrounding user
+// transaction ever commits, and `Engine::abort` has no hook that retracts it
+// (index removal is a vacuum-time concern, not an abort-time one). This test
+// proves that fact never leaks into a correctness bug for the index-assisted
+// `exec_select` path (`try_exec_select_btree` in `sql/executor.rs`): every
+// candidate RowId the tree returns is re-checked against MVCC visibility via
+// `heap.get` before being included, exactly like `exec_select_near` does for
+// vector search.
 //
-// Unlike `NEAR`, using the index at all is conditional on `IndexStatus::
-// Ready` (an in-progress backfill only having *some* rows would silently
-// produce an incomplete, wrong result set for an equality/range query,
-// unlike NEAR's inherently-approximate top-k). This test confirms `Ready`
-// via `Engine::index_status` before the doomed insert, and relies on the
-// documented fact that a live `Upsert` on an already-`Ready` entry never
-// regresses it back to `Building` (see `index_worker.rs::worker_loop`) —
-// so the final, fresh-transaction query below is guaranteed to actually
-// exercise the index-assisted path, not silently fall back to a full scan.
+// Unlike the M6 in-memory index this replaces, the durable tree is synchronous
+// and always crash-consistent with committed data, so there is no `Ready`
+// status to wait on and no background worker to poll — the entry exists the
+// instant the INSERT statement returns. That is why this test is *stronger*
+// than its predecessor: the doomed entry is not merely "eventually indexed,"
+// it is durably present, and the fresh-transaction query below is guaranteed
+// to hit the index-assisted path (the column has a durable `index_root`).
 
 use tempfile::tempdir;
-use unidb::index_worker::IndexStatus;
 use unidb::sql::executor::ExecResult as SqlResult;
 use unidb::sql::logical::Literal;
 use unidb::Engine;
@@ -54,43 +53,21 @@ fn aborted_insert_never_surfaces_in_btree_assisted_results() {
         .unwrap();
     engine.commit(setup_xid).unwrap();
 
-    // Confirm the index reached Ready (an empty-table backfill marks Ready
-    // immediately, but poll rather than assume — the worker is async) before
-    // the doomed insert, so the later verification query is guaranteed to
-    // exercise the index-assisted path rather than a full-scan fallback.
-    let start = std::time::Instant::now();
-    loop {
-        if engine.index_status("t", "id") == Some(IndexStatus::Ready) {
-            break;
-        }
-        if start.elapsed() > std::time::Duration::from_secs(5) {
-            panic!("index never reached Ready within timeout");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-
     let doomed_xid = engine.begin().unwrap();
     engine
         .execute_sql(doomed_xid, "INSERT INTO t (id, name) VALUES (999, 'ghost')")
         .unwrap();
 
-    // Poll the inserting transaction's own view (MVCC self-visibility of an
-    // uncommitted write) until the background worker has demonstrably
-    // indexed row 999 — a confirmed precondition, not a timing guess.
-    let start = std::time::Instant::now();
-    loop {
-        if matching_ids(&mut engine, doomed_xid).contains(&999) {
-            break;
-        }
-        if start.elapsed() > std::time::Duration::from_secs(5) {
-            panic!("worker never indexed the doomed row within timeout");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
+    // Durable + synchronous: the inserting transaction sees its own uncommitted
+    // write through the index-assisted path immediately, no polling.
+    assert!(
+        matching_ids(&mut engine, doomed_xid).contains(&999),
+        "the inserting txn must see its own uncommitted, durably-indexed row"
+    );
 
-    // Abort instead of commit. The BTreeIndex's stale entry for row 999 is
-    // not retracted (worker has no transaction concept — same documented
-    // tech debt as VectorIndex's).
+    // Abort instead of commit. The durable tree's `(999, rowid)` entry is NOT
+    // retracted (abort has no index hook — it's a stale hint, scrubbed only by
+    // vacuum), so correctness rides entirely on the MVCC re-check below.
     engine.abort(doomed_xid).unwrap();
 
     // A fresh transaction sees only committed data. If try_exec_select_btree
@@ -102,4 +79,48 @@ fn aborted_insert_never_surfaces_in_btree_assisted_results() {
         !ids.contains(&999),
         "aborted insert leaked into BTree-assisted results: {ids:?}"
     );
+}
+
+/// P3.a's headline property at the engine level: the durable B-Tree is
+/// **reconstructed from disk on reopen with no rebuild**, and index-assisted
+/// queries return the same committed rows they did before the restart.
+#[test]
+fn durable_btree_survives_reopen_without_rebuild() {
+    let dir = tempdir().unwrap();
+    {
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, name TEXT)")
+            .unwrap();
+        engine
+            .execute_sql(xid, "CREATE INDEX idx ON t USING BTREE (id)")
+            .unwrap();
+        for i in 0..50 {
+            engine
+                .execute_sql(
+                    xid,
+                    &format!("INSERT INTO t (id, name) VALUES ({i}, 'row{i}')"),
+                )
+                .unwrap();
+        }
+        engine.commit(xid).unwrap();
+        engine.checkpoint().unwrap();
+    }
+
+    // Reopen: `Engine::open` does NOT rescan the heap to rebuild this index —
+    // it reads the tree straight from its meta page. The query still works.
+    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let xid = engine.begin().unwrap();
+    let results = engine
+        .execute_sql(xid, "SELECT id FROM t WHERE id = 42")
+        .unwrap();
+    match &results[0] {
+        SqlResult::Rows(rows) => {
+            assert_eq!(rows.len(), 1, "durable index must find the committed row");
+            assert_eq!(rows[0][0], Literal::Int(42));
+        }
+        other => panic!("expected Rows, got {other:?}"),
+    }
+    engine.commit(xid).unwrap();
 }

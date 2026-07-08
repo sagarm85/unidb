@@ -65,6 +65,7 @@ mod tests {
             name: name.to_string(),
             ty,
             index: None,
+            index_root: None,
             dropped: false,
             constraints: Default::default(),
         }

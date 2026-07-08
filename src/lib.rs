@@ -69,6 +69,7 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use crate::{
+    btree_index::{DiskBTree, OrderedValue},
     bufferpool::BufferPool,
     catalog::{Catalog, CatalogCtx, ColumnDef, IndexKind, TableDef},
     control::ControlData,
@@ -1215,6 +1216,34 @@ impl Engine {
                 continue;
             }
 
+            // P3.a: gather each reclaimable version's durable-BTree key(s)
+            // *before* marking it DEAD — the tuple body is only readable while
+            // the slot is still LIVE. These `(meta_page, value, rid)` triples
+            // are scrubbed from the on-disk B+trees in the aliasing gate below.
+            let btree_cols: Vec<(usize, PageId)> = table
+                .columns
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| match (c.index, c.index_root) {
+                    (Some(IndexKind::BTree), Some(root)) if !c.dropped => Some((i, root)),
+                    _ => None,
+                })
+                .collect();
+            let mut btree_removals: Vec<(PageId, OrderedValue, RowId)> = Vec::new();
+            if clean_indexes && !btree_cols.is_empty() {
+                for rid in &reclaimable {
+                    let Ok(bytes) = heap.get_raw(*rid, &self.pool) else {
+                        continue;
+                    };
+                    let row = executor::decode_row(&bytes, &table.columns)?;
+                    for (i, root) in &btree_cols {
+                        if let Ok(v) = OrderedValue::try_from(&row[*i]) {
+                            btree_removals.push((*root, v, *rid));
+                        }
+                    }
+                }
+            }
+
             // (b) Mark every reclaimable version DEAD (not yet reusable).
             for rid in &reclaimable {
                 heap.mark_dead(*rid, &mut self.pool, &mut self.wal)?;
@@ -1230,6 +1259,12 @@ impl Engine {
                     }
                 }
                 self.index_worker.remove_rows(&table.name, &reclaimable);
+                // P3.a: scrub the durable on-disk B+trees too (synchronous,
+                // WAL-logged), so a reused slot can't surface a stale candidate.
+                for (root, value, rid) in &btree_removals {
+                    let tree = DiskBTree::new(*root, page_size);
+                    tree.remove(value, *rid, &mut self.pool, &mut self.wal)?;
+                }
             }
 
             // (d) Compact each touched page: drop dead bodies, coalesce free
@@ -1415,8 +1450,15 @@ fn rebuild_secondary_indexes(
     handle: &IndexHandle,
 ) -> Result<()> {
     for table in catalog.tables() {
-        let indexed_cols: Vec<&ColumnDef> =
-            table.columns.iter().filter(|c| c.index.is_some()).collect();
+        // P3.a: BTree indexes are durable (paged, WAL-logged, crash-recovered),
+        // so they are NOT rebuilt on open — that is the whole point of Phase 3.
+        // Only the still-in-memory kinds (Hnsw/FullText, plus Csr via the
+        // separate `rebuild_csr_index`) are reconstructed here.
+        let indexed_cols: Vec<&ColumnDef> = table
+            .columns
+            .iter()
+            .filter(|c| matches!(c.index, Some(IndexKind::Hnsw | IndexKind::FullText)))
+            .collect();
         if indexed_cols.is_empty() {
             continue;
         }
@@ -2650,17 +2692,8 @@ mod tests {
         }
         engine.commit(xid).unwrap();
 
-        let start = std::time::Instant::now();
-        loop {
-            if engine.index_status("indexed", "id") == Some(index_worker::IndexStatus::Ready) {
-                break;
-            }
-            if start.elapsed() > std::time::Duration::from_secs(5) {
-                panic!("index never reached Ready within timeout");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-
+        // P3.a: the durable B-Tree is built synchronously with each INSERT —
+        // no async worker, no `Ready` status to wait on.
         let xid2 = engine.begin().unwrap();
 
         // Equality.
@@ -2718,19 +2751,8 @@ mod tests {
             .unwrap();
         engine.commit(xid).unwrap();
 
-        // Confirm the index reached Ready before relying on it, so this
-        // test actually exercises the index-assisted path.
-        let start = std::time::Instant::now();
-        loop {
-            if engine.index_status("t", "id") == Some(index_worker::IndexStatus::Ready) {
-                break;
-            }
-            if start.elapsed() > std::time::Duration::from_secs(5) {
-                panic!("index never reached Ready within timeout");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-
+        // P3.a: the durable B-Tree is always consistent with committed data —
+        // no `Ready` wait — so the index-assisted path is exercised directly.
         let policy = crate::sql::logical::Expr::BinOp {
             op: crate::sql::logical::CmpOp::Eq,
             lhs: Box::new(crate::sql::logical::Expr::Column("owner".to_string())),

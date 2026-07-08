@@ -14,8 +14,8 @@ use crate::{
     error::{DbError, Result},
     format::{
         u64_from_le, Xid, INVALID_LSN, WAL_ABORT, WAL_BEGIN, WAL_CHECKPOINT, WAL_COMMIT,
-        WAL_DELETE, WAL_FPI, WAL_INSERT, WAL_TXN_ABORT, WAL_TXN_BEGIN, WAL_TXN_COMMIT, WAL_UPDATE,
-        WAL_VACUUM,
+        WAL_DELETE, WAL_FPI, WAL_INDEX, WAL_INSERT, WAL_TXN_ABORT, WAL_TXN_BEGIN, WAL_TXN_COMMIT,
+        WAL_UPDATE, WAL_VACUUM,
     },
     heap::decode_insert_redo,
     page::SlottedPage,
@@ -242,6 +242,20 @@ fn redo_record(r: &WalRecord, pool: &mut BufferPool, page_size: usize) -> Result
             // (`restore_page_image` writes straight to the mmap; it pins no
             // frame, so there is nothing to unpin here.)
             pool.restore_page_image(r.page_id, &r.redo)?;
+        }
+        WAL_INDEX => {
+            // P3.a durable B-Tree. The redo payload is a full node/meta page
+            // image; overwrite the on-disk page with it, stamped with this
+            // record's LSN, exactly like a WAL_FPI base image. Unconditional and
+            // idempotent — a later WAL_INDEX for the same page (higher LSN,
+            // appearing later in this LSN-ordered pass) overwrites again, so the
+            // last committed image wins. Index pages never overlap heap pages,
+            // so no LSN gate against incremental heap redos is needed.
+            // (`restore_page_image` writes straight to the mmap and ensures the
+            // file is sized; it pins no frame, so nothing to unpin.)
+            let mut img = SlottedPage::from_bytes_unchecked(r.redo.clone());
+            img.set_lsn(r.lsn);
+            pool.restore_page_image(r.page_id, img.as_bytes())?;
         }
         WAL_INSERT => {
             let mut page = fetch_or_create(pool, r.page_id, page_size)?;

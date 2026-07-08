@@ -32,7 +32,6 @@ use std::sync::{mpsc, Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::btree_index::{BTreeIndex, OrderedValue};
 use crate::catalog::IndexKind;
 use crate::csr_index::CsrIndex;
 use crate::fulltext::InvertedIndex;
@@ -43,7 +42,6 @@ use crate::vector::VectorIndex;
 pub enum IndexedColumn {
     Vector { column: String, data: Vec<f32> },
     Text { column: String, data: String },
-    Ordered { column: String, data: OrderedValue },
     Edge { column: String, from_id: i64 },
 }
 
@@ -71,7 +69,6 @@ pub enum IndexMsg {
 pub enum SecondaryIndex {
     Vector(VectorIndex),
     FullText(InvertedIndex),
-    BTree(BTreeIndex),
     Csr(CsrIndex),
 }
 
@@ -133,7 +130,9 @@ impl IndexHandle {
     /// removal to have *completed* before it hands the freed slot out for
     /// reuse, so this deliberately is not an async channel message.
     ///
-    /// `Vector`/`FullText`/`BTree` all support removal by `RowId`. `Csr`
+    /// `Vector`/`FullText` support removal by `RowId`. `BTree` is no longer
+    /// here (P3.a — it is durable; vacuum scrubs it directly via `DiskBTree::
+    /// remove`, see `lib.rs`). `Csr`
     /// entries are intentionally left untouched: the CSR index is rebuilt from
     /// committed rows on every open and — since M7's traversal-uses-CSR wiring
     /// was reverted — is not consulted by any read path, so a stale CSR
@@ -151,7 +150,6 @@ impl IndexHandle {
                 match &mut entry.index {
                     SecondaryIndex::Vector(v) => v.remove(rid),
                     SecondaryIndex::FullText(ft) => ft.remove(rid),
-                    SecondaryIndex::BTree(b) => b.remove(rid),
                     SecondaryIndex::Csr(_) => {}
                 }
             }
@@ -192,7 +190,12 @@ fn new_index_for_kind(kind: IndexKind) -> SecondaryIndex {
     match kind {
         IndexKind::Hnsw => SecondaryIndex::Vector(VectorIndex::new()),
         IndexKind::FullText => SecondaryIndex::FullText(InvertedIndex::new()),
-        IndexKind::BTree => SecondaryIndex::BTree(BTreeIndex::new()),
+        // BTree is durable since P3.a and never handled by this worker — the
+        // executor writes it synchronously and never sends it an Upsert/
+        // MarkReady, so this arm is unreachable by construction.
+        IndexKind::BTree => {
+            unreachable!("BTree indexes are durable (P3.a), not managed by the async worker")
+        }
         IndexKind::Csr => SecondaryIndex::Csr(CsrIndex::new()),
     }
 }
@@ -262,23 +265,6 @@ fn apply_msg(msg: IndexMsg, indexes: &SharedIndexes, dirty: &mut DirtyCsrKeys) -
                             continue;
                         };
                         t.upsert(record, &data);
-                    }
-                    IndexedColumn::Ordered { column, data } => {
-                        let mut guard = indexes.write().unwrap();
-                        let entry =
-                            guard
-                                .entry((table.clone(), column))
-                                .or_insert_with(|| IndexEntry {
-                                    status: IndexStatus::Building { rows_done: 0 },
-                                    index: new_index_for_kind(IndexKind::BTree),
-                                });
-                        if let IndexStatus::Building { rows_done } = &mut entry.status {
-                            *rows_done += 1;
-                        }
-                        let SecondaryIndex::BTree(b) = &mut entry.index else {
-                            continue;
-                        };
-                        b.upsert(record, data);
                     }
                     IndexedColumn::Edge { column, from_id } => {
                         let mut guard = indexes.write().unwrap();
@@ -520,45 +506,47 @@ mod tests {
     }
 
     /// M10.c: `remove_rows` synchronously scrubs reclaimed RowIds from a
-    /// table's in-memory secondary indexes (here a BTree), so a vacuumed slot
-    /// can be reused without a stale candidate surviving.
+    /// table's in-memory secondary indexes (here a full-text index), so a
+    /// vacuumed slot can be reused without a stale candidate surviving. (The
+    /// BTree is durable since P3.a and scrubbed directly via `DiskBTree::
+    /// remove`, tested in `btree_index.rs`, not through this worker.)
     #[test]
     fn remove_rows_scrubs_reclaimed_rowids_from_secondary_indexes() {
         let mut handle = IndexHandle::spawn();
         handle.send(IndexMsg::Upsert {
             table: "t".into(),
             record: rid(4, 0),
-            indexed_cols: vec![IndexedColumn::Ordered {
-                column: "id".into(),
-                data: OrderedValue::Int(7),
+            indexed_cols: vec![IndexedColumn::Text {
+                column: "body".into(),
+                data: "hello world".into(),
             }],
         });
         handle.send(IndexMsg::MarkReady {
             table: "t".into(),
-            column: "id".into(),
-            kind: IndexKind::BTree,
+            column: "body".into(),
+            kind: IndexKind::FullText,
         });
-        wait_for(|| handle.status("t", "id") == Some(IndexStatus::Ready));
+        wait_for(|| handle.status("t", "body") == Some(IndexStatus::Ready));
         wait_for(|| {
             let guard = handle.indexes.read().unwrap();
             matches!(
-                &guard.get(&("t".to_string(), "id".to_string())).unwrap().index,
-                SecondaryIndex::BTree(b) if !b.search_eq(&OrderedValue::Int(7)).is_empty()
+                &guard.get(&("t".to_string(), "body".to_string())).unwrap().index,
+                SecondaryIndex::FullText(ft) if !ft.search("hello").is_empty()
             )
         });
 
         handle.remove_rows("t", &[rid(4, 0)]);
 
         let guard = handle.indexes.read().unwrap();
-        let SecondaryIndex::BTree(b) = &guard
-            .get(&("t".to_string(), "id".to_string()))
+        let SecondaryIndex::FullText(ft) = &guard
+            .get(&("t".to_string(), "body".to_string()))
             .unwrap()
             .index
         else {
-            panic!("expected a BTree index");
+            panic!("expected a full-text index");
         };
         assert!(
-            b.search_eq(&OrderedValue::Int(7)).is_empty(),
+            ft.search("hello").is_empty(),
             "the reclaimed RowId must be gone from the index"
         );
         drop(guard);

@@ -394,6 +394,12 @@ impl BufferPool {
         self.file_page_count
     }
 
+    /// The configured page size in bytes (P3.a — the durable B-Tree serializes
+    /// node pages of exactly this size).
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+
     /// A shared, read-only view over the page file for concurrent readers
     /// (6b). See [`SharedPageReader`].
     pub fn shared_reader(&self) -> SharedPageReader {

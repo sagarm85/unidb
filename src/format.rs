@@ -26,7 +26,16 @@ pub const MAGIC: u32 = 0x556E4442; // "UnDB"
 // contain the record, so a version bump (D9) keeps a pre-P1.a database from
 // being read by a build that would not know to look for it. No migration path
 // — no prior version of this database has shipped externally.
-pub const FORMAT_VERSION: u16 = 4;
+//
+// v4 -> v5 (P3.a): the B-Tree secondary index became durable — nodes are pages
+// in the page store, WAL-logged as full node-page images via a new record kind
+// `WAL_INDEX` (redo-only), and crash-recovered instead of rebuilt on open. A
+// new page type `PAGE_TYPE_BTREE` tags those node/meta pages. Old WALs never
+// contain `WAL_INDEX`, and a pre-P3.a database has no durable index pages nor
+// the per-column `index_root` catalog pointer, so a version bump (D9) keeps an
+// older build from misreading them. No migration path — no prior version has
+// shipped externally.
+pub const FORMAT_VERSION: u16 = 5;
 
 /// Default page size: 8 KiB (D8). Baked into the control file at DB init.
 pub const DEFAULT_PAGE_SIZE: u32 = 8192;
@@ -54,6 +63,9 @@ pub const INVALID_XID: Xid = 0;
 pub const PAGE_TYPE_HEAP: u8 = 1;
 pub const PAGE_TYPE_FREE: u8 = 2;
 pub const PAGE_TYPE_META: u8 = 3;
+/// Durable B-Tree node/meta pages (P3.a). Distinguishes index-structure pages
+/// from heap pages so a future integrity checker can tell them apart.
+pub const PAGE_TYPE_BTREE: u8 = 4;
 
 // WAL record type tags.
 pub const WAL_BEGIN: u8 = 1;
@@ -95,6 +107,19 @@ pub const WAL_VACUUM: u8 = 11;
 // when that mini-txn committed — which is exactly when the page could have
 // reached disk torn (D5 forbids flushing a page whose WAL is not yet durable).
 pub const WAL_FPI: u8 = 12;
+
+// WAL durable-index record (P3.a — durable B-Tree). Redo-only, idempotent: the
+// redo payload is a full B-Tree node/meta page image (`page_size` bytes) and
+// `slot` is `u16::MAX` (a whole-page record). Recovery overwrites the on-disk
+// page with the image, stamped with this record's LSN, exactly like a `WAL_FPI`
+// base image — last-writer-in-LSN-order wins, and index pages never overlap
+// heap pages, so no LSN gate is needed. Every index mutation brackets all of
+// its node writes (a leaf write, or a split chain + meta-page repoint) in one
+// mini-transaction, so recovery redoes all pages of a committed index mutation
+// or none. There is no undo: a secondary-index entry is a hint re-validated
+// against MVCC visibility, so a stale/extra entry is harmless and a missing one
+// is prevented by the index mini-txn fsyncing before the user txn commits.
+pub const WAL_INDEX: u8 = 13;
 
 // ── little-endian helpers ────────────────────────────────────────────────────
 

@@ -23,14 +23,14 @@ use std::path::Path;
 use serde_json::Value as JsonValue;
 
 use crate::{
-    btree_index::OrderedValue,
+    btree_index::{DiskBTree, OrderedValue},
     bufferpool::{BufferPool, PageReader},
     catalog::{Catalog, CatalogCtx, ColumnDef, ColumnType, IndexKind, TableConstraints, TableDef},
     control::ControlData,
     error::{DbError, Result},
     format::{PageId, Xid},
     heap::{Heap, RowId},
-    index_worker::{IndexHandle, IndexMsg, IndexStatus, IndexedColumn, SecondaryIndex},
+    index_worker::{IndexHandle, IndexMsg, IndexedColumn, SecondaryIndex},
     lockmgr::LockManager,
     mvcc::Snapshot,
     queue::{self, EVENTS_TABLE},
@@ -92,19 +92,10 @@ pub fn build_indexed_columns(
                 column: col.name.clone(),
                 data: t.clone(),
             }),
-            // `Literal::Null` (and any other non-orderable value that
-            // shouldn't occur given `exec_create_index`'s type validation)
-            // is silently skipped rather than erroring the write — a NULL
-            // indexed column just means that row never appears as a BTree
-            // candidate, matching ordinary SQL index semantics.
-            (Some(IndexKind::BTree), lit) => {
-                if let Ok(value) = OrderedValue::try_from(lit) {
-                    out.push(IndexedColumn::Ordered {
-                        column: col.name.clone(),
-                        data: value,
-                    });
-                }
-            }
+            // `IndexKind::BTree` is deliberately absent: since P3.a the B-Tree
+            // is a durable, synchronous, WAL-logged on-disk structure written
+            // via `apply_durable_btree_writes`, not sent to the async worker
+            // that serves the still-in-memory Hnsw/FullText/Csr kinds.
             _ => {}
         }
     }
@@ -137,6 +128,39 @@ fn send_index_upserts(table_def: &TableDef, row_id: RowId, row: &[Literal], ctx:
             indexed_cols,
         });
     }
+}
+
+/// Insert `row`'s durable-B-Tree-indexed column values into their on-disk
+/// B+trees (P3.a). Synchronous, durable, WAL-logged on the writer thread —
+/// unlike the async `send_index_upserts` (which now serves only the still-
+/// in-memory Hnsw/FullText/Csr kinds). Called on every INSERT and on the new
+/// row version each UPDATE creates. The old version's entry is intentionally
+/// left in place: it points at a now-superseded (MVCC-invisible) tuple, so it
+/// is a harmless stale hint that vacuum later scrubs — exactly how the heap
+/// keeps the old version until vacuum. A NULL / non-orderable value is skipped
+/// (that row simply never appears as a B-Tree candidate). A BTree column with
+/// no `index_root` yet (index flagged but never built via `CREATE INDEX`) is
+/// also skipped — queries fall back to a full scan, never a wrong answer.
+fn apply_durable_btree_writes(
+    table_def: &TableDef,
+    row_id: RowId,
+    row: &[Literal],
+    ctx: &mut ExecCtx,
+) -> Result<()> {
+    for (idx, col) in table_def.columns.iter().enumerate() {
+        if col.dropped || col.index != Some(IndexKind::BTree) {
+            continue;
+        }
+        let Some(meta_page) = col.index_root else {
+            continue;
+        };
+        let Ok(value) = OrderedValue::try_from(&row[idx]) else {
+            continue;
+        };
+        let tree = DiskBTree::new(meta_page, ctx.page_size);
+        tree.insert(value, row_id, ctx.pool, ctx.wal)?;
+    }
+    Ok(())
 }
 
 /// If `table_def` has events enabled, durably capture one event row in
@@ -392,8 +416,35 @@ fn exec_create_index(
     let mut cctx = catalog_ctx!(ctx);
     ctx.catalog
         .set_column_index(table, column, Some(kind), &mut cctx)?;
-    let table_def = ctx.catalog.lookup(table)?.clone();
 
+    // P3.a: a durable B-Tree is built synchronously on the writer thread —
+    // allocate its stable meta page, backfill every committed row into the
+    // on-disk tree, then record the meta page id in the catalog. Everything is
+    // WAL-logged, so `Engine::open` never rebuilds it. The other (still
+    // in-memory) kinds keep the async-worker backfill below.
+    if kind == IndexKind::BTree {
+        let tree = DiskBTree::create(ctx.pool, ctx.wal)?;
+        let table_def = ctx.catalog.lookup(table)?.clone();
+        let col_idx = table_def
+            .columns
+            .iter()
+            .position(|c| c.name == column)
+            .expect("column just validated above");
+        let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+        let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+        for (row_id, bytes) in heap.scan(&snapshot, ctx.xid, ctx.pool)? {
+            let row = decode_row(&bytes, &table_def.columns)?;
+            if let Ok(value) = OrderedValue::try_from(&row[col_idx]) {
+                tree.insert(value, row_id, ctx.pool, ctx.wal)?;
+            }
+        }
+        let mut cctx = catalog_ctx!(ctx);
+        ctx.catalog
+            .set_column_index_root(table, column, Some(tree.meta_page()), &mut cctx)?;
+        return Ok(ExecResult::CreatedIndex);
+    }
+
+    let table_def = ctx.catalog.lookup(table)?.clone();
     if let Some(handle) = ctx.index_worker {
         let col = table_def
             .columns
@@ -480,6 +531,7 @@ fn exec_insert(
             },
         )?;
         send_index_upserts(&table_def, row_id, &coerced, ctx);
+        apply_durable_btree_writes(&table_def, row_id, &coerced, ctx)?;
         send_event_capture(&table_def, "insert", &coerced, ctx)?;
         count += 1;
     }
@@ -637,28 +689,25 @@ fn try_exec_select_btree(
     ctx: &mut ExecCtx,
 ) -> Result<Option<ExecResult>> {
     let (column, op, literal) = hit;
-    let Some(handle) = ctx.index_worker else {
-        return Ok(None);
-    };
     let Ok(value) = OrderedValue::try_from(literal) else {
         return Ok(None);
     };
-
-    let candidate_ids: Vec<RowId> = {
-        let guard = handle.indexes.read().unwrap();
-        let Some(entry) = guard.get(&(table_def.name.clone(), column.to_string())) else {
-            return Ok(None);
-        };
-        if entry.status != IndexStatus::Ready {
-            return Ok(None);
-        }
-        let SecondaryIndex::BTree(b) = &entry.index else {
-            return Ok(None);
-        };
-        match b.search(op, &value) {
-            Some(ids) => ids,
-            None => return Ok(None),
-        }
+    // P3.a: the durable on-disk B+tree, reconstructed from the column's stable
+    // meta page id (no rebuild, no `Ready` status to wait on — the tree is
+    // always crash-consistent with committed data). A column flagged BTree but
+    // never built (no `index_root`) falls back to a full scan.
+    let Some(meta_page) = table_def
+        .columns
+        .iter()
+        .find(|c| c.name == column)
+        .and_then(|c| c.index_root)
+    else {
+        return Ok(None);
+    };
+    let tree = DiskBTree::new(meta_page, ctx.page_size);
+    let candidate_ids: Vec<RowId> = match tree.search(op, &value, ctx.pool)? {
+        Some(ids) => ids,
+        None => return Ok(None),
     };
 
     let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
@@ -821,6 +870,7 @@ fn exec_update(
             },
         )?;
         send_index_upserts(&table_def, new_row_id, &coerced, ctx);
+        apply_durable_btree_writes(&table_def, new_row_id, &coerced, ctx)?;
         send_event_capture(&table_def, "update", &coerced, ctx)?;
         count += 1;
     }
@@ -2175,6 +2225,7 @@ mod tests {
             ColumnDef {
                 name: "a".to_string(),
                 index: None,
+                index_root: None,
                 dropped: false,
                 constraints: Default::default(),
                 ty: ColumnType::Int64,
@@ -2182,6 +2233,7 @@ mod tests {
             ColumnDef {
                 name: "b".to_string(),
                 index: None,
+                index_root: None,
                 dropped: false,
                 constraints: Default::default(),
                 ty: ColumnType::Text,
@@ -2189,6 +2241,7 @@ mod tests {
             ColumnDef {
                 name: "c".to_string(),
                 index: None,
+                index_root: None,
                 dropped: false,
                 constraints: Default::default(),
                 ty: ColumnType::Bool,
@@ -2196,6 +2249,7 @@ mod tests {
             ColumnDef {
                 name: "d".to_string(),
                 index: None,
+                index_root: None,
                 dropped: false,
                 constraints: Default::default(),
                 ty: ColumnType::Json,
@@ -2217,6 +2271,7 @@ mod tests {
         let columns = vec![ColumnDef {
             name: "a".to_string(),
             index: None,
+            index_root: None,
             dropped: false,
             constraints: Default::default(),
             ty: ColumnType::Int64,
@@ -2231,6 +2286,7 @@ mod tests {
         let columns = vec![ColumnDef {
             name: "embedding".to_string(),
             index: None,
+            index_root: None,
             dropped: false,
             constraints: Default::default(),
             ty: ColumnType::Vector(4),
@@ -2246,6 +2302,7 @@ mod tests {
         let columns = vec![ColumnDef {
             name: "embedding".to_string(),
             index: None,
+            index_root: None,
             dropped: false,
             constraints: Default::default(),
             ty: ColumnType::Vector(4),
@@ -2263,6 +2320,7 @@ mod tests {
             columns: vec![ColumnDef {
                 name: "embedding".to_string(),
                 index: None,
+                index_root: None,
                 dropped: false,
                 constraints: Default::default(),
                 ty: ColumnType::Vector(4),
@@ -2283,6 +2341,7 @@ mod tests {
         ColumnDef {
             name: name.to_string(),
             index: None,
+            index_root: None,
             dropped: false,
             constraints: Default::default(),
             ty,

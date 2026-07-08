@@ -12,6 +12,8 @@ The competitive edge is eliminating the multi-system dual-write tax. "Save row +
 
 **Phase 1 (complete): ACID & storage foundation — the feature-freeze gate.** Before further scale/feature work, the engine closed its silent correctness holes (`docs/backlog/roadmap.md` §4, `docs/backlog/phase1_acid_hardening.md`). **P1.a — full-page-writes — is shipped:** an 8 KiB page write is not atomic, so a crash mid-write used to leave a torn page that CRC detects but cannot repair (the #1 data-loss hole). Now, on the first modification of a page after each checkpoint, the buffer pool logs the whole clean page image to the WAL (a redo-only `WAL_FPI` record); recovery replays it as the clean base before re-applying the interval's incremental redo on top, so a torn on-disk page is fully reconstructed. New crash point **P11** manufactures a real torn page and asserts recovery (`FORMAT_VERSION` 3→4). **P1.b — fsync-failure handling — is also shipped:** a failed `fsync`/`msync` may leave the OS having dropped the dirty data while clearing its dirty bit, so the WAL and buffer pool now treat a durability failure as fatal — they latch a poisoned state and never falsely report success (new crash point **P12**). **P1.c — the scaling foundation — is also shipped:** the page file now grows in 4 MiB chunks (was a whole-file remap on every `alloc_page` — O(N²), fatal at 100s of GB), the buffer pool is configurable (`UNIDB_BUFFER_POOL_PAGES`, default raised 256→4096 frames), and a real free-space map replaces the linear per-insert page scan — so insert/read throughput stays flat as a table grows (`benches/scale.rs`). **P1.d — isolation correctness — is also shipped:** write-write conflicts under `REPEATABLE READ`/`SERIALIZABLE` now surface as `SerializationFailure` (not a raw conflict), `READ COMMITTED` re-reads the latest committed version via its fresh per-statement snapshot (no spurious abort), and a new `SERIALIZABLE` level uses SSI rw-antidependency (pivot) detection to prevent write-skew. **P1.e — auto-checkpoint — is shipped, completing the phase:** the WAL used to grow unbounded (checkpoint was manual-only), so a checkpoint now fires automatically on a time or WAL-size trigger (at a quiescent point), keeping the WAL bounded (benchmarked ~8–23× smaller) at unchanged throughput. The crash-injection harness grew from 11 to **14** points and `FORMAT_VERSION` went 3→4; no locked decision was reversed. See `PROGRESS.md`'s Phase 1 entries.
 
+**Phase 3 (in progress): multi-model durable storage — the moat.** This phase kills the "rebuild every secondary index on open" tax (O(all data) startup, RAM-bound) by making the indexes durable on disk. **P3.a — the durable B-Tree — is shipped:** the B-Tree secondary index is now an on-disk B+tree (`DiskBTree`) whose nodes are pages in the shared page store, buffer-pool-managed, WAL-logged as full node-page images (a new redo-only `WAL_INDEX` record) and crash-recovered — so `Engine::open` reads it straight from a stable meta page instead of rescanning the heap to rebuild it. It moved off the async index worker onto the synchronous writer/read path, and vacuum scrubs it directly. New crash point **P13** wipes the entire data file and proves the whole tree is reconstructed from the WAL alone; the harness grew 14 → **15** and `FORMAT_VERSION` went 4→5. The open-cost benchmark (`benches/durable_index.rs`) shows B-Tree reopen time is flat as the table grows while a still-rebuilt HNSW index's reopen time rises. P3.b (durable inverted/CSR/edge), P3.c (on-disk vector), and P3.d (large objects) are pending. See `PROGRESS.md`'s P3.a entry.
+
 ---
 
 ## Prerequisites
@@ -284,9 +286,9 @@ src/
   sql/             — parser.rs, logical.rs (plan + RLS rewrite), executor.rs, datetime.rs (timestamp parse/format)
   vector.rs        — HNSW wrapper (instant-distance) for VECTOR(n) columns
   fulltext.rs      — inverted index for full-text search
-  btree_index.rs   — BTreeMap-backed secondary index for equality/range WHERE predicates
+  btree_index.rs   — durable on-disk B+tree (DiskBTree) for equality/range WHERE predicates; paged, WAL-logged, crash-recovered, no rebuild on open (P3.a)
   csr_index.rs     — Compressed Sparse Row adjacency structure for the graph layer
-  index_worker.rs  — background thread building HNSW/full-text/B-Tree/CSR indexes asynchronously, debounced
+  index_worker.rs  — background thread building HNSW/full-text/CSR indexes asynchronously, debounced (B-Tree is durable/synchronous since P3.a)
   graph/           — edges.rs, index.rs, logical.rs, parser.rs, executor.rs (Cypher subset)
   queue/           — mod.rs (event capture, poll/ack/vacuum), payload.rs
   checkpoint.rs    — flush dirty pages → checkpoint record (+ next_xid) → truncate WAL
@@ -341,6 +343,7 @@ Phase 4 query power is next for the SQL lane). Metrics tables are in
 | P2.c — ALTER/DROP/TRUNCATE | done | Schema evolution — `ADD COLUMN` (with `DEFAULT`), tombstone `DROP COLUMN`, `DROP TABLE`, `TRUNCATE`, and request-level DDL rollback |
 | P2.d — sequences / SERIAL | done | Durable, monotonic, crash-safe auto-increment (`SERIAL` / `GENERATED AS IDENTITY`) |
 | P2.e — prepared statements | done | `$n` bind parameters (`execute_sql_params`, `prepare`/`execute_prepared`, `POST /sql` `params`) — closes the SQL-injection surface |
+| P3.a — durable B-Tree | done | The M6 B-Tree is now an on-disk B+tree (`DiskBTree`): paged, buffer-pool-managed, WAL-logged (`WAL_INDEX`), crash-recovered, **not rebuilt on open** (Phase 3, Core lane) |
 
 ---
 
