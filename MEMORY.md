@@ -80,9 +80,9 @@
   workspace's dependency union, which is *not* the right check here).
 - **Current work: Phase 1 — ACID & storage foundation** (the feature-freeze
   gate, `docs/backlog/phase1_acid_hardening.md`), on Core lane branch
-  `acid-hardening`. **P1.a (full-page-writes) and P1.b (fsync-failure handling)
-  are shipped**; P1.c–P1.e (alloc_page remap + configurable pool + real FSM,
-  isolation correctness, auto-checkpoint) are next, in that order, one PR each.
+  `acid-hardening`. **P1.a (full-page-writes), P1.b (fsync-failure handling), and
+  P1.c (alloc_page remap + configurable pool + real FSM) are shipped**; P1.d–P1.e
+  (isolation correctness, auto-checkpoint) are next, in that order, one PR each.
   See the
   Phase 1 section below. The roadmap is now `docs/backlog/roadmap.md` (6-phase
   plan); the older per-milestone backlog docs were retired. A CSR-preferring
@@ -166,9 +166,24 @@ one PR per checkpoint (P1.a → P1.e). **In progress as of 2026-07-08.**
   (`p12_fsync_failure_refuses_to_report_success`) injects a fault at both the
   WAL-commit and data-file-flush boundaries; crash harness now 14 tests. No
   format change. See `PROGRESS.md`'s Phase 1 → P1.b entry.
-- **P1.c–P1.e — not started.** alloc_page remap fix + configurable pool + real
-  FSM; isolation correctness (RC re-eval + SSI); auto-checkpoint. In that
-  order, one PR each.
+- **P1.c — alloc_page remap fix + configurable pool + real FSM — SHIPPED
+  (2026-07-08).** (1) Page file grows in **4 MiB chunks** (`BufferPool::
+  ensure_mapped`), remapping only on a chunk boundary — was a whole-file remap
+  per page (O(N²) total). `logical_page_count` reclaims trailing all-zero slack
+  on open. (2) Pool capacity configurable via `UNIDB_BUFFER_POOL_PAGES` /
+  `Engine::open_with_pool_capacity`, default 256 → **4096** frames. (3) Real
+  free-space map (`Heap::free_map`) replaces the linear per-insert scan — page
+  selection is integer compares, not a fetch of every page; kept exact via
+  `note_free_space` after insert/update/compact. Bench `benches/scale.rs`:
+  `alloc_page` flat ~1M pages/s to 100k pages (was O(N²)); insert throughput
+  does **not** degrade to 300k rows; point reads ~1.14M/s. No format change; D6/
+  D8 unchanged. Known limit: the SQL path's per-statement `from_pages` rebuilds
+  the FSM lazily (raw `Engine::insert` keeps it warm) — a durable on-disk FSM is
+  a later item. **Note: page 0 is now allocatable** (the sentinel is
+  `INVALID_PAGE_ID = u32::MAX`, not 0) — a fresh DB starts allocating at id 0
+  instead of reserving it; no on-disk/sentinel meaning changed.
+- **P1.d–P1.e — not started.** isolation correctness (RC re-eval + SSI);
+  auto-checkpoint. In that order, one PR each.
 
 ### M10 — heap vacuum / MVCC GC (Core lane, branch `core-vacuum`, 2026-07-08)
 

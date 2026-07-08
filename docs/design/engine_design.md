@@ -164,14 +164,25 @@ starts here** — it is the single source of recovery truth.
 
 ### 3.4 Buffer pool
 
-Fixed capacity of **256 frames** (`POOL_CAPACITY` in `lib.rs`), pin/unpin,
-clock eviction, dirty tracking, D5 enforcement on flush/evict.
+**Configurable** capacity (P1.c): `DEFAULT_POOL_CAPACITY = 4096` frames
+(32 MiB at 8 KiB pages, raised from the old fixed 256), overridable via the
+`UNIDB_BUFFER_POOL_PAGES` env var or `Engine::open_with_pool_capacity`.
+Pin/unpin, clock eviction, dirty tracking, D5 enforcement on flush/evict.
 `fetch_page` returns a per-call page copy — cheap for point access,
 measurably expensive for hot-hub scans, which is what motivated the graph
 layer's batch-latch optimization (§7.2). A real scaling limit was
 discovered in M6: tables growing into the hundreds of pages could exhaust
 the pool (`DbError::BufferPoolFull`) even with small individually-committed
 transactions.
+
+**Chunked file growth (P1.c).** `alloc_page` previously `set_len`'d and
+**re-mapped the whole file on every allocation** — O(inserts) full-file
+remaps, O(N²) total, fatal at 100s of GB. Now the file grows in 4 MiB chunks
+(`ensure_mapped` / `grow_chunk_pages`), re-creating the mmap only when a new
+page crosses the mapped boundary. `mapped_pages` (physical) is tracked apart
+from `file_page_count` (logical high-water mark); `logical_page_count` skips
+trailing all-zero slack on open so a reopen reuses it rather than leaking a
+chunk. Benchmarked flat at ~1M `alloc_page`/s to 100k pages (`benches/scale.rs`).
 
 **Steal / force-WAL-on-evict (2026-07-08, branch `m9-group-commit`).** The
 pool tracks the durable WAL frontier (`durable_wal_lsn`, a stale-low-safe
@@ -186,8 +197,18 @@ and, if the pool is still full of *not-yet-durable* dirty pages (the
 group-commit deferred-sync case), forces one `Wal::sync()` and retries —
 "force the log before stealing the page" (D5). Reads keep plain `fetch_page`
 (they never dirty pages). This makes deferred mode safe for working sets
-larger than the pool and largely closes the M6 limit; the linear-scan FSM
-cost is separate and still open (§12).
+larger than the pool and largely closes the M6 limit.
+
+**Real free-space map (P1.c).** The heap's `find_or_alloc_page` no longer
+scans (and *fetches*) every page to find room — the old O(pages) per-insert
+cost that made a heap O(pages²) to fill. `Heap::free_map` caches free bytes
+per page, so page selection is integer comparisons; only pages whose free
+space is still unknown (a `from_pages`-reconstructed heap) are probed, from
+the end backward (append locality), caching each. Benchmarked: insert
+throughput does **not** degrade as a heap grows to 300k rows (`benches/
+scale.rs`). Caveat: the map is per-`Heap`-instance, and the SQL executor
+rebuilds a `Heap` per statement (`from_pages`), so single-row autocommit SQL
+inserts rebuild it lazily; a durable on-disk FSM fork is a later item (§12).
 
 ### 3.5 Checkpoint & recovery
 
@@ -757,12 +778,16 @@ the single writer thread).
 - **`NEAR` latency (~4–5 ms)** is transactional overhead, not vector
   search — the raw structures answer in microseconds (fulltext search
   ~14.2 µs).
-- **`BufferPoolFull` at ~100k rows/table** (M6 discovery): **largely fixed
-  2026-07-08** — the root cause was that `find_victim` could never evict a
-  dirty page (its D5 hint was hardwired to `INVALID_LSN`); it now writes back
-  + evicts dirty pages once durable, and `fetch_page_for_write` force-syncs
-  when needed (§3.4). The linear-scan FSM interaction is separate and still
-  open; no dedicated large-single-table stress test was added.
+- **`BufferPoolFull` at ~100k rows/table** (M6 discovery): **fixed** — the
+  M9 change made `find_victim` write back + evict dirty pages once durable
+  (root cause: its D5 hint was hardwired to `INVALID_LSN`), and **P1.c**
+  raised the default pool to 4096 frames (configurable) and replaced the
+  O(N²) whole-file-remap-per-`alloc_page` with chunked growth, so heaps scale
+  to 300k+ rows with flat throughput (`benches/scale.rs`, §3.4).
+- **Linear-scan FSM** (was open): **fixed by P1.c** — `Heap::free_map` makes
+  page selection integer comparisons, not a fetch of every page. Remaining
+  caveat: the map is per-`Heap`-instance and the SQL path rebuilds a heap per
+  statement, so a durable on-disk FSM fork is a later item.
 - Peak RSS has stayed ~27–28 MB across M0/M1 measurement points.
 
 ---
@@ -808,9 +833,11 @@ last of which also largely resolves the `BufferPoolFull`-at-scale item
 below; the one remaining follow-up is a concurrent read path (readers off
 the single writer thread) — see
 `docs/backlog/group_commit_and_read_concurrency.md`. WAL truncation rewrites
-the whole file (needs log segments); FSM is a linear scan; ~~256-frame
-buffer pool + `BufferPoolFull` at scale~~ (largely fixed — see above; FSM
-scan cost remains); HNSW full rebuild per upsert; CSR full
+the whole file (needs log segments); ~~FSM is a linear scan~~ (**fixed P1.c**:
+`Heap::free_map`); ~~256-frame buffer pool + `BufferPoolFull` at scale~~
+(**fixed** — configurable 4096-frame default + chunked file growth, P1.c);
+~~`alloc_page` remaps the whole file per page~~ (**fixed P1.c**: chunked
+growth); HNSW full rebuild per upsert; CSR full
 rebuild per debounce pass (currently moot — CSR isn't consulted, see
 above); `poll_events` full-scan (needs a `seq` index); SSE
 poll-per-subscriber.
@@ -882,7 +909,10 @@ item (see §12's correction note and `docs/backlog/m10_heap_vacuum_gc.md`).
 **Phase 1 — ACID & storage foundation (2026-07-08, branch `acid-hardening`):
 P1.a full-page-writes + P1.b fsync-failure handling shipped** — `WAL_FPI`
 torn-page protection (§3.3, `FORMAT_VERSION` 3→4, crash point P11) and the
-fsyncgate poison path (§3.3, crash point P12); 14 crash tests total. P1.c–P1.e
-(`alloc_page` remap + configurable pool + real FSM, isolation correctness incl.
-the still-pending D12 RC re-eval + SSI, auto-checkpoint) to follow. See `docs/backlog/phase1_acid_hardening.md` and `PROGRESS.md`'s Phase 1
-entry. Update alongside the next checkpoint's closeout.*
+fsyncgate poison path (§3.3, crash point P12); 14 crash tests total. **P1.c
+scaling foundation shipped** — chunked `alloc_page` growth, a configurable
+buffer pool (4096-frame default), and a real free-space map (§3.4,
+`benches/scale.rs`; no crash point — no new durability mechanism). P1.d–P1.e
+(isolation correctness incl. the still-pending D12 RC re-eval + SSI,
+auto-checkpoint) to follow. See `docs/backlog/phase1_acid_hardening.md` and
+`PROGRESS.md`'s Phase 1 entry. Update alongside the next checkpoint's closeout.*

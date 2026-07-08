@@ -56,8 +56,37 @@ impl PageReader for SharedPageReader {
     }
 }
 
+/// How many bytes the page file grows by per extension (P1.c). One whole-file
+/// remap per chunk instead of per page. 4 MiB balances remap frequency against
+/// slack: at the 8 KiB default page size this is 512 pages per grow.
+const GROW_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
 fn lock_poisoned() -> DbError {
     DbError::Recovery("buffer pool mmap lock poisoned".into())
+}
+
+/// The logical high-water mark (next-unused page id) given a file physically
+/// sized to `mapped_pages` (P1.c). Trailing pages left all-zero by a previous
+/// session's chunked pre-growth were never handed out — a real heap/catalog
+/// page always carries a non-zero header — so skip them so `alloc_page` reuses
+/// that slack rather than leaking a chunk per reopen. The scan is bounded by
+/// one chunk (growth never runs more than a chunk ahead of allocation).
+fn logical_page_count(
+    mmap: &Arc<RwLock<PageFileMmap>>,
+    page_size: usize,
+    mapped_pages: u32,
+) -> Result<u32> {
+    let guard = mmap.read().map_err(|_| lock_poisoned())?;
+    let mut count = mapped_pages;
+    while count > 0 {
+        let start = (count - 1) as usize * page_size;
+        let end = start + page_size;
+        if end > guard.len() || !guard[start..end].iter().all(|&b| b == 0) {
+            break;
+        }
+        count -= 1;
+    }
+    Ok(count)
 }
 
 /// Read one page out of the shared mmap under its read-lock, returning an
@@ -108,7 +137,20 @@ pub struct BufferPool {
     clock_hand: usize,
     file: File,
     mmap: Arc<RwLock<PageFileMmap>>,
+    /// Next page id to hand out (the logical high-water mark). Distinct from
+    /// `mapped_pages` (P1.c): the file is pre-grown in large chunks, so the
+    /// mapping usually covers more pages than have been allocated.
     file_page_count: u32,
+    /// Number of pages the backing file is sized to *and* the mmap covers
+    /// (P1.c). `alloc_page` hands out ids up to `file_page_count`; the file is
+    /// extended (and the mmap re-created — the O(inserts) cost we are killing)
+    /// only when a new id would cross this boundary, then by a whole chunk.
+    /// Always `>= file_page_count`.
+    mapped_pages: u32,
+    /// How many pages to grow the file by when the mapping must be extended
+    /// (P1.c). One remap per `grow_chunk_pages` allocations instead of one per
+    /// allocation.
+    grow_chunk_pages: u32,
     /// The durable WAL frontier as last observed from the `Wal` (D5). A dirty
     /// page may be written back and evicted only when `page.LSN <=
     /// durable_wal_lsn` — otherwise stealing it would put un-recoverable state
@@ -160,16 +202,32 @@ impl BufferPool {
         }
 
         let file_len = file.metadata()?.len();
-        let file_page_count = (file_len / page_size as u64) as u32;
+        let mapped_pages = (file_len / page_size as u64) as u32;
 
         let mmap = Arc::new(RwLock::new(PageFileMmap::new(&file)?));
+
+        // P1.c: the file may carry trailing all-zero *slack* pages pre-grown by
+        // a previous session's chunked growth (see `grow_mapping`). They were
+        // never handed out (a real heap/catalog page always has a non-zero
+        // header — the same "all-zero ⇒ unwritten" invariant `read_page_locked`
+        // already relies on), so recover the logical high-water mark by
+        // skipping them. This keeps `alloc_page` reusing that slack instead of
+        // leaking a chunk per reopen.
+        let file_page_count = logical_page_count(&mmap, page_size, mapped_pages)?;
+
         let frames = (0..capacity).map(|_| Frame::empty()).collect();
+
+        // Grow the file by ~4 MiB at a time (at least one page), so the
+        // expensive whole-file remap happens once per chunk, not per page.
+        let grow_chunk_pages = (GROW_CHUNK_BYTES / page_size).max(1) as u32;
 
         tracing::info!(
             path = %path.display(),
             page_size,
             capacity,
             file_page_count,
+            mapped_pages,
+            grow_chunk_pages,
             "buffer pool opened"
         );
 
@@ -182,6 +240,8 @@ impl BufferPool {
             file,
             mmap,
             file_page_count,
+            mapped_pages,
+            grow_chunk_pages,
             durable_wal_lsn: INVALID_LSN,
             fpi_logged: HashSet::new(),
             flush_poisoned: false,
@@ -262,12 +322,11 @@ impl BufferPool {
                 self.page_size
             )));
         }
-        if page_id >= self.file_page_count {
+        // Ensure the page exists physically (recovery may target a page beyond
+        // the current end); chunked-grow like `alloc_page`.
+        self.ensure_mapped(page_id + 1)?;
+        if page_id + 1 > self.file_page_count {
             self.file_page_count = page_id + 1;
-            let new_len = self.file_page_count as u64 * self.page_size as u64;
-            self.file.set_len(new_len)?;
-            let mut guard = self.mmap.write().map_err(|_| lock_poisoned())?;
-            *guard = PageFileMmap::new(&self.file)?;
         }
         let start = page_id as usize * self.page_size;
         let end = start + self.page_size;
@@ -290,20 +349,49 @@ impl BufferPool {
         }
     }
 
-    /// Allocate a new page in the file, return its PageId. Takes the mmap
-    /// write-lock for the remap so no concurrent reader is holding a slice
-    /// into the mapping being replaced.
+    /// Allocate a new page in the file, return its PageId (P1.c). The file is
+    /// pre-grown in large chunks (`grow_chunk_pages`), so this only extends the
+    /// file and re-creates the mmap when a new id crosses the current mapped
+    /// boundary — once per chunk, not once per page. Before P1.c this re-mapped
+    /// the *whole file on every allocation* (O(inserts) full remaps, fatal at
+    /// 100s of GB).
     pub fn alloc_page(&mut self) -> Result<PageId> {
         let new_id = self.file_page_count;
+        self.ensure_mapped(new_id + 1)?;
         self.file_page_count += 1;
-        let new_len = self.file_page_count as u64 * self.page_size as u64;
+        tracing::debug!(page_id = new_id, "new page allocated");
+        Ok(new_id)
+    }
+
+    /// Ensure the file is sized (and mapped) to at least `min_pages` pages,
+    /// growing by whole `grow_chunk_pages` chunks and re-creating the mmap only
+    /// when the boundary is actually crossed (P1.c). The remap takes the mmap
+    /// write-lock so no concurrent reader holds a slice into the old mapping.
+    fn ensure_mapped(&mut self, min_pages: u32) -> Result<()> {
+        if min_pages <= self.mapped_pages {
+            return Ok(());
+        }
+        // Round up to the next chunk boundary at or above `min_pages`.
+        let chunk = self.grow_chunk_pages;
+        let target = min_pages
+            .div_ceil(chunk)
+            .saturating_mul(chunk)
+            .max(min_pages);
+        let new_len = target as u64 * self.page_size as u64;
         self.file.set_len(new_len)?;
         {
             let mut guard = self.mmap.write().map_err(|_| lock_poisoned())?;
             *guard = PageFileMmap::new(&self.file)?;
         }
-        tracing::debug!(page_id = new_id, "new page allocated");
-        Ok(new_id)
+        self.mapped_pages = target;
+        tracing::debug!(mapped_pages = target, "page file mapping grown");
+        Ok(())
+    }
+
+    /// Number of pages logically allocated (the next page id to be handed out).
+    /// Distinct from the physically-mapped size, which is pre-grown in chunks.
+    pub fn page_count(&self) -> u32 {
+        self.file_page_count
     }
 
     /// A shared, read-only view over the page file for concurrent readers
@@ -708,6 +796,48 @@ mod tests {
             pool.flush_all(5),
             Err(DbError::DurabilityFailure(_))
         ));
+    }
+
+    /// P1.c: `alloc_page` grows the file in chunks (not per page), and a
+    /// reopen reclaims trailing all-zero slack pages so ids stay contiguous.
+    #[test]
+    fn alloc_page_grows_in_chunks_and_reopen_reclaims_slack() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("data.db");
+        let ps = DEFAULT_PAGE_SIZE as usize;
+        {
+            let mut pool = BufferPool::open(&path, ps, 16).unwrap();
+            // Allocate and *write* three pages (non-zero headers).
+            let mut ids = Vec::new();
+            for _ in 0..3 {
+                let pid = pool.alloc_page().unwrap();
+                let mut page = SlottedPage::new(pid, PAGE_TYPE_HEAP, ps);
+                page.set_lsn(1);
+                pool.write_page(&page).unwrap();
+                ids.push(pid);
+            }
+            assert_eq!(ids, vec![0, 1, 2], "ids are contiguous from 0");
+            assert_eq!(pool.page_count(), 3);
+            // The file was pre-grown by a whole 4 MiB chunk (512 pages), not 3.
+            let physical = std::fs::metadata(&path).unwrap().len() / ps as u64;
+            assert!(
+                physical >= 512,
+                "file should be pre-grown by a chunk, got {physical} pages"
+            );
+        }
+        // Reopen: the logical count is recovered as 3 (trailing zero slack
+        // skipped), so the next allocation is id 3 — no per-reopen chunk leak.
+        let mut pool = BufferPool::open(&path, ps, 16).unwrap();
+        assert_eq!(
+            pool.page_count(),
+            3,
+            "slack pages must not inflate the count"
+        );
+        assert_eq!(
+            pool.alloc_page().unwrap(),
+            3,
+            "next id continues contiguously"
+        );
     }
 
     #[test]
