@@ -191,10 +191,39 @@ fn send_event_capture(
 pub enum ExecResult {
     CreatedTable,
     CreatedIndex,
-    Inserted { count: usize },
+    Inserted {
+        count: usize,
+    },
     Rows(Vec<Vec<Literal>>),
-    Updated { count: usize },
-    Deleted { count: usize },
+    Updated {
+        count: usize,
+    },
+    Deleted {
+        count: usize,
+    },
+    /// `ALTER TABLE` succeeded (P2.c).
+    AlteredTable,
+    /// `DROP TABLE` succeeded (P2.c).
+    DroppedTable,
+    /// `TRUNCATE` succeeded (P2.c); `count` = rows removed.
+    Truncated {
+        count: usize,
+    },
+}
+
+/// Build a `CatalogCtx` from `ExecCtx`'s individual fields (not from `&mut
+/// ExecCtx` as a whole) so the borrow checker sees disjoint field borrows —
+/// this lets `ctx.catalog` stay independently borrowable at each call site.
+macro_rules! catalog_ctx {
+    ($ctx:expr) => {
+        CatalogCtx {
+            pool: $ctx.pool,
+            wal: $ctx.wal,
+            control_path: $ctx.control_path,
+            control: $ctx.control,
+            page_size: $ctx.page_size,
+        }
+    };
 }
 
 pub fn execute(plan: LogicalPlan, ctx: &mut ExecCtx) -> Result<ExecResult> {
@@ -225,22 +254,74 @@ pub fn execute(plan: LogicalPlan, ctx: &mut ExecCtx) -> Result<ExecResult> {
             column,
             kind,
         } => exec_create_index(&table, &column, kind, ctx),
+        LogicalPlan::AlterTableAddColumn { table, column } => {
+            exec_alter_add_column(&table, column, ctx)
+        }
+        LogicalPlan::AlterTableDropColumn {
+            table,
+            column,
+            if_exists,
+        } => exec_alter_drop_column(&table, &column, if_exists, ctx),
+        LogicalPlan::DropTable { table, if_exists } => exec_drop_table(&table, if_exists, ctx),
+        LogicalPlan::Truncate { table } => exec_truncate(&table, ctx),
     }
 }
 
-/// Build a `CatalogCtx` from `ExecCtx`'s individual fields (not from `&mut
-/// ExecCtx` as a whole) so the borrow checker sees disjoint field borrows —
-/// this lets `ctx.catalog` stay independently borrowable at each call site.
-macro_rules! catalog_ctx {
-    ($ctx:expr) => {
-        CatalogCtx {
-            pool: $ctx.pool,
-            wal: $ctx.wal,
-            control_path: $ctx.control_path,
-            control: $ctx.control,
-            page_size: $ctx.page_size,
-        }
-    };
+/// Reject DDL against the engine-managed system tables (`__events__`,
+/// `__consumers__`, `__edges__`) — they have no user-facing schema surface.
+fn reject_system_table(table: &str) -> Result<()> {
+    if table.starts_with("__") {
+        return Err(DbError::SqlPlan(format!(
+            "'{table}' is an engine-managed system table and cannot be altered or dropped"
+        )));
+    }
+    Ok(())
+}
+
+fn exec_alter_add_column(table: &str, column: ColumnDef, ctx: &mut ExecCtx) -> Result<ExecResult> {
+    reject_system_table(table)?;
+    let mut cctx = catalog_ctx!(ctx);
+    ctx.catalog.add_column(table, column, &mut cctx)?;
+    Ok(ExecResult::AlteredTable)
+}
+
+fn exec_alter_drop_column(
+    table: &str,
+    column: &str,
+    if_exists: bool,
+    ctx: &mut ExecCtx,
+) -> Result<ExecResult> {
+    reject_system_table(table)?;
+    let mut cctx = catalog_ctx!(ctx);
+    match ctx.catalog.drop_column(table, column, &mut cctx) {
+        Ok(()) => Ok(ExecResult::AlteredTable),
+        // `IF EXISTS`: a missing column is not an error.
+        Err(DbError::ColumnNotFound { .. }) if if_exists => Ok(ExecResult::AlteredTable),
+        Err(e) => Err(e),
+    }
+}
+
+fn exec_drop_table(table: &str, if_exists: bool, ctx: &mut ExecCtx) -> Result<ExecResult> {
+    reject_system_table(table)?;
+    let mut cctx = catalog_ctx!(ctx);
+    match ctx.catalog.drop_table(table, &mut cctx) {
+        Ok(()) => Ok(ExecResult::DroppedTable),
+        Err(DbError::TableNotFound(_)) if if_exists => Ok(ExecResult::DroppedTable),
+        Err(e) => Err(e),
+    }
+}
+
+fn exec_truncate(table: &str, ctx: &mut ExecCtx) -> Result<ExecResult> {
+    reject_system_table(table)?;
+    let table_def = ctx.catalog.lookup(table)?.clone();
+    // Count the live rows removed (under this statement's snapshot) for the
+    // result, before the page list is cleared.
+    let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+    let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+    let count = heap.scan(&snapshot, ctx.xid, ctx.pool)?.len();
+    let mut cctx = catalog_ctx!(ctx);
+    ctx.catalog.truncate(table, &mut cctx)?;
+    Ok(ExecResult::Truncated { count })
 }
 
 fn exec_create_table(
@@ -772,16 +853,27 @@ fn order_values_by_columns(
     values: Vec<Literal>,
 ) -> Result<Vec<Literal>> {
     match columns {
+        // `INSERT INTO t VALUES (...)` — one value per *visible* column, in
+        // declaration order. Dropped columns (P2.c tombstones) hold their slot
+        // in the physical row but are always written NULL.
         None => {
-            if values.len() != table.columns.len() {
+            let visible = table.columns.iter().filter(|c| !c.dropped).count();
+            if values.len() != visible {
                 return Err(DbError::SqlPlan(format!(
                     "table '{}' has {} columns, but {} values were supplied",
                     table.name,
-                    table.columns.len(),
+                    visible,
                     values.len()
                 )));
             }
-            Ok(values)
+            let mut ordered = vec![Literal::Null; table.columns.len()];
+            let mut vals = values.into_iter();
+            for (slot, col) in ordered.iter_mut().zip(&table.columns) {
+                if !col.dropped {
+                    *slot = vals.next().expect("visible count checked above");
+                }
+            }
+            Ok(ordered)
         }
         Some(cols) => {
             if cols.len() != values.len() {
@@ -803,7 +895,7 @@ fn column_index(table: &TableDef, name: &str) -> Result<usize> {
     table
         .columns
         .iter()
-        .position(|c| c.name == name)
+        .position(|c| c.name == name && !c.dropped)
         .ok_or_else(|| DbError::ColumnNotFound {
             table: table.name.clone(),
             column: name.to_string(),
@@ -1030,6 +1122,9 @@ fn rescale_decimal(
 /// VALUES (NULL)` into a defaulted column fills the default here).
 fn apply_defaults(table_def: &TableDef, mut row: Vec<Literal>) -> Vec<Literal> {
     for (i, col) in table_def.columns.iter().enumerate() {
+        if col.dropped {
+            continue;
+        }
         if matches!(row[i], Literal::Null) {
             if let Some(default) = &col.constraints.default {
                 row[i] = default.clone();
@@ -1042,6 +1137,9 @@ fn apply_defaults(table_def: &TableDef, mut row: Vec<Literal>) -> Vec<Literal> {
 /// NOT NULL (and the NOT-NULL half of PRIMARY KEY).
 fn enforce_not_null(table_def: &TableDef, row: &[Literal]) -> Result<()> {
     for (i, col) in table_def.columns.iter().enumerate() {
+        if col.dropped {
+            continue;
+        }
         let required = col.constraints.not_null || col.constraints.primary_key;
         if required && matches!(row[i], Literal::Null) {
             return Err(DbError::NotNullViolation {
@@ -1072,6 +1170,9 @@ fn enforce_checks(table_def: &TableDef, row: &[Literal]) -> Result<()> {
         }
     };
     for col in columns {
+        if col.dropped {
+            continue;
+        }
         if let Some(check) = &col.constraints.check {
             check_one(check)?;
         }
@@ -1125,7 +1226,7 @@ fn enforce_referenced_tables_exist(table_def: &TableDef, catalog: &Catalog) -> R
 fn unique_column_sets(table_def: &TableDef) -> Result<Vec<Vec<usize>>> {
     let mut sets: Vec<Vec<usize>> = Vec::new();
     for (i, col) in table_def.columns.iter().enumerate() {
-        if col.constraints.unique || col.constraints.primary_key {
+        if !col.dropped && (col.constraints.unique || col.constraints.primary_key) {
             sets.push(vec![i]);
         }
     }
@@ -1200,15 +1301,22 @@ pub(crate) fn project_row(
     columns: &[ColumnDef],
     row: &[Literal],
 ) -> Result<Vec<Literal>> {
+    // `SELECT *` returns every *visible* column — dropped columns (P2.c) keep
+    // their physical slot but never surface to the client.
     if projection.is_empty() {
-        return Ok(row.to_vec());
+        return Ok(row
+            .iter()
+            .zip(columns)
+            .filter(|(_, c)| !c.dropped)
+            .map(|(v, _)| v.clone())
+            .collect());
     }
     projection
         .iter()
         .map(|name| {
             let idx = columns
                 .iter()
-                .position(|c| &c.name == name)
+                .position(|c| &c.name == name && !c.dropped)
                 .ok_or_else(|| DbError::ColumnNotFound {
                     table: String::new(),
                     column: name.clone(),
@@ -1254,7 +1362,7 @@ pub(crate) fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Literal]) -> 
         Expr::Column(name) => {
             let idx = columns
                 .iter()
-                .position(|c| &c.name == name)
+                .position(|c| &c.name == name && !c.dropped)
                 .ok_or_else(|| DbError::ColumnNotFound {
                     table: String::new(),
                     column: name.clone(),
@@ -1520,6 +1628,18 @@ pub fn decode_row(bytes: &[u8], columns: &[ColumnDef]) -> Result<Vec<Literal>> {
     let mut out = Vec::with_capacity(columns.len());
     let mut pos = 0usize;
     for col in columns {
+        // A row written before an `ALTER TABLE ADD COLUMN` (P2.c) has no bytes
+        // for the trailing new column(s). Fill each such column with its
+        // coerced DEFAULT (so `ADD COLUMN ... DEFAULT x` shows `x` for old
+        // rows) or NULL — no heap rewrite needed.
+        if pos >= bytes.len() {
+            let lit = match &col.constraints.default {
+                Some(default) => coerce_value("", col, default.clone()).unwrap_or(Literal::Null),
+                None => Literal::Null,
+            };
+            out.push(lit);
+            continue;
+        }
         let tag = *bytes
             .get(pos)
             .ok_or_else(|| DbError::SqlPlan("row decode error: truncated tag".into()))?;
@@ -1967,24 +2087,28 @@ mod tests {
             ColumnDef {
                 name: "a".to_string(),
                 index: None,
+                dropped: false,
                 constraints: Default::default(),
                 ty: ColumnType::Int64,
             },
             ColumnDef {
                 name: "b".to_string(),
                 index: None,
+                dropped: false,
                 constraints: Default::default(),
                 ty: ColumnType::Text,
             },
             ColumnDef {
                 name: "c".to_string(),
                 index: None,
+                dropped: false,
                 constraints: Default::default(),
                 ty: ColumnType::Bool,
             },
             ColumnDef {
                 name: "d".to_string(),
                 index: None,
+                dropped: false,
                 constraints: Default::default(),
                 ty: ColumnType::Json,
             },
@@ -2005,6 +2129,7 @@ mod tests {
         let columns = vec![ColumnDef {
             name: "a".to_string(),
             index: None,
+            dropped: false,
             constraints: Default::default(),
             ty: ColumnType::Int64,
         }];
@@ -2018,6 +2143,7 @@ mod tests {
         let columns = vec![ColumnDef {
             name: "embedding".to_string(),
             index: None,
+            dropped: false,
             constraints: Default::default(),
             ty: ColumnType::Vector(4),
         }];
@@ -2032,6 +2158,7 @@ mod tests {
         let columns = vec![ColumnDef {
             name: "embedding".to_string(),
             index: None,
+            dropped: false,
             constraints: Default::default(),
             ty: ColumnType::Vector(4),
         }];
@@ -2048,6 +2175,7 @@ mod tests {
             columns: vec![ColumnDef {
                 name: "embedding".to_string(),
                 index: None,
+                dropped: false,
                 constraints: Default::default(),
                 ty: ColumnType::Vector(4),
             }],
@@ -2066,6 +2194,7 @@ mod tests {
         ColumnDef {
             name: name.to_string(),
             index: None,
+            dropped: false,
             constraints: Default::default(),
             ty,
         }
@@ -2479,6 +2608,174 @@ mod tests {
             o => panic!("{o:?}"),
         };
         assert_eq!(after, vec![vec![Literal::Int(2)]]);
+    }
+
+    // ── P2.c: ALTER / DROP / TRUNCATE ────────────────────────────────────────
+
+    #[test]
+    fn alter_add_column_shows_default_for_old_rows() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT)").unwrap();
+        h.exec_as(xid, "INSERT INTO t (id) VALUES (1)").unwrap();
+        // Add a column with a DEFAULT: the pre-existing row must show it.
+        let r = h
+            .exec_as(xid, "ALTER TABLE t ADD COLUMN status TEXT DEFAULT 'new'")
+            .unwrap();
+        assert_eq!(r, ExecResult::AlteredTable);
+        h.exec_as(xid, "INSERT INTO t (id, status) VALUES (2, 'live')")
+            .unwrap();
+        h.commit(xid);
+
+        let xid2 = h.begin();
+        let old = match h
+            .exec_as(xid2, "SELECT status FROM t WHERE id = 1")
+            .unwrap()
+        {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(old, vec![vec![Literal::Text("new".to_string())]]);
+        let new = match h
+            .exec_as(xid2, "SELECT status FROM t WHERE id = 2")
+            .unwrap()
+        {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(new, vec![vec![Literal::Text("live".to_string())]]);
+    }
+
+    #[test]
+    fn alter_add_not_null_column_without_default_rejected() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT)").unwrap();
+        let err = h.exec_as(xid, "ALTER TABLE t ADD COLUMN x INT NOT NULL");
+        assert!(matches!(err, Err(DbError::SqlPlan(_))));
+    }
+
+    #[test]
+    fn drop_middle_column_preserves_old_row_alignment() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (a INT, b INT, c INT)")
+            .unwrap();
+        h.exec_as(xid, "INSERT INTO t (a, b, c) VALUES (1, 2, 3)")
+            .unwrap();
+        h.exec_as(xid, "ALTER TABLE t DROP COLUMN b").unwrap();
+        h.commit(xid);
+
+        let xid2 = h.begin();
+        // The tombstone hazard: the pre-drop row's `c` must still decode as 3,
+        // not be misread from `b`'s old bytes.
+        let rows = match h.exec_as(xid2, "SELECT a, c FROM t").unwrap() {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(rows, vec![vec![Literal::Int(1), Literal::Int(3)]]);
+        // SELECT * returns only the two visible columns.
+        let star = match h.exec_as(xid2, "SELECT * FROM t").unwrap() {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(star, vec![vec![Literal::Int(1), Literal::Int(3)]]);
+        // The dropped column is no longer referenceable.
+        assert!(matches!(
+            h.exec_as(xid2, "SELECT b FROM t"),
+            Err(DbError::ColumnNotFound { .. })
+        ));
+        // A new insert over the visible columns still aligns.
+        let xid3 = h.begin();
+        h.exec_as(xid3, "INSERT INTO t (a, c) VALUES (4, 6)")
+            .unwrap();
+        h.commit(xid3);
+        let xid4 = h.begin();
+        let after = match h.exec_as(xid4, "SELECT a, c FROM t WHERE a = 4").unwrap() {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(after, vec![vec![Literal::Int(4), Literal::Int(6)]]);
+    }
+
+    #[test]
+    fn drop_column_if_exists_is_noop() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (a INT, b INT)").unwrap();
+        assert_eq!(
+            h.exec_as(xid, "ALTER TABLE t DROP COLUMN IF EXISTS nope")
+                .unwrap(),
+            ExecResult::AlteredTable
+        );
+        assert!(matches!(
+            h.exec_as(xid, "ALTER TABLE t DROP COLUMN nope"),
+            Err(DbError::ColumnNotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn drop_table_then_recreate() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT)").unwrap();
+        h.exec_as(xid, "INSERT INTO t (id) VALUES (1)").unwrap();
+        assert_eq!(
+            h.exec_as(xid, "DROP TABLE t").unwrap(),
+            ExecResult::DroppedTable
+        );
+        assert!(matches!(
+            h.exec_as(xid, "SELECT * FROM t"),
+            Err(DbError::TableNotFound(_))
+        ));
+        // Re-create with a fresh schema; the old rows are gone.
+        h.exec_as(xid, "CREATE TABLE t (name TEXT)").unwrap();
+        h.commit(xid);
+        let xid2 = h.begin();
+        assert_eq!(
+            h.exec_as(xid2, "SELECT * FROM t").unwrap(),
+            ExecResult::Rows(vec![])
+        );
+    }
+
+    #[test]
+    fn truncate_removes_all_rows_keeps_schema() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT)").unwrap();
+        h.exec_as(xid, "INSERT INTO t (id) VALUES (1)").unwrap();
+        h.exec_as(xid, "INSERT INTO t (id) VALUES (2)").unwrap();
+        h.commit(xid);
+        let xid2 = h.begin();
+        assert_eq!(
+            h.exec_as(xid2, "TRUNCATE TABLE t").unwrap(),
+            ExecResult::Truncated { count: 2 }
+        );
+        h.commit(xid2);
+        let xid3 = h.begin();
+        assert_eq!(
+            h.exec_as(xid3, "SELECT * FROM t").unwrap(),
+            ExecResult::Rows(vec![])
+        );
+        // Schema intact: can still insert.
+        h.exec_as(xid3, "INSERT INTO t (id) VALUES (9)").unwrap();
+    }
+
+    #[test]
+    fn ddl_on_system_table_rejected() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        assert!(matches!(
+            h.exec_as(xid, "DROP TABLE __events__"),
+            Err(DbError::SqlPlan(_))
+        ));
     }
 
     // ── M2.c: CREATE INDEX ───────────────────────────────────────────────────

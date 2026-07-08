@@ -94,6 +94,16 @@ pub fn exec_result_to_json(result: &ExecResult) -> Json {
                 .collect();
             obj.insert("rows".into(), Json::Array(json_rows));
         }
+        ExecResult::AlteredTable => {
+            obj.insert("type".into(), Json::String("altered_table".into()));
+        }
+        ExecResult::DroppedTable => {
+            obj.insert("type".into(), Json::String("dropped_table".into()));
+        }
+        ExecResult::Truncated { count } => {
+            obj.insert("type".into(), Json::String("truncated".into()));
+            obj.insert("count".into(), Json::Number(Number::from(*count)));
+        }
     }
     Json::Object(obj)
 }

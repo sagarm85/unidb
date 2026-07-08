@@ -6,8 +6,9 @@
 // is the actual point of this milestone, not parser plumbing.
 
 use sqlparser::ast::{
-    self, Array as SqlArray, BinaryOperator, DataType, ExactNumberInfo, Expr as SqlExpr, FromTable,
-    IndexType, SelectItem, SetExpr, Statement, TableFactor, TableObject, Value,
+    self, AlterTableOperation, Array as SqlArray, BinaryOperator, DataType, ExactNumberInfo,
+    Expr as SqlExpr, FromTable, IndexType, ObjectType, SelectItem, SetExpr, Statement, TableFactor,
+    TableObject, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser as SqlParser;
@@ -39,10 +40,88 @@ fn convert_statement(stmt: Statement) -> Result<LogicalPlan> {
         Statement::Update(u) => convert_update(u),
         Statement::Delete(d) => convert_delete(d),
         Statement::CreateIndex(ci) => convert_create_index(ci),
+        Statement::AlterTable(at) => convert_alter_table(at),
+        Statement::Drop {
+            object_type,
+            names,
+            if_exists,
+            ..
+        } => convert_drop(object_type, names, if_exists),
+        Statement::Truncate(t) => convert_truncate(t),
         other => Err(DbError::SqlUnsupported(format!(
             "unsupported statement: {other}"
         ))),
     }
+}
+
+/// `ALTER TABLE t <op>` (P2.c). Exactly one operation per statement in v1;
+/// only `ADD COLUMN` and `DROP COLUMN` are supported.
+fn convert_alter_table(at: ast::AlterTable) -> Result<LogicalPlan> {
+    let table = at.name.to_string();
+    if at.operations.len() != 1 {
+        return Err(DbError::SqlUnsupported(
+            "ALTER TABLE supports exactly one operation per statement".into(),
+        ));
+    }
+    match at.operations.into_iter().next().expect("len checked") {
+        AlterTableOperation::AddColumn { column_def, .. } => {
+            let column = convert_column_def(column_def)?;
+            Ok(LogicalPlan::AlterTableAddColumn { table, column })
+        }
+        AlterTableOperation::DropColumn {
+            column_names,
+            if_exists,
+            ..
+        } => {
+            if column_names.len() != 1 {
+                return Err(DbError::SqlUnsupported(
+                    "DROP COLUMN supports exactly one column per statement".into(),
+                ));
+            }
+            Ok(LogicalPlan::AlterTableDropColumn {
+                table,
+                column: column_names[0].value.clone(),
+                if_exists,
+            })
+        }
+        other => Err(DbError::SqlUnsupported(format!(
+            "unsupported ALTER TABLE operation: {other:?}"
+        ))),
+    }
+}
+
+/// `DROP TABLE [IF EXISTS] t` (P2.c). Only `TABLE`, exactly one name.
+fn convert_drop(
+    object_type: ObjectType,
+    names: Vec<ast::ObjectName>,
+    if_exists: bool,
+) -> Result<LogicalPlan> {
+    if object_type != ObjectType::Table {
+        return Err(DbError::SqlUnsupported(format!(
+            "DROP {object_type:?} is not supported (only DROP TABLE)"
+        )));
+    }
+    if names.len() != 1 {
+        return Err(DbError::SqlUnsupported(
+            "DROP TABLE supports exactly one table per statement".into(),
+        ));
+    }
+    Ok(LogicalPlan::DropTable {
+        table: names[0].to_string(),
+        if_exists,
+    })
+}
+
+/// `TRUNCATE [TABLE] t` (P2.c). Exactly one table.
+fn convert_truncate(t: ast::Truncate) -> Result<LogicalPlan> {
+    if t.table_names.len() != 1 {
+        return Err(DbError::SqlUnsupported(
+            "TRUNCATE supports exactly one table per statement".into(),
+        ));
+    }
+    Ok(LogicalPlan::Truncate {
+        table: t.table_names[0].name.to_string(),
+    })
 }
 
 fn convert_create_table(ct: ast::CreateTable) -> Result<LogicalPlan> {
@@ -99,6 +178,7 @@ fn convert_column_def(c: ast::ColumnDef) -> Result<ColumnDef> {
         name: c.name.value,
         ty: convert_data_type(&c.data_type)?,
         index: None,
+        dropped: false,
         constraints: cons,
     })
 }
@@ -756,6 +836,51 @@ mod tests {
             }
             _ => panic!("expected CreateTable"),
         }
+    }
+
+    #[test]
+    fn parses_alter_add_and_drop_column() {
+        match parse_one("ALTER TABLE t ADD COLUMN c TEXT DEFAULT 'x'") {
+            LogicalPlan::AlterTableAddColumn { table, column } => {
+                assert_eq!(table, "t");
+                assert_eq!(column.name, "c");
+                assert_eq!(column.ty, ColumnType::Text);
+                assert_eq!(column.constraints.default, Some(Literal::Text("x".into())));
+            }
+            other => panic!("expected AlterTableAddColumn, got {other:?}"),
+        }
+        match parse_one("ALTER TABLE t DROP COLUMN IF EXISTS c") {
+            LogicalPlan::AlterTableDropColumn {
+                table,
+                column,
+                if_exists,
+            } => {
+                assert_eq!(table, "t");
+                assert_eq!(column, "c");
+                assert!(if_exists);
+            }
+            other => panic!("expected AlterTableDropColumn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_drop_table_and_truncate() {
+        match parse_one("DROP TABLE IF EXISTS t") {
+            LogicalPlan::DropTable { table, if_exists } => {
+                assert_eq!(table, "t");
+                assert!(if_exists);
+            }
+            other => panic!("expected DropTable, got {other:?}"),
+        }
+        match parse_one("TRUNCATE TABLE t") {
+            LogicalPlan::Truncate { table } => assert_eq!(table, "t"),
+            other => panic!("expected Truncate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_drop_non_table_object() {
+        assert!(parse_sql("DROP SCHEMA s").is_err());
     }
 
     #[test]

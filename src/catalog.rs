@@ -158,6 +158,14 @@ pub struct ColumnDef {
     pub index: Option<IndexKind>,
     #[serde(default)]
     pub constraints: ColumnConstraints,
+    /// Logically dropped by `ALTER TABLE DROP COLUMN` (P2.c). A dropped column
+    /// keeps its physical slot in the row layout (so rows written before the
+    /// drop still decode positionally) but is invisible to `SELECT *`, cannot
+    /// be referenced by name, and is always written as NULL on new inserts.
+    /// This is the standard "tombstone" approach (cf. Postgres
+    /// `pg_attribute.attisdropped`) — dropping a column never rewrites the heap.
+    #[serde(default)]
+    pub dropped: bool,
 }
 
 /// A table-level `FOREIGN KEY (cols) REFERENCES table(cols)` (M11). As with
@@ -350,6 +358,97 @@ impl Catalog {
         self.persist(ctx)
     }
 
+    /// `ALTER TABLE ADD COLUMN` (P2.c). The new column is appended physically
+    /// (so existing rows still decode positionally — they simply lack bytes for
+    /// it, and `decode_row` fills the DEFAULT/NULL). A `NOT NULL` column with no
+    /// `DEFAULT` is rejected: old rows can't satisfy it without a backfill,
+    /// which this tombstone-based scheme deliberately does not do.
+    pub fn add_column(&mut self, table: &str, col: ColumnDef, ctx: &mut CatalogCtx) -> Result<()> {
+        let t = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
+        if t.columns.iter().any(|c| !c.dropped && c.name == col.name) {
+            return Err(DbError::SqlPlan(format!(
+                "column '{}' already exists on table '{table}'",
+                col.name
+            )));
+        }
+        if (col.constraints.not_null || col.constraints.primary_key)
+            && col.constraints.default.is_none()
+        {
+            return Err(DbError::SqlPlan(format!(
+                "ADD COLUMN '{}' is NOT NULL but has no DEFAULT (existing rows would violate it)",
+                col.name
+            )));
+        }
+        t.columns.push(col);
+        self.persist(ctx)
+    }
+
+    /// `ALTER TABLE DROP COLUMN` (P2.c). Logical tombstone: the column keeps its
+    /// physical slot (so rows written before the drop still decode) but is
+    /// marked `dropped`, its constraints/index cleared. Dropping a column that
+    /// participates in a *table-level* constraint is rejected (drop the
+    /// constraint first); dropping the last visible column is rejected.
+    pub fn drop_column(&mut self, table: &str, column: &str, ctx: &mut CatalogCtx) -> Result<()> {
+        let t = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
+        let referenced = t.constraints.primary_key.iter().any(|c| c == column)
+            || t.constraints.unique.iter().flatten().any(|c| c == column)
+            || t.constraints
+                .foreign_keys
+                .iter()
+                .any(|fk| fk.columns.iter().any(|c| c == column));
+        if referenced {
+            return Err(DbError::SqlPlan(format!(
+                "cannot drop column '{column}': it participates in a table-level constraint"
+            )));
+        }
+        if t.columns.iter().filter(|c| !c.dropped).count() <= 1 {
+            return Err(DbError::SqlPlan(
+                "cannot drop the table's only remaining column".into(),
+            ));
+        }
+        let col = t
+            .columns
+            .iter_mut()
+            .find(|c| !c.dropped && c.name == column)
+            .ok_or_else(|| DbError::ColumnNotFound {
+                table: table.to_string(),
+                column: column.to_string(),
+            })?;
+        col.dropped = true;
+        col.index = None;
+        col.constraints = ColumnConstraints::default();
+        self.persist(ctx)
+    }
+
+    /// `DROP TABLE` (P2.c). Removes the table from the catalog. Its heap pages
+    /// are orphaned (reclaimed once Phase 1's free-space map / free-page list
+    /// lands — until then, dropped-table space is not reused, same accepted
+    /// tradeoff as pre-vacuum heap bloat).
+    pub fn drop_table(&mut self, table: &str, ctx: &mut CatalogCtx) -> Result<()> {
+        if self.tables.remove(table).is_none() {
+            return Err(DbError::TableNotFound(table.to_string()));
+        }
+        self.persist(ctx)
+    }
+
+    /// `TRUNCATE` (P2.c). Drops every row by clearing the table's page list; the
+    /// orphaned pages are reclaimed once Phase 1's FSM lands (as with
+    /// `DROP TABLE`). The schema (columns/constraints) is unchanged.
+    pub fn truncate(&mut self, table: &str, ctx: &mut CatalogCtx) -> Result<()> {
+        let t = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
+        t.pages.clear();
+        self.persist(ctx)
+    }
+
     fn persist(&self, ctx: &mut CatalogCtx) -> Result<()> {
         let encoded =
             serde_json::to_vec(&self.tables).map_err(|e| DbError::CatalogCorrupt(e.to_string()))?;
@@ -408,6 +507,7 @@ mod tests {
             columns: vec![ColumnDef {
                 name: "id".to_string(),
                 index: None,
+                dropped: false,
                 constraints: Default::default(),
                 ty: ColumnType::Int64,
             }],
@@ -464,12 +564,14 @@ mod tests {
                 ColumnDef {
                     name: "id".to_string(),
                     index: None,
+                    dropped: false,
                     constraints: Default::default(),
                     ty: ColumnType::Int64,
                 },
                 ColumnDef {
                     name: "data".to_string(),
                     index: None,
+                    dropped: false,
                     constraints: Default::default(),
                     ty: ColumnType::Json,
                 },
@@ -509,12 +611,14 @@ mod tests {
                     name: "id".to_string(),
                     ty: ColumnType::Int64,
                     index: None,
+                    dropped: false,
                     constraints: Default::default(),
                 },
                 ColumnDef {
                     name: "vec".to_string(),
                     ty: ColumnType::Vector(384),
                     index: Some(IndexKind::Hnsw),
+                    dropped: false,
                     constraints: Default::default(),
                 },
             ],

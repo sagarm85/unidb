@@ -302,6 +302,12 @@ impl Engine {
     pub fn execute_sql(&mut self, xid: Xid, sql: &str) -> Result<Vec<ExecResult>> {
         let page_size = self.control.page_size as usize;
         let plans = parse_sql(sql)?;
+        // Snapshot the catalog root so DDL (which the catalog persists
+        // immediately, not on user-txn commit) from earlier statements of a
+        // multi-statement request can be rolled back if a later one fails
+        // (P2.c). Heap writes are undone by the caller's transaction abort; the
+        // catalog, being non-MVCC, needs this explicit restore.
+        let saved_catalog_root = self.control.catalog_root;
         let mut results = Vec::with_capacity(plans.len());
         for plan in plans {
             let plan = apply_rls(plan, &cat_read(&self.catalog));
@@ -319,9 +325,35 @@ impl Engine {
                 index_worker: Some(&self.index_worker),
                 next_event_seq: &mut self.next_event_seq,
             };
-            results.push(executor::execute(plan, &mut ctx)?);
+            match executor::execute(plan, &mut ctx) {
+                Ok(result) => results.push(result),
+                Err(e) => {
+                    drop(catalog);
+                    self.restore_catalog_root(saved_catalog_root)?;
+                    return Err(e);
+                }
+            }
         }
         Ok(results)
+    }
+
+    /// Roll the catalog back to a previously captured root page (P2.c). Used by
+    /// `execute_sql` to undo DDL that earlier statements of a now-failed
+    /// multi-statement request already persisted: the catalog is not
+    /// user-transaction-scoped (a documented M1 limitation), so this manual
+    /// restore is what makes a failed request leave the schema untouched. It
+    /// rewrites the control file to the saved root and reloads the in-memory
+    /// catalog from it. (Crash-safe, user-txn-scoped catalog redo/undo through
+    /// recovery is a larger, Core-lane-coordinated follow-up — see PROGRESS.)
+    fn restore_catalog_root(&mut self, root: crate::format::PageId) -> Result<()> {
+        if self.control.catalog_root == root {
+            return Ok(());
+        }
+        self.control.catalog_root = root;
+        control::write(&self.control_path, &self.control)?;
+        let reloaded = Catalog::load(&self.control, &mut self.pool)?;
+        *cat_write(&self.catalog) = reloaded;
+        Ok(())
     }
 
     /// Parse and execute one Cypher query (M3.c): `MATCH (a)-[:TYPE]->(b)
@@ -1498,6 +1530,79 @@ mod tests {
         let xid3 = engine.begin().unwrap();
         let remaining = engine.execute_sql(xid3, "SELECT * FROM accounts").unwrap();
         assert!(matches!(&remaining[0], SqlResult::Rows(rows) if rows.len() == 1));
+    }
+
+    #[test]
+    fn failed_multi_statement_request_rolls_back_ddl() {
+        // P2.c: a `;`-separated request whose first statement is DDL and whose
+        // second statement fails must leave the schema untouched — the catalog
+        // change is rolled back even though the catalog persists eagerly.
+        let dir = tempdir().unwrap();
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        let res = engine.execute_sql(
+            xid,
+            "CREATE TABLE t (id INT); INSERT INTO missing_table (id) VALUES (1)",
+        );
+        assert!(res.is_err());
+        engine.abort(xid).unwrap();
+
+        // `t` must not exist — the CREATE TABLE was rolled back.
+        let xid2 = engine.begin().unwrap();
+        assert!(matches!(
+            engine.execute_sql(xid2, "SELECT * FROM t"),
+            Err(DbError::TableNotFound(_))
+        ));
+        engine.abort(xid2).unwrap();
+
+        // And the catalog is still usable afterwards.
+        let xid3 = engine.begin().unwrap();
+        engine
+            .execute_sql(xid3, "CREATE TABLE ok (id INT)")
+            .unwrap();
+        engine.commit(xid3).unwrap();
+    }
+
+    #[test]
+    fn alter_and_drop_survive_reopen() {
+        // P2.c: schema changes persist across an engine reopen.
+        let dir = tempdir().unwrap();
+        {
+            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let xid = engine.begin().unwrap();
+            engine
+                .execute_sql(xid, "CREATE TABLE t (a INT, b INT)")
+                .unwrap();
+            engine
+                .execute_sql(xid, "INSERT INTO t (a, b) VALUES (1, 2)")
+                .unwrap();
+            engine
+                .execute_sql(xid, "ALTER TABLE t ADD COLUMN c TEXT DEFAULT 'x'")
+                .unwrap();
+            engine
+                .execute_sql(xid, "ALTER TABLE t DROP COLUMN b")
+                .unwrap();
+            engine.commit(xid).unwrap();
+            engine.checkpoint().unwrap();
+        }
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        let rows = engine.execute_sql(xid, "SELECT a, c FROM t").unwrap();
+        match &rows[0] {
+            SqlResult::Rows(r) => assert_eq!(
+                r,
+                &vec![vec![
+                    crate::sql::logical::Literal::Int(1),
+                    crate::sql::logical::Literal::Text("x".to_string())
+                ]]
+            ),
+            other => panic!("expected Rows, got {other:?}"),
+        }
+        // Dropped column stays gone after reopen.
+        assert!(matches!(
+            engine.execute_sql(xid, "SELECT b FROM t"),
+            Err(DbError::ColumnNotFound { .. })
+        ));
     }
 
     // ── M2.a: VECTOR(n) end-to-end ──────────────────────────────────────────

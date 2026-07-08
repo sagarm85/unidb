@@ -153,6 +153,18 @@ pub enum LogicalPlan {
         column: String,
         kind: IndexKind,
     },
+    /// `ALTER TABLE t ADD COLUMN c <type> [constraints]` (P2.c).
+    AlterTableAddColumn { table: String, column: ColumnDef },
+    /// `ALTER TABLE t DROP COLUMN [IF EXISTS] c` (P2.c).
+    AlterTableDropColumn {
+        table: String,
+        column: String,
+        if_exists: bool,
+    },
+    /// `DROP TABLE [IF EXISTS] t` (P2.c).
+    DropTable { table: String, if_exists: bool },
+    /// `TRUNCATE [TABLE] t` (P2.c).
+    Truncate { table: String },
 }
 
 /// AND the table's RLS policy (if any) into the plan's predicate. This is
@@ -190,7 +202,11 @@ pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog) -> LogicalPlan {
         }
         other @ (LogicalPlan::CreateTable { .. }
         | LogicalPlan::Insert { .. }
-        | LogicalPlan::CreateIndex { .. }) => other,
+        | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::AlterTableAddColumn { .. }
+        | LogicalPlan::AlterTableDropColumn { .. }
+        | LogicalPlan::DropTable { .. }
+        | LogicalPlan::Truncate { .. }) => other,
     }
 }
 
@@ -222,6 +238,7 @@ mod tests {
             columns: vec![ColumnDef {
                 name: "id".to_string(),
                 index: None,
+                dropped: false,
                 ty: ColumnType::Int64,
                 constraints: Default::default(),
             }],
