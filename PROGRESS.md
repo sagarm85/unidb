@@ -1675,7 +1675,7 @@ No format change (`FORMAT_VERSION` unchanged — no on-disk layout touched).
 
 ### P1.c — alloc_page remap fix + configurable buffer pool + real FSM   [shipped]   2026-07-08
 
-**PR:** _(pending — Core lane, branch `acid-hardening`)_
+**PR:** #8 — https://github.com/sagarm85/unidb/pull/8 (Core lane, branch `acid-hardening`)
 **Summary:** Removes the growth blocker (roadmap Tier 3, "`alloc_page` re-maps
 the whole file per page"). Three changes: (1) the page file now grows in **4 MiB
 chunks**, re-creating the mmap only when a new page crosses the chunk boundary,
