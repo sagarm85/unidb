@@ -1658,6 +1658,14 @@ pub fn encode_row(values: &[Literal]) -> Vec<u8> {
                 buf.push(12);
                 buf.extend_from_slice(&micros.to_le_bytes());
             }
+            // Unreachable: `bind_params` (P2.e) replaces every placeholder with
+            // a concrete value, and `coerce_value` would reject any leftover
+            // `Param` long before encoding. Encoded as NULL as a benign
+            // no-panic fallback for the theoretically-impossible case.
+            Literal::Param(_) => {
+                debug_assert!(false, "unbound bind parameter reached encode_row");
+                buf.push(0);
+            }
         }
     }
     buf

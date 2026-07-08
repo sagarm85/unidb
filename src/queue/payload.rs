@@ -46,6 +46,9 @@ pub fn row_to_json(row: &[Literal], columns: &[ColumnDef]) -> JsonValue {
             Literal::Bytea(b) => JsonValue::String(crate::sql::executor::format_bytea(b)),
             Literal::Date(d) => JsonValue::String(crate::sql::datetime::format_date(*d)),
             Literal::Time(t) => JsonValue::String(crate::sql::datetime::format_time(*t)),
+            // Bind placeholders are substituted before execution (P2.e); a
+            // stored row can never contain one.
+            Literal::Param(_) => JsonValue::Null,
         };
         map.insert(col.name.clone(), json_val);
     }

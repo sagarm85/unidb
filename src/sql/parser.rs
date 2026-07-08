@@ -508,10 +508,28 @@ fn convert_value(v: &Value) -> Result<Literal> {
         Value::SingleQuotedString(s) => Ok(Literal::Text(s.clone())),
         Value::Boolean(b) => Ok(Literal::Bool(*b)),
         Value::Null => Ok(Literal::Null),
+        // `$n` bind parameter (P2.e): carried through as a placeholder and
+        // substituted by `bind_params` before execution.
+        Value::Placeholder(p) => parse_placeholder(p),
         other => Err(DbError::SqlUnsupported(format!(
             "unsupported literal: {other:?}"
         ))),
     }
+}
+
+/// Parse a `$n` placeholder into a 1-based [`Literal::Param`] (P2.e). Only the
+/// `$n` form is supported (not `?` positional or `:name`).
+fn parse_placeholder(p: &str) -> Result<Literal> {
+    let n = p
+        .strip_prefix('$')
+        .and_then(|d| d.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .ok_or_else(|| {
+            DbError::SqlUnsupported(format!(
+                "unsupported bind parameter '{p}' (use $1, $2, ...)"
+            ))
+        })?;
+    Ok(Literal::Param(n))
 }
 
 /// A bare numeric literal. Integers stay [`Literal::Int`]; anything with a
@@ -856,6 +874,25 @@ mod tests {
                 assert_eq!(columns[0].ty, ColumnType::Timestamp);
             }
             _ => panic!("expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn parses_bind_placeholders() {
+        match parse_one("SELECT * FROM t WHERE id = $1") {
+            LogicalPlan::Select { predicate, .. } => match predicate {
+                Some(Expr::BinOp { rhs, .. }) => {
+                    assert_eq!(*rhs, Expr::Literal(Literal::Param(1)));
+                }
+                other => panic!("expected BinOp, got {other:?}"),
+            },
+            other => panic!("expected Select, got {other:?}"),
+        }
+        match parse_one("INSERT INTO t (a, b) VALUES ($1, $2)") {
+            LogicalPlan::Insert { values, .. } => {
+                assert_eq!(values, vec![vec![Literal::Param(1), Literal::Param(2)]]);
+            }
+            other => panic!("expected Insert, got {other:?}"),
         }
     }
 

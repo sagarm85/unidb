@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::{Catalog, ColumnDef, IndexKind, TableConstraints};
+use crate::error::{DbError, Result};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Literal {
@@ -47,7 +48,81 @@ pub enum Literal {
     Date(i32),
     /// Time of day as micros since midnight (P2.b). Arrives as text.
     Time(i64),
+    /// A `$n` bind-parameter placeholder (P2.e), 1-based. Produced by the
+    /// parser; every occurrence is replaced with the caller-supplied value by
+    /// [`bind_params`] *before* the plan reaches the executor — a `Param` never
+    /// survives into encoding, comparison, or the wire. This is what makes
+    /// parameterized queries injection-proof: the value is always data, never
+    /// re-parsed as SQL.
+    Param(usize),
     Null,
+}
+
+/// Substitute every `$n` placeholder in `plan` with the corresponding value
+/// from `params` (1-based: `$1` -> `params[0]`) (P2.e). Errors on an
+/// out-of-range index. After this runs, no [`Literal::Param`] remains, so the
+/// executor only ever sees concrete values.
+pub fn bind_params(plan: &mut LogicalPlan, params: &[Literal]) -> Result<()> {
+    match plan {
+        LogicalPlan::Insert { values, .. } => {
+            for row in values {
+                for lit in row {
+                    bind_literal(lit, params)?;
+                }
+            }
+        }
+        LogicalPlan::Update {
+            assignments,
+            predicate,
+            ..
+        } => {
+            for (_, expr) in assignments {
+                bind_expr(expr, params)?;
+            }
+            if let Some(expr) = predicate {
+                bind_expr(expr, params)?;
+            }
+        }
+        LogicalPlan::Select { predicate, .. } | LogicalPlan::Delete { predicate, .. } => {
+            if let Some(expr) = predicate {
+                bind_expr(expr, params)?;
+            }
+        }
+        // DDL / CREATE INDEX carry no bind parameters.
+        LogicalPlan::CreateTable { .. }
+        | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::AlterTableAddColumn { .. }
+        | LogicalPlan::AlterTableDropColumn { .. }
+        | LogicalPlan::DropTable { .. }
+        | LogicalPlan::Truncate { .. } => {}
+    }
+    Ok(())
+}
+
+fn bind_literal(lit: &mut Literal, params: &[Literal]) -> Result<()> {
+    if let Literal::Param(n) = *lit {
+        *lit = params.get(n - 1).cloned().ok_or_else(|| {
+            DbError::SqlPlan(format!(
+                "bind parameter ${n} has no value ({} supplied)",
+                params.len()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn bind_expr(expr: &mut Expr, params: &[Literal]) -> Result<()> {
+    match expr {
+        Expr::Literal(lit) => bind_literal(lit, params),
+        Expr::BinOp { lhs, rhs, .. } | Expr::And(lhs, rhs) => {
+            bind_expr(lhs, params)?;
+            bind_expr(rhs, params)
+        }
+        Expr::JsonExtract { expr, .. } | Expr::JsonExtractText { expr, .. } => {
+            bind_expr(expr, params)
+        }
+        Expr::Column(_) | Expr::Near { .. } => Ok(()),
+    }
 }
 
 /// Render an exact decimal `(unscaled_value, scale)` as canonical decimal
@@ -313,6 +388,39 @@ mod tests {
             LogicalPlan::Select { predicate, .. } => assert_eq!(predicate, None),
             _ => panic!("expected Select"),
         }
+    }
+
+    #[test]
+    fn bind_params_substitutes_placeholders_in_predicate() {
+        let mut plan = LogicalPlan::Select {
+            table: "t".to_string(),
+            projection: vec![],
+            predicate: Some(Expr::BinOp {
+                op: CmpOp::Eq,
+                lhs: Box::new(Expr::Column("id".to_string())),
+                rhs: Box::new(Expr::Literal(Literal::Param(1))),
+            }),
+        };
+        bind_params(&mut plan, &[Literal::Int(7)]).unwrap();
+        match plan {
+            LogicalPlan::Select { predicate, .. } => match predicate {
+                Some(Expr::BinOp { rhs, .. }) => {
+                    assert_eq!(*rhs, Expr::Literal(Literal::Int(7)));
+                }
+                _ => panic!("expected BinOp"),
+            },
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn bind_params_errors_on_missing_value() {
+        let mut plan = LogicalPlan::Insert {
+            table: "t".to_string(),
+            columns: None,
+            values: vec![vec![Literal::Param(2)]],
+        };
+        assert!(bind_params(&mut plan, &[Literal::Int(1)]).is_err());
     }
 
     #[test]

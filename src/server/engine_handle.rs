@@ -89,6 +89,13 @@ pub enum EngineRequest {
         sql: String,
         reply: oneshot::Sender<Result<Vec<ExecResult>>>,
     },
+    /// Parameterized SQL (`$n` + bound values) — the injection-safe path (P2.e).
+    ExecuteSqlParams {
+        xid: Xid,
+        sql: String,
+        params: Vec<crate::sql::logical::Literal>,
+        reply: oneshot::Sender<Result<Vec<ExecResult>>>,
+    },
     ExecuteCypher {
         xid: Xid,
         query: String,
@@ -271,6 +278,21 @@ impl EngineHandle {
     pub async fn execute_sql(&self, xid: Xid, sql: String) -> Result<Vec<ExecResult>> {
         self.dispatch(|reply| EngineRequest::ExecuteSql { xid, sql, reply })
             .await?
+    }
+
+    pub async fn execute_sql_params(
+        &self,
+        xid: Xid,
+        sql: String,
+        params: Vec<crate::sql::logical::Literal>,
+    ) -> Result<Vec<ExecResult>> {
+        self.dispatch(|reply| EngineRequest::ExecuteSqlParams {
+            xid,
+            sql,
+            params,
+            reply,
+        })
+        .await?
     }
 
     pub async fn execute_cypher(&self, xid: Xid, query: String) -> Result<Vec<ExecResult>> {
@@ -531,6 +553,14 @@ fn dispatch_immediate(engine: &mut Engine, req: EngineRequest) {
         }
         EngineRequest::ExecuteSql { xid, sql, reply } => {
             let _ = reply.send(engine.execute_sql(xid, &sql));
+        }
+        EngineRequest::ExecuteSqlParams {
+            xid,
+            sql,
+            params,
+            reply,
+        } => {
+            let _ = reply.send(engine.execute_sql_params(xid, &sql, &params));
         }
         EngineRequest::ExecuteCypher { xid, query, reply } => {
             let _ = reply.send(engine.execute_cypher(xid, &query));
