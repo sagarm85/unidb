@@ -1,6 +1,6 @@
 # Phase 4 — Query power (SQL lane)
 
-## Status as of 2026-07-08: NOT STARTED.
+## Status as of 2026-07-09: DONE (all checkpoints P4.a–P4.e shipped on branch `query-power`; see `PROGRESS.md`'s Phase 4 entry).
 
 Real SQL + a query brain. Companion to [`roadmap.md`](roadmap.md) §4. Runs in
 the **SQL lane after Phase 2** (types), and benefits from **Phase 3** durable

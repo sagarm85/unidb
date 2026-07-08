@@ -36,7 +36,11 @@ pub struct ColumnStats {
     pub bounds: Vec<Literal>,
 }
 
-const HISTOGRAM_BUCKETS: usize = 16;
+// Kept small so per-column stats stay compact: the whole catalog (all
+// TableDefs + all stats) is persisted as a single ~8 KiB page blob, so a wide
+// schema's histograms must not balloon it. 8 equi-depth buckets is ample for
+// range-selectivity estimation. (A multi-page catalog is tracked tech debt.)
+const HISTOGRAM_BUCKETS: usize = 8;
 
 /// Compute statistics for a table from its live rows (one `Vec<Literal>` per
 /// row, in declaration order including dropped columns as NULL slots).

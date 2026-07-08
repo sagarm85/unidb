@@ -49,6 +49,17 @@ fn convert_statement(stmt: Statement) -> Result<LogicalPlan> {
             ..
         } => convert_drop(object_type, names, if_exists),
         Statement::Truncate(t) => convert_truncate(t),
+        Statement::Explain {
+            analyze, statement, ..
+        } => match *statement {
+            Statement::Query(q) => Ok(LogicalPlan::Explain {
+                analyze,
+                spec: query_to_spec(*q)?,
+            }),
+            other => Err(DbError::SqlUnsupported(format!(
+                "EXPLAIN is only supported for SELECT queries in v1, got: {other}"
+            ))),
+        },
         Statement::Analyze(a) => {
             let table = a
                 .table_name

@@ -90,6 +90,7 @@ pub fn bind_params(plan: &mut LogicalPlan, params: &[Literal]) -> Result<()> {
             }
         }
         LogicalPlan::Query(spec) => spec.bind_params(params)?,
+        LogicalPlan::Explain { spec, .. } => spec.bind_params(params)?,
         // DDL / CREATE INDEX carry no bind parameters.
         LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateIndex { .. }
@@ -251,6 +252,9 @@ pub enum LogicalPlan {
     Truncate { table: String },
     /// `ANALYZE [TABLE] t` (P4.d): gather + persist optimizer statistics.
     Analyze { table: String },
+    /// `EXPLAIN [ANALYZE] <query>` (P4.e): show the chosen plan tree with
+    /// estimated rows/cost, and (with ANALYZE) the actual rows + execution time.
+    Explain { analyze: bool, spec: QuerySpec },
 }
 
 /// AND the table's RLS policy (if any) into the plan's predicate. This is
@@ -292,6 +296,11 @@ pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog) -> LogicalPlan {
             // to that relation. The executor never learns RLS exists.
             spec.apply_rls_from(&|table| policy_for(catalog, table));
             LogicalPlan::Query(spec)
+        }
+        LogicalPlan::Explain { analyze, mut spec } => {
+            // EXPLAIN shows the RLS-rewritten plan the query would actually run.
+            spec.apply_rls_from(&|table| policy_for(catalog, table));
+            LogicalPlan::Explain { analyze, spec }
         }
         other @ (LogicalPlan::CreateTable { .. }
         | LogicalPlan::Insert { .. }

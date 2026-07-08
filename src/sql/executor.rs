@@ -255,6 +255,9 @@ pub fn execute(plan: LogicalPlan, ctx: &mut ExecCtx) -> Result<ExecResult> {
         LogicalPlan::DropTable { table, if_exists } => exec_drop_table(&table, if_exists, ctx),
         LogicalPlan::Truncate { table } => exec_truncate(&table, ctx),
         LogicalPlan::Analyze { table } => exec_analyze(&table, ctx),
+        LogicalPlan::Explain { analyze, spec } => {
+            crate::sql::query_exec::exec_explain(&spec, analyze, ctx)
+        }
     }
 }
 

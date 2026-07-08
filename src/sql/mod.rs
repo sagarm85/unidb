@@ -1,6 +1,7 @@
 pub mod aggregate;
 pub mod datetime;
 pub mod executor;
+pub mod explain;
 pub mod join;
 pub mod logical;
 pub mod optimizer;

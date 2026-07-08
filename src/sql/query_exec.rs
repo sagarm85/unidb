@@ -43,6 +43,35 @@ pub fn exec_query(spec: &QuerySpec, ctx: &mut ExecCtx) -> Result<ExecResult> {
     Ok(ExecResult::Rows(batch.rows))
 }
 
+/// `EXPLAIN [ANALYZE]` (P4.e): render the chosen plan tree (estimated rows),
+/// and with `analyze` also run it and append actual rows + execution time. The
+/// result is one text column, one plan line per row.
+pub fn exec_explain(spec: &QuerySpec, analyze: bool, ctx: &mut ExecCtx) -> Result<ExecResult> {
+    let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+    let mut runner = Runner {
+        ctx,
+        snapshot,
+        cte_schemas: CteSchemas::new(),
+        cte_batches: HashMap::new(),
+        subquery_cache: HashMap::new(),
+    };
+    let node = runner.materialize_ctes_and_plan(spec)?;
+    let mut lines = crate::sql::explain::render_estimated(&node, runner.ctx.catalog);
+    if analyze {
+        let start = std::time::Instant::now();
+        let batch = runner.run(&node)?;
+        let elapsed = start.elapsed();
+        lines.push(format!("actual_rows={}", batch.rows.len()));
+        lines.push(format!(
+            "execution_time_ms={:.3}",
+            elapsed.as_secs_f64() * 1000.0
+        ));
+    }
+    Ok(ExecResult::Rows(
+        lines.into_iter().map(|l| vec![Literal::Text(l)]).collect(),
+    ))
+}
+
 struct Runner<'a, 'b> {
     ctx: &'a mut ExecCtx<'b>,
     snapshot: Snapshot,

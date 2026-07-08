@@ -111,6 +111,10 @@ name = "server"
 harness = false
 required-features = ["server"]
 
+[[bench]]
+name = "tpch"
+harness = false
+
 # M5.d: server integration tests, gated the same way as the unidb-server
 # binary — `tests/server_common/mod.rs` is a shared helper module, not its
 # own test binary (Cargo doesn't auto-discover files in tests/ subdirectories).

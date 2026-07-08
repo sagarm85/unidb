@@ -126,19 +126,24 @@
   plan); the older per-milestone backlog docs were retired. A CSR-preferring
   traversal fix (staleness/generation marker design) remains documented tech
   debt below — deliberately not attempted as part of the M7 bug fix.
-- **Immediate next task (SQL lane): Phase 2 is COMPLETE (P2.a–P2.e all shipped
-  on branch `sql-types`, 2026-07-08).** Next standing item per the roadmap is
-  **Phase 4 (query power: joins, aggregates, GROUP BY/ORDER BY, cost-based
-  optimizer, EXPLAIN)** — the other SQL-lane phase — while the Core lane
-  continues Phase 1 and Phase 3 (durable indexes + big-file) awaits a lane. The
-  SQL lane delivered the full Phase 2 real-data-model set: P2.a
-  DECIMAL+TIMESTAMP, P2.b FLOAT/UUID/BYTEA/DATE/TIME, P2.c ALTER/DROP/TRUNCATE
-  + request-level DDL rollback, P2.d sequences/SERIAL, P2.e prepared statements
-  + bind params (injection surface closed). Dated subsections below; full
-  entries in `PROGRESS.md`. A CSR-preferring traversal fix (staleness/generation
-  marker design) is documented as known tech debt below but was deliberately
-  not attempted as part of the M7 bug fix — that's new design work, not a
-  regression fix.
+- **SQL lane: Phase 2 AND Phase 4 are both COMPLETE — the SQL-lane roadmap
+  items are fully delivered.** Phase 2 (P2.a–P2.e, branch `sql-types`,
+  2026-07-08): DECIMAL+TIMESTAMP, FLOAT/UUID/BYTEA/DATE/TIME, ALTER/DROP/TRUNCATE
+  + request-level DDL rollback, SERIAL, prepared statements + bind params
+  (injection surface closed). **Phase 4 (P4.a–P4.e, branch `query-power`,
+  2026-07-09): query power** — P4.a joins (hash + Grace spill / sort-merge /
+  index-nested-loop over the durable B-Tree), P4.b aggregates + GROUP BY/HAVING
+  + ORDER BY (external merge-sort spill) + DISTINCT + LIMIT/OFFSET, P4.c
+  scalar/IN/EXISTS subqueries (correlated + uncorrelated) + WITH CTEs, P4.d
+  ANALYZE (durable per-table statistics, never recomputed on open) + cost-based
+  optimizer (Selinger left-deep DP join order + index-vs-scan), P4.e
+  EXPLAIN/EXPLAIN ANALYZE. Correctness checked differentially against SQLite
+  (rusqlite dev-dep). Additive only (a trivial single-table SELECT keeps its
+  fast path; richer queries route through `LogicalPlan::Query`); no
+  `FORMAT_VERSION` bump, no new crash point. See the Phase 4 subsection below +
+  `PROGRESS.md`'s Phase 4 entry. A CSR-preferring traversal fix
+  (staleness/generation marker design) is documented as known tech debt below
+  but was deliberately not attempted as part of the M7 bug fix.
 - **In-flight performance work (branch `m9-group-commit`, 2026-07-08, not
   yet merged):** group commit + read-only fsync skip. The diagnosis (see
   `docs/performance/fssdb/`) was that the ~3–4 ms floor on every durable op
@@ -622,6 +627,67 @@ Fourth Phase 3 checkpoint. Full entry in `PROGRESS.md`'s P3.d section. Key point
   value; streaming REST upload/download routes (server-side streaming through
   the single writer thread needs a chunked-command path — real design work, not
   buffering a whole blob in the writer).
+
+### Phase 4 — query power (SQL lane, branch `query-power`, 2026-07-09)
+
+The SQL lane's second phase: real SQL over a physical operator tree. Full entry
++ TPC-H-subset benchmark in `PROGRESS.md`'s Phase 4 entry. What a future reader
+most needs:
+
+- **The load-bearing design decision: additive routing.** `LogicalPlan::Select`
+  is **unchanged** for the trivial single-table filter/project case (it still
+  feeds the concurrent-read fast path `plan_is_concurrent_read` and every pre-P4
+  test). Anything richer — a join, aggregate, GROUP BY, ORDER BY, DISTINCT,
+  LIMIT, subquery, IN-list, or CTE — the parser routes into a new
+  **`LogicalPlan::Query(QuerySpec)`** that a Phase-4 planner turns into a
+  physical `PlanNode` tree the executor runs. This is why the merge stayed clean
+  and the 258 pre-P4 tests never moved.
+- **A separate expression type `QExpr`** (qualified columns, OR/NOT/IS NULL,
+  aggregates, subqueries) lives beside the flat `Expr` rather than extending it,
+  so Phase-4 work only ever adds arms to its own matches — the battle-tested
+  single-table `Expr` (used by RLS, CHECK, DTOs) is untouched. RLS composes with
+  joins by AND-ing each base relation's policy into the query's residual filter,
+  qualified to that relation (`QuerySpec::apply_rls_from`) — the executor still
+  never learns RLS exists.
+- **New modules (all SQL-lane, additive):** `sql/query.rs` (QuerySpec/QExpr),
+  `sql/plan.rs` (PlanNode tree + planner + QExpr eval, reusing
+  `executor::compare`), `sql/join.rs` (hash join w/ Grace spill-to-disk,
+  sort-merge, block nested-loop), `sql/query_exec.rs` (the driver: base scans +
+  index-nested-loop probe the durable B-Tree; a Runner materializes CTEs once
+  and executes correlated subqueries per outer row via literal substitution,
+  caching uncorrelated ones), `sql/aggregate.rs` (hash aggregation, SQLite-
+  compatible result typing), `sql/sort.rs` (in-memory + external merge sort),
+  `sql/optimizer.rs` (ANALYZE-driven cost model + Selinger DP join order +
+  index-vs-scan), `sql/statistics.rs`, `sql/explain.rs`.
+- **P4.d statistics are durable and never recomputed on open.** `ANALYZE
+  <table>` scans + computes `TableStats` (row count, per-column distinct/null/
+  min/max/equi-depth-histogram) stored in a **`Catalog`-side map**, not on
+  `TableDef` — a deliberate choice so adding stats touched only `catalog.rs`, no
+  storage-core (`large_object.rs` is off-limits) or other-lane `TableDef`
+  constructor. Persisted via the catalog's existing WAL-logged page write, with
+  a **backward-compatible catalog blob** (`{tables, stats}`; old bare-map
+  catalogs still load). The optimizer **engages only when every base relation is
+  an ANALYZEd plain table and the join tree is inner/cross-only** — otherwise it
+  falls back to the rule-based `plan_from` (which keeps P4.a's index-nested-loop
+  join). So an un-ANALYZEd query behaves exactly as before P4.d.
+- **Correctness is differential vs SQLite** (rusqlite `bundled`, a **dev-dep
+  only** — the sync invariant `cargo tree -p unidb --no-default-features
+  --edges normal` still has no tokio/reqwest/axum). `tests/{join,aggregate,
+  subquery,optimizer}.rs` compare result multisets/ordered rows against SQLite
+  on shared data; `tests/explain.rs` asserts the plan reflects the chosen
+  operators (incl. the index-vs-scan crossover). Unit tests in `sql/optimizer.rs`
+  assert IndexScan-vs-Scan selection directly.
+- **No `FORMAT_VERSION` bump, no new crash point** — Phase 4 added no new
+  storage mechanism (stats ride the existing catalog page; joins/aggregates are
+  read-side). Crash harness stays **19**.
+- **Known limits (documented, not silent):** no window functions / recursive
+  CTEs / FULL OUTER + USING + NATURAL joins; ORDER BY resolves an output-column
+  name or 1-based position (not arbitrary expressions) in v1; join keys are
+  compared by exact encoding (declare matching key types for cross-type numeric
+  joins); the optimizer emits hash joins for reordered joins (INLJ comes from
+  the rule-based path); and **the catalog is still a single ~8 KiB page blob**,
+  so a very wide ANALYZEd schema can overflow it — a multi-page catalog is
+  tracked tech debt (histogram buckets were kept at 8 to reduce the pressure).
 
 ### Design note: xid reuse after checkpoint — a real M1-era bug, found and fixed during M5
 
