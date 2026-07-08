@@ -38,7 +38,7 @@
 | M11 | SQL constraints (PK / FK / UNIQUE / NOT NULL / CHECK / DEFAULT) |
 | **Phase 1** | **ACID hardening (complete):** full-page-writes (torn-page) · fsync-failure handling · `alloc_page` chunked growth + configurable pool + real FSM · isolation correctness (RC re-eval + SSI) · auto-checkpoint |
 | **Phase 2** | **Real data model (complete):** DECIMAL/TIMESTAMP/FLOAT/UUID/BYTEA/DATE/TIME · ALTER/DROP/TRUNCATE + request-level DDL rollback · SERIAL · prepared statements + `$n` bind params |
-| **Phase 3** | **Multi-model durable storage (in progress):** P3.a durable B-Tree · P3.b durable full-text + edge index (CSR retired) — both shipped (no rebuild on open). P3.c (on-disk vector), P3.d (large objects) pending. |
+| **Phase 3** | **Multi-model durable storage (in progress):** P3.a durable B-Tree · P3.b durable full-text + edge index (CSR retired) — shipped (no rebuild on open). P3.c on-disk vector — **spike complete** (IVF-Flat, recall@10=1.0 at nprobe=4; production PR pending). P3.d (large objects) in progress. |
 
 The core is architecturally correct — it is not a toy. But it is the **small
 version**; §3 is the honest gap to production.
@@ -181,6 +181,18 @@ status, same discipline as M10.
 ---
 
 ## 8. Decision & session log (newest first)
+
+### 2026-07-08 — Phase 3 P3.c (on-disk vector) spike complete
+- Spiked the durable on-disk vector index (blueprint mandates "spike first,
+  validate recall before committing"). **Chose on-disk IVF-Flat** for v1: its
+  cell posting lists are a durable `DiskBTree` (reuses P3.a), centroids in
+  bounded RAM; DiskANN/Vamana parked as a higher-recall option behind the same
+  interface. Recall validated (`benches/vector_recall.rs`): **recall@10 = 1.000
+  at nprobe=4** vs. ground truth, 4 KB RAM, 24 ms build (in-RAM HNSW: 30 s build
+  for 1,200 vectors). Spike surfaced + fixed a real `DiskBTree` duplicate-key bug
+  (a run straddling a leaf boundary under-returned) that affected P3.a/P3.b too.
+  Prototype `src/disk_vector.rs`; findings `docs/design/p3c_vector_spike.md`.
+  **Production wiring is a follow-up PR** (not rushed, per the blueprint).
 
 ### 2026-07-08 — Phase 3 P3.b (durable full-text + edge index; CSR retired) shipped
 - Full-text (inverted) and the edge-adjacency index (`__edges__.from_id`) are

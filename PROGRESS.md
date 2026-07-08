@@ -2291,3 +2291,57 @@ vector kind. All default-feature + server + workspace suites green; clippy
 **Locked-decision impact:** none new beyond P3.a (same `WAL_INDEX`/D5/D9). No
 `FORMAT_VERSION` bump. No decision reversed (CSR retirement is not a §3 item).
 **PR:** _pending._
+
+---
+
+### P3.c — On-disk vector index (SPIKE)   [Core lane — Phase 3 — spike complete]   2026-07-08
+
+**Branch:** `durable-storage`. The blueprint marks this **research-grade** and
+mandates a **spike that validates recall@k before committing** — so the P3.c
+deliverable is the spike + recommendation; the production wiring is a separate
+follow-up PR, deliberately not rushed.
+
+**Approach chosen: on-disk IVF-Flat** (over DiskANN/Vamana for v1). The insight:
+an IVF index's only on-disk state is a **cell posting list `cell_id → [RowId]`**,
+which is *exactly* a `DiskBTree` (P3.a) — so it is already durable, WAL-logged,
+crash-recovered, buffer-pool-managed, and vacuum-scrubbable, with **no new
+storage format**. The only new in-RAM state is the centroid table (`nlist·dim`
+f32s — **bounded, independent of corpus size**, vs. HNSW's O(corpus) graph).
+Vectors stay in the heap (IVF-Flat re-ranks with exact distances). DiskANN is
+parked as a higher-recall option behind the same interface. Prototype:
+`src/disk_vector.rs` (`DiskIvfIndex`: k-means `train`, `insert`, `search`).
+
+**Recall validated (`benches/vector_recall.rs`)** — 1,200 vecs × 32d, 30
+clusters, 100 queries, k=10, nlist=32, brute-force ground truth:
+
+| index | recall@10 | q-latency | build | RAM |
+|---|---|---|---|---|
+| HNSW (in-RAM, rebuilt-on-open) | 1.000 | ~26 µs | **30,223 ms** | O(corpus) |
+| IVF-Flat `nprobe=1` | 0.957 | 8 µs | 24 ms | **4,096 B** |
+| IVF-Flat `nprobe=4` | **1.000** | 31 µs | 24 ms | 4,096 B |
+| IVF-Flat `nprobe=8/16/32` | 1.000 | 59/113/216 µs | 24 ms | 4,096 B |
+
+IVF-Flat reaches exact top-10 at `nprobe=4` (a few of 32 cells) at 4 KB RAM; the
+HNSW *build* took 30 s for 1,200 vectors (the M2 rebuild-per-upsert pathology —
+exactly the O(corpus)-on-open cost Phase 3 kills).
+
+**Bug found + fixed by the spike (affects P3.a/P3.b):** an early run capped IVF
+recall at 0.912 even probing all cells — a real `DiskBTree` bug where a
+duplicate-key run **straddling a leaf boundary** was under-returned (`search_eq`
+could land mid-run and stop early). Fixed: `find_leaf` now descends to the
+**leftmost** candidate leaf and `search_eq`/`remove` walk the leaf links until
+they pass the key. Regression:
+`btree_index::heavily_duplicated_key_spanning_leaves_returns_all` (a key with
+3,000 duplicates spanning ~7 leaves). This mattered for real workloads: a
+full-text token in many docs, a graph hub, or a BTree value on many rows.
+
+**Production follow-up (its own PR):** persist centroids in a meta page +
+re-train as a maintenance op; wire `CREATE INDEX ... USING HNSW`/`IVF` →
+`DiskIvfIndex`, route `NEAR` through it, retire the async worker; crash point
+P16; larger-corpus sweep. Recommendation + numbers: `docs/design/p3c_vector_spike.md`.
+
+**Tests:** `disk_vector` module (IVF finds nearest on separated clusters; RAM
+bounded by nlist not corpus) + the DiskBTree duplicate regression. All suites
+green; clippy `-D warnings` + fmt clean.
+**Locked-decision impact:** none. No `FORMAT_VERSION` bump.
+**PR:** _pending (spike; production PR is the follow-up)._

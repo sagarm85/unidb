@@ -44,6 +44,9 @@ pub mod checkpoint;
 pub mod concurrency_hooks;
 pub mod control;
 pub mod csr_index;
+/// P3.c spike — on-disk IVF-Flat vector index (recall validation, not yet wired
+/// into the Engine). See the module doc and `docs/design/p3c_vector_spike.md`.
+pub mod disk_vector;
 pub mod error;
 pub mod format;
 pub mod fulltext;

@@ -16,7 +16,16 @@
   revert, and adjacency is now served durably by the edge index. The async
   worker now serves only the vector (Hnsw) index. New Rust-API read path
   `Engine::search_fulltext`. Crash harness 15 → 17 (P14 full-text, P15 edge).
-- P3.c (on-disk vector), P3.d (large objects): not started.
+- **P3.c — On-disk vector index: SPIKE COMPLETE** (`docs/design/p3c_vector_spike.md`).
+  Prototyped **on-disk IVF-Flat** (`src/disk_vector.rs`) — cell posting lists are
+  a durable `DiskBTree` (reuses P3.a), centroids in bounded RAM. Recall validated
+  (`benches/vector_recall.rs`): **recall@10 = 1.000 at nprobe=4** vs. brute-force
+  ground truth, 4 KB RAM, 24 ms build — vs. the in-RAM HNSW's 30 s build for 1,200
+  vectors. **The spike also found + fixed a real `DiskBTree` duplicate-key bug**
+  (a run straddling a leaf boundary under-returned) affecting P3.a/P3.b.
+  Production wiring (CREATE INDEX → durable, NEAR reads it, crash point, centroid
+  persistence) is the follow-up PR — deliberately not rushed per the blueprint.
+- P3.d (large objects): in progress.
 
 Kills rebuild-on-open + the RAM ceiling, and owns the AI/big-file story
 Postgres doesn't have. Companion to [`roadmap.md`](roadmap.md) §4. **Depends on
@@ -81,15 +90,23 @@ which is the differentiator.
   unchanged. `search_fulltext` unit tests. `benches/durable_index.rs` gains an
   edge-index reopen-cost table.
 
-### P3.c — Durable on-disk vector index (the frontier item)
-- HNSW (a RAM graph) doesn't page cleanly. Adopt an **on-disk ANN**: a
-  DiskANN/Vamana-style on-disk graph with PQ-compressed vectors in RAM for
-  routing, or an on-disk IVF. Bounded RAM, no full rebuild, crash-safe.
-- **Start with a spike** to choose the approach and validate recall before
-  committing — this is the hardest, possibly research-grade piece.
-- Files: `vector.rs` rewrite / new `disk_vector` module.
-- Tests: recall@k vs. the current HNSW baseline; RAM bounded under a large
-  corpus; O(1) open; crash-safe.
+### P3.c — Durable on-disk vector index — SPIKE COMPLETE (2026-07-08); production PR is the follow-up
+- **Spike done.** Chose **on-disk IVF-Flat** over DiskANN/Vamana for v1: its only
+  on-disk state is a cell posting list (`cell_id → [RowId]`), which is exactly a
+  `DiskBTree` (P3.a) — so it is already durable, WAL-logged, crash-recovered, and
+  bounded-RAM (just the centroid table), with no new storage format. DiskANN is
+  parked as a higher-recall option behind the same interface. Full rationale +
+  numbers: `docs/design/p3c_vector_spike.md`.
+- **Recall validated** (`benches/vector_recall.rs`): recall@10 reaches **1.000 at
+  nprobe=4** vs. brute-force ground truth, at 4 KB RAM / 24 ms build; the in-RAM
+  HNSW baseline took 30 s to build 1,200 vectors (the rebuild-per-upsert
+  pathology Phase 3 kills). The spike also surfaced + fixed a real `DiskBTree`
+  duplicate-key-spanning-leaves bug (regression-tested).
+- Files: `src/disk_vector.rs` (spike prototype), `benches/vector_recall.rs`,
+  `docs/design/p3c_vector_spike.md`.
+- **Production follow-up (its own PR):** persist centroids in a meta page; wire
+  `CREATE INDEX ... USING HNSW`/`IVF` → `DiskIvfIndex`, route `NEAR` through it,
+  retire the async worker; crash point P16; larger-corpus recall/latency sweep.
 
 ### P3.d — Big-file / large-object storage (the "big file" differentiator)
 - Values above a threshold stored **out-of-line** (TOAST-like): chunked into

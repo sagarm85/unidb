@@ -393,7 +393,15 @@ impl DiskBTree {
         }
     }
 
-    /// Descend to the leaf that would hold `key`, following internal separators.
+    /// Descend to the **leftmost** leaf that could contain `key`, following
+    /// internal separators. Routing goes left on `key <= separator` (not `<`):
+    /// a separator is the first key of its right subtree, so when `key` equals a
+    /// separator the *first* occurrence of `key` may be an earlier duplicate in
+    /// the left subtree. Reads then walk rightward via the leaf links from here,
+    /// so a duplicate run straddling any number of leaf boundaries is fully
+    /// collected. (The insert path has its own routing — it deliberately keeps
+    /// `<` so new duplicates append after existing ones; only reads need the
+    /// leftmost leaf.)
     fn find_leaf(&self, key: &OrderedValue, pool: &mut BufferPool) -> Result<PageId> {
         let mut pid = self.root_page(pool)?;
         loop {
@@ -403,10 +411,9 @@ impl DiskBTree {
             match node {
                 Node::Leaf { .. } => return Ok(pid),
                 Node::Internal { keys, children } => {
-                    // Descend into child i where keys[i-1] <= key < keys[i].
                     let mut idx = keys.len();
                     for (i, k) in keys.iter().enumerate() {
-                        if key < k {
+                        if key <= k {
                             idx = i;
                             break;
                         }
@@ -417,8 +424,14 @@ impl DiskBTree {
         }
     }
 
-    /// Exact-match candidates. Walks right across leaves in case a key's
-    /// duplicates straddle a leaf boundary.
+    /// Exact-match candidates. Starts at the leftmost leaf that could contain
+    /// `value` (see [`Self::find_leaf`]) and walks rightward across the leaf
+    /// links, collecting every `== value` entry, until it sees a key strictly
+    /// greater than `value` (the run is over) or runs off the end. This is
+    /// robust to a duplicate run straddling any number of leaf boundaries — the
+    /// case that previously under-returned when a heavily-duplicated key (a
+    /// full-text token in many docs, a graph hub, a BTree value on many rows)
+    /// spanned a leaf split.
     pub fn search_eq(&self, value: &OrderedValue, pool: &mut BufferPool) -> Result<Vec<RowId>> {
         let mut pid = self.find_leaf(value, pool)?;
         let mut out = Vec::new();
@@ -440,13 +453,10 @@ impl DiskBTree {
                     }
                 }
             }
-            // Only continue to the next leaf if this leaf ended exactly at the
-            // matching key (a duplicate run may spill over).
+            // Continue to the next leaf unless we've passed `value` (a key
+            // greater than it appeared) — the run may span leaves, and starting
+            // leaf may even be entirely `< value` if `find_leaf` landed early.
             if past || next == INVALID_PAGE_ID {
-                break;
-            }
-            let ended_on_match = entries.last().map(|(k, _)| k == value).unwrap_or(false);
-            if !ended_on_match {
                 break;
             }
             pid = next;
@@ -682,23 +692,32 @@ impl DiskBTree {
         pool: &mut BufferPool,
         wal: &mut Wal,
     ) -> Result<()> {
-        let pid = self.find_leaf(value, pool)?;
-        let page = pool.fetch_page(pid)?;
-        let node = Node::deserialize(&page)?;
-        pool.unpin(pid);
-        let Node::Leaf { mut entries, next } = node else {
-            return Ok(());
-        };
-        let before = entries.len();
-        entries.retain(|(k, r)| !(k == value && *r == rid));
-        if entries.len() == before {
-            return Ok(()); // nothing removed
+        // Walk leaves rightward from the leftmost candidate leaf (a duplicate
+        // run may span leaves, and `find_leaf` lands at-or-before the run's
+        // start), stopping once we pass `value`.
+        let mut pid = self.find_leaf(value, pool)?;
+        loop {
+            let page = pool.fetch_page(pid)?;
+            let node = Node::deserialize(&page)?;
+            pool.unpin(pid);
+            let Node::Leaf { mut entries, next } = node else {
+                return Ok(());
+            };
+            let past = entries.last().map(|(k, _)| k > value).unwrap_or(true);
+            let before = entries.len();
+            entries.retain(|(k, r)| !(k == value && *r == rid));
+            if entries.len() != before {
+                let leaf = Node::Leaf { entries, next };
+                let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
+                let lsn = write_node(pool, wal, txn_id, begin_lsn, pid, &leaf, self.page_size)?;
+                wal.commit_mini_txn(txn_id, lsn)?;
+                return Ok(());
+            }
+            if past || next == INVALID_PAGE_ID {
+                return Ok(()); // not present
+            }
+            pid = next;
         }
-        let leaf = Node::Leaf { entries, next };
-        let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
-        let lsn = write_node(pool, wal, txn_id, begin_lsn, pid, &leaf, self.page_size)?;
-        wal.commit_mini_txn(txn_id, lsn)?;
-        Ok(())
     }
 }
 
@@ -939,6 +958,58 @@ mod tests {
                 .unwrap()
                 .len(),
             n as usize
+        );
+    }
+
+    /// Regression (found by the P3.c recall spike): a single key with enough
+    /// duplicate `RowId`s to span several leaves must return **all** of them
+    /// from `search_eq`. Before the leftmost-descent + walk-right fix,
+    /// `find_leaf` could land mid-run and the walk stopped early, silently
+    /// under-returning a heavily-duplicated key (a full-text token in many docs,
+    /// a graph hub, a BTree value on many rows).
+    #[test]
+    fn heavily_duplicated_key_spanning_leaves_returns_all() {
+        let mut e = env();
+        let t = DiskBTree::create(&mut e.pool, &mut e.wal).unwrap();
+        // Neighbours on both sides so the hot key's run sits between other keys
+        // and its leaves split with real separators around it.
+        let dup = 3000u32; // far more than one leaf holds (~480 int entries)
+        for i in 0..500 {
+            t.insert(OrderedValue::Int(1), rid(i, 0), &mut e.pool, &mut e.wal)
+                .unwrap();
+        }
+        for i in 0..dup {
+            t.insert(OrderedValue::Int(2), rid(i, 1), &mut e.pool, &mut e.wal)
+                .unwrap();
+        }
+        for i in 0..500 {
+            t.insert(OrderedValue::Int(3), rid(i, 2), &mut e.pool, &mut e.wal)
+                .unwrap();
+        }
+        let got = t.search_eq(&OrderedValue::Int(2), &mut e.pool).unwrap();
+        assert_eq!(got.len(), dup as usize, "must return every duplicate");
+        assert!(got.iter().all(|r| r.slot == 1));
+        // Neighbours unaffected.
+        assert_eq!(
+            t.search_eq(&OrderedValue::Int(1), &mut e.pool)
+                .unwrap()
+                .len(),
+            500
+        );
+        assert_eq!(
+            t.search_eq(&OrderedValue::Int(3), &mut e.pool)
+                .unwrap()
+                .len(),
+            500
+        );
+        // Remove one from deep in the run, then re-count.
+        t.remove(&OrderedValue::Int(2), rid(1500, 1), &mut e.pool, &mut e.wal)
+            .unwrap();
+        assert_eq!(
+            t.search_eq(&OrderedValue::Int(2), &mut e.pool)
+                .unwrap()
+                .len(),
+            dup as usize - 1
         );
     }
 

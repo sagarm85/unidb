@@ -81,6 +81,10 @@ name = "durable_index"
 harness = false
 
 [[bench]]
+name = "vector_recall"
+harness = false
+
+[[bench]]
 name = "vacuum"
 harness = false
 

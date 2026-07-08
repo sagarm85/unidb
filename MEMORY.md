@@ -96,9 +96,15 @@
     only for its benchmark. The async index worker now serves **only the vector
     (Hnsw) index**.
   Crash harness **14 → 17** (P13 B-Tree total-data-loss recovery, P14 durable
-  full-text, P15 durable edge index). Dated subsections below; full entries in
-  `PROGRESS.md`. **Next: P3.c (on-disk vector — spike first, research-grade),
-  P3.d (large objects)**, one PR each.
+  full-text, P15 durable edge index). **P3.c (on-disk vector) SPIKE is COMPLETE:**
+  chose on-disk **IVF-Flat** (cell posting lists = a durable `DiskBTree`,
+  centroids in bounded RAM), recall@10 = **1.000 at nprobe=4** validated vs.
+  ground truth (`src/disk_vector.rs`, `benches/vector_recall.rs`,
+  `docs/design/p3c_vector_spike.md`) — the production wiring is a follow-up PR
+  (not rushed, per the blueprint). The spike also **found + fixed a real
+  `DiskBTree` duplicate-key-spanning-leaves bug** affecting P3.a/P3.b (see
+  subsection). Dated subsections below; full entries in `PROGRESS.md`. **In
+  progress: P3.d (large objects).**
 - **Prior Core-lane work: Phase 1 — ACID & storage foundation** (the feature-freeze
   gate, `docs/backlog/phase1_acid_hardening.md`), on Core lane branch
   `acid-hardening`. **Phase 1 is COMPLETE — all five checkpoints shipped:** P1.a
@@ -502,6 +508,37 @@ section. The load-bearing insight and what a future reader most needs:
 - **Crash points P14 (full-text) + P15 (edge index)** at the Engine level:
   commit, "crash" (drop, no checkpoint), reopen, query works with no rebuild.
   Harness **15 → 17**. No `FORMAT_VERSION` change.
+
+### P3.c — on-disk vector index spike + a DiskBTree duplicate-key bug fix (Core lane, branch `durable-storage`, 2026-07-08)
+
+Third Phase 3 checkpoint, delivered as the **spike** the blueprint mandates
+(research-grade; validate recall before committing). Full entry + numbers in
+`PROGRESS.md`'s P3.c section and `docs/design/p3c_vector_spike.md`.
+
+- **Chose on-disk IVF-Flat** (`src/disk_vector.rs`, `DiskIvfIndex`). The reuse
+  insight (same as P3.b): an IVF cell posting list `cell_id → [RowId]` is
+  *exactly* a `DiskBTree`, so the durable core is already built; the only new
+  in-RAM state is the centroid table (bounded, not O(corpus)). Vectors stay in
+  the heap (exact re-rank). DiskANN/Vamana parked as a higher-recall option
+  behind the same interface. **Recall validated: recall@10 = 1.000 at nprobe=4**
+  vs. brute-force ground truth (`benches/vector_recall.rs`), 4 KB RAM, 24 ms
+  build — vs. the in-RAM HNSW's 30 s build for 1,200 vectors (the M2
+  rebuild-per-upsert pathology, quantified). **Production wiring (CREATE INDEX →
+  durable, NEAR reads it, centroid persistence, crash point P16) is the
+  follow-up PR.**
+- **The spike found + fixed a real `DiskBTree` bug that also affected P3.a/P3.b.**
+  IVF recall capped at 0.912 even probing all cells → a duplicate-key run
+  **straddling a leaf boundary** was under-returned: `search_eq` (and `remove`)
+  could land mid-run via `find_leaf` and stop early. **Fix:** `find_leaf` now
+  descends to the *leftmost* candidate leaf (routes left on `key <= separator`,
+  since a separator is the first key of its right subtree) and `search_eq`/
+  `remove` walk the leaf `next`-links until a key strictly greater than the
+  target appears. Regression: `btree_index::
+  heavily_duplicated_key_spanning_leaves_returns_all` (3,000 dups over ~7
+  leaves). Real-world impact this closed: a full-text token in many docs, a
+  graph hub with many edges, or a BTree value on many rows would have silently
+  returned an incomplete set. (The insert path keeps `<` routing so new
+  duplicates append after existing ones — only reads needed leftmost descent.)
 
 ### Design note: xid reuse after checkpoint — a real M1-era bug, found and fixed during M5
 
