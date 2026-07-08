@@ -97,12 +97,16 @@
   batching all queued requests behind **one fsync per batch**
   (`server/engine_handle.rs`) — concurrent INSERT throughput went from flat
   to **scaling**: ~242 / ~756 / **~4,780 ops/s** at 1/10/50 clients (31× at
-  50). Full plan, numbers, correctness analysis, and the two remaining
-  items (buffer-pool force-WAL-on-evict hardening; concurrent read path) are
-  in `docs/backlog/group_commit_and_read_concurrency.md`. All 228 unit + 25
+  50). **Item 6a also landed:** buffer-pool force-WAL-on-evict
+  (`bufferpool.rs` — `durable_wal_lsn` tracking + `fetch_page_for_write`),
+  making deferred mode unconditionally safe for working sets larger than the
+  pool and largely fixing the pre-existing M6 `BufferPoolFull`-at-scale
+  limitation. Only item 6b (concurrent read path) remains. Full plan,
+  numbers, and correctness analysis are in
+  `docs/backlog/group_commit_and_read_concurrency.md`. All 229 unit + 25
   server + 11 crash-harness tests green; clippy/fmt clean. Default
-  (embedded, non-deferred) path and the crash harness are unchanged —
-  deferred mode is server-writer-thread-only.
+  (embedded, non-deferred) path keeps per-statement durability; the crash
+  harness is green (the new write-back-on-evict path preserves recovery).
 - Two explicitly deferred follow-ups remain, neither started: (1) the
   full CLAUDE.md §6 cross-domain "replaced stack" benchmark (possible
   since all four data models + the server exist, but a separate,
@@ -1572,15 +1576,16 @@ plain reporting.
   **FIXED 2026-07-08** (branch `m9-group-commit`): `TransactionManager::
   commit` skips `commit_user_txn` when `undo_log.is_empty()`. Point SELECT
   ~3.05 ms → 1.09 µs. See `docs/backlog/group_commit_and_read_concurrency.md`.
-- **Deferred-sync (group-commit) mode has no buffer-pool force-WAL-on-evict
-  yet** (new, branch `m9-group-commit`, 2026-07-08): while the server
-  writer thread runs in `Wal::deferred_sync` mode, `durable_lsn` lags within
-  a batch, so if a batch's working set exceeds the buffer pool the D5
-  eviction path (`find_victim`, which *skips* pages ahead of `durable_lsn`)
-  can fail to find a victim — a failed insert, **not corruption**. Never
-  triggers at test/bench scale (small working sets); the hardening (force
-  the WAL on eviction, proper ARIES no-force) is item 6a of the design doc.
-  The default embedded path is unaffected (it never enables deferred mode).
+- ~~**Deferred-sync (group-commit) mode has no buffer-pool
+  force-WAL-on-evict yet**~~ **FIXED 2026-07-08** (branch `m9-group-commit`,
+  design-doc item 6a): the buffer pool now tracks the durable WAL frontier
+  (`durable_wal_lsn`) and `find_victim` writes back + evicts a dirty page
+  once its LSN is durable (ARIES steal); `BufferPool::fetch_page_for_write`
+  (used by every heap write/undo path + FSM scan) forces one `Wal::sync()`
+  and retries when the pool is full of not-yet-durable dirty pages. Deferred
+  mode is now unconditionally safe. Proven by `bufferpool.rs::
+  fetch_for_write_forces_wal_sync_to_evict_nondurable_dirty_pages`; crash
+  harness green.
 - FSM is a linear scan over all heap pages — fine for M0/M1, revisit if insert
   throughput regresses.
 - **`DbError::BufferPoolFull` at large single-table scale (discovered M6,
@@ -1594,7 +1599,15 @@ plain reporting.
   purely per-transaction pinning bug. Not investigated further — `benches/
   btree.rs` scopes its largest tier down to 10,000 rows instead. Revisit
   alongside the FSM item above if a real workload needs single tables
-  larger than this.
+  larger than this. **Largely addressed 2026-07-08** (branch
+  `m9-group-commit`, design-doc item 6a): the root cause was that
+  `find_victim` could *never* evict a dirty page (its D5 hint was hardwired
+  to `INVALID_LSN`), so a pool full of dirty pages had no victim. It now
+  writes back + evicts dirty pages once their WAL is durable (and
+  `fetch_page_for_write` force-syncs when needed), so the write path no
+  longer dead-ends at `BufferPoolFull`. The FSM linear-scan cost above is
+  separate and still open; a dedicated large-single-table stress test
+  wasn't added, so this is "largely addressed," not formally closed.
 - WAL truncation rewrites the entire file — acceptable for now, needs a proper
   log-segment scheme in later milestones.
 - **No vacuum/GC in M1.** Dead tuple versions (`xmax` set, no snapshot can see
@@ -1736,10 +1749,20 @@ plain reporting.
   clippy `-D warnings` + fmt clean. No §3 locked decision re-opened (D1/D2/
   D5 upheld — deferring the commit fsync only delays when `durable_lsn`
   advances; no page flushes ahead of the durable WAL).
-- **Not done (tracked in `docs/backlog/group_commit_and_read_concurrency.md`):**
-  6a buffer-pool force-WAL-on-evict (makes deferred mode unconditionally
-  safe for working sets > pool — see tech-debt entry); 6b concurrent read
-  path (readers off the single writer thread — the one real architectural
+- **Then item 6a landed (same session):** buffer-pool force-WAL-on-evict.
+  `bufferpool.rs` now tracks `durable_wal_lsn` and `find_victim` writes back
+  + evicts a dirty page once its WAL is durable (ARIES steal, was previously
+  impossible — the D5 hint was hardwired to `INVALID_LSN`);
+  `BufferPool::fetch_page_for_write(page_id, &mut Wal)` (used by every heap
+  write/undo path + FSM scan) force-syncs the WAL and retries when the pool
+  is full of not-yet-durable dirty pages. `Engine::sync_wal` now also
+  refreshes the pool's frontier. New unit test
+  `fetch_for_write_forces_wal_sync_to_evict_nondurable_dirty_pages` (229
+  unit total); crash harness green (write-back-on-evict preserves recovery).
+  This makes deferred mode unconditionally safe *and* largely fixes the M6
+  `BufferPoolFull`-at-scale limitation.
+- **Still not done (tracked in the design doc):** 6b concurrent read path
+  (readers off the single writer thread — the one real architectural
   change, an addition to existing MVCC). "M9" filename is taken by the
   parked Python-bindings doc, so this track is documented descriptively.
 - Not merged to `main` this session; on branch pending PR.

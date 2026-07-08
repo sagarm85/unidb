@@ -8,16 +8,17 @@
 > working branch is nonetheless named `m9-group-commit`. Milestone
 > numbering for post-M8 work is the user's to sequence.
 
-## Status as of 2026-07-08: PROTOTYPE LANDED (branch `m9-group-commit`)
+## Status as of 2026-07-08: PROTOTYPE + HARDENING LANDED (branch `m9-group-commit`)
 
-Two of the three changes from the concurrency diagnosis are **implemented,
-tested, and benchmarked**; one hardening item and one larger follow-on
-remain (see [Remaining work](#remaining-work)).
+Three of the four changes are **implemented, tested, and benchmarked**; one
+larger follow-on remains (see [Remaining work](#remaining-work)).
 
 - ✅ Read-only fsync skip (embedded + server paths)
 - ✅ Group commit (server writer thread)
-- ☐ Buffer-pool force-WAL-on-evict (required to make deferred-sync mode
-  unconditionally safe for working sets larger than the buffer pool)
+- ✅ Buffer-pool force-WAL-on-evict (deferred-sync mode is now
+  unconditionally safe for working sets larger than the buffer pool; also
+  fixes the pre-existing `BufferPoolFull`-at-scale limitation for the
+  ordinary per-statement-fsync path)
 - ☐ Concurrent read path (readers off the single writer thread — the one
   genuine architectural change, an *addition* to existing MVCC)
 
@@ -128,28 +129,35 @@ off the read path.
   green; clippy `-D warnings` and fmt clean. The crash harness exercises
   the default (non-deferred) path, which is unchanged.
 
-## 5. The known caveat (drives the hardening item)
+## 5. The former caveat — now fixed by 6a
 
-In deferred mode `durable_lsn` lags within a batch. If a batch's working
-set ever exceeds the buffer pool, the D5 eviction path
-(`bufferpool.rs::find_victim`) — which *skips* dirty pages whose LSN is
-ahead of `durable_lsn` — could fail to find a victim, surfacing as a failed
-insert (`DbError::BufferPoolFull`-class), **not corruption**. It never
-triggers in the tests or benchmarks (small working sets), but production
-robustness requires the fix in [6a](#6a-buffer-pool-force-wal-on-evict).
+In deferred mode `durable_lsn` lags within a batch, so if a batch's working
+set exceeded the buffer pool the old D5 eviction path
+(`bufferpool.rs::find_victim`) — which merely *skipped* dirty pages ahead of
+`durable_lsn` — could dead-end at `DbError::BufferPoolFull` (a failed
+insert, **not corruption**). **Resolved 2026-07-08 by [6a](#6a-buffer-pool-force-wal-on-evict).**
 
 ## 6. Remaining work
 
-### 6a. Buffer-pool force-WAL-on-evict (hardening — do before relying on deferred mode at scale)
-Make the buffer pool force the WAL (a `Wal::sync` or bounded flush) when
-eviction cannot find a victim because every candidate is ahead of
-`durable_lsn`, instead of skipping/erroring. This is the proper ARIES
-no-force behavior and is currently missing (it was never needed while every
-mini-txn fsync'd). Requires the eviction path to reach a WAL handle (today
-it does not) — a contained change. With it, deferred mode is
-unconditionally safe. A cheaper interim mitigation is a batch-size cap in
-the writer loop (`flush_pending` every N requests) to bound how many
-non-durable pages can accumulate between syncs.
+### 6a. Buffer-pool force-WAL-on-evict — ✅ DONE (2026-07-08)
+**Implemented.** The buffer pool now tracks the durable WAL frontier
+(`durable_wal_lsn`, a stale-low-safe lower bound refreshed on every
+write-path fetch and on `Engine::sync_wal`). `find_victim` writes back and
+evicts a dirty page once its LSN is durable (ARIES steal), instead of just
+skipping it. The new `BufferPool::fetch_page_for_write(page_id, &mut Wal)` —
+used by every heap write/undo path and the FSM scan — refreshes that
+frontier and, if the pool is still full of *not-yet-durable* dirty pages,
+forces one `Wal::sync()` and retries (ARIES "force the log before stealing
+the page", D5). Reads keep using plain `fetch_page` (reads never dirty
+pages). Proven by `bufferpool.rs::
+fetch_for_write_forces_wal_sync_to_evict_nondurable_dirty_pages`; the crash
+harness stays green, confirming the new write-back-on-evict path preserves
+recovery correctness.
+
+**Bonus:** this also fixes the pre-existing `BufferPoolFull`-at-scale
+limitation (discovered M6) for the ordinary per-statement-fsync path — dirty
+pages are now evictable once durable, where before the pool could only ever
+evict clean frames.
 
 ### 6b. Concurrent read path (the one real architectural change)
 Take reads off the single writer thread. With MVCC snapshots already built,
@@ -164,8 +172,10 @@ readers + one group-committing writer** — a standard, correct MVCC design
 that fits the single-primary scope (CLAUDE.md §1).
 
 ## 7. Definition of done (for promoting this to a shipped milestone)
-- 6a implemented; a deferred-mode durability test added alongside the crash
-  harness (crash before batch sync ⇒ txn not durable; after ⇒ durable).
-- 6b implemented and benchmarked (concurrent read throughput scaling).
-- Benchmark tables recorded in `PROGRESS.md`; `README.md`/`docs/` updated.
-- No locked decision (§3) violated.
+- ✅ 6a implemented; force-WAL-on-evict unit test added; crash harness green.
+- ☐ A deferred-mode durability test alongside the crash harness (crash
+  before batch sync ⇒ txn not durable; after ⇒ durable) would further
+  harden the group-commit path — not yet added.
+- ☐ 6b implemented and benchmarked (concurrent read throughput scaling).
+- ✅ Benchmark tables recorded in `PROGRESS.md`; `README.md`/`docs/` updated.
+- ✅ No locked decision (§3) violated (D1/D2/D5 upheld).

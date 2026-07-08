@@ -732,9 +732,13 @@ impl Engine {
     }
 
     /// Force the WAL to durable storage — the single fsync a group-commit
-    /// batch issues after appending many transactions' commit records.
+    /// batch issues after appending many transactions' commit records. Also
+    /// advances the buffer pool's durable-frontier view (D5) so eviction can
+    /// steal any now-durable dirty page.
     pub fn sync_wal(&mut self) -> Result<()> {
-        self.wal.sync()
+        self.wal.sync()?;
+        self.pool.set_durable_wal_lsn(self.wal.durable_lsn);
+        Ok(())
     }
 
     /// Abort `xid`, physically undoing its writes and releasing every lock

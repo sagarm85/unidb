@@ -1224,7 +1224,7 @@ operation is per-statement fsync, compounded by the server serializing all
 requests through one writer thread. Full plan + correctness analysis:
 `docs/backlog/group_commit_and_read_concurrency.md`.
 
-**What shipped in the prototype (2 of 3 fixes):**
+**What shipped (3 of 4 changes):**
 - **Read-only fsync skip** (`txn.rs`): `TransactionManager::commit` skips
   `commit_user_txn` (WAL record + fsync) when `undo_log.is_empty()`. A
   read-only txn has nothing to make durable; recovery treats the orphan
@@ -1237,6 +1237,16 @@ requests through one writer thread. Full plan + correctness analysis:
   that fsync so no client observes a non-durable commit. The embedded API
   and crash harness keep per-statement durability (deferred mode is
   server-writer-thread-only).
+- **Buffer-pool force-WAL-on-evict** (`bufferpool.rs` + `heap.rs` + `lib.rs`):
+  the pool tracks the durable WAL frontier (`durable_wal_lsn`) and
+  `find_victim` writes back + evicts a dirty page once its WAL is durable
+  (ARIES steal); `BufferPool::fetch_page_for_write` — used by every heap
+  write/undo path + the FSM scan — force-syncs the WAL and retries when the
+  pool is full of not-yet-durable dirty pages. Makes deferred mode
+  unconditionally safe for working sets larger than the pool, and **largely
+  fixes the pre-existing M6 `BufferPoolFull`-at-scale limitation** (dirty
+  pages were previously never evictable — the D5 hint was hardwired to
+  `INVALID_LSN`).
 
 **Metrics (M5 Pro, 2026-07-08):**
 
@@ -1251,11 +1261,11 @@ with load. Embedded point SELECT (read-only fsync skip): ~3.05 ms →
 **1.09 µs** (~2,800×). Peak RSS unchanged (no new buffering — batching
 reuses the existing unbounded request channel).
 
-**Verification:** 228 unit + 25 server integration + 11 crash-harness tests
+**Verification:** 229 unit + 25 server integration + 11 crash-harness tests
 green; clippy `-D warnings` + fmt clean. No §3 locked decision re-opened
-(D1/D2/D5 upheld).
+(D1/D2/D5 upheld — the new write-back-on-evict path only writes pages whose
+WAL is already durable, and the crash harness confirms recovery is intact).
 
-**Not done (tracked in the design doc):** 6a buffer-pool force-WAL-on-evict
-(hardening for working sets larger than the buffer pool in deferred mode —
-see `MEMORY.md` tech debt); 6b concurrent read path (readers off the single
-writer thread).
+**Not done (tracked in the design doc):** 6b concurrent read path (readers
+off the single writer thread — the one remaining architectural change, an
+addition to existing MVCC).

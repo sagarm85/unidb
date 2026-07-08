@@ -142,10 +142,25 @@ clock eviction, dirty tracking, D5 enforcement on flush/evict.
 `fetch_page` returns a per-call page copy — cheap for point access,
 measurably expensive for hot-hub scans, which is what motivated the graph
 layer's batch-latch optimization (§7.2). A real scaling limit was
-discovered in M6: tables growing into the hundreds of pages can exhaust
+discovered in M6: tables growing into the hundreds of pages could exhaust
 the pool (`DbError::BufferPoolFull`) even with small individually-committed
-transactions — tracked tech debt (§12), interacting with the linear-scan
-FSM.
+transactions.
+
+**Steal / force-WAL-on-evict (2026-07-08, branch `m9-group-commit`).** The
+pool tracks the durable WAL frontier (`durable_wal_lsn`, a stale-low-safe
+lower bound refreshed on every write-path fetch and on `Engine::sync_wal`).
+`find_victim` now writes back and evicts a dirty page once its LSN is
+durable (proper ARIES steal) instead of only ever evicting clean frames —
+which is why the M6 `BufferPoolFull` limit existed (the old D5 hint was
+hardwired to `INVALID_LSN`, so no dirty page was ever a victim). The
+write-path entry point `BufferPool::fetch_page_for_write(page_id, &mut Wal)`
+(used by every heap write/undo path and the FSM scan) refreshes the frontier
+and, if the pool is still full of *not-yet-durable* dirty pages (the
+group-commit deferred-sync case), forces one `Wal::sync()` and retries —
+"force the log before stealing the page" (D5). Reads keep plain `fetch_page`
+(they never dirty pages). This makes deferred mode safe for working sets
+larger than the pool and largely closes the M6 limit; the linear-scan FSM
+cost is separate and still open (§12).
 
 ### 3.5 Checkpoint & recovery
 
@@ -666,9 +681,11 @@ landed 2026-07-08 (branch `m9-group-commit`, server writer thread) — see
 all commit records for a drained request batch and force durability with a
 single fsync, withholding each commit's reply until that fsync so no client
 observes a non-durable commit. This is the prerequisite for the
-cross-domain workload being fast too. Two follow-ups remain: buffer-pool
-force-WAL-on-evict (hardening for working sets > pool in deferred mode) and
-a concurrent read path (readers off the single writer thread).
+cross-domain workload being fast too. Buffer-pool force-WAL-on-evict landed
+alongside it (§3.4) — the pool now forces the log before stealing a
+not-yet-durable dirty page, so deferred mode is safe for working sets larger
+than the pool. One follow-up remains: a concurrent read path (readers off
+the single writer thread).
 
 ### 10.2 Where the engine is genuinely competitive
 
@@ -696,8 +713,12 @@ a concurrent read path (readers off the single writer thread).
 - **`NEAR` latency (~4–5 ms)** is transactional overhead, not vector
   search — the raw structures answer in microseconds (fulltext search
   ~14.2 µs).
-- **`BufferPoolFull` at ~100k rows/table** (M6 discovery): fixed 256-frame
-  pool + linear-scan FSM interaction; untriaged.
+- **`BufferPoolFull` at ~100k rows/table** (M6 discovery): **largely fixed
+  2026-07-08** — the root cause was that `find_victim` could never evict a
+  dirty page (its D5 hint was hardwired to `INVALID_LSN`); it now writes back
+  + evicts dirty pages once durable, and `fetch_page_for_write` force-syncs
+  when needed (§3.4). The linear-scan FSM interaction is separate and still
+  open; no dedicated large-single-table stress test was added.
 - Peak RSS has stayed ~27–28 MB across M0/M1 measurement points.
 
 ---
@@ -724,12 +745,14 @@ a specific point before it can be safely preferred again.
 
 Performance debt: per-statement fsync — **group commit landed on the server
 writer thread 2026-07-08 (branch `m9-group-commit`), read-only-txn commit
-fsync fixed** (§11.1); its follow-ups are buffer-pool force-WAL-on-evict
-(needed for deferred-mode working sets > pool) and a concurrent read path
-(readers off the single writer thread) — see
+fsync fixed, and buffer-pool force-WAL-on-evict landed** (§3.4/§11.1), the
+last of which also largely resolves the `BufferPoolFull`-at-scale item
+below; the one remaining follow-up is a concurrent read path (readers off
+the single writer thread) — see
 `docs/backlog/group_commit_and_read_concurrency.md`. WAL truncation rewrites
-the whole file (needs log segments); FSM is a linear scan; 256-frame buffer
-pool + `BufferPoolFull` at scale; HNSW full rebuild per upsert; CSR full
+the whole file (needs log segments); FSM is a linear scan; ~~256-frame
+buffer pool + `BufferPoolFull` at scale~~ (largely fixed — see above; FSM
+scan cost remains); HNSW full rebuild per upsert; CSR full
 rebuild per debounce pass (currently moot — CSR isn't consulted, see
 above); `poll_events` full-scan (needs a `seq` index); SSE
 poll-per-subscriber.
@@ -776,6 +799,7 @@ follow-up lands.
 *Document version: covers M0–M8 complete (through commit `af5601b`,
 including the M7 CSR-traversal correction found during M8 merge
 verification), plus the post-M8 group-commit + read-only-fsync-skip
-performance work on branch `m9-group-commit` (2026-07-08) — see §3.3, §4.4,
-§11.1, §12 and `docs/backlog/group_commit_and_read_concurrency.md`. Update
-alongside the next milestone's closeout.*
++ buffer-pool force-WAL-on-evict performance work on branch
+`m9-group-commit` (2026-07-08) — see §3.3, §3.4, §4.4, §11.1, §12 and
+`docs/backlog/group_commit_and_read_concurrency.md`. Update alongside the
+next milestone's closeout.*

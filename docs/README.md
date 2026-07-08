@@ -18,8 +18,9 @@
   `NOT STARTED`/`PAUSED` while pending and updated (or removed in favor of
   the `PROGRESS.md` entry) once the work ships — e.g.
   `phase2_sql_capability_expansion.md` (paused, not started) and
-  `group_commit_and_read_concurrency.md` (prototype landed on branch
-  `m9-group-commit`; two hardening/follow-up items remain). These are
+  `group_commit_and_read_concurrency.md` (group commit + read-only fsync
+  skip + buffer-pool force-WAL-on-evict landed on branch `m9-group-commit`;
+  one follow-up — a concurrent read path — remains). These are
   durable, git-tracked references — unlike Claude Code's own ephemeral
   plan-mode file, which gets overwritten by the next plan.
 
