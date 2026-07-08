@@ -1620,7 +1620,7 @@ scope (`wal`/`bufferpool`/`recovery`/`checkpoint`).
 
 ### P1.b — fsync-failure handling (fsyncgate) + ordering   [shipped]   2026-07-08
 
-**PR:** _(pending — Core lane, branch `acid-hardening`)_
+**PR:** #7 — https://github.com/sagarm85/unidb/pull/7 (Core lane, branch `acid-hardening`)
 **Summary:** Closes the fsyncgate hazard (roadmap Tier 0). A failed
 `fsync`/`msync` may leave the OS having dropped the dirty data while clearing
 its dirty bit, so a naive retry can return success without the data ever
