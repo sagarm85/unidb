@@ -1721,6 +1721,36 @@ plain reporting.
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-07-08 — 6b concurrent SQL SELECT (branch `m9-concurrent-select`)
+
+- Extended 6b from point reads to **read-only SQL `SELECT`** on the
+  concurrent read path (stacked on `m9-concurrent-reads`; PR #2 group-commit
+  work already merged to `main`).
+- **What landed:**
+  - `Engine.catalog` → `Arc<RwLock<Catalog>>` (readers need the live
+    `TableDef.pages`, which grows on INSERT). Writer takes the write-lock per
+    statement only — never across an fsync (group-commit defers the fsync to
+    a later step), so readers block only briefly. 16 catalog call sites in
+    `lib.rs` routed through `cat_read`/`cat_write` free helpers (field-level
+    borrow so other engine fields stay disjointly borrowable).
+  - `executor::exec_select_readonly` — `PageReader`-generic full-scan SELECT
+    reusing `decode_row`/`predicate_matches`/`project_row`;
+    `plan_is_concurrent_read` (plain SELECT, no NEAR). `project_row`/
+    `find_near` promoted to `pub(crate)`.
+  - `ReadHandle::execute_sql` (read-only) + `is_concurrent_read_sql`
+    classifier; `EngineHandle::execute_sql_read` (spawn_blocking); server
+    `post_sql` routes concurrent-readable SQL to the read handle, everything
+    else (writes/DDL/NEAR) to the writer thread.
+- **Lock order** is consistent catalog → txn → mmap on both writer and reader
+  sides (reader never holds catalog+txn simultaneously; both hold
+  catalog-outer/mmap-inner) — no inversion/deadlock.
+- **Verification:** new `concurrent_sql_select_...` test (4 readers `SELECT`
+  while writer inserts 500; every row's `name` pairs with its `id` — catches
+  torn reads / inconsistent catalog+snapshot). 232 unit + 25 server + 11
+  crash + 2 concurrent_reads + unidb-attach green; clippy/fmt clean.
+- **Still writer-thread by design:** `NEAR` (needs HNSW fast path),
+  `edges_from`/Cypher, `poll_events` — additive same pattern if needed.
+
 ### 2026-07-08 — 6b concurrent read path: point reads (branch `m9-concurrent-reads`)
 
 - Continued the concurrency track (item 6b of

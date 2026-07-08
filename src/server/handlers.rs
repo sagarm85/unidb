@@ -64,9 +64,16 @@ pub async fn post_sql(
     State(state): State<AppState>,
     Json(body): Json<SqlRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, ApiError> {
-    let xid = state.engine.begin(None).await?;
-    let result = state.engine.execute_sql(xid, body.sql).await;
-    let results = finish(&state.engine, xid, result).await?;
+    // Read-only SELECTs run on the concurrent read path (6b), off the single
+    // writer thread — no begin/commit round-trips. Everything else (writes,
+    // DDL, NEAR) goes through the writer thread as before.
+    let results = if crate::read_handle::is_concurrent_read_sql(&body.sql) {
+        state.engine.execute_sql_read(body.sql).await?
+    } else {
+        let xid = state.engine.begin(None).await?;
+        let result = state.engine.execute_sql(xid, body.sql).await;
+        finish(&state.engine, xid, result).await?
+    };
     let json_results: Vec<_> = results.iter().map(exec_result_to_json).collect();
     Ok(Json(json!({ "results": json_results })))
 }

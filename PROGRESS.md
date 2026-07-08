@@ -1276,6 +1276,16 @@ concurrent_reads.rs` proves 4 concurrent readers see exact committed bytes
 `concurrent_read_throughput` shows reads scale with concurrency (~3.0k →
 ~4.3k → ~4.5k reads/s at 1/10/50, HTTP-client-bound in the microbench)
 rather than the flat writer-serialized ceiling. `Engine` stays non-`Sync`;
-`ReadHandle` is the shared reader. **Remaining:** concurrent SQL `SELECT`
-(shared catalog + a read-only executor path — additive on the same
-foundation), tracked in the design doc.
+`ReadHandle` is the shared reader.
+
+**Concurrent SQL `SELECT` also landed** (branch `m9-concurrent-select`):
+`Engine.catalog` → `Arc<RwLock<Catalog>>` (readers need the live
+`TableDef.pages`), a `PageReader`-generic `exec_select_readonly` reusing the
+existing decode/predicate/projection helpers, and `ReadHandle::execute_sql`
++ an `is_concurrent_read_sql` classifier so the server routes read-only
+`POST /sql` to the read path and writes/DDL/`NEAR` to the writer thread.
+`tests/concurrent_reads.rs` proves 4 readers running `SELECT` see consistent
+rows (every `name` pairs with its `id` — no torn reads) while the writer
+inserts 500 rows. Lock order is consistent (catalog → txn → mmap), so no
+deadlock. `NEAR`/graph/queue reads remain on the writer thread by design —
+additive on the same foundation if a workload needs them concurrent.

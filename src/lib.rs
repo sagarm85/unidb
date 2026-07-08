@@ -65,6 +65,7 @@ pub mod vector;
 pub mod wal;
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::{
     bufferpool::BufferPool,
@@ -106,7 +107,11 @@ pub struct Engine {
     heap: Heap,
     txn_mgr: TransactionManager,
     lock_mgr: LockManager,
-    catalog: Catalog,
+    // Behind `Arc<RwLock>` (6b) so the concurrent read path (`ReadHandle`)
+    // can see the live catalog — including `TableDef.pages`, which grows on
+    // INSERT. The writer takes the write-lock only briefly (per statement,
+    // never across an fsync); readers take the read-lock.
+    catalog: Arc<RwLock<Catalog>>,
     control_path: PathBuf,
     _wal_path: PathBuf,
     index_worker: IndexHandle,
@@ -135,6 +140,19 @@ impl Drop for Engine {
     fn drop(&mut self) {
         self.index_worker.shutdown();
     }
+}
+
+/// Read/write-lock a shared catalog, recovering from poisoning rather than
+/// panicking (a poisoned catalog means a prior panic-while-locked; proceeding
+/// with the state as-is is safer than aborting the process). Free functions
+/// (not `&self` methods) so they borrow only the `catalog` field, leaving the
+/// engine's other fields free to borrow disjointly in the same scope.
+fn cat_read(c: &RwLock<Catalog>) -> RwLockReadGuard<'_, Catalog> {
+    c.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn cat_write(c: &RwLock<Catalog>) -> RwLockWriteGuard<'_, Catalog> {
+    c.write().unwrap_or_else(|e| e.into_inner())
 }
 
 impl Engine {
@@ -245,7 +263,7 @@ impl Engine {
             heap,
             txn_mgr,
             lock_mgr,
-            catalog,
+            catalog: Arc::new(RwLock::new(catalog)),
             control_path: ctrl_p,
             _wal_path: wal_p,
             index_worker,
@@ -262,9 +280,10 @@ impl Engine {
         let plans = parse_sql(sql)?;
         let mut results = Vec::with_capacity(plans.len());
         for plan in plans {
-            let plan = apply_rls(plan, &self.catalog);
+            let plan = apply_rls(plan, &cat_read(&self.catalog));
+            let mut catalog = cat_write(&self.catalog);
             let mut ctx = ExecCtx {
-                catalog: &mut self.catalog,
+                catalog: &mut catalog,
                 txn_mgr: &mut self.txn_mgr,
                 pool: &mut self.pool,
                 wal: &mut self.wal,
@@ -289,8 +308,9 @@ impl Engine {
     pub fn execute_cypher(&mut self, xid: Xid, query: &str) -> Result<Vec<ExecResult>> {
         let page_size = self.control.page_size as usize;
         let parsed = parse_cypher(query)?;
+        let mut catalog = cat_write(&self.catalog);
         let mut ctx = ExecCtx {
-            catalog: &mut self.catalog,
+            catalog: &mut catalog,
             txn_mgr: &mut self.txn_mgr,
             pool: &mut self.pool,
             wal: &mut self.wal,
@@ -317,7 +337,7 @@ impl Engine {
             control: &mut self.control,
             page_size,
         };
-        self.catalog.set_rls_policy(table, policy, &mut ctx)
+        cat_write(&self.catalog).set_rls_policy(table, policy, &mut ctx)
     }
 
     /// Attach (or clear) a secondary index on one column (M2: Rust API
@@ -339,7 +359,7 @@ impl Engine {
             control: &mut self.control,
             page_size,
         };
-        self.catalog.set_column_index(table, column, kind, &mut ctx)
+        cat_write(&self.catalog).set_column_index(table, column, kind, &mut ctx)
     }
 
     /// Current build status of a secondary index, or `None` if no index has
@@ -372,7 +392,7 @@ impl Engine {
             control: &mut self.control,
             page_size,
         };
-        self.catalog.set_events_enabled(table, true, &mut ctx)
+        cat_write(&self.catalog).set_events_enabled(table, true, &mut ctx)
     }
 
     /// Fetch up to `limit` events with `seq` greater than `consumer`'s
@@ -393,8 +413,8 @@ impl Engine {
         limit: usize,
     ) -> Result<Vec<queue::Event>> {
         let page_size = self.control.page_size as usize;
-        let events_def = self.catalog.lookup(EVENTS_TABLE)?.clone();
-        let consumers_def = self.catalog.lookup(CONSUMERS_TABLE)?.clone();
+        let events_def = cat_read(&self.catalog).lookup(EVENTS_TABLE)?.clone();
+        let consumers_def = cat_read(&self.catalog).lookup(CONSUMERS_TABLE)?.clone();
         let events_heap = Heap::from_pages(page_size, events_def.pages.clone());
         let consumers_heap = Heap::from_pages(page_size, consumers_def.pages.clone());
         let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
@@ -443,7 +463,7 @@ impl Engine {
     /// poll).
     pub fn ack_events(&mut self, xid: Xid, consumer: &str, up_to_seq: i64) -> Result<()> {
         let page_size = self.control.page_size as usize;
-        let consumers_def = self.catalog.lookup(CONSUMERS_TABLE)?.clone();
+        let consumers_def = cat_read(&self.catalog).lookup(CONSUMERS_TABLE)?.clone();
         let mut heap = Heap::from_pages(page_size, consumers_def.pages.clone());
         let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
         let existing =
@@ -495,8 +515,11 @@ impl Engine {
                 control: &mut self.control,
                 page_size,
             };
-            self.catalog
-                .set_pages(CONSUMERS_TABLE, heap.page_ids().to_vec(), &mut cctx)?;
+            cat_write(&self.catalog).set_pages(
+                CONSUMERS_TABLE,
+                heap.page_ids().to_vec(),
+                &mut cctx,
+            )?;
         }
         Ok(())
     }
@@ -514,7 +537,7 @@ impl Engine {
     /// zero-automatic-vacuum precedent.
     pub fn vacuum_events(&mut self, xid: Xid) -> Result<usize> {
         let page_size = self.control.page_size as usize;
-        let consumers_def = self.catalog.lookup(CONSUMERS_TABLE)?.clone();
+        let consumers_def = cat_read(&self.catalog).lookup(CONSUMERS_TABLE)?.clone();
         let consumers_heap = Heap::from_pages(page_size, consumers_def.pages.clone());
         let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
 
@@ -529,7 +552,7 @@ impl Engine {
             return Ok(0);
         };
 
-        let events_def = self.catalog.lookup(EVENTS_TABLE)?.clone();
+        let events_def = cat_read(&self.catalog).lookup(EVENTS_TABLE)?.clone();
         let mut events_heap = Heap::from_pages(page_size, events_def.pages.clone());
         let to_reclaim: Vec<RowId> = events_heap
             .scan(&snapshot, xid, &self.pool)?
@@ -579,7 +602,7 @@ impl Engine {
         props: &str,
     ) -> Result<RowId> {
         let page_size = self.control.page_size as usize;
-        let table_def = self.catalog.lookup(edges::EDGES_TABLE)?.clone();
+        let table_def = cat_read(&self.catalog).lookup(edges::EDGES_TABLE)?.clone();
         let mut heap = Heap::from_pages(page_size, table_def.pages.clone());
 
         let encoded = executor::encode_row(&edges::edge_row(from_id, to_id, edge_type, props));
@@ -600,8 +623,11 @@ impl Engine {
                 control: &mut self.control,
                 page_size,
             };
-            self.catalog
-                .set_pages(edges::EDGES_TABLE, heap.page_ids().to_vec(), &mut cctx)?;
+            cat_write(&self.catalog).set_pages(
+                edges::EDGES_TABLE,
+                heap.page_ids().to_vec(),
+                &mut cctx,
+            )?;
         }
 
         self.edge_index.insert(from_id, row_id);
@@ -627,7 +653,7 @@ impl Engine {
     /// located the row) to avoid a redundant `Heap::get` just to find it.
     pub fn delete_edge(&mut self, xid: Xid, row_id: RowId, from_id: i64) -> Result<()> {
         let page_size = self.control.page_size as usize;
-        let table_def = self.catalog.lookup(edges::EDGES_TABLE)?.clone();
+        let table_def = cat_read(&self.catalog).lookup(edges::EDGES_TABLE)?.clone();
         let mut heap = Heap::from_pages(page_size, table_def.pages.clone());
 
         heap.delete(
@@ -655,7 +681,7 @@ impl Engine {
     /// creating transaction aborted never surfaces here even though the
     /// index may still reference it.
     pub fn edges_from(&mut self, xid: Xid, from_id: i64) -> Result<Vec<Edge>> {
-        let table_def = self.catalog.lookup(edges::EDGES_TABLE)?.clone();
+        let table_def = cat_read(&self.catalog).lookup(edges::EDGES_TABLE)?.clone();
         let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
         let candidates = self.edge_index.candidates(from_id).to_vec();
         let resolved = resolve_candidates_batched(
@@ -726,7 +752,11 @@ impl Engine {
     /// parallel with each other and with the writer, coordinating only through
     /// MVCC snapshots. See [`crate::read_handle::ReadHandle`].
     pub fn read_handle(&self) -> ReadHandle {
-        ReadHandle::new(self.pool.shared_reader(), self.txn_mgr.shared())
+        ReadHandle::new(
+            self.pool.shared_reader(),
+            self.txn_mgr.shared(),
+            Arc::clone(&self.catalog),
+        )
     }
 
     /// Enable/disable WAL group-commit deferral (M9). When enabled, per-

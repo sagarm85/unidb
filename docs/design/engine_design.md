@@ -777,9 +777,13 @@ the buffer pool's `Arc<RwLock<PageFileMmap>>` plus the shared `Arc<Mutex>`
 txn snapshot state — so a read allocates no xid, writes no WAL, and never
 touches the writer's request channel. `Engine` itself stays deliberately
 non-`Sync`; `ReadHandle` is the shared-reader type (asserted `Send + Sync`).
-*Writes* still serialize through the single writer thread (by design — they
-are fsync-/group-commit-bound); concurrent SQL `SELECT` is the remaining 6b
-slice (needs a shared catalog + a read-only executor path).
+Read-only SQL `SELECT` (`POST /sql`) also runs on this path: `Engine.catalog`
+is behind an `Arc<RwLock>` (readers need the live `TableDef.pages`), and
+`ReadHandle::execute_sql` reuses a `PageReader`-generic `exec_select_readonly`;
+`is_concurrent_read_sql` classifies each statement so the handler routes
+reads to the read handle and writes/DDL/`NEAR` to the writer. *Writes* still
+serialize through the single writer thread (by design — fsync-/group-commit-
+bound). `NEAR`/graph/queue reads remain writer-side for now (additive).
 
 ---
 
@@ -807,8 +811,8 @@ slice (needs a shared catalog + a read-only executor path).
 including the M7 CSR-traversal correction found during M8 merge
 verification), plus the post-M8 performance track (2026-07-08):
 group commit + read-only-fsync-skip + buffer-pool force-WAL-on-evict on
-branch `m9-group-commit`, and the concurrent-read-path *point-read* slice
-(shared `ReadHandle`) on branch `m9-concurrent-reads` — see §3.3, §3.4,
-§4.4, §8, §11.1, §12 and `docs/backlog/group_commit_and_read_concurrency.md`.
-Concurrent SQL `SELECT` remains. Update alongside the next milestone's
-closeout.*
+branch `m9-group-commit`, and the concurrent read path (shared
+`ReadHandle`) — point reads on branch `m9-concurrent-reads` and read-only SQL
+`SELECT` on `m9-concurrent-select` — see §3.3, §3.4, §4.4, §8, §11.1, §12 and
+`docs/backlog/group_commit_and_read_concurrency.md`. `NEAR`/graph/queue reads
+remain writer-side. Update alongside the next milestone's closeout.*
