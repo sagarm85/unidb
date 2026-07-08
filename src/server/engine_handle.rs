@@ -375,111 +375,195 @@ impl Drop for EngineHandle {
     }
 }
 
+/// Group commit (M9). The writer thread owns the sole `Engine` handle, so it
+/// can safely defer every per-statement and per-commit fsync and force
+/// durability just **once per drained request batch**. Under concurrent load
+/// (many clients' `begin`/`execute`/`commit` messages interleaving on the
+/// channel), a batch contains many transactions' commit records, and this
+/// collapses what used to be one-or-two fsyncs *per statement* into one fsync
+/// per batch — directly lifting the single-writer throughput ceiling.
+///
+/// Durability contract: a `Commit`/`Abort` reply is **withheld** until the
+/// batch fsync completes, so a client never observes a committed transaction
+/// whose WAL record isn't yet durable. Non-durability-bearing replies (reads,
+/// and inserts inside a not-yet-committed txn) are sent immediately — their
+/// durability is only promised at commit time. If the batch fsync fails, every
+/// commit in that batch is reported as failed, since none of them are durable.
 fn worker_loop(mut engine: Engine, mut rx: mpsc::UnboundedReceiver<EngineRequest>) {
-    while let Some(req) = rx.blocking_recv() {
-        match req {
-            EngineRequest::Shutdown => break,
-            EngineRequest::Begin { isolation, reply } => {
-                let result = match isolation {
-                    Some(iso) => engine.begin_with_isolation(iso),
-                    None => engine.begin(),
-                };
-                let _ = reply.send(result);
+    engine.set_deferred_sync(true);
+
+    // Replies (and their tentative results) for commits/aborts whose
+    // durability the end-of-batch fsync must cover before we ack them. Both
+    // `Commit` and `Abort` reply with `Result<()>`, so they share one queue.
+    let mut pending: Vec<(oneshot::Sender<Result<()>>, Result<()>)> = Vec::new();
+
+    // Ack every pending commit/abort after forcing the WAL durable. On fsync
+    // failure, downgrade all of them to an error — none are durable.
+    fn flush_pending(
+        engine: &mut Engine,
+        pending: &mut Vec<(oneshot::Sender<Result<()>>, Result<()>)>,
+    ) {
+        if pending.is_empty() {
+            return;
+        }
+        let sync_ok = match engine.sync_wal() {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!(error = %e, "group-commit fsync failed; failing the batch");
+                false
             }
-            EngineRequest::Commit { xid, reply } => {
-                let _ = reply.send(engine.commit(xid));
+        };
+        for (reply, result) in pending.drain(..) {
+            let final_result = if sync_ok {
+                result
+            } else {
+                Err(DbError::EngineUnavailable)
+            };
+            let _ = reply.send(final_result);
+        }
+    }
+
+    'outer: loop {
+        // Block for the first request, then greedily drain everything already
+        // queued into one batch.
+        let Some(first) = rx.blocking_recv() else {
+            break;
+        };
+        let mut batch = vec![first];
+        while let Ok(next) = rx.try_recv() {
+            batch.push(next);
+        }
+
+        for req in batch {
+            match req {
+                EngineRequest::Shutdown => {
+                    flush_pending(&mut engine, &mut pending);
+                    break 'outer;
+                }
+                EngineRequest::Commit { xid, reply } => {
+                    let result = engine.commit(xid);
+                    pending.push((reply, result));
+                }
+                EngineRequest::Abort { xid, reply } => {
+                    let result = engine.abort(xid);
+                    pending.push((reply, result));
+                }
+                EngineRequest::Checkpoint { reply } => {
+                    // A checkpoint flushes dirty pages and truncates the WAL,
+                    // so anything deferred must be forced durable first.
+                    flush_pending(&mut engine, &mut pending);
+                    let _ = reply.send(engine.checkpoint());
+                }
+                other => dispatch_immediate(&mut engine, other),
             }
-            EngineRequest::Abort { xid, reply } => {
-                let _ = reply.send(engine.abort(xid));
-            }
-            EngineRequest::Insert { xid, data, reply } => {
-                let _ = reply.send(engine.insert(xid, &data));
-            }
-            EngineRequest::Get { xid, row_id, reply } => {
-                let _ = reply.send(engine.get(xid, row_id));
-            }
-            EngineRequest::Update {
-                xid,
-                row_id,
-                new_data,
-                reply,
-            } => {
-                let _ = reply.send(engine.update(xid, row_id, &new_data));
-            }
-            EngineRequest::Delete { xid, row_id, reply } => {
-                let _ = reply.send(engine.delete(xid, row_id));
-            }
-            EngineRequest::ExecuteSql { xid, sql, reply } => {
-                let _ = reply.send(engine.execute_sql(xid, &sql));
-            }
-            EngineRequest::ExecuteCypher { xid, query, reply } => {
-                let _ = reply.send(engine.execute_cypher(xid, &query));
-            }
-            EngineRequest::CreateEdge {
-                xid,
-                from_id,
-                to_id,
-                edge_type,
-                props,
-                reply,
-            } => {
-                let _ = reply.send(engine.create_edge(xid, from_id, to_id, &edge_type, &props));
-            }
-            EngineRequest::DeleteEdge {
-                xid,
-                row_id,
-                from_id,
-                reply,
-            } => {
-                let _ = reply.send(engine.delete_edge(xid, row_id, from_id));
-            }
-            EngineRequest::EdgesFrom {
-                xid,
-                from_id,
-                reply,
-            } => {
-                let _ = reply.send(engine.edges_from(xid, from_id));
-            }
-            EngineRequest::EnableEvents { table, reply } => {
-                let _ = reply.send(engine.enable_events(&table));
-            }
-            EngineRequest::PollEvents {
-                xid,
-                consumer,
-                limit,
-                reply,
-            } => {
-                let _ = reply.send(engine.poll_events(xid, &consumer, limit));
-            }
-            EngineRequest::AckEvents {
-                xid,
-                consumer,
-                up_to_seq,
-                reply,
-            } => {
-                let _ = reply.send(engine.ack_events(xid, &consumer, up_to_seq));
-            }
-            EngineRequest::VacuumEvents { xid, reply } => {
-                let _ = reply.send(engine.vacuum_events(xid));
-            }
-            EngineRequest::SetColumnIndex {
-                table,
-                column,
-                kind,
-                reply,
-            } => {
-                let _ = reply.send(engine.set_column_index(&table, &column, kind));
-            }
-            EngineRequest::IndexStatus {
-                table,
-                column,
-                reply,
-            } => {
-                let _ = reply.send(engine.index_status(&table, &column));
-            }
-            EngineRequest::Checkpoint { reply } => {
-                let _ = reply.send(engine.checkpoint());
-            }
+        }
+
+        flush_pending(&mut engine, &mut pending);
+    }
+}
+
+/// Handle every request whose reply can be sent immediately (reads, and writes
+/// inside a not-yet-committed transaction). `Commit`/`Abort`/`Checkpoint`/
+/// `Shutdown` are handled by the batching loop and never reach here.
+fn dispatch_immediate(engine: &mut Engine, req: EngineRequest) {
+    match req {
+        EngineRequest::Shutdown
+        | EngineRequest::Commit { .. }
+        | EngineRequest::Abort { .. }
+        | EngineRequest::Checkpoint { .. } => {
+            unreachable!("batching loop handles these variants directly")
+        }
+        EngineRequest::Begin { isolation, reply } => {
+            let result = match isolation {
+                Some(iso) => engine.begin_with_isolation(iso),
+                None => engine.begin(),
+            };
+            let _ = reply.send(result);
+        }
+        EngineRequest::Insert { xid, data, reply } => {
+            let _ = reply.send(engine.insert(xid, &data));
+        }
+        EngineRequest::Get { xid, row_id, reply } => {
+            let _ = reply.send(engine.get(xid, row_id));
+        }
+        EngineRequest::Update {
+            xid,
+            row_id,
+            new_data,
+            reply,
+        } => {
+            let _ = reply.send(engine.update(xid, row_id, &new_data));
+        }
+        EngineRequest::Delete { xid, row_id, reply } => {
+            let _ = reply.send(engine.delete(xid, row_id));
+        }
+        EngineRequest::ExecuteSql { xid, sql, reply } => {
+            let _ = reply.send(engine.execute_sql(xid, &sql));
+        }
+        EngineRequest::ExecuteCypher { xid, query, reply } => {
+            let _ = reply.send(engine.execute_cypher(xid, &query));
+        }
+        EngineRequest::CreateEdge {
+            xid,
+            from_id,
+            to_id,
+            edge_type,
+            props,
+            reply,
+        } => {
+            let _ = reply.send(engine.create_edge(xid, from_id, to_id, &edge_type, &props));
+        }
+        EngineRequest::DeleteEdge {
+            xid,
+            row_id,
+            from_id,
+            reply,
+        } => {
+            let _ = reply.send(engine.delete_edge(xid, row_id, from_id));
+        }
+        EngineRequest::EdgesFrom {
+            xid,
+            from_id,
+            reply,
+        } => {
+            let _ = reply.send(engine.edges_from(xid, from_id));
+        }
+        EngineRequest::EnableEvents { table, reply } => {
+            let _ = reply.send(engine.enable_events(&table));
+        }
+        EngineRequest::PollEvents {
+            xid,
+            consumer,
+            limit,
+            reply,
+        } => {
+            let _ = reply.send(engine.poll_events(xid, &consumer, limit));
+        }
+        EngineRequest::AckEvents {
+            xid,
+            consumer,
+            up_to_seq,
+            reply,
+        } => {
+            let _ = reply.send(engine.ack_events(xid, &consumer, up_to_seq));
+        }
+        EngineRequest::VacuumEvents { xid, reply } => {
+            let _ = reply.send(engine.vacuum_events(xid));
+        }
+        EngineRequest::SetColumnIndex {
+            table,
+            column,
+            kind,
+            reply,
+        } => {
+            let _ = reply.send(engine.set_column_index(&table, &column, kind));
+        }
+        EngineRequest::IndexStatus {
+            table,
+            column,
+            reply,
+        } => {
+            let _ = reply.send(engine.index_status(&table, &column));
         }
     }
 }

@@ -1210,3 +1210,62 @@ original planning document for this milestone.
 - **Rust-only in v1** — no other language bindings.
 - **Blocking I/O** — one attach-client call blocks its calling thread for
   the HTTP round-trip; acceptable given no stated concurrency requirement.
+
+---
+
+## Performance: group commit + read-only fsync skip   [PROTOTYPE — branch `m9-group-commit`]   2026-07-08
+
+**PR:** _pending_
+
+Not a numbered milestone (the `m9_*` filename is taken by the parked
+Python-bindings backlog doc). A post-M8 performance track addressing the
+diagnosis from the FFSDB-eval session: the ~3–4 ms floor on every durable
+operation is per-statement fsync, compounded by the server serializing all
+requests through one writer thread. Full plan + correctness analysis:
+`docs/backlog/group_commit_and_read_concurrency.md`.
+
+**What shipped (3 of 4 changes):**
+- **Read-only fsync skip** (`txn.rs`): `TransactionManager::commit` skips
+  `commit_user_txn` (WAL record + fsync) when `undo_log.is_empty()`. A
+  read-only txn has nothing to make durable; recovery treats the orphan
+  `WAL_TXN_BEGIN` as an incomplete user txn whose undo pass finds no
+  mutations to reverse. Resolves the M1.d open question.
+- **Group commit** (`wal.rs` + `server/engine_handle.rs`): a default-off
+  `Wal::deferred_sync` mode gates the fsync in all four commit/abort paths;
+  the server writer thread drains all queued requests into a batch and
+  issues **one fsync per batch**, withholding commit/abort replies until
+  that fsync so no client observes a non-durable commit. The embedded API
+  and crash harness keep per-statement durability (deferred mode is
+  server-writer-thread-only).
+- **Buffer-pool force-WAL-on-evict** (`bufferpool.rs` + `heap.rs` + `lib.rs`):
+  the pool tracks the durable WAL frontier (`durable_wal_lsn`) and
+  `find_victim` writes back + evicts a dirty page once its WAL is durable
+  (ARIES steal); `BufferPool::fetch_page_for_write` — used by every heap
+  write/undo path + the FSM scan — force-syncs the WAL and retries when the
+  pool is full of not-yet-durable dirty pages. Makes deferred mode
+  unconditionally safe for working sets larger than the pool, and **largely
+  fixes the pre-existing M6 `BufferPoolFull`-at-scale limitation** (dirty
+  pages were previously never evictable — the D5 hint was hardwired to
+  `INVALID_LSN`).
+
+**Metrics (M5 Pro, 2026-07-08):**
+
+| Concurrent `POST /sql` INSERT | before ops/s | after ops/s | speedup |
+|---|---|---|---|
+| 1 client | ~131 | ~242 | 1.8× |
+| 10 clients | ~149 | ~756 | 5.1× |
+| 50 clients | ~153 | **~4,780** | **31×** |
+
+Throughput went from **flat** (the single-writer ceiling) to **scaling**
+with load. Embedded point SELECT (read-only fsync skip): ~3.05 ms →
+**1.09 µs** (~2,800×). Peak RSS unchanged (no new buffering — batching
+reuses the existing unbounded request channel).
+
+**Verification:** 229 unit + 25 server integration + 11 crash-harness tests
+green; clippy `-D warnings` + fmt clean. No §3 locked decision re-opened
+(D1/D2/D5 upheld — the new write-back-on-evict path only writes pages whose
+WAL is already durable, and the crash harness confirms recovery is intact).
+
+**Not done (tracked in the design doc):** 6b concurrent read path (readers
+off the single writer thread — the one remaining architectural change, an
+addition to existing MVCC).

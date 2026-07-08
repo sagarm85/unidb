@@ -112,6 +112,14 @@ pub struct Wal {
     next_mini_txn: u64,
     /// LSN of the last fsync'd record (the durable WAL frontier).
     pub durable_lsn: Lsn,
+    /// Group-commit mode (M9). When `true`, `commit_mini_txn`/`abort_mini_txn`
+    /// /`commit_user_txn`/`abort_user_txn` append their records but skip the
+    /// per-call fsync; durability is forced explicitly by a later [`Self::sync`]
+    /// call. Off by default so the embedded API and the crash-injection harness
+    /// keep their per-statement durability guarantee. Only the server writer
+    /// thread — which owns the sole `Engine` handle and issues one `sync` per
+    /// drained request batch — turns this on.
+    deferred_sync: bool,
 }
 
 impl Wal {
@@ -129,6 +137,7 @@ impl Wal {
             next_lsn,
             next_mini_txn: 1,
             durable_lsn: INVALID_LSN,
+            deferred_sync: false,
         })
     }
 
@@ -142,15 +151,29 @@ impl Wal {
 
     pub fn commit_mini_txn(&mut self, txn_id: u64, prev_lsn: Lsn) -> Result<Lsn> {
         let lsn = self.append_raw(txn_id, prev_lsn, WAL_COMMIT, 0, 0, &[], &[])?;
-        self.fsync()?;
-        tracing::debug!(mini_txn_id = txn_id, lsn, "WAL COMMIT (fsynced)");
+        if !self.deferred_sync {
+            self.fsync()?;
+        }
+        tracing::debug!(
+            mini_txn_id = txn_id,
+            lsn,
+            deferred = self.deferred_sync,
+            "WAL COMMIT"
+        );
         Ok(lsn)
     }
 
     pub fn abort_mini_txn(&mut self, txn_id: u64, prev_lsn: Lsn) -> Result<Lsn> {
         let lsn = self.append_raw(txn_id, prev_lsn, WAL_ABORT, 0, 0, &[], &[])?;
-        self.fsync()?;
-        tracing::debug!(mini_txn_id = txn_id, lsn, "WAL ABORT (fsynced)");
+        if !self.deferred_sync {
+            self.fsync()?;
+        }
+        tracing::debug!(
+            mini_txn_id = txn_id,
+            lsn,
+            deferred = self.deferred_sync,
+            "WAL ABORT"
+        );
         Ok(lsn)
     }
 
@@ -207,16 +230,35 @@ impl Wal {
 
     pub fn commit_user_txn(&mut self, xid: Xid, prev_lsn: Lsn) -> Result<Lsn> {
         let lsn = self.append_raw(xid, prev_lsn, WAL_TXN_COMMIT, 0, 0, &[], &[])?;
-        self.fsync()?;
-        tracing::debug!(xid, lsn, "WAL TXN_COMMIT (fsynced)");
+        if !self.deferred_sync {
+            self.fsync()?;
+        }
+        tracing::debug!(xid, lsn, deferred = self.deferred_sync, "WAL TXN_COMMIT");
         Ok(lsn)
     }
 
     pub fn abort_user_txn(&mut self, xid: Xid, prev_lsn: Lsn) -> Result<Lsn> {
         let lsn = self.append_raw(xid, prev_lsn, WAL_TXN_ABORT, 0, 0, &[], &[])?;
-        self.fsync()?;
-        tracing::debug!(xid, lsn, "WAL TXN_ABORT (fsynced)");
+        if !self.deferred_sync {
+            self.fsync()?;
+        }
+        tracing::debug!(xid, lsn, deferred = self.deferred_sync, "WAL TXN_ABORT");
         Ok(lsn)
+    }
+
+    /// Enable/disable group-commit deferral (M9). See the `deferred_sync`
+    /// field doc. When turning it **off**, callers should normally call
+    /// [`Self::sync`] first to make anything appended-but-unsynced durable.
+    pub fn set_deferred_sync(&mut self, deferred: bool) {
+        self.deferred_sync = deferred;
+    }
+
+    /// Force every record appended so far to durable storage and advance the
+    /// durable frontier. In group-commit mode the writer thread calls this
+    /// exactly once per drained batch, amortizing one fsync across every
+    /// transaction that committed in that batch.
+    pub fn sync(&mut self) -> Result<()> {
+        self.fsync()
     }
 
     pub fn log_checkpoint(&mut self) -> Result<Lsn> {

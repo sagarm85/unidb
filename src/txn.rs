@@ -182,7 +182,17 @@ impl TransactionManager {
             .active
             .remove(&xid)
             .ok_or(DbError::TxnNotActive { xid })?;
-        wal.commit_user_txn(xid, txn.last_lsn)?;
+        // Read-only transactions (nothing recorded in `undo_log`) have no
+        // changes to make durable, so they write no WAL_TXN_COMMIT record and
+        // pay no fsync — the same optimization Postgres/SQLite apply. Safe
+        // because recovery classifies the orphan WAL_TXN_BEGIN as an
+        // incomplete user txn whose undo pass finds no mutations owned by
+        // `xid` to reverse (see recovery.rs), and no committed tuple ever
+        // references a read-only xid's xmin/xmax. Fixes the M1.d "read-only
+        // commit pays an unnecessary fsync" regression noted in MEMORY.md.
+        if !txn.undo_log.is_empty() {
+            wal.commit_user_txn(xid, txn.last_lsn)?;
+        }
         self.committed.insert(xid);
         lock_mgr.release_all(xid);
         tracing::info!(xid, "transaction commit");

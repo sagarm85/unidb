@@ -16,6 +16,7 @@ use crate::{
     format::{Lsn, PageId, INVALID_LSN},
     mmap::PageFileMmap,
     page::SlottedPage,
+    wal::Wal,
 };
 
 struct Frame {
@@ -46,6 +47,13 @@ pub struct BufferPool {
     file: File,
     mmap: PageFileMmap,
     file_page_count: u32,
+    /// The durable WAL frontier as last observed from the `Wal` (D5). A dirty
+    /// page may be written back and evicted only when `page.LSN <=
+    /// durable_wal_lsn` — otherwise stealing it would put un-recoverable state
+    /// on disk. Kept as a lower-bound hint: stale-low is always safe (it only
+    /// makes `find_victim` skip a page that is in fact evictable), never
+    /// unsafe. Refreshed on every write-path fetch and on `sync_wal`.
+    durable_wal_lsn: Lsn,
 }
 
 impl BufferPool {
@@ -85,7 +93,17 @@ impl BufferPool {
             file,
             mmap,
             file_page_count,
+            durable_wal_lsn: INVALID_LSN,
         })
+    }
+
+    /// Advance the pool's view of the durable WAL frontier (D5). Called after
+    /// any WAL fsync so `find_victim` can safely write back and evict dirty
+    /// pages up to `lsn`. Monotonic: never moves the frontier backward.
+    pub fn set_durable_wal_lsn(&mut self, lsn: Lsn) {
+        if lsn > self.durable_wal_lsn {
+            self.durable_wal_lsn = lsn;
+        }
     }
 
     /// Allocate a new page in the file, return its PageId.
@@ -121,6 +139,28 @@ impl BufferPool {
         self.frame_index.insert(page_id, frame_idx);
 
         self.read_page_from_mmap(page_id)
+    }
+
+    /// Like [`Self::fetch_page`], but usable on the write path, where making
+    /// room may require *stealing* a dirty page. It first refreshes the
+    /// durable-WAL frontier from `wal` so `find_victim` can write back and
+    /// evict any now-durable dirty page; and if the pool is still full of
+    /// dirty pages whose WAL is **not** yet durable (the group-commit
+    /// deferred-sync case, M9), it forces a single WAL fsync and retries once
+    /// — the ARIES "force the log before stealing the page" step (D5). This is
+    /// what makes deferred-sync mode safe for working sets larger than the
+    /// pool, and it also lets the ordinary (per-statement-fsync) path evict
+    /// dirty pages at scale instead of failing with `BufferPoolFull`.
+    pub fn fetch_page_for_write(&mut self, page_id: PageId, wal: &mut Wal) -> Result<SlottedPage> {
+        self.set_durable_wal_lsn(wal.durable_lsn);
+        match self.fetch_page(page_id) {
+            Err(DbError::BufferPoolFull) => {
+                wal.sync()?;
+                self.set_durable_wal_lsn(wal.durable_lsn);
+                self.fetch_page(page_id)
+            }
+            other => other,
+        }
     }
 
     /// Write a modified SlottedPage back into the mmap window (in-memory only).
@@ -200,36 +240,35 @@ impl BufferPool {
         for _ in 0..cap * 2 {
             let idx = self.clock_hand;
             self.clock_hand = (self.clock_hand + 1) % cap;
-            let f = &self.frames[idx];
-            if f.pin_count > 0 {
+            let (pinned, referenced, dirty, page_id) = {
+                let f = &self.frames[idx];
+                (f.pin_count > 0, f.clock_ref, f.dirty, f.page_id)
+            };
+            if pinned {
                 continue;
             }
-            if f.clock_ref {
+            if referenced {
                 self.frames[idx].clock_ref = false;
                 continue;
             }
-            // D5: never evict a dirty page whose LSN is ahead of the durable WAL.
-            // Callers of find_victim must flush first if needed; for now just skip
-            // such frames (they will become evictable after a flush).
-            if f.dirty {
-                if let Some(pid) = f.page_id {
-                    if let Ok(p) = self.read_page_from_mmap(pid) {
-                        if p.lsn() > self.durable_wal_lsn_hint() {
-                            continue; // skip — can't evict yet
-                        }
-                    }
+            if dirty {
+                let Some(pid) = page_id else {
+                    return Ok(idx);
+                };
+                let page_lsn = self.read_page_from_mmap(pid).map(|p| p.lsn()).unwrap_or(0);
+                // D5: a dirty page may be stolen only once its WAL is durable.
+                // If the durable frontier is unknown (nothing fsynced yet) or
+                // behind this page, skip it — the write path
+                // (`fetch_page_for_write`) forces a WAL sync and retries.
+                if self.durable_wal_lsn == INVALID_LSN || page_lsn > self.durable_wal_lsn {
+                    continue;
                 }
+                // Durable: write it back before reusing the frame (ARIES steal).
+                self.flush_page(pid, self.durable_wal_lsn)?;
             }
             return Ok(idx);
         }
         Err(DbError::BufferPoolFull)
-    }
-
-    /// Returns 0 when unknown; callers that want strict D5 on eviction should
-    /// flush_all before relying on pool capacity. This hint keeps the eviction
-    /// path simple without requiring the pool to track the WAL.
-    fn durable_wal_lsn_hint(&self) -> Lsn {
-        INVALID_LSN
     }
 }
 
@@ -269,6 +308,55 @@ mod tests {
             result.is_err(),
             "D5: flush must be rejected when page LSN > durable WAL LSN"
         );
+    }
+
+    /// 6a: a pool full of dirty pages whose WAL is not yet durable (the
+    /// group-commit deferred-sync case) must not dead-end at `BufferPoolFull`.
+    /// The write-path fetch forces a WAL fsync and then steals a now-durable
+    /// page — without ever violating D5 (a page is written back only once its
+    /// LSN is durable).
+    #[test]
+    fn fetch_for_write_forces_wal_sync_to_evict_nondurable_dirty_pages() {
+        use crate::wal::Wal;
+        let dir = tempdir().unwrap();
+        let mut pool = open_pool(dir.path(), 2); // tiny: 2 frames
+        let mut wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
+        wal.set_deferred_sync(true); // append without fsync — durable stays behind
+
+        // Fill both frames with unpinned, dirty, NOT-yet-durable pages.
+        for i in 0..2u64 {
+            let pid = pool.alloc_page().unwrap();
+            let _ = pool.fetch_page(pid).unwrap(); // bring into a frame (pins it)
+            let lsn = wal.begin_user_txn(i + 1).unwrap(); // deferred: no fsync
+            let mut page = SlottedPage::new(pid, PAGE_TYPE_HEAP, DEFAULT_PAGE_SIZE as usize);
+            page.set_lsn(lsn);
+            pool.write_page(&page).unwrap(); // marks the frame dirty
+            pool.unpin(pid);
+        }
+        assert_eq!(wal.durable_lsn, INVALID_LSN, "nothing fsynced yet");
+
+        // A plain fetch can find no victim — every frame is dirty and ahead of
+        // the (still-INVALID) durable frontier.
+        let pid2 = pool.alloc_page().unwrap();
+        assert!(
+            matches!(pool.fetch_page(pid2), Err(DbError::BufferPoolFull)),
+            "plain fetch must fail when all frames are dirty + non-durable"
+        );
+
+        // The write-path fetch forces a WAL sync (making the two pages durable)
+        // and then succeeds by stealing one of them — reaching past this
+        // `unwrap` is itself the proof that eviction no longer dead-ends. (The
+        // freshly-alloc'd page reads as zeros until the caller initializes it,
+        // so its embedded page_id is not yet meaningful — hence no id check.)
+        let _ = pool.fetch_page_for_write(pid2, &mut wal).unwrap();
+        assert!(
+            wal.durable_lsn > INVALID_LSN,
+            "fetch_for_write must have forced an fsync to make room"
+        );
+        // The pool is usable again: only one of the two originals was stolen,
+        // so a subsequent write-path fetch still succeeds.
+        let pid3 = pool.alloc_page().unwrap();
+        pool.fetch_page_for_write(pid3, &mut wal).unwrap();
     }
 
     #[test]

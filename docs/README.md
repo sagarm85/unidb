@@ -8,10 +8,19 @@
   `unidb-server` binary (M5): every route's payload and response shape,
   auth model, error codes, and known limitations. Also documents the
   Rust attach client (M8).
+- [performance/](performance/) — benchmark evaluations against external
+  systems. `fssdb/` holds the head-to-head comparison against the FFS
+  database's published evals (<https://ffsdb.com/evals>), unidb's fresh
+  `cargo bench` numbers, and a same-machine Postgres + pgvector run — with
+  the architectural caveats that make the ratios meaningful (raw index
+  primitives vs a durable transactional engine).
 - [backlog/](backlog/) — saved plans for future work. Entries are marked
   `NOT STARTED`/`PAUSED` while pending and updated (or removed in favor of
   the `PROGRESS.md` entry) once the work ships — e.g.
-  `phase2_sql_capability_expansion.md` (paused, not started). These are
+  `phase2_sql_capability_expansion.md` (paused, not started) and
+  `group_commit_and_read_concurrency.md` (group commit + read-only fsync
+  skip + buffer-pool force-WAL-on-evict landed on branch `m9-group-commit`;
+  one follow-up — a concurrent read path — remains). These are
   durable, git-tracked references — unlike Claude Code's own ephemeral
   plan-mode file, which gets overwritten by the next plan.
 

@@ -104,7 +104,7 @@ impl Heap {
         let page_id = self.find_or_alloc_page(needed, pool, wal)?;
 
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
-        let mut page = pool.fetch_page(page_id)?;
+        let mut page = pool.fetch_page_for_write(page_id, wal)?;
         let slot = page.insert_versioned(data, xid, 0, prev)?;
         on_write(xid, RowId { page_id, slot });
         let redo = encode_insert_redo(xid, prev, data);
@@ -174,7 +174,7 @@ impl Heap {
 
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
 
-        let mut old_page = pool.fetch_page(row_id.page_id)?;
+        let mut old_page = pool.fetch_page_for_write(row_id.page_id, wal)?;
         let old_th = old_page.tuple_header(row_id.slot)?;
         if old_th.xmax != 0 {
             pool.unpin(row_id.page_id);
@@ -197,7 +197,7 @@ impl Heap {
         pool.write_page(&old_page)?;
         pool.unpin(row_id.page_id);
 
-        let mut new_page = pool.fetch_page(new_page_id)?;
+        let mut new_page = pool.fetch_page_for_write(new_page_id, wal)?;
         let prev = Some((row_id.page_id, row_id.slot));
         let new_slot = new_page.insert_versioned(new_data, xid, 0, prev)?;
         let insert_redo = encode_insert_redo(xid, prev, new_data);
@@ -228,7 +228,7 @@ impl Heap {
         lock_mgr.try_acquire_write(RecordId::row(row_id.page_id, row_id.slot), xid)?;
 
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
-        let mut page = pool.fetch_page(row_id.page_id)?;
+        let mut page = pool.fetch_page_for_write(row_id.page_id, wal)?;
         let th = page.tuple_header(row_id.slot)?;
         if th.xmax != 0 {
             pool.unpin(row_id.page_id);
@@ -266,7 +266,7 @@ impl Heap {
         wal: &mut Wal,
     ) -> Result<()> {
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
-        let mut page = pool.fetch_page(page_id)?;
+        let mut page = pool.fetch_page_for_write(page_id, wal)?;
         let old_xmax = page.tuple_header(slot)?.xmax;
         let lsn = wal.log_update(
             txn_id,
@@ -300,7 +300,7 @@ impl Heap {
         wal: &mut Wal,
     ) -> Result<()> {
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
-        let mut page = pool.fetch_page(page_id)?;
+        let mut page = pool.fetch_page_for_write(page_id, wal)?;
         let lsn = wal.log_update(
             txn_id,
             begin_lsn,
@@ -352,7 +352,7 @@ impl Heap {
         wal: &mut Wal,
     ) -> Result<PageId> {
         for &pid in &self.pages {
-            let page = pool.fetch_page(pid)?;
+            let page = pool.fetch_page_for_write(pid, wal)?;
             let free = page.free_space();
             pool.unpin(pid);
             if free >= needed {
