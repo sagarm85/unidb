@@ -14,18 +14,13 @@
   `cargo bench` numbers, and a same-machine Postgres + pgvector run — with
   the architectural caveats that make the ratios meaningful (raw index
   primitives vs a durable transactional engine).
-- [backlog/](backlog/) — saved plans for future work. Start with
-  [`roadmap.md`](backlog/roadmap.md) — the consolidated future roadmap,
-  positioning decision, parallel-worktree lane map (Core/SQL/Surface), and
-  per-session decision log. Individual plans are marked `NOT STARTED`/
-  `PAUSED` while pending and updated (or removed in favor of the
-  `PROGRESS.md` entry) once the work ships — e.g.
-  `phase2_sql_capability_expansion.md` (paused, not started) and
-  `group_commit_and_read_concurrency.md` (group commit + read-only fsync
-  skip + buffer-pool force-WAL-on-evict + concurrent reads — merged to
-  `main` via PRs #2–#4). These are durable, git-tracked references — unlike
-  Claude Code's own ephemeral plan-mode file, which gets overwritten by the
-  next plan.
+- [backlog/](backlog/) — [`roadmap.md`](backlog/roadmap.md) is the **single
+  forward plan**: positioning, the honest gap-to-a-real-database inventory,
+  the 6-phase ACID-first scaling plan, the parallel-worktree lane model
+  (Core/SQL/Ops), how to start now, and the decision log. Shipped
+  per-milestone plans have been retired here — their record lives in
+  `PROGRESS.md`. This is a durable, git-tracked reference — unlike Claude
+  Code's own ephemeral plan-mode file, which gets overwritten by the next plan.
 
 For design decisions, milestone status, and architecture, see the
 project-root `CLAUDE.md`, `PROGRESS.md`, and `MEMORY.md`.

@@ -1,237 +1,182 @@
-# unidb — Future Roadmap & Decision Log
+# unidb — Roadmap & Scaling Plan
 
-> Durable roadmap: the positioning decision, what has shipped, the planned
-> tracks, the parallel-worktree lane map, and a per-session record of what
-> was decided and achieved. This *distills* `CLAUDE.md` / `MEMORY.md` /
+> The single forward-looking plan: positioning, what's shipped, the honest
+> gap to a real database, and the phased path to close it. Correctness and
+> performance are gates, not features. Distills `CLAUDE.md` / `MEMORY.md` /
 > `PROGRESS.md` — when it disagrees with them, they win.
-> **Last updated: 2026-07-08.**
+> **Last updated: 2026-07-08.** Supersedes the earlier per-milestone backlog
+> docs (now shipped and recorded in `PROGRESS.md`, or folded into a phase below).
 
 ---
 
-## 1. Positioning (the decision)
+## 1. Positioning (the principles — unchanged)
 
-The charter stays honest, sharpened toward an **AI-native multi-model** identity:
-
-- unidb is **the transactional database for AI-native apps** — relational +
-  vector + graph + events in **one commit** — so a team never stitches
-  together Postgres + pgvector + a graph DB + Kafka.
-- **Performance goal: Postgres-*class* on single-model (match, not beat);
-  win decisively on the cross-domain transactional workload and on developer
-  experience.** We do **not** chase "beat Postgres/MySQL generally" — that
-  reverses `CLAUDE.md` §1, is team/years-scale, and dilutes the moat.
-- **Columnar / HTAP (OLAP) is parked as an explicit future Track E**, gated
-  on real analytics demand — not pursued now.
-
-**Why (the honest framing):** vector search and graph traversal are
-*index-probe* (operational) workloads, not *scan-and-aggregate* (OLAP) — so
-"we already have vector + graph" does **not** make unidb analytical. unidb is
-OLTP-shaped (row store, WAL, MVCC, single-writer), a deliberate generalist
-across four **operational** models. Multi-model breadth and OLAP
-specialization are opposite axes; doing both at once is the
-maximum-difficulty path.
+- unidb is **the transactional database for AI-native apps**: relational +
+  vector + graph + events + **big files**, atomic in **one commit**.
+- **ACID is non-negotiable.** No change lands if it weakens durability or
+  isolation. The crash-injection harness must stay green and grow.
+- **Performance is measured, never assumed** — every phase carries a benchmark.
+- **Not a Postgres clone.** We build the standard, correct engine core (ARIES
+  WAL, MVCC, buffer pool — the right foundation), but the *moat* is the
+  multi-model, AI-native story Postgres doesn't have: durable vector search,
+  graph, and large-object storage under one atomic commit.
+- **Target scale (confirmed): a strong single node + read replicas** — 100s of
+  GB, high read throughput, single primary for writes. Fully distributed /
+  sharded write scale is parked (see §7), not a near-term goal.
 
 ---
 
 ## 2. What's shipped (baseline)
 
-| Milestone | Capability delivered |
+| Milestone | Capability |
 |---|---|
-| M0 | Single-file paged storage, buffer pool, WAL, ARIES crash recovery, control file |
-| M1 | MVCC transactions (RC/RR), SQL subset, catalog, JSON columns, RLS |
-| M2 | `VECTOR(n)` type, async HNSW index, `NEAR`, full-text inverted index |
-| M3 | Graph edges, edge-list index, Cypher read subset |
-| M4 | WAL-derived event queue, durable consumer offsets, `vacuum_events` |
-| M5 | REST server + verify-only JWT + SSE subscribe + `/metrics` |
-| M6 / M7 / M8 | B-Tree index + index-assisted SELECT · CSR graph index · Rust attach client |
-| M9 (perf) | **Group commit + read-only fsync skip + concurrent reads (ReadHandle)** — merged via PRs #2–#4 to `main`, 2026-07-08 |
-| Track D | Semantic search: per-index cosine metric (`Metric::{Euclidean,Cosine}`) + `unidb-embed` CLI (embed/search over REST) — `main`, 2026-07-08 |
-| M11 | SQL constraints: PK / FK / UNIQUE / NOT NULL / CHECK / DEFAULT — parsed, persisted, enforced on write — landing 2026-07-08 |
-| M10 | Heap vacuum / MVCC GC: `Engine::vacuum()` — reader-aware horizon, crash-safe `WAL_VACUUM`, secondary-index vacuum gate, page compaction + slot reuse — landing 2026-07-08 |
+| M0–M5 | Storage core · MVCC + SQL subset + RLS + JSON · vector (HNSW) + full-text · graph (Cypher subset) · WAL event queue · REST/JWT/SSE/metrics server |
+| M6 / M7 / M8 | B-Tree index · CSR graph index · Rust attach client (`unidb-attach`) |
+| M9 (perf) | Group commit + read-only fsync skip + concurrent reads (`ReadHandle`) |
+| Track D | Semantic search: per-index cosine metric + `unidb-embed` CLI |
+| M10 | Heap vacuum / MVCC GC (`Engine::vacuum()`) |
+| M11 | SQL constraints (PK / FK / UNIQUE / NOT NULL / CHECK / DEFAULT) |
+
+The core is architecturally correct — it is not a toy. But it is the **small
+version**; §3 is the honest gap to production.
 
 ---
 
-## 3. The blend roadmap (planned)
+## 3. The gap to a real database (honest inventory)
 
-| Track | Deliverables | Achieves | Effort* | Phase |
+Ranked by severity. **The correctness holes (Tier 0) outrank every
+scale/feature item** — they pass tests and demos, then silently lose or corrupt
+data under load. Fix them first.
+
+**Tier 0 — silent correctness / data-loss (invisible until the worst moment)**
+- **No torn-page protection** (no full-page-writes / double-write) — a crash
+  mid-8 KiB-page-write leaves a half-written page; CRC detects it, then the page
+  is unrecoverable. *The #1 hole.*
+- **Isolation not fully correct** — RC concurrent-update re-evaluation
+  (EvalPlanQual) aborts instead of re-reading; `SERIALIZABLE` (SSI) is a no-op
+  seam, so write-skew is possible.
+- **fsync failure handling** (fsyncgate), ordering.
+
+**Tier 1 — can't build real apps (functional)**
+- **Data types far too few** — only Int/Text/Bool/JSON/Vector. No **DECIMAL**
+  (money), no **DATE/TIME/TIMESTAMP** (time), no FLOAT/UUID/BYTEA.
+- **No ALTER / DROP / TRUNCATE** — no schema evolution.
+- **No sequences / SERIAL** — no surrogate keys.
+- **No prepared statements / bind params** — injection surface + no plan reuse.
+
+**Tier 2 — can't operate it (ops)**
+- **No EXPLAIN** — can't diagnose slow queries. No **backups / PITR**. No
+  **users / roles / GRANT**. No **connection model** (single writer thread). No
+  **query timeouts / cancel / per-query memory limits**.
+
+**Tier 3 — scale/performance (the 4 flags)**
+- **Joins unbuilt** (+ need cost-based optimizer + statistics).
+- **Indexes rebuilt on open, RAM-bound** — O(data) startup, won't fit at scale.
+- **Single writer thread** — one-core write ceiling; needs concurrent writers +
+  a real lock manager (shared/exclusive, wait queues, deadlock detection).
+- **Manual checkpoint + single-file rewrite-truncate WAL** — needs
+  auto-checkpoint + segmented WAL + slots for multiple consumers/replicas.
+- Plus: **`alloc_page` re-maps the whole file per page** (`bufferpool.rs`) —
+  fine small, fatal at 100s of GB; fixed 256-frame buffer pool; linear-scan FSM.
+
+**Tier 4 — HA & security**
+- Replication / failover · TLS · encryption-at-rest · audit log.
+
+---
+
+## 4. The phased plan
+
+| Phase | Goal | Key workstreams | Lane | Gate |
 |---|---|---|---|---|
-| **A — Engine maturity** | ~~Constraints (PK/FK/UNIQUE/NN/CHECK/DEFAULT)~~ ✅ done (M11) · ~~GC/vacuum (M10)~~ ✅ done · ~~group commit + concurrent reads~~ ✅ done · buffer pool + real FSM · Phase 2 SQL (joins/agg/ORDER BY) + cost-based optimizer · async replication + PITR/backup | Postgres-**class** correctness, durability, standard SQL, HA; no space leak | ~6–8 remaining | P1→P3 |
-| **B — Studio UI** | SQL + Table editor · realtime changes feed · graph explorer ★ · vector playground ★ · metrics/logs · (file upload ⚙, auth ⚙ after engine work) | Visual test/admin console; showcases the multi-model thesis | ~3–4 (+engine deps) | P1→P2 |
-| **C — GraphQL** | Catalog-auto-generated schema + edge-traversal resolvers | Typed graph API; framework/AI-friendly | ~2 (after Phase 2 SQL) | P2→P3 |
-| **D — Semantic search** | ~~Embedding CLI/client · cosine metric~~ ✅ done · filtered vector search · (optional search UI) | End-to-end AI semantic search on the shipped vector engine | ~0.5 remaining | P1→P2 |
-| **E — Columnar / HTAP** *(parked, gated on demand)* | Columnar segment store + vectorized executor — **only if analytics demand appears** | OLAP scan performance; true HTAP | ~5–7 (rewrite/team-scale) | Deferred |
+| **1 — ACID & storage foundation** *(freeze features until done)* | Close the silent correctness holes + growth blocker | Full-page-writes · fsync hardening · `alloc_page` remap fix + large configurable buffer pool + real FSM · isolation correctness (RC re-eval + SSI) · auto-checkpoint | **Core (serial)** | New crash points; write-skew tests; no perf regression |
+| **2 — Real data model** | Usable for real apps | DECIMAL, DATE/TIME/TIMESTAMP, FLOAT, UUID, BYTEA · ALTER/DROP/TRUNCATE + transactional DDL · sequences/SERIAL · prepared statements + bind params | **SQL (parallel)** | Type round-trips; no injection surface |
+| **3 — Multi-model durable storage** *(the moat)* | Kill rebuild-on-open + RAM ceiling; own the AI/big-file story | Durable paged WAL-logged indexes (B-Tree/inverted/CSR) · durable on-disk vector index (DiskANN-style) · **big-file / large-object storage** (out-of-line + streaming) | Core + new lanes | O(1) open regardless of size; RAM bounded; vector recall bench |
+| **4 — Query power** | Real SQL + a brain | Joins (hash + merge) · aggregates/GROUP BY/ORDER BY/subqueries · cost-based optimizer + statistics · EXPLAIN | **SQL (parallel)** | Optimizer picks right plans; join benchmarks |
+| **5 — Concurrency & performance** | Multiple writers; lift the single-core ceiling | Concurrent writers (buffer-pool latches, concurrent WAL, concurrent txn mgr) · real lock manager (modes, wait queues, deadlock detection) · connection pooling · timeouts/cancel/memory limits | **Core (serial)** | Concurrency stress; throughput scales with cores |
+| **6 — Operations & HA** | Deploy for real | Segmented WAL + replication slots + archiving · streaming replication → read replicas + failover · backups + PITR · users/roles/GRANT · TLS + encryption-at-rest + audit · observability | Core (WAL) + Ops | Replica catch-up; failover + restore drills; security review |
 
-*Effort in rough milestone-units, where 1 unit ≈ what M6/M7/M8 each were.
-★ = unidb-only, no Supabase equivalent. ⚙ = needs engine work before the UI panel.
-
----
-
-## 4. End-state positioning (after A–D; E deferred)
-
-| Dimension | Where we land | Verdict |
-|---|---|---|
-| Single-model OLTP throughput | Postgres-class, not Postgres-beating | **Match** (concede the sprint, honestly) |
-| Cross-domain transaction (row+vector+edge+event, one commit) | Beat the assembled Pg + pgvector + graph DB + Kafka stack | **Beat** |
-| Developer experience / AI-native adoption | One store, one commit, one API vs four systems | **Beat** |
-| Standard-DB completeness (ACID, MVCC, constraints, GC, optimizer, HA) | Maturity parity via Track A | **Match** |
-| Operational simplicity | One node vs four systems | **Beat** |
-| OLAP / analytical scans | Conceded unless Track E is built | **Concede** (escape hatch parked) |
-
-**Net end-state:** a mature, Postgres-class, **AI-native multi-model
-transactional database** — CRUD + vector + graph + events in one commit —
-with a Supabase-style console, REST + GraphQL + attach APIs, and semantic
-search. Wins on integration, DX, and cross-domain correctness; honestly
-concedes raw single-model speed and OLAP; keeps a columnar/HTAP escape hatch
-ready.
+**Why this order:** Phase 1 fixes the invisible correctness holes (mandatory
+before anything). Phases 2 + 3 run in parallel with it. Phase 4 gives a real
+query engine. Phase 5 (biggest perf unlock) depends on 1 + 3 being solid.
+Phase 6 delivers the single-node + read-replica target.
 
 ---
 
-## 5. Parallel-worktree lane map
+## 5. Parallel-worktree lane model
 
-Governing rule: **worktree parallelism is safe only across disjoint file
-sets.** All storage/txn-core work is a **single serial lane** (one worktree
-at a time). Parallelism comes from running that one core lane alongside
-genuinely disjoint lanes. Keep the main repo dir **on `main` as the
-integration home base**; develop only in sibling worktrees (`../unidb-<name>`,
-standard layout — not under `.claude/`).
+Lanes are **file-disjoint** so worktrees never conflict. Keep the main repo
+dir on `main` as the integration base; develop only in sibling worktrees
+(`../unidb-<name>`).
 
-**Lane → Track → worktree mapping.** Lanes are named **Core / SQL / Surface** so
-they don't collide with the Track letters A–E (note especially: the old "Lane E"
-is *not* Track E — Track E is columnar/HTAP, parked):
+| Lane | Owns (files) | Runs phases | Notes |
+|---|---|---|---|
+| **Core** *(serial — ONE worktree)* | `wal` `heap` `page` `bufferpool` `mmap` `mvcc` `txn` `lockmgr` `recovery` `checkpoint` · `tests/crash` | 1 → 3 (indexes) → 5 → 6 (WAL) | Critical path; the storage/txn core |
+| **SQL** *(parallel)* | `catalog` `sql/*` | 2 → 4 | Types, DDL, joins, optimizer, EXPLAIN |
+| **Ops / Surface** *(parallel)* | `server/*` · new modules (big-file, TLS, observability) | 2/3/6 pieces | Disjoint from Core and SQL |
 
-| Lane | = Tracks | Worktree dir(s) |
-|---|---|---|
-| **Core** | Track A storage slice (M10 vacuum → buffer/FSM) | `../unidb-vacuum` |
-| **SQL** | Track A SQL slice (constraints) → Phase 2 SQL + optimizer | `../unidb-constraints` |
-| **Surface** | Track B (UI) · Track C (GraphQL) · **Track D (embed/cosine)** | `../unidb-embed`, `../unidb-studio`, `../unidb-graphql` |
+**Operating rules:** only one Core worktree ever; `lib.rs` edits off the Core
+lane are additive-only; each lane appends its own dated subsection to the
+narrative docs (merge by hand at land-time); land the Core lane to `main`
+frequently so the others rebase cleanly.
 
-| Lane | Owns (files) | Internal order | Parallel-safe with | Conflict watch |
-|---|---|---|---|---|
-| **Core** *(serial, ONE worktree only)* | `heap` `bufferpool` `wal` `txn` `mvcc` `recovery` `read_handle` · core of `lib.rs` · `tests/crash` | M10 vacuum → buffer-pool/FSM | SQL, Surface | `lib.rs` |
-| **SQL** *(query/capability)* | `catalog` `sql/parser` `sql/logical` `sql/executor` | constraints → Phase 2 SQL → optimizer | Core, Surface | `lib.rs` (execute_sql wiring), `sql/executor` |
-| **Surface** *(peripheral / new surface, near-zero core overlap)* | new crates/dirs: `studio/`, `unidb-graphql/`, `unidb-embed/` · `server/` additions · small `vector.rs` | UI · GraphQL · embedding CLI + cosine — any order | Core, SQL | almost none |
+---
 
-**Operating rules:**
-1. Only ever **one** Core worktree. SQL and Surface never touch `heap`/`bufferpool`/`wal`/`txn`.
-2. **`lib.rs` is the #1 conflict source.** Off the core lane, edits must be *additive method insertions*, never restructuring.
-3. **Narrative docs (`MEMORY.md`, `PROGRESS.md`, `engine_design.md`) conflict constantly** — each lane appends to its own dated subsection; merge the narrative by hand at land-time.
-4. **Land the core lane to `main` frequently** (small, fast-forward-able) so Q and P rebase onto fresh `main` and conflicts stay tiny.
+## 6. How we start now (Phase 1 + Phase 2 launch)
 
-**Worktree setup (run from the main repo dir):**
+Two lanes launch immediately — both high-value, fully disjoint:
+
 ```bash
-git worktree add -b core-vacuum     ../unidb-vacuum       main   # Core lane: M10 (concurrent reads already merged)
-git worktree add -b sql-constraints ../unidb-constraints  main   # SQL lane
-git worktree add -b surface-embed   ../unidb-embed        main   # Surface lane (Track D: embed/cosine)
-# cleanup when a lane lands:  git worktree remove ../unidb-<name>
+cd /Users/sagarmahamuni/Development/AI_World/unidb
+git checkout main && git pull --ff-only origin main
+
+git worktree add -b acid-hardening ../unidb-acid   main   # Core  — Phase 1
+git worktree add -b sql-types      ../unidb-types  main   # SQL   — Phase 2
+# optional 3rd, fully disjoint (server/ only): TLS + query timeouts
+# git worktree add -b ops-tls      ../unidb-ops    main
 ```
 
----
+**First checkpoint per lane:**
+- **Core / `acid-hardening` → P1.a Full-page-writes** — log the whole page image
+  into the WAL on first modification after a checkpoint; recovery uses it as the
+  clean redo base; new crash-injection point corrupts a page mid-write and
+  asserts recovery. Files: `wal.rs`, `bufferpool.rs` (first-touch tracking),
+  `recovery.rs`, `checkpoint.rs`, `tests/crash`. **Closes the #1 data-loss hole.**
+- **SQL / `sql-types` → P2.a DECIMAL + TIMESTAMP** — `ColumnType::{Decimal(p,s),
+  Timestamp}`: catalog variants, LE row encoding, parser, `Literal` variants,
+  executor coercion + constraint compatibility. Files: `catalog.rs`,
+  `sql/parser.rs`, `sql/logical.rs`, `sql/executor.rs`. **Money + time first.**
 
-## 6. Current status & next actions
-
-- **Core lane:** group-commit / concurrent-reads **DONE** (PRs #2–#4, on `main`);
-  **M10 heap vacuum / GC DONE** (branch `core-vacuum`, 2026-07-08) — reader-aware
-  horizon, crash-safe redo-only `WAL_VACUUM`, secondary-index vacuum gate, page
-  compaction + slot reuse, `Engine::vacuum()`; see `PROGRESS.md`'s M10 entry and
-  [`m10_heap_vacuum_gc.md`](m10_heap_vacuum_gc.md) (now marked SHIPPED). The
-  horizon includes live `ReadHandle` readers as required.
-  **Next: buffer pool + real FSM** (the other half of the Core Track A storage
-  slice), then Phase 2 SQL / optimizer.
-- **SQL lane:** constraints (PK/FK/UNIQUE/NOT NULL/CHECK/DEFAULT) —
-  **implemented as M11 (branch `sql-constraints`, merged to `main`)**
-  (see `PROGRESS.md`'s M11 entry). Parser now maps column options +
-  table constraints into new `ColumnConstraints`/`TableConstraints` catalog
-  fields; enforced on INSERT/UPDATE. UNIQUE uses a synchronous heap scan, not
-  the async B-Tree index (correctness — `Ready` ≠ current, the M7 lesson); FK
-  is referenced-table existence only. **Next in the SQL lane: Phase 2 SQL**
-  (OR/ORDER BY/LIMIT/aggregates/JOIN) + cost-based optimizer
-  (`phase2_sql_capability_expansion.md`).
-- **Surface lane:** embedding CLI + cosine (**Track D**) — **DONE**
-  (branch `surface-embed`, 2026-07-08; see `PROGRESS.md`'s Track D entry).
-  `vector.rs` gained a per-index `Metric::{Euclidean,Cosine}` (cosine =
-  `1 - cos`, rebuild on metric change); new `unidb-embed/` crate is a CLI
-  (`embed-insert`/`search`) that embeds text via a pluggable HTTP endpoint and
-  stores/searches via the `unidb-attach` client. Embedding generation stayed
-  client-side (no model deps in the engine). Remaining Track D polish: expose the
-  metric through `CREATE INDEX ... USING HNSW <metric>` (SQL lane) and an
-  optional search UI (Track B). Still holds Track B (Studio UI) and Track C
-  (GraphQL).
+Each lane opens a PR per phase-checkpoint with its benchmark + crash-harness
+status, same discipline as M10.
 
 ---
 
-## 7. Decision & session log (newest first)
+## 7. Parked / deferred (explicitly, not forgotten)
 
-### 2026-07-08 — M10 heap vacuum / MVCC GC landed (Core lane, branch `core-vacuum`)
-- First physical space reclamation in the engine — `Engine::vacuum()`. Dead
-  versions (committed `xmax` < a reader-aware horizon = `min(snapshot.xmin)`
-  across live txns **and** `ReadHandle` readers) are physically removed;
-  line-pointers go DEAD → UNUSED only after a secondary-index vacuum pass
-  clears the aliasing hazard (EdgeIndex/CsrIndex/BTree/InvertedIndex/Vector).
-- Crash-safe: redo-only idempotent `WAL_VACUUM`, new D7 crash-injection point;
-  page compaction + free-space map enable slot reuse. `benches/vacuum.rs` +
-  before/after space measurement. 247 unit + 12 crash-harness green.
-- Storage-core lane, disjoint from SQL/Surface — no code conflicts on rebase,
-  only narrative-doc conflicts (resolved). Full record in `PROGRESS.md`'s M10
-  entry; plan `m10_heap_vacuum_gc.md` marked SHIPPED.
-
-### 2026-07-08 — M11 SQL constraints landed (SQL lane, branch `sql-constraints`)
-- Constraints (PK/FK/UNIQUE/NOT NULL/CHECK/DEFAULT), column- and table-level,
-  now parsed off `CREATE TABLE` (previously `convert_create_table` dropped
-  `c.options`), persisted on the catalog (`ColumnConstraints`/`TableConstraints`,
-  all `#[serde(default)]` — no `FORMAT_VERSION` bump), and enforced on
-  INSERT/UPDATE (DEFAULT → NOT NULL → CHECK → UNIQUE → FK).
-- **UNIQUE uses a synchronous heap scan, deliberately NOT the async B-Tree
-  index** — `IndexStatus::Ready` ≠ "reflects every write" (the M7 CSR lesson);
-  a stale index entry is a false "no conflict." FK is referenced-table
-  existence only (no row-level RI / cascades).
-- Disjoint from Core/Surface lanes: no storage-core or `lib.rs` changes;
-  `server/error.rs` got additive 4xx arms (small cross-lane touch). Rebased
-  onto the Track D merge — narrative-doc conflicts (MEMORY/PROGRESS/roadmap)
-  resolved keep-both. Full record in `PROGRESS.md`'s M11 entry + `MEMORY.md`.
-
-### 2026-07-08 — Track D shipped (semantic search: cosine metric + embedding CLI)
-- Surface lane, worktree `../unidb-embed`, branch `surface-embed`. Only engine
-  file touched: `src/vector.rs` (added per-index `Metric::{Euclidean,Cosine}`,
-  cosine = `1 - cos`, `set_metric` rebuilds the HNSW graph). New workspace crate
-  `unidb-embed/` (CLI: `embed-insert`/`search`) reuses the `unidb-attach` client;
-  embedding generation is client-side via a pluggable HTTP endpoint (key via env
-  var) — no model/network dep in the engine. `cargo test --workspace` + clippy
-  `-D warnings` + fmt clean. Full record in `PROGRESS.md`'s Track D entry.
-- Deferred: `CREATE INDEX ... USING HNSW <metric>` wiring is SQL-lane work.
-
-### 2026-07-08 — roadmap consolidation + parallelization
-- **Positioning decided (the blend):** AI-native multi-model identity;
-  Postgres-*class* not Postgres-beating; columnar/HTAP parked as Track E.
-  Explicitly declined to reverse `CLAUDE.md` §1.
-- **Placement analysis:** unidb is OLTP-shaped (row store, tuple-at-a-time),
-  a deliberate generalist; vector + graph are index-probe workloads, not
-  OLAP — so multi-model ≠ analytical.
-- **Cost sketch:** Path 0 (GC/vacuum) is the mandatory correctness fix;
-  Path B (OLTP-max) aligned & mostly done; Path A (OLAP/HTAP) is
-  rewrite/team-scale, deferred.
-- **Four-track roadmap** defined (user's M0–M3 → Tracks A–D, + parked E) and
-  a **parallel-worktree lane map** (Core / SQL / Surface) with operating rules.
-- **Status correction:** the M9 perf line (group commit + concurrent reads)
-  is already merged to `main` via PRs #2–#4; the Core lane advances to **M10**.
-- Backlog plans written: `m9_python_embedded_bindings.md`,
-  `m10_heap_vacuum_gc.md`, this `roadmap.md`.
-
-### 2026-07-07/08 — M6/M7/M8 close-out + doc hygiene
-- Merged M8 (attach client) from its worktree; **found & fixed a real M7
-  CSR-traversal correctness bug** during merge verification (CSR preferred
-  once `Ready` could hide a just-created edge; reverted to `EdgeIndex`).
-- Cleaned up stale worktrees/branches (M7 CSR plan-only worktree, M8 worktree).
-- Doc-staleness audit: corrected `docs/design/engine_design.md` (M0–M8; CSR
-  correction), `docs/README.md`, `m8_attach_client_plan.md` (→ SHIPPED).
-- Added a **`CLAUDE.md` §9 rule**: check `README.md` + all `docs/` for
-  staleness before every push/PR, not just `PROGRESS.md`/`MEMORY.md`.
+- **Columnar / HTAP (OLAP)** — gated on real analytics demand; opposite axis to
+  the multi-model thesis. Not pursued unless a scan-heavy workload appears.
+- **Fully distributed / sharded write scale** — reverses `CLAUDE.md` §1
+  (single-primary) and strains cross-model atomicity; a separate, multi-year
+  project beyond the single-node + read-replica target.
+- **S3 / tiered storage** — relevant only past local-disk economics (TBs);
+  reverses D6 (single mmap'd file). Behind Phase 6 replication.
+- **Python / multi-language embedded clients** (PyO3 etc.) — orthogonal
+  developer-experience feature; revisit after the engine is production-solid.
 
 ---
 
-## 8. Backlog index (durable plans)
+## 8. Decision & session log (newest first)
 
-- [`roadmap.md`](roadmap.md) — this document.
-- [`m10_heap_vacuum_gc.md`](m10_heap_vacuum_gc.md) — heap vacuum / MVCC GC (next in the Core lane).
-- [`group_commit_and_read_concurrency.md`](group_commit_and_read_concurrency.md) — the M9 perf line (largely shipped via PRs #2–#4).
-- [`phase2_sql_capability_expansion.md`](phase2_sql_capability_expansion.md) — OR / ORDER BY / LIMIT / aggregates / JOIN (SQL lane).
-- [`m9_python_embedded_bindings.md`](m9_python_embedded_bindings.md) — PyO3 in-process bindings (future).
-- [`m8_attach_client_plan.md`](m8_attach_client_plan.md) — shipped (kept as record).
+### 2026-07-08 — adopted the ACID-first phased scaling plan; backlog cleaned
+- Ran an expert gap analysis: the user's 4 flags (joins, index durability,
+  concurrent writers, WAL/checkpoint) + 12 more, tiered. **Key reframe:
+  correctness (torn-page, isolation) outranks scale — fix before scaling.**
+- Adopted a 6-phase plan (this doc §4), ACID + performance as gates, multi-model
+  (vector/graph/big-file) as first-class, single-node + read-replicas as the
+  scale target. Distributed/columnar parked (§7).
+- Removed shipped/superseded backlog docs (M8/M10/group-commit → `PROGRESS.md`;
+  phase2 SQL → Phase 4; Python bindings → §7 parked). This doc is now the single
+  forward plan.
+- Prior shipped work this cycle: M9 perf (group commit + concurrent reads),
+  Track D (semantic search), M10 (vacuum), M11 (constraints) — all merged to
+  `main`; REST API doc audited + live CRUD end-to-end verified.
