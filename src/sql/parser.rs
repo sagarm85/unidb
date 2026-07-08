@@ -173,6 +173,29 @@ fn convert_data_type(dt: &DataType) -> Result<ColumnType> {
         // Timestamp (P2.a): all zone variants store UTC micros in v1; the
         // precision hint is ignored (we always keep microsecond resolution).
         DataType::Timestamp(_, _) | DataType::TimestampNtz(_) => Ok(ColumnType::Timestamp),
+        // Floating point (P2.b): every spelling collapses to f64.
+        DataType::Float(_)
+        | DataType::FloatUnsigned(_)
+        | DataType::Real
+        | DataType::RealUnsigned
+        | DataType::Float4
+        | DataType::Float8
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Double(_)
+        | DataType::DoubleUnsigned(_)
+        | DataType::DoublePrecision => Ok(ColumnType::Float),
+        DataType::Uuid => Ok(ColumnType::Uuid),
+        // Opaque binary (P2.b): every blob/binary spelling maps to BYTEA.
+        DataType::Bytea
+        | DataType::Blob(_)
+        | DataType::TinyBlob
+        | DataType::MediumBlob
+        | DataType::LongBlob
+        | DataType::Binary(_)
+        | DataType::Varbinary(_) => Ok(ColumnType::Bytea),
+        DataType::Date => Ok(ColumnType::Date),
+        DataType::Time(_, _) => Ok(ColumnType::Time),
         // `VECTOR(n)` has no built-in sqlparser type; it falls through to
         // `DataType::Custom(name, modifiers)` (confirmed against sqlparser
         // 0.62.0's own AST — see the M2 plan's checkpoint M2.a notes).
@@ -730,6 +753,25 @@ mod tests {
         match plan {
             LogicalPlan::CreateTable { columns, .. } => {
                 assert_eq!(columns[0].ty, ColumnType::Timestamp);
+            }
+            _ => panic!("expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn parses_p2b_scalar_columns() {
+        let plan = parse_one(
+            "CREATE TABLE t (a FLOAT, b DOUBLE PRECISION, c REAL, d UUID, e BYTEA, f DATE, g TIME)",
+        );
+        match plan {
+            LogicalPlan::CreateTable { columns, .. } => {
+                assert_eq!(columns[0].ty, ColumnType::Float);
+                assert_eq!(columns[1].ty, ColumnType::Float);
+                assert_eq!(columns[2].ty, ColumnType::Float);
+                assert_eq!(columns[3].ty, ColumnType::Uuid);
+                assert_eq!(columns[4].ty, ColumnType::Bytea);
+                assert_eq!(columns[5].ty, ColumnType::Date);
+                assert_eq!(columns[6].ty, ColumnType::Time);
             }
             _ => panic!("expected CreateTable"),
         }

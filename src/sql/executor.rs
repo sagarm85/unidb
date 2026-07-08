@@ -856,11 +856,84 @@ fn coerce_value(table_name: &str, col: &ColumnDef, val: Literal) -> Result<Liter
         (ColumnType::Timestamp, Literal::Text(s)) => {
             Ok(Literal::Timestamp(datetime::parse_timestamp(&s)?))
         }
+        // Float (P2.b): accept a float, an integer, or an exact decimal literal
+        // — the last two widen into IEEE-754 (money literals in a FLOAT column).
+        (ColumnType::Float, Literal::Float(f)) => Ok(Literal::Float(f)),
+        (ColumnType::Float, Literal::Int(n)) => Ok(Literal::Float(n as f64)),
+        (ColumnType::Float, Literal::Decimal(v, s)) => {
+            Ok(Literal::Float(v as f64 / 10f64.powi(s as i32)))
+        }
+        // UUID / BYTEA / DATE / TIME arrive as string literals, parsed here.
+        (ColumnType::Uuid, Literal::Uuid(b)) => Ok(Literal::Uuid(b)),
+        (ColumnType::Uuid, Literal::Text(s)) => Ok(Literal::Uuid(parse_uuid(&s)?)),
+        (ColumnType::Bytea, Literal::Bytea(b)) => Ok(Literal::Bytea(b)),
+        (ColumnType::Bytea, Literal::Text(s)) => Ok(Literal::Bytea(parse_bytea(&s))),
+        (ColumnType::Date, Literal::Date(d)) => Ok(Literal::Date(d)),
+        (ColumnType::Date, Literal::Text(s)) => Ok(Literal::Date(datetime::parse_date(&s)?)),
+        (ColumnType::Time, Literal::Time(t)) => Ok(Literal::Time(t)),
+        (ColumnType::Time, Literal::Text(s)) => Ok(Literal::Time(datetime::parse_time(&s)?)),
         (expected, got) => Err(DbError::SqlPlan(format!(
             "table '{table_name}' column '{}': expected {expected:?}, got {got:?}",
             col.name
         ))),
     }
+}
+
+/// Parse UUID text — canonical hyphenated `8-4-4-4-12` or a bare 32 hex
+/// digits — into 16 raw bytes (P2.b). Case-insensitive; rejects anything else.
+fn parse_uuid(s: &str) -> Result<[u8; 16]> {
+    let hex: String = s.chars().filter(|&c| c != '-').collect();
+    if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(DbError::SqlPlan(format!("invalid UUID literal: {s:?}")));
+    }
+    let mut out = [0u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .map_err(|_| DbError::SqlPlan(format!("invalid UUID literal: {s:?}")))?;
+    }
+    Ok(out)
+}
+
+/// Render 16 bytes as canonical lowercase hyphenated UUID text (P2.b).
+pub fn format_uuid(b: &[u8; 16]) -> String {
+    let h: String = b.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
+}
+
+/// Interpret a BYTEA string literal (P2.b): a `\x`-prefixed hex string decodes
+/// to those bytes (Postgres hex format); anything else is taken as the
+/// string's raw UTF-8 bytes. A malformed `\x` body falls back to raw bytes
+/// rather than erroring — BYTEA input is deliberately permissive.
+fn parse_bytea(s: &str) -> Vec<u8> {
+    if let Some(hex) = s.strip_prefix("\\x").or_else(|| s.strip_prefix("\\X")) {
+        if hex.len() % 2 == 0 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            if let Some(bytes) = (0..hex.len() / 2)
+                .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
+                .collect::<Option<Vec<u8>>>()
+            {
+                return bytes;
+            }
+        }
+    }
+    s.as_bytes().to_vec()
+}
+
+/// Render bytes as a Postgres-style `\x`-prefixed hex string (P2.b) for the
+/// JSON/DTO boundary.
+pub fn format_bytea(b: &[u8]) -> String {
+    let mut out = String::with_capacity(2 + b.len() * 2);
+    out.push_str("\\x");
+    for byte in b {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 /// `10^n` as an `i128`, or `None` on overflow (n up to 38 fits; beyond does
@@ -1283,9 +1356,46 @@ fn compare(op: CmpOp, l: &Literal, r: &Literal) -> Result<bool> {
         (Literal::Text(a), Literal::Timestamp(b)) => {
             Ok(apply_cmp(op, datetime::parse_timestamp(a)?.cmp(b)))
         }
+        // Float ordering (P2.b), mixing with Int/Decimal via f64. A NaN
+        // operand makes every comparison false (IEEE-754 unordered), matching
+        // the NULL-operand convention above.
+        (Literal::Float(_), _) | (_, Literal::Float(_)) => match (float_of(l), float_of(r)) {
+            (Some(a), Some(b)) => Ok(match a.partial_cmp(&b) {
+                Some(ord) => apply_cmp(op, ord),
+                None => false,
+            }),
+            _ => Err(DbError::SqlUnsupported(format!(
+                "cannot compare {l:?} with {r:?}"
+            ))),
+        },
+        // UUID / DATE / TIME: equality + ordering by their natural key; a Text
+        // operand is parsed on demand so `WHERE d > '2024-01-01'` reads well.
+        (Literal::Uuid(a), Literal::Uuid(b)) => Ok(apply_cmp(op, a.cmp(b))),
+        (Literal::Uuid(a), Literal::Text(b)) => Ok(apply_cmp(op, a.cmp(&parse_uuid(b)?))),
+        (Literal::Text(a), Literal::Uuid(b)) => Ok(apply_cmp(op, parse_uuid(a)?.cmp(b))),
+        (Literal::Bytea(a), Literal::Bytea(b)) => Ok(apply_cmp(op, a.cmp(b))),
+        (Literal::Bytea(a), Literal::Text(b)) => Ok(apply_cmp(op, a.cmp(&parse_bytea(b)))),
+        (Literal::Text(a), Literal::Bytea(b)) => Ok(apply_cmp(op, parse_bytea(a).cmp(b))),
+        (Literal::Date(a), Literal::Date(b)) => Ok(apply_cmp(op, a.cmp(b))),
+        (Literal::Date(a), Literal::Text(b)) => Ok(apply_cmp(op, a.cmp(&datetime::parse_date(b)?))),
+        (Literal::Text(a), Literal::Date(b)) => Ok(apply_cmp(op, datetime::parse_date(a)?.cmp(b))),
+        (Literal::Time(a), Literal::Time(b)) => Ok(apply_cmp(op, a.cmp(b))),
+        (Literal::Time(a), Literal::Text(b)) => Ok(apply_cmp(op, a.cmp(&datetime::parse_time(b)?))),
+        (Literal::Text(a), Literal::Time(b)) => Ok(apply_cmp(op, datetime::parse_time(a)?.cmp(b))),
         (a, b) => Err(DbError::SqlUnsupported(format!(
             "cannot compare {a:?} with {b:?}"
         ))),
+    }
+}
+
+/// Coerce a numeric literal to `f64` for float comparisons (`Int`/`Decimal`/
+/// `Float`), or `None` for non-numeric operands.
+fn float_of(lit: &Literal) -> Option<f64> {
+    match lit {
+        Literal::Float(f) => Some(*f),
+        Literal::Int(n) => Some(*n as f64),
+        Literal::Decimal(v, s) => Some(*v as f64 / 10f64.powi(*s as i32)),
+        _ => None,
     }
 }
 
@@ -1329,7 +1439,9 @@ fn apply_cmp(op: CmpOp, ord: std::cmp::Ordering) -> bool {
 // Tags: 0=Null, 1=Int64 (8 bytes LE), 2=Text (4-byte LE len + UTF8),
 // 3=Bool (1 byte), 4=Json (4-byte LE len + UTF8 text), 5=Vector
 // (4-byte LE dimension + dimension * 4-byte LE f32), 6=Decimal (16-byte LE
-// i128 unscaled value + 1-byte scale), 7=Timestamp (8-byte LE i64 micros).
+// i128 unscaled value + 1-byte scale), 7=Timestamp (8-byte LE i64 micros),
+// 8=Float (8-byte LE f64), 9=Uuid (16 raw bytes), 10=Bytea (4-byte LE len +
+// bytes), 11=Date (4-byte LE i32 days), 12=Time (8-byte LE i64 micros).
 //
 // New tags are purely additive (D4, forward-compatible): a row written before
 // P2.a never carries tag 6/7, so old rows still decode unchanged, and there is
@@ -1376,6 +1488,27 @@ pub fn encode_row(values: &[Literal]) -> Vec<u8> {
             }
             Literal::Timestamp(micros) => {
                 buf.push(7);
+                buf.extend_from_slice(&micros.to_le_bytes());
+            }
+            Literal::Float(f) => {
+                buf.push(8);
+                buf.extend_from_slice(&f.to_le_bytes());
+            }
+            Literal::Uuid(bytes) => {
+                buf.push(9);
+                buf.extend_from_slice(bytes);
+            }
+            Literal::Bytea(b) => {
+                buf.push(10);
+                buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                buf.extend_from_slice(b);
+            }
+            Literal::Date(days) => {
+                buf.push(11);
+                buf.extend_from_slice(&days.to_le_bytes());
+            }
+            Literal::Time(micros) => {
+                buf.push(12);
                 buf.extend_from_slice(&micros.to_le_bytes());
             }
         }
@@ -1500,6 +1633,64 @@ pub fn decode_row(bytes: &[u8], columns: &[ColumnDef]) -> Result<Vec<Literal>> {
                     .unwrap();
                 pos = end;
                 Literal::Timestamp(i64::from_le_bytes(raw))
+            }
+            8 => {
+                let end = pos + 8;
+                let raw: [u8; 8] = bytes
+                    .get(pos..end)
+                    .ok_or_else(|| DbError::SqlPlan("row decode error: truncated float".into()))?
+                    .try_into()
+                    .unwrap();
+                pos = end;
+                Literal::Float(f64::from_le_bytes(raw))
+            }
+            9 => {
+                let end = pos + 16;
+                let raw: [u8; 16] = bytes
+                    .get(pos..end)
+                    .ok_or_else(|| DbError::SqlPlan("row decode error: truncated uuid".into()))?
+                    .try_into()
+                    .unwrap();
+                pos = end;
+                Literal::Uuid(raw)
+            }
+            10 => {
+                let len_end = pos + 4;
+                let len_raw: [u8; 4] = bytes
+                    .get(pos..len_end)
+                    .ok_or_else(|| {
+                        DbError::SqlPlan("row decode error: truncated bytea length".into())
+                    })?
+                    .try_into()
+                    .unwrap();
+                let len = u32::from_le_bytes(len_raw) as usize;
+                pos = len_end;
+                let end = pos + len;
+                let raw = bytes
+                    .get(pos..end)
+                    .ok_or_else(|| DbError::SqlPlan("row decode error: truncated bytea".into()))?;
+                pos = end;
+                Literal::Bytea(raw.to_vec())
+            }
+            11 => {
+                let end = pos + 4;
+                let raw: [u8; 4] = bytes
+                    .get(pos..end)
+                    .ok_or_else(|| DbError::SqlPlan("row decode error: truncated date".into()))?
+                    .try_into()
+                    .unwrap();
+                pos = end;
+                Literal::Date(i32::from_le_bytes(raw))
+            }
+            12 => {
+                let end = pos + 8;
+                let raw: [u8; 8] = bytes
+                    .get(pos..end)
+                    .ok_or_else(|| DbError::SqlPlan("row decode error: truncated time".into()))?
+                    .try_into()
+                    .unwrap();
+                pos = end;
+                Literal::Time(i64::from_le_bytes(raw))
             }
             other => {
                 return Err(DbError::SqlPlan(format!(
@@ -2137,6 +2328,157 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    // ── P2.b: FLOAT / UUID / BYTEA / DATE / TIME ─────────────────────────────
+
+    #[test]
+    fn row_encode_decode_p2b_round_trip() {
+        let columns = vec![
+            col("f", ColumnType::Float),
+            col("u", ColumnType::Uuid),
+            col("b", ColumnType::Bytea),
+            col("d", ColumnType::Date),
+            col("t", ColumnType::Time),
+        ];
+        let values = vec![
+            Literal::Float(-3.5),
+            Literal::Uuid([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]),
+            Literal::Bytea(vec![0xde, 0xad, 0xbe, 0xef]),
+            Literal::Date(19_000),
+            Literal::Time(45_296_000_000),
+        ];
+        let encoded = encode_row(&values);
+        assert_eq!(decode_row(&encoded, &columns).unwrap(), values);
+    }
+
+    #[test]
+    fn float_column_round_trips_and_orders() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, x FLOAT)").unwrap();
+        h.exec_as(xid, "INSERT INTO t (id, x) VALUES (1, 1.5)")
+            .unwrap();
+        h.exec_as(xid, "INSERT INTO t (id, x) VALUES (2, 10)")
+            .unwrap();
+        h.commit(xid);
+        let xid2 = h.begin();
+        let rows = match h.exec_as(xid2, "SELECT x FROM t WHERE id = 1").unwrap() {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(rows, vec![vec![Literal::Float(1.5)]]);
+        let gt = match h.exec_as(xid2, "SELECT id FROM t WHERE x > 2").unwrap() {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(gt, vec![vec![Literal::Int(2)]]);
+    }
+
+    #[test]
+    fn uuid_round_trip_equality_and_pk() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id UUID PRIMARY KEY)")
+            .unwrap();
+        h.exec_as(
+            xid,
+            "INSERT INTO t (id) VALUES ('550e8400-e29b-41d4-a716-446655440000')",
+        )
+        .unwrap();
+        // Same UUID without hyphens must collide under PRIMARY KEY.
+        let dup = h.exec_as(
+            xid,
+            "INSERT INTO t (id) VALUES ('550e8400e29b41d4a716446655440000')",
+        );
+        assert!(matches!(dup, Err(DbError::UniqueViolation { .. })));
+        // Round-trip: canonical lowercase hyphenated form comes back.
+        let rows = match h
+            .exec_as(
+                xid,
+                "SELECT id FROM t WHERE id = '550E8400-E29B-41D4-A716-446655440000'",
+            )
+            .unwrap()
+        {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0][0],
+            Literal::Uuid(parse_uuid("550e8400-e29b-41d4-a716-446655440000").unwrap())
+        );
+        let bad = h.exec_as(xid, "INSERT INTO t (id) VALUES ('not-a-uuid')");
+        assert!(matches!(bad, Err(DbError::SqlPlan(_))));
+    }
+
+    #[test]
+    fn bytea_round_trip_hex_and_raw() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, b BYTEA)").unwrap();
+        h.exec_as(xid, r"INSERT INTO t (id, b) VALUES (1, '\xDEADBEEF')")
+            .unwrap();
+        h.exec_as(xid, "INSERT INTO t (id, b) VALUES (2, 'hi')")
+            .unwrap();
+        h.commit(xid);
+        let xid2 = h.begin();
+        let r1 = match h.exec_as(xid2, "SELECT b FROM t WHERE id = 1").unwrap() {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(r1, vec![vec![Literal::Bytea(vec![0xde, 0xad, 0xbe, 0xef])]]);
+        let r2 = match h.exec_as(xid2, "SELECT b FROM t WHERE id = 2").unwrap() {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(r2, vec![vec![Literal::Bytea(b"hi".to_vec())]]);
+    }
+
+    #[test]
+    fn date_and_time_round_trip_and_order() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, d DATE, tm TIME)")
+            .unwrap();
+        h.exec_as(
+            xid,
+            "INSERT INTO t (id, d, tm) VALUES (1, '2024-01-15', '09:30:00')",
+        )
+        .unwrap();
+        h.exec_as(
+            xid,
+            "INSERT INTO t (id, d, tm) VALUES (2, '2024-06-01', '18:00:00')",
+        )
+        .unwrap();
+        h.commit(xid);
+        let xid2 = h.begin();
+        let rows = match h.exec_as(xid2, "SELECT d, tm FROM t WHERE id = 1").unwrap() {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(
+            rows,
+            vec![vec![
+                Literal::Date(crate::sql::datetime::parse_date("2024-01-15").unwrap()),
+                Literal::Time(crate::sql::datetime::parse_time("09:30:00").unwrap()),
+            ]]
+        );
+        let after = match h
+            .exec_as(
+                xid2,
+                "SELECT id FROM t WHERE d > '2024-03-01' AND tm > '12:00:00'",
+            )
+            .unwrap()
+        {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(after, vec![vec![Literal::Int(2)]]);
     }
 
     // ── M2.c: CREATE INDEX ───────────────────────────────────────────────────

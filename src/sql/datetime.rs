@@ -164,9 +164,100 @@ pub fn format_timestamp(micros: i64) -> String {
     }
 }
 
+/// Parse `'YYYY-MM-DD'` into days since the Unix epoch (P2.b). Rejects any
+/// time-of-day suffix — that is `TIMESTAMP`, not `DATE`.
+pub fn parse_date(input: &str) -> Result<i32> {
+    let s = input.trim();
+    let mut parts = s.split('-');
+    let (y, mo, d) = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(y), Some(mo), Some(d), None) => (parse_uint(y)?, parse_uint(mo)?, parse_uint(d)?),
+        _ => {
+            return Err(DbError::SqlPlan(format!(
+                "invalid date {input:?}: expected 'YYYY-MM-DD'"
+            )))
+        }
+    };
+    if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) {
+        return Err(DbError::SqlPlan(format!(
+            "invalid date {input:?}: not a real date"
+        )));
+    }
+    i32::try_from(days_from_civil(y, mo, d))
+        .map_err(|_| DbError::SqlPlan(format!("date out of range: {input:?}")))
+}
+
+/// Render days-since-epoch back to `YYYY-MM-DD` (P2.b).
+pub fn format_date(days: i32) -> String {
+    let (y, mo, d) = civil_from_days(days as i64);
+    format!("{y:04}-{mo:02}-{d:02}")
+}
+
+/// Parse `'HH:MM:SS[.ffffff]'` (seconds optional) into microseconds since
+/// midnight (P2.b).
+pub fn parse_time(input: &str) -> Result<i64> {
+    let s = input.trim();
+    let (hms, frac) = match s.split_once('.') {
+        Some((hms, frac)) => (hms, frac),
+        None => (s, ""),
+    };
+    let mut parts = hms.split(':');
+    let (hh, mm, ss) = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(h), Some(m), Some(sec), None) => (parse_uint(h)?, parse_uint(m)?, parse_uint(sec)?),
+        (Some(h), Some(m), None, None) => (parse_uint(h)?, parse_uint(m)?, 0),
+        _ => {
+            return Err(DbError::SqlPlan(format!(
+                "invalid time {input:?}: expected 'HH:MM:SS[.ffffff]'"
+            )))
+        }
+    };
+    if hh > 23 || mm > 59 || ss > 59 {
+        return Err(DbError::SqlPlan(format!("invalid time-of-day {input:?}")));
+    }
+    let micros = parse_fraction(frac, input)?;
+    Ok((hh * 3600 + mm * 60 + ss) * MICROS_PER_SEC + micros)
+}
+
+/// Render micros-since-midnight back to `HH:MM:SS[.ffffff]` (P2.b).
+pub fn format_time(micros: i64) -> String {
+    let secs = micros / MICROS_PER_SEC;
+    let frac = micros % MICROS_PER_SEC;
+    let hh = secs / 3600;
+    let mm = (secs % 3600) / 60;
+    let ss = secs % 60;
+    let base = format!("{hh:02}:{mm:02}:{ss:02}");
+    if frac == 0 {
+        base
+    } else {
+        let frac_str = format!("{frac:06}");
+        format!("{base}.{}", frac_str.trim_end_matches('0'))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn date_round_trips() {
+        let d = parse_date("2024-03-14").unwrap();
+        assert_eq!(format_date(d), "2024-03-14");
+        assert_eq!(parse_date("1970-01-01").unwrap(), 0);
+        assert!(parse_date("2024-03-14 00:00:00").is_err());
+        assert!(parse_date("2023-02-29").is_err());
+    }
+
+    #[test]
+    fn time_round_trips() {
+        assert_eq!(parse_time("00:00:00").unwrap(), 0);
+        let t = parse_time("13:45:30.5").unwrap();
+        assert_eq!(format_time(t), "13:45:30.5");
+        assert_eq!(
+            parse_time("23:59:59").unwrap(),
+            (23 * 3600 + 59 * 60 + 59) * 1_000_000
+        );
+        assert!(parse_time("24:00:00").is_err());
+        assert_eq!(format_time(parse_time("09:05:00").unwrap()), "09:05:00");
+    }
 
     #[test]
     fn epoch_round_trips() {

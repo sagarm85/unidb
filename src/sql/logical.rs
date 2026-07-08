@@ -36,6 +36,17 @@ pub enum Literal {
     /// know the column is temporal); the executor converts Text -> Timestamp
     /// at coercion time and `compare` parses a Text operand on demand.
     Timestamp(i64),
+    /// IEEE-754 double (P2.b). Numeric literals stay `Int`/`Decimal` at parse
+    /// time and coerce to `Float` against a `FLOAT` column.
+    Float(f64),
+    /// UUID as 16 raw bytes (P2.b). Arrives as text, parsed at coercion.
+    Uuid([u8; 16]),
+    /// Opaque bytes (P2.b). Arrives as text, decoded at coercion.
+    Bytea(Vec<u8>),
+    /// Calendar date as days since the Unix epoch (P2.b). Arrives as text.
+    Date(i32),
+    /// Time of day as micros since midnight (P2.b). Arrives as text.
+    Time(i64),
     Null,
 }
 

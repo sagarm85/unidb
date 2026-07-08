@@ -38,6 +38,14 @@ pub fn row_to_json(row: &[Literal], columns: &[ColumnDef]) -> JsonValue {
             Literal::Timestamp(micros) => {
                 JsonValue::String(crate::sql::datetime::format_timestamp(*micros))
             }
+            // P2.b scalar types.
+            Literal::Float(f) => Number::from_f64(*f)
+                .map(JsonValue::Number)
+                .unwrap_or(JsonValue::Null),
+            Literal::Uuid(b) => JsonValue::String(crate::sql::executor::format_uuid(b)),
+            Literal::Bytea(b) => JsonValue::String(crate::sql::executor::format_bytea(b)),
+            Literal::Date(d) => JsonValue::String(crate::sql::datetime::format_date(*d)),
+            Literal::Time(t) => JsonValue::String(crate::sql::datetime::format_time(*t)),
         };
         map.insert(col.name.clone(), json_val);
     }

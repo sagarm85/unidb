@@ -53,6 +53,13 @@ pub fn literal_to_json(lit: &Literal) -> Json {
             Json::String(crate::sql::logical::format_decimal(*value, *scale))
         }
         Literal::Timestamp(micros) => Json::String(crate::sql::datetime::format_timestamp(*micros)),
+        // P2.b scalar types: floats as JSON numbers; uuid/bytea/date/time as
+        // canonical strings.
+        Literal::Float(f) => Number::from_f64(*f).map(Json::Number).unwrap_or(Json::Null),
+        Literal::Uuid(b) => Json::String(crate::sql::executor::format_uuid(b)),
+        Literal::Bytea(b) => Json::String(crate::sql::executor::format_bytea(b)),
+        Literal::Date(d) => Json::String(crate::sql::datetime::format_date(*d)),
+        Literal::Time(t) => Json::String(crate::sql::datetime::format_time(*t)),
     }
 }
 

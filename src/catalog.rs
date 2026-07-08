@@ -64,6 +64,21 @@ pub enum ColumnType {
     /// `i64` (8 bytes LE). `TIMESTAMPTZ` normalizes to UTC on input; v1 only
     /// stores UTC and does not track the original zone.
     Timestamp,
+    /// IEEE-754 double (P2.b): `f64`, 8 bytes LE. `FLOAT`/`REAL`/`DOUBLE
+    /// PRECISION` all map here — inexact by nature (use `Decimal` for money).
+    Float,
+    /// UUID (P2.b): 16 raw bytes. Accepts canonical hyphenated or 32-hex-digit
+    /// text on input; renders canonical lowercase hyphenated on output.
+    Uuid,
+    /// Opaque binary blob (P2.b): variable-length bytes, same length-prefixed
+    /// on-disk shape as `Text`/`Json`. Text input is hex (`\xDEADBEEF`) or the
+    /// string's raw UTF-8 bytes.
+    Bytea,
+    /// Calendar date (P2.b): days since the Unix epoch, `i32`, 4 bytes LE.
+    Date,
+    /// Time of day (P2.b): microseconds since midnight, `i64`, 8 bytes LE. No
+    /// zone.
+    Time,
 }
 
 /// Which secondary index (if any) a column has. `None` by default — indexing
