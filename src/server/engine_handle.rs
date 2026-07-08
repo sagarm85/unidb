@@ -38,6 +38,7 @@ use crate::{
     heap::RowId,
     index_worker::IndexStatus,
     queue::Event,
+    read_handle::ReadHandle,
     sql::executor::ExecResult,
     txn::IsolationLevel,
     Engine,
@@ -161,6 +162,10 @@ pub enum EngineRequest {
 pub struct EngineHandle {
     tx: mpsc::UnboundedSender<EngineRequest>,
     join: Option<JoinHandle<()>>,
+    /// Concurrent read path (6b): reads bypass the writer thread's channel
+    /// entirely and run on this `Send + Sync` handle over shared state, so
+    /// many readers execute in parallel with each other and with the writer.
+    read: ReadHandle,
 }
 
 impl EngineHandle {
@@ -169,6 +174,10 @@ impl EngineHandle {
     /// thread that owns it for the rest of its life.
     pub fn spawn(dir: &Path, page_size: u32) -> Result<Self> {
         let engine = Engine::open(dir, page_size)?;
+        // Capture the concurrent read handle before the writer thread takes
+        // ownership of the engine — it references only shared state, so it
+        // stays valid for the engine's whole life.
+        let read = engine.read_handle();
         let (tx, rx) = mpsc::unbounded_channel();
         let join = thread::Builder::new()
             .name("unidb-writer".into())
@@ -177,7 +186,18 @@ impl EngineHandle {
         Ok(Self {
             tx,
             join: Some(join),
+            read,
         })
+    }
+
+    /// Read one row by [`RowId`] on the concurrent read path (6b): no writer-
+    /// thread round-trip, no xid, no WAL. Runs on a blocking pool thread since
+    /// the read briefly locks shared state.
+    pub async fn get_row(&self, row_id: RowId) -> Result<Vec<u8>> {
+        let read = self.read.clone();
+        tokio::task::spawn_blocking(move || read.get(row_id))
+            .await
+            .map_err(|_| DbError::EngineUnavailable)?
     }
 
     /// Build one `EngineRequest` via `build`, send it (a plain, immediate,

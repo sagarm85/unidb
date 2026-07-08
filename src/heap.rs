@@ -24,7 +24,7 @@
 // transaction's xid, so no extra encoding is needed there.
 
 use crate::{
-    bufferpool::BufferPool,
+    bufferpool::{BufferPool, PageReader},
     concurrency_hooks::{on_read, on_write},
     error::{DbError, Result},
     format::{
@@ -124,27 +124,24 @@ impl Heap {
     /// superseded it. Callers needing "the current version of this row"
     /// re-resolve via `scan()` or the row_id an `insert`/`update` returned,
     /// not by re-using a stale one.
-    pub fn get(
+    pub fn get<P: PageReader>(
         &self,
         row_id: RowId,
         snapshot: &Snapshot,
         self_xid: Xid,
-        pool: &mut BufferPool,
+        reader: &P,
     ) -> Result<Vec<u8>> {
-        let page = pool.fetch_page(row_id.page_id)?;
+        let page = reader.read_page(row_id.page_id)?;
         let th = page.tuple_header(row_id.slot)?;
-        let visible = is_visible(th.xmin, th.xmax, snapshot, self_xid);
-        let data = if visible {
+        if is_visible(th.xmin, th.xmax, snapshot, self_xid) {
             on_read(self_xid, row_id);
-            Some(page.get(row_id.slot)?.to_vec())
+            Ok(page.get(row_id.slot)?.to_vec())
         } else {
-            None
-        };
-        pool.unpin(row_id.page_id);
-        data.ok_or(DbError::NoVisibleVersion {
-            page_id: row_id.page_id,
-            slot: row_id.slot,
-        })
+            Err(DbError::NoVisibleVersion {
+                page_id: row_id.page_id,
+                slot: row_id.slot,
+            })
+        }
     }
 
     /// UPDATE: insert a new version chained to `row_id`, then stamp the old
@@ -320,15 +317,15 @@ impl Heap {
     /// Sequential scan: every row visible under `snapshot`. Used by the SQL
     /// executor's table scan (M1.c) and available now for hand-written
     /// interleaved-transaction tests.
-    pub fn scan(
+    pub fn scan<P: PageReader>(
         &self,
         snapshot: &Snapshot,
         self_xid: Xid,
-        pool: &mut BufferPool,
+        reader: &P,
     ) -> Result<Vec<(RowId, Vec<u8>)>> {
         let mut out = Vec::new();
         for &page_id in &self.pages {
-            let page = pool.fetch_page(page_id)?;
+            let page = reader.read_page(page_id)?;
             let sc = page.slot_count_pub();
             for slot in 0..sc {
                 let th = page.tuple_header(slot)?;
@@ -338,7 +335,6 @@ impl Heap {
                     out.push((row_id, page.get(slot)?.to_vec()));
                 }
             }
-            pool.unpin(page_id);
         }
         Ok(out)
     }
@@ -438,7 +434,7 @@ mod tests {
         let xid = 1;
         let rid = heap.insert(b"hello", xid, &mut pool, &mut wal).unwrap();
         let snap = solo_snapshot(xid);
-        let data = heap.get(rid, &snap, xid, &mut pool).unwrap();
+        let data = heap.get(rid, &snap, xid, &pool).unwrap();
         assert_eq!(data, b"hello");
     }
 
@@ -451,7 +447,7 @@ mod tests {
         // xid_b's snapshot considers xid_a still active.
         let snap_b = Snapshot::new(xid_a, 3, vec![xid_a]);
         assert!(matches!(
-            heap.get(rid, &snap_b, 2, &mut pool),
+            heap.get(rid, &snap_b, 2, &pool),
             Err(DbError::NoVisibleVersion { .. })
         ));
     }
@@ -464,7 +460,7 @@ mod tests {
         let rid = heap.insert(b"hello", xid_a, &mut pool, &mut wal).unwrap();
         // Fresh snapshot after xid_a "committed": xid_a no longer active.
         let snap_after = Snapshot::new(2, 2, vec![]);
-        assert_eq!(heap.get(rid, &snap_after, 2, &mut pool).unwrap(), b"hello");
+        assert_eq!(heap.get(rid, &snap_after, 2, &pool).unwrap(), b"hello");
     }
 
     #[test]
@@ -482,13 +478,10 @@ mod tests {
         // itself (no cross-statement RowId stability across an UPDATE;
         // callers re-resolve via the RowId `update` returned, or a scan).
         assert!(matches!(
-            heap.get(rid, &snap, xid, &mut pool),
+            heap.get(rid, &snap, xid, &pool),
             Err(DbError::NoVisibleVersion { .. })
         ));
-        assert_eq!(
-            heap.get(new_rid, &snap, xid, &mut pool).unwrap(),
-            b"new_value"
-        );
+        assert_eq!(heap.get(new_rid, &snap, xid, &pool).unwrap(), b"new_value");
     }
 
     #[test]
@@ -510,8 +503,7 @@ mod tests {
             .unwrap();
         // xid_b's fixed snapshot predates xid_c's update, so it still sees v1.
         assert_eq!(
-            heap.get(rid, &snap_before_update, xid_b, &mut pool)
-                .unwrap(),
+            heap.get(rid, &snap_before_update, xid_b, &pool).unwrap(),
             b"v1"
         );
     }
@@ -526,7 +518,7 @@ mod tests {
             .unwrap();
         let snap_after = Snapshot::new(2, 2, vec![]);
         assert!(matches!(
-            heap.get(rid, &snap_after, 2, &mut pool),
+            heap.get(rid, &snap_after, 2, &pool),
             Err(DbError::NoVisibleVersion { .. })
         ));
     }
@@ -557,7 +549,7 @@ mod tests {
             .unwrap();
         let snap = solo_snapshot(xid);
         let rows: Vec<Vec<u8>> = heap
-            .scan(&snap, xid, &mut pool)
+            .scan(&snap, xid, &pool)
             .unwrap()
             .into_iter()
             .map(|(_, d)| d)
@@ -576,13 +568,13 @@ mod tests {
         // Even to xid itself, the row is gone.
         let snap = solo_snapshot(xid);
         assert!(matches!(
-            heap.get(rid, &snap, xid, &mut pool),
+            heap.get(rid, &snap, xid, &pool),
             Err(DbError::NoVisibleVersion { .. })
         ));
         // And to a later, unrelated snapshot too.
         let snap_after = Snapshot::new(2, 2, vec![]);
         assert!(matches!(
-            heap.get(rid, &snap_after, 2, &mut pool),
+            heap.get(rid, &snap_after, 2, &pool),
             Err(DbError::NoVisibleVersion { .. })
         ));
     }
@@ -598,7 +590,7 @@ mod tests {
         heap.undo_xmax_stamp(rid.page_id, rid.slot, &mut pool, &mut wal)
             .unwrap();
         let snap = solo_snapshot(xid);
-        assert_eq!(heap.get(rid, &snap, xid, &mut pool).unwrap(), b"row");
+        assert_eq!(heap.get(rid, &snap, xid, &pool).unwrap(), b"row");
     }
 
     #[test]
@@ -610,9 +602,9 @@ mod tests {
         let r2 = heap.insert(b"row2", xid, &mut pool, &mut wal).unwrap();
         let r3 = heap.insert(b"row3", xid, &mut pool, &mut wal).unwrap();
         let snap = solo_snapshot(xid);
-        assert_eq!(heap.get(r1, &snap, xid, &mut pool).unwrap(), b"row1");
-        assert_eq!(heap.get(r2, &snap, xid, &mut pool).unwrap(), b"row2");
-        assert_eq!(heap.get(r3, &snap, xid, &mut pool).unwrap(), b"row3");
+        assert_eq!(heap.get(r1, &snap, xid, &pool).unwrap(), b"row1");
+        assert_eq!(heap.get(r2, &snap, xid, &pool).unwrap(), b"row2");
+        assert_eq!(heap.get(r3, &snap, xid, &pool).unwrap(), b"row3");
     }
 
     #[test]

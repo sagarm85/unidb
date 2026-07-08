@@ -399,10 +399,10 @@ mod tests {
         assert!(stats.records_undone > 0, "must undo the orphaned insert");
 
         // After recovery, the row must be permanently invisible.
-        let mut pool = BufferPool::open(&data_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
+        let pool = BufferPool::open(&data_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
         let heap = Heap::new(DEFAULT_PAGE_SIZE as usize);
         let snap = crate::mvcc::Snapshot::new(100, 100, vec![]);
-        assert!(heap.get(rid, &snap, 100, &mut pool).is_err());
+        assert!(heap.get(rid, &snap, 100, &pool).is_err());
     }
 
     #[test]
@@ -428,10 +428,10 @@ mod tests {
         let (_, stats) = recover(&ctrl_p, &data_p, &wal_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
         assert_eq!(stats.incomplete_user_txns, 0);
 
-        let mut pool = BufferPool::open(&data_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
+        let pool = BufferPool::open(&data_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
         let heap = Heap::new(DEFAULT_PAGE_SIZE as usize);
         let snap = crate::mvcc::Snapshot::new(100, 100, vec![]);
-        assert_eq!(heap.get(rid, &snap, 100, &mut pool).unwrap(), b"survives");
+        assert_eq!(heap.get(rid, &snap, 100, &pool).unwrap(), b"survives");
     }
 
     #[test]

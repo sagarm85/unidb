@@ -19,8 +19,11 @@ larger follow-on remains (see [Remaining work](#remaining-work)).
   unconditionally safe for working sets larger than the buffer pool; also
   fixes the pre-existing `BufferPoolFull`-at-scale limitation for the
   ordinary per-statement-fsync path)
-- ☐ Concurrent read path (readers off the single writer thread — the one
-  genuine architectural change, an *addition* to existing MVCC)
+- 🟡 Concurrent read path (branch `m9-concurrent-reads`): **point reads
+  (`get` / `GET /rows/:id`) done** — readers run off the single writer
+  thread on a `Send + Sync` `ReadHandle` over shared state. Concurrent SQL
+  `SELECT` (same pattern + shared catalog + a read-only executor path) is
+  the remaining slice. See [6b](#6b-concurrent-read-path-the-one-real-architectural-change).
 
 ---
 
@@ -159,23 +162,48 @@ limitation (discovered M6) for the ordinary per-statement-fsync path — dirty
 pages are now evictable once durable, where before the pool could only ever
 evict clean frames.
 
-### 6b. Concurrent read path (the one real architectural change)
-Take reads off the single writer thread. With MVCC snapshots already built,
-`get`/`scan`/`NEAR`/`edges_from` can run concurrently on a read-only shared
-view of the buffer pool, each holding only a snapshot; keep the
-single-writer model for mutations (they are fsync-bound anyway, so
-page-level write latching buys little once group commit exists). This
-requires `BufferPool` to support concurrent shared page reads (per-frame
-`RwLock` or a concurrent page cache) and splitting `Engine`'s API into
-`&self` read methods vs. a serialized write lane. Result: **many concurrent
-readers + one group-committing writer** — a standard, correct MVCC design
-that fits the single-primary scope (CLAUDE.md §1).
+### 6b. Concurrent read path — 🟡 POINT READS DONE (branch `m9-concurrent-reads`)
+Take reads off the single writer thread. Chosen structure: **shared read
+handle**, not full interior-mutability of the engine (which would have put a
+`Mutex` on the buffer-pool frames — a `find_victim`-must-flush reentrancy
+trap). The writer keeps owning `Engine` with `&mut self` writes unchanged;
+only the read-relevant state is shared.
+
+**Landed (Phase 1a foundation + point reads):**
+- `bufferpool.rs`: `mmap` → `Arc<RwLock<PageFileMmap>>` (the guard against a
+  reader seeing a torn or remapped-away page); a `PageReader` trait (the read
+  seam) + `SharedPageReader` (frame-free reader view). Writer methods stay
+  `&mut self`, locking the mmap internally.
+- `heap.rs`: `get`/`scan` are generic over `PageReader` (reads copy the page
+  out — no pin/unpin).
+- `txn.rs`: `TransactionManager` state behind `Arc<Mutex<TxnInner>>`
+  (`SharedTxn`); `read_snapshot()` builds a self-contained READ COMMITTED
+  snapshot for a read that allocates **no xid and writes no WAL**.
+- `read_handle.rs`: `ReadHandle` (`Send + Sync + Clone`) with `get(row_id)`;
+  `Engine::read_handle()`. Server `GET /rows/:id` dispatches to it via
+  `spawn_blocking`, bypassing the writer channel entirely.
+- Proof: `tests/concurrent_reads.rs` (4 readers hammering committed rows
+  while the writer inserts 1000 — every read returns exact bytes, no tears);
+  `benches/server.rs::concurrent_read_throughput` shows reads *scale* with
+  concurrency (~3.0k → ~4.3k → ~4.5k reads/s at 1/10/50, HTTP-client-bound in
+  the microbench) instead of the flat single-writer ceiling.
+
+**Remaining slice — concurrent SQL `SELECT`/`NEAR`/`edges_from`/`poll`:** the
+same pattern, needing (1) `Engine.catalog` → `Arc<RwLock<Catalog>>` (readers
+need the live `TableDef.pages`, which grows on INSERT) and `EdgeIndex` shared
+likewise; (2) a read-only executor path (`exec_select_readonly` reusing
+`decode_row`/`predicate_matches`/`project_row` over a `PageReader` + shared
+snapshot); (3) `ReadHandle::execute_sql` (Select-only) + server routing of
+read-only `POST /sql` to it. The `PageReader`/`SharedTxn` foundation already
+makes this additive.
 
 ## 7. Definition of done (for promoting this to a shipped milestone)
 - ✅ 6a implemented; force-WAL-on-evict unit test added; crash harness green.
 - ☐ A deferred-mode durability test alongside the crash harness (crash
   before batch sync ⇒ txn not durable; after ⇒ durable) would further
   harden the group-commit path — not yet added.
-- ☐ 6b implemented and benchmarked (concurrent read throughput scaling).
+- 🟡 6b: point reads implemented, benchmarked, and covered by a concurrency
+  correctness test; concurrent SQL `SELECT` remains (see above).
 - ✅ Benchmark tables recorded in `PROGRESS.md`; `README.md`/`docs/` updated.
-- ✅ No locked decision (§3) violated (D1/D2/D5 upheld).
+- ✅ No locked decision (§3) violated (D1/D2/D5 upheld). `Engine` stays
+  non-`Sync`; the new `ReadHandle` is the `Send + Sync` shared reader.

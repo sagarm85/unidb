@@ -55,6 +55,7 @@ pub mod mmap;
 pub mod mvcc;
 pub mod page;
 pub mod queue;
+pub mod read_handle;
 pub mod recovery;
 #[cfg(feature = "server")]
 pub mod server;
@@ -92,6 +93,7 @@ use crate::{
 
 pub use crate::error::DbError;
 pub use crate::heap::RowId;
+pub use crate::read_handle::ReadHandle;
 pub use crate::sql::executor::ExecResult as SqlResult;
 pub use crate::txn::IsolationLevel as Isolation;
 
@@ -403,7 +405,7 @@ impl Engine {
                 .unwrap_or(0);
 
         let mut events = Vec::new();
-        for (_, bytes) in events_heap.scan(&snapshot, xid, &mut self.pool)? {
+        for (_, bytes) in events_heap.scan(&snapshot, xid, &self.pool)? {
             let row = executor::decode_row(&bytes, &events_def.columns)?;
             let (
                 Literal::Int(seq),
@@ -517,7 +519,7 @@ impl Engine {
         let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
 
         let mut min_offset: Option<i64> = None;
-        for (_, bytes) in consumers_heap.scan(&snapshot, xid, &mut self.pool)? {
+        for (_, bytes) in consumers_heap.scan(&snapshot, xid, &self.pool)? {
             let row = executor::decode_row(&bytes, &consumers_def.columns)?;
             if let Literal::Int(offset) = row[1] {
                 min_offset = Some(min_offset.map_or(offset, |m: i64| m.min(offset)));
@@ -530,7 +532,7 @@ impl Engine {
         let events_def = self.catalog.lookup(EVENTS_TABLE)?.clone();
         let mut events_heap = Heap::from_pages(page_size, events_def.pages.clone());
         let to_reclaim: Vec<RowId> = events_heap
-            .scan(&snapshot, xid, &mut self.pool)?
+            .scan(&snapshot, xid, &self.pool)?
             .into_iter()
             .filter_map(|(row_id, bytes)| {
                 let row = executor::decode_row(&bytes, &events_def.columns).ok()?;
@@ -718,6 +720,15 @@ impl Engine {
         self.txn_mgr.commit(xid, &mut self.wal, &mut self.lock_mgr)
     }
 
+    /// A cloneable, `Send + Sync` handle for concurrent reads that run off the
+    /// single writer thread (6b). Derived from the buffer pool's shared mmap
+    /// and the shared transaction snapshot state, so many readers execute in
+    /// parallel with each other and with the writer, coordinating only through
+    /// MVCC snapshots. See [`crate::read_handle::ReadHandle`].
+    pub fn read_handle(&self) -> ReadHandle {
+        ReadHandle::new(self.pool.shared_reader(), self.txn_mgr.shared())
+    }
+
     /// Enable/disable WAL group-commit deferral (M9). When enabled, per-
     /// statement and per-commit fsyncs are skipped; the caller becomes
     /// responsible for calling [`Self::sync_wal`] to force durability before
@@ -777,7 +788,7 @@ impl Engine {
     /// [`Self::abort`] on it, even for a read-only `xid`.
     pub fn get(&mut self, xid: Xid, row_id: RowId) -> Result<Vec<u8>> {
         let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
-        self.heap.get(row_id, &snapshot, xid, &mut self.pool)
+        self.heap.get(row_id, &snapshot, xid, &self.pool)
     }
 
     /// Update `row_id`, returning the new version's RowId (M1: UPDATE

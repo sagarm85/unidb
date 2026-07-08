@@ -99,9 +99,9 @@ pub async fn get_row(
     Path((page_id, slot)): Path<(u32, u16)>,
 ) -> std::result::Result<Vec<u8>, ApiError> {
     let row_id = RowId { page_id, slot };
-    let xid = state.engine.begin(None).await?;
-    let result = state.engine.get(xid, row_id).await;
-    finish(&state.engine, xid, result).await.map_err(ApiError)
+    // Concurrent read path (6b): reads run off the single writer thread on a
+    // shared, snapshot-consistent handle — no begin/get/commit round-trips.
+    state.engine.get_row(row_id).await.map_err(ApiError)
 }
 
 pub async fn put_row(
