@@ -1740,3 +1740,151 @@ never a silent misread. **`FORMAT_VERSION` deliberately NOT bumped**: the tag
 set only grows, no old file becomes unreadable, and a bump here would needlessly
 reject pre-P2.a databases and collide with the parallel Core lane's Phase 1
 version work. (Reserved the bump for a genuinely incompatible change.)
+
+---
+
+## P2.b — FLOAT / UUID / BYTEA / DATE / TIME   [SQL lane — Phase 2 — landing]   2026-07-08
+
+**Branch:** `sql-types` (SQL lane worktree). Second Phase 2 checkpoint, same
+four-touchpoint pattern as P2.a.
+**Summary:** Five more scalar types — `FLOAT` (f64), `UUID` (16 bytes), `BYTEA`
+(opaque bytes), `DATE`, `TIME`. Each round-trips exactly, orders/compares
+correctly (including string-operand coercion), and works under M11 constraints.
+
+**What changed:**
+- `catalog.rs`: `ColumnType::{Float, Uuid, Bytea, Date, Time}`.
+- `sql/logical.rs`: `Literal::{Float(f64), Uuid([u8;16]), Bytea(Vec<u8>),
+  Date(i32), Time(i64)}`.
+- `sql/datetime.rs`: `parse_date`/`format_date` (days since epoch),
+  `parse_time`/`format_time` (micros since midnight).
+- `sql/parser.rs`: `FLOAT`/`REAL`/`DOUBLE PRECISION`/... → `Float`; `UUID`;
+  `BYTEA`/`BLOB`/`BINARY`/`VARBINARY` → `Bytea`; `DATE`; `TIME`.
+- `sql/executor.rs`: row-encoding tags **8** (Float, 8 B LE), **9** (Uuid, 16 B),
+  **10** (Bytea, len-prefixed), **11** (Date, i32 LE), **12** (Time, i64 LE);
+  coercion (float widens from int/decimal; uuid/bytea/date/time parse from a
+  string literal); comparison (float via f64 with NaN-unordered → false;
+  uuid/bytea/date/time ordering + on-demand string parse); `parse_uuid`/
+  `format_uuid`, `parse_bytea`/`format_bytea`.
+- `queue/payload.rs`, `server/dto.rs`: additive arms (float as JSON number;
+  uuid/bytea/date/time as canonical strings).
+
+**Design notes:** `BYTEA` text input is Postgres `\xHEX` or the string's raw
+UTF-8 bytes (permissive, documented). `UUID` accepts hyphenated or bare 32-hex,
+renders canonical lowercase hyphenated. No BTree index on the new types yet
+(`OrderedValue` doesn't cover them; they're skipped in `build_indexed_columns`,
+not errored).
+
+**Benchmark note (§6):** functional type additions; fixed-width row growth only,
+no hot-path algorithm change — no new benchmark table.
+**Tests:** +2 `datetime` (date/time), +5 executor (round-trip / order /
+UUID-PK / BYTEA hex+raw), +1 parser. `cargo test -p unidb` 277 → 285.
+**Locked-decision changes:** none. Tags 8–12 additive/forward-compatible (D4);
+no `FORMAT_VERSION` bump (same reasoning as P2.a).
+
+---
+
+## P2.c — ALTER / DROP / TRUNCATE + transactional DDL   [SQL lane — Phase 2 — landing]   2026-07-08
+
+**Branch:** `sql-types`. Third Phase 2 checkpoint — schema evolution.
+**Summary:** `ALTER TABLE ADD COLUMN` (with `DEFAULT`), `ALTER TABLE DROP
+COLUMN` (logical tombstone), `DROP TABLE`, `TRUNCATE`, plus request-level DDL
+rollback so a failed multi-statement request leaves the schema untouched.
+
+**What changed:**
+- **ADD COLUMN**: appended physically; pre-existing rows (which lack bytes for
+  the new trailing column) decode it as its coerced `DEFAULT`/NULL — no heap
+  rewrite. `NOT NULL` without `DEFAULT` is rejected.
+- **DROP COLUMN**: **logical tombstone** (`ColumnDef.dropped`, `#[serde(default)]`).
+  The column keeps its physical row slot so rows written before the drop still
+  decode positionally, but it is hidden from `SELECT *`, unreferenceable by
+  name, and written NULL on new inserts. Every row-handling path (project /
+  order / column-index / apply-defaults / not-null / check / unique) is now
+  tombstone-aware. Dropping a constraint-referenced or last-visible column is
+  rejected.
+- **DROP TABLE / TRUNCATE**: catalog removal / page-list clear. Orphaned heap
+  pages are reclaimed once Phase 1's FSM/free-page list lands (same accepted
+  tradeoff as pre-vacuum bloat). System tables (`__*`) are protected.
+- **Transactional DDL (request-level)**: `execute_sql`/`run_bound_plans`
+  snapshot the catalog root and restore it (`Engine::restore_catalog_root`) if
+  any statement of a `;`-separated request fails — the catalog persists
+  eagerly (non-MVCC, a documented M1 limitation), so this manual restore is
+  what makes failed DDL roll back; heap writes are undone by the caller's txn
+  abort. **Full crash-safe, user-transaction-scoped catalog redo/undo through
+  recovery is deferred** — it needs a `recovery.rs` hook, which is Core-lane
+  territory; the mechanism (catalog-root snapshot/restore) is in place for
+  whoever wires it.
+- `sql/logical.rs`: `LogicalPlan::{AlterTableAddColumn, AlterTableDropColumn,
+  DropTable, Truncate}`; `sql/parser.rs`: the matching `Statement` handlers;
+  `ExecResult::{AlteredTable, DroppedTable, Truncated}` + server DTO arms.
+
+**lib.rs impact:** a minimal additive guard on `execute_sql`'s loop (catalog
+snapshot + restore-on-error) plus one new helper method — no restructuring.
+**Tests:** executor ALTER/DROP/TRUNCATE incl. the **middle-column alignment
+hazard** (pre-drop rows must still read the right columns), `DROP COLUMN IF
+EXISTS`, system-table rejection; lib DDL-rollback + survive-reopen; parser DDL.
+285 → 294 unit tests.
+**Locked-decision changes:** none. `ColumnDef.dropped` / `serde` catalog fields
+are forward-compatible additions (same discipline as M4/M11).
+
+---
+
+## P2.d — sequences / SERIAL   [SQL lane — Phase 2 — landing]   2026-07-08
+
+**Branch:** `sql-types`. Fourth Phase 2 checkpoint — surrogate keys.
+**Summary:** `SERIAL`/`BIGSERIAL`/`GENERATED ... AS IDENTITY` columns auto-fill
+from a durable, monotonic per-column counter that survives reopen.
+
+**What changed:**
+- `catalog.rs`: `ColumnConstraints.identity` flag; `TableDef.serial_next`
+  (`HashMap<column, i64>`, `#[serde(default)]`) — the durable counter,
+  crash-safe via the same WAL-logged catalog page write as any catalog change;
+  `Catalog::alloc_serial` (monotonic, i64-overflow-checked, persists per call).
+- `sql/parser.rs`: `SERIAL`/`BIGSERIAL`/`SMALLSERIAL` (custom types) and
+  `GENERATED ... AS IDENTITY` → `Int64` identity column.
+- `sql/executor.rs`: `exec_create_table` validates identity columns are `Int64`
+  and seeds the counter at 1; `exec_insert`'s `fill_serials` allocates the next
+  value for any omitted/NULL identity column before DEFAULT/NOT NULL run.
+
+**Design notes:** single-writer serialization guarantees no duplicate ids. An
+explicit value is honored as-is and does **not** advance the counter (matching
+Postgres `SERIAL` — a documented sharp edge). Persist-per-allocation keeps the
+sequence crash-safe; batching is a future optimization.
+**Tests:** monotonic increment, explicit value + PK conflict, `GENERATED AS
+IDENTITY`, non-integer rejection, survives-reopen. 294 → 303 unit tests.
+**Locked-decision changes:** none.
+
+---
+
+## P2.e — prepared statements + bind parameters   [SQL lane — Phase 2 — landing]   2026-07-08
+
+**Branch:** `sql-types`. Fifth Phase 2 checkpoint — **closes the SQL-injection
+surface** and enables parse-once/execute-many.
+**Summary:** `$n` placeholders + a positional values array. A bound value is
+always *data*, never re-parsed as SQL.
+
+**What changed:**
+- `sql/logical.rs`: `Literal::Param(usize)` placeholder + `bind_params(plan,
+  params)` — substitutes every `$n` before the plan reaches the executor;
+  errors on an out-of-range index. No `Param` survives into encoding /
+  comparison / the wire.
+- `sql/parser.rs`: `$n` (`Value::Placeholder`) → `Literal::Param`.
+- `lib.rs`: `Engine::execute_sql_params` (injection-safe entry point) and
+  `prepare()`/`execute_prepared()` (parse once, execute many) over a shared
+  `run_bound_plans` loop (bind → RLS → execute → request-level DDL rollback on
+  failure). New `Prepared` type.
+- `server/`: `SqlRequest.params` + `json_to_literal`;
+  `EngineHandle::execute_sql_params` + writer-thread command;
+  `post_sql` routes parameterized requests through the writer thread with
+  values bound as data.
+- Defensive `Literal::Param` arms on the exhaustive matches (`encode_row` /
+  `literal_to_json` / `row_to_json`) — unreachable after binding, benign
+  (never panic; `encode_row` uses a `debug_assert` + NULL fallback).
+
+**Injection proof:** a value like `"'; DROP TABLE t; --"` bound via
+`execute_sql_params` matches/inserts only that literal string; the table is
+untouched (tested end-to-end).
+**Tests:** injection-as-data, out-of-range error, prepared-plan reuse, parser
+placeholders, `bind_params` unit, `json_to_literal` + `SqlRequest` param
+defaults. 303 → 309 unit tests (+2 server-feature).
+**Docs:** `docs/REST_API.md` documents the `params` field on `POST /sql`.
+**Locked-decision changes:** none.

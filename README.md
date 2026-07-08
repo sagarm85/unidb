@@ -315,9 +315,10 @@ unidb-attach/
 
 ## Milestone roadmap
 
-Milestones M0–M11 are **shipped, tested, and benchmarked**; the project is now
-executing the phased scaling plan in `docs/backlog/roadmap.md` (Phase 1 ACID
-hardening + Phase 2 real data model run in parallel). Metrics tables are in
+Milestones M0–M11 are **shipped, tested, and benchmarked**, and **Phase 2
+(real data model) is complete** — the project is executing the phased scaling
+plan in `docs/backlog/roadmap.md` (Phase 1 ACID hardening runs in parallel;
+Phase 4 query power is next for the SQL lane). Metrics tables are in
 `PROGRESS.md`; current implementation state and known tech debt are in
 `MEMORY.md`.
 
@@ -335,6 +336,10 @@ hardening + Phase 2 real data model run in parallel). Metrics tables are in
 | M10 — Heap vacuum / GC | done | `Engine::vacuum()`: reader-aware horizon, crash-safe `WAL_VACUUM`, secondary-index vacuum gate, page compaction + slot reuse |
 | M11 — SQL constraints | done | `PRIMARY KEY` / `FOREIGN KEY` / `UNIQUE` / `NOT NULL` / `CHECK` / `DEFAULT` on `CREATE TABLE`, enforced on INSERT/UPDATE |
 | P2.a — DECIMAL + TIMESTAMP | done | Exact fixed-point `DECIMAL(p, s)` (money) and UTC `TIMESTAMP` (time) column types, with round-trip + ordering + constraint support (Phase 2, SQL lane) |
+| P2.b — FLOAT/UUID/BYTEA/DATE/TIME | done | Five more scalar types on the same encoding/coercion/comparison machinery |
+| P2.c — ALTER/DROP/TRUNCATE | done | Schema evolution — `ADD COLUMN` (with `DEFAULT`), tombstone `DROP COLUMN`, `DROP TABLE`, `TRUNCATE`, and request-level DDL rollback |
+| P2.d — sequences / SERIAL | done | Durable, monotonic, crash-safe auto-increment (`SERIAL` / `GENERATED AS IDENTITY`) |
+| P2.e — prepared statements | done | `$n` bind parameters (`execute_sql_params`, `prepare`/`execute_prepared`, `POST /sql` `params`) — closes the SQL-injection surface |
 
 ---
 

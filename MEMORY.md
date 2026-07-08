@@ -88,17 +88,19 @@
   plan); the older per-milestone backlog docs were retired. A CSR-preferring
   traversal fix (staleness/generation marker design) remains documented tech
   debt below — deliberately not attempted as part of the M7 bug fix.
-- **Immediate next task: Phase 2 P2.b (FLOAT/UUID/BYTEA/DATE/TIME).** The
-  ACID-first phased scaling plan (`docs/backlog/roadmap.md`) is now the forward
-  plan; M0–M11 all shipped. The SQL lane (branch `sql-types`,
-  `docs/backlog/phase2_data_model.md`) launched Phase 2 — **P2.a (DECIMAL +
-  TIMESTAMP) landed 2026-07-08** (dated subsection below), and P2.b is next on
-  the same machinery, then P2.c (ALTER/DROP/TRUNCATE + transactional DDL), P2.d
-  (sequences/SERIAL), P2.e (prepared statements + bind params). The Core lane
-  (branch `acid-hardening`) runs Phase 1 in parallel on disjoint files. A
-  CSR-preferring traversal fix (staleness/generation marker design) is
-  documented as known tech debt below but was deliberately not attempted as
-  part of the M7 bug fix — that's new design work, not a regression fix.
+- **Immediate next task (SQL lane): Phase 2 is COMPLETE (P2.a–P2.e all shipped
+  on branch `sql-types`, 2026-07-08).** Next standing item per the roadmap is
+  **Phase 4 (query power: joins, aggregates, GROUP BY/ORDER BY, cost-based
+  optimizer, EXPLAIN)** — the other SQL-lane phase — while the Core lane
+  continues Phase 1 and Phase 3 (durable indexes + big-file) awaits a lane. The
+  SQL lane delivered the full Phase 2 real-data-model set: P2.a
+  DECIMAL+TIMESTAMP, P2.b FLOAT/UUID/BYTEA/DATE/TIME, P2.c ALTER/DROP/TRUNCATE
+  + request-level DDL rollback, P2.d sequences/SERIAL, P2.e prepared statements
+  + bind params (injection surface closed). Dated subsections below; full
+  entries in `PROGRESS.md`. A CSR-preferring traversal fix (staleness/generation
+  marker design) is documented as known tech debt below but was deliberately
+  not attempted as part of the M7 bug fix — that's new design work, not a
+  regression fix.
 - **In-flight performance work (branch `m9-group-commit`, 2026-07-08, not
   yet merged):** group commit + read-only fsync skip. The diagnosis (see
   `docs/performance/fssdb/`) was that the ~3–4 ms floor on every durable op
@@ -290,6 +292,51 @@ future reader needs:
   `2024-01-01 00:00:00` and `2024-01-01T00:00:00` collide as they should).
   No BTree index on decimal/timestamp yet (`OrderedValue` doesn't cover them;
   they're skipped in `build_indexed_columns`, not errored).
+
+### P2.b–P2.e — rest of Phase 2 (SQL lane, branch `sql-types`, 2026-07-08)
+
+Full entries in `PROGRESS.md`. What a future reader most needs:
+
+- **P2.b (FLOAT/UUID/BYTEA/DATE/TIME).** Row-encoding tags **8–12** (all
+  additive, no `FORMAT_VERSION` bump). `Literal::{Float(f64), Uuid([u8;16]),
+  Bytea(Vec<u8>), Date(i32), Time(i64)}`. Same "parser can't know the column
+  type, so uuid/bytea/date/time arrive as `Literal::Text` and coerce at
+  `coerce_value`" pattern as P2.a's timestamp. `BYTEA` text = `\xHEX` or raw
+  UTF-8 bytes; `UUID` in/out is canonical. Float compares via `f64` (NaN →
+  unordered → false). No BTree index on these yet (`OrderedValue` skips them).
+- **P2.c (ALTER/DROP/TRUNCATE + transactional DDL).** The subtle part:
+  **DROP COLUMN is a logical tombstone** (`ColumnDef.dropped`), *not* a physical
+  removal — removing a middle column's bytes would misalign every pre-drop
+  row's positional decode. The tombstone keeps the slot; ~7 row-handling
+  functions became `!dropped`-aware (project/order/column_index/apply_defaults/
+  not_null/checks/unique_sets). **ADD COLUMN** appends physically and relies on
+  `decode_row` filling missing trailing columns with the coerced DEFAULT/NULL
+  (no heap rewrite). **Transactional DDL is request-level only**: `execute_sql`/
+  `run_bound_plans` snapshot `control.catalog_root` and restore via
+  `Engine::restore_catalog_root` on any statement failure (the catalog persists
+  eagerly and is non-MVCC — the documented M1 limitation — so this manual
+  restore is the rollback). **Crash-safe user-txn-scoped catalog redo/undo
+  through `recovery.rs` is deliberately deferred** (Core-lane territory); the
+  snapshot/restore mechanism is in place for whoever wires it. `DROP`/`TRUNCATE`
+  orphan heap pages until Phase 1's FSM lands. `lib.rs` change was a minimal
+  additive guard on `execute_sql` + one helper — no restructuring.
+- **P2.d (SERIAL).** `ColumnConstraints.identity` + `TableDef.serial_next`
+  (durable per-column counter in the catalog blob; crash-safe via the catalog's
+  own WAL-logged persist). `exec_insert::fill_serials` allocates before DEFAULT
+  fill. Explicit value honored as-is, counter *not* advanced past it (Postgres
+  `SERIAL` semantics). Single-writer ⇒ no duplicates. Persist-per-allocation
+  (batching is a future perf item).
+- **P2.e (prepared statements + bind params — injection surface closed).**
+  `Literal::Param(usize)` + `logical::bind_params` substitutes every `$n` with
+  the caller's value **before** the plan reaches the executor, so a Param never
+  reaches encoding/comparison/wire (defensive unreachable arms on the 3
+  exhaustive `Literal` matches). `Engine::execute_sql_params` is the
+  injection-safe entry point; `prepare()`/`execute_prepared()` (new `Prepared`
+  type) give parse-once/execute-many; both go through a shared
+  `run_bound_plans`. Server: `SqlRequest.params` + `json_to_literal` +
+  `EngineHandle::execute_sql_params` (writer-thread command); `POST /sql`
+  documents `params`. **All parameterized paths bind before RLS/execute**, so a
+  value is always data.
 
 ### Design note: xid reuse after checkpoint — a real M1-era bug, found and fixed during M5
 

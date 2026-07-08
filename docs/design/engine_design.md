@@ -316,8 +316,9 @@ sign-off, recorded in `PROGRESS.md`.
 ### 4.6 Catalog
 
 `catalog.rs`: `TableDef`/`ColumnDef`/`ColumnType`
-(`Int64`/`Text`/`Bool`/`Json`/`Vector(n)`/`Decimal(p,s)`/`Timestamp` — the last
-two added in Phase 2 P2.a), persisted as a single
+(`Int64`/`Text`/`Bool`/`Json`/`Vector(n)`/`Decimal(p,s)`/`Timestamp`/`Float`/
+`Uuid`/`Bytea`/`Date`/`Time` — everything past `Vector(n)` added across Phase 2
+P2.a–P2.b), persisted as a single
 `serde_json` blob rewritten to a fresh page on every change, pointed at by
 `control.catalog_root`. Using `serde` here is deliberate — schema is
 infrequent control-plane data, not the hot path D9 protects.
@@ -366,8 +367,10 @@ Row encoding is hand-rolled tag+value per column (that *is* the hot path):
 tags 0=`Null`, 1=`Int64`, 2=`Text`, 3=`Bool`, 4=`Json`, 5=`Vector`
 (`[dim: u32 LE][f32 LE × dim]`, dimension-prefixed so `decode_row` can
 cross-check the schema), 6=`Decimal` (`[i128 LE (16 B)][scale: u8]`, P2.a),
-7=`Timestamp` (`[i64 LE micros]`, P2.a). New tags are additive and
-forward-compatible (D4) — old rows never carry them, so no `FORMAT_VERSION`
+7=`Timestamp` (`[i64 LE micros]`, P2.a), 8=`Float` (`[f64 LE]`), 9=`Uuid`
+(`[16 B]`), 10=`Bytea` (`[u32 LE len][bytes]`), 11=`Date` (`[i32 LE days]`),
+12=`Time` (`[i64 LE micros]`) — the last five from P2.b. New tags are additive
+and forward-compatible (D4) — old rows never carry them, so no `FORMAT_VERSION`
 bump. Vector dimension (and, for decimals, the stored scale) is validated in
 three independent places (DDL, INSERT/UPDATE coercion, every decode), each
 guarding a different failure mode.
@@ -889,10 +892,16 @@ P1.a full-page-writes + P1.b fsync-failure handling shipped** — `WAL_FPI`
 torn-page protection (§3.3, `FORMAT_VERSION` 3→4, crash point P11) and the
 fsyncgate poison path (§3.3, crash point P12); 14 crash tests total. P1.c–P1.e
 (`alloc_page` remap + configurable pool + real FSM, isolation correctness incl.
-the still-pending D12 RC re-eval + SSI, auto-checkpoint) to follow. See `docs/backlog/phase1_acid_hardening.md` and `PROGRESS.md`'s Phase 1
-entry. Update alongside the next checkpoint's closeout.*
-**Phase 2 P2.a (2026-07-08, SQL lane, branch `sql-types`): DECIMAL + TIMESTAMP**
-— `ColumnType::Decimal(p,s)`/`Timestamp`, row-encoding tags 6/7 (§4.6), exact
-fixed-point + UTC-micros representations, working under M11 constraints; see
-`docs/backlog/phase2_data_model.md` and `PROGRESS.md`'s P2.a entry.
+the still-pending D12 RC re-eval + SSI, auto-checkpoint) to follow. See `docs/backlog/phase1_acid_hardening.md` and `PROGRESS.md`'s Phase 1 entry.
+**Phase 2 complete (2026-07-08, SQL lane, branch `sql-types`): real data model.**
+P2.a DECIMAL+TIMESTAMP · P2.b FLOAT/UUID/BYTEA/DATE/TIME (row-encoding tags
+6–12, §4.6) · P2.c ALTER/DROP/TRUNCATE with a **tombstone `DROP COLUMN`**
+(`ColumnDef.dropped`) and **request-level DDL rollback** (`execute_sql`
+snapshots/restores the catalog root; full crash-safe user-txn-scoped catalog
+undo through recovery is a deferred Core-lane follow-up) · P2.d **SERIAL**
+(durable `TableDef.serial_next` counter) · P2.e **prepared statements + `$n`
+bind parameters** (`Literal::Param` + `bind_params`, `Engine::execute_sql_params`
+/`prepare`/`execute_prepared`, `POST /sql` `params`) — closes the SQL-injection
+surface. All additive/forward-compatible; no `FORMAT_VERSION` bump. See
+`docs/backlog/phase2_data_model.md` and `PROGRESS.md`'s P2.a–P2.e entries.
 Update alongside the next milestone's closeout.*
