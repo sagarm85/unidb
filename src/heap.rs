@@ -57,6 +57,15 @@ pub struct Heap {
     page_size: usize,
     /// Ordered list of page IDs belonging to this heap.
     pages: Vec<PageId>,
+    /// Free-space map (P1.c): cached free bytes per known page, so
+    /// `find_or_alloc_page` can pick a page that fits by comparing integers
+    /// instead of *fetching* (copying 8 KiB of) every page — the old O(pages)
+    /// per-insert cost that made the heap O(pages²) to fill. Populated as pages
+    /// are touched and kept exact after every mutation that changes a page's
+    /// free space (a hint only — never over-reports, so a chosen page always
+    /// fits). For a `Heap` reconstructed via [`Self::from_pages`] it starts
+    /// empty and is filled lazily (scanning from the end, append-locality).
+    free_map: std::collections::HashMap<PageId, usize>,
 }
 
 impl Heap {
@@ -64,6 +73,7 @@ impl Heap {
         Self {
             page_size,
             pages: Vec::new(),
+            free_map: std::collections::HashMap::new(),
         }
     }
 
@@ -72,7 +82,11 @@ impl Heap {
     /// work correctly after a reopen, rather than starting from an empty
     /// page list every time — see catalog.rs's `TableDef.pages`).
     pub fn from_pages(page_size: usize, pages: Vec<PageId>) -> Self {
-        Self { page_size, pages }
+        Self {
+            page_size,
+            pages,
+            free_map: std::collections::HashMap::new(),
+        }
     }
 
     /// The heap's current page list, so callers (the SQL executor) can
@@ -115,6 +129,7 @@ impl Heap {
         let ins_lsn = wal.log_insert(txn_id, prev_lsn, page_id, slot, &redo)?;
         page.set_lsn(ins_lsn);
         pool.write_page(&page)?;
+        self.note_free_space(page_id, &page); // P1.c: keep the FSM exact
         pool.unpin(page_id);
         wal.commit_mini_txn(txn_id, ins_lsn)?;
         Ok(RowId { page_id, slot })
@@ -224,6 +239,7 @@ impl Heap {
         let ins_lsn = wal.log_insert(txn_id, ins_prev, new_page_id, new_slot, &insert_redo)?;
         new_page.set_lsn(ins_lsn);
         pool.write_page(&new_page)?;
+        self.note_free_space(new_page_id, &new_page); // P1.c: keep the FSM exact
         pool.unpin(new_page_id);
 
         wal.commit_mini_txn(txn_id, ins_lsn)?;
@@ -381,20 +397,50 @@ impl Heap {
 
     // ── FSM ──────────────────────────────────────────────────────────────────
 
+    /// Record a page's current free space in the FSM (P1.c). Call after any
+    /// mutation that changes free space, with the page in hand.
+    fn note_free_space(&mut self, page_id: PageId, page: &SlottedPage) {
+        self.free_map.insert(page_id, page.free_space());
+    }
+
+    /// Find a page with room for `needed` bytes, or allocate a new one (P1.c —
+    /// real free-space map). Fast path: the cached `free_map` answers "which
+    /// page fits?" with integer comparisons and **no page fetch**. Only pages
+    /// whose free space is still *unknown* (a freshly reconstructed
+    /// `from_pages` heap) are fetched — and those from the end backward
+    /// (append locality), stopping at the first fit and caching every probe —
+    /// so the common append case costs at most one fetch instead of O(pages).
     fn find_or_alloc_page(
         &mut self,
         needed: usize,
         pool: &mut BufferPool,
         wal: &mut Wal,
     ) -> Result<PageId> {
+        // 1. Known pages that fit — pure integer comparison, no fetch.
         for &pid in &self.pages {
+            if self.free_map.get(&pid).is_some_and(|&free| free >= needed) {
+                return Ok(pid);
+            }
+        }
+        // 2. Unknown pages: probe from the end (most recent = most likely to
+        //    have room), caching each result so a later probe is free.
+        let unknown: Vec<PageId> = self
+            .pages
+            .iter()
+            .rev()
+            .filter(|pid| !self.free_map.contains_key(pid))
+            .copied()
+            .collect();
+        for pid in unknown {
             let page = pool.fetch_page_for_write(pid, wal)?;
             let free = page.free_space();
             pool.unpin(pid);
+            self.free_map.insert(pid, free);
             if free >= needed {
                 return Ok(pid);
             }
         }
+        // 3. Nothing fits — allocate a fresh page.
         self.alloc_heap_page(pool, wal)
     }
 
@@ -408,6 +454,7 @@ impl Heap {
         pool.write_page(&page)?;
         pool.unpin(pid);
         self.pages.push(pid);
+        self.note_free_space(pid, &page);
         tracing::debug!(page_id = pid, "heap page allocated");
         Ok(pid)
     }
@@ -486,6 +533,7 @@ impl Heap {
         let lsn = wal.log_vacuum(txn_id, begin_lsn, page_id, u16::MAX, &image)?;
         page.set_lsn(lsn);
         pool.write_page(&page)?;
+        self.note_free_space(page_id, &page); // P1.c: compaction freed space
         pool.unpin(page_id);
         wal.commit_mini_txn(txn_id, lsn)?;
         // P1.a: this WAL_VACUUM record already carries a full clean page image
@@ -801,6 +849,63 @@ mod tests {
             .map(|(_, d)| d)
             .collect();
         assert_eq!(rows, vec![b"survivor".to_vec()]);
+    }
+
+    /// P1.c: many small inserts pack into as few pages as fit (the FSM points
+    /// each insert at a page with room), and every row stays readable.
+    #[test]
+    fn fsm_packs_small_rows_and_reuses_pages() {
+        let dir = tempdir().unwrap();
+        let (mut heap, mut pool, mut wal, _lock) = setup(dir.path());
+        let xid = 1;
+        let mut rids = Vec::new();
+        for i in 0u32..200 {
+            rids.push(
+                heap.insert(&i.to_le_bytes(), xid, &mut pool, &mut wal)
+                    .unwrap(),
+            );
+        }
+        // 200 tiny rows fit in only a handful of 8 KiB pages — the FSM must
+        // keep filling a page with room rather than allocating one per row.
+        assert!(
+            heap.page_ids().len() < 10,
+            "small rows should pack tightly, got {} pages",
+            heap.page_ids().len()
+        );
+        // Every row is still correct.
+        let snap = solo_snapshot(xid);
+        for (i, rid) in rids.iter().enumerate() {
+            assert_eq!(
+                heap.get(*rid, &snap, xid, &pool).unwrap(),
+                (i as u32).to_le_bytes()
+            );
+        }
+    }
+
+    /// P1.c: space freed by vacuum compaction is recorded in the FSM and
+    /// reused by a later insert rather than growing the heap.
+    #[test]
+    fn fsm_reuses_compacted_space() {
+        let dir = tempdir().unwrap();
+        let (mut heap, mut pool, mut wal, mut lock) = setup(dir.path());
+        let xid = 1;
+        let big = vec![b'x'; 4000]; // ~half a page
+        let dead = heap.insert(&big, xid, &mut pool, &mut wal).unwrap();
+        heap.delete(dead, xid, &mut pool, &mut wal, &mut lock)
+            .unwrap();
+        heap.mark_dead(dead, &mut pool, &mut wal).unwrap();
+        heap.compact_page(dead.page_id, &mut pool, &mut wal)
+            .unwrap();
+        let pages_before = heap.page_ids().len();
+        // A row that fits in the reclaimed space must reuse the compacted page.
+        let reused = heap
+            .insert(&vec![b'y'; 3000], xid, &mut pool, &mut wal)
+            .unwrap();
+        assert_eq!(
+            reused.page_id, dead.page_id,
+            "insert must reuse freed space"
+        );
+        assert_eq!(heap.page_ids().len(), pages_before, "heap must not grow");
     }
 
     #[test]

@@ -98,7 +98,21 @@ pub use crate::read_handle::ReadHandle;
 pub use crate::sql::executor::ExecResult as SqlResult;
 pub use crate::txn::IsolationLevel as Isolation;
 
-const POOL_CAPACITY: usize = 256;
+/// Default buffer-pool capacity in frames (P1.c). Raised from 256 (2 MiB at
+/// the 8 KiB default page size) to 4096 (32 MiB) — far fewer evictions at
+/// 100k+ rows per table. Override with the `UNIDB_BUFFER_POOL_PAGES` env var
+/// or [`Engine::open_with_pool_capacity`].
+const DEFAULT_POOL_CAPACITY: usize = 4096;
+
+/// The configured buffer-pool capacity: `UNIDB_BUFFER_POOL_PAGES` if it parses
+/// to a sane value (>= 16 frames), else [`DEFAULT_POOL_CAPACITY`].
+fn configured_pool_capacity() -> usize {
+    std::env::var("UNIDB_BUFFER_POOL_PAGES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 16)
+        .unwrap_or(DEFAULT_POOL_CAPACITY)
+}
 
 /// The outcome of an [`Engine::vacuum`] pass (M10). Surfaces the numbers the
 /// milestone cares about — including whether a long-lived transaction/reader
@@ -180,8 +194,22 @@ fn cat_write(c: &RwLock<Catalog>) -> RwLockWriteGuard<'_, Catalog> {
 }
 
 impl Engine {
-    /// Open (or create) a database at `dir`. Pass `page_size = 0` to use the default.
+    /// Open (or create) a database at `dir`. Pass `page_size = 0` to use the
+    /// default. The buffer-pool capacity comes from `UNIDB_BUFFER_POOL_PAGES`
+    /// or the [`DEFAULT_POOL_CAPACITY`] default (P1.c).
     pub fn open(dir: &Path, page_size: u32) -> Result<Self> {
+        Self::open_with_pool_capacity(dir, page_size, configured_pool_capacity())
+    }
+
+    /// Open (or create) a database with an explicit buffer-pool capacity in
+    /// frames (P1.c) — for tests/benchmarks that need a specific pool size
+    /// without going through the `UNIDB_BUFFER_POOL_PAGES` env var.
+    pub fn open_with_pool_capacity(
+        dir: &Path,
+        page_size: u32,
+        pool_capacity: usize,
+    ) -> Result<Self> {
+        let pool_capacity = pool_capacity.max(16);
         std::fs::create_dir_all(dir)?;
         let ctrl_p = dir.join("control");
         let data_p = dir.join("data.db");
@@ -197,10 +225,10 @@ impl Engine {
 
         // Run recovery before opening normal operation.
         if wal_p.exists() && ctrl_p.exists() {
-            recovery::recover(&ctrl_p, &data_p, &wal_p, page_size_usize, POOL_CAPACITY)?;
+            recovery::recover(&ctrl_p, &data_p, &wal_p, page_size_usize, pool_capacity)?;
         }
 
-        let mut pool = BufferPool::open(&data_p, page_size_usize, POOL_CAPACITY)?;
+        let mut pool = BufferPool::open(&data_p, page_size_usize, pool_capacity)?;
         let wal_tail = control.wal_tail_lsn;
         let mut wal = Wal::open(&wal_p, wal_tail)?;
         let heap = Heap::new(page_size_usize);

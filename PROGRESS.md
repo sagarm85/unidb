@@ -1672,3 +1672,78 @@ is not on any measurable hot path). Peak memory unchanged (two `bool` fields).
 **Locked-decision changes:** none reversed; **D5 strengthened** (fsync-failure
 path hardens the WAL-before-page discipline; new steal-point debug assertion).
 No format change (`FORMAT_VERSION` unchanged — no on-disk layout touched).
+
+### P1.c — alloc_page remap fix + configurable buffer pool + real FSM   [shipped]   2026-07-08
+
+**PR:** #8 — https://github.com/sagarm85/unidb/pull/8 (Core lane, branch `acid-hardening`)
+**Summary:** Removes the growth blocker (roadmap Tier 3, "`alloc_page` re-maps
+the whole file per page"). Three changes: (1) the page file now grows in **4 MiB
+chunks**, re-creating the mmap only when a new page crosses the chunk boundary,
+not once per page (was O(inserts) full-file remaps — O(N²) total, fatal at 100s
+of GB); (2) the buffer-pool capacity is **configurable** (`UNIDB_BUFFER_POOL_
+PAGES` env / `Engine::open_with_pool_capacity`), default raised 256 → **4096**
+frames; (3) a **real free-space map** replaces the linear per-insert page scan,
+so picking a page that fits is integer comparisons, not a fetch (8 KiB copy) of
+every page.
+
+**What landed:**
+- `bufferpool.rs`: `mapped_pages` / `grow_chunk_pages` fields + `ensure_mapped`
+  (chunked grow, one remap per chunk); `alloc_page` and `restore_page_image`
+  route through it. `logical_page_count` recovers the true high-water mark on
+  open by skipping trailing all-zero slack pages (a written page always has a
+  non-zero header), so a reopen reuses slack instead of leaking a chunk.
+  `page_count()` accessor.
+- `lib.rs`: `DEFAULT_POOL_CAPACITY = 4096`, `configured_pool_capacity()` (env),
+  `Engine::open_with_pool_capacity`; `open` delegates.
+- `heap.rs`: `free_map: HashMap<PageId, usize>` FSM. `find_or_alloc_page` first
+  answers from the map (no fetch), probes only *unknown* pages (from the end,
+  append locality, caching each), then allocates. `note_free_space` keeps it
+  exact after every insert / update-new-version / page compaction — a hint that
+  never over-reports, so a chosen page always fits.
+
+**Benchmark** (`benches/scale.rs`, release; fsync-free to expose the O(pages)
+effects the end-to-end fsync floor would otherwise hide):
+
+_(A) `alloc_page` throughput — was O(N²) total pre-P1.c (whole-file remap per
+call), now flat:_
+
+| pages allocated | pages/sec |
+|---|---|
+| 10,000  | ~629,000   |
+| 50,000  | ~1,045,000 |
+| 100,000 | ~1,000,000 |
+
+_(B) heap insert throughput per 50k-row window (deferred WAL, large pool) — does
+**not** degrade as the heap grows (a linear-scan FSM would show the opposite):_
+
+| window (rows) | inserts/sec |
+|---|---|
+| 0–50k    | ~12,200 |
+| 50–100k  | ~16,800 |
+| 100–150k | ~17,800 |
+| 150–200k | ~26,000 |
+| 200–250k | ~84,900 |
+| 250–300k | ~71,300 |
+
+Point reads at ~300k rows: **~1,140,000 reads/sec** (unaffected by table size).
+
+Throughput is flat-to-rising as the table grows (the rise is OS-cache warmth,
+not FSM cost) — the P1.c win is the *absence of degradation*: no per-page
+whole-file remap, and no O(pages) fetch-every-page scan per insert. **Peak
+memory:** the FSM is one `usize` per heap page (~a few hundred KB at 300k rows /
+2k pages); the larger default pool is a config choice (32 MiB at 4096 × 8 KiB),
+overridable down via the env var. `BufferPoolFull`-at-scale is gone (already
+mitigated by M9's force-WAL-on-evict; the larger pool + chunked file make it a
+non-issue).
+
+**Known limitations (documented, not silent):** (1) the FSM is per-`Heap`-
+instance in-memory state; the SQL executor reconstructs a `Heap` via
+`from_pages` per statement, so a single-row autocommit SQL INSERT rebuilds the
+map lazily (bounded: it probes from the last page, usually one fetch) — the raw
+`Engine::insert` path (and bulk multi-row statements) keep a warm map. A durable
+on-disk FSM fork (Postgres `_fsm`) is a later item. (2) Trailing chunk slack is
+reclaimed on reopen but not shrunk mid-session (bounded to one chunk).
+
+**Locked-decision changes:** none. D6 (single file) / D8 (8 KiB pages)
+unchanged; no format change (chunk growth is purely a file-sizing strategy,
+invisible on disk).
