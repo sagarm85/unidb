@@ -81,6 +81,10 @@ name = "vacuum"
 harness = false
 
 [[bench]]
+name = "fpi"
+harness = false
+
+[[bench]]
 name = "server"
 harness = false
 required-features = ["server"]

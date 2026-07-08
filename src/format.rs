@@ -15,7 +15,18 @@ pub const MAGIC: u32 = 0x556E4442; // "UnDB"
 // visibility corruption). No migration path — no prior version of this
 // database has shipped externally (same precedent as v1->v2's tuple-header
 // change, M1.a).
-pub const FORMAT_VERSION: u16 = 3;
+//
+// v3 -> v4 (P1.a): a new WAL record kind, `WAL_FPI` (full-page image), was
+// added for torn-page protection (full_page_writes). An 8 KiB page write is
+// not atomic; a crash mid-write leaves a half-old/half-new page that CRC
+// detects but cannot repair. On the first modification of a page after each
+// checkpoint the buffer pool now logs the whole clean page image to the WAL;
+// recovery replays it as the clean base before the incremental redo records
+// on top, so a torn on-disk page is fully reconstructed. Old WALs never
+// contain the record, so a version bump (D9) keeps a pre-P1.a database from
+// being read by a build that would not know to look for it. No migration path
+// — no prior version of this database has shipped externally.
+pub const FORMAT_VERSION: u16 = 4;
 
 /// Default page size: 8 KiB (D8). Baked into the control file at DB init.
 pub const DEFAULT_PAGE_SIZE: u32 = 8192;
@@ -72,6 +83,18 @@ pub const WAL_TXN_ABORT: u8 = 10;
 //     (M10.d — intra-page compaction + DEAD→UNUSED promotion); redo restores
 //     the exact page bytes. Idempotent via the page LSN check in recovery.
 pub const WAL_VACUUM: u8 = 11;
+
+// WAL full-page image (P1.a — torn-page protection / full_page_writes).
+// Redo-only, no undo payload: the redo payload is the entire clean page image
+// (`page_size` bytes) captured on the first modification of that page after a
+// checkpoint, and `slot` is `u16::MAX` (a whole-page record carries no slot).
+// Recovery redo overwrites the on-disk page (which may be torn) with this
+// image as the clean base, then replays the interval's subsequent incremental
+// redo records (higher LSN) on top. Logged *before* the first incremental
+// change record for the page, within the same mini-txn, so it is redone only
+// when that mini-txn committed — which is exactly when the page could have
+// reached disk torn (D5 forbids flushing a page whose WAL is not yet durable).
+pub const WAL_FPI: u8 = 12;
 
 // ── little-endian helpers ────────────────────────────────────────────────────
 

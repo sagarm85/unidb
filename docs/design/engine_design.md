@@ -92,8 +92,9 @@ Two invariants shape everything above the storage layer:
   checksum and an LSN. No `serde` on the page/WAL hot path — page and WAL
   records are hand-rolled / `zerocopy`-style byte encodings for exact byte
   control (`serde_json` is used only for control-plane data; see §4.6).
-- `FORMAT_VERSION` is currently **3**: v1→v2 for M1's tuple-header
-  extension, v2→v3 for the `next_xid` control-file field (§4.7). No
+- `FORMAT_VERSION` is currently **4**: v1→v2 for M1's tuple-header
+  extension, v2→v3 for the `next_xid` control-file field (§4.7), v3→v4 for
+  the `WAL_FPI` full-page-image record (P1.a torn-page protection, §3.3). No
   migration paths — no earlier version ever shipped externally.
 - Pages use a **slotted-page** layout; tuples carry a 24-byte header with
   `xmin`/`xmax`/`prev_page`/`prev_slot` (reserved in M0 per D4, in active
@@ -133,7 +134,22 @@ starts here** — it is the single source of recovery truth.
 - User transactions (M1) add `WAL_TXN_BEGIN`/`COMMIT`/`ABORT` record types
   sharing the mini-txn wire format — the `mini_txn_id` u64 slot doubles as
   the `Xid`. Mini-txn ids and xids are two independent ID spaces on one
-  format.
+  format. Later additive record kinds on the same wire format: `WAL_VACUUM`
+  (M10, redo-only reclamation) and `WAL_FPI` (P1.a, below).
+- **Torn-page protection (P1.a, `full_page_writes`).** An 8 KiB page write is
+  not atomic; a crash mid-write leaves a half-old/half-new page that CRC
+  detects but cannot repair — the #1 silent data-loss hole. On the **first
+  modification of a page after each checkpoint**, the buffer pool logs the
+  entire clean page image to the WAL as a redo-only `WAL_FPI` record
+  (`BufferPool::maybe_log_fpi`, called from every `heap.rs` mutation before
+  its first incremental record). Recovery replays the image as the clean base
+  (`restore_page_image`, CRC-bypassing) and re-applies the interval's later
+  incremental redos on top; a checkpoint's `clear_fpi_tracking()` re-arms the
+  next interval. Correct with one image per page per interval because D5
+  forbids flushing a page whose WAL isn't durable, so any torn on-disk page
+  belongs to a committed mini-txn whose FPI is in the redo set. Cost: WAL
+  grows (one 8 KiB image per page per interval — bounded by checkpoint
+  frequency, hence auto-checkpoint P1.e); throughput unchanged (fsync-bound).
 
 ### 3.4 Buffer pool
 
@@ -184,16 +200,20 @@ idempotent, which is what makes crash-*during*-abort safe.
 recovered state equals the expected committed set. Points P1–P5 (M0:
 post-WAL/pre-flush, mid-checkpoint, post-mutation/pre-commit, during WAL
 truncation, post-commit-fsync), P6/P7 (M1: user-txn boundaries), P9 (M1:
-crash mid-undo of an aborting transaction), plus a property test running
-random `BEGIN`/`INSERT`/`COMMIT`/`ROLLBACK` sequences with random crash
-points — recovered state must be exactly the set of transactions that
-reached `WAL_TXN_COMMIT`. 11 crash tests as of M7. Deliberately *not* a
-deterministic simulator (no TigerBeetle/FoundationDB-grade sim).
+crash mid-undo of an aborting transaction), P10 (M10: crash mid-vacuum),
+P11 (P1.a: torn 8 KiB page write recovered from its `WAL_FPI` image + redo),
+plus a property test running random `BEGIN`/`INSERT`/`COMMIT`/`ROLLBACK`
+sequences with random crash points — recovered state must be exactly the set
+of transactions that reached `WAL_TXN_COMMIT`. **13 crash tests as of P1.a.**
+Deliberately *not* a deterministic simulator (no TigerBeetle/FoundationDB-grade
+sim).
 
-Later milestones added **zero** new crash points — a deliberate pattern:
-edges, events, and consumer offsets are all ordinary WAL-backed heap rows
-covered by the existing machinery, and every secondary index is derived,
-rebuildable, WAL-free state whose loss on crash is expected (§10).
+The harness is required to **grow** whenever a new durability mechanism lands:
+M1–M8 added none (edges, events, and consumer offsets are all ordinary
+WAL-backed heap rows covered by the existing machinery, and every secondary
+index is derived, rebuildable, WAL-free state whose loss on crash is expected,
+§10), but M10 added P10 for the new `WAL_VACUUM` path and Phase 1's P1.a added
+P11 for the new `WAL_FPI` torn-page path.
 
 ---
 
@@ -822,9 +842,9 @@ bound). `NEAR`/graph/queue reads remain writer-side for now (additive).
 | D4 | Tuple header reserves MVCC bytes up front | `page.rs` 24-byte header; used since M1 with format bump v1→v2 |
 | D5 | No dirty page flushes ahead of durable WAL | `bufferpool.rs::flush_page()` + `find_victim()`; debug assertions + crash harness |
 | D6 | Single-file storage (WAL separate) | unchanged; revisit was gated post-M4, not yet re-opened |
-| D7 | Crash-injection harness, simple by design | `tests/crash/main.rs` P1–P10 (P10 = mid-vacuum, M10) + property test |
+| D7 | Crash-injection harness, simple by design | `tests/crash/main.rs` P1–P11 (P10 = mid-vacuum M10, P11 = torn-page/`WAL_FPI` P1.a) + property test |
 | D8 | 8 KiB pages, init-time config, immutable after | `format.rs`; baked into control file |
-| D9 | Little-endian, CRC32+LSN per page, magic+version | `format.rs`/`page.rs`/`wal.rs`; `FORMAT_VERSION = 3` |
+| D9 | Little-endian, CRC32+LSN per page, magic+version | `format.rs`/`page.rs`/`wal.rs`; `FORMAT_VERSION = 4` (v3→v4 for `WAL_FPI`, P1.a) |
 | D10 | RC default, RR available, same snapshots | `txn.rs` snapshot lifetime |
 | D11 | `on_read`/`on_write` no-op seam for future SSI | `concurrency_hooks.rs`, threaded through all heap paths |
 | D12 | SI abort-on-conflict before RC re-evaluation | `lockmgr.rs` (no wait queue); RC path still pending |
@@ -845,4 +865,10 @@ GC** — `Engine::vacuum()` with a reader-aware horizon, crash-safe redo-only
 `WAL_VACUUM`, the secondary-index vacuum gate, and page compaction + slot reuse;
 adds crash point P10 and retires the "heap tuples never reclaimed" tech-debt
 item (see §12's correction note and `docs/backlog/m10_heap_vacuum_gc.md`).
-Update alongside the next milestone's closeout.*
+**Phase 1 — ACID & storage foundation (2026-07-08, branch `acid-hardening`):
+P1.a full-page-writes shipped** — `WAL_FPI` torn-page protection (§3.3),
+`FORMAT_VERSION` 3→4, new crash point P11 (13 crash tests total); P1.b–P1.e
+(fsync hardening, `alloc_page` remap + configurable pool + real FSM, isolation
+correctness incl. the still-pending D12 RC re-eval + SSI, auto-checkpoint) to
+follow. See `docs/backlog/phase1_acid_hardening.md` and `PROGRESS.md`'s Phase 1
+entry. Update alongside the next checkpoint's closeout.*

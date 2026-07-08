@@ -1523,3 +1523,97 @@ over REST; `VectorIndex` true incremental remove; index bloat reclamation;
 additive extension of the existing WAL wire format (like M1's `WAL_TXN_*`), not
 a change to a locked decision; `FORMAT_VERSION` is unchanged (no on-disk page or
 control-file layout change).
+
+---
+
+## Phase 1 — ACID & storage foundation (Core lane, `acid-hardening`)
+
+The feature-freeze gate (`docs/backlog/phase1_acid_hardening.md`): close the
+silent correctness holes before any scale/feature work. One PR per checkpoint.
+
+### P1.a — Full-page-writes (WAL_FPI, torn-page protection)   [shipped]   2026-07-08
+
+**PR:** #6 — https://github.com/sagarm85/unidb/pull/6 (Core lane, branch `acid-hardening`)
+**Summary:** Closes the #1 silent data-loss hole (roadmap Tier 0). An 8 KiB
+page write is not atomic; a crash mid-write leaves a half-old/half-new page
+that CRC detects but cannot repair. Now, on the **first modification of a page
+after each checkpoint**, the buffer pool logs the whole clean page image to the
+WAL as a new redo-only `WAL_FPI` record before the first incremental change
+record; recovery replays that image as the clean base and re-applies the
+interval's later incremental redo records on top, so a torn on-disk page is
+fully reconstructed. `FORMAT_VERSION` bumped **3 → 4** (new WAL record kind, D9).
+
+**What landed:**
+- `format.rs`: `WAL_FPI = 12`; `FORMAT_VERSION = 4`.
+- `wal.rs`: `Wal::log_fpi` (redo-only whole-page record, `slot = u16::MAX`).
+- `bufferpool.rs`: `fpi_logged: HashSet<PageId>` tracking; `maybe_log_fpi`
+  (logs one image per page per checkpoint interval, before the first change),
+  `mark_fpi_logged`, `clear_fpi_tracking`, and `restore_page_image` (recovery
+  overwrite that bypasses CRC on the possibly-torn on-disk page, extending the
+  file if needed). Tracking by `PageId` (not a per-frame flag) deliberately
+  survives eviction → exactly one FPI per page per interval, strictly less WAL
+  than a per-frame flag would emit, equally correct.
+- `heap.rs`: every mutation path (`insert`/`update` [both pages]/`delete`/
+  `undo_xmax_stamp`/`undo_insert`/`mark_dead`) logs its FPI right after
+  fetching the page and before the incremental record, chaining `prev_lsn`.
+  `compact_page` already writes a full page image, so it just marks the page
+  FPI-covered.
+- `recovery.rs`: `WAL_FPI` redo arm — unconditional, idempotent restore of the
+  clean base before the interval's incremental redos (higher LSN) replay.
+- `checkpoint.rs`: `clear_fpi_tracking()` after `flush_all` re-arms the next
+  interval (the checkpoint re-established a clean on-disk base for every page).
+
+**Why one FPI per page per interval is sufficient (and why incomplete txns are
+safe without one):** a page can only reach disk (torn) *after* its mini-txn
+commit record is durable — D5 forbids flushing a page whose WAL is not yet
+durable — so any torn on-disk page belongs to a committed mini-txn whose FPI is
+in the committed redo set. Incomplete mini-txns never reach disk torn, so their
+undo pass always reads a clean page. The single interval-opening image plus all
+of the page's subsequent WAL records reconstruct it regardless of torn bytes.
+
+**Crash harness (grew, per the gate):** new **P11** — `p11_torn_page_restored_
+from_full_page_image`. Commits a row, flushes + checkpoints (clean base on
+disk, FPI tracking reset), inserts a second row on the same page (logs
+`WAL_FPI` + the incremental insert), then **manufactures a genuine torn page**
+by clobbering the second half of the on-disk page (CRC now invalid, asserted as
+a precondition), and asserts recovery restores *both* rows. Full P-series (P1–
+P11) + property test green: `cargo test -p unidb --test crash` = 13 tests.
+
+**Benchmark** (`benches/fpi.rs`, release; insert-only, no manual checkpoint —
+close to the worst case for FPI overhead, since every page is written once so
+the fixed 8 KiB image amortizes over only the rows that fit in it):
+
+| rows | payload | WAL bytes | #FPI | FPI bytes | FPI % of WAL | ins/s |
+|------|---------|-----------|------|-----------|--------------|-------|
+| 2000 | 8 B     | 614,951   | 9    | 74,169    | **12.1 %**   | 162   |
+| 2000 | 64 B    | 844,383   | 23   | 189,543   | 22.5 %       | 160   |
+| 2000 | 256 B   | 1,639,395 | 72   | 593,352   | 36.2 %       | 154   |
+| 2000 | 1024 B  | 4,970,427 | 286  | 2,356,926 | 47.4 %       | 137   |
+
+- **WAL overhead:** one 8 KiB image per page per interval. It falls as more
+  rows share a page (small rows: 12 %) and rises as rows approach page size
+  (1 KiB rows: 47 %). This is the standard `full_page_writes` cost, and exactly
+  why it pairs with auto-checkpoint (P1.e), which bounds total FPI volume to one
+  image per page per interval rather than the once-ever seen here.
+- **Throughput: unchanged** vs. pre-FPI (~137–162 ins/s across payloads). The
+  embedded write path is fsync-bound (two fsyncs per autocommit row — the
+  mini-txn commit and the user-txn commit, the same M1 floor); an FPI adds WAL
+  *bytes* but no extra fsync, so wall-clock is untouched.
+- **Update-heavy note:** because the image is per-page-per-interval, a workload
+  that writes a page many times per checkpoint interval amortizes the single
+  image over far more records, so its FPI % is far below these write-once
+  figures.
+
+**Locked-decision changes:** none reversed; D1/D5 **strengthened** (FPI makes
+redo torn-page-safe). D9 `FORMAT_VERSION` 3 → 4 for the new record kind (no
+migration path — no version shipped externally).
+
+**Known limitation (documented, not silent):** P1.a protects the heap write
+path (where committed row data lives) and its recovery. A brand-new page that
+is allocated, flushed torn, and then never written again (heap alloc without a
+following insert, or the catalog's fresh-page blob persist in `catalog.rs`) is
+*not* FPI-covered — but such a page holds no independently-committed data and is
+not referenced by any committed heap, so a torn copy causes no committed-data
+loss. Closing the fresh-page/catalog case (torn-tolerant reconstruction) is
+tracked for a later Phase-1/Phase-3 pass; it is out of P1.a's declared file
+scope (`wal`/`bufferpool`/`recovery`/`checkpoint`).

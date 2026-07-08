@@ -16,6 +16,8 @@
 //   P7 – immediately after WAL_TXN_COMMIT fsync (M1), before page flush
 //   P9 – crash mid-undo of an already-aborting transaction (M1.b)
 //   P10 – crash mid-vacuum (M10): WAL_VACUUM durable, page not flushed
+//   P11 – torn 8 KiB page write (P1.a): reopen restores the page from its
+//         full-page image (WAL_FPI) + incremental redo
 
 use tempfile::tempdir;
 use unidb::{Engine, RowId};
@@ -385,6 +387,106 @@ fn p10_crash_mid_vacuum_redoes_cleanly_and_loses_no_committed_row() {
     assert!(
         heap.collect_reclaimable(100, &pool).unwrap().is_empty(),
         "P10: re-running vacuum after recovery must be a no-op (idempotent)"
+    );
+}
+
+// ── P11: torn-page recovery via full-page image (P1.a) ───────────────────────
+//
+// An 8 KiB page write is not atomic; a crash mid-write leaves a torn page (half
+// old, half new) that CRC detects but cannot repair — the #1 silent data-loss
+// hole. Full-page-writes (WAL_FPI) close it: the first modification of a page
+// after each checkpoint logs the whole clean page image to the WAL, and
+// recovery replays that image as the clean base before re-applying the
+// interval's later incremental redo records on top. This test manufactures a
+// genuine torn page on disk and asserts every committed row is restored.
+
+#[test]
+fn p11_torn_page_restored_from_full_page_image() {
+    use std::io::{Seek, SeekFrom, Write};
+    use unidb::bufferpool::BufferPool;
+    use unidb::checkpoint;
+    use unidb::control;
+    use unidb::format::{DEFAULT_PAGE_SIZE, INVALID_LSN};
+    use unidb::heap::Heap;
+    use unidb::mvcc::Snapshot;
+    use unidb::wal::Wal;
+
+    let dir = tempdir().unwrap();
+    let ctrl_p = dir.path().join("control");
+    let data_p = dir.path().join("data.db");
+    let wal_p = dir.path().join("db.wal");
+    let mut control = control::create(&ctrl_p, DEFAULT_PAGE_SIZE).unwrap();
+    let page_size = DEFAULT_PAGE_SIZE as usize;
+
+    let (r1, r2) = {
+        let mut pool = BufferPool::open(&data_p, page_size, 64).unwrap();
+        let mut wal = Wal::open(&wal_p, INVALID_LSN).unwrap();
+        let mut heap = Heap::new(page_size);
+
+        // R1 committed, its page flushed to disk, then a checkpoint: the page
+        // is now clean on disk and FPI tracking is reset, so the next
+        // modification opens a fresh interval and must log a full-page image.
+        let r1 = heap
+            .insert(b"r1_committed", 1, &mut pool, &mut wal)
+            .unwrap();
+        pool.flush_all(wal.durable_lsn).unwrap();
+        checkpoint::run(&mut pool, &mut wal, &ctrl_p, &mut control, 2).unwrap();
+
+        // R2 lands on the SAME page (small rows share a page): the insert logs
+        // WAL_FPI(page, the clean image still holding only R1) then the
+        // incremental INSERT for R2, all durably fsynced. The in-memory page now
+        // holds R1+R2 but is deliberately NOT flushed.
+        let r2 = heap
+            .insert(b"r2_committed", 1, &mut pool, &mut wal)
+            .unwrap();
+        assert_eq!(r1.page_id, r2.page_id, "both rows must share a page");
+        drop(pool);
+        drop(wal);
+        (r1, r2)
+    };
+
+    // Simulate a torn 8 KiB write: clobber the second half of the row page on
+    // disk so its CRC no longer validates (a half-old/half-new page).
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&data_p)
+            .unwrap();
+        let page_off = r1.page_id as u64 * DEFAULT_PAGE_SIZE as u64;
+        f.seek(SeekFrom::Start(page_off + DEFAULT_PAGE_SIZE as u64 / 2))
+            .unwrap();
+        f.write_all(&vec![0xFFu8; page_size / 2]).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    // Precondition: the on-disk page really is torn now.
+    {
+        let pool = BufferPool::open(&data_p, page_size, 64).unwrap();
+        assert!(
+            pool.read_page(r1.page_id).is_err(),
+            "P11: precondition — the on-disk page must be torn (CRC invalid)"
+        );
+    }
+
+    // Recovery rebuilds the page from WAL_FPI + the incremental INSERT redo.
+    let (_, stats) = unidb::recovery::recover(&ctrl_p, &data_p, &wal_p, page_size, 64).unwrap();
+    assert!(
+        stats.records_redone > 0,
+        "P11: the FPI + insert must be redone"
+    );
+
+    let pool = BufferPool::open(&data_p, page_size, 64).unwrap();
+    let heap = Heap::from_pages(page_size, vec![r1.page_id]);
+    let snap = Snapshot::new(100, 100, vec![]);
+    assert_eq!(
+        heap.get(r1, &snap, 100, &pool).unwrap(),
+        b"r1_committed",
+        "P11: the pre-checkpoint row must be restored from the FPI clean base"
+    );
+    assert_eq!(
+        heap.get(r2, &snap, 100, &pool).unwrap(),
+        b"r2_committed",
+        "P11: the post-checkpoint row must be restored by redo on top of the FPI"
     );
 }
 

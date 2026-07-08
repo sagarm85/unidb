@@ -14,7 +14,7 @@ use crate::{
     error::{DbError, Result},
     format::{
         u64_from_le, Xid, INVALID_LSN, WAL_ABORT, WAL_BEGIN, WAL_CHECKPOINT, WAL_COMMIT,
-        WAL_DELETE, WAL_INSERT, WAL_TXN_ABORT, WAL_TXN_BEGIN, WAL_TXN_COMMIT, WAL_UPDATE,
+        WAL_DELETE, WAL_FPI, WAL_INSERT, WAL_TXN_ABORT, WAL_TXN_BEGIN, WAL_TXN_COMMIT, WAL_UPDATE,
         WAL_VACUUM,
     },
     heap::decode_insert_redo,
@@ -227,6 +227,22 @@ pub fn recover(
 
 fn redo_record(r: &WalRecord, pool: &mut BufferPool, page_size: usize) -> Result<()> {
     match r.rec_type {
+        WAL_FPI => {
+            // P1.a torn-page protection. The redo payload is the entire clean
+            // page image captured before the first modification of this page in
+            // the checkpoint interval. Overwrite whatever is on disk (which may
+            // be torn — half-old/half-new from an interrupted 8 KiB write),
+            // establishing the clean base; the interval's subsequent
+            // incremental redo records for this page (higher LSN, appearing
+            // later in this pass) replay on top. Unconditional and idempotent:
+            // re-running recovery re-writes the same base and re-derives the
+            // same final page. The image bytes carry their own (pre-change) LSN,
+            // which is below every following record's LSN, so the LSN-gated
+            // incremental redos below all still apply.
+            // (`restore_page_image` writes straight to the mmap; it pins no
+            // frame, so there is nothing to unpin here.)
+            pool.restore_page_image(r.page_id, &r.redo)?;
+        }
         WAL_INSERT => {
             let mut page = fetch_or_create(pool, r.page_id, page_size)?;
             if r.slot == u16::MAX {
