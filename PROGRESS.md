@@ -1826,7 +1826,7 @@ was built for). No format change.
 
 ### P1.e — auto-checkpoint (time + WAL-size triggers)   [shipped]   2026-07-08
 
-**PR:** _(pending — Core lane, branch `acid-hardening`)_
+**PR:** #11 — https://github.com/sagarm85/unidb/pull/11 (Core lane, branch `acid-hardening`)
 **Summary:** Closes the last Phase-1 item and bounds WAL growth (roadmap Tier
 3). Checkpoint was manual-only, so the WAL — and the P1.a full-page-image volume
 it now carries — grew unbounded for the life of a session. The engine now runs
