@@ -1,3 +1,4 @@
+pub mod aggregate;
 pub mod datetime;
 pub mod executor;
 pub mod join;
@@ -6,3 +7,4 @@ pub mod parser;
 pub mod plan;
 pub mod query;
 pub mod query_exec;
+pub mod sort;

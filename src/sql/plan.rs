@@ -14,7 +14,7 @@ use crate::catalog::{Catalog, ColumnType, IndexKind};
 use crate::error::{DbError, Result};
 use crate::sql::executor;
 use crate::sql::logical::Literal;
-use crate::sql::query::{FromNode, JoinType, Projection, QExpr, QuerySpec};
+use crate::sql::query::{AggFunc, FromNode, JoinType, OrderKey, Projection, QExpr, QuerySpec};
 
 /// One output column of an operator: the relation qualifier it came from, its
 /// name, and its declared type (for EXPLAIN and future coercion).
@@ -108,6 +108,51 @@ pub enum PlanNode {
         items: Vec<ProjItem>,
         output: Vec<ColumnRef>,
     },
+    /// Hash aggregation (P4.b): group `input` by `group_exprs` and compute
+    /// `aggs` per group. Output schema is the group columns (`__g0`..) followed
+    /// by the aggregate columns (`__a0`..); the surrounding projection/having/
+    /// order expressions are rewritten to reference those synthetic names.
+    Aggregate {
+        input: Box<PlanNode>,
+        group_exprs: Vec<QExpr>,
+        aggs: Vec<AggCall>,
+        output: Vec<ColumnRef>,
+    },
+    /// `SELECT DISTINCT` (P4.b): dedupe whole output rows.
+    Distinct {
+        input: Box<PlanNode>,
+        output: Vec<ColumnRef>,
+    },
+    /// `ORDER BY` (P4.b): sort by output-column keys. Spills to an external
+    /// merge sort past a row budget — see [`crate::sql::sort`].
+    Sort {
+        input: Box<PlanNode>,
+        keys: Vec<SortKey>,
+        output: Vec<ColumnRef>,
+    },
+    /// `LIMIT` / `OFFSET` (P4.b).
+    Limit {
+        input: Box<PlanNode>,
+        limit: Option<usize>,
+        offset: usize,
+        output: Vec<ColumnRef>,
+    },
+}
+
+/// One aggregate to compute (P4.b): function, argument expression (`None` for
+/// `COUNT(*)`), and whether the argument is de-duplicated first.
+#[derive(Debug, Clone)]
+pub struct AggCall {
+    pub func: AggFunc,
+    pub arg: Option<QExpr>,
+    pub distinct: bool,
+}
+
+/// One `ORDER BY` key resolved to an output-column index + direction (P4.b).
+#[derive(Debug, Clone, Copy)]
+pub struct SortKey {
+    pub column: usize,
+    pub asc: bool,
 }
 
 impl PlanNode {
@@ -119,13 +164,20 @@ impl PlanNode {
             | PlanNode::MergeJoin { output, .. }
             | PlanNode::IndexNestedLoopJoin { output, .. }
             | PlanNode::Filter { output, .. }
-            | PlanNode::Projection { output, .. } => output,
+            | PlanNode::Projection { output, .. }
+            | PlanNode::Aggregate { output, .. }
+            | PlanNode::Distinct { output, .. }
+            | PlanNode::Sort { output, .. }
+            | PlanNode::Limit { output, .. } => output,
         }
     }
 }
 
 /// Build the physical plan for a [`QuerySpec`] against the catalog. Pure (no
 /// storage access): scans are placeholders the executor fills by reading heaps.
+///
+/// Pipeline (SQL logical order): FROM → WHERE → [Aggregate → HAVING] →
+/// Projection → DISTINCT → ORDER BY → LIMIT/OFFSET.
 pub fn plan_query(spec: &QuerySpec, catalog: &Catalog) -> Result<PlanNode> {
     let mut node = plan_from(&spec.from, catalog)?;
     if let Some(sel) = &spec.selection {
@@ -136,8 +188,40 @@ pub fn plan_query(spec: &QuerySpec, catalog: &Catalog) -> Result<PlanNode> {
             output,
         };
     }
-    let items = resolve_projection(&spec.projection, node.output())?;
-    let output = items
+
+    // Does this query aggregate? Either an explicit GROUP BY, or an aggregate
+    // anywhere in the SELECT list / HAVING / ORDER BY.
+    let proj_has_agg = spec.projection.iter().any(|p| match p {
+        Projection::Expr { expr, .. } => expr.has_aggregate(),
+        _ => false,
+    });
+    let having_has_agg = spec.having.as_ref().is_some_and(|h| h.has_aggregate());
+    let has_agg = !spec.group_by.is_empty() || proj_has_agg || having_has_agg;
+
+    let items = if has_agg {
+        node = plan_aggregate(node, spec)?;
+        let (group_exprs, aggs) = match &node {
+            PlanNode::Aggregate {
+                group_exprs, aggs, ..
+            } => (group_exprs.clone(), aggs.clone()),
+            _ => unreachable!("plan_aggregate returns an Aggregate node"),
+        };
+        let agg_schema = node.output().to_vec();
+        if let Some(having) = &spec.having {
+            let pred = rewrite_over_agg(having, &group_exprs, &aggs)?;
+            let output = agg_schema.clone();
+            node = PlanNode::Filter {
+                input: Box::new(node),
+                predicate: pred,
+                output,
+            };
+        }
+        resolve_projection_agg(&spec.projection, spec, &agg_schema)?
+    } else {
+        resolve_projection(&spec.projection, node.output())?
+    };
+
+    let proj_output: Vec<ColumnRef> = items
         .iter()
         .map(|it| ColumnRef {
             qualifier: String::new(),
@@ -145,11 +229,247 @@ pub fn plan_query(spec: &QuerySpec, catalog: &Catalog) -> Result<PlanNode> {
             ty: ColumnType::Text, // projected type is not tracked past here
         })
         .collect();
-    Ok(PlanNode::Projection {
+    node = PlanNode::Projection {
         input: Box::new(node),
         items,
+        output: proj_output.clone(),
+    };
+
+    if spec.distinct {
+        node = PlanNode::Distinct {
+            input: Box::new(node),
+            output: proj_output.clone(),
+        };
+    }
+
+    if !spec.order_by.is_empty() {
+        let keys = resolve_order_by(&spec.order_by, &proj_output)?;
+        node = PlanNode::Sort {
+            input: Box::new(node),
+            keys,
+            output: proj_output.clone(),
+        };
+    }
+
+    if spec.limit.is_some() || spec.offset > 0 {
+        node = PlanNode::Limit {
+            input: Box::new(node),
+            limit: spec.limit,
+            offset: spec.offset,
+            output: proj_output,
+        };
+    }
+
+    Ok(node)
+}
+
+/// Build the [`PlanNode::Aggregate`] for a grouped/aggregated query: collect the
+/// distinct aggregate calls appearing in projection/having/order, and produce a
+/// synthetic output schema (`__g*` group cols, `__a*` aggregate cols).
+fn plan_aggregate(input: PlanNode, spec: &QuerySpec) -> Result<PlanNode> {
+    let mut aggs: Vec<AggCall> = Vec::new();
+    for p in &spec.projection {
+        if let Projection::Expr { expr, .. } = p {
+            collect_aggs(expr, &mut aggs);
+        }
+    }
+    if let Some(h) = &spec.having {
+        collect_aggs(h, &mut aggs);
+    }
+    for k in &spec.order_by {
+        collect_aggs(&k.expr, &mut aggs);
+    }
+
+    let mut output = Vec::new();
+    for (i, _) in spec.group_by.iter().enumerate() {
+        output.push(ColumnRef {
+            qualifier: String::new(),
+            name: format!("__g{i}"),
+            ty: ColumnType::Text,
+        });
+    }
+    for (i, _) in aggs.iter().enumerate() {
+        output.push(ColumnRef {
+            qualifier: String::new(),
+            name: format!("__a{i}"),
+            ty: ColumnType::Text,
+        });
+    }
+    Ok(PlanNode::Aggregate {
+        input: Box::new(input),
+        group_exprs: spec.group_by.clone(),
+        aggs,
         output,
     })
+}
+
+/// Collect distinct aggregate calls (by structural equality) appearing in
+/// `expr`.
+fn collect_aggs(expr: &QExpr, out: &mut Vec<AggCall>) {
+    match expr {
+        QExpr::Aggregate {
+            func,
+            arg,
+            distinct,
+        } => {
+            let call = AggCall {
+                func: *func,
+                arg: arg.as_deref().cloned(),
+                distinct: *distinct,
+            };
+            if !out.iter().any(|c| agg_call_eq(c, &call)) {
+                out.push(call);
+            }
+        }
+        QExpr::Column { .. } | QExpr::Literal(_) => {}
+        QExpr::Compare { lhs, rhs, .. } | QExpr::And(lhs, rhs) | QExpr::Or(lhs, rhs) => {
+            collect_aggs(lhs, out);
+            collect_aggs(rhs, out);
+        }
+        QExpr::Not(e) | QExpr::IsNull { expr: e, .. } => collect_aggs(e, out),
+    }
+}
+
+fn agg_call_eq(a: &AggCall, b: &AggCall) -> bool {
+    a.func == b.func && a.distinct == b.distinct && a.arg == b.arg
+}
+
+/// Rewrite an expression over the aggregate's synthetic output: a subexpression
+/// equal to a group key becomes `__g{i}`; an aggregate call becomes `__a{j}`; a
+/// bare column that is neither is an error (it must appear in GROUP BY or an
+/// aggregate).
+fn rewrite_over_agg(expr: &QExpr, group_exprs: &[QExpr], aggs: &[AggCall]) -> Result<QExpr> {
+    // Group-key match first (so `GROUP BY a+b` style keys, once supported, win
+    // over descending into children).
+    if let Some(i) = group_exprs.iter().position(|g| g == expr) {
+        return Ok(QExpr::Column {
+            qualifier: None,
+            name: format!("__g{i}"),
+        });
+    }
+    match expr {
+        QExpr::Aggregate {
+            func,
+            arg,
+            distinct,
+        } => {
+            let call = AggCall {
+                func: *func,
+                arg: arg.as_deref().cloned(),
+                distinct: *distinct,
+            };
+            let j = aggs
+                .iter()
+                .position(|c| agg_call_eq(c, &call))
+                .expect("aggregate was collected in plan_aggregate");
+            Ok(QExpr::Column {
+                qualifier: None,
+                name: format!("__a{j}"),
+            })
+        }
+        QExpr::Column { name, .. } => Err(DbError::SqlPlan(format!(
+            "column '{name}' must appear in GROUP BY or be used in an aggregate"
+        ))),
+        QExpr::Literal(l) => Ok(QExpr::Literal(l.clone())),
+        QExpr::Compare { op, lhs, rhs } => Ok(QExpr::Compare {
+            op: *op,
+            lhs: Box::new(rewrite_over_agg(lhs, group_exprs, aggs)?),
+            rhs: Box::new(rewrite_over_agg(rhs, group_exprs, aggs)?),
+        }),
+        QExpr::And(lhs, rhs) => Ok(QExpr::And(
+            Box::new(rewrite_over_agg(lhs, group_exprs, aggs)?),
+            Box::new(rewrite_over_agg(rhs, group_exprs, aggs)?),
+        )),
+        QExpr::Or(lhs, rhs) => Ok(QExpr::Or(
+            Box::new(rewrite_over_agg(lhs, group_exprs, aggs)?),
+            Box::new(rewrite_over_agg(rhs, group_exprs, aggs)?),
+        )),
+        QExpr::Not(e) => Ok(QExpr::Not(Box::new(rewrite_over_agg(
+            e,
+            group_exprs,
+            aggs,
+        )?))),
+        QExpr::IsNull { expr, negated } => Ok(QExpr::IsNull {
+            expr: Box::new(rewrite_over_agg(expr, group_exprs, aggs)?),
+            negated: *negated,
+        }),
+    }
+}
+
+/// Resolve the SELECT list of an aggregated query: each item is rewritten to
+/// reference the aggregate's synthetic output columns.
+fn resolve_projection_agg(
+    projection: &[Projection],
+    spec: &QuerySpec,
+    agg_schema: &[ColumnRef],
+) -> Result<Vec<ProjItem>> {
+    // Re-derive the aggregate calls (same order as plan_aggregate) so rewriting
+    // maps to the right `__a{j}`.
+    let mut aggs: Vec<AggCall> = Vec::new();
+    for p in projection {
+        if let Projection::Expr { expr, .. } = p {
+            collect_aggs(expr, &mut aggs);
+        }
+    }
+    if let Some(h) = &spec.having {
+        collect_aggs(h, &mut aggs);
+    }
+    for k in &spec.order_by {
+        collect_aggs(&k.expr, &mut aggs);
+    }
+
+    let mut items = Vec::new();
+    for p in projection {
+        match p {
+            Projection::Wildcard | Projection::QualifiedWildcard(_) => {
+                return Err(DbError::SqlPlan(
+                    "SELECT * cannot be combined with aggregation".into(),
+                ))
+            }
+            Projection::Expr { expr, alias } => {
+                let name = alias.clone().unwrap_or_else(|| default_expr_name(expr));
+                let rewritten = rewrite_over_agg(expr, &spec.group_by, &aggs)?;
+                // Validate it now resolves against the synthetic schema.
+                validate_expr(&rewritten, agg_schema)?;
+                items.push(ProjItem {
+                    expr: rewritten,
+                    name,
+                });
+            }
+        }
+    }
+    Ok(items)
+}
+
+/// Resolve `ORDER BY` keys to output-column indices. v1 supports a bare output
+/// column name/alias or a 1-based position (`ORDER BY 1`).
+fn resolve_order_by(order_by: &[OrderKey], output: &[ColumnRef]) -> Result<Vec<SortKey>> {
+    let mut keys = Vec::new();
+    for k in order_by {
+        let column = match &k.expr {
+            QExpr::Literal(crate::sql::logical::Literal::Int(n)) => {
+                let idx = (*n as usize).checked_sub(1).filter(|i| *i < output.len());
+                idx.ok_or_else(|| {
+                    DbError::SqlPlan(format!("ORDER BY position {n} is out of range"))
+                })?
+            }
+            QExpr::Column { name, .. } => output
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(name))
+                .ok_or_else(|| {
+                    DbError::SqlPlan(format!(
+                        "ORDER BY '{name}' must be an output column name or position in v1"
+                    ))
+                })?,
+            _ => {
+                return Err(DbError::SqlUnsupported(
+                    "ORDER BY supports an output column name or 1-based position in v1".into(),
+                ))
+            }
+        };
+        keys.push(SortKey { column, asc: k.asc });
+    }
+    Ok(keys)
 }
 
 fn plan_from(node: &FromNode, catalog: &Catalog) -> Result<PlanNode> {
@@ -427,6 +747,11 @@ fn validate_expr(expr: &QExpr, schema: &[ColumnRef]) -> Result<()> {
             validate_expr(rhs, schema)
         }
         QExpr::Not(e) | QExpr::IsNull { expr: e, .. } => validate_expr(e, schema),
+        // Aggregates are rewritten to synthetic columns before validation; a
+        // raw aggregate here means one was used outside an aggregated query.
+        QExpr::Aggregate { .. } => Err(DbError::SqlPlan(
+            "aggregate functions are only allowed in an aggregated query".into(),
+        )),
     }
 }
 
@@ -475,6 +800,11 @@ pub fn eval_qexpr(expr: &QExpr, schema: &[ColumnRef], row: &[Literal]) -> Result
             let is_null = matches!(v, Literal::Null);
             Ok(Literal::Bool(is_null != *negated))
         }
+        // Aggregates are computed by the Aggregate operator and referenced via
+        // synthetic columns; one should never reach per-row evaluation.
+        QExpr::Aggregate { .. } => Err(DbError::SqlPlan(
+            "internal: aggregate reached row-level evaluation".into(),
+        )),
     }
 }
 
@@ -576,6 +906,12 @@ mod tests {
             },
             selection: None,
             projection: vec![Projection::Wildcard],
+            group_by: vec![],
+            having: None,
+            distinct: false,
+            order_by: vec![],
+            limit: None,
+            offset: 0,
         }
     }
 

@@ -136,6 +136,65 @@ fn run_node(node: &PlanNode, snapshot: &Snapshot, ctx: &mut ExecCtx) -> Result<B
             snapshot,
             ctx,
         ),
+
+        PlanNode::Aggregate {
+            input,
+            group_exprs,
+            aggs,
+            output,
+        } => {
+            let batch = run_node(input, snapshot, ctx)?;
+            crate::sql::aggregate::aggregate(batch, group_exprs, aggs, output)
+        }
+
+        PlanNode::Distinct { input, output } => {
+            let batch = run_node(input, snapshot, ctx)?;
+            let mut seen = std::collections::HashSet::new();
+            let mut rows = Vec::new();
+            for row in batch.rows {
+                let key = crate::sql::executor::encode_row(&row);
+                if seen.insert(key) {
+                    rows.push(row);
+                }
+            }
+            Ok(Batch {
+                schema: output.clone(),
+                rows,
+            })
+        }
+
+        PlanNode::Sort {
+            input,
+            keys,
+            output,
+        } => {
+            let batch = run_node(input, snapshot, ctx)?;
+            let rows =
+                crate::sql::sort::sort_rows(batch.rows, keys, crate::sql::sort::sort_mem_rows())?;
+            Ok(Batch {
+                schema: output.clone(),
+                rows,
+            })
+        }
+
+        PlanNode::Limit {
+            input,
+            limit,
+            offset,
+            output,
+        } => {
+            let batch = run_node(input, snapshot, ctx)?;
+            let rows: Vec<_> = batch
+                .rows
+                .into_iter()
+                .skip(*offset)
+                .take(limit.unwrap_or(usize::MAX))
+                .collect();
+            Ok(Batch {
+                schema: output.clone(),
+                rows,
+            })
+        }
     }
 }
 

@@ -35,6 +35,45 @@ pub struct QuerySpec {
     pub selection: Option<QExpr>,
     /// SELECT list.
     pub projection: Vec<Projection>,
+    /// `GROUP BY` keys (P4.b). Empty means no explicit grouping — but an
+    /// aggregate in the projection with no GROUP BY still produces one group.
+    #[serde(default)]
+    pub group_by: Vec<QExpr>,
+    /// `HAVING` predicate over grouped rows (P4.b).
+    #[serde(default)]
+    pub having: Option<QExpr>,
+    /// `SELECT DISTINCT` (P4.b).
+    #[serde(default)]
+    pub distinct: bool,
+    /// `ORDER BY` keys (P4.b).
+    #[serde(default)]
+    pub order_by: Vec<OrderKey>,
+    /// `LIMIT n` (P4.b).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// `OFFSET n` (P4.b).
+    #[serde(default)]
+    pub offset: usize,
+}
+
+/// One `ORDER BY` term (P4.b). `expr` is resolved against the query's *output*
+/// columns in v1 — a bare output column name/alias or a 1-based position — so
+/// `ORDER BY revenue DESC` and `ORDER BY 1` work; arbitrary expressions over
+/// non-projected columns are a documented follow-up.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OrderKey {
+    pub expr: QExpr,
+    pub asc: bool,
+}
+
+/// Aggregate function (P4.b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AggFunc {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
 }
 
 /// One SELECT-list item.
@@ -108,6 +147,15 @@ pub enum QExpr {
         expr: Box<QExpr>,
         negated: bool,
     },
+    /// An aggregate call (P4.b): `COUNT(*)` (`arg == None`), `SUM(x)`,
+    /// `AVG(x)`, `MIN(x)`, `MAX(x)`, and their `DISTINCT` forms. The planner
+    /// hoists these into a [`crate::sql::plan::PlanNode::Aggregate`] and
+    /// rewrites the surrounding expression to reference the aggregate's output.
+    Aggregate {
+        func: AggFunc,
+        arg: Option<Box<QExpr>>,
+        distinct: bool,
+    },
 }
 
 impl QExpr {
@@ -165,6 +213,24 @@ impl QExpr {
                 rhs.bind_params(params)
             }
             QExpr::Not(e) | QExpr::IsNull { expr: e, .. } => e.bind_params(params),
+            QExpr::Aggregate { arg, .. } => {
+                if let Some(a) = arg {
+                    a.bind_params(params)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Whether this expression contains an aggregate call anywhere within it.
+    pub fn has_aggregate(&self) -> bool {
+        match self {
+            QExpr::Aggregate { .. } => true,
+            QExpr::Column { .. } | QExpr::Literal(_) => false,
+            QExpr::Compare { lhs, rhs, .. } | QExpr::And(lhs, rhs) | QExpr::Or(lhs, rhs) => {
+                lhs.has_aggregate() || rhs.has_aggregate()
+            }
+            QExpr::Not(e) | QExpr::IsNull { expr: e, .. } => e.has_aggregate(),
         }
     }
 }
