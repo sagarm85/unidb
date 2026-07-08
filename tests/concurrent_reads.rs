@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use unidb::sql::executor::ExecResult;
+use unidb::sql::logical::Literal;
 use unidb::{Engine, RowId};
 
 /// Committed (RowId -> exact value) pairs, published only after commit.
@@ -64,4 +66,72 @@ fn concurrent_readers_see_consistent_committed_rows_while_writer_inserts() {
     for (rid, expected) in final_rows {
         assert_eq!(engine.read_handle().get(rid).unwrap(), expected);
     }
+}
+
+/// 6b concurrent SQL SELECT: readers run `SELECT` on the `ReadHandle`, off the
+/// writer thread, while the writer inserts. Each returned row's `name` must
+/// pair with its `id` (`name-<id>`) — a torn page or an inconsistent catalog/
+/// snapshot view would break that pairing.
+#[test]
+fn concurrent_sql_select_sees_consistent_rows_while_writer_inserts() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    {
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, name TEXT)")
+            .unwrap();
+        engine.commit(xid).unwrap();
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut readers = Vec::new();
+    for _ in 0..4 {
+        let read = engine.read_handle();
+        let stop = Arc::clone(&stop);
+        readers.push(thread::spawn(move || {
+            let mut queries = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let mut results = read.execute_sql("SELECT id, name FROM t").unwrap();
+                let ExecResult::Rows(rows) = results.remove(0) else {
+                    panic!("expected Rows");
+                };
+                for row in rows {
+                    let (Literal::Int(id), Literal::Text(name)) = (&row[0], &row[1]) else {
+                        panic!("unexpected row shape: {row:?}");
+                    };
+                    assert_eq!(name, &format!("name-{id}"), "torn/inconsistent SELECT row");
+                }
+                queries += 1;
+            }
+            queries
+        }));
+    }
+
+    for i in 0..500i64 {
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(
+                xid,
+                &format!("INSERT INTO t (id, name) VALUES ({i}, 'name-{i}')"),
+            )
+            .unwrap();
+        engine.commit(xid).unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+    let total: u64 = readers.into_iter().map(|h| h.join().unwrap()).sum();
+    assert!(total > 0, "readers should have run concurrently");
+
+    let mut results = engine
+        .read_handle()
+        .execute_sql("SELECT id, name FROM t")
+        .unwrap();
+    let ExecResult::Rows(rows) = results.remove(0) else {
+        panic!("expected Rows");
+    };
+    assert_eq!(
+        rows.len(),
+        500,
+        "all committed rows visible after the writer"
+    );
 }

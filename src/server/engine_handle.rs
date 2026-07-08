@@ -200,6 +200,18 @@ impl EngineHandle {
             .map_err(|_| DbError::EngineUnavailable)?
     }
 
+    /// Execute read-only SQL (`SELECT`) on the concurrent read path (6b),
+    /// off the writer thread. The caller is responsible for having classified
+    /// the SQL as concurrent-readable (see
+    /// [`crate::read_handle::is_concurrent_read_sql`]); a non-read statement
+    /// returns [`DbError::SqlPlan`].
+    pub async fn execute_sql_read(&self, sql: String) -> Result<Vec<ExecResult>> {
+        let read = self.read.clone();
+        tokio::task::spawn_blocking(move || read.execute_sql(&sql))
+            .await
+            .map_err(|_| DbError::EngineUnavailable)?
+    }
+
     /// Build one `EngineRequest` via `build`, send it (a plain, immediate,
     /// non-blocking call — the channel is unbounded), then await its
     /// reply. A closed channel (writer thread gone, most likely panicked)

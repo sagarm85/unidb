@@ -24,7 +24,7 @@ use serde_json::Value as JsonValue;
 
 use crate::{
     btree_index::OrderedValue,
-    bufferpool::BufferPool,
+    bufferpool::{BufferPool, PageReader},
     catalog::{Catalog, CatalogCtx, ColumnDef, ColumnType, IndexKind, TableDef},
     control::ControlData,
     error::{DbError, Result},
@@ -32,6 +32,7 @@ use crate::{
     heap::{Heap, RowId},
     index_worker::{IndexHandle, IndexMsg, IndexStatus, IndexedColumn, SecondaryIndex},
     lockmgr::LockManager,
+    mvcc::Snapshot,
     queue::{self, EVENTS_TABLE},
     txn::{TransactionManager, UndoAction},
     wal::Wal,
@@ -400,11 +401,49 @@ fn exec_select(
     Ok(ExecResult::Rows(out))
 }
 
+/// Read-only, `PageReader`-generic SELECT for the concurrent read path (6b).
+/// Reuses the same decode/predicate/project helpers as the writer-side
+/// `exec_select`, but sources pages from any [`PageReader`] and its snapshot
+/// from shared state — no `ExecCtx`, no writer thread. The NEAR / B-Tree index
+/// fast paths are intentionally *not* taken here: a plain full scan is always
+/// correct, and NEAR (which a full scan cannot answer — it needs the HNSW
+/// index) stays on the writer path via [`plan_is_concurrent_read`].
+pub(crate) fn exec_select_readonly<P: PageReader>(
+    table: &str,
+    projection: &[String],
+    predicate: &Option<Expr>,
+    catalog: &Catalog,
+    snapshot: &Snapshot,
+    self_xid: Xid,
+    reader: &P,
+) -> Result<ExecResult> {
+    let table_def = catalog.lookup(table)?.clone();
+    let heap = Heap::from_pages(reader.page_size(), table_def.pages.clone());
+    let mut out = Vec::new();
+    for (_, bytes) in heap.scan(snapshot, self_xid, reader)? {
+        let row = decode_row(&bytes, &table_def.columns)?;
+        if predicate_matches(predicate, &table_def.columns, &row)? {
+            out.push(project_row(projection, &table_def.columns, &row)?);
+        }
+    }
+    Ok(ExecResult::Rows(out))
+}
+
+/// Whether `plan` may run on the concurrent read path (6b): a plain `SELECT`
+/// with no NEAR term. Everything else (writes, DDL, NEAR) routes to the
+/// single writer thread, unchanged.
+pub(crate) fn plan_is_concurrent_read(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Select { predicate, .. } => predicate.as_ref().and_then(find_near).is_none(),
+        _ => false,
+    }
+}
+
 /// Find a top-level (or top-level-AND'd) `Expr::Near` in a predicate.
 /// Recurses only through `And`, matching the AND-only `WHERE` grammar — an
 /// exhaustive search given there's no `OR`/nesting construct that could
 /// hide a `Near` from this walk.
-fn find_near(expr: &Expr) -> Option<(&str, &[f32], usize)> {
+pub(crate) fn find_near(expr: &Expr) -> Option<(&str, &[f32], usize)> {
     match expr {
         Expr::Near { column, query, k } => Some((column.as_str(), query.as_slice(), *k)),
         Expr::And(lhs, rhs) => find_near(lhs).or_else(|| find_near(rhs)),
@@ -770,7 +809,7 @@ fn coerce_value(table_name: &str, col: &ColumnDef, val: Literal) -> Result<Liter
     }
 }
 
-fn project_row(
+pub(crate) fn project_row(
     projection: &[String],
     columns: &[ColumnDef],
     row: &[Literal],
