@@ -280,7 +280,7 @@ src/
   lockmgr.rs       — lock manager keyed by (record_kind, record_id), SI abort-on-conflict
   concurrency_hooks.rs — on_read/on_write seam (no-op today, SSI landing point later)
   catalog.rs       — table/column/index definitions, RLS policies, serde_json-persisted
-  sql/             — parser.rs, logical.rs (plan + RLS rewrite), executor.rs
+  sql/             — parser.rs, logical.rs (plan + RLS rewrite), executor.rs, datetime.rs (timestamp parse/format)
   vector.rs        — HNSW wrapper (instant-distance) for VECTOR(n) columns
   fulltext.rs      — inverted index for full-text search
   btree_index.rs   — BTreeMap-backed secondary index for equality/range WHERE predicates
@@ -315,7 +315,11 @@ unidb-attach/
 
 ## Milestone roadmap
 
-All milestones below are **shipped, tested, and benchmarked**. Metrics tables are in `PROGRESS.md`; current implementation state and known tech debt are in `MEMORY.md`.
+Milestones M0–M11 are **shipped, tested, and benchmarked**; the project is now
+executing the phased scaling plan in `docs/backlog/roadmap.md` (Phase 1 ACID
+hardening + Phase 2 real data model run in parallel). Metrics tables are in
+`PROGRESS.md`; current implementation state and known tech debt are in
+`MEMORY.md`.
 
 | Milestone | Status | Summary |
 |-----------|--------|---------|
@@ -330,6 +334,7 @@ All milestones below are **shipped, tested, and benchmarked**. Metrics tables ar
 | M8 — Attach client | done | `unidb-attach`: Rust blocking-`reqwest` client over the REST API, no new protocol |
 | M10 — Heap vacuum / GC | done | `Engine::vacuum()`: reader-aware horizon, crash-safe `WAL_VACUUM`, secondary-index vacuum gate, page compaction + slot reuse |
 | M11 — SQL constraints | done | `PRIMARY KEY` / `FOREIGN KEY` / `UNIQUE` / `NOT NULL` / `CHECK` / `DEFAULT` on `CREATE TABLE`, enforced on INSERT/UPDATE |
+| P2.a — DECIMAL + TIMESTAMP | done | Exact fixed-point `DECIMAL(p, s)` (money) and UTC `TIMESTAMP` (time) column types, with round-trip + ordering + constraint support (Phase 2, SQL lane) |
 
 ---
 

@@ -1,6 +1,6 @@
 # Phase 2 — Real data model (SQL lane, `sql-types`)
 
-## Status as of 2026-07-08: NOT STARTED.
+## Status as of 2026-07-08: IN PROGRESS — P2.a (DECIMAL + TIMESTAMP) shipped (see `PROGRESS.md`); P2.b next.
 
 Runs **in parallel with Phase 1** (disjoint files). Companion to
 [`roadmap.md`](roadmap.md) §4/§5 — this is the detailed spec the `sql-types`

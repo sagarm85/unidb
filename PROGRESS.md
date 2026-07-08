@@ -1672,3 +1672,71 @@ is not on any measurable hot path). Peak memory unchanged (two `bool` fields).
 **Locked-decision changes:** none reversed; **D5 strengthened** (fsync-failure
 path hardens the WAL-before-page discipline; new steal-point debug assertion).
 No format change (`FORMAT_VERSION` unchanged — no on-disk layout touched).
+## P2.a — DECIMAL + TIMESTAMP   [SQL lane — Phase 2 — landing]   2026-07-08
+
+**Branch:** `sql-types` (SQL lane worktree; hand-merged to `main` at land-time
+per the roadmap's parallel-lane operating rules). First checkpoint of Phase 2
+(`docs/backlog/phase2_data_model.md`), runs disjoint from the Core lane's
+Phase 1.
+**Summary:** Added the first two "real app" scalar types — exact fixed-point
+`DECIMAL(p, s)` (money) and `TIMESTAMP` (time). Both round-trip exactly through
+the hand-rolled row encoding, order and compare correctly (including
+cross-scale decimals and string↔timestamp predicates), and work under every
+M11 constraint (`DEFAULT` / `CHECK` / `PRIMARY KEY` / `UNIQUE`). No storage-core
+file touched; `lib.rs` untouched.
+
+**What changed:**
+- `catalog.rs`: `ColumnType::Decimal(u8, u8)` (precision, scale) and
+  `ColumnType::Timestamp`. `ColumnType` is `Copy`, so no `ColumnDef` derive
+  changes.
+- `sql/logical.rs`: `Literal::Decimal(i128, u8)` (unscaled value + scale) and
+  `Literal::Timestamp(i64)` (micros since Unix epoch, UTC); plus
+  `format_decimal` for the JSON/DTO boundary.
+- `sql/datetime.rs` (new): dependency-light timestamp parse/format via
+  Hinnant's `days_from_civil`/`civil_from_days` — no `chrono`. Accepts
+  `YYYY-MM-DD[ |T]HH:MM:SS[.ffffff][Z]` and date-only; UTC only in v1.
+- `sql/parser.rs`: `DECIMAL`/`NUMERIC`/`DEC`/`BIGDECIMAL`/`BIGNUMERIC` and all
+  `TIMESTAMP` zone variants map to the new `ColumnType`s (precision 1..=38,
+  `0 <= scale <= precision` validated at `CREATE TABLE`); numeric literals with
+  a fractional point parse to exact `Literal::Decimal` (scale as written, never
+  via `f64`), including unary-minus.
+- `sql/executor.rs`: encode/decode tags **6** (Decimal: 16-byte LE `i128` +
+  1-byte scale) and **7** (Timestamp: 8-byte LE `i64`); `coerce_value` rescales
+  a decimal literal to the column's exact `(p, s)` (widening multiplies,
+  narrowing allowed only when dropped digits are zero, precision cap enforced)
+  and parses a timestamp string; `compare` orders decimals across scales via
+  cross-multiplication (overflow → error, never a wrong answer) and parses a
+  string operand against a `TIMESTAMP` on demand.
+- `queue/payload.rs`, `server/dto.rs`: additive match arms rendering
+  `Decimal`/`Timestamp` as **strings** so no precision is lost crossing into
+  JSON (both are exhaustive `Literal` matches that had to keep compiling).
+
+**Tests:** 8 `sql::datetime` unit tests (epoch/pre-epoch/leap-day/fractional/
+ordering/garbage), executor round-trip + constraint tests (exact decimal
+round-trip, excess-fractional-digit + precision-overflow rejection, decimal
+range/equality predicates across scales, DEFAULT/CHECK/UNIQUE on decimals,
+timestamp round-trip + ordering + PK uniqueness across `' '`/`'T'` spellings,
+invalid-timestamp rejection, decimal+timestamp survive-reopen), parser tests
+(DECIMAL/NUMERIC/bare-DECIMAL, TIMESTAMP, bad precision/scale, decimal literal
+scale, negative decimal), and `format_decimal` rendering. `cargo test -p unidb`
+260 → 285 unit tests, all green; `--workspace` and `--features server` green;
+crash harness 12/12 (storage untouched).
+
+**Benchmark note (§6):** new scalar types are a functional capability, not a
+throughput workload — no new benchmark table. Row size grows by fixed-width
+fields only (17 bytes/decimal, 9 bytes/timestamp) with no hot-path algorithm
+change; existing INSERT/SELECT benchmarks are unaffected.
+
+**Known limitations / tech debt (new in P2.a):** `NUMERIC` precision capped at
+`i128` (~38 digits; arbitrary-precision out of scope); timestamps are UTC-only
+(`TIMESTAMPTZ` normalizes to UTC, original zone not tracked); no `DATE`/`TIME`
+yet (P2.b); no BTree index on `DECIMAL`/`TIMESTAMP` yet (`OrderedValue` doesn't
+cover them — they're skipped, not errored). All tracked in the Phase 2 spec.
+
+**Locked-decision changes (if any):** none. Row-encoding tags 6/7 are purely
+additive and forward-compatible (D4) — old rows never carry them and still
+decode; an older binary meeting a tag-6/7 row fails safe with a decode error,
+never a silent misread. **`FORMAT_VERSION` deliberately NOT bumped**: the tag
+set only grows, no old file becomes unreadable, and a bump here would needlessly
+reject pre-P2.a databases and collide with the parallel Core lane's Phase 1
+version work. (Reserved the bump for a genuinely incompatible change.)

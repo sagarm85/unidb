@@ -88,6 +88,17 @@
   plan); the older per-milestone backlog docs were retired. A CSR-preferring
   traversal fix (staleness/generation marker design) remains documented tech
   debt below — deliberately not attempted as part of the M7 bug fix.
+- **Immediate next task: Phase 2 P2.b (FLOAT/UUID/BYTEA/DATE/TIME).** The
+  ACID-first phased scaling plan (`docs/backlog/roadmap.md`) is now the forward
+  plan; M0–M11 all shipped. The SQL lane (branch `sql-types`,
+  `docs/backlog/phase2_data_model.md`) launched Phase 2 — **P2.a (DECIMAL +
+  TIMESTAMP) landed 2026-07-08** (dated subsection below), and P2.b is next on
+  the same machinery, then P2.c (ALTER/DROP/TRUNCATE + transactional DDL), P2.d
+  (sequences/SERIAL), P2.e (prepared statements + bind params). The Core lane
+  (branch `acid-hardening`) runs Phase 1 in parallel on disjoint files. A
+  CSR-preferring traversal fix (staleness/generation marker design) is
+  documented as known tech debt below but was deliberately not attempted as
+  part of the M7 bug fix — that's new design work, not a regression fix.
 - **In-flight performance work (branch `m9-group-commit`, 2026-07-08, not
   yet merged):** group commit + read-only fsync skip. The diagnosis (see
   `docs/performance/fssdb/`) was that the ~3–4 ms floor on every durable op
@@ -239,6 +250,46 @@ table in `PROGRESS.md`'s M10 entry. Key points a future reader needs:
   speedup, deliberately not done here. Leak-closed proof: under 200-key ×
   30-round update churn, periodic vacuum keeps the heap file at 73,728 B vs
   606,208 B un-vacuumed (**8.2× smaller**).
+
+### P2.a — DECIMAL + TIMESTAMP (SQL lane, branch `sql-types`, 2026-07-08)
+
+First checkpoint of **Phase 2** (`docs/backlog/phase2_data_model.md`), the
+SQL-lane worktree that runs disjoint from the Core lane's Phase 1
+(`acid-hardening`). Adds the first two "real app" scalar types — exact
+fixed-point money and time — on top of the existing catalog/encoding/parser
+machinery. Full entry + rationale in `PROGRESS.md`'s P2.a section. Points a
+future reader needs:
+
+- **Representations.** `ColumnType::Decimal(u8, u8)` = `(precision, scale)`;
+  `ColumnType::Timestamp`. `Literal::Decimal(i128, u8)` = `(unscaled_value,
+  scale)` — the value is `unscaled_value / 10^scale`, exact, never through
+  `f64`. `Literal::Timestamp(i64)` = micros since the Unix epoch, UTC. Row
+  encoding tags **6** (16-byte LE `i128` + 1-byte scale) and **7** (8-byte LE
+  `i64`) — purely additive, **no `FORMAT_VERSION` bump** (tags only grow, old
+  rows still decode per D4, a bump would needlessly reject pre-P2.a DBs and
+  collide with the Core lane's Phase 1 version work).
+- **The parser can't know a column is temporal** (it has no catalog), so a
+  timestamp arrives as a `Literal::Text` string and is converted to
+  `Timestamp` in `coerce_value`; `compare` parses a Text operand against a
+  `Timestamp` on demand (`WHERE ts > '2024-01-01'`). Numeric literals with a
+  fractional point parse to `Literal::Decimal` with the scale exactly as
+  written (`9.90` → `(990, 2)`), rescaled to the column's declared scale at
+  coercion. Narrowing scale is allowed only when dropped digits are zero
+  (exact, never rounding); widening multiplies; precision cap enforced.
+- **`sql/datetime.rs` is new, dependency-light** (Hinnant civil-date math, no
+  `chrono`). UTC only in v1 (`TIMESTAMPTZ` normalizes to UTC, original zone
+  not tracked). No `DATE`/`TIME` yet — those are P2.b and will reuse it.
+- **Cross-lane compile obligation:** `queue/payload.rs::row_to_json` and
+  `server/dto.rs::literal_to_json` are exhaustive `Literal` matches outside the
+  SQL lane; both got additive arms rendering the new types as **strings** (so
+  JSON's `f64` never truncates a decimal). Necessary to keep the default and
+  `--features server` builds compiling; not a semantic change to those files.
+- **M11 constraint compatibility verified end-to-end:** `DEFAULT` / `CHECK` /
+  `PRIMARY KEY` / `UNIQUE` all work on both types (UNIQUE relies on
+  `Literal` `PartialEq` over the coerced-to-column-scale values, so
+  `2024-01-01 00:00:00` and `2024-01-01T00:00:00` collide as they should).
+  No BTree index on decimal/timestamp yet (`OrderedValue` doesn't cover them;
+  they're skipped in `build_indexed_columns`, not errored).
 
 ### Design note: xid reuse after checkpoint — a real M1-era bug, found and fixed during M5
 

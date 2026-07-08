@@ -6,8 +6,8 @@
 // is the actual point of this milestone, not parser plumbing.
 
 use sqlparser::ast::{
-    self, Array as SqlArray, BinaryOperator, DataType, Expr as SqlExpr, FromTable, IndexType,
-    SelectItem, SetExpr, Statement, TableFactor, TableObject, Value,
+    self, Array as SqlArray, BinaryOperator, DataType, ExactNumberInfo, Expr as SqlExpr, FromTable,
+    IndexType, SelectItem, SetExpr, Statement, TableFactor, TableObject, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser as SqlParser;
@@ -164,6 +164,15 @@ fn convert_data_type(dt: &DataType) -> Result<ColumnType> {
         }
         DataType::Bool | DataType::Boolean => Ok(ColumnType::Bool),
         DataType::JSON => Ok(ColumnType::Json),
+        // Exact fixed-point (P2.a). `DECIMAL`/`NUMERIC`/`DEC` are synonyms.
+        DataType::Decimal(info)
+        | DataType::Numeric(info)
+        | DataType::Dec(info)
+        | DataType::BigDecimal(info)
+        | DataType::BigNumeric(info) => convert_decimal_type(info),
+        // Timestamp (P2.a): all zone variants store UTC micros in v1; the
+        // precision hint is ignored (we always keep microsecond resolution).
+        DataType::Timestamp(_, _) | DataType::TimestampNtz(_) => Ok(ColumnType::Timestamp),
         // `VECTOR(n)` has no built-in sqlparser type; it falls through to
         // `DataType::Custom(name, modifiers)` (confirmed against sqlparser
         // 0.62.0's own AST — see the M2 plan's checkpoint M2.a notes).
@@ -186,6 +195,35 @@ fn convert_data_type(dt: &DataType) -> Result<ColumnType> {
             "unsupported column type: {other}"
         ))),
     }
+}
+
+/// Maximum DECIMAL precision — bounded by the `i128` backing store (`i128`
+/// holds 39 decimal digits, but 38 is the largest that fits *every* value at
+/// that width, matching SQL Server / common `DECIMAL(38, s)` practice).
+pub(crate) const MAX_DECIMAL_PRECISION: u8 = 38;
+
+/// Map sqlparser's `ExactNumberInfo` to `ColumnType::Decimal(precision,
+/// scale)`. A bare `DECIMAL` defaults to `(38, 0)` (integer-valued exact
+/// numeric); `DECIMAL(p)` defaults scale to 0. Validates `1 <= p <= 38` and
+/// `0 <= s <= p`, so a bad type is rejected at `CREATE TABLE` rather than at
+/// first insert.
+fn convert_decimal_type(info: &ExactNumberInfo) -> Result<ColumnType> {
+    let (precision, scale) = match info {
+        ExactNumberInfo::None => (MAX_DECIMAL_PRECISION as u64, 0i64),
+        ExactNumberInfo::Precision(p) => (*p, 0),
+        ExactNumberInfo::PrecisionAndScale(p, s) => (*p, *s),
+    };
+    if precision == 0 || precision > MAX_DECIMAL_PRECISION as u64 {
+        return Err(DbError::SqlUnsupported(format!(
+            "DECIMAL precision must be between 1 and {MAX_DECIMAL_PRECISION}, got {precision}"
+        )));
+    }
+    if scale < 0 || scale as u64 > precision {
+        return Err(DbError::SqlUnsupported(format!(
+            "DECIMAL scale must be between 0 and the precision ({precision}), got {scale}"
+        )));
+    }
+    Ok(ColumnType::Decimal(precision as u8, scale as u8))
 }
 
 /// `CREATE INDEX ... ON table USING HNSW|FULLTEXT|BTREE (column)`. Note
@@ -287,6 +325,7 @@ fn convert_value_expr(e: &SqlExpr) -> Result<Literal> {
             expr,
         } => match convert_value_expr(expr)? {
             Literal::Int(n) => Ok(Literal::Int(-n)),
+            Literal::Decimal(v, scale) => Ok(Literal::Decimal(-v, scale)),
             other => Err(DbError::SqlUnsupported(format!(
                 "unary minus not supported on {other:?}"
             ))),
@@ -341,10 +380,7 @@ fn convert_array_literal(arr: &SqlArray) -> Result<Literal> {
 
 fn convert_value(v: &Value) -> Result<Literal> {
     match v {
-        Value::Number(s, _) => s
-            .parse::<i64>()
-            .map(Literal::Int)
-            .map_err(|_| DbError::SqlUnsupported(format!("unsupported numeric literal: {s}"))),
+        Value::Number(s, _) => convert_number_literal(s),
         Value::SingleQuotedString(s) => Ok(Literal::Text(s.clone())),
         Value::Boolean(b) => Ok(Literal::Bool(*b)),
         Value::Null => Ok(Literal::Null),
@@ -352,6 +388,52 @@ fn convert_value(v: &Value) -> Result<Literal> {
             "unsupported literal: {other:?}"
         ))),
     }
+}
+
+/// A bare numeric literal. Integers stay [`Literal::Int`]; anything with a
+/// fractional point becomes an exact [`Literal::Decimal`] carrying the scale
+/// exactly as written (`9.90` -> `(990, 2)`), which the executor then rescales
+/// to the target column. This keeps money literals exact end-to-end — never
+/// routed through `f64` — even before the column type is known. A `DECIMAL`
+/// value can still land in a `FLOAT` column: the executor's `coerce_value`
+/// converts it there (P2.b).
+fn convert_number_literal(s: &str) -> Result<Literal> {
+    if s.contains('.') {
+        parse_decimal_literal(s)
+    } else {
+        s.parse::<i64>()
+            .map(Literal::Int)
+            .map_err(|_| DbError::SqlUnsupported(format!("unsupported numeric literal: {s}")))
+    }
+}
+
+/// Parse a fixed-point decimal string (`"-12.340"`) into `(unscaled i128,
+/// scale)`. Exponent forms (`1e3`) are rejected — SQL numeric literals in this
+/// subset are plain fixed-point.
+fn parse_decimal_literal(s: &str) -> Result<Literal> {
+    let invalid = || DbError::SqlUnsupported(format!("unsupported numeric literal: {s}"));
+    let (neg, digits) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let (int_part, frac_part) = digits.split_once('.').ok_or_else(invalid)?;
+    // Reject a second dot or any non-digit (e.g. an exponent marker).
+    if !int_part.bytes().all(|b| b.is_ascii_digit())
+        || !frac_part.bytes().all(|b| b.is_ascii_digit())
+        || (int_part.is_empty() && frac_part.is_empty())
+    {
+        return Err(invalid());
+    }
+    let scale = u8::try_from(frac_part.len())
+        .map_err(|_| DbError::SqlUnsupported(format!("decimal scale too large: {s}")))?;
+    let combined = format!("{int_part}{frac_part}");
+    let magnitude = if combined.is_empty() {
+        0i128
+    } else {
+        combined.parse::<i128>().map_err(|_| invalid())?
+    };
+    let value = if neg { -magnitude } else { magnitude };
+    Ok(Literal::Decimal(value, scale))
 }
 
 fn convert_query(q: ast::Query) -> Result<LogicalPlan> {
@@ -626,6 +708,58 @@ mod tests {
                 assert_eq!(columns[1].ty, ColumnType::Json);
             }
             _ => panic!("expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn parses_decimal_and_numeric_columns() {
+        let plan = parse_one("CREATE TABLE t (a DECIMAL(10, 2), b NUMERIC(5), c DECIMAL)");
+        match plan {
+            LogicalPlan::CreateTable { columns, .. } => {
+                assert_eq!(columns[0].ty, ColumnType::Decimal(10, 2));
+                assert_eq!(columns[1].ty, ColumnType::Decimal(5, 0));
+                assert_eq!(columns[2].ty, ColumnType::Decimal(38, 0));
+            }
+            _ => panic!("expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn parses_timestamp_column() {
+        let plan = parse_one("CREATE TABLE t (created TIMESTAMP)");
+        match plan {
+            LogicalPlan::CreateTable { columns, .. } => {
+                assert_eq!(columns[0].ty, ColumnType::Timestamp);
+            }
+            _ => panic!("expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn rejects_decimal_with_bad_precision_or_scale() {
+        assert!(parse_sql("CREATE TABLE t (a DECIMAL(50, 2))").is_err());
+        assert!(parse_sql("CREATE TABLE t (a DECIMAL(4, 6))").is_err());
+    }
+
+    #[test]
+    fn parses_decimal_literal_with_scale_as_written() {
+        let plan = parse_one("INSERT INTO t (price) VALUES (9.90)");
+        match plan {
+            LogicalPlan::Insert { values, .. } => {
+                assert_eq!(values, vec![vec![Literal::Decimal(990, 2)]]);
+            }
+            _ => panic!("expected Insert"),
+        }
+    }
+
+    #[test]
+    fn parses_negative_decimal_literal() {
+        let plan = parse_one("INSERT INTO t (x) VALUES (-0.05)");
+        match plan {
+            LogicalPlan::Insert { values, .. } => {
+                assert_eq!(values, vec![vec![Literal::Decimal(-5, 2)]]);
+            }
+            _ => panic!("expected Insert"),
         }
     }
 

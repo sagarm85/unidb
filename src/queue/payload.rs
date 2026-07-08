@@ -29,6 +29,15 @@ pub fn row_to_json(row: &[Literal], columns: &[ColumnDef]) -> JsonValue {
                     })
                     .collect(),
             ),
+            // Exact types render as strings so no precision is lost crossing
+            // into JSON (P2.a): a `DECIMAL` as its canonical decimal text, a
+            // `TIMESTAMP` as canonical UTC `YYYY-MM-DD HH:MM:SS[.ffffff]`.
+            Literal::Decimal(value, scale) => {
+                JsonValue::String(crate::sql::logical::format_decimal(*value, *scale))
+            }
+            Literal::Timestamp(micros) => {
+                JsonValue::String(crate::sql::datetime::format_timestamp(*micros))
+            }
         };
         map.insert(col.name.clone(), json_val);
     }

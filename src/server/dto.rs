@@ -47,6 +47,12 @@ pub fn literal_to_json(lit: &Literal) -> Json {
                 })
                 .collect(),
         ),
+        // Exact types serialize as strings so JSON's f64 numbers never lose
+        // precision (P2.a) — decimal text and canonical UTC timestamp text.
+        Literal::Decimal(value, scale) => {
+            Json::String(crate::sql::logical::format_decimal(*value, *scale))
+        }
+        Literal::Timestamp(micros) => Json::String(crate::sql::datetime::format_timestamp(*micros)),
     }
 }
 

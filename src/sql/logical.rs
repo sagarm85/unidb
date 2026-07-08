@@ -25,7 +25,39 @@ pub enum Literal {
     /// the column's declared `n` at INSERT/UPDATE time by the executor, not
     /// here — this type just carries the parsed values.
     Vector(Vec<f32>),
+    /// Exact fixed-point decimal (P2.a): `(unscaled_value, scale)`, i.e. the
+    /// numeric value is `unscaled_value / 10^scale`. The parser produces this
+    /// with the scale exactly as written (`9.90` -> `(990, 2)`); the executor
+    /// rescales it to the target column's declared scale at coercion time.
+    /// `i128` bounds precision to ~38 significant digits.
+    Decimal(i128, u8),
+    /// Timestamp (P2.a): microseconds since the Unix epoch, UTC. The parser
+    /// leaves a timestamp *string* as [`Literal::Text`] (it has no schema to
+    /// know the column is temporal); the executor converts Text -> Timestamp
+    /// at coercion time and `compare` parses a Text operand on demand.
+    Timestamp(i64),
     Null,
+}
+
+/// Render an exact decimal `(unscaled_value, scale)` as canonical decimal
+/// text (`(990, 2)` -> `"9.90"`, `(-5, 0)` -> `"-5"`). Used by the JSON/DTO
+/// boundary layers so a `DECIMAL` crosses into JSON as a string, never an
+/// `f64`. Preserves trailing zeros implied by the scale (money stays `9.90`).
+pub fn format_decimal(value: i128, scale: u8) -> String {
+    if scale == 0 {
+        return value.to_string();
+    }
+    let neg = value < 0;
+    let digits = value.unsigned_abs().to_string();
+    let scale = scale as usize;
+    let (int_part, frac_part) = if digits.len() > scale {
+        let split = digits.len() - scale;
+        (digits[..split].to_string(), digits[split..].to_string())
+    } else {
+        ("0".to_string(), format!("{digits:0>scale$}"))
+    };
+    let sign = if neg { "-" } else { "" };
+    format!("{sign}{int_part}.{frac_part}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,6 +284,17 @@ mod tests {
             LogicalPlan::Select { predicate, .. } => assert_eq!(predicate, None),
             _ => panic!("expected Select"),
         }
+    }
+
+    #[test]
+    fn format_decimal_renders_canonical_text() {
+        assert_eq!(format_decimal(990, 2), "9.90");
+        assert_eq!(format_decimal(-5, 2), "-0.05");
+        assert_eq!(format_decimal(10000, 2), "100.00");
+        assert_eq!(format_decimal(-12345, 2), "-123.45");
+        assert_eq!(format_decimal(42, 0), "42");
+        assert_eq!(format_decimal(0, 2), "0.00");
+        assert_eq!(format_decimal(7, 3), "0.007");
     }
 
     #[test]

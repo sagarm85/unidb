@@ -316,7 +316,8 @@ sign-off, recorded in `PROGRESS.md`.
 ### 4.6 Catalog
 
 `catalog.rs`: `TableDef`/`ColumnDef`/`ColumnType`
-(`Int64`/`Text`/`Bool`/`Json`/`Vector(n)`), persisted as a single
+(`Int64`/`Text`/`Bool`/`Json`/`Vector(n)`/`Decimal(p,s)`/`Timestamp` — the last
+two added in Phase 2 P2.a), persisted as a single
 `serde_json` blob rewritten to a fresh page on every change, pointed at by
 `control.catalog_root`. Using `serde` here is deliberate — schema is
 infrequent control-plane data, not the hot path D9 protects.
@@ -361,11 +362,15 @@ filter through the same `predicate_matches`. RLS is Rust-API-only
 (`set_rls_policy`) — no SQL or REST surface, since `Expr` has no untrusted
 serialization design.
 
-Row encoding is hand-rolled tag+value per column (that *is* the hot path);
-tag 5 = `Vector`: `[dim: u32 LE][f32 LE × dim]` — dimension-prefixed so
-`decode_row` can cross-check against the schema. Vector dimension is
-validated in three independent places (DDL, INSERT/UPDATE coercion, every
-decode), each guarding a different failure mode.
+Row encoding is hand-rolled tag+value per column (that *is* the hot path):
+tags 0=`Null`, 1=`Int64`, 2=`Text`, 3=`Bool`, 4=`Json`, 5=`Vector`
+(`[dim: u32 LE][f32 LE × dim]`, dimension-prefixed so `decode_row` can
+cross-check the schema), 6=`Decimal` (`[i128 LE (16 B)][scale: u8]`, P2.a),
+7=`Timestamp` (`[i64 LE micros]`, P2.a). New tags are additive and
+forward-compatible (D4) — old rows never carry them, so no `FORMAT_VERSION`
+bump. Vector dimension (and, for decimals, the stored scale) is validated in
+three independent places (DDL, INSERT/UPDATE coercion, every decode), each
+guarding a different failure mode.
 
 ---
 
@@ -886,3 +891,8 @@ fsyncgate poison path (§3.3, crash point P12); 14 crash tests total. P1.c–P1.
 (`alloc_page` remap + configurable pool + real FSM, isolation correctness incl.
 the still-pending D12 RC re-eval + SSI, auto-checkpoint) to follow. See `docs/backlog/phase1_acid_hardening.md` and `PROGRESS.md`'s Phase 1
 entry. Update alongside the next checkpoint's closeout.*
+**Phase 2 P2.a (2026-07-08, SQL lane, branch `sql-types`): DECIMAL + TIMESTAMP**
+— `ColumnType::Decimal(p,s)`/`Timestamp`, row-encoding tags 6/7 (§4.6), exact
+fixed-point + UTC-micros representations, working under M11 constraints; see
+`docs/backlog/phase2_data_model.md` and `PROGRESS.md`'s P2.a entry.
+Update alongside the next milestone's closeout.*

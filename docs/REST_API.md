@@ -123,7 +123,10 @@ Other `ExecResult` shapes:
 ```
 `rows` is an array of arrays (one array per row, positional column order).
 A `JSON` column re-parses into a real nested JSON value on the wire — never
-a JSON-encoded string (see `dto.rs`'s module doc for why).
+a JSON-encoded string (see `dto.rs`'s module doc for why). A `DECIMAL` column
+serializes as a **decimal string** (e.g. `"9.90"`) and a `TIMESTAMP` as a UTC
+string (`"2024-01-01 12:00:00"`) so no precision is lost through JSON's `f64`
+numbers.
 
 **Response on failure** — e.g. a later statement references a nonexistent
 table, rolling back the whole request:

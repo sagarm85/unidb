@@ -52,6 +52,18 @@ pub enum ColumnType {
     /// `> 0` at `CREATE TABLE` time; every inserted vector must match it
     /// exactly (checked in `sql/executor.rs::coerce_and_validate_row`).
     Vector(u32),
+    /// Exact fixed-point decimal (P2.a): `Decimal(precision, scale)`. Stored
+    /// as an `i128` scaled by `10^scale` — exact arithmetic, no float error.
+    /// `precision` is the maximum number of significant decimal digits and
+    /// `scale` the number of fractional digits (`scale <= precision`, both
+    /// validated at `CREATE TABLE` time). The `i128` backing bounds the usable
+    /// precision to ~38 digits; larger `NUMERIC` is out of scope (see the
+    /// Phase 2 spec's "known limitations").
+    Decimal(u8, u8),
+    /// Timestamp (P2.a): microseconds since the Unix epoch, UTC, stored as an
+    /// `i64` (8 bytes LE). `TIMESTAMPTZ` normalizes to UTC on input; v1 only
+    /// stores UTC and does not track the original zone.
+    Timestamp,
 }
 
 /// Which secondary index (if any) a column has. `None` by default — indexing

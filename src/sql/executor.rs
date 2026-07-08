@@ -38,6 +38,7 @@ use crate::{
     wal::Wal,
 };
 
+use super::datetime;
 use super::logical::{CmpOp, Expr, Literal, LogicalPlan};
 
 /// Everything the executor needs, bundled to avoid a long parameter list.
@@ -840,11 +841,95 @@ fn coerce_value(table_name: &str, col: &ColumnDef, val: Literal) -> Result<Liter
             }
             Ok(Literal::Vector(v))
         }
+        // Exact decimal (P2.a): rescale the literal to the column's declared
+        // scale and precision. A plain integer literal is treated as a
+        // scale-0 decimal so `INSERT ... VALUES (100)` fills a money column.
+        (ColumnType::Decimal(p, s), Literal::Decimal(value, from_scale)) => {
+            rescale_decimal(table_name, col, value, from_scale, *p, *s)
+        }
+        (ColumnType::Decimal(p, s), Literal::Int(n)) => {
+            rescale_decimal(table_name, col, n as i128, 0, *p, *s)
+        }
+        (ColumnType::Timestamp, Literal::Timestamp(t)) => Ok(Literal::Timestamp(t)),
+        // A timestamp arrives from SQL as a string literal — the parser has no
+        // schema to know it is temporal, so it is coerced here.
+        (ColumnType::Timestamp, Literal::Text(s)) => {
+            Ok(Literal::Timestamp(datetime::parse_timestamp(&s)?))
+        }
         (expected, got) => Err(DbError::SqlPlan(format!(
             "table '{table_name}' column '{}': expected {expected:?}, got {got:?}",
             col.name
         ))),
     }
+}
+
+/// `10^n` as an `i128`, or `None` on overflow (n up to 38 fits; beyond does
+/// not). Small, exact, and dependency-free — the DECIMAL scaling primitive.
+fn pow10(n: u8) -> Option<i128> {
+    let mut acc: i128 = 1;
+    for _ in 0..n {
+        acc = acc.checked_mul(10)?;
+    }
+    Some(acc)
+}
+
+/// Number of significant decimal digits in `|value|` (0 has 1 digit here,
+/// which is fine: a scale-`s` zero always fits any `precision >= s`).
+fn digit_count(value: i128) -> u32 {
+    let mut v = value.unsigned_abs();
+    if v == 0 {
+        return 1;
+    }
+    let mut n = 0;
+    while v > 0 {
+        v /= 10;
+        n += 1;
+    }
+    n
+}
+
+/// Rescale a decimal literal `(value, from_scale)` to the column's declared
+/// `(precision, scale)`, exactly — never rounding. Widening the scale
+/// multiplies; narrowing is allowed only when the dropped digits are all zero
+/// (`9.90` -> scale 1 = `9.9`, but `9.99` -> scale 1 is rejected). Enforces
+/// the precision cap after rescaling so an out-of-range value fails the write
+/// rather than being silently stored.
+fn rescale_decimal(
+    table_name: &str,
+    col: &ColumnDef,
+    value: i128,
+    from_scale: u8,
+    precision: u8,
+    scale: u8,
+) -> Result<Literal> {
+    let overflow = || {
+        DbError::SqlPlan(format!(
+            "table '{table_name}' column '{}': decimal value out of range",
+            col.name
+        ))
+    };
+    let scaled = if from_scale == scale {
+        value
+    } else if from_scale < scale {
+        let factor = pow10(scale - from_scale).ok_or_else(overflow)?;
+        value.checked_mul(factor).ok_or_else(overflow)?
+    } else {
+        let factor = pow10(from_scale - scale).ok_or_else(overflow)?;
+        if value % factor != 0 {
+            return Err(DbError::SqlPlan(format!(
+                "table '{table_name}' column '{}': value has more fractional digits than the column's scale {scale} allows",
+                col.name
+            )));
+        }
+        value / factor
+    };
+    if digit_count(scaled) > precision as u32 {
+        return Err(DbError::SqlPlan(format!(
+            "table '{table_name}' column '{}': value exceeds DECIMAL({precision}, {scale}) precision",
+            col.name
+        )));
+    }
+    Ok(Literal::Decimal(scaled, scale))
 }
 
 // ── constraint enforcement (M11) ─────────────────────────────────────────────
@@ -1178,10 +1263,53 @@ fn compare(op: CmpOp, l: &Literal, r: &Literal) -> Result<bool> {
                 "ordering comparisons are not supported on booleans".into(),
             )),
         },
+        // Exact decimal ordering (P2.a). Integers compare as scale-0 decimals,
+        // so `WHERE price > 10` works against a `DECIMAL` column.
+        (Literal::Decimal(a, sa), Literal::Decimal(b, sb)) => {
+            Ok(apply_cmp(op, decimal_cmp(*a, *sa, *b, *sb)?))
+        }
+        (Literal::Decimal(a, sa), Literal::Int(b)) => {
+            Ok(apply_cmp(op, decimal_cmp(*a, *sa, *b as i128, 0)?))
+        }
+        (Literal::Int(a), Literal::Decimal(b, sb)) => {
+            Ok(apply_cmp(op, decimal_cmp(*a as i128, 0, *b, *sb)?))
+        }
+        // Timestamp ordering (P2.a). A string operand (`ts > '2024-01-01'`) is
+        // parsed on demand so predicates read naturally in SQL.
+        (Literal::Timestamp(a), Literal::Timestamp(b)) => Ok(apply_cmp(op, a.cmp(b))),
+        (Literal::Timestamp(a), Literal::Text(b)) => {
+            Ok(apply_cmp(op, a.cmp(&datetime::parse_timestamp(b)?)))
+        }
+        (Literal::Text(a), Literal::Timestamp(b)) => {
+            Ok(apply_cmp(op, datetime::parse_timestamp(a)?.cmp(b)))
+        }
         (a, b) => Err(DbError::SqlUnsupported(format!(
             "cannot compare {a:?} with {b:?}"
         ))),
     }
+}
+
+/// Compare two exact decimals of possibly different scales by aligning both to
+/// the larger scale via cross-multiplication. Returns an error rather than a
+/// wrong answer if either side overflows `i128` at the common scale.
+fn decimal_cmp(a: i128, sa: u8, b: i128, sb: u8) -> Result<std::cmp::Ordering> {
+    let overflow = || DbError::SqlUnsupported("decimal comparison overflowed i128".into());
+    let (la, lb) = if sa == sb {
+        (a, b)
+    } else if sa < sb {
+        (
+            a.checked_mul(pow10(sb - sa).ok_or_else(overflow)?)
+                .ok_or_else(overflow)?,
+            b,
+        )
+    } else {
+        (
+            a,
+            b.checked_mul(pow10(sa - sb).ok_or_else(overflow)?)
+                .ok_or_else(overflow)?,
+        )
+    };
+    Ok(la.cmp(&lb))
 }
 
 fn apply_cmp(op: CmpOp, ord: std::cmp::Ordering) -> bool {
@@ -1200,7 +1328,16 @@ fn apply_cmp(op: CmpOp, ord: std::cmp::Ordering) -> bool {
 // ── row encoding: [tag:1][value...] per column, in table-column order ──────
 // Tags: 0=Null, 1=Int64 (8 bytes LE), 2=Text (4-byte LE len + UTF8),
 // 3=Bool (1 byte), 4=Json (4-byte LE len + UTF8 text), 5=Vector
-// (4-byte LE dimension + dimension * 4-byte LE f32).
+// (4-byte LE dimension + dimension * 4-byte LE f32), 6=Decimal (16-byte LE
+// i128 unscaled value + 1-byte scale), 7=Timestamp (8-byte LE i64 micros).
+//
+// New tags are purely additive (D4, forward-compatible): a row written before
+// P2.a never carries tag 6/7, so old rows still decode unchanged, and there is
+// no `FORMAT_VERSION` bump — the tag set only *grows*. An older binary reading
+// a tag-6/7 row fails safe with a "unknown tag" `DbError`, never a silent
+// misread. (The `FORMAT_VERSION` gate is reserved for changes that make old
+// files genuinely unreadable; a bump here would needlessly reject pre-P2.a
+// databases and collide with the parallel Core lane's own version work.)
 
 pub fn encode_row(values: &[Literal]) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -1231,6 +1368,15 @@ pub fn encode_row(values: &[Literal]) -> Vec<u8> {
                 for f in v {
                     buf.extend_from_slice(&f.to_le_bytes());
                 }
+            }
+            Literal::Decimal(value, scale) => {
+                buf.push(6);
+                buf.extend_from_slice(&value.to_le_bytes());
+                buf.push(*scale);
+            }
+            Literal::Timestamp(micros) => {
+                buf.push(7);
+                buf.extend_from_slice(&micros.to_le_bytes());
             }
         }
     }
@@ -1320,6 +1466,40 @@ pub fn decode_row(bytes: &[u8], columns: &[ColumnDef]) -> Result<Vec<Literal>> {
                     pos = f_end;
                 }
                 Literal::Vector(values)
+            }
+            6 => {
+                let val_end = pos + 16;
+                let raw: [u8; 16] = bytes
+                    .get(pos..val_end)
+                    .ok_or_else(|| DbError::SqlPlan("row decode error: truncated decimal".into()))?
+                    .try_into()
+                    .unwrap();
+                pos = val_end;
+                let scale = *bytes.get(pos).ok_or_else(|| {
+                    DbError::SqlPlan("row decode error: truncated decimal scale".into())
+                })?;
+                pos += 1;
+                if let ColumnType::Decimal(_, col_scale) = col.ty {
+                    if scale != col_scale {
+                        return Err(DbError::SqlPlan(format!(
+                            "row decode error: column '{}' declares scale {col_scale}, but stored data has scale {scale}",
+                            col.name
+                        )));
+                    }
+                }
+                Literal::Decimal(i128::from_le_bytes(raw), scale)
+            }
+            7 => {
+                let end = pos + 8;
+                let raw: [u8; 8] = bytes
+                    .get(pos..end)
+                    .ok_or_else(|| {
+                        DbError::SqlPlan("row decode error: truncated timestamp".into())
+                    })?
+                    .try_into()
+                    .unwrap();
+                pos = end;
+                Literal::Timestamp(i64::from_le_bytes(raw))
             }
             other => {
                 return Err(DbError::SqlPlan(format!(
@@ -1687,6 +1867,276 @@ mod tests {
         };
         let err = coerce_and_validate_row(&table, vec![Literal::Vector(vec![0.1, 0.2, 0.3])]);
         assert!(matches!(err, Err(DbError::SqlPlan(_))));
+    }
+
+    // ── P2.a: DECIMAL + TIMESTAMP ────────────────────────────────────────────
+
+    fn col(name: &str, ty: ColumnType) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            index: None,
+            constraints: Default::default(),
+            ty,
+        }
+    }
+
+    #[test]
+    fn row_encode_decode_decimal_and_timestamp_round_trip() {
+        let columns = vec![
+            col("price", ColumnType::Decimal(10, 2)),
+            col("created", ColumnType::Timestamp),
+        ];
+        let values = vec![
+            Literal::Decimal(-12345, 2),
+            Literal::Timestamp(1_700_000_000_000_000),
+        ];
+        let encoded = encode_row(&values);
+        let decoded = decode_row(&encoded, &columns).unwrap();
+        assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn row_decode_rejects_decimal_scale_mismatch() {
+        let columns = vec![col("price", ColumnType::Decimal(10, 2))];
+        // Stored scale 3 but column declares scale 2.
+        let encoded = encode_row(&[Literal::Decimal(1234, 3)]);
+        let err = decode_row(&encoded, &columns);
+        assert!(matches!(err, Err(DbError::SqlPlan(_))));
+    }
+
+    #[test]
+    fn decimal_column_round_trips_exactly() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, price DECIMAL(10, 2))")
+            .unwrap();
+        // Literal 9.5 widens to scale 2 => 9.50; integer 100 => 100.00.
+        h.exec_as(xid, "INSERT INTO t (id, price) VALUES (1, 9.5)")
+            .unwrap();
+        h.exec_as(xid, "INSERT INTO t (id, price) VALUES (2, 100)")
+            .unwrap();
+        h.commit(xid);
+
+        let xid2 = h.begin();
+        let rows = match h.exec_as(xid2, "SELECT price FROM t WHERE id = 1").unwrap() {
+            ExecResult::Rows(r) => r,
+            other => panic!("expected Rows, got {other:?}"),
+        };
+        assert_eq!(rows, vec![vec![Literal::Decimal(950, 2)]]);
+        let rows2 = match h.exec_as(xid2, "SELECT price FROM t WHERE id = 2").unwrap() {
+            ExecResult::Rows(r) => r,
+            other => panic!("expected Rows, got {other:?}"),
+        };
+        assert_eq!(rows2, vec![vec![Literal::Decimal(10000, 2)]]);
+    }
+
+    #[test]
+    fn decimal_rejects_excess_fractional_digits() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (price DECIMAL(10, 2))")
+            .unwrap();
+        // 9.999 has scale 3; column allows scale 2 and the extra digit is
+        // nonzero -> exact rescale impossible, reject rather than round.
+        let err = h.exec_as(xid, "INSERT INTO t (price) VALUES (9.999)");
+        assert!(matches!(err, Err(DbError::SqlPlan(_))));
+        // 9.990 narrows exactly to 9.99 -> accepted.
+        h.exec_as(xid, "INSERT INTO t (price) VALUES (9.990)")
+            .unwrap();
+    }
+
+    #[test]
+    fn decimal_rejects_precision_overflow() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (price DECIMAL(4, 2))")
+            .unwrap();
+        // 999.99 needs 5 significant digits; DECIMAL(4,2) caps at 4.
+        let err = h.exec_as(xid, "INSERT INTO t (price) VALUES (999.99)");
+        assert!(matches!(err, Err(DbError::SqlPlan(_))));
+    }
+
+    #[test]
+    fn decimal_range_and_equality_predicates() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, price DECIMAL(10, 2))")
+            .unwrap();
+        for (id, p) in [(1, "5.00"), (2, "9.99"), (3, "10.00"), (4, "10.50")] {
+            h.exec_as(
+                xid,
+                &format!("INSERT INTO t (id, price) VALUES ({id}, {p})"),
+            )
+            .unwrap();
+        }
+        h.commit(xid);
+
+        let xid2 = h.begin();
+        // Range predicate against a decimal literal of a *different* scale.
+        let rows = match h
+            .exec_as(xid2, "SELECT id FROM t WHERE price > 9.9")
+            .unwrap()
+        {
+            ExecResult::Rows(r) => r,
+            other => panic!("expected Rows, got {other:?}"),
+        };
+        assert_eq!(rows.len(), 3); // 9.99, 10.00, 10.50
+                                   // Equality against an integer literal (scale 0 vs stored scale 2).
+        let eq = match h
+            .exec_as(xid2, "SELECT id FROM t WHERE price = 10")
+            .unwrap()
+        {
+            ExecResult::Rows(r) => r,
+            other => panic!("expected Rows, got {other:?}"),
+        };
+        assert_eq!(eq, vec![vec![Literal::Int(3)]]);
+    }
+
+    #[test]
+    fn decimal_default_check_and_unique_constraints() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(
+            xid,
+            "CREATE TABLE t (id INT, price DECIMAL(10, 2) DEFAULT 1.00 CHECK (price > 0) UNIQUE)",
+        )
+        .unwrap();
+        // DEFAULT fills 1.00 when omitted.
+        h.exec_as(xid, "INSERT INTO t (id) VALUES (1)").unwrap();
+        // CHECK rejects a non-positive price.
+        let bad = h.exec_as(xid, "INSERT INTO t (id, price) VALUES (2, -3.00)");
+        assert!(matches!(bad, Err(DbError::CheckViolation { .. })));
+        // UNIQUE rejects a duplicate decimal (1.00 already present via default).
+        let dup = h.exec_as(xid, "INSERT INTO t (id, price) VALUES (3, 1.00)");
+        assert!(matches!(dup, Err(DbError::UniqueViolation { .. })));
+        // A distinct decimal is accepted.
+        h.exec_as(xid, "INSERT INTO t (id, price) VALUES (4, 2.50)")
+            .unwrap();
+    }
+
+    #[test]
+    fn timestamp_column_round_trips_and_orders() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, created TIMESTAMP)")
+            .unwrap();
+        h.exec_as(
+            xid,
+            "INSERT INTO t (id, created) VALUES (1, '2023-12-31 23:59:59')",
+        )
+        .unwrap();
+        h.exec_as(
+            xid,
+            "INSERT INTO t (id, created) VALUES (2, '2024-06-01 12:00:00')",
+        )
+        .unwrap();
+        h.commit(xid);
+
+        let xid2 = h.begin();
+        let created = crate::sql::datetime::parse_timestamp("2023-12-31 23:59:59").unwrap();
+        let rows = match h
+            .exec_as(xid2, "SELECT created FROM t WHERE id = 1")
+            .unwrap()
+        {
+            ExecResult::Rows(r) => r,
+            other => panic!("expected Rows, got {other:?}"),
+        };
+        assert_eq!(rows, vec![vec![Literal::Timestamp(created)]]);
+
+        // Range predicate with a string literal on the right-hand side.
+        let after = match h
+            .exec_as(
+                xid2,
+                "SELECT id FROM t WHERE created > '2024-01-01 00:00:00'",
+            )
+            .unwrap()
+        {
+            ExecResult::Rows(r) => r,
+            other => panic!("expected Rows, got {other:?}"),
+        };
+        assert_eq!(after, vec![vec![Literal::Int(2)]]);
+    }
+
+    #[test]
+    fn timestamp_as_primary_key_enforces_uniqueness() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (created TIMESTAMP PRIMARY KEY)")
+            .unwrap();
+        h.exec_as(
+            xid,
+            "INSERT INTO t (created) VALUES ('2024-01-01 00:00:00')",
+        )
+        .unwrap();
+        // Same instant expressed with a 'T' separator — must still collide.
+        let dup = h.exec_as(
+            xid,
+            "INSERT INTO t (created) VALUES ('2024-01-01T00:00:00')",
+        );
+        assert!(matches!(dup, Err(DbError::UniqueViolation { .. })));
+    }
+
+    #[test]
+    fn invalid_timestamp_literal_is_rejected() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (created TIMESTAMP)")
+            .unwrap();
+        let err = h.exec_as(
+            xid,
+            "INSERT INTO t (created) VALUES ('2024-13-40 99:99:99')",
+        );
+        assert!(matches!(err, Err(DbError::SqlPlan(_))));
+    }
+
+    #[test]
+    fn decimal_and_timestamp_survive_reopen() {
+        let dir = tempdir().unwrap();
+        {
+            let mut h = Harness::new(dir.path());
+            let xid = h.begin();
+            h.exec_as(
+                xid,
+                "CREATE TABLE t (price DECIMAL(10, 2), created TIMESTAMP)",
+            )
+            .unwrap();
+            h.exec_as(
+                xid,
+                "INSERT INTO t (price, created) VALUES (19.95, '2024-03-14 09:26:53')",
+            )
+            .unwrap();
+            h.commit(xid);
+            h.pool.flush_all(h.wal.durable_lsn).unwrap();
+        }
+
+        let mut pool =
+            BufferPool::open(&dir.path().join("data.db"), DEFAULT_PAGE_SIZE as usize, 64).unwrap();
+        let control = crate::control::read(&dir.path().join("control")).unwrap();
+        let catalog = Catalog::load(&control, &mut pool).unwrap();
+        let table_def = catalog.lookup("t").unwrap();
+        assert_eq!(table_def.columns[0].ty, ColumnType::Decimal(10, 2));
+        assert_eq!(table_def.columns[1].ty, ColumnType::Timestamp);
+        let heap = Heap::from_pages(DEFAULT_PAGE_SIZE as usize, table_def.pages.clone());
+        let snap = crate::mvcc::Snapshot::new(1000, 1000, vec![]);
+        let rows = heap.scan(&snap, 1000, &pool).unwrap();
+        let decoded = decode_row(&rows[0].1, &table_def.columns).unwrap();
+        assert_eq!(
+            decoded,
+            vec![
+                Literal::Decimal(1995, 2),
+                Literal::Timestamp(
+                    crate::sql::datetime::parse_timestamp("2024-03-14 09:26:53").unwrap()
+                ),
+            ]
+        );
     }
 
     // ── M2.c: CREATE INDEX ───────────────────────────────────────────────────
