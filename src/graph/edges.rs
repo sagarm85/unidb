@@ -70,6 +70,7 @@ pub fn edges_table_def() -> TableDef {
         pages: Vec::new(),
         rls_policy: None,
         events_enabled: false,
+        serial_next: Default::default(),
         constraints: Default::default(),
     }
 }

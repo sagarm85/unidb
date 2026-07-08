@@ -167,6 +167,9 @@ fn convert_column_def(c: ast::ColumnDef) -> Result<ColumnDef> {
                 });
             }
             ast::ColumnOption::Check(cc) => cons.check = Some(convert_expr(&cc.expr)?),
+            // `GENERATED ... AS IDENTITY` (P2.d): auto-fill from the table's
+            // serial counter, same mechanism as `SERIAL`.
+            ast::ColumnOption::Generated { .. } => cons.identity = true,
             other => {
                 return Err(DbError::SqlUnsupported(format!(
                     "unsupported column option: {other:?}"
@@ -174,13 +177,31 @@ fn convert_column_def(c: ast::ColumnDef) -> Result<ColumnDef> {
             }
         }
     }
+    // `SERIAL`/`BIGSERIAL`/`SMALLSERIAL` (P2.d) parse as a custom type name; map
+    // them to an `Int64` identity column (auto-filled from the table counter).
+    let ty = if is_serial_type(&c.data_type) {
+        cons.identity = true;
+        ColumnType::Int64
+    } else {
+        convert_data_type(&c.data_type)?
+    };
     Ok(ColumnDef {
         name: c.name.value,
-        ty: convert_data_type(&c.data_type)?,
+        ty,
         index: None,
         dropped: false,
         constraints: cons,
     })
+}
+
+/// Whether a data type is a `SERIAL` pseudo-type (P2.d). These have no
+/// built-in `sqlparser` variant, so they arrive as `DataType::Custom`.
+fn is_serial_type(dt: &DataType) -> bool {
+    matches!(dt, DataType::Custom(name, _)
+    if matches!(
+        name.to_string().to_ascii_lowercase().as_str(),
+        "serial" | "bigserial" | "smallserial" | "serial2" | "serial4" | "serial8"
+    ))
 }
 
 /// Map the table-level `constraints` list (`PRIMARY KEY (..)`, `UNIQUE (..)`,
@@ -835,6 +856,21 @@ mod tests {
                 assert_eq!(columns[0].ty, ColumnType::Timestamp);
             }
             _ => panic!("expected CreateTable"),
+        }
+    }
+
+    #[test]
+    fn parses_serial_and_generated_identity() {
+        match parse_one(
+            "CREATE TABLE t (id SERIAL, big BIGSERIAL, g INT GENERATED ALWAYS AS IDENTITY)",
+        ) {
+            LogicalPlan::CreateTable { columns, .. } => {
+                assert_eq!(columns[0].ty, ColumnType::Int64);
+                assert!(columns[0].constraints.identity);
+                assert!(columns[1].constraints.identity);
+                assert!(columns[2].constraints.identity);
+            }
+            other => panic!("expected CreateTable, got {other:?}"),
         }
     }
 

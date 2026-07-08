@@ -85,6 +85,7 @@ pub fn events_table_def() -> TableDef {
         pages: Vec::new(),
         rls_policy: None,
         events_enabled: false,
+        serial_next: Default::default(),
         constraints: Default::default(),
     }
 }
@@ -111,6 +112,7 @@ pub fn consumers_table_def() -> TableDef {
         pages: Vec::new(),
         rls_policy: None,
         events_enabled: false,
+        serial_next: Default::default(),
         constraints: Default::default(),
     }
 }

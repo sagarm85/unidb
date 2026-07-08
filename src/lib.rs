@@ -1605,6 +1605,45 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn serial_sequence_survives_reopen() {
+        // P2.d: the SERIAL counter is durable — after a reopen it continues
+        // past the last-handed-out value, never reusing an id.
+        let dir = tempdir().unwrap();
+        {
+            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let xid = engine.begin().unwrap();
+            engine
+                .execute_sql(xid, "CREATE TABLE t (id SERIAL, v INT)")
+                .unwrap();
+            engine
+                .execute_sql(xid, "INSERT INTO t (v) VALUES (10)")
+                .unwrap();
+            engine
+                .execute_sql(xid, "INSERT INTO t (v) VALUES (20)")
+                .unwrap();
+            engine.commit(xid).unwrap();
+            engine.checkpoint().unwrap();
+        }
+        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "INSERT INTO t (v) VALUES (30)")
+            .unwrap();
+        engine.commit(xid).unwrap();
+        let xid2 = engine.begin().unwrap();
+        let rows = engine
+            .execute_sql(xid2, "SELECT id FROM t WHERE v = 30")
+            .unwrap();
+        match &rows[0] {
+            SqlResult::Rows(r) => {
+                // Must be 3, not a reused 1 — the sequence resumed after reopen.
+                assert_eq!(r, &vec![vec![crate::sql::logical::Literal::Int(3)]]);
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
     // ── M2.a: VECTOR(n) end-to-end ──────────────────────────────────────────
 
     #[test]

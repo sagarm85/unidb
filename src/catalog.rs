@@ -149,6 +149,11 @@ pub struct ColumnConstraints {
     /// Column-level `REFERENCES <table>(<column>)`.
     #[serde(default)]
     pub references: Option<ForeignKeyRef>,
+    /// `SERIAL` / `GENERATED ... AS IDENTITY` (P2.d): the column auto-fills
+    /// from the table's monotonic counter (`TableDef.serial_next`) when its
+    /// value is omitted/NULL on INSERT. Only valid on `Int64`.
+    #[serde(default)]
+    pub identity: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -220,6 +225,11 @@ pub struct TableDef {
     /// blobs deserialize with an empty set.
     #[serde(default)]
     pub constraints: TableConstraints,
+    /// Next value to hand out for each `SERIAL`/identity column, keyed by
+    /// column name (P2.d). Durable (persisted in the catalog blob, crash-safe
+    /// via the same WAL-logged page write as any catalog change) and monotonic.
+    #[serde(default)]
+    pub serial_next: HashMap<String, i64>,
 }
 
 /// Everything `Catalog` needs to durably persist itself, bundled so
@@ -356,6 +366,25 @@ impl Catalog {
             .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
         t.pages = pages;
         self.persist(ctx)
+    }
+
+    /// Allocate and durably persist the next value for a `SERIAL`/identity
+    /// column (P2.d). Monotonic; the counter starts at 1. Persisting on every
+    /// allocation keeps the sequence crash-safe (it survives reopen at the
+    /// last-handed-out value) at the cost of a catalog rewrite per serial
+    /// INSERT — acceptable for v1 correctness; batching is a later optimization.
+    pub fn alloc_serial(&mut self, table: &str, column: &str, ctx: &mut CatalogCtx) -> Result<i64> {
+        let t = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
+        let next = t.serial_next.entry(column.to_string()).or_insert(1);
+        let value = *next;
+        *next = value.checked_add(1).ok_or_else(|| {
+            DbError::SqlPlan(format!("sequence for '{table}.{column}' exhausted i64"))
+        })?;
+        self.persist(ctx)?;
+        Ok(value)
     }
 
     /// `ALTER TABLE ADD COLUMN` (P2.c). The new column is appended physically
@@ -514,6 +543,7 @@ mod tests {
             pages: vec![],
             rls_policy: None,
             events_enabled: false,
+            serial_next: Default::default(),
             constraints: Default::default(),
         };
         let mut ctx = CatalogCtx {
@@ -539,6 +569,7 @@ mod tests {
             pages: vec![],
             rls_policy: None,
             events_enabled: false,
+            serial_next: Default::default(),
             constraints: Default::default(),
         };
         let mut ctx = CatalogCtx {
@@ -579,6 +610,7 @@ mod tests {
             pages: vec![7],
             rls_policy: None,
             events_enabled: false,
+            serial_next: Default::default(),
             constraints: Default::default(),
         };
         {
@@ -625,6 +657,7 @@ mod tests {
             pages: vec![],
             rls_policy: None,
             events_enabled: false,
+            serial_next: Default::default(),
             constraints: Default::default(),
         };
         {
@@ -656,6 +689,7 @@ mod tests {
             pages: vec![],
             rls_policy: None,
             events_enabled: false,
+            serial_next: Default::default(),
             constraints: Default::default(),
         };
         let policy = Expr::BinOp {

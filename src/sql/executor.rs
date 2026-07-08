@@ -330,12 +330,27 @@ fn exec_create_table(
     constraints: TableConstraints,
     ctx: &mut ExecCtx,
 ) -> Result<ExecResult> {
+    // Identity/SERIAL columns (P2.d) must be Int64, and start their counter
+    // at 1. Validate + seed here so `create_table` stays a pure catalog op.
+    let mut serial_next = std::collections::HashMap::new();
+    for col in &columns {
+        if col.constraints.identity {
+            if col.ty != ColumnType::Int64 {
+                return Err(DbError::SqlPlan(format!(
+                    "SERIAL/identity column '{}' must be an integer type",
+                    col.name
+                )));
+            }
+            serial_next.insert(col.name.clone(), 1);
+        }
+    }
     let def = TableDef {
         name,
         columns,
         pages: Vec::new(),
         rls_policy: None,
         events_enabled: false,
+        serial_next,
         constraints,
     };
     let mut cctx = catalog_ctx!(ctx);
@@ -439,9 +454,12 @@ fn exec_insert(
     let mut count = 0;
     for row_values in values {
         let ordered = order_values_by_columns(&table_def, &columns, row_values)?;
+        // SERIAL/identity fill (P2.d): allocate the next counter value for any
+        // identity column whose value was omitted/NULL, before DEFAULT fill.
+        let seeded = fill_serials(table, &table_def, ordered, ctx)?;
         // DEFAULT fill happens on INSERT only (never UPDATE), before NOT
         // NULL / CHECK / coercion see the row.
-        let filled = apply_defaults(&table_def, ordered);
+        let filled = apply_defaults(&table_def, seeded);
         let coerced = coerce_and_validate_row(&table_def, filled)?;
         enforce_not_null(&table_def, &coerced)?;
         enforce_checks(&table_def, &coerced)?;
@@ -1120,6 +1138,27 @@ fn rescale_decimal(
 /// omitted column once values are positionally ordered, so DEFAULT applies to
 /// any NULL — a minor, documented divergence from strict SQL (`INSERT ...
 /// VALUES (NULL)` into a defaulted column fills the default here).
+/// Fill any identity/SERIAL column whose value is NULL (omitted) with the next
+/// value from the table's durable counter (P2.d). An explicitly-supplied value
+/// is left as-is (the counter is not advanced past it — matching Postgres
+/// `SERIAL`, a documented sharp edge). Allocation persists the catalog, so the
+/// sequence survives a crash/reopen at the last-handed-out value.
+fn fill_serials(
+    table: &str,
+    table_def: &TableDef,
+    mut row: Vec<Literal>,
+    ctx: &mut ExecCtx,
+) -> Result<Vec<Literal>> {
+    for (i, col) in table_def.columns.iter().enumerate() {
+        if col.constraints.identity && !col.dropped && matches!(row[i], Literal::Null) {
+            let mut cctx = catalog_ctx!(ctx);
+            let value = ctx.catalog.alloc_serial(table, &col.name, &mut cctx)?;
+            row[i] = Literal::Int(value);
+        }
+    }
+    Ok(row)
+}
+
 fn apply_defaults(table_def: &TableDef, mut row: Vec<Literal>) -> Vec<Literal> {
     for (i, col) in table_def.columns.iter().enumerate() {
         if col.dropped {
@@ -2182,6 +2221,7 @@ mod tests {
             pages: vec![],
             rls_policy: None,
             events_enabled: false,
+            serial_next: Default::default(),
             constraints: Default::default(),
         };
         let err = coerce_and_validate_row(&table, vec![Literal::Vector(vec![0.1, 0.2, 0.3])]);
@@ -2776,6 +2816,81 @@ mod tests {
             h.exec_as(xid, "DROP TABLE __events__"),
             Err(DbError::SqlPlan(_))
         ));
+    }
+
+    // ── P2.d: SERIAL / sequences ─────────────────────────────────────────────
+
+    #[test]
+    fn serial_auto_increments_monotonically() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id SERIAL, name TEXT)")
+            .unwrap();
+        h.exec_as(xid, "INSERT INTO t (name) VALUES ('a')").unwrap();
+        h.exec_as(xid, "INSERT INTO t (name) VALUES ('b')").unwrap();
+        h.exec_as(xid, "INSERT INTO t (name) VALUES ('c')").unwrap();
+        h.commit(xid);
+        let xid2 = h.begin();
+        let rows = match h.exec_as(xid2, "SELECT id, name FROM t").unwrap() {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        let mut ids: Vec<i64> = rows
+            .iter()
+            .map(|r| match r[0] {
+                Literal::Int(n) => n,
+                _ => panic!("id not int"),
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn serial_respects_explicit_value_and_is_the_pk() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id SERIAL PRIMARY KEY, name TEXT)")
+            .unwrap();
+        h.exec_as(xid, "INSERT INTO t (name) VALUES ('a')").unwrap(); // id=1
+                                                                      // Explicit value is honored as-is.
+        h.exec_as(xid, "INSERT INTO t (id, name) VALUES (100, 'b')")
+            .unwrap();
+        h.exec_as(xid, "INSERT INTO t (name) VALUES ('c')").unwrap(); // id=2
+        let xid_dup = xid;
+        // id=1 already used -> PRIMARY KEY conflict on an explicit dup.
+        let dup = h.exec_as(xid_dup, "INSERT INTO t (id, name) VALUES (1, 'x')");
+        assert!(matches!(dup, Err(DbError::UniqueViolation { .. })));
+    }
+
+    #[test]
+    fn generated_as_identity_auto_fills() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(
+            xid,
+            "CREATE TABLE t (id INT GENERATED ALWAYS AS IDENTITY, name TEXT)",
+        )
+        .unwrap();
+        h.exec_as(xid, "INSERT INTO t (name) VALUES ('a')").unwrap();
+        let rows = match h.exec_as(xid, "SELECT id FROM t").unwrap() {
+            ExecResult::Rows(r) => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(rows, vec![vec![Literal::Int(1)]]);
+    }
+
+    #[test]
+    fn serial_on_non_integer_rejected() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        // GENERATED AS IDENTITY on a TEXT column must be rejected.
+        let err = h.exec_as(xid, "CREATE TABLE t (id TEXT GENERATED ALWAYS AS IDENTITY)");
+        assert!(matches!(err, Err(DbError::SqlPlan(_))));
     }
 
     // ── M2.c: CREATE INDEX ───────────────────────────────────────────────────

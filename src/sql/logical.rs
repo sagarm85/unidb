@@ -245,6 +245,7 @@ mod tests {
             pages: vec![],
             rls_policy: policy,
             events_enabled: false,
+            serial_next: Default::default(),
             constraints: Default::default(),
         });
         catalog
