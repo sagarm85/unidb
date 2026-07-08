@@ -6,7 +6,7 @@
 // Frames are eviction-tracking metadata; actual data lives in the mmap window.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
     path::Path,
     sync::{Arc, RwLock},
@@ -116,6 +116,21 @@ pub struct BufferPool {
     /// makes `find_victim` skip a page that is in fact evictable), never
     /// unsafe. Refreshed on every write-path fetch and on `sync_wal`.
     durable_wal_lsn: Lsn,
+    /// Pages that have already had a full-page image (`WAL_FPI`) logged since
+    /// the last checkpoint (P1.a — torn-page protection). The write path logs
+    /// one FPI on the *first* modification of a page in each checkpoint
+    /// interval, before its first incremental change record; every subsequent
+    /// modification of that same page in the interval is protected by that one
+    /// image + the WAL records that follow it, so no further FPI is needed.
+    /// Cleared at every checkpoint (a checkpoint re-establishes a clean
+    /// on-disk base for all pages). Tracking by `PageId` rather than per-frame
+    /// deliberately survives eviction — a page evicted and re-fetched inside
+    /// one interval keeps its "already FPI-logged" status, giving exactly one
+    /// FPI per page per interval (strictly less WAL than a per-frame flag,
+    /// which would re-log after every eviction) while staying correct: the
+    /// single interval-opening image plus all of the page's subsequent redo
+    /// records fully reconstruct it regardless of any torn on-disk state.
+    fpi_logged: HashSet<PageId>,
 }
 
 impl BufferPool {
@@ -156,7 +171,87 @@ impl BufferPool {
             mmap,
             file_page_count,
             durable_wal_lsn: INVALID_LSN,
+            fpi_logged: HashSet::new(),
         })
+    }
+
+    /// Log a full-page image (`WAL_FPI`) for `page_id` if one has not yet been
+    /// logged since the last checkpoint (P1.a — torn-page protection). Call
+    /// this on the write path right after fetching a page for write and before
+    /// emitting the first incremental change record for that page in the
+    /// current mini-txn, passing the mini-txn id and the LSN to chain from.
+    /// Returns `Some(fpi_lsn)` when an image was written (so the caller can
+    /// chain the following record's `prev_lsn`), or `None` when the page was
+    /// already covered this interval.
+    ///
+    /// The image is the page's *current* (pre-modification) content read
+    /// straight from the mmap — always CRC-valid in memory, since torn pages
+    /// only ever arise from an interrupted *disk* write, never from an
+    /// in-memory page. Recovery replays this image as the clean base and then
+    /// applies the interval's later incremental redo records on top, so a torn
+    /// on-disk page is fully reconstructed.
+    pub fn maybe_log_fpi(
+        &mut self,
+        page_id: PageId,
+        wal: &mut Wal,
+        txn_id: u64,
+        prev_lsn: Lsn,
+    ) -> Result<Option<Lsn>> {
+        if self.fpi_logged.contains(&page_id) {
+            return Ok(None);
+        }
+        let image = self.read_page(page_id)?;
+        let lsn = wal.log_fpi(txn_id, prev_lsn, page_id, image.as_bytes())?;
+        self.fpi_logged.insert(page_id);
+        Ok(Some(lsn))
+    }
+
+    /// Record that `page_id` has an equivalent full-page image already in the
+    /// WAL for this checkpoint interval, so [`Self::maybe_log_fpi`] will not
+    /// log a redundant one. Used by paths that write a full page image through
+    /// another record kind (e.g. vacuum's compacted-page `WAL_VACUUM` image).
+    pub fn mark_fpi_logged(&mut self, page_id: PageId) {
+        self.fpi_logged.insert(page_id);
+    }
+
+    /// Reset full-page-image tracking (P1.a). Called by `checkpoint::run` once
+    /// all dirty pages have been flushed: the checkpoint has re-established a
+    /// clean on-disk base for every page, so the next modification of each
+    /// page must log a fresh FPI to open the new interval.
+    pub fn clear_fpi_tracking(&mut self) {
+        self.fpi_logged.clear();
+    }
+
+    /// Overwrite a page with a raw image during recovery redo of a `WAL_FPI`
+    /// (P1.a). Deliberately does **not** read or CRC-validate the existing
+    /// on-disk page — that page may be torn, and this image is the clean base
+    /// that replaces it wholesale. Extends the file (and remaps) if `page_id`
+    /// is beyond the current end. `image` must be exactly `page_size` bytes.
+    pub fn restore_page_image(&mut self, page_id: PageId, image: &[u8]) -> Result<()> {
+        if image.len() != self.page_size {
+            return Err(DbError::Recovery(format!(
+                "WAL_FPI image for page {page_id} is {} bytes, expected {}",
+                image.len(),
+                self.page_size
+            )));
+        }
+        if page_id >= self.file_page_count {
+            self.file_page_count = page_id + 1;
+            let new_len = self.file_page_count as u64 * self.page_size as u64;
+            self.file.set_len(new_len)?;
+            let mut guard = self.mmap.write().map_err(|_| lock_poisoned())?;
+            *guard = PageFileMmap::new(&self.file)?;
+        }
+        let start = page_id as usize * self.page_size;
+        let end = start + self.page_size;
+        {
+            let mut guard = self.mmap.write().map_err(|_| lock_poisoned())?;
+            guard[start..end].copy_from_slice(image);
+        }
+        if let Some(&frame_idx) = self.frame_index.get(&page_id) {
+            self.frames[frame_idx].dirty = true;
+        }
+        Ok(())
     }
 
     /// Advance the pool's view of the durable WAL frontier (D5). Called after
@@ -443,6 +538,64 @@ mod tests {
         // so a subsequent write-path fetch still succeeds.
         let pid3 = pool.alloc_page().unwrap();
         pool.fetch_page_for_write(pid3, &mut wal).unwrap();
+    }
+
+    /// P1.a: `maybe_log_fpi` logs exactly one full-page image per page per
+    /// checkpoint interval, and `clear_fpi_tracking` (called at checkpoint)
+    /// re-arms it. The logged image is the page's current clean content.
+    #[test]
+    fn maybe_log_fpi_logs_once_per_interval_then_rearms_on_clear() {
+        use crate::wal::Wal;
+        let dir = tempdir().unwrap();
+        let mut pool = open_pool(dir.path(), 16);
+        let mut wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
+
+        let pid = pool.alloc_page().unwrap();
+        let mut page = SlottedPage::new(pid, PAGE_TYPE_HEAP, DEFAULT_PAGE_SIZE as usize);
+        page.insert(b"row").unwrap();
+        page.set_lsn(1);
+        pool.write_page(&page).unwrap();
+
+        let (txn, begin) = wal.begin_mini_txn().unwrap();
+        // First modification of the interval: an FPI is written.
+        let first = pool.maybe_log_fpi(pid, &mut wal, txn, begin).unwrap();
+        assert!(first.is_some(), "first touch must log an FPI");
+        // Second touch in the same interval: no redundant FPI.
+        let second = pool.maybe_log_fpi(pid, &mut wal, txn, begin).unwrap();
+        assert!(second.is_none(), "second touch must not re-log");
+
+        // A checkpoint clears tracking, re-arming the next interval.
+        pool.clear_fpi_tracking();
+        let third = pool.maybe_log_fpi(pid, &mut wal, txn, begin).unwrap();
+        assert!(
+            third.is_some(),
+            "post-checkpoint touch must log a fresh FPI"
+        );
+    }
+
+    /// P1.a: `restore_page_image` overwrites a page from a raw image without
+    /// reading (or CRC-validating) the possibly-torn existing bytes, and
+    /// extends the file when the image targets a page past the current end.
+    #[test]
+    fn restore_page_image_overwrites_torn_and_extends() {
+        let dir = tempdir().unwrap();
+        let mut pool = open_pool(dir.path(), 16);
+        let ps = DEFAULT_PAGE_SIZE as usize;
+
+        // Build a valid page image for a page id beyond the current file end.
+        let far_pid: PageId = 5;
+        let mut page = SlottedPage::new(far_pid, PAGE_TYPE_HEAP, ps);
+        page.insert(b"restored").unwrap();
+        page.set_lsn(9);
+        let image = page.as_bytes().to_vec();
+
+        pool.restore_page_image(far_pid, &image).unwrap();
+        let read = pool.read_page(far_pid).unwrap();
+        assert_eq!(read.get(0).unwrap(), b"restored");
+        assert_eq!(read.lsn(), 9);
+
+        // A wrong-sized image is rejected rather than silently misapplied.
+        assert!(pool.restore_page_image(far_pid, &image[..ps - 1]).is_err());
     }
 
     #[test]

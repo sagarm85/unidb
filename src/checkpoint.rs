@@ -29,6 +29,12 @@ pub fn run(
     // 1. Flush all dirty pages. D5 is enforced inside flush_page.
     pool.flush_all(wal.durable_lsn)?;
 
+    // P1.a: with every dirty page now durably flushed, the on-disk image of
+    // every page is clean, so the current interval's full-page images are no
+    // longer needed. Reset FPI tracking — the next modification of each page
+    // opens a new interval and logs a fresh full-page image.
+    pool.clear_fpi_tracking();
+
     // 2. Write checkpoint record to WAL and fsync.
     let ckpt_lsn = wal.log_checkpoint()?;
 

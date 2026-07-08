@@ -28,8 +28,8 @@ use crate::{
     error::{DbError, Result},
     format::{
         u16_from_le, u16_to_le, u32_from_le, u32_to_le, u64_from_le, u64_to_le, Lsn, PageId, Xid,
-        INVALID_LSN, WAL_ABORT, WAL_BEGIN, WAL_CHECKPOINT, WAL_COMMIT, WAL_DELETE, WAL_INSERT,
-        WAL_TXN_ABORT, WAL_TXN_BEGIN, WAL_TXN_COMMIT, WAL_UPDATE, WAL_VACUUM,
+        INVALID_LSN, WAL_ABORT, WAL_BEGIN, WAL_CHECKPOINT, WAL_COMMIT, WAL_DELETE, WAL_FPI,
+        WAL_INSERT, WAL_TXN_ABORT, WAL_TXN_BEGIN, WAL_TXN_COMMIT, WAL_UPDATE, WAL_VACUUM,
     },
 };
 
@@ -232,6 +232,24 @@ impl Wal {
     ) -> Result<Lsn> {
         let lsn = self.append_raw(txn_id, prev_lsn, WAL_VACUUM, page_id, slot, redo, &[])?;
         tracing::trace!(mini_txn_id = txn_id, lsn, page_id, slot, "WAL VACUUM");
+        Ok(lsn)
+    }
+
+    /// Log a full-page image for torn-page protection (P1.a). `image` is the
+    /// entire clean page (`page_size` bytes) as it stood *before* the first
+    /// modification of `page_id` in the current checkpoint interval. Redo-only
+    /// (no undo — recovery uses it as the clean base and replays subsequent
+    /// incremental records on top). `slot` is `u16::MAX`: a whole-page record.
+    /// See `format::WAL_FPI` and `BufferPool::maybe_log_fpi`.
+    pub fn log_fpi(
+        &mut self,
+        txn_id: u64,
+        prev_lsn: Lsn,
+        page_id: PageId,
+        image: &[u8],
+    ) -> Result<Lsn> {
+        let lsn = self.append_raw(txn_id, prev_lsn, WAL_FPI, page_id, u16::MAX, image, &[])?;
+        tracing::trace!(mini_txn_id = txn_id, lsn, page_id, "WAL FPI");
         Ok(lsn)
     }
 

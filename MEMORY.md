@@ -78,13 +78,15 @@
   on `reqwest` — note `-p unidb --edges normal` is required: plain `cargo
   tree --no-default-features` from a workspace root shows the whole
   workspace's dependency union, which is *not* the right check here).
-- **Immediate next task: none — M0-M8 all shipped.** If continuing, the
-  standing next item is the parked Phase 2 SQL capability plan
-  (`docs/backlog/phase2_sql_capability_expansion.md`, OR/ORDER BY/LIMIT/
-  aggregates/JOIN). A CSR-preferring traversal fix (staleness/generation
-  marker design) is documented as known tech debt below but was
-  deliberately not attempted as part of the M7 bug fix — that's new design
-  work, not a regression fix.
+- **Current work: Phase 1 — ACID & storage foundation** (the feature-freeze
+  gate, `docs/backlog/phase1_acid_hardening.md`), on Core lane branch
+  `acid-hardening`. **P1.a (full-page-writes) is shipped**; P1.b–P1.e (fsync
+  hardening, alloc_page remap + configurable pool + real FSM, isolation
+  correctness, auto-checkpoint) are next, in that order, one PR each. See the
+  Phase 1 section below. The roadmap is now `docs/backlog/roadmap.md` (6-phase
+  plan); the older per-milestone backlog docs were retired. A CSR-preferring
+  traversal fix (staleness/generation marker design) remains documented tech
+  debt below — deliberately not attempted as part of the M7 bug fix.
 - **In-flight performance work (branch `m9-group-commit`, 2026-07-08, not
   yet merged):** group commit + read-only fsync skip. The diagnosis (see
   `docs/performance/fssdb/`) was that the ~3–4 ms floor on every durable op
@@ -120,6 +122,39 @@
   phase2_sql_capability_expansion.md`). See Open questions below for
   what's still unresolved from M1-M5.
 - **Last updated:** 2026-07-08
+
+### Phase 1 — ACID & storage foundation (Core lane, branch `acid-hardening`)
+
+The **feature-freeze gate** (`docs/backlog/phase1_acid_hardening.md`): close the
+silent Tier-0 correctness holes before any scale/feature work. Serial Core lane;
+one PR per checkpoint (P1.a → P1.e). **In progress as of 2026-07-08.**
+
+- **P1.a — Full-page-writes (WAL_FPI) — SHIPPED (2026-07-08).** Closes the #1
+  data-loss hole: a torn 8 KiB page write (crash mid-write → half-old/half-new,
+  CRC detects but can't repair). On the **first modification of a page after
+  each checkpoint** the buffer pool logs the whole clean page image to the WAL
+  (`WAL_FPI`, redo-only, `slot=u16::MAX`) via `BufferPool::maybe_log_fpi`,
+  called from every `heap.rs` mutation right after the page fetch and before the
+  incremental record; recovery (`restore_page_image`, CRC-bypassing) replays it
+  as the clean base, then the interval's incremental redos (higher LSN) apply on
+  top. `checkpoint::run` calls `clear_fpi_tracking()` after `flush_all` to
+  re-arm the next interval. Tracking is a `HashSet<PageId>` (not a per-frame
+  flag) so it survives eviction → exactly one FPI per page per interval.
+  **Why sufficient:** D5 forbids flushing a page whose WAL isn't durable, so any
+  torn on-disk page belongs to a *committed* mini-txn whose FPI is in the redo
+  set; incomplete mini-txns never reach disk torn. `FORMAT_VERSION` 3→4 (new
+  record kind, D9). New crash point **P11** (`p11_torn_page_restored_from_full_
+  page_image`) manufactures a real torn page and asserts both rows recover;
+  crash harness now 13 tests (P1–P11 + property). Bench `benches/fpi.rs`: FPI
+  adds 12 % (8 B rows) → 47 % (1 KiB rows) WAL volume in a write-once/no-
+  checkpoint worst case, **zero throughput change** (write path is fsync-bound;
+  FPI adds bytes not fsyncs); auto-checkpoint (P1.e) bounds total FPI volume.
+  See `PROGRESS.md`'s Phase 1 entry for the full table + the documented
+  fresh-page/catalog limitation (fresh un-referenced pages aren't FPI-covered —
+  no committed-data loss, tracked for a later pass).
+- **P1.b–P1.e — not started.** fsync-failure handling; alloc_page remap fix +
+  configurable pool + real FSM; isolation correctness (RC re-eval + SSI);
+  auto-checkpoint. In that order, one PR each.
 
 ### M10 — heap vacuum / MVCC GC (Core lane, branch `core-vacuum`, 2026-07-08)
 

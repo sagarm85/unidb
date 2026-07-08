@@ -10,6 +10,8 @@ The competitive edge is eliminating the multi-system dual-write tax. "Save row +
 
 **M10: heap vacuum / MVCC garbage collection.** The engine now physically reclaims space held by dead tuple versions via an explicit `Engine::vacuum() -> VacuumReport` (there is no autovacuum in v1; it mirrors the existing `vacuum_events` explicit-call model). Vacuum computes a conservative visibility horizon over every live transaction **and** every live concurrent `ReadHandle` reader, marks reclaimable versions' line pointers DEAD via a crash-safe redo-only `WAL_VACUUM` record, scrubs those `RowId`s from every secondary index **before** any slot becomes reusable (the aliasing gate that keeps a reused slot from resolving a stale index entry to a live, wrong row), then compacts each page and frees the slots. Long-lived `REPEATABLE READ` transactions or readers hold the horizon back and are surfaced in `VacuumReport.horizon_blocked` rather than silently ignored. Embedded-API only in v1 (no REST route). See `docs/backlog/m10_heap_vacuum_gc.md` and `PROGRESS.md`'s M10 entry.
 
+**Phase 1 (in progress): ACID & storage foundation — the feature-freeze gate.** Before further scale/feature work, the engine is closing its silent correctness holes (`docs/backlog/roadmap.md` §4, `docs/backlog/phase1_acid_hardening.md`). **P1.a — full-page-writes — is shipped:** an 8 KiB page write is not atomic, so a crash mid-write used to leave a torn page that CRC detects but cannot repair (the #1 data-loss hole). Now, on the first modification of a page after each checkpoint, the buffer pool logs the whole clean page image to the WAL (a redo-only `WAL_FPI` record); recovery replays it as the clean base before re-applying the interval's incremental redo on top, so a torn on-disk page is fully reconstructed. New crash point **P11** manufactures a real torn page and asserts recovery (`FORMAT_VERSION` 3→4). Still to come in this phase: fsync-failure handling, the `alloc_page` whole-file-remap fix + configurable buffer pool + real free-space map, isolation correctness (RC re-evaluation + true `SERIALIZABLE`/SSI), and auto-checkpoint. See `PROGRESS.md`'s Phase 1 entry.
+
 ---
 
 ## Prerequisites
@@ -44,7 +46,7 @@ cargo build --release
 # All unit tests + integration tests (embedded crate, default features)
 cargo test
 
-# Crash-injection harness only (D7 — 5 injection points)
+# Crash-injection harness only (D7 — P1–P11 injection points + property test)
 cargo test --test crash
 
 # Server tests (REST/JWT/SSE/metrics) — requires the `server` feature
@@ -292,7 +294,7 @@ src/
   bin/unidb-server.rs — the server binary (required-features = ["server"])
   lib.rs           — Engine public API, init_tracing()
 tests/
-  crash/           — crash-injection harness (5+ injection points)
+  crash/           — crash-injection harness (P1–P11 injection points + property test)
   server_*.rs      — REST server integration tests (feature = "server")
   graph_*.rs, vector_mvcc.rs, queue_*.rs, index_rebuild.rs, btree_mvcc.rs — per-milestone integration tests
 benches/
@@ -341,7 +343,7 @@ All milestones below are **shipped, tested, and benchmarked**. Metrics tables ar
 | D4 | Tuple header reserves xmin/xmax now; in-place UPDATE in M0, MVCC in M1 |
 | D5 | WAL-before-page invariant: no dirty page flushed while page.LSN > durable WAL LSN |
 | D6 | Single-file storage for M0 (WAL may be a separate file) |
-| D7 | Crash-injection harness: kill at 5 points, reopen, assert recovered state |
+| D7 | Crash-injection harness: kill at defined points, reopen, assert recovered state (grows with each new durability mechanism — P1–P11 today) |
 | D8 | Page size 8 KiB default, config-overridable at init, fixed after creation |
 | D9 | On-disk format is fixed little-endian; every page carries CRC32 + LSN |
 | D10 | Default isolation: READ COMMITTED; REPEATABLE READ available |

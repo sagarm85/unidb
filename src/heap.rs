@@ -105,10 +105,14 @@ impl Heap {
 
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
         let mut page = pool.fetch_page_for_write(page_id, wal)?;
+        // P1.a: full-page image before this page's first change of the interval.
+        let prev_lsn = pool
+            .maybe_log_fpi(page_id, wal, txn_id, begin_lsn)?
+            .unwrap_or(begin_lsn);
         let slot = page.insert_versioned(data, xid, 0, prev)?;
         on_write(xid, RowId { page_id, slot });
         let redo = encode_insert_redo(xid, prev, data);
-        let ins_lsn = wal.log_insert(txn_id, begin_lsn, page_id, slot, &redo)?;
+        let ins_lsn = wal.log_insert(txn_id, prev_lsn, page_id, slot, &redo)?;
         page.set_lsn(ins_lsn);
         pool.write_page(&page)?;
         pool.unpin(page_id);
@@ -191,9 +195,13 @@ impl Heap {
             });
         }
         on_write(xid, row_id);
+        // P1.a: full-page image of the old-version page before its xmax stamp.
+        let xmax_prev = pool
+            .maybe_log_fpi(row_id.page_id, wal, txn_id, begin_lsn)?
+            .unwrap_or(begin_lsn);
         let xmax_lsn = wal.log_update(
             txn_id,
-            begin_lsn,
+            xmax_prev,
             row_id.page_id,
             row_id.slot,
             &u64_to_le(xid),
@@ -205,10 +213,15 @@ impl Heap {
         pool.unpin(row_id.page_id);
 
         let mut new_page = pool.fetch_page_for_write(new_page_id, wal)?;
+        // P1.a: full-page image of the new-version page before its insert. A
+        // no-op if this is the same page as the old version (already covered).
+        let ins_prev = pool
+            .maybe_log_fpi(new_page_id, wal, txn_id, xmax_lsn)?
+            .unwrap_or(xmax_lsn);
         let prev = Some((row_id.page_id, row_id.slot));
         let new_slot = new_page.insert_versioned(new_data, xid, 0, prev)?;
         let insert_redo = encode_insert_redo(xid, prev, new_data);
-        let ins_lsn = wal.log_insert(txn_id, xmax_lsn, new_page_id, new_slot, &insert_redo)?;
+        let ins_lsn = wal.log_insert(txn_id, ins_prev, new_page_id, new_slot, &insert_redo)?;
         new_page.set_lsn(ins_lsn);
         pool.write_page(&new_page)?;
         pool.unpin(new_page_id);
@@ -245,9 +258,13 @@ impl Heap {
             });
         }
         on_write(xid, row_id);
+        // P1.a: full-page image before this page's first change of the interval.
+        let prev_lsn = pool
+            .maybe_log_fpi(row_id.page_id, wal, txn_id, begin_lsn)?
+            .unwrap_or(begin_lsn);
         let lsn = wal.log_update(
             txn_id,
-            begin_lsn,
+            prev_lsn,
             row_id.page_id,
             row_id.slot,
             &u64_to_le(xid),
@@ -275,9 +292,13 @@ impl Heap {
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
         let mut page = pool.fetch_page_for_write(page_id, wal)?;
         let old_xmax = page.tuple_header(slot)?.xmax;
+        // P1.a: full-page image before this page's first change of the interval.
+        let prev_lsn = pool
+            .maybe_log_fpi(page_id, wal, txn_id, begin_lsn)?
+            .unwrap_or(begin_lsn);
         let lsn = wal.log_update(
             txn_id,
-            begin_lsn,
+            prev_lsn,
             page_id,
             slot,
             &u64_to_le(0),
@@ -308,9 +329,13 @@ impl Heap {
     ) -> Result<()> {
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
         let mut page = pool.fetch_page_for_write(page_id, wal)?;
+        // P1.a: full-page image before this page's first change of the interval.
+        let prev_lsn = pool
+            .maybe_log_fpi(page_id, wal, txn_id, begin_lsn)?
+            .unwrap_or(begin_lsn);
         let lsn = wal.log_update(
             txn_id,
-            begin_lsn,
+            prev_lsn,
             page_id,
             slot,
             &u64_to_le(xid),
@@ -425,7 +450,13 @@ impl Heap {
     pub fn mark_dead(&mut self, row_id: RowId, pool: &mut BufferPool, wal: &mut Wal) -> Result<()> {
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
         let mut page = pool.fetch_page_for_write(row_id.page_id, wal)?;
-        let lsn = wal.log_vacuum(txn_id, begin_lsn, row_id.page_id, row_id.slot, &[])?;
+        // P1.a: full-page image before this page's first change of the interval
+        // (mark_dead is an incremental slot mutation, so it needs torn-page
+        // protection just like an INSERT/UPDATE).
+        let prev_lsn = pool
+            .maybe_log_fpi(row_id.page_id, wal, txn_id, begin_lsn)?
+            .unwrap_or(begin_lsn);
+        let lsn = wal.log_vacuum(txn_id, prev_lsn, row_id.page_id, row_id.slot, &[])?;
         page.mark_dead(row_id.slot)?;
         page.set_lsn(lsn);
         pool.write_page(&page)?;
@@ -457,6 +488,10 @@ impl Heap {
         pool.write_page(&page)?;
         pool.unpin(page_id);
         wal.commit_mini_txn(txn_id, lsn)?;
+        // P1.a: this WAL_VACUUM record already carries a full clean page image
+        // (its own torn-page protection), so no separate FPI is needed for a
+        // later modification of this page in the same interval.
+        pool.mark_fpi_logged(page_id);
         Ok(reclaimed)
     }
 }
