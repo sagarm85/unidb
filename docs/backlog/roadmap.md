@@ -100,6 +100,14 @@ before anything). Phases 2 + 3 run in parallel with it. Phase 4 gives a real
 query engine. Phase 5 (biggest perf unlock) depends on 1 + 3 being solid.
 Phase 6 delivers the single-node + read-replica target.
 
+**Per-phase detailed specs** (checkpoints, files, gates, locked-decision impact):
+[`phase1_acid_hardening.md`](phase1_acid_hardening.md) ·
+[`phase2_data_model.md`](phase2_data_model.md) ·
+[`phase3_durable_storage.md`](phase3_durable_storage.md) ·
+[`phase4_query_power.md`](phase4_query_power.md) ·
+[`phase5_concurrency.md`](phase5_concurrency.md) ·
+[`phase6_ops_ha.md`](phase6_ops_ha.md).
+
 ---
 
 ## 5. Parallel-worktree lane model
