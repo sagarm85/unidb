@@ -34,7 +34,7 @@ use crate::{
     lockmgr::LockManager,
     mvcc::Snapshot,
     queue::{self, EVENTS_TABLE},
-    txn::{TransactionManager, UndoAction},
+    txn::{IsolationLevel, TransactionManager, UndoAction},
     wal::Wal,
 };
 
@@ -413,12 +413,17 @@ fn exec_select(
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
 
     let mut out = Vec::new();
-    for (_, bytes) in heap.scan(&snapshot, ctx.xid, ctx.pool)? {
+    let mut read_ids = Vec::new();
+    for (row_id, bytes) in heap.scan(&snapshot, ctx.xid, ctx.pool)? {
         let row = decode_row(&bytes, &table_def.columns)?;
         if predicate_matches(predicate, &table_def.columns, &row)? {
+            // P1.d: this row is part of the statement's read set (an SSI
+            // rw-antidependency source). No-op unless `xid` is serializable.
+            read_ids.push(row_id);
             out.push(project_row(projection, &table_def.columns, &row)?);
         }
     }
+    ctx.txn_mgr.ssi_note_reads(ctx.xid, &read_ids);
     Ok(ExecResult::Rows(out))
 }
 
@@ -665,6 +670,9 @@ fn exec_update(
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
 
     let matching = matching_rows(&heap, &snapshot, ctx, &table_def, predicate)?;
+    // P1.d: the rows an UPDATE selects are part of its read set (SSI).
+    let read_ids: Vec<RowId> = matching.iter().map(|(rid, _)| *rid).collect();
+    ctx.txn_mgr.ssi_note_reads(ctx.xid, &read_ids);
 
     let mut count = 0;
     for (row_id, mut row) in matching {
@@ -690,7 +698,14 @@ fn exec_update(
             Some(row_id),
         )?;
         let encoded = encode_row(&coerced);
-        let new_row_id = heap.update(row_id, &encoded, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr)?;
+        let new_row_id =
+            match heap.update(row_id, &encoded, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr) {
+                Err(e @ DbError::WriteConflict { .. }) => return Err(classify_conflict(e, ctx)),
+                other => other?,
+            };
+        // P1.d: writing supersedes the version at `row_id` — an SSI write of the
+        // exact version a concurrent reader would have read.
+        ctx.txn_mgr.ssi_note_write(ctx.xid, row_id);
         ctx.txn_mgr.record_undo(
             ctx.xid,
             UndoAction::XmaxStamp {
@@ -720,13 +735,22 @@ fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Resu
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
 
     let matching = matching_rows(&heap, &snapshot, ctx, &table_def, predicate)?;
+    // P1.d: the rows a DELETE selects are part of its read set (SSI).
+    let read_ids: Vec<RowId> = matching.iter().map(|(rid, _)| *rid).collect();
+    ctx.txn_mgr.ssi_note_reads(ctx.xid, &read_ids);
 
     let mut count = 0;
     for (row_id, row) in matching {
         // Captured before `heap.delete` runs — once the row is deleted
         // there is nothing left to build a payload from.
         send_event_capture(&table_def, "delete", &row, ctx)?;
-        heap.delete(row_id, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr)?;
+        if let Err(e @ DbError::WriteConflict { .. }) =
+            heap.delete(row_id, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr)
+        {
+            return Err(classify_conflict(e, ctx));
+        }
+        // P1.d: deleting supersedes the version at `row_id` (SSI write).
+        ctx.txn_mgr.ssi_note_write(ctx.xid, row_id);
         ctx.txn_mgr.record_undo(
             ctx.xid,
             UndoAction::XmaxStamp {
@@ -739,6 +763,23 @@ fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Resu
 
     persist_pages_if_changed(table, &heap, &table_def.pages, ctx)?;
     Ok(ExecResult::Deleted { count })
+}
+
+/// Classify a `Heap` write-write `WriteConflict` by isolation level (P1.d):
+/// under `REPEATABLE READ` / `SERIALIZABLE` it is a serialization anomaly the
+/// transaction cannot proceed through, surfaced as `SerializationFailure` (the
+/// caller should retry). Under `READ COMMITTED` it is left as-is — the only way
+/// this fires at RC is a genuine no-wait conflict against a *still-active*
+/// writer (a committed superseder is instead re-read by RC's fresh per-
+/// statement snapshot, so no spurious abort). True blocking-then-EvalPlanQual
+/// for that active-writer case needs a lock wait queue (Phase 5).
+fn classify_conflict(err: DbError, ctx: &ExecCtx) -> DbError {
+    match ctx.txn_mgr.isolation(ctx.xid) {
+        Some(IsolationLevel::RepeatableRead) | Some(IsolationLevel::Serializable) => {
+            DbError::SerializationFailure { xid: ctx.xid }
+        }
+        _ => err,
+    }
 }
 
 fn matching_rows(

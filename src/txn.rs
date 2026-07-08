@@ -21,7 +21,7 @@ use crate::{
     bufferpool::BufferPool,
     error::{DbError, Result},
     format::{Lsn, PageId, Xid},
-    heap::Heap,
+    heap::{Heap, RowId},
     lockmgr::LockManager,
     mvcc::Snapshot,
     wal::{Wal, WalRecord},
@@ -31,6 +31,14 @@ use crate::{
 pub enum IsolationLevel {
     ReadCommitted,
     RepeatableRead,
+    /// True serializability via SSI (P1.d). Uses the same fixed BEGIN-time
+    /// snapshot as `RepeatableRead` (so it never sees anomalies RR would),
+    /// **plus** rw-antidependency tracking: a transaction that forms a
+    /// dangerous structure (an inbound *and* an outbound rw-conflict — a
+    /// pivot) is aborted with [`DbError::SerializationFailure`] rather than
+    /// committing a non-serializable schedule (e.g. write-skew). See the SSI
+    /// tracker below.
+    Serializable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +71,34 @@ pub struct Transaction {
     pub begin_lsn: Lsn,
     pub last_lsn: Lsn,
     pub undo_log: Vec<UndoAction>,
+    /// SSI rw-antidependency tracking (P1.d), populated only for
+    /// `Serializable` transactions. `None` for RC/RR (no overhead).
+    pub ssi: Option<SsiState>,
+}
+
+/// Per-transaction SSI state (P1.d, Cahill-style rw-antidependency tracking).
+/// A transaction records the rows it read and wrote, and two flags: an
+/// **incoming** rw-conflict (a concurrent transaction read a row this one then
+/// wrote — someone rw-depends *on* us) and an **outgoing** rw-conflict (this
+/// transaction read a row a concurrent one then wrote — we rw-depend on them).
+/// A transaction that ends up with *both* is a **pivot** in a dangerous
+/// structure and is aborted at commit rather than committing a non-serializable
+/// schedule. Row-granularity (no predicate locks), so this catches write-skew
+/// on existing rows but not phantom anomalies — the reduced form the plan
+/// allows.
+#[derive(Debug, Default, Clone)]
+pub struct SsiState {
+    pub reads: HashSet<RowId>,
+    pub writes: HashSet<RowId>,
+    pub in_conflict: bool,
+    pub out_conflict: bool,
+}
+
+impl SsiState {
+    /// A pivot: has both an inbound and an outbound rw-antidependency.
+    fn is_pivot(&self) -> bool {
+        self.in_conflict && self.out_conflict
+    }
 }
 
 /// The snapshot-relevant transaction state, shared between the writer's
@@ -84,6 +120,13 @@ pub struct TxnInner {
     /// [`ReadRegistration`]). Held only for the duration of one read call.
     read_registrations: HashMap<u64, Xid>,
     next_reg_id: u64,
+    /// SSI state of `Serializable` transactions that have **committed** but may
+    /// still be concurrent with a live serializable transaction (P1.d), kept so
+    /// a later read/write by that live transaction can still form an
+    /// rw-antidependency edge with them. Cleared whenever no serializable
+    /// transaction is active (nothing left that could conflict). Aborted
+    /// transactions are never added — their writes are physically undone.
+    committed_ser: HashMap<Xid, SsiState>,
 }
 
 impl TxnInner {
@@ -213,6 +256,7 @@ impl TransactionManager {
                 aborted: HashSet::new(),
                 read_registrations: HashMap::new(),
                 next_reg_id: 1,
+                committed_ser: HashMap::new(),
             })),
         }
     }
@@ -264,6 +308,11 @@ impl TransactionManager {
                 begin_lsn,
                 last_lsn: begin_lsn,
                 undo_log: Vec::new(),
+                ssi: if isolation == IsolationLevel::Serializable {
+                    Some(SsiState::default())
+                } else {
+                    None
+                },
             },
         );
         tracing::info!(xid, ?isolation, "transaction begin");
@@ -295,6 +344,91 @@ impl TransactionManager {
         Ok(())
     }
 
+    /// The isolation level `xid` is running under, if it is active. Used by
+    /// the executor to classify a write-write conflict (P1.d): a serialization
+    /// anomaly under RR/Serializable, a plain no-wait conflict under RC.
+    pub fn isolation(&self, xid: Xid) -> Option<IsolationLevel> {
+        self.lock().active.get(&xid).map(|t| t.isolation)
+    }
+
+    /// SSI (P1.d): record that serializable `xid` read `rows` (from a scan),
+    /// and form an outbound rw-antidependency to every concurrent serializable
+    /// transaction that *wrote* any of those rows (we read a version they
+    /// superseded). No-op for RC/RR transactions.
+    pub fn ssi_note_reads(&self, xid: Xid, rows: &[RowId]) {
+        let mut inner = self.lock();
+        if inner.active.get(&xid).is_none_or(|t| t.ssi.is_none()) {
+            return;
+        }
+        for &r in rows {
+            // Writers of r among *other* serializable txns (active or committed).
+            let active_writers: Vec<Xid> = inner
+                .active
+                .iter()
+                .filter(|(&o, t)| o != xid && t.ssi.as_ref().is_some_and(|s| s.writes.contains(&r)))
+                .map(|(&o, _)| o)
+                .collect();
+            let committed_writer = inner
+                .committed_ser
+                .iter()
+                .any(|(&o, s)| o != xid && s.writes.contains(&r));
+            if let Some(s) = inner.active.get_mut(&xid).and_then(|t| t.ssi.as_mut()) {
+                s.reads.insert(r);
+                if !active_writers.is_empty() || committed_writer {
+                    s.out_conflict = true; // we rw-depend on a concurrent writer
+                }
+            }
+            for w in active_writers {
+                if let Some(s) = inner.active.get_mut(&w).and_then(|t| t.ssi.as_mut()) {
+                    s.in_conflict = true; // a concurrent reader (us) depends on them
+                }
+            }
+        }
+    }
+
+    /// SSI (P1.d): record that serializable `xid` wrote `row`, and form an
+    /// inbound rw-antidependency from every concurrent serializable transaction
+    /// that *read* that row (they read a version we superseded). No-op for
+    /// RC/RR transactions.
+    pub fn ssi_note_write(&self, xid: Xid, row: RowId) {
+        let mut inner = self.lock();
+        if inner.active.get(&xid).is_none_or(|t| t.ssi.is_none()) {
+            return;
+        }
+        let active_readers: Vec<Xid> = inner
+            .active
+            .iter()
+            .filter(|(&o, t)| o != xid && t.ssi.as_ref().is_some_and(|s| s.reads.contains(&row)))
+            .map(|(&o, _)| o)
+            .collect();
+        let committed_reader = inner
+            .committed_ser
+            .iter()
+            .any(|(&o, s)| o != xid && s.reads.contains(&row));
+        if let Some(s) = inner.active.get_mut(&xid).and_then(|t| t.ssi.as_mut()) {
+            s.writes.insert(row);
+            if !active_readers.is_empty() || committed_reader {
+                s.in_conflict = true; // a concurrent reader rw-depends on us
+            }
+        }
+        for rdr in active_readers {
+            if let Some(s) = inner.active.get_mut(&rdr).and_then(|t| t.ssi.as_mut()) {
+                s.out_conflict = true; // they rw-depend on our write
+            }
+        }
+    }
+
+    /// SSI (P1.d): is `xid` a pivot (both an inbound and an outbound
+    /// rw-antidependency) — i.e. must it abort rather than commit? Always
+    /// `false` for non-serializable transactions.
+    pub fn ssi_is_pivot(&self, xid: Xid) -> bool {
+        self.lock()
+            .active
+            .get(&xid)
+            .and_then(|t| t.ssi.as_ref())
+            .is_some_and(|s| s.is_pivot())
+    }
+
     /// Commit `xid`. Note on conflict detection (M1.b, D12): there is no
     /// separate "recheck at commit time" step. Because `LockManager` holds
     /// a row's write lock for the *entire* lifetime of the transaction that
@@ -304,6 +438,14 @@ impl TransactionManager {
     /// immediately at `Heap::update`/`delete` time via `try_acquire_write`.
     /// This is stronger than needing a distinct commit-time check.
     pub fn commit(&self, xid: Xid, wal: &mut Wal, lock_mgr: &mut LockManager) -> Result<()> {
+        // SSI (P1.d): a serializable pivot must not commit — it would seal a
+        // non-serializable schedule (e.g. write-skew). Refuse *before* removing
+        // it from `active`, leaving it live for the caller to roll back
+        // (`Engine::commit` turns this into an abort + `SerializationFailure`).
+        if self.ssi_is_pivot(xid) {
+            tracing::info!(xid, "SSI: aborting serializable pivot at commit");
+            return Err(DbError::SerializationFailure { xid });
+        }
         let txn = self
             .lock()
             .active
@@ -320,7 +462,19 @@ impl TransactionManager {
         if !txn.undo_log.is_empty() {
             wal.commit_user_txn(xid, txn.last_lsn)?;
         }
-        self.lock().committed.insert(xid);
+        {
+            let mut inner = self.lock();
+            inner.committed.insert(xid);
+            // SSI (P1.d): keep this serializable txn's read/write sets available
+            // to still-concurrent serializable txns for edge detection; drop all
+            // committed-ser state once nothing serializable is active.
+            if let Some(ssi) = txn.ssi {
+                inner.committed_ser.insert(xid, ssi);
+            }
+            if !inner.active.values().any(|t| t.ssi.is_some()) {
+                inner.committed_ser.clear();
+            }
+        }
         lock_mgr.release_all(xid);
         tracing::info!(xid, "transaction commit");
         Ok(())
@@ -357,7 +511,16 @@ impl TransactionManager {
             }
         }
         wal.abort_user_txn(xid, txn.last_lsn)?;
-        self.lock().aborted.insert(xid);
+        {
+            let mut inner = self.lock();
+            inner.aborted.insert(xid);
+            // SSI (P1.d): an aborted txn's writes are physically undone, so it
+            // never enters `committed_ser`; drop committed-ser state once
+            // nothing serializable remains active.
+            if !inner.active.values().any(|t| t.ssi.is_some()) {
+                inner.committed_ser.clear();
+            }
+        }
         lock_mgr.release_all(xid);
         tracing::info!(xid, "transaction abort");
         Ok(())

@@ -262,21 +262,37 @@ state** in visibility: `is_committed_at_snapshot` treats
 not-in-active-set-and-in-range as committed. Abort therefore requires
 **physical undo** (§4.3).
 
-### 4.2 Isolation levels (D10, D12)
+### 4.2 Isolation levels (D10, D12; SSI completed P1.d)
 
-- **READ COMMITTED** (default) and **REPEATABLE READ** (= snapshot
-  isolation) differ *only* in snapshot lifetime: per-statement vs
-  per-transaction. Same MVCC machinery.
-- **Conflict handling is SI's abort-on-conflict path (D12)**: a
-  write-write conflict aborts the second writer immediately — no blocking,
-  no wait queue, no deadlock detection (deliberately). RC's
-  EvalPlanQual-style re-evaluation path is designed but **unimplemented**;
-  UPDATE/DELETE conflicts surface as `WriteConflict` at every isolation
-  level (tracked gap, §12).
-- **The `on_read()`/`on_write()` seam (D11)** exists in every scan and
-  lookup path (`concurrency_hooks.rs`), all no-ops — so a future
-  SERIALIZABLE/SSI is an *addition* (read-set tracking behind the seam),
-  not an executor rewrite.
+- **READ COMMITTED** (default), **REPEATABLE READ** (= snapshot isolation),
+  and **SERIALIZABLE** (P1.d). RC vs RR differ *only* in snapshot lifetime
+  (per-statement vs per-transaction); SERIALIZABLE uses RR's fixed snapshot
+  **plus** SSI rw-antidependency tracking. Same MVCC machinery.
+- **Conflict classification (P1.d, completing D12).** A write-write conflict
+  under RR/SERIALIZABLE now surfaces as `SerializationFailure` (a real
+  serialization anomaly — the caller retries), not a raw `WriteConflict`.
+  Under RC the *committed*-superseder case never reaches the conflict at all:
+  each statement takes a fresh snapshot, so the scan-based executor re-reads
+  the latest committed tip and applies to it (EvalPlanQual is inherent to a
+  re-scanning executor — no spurious abort). The only conflict that can fire
+  at RC is against a *still-active* writer, which a no-wait engine (D12) must
+  reject; blocking-then-EvalPlanQual for that case needs a lock wait queue
+  (Phase 5).
+- **SSI (P1.d — true SERIALIZABLE).** Cahill-style pivot detection: each
+  serializable txn tracks its read and write sets (`txn.rs::SsiState`);
+  `ssi_note_reads`/`ssi_note_write` (fed by `exec_select`/`exec_update`/
+  `exec_delete`) form rw-antidependency edges between concurrent serializable
+  txns; a txn that ends up with both an inbound and an outbound edge (a pivot)
+  is aborted at commit with `SerializationFailure`, so write-skew is
+  prevented. **Reduced form** (as planned): row-granularity (no predicate
+  locks → no phantom protection), statement-granularity tracking at the
+  executor, and a write-skew pair may both abort in some orderings (sound,
+  occasionally over-conservative).
+- **The `on_read()`/`on_write()` seam (D11)** still exists in every heap
+  scan/lookup path (`concurrency_hooks.rs`), kept no-op: P1.d's SSI tracks at
+  the executor (where the txn context lives) rather than threading a tracker
+  through every `heap` method, leaving the seam available for finer-grained
+  (e.g. index-level) tracking later.
 
 ### 4.3 Writes, locks, abort
 
@@ -842,10 +858,13 @@ rebuild per debounce pass (currently moot — CSR isn't consulted, see
 above); `poll_events` full-scan (needs a `seq` index); SSE
 poll-per-subscriber.
 
-Functional gaps (deliberate scope, tracked): RC re-evaluation
-(EvalPlanQual) unimplemented — `WriteConflict` at all isolation levels;
-SSI is a no-op seam; no wait queue/deadlock detection (by design, D12);
-catalog DDL not transactional; SQL grammar gaps (no OR/ORDER
+Functional gaps (deliberate scope, tracked): ~~RC re-evaluation
+(EvalPlanQual) unimplemented~~ and ~~SSI is a no-op seam~~ (**both fixed P1.d**
+— RR/SERIALIZABLE conflicts are now `SerializationFailure`, RC re-reads via its
+fresh snapshot, and SSI pivot detection prevents write-skew; reduced form:
+row-granularity, no phantom protection); no wait queue/deadlock detection (by
+design, D12 — blocking-then-EvalPlanQual for an *active*-writer conflict is
+Phase 5); catalog DDL not transactional; SQL grammar gaps (no OR/ORDER
 BY/LIMIT/aggregates/joins/subqueries/`IN` — parked as Phase 2); no
 full-text SQL operator; single-column indexes only; no cost-based index
 selection; Cypher is single-hop read-only, nodes are opaque i64s; no CSR
@@ -887,8 +906,8 @@ bound). `NEAR`/graph/queue reads remain writer-side for now (additive).
 | D8 | 8 KiB pages, init-time config, immutable after | `format.rs`; baked into control file |
 | D9 | Little-endian, CRC32+LSN per page, magic+version | `format.rs`/`page.rs`/`wal.rs`; `FORMAT_VERSION = 4` (v3→v4 for `WAL_FPI`, P1.a) |
 | D10 | RC default, RR available, same snapshots | `txn.rs` snapshot lifetime |
-| D11 | `on_read`/`on_write` no-op seam for future SSI | `concurrency_hooks.rs`, threaded through all heap paths |
-| D12 | SI abort-on-conflict before RC re-evaluation | `lockmgr.rs` (no wait queue); RC path still pending |
+| D11 | `on_read`/`on_write` seam; SSI is an addition | seam in `concurrency_hooks.rs`; SSI landed at the executor + `txn.rs::SsiState` (P1.d) |
+| D12 | SI abort-on-conflict; RC re-eval; SSI | `lockmgr.rs` (no wait queue); RC re-reads via fresh snapshot + RR/SER `SerializationFailure` + SSI pivot abort (P1.d) |
 | D13 | Structured logging from day one | `tracing` on WAL/checkpoint/recovery; `/metrics` shipped with M5 |
 
 ---
@@ -912,7 +931,10 @@ torn-page protection (§3.3, `FORMAT_VERSION` 3→4, crash point P11) and the
 fsyncgate poison path (§3.3, crash point P12); 14 crash tests total. **P1.c
 scaling foundation shipped** — chunked `alloc_page` growth, a configurable
 buffer pool (4096-frame default), and a real free-space map (§3.4,
-`benches/scale.rs`; no crash point — no new durability mechanism). P1.d–P1.e
-(isolation correctness incl. the still-pending D12 RC re-eval + SSI,
-auto-checkpoint) to follow. See `docs/backlog/phase1_acid_hardening.md` and
+`benches/scale.rs`; no crash point — no new durability mechanism). **P1.d
+isolation correctness shipped** — RC re-evaluation (via fresh-snapshot
+re-scan), RR/SERIALIZABLE write-write conflicts as `SerializationFailure`, and
+true SERIALIZABLE via SSI pivot detection preventing write-skew (§4.2; no crash
+point — an SSI abort is an ordinary rollback). **P1.e (auto-checkpoint) is the
+last remaining checkpoint.** See `docs/backlog/phase1_acid_hardening.md` and
 `PROGRESS.md`'s Phase 1 entry. Update alongside the next checkpoint's closeout.*

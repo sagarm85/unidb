@@ -80,10 +80,10 @@
   workspace's dependency union, which is *not* the right check here).
 - **Current work: Phase 1 — ACID & storage foundation** (the feature-freeze
   gate, `docs/backlog/phase1_acid_hardening.md`), on Core lane branch
-  `acid-hardening`. **P1.a (full-page-writes), P1.b (fsync-failure handling), and
-  P1.c (alloc_page remap + configurable pool + real FSM) are shipped**; P1.d–P1.e
-  (isolation correctness, auto-checkpoint) are next, in that order, one PR each.
-  See the
+  `acid-hardening`. **P1.a (full-page-writes), P1.b (fsync-failure handling),
+  P1.c (alloc_page remap + configurable pool + real FSM), and P1.d (isolation
+  correctness — RC re-eval + SSI) are shipped**; **P1.e (auto-checkpoint) is the
+  last remaining checkpoint**. See the
   Phase 1 section below. The roadmap is now `docs/backlog/roadmap.md` (6-phase
   plan); the older per-milestone backlog docs were retired. A CSR-preferring
   traversal fix (staleness/generation marker design) remains documented tech
@@ -182,8 +182,27 @@ one PR per checkpoint (P1.a → P1.e). **In progress as of 2026-07-08.**
   a later item. **Note: page 0 is now allocatable** (the sentinel is
   `INVALID_PAGE_ID = u32::MAX`, not 0) — a fresh DB starts allocating at id 0
   instead of reserving it; no on-disk/sentinel meaning changed.
-- **P1.d–P1.e — not started.** isolation correctness (RC re-eval + SSI);
-  auto-checkpoint. In that order, one PR each.
+- **P1.d — isolation correctness (RC re-eval + SSI) — SHIPPED (2026-07-08).**
+  (1) Write-write conflicts now classify by isolation: `SerializationFailure`
+  under RR/`Serializable`, left as a no-wait `WriteConflict` under RC (where the
+  fresh per-statement snapshot re-reads the tip anyway — EvalPlanQual is
+  inherent to the scan-based executor; blocking-then-reeval for an *active*
+  writer conflict needs a wait queue, Phase 5). (2) New
+  `IsolationLevel::Serializable` + **SSI** — `SsiState` per serializable txn
+  (read/write sets + in/out rw-conflict flags), `committed_ser` for concurrency,
+  `ssi_note_reads`/`ssi_note_write` (called from `exec_select`/`exec_update`/
+  `exec_delete`) form Cahill-style rw-antidependency edges, and `commit` aborts
+  a **pivot** (in+out) with `SerializationFailure`; `Engine::commit` turns that
+  into a real rollback. Reduced form: row-granularity (no predicate locks → no
+  phantom protection), statement-granularity tracking at the executor (the
+  `on_read`/`on_write` heap seam stays no-op for finer tracking later), and a
+  write-skew pair may both abort in some orderings (sound, occasionally
+  over-conservative). Tests in `lib.rs` (write-skew commits under RR / aborts
+  under Serializable; RC no-spurious-abort; RR conflict→SerializationFailure;
+  lone serializable commits). **No new crash point** (an SSI abort is an
+  ordinary rollback — harness stays 14). No format change. See `PROGRESS.md`'s
+  Phase 1 → P1.d entry.
+- **P1.e — not started.** auto-checkpoint (time + WAL-size triggers). One PR.
 
 ### M10 — heap vacuum / MVCC GC (Core lane, branch `core-vacuum`, 2026-07-08)
 

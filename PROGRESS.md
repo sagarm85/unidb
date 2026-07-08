@@ -1747,3 +1747,79 @@ reclaimed on reopen but not shrunk mid-session (bounded to one chunk).
 **Locked-decision changes:** none. D6 (single file) / D8 (8 KiB pages)
 unchanged; no format change (chunk growth is purely a file-sizing strategy,
 invisible on disk).
+
+### P1.d — isolation correctness (RC re-evaluation + SSI)   [shipped]   2026-07-08
+
+**PR:** #10 — https://github.com/sagarm85/unidb/pull/10 (Core lane, branch `acid-hardening`)
+**Summary:** Closes the isolation Tier-0 hole (D10–D12): conflicts previously
+propagated as raw `WriteConflict` regardless of isolation level, and
+`SERIALIZABLE` was an unimplemented no-op seam (write-skew possible). Now: (1)
+a write-write conflict under `REPEATABLE READ`/`SERIALIZABLE` surfaces as
+`SerializationFailure` (the D12-deferred classification); under `READ
+COMMITTED` the fresh per-statement snapshot re-reads the latest committed
+version (EvalPlanQual via re-scan), so a committed concurrent update no longer
+spuriously aborts; (2) **true `SERIALIZABLE` via SSI** — a new
+`IsolationLevel::Serializable` tracks rw-antidependencies (Cahill-style pivot
+detection) and aborts a transaction that forms a dangerous structure, so
+write-skew is prevented.
+
+**What landed:**
+- `txn.rs`: `IsolationLevel::Serializable` (fixed BEGIN-time snapshot like RR,
+  plus tracking); `SsiState` (per-txn read/write sets + `in_conflict`/
+  `out_conflict` flags) on each serializable `Transaction`; `committed_ser`
+  map (committed serializable txns kept for edge detection while any
+  serializable txn is live). `ssi_note_reads` / `ssi_note_write` form
+  rw-edges between concurrent serializable txns; `ssi_is_pivot`; `isolation()`
+  accessor. `commit` refuses a pivot with `SerializationFailure` and moves a
+  clean commit's sets into `committed_ser`.
+- `sql/executor.rs`: `exec_select` / `exec_update` / `exec_delete` feed their
+  read sets (`ssi_note_reads`) and write sets (`ssi_note_write`) to the tracker;
+  `classify_conflict` maps a heap `WriteConflict` to `SerializationFailure`
+  under RR/Serializable (left as-is under RC — see below).
+- `lib.rs`: `Engine::commit` turns a pivot `SerializationFailure` into a real
+  rollback (undoing the txn's writes) before returning the error, so the caller
+  sees a clean, retryable failure.
+
+**Design notes (single-writer model):**
+- **RC EvalPlanQual is inherent to the scan-based executor**: each RC statement
+  takes a *fresh* snapshot, so an UPDATE/DELETE re-scans and finds the latest
+  committed tip — the committed-superseder conflict never reaches `heap.update`.
+  The only `WriteConflict` that can fire at RC is against a *still-active*
+  concurrent writer, which a no-wait engine (D12) must reject; true
+  blocking-then-EvalPlanQual for that case needs a lock wait queue (Phase 5).
+  So "no spurious abort at RC" holds for the committed-conflicter case.
+- **Reduced SSI** (as the plan allows): row-granularity rw-tracking (no
+  predicate locks), so write-skew on existing rows is caught but phantom
+  anomalies are not (row-level, like Postgres SI without predicate locks would
+  miss). Pivot abort is decided at commit; a write-skew pair can in some
+  orderings both abort (sound — never commits a non-serializable schedule —
+  but occasionally over-conservative). Tracking is done at the executor
+  (statement) granularity where the txn context is available, rather than
+  threading a tracker through every `heap` method — the `on_read`/`on_write`
+  D11 seam stays in place for finer-grained tracking later.
+
+**Crash harness:** unchanged at **14** (P1–P12). P1.d adds no new durability
+mechanism — an SSI/serialization abort is an ordinary transaction rollback
+already covered by the existing abort/undo crash paths (P6/P9) — so, like
+M1–M8, it adds no crash point (the harness grows only when a new durability
+mechanism lands, as it did for P1.a/P1.b).
+
+**Tests** (`lib.rs`): `write_skew_commits_under_rr_but_aborts_under_serializable`
+(the canonical SSI test — commits under RR, aborts under SERIALIZABLE);
+`read_committed_concurrent_update_does_not_spuriously_abort`;
+`repeatable_read_write_over_committed_update_is_serialization_failure`;
+`serializable_non_conflicting_transaction_commits` (no over-abort of the common
+case). 263 unit + 14 crash + server + workspace green.
+
+**Benchmark (no-regression):** SSI tracking is gated to `Serializable`
+transactions — the `ssi` field is `None` for RC/RR and every hook early-returns
+before touching a set, so the default RC path and the raw `Engine::insert`
+path (which don't route through the SSI hooks at all) are unaffected; the
+unchanged `benches/fpi.rs` / `benches/scale.rs` RC numbers stand. For a
+`Serializable` transaction the added cost is O(rows in its read+write set) of
+`HashSet` inserts and, per write, a scan of concurrent serializable txns'
+read sets — paid only by workloads that opt into SERIALIZABLE.
+
+**Locked-decision changes:** none reversed; **D10–D12 completed as originally
+designed** (RC re-evaluation + the SSI addition the `on_read`/`on_write` seam
+was built for). No format change.
