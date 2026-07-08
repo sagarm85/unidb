@@ -120,6 +120,18 @@ pub struct Wal {
     /// thread — which owns the sole `Engine` handle and issues one `sync` per
     /// drained request batch — turns this on.
     deferred_sync: bool,
+    /// Set once an `fsync` has failed (or a fault was injected) — P1.b
+    /// (fsyncgate). A failed `fsync` may leave the OS having dropped the dirty
+    /// data while clearing its dirty bit, so retrying could falsely succeed.
+    /// Once poisoned, every durability call ([`Self::sync`] / the commit
+    /// fsyncs) returns [`DbError::DurabilityFailure`] instead of ever
+    /// reporting success again; the session is unrecoverable and must restart.
+    poisoned: bool,
+    /// Test/fault-injection hook (P1.b): when armed, the next `fsync` fails
+    /// (and poisons the WAL) *without* touching the real file, so a test can
+    /// deterministically prove the engine refuses to report durability on a
+    /// failed flush. Armed via [`Self::arm_fsync_fault`].
+    fsync_fault_armed: bool,
 }
 
 impl Wal {
@@ -138,7 +150,21 @@ impl Wal {
             next_mini_txn: 1,
             durable_lsn: INVALID_LSN,
             deferred_sync: false,
+            poisoned: false,
+            fsync_fault_armed: false,
         })
+    }
+
+    /// Arm a one-shot fsync fault (P1.b fault injection). The next `fsync`
+    /// fails and poisons the WAL, without writing the real file — for tests
+    /// that assert the engine never reports success on a failed flush.
+    pub fn arm_fsync_fault(&mut self) {
+        self.fsync_fault_armed = true;
+    }
+
+    /// Whether the WAL has latched into the poisoned state (an fsync failed).
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
     }
 
     pub fn begin_mini_txn(&mut self) -> Result<(u64, Lsn)> {
@@ -340,8 +366,36 @@ impl Wal {
     }
 
     fn fsync(&mut self) -> Result<()> {
-        self.writer.flush()?;
-        self.writer.get_ref().sync_all()?;
+        // P1.b: once poisoned, never report success again — a prior fsync
+        // failure means we cannot trust the durable frontier.
+        if self.poisoned {
+            return Err(DbError::DurabilityFailure(
+                "WAL is poisoned by an earlier fsync failure; session is unrecoverable".into(),
+            ));
+        }
+        // Fault injection: fail before touching the file, and poison. Crucially
+        // `durable_lsn` is NOT advanced.
+        if self.fsync_fault_armed {
+            self.fsync_fault_armed = false;
+            self.poisoned = true;
+            tracing::error!("WAL fsync fault injected — poisoning session (P1.b)");
+            return Err(DbError::DurabilityFailure(
+                "injected WAL fsync failure".into(),
+            ));
+        }
+        // Real path: on any failure, poison and surface a fatal error *before*
+        // advancing the durable frontier or letting a caller believe the WAL
+        // is durable. The OS may have dropped the buffered write on error.
+        if let Err(e) = self.writer.flush() {
+            self.poisoned = true;
+            return Err(DbError::DurabilityFailure(format!(
+                "WAL buffer flush failed: {e}"
+            )));
+        }
+        if let Err(e) = self.writer.get_ref().sync_all() {
+            self.poisoned = true;
+            return Err(DbError::DurabilityFailure(format!("WAL fsync failed: {e}")));
+        }
         self.durable_lsn = self.next_lsn - 1;
         Ok(())
     }
@@ -495,6 +549,37 @@ mod tests {
         assert_eq!(records[1].rec_type, WAL_BEGIN);
         assert_eq!(records[2].rec_type, WAL_COMMIT);
         assert_eq!(records[3].rec_type, WAL_TXN_COMMIT);
+    }
+
+    /// P1.b: an injected fsync failure poisons the WAL — the commit returns a
+    /// `DurabilityFailure`, the durable frontier does NOT advance, and every
+    /// later durability call keeps failing (never falsely reports success).
+    #[test]
+    fn fsync_failure_poisons_and_never_reports_success() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("test.wal");
+        let mut wal = Wal::open(&p, INVALID_LSN).unwrap();
+        let (txn_id, begin_lsn) = wal.begin_mini_txn().unwrap();
+        let ins_lsn = wal.log_insert(txn_id, begin_lsn, 1, 0, b"x").unwrap();
+        let durable_before = wal.durable_lsn;
+
+        wal.arm_fsync_fault();
+        let res = wal.commit_mini_txn(txn_id, ins_lsn);
+        assert!(
+            matches!(res, Err(DbError::DurabilityFailure(_))),
+            "a failed fsync must surface a fatal DurabilityFailure, got {res:?}"
+        );
+        assert!(
+            wal.is_poisoned(),
+            "WAL must latch poisoned after fsync failure"
+        );
+        assert_eq!(
+            wal.durable_lsn, durable_before,
+            "durable frontier must NOT advance on a failed fsync"
+        );
+
+        // A later durability call must keep failing — no false success.
+        assert!(matches!(wal.sync(), Err(DbError::DurabilityFailure(_))));
     }
 
     #[test]

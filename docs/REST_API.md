@@ -416,6 +416,7 @@ trigger) falls into one grouped 500.
 | 400 | `TXN_ALREADY_FINISHED` | Operation on an already committed/aborted txn |
 | 400 | `BAD_PAGE_SIZE` | Invalid page size at open |
 | 401 | `UNAUTHORIZED` | Missing/malformed/wrong-signature/expired JWT |
+| 503 | `DURABILITY_FAILURE` | An `fsync`/`msync` failed (P1.b, fsyncgate); the engine can no longer guarantee durability and must be restarted (session is poisoned) |
 | 500 | `INTERNAL_ERROR` | I/O, checksum, WAL corruption, control-file corruption, catalog corruption, buffer pool exhaustion, or a dead writer thread (`EngineUnavailable`) |
 
 ---

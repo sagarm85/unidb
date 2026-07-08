@@ -18,6 +18,8 @@
 //   P10 – crash mid-vacuum (M10): WAL_VACUUM durable, page not flushed
 //   P11 – torn 8 KiB page write (P1.a): reopen restores the page from its
 //         full-page image (WAL_FPI) + incremental redo
+//   P12 – fsync/msync failure (P1.b): the WAL and buffer pool refuse to
+//         report durability on a failed flush, and latch poisoned
 
 use tempfile::tempdir;
 use unidb::{Engine, RowId};
@@ -488,6 +490,76 @@ fn p11_torn_page_restored_from_full_page_image() {
         b"r2_committed",
         "P11: the post-checkpoint row must be restored by redo on top of the FPI"
     );
+}
+
+// ── P12: fsync/msync failure refuses to report success (P1.b) ────────────────
+//
+// The fsyncgate hazard: a failed fsync/msync may leave the OS having dropped
+// the dirty data while clearing its dirty bit, so a retry can falsely succeed.
+// The engine must never report durability on a failed flush — it latches into
+// a poisoned state and keeps failing. This test injects a fault at both
+// durability boundaries (the WAL commit fsync and the data-file page flush) and
+// asserts each refuses success, does not advance/clean, and stays poisoned.
+
+#[test]
+fn p12_fsync_failure_refuses_to_report_success() {
+    use unidb::bufferpool::BufferPool;
+    use unidb::error::DbError;
+    use unidb::format::{DEFAULT_PAGE_SIZE, INVALID_LSN};
+    use unidb::heap::Heap;
+    use unidb::page::SlottedPage;
+    use unidb::wal::Wal;
+
+    let dir = tempdir().unwrap();
+    let page_size = DEFAULT_PAGE_SIZE as usize;
+
+    // (a) WAL commit fsync fails → the row's mini-txn commit is fatal, the
+    //     durable frontier does not advance, and the WAL stays poisoned.
+    {
+        let mut pool = BufferPool::open(&dir.path().join("a.db"), page_size, 64).unwrap();
+        let mut wal = Wal::open(&dir.path().join("a.wal"), INVALID_LSN).unwrap();
+        let mut heap = Heap::new(page_size);
+        // First insert commits normally (durable frontier advances).
+        heap.insert(b"durable", 1, &mut pool, &mut wal).unwrap();
+        let durable_before = wal.durable_lsn;
+        // Arm a fault: the *next* fsync (this insert's mini-txn commit) fails.
+        wal.arm_fsync_fault();
+        let res = heap.insert(b"never_durable", 1, &mut pool, &mut wal);
+        assert!(
+            matches!(res, Err(DbError::DurabilityFailure(_))),
+            "P12: a failed WAL fsync must surface a fatal DurabilityFailure, got {res:?}"
+        );
+        assert!(wal.is_poisoned(), "P12: WAL must latch poisoned");
+        assert_eq!(
+            wal.durable_lsn, durable_before,
+            "P12: durable frontier must not advance on a failed fsync"
+        );
+        assert!(
+            matches!(wal.sync(), Err(DbError::DurabilityFailure(_))),
+            "P12: a poisoned WAL must keep failing, never a false success"
+        );
+    }
+
+    // (b) Data-file msync fails → the page flush is fatal, the frame stays
+    //     dirty (not claimed durable), and the pool stays poisoned.
+    {
+        let mut pool = BufferPool::open(&dir.path().join("b.db"), page_size, 64).unwrap();
+        let pid = pool.alloc_page().unwrap();
+        let mut page = SlottedPage::new(pid, unidb::format::PAGE_TYPE_HEAP, page_size);
+        page.set_lsn(3);
+        pool.write_page(&page).unwrap();
+        pool.arm_flush_fault();
+        let res = pool.flush_page(pid, 3);
+        assert!(
+            matches!(res, Err(DbError::DurabilityFailure(_))),
+            "P12: a failed data-file flush must surface a fatal DurabilityFailure, got {res:?}"
+        );
+        assert!(pool.is_flush_poisoned(), "P12: pool must latch poisoned");
+        assert!(
+            matches!(pool.flush_all(3), Err(DbError::DurabilityFailure(_))),
+            "P12: a poisoned pool must keep failing, never a false success"
+        );
+    }
 }
 
 // ── M4.d: two-table crash (no new P-number) ──────────────────────────────────

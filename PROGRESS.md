@@ -1617,3 +1617,58 @@ not referenced by any committed heap, so a torn copy causes no committed-data
 loss. Closing the fresh-page/catalog case (torn-tolerant reconstruction) is
 tracked for a later Phase-1/Phase-3 pass; it is out of P1.a's declared file
 scope (`wal`/`bufferpool`/`recovery`/`checkpoint`).
+
+### P1.b — fsync-failure handling (fsyncgate) + ordering   [shipped]   2026-07-08
+
+**PR:** #7 — https://github.com/sagarm85/unidb/pull/7 (Core lane, branch `acid-hardening`)
+**Summary:** Closes the fsyncgate hazard (roadmap Tier 0). A failed
+`fsync`/`msync` may leave the OS having dropped the dirty data while clearing
+its dirty bit, so a naive retry can return success without the data ever
+reaching disk. The WAL and the buffer pool now treat a durability-primitive
+failure as **fatal for the session**: they latch into a poisoned state and
+return the new `DbError::DurabilityFailure` for every subsequent durability
+request, never falsely reporting durable. On failure the durable frontier is
+**not** advanced (`Wal`) and the frame is **not** marked clean (`BufferPool`) —
+so recovery still sees a consistent prefix.
+
+**What landed:**
+- `error.rs`: `DurabilityFailure(String)` — fatal, session-poisoning.
+- `wal.rs`: `Wal::fsync` poisons on `writer.flush()`/`sync_all()` failure and
+  refuses to advance `durable_lsn`; once poisoned, every fsync/`sync` fails.
+  `arm_fsync_fault()` / `is_poisoned()` for deterministic fault injection.
+- `bufferpool.rs`: `flush_page` poisons on `msync` failure and does **not**
+  mark the frame clean; `flush_all` fails up-front when poisoned (so a poisoned
+  pool never claims a successful flush even with no dirty frames).
+  `arm_flush_fault()` / `is_flush_poisoned()`.
+- `bufferpool.rs`: **D5 re-verified end-to-end** — the existing flush-time D5
+  check is kept, and a `debug_assert!` tripwire was added at the eviction steal
+  point in `find_victim` so a future change to the victim filter can't silently
+  flush a page ahead of the durable WAL.
+- `mmap.rs`: `flush_range` doc now states the fatal-failure contract its caller
+  enforces.
+
+**Crash harness (grew, per the gate):** new **P12** —
+`p12_fsync_failure_refuses_to_report_success`. Injects a fault at *both*
+durability boundaries: (a) a WAL commit fsync fails → the insert returns
+`DurabilityFailure`, `durable_lsn` does not advance, and the WAL stays poisoned;
+(b) a data-file page flush fails → the flush returns `DurabilityFailure`, the
+frame stays dirty, and the pool stays poisoned. Full P-series (P1–P12) +
+property test green: `cargo test -p unidb --test crash` = **14 tests**.
+
+**Benchmark (no-regression):** the added work on the happy path is a single
+`bool` check per fsync and per `flush_page`. Insert throughput through the now
+poison-checked path is unchanged vs. P1.a (`benches/fpi.rs`, release):
+
+| rows | payload | ins/s (P1.a) | ins/s (P1.b) |
+|------|---------|--------------|--------------|
+| 2000 | 8 B     | 162          | 160          |
+| 2000 | 64 B    | 160          | 159          |
+| 2000 | 256 B   | 154          | 152          |
+| 2000 | 1024 B  | 137          | 137          |
+
+(within run-to-run noise; the write path remains fsync-bound — the poison check
+is not on any measurable hot path). Peak memory unchanged (two `bool` fields).
+
+**Locked-decision changes:** none reversed; **D5 strengthened** (fsync-failure
+path hardens the WAL-before-page discipline; new steal-point debug assertion).
+No format change (`FORMAT_VERSION` unchanged — no on-disk layout touched).
