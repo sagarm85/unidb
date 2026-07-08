@@ -303,16 +303,16 @@ fn p9_crash_mid_undo_still_converges_to_fully_undone() {
     // Both rows must be permanently invisible: r2 because it was already
     // undone before the crash, r1 because recovery's own undo pass must
     // finish what runtime abort started.
-    let mut pool =
+    let pool =
         unidb::bufferpool::BufferPool::open(&data_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
     let heap = Heap::new(DEFAULT_PAGE_SIZE as usize);
     let snap = Snapshot::new(100, 100, vec![]);
     assert!(
-        heap.get(r1, &snap, 100, &mut pool).is_err(),
+        heap.get(r1, &snap, 100, &pool).is_err(),
         "P9: row untouched before the crash must still be undone by recovery"
     );
     assert!(
-        heap.get(r2, &snap, 100, &mut pool).is_err(),
+        heap.get(r2, &snap, 100, &pool).is_err(),
         "P9: row already undone before the crash must remain undone (idempotent)"
     );
 }

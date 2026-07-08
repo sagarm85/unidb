@@ -15,6 +15,7 @@
 // (mvcc::is_visible) — only snapshot lifetime differs.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::{
     bufferpool::BufferPool,
@@ -64,11 +65,64 @@ pub struct Transaction {
     pub undo_log: Vec<UndoAction>,
 }
 
-pub struct TransactionManager {
+/// The snapshot-relevant transaction state, shared between the writer's
+/// `TransactionManager` and concurrent readers' `ReadHandle` (6b) behind an
+/// `Arc<Mutex<..>>`. The writer is the only mutator; readers lock briefly to
+/// build an MVCC snapshot for a statement. `undo_log` lives here too but is
+/// only ever touched on the (single-threaded) write path.
+pub struct TxnInner {
     next_xid: Xid,
     active: HashMap<Xid, Transaction>,
     committed: HashSet<Xid>,
     aborted: HashSet<Xid>,
+}
+
+impl TxnInner {
+    fn compute_snapshot(&self) -> Snapshot {
+        let active_xids: Vec<Xid> = self.active.keys().copied().collect();
+        let xmin = active_xids.iter().copied().min().unwrap_or(self.next_xid);
+        Snapshot::new(xmin, self.next_xid, active_xids)
+    }
+
+    /// The snapshot a statement inside `xid` should read under: fresh for
+    /// READ COMMITTED, the fixed BEGIN-time snapshot for REPEATABLE READ/SI.
+    fn snapshot_for_statement(&mut self, xid: Xid) -> Result<Snapshot> {
+        let isolation = self
+            .active
+            .get(&xid)
+            .ok_or(DbError::TxnNotActive { xid })?
+            .isolation;
+        if isolation == IsolationLevel::ReadCommitted {
+            let fresh = self.compute_snapshot();
+            if let Some(txn) = self.active.get_mut(&xid) {
+                txn.snapshot = fresh.clone();
+            }
+            Ok(fresh)
+        } else {
+            Ok(self.active[&xid].snapshot.clone())
+        }
+    }
+}
+
+/// Shared handle to [`TxnInner`], cloneable and `Send + Sync` — a `ReadHandle`
+/// holds one to compute snapshots off the writer thread.
+pub type SharedTxn = Arc<Mutex<TxnInner>>;
+
+/// Compute a statement snapshot for `xid` from shared txn state. Used by the
+/// concurrent read path (`ReadHandle`); the writer uses
+/// [`TransactionManager::snapshot_for_statement`], which delegates here.
+pub fn snapshot_for_statement(shared: &SharedTxn, xid: Xid) -> Result<Snapshot> {
+    lock_txn(shared).snapshot_for_statement(xid)
+}
+
+fn lock_txn(shared: &SharedTxn) -> MutexGuard<'_, TxnInner> {
+    // Recover from a poisoned lock rather than panicking (a poisoned txn map
+    // means a prior panic-while-locked; proceed with the state as-is).
+    shared.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub struct TransactionManager {
+    inner: SharedTxn,
 }
 
 impl Default for TransactionManager {
@@ -84,11 +138,23 @@ impl TransactionManager {
 
     pub fn with_next_xid(next_xid: Xid) -> Self {
         Self {
-            next_xid,
-            active: HashMap::new(),
-            committed: HashSet::new(),
-            aborted: HashSet::new(),
+            inner: Arc::new(Mutex::new(TxnInner {
+                next_xid,
+                active: HashMap::new(),
+                committed: HashSet::new(),
+                aborted: HashSet::new(),
+            })),
         }
+    }
+
+    /// A cloneable shared handle to the snapshot-relevant txn state, for the
+    /// concurrent read path (6b).
+    pub fn shared(&self) -> SharedTxn {
+        Arc::clone(&self.inner)
+    }
+
+    fn lock(&self) -> MutexGuard<'_, TxnInner> {
+        lock_txn(&self.inner)
     }
 
     /// The next xid that will be issued by [`Self::begin`]. Persisted into
@@ -96,7 +162,7 @@ impl TransactionManager {
     /// `Engine::open` can resume correctly even after the WAL has been
     /// truncated and no longer has any `WAL_TXN_BEGIN` record to scan.
     pub fn next_xid(&self) -> Xid {
-        self.next_xid
+        self.lock().next_xid
     }
 
     /// Determine the xid counter to resume from after a crash: one past the
@@ -112,18 +178,13 @@ impl TransactionManager {
             .unwrap_or(1)
     }
 
-    fn compute_snapshot(&self) -> Snapshot {
-        let active_xids: Vec<Xid> = self.active.keys().copied().collect();
-        let xmin = active_xids.iter().copied().min().unwrap_or(self.next_xid);
-        Snapshot::new(xmin, self.next_xid, active_xids)
-    }
-
-    pub fn begin(&mut self, isolation: IsolationLevel, wal: &mut Wal) -> Result<Xid> {
-        let xid = self.next_xid;
-        self.next_xid += 1;
+    pub fn begin(&self, isolation: IsolationLevel, wal: &mut Wal) -> Result<Xid> {
+        let mut inner = self.lock();
+        let xid = inner.next_xid;
+        inner.next_xid += 1;
         let begin_lsn = wal.begin_user_txn(xid)?;
-        let snapshot = self.compute_snapshot();
-        self.active.insert(
+        let snapshot = inner.compute_snapshot();
+        inner.active.insert(
             xid,
             Transaction {
                 xid,
@@ -141,27 +202,15 @@ impl TransactionManager {
 
     /// The snapshot a statement inside `xid` should read under: fresh for
     /// READ COMMITTED, the fixed BEGIN-time snapshot for REPEATABLE READ/SI.
-    pub fn snapshot_for_statement(&mut self, xid: Xid) -> Result<Snapshot> {
-        let isolation = self
-            .active
-            .get(&xid)
-            .ok_or(DbError::TxnNotActive { xid })?
-            .isolation;
-        if isolation == IsolationLevel::ReadCommitted {
-            let fresh = self.compute_snapshot();
-            if let Some(txn) = self.active.get_mut(&xid) {
-                txn.snapshot = fresh.clone();
-            }
-            Ok(fresh)
-        } else {
-            Ok(self.active[&xid].snapshot.clone())
-        }
+    pub fn snapshot_for_statement(&self, xid: Xid) -> Result<Snapshot> {
+        self.lock().snapshot_for_statement(xid)
     }
 
     /// Record a mutation for possible later rollback. Called by the Engine
     /// layer after each successful `Heap` insert/update/delete.
-    pub fn record_undo(&mut self, xid: Xid, action: UndoAction) -> Result<()> {
-        self.active
+    pub fn record_undo(&self, xid: Xid, action: UndoAction) -> Result<()> {
+        self.lock()
+            .active
             .get_mut(&xid)
             .ok_or(DbError::TxnNotActive { xid })?
             .undo_log
@@ -177,8 +226,9 @@ impl TransactionManager {
     /// write and this commit — the conflict, if any, was already caught
     /// immediately at `Heap::update`/`delete` time via `try_acquire_write`.
     /// This is stronger than needing a distinct commit-time check.
-    pub fn commit(&mut self, xid: Xid, wal: &mut Wal, lock_mgr: &mut LockManager) -> Result<()> {
+    pub fn commit(&self, xid: Xid, wal: &mut Wal, lock_mgr: &mut LockManager) -> Result<()> {
         let txn = self
+            .lock()
             .active
             .remove(&xid)
             .ok_or(DbError::TxnNotActive { xid })?;
@@ -193,7 +243,7 @@ impl TransactionManager {
         if !txn.undo_log.is_empty() {
             wal.commit_user_txn(xid, txn.last_lsn)?;
         }
-        self.committed.insert(xid);
+        self.lock().committed.insert(xid);
         lock_mgr.release_all(xid);
         tracing::info!(xid, "transaction commit");
         Ok(())
@@ -207,7 +257,7 @@ impl TransactionManager {
     /// left untouched would look committed to any snapshot taken after the
     /// abort. See MEMORY.md's design note for the full reasoning.
     pub fn abort(
-        &mut self,
+        &self,
         xid: Xid,
         pool: &mut BufferPool,
         heap: &mut Heap,
@@ -215,6 +265,7 @@ impl TransactionManager {
         lock_mgr: &mut LockManager,
     ) -> Result<()> {
         let txn = self
+            .lock()
             .active
             .remove(&xid)
             .ok_or(DbError::TxnNotActive { xid })?;
@@ -229,22 +280,22 @@ impl TransactionManager {
             }
         }
         wal.abort_user_txn(xid, txn.last_lsn)?;
-        self.aborted.insert(xid);
+        self.lock().aborted.insert(xid);
         lock_mgr.release_all(xid);
         tracing::info!(xid, "transaction abort");
         Ok(())
     }
 
     pub fn is_active(&self, xid: Xid) -> bool {
-        self.active.contains_key(&xid)
+        self.lock().active.contains_key(&xid)
     }
 
     pub fn is_committed(&self, xid: Xid) -> bool {
-        self.committed.contains(&xid)
+        self.lock().committed.contains(&xid)
     }
 
     pub fn is_aborted(&self, xid: Xid) -> bool {
-        self.aborted.contains(&xid)
+        self.lock().aborted.contains(&xid)
     }
 }
 
@@ -265,7 +316,7 @@ mod tests {
     fn begin_assigns_increasing_xids() {
         let dir = tempdir().unwrap();
         let (_pool, _heap, mut wal) = setup(dir.path());
-        let mut mgr = TransactionManager::new();
+        let mgr = TransactionManager::new();
         let a = mgr.begin(IsolationLevel::ReadCommitted, &mut wal).unwrap();
         let b = mgr.begin(IsolationLevel::ReadCommitted, &mut wal).unwrap();
         assert!(b > a);
@@ -275,7 +326,7 @@ mod tests {
     fn read_committed_recomputes_snapshot_each_statement() {
         let dir = tempdir().unwrap();
         let (_pool, _heap, mut wal) = setup(dir.path());
-        let mut mgr = TransactionManager::new();
+        let mgr = TransactionManager::new();
         let a = mgr.begin(IsolationLevel::ReadCommitted, &mut wal).unwrap();
         let snap1 = mgr.snapshot_for_statement(a).unwrap();
         let b = mgr.begin(IsolationLevel::ReadCommitted, &mut wal).unwrap();
@@ -289,7 +340,7 @@ mod tests {
     fn repeatable_read_keeps_fixed_snapshot() {
         let dir = tempdir().unwrap();
         let (_pool, _heap, mut wal) = setup(dir.path());
-        let mut mgr = TransactionManager::new();
+        let mgr = TransactionManager::new();
         let a = mgr.begin(IsolationLevel::RepeatableRead, &mut wal).unwrap();
         let snap1 = mgr.snapshot_for_statement(a).unwrap();
         mgr.begin(IsolationLevel::ReadCommitted, &mut wal).unwrap();
@@ -301,7 +352,7 @@ mod tests {
     fn commit_marks_committed_and_removes_from_active() {
         let dir = tempdir().unwrap();
         let (_pool, _heap, mut wal) = setup(dir.path());
-        let mut mgr = TransactionManager::new();
+        let mgr = TransactionManager::new();
         let mut lock_mgr = LockManager::new();
         let a = mgr.begin(IsolationLevel::ReadCommitted, &mut wal).unwrap();
         mgr.commit(a, &mut wal, &mut lock_mgr).unwrap();
@@ -313,7 +364,7 @@ mod tests {
     fn abort_undoes_insert_and_marks_aborted() {
         let dir = tempdir().unwrap();
         let (mut pool, mut heap, mut wal) = setup(dir.path());
-        let mut mgr = TransactionManager::new();
+        let mgr = TransactionManager::new();
         let mut lock_mgr = LockManager::new();
         let a = mgr.begin(IsolationLevel::ReadCommitted, &mut wal).unwrap();
         let rid = heap.insert(b"oops", a, &mut pool, &mut wal).unwrap();
@@ -332,7 +383,7 @@ mod tests {
         // A fresh snapshot after the abort must never see the row.
         let snap_after = Snapshot::new(a + 1, a + 1, vec![]);
         assert!(matches!(
-            heap.get(rid, &snap_after, a + 1, &mut pool),
+            heap.get(rid, &snap_after, a + 1, &pool),
             Err(DbError::NoVisibleVersion { .. })
         ));
     }
@@ -341,7 +392,7 @@ mod tests {
     fn double_commit_is_an_error() {
         let dir = tempdir().unwrap();
         let (_pool, _heap, mut wal) = setup(dir.path());
-        let mut mgr = TransactionManager::new();
+        let mgr = TransactionManager::new();
         let mut lock_mgr = LockManager::new();
         let a = mgr.begin(IsolationLevel::ReadCommitted, &mut wal).unwrap();
         mgr.commit(a, &mut wal, &mut lock_mgr).unwrap();

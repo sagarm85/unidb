@@ -1315,7 +1315,7 @@ mod tests {
         let table_def = catalog.lookup("t").unwrap();
         let heap = Heap::from_pages(DEFAULT_PAGE_SIZE as usize, table_def.pages.clone());
         let snap = crate::mvcc::Snapshot::new(1000, 1000, vec![]);
-        let rows = heap.scan(&snap, 1000, &mut pool).unwrap();
+        let rows = heap.scan(&snap, 1000, &pool).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(
             decode_row(&rows[0].1, &table_def.columns).unwrap(),
