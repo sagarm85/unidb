@@ -37,6 +37,7 @@
 | M10 | Heap vacuum / MVCC GC (`Engine::vacuum()`) |
 | M11 | SQL constraints (PK / FK / UNIQUE / NOT NULL / CHECK / DEFAULT) |
 | **Phase 1** | **ACID hardening (complete):** full-page-writes (torn-page) · fsync-failure handling · `alloc_page` chunked growth + configurable pool + real FSM · isolation correctness (RC re-eval + SSI) · auto-checkpoint |
+| **Phase 2** | **Real data model (complete):** DECIMAL/TIMESTAMP/FLOAT/UUID/BYTEA/DATE/TIME · ALTER/DROP/TRUNCATE + request-level DDL rollback · SERIAL · prepared statements + `$n` bind params |
 
 The core is architecturally correct — it is not a toy. But it is the **small
 version**; §3 is the honest gap to production.
