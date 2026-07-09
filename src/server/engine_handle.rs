@@ -53,9 +53,10 @@ impl EngineHandle {
     /// immediately), enable group-commit deferral, and share it via `Arc`.
     pub fn spawn(dir: &Path, page_size: u32) -> Result<Self> {
         let engine = Engine::open(dir, page_size)?;
-        // Group commit (P5.e-3): defer per-statement fsyncs; `Engine::commit`
-        // forces durability via the coalescing `Wal::sync_up_to` barrier.
-        engine.set_deferred_sync(true);
+        // Group-committed force-log-at-commit is now the engine default (C1):
+        // `Engine::open` defers per-statement fsyncs and `Engine::commit` forces
+        // durability via the coalescing `Wal::sync_up_to` barrier. No explicit
+        // `set_deferred_sync` call is needed here anymore.
         let read = engine.read_handle();
         Ok(Self {
             engine: Some(Arc::new(engine)),

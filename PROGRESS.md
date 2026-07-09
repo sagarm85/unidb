@@ -2704,3 +2704,59 @@ timestamps); RLS-over-SQL (`CREATE POLICY`); encryption-at-rest (D9-gated);
 automatic failover coordinator (manual promotion in v1); S3 archiving.
 
 **Phase 6 is COMPLETE — the roadmap's 6-phase plan is fully delivered.**
+
+---
+
+## Commit-time WAL fsync — group-committed force-log-at-commit as default   [LANDING]   2026-07-09
+
+**PR:** _pending_
+**Spec:** `docs/backlog/commit_time_fsync.md` (checkpoints C1–C5).
+**Summary:** Flips the durability default from per-statement fsync to
+**group-committed force-log-at-commit**: statement mini-txns issued inside an
+open user transaction append their WAL records without a per-statement fsync,
+and `Engine::commit`'s `sync_up_to(commit_lsn)` is the single durable point —
+one group-coalesced fsync per transaction. This is ARIES' force-log-at-commit
+(fulfilling **D1**); **D2** (mini-txn bracketing) and **D5** (WAL-before-page)
+are untouched — no §3 decision is reversed.
+
+### Human sign-off (durability timing change)
+
+Per the spec's C5 and CLAUDE.md §0.5/§6 evidence ethos (which applies to
+durability semantics even though no locked decision flips), the user
+**explicitly authorized making group-committed force-log-at-commit the default
+on 2026-07-09.** Durability *timing* changes (per-statement → per-transaction);
+the durability *guarantee* is unchanged: no commit is acknowledged until its
+commit record is fsync'd. D1 is fulfilled (its ARIES durability point *is*
+force-log-at-commit); D2 and D5 are unchanged. `synchronous_commit=off`-style
+ack-before-flush (a genuine D violation) is explicitly **out of scope** — never
+the default, at most a separate documented opt-in later.
+
+### C1 — durability-claim audit (every `commit_mini_txn` site)
+
+Under the new default the WAL runs deferred; a mini-txn's records are made
+durable either by the enclosing user transaction's commit `sync_up_to`, or by
+the operation issuing its own explicit sync. Each site classified:
+
+| Site | Path | Durable via |
+|------|------|-------------|
+| heap insert/update/delete (`heap.rs`) | `Engine::insert/update/delete` under an `xid` | **covered-by-commit** — `Engine::commit` → `sync_up_to(commit_lsn)` |
+| durable B-Tree / full-text index maint. (`btree_index.rs`) | `apply_durable_index_writes` during INSERT/UPDATE / `CREATE INDEX` backfill (both under `xid`) | **covered-by-commit** (or by the standalone entry point's self-sync, below) |
+| durable vector (IVF) index maint. (`disk_vector.rs`) | same as above | **covered-by-commit** |
+| catalog persist (`catalog.rs`) | DDL under `execute_sql(xid)` | **covered-by-commit** (request-level catalog snapshot/restore handles rollback) |
+| large-object chunk rows (`large_object.rs`) | `Engine::put_large_object(xid, …)` under `xid` | **covered-by-commit** |
+| open-time system setup (`ensure_edges_table`/`ensure_edge_index`/`ensure_lobs_table`/`derive_*`) | `Engine::open`, **before** the deferred flag is set | **self-syncing** — runs while the WAL is still per-statement, so each mini-txn fsyncs during open |
+| checkpoint (`checkpoint.rs`) | `Engine::checkpoint` (standalone, no `xid`) | **self-syncing** — added `wal.sync()` at entry (before `flush_all`, so D5 lets every dirty page reach disk) + `log_checkpoint` already fsyncs |
+| vacuum (`lib.rs::vacuum_inner`) | `Engine::vacuum` (standalone, no `xid`) | **self-syncing** — added `sync_wal()` before return |
+| `set_column_index` / `enable_events` (`lib.rs`) | standalone DDL-like (no `xid`) | **self-syncing** — added `sync_wal()` before return |
+| replication slots (`slots.json`) | `create/advance/drop_replication_slot` | **self-syncing** — atomic write-tmp + rename (independent of the WAL fsync flag) |
+| backup / PITR (`base_backup`) | `Engine::base_backup` | **self-syncing** — calls `checkpoint()` (which now self-syncs) then copies files |
+
+**What changed (C1):** `Engine::open` sets `wal.set_deferred_sync(true)` after
+open-time setup; `set_deferred_sync` is now `#[doc(hidden)]` (the per-statement
+policy survives only so the crash harness can exercise both). `checkpoint::run`,
+`vacuum_inner`, `set_column_index`, and `enable_events` self-sync. The server
+handle no longer needs its explicit `set_deferred_sync(true)`.
+
+**Locked-decision changes:** none reversed. **D1 fulfilled** (force-log-at-commit
+is its ARIES durability point); D2 and D5 unchanged. Human sign-off recorded
+above (2026-07-09).

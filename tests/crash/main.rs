@@ -226,6 +226,13 @@ fn p6_incomplete_user_txn_leaves_no_trace() {
     let dir = tempdir().unwrap();
     let (r1, r2) = {
         let engine = open(dir.path());
+        // This point exercises the **per-statement** durability policy (the
+        // non-default legacy mode kept for the harness): each insert's mini-txn
+        // fsyncs immediately, so its pages are WAL-durable and `flush()` may
+        // write them to the data file — yet the user transaction never commits.
+        // The commit-time-fsync default's equivalent (statements unsynced) is
+        // proven separately by `pa_deferred_mid_txn_unsynced_leaves_no_trace`.
+        engine.set_deferred_sync(false);
         let xid = engine.begin().unwrap();
         let r1 = engine.insert(xid, b"p6_row1").unwrap();
         let r2 = engine.insert(xid, b"p6_row2").unwrap();
@@ -603,6 +610,11 @@ fn incomplete_user_txn_leaves_no_trace_across_two_tables() {
     let dir = tempdir().unwrap();
     {
         let engine = open(dir.path());
+        // Per-statement policy (see `p6_...`): mini-txns fsync immediately so
+        // `flush()` can push their pages to disk while the user txn stays
+        // incomplete. The commit-time-fsync default's equivalent is proven by
+        // `pa_deferred_mid_txn_unsynced_leaves_no_trace`.
+        engine.set_deferred_sync(false);
         let xid = engine.begin().unwrap();
         engine.execute_sql(xid, "CREATE TABLE t (id INT)").unwrap();
         engine.commit(xid).unwrap();

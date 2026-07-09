@@ -589,9 +589,12 @@ impl Wal {
         Ok(lsn)
     }
 
-    /// Enable/disable group-commit deferral (M9). When turning it **off**,
-    /// callers should normally call [`Self::sync`] first to make anything
-    /// appended-but-unsynced durable.
+    /// Enable/disable group-commit deferral. In deferred mode (the engine
+    /// default since C1 — commit-time fsync) statement mini-txn commit/abort
+    /// records are appended without a per-call fsync; durability is forced by a
+    /// later [`Self::sync`] / [`Self::sync_up_to`] (the transaction's commit
+    /// point). When turning it **off**, callers should normally call
+    /// [`Self::sync`] first to make anything appended-but-unsynced durable.
     pub fn set_deferred_sync(&self, deferred: bool) {
         self.lock().deferred_sync = deferred;
     }

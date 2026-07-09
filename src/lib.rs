@@ -529,6 +529,23 @@ impl Engine {
         // index as an on-disk IVF-Flat (P3.c). `Engine::open` does ZERO index
         // rebuilding: it reads each index straight from its stable meta page.
         // This is the O(1)-open moat; the async rebuild worker is retired.
+        //
+        // Commit-time fsync (C1): make **group-committed force-log-at-commit**
+        // the default. Statement mini-txns issued inside an open user
+        // transaction append their WAL records without a per-statement fsync;
+        // `Engine::commit`'s `sync_up_to(commit_lsn)` is the single durable
+        // point (one fsync per transaction — group-coalesced across concurrent
+        // committers). This is ARIES' force-log-at-commit, fulfilling D1; D2
+        // (mini-txn bracketing) and D5 (WAL-before-page) are unchanged — D5 now
+        // holds under deferral via the buffer pool's eviction-forced sync (C2).
+        // The open-time system-table setup above ran while the WAL was still in
+        // per-statement mode, so those meta pages are already durable; the flip
+        // affects only post-open user activity. Standalone operations that claim
+        // durability without a following commit (checkpoint, vacuum) issue their
+        // own sync — see the C1 durability-claim audit in PROGRESS.md. The
+        // per-statement policy survives only as an internal flag
+        // (`set_deferred_sync(false)`) so the crash harness can exercise both.
+        wal.set_deferred_sync(true);
         tracing::info!(dir = %dir.display(), page_size = page_size_usize, next_xid, "engine opened");
         Ok(Self {
             control,
@@ -975,7 +992,12 @@ impl Engine {
             control: &self.control,
             page_size,
         };
-        cat_write(&self.catalog).set_column_index(table, column, kind, &mut ctx)
+        cat_write(&self.catalog).set_column_index(table, column, kind, &mut ctx)?;
+        // C1 durability-claim audit: this is a **standalone** DDL-like operation
+        // (no `xid`, no enclosing user commit to cover it), so it self-syncs its
+        // catalog + index-backfill mini-txns before returning — preserving the
+        // per-call durability contract it had before the commit-time-fsync flip.
+        self.sync_wal()
     }
 
     /// Build status of a secondary index, or `None` if the column has no index.
@@ -1014,7 +1036,11 @@ impl Engine {
             control: &self.control,
             page_size,
         };
-        cat_write(&self.catalog).set_events_enabled(table, true, &mut ctx)
+        cat_write(&self.catalog).set_events_enabled(table, true, &mut ctx)?;
+        // C1 durability-claim audit: standalone catalog mutation (no `xid`),
+        // so it self-syncs before returning — same rationale as
+        // `set_column_index` and the checkpoint/vacuum sites.
+        self.sync_wal()
     }
 
     /// Fetch up to `limit` events with `seq` greater than `consumer`'s
@@ -1601,15 +1627,19 @@ impl Engine {
         )
     }
 
-    /// Enable/disable WAL group-commit deferral (M9). When enabled, per-
-    /// statement and per-commit fsyncs are skipped; the caller becomes
-    /// responsible for calling [`Self::sync_wal`] to force durability before
-    /// acknowledging any commit to a client. This is intended for a single
-    /// owner of the `Engine` that serializes all access (the server writer
-    /// thread) — see `server::engine_handle`. Off by default. See
-    /// [`crate::wal::Wal::set_deferred_sync`] for the durability contract and
-    /// the current buffer-pool caveat (a working set exceeding the pool while
-    /// in deferred mode is not yet supported — tracked for M9 hardening).
+    /// Toggle statement-level WAL fsync deferral. **`true` is now the default**
+    /// (set by [`Self::open`]): group-committed force-log-at-commit, where
+    /// statement mini-txns append without a per-statement fsync and
+    /// [`Self::commit`] forces the transaction's commit record durable via the
+    /// coalescing `Wal::sync_up_to` barrier — one fsync per transaction (C1).
+    ///
+    /// Passing `false` restores the legacy **per-statement** durability policy
+    /// (every mini-txn fsyncs immediately). This is **not a user knob** — it
+    /// exists so the crash-injection harness can exercise both policies; the
+    /// buffer pool's eviction-forced sync (C2) makes the deferred default safe
+    /// for working sets larger than the pool, so there is no longer a reason
+    /// for a caller to opt out. `#[doc(hidden)]` for that reason.
+    #[doc(hidden)]
     pub fn set_deferred_sync(&self, deferred: bool) {
         self.wal.set_deferred_sync(deferred);
     }
@@ -1988,6 +2018,16 @@ impl Engine {
             report.versions_reclaimed += raw_reclaimable.len();
             report.slots_freed += raw_reclaimable.len();
         }
+
+        // C1 durability-claim audit — vacuum is a **standalone** operation (no
+        // enclosing user transaction whose commit `sync_up_to` would cover it),
+        // so it self-syncs: force its `WAL_VACUUM` records durable before
+        // returning so a caller that observes reclaimed space also observes it
+        // durably. Crash-safety does not depend on this (the vacuum records are
+        // idempotent redo-only, and D5 keeps any flushed page behind the durable
+        // frontier), but the durability *claim* on return does. Cheap when
+        // nothing was reclaimed (the WAL is already at its frontier).
+        self.sync_wal()?;
 
         tracing::info!(
             horizon,

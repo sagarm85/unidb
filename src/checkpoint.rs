@@ -33,6 +33,17 @@ pub fn run(
 ) -> Result<()> {
     tracing::info!("checkpoint started");
 
+    // 0. C1 durability-claim audit — checkpoint is a **standalone** operation
+    //    (no enclosing user transaction whose commit `sync_up_to` would cover
+    //    it), so it self-syncs. Under the commit-time-fsync default, statement
+    //    mini-txns may have appended WAL records that are not yet durable; force
+    //    them durable before `flush_all` so (a) D5 lets every dirty page reach
+    //    disk (page LSN <= durable frontier) and (b) the checkpoint reflects a
+    //    durable log. Syncing appended-but-uncommitted records is harmless —
+    //    recovery undoes any incomplete transaction regardless. Cheap when
+    //    nothing is pending (the WAL is already at its frontier).
+    wal.sync()?;
+
     // 1. Flush all dirty pages. D5 is enforced inside flush_page. (No `control`
     //    lock held here — this fsyncs, and the P5.e invariant forbids holding
     //    the control lock across an fsync.)
