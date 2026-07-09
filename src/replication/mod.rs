@@ -30,8 +30,25 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{DbError, Result},
-    format::Lsn,
+    format::{Lsn, PageId, Xid},
 };
+
+mod replica;
+pub use replica::Replica;
+
+/// The primary control-file state a replica must adopt to interpret the shipped
+/// WAL (P6.c). The catalog *content* rides the WAL (a `WAL_INSERT` on the
+/// catalog page), but its **root pointer** and the transaction counter live in
+/// the control file, which is not part of the WAL stream — so they travel
+/// alongside it. Checkpoint LSN is deliberately *not* shipped: a replica always
+/// replays its full local WAL from the start (materialize-from-clean), so it
+/// keeps `checkpoint_lsn = INVALID`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimaryControl {
+    pub page_size: u32,
+    pub catalog_root: PageId,
+    pub next_xid: Xid,
+}
 
 /// How a slot's consumer is treated for commit durability.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

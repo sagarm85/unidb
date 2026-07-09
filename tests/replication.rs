@@ -7,6 +7,7 @@
 //     a replica needs to catch up.
 
 use std::sync::Mutex;
+use std::time::Duration;
 use tempfile::tempdir;
 use unidb::bufferpool::BufferPool;
 use unidb::control;
@@ -143,4 +144,39 @@ fn registry_min_restart_lsn_is_floor() {
     assert_eq!(reg.min_restart_lsn(), Some(40));
     reg.advance("b", 200).unwrap();
     assert_eq!(reg.min_restart_lsn(), Some(100));
+}
+
+// P6.c synchronous-replica option: a commit-wait blocks until every sync slot
+// has confirmed the target LSN, times out otherwise, and is a no-op with no
+// sync slots.
+#[test]
+fn sync_replica_wait_gates_on_slot_advance() {
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
+    engine
+        .create_replication_slot("sync1", SlotKind::Sync)
+        .unwrap();
+    let target = engine.wal_current_lsn() + 100;
+
+    // The sync slot is behind the target → wait returns false after the timeout.
+    let t0 = std::time::Instant::now();
+    assert!(!engine
+        .wait_for_sync_replicas(target, Duration::from_millis(40))
+        .unwrap());
+    assert!(
+        t0.elapsed() >= Duration::from_millis(30),
+        "must actually wait"
+    );
+
+    // Confirm the slot past the target → wait returns true right away.
+    engine.advance_replication_slot("sync1", target).unwrap();
+    assert!(engine
+        .wait_for_sync_replicas(target, Duration::from_millis(40))
+        .unwrap());
+
+    // With no sync slots, a commit never blocks (pure async replication).
+    engine.drop_replication_slot("sync1").unwrap();
+    assert!(engine
+        .wait_for_sync_replicas(target + 10_000, Duration::from_millis(5))
+        .unwrap());
 }

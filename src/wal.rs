@@ -772,6 +772,34 @@ impl Wal {
     pub fn ship_from(&self, from_lsn: Lsn) -> Result<Vec<u8>> {
         Ok(encode_stream(&self.records_from(from_lsn)?))
     }
+
+    /// Write shipped records **verbatim** (preserving each record's original
+    /// LSN) into this WAL, then fsync (P6.c replica apply). Unlike
+    /// [`append_locked`] the LSNs are the primary's, not self-allocated, so the
+    /// replica's WAL mirrors the primary's and recovery replays it identically.
+    /// Records are expected in ascending LSN order (as shipped). Duplicate/old
+    /// records (`lsn < next_lsn`) are still written but harmless — recovery's
+    /// redo is idempotent and LSN-gated. Advances `next_lsn` past the highest.
+    pub fn write_shipped(&self, records: &[WalRecord]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut inner = self.lock();
+        if inner.poisoned {
+            return Err(DbError::DurabilityFailure(
+                "WAL is poisoned by an earlier fsync failure; session is unrecoverable".into(),
+            ));
+        }
+        for r in records {
+            let encoded = encode_record(r);
+            write_framed_locked(&mut inner, &encoded, r.lsn)?;
+            if r.lsn + 1 > inner.next_lsn {
+                inner.next_lsn = r.lsn + 1;
+            }
+        }
+        fsync_locked(&mut inner)?;
+        Ok(())
+    }
 }
 
 /// Frame a list of WAL records into a `[len:u32][record]...` byte stream (the
@@ -880,22 +908,29 @@ fn append_locked(
         undo: undo.to_vec(),
     };
     let encoded = encode_record(&rec);
-    let framed = 4 + encoded.len() as u64;
+    write_framed_locked(inner, &encoded, lsn)?;
+    inner.next_lsn += 1;
+    Ok(lsn)
+}
 
+/// Physically append one already-encoded record to the active segment, rotating
+/// first if it would overflow (`base_lsn` is the LSN of the record being written
+/// — the fresh segment's base). Shared by [`append_locked`] (self-allocated LSN)
+/// and [`Wal::write_shipped`] (verbatim replica apply, P6.c).
+fn write_framed_locked(inner: &mut WalInner, encoded: &[u8], base_lsn: Lsn) -> Result<()> {
+    let framed = 4 + encoded.len() as u64;
     // P6.a: seal + rotate before this record if the active segment already holds
     // at least one record and would overflow. `active_bytes > SEG_HDR` guards
     // against rotating a header-only segment forever when a single record is
     // larger than the whole segment (it then lands whole in its own segment).
     if inner.active_bytes > SEG_HDR && inner.active_bytes + framed > inner.segment_size {
-        rotate_segment(inner, lsn)?;
+        rotate_segment(inner, base_lsn)?;
     }
-
-    inner.next_lsn += 1;
     inner.writer.write_all(&u32_to_le(encoded.len() as u32))?;
-    inner.writer.write_all(&encoded)?;
+    inner.writer.write_all(encoded)?;
     inner.active_bytes += framed;
     inner.wal_bytes += framed; // P1.e: track WAL size
-    Ok(lsn)
+    Ok(())
 }
 
 /// Seal the active segment (flush + fsync so its records are durable) and open a

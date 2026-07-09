@@ -1445,10 +1445,58 @@ impl Engine {
         self.wal.current_lsn()
     }
 
+    /// The control-file state a replica must adopt alongside the shipped WAL
+    /// (P6.c): the live catalog root and next-xid counter (the catalog *content*
+    /// rides the WAL, but its root pointer + xid counter are control-file state).
+    pub fn primary_control(&self) -> crate::replication::PrimaryControl {
+        // Read both control fields under a single lock — taking the `control`
+        // Mutex twice in one statement would keep both guards alive to the end
+        // of the statement and self-deadlock (the Mutex is not reentrant).
+        let (page_size, catalog_root) = {
+            let c = ctrl_lock(&self.control);
+            (c.page_size, c.catalog_root)
+        };
+        crate::replication::PrimaryControl {
+            page_size,
+            catalog_root,
+            next_xid: self.txn_mgr.next_xid(),
+        }
+    }
+
     /// Ship every WAL record after `from_lsn` as a framed byte stream (P6.b) the
     /// replica decodes with [`crate::wal::decode_stream`] and applies via redo.
     pub fn ship_wal(&self, from_lsn: Lsn) -> Result<Vec<u8>> {
         self.wal.ship_from(from_lsn)
+    }
+
+    /// The synchronous-replica durability option (P6.c): block until every
+    /// **synchronous** slot has confirmed (advanced past) `lsn`, or `timeout`
+    /// elapses. A primary calls this after a commit's WAL is durable but before
+    /// acknowledging it, so a failover to a sync replica loses no acknowledged
+    /// commit. Returns `true` if all sync slots caught up, `false` on timeout
+    /// (the caller decides whether to still acknowledge). No sync slots →
+    /// returns `true` immediately (pure async replication). Opt-in: the default
+    /// commit path stays async (the documented tradeoff — see the phase6 spec).
+    pub fn wait_for_sync_replicas(&self, lsn: Lsn, timeout: Duration) -> Result<bool> {
+        if !self.replication.has_sync() {
+            return Ok(true);
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let all_caught_up = self
+                .replication
+                .list()
+                .iter()
+                .filter(|s| s.kind == crate::replication::SlotKind::Sync)
+                .all(|s| s.restart_lsn >= lsn);
+            if all_caught_up {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 
     /// Reclaim physical space held by dead tuple versions (M10) — the explicit,
