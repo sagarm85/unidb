@@ -39,6 +39,10 @@
 
 pub mod audit;
 pub mod authz;
+/// Autovacuum (A3) — the background launcher thread that auto-triggers the
+/// existing M10 `Engine::vacuum`. See the module doc for why concurrent
+/// background vacuum needs no new locking.
+pub mod autovacuum;
 pub mod backup;
 pub mod btree_index;
 pub mod bufferpool;
@@ -320,6 +324,15 @@ pub struct Engine {
     /// How many autovacuum passes the background launcher has run this session
     /// (A4 observability). Distinct from manual `Engine::vacuum` calls.
     autovacuums_triggered: AtomicU64,
+    /// Wall-clock (seconds since the Unix epoch) of the last autovacuum pass,
+    /// 0 if none yet (A4 observability). Coarse timestamp for `/metrics`.
+    last_autovacuum_epoch_secs: AtomicU64,
+    /// The background autovacuum launcher (A3), present once `spawn_autovacuum`
+    /// has been called on an `Arc<Engine>`. `None` for a bare `Engine::open`
+    /// handle (which cannot host a `Weak`-holding worker) or when the policy is
+    /// disabled. Dropping the engine drops this, whose `Drop` stops the thread —
+    /// the clean-shutdown hook.
+    autovacuum_handle: Mutex<Option<crate::autovacuum::AutoVacuumHandle>>,
     /// Serializes the non-CRUD write paths that do a *non-atomic*
     /// read-catalog-then-mutate-a-shared-secondary-index sequence — graph edges
     /// (the `__edges__.from_id` `DiskBTree` + page list), large objects (the
@@ -508,6 +521,21 @@ impl Engine {
         Self::open_with_pool_capacity(dir, page_size, configured_pool_capacity())
     }
 
+    /// Open (or create) a database and return it wrapped in an `Arc` with the
+    /// background **autovacuum launcher started** (A3) — the "default-on"
+    /// deployment/embedded-primary entry point. Equivalent to
+    /// `let e = Arc::new(Engine::open(..)?); e.spawn_autovacuum(); e`.
+    ///
+    /// `Engine::open` itself returns a bare `Engine` with no background thread
+    /// (a `Weak`-holding worker needs an `Arc`); use this when you want
+    /// autovacuum without managing the `Arc`/`spawn_autovacuum` dance yourself.
+    /// Honors the A2 policy: no thread is spawned if autovacuum is disabled.
+    pub fn open_arc(dir: &Path, page_size: u32) -> Result<Arc<Self>> {
+        let engine = Arc::new(Self::open(dir, page_size)?);
+        engine.spawn_autovacuum();
+        Ok(engine)
+    }
+
     /// Open (or create) a database with an explicit buffer-pool capacity in
     /// frames (P1.c) — for tests/benchmarks that need a specific pool size
     /// without going through the `UNIDB_BUFFER_POOL_PAGES` env var.
@@ -657,6 +685,8 @@ impl Engine {
             live_tuples: AtomicU64::new(0),
             autovacuum: Mutex::new(AutoVacuumConfig::default()),
             autovacuums_triggered: AtomicU64::new(0),
+            last_autovacuum_epoch_secs: AtomicU64::new(0),
+            autovacuum_handle: Mutex::new(None),
             write_serial: Mutex::new(()),
             replication,
             authz,
@@ -4400,6 +4430,104 @@ mod tests {
         assert!(
             !engine.autovacuum_should_run(),
             "vacuum reset the dead estimate"
+        );
+    }
+
+    /// Poll `cond` up to `timeout`, sleeping briefly between checks. Returns
+    /// whether it became true — for asserting an *asynchronous* background event.
+    fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        cond()
+    }
+
+    #[test]
+    fn autovacuum_launcher_reclaims_without_a_manual_vacuum_call() {
+        let dir = tempdir().unwrap();
+        // Set an aggressive policy BEFORE spawning so the launcher's first nap
+        // already uses the short naptime.
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        engine.set_autovacuum_config(AutoVacuumConfig {
+            enabled: true,
+            threshold: 10,
+            scale_factor: 0.0,
+            naptime: Duration::from_millis(25),
+        });
+        let engine = Arc::new(engine);
+        engine.spawn_autovacuum();
+        assert!(engine.autovacuum_running());
+
+        // Churn one row hard: 40 dead versions, no manual vacuum() anywhere.
+        let x = engine.begin().unwrap();
+        let mut rid = engine.insert(x, b"v0").unwrap();
+        engine.commit(x).unwrap();
+        for i in 0..40 {
+            let x = engine.begin().unwrap();
+            rid = engine.update(x, rid, format!("v{i}").as_bytes()).unwrap();
+            engine.commit(x).unwrap();
+        }
+
+        // The launcher must fire and drive the dead estimate back down on its
+        // own — the defining autovacuum behaviour.
+        let fired = wait_until(Duration::from_secs(5), || {
+            engine.autovacuums_triggered() > 0 && engine.dead_tuple_estimate() <= 10
+        });
+        assert!(
+            fired,
+            "autovacuum did not reclaim: runs={}, dead={}",
+            engine.autovacuums_triggered(),
+            engine.dead_tuple_estimate()
+        );
+
+        // Data is intact after background reclamation.
+        let x = engine.begin().unwrap();
+        assert_eq!(engine.get(x, rid).unwrap(), b"v39");
+    }
+
+    #[test]
+    fn autovacuum_launcher_shuts_down_cleanly_on_drop() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        engine.set_autovacuum_config(AutoVacuumConfig {
+            enabled: true,
+            threshold: 5,
+            scale_factor: 0.0,
+            naptime: Duration::from_millis(25),
+        });
+        let engine = Arc::new(engine);
+        engine.spawn_autovacuum();
+        assert!(engine.autovacuum_running());
+
+        // A Weak witness: after dropping the only strong Arc, the engine must be
+        // freed — proving the worker holds no strong reference (no cycle leak).
+        let witness = Arc::downgrade(&engine);
+        assert!(witness.upgrade().is_some());
+        drop(engine); // engine field-drop stops + joins the worker (bounded)
+
+        assert!(
+            wait_until(Duration::from_secs(5), || witness.upgrade().is_none()),
+            "engine was not freed after drop — the launcher leaked a strong ref"
+        );
+    }
+
+    #[test]
+    fn disabled_policy_starts_no_launcher() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        engine.set_autovacuum_config(AutoVacuumConfig {
+            enabled: false,
+            ..AutoVacuumConfig::default()
+        });
+        let engine = Arc::new(engine);
+        engine.spawn_autovacuum();
+        assert!(
+            !engine.autovacuum_running(),
+            "disabled ⇒ no background thread"
         );
     }
 

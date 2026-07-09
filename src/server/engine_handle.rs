@@ -58,8 +58,13 @@ impl EngineHandle {
         // durability via the coalescing `Wal::sync_up_to` barrier. No explicit
         // `set_deferred_sync` call is needed here anymore.
         let read = engine.read_handle();
+        let engine = Arc::new(engine);
+        // A3: start the background autovacuum launcher for the served instance
+        // (default-on, policy-gated). The worker holds a `Weak<Engine>`, so this
+        // Arc's eventual drop still tears the engine down cleanly.
+        engine.spawn_autovacuum();
         Ok(Self {
-            engine: Some(Arc::new(engine)),
+            engine: Some(engine),
             read,
         })
     }
