@@ -155,7 +155,7 @@ fn send_event_capture(
     }
     let payload = queue::payload::row_to_json(row, &table_def.columns);
     let events_def = ctx.catalog.lookup(EVENTS_TABLE)?.clone();
-    let heap = Heap::from_pages(ctx.page_size, events_def.pages.clone());
+    let heap = Heap::open(ctx.page_size, events_def.fsm_meta, events_def.pages.clone());
 
     let seq = ctx.next_event_seq.fetch_add(1, Ordering::SeqCst);
 
@@ -186,7 +186,15 @@ pub enum ExecResult {
     Inserted {
         count: usize,
     },
-    Rows(Vec<Vec<Literal>>),
+    /// A result set: the output column names (in order) plus one value vector
+    /// per row. `columns` lets the REST layer return `{columns, rows}` (a client
+    /// can zip names to values) instead of anonymous positional arrays. For
+    /// `SELECT *` the columns are the table's non-dropped columns in order; for
+    /// an explicit projection they are exactly the projected names.
+    Rows {
+        columns: Vec<String>,
+        rows: Vec<Vec<Literal>>,
+    },
     Updated {
         count: usize,
     },
@@ -313,7 +321,7 @@ fn exec_drop_table(table: &str, if_exists: bool, ctx: &mut ExecCtx) -> Result<Ex
 /// recomputed on open). Returns an empty result set.
 fn exec_analyze(table: &str, ctx: &mut ExecCtx) -> Result<ExecResult> {
     let table_def = ctx.catalog.lookup(table)?.clone();
-    let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+    let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
     let mut rows = Vec::new();
     for (_, bytes) in heap.scan(&snapshot, ctx.xid, ctx.pool)? {
@@ -322,7 +330,10 @@ fn exec_analyze(table: &str, ctx: &mut ExecCtx) -> Result<ExecResult> {
     let stats = crate::sql::statistics::compute(&rows, &table_def.columns);
     let mut cctx = catalog_ctx!(ctx);
     ctx.catalog.set_table_stats(table, stats, &mut cctx)?;
-    Ok(ExecResult::Rows(Vec::new()))
+    Ok(ExecResult::Rows {
+        columns: Vec::new(),
+        rows: Vec::new(),
+    })
 }
 
 fn exec_truncate(table: &str, ctx: &mut ExecCtx) -> Result<ExecResult> {
@@ -330,7 +341,7 @@ fn exec_truncate(table: &str, ctx: &mut ExecCtx) -> Result<ExecResult> {
     let table_def = ctx.catalog.lookup(table)?.clone();
     // Count the live rows removed (under this statement's snapshot) for the
     // result, before the page list is cleared.
-    let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+    let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
     let count = heap.scan(&snapshot, ctx.xid, ctx.pool)?.len();
     let mut cctx = catalog_ctx!(ctx);
@@ -362,6 +373,7 @@ fn exec_create_table(
         name,
         columns,
         pages: Vec::new(),
+        fsm_meta: None,
         rls_policy: None,
         events_enabled: false,
         serial_next,
@@ -421,7 +433,7 @@ fn exec_create_index(
         // vectors as the training sample, train centroids, then insert each row
         // into its cell. Training holds the sample in RAM transiently (one-time
         // build cost); the persisted index is bounded (centroids only).
-        let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+        let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
         let mut sample: Vec<(RowId, Vec<f32>)> = Vec::new();
         for (row_id, bytes) in heap.scan(&snapshot, ctx.xid, ctx.pool)? {
             let row = decode_row(&bytes, &table_def.columns)?;
@@ -449,7 +461,7 @@ fn exec_create_index(
         // P3.a/P3.b: a durable BTree/FullText index — a `DiskBTree` backfilled
         // from every committed row.
         let tree = DiskBTree::create(ctx.pool, ctx.wal)?;
-        let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+        let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
         for (row_id, bytes) in heap.scan(&snapshot, ctx.xid, ctx.pool)? {
             let row = decode_row(&bytes, &table_def.columns)?;
             match kind {
@@ -477,14 +489,22 @@ fn exec_create_index(
     Ok(ExecResult::CreatedIndex)
 }
 
-/// Persist a table's page list back to the catalog if the heap grew during
-/// this statement's execution.
+/// Persist a **legacy** table's page list back to the catalog if the heap grew
+/// during this statement's execution. For an **FSM-backed** table (the common
+/// case since the durable-FSM milestone) this is a no-op: the page directory
+/// lives in the durable FSM tree and self-persists at page-alloc time, so there
+/// is no catalog `pages` blob to rewrite — which is exactly what removed the
+/// O(heap-pages) blob-overflow (`HeapFull`) ceiling. Guarding on `fsm_meta`
+/// keeps pre-FSM catalogs (no `fsm_meta`) working via their old in-catalog list.
 fn persist_pages_if_changed(
     table: &str,
     heap: &Heap,
     original: &[PageId],
     ctx: &mut ExecCtx,
 ) -> Result<()> {
+    if heap.is_fsm_backed() {
+        return Ok(());
+    }
     if heap.page_ids() != original {
         let new_pages = heap.page_ids().to_vec();
         let mut cctx = catalog_ctx!(ctx);
@@ -503,7 +523,7 @@ fn exec_insert(
     // FK (M11): only referenced-table existence is enforced, and it's a
     // schema-level property — check it once per statement, not per row.
     enforce_referenced_tables_exist(&table_def, ctx.catalog)?;
-    let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+    let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
 
     let mut count = 0;
     for row_values in values {
@@ -563,7 +583,7 @@ fn exec_select(
         }
     }
 
-    let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+    let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
 
     let mut out = Vec::new();
@@ -585,7 +605,10 @@ fn exec_select(
         }
     }
     ctx.txn_mgr.ssi_note_reads(ctx.xid, &read_ids);
-    Ok(ExecResult::Rows(out))
+    Ok(ExecResult::Rows {
+        columns: output_columns(projection, &table_def.columns),
+        rows: out,
+    })
 }
 
 /// Read-only, `PageReader`-generic SELECT for the concurrent read path (6b).
@@ -605,7 +628,11 @@ pub(crate) fn exec_select_readonly<P: PageReader>(
     reader: &P,
 ) -> Result<ExecResult> {
     let table_def = catalog.lookup(table)?.clone();
-    let heap = Heap::from_pages(reader.page_size(), table_def.pages.clone());
+    let heap = Heap::open(
+        reader.page_size(),
+        table_def.fsm_meta,
+        table_def.pages.clone(),
+    );
     let mut out = Vec::new();
     for (i, (_, bytes)) in heap
         .scan(snapshot, self_xid, reader)?
@@ -620,7 +647,10 @@ pub(crate) fn exec_select_readonly<P: PageReader>(
             out.push(project_row(projection, &table_def.columns, &row)?);
         }
     }
-    Ok(ExecResult::Rows(out))
+    Ok(ExecResult::Rows {
+        columns: output_columns(projection, &table_def.columns),
+        rows: out,
+    })
 }
 
 /// Whether `plan` may run on the concurrent read path (6b): a plain `SELECT`
@@ -726,7 +756,7 @@ fn try_exec_select_btree(
         None => return Ok(None),
     };
 
-    let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+    let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
     let mut out = Vec::new();
     for row_id in candidate_ids {
@@ -740,7 +770,10 @@ fn try_exec_select_btree(
             out.push(project_row(projection, &table_def.columns, &row)?);
         }
     }
-    Ok(Some(ExecResult::Rows(out)))
+    Ok(Some(ExecResult::Rows {
+        columns: output_columns(projection, &table_def.columns),
+        rows: out,
+    }))
 }
 
 /// `NEAR`'s over-fetch-then-filter execution: probe the durable IVF-Flat
@@ -777,7 +810,10 @@ fn exec_select_near(
     // is always crash-consistent with committed data). A column flagged but never
     // built (no `index_root`) has zero candidates, not an error.
     let Some(meta_page) = col.index_root else {
-        return Ok(ExecResult::Rows(Vec::new()));
+        return Ok(ExecResult::Rows {
+            columns: output_columns(projection, &table_def.columns),
+            rows: Vec::new(),
+        });
     };
 
     // Probe the nearest cells' posting lists for candidate RowIds. Candidates are
@@ -788,7 +824,7 @@ fn exec_select_near(
     let ivf = DiskIvfIndex::open(meta_page, ctx.page_size);
     let (metric, candidate_ids) = ivf.candidates(query, None, ctx.pool)?;
 
-    let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+    let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
     let mut scored: Vec<(f32, Vec<Literal>)> = Vec::new();
     for row_id in candidate_ids {
@@ -814,9 +850,10 @@ fn exec_select_near(
     }
     scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(k);
-    Ok(ExecResult::Rows(
-        scored.into_iter().map(|(_, r)| r).collect(),
-    ))
+    Ok(ExecResult::Rows {
+        columns: output_columns(projection, &table_def.columns),
+        rows: scored.into_iter().map(|(_, r)| r).collect(),
+    })
 }
 
 /// Exact distance for NEAR re-ranking, matching the index's `Metric` (must agree
@@ -856,7 +893,7 @@ fn exec_update(
 ) -> Result<ExecResult> {
     let table_def = ctx.catalog.lookup(table)?.clone();
     enforce_referenced_tables_exist(&table_def, ctx.catalog)?;
-    let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+    let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
 
     let matching = matching_rows(&heap, &snapshot, ctx, &table_def, predicate)?;
@@ -921,7 +958,7 @@ fn exec_update(
 
 fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Result<ExecResult> {
     let table_def = ctx.catalog.lookup(table)?.clone();
-    let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+    let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
 
     let matching = matching_rows(&heap, &snapshot, ctx, &table_def, predicate)?;
@@ -1463,6 +1500,21 @@ fn enforce_unique(
         }
     }
     Ok(())
+}
+
+/// The output column names for a projection over `columns`, matching exactly
+/// what [`project_row`] emits: `SELECT *` (empty projection) → every non-dropped
+/// column in order; an explicit projection → the projected names as written.
+pub(crate) fn output_columns(projection: &[String], columns: &[ColumnDef]) -> Vec<String> {
+    if projection.is_empty() {
+        columns
+            .iter()
+            .filter(|c| !c.dropped)
+            .map(|c| c.name.clone())
+            .collect()
+    } else {
+        projection.to_vec()
+    }
 }
 
 pub(crate) fn project_row(
@@ -2118,7 +2170,7 @@ mod tests {
             .exec_as(xid2, "SELECT * FROM accounts WHERE id = 1")
             .unwrap();
         match result {
-            ExecResult::Rows(rows) => {
+            ExecResult::Rows { rows, .. } => {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(
                     rows[0],
@@ -2148,7 +2200,7 @@ mod tests {
         let xid2 = h.begin();
         let result = h.exec_as(xid2, "SELECT name FROM t").unwrap();
         match result {
-            ExecResult::Rows(rows) => {
+            ExecResult::Rows { rows, .. } => {
                 assert_eq!(rows, vec![vec![Literal::Text("a".to_string())]]);
             }
             other => panic!("expected Rows, got {other:?}"),
@@ -2175,7 +2227,13 @@ mod tests {
 
         let xid3 = h.begin();
         let result = h.exec_as(xid3, "SELECT balance FROM accounts").unwrap();
-        assert_eq!(result, ExecResult::Rows(vec![vec![Literal::Int(50)]]));
+        assert_eq!(
+            result,
+            ExecResult::Rows {
+                columns: vec!["balance".to_string()],
+                rows: vec![vec![Literal::Int(50)]]
+            }
+        );
     }
 
     #[test]
@@ -2194,7 +2252,7 @@ mod tests {
 
         let xid3 = h.begin();
         let result = h.exec_as(xid3, "SELECT * FROM t").unwrap();
-        assert_eq!(result, ExecResult::Rows(vec![]));
+        assert!(matches!(result, ExecResult::Rows { rows, .. } if rows.is_empty()));
     }
 
     #[test]
@@ -2216,7 +2274,7 @@ mod tests {
             .exec_as(xid2, "SELECT * FROM t WHERE (data ->> 'status') = 'active'")
             .unwrap();
         match result {
-            ExecResult::Rows(rows) => assert_eq!(rows.len(), 1),
+            ExecResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
             other => panic!("expected Rows, got {other:?}"),
         }
 
@@ -2226,7 +2284,7 @@ mod tests {
                 "SELECT * FROM t WHERE (data ->> 'status') = 'inactive'",
             )
             .unwrap();
-        assert_eq!(none, ExecResult::Rows(vec![]));
+        assert!(matches!(none, ExecResult::Rows { rows, .. } if rows.is_empty()));
     }
 
     #[test]
@@ -2240,9 +2298,9 @@ mod tests {
     }
 
     #[test]
-    fn table_survives_reopen_via_catalog_pages() {
+    fn table_survives_reopen_via_durable_fsm() {
         let dir = tempdir().unwrap();
-        let (root_page, rid_data);
+        let (root_page, fsm_meta, legacy_pages);
         {
             let mut h = Harness::new(dir.path());
             let xid = h.begin();
@@ -2251,12 +2309,21 @@ mod tests {
             h.commit(xid);
             h.pool.flush_all(h.wal.durable_lsn()).unwrap();
             root_page = h.control.lock().unwrap().catalog_root;
-            rid_data = h.catalog.lookup("t").unwrap().pages.clone();
+            let def = h.catalog.lookup("t").unwrap();
+            fsm_meta = def.fsm_meta;
+            legacy_pages = def.pages.clone();
         }
         assert_ne!(root_page, crate::format::INVALID_PAGE_ID);
+        // The durable FSM (not the old catalog `pages` blob) now holds the page
+        // directory — that is what carries the table's pages across a reopen.
         assert!(
-            !rid_data.is_empty(),
-            "table must have recorded its page list"
+            fsm_meta.is_some(),
+            "table must have minted a durable free-space map"
+        );
+        assert!(
+            legacy_pages.is_empty(),
+            "FSM-backed table must not grow the catalog page-list blob \
+             (that O(pages) blob rewrite was the HeapFull ceiling)"
         );
 
         // Reopen: reconstruct catalog + pool from what was persisted.
@@ -2265,7 +2332,11 @@ mod tests {
         let control = crate::control::read(&dir.path().join("control")).unwrap();
         let catalog = Catalog::load(&control, &pool).unwrap();
         let table_def = catalog.lookup("t").unwrap();
-        let heap = Heap::from_pages(DEFAULT_PAGE_SIZE as usize, table_def.pages.clone());
+        let heap = Heap::open(
+            DEFAULT_PAGE_SIZE as usize,
+            table_def.fsm_meta,
+            table_def.pages.clone(),
+        );
         let snap = crate::mvcc::Snapshot::new(1000, 1000, vec![]);
         let rows = heap.scan(&snap, 1000, &pool).unwrap();
         assert_eq!(rows.len(), 1);
@@ -2382,6 +2453,7 @@ mod tests {
                 ty: ColumnType::Vector(4),
             }],
             pages: vec![],
+            fsm_meta: None,
             rls_policy: None,
             events_enabled: false,
             serial_next: Default::default(),
@@ -2444,12 +2516,12 @@ mod tests {
 
         let xid2 = h.begin();
         let rows = match h.exec_as(xid2, "SELECT price FROM t WHERE id = 1").unwrap() {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             other => panic!("expected Rows, got {other:?}"),
         };
         assert_eq!(rows, vec![vec![Literal::Decimal(950, 2)]]);
         let rows2 = match h.exec_as(xid2, "SELECT price FROM t WHERE id = 2").unwrap() {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             other => panic!("expected Rows, got {other:?}"),
         };
         assert_eq!(rows2, vec![vec![Literal::Decimal(10000, 2)]]);
@@ -2505,7 +2577,7 @@ mod tests {
             .exec_as(xid2, "SELECT id FROM t WHERE price > 9.9")
             .unwrap()
         {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             other => panic!("expected Rows, got {other:?}"),
         };
         assert_eq!(rows.len(), 3); // 9.99, 10.00, 10.50
@@ -2514,7 +2586,7 @@ mod tests {
             .exec_as(xid2, "SELECT id FROM t WHERE price = 10")
             .unwrap()
         {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             other => panic!("expected Rows, got {other:?}"),
         };
         assert_eq!(eq, vec![vec![Literal::Int(3)]]);
@@ -2568,7 +2640,7 @@ mod tests {
             .exec_as(xid2, "SELECT created FROM t WHERE id = 1")
             .unwrap()
         {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             other => panic!("expected Rows, got {other:?}"),
         };
         assert_eq!(rows, vec![vec![Literal::Timestamp(created)]]);
@@ -2581,7 +2653,7 @@ mod tests {
             )
             .unwrap()
         {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             other => panic!("expected Rows, got {other:?}"),
         };
         assert_eq!(after, vec![vec![Literal::Int(2)]]);
@@ -2648,7 +2720,11 @@ mod tests {
         let table_def = catalog.lookup("t").unwrap();
         assert_eq!(table_def.columns[0].ty, ColumnType::Decimal(10, 2));
         assert_eq!(table_def.columns[1].ty, ColumnType::Timestamp);
-        let heap = Heap::from_pages(DEFAULT_PAGE_SIZE as usize, table_def.pages.clone());
+        let heap = Heap::open(
+            DEFAULT_PAGE_SIZE as usize,
+            table_def.fsm_meta,
+            table_def.pages.clone(),
+        );
         let snap = crate::mvcc::Snapshot::new(1000, 1000, vec![]);
         let rows = heap.scan(&snap, 1000, &pool).unwrap();
         let decoded = decode_row(&rows[0].1, &table_def.columns).unwrap();
@@ -2698,12 +2774,12 @@ mod tests {
         h.commit(xid);
         let xid2 = h.begin();
         let rows = match h.exec_as(xid2, "SELECT x FROM t WHERE id = 1").unwrap() {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         assert_eq!(rows, vec![vec![Literal::Float(1.5)]]);
         let gt = match h.exec_as(xid2, "SELECT id FROM t WHERE x > 2").unwrap() {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         assert_eq!(gt, vec![vec![Literal::Int(2)]]);
@@ -2735,7 +2811,7 @@ mod tests {
             )
             .unwrap()
         {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         assert_eq!(rows.len(), 1);
@@ -2760,12 +2836,12 @@ mod tests {
         h.commit(xid);
         let xid2 = h.begin();
         let r1 = match h.exec_as(xid2, "SELECT b FROM t WHERE id = 1").unwrap() {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         assert_eq!(r1, vec![vec![Literal::Bytea(vec![0xde, 0xad, 0xbe, 0xef])]]);
         let r2 = match h.exec_as(xid2, "SELECT b FROM t WHERE id = 2").unwrap() {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         assert_eq!(r2, vec![vec![Literal::Bytea(b"hi".to_vec())]]);
@@ -2791,7 +2867,7 @@ mod tests {
         h.commit(xid);
         let xid2 = h.begin();
         let rows = match h.exec_as(xid2, "SELECT d, tm FROM t WHERE id = 1").unwrap() {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         assert_eq!(
@@ -2808,7 +2884,7 @@ mod tests {
             )
             .unwrap()
         {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         assert_eq!(after, vec![vec![Literal::Int(2)]]);
@@ -2837,7 +2913,7 @@ mod tests {
             .exec_as(xid2, "SELECT status FROM t WHERE id = 1")
             .unwrap()
         {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         assert_eq!(old, vec![vec![Literal::Text("new".to_string())]]);
@@ -2845,7 +2921,7 @@ mod tests {
             .exec_as(xid2, "SELECT status FROM t WHERE id = 2")
             .unwrap()
         {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         assert_eq!(new, vec![vec![Literal::Text("live".to_string())]]);
@@ -2877,13 +2953,13 @@ mod tests {
         // The tombstone hazard: the pre-drop row's `c` must still decode as 3,
         // not be misread from `b`'s old bytes.
         let rows = match h.exec_as(xid2, "SELECT a, c FROM t").unwrap() {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         assert_eq!(rows, vec![vec![Literal::Int(1), Literal::Int(3)]]);
         // SELECT * returns only the two visible columns.
         let star = match h.exec_as(xid2, "SELECT * FROM t").unwrap() {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         assert_eq!(star, vec![vec![Literal::Int(1), Literal::Int(3)]]);
@@ -2899,7 +2975,7 @@ mod tests {
         h.commit(xid3);
         let xid4 = h.begin();
         let after = match h.exec_as(xid4, "SELECT a, c FROM t WHERE a = 4").unwrap() {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         assert_eq!(after, vec![vec![Literal::Int(4), Literal::Int(6)]]);
@@ -2941,10 +3017,10 @@ mod tests {
         h.exec_as(xid, "CREATE TABLE t (name TEXT)").unwrap();
         h.commit(xid);
         let xid2 = h.begin();
-        assert_eq!(
+        assert!(matches!(
             h.exec_as(xid2, "SELECT * FROM t").unwrap(),
-            ExecResult::Rows(vec![])
-        );
+            ExecResult::Rows { rows, .. } if rows.is_empty()
+        ));
     }
 
     #[test]
@@ -2963,10 +3039,10 @@ mod tests {
         );
         h.commit(xid2);
         let xid3 = h.begin();
-        assert_eq!(
+        assert!(matches!(
             h.exec_as(xid3, "SELECT * FROM t").unwrap(),
-            ExecResult::Rows(vec![])
-        );
+            ExecResult::Rows { rows, .. } if rows.is_empty()
+        ));
         // Schema intact: can still insert.
         h.exec_as(xid3, "INSERT INTO t (id) VALUES (9)").unwrap();
     }
@@ -2997,7 +3073,7 @@ mod tests {
         h.commit(xid);
         let xid2 = h.begin();
         let rows = match h.exec_as(xid2, "SELECT id, name FROM t").unwrap() {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         let mut ids: Vec<i64> = rows
@@ -3041,7 +3117,7 @@ mod tests {
         .unwrap();
         h.exec_as(xid, "INSERT INTO t (name) VALUES ('a')").unwrap();
         let rows = match h.exec_as(xid, "SELECT id FROM t").unwrap() {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         assert_eq!(rows, vec![vec![Literal::Int(1)]]);
@@ -3243,7 +3319,7 @@ mod tests {
             .exec_as(xid, "SELECT id FROM t WHERE NEAR(embedding, [0.0, 0.0], 2)")
             .unwrap();
         match res {
-            ExecResult::Rows(rows) => {
+            ExecResult::Rows { rows, .. } => {
                 assert_eq!(rows.len(), 2);
                 assert_eq!(rows[0][0], Literal::Int(1));
                 assert_eq!(rows[1][0], Literal::Int(3));

@@ -40,7 +40,10 @@ pub fn exec_query(spec: &QuerySpec, ctx: &mut ExecCtx) -> Result<ExecResult> {
     };
     let node = runner.materialize_ctes_and_plan(spec)?;
     let batch = runner.run(&node)?;
-    Ok(ExecResult::Rows(batch.rows))
+    Ok(ExecResult::Rows {
+        columns: batch.schema.iter().map(|c| c.name.clone()).collect(),
+        rows: batch.rows,
+    })
 }
 
 /// `EXPLAIN [ANALYZE]` (P4.e): render the chosen plan tree (estimated rows),
@@ -67,9 +70,10 @@ pub fn exec_explain(spec: &QuerySpec, analyze: bool, ctx: &mut ExecCtx) -> Resul
             elapsed.as_secs_f64() * 1000.0
         ));
     }
-    Ok(ExecResult::Rows(
-        lines.into_iter().map(|l| vec![Literal::Text(l)]).collect(),
-    ))
+    Ok(ExecResult::Rows {
+        columns: vec!["QUERY PLAN".to_string()],
+        rows: lines.into_iter().map(|l| vec![Literal::Text(l)]).collect(),
+    })
 }
 
 struct Runner<'a, 'b> {
@@ -288,7 +292,11 @@ impl Runner<'_, '_> {
 
     fn scan(&mut self, table: &str, output: &[ColumnRef]) -> Result<Batch> {
         let table_def = self.ctx.catalog.lookup(table)?.clone();
-        let heap = Heap::from_pages(self.ctx.page_size, table_def.pages.clone());
+        let heap = Heap::open(
+            self.ctx.page_size,
+            table_def.fsm_meta,
+            table_def.pages.clone(),
+        );
         let mut rows = Vec::new();
         for (i, (_, bytes)) in heap
             .scan(&self.snapshot, self.ctx.xid, self.ctx.pool)?
@@ -335,7 +343,11 @@ impl Runner<'_, '_> {
         let Some(candidate_ids) = tree.search(op, &ordered, self.ctx.pool)? else {
             return self.scan(table, output);
         };
-        let heap = Heap::from_pages(self.ctx.page_size, table_def.pages.clone());
+        let heap = Heap::open(
+            self.ctx.page_size,
+            table_def.fsm_meta,
+            table_def.pages.clone(),
+        );
         let mut rows = Vec::new();
         for row_id in candidate_ids {
             match heap.get(row_id, &self.snapshot, self.ctx.xid, self.ctx.pool) {
@@ -385,7 +397,11 @@ impl Runner<'_, '_> {
                 ))
             })?;
         let tree = DiskBTree::new(meta_page, self.ctx.page_size);
-        let heap = Heap::from_pages(self.ctx.page_size, right_def.pages.clone());
+        let heap = Heap::open(
+            self.ctx.page_size,
+            right_def.fsm_meta,
+            right_def.pages.clone(),
+        );
 
         let emit_unmatched_left = matches!(join_type, JoinType::Left);
         let mut out_rows = Vec::new();

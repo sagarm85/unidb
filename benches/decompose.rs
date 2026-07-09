@@ -816,7 +816,193 @@ fn pg_sweep_point(client: &mut Client, size: u64) -> (f64, f64) {
     (ins_us, read_us)
 }
 
+/// Durable-FSM B-accept: marginal SQL-insert cost as a single table grows, in
+/// one open transaction (so there is no per-row fsync masking the CPU cost). The
+/// segment µs/row includes each page-growth's amortized bookkeeping. On `main`
+/// (before), every growth rewrote the whole `TableDef.pages` list into the
+/// catalog blob (O(pages)), and at ~1,450 pages that blob overflowed an 8 KiB
+/// page → `HeapFull { size: 8138 }` (printed as ERROR — the ceiling). With the
+/// durable FSM (after), the directory lives in the FSM tree (an O(log n) tail
+/// probe and one node write per new page), so the cost stays flat and the build
+/// sails past the old ceiling. Rows overridable via `FSM_ROWS`.
+fn bench_fsm_scale() {
+    use unidb::sql::logical::Literal;
+    println!(
+        "\n=== FSM B-accept: marginal SQL-insert cost vs table size (one txn, ~4 rows/page) ==="
+    );
+    println!(
+        "  {:>8}  {:>8}  {:>14}  status",
+        "rows", "~pages", "us/row(seg)"
+    );
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
+    let x0 = engine.begin().unwrap();
+    engine
+        .execute_sql(x0, "CREATE TABLE t (id INT, body TEXT)")
+        .unwrap();
+    engine.commit(x0).unwrap();
+    let body = "x".repeat(1900); // ~4 rows per 8 KiB page
+    let ins = engine
+        .prepare("INSERT INTO t (id, body) VALUES ($1, $2)")
+        .unwrap();
+    let target: u64 = std::env::var("FSM_ROWS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8_000);
+    let milestone = 1_000u64;
+    let x = engine.begin().unwrap();
+    let mut seg_start = Instant::now();
+    let mut seg_rows = 0u64;
+    for i in 0..target {
+        match engine.execute_prepared(
+            x,
+            &ins,
+            &[Literal::Int(i as i64), Literal::Text(body.clone())],
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                println!("  {:>8}  {:>8}  {:>14}  ERROR: {e}", i, i / 4, "-");
+                return; // the ceiling (before) — no commit; txn is abandoned
+            }
+        }
+        seg_rows += 1;
+        if (i + 1) % milestone == 0 {
+            let us = seg_start.elapsed().as_micros() as f64 / seg_rows as f64;
+            println!("  {:>8}  {:>8}  {:>14.1}  ok", i + 1, (i + 1) / 4, us);
+            seg_start = Instant::now();
+            seg_rows = 0;
+        }
+    }
+    engine.commit(x).unwrap();
+}
+
+/// Concurrent SQL writers over a table **pre-grown** to `pregrow_rows` wide rows
+/// (so the heap already spans many pages before the measured phase). The
+/// measured phase is the same as `unidb_sql_concurrency`: N writers, each
+/// committing `per_thread` durable single-row INSERTs. Isolates one variable —
+/// does concurrent-write throughput hold as the table gets large? On `main`
+/// (before), each measured INSERT rebuilds `Heap::from_pages(pages.clone())`
+/// (O(pages)) and, on any page growth, rewrites the whole page list into the
+/// catalog under the write lock; after, `Heap::open` is O(1) and growth is an
+/// O(log n) FSM write with no catalog lock. Returns commits/sec of the measured
+/// phase only (the pre-grow is not timed).
+fn unidb_sql_conc_pregrown(writers: usize, per_thread: usize, pregrow_rows: u64) -> f64 {
+    let dir = tempdir().unwrap();
+    let engine = Arc::new(Engine::open(dir.path(), 0).unwrap());
+    let x = engine.begin().unwrap();
+    engine
+        .execute_sql(x, "CREATE TABLE t (id INT, body TEXT)")
+        .unwrap();
+    engine.commit(x).unwrap();
+    if pregrow_rows > 0 {
+        let wide = "w".repeat(1900); // ~4 rows per 8 KiB page → many pages fast
+        let ins = engine
+            .prepare("INSERT INTO t (id, body) VALUES ($1, $2)")
+            .unwrap();
+        let mut x = engine.begin().unwrap();
+        for i in 0..pregrow_rows {
+            engine
+                .execute_prepared(
+                    x,
+                    &ins,
+                    &[Literal::Int(-(i as i64) - 1), Literal::Text(wide.clone())],
+                )
+                .unwrap();
+            if (i + 1) % 2000 == 0 {
+                engine.commit(x).unwrap();
+                x = engine.begin().unwrap();
+            }
+        }
+        engine.commit(x).unwrap();
+    }
+    let barrier = Arc::new(Barrier::new(writers + 1));
+    let committed = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::new();
+    for w in 0..writers {
+        let (engine, barrier, committed) = (engine.clone(), barrier.clone(), committed.clone());
+        handles.push(thread::spawn(move || {
+            let ins = engine
+                .prepare("INSERT INTO t (id, body) VALUES ($1, $2)")
+                .unwrap();
+            barrier.wait();
+            for i in 0..per_thread {
+                let id = (w * per_thread + i) as i64;
+                let xid = engine.begin().unwrap();
+                engine
+                    .execute_prepared(
+                        xid,
+                        &ins,
+                        &[Literal::Int(id), Literal::Text(format!("b{id}"))],
+                    )
+                    .unwrap();
+                engine.commit(xid).unwrap();
+            }
+            committed.fetch_add(per_thread, Ordering::Relaxed);
+        }));
+    }
+    barrier.wait();
+    let start = Instant::now();
+    for h in handles {
+        h.join().unwrap();
+    }
+    committed.load(Ordering::Relaxed) as f64 / start.elapsed().as_secs_f64()
+}
+
+/// High-scale concurrency: 8-writer commits/sec as the table is pre-grown to
+/// increasing sizes. `FSM_PREGROW_SIZES` (comma list of pre-grow row counts)
+/// overrides the sweep — `main` (before) can only reach sizes below the ~876-page
+/// ceiling, so run it with e.g. `FSM_PREGROW_SIZES=0,2000`; the after binary runs
+/// the full sweep to show whether throughput stays flat at scales before could
+/// not reach at all.
+fn bench_conc_scale() {
+    const W: usize = 8;
+    const PER: usize = 300;
+    println!("\n=== Concurrent SQL writes vs pre-grown table size ({W} writers, PER={PER}, commits/sec) ===");
+    println!(
+        "  {:>12}  {:>8}  {:>16}",
+        "pregrow_rows", "~pages", "commits/sec"
+    );
+    let sizes: Vec<u64> = std::env::var("FSM_PREGROW_SIZES")
+        .ok()
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![0, 2_000, 8_000, 30_000]);
+    for &pg in &sizes {
+        let tput = unidb_sql_conc_pregrown(W, PER, pg);
+        println!("  {:>12}  {:>8}  {:>16.0}", pg, pg / 4, tput);
+    }
+}
+
 fn main() {
+    // `UNIDB_BENCH` selects a subset so a single section can be re-run quickly
+    // (e.g. the durable-FSM B-accept re-runs just B3/B4 before vs after without
+    // paying for the full criterion ladders): "b3", "b4", or "b3b4". Unset =
+    // the full suite.
+    let only = std::env::var("UNIDB_BENCH").unwrap_or_default();
+    match only.as_str() {
+        "b3" => {
+            bench_pg_concurrency();
+            return;
+        }
+        "b4" => {
+            bench_size_sweep();
+            return;
+        }
+        "b3b4" => {
+            bench_pg_concurrency();
+            bench_size_sweep();
+            return;
+        }
+        "fsm" => {
+            bench_fsm_scale();
+            return;
+        }
+        "cscale" => {
+            bench_conc_scale();
+            return;
+        }
+        _ => {}
+    }
+
     // Criterion-measured groups: the ladder (existing) + B1 pg ladder + B2 CRUD.
     let mut criterion = Criterion::default().configure_from_args();
     bench_ladder(&mut criterion);

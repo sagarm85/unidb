@@ -24,7 +24,7 @@ fn execute_sql_create_insert_select_round_trip() {
         .unwrap();
 
     let r = c.execute_sql("SELECT * FROM t").unwrap();
-    let ExecResult::Rows(rows) = &r[0] else {
+    let ExecResult::Rows { rows, .. } = &r[0] else {
         panic!("expected Rows");
     };
     assert_eq!(rows.len(), 1);
@@ -44,14 +44,14 @@ fn execute_sql_update_and_delete() {
         .unwrap();
 
     let r = c.execute_sql("SELECT * FROM t WHERE id = 1").unwrap();
-    let ExecResult::Rows(rows) = &r[0] else {
+    let ExecResult::Rows { rows, .. } = &r[0] else {
         panic!()
     };
     assert_eq!(rows[0][1], serde_json::json!("second"));
 
     c.execute_sql("DELETE FROM t WHERE id = 1").unwrap();
     let r = c.execute_sql("SELECT * FROM t").unwrap();
-    let ExecResult::Rows(rows) = &r[0] else {
+    let ExecResult::Rows { rows, .. } = &r[0] else {
         panic!()
     };
     assert!(rows.is_empty());
@@ -97,7 +97,7 @@ fn execute_sql_multi_statement_is_atomic() {
     assert!(matches!(err, AttachError::TableNotFound(_)));
 
     let r = c.execute_sql("SELECT * FROM t").unwrap();
-    let ExecResult::Rows(rows) = &r[0] else {
+    let ExecResult::Rows { rows, .. } = &r[0] else {
         panic!()
     };
     assert!(rows.is_empty(), "aborted INSERT must not be visible");
@@ -119,7 +119,7 @@ fn execute_cypher_returns_matching_edges() {
         .execute_cypher("MATCH (a)-[:KNOWS]->(b) WHERE a = 10 RETURN b")
         .unwrap();
 
-    let ExecResult::Rows(rows) = &r[0] else {
+    let ExecResult::Rows { rows, .. } = &r[0] else {
         panic!("expected Rows, got {:?}", r);
     };
     assert_eq!(rows.len(), 1);

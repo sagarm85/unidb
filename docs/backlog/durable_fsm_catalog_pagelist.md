@@ -1,6 +1,6 @@
 # Durable free-space map + O(1) table-page representation
 
-## Status as of 2026-07-09: NOT STARTED (backlog). **Core-lane, engine work.**
+## Status as of 2026-07-10: **SHIPPED** (Core lane, branch `durable-fsm`; one PR, commits B1 → B2 → B-accept + docs). The `HeapFull` ceiling is removed; page directory + free-space map are a per-table durable `DiskBTree`. Metrics + verdict in `PROGRESS.md`'s "Durable on-disk FSM + catalog page-list" entry. See "Implementation (B1 / B2)" and "B-accept" below.
 
 Filed from the Postgres baseline comparison (`pg_baseline_comparison.md`, PR #25),
 which root-caused a hard scaling limit in the SQL insert path. This is the fix.
@@ -96,6 +96,62 @@ as P3.a).
   statement; vacuum updates it. New crash point (kill mid-FSM-update → reopen →
   free space correct, O(1) open preserved). Benchmark: SQL bulk-load throughput
   now matches the raw path; open time flat vs table size.
+
+## Implementation (B1 / B2) — as built
+
+The two checkpoints are implemented on the existing **`DiskBTree`** rather than a
+bespoke extent/bitmap structure, because the spike (P3.a–P3.d) already made
+`DiskBTree` durable, WAL-logged (`WAL_INDEX` full-page images), crash-recovered,
+and O(1)-open — exactly the properties the "design constraint that pins the
+solution" section demands, for free. **The per-table FSM is a `DiskBTree` keyed
+`page_id → free_bytes`; its keys are the page directory, so it also subsumes F1's
+page representation.** `TableDef` stores one stable `fsm_meta: Option<PageId>`
+(like `ColumnDef.index_root` / the edge & LOB index meta pages), minted at
+`create_table`. **No data-dir migration:** `pages` is retained as a
+`#[serde(default)]` legacy fallback (a pre-FSM catalog with `fsm_meta == None`
+still opens and scans via it), and no `FORMAT_VERSION` bump is needed (additive,
+D9-consistent).
+
+- **B1 (page directory off the catalog blob).** `TableDef.fsm_meta` replaces the
+  growing `pages` blob; `Heap::open(fsm_meta, …)` is O(1) (no directory load); the
+  insert path finds the append tail via `DiskBTree::max_entry` (O(log n), not the
+  O(pages) walk); a full `scan`/vacuum lazily loads the directory via
+  `DiskBTree::page_directory` over any `PageReader` (buffer pool **or** the
+  concurrent-read mmap); `persist_pages_if_changed`/`set_pages` are no-ops for
+  FSM-backed tables. **Removes the ~1,450-page (`HeapFull`) ceiling** — regression
+  test builds a table past it via the SQL path.
+- **B2 (durable free-space + crash safety).** Free-space values go durable in the
+  FSM tree (removing the per-statement cold-FSM rebuild); vacuum's
+  `compact_page`/reclamation updates it; alloc+FSM-insert become one atomic
+  mini-txn; new crash points (mid-FSM-update, mid-heap-grow).
+
+## B-accept — validate against the benchmark that found the bug
+
+This milestone exists because running `pg_baseline_comparison.md`'s size sweep
+(`benches/decompose.rs` + `scripts/pg_compare.sh`) at scale hit `HeapFull`. B-accept
+re-runs that exact benchmark, before vs after, and records results in `PROGRESS.md`.
+**This gate can legitimately fail** — if a re-run still errors or shows no real
+improvement, the milestone is not done; report the finding, do not rationalize it.
+
+1. **Correctness (primary pass/fail).** The size-sweep / SQL-bulk-load run that
+   previously died with `HeapFull { size: 8138 }` now completes cleanly at the
+   scale that exposed it (identify the config from the pg-baseline `PROGRESS.md`
+   entry + the "correct HeapFull root cause" commit).
+2. **Improvement — throughput/open.** Catalog-write cost, cold-open, and insert
+   throughput at scale, before vs after (the durable FSM should flatten the
+   O(pages) catalog rewrite).
+3. **Improvement — concurrent SQL writes (refinement, 2026-07-10).** Re-run
+   `pg_baseline_comparison.md`'s **B3 concurrent-SQL-write comparison** — N unidb
+   writer threads on the SQL path vs N Postgres connections, N ∈ {1,2,4,8}, matched
+   durability — **before vs after**, and record the scaling curve. Rationale: today
+   the SQL insert path takes the catalog `RwLock` write-lock at
+   `sql/executor.rs` `set_pages` (persisting the grown page-list) on every heap
+   growth; moving the page-list into the per-table durable FSM should reduce that
+   catalog-write contention and improve concurrent-SQL-write scaling. **Measure,
+   don't assume:** if the curve improves, record by how much; if it does not (or
+   barely moves), that is a real finding — report the next serialization point
+   (FSM page-latch contention, index-page latches, executor locking) rather than
+   claiming it is fixed.
 
 ## Non-goals / notes
 

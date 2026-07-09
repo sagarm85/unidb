@@ -93,7 +93,7 @@ fn concurrent_sql_select_sees_consistent_rows_while_writer_inserts() {
             let mut queries = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 let mut results = read.execute_sql("SELECT id, name FROM t").unwrap();
-                let ExecResult::Rows(rows) = results.remove(0) else {
+                let ExecResult::Rows { rows, .. } = results.remove(0) else {
                     panic!("expected Rows");
                 };
                 for row in rows {
@@ -126,7 +126,7 @@ fn concurrent_sql_select_sees_consistent_rows_while_writer_inserts() {
         .read_handle()
         .execute_sql("SELECT id, name FROM t")
         .unwrap();
-    let ExecResult::Rows(rows) = results.remove(0) else {
+    let ExecResult::Rows { rows, .. } = results.remove(0) else {
         panic!("expected Rows");
     };
     assert_eq!(

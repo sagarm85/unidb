@@ -56,7 +56,7 @@
 //   them, exactly like `DROP TABLE` heap pages today.
 
 use crate::{
-    bufferpool::BufferPool,
+    bufferpool::{BufferPool, PageReader},
     error::{DbError, Result},
     format::{
         u16_from_le, u16_to_le, u32_from_le, u32_to_le, u64_from_le, u64_to_le, Lsn, PageId,
@@ -523,6 +523,93 @@ impl DiskBTree {
         }
     }
 
+    fn rightmost_leaf(&self, pool: &BufferPool) -> Result<PageId> {
+        let mut pid = self.root_page(pool)?;
+        loop {
+            let page = pool.fetch_page(pid)?;
+            let node = Node::deserialize(&page)?;
+            pool.unpin(pid);
+            match node {
+                Node::Leaf { .. } => return Ok(pid),
+                // The last child holds every key >= the last separator, so it is
+                // the rightmost subtree.
+                Node::Internal { children, .. } => pid = children[children.len() - 1],
+            }
+        }
+    }
+
+    /// The single greatest `(key, rid)` entry, or `None` for an empty tree.
+    /// O(tree height) — one root-to-rightmost-leaf descent, no full scan — so
+    /// the durable FSM can find a heap's append tail (its highest page id)
+    /// without the O(pages) directory walk `TableDef.pages` used to force.
+    pub fn max_entry(&self, pool: &BufferPool) -> Result<Option<(OrderedValue, RowId)>> {
+        let pid = self.rightmost_leaf(pool)?;
+        let page = pool.fetch_page(pid)?;
+        let node = Node::deserialize(&page)?;
+        pool.unpin(pid);
+        let Node::Leaf { entries, .. } = node else {
+            return Err(DbError::Recovery(
+                "B+tree rightmost node is not a leaf".into(),
+            ));
+        };
+        Ok(entries.last().cloned())
+    }
+
+    /// Enumerate the durable FSM's `(page_id, free_bytes)` entries in ascending
+    /// page-id order over **any** [`PageReader`] — the buffer pool *or* a
+    /// concurrent reader's shared mmap ([`SharedPageReader`]). The FSM's keys are
+    /// exactly the pages a heap owns (the directory) and each value carries that
+    /// page's last-recorded free space (B2: encoded in the `RowId.slot` field,
+    /// since a page's free space is `< page_size <= u16::MAX`), so this both
+    /// reconstructs the directory a full scan/vacuum needs *and* warms the free
+    /// map without re-fetching every heap page. Reader-only: no pin/unpin, no
+    /// allocation, no WAL — never mutates the tree. O(pages), amortized into the
+    /// O(pages) scan it feeds; never on the O(1)-open path.
+    pub fn page_directory<P: PageReader>(&self, reader: &P) -> Result<Vec<(PageId, usize)>> {
+        // Meta page → root (mirrors `root_page`, but over `read_page`).
+        let meta = reader.read_page(self.meta_page)?;
+        let mbody = &meta.as_bytes()[PAGE_HEADER_SIZE..];
+        if mbody.first().copied() != Some(NODE_META) {
+            return Err(DbError::Recovery(format!(
+                "FSM meta page {} is not a meta node",
+                self.meta_page
+            )));
+        }
+        let mut pid = u32_from_le(mbody[1..5].try_into().unwrap());
+        // Descend to the leftmost leaf.
+        loop {
+            let page = reader.read_page(pid)?;
+            match Node::deserialize(&page)? {
+                Node::Leaf { .. } => break,
+                Node::Internal { children, .. } => pid = children[0],
+            }
+        }
+        // Walk the leaf chain, collecting (page id from the key, free bytes from
+        // the value's slot field).
+        let mut out = Vec::new();
+        loop {
+            let page = reader.read_page(pid)?;
+            let Node::Leaf { entries, next } = Node::deserialize(&page)? else {
+                break;
+            };
+            for (k, rid) in &entries {
+                match k {
+                    OrderedValue::Int(n) => out.push((*n as PageId, rid.slot as usize)),
+                    other => {
+                        return Err(DbError::Recovery(format!(
+                            "FSM key is not an Int page id: {other:?}"
+                        )))
+                    }
+                }
+            }
+            if next == INVALID_PAGE_ID {
+                break;
+            }
+            pid = next;
+        }
+        Ok(out)
+    }
+
     // ── writes ─────────────────────────────────────────────────────────────────
 
     /// Insert `(value, rid)`. One WAL mini-txn covers every page touched,
@@ -536,10 +623,31 @@ impl DiskBTree {
         pool: &BufferPool,
         wal: &Wal,
     ) -> Result<()> {
-        let root = self.root_page(pool)?;
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
         let mut prev_lsn = begin_lsn;
-        let split = self.insert_into(root, value, rid, pool, wal, txn_id, &mut prev_lsn)?;
+        self.insert_in_txn(value, rid, pool, wal, txn_id, &mut prev_lsn)?;
+        wal.commit_mini_txn(txn_id, prev_lsn)?;
+        Ok(())
+    }
+
+    /// The body of [`Self::insert`], but participating in a **caller-supplied**
+    /// mini-txn (`txn_id`, `prev_lsn`) instead of opening/committing its own.
+    /// Lets a caller fold a tree insert into a larger atomic unit — the durable
+    /// heap grow (`Heap::alloc_heap_page`) brackets the new page's init *and*
+    /// its FSM directory entry in one mini-txn, so a crash mid-grow leaves
+    /// neither (no orphan page, no torn directory) rather than a page absent
+    /// from its directory (B2).
+    pub fn insert_in_txn(
+        &self,
+        value: OrderedValue,
+        rid: RowId,
+        pool: &BufferPool,
+        wal: &Wal,
+        txn_id: u64,
+        prev_lsn: &mut Lsn,
+    ) -> Result<()> {
+        let root = self.root_page(pool)?;
+        let split = self.insert_into(root, value, rid, pool, wal, txn_id, prev_lsn)?;
         if let Some((sep_key, new_child)) = split {
             // Root split: build a new internal root over the two halves and
             // repoint the meta page — all in this same mini-txn.
@@ -548,20 +656,52 @@ impl DiskBTree {
                 keys: vec![sep_key],
                 children: vec![root, new_child],
             };
-            prev_lsn = write_node(
+            *prev_lsn = write_node(
                 pool,
                 wal,
                 txn_id,
-                prev_lsn,
+                *prev_lsn,
                 new_root_page,
                 &new_root,
                 self.page_size,
             )?;
             let meta = meta_bytes(self.meta_page, new_root_page, self.page_size);
-            prev_lsn = write_raw(pool, wal, txn_id, prev_lsn, self.meta_page, meta)?;
+            *prev_lsn = write_raw(pool, wal, txn_id, *prev_lsn, self.meta_page, meta)?;
         }
-        wal.commit_mini_txn(txn_id, prev_lsn)?;
         Ok(())
+    }
+
+    /// Update the value (`RowId`) of the entry with key `value` in place, if it
+    /// exists — the durable FSM uses this to record a page's new free space
+    /// (`RowId.slot`) after a vacuum `compact_page` reclaims space, without
+    /// adding a second entry for the same page. One WAL mini-txn, a single leaf
+    /// rewrite, **no split** (the key set is unchanged, so the leaf size is
+    /// unchanged). Returns `false` if the key is absent (the caller then falls
+    /// back to `insert`). Keys in the FSM are unique (one entry per page), so at
+    /// most one entry matches.
+    pub fn set_value(
+        &self,
+        value: &OrderedValue,
+        new_rid: RowId,
+        pool: &BufferPool,
+        wal: &Wal,
+    ) -> Result<bool> {
+        let pid = self.find_leaf(value, pool)?;
+        let page = pool.fetch_page(pid)?;
+        let node = Node::deserialize(&page)?;
+        pool.unpin(pid);
+        let Node::Leaf { mut entries, next } = node else {
+            return Ok(false);
+        };
+        let Some(slot) = entries.iter().position(|(k, _)| k == value) else {
+            return Ok(false);
+        };
+        entries[slot].1 = new_rid;
+        let leaf = Node::Leaf { entries, next };
+        let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
+        let lsn = write_node(pool, wal, txn_id, begin_lsn, pid, &leaf, self.page_size)?;
+        wal.commit_mini_txn(txn_id, lsn)?;
+        Ok(true)
     }
 
     /// Recursive insert. Returns `Some((separator_key, new_right_page))` when
@@ -808,6 +948,66 @@ mod tests {
             OrderedValue::try_from(&Literal::Int(5)).unwrap(),
             OrderedValue::Int(5)
         );
+    }
+
+    #[test]
+    fn max_entry_and_page_directory_span_leaves() {
+        let e = env();
+        let t = DiskBTree::create(&e.pool, &e.wal).unwrap();
+        // Empty tree.
+        assert_eq!(t.max_entry(&e.pool).unwrap(), None);
+        assert!(t.page_directory(&e.pool).unwrap().is_empty());
+        // Enough keys to force several leaf splits, so rightmost/leftmost
+        // descent and the leaf-chain walk are actually exercised (not a single
+        // leaf). Insert out of order to prove ordering is by key, not arrival.
+        const N: i64 = 400;
+        for i in (0..N).rev() {
+            t.insert(OrderedValue::Int(i), rid(i as u32, 0), &e.pool, &e.wal)
+                .unwrap();
+        }
+        // Tail = highest key (the heap's append point).
+        assert_eq!(
+            t.max_entry(&e.pool).unwrap(),
+            Some((OrderedValue::Int(N - 1), rid((N - 1) as u32, 0)))
+        );
+        // Full directory enumeration, ascending, every page id present once —
+        // over the pool, which is itself a `PageReader` (the mmap reader takes
+        // the same path).
+        let dir = t.page_directory(&e.pool).unwrap();
+        assert_eq!(dir.len(), N as usize);
+        for (i, (pid, _free)) in dir.iter().enumerate() {
+            assert_eq!(*pid, i as u32);
+        }
+    }
+
+    #[test]
+    fn set_value_updates_in_place_without_duplicating() {
+        let e = env();
+        let t = DiskBTree::create(&e.pool, &e.wal).unwrap();
+        // FSM-style: one entry per page key, value's slot carries free bytes.
+        for pid in 0..50u32 {
+            t.insert(
+                OrderedValue::Int(pid as i64),
+                rid(pid, 100),
+                &e.pool,
+                &e.wal,
+            )
+            .unwrap();
+        }
+        // Update page 7's "free" (slot) in place.
+        let updated = t
+            .set_value(&OrderedValue::Int(7), rid(7, 4096), &e.pool, &e.wal)
+            .unwrap();
+        assert!(updated);
+        // Exactly one entry for key 7, now carrying the new value.
+        let dir = t.page_directory(&e.pool).unwrap();
+        let sevens: Vec<_> = dir.iter().filter(|(p, _)| *p == 7).collect();
+        assert_eq!(sevens.len(), 1, "must not duplicate the key");
+        assert_eq!(sevens[0].1, 4096);
+        // A missing key reports false (caller falls back to insert).
+        assert!(!t
+            .set_value(&OrderedValue::Int(999), rid(999, 0), &e.pool, &e.wal)
+            .unwrap());
     }
 
     #[test]

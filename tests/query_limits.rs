@@ -63,7 +63,7 @@ fn generous_timeout_completes() {
         .unwrap();
     engine.commit(xid).unwrap();
     match &res[0] {
-        unidb::sql::executor::ExecResult::Rows(rows) => assert_eq!(rows.len(), 500),
+        unidb::sql::executor::ExecResult::Rows { rows, .. } => assert_eq!(rows.len(), 500),
         other => panic!("expected rows, got {other:?}"),
     }
 }
@@ -129,7 +129,7 @@ fn per_query_work_mem_forces_order_by_spill_but_stays_correct() {
         .unwrap();
     engine.commit(xid).unwrap();
     match &res[0] {
-        unidb::sql::executor::ExecResult::Rows(rows) => {
+        unidb::sql::executor::ExecResult::Rows { rows, .. } => {
             assert_eq!(rows.len(), 300);
             // Ascending, contiguous 0..300.
             for (i, row) in rows.iter().enumerate() {

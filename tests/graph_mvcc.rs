@@ -82,7 +82,7 @@ fn aborted_edge_creation_never_surfaces_in_cypher_query() {
         .execute_cypher(fresh_xid, "MATCH (a)-[:KNOWS]->(b) WHERE a = 1 RETURN b")
         .unwrap();
     match &results[0] {
-        ExecResult::Rows(rows) => assert!(
+        ExecResult::Rows { rows, .. } => assert!(
             rows.is_empty(),
             "aborted edge leaked into a Cypher query: {rows:?}"
         ),

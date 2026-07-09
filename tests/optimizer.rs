@@ -26,7 +26,7 @@ fn run_unidb(setup: &[&str], extra: &[&str], analyze: &[&str], query: &str) -> V
     let results = engine.execute_sql(xid, query).unwrap();
     engine.commit(xid).unwrap();
     match results.into_iter().next().unwrap() {
-        SqlResult::Rows(rows) => rows
+        SqlResult::Rows { rows, .. } => rows
             .into_iter()
             .map(|r| r.iter().map(lit_to_string).collect())
             .collect(),
@@ -200,7 +200,7 @@ fn stats_survive_reopen() {
         .unwrap();
     engine.commit(xid).unwrap();
     let ours = match results.into_iter().next().unwrap() {
-        SqlResult::Rows(rows) => rows.len(),
+        SqlResult::Rows { rows, .. } => rows.len(),
         other => panic!("expected Rows, got {other:?}"),
     };
     let theirs = run_sqlite(

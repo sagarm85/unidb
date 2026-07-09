@@ -984,6 +984,7 @@ mod tests {
             name: name.to_string(),
             columns,
             pages: vec![],
+            fsm_meta: None,
             rls_policy: None,
             events_enabled: false,
             constraints: Default::default(),

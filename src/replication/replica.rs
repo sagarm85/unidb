@@ -198,7 +198,7 @@ mod tests {
 
     fn row_count(rows: &crate::sql::executor::ExecResult) -> usize {
         match rows {
-            crate::sql::executor::ExecResult::Rows(r) => r.len(),
+            crate::sql::executor::ExecResult::Rows { rows: r, .. } => r.len(),
             other => panic!("expected rows, got {other:?}"),
         }
     }

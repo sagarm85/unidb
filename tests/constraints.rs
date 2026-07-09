@@ -46,7 +46,7 @@ fn select_ints(engine: &mut Engine, sql: &str) -> Vec<i64> {
     let results = engine.execute_sql(xid, sql).unwrap();
     engine.commit(xid).unwrap();
     match &results[0] {
-        ExecResult::Rows(rows) => rows
+        ExecResult::Rows { rows, .. } => rows
             .iter()
             .map(|r| match &r[0] {
                 Literal::Int(n) => *n,
@@ -62,7 +62,7 @@ fn select_texts(engine: &mut Engine, sql: &str) -> Vec<String> {
     let results = engine.execute_sql(xid, sql).unwrap();
     engine.commit(xid).unwrap();
     match &results[0] {
-        ExecResult::Rows(rows) => rows
+        ExecResult::Rows { rows, .. } => rows
             .iter()
             .map(|r| match &r[0] {
                 Literal::Text(s) => s.clone(),

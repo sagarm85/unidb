@@ -115,7 +115,7 @@ mod tests {
         let rows = engine.execute_sql(xid, sql).unwrap();
         engine.commit(xid).unwrap();
         match &rows[0] {
-            crate::sql::executor::ExecResult::Rows(r) => r.len(),
+            crate::sql::executor::ExecResult::Rows { rows: r, .. } => r.len(),
             other => panic!("expected rows, got {other:?}"),
         }
     }

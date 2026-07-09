@@ -162,7 +162,10 @@ fn main() -> Result<()> {
 /// Print the rows from a `SELECT` result set, one per line.
 fn print_search_results(results: &[ExecResult]) {
     for result in results {
-        if let ExecResult::Rows(rows) = result {
+        if let ExecResult::Rows { columns, rows } = result {
+            if !columns.is_empty() {
+                println!("{}", columns.join(" | "));
+            }
             if rows.is_empty() {
                 println!("(no matches)");
             }

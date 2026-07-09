@@ -134,12 +134,18 @@ Other `ExecResult` shapes:
 { "type": "truncated", "count": 5 }
 {
   "type": "rows",
+  "columns": ["id", "name", "profile"],
   "rows": [
     [1, "alice", { "status": "active" }]
   ]
 }
 ```
-`rows` is an array of arrays (one array per row, positional column order).
+`columns` is the output column names in order (for `SELECT *`, the table's
+non-dropped columns; for an explicit projection, the projected names; for
+aggregates/joins, the resolved output names; `EXPLAIN` returns a single
+`"QUERY PLAN"` column). `rows` is an array of arrays (one array per row);
+each row's values align positionally with `columns`, so a client can zip them
+into named fields.
 A `JSON` column re-parses into a real nested JSON value on the wire — never
 a JSON-encoded string (see `dto.rs`'s module doc for why). A `DECIMAL` column
 serializes as a **decimal string** (e.g. `"9.90"`) and a `TIMESTAMP` as a UTC
@@ -178,7 +184,7 @@ graph edge data, atomically.
 ```json
 {
   "results": [
-    { "type": "rows", "rows": [[2], [3]] }
+    { "type": "rows", "columns": ["id"], "rows": [[2], [3]] }
   ]
 }
 ```

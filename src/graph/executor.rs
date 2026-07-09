@@ -92,8 +92,12 @@ pub fn execute(
             }
             out
         } else {
-            let pages = ctx.catalog.lookup(EDGES_TABLE)?.pages.clone();
-            let heap = Heap::from_pages(ctx.page_size, pages);
+            let edges_stored = ctx.catalog.lookup(EDGES_TABLE)?;
+            let heap = Heap::open(
+                ctx.page_size,
+                edges_stored.fsm_meta,
+                edges_stored.pages.clone(),
+            );
             let mut out = Vec::new();
             for (_, bytes) in heap.scan(&snapshot, ctx.xid, ctx.pool)? {
                 let row = decode_row(&bytes, &table_def.columns)?;
@@ -127,5 +131,14 @@ pub fn execute(
         }
         out.push(projected);
     }
-    Ok(ExecResult::Rows(out))
+    let columns = query
+        .returns
+        .iter()
+        .map(|item| match item {
+            ReturnItem::FromVar => "from_id".to_string(),
+            ReturnItem::ToVar => "to_id".to_string(),
+            ReturnItem::EdgeColumn(name) => name.clone(),
+        })
+        .collect();
+    Ok(ExecResult::Rows { columns, rows: out })
 }

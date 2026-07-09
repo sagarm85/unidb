@@ -140,8 +140,13 @@ pub enum ExecResult {
     Deleted {
         count: u64,
     },
-    /// Each inner `Vec<Json>` is one row; values are in column declaration order.
-    Rows(Vec<Vec<Json>>),
+    /// A result set: `columns` are the output column names in order, and each
+    /// inner `Vec<Json>` in `rows` is one row whose values align positionally
+    /// with `columns`.
+    Rows {
+        columns: Vec<String>,
+        rows: Vec<Vec<Json>>,
+    },
 }
 
 /// Secondary index kind. Serialization matches `unidb::catalog::IndexKind`'s
@@ -199,6 +204,14 @@ fn decode_exec_result(v: &Json) -> Result<ExecResult, AttachError> {
             count: v["count"].as_u64().unwrap_or(0),
         }),
         "rows" => {
+            let columns = v["columns"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .map(|c| c.as_str().unwrap_or_default().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
             let rows = v["rows"]
                 .as_array()
                 .map(|arr| {
@@ -207,7 +220,7 @@ fn decode_exec_result(v: &Json) -> Result<ExecResult, AttachError> {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            Ok(ExecResult::Rows(rows))
+            Ok(ExecResult::Rows { columns, rows })
         }
         other => Err(AttachError::Api {
             status: 200,

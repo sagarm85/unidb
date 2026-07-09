@@ -752,7 +752,10 @@ impl Engine {
             {
                 Ok(()) => {
                     self.audit.record_admin(user, action, &object, true);
-                    Ok(vec![ExecResult::Rows(Vec::new())])
+                    Ok(vec![ExecResult::Rows {
+                        columns: Vec::new(),
+                        rows: Vec::new(),
+                    }])
                 }
                 Err(e) => {
                     self.audit.record_admin(user, action, &object, false);
@@ -1208,8 +1211,12 @@ impl Engine {
         let page_size = self.page_size;
         let events_def = cat_read(&self.catalog).lookup(EVENTS_TABLE)?.clone();
         let consumers_def = cat_read(&self.catalog).lookup(CONSUMERS_TABLE)?.clone();
-        let events_heap = Heap::from_pages(page_size, events_def.pages.clone());
-        let consumers_heap = Heap::from_pages(page_size, consumers_def.pages.clone());
+        let events_heap = Heap::open(page_size, events_def.fsm_meta, events_def.pages.clone());
+        let consumers_heap = Heap::open(
+            page_size,
+            consumers_def.fsm_meta,
+            consumers_def.pages.clone(),
+        );
         let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
 
         let offset =
@@ -1258,7 +1265,11 @@ impl Engine {
         let _ws = serial_lock(&self.write_serial); // P5.e-3: serialize catalog/index writes
         let page_size = self.page_size;
         let consumers_def = cat_read(&self.catalog).lookup(CONSUMERS_TABLE)?.clone();
-        let heap = Heap::from_pages(page_size, consumers_def.pages.clone());
+        let heap = Heap::open(
+            page_size,
+            consumers_def.fsm_meta,
+            consumers_def.pages.clone(),
+        );
         let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
         let existing = queue::find_consumer_offset(&heap, &snapshot, xid, &self.pool, consumer)?;
 
@@ -1294,7 +1305,7 @@ impl Engine {
             }
         }
 
-        if heap.page_ids() != consumers_def.pages.as_slice() {
+        if !heap.is_fsm_backed() && heap.page_ids() != consumers_def.pages.as_slice() {
             let mut cctx = CatalogCtx {
                 pool: &self.pool,
                 wal: &self.wal,
@@ -1326,7 +1337,11 @@ impl Engine {
         let _ws = serial_lock(&self.write_serial); // P5.e-3: serialize catalog/index writes
         let page_size = self.page_size;
         let consumers_def = cat_read(&self.catalog).lookup(CONSUMERS_TABLE)?.clone();
-        let consumers_heap = Heap::from_pages(page_size, consumers_def.pages.clone());
+        let consumers_heap = Heap::open(
+            page_size,
+            consumers_def.fsm_meta,
+            consumers_def.pages.clone(),
+        );
         let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
 
         let mut min_offset: Option<i64> = None;
@@ -1341,7 +1356,7 @@ impl Engine {
         };
 
         let events_def = cat_read(&self.catalog).lookup(EVENTS_TABLE)?.clone();
-        let events_heap = Heap::from_pages(page_size, events_def.pages.clone());
+        let events_heap = Heap::open(page_size, events_def.fsm_meta, events_def.pages.clone());
         let to_reclaim: Vec<RowId> = events_heap
             .scan(&snapshot, xid, &self.pool)?
             .into_iter()
@@ -1386,7 +1401,7 @@ impl Engine {
         let _ws = serial_lock(&self.write_serial); // P5.e-3: serialize catalog/index writes
         let page_size = self.page_size;
         let table_def = cat_read(&self.catalog).lookup(edges::EDGES_TABLE)?.clone();
-        let heap = Heap::from_pages(page_size, table_def.pages.clone());
+        let heap = Heap::open(page_size, table_def.fsm_meta, table_def.pages.clone());
 
         let encoded = executor::encode_row(&edges::edge_row(from_id, to_id, edge_type, props));
         let row_id = heap.insert(&encoded, xid, &self.pool, &self.wal)?;
@@ -1398,7 +1413,7 @@ impl Engine {
             },
         )?;
 
-        if heap.page_ids() != table_def.pages.as_slice() {
+        if !heap.is_fsm_backed() && heap.page_ids() != table_def.pages.as_slice() {
             let mut cctx = CatalogCtx {
                 pool: &self.pool,
                 wal: &self.wal,
@@ -1435,7 +1450,7 @@ impl Engine {
         let _ws = serial_lock(&self.write_serial); // P5.e-3: serialize catalog/index writes
         let page_size = self.page_size;
         let table_def = cat_read(&self.catalog).lookup(edges::EDGES_TABLE)?.clone();
-        let heap = Heap::from_pages(page_size, table_def.pages.clone());
+        let heap = Heap::open(page_size, table_def.fsm_meta, table_def.pages.clone());
 
         heap.delete(row_id, xid, &self.pool, &self.wal, &self.lock_mgr)?;
         self.txn_mgr.record_undo(
@@ -1565,7 +1580,7 @@ impl Engine {
             }
         }
 
-        let heap = Heap::from_pages(page_size, table_def.pages.clone());
+        let heap = Heap::open(page_size, table_def.fsm_meta, table_def.pages.clone());
         let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
         let mut out = Vec::new();
         for rid in candidates {
@@ -1593,7 +1608,7 @@ impl Engine {
         let table_def = cat_read(&self.catalog)
             .lookup(large_object::LOBS_TABLE)?
             .clone();
-        let heap = Heap::from_pages(page_size, table_def.pages.clone());
+        let heap = Heap::open(page_size, table_def.fsm_meta, table_def.pages.clone());
         let store = LobStore::new(self.lob_index_meta, page_size);
         store.write_stream(
             xid,
@@ -1635,7 +1650,7 @@ impl Engine {
         let table_def = cat_read(&self.catalog)
             .lookup(large_object::LOBS_TABLE)?
             .clone();
-        let heap = Heap::from_pages(page_size, table_def.pages.clone());
+        let heap = Heap::open(page_size, table_def.fsm_meta, table_def.pages.clone());
         let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
         let store = LobStore::new(self.lob_index_meta, page_size);
         store.delete(
@@ -1653,7 +1668,7 @@ impl Engine {
 
     /// Persist `__lobs__`'s page list back to the catalog if the heap grew.
     fn persist_lobs_pages(&self, heap: &Heap, original: &[PageId]) -> Result<()> {
-        if heap.page_ids() != original {
+        if !heap.is_fsm_backed() && heap.page_ids() != original {
             let page_size = self.page_size;
             let mut cctx = CatalogCtx {
                 pool: &self.pool,
@@ -2161,7 +2176,7 @@ impl Engine {
         // separately below.
         let table_defs: Vec<TableDef> = cat_read(&self.catalog).tables().cloned().collect();
         for table in &table_defs {
-            let heap = Heap::from_pages(page_size, table.pages.clone());
+            let heap = Heap::open(page_size, table.fsm_meta, table.pages.clone());
             report.rows_scanned += count_live_slots(&heap, &self.pool)?;
             let reclaimable = heap.collect_reclaimable(horizon, &self.pool)?;
             if reclaimable.is_empty() {
@@ -2315,6 +2330,7 @@ fn unique_pages(rows: &[RowId]) -> Vec<PageId> {
 /// Count LIVE slots across a heap's pages (for the vacuum report's
 /// `rows_scanned`), tolerating reclaimed (DEAD/UNUSED) slots.
 fn count_live_slots(heap: &Heap, pool: &BufferPool) -> Result<usize> {
+    heap.ensure_directory(pool)?; // FSM-backed: load the page directory first
     let mut n = 0;
     for page_id in heap.page_ids() {
         let page = pool.read_page(page_id)?;
@@ -2361,7 +2377,7 @@ fn ensure_edge_index(
     // on a fresh database; non-empty only when upgrading a pre-P3.b `__edges__`).
     let tree = DiskBTree::create(pool, wal)?;
     let table = catalog.lookup(edges::EDGES_TABLE)?.clone();
-    let heap = Heap::from_pages(page_size, table.pages.clone());
+    let heap = Heap::open(page_size, table.fsm_meta, table.pages.clone());
     let xid = txn_mgr.begin(IsolationLevel::ReadCommitted, wal)?;
     let snapshot = txn_mgr.snapshot_for_statement(xid)?;
     for (row_id, bytes) in heap.scan(&snapshot, xid, pool)? {
@@ -2414,7 +2430,7 @@ fn derive_next_lob_id(
     page_size: usize,
 ) -> Result<i64> {
     let table = catalog.lookup(large_object::LOBS_TABLE)?;
-    let heap = Heap::from_pages(page_size, table.pages.clone());
+    let heap = Heap::open(page_size, table.fsm_meta, table.pages.clone());
     let xid = txn_mgr.begin(IsolationLevel::ReadCommitted, wal)?;
     let snapshot = txn_mgr.snapshot_for_statement(xid)?;
     let mut max_id: i64 = 0;
@@ -2437,7 +2453,7 @@ fn derive_next_event_seq(
     page_size: usize,
 ) -> Result<u64> {
     let table = catalog.lookup(EVENTS_TABLE)?;
-    let heap = Heap::from_pages(page_size, table.pages.clone());
+    let heap = Heap::open(page_size, table.fsm_meta, table.pages.clone());
     let xid = txn_mgr.begin(IsolationLevel::ReadCommitted, wal)?;
     let snapshot = txn_mgr.snapshot_for_statement(xid)?;
     let mut max_seq: u64 = 0;
@@ -2487,6 +2503,66 @@ mod tests {
         let new_rid = engine.update(xid, rid, b"updated").unwrap();
         assert_eq!(engine.get(xid, new_rid).unwrap(), b"updated");
         engine.commit(xid).unwrap();
+    }
+
+    /// B1 regression: the SQL INSERT path builds a table **past the old
+    /// ~1,450-page catalog-blob ceiling**. Before the durable FSM, every heap
+    /// page alloc rewrote the whole page list into the single JSON catalog blob
+    /// (`set_pages`); at ~1,450 pages that blob overflowed an 8 KiB page and the
+    /// next INSERT died with `HeapFull { size: 8138 }`, capping SQL-built tables
+    /// at ~145k small rows. The durable FSM moves the page directory out of the
+    /// catalog into the per-table `DiskBTree`, so there is no blob to overflow.
+    #[test]
+    fn sql_insert_path_clears_old_catalog_pagelist_ceiling() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE t (id INT, body TEXT)")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        // ~4 KiB bodies pack ~2 rows per 8 KiB page, so a few thousand rows
+        // clear the ~1,450-page ceiling without a million inserts. One
+        // transaction (group-committed) keeps it fast.
+        let body = "x".repeat(4000);
+        let ins = engine
+            .prepare("INSERT INTO t (id, body) VALUES ($1, $2)")
+            .unwrap();
+        const N: i64 = 3_400; // > 1,450 pages at ~2 rows/page
+        let x = engine.begin().unwrap();
+        for i in 0..N {
+            engine
+                .execute_prepared(x, &ins, &[Literal::Int(i), Literal::Text(body.clone())])
+                .unwrap();
+        }
+        engine.commit(x).unwrap();
+
+        // The durable directory holds more pages than the old ceiling — direct
+        // proof the O(pages) blob cap is gone.
+        let fsm_meta = cat_read(&engine.catalog).lookup("t").unwrap().fsm_meta;
+        assert!(fsm_meta.is_some(), "table must be FSM-backed");
+        let heap = Heap::open(engine.page_size, fsm_meta, Vec::new());
+        heap.ensure_directory(&engine.pool).unwrap();
+        let pages = heap.page_ids().len();
+        assert!(
+            pages > 1_450,
+            "expected to clear the ~1,450-page ceiling, built only {pages} pages"
+        );
+
+        // And every row is durably readable back through the SQL path.
+        let x = engine.begin().unwrap();
+        let rows = match engine
+            .execute_sql(x, "SELECT id FROM t")
+            .unwrap()
+            .pop()
+            .unwrap()
+        {
+            ExecResult::Rows { rows: r, .. } => r,
+            other => panic!("expected Rows, got {other:?}"),
+        };
+        engine.commit(x).unwrap();
+        assert_eq!(rows.len(), N as usize);
     }
 
     #[test]
@@ -2734,7 +2810,7 @@ mod tests {
             .execute_sql(xid2, "SELECT * FROM accounts WHERE id = 1")
             .unwrap();
         assert_eq!(results.len(), 1);
-        assert!(matches!(&results[0], SqlResult::Rows(rows) if rows.len() == 1));
+        assert!(matches!(&results[0], SqlResult::Rows { rows, .. } if rows.len() == 1));
 
         engine
             .execute_sql(xid2, "UPDATE accounts SET balance = 200 WHERE id = 1")
@@ -2743,7 +2819,7 @@ mod tests {
             .execute_sql(xid2, "SELECT balance FROM accounts WHERE id = 1")
             .unwrap();
         match &reselect[0] {
-            SqlResult::Rows(rows) => {
+            SqlResult::Rows { rows, .. } => {
                 assert_eq!(rows[0][0], crate::sql::logical::Literal::Int(200))
             }
             other => panic!("expected Rows, got {other:?}"),
@@ -2756,7 +2832,7 @@ mod tests {
 
         let xid3 = engine.begin().unwrap();
         let remaining = engine.execute_sql(xid3, "SELECT * FROM accounts").unwrap();
-        assert!(matches!(&remaining[0], SqlResult::Rows(rows) if rows.len() == 1));
+        assert!(matches!(&remaining[0], SqlResult::Rows { rows, .. } if rows.len() == 1));
     }
 
     #[test]
@@ -2816,7 +2892,7 @@ mod tests {
         let xid = engine.begin().unwrap();
         let rows = engine.execute_sql(xid, "SELECT a, c FROM t").unwrap();
         match &rows[0] {
-            SqlResult::Rows(r) => assert_eq!(
+            SqlResult::Rows { rows: r, .. } => assert_eq!(
                 r,
                 &vec![vec![
                     crate::sql::logical::Literal::Int(1),
@@ -2863,7 +2939,7 @@ mod tests {
             .execute_sql(xid2, "SELECT id FROM t WHERE v = 30")
             .unwrap();
         match &rows[0] {
-            SqlResult::Rows(r) => {
+            SqlResult::Rows { rows: r, .. } => {
                 // Must be 3, not a reused 1 — the sequence resumed after reopen.
                 assert_eq!(r, &vec![vec![crate::sql::logical::Literal::Int(3)]]);
             }
@@ -2896,13 +2972,13 @@ mod tests {
                 std::slice::from_ref(&attack),
             )
             .unwrap();
-        assert!(matches!(&rows[0], SqlResult::Rows(r) if r.is_empty()));
+        assert!(matches!(&rows[0], SqlResult::Rows { rows: r, .. } if r.is_empty()));
         engine.commit(xid2).unwrap();
 
         // The table still exists and its row is intact — nothing was dropped.
         let xid3 = engine.begin().unwrap();
         let all = engine.execute_sql(xid3, "SELECT * FROM t").unwrap();
-        assert!(matches!(&all[0], SqlResult::Rows(r) if r.len() == 1));
+        assert!(matches!(&all[0], SqlResult::Rows { rows: r, .. } if r.len() == 1));
 
         // Binding that exact string as an INSERT value stores it verbatim.
         engine
@@ -2916,7 +2992,7 @@ mod tests {
             .execute_sql_params(xid3, "SELECT id FROM t WHERE name = $1", &[attack])
             .unwrap();
         match &found[0] {
-            SqlResult::Rows(r) => assert_eq!(r, &vec![vec![Literal::Int(2)]]),
+            SqlResult::Rows { rows: r, .. } => assert_eq!(r, &vec![vec![Literal::Int(2)]]),
             other => panic!("expected Rows, got {other:?}"),
         }
     }
@@ -2959,7 +3035,7 @@ mod tests {
             .execute_prepared(xid2, &stmt, &[Literal::Int(2)])
             .unwrap();
         match (&r1[0], &r2[0]) {
-            (SqlResult::Rows(a), SqlResult::Rows(b)) => {
+            (SqlResult::Rows { rows: a, .. }, SqlResult::Rows { rows: b, .. }) => {
                 assert_eq!(a, &vec![vec![Literal::Text("a".to_string())]]);
                 assert_eq!(b, &vec![vec![Literal::Text("b".to_string())]]);
             }
@@ -2991,7 +3067,7 @@ mod tests {
             .execute_sql(xid2, "SELECT * FROM t WHERE id = 1")
             .unwrap();
         match &results[0] {
-            SqlResult::Rows(rows) => {
+            SqlResult::Rows { rows, .. } => {
                 assert_eq!(
                     rows[0][1],
                     crate::sql::logical::Literal::Vector(vec![0.1, 0.2, 0.3, 0.4])
@@ -3021,7 +3097,7 @@ mod tests {
     /// Collect the integer `id`s a NEAR query returns, in order.
     fn near_ids(engine: &mut Engine, xid: Xid, sql: &str) -> Vec<i64> {
         match &engine.execute_sql(xid, sql).unwrap()[0] {
-            SqlResult::Rows(rows) => rows
+            SqlResult::Rows { rows, .. } => rows
                 .iter()
                 .map(|r| match r[0] {
                     crate::sql::logical::Literal::Int(n) => n,
@@ -3230,7 +3306,7 @@ mod tests {
             )
             .unwrap();
         match &results[0] {
-            SqlResult::Rows(rows) => {
+            SqlResult::Rows { rows, .. } => {
                 assert_eq!(rows.len(), 2);
                 assert_eq!(rows[0][0], crate::sql::logical::Literal::Int(1));
                 assert_eq!(rows[1][0], crate::sql::logical::Literal::Int(3));
@@ -3275,7 +3351,7 @@ mod tests {
             )
             .unwrap();
         match &results[0] {
-            SqlResult::Rows(rows) => {
+            SqlResult::Rows { rows, .. } => {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0][0], crate::sql::logical::Literal::Int(2));
             }
@@ -3300,7 +3376,7 @@ mod tests {
         let xid = engine2.begin().unwrap();
         let result = engine2.execute_sql(xid, "SELECT * FROM t").unwrap();
         match &result[0] {
-            SqlResult::Rows(rows) => assert_eq!(rows.len(), 1),
+            SqlResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
             other => panic!("expected Rows, got {other:?}"),
         }
     }
@@ -3413,7 +3489,7 @@ mod tests {
             .execute_sql(q, "SELECT v FROM t WHERE id = 1")
             .unwrap()[0]
         {
-            SqlResult::Rows(rows) => assert_eq!(rows.len(), 1),
+            SqlResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
             other => panic!("expected Rows, got {other:?}"),
         }
     }
@@ -3530,7 +3606,7 @@ mod tests {
         let engine = Engine::open(dir.path(), 0).unwrap();
         let q = engine.begin().unwrap();
         match &engine.execute_sql(q, "SELECT id FROM t").unwrap()[0] {
-            SqlResult::Rows(rows) => assert_eq!(rows.len(), 50, "all rows must survive"),
+            SqlResult::Rows { rows, .. } => assert_eq!(rows.len(), 50, "all rows must survive"),
             other => panic!("expected Rows, got {other:?}"),
         }
     }
@@ -3604,14 +3680,14 @@ mod tests {
         let xid2 = engine.begin().unwrap();
         let result = engine.execute_sql(xid2, "SELECT * FROM t").unwrap();
         match &result[0] {
-            SqlResult::Rows(rows) => assert_eq!(rows.len(), 1),
+            SqlResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
             other => panic!("expected Rows, got {other:?}"),
         }
     }
 
     fn sorted_names(result: &SqlResult) -> Vec<String> {
         match result {
-            SqlResult::Rows(rows) => {
+            SqlResult::Rows { rows, .. } => {
                 let mut names: Vec<String> = rows
                     .iter()
                     .map(|r| match &r[0] {
@@ -3735,7 +3811,7 @@ mod tests {
             .execute_sql(xid2, "SELECT owner FROM t WHERE id = 1")
             .unwrap();
         match &result[0] {
-            SqlResult::Rows(rows) => {
+            SqlResult::Rows { rows, .. } => {
                 assert_eq!(rows.len(), 1, "RLS must filter out bob's row: {rows:?}");
                 assert_eq!(
                     rows[0][0],
@@ -3761,7 +3837,7 @@ mod tests {
             .execute_sql(xid2, "SELECT * FROM __edges__ WHERE from_id = 1")
             .unwrap();
         match &result[0] {
-            SqlResult::Rows(rows) => assert_eq!(rows.len(), 1),
+            SqlResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
             other => panic!("expected Rows, got {other:?}"),
         }
     }
@@ -3843,7 +3919,7 @@ mod tests {
             .execute_cypher(xid2, "MATCH (a)-[:KNOWS]->(b) WHERE a = 1 RETURN b")
             .unwrap();
         match &results[0] {
-            SqlResult::Rows(rows) => {
+            SqlResult::Rows { rows, .. } => {
                 let mut to_ids: Vec<i64> = rows
                     .iter()
                     .map(|r| match &r[0] {
@@ -3872,7 +3948,7 @@ mod tests {
             .execute_cypher(xid2, "MATCH (a)-[:LIKES]->(b) WHERE a = 1 RETURN b")
             .unwrap();
         match &results[0] {
-            SqlResult::Rows(rows) => {
+            SqlResult::Rows { rows, .. } => {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0][0], Literal::Int(3));
             }
@@ -3897,7 +3973,7 @@ mod tests {
             .execute_cypher(xid2, "MATCH (a)-[:KNOWS]->(b) RETURN a, b")
             .unwrap();
         match &results[0] {
-            SqlResult::Rows(rows) => assert_eq!(rows.len(), 2),
+            SqlResult::Rows { rows, .. } => assert_eq!(rows.len(), 2),
             other => panic!("expected Rows, got {other:?}"),
         }
     }
@@ -3920,7 +3996,7 @@ mod tests {
             )
             .unwrap();
         match &results[0] {
-            SqlResult::Rows(rows) => {
+            SqlResult::Rows { rows, .. } => {
                 assert_eq!(rows[0][0], Literal::Int(2));
                 assert_eq!(rows[0][1], Literal::Text("KNOWS".to_string()));
                 assert_eq!(rows[0][2], Literal::Json("{\"since\":2020}".to_string()));
@@ -3954,7 +4030,7 @@ mod tests {
             )
             .unwrap();
         match &results[0] {
-            SqlResult::Rows(rows) => rows.clone(),
+            SqlResult::Rows { rows, .. } => rows.clone(),
             other => panic!("expected Rows, got {other:?}"),
         }
     }
@@ -3965,11 +4041,17 @@ mod tests {
         let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         let events = engine.execute_sql(xid, "SELECT * FROM __events__").unwrap();
-        assert_eq!(events, vec![SqlResult::Rows(vec![])]);
+        match &events[0] {
+            SqlResult::Rows { rows, .. } => assert!(rows.is_empty()),
+            other => panic!("expected Rows, got {other:?}"),
+        }
         let consumers = engine
             .execute_sql(xid, "SELECT * FROM __consumers__")
             .unwrap();
-        assert_eq!(consumers, vec![SqlResult::Rows(vec![])]);
+        match &consumers[0] {
+            SqlResult::Rows { rows, .. } => assert!(rows.is_empty()),
+            other => panic!("expected Rows, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4107,7 +4189,7 @@ mod tests {
             .execute_sql(doomed, "SELECT * FROM __events__ WHERE table_name = 't'")
             .unwrap();
         match &self_view[0] {
-            SqlResult::Rows(rows) => assert_eq!(
+            SqlResult::Rows { rows, .. } => assert_eq!(
                 rows.len(),
                 1,
                 "inserting transaction must see its own uncommitted event"
@@ -4264,7 +4346,7 @@ mod tests {
             .execute_sql(xid, "SELECT * FROM __consumers__")
             .unwrap();
         match &consumers[0] {
-            SqlResult::Rows(rows) => assert!(
+            SqlResult::Rows { rows, .. } => assert!(
                 rows.is_empty(),
                 "poll_events must not write a __consumers__ row"
             ),

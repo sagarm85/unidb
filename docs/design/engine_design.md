@@ -60,7 +60,7 @@ Module map (what each layer became in code):
 | Transactions (M1; concurrent since Phase 5) | `mvcc.rs`, `txn.rs`, `lockmgr.rs`, `concurrency_hooks.rs`, `query_limits.rs` (P5.f timeouts/cancel/`work_mem`) |
 | Catalog & SQL (M1) | `catalog.rs`, `sql/{parser,logical,executor}.rs` |
 | Query power (Phase 4) | `sql/{query,plan,query_exec,join,aggregate,sort,optimizer,statistics,explain}.rs` — joins (hash+Grace-spill / sort-merge / index-nested-loop), aggregation + sort, subqueries/CTEs, `ANALYZE` + cost-based optimizer, `EXPLAIN` |
-| Secondary indexes (M2, M6, M7; all durable since Phase 3) | `btree_index.rs` (durable `DiskBTree`, also backs full-text + edge), `disk_vector.rs` (durable IVF-Flat `DiskIvfIndex`), `fulltext.rs` (tokenizer), `vector.rs` (retired in-RAM HNSW baseline), `csr_index.rs` (retired) |
+| Secondary indexes (M2, M6, M7; all durable since Phase 3) | `btree_index.rs` (durable `DiskBTree`, also backs full-text + edge, and the per-table durable **free-space map / page directory** since the durable-FSM milestone), `disk_vector.rs` (durable IVF-Flat `DiskIvfIndex`), `fulltext.rs` (tokenizer), `vector.rs` (retired in-RAM HNSW baseline), `csr_index.rs` (retired) |
 | Graph (M3, M7) | `graph/{edges,index,logical,parser,executor}.rs` |
 | Event queue (M4) | `queue/{mod,payload}.rs` |
 | Server (M5, feature-gated) | `server/{engine_handle,error,dto,handlers,router,auth,sse}.rs`, `bin/unidb-server.rs` |
@@ -246,9 +246,15 @@ per page, so page selection is integer comparisons; only pages whose free
 space is still unknown (a `from_pages`-reconstructed heap) are probed, from
 the end backward (append locality), caching each. Benchmarked: insert
 throughput does **not** degrade as a heap grows to 300k rows (`benches/
-scale.rs`). Caveat: the map is per-`Heap`-instance, and the SQL executor
-rebuilds a `Heap` per statement (`from_pages`), so single-row autocommit SQL
-inserts rebuild it lazily; a durable on-disk FSM fork is a later item (§12).
+scale.rs`). **Since the durable-FSM milestone (2026-07-10)** a catalog table's
+page directory + free-space map is a per-table durable `DiskBTree` keyed
+`page_id → free_bytes` (`TableDef.fsm_meta`), not the old in-catalog `pages`
+blob: `Heap::open` is O(1) (no directory load), the SQL insert path appends at
+the durable tail via `DiskBTree::max_entry` (O(log n), no per-statement rebuild),
+and a full scan/vacuum lazily warms the free map from the tree. This closed the
+O(heap-pages) catalog-blob `HeapFull` ceiling (see §12 and `docs/backlog/
+durable_fsm_catalog_pagelist.md`). The legacy raw-CRUD `self.heap` still uses the
+in-memory `free_map` described above.
 
 ### 3.5 Checkpoint & recovery
 
@@ -415,9 +421,14 @@ P2.a–P2.b), persisted as a single
 `serde_json` blob rewritten to a fresh page on every change, pointed at by
 `control.catalog_root`. Using `serde` here is deliberate — schema is
 infrequent control-plane data, not the hot path D9 protects.
-`TableDef.pages: Vec<PageId>` persists each table's page list; the
-executor reconstructs a `Heap` handle per statement via
-`Heap::from_pages` (cheap; avoids a cache-invalidation story).
+`TableDef.fsm_meta: Option<PageId>` holds the stable meta page of each table's
+**durable free-space map** (a `DiskBTree` keyed `page_id → free_bytes` whose keys
+are the page directory — durable-FSM milestone); the executor reconstructs a
+`Heap` handle per statement via `Heap::open` (O(1) — the directory is not loaded
+until a full scan needs it). The legacy `TableDef.pages: Vec<PageId>` field is
+retained only as a `#[serde(default)]` fallback for pre-FSM catalogs (no
+migration). Storing the page list *inline in the catalog blob* was the
+O(heap-pages) `HeapFull` ceiling this milestone removed (§12).
 
 **Catalog is not MVCC-versioned**: DDL takes effect immediately and
 globally; `CREATE TABLE` inside a transaction that later aborts is *not*
@@ -963,9 +974,13 @@ the single writer thread).
   O(N²) whole-file-remap-per-`alloc_page` with chunked growth, so heaps scale
   to 300k+ rows with flat throughput (`benches/scale.rs`, §3.4).
 - **Linear-scan FSM** (was open): **fixed by P1.c** — `Heap::free_map` makes
-  page selection integer comparisons, not a fetch of every page. Remaining
+  page selection integer comparisons, not a fetch of every page. ~~Remaining
   caveat: the map is per-`Heap`-instance and the SQL path rebuilds a heap per
-  statement, so a durable on-disk FSM fork is a later item.
+  statement, so a durable on-disk FSM fork is a later item.~~ **Fixed by the
+  durable-FSM milestone (2026-07-10):** each catalog table's page directory +
+  free-space map is a durable per-table `DiskBTree` (`TableDef.fsm_meta`), so the
+  SQL path no longer rebuilds per statement and the O(heap-pages) catalog-blob
+  `HeapFull` ceiling is gone (see §12, `docs/backlog/durable_fsm_catalog_pagelist.md`).
 - Peak RSS has stayed ~27–28 MB across M0/M1 measurement points.
 
 ---
@@ -1022,7 +1037,12 @@ too.) The remaining smoother is a background WAL-writer thread for
 eviction-forced syncs under memory pressure (noted, not required for
 correctness). WAL truncation rewrites
 the whole file (needs log segments); ~~FSM is a linear scan~~ (**fixed P1.c**:
-`Heap::free_map`); ~~256-frame buffer pool + `BufferPoolFull` at scale~~
+`Heap::free_map`) ~~/ per-`Heap` map rebuilt per SQL statement + an O(heap-pages)
+catalog page-list blob that overflowed a page at ~1,450 pages (`HeapFull{8138}`,
+capping SQL bulk loads at ~145k rows)~~ (**fixed by the durable-FSM milestone
+2026-07-10**: per-table durable `DiskBTree` FSM keyed `page_id → free_bytes`,
+`TableDef.fsm_meta`, O(1) open, no per-statement rebuild — `docs/backlog/
+durable_fsm_catalog_pagelist.md`); ~~256-frame buffer pool + `BufferPoolFull` at scale~~
 (**fixed** — configurable 4096-frame default + chunked file growth, P1.c);
 ~~`alloc_page` remaps the whole file per page~~ (**fixed P1.c**: chunked
 growth); ~~HNSW full rebuild per upsert~~ (**fixed P3.c**: durable IVF-Flat, O(1)
@@ -1057,8 +1077,11 @@ txn snapshot state — so a read allocates no xid, writes no WAL, and never
 touches the writer's request channel. `Engine` itself stays deliberately
 non-`Sync`; `ReadHandle` is the shared-reader type (asserted `Send + Sync`).
 Read-only SQL `SELECT` (`POST /sql`) also runs on this path: `Engine.catalog`
-is behind an `Arc<RwLock>` (readers need the live `TableDef.pages`), and
-`ReadHandle::execute_sql` reuses a `PageReader`-generic `exec_select_readonly`;
+is behind an `Arc<RwLock>` (readers need the live `TableDef.fsm_meta`, from which
+the concurrent-read scan reconstructs the page directory via the FSM tree over
+its `SharedPageReader` mmap — `DiskBTree::page_directory` is `PageReader`-generic
+for exactly this), and `ReadHandle::execute_sql` reuses a `PageReader`-generic
+`exec_select_readonly`;
 `is_concurrent_read_sql` classifies each statement so the handler routes
 reads to the read handle and writes/DDL/`NEAR` to the writer. *Writes* still
 serialize through the single writer thread (by design — fsync-/group-commit-
@@ -1228,4 +1251,16 @@ the valid-prefix property test now runs under both durability policies.
 Acceptance: `benches/decompose.rs` shows the multi-model commit dropping ~33.1 ms
 → ~4.3 ms (~7.7×) at one fsync per commit, W0 at SQLite parity. No `FORMAT_VERSION`
 bump; sync invariant holds. See `docs/backlog/commit_time_fsync.md`.
+**Postgres baseline comparison (2026-07-09, branch `pg-baseline`)** and
+**Autovacuum (2026-07-09, branch `autovacuum`, crash harness 25→26)** then
+shipped (benches/ops only, and a background `std::thread` vacuum launcher). **Durable
+on-disk FSM + catalog page-list (2026-07-10, branch `durable-fsm`): the SQL page
+directory + free-space map move off the catalog blob into a per-table durable
+`DiskBTree` keyed `page_id → free_bytes` (`TableDef.fsm_meta`), O(1) open, atomic
+heap grow, vacuum-durable reclamation — closing the O(heap-pages) catalog-blob
+`HeapFull` ceiling (§3.4/§8/§12; crash harness 26→28, P27+P28; no `FORMAT_VERSION`
+bump). B-accept: marginal SQL-insert cost goes from rising-then-`HeapFull` (65→108→173
+µs/row, dies at ~876 pages) to flat ~17–28 µs/row past 2,000 pages; concurrent-SQL
+scaling unchanged (honest finding — `set_pages` was not the small-table bottleneck).
+See `docs/backlog/durable_fsm_catalog_pagelist.md` + `PROGRESS.md`.**
 Update alongside the next milestone's closeout.*
