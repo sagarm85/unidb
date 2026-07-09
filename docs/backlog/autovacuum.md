@@ -1,6 +1,32 @@
 # Autovacuum — background/triggered MVCC garbage collection
 
-## Status as of 2026-07-09: NOT STARTED (backlog). **Core-lane, engine work.**
+## Status as of 2026-07-09: **SHIPPED** (branch `autovacuum`, checkpoints A1–A4 as
+## ordered commits). See `PROGRESS.md`'s "Autovacuum" entry.
+
+**Implemented as the background-worker shape directly** (the spec's AV2), per the
+Core-lane directive to add a `std::thread` launcher rather than an inline
+`maybe_auto_vacuum()` from `commit` (AV1). This keeps *all* vacuum work off the
+foreground commit path — the real autovacuum value — and is safe without new
+locking because `Engine` is `Send + Sync` (Phase 5) and `vacuum` takes `&self`
+under `write_serial` + per-page latches (M10). Honest divergences from the
+proposal below, all documented in the shipped code + `PROGRESS.md`:
+
+- **Global** dead/live-tuple estimates (the spec's "global atomic in v1" option),
+  not per-table. Whole-engine `Engine::vacuum` pass, not per-table `vacuum_table`
+  — per-table accounting + `vacuum_table` + a cost-based throttle remain the
+  documented AV-follow-up.
+- **No bounded-K-per-call throttle.** The pass runs on the background thread, so
+  an unbounded pass is not a *foreground* stall (the AV1 bounding was to protect
+  the committing thread; AV2 doesn't share it). A cost limit is future work.
+- The worker holds a `Weak<Engine>` (a strong `Arc` would form a refcount cycle
+  preventing `Engine::Drop`); the handle is an engine field, so field-drop is the
+  clean-shutdown hook (M2.b-style, bounded join). Default-on for the served
+  instance + the `Engine::open_arc` convenience; a bare `Engine::open` handle has
+  no thread by construction (deterministic for tests; manual `vacuum()` stays).
+
+---
+
+## Original spec (as filed) — NOT STARTED (backlog). **Core-lane, engine work.**
 
 Filed from the Postgres baseline comparison (`pg_baseline_comparison.md`, PR #25).
 The churn test was the one place unidb clearly trails Postgres: under 30× update

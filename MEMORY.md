@@ -12,6 +12,45 @@
 
 ## Current status
 
+- **Autovacuum — COMPLETE (2026-07-09), on branch `autovacuum` (one PR,
+  checkpoints A1–A4 as ordered commits).** Closes the one automation gap the
+  Postgres baseline surfaced: M10 `Engine::vacuum` was manual-only, so sustained
+  churn bloated reads. A background **`std::thread`** launcher (NOT tokio — §4
+  sync-core invariant held; `cargo tree` free of tokio/reqwest/axum) now
+  **auto-triggers that same, already-safe M10 vacuum** on a Postgres-shape policy
+  `dead > threshold + scale_factor·live`. **No reclamation re-implemented; the
+  vacuum horizon is untouched** (reader-correct P5.c, slot-pinned P6.b) —
+  autovacuum only decides *when*. Checkpoints: **A1** global `dead_tuples`/
+  `live_tuples` atomic estimates (Postgres `n_dead_tup`/`reltuples`-style),
+  counted at the raw-CRUD + SQL-statement chokepoints (never in `heap.rs` —
+  recovery redo drives that), refreshed by `vacuum_inner`; **A2**
+  `AutoVacuumConfig{enabled,threshold,scale_factor,naptime}` mirroring
+  `AutoCheckpointConfig`, env knobs `UNIDB_AUTOVACUUM_{ENABLED,THRESHOLD,
+  SCALE_FACTOR,NAPTIME_SECS}`, default-on (50/0.2/60 s), pure `should_vacuum`;
+  **A3** `src/autovacuum.rs` — the worker holds a **`Weak<Engine>`** (a strong
+  `Arc` would form a refcount cycle preventing `Engine::Drop`), the
+  `AutoVacuumHandle` is an engine field so field-drop = clean shutdown (M2.b-style
+  bounded join + a `worker_id` self-join guard for the external-drop-mid-pass
+  race); `spawn_autovacuum(&Arc<Engine>)` + `open_arc()` (default-on, wired into
+  the server); a bare `Engine::open` is thread-free by construction
+  (deterministic tests; manual `vacuum()` always available); **A4** stats via
+  `EngineStats`/`/stats`/`/metrics` gauges, `run_autovacuum_pass` public. **Why
+  concurrent background vacuum needs no new locking (M3.b-style):** `Engine` is
+  `Send+Sync` (P5.e), `vacuum` already takes `write_serial` + per-page latches
+  (M10) so a background pass interleaves exactly as a *manual* `vacuum()` already
+  does; `WAL_VACUUM` is redo-only/idempotent (P10) so crash-during-autovacuum
+  recovers identically. **Crash harness 25 → 26** (P26: crash after an autovacuum
+  pass through a real SQL table + durable BTREE index — reopen, live row survives,
+  reclaimed stays reclaimed, re-vacuum idempotent). **Benchmark** (`benches/
+  vacuum.rs`, logical heap pages since physical file is quantized to P1.c's 4 MiB
+  chunks): 200×30 churn → **82 pages un-vacuumed vs 35 with background autovacuum
+  (2.3× fewer, bounded)** vs 17 manual-every-round. Known limits (documented):
+  global (not per-table) estimates + whole-engine pass (per-table `vacuum_table`
+  + cost throttle are the follow-up); estimates approximate (drift until vacuum
+  refresh); a horizon-holding RR reader/slot makes it re-run reclaiming nothing
+  until it advances. No `FORMAT_VERSION` bump; no §3 decision touched. Full detail
+  in `PROGRESS.md`'s "Autovacuum" entry + `docs/backlog/autovacuum.md` (status
+  flipped to SHIPPED).
 - **Postgres baseline comparison — COMPLETE (2026-07-09), on branch `pg-baseline`
   (one PR, checkpoints B1–B4 as ordered commits).** A **fitness check** — unidb vs
   PostgreSQL 18.4, both as shipped, CRUD-only overlap — distinct from the ladder
@@ -497,8 +536,10 @@ table in `PROGRESS.md`'s M10 entry. Key points a future reader needs:
   incremental remove, is rebuilt from committed rows on open, and — since M7's
   "prefer CSR for traversal" wiring was reverted — is consulted by no read
   path, so a stale CSR candidate can never surface.
-- **Scope / known limits (documented, not silent).** Manual only (no
-  autovacuum); long-lived RR txns / readers hold the horizon back (surfaced in
+- **Scope / known limits (documented, not silent).** ~~Manual only (no
+  autovacuum)~~ — now **auto-triggered by the Autovacuum background launcher
+  (A1–A4, branch `autovacuum`)**, which fires this exact pass on a threshold
+  policy; long-lived RR txns / readers hold the horizon back (surfaced in
   `VacuumReport.horizon_blocked`, not swallowed); intra-page compaction only
   (no cross-page/`VACUUM FULL` high-water-mark shrink); index structures shrink
   logically (entry removal) but aren't physically rebuilt. All parked in the
