@@ -2827,3 +2827,36 @@ only records `<= durable`; the replica has exactly the durable rows; the primary
 replica a faithful prefix. Uses the raw byte-slice heap so the eagerly-persisted
 non-MVCC M1 catalog root doesn't confound the WAL cap. **Files:** `wal.rs`,
 `lib.rs` (accessor), `replica.rs` (test). No format change; crash harness 21/21.
+
+### C4 — crash-harness proof (21 → 25) + valid-prefix property in both modes
+
+Four new crash points under the group-committed force-log-at-commit default
+(`tests/crash/main.rs`), and the valid-prefix property test
+(`run_property_case`) now runs under **both** durability policies (`deferred =
+true` default and `false` legacy per-statement), so the invariant "the recovered
+DB is exactly the set of transactions that reached WAL_TXN_COMMIT" is proven for
+each:
+
+- **Pa** `pa_deferred_mid_txn_unsynced_leaves_no_trace` — a transaction whose
+  statements are never fsynced (no commit → no `sync_up_to`) and never commits
+  leaves no trace on reopen. The deferred-mode analog of P6.
+- **Pb** `pb_cross_txn_shared_log_sync_undoes_open_txn_keeps_committed` — txn A
+  appends statements (unsynced) and stays open; txn B commits, and B's
+  `sync_up_to` flushes the *shared* WAL buffer — including A's records — to
+  durable storage. A crash with A still open cleanly undoes A (it never reached
+  WAL_TXN_COMMIT) while B survives: the single ordered log never accidentally
+  persists an uncommitted transaction.
+- **Pc** `pc_torn_unsynced_tail_replay_stops_cleanly` — a torn record in the
+  unsynced WAL tail (a large uncommitted row forced onto the segment file, then
+  its tail byte flipped) is caught by CRC; replay stops cleanly at the last valid
+  record and the committed prefix survives.
+- **Pd** `pd_eviction_forced_sync_preserves_d5_on_crash` — a large transaction on
+  a 16-frame pool triggers eviction-forced WAL syncs (D5: log durable before a
+  dirty page is stolen); a crash after commit, with most pages only ever
+  eviction-flushed (never checkpointed), recovers every committed row from the
+  durable WAL. Exercises the C2 recovery fixes end-to-end.
+
+P6 and the two-table incomplete-txn test were pinned to the legacy per-statement
+policy (they call `flush()` mid-transaction, which is only valid when statements
+are individually durable) so that policy stays covered. **Crash harness 21 → 25,
+all green.** No format change.

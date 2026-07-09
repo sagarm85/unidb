@@ -48,6 +48,12 @@
 //         archived; the primary is lost ("crash"), and a restore of base +
 //         archived WAL into a fresh directory recovers every committed row —
 //         the backup/restore drill as a recovery path.
+//   Pa..Pd – commit-time WAL fsync (group-committed force-log-at-commit default):
+//         Pa incomplete unsynced txn leaves no trace; Pb a committed txn's sync
+//         that flushes an open txn's shared-log records still cleanly undoes the
+//         open txn; Pc a torn unsynced tail stops replay cleanly (committed
+//         prefix survives); Pd eviction-forced-sync D5 ordering holds on crash.
+//         The valid-prefix property test also runs under BOTH policies.
 
 use tempfile::tempdir;
 use unidb::{Engine, RowId};
@@ -704,7 +710,7 @@ impl Lcg {
     }
 }
 
-fn run_property_case(seed: u64) {
+fn run_property_case(seed: u64, deferred: bool) {
     let dir = tempdir().unwrap();
     let mut rng = Lcg(seed);
 
@@ -713,6 +719,10 @@ fn run_property_case(seed: u64) {
 
     {
         let engine = open(dir.path());
+        // The valid-prefix invariant must hold under BOTH durability policies:
+        // the commit-time-fsync default (`deferred = true`, statements unsynced
+        // until commit) and the legacy per-statement policy (`deferred = false`).
+        engine.set_deferred_sync(deferred);
         let num_txns = 5 + rng.next_range(5) as usize; // 5..=9
         let crash_after = rng.next_range(num_txns as u64) as usize;
 
@@ -727,9 +737,10 @@ fn run_property_case(seed: u64) {
             }
 
             if txn_idx == crash_after && rng.next_range(2) == 0 {
-                // Crash mid-transaction: no commit, no abort call at all.
-                // Its mini-txns are durably logged (D2), but WAL_TXN_COMMIT
-                // never gets written — recovery must undo it entirely.
+                // Crash mid-transaction: no commit, no abort call at all. The
+                // transaction never reaches WAL_TXN_COMMIT — recovery must undo
+                // it entirely, whether or not its statements were fsynced (in
+                // deferred mode they were not; either way it leaves no trace).
                 for (rid, _) in local {
                     rejected.push(rid);
                 }
@@ -776,7 +787,9 @@ fn run_property_case(seed: u64) {
 #[test]
 fn property_crash_recovery_reflects_only_committed_transactions() {
     for seed in [1u64, 42, 12345, 999_999, 7, 2024] {
-        run_property_case(seed);
+        // Both policies: commit-time-fsync default AND legacy per-statement.
+        run_property_case(seed, true);
+        run_property_case(seed, false);
     }
 }
 
@@ -1288,4 +1301,174 @@ fn p19_backup_and_pitr_restore_after_primary_loss() {
         n, 5,
         "P19: restore must recover every committed row after primary loss"
     );
+}
+
+// ── Commit-time WAL fsync (C4): crash points for the group-committed
+// force-log-at-commit default ────────────────────────────────────────────────
+//
+// Under the default, statement mini-txns issued inside an open user transaction
+// append their WAL records WITHOUT a per-statement fsync; `Engine::commit`'s
+// `sync_up_to` is the single durable point. These four points prove recovery is
+// correct under that policy (P6 and the two-table test cover the legacy
+// per-statement policy; the valid-prefix property test above now runs BOTH).
+//
+//   Pa – crash mid-transaction with N unsynced statements → reopen → zero trace
+//   Pb – txn A's unsynced statements are flushed to disk as a side effect of
+//        txn B's commit sync (one ordered shared log) → crash with A still open
+//        → A is cleanly undone, B survives
+//   Pc – a torn record in the unsynced WAL tail → CRC detects it, replay stops
+//        cleanly at the last valid record; the committed prefix survives
+//   Pd – crash after eviction-forced WAL syncs during a large deferred txn
+//        (D5 ordering under the new steal path) → every committed row recovers
+
+/// Pa: a transaction whose statements were never fsynced (the commit-time-fsync
+/// default) and that never commits must leave no trace after a crash — the
+/// deferred-mode analog of P6.
+#[test]
+fn pa_deferred_mid_txn_unsynced_leaves_no_trace() {
+    let dir = tempdir().unwrap();
+    let rids = {
+        let engine = open(dir.path()); // group-committed default: statements deferred
+        let xid = engine.begin().unwrap();
+        let mut rids = Vec::new();
+        for i in 0..5 {
+            rids.push(
+                engine
+                    .insert(xid, format!("pa-row-{i}").as_bytes())
+                    .unwrap(),
+            );
+        }
+        // No commit → `sync_up_to` never runs → the statements are not durable.
+        // "Crash": drop without commit/flush.
+        drop(engine);
+        rids
+    };
+    let engine = open(dir.path());
+    let xid = engine.begin().unwrap();
+    for rid in &rids {
+        assert!(
+            engine.get(xid, *rid).is_err(),
+            "Pa: an unsynced, uncommitted statement must leave no trace ({rid:?})"
+        );
+    }
+}
+
+/// Pb: txn A appends statements (unsynced) and stays open; txn B then commits,
+/// whose `sync_up_to` flushes the shared WAL buffer — including A's records — to
+/// durable storage. A crash with A still open must still cleanly undo A (it
+/// never reached WAL_TXN_COMMIT) while B survives. Proves the shared, single
+/// ordered log never accidentally persists an uncommitted transaction.
+#[test]
+fn pb_cross_txn_shared_log_sync_undoes_open_txn_keeps_committed() {
+    let dir = tempdir().unwrap();
+    let (a_rid, b_rid) = {
+        let engine = open(dir.path());
+        let a = engine.begin().unwrap();
+        let a_rid = engine.insert(a, b"pb-txn-A-uncommitted").unwrap(); // appended, unsynced
+        let b = engine.begin().unwrap();
+        let b_rid = engine.insert(b, b"pb-txn-B-committed").unwrap();
+        engine.commit(b).unwrap(); // sync_up_to flushes the shared WAL → A's record hits disk too
+                                   // A never commits. "Crash".
+        drop(engine);
+        (a_rid, b_rid)
+    };
+    let engine = open(dir.path());
+    let xid = engine.begin().unwrap();
+    assert!(
+        engine.get(xid, a_rid).is_err(),
+        "Pb: open txn A's statement — made durable by B's commit sync — must be undone"
+    );
+    assert_eq!(
+        engine.get(xid, b_rid).unwrap(),
+        b"pb-txn-B-committed",
+        "Pb: committed txn B must survive"
+    );
+}
+
+/// Corrupt the last few bytes of the highest-numbered WAL segment file in
+/// `dir/db.wal` (simulating a torn write of the unsynced tail).
+fn corrupt_last_wal_segment_tail(dir: &std::path::Path) {
+    let wal_dir = dir.join("db.wal");
+    let mut segs: Vec<_> = std::fs::read_dir(&wal_dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("seg-") && n.ends_with(".wal"))
+                .unwrap_or(false)
+        })
+        .collect();
+    segs.sort();
+    let last = segs.last().expect("at least one WAL segment");
+    let mut bytes = std::fs::read(last).unwrap();
+    let n = bytes.len();
+    assert!(n > 8, "segment must have content to corrupt");
+    bytes[n - 5] ^= 0xff; // flip a byte inside the last record → CRC mismatch
+    std::fs::write(last, &bytes).unwrap();
+}
+
+/// Pc: a torn record in the unsynced WAL tail is detected by CRC; recovery stops
+/// cleanly at the last valid record, so the committed prefix survives. Re-proves
+/// the existing torn-tail behavior under the commit-time-fsync default.
+#[test]
+fn pc_torn_unsynced_tail_replay_stops_cleanly() {
+    let dir = tempdir().unwrap();
+    let committed_rid = {
+        let engine = open(dir.path());
+        let xid = engine.begin().unwrap();
+        let rid = engine.insert(xid, b"pc-committed-durable").unwrap();
+        engine.commit(xid).unwrap(); // durable (sync_up_to)
+                                     // Unsynced tail: a large uncommitted row is flushed to the WAL file
+                                     // (overflowing the writer buffer) but never fsynced.
+        let x2 = engine.begin().unwrap();
+        engine.insert(x2, &vec![b't'; 7000]).unwrap();
+        drop(engine); // "crash"
+        rid
+    };
+    // Manufacture a torn record at the tail.
+    corrupt_last_wal_segment_tail(dir.path());
+
+    let engine = open(dir.path());
+    let xid = engine.begin().unwrap();
+    assert_eq!(
+        engine.get(xid, committed_rid).unwrap(),
+        b"pc-committed-durable",
+        "Pc: the committed prefix must survive a torn unsynced tail"
+    );
+}
+
+/// Pd: under the default, a large transaction dirties more pages than the pool
+/// holds; eviction forces WAL syncs (D5: the log is made durable before a dirty
+/// page is stolen). A crash after commit — with most pages only ever
+/// eviction-flushed, never checkpointed — must recover every committed row from
+/// the durable WAL. Exercises D5 ordering on the eviction-forced-sync path.
+#[test]
+fn pd_eviction_forced_sync_preserves_d5_on_crash() {
+    let dir = tempdir().unwrap();
+    let payload = vec![b'z'; 3000];
+    let rids = {
+        // Tiny pool (16 frames) forces eviction during the transaction.
+        let engine = Engine::open_with_pool_capacity(dir.path(), 0, 16).unwrap();
+        let xid = engine.begin().unwrap();
+        let mut rids = Vec::new();
+        for _ in 0..60 {
+            rids.push(engine.insert(xid, &payload).unwrap()); // ~20+ pages > 16 frames
+        }
+        engine.commit(xid).unwrap(); // durable
+                                     // "Crash": no checkpoint/flush. Pages evicted during the txn reached
+                                     // disk (WAL forced durable first, per D5); the rest are lost and must be
+                                     // redone from the durable WAL.
+        drop(engine);
+        rids
+    };
+    let engine = Engine::open_with_pool_capacity(dir.path(), 0, 16).unwrap();
+    let xid = engine.begin().unwrap();
+    for (i, rid) in rids.iter().enumerate() {
+        assert_eq!(
+            engine.get(xid, *rid).unwrap(),
+            payload,
+            "Pd: row {i} must recover after an eviction-forced-sync crash"
+        );
+    }
 }
