@@ -38,6 +38,12 @@
 //         checkpoint), and after reopen `NEAR` returns the correct nearest
 //         neighbor with recall intact — the index is read from its WAL-recovered
 //         meta/centroid/posting pages, never rebuilt on open
+//   P18 – segmented WAL (P6.a): committed inserts written across several sealed
+//         WAL segments (small segment size forces multiple rotations) survive a
+//         crash with no checkpoint; recovery scans every segment in LSN order
+//         and redoes them all, so every committed row is present on reopen.
+//         Whole-segment truncation then deletes only fully-consumed segments and
+//         the retained data still recovers.
 
 use tempfile::tempdir;
 use unidb::{Engine, RowId};
@@ -1094,5 +1100,119 @@ fn p17_durable_vector_index_survives_crash_recall_intact() {
             );
         }
         other => panic!("expected Rows, got {other:?}"),
+    }
+}
+
+// ── P18: segmented WAL survives a crash spanning multiple segments (P6.a) ─────
+//
+// The WAL is a directory of fixed-size segments. With a tiny segment size, a
+// stream of committed heap inserts forces several seal+rotate boundaries, so the
+// committed records live across multiple segment files. A "crash" (drop, no page
+// flush, no checkpoint) leaves the pages only in the WAL; recovery must scan
+// every segment in LSN order and redo all committed inserts. Then a whole-segment
+// truncation deletes only fully-consumed sealed segments and the retained data
+// still recovers — proving segment deletion never drops a needed record.
+#[test]
+fn p18_segmented_wal_recovers_across_multiple_segments() {
+    use unidb::bufferpool::BufferPool;
+    use unidb::control;
+    use unidb::format::{DEFAULT_PAGE_SIZE, INVALID_LSN};
+    use unidb::heap::Heap;
+    use unidb::mvcc::Snapshot;
+    use unidb::wal::Wal;
+
+    let dir = tempdir().unwrap();
+    let ctrl_p = dir.path().join("control");
+    let data_p = dir.path().join("data.db");
+    let wal_p = dir.path().join("db.wal");
+    control::create(&ctrl_p, DEFAULT_PAGE_SIZE).unwrap();
+    let page_size = DEFAULT_PAGE_SIZE as usize;
+
+    // A snapshot that sees every xid < 100 as committed (xid 1 here is a bare
+    // mini-txn insert, no user-txn begin, so recovery never undoes it).
+    let snap = Snapshot::new(100, 100, vec![]);
+    let n = 200usize;
+
+    let rids = {
+        let pool = BufferPool::open(&data_p, page_size, 64).unwrap();
+        // 2 KiB segments: each committed insert (begin + insert + commit records,
+        // plus a one-time full-page image per page) rotates the WAL well before
+        // 200 rows are in.
+        let wal = Wal::open_with_segment_size(&wal_p, INVALID_LSN, 2048).unwrap();
+        let heap = Heap::new(page_size);
+        let mut rids = Vec::with_capacity(n);
+        for i in 0..n {
+            let rid = heap
+                .insert(format!("seg_row_{i:04}").as_bytes(), 1, &pool, &wal)
+                .unwrap();
+            rids.push(rid);
+        }
+        // The stream really did span multiple segments.
+        assert!(
+            wal.segment_count().unwrap() >= 3,
+            "P18: inserts must have forced multiple WAL rotations"
+        );
+        // "Crash": drop without flushing pages or checkpointing — the committed
+        // rows live only in the WAL segments (each insert's mini-txn fsynced).
+        drop(pool);
+        drop(wal);
+        rids
+    };
+
+    // Recovery scans every segment in LSN order and redoes the committed inserts.
+    let (_, stats) = unidb::recovery::recover(&ctrl_p, &data_p, &wal_p, page_size, 64).unwrap();
+    assert!(
+        stats.records_redone >= n,
+        "P18: every committed insert across all segments must be redone"
+    );
+
+    // Every committed row is present after recovery.
+    {
+        let pool = BufferPool::open(&data_p, page_size, 64).unwrap();
+        let heap = Heap::new(page_size);
+        for (i, rid) in rids.iter().enumerate() {
+            let got = heap.get(*rid, &snap, 100, &pool).unwrap();
+            assert_eq!(
+                got,
+                format!("seg_row_{i:04}").into_bytes(),
+                "P18: row {i} must survive multi-segment WAL recovery"
+            );
+        }
+    }
+
+    // Whole-segment truncation: keep only the segment holding the highest LSN.
+    // Deletes fully-consumed sealed segments (never the active one). Recovery
+    // already persisted every page to `data.db`, so the truncated-away records
+    // are no longer needed.
+    {
+        // The highest LSN in the log is the keep-point; every fully-earlier
+        // sealed segment is then deletable.
+        let max_lsn = Wal::scan_file(&wal_p)
+            .unwrap()
+            .iter()
+            .map(|r| r.lsn)
+            .max()
+            .unwrap();
+        let wal = Wal::open_with_segment_size(&wal_p, max_lsn, 2048).unwrap();
+        let before = wal.segment_count().unwrap();
+        wal.truncate_before(max_lsn).unwrap();
+        let after = wal.segment_count().unwrap();
+        assert!(
+            after < before && after > 0,
+            "P18: truncation must delete whole consumed segments (before={before}, after={after})"
+        );
+        drop(wal);
+    }
+    // Rows still readable after truncation + reopen.
+    let (_, _) = unidb::recovery::recover(&ctrl_p, &data_p, &wal_p, page_size, 64).unwrap();
+    let pool = BufferPool::open(&data_p, page_size, 64).unwrap();
+    let heap = Heap::new(page_size);
+    for (i, rid) in rids.iter().enumerate() {
+        let got = heap.get(*rid, &snap, 100, &pool).unwrap();
+        assert_eq!(
+            got,
+            format!("seg_row_{i:04}").into_bytes(),
+            "P18: row {i} must survive whole-segment truncation"
+        );
     }
 }

@@ -2593,3 +2593,36 @@ cores (3.68× at 8 writers)**, and added per-query timeouts / cancellation /
 - **P5.f — resource control — DONE** (`6f8e8c4`, 2026-07-09). Per-query **timeout**, cooperative **cancellation** (`CancelToken`), and **`work_mem`** (spill row budget), held in a thread-local `QueryLimits` installed for the call (a query runs on one worker thread). The executor's scan loops call `query_limits::check()` every 1024 rows (`QueryTimeout`/`QueryCancelled`); `sort_mem_rows`/`hash_join_mem_rows` consult the per-query `work_mem`. Entry point `Engine::execute_sql_with_limits`; server maps both errors to 408. Tests: unit (`query_limits`) + `tests/query_limits.rs` end-to-end (timeout aborts a scan, generous timeout completes, pre-/cross-thread cancel abort, tiny `work_mem` forces the `ORDER BY` spill yet stays correctly ordered).
 
 **Phase 5 is COMPLETE** (P5.a–P5.f). The single-writer → concurrent-writer unlock shipped; write throughput scales with cores; the crash harness stays 19/19 and the sync invariant (no tokio/reqwest/axum in the default engine) holds.
+
+---
+
+## Phase 6 — Operations & HA   [IN PROGRESS]   started 2026-07-09
+
+Branch `phase6-ops-ha` (Core WAL + Ops lane). Spec: `docs/backlog/phase6_ops_ha.md`.
+Delivers the confirmed scale target — **a strong single primary + read replicas**.
+One PR for all of Phase 6; checkpoints P6.a→P6.g as separate commits.
+
+### Locked-decision sign-offs (recorded before any P6 code — CLAUDE.md §3)
+
+Two §3 decisions are touched by Phase 6. Both were flagged to the human and
+**explicitly approved on 2026-07-09** before implementation began:
+
+- **D6 (single-file storage; "WAL may be a separate file — revisit post-M4") —
+  EVOLVED, signed off 2026-07-09.** P6.a splits the WAL from one append-only
+  file into fixed-size **16 MiB segment files** in a `wal/` directory
+  (seal + rotate on the boundary; truncation deletes whole consumed segments
+  instead of rewrite-to-truncate). This is the enabler for concurrent WAL
+  readers (replication slots / shipping) and is exactly the "revisit post-M4"
+  D6 anticipated. **The data store remains a single file — only the WAL layout
+  changes.** No reversal of D6's single-file *data-store* core; D3
+  (checkpoint/WAL root) is extended with segments, matching the spec's
+  "Locked decisions touched" table.
+- **§1 "no cloud control plane" — RELAXED slightly, signed off 2026-07-09.**
+  P6.b–P6.d add a backup/replication ops surface (replication slots, WAL
+  shipping, online base backup, WAL archiving). This relaxes §1's blanket
+  "no cloud control plane" for operational tooling only. **The single-primary
+  charter is unchanged** — async (or optional sync) read replicas, *not*
+  consensus; no multi-primary, no sharded writes (both remain parked, roadmap §7).
+
+Encryption-at-rest (P6.f) will touch **D9** (page CRC + LSN + on-disk format);
+that sign-off will be recorded here when P6.f is reached, not assumed now.
