@@ -1792,6 +1792,14 @@ impl Engine {
         self.wal.current_lsn()
     }
 
+    /// The durable WAL frontier — the LSN of the last fsync'd record. Under the
+    /// group-committed default this can trail [`Self::wal_current_lsn`] between
+    /// commits; WAL shipping is capped here so a replica never receives records
+    /// the primary has not made durable (C3, see `Wal::records_from`).
+    pub fn wal_durable_lsn(&self) -> Lsn {
+        self.wal.durable_lsn()
+    }
+
     /// The database directory (parent of the control file) — used by backup and
     /// base-snapshot tooling (P6.d).
     pub fn data_dir(&self) -> &Path {

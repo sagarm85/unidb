@@ -203,6 +203,156 @@ mod tests {
         }
     }
 
+    /// Assert `rid` reads back as `expected` through `engine`.
+    fn assert_row(engine: &Engine, rid: crate::heap::RowId, expected: &[u8]) {
+        let x = engine.begin().unwrap();
+        assert_eq!(engine.get(x, rid).unwrap(), expected, "row {rid:?}");
+        engine.commit(x).unwrap();
+    }
+
+    /// Assert `rid` is NOT visible through `engine` (was never durably applied).
+    fn assert_absent(engine: &Engine, rid: crate::heap::RowId) {
+        let x = engine.begin().unwrap();
+        assert!(
+            engine.get(x, rid).is_err(),
+            "row {rid:?} must be absent (uncommitted tail)"
+        );
+        engine.commit(x).unwrap();
+    }
+
+    /// C3 — WAL shipping is capped at the durable frontier, so a replica can
+    /// never get ahead of the primary. An unsynced tail (an open, uncommitted
+    /// transaction under the group-committed default) is written to the WAL file
+    /// but is *not* durable; it must not ship. When the primary then "crashes"
+    /// before fsyncing that tail and restarts, recovery drops it — and the
+    /// replica, having only ever received durable records, is a prefix of the
+    /// recovered primary (no divergence on failover).
+    ///
+    /// Uses the raw byte-slice heap (`Engine::insert`/`get`) so the M1 catalog —
+    /// which is persisted eagerly and non-MVCC, and whose root can move when a
+    /// table allocates pages — does not confound the WAL durable-frontier cap
+    /// this test isolates.
+    #[test]
+    fn shipping_capped_at_durable_lsn_keeps_replica_a_prefix_on_primary_crash() {
+        let primary_dir = tempdir().unwrap();
+        let replica_dir = tempdir().unwrap();
+
+        // Durable base: row 1, checkpointed to a clean base point.
+        let primary = Engine::open(primary_dir.path(), 0).unwrap();
+        let xid = primary.begin().unwrap();
+        let rid1 = primary.insert(xid, b"durable-row-1").unwrap();
+        primary.commit(xid).unwrap();
+        primary.checkpoint().unwrap();
+        let base_lsn = primary.wal_current_lsn();
+        let mut replica = Replica::init_from_base(replica_dir.path(), primary_dir.path()).unwrap();
+
+        // A second durable (committed) row, shipped + applied normally.
+        let xid = primary.begin().unwrap();
+        let rid2 = primary.insert(xid, b"durable-row-2").unwrap();
+        primary.commit(xid).unwrap();
+        let stream = primary.ship_wal(base_lsn).unwrap();
+        replica
+            .apply_stream(&stream, primary.primary_control())
+            .unwrap();
+
+        let durable = primary.wal_durable_lsn();
+
+        // The unsynced tail: an open transaction inserting large (~7 KiB) rows,
+        // never committed. Big rows overflow the WAL writer's 8 KiB buffer and
+        // allocate fresh pages (each logging an 8 KiB FPI), so the records are
+        // flushed from the buffer to the OS file — but never fsynced, so they
+        // sit on disk PAST the durable frontier.
+        let big = vec![b'x'; 7000];
+        let xid_uncommitted = primary.begin().unwrap();
+        let mut tail_rids = Vec::new();
+        for _ in 0..10 {
+            tail_rids.push(primary.insert(xid_uncommitted, &big).unwrap());
+        }
+        assert_eq!(
+            primary.wal_durable_lsn(),
+            durable,
+            "an uncommitted tail must not advance the durable frontier"
+        );
+        assert!(
+            primary.wal_current_lsn() > durable,
+            "the uncommitted tail is past the durable frontier"
+        );
+        // Prove the cap actually filters ON-DISK records (not merely that
+        // buffered records never reached the file): the raw WAL on disk holds
+        // records past the durable frontier.
+        let wal_dir = primary_dir.path().join("db.wal");
+        let on_disk_max = Wal::scan_file(&wal_dir)
+            .unwrap()
+            .iter()
+            .map(|r| r.lsn)
+            .max()
+            .unwrap();
+        assert!(
+            on_disk_max > durable,
+            "uncommitted records must be physically on disk past durable to exercise the cap (on_disk_max={on_disk_max}, durable={durable})"
+        );
+
+        // The cap: `ship_wal` returns only records at or below the durable
+        // frontier — none of the unsynced tail.
+        let stream = primary.ship_wal(replica.applied_lsn()).unwrap();
+        for r in decode_stream(&stream).unwrap() {
+            assert!(
+                r.lsn <= durable,
+                "shipped record lsn {} exceeds the durable frontier {durable}",
+                r.lsn
+            );
+        }
+        replica
+            .apply_stream(&stream, primary.primary_control())
+            .unwrap();
+
+        // The replica has the two durable rows and none of the uncommitted tail.
+        {
+            let re = replica.read_engine().unwrap();
+            assert_row(&re, rid1, b"durable-row-1");
+            assert_row(&re, rid2, b"durable-row-2");
+            for rid in &tail_rids {
+                assert_absent(&re, *rid);
+            }
+        }
+        let replica_applied_before_crash = replica.applied_lsn();
+
+        // "Crash" the primary before it ever fsyncs the tail, then restart:
+        // recovery undoes the incomplete transaction. The primary's durable
+        // state is exactly the two committed rows — a *superset* of nothing the
+        // replica lacks, i.e. the replica is a prefix (no divergence).
+        drop(primary);
+        let primary = Engine::open(primary_dir.path(), 0).unwrap();
+        assert_row(&primary, rid1, b"durable-row-1");
+        assert_row(&primary, rid2, b"durable-row-2");
+        for rid in &tail_rids {
+            assert_absent(&primary, *rid);
+        }
+
+        // The replica never advanced past what the primary made durable: its
+        // applied frontier is at or below the primary's durable frontier, so on
+        // failover it can never hold a commit the recovered primary lost.
+        assert!(
+            replica_applied_before_crash <= durable,
+            "replica applied frontier {replica_applied_before_crash} must not exceed the primary's durable frontier {durable}"
+        );
+
+        // Re-ship from the recovered primary: the replica catches up and remains
+        // a faithful prefix — the two durable rows, still no tail.
+        let stream = primary.ship_wal(replica.applied_lsn()).unwrap();
+        replica
+            .apply_stream(&stream, primary.primary_control())
+            .unwrap();
+        {
+            let re = replica.read_engine().unwrap();
+            assert_row(&re, rid1, b"durable-row-1");
+            assert_row(&re, rid2, b"durable-row-2");
+            for rid in &tail_rids {
+                assert_absent(&re, *rid);
+            }
+        }
+    }
+
     // Base snapshot + incremental WAL apply: the replica serves rows that landed
     // on the primary *after* the base, then promotes to a writable primary.
     #[test]

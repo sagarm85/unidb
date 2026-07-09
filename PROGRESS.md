@@ -2801,3 +2801,29 @@ deliberately tiny recovery pool exposes them. **Files:** `recovery.rs` (both
 fixes), `bufferpool.rs` (mechanism, unchanged), `lib.rs` (test). Crash harness
 still **21/21** (the fixes only affect the pool-exhaustion path a large pool
 never hits); no format change.
+
+### C3 — replication durable-LSN cap
+
+`Wal::records_from` (and therefore `ship_from` / `Engine::ship_wal`) now returns
+only records with `lsn <= durable_lsn`. Under the group-committed default,
+records are written to the segment file *before* their fsync, so the on-disk WAL
+can hold records past the durable frontier; shipping those would let a replica
+apply — and a promoted replica *retain* — commits the primary had not made
+durable, so a primary crash before its own fsync would leave the replica **ahead
+of the recovered primary** (divergence on failover). Capping at `durable_lsn`
+makes a replica's state always a prefix of the primary's durable state; records
+between `durable_lsn` and the tail simply ship in a later batch once durable.
+Sync-slot acks are bounded transitively — a `SlotKind::Sync` consumer can only
+confirm what it received (all `<= durable_lsn`), and `wait_for_sync_replicas`
+runs after a commit's own `sync_up_to`, so it waits on a durable LSN.
+
+New `Engine::wal_durable_lsn()` accessor. Test
+`shipping_capped_at_durable_lsn_keeps_replica_a_prefix_on_primary_crash`
+(`replica.rs`): a durable base + one shipped durable row, then an open,
+uncommitted transaction whose large (~7 KiB) rows push records onto the WAL file
+past the durable frontier (asserted via a raw `scan_file`); `ship_wal` returns
+only records `<= durable`; the replica has exactly the durable rows; the primary
+"crashes" pre-fsync, restarts (recovery drops the tail), and a re-ship leaves the
+replica a faithful prefix. Uses the raw byte-slice heap so the eagerly-persisted
+non-MVCC M1 catalog root doesn't confound the WAL cap. **Files:** `wal.rs`,
+`lib.rs` (accessor), `replica.rs` (test). No format change; crash harness 21/21.
