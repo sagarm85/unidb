@@ -12,6 +12,41 @@
 
 ## Current status
 
+- **Commit-time WAL fsync — COMPLETE (2026-07-09), on branch `commit-time-fsync`
+  (one PR, checkpoints C1–C5 as ordered commits).** Flipped the durability
+  default to **group-committed force-log-at-commit**: statement mini-txns issued
+  inside an open user transaction append their WAL records without a
+  per-statement fsync; `Engine::commit`'s `sync_up_to` is the single durable
+  point (one group-coalesced fsync per transaction). ARIES force-log-at-commit —
+  **fulfills D1; D2 (mini-txn bracketing) and D5 (WAL-before-page) unchanged, no
+  §3 decision reversed.** Human sign-off for making it the default recorded in
+  `PROGRESS.md` (2026-07-09). Checkpoints: **C1** `Engine::open` sets deferred by
+  default (after open-time system setup, which stays per-statement-durable);
+  `set_deferred_sync` is now `#[doc(hidden)]` (legacy per-statement policy kept
+  only for the harness); standalone durability-claim sites self-sync (checkpoint
+  `wal.sync()` before `flush_all`, vacuum, `set_column_index`, `enable_events`) —
+  full audit table in `PROGRESS.md`. **C2** eviction-forced sync
+  (`fetch_page_for_write` already forced `wal.sync()` + retry; added the
+  memory-pressure test) — which **surfaced + fixed two pre-existing latent
+  recovery bugs**: (i) WAL_INSERT redo leaked a buffer-pool frame pin on its two
+  early-return paths (alloc record `slot==u16::MAX`, and the idempotent skip),
+  exhausting a small recovery pool; (ii) recovery replayed with
+  `durable_wal_lsn=INVALID_LSN`, so `find_victim` couldn't evict any dirty redo
+  page — both only bite when recovered data spans more pages than the recovery
+  pool (normal 4096-frame recovery never hit them). **C3** WAL shipping
+  (`records_from`/`ship_from`) capped at the durable frontier (divergence guard —
+  a replica stays a prefix of the primary on failover); new
+  `Engine::wal_durable_lsn()`. **C4** crash harness **21 → 25** (Pa mid-txn
+  unsynced → zero trace, Pb cross-txn shared-log sync cleanly undoes the open
+  txn, Pc torn unsynced tail, Pd eviction-forced-sync D5 ordering) + the
+  valid-prefix property test now runs under **both** policies. **C5** acceptance
+  bench (`benches/decompose.rs`, fetched from `origin/bench-ladder`): the
+  ordinary rungs now converge with the explicit one-fsync rungs (proof the flip
+  landed) — full multi-model commit **~33.1 → ~4.40 ms/commit (~7.5×)**, W0 at
+  SQLite parity (3.59 vs 3.64 ms). **No `FORMAT_VERSION` bump; sync invariant
+  holds.** Async derivation stays parked (re-trigger = re-run the ladder at large
+  table sizes). Full detail + before/after table in `PROGRESS.md`'s "Commit-time
+  WAL fsync" entry.
 - **Phase 6 (Operations & HA) — COMPLETE (2026-07-09), on branch `phase6-ops-ha`
   (one PR for all of P6.a–P6.g).** The roadmap's 6-phase plan is now fully
   delivered: unidb is a deployable, operable **single primary + read replicas**.

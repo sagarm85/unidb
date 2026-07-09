@@ -2704,3 +2704,204 @@ timestamps); RLS-over-SQL (`CREATE POLICY`); encryption-at-rest (D9-gated);
 automatic failover coordinator (manual promotion in v1); S3 archiving.
 
 **Phase 6 is COMPLETE — the roadmap's 6-phase plan is fully delivered.**
+
+---
+
+## Commit-time WAL fsync — group-committed force-log-at-commit as default   [LANDING]   2026-07-09
+
+**PR:** _pending_
+**Spec:** `docs/backlog/commit_time_fsync.md` (checkpoints C1–C5).
+**Summary:** Flips the durability default from per-statement fsync to
+**group-committed force-log-at-commit**: statement mini-txns issued inside an
+open user transaction append their WAL records without a per-statement fsync,
+and `Engine::commit`'s `sync_up_to(commit_lsn)` is the single durable point —
+one group-coalesced fsync per transaction. This is ARIES' force-log-at-commit
+(fulfilling **D1**); **D2** (mini-txn bracketing) and **D5** (WAL-before-page)
+are untouched — no §3 decision is reversed.
+
+### Human sign-off (durability timing change)
+
+Per the spec's C5 and CLAUDE.md §0.5/§6 evidence ethos (which applies to
+durability semantics even though no locked decision flips), the user
+**explicitly authorized making group-committed force-log-at-commit the default
+on 2026-07-09.** Durability *timing* changes (per-statement → per-transaction);
+the durability *guarantee* is unchanged: no commit is acknowledged until its
+commit record is fsync'd. D1 is fulfilled (its ARIES durability point *is*
+force-log-at-commit); D2 and D5 are unchanged. `synchronous_commit=off`-style
+ack-before-flush (a genuine D violation) is explicitly **out of scope** — never
+the default, at most a separate documented opt-in later.
+
+### C1 — durability-claim audit (every `commit_mini_txn` site)
+
+Under the new default the WAL runs deferred; a mini-txn's records are made
+durable either by the enclosing user transaction's commit `sync_up_to`, or by
+the operation issuing its own explicit sync. Each site classified:
+
+| Site | Path | Durable via |
+|------|------|-------------|
+| heap insert/update/delete (`heap.rs`) | `Engine::insert/update/delete` under an `xid` | **covered-by-commit** — `Engine::commit` → `sync_up_to(commit_lsn)` |
+| durable B-Tree / full-text index maint. (`btree_index.rs`) | `apply_durable_index_writes` during INSERT/UPDATE / `CREATE INDEX` backfill (both under `xid`) | **covered-by-commit** (or by the standalone entry point's self-sync, below) |
+| durable vector (IVF) index maint. (`disk_vector.rs`) | same as above | **covered-by-commit** |
+| catalog persist (`catalog.rs`) | DDL under `execute_sql(xid)` | **covered-by-commit** (request-level catalog snapshot/restore handles rollback) |
+| large-object chunk rows (`large_object.rs`) | `Engine::put_large_object(xid, …)` under `xid` | **covered-by-commit** |
+| open-time system setup (`ensure_edges_table`/`ensure_edge_index`/`ensure_lobs_table`/`derive_*`) | `Engine::open`, **before** the deferred flag is set | **self-syncing** — runs while the WAL is still per-statement, so each mini-txn fsyncs during open |
+| checkpoint (`checkpoint.rs`) | `Engine::checkpoint` (standalone, no `xid`) | **self-syncing** — added `wal.sync()` at entry (before `flush_all`, so D5 lets every dirty page reach disk) + `log_checkpoint` already fsyncs |
+| vacuum (`lib.rs::vacuum_inner`) | `Engine::vacuum` (standalone, no `xid`) | **self-syncing** — added `sync_wal()` before return |
+| `set_column_index` / `enable_events` (`lib.rs`) | standalone DDL-like (no `xid`) | **self-syncing** — added `sync_wal()` before return |
+| replication slots (`slots.json`) | `create/advance/drop_replication_slot` | **self-syncing** — atomic write-tmp + rename (independent of the WAL fsync flag) |
+| backup / PITR (`base_backup`) | `Engine::base_backup` | **self-syncing** — calls `checkpoint()` (which now self-syncs) then copies files |
+
+**What changed (C1):** `Engine::open` sets `wal.set_deferred_sync(true)` after
+open-time setup; `set_deferred_sync` is now `#[doc(hidden)]` (the per-statement
+policy survives only so the crash harness can exercise both). `checkpoint::run`,
+`vacuum_inner`, `set_column_index`, and `enable_events` self-sync. The server
+handle no longer needs its explicit `set_deferred_sync(true)`.
+
+**Locked-decision changes:** none reversed. **D1 fulfilled** (force-log-at-commit
+is its ARIES durability point); D2 and D5 unchanged. Human sign-off recorded
+above (2026-07-09).
+
+### C2 — D5 eviction-forced sync (+ two pre-existing recovery bugs it surfaced)
+
+The eviction-forced-sync mechanism itself (`BufferPool::fetch_page_for_write`:
+on `BufferPoolFull`, force `wal.sync()`, refresh the durable frontier, retry
+once) already shipped with the M9/P5 group-commit work and the whole heap write
+path already routes through it — so under the new default a large transaction
+that dirties more pages than the pool holds forces a WAL sync and steals a
+now-durable page rather than dead-ending. C2 adds the end-to-end memory-pressure
+proof: `large_deferred_transaction_survives_pool_smaller_than_working_set` (16
+frames, one transaction inserting 400×~1 KiB rows → dozens of pages), asserting
+completion, correct in-session read-back, **and correct recovery after reopen**.
+
+That reopen assertion surfaced **two pre-existing latent recovery bugs**
+(present independent of the deferral flip — they reproduce in per-statement mode
+too — but which commit-time fsync makes ordinary, since deferral routinely
+dirties more pages than a small pool holds):
+
+1. **WAL_INSERT redo leaked a buffer-pool frame pin.** The page-allocation
+   record (`slot == u16::MAX`) and the "already applied" idempotent-skip path
+   both `return Ok(())` after `fetch_or_create` **without unpinning**
+   (WAL_UPDATE/DELETE/VACUUM unpin correctly; only WAL_INSERT leaked). When the
+   recovered data spans more pages than the recovery pool capacity, the leaked
+   pins exhaust the pool and every later redo fails with `BufferPoolFull` —
+   swallowed as a `tracing::warn`, so committed rows were silently dropped.
+   **Fix:** the allocation record now calls `ensure_page_allocated` (sizes the
+   page into the file, no pin) instead of `fetch_or_create`; the idempotent-skip
+   path unpins.
+2. **Recovery never advanced the pool's durable-WAL frontier.** It replayed with
+   `durable_wal_lsn == INVALID_LSN`, so `find_victim` refused to evict *any*
+   dirty redo page (D5 conservative) and the pool filled after `pool_capacity`
+   pages. **Fix:** set the frontier to the tail LSN of the on-disk WAL before
+   the redo pass — every record being replayed is already durable, so evicting
+   redone pages is sound.
+
+Both were invisible before because normal recovery uses the default 4096-frame
+pool, which comfortably holds any realistic redo working set; only a
+deliberately tiny recovery pool exposes them. **Files:** `recovery.rs` (both
+fixes), `bufferpool.rs` (mechanism, unchanged), `lib.rs` (test). Crash harness
+still **21/21** (the fixes only affect the pool-exhaustion path a large pool
+never hits); no format change.
+
+### C3 — replication durable-LSN cap
+
+`Wal::records_from` (and therefore `ship_from` / `Engine::ship_wal`) now returns
+only records with `lsn <= durable_lsn`. Under the group-committed default,
+records are written to the segment file *before* their fsync, so the on-disk WAL
+can hold records past the durable frontier; shipping those would let a replica
+apply — and a promoted replica *retain* — commits the primary had not made
+durable, so a primary crash before its own fsync would leave the replica **ahead
+of the recovered primary** (divergence on failover). Capping at `durable_lsn`
+makes a replica's state always a prefix of the primary's durable state; records
+between `durable_lsn` and the tail simply ship in a later batch once durable.
+Sync-slot acks are bounded transitively — a `SlotKind::Sync` consumer can only
+confirm what it received (all `<= durable_lsn`), and `wait_for_sync_replicas`
+runs after a commit's own `sync_up_to`, so it waits on a durable LSN.
+
+New `Engine::wal_durable_lsn()` accessor. Test
+`shipping_capped_at_durable_lsn_keeps_replica_a_prefix_on_primary_crash`
+(`replica.rs`): a durable base + one shipped durable row, then an open,
+uncommitted transaction whose large (~7 KiB) rows push records onto the WAL file
+past the durable frontier (asserted via a raw `scan_file`); `ship_wal` returns
+only records `<= durable`; the replica has exactly the durable rows; the primary
+"crashes" pre-fsync, restarts (recovery drops the tail), and a re-ship leaves the
+replica a faithful prefix. Uses the raw byte-slice heap so the eagerly-persisted
+non-MVCC M1 catalog root doesn't confound the WAL cap. **Files:** `wal.rs`,
+`lib.rs` (accessor), `replica.rs` (test). No format change; crash harness 21/21.
+
+### C4 — crash-harness proof (21 → 25) + valid-prefix property in both modes
+
+Four new crash points under the group-committed force-log-at-commit default
+(`tests/crash/main.rs`), and the valid-prefix property test
+(`run_property_case`) now runs under **both** durability policies (`deferred =
+true` default and `false` legacy per-statement), so the invariant "the recovered
+DB is exactly the set of transactions that reached WAL_TXN_COMMIT" is proven for
+each:
+
+- **Pa** `pa_deferred_mid_txn_unsynced_leaves_no_trace` — a transaction whose
+  statements are never fsynced (no commit → no `sync_up_to`) and never commits
+  leaves no trace on reopen. The deferred-mode analog of P6.
+- **Pb** `pb_cross_txn_shared_log_sync_undoes_open_txn_keeps_committed` — txn A
+  appends statements (unsynced) and stays open; txn B commits, and B's
+  `sync_up_to` flushes the *shared* WAL buffer — including A's records — to
+  durable storage. A crash with A still open cleanly undoes A (it never reached
+  WAL_TXN_COMMIT) while B survives: the single ordered log never accidentally
+  persists an uncommitted transaction.
+- **Pc** `pc_torn_unsynced_tail_replay_stops_cleanly` — a torn record in the
+  unsynced WAL tail (a large uncommitted row forced onto the segment file, then
+  its tail byte flipped) is caught by CRC; replay stops cleanly at the last valid
+  record and the committed prefix survives.
+- **Pd** `pd_eviction_forced_sync_preserves_d5_on_crash` — a large transaction on
+  a 16-frame pool triggers eviction-forced WAL syncs (D5: log durable before a
+  dirty page is stolen); a crash after commit, with most pages only ever
+  eviction-flushed (never checkpointed), recovers every committed row from the
+  durable WAL. Exercises the C2 recovery fixes end-to-end.
+
+P6 and the two-table incomplete-txn test were pinned to the legacy per-statement
+policy (they call `flush()` mid-transaction, which is only valid when statements
+are individually durable) so that policy stays covered. **Crash harness 21 → 25,
+all green.** No format change.
+
+### C5 — acceptance benchmark + closeout
+
+**Acceptance benchmark** (`benches/decompose.rs`, fetched from `origin/bench-ladder`;
+release, Apple Silicon macOS; SQLite baseline `PRAGMA journal_mode=WAL,
+synchronous=FULL, fullfsync=ON` to match Rust `sync_all`'s `F_FULLFSYNC`; 100
+single-row durable transactions per rung, median of 10 samples). Because
+group-committed force-log-at-commit is now the **default**, the ladder's ordinary
+rungs (`w0_row`…`w4_event_full`) now measure that default and **converge with the
+explicit one-fsync rungs (`w4_1fsync`)** — which is the proof the flip landed.
+
+| Rung | ms/commit (after: default) | note |
+|------|----------------------------|------|
+| W0 `w0_row` (plain row) | **3.59** | ≈ SQLite `sqlite_w0` **3.64** — parity |
+| W1 `w1_btree` (+ B-tree) | 4.39 | |
+| W2 `w2_vector` (+ VECTOR(128) IVF) | 4.36 | |
+| W3 `w3_edge` (+ graph edge) | 4.24 | |
+| W4 `w4_event_full` (+ event capture) | **4.40** | full multi-model commit |
+| `w0_1fsync` (explicit one-fsync W0) | 3.57 | == `w0_row` ✓ |
+| `w4_1fsync` (explicit one-fsync W4) | 4.37 | == `w4_event_full` ✓ |
+| SQLite `sqlite_w0` / `sqlite_w1` | 3.64 / 4.03 | durability-matched baseline |
+
+**Before → after (the headline):** the full multi-model commit (row + B-tree +
+vector + edge + event) goes from the old per-statement default's **~33.1
+ms/commit** (PR #21 ladder — ~10 `F_FULLFSYNC`s where one suffices) to **~4.40
+ms/commit** at one group-coalesced fsync — **~7.5×**. W0 is at SQLite parity
+(3.59 vs 3.64 ms). The old default cannot be re-measured on this machine (the
+default changed); its 33.1 ms is PR #21's recorded number, and the
+`w4_event_full` ≈ `w4_1fsync` convergence above is the same-machine confirmation
+that the default is now the one-fsync path.
+
+**Peak memory:** unchanged — this milestone moves *when* the WAL is fsynced, not
+what is buffered; no new resident structures (the ladder engine holds the same
+buffer pool + IVF centroids as before).
+
+**Crash harness:** 21 → **25** (Pa–Pd) + valid-prefix property test under both
+policies — all green. **No `FORMAT_VERSION` bump.** Sync invariant holds
+(`cargo tree -p unidb --no-default-features --edges normal` has no
+tokio/reqwest/axum).
+
+**Locked-decision changes:** none reversed — **D1 fulfilled**, D2/D5 unchanged.
+Human sign-off for making group-committed force-log-at-commit the default
+recorded above (2026-07-09).
+
+**Commit-time WAL fsync is COMPLETE.**

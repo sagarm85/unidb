@@ -589,9 +589,12 @@ impl Wal {
         Ok(lsn)
     }
 
-    /// Enable/disable group-commit deferral (M9). When turning it **off**,
-    /// callers should normally call [`Self::sync`] first to make anything
-    /// appended-but-unsynced durable.
+    /// Enable/disable group-commit deferral. In deferred mode (the engine
+    /// default since C1 — commit-time fsync) statement mini-txn commit/abort
+    /// records are appended without a per-call fsync; durability is forced by a
+    /// later [`Self::sync`] / [`Self::sync_up_to`] (the transaction's commit
+    /// point). When turning it **off**, callers should normally call
+    /// [`Self::sync`] first to make anything appended-but-unsynced durable.
     pub fn set_deferred_sync(&self, deferred: bool) {
         self.lock().deferred_sync = deferred;
     }
@@ -756,14 +759,30 @@ impl Wal {
         Ok(records)
     }
 
-    /// WAL shipping (P6.b): every record strictly after `from_lsn`, in LSN order
-    /// — what a replica or archiver needs to catch up from its last-applied LSN.
+    /// WAL shipping (P6.b): every record strictly after `from_lsn` **and at or
+    /// below the durable frontier**, in LSN order — what a replica or archiver
+    /// needs to catch up from its last-applied LSN.
+    ///
+    /// The durable-frontier cap is the commit-time-fsync replication guard (C3):
+    /// under the group-committed default, records are appended to the segment
+    /// file before their fsync, so the file on disk can contain records past
+    /// `durable_lsn`. Shipping those would let a replica apply — and, on
+    /// failover, a promoted replica *retain* — commits the primary had not yet
+    /// made durable; a crash of the primary before its own fsync would then
+    /// leave the replica **ahead** of the recovered primary (divergence). Capping
+    /// at `durable_lsn` guarantees a replica's state is always a prefix of the
+    /// primary's durable state. Records between `durable_lsn` and the WAL tail
+    /// are simply shipped in a later batch once they become durable.
+    ///
     /// v1 scans all segments then filters; skipping already-consumed segments by
     /// their base LSN is a future optimization.
     pub fn records_from(&self, from_lsn: Lsn) -> Result<Vec<WalRecord>> {
-        let dir = self.lock().dir.clone();
+        let (dir, durable) = {
+            let g = self.lock();
+            (g.dir.clone(), g.durable_lsn)
+        };
         let mut recs = Self::scan_file(&dir)?;
-        recs.retain(|r| r.lsn > from_lsn);
+        recs.retain(|r| r.lsn > from_lsn && r.lsn <= durable);
         Ok(recs)
     }
 

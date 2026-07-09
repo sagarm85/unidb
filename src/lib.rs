@@ -529,6 +529,23 @@ impl Engine {
         // index as an on-disk IVF-Flat (P3.c). `Engine::open` does ZERO index
         // rebuilding: it reads each index straight from its stable meta page.
         // This is the O(1)-open moat; the async rebuild worker is retired.
+        //
+        // Commit-time fsync (C1): make **group-committed force-log-at-commit**
+        // the default. Statement mini-txns issued inside an open user
+        // transaction append their WAL records without a per-statement fsync;
+        // `Engine::commit`'s `sync_up_to(commit_lsn)` is the single durable
+        // point (one fsync per transaction — group-coalesced across concurrent
+        // committers). This is ARIES' force-log-at-commit, fulfilling D1; D2
+        // (mini-txn bracketing) and D5 (WAL-before-page) are unchanged — D5 now
+        // holds under deferral via the buffer pool's eviction-forced sync (C2).
+        // The open-time system-table setup above ran while the WAL was still in
+        // per-statement mode, so those meta pages are already durable; the flip
+        // affects only post-open user activity. Standalone operations that claim
+        // durability without a following commit (checkpoint, vacuum) issue their
+        // own sync — see the C1 durability-claim audit in PROGRESS.md. The
+        // per-statement policy survives only as an internal flag
+        // (`set_deferred_sync(false)`) so the crash harness can exercise both.
+        wal.set_deferred_sync(true);
         tracing::info!(dir = %dir.display(), page_size = page_size_usize, next_xid, "engine opened");
         Ok(Self {
             control,
@@ -975,7 +992,12 @@ impl Engine {
             control: &self.control,
             page_size,
         };
-        cat_write(&self.catalog).set_column_index(table, column, kind, &mut ctx)
+        cat_write(&self.catalog).set_column_index(table, column, kind, &mut ctx)?;
+        // C1 durability-claim audit: this is a **standalone** DDL-like operation
+        // (no `xid`, no enclosing user commit to cover it), so it self-syncs its
+        // catalog + index-backfill mini-txns before returning — preserving the
+        // per-call durability contract it had before the commit-time-fsync flip.
+        self.sync_wal()
     }
 
     /// Build status of a secondary index, or `None` if the column has no index.
@@ -1014,7 +1036,11 @@ impl Engine {
             control: &self.control,
             page_size,
         };
-        cat_write(&self.catalog).set_events_enabled(table, true, &mut ctx)
+        cat_write(&self.catalog).set_events_enabled(table, true, &mut ctx)?;
+        // C1 durability-claim audit: standalone catalog mutation (no `xid`),
+        // so it self-syncs before returning — same rationale as
+        // `set_column_index` and the checkpoint/vacuum sites.
+        self.sync_wal()
     }
 
     /// Fetch up to `limit` events with `seq` greater than `consumer`'s
@@ -1601,15 +1627,19 @@ impl Engine {
         )
     }
 
-    /// Enable/disable WAL group-commit deferral (M9). When enabled, per-
-    /// statement and per-commit fsyncs are skipped; the caller becomes
-    /// responsible for calling [`Self::sync_wal`] to force durability before
-    /// acknowledging any commit to a client. This is intended for a single
-    /// owner of the `Engine` that serializes all access (the server writer
-    /// thread) — see `server::engine_handle`. Off by default. See
-    /// [`crate::wal::Wal::set_deferred_sync`] for the durability contract and
-    /// the current buffer-pool caveat (a working set exceeding the pool while
-    /// in deferred mode is not yet supported — tracked for M9 hardening).
+    /// Toggle statement-level WAL fsync deferral. **`true` is now the default**
+    /// (set by [`Self::open`]): group-committed force-log-at-commit, where
+    /// statement mini-txns append without a per-statement fsync and
+    /// [`Self::commit`] forces the transaction's commit record durable via the
+    /// coalescing `Wal::sync_up_to` barrier — one fsync per transaction (C1).
+    ///
+    /// Passing `false` restores the legacy **per-statement** durability policy
+    /// (every mini-txn fsyncs immediately). This is **not a user knob** — it
+    /// exists so the crash-injection harness can exercise both policies; the
+    /// buffer pool's eviction-forced sync (C2) makes the deferred default safe
+    /// for working sets larger than the pool, so there is no longer a reason
+    /// for a caller to opt out. `#[doc(hidden)]` for that reason.
+    #[doc(hidden)]
     pub fn set_deferred_sync(&self, deferred: bool) {
         self.wal.set_deferred_sync(deferred);
     }
@@ -1760,6 +1790,14 @@ impl Engine {
     /// The current WAL tail LSN — a replica's starting point for streaming.
     pub fn wal_current_lsn(&self) -> Lsn {
         self.wal.current_lsn()
+    }
+
+    /// The durable WAL frontier — the LSN of the last fsync'd record. Under the
+    /// group-committed default this can trail [`Self::wal_current_lsn`] between
+    /// commits; WAL shipping is capped here so a replica never receives records
+    /// the primary has not made durable (C3, see `Wal::records_from`).
+    pub fn wal_durable_lsn(&self) -> Lsn {
+        self.wal.durable_lsn()
     }
 
     /// The database directory (parent of the control file) — used by backup and
@@ -1988,6 +2026,16 @@ impl Engine {
             report.versions_reclaimed += raw_reclaimable.len();
             report.slots_freed += raw_reclaimable.len();
         }
+
+        // C1 durability-claim audit — vacuum is a **standalone** operation (no
+        // enclosing user transaction whose commit `sync_up_to` would cover it),
+        // so it self-syncs: force its `WAL_VACUUM` records durable before
+        // returning so a caller that observes reclaimed space also observes it
+        // durably. Crash-safety does not depend on this (the vacuum records are
+        // idempotent redo-only, and D5 keeps any flushed page behind the durable
+        // frontier), but the durability *claim* on return does. Cheap when
+        // nothing was reclaimed (the WAL is already at its frontier).
+        self.sync_wal()?;
 
         tracing::info!(
             horizon,
@@ -4131,5 +4179,54 @@ mod tests {
         let engine = Engine::open(dir.path(), 0).unwrap();
         let x = engine.begin().unwrap();
         assert_eq!(engine.get(x, keep).unwrap(), b"keep");
+    }
+
+    /// C2 (D5 eviction-forced sync): under the commit-time-fsync default a
+    /// single transaction can dirty more pages than the buffer pool holds
+    /// without any statement fsync. Eviction must then force a WAL sync and
+    /// steal a now-durable page rather than dead-ending at `BufferPoolFull`.
+    /// A tiny pool + one large transaction inserting far more pages' worth of
+    /// rows than the pool has frames must still commit and read back every row,
+    /// with the D5 invariant (page LSN never ahead of the durable WAL at the
+    /// steal point — a debug tripwire in `find_victim`) intact.
+    #[test]
+    fn large_deferred_transaction_survives_pool_smaller_than_working_set() {
+        let dir = tempdir().unwrap();
+        // Minimum pool (16 frames). Each row is ~1 KiB, so a page holds only a
+        // handful — 400 rows dirties dozens of pages, many times the 16 frames.
+        let engine = Engine::open_with_pool_capacity(dir.path(), 0, 16).unwrap();
+        let payload = vec![0xABu8; 1024];
+
+        let xid = engine.begin().unwrap();
+        let mut rids = Vec::new();
+        for i in 0..400u32 {
+            // Distinguish rows by a small prefix so read-back is meaningful.
+            let mut row = i.to_le_bytes().to_vec();
+            row.extend_from_slice(&payload);
+            // Every insert goes through `fetch_page_for_write`, which forces a
+            // WAL sync + retry when the pool is full of not-yet-durable dirty
+            // pages — this is the assertion under test: no `BufferPoolFull`.
+            rids.push(engine.insert(xid, &row).unwrap());
+        }
+        engine.commit(xid).unwrap();
+
+        // Every row is present and intact after eviction churn.
+        let reader = engine.begin().unwrap();
+        for (i, rid) in rids.iter().enumerate() {
+            let got = engine.get(reader, *rid).unwrap();
+            assert_eq!(&got[..4], &(i as u32).to_le_bytes(), "row {i} prefix");
+            assert_eq!(&got[4..], &payload[..], "row {i} payload");
+        }
+        engine.commit(reader).unwrap();
+
+        // And they survive a reopen (recovery redoes the committed inserts even
+        // though most pages were evicted, not checkpoint-flushed).
+        drop(engine);
+        let engine = Engine::open_with_pool_capacity(dir.path(), 0, 16).unwrap();
+        let reader = engine.begin().unwrap();
+        let last = rids.len() - 1;
+        let got = engine.get(reader, rids[last]).unwrap();
+        assert_eq!(&got[..4], &(last as u32).to_le_bytes());
+        engine.commit(reader).unwrap();
     }
 }
