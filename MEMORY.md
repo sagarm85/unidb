@@ -15,13 +15,16 @@
 - **Phase 5 (concurrency & performance) — COMPLETE (2026-07-09).** Part 1
   (P5.a–P5.d) shipped to `main` via PR #14 (merge `30109d9`); Part 2 (P5.e
   multiple writers + P5.f resource control) shipped on branch
-  `p5e-concurrent-writers` (PR #15). **`Engine` is now `Send + Sync`, a worker
-  pool shares `Arc<Engine>`, heap page latches + leader-election group commit
-  make write throughput scale with cores (3.68× at 8 writers), and per-query
-  timeouts/cancellation/`work_mem` are in place.** Crash harness 19/19; sync
-  invariant holds. Docs closeout done (README, `docs/design/engine_design.md`,
-  `PROGRESS.md` Phase 5 entry, `docs/backlog/phase5_concurrency.md`). **Next:
-  mark PR #15 ready.** Detail below.
+  `p5e-concurrent-writers`, **open as PR #16** (ready). **`Engine` is now `Send +
+  Sync`, a worker pool shares `Arc<Engine>`, heap page latches + leader-election
+  group commit make write throughput scale with cores (3.68× at 8 writers), and
+  per-query timeouts/cancellation/`work_mem` are in place.** Crash harness 19/19;
+  sync invariant holds. Docs closeout done (README, `docs/design/engine_design.md`,
+  `PROGRESS.md` Phase 5 entry, `docs/backlog/phase5_concurrency.md`). **PR-history
+  note:** the harness auto-created+merged **PR #15 at an early `wip(P5.e-2)`
+  snapshot (`7e4b89b`)** — it does *not* contain the finished work; **PR #16 (from
+  the same branch → `main`) is the real, complete Phase 5 pt.2** and is the one to
+  review/merge. Detail below.
   - **What shipped (concurrency infrastructure — non-breaking; single-writer
     behavior is unchanged, these just make the internal components
     concurrency-capable):** P5.a concurrent buffer-pool latching (`Mutex<PoolState>`
