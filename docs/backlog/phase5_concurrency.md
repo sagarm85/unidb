@@ -70,8 +70,38 @@ adversarially.
 now interior-mutable `&self`, so **every** storage component is `&self`. The
 `Sync`-Engine foundation is complete.
 
-**Step 2+ — measured execution plan (surveyed 2026-07-09, not yet started).**
-The remaining work is large but mechanical; the exact surface is known:
+**Steps 2–4 — DONE** (branch `p5e-concurrent-writers`, 2026-07-09):
+- **Step 2 (`0478db7`) — `Engine` is `Send + Sync`.** The 6 mutated fields became
+  interior-mutable (`control → Mutex<ControlData>` + a cached immutable
+  `page_size`; `next_lob_id`/`next_event_seq`/`checkpoints_triggered` → atomics;
+  `auto_checkpoint`/`last_checkpoint` → `Mutex`), all 27 `&mut self` methods
+  flipped to `&self`, and every vestigial `&mut BufferPool/Wal/…` signature/
+  reborrow became `&`. `checkpoint::run` takes `&Mutex<ControlData>` and locks
+  only for the small control update (never across an fsync). Compile assertion
+  upgraded `Send` → `Send + Sync`.
+- **Step 3 (`f977fb3`) — concurrent writers.** `server/engine_handle.rs` rewritten:
+  `EngineHandle` holds `Arc<Engine>` and runs each blocking call on a tokio
+  blocking-pool thread (`spawn_blocking`); the channel/`worker_loop` machinery is
+  gone; read fast-path unchanged. **Heap page latches** (`BufferPool::
+  latch_exclusive`, built in P5.a, finally wired) now wrap every heap RMW so
+  concurrent writers can't lose an update; insert/update use a re-checking
+  `acquire_page_for_insert`; latches are taken one page at a time (no two-latch
+  deadlock). A coarse `write_serial` `Mutex` serializes the non-CRUD paths that do
+  a non-atomic read-catalog-then-mutate-shared-index sequence (edges, LOBs, event
+  tables, DDL, vacuum) — raw CRUD + reads stay concurrent. `tests/
+  concurrent_writers.rs` (insert stress / distinct-row updates / same-row
+  contention, all under a deadline guard).
+- **Step 4 (`29fe805`) — group commit that scales.** `txn::commit` returns the
+  commit LSN; `Engine::commit` forces durability via new `Wal::sync_up_to`, whose
+  leader (`group_fsync`) runs `sync_all` **with the append lock released** so
+  concurrent committers coalesce behind one fsync. Headline
+  (`benches/concurrent_writers.rs`, 8 cores): **1→325, 2→330, 4→647 (1.99x),
+  8→1197 (3.68x) commits/sec** — write throughput scales with cores.
+
+**Remaining:** P5.f (below). Docs closeout + mark PR #15 ready.
+
+**Step 2+ — measured execution plan (surveyed 2026-07-09; DONE per above).**
+The remaining work was large but mechanical; the exact surface is known:
 - **`Engine` → `&self`/`Sync` (`lib.rs`).** Only **6 fields are mutated** and
   need interior mutability; everything else is already `&self`:
   - `control: ControlData` → `Mutex<ControlData>` — **~44 access sites** (the

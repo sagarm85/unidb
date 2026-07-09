@@ -39,17 +39,42 @@
     now returns an owned `Vec`; `txn::abort` now takes `&Heap`/`&BufferPool`.
     **Every storage component is now `&self`/shareable — the `Sync` Engine
     foundation is complete.**
-  - **NEXT — P5.e step 2+ (the payoff), on `p5e-concurrent-writers`:** (2) make
-    `Engine` `Sync` — hold `Arc<_>` components and convert its write methods to
-    `&self` (the big `lib.rs` change); (3) replace the M5.a single-writer-thread
-    bridge (`server/engine_handle.rs`) with a writer/connection pool + admission
-    control; (4) concurrent-writer stress + linearizability tests (no lost
-    updates/torn state/deadlock hangs) and the **headline benchmark: write
-    throughput scales with cores** → `PROGRESS.md`. Then **P5.f** (query
-    timeouts, cancellation, per-query `work_mem`) and docs closeout (README,
-    `docs/design/engine_design.md`, flip `docs/backlog/phase5_concurrency.md` to
-    done). Spec: `docs/backlog/phase5_concurrency.md`. Human sign-off to reverse
-    the single-writer design is recorded in `PROGRESS.md` (2026-07-09).
+  - **P5.e steps 2–4 — DONE** (branch `p5e-concurrent-writers`, 2026-07-09):
+    - **Step 2 (`0478db7`) — `Engine` is `Send + Sync`.** 6 mutated fields →
+      interior-mutable (`control → Mutex<ControlData>` + cached immutable
+      `page_size`; `next_lob_id`/`next_event_seq`/`checkpoints_triggered` →
+      atomics; `auto_checkpoint`/`last_checkpoint` → `Mutex`); all 27 `&mut self`
+      methods → `&self`; every vestigial `&mut BufferPool/Wal/…` sig+reborrow →
+      `&` (those components were already `&self`). `checkpoint::run` takes
+      `&Mutex<ControlData>`, locks only for the small control update (never
+      across an fsync). Compile assert `Send` → `Send + Sync`.
+    - **Step 3 (`f977fb3`) — concurrent writers.** `server/engine_handle.rs`
+      rewritten to `Arc<Engine>` + `spawn_blocking` (channel/`worker_loop`
+      deleted; read fast-path kept). **Heap page latches** (`BufferPool::
+      latch_exclusive`, built in P5.a, finally wired) wrap every heap RMW → no
+      lost updates; insert/update via re-checking `acquire_page_for_insert`; one
+      latch at a time (no two-latch deadlock); FSM lock never nests under a latch.
+      Coarse `write_serial: Mutex<()>` serializes the non-CRUD paths that do a
+      non-atomic read-catalog-then-mutate-shared-index sequence (edges/LOBs/event
+      tables/DDL/vacuum); **raw CRUD + reads stay concurrent**; SQL already
+      serializes on the catalog `RwLock`. `tests/concurrent_writers.rs` (insert
+      stress / distinct-row updates / same-row contention, deadline-guarded).
+    - **Step 4 (`29fe805`) — group commit that scales.** `txn::commit` returns the
+      commit LSN; `Engine::commit` forces durability via new `Wal::sync_up_to`
+      (leader-election barrier); crucially `Wal::group_fsync` runs `sync_all`
+      **with the append lock released** so concurrent committers coalesce behind
+      one fsync. **Headline** (`benches/concurrent_writers.rs`, 8 cores): 1→325,
+      2→330, 4→647 (1.99x), **8→1197 commits/s (3.68x)** — scales with cores.
+      Crash harness **still 19/19** (incl. P12 fsync-fault); sync-invariant holds.
+  - **NEXT on `p5e-concurrent-writers`:** **P5.f** (query timeouts, cancellation,
+    per-query `work_mem`), then docs closeout (README,
+    `docs/design/engine_design.md`, add a `PROGRESS.md` Phase 5 entry, flip
+    `docs/backlog/phase5_concurrency.md` to done) and **mark PR #15 ready**.
+    Human sign-off to reverse the single-writer design is recorded in
+    `PROGRESS.md` (2026-07-09). **Known limitation (documented):** only *raw
+    CRUD* scales with cores; SQL/graph/LOB writes serialize (catalog RwLock /
+    `write_serial`) — finer-grained (latch-coupled B-tree) index concurrency is
+    future work.
 - **Milestone: M0-M8 are ALL DONE.** Every milestone on CLAUDE.md's
   original roadmap (M0-M5) shipped; M6-M8 are a user-approved follow-on
   set (B-Tree indexing, CSR graph, an "attach" Rust client over REST)
