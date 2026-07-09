@@ -298,9 +298,257 @@ fn bench_pg_ladder(c: &mut Criterion) {
     group.finish();
 }
 
+// ------------------------------ B2: CRUD -----------------------------------
+
+/// Build a keyed unidb table of `n` rows with a BTREE index on `id`; return the
+/// engine (kept alive by the caller) plus a prepared point-SELECT.
+fn unidb_build_keyed(dir: &std::path::Path, n: u64) -> Engine {
+    let engine = Engine::open(dir, 0).unwrap();
+    let x = engine.begin().unwrap();
+    engine
+        .execute_sql(x, "CREATE TABLE t (id INT, body TEXT)")
+        .unwrap();
+    engine
+        .execute_sql(x, "CREATE INDEX ib ON t USING BTREE (id)")
+        .unwrap();
+    engine.commit(x).unwrap();
+    // Bulk-load in BATCHED transactions — the size sweep builds tables of up to
+    // millions of rows. Per-row durable commit (~3.5 ms each) would take hours;
+    // one giant transaction overflows the heap's per-statement FSM at ~1e5+ rows
+    // (a documented SQL-path bulk-insert limitation). Batching (commit every
+    // BATCH rows) is both fast and correct — load speed is not what any keyed
+    // test measures.
+    const BATCH: u64 = 2_000;
+    let ins = engine
+        .prepare("INSERT INTO t (id, body) VALUES ($1, $2)")
+        .unwrap();
+    let mut x = engine.begin().unwrap();
+    for i in 0..n {
+        engine
+            .execute_prepared(
+                x,
+                &ins,
+                &[Literal::Int(i as i64), Literal::Text(format!("b{i}"))],
+            )
+            .unwrap();
+        if (i + 1) % BATCH == 0 {
+            engine.commit(x).unwrap();
+            x = engine.begin().unwrap();
+        }
+    }
+    engine.commit(x).unwrap();
+    engine
+}
+
+/// Build a keyed Postgres table of `n` rows (PK on id) via a fast bulk load
+/// (one transaction) — table content, not load speed, is what this sets up.
+fn pg_build_keyed(client: &mut Client, n: u64) {
+    client
+        .batch_execute("DROP TABLE IF EXISTS t; CREATE TABLE t (id INT PRIMARY KEY, body TEXT)")
+        .unwrap();
+    let stmt = client
+        .prepare("INSERT INTO t (id, body) VALUES ($1, $2)")
+        .unwrap();
+    let mut txn = client.transaction().unwrap();
+    for i in 0..n {
+        txn.execute(&stmt, &[&(i as i32), &format!("b{i}")])
+            .unwrap();
+    }
+    txn.commit().unwrap();
+}
+
+/// B2: point SELECT by key, MVCC UPDATE, and churn-then-remeasure — unidb vs
+/// both Postgres lenses. Reads don't fsync, so the lens is irrelevant to SELECT
+/// throughput (we still run under lens 2, the matched-durability environment,
+/// and note it); UPDATE and the churn re-measure are durability-sensitive.
+fn bench_pg_crud(c: &mut Criterion) {
+    let Some(url) = pg_url() else {
+        eprintln!("[pg] PG_URL unset — skipping Postgres CRUD suite (B2)");
+        return;
+    };
+    let mut group = c.benchmark_group("pg_crud");
+    group.sample_size(20);
+    group.throughput(Throughput::Elements(1));
+
+    // ---- unidb (embedded, as-shipped default) ----
+    let udir = tempdir().unwrap();
+    let engine = unidb_build_keyed(udir.path(), KEYED_ROWS);
+    let sel = engine
+        .prepare("SELECT id, body FROM t WHERE id = $1")
+        .unwrap();
+    let upd = engine
+        .prepare("UPDATE t SET body = $1 WHERE id = $2")
+        .unwrap();
+    // point SELECT by key (embedded index path — the no-IPC advantage)
+    group.bench_function("unidb_point_select", |b| {
+        let mut i = 0u64;
+        b.iter(|| {
+            let x = engine.begin().unwrap();
+            let key = (i % KEYED_ROWS) as i64;
+            engine
+                .execute_prepared(x, &sel, &[Literal::Int(key)])
+                .unwrap();
+            engine.commit(x).unwrap();
+            i += 1;
+        });
+    });
+    // MVCC UPDATE by key (new version + xmax stamp)
+    group.bench_function("unidb_update", |b| {
+        let mut i = 0u64;
+        b.iter(|| {
+            let x = engine.begin().unwrap();
+            let key = (i % KEYED_ROWS) as i64;
+            engine
+                .execute_prepared(
+                    x,
+                    &upd,
+                    &[Literal::Text(format!("u{i}")), Literal::Int(key)],
+                )
+                .unwrap();
+            engine.commit(x).unwrap();
+            i += 1;
+        });
+    });
+    drop(sel);
+    drop(upd);
+    drop(engine);
+    drop(udir);
+
+    // ---- unidb churn: read latency fresh vs after heavy update churn, and
+    // after a manual VACUUM (M10) — the bloat-management maturity check ----
+    unidb_churn_bench(&mut group);
+
+    // ---- Postgres (lens 2, matched durability) ----
+    let Some((mut client, method)) = pg_open_lens(&url, true) else {
+        group.finish();
+        return;
+    };
+    eprintln!("[pg] CRUD suite running under wal_sync_method={method} (lens 2)");
+    pg_build_keyed(&mut client, KEYED_ROWS);
+    let sel = client
+        .prepare("SELECT id, body FROM t WHERE id = $1")
+        .unwrap();
+    let upd = client
+        .prepare("UPDATE t SET body = $1 WHERE id = $2")
+        .unwrap();
+    group.bench_function(format!("pg_point_select [{method}]"), |b| {
+        let mut i = 0i32;
+        b.iter(|| {
+            let key = i % KEYED_ROWS as i32;
+            client.query(&sel, &[&key]).unwrap();
+            i += 1;
+        });
+    });
+    group.bench_function(format!("pg_update [{method}]"), |b| {
+        let mut i = 0i32;
+        b.iter(|| {
+            let key = i % KEYED_ROWS as i32;
+            client.execute(&upd, &[&format!("u{i}"), &key]).unwrap();
+            i += 1;
+        });
+    });
+    pg_churn_bench(&mut group, &mut client, &method);
+    group.finish();
+}
+
+/// unidb churn: measure point-read latency on a fresh table, then after
+/// `CHURN_ROUNDS` full-table update passes (heavy version accumulation), then
+/// after a manual `Engine::vacuum()`. Fresh vs churned exposes MVCC bloat;
+/// churned vs vacuumed shows M10 reclaiming it.
+fn unidb_churn_bench(group: &mut criterion::BenchmarkGroup<criterion::measurement::WallTime>) {
+    const CHURN_ROUNDS: u64 = 30;
+    let dir = tempdir().unwrap();
+    let engine = unidb_build_keyed(dir.path(), KEYED_ROWS);
+    let sel = engine
+        .prepare("SELECT id, body FROM t WHERE id = $1")
+        .unwrap();
+    let read = |i: &mut u64| {
+        let x = engine.begin().unwrap();
+        let key = (*i % KEYED_ROWS) as i64;
+        engine
+            .execute_prepared(x, &sel, &[Literal::Int(key)])
+            .unwrap();
+        engine.commit(x).unwrap();
+        *i += 1;
+    };
+
+    group.bench_function("unidb_read_fresh", |b| {
+        let mut i = 0u64;
+        b.iter(|| read(&mut i));
+    });
+
+    // Heavy update churn: rewrite every row CHURN_ROUNDS times.
+    let upd = engine
+        .prepare("UPDATE t SET body = $1 WHERE id = $2")
+        .unwrap();
+    for r in 0..CHURN_ROUNDS {
+        for k in 0..KEYED_ROWS {
+            let x = engine.begin().unwrap();
+            engine
+                .execute_prepared(
+                    x,
+                    &upd,
+                    &[Literal::Text(format!("c{r}-{k}")), Literal::Int(k as i64)],
+                )
+                .unwrap();
+            engine.commit(x).unwrap();
+        }
+    }
+    group.bench_function("unidb_read_after_churn", |b| {
+        let mut i = 0u64;
+        b.iter(|| read(&mut i));
+    });
+
+    engine.vacuum().unwrap();
+    group.bench_function("unidb_read_after_vacuum", |b| {
+        let mut i = 0u64;
+        b.iter(|| read(&mut i));
+    });
+}
+
+/// Postgres churn: same shape (fresh read, then heavy update churn with
+/// autovacuum on, then re-measure). No manual VACUUM — autovacuum is the point.
+fn pg_churn_bench(
+    group: &mut criterion::BenchmarkGroup<criterion::measurement::WallTime>,
+    client: &mut Client,
+    method: &str,
+) {
+    const CHURN_ROUNDS: u64 = 30;
+    pg_build_keyed(client, KEYED_ROWS);
+    let sel = client
+        .prepare("SELECT id, body FROM t WHERE id = $1")
+        .unwrap();
+    group.bench_function(format!("pg_read_fresh [{method}]"), |b| {
+        let mut i = 0i32;
+        b.iter(|| {
+            let key = i % KEYED_ROWS as i32;
+            client.query(&sel, &[&key]).unwrap();
+            i += 1;
+        });
+    });
+
+    let upd = client
+        .prepare("UPDATE t SET body = $1 WHERE id = $2")
+        .unwrap();
+    for r in 0..CHURN_ROUNDS {
+        for k in 0..KEYED_ROWS as i32 {
+            client.execute(&upd, &[&format!("c{r}-{k}"), &k]).unwrap();
+        }
+    }
+    group.bench_function(format!("pg_read_after_churn [{method}]"), |b| {
+        let mut i = 0i32;
+        b.iter(|| {
+            let key = i % KEYED_ROWS as i32;
+            client.query(&sel, &[&key]).unwrap();
+            i += 1;
+        });
+    });
+}
+
 fn main() {
     let mut criterion = Criterion::default().configure_from_args();
     bench_ladder(&mut criterion);
     bench_pg_ladder(&mut criterion);
+    bench_pg_crud(&mut criterion);
     criterion.final_summary();
 }
