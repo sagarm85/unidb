@@ -61,6 +61,15 @@
 //         compaction) — the current row survives, reclaimed versions stay
 //         reclaimed, and a re-vacuum finds nothing new (idempotent). Distinct
 //         from P10, which exercises the raw-Heap mark at a lower level.
+//   P27 – durable FSM directory (durable-FSM B2): a table's heap page directory
+//         lives in the durable FSM tree (WAL_INDEX), not the catalog blob. A
+//         multi-page table crashed with no checkpoint recovers every row via a
+//         full scan (which walks the WAL-recovered directory), and the reopened
+//         heap appends new rows at the recovered tail (DiskBTree::max_entry).
+//   P28 – atomic heap grow (durable-FSM B2): a grow brackets the new page's init
+//         and its FSM directory entry in one WAL mini-txn, so a crash mid-grow
+//         leaves both or neither — never an orphan page absent from the
+//         directory. Rows on freshly grown pages survive a crash byte-intact.
 
 use tempfile::tempdir;
 use unidb::{Engine, RowId};
@@ -1553,4 +1562,165 @@ fn p26_crash_after_autovacuum_pass_recovers() {
         after.versions_reclaimed, 0,
         "P26: reclaimed versions must stay reclaimed after recovery (before={before:?}, after={after:?})"
     );
+}
+
+// ── P27: durable FSM directory survives a crash (durable-FSM B2) ──────────────
+//
+// A table's heap page directory now lives in the durable FSM tree (a `DiskBTree`,
+// WAL-logged as `WAL_INDEX` full-page images), not the catalog blob. This builds
+// a table spanning many heap pages (so the FSM tree holds a real multi-entry
+// directory), "crashes" (drop, no checkpoint — the FSM node pages live only in
+// the WAL), reopens, and asserts (i) a full-table scan returns every committed
+// row — which it can only do if the FSM directory was recovered from the WAL,
+// since the scan enumerates pages *through* it — and (ii) the reopened heap
+// appends new rows at the WAL-recovered tail (via `DiskBTree::max_entry`) with no
+// lost or duplicated pages, so old + new rows all read back.
+#[test]
+fn p27_durable_fsm_directory_survives_crash_and_scan_recovers_all_rows() {
+    use unidb::sql::logical::Literal;
+    use unidb::SqlResult;
+
+    // ~4 KiB bodies -> ~2 rows/page, so 80 rows span ~40 heap pages: a real
+    // multi-page FSM directory, without a slow build.
+    let body = "z".repeat(4000);
+    let n_before = 80usize;
+
+    let dir = tempdir().unwrap();
+    {
+        let engine = open(dir.path());
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE t (id INT, body TEXT)")
+            .unwrap();
+        engine.commit(x).unwrap();
+        let ins = engine
+            .prepare("INSERT INTO t (id, body) VALUES ($1, $2)")
+            .unwrap();
+        let x = engine.begin().unwrap();
+        for i in 0..n_before {
+            engine
+                .execute_prepared(
+                    x,
+                    &ins,
+                    &[Literal::Int(i as i64), Literal::Text(body.clone())],
+                )
+                .unwrap();
+        }
+        engine.commit(x).unwrap();
+        // "Crash": drop with no checkpoint/flush. The FSM tree's node pages are
+        // durable only in the WAL and must be redone on reopen.
+        drop(engine);
+    }
+
+    let engine = open(dir.path());
+    // (i) full scan recovers every committed row — proves the FSM directory
+    // (which the scan walks) was rebuilt from the WAL.
+    let count = |e: &Engine| -> usize {
+        let x = e.begin().unwrap();
+        let out = e.execute_sql(x, "SELECT id FROM t").unwrap();
+        e.commit(x).unwrap();
+        match &out[0] {
+            SqlResult::Rows(r) => r.len(),
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    };
+    assert_eq!(
+        count(&engine),
+        n_before,
+        "P27: every committed row must survive via the WAL-recovered FSM directory"
+    );
+
+    // (ii) the reopened heap appends at the recovered tail — insert more rows,
+    // then old + new all read back (no lost/duplicated pages post-recovery).
+    let ins = engine
+        .prepare("INSERT INTO t (id, body) VALUES ($1, $2)")
+        .unwrap();
+    let x = engine.begin().unwrap();
+    for i in n_before..(n_before + 20) {
+        engine
+            .execute_prepared(
+                x,
+                &ins,
+                &[Literal::Int(i as i64), Literal::Text(body.clone())],
+            )
+            .unwrap();
+    }
+    engine.commit(x).unwrap();
+    assert_eq!(
+        count(&engine),
+        n_before + 20,
+        "P27: appends after recovery must land at the recovered FSM tail"
+    );
+}
+
+// ── P28: atomic heap grow leaves no orphan on crash (durable-FSM B2) ──────────
+//
+// A heap grow makes the new page's init record AND its FSM directory entry one
+// WAL mini-txn (`alloc_heap_page` -> `DiskBTree::insert_in_txn`), so recovery
+// replays both or neither — a crash mid-grow can never leave an initialized page
+// that is absent from its directory (an orphan the scan would skip, silently
+// losing the rows later written to it). This grows a table, "crashes" (drop, no
+// checkpoint) immediately after the transaction that grew it, reopens, and
+// asserts the rows on the freshly grown pages are present (their pages are in the
+// recovered directory — not orphaned) and read back byte-intact (not torn).
+#[test]
+fn p28_atomic_heap_grow_leaves_no_orphan_on_crash() {
+    use unidb::sql::logical::Literal;
+    use unidb::SqlResult;
+
+    let body = "q".repeat(4000); // ~2 rows/page -> many grows
+    let n = 60usize;
+    let last_body = format!("LAST-{}", "q".repeat(3990));
+
+    let dir = tempdir().unwrap();
+    {
+        let engine = open(dir.path());
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE t (id INT, body TEXT)")
+            .unwrap();
+        engine.commit(x).unwrap();
+        let ins = engine
+            .prepare("INSERT INTO t (id, body) VALUES ($1, $2)")
+            .unwrap();
+        // Each committed insert may grow a page; commit per row so the grow
+        // mini-txns are durable but no checkpoint ever flushes the pages.
+        for i in 0..n {
+            let x = engine.begin().unwrap();
+            let b = if i == n - 1 { &last_body } else { &body };
+            engine
+                .execute_prepared(x, &ins, &[Literal::Int(i as i64), Literal::Text(b.clone())])
+                .unwrap();
+            engine.commit(x).unwrap();
+        }
+        // "Crash" immediately after the last grow, no checkpoint.
+        drop(engine);
+    }
+
+    let engine = open(dir.path());
+    let x = engine.begin().unwrap();
+    // Full scan (no index) enumerates pages through the recovered FSM directory.
+    let out = engine.execute_sql(x, "SELECT id, body FROM t").unwrap();
+    let rows = match &out[0] {
+        SqlResult::Rows(r) => r,
+        other => panic!("expected Rows, got {other:?}"),
+    };
+    // Every row survives — no page (grown by any insert) was orphaned out of the
+    // directory, or the scan would be short.
+    assert_eq!(
+        rows.len(),
+        n,
+        "P28: no grown page may be orphaned from the recovered FSM directory"
+    );
+    // The very last row (on the most-recently grown page) is present and intact
+    // — its page's directory entry recovered atomically with the page.
+    let has_last = rows.iter().any(|r| {
+        r.first() == Some(&Literal::Int((n - 1) as i64))
+            && r.get(1) == Some(&Literal::Text(last_body.clone()))
+    });
+    assert!(
+        has_last,
+        "P28: the last grown page's row must survive byte-intact (atomic grow, not torn)"
+    );
+    engine.commit(x).unwrap();
 }

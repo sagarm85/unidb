@@ -166,10 +166,17 @@ impl Heap {
         };
         let dir = tree.page_directory(reader)?; // FSM lock NOT held across tree I/O
         let mut fsm = self.lock_fsm();
-        for pid in dir {
+        for (pid, free) in dir {
             if !fsm.pages.contains(&pid) {
                 fsm.pages.push(pid);
             }
+            // Warm the free map from the durable FSM value (B2) — so a reopened
+            // heap knows each page's free space without re-fetching it. Do NOT
+            // clobber a fresher in-memory value recorded this session (the tree
+            // value is only refreshed at alloc + vacuum, so it can be stale-high
+            // for a page filled since; a stale-high hint is corrected by the
+            // insert retry loop, never an over-allocation).
+            fsm.free_map.entry(pid).or_insert(free);
         }
         fsm.pages.sort_unstable();
         fsm.directory_loaded = true;
@@ -633,32 +640,39 @@ impl Heap {
 
     fn alloc_heap_page(&self, pool: &BufferPool, wal: &Wal) -> Result<PageId> {
         let pid = pool.alloc_page()?;
+        let mut page = SlottedPage::new(pid, PAGE_TYPE_HEAP, self.page_size);
+        let free = page.free_space();
+        // B2 — atomic heap grow: the new page's init record AND its FSM directory
+        // entry live in ONE mini-txn, so recovery replays both or neither. A
+        // crash mid-grow can no longer orphan an initialized page that is absent
+        // from its directory. The FSM value's slot carries the page's initial
+        // free space so a reopened heap knows it without a re-fetch (B2).
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
         let alloc_lsn = wal.log_insert(txn_id, begin_lsn, pid, u16::MAX, &[])?;
-        let mut page = SlottedPage::new(pid, PAGE_TYPE_HEAP, self.page_size);
         page.set_lsn(alloc_lsn);
-        wal.commit_mini_txn(txn_id, alloc_lsn)?;
         pool.write_page(&page)?;
-        let free = page.free_space();
-        pool.unpin(pid);
-        // FSM-backed: record the new page in the durable directory (the FSM
-        // tree). Its own WAL mini-txn, crash-recovered by inheritance
-        // (`WAL_INDEX` full-page images). Done with NO page latch and NO FSM
-        // lock held (P5.e) — the tree op takes its own latches / WAL. (B1: a
-        // separate mini-txn from the page init, so a crash between the two can
-        // orphan an empty page — a space leak, never corruption; B2 folds them
-        // into one atomic grow.)
-        if let Some(tree) = &self.fsm_tree {
-            tree.insert(
+        let commit_lsn = if let Some(tree) = &self.fsm_tree {
+            // Same mini-txn as the page init; NO page latch and NO FSM lock held
+            // across the tree I/O (P5.e). `set_lsn(alloc_lsn)` above stamped the
+            // heap page; the tree nodes get their own higher LSNs under txn_id.
+            let mut prev_lsn = alloc_lsn;
+            tree.insert_in_txn(
                 OrderedValue::Int(pid as i64),
                 RowId {
                     page_id: pid,
-                    slot: 0,
+                    slot: free.min(u16::MAX as usize) as u16,
                 },
                 pool,
                 wal,
+                txn_id,
+                &mut prev_lsn,
             )?;
-        }
+            prev_lsn
+        } else {
+            alloc_lsn
+        };
+        wal.commit_mini_txn(txn_id, commit_lsn)?;
+        pool.unpin(pid);
         // Register the new page — FSM lock taken only now, after all page I/O
         // (no latch is held), so it forms no cycle with the pool's latches.
         {
@@ -744,12 +758,31 @@ impl Heap {
         pool.write_page(&page)?;
         let free = page.free_space(); // capture before releasing the latch
         pool.unpin(page_id);
-        self.note_free_space(page_id, free); // P1.c: FSM lock after unpin
         wal.commit_mini_txn(txn_id, lsn)?;
         // P1.a: this WAL_VACUUM record already carries a full clean page image
         // (its own torn-page protection), so no separate FPI is needed for a
         // later modification of this page in the same interval.
         pool.mark_fpi_logged(page_id);
+        drop(_wg); // release the page latch BEFORE any FSM tree I/O (P5.e)
+        self.note_free_space(page_id, free); // in-memory free map
+                                             // B2 — durable vacuum reclamation: record the reclaimed free space in
+                                             // the FSM tree so a reopened heap can reuse this page without
+                                             // re-probing (this is how autovacuum's `compact_page` "updates the
+                                             // durable FSM"). Its own mini-txn (the compaction above is already
+                                             // durable); a crash before it commits only leaves the FSM free value
+                                             // stale-low — safe (an under-report never over-allocates), and the next
+                                             // vacuum re-records it. No page latch / FSM lock held across the tree I/O.
+        if let Some(tree) = &self.fsm_tree {
+            tree.set_value(
+                &OrderedValue::Int(page_id as i64),
+                RowId {
+                    page_id,
+                    slot: free.min(u16::MAX as usize) as u16,
+                },
+                pool,
+                wal,
+            )?;
+        }
         Ok(reclaimed)
     }
 }
