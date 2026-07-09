@@ -47,7 +47,8 @@ API layer (M5)                REST + JWT(verify-only) + SSE + /metrics; embedded
 Query & execution (M1+)       SQL parser -> logical plan -> executor; Cypher subset (M3);
                               joins/aggregates/subqueries/CTEs + cost-based optimizer + EXPLAIN (Phase 4)
 Logical record layer (M1+)    rows / vector records / graph edges / queue events
-Transaction & concurrency     MVCC snapshots; write-write lock manager (abort-on-conflict)
+Transaction & concurrency     MVCC snapshots; real lock manager (S/X modes, blocking
+                              waits, wait-for-graph deadlock detection); concurrent writers (Phase 5)
 Storage layer (M0)            single-file paged store; buffer pool; WAL; control file; recovery
 ```
 
@@ -56,7 +57,7 @@ Module map (what each layer became in code):
 | Layer | Modules |
 |---|---|
 | Storage core (M0) | `format.rs`, `control.rs`, `mmap.rs`, `page.rs`, `bufferpool.rs`, `wal.rs`, `heap.rs`, `checkpoint.rs`, `recovery.rs` |
-| Transactions (M1) | `mvcc.rs`, `txn.rs`, `lockmgr.rs`, `concurrency_hooks.rs` |
+| Transactions (M1; concurrent since Phase 5) | `mvcc.rs`, `txn.rs`, `lockmgr.rs`, `concurrency_hooks.rs`, `query_limits.rs` (P5.f timeouts/cancel/`work_mem`) |
 | Catalog & SQL (M1) | `catalog.rs`, `sql/{parser,logical,executor}.rs` |
 | Query power (Phase 4) | `sql/{query,plan,query_exec,join,aggregate,sort,optimizer,statistics,explain}.rs` — joins (hash+Grace-spill / sort-merge / index-nested-loop), aggregation + sort, subqueries/CTEs, `ANALYZE` + cost-based optimizer, `EXPLAIN` |
 | Secondary indexes (M2, M6, M7; all durable since Phase 3) | `btree_index.rs` (durable `DiskBTree`, also backs full-text + edge), `disk_vector.rs` (durable IVF-Flat `DiskIvfIndex`), `fulltext.rs` (tokenizer), `vector.rs` (retired in-RAM HNSW baseline), `csr_index.rs` (retired) |
@@ -68,12 +69,19 @@ Module map (what each layer became in code):
 
 Two invariants shape everything above the storage layer:
 
-- **The engine is synchronous and single-threaded by design.** The only
-  background threads are the secondary-index worker (M2) and, when the
-  `server` feature is on, the server's writer thread (M5) — and the writer
-  thread *owns* the `Engine`, it does not share it. A default build has
-  zero async dependencies (verified via
-  `cargo tree --no-default-features --edges normal`).
+- **The engine is synchronous, but `Send + Sync` and safely shared across
+  threads (Phase 5).** Every method takes `&self`; all mutable state is behind
+  interior-mutable latches/locks/atomics (buffer-pool page latches, the
+  `Mutex<WalInner>` WAL, the `&self` lock manager, `Mutex<ControlData>`, …). The
+  async worker is retired (Phase 3); the server no longer owns the engine on one
+  writer thread — it shares an `Arc<Engine>` across a pool of blocking worker
+  threads (P5.e), so writers run in parallel. The engine itself pulls in **no
+  async runtime**: a default build has zero async dependencies (verified via
+  `cargo tree -p unidb --no-default-features --edges normal` — no
+  tokio/reqwest/axum). Durability under concurrency uses a leader-election
+  **group-commit** barrier (`Wal::sync_up_to`) whose fsync runs with the append
+  lock released, so committers coalesce behind one fsync and write throughput
+  scales with cores.
 - **Every operation takes an explicit `Xid`** from `Engine::begin` /
   `begin_with_isolation` and ends with `commit`/`abort`. There is no
   implicit transaction anywhere in the crate.
@@ -451,9 +459,12 @@ guarding a different failure mode.
 > edge-adjacency (P3.b) indexes are on-disk B+trees (`DiskBTree`); the vector
 > index (P3.c) is an on-disk IVF-Flat (`DiskIvfIndex`) whose cell posting lists
 > are themselves a `DiskBTree` and whose centroids live in a WAL-logged meta
-> page. All are updated inline on the writer thread
+> page. All are updated inline on the write path
 > (`apply_durable_index_writes`, `graph/edges::ensure_edge_index`) and read from
-> their stable meta pages. The M7 **CSR index was retired** in P3.b; the
+> their stable meta pages. Since Phase 5 these index-maintaining write paths are
+> serialized by a coarse write lock (SQL by the catalog `RwLock`, graph/LOB by
+> `Engine::write_serial`) rather than by a single owner thread — concurrent
+> latch-coupled B-tree writes are future work. The M7 **CSR index was retired** in P3.b; the
 > **async index worker was retired entirely** in P3.c (its last user was the
 > in-RAM HNSW). So §5.1 below is historical — there is no background index
 > thread anymore. See §5.2 and §5.4.
@@ -479,7 +490,7 @@ meta page id in `ColumnDef.index_root`.
 |---|---|---|
 | `Hnsw` (M2; **durable IVF-Flat since P3.c**) | `disk_vector.rs`, `DiskIvfIndex` — on-disk IVF-Flat; cell posting lists = durable `DiskBTree`, centroids in a WAL-logged meta page | **Durable, WAL-logged, crash-recovered, not rebuilt on open.** The `Hnsw` keyword now *denotes* the IVF-Flat index (the in-RAM HNSW graph in `vector.rs` is retired — kept only as a benchmark baseline). `CREATE INDEX ... USING HNSW`/`IVF` trains centroids from committed rows (`nlist ≈ √rows`, recall-favoring `nprobe`), stored in the meta page (id in `ColumnDef.index_root`). `NEAR` probes the nearest cells' posting lists → exact re-rank from the heap → MVCC re-check. f32, Euclidean (pgvector `<->` convention). |
 | `FullText` (M2; **durable since P3.b**) | durable `DiskBTree` keyed on tokens (`fulltext::tokenize`), one `(token, RowId)` entry per token | **Durable, WAL-logged, not rebuilt on open** — same `DiskBTree`/`WAL_INDEX` machinery as `BTree`. Now has a real read path: `Engine::search_fulltext` (tokenize → intersect per-token `search_eq` posting lists, AND-only → MVCC-resolve). |
-| `BTree` (M6; **durable since P3.a**) | `btree_index.rs`, `DiskBTree` — on-disk B+tree of buffer-pool-managed pages | **Durable, WAL-logged, crash-recovered, not rebuilt on open** (§5.4). Node pages carry the standard page header + a body-tag; a stable meta page (id in `ColumnDef.index_root`) points at the root so a root split never rewrites the catalog. Mutations log full node-page images (`WAL_INDEX`, redo-only) in one mini-txn each. No undo (entries are MVCC-validated hints). Written synchronously on the writer thread — **not** via the async worker. |
+| `BTree` (M6; **durable since P3.a**) | `btree_index.rs`, `DiskBTree` — on-disk B+tree of buffer-pool-managed pages | **Durable, WAL-logged, crash-recovered, not rebuilt on open** (§5.4). Node pages carry the standard page header + a body-tag; a stable meta page (id in `ColumnDef.index_root`) points at the root so a root split never rewrites the catalog. Mutations log full node-page images (`WAL_INDEX`, redo-only) in one mini-txn each. No undo (entries are MVCC-validated hints). Written synchronously on the write path — **not** via the async worker. |
 | `Csr` (M7) | `csr_index.rs` | **Retired in P3.b** — consulted by no read path after the M7 traversal revert (§7.3); adjacency is now served by the durable edge index. The module + its benchmark remain but are unwired from the runtime. |
 
 ### 5.3 Query execution against indexes
@@ -1096,4 +1107,21 @@ OUTER`+`USING`+`NATURAL` joins unsupported; the catalog (all TableDefs + stats)
 is still a single ~8 KiB page blob, so a very wide analyzed schema can overflow
 it (multi-page catalog is tracked tech debt). See `docs/backlog/
 phase4_query_power.md` + `PROGRESS.md`'s Phase 4 entry.
+**Phase 5 COMPLETE (2026-07-09, branch `p5e-concurrent-writers`): concurrency &
+performance.** P5.a–P5.d (part 1, PR #14): thread-safe buffer pool (per-page
+S/X latches), concurrent WAL append, `&self` transaction manager, and a real
+lock manager (modes / blocking `Condvar` waits / wait-for-graph deadlock
+detection). P5.e (part 2): `Heap`→`&self`, then **`Engine` is `Send + Sync`**
+(all 6 mutated fields interior-mutable; `checkpoint::run` locks control only
+off the fsync path), the server's single writer thread replaced by an
+`Arc<Engine>` + `spawn_blocking` **worker pool**, heap read-modify-writes wired
+to the per-page exclusive latch (no lost updates), and **group commit**
+(`Wal::sync_up_to` leader runs `sync_all` with the append lock released) so
+write throughput **scales with cores — 3.68× at 8 writers**
+(`benches/concurrent_writers.rs`). A coarse `write_serial` lock serializes the
+non-CRUD catalog/index write paths (documented limitation; only raw CRUD +
+reads run concurrently). P5.f: per-query **timeouts / cancellation / `work_mem`**
+(`query_limits.rs`, `Engine::execute_sql_with_limits`). Crash harness stays
+**19/19**; sync invariant holds; no `FORMAT_VERSION` bump. See
+`docs/backlog/phase5_concurrency.md` + `PROGRESS.md`'s Phase 5 entry.
 Update alongside the next milestone's closeout.*

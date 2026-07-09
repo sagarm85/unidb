@@ -1,14 +1,18 @@
 # Phase 5 — Concurrency & performance (Core lane)
 
-## Status as of 2026-07-09: IN PROGRESS — part 1 (P5.a–P5.d) shipped to `main` (PR #14).
+## Status as of 2026-07-09: COMPLETE — all checkpoints (P5.a–P5.f) shipped.
 
-P5.a (buffer-pool latching), P5.b (concurrent WAL append), P5.c (concurrent
-transaction manager), and P5.d (real lock manager — modes, blocking waits,
-wait-for-graph deadlock detection) are merged and green (crash harness 19/19).
-These are the concurrency *infrastructure*; single-writer behavior is unchanged.
-Remaining, on branch `p5e-concurrent-writers`: **P5.e** (Heap → `&self`, then
-`Engine` → `Sync` + writer/connection pool + admission control — the
-scales-with-cores payoff and its benchmark) and **P5.f** (resource control).
+Part 1 (P5.a buffer-pool latching, P5.b concurrent WAL append, P5.c concurrent
+transaction manager, P5.d real lock manager) merged to `main` via PR #14. Part 2
+(**P5.e** multiple writers — `Engine` is `Send + Sync`, an `Arc<Engine>` worker
+pool, heap page latches, and leader-election group commit so write throughput
+scales with cores (3.68× at 8 writers); **P5.f** resource control — per-query
+timeouts/cancellation/`work_mem`) shipped on branch `p5e-concurrent-writers`
+(PR #15). Crash harness **19/19** throughout; the sync invariant holds. Full
+detail in the checkpoint sections below and `PROGRESS.md`'s Phase 5 entry.
+**Documented limitation:** only raw CRUD scales with cores; SQL/graph/LOB writes
+serialize (catalog `RwLock` / `Engine::write_serial`) — finer-grained
+(latch-coupled B-tree) index concurrency is future work.
 
 The single-writer → concurrent-writers unlock. **The biggest and highest-risk
 phase** — it reverses the M5 "single writer thread, `Engine` is `!Sync`"
@@ -122,9 +126,16 @@ The remaining work was large but mechanical; the exact surface is known:
   torn state / deadlock hangs) and the **headline benchmark: write throughput
   scales with cores** → `PROGRESS.md`.
 
-### P5.f — Resource control
+### P5.f — Resource control — DONE (`6f8e8c4`)
 - Query timeouts, cancellation, per-query memory limits (a `work_mem` budget the
-  hash-join/sort spills respect).
+  hash-join/sort spills respect). Shipped as `query_limits.rs`: a thread-local
+  `QueryLimits { deadline, cancel: CancelToken, work_mem_rows }` installed for
+  the call via an RAII guard (a query runs on one worker thread). Executor scan
+  loops call `query_limits::check()` every 1024 rows → `DbError::QueryTimeout` /
+  `QueryCancelled`; `sort_mem_rows`/`hash_join_mem_rows` consult `work_mem_rows`.
+  Entry point `Engine::execute_sql_with_limits`; server maps both errors to 408
+  (and already has an HTTP `TimeoutLayer`). Tests: `query_limits` unit +
+  `tests/query_limits.rs` end-to-end.
 
 ## Locked decisions touched
 

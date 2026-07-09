@@ -12,9 +12,16 @@
 
 ## Current status
 
-- **Phase 5 (concurrency & performance) — IN PROGRESS. Part 1 (P5.a–P5.d)
-  shipped to `main` 2026-07-09** via PR #14 (merge `30109d9`); a fresh branch
-  `p5e-concurrent-writers` is cut off updated `main` for the rest.
+- **Phase 5 (concurrency & performance) — COMPLETE (2026-07-09).** Part 1
+  (P5.a–P5.d) shipped to `main` via PR #14 (merge `30109d9`); Part 2 (P5.e
+  multiple writers + P5.f resource control) shipped on branch
+  `p5e-concurrent-writers` (PR #15). **`Engine` is now `Send + Sync`, a worker
+  pool shares `Arc<Engine>`, heap page latches + leader-election group commit
+  make write throughput scale with cores (3.68× at 8 writers), and per-query
+  timeouts/cancellation/`work_mem` are in place.** Crash harness 19/19; sync
+  invariant holds. Docs closeout done (README, `docs/design/engine_design.md`,
+  `PROGRESS.md` Phase 5 entry, `docs/backlog/phase5_concurrency.md`). **Next:
+  mark PR #15 ready.** Detail below.
   - **What shipped (concurrency infrastructure — non-breaking; single-writer
     behavior is unchanged, these just make the internal components
     concurrency-capable):** P5.a concurrent buffer-pool latching (`Mutex<PoolState>`
