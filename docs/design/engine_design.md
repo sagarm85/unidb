@@ -128,21 +128,48 @@ starts here** — it is the single source of recovery truth.
   carries both **redo and undo** information per record.
 - **The atomic unit for a single statement is a mini-transaction (D2)**: a
   WAL-bracketed group of page writes (begin/commit records) that redo/undo
-  treat as one. Every statement — including each statement inside a larger
-  user transaction — is its own mini-txn with its own commit fsync. (This
-  is the single largest measured performance cost in the engine; see §11.)
-  **Update (2026-07-08, branch `m9-group-commit`):** a default-off
-  `Wal::deferred_sync` mode lets a single serialized owner (the server
-  writer thread) *append* mini-txn/user-txn commit records without fsyncing
-  and force durability once per request batch (group commit) — see §11.1.
-  The embedded path and the crash harness keep the per-statement fsync.
+  treat as one. The redo/undo bracketing is unchanged; only *when* the log is
+  fsynced has moved (see the durability protocol below).
+- **Durability protocol: group-committed force-log-at-commit (default since
+  2026-07-09).** Statement mini-txns issued **inside an open user transaction**
+  append their WAL records *without* a per-statement fsync; `Engine::commit`
+  forces the transaction's commit record durable via `Wal::sync_up_to`, the
+  single durable point — **one group-coalesced fsync per transaction** (the
+  leader's `sync_all` runs with the append lock released, so concurrent
+  committers coalesce behind it). This is ARIES' *force-log-at-commit*, which
+  **fulfills D1** (per-statement fsync was an over-fulfillment inherited from
+  M0, where a statement *was* the transaction); **D2 and D5 are unchanged**.
+  Durability is a transaction-granularity promise: no commit is acknowledged
+  until its commit LSN is synced; syncing uncommitted statements bought nothing
+  (a mid-txn crash rolls back either way). **Standalone operations** that claim
+  durability without a following user commit self-sync: checkpoint (`wal.sync()`
+  before `flush_all`), vacuum, `set_column_index`, `enable_events`; slot
+  metadata and backups fsync their own files (the C1 durability-claim audit,
+  `PROGRESS.md`). The legacy **per-statement** policy survives only as an
+  internal `#[doc(hidden)]` `set_deferred_sync(false)` so the crash harness can
+  exercise both; `synchronous_commit=off`-style ack-before-flush is a genuine D
+  violation and is deliberately *not* offered as the default. Was the single
+  largest per-commit cost in the engine (see §11); the decomposition ladder put
+  the multi-model write tax at ~97% fsync multiplication (`benches/decompose.rs`).
 - WAL records use length-prefix framing (`u32` LE) plus a per-record CRC32;
   a recovery scan stops cleanly at the first corrupt/truncated record.
 - **D5 — the invariant that must never break**: a dirty page may not be
   flushed or evicted while `page.LSN > durable_WAL_LSN`. Enforced in
   exactly two places: `bufferpool.rs::flush_page()` and the clock
   eviction's `find_victim()` path. This is a tested invariant (debug
-  assertions + crash harness), not folklore.
+  assertions + crash harness), not folklore. **Under deferral (C2), eviction
+  that finds no evictable victim — because every dirty frame leads the durable
+  WAL — forces `wal.sync()` and retries (`fetch_page_for_write`) rather than
+  failing with `BufferPoolFull`**, so a transaction dirtying more pages than the
+  pool holds still completes (crash point Pd). Recovery advances the pool's
+  durable frontier to the on-disk WAL tail before replaying, so redo may evict
+  freely (all replayed records are already durable).
+- **Replication shipping is capped at the durable frontier (C3).** Since
+  deferral appends records to the segment file before their fsync, `Wal::
+  records_from`/`ship_from` ship only records with `lsn <= durable_lsn` — a
+  replica can never apply (or, on failover, retain) a commit the primary had
+  not made durable, so its state is always a prefix of the primary's durable
+  state (see `replica.rs`'s divergence test).
 - User transactions (M1) add `WAL_TXN_BEGIN`/`COMMIT`/`ABORT` record types
   sharing the mini-txn wire format — the `mini_txn_id` u64 slot doubles as
   the `Xid`. Mini-txn ids and xids are two independent ID spaces on one
@@ -878,6 +905,13 @@ independently in every milestone:
 - Batching statements inside one user transaction amortizes the
   *user-commit* fsync but not the per-statement one: 100-row single-txn
   INSERT still ~3.45 ms/row (M4) vs Postgres ~0.062 ms/row.
+  **Correction (2026-07-09, commit-time WAL fsync):** this per-statement cost
+  is *gone by default* — statement mini-txns inside a user transaction no
+  longer fsync; only `Engine::commit`'s `sync_up_to` does (§3.3). Batching now
+  amortizes to **one fsync per transaction**. The decomposition ladder
+  (`benches/decompose.rs`) measures the full multi-model commit (row + B-tree +
+  vector + edge + event) dropping from ~33.1 ms to ~4.3 ms/commit — **~7.7×** —
+  at one fsync per commit, and W0 (plain row) at SQLite parity.
 
 ~~Group commit / WAL batching has never been scheduled~~ **Group commit
 landed 2026-07-08 (branch `m9-group-commit`, server writer thread) — see
@@ -967,13 +1001,17 @@ Cypher always use `EdgeIndex` (see §7.3). A future fix needs a
 staleness/generation marker proving CSR has incorporated every write up to
 a specific point before it can be safely preferred again.
 
-Performance debt: per-statement fsync — **group commit landed on the server
-writer thread 2026-07-08 (branch `m9-group-commit`), read-only-txn commit
-fsync fixed, and buffer-pool force-WAL-on-evict landed** (§3.4/§11.1), the
-last of which also largely resolves the `BufferPoolFull`-at-scale item
-below; the one remaining follow-up is a concurrent read path (readers off
-the single writer thread) — see
-`docs/backlog/group_commit_and_read_concurrency.md`. WAL truncation rewrites
+Performance debt: ~~per-statement fsync~~ **fixed 2026-07-09 (commit-time WAL
+fsync): group-committed force-log-at-commit is now the engine default on every
+path (§3.3) — statement mini-txns inside a user transaction defer, `Engine::
+commit` issues the single coalesced fsync; the eviction-forced-sync path (C2)
+keeps it safe under memory pressure and the shipping cap (C3) keeps replicas a
+prefix.** (Group commit had already landed on the server writer thread
+2026-07-08, branch `m9-group-commit`, with read-only-txn commit fsync fixed and
+buffer-pool force-WAL-on-evict; this flips the default for the embedded path
+too.) The remaining smoother is a background WAL-writer thread for
+eviction-forced syncs under memory pressure (noted, not required for
+correctness). WAL truncation rewrites
 the whole file (needs log segments); ~~FSM is a linear scan~~ (**fixed P1.c**:
 `Heap::free_map`); ~~256-frame buffer pool + `BufferPoolFull` at scale~~
 (**fixed** — configurable 4096-frame default + chunked file growth, P1.c);
@@ -1020,11 +1058,11 @@ bound). `NEAR`/graph/queue reads remain writer-side for now (additive).
 
 | # | Decision | Where it lives / is enforced |
 |---|---|---|
-| D1 | Steal + no-force (ARIES): redo **and** undo logging | `wal.rs` record format; `recovery.rs` both passes |
-| D2 | Per-statement mini-transaction is the M0 atomic unit | `wal.rs` mini-txn bracketing; every `heap.rs` mutation |
+| D1 | Steal + no-force (ARIES): redo **and** undo logging | `wal.rs` record format; `recovery.rs` both passes; **fulfilled by group-committed force-log-at-commit — the ARIES durability point — as the default (2026-07-09, §3.3)** |
+| D2 | Per-statement mini-transaction is the M0 atomic unit | `wal.rs` mini-txn bracketing; every `heap.rs` mutation; bracketing unchanged, only fsync timing moved to commit (§3.3) |
 | D3 | Control file is the recovery root | `control.rs`; `recovery.rs` starts there; extended (not re-litigated) with `catalog_root` (M1) and `next_xid` (v3, signed off) |
 | D4 | Tuple header reserves MVCC bytes up front | `page.rs` 24-byte header; used since M1 with format bump v1→v2 |
-| D5 | No dirty page flushes ahead of durable WAL | `bufferpool.rs::flush_page()` + `find_victim()` (steal-point `debug_assert!`, P1.b); + fsync-failure poison (P1.b); crash harness P1–P12 |
+| D5 | No dirty page flushes ahead of durable WAL | `bufferpool.rs::flush_page()` + `find_victim()` (steal-point `debug_assert!`, P1.b); + fsync-failure poison (P1.b); + eviction-forced sync under deferral (C2); crash harness P1–P19 + Pa–Pd |
 | D6 | Single-file storage (WAL separate) | unchanged; revisit was gated post-M4, not yet re-opened |
 | D7 | Crash-injection harness, simple by design | `tests/crash/main.rs` P1–P12 (P10 = mid-vacuum M10, P11 = torn-page/`WAL_FPI` P1.a, P12 = fsync-failure poison P1.b) + property test |
 | D8 | 8 KiB pages, init-time config, immutable after | `format.rs`; baked into control file |
@@ -1165,4 +1203,17 @@ invariant holds (no tokio/reqwest/axum/rustls in the default build). Benchmarks
 (base backup 7 ms, restore 72 ms, PITR 43 ms, failover 26 ms at 5k rows) +
 per-checkpoint detail in `PROGRESS.md`'s Phase 6 entry; ops in
 `docs/backlog/phase6_ops_ha.md` and `docs/ops_runbook.md`.
+**Commit-time WAL fsync (2026-07-09, branch `commit-time-fsync`): group-committed
+force-log-at-commit is now the durability default on every path (§3.3).**
+Statement mini-txns inside a user transaction defer their fsync; `Engine::commit`
+issues the single coalesced commit fsync (fulfilling D1; D2/D5 unchanged, human
+sign-off recorded in `PROGRESS.md`). Standalone ops self-sync (C1 audit);
+eviction forces a WAL sync when no victim is durable, never `BufferPoolFull` (C2,
+which also fixed two latent recovery pin-leak/durable-frontier bugs surfaced by a
+small-pool memory-pressure test); WAL shipping is capped at the durable frontier
+so replicas stay a prefix on failover (C3). Crash harness **21 → 25** (Pa–Pd) +
+the valid-prefix property test now runs under both durability policies.
+Acceptance: `benches/decompose.rs` shows the multi-model commit dropping ~33.1 ms
+→ ~4.3 ms (~7.7×) at one fsync per commit, W0 at SQLite parity. No `FORMAT_VERSION`
+bump; sync invariant holds. See `docs/backlog/commit_time_fsync.md`.
 Update alongside the next milestone's closeout.*

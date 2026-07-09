@@ -116,6 +116,10 @@ name = "concurrent_writers"
 harness = false
 
 [[bench]]
+name = "decompose"
+harness = false
+
+[[bench]]
 name = "checkpoint"
 harness = false
 

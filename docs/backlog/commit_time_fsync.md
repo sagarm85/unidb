@@ -1,6 +1,6 @@
 # Commit-time WAL fsync — group-committed force-log-at-commit as the default
 
-## Status as of 2026-07-09: NOT STARTED. Ready to execute on post-Phase-6 `main`.
+## Status as of 2026-07-09: DONE — shipped on branch `commit-time-fsync` (C1–C5 all landed). See `PROGRESS.md`'s "Commit-time WAL fsync" entry (before/after ladder table, C1 durability-claim audit, human sign-off). Group-committed force-log-at-commit is the default; crash harness 21 → 25; measured W4 ~33.1 → ~4.40 ms/commit (~7.5×), W0 at SQLite parity.
 
 Evidence base: the **W0–W4 decomposition ladder** (`benches/decompose.rs`,
 PR #21; full table in `PROGRESS.md`'s ladder entry). Measured on the ladder,

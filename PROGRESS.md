@@ -2860,3 +2860,48 @@ P6 and the two-table incomplete-txn test were pinned to the legacy per-statement
 policy (they call `flush()` mid-transaction, which is only valid when statements
 are individually durable) so that policy stays covered. **Crash harness 21 → 25,
 all green.** No format change.
+
+### C5 — acceptance benchmark + closeout
+
+**Acceptance benchmark** (`benches/decompose.rs`, fetched from `origin/bench-ladder`;
+release, Apple Silicon macOS; SQLite baseline `PRAGMA journal_mode=WAL,
+synchronous=FULL, fullfsync=ON` to match Rust `sync_all`'s `F_FULLFSYNC`; 100
+single-row durable transactions per rung, median of 10 samples). Because
+group-committed force-log-at-commit is now the **default**, the ladder's ordinary
+rungs (`w0_row`…`w4_event_full`) now measure that default and **converge with the
+explicit one-fsync rungs (`w4_1fsync`)** — which is the proof the flip landed.
+
+| Rung | ms/commit (after: default) | note |
+|------|----------------------------|------|
+| W0 `w0_row` (plain row) | **3.59** | ≈ SQLite `sqlite_w0` **3.64** — parity |
+| W1 `w1_btree` (+ B-tree) | 4.39 | |
+| W2 `w2_vector` (+ VECTOR(128) IVF) | 4.36 | |
+| W3 `w3_edge` (+ graph edge) | 4.24 | |
+| W4 `w4_event_full` (+ event capture) | **4.40** | full multi-model commit |
+| `w0_1fsync` (explicit one-fsync W0) | 3.57 | == `w0_row` ✓ |
+| `w4_1fsync` (explicit one-fsync W4) | 4.37 | == `w4_event_full` ✓ |
+| SQLite `sqlite_w0` / `sqlite_w1` | 3.64 / 4.03 | durability-matched baseline |
+
+**Before → after (the headline):** the full multi-model commit (row + B-tree +
+vector + edge + event) goes from the old per-statement default's **~33.1
+ms/commit** (PR #21 ladder — ~10 `F_FULLFSYNC`s where one suffices) to **~4.40
+ms/commit** at one group-coalesced fsync — **~7.5×**. W0 is at SQLite parity
+(3.59 vs 3.64 ms). The old default cannot be re-measured on this machine (the
+default changed); its 33.1 ms is PR #21's recorded number, and the
+`w4_event_full` ≈ `w4_1fsync` convergence above is the same-machine confirmation
+that the default is now the one-fsync path.
+
+**Peak memory:** unchanged — this milestone moves *when* the WAL is fsynced, not
+what is buffered; no new resident structures (the ladder engine holds the same
+buffer pool + IVF centroids as before).
+
+**Crash harness:** 21 → **25** (Pa–Pd) + valid-prefix property test under both
+policies — all green. **No `FORMAT_VERSION` bump.** Sync invariant holds
+(`cargo tree -p unidb --no-default-features --edges normal` has no
+tokio/reqwest/axum).
+
+**Locked-decision changes:** none reversed — **D1 fulfilled**, D2/D5 unchanged.
+Human sign-off for making group-committed force-log-at-commit the default
+recorded above (2026-07-09).
+
+**Commit-time WAL fsync is COMPLETE.**
