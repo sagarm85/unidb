@@ -1,26 +1,41 @@
-// Lock manager (M1.b, D12).
+// Lock manager (M1.b; upgraded to a real, blocking lock manager in P5.d).
 //
 // Keyed by (record_kind, record_id) per the architecture doc's stated design
-// — only `RecordKind::Row` exists in M1; `Vector`/`GraphEdge`/`QueueEvent`
-// variants land in M2+ without reshaping this key.
+// — only `RecordKind::Row` exists today; `Vector`/`GraphEdge`/`QueueEvent`
+// variants land later without reshaping this key.
 //
-// Write-write conflicts only: under MVCC, readers never block writers or
-// other readers (that's the whole point of MVCC), so there is no read-lock
-// concept here. Per D12, SI's conflict handling is "abort," not
-// "block-and-wait" — `try_acquire_write` either succeeds immediately or the
-// caller aborts. No wait queue, no deadlock detection: that complexity is
-// deliberately deferred to a future SERIALIZABLE/SSI effort, which is
-// exactly what the `concurrency_hooks` seam (D11) exists to bolt on without
-// reworking this module.
+// ## Evolution
 //
-// Locks are in-memory only, not WAL-logged — they are a concurrency-control
-// mechanism for the currently-open transaction table, not a durability
-// concern. Any in-flight transaction is implicitly aborted by recovery on
-// restart (the transaction table itself doesn't survive a crash), so there
+// * **M1.b** — a single `HashMap<RecordId, Xid>` of exclusive write intents,
+//   abort-on-conflict, no waiting. That was correct for the single-writer
+//   engine, where SI's first-committer-wins was the only policy needed.
+// * **P5.c** — moved behind a `Mutex` so an `Arc<LockManager>` is shareable
+//   across threads.
+// * **P5.d (this)** — a real lock manager: **shared/exclusive modes**, a
+//   **`WaitPolicy`** (`NoWait` keeps SI's immediate-abort first-committer-wins;
+//   `Wait` blocks on a `Condvar` until the lock is free — the behavior a
+//   blocking isolation level like READ COMMITTED wants), and **deadlock
+//   detection** over a wait-for graph. When a blocking waiter would close a
+//   cycle it is chosen as the victim and returned `DbError::Deadlock` instead
+//   of hanging; the caller aborts (which releases its locks and unblocks the
+//   rest). This is exercised for real once P5.e runs multiple writer threads;
+//   the single-writer path keeps calling `try_acquire_write` (= Exclusive +
+//   NoWait), so its behavior is unchanged.
+//
+// Locks are in-memory only, not WAL-logged — a concurrency-control mechanism
+// for the currently-open transaction table, not a durability concern. Any
+// in-flight transaction is implicitly aborted by recovery on restart, so there
 // is nothing to recover here.
+//
+// Fairness is best-effort, not strict FIFO: a request is granted as soon as it
+// is compatible with the current holders, so a steady stream of shared locks
+// could in principle starve an exclusive waiter. Acceptable because the only
+// caller today (`try_acquire_write`) takes exclusive locks exclusively, for
+// which "grant when no other holder" is fair; strict queue fairness is noted as
+// deferred tuning, not correctness.
 
-use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Condvar, Mutex, MutexGuard};
 
 use crate::{
     error::{DbError, Result},
@@ -49,51 +64,243 @@ impl RecordId {
     }
 }
 
-/// Write-lock table (M1.b). **P5.c** moved its state behind a `Mutex` and made
-/// every method `&self`, so an `Arc<LockManager>` can be shared across the
-/// concurrent writer threads P5.e introduces (an owned `&mut LockManager` on
-/// the single-writer path still works unchanged — `&mut` derefs to `&`). The
-/// policy is unchanged: abort-on-conflict, no waiting. **P5.d** will add lock
-/// modes, real blocking wait queues, and wait-for-graph deadlock detection on
-/// top of this same `&self` surface.
+/// Lock strength. `Shared` locks are mutually compatible; `Exclusive` conflicts
+/// with everything else. Readers under MVCC take no locks at all, so `Shared`
+/// exists for future `SELECT ... FOR SHARE`-style intent; every current caller
+/// takes `Exclusive`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockMode {
+    Shared,
+    Exclusive,
+}
+
+/// What to do when a lock cannot be granted immediately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitPolicy {
+    /// Fail immediately with `WriteConflict` — SI's first-committer-wins (D12).
+    NoWait,
+    /// Block until the lock becomes grantable, or `Deadlock` if waiting would
+    /// close a wait-for cycle — the behavior a blocking level (RC) wants.
+    Wait,
+}
+
 #[derive(Default)]
+struct LockEntry {
+    /// Current holders and the mode each holds.
+    holders: HashMap<Xid, LockMode>,
+    /// Xids blocked on this record, in arrival order. Used to keep the entry
+    /// alive while anyone waits and for idempotent enqueue; grants are decided
+    /// purely by holder compatibility (best-effort fairness — see module doc).
+    queue: VecDeque<Xid>,
+}
+
+#[derive(Default)]
+struct LockTable {
+    locks: HashMap<RecordId, LockEntry>,
+    /// Wait-for graph: `waits_for[w]` is the set of xids `w` is currently
+    /// blocked behind. Maintained only while a `Wait` request is parked, and
+    /// used for deadlock detection.
+    waits_for: HashMap<Xid, HashSet<Xid>>,
+}
+
+impl LockTable {
+    /// Can `xid` hold `mode` on `id` given the *other* xids' current holds?
+    fn can_grant(&self, id: RecordId, xid: Xid, mode: LockMode) -> bool {
+        match self.locks.get(&id) {
+            None => true,
+            Some(e) => match mode {
+                LockMode::Exclusive => e.holders.keys().all(|&h| h == xid),
+                LockMode::Shared => e
+                    .holders
+                    .iter()
+                    .all(|(&h, &m)| h == xid || m == LockMode::Shared),
+            },
+        }
+    }
+
+    /// The *other* xids whose holds currently block `xid`'s `mode` request.
+    fn blockers(&self, id: RecordId, xid: Xid, mode: LockMode) -> Vec<Xid> {
+        match self.locks.get(&id) {
+            None => Vec::new(),
+            Some(e) => e
+                .holders
+                .iter()
+                .filter(|(&h, &m)| {
+                    h != xid
+                        && match mode {
+                            LockMode::Exclusive => true,
+                            LockMode::Shared => m == LockMode::Exclusive,
+                        }
+                })
+                .map(|(&h, _)| h)
+                .collect(),
+        }
+    }
+
+    /// Record `xid` as a holder of `id` at `mode` (upgrading S→X in place),
+    /// and clear any waiting/blocked-on state it had.
+    fn grant(&mut self, id: RecordId, xid: Xid, mode: LockMode) {
+        let e = self.locks.entry(id).or_default();
+        let slot = e.holders.entry(xid).or_insert(mode);
+        if mode == LockMode::Exclusive {
+            *slot = LockMode::Exclusive;
+        }
+        e.queue.retain(|&w| w != xid);
+        self.waits_for.remove(&xid);
+    }
+
+    /// Add `xid` to `id`'s wait queue once (idempotent).
+    fn enqueue(&mut self, id: RecordId, xid: Xid) {
+        let e = self.locks.entry(id).or_default();
+        if !e.queue.iter().any(|&w| w == xid) {
+            e.queue.push_back(xid);
+        }
+    }
+
+    /// Remove `xid` from `id`'s wait queue (on deadlock back-out).
+    fn dequeue(&mut self, id: RecordId, xid: Xid) {
+        if let Some(e) = self.locks.get_mut(&id) {
+            e.queue.retain(|&w| w != xid);
+        }
+    }
+
+    /// Would following wait-for edges from `start` lead back to `start`? A DFS
+    /// over `waits_for`; the graph is acyclic before this call (every prior
+    /// waiter that would have closed a cycle was aborted), so any cycle must
+    /// pass through `start`.
+    fn has_cycle(&self, start: Xid) -> bool {
+        let mut stack: Vec<Xid> = self
+            .waits_for
+            .get(&start)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
+        let mut seen: HashSet<Xid> = HashSet::new();
+        while let Some(n) = stack.pop() {
+            if n == start {
+                return true;
+            }
+            if !seen.insert(n) {
+                continue;
+            }
+            if let Some(next) = self.waits_for.get(&n) {
+                stack.extend(next.iter().copied());
+            }
+        }
+        false
+    }
+
+    /// Drop every empty lock entry so the table doesn't grow without bound.
+    fn gc(&mut self) {
+        self.locks
+            .retain(|_, e| !(e.holders.is_empty() && e.queue.is_empty()));
+    }
+}
+
 pub struct LockManager {
-    write_locks: Mutex<HashMap<RecordId, Xid>>,
+    table: Mutex<LockTable>,
+    cvar: Condvar,
+}
+
+impl Default for LockManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LockManager {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            table: Mutex::new(LockTable::default()),
+            cvar: Condvar::new(),
+        }
     }
 
-    /// Poison-safe access to the lock table: a prior panic-while-locked leaves
-    /// the map usable as-is (consistent with `txn.rs`/`wal.rs`), so a single
-    /// poisoned mutation never cascades into a crash on every later lock op.
-    fn lock(&self) -> MutexGuard<'_, HashMap<RecordId, Xid>> {
-        self.write_locks.lock().unwrap_or_else(|e| e.into_inner())
+    /// Poison-safe access: a prior panic-while-locked leaves the table usable
+    /// as-is (consistent with `txn.rs`/`wal.rs`).
+    fn lock(&self) -> MutexGuard<'_, LockTable> {
+        self.table.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Attempt to acquire (or re-acquire, if `xid` already holds it) a write
-    /// intent on `id`. Fails immediately with `WriteConflict` if another
-    /// *active* xid already holds it — no waiting.
-    pub fn try_acquire_write(&self, id: RecordId, xid: Xid) -> Result<()> {
-        let mut locks = self.lock();
-        match locks.get(&id) {
-            Some(&holder) if holder != xid => Err(DbError::WriteConflict { holder_xid: holder }),
-            _ => {
-                locks.insert(id, xid);
-                Ok(())
+    /// Acquire (or re-acquire / upgrade) `mode` on `id` for `xid`.
+    ///
+    /// `NoWait` returns `WriteConflict` the moment the lock is unavailable (SI).
+    /// `Wait` blocks until the lock is grantable, or returns `Deadlock` if
+    /// parking would close a wait-for cycle (the caller must then abort `xid`).
+    pub fn acquire(
+        &self,
+        id: RecordId,
+        xid: Xid,
+        mode: LockMode,
+        policy: WaitPolicy,
+    ) -> Result<()> {
+        let mut t = self.lock();
+        loop {
+            if t.can_grant(id, xid, mode) {
+                t.grant(id, xid, mode);
+                // A grant can make queued (e.g. shared) waiters grantable too.
+                self.cvar.notify_all();
+                return Ok(());
+            }
+            match policy {
+                WaitPolicy::NoWait => {
+                    let holder = t.blockers(id, xid, mode).first().copied().unwrap_or(xid);
+                    return Err(DbError::WriteConflict { holder_xid: holder });
+                }
+                WaitPolicy::Wait => {
+                    t.enqueue(id, xid);
+                    let blockers: HashSet<Xid> = t.blockers(id, xid, mode).into_iter().collect();
+                    t.waits_for.insert(xid, blockers);
+                    if t.has_cycle(xid) {
+                        // This waiter would close a cycle: abort it as the
+                        // victim, backing out its queue/graph presence first.
+                        t.dequeue(id, xid);
+                        t.waits_for.remove(&xid);
+                        t.gc();
+                        self.cvar.notify_all();
+                        tracing::info!(xid, "deadlock: chosen as victim");
+                        return Err(DbError::Deadlock { xid });
+                    }
+                    t = self.cvar.wait(t).unwrap_or_else(|e| e.into_inner());
+                }
             }
         }
     }
 
-    /// Release every write lock held by `xid` (called on commit or abort).
-    pub fn release_all(&self, xid: Xid) {
-        self.lock().retain(|_, holder| *holder != xid);
+    /// Attempt an exclusive write intent on `id`, failing immediately on
+    /// conflict — the M1.b/SI behavior, now a thin wrapper over [`Self::
+    /// acquire`]. The single-writer path and every existing caller use this.
+    pub fn try_acquire_write(&self, id: RecordId, xid: Xid) -> Result<()> {
+        self.acquire(id, xid, LockMode::Exclusive, WaitPolicy::NoWait)
     }
 
+    /// Release every lock held (and any wait parked) by `xid` — called on
+    /// commit or abort — then wake blocked waiters so they can re-check.
+    pub fn release_all(&self, xid: Xid) {
+        {
+            let mut t = self.lock();
+            for e in t.locks.values_mut() {
+                e.holders.remove(&xid);
+                e.queue.retain(|&w| w != xid);
+            }
+            t.gc();
+            t.waits_for.remove(&xid);
+            // Stale edges pointing at the departed xid; live waiters rebuild
+            // their blocker set on their next wake-up loop regardless.
+            for blockers in t.waits_for.values_mut() {
+                blockers.remove(&xid);
+            }
+        }
+        self.cvar.notify_all();
+    }
+
+    /// Some xid currently holding `id`, if any (an exclusive holder is unique;
+    /// with shared holders this returns an arbitrary one). Used by tests and
+    /// introspection.
     pub fn holder(&self, id: RecordId) -> Option<Xid> {
-        self.lock().get(&id).copied()
+        self.lock()
+            .locks
+            .get(&id)
+            .and_then(|e| e.holders.keys().next().copied())
     }
 }
 
@@ -157,5 +364,107 @@ mod tests {
         assert!(lm.try_acquire_write(a, 1).is_ok());
         assert!(lm.try_acquire_write(b, 2).is_ok());
         assert!(lm.try_acquire_write(c, 3).is_ok());
+    }
+
+    // ── P5.d: modes, blocking waits, deadlock detection ──────────────────────
+
+    #[test]
+    fn shared_locks_coexist() {
+        let lm = LockManager::new();
+        let r = RecordId::row(3, 0);
+        lm.acquire(r, 1, LockMode::Shared, WaitPolicy::Wait)
+            .unwrap();
+        // A second shared holder is compatible and never blocks.
+        lm.acquire(r, 2, LockMode::Shared, WaitPolicy::Wait)
+            .unwrap();
+        // But an exclusive request cannot barge in while shared locks are held.
+        let err = lm.acquire(r, 3, LockMode::Exclusive, WaitPolicy::NoWait);
+        assert!(matches!(err, Err(DbError::WriteConflict { .. })));
+    }
+
+    #[test]
+    fn exclusive_excludes_shared() {
+        let lm = LockManager::new();
+        let r = RecordId::row(4, 0);
+        lm.acquire(r, 1, LockMode::Exclusive, WaitPolicy::NoWait)
+            .unwrap();
+        let err = lm.acquire(r, 2, LockMode::Shared, WaitPolicy::NoWait);
+        assert!(matches!(err, Err(DbError::WriteConflict { holder_xid: 1 })));
+    }
+
+    #[test]
+    fn blocking_wait_parks_then_grants_on_release() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let lm = LockManager::new();
+        let r = RecordId::row(5, 0);
+        lm.try_acquire_write(r, 1).unwrap(); // xid1 holds it exclusively
+        let got = AtomicBool::new(false);
+
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                // Blocks until xid1 releases, then acquires.
+                lm.acquire(r, 2, LockMode::Exclusive, WaitPolicy::Wait)
+                    .unwrap();
+                got.store(true, Ordering::SeqCst);
+            });
+
+            // Give the waiter time to reach the parked state; it must NOT have
+            // acquired while xid1 still holds the lock.
+            std::thread::sleep(Duration::from_millis(80));
+            assert!(
+                !got.load(Ordering::SeqCst),
+                "waiter acquired while lock was held"
+            );
+
+            // Releasing xid1 unblocks the waiter (scope join waits for it).
+            lm.release_all(1);
+        });
+
+        assert!(got.load(Ordering::SeqCst));
+        assert_eq!(lm.holder(r), Some(2));
+    }
+
+    #[test]
+    fn deadlock_is_detected_and_one_victim_aborts() {
+        let lm = LockManager::new();
+        let a = RecordId::row(6, 0);
+        let b = RecordId::row(6, 1);
+
+        // xid1 holds a, xid2 holds b.
+        lm.try_acquire_write(a, 1).unwrap();
+        lm.try_acquire_write(b, 2).unwrap();
+
+        // Each now reaches across for the other's lock: xid1 wants b, xid2
+        // wants a — a cycle. Exactly one is chosen as the deadlock victim; it
+        // aborts (releases its locks), which lets the other proceed.
+        let (r1, r2) = std::thread::scope(|s| {
+            let h1 = s.spawn(|| {
+                let r = lm.acquire(b, 1, LockMode::Exclusive, WaitPolicy::Wait);
+                if r.is_err() {
+                    lm.release_all(1);
+                }
+                r
+            });
+            let h2 = s.spawn(|| {
+                let r = lm.acquire(a, 2, LockMode::Exclusive, WaitPolicy::Wait);
+                if r.is_err() {
+                    lm.release_all(2);
+                }
+                r
+            });
+            (h1.join().unwrap(), h2.join().unwrap())
+        });
+
+        // Exactly one deadlocked; the other acquired.
+        assert!(
+            r1.is_err() ^ r2.is_err(),
+            "exactly one transaction must be the victim (r1={r1:?}, r2={r2:?})"
+        );
+        let victim = if r1.is_err() { &r1 } else { &r2 };
+        let survivor = if r1.is_err() { &r2 } else { &r1 };
+        assert!(matches!(victim, Err(DbError::Deadlock { .. })));
+        assert!(survivor.is_ok());
     }
 }

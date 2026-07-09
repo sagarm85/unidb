@@ -37,6 +37,7 @@ fn map_status(err: &DbError) -> (StatusCode, &'static str) {
         DbError::TableAlreadyExists(_) => (StatusCode::CONFLICT, "TABLE_ALREADY_EXISTS"),
         DbError::WriteConflict { .. } => (StatusCode::CONFLICT, "WRITE_CONFLICT"),
         DbError::SerializationFailure { .. } => (StatusCode::CONFLICT, "SERIALIZATION_FAILURE"),
+        DbError::Deadlock { .. } => (StatusCode::CONFLICT, "DEADLOCK"),
 
         DbError::SqlParse(_) => (StatusCode::BAD_REQUEST, "SQL_PARSE_ERROR"),
         DbError::SqlPlan(_) => (StatusCode::BAD_REQUEST, "SQL_PLAN_ERROR"),
