@@ -237,6 +237,22 @@ pub struct Engine {
     auto_checkpoint: Mutex<AutoCheckpointConfig>,
     last_checkpoint: Mutex<Instant>,
     checkpoints_triggered: AtomicU64,
+    /// Approximate count of **dead tuple versions** created since the last
+    /// vacuum (A1). Incremented once per `xmax` stamp — every UPDATE (the old
+    /// version dies) and every DELETE — and reset to 0 by `vacuum_inner`. This
+    /// is the autovacuum trigger's numerator (A2). Approximate by design, like
+    /// Postgres's `n_dead_tup`: it counts at the raw-CRUD and SQL-statement
+    /// chokepoints (not the `heap.rs` mutation itself, which recovery redo also
+    /// drives — recovery must not count), so an aborted UPDATE/DELETE over-counts
+    /// until the next vacuum refreshes the estimate.
+    dead_tuples: AtomicU64,
+    /// Approximate count of **live tuples** (Postgres `reltuples`) — the
+    /// trigger's `live` term (A2). Incremented on INSERT, decremented on DELETE
+    /// (UPDATE leaves it unchanged: one visible version replaces another), and
+    /// re-set exactly to the scanned live-slot count at the end of every vacuum
+    /// (`vacuum_inner`), so vacuum corrects any accumulated drift — again
+    /// mirroring how Postgres refreshes its estimate on (auto)vacuum/analyze.
+    live_tuples: AtomicU64,
     /// Serializes the non-CRUD write paths that do a *non-atomic*
     /// read-catalog-then-mutate-a-shared-secondary-index sequence — graph edges
     /// (the `__edges__.from_id` `DiskBTree` + page list), large objects (the
@@ -565,6 +581,8 @@ impl Engine {
             auto_checkpoint: Mutex::new(AutoCheckpointConfig::default()),
             last_checkpoint: Mutex::new(Instant::now()),
             checkpoints_triggered: AtomicU64::new(0),
+            dead_tuples: AtomicU64::new(0),
+            live_tuples: AtomicU64::new(0),
             write_serial: Mutex::new(()),
             replication,
             authz,
@@ -820,7 +838,10 @@ impl Engine {
                 next_event_seq: &self.next_event_seq,
             };
             match executor::execute(plan, &mut ctx) {
-                Ok(result) => results.push(result),
+                Ok(result) => {
+                    self.note_dml_result(&result); // A1: dead/live-tuple accounting.
+                    results.push(result);
+                }
                 Err(e) => {
                     drop(catalog);
                     self.restore_catalog_root(saved_catalog_root)?;
@@ -921,7 +942,10 @@ impl Engine {
                 next_event_seq: &self.next_event_seq,
             };
             match executor::execute(plan, &mut ctx) {
-                Ok(result) => results.push(result),
+                Ok(result) => {
+                    self.note_dml_result(&result); // A1: dead/live-tuple accounting.
+                    results.push(result);
+                }
                 Err(e) => {
                     drop(catalog);
                     self.restore_catalog_root(saved_catalog_root)?;
@@ -1614,6 +1638,64 @@ impl Engine {
         self.checkpoints_triggered.load(Ordering::SeqCst)
     }
 
+    /// Estimated dead tuple versions accumulated since the last vacuum (A1).
+    /// The autovacuum trigger's numerator; an approximation, like Postgres's
+    /// `n_dead_tup` (see the `dead_tuples` field).
+    pub fn dead_tuple_estimate(&self) -> u64 {
+        self.dead_tuples.load(Ordering::Relaxed)
+    }
+
+    /// Estimated live tuple count (A1) — Postgres `reltuples`. The autovacuum
+    /// trigger's `live` term; refreshed exactly at each vacuum.
+    pub fn live_tuple_estimate(&self) -> u64 {
+        self.live_tuples.load(Ordering::Relaxed)
+    }
+
+    /// Record `n` freshly-dead versions (one `xmax` stamp each) for the
+    /// autovacuum estimate (A1). Called from the raw-CRUD and SQL-statement
+    /// chokepoints — never from `heap.rs`/recovery redo, which must not count.
+    fn note_dead_tuples(&self, n: u64) {
+        if n != 0 {
+            self.dead_tuples.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Fold one successful SQL statement's row-count into the autovacuum
+    /// estimates (A1). Mirrors the raw-CRUD chokepoints: UPDATE stamps dead
+    /// versions, DELETE stamps dead versions and drops live rows, INSERT adds
+    /// live rows. Other statement kinds don't churn tuples.
+    fn note_dml_result(&self, result: &ExecResult) {
+        match result {
+            ExecResult::Updated { count } => self.note_dead_tuples(*count as u64),
+            ExecResult::Deleted { count } => {
+                self.note_dead_tuples(*count as u64);
+                self.note_live_delta(-(*count as i64));
+            }
+            ExecResult::Inserted { count } => self.note_live_delta(*count as i64),
+            _ => {}
+        }
+    }
+
+    /// Adjust the live-tuple estimate by `delta` (A1): `+n` on INSERT, `-n` on
+    /// DELETE, 0 on UPDATE (a new version replaces the old). Saturates at 0 so a
+    /// drifted estimate can never wrap.
+    fn note_live_delta(&self, delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        // `fetch_update` keeps the saturating-subtract atomic against the
+        // concurrent writers that share this counter (P5.e).
+        let _ = self
+            .live_tuples
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(if delta >= 0 {
+                    cur.saturating_add(delta as u64)
+                } else {
+                    cur.saturating_sub((-delta) as u64)
+                })
+            });
+    }
+
     /// A cloneable, `Send + Sync` handle for concurrent reads that run off the
     /// single writer thread (6b). Derived from the buffer pool's shared mmap
     /// and the shared transaction snapshot state, so many readers execute in
@@ -1680,6 +1762,7 @@ impl Engine {
                 slot: rid.slot,
             },
         )?;
+        self.note_live_delta(1); // A1: one new live tuple.
         Ok(rid)
     }
 
@@ -1714,6 +1797,7 @@ impl Engine {
                 slot: new_rid.slot,
             },
         )?;
+        self.note_dead_tuples(1); // A1: old version now dead; live count unchanged.
         Ok(new_rid)
     }
 
@@ -1729,6 +1813,8 @@ impl Engine {
                 slot: row_id.slot,
             },
         )?;
+        self.note_dead_tuples(1); // A1: deleted version now dead …
+        self.note_live_delta(-1); // … and no longer live.
         Ok(())
     }
 
@@ -2036,6 +2122,22 @@ impl Engine {
         // frontier), but the durability *claim* on return does. Cheap when
         // nothing was reclaimed (the WAL is already at its frontier).
         self.sync_wal()?;
+
+        // A1: refresh the autovacuum estimates. `live` is now exactly the scanned
+        // live-slot count (corrects any accumulated drift). `dead` drops by what
+        // we physically reclaimed — normally to 0, but if the horizon was held
+        // back (a long-lived reader / replication slot) the un-reclaimable
+        // remainder stays counted, so the trigger re-fires once the horizon
+        // advances rather than losing the signal (Postgres keeps not-yet-removable
+        // dead tuples counted too).
+        self.live_tuples
+            .store(report.rows_scanned as u64, Ordering::Relaxed);
+        let reclaimed = report.versions_reclaimed as u64;
+        let _ = self
+            .dead_tuples
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_sub(reclaimed))
+            });
 
         tracing::info!(
             horizon,
@@ -4105,6 +4207,78 @@ mod tests {
         // The current version still reads correctly after compaction.
         let x = engine.begin().unwrap();
         assert_eq!(engine.get(x, rid).unwrap(), b"v19");
+    }
+
+    // ── A1: dead-tuple accounting ─────────────────────────────────────────────
+
+    #[test]
+    fn dead_tuple_estimate_tracks_raw_crud_and_resets_on_vacuum() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        assert_eq!(engine.dead_tuple_estimate(), 0);
+        assert_eq!(engine.live_tuple_estimate(), 0);
+
+        // INSERT bumps live only.
+        let x = engine.begin().unwrap();
+        let rid = engine.insert(x, b"v0").unwrap();
+        engine.commit(x).unwrap();
+        assert_eq!(engine.live_tuple_estimate(), 1);
+        assert_eq!(engine.dead_tuple_estimate(), 0);
+
+        // Each UPDATE stamps one dead version; live unchanged.
+        let mut rid = rid;
+        for i in 0..5 {
+            let x = engine.begin().unwrap();
+            rid = engine.update(x, rid, format!("v{i}").as_bytes()).unwrap();
+            engine.commit(x).unwrap();
+        }
+        assert_eq!(engine.dead_tuple_estimate(), 5);
+        assert_eq!(engine.live_tuple_estimate(), 1);
+
+        // DELETE: one more dead, live back to 0.
+        let x = engine.begin().unwrap();
+        engine.delete(x, rid).unwrap();
+        engine.commit(x).unwrap();
+        assert_eq!(engine.dead_tuple_estimate(), 6);
+        assert_eq!(engine.live_tuple_estimate(), 0);
+
+        // Vacuum reclaims the dead versions and refreshes both estimates.
+        let report = engine.vacuum().unwrap();
+        assert!(report.versions_reclaimed >= 6, "{report:?}");
+        assert_eq!(engine.dead_tuple_estimate(), 0);
+        assert_eq!(engine.live_tuple_estimate() as usize, report.rows_scanned);
+    }
+
+    #[test]
+    fn dead_tuple_estimate_tracks_sql_dml() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE t (id INT, v INT)")
+            .unwrap();
+        for i in 0..10 {
+            engine
+                .execute_sql(x, &format!("INSERT INTO t VALUES ({i}, 0)"))
+                .unwrap();
+        }
+        engine.commit(x).unwrap();
+        assert_eq!(engine.live_tuple_estimate(), 10);
+        assert_eq!(engine.dead_tuple_estimate(), 0);
+
+        // UPDATE of 10 rows → 10 dead versions; live unchanged.
+        let x = engine.begin().unwrap();
+        engine.execute_sql(x, "UPDATE t SET v = 1").unwrap();
+        engine.commit(x).unwrap();
+        assert_eq!(engine.dead_tuple_estimate(), 10);
+        assert_eq!(engine.live_tuple_estimate(), 10);
+
+        // DELETE of 4 rows → 4 more dead, live 10 → 6.
+        let x = engine.begin().unwrap();
+        engine.execute_sql(x, "DELETE FROM t WHERE id < 4").unwrap();
+        engine.commit(x).unwrap();
+        assert_eq!(engine.dead_tuple_estimate(), 14);
+        assert_eq!(engine.live_tuple_estimate(), 6);
     }
 
     #[test]
