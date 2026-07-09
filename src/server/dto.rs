@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value as Json};
 
 use crate::{
-    catalog::IndexKind,
+    catalog::{ColumnType, IndexKind, TableDef},
     heap::RowId,
     sql::{executor::ExecResult, logical::Literal},
 };
@@ -186,6 +186,90 @@ pub struct SetIndexRequest {
     pub table: String,
     pub column: String,
     pub kind: Option<IndexKind>,
+}
+
+// ── table introspection (S1, `GET /tables`) ────────────────────────────────
+
+/// One table's schema in the `GET /tables` response. Internal `__…__` tables
+/// (`__events__`/`__consumers__`/`__edges__`/`__lobs__`) are omitted entirely
+/// by the handler — this shape describes only user tables.
+#[derive(Debug, Serialize, PartialEq)]
+pub struct TableInfo {
+    pub name: String,
+    pub columns: Vec<ColumnInfo>,
+}
+
+/// One column's schema within [`TableInfo`].
+#[derive(Debug, Serialize, PartialEq)]
+pub struct ColumnInfo {
+    pub name: String,
+    /// Human-readable type name (`"int"`, `"text"`, `"vector(384)"`, …).
+    #[serde(rename = "type")]
+    pub ty: String,
+    /// `false` iff the column is `NOT NULL` or `PRIMARY KEY`.
+    pub nullable: bool,
+    /// The column's secondary-index kind, or `null` if unindexed.
+    pub index: Option<&'static str>,
+}
+
+/// Render a [`ColumnType`] as the human-readable name used on the wire. Kept in
+/// the REST layer (not `catalog.rs`) so the wire vocabulary is owned here — the
+/// engine's on-disk enum can evolve without silently changing the API contract.
+fn column_type_name(ty: &ColumnType) -> String {
+    match ty {
+        ColumnType::Int64 => "int".to_string(),
+        ColumnType::Text => "text".to_string(),
+        ColumnType::Bool => "bool".to_string(),
+        ColumnType::Json => "json".to_string(),
+        ColumnType::Vector(n) => format!("vector({n})"),
+        ColumnType::Decimal(p, s) => format!("decimal({p},{s})"),
+        ColumnType::Timestamp => "timestamp".to_string(),
+        ColumnType::Float => "float".to_string(),
+        ColumnType::Uuid => "uuid".to_string(),
+        ColumnType::Bytea => "bytea".to_string(),
+        ColumnType::Date => "date".to_string(),
+        ColumnType::Time => "time".to_string(),
+    }
+}
+
+/// Stable wire name for a secondary-index kind. `Hnsw` keeps its historical
+/// name even though it is the durable IVF-Flat index since P3.c (matching the
+/// catalog/SQL surface, see `catalog::IndexKind`).
+fn index_kind_name(kind: IndexKind) -> &'static str {
+    match kind {
+        IndexKind::Hnsw => "hnsw",
+        IndexKind::FullText => "fulltext",
+        IndexKind::BTree => "btree",
+        IndexKind::Csr => "csr",
+    }
+}
+
+/// Build the introspection view of one table. Dropped columns (P2.c logical
+/// tombstones) are excluded — they are invisible to `SELECT *`, so they are
+/// invisible here too.
+pub fn table_def_to_info(def: &TableDef) -> TableInfo {
+    let columns = def
+        .columns
+        .iter()
+        .filter(|c| !c.dropped)
+        .map(|c| ColumnInfo {
+            name: c.name.clone(),
+            ty: column_type_name(&c.ty),
+            nullable: !(c.constraints.not_null || c.constraints.primary_key),
+            index: c.index.map(index_kind_name),
+        })
+        .collect();
+    TableInfo {
+        name: def.name.clone(),
+        columns,
+    }
+}
+
+/// Whether a table is an internal engine table (`__events__`, `__edges__`,
+/// `__lobs__`, `__consumers__`, …) hidden from `GET /tables`. All such tables
+/// share the reserved `__…__` naming convention.
+pub fn is_internal_table(name: &str) -> bool {
+    name.starts_with("__")
 }
 
 #[derive(Debug, Deserialize)]

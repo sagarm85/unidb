@@ -332,6 +332,55 @@ or, if no index exists on that column:
 
 ---
 
+### `GET /tables`
+
+Schema introspection (S1, studio UI). List every **user** table with its
+columns — built from the in-memory catalog, so it is cheap (no heap scan).
+
+Internal engine tables (`__events__`, `__consumers__`, `__edges__`,
+`__lobs__` — everything under the reserved `__…__` naming convention) are
+**omitted**. There is deliberately **no `row_count`** in v1: a row count is a
+full scan, out of scope for a lightweight introspection call. Logically dropped
+columns (`ALTER TABLE DROP COLUMN`) are excluded, mirroring `SELECT *`.
+
+**Payload**: none.
+
+**Response** `200 OK` — a JSON array, sorted by table name for determinism:
+```json
+[
+  {
+    "name": "docs",
+    "columns": [
+      { "name": "id", "type": "int", "nullable": true, "index": null },
+      { "name": "embedding", "type": "vector(4)", "nullable": true, "index": "hnsw" }
+    ]
+  },
+  {
+    "name": "users",
+    "columns": [
+      { "name": "id", "type": "int", "nullable": false, "index": null },
+      { "name": "email", "type": "text", "nullable": false, "index": null }
+    ]
+  }
+]
+```
+
+Per column:
+- `type` — a human-readable type name: `int`, `text`, `bool`, `json`, `float`,
+  `uuid`, `bytea`, `date`, `time`, `timestamp`, `vector(<n>)`,
+  `decimal(<p>,<s>)`. (This is the REST vocabulary, owned by `server/dto.rs`;
+  it is intentionally decoupled from the engine's on-disk `ColumnType` enum.)
+- `nullable` — `false` iff the column is `NOT NULL` or `PRIMARY KEY`.
+- `index` — the column's secondary-index kind (`btree`, `hnsw`, `fulltext`,
+  `csr`) or `null` if unindexed. `hnsw` denotes the durable IVF-Flat vector
+  index (the historical name is kept, see `catalog::IndexKind`).
+
+**Errors**: same as every data-plane route — `401 UNAUTHORIZED` without a valid
+bearer token, `500 INTERNAL_ERROR` if the engine is unavailable. No route-specific
+error codes.
+
+---
+
 ### `POST /tables/{table}/events`
 
 Opt a table into event capture (M4). From this point on, every
