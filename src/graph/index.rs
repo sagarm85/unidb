@@ -39,7 +39,7 @@ pub fn resolve_candidates_batched(
     candidates: &[RowId],
     snapshot: &Snapshot,
     self_xid: Xid,
-    pool: &mut BufferPool,
+    pool: &BufferPool,
     columns: &[ColumnDef],
 ) -> Result<Vec<(RowId, Vec<Literal>)>> {
     let mut by_page: HashMap<PageId, Vec<u16>> = HashMap::new();

@@ -340,7 +340,7 @@ impl DiskBTree {
     /// Create a fresh empty tree: allocate a meta page and an empty leaf root,
     /// WAL-log both in one mini-txn, and return a handle. The caller records
     /// [`Self::meta_page`] durably in the catalog.
-    pub fn create(pool: &mut BufferPool, wal: &mut Wal) -> Result<DiskBTree> {
+    pub fn create(pool: &BufferPool, wal: &Wal) -> Result<DiskBTree> {
         let meta_page = pool.alloc_page()?;
         let root_page = pool.alloc_page()?;
         let page_size = pool.page_size();
@@ -357,7 +357,7 @@ impl DiskBTree {
         Ok(DiskBTree::new(meta_page, page_size))
     }
 
-    fn root_page(&self, pool: &mut BufferPool) -> Result<PageId> {
+    fn root_page(&self, pool: &BufferPool) -> Result<PageId> {
         let page = pool.fetch_page(self.meta_page)?;
         let body = &page.as_bytes()[PAGE_HEADER_SIZE..];
         if body.first().copied() != Some(NODE_META) {
@@ -381,7 +381,7 @@ impl DiskBTree {
         &self,
         op: CmpOp,
         value: &OrderedValue,
-        pool: &mut BufferPool,
+        pool: &BufferPool,
     ) -> Result<Option<Vec<RowId>>> {
         match op {
             CmpOp::Eq => Ok(Some(self.search_eq(value, pool)?)),
@@ -402,7 +402,7 @@ impl DiskBTree {
     /// collected. (The insert path has its own routing — it deliberately keeps
     /// `<` so new duplicates append after existing ones; only reads need the
     /// leftmost leaf.)
-    fn find_leaf(&self, key: &OrderedValue, pool: &mut BufferPool) -> Result<PageId> {
+    fn find_leaf(&self, key: &OrderedValue, pool: &BufferPool) -> Result<PageId> {
         let mut pid = self.root_page(pool)?;
         loop {
             let page = pool.fetch_page(pid)?;
@@ -432,7 +432,7 @@ impl DiskBTree {
     /// case that previously under-returned when a heavily-duplicated key (a
     /// full-text token in many docs, a graph hub, a BTree value on many rows)
     /// spanned a leaf split.
-    pub fn search_eq(&self, value: &OrderedValue, pool: &mut BufferPool) -> Result<Vec<RowId>> {
+    pub fn search_eq(&self, value: &OrderedValue, pool: &BufferPool) -> Result<Vec<RowId>> {
         let mut pid = self.find_leaf(value, pool)?;
         let mut out = Vec::new();
         loop {
@@ -471,7 +471,7 @@ impl DiskBTree {
         &self,
         op: RangeOp,
         value: &OrderedValue,
-        pool: &mut BufferPool,
+        pool: &BufferPool,
     ) -> Result<Vec<RowId>> {
         let start = match op {
             RangeOp::Lt | RangeOp::Le => self.leftmost_leaf(pool)?,
@@ -510,7 +510,7 @@ impl DiskBTree {
         Ok(out)
     }
 
-    fn leftmost_leaf(&self, pool: &mut BufferPool) -> Result<PageId> {
+    fn leftmost_leaf(&self, pool: &BufferPool) -> Result<PageId> {
         let mut pid = self.root_page(pool)?;
         loop {
             let page = pool.fetch_page(pid)?;
@@ -533,8 +533,8 @@ impl DiskBTree {
         &self,
         value: OrderedValue,
         rid: RowId,
-        pool: &mut BufferPool,
-        wal: &mut Wal,
+        pool: &BufferPool,
+        wal: &Wal,
     ) -> Result<()> {
         let root = self.root_page(pool)?;
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
@@ -572,8 +572,8 @@ impl DiskBTree {
         pid: PageId,
         value: OrderedValue,
         rid: RowId,
-        pool: &mut BufferPool,
-        wal: &mut Wal,
+        pool: &BufferPool,
+        wal: &Wal,
         txn_id: u64,
         prev_lsn: &mut Lsn,
     ) -> Result<Option<(OrderedValue, PageId)>> {
@@ -689,8 +689,8 @@ impl DiskBTree {
         &self,
         value: &OrderedValue,
         rid: RowId,
-        pool: &mut BufferPool,
-        wal: &mut Wal,
+        pool: &BufferPool,
+        wal: &Wal,
     ) -> Result<()> {
         // Walk leaves rightward from the leftmost candidate leaf (a duplicate
         // run may span leaves, and `find_leaf` lands at-or-before the run's
@@ -736,8 +736,8 @@ fn meta_bytes(meta_page: PageId, root_page: PageId, page_size: usize) -> Vec<u8>
 /// full-page image), stamp the record LSN into the page, and write it into the
 /// buffer pool. Returns the record LSN so the caller can chain `prev_lsn`.
 fn write_node(
-    pool: &mut BufferPool,
-    wal: &mut Wal,
+    pool: &BufferPool,
+    wal: &Wal,
     txn_id: u64,
     prev_lsn: Lsn,
     page_id: PageId,
@@ -751,8 +751,8 @@ fn write_node(
 /// Like [`write_node`] but takes an already-serialized page image (used for the
 /// meta page). Pins the page for write, logs the image, stamps the LSN, writes.
 fn write_raw(
-    pool: &mut BufferPool,
-    wal: &mut Wal,
+    pool: &BufferPool,
+    wal: &Wal,
     txn_id: u64,
     prev_lsn: Lsn,
     page_id: PageId,

@@ -12,7 +12,7 @@
 //     taken only to mutate page bytes or grow the mapping.
 //   * The frame table + allocation metadata + D5/FPI/poison bookkeeping move
 //     under one `Mutex<PoolState>`. Every method that used to be `&mut self` is
-//     now `&self` (callers passing `&mut pool` auto-reborrow to `&`), so P5.a
+//     now `&self` (callers passing `&pool` auto-reborrow to `&`), so P5.a
 //     lands without touching heap/index/graph call sites.
 //   * A **page-latch table** (`latches`) hands out shared/exclusive latches per
 //     page via a small `#![forbid(unsafe_code)]`-clean custom latch

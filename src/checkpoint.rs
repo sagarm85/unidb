@@ -2,6 +2,7 @@
 // file → truncate WAL to the checkpoint LSN (D3, D5).
 
 use std::path::Path;
+use std::sync::Mutex;
 
 use crate::{
     bufferpool::BufferPool,
@@ -18,15 +19,17 @@ use crate::{
 /// `Engine::open`'s recovery scan to find. See `format.rs`'s v2->v3 note
 /// and `control.rs`'s module doc for the bug this closes.
 pub fn run(
-    pool: &mut BufferPool,
-    wal: &mut Wal,
+    pool: &BufferPool,
+    wal: &Wal,
     control_path: &Path,
-    control: &mut ControlData,
+    control: &Mutex<ControlData>,
     next_xid: Xid,
 ) -> Result<()> {
     tracing::info!("checkpoint started");
 
-    // 1. Flush all dirty pages. D5 is enforced inside flush_page.
+    // 1. Flush all dirty pages. D5 is enforced inside flush_page. (No `control`
+    //    lock held here — this fsyncs, and the P5.e invariant forbids holding
+    //    the control lock across an fsync.)
     pool.flush_all(wal.durable_lsn())?;
 
     // P1.a: with every dirty page now durably flushed, the on-disk image of
@@ -35,14 +38,18 @@ pub fn run(
     // opens a new interval and logs a fresh full-page image.
     pool.clear_fpi_tracking();
 
-    // 2. Write checkpoint record to WAL and fsync.
+    // 2. Write checkpoint record to WAL and fsync (again, no `control` lock).
     let ckpt_lsn = wal.log_checkpoint()?;
 
-    // 3. Update control file with new checkpoint LSN, WAL tail, and xid.
-    control.checkpoint_lsn = ckpt_lsn;
-    control.wal_tail_lsn = wal.current_lsn();
-    control.next_xid = next_xid;
-    control::write(control_path, control)?;
+    // 3. Update control file with new checkpoint LSN, WAL tail, and xid. Lock
+    //    `control` only for this small, fsync-free critical section.
+    {
+        let mut control = control.lock().unwrap_or_else(|e| e.into_inner());
+        control.checkpoint_lsn = ckpt_lsn;
+        control.wal_tail_lsn = wal.current_lsn();
+        control.next_xid = next_xid;
+        control::write(control_path, &control)?;
+    }
 
     // 4. Truncate WAL: records before ckpt_lsn are now redundant.
     wal.truncate_before(ckpt_lsn)?;
@@ -65,20 +72,21 @@ mod tests {
     fn checkpoint_runs_and_updates_control() {
         let dir = tempdir().unwrap();
         let ctrl_path = dir.path().join("control");
-        let mut ctrl = control::create(&ctrl_path, DEFAULT_PAGE_SIZE).unwrap();
-        let mut pool =
+        let ctrl = Mutex::new(control::create(&ctrl_path, DEFAULT_PAGE_SIZE).unwrap());
+        let pool =
             BufferPool::open(&dir.path().join("data.db"), DEFAULT_PAGE_SIZE as usize, 16).unwrap();
-        let mut wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
+        let wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
         let heap = Heap::new(DEFAULT_PAGE_SIZE as usize);
 
         heap.insert(b"checkpoint_test", 1, &pool, &wal).unwrap();
 
-        run(&mut pool, &mut wal, &ctrl_path, &mut ctrl, 7).unwrap();
-        assert!(ctrl.checkpoint_lsn > INVALID_LSN);
+        run(&pool, &wal, &ctrl_path, &ctrl, 7).unwrap();
+        let ckpt_lsn = ctrl.lock().unwrap().checkpoint_lsn;
+        assert!(ckpt_lsn > INVALID_LSN);
 
         // Verify control file on disk matches.
         let on_disk = control::read(&ctrl_path).unwrap();
-        assert_eq!(on_disk.checkpoint_lsn, ctrl.checkpoint_lsn);
+        assert_eq!(on_disk.checkpoint_lsn, ckpt_lsn);
         assert_eq!(on_disk.next_xid, 7);
     }
 }

@@ -490,9 +490,9 @@ impl TransactionManager {
     pub fn abort(
         &self,
         xid: Xid,
-        pool: &mut BufferPool,
-        heap: &mut Heap,
-        wal: &mut Wal,
+        pool: &BufferPool,
+        heap: &Heap,
+        wal: &Wal,
         lock_mgr: &LockManager,
     ) -> Result<()> {
         let txn = self
@@ -623,7 +623,7 @@ mod tests {
             },
         )
         .unwrap();
-        mgr.abort(a, &mut pool, &mut heap, &mut wal, &lock_mgr)
+        mgr.abort(a, &pool, &heap, &wal, &lock_mgr)
             .unwrap();
         assert!(!mgr.is_active(a));
         assert!(mgr.is_aborted(a));

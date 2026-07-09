@@ -24,6 +24,7 @@
 // SQL executor — there is no chicken-and-egg problem of needing a catalog
 // entry to read the catalog.
 
+use std::sync::Mutex;
 use std::{collections::HashMap, path::Path};
 
 use serde::{Deserialize, Serialize};
@@ -259,10 +260,10 @@ pub struct TableDef {
 /// Everything `Catalog` needs to durably persist itself, bundled so
 /// mutating methods don't balloon into a long parameter list.
 pub struct CatalogCtx<'a> {
-    pub pool: &'a mut BufferPool,
-    pub wal: &'a mut Wal,
+    pub pool: &'a BufferPool,
+    pub wal: &'a Wal,
     pub control_path: &'a Path,
-    pub control: &'a mut ControlData,
+    pub control: &'a Mutex<ControlData>,
     pub page_size: usize,
 }
 
@@ -306,7 +307,7 @@ impl Catalog {
 
     /// Load the catalog from `control.catalog_root`, or return an empty
     /// catalog if this is a fresh database.
-    pub fn load(control: &ControlData, pool: &mut BufferPool) -> Result<Self> {
+    pub fn load(control: &ControlData, pool: &BufferPool) -> Result<Self> {
         if control.catalog_root == INVALID_PAGE_ID {
             return Ok(Self::new());
         }
@@ -605,8 +606,11 @@ impl Catalog {
         page.set_lsn(lsn);
         ctx.pool.write_page(&page)?;
         ctx.wal.commit_mini_txn(txn_id, lsn)?;
-        ctx.control.catalog_root = page_id;
-        control::write(ctx.control_path, ctx.control)?;
+        {
+            let mut control = ctx.control.lock().unwrap_or_else(|e| e.into_inner());
+            control.catalog_root = page_id;
+            control::write(ctx.control_path, &control)?;
+        }
         Ok(())
     }
 
@@ -631,26 +635,26 @@ mod tests {
     use crate::format::DEFAULT_PAGE_SIZE;
     use tempfile::tempdir;
 
-    fn setup(dir: &std::path::Path) -> (BufferPool, Wal, std::path::PathBuf, ControlData) {
+    fn setup(dir: &std::path::Path) -> (BufferPool, Wal, std::path::PathBuf, Mutex<ControlData>) {
         let control_path = dir.join("control");
         let control = control::create(&control_path, DEFAULT_PAGE_SIZE).unwrap();
         let pool = BufferPool::open(&dir.join("data.db"), DEFAULT_PAGE_SIZE as usize, 64).unwrap();
         let wal = Wal::open(&dir.join("db.wal"), crate::format::INVALID_LSN).unwrap();
-        (pool, wal, control_path, control)
+        (pool, wal, control_path, Mutex::new(control))
     }
 
     #[test]
     fn fresh_database_has_empty_catalog() {
         let dir = tempdir().unwrap();
         let (mut pool, _wal, _cp, control) = setup(dir.path());
-        let catalog = Catalog::load(&control, &mut pool).unwrap();
+        let catalog = Catalog::load(&control.lock().unwrap(), &pool).unwrap();
         assert!(catalog.lookup("t").is_err());
     }
 
     #[test]
     fn create_table_then_lookup() {
         let dir = tempdir().unwrap();
-        let (mut pool, mut wal, cp, mut control) = setup(dir.path());
+        let (mut pool, mut wal, cp, control) = setup(dir.path());
         let mut catalog = Catalog::new();
         let def = TableDef {
             name: "accounts".to_string(),
@@ -669,10 +673,10 @@ mod tests {
             constraints: Default::default(),
         };
         let mut ctx = CatalogCtx {
-            pool: &mut pool,
-            wal: &mut wal,
+            pool: &pool,
+            wal: &wal,
             control_path: &cp,
-            control: &mut control,
+            control: &control,
             page_size: DEFAULT_PAGE_SIZE as usize,
         };
         catalog.create_table(def, &mut ctx).unwrap();
@@ -683,7 +687,7 @@ mod tests {
     #[test]
     fn duplicate_create_table_is_rejected() {
         let dir = tempdir().unwrap();
-        let (mut pool, mut wal, cp, mut control) = setup(dir.path());
+        let (mut pool, mut wal, cp, control) = setup(dir.path());
         let mut catalog = Catalog::new();
         let def = || TableDef {
             name: "t".to_string(),
@@ -695,10 +699,10 @@ mod tests {
             constraints: Default::default(),
         };
         let mut ctx = CatalogCtx {
-            pool: &mut pool,
-            wal: &mut wal,
+            pool: &pool,
+            wal: &wal,
             control_path: &cp,
-            control: &mut control,
+            control: &control,
             page_size: DEFAULT_PAGE_SIZE as usize,
         };
         catalog.create_table(def(), &mut ctx).unwrap();
@@ -709,7 +713,7 @@ mod tests {
     #[test]
     fn catalog_survives_reload() {
         let dir = tempdir().unwrap();
-        let (mut pool, mut wal, cp, mut control) = setup(dir.path());
+        let (mut pool, mut wal, cp, control) = setup(dir.path());
         let mut catalog = Catalog::new();
         let def = TableDef {
             name: "widgets".to_string(),
@@ -739,17 +743,17 @@ mod tests {
         };
         {
             let mut ctx = CatalogCtx {
-                pool: &mut pool,
-                wal: &mut wal,
+                pool: &pool,
+                wal: &wal,
                 control_path: &cp,
-                control: &mut control,
+                control: &control,
                 page_size: DEFAULT_PAGE_SIZE as usize,
             };
             catalog.create_table(def, &mut ctx).unwrap();
         }
 
         // Reload from the persisted control-file pointer.
-        let reloaded = Catalog::load(&control, &mut pool).unwrap();
+        let reloaded = Catalog::load(&control.lock().unwrap(), &pool).unwrap();
         let t = reloaded.lookup("widgets").unwrap();
         assert_eq!(t.columns.len(), 2);
         assert_eq!(t.pages, vec![7]);
@@ -758,7 +762,7 @@ mod tests {
     #[test]
     fn vector_column_and_index_kind_survive_reload() {
         let dir = tempdir().unwrap();
-        let (mut pool, mut wal, cp, mut control) = setup(dir.path());
+        let (mut pool, mut wal, cp, control) = setup(dir.path());
         let mut catalog = Catalog::new();
         let def = TableDef {
             name: "embeddings".to_string(),
@@ -788,16 +792,16 @@ mod tests {
         };
         {
             let mut ctx = CatalogCtx {
-                pool: &mut pool,
-                wal: &mut wal,
+                pool: &pool,
+                wal: &wal,
                 control_path: &cp,
-                control: &mut control,
+                control: &control,
                 page_size: DEFAULT_PAGE_SIZE as usize,
             };
             catalog.create_table(def, &mut ctx).unwrap();
         }
 
-        let reloaded = Catalog::load(&control, &mut pool).unwrap();
+        let reloaded = Catalog::load(&control.lock().unwrap(), &pool).unwrap();
         let t = reloaded.lookup("embeddings").unwrap();
         assert_eq!(t.columns[1].ty, ColumnType::Vector(384));
         assert_eq!(t.columns[1].index, Some(IndexKind::Hnsw));
@@ -807,7 +811,7 @@ mod tests {
     fn set_rls_policy_persists() {
         use crate::sql::logical::{CmpOp, Literal};
         let dir = tempdir().unwrap();
-        let (mut pool, mut wal, cp, mut control) = setup(dir.path());
+        let (mut pool, mut wal, cp, control) = setup(dir.path());
         let mut catalog = Catalog::new();
         let def = TableDef {
             name: "t".to_string(),
@@ -825,10 +829,10 @@ mod tests {
         };
         {
             let mut ctx = CatalogCtx {
-                pool: &mut pool,
-                wal: &mut wal,
+                pool: &pool,
+                wal: &wal,
                 control_path: &cp,
-                control: &mut control,
+                control: &control,
                 page_size: DEFAULT_PAGE_SIZE as usize,
             };
             catalog.create_table(def, &mut ctx).unwrap();
@@ -837,7 +841,7 @@ mod tests {
                 .unwrap();
         }
 
-        let reloaded = Catalog::load(&control, &mut pool).unwrap();
+        let reloaded = Catalog::load(&control.lock().unwrap(), &pool).unwrap();
         assert_eq!(reloaded.lookup("t").unwrap().rls_policy, Some(policy));
     }
 }

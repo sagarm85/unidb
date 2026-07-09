@@ -28,6 +28,8 @@
 // large-object API the toast path would call); streaming REST upload/download
 // routes (`server/`); and a per-blob length/refcount header.
 
+use std::sync::Mutex;
+
 use crate::{
     btree_index::{DiskBTree, OrderedValue},
     bufferpool::BufferPool,
@@ -109,10 +111,10 @@ impl LobStore {
         lob_id: i64,
         mut reader: R,
         lobs: &TableDef,
-        heap: &mut Heap,
-        pool: &mut BufferPool,
-        wal: &mut Wal,
-        txn_mgr: &mut TransactionManager,
+        heap: &Heap,
+        pool: &BufferPool,
+        wal: &Wal,
+        txn_mgr: &TransactionManager,
     ) -> Result<u64> {
         let index = self.index();
         let mut buf = vec![0u8; CHUNK_SIZE];
@@ -164,7 +166,7 @@ impl LobStore {
         lobs: &TableDef,
         snapshot: &Snapshot,
         xid: Xid,
-        pool: &mut BufferPool,
+        pool: &BufferPool,
     ) -> Result<Vec<RowId>> {
         let candidates = self.index().search_eq(&OrderedValue::Int(lob_id), pool)?;
         let heap = Heap::from_pages(self.page_size, lobs.pages.clone());
@@ -192,7 +194,7 @@ impl LobStore {
         lobs: &TableDef,
         snapshot: &Snapshot,
         xid: Xid,
-        pool: &mut BufferPool,
+        pool: &BufferPool,
         mut sink: W,
     ) -> Result<u64> {
         let rids = self.ordered_chunk_rids(lob_id, lobs, snapshot, xid, pool)?;
@@ -222,11 +224,11 @@ impl LobStore {
         xid: Xid,
         lob_id: i64,
         lobs: &TableDef,
-        heap: &mut Heap,
-        pool: &mut BufferPool,
-        wal: &mut Wal,
-        lock_mgr: &mut crate::lockmgr::LockManager,
-        txn_mgr: &mut TransactionManager,
+        heap: &Heap,
+        pool: &BufferPool,
+        wal: &Wal,
+        lock_mgr: &crate::lockmgr::LockManager,
+        txn_mgr: &TransactionManager,
         snapshot: &Snapshot,
     ) -> Result<usize> {
         let rids = self.ordered_chunk_rids(lob_id, lobs, snapshot, xid, pool)?;
@@ -254,12 +256,12 @@ impl LobStore {
 #[allow(clippy::too_many_arguments)]
 pub fn ensure_lobs_table(
     catalog: &mut Catalog,
-    txn_mgr: &mut TransactionManager,
-    pool: &mut BufferPool,
-    wal: &mut Wal,
-    lock_mgr: &mut crate::lockmgr::LockManager,
+    txn_mgr: &TransactionManager,
+    pool: &BufferPool,
+    wal: &Wal,
+    lock_mgr: &crate::lockmgr::LockManager,
     control_path: &std::path::Path,
-    control: &mut crate::control::ControlData,
+    control: &Mutex<crate::control::ControlData>,
     page_size: usize,
 ) -> Result<PageId> {
     // Create the table if missing.
