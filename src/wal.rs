@@ -34,7 +34,7 @@
 use std::{
     fs::{File, OpenOptions},
     io::{BufWriter, Read, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
 };
 
@@ -49,6 +49,37 @@ use crate::{
 };
 
 const FIXED_HDR: usize = 41;
+
+// ── Segmented WAL (P6.a) ──────────────────────────────────────────────────────
+//
+// The WAL is no longer one ever-growing file that is rewritten to truncate.
+// It is a **directory** of fixed-size *segment* files (`seg-<NNNNNNNNNN>.wal`).
+// Records append to the highest-numbered (active) segment; when that segment
+// fills past `segment_size` the WAL **seals** it (flush + fsync) and **rotates**
+// to a fresh segment. Recovery scans every segment in index order; truncation
+// deletes **whole consumed segments** (no rewrite). This is what makes cheap
+// WAL retention + concurrent WAL readers (replication slots, P6.b) possible.
+//
+// A record is never split across segments: an oversized record (e.g. an 8 KiB
+// full-page image larger than `segment_size`) lands whole in its own segment.
+//
+// This evolves D6's "single-file for now — WAL may be separate, revisit
+// post-M4" note; the *data store* stays a single file. Human sign-off recorded
+// in PROGRESS.md (Phase 6, 2026-07-09).
+
+/// Segment file header magic ("WSEG" little-endian).
+const SEG_MAGIC: u32 = 0x4745_5357;
+/// Segment file format version.
+const SEG_VERSION: u16 = 1;
+/// Bytes at the head of every segment file: magic(4) + version(2) + pad(2) +
+/// base_lsn(8). The record stream follows.
+const SEG_HDR: u64 = 16;
+/// Default segment size (16 MiB). Overridable at open via
+/// `UNIDB_WAL_SEGMENT_BYTES` or [`Wal::open_with_segment_size`].
+const DEFAULT_SEGMENT_SIZE: u64 = 16 * 1024 * 1024;
+/// Filename prefix + extension for segment files.
+const SEG_PREFIX: &str = "seg-";
+const SEG_EXT: &str = "wal";
 
 #[derive(Debug, Clone)]
 pub struct WalRecord {
@@ -120,12 +151,95 @@ fn decode_record(buf: &[u8]) -> Result<WalRecord> {
     })
 }
 
+/// Path of segment file `idx` inside the WAL directory `dir`.
+fn segment_path(dir: &Path, idx: u64) -> PathBuf {
+    dir.join(format!("{SEG_PREFIX}{idx:010}.{SEG_EXT}"))
+}
+
+/// Parse a segment index out of a filename (`seg-0000000003.wal` → 3).
+fn parse_segment_idx(name: &str) -> Option<u64> {
+    let rest = name.strip_prefix(SEG_PREFIX)?;
+    let num = rest.strip_suffix(&format!(".{SEG_EXT}"))?;
+    num.parse::<u64>().ok()
+}
+
+/// List the WAL directory's segment files, sorted ascending by index. A missing
+/// directory yields an empty list (a brand-new / never-written WAL).
+fn list_segments(dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
+    let mut out = Vec::new();
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in rd {
+        let entry = entry?;
+        if let Some(name) = entry.file_name().to_str() {
+            if let Some(idx) = parse_segment_idx(name) {
+                out.push((idx, entry.path()));
+            }
+        }
+    }
+    out.sort_by_key(|(idx, _)| *idx);
+    Ok(out)
+}
+
+/// Read the `base_lsn` (the LSN the first record in this segment will carry)
+/// from a segment file header. A short/garbled header reports base_lsn 0.
+fn read_segment_base_lsn(path: &Path) -> Result<Lsn> {
+    let mut f = File::open(path)?;
+    let mut hdr = [0u8; SEG_HDR as usize];
+    if f.read_exact(&mut hdr).is_err() {
+        return Ok(0);
+    }
+    let magic = u32_from_le(hdr[0..4].try_into().unwrap());
+    if magic != SEG_MAGIC {
+        return Ok(0);
+    }
+    Ok(u64_from_le(hdr[8..16].try_into().unwrap()))
+}
+
+fn segment_header_bytes(base_lsn: Lsn) -> [u8; SEG_HDR as usize] {
+    let mut hdr = [0u8; SEG_HDR as usize];
+    hdr[0..4].copy_from_slice(&u32_to_le(SEG_MAGIC));
+    hdr[4..6].copy_from_slice(&u16_to_le(SEG_VERSION));
+    // [6..8] pad
+    hdr[8..16].copy_from_slice(&u64_to_le(base_lsn));
+    hdr
+}
+
+/// Create a fresh segment file, write its header, and return a writer
+/// positioned right after the header (ready to append records).
+fn create_segment(dir: &Path, idx: u64, base_lsn: Lsn) -> Result<BufWriter<File>> {
+    let path = segment_path(dir, idx);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)?;
+    file.write_all(&segment_header_bytes(base_lsn))?;
+    Ok(BufWriter::new(file))
+}
+
 /// The mutable WAL state guarded by one mutex (P5.b). LSN allocation and the
 /// physical append both happen while this is held, so concurrent appenders
 /// never interleave a partial record or hand out a duplicate/out-of-order LSN.
+///
+/// P6.a: `writer` targets the **active** (highest-numbered) segment in `dir`;
+/// `active_seg`/`active_base_lsn`/`active_bytes` track it for rotation.
 struct WalInner {
     writer: BufWriter<File>,
-    path: std::path::PathBuf,
+    dir: PathBuf,
+    /// Index of the segment `writer` is appending to.
+    active_seg: u64,
+    /// LSN of the first record that segment `active_seg` will hold.
+    active_base_lsn: Lsn,
+    /// Physical bytes in the active segment (header + records so far), used to
+    /// decide when to seal + rotate.
+    active_bytes: u64,
+    /// Max segment size before sealing + rotating (a record is never split, so
+    /// a single oversized record may exceed this).
+    segment_size: u64,
     next_lsn: Lsn,
     next_mini_txn: u64,
     /// Framed bytes currently in the WAL file (P1.e) — the WAL size since the
@@ -162,20 +276,62 @@ pub struct Wal {
 }
 
 impl Wal {
-    pub fn open(path: &Path, start_lsn: Lsn) -> Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+    /// Open (or create) the segmented WAL rooted at directory `dir`. `start_lsn`
+    /// is the last LSN known durable from the control file; the next record is
+    /// `start_lsn + 1` (or 1 for a fresh WAL). Segment size comes from
+    /// `UNIDB_WAL_SEGMENT_BYTES` or defaults to 16 MiB.
+    pub fn open(dir: &Path, start_lsn: Lsn) -> Result<Self> {
+        let segment_size = std::env::var("UNIDB_WAL_SEGMENT_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|v| *v > SEG_HDR)
+            .unwrap_or(DEFAULT_SEGMENT_SIZE);
+        Self::open_with_segment_size(dir, start_lsn, segment_size)
+    }
+
+    /// Like [`Wal::open`] with an explicit segment size — used by tests to force
+    /// rotation with a small cap.
+    pub fn open_with_segment_size(dir: &Path, start_lsn: Lsn, segment_size: u64) -> Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        let segment_size = segment_size.max(SEG_HDR + 1);
         let next_lsn = if start_lsn == INVALID_LSN {
             1
         } else {
             start_lsn + 1
         };
-        // Seed the WAL-size counter from the existing file (P1.e).
-        let wal_bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
-        tracing::info!(path = %path.display(), next_lsn, "WAL opened");
+
+        let segments = list_segments(dir)?;
+        // Seed the WAL-size counter from every existing segment (P1.e).
+        let mut wal_bytes = 0u64;
+        for (_, path) in &segments {
+            wal_bytes += std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        }
+
+        let (writer, active_seg, active_base_lsn, active_bytes) = match segments.last() {
+            Some((idx, path)) => {
+                // Reopen the highest-numbered (active) segment in append mode.
+                let file = OpenOptions::new().append(true).open(path)?;
+                let bytes = file.metadata().map(|m| m.len()).unwrap_or(SEG_HDR);
+                let base = read_segment_base_lsn(path)?;
+                (BufWriter::new(file), *idx, base, bytes)
+            }
+            None => {
+                // Brand-new WAL: create segment 1 with base_lsn = next_lsn.
+                let writer = create_segment(dir, 1, next_lsn)?;
+                wal_bytes = SEG_HDR;
+                (writer, 1, next_lsn, SEG_HDR)
+            }
+        };
+
+        tracing::info!(dir = %dir.display(), next_lsn, active_seg, segment_size, "WAL opened");
         Ok(Self {
             inner: Mutex::new(WalInner {
-                writer: BufWriter::new(file),
-                path: path.to_path_buf(),
+                writer,
+                dir: dir.to_path_buf(),
+                active_seg,
+                active_base_lsn,
+                active_bytes,
+                segment_size,
                 next_lsn,
                 next_mini_txn: 1,
                 wal_bytes,
@@ -186,6 +342,12 @@ impl Wal {
             }),
             flush_lock: Mutex::new(()),
         })
+    }
+
+    /// Number of segment files currently on disk (observability + tests).
+    pub fn segment_count(&self) -> Result<usize> {
+        let dir = self.lock().dir.clone();
+        Ok(list_segments(&dir)?.len())
     }
 
     fn lock(&self) -> MutexGuard<'_, WalInner> {
@@ -540,70 +702,178 @@ impl Wal {
         self.lock().next_lsn - 1
     }
 
-    /// Truncate WAL up to (but not including) `keep_from_lsn`.
-    /// Simple impl: rewrite the file keeping only records with LSN >= keep_from_lsn.
+    /// Truncate the WAL up to (but not including) `keep_from_lsn` by deleting
+    /// whole consumed segments (P6.a) — no file rewrite. A sealed segment is
+    /// removable iff *every* record it holds has an LSN below `keep_from_lsn`,
+    /// which holds exactly when the **next** segment's base LSN is
+    /// `<= keep_from_lsn`. The active segment is never deleted. This is coarser
+    /// than the old record-exact rewrite (a surviving segment may still carry a
+    /// few pre-`keep_from_lsn` records), which is harmless: recovery filters by
+    /// `lsn >= checkpoint_lsn` anyway, and the retained records are idempotent.
     pub fn truncate_before(&self, keep_from_lsn: Lsn) -> Result<()> {
         let mut inner = self.lock();
         inner.writer.flush()?;
-        let path = inner.path.clone();
-        let records = Self::scan_file(&path)?;
-        let kept: Vec<_> = records
-            .into_iter()
-            .filter(|r| r.lsn >= keep_from_lsn)
-            .collect();
-        let tmp = path.with_extension("wal_tmp");
-        {
-            let mut f = BufWriter::new(File::create(&tmp)?);
-            for r in &kept {
-                let encoded = encode_record(r);
-                f.write_all(&u32_to_le(encoded.len() as u32))?;
-                f.write_all(&encoded)?;
+        let dir = inner.dir.clone();
+        let active_seg = inner.active_seg;
+        let active_base_lsn = inner.active_base_lsn;
+
+        let segments = list_segments(&dir)?;
+        let mut removed = 0usize;
+        for (i, (idx, path)) in segments.iter().enumerate() {
+            if *idx == active_seg {
+                continue; // never delete the segment we are appending to
             }
-            f.flush()?;
-            f.get_ref().sync_all()?;
+            // Base LSN of the segment *after* this one (or the active segment's
+            // base if this is the last sealed segment).
+            let next_base = match segments.get(i + 1) {
+                Some((_, next_path)) => read_segment_base_lsn(next_path)?,
+                None => active_base_lsn,
+            };
+            if next_base <= keep_from_lsn {
+                std::fs::remove_file(path)?;
+                removed += 1;
+                tracing::info!(segment = *idx, "WAL segment removed (truncation)");
+            }
         }
-        std::fs::rename(&tmp, &path)?;
-        let file = OpenOptions::new().append(true).open(&path)?;
-        // P1.e: the WAL-size counter now reflects only the kept records.
-        inner.wal_bytes = kept.iter().map(|r| 4 + encode_record(r).len() as u64).sum();
-        inner.writer = BufWriter::new(file);
-        tracing::info!(keep_from_lsn, "WAL truncated");
+
+        // P1.e: recompute the WAL-size counter from the surviving segments.
+        inner.wal_bytes = list_segments(&dir)?
+            .iter()
+            .map(|(_, p)| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+            .sum();
+        tracing::info!(keep_from_lsn, removed_segments = removed, "WAL truncated");
         Ok(())
     }
 
-    /// Scan all records from the WAL file in LSN order for recovery.
-    pub fn scan_file(path: &Path) -> Result<Vec<WalRecord>> {
+    /// Scan every record in the WAL directory `dir`, across all segments, in LSN
+    /// order (segments are numbered monotonically, so index order = LSN order).
+    /// A missing directory or missing segments yield an empty log.
+    pub fn scan_file(dir: &Path) -> Result<Vec<WalRecord>> {
         let mut records = Vec::new();
-        let mut f = match File::open(path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(records),
-            Err(e) => return Err(e.into()),
-        };
-        f.seek(SeekFrom::Start(0))?;
-        loop {
-            let mut len_buf = [0u8; 4];
-            match f.read_exact(&mut len_buf) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e.into()),
-            }
-            let len = u32_from_le(len_buf) as usize;
-            let mut rec_buf = vec![0u8; len];
-            match f.read_exact(&mut rec_buf) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e.into()),
-            }
-            match decode_record(&rec_buf) {
-                Ok(r) => records.push(r),
-                Err(e) => {
-                    tracing::warn!("WAL scan: skipping corrupt record: {e}");
-                    break;
-                }
-            }
+        for (_, path) in list_segments(dir)? {
+            records.extend(scan_segment_file(&path)?);
         }
         Ok(records)
     }
+
+    /// WAL shipping (P6.b): every record strictly after `from_lsn`, in LSN order
+    /// — what a replica or archiver needs to catch up from its last-applied LSN.
+    /// v1 scans all segments then filters; skipping already-consumed segments by
+    /// their base LSN is a future optimization.
+    pub fn records_from(&self, from_lsn: Lsn) -> Result<Vec<WalRecord>> {
+        let dir = self.lock().dir.clone();
+        let mut recs = Self::scan_file(&dir)?;
+        recs.retain(|r| r.lsn > from_lsn);
+        Ok(recs)
+    }
+
+    /// Serialize every record after `from_lsn` into a framed byte stream that a
+    /// replica applies via [`decode_stream`] + redo (the P6.c consumer side).
+    pub fn ship_from(&self, from_lsn: Lsn) -> Result<Vec<u8>> {
+        Ok(encode_stream(&self.records_from(from_lsn)?))
+    }
+
+    /// Write shipped records **verbatim** (preserving each record's original
+    /// LSN) into this WAL, then fsync (P6.c replica apply). Unlike
+    /// [`append_locked`] the LSNs are the primary's, not self-allocated, so the
+    /// replica's WAL mirrors the primary's and recovery replays it identically.
+    /// Records are expected in ascending LSN order (as shipped). Duplicate/old
+    /// records (`lsn < next_lsn`) are still written but harmless — recovery's
+    /// redo is idempotent and LSN-gated. Advances `next_lsn` past the highest.
+    pub fn write_shipped(&self, records: &[WalRecord]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut inner = self.lock();
+        if inner.poisoned {
+            return Err(DbError::DurabilityFailure(
+                "WAL is poisoned by an earlier fsync failure; session is unrecoverable".into(),
+            ));
+        }
+        for r in records {
+            let encoded = encode_record(r);
+            write_framed_locked(&mut inner, &encoded, r.lsn)?;
+            if r.lsn + 1 > inner.next_lsn {
+                inner.next_lsn = r.lsn + 1;
+            }
+        }
+        fsync_locked(&mut inner)?;
+        Ok(())
+    }
+}
+
+/// Frame a list of WAL records into a `[len:u32][record]...` byte stream (the
+/// WAL-shipping wire format, P6.b) — the same framing used inside a segment.
+pub fn encode_stream(records: &[WalRecord]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for r in records {
+        let encoded = encode_record(r);
+        out.extend_from_slice(&u32_to_le(encoded.len() as u32));
+        out.extend_from_slice(&encoded);
+    }
+    out
+}
+
+/// Decode a framed WAL-shipping byte stream back into records (P6.c consumer).
+pub fn decode_stream(bytes: &[u8]) -> Result<Vec<WalRecord>> {
+    let mut records = Vec::new();
+    let mut pos = 0usize;
+    while pos + 4 <= bytes.len() {
+        let len = u32_from_le(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        if pos + len > bytes.len() {
+            return Err(DbError::WalCorrupt { lsn: 0 });
+        }
+        records.push(decode_record(&bytes[pos..pos + len])?);
+        pos += len;
+    }
+    Ok(records)
+}
+
+/// Read every record from a single segment file, skipping its header. Stops at
+/// the first short/corrupt record (a partially-written tail after a crash).
+fn scan_segment_file(path: &Path) -> Result<Vec<WalRecord>> {
+    let mut records = Vec::new();
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(records),
+        Err(e) => return Err(e.into()),
+    };
+    // Skip and validate the segment header.
+    let mut hdr = [0u8; SEG_HDR as usize];
+    match f.read_exact(&mut hdr) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(records),
+        Err(e) => return Err(e.into()),
+    }
+    if u32_from_le(hdr[0..4].try_into().unwrap()) != SEG_MAGIC {
+        tracing::warn!(?path, "WAL scan: bad segment magic, skipping segment");
+        return Ok(records);
+    }
+    f.seek(SeekFrom::Start(SEG_HDR))?;
+    loop {
+        let mut len_buf = [0u8; 4];
+        match f.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        }
+        let len = u32_from_le(len_buf) as usize;
+        let mut rec_buf = vec![0u8; len];
+        match f.read_exact(&mut rec_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        }
+        match decode_record(&rec_buf) {
+            Ok(r) => records.push(r),
+            Err(e) => {
+                tracing::warn!("WAL scan: skipping corrupt record: {e}");
+                break;
+            }
+        }
+    }
+    Ok(records)
 }
 
 /// Compile-time proof the WAL is shareable across threads (P5.b).
@@ -627,7 +897,6 @@ fn append_locked(
     undo: &[u8],
 ) -> Result<Lsn> {
     let lsn = inner.next_lsn;
-    inner.next_lsn += 1;
     let rec = WalRecord {
         lsn,
         prev_lsn,
@@ -639,11 +908,71 @@ fn append_locked(
         undo: undo.to_vec(),
     };
     let encoded = encode_record(&rec);
-    let len = encoded.len() as u32;
-    inner.writer.write_all(&u32_to_le(len))?;
-    inner.writer.write_all(&encoded)?;
-    inner.wal_bytes += 4 + encoded.len() as u64; // P1.e: track WAL size
+    write_framed_locked(inner, &encoded, lsn)?;
+    inner.next_lsn += 1;
     Ok(lsn)
+}
+
+/// Physically append one already-encoded record to the active segment, rotating
+/// first if it would overflow (`base_lsn` is the LSN of the record being written
+/// — the fresh segment's base). Shared by [`append_locked`] (self-allocated LSN)
+/// and [`Wal::write_shipped`] (verbatim replica apply, P6.c).
+fn write_framed_locked(inner: &mut WalInner, encoded: &[u8], base_lsn: Lsn) -> Result<()> {
+    let framed = 4 + encoded.len() as u64;
+    // P6.a: seal + rotate before this record if the active segment already holds
+    // at least one record and would overflow. `active_bytes > SEG_HDR` guards
+    // against rotating a header-only segment forever when a single record is
+    // larger than the whole segment (it then lands whole in its own segment).
+    if inner.active_bytes > SEG_HDR && inner.active_bytes + framed > inner.segment_size {
+        rotate_segment(inner, base_lsn)?;
+    }
+    inner.writer.write_all(&u32_to_le(encoded.len() as u32))?;
+    inner.writer.write_all(encoded)?;
+    inner.active_bytes += framed;
+    inner.wal_bytes += framed; // P1.e: track WAL size
+    Ok(())
+}
+
+/// Seal the active segment (flush + fsync so its records are durable) and open a
+/// fresh segment whose first record will carry `new_base_lsn`. Called from the
+/// append path when the active segment is full. Sealing fsyncs unconditionally
+/// (rotation is rare — one fsync per `segment_size` of log) so a sealed segment
+/// is always durable before the WAL moves on, even in group-commit deferred
+/// mode; the durable frontier advances to the sealed segment's last record.
+fn rotate_segment(inner: &mut WalInner, new_base_lsn: Lsn) -> Result<()> {
+    if inner.poisoned {
+        return Err(DbError::DurabilityFailure(
+            "WAL is poisoned by an earlier fsync failure; session is unrecoverable".into(),
+        ));
+    }
+    if let Err(e) = inner.writer.flush() {
+        inner.poisoned = true;
+        return Err(DbError::DurabilityFailure(format!(
+            "WAL segment seal flush failed: {e}"
+        )));
+    }
+    if let Err(e) = inner.writer.get_ref().sync_all() {
+        inner.poisoned = true;
+        return Err(DbError::DurabilityFailure(format!(
+            "WAL segment seal fsync failed: {e}"
+        )));
+    }
+    // Everything written so far (up to the last appended record) is now durable.
+    let sealed_last = inner.next_lsn - 1;
+    if inner.durable_lsn < sealed_last {
+        inner.durable_lsn = sealed_last;
+    }
+    let next_idx = inner.active_seg + 1;
+    inner.writer = create_segment(&inner.dir, next_idx, new_base_lsn)?;
+    inner.active_seg = next_idx;
+    inner.active_base_lsn = new_base_lsn;
+    inner.active_bytes = SEG_HDR;
+    tracing::info!(
+        segment = next_idx,
+        base_lsn = new_base_lsn,
+        "WAL rotated to new segment"
+    );
+    Ok(())
 }
 
 /// Flush + fsync the WAL and advance the durable frontier (P1.b/P5.b), while
@@ -806,11 +1135,12 @@ mod tests {
         wal.log_insert(txn_id, begin_lsn, 1, 0, b"x").unwrap();
         wal.sync().unwrap();
         drop(wal);
-        // corrupt last bytes of file
-        let mut bytes = std::fs::read(&p).unwrap();
+        // corrupt the last bytes of the active segment file
+        let seg = segment_path(&p, 1);
+        let mut bytes = std::fs::read(&seg).unwrap();
         let n = bytes.len();
         bytes[n - 5] ^= 0xff;
-        std::fs::write(&p, &bytes).unwrap();
+        std::fs::write(&seg, &bytes).unwrap();
         let records = Wal::scan_file(&p).unwrap();
         // only begin record survives (or zero if corruption hit it)
         assert!(records.len() <= 2);

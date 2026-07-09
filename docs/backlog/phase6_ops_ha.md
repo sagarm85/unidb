@@ -1,6 +1,6 @@
 # Phase 6 — Operations & HA (Core WAL + Ops lane)
 
-## Status as of 2026-07-08: NOT STARTED.
+## Status as of 2026-07-09: **COMPLETE — shipped on branch `phase6-ops-ha`** (P6.a–P6.g), see `PROGRESS.md`'s Phase 6 entry for the benchmark table + sign-offs. Encryption-at-rest is the one IN-scope item deferred (D9 sign-off-gated); RLS-over-SQL and an auto-failover coordinator are documented follow-ups.
 
 Delivers the confirmed target — **a strong single node + read replicas**,
 deployable and operable. Companion to [`roadmap.md`](roadmap.md) §4. WAL work is

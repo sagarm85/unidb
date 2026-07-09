@@ -120,6 +120,20 @@ pub enum DbError {
     /// restart, not retrying against the same `EngineHandle`.
     #[error("engine is unavailable: the writer thread has stopped responding")]
     EngineUnavailable,
+
+    /// Replication / slot management error (P6.b): e.g. a slot name already
+    /// exists, is unknown, or a slots-file (de)serialization failed.
+    #[error("replication error: {0}")]
+    Replication(String),
+
+    /// Authorization error (P6.e): a bad users/roles/GRANT statement (unknown
+    /// grantee, duplicate user, etc.).
+    #[error("authorization error: {0}")]
+    Authz(String),
+
+    /// Permission denied (P6.e): the current user lacks the required privilege.
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;

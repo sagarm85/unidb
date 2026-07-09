@@ -2593,3 +2593,114 @@ cores (3.68× at 8 writers)**, and added per-query timeouts / cancellation /
 - **P5.f — resource control — DONE** (`6f8e8c4`, 2026-07-09). Per-query **timeout**, cooperative **cancellation** (`CancelToken`), and **`work_mem`** (spill row budget), held in a thread-local `QueryLimits` installed for the call (a query runs on one worker thread). The executor's scan loops call `query_limits::check()` every 1024 rows (`QueryTimeout`/`QueryCancelled`); `sort_mem_rows`/`hash_join_mem_rows` consult the per-query `work_mem`. Entry point `Engine::execute_sql_with_limits`; server maps both errors to 408. Tests: unit (`query_limits`) + `tests/query_limits.rs` end-to-end (timeout aborts a scan, generous timeout completes, pre-/cross-thread cancel abort, tiny `work_mem` forces the `ORDER BY` spill yet stays correctly ordered).
 
 **Phase 5 is COMPLETE** (P5.a–P5.f). The single-writer → concurrent-writer unlock shipped; write throughput scales with cores; the crash harness stays 19/19 and the sync invariant (no tokio/reqwest/axum in the default engine) holds.
+
+---
+
+## Phase 6 — Operations & HA   [IN PROGRESS]   started 2026-07-09
+
+Branch `phase6-ops-ha` (Core WAL + Ops lane). Spec: `docs/backlog/phase6_ops_ha.md`.
+Delivers the confirmed scale target — **a strong single primary + read replicas**.
+One PR for all of Phase 6; checkpoints P6.a→P6.g as separate commits.
+
+### Locked-decision sign-offs (recorded before any P6 code — CLAUDE.md §3)
+
+Two §3 decisions are touched by Phase 6. Both were flagged to the human and
+**explicitly approved on 2026-07-09** before implementation began:
+
+- **D6 (single-file storage; "WAL may be a separate file — revisit post-M4") —
+  EVOLVED, signed off 2026-07-09.** P6.a splits the WAL from one append-only
+  file into fixed-size **16 MiB segment files** in a `wal/` directory
+  (seal + rotate on the boundary; truncation deletes whole consumed segments
+  instead of rewrite-to-truncate). This is the enabler for concurrent WAL
+  readers (replication slots / shipping) and is exactly the "revisit post-M4"
+  D6 anticipated. **The data store remains a single file — only the WAL layout
+  changes.** No reversal of D6's single-file *data-store* core; D3
+  (checkpoint/WAL root) is extended with segments, matching the spec's
+  "Locked decisions touched" table.
+- **§1 "no cloud control plane" — RELAXED slightly, signed off 2026-07-09.**
+  P6.b–P6.d add a backup/replication ops surface (replication slots, WAL
+  shipping, online base backup, WAL archiving). This relaxes §1's blanket
+  "no cloud control plane" for operational tooling only. **The single-primary
+  charter is unchanged** — async (or optional sync) read replicas, *not*
+  consensus; no multi-primary, no sharded writes (both remain parked, roadmap §7).
+
+- **D9 (on-disk page format) / encryption-at-rest — DEFERRED, sign-off-gated
+  (flagged at P6.f, 2026-07-09).** P6.f ships native **TLS** (rustls) and an
+  **audit log** — neither touches the on-disk format. **Encryption-at-rest was
+  deliberately NOT implemented:** it would change the D9 page format (encrypting
+  page bytes vs. the current plaintext + CRC32 + LSN layout) **and** is
+  fundamentally at odds with this engine's `memmap2`-based page store —
+  transparent block encryption can't compose with mmap page-faults without a
+  decrypt-on-read buffer layer or moving off mmap entirely (a storage-core
+  re-architecture). Per §3, a D9 change needs explicit human sign-off; that
+  sign-off has **not** been given, so encryption-at-rest is recorded here as a
+  documented, sign-off-gated follow-up rather than assumed. TLS-on-the-wire +
+  audit trail satisfy the deployable-security bar for v1; at-rest encryption is
+  typically provided by full-disk/volume encryption (LUKS/FileVault) underneath,
+  which needs no engine change.
+
+### Phase 6 checkpoints — SHIPPED (2026-07-09)
+
+One PR for all of Phase 6 (branch `phase6-ops-ha`), checkpoints P6.a→P6.g as
+separate commits. Delivers the confirmed scale target — a strong single primary
++ read replicas, deployable and operable.
+
+- **P6.a — segmented WAL** (`8f2fdf3`): WAL is now a directory of fixed-size
+  16 MiB segment files (seal + rotate; truncation deletes whole consumed
+  segments, no rewrite). Recovery scans segments in LSN order. New crash point
+  **P18** (harness 19→20). D6 evolution signed off (above).
+- **P6.b — replication slots + WAL shipping** (`6e83fa7`): persisted
+  `SlotRegistry` (`slots.json`); checkpoint truncation floor =
+  `min(checkpoint_lsn, min slot restart_lsn)`; `Wal::records_from`/`ship_from` +
+  `encode_stream`/`decode_stream`; REST `/replication/{slots,stream}`.
+- **P6.c — read replicas + failover** (`aab4a06`): `replication::Replica` —
+  base snapshot + incremental WAL apply (`apply_stream`), `promote()` failover,
+  `wait_for_sync_replicas` sync option. Fixed a self-deadlock in
+  `primary_control` (double control-lock in one statement).
+- **P6.d — backups + PITR** (`d4f76c7`): `Engine::base_backup`/`archive_wal`,
+  `backup::restore(base, archive, dest, target_lsn)` — PITR **by LSN**. New
+  crash point **P19** (harness 20→21).
+- **P6.e — users/roles/GRANT** (`c8109ed`): `authz::RoleStore` (`roles.json`),
+  transitive role membership, per-table privileges, `execute_sql_as` enforcement,
+  per-user JWT (`sub` claim) with open/bootstrap mode. RLS-over-SQL deferred.
+- **P6.f — security** (`22f9539`): native TLS (rustls via `axum-server`), audit
+  log (`audit.log`). Encryption-at-rest DEFERRED, D9 sign-off-gated (above).
+- **P6.g — observability** (`afb2d37`): `Engine::stats()` (`pg_stat_*`-style) +
+  `GET /stats`, slow-query log, ops runbook (`docs/ops_runbook.md`). EXPLAIN was
+  already shipped (P4.e).
+
+**Benchmarks** (release build, Apple Silicon macOS; `benches/phase6_ops.rs`,
+5,000-row table):
+
+| Operation                          | Time                    |
+|------------------------------------|-------------------------|
+| Base backup (5,000 rows)           | 7.1 ms                  |
+| Restore to latest                  | 72.1 ms                 |
+| PITR restore (to a target LSN)     | 42.8 ms                 |
+| Replica apply (100 shipped updates)| 40.2 ms (~2,490 rows/s) |
+| WAL ship batch size (100 updates)  | 40,980 bytes            |
+| Failover (promote → read-write)    | 26.3 ms                 |
+
+Honest notes: replica apply is O(WAL) per batch (v1 re-materializes via the
+recovery path — a re-base is the documented mitigation), so ~2.5k rows/s is a
+correctness-first figure, not a tuned steady-state number. Backup/restore/PITR
+and failover are sub-100 ms at this scale.
+
+**Crash harness:** 19 → **21** (P18 segmented-WAL multi-segment recovery +
+truncation; P19 backup+PITR restore after primary loss). All green.
+**Gates:** `cargo test -p unidb` + `--features server` + `--test crash` (21/21),
+`clippy --workspace --all-targets` (default + server), `fmt`, and the sync
+invariant (`cargo tree -p unidb --no-default-features --edges normal` has no
+tokio/reqwest/axum/rustls) all pass. No `FORMAT_VERSION` bump.
+
+**Locked-decision changes:** D6 evolved (segmented WAL) + §1 "no cloud control
+plane" relaxed for ops — both signed off 2026-07-09 (recorded above). D9 /
+encryption-at-rest deferred pending sign-off.
+
+**Known limitations / deferred:** incremental replica/PITR roll-forward
+reconstructs pages present in the base (fresh pages aren't FPI-covered — take
+base backups regularly / re-base); PITR is by-LSN (time-based needs commit
+timestamps); RLS-over-SQL (`CREATE POLICY`); encryption-at-rest (D9-gated);
+automatic failover coordinator (manual promotion in v1); S3 archiving.
+
+**Phase 6 is COMPLETE — the roadmap's 6-phase plan is fully delivered.**

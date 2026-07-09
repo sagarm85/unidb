@@ -12,6 +12,31 @@
 
 ## Current status
 
+- **Phase 6 (Operations & HA) — COMPLETE (2026-07-09), on branch `phase6-ops-ha`
+  (one PR for all of P6.a–P6.g).** The roadmap's 6-phase plan is now fully
+  delivered: unidb is a deployable, operable **single primary + read replicas**.
+  Checkpoints (each its own commit): **P6.a** segmented WAL (`db.wal/` is a
+  directory of 16 MiB segments; truncation deletes whole consumed segments) ·
+  **P6.b** replication slots (`slots.json`) + WAL shipping (`ship_wal`/
+  `decode_stream`, REST `/replication/*`) · **P6.c** read replicas
+  (`replication::Replica`: base snapshot + incremental WAL apply) + `promote()`
+  failover + `wait_for_sync_replicas` sync option · **P6.d** backups + PITR
+  (`Engine::base_backup`/`archive_wal`, `backup::restore(..., target_lsn)` —
+  PITR by LSN) · **P6.e** users/roles/GRANT (`authz::RoleStore` in `roles.json`,
+  `execute_sql_as` enforcement, per-user JWT `sub`, open/bootstrap mode) ·
+  **P6.f** security: native TLS (rustls/`axum-server`) + audit log
+  (`audit.log`) — **encryption-at-rest DEFERRED, D9 sign-off-gated** (mmap page
+  store + on-disk format) · **P6.g** observability: `Engine::stats()` +
+  `GET /stats` + slow-query log + `docs/ops_runbook.md`. **Crash harness 19 →
+  21** (P18 segmented-WAL, P19 backup+PITR-restore). Sign-offs recorded in
+  `PROGRESS.md`: **D6** evolved (segmented WAL) + **§1** "no cloud control plane"
+  relaxed for ops (both 2026-07-09). No `FORMAT_VERSION` bump; sync invariant
+  holds (no tokio/reqwest/axum/rustls in the default build). Benchmark table +
+  full detail in `PROGRESS.md`'s Phase 6 entry. **Key documented limitations:**
+  incremental replica/PITR roll-forward reconstructs pages present in the base
+  (fresh pages aren't FPI-covered — re-base regularly); PITR is by-LSN;
+  RLS-over-SQL, encryption-at-rest (D9), and an auto-failover coordinator are
+  follow-ups.
 - **Phase 5 (concurrency & performance) — COMPLETE (2026-07-09).** Part 1
   (P5.a–P5.d) shipped to `main` via PR #14 (merge `30109d9`); Part 2 (P5.e
   multiple writers + P5.f resource control) shipped on branch

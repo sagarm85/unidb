@@ -158,6 +158,24 @@ impl EngineHandle {
         self.on_engine(move |e| e.execute_cypher(xid, &query)).await
     }
 
+    /// Execute SQL as a named user (P6.e), enforcing privileges + handling auth
+    /// DDL. `user == None` is the embedded superuser.
+    pub async fn execute_sql_as(
+        &self,
+        user: Option<String>,
+        xid: Xid,
+        sql: String,
+    ) -> Result<Vec<ExecResult>> {
+        self.on_engine(move |e| e.execute_sql_as(user.as_deref(), xid, &sql))
+            .await
+    }
+
+    /// Privilege pre-check for the read/param fast paths (P6.e).
+    pub async fn authorize_sql(&self, user: Option<String>, sql: String) -> Result<()> {
+        self.on_engine(move |e| e.authorize_sql(user.as_deref(), &sql))
+            .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn create_edge(
         &self,
@@ -224,6 +242,44 @@ impl EngineHandle {
 
     pub async fn checkpoint(&self) -> Result<()> {
         self.on_engine(|e| e.checkpoint()).await
+    }
+
+    /// A `pg_stat_*`-style activity + counter snapshot (P6.g).
+    pub async fn stats(&self) -> Result<crate::EngineStats> {
+        self.on_engine(|e| Ok(e.stats())).await
+    }
+
+    // ── Replication slots + WAL shipping (P6.b) ────────────────────────────────
+
+    pub async fn create_replication_slot(
+        &self,
+        name: String,
+        kind: crate::replication::SlotKind,
+    ) -> Result<crate::replication::SlotInfo> {
+        self.on_engine(move |e| e.create_replication_slot(&name, kind))
+            .await
+    }
+
+    pub async fn drop_replication_slot(&self, name: String) -> Result<()> {
+        self.on_engine(move |e| e.drop_replication_slot(&name))
+            .await
+    }
+
+    pub async fn advance_replication_slot(&self, name: String, lsn: u64) -> Result<()> {
+        self.on_engine(move |e| e.advance_replication_slot(&name, lsn))
+            .await
+    }
+
+    pub async fn replication_slots(&self) -> Result<Vec<crate::replication::SlotInfo>> {
+        self.on_engine(|e| Ok(e.replication_slots())).await
+    }
+
+    /// Ship the WAL record stream after `from_lsn` as framed bytes (P6.b), for a
+    /// replica to decode + apply. Returns the primary's current tail LSN too, so
+    /// the caller knows where the batch ends without decoding it.
+    pub async fn ship_wal(&self, from_lsn: u64) -> Result<(u64, Vec<u8>)> {
+        self.on_engine(move |e| Ok((e.wal_current_lsn(), e.ship_wal(from_lsn)?)))
+            .await
     }
 
     /// Release the shared engine. Every write already made itself durable at

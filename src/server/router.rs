@@ -58,6 +58,20 @@ pub fn build_router(
         .route("/events/subscribe", get(sse::get_events_subscribe))
         .route("/events/ack", post(handlers::post_events_ack))
         .route("/checkpoint", post(handlers::post_checkpoint))
+        .route("/stats", get(handlers::get_stats))
+        .route(
+            "/replication/slots",
+            post(handlers::post_replication_slot).get(handlers::get_replication_slots),
+        )
+        .route(
+            "/replication/slots/{name}",
+            delete(handlers::delete_replication_slot),
+        )
+        .route(
+            "/replication/slots/{name}/advance",
+            post(handlers::post_replication_slot_advance),
+        )
+        .route("/replication/stream", get(handlers::get_replication_stream))
         .route_layer(axum::middleware::from_fn_with_state(
             jwt_config,
             crate::server::auth::require_jwt,

@@ -37,6 +37,9 @@
 // unsafe_code is denied crate-wide; mmap.rs is the sole exception (CLAUDE.md §4).
 #![deny(unsafe_code)]
 
+pub mod audit;
+pub mod authz;
+pub mod backup;
 pub mod btree_index;
 pub mod bufferpool;
 pub mod catalog;
@@ -63,6 +66,7 @@ pub mod query_limits;
 pub mod queue;
 pub mod read_handle;
 pub mod recovery;
+pub mod replication;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod sql;
@@ -82,7 +86,7 @@ use crate::{
     control::ControlData,
     disk_vector::DiskIvfIndex,
     error::Result,
-    format::{PageId, Xid, DEFAULT_PAGE_SIZE},
+    format::{Lsn, PageId, Xid, DEFAULT_PAGE_SIZE},
     graph::{
         edges::{self, Edge},
         executor as graph_executor,
@@ -97,6 +101,7 @@ use crate::{
         executor::{self, ExecCtx, ExecResult},
         logical::{apply_rls, bind_params, Expr, Literal, LogicalPlan},
         parser::parse_sql,
+        query::{FromNode, QuerySpec},
     },
     txn::{IsolationLevel, TransactionManager, UndoAction},
     wal::Wal,
@@ -247,6 +252,53 @@ pub struct Engine {
     /// low-frequency write paths — correctness first; finer-grained index
     /// concurrency (latch-coupled B-tree writes) is future work.
     write_serial: Mutex<()>,
+    /// Replication slots (P6.b). Each slot pins a `restart_lsn` the WAL must be
+    /// retained from; the checkpoint truncation floor is
+    /// `min(checkpoint_lsn, min slot restart_lsn)` so a consumer's segments are
+    /// never deleted before it has streamed them. Persisted in `slots.json`.
+    replication: Arc<crate::replication::SlotRegistry>,
+    /// Users / roles / privileges (P6.e). The embedded API runs as an implicit
+    /// superuser (identity `None`); named users go through `execute_sql_as` with
+    /// per-table privilege checks. Persisted in `roles.json`.
+    authz: Arc<crate::authz::RoleStore>,
+    /// Security audit trail (P6.f) — auth DDL + named-user access decisions,
+    /// appended to `audit.log`.
+    audit: Arc<crate::audit::AuditLog>,
+    /// Observability counters (P6.g): lifetime commits / aborts this session.
+    commits: AtomicU64,
+    aborts: AtomicU64,
+    /// Slow-query log (P6.g): SQL statements whose wall-clock exceeded the
+    /// threshold, kept as a bounded ring (most recent last). Threshold in
+    /// **micros**; 0 disables (default), settable via `set_slow_query_threshold`.
+    slow_query_threshold_us: AtomicU64,
+    slow_queries: Mutex<std::collections::VecDeque<SlowQuery>>,
+}
+
+/// One slow-query-log entry (P6.g).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SlowQuery {
+    pub sql: String,
+    pub micros: u64,
+}
+
+/// A point-in-time snapshot of engine activity + counters (P6.g) — the
+/// `pg_stat_*`-style view surfaced by `Engine::stats` and `GET /stats`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EngineStats {
+    pub commits: u64,
+    pub aborts: u64,
+    pub checkpoints: u64,
+    /// Live transactions (writers) — the active-session count.
+    pub active_transactions: usize,
+    /// WAL bytes since the last checkpoint (auto-checkpoint pressure).
+    pub wal_bytes: u64,
+    /// Registered replication slots + the largest lag (tail LSN − min slot).
+    pub replication_slots: usize,
+    pub max_replication_lag: u64,
+    /// Pages currently in the data file.
+    pub data_pages: u32,
+    /// The most recent slow queries (bounded).
+    pub recent_slow_queries: Vec<SlowQuery>,
 }
 
 /// `Engine` must be safely **shareable** across threads (P5.e: a pool of N
@@ -275,6 +327,64 @@ fn cat_read(c: &RwLock<Catalog>) -> RwLockReadGuard<'_, Catalog> {
 
 fn cat_write(c: &RwLock<Catalog>) -> RwLockWriteGuard<'_, Catalog> {
     c.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Map an auth-DDL statement to an `(action, object)` pair for the audit log
+/// (P6.f).
+fn auth_stmt_audit(stmt: &crate::authz::AuthStmt) -> (&'static str, String) {
+    use crate::authz::AuthStmt as A;
+    match stmt {
+        A::CreateUser { name, .. } => ("create_user", name.clone()),
+        A::DropUser(name) => ("drop_user", name.clone()),
+        A::CreateRole(name) => ("create_role", name.clone()),
+        A::DropRole(name) => ("drop_role", name.clone()),
+        A::GrantPrivs { table, grantee, .. } => ("grant", format!("{table} to {grantee}")),
+        A::RevokePrivs { table, grantee, .. } => ("revoke", format!("{table} from {grantee}")),
+        A::GrantRole { role, grantee } => ("grant_role", format!("{role} to {grantee}")),
+        A::RevokeRole { role, grantee } => ("revoke_role", format!("{role} from {grantee}")),
+    }
+}
+
+/// A short audit action verb for a data/DDL plan (P6.f).
+fn plan_audit_action(plan: &LogicalPlan) -> &'static str {
+    match plan {
+        LogicalPlan::Select { .. } | LogicalPlan::Query(_) | LogicalPlan::Explain { .. } => {
+            "select"
+        }
+        LogicalPlan::Insert { .. } => "insert",
+        LogicalPlan::Update { .. } => "update",
+        LogicalPlan::Delete { .. } => "delete",
+        _ => "ddl",
+    }
+}
+
+/// The base tables a Phase-4 query reads (P6.e privilege check): every
+/// `FROM` table across the query and its CTE bodies, excluding CTE names (which
+/// are derived relations, not base tables). Subquery-only references are not
+/// walked in v1 (a documented approximation — such a query from a non-superuser
+/// simply isn't over-granted; it may need broader grants).
+fn query_base_tables(spec: &QuerySpec) -> Vec<String> {
+    fn walk(node: &FromNode, ctes: &std::collections::HashSet<String>, out: &mut Vec<String>) {
+        match node {
+            FromNode::Table(t) => {
+                if !ctes.contains(&t.table) {
+                    out.push(t.table.clone());
+                }
+            }
+            FromNode::Join { left, right, .. } => {
+                walk(left, ctes, out);
+                walk(right, ctes, out);
+            }
+        }
+    }
+    let cte_names: std::collections::HashSet<String> =
+        spec.with.iter().map(|(n, _)| n.clone()).collect();
+    let mut out = Vec::new();
+    walk(&spec.from, &cte_names, &mut out);
+    for (_, cte) in &spec.with {
+        out.extend(query_base_tables(cte));
+    }
+    out
 }
 
 /// Lock the control-metadata `Mutex`, recovering from poisoning rather than
@@ -406,6 +516,13 @@ impl Engine {
             derive_next_lob_id(&catalog, &txn_mgr, &pool, &wal, &lock_mgr, page_size_usize)?;
         let next_event_seq =
             derive_next_event_seq(&catalog, &txn_mgr, &pool, &wal, &lock_mgr, page_size_usize)?;
+        // Replication slots (P6.b): persisted retention positions loaded from
+        // `slots.json` — they hold the WAL truncation floor back at checkpoint.
+        let replication = Arc::new(crate::replication::SlotRegistry::open(dir)?);
+        // Users / roles / privileges (P6.e), loaded from `roles.json`.
+        let authz = Arc::new(crate::authz::RoleStore::open(dir)?);
+        // Security audit trail (P6.f).
+        let audit = Arc::new(crate::audit::AuditLog::open(dir)?);
 
         // Phase 3: every secondary index is durable and crash-recovered — the
         // B-Tree/full-text/edge indexes as `DiskBTree`s (P3.a/P3.b), the vector
@@ -432,6 +549,13 @@ impl Engine {
             last_checkpoint: Mutex::new(Instant::now()),
             checkpoints_triggered: AtomicU64::new(0),
             write_serial: Mutex::new(()),
+            replication,
+            authz,
+            audit,
+            commits: AtomicU64::new(0),
+            aborts: AtomicU64::new(0),
+            slow_query_threshold_us: AtomicU64::new(0),
+            slow_queries: Mutex::new(std::collections::VecDeque::new()),
         })
     }
 
@@ -453,10 +577,207 @@ impl Engine {
         self.execute_sql(xid, sql)
     }
 
+    /// The authorization store (P6.e) — users/roles/privileges.
+    pub fn authz(&self) -> &crate::authz::RoleStore {
+        &self.authz
+    }
+
+    /// Execute SQL **as** a named user (P6.e), enforcing per-table privileges.
+    /// `user == None` is the implicit **superuser** (the embedded API), so
+    /// `execute_sql` is exactly `execute_sql_as(None, ..)` and is unrestricted.
+    ///
+    /// Also the entry point for auth DDL (`CREATE USER`/`ROLE`, `GRANT`,
+    /// `REVOKE`) — those are intercepted here (they aren't `sqlparser` grammar),
+    /// require superuser, and mutate the role store rather than the catalog.
+    pub fn execute_sql_as(
+        &self,
+        user: Option<&str>,
+        xid: Xid,
+        sql: &str,
+    ) -> Result<Vec<ExecResult>> {
+        // Auth DDL (whole-statement) is handled here, not by the SQL executor.
+        if let Some(stmt) = crate::authz::parse_auth_stmt(sql)? {
+            let (action, object) = auth_stmt_audit(&stmt);
+            match self
+                .require_superuser(user)
+                .and_then(|()| self.authz.apply(&stmt))
+            {
+                Ok(()) => {
+                    self.audit.record_admin(user, action, &object, true);
+                    Ok(vec![ExecResult::Rows(Vec::new())])
+                }
+                Err(e) => {
+                    self.audit.record_admin(user, action, &object, false);
+                    Err(e)
+                }
+            }
+        } else {
+            // A named non-superuser must hold the matching privilege on every
+            // table each statement touches (an effective superuser skips checks).
+            if let Some(u) = user {
+                if !self.is_effective_superuser(Some(u)) {
+                    for plan in parse_sql(sql)? {
+                        if let Err(e) = self.check_plan_privileges(u, &plan) {
+                            self.audit
+                                .record(Some(u), plan_audit_action(&plan), "", false);
+                            return Err(e);
+                        }
+                        self.audit
+                            .record(Some(u), plan_audit_action(&plan), "", true);
+                    }
+                }
+            }
+            self.execute_sql(xid, sql)
+        }
+    }
+
+    /// Privilege pre-check for `sql` as `user`, without executing (P6.e). Used by
+    /// the server's read/param fast paths, which don't route through
+    /// [`Engine::execute_sql_as`]. A superuser / embedded (`None`) always passes.
+    /// Auth DDL requires superuser here too.
+    pub fn authorize_sql(&self, user: Option<&str>, sql: &str) -> Result<()> {
+        if crate::authz::parse_auth_stmt(sql)?.is_some() {
+            return self.require_superuser(user);
+        }
+        if self.is_effective_superuser(user) {
+            return Ok(());
+        }
+        let u = user.expect("effective superuser covers None");
+        for plan in parse_sql(sql)? {
+            self.check_plan_privileges(u, &plan)?;
+        }
+        Ok(())
+    }
+
+    /// An **effective** superuser skips all privilege checks: the embedded API
+    /// (`None`), a named `SUPERUSER`, or *any* identity while the role store has
+    /// no registered users (open / bootstrap mode — see [`RoleStore::has_users`]).
+    fn is_effective_superuser(&self, user: Option<&str>) -> bool {
+        match user {
+            None => true,
+            Some(u) => self.authz.is_superuser(u) || !self.authz.has_users(),
+        }
+    }
+
+    /// Superuser gate for auth/schema DDL (P6.e).
+    fn require_superuser(&self, user: Option<&str>) -> Result<()> {
+        if self.is_effective_superuser(user) {
+            Ok(())
+        } else {
+            Err(DbError::PermissionDenied(format!(
+                "user '{}' must be a superuser for this operation",
+                user.unwrap_or("?")
+            )))
+        }
+    }
+
+    /// Enforce that non-superuser `user` may run `plan` (P6.e).
+    fn check_plan_privileges(&self, user: &str, plan: &LogicalPlan) -> Result<()> {
+        use crate::authz::Privilege as P;
+        let reqs: Vec<(String, P)> = match plan {
+            LogicalPlan::Select { table, .. } => vec![(table.clone(), P::Select)],
+            LogicalPlan::Insert { table, .. } => vec![(table.clone(), P::Insert)],
+            LogicalPlan::Update { table, .. } => vec![(table.clone(), P::Update)],
+            LogicalPlan::Delete { table, .. } => vec![(table.clone(), P::Delete)],
+            LogicalPlan::Query(spec) | LogicalPlan::Explain { spec, .. } => query_base_tables(spec)
+                .into_iter()
+                .map(|t| (t, P::Select))
+                .collect(),
+            // Schema DDL requires superuser in v1.
+            LogicalPlan::CreateTable { .. }
+            | LogicalPlan::CreateIndex { .. }
+            | LogicalPlan::AlterTableAddColumn { .. }
+            | LogicalPlan::AlterTableDropColumn { .. }
+            | LogicalPlan::DropTable { .. }
+            | LogicalPlan::Truncate { .. }
+            | LogicalPlan::Analyze { .. } => {
+                return Err(DbError::PermissionDenied(
+                    "schema DDL requires a superuser".into(),
+                ));
+            }
+        };
+        for (table, priv_) in reqs {
+            if !self.authz.has_privilege(user, &table, priv_) {
+                return Err(DbError::PermissionDenied(format!(
+                    "{priv_:?} on '{table}' for user '{user}'"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Parse and execute one or more `;`-separated SQL statements under
     /// `xid`, applying each table's RLS policy (if any) as a planner
-    /// rewrite before execution. Returns one result per statement.
+    /// rewrite before execution. Returns one result per statement. Wraps the
+    /// executor with slow-query timing (P6.g).
     pub fn execute_sql(&self, xid: Xid, sql: &str) -> Result<Vec<ExecResult>> {
+        let start = Instant::now();
+        let result = self.execute_sql_inner(xid, sql);
+        self.note_query_time(sql, start.elapsed());
+        result
+    }
+
+    // ── Observability (P6.g) ───────────────────────────────────────────────────
+
+    /// Set the slow-query threshold; a query slower than this is logged
+    /// (`tracing::warn`) and added to the bounded slow-query ring surfaced by
+    /// [`Engine::stats`]. Zero (the default) disables slow-query logging.
+    pub fn set_slow_query_threshold(&self, threshold: Duration) {
+        self.slow_query_threshold_us
+            .store(threshold.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    /// Record a statement's wall-clock, logging + retaining it if slow (P6.g).
+    fn note_query_time(&self, sql: &str, elapsed: Duration) {
+        let threshold = self.slow_query_threshold_us.load(Ordering::Relaxed);
+        if threshold == 0 {
+            return;
+        }
+        let micros = elapsed.as_micros() as u64;
+        if micros < threshold {
+            return;
+        }
+        tracing::warn!(micros, threshold_us = threshold, "slow query");
+        let entry = SlowQuery {
+            sql: sql.chars().take(500).collect(),
+            micros,
+        };
+        let mut ring = self.slow_queries.lock().unwrap_or_else(|e| e.into_inner());
+        ring.push_back(entry);
+        while ring.len() > 32 {
+            ring.pop_front();
+        }
+    }
+
+    /// A `pg_stat_*`-style snapshot of engine activity + counters (P6.g).
+    pub fn stats(&self) -> EngineStats {
+        let tail = self.wal.current_lsn();
+        let max_replication_lag = self
+            .replication
+            .min_restart_lsn()
+            .map(|m| tail.saturating_sub(m))
+            .unwrap_or(0);
+        let recent_slow_queries = self
+            .slow_queries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+        EngineStats {
+            commits: self.commits.load(Ordering::Relaxed),
+            aborts: self.aborts.load(Ordering::Relaxed),
+            checkpoints: self.checkpoints_triggered.load(Ordering::SeqCst),
+            active_transactions: self.txn_mgr.active_count(),
+            wal_bytes: self.wal.wal_bytes(),
+            replication_slots: self.replication.list().len(),
+            max_replication_lag,
+            data_pages: self.pool.page_count(),
+            recent_slow_queries,
+        }
+    }
+
+    fn execute_sql_inner(&self, xid: Xid, sql: &str) -> Result<Vec<ExecResult>> {
         let page_size = self.page_size;
         let plans = parse_sql(sql)?;
         // Snapshot the catalog root so DDL (which the catalog persists
@@ -1217,6 +1538,7 @@ impl Engine {
         // P1.e: a commit is a quiescence boundary — the natural point to run an
         // auto-checkpoint if a trigger has fired.
         self.maybe_auto_checkpoint()?;
+        self.commits.fetch_add(1, Ordering::Relaxed); // P6.g stat
         Ok(())
     }
 
@@ -1305,8 +1627,13 @@ impl Engine {
     /// Abort `xid`, physically undoing its writes and releasing every lock
     /// it held. `xid` is finished after this call and must not be reused.
     pub fn abort(&self, xid: Xid) -> Result<()> {
-        self.txn_mgr
-            .abort(xid, &self.pool, &self.heap, &self.wal, &self.lock_mgr)
+        let r = self
+            .txn_mgr
+            .abort(xid, &self.pool, &self.heap, &self.wal, &self.lock_mgr);
+        if r.is_ok() {
+            self.aborts.fetch_add(1, Ordering::Relaxed); // P6.g stat
+        }
+        r
     }
 
     /// Insert one untyped byte-slice row, the lowest-level write primitive
@@ -1380,18 +1707,140 @@ impl Engine {
     /// `xid`, is not part of any user transaction's lifecycle, and is safe
     /// to call at any time (it only touches already-committed state).
     pub fn checkpoint(&self) -> Result<()> {
+        // P6.b: hold the WAL truncation floor back to the minimum replication
+        // slot position so a consumer's un-streamed segments survive the
+        // checkpoint. No slots → `Lsn::MAX` → truncate freely to the ckpt LSN.
+        let wal_retain_lsn = self.replication.min_restart_lsn().unwrap_or(Lsn::MAX);
         checkpoint::run(
             &self.pool,
             &self.wal,
             &self.control_path,
             &self.control,
             self.txn_mgr.next_xid(),
+            wal_retain_lsn,
         )
     }
 
     /// Flush all dirty pages without a full checkpoint (used in tests).
     pub fn flush(&self) -> Result<()> {
         self.pool.flush_all(self.wal.durable_lsn())
+    }
+
+    // ── Replication slots + WAL shipping (P6.b) ────────────────────────────────
+
+    /// Create a replication slot starting at the current WAL tail — the consumer
+    /// (read replica, archiver) streams everything committed from now on and the
+    /// slot pins the WAL so those records survive a checkpoint until confirmed.
+    pub fn create_replication_slot(
+        &self,
+        name: &str,
+        kind: replication::SlotKind,
+    ) -> Result<replication::SlotInfo> {
+        let start = self.wal.current_lsn();
+        self.replication.create(name, start, kind)
+    }
+
+    /// Drop a replication slot, releasing its WAL retention (a dropped slot no
+    /// longer holds the checkpoint truncation floor back).
+    pub fn drop_replication_slot(&self, name: &str) -> Result<()> {
+        self.replication.drop_slot(name)
+    }
+
+    /// Advance a slot's confirmed position after a consumer has durably applied
+    /// up to `lsn`. Monotonic — a stale confirmation never rewinds retention.
+    pub fn advance_replication_slot(&self, name: &str, lsn: Lsn) -> Result<()> {
+        self.replication.advance(name, lsn)
+    }
+
+    /// Snapshot of every replication slot (for the REST layer + monitoring).
+    pub fn replication_slots(&self) -> Vec<replication::SlotInfo> {
+        self.replication.list()
+    }
+
+    /// The current WAL tail LSN — a replica's starting point for streaming.
+    pub fn wal_current_lsn(&self) -> Lsn {
+        self.wal.current_lsn()
+    }
+
+    /// The database directory (parent of the control file) — used by backup and
+    /// base-snapshot tooling (P6.d).
+    pub fn data_dir(&self) -> &Path {
+        self.control_path.parent().unwrap_or_else(|| Path::new("."))
+    }
+
+    /// The control-file state a replica must adopt alongside the shipped WAL
+    /// (P6.c): the live catalog root and next-xid counter (the catalog *content*
+    /// rides the WAL, but its root pointer + xid counter are control-file state).
+    pub fn primary_control(&self) -> crate::replication::PrimaryControl {
+        // Read both control fields under a single lock — taking the `control`
+        // Mutex twice in one statement would keep both guards alive to the end
+        // of the statement and self-deadlock (the Mutex is not reentrant).
+        let (page_size, catalog_root) = {
+            let c = ctrl_lock(&self.control);
+            (c.page_size, c.catalog_root)
+        };
+        crate::replication::PrimaryControl {
+            page_size,
+            catalog_root,
+            next_xid: self.txn_mgr.next_xid(),
+        }
+    }
+
+    /// Ship every WAL record after `from_lsn` as a framed byte stream (P6.b) the
+    /// replica decodes with [`crate::wal::decode_stream`] and applies via redo.
+    pub fn ship_wal(&self, from_lsn: Lsn) -> Result<Vec<u8>> {
+        self.wal.ship_from(from_lsn)
+    }
+
+    // ── Backups + PITR (P6.d) ──────────────────────────────────────────────────
+
+    /// Take an online **base backup** into `dest`: checkpoint (flush all pages +
+    /// truncate WAL to a consistent point), then copy the DB directory. The
+    /// result is directly openable (restore-to-base) and is the starting point
+    /// for point-in-time recovery via [`crate::backup::restore`]. Returns the
+    /// WAL LSN the backup is consistent as of.
+    pub fn base_backup(&self, dest: &Path) -> Result<Lsn> {
+        self.checkpoint()?;
+        crate::backup::base_backup_dir(self.data_dir(), dest)?;
+        Ok(self.wal_current_lsn())
+    }
+
+    /// Archive the WAL segment files into `archive_dir` (P6.d) for point-in-time
+    /// recovery — a plain copy of the append-only segments. Re-run to pick up
+    /// newly written records. Returns the number of segments archived.
+    pub fn archive_wal(&self, archive_dir: &Path) -> Result<usize> {
+        let wal_dir = self.data_dir().join("db.wal");
+        crate::backup::archive_wal_dir(&wal_dir, archive_dir)
+    }
+
+    /// The synchronous-replica durability option (P6.c): block until every
+    /// **synchronous** slot has confirmed (advanced past) `lsn`, or `timeout`
+    /// elapses. A primary calls this after a commit's WAL is durable but before
+    /// acknowledging it, so a failover to a sync replica loses no acknowledged
+    /// commit. Returns `true` if all sync slots caught up, `false` on timeout
+    /// (the caller decides whether to still acknowledge). No sync slots →
+    /// returns `true` immediately (pure async replication). Opt-in: the default
+    /// commit path stays async (the documented tradeoff — see the phase6 spec).
+    pub fn wait_for_sync_replicas(&self, lsn: Lsn, timeout: Duration) -> Result<bool> {
+        if !self.replication.has_sync() {
+            return Ok(true);
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let all_caught_up = self
+                .replication
+                .list()
+                .iter()
+                .filter(|s| s.kind == crate::replication::SlotKind::Sync)
+                .all(|s| s.restart_lsn >= lsn);
+            if all_caught_up {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 
     /// Reclaim physical space held by dead tuple versions (M10) — the explicit,

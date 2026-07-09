@@ -47,7 +47,14 @@ fn run(n: u64, payload_len: usize) -> (f64, u64, u64, usize, u64) {
             fpi_count += 1;
         }
     }
-    let wal_total = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+    // P6.a: the WAL is a directory of segment files — sum them for the total.
+    let wal_total: u64 = std::fs::read_dir(&wal_path)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+                .sum()
+        })
+        .unwrap_or(0);
     let data_bytes = std::fs::metadata(dir.path().join("data.db"))
         .map(|m| m.len())
         .unwrap_or(0);

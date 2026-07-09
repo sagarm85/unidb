@@ -84,20 +84,31 @@ async fn main() {
     let (prometheus_layer, metric_handle) = PrometheusMetricLayer::pair();
 
     let router = build_router(state, jwt_config, prometheus_layer, metric_handle);
-    let listener = tokio::net::TcpListener::bind(&bind_addr)
-        .await
-        .unwrap_or_else(|e| panic!("failed to bind {bind_addr}: {e}"));
-    tracing::info!(
-        addr = %bind_addr,
-        data_dir = %data_dir,
-        log_dir = %log_dir,
-        "unidb-server listening"
-    );
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .expect("server error");
+    // P6.f: serve HTTPS directly when TLS is configured; otherwise plain HTTP.
+    if let Some((cert, key)) = unidb::server::tls::tls_paths_from_env() {
+        unidb::server::tls::install_crypto_provider();
+        let config = unidb::server::tls::load_rustls_config(cert.as_ref(), key.as_ref())
+            .await
+            .unwrap_or_else(|e| panic!("failed to load TLS cert/key: {e}"));
+        let addr: std::net::SocketAddr = bind_addr
+            .parse()
+            .unwrap_or_else(|e| panic!("invalid UNIDB_BIND_ADDR {bind_addr}: {e}"));
+        tracing::info!(addr = %bind_addr, data_dir = %data_dir, log_dir = %log_dir, tls = true, "unidb-server listening (HTTPS)");
+        axum_server::bind_rustls(addr, config)
+            .serve(router.into_make_service())
+            .await
+            .expect("server error");
+    } else {
+        let listener = tokio::net::TcpListener::bind(&bind_addr)
+            .await
+            .unwrap_or_else(|e| panic!("failed to bind {bind_addr}: {e}"));
+        tracing::info!(addr = %bind_addr, data_dir = %data_dir, log_dir = %log_dir, tls = false, "unidb-server listening (HTTP)");
+        axum::serve(listener, router)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .expect("server error");
+    }
 
     tracing::info!("unidb-server shut down cleanly");
 }

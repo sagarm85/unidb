@@ -35,19 +35,22 @@ axum-prometheus = { version = "0.10", optional = true }
 async-stream = { version = "0.3", optional = true }
 futures-util = { version = "0.3", optional = true }
 tracing-appender = { version = "0.2", optional = true }
+# P6.f: native TLS termination for the server (rustls, no OpenSSL). Server-only.
+axum-server = { version = "0.7", optional = true, features = ["tls-rustls"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["aws_lc_rs"] }
 
 [features]
 server = [
     "dep:tokio", "dep:axum", "dep:tower", "dep:tower-http",
     "dep:jsonwebtoken", "dep:metrics", "dep:metrics-exporter-prometheus",
     "dep:axum-prometheus", "dep:async-stream", "dep:futures-util",
-    "dep:tracing-appender",
+    "dep:tracing-appender", "dep:axum-server", "dep:rustls",
 ]
 
 [dev-dependencies]
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
 jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs"] }
 futures-util = "0.3"
 # Phase 4 differential correctness: join/aggregate/subquery results are checked
@@ -56,11 +59,17 @@ futures-util = "0.3"
 # it never enters the engine's own dependency graph, so the "engine stays sync"
 # invariant (`cargo tree -p unidb --no-default-features --edges normal`) holds.
 rusqlite = { version = "0.32", features = ["bundled"] }
+# P6.f: generate a self-signed cert in the TLS integration test (dev-only).
+rcgen = "0.13"
 
 [[bin]]
 name = "unidb-server"
 path = "src/bin/unidb-server.rs"
 required-features = ["server"]
+
+[[bench]]
+name = "phase6_ops"
+harness = false
 
 [[bench]]
 name = "load"
@@ -160,4 +169,24 @@ required-features = ["server"]
 [[test]]
 name = "server_metrics"
 path = "tests/server_metrics.rs"
+required-features = ["server"]
+
+[[test]]
+name = "server_replication"
+path = "tests/server_replication.rs"
+required-features = ["server"]
+
+[[test]]
+name = "server_authz"
+path = "tests/server_authz.rs"
+required-features = ["server"]
+
+[[test]]
+name = "server_tls"
+path = "tests/server_tls.rs"
+required-features = ["server"]
+
+[[test]]
+name = "server_stats"
+path = "tests/server_stats.rs"
 required-features = ["server"]

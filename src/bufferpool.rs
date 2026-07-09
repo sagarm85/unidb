@@ -461,6 +461,21 @@ impl BufferPool {
         Ok(())
     }
 
+    /// Ensure the page file is sized (and mapped) to include `page_id`, only
+    /// ever growing. Recovery uses this when replaying heap redo into a data
+    /// file smaller than the log implies — e.g. a freshly-created replica
+    /// materializing from a shipped WAL (P6.c), or any recover-into-wiped-file
+    /// path. Normal crash recovery leaves the file already sized, so this is a
+    /// cheap no-op there.
+    pub fn ensure_page_allocated(&self, page_id: PageId) -> Result<()> {
+        self.ensure_mapped(page_id + 1)?;
+        let mut st = self.lock_state();
+        if page_id + 1 > st.file_page_count {
+            st.file_page_count = page_id + 1;
+        }
+        Ok(())
+    }
+
     /// Advance the pool's view of the durable WAL frontier (D5). Monotonic.
     pub fn set_durable_wal_lsn(&self, lsn: Lsn) {
         let mut st = self.lock_state();

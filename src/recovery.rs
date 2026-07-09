@@ -380,6 +380,11 @@ fn fetch_or_create(pool: &BufferPool, page_id: u32, page_size: usize) -> Result<
     match pool.fetch_page(page_id) {
         Ok(p) => Ok(p),
         Err(DbError::PageNotFound { .. }) => {
+            // Grow the file to include this page when replaying into a
+            // smaller-than-implied data file (e.g. a replica/restore applying WAL
+            // onto a page beyond its base, P6.c/P6.d) — normal crash recovery,
+            // where the file is already sized, leaves this a no-op.
+            pool.ensure_page_allocated(page_id)?;
             Ok(SlottedPage::new(page_id, PAGE_TYPE_HEAP, page_size))
         }
         Err(e) => Err(e),

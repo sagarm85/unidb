@@ -97,8 +97,14 @@ fn now_secs() -> usize {
 
 /// A validly-signed, unexpired token for [`TEST_JWT_SECRET`].
 pub fn valid_token() -> String {
+    token_for("test-user")
+}
+
+/// A validly-signed, unexpired token whose `sub` claim is `user` (P6.e per-user
+/// identity).
+pub fn token_for(user: &str) -> String {
     let claims = Claims {
-        sub: "test-user".into(),
+        sub: user.into(),
         exp: now_secs() + 3600,
     };
     encode(

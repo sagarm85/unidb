@@ -57,6 +57,15 @@ fn map_status(err: &DbError) -> (StatusCode, &'static str) {
         DbError::TxnAlreadyFinished { .. } => (StatusCode::BAD_REQUEST, "TXN_ALREADY_FINISHED"),
         DbError::BadPageSize(_) => (StatusCode::BAD_REQUEST, "BAD_PAGE_SIZE"),
 
+        // Replication slot management (P6.b): a bad slot request (duplicate/
+        // unknown name) is a client error, not a server fault.
+        DbError::Replication(_) => (StatusCode::BAD_REQUEST, "REPLICATION_ERROR"),
+
+        // Authorization (P6.e): a bad users/roles/GRANT statement is a client
+        // error; a missing privilege is 403 Forbidden.
+        DbError::Authz(_) => (StatusCode::BAD_REQUEST, "AUTHZ_ERROR"),
+        DbError::PermissionDenied(_) => (StatusCode::FORBIDDEN, "PERMISSION_DENIED"),
+
         // Durability failure (P1.b, fsyncgate) is fatal for the session — the
         // engine can no longer guarantee writes reach disk and must be
         // restarted. 503 signals the service is (temporarily) unable to handle

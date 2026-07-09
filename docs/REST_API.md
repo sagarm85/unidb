@@ -402,6 +402,51 @@ route — same auth as everything else in v1 (no admin-only scope).
 
 ---
 
+### `GET /stats` (P6.g)
+
+A `pg_stat_*`-style activity snapshot.
+
+**Response** `200 OK`:
+```json
+{
+  "commits": 42, "aborts": 3, "checkpoints": 1,
+  "active_transactions": 0, "wal_bytes": 81920,
+  "replication_slots": 1, "max_replication_lag": 128,
+  "data_pages": 37, "recent_slow_queries": [{"sql": "...", "micros": 4210}]
+}
+```
+
+---
+
+### Replication (P6.b)
+
+- `POST /replication/slots` — create a slot. Body `{"name": "...", "sync": false}`.
+  `201 Created` with `{"name","restart_lsn","kind"}`.
+- `GET /replication/slots` — list slots: `{"slots": [...]}`.
+- `DELETE /replication/slots/{name}` — drop a slot. `204`.
+- `POST /replication/slots/{name}/advance` — a consumer confirms it applied up to
+  an LSN. Body `{"lsn": <n>}`. `204`.
+- `GET /replication/stream?from_lsn={n}` — ship WAL records after `from_lsn` as
+  `application/octet-stream`; the primary's tail LSN is in the `x-unidb-tail-lsn`
+  response header. Decode with `wal::decode_stream` and apply via a replica.
+
+A bad slot request (duplicate/unknown name) returns `400 REPLICATION_ERROR`.
+
+---
+
+### Per-user authorization (P6.e)
+
+`POST /sql` also accepts the auth DDL `CREATE USER|ROLE`, `GRANT`, `REVOKE`
+(superuser only). The JWT `sub` claim is the acting username; a token with no
+`sub` is the implicit superuser. With no users registered the server is in open
+mode (backward compatible); once users exist, a missing privilege returns
+`403 PERMISSION_DENIED`. All auth DDL + named-user decisions are written to
+`audit.log`.
+
+**TLS (P6.f):** set `UNIDB_TLS_CERT`/`UNIDB_TLS_KEY` (PEM) to serve HTTPS.
+
+---
+
 ### `GET /metrics`
 
 Prometheus text exposition format. The only route with no JWT requirement.
