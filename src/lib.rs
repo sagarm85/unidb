@@ -395,6 +395,15 @@ pub struct EngineStats {
     pub data_pages: u32,
     /// The most recent slow queries (bounded).
     pub recent_slow_queries: Vec<SlowQuery>,
+    /// Autovacuum passes run by the background launcher this session (A4).
+    pub autovacuums: u64,
+    /// Estimated dead tuple versions since the last vacuum (A1/A4) — the
+    /// autovacuum trigger's numerator.
+    pub dead_tuple_estimate: u64,
+    /// Estimated live tuples (A1/A4) — the trigger's `live` term.
+    pub live_tuple_estimate: u64,
+    /// Unix-epoch seconds of the last autovacuum pass, 0 if none yet (A4).
+    pub last_autovacuum_epoch_secs: u64,
 }
 
 /// `Engine` must be safely **shareable** across threads (P5.e: a pool of N
@@ -913,6 +922,10 @@ impl Engine {
             max_replication_lag,
             data_pages: self.pool.page_count(),
             recent_slow_queries,
+            autovacuums: self.autovacuums_triggered.load(Ordering::Relaxed),
+            dead_tuple_estimate: self.dead_tuples.load(Ordering::Relaxed),
+            live_tuple_estimate: self.live_tuples.load(Ordering::Relaxed),
+            last_autovacuum_epoch_secs: self.last_autovacuum_epoch_secs.load(Ordering::Relaxed),
         }
     }
 
@@ -4512,6 +4525,64 @@ mod tests {
         assert!(
             wait_until(Duration::from_secs(5), || witness.upgrade().is_none()),
             "engine was not freed after drop — the launcher leaked a strong ref"
+        );
+    }
+
+    #[test]
+    fn autovacuum_respects_the_horizon_held_by_a_repeatable_read_reader() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        engine.set_autovacuum_config(AutoVacuumConfig {
+            enabled: true,
+            threshold: 10,
+            scale_factor: 0.0,
+            naptime: Duration::from_millis(25),
+        });
+        let engine = Arc::new(engine);
+
+        // Seed one row, then open a REPEATABLE READ transaction whose BEGIN-time
+        // snapshot pins the vacuum horizon (M10.a / P5.c).
+        let x = engine.begin().unwrap();
+        let mut rid = engine.insert(x, b"v0").unwrap();
+        engine.commit(x).unwrap();
+        let v0_rid = rid; // v0's version never moves; updates create new versions
+        let reader = engine
+            .begin_with_isolation(IsolationLevel::RepeatableRead)
+            .unwrap();
+        assert_eq!(engine.get(reader, v0_rid).unwrap(), b"v0"); // establish the snapshot
+
+        // Churn hard AFTER the reader's snapshot: every dead version's xmax is
+        // above the reader's xmin, so none is reclaimable while the reader lives.
+        for i in 0..40 {
+            let x = engine.begin().unwrap();
+            rid = engine.update(x, rid, format!("v{i}").as_bytes()).unwrap();
+            engine.commit(x).unwrap();
+        }
+        engine.spawn_autovacuum();
+
+        // The launcher fires (dead=40 > threshold 10) but the horizon blocks it:
+        // it runs yet reclaims nothing, so the dead estimate stays high.
+        assert!(
+            wait_until(Duration::from_secs(5), || engine.autovacuums_triggered()
+                > 0),
+            "autovacuum should still *run* while blocked"
+        );
+        std::thread::sleep(Duration::from_millis(100)); // let a few more passes run
+        assert!(
+            engine.dead_tuple_estimate() >= 40,
+            "a live RR reader must block reclamation: dead={}",
+            engine.dead_tuple_estimate()
+        );
+        // The reader still sees its snapshot — the versions it needs are intact.
+        assert_eq!(engine.get(reader, v0_rid).unwrap(), b"v0");
+
+        // Release the horizon: the reader commits. Now autovacuum can reclaim.
+        engine.commit(reader).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(5), || engine.dead_tuple_estimate()
+                <= 10),
+            "after the reader commits, autovacuum must reclaim: dead={}",
+            engine.dead_tuple_estimate()
         );
     }
 

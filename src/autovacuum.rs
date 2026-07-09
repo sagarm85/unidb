@@ -225,8 +225,10 @@ impl Engine {
     /// Run one autovacuum pass and record its observability counters (A4). This
     /// is the background launcher's single call site into reclamation — it is
     /// exactly [`Engine::vacuum`] plus the run-count / last-run bookkeeping, so
-    /// autovacuum reclaims through the same already-safe M10 path.
-    pub(crate) fn run_autovacuum_pass(&self) -> crate::Result<crate::VacuumReport> {
+    /// autovacuum reclaims through the same already-safe M10 path. Public so an
+    /// operator (or a test) can force a counted pass without waiting on the
+    /// launcher's naptime.
+    pub fn run_autovacuum_pass(&self) -> crate::Result<crate::VacuumReport> {
         let report = self.vacuum()?;
         self.autovacuums_triggered.fetch_add(1, Ordering::Relaxed);
         self.last_autovacuum_epoch_secs
