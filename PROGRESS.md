@@ -2704,3 +2704,65 @@ timestamps); RLS-over-SQL (`CREATE POLICY`); encryption-at-rest (D9-gated);
 automatic failover coordinator (manual promotion in v1); S3 archiving.
 
 **Phase 6 is COMPLETE — the roadmap's 6-phase plan is fully delivered.**
+
+---
+
+## Benchmark — W0–W4 write-cost decomposition ladder   [DONE]   2026-07-09
+
+**Branch:** `bench-ladder`. New `benches/decompose.rs`: the same durable
+single-row transaction measured five times, each rung adding one layer —
+W0 plain row → W1 +B-tree → W2 +VECTOR(128)/IVF → W3 +edge → W4 +event (the
+full multi-model signature op) — so cost attribution is subtraction, not
+instinct. Durability-matched SQLite baselines (rusqlite, WAL,
+`synchronous=FULL`, **`fullfsync=ON`**) anchor W0/W1. Prepared statements
+throughout so parse cost is constant across rungs. Purpose: decision gate for
+the async-derivation design (`W4−W0` = the most a log-derived background
+applier could ever take off the commit path).
+
+| Config (100 rows, per-row durable txn) | ms/commit | commits/s |
+|---|---|---|
+| SQLite W0 (plain row, fullfsync=ON) | 3.58 | 280 |
+| SQLite W1 (+btree) | 3.59 | 278 |
+| unidb W0 — default (per-statement sync) | 6.85 | 146 |
+| unidb W1 (+btree) — default | 10.99 | 91 |
+| unidb W2 (+vector IVF) — default | 17.65 | 57 |
+| unidb W3 (+edge) — default | 26.95 | 37 |
+| unidb W4 (+event, full) — default | 33.14 | 30 |
+| **unidb W0 — one fsync per txn** (`set_deferred_sync` + commit `sync_up_to`) | **3.54** | **283** |
+| **unidb W4 — one fsync per txn** | **4.30** | **233** |
+
+(macOS/APFS, 8-core M-series, tempdir; criterion `--sample-size 10`;
+one F_FULLFSYNC ≈ 3.3–3.5 ms on this hardware.)
+
+**Findings (evidence, not aspiration):**
+1. **The base engine is SQLite-competitive at matched durability** — unidb W0
+   @ one-fsync (3.54 ms) == SQLite fullfsync (3.58 ms). Architecture is not the
+   bottleneck.
+2. **The multi-model tax in default mode is ~97% fsync multiplication, ~3%
+   work.** Every statement mini-txn fsyncs immediately (`wal.rs` default,
+   a pre-M1 policy), so a W4 commit pays ~10 F_FULLFSYNCs. At one fsync per
+   transaction the entire row+vector+edge+event workload costs **+0.76 ms
+   (+21%)** over a plain row insert.
+3. **Methodology catch worth recording:** Rust `File::sync_all` issues
+   `F_FULLFSYNC` on macOS (true flush-to-platter); SQLite `synchronous=FULL`
+   uses plain `fsync()`, which macOS leaves non-durable. Without
+   `PRAGMA fullfsync=ON` the SQLite baseline looks ~48–100× faster purely by
+   syncing less. Any future unidb-vs-X comparison on macOS must match this.
+
+**Decisions this gates:**
+- **Async derivation (docs discussion, 2026-07-09): PARKED.** Its maximum
+  prize is the +21% work share — below the ~30% build gate set before
+  measuring. Re-trigger: re-run this ladder at large table sizes (IVF
+  maintenance grows with scale); revisit if the work share crosses the gate.
+- **Next optimization instead: commit-time-only fsync inside user
+  transactions** — defer statement mini-txn syncs, keep the commit's existing
+  `sync_up_to` as the single durable point (machinery shipped in M9/P5.e-3;
+  today it is an all-or-nothing engine flag). Prize measured here: **W4
+  33.1 → 4.3 ms (7.7×)** with commits exactly as durable; only
+  never-promised mid-txn statement durability is given up. Needs its own
+  crash-harness proof (crash mid-txn with unsynced statement records must
+  still recover to a clean abort) before becoming the default.
+
+**Locked-decision changes:** none (D2's mini-txn bracketing untouched; this
+measures and proposes changing only *when* the WAL is fsynced within a user
+txn, which D5 permits — pages still never outrun the durable WAL).

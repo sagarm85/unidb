@@ -12,6 +12,22 @@
 
 ## Current status
 
+- **Benchmark: W0–W4 write-cost decomposition ladder — DONE (2026-07-09,
+  branch `bench-ladder`, `benches/decompose.rs`).** Verdicts (full table +
+  analysis in `PROGRESS.md`'s ladder entry): the base engine is
+  **SQLite-competitive at matched true durability** (W0 @ one-fsync 3.54 ms
+  vs SQLite fullfsync 3.58 ms); the default mode's multi-model tax is **~97%
+  fsync multiplication** (per-statement mini-txn sync → ~10 F_FULLFSYNCs per
+  W4 commit), only **+21% real work**; so the **async-derivation design is
+  PARKED** (prize below the pre-set ~30% build gate; re-trigger = re-run the
+  ladder at large table sizes where IVF maintenance grows) and the **next
+  optimization is commit-time-only fsync inside user txns** (defer statement
+  syncs to the commit's `sync_up_to` — measured 7.7× on W4, machinery already
+  shipped in M9/P5.e-3, needs a crash-harness proof of mid-txn-crash recovery
+  before becoming the default). Benchmark-fairness note that must survive: on
+  macOS always set SQLite `PRAGMA fullfsync=ON` (Rust `sync_all` issues
+  F_FULLFSYNC; plain `fsync` is not durable there — without it SQLite looks
+  ~48–100× faster purely by syncing less).
 - **Phase 6 (Operations & HA) — COMPLETE (2026-07-09), on branch `phase6-ops-ha`
   (one PR for all of P6.a–P6.g).** The roadmap's 6-phase plan is now fully
   delivered: unidb is a deployable, operable **single primary + read replicas**.
