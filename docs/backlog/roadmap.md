@@ -207,6 +207,24 @@ status, same discipline as M10.
 
 ## 8. Decision & session log (newest first)
 
+### 2026-07-10 — Durable on-disk FSM + catalog page-list shipped; index/heap write-concurrency filed
+- Shipped the durable FSM (branch `durable-fsm`, PR #29): the SQL page directory +
+  free-space map move off the catalog blob into a per-table durable `DiskBTree`
+  keyed `page_id → free_bytes` (`TableDef.fsm_meta`), O(1) open, atomic heap grow,
+  vacuum-durable reclamation — closing the O(heap-pages) `HeapFull` ceiling.
+  Crash harness 26→28 (P27/P28). B-accept: marginal SQL-insert cost goes from
+  rising-then-`HeapFull` (65→108→173 µs/row, dies ~876 pages) to flat ~17–28 µs/row
+  past 2,000 pages. `durable_fsm_catalog_pagelist.md` → SHIPPED.
+- **Concurrency finding (measured, honest):** concurrent SQL-insert throughput is
+  **flat ~1,250 commits/s at 8 writers across every table size (0 → 7,500 pages)**,
+  at Postgres parity — bounded by the group-commit fsync, *not* by the page-list
+  write the FSM removed. So the FSM makes high-scale concurrent SQL writes
+  *possible and flat* (before dies at ~876 pages) but does **not** raise the
+  per-commit ceiling. Raising it needs page/index-layer concurrency → filed
+  **`docs/backlog/index_write_concurrency.md`** (latch-coupled "crabbing" B-tree
+  descent + spread the heap insertion target across writers). The durable-throughput
+  edge remains the one-commit multi-model write, not a faster single-table commit.
+
 ### 2026-07-09 — Postgres baseline comparison shipped; two hardening items filed
 - Ran the standard-vs-standard fitness check (unidb vs PostgreSQL 18.4, both as
   shipped, both durability lenses; PR #25, `pg_baseline_comparison.md`). Verdict:
