@@ -13,7 +13,7 @@ fn bench_insert(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(rows), &rows, |b, &n| {
             b.iter(|| {
                 let dir = tempdir().unwrap();
-                let mut engine = Engine::open(dir.path(), 0).unwrap();
+                let engine = Engine::open(dir.path(), 0).unwrap();
                 for i in 0..n {
                     let payload = i.to_le_bytes();
                     let xid = engine.begin().unwrap();
@@ -30,7 +30,7 @@ fn bench_insert(c: &mut Criterion) {
 fn bench_select(c: &mut Criterion) {
     let mut group = c.benchmark_group("select_point");
     let dir = tempdir().unwrap();
-    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
     let mut rids = Vec::new();
     let setup_xid = engine.begin().unwrap();
     for i in 0u64..1_000 {
@@ -56,7 +56,7 @@ fn bench_select(c: &mut Criterion) {
 fn bench_update(c: &mut Criterion) {
     let mut group = c.benchmark_group("update");
     let dir = tempdir().unwrap();
-    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
     let setup_xid = engine.begin().unwrap();
     let mut rids: Vec<_> = (0u64..1_000)
         .map(|i| {
@@ -95,7 +95,7 @@ fn bench_update(c: &mut Criterion) {
 fn bench_contention(c: &mut Criterion) {
     let mut group = c.benchmark_group("contention");
     let dir = tempdir().unwrap();
-    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
     let setup_xid = engine.begin().unwrap();
     let mut rid = engine.insert(setup_xid, b"initial").unwrap();
     engine.commit(setup_xid).unwrap();

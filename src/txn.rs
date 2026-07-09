@@ -610,7 +610,7 @@ mod tests {
     #[test]
     fn abort_undoes_insert_and_marks_aborted() {
         let dir = tempdir().unwrap();
-        let (mut pool, mut heap, mut wal) = setup(dir.path());
+        let (pool, heap, wal) = setup(dir.path());
         let mgr = TransactionManager::new();
         let lock_mgr = LockManager::new();
         let a = mgr.begin(IsolationLevel::ReadCommitted, &wal).unwrap();
@@ -623,8 +623,7 @@ mod tests {
             },
         )
         .unwrap();
-        mgr.abort(a, &pool, &heap, &wal, &lock_mgr)
-            .unwrap();
+        mgr.abort(a, &pool, &heap, &wal, &lock_mgr).unwrap();
         assert!(!mgr.is_active(a));
         assert!(mgr.is_aborted(a));
         // A fresh snapshot after the abort must never see the row.

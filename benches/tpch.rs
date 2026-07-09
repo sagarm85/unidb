@@ -37,7 +37,7 @@ fn build(engine: &mut Engine) {
     }
     engine.commit(xid).unwrap();
 
-    let mut load = |sql: String| {
+    let load = |sql: String| {
         let xid = engine.begin().unwrap();
         engine.execute_sql(xid, &sql).unwrap();
         engine.commit(xid).unwrap();

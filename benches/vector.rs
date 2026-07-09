@@ -43,7 +43,7 @@ fn bench_vector_insert(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("without_index", rows), &rows, |b, &n| {
             b.iter(|| {
                 let dir = tempdir().unwrap();
-                let mut engine = Engine::open(dir.path(), 0).unwrap();
+                let engine = Engine::open(dir.path(), 0).unwrap();
                 let xid = engine.begin().unwrap();
                 engine
                     .execute_sql(xid, "CREATE TABLE t (id INT, embedding VECTOR(128))")
@@ -61,7 +61,7 @@ fn bench_vector_insert(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("with_index", rows), &rows, |b, &n| {
             b.iter(|| {
                 let dir = tempdir().unwrap();
-                let mut engine = Engine::open(dir.path(), 0).unwrap();
+                let engine = Engine::open(dir.path(), 0).unwrap();
                 let xid = engine.begin().unwrap();
                 engine
                     .execute_sql(xid, "CREATE TABLE t (id INT, embedding VECTOR(128))")
@@ -87,7 +87,7 @@ fn bench_vector_insert(c: &mut Criterion) {
 /// index of 300 rows.
 fn bench_near_query(c: &mut Criterion) {
     let dir = tempdir().unwrap();
-    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
     let xid = engine.begin().unwrap();
     engine
         .execute_sql(xid, "CREATE TABLE t (id INT, embedding VECTOR(128))")

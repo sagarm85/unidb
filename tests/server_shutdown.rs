@@ -94,7 +94,7 @@ async fn graceful_shutdown_drains_in_flight_requests_and_preserves_committed_dat
     // already been dropped, running `EngineHandle`'s own bounded-timeout
     // shutdown synchronously as part of that drop — so no extra wait
     // should be needed before reopening directly.
-    let mut fresh = Engine::open(dir.path(), 0).unwrap();
+    let fresh = Engine::open(dir.path(), 0).unwrap();
     let xid = fresh.begin().unwrap();
     let rows = fresh.execute_sql(xid, "SELECT * FROM t").unwrap();
     match &rows[0] {

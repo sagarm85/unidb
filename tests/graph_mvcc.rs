@@ -32,7 +32,7 @@ use unidb::Engine;
 #[test]
 fn aborted_edge_creation_never_surfaces_in_traversal() {
     let dir = tempdir().unwrap();
-    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
 
     let doomed_xid = engine.begin().unwrap();
     engine
@@ -69,7 +69,7 @@ fn aborted_edge_creation_never_surfaces_in_traversal() {
 #[test]
 fn aborted_edge_creation_never_surfaces_in_cypher_query() {
     let dir = tempdir().unwrap();
-    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
 
     let doomed_xid = engine.begin().unwrap();
     engine

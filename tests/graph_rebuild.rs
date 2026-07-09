@@ -18,7 +18,7 @@ use unidb::Engine;
 fn engine_restart_rebuilds_edge_index_and_traversal_still_works() {
     let dir = tempdir().unwrap();
     {
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine.create_edge(xid, 1, 2, "KNOWS", "{}").unwrap();
         engine.create_edge(xid, 1, 3, "LIKES", "{}").unwrap();
@@ -31,7 +31,7 @@ fn engine_restart_rebuilds_edge_index_and_traversal_still_works() {
     // is gone. Only the `__edges__` heap's committed rows survived —
     // rebuild-on-open must reconstruct the index from those alone, with
     // no transient "not ready yet" window to account for.
-    let mut engine2 = Engine::open(dir.path(), 0).unwrap();
+    let engine2 = Engine::open(dir.path(), 0).unwrap();
     let xid = engine2.begin().unwrap();
     let mut edges = engine2.edges_from(xid, 1).unwrap();
     edges.sort_by_key(|e| e.to_id);
@@ -48,7 +48,7 @@ fn engine_restart_rebuilds_edge_index_and_traversal_still_works() {
 fn engine_restart_reflects_deletes_from_before_close() {
     let dir = tempdir().unwrap();
     {
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         let row_id = engine.create_edge(xid, 1, 2, "KNOWS", "{}").unwrap();
         engine.create_edge(xid, 1, 3, "LIKES", "{}").unwrap();
@@ -60,7 +60,7 @@ fn engine_restart_reflects_deletes_from_before_close() {
         engine.flush().unwrap();
     }
 
-    let mut engine2 = Engine::open(dir.path(), 0).unwrap();
+    let engine2 = Engine::open(dir.path(), 0).unwrap();
     let xid = engine2.begin().unwrap();
     let edges = engine2.edges_from(xid, 1).unwrap();
     assert_eq!(edges.len(), 1);
@@ -71,14 +71,14 @@ fn engine_restart_reflects_deletes_from_before_close() {
 fn engine_restart_rebuild_also_serves_cypher_queries() {
     let dir = tempdir().unwrap();
     {
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine.create_edge(xid, 1, 2, "KNOWS", "{}").unwrap();
         engine.commit(xid).unwrap();
         engine.flush().unwrap();
     }
 
-    let mut engine2 = Engine::open(dir.path(), 0).unwrap();
+    let engine2 = Engine::open(dir.path(), 0).unwrap();
     let xid = engine2.begin().unwrap();
     let results = engine2
         .execute_cypher(xid, "MATCH (a)-[:KNOWS]->(b) WHERE a = 1 RETURN b")

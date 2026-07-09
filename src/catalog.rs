@@ -646,7 +646,7 @@ mod tests {
     #[test]
     fn fresh_database_has_empty_catalog() {
         let dir = tempdir().unwrap();
-        let (mut pool, _wal, _cp, control) = setup(dir.path());
+        let (pool, _wal, _cp, control) = setup(dir.path());
         let catalog = Catalog::load(&control.lock().unwrap(), &pool).unwrap();
         assert!(catalog.lookup("t").is_err());
     }
@@ -654,7 +654,7 @@ mod tests {
     #[test]
     fn create_table_then_lookup() {
         let dir = tempdir().unwrap();
-        let (mut pool, mut wal, cp, control) = setup(dir.path());
+        let (pool, wal, cp, control) = setup(dir.path());
         let mut catalog = Catalog::new();
         let def = TableDef {
             name: "accounts".to_string(),
@@ -687,7 +687,7 @@ mod tests {
     #[test]
     fn duplicate_create_table_is_rejected() {
         let dir = tempdir().unwrap();
-        let (mut pool, mut wal, cp, control) = setup(dir.path());
+        let (pool, wal, cp, control) = setup(dir.path());
         let mut catalog = Catalog::new();
         let def = || TableDef {
             name: "t".to_string(),
@@ -713,7 +713,7 @@ mod tests {
     #[test]
     fn catalog_survives_reload() {
         let dir = tempdir().unwrap();
-        let (mut pool, mut wal, cp, control) = setup(dir.path());
+        let (pool, wal, cp, control) = setup(dir.path());
         let mut catalog = Catalog::new();
         let def = TableDef {
             name: "widgets".to_string(),
@@ -762,7 +762,7 @@ mod tests {
     #[test]
     fn vector_column_and_index_kind_survive_reload() {
         let dir = tempdir().unwrap();
-        let (mut pool, mut wal, cp, control) = setup(dir.path());
+        let (pool, wal, cp, control) = setup(dir.path());
         let mut catalog = Catalog::new();
         let def = TableDef {
             name: "embeddings".to_string(),
@@ -811,7 +811,7 @@ mod tests {
     fn set_rls_policy_persists() {
         use crate::sql::logical::{CmpOp, Literal};
         let dir = tempdir().unwrap();
-        let (mut pool, mut wal, cp, control) = setup(dir.path());
+        let (pool, wal, cp, control) = setup(dir.path());
         let mut catalog = Catalog::new();
         let def = TableDef {
             name: "t".to_string(),

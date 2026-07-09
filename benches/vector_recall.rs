@@ -122,9 +122,8 @@ fn build_ivf(
     nprobe: usize,
     dir: &std::path::Path,
 ) -> (DiskIvfIndex, BufferPool, Wal, std::time::Duration) {
-    let mut pool =
-        BufferPool::open(&dir.join("data.db"), DEFAULT_PAGE_SIZE as usize, 4096).unwrap();
-    let mut wal = Wal::open(&dir.join("db.wal"), INVALID_LSN).unwrap();
+    let pool = BufferPool::open(&dir.join("data.db"), DEFAULT_PAGE_SIZE as usize, 4096).unwrap();
+    let wal = Wal::open(&dir.join("db.wal"), INVALID_LSN).unwrap();
     wal.set_deferred_sync(true); // batch fsyncs for the build (server-mode style)
 
     let dim = c.corpus[0].len();
@@ -136,12 +135,12 @@ fn build_ivf(
         nprobe,
         12,
         Metric::Euclidean,
-        &mut pool,
-        &mut wal,
+        &pool,
+        &wal,
     )
     .unwrap();
     for (i, v) in c.corpus.iter().enumerate() {
-        ivf.insert(rid(i as u32), v, &mut pool, &mut wal).unwrap();
+        ivf.insert(rid(i as u32), v, &pool, &wal).unwrap();
     }
     wal.sync().unwrap();
     let build = t.elapsed();
@@ -149,7 +148,7 @@ fn build_ivf(
 }
 
 /// Run the IVF nprobe sweep against `c` and print a recall/latency table.
-fn ivf_sweep(c: &Corpus, ivf: &DiskIvfIndex, pool: &mut BufferPool, probes: &[usize]) {
+fn ivf_sweep(c: &Corpus, ivf: &DiskIvfIndex, pool: &BufferPool, probes: &[usize]) {
     let corpus = &c.corpus;
     let lookup = |r: RowId| corpus.get(r.page_id as usize).cloned();
     println!("  {:>7}  {:>10}  {:>14}", "nprobe", "recall", "q_latency");
@@ -214,13 +213,13 @@ fn main() {
     );
 
     let dir = tempdir().unwrap();
-    let (ivf, mut pool, _wal, build) = build_ivf(&small, nlist_small, 4, dir.path());
+    let (ivf, pool, _wal, build) = build_ivf(&small, nlist_small, 4, dir.path());
     println!(
         "\nIVF-Flat (on-disk, durable postings, RAM = {} B for {nlist_small} centroids, build={:.1}ms):",
-        ivf.ram_bytes(&mut pool).unwrap(),
+        ivf.ram_bytes(&pool).unwrap(),
         build.as_secs_f64() * 1e3
     );
-    ivf_sweep(&small, &ivf, &mut pool, &[1, 4, 8, 16, 32]);
+    ivf_sweep(&small, &ivf, &pool, &[1, 4, 8, 16, 32]);
 
     // Durability check: reopen the index through a *fresh* handle over the same
     // meta page (nothing rebuilt) and confirm identical recall.
@@ -229,7 +228,7 @@ fn main() {
     let mut reopen_recall = 0.0;
     for (qi, q) in small.queries.iter().enumerate() {
         let got: Vec<u32> = reopened
-            .search(q, small.k, Some(8), &mut pool, lookup)
+            .search(q, small.k, Some(8), &pool, lookup)
             .unwrap()
             .into_iter()
             .map(|(r, _)| r.page_id)
@@ -255,13 +254,13 @@ fn main() {
         big.queries.len()
     );
     let dir2 = tempdir().unwrap();
-    let (ivf2, mut pool2, _wal2, build2) = build_ivf(&big, nlist_big, 16, dir2.path());
+    let (ivf2, pool2, _wal2, build2) = build_ivf(&big, nlist_big, 16, dir2.path());
     println!(
         "IVF-Flat (on-disk, RAM = {} B for {nlist_big} centroids, build={:.1}ms):",
-        ivf2.ram_bytes(&mut pool2).unwrap(),
+        ivf2.ram_bytes(&pool2).unwrap(),
         build2.as_secs_f64() * 1e3
     );
-    ivf_sweep(&big, &ivf2, &mut pool2, &[1, 8, 16, 32, 64]);
+    ivf_sweep(&big, &ivf2, &pool2, &[1, 8, 16, 32, 64]);
 
     println!(
         "\nTakeaway: IVF-Flat recall climbs to HNSW-competitive with modest nprobe,\n\

@@ -64,7 +64,7 @@ impl std::io::Read for BlobReader {
 #[test]
 fn store_and_stream_large_blob_roundtrips() {
     let dir = tempdir().unwrap();
-    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
     // 5 MiB ≈ 750 chunks across many heap pages — proves chunking + streaming.
     // The mechanism is identical at multi-GB; only one chunk is ever resident.
     let n = 5 * 1024 * 1024usize;
@@ -89,7 +89,7 @@ fn store_and_stream_large_blob_roundtrips() {
 #[test]
 fn large_object_is_atomic_with_transaction() {
     let dir = tempdir().unwrap();
-    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
     let n = 200 * 1024usize; // a few dozen chunks
 
     // A blob written in an aborted transaction must be invisible afterward.
@@ -125,7 +125,7 @@ fn large_object_is_atomic_with_transaction() {
 #[test]
 fn vacuum_reclaims_deleted_large_object_chunks() {
     let dir = tempdir().unwrap();
-    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
     let n = 400 * 1024usize;
 
     let xid = engine.begin().unwrap();

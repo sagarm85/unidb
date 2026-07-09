@@ -19,7 +19,7 @@ use unidb::{AutoCheckpointConfig, Engine};
 /// auto-checkpoints fired).
 fn run(n: u64, auto: Option<u64>) -> (f64, u64, u64) {
     let dir = tempdir().unwrap();
-    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
     engine.set_auto_checkpoint_config(AutoCheckpointConfig {
         enabled: auto.is_some(),
         timeout: Duration::from_secs(3600), // size-triggered only, deterministic

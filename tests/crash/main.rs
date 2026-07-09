@@ -51,7 +51,7 @@ fn open(dir: &std::path::Path) -> Engine {
 /// Insert a row (in its own committed transaction) and flush only the WAL
 /// (page stays dirty — simulates P1/P3).
 fn insert_wal_only(dir: &std::path::Path, data: &[u8]) -> RowId {
-    let mut engine = open(dir);
+    let engine = open(dir);
     let xid = engine.begin().unwrap();
     let rid = engine.insert(xid, data).unwrap();
     engine.commit(xid).unwrap();
@@ -63,7 +63,7 @@ fn insert_wal_only(dir: &std::path::Path, data: &[u8]) -> RowId {
 
 #[allow(dead_code)]
 fn insert_full_flush(dir: &std::path::Path, data: &[u8]) -> RowId {
-    let mut engine = open(dir);
+    let engine = open(dir);
     let xid = engine.begin().unwrap();
     let rid = engine.insert(xid, data).unwrap();
     engine.commit(xid).unwrap();
@@ -80,7 +80,7 @@ fn p1_wal_durable_page_not_flushed() {
     let rid = insert_wal_only(dir.path(), b"p1_data");
 
     // Recovery: redo the committed insert → row must exist.
-    let mut engine = open(dir.path());
+    let engine = open(dir.path());
     let xid = engine.begin().unwrap();
     let result = engine.get(xid, rid);
     // After redo, page content is recovered from WAL.
@@ -101,7 +101,7 @@ fn p2_mid_checkpoint_pages_flushed_no_ckpt_record() {
     // record — simulated by flushing pages manually then dropping without
     // calling checkpoint().
     let rid = {
-        let mut engine = open(dir.path());
+        let engine = open(dir.path());
         let xid = engine.begin().unwrap();
         let rid = engine.insert(xid, b"p2_data").unwrap();
         engine.commit(xid).unwrap();
@@ -111,7 +111,7 @@ fn p2_mid_checkpoint_pages_flushed_no_ckpt_record() {
         rid
     };
 
-    let mut engine = open(dir.path());
+    let engine = open(dir.path());
     let xid = engine.begin().unwrap();
     let result = engine.get(xid, rid);
     assert!(result.is_ok(), "P2: row must survive; got {:?}", result);
@@ -167,7 +167,7 @@ fn p4_wal_truncation_interrupted() {
     let dir = tempdir().unwrap();
 
     let rid = {
-        let mut engine = open(dir.path());
+        let engine = open(dir.path());
         let xid = engine.begin().unwrap();
         let rid = engine.insert(xid, b"p4_data").unwrap();
         engine.commit(xid).unwrap();
@@ -178,7 +178,7 @@ fn p4_wal_truncation_interrupted() {
     };
 
     // Reopen: WAL may be empty after truncation. Data should come from page.
-    let mut engine = open(dir.path());
+    let engine = open(dir.path());
     let xid = engine.begin().unwrap();
     let result = engine.get(xid, rid);
     assert!(
@@ -198,7 +198,7 @@ fn p5_after_commit_fsync() {
     let dir = tempdir().unwrap();
     let rid = insert_wal_only(dir.path(), b"p5_data");
 
-    let mut engine = open(dir.path());
+    let engine = open(dir.path());
     let xid = engine.begin().unwrap();
     let result = engine.get(xid, rid);
     assert!(
@@ -215,7 +215,7 @@ fn p5_after_commit_fsync() {
 fn p6_incomplete_user_txn_leaves_no_trace() {
     let dir = tempdir().unwrap();
     let (r1, r2) = {
-        let mut engine = open(dir.path());
+        let engine = open(dir.path());
         let xid = engine.begin().unwrap();
         let r1 = engine.insert(xid, b"p6_row1").unwrap();
         let r2 = engine.insert(xid, b"p6_row2").unwrap();
@@ -227,7 +227,7 @@ fn p6_incomplete_user_txn_leaves_no_trace() {
         (r1, r2)
     };
 
-    let mut engine = open(dir.path());
+    let engine = open(dir.path());
     let xid2 = engine.begin().unwrap();
     assert!(
         engine.get(xid2, r1).is_err(),
@@ -245,7 +245,7 @@ fn p6_incomplete_user_txn_leaves_no_trace() {
 fn p7_committed_user_txn_survives_without_page_flush() {
     let dir = tempdir().unwrap();
     let (r1, r2) = {
-        let mut engine = open(dir.path());
+        let engine = open(dir.path());
         let xid = engine.begin().unwrap();
         let r1 = engine.insert(xid, b"p7_row1").unwrap();
         let r2 = engine.insert(xid, b"p7_row2").unwrap();
@@ -255,7 +255,7 @@ fn p7_committed_user_txn_survives_without_page_flush() {
         (r1, r2)
     };
 
-    let mut engine = open(dir.path());
+    let engine = open(dir.path());
     let xid2 = engine.begin().unwrap();
     assert_eq!(
         engine.get(xid2, r1).unwrap(),
@@ -438,8 +438,8 @@ fn p11_torn_page_restored_from_full_page_image() {
     let page_size = DEFAULT_PAGE_SIZE as usize;
 
     let (r1, r2) = {
-        let mut pool = BufferPool::open(&data_p, page_size, 64).unwrap();
-        let mut wal = Wal::open(&wal_p, INVALID_LSN).unwrap();
+        let pool = BufferPool::open(&data_p, page_size, 64).unwrap();
+        let wal = Wal::open(&wal_p, INVALID_LSN).unwrap();
         let heap = Heap::new(page_size);
 
         // R1 committed, its page flushed to disk, then a checkpoint: the page
@@ -592,7 +592,7 @@ fn p12_fsync_failure_refuses_to_report_success() {
 fn incomplete_user_txn_leaves_no_trace_across_two_tables() {
     let dir = tempdir().unwrap();
     {
-        let mut engine = open(dir.path());
+        let engine = open(dir.path());
         let xid = engine.begin().unwrap();
         engine.execute_sql(xid, "CREATE TABLE t (id INT)").unwrap();
         engine.commit(xid).unwrap();
@@ -608,7 +608,7 @@ fn incomplete_user_txn_leaves_no_trace_across_two_tables() {
         drop(engine); // "crash"
     }
 
-    let mut engine = open(dir.path());
+    let engine = open(dir.path());
     let xid = engine.begin().unwrap();
     let rows = engine.execute_sql(xid, "SELECT * FROM t").unwrap();
     match &rows[0] {
@@ -632,7 +632,7 @@ fn committed_rows_survive_after_reopen() {
     let dir = tempdir().unwrap();
     let mut rids = Vec::new();
     {
-        let mut engine = open(dir.path());
+        let engine = open(dir.path());
         let xid = engine.begin().unwrap();
         for i in 0u32..50 {
             let data = i.to_le_bytes();
@@ -642,7 +642,7 @@ fn committed_rows_survive_after_reopen() {
         engine.commit(xid).unwrap();
         engine.flush().unwrap();
     }
-    let mut engine = open(dir.path());
+    let engine = open(dir.path());
     let xid = engine.begin().unwrap();
     for (rid, expected) in &rids {
         let data = engine.get(xid, *rid).unwrap();
@@ -690,7 +690,7 @@ fn run_property_case(seed: u64) {
     let mut rejected: Vec<RowId> = Vec::new();
 
     {
-        let mut engine = open(dir.path());
+        let engine = open(dir.path());
         let num_txns = 5 + rng.next_range(5) as usize; // 5..=9
         let crash_after = rng.next_range(num_txns as u64) as usize;
 
@@ -732,7 +732,7 @@ fn run_property_case(seed: u64) {
         // from the WAL, not just read already-flushed pages.
     }
 
-    let mut engine = open(dir.path());
+    let engine = open(dir.path());
     let xid = engine.begin().unwrap();
     for (rid, expected) in &committed {
         let data = engine
@@ -770,7 +770,7 @@ fn property_crash_recovery_reflects_only_committed_transactions() {
 fn p14_durable_fulltext_survives_crash_and_is_searchable_on_reopen() {
     let dir = tempdir().unwrap();
     {
-        let mut engine = open(dir.path());
+        let engine = open(dir.path());
         let xid = engine.begin().unwrap();
         engine
             .execute_sql(xid, "CREATE TABLE docs (id INT, body TEXT)")
@@ -796,7 +796,7 @@ fn p14_durable_fulltext_survives_crash_and_is_searchable_on_reopen() {
         drop(engine);
     }
 
-    let mut engine = open(dir.path());
+    let engine = open(dir.path());
     let xid = engine.begin().unwrap();
     let rust_hits = engine.search_fulltext(xid, "docs", "body", "rust").unwrap();
     assert_eq!(
@@ -828,7 +828,7 @@ fn p15_durable_edge_index_survives_crash_and_traversal_works_on_reopen() {
     let dir = tempdir().unwrap();
     let hub = 100i64;
     {
-        let mut engine = open(dir.path());
+        let engine = open(dir.path());
         let xid = engine.begin().unwrap();
         for to in 0..5i64 {
             engine.create_edge(xid, hub, to, "LINKS", "{}").unwrap();
@@ -837,7 +837,7 @@ fn p15_durable_edge_index_survives_crash_and_traversal_works_on_reopen() {
         drop(engine); // "crash" — no checkpoint
     }
 
-    let mut engine = open(dir.path());
+    let engine = open(dir.path());
     let xid = engine.begin().unwrap();
     let edges = engine.edges_from(xid, hub).unwrap();
     assert_eq!(
@@ -880,7 +880,7 @@ fn p16_large_object_survives_crash_and_streams_back_intact() {
     }
 
     let lob_id = {
-        let mut engine = open(dir.path());
+        let engine = open(dir.path());
         let xid = engine.begin().unwrap();
         let id = engine
             .put_large_object(
@@ -897,7 +897,7 @@ fn p16_large_object_survives_crash_and_streams_back_intact() {
         id
     };
 
-    let mut engine = open(dir.path());
+    let engine = open(dir.path());
     let xid = engine.begin().unwrap();
     let mut out: Vec<u8> = Vec::new();
     let written = engine.read_large_object(xid, lob_id, &mut out).unwrap();
@@ -940,15 +940,15 @@ fn p13_durable_btree_recovered_from_wal_after_total_data_loss() {
     let n = 150i64;
 
     let meta = {
-        let mut pool = BufferPool::open(&data_p, page_size, 64).unwrap();
-        let mut wal = Wal::open(&wal_p, INVALID_LSN).unwrap();
-        let tree = DiskBTree::create(&mut pool, &mut wal).unwrap();
+        let pool = BufferPool::open(&data_p, page_size, 64).unwrap();
+        let wal = Wal::open(&wal_p, INVALID_LSN).unwrap();
+        let tree = DiskBTree::create(&pool, &wal).unwrap();
         for i in 0..n {
             let rid = RowId {
                 page_id: i as u32,
                 slot: 0,
             };
-            tree.insert(key(i), rid, &mut pool, &mut wal).unwrap();
+            tree.insert(key(i), rid, &pool, &wal).unwrap();
         }
         // Sanity: the tree really did grow past a single leaf (a split happened).
         assert!(
@@ -969,11 +969,11 @@ fn p13_durable_btree_recovered_from_wal_after_total_data_loss() {
 
     // Precondition: with the data file gone, the tree is unreadable.
     {
-        let mut pool = BufferPool::open(&data_p, page_size, 64).unwrap();
+        let pool = BufferPool::open(&data_p, page_size, 64).unwrap();
         let tree = DiskBTree::new(meta, page_size);
         assert!(
-            tree.search_eq(&key(0), &mut pool).is_err()
-                || tree.search_eq(&key(0), &mut pool).unwrap().is_empty(),
+            tree.search_eq(&key(0), &pool).is_err()
+                || tree.search_eq(&key(0), &pool).unwrap().is_empty(),
             "P13: precondition — a wiped data file must not resolve any key"
         );
     }
@@ -986,10 +986,10 @@ fn p13_durable_btree_recovered_from_wal_after_total_data_loss() {
     );
 
     // Every committed key is findable again, from the WAL-reconstructed tree.
-    let mut pool = BufferPool::open(&data_p, page_size, 64).unwrap();
+    let pool = BufferPool::open(&data_p, page_size, 64).unwrap();
     let tree = DiskBTree::new(meta, page_size);
     for i in 0..n {
-        let got = tree.search_eq(&key(i), &mut pool).unwrap();
+        let got = tree.search_eq(&key(i), &pool).unwrap();
         assert_eq!(
             got,
             vec![RowId {
@@ -1019,7 +1019,7 @@ fn p17_durable_vector_index_survives_crash_recall_intact() {
     // (nlist ≈ √120) — this exercises crash recovery of the persisted centroid
     // table + multiple cell posting lists, not just a single origin cell.
     {
-        let mut engine = open(dir.path());
+        let engine = open(dir.path());
         let xid = engine.begin().unwrap();
         engine
             .execute_sql(xid, "CREATE TABLE t (id INT, embedding VECTOR(2))")

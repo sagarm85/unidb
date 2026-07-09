@@ -321,13 +321,7 @@ impl DiskIvfIndex {
 
     /// Insert `(rid, vector)`: assign to the nearest cell and record it in the
     /// durable posting-list tree (one WAL mini-txn).
-    pub fn insert(
-        &self,
-        rid: RowId,
-        vector: &[f32],
-        pool: &BufferPool,
-        wal: &Wal,
-    ) -> Result<()> {
+    pub fn insert(&self, rid: RowId, vector: &[f32], pool: &BufferPool, wal: &Wal) -> Result<()> {
         let hdr = self.load_header(pool)?;
         let centroids = self.load_centroids(&hdr, pool)?;
         let cell = nearest_centroid(&centroids, hdr.metric, vector);
@@ -341,13 +335,7 @@ impl DiskIvfIndex {
 
     /// Remove `(rid, vector)` from its cell's posting list (used by vacuum's
     /// aliasing gate so a reused slot can't surface a stale candidate).
-    pub fn remove(
-        &self,
-        rid: RowId,
-        vector: &[f32],
-        pool: &BufferPool,
-        wal: &Wal,
-    ) -> Result<()> {
+    pub fn remove(&self, rid: RowId, vector: &[f32], pool: &BufferPool, wal: &Wal) -> Result<()> {
         let hdr = self.load_header(pool)?;
         let centroids = self.load_centroids(&hdr, pool)?;
         let cell = nearest_centroid(&centroids, hdr.metric, vector);
@@ -506,9 +494,9 @@ mod tests {
     #[test]
     fn ivf_finds_nearest_on_separated_clusters() {
         let dir = tempdir().unwrap();
-        let mut pool =
+        let pool =
             BufferPool::open(&dir.path().join("data.db"), DEFAULT_PAGE_SIZE as usize, 256).unwrap();
-        let mut wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
+        let wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
 
         let centers = [[0.0, 0.0], [100.0, 0.0], [0.0, 100.0], [100.0, 100.0]];
         let mut vectors: HashMap<RowId, Vec<f32>> = HashMap::new();
@@ -526,8 +514,7 @@ mod tests {
         }
 
         let ivf =
-            DiskIvfIndex::create(2, &sample, 4, 2, 10, Metric::Euclidean, &pool, &wal)
-                .unwrap();
+            DiskIvfIndex::create(2, &sample, 4, 2, 10, Metric::Euclidean, &pool, &wal).unwrap();
         for (r, v) in &vectors {
             ivf.insert(*r, v, &pool, &wal).unwrap();
         }
@@ -550,13 +537,12 @@ mod tests {
     #[test]
     fn ram_footprint_is_bounded_by_nlist_not_corpus() {
         let dir = tempdir().unwrap();
-        let mut pool =
+        let pool =
             BufferPool::open(&dir.path().join("data.db"), DEFAULT_PAGE_SIZE as usize, 256).unwrap();
-        let mut wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
+        let wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
         let sample: Vec<Vec<f32>> = (0..1000).map(|i| vec![i as f32, (i * 2) as f32]).collect();
         let ivf =
-            DiskIvfIndex::create(2, &sample, 16, 4, 5, Metric::Euclidean, &pool, &wal)
-                .unwrap();
+            DiskIvfIndex::create(2, &sample, 16, 4, 5, Metric::Euclidean, &pool, &wal).unwrap();
         assert_eq!(ivf.ram_bytes(&pool).unwrap(), 16 * 2 * 4);
         assert_eq!(ivf.load_header(&pool).unwrap().nlist, 16);
     }
@@ -566,16 +552,15 @@ mod tests {
     #[test]
     fn reopen_by_meta_page_preserves_search() {
         let dir = tempdir().unwrap();
-        let mut pool =
+        let pool =
             BufferPool::open(&dir.path().join("data.db"), DEFAULT_PAGE_SIZE as usize, 256).unwrap();
-        let mut wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
+        let wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
 
         let sample: Vec<Vec<f32>> = (0..200).map(|i| vec![i as f32, -(i as f32)]).collect();
         let mut vectors: HashMap<RowId, Vec<f32>> = HashMap::new();
         let meta = {
             let ivf =
-                DiskIvfIndex::create(2, &sample, 8, 4, 8, Metric::Euclidean, &pool, &wal)
-                    .unwrap();
+                DiskIvfIndex::create(2, &sample, 8, 4, 8, Metric::Euclidean, &pool, &wal).unwrap();
             for (i, v) in sample.iter().enumerate() {
                 let r = rid(i as u32);
                 vectors.insert(r, v.clone());
@@ -600,12 +585,11 @@ mod tests {
     #[test]
     fn empty_table_index_is_flat_but_correct() {
         let dir = tempdir().unwrap();
-        let mut pool =
+        let pool =
             BufferPool::open(&dir.path().join("data.db"), DEFAULT_PAGE_SIZE as usize, 256).unwrap();
-        let mut wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
+        let wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
 
-        let ivf =
-            DiskIvfIndex::create(2, &[], 16, 8, 5, Metric::Euclidean, &pool, &wal).unwrap();
+        let ivf = DiskIvfIndex::create(2, &[], 16, 8, 5, Metric::Euclidean, &pool, &wal).unwrap();
         assert_eq!(ivf.load_header(&pool).unwrap().nlist, 1);
 
         let mut vectors: HashMap<RowId, Vec<f32>> = HashMap::new();
@@ -615,9 +599,7 @@ mod tests {
             ivf.insert(rid(i), &v, &pool, &wal).unwrap();
         }
         let results = ivf
-            .search(&[0.0, 0.0], 3, None, &pool, |r| {
-                vectors.get(&r).cloned()
-            })
+            .search(&[0.0, 0.0], 3, None, &pool, |r| vectors.get(&r).cloned())
             .unwrap();
         let ids: Vec<u32> = results.iter().map(|(r, _)| r.page_id).collect();
         assert_eq!(ids, vec![0, 1, 2]);
@@ -627,13 +609,13 @@ mod tests {
     #[test]
     fn remove_drops_candidate() {
         let dir = tempdir().unwrap();
-        let mut pool =
+        let pool =
             BufferPool::open(&dir.path().join("data.db"), DEFAULT_PAGE_SIZE as usize, 256).unwrap();
-        let mut wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
+        let wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
 
         let sample: Vec<Vec<f32>> = (0..40).map(|i| vec![i as f32, i as f32]).collect();
-        let ivf = DiskIvfIndex::create(2, &sample, 4, 4, 5, Metric::Euclidean, &pool, &wal)
-            .unwrap();
+        let ivf =
+            DiskIvfIndex::create(2, &sample, 4, 4, 5, Metric::Euclidean, &pool, &wal).unwrap();
         let mut vectors: HashMap<RowId, Vec<f32>> = HashMap::new();
         for (i, v) in sample.iter().enumerate() {
             vectors.insert(rid(i as u32), v.clone());

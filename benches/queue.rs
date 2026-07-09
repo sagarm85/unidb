@@ -99,7 +99,7 @@ fn bench_vacuum_events_cost(c: &mut Criterion) {
                     engine.commit(ack_xid).unwrap();
                     (dir, engine)
                 },
-                |(dir, mut engine)| {
+                |(dir, engine)| {
                     let xid = engine.begin().unwrap();
                     let reclaimed = engine.vacuum_events(xid).unwrap();
                     engine.commit(xid).unwrap();

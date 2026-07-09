@@ -25,7 +25,7 @@ use unidb::Engine;
 /// Returns the resulting `data.db` size in bytes.
 fn churn_file_size(keys: u64, rounds: u64, vacuum_each: bool) -> u64 {
     let dir = tempdir().unwrap();
-    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
     let mut rids = Vec::new();
     let x = engine.begin().unwrap();
     for i in 0..keys {
@@ -57,7 +57,7 @@ fn churn_file_size(keys: u64, rounds: u64, vacuum_each: bool) -> u64 {
 /// RowIds, so the caller can time a single `vacuum()` over the full backlog.
 fn churned_engine(keys: u64, rounds: u64) -> (tempfile::TempDir, Engine) {
     let dir = tempdir().unwrap();
-    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
     let mut rids = Vec::new();
     let x = engine.begin().unwrap();
     for i in 0..keys {
@@ -84,7 +84,7 @@ fn bench_vacuum(c: &mut Criterion) {
         let rounds = 30u64;
         let grows = churn_file_size(keys, rounds, false);
         let bounded = churn_file_size(keys, rounds, true);
-        let (_dir, mut engine) = churned_engine(keys, rounds);
+        let (_dir, engine) = churned_engine(keys, rounds);
         let t0 = std::time::Instant::now();
         let report = engine.vacuum().unwrap();
         let elapsed = t0.elapsed();
@@ -111,7 +111,7 @@ fn bench_vacuum(c: &mut Criterion) {
         |b, &(keys, rounds)| {
             b.iter_batched(
                 || churned_engine(keys, rounds),
-                |(dir, mut engine)| {
+                |(dir, engine)| {
                     engine.vacuum().unwrap();
                     (dir, engine)
                 },

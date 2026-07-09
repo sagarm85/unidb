@@ -8,7 +8,7 @@ use unidb::{Engine, SqlResult};
 
 fn run_unidb(setup: &[&str], query: &str) -> Vec<Vec<String>> {
     let dir = tempfile::tempdir().unwrap();
-    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
     let xid = engine.begin().unwrap();
     for stmt in setup {
         engine.execute_sql(xid, stmt).unwrap();

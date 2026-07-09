@@ -13,7 +13,7 @@ use unidb::{DbError, Engine};
 #[test]
 fn concurrent_edge_delete_conflicts_via_existing_lock_manager() {
     let dir = tempdir().unwrap();
-    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
     let setup_xid = engine.begin().unwrap();
     let row_id = engine.create_edge(setup_xid, 1, 2, "KNOWS", "{}").unwrap();
     engine.commit(setup_xid).unwrap();
@@ -40,7 +40,7 @@ fn concurrent_edge_delete_conflicts_via_existing_lock_manager() {
 #[test]
 fn edge_lock_and_unrelated_row_lock_do_not_collide() {
     let dir = tempdir().unwrap();
-    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
     let setup_xid = engine.begin().unwrap();
     engine
         .execute_sql(setup_xid, "CREATE TABLE t (id INT)")
@@ -65,7 +65,7 @@ fn edge_lock_and_unrelated_row_lock_do_not_collide() {
 #[test]
 fn edge_lock_releases_on_commit_and_next_writer_proceeds() {
     let dir = tempdir().unwrap();
-    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
     let setup_xid = engine.begin().unwrap();
     let row_id = engine.create_edge(setup_xid, 1, 2, "KNOWS", "{}").unwrap();
     engine.commit(setup_xid).unwrap();
@@ -94,7 +94,7 @@ fn edge_lock_releases_on_commit_and_next_writer_proceeds() {
 #[test]
 fn edge_lock_releases_on_abort_and_next_writer_proceeds() {
     let dir = tempdir().unwrap();
-    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
     let setup_xid = engine.begin().unwrap();
     let row_id = engine.create_edge(setup_xid, 1, 2, "KNOWS", "{}").unwrap();
     engine.commit(setup_xid).unwrap();

@@ -9,7 +9,7 @@ use unidb::{Engine, SqlResult};
 
 fn run_unidb(setup: &[&str], extra: &[&str], analyze: &[&str], query: &str) -> Vec<Vec<String>> {
     let dir = tempfile::tempdir().unwrap();
-    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
     let xid = engine.begin().unwrap();
     for stmt in setup.iter().chain(extra.iter()) {
         engine.execute_sql(xid, stmt).unwrap();
@@ -177,7 +177,7 @@ fn stats_survive_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let setup = star_setup();
     {
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         for stmt in &setup {
             engine.execute_sql(xid, stmt).unwrap();
@@ -189,7 +189,7 @@ fn stats_survive_reopen() {
         engine.commit(xid).unwrap();
     }
     // Reopen — no re-ANALYZE.
-    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
     let xid = engine.begin().unwrap();
     let results = engine
         .execute_sql(

@@ -18,7 +18,7 @@ type Published = Arc<Mutex<Vec<(RowId, Vec<u8>)>>>;
 #[test]
 fn concurrent_readers_see_consistent_committed_rows_while_writer_inserts() {
     let dir = tempfile::tempdir().unwrap();
-    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
 
     let committed: Published = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
@@ -75,7 +75,7 @@ fn concurrent_readers_see_consistent_committed_rows_while_writer_inserts() {
 #[test]
 fn concurrent_sql_select_sees_consistent_rows_while_writer_inserts() {
     let dir = tempfile::tempdir().unwrap();
-    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
     {
         let xid = engine.begin().unwrap();
         engine

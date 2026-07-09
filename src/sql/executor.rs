@@ -2246,7 +2246,7 @@ mod tests {
         );
 
         // Reopen: reconstruct catalog + pool from what was persisted.
-        let mut pool =
+        let pool =
             BufferPool::open(&dir.path().join("data.db"), DEFAULT_PAGE_SIZE as usize, 64).unwrap();
         let control = crate::control::read(&dir.path().join("control")).unwrap();
         let catalog = Catalog::load(&control, &pool).unwrap();
@@ -2627,7 +2627,7 @@ mod tests {
             h.pool.flush_all(h.wal.durable_lsn()).unwrap();
         }
 
-        let mut pool =
+        let pool =
             BufferPool::open(&dir.path().join("data.db"), DEFAULT_PAGE_SIZE as usize, 64).unwrap();
         let control = crate::control::read(&dir.path().join("control")).unwrap();
         let catalog = Catalog::load(&control, &pool).unwrap();

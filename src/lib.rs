@@ -269,7 +269,9 @@ fn ctrl_lock(c: &Mutex<ControlData>) -> std::sync::MutexGuard<'_, ControlData> {
 }
 
 /// Poison-tolerant lock of the auto-checkpoint policy `Mutex` (P5.e).
-fn ctrl_lock_ac(m: &Mutex<AutoCheckpointConfig>) -> std::sync::MutexGuard<'_, AutoCheckpointConfig> {
+fn ctrl_lock_ac(
+    m: &Mutex<AutoCheckpointConfig>,
+) -> std::sync::MutexGuard<'_, AutoCheckpointConfig> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -378,22 +380,10 @@ impl Engine {
             &control,
             page_size_usize,
         )?;
-        let next_lob_id = derive_next_lob_id(
-            &catalog,
-            &txn_mgr,
-            &pool,
-            &wal,
-            &lock_mgr,
-            page_size_usize,
-        )?;
-        let next_event_seq = derive_next_event_seq(
-            &catalog,
-            &txn_mgr,
-            &pool,
-            &wal,
-            &lock_mgr,
-            page_size_usize,
-        )?;
+        let next_lob_id =
+            derive_next_lob_id(&catalog, &txn_mgr, &pool, &wal, &lock_mgr, page_size_usize)?;
+        let next_event_seq =
+            derive_next_event_seq(&catalog, &txn_mgr, &pool, &wal, &lock_mgr, page_size_usize)?;
 
         // Phase 3: every secondary index is durable and crash-recovered — the
         // B-Tree/full-text/edge indexes as `DiskBTree`s (P3.a/P3.b), the vector
@@ -673,12 +663,7 @@ impl Engine {
     /// `__events__`'s total row count, not with consumer lag or `limit`
     /// (see queue/mod.rs's module doc and `Engine::vacuum_events`, M4.c,
     /// which is the actual lever for this cost).
-    pub fn poll_events(
-        &self,
-        xid: Xid,
-        consumer: &str,
-        limit: usize,
-    ) -> Result<Vec<queue::Event>> {
+    pub fn poll_events(&self, xid: Xid, consumer: &str, limit: usize) -> Result<Vec<queue::Event>> {
         let page_size = self.page_size;
         let events_def = cat_read(&self.catalog).lookup(EVENTS_TABLE)?.clone();
         let consumers_def = cat_read(&self.catalog).lookup(CONSUMERS_TABLE)?.clone();
@@ -733,8 +718,7 @@ impl Engine {
         let consumers_def = cat_read(&self.catalog).lookup(CONSUMERS_TABLE)?.clone();
         let heap = Heap::from_pages(page_size, consumers_def.pages.clone());
         let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
-        let existing =
-            queue::find_consumer_offset(&heap, &snapshot, xid, &self.pool, consumer)?;
+        let existing = queue::find_consumer_offset(&heap, &snapshot, xid, &self.pool, consumer)?;
 
         let encoded = executor::encode_row(&queue::consumer_row(consumer, up_to_seq));
         match existing {
@@ -1261,13 +1245,8 @@ impl Engine {
     /// Abort `xid`, physically undoing its writes and releasing every lock
     /// it held. `xid` is finished after this call and must not be reused.
     pub fn abort(&self, xid: Xid) -> Result<()> {
-        self.txn_mgr.abort(
-            xid,
-            &self.pool,
-            &self.heap,
-            &self.wal,
-            &self.lock_mgr,
-        )
+        self.txn_mgr
+            .abort(xid, &self.pool, &self.heap, &self.wal, &self.lock_mgr)
     }
 
     /// Insert one untyped byte-slice row, the lowest-level write primitive
@@ -1677,7 +1656,7 @@ mod tests {
     #[test]
     fn open_insert_get_roundtrip() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         let rid = engine.insert(xid, b"hello world").unwrap();
         let data = engine.get(xid, rid).unwrap();
@@ -1688,7 +1667,7 @@ mod tests {
     #[test]
     fn update_and_verify() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         let rid = engine.insert(xid, b"initial_value").unwrap();
         let new_rid = engine.update(xid, rid, b"updated").unwrap();
@@ -1699,7 +1678,7 @@ mod tests {
     #[test]
     fn delete_makes_row_gone() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         let rid = engine.insert(xid, b"transient").unwrap();
         engine.delete(xid, rid).unwrap();
@@ -1711,14 +1690,14 @@ mod tests {
     fn reopen_after_flush_recovers_data() {
         let dir = tempdir().unwrap();
         let rid = {
-            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let engine = Engine::open(dir.path(), 0).unwrap();
             let xid = engine.begin().unwrap();
             let rid = engine.insert(xid, b"durable").unwrap();
             engine.commit(xid).unwrap();
             engine.flush().unwrap();
             rid
         };
-        let mut engine2 = Engine::open(dir.path(), 0).unwrap();
+        let engine2 = Engine::open(dir.path(), 0).unwrap();
         let xid2 = engine2.begin().unwrap();
         assert_eq!(engine2.get(xid2, rid).unwrap(), b"durable");
     }
@@ -1726,7 +1705,7 @@ mod tests {
     #[test]
     fn read_committed_sees_other_txns_committed_write() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let a = engine.begin().unwrap();
         let rid = engine.insert(a, b"v1").unwrap();
         engine.commit(a).unwrap();
@@ -1739,7 +1718,7 @@ mod tests {
     #[test]
     fn repeatable_read_does_not_see_write_committed_after_begin() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let a = engine.begin().unwrap();
         let rid = engine.insert(a, b"v1").unwrap();
         engine.commit(a).unwrap();
@@ -1769,7 +1748,7 @@ mod tests {
     #[test]
     fn rollback_undoes_insert() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let a = engine.begin().unwrap();
         let rid = engine.insert(a, b"oops").unwrap();
         engine.abort(a).unwrap();
@@ -1782,14 +1761,14 @@ mod tests {
     fn xid_counter_survives_reopen() {
         let dir = tempdir().unwrap();
         let first_xid = {
-            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let engine = Engine::open(dir.path(), 0).unwrap();
             let xid = engine.begin().unwrap();
             engine.insert(xid, b"row").unwrap();
             engine.commit(xid).unwrap();
             engine.flush().unwrap();
             xid
         };
-        let mut engine2 = Engine::open(dir.path(), 0).unwrap();
+        let engine2 = Engine::open(dir.path(), 0).unwrap();
         let next_xid = engine2.begin().unwrap();
         assert!(next_xid > first_xid, "reopened engine must not reuse xids");
     }
@@ -1809,7 +1788,7 @@ mod tests {
     fn xid_counter_survives_reopen_after_checkpoint() {
         let dir = tempdir().unwrap();
         let last_xid_before_checkpoint = {
-            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let engine = Engine::open(dir.path(), 0).unwrap();
             let mut last = 0;
             for i in 0..5u32 {
                 let xid = engine.begin().unwrap();
@@ -1823,7 +1802,7 @@ mod tests {
             last
         };
 
-        let mut engine2 = Engine::open(dir.path(), 0).unwrap();
+        let engine2 = Engine::open(dir.path(), 0).unwrap();
         let resumed_xid = engine2.begin().unwrap();
         assert!(
             resumed_xid > last_xid_before_checkpoint,
@@ -1837,7 +1816,7 @@ mod tests {
     #[test]
     fn concurrent_update_aborts_second_writer_immediately() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let setup_xid = engine.begin().unwrap();
         let rid = engine.insert(setup_xid, b"row").unwrap();
         engine.commit(setup_xid).unwrap();
@@ -1870,7 +1849,7 @@ mod tests {
     #[test]
     fn commit_releases_lock_for_next_writer() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let setup_xid = engine.begin().unwrap();
         let rid = engine.insert(setup_xid, b"row").unwrap();
         engine.commit(setup_xid).unwrap();
@@ -1889,7 +1868,7 @@ mod tests {
     #[test]
     fn abort_releases_lock_for_next_writer() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let setup_xid = engine.begin().unwrap();
         let rid = engine.insert(setup_xid, b"row").unwrap();
         engine.commit(setup_xid).unwrap();
@@ -1913,7 +1892,7 @@ mod tests {
     #[test]
     fn execute_sql_full_round_trip() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
 
         let xid = engine.begin().unwrap();
         engine
@@ -1972,7 +1951,7 @@ mod tests {
         // second statement fails must leave the schema untouched — the catalog
         // change is rolled back even though the catalog persists eagerly.
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         let res = engine.execute_sql(
             xid,
@@ -2002,7 +1981,7 @@ mod tests {
         // P2.c: schema changes persist across an engine reopen.
         let dir = tempdir().unwrap();
         {
-            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let engine = Engine::open(dir.path(), 0).unwrap();
             let xid = engine.begin().unwrap();
             engine
                 .execute_sql(xid, "CREATE TABLE t (a INT, b INT)")
@@ -2019,7 +1998,7 @@ mod tests {
             engine.commit(xid).unwrap();
             engine.checkpoint().unwrap();
         }
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         let rows = engine.execute_sql(xid, "SELECT a, c FROM t").unwrap();
         match &rows[0] {
@@ -2045,7 +2024,7 @@ mod tests {
         // past the last-handed-out value, never reusing an id.
         let dir = tempdir().unwrap();
         {
-            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let engine = Engine::open(dir.path(), 0).unwrap();
             let xid = engine.begin().unwrap();
             engine
                 .execute_sql(xid, "CREATE TABLE t (id SERIAL, v INT)")
@@ -2059,7 +2038,7 @@ mod tests {
             engine.commit(xid).unwrap();
             engine.checkpoint().unwrap();
         }
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine
             .execute_sql(xid, "INSERT INTO t (v) VALUES (30)")
@@ -2083,7 +2062,7 @@ mod tests {
         // P2.e: a bound value that would be catastrophic as an interpolated
         // string literal is treated purely as data — no SQL is re-parsed.
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine
             .execute_sql(xid, "CREATE TABLE t (id INT, name TEXT)")
@@ -2131,7 +2110,7 @@ mod tests {
     #[test]
     fn bind_params_out_of_range_errors() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine.execute_sql(xid, "CREATE TABLE t (id INT)").unwrap();
         // `$2` referenced but only one value supplied.
@@ -2144,7 +2123,7 @@ mod tests {
     fn prepared_plan_reused_across_executions() {
         // P2.e: parse once, execute many with different bind values.
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine
             .execute_sql(xid, "CREATE TABLE t (id INT, name TEXT)")
@@ -2179,7 +2158,7 @@ mod tests {
     #[test]
     fn execute_sql_vector_round_trip() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
 
         let xid = engine.begin().unwrap();
         engine
@@ -2211,7 +2190,7 @@ mod tests {
     #[test]
     fn execute_sql_vector_dimension_mismatch_rejected() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
 
         let xid = engine.begin().unwrap();
         engine
@@ -2274,7 +2253,7 @@ mod tests {
         // from disk — and NEAR still returns the right nearest neighbor.
         let dir = tempdir().unwrap();
         {
-            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let engine = Engine::open(dir.path(), 0).unwrap();
             let xid = engine.begin().unwrap();
             engine
                 .execute_sql(xid, "CREATE TABLE t (id INT, embedding VECTOR(2))")
@@ -2317,7 +2296,7 @@ mod tests {
     #[test]
     fn index_status_is_ready_for_durable_index() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine
             .execute_sql(xid, "CREATE TABLE t (id INT, embedding VECTOR(2))")
@@ -2338,7 +2317,7 @@ mod tests {
     #[test]
     fn create_index_fulltext_backfills_immediately_and_is_queryable() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
 
         let xid = engine.begin().unwrap();
         engine
@@ -2390,7 +2369,7 @@ mod tests {
     #[test]
     fn create_index_rejects_type_mismatch_via_sql() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
 
         let xid = engine.begin().unwrap();
         engine
@@ -2407,7 +2386,7 @@ mod tests {
     #[test]
     fn near_query_returns_nearest_neighbors_in_order() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
 
         let xid = engine.begin().unwrap();
         engine
@@ -2449,7 +2428,7 @@ mod tests {
     #[test]
     fn near_composes_with_ordinary_where_predicate() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
 
         let xid = engine.begin().unwrap();
         engine
@@ -2494,7 +2473,7 @@ mod tests {
     fn sql_survives_reopen() {
         let dir = tempdir().unwrap();
         {
-            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let engine = Engine::open(dir.path(), 0).unwrap();
             let xid = engine.begin().unwrap();
             engine.execute_sql(xid, "CREATE TABLE t (id INT)").unwrap();
             engine
@@ -2503,7 +2482,7 @@ mod tests {
             engine.commit(xid).unwrap();
             engine.flush().unwrap();
         }
-        let mut engine2 = Engine::open(dir.path(), 0).unwrap();
+        let engine2 = Engine::open(dir.path(), 0).unwrap();
         let xid = engine2.begin().unwrap();
         let result = engine2.execute_sql(xid, "SELECT * FROM t").unwrap();
         match &result[0] {
@@ -2524,7 +2503,7 @@ mod tests {
     fn write_skew_commits_under_rr_but_aborts_under_serializable() {
         fn run(iso: Isolation) -> (Result<()>, Result<()>) {
             let dir = tempdir().unwrap();
-            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let engine = Engine::open(dir.path(), 0).unwrap();
             let s = engine.begin().unwrap();
             engine
                 .execute_sql(s, "CREATE TABLE doctors (id INT, on_call INT)")
@@ -2589,7 +2568,7 @@ mod tests {
     #[test]
     fn read_committed_concurrent_update_does_not_spuriously_abort() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let s = engine.begin().unwrap();
         engine
             .execute_sql(s, "CREATE TABLE t (id INT, v INT)")
@@ -2633,7 +2612,7 @@ mod tests {
     #[test]
     fn repeatable_read_write_over_committed_update_is_serialization_failure() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let s = engine.begin().unwrap();
         engine
             .execute_sql(s, "CREATE TABLE t (id INT, v INT)")
@@ -2673,7 +2652,7 @@ mod tests {
     #[test]
     fn serializable_non_conflicting_transaction_commits() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let s = engine.begin().unwrap();
         engine
             .execute_sql(s, "CREATE TABLE t (id INT, v INT)")
@@ -2706,7 +2685,7 @@ mod tests {
     #[test]
     fn auto_checkpoint_fires_on_wal_size_and_data_survives() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         // A tiny WAL-size threshold so a handful of inserts crosses it; disable
         // the time trigger so the test doesn't depend on wall-clock.
         engine.set_auto_checkpoint_config(AutoCheckpointConfig {
@@ -2734,7 +2713,7 @@ mod tests {
         // Reopen: the auto-checkpoints truncated the WAL, so recovery must come
         // from the checkpointed pages — all 50 rows must still be present.
         drop(engine);
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let q = engine.begin().unwrap();
         match &engine.execute_sql(q, "SELECT id FROM t").unwrap()[0] {
             SqlResult::Rows(rows) => assert_eq!(rows.len(), 50, "all rows must survive"),
@@ -2748,7 +2727,7 @@ mod tests {
     #[test]
     fn auto_checkpoint_does_not_fire_mid_transaction() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         engine.set_auto_checkpoint_config(AutoCheckpointConfig {
             enabled: true,
             timeout: std::time::Duration::from_secs(3600),
@@ -2786,7 +2765,7 @@ mod tests {
     #[test]
     fn rls_policy_filters_rows() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine
             .execute_sql(xid, "CREATE TABLE t (id INT, owner TEXT)")
@@ -2840,7 +2819,7 @@ mod tests {
     #[test]
     fn btree_assisted_select_matches_full_scan_equality_and_range() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine
             .execute_sql(xid, "CREATE TABLE indexed (id INT, name TEXT)")
@@ -2910,7 +2889,7 @@ mod tests {
     #[test]
     fn btree_assisted_select_still_respects_rls() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine
             .execute_sql(xid, "CREATE TABLE t (id INT, owner TEXT)")
@@ -2958,7 +2937,7 @@ mod tests {
     #[test]
     fn edges_table_exists_and_is_ordinary_sql_queryable() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine.create_edge(xid, 1, 2, "KNOWS", "{}").unwrap();
         engine.commit(xid).unwrap();
@@ -2976,7 +2955,7 @@ mod tests {
     #[test]
     fn create_edge_then_edges_from_returns_it() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine.create_edge(xid, 1, 2, "KNOWS", "{}").unwrap();
         engine.create_edge(xid, 1, 3, "KNOWS", "{}").unwrap();
@@ -2994,7 +2973,7 @@ mod tests {
     #[test]
     fn delete_edge_removes_from_index_and_traversal() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         let row_id = engine.create_edge(xid, 1, 2, "KNOWS", "{}").unwrap();
         engine.commit(xid).unwrap();
@@ -3010,7 +2989,7 @@ mod tests {
     #[test]
     fn edges_from_on_from_id_with_no_edges_returns_empty() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         assert!(engine.edges_from(xid, 999).unwrap().is_empty());
     }
@@ -3019,7 +2998,7 @@ mod tests {
     fn edge_index_rebuilds_on_reopen() {
         let dir = tempdir().unwrap();
         {
-            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let engine = Engine::open(dir.path(), 0).unwrap();
             let xid = engine.begin().unwrap();
             engine.create_edge(xid, 1, 2, "KNOWS", "{}").unwrap();
             engine.create_edge(xid, 1, 3, "LIKES", "{}").unwrap();
@@ -3027,7 +3006,7 @@ mod tests {
             engine.flush().unwrap();
         }
 
-        let mut engine2 = Engine::open(dir.path(), 0).unwrap();
+        let engine2 = Engine::open(dir.path(), 0).unwrap();
         let xid = engine2.begin().unwrap();
         let edges = engine2.edges_from(xid, 1).unwrap();
         assert_eq!(edges.len(), 2);
@@ -3038,7 +3017,7 @@ mod tests {
     #[test]
     fn execute_cypher_match_where_return_uses_index_fast_path() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine.create_edge(xid, 1, 2, "KNOWS", "{}").unwrap();
         engine.create_edge(xid, 1, 3, "KNOWS", "{}").unwrap();
@@ -3068,7 +3047,7 @@ mod tests {
     #[test]
     fn execute_cypher_filters_by_edge_type() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine.create_edge(xid, 1, 2, "KNOWS", "{}").unwrap();
         engine.create_edge(xid, 1, 3, "LIKES", "{}").unwrap();
@@ -3090,7 +3069,7 @@ mod tests {
     #[test]
     fn execute_cypher_without_from_id_predicate_falls_back_to_full_scan() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine.create_edge(xid, 1, 2, "KNOWS", "{}").unwrap();
         engine.create_edge(xid, 5, 6, "KNOWS", "{}").unwrap();
@@ -3112,7 +3091,7 @@ mod tests {
     #[test]
     fn execute_cypher_returns_edge_type_and_props() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine
             .create_edge(xid, 1, 2, "KNOWS", "{\"since\":2020}")
@@ -3139,7 +3118,7 @@ mod tests {
     #[test]
     fn execute_cypher_rejects_property_access() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         let err = engine
             .execute_cypher(
@@ -3169,7 +3148,7 @@ mod tests {
     #[test]
     fn queue_tables_exist_and_are_ordinary_sql_queryable() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         let events = engine.execute_sql(xid, "SELECT * FROM __events__").unwrap();
         assert_eq!(events, vec![SqlResult::Rows(vec![])]);
@@ -3198,7 +3177,7 @@ mod tests {
     #[test]
     fn enable_events_rejects_system_tables() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         assert!(matches!(
             engine.enable_events(queue::EVENTS_TABLE),
             Err(DbError::SqlPlan(_))
@@ -3334,7 +3313,7 @@ mod tests {
     fn event_seq_derivation_resumes_past_highest_seen_after_reopen() {
         let dir = tempdir().unwrap();
         {
-            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let engine = Engine::open(dir.path(), 0).unwrap();
             let xid = engine.begin().unwrap();
             engine.execute_sql(xid, "CREATE TABLE t (id INT)").unwrap();
             engine.commit(xid).unwrap();
@@ -3433,7 +3412,7 @@ mod tests {
             engine.flush().unwrap();
         }
 
-        let mut engine2 = Engine::open(dir.path(), 0).unwrap();
+        let engine2 = Engine::open(dir.path(), 0).unwrap();
         let xid = engine2.begin().unwrap();
         let remaining = engine2.poll_events(xid, "c1", 10).unwrap();
         assert_eq!(remaining.len(), 1);
@@ -3492,7 +3471,7 @@ mod tests {
         // stale EdgeIndex entry left by an aborted create_edge.
         {
             let dir = tempdir().unwrap();
-            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let engine = Engine::open(dir.path(), 0).unwrap();
             let t1 = engine.begin().unwrap();
             let stale = engine.create_edge(t1, 100, 999, "T", "{}").unwrap();
             engine.abort(t1).unwrap(); // row dead; EdgeIndex[100]->stale lingers
@@ -3520,7 +3499,7 @@ mod tests {
         // reusable — the wrong answer can no longer occur.
         {
             let dir = tempdir().unwrap();
-            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let engine = Engine::open(dir.path(), 0).unwrap();
             let t1 = engine.begin().unwrap();
             let stale = engine.create_edge(t1, 100, 999, "T", "{}").unwrap();
             engine.abort(t1).unwrap();
@@ -3548,7 +3527,7 @@ mod tests {
     #[test]
     fn vacuum_reclaims_dead_update_versions() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let x = engine.begin().unwrap();
         let mut rid = engine.insert(x, b"v0").unwrap();
         engine.commit(x).unwrap();
@@ -3571,7 +3550,7 @@ mod tests {
     #[test]
     fn vacuum_horizon_blocked_flag_tracks_open_transactions() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let open = engine.begin().unwrap();
         // Advance next_xid past `open`'s snapshot so it genuinely holds the
         // horizon below where a quiescent database would sit.
@@ -3593,7 +3572,7 @@ mod tests {
     #[test]
     fn vacuum_does_not_reclaim_versions_a_live_reader_still_needs() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let x = engine.begin().unwrap();
         let rid = engine.insert(x, b"v0").unwrap();
         engine.commit(x).unwrap();
@@ -3624,7 +3603,7 @@ mod tests {
     fn vacuumed_database_survives_reopen() {
         let dir = tempdir().unwrap();
         let keep = {
-            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let engine = Engine::open(dir.path(), 0).unwrap();
             let x = engine.begin().unwrap();
             let keep = engine.insert(x, b"keep").unwrap();
             let drop_it = engine.insert(x, b"drop").unwrap();
@@ -3637,7 +3616,7 @@ mod tests {
             keep
         };
         // Reopen runs recovery (which must idempotently redo the vacuum).
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let x = engine.begin().unwrap();
         assert_eq!(engine.get(x, keep).unwrap(), b"keep");
     }

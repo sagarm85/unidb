@@ -94,7 +94,7 @@ fn bench_execute_sql(c: &mut Criterion) {
 
     // ── baseline: direct embedded engine ────────────────────────────────────
     let dir = tempdir().unwrap();
-    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
     let xid = engine.begin().unwrap();
     engine
         .execute_sql(xid, "CREATE TABLE bench (id INT)")
