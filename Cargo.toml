@@ -199,3 +199,8 @@ required-features = ["server"]
 name = "server_stats"
 path = "tests/server_stats.rs"
 required-features = ["server"]
+
+[[test]]
+name = "server_tables"
+path = "tests/server_tables.rs"
+required-features = ["server"]

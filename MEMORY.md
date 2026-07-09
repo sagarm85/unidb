@@ -12,8 +12,16 @@
 
 ## Current status
 
-- **Durable on-disk FSM + catalog page-list — COMPLETE (2026-07-10), on branch
-  `durable-fsm` (one PR; ordered commits B1 → B2 → B-accept + docs).** Closes the
+- **Coordinator housekeeping (2026-07-10) — `main` fully green.** `GET /tables`
+  merged (PR #28); studio-UI spec closed as not-needed (PR #27); **build hotfix**:
+  registered `tests/server_tables.rs` behind `required-features = ["server"]` in
+  `Cargo.toml` — #28 left it unregistered, so the default `cargo test -p unidb`
+  (no server feature) auto-discovered it and failed to compile (the `--features
+  server` CI stayed green, which is how #28 merged). Verified: crash harness
+  **28/28**, clippy/fmt clean, 0 async-deps, default + server suites pass.
+  Worktrees `../unidb-fsm` and `../unidb-tables` removed; `../unidb-pgbench` kept.
+- **Durable on-disk FSM + catalog page-list — COMPLETE (2026-07-10), merged to
+  `main` via PR #29 (ordered commits B1 → B2 → B-accept + docs).** Closes the
   SQL-path `HeapFull{8138}` scaling ceiling the Postgres baseline (PR #25)
   root-caused, and the §12 "durable on-disk FSM fork" tech-debt item. **Root
   cause:** `TableDef.pages: Vec<PageId>` lived inline in the single JSON catalog
@@ -2537,6 +2545,27 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-10 — Coordinator: post-merge verify + main-unbreak hotfix
+
+- **Verified #28 (`GET /tables`) and #29 (durable on-disk FSM) after their merges
+  to `main`.** The coordinator gate runs *both* the default `cargo test -p unidb`
+  and `--features server` (a single worktree lane runs one); that caught a
+  regression #28's own green PR had hidden — `tests/server_tables.rs` was never
+  registered in `Cargo.toml` with `required-features = ["server"]`, so the
+  default (no-server) test build auto-discovered it and failed to compile
+  (`unresolved import server_common`, `cannot find crate tokio`). Fixed by adding
+  the `[[test]]` block, mirroring the 13 existing server-test entries. `main` now
+  green: crash harness 28/28, clippy/fmt clean, 0 async-deps.
+- **durable-FSM verdict (measured, honest):** the `HeapFull` scaling ceiling the
+  PR #25 Postgres baseline found is FIXED (dies ~876 pages before → clean to
+  ≥2,000 after; insert cost flat ~17–28 µs/row vs. rising 65→173 then error). The
+  requested concurrent-SQL-write refinement showed **no measurable improvement**
+  (B3 microbench ~40 pages so `set_pages` rarely fired; concurrency was already
+  fine via group-commit fsync) — recorded, not buried.
+- **#27 (studio-UI spec) closed** as not-needed; worktrees `../unidb-fsm` +
+  `../unidb-tables` removed (merged), `../unidb-pgbench` kept.
+- Committed direct to `main` per user (build-unbreak + this handoff refresh).
 
 ### 2026-07-08 — M11 SQL constraints (SQL lane, branch `sql-constraints`)
 
