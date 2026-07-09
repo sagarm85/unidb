@@ -12,6 +12,34 @@
 
 ## Current status
 
+- **Postgres baseline comparison — COMPLETE (2026-07-09), on branch `pg-baseline`
+  (one PR, checkpoints B1–B4 as ordered commits).** A **fitness check** — unidb vs
+  PostgreSQL 18.4, both as shipped, CRUD-only overlap — distinct from the ladder
+  (PR #24) and the future replaced-stack headline. **Benches + script + docs only;
+  no engine code touched.** `benches/decompose.rs` gained `PG_URL`-gated configs
+  (`postgres` **dev-dep only**, sync invariant verified clean) that flip Postgres's
+  server-wide `wal_sync_method` via `ALTER SYSTEM`+`pg_reload_conf()` and **report
+  two durability lenses side by side, never one alone** (the spec's core rule):
+  lens 1 = `open_datasync` (macOS PG default, not flush-to-platter), lens 2 =
+  `fsync_writethrough` (F_FULLFSYNC, matches unidb). Every printed number is
+  labelled with the sync method actually in force (verified via `SHOW`).
+  `scripts/pg_compare.sh` does native-preferred bring-up (Docker mode prints the
+  VM-durability caveat), both lenses, teardown, peak-RSS capture. **Environment:
+  NATIVE macOS 26.4, Apple M5 Pro (18 cores), PG 18.4 Homebrew, local Unix socket.**
+  **Headline (lens 2, matched durability):** durable insert **parity** (unidb
+  3.58 ms vs PG 3.31 ms/row); point reads **unidb ~4.9× faster** (6.87 µs embedded
+  vs 33.6 µs); concurrent writes **scale on BOTH unidb raw AND SQL paths** (3.55×/
+  3.82× at 8 cores, matching PG's 3.81×) — **refuting filed prediction 3** (the
+  catalog-`RwLock` serializes only the fast in-memory work; group commit coalesces
+  the dominant fsync outside the lock); size sweep **flat 10k→1M** (nothing bends,
+  unidb read ~13× faster at every size). The one honest gap: 30× update churn
+  bloats unidb reads (6.8→35 µs) with no autovacuum, but a manual M10 `vacuum()`
+  restores 5.85 µs (better than fresh) — automation gap, not capability. Peak RSS
+  ~35 MB. B4 unidb uses the **raw** path (P1.c claim); the SQL bulk-load path hits
+  a documented `HeapFull` at ~145k rows/txn (lazy per-statement FSM — raw
+  `Engine::insert` keeps it warm). Predictions-vs-actuals table + verdict in
+  `PROGRESS.md`'s "Postgres baseline comparison" entry. Linux re-run is the filed
+  follow-up for publishable numbers. No `FORMAT_VERSION` bump; no §3 decision touched.
 - **Commit-time WAL fsync — COMPLETE (2026-07-09), on branch `commit-time-fsync`
   (one PR, checkpoints C1–C5 as ordered commits).** Flipped the durability
   default to **group-committed force-log-at-commit**: statement mini-txns issued

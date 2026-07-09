@@ -1,6 +1,17 @@
 # Postgres baseline comparison — how solid is the standard design?
 
-## Status as of 2026-07-09: NOT STARTED. **Blocked on two merges, by design:**
+## Status as of 2026-07-09: **DONE** — shipped on branch `pg-baseline` (checkpoints
+B1–B4 as ordered commits). Full results, both durability lenses side by side, the
+predictions-vs-actuals grading, and the verdict are in **`PROGRESS.md`'s "Postgres
+baseline comparison — standard design vs standard default" entry**. Headline
+(lens 2, matched F_FULLFSYNC durability, native macOS / Apple M5 Pro / PG 18.4):
+durable-insert **parity** (unidb 3.58 ms vs PG 3.31 ms/row), embedded point reads
+**~4.9× faster**, concurrent writes **scale on both unidb raw and SQL paths**
+(refuting filed prediction 3), size sweep **flat 10k→1M**. Both blocking merges
+below landed first, as designed.
+
+_Original plan (kept for the record):_
+
 1. the **commit-time fsync milestone** (`docs/backlog/commit_time_fsync.md`) —
    unidb's "standard design" being measured must be the post-milestone default
    (group-committed force-log-at-commit), not the known per-statement-sync bug;

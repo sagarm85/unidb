@@ -87,7 +87,7 @@ cargo bench --features server        # + server-overhead benches
 | `benches/graph.rs` | Edge CRUD + adjacency-scan batch-latching |
 | `benches/queue.rs` | Event capture/poll/ack vs. Postgres `FOR UPDATE SKIP LOCKED` |
 | `benches/server.rs` | HTTP+writer-thread overhead, JWT verification, SSE polling, concurrent throughput ceiling |
-| `benches/decompose.rs` | W0–W4 per-commit write decomposition ladder (row → +B-tree → +vector → +edge → +event) vs. durability-matched SQLite; proves the commit-time-fsync default |
+| `benches/decompose.rs` | W0–W4 per-commit write decomposition ladder (row → +B-tree → +vector → +edge → +event) vs. durability-matched SQLite; proves the commit-time-fsync default. Also the **`PG_URL`-gated Postgres baseline comparison** (B1–B4: durable insert, CRUD, concurrency, size sweep) reporting both durability lenses — `open_datasync` vs `fsync_writethrough` — side by side; driven by `scripts/pg_compare.sh`. Unaffected by plain `cargo bench` (skips when `PG_URL` unset). |
 
 Full metrics tables for every milestone are in `PROGRESS.md`. Open
 `target/criterion/report/index.html` for the HTML report.
@@ -321,6 +321,7 @@ benches/
 scripts/
   bench_server.sh  — plain-shell perf smoke test against a running server (no Rust toolchain)
   gen_jwt.sh       — generate a verify-only HS256 JWT (bash + openssl, no Python/PyJWT)
+  pg_compare.sh    — bring up Postgres (native-preferred; --docker mode), run the unidb-vs-Postgres baseline comparison (both durability lenses), report peak RSS, tear down
 docs/
   REST_API.md      — full HTTP route reference (payloads, responses, error codes)
   backlog/         — saved plans for not-yet-started future work (e.g. Phase 2 SQL expansion)

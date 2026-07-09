@@ -2905,3 +2905,153 @@ Human sign-off for making group-committed force-log-at-commit the default
 recorded above (2026-07-09).
 
 **Commit-time WAL fsync is COMPLETE.**
+
+---
+
+## Postgres baseline comparison — standard design vs standard default   [DONE]   2026-07-09
+
+**PR:** _pending — branch `pg-baseline` (checkpoints B1→B4 as ordered commits)_
+**Spec:** `docs/backlog/pg_baseline_comparison.md`
+**Summary:** A **fitness check** (not marketing): unidb vs PostgreSQL, both as
+shipped, on the CRUD both can do — the honest question "how solid is unidb's
+foundation against the reference OLTP engine?" Benches-only (`benches/decompose.rs`
++ `scripts/pg_compare.sh`); **no engine code touched.** Deliberately distinct from
+the ladder (PR #24, unidb-internal) and the future replaced-stack headline
+(§6 framing "A").
+
+**The non-negotiable honesty rule — both durability lenses, side by side:**
+On macOS the two "defaults" are not equally safe. unidb commits via Rust
+`File::sync_all` → `F_FULLFSYNC` (true flush-to-platter) by default; Postgres's
+macOS default `wal_sync_method=open_datasync` uses a plain `fsync()` that macOS
+does **not** make durable. So we report two lenses and never one alone:
+- **Lens 1 — as-shipped defaults** (`open_datasync`): what a user gets. Postgres
+  looks ~35–40× faster here — but that speed is bought by *not* flushing to
+  platter on macOS. A durability illusion, not a throughput advantage.
+- **Lens 2 — matched true durability** (`fsync_writethrough` = F_FULLFSYNC):
+  the engineering truth. **Headline numbers come from this lens.** The bench
+  flips the server-wide `wal_sync_method` via `ALTER SYSTEM` + `pg_reload_conf()`
+  and *verifies it* with `SHOW` — every printed number is labelled with the sync
+  method actually in force (`[open_datasync]` / `[fsync_writethrough]`), so a
+  mislabelled lens is impossible. (Third instance of the macOS durability trap,
+  after the SQLite `fullfsync=ON` and the ladder rules — a standing checklist item.)
+
+**Environment:** **NATIVE** Postgres — **PostgreSQL 18.4 (Homebrew), macOS 26.4
+(build 25E246), Apple M5 Pro (18 cores), 48 GB**, rustc 1.95.0, local Unix
+socket, prepared statements. Native (not Docker) is required for an honest lens 2:
+Docker on macOS runs a Linux VM whose fsync-to-host-platter semantics are
+unquantifiable and flattering to Postgres (`pg_compare.sh --docker` prints this
+caveat). A Linux re-run — where fsync semantics are uniform for both engines —
+is the follow-up for eventually-publishable numbers.
+
+### B1 — Durable single-row INSERT (per-row, own transaction)
+
+| Workload | unidb (F_FULLFSYNC default) | PG lens 1 `open_datasync` | PG lens 2 `fsync_writethrough` |
+|---|---|---|---|
+| W0 plain insert     | **3.58 ms/row · 279 ops/s** | 0.091 ms · ~11,000 ops/s | **3.31 ms · 302 ops/s** |
+| W1 + secondary btree | **4.24 ms/row · 236 ops/s** | 0.129 ms · ~7,700 ops/s | **3.36 ms · 298 ops/s** |
+
+At **matched durability (lens 2) this is parity** — unidb W0 3.58 ms vs PG 3.31 ms
+(both fsync-bound; PG ~8% ahead). Lens 1 shows PG ~40× faster purely by syncing
+less. (Honesty note: unidb W0 has *no* index; PG W0 carries a PRIMARY KEY per the
+spec's "a PG table always has a PK" — a small asymmetry that slightly favours unidb
+on W0. W1 adds a secondary btree both sides.) At matched durability the fsync
+dwarfs index maintenance on the PG side (W1≈W0); unidb's extra btree fsync shows as
+the W1−W0 ≈ 0.66 ms gap.
+
+### B2 — CRUD suite (lens 2 for Postgres; reads don't fsync so the lens is moot for SELECT)
+
+| Op | unidb | Postgres (lens 2) | Winner |
+|---|---|---|---|
+| Point SELECT by key   | **6.87 µs** (embedded, no IPC) | 33.6 µs (socket+plan) | **unidb ~4.9×** |
+| MVCC UPDATE by key    | 4.00 ms | **3.65 ms** | PG ~10% |
+| Read — fresh table    | **6.83 µs** | 34.4 µs | unidb |
+| Read — after 30× churn | 35.4 µs *(bloat)* | **34.6 µs** *(autovacuum)* | ~tie |
+| Read — after manual VACUUM | **5.85 µs** | (n/a) | unidb (M10 reclaims fully) |
+
+The **embedded read advantage is real and large** (~5×, no socket round-trip / no
+per-query planning). The **churn row is the honest one**: with no autovacuum,
+30 update passes bloat unidb's version chains and point reads slow 6.8 → 35 µs
+(≈ Postgres's *normal* read latency); Postgres's autovacuum keeps it flat. A
+single manual `Engine::vacuum()` (M10) then restores unidb to 5.85 µs — *better*
+than fresh. The gap is automation (autovacuum) not capability.
+
+### B3 — Concurrent writers (commits/sec, lens 2 both sides; N ∈ {1,2,4,8})
+
+| N | unidb raw CRUD | unidb SQL | Postgres |
+|---|---|---|---|
+| 1 | 316 (1.00×) | 315 (1.00×) | 309 (1.00×) |
+| 2 | 333 (1.05×) | 308 (0.98×) | 311 (1.01×) |
+| 4 | 654 (2.07×) | 620 (1.97×) | 635 (2.06×) |
+| 8 | **1121 (3.55×)** | **1205 (3.82×)** | **1179 (3.81×)** |
+
+**This is the checkpoint that overturned a filed prediction (below), and it ships
+as-is.** The spec predicted unidb's *SQL* write path would fail to scale because
+every `execute_sql` takes the catalog `RwLock` in write mode. It scales anyway
+(3.82× at 8 cores, matching Postgres's 3.81× and its own raw path's 3.55×). Why:
+the catalog lock serializes only the *fast in-memory* execution; the *dominant*
+cost is the commit fsync, which group commit (`Wal::sync_up_to`) coalesces
+**outside** the lock. When fsync dominates, catalog serialization is in the noise.
+
+### B4 — Size sweep 10k → 1M rows (µs/op; does anything bend with scale?)
+
+| rows | unidb insert | unidb point-read | PG insert | PG point-read |
+|---|---|---|---|---|
+| 10,000    | 3251 µs | **4.4 µs** | 3406 µs | 66.9 µs |
+| 100,000   | 3100 µs | **3.2 µs** | 3550 µs | 69.3 µs |
+| 1,000,000 | 3495 µs | **5.3 µs** | 3530 µs | 61.5 µs |
+
+**Nothing bends.** Durable insert throughput and point-read latency are flat
+across a 100× size range for both engines (the P1.c flatness claim, confirmed
+against Postgres). unidb's read is ~13× faster at every size (embedded). *unidb's
+B4 uses the raw CRUD path* — this is the P1.c-claim path and it keeps the
+free-space map warm; the SQL bulk-load path hits a documented `HeapFull` at
+~145k rows in a single transaction because its per-statement FSM is rebuilt
+lazily (raw `Engine::insert` keeps it warm — a known limitation, "durable on-disk
+FSM is a later item", MEMORY/P1.c). Raw insert is separately proven to build 5M
+rows (linear, ~247 s); 1M is the measured headline, 5M is env-reachable
+(`PG_SWEEP_SIZES`).
+
+**Peak RSS (unidb):** **~35 MB** (36.7 MB max RSS over the unidb-only path
+incl. the 1M-row sweep + B3 concurrency) — dominated by the 4096-frame (32 MB)
+buffer pool. Postgres RSS is a separate server process, out of scope for the
+"our engine's footprint" metric (§6).
+
+### Predictions vs actuals (5 filed BEFORE measuring — §6 ethos)
+
+| # | Prediction (filed) | Actual | Grade |
+|---|---|---|---|
+| 1 | Durable insert (lens 2): ~parity | unidb 3.58 ms vs PG 3.31 ms — parity | ✅ **Confirmed** |
+| 2 | Point reads: unidb wins (embedded) | 6.87 µs vs 33.6 µs — unidb ~4.9× | ✅ **Confirmed (strongly)** |
+| 3 | Concurrent SQL writes: **Postgres wins, possibly by a lot** (unidb SQL serializes on catalog RwLock) | unidb SQL **scales 3.82×**, matches PG (1205 vs 1179) | ❌ **Refuted** — group commit coalesces the dominant fsync outside the lock; catalog serialization is in the noise |
+| 4 | Update-heavy churn at scale: Postgres ahead | Ahead *only* unmanaged (autovacuum vs manual); a manual VACUUM makes unidb reads faster than PG's | ⚠️ **Partly** — automation gap, not capability |
+| 5 | Big scans: Postgres wins | Not measured (optional; conceded in the prediction) | ⏭️ **N/A** |
+
+**Prediction 3 refuted is the finding worth keeping** (per the spec: "any result
+far from a prediction is the finding worth investigating"). The documented
+catalog-`RwLock` limitation is real but its *feared consequence* — SQL-write
+throughput collapse — does not occur, because commit-time group fsync dominates
+and is handled outside the lock. The next optimization target is finer-grained
+index concurrency, not the catalog lock, on this workload.
+
+**Verdict.** A **solid, SQLite-class-and-then-some foundation.** At matched true
+durability unidb is at **parity** with PostgreSQL on durable commits, **wins
+decisively (~5×) on embedded point reads**, and — contrary to the filed
+prediction — **scales concurrent writes on both its raw and SQL paths**, matching
+Postgres core-for-core. The honest gaps are exactly the known/documented ones:
+bloat *automation* (manual M10 vacuum vs autovacuum — the capability is there and
+recovers fully), the single-transaction SQL bulk-load FSM cap (~145k rows; raw
+path unaffected), and analytic/parallel scans (not measured, already deferred).
+The apparent lens-1 "loss" is a macOS durability illusion, not a speed deficit.
+None of this reopens a §3 decision.
+
+**Verification gates:** benches green with and without `PG_URL` (plain
+`cargo bench` unaffected — every Postgres path logs a skip and returns);
+`postgres` is a **dev-dependency only** and the sync invariant holds
+(`cargo tree -p unidb --no-default-features --edges normal` free of
+tokio/reqwest/axum/postgres); `cargo build --workspace`, `cargo test -p unidb`
+(+ `--features server`), `cargo clippy --workspace --all-targets -D warnings`,
+`cargo fmt --all --check` all clean; **no engine code changed.**
+
+**Locked-decision changes:** none.
+
+**Postgres baseline comparison is COMPLETE.**

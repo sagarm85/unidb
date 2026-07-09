@@ -704,11 +704,128 @@ fn bench_pg_concurrency() {
     }
 }
 
+// --------------------------- B4: size sweep --------------------------------
+
+/// B4: does anything bend with table size? Build to size S via bulk load, then
+/// measure marginal durable-insert throughput and point-read latency at that
+/// size, for both engines. Sizes are env-overridable (`PG_SWEEP_SIZES`, comma
+/// list) so a plain `cargo bench` stays quick; the script drives the full run.
+fn bench_size_sweep() {
+    let sizes: Vec<u64> = std::env::var("PG_SWEEP_SIZES")
+        .ok()
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![10_000, 100_000]);
+    let url = pg_url();
+    println!("\n=== B4: size sweep (insert µs/op, point-read µs/op) ===");
+    if url.is_none() {
+        println!("[pg] PG_URL unset — Postgres columns skipped, unidb only");
+    }
+    println!(
+        "{:>10}  {:>22}  {:>22}",
+        "rows", "unidb ins/read µs", "pg ins/read µs (lens2)"
+    );
+    // Set lens 2 once for the whole sweep.
+    let mut pg_lens: Option<(Client, String)> = url.as_deref().and_then(|u| pg_open_lens(u, true));
+    for &s in &sizes {
+        let (u_ins, u_read) = unidb_sweep_point(s);
+        let pg_cell = match pg_lens.as_mut() {
+            Some((client, _)) => {
+                let (p_ins, p_read) = pg_sweep_point(client, s);
+                format!("{p_ins:>9.1} / {p_read:>9.1}")
+            }
+            None => "            n/a".to_string(),
+        };
+        println!(
+            "{:>10}  {:>9.1} / {:>9.1}      {:>22}",
+            s, u_ins, u_read, pg_cell
+        );
+    }
+}
+
+const SWEEP_SAMPLE: u64 = 200;
+
+/// Build a unidb heap of `size` rows via the RAW CRUD path, then return
+/// (marginal durable insert µs/op, point-read µs/op) at that size.
+///
+/// Why the raw path (not SQL) here: this test *is* the P1.c flatness claim
+/// (`benches/scale.rs`), and the SQL insert path's per-statement lazy FSM caps
+/// bulk SQL loads at ~145k rows in one transaction (a documented limitation —
+/// `Engine::insert` keeps the FSM warm and scales, SQL does not). Point reads
+/// are raw `get(row_id)` — the embedded no-IPC read compared against Postgres's
+/// keyed SELECT. Load itself is batched (undo/WAL bounded); the *measured* ops
+/// are per-row durable.
+fn unidb_sweep_point(size: u64) -> (f64, f64) {
+    const BATCH: u64 = 5_000;
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
+    let mut rids = Vec::with_capacity(size as usize);
+    let mut x = engine.begin().unwrap();
+    for i in 0..size {
+        rids.push(engine.insert(x, &i.to_le_bytes()).unwrap());
+        if (i + 1) % BATCH == 0 {
+            engine.commit(x).unwrap();
+            x = engine.begin().unwrap();
+        }
+    }
+    engine.commit(x).unwrap();
+
+    // marginal durable insert throughput at this size
+    let start = Instant::now();
+    for j in 0..SWEEP_SAMPLE {
+        let x = engine.begin().unwrap();
+        engine.insert(x, &(size + j).to_le_bytes()).unwrap();
+        engine.commit(x).unwrap();
+    }
+    let ins_us = start.elapsed().as_micros() as f64 / SWEEP_SAMPLE as f64;
+
+    // point read (embedded get by row id) at this size
+    let step = (size / SWEEP_SAMPLE).max(1);
+    let start = Instant::now();
+    for j in 0..SWEEP_SAMPLE {
+        let rid = rids[((j * step) % size) as usize];
+        let x = engine.begin().unwrap();
+        engine.get(x, rid).unwrap();
+        engine.commit(x).unwrap();
+    }
+    let read_us = start.elapsed().as_micros() as f64 / SWEEP_SAMPLE as f64;
+    (ins_us, read_us)
+}
+
+/// Same for Postgres (lens set by the caller). Bulk-builds to `size`, then
+/// measures marginal durable insert + point read.
+fn pg_sweep_point(client: &mut Client, size: u64) -> (f64, f64) {
+    pg_build_keyed(client, size);
+    let ins = client
+        .prepare("INSERT INTO t (id, body) VALUES ($1, $2)")
+        .unwrap();
+    let start = Instant::now();
+    for j in 0..SWEEP_SAMPLE {
+        let id = (size + j) as i32;
+        client.execute(&ins, &[&id, &format!("b{id}")]).unwrap();
+    }
+    let ins_us = start.elapsed().as_micros() as f64 / SWEEP_SAMPLE as f64;
+    let sel = client
+        .prepare("SELECT id, body FROM t WHERE id = $1")
+        .unwrap();
+    let start = Instant::now();
+    for j in 0..SWEEP_SAMPLE {
+        let key = (j * (size / SWEEP_SAMPLE).max(1)) as i32 % size as i32;
+        client.query(&sel, &[&key]).unwrap();
+    }
+    let read_us = start.elapsed().as_micros() as f64 / SWEEP_SAMPLE as f64;
+    (ins_us, read_us)
+}
+
 fn main() {
+    // Criterion-measured groups: the ladder (existing) + B1 pg ladder + B2 CRUD.
     let mut criterion = Criterion::default().configure_from_args();
     bench_ladder(&mut criterion);
     bench_pg_ladder(&mut criterion);
     bench_pg_crud(&mut criterion);
     criterion.final_summary();
+
+    // Manual throughput sweeps that print their own tables: B3 concurrency, B4
+    // size sweep. Skipped-Postgres-column handling is internal.
     bench_pg_concurrency();
+    bench_size_sweep();
 }
