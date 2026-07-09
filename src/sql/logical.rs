@@ -347,6 +347,7 @@ mod tests {
                 constraints: Default::default(),
             }],
             pages: vec![],
+            fsm_meta: None,
             rls_policy: policy,
             events_enabled: false,
             serial_next: Default::default(),

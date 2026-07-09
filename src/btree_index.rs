@@ -56,7 +56,7 @@
 //   them, exactly like `DROP TABLE` heap pages today.
 
 use crate::{
-    bufferpool::BufferPool,
+    bufferpool::{BufferPool, PageReader},
     error::{DbError, Result},
     format::{
         u16_from_le, u16_to_le, u32_from_le, u32_to_le, u64_from_le, u64_to_le, Lsn, PageId,
@@ -523,6 +523,90 @@ impl DiskBTree {
         }
     }
 
+    fn rightmost_leaf(&self, pool: &BufferPool) -> Result<PageId> {
+        let mut pid = self.root_page(pool)?;
+        loop {
+            let page = pool.fetch_page(pid)?;
+            let node = Node::deserialize(&page)?;
+            pool.unpin(pid);
+            match node {
+                Node::Leaf { .. } => return Ok(pid),
+                // The last child holds every key >= the last separator, so it is
+                // the rightmost subtree.
+                Node::Internal { children, .. } => pid = children[children.len() - 1],
+            }
+        }
+    }
+
+    /// The single greatest `(key, rid)` entry, or `None` for an empty tree.
+    /// O(tree height) — one root-to-rightmost-leaf descent, no full scan — so
+    /// the durable FSM can find a heap's append tail (its highest page id)
+    /// without the O(pages) directory walk `TableDef.pages` used to force.
+    pub fn max_entry(&self, pool: &BufferPool) -> Result<Option<(OrderedValue, RowId)>> {
+        let pid = self.rightmost_leaf(pool)?;
+        let page = pool.fetch_page(pid)?;
+        let node = Node::deserialize(&page)?;
+        pool.unpin(pid);
+        let Node::Leaf { entries, .. } = node else {
+            return Err(DbError::Recovery(
+                "B+tree rightmost node is not a leaf".into(),
+            ));
+        };
+        Ok(entries.last().cloned())
+    }
+
+    /// Enumerate the `Int` keys (a heap's page-directory page ids) in ascending
+    /// order over **any** [`PageReader`] — the buffer pool *or* a concurrent
+    /// reader's shared mmap ([`SharedPageReader`]). The durable FSM's keys are
+    /// exactly the pages a heap owns, so this reconstructs the directory a full
+    /// scan/vacuum needs without the buffer pool (the concurrent-read scan path
+    /// has only an mmap reader). Reader-only: no pin/unpin, no allocation, no
+    /// WAL — leaves are read-shared, so it never mutates the tree. O(pages) but
+    /// amortized into the O(pages) scan it feeds; never on the O(1)-open path.
+    pub fn page_directory<P: PageReader>(&self, reader: &P) -> Result<Vec<PageId>> {
+        // Meta page → root (mirrors `root_page`, but over `read_page`).
+        let meta = reader.read_page(self.meta_page)?;
+        let mbody = &meta.as_bytes()[PAGE_HEADER_SIZE..];
+        if mbody.first().copied() != Some(NODE_META) {
+            return Err(DbError::Recovery(format!(
+                "FSM meta page {} is not a meta node",
+                self.meta_page
+            )));
+        }
+        let mut pid = u32_from_le(mbody[1..5].try_into().unwrap());
+        // Descend to the leftmost leaf.
+        loop {
+            let page = reader.read_page(pid)?;
+            match Node::deserialize(&page)? {
+                Node::Leaf { .. } => break,
+                Node::Internal { children, .. } => pid = children[0],
+            }
+        }
+        // Walk the leaf chain, collecting page ids.
+        let mut out = Vec::new();
+        loop {
+            let page = reader.read_page(pid)?;
+            let Node::Leaf { entries, next } = Node::deserialize(&page)? else {
+                break;
+            };
+            for (k, _) in &entries {
+                match k {
+                    OrderedValue::Int(n) => out.push(*n as PageId),
+                    other => {
+                        return Err(DbError::Recovery(format!(
+                            "FSM key is not an Int page id: {other:?}"
+                        )))
+                    }
+                }
+            }
+            if next == INVALID_PAGE_ID {
+                break;
+            }
+            pid = next;
+        }
+        Ok(out)
+    }
+
     // ── writes ─────────────────────────────────────────────────────────────────
 
     /// Insert `(value, rid)`. One WAL mini-txn covers every page touched,
@@ -808,6 +892,36 @@ mod tests {
             OrderedValue::try_from(&Literal::Int(5)).unwrap(),
             OrderedValue::Int(5)
         );
+    }
+
+    #[test]
+    fn max_entry_and_page_directory_span_leaves() {
+        let e = env();
+        let t = DiskBTree::create(&e.pool, &e.wal).unwrap();
+        // Empty tree.
+        assert_eq!(t.max_entry(&e.pool).unwrap(), None);
+        assert!(t.page_directory(&e.pool).unwrap().is_empty());
+        // Enough keys to force several leaf splits, so rightmost/leftmost
+        // descent and the leaf-chain walk are actually exercised (not a single
+        // leaf). Insert out of order to prove ordering is by key, not arrival.
+        const N: i64 = 400;
+        for i in (0..N).rev() {
+            t.insert(OrderedValue::Int(i), rid(i as u32, 0), &e.pool, &e.wal)
+                .unwrap();
+        }
+        // Tail = highest key (the heap's append point).
+        assert_eq!(
+            t.max_entry(&e.pool).unwrap(),
+            Some((OrderedValue::Int(N - 1), rid((N - 1) as u32, 0)))
+        );
+        // Full directory enumeration, ascending, every page id present once —
+        // over the pool, which is itself a `PageReader` (the mmap reader takes
+        // the same path).
+        let dir = t.page_directory(&e.pool).unwrap();
+        assert_eq!(dir.len(), N as usize);
+        for (i, pid) in dir.iter().enumerate() {
+            assert_eq!(*pid, i as u32);
+        }
     }
 
     #[test]

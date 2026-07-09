@@ -24,6 +24,7 @@
 // transaction's xid, so no extra encoding is needed there.
 
 use crate::{
+    btree_index::{DiskBTree, OrderedValue},
     bufferpool::{BufferPool, ExclusiveLatch, PageReader},
     concurrency_hooks::{on_read, on_write},
     error::{DbError, Result},
@@ -74,39 +75,119 @@ struct HeapFsm {
     /// fits). For a `Heap` reconstructed via [`Self::from_pages`] it starts
     /// empty and is filled lazily (scanning from the end, append-locality).
     free_map: std::collections::HashMap<PageId, usize>,
+    /// For an **FSM-backed** heap (`fsm_tree.is_some()`), whether `pages` has
+    /// yet been lazily loaded from the durable directory (the FSM tree's keys).
+    /// It is NOT loaded at construction — that would reintroduce O(pages) work
+    /// per statement / at open (the moat). The insert path never needs the full
+    /// directory (it appends at the durable tail via `DiskBTree::max_entry`);
+    /// only a full `scan`/vacuum does, and it loads it then via
+    /// [`Heap::ensure_directory`]. For a **legacy** heap (`fsm_tree.is_none()`)
+    /// `pages` is authoritative from construction, so this is always `true`.
+    directory_loaded: bool,
 }
 
 pub struct Heap {
     page_size: usize,
     fsm: std::sync::Mutex<HeapFsm>,
+    /// This table's durable free-space map / page directory (durable-FSM
+    /// milestone): a `DiskBTree` keyed `page_id -> free_bytes` whose keys are
+    /// the pages the heap owns. `Some` for a catalog table (its stable meta
+    /// page lives in `TableDef.fsm_meta`); `None` for the legacy raw-CRUD heap
+    /// and any pre-FSM table, which track their page list in memory / the
+    /// catalog `pages` blob. A `DiskBTree` handle is stateless (just the meta
+    /// page id + page size), so holding one costs nothing and reopening it is
+    /// O(1).
+    fsm_tree: Option<DiskBTree>,
 }
 
 impl Heap {
     pub fn new(page_size: usize) -> Self {
         Self {
             page_size,
-            fsm: std::sync::Mutex::new(HeapFsm::default()),
+            fsm: std::sync::Mutex::new(HeapFsm {
+                directory_loaded: true,
+                ..HeapFsm::default()
+            }),
+            fsm_tree: None,
         }
     }
 
-    /// Reconstruct a `Heap` handle over an already-populated set of pages
-    /// (M1.c: the catalog persists each table's page list so `scan`/FSM
-    /// work correctly after a reopen, rather than starting from an empty
-    /// page list every time — see catalog.rs's `TableDef.pages`).
+    /// Reconstruct a **legacy** `Heap` over an in-memory page list (the raw-CRUD
+    /// heap and pre-FSM catalog tables). The page list is authoritative here —
+    /// no durable FSM tree. FSM-backed catalog tables use [`Self::open`].
     pub fn from_pages(page_size: usize, pages: Vec<PageId>) -> Self {
         Self {
             page_size,
             fsm: std::sync::Mutex::new(HeapFsm {
                 pages,
                 free_map: std::collections::HashMap::new(),
+                directory_loaded: true,
             }),
+            fsm_tree: None,
         }
+    }
+
+    /// Open a catalog table's heap from its durable FSM (durable-FSM milestone).
+    /// When `fsm_meta` is `Some`, the page directory lives in the FSM tree (its
+    /// keys), so construction is **O(1)** — no directory load, no page scan (the
+    /// moat). `legacy_pages` is the fallback for a pre-FSM catalog whose
+    /// `fsm_meta` is `None` (no data-dir migration: it keeps working via its
+    /// old in-catalog `pages` list).
+    pub fn open(page_size: usize, fsm_meta: Option<PageId>, legacy_pages: Vec<PageId>) -> Self {
+        match fsm_meta {
+            Some(meta) => Self {
+                page_size,
+                fsm: std::sync::Mutex::new(HeapFsm {
+                    pages: Vec::new(),
+                    free_map: std::collections::HashMap::new(),
+                    directory_loaded: false,
+                }),
+                fsm_tree: Some(DiskBTree::new(meta, page_size)),
+            },
+            None => Self::from_pages(page_size, legacy_pages),
+        }
+    }
+
+    /// Lazily populate the in-memory page directory from the durable FSM tree,
+    /// over **any** [`PageReader`] (the buffer pool on the writer path, or a
+    /// concurrent reader's shared mmap). A no-op for a legacy heap or once
+    /// already loaded. Called at the top of every full `scan`/vacuum path — the
+    /// only paths that need the *whole* directory (they are O(pages) regardless,
+    /// so the walk amortizes). The insert path never calls this. The FSM lock is
+    /// **not** held across the tree read (P5.e). `pub(crate)` so the vacuum's
+    /// `count_live_slots` (which iterates [`Self::page_ids`]) can force the load.
+    pub(crate) fn ensure_directory<P: PageReader>(&self, reader: &P) -> Result<()> {
+        if self.lock_fsm().directory_loaded {
+            return Ok(());
+        }
+        let Some(tree) = &self.fsm_tree else {
+            self.lock_fsm().directory_loaded = true;
+            return Ok(());
+        };
+        let dir = tree.page_directory(reader)?; // FSM lock NOT held across tree I/O
+        let mut fsm = self.lock_fsm();
+        for pid in dir {
+            if !fsm.pages.contains(&pid) {
+                fsm.pages.push(pid);
+            }
+        }
+        fsm.pages.sort_unstable();
+        fsm.directory_loaded = true;
+        Ok(())
     }
 
     /// Poison-safe access to the FSM (P5.e). Consistent with `wal.rs`/`txn.rs`:
     /// a prior panic-while-locked leaves the map usable as-is.
     fn lock_fsm(&self) -> std::sync::MutexGuard<'_, HeapFsm> {
         self.fsm.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether this heap's page directory is a durable FSM tree (a catalog
+    /// table) rather than the legacy in-catalog `pages` list. When true, the
+    /// directory self-persists at page-alloc time, so callers must NOT write it
+    /// back into the catalog blob (that blob rewrite was the `HeapFull` ceiling).
+    pub fn is_fsm_backed(&self) -> bool {
+        self.fsm_tree.is_some()
     }
 
     /// A snapshot of the heap's current page list, so callers (the SQL
@@ -447,6 +528,7 @@ impl Heap {
         self_xid: Xid,
         reader: &P,
     ) -> Result<Vec<(RowId, Vec<u8>)>> {
+        self.ensure_directory(reader)?; // FSM-backed: load the page directory
         let mut out = Vec::new();
         for page_id in self.lock_fsm().pages.clone() {
             let page = reader.read_page(page_id)?;
@@ -517,6 +599,34 @@ impl Heap {
                 return Ok(pid);
             }
         }
+        // 2b. FSM-backed heap: the in-memory `pages` above holds only pages
+        //     touched this statement (the directory is not eagerly loaded — the
+        //     moat). The durable append tail may be an earlier page not yet in
+        //     memory, so probe it once via a single O(log n) descent
+        //     (`max_entry`), NOT the O(pages) directory walk. This is how a
+        //     fresh per-statement heap keeps appending to the existing tail
+        //     across statements without rebuilding the free-space map.
+        if let Some(tree) = &self.fsm_tree {
+            if let Some((OrderedValue::Int(tail), _)) = tree.max_entry(pool)? {
+                let tail = tail as PageId;
+                let already_probed = self.lock_fsm().free_map.contains_key(&tail);
+                if !already_probed {
+                    let page = pool.fetch_page_for_write(tail, wal)?;
+                    let free = page.free_space();
+                    pool.unpin(tail);
+                    {
+                        let mut fsm = self.lock_fsm();
+                        if !fsm.pages.contains(&tail) {
+                            fsm.pages.push(tail);
+                        }
+                        fsm.free_map.insert(tail, free);
+                    }
+                    if free >= needed {
+                        return Ok(tail);
+                    }
+                }
+            }
+        }
         // 3. Nothing fits — allocate a fresh page.
         self.alloc_heap_page(pool, wal)
     }
@@ -531,6 +641,24 @@ impl Heap {
         pool.write_page(&page)?;
         let free = page.free_space();
         pool.unpin(pid);
+        // FSM-backed: record the new page in the durable directory (the FSM
+        // tree). Its own WAL mini-txn, crash-recovered by inheritance
+        // (`WAL_INDEX` full-page images). Done with NO page latch and NO FSM
+        // lock held (P5.e) — the tree op takes its own latches / WAL. (B1: a
+        // separate mini-txn from the page init, so a crash between the two can
+        // orphan an empty page — a space leak, never corruption; B2 folds them
+        // into one atomic grow.)
+        if let Some(tree) = &self.fsm_tree {
+            tree.insert(
+                OrderedValue::Int(pid as i64),
+                RowId {
+                    page_id: pid,
+                    slot: 0,
+                },
+                pool,
+                wal,
+            )?;
+        }
         // Register the new page — FSM lock taken only now, after all page I/O
         // (no latch is held), so it forms no cycle with the pool's latches.
         {
@@ -554,6 +682,7 @@ impl Heap {
         horizon: Xid,
         reader: &P,
     ) -> Result<Vec<RowId>> {
+        self.ensure_directory(reader)?; // FSM-backed: load the page directory
         let mut out = Vec::new();
         for page_id in self.lock_fsm().pages.clone() {
             let page = reader.read_page(page_id)?;

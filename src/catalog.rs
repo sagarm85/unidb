@@ -30,6 +30,7 @@ use std::{collections::HashMap, path::Path};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    btree_index::DiskBTree,
     bufferpool::BufferPool,
     control::{self, ControlData},
     error::{DbError, Result},
@@ -232,13 +233,24 @@ pub struct TableConstraints {
 pub struct TableDef {
     pub name: String,
     pub columns: Vec<ColumnDef>,
-    /// This table's own data heap's page list (distinct from the catalog's
-    /// own storage page) — persisted here, not just kept in-memory on the
-    /// `Heap` struct, so `Heap::from_pages` can reconstruct a working FSM
-    /// and `scan()` after a reopen (see `heap.rs`'s tech-debt note this
-    /// closes: an in-memory-only page list was silently losing track of a
-    /// table's existing pages across restarts).
+    /// **Legacy** (pre-durable-FSM) in-catalog page list. Retained only so a
+    /// catalog written before the durable FSM (`fsm_meta == None`) still opens
+    /// and scans its existing pages — no data-dir migration (per the durable-FSM
+    /// spec). Tables created since carry `fsm_meta` and leave this empty; it is
+    /// never grown again (that O(heap-pages) blob rewrite was the `HeapFull`
+    /// ceiling this milestone removes). `#[serde(default)]` so nothing else must
+    /// set it.
+    #[serde(default)]
     pub pages: Vec<PageId>,
+    /// Stable meta-page id of this table's **durable free-space map** (a
+    /// `DiskBTree` keyed `page_id -> free_bytes`; its keys are the page
+    /// directory, replacing the legacy `pages` blob — see the durable-FSM spec).
+    /// Minted once at `create_table`, then never changes (like `ColumnDef.
+    /// index_root` / the edge & LOB index meta pages), so `Engine::open` stays
+    /// O(1) — the heap opens the FSM from this id, never rescans. `None` only for
+    /// a legacy catalog predating the FSM (falls back to `pages`).
+    #[serde(default)]
+    pub fsm_meta: Option<PageId>,
     pub rls_policy: Option<Expr>,
     /// Whether INSERT/UPDATE/DELETE on this table also durably capture a
     /// row in `__events__` (M4). `false` by default — event capture is
@@ -344,9 +356,17 @@ impl Catalog {
         self.tables.values()
     }
 
-    pub fn create_table(&mut self, def: TableDef, ctx: &mut CatalogCtx) -> Result<()> {
+    pub fn create_table(&mut self, mut def: TableDef, ctx: &mut CatalogCtx) -> Result<()> {
         if self.tables.contains_key(&def.name) {
             return Err(DbError::TableAlreadyExists(def.name));
+        }
+        // Mint this table's durable free-space map up front (durable-FSM spec):
+        // a fresh `DiskBTree` whose stable meta page id becomes the table's O(1)
+        // page-directory handle. Every table born since the FSM landed carries
+        // one, so its heap never needs the legacy O(heap-pages) `pages` blob.
+        if def.fsm_meta.is_none() {
+            let fsm = DiskBTree::create(ctx.pool, ctx.wal)?;
+            def.fsm_meta = Some(fsm.meta_page());
         }
         self.tables.insert(def.name.clone(), def);
         self.persist(ctx)
@@ -577,11 +597,27 @@ impl Catalog {
     /// orphaned pages are reclaimed once Phase 1's FSM lands (as with
     /// `DROP TABLE`). The schema (columns/constraints) is unchanged.
     pub fn truncate(&mut self, table: &str, ctx: &mut CatalogCtx) -> Result<()> {
-        let t = self
-            .tables
-            .get_mut(table)
-            .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
+        // An FSM-backed table empties by adopting a fresh, empty free-space map
+        // (the old tree's pages are orphaned, same accepted tradeoff as DROP);
+        // its keys were the page directory, so a new tree = zero pages. Legacy
+        // tables still clear the in-catalog `pages` list. Mint outside the
+        // borrow of `t` (needs `ctx.pool`/`ctx.wal`).
+        let fresh_fsm = {
+            let t = self
+                .tables
+                .get(table)
+                .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
+            if t.fsm_meta.is_some() {
+                Some(DiskBTree::create(ctx.pool, ctx.wal)?.meta_page())
+            } else {
+                None
+            }
+        };
+        let t = self.tables.get_mut(table).expect("checked above");
         t.pages.clear();
+        if let Some(meta) = fresh_fsm {
+            t.fsm_meta = Some(meta);
+        }
         // Row set is now empty; previously gathered stats are stale.
         self.stats.remove(table);
         self.persist(ctx)
@@ -667,6 +703,7 @@ mod tests {
                 ty: ColumnType::Int64,
             }],
             pages: vec![],
+            fsm_meta: None,
             rls_policy: None,
             events_enabled: false,
             serial_next: Default::default(),
@@ -693,6 +730,7 @@ mod tests {
             name: "t".to_string(),
             columns: vec![],
             pages: vec![],
+            fsm_meta: None,
             rls_policy: None,
             events_enabled: false,
             serial_next: Default::default(),
@@ -736,6 +774,7 @@ mod tests {
                 },
             ],
             pages: vec![7],
+            fsm_meta: None,
             rls_policy: None,
             events_enabled: false,
             serial_next: Default::default(),
@@ -785,6 +824,7 @@ mod tests {
                 },
             ],
             pages: vec![],
+            fsm_meta: None,
             rls_policy: None,
             events_enabled: false,
             serial_next: Default::default(),
@@ -817,6 +857,7 @@ mod tests {
             name: "t".to_string(),
             columns: vec![],
             pages: vec![],
+            fsm_meta: None,
             rls_policy: None,
             events_enabled: false,
             serial_next: Default::default(),

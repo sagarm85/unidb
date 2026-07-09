@@ -71,6 +71,7 @@ pub fn lobs_table_def() -> TableDef {
             col("data", ColumnType::Bytea),
         ],
         pages: Vec::new(),
+        fsm_meta: None,
         rls_policy: None,
         events_enabled: false,
         serial_next: Default::default(),
@@ -169,7 +170,7 @@ impl LobStore {
         pool: &BufferPool,
     ) -> Result<Vec<RowId>> {
         let candidates = self.index().search_eq(&OrderedValue::Int(lob_id), pool)?;
-        let heap = Heap::from_pages(self.page_size, lobs.pages.clone());
+        let heap = Heap::open(self.page_size, lobs.fsm_meta, lobs.pages.clone());
         let mut ordered: Vec<(i64, RowId)> = Vec::new();
         for rid in candidates {
             let bytes = match heap.get(rid, snapshot, xid, pool) {
@@ -198,7 +199,7 @@ impl LobStore {
         mut sink: W,
     ) -> Result<u64> {
         let rids = self.ordered_chunk_rids(lob_id, lobs, snapshot, xid, pool)?;
-        let heap = Heap::from_pages(self.page_size, lobs.pages.clone());
+        let heap = Heap::open(self.page_size, lobs.fsm_meta, lobs.pages.clone());
         let mut total = 0u64;
         for rid in rids {
             let bytes = match heap.get(rid, snapshot, xid, pool) {
@@ -291,7 +292,7 @@ pub fn ensure_lobs_table(
     // chunk rows (empty on a fresh database).
     let tree = DiskBTree::create(pool, wal)?;
     let table = catalog.lookup(LOBS_TABLE)?.clone();
-    let heap = Heap::from_pages(page_size, table.pages.clone());
+    let heap = Heap::open(page_size, table.fsm_meta, table.pages.clone());
     let xid = txn_mgr.begin(crate::txn::IsolationLevel::ReadCommitted, wal)?;
     let snapshot = txn_mgr.snapshot_for_statement(xid)?;
     for (rid, bytes) in heap.scan(&snapshot, xid, pool)? {

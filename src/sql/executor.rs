@@ -155,7 +155,7 @@ fn send_event_capture(
     }
     let payload = queue::payload::row_to_json(row, &table_def.columns);
     let events_def = ctx.catalog.lookup(EVENTS_TABLE)?.clone();
-    let heap = Heap::from_pages(ctx.page_size, events_def.pages.clone());
+    let heap = Heap::open(ctx.page_size, events_def.fsm_meta, events_def.pages.clone());
 
     let seq = ctx.next_event_seq.fetch_add(1, Ordering::SeqCst);
 
@@ -313,7 +313,7 @@ fn exec_drop_table(table: &str, if_exists: bool, ctx: &mut ExecCtx) -> Result<Ex
 /// recomputed on open). Returns an empty result set.
 fn exec_analyze(table: &str, ctx: &mut ExecCtx) -> Result<ExecResult> {
     let table_def = ctx.catalog.lookup(table)?.clone();
-    let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+    let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
     let mut rows = Vec::new();
     for (_, bytes) in heap.scan(&snapshot, ctx.xid, ctx.pool)? {
@@ -330,7 +330,7 @@ fn exec_truncate(table: &str, ctx: &mut ExecCtx) -> Result<ExecResult> {
     let table_def = ctx.catalog.lookup(table)?.clone();
     // Count the live rows removed (under this statement's snapshot) for the
     // result, before the page list is cleared.
-    let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+    let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
     let count = heap.scan(&snapshot, ctx.xid, ctx.pool)?.len();
     let mut cctx = catalog_ctx!(ctx);
@@ -362,6 +362,7 @@ fn exec_create_table(
         name,
         columns,
         pages: Vec::new(),
+        fsm_meta: None,
         rls_policy: None,
         events_enabled: false,
         serial_next,
@@ -421,7 +422,7 @@ fn exec_create_index(
         // vectors as the training sample, train centroids, then insert each row
         // into its cell. Training holds the sample in RAM transiently (one-time
         // build cost); the persisted index is bounded (centroids only).
-        let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+        let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
         let mut sample: Vec<(RowId, Vec<f32>)> = Vec::new();
         for (row_id, bytes) in heap.scan(&snapshot, ctx.xid, ctx.pool)? {
             let row = decode_row(&bytes, &table_def.columns)?;
@@ -449,7 +450,7 @@ fn exec_create_index(
         // P3.a/P3.b: a durable BTree/FullText index — a `DiskBTree` backfilled
         // from every committed row.
         let tree = DiskBTree::create(ctx.pool, ctx.wal)?;
-        let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+        let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
         for (row_id, bytes) in heap.scan(&snapshot, ctx.xid, ctx.pool)? {
             let row = decode_row(&bytes, &table_def.columns)?;
             match kind {
@@ -477,14 +478,22 @@ fn exec_create_index(
     Ok(ExecResult::CreatedIndex)
 }
 
-/// Persist a table's page list back to the catalog if the heap grew during
-/// this statement's execution.
+/// Persist a **legacy** table's page list back to the catalog if the heap grew
+/// during this statement's execution. For an **FSM-backed** table (the common
+/// case since the durable-FSM milestone) this is a no-op: the page directory
+/// lives in the durable FSM tree and self-persists at page-alloc time, so there
+/// is no catalog `pages` blob to rewrite — which is exactly what removed the
+/// O(heap-pages) blob-overflow (`HeapFull`) ceiling. Guarding on `fsm_meta`
+/// keeps pre-FSM catalogs (no `fsm_meta`) working via their old in-catalog list.
 fn persist_pages_if_changed(
     table: &str,
     heap: &Heap,
     original: &[PageId],
     ctx: &mut ExecCtx,
 ) -> Result<()> {
+    if heap.is_fsm_backed() {
+        return Ok(());
+    }
     if heap.page_ids() != original {
         let new_pages = heap.page_ids().to_vec();
         let mut cctx = catalog_ctx!(ctx);
@@ -503,7 +512,7 @@ fn exec_insert(
     // FK (M11): only referenced-table existence is enforced, and it's a
     // schema-level property — check it once per statement, not per row.
     enforce_referenced_tables_exist(&table_def, ctx.catalog)?;
-    let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+    let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
 
     let mut count = 0;
     for row_values in values {
@@ -563,7 +572,7 @@ fn exec_select(
         }
     }
 
-    let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+    let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
 
     let mut out = Vec::new();
@@ -605,7 +614,11 @@ pub(crate) fn exec_select_readonly<P: PageReader>(
     reader: &P,
 ) -> Result<ExecResult> {
     let table_def = catalog.lookup(table)?.clone();
-    let heap = Heap::from_pages(reader.page_size(), table_def.pages.clone());
+    let heap = Heap::open(
+        reader.page_size(),
+        table_def.fsm_meta,
+        table_def.pages.clone(),
+    );
     let mut out = Vec::new();
     for (i, (_, bytes)) in heap
         .scan(snapshot, self_xid, reader)?
@@ -726,7 +739,7 @@ fn try_exec_select_btree(
         None => return Ok(None),
     };
 
-    let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+    let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
     let mut out = Vec::new();
     for row_id in candidate_ids {
@@ -788,7 +801,7 @@ fn exec_select_near(
     let ivf = DiskIvfIndex::open(meta_page, ctx.page_size);
     let (metric, candidate_ids) = ivf.candidates(query, None, ctx.pool)?;
 
-    let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+    let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
     let mut scored: Vec<(f32, Vec<Literal>)> = Vec::new();
     for row_id in candidate_ids {
@@ -856,7 +869,7 @@ fn exec_update(
 ) -> Result<ExecResult> {
     let table_def = ctx.catalog.lookup(table)?.clone();
     enforce_referenced_tables_exist(&table_def, ctx.catalog)?;
-    let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+    let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
 
     let matching = matching_rows(&heap, &snapshot, ctx, &table_def, predicate)?;
@@ -921,7 +934,7 @@ fn exec_update(
 
 fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Result<ExecResult> {
     let table_def = ctx.catalog.lookup(table)?.clone();
-    let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+    let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
 
     let matching = matching_rows(&heap, &snapshot, ctx, &table_def, predicate)?;
@@ -2240,9 +2253,9 @@ mod tests {
     }
 
     #[test]
-    fn table_survives_reopen_via_catalog_pages() {
+    fn table_survives_reopen_via_durable_fsm() {
         let dir = tempdir().unwrap();
-        let (root_page, rid_data);
+        let (root_page, fsm_meta, legacy_pages);
         {
             let mut h = Harness::new(dir.path());
             let xid = h.begin();
@@ -2251,12 +2264,21 @@ mod tests {
             h.commit(xid);
             h.pool.flush_all(h.wal.durable_lsn()).unwrap();
             root_page = h.control.lock().unwrap().catalog_root;
-            rid_data = h.catalog.lookup("t").unwrap().pages.clone();
+            let def = h.catalog.lookup("t").unwrap();
+            fsm_meta = def.fsm_meta;
+            legacy_pages = def.pages.clone();
         }
         assert_ne!(root_page, crate::format::INVALID_PAGE_ID);
+        // The durable FSM (not the old catalog `pages` blob) now holds the page
+        // directory — that is what carries the table's pages across a reopen.
         assert!(
-            !rid_data.is_empty(),
-            "table must have recorded its page list"
+            fsm_meta.is_some(),
+            "table must have minted a durable free-space map"
+        );
+        assert!(
+            legacy_pages.is_empty(),
+            "FSM-backed table must not grow the catalog page-list blob \
+             (that O(pages) blob rewrite was the HeapFull ceiling)"
         );
 
         // Reopen: reconstruct catalog + pool from what was persisted.
@@ -2265,7 +2287,11 @@ mod tests {
         let control = crate::control::read(&dir.path().join("control")).unwrap();
         let catalog = Catalog::load(&control, &pool).unwrap();
         let table_def = catalog.lookup("t").unwrap();
-        let heap = Heap::from_pages(DEFAULT_PAGE_SIZE as usize, table_def.pages.clone());
+        let heap = Heap::open(
+            DEFAULT_PAGE_SIZE as usize,
+            table_def.fsm_meta,
+            table_def.pages.clone(),
+        );
         let snap = crate::mvcc::Snapshot::new(1000, 1000, vec![]);
         let rows = heap.scan(&snap, 1000, &pool).unwrap();
         assert_eq!(rows.len(), 1);
@@ -2382,6 +2408,7 @@ mod tests {
                 ty: ColumnType::Vector(4),
             }],
             pages: vec![],
+            fsm_meta: None,
             rls_policy: None,
             events_enabled: false,
             serial_next: Default::default(),
@@ -2648,7 +2675,11 @@ mod tests {
         let table_def = catalog.lookup("t").unwrap();
         assert_eq!(table_def.columns[0].ty, ColumnType::Decimal(10, 2));
         assert_eq!(table_def.columns[1].ty, ColumnType::Timestamp);
-        let heap = Heap::from_pages(DEFAULT_PAGE_SIZE as usize, table_def.pages.clone());
+        let heap = Heap::open(
+            DEFAULT_PAGE_SIZE as usize,
+            table_def.fsm_meta,
+            table_def.pages.clone(),
+        );
         let snap = crate::mvcc::Snapshot::new(1000, 1000, vec![]);
         let rows = heap.scan(&snap, 1000, &pool).unwrap();
         let decoded = decode_row(&rows[0].1, &table_def.columns).unwrap();
