@@ -310,7 +310,10 @@ mod tests {
             let h = handle.clone();
             tasks.push(tokio::spawn(async move {
                 let xid = h.begin(None).await.unwrap();
-                let rid = h.insert(xid, format!("row-{i}").into_bytes()).await.unwrap();
+                let rid = h
+                    .insert(xid, format!("row-{i}").into_bytes())
+                    .await
+                    .unwrap();
                 h.commit(xid).await.unwrap();
                 rid
             }));

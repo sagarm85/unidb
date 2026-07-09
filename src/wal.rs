@@ -24,10 +24,12 @@
 // is `Sync` and every method takes `&self`. LSN allocation and the physical
 // append happen together under that lock, so many concurrent appenders produce
 // a correctly-ordered, non-interleaved log (monotonic LSNs, no torn records).
-// Group commit is unchanged: in `deferred_sync` mode appends skip the per-call
-// fsync, and one later `sync()` forces a single fsync covering every record
-// appended by every thread since — the amortization that makes throughput scale
-// with cores rather than fsyncs.
+// Group commit (P5.e-3): in `deferred_sync` mode appends skip the per-call
+// fsync; committers instead call `sync_up_to`, whose leader runs the actual
+// `sync_all` in `group_fsync` **with the append lock released**, so other
+// threads keep appending their commit records while the leader fsyncs and that
+// one fsync makes all of them durable — the amortization that makes throughput
+// scale with concurrent writers rather than fsyncs.
 
 use std::{
     fs::{File, OpenOptions},
@@ -449,9 +451,9 @@ impl Wal {
     /// `target`, some other committer's fsync has already made us durable;
     /// (2) after taking the leader-election [`Wal::flush_lock`], re-check —
     /// another leader may have flushed past `target` while we waited for the
-    /// lock. Only the thread that finds itself still behind actually fsyncs, and
-    /// its one fsync advances `durable_lsn` to the current tail (`fsync_locked`
-    /// flushes the whole buffered writer), covering all the waiters behind it.
+    /// lock. Only the thread that finds itself still behind actually fsyncs, via
+    /// [`Wal::group_fsync`], whose one fsync covers every commit that landed
+    /// before it — including the followers now blocked on `flush_lock`.
     pub fn sync_up_to(&self, target: Lsn) -> Result<()> {
         if self.durable_lsn() >= target {
             return Ok(());
@@ -460,7 +462,60 @@ impl Wal {
         if self.durable_lsn() >= target {
             return Ok(());
         }
-        self.sync()
+        self.group_fsync()
+    }
+
+    /// The actual group-commit fsync (P5.e-3), called only by the `flush_lock`
+    /// leader. Its defining property — and the whole reason write throughput
+    /// scales — is that **the slow `sync_all` runs without the append lock
+    /// held**, so other committers keep appending their `WAL_TXN_COMMIT` records
+    /// while the leader fsyncs; the one fsync then makes all of them durable.
+    ///
+    /// Three phases: (1) under the append lock, push the buffered writer to the
+    /// OS and capture both the flushed tail LSN and a `try_clone`d file handle;
+    /// (2) release the append lock and `sync_all` the cloned handle (same
+    /// underlying file); (3) re-take the append lock and advance `durable_lsn`
+    /// to the captured tail. Poison / fault-injection are handled in phase 1 so
+    /// their existing semantics (P1.b) are unchanged.
+    fn group_fsync(&self) -> Result<()> {
+        let (flushed_lsn, file) = {
+            let mut inner = self.lock();
+            if inner.poisoned {
+                return Err(DbError::DurabilityFailure(
+                    "WAL is poisoned by an earlier fsync failure; session is unrecoverable".into(),
+                ));
+            }
+            if inner.fsync_fault_armed {
+                inner.fsync_fault_armed = false;
+                inner.poisoned = true;
+                tracing::error!("WAL fsync fault injected — poisoning session (P1.b)");
+                return Err(DbError::DurabilityFailure(
+                    "injected WAL fsync failure".into(),
+                ));
+            }
+            if let Err(e) = inner.writer.flush() {
+                inner.poisoned = true;
+                return Err(DbError::DurabilityFailure(format!(
+                    "WAL buffer flush failed: {e}"
+                )));
+            }
+            let file = inner.writer.get_ref().try_clone().map_err(|e| {
+                inner.poisoned = true;
+                DbError::DurabilityFailure(format!("WAL fd clone for group fsync failed: {e}"))
+            })?;
+            (inner.next_lsn - 1, file)
+        };
+        // The slow part, with the append lock RELEASED so appends coalesce.
+        if let Err(e) = file.sync_all() {
+            let mut inner = self.lock();
+            inner.poisoned = true;
+            return Err(DbError::DurabilityFailure(format!("WAL fsync failed: {e}")));
+        }
+        let mut inner = self.lock();
+        if inner.durable_lsn < flushed_lsn {
+            inner.durable_lsn = flushed_lsn;
+        }
+        Ok(())
     }
 
     pub fn log_checkpoint(&self) -> Result<Lsn> {

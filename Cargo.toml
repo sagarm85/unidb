@@ -103,6 +103,10 @@ name = "scale"
 harness = false
 
 [[bench]]
+name = "concurrent_writers"
+harness = false
+
+[[bench]]
 name = "checkpoint"
 harness = false
 
