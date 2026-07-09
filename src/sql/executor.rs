@@ -19,6 +19,8 @@
 // M1.c proving SQL works end-to-end.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use serde_json::Value as JsonValue;
 
@@ -59,21 +61,23 @@ use super::logical::{CmpOp, Expr, Literal, LogicalPlan};
 /// Everything the executor needs, bundled to avoid a long parameter list.
 pub struct ExecCtx<'a> {
     pub catalog: &'a mut Catalog,
-    pub txn_mgr: &'a mut TransactionManager,
-    pub pool: &'a mut BufferPool,
-    pub wal: &'a mut Wal,
-    pub lock_mgr: &'a mut LockManager,
+    pub txn_mgr: &'a TransactionManager,
+    pub pool: &'a BufferPool,
+    pub wal: &'a Wal,
+    pub lock_mgr: &'a LockManager,
     pub control_path: &'a Path,
-    pub control: &'a mut ControlData,
+    pub control: &'a Mutex<ControlData>,
     pub page_size: usize,
     pub xid: Xid,
     /// Next `seq` to assign in `__events__` (M4). Lives here rather than as
     /// an extra function argument threaded through `execute()` — unlike
     /// M3.c's `edge_index` (needed by exactly one top-level entry point,
     /// `graph_executor::execute`), event capture must reach the deeply
-    /// nested private `exec_insert`/`exec_update`/`exec_delete`. Incremented in
-    /// place by `send_event_capture` on every captured event.
-    pub next_event_seq: &'a mut u64,
+    /// nested private `exec_insert`/`exec_update`/`exec_delete`. Bumped by
+    /// `send_event_capture` on every captured event. Atomic (P5.e) so the
+    /// shared `&self` engine can hand out `__events__` sequence numbers from
+    /// concurrent writer threads without a lock.
+    pub next_event_seq: &'a AtomicU64,
 }
 
 /// Insert `row`'s durable-index column values into their on-disk structures
@@ -153,8 +157,7 @@ fn send_event_capture(
     let events_def = ctx.catalog.lookup(EVENTS_TABLE)?.clone();
     let heap = Heap::from_pages(ctx.page_size, events_def.pages.clone());
 
-    let seq = *ctx.next_event_seq;
-    *ctx.next_event_seq += 1;
+    let seq = ctx.next_event_seq.fetch_add(1, Ordering::SeqCst);
 
     let encoded = encode_row(&queue::event_row(
         seq as i64,
@@ -565,7 +568,14 @@ fn exec_select(
 
     let mut out = Vec::new();
     let mut read_ids = Vec::new();
-    for (row_id, bytes) in heap.scan(&snapshot, ctx.xid, ctx.pool)? {
+    for (i, (row_id, bytes)) in heap
+        .scan(&snapshot, ctx.xid, ctx.pool)?
+        .into_iter()
+        .enumerate()
+    {
+        if i % 1024 == 0 {
+            crate::query_limits::check()?; // P5.f: timeout / cancellation
+        }
         let row = decode_row(&bytes, &table_def.columns)?;
         if predicate_matches(predicate, &table_def.columns, &row)? {
             // P1.d: this row is part of the statement's read set (an SSI
@@ -597,7 +607,14 @@ pub(crate) fn exec_select_readonly<P: PageReader>(
     let table_def = catalog.lookup(table)?.clone();
     let heap = Heap::from_pages(reader.page_size(), table_def.pages.clone());
     let mut out = Vec::new();
-    for (_, bytes) in heap.scan(snapshot, self_xid, reader)? {
+    for (i, (_, bytes)) in heap
+        .scan(snapshot, self_xid, reader)?
+        .into_iter()
+        .enumerate()
+    {
+        if i % 1024 == 0 {
+            crate::query_limits::check()?; // P5.f: timeout / cancellation
+        }
         let row = decode_row(&bytes, &table_def.columns)?;
         if predicate_matches(predicate, &table_def.columns, &row)? {
             out.push(project_row(projection, &table_def.columns, &row)?);
@@ -1410,7 +1427,7 @@ fn enforce_unique(
     heap: &Heap,
     snapshot: &Snapshot,
     xid: Xid,
-    pool: &mut BufferPool,
+    pool: &BufferPool,
     exclude: Option<RowId>,
 ) -> Result<()> {
     let sets = unique_column_sets(table_def)?;
@@ -2017,10 +2034,10 @@ mod tests {
         lock_mgr: LockManager,
         txn_mgr: TransactionManager,
         catalog: Catalog,
-        control: ControlData,
+        control: Mutex<ControlData>,
         control_path: std::path::PathBuf,
         page_size: usize,
-        next_event_seq: u64,
+        next_event_seq: AtomicU64,
     }
 
     impl Harness {
@@ -2036,10 +2053,10 @@ mod tests {
                 lock_mgr: LockManager::new(),
                 txn_mgr: TransactionManager::new(),
                 catalog: Catalog::new(),
-                control,
+                control: Mutex::new(control),
                 control_path,
                 page_size: DEFAULT_PAGE_SIZE as usize,
-                next_event_seq: 1,
+                next_event_seq: AtomicU64::new(1),
             }
         }
 
@@ -2049,15 +2066,15 @@ mod tests {
             let plan = plans.remove(0);
             let mut ctx = ExecCtx {
                 catalog: &mut self.catalog,
-                txn_mgr: &mut self.txn_mgr,
-                pool: &mut self.pool,
-                wal: &mut self.wal,
-                lock_mgr: &mut self.lock_mgr,
+                txn_mgr: &self.txn_mgr,
+                pool: &self.pool,
+                wal: &self.wal,
+                lock_mgr: &self.lock_mgr,
                 control_path: &self.control_path,
-                control: &mut self.control,
+                control: &self.control,
                 page_size: self.page_size,
                 xid,
-                next_event_seq: &mut self.next_event_seq,
+                next_event_seq: &self.next_event_seq,
             };
             execute(plan, &mut ctx)
         }
@@ -2233,7 +2250,7 @@ mod tests {
             h.exec_as(xid, "INSERT INTO t (id) VALUES (42)").unwrap();
             h.commit(xid);
             h.pool.flush_all(h.wal.durable_lsn()).unwrap();
-            root_page = h.control.catalog_root;
+            root_page = h.control.lock().unwrap().catalog_root;
             rid_data = h.catalog.lookup("t").unwrap().pages.clone();
         }
         assert_ne!(root_page, crate::format::INVALID_PAGE_ID);
@@ -2243,10 +2260,10 @@ mod tests {
         );
 
         // Reopen: reconstruct catalog + pool from what was persisted.
-        let mut pool =
+        let pool =
             BufferPool::open(&dir.path().join("data.db"), DEFAULT_PAGE_SIZE as usize, 64).unwrap();
         let control = crate::control::read(&dir.path().join("control")).unwrap();
-        let catalog = Catalog::load(&control, &mut pool).unwrap();
+        let catalog = Catalog::load(&control, &pool).unwrap();
         let table_def = catalog.lookup("t").unwrap();
         let heap = Heap::from_pages(DEFAULT_PAGE_SIZE as usize, table_def.pages.clone());
         let snap = crate::mvcc::Snapshot::new(1000, 1000, vec![]);
@@ -2624,10 +2641,10 @@ mod tests {
             h.pool.flush_all(h.wal.durable_lsn()).unwrap();
         }
 
-        let mut pool =
+        let pool =
             BufferPool::open(&dir.path().join("data.db"), DEFAULT_PAGE_SIZE as usize, 64).unwrap();
         let control = crate::control::read(&dir.path().join("control")).unwrap();
-        let catalog = Catalog::load(&control, &mut pool).unwrap();
+        let catalog = Catalog::load(&control, &pool).unwrap();
         let table_def = catalog.lookup("t").unwrap();
         assert_eq!(table_def.columns[0].ty, ColumnType::Decimal(10, 2));
         assert_eq!(table_def.columns[1].ty, ColumnType::Timestamp);

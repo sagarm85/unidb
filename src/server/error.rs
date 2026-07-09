@@ -39,6 +39,11 @@ fn map_status(err: &DbError) -> (StatusCode, &'static str) {
         DbError::SerializationFailure { .. } => (StatusCode::CONFLICT, "SERIALIZATION_FAILURE"),
         DbError::Deadlock { .. } => (StatusCode::CONFLICT, "DEADLOCK"),
 
+        // Resource control (P5.f): the query hit its time budget or was
+        // cancelled — both are request-scoped, not server faults.
+        DbError::QueryTimeout { .. } => (StatusCode::REQUEST_TIMEOUT, "QUERY_TIMEOUT"),
+        DbError::QueryCancelled => (StatusCode::REQUEST_TIMEOUT, "QUERY_CANCELLED"),
+
         DbError::SqlParse(_) => (StatusCode::BAD_REQUEST, "SQL_PARSE_ERROR"),
         DbError::SqlPlan(_) => (StatusCode::BAD_REQUEST, "SQL_PLAN_ERROR"),
         DbError::SqlUnsupported(_) => (StatusCode::BAD_REQUEST, "SQL_UNSUPPORTED"),

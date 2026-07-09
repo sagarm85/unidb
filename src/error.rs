@@ -62,6 +62,12 @@ pub enum DbError {
     #[error("deadlock detected: transaction {xid} chosen as victim to break a wait-for cycle")]
     Deadlock { xid: u64 },
 
+    #[error("query exceeded its time limit of {limit_ms} ms")]
+    QueryTimeout { limit_ms: u64 },
+
+    #[error("query was cancelled")]
+    QueryCancelled,
+
     #[error("transaction {xid} is not active")]
     TxnNotActive { xid: u64 },
 

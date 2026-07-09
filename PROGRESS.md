@@ -2545,12 +2545,12 @@ tokio/reqwest/axum (rusqlite is a dev-dep, outside the normal graph).
 
 ---
 
-## Phase 5 — Concurrency & performance   [IN PROGRESS]   2026-07-09
+## Phase 5 — Concurrency & performance   [COMPLETE]   2026-07-09
 
-**Branches / PRs:** landing incrementally. **Part 1 — P5.a–P5.d (concurrency
-infrastructure) merged to `main` 2026-07-09 via [PR #14] (`30109d9`).** The
-remainder (P5.e/P5.f + the scaling benchmark) continues on branch
-`p5e-concurrent-writers` off updated `main`, in a follow-up PR.
+**Branches / PRs:** landed in two parts. **Part 1 — P5.a–P5.d (concurrency
+infrastructure) merged to `main` 2026-07-09 via [PR #14] (`30109d9`).** **Part 2
+— P5.e (multiple writers) + P5.f (resource control)** on branch
+`p5e-concurrent-writers` off updated `main` (PR #15).
 
 **Locked-decision sign-off (CLAUDE.md §3, required before any work):** Phase 5
 reverses the M5 "single writer thread, `Engine` is `!Sync`" simplification —
@@ -2562,14 +2562,34 @@ concurrency (D5 preserved by page latching; D11/D12 completed by real wait
 queues + deadlock detection replacing abort-only). No other §3 decision is
 touched.
 
-**Summary:** _in progress. Part 1 (concurrency infrastructure) shipped and
-green; the scales-with-cores payoff (P5.e) plus its metrics table and
-peak-memory note land at phase close._
+**Summary:** _complete. Part 1 (P5.a–P5.d) built the thread-safe storage core +
+real lock manager; Part 2 (P5.e/P5.f) made `Engine` `Send + Sync`, replaced the
+single writer thread with an `Arc<Engine>` worker pool, wired heap page latches
+and a leader-election group-commit barrier so **write throughput scales with
+cores (3.68× at 8 writers)**, and added per-query timeouts / cancellation /
+`work_mem`. Crash harness 19/19 throughout; the sync invariant holds._
 
 **Checkpoint status:**
 - **P5.a — buffer-pool latching — DONE.** Concurrent pool (`Mutex<PoolState>` frames, mmap behind `Arc<RwLock>`), hand-rolled `unsafe`-free per-page shared/exclusive latch table; D5 (WAL-before-page) preserved under concurrency.
 - **P5.b — concurrent WAL append — DONE.** `Mutex<WalInner>`, all methods `&self`; serialized LSN allocation + group-batched flush.
 - **P5.c — concurrent transaction manager — DONE.** `&self` `LockManager`; txn write path takes `&Wal`/`&LockManager`; 3 adversarial concurrency tests (unique-xid allocation, vacuum-horizon soundness under writer churn, single-winner row locking).
 - **P5.d — real lock manager — DONE.** Shared/exclusive modes, blocking `Condvar` wait queues, wait-for-graph deadlock detection (`DbError::Deadlock` → 409). SI first-committer-wins kept as the `NoWait` policy. 4 multi-threaded tests incl. a genuine 2-thread deadlock. Crash harness 19/19; sync-invariant holds.
-- **P5.e — multiple writers — NEXT.** `Heap` → interior-mutable `&self`, then `Engine` → `Sync`, writer/connection pool + admission control. The scales-with-cores payoff and headline benchmark.
-- **P5.f — resource control — pending.** Query timeouts, cancellation, per-query memory limits.
+- **P5.e — multiple writers — DONE** (branch `p5e-concurrent-writers`, 2026-07-09).
+  - **Step 1 (`75eaaa1`)** — `Heap` → interior-mutable `&self` (deadlock-safe FSM behind a `Mutex` never held across a page latch or WAL I/O), so every storage component is `&self`.
+  - **Step 2 (`0478db7`)** — `Engine` is `Send + Sync`. The 6 mutated fields became interior-mutable (`control → Mutex<ControlData>` + a cached immutable `page_size`; `next_lob_id`/`next_event_seq`/`checkpoints_triggered` → atomics; `auto_checkpoint`/`last_checkpoint` → `Mutex`); all 27 `&mut self` methods → `&self`; every vestigial `&mut BufferPool/Wal/…` signature+reborrow → `&`. `checkpoint::run` takes `&Mutex<ControlData>` and locks only for the small control update (never across an fsync). Compile assertion `Send` → `Send + Sync`.
+  - **Step 3 (`f977fb3`)** — concurrent writers. `server/engine_handle.rs` rewritten to `Arc<Engine>` + `spawn_blocking` (channel/`worker_loop` deleted; read fast-path kept). **Heap page latches** (`BufferPool::latch_exclusive`, built in P5.a, finally wired) wrap every heap read-modify-write, so two writers can't lose an update; insert/update use a re-checking `acquire_page_for_insert`; latches are taken one page at a time (no two-latch deadlock). A coarse `write_serial` `Mutex` serializes the non-CRUD paths that do a non-atomic read-catalog-then-mutate-shared-index sequence (edges/LOBs/event tables/DDL/vacuum) — **raw CRUD + reads stay concurrent**; SQL already serializes on the catalog `RwLock`. `tests/concurrent_writers.rs` (insert stress / distinct-row updates / same-row contention, all deadline-guarded).
+  - **Step 4 (`29fe805`)** — group commit that scales. `txn::commit` returns the commit LSN; `Engine::commit` forces durability via new `Wal::sync_up_to`, whose leader (`group_fsync`) runs `sync_all` **with the append lock released** so concurrent committers coalesce behind one fsync.
+
+  **Headline benchmark (`benches/concurrent_writers.rs`, 8 logical cores, group-commit mode, one insert+commit txn per iteration):**
+
+  | writers | commits/sec | speedup |
+  |--------:|------------:|--------:|
+  |       1 |         325 |   1.00× |
+  |       2 |         330 |   1.02× |
+  |       4 |         647 |   1.99× |
+  |       8 |        1197 |   3.68× |
+
+  Write throughput now scales with concurrent writers (3.68× at 8 threads) versus the flat single-writer-thread ceiling. Crash harness **still 19/19** (incl. P12 fsync-fault); sync-invariant holds. **Documented limitation:** only *raw CRUD* scales with cores; SQL/graph/LOB writes serialize (catalog `RwLock` / `write_serial`) — finer-grained (latch-coupled B-tree) index concurrency is future work.
+- **P5.f — resource control — DONE** (`6f8e8c4`, 2026-07-09). Per-query **timeout**, cooperative **cancellation** (`CancelToken`), and **`work_mem`** (spill row budget), held in a thread-local `QueryLimits` installed for the call (a query runs on one worker thread). The executor's scan loops call `query_limits::check()` every 1024 rows (`QueryTimeout`/`QueryCancelled`); `sort_mem_rows`/`hash_join_mem_rows` consult the per-query `work_mem`. Entry point `Engine::execute_sql_with_limits`; server maps both errors to 408. Tests: unit (`query_limits`) + `tests/query_limits.rs` end-to-end (timeout aborts a scan, generous timeout completes, pre-/cross-thread cancel abort, tiny `work_mem` forces the `ORDER BY` spill yet stays correctly ordered).
+
+**Phase 5 is COMPLETE** (P5.a–P5.f). The single-writer → concurrent-writer unlock shipped; write throughput scales with cores; the crash harness stays 19/19 and the sync invariant (no tokio/reqwest/axum in the default engine) holds.

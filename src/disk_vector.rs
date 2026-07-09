@@ -215,8 +215,8 @@ impl DiskIvfIndex {
         nprobe_req: usize,
         iters: usize,
         metric: Metric,
-        pool: &mut BufferPool,
-        wal: &mut Wal,
+        pool: &BufferPool,
+        wal: &Wal,
     ) -> Result<DiskIvfIndex> {
         let page_size = pool.page_size();
         let centroids = train_centroids(dim, sample, nlist_req, iters, metric);
@@ -268,7 +268,7 @@ impl DiskIvfIndex {
     }
 
     /// Load the meta page's config (bounded; a single page read).
-    pub fn load_header(&self, pool: &mut BufferPool) -> Result<IvfHeader> {
+    pub fn load_header(&self, pool: &BufferPool) -> Result<IvfHeader> {
         let page = pool.fetch_page(self.meta_page)?;
         let body = &page.as_bytes()[PAGE_HEADER_SIZE..];
         if body.first().copied() != Some(IVF_META_MAGIC) {
@@ -292,7 +292,7 @@ impl DiskIvfIndex {
 
     /// Load the centroid table (bounded: `nlist * dim` floats) by walking the
     /// centroid page chain.
-    fn load_centroids(&self, hdr: &IvfHeader, pool: &mut BufferPool) -> Result<Vec<Vec<f32>>> {
+    fn load_centroids(&self, hdr: &IvfHeader, pool: &BufferPool) -> Result<Vec<Vec<f32>>> {
         let mut flat: Vec<f32> = Vec::with_capacity(hdr.nlist * hdr.dim);
         let mut pid = hdr.centroid_head;
         while pid != INVALID_PAGE_ID {
@@ -321,13 +321,7 @@ impl DiskIvfIndex {
 
     /// Insert `(rid, vector)`: assign to the nearest cell and record it in the
     /// durable posting-list tree (one WAL mini-txn).
-    pub fn insert(
-        &self,
-        rid: RowId,
-        vector: &[f32],
-        pool: &mut BufferPool,
-        wal: &mut Wal,
-    ) -> Result<()> {
+    pub fn insert(&self, rid: RowId, vector: &[f32], pool: &BufferPool, wal: &Wal) -> Result<()> {
         let hdr = self.load_header(pool)?;
         let centroids = self.load_centroids(&hdr, pool)?;
         let cell = nearest_centroid(&centroids, hdr.metric, vector);
@@ -341,13 +335,7 @@ impl DiskIvfIndex {
 
     /// Remove `(rid, vector)` from its cell's posting list (used by vacuum's
     /// aliasing gate so a reused slot can't surface a stale candidate).
-    pub fn remove(
-        &self,
-        rid: RowId,
-        vector: &[f32],
-        pool: &mut BufferPool,
-        wal: &mut Wal,
-    ) -> Result<()> {
+    pub fn remove(&self, rid: RowId, vector: &[f32], pool: &BufferPool, wal: &Wal) -> Result<()> {
         let hdr = self.load_header(pool)?;
         let centroids = self.load_centroids(&hdr, pool)?;
         let cell = nearest_centroid(&centroids, hdr.metric, vector);
@@ -366,7 +354,7 @@ impl DiskIvfIndex {
         &self,
         query: &[f32],
         nprobe_override: Option<usize>,
-        pool: &mut BufferPool,
+        pool: &BufferPool,
     ) -> Result<(Metric, Vec<RowId>)> {
         let hdr = self.load_header(pool)?;
         let centroids = self.load_centroids(&hdr, pool)?;
@@ -393,14 +381,14 @@ impl DiskIvfIndex {
     /// stored vector for a candidate `RowId` (the heap, in production). Convenience
     /// wrapper over [`Self::candidates`] for benches/tests where the fetch source
     /// is independent of the buffer pool; the SQL executor calls `candidates`
-    /// directly so its heap fetch shares the same `&mut BufferPool` and re-checks
+    /// directly so its heap fetch shares the same `&BufferPool` and re-checks
     /// MVCC visibility per row.
     pub fn search<F>(
         &self,
         query: &[f32],
         k: usize,
         nprobe_override: Option<usize>,
-        pool: &mut BufferPool,
+        pool: &BufferPool,
         fetch: F,
     ) -> Result<Vec<(RowId, f32)>>
     where
@@ -418,7 +406,7 @@ impl DiskIvfIndex {
 
     /// Approximate in-RAM footprint of the centroid table in bytes — bounded by
     /// `nlist * dim`, independent of corpus size (the whole point vs. HNSW).
-    pub fn ram_bytes(&self, pool: &mut BufferPool) -> Result<usize> {
+    pub fn ram_bytes(&self, pool: &BufferPool) -> Result<usize> {
         let hdr = self.load_header(pool)?;
         Ok(hdr.nlist * hdr.dim * std::mem::size_of::<f32>())
     }
@@ -471,8 +459,8 @@ fn centroid_page_bytes(page_id: PageId, next: PageId, floats: &[f32], page_size:
 /// recovered exactly like a `DiskBTree` node), stamp the LSN, write it. Mirrors
 /// `btree_index::write_raw`.
 fn write_image(
-    pool: &mut BufferPool,
-    wal: &mut Wal,
+    pool: &BufferPool,
+    wal: &Wal,
     txn_id: u64,
     prev_lsn: Lsn,
     page_id: PageId,
@@ -506,9 +494,9 @@ mod tests {
     #[test]
     fn ivf_finds_nearest_on_separated_clusters() {
         let dir = tempdir().unwrap();
-        let mut pool =
+        let pool =
             BufferPool::open(&dir.path().join("data.db"), DEFAULT_PAGE_SIZE as usize, 256).unwrap();
-        let mut wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
+        let wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
 
         let centers = [[0.0, 0.0], [100.0, 0.0], [0.0, 100.0], [100.0, 100.0]];
         let mut vectors: HashMap<RowId, Vec<f32>> = HashMap::new();
@@ -526,15 +514,14 @@ mod tests {
         }
 
         let ivf =
-            DiskIvfIndex::create(2, &sample, 4, 2, 10, Metric::Euclidean, &mut pool, &mut wal)
-                .unwrap();
+            DiskIvfIndex::create(2, &sample, 4, 2, 10, Metric::Euclidean, &pool, &wal).unwrap();
         for (r, v) in &vectors {
-            ivf.insert(*r, v, &mut pool, &mut wal).unwrap();
+            ivf.insert(*r, v, &pool, &wal).unwrap();
         }
 
         let query = vec![100.0, 0.0];
         let results = ivf
-            .search(&query, 5, None, &mut pool, |r| vectors.get(&r).cloned())
+            .search(&query, 5, None, &pool, |r| vectors.get(&r).cloned())
             .unwrap();
         assert!(!results.is_empty());
         assert!(
@@ -550,15 +537,14 @@ mod tests {
     #[test]
     fn ram_footprint_is_bounded_by_nlist_not_corpus() {
         let dir = tempdir().unwrap();
-        let mut pool =
+        let pool =
             BufferPool::open(&dir.path().join("data.db"), DEFAULT_PAGE_SIZE as usize, 256).unwrap();
-        let mut wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
+        let wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
         let sample: Vec<Vec<f32>> = (0..1000).map(|i| vec![i as f32, (i * 2) as f32]).collect();
         let ivf =
-            DiskIvfIndex::create(2, &sample, 16, 4, 5, Metric::Euclidean, &mut pool, &mut wal)
-                .unwrap();
-        assert_eq!(ivf.ram_bytes(&mut pool).unwrap(), 16 * 2 * 4);
-        assert_eq!(ivf.load_header(&mut pool).unwrap().nlist, 16);
+            DiskIvfIndex::create(2, &sample, 16, 4, 5, Metric::Euclidean, &pool, &wal).unwrap();
+        assert_eq!(ivf.ram_bytes(&pool).unwrap(), 16 * 2 * 4);
+        assert_eq!(ivf.load_header(&pool).unwrap().nlist, 16);
     }
 
     /// The centroid table survives being reloaded from disk through a fresh
@@ -566,20 +552,19 @@ mod tests {
     #[test]
     fn reopen_by_meta_page_preserves_search() {
         let dir = tempdir().unwrap();
-        let mut pool =
+        let pool =
             BufferPool::open(&dir.path().join("data.db"), DEFAULT_PAGE_SIZE as usize, 256).unwrap();
-        let mut wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
+        let wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
 
         let sample: Vec<Vec<f32>> = (0..200).map(|i| vec![i as f32, -(i as f32)]).collect();
         let mut vectors: HashMap<RowId, Vec<f32>> = HashMap::new();
         let meta = {
             let ivf =
-                DiskIvfIndex::create(2, &sample, 8, 4, 8, Metric::Euclidean, &mut pool, &mut wal)
-                    .unwrap();
+                DiskIvfIndex::create(2, &sample, 8, 4, 8, Metric::Euclidean, &pool, &wal).unwrap();
             for (i, v) in sample.iter().enumerate() {
                 let r = rid(i as u32);
                 vectors.insert(r, v.clone());
-                ivf.insert(r, v, &mut pool, &mut wal).unwrap();
+                ivf.insert(r, v, &pool, &wal).unwrap();
             }
             ivf.meta_page()
         };
@@ -588,7 +573,7 @@ mod tests {
         let reopened = DiskIvfIndex::open(meta, DEFAULT_PAGE_SIZE as usize);
         let query = vec![150.0, -150.0];
         let results = reopened
-            .search(&query, 1, Some(8), &mut pool, |r| vectors.get(&r).cloned())
+            .search(&query, 1, Some(8), &pool, |r| vectors.get(&r).cloned())
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, rid(150));
@@ -600,24 +585,21 @@ mod tests {
     #[test]
     fn empty_table_index_is_flat_but_correct() {
         let dir = tempdir().unwrap();
-        let mut pool =
+        let pool =
             BufferPool::open(&dir.path().join("data.db"), DEFAULT_PAGE_SIZE as usize, 256).unwrap();
-        let mut wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
+        let wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
 
-        let ivf =
-            DiskIvfIndex::create(2, &[], 16, 8, 5, Metric::Euclidean, &mut pool, &mut wal).unwrap();
-        assert_eq!(ivf.load_header(&mut pool).unwrap().nlist, 1);
+        let ivf = DiskIvfIndex::create(2, &[], 16, 8, 5, Metric::Euclidean, &pool, &wal).unwrap();
+        assert_eq!(ivf.load_header(&pool).unwrap().nlist, 1);
 
         let mut vectors: HashMap<RowId, Vec<f32>> = HashMap::new();
         for i in 0..50u32 {
             let v = vec![i as f32, i as f32];
             vectors.insert(rid(i), v.clone());
-            ivf.insert(rid(i), &v, &mut pool, &mut wal).unwrap();
+            ivf.insert(rid(i), &v, &pool, &wal).unwrap();
         }
         let results = ivf
-            .search(&[0.0, 0.0], 3, None, &mut pool, |r| {
-                vectors.get(&r).cloned()
-            })
+            .search(&[0.0, 0.0], 3, None, &pool, |r| vectors.get(&r).cloned())
             .unwrap();
         let ids: Vec<u32> = results.iter().map(|(r, _)| r.page_id).collect();
         assert_eq!(ids, vec![0, 1, 2]);
@@ -627,28 +609,28 @@ mod tests {
     #[test]
     fn remove_drops_candidate() {
         let dir = tempdir().unwrap();
-        let mut pool =
+        let pool =
             BufferPool::open(&dir.path().join("data.db"), DEFAULT_PAGE_SIZE as usize, 256).unwrap();
-        let mut wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
+        let wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
 
         let sample: Vec<Vec<f32>> = (0..40).map(|i| vec![i as f32, i as f32]).collect();
-        let ivf = DiskIvfIndex::create(2, &sample, 4, 4, 5, Metric::Euclidean, &mut pool, &mut wal)
-            .unwrap();
+        let ivf =
+            DiskIvfIndex::create(2, &sample, 4, 4, 5, Metric::Euclidean, &pool, &wal).unwrap();
         let mut vectors: HashMap<RowId, Vec<f32>> = HashMap::new();
         for (i, v) in sample.iter().enumerate() {
             vectors.insert(rid(i as u32), v.clone());
-            ivf.insert(rid(i as u32), v, &mut pool, &mut wal).unwrap();
+            ivf.insert(rid(i as u32), v, &pool, &wal).unwrap();
         }
         let target = vec![10.0, 10.0];
         let before = ivf
-            .search(&target, 1, None, &mut pool, |r| vectors.get(&r).cloned())
+            .search(&target, 1, None, &pool, |r| vectors.get(&r).cloned())
             .unwrap();
         assert_eq!(before[0].0, rid(10));
 
-        ivf.remove(rid(10), &target, &mut pool, &mut wal).unwrap();
+        ivf.remove(rid(10), &target, &pool, &wal).unwrap();
         vectors.remove(&rid(10));
         let after = ivf
-            .search(&target, 1, None, &mut pool, |r| vectors.get(&r).cloned())
+            .search(&target, 1, None, &pool, |r| vectors.get(&r).cloned())
             .unwrap();
         assert_ne!(after[0].0, rid(10), "removed point must not resurface");
     }

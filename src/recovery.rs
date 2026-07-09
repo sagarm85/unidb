@@ -89,7 +89,7 @@ pub fn recover(
         "recovery: analysis pass complete"
     );
 
-    let mut pool = BufferPool::open(data_path, page_size, pool_capacity)?;
+    let pool = BufferPool::open(data_path, page_size, pool_capacity)?;
     let mut stats = RecoveryStats {
         records_scanned: relevant.len(),
         records_redone: 0,
@@ -111,7 +111,7 @@ pub fn recover(
             continue;
         }
 
-        match redo_record(r, &mut pool, page_size) {
+        match redo_record(r, &pool, page_size) {
             Ok(()) => stats.records_redone += 1,
             Err(e) => {
                 tracing::warn!(lsn = r.lsn, error = %e, "recovery: redo skipped");
@@ -132,7 +132,7 @@ pub fn recover(
     undo_records.sort_by_key(|r| std::cmp::Reverse(r.lsn));
 
     for r in undo_records {
-        match undo_record(r, &mut pool, page_size) {
+        match undo_record(r, &pool, page_size) {
             Ok(()) => stats.records_undone += 1,
             Err(e) => {
                 tracing::warn!(lsn = r.lsn, error = %e, "recovery: undo skipped");
@@ -182,7 +182,7 @@ pub fn recover(
         {
             if let Ok(new_xmax) = decode_xmax(&r.redo) {
                 if incomplete_user_txns.contains(&new_xmax) {
-                    let mut page = fetch_or_create(&mut pool, r.page_id, page_size)?;
+                    let mut page = fetch_or_create(&pool, r.page_id, page_size)?;
                     page.set_xmax(r.slot, 0)?;
                     pool.write_page(&page)?;
                     pool.unpin(r.page_id);
@@ -201,7 +201,7 @@ pub fn recover(
         }) {
             if let Ok((xmin, _, _)) = decode_insert_redo(&r.redo) {
                 if incomplete_user_txns.contains(&xmin) {
-                    let mut page = fetch_or_create(&mut pool, r.page_id, page_size)?;
+                    let mut page = fetch_or_create(&pool, r.page_id, page_size)?;
                     page.set_xmax(r.slot, xmin)?;
                     pool.write_page(&page)?;
                     pool.unpin(r.page_id);
@@ -225,7 +225,7 @@ pub fn recover(
     Ok((control, stats))
 }
 
-fn redo_record(r: &WalRecord, pool: &mut BufferPool, page_size: usize) -> Result<()> {
+fn redo_record(r: &WalRecord, pool: &BufferPool, page_size: usize) -> Result<()> {
     match r.rec_type {
         WAL_FPI => {
             // P1.a torn-page protection. The redo payload is the entire clean
@@ -329,7 +329,7 @@ fn redo_record(r: &WalRecord, pool: &mut BufferPool, page_size: usize) -> Result
     Ok(())
 }
 
-fn undo_record(r: &WalRecord, pool: &mut BufferPool, page_size: usize) -> Result<()> {
+fn undo_record(r: &WalRecord, pool: &BufferPool, page_size: usize) -> Result<()> {
     match r.rec_type {
         WAL_INSERT => {
             // Undo an insert = delete the slot.
@@ -375,7 +375,7 @@ fn decode_xmax(buf: &[u8]) -> Result<u64> {
     Ok(u64_from_le(arr))
 }
 
-fn fetch_or_create(pool: &mut BufferPool, page_id: u32, page_size: usize) -> Result<SlottedPage> {
+fn fetch_or_create(pool: &BufferPool, page_id: u32, page_size: usize) -> Result<SlottedPage> {
     use crate::format::PAGE_TYPE_HEAP;
     match pool.fetch_page(page_id) {
         Ok(p) => Ok(p),

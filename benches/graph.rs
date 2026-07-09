@@ -42,7 +42,7 @@ fn resolve_naive(
     heap: &Heap,
     candidates: &[RowId],
     snapshot: &Snapshot,
-    pool: &mut BufferPool,
+    pool: &BufferPool,
 ) -> usize {
     let mut found = 0;
     for &rid in candidates {
@@ -59,7 +59,7 @@ fn bench_adjacency_scan(c: &mut Criterion) {
 
     for n in [1_000u64, 10_000] {
         let dir = tempdir().unwrap();
-        let (heap, mut pool, ids, snapshot) = build_hot_hub(dir.path(), n);
+        let (heap, pool, ids, snapshot) = build_hot_hub(dir.path(), n);
         let distinct_pages: std::collections::HashSet<_> = ids.iter().map(|r| r.page_id).collect();
         eprintln!(
             "adjacency_scan n={n}: {} distinct pages",
@@ -67,11 +67,11 @@ fn bench_adjacency_scan(c: &mut Criterion) {
         );
 
         group.bench_with_input(BenchmarkId::new("naive", n), &n, |b, _| {
-            b.iter(|| resolve_naive(&heap, &ids, &snapshot, &mut pool));
+            b.iter(|| resolve_naive(&heap, &ids, &snapshot, &pool));
         });
 
         group.bench_with_input(BenchmarkId::new("batched", n), &n, |b, _| {
-            b.iter(|| resolve_candidates_batched(&ids, &snapshot, 2, &mut pool, &columns).unwrap());
+            b.iter(|| resolve_candidates_batched(&ids, &snapshot, 2, &pool, &columns).unwrap());
         });
 
         // M7: CSR-backed candidate fetch + the same batched resolve/
@@ -89,7 +89,7 @@ fn bench_adjacency_scan(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("csr", n), &n, |b, _| {
             b.iter(|| {
                 let candidates = csr.candidates(1).to_vec();
-                resolve_candidates_batched(&candidates, &snapshot, 2, &mut pool, &columns).unwrap()
+                resolve_candidates_batched(&candidates, &snapshot, 2, &pool, &columns).unwrap()
             });
         });
     }
@@ -101,7 +101,7 @@ fn bench_edge_insert(c: &mut Criterion) {
     group.bench_function("uncontended", |b| {
         b.iter(|| {
             let dir = tempdir().unwrap();
-            let mut engine = unidb::Engine::open(dir.path(), 0).unwrap();
+            let engine = unidb::Engine::open(dir.path(), 0).unwrap();
             let xid = engine.begin().unwrap();
             for i in 0..100u64 {
                 engine.create_edge(xid, 1, i as i64, "KNOWS", "{}").unwrap();

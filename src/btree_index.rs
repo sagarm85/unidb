@@ -340,7 +340,7 @@ impl DiskBTree {
     /// Create a fresh empty tree: allocate a meta page and an empty leaf root,
     /// WAL-log both in one mini-txn, and return a handle. The caller records
     /// [`Self::meta_page`] durably in the catalog.
-    pub fn create(pool: &mut BufferPool, wal: &mut Wal) -> Result<DiskBTree> {
+    pub fn create(pool: &BufferPool, wal: &Wal) -> Result<DiskBTree> {
         let meta_page = pool.alloc_page()?;
         let root_page = pool.alloc_page()?;
         let page_size = pool.page_size();
@@ -357,7 +357,7 @@ impl DiskBTree {
         Ok(DiskBTree::new(meta_page, page_size))
     }
 
-    fn root_page(&self, pool: &mut BufferPool) -> Result<PageId> {
+    fn root_page(&self, pool: &BufferPool) -> Result<PageId> {
         let page = pool.fetch_page(self.meta_page)?;
         let body = &page.as_bytes()[PAGE_HEADER_SIZE..];
         if body.first().copied() != Some(NODE_META) {
@@ -381,7 +381,7 @@ impl DiskBTree {
         &self,
         op: CmpOp,
         value: &OrderedValue,
-        pool: &mut BufferPool,
+        pool: &BufferPool,
     ) -> Result<Option<Vec<RowId>>> {
         match op {
             CmpOp::Eq => Ok(Some(self.search_eq(value, pool)?)),
@@ -402,7 +402,7 @@ impl DiskBTree {
     /// collected. (The insert path has its own routing — it deliberately keeps
     /// `<` so new duplicates append after existing ones; only reads need the
     /// leftmost leaf.)
-    fn find_leaf(&self, key: &OrderedValue, pool: &mut BufferPool) -> Result<PageId> {
+    fn find_leaf(&self, key: &OrderedValue, pool: &BufferPool) -> Result<PageId> {
         let mut pid = self.root_page(pool)?;
         loop {
             let page = pool.fetch_page(pid)?;
@@ -432,7 +432,7 @@ impl DiskBTree {
     /// case that previously under-returned when a heavily-duplicated key (a
     /// full-text token in many docs, a graph hub, a BTree value on many rows)
     /// spanned a leaf split.
-    pub fn search_eq(&self, value: &OrderedValue, pool: &mut BufferPool) -> Result<Vec<RowId>> {
+    pub fn search_eq(&self, value: &OrderedValue, pool: &BufferPool) -> Result<Vec<RowId>> {
         let mut pid = self.find_leaf(value, pool)?;
         let mut out = Vec::new();
         loop {
@@ -471,7 +471,7 @@ impl DiskBTree {
         &self,
         op: RangeOp,
         value: &OrderedValue,
-        pool: &mut BufferPool,
+        pool: &BufferPool,
     ) -> Result<Vec<RowId>> {
         let start = match op {
             RangeOp::Lt | RangeOp::Le => self.leftmost_leaf(pool)?,
@@ -510,7 +510,7 @@ impl DiskBTree {
         Ok(out)
     }
 
-    fn leftmost_leaf(&self, pool: &mut BufferPool) -> Result<PageId> {
+    fn leftmost_leaf(&self, pool: &BufferPool) -> Result<PageId> {
         let mut pid = self.root_page(pool)?;
         loop {
             let page = pool.fetch_page(pid)?;
@@ -533,8 +533,8 @@ impl DiskBTree {
         &self,
         value: OrderedValue,
         rid: RowId,
-        pool: &mut BufferPool,
-        wal: &mut Wal,
+        pool: &BufferPool,
+        wal: &Wal,
     ) -> Result<()> {
         let root = self.root_page(pool)?;
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
@@ -572,8 +572,8 @@ impl DiskBTree {
         pid: PageId,
         value: OrderedValue,
         rid: RowId,
-        pool: &mut BufferPool,
-        wal: &mut Wal,
+        pool: &BufferPool,
+        wal: &Wal,
         txn_id: u64,
         prev_lsn: &mut Lsn,
     ) -> Result<Option<(OrderedValue, PageId)>> {
@@ -689,8 +689,8 @@ impl DiskBTree {
         &self,
         value: &OrderedValue,
         rid: RowId,
-        pool: &mut BufferPool,
-        wal: &mut Wal,
+        pool: &BufferPool,
+        wal: &Wal,
     ) -> Result<()> {
         // Walk leaves rightward from the leftmost candidate leaf (a duplicate
         // run may span leaves, and `find_leaf` lands at-or-before the run's
@@ -736,8 +736,8 @@ fn meta_bytes(meta_page: PageId, root_page: PageId, page_size: usize) -> Vec<u8>
 /// full-page image), stamp the record LSN into the page, and write it into the
 /// buffer pool. Returns the record LSN so the caller can chain `prev_lsn`.
 fn write_node(
-    pool: &mut BufferPool,
-    wal: &mut Wal,
+    pool: &BufferPool,
+    wal: &Wal,
     txn_id: u64,
     prev_lsn: Lsn,
     page_id: PageId,
@@ -751,8 +751,8 @@ fn write_node(
 /// Like [`write_node`] but takes an already-serialized page image (used for the
 /// meta page). Pins the page for write, logs the image, stamps the LSN, writes.
 fn write_raw(
-    pool: &mut BufferPool,
-    wal: &mut Wal,
+    pool: &BufferPool,
+    wal: &Wal,
     txn_id: u64,
     prev_lsn: Lsn,
     page_id: PageId,
@@ -812,56 +812,51 @@ mod tests {
 
     #[test]
     fn insert_and_search_eq() {
-        let mut e = env();
-        let t = DiskBTree::create(&mut e.pool, &mut e.wal).unwrap();
-        t.insert(OrderedValue::Int(5), rid(1, 0), &mut e.pool, &mut e.wal)
+        let e = env();
+        let t = DiskBTree::create(&e.pool, &e.wal).unwrap();
+        t.insert(OrderedValue::Int(5), rid(1, 0), &e.pool, &e.wal)
             .unwrap();
-        t.insert(OrderedValue::Int(7), rid(2, 0), &mut e.pool, &mut e.wal)
+        t.insert(OrderedValue::Int(7), rid(2, 0), &e.pool, &e.wal)
             .unwrap();
-        t.insert(OrderedValue::Int(5), rid(3, 0), &mut e.pool, &mut e.wal)
+        t.insert(OrderedValue::Int(5), rid(3, 0), &e.pool, &e.wal)
             .unwrap();
-        let mut got = t.search_eq(&OrderedValue::Int(5), &mut e.pool).unwrap();
+        let mut got = t.search_eq(&OrderedValue::Int(5), &e.pool).unwrap();
         got.sort_by_key(|r| r.page_id);
         assert_eq!(got, vec![rid(1, 0), rid(3, 0)]);
         assert!(t
-            .search_eq(&OrderedValue::Int(99), &mut e.pool)
+            .search_eq(&OrderedValue::Int(99), &e.pool)
             .unwrap()
             .is_empty());
     }
 
     #[test]
     fn range_queries() {
-        let mut e = env();
-        let t = DiskBTree::create(&mut e.pool, &mut e.wal).unwrap();
+        let e = env();
+        let t = DiskBTree::create(&e.pool, &e.wal).unwrap();
         for i in 1..=5 {
-            t.insert(
-                OrderedValue::Int(i),
-                rid(i as u32, 0),
-                &mut e.pool,
-                &mut e.wal,
-            )
-            .unwrap();
+            t.insert(OrderedValue::Int(i), rid(i as u32, 0), &e.pool, &e.wal)
+                .unwrap();
         }
         assert_eq!(
-            t.search_range(RangeOp::Lt, &OrderedValue::Int(3), &mut e.pool)
+            t.search_range(RangeOp::Lt, &OrderedValue::Int(3), &e.pool)
                 .unwrap()
                 .len(),
             2
         );
         assert_eq!(
-            t.search_range(RangeOp::Le, &OrderedValue::Int(3), &mut e.pool)
+            t.search_range(RangeOp::Le, &OrderedValue::Int(3), &e.pool)
                 .unwrap()
                 .len(),
             3
         );
         assert_eq!(
-            t.search_range(RangeOp::Gt, &OrderedValue::Int(3), &mut e.pool)
+            t.search_range(RangeOp::Gt, &OrderedValue::Int(3), &e.pool)
                 .unwrap()
                 .len(),
             2
         );
         assert_eq!(
-            t.search_range(RangeOp::Ge, &OrderedValue::Int(3), &mut e.pool)
+            t.search_range(RangeOp::Ge, &OrderedValue::Int(3), &e.pool)
                 .unwrap()
                 .len(),
             3
@@ -870,60 +865,60 @@ mod tests {
 
     #[test]
     fn search_dispatches_and_rejects_ne() {
-        let mut e = env();
-        let t = DiskBTree::create(&mut e.pool, &mut e.wal).unwrap();
-        t.insert(OrderedValue::Int(1), rid(1, 0), &mut e.pool, &mut e.wal)
+        let e = env();
+        let t = DiskBTree::create(&e.pool, &e.wal).unwrap();
+        t.insert(OrderedValue::Int(1), rid(1, 0), &e.pool, &e.wal)
             .unwrap();
         assert!(t
-            .search(CmpOp::Eq, &OrderedValue::Int(1), &mut e.pool)
+            .search(CmpOp::Eq, &OrderedValue::Int(1), &e.pool)
             .unwrap()
             .is_some());
         assert!(t
-            .search(CmpOp::Lt, &OrderedValue::Int(1), &mut e.pool)
+            .search(CmpOp::Lt, &OrderedValue::Int(1), &e.pool)
             .unwrap()
             .is_some());
         assert!(t
-            .search(CmpOp::Ne, &OrderedValue::Int(1), &mut e.pool)
+            .search(CmpOp::Ne, &OrderedValue::Int(1), &e.pool)
             .unwrap()
             .is_none());
     }
 
     #[test]
     fn remove_drops_entry() {
-        let mut e = env();
-        let t = DiskBTree::create(&mut e.pool, &mut e.wal).unwrap();
-        t.insert(OrderedValue::Int(1), rid(1, 0), &mut e.pool, &mut e.wal)
+        let e = env();
+        let t = DiskBTree::create(&e.pool, &e.wal).unwrap();
+        t.insert(OrderedValue::Int(1), rid(1, 0), &e.pool, &e.wal)
             .unwrap();
-        t.insert(OrderedValue::Int(1), rid(2, 0), &mut e.pool, &mut e.wal)
+        t.insert(OrderedValue::Int(1), rid(2, 0), &e.pool, &e.wal)
             .unwrap();
-        t.remove(&OrderedValue::Int(1), rid(1, 0), &mut e.pool, &mut e.wal)
+        t.remove(&OrderedValue::Int(1), rid(1, 0), &e.pool, &e.wal)
             .unwrap();
         assert_eq!(
-            t.search_eq(&OrderedValue::Int(1), &mut e.pool).unwrap(),
+            t.search_eq(&OrderedValue::Int(1), &e.pool).unwrap(),
             vec![rid(2, 0)]
         );
     }
 
     #[test]
     fn text_keys() {
-        let mut e = env();
-        let t = DiskBTree::create(&mut e.pool, &mut e.wal).unwrap();
+        let e = env();
+        let t = DiskBTree::create(&e.pool, &e.wal).unwrap();
         t.insert(
             OrderedValue::Text("banana".into()),
             rid(1, 0),
-            &mut e.pool,
-            &mut e.wal,
+            &e.pool,
+            &e.wal,
         )
         .unwrap();
         t.insert(
             OrderedValue::Text("apple".into()),
             rid(2, 0),
-            &mut e.pool,
-            &mut e.wal,
+            &e.pool,
+            &e.wal,
         )
         .unwrap();
         assert_eq!(
-            t.search_eq(&OrderedValue::Text("apple".into()), &mut e.pool)
+            t.search_eq(&OrderedValue::Text("apple".into()), &e.pool)
                 .unwrap(),
             vec![rid(2, 0)]
         );
@@ -933,28 +928,23 @@ mod tests {
     /// findable — the core correctness proof for node splitting + routing.
     #[test]
     fn many_inserts_force_splits_and_stay_searchable() {
-        let mut e = env();
-        let t = DiskBTree::create(&mut e.pool, &mut e.wal).unwrap();
+        let e = env();
+        let t = DiskBTree::create(&e.pool, &e.wal).unwrap();
         // Enough to force several leaf splits and at least one internal level
         // (~480 entries/leaf), proving split + separator routing. Kept modest
         // because each insert is its own fsyncing mini-txn.
         let n = 2000i64;
         for i in 0..n {
-            t.insert(
-                OrderedValue::Int(i),
-                rid(i as u32, 0),
-                &mut e.pool,
-                &mut e.wal,
-            )
-            .unwrap();
+            t.insert(OrderedValue::Int(i), rid(i as u32, 0), &e.pool, &e.wal)
+                .unwrap();
         }
         for i in 0..n {
-            let got = t.search_eq(&OrderedValue::Int(i), &mut e.pool).unwrap();
+            let got = t.search_eq(&OrderedValue::Int(i), &e.pool).unwrap();
             assert_eq!(got, vec![rid(i as u32, 0)], "key {i} missing after splits");
         }
         // Range over the whole set.
         assert_eq!(
-            t.search_range(RangeOp::Ge, &OrderedValue::Int(0), &mut e.pool)
+            t.search_range(RangeOp::Ge, &OrderedValue::Int(0), &e.pool)
                 .unwrap()
                 .len(),
             n as usize
@@ -969,46 +959,40 @@ mod tests {
     /// a graph hub, a BTree value on many rows).
     #[test]
     fn heavily_duplicated_key_spanning_leaves_returns_all() {
-        let mut e = env();
-        let t = DiskBTree::create(&mut e.pool, &mut e.wal).unwrap();
+        let e = env();
+        let t = DiskBTree::create(&e.pool, &e.wal).unwrap();
         // Neighbours on both sides so the hot key's run sits between other keys
         // and its leaves split with real separators around it.
         let dup = 3000u32; // far more than one leaf holds (~480 int entries)
         for i in 0..500 {
-            t.insert(OrderedValue::Int(1), rid(i, 0), &mut e.pool, &mut e.wal)
+            t.insert(OrderedValue::Int(1), rid(i, 0), &e.pool, &e.wal)
                 .unwrap();
         }
         for i in 0..dup {
-            t.insert(OrderedValue::Int(2), rid(i, 1), &mut e.pool, &mut e.wal)
+            t.insert(OrderedValue::Int(2), rid(i, 1), &e.pool, &e.wal)
                 .unwrap();
         }
         for i in 0..500 {
-            t.insert(OrderedValue::Int(3), rid(i, 2), &mut e.pool, &mut e.wal)
+            t.insert(OrderedValue::Int(3), rid(i, 2), &e.pool, &e.wal)
                 .unwrap();
         }
-        let got = t.search_eq(&OrderedValue::Int(2), &mut e.pool).unwrap();
+        let got = t.search_eq(&OrderedValue::Int(2), &e.pool).unwrap();
         assert_eq!(got.len(), dup as usize, "must return every duplicate");
         assert!(got.iter().all(|r| r.slot == 1));
         // Neighbours unaffected.
         assert_eq!(
-            t.search_eq(&OrderedValue::Int(1), &mut e.pool)
-                .unwrap()
-                .len(),
+            t.search_eq(&OrderedValue::Int(1), &e.pool).unwrap().len(),
             500
         );
         assert_eq!(
-            t.search_eq(&OrderedValue::Int(3), &mut e.pool)
-                .unwrap()
-                .len(),
+            t.search_eq(&OrderedValue::Int(3), &e.pool).unwrap().len(),
             500
         );
         // Remove one from deep in the run, then re-count.
-        t.remove(&OrderedValue::Int(2), rid(1500, 1), &mut e.pool, &mut e.wal)
+        t.remove(&OrderedValue::Int(2), rid(1500, 1), &e.pool, &e.wal)
             .unwrap();
         assert_eq!(
-            t.search_eq(&OrderedValue::Int(2), &mut e.pool)
-                .unwrap()
-                .len(),
+            t.search_eq(&OrderedValue::Int(2), &e.pool).unwrap().len(),
             dup as usize - 1
         );
     }
@@ -1017,24 +1001,19 @@ mod tests {
     /// Phase-3 "no rebuild on open" property, at the module level.
     #[test]
     fn reopen_from_meta_page_only() {
-        let mut e = env();
+        let e = env();
         let meta = {
-            let t = DiskBTree::create(&mut e.pool, &mut e.wal).unwrap();
+            let t = DiskBTree::create(&e.pool, &e.wal).unwrap();
             for i in 0..500i64 {
-                t.insert(
-                    OrderedValue::Int(i),
-                    rid(i as u32, 0),
-                    &mut e.pool,
-                    &mut e.wal,
-                )
-                .unwrap();
+                t.insert(OrderedValue::Int(i), rid(i as u32, 0), &e.pool, &e.wal)
+                    .unwrap();
             }
             t.meta_page()
         };
         // A brand-new handle over the same meta page — no rebuild, no scan.
         let t2 = DiskBTree::new(meta, DEFAULT_PAGE_SIZE as usize);
         assert_eq!(
-            t2.search_eq(&OrderedValue::Int(250), &mut e.pool).unwrap(),
+            t2.search_eq(&OrderedValue::Int(250), &e.pool).unwrap(),
             vec![rid(250, 0)]
         );
     }

@@ -94,7 +94,7 @@ fn bench_insert_direct_vs_http(c: &mut Criterion) {
     let mut group = c.benchmark_group("insert_overhead");
 
     let dir = tempdir().unwrap();
-    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
     group.bench_function("direct_engine_insert", |b| {
         b.iter(|| {
             let xid = engine.begin().unwrap();

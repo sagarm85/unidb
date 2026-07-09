@@ -171,7 +171,7 @@ pub fn find_consumer_offset(
     heap: &Heap,
     snapshot: &Snapshot,
     xid: Xid,
-    pool: &mut BufferPool,
+    pool: &BufferPool,
     consumer: &str,
 ) -> Result<Option<(RowId, i64)>> {
     let columns = &consumers_table_def().columns;
@@ -197,7 +197,7 @@ mod tests {
         crate::bufferpool::BufferPool,
         crate::wal::Wal,
         std::path::PathBuf,
-        crate::control::ControlData,
+        std::sync::Mutex<crate::control::ControlData>,
     ) {
         let control_path = dir.join("control");
         let control = control::create(&control_path, DEFAULT_PAGE_SIZE).unwrap();
@@ -208,19 +208,19 @@ mod tests {
         )
         .unwrap();
         let wal = crate::wal::Wal::open(&dir.join("db.wal"), crate::format::INVALID_LSN).unwrap();
-        (pool, wal, control_path, control)
+        (pool, wal, control_path, std::sync::Mutex::new(control))
     }
 
     #[test]
     fn ensure_queue_tables_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut pool, mut wal, cp, mut control) = setup(dir.path());
+        let (pool, wal, cp, control) = setup(dir.path());
         let mut catalog = Catalog::new();
         let mut ctx = CatalogCtx {
-            pool: &mut pool,
-            wal: &mut wal,
+            pool: &pool,
+            wal: &wal,
             control_path: &cp,
-            control: &mut control,
+            control: &control,
             page_size: DEFAULT_PAGE_SIZE as usize,
         };
         ensure_queue_tables(&mut catalog, &mut ctx).unwrap();

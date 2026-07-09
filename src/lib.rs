@@ -59,6 +59,7 @@ pub mod lockmgr;
 pub mod mmap;
 pub mod mvcc;
 pub mod page;
+pub mod query_limits;
 pub mod queue;
 pub mod read_handle;
 pub mod recovery;
@@ -70,7 +71,8 @@ pub mod vector;
 pub mod wal;
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use crate::{
@@ -191,7 +193,16 @@ pub struct VacuumReport {
 }
 
 pub struct Engine {
-    control: ControlData,
+    /// Recovery/control metadata. Interior-mutable behind a `Mutex` (P5.e) so
+    /// the shared `&self` engine can rewrite `catalog_root`/checkpoint state
+    /// from any worker thread. **Never hold this lock across an fsync** (WAL or
+    /// data-file) — lock, read/mutate the small struct, unlock. `page_size` is
+    /// cached out-of-band below because it never changes after open and is read
+    /// on nearly every method.
+    control: Mutex<ControlData>,
+    /// Immutable page size (bytes), cached from the control file at open so the
+    /// hot paths don't lock `control` just to read it.
+    page_size: usize,
     pool: BufferPool,
     wal: Wal,
     heap: Heap,
@@ -214,29 +225,43 @@ pub struct Engine {
     lob_index_meta: PageId,
     /// Next large-object id to hand out (P3.d), derived at open from the highest
     /// committed `lob_id` in `__lobs__` (mirrors `next_event_seq`).
-    next_lob_id: i64,
-    next_event_seq: u64,
-    /// Auto-checkpoint policy + state (P1.e).
-    auto_checkpoint: AutoCheckpointConfig,
-    last_checkpoint: Instant,
-    checkpoints_triggered: u64,
+    /// Atomic (P5.e) so `put_large_object` can hand out ids from `&self`.
+    next_lob_id: AtomicI64,
+    next_event_seq: AtomicU64,
+    /// Auto-checkpoint policy + state (P1.e). Behind `Mutex` (P5.e) for `&self`.
+    auto_checkpoint: Mutex<AutoCheckpointConfig>,
+    last_checkpoint: Mutex<Instant>,
+    checkpoints_triggered: AtomicU64,
+    /// Serializes the non-CRUD write paths that do a *non-atomic*
+    /// read-catalog-then-mutate-a-shared-secondary-index sequence — graph edges
+    /// (the `__edges__.from_id` `DiskBTree` + page list), large objects (the
+    /// `__lobs__` tree), the event queue's system tables, and catalog DDL
+    /// (P5.e-3). Two of these running at once could lose a page-list update or
+    /// corrupt a shared index tree, which the per-page heap latches alone don't
+    /// prevent (they guard one page, not a multi-page tree or a catalog RMW).
+    ///
+    /// The hot paths do **not** take this lock: raw CRUD (`insert`/`get`/
+    /// `update`/`delete`) touches only the latched heap + row locks and scales
+    /// across cores, and SQL already serializes writers on the catalog
+    /// `RwLock`. So this coarse lock only serializes the secondary,
+    /// low-frequency write paths — correctness first; finer-grained index
+    /// concurrency (latch-coupled B-tree writes) is future work.
+    write_serial: Mutex<()>,
 }
 
-/// `Engine` must be movable into another thread's ownership (M5: the
-/// optional server's writer thread takes exclusive, lifelong ownership of
-/// one `Engine` — see `src/server/engine_handle.rs`). This is a
-/// compiler-enforced fact, not an assumption: every field is owned data or
-/// a standard-library/`memmap2` type with no `Rc`/`RefCell`/raw pointer, so
-/// `Send` already holds automatically — this line just turns "believed
-/// true" into "verified at every compile," so a future field addition that
-/// broke it would fail to build immediately rather than silently. `Engine`
-/// deliberately does *not* need (and is not asserted) `Sync` — the
-/// writer-thread design gives exactly one thread ownership for the whole
-/// lifetime of the value, so concurrent access from multiple threads is
-/// never required.
+/// `Engine` must be safely **shareable** across threads (P5.e: a pool of N
+/// worker threads each hold `Arc<Engine>` and issue concurrent writes — see
+/// `src/server/engine_handle.rs`). This reverses the M5 "single writer thread,
+/// `Engine` is `!Sync`" simplification (human sign-off recorded in
+/// `PROGRESS.md`). It is a compiler-enforced fact, not an assumption: every
+/// mutated field is now interior-mutable behind a `Mutex`/`RwLock`/atomic, and
+/// every storage component (`BufferPool`/`Wal`/`Heap`/`TransactionManager`/
+/// `LockManager`) exposes a `&self` API (P5.a–P5.e-1), so `Send + Sync` hold.
+/// This line turns "believed true" into "verified at every compile," so a
+/// future field addition that broke `Sync` would fail to build immediately.
 const _: fn() = || {
-    fn assert_send<T: Send>() {}
-    assert_send::<Engine>();
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Engine>();
 };
 
 /// Read/write-lock a shared catalog, recovering from poisoning rather than
@@ -250,6 +275,31 @@ fn cat_read(c: &RwLock<Catalog>) -> RwLockReadGuard<'_, Catalog> {
 
 fn cat_write(c: &RwLock<Catalog>) -> RwLockWriteGuard<'_, Catalog> {
     c.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Lock the control-metadata `Mutex`, recovering from poisoning rather than
+/// panicking (same rationale as [`cat_read`]). **Keep the guard's scope
+/// minimal — never hold it across an fsync** (see the `control` field doc).
+fn ctrl_lock(c: &Mutex<ControlData>) -> std::sync::MutexGuard<'_, ControlData> {
+    c.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Poison-tolerant lock of the non-CRUD write serializer (P5.e-3, see the
+/// `write_serial` field).
+fn serial_lock(m: &Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Poison-tolerant lock of the auto-checkpoint policy `Mutex` (P5.e).
+fn ctrl_lock_ac(
+    m: &Mutex<AutoCheckpointConfig>,
+) -> std::sync::MutexGuard<'_, AutoCheckpointConfig> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Poison-tolerant lock of the last-checkpoint-instant `Mutex` (P5.e).
+fn ctrl_lock_lc(m: &Mutex<Instant>) -> std::sync::MutexGuard<'_, Instant> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl Engine {
@@ -279,17 +329,20 @@ impl Engine {
         } else {
             page_size
         };
-        let mut control = control::open_or_create(&ctrl_p, ps)?;
-        let page_size_usize = control.page_size as usize;
+        // `control` is interior-mutable from the start (P5.e) so the same
+        // `&Mutex<ControlData>` can be handed to the `CatalogCtx`/`ensure_*`
+        // helpers below and then moved directly into the `Engine`.
+        let control = Mutex::new(control::open_or_create(&ctrl_p, ps)?);
+        let page_size_usize = ctrl_lock(&control).page_size as usize;
 
         // Run recovery before opening normal operation.
         if wal_p.exists() && ctrl_p.exists() {
             recovery::recover(&ctrl_p, &data_p, &wal_p, page_size_usize, pool_capacity)?;
         }
 
-        let mut pool = BufferPool::open(&data_p, page_size_usize, pool_capacity)?;
-        let wal_tail = control.wal_tail_lsn;
-        let mut wal = Wal::open(&wal_p, wal_tail)?;
+        let pool = BufferPool::open(&data_p, page_size_usize, pool_capacity)?;
+        let wal_tail = ctrl_lock(&control).wal_tail_lsn;
+        let wal = Wal::open(&wal_p, wal_tail)?;
         let heap = Heap::new(page_size_usize);
 
         // Resume the xid counter past the highest xid that ever began —
@@ -307,12 +360,12 @@ impl Engine {
         } else {
             Vec::new()
         };
-        let next_xid =
-            TransactionManager::recover_next_xid(&existing_records).max(control.next_xid);
-        let mut txn_mgr = TransactionManager::with_next_xid(next_xid);
-        let mut lock_mgr = LockManager::new();
+        let next_xid = TransactionManager::recover_next_xid(&existing_records)
+            .max(ctrl_lock(&control).next_xid);
+        let txn_mgr = TransactionManager::with_next_xid(next_xid);
+        let lock_mgr = LockManager::new();
 
-        let mut catalog = Catalog::load(&control, &mut pool)?;
+        let mut catalog = Catalog::load(&ctrl_lock(&control), &pool)?;
 
         // `__edges__` always exists after open — before any user transaction
         // begins, so unlike ordinary `CREATE TABLE` there's no "ran inside a
@@ -320,10 +373,10 @@ impl Engine {
         // design note).
         {
             let mut cctx = CatalogCtx {
-                pool: &mut pool,
-                wal: &mut wal,
+                pool: &pool,
+                wal: &wal,
                 control_path: &ctrl_p,
-                control: &mut control,
+                control: &control,
                 page_size: page_size_usize,
             };
             edges::ensure_edges_table(&mut catalog, &mut cctx)?;
@@ -331,49 +384,38 @@ impl Engine {
         }
         let edge_index_meta = ensure_edge_index(
             &mut catalog,
-            &mut txn_mgr,
-            &mut pool,
-            &mut wal,
-            &mut lock_mgr,
+            &txn_mgr,
+            &pool,
+            &wal,
+            &lock_mgr,
             &ctrl_p,
-            &mut control,
+            &control,
             page_size_usize,
         )?;
         let lob_index_meta = large_object::ensure_lobs_table(
             &mut catalog,
-            &mut txn_mgr,
-            &mut pool,
-            &mut wal,
-            &mut lock_mgr,
+            &txn_mgr,
+            &pool,
+            &wal,
+            &lock_mgr,
             &ctrl_p,
-            &mut control,
+            &control,
             page_size_usize,
         )?;
-        let next_lob_id = derive_next_lob_id(
-            &catalog,
-            &mut txn_mgr,
-            &mut pool,
-            &mut wal,
-            &mut lock_mgr,
-            page_size_usize,
-        )?;
-        let next_event_seq = derive_next_event_seq(
-            &catalog,
-            &mut txn_mgr,
-            &mut pool,
-            &mut wal,
-            &mut lock_mgr,
-            page_size_usize,
-        )?;
+        let next_lob_id =
+            derive_next_lob_id(&catalog, &txn_mgr, &pool, &wal, &lock_mgr, page_size_usize)?;
+        let next_event_seq =
+            derive_next_event_seq(&catalog, &txn_mgr, &pool, &wal, &lock_mgr, page_size_usize)?;
 
         // Phase 3: every secondary index is durable and crash-recovered — the
         // B-Tree/full-text/edge indexes as `DiskBTree`s (P3.a/P3.b), the vector
         // index as an on-disk IVF-Flat (P3.c). `Engine::open` does ZERO index
         // rebuilding: it reads each index straight from its stable meta page.
         // This is the O(1)-open moat; the async rebuild worker is retired.
-        tracing::info!(dir = %dir.display(), page_size = control.page_size, next_xid, "engine opened");
+        tracing::info!(dir = %dir.display(), page_size = page_size_usize, next_xid, "engine opened");
         Ok(Self {
             control,
+            page_size: page_size_usize,
             pool,
             wal,
             heap,
@@ -384,41 +426,60 @@ impl Engine {
             _wal_path: wal_p,
             edge_index_meta,
             lob_index_meta,
-            next_lob_id,
-            next_event_seq,
-            auto_checkpoint: AutoCheckpointConfig::default(),
-            last_checkpoint: Instant::now(),
-            checkpoints_triggered: 0,
+            next_lob_id: AtomicI64::new(next_lob_id),
+            next_event_seq: AtomicU64::new(next_event_seq),
+            auto_checkpoint: Mutex::new(AutoCheckpointConfig::default()),
+            last_checkpoint: Mutex::new(Instant::now()),
+            checkpoints_triggered: AtomicU64::new(0),
+            write_serial: Mutex::new(()),
         })
+    }
+
+    /// Like [`Engine::execute_sql`], but under per-query resource limits (P5.f):
+    /// a wall-clock **timeout**, a cooperative **cancellation** token, and/or a
+    /// **`work_mem`** row budget the `ORDER BY`/hash-join spill operators respect.
+    /// The limits are installed on the current thread for the duration of the
+    /// call (a query runs on one worker thread, P5.e-3) and cleared on return, so
+    /// a long scan/sort/join aborts with [`DbError::QueryTimeout`] /
+    /// [`DbError::QueryCancelled`] at its next check point instead of running
+    /// unbounded. `QueryLimits::default()` imposes no limit.
+    pub fn execute_sql_with_limits(
+        &self,
+        xid: Xid,
+        sql: &str,
+        limits: crate::query_limits::QueryLimits,
+    ) -> Result<Vec<ExecResult>> {
+        let _guard = crate::query_limits::install(limits);
+        self.execute_sql(xid, sql)
     }
 
     /// Parse and execute one or more `;`-separated SQL statements under
     /// `xid`, applying each table's RLS policy (if any) as a planner
     /// rewrite before execution. Returns one result per statement.
-    pub fn execute_sql(&mut self, xid: Xid, sql: &str) -> Result<Vec<ExecResult>> {
-        let page_size = self.control.page_size as usize;
+    pub fn execute_sql(&self, xid: Xid, sql: &str) -> Result<Vec<ExecResult>> {
+        let page_size = self.page_size;
         let plans = parse_sql(sql)?;
         // Snapshot the catalog root so DDL (which the catalog persists
         // immediately, not on user-txn commit) from earlier statements of a
         // multi-statement request can be rolled back if a later one fails
         // (P2.c). Heap writes are undone by the caller's transaction abort; the
         // catalog, being non-MVCC, needs this explicit restore.
-        let saved_catalog_root = self.control.catalog_root;
+        let saved_catalog_root = ctrl_lock(&self.control).catalog_root;
         let mut results = Vec::with_capacity(plans.len());
         for plan in plans {
             let plan = apply_rls(plan, &cat_read(&self.catalog));
             let mut catalog = cat_write(&self.catalog);
             let mut ctx = ExecCtx {
                 catalog: &mut catalog,
-                txn_mgr: &mut self.txn_mgr,
-                pool: &mut self.pool,
-                wal: &mut self.wal,
-                lock_mgr: &mut self.lock_mgr,
+                txn_mgr: &self.txn_mgr,
+                pool: &self.pool,
+                wal: &self.wal,
+                lock_mgr: &self.lock_mgr,
                 control_path: &self.control_path,
-                control: &mut self.control,
+                control: &self.control,
                 page_size,
                 xid,
-                next_event_seq: &mut self.next_event_seq,
+                next_event_seq: &self.next_event_seq,
             };
             match executor::execute(plan, &mut ctx) {
                 Ok(result) => results.push(result),
@@ -440,13 +501,16 @@ impl Engine {
     /// rewrites the control file to the saved root and reloads the in-memory
     /// catalog from it. (Crash-safe, user-txn-scoped catalog redo/undo through
     /// recovery is a larger, Core-lane-coordinated follow-up — see PROGRESS.)
-    fn restore_catalog_root(&mut self, root: crate::format::PageId) -> Result<()> {
-        if self.control.catalog_root == root {
-            return Ok(());
-        }
-        self.control.catalog_root = root;
-        control::write(&self.control_path, &self.control)?;
-        let reloaded = Catalog::load(&self.control, &mut self.pool)?;
+    fn restore_catalog_root(&self, root: crate::format::PageId) -> Result<()> {
+        let reloaded = {
+            let mut control = ctrl_lock(&self.control);
+            if control.catalog_root == root {
+                return Ok(());
+            }
+            control.catalog_root = root;
+            control::write(&self.control_path, &control)?;
+            Catalog::load(&control, &self.pool)?
+        };
         *cat_write(&self.catalog) = reloaded;
         Ok(())
     }
@@ -458,7 +522,7 @@ impl Engine {
     /// is bound as a plain `Literal::Text` and can only ever match/insert that
     /// literal string.
     pub fn execute_sql_params(
-        &mut self,
+        &self,
         xid: Xid,
         sql: &str,
         params: &[Literal],
@@ -480,7 +544,7 @@ impl Engine {
     /// Execute a previously [`prepare`](Engine::prepare)d plan with `params`
     /// bound by position (P2.e).
     pub fn execute_prepared(
-        &mut self,
+        &self,
         xid: Xid,
         prepared: &Prepared,
         params: &[Literal],
@@ -492,13 +556,13 @@ impl Engine {
     /// placeholders, apply RLS, execute, and roll DDL back on failure (the same
     /// request-level catalog rollback [`Engine::execute_sql`] performs).
     fn run_bound_plans(
-        &mut self,
+        &self,
         xid: Xid,
         plans: Vec<LogicalPlan>,
         params: &[Literal],
     ) -> Result<Vec<ExecResult>> {
-        let page_size = self.control.page_size as usize;
-        let saved_catalog_root = self.control.catalog_root;
+        let page_size = self.page_size;
+        let saved_catalog_root = ctrl_lock(&self.control).catalog_root;
         let mut results = Vec::with_capacity(plans.len());
         for mut plan in plans {
             // Bind before RLS/execute so a placeholder value can never be
@@ -508,15 +572,15 @@ impl Engine {
             let mut catalog = cat_write(&self.catalog);
             let mut ctx = ExecCtx {
                 catalog: &mut catalog,
-                txn_mgr: &mut self.txn_mgr,
-                pool: &mut self.pool,
-                wal: &mut self.wal,
-                lock_mgr: &mut self.lock_mgr,
+                txn_mgr: &self.txn_mgr,
+                pool: &self.pool,
+                wal: &self.wal,
+                lock_mgr: &self.lock_mgr,
                 control_path: &self.control_path,
-                control: &mut self.control,
+                control: &self.control,
                 page_size,
                 xid,
-                next_event_seq: &mut self.next_event_seq,
+                next_event_seq: &self.next_event_seq,
             };
             match executor::execute(plan, &mut ctx) {
                 Ok(result) => results.push(result),
@@ -535,21 +599,21 @@ impl Engine {
     /// `ExecCtx` construction — single-statement only in v1, but returns
     /// `Vec<ExecResult>` for API symmetry and future multi-statement
     /// headroom.
-    pub fn execute_cypher(&mut self, xid: Xid, query: &str) -> Result<Vec<ExecResult>> {
-        let page_size = self.control.page_size as usize;
+    pub fn execute_cypher(&self, xid: Xid, query: &str) -> Result<Vec<ExecResult>> {
+        let page_size = self.page_size;
         let parsed = parse_cypher(query)?;
         let mut catalog = cat_write(&self.catalog);
         let mut ctx = ExecCtx {
             catalog: &mut catalog,
-            txn_mgr: &mut self.txn_mgr,
-            pool: &mut self.pool,
-            wal: &mut self.wal,
-            lock_mgr: &mut self.lock_mgr,
+            txn_mgr: &self.txn_mgr,
+            pool: &self.pool,
+            wal: &self.wal,
+            lock_mgr: &self.lock_mgr,
             control_path: &self.control_path,
-            control: &mut self.control,
+            control: &self.control,
             page_size,
             xid,
-            next_event_seq: &mut self.next_event_seq,
+            next_event_seq: &self.next_event_seq,
         };
         let result = graph_executor::execute(parsed, &mut ctx, self.edge_index_meta)?;
         Ok(vec![result])
@@ -557,13 +621,14 @@ impl Engine {
 
     /// Attach a row-level-security policy to a table (M1: Rust API only,
     /// no `CREATE POLICY` SQL surface — see catalog.rs's module doc).
-    pub fn set_rls_policy(&mut self, table: &str, policy: Expr) -> Result<()> {
-        let page_size = self.control.page_size as usize;
+    pub fn set_rls_policy(&self, table: &str, policy: Expr) -> Result<()> {
+        let _ws = serial_lock(&self.write_serial); // P5.e-3: serialize catalog/index writes
+        let page_size = self.page_size;
         let mut ctx = crate::catalog::CatalogCtx {
-            pool: &mut self.pool,
-            wal: &mut self.wal,
+            pool: &self.pool,
+            wal: &self.wal,
             control_path: &self.control_path,
-            control: &mut self.control,
+            control: &self.control,
             page_size,
         };
         cat_write(&self.catalog).set_rls_policy(table, policy, &mut ctx)
@@ -575,17 +640,18 @@ impl Engine {
     /// `Engine::open`'s rebuild-on-open rescan. M2.c's `CREATE INDEX`
     /// backfills immediately instead, reusing this same catalog primitive.
     pub fn set_column_index(
-        &mut self,
+        &self,
         table: &str,
         column: &str,
         kind: Option<IndexKind>,
     ) -> Result<()> {
-        let page_size = self.control.page_size as usize;
+        let _ws = serial_lock(&self.write_serial); // P5.e-3: serialize catalog/index writes
+        let page_size = self.page_size;
         let mut ctx = crate::catalog::CatalogCtx {
-            pool: &mut self.pool,
-            wal: &mut self.wal,
+            pool: &self.pool,
+            wal: &self.wal,
             control_path: &self.control_path,
-            control: &mut self.control,
+            control: &self.control,
             page_size,
         };
         cat_write(&self.catalog).set_column_index(table, column, kind, &mut ctx)
@@ -612,18 +678,19 @@ impl Engine {
     /// `__consumers__` themselves as targets — defense in depth alongside
     /// the same guard in `send_event_capture`, following M2.a's
     /// "validate in more than one place" precedent for `VECTOR(n)`.
-    pub fn enable_events(&mut self, table: &str) -> Result<()> {
+    pub fn enable_events(&self, table: &str) -> Result<()> {
+        let _ws = serial_lock(&self.write_serial); // P5.e-3: serialize catalog/index writes
         if table == EVENTS_TABLE || table == CONSUMERS_TABLE {
             return Err(DbError::SqlPlan(format!(
                 "cannot enable events on the system table '{table}' itself"
             )));
         }
-        let page_size = self.control.page_size as usize;
+        let page_size = self.page_size;
         let mut ctx = crate::catalog::CatalogCtx {
-            pool: &mut self.pool,
-            wal: &mut self.wal,
+            pool: &self.pool,
+            wal: &self.wal,
             control_path: &self.control_path,
-            control: &mut self.control,
+            control: &self.control,
             page_size,
         };
         cat_write(&self.catalog).set_events_enabled(table, true, &mut ctx)
@@ -640,13 +707,8 @@ impl Engine {
     /// `__events__`'s total row count, not with consumer lag or `limit`
     /// (see queue/mod.rs's module doc and `Engine::vacuum_events`, M4.c,
     /// which is the actual lever for this cost).
-    pub fn poll_events(
-        &mut self,
-        xid: Xid,
-        consumer: &str,
-        limit: usize,
-    ) -> Result<Vec<queue::Event>> {
-        let page_size = self.control.page_size as usize;
+    pub fn poll_events(&self, xid: Xid, consumer: &str, limit: usize) -> Result<Vec<queue::Event>> {
+        let page_size = self.page_size;
         let events_def = cat_read(&self.catalog).lookup(EVENTS_TABLE)?.clone();
         let consumers_def = cat_read(&self.catalog).lookup(CONSUMERS_TABLE)?.clone();
         let events_heap = Heap::from_pages(page_size, events_def.pages.clone());
@@ -654,7 +716,7 @@ impl Engine {
         let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
 
         let offset =
-            queue::find_consumer_offset(&consumers_heap, &snapshot, xid, &mut self.pool, consumer)?
+            queue::find_consumer_offset(&consumers_heap, &snapshot, xid, &self.pool, consumer)?
                 .map(|(_, offset)| offset)
                 .unwrap_or(0);
 
@@ -695,13 +757,13 @@ impl Engine {
     /// has never acked before, this is where its row is created
     /// (auto-registration becomes durable on first ack, not on first
     /// poll).
-    pub fn ack_events(&mut self, xid: Xid, consumer: &str, up_to_seq: i64) -> Result<()> {
-        let page_size = self.control.page_size as usize;
+    pub fn ack_events(&self, xid: Xid, consumer: &str, up_to_seq: i64) -> Result<()> {
+        let _ws = serial_lock(&self.write_serial); // P5.e-3: serialize catalog/index writes
+        let page_size = self.page_size;
         let consumers_def = cat_read(&self.catalog).lookup(CONSUMERS_TABLE)?.clone();
         let heap = Heap::from_pages(page_size, consumers_def.pages.clone());
         let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
-        let existing =
-            queue::find_consumer_offset(&heap, &snapshot, xid, &mut self.pool, consumer)?;
+        let existing = queue::find_consumer_offset(&heap, &snapshot, xid, &self.pool, consumer)?;
 
         let encoded = executor::encode_row(&queue::consumer_row(consumer, up_to_seq));
         match existing {
@@ -737,10 +799,10 @@ impl Engine {
 
         if heap.page_ids() != consumers_def.pages.as_slice() {
             let mut cctx = CatalogCtx {
-                pool: &mut self.pool,
-                wal: &mut self.wal,
+                pool: &self.pool,
+                wal: &self.wal,
                 control_path: &self.control_path,
-                control: &mut self.control,
+                control: &self.control,
                 page_size,
             };
             cat_write(&self.catalog).set_pages(
@@ -763,8 +825,9 @@ impl Engine {
     /// need full history. Deliberately **not** called from `Engine::
     /// checkpoint()` or any other automatic path, matching M1's
     /// zero-automatic-vacuum precedent.
-    pub fn vacuum_events(&mut self, xid: Xid) -> Result<usize> {
-        let page_size = self.control.page_size as usize;
+    pub fn vacuum_events(&self, xid: Xid) -> Result<usize> {
+        let _ws = serial_lock(&self.write_serial); // P5.e-3: serialize catalog/index writes
+        let page_size = self.page_size;
         let consumers_def = cat_read(&self.catalog).lookup(CONSUMERS_TABLE)?.clone();
         let consumers_heap = Heap::from_pages(page_size, consumers_def.pages.clone());
         let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
@@ -816,14 +879,15 @@ impl Engine {
     /// `self.heap`, which has no table concept and backs only the raw
     /// `insert`/`get`/`update`/`delete` API above.
     pub fn create_edge(
-        &mut self,
+        &self,
         xid: Xid,
         from_id: i64,
         to_id: i64,
         edge_type: &str,
         props: &str,
     ) -> Result<RowId> {
-        let page_size = self.control.page_size as usize;
+        let _ws = serial_lock(&self.write_serial); // P5.e-3: serialize catalog/index writes
+        let page_size = self.page_size;
         let table_def = cat_read(&self.catalog).lookup(edges::EDGES_TABLE)?.clone();
         let heap = Heap::from_pages(page_size, table_def.pages.clone());
 
@@ -839,10 +903,10 @@ impl Engine {
 
         if heap.page_ids() != table_def.pages.as_slice() {
             let mut cctx = CatalogCtx {
-                pool: &mut self.pool,
-                wal: &mut self.wal,
+                pool: &self.pool,
+                wal: &self.wal,
                 control_path: &self.control_path,
-                control: &mut self.control,
+                control: &self.control,
                 page_size,
             };
             cat_write(&self.catalog).set_pages(
@@ -861,8 +925,8 @@ impl Engine {
         DiskBTree::new(self.edge_index_meta, page_size).insert(
             OrderedValue::Int(from_id),
             row_id,
-            &mut self.pool,
-            &mut self.wal,
+            &self.pool,
+            &self.wal,
         )?;
         Ok(row_id)
     }
@@ -870,8 +934,9 @@ impl Engine {
     /// Delete one edge record. `from_id` is taken as an explicit parameter
     /// (the caller already has it from whatever scan/`edges_from` call
     /// located the row) to avoid a redundant `Heap::get` just to find it.
-    pub fn delete_edge(&mut self, xid: Xid, row_id: RowId, from_id: i64) -> Result<()> {
-        let page_size = self.control.page_size as usize;
+    pub fn delete_edge(&self, xid: Xid, row_id: RowId, from_id: i64) -> Result<()> {
+        let _ws = serial_lock(&self.write_serial); // P5.e-3: serialize catalog/index writes
+        let page_size = self.page_size;
         let table_def = cat_read(&self.catalog).lookup(edges::EDGES_TABLE)?.clone();
         let heap = Heap::from_pages(page_size, table_def.pages.clone());
 
@@ -886,8 +951,8 @@ impl Engine {
         DiskBTree::new(self.edge_index_meta, page_size).remove(
             &OrderedValue::Int(from_id),
             row_id,
-            &mut self.pool,
-            &mut self.wal,
+            &self.pool,
+            &self.wal,
         )?;
         Ok(())
     }
@@ -898,17 +963,17 @@ impl Engine {
     /// MVCC snapshot check (`resolve_candidates_batched`), so an edge whose
     /// creating transaction aborted never surfaces here even though the
     /// index may still reference it.
-    pub fn edges_from(&mut self, xid: Xid, from_id: i64) -> Result<Vec<Edge>> {
-        let page_size = self.control.page_size as usize;
+    pub fn edges_from(&self, xid: Xid, from_id: i64) -> Result<Vec<Edge>> {
+        let page_size = self.page_size;
         let table_def = cat_read(&self.catalog).lookup(edges::EDGES_TABLE)?.clone();
         let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
         let candidates = DiskBTree::new(self.edge_index_meta, page_size)
-            .search_eq(&OrderedValue::Int(from_id), &mut self.pool)?;
+            .search_eq(&OrderedValue::Int(from_id), &self.pool)?;
         let resolved = resolve_candidates_batched(
             &candidates,
             &snapshot,
             xid,
-            &mut self.pool,
+            &self.pool,
             &table_def.columns,
         )?;
 
@@ -957,13 +1022,13 @@ impl Engine {
     /// it. Errors if the column has no built full-text index (Rust API only —
     /// there is still no `WHERE MATCH(...)` SQL surface).
     pub fn search_fulltext(
-        &mut self,
+        &self,
         xid: Xid,
         table: &str,
         column: &str,
         query: &str,
     ) -> Result<Vec<Vec<Literal>>> {
-        let page_size = self.control.page_size as usize;
+        let page_size = self.page_size;
         let table_def = cat_read(&self.catalog).lookup(table)?.clone();
         let col = table_def
             .columns
@@ -990,7 +1055,7 @@ impl Engine {
         let tree = DiskBTree::new(meta, page_size);
         let mut posting_lists: Vec<Vec<RowId>> = Vec::with_capacity(tokens.len());
         for token in &tokens {
-            posting_lists.push(tree.search_eq(&OrderedValue::Text(token.clone()), &mut self.pool)?);
+            posting_lists.push(tree.search_eq(&OrderedValue::Text(token.clone()), &self.pool)?);
         }
         posting_lists.sort_by_key(|l| l.len());
         let mut candidates: std::collections::HashSet<RowId> =
@@ -1024,24 +1089,24 @@ impl Engine {
     /// so a caller can store a big value and its owning row in one transaction.
     /// Resident memory is one ~7 KiB chunk at a time — a multi-GB value never
     /// loads whole (the "without OOM" gate).
-    pub fn put_large_object<R: std::io::Read>(&mut self, xid: Xid, reader: R) -> Result<i64> {
-        let page_size = self.control.page_size as usize;
-        let lob_id = self.next_lob_id;
-        self.next_lob_id += 1;
+    pub fn put_large_object<R: std::io::Read>(&self, xid: Xid, reader: R) -> Result<i64> {
+        let _ws = serial_lock(&self.write_serial); // P5.e-3: serialize catalog/index writes
+        let page_size = self.page_size;
+        let lob_id = self.next_lob_id.fetch_add(1, Ordering::SeqCst);
         let table_def = cat_read(&self.catalog)
             .lookup(large_object::LOBS_TABLE)?
             .clone();
-        let mut heap = Heap::from_pages(page_size, table_def.pages.clone());
+        let heap = Heap::from_pages(page_size, table_def.pages.clone());
         let store = LobStore::new(self.lob_index_meta, page_size);
         store.write_stream(
             xid,
             lob_id,
             reader,
             &table_def,
-            &mut heap,
-            &mut self.pool,
-            &mut self.wal,
-            &mut self.txn_mgr,
+            &heap,
+            &self.pool,
+            &self.wal,
+            &self.txn_mgr,
         )?;
         self.persist_lobs_pages(&heap, &table_def.pages)?;
         Ok(lob_id)
@@ -1051,52 +1116,53 @@ impl Engine {
     /// more than a chunk in memory), MVCC-filtered against `xid`. Returns bytes
     /// written; a `lob_id` with no visible chunks writes nothing.
     pub fn read_large_object<W: std::io::Write>(
-        &mut self,
+        &self,
         xid: Xid,
         lob_id: i64,
         sink: W,
     ) -> Result<u64> {
-        let page_size = self.control.page_size as usize;
+        let page_size = self.page_size;
         let table_def = cat_read(&self.catalog)
             .lookup(large_object::LOBS_TABLE)?
             .clone();
         let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
         let store = LobStore::new(self.lob_index_meta, page_size);
-        store.read_stream(lob_id, &table_def, &snapshot, xid, &mut self.pool, sink)
+        store.read_stream(lob_id, &table_def, &snapshot, xid, &self.pool, sink)
     }
 
     /// Delete every chunk of `lob_id` under `xid` (MVCC delete; the heap vacuum
     /// reclaims the dead chunk rows later). Returns the number of chunks removed.
-    pub fn delete_large_object(&mut self, xid: Xid, lob_id: i64) -> Result<usize> {
-        let page_size = self.control.page_size as usize;
+    pub fn delete_large_object(&self, xid: Xid, lob_id: i64) -> Result<usize> {
+        let _ws = serial_lock(&self.write_serial); // P5.e-3: serialize catalog/index writes
+        let page_size = self.page_size;
         let table_def = cat_read(&self.catalog)
             .lookup(large_object::LOBS_TABLE)?
             .clone();
-        let mut heap = Heap::from_pages(page_size, table_def.pages.clone());
+        let heap = Heap::from_pages(page_size, table_def.pages.clone());
         let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
         let store = LobStore::new(self.lob_index_meta, page_size);
         store.delete(
             xid,
             lob_id,
             &table_def,
-            &mut heap,
-            &mut self.pool,
-            &mut self.wal,
-            &mut self.lock_mgr,
-            &mut self.txn_mgr,
+            &heap,
+            &self.pool,
+            &self.wal,
+            &self.lock_mgr,
+            &self.txn_mgr,
             &snapshot,
         )
     }
 
     /// Persist `__lobs__`'s page list back to the catalog if the heap grew.
-    fn persist_lobs_pages(&mut self, heap: &Heap, original: &[PageId]) -> Result<()> {
+    fn persist_lobs_pages(&self, heap: &Heap, original: &[PageId]) -> Result<()> {
         if heap.page_ids() != original {
-            let page_size = self.control.page_size as usize;
+            let page_size = self.page_size;
             let mut cctx = CatalogCtx {
-                pool: &mut self.pool,
-                wal: &mut self.wal,
+                pool: &self.pool,
+                wal: &self.wal,
                 control_path: &self.control_path,
-                control: &mut self.control,
+                control: &self.control,
                 page_size,
             };
             cat_write(&self.catalog).set_pages(
@@ -1109,14 +1175,14 @@ impl Engine {
     }
 
     /// Begin a new transaction under READ COMMITTED (the default, D10).
-    pub fn begin(&mut self) -> Result<Xid> {
+    pub fn begin(&self) -> Result<Xid> {
         self.begin_with_isolation(IsolationLevel::ReadCommitted)
     }
 
     /// Begin a new transaction under an explicit isolation level (RC or RR,
     /// D10). The returned `xid` must eventually reach [`Self::commit`] or
     /// [`Self::abort`] — there is no timeout or automatic cleanup.
-    pub fn begin_with_isolation(&mut self, isolation: IsolationLevel) -> Result<Xid> {
+    pub fn begin_with_isolation(&self, isolation: IsolationLevel) -> Result<Xid> {
         self.txn_mgr.begin(isolation, &self.wal)
     }
 
@@ -1129,14 +1195,24 @@ impl Engine {
     /// with `xid` still live, and this method rolls it back before returning
     /// the error — so the caller just sees `SerializationFailure` on a fully
     /// cleaned-up transaction, and should retry.
-    pub fn commit(&mut self, xid: Xid) -> Result<()> {
-        match self.txn_mgr.commit(xid, &self.wal, &self.lock_mgr) {
+    pub fn commit(&self, xid: Xid) -> Result<()> {
+        let commit_lsn = match self.txn_mgr.commit(xid, &self.wal, &self.lock_mgr) {
             Err(DbError::SerializationFailure { xid }) => {
                 self.abort(xid)?;
                 return Err(DbError::SerializationFailure { xid });
             }
             Err(e) => return Err(e),
-            Ok(()) => {}
+            Ok(lsn) => lsn,
+        };
+        // Group commit (P5.e-3): force this transaction's commit record durable
+        // before returning, coalescing with any concurrent committers behind a
+        // single fsync. In the default (non-deferred) mode `commit_user_txn`
+        // already fsynced, so this is a no-op fast path; in the server's
+        // deferred mode this is where durability is actually forced, and the
+        // more writers commit at once, the fewer fsyncs they collectively pay.
+        // A read-only transaction (`None`) wrote no commit record and skips it.
+        if let Some(lsn) = commit_lsn {
+            self.wal.sync_up_to(lsn)?;
         }
         // P1.e: a commit is a quiescence boundary — the natural point to run an
         // auto-checkpoint if a trigger has fired.
@@ -1150,12 +1226,12 @@ impl Engine {
     /// checkpoint's WAL truncation cannot discard an in-flight transaction's
     /// undo records. The WAL is synced first so a deferred-sync session's pages
     /// are durable before `flush_all` (D5).
-    fn maybe_auto_checkpoint(&mut self) -> Result<()> {
-        let cfg = self.auto_checkpoint;
+    fn maybe_auto_checkpoint(&self) -> Result<()> {
+        let cfg = *ctrl_lock_ac(&self.auto_checkpoint);
         if !cfg.enabled || self.txn_mgr.active_count() > 0 {
             return Ok(());
         }
-        let by_time = self.last_checkpoint.elapsed() >= cfg.timeout;
+        let by_time = ctrl_lock_lc(&self.last_checkpoint).elapsed() >= cfg.timeout;
         let by_size = self.wal.wal_bytes() >= cfg.max_wal_size;
         if by_time || by_size {
             tracing::info!(
@@ -1166,28 +1242,28 @@ impl Engine {
             );
             self.sync_wal()?;
             self.checkpoint()?;
-            self.last_checkpoint = Instant::now();
-            self.checkpoints_triggered += 1;
+            *ctrl_lock_lc(&self.last_checkpoint) = Instant::now();
+            self.checkpoints_triggered.fetch_add(1, Ordering::SeqCst);
         }
         Ok(())
     }
 
     /// Current auto-checkpoint policy (P1.e).
     pub fn auto_checkpoint_config(&self) -> AutoCheckpointConfig {
-        self.auto_checkpoint
+        *ctrl_lock_ac(&self.auto_checkpoint)
     }
 
     /// Replace the auto-checkpoint policy (P1.e). Resets the time trigger's
     /// clock so a freshly-lowered `timeout` doesn't fire on stale elapsed time.
-    pub fn set_auto_checkpoint_config(&mut self, cfg: AutoCheckpointConfig) {
-        self.auto_checkpoint = cfg;
-        self.last_checkpoint = Instant::now();
+    pub fn set_auto_checkpoint_config(&self, cfg: AutoCheckpointConfig) {
+        *ctrl_lock_ac(&self.auto_checkpoint) = cfg;
+        *ctrl_lock_lc(&self.last_checkpoint) = Instant::now();
     }
 
     /// How many auto-checkpoints have fired this session (P1.e) — for tests and
     /// observability.
     pub fn checkpoints_triggered(&self) -> u64 {
-        self.checkpoints_triggered
+        self.checkpoints_triggered.load(Ordering::SeqCst)
     }
 
     /// A cloneable, `Send + Sync` handle for concurrent reads that run off the
@@ -1212,7 +1288,7 @@ impl Engine {
     /// [`crate::wal::Wal::set_deferred_sync`] for the durability contract and
     /// the current buffer-pool caveat (a working set exceeding the pool while
     /// in deferred mode is not yet supported — tracked for M9 hardening).
-    pub fn set_deferred_sync(&mut self, deferred: bool) {
+    pub fn set_deferred_sync(&self, deferred: bool) {
         self.wal.set_deferred_sync(deferred);
     }
 
@@ -1220,7 +1296,7 @@ impl Engine {
     /// batch issues after appending many transactions' commit records. Also
     /// advances the buffer pool's durable-frontier view (D5) so eviction can
     /// steal any now-durable dirty page.
-    pub fn sync_wal(&mut self) -> Result<()> {
+    pub fn sync_wal(&self) -> Result<()> {
         self.wal.sync()?;
         self.pool.set_durable_wal_lsn(self.wal.durable_lsn());
         Ok(())
@@ -1228,14 +1304,9 @@ impl Engine {
 
     /// Abort `xid`, physically undoing its writes and releasing every lock
     /// it held. `xid` is finished after this call and must not be reused.
-    pub fn abort(&mut self, xid: Xid) -> Result<()> {
-        self.txn_mgr.abort(
-            xid,
-            &mut self.pool,
-            &mut self.heap,
-            &mut self.wal,
-            &self.lock_mgr,
-        )
+    pub fn abort(&self, xid: Xid) -> Result<()> {
+        self.txn_mgr
+            .abort(xid, &self.pool, &self.heap, &self.wal, &self.lock_mgr)
     }
 
     /// Insert one untyped byte-slice row, the lowest-level write primitive
@@ -1243,7 +1314,7 @@ impl Engine {
     /// or [`Self::begin_with_isolation`]); does not itself begin, commit,
     /// or abort anything — the caller owns the transaction's whole
     /// lifetime, exactly like every other method taking an `xid` parameter.
-    pub fn insert(&mut self, xid: Xid, data: &[u8]) -> Result<RowId> {
+    pub fn insert(&self, xid: Xid, data: &[u8]) -> Result<RowId> {
         let rid = self.heap.insert(data, xid, &self.pool, &self.wal)?;
         self.txn_mgr.record_undo(
             xid,
@@ -1260,7 +1331,7 @@ impl Engine {
     /// (there is no snapshot without a transaction) — the caller is
     /// responsible for eventually calling [`Self::commit`] or
     /// [`Self::abort`] on it, even for a read-only `xid`.
-    pub fn get(&mut self, xid: Xid, row_id: RowId) -> Result<Vec<u8>> {
+    pub fn get(&self, xid: Xid, row_id: RowId) -> Result<Vec<u8>> {
         let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
         self.heap.get(row_id, &snapshot, xid, &self.pool)
     }
@@ -1268,7 +1339,7 @@ impl Engine {
     /// Update `row_id`, returning the new version's RowId (M1: UPDATE
     /// creates a new tuple version rather than overwriting in place, so the
     /// physical location may change; re-resolve via the returned RowId).
-    pub fn update(&mut self, xid: Xid, row_id: RowId, new_data: &[u8]) -> Result<RowId> {
+    pub fn update(&self, xid: Xid, row_id: RowId, new_data: &[u8]) -> Result<RowId> {
         let new_rid =
             self.heap
                 .update(row_id, new_data, xid, &self.pool, &self.wal, &self.lock_mgr)?;
@@ -1291,7 +1362,7 @@ impl Engine {
 
     /// Delete one row by `RowId`. Requires an already-open `xid`; does not
     /// commit or abort it.
-    pub fn delete(&mut self, xid: Xid, row_id: RowId) -> Result<()> {
+    pub fn delete(&self, xid: Xid, row_id: RowId) -> Result<()> {
         self.heap
             .delete(row_id, xid, &self.pool, &self.wal, &self.lock_mgr)?;
         self.txn_mgr.record_undo(
@@ -1308,18 +1379,18 @@ impl Engine {
     /// file, and truncate the WAL. Operational/administrative — takes no
     /// `xid`, is not part of any user transaction's lifecycle, and is safe
     /// to call at any time (it only touches already-committed state).
-    pub fn checkpoint(&mut self) -> Result<()> {
+    pub fn checkpoint(&self) -> Result<()> {
         checkpoint::run(
-            &mut self.pool,
-            &mut self.wal,
+            &self.pool,
+            &self.wal,
             &self.control_path,
-            &mut self.control,
+            &self.control,
             self.txn_mgr.next_xid(),
         )
     }
 
     /// Flush all dirty pages without a full checkpoint (used in tests).
-    pub fn flush(&mut self) -> Result<()> {
+    pub fn flush(&self) -> Result<()> {
         self.pool.flush_all(self.wal.durable_lsn())
     }
 
@@ -1338,7 +1409,7 @@ impl Engine {
     /// everyone state — and crash-safe: a crash mid-vacuum leaves either the
     /// pre- or post-mark state, never a lost committed row (its WAL records are
     /// idempotent redo, no undo).
-    pub fn vacuum(&mut self) -> Result<VacuumReport> {
+    pub fn vacuum(&self) -> Result<VacuumReport> {
         self.vacuum_inner(true)
     }
 
@@ -1347,9 +1418,12 @@ impl Engine {
     /// production (`Engine::vacuum`); `false` exists solely to *reproduce* the
     /// index-aliasing hazard in tests (skipping the gate lets a reused slot
     /// alias a stale index entry — see `lib.rs`'s M10.c regression test).
-    fn vacuum_inner(&mut self, clean_indexes: bool) -> Result<VacuumReport> {
+    fn vacuum_inner(&self, clean_indexes: bool) -> Result<VacuumReport> {
+        // P5.e-3: vacuum mutates the same secondary-index trees + compacts heap
+        // pages that the guarded write paths touch — serialize it with them.
+        let _ws = serial_lock(&self.write_serial);
         let horizon = self.txn_mgr.vacuum_horizon();
-        let page_size = self.control.page_size as usize;
+        let page_size = self.page_size;
         let mut report = VacuumReport {
             horizon,
             horizon_blocked: horizon < self.txn_mgr.next_xid(),
@@ -1434,11 +1508,11 @@ impl Engine {
             if clean_indexes {
                 for (root, value, rid) in &durable_removals {
                     let tree = DiskBTree::new(*root, page_size);
-                    tree.remove(value, *rid, &mut self.pool, &mut self.wal)?;
+                    tree.remove(value, *rid, &self.pool, &self.wal)?;
                 }
                 for (root, vector, rid) in &ivf_removals {
                     let ivf = DiskIvfIndex::open(*root, page_size);
-                    ivf.remove(*rid, vector, &mut self.pool, &mut self.wal)?;
+                    ivf.remove(*rid, vector, &self.pool, &self.wal)?;
                 }
             }
 
@@ -1513,12 +1587,12 @@ fn count_live_slots(heap: &Heap, pool: &BufferPool) -> Result<usize> {
 #[allow(clippy::too_many_arguments)] // open-time wiring, mirrors rebuild_* helpers
 fn ensure_edge_index(
     catalog: &mut Catalog,
-    txn_mgr: &mut TransactionManager,
-    pool: &mut BufferPool,
-    wal: &mut Wal,
-    lock_mgr: &mut LockManager,
+    txn_mgr: &TransactionManager,
+    pool: &BufferPool,
+    wal: &Wal,
+    lock_mgr: &LockManager,
     control_path: &Path,
-    control: &mut ControlData,
+    control: &Mutex<ControlData>,
     page_size: usize,
 ) -> Result<PageId> {
     // Already built? Reuse it — this is the no-rebuild-on-open fast path.
@@ -1582,10 +1656,10 @@ fn ensure_edge_index(
 /// — mirrors `derive_next_event_seq`. Crash-safe (persisted as ordinary rows).
 fn derive_next_lob_id(
     catalog: &Catalog,
-    txn_mgr: &mut TransactionManager,
-    pool: &mut BufferPool,
-    wal: &mut Wal,
-    lock_mgr: &mut LockManager,
+    txn_mgr: &TransactionManager,
+    pool: &BufferPool,
+    wal: &Wal,
+    lock_mgr: &LockManager,
     page_size: usize,
 ) -> Result<i64> {
     let table = catalog.lookup(large_object::LOBS_TABLE)?;
@@ -1605,10 +1679,10 @@ fn derive_next_lob_id(
 
 fn derive_next_event_seq(
     catalog: &Catalog,
-    txn_mgr: &mut TransactionManager,
-    pool: &mut BufferPool,
-    wal: &mut Wal,
-    lock_mgr: &mut LockManager,
+    txn_mgr: &TransactionManager,
+    pool: &BufferPool,
+    wal: &Wal,
+    lock_mgr: &LockManager,
     page_size: usize,
 ) -> Result<u64> {
     let table = catalog.lookup(EVENTS_TABLE)?;
@@ -1645,7 +1719,7 @@ mod tests {
     #[test]
     fn open_insert_get_roundtrip() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         let rid = engine.insert(xid, b"hello world").unwrap();
         let data = engine.get(xid, rid).unwrap();
@@ -1656,7 +1730,7 @@ mod tests {
     #[test]
     fn update_and_verify() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         let rid = engine.insert(xid, b"initial_value").unwrap();
         let new_rid = engine.update(xid, rid, b"updated").unwrap();
@@ -1667,7 +1741,7 @@ mod tests {
     #[test]
     fn delete_makes_row_gone() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         let rid = engine.insert(xid, b"transient").unwrap();
         engine.delete(xid, rid).unwrap();
@@ -1679,14 +1753,14 @@ mod tests {
     fn reopen_after_flush_recovers_data() {
         let dir = tempdir().unwrap();
         let rid = {
-            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let engine = Engine::open(dir.path(), 0).unwrap();
             let xid = engine.begin().unwrap();
             let rid = engine.insert(xid, b"durable").unwrap();
             engine.commit(xid).unwrap();
             engine.flush().unwrap();
             rid
         };
-        let mut engine2 = Engine::open(dir.path(), 0).unwrap();
+        let engine2 = Engine::open(dir.path(), 0).unwrap();
         let xid2 = engine2.begin().unwrap();
         assert_eq!(engine2.get(xid2, rid).unwrap(), b"durable");
     }
@@ -1694,7 +1768,7 @@ mod tests {
     #[test]
     fn read_committed_sees_other_txns_committed_write() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let a = engine.begin().unwrap();
         let rid = engine.insert(a, b"v1").unwrap();
         engine.commit(a).unwrap();
@@ -1707,7 +1781,7 @@ mod tests {
     #[test]
     fn repeatable_read_does_not_see_write_committed_after_begin() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let a = engine.begin().unwrap();
         let rid = engine.insert(a, b"v1").unwrap();
         engine.commit(a).unwrap();
@@ -1737,7 +1811,7 @@ mod tests {
     #[test]
     fn rollback_undoes_insert() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let a = engine.begin().unwrap();
         let rid = engine.insert(a, b"oops").unwrap();
         engine.abort(a).unwrap();
@@ -1750,14 +1824,14 @@ mod tests {
     fn xid_counter_survives_reopen() {
         let dir = tempdir().unwrap();
         let first_xid = {
-            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let engine = Engine::open(dir.path(), 0).unwrap();
             let xid = engine.begin().unwrap();
             engine.insert(xid, b"row").unwrap();
             engine.commit(xid).unwrap();
             engine.flush().unwrap();
             xid
         };
-        let mut engine2 = Engine::open(dir.path(), 0).unwrap();
+        let engine2 = Engine::open(dir.path(), 0).unwrap();
         let next_xid = engine2.begin().unwrap();
         assert!(next_xid > first_xid, "reopened engine must not reuse xids");
     }
@@ -1777,7 +1851,7 @@ mod tests {
     fn xid_counter_survives_reopen_after_checkpoint() {
         let dir = tempdir().unwrap();
         let last_xid_before_checkpoint = {
-            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let engine = Engine::open(dir.path(), 0).unwrap();
             let mut last = 0;
             for i in 0..5u32 {
                 let xid = engine.begin().unwrap();
@@ -1791,7 +1865,7 @@ mod tests {
             last
         };
 
-        let mut engine2 = Engine::open(dir.path(), 0).unwrap();
+        let engine2 = Engine::open(dir.path(), 0).unwrap();
         let resumed_xid = engine2.begin().unwrap();
         assert!(
             resumed_xid > last_xid_before_checkpoint,
@@ -1805,7 +1879,7 @@ mod tests {
     #[test]
     fn concurrent_update_aborts_second_writer_immediately() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let setup_xid = engine.begin().unwrap();
         let rid = engine.insert(setup_xid, b"row").unwrap();
         engine.commit(setup_xid).unwrap();
@@ -1838,7 +1912,7 @@ mod tests {
     #[test]
     fn commit_releases_lock_for_next_writer() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let setup_xid = engine.begin().unwrap();
         let rid = engine.insert(setup_xid, b"row").unwrap();
         engine.commit(setup_xid).unwrap();
@@ -1857,7 +1931,7 @@ mod tests {
     #[test]
     fn abort_releases_lock_for_next_writer() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let setup_xid = engine.begin().unwrap();
         let rid = engine.insert(setup_xid, b"row").unwrap();
         engine.commit(setup_xid).unwrap();
@@ -1881,7 +1955,7 @@ mod tests {
     #[test]
     fn execute_sql_full_round_trip() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
 
         let xid = engine.begin().unwrap();
         engine
@@ -1940,7 +2014,7 @@ mod tests {
         // second statement fails must leave the schema untouched — the catalog
         // change is rolled back even though the catalog persists eagerly.
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         let res = engine.execute_sql(
             xid,
@@ -1970,7 +2044,7 @@ mod tests {
         // P2.c: schema changes persist across an engine reopen.
         let dir = tempdir().unwrap();
         {
-            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let engine = Engine::open(dir.path(), 0).unwrap();
             let xid = engine.begin().unwrap();
             engine
                 .execute_sql(xid, "CREATE TABLE t (a INT, b INT)")
@@ -1987,7 +2061,7 @@ mod tests {
             engine.commit(xid).unwrap();
             engine.checkpoint().unwrap();
         }
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         let rows = engine.execute_sql(xid, "SELECT a, c FROM t").unwrap();
         match &rows[0] {
@@ -2013,7 +2087,7 @@ mod tests {
         // past the last-handed-out value, never reusing an id.
         let dir = tempdir().unwrap();
         {
-            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let engine = Engine::open(dir.path(), 0).unwrap();
             let xid = engine.begin().unwrap();
             engine
                 .execute_sql(xid, "CREATE TABLE t (id SERIAL, v INT)")
@@ -2027,7 +2101,7 @@ mod tests {
             engine.commit(xid).unwrap();
             engine.checkpoint().unwrap();
         }
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine
             .execute_sql(xid, "INSERT INTO t (v) VALUES (30)")
@@ -2051,7 +2125,7 @@ mod tests {
         // P2.e: a bound value that would be catastrophic as an interpolated
         // string literal is treated purely as data — no SQL is re-parsed.
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine
             .execute_sql(xid, "CREATE TABLE t (id INT, name TEXT)")
@@ -2099,7 +2173,7 @@ mod tests {
     #[test]
     fn bind_params_out_of_range_errors() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine.execute_sql(xid, "CREATE TABLE t (id INT)").unwrap();
         // `$2` referenced but only one value supplied.
@@ -2112,7 +2186,7 @@ mod tests {
     fn prepared_plan_reused_across_executions() {
         // P2.e: parse once, execute many with different bind values.
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine
             .execute_sql(xid, "CREATE TABLE t (id INT, name TEXT)")
@@ -2147,7 +2221,7 @@ mod tests {
     #[test]
     fn execute_sql_vector_round_trip() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
 
         let xid = engine.begin().unwrap();
         engine
@@ -2179,7 +2253,7 @@ mod tests {
     #[test]
     fn execute_sql_vector_dimension_mismatch_rejected() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
 
         let xid = engine.begin().unwrap();
         engine
@@ -2242,7 +2316,7 @@ mod tests {
         // from disk — and NEAR still returns the right nearest neighbor.
         let dir = tempdir().unwrap();
         {
-            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let engine = Engine::open(dir.path(), 0).unwrap();
             let xid = engine.begin().unwrap();
             engine
                 .execute_sql(xid, "CREATE TABLE t (id INT, embedding VECTOR(2))")
@@ -2285,7 +2359,7 @@ mod tests {
     #[test]
     fn index_status_is_ready_for_durable_index() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine
             .execute_sql(xid, "CREATE TABLE t (id INT, embedding VECTOR(2))")
@@ -2306,7 +2380,7 @@ mod tests {
     #[test]
     fn create_index_fulltext_backfills_immediately_and_is_queryable() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
 
         let xid = engine.begin().unwrap();
         engine
@@ -2358,7 +2432,7 @@ mod tests {
     #[test]
     fn create_index_rejects_type_mismatch_via_sql() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
 
         let xid = engine.begin().unwrap();
         engine
@@ -2375,7 +2449,7 @@ mod tests {
     #[test]
     fn near_query_returns_nearest_neighbors_in_order() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
 
         let xid = engine.begin().unwrap();
         engine
@@ -2417,7 +2491,7 @@ mod tests {
     #[test]
     fn near_composes_with_ordinary_where_predicate() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
 
         let xid = engine.begin().unwrap();
         engine
@@ -2462,7 +2536,7 @@ mod tests {
     fn sql_survives_reopen() {
         let dir = tempdir().unwrap();
         {
-            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let engine = Engine::open(dir.path(), 0).unwrap();
             let xid = engine.begin().unwrap();
             engine.execute_sql(xid, "CREATE TABLE t (id INT)").unwrap();
             engine
@@ -2471,7 +2545,7 @@ mod tests {
             engine.commit(xid).unwrap();
             engine.flush().unwrap();
         }
-        let mut engine2 = Engine::open(dir.path(), 0).unwrap();
+        let engine2 = Engine::open(dir.path(), 0).unwrap();
         let xid = engine2.begin().unwrap();
         let result = engine2.execute_sql(xid, "SELECT * FROM t").unwrap();
         match &result[0] {
@@ -2492,7 +2566,7 @@ mod tests {
     fn write_skew_commits_under_rr_but_aborts_under_serializable() {
         fn run(iso: Isolation) -> (Result<()>, Result<()>) {
             let dir = tempdir().unwrap();
-            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let engine = Engine::open(dir.path(), 0).unwrap();
             let s = engine.begin().unwrap();
             engine
                 .execute_sql(s, "CREATE TABLE doctors (id INT, on_call INT)")
@@ -2557,7 +2631,7 @@ mod tests {
     #[test]
     fn read_committed_concurrent_update_does_not_spuriously_abort() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let s = engine.begin().unwrap();
         engine
             .execute_sql(s, "CREATE TABLE t (id INT, v INT)")
@@ -2601,7 +2675,7 @@ mod tests {
     #[test]
     fn repeatable_read_write_over_committed_update_is_serialization_failure() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let s = engine.begin().unwrap();
         engine
             .execute_sql(s, "CREATE TABLE t (id INT, v INT)")
@@ -2641,7 +2715,7 @@ mod tests {
     #[test]
     fn serializable_non_conflicting_transaction_commits() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let s = engine.begin().unwrap();
         engine
             .execute_sql(s, "CREATE TABLE t (id INT, v INT)")
@@ -2674,7 +2748,7 @@ mod tests {
     #[test]
     fn auto_checkpoint_fires_on_wal_size_and_data_survives() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         // A tiny WAL-size threshold so a handful of inserts crosses it; disable
         // the time trigger so the test doesn't depend on wall-clock.
         engine.set_auto_checkpoint_config(AutoCheckpointConfig {
@@ -2702,7 +2776,7 @@ mod tests {
         // Reopen: the auto-checkpoints truncated the WAL, so recovery must come
         // from the checkpointed pages — all 50 rows must still be present.
         drop(engine);
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let q = engine.begin().unwrap();
         match &engine.execute_sql(q, "SELECT id FROM t").unwrap()[0] {
             SqlResult::Rows(rows) => assert_eq!(rows.len(), 50, "all rows must survive"),
@@ -2716,7 +2790,7 @@ mod tests {
     #[test]
     fn auto_checkpoint_does_not_fire_mid_transaction() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         engine.set_auto_checkpoint_config(AutoCheckpointConfig {
             enabled: true,
             timeout: std::time::Duration::from_secs(3600),
@@ -2754,7 +2828,7 @@ mod tests {
     #[test]
     fn rls_policy_filters_rows() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine
             .execute_sql(xid, "CREATE TABLE t (id INT, owner TEXT)")
@@ -2808,7 +2882,7 @@ mod tests {
     #[test]
     fn btree_assisted_select_matches_full_scan_equality_and_range() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine
             .execute_sql(xid, "CREATE TABLE indexed (id INT, name TEXT)")
@@ -2878,7 +2952,7 @@ mod tests {
     #[test]
     fn btree_assisted_select_still_respects_rls() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine
             .execute_sql(xid, "CREATE TABLE t (id INT, owner TEXT)")
@@ -2926,7 +3000,7 @@ mod tests {
     #[test]
     fn edges_table_exists_and_is_ordinary_sql_queryable() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine.create_edge(xid, 1, 2, "KNOWS", "{}").unwrap();
         engine.commit(xid).unwrap();
@@ -2944,7 +3018,7 @@ mod tests {
     #[test]
     fn create_edge_then_edges_from_returns_it() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine.create_edge(xid, 1, 2, "KNOWS", "{}").unwrap();
         engine.create_edge(xid, 1, 3, "KNOWS", "{}").unwrap();
@@ -2962,7 +3036,7 @@ mod tests {
     #[test]
     fn delete_edge_removes_from_index_and_traversal() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         let row_id = engine.create_edge(xid, 1, 2, "KNOWS", "{}").unwrap();
         engine.commit(xid).unwrap();
@@ -2978,7 +3052,7 @@ mod tests {
     #[test]
     fn edges_from_on_from_id_with_no_edges_returns_empty() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         assert!(engine.edges_from(xid, 999).unwrap().is_empty());
     }
@@ -2987,7 +3061,7 @@ mod tests {
     fn edge_index_rebuilds_on_reopen() {
         let dir = tempdir().unwrap();
         {
-            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let engine = Engine::open(dir.path(), 0).unwrap();
             let xid = engine.begin().unwrap();
             engine.create_edge(xid, 1, 2, "KNOWS", "{}").unwrap();
             engine.create_edge(xid, 1, 3, "LIKES", "{}").unwrap();
@@ -2995,7 +3069,7 @@ mod tests {
             engine.flush().unwrap();
         }
 
-        let mut engine2 = Engine::open(dir.path(), 0).unwrap();
+        let engine2 = Engine::open(dir.path(), 0).unwrap();
         let xid = engine2.begin().unwrap();
         let edges = engine2.edges_from(xid, 1).unwrap();
         assert_eq!(edges.len(), 2);
@@ -3006,7 +3080,7 @@ mod tests {
     #[test]
     fn execute_cypher_match_where_return_uses_index_fast_path() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine.create_edge(xid, 1, 2, "KNOWS", "{}").unwrap();
         engine.create_edge(xid, 1, 3, "KNOWS", "{}").unwrap();
@@ -3036,7 +3110,7 @@ mod tests {
     #[test]
     fn execute_cypher_filters_by_edge_type() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine.create_edge(xid, 1, 2, "KNOWS", "{}").unwrap();
         engine.create_edge(xid, 1, 3, "LIKES", "{}").unwrap();
@@ -3058,7 +3132,7 @@ mod tests {
     #[test]
     fn execute_cypher_without_from_id_predicate_falls_back_to_full_scan() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine.create_edge(xid, 1, 2, "KNOWS", "{}").unwrap();
         engine.create_edge(xid, 5, 6, "KNOWS", "{}").unwrap();
@@ -3080,7 +3154,7 @@ mod tests {
     #[test]
     fn execute_cypher_returns_edge_type_and_props() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine
             .create_edge(xid, 1, 2, "KNOWS", "{\"since\":2020}")
@@ -3107,7 +3181,7 @@ mod tests {
     #[test]
     fn execute_cypher_rejects_property_access() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         let err = engine
             .execute_cypher(
@@ -3137,7 +3211,7 @@ mod tests {
     #[test]
     fn queue_tables_exist_and_are_ordinary_sql_queryable() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         let events = engine.execute_sql(xid, "SELECT * FROM __events__").unwrap();
         assert_eq!(events, vec![SqlResult::Rows(vec![])]);
@@ -3166,7 +3240,7 @@ mod tests {
     #[test]
     fn enable_events_rejects_system_tables() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         assert!(matches!(
             engine.enable_events(queue::EVENTS_TABLE),
             Err(DbError::SqlPlan(_))
@@ -3302,7 +3376,7 @@ mod tests {
     fn event_seq_derivation_resumes_past_highest_seen_after_reopen() {
         let dir = tempdir().unwrap();
         {
-            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let engine = Engine::open(dir.path(), 0).unwrap();
             let xid = engine.begin().unwrap();
             engine.execute_sql(xid, "CREATE TABLE t (id INT)").unwrap();
             engine.commit(xid).unwrap();
@@ -3401,7 +3475,7 @@ mod tests {
             engine.flush().unwrap();
         }
 
-        let mut engine2 = Engine::open(dir.path(), 0).unwrap();
+        let engine2 = Engine::open(dir.path(), 0).unwrap();
         let xid = engine2.begin().unwrap();
         let remaining = engine2.poll_events(xid, "c1", 10).unwrap();
         assert_eq!(remaining.len(), 1);
@@ -3460,7 +3534,7 @@ mod tests {
         // stale EdgeIndex entry left by an aborted create_edge.
         {
             let dir = tempdir().unwrap();
-            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let engine = Engine::open(dir.path(), 0).unwrap();
             let t1 = engine.begin().unwrap();
             let stale = engine.create_edge(t1, 100, 999, "T", "{}").unwrap();
             engine.abort(t1).unwrap(); // row dead; EdgeIndex[100]->stale lingers
@@ -3488,7 +3562,7 @@ mod tests {
         // reusable — the wrong answer can no longer occur.
         {
             let dir = tempdir().unwrap();
-            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let engine = Engine::open(dir.path(), 0).unwrap();
             let t1 = engine.begin().unwrap();
             let stale = engine.create_edge(t1, 100, 999, "T", "{}").unwrap();
             engine.abort(t1).unwrap();
@@ -3516,7 +3590,7 @@ mod tests {
     #[test]
     fn vacuum_reclaims_dead_update_versions() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let x = engine.begin().unwrap();
         let mut rid = engine.insert(x, b"v0").unwrap();
         engine.commit(x).unwrap();
@@ -3539,7 +3613,7 @@ mod tests {
     #[test]
     fn vacuum_horizon_blocked_flag_tracks_open_transactions() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let open = engine.begin().unwrap();
         // Advance next_xid past `open`'s snapshot so it genuinely holds the
         // horizon below where a quiescent database would sit.
@@ -3561,7 +3635,7 @@ mod tests {
     #[test]
     fn vacuum_does_not_reclaim_versions_a_live_reader_still_needs() {
         let dir = tempdir().unwrap();
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let x = engine.begin().unwrap();
         let rid = engine.insert(x, b"v0").unwrap();
         engine.commit(x).unwrap();
@@ -3592,7 +3666,7 @@ mod tests {
     fn vacuumed_database_survives_reopen() {
         let dir = tempdir().unwrap();
         let keep = {
-            let mut engine = Engine::open(dir.path(), 0).unwrap();
+            let engine = Engine::open(dir.path(), 0).unwrap();
             let x = engine.begin().unwrap();
             let keep = engine.insert(x, b"keep").unwrap();
             let drop_it = engine.insert(x, b"drop").unwrap();
@@ -3605,7 +3679,7 @@ mod tests {
             keep
         };
         // Reopen runs recovery (which must idempotently redo the vacuum).
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let x = engine.begin().unwrap();
         assert_eq!(engine.get(x, keep).unwrap(), b"keep");
     }

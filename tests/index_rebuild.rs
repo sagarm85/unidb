@@ -16,7 +16,7 @@ use unidb::Engine;
 fn engine_restart_vector_index_is_durable_no_rebuild() {
     let dir = tempdir().unwrap();
     {
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine
             .execute_sql(xid, "CREATE TABLE t (id INT, embedding VECTOR(2))")
@@ -39,7 +39,7 @@ fn engine_restart_vector_index_is_durable_no_rebuild() {
 
     // Fresh process-equivalent open: the durable IVF index is read from its
     // meta/centroid pages — no heap rescan, no `Ready` wait — and NEAR works.
-    let mut engine2 = Engine::open(dir.path(), 0).unwrap();
+    let engine2 = Engine::open(dir.path(), 0).unwrap();
     let xid = engine2.begin().unwrap();
     let results = engine2
         .execute_sql(xid, "SELECT id FROM t WHERE NEAR(embedding, [0.0, 0.0], 1)")
@@ -60,7 +60,7 @@ fn engine_restart_vector_index_is_durable_no_rebuild() {
 fn fulltext_index_is_durable_and_searchable_after_reopen() {
     let dir = tempdir().unwrap();
     {
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine
             .execute_sql(xid, "CREATE TABLE t (id INT, body TEXT)")
@@ -76,7 +76,7 @@ fn fulltext_index_is_durable_and_searchable_after_reopen() {
     }
 
     // Reopen: no heap rescan to rebuild the index, no `Ready` to wait on.
-    let mut engine2 = Engine::open(dir.path(), 0).unwrap();
+    let engine2 = Engine::open(dir.path(), 0).unwrap();
     let xid = engine2.begin().unwrap();
     let hits = engine2.search_fulltext(xid, "t", "body", "rust").unwrap();
     assert_eq!(
@@ -100,7 +100,7 @@ fn fulltext_index_is_durable_and_searchable_after_reopen() {
 fn engine_restart_btree_index_is_durable_no_rebuild() {
     let dir = tempdir().unwrap();
     {
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine
             .execute_sql(xid, "CREATE TABLE t (id INT, name TEXT)")
@@ -120,7 +120,7 @@ fn engine_restart_btree_index_is_durable_no_rebuild() {
 
     // Fresh process-equivalent open: the durable tree is read from its meta
     // page — no heap rescan, no `Ready` wait — and the query still works.
-    let mut engine2 = Engine::open(dir.path(), 0).unwrap();
+    let engine2 = Engine::open(dir.path(), 0).unwrap();
     let xid = engine2.begin().unwrap();
     let results = engine2
         .execute_sql(xid, "SELECT name FROM t WHERE id = 2")
@@ -137,7 +137,7 @@ fn engine_restart_btree_index_is_durable_no_rebuild() {
 #[test]
 fn btree_select_before_index_ready_still_returns_correct_full_result() {
     let dir = tempdir().unwrap();
-    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
 
     let xid = engine.begin().unwrap();
     engine
@@ -179,7 +179,7 @@ fn near_on_index_built_over_empty_table_returns_exact_topk() {
     // rows inserted afterward all land in it and are exact-re-ranked, so NEAR is
     // correct-but-flat. The durable index is synchronous — no `Ready` to wait on.
     let dir = tempdir().unwrap();
-    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
 
     let xid = engine.begin().unwrap();
     engine

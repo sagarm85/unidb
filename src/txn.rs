@@ -437,7 +437,11 @@ impl TransactionManager {
     /// write and this commit — the conflict, if any, was already caught
     /// immediately at `Heap::update`/`delete` time via `try_acquire_write`.
     /// This is stronger than needing a distinct commit-time check.
-    pub fn commit(&self, xid: Xid, wal: &Wal, lock_mgr: &LockManager) -> Result<()> {
+    /// Commit `xid`. Returns the LSN of its `WAL_TXN_COMMIT` record so the
+    /// caller can force durability up to exactly that point (group commit,
+    /// P5.e-3), or `None` for a read-only transaction — which writes no commit
+    /// record and needs no fsync (the M1.d read-only optimization).
+    pub fn commit(&self, xid: Xid, wal: &Wal, lock_mgr: &LockManager) -> Result<Option<Lsn>> {
         // SSI (P1.d): a serializable pivot must not commit — it would seal a
         // non-serializable schedule (e.g. write-skew). Refuse *before* removing
         // it from `active`, leaving it live for the caller to roll back
@@ -459,9 +463,11 @@ impl TransactionManager {
         // `xid` to reverse (see recovery.rs), and no committed tuple ever
         // references a read-only xid's xmin/xmax. Fixes the M1.d "read-only
         // commit pays an unnecessary fsync" regression noted in MEMORY.md.
-        if !txn.undo_log.is_empty() {
-            wal.commit_user_txn(xid, txn.last_lsn)?;
-        }
+        let commit_lsn = if !txn.undo_log.is_empty() {
+            Some(wal.commit_user_txn(xid, txn.last_lsn)?)
+        } else {
+            None
+        };
         {
             let mut inner = self.lock();
             inner.committed.insert(xid);
@@ -477,7 +483,7 @@ impl TransactionManager {
         }
         lock_mgr.release_all(xid);
         tracing::info!(xid, "transaction commit");
-        Ok(())
+        Ok(commit_lsn)
     }
 
     /// Roll back `xid`: physically reverse its writes in reverse order
@@ -490,9 +496,9 @@ impl TransactionManager {
     pub fn abort(
         &self,
         xid: Xid,
-        pool: &mut BufferPool,
-        heap: &mut Heap,
-        wal: &mut Wal,
+        pool: &BufferPool,
+        heap: &Heap,
+        wal: &Wal,
         lock_mgr: &LockManager,
     ) -> Result<()> {
         let txn = self
@@ -610,7 +616,7 @@ mod tests {
     #[test]
     fn abort_undoes_insert_and_marks_aborted() {
         let dir = tempdir().unwrap();
-        let (mut pool, mut heap, mut wal) = setup(dir.path());
+        let (pool, heap, wal) = setup(dir.path());
         let mgr = TransactionManager::new();
         let lock_mgr = LockManager::new();
         let a = mgr.begin(IsolationLevel::ReadCommitted, &wal).unwrap();
@@ -623,8 +629,7 @@ mod tests {
             },
         )
         .unwrap();
-        mgr.abort(a, &mut pool, &mut heap, &mut wal, &lock_mgr)
-            .unwrap();
+        mgr.abort(a, &pool, &heap, &wal, &lock_mgr).unwrap();
         assert!(!mgr.is_active(a));
         assert!(mgr.is_aborted(a));
         // A fresh snapshot after the abort must never see the row.

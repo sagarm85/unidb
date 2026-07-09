@@ -24,7 +24,7 @@ fn run(n: u64, payload_len: usize) -> (f64, u64, u64, usize, u64) {
 
     let start = Instant::now();
     {
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         for _ in 0..n {
             let xid = engine.begin().unwrap();
             engine.insert(xid, &payload).unwrap();

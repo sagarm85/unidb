@@ -28,7 +28,7 @@ use unidb::Engine;
 /// floor allows (one user-txn commit per batch). Returns nothing — the data
 /// lives in `dir` for a subsequent reopen to be timed.
 fn build(dir: &std::path::Path, n: u64, hnsw: bool) {
-    let mut engine = Engine::open(dir, 0).unwrap();
+    let engine = Engine::open(dir, 0).unwrap();
     let xid = engine.begin().unwrap();
     if hnsw {
         engine
@@ -137,7 +137,7 @@ fn main() {
 /// Build `n` committed edges out of one hub node, batched by committing every
 /// 500 edges (bounding pinned-page pressure), then checkpoint.
 fn build_edges(dir: &std::path::Path, n: u64) {
-    let mut engine = Engine::open(dir, 0).unwrap();
+    let engine = Engine::open(dir, 0).unwrap();
     const BATCH: u64 = 500;
     let mut i = 0;
     while i < n {

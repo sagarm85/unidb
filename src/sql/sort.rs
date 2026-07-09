@@ -18,13 +18,15 @@ use crate::sql::logical::Literal;
 use crate::sql::plan::SortKey;
 
 /// The in-memory row budget before `ORDER BY` spills to an external merge sort.
-/// Overridable via `UNIDB_SORT_MEM_ROWS` (tests force spill with a small value).
+/// A per-query `work_mem` (P5.f) takes precedence; otherwise `UNIDB_SORT_MEM_ROWS`
+/// or the process default (tests force spill with a small value).
 pub fn sort_mem_rows() -> usize {
-    std::env::var("UNIDB_SORT_MEM_ROWS")
+    let default = std::env::var("UNIDB_SORT_MEM_ROWS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(1_000_000)
+        .unwrap_or(1_000_000);
+    crate::query_limits::work_mem_rows(default)
 }
 
 /// Compare two rows by the ordered `keys`. NULL sorts smallest; direction is

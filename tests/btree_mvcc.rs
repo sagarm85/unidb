@@ -88,7 +88,7 @@ fn aborted_insert_never_surfaces_in_btree_assisted_results() {
 fn durable_btree_survives_reopen_without_rebuild() {
     let dir = tempdir().unwrap();
     {
-        let mut engine = Engine::open(dir.path(), 0).unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         engine
             .execute_sql(xid, "CREATE TABLE t (id INT, name TEXT)")
@@ -110,7 +110,7 @@ fn durable_btree_survives_reopen_without_rebuild() {
 
     // Reopen: `Engine::open` does NOT rescan the heap to rebuild this index —
     // it reads the tree straight from its meta page. The query still works.
-    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
     let xid = engine.begin().unwrap();
     let results = engine
         .execute_sql(xid, "SELECT id FROM t WHERE id = 42")
