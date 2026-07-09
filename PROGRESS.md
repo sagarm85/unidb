@@ -3004,12 +3004,27 @@ cost is the commit fsync, which group commit (`Wal::sync_up_to`) coalesces
 across a 100× size range for both engines (the P1.c flatness claim, confirmed
 against Postgres). unidb's read is ~13× faster at every size (embedded). *unidb's
 B4 uses the raw CRUD path* — this is the P1.c-claim path and it keeps the
-free-space map warm; the SQL bulk-load path hits a documented `HeapFull` at
-~145k rows in a single transaction because its per-statement FSM is rebuilt
-lazily (raw `Engine::insert` keeps it warm — a known limitation, "durable on-disk
-FSM is a later item", MEMORY/P1.c). Raw insert is separately proven to build 5M
-rows (linear, ~247 s); 1M is the measured headline, 5M is env-reachable
-(`PG_SWEEP_SIZES`).
+free-space map warm; the SQL bulk-load path hits a `HeapFull` at ~145k rows.
+
+> **Correction (2026-07-09, root-caused during PR review — inline per §9, not a
+> silent rewrite):** the earlier "per-statement lazy FSM" framing *undersells*
+> this. The lazy `Heap::from_pages` rebuild is a real per-statement *performance*
+> cost, but it is **not** the hard cap. The actual ceiling is that the catalog is
+> persisted as a **single JSON blob** and `TableDef.pages` is an **unbounded
+> `Vec<PageId>` — one entry per heap page the table owns**. The SQL insert path
+> rewrites that list into the catalog blob on every page allocation
+> (`persist_pages_if_changed` → `set_pages`), and the blob is stored as one tuple
+> that must fit a single 8 KiB page. At ~1,450 heap pages (~145k tiny rows) the
+> encoded page list alone approaches the ~8,138-byte usable page space, and the
+> next catalog write fails — `HeapFull { size: 8138 }`, where `8138` is the
+> *catalog blob*, not a data row. The raw path never rewrites the catalog, so it
+> is immune (proven to build 5M rows linearly). This is an **O(heap-pages)
+> catalog-size limit**, not an FSM-rebuild limit; the fix (durable FSM + an O(1)
+> table-page representation, preserving the O(1)-open moat) is specced in
+> `docs/backlog/durable_fsm_catalog_pagelist.md`.
+
+Raw insert is separately proven to build 5M rows (linear, ~247 s); 1M is the
+measured headline, 5M is env-reachable (`PG_SWEEP_SIZES`).
 
 **Peak RSS (unidb):** **~35 MB** (36.7 MB max RSS over the unidb-only path
 incl. the 1M-row sweep + B3 concurrency) — dominated by the 4096-frame (32 MB)
@@ -3039,8 +3054,10 @@ decisively (~5×) on embedded point reads**, and — contrary to the filed
 prediction — **scales concurrent writes on both its raw and SQL paths**, matching
 Postgres core-for-core. The honest gaps are exactly the known/documented ones:
 bloat *automation* (manual M10 vacuum vs autovacuum — the capability is there and
-recovers fully), the single-transaction SQL bulk-load FSM cap (~145k rows; raw
-path unaffected), and analytic/parallel scans (not measured, already deferred).
+recovers fully), the SQL bulk-load catalog-page-list cap (~145k rows, raw path
+unaffected — an O(heap-pages) catalog-blob limit, see the correction above and
+`docs/backlog/durable_fsm_catalog_pagelist.md`), and analytic/parallel scans
+(not measured, already deferred).
 The apparent lens-1 "loss" is a macOS durability illusion, not a speed deficit.
 None of this reopens a §3 decision.
 

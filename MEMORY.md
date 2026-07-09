@@ -36,8 +36,14 @@
   bloats unidb reads (6.8→35 µs) with no autovacuum, but a manual M10 `vacuum()`
   restores 5.85 µs (better than fresh) — automation gap, not capability. Peak RSS
   ~35 MB. B4 unidb uses the **raw** path (P1.c claim); the SQL bulk-load path hits
-  a documented `HeapFull` at ~145k rows/txn (lazy per-statement FSM — raw
-  `Engine::insert` keeps it warm). Predictions-vs-actuals table + verdict in
+  `HeapFull` at ~145k rows. **Root cause (corrected — not the "lazy FSM" the
+  first pass claimed):** the catalog is a single JSON blob and `TableDef.pages`
+  is an unbounded `Vec<PageId>` (one per heap page); the SQL insert rewrites it
+  into the blob on every page alloc, and at ~1,450 pages the blob overflows a
+  single 8 KiB page → `HeapFull{size:8138}` (the blob, not a data row). Raw insert
+  never rewrites the catalog → immune (builds 5M linearly). An **O(heap-pages)
+  catalog-size cap**, fix specced in `docs/backlog/durable_fsm_catalog_pagelist.md`.
+  Predictions-vs-actuals table + verdict in
   `PROGRESS.md`'s "Postgres baseline comparison" entry. Linux re-run is the filed
   follow-up for publishable numbers. No `FORMAT_VERSION` bump; no §3 decision touched.
 - **Commit-time WAL fsync — COMPLETE (2026-07-09), on branch `commit-time-fsync`
