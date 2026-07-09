@@ -264,6 +264,41 @@ pub struct Engine {
     /// Security audit trail (P6.f) — auth DDL + named-user access decisions,
     /// appended to `audit.log`.
     audit: Arc<crate::audit::AuditLog>,
+    /// Observability counters (P6.g): lifetime commits / aborts this session.
+    commits: AtomicU64,
+    aborts: AtomicU64,
+    /// Slow-query log (P6.g): SQL statements whose wall-clock exceeded the
+    /// threshold, kept as a bounded ring (most recent last). Threshold in
+    /// **micros**; 0 disables (default), settable via `set_slow_query_threshold`.
+    slow_query_threshold_us: AtomicU64,
+    slow_queries: Mutex<std::collections::VecDeque<SlowQuery>>,
+}
+
+/// One slow-query-log entry (P6.g).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SlowQuery {
+    pub sql: String,
+    pub micros: u64,
+}
+
+/// A point-in-time snapshot of engine activity + counters (P6.g) — the
+/// `pg_stat_*`-style view surfaced by `Engine::stats` and `GET /stats`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EngineStats {
+    pub commits: u64,
+    pub aborts: u64,
+    pub checkpoints: u64,
+    /// Live transactions (writers) — the active-session count.
+    pub active_transactions: usize,
+    /// WAL bytes since the last checkpoint (auto-checkpoint pressure).
+    pub wal_bytes: u64,
+    /// Registered replication slots + the largest lag (tail LSN − min slot).
+    pub replication_slots: usize,
+    pub max_replication_lag: u64,
+    /// Pages currently in the data file.
+    pub data_pages: u32,
+    /// The most recent slow queries (bounded).
+    pub recent_slow_queries: Vec<SlowQuery>,
 }
 
 /// `Engine` must be safely **shareable** across threads (P5.e: a pool of N
@@ -517,6 +552,10 @@ impl Engine {
             replication,
             authz,
             audit,
+            commits: AtomicU64::new(0),
+            aborts: AtomicU64::new(0),
+            slow_query_threshold_us: AtomicU64::new(0),
+            slow_queries: Mutex::new(std::collections::VecDeque::new()),
         })
     }
 
@@ -669,8 +708,76 @@ impl Engine {
 
     /// Parse and execute one or more `;`-separated SQL statements under
     /// `xid`, applying each table's RLS policy (if any) as a planner
-    /// rewrite before execution. Returns one result per statement.
+    /// rewrite before execution. Returns one result per statement. Wraps the
+    /// executor with slow-query timing (P6.g).
     pub fn execute_sql(&self, xid: Xid, sql: &str) -> Result<Vec<ExecResult>> {
+        let start = Instant::now();
+        let result = self.execute_sql_inner(xid, sql);
+        self.note_query_time(sql, start.elapsed());
+        result
+    }
+
+    // ── Observability (P6.g) ───────────────────────────────────────────────────
+
+    /// Set the slow-query threshold; a query slower than this is logged
+    /// (`tracing::warn`) and added to the bounded slow-query ring surfaced by
+    /// [`Engine::stats`]. Zero (the default) disables slow-query logging.
+    pub fn set_slow_query_threshold(&self, threshold: Duration) {
+        self.slow_query_threshold_us
+            .store(threshold.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    /// Record a statement's wall-clock, logging + retaining it if slow (P6.g).
+    fn note_query_time(&self, sql: &str, elapsed: Duration) {
+        let threshold = self.slow_query_threshold_us.load(Ordering::Relaxed);
+        if threshold == 0 {
+            return;
+        }
+        let micros = elapsed.as_micros() as u64;
+        if micros < threshold {
+            return;
+        }
+        tracing::warn!(micros, threshold_us = threshold, "slow query");
+        let entry = SlowQuery {
+            sql: sql.chars().take(500).collect(),
+            micros,
+        };
+        let mut ring = self.slow_queries.lock().unwrap_or_else(|e| e.into_inner());
+        ring.push_back(entry);
+        while ring.len() > 32 {
+            ring.pop_front();
+        }
+    }
+
+    /// A `pg_stat_*`-style snapshot of engine activity + counters (P6.g).
+    pub fn stats(&self) -> EngineStats {
+        let tail = self.wal.current_lsn();
+        let max_replication_lag = self
+            .replication
+            .min_restart_lsn()
+            .map(|m| tail.saturating_sub(m))
+            .unwrap_or(0);
+        let recent_slow_queries = self
+            .slow_queries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+        EngineStats {
+            commits: self.commits.load(Ordering::Relaxed),
+            aborts: self.aborts.load(Ordering::Relaxed),
+            checkpoints: self.checkpoints_triggered.load(Ordering::SeqCst),
+            active_transactions: self.txn_mgr.active_count(),
+            wal_bytes: self.wal.wal_bytes(),
+            replication_slots: self.replication.list().len(),
+            max_replication_lag,
+            data_pages: self.pool.page_count(),
+            recent_slow_queries,
+        }
+    }
+
+    fn execute_sql_inner(&self, xid: Xid, sql: &str) -> Result<Vec<ExecResult>> {
         let page_size = self.page_size;
         let plans = parse_sql(sql)?;
         // Snapshot the catalog root so DDL (which the catalog persists
@@ -1431,6 +1538,7 @@ impl Engine {
         // P1.e: a commit is a quiescence boundary — the natural point to run an
         // auto-checkpoint if a trigger has fired.
         self.maybe_auto_checkpoint()?;
+        self.commits.fetch_add(1, Ordering::Relaxed); // P6.g stat
         Ok(())
     }
 
@@ -1519,8 +1627,13 @@ impl Engine {
     /// Abort `xid`, physically undoing its writes and releasing every lock
     /// it held. `xid` is finished after this call and must not be reused.
     pub fn abort(&self, xid: Xid) -> Result<()> {
-        self.txn_mgr
-            .abort(xid, &self.pool, &self.heap, &self.wal, &self.lock_mgr)
+        let r = self
+            .txn_mgr
+            .abort(xid, &self.pool, &self.heap, &self.wal, &self.lock_mgr);
+        if r.is_ok() {
+            self.aborts.fetch_add(1, Ordering::Relaxed); // P6.g stat
+        }
+        r
     }
 
     /// Insert one untyped byte-slice row, the lowest-level write primitive

@@ -274,6 +274,15 @@ pub async fn post_checkpoint(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `pg_stat_*`-style activity view (P6.g): commits/aborts/checkpoints, active
+/// sessions, WAL pressure, replication lag, and recent slow queries.
+pub async fn get_stats(
+    State(state): State<AppState>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    let stats = state.engine.stats().await.map_err(ApiError)?;
+    Ok(Json(serde_json::to_value(stats).unwrap_or_default()))
+}
+
 // ── replication (P6.b) ─────────────────────────────────────────────────────
 
 pub async fn post_replication_slot(

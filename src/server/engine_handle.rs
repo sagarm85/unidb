@@ -244,6 +244,11 @@ impl EngineHandle {
         self.on_engine(|e| e.checkpoint()).await
     }
 
+    /// A `pg_stat_*`-style activity + counter snapshot (P6.g).
+    pub async fn stats(&self) -> Result<crate::EngineStats> {
+        self.on_engine(|e| Ok(e.stats())).await
+    }
+
     // ── Replication slots + WAL shipping (P6.b) ────────────────────────────────
 
     pub async fn create_replication_slot(

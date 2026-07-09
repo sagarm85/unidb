@@ -181,3 +181,8 @@ required-features = ["server"]
 name = "server_tls"
 path = "tests/server_tls.rs"
 required-features = ["server"]
+
+[[test]]
+name = "server_stats"
+path = "tests/server_stats.rs"
+required-features = ["server"]

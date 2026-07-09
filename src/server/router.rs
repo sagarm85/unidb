@@ -58,6 +58,7 @@ pub fn build_router(
         .route("/events/subscribe", get(sse::get_events_subscribe))
         .route("/events/ack", post(handlers::post_events_ack))
         .route("/checkpoint", post(handlers::post_checkpoint))
+        .route("/stats", get(handlers::get_stats))
         .route(
             "/replication/slots",
             post(handlers::post_replication_slot).get(handlers::get_replication_slots),
