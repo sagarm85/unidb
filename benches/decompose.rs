@@ -21,7 +21,13 @@
 //
 // Run with: cargo bench --bench decompose
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use criterion::{BenchmarkId, Criterion, Throughput};
+use postgres::{Client, NoTls};
 use rusqlite::Connection;
 use tempfile::tempdir;
 use unidb::sql::logical::Literal;
@@ -29,6 +35,9 @@ use unidb::Engine;
 
 const DIM: usize = 128;
 const ROWS: u64 = 100;
+
+/// Table size for the keyed CRUD tests (point SELECT / UPDATE / churn).
+const KEYED_ROWS: u64 = 1_000;
 
 fn embedding(seed: u64) -> Vec<f32> {
     (0..DIM)
@@ -166,5 +175,132 @@ fn bench_ladder(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_ladder);
-criterion_main!(benches);
+// ---------------------------------------------------------------------------
+// Postgres baseline comparison (spec: docs/backlog/pg_baseline_comparison.md).
+//
+// A fitness check — engine vs engine, both as shipped, on the CRUD both can do.
+// PG_URL-gated: when unset, every Postgres path logs a skip line and returns, so
+// a plain `cargo bench` is unaffected. When set, we report TWO durability lenses
+// side by side, never one alone (the spec's core honesty rule):
+//
+//   lens 1 "default"  — wal_sync_method = open_datasync (macOS PG default, NOT
+//                       flush-to-platter durable on macOS)
+//   lens 2 "durable"  — wal_sync_method = fsync_writethrough (F_FULLFSYNC),
+//                       matching unidb's Rust File::sync_all default. Headline
+//                       numbers come from this lens.
+//
+// wal_sync_method is a `sighup` GUC (not settable per-session), so we flip it
+// server-wide via ALTER SYSTEM + pg_reload_conf() (superuser; native local
+// setup) and VERIFY it took effect with SHOW — the printed bench id carries the
+// actual method in force, so a mislabelled number is impossible.
+// ---------------------------------------------------------------------------
+
+/// The `PG_URL` connection string, or `None` (→ skip the Postgres paths).
+fn pg_url() -> Option<String> {
+    std::env::var("PG_URL").ok()
+}
+
+fn pg_connect(url: &str) -> Option<Client> {
+    match Client::connect(url, NoTls) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!("  [pg] WARNING: PG_URL set but connect failed ({e}) — skipping");
+            None
+        }
+    }
+}
+
+/// Flip the server-wide durability lens, then open a fresh work connection that
+/// is guaranteed to observe the reloaded setting. Returns `(client, method)`
+/// where `method` is the `wal_sync_method` actually in force (verified). `None`
+/// on any failure (unreachable, or non-superuser → ALTER SYSTEM denied), after
+/// logging — the caller then skips this config cleanly.
+fn pg_open_lens(url: &str, durable: bool) -> Option<(Client, String)> {
+    let want = if durable {
+        "fsync_writethrough"
+    } else {
+        "open_datasync"
+    };
+    let mut admin = pg_connect(url)?;
+    if let Err(e) = admin.batch_execute(&format!("ALTER SYSTEM SET wal_sync_method = '{want}'")) {
+        eprintln!("  [pg] WARNING: ALTER SYSTEM denied ({e}) — need superuser; skipping lens");
+        return None;
+    }
+    admin.batch_execute("SELECT pg_reload_conf()").ok()?;
+    drop(admin);
+    // pg_reload_conf() signals the postmaster; a *fresh* backend is the reliable
+    // way to read the applied value. Small settle delay first.
+    thread::sleep(Duration::from_millis(600));
+    let mut client = pg_connect(url)?;
+    let actual: String = client.query_one("SHOW wal_sync_method", &[]).ok()?.get(0);
+    if actual != want {
+        eprintln!("  [pg] WARNING: wanted wal_sync_method={want}, got {actual} — labelling actual");
+    }
+    Some((client, actual))
+}
+
+// ------------------------------ B1: ladder ---------------------------------
+
+/// One Postgres ladder iteration: TRUNCATE, then `n` autocommit single-row
+/// INSERTs via a prepared statement (each its own durable transaction — matches
+/// unidb's per-row begin/insert/commit). Schema is created once by the caller.
+fn pg_run_ladder(client: &mut Client, stmt: &postgres::Statement, n: u64) {
+    client.batch_execute("TRUNCATE t").unwrap();
+    for i in 0..n {
+        client
+            .execute(stmt, &[&(i as i32), &format!("body-{i}")])
+            .unwrap();
+    }
+}
+
+/// Register the four B1 configs (pg_w0/w1 × default/durable) plus the unidb W0/W1
+/// counterparts re-measured here so the group reads side by side.
+fn bench_pg_ladder(c: &mut Criterion) {
+    let Some(url) = pg_url() else {
+        eprintln!("[pg] PG_URL unset — skipping Postgres ladder (B1)");
+        return;
+    };
+    let mut group = c.benchmark_group("pg_ladder");
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(ROWS));
+
+    // unidb side (as-shipped default = group-committed force-log-at-commit).
+    for (name, rung) in [("unidb_w0", 0u8), ("unidb_w1", 1u8)] {
+        group.bench_function(BenchmarkId::new(name, ROWS), |b| {
+            b.iter(|| run_unidb_rung(rung, false, ROWS));
+        });
+    }
+
+    // Postgres side, both lenses. w0 = PRIMARY KEY table (spec: a PG table always
+    // has a PK); w1 = + a secondary btree, so w1-w0 = secondary-index maintenance.
+    for (name, durable, with_index) in [
+        ("pg_w0_default", false, false),
+        ("pg_w1_default", false, true),
+        ("pg_w0_durable", true, false),
+        ("pg_w1_durable", true, true),
+    ] {
+        let Some((mut client, method)) = pg_open_lens(&url, durable) else {
+            continue;
+        };
+        client
+            .batch_execute("DROP TABLE IF EXISTS t; CREATE TABLE t (id INT PRIMARY KEY, body TEXT)")
+            .unwrap();
+        if with_index {
+            client.batch_execute("CREATE INDEX ib ON t (body)").unwrap();
+        }
+        let stmt = client
+            .prepare("INSERT INTO t (id, body) VALUES ($1, $2)")
+            .unwrap();
+        group.bench_function(BenchmarkId::new(format!("{name} [{method}]"), ROWS), |b| {
+            b.iter(|| pg_run_ladder(&mut client, &stmt, ROWS));
+        });
+    }
+    group.finish();
+}
+
+fn main() {
+    let mut criterion = Criterion::default().configure_from_args();
+    bench_ladder(&mut criterion);
+    bench_pg_ladder(&mut criterion);
+    criterion.final_summary();
+}

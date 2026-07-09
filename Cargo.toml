@@ -61,6 +61,11 @@ futures-util = "0.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 # P6.f: generate a self-signed cert in the TLS integration test (dev-only).
 rcgen = "0.13"
+# Postgres baseline comparison (benches/decompose.rs, PG_URL-gated). Sync
+# client, dev-dependency ONLY (same precedent as rusqlite/reqwest) — it never
+# enters the engine's normal-edge graph, so the "engine stays sync" invariant
+# (`cargo tree -p unidb --no-default-features --edges normal`) still holds.
+postgres = "0.19"
 
 [[bin]]
 name = "unidb-server"
