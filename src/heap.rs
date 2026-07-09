@@ -24,7 +24,7 @@
 // transaction's xid, so no extra encoding is needed there.
 
 use crate::{
-    bufferpool::{BufferPool, PageReader},
+    bufferpool::{BufferPool, ExclusiveLatch, PageReader},
     concurrency_hooks::{on_read, on_write},
     error::{DbError, Result},
     format::{
@@ -131,10 +131,9 @@ impl Heap {
         wal: &Wal,
     ) -> Result<RowId> {
         let needed = crate::page::SLOT_SIZE + crate::page::TUPLE_HEADER_SIZE + data.len();
-        let page_id = self.find_or_alloc_page(needed, pool, wal)?;
+        let (page_id, _wg, mut page) = self.acquire_page_for_insert(needed, pool, wal)?;
 
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
-        let mut page = pool.fetch_page_for_write(page_id, wal)?;
         // P1.a: full-page image before this page's first change of the interval.
         let prev_lsn = pool
             .maybe_log_fpi(page_id, wal, txn_id, begin_lsn)?
@@ -145,11 +144,45 @@ impl Heap {
         let ins_lsn = wal.log_insert(txn_id, prev_lsn, page_id, slot, &redo)?;
         page.set_lsn(ins_lsn);
         pool.write_page(&page)?;
-        let free = page.free_space(); // capture before releasing the page latch
+        let free = page.free_space();
         pool.unpin(page_id);
-        self.note_free_space(page_id, free); // P1.c: FSM lock taken after unpin
+        self.note_free_space(page_id, free); // P1.c: FSM lock (latch→FSM, no cycle)
         wal.commit_mini_txn(txn_id, ins_lsn)?;
         Ok(RowId { page_id, slot })
+    }
+
+    /// Acquire a page with room for `needed` bytes, **already exclusively latched
+    /// and fetched**, ready for a versioned insert (P5.e-3). The returned
+    /// [`ExclusiveLatch`] must be held for the whole page read-modify-write so
+    /// two concurrent writers can never both take slot N and lose an update.
+    ///
+    /// `find_or_alloc_page` only *estimates* free space with the FSM lock
+    /// released, so a page it returns may have been filled by another writer by
+    /// the time we latch it — re-check under the latch and retry (correcting the
+    /// FSM's stale free-space estimate) until we hold a page that truly fits. A
+    /// freshly `alloc_heap_page`'d page always fits, so the loop terminates. The
+    /// FSM lock is only ever taken with no page latch held, or *after* one
+    /// (never the reverse), so the two lock classes form no cycle.
+    fn acquire_page_for_insert(
+        &self,
+        needed: usize,
+        pool: &BufferPool,
+        wal: &Wal,
+    ) -> Result<(PageId, ExclusiveLatch, SlottedPage)> {
+        loop {
+            let page_id = self.find_or_alloc_page(needed, pool, wal)?;
+            let latch = pool.latch_exclusive(page_id);
+            let page = pool.fetch_page_for_write(page_id, wal)?;
+            if page.free_space() >= needed {
+                return Ok((page_id, latch, page));
+            }
+            // Lost the page to a concurrent writer; correct the FSM's cached
+            // free-space so we don't immediately re-pick it, then retry.
+            let free = page.free_space();
+            pool.unpin(page_id);
+            drop(latch);
+            self.note_free_space(page_id, free);
+        }
     }
 
     /// Read the specific tuple version at `row_id` if it is visible under
@@ -223,38 +256,46 @@ impl Heap {
         lock_mgr.try_acquire_write(RecordId::row(row_id.page_id, row_id.slot), xid)?;
 
         let needed = crate::page::SLOT_SIZE + crate::page::TUPLE_HEADER_SIZE + new_data.len();
-        let new_page_id = self.find_or_alloc_page(needed, pool, wal)?;
 
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
 
-        let mut old_page = pool.fetch_page_for_write(row_id.page_id, wal)?;
-        let old_th = old_page.tuple_header(row_id.slot)?;
-        if old_th.xmax != 0 {
+        // Old version's xmax stamp, under the old page's exclusive latch (P5.e-3).
+        let xmax_lsn = {
+            let _og = pool.latch_exclusive(row_id.page_id);
+            let mut old_page = pool.fetch_page_for_write(row_id.page_id, wal)?;
+            let old_th = old_page.tuple_header(row_id.slot)?;
+            if old_th.xmax != 0 {
+                pool.unpin(row_id.page_id);
+                drop(_og);
+                wal.abort_mini_txn(txn_id, begin_lsn)?;
+                return Err(DbError::WriteConflict {
+                    holder_xid: old_th.xmax,
+                });
+            }
+            on_write(xid, row_id);
+            // P1.a: full-page image of the old-version page before its xmax stamp.
+            let xmax_prev = pool
+                .maybe_log_fpi(row_id.page_id, wal, txn_id, begin_lsn)?
+                .unwrap_or(begin_lsn);
+            let xmax_lsn = wal.log_update(
+                txn_id,
+                xmax_prev,
+                row_id.page_id,
+                row_id.slot,
+                &u64_to_le(xid),
+                &u64_to_le(old_th.xmax),
+            )?;
+            old_page.set_xmax(row_id.slot, xid)?;
+            old_page.set_lsn(xmax_lsn);
+            pool.write_page(&old_page)?;
             pool.unpin(row_id.page_id);
-            wal.abort_mini_txn(txn_id, begin_lsn)?;
-            return Err(DbError::WriteConflict {
-                holder_xid: old_th.xmax,
-            });
-        }
-        on_write(xid, row_id);
-        // P1.a: full-page image of the old-version page before its xmax stamp.
-        let xmax_prev = pool
-            .maybe_log_fpi(row_id.page_id, wal, txn_id, begin_lsn)?
-            .unwrap_or(begin_lsn);
-        let xmax_lsn = wal.log_update(
-            txn_id,
-            xmax_prev,
-            row_id.page_id,
-            row_id.slot,
-            &u64_to_le(xid),
-            &u64_to_le(old_th.xmax),
-        )?;
-        old_page.set_xmax(row_id.slot, xid)?;
-        old_page.set_lsn(xmax_lsn);
-        pool.write_page(&old_page)?;
-        pool.unpin(row_id.page_id);
+            xmax_lsn
+        };
 
-        let mut new_page = pool.fetch_page_for_write(new_page_id, wal)?;
+        // New version's insert, under a fresh page latch acquired only after the
+        // old latch was released (one physical latch at a time — never two — so
+        // two concurrent updates can't deadlock on inverse page-latch order).
+        let (new_page_id, _ng, mut new_page) = self.acquire_page_for_insert(needed, pool, wal)?;
         // P1.a: full-page image of the new-version page before its insert. A
         // no-op if this is the same page as the old version (already covered).
         let ins_prev = pool
@@ -292,6 +333,8 @@ impl Heap {
         lock_mgr.try_acquire_write(RecordId::row(row_id.page_id, row_id.slot), xid)?;
 
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
+        // Exclusive page latch across the whole read-modify-write (P5.e-3).
+        let _wg = pool.latch_exclusive(row_id.page_id);
         let mut page = pool.fetch_page_for_write(row_id.page_id, wal)?;
         let th = page.tuple_header(row_id.slot)?;
         if th.xmax != 0 {
@@ -334,6 +377,7 @@ impl Heap {
         wal: &Wal,
     ) -> Result<()> {
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
+        let _wg = pool.latch_exclusive(page_id); // P5.e-3: exclusive page latch
         let mut page = pool.fetch_page_for_write(page_id, wal)?;
         let old_xmax = page.tuple_header(slot)?.xmax;
         // P1.a: full-page image before this page's first change of the interval.
@@ -372,6 +416,7 @@ impl Heap {
         wal: &Wal,
     ) -> Result<()> {
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
+        let _wg = pool.latch_exclusive(page_id); // P5.e-3: exclusive page latch
         let mut page = pool.fetch_page_for_write(page_id, wal)?;
         // P1.a: full-page image before this page's first change of the interval.
         let prev_lsn = pool
@@ -534,6 +579,7 @@ impl Heap {
     /// recovery replay is a no-op.
     pub fn mark_dead(&self, row_id: RowId, pool: &BufferPool, wal: &Wal) -> Result<()> {
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
+        let _wg = pool.latch_exclusive(row_id.page_id); // P5.e-3: exclusive page latch
         let mut page = pool.fetch_page_for_write(row_id.page_id, wal)?;
         // P1.a: full-page image before this page's first change of the interval
         // (mark_dead is an incremental slot mutation, so it needs torn-page
@@ -558,6 +604,7 @@ impl Heap {
     /// index-clean pass (M10.c), since it makes reclaimed slots reusable.
     pub fn compact_page(&self, page_id: PageId, pool: &BufferPool, wal: &Wal) -> Result<usize> {
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
+        let _wg = pool.latch_exclusive(page_id); // P5.e-3: exclusive page latch
         let mut page = pool.fetch_page_for_write(page_id, wal)?;
         let reclaimed = page.compact();
         // Log the compacted bytes *before* stamping the record's LSN — recovery

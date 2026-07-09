@@ -231,6 +231,21 @@ pub struct Engine {
     auto_checkpoint: Mutex<AutoCheckpointConfig>,
     last_checkpoint: Mutex<Instant>,
     checkpoints_triggered: AtomicU64,
+    /// Serializes the non-CRUD write paths that do a *non-atomic*
+    /// read-catalog-then-mutate-a-shared-secondary-index sequence — graph edges
+    /// (the `__edges__.from_id` `DiskBTree` + page list), large objects (the
+    /// `__lobs__` tree), the event queue's system tables, and catalog DDL
+    /// (P5.e-3). Two of these running at once could lose a page-list update or
+    /// corrupt a shared index tree, which the per-page heap latches alone don't
+    /// prevent (they guard one page, not a multi-page tree or a catalog RMW).
+    ///
+    /// The hot paths do **not** take this lock: raw CRUD (`insert`/`get`/
+    /// `update`/`delete`) touches only the latched heap + row locks and scales
+    /// across cores, and SQL already serializes writers on the catalog
+    /// `RwLock`. So this coarse lock only serializes the secondary,
+    /// low-frequency write paths — correctness first; finer-grained index
+    /// concurrency (latch-coupled B-tree writes) is future work.
+    write_serial: Mutex<()>,
 }
 
 /// `Engine` must be safely **shareable** across threads (P5.e: a pool of N
@@ -266,6 +281,12 @@ fn cat_write(c: &RwLock<Catalog>) -> RwLockWriteGuard<'_, Catalog> {
 /// minimal — never hold it across an fsync** (see the `control` field doc).
 fn ctrl_lock(c: &Mutex<ControlData>) -> std::sync::MutexGuard<'_, ControlData> {
     c.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Poison-tolerant lock of the non-CRUD write serializer (P5.e-3, see the
+/// `write_serial` field).
+fn serial_lock(m: &Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Poison-tolerant lock of the auto-checkpoint policy `Mutex` (P5.e).
@@ -409,6 +430,7 @@ impl Engine {
             auto_checkpoint: Mutex::new(AutoCheckpointConfig::default()),
             last_checkpoint: Mutex::new(Instant::now()),
             checkpoints_triggered: AtomicU64::new(0),
+            write_serial: Mutex::new(()),
         })
     }
 
@@ -581,6 +603,7 @@ impl Engine {
     /// Attach a row-level-security policy to a table (M1: Rust API only,
     /// no `CREATE POLICY` SQL surface — see catalog.rs's module doc).
     pub fn set_rls_policy(&self, table: &str, policy: Expr) -> Result<()> {
+        let _ws = serial_lock(&self.write_serial); // P5.e-3: serialize catalog/index writes
         let page_size = self.page_size;
         let mut ctx = crate::catalog::CatalogCtx {
             pool: &self.pool,
@@ -603,6 +626,7 @@ impl Engine {
         column: &str,
         kind: Option<IndexKind>,
     ) -> Result<()> {
+        let _ws = serial_lock(&self.write_serial); // P5.e-3: serialize catalog/index writes
         let page_size = self.page_size;
         let mut ctx = crate::catalog::CatalogCtx {
             pool: &self.pool,
@@ -636,6 +660,7 @@ impl Engine {
     /// the same guard in `send_event_capture`, following M2.a's
     /// "validate in more than one place" precedent for `VECTOR(n)`.
     pub fn enable_events(&self, table: &str) -> Result<()> {
+        let _ws = serial_lock(&self.write_serial); // P5.e-3: serialize catalog/index writes
         if table == EVENTS_TABLE || table == CONSUMERS_TABLE {
             return Err(DbError::SqlPlan(format!(
                 "cannot enable events on the system table '{table}' itself"
@@ -714,6 +739,7 @@ impl Engine {
     /// (auto-registration becomes durable on first ack, not on first
     /// poll).
     pub fn ack_events(&self, xid: Xid, consumer: &str, up_to_seq: i64) -> Result<()> {
+        let _ws = serial_lock(&self.write_serial); // P5.e-3: serialize catalog/index writes
         let page_size = self.page_size;
         let consumers_def = cat_read(&self.catalog).lookup(CONSUMERS_TABLE)?.clone();
         let heap = Heap::from_pages(page_size, consumers_def.pages.clone());
@@ -781,6 +807,7 @@ impl Engine {
     /// checkpoint()` or any other automatic path, matching M1's
     /// zero-automatic-vacuum precedent.
     pub fn vacuum_events(&self, xid: Xid) -> Result<usize> {
+        let _ws = serial_lock(&self.write_serial); // P5.e-3: serialize catalog/index writes
         let page_size = self.page_size;
         let consumers_def = cat_read(&self.catalog).lookup(CONSUMERS_TABLE)?.clone();
         let consumers_heap = Heap::from_pages(page_size, consumers_def.pages.clone());
@@ -840,6 +867,7 @@ impl Engine {
         edge_type: &str,
         props: &str,
     ) -> Result<RowId> {
+        let _ws = serial_lock(&self.write_serial); // P5.e-3: serialize catalog/index writes
         let page_size = self.page_size;
         let table_def = cat_read(&self.catalog).lookup(edges::EDGES_TABLE)?.clone();
         let heap = Heap::from_pages(page_size, table_def.pages.clone());
@@ -888,6 +916,7 @@ impl Engine {
     /// (the caller already has it from whatever scan/`edges_from` call
     /// located the row) to avoid a redundant `Heap::get` just to find it.
     pub fn delete_edge(&self, xid: Xid, row_id: RowId, from_id: i64) -> Result<()> {
+        let _ws = serial_lock(&self.write_serial); // P5.e-3: serialize catalog/index writes
         let page_size = self.page_size;
         let table_def = cat_read(&self.catalog).lookup(edges::EDGES_TABLE)?.clone();
         let heap = Heap::from_pages(page_size, table_def.pages.clone());
@@ -1042,6 +1071,7 @@ impl Engine {
     /// Resident memory is one ~7 KiB chunk at a time — a multi-GB value never
     /// loads whole (the "without OOM" gate).
     pub fn put_large_object<R: std::io::Read>(&self, xid: Xid, reader: R) -> Result<i64> {
+        let _ws = serial_lock(&self.write_serial); // P5.e-3: serialize catalog/index writes
         let page_size = self.page_size;
         let lob_id = self.next_lob_id.fetch_add(1, Ordering::SeqCst);
         let table_def = cat_read(&self.catalog)
@@ -1084,6 +1114,7 @@ impl Engine {
     /// Delete every chunk of `lob_id` under `xid` (MVCC delete; the heap vacuum
     /// reclaims the dead chunk rows later). Returns the number of chunks removed.
     pub fn delete_large_object(&self, xid: Xid, lob_id: i64) -> Result<usize> {
+        let _ws = serial_lock(&self.write_serial); // P5.e-3: serialize catalog/index writes
         let page_size = self.page_size;
         let table_def = cat_read(&self.catalog)
             .lookup(large_object::LOBS_TABLE)?
@@ -1146,13 +1177,23 @@ impl Engine {
     /// the error — so the caller just sees `SerializationFailure` on a fully
     /// cleaned-up transaction, and should retry.
     pub fn commit(&self, xid: Xid) -> Result<()> {
-        match self.txn_mgr.commit(xid, &self.wal, &self.lock_mgr) {
+        let commit_lsn = match self.txn_mgr.commit(xid, &self.wal, &self.lock_mgr) {
             Err(DbError::SerializationFailure { xid }) => {
                 self.abort(xid)?;
                 return Err(DbError::SerializationFailure { xid });
             }
             Err(e) => return Err(e),
-            Ok(()) => {}
+            Ok(lsn) => lsn,
+        };
+        // Group commit (P5.e-3): force this transaction's commit record durable
+        // before returning, coalescing with any concurrent committers behind a
+        // single fsync. In the default (non-deferred) mode `commit_user_txn`
+        // already fsynced, so this is a no-op fast path; in the server's
+        // deferred mode this is where durability is actually forced, and the
+        // more writers commit at once, the fewer fsyncs they collectively pay.
+        // A read-only transaction (`None`) wrote no commit record and skips it.
+        if let Some(lsn) = commit_lsn {
+            self.wal.sync_up_to(lsn)?;
         }
         // P1.e: a commit is a quiescence boundary — the natural point to run an
         // auto-checkpoint if a trigger has fired.
@@ -1359,6 +1400,9 @@ impl Engine {
     /// index-aliasing hazard in tests (skipping the gate lets a reused slot
     /// alias a stale index entry — see `lib.rs`'s M10.c regression test).
     fn vacuum_inner(&self, clean_indexes: bool) -> Result<VacuumReport> {
+        // P5.e-3: vacuum mutates the same secondary-index trees + compacts heap
+        // pages that the guarded write paths touch — serialize it with them.
+        let _ws = serial_lock(&self.write_serial);
         let horizon = self.txn_mgr.vacuum_horizon();
         let page_size = self.page_size;
         let mut report = VacuumReport {

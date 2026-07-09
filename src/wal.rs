@@ -147,6 +147,16 @@ struct WalInner {
 
 pub struct Wal {
     inner: Mutex<WalInner>,
+    /// Group-commit leader-election lock (P5.e-3), held **only** during
+    /// [`Wal::sync_up_to`]'s fsync — deliberately *separate* from `inner` so
+    /// that while one committer (the "leader") is fsyncing, other threads can
+    /// still append their own commit records under `inner`. When the leader's
+    /// single fsync completes it has flushed the WAL to its current tail,
+    /// covering every commit that landed while it ran; those followers then
+    /// see `durable_lsn` already past their commit LSN and skip their own
+    /// fsync entirely. That coalescing is what makes write throughput scale
+    /// with concurrent writers instead of paying one fsync per commit.
+    flush_lock: Mutex<()>,
 }
 
 impl Wal {
@@ -172,6 +182,7 @@ impl Wal {
                 poisoned: false,
                 fsync_fault_armed: false,
             }),
+            flush_lock: Mutex::new(()),
         })
     }
 
@@ -428,6 +439,28 @@ impl Wal {
     pub fn sync(&self) -> Result<()> {
         let mut inner = self.lock();
         fsync_locked(&mut inner)
+    }
+
+    /// Group-commit durability barrier (P5.e-3): return once every record up to
+    /// and including `target` is durable, coalescing concurrent callers behind
+    /// as few fsyncs as possible.
+    ///
+    /// Two fast paths avoid an fsync: (1) if `durable_lsn` is already at or past
+    /// `target`, some other committer's fsync has already made us durable;
+    /// (2) after taking the leader-election [`Wal::flush_lock`], re-check —
+    /// another leader may have flushed past `target` while we waited for the
+    /// lock. Only the thread that finds itself still behind actually fsyncs, and
+    /// its one fsync advances `durable_lsn` to the current tail (`fsync_locked`
+    /// flushes the whole buffered writer), covering all the waiters behind it.
+    pub fn sync_up_to(&self, target: Lsn) -> Result<()> {
+        if self.durable_lsn() >= target {
+            return Ok(());
+        }
+        let _leader = self.flush_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if self.durable_lsn() >= target {
+            return Ok(());
+        }
+        self.sync()
     }
 
     pub fn log_checkpoint(&self) -> Result<Lsn> {
