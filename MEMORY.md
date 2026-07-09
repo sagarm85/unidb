@@ -15,7 +15,7 @@
 - **Phase 5 (concurrency & performance) — COMPLETE (2026-07-09).** Part 1
   (P5.a–P5.d) shipped to `main` via PR #14 (merge `30109d9`); Part 2 (P5.e
   multiple writers + P5.f resource control) shipped on branch
-  `p5e-concurrent-writers`, **open as PR #16** (ready). **`Engine` is now `Send +
+  `p5e-concurrent-writers`, **merged to `main` via PR #16** (merge `12ca9f9`). **`Engine` is now `Send +
   Sync`, a worker pool shares `Arc<Engine>`, heap page latches + leader-election
   group commit make write throughput scale with cores (3.68× at 8 writers), and
   per-query timeouts/cancellation/`work_mem` are in place.** Crash harness 19/19;
@@ -23,8 +23,8 @@
   `PROGRESS.md` Phase 5 entry, `docs/backlog/phase5_concurrency.md`). **PR-history
   note:** the harness auto-created+merged **PR #15 at an early `wip(P5.e-2)`
   snapshot (`7e4b89b`)** — it does *not* contain the finished work; **PR #16 (from
-  the same branch → `main`) is the real, complete Phase 5 pt.2** and is the one to
-  review/merge. Detail below.
+  the same branch → `main`) is the real, complete Phase 5 pt.2**, merged as
+  `12ca9f9`; PR #15 now carries a comment pointing here. Detail below.
   - **What shipped (concurrency infrastructure — non-breaking; single-writer
     behavior is unchanged, these just make the internal components
     concurrency-capable):** P5.a concurrent buffer-pool latching (`Mutex<PoolState>`
@@ -76,10 +76,11 @@
       one fsync. **Headline** (`benches/concurrent_writers.rs`, 8 cores): 1→325,
       2→330, 4→647 (1.99x), **8→1197 commits/s (3.68x)** — scales with cores.
       Crash harness **still 19/19** (incl. P12 fsync-fault); sync-invariant holds.
-  - **NEXT on `p5e-concurrent-writers`:** **P5.f** (query timeouts, cancellation,
-    per-query `work_mem`), then docs closeout (README,
-    `docs/design/engine_design.md`, add a `PROGRESS.md` Phase 5 entry, flip
-    `docs/backlog/phase5_concurrency.md` to done) and **mark PR #15 ready**.
+  - **P5.f — DONE** (`6f8e8c4`): query timeouts, cancellation, per-query
+    `work_mem` — a thread-local `QueryLimits` via an RAII guard; scan loops check
+    every 1024 rows (`DbError::QueryTimeout`/`QueryCancelled`), sort/hash-join
+    spills consult `work_mem_rows`. Docs closeout done (README,
+    `docs/design/engine_design.md`, `PROGRESS.md` Phase 5 entry, phase5 spec).
     Human sign-off to reverse the single-writer design is recorded in
     `PROGRESS.md` (2026-07-09). **Known limitation (documented):** only *raw
     CRUD* scales with cores; SQL/graph/LOB writes serialize (catalog RwLock /
