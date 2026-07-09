@@ -2760,3 +2760,44 @@ handle no longer needs its explicit `set_deferred_sync(true)`.
 **Locked-decision changes:** none reversed. **D1 fulfilled** (force-log-at-commit
 is its ARIES durability point); D2 and D5 unchanged. Human sign-off recorded
 above (2026-07-09).
+
+### C2 — D5 eviction-forced sync (+ two pre-existing recovery bugs it surfaced)
+
+The eviction-forced-sync mechanism itself (`BufferPool::fetch_page_for_write`:
+on `BufferPoolFull`, force `wal.sync()`, refresh the durable frontier, retry
+once) already shipped with the M9/P5 group-commit work and the whole heap write
+path already routes through it — so under the new default a large transaction
+that dirties more pages than the pool holds forces a WAL sync and steals a
+now-durable page rather than dead-ending. C2 adds the end-to-end memory-pressure
+proof: `large_deferred_transaction_survives_pool_smaller_than_working_set` (16
+frames, one transaction inserting 400×~1 KiB rows → dozens of pages), asserting
+completion, correct in-session read-back, **and correct recovery after reopen**.
+
+That reopen assertion surfaced **two pre-existing latent recovery bugs**
+(present independent of the deferral flip — they reproduce in per-statement mode
+too — but which commit-time fsync makes ordinary, since deferral routinely
+dirties more pages than a small pool holds):
+
+1. **WAL_INSERT redo leaked a buffer-pool frame pin.** The page-allocation
+   record (`slot == u16::MAX`) and the "already applied" idempotent-skip path
+   both `return Ok(())` after `fetch_or_create` **without unpinning**
+   (WAL_UPDATE/DELETE/VACUUM unpin correctly; only WAL_INSERT leaked). When the
+   recovered data spans more pages than the recovery pool capacity, the leaked
+   pins exhaust the pool and every later redo fails with `BufferPoolFull` —
+   swallowed as a `tracing::warn`, so committed rows were silently dropped.
+   **Fix:** the allocation record now calls `ensure_page_allocated` (sizes the
+   page into the file, no pin) instead of `fetch_or_create`; the idempotent-skip
+   path unpins.
+2. **Recovery never advanced the pool's durable-WAL frontier.** It replayed with
+   `durable_wal_lsn == INVALID_LSN`, so `find_victim` refused to evict *any*
+   dirty redo page (D5 conservative) and the pool filled after `pool_capacity`
+   pages. **Fix:** set the frontier to the tail LSN of the on-disk WAL before
+   the redo pass — every record being replayed is already durable, so evicting
+   redone pages is sound.
+
+Both were invisible before because normal recovery uses the default 4096-frame
+pool, which comfortably holds any realistic redo working set; only a
+deliberately tiny recovery pool exposes them. **Files:** `recovery.rs` (both
+fixes), `bufferpool.rs` (mechanism, unchanged), `lib.rs` (test). Crash harness
+still **21/21** (the fixes only affect the pool-exhaustion path a large pool
+never hits); no format change.

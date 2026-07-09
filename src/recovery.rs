@@ -90,6 +90,18 @@ pub fn recover(
     );
 
     let pool = BufferPool::open(data_path, page_size, pool_capacity)?;
+
+    // Advance the pool's durable-WAL frontier (D5) to the tail of the on-disk
+    // log before replaying. Every record we are about to redo is *already
+    // durable* (it is in the persisted WAL being scanned), so the redo/undo
+    // passes may freely flush dirty pages back to steal frames — otherwise, with
+    // the frontier left at `INVALID_LSN`, `find_victim` would refuse to evict any
+    // dirty redo page and a recovery whose working set exceeds `pool_capacity`
+    // (the small-pool / large-transaction case commit-time fsync's C2 makes
+    // ordinary) would exhaust the pool and silently drop the rest of the redo.
+    let durable_frontier = records.iter().map(|r| r.lsn).max().unwrap_or(INVALID_LSN);
+    pool.set_durable_wal_lsn(durable_frontier);
+
     let mut stats = RecoveryStats {
         records_scanned: relevant.len(),
         records_redone: 0,
@@ -258,13 +270,25 @@ fn redo_record(r: &WalRecord, pool: &BufferPool, page_size: usize) -> Result<()>
             pool.restore_page_image(r.page_id, img.as_bytes())?;
         }
         WAL_INSERT => {
-            let mut page = fetch_or_create(pool, r.page_id, page_size)?;
             if r.slot == u16::MAX {
-                // Page allocation record — nothing to redo on content.
+                // Page-allocation record — no tuple content to redo. Just size
+                // the page into the file. Crucially, do NOT go through
+                // `fetch_or_create`: that pins a frame, and returning here
+                // without unpinning would leak the pin. When recovered data
+                // spans more pages than the recovery buffer pool holds, those
+                // leaked pins exhaust the pool and every later redo fails with
+                // `BufferPoolFull` (silently swallowed as a warn) — the row is
+                // then lost. This surfaced under commit-time fsync's C2
+                // memory-pressure path (a large transaction dirties more pages
+                // than the pool); `ensure_page_allocated` sizes without pinning.
+                pool.ensure_page_allocated(r.page_id)?;
                 return Ok(());
             }
-            // Only redo if current slot count ≤ slot (idempotent redo).
+            let mut page = fetch_or_create(pool, r.page_id, page_size)?;
+            // Only redo if current slot count ≤ slot (idempotent redo). Unpin on
+            // this early return too — the same pin-leak hazard as above.
             if r.slot < page.slot_count_pub() {
+                pool.unpin(r.page_id);
                 return Ok(()); // already applied
             }
             // M1: redo payload is [xmin:8][prev_page:4][prev_slot:2][payload]

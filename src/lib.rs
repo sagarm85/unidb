@@ -4172,4 +4172,53 @@ mod tests {
         let x = engine.begin().unwrap();
         assert_eq!(engine.get(x, keep).unwrap(), b"keep");
     }
+
+    /// C2 (D5 eviction-forced sync): under the commit-time-fsync default a
+    /// single transaction can dirty more pages than the buffer pool holds
+    /// without any statement fsync. Eviction must then force a WAL sync and
+    /// steal a now-durable page rather than dead-ending at `BufferPoolFull`.
+    /// A tiny pool + one large transaction inserting far more pages' worth of
+    /// rows than the pool has frames must still commit and read back every row,
+    /// with the D5 invariant (page LSN never ahead of the durable WAL at the
+    /// steal point — a debug tripwire in `find_victim`) intact.
+    #[test]
+    fn large_deferred_transaction_survives_pool_smaller_than_working_set() {
+        let dir = tempdir().unwrap();
+        // Minimum pool (16 frames). Each row is ~1 KiB, so a page holds only a
+        // handful — 400 rows dirties dozens of pages, many times the 16 frames.
+        let engine = Engine::open_with_pool_capacity(dir.path(), 0, 16).unwrap();
+        let payload = vec![0xABu8; 1024];
+
+        let xid = engine.begin().unwrap();
+        let mut rids = Vec::new();
+        for i in 0..400u32 {
+            // Distinguish rows by a small prefix so read-back is meaningful.
+            let mut row = i.to_le_bytes().to_vec();
+            row.extend_from_slice(&payload);
+            // Every insert goes through `fetch_page_for_write`, which forces a
+            // WAL sync + retry when the pool is full of not-yet-durable dirty
+            // pages — this is the assertion under test: no `BufferPoolFull`.
+            rids.push(engine.insert(xid, &row).unwrap());
+        }
+        engine.commit(xid).unwrap();
+
+        // Every row is present and intact after eviction churn.
+        let reader = engine.begin().unwrap();
+        for (i, rid) in rids.iter().enumerate() {
+            let got = engine.get(reader, *rid).unwrap();
+            assert_eq!(&got[..4], &(i as u32).to_le_bytes(), "row {i} prefix");
+            assert_eq!(&got[4..], &payload[..], "row {i} payload");
+        }
+        engine.commit(reader).unwrap();
+
+        // And they survive a reopen (recovery redoes the committed inserts even
+        // though most pages were evicted, not checkpoint-flushed).
+        drop(engine);
+        let engine = Engine::open_with_pool_capacity(dir.path(), 0, 16).unwrap();
+        let reader = engine.begin().unwrap();
+        let last = rids.len() - 1;
+        let got = engine.get(reader, rids[last]).unwrap();
+        assert_eq!(&got[..4], &(last as u32).to_le_bytes());
+        engine.commit(reader).unwrap();
+    }
 }
