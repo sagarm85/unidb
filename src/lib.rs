@@ -752,7 +752,10 @@ impl Engine {
             {
                 Ok(()) => {
                     self.audit.record_admin(user, action, &object, true);
-                    Ok(vec![ExecResult::Rows(Vec::new())])
+                    Ok(vec![ExecResult::Rows {
+                        columns: Vec::new(),
+                        rows: Vec::new(),
+                    }])
                 }
                 Err(e) => {
                     self.audit.record_admin(user, action, &object, false);
@@ -2546,7 +2549,7 @@ mod tests {
             .pop()
             .unwrap()
         {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             other => panic!("expected Rows, got {other:?}"),
         };
         engine.commit(x).unwrap();
@@ -2798,7 +2801,7 @@ mod tests {
             .execute_sql(xid2, "SELECT * FROM accounts WHERE id = 1")
             .unwrap();
         assert_eq!(results.len(), 1);
-        assert!(matches!(&results[0], SqlResult::Rows(rows) if rows.len() == 1));
+        assert!(matches!(&results[0], SqlResult::Rows { rows, .. } if rows.len() == 1));
 
         engine
             .execute_sql(xid2, "UPDATE accounts SET balance = 200 WHERE id = 1")
@@ -2807,7 +2810,7 @@ mod tests {
             .execute_sql(xid2, "SELECT balance FROM accounts WHERE id = 1")
             .unwrap();
         match &reselect[0] {
-            SqlResult::Rows(rows) => {
+            SqlResult::Rows { rows, .. } => {
                 assert_eq!(rows[0][0], crate::sql::logical::Literal::Int(200))
             }
             other => panic!("expected Rows, got {other:?}"),
@@ -2820,7 +2823,7 @@ mod tests {
 
         let xid3 = engine.begin().unwrap();
         let remaining = engine.execute_sql(xid3, "SELECT * FROM accounts").unwrap();
-        assert!(matches!(&remaining[0], SqlResult::Rows(rows) if rows.len() == 1));
+        assert!(matches!(&remaining[0], SqlResult::Rows { rows, .. } if rows.len() == 1));
     }
 
     #[test]
@@ -2880,7 +2883,7 @@ mod tests {
         let xid = engine.begin().unwrap();
         let rows = engine.execute_sql(xid, "SELECT a, c FROM t").unwrap();
         match &rows[0] {
-            SqlResult::Rows(r) => assert_eq!(
+            SqlResult::Rows { rows: r, .. } => assert_eq!(
                 r,
                 &vec![vec![
                     crate::sql::logical::Literal::Int(1),
@@ -2927,7 +2930,7 @@ mod tests {
             .execute_sql(xid2, "SELECT id FROM t WHERE v = 30")
             .unwrap();
         match &rows[0] {
-            SqlResult::Rows(r) => {
+            SqlResult::Rows { rows: r, .. } => {
                 // Must be 3, not a reused 1 — the sequence resumed after reopen.
                 assert_eq!(r, &vec![vec![crate::sql::logical::Literal::Int(3)]]);
             }
@@ -2960,13 +2963,13 @@ mod tests {
                 std::slice::from_ref(&attack),
             )
             .unwrap();
-        assert!(matches!(&rows[0], SqlResult::Rows(r) if r.is_empty()));
+        assert!(matches!(&rows[0], SqlResult::Rows { rows: r, .. } if r.is_empty()));
         engine.commit(xid2).unwrap();
 
         // The table still exists and its row is intact — nothing was dropped.
         let xid3 = engine.begin().unwrap();
         let all = engine.execute_sql(xid3, "SELECT * FROM t").unwrap();
-        assert!(matches!(&all[0], SqlResult::Rows(r) if r.len() == 1));
+        assert!(matches!(&all[0], SqlResult::Rows { rows: r, .. } if r.len() == 1));
 
         // Binding that exact string as an INSERT value stores it verbatim.
         engine
@@ -2980,7 +2983,7 @@ mod tests {
             .execute_sql_params(xid3, "SELECT id FROM t WHERE name = $1", &[attack])
             .unwrap();
         match &found[0] {
-            SqlResult::Rows(r) => assert_eq!(r, &vec![vec![Literal::Int(2)]]),
+            SqlResult::Rows { rows: r, .. } => assert_eq!(r, &vec![vec![Literal::Int(2)]]),
             other => panic!("expected Rows, got {other:?}"),
         }
     }
@@ -3023,7 +3026,7 @@ mod tests {
             .execute_prepared(xid2, &stmt, &[Literal::Int(2)])
             .unwrap();
         match (&r1[0], &r2[0]) {
-            (SqlResult::Rows(a), SqlResult::Rows(b)) => {
+            (SqlResult::Rows { rows: a, .. }, SqlResult::Rows { rows: b, .. }) => {
                 assert_eq!(a, &vec![vec![Literal::Text("a".to_string())]]);
                 assert_eq!(b, &vec![vec![Literal::Text("b".to_string())]]);
             }
@@ -3055,7 +3058,7 @@ mod tests {
             .execute_sql(xid2, "SELECT * FROM t WHERE id = 1")
             .unwrap();
         match &results[0] {
-            SqlResult::Rows(rows) => {
+            SqlResult::Rows { rows, .. } => {
                 assert_eq!(
                     rows[0][1],
                     crate::sql::logical::Literal::Vector(vec![0.1, 0.2, 0.3, 0.4])
@@ -3085,7 +3088,7 @@ mod tests {
     /// Collect the integer `id`s a NEAR query returns, in order.
     fn near_ids(engine: &mut Engine, xid: Xid, sql: &str) -> Vec<i64> {
         match &engine.execute_sql(xid, sql).unwrap()[0] {
-            SqlResult::Rows(rows) => rows
+            SqlResult::Rows { rows, .. } => rows
                 .iter()
                 .map(|r| match r[0] {
                     crate::sql::logical::Literal::Int(n) => n,
@@ -3294,7 +3297,7 @@ mod tests {
             )
             .unwrap();
         match &results[0] {
-            SqlResult::Rows(rows) => {
+            SqlResult::Rows { rows, .. } => {
                 assert_eq!(rows.len(), 2);
                 assert_eq!(rows[0][0], crate::sql::logical::Literal::Int(1));
                 assert_eq!(rows[1][0], crate::sql::logical::Literal::Int(3));
@@ -3339,7 +3342,7 @@ mod tests {
             )
             .unwrap();
         match &results[0] {
-            SqlResult::Rows(rows) => {
+            SqlResult::Rows { rows, .. } => {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0][0], crate::sql::logical::Literal::Int(2));
             }
@@ -3364,7 +3367,7 @@ mod tests {
         let xid = engine2.begin().unwrap();
         let result = engine2.execute_sql(xid, "SELECT * FROM t").unwrap();
         match &result[0] {
-            SqlResult::Rows(rows) => assert_eq!(rows.len(), 1),
+            SqlResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
             other => panic!("expected Rows, got {other:?}"),
         }
     }
@@ -3477,7 +3480,7 @@ mod tests {
             .execute_sql(q, "SELECT v FROM t WHERE id = 1")
             .unwrap()[0]
         {
-            SqlResult::Rows(rows) => assert_eq!(rows.len(), 1),
+            SqlResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
             other => panic!("expected Rows, got {other:?}"),
         }
     }
@@ -3594,7 +3597,7 @@ mod tests {
         let engine = Engine::open(dir.path(), 0).unwrap();
         let q = engine.begin().unwrap();
         match &engine.execute_sql(q, "SELECT id FROM t").unwrap()[0] {
-            SqlResult::Rows(rows) => assert_eq!(rows.len(), 50, "all rows must survive"),
+            SqlResult::Rows { rows, .. } => assert_eq!(rows.len(), 50, "all rows must survive"),
             other => panic!("expected Rows, got {other:?}"),
         }
     }
@@ -3668,14 +3671,14 @@ mod tests {
         let xid2 = engine.begin().unwrap();
         let result = engine.execute_sql(xid2, "SELECT * FROM t").unwrap();
         match &result[0] {
-            SqlResult::Rows(rows) => assert_eq!(rows.len(), 1),
+            SqlResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
             other => panic!("expected Rows, got {other:?}"),
         }
     }
 
     fn sorted_names(result: &SqlResult) -> Vec<String> {
         match result {
-            SqlResult::Rows(rows) => {
+            SqlResult::Rows { rows, .. } => {
                 let mut names: Vec<String> = rows
                     .iter()
                     .map(|r| match &r[0] {
@@ -3799,7 +3802,7 @@ mod tests {
             .execute_sql(xid2, "SELECT owner FROM t WHERE id = 1")
             .unwrap();
         match &result[0] {
-            SqlResult::Rows(rows) => {
+            SqlResult::Rows { rows, .. } => {
                 assert_eq!(rows.len(), 1, "RLS must filter out bob's row: {rows:?}");
                 assert_eq!(
                     rows[0][0],
@@ -3825,7 +3828,7 @@ mod tests {
             .execute_sql(xid2, "SELECT * FROM __edges__ WHERE from_id = 1")
             .unwrap();
         match &result[0] {
-            SqlResult::Rows(rows) => assert_eq!(rows.len(), 1),
+            SqlResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
             other => panic!("expected Rows, got {other:?}"),
         }
     }
@@ -3907,7 +3910,7 @@ mod tests {
             .execute_cypher(xid2, "MATCH (a)-[:KNOWS]->(b) WHERE a = 1 RETURN b")
             .unwrap();
         match &results[0] {
-            SqlResult::Rows(rows) => {
+            SqlResult::Rows { rows, .. } => {
                 let mut to_ids: Vec<i64> = rows
                     .iter()
                     .map(|r| match &r[0] {
@@ -3936,7 +3939,7 @@ mod tests {
             .execute_cypher(xid2, "MATCH (a)-[:LIKES]->(b) WHERE a = 1 RETURN b")
             .unwrap();
         match &results[0] {
-            SqlResult::Rows(rows) => {
+            SqlResult::Rows { rows, .. } => {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0][0], Literal::Int(3));
             }
@@ -3961,7 +3964,7 @@ mod tests {
             .execute_cypher(xid2, "MATCH (a)-[:KNOWS]->(b) RETURN a, b")
             .unwrap();
         match &results[0] {
-            SqlResult::Rows(rows) => assert_eq!(rows.len(), 2),
+            SqlResult::Rows { rows, .. } => assert_eq!(rows.len(), 2),
             other => panic!("expected Rows, got {other:?}"),
         }
     }
@@ -3984,7 +3987,7 @@ mod tests {
             )
             .unwrap();
         match &results[0] {
-            SqlResult::Rows(rows) => {
+            SqlResult::Rows { rows, .. } => {
                 assert_eq!(rows[0][0], Literal::Int(2));
                 assert_eq!(rows[0][1], Literal::Text("KNOWS".to_string()));
                 assert_eq!(rows[0][2], Literal::Json("{\"since\":2020}".to_string()));
@@ -4018,7 +4021,7 @@ mod tests {
             )
             .unwrap();
         match &results[0] {
-            SqlResult::Rows(rows) => rows.clone(),
+            SqlResult::Rows { rows, .. } => rows.clone(),
             other => panic!("expected Rows, got {other:?}"),
         }
     }
@@ -4029,11 +4032,17 @@ mod tests {
         let engine = Engine::open(dir.path(), 0).unwrap();
         let xid = engine.begin().unwrap();
         let events = engine.execute_sql(xid, "SELECT * FROM __events__").unwrap();
-        assert_eq!(events, vec![SqlResult::Rows(vec![])]);
+        match &events[0] {
+            SqlResult::Rows { rows, .. } => assert!(rows.is_empty()),
+            other => panic!("expected Rows, got {other:?}"),
+        }
         let consumers = engine
             .execute_sql(xid, "SELECT * FROM __consumers__")
             .unwrap();
-        assert_eq!(consumers, vec![SqlResult::Rows(vec![])]);
+        match &consumers[0] {
+            SqlResult::Rows { rows, .. } => assert!(rows.is_empty()),
+            other => panic!("expected Rows, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4171,7 +4180,7 @@ mod tests {
             .execute_sql(doomed, "SELECT * FROM __events__ WHERE table_name = 't'")
             .unwrap();
         match &self_view[0] {
-            SqlResult::Rows(rows) => assert_eq!(
+            SqlResult::Rows { rows, .. } => assert_eq!(
                 rows.len(),
                 1,
                 "inserting transaction must see its own uncommitted event"
@@ -4328,7 +4337,7 @@ mod tests {
             .execute_sql(xid, "SELECT * FROM __consumers__")
             .unwrap();
         match &consumers[0] {
-            SqlResult::Rows(rows) => assert!(
+            SqlResult::Rows { rows, .. } => assert!(
                 rows.is_empty(),
                 "poll_events must not write a __consumers__ row"
             ),

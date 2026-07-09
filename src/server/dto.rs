@@ -89,8 +89,12 @@ pub fn exec_result_to_json(result: &ExecResult) -> Json {
             obj.insert("type".into(), Json::String("deleted".into()));
             obj.insert("count".into(), Json::Number(Number::from(*count)));
         }
-        ExecResult::Rows(rows) => {
+        ExecResult::Rows { columns, rows } => {
             obj.insert("type".into(), Json::String("rows".into()));
+            obj.insert(
+                "columns".into(),
+                Json::Array(columns.iter().map(|c| Json::String(c.clone())).collect()),
+            );
             let json_rows: Vec<Json> = rows
                 .iter()
                 .map(|row| Json::Array(row.iter().map(literal_to_json).collect()))
@@ -261,5 +265,21 @@ mod tests {
         let req2: SqlRequest =
             serde_json::from_value(json!({"sql": "SELECT $1", "params": [7]})).unwrap();
         assert_eq!(req2.params.len(), 1);
+    }
+
+    #[test]
+    fn rows_result_carries_column_names() {
+        let result = ExecResult::Rows {
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![vec![Literal::Int(1), Literal::Text("alice".to_string())]],
+        };
+        assert_eq!(
+            exec_result_to_json(&result),
+            json!({
+                "type": "rows",
+                "columns": ["id", "name"],
+                "rows": [[1, "alice"]]
+            })
+        );
     }
 }

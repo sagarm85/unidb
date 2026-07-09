@@ -98,7 +98,7 @@ async fn graceful_shutdown_drains_in_flight_requests_and_preserves_committed_dat
     let xid = fresh.begin().unwrap();
     let rows = fresh.execute_sql(xid, "SELECT * FROM t").unwrap();
     match &rows[0] {
-        unidb::sql::executor::ExecResult::Rows(r) => {
+        unidb::sql::executor::ExecResult::Rows { rows: r, .. } => {
             assert!(
                 r.len() >= 2,
                 "at least the two writes committed before shutdown was \

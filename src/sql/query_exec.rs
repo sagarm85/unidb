@@ -40,7 +40,10 @@ pub fn exec_query(spec: &QuerySpec, ctx: &mut ExecCtx) -> Result<ExecResult> {
     };
     let node = runner.materialize_ctes_and_plan(spec)?;
     let batch = runner.run(&node)?;
-    Ok(ExecResult::Rows(batch.rows))
+    Ok(ExecResult::Rows {
+        columns: batch.schema.iter().map(|c| c.name.clone()).collect(),
+        rows: batch.rows,
+    })
 }
 
 /// `EXPLAIN [ANALYZE]` (P4.e): render the chosen plan tree (estimated rows),
@@ -67,9 +70,10 @@ pub fn exec_explain(spec: &QuerySpec, analyze: bool, ctx: &mut ExecCtx) -> Resul
             elapsed.as_secs_f64() * 1000.0
         ));
     }
-    Ok(ExecResult::Rows(
-        lines.into_iter().map(|l| vec![Literal::Text(l)]).collect(),
-    ))
+    Ok(ExecResult::Rows {
+        columns: vec!["QUERY PLAN".to_string()],
+        rows: lines.into_iter().map(|l| vec![Literal::Text(l)]).collect(),
+    })
 }
 
 struct Runner<'a, 'b> {

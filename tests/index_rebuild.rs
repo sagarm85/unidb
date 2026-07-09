@@ -45,7 +45,7 @@ fn engine_restart_vector_index_is_durable_no_rebuild() {
         .execute_sql(xid, "SELECT id FROM t WHERE NEAR(embedding, [0.0, 0.0], 1)")
         .unwrap();
     match &results[0] {
-        SqlResult::Rows(rows) => {
+        SqlResult::Rows { rows, .. } => {
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0][0], Literal::Int(1));
         }
@@ -126,7 +126,7 @@ fn engine_restart_btree_index_is_durable_no_rebuild() {
         .execute_sql(xid, "SELECT name FROM t WHERE id = 2")
         .unwrap();
     match &results[0] {
-        SqlResult::Rows(rows) => {
+        SqlResult::Rows { rows, .. } => {
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0][0], Literal::Text("bob".into()));
         }
@@ -165,7 +165,7 @@ fn btree_select_before_index_ready_still_returns_correct_full_result() {
         .execute_sql(xid2, "SELECT name FROM t WHERE id = 17")
         .unwrap();
     match &results[0] {
-        SqlResult::Rows(rows) => {
+        SqlResult::Rows { rows, .. } => {
             assert_eq!(rows.len(), 1, "must find the exact match even pre-Ready");
             assert_eq!(rows[0][0], Literal::Text("row17".into()));
         }
@@ -206,7 +206,7 @@ fn near_on_index_built_over_empty_table_returns_exact_topk() {
         )
         .unwrap();
     match &results[0] {
-        SqlResult::Rows(rows) => {
+        SqlResult::Rows { rows, .. } => {
             assert_eq!(rows.len(), 3);
             assert_eq!(rows[0][0], Literal::Int(0));
             assert_eq!(rows[1][0], Literal::Int(1));

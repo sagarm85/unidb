@@ -186,7 +186,15 @@ pub enum ExecResult {
     Inserted {
         count: usize,
     },
-    Rows(Vec<Vec<Literal>>),
+    /// A result set: the output column names (in order) plus one value vector
+    /// per row. `columns` lets the REST layer return `{columns, rows}` (a client
+    /// can zip names to values) instead of anonymous positional arrays. For
+    /// `SELECT *` the columns are the table's non-dropped columns in order; for
+    /// an explicit projection they are exactly the projected names.
+    Rows {
+        columns: Vec<String>,
+        rows: Vec<Vec<Literal>>,
+    },
     Updated {
         count: usize,
     },
@@ -322,7 +330,10 @@ fn exec_analyze(table: &str, ctx: &mut ExecCtx) -> Result<ExecResult> {
     let stats = crate::sql::statistics::compute(&rows, &table_def.columns);
     let mut cctx = catalog_ctx!(ctx);
     ctx.catalog.set_table_stats(table, stats, &mut cctx)?;
-    Ok(ExecResult::Rows(Vec::new()))
+    Ok(ExecResult::Rows {
+        columns: Vec::new(),
+        rows: Vec::new(),
+    })
 }
 
 fn exec_truncate(table: &str, ctx: &mut ExecCtx) -> Result<ExecResult> {
@@ -594,7 +605,10 @@ fn exec_select(
         }
     }
     ctx.txn_mgr.ssi_note_reads(ctx.xid, &read_ids);
-    Ok(ExecResult::Rows(out))
+    Ok(ExecResult::Rows {
+        columns: output_columns(projection, &table_def.columns),
+        rows: out,
+    })
 }
 
 /// Read-only, `PageReader`-generic SELECT for the concurrent read path (6b).
@@ -633,7 +647,10 @@ pub(crate) fn exec_select_readonly<P: PageReader>(
             out.push(project_row(projection, &table_def.columns, &row)?);
         }
     }
-    Ok(ExecResult::Rows(out))
+    Ok(ExecResult::Rows {
+        columns: output_columns(projection, &table_def.columns),
+        rows: out,
+    })
 }
 
 /// Whether `plan` may run on the concurrent read path (6b): a plain `SELECT`
@@ -753,7 +770,10 @@ fn try_exec_select_btree(
             out.push(project_row(projection, &table_def.columns, &row)?);
         }
     }
-    Ok(Some(ExecResult::Rows(out)))
+    Ok(Some(ExecResult::Rows {
+        columns: output_columns(projection, &table_def.columns),
+        rows: out,
+    }))
 }
 
 /// `NEAR`'s over-fetch-then-filter execution: probe the durable IVF-Flat
@@ -790,7 +810,10 @@ fn exec_select_near(
     // is always crash-consistent with committed data). A column flagged but never
     // built (no `index_root`) has zero candidates, not an error.
     let Some(meta_page) = col.index_root else {
-        return Ok(ExecResult::Rows(Vec::new()));
+        return Ok(ExecResult::Rows {
+            columns: output_columns(projection, &table_def.columns),
+            rows: Vec::new(),
+        });
     };
 
     // Probe the nearest cells' posting lists for candidate RowIds. Candidates are
@@ -827,9 +850,10 @@ fn exec_select_near(
     }
     scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(k);
-    Ok(ExecResult::Rows(
-        scored.into_iter().map(|(_, r)| r).collect(),
-    ))
+    Ok(ExecResult::Rows {
+        columns: output_columns(projection, &table_def.columns),
+        rows: scored.into_iter().map(|(_, r)| r).collect(),
+    })
 }
 
 /// Exact distance for NEAR re-ranking, matching the index's `Metric` (must agree
@@ -1476,6 +1500,21 @@ fn enforce_unique(
         }
     }
     Ok(())
+}
+
+/// The output column names for a projection over `columns`, matching exactly
+/// what [`project_row`] emits: `SELECT *` (empty projection) → every non-dropped
+/// column in order; an explicit projection → the projected names as written.
+pub(crate) fn output_columns(projection: &[String], columns: &[ColumnDef]) -> Vec<String> {
+    if projection.is_empty() {
+        columns
+            .iter()
+            .filter(|c| !c.dropped)
+            .map(|c| c.name.clone())
+            .collect()
+    } else {
+        projection.to_vec()
+    }
 }
 
 pub(crate) fn project_row(
@@ -2131,7 +2170,7 @@ mod tests {
             .exec_as(xid2, "SELECT * FROM accounts WHERE id = 1")
             .unwrap();
         match result {
-            ExecResult::Rows(rows) => {
+            ExecResult::Rows { rows, .. } => {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(
                     rows[0],
@@ -2161,7 +2200,7 @@ mod tests {
         let xid2 = h.begin();
         let result = h.exec_as(xid2, "SELECT name FROM t").unwrap();
         match result {
-            ExecResult::Rows(rows) => {
+            ExecResult::Rows { rows, .. } => {
                 assert_eq!(rows, vec![vec![Literal::Text("a".to_string())]]);
             }
             other => panic!("expected Rows, got {other:?}"),
@@ -2188,7 +2227,13 @@ mod tests {
 
         let xid3 = h.begin();
         let result = h.exec_as(xid3, "SELECT balance FROM accounts").unwrap();
-        assert_eq!(result, ExecResult::Rows(vec![vec![Literal::Int(50)]]));
+        assert_eq!(
+            result,
+            ExecResult::Rows {
+                columns: vec!["balance".to_string()],
+                rows: vec![vec![Literal::Int(50)]]
+            }
+        );
     }
 
     #[test]
@@ -2207,7 +2252,7 @@ mod tests {
 
         let xid3 = h.begin();
         let result = h.exec_as(xid3, "SELECT * FROM t").unwrap();
-        assert_eq!(result, ExecResult::Rows(vec![]));
+        assert!(matches!(result, ExecResult::Rows { rows, .. } if rows.is_empty()));
     }
 
     #[test]
@@ -2229,7 +2274,7 @@ mod tests {
             .exec_as(xid2, "SELECT * FROM t WHERE (data ->> 'status') = 'active'")
             .unwrap();
         match result {
-            ExecResult::Rows(rows) => assert_eq!(rows.len(), 1),
+            ExecResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
             other => panic!("expected Rows, got {other:?}"),
         }
 
@@ -2239,7 +2284,7 @@ mod tests {
                 "SELECT * FROM t WHERE (data ->> 'status') = 'inactive'",
             )
             .unwrap();
-        assert_eq!(none, ExecResult::Rows(vec![]));
+        assert!(matches!(none, ExecResult::Rows { rows, .. } if rows.is_empty()));
     }
 
     #[test]
@@ -2471,12 +2516,12 @@ mod tests {
 
         let xid2 = h.begin();
         let rows = match h.exec_as(xid2, "SELECT price FROM t WHERE id = 1").unwrap() {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             other => panic!("expected Rows, got {other:?}"),
         };
         assert_eq!(rows, vec![vec![Literal::Decimal(950, 2)]]);
         let rows2 = match h.exec_as(xid2, "SELECT price FROM t WHERE id = 2").unwrap() {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             other => panic!("expected Rows, got {other:?}"),
         };
         assert_eq!(rows2, vec![vec![Literal::Decimal(10000, 2)]]);
@@ -2532,7 +2577,7 @@ mod tests {
             .exec_as(xid2, "SELECT id FROM t WHERE price > 9.9")
             .unwrap()
         {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             other => panic!("expected Rows, got {other:?}"),
         };
         assert_eq!(rows.len(), 3); // 9.99, 10.00, 10.50
@@ -2541,7 +2586,7 @@ mod tests {
             .exec_as(xid2, "SELECT id FROM t WHERE price = 10")
             .unwrap()
         {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             other => panic!("expected Rows, got {other:?}"),
         };
         assert_eq!(eq, vec![vec![Literal::Int(3)]]);
@@ -2595,7 +2640,7 @@ mod tests {
             .exec_as(xid2, "SELECT created FROM t WHERE id = 1")
             .unwrap()
         {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             other => panic!("expected Rows, got {other:?}"),
         };
         assert_eq!(rows, vec![vec![Literal::Timestamp(created)]]);
@@ -2608,7 +2653,7 @@ mod tests {
             )
             .unwrap()
         {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             other => panic!("expected Rows, got {other:?}"),
         };
         assert_eq!(after, vec![vec![Literal::Int(2)]]);
@@ -2729,12 +2774,12 @@ mod tests {
         h.commit(xid);
         let xid2 = h.begin();
         let rows = match h.exec_as(xid2, "SELECT x FROM t WHERE id = 1").unwrap() {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         assert_eq!(rows, vec![vec![Literal::Float(1.5)]]);
         let gt = match h.exec_as(xid2, "SELECT id FROM t WHERE x > 2").unwrap() {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         assert_eq!(gt, vec![vec![Literal::Int(2)]]);
@@ -2766,7 +2811,7 @@ mod tests {
             )
             .unwrap()
         {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         assert_eq!(rows.len(), 1);
@@ -2791,12 +2836,12 @@ mod tests {
         h.commit(xid);
         let xid2 = h.begin();
         let r1 = match h.exec_as(xid2, "SELECT b FROM t WHERE id = 1").unwrap() {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         assert_eq!(r1, vec![vec![Literal::Bytea(vec![0xde, 0xad, 0xbe, 0xef])]]);
         let r2 = match h.exec_as(xid2, "SELECT b FROM t WHERE id = 2").unwrap() {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         assert_eq!(r2, vec![vec![Literal::Bytea(b"hi".to_vec())]]);
@@ -2822,7 +2867,7 @@ mod tests {
         h.commit(xid);
         let xid2 = h.begin();
         let rows = match h.exec_as(xid2, "SELECT d, tm FROM t WHERE id = 1").unwrap() {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         assert_eq!(
@@ -2839,7 +2884,7 @@ mod tests {
             )
             .unwrap()
         {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         assert_eq!(after, vec![vec![Literal::Int(2)]]);
@@ -2868,7 +2913,7 @@ mod tests {
             .exec_as(xid2, "SELECT status FROM t WHERE id = 1")
             .unwrap()
         {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         assert_eq!(old, vec![vec![Literal::Text("new".to_string())]]);
@@ -2876,7 +2921,7 @@ mod tests {
             .exec_as(xid2, "SELECT status FROM t WHERE id = 2")
             .unwrap()
         {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         assert_eq!(new, vec![vec![Literal::Text("live".to_string())]]);
@@ -2908,13 +2953,13 @@ mod tests {
         // The tombstone hazard: the pre-drop row's `c` must still decode as 3,
         // not be misread from `b`'s old bytes.
         let rows = match h.exec_as(xid2, "SELECT a, c FROM t").unwrap() {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         assert_eq!(rows, vec![vec![Literal::Int(1), Literal::Int(3)]]);
         // SELECT * returns only the two visible columns.
         let star = match h.exec_as(xid2, "SELECT * FROM t").unwrap() {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         assert_eq!(star, vec![vec![Literal::Int(1), Literal::Int(3)]]);
@@ -2930,7 +2975,7 @@ mod tests {
         h.commit(xid3);
         let xid4 = h.begin();
         let after = match h.exec_as(xid4, "SELECT a, c FROM t WHERE a = 4").unwrap() {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         assert_eq!(after, vec![vec![Literal::Int(4), Literal::Int(6)]]);
@@ -2972,10 +3017,10 @@ mod tests {
         h.exec_as(xid, "CREATE TABLE t (name TEXT)").unwrap();
         h.commit(xid);
         let xid2 = h.begin();
-        assert_eq!(
+        assert!(matches!(
             h.exec_as(xid2, "SELECT * FROM t").unwrap(),
-            ExecResult::Rows(vec![])
-        );
+            ExecResult::Rows { rows, .. } if rows.is_empty()
+        ));
     }
 
     #[test]
@@ -2994,10 +3039,10 @@ mod tests {
         );
         h.commit(xid2);
         let xid3 = h.begin();
-        assert_eq!(
+        assert!(matches!(
             h.exec_as(xid3, "SELECT * FROM t").unwrap(),
-            ExecResult::Rows(vec![])
-        );
+            ExecResult::Rows { rows, .. } if rows.is_empty()
+        ));
         // Schema intact: can still insert.
         h.exec_as(xid3, "INSERT INTO t (id) VALUES (9)").unwrap();
     }
@@ -3028,7 +3073,7 @@ mod tests {
         h.commit(xid);
         let xid2 = h.begin();
         let rows = match h.exec_as(xid2, "SELECT id, name FROM t").unwrap() {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         let mut ids: Vec<i64> = rows
@@ -3072,7 +3117,7 @@ mod tests {
         .unwrap();
         h.exec_as(xid, "INSERT INTO t (name) VALUES ('a')").unwrap();
         let rows = match h.exec_as(xid, "SELECT id FROM t").unwrap() {
-            ExecResult::Rows(r) => r,
+            ExecResult::Rows { rows: r, .. } => r,
             o => panic!("{o:?}"),
         };
         assert_eq!(rows, vec![vec![Literal::Int(1)]]);
@@ -3274,7 +3319,7 @@ mod tests {
             .exec_as(xid, "SELECT id FROM t WHERE NEAR(embedding, [0.0, 0.0], 2)")
             .unwrap();
         match res {
-            ExecResult::Rows(rows) => {
+            ExecResult::Rows { rows, .. } => {
                 assert_eq!(rows.len(), 2);
                 assert_eq!(rows[0][0], Literal::Int(1));
                 assert_eq!(rows[1][0], Literal::Int(3));

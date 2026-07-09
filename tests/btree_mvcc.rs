@@ -28,7 +28,7 @@ fn matching_ids(engine: &mut Engine, xid: unidb::format::Xid) -> Vec<i64> {
         .execute_sql(xid, "SELECT id FROM t WHERE id = 999")
         .unwrap();
     match &results[0] {
-        SqlResult::Rows(rows) => rows
+        SqlResult::Rows { rows, .. } => rows
             .iter()
             .map(|r| match &r[0] {
                 Literal::Int(n) => *n,
@@ -116,7 +116,7 @@ fn durable_btree_survives_reopen_without_rebuild() {
         .execute_sql(xid, "SELECT id FROM t WHERE id = 42")
         .unwrap();
     match &results[0] {
-        SqlResult::Rows(rows) => {
+        SqlResult::Rows { rows, .. } => {
             assert_eq!(rows.len(), 1, "durable index must find the committed row");
             assert_eq!(rows[0][0], Literal::Int(42));
         }

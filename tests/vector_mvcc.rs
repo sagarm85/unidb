@@ -20,7 +20,7 @@ fn near_result_ids(engine: &mut Engine, xid: unidb::format::Xid) -> Vec<i64> {
         .execute_sql(xid, "SELECT id FROM t WHERE NEAR(embedding, [0.0, 0.0], 5)")
         .unwrap();
     match &results[0] {
-        SqlResult::Rows(rows) => rows
+        SqlResult::Rows { rows, .. } => rows
             .iter()
             .map(|r| match &r[0] {
                 Literal::Int(n) => *n,

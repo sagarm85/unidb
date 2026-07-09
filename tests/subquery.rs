@@ -17,7 +17,7 @@ fn run_unidb(setup: &[&str], query: &str) -> Vec<Vec<String>> {
     let results = engine.execute_sql(xid, query).unwrap();
     engine.commit(xid).unwrap();
     match results.into_iter().next().unwrap() {
-        SqlResult::Rows(rows) => rows
+        SqlResult::Rows { rows, .. } => rows
             .into_iter()
             .map(|r| r.iter().map(lit_to_string).collect())
             .collect(),

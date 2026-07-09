@@ -120,7 +120,7 @@ fn checkpoint_succeeds_after_writes() {
 
     // Data committed before the checkpoint must still be readable.
     let r = c.execute_sql("SELECT * FROM t").unwrap();
-    let unidb_attach::ExecResult::Rows(rows) = &r[0] else {
+    let unidb_attach::ExecResult::Rows { rows, .. } = &r[0] else {
         panic!("expected Rows");
     };
     assert_eq!(rows.len(), 1);

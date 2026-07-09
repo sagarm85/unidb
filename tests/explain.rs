@@ -10,7 +10,7 @@ fn explain_lines(engine: &mut Engine, sql: &str) -> Vec<String> {
     let results = engine.execute_sql(xid, sql).unwrap();
     engine.commit(xid).unwrap();
     match results.into_iter().next().unwrap() {
-        SqlResult::Rows(rows) => rows
+        SqlResult::Rows { rows, .. } => rows
             .into_iter()
             .map(|r| match &r[0] {
                 Literal::Text(s) => s.clone(),

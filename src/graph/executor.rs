@@ -131,5 +131,14 @@ pub fn execute(
         }
         out.push(projected);
     }
-    Ok(ExecResult::Rows(out))
+    let columns = query
+        .returns
+        .iter()
+        .map(|item| match item {
+            ReturnItem::FromVar => "from_id".to_string(),
+            ReturnItem::ToVar => "to_id".to_string(),
+            ReturnItem::EdgeColumn(name) => name.clone(),
+        })
+        .collect();
+    Ok(ExecResult::Rows { columns, rows: out })
 }

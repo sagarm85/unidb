@@ -79,7 +79,7 @@ fn time_query(engine: &mut Engine, sql: &str, iters: usize) -> (f64, f64, usize)
         let res = engine.execute_sql(xid, sql).unwrap();
         latencies.push(start.elapsed().as_secs_f64() * 1000.0);
         engine.commit(xid).unwrap();
-        if let Some(SqlResult::Rows(r)) = res.into_iter().next() {
+        if let Some(SqlResult::Rows { rows: r, .. }) = res.into_iter().next() {
             rows_out = r.len();
         }
     }
@@ -138,7 +138,7 @@ fn main() {
         let res = engine.execute_sql(xid, sql).unwrap();
         engine.commit(xid).unwrap();
         match res.into_iter().next().unwrap() {
-            SqlResult::Rows(rows) => rows
+            SqlResult::Rows { rows, .. } => rows
                 .iter()
                 .map(|r| match &r[0] {
                     unidb::sql::logical::Literal::Text(s) => s.clone(),

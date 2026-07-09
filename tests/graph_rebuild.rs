@@ -84,7 +84,7 @@ fn engine_restart_rebuild_also_serves_cypher_queries() {
         .execute_cypher(xid, "MATCH (a)-[:KNOWS]->(b) WHERE a = 1 RETURN b")
         .unwrap();
     match &results[0] {
-        unidb::sql::executor::ExecResult::Rows(rows) => assert_eq!(rows.len(), 1),
+        unidb::sql::executor::ExecResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
         other => panic!("expected Rows, got {other:?}"),
     }
 }

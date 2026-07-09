@@ -656,7 +656,7 @@ fn incomplete_user_txn_leaves_no_trace_across_two_tables() {
     let xid = engine.begin().unwrap();
     let rows = engine.execute_sql(xid, "SELECT * FROM t").unwrap();
     match &rows[0] {
-        unidb::sql::executor::ExecResult::Rows(r) => assert!(
+        unidb::sql::executor::ExecResult::Rows { rows: r, .. } => assert!(
             r.is_empty(),
             "incomplete txn's row in the triggering table must leave no trace"
         ),
@@ -1103,7 +1103,7 @@ fn p17_durable_vector_index_survives_crash_recall_intact() {
         let res = engine.execute_sql(xid, &sql).unwrap();
         engine.commit(xid).unwrap();
         match &res[0] {
-            unidb::sql::executor::ExecResult::Rows(rows) => match rows[0][0] {
+            unidb::sql::executor::ExecResult::Rows { rows, .. } => match rows[0][0] {
                 unidb::sql::logical::Literal::Int(v) => v,
                 ref other => panic!("expected Int, got {other:?}"),
             },
@@ -1129,7 +1129,7 @@ fn p17_durable_vector_index_survives_crash_recall_intact() {
         )
         .unwrap();
     match &res[0] {
-        unidb::sql::executor::ExecResult::Rows(rows) => {
+        unidb::sql::executor::ExecResult::Rows { rows, .. } => {
             let mut ids: Vec<i64> = rows
                 .iter()
                 .map(|r| match r[0] {
@@ -1310,7 +1310,7 @@ fn p19_backup_and_pitr_restore_after_primary_loss() {
     let rows = restored.execute_sql(xid, "SELECT id FROM t").unwrap();
     restored.commit(xid).unwrap();
     let n = match &rows[0] {
-        ExecResult::Rows(r) => r.len(),
+        ExecResult::Rows { rows: r, .. } => r.len(),
         other => panic!("expected rows, got {other:?}"),
     };
     assert_eq!(
@@ -1546,7 +1546,7 @@ fn p26_crash_after_autovacuum_pass_recovers() {
         .execute_sql(x, "SELECT v FROM t WHERE id = 1")
         .unwrap();
     match &rows[0] {
-        unidb::SqlResult::Rows(r) => assert_eq!(
+        unidb::SqlResult::Rows { rows: r, .. } => assert_eq!(
             r,
             &vec![vec![unidb::sql::logical::Literal::Int(final_v)]],
             "P26: the live row must survive with its latest value"
@@ -1620,7 +1620,7 @@ fn p27_durable_fsm_directory_survives_crash_and_scan_recovers_all_rows() {
         let out = e.execute_sql(x, "SELECT id FROM t").unwrap();
         e.commit(x).unwrap();
         match &out[0] {
-            SqlResult::Rows(r) => r.len(),
+            SqlResult::Rows { rows: r, .. } => r.len(),
             other => panic!("expected Rows, got {other:?}"),
         }
     };
@@ -1702,7 +1702,7 @@ fn p28_atomic_heap_grow_leaves_no_orphan_on_crash() {
     // Full scan (no index) enumerates pages through the recovered FSM directory.
     let out = engine.execute_sql(x, "SELECT id, body FROM t").unwrap();
     let rows = match &out[0] {
-        SqlResult::Rows(r) => r,
+        SqlResult::Rows { rows: r, .. } => r,
         other => panic!("expected Rows, got {other:?}"),
     };
     // Every row survives — no page (grown by any insert) was orphaned out of the
