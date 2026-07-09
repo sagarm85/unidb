@@ -292,7 +292,7 @@ impl TransactionManager {
             .unwrap_or(1)
     }
 
-    pub fn begin(&self, isolation: IsolationLevel, wal: &mut Wal) -> Result<Xid> {
+    pub fn begin(&self, isolation: IsolationLevel, wal: &Wal) -> Result<Xid> {
         let mut inner = self.lock();
         let xid = inner.next_xid;
         inner.next_xid += 1;
@@ -437,7 +437,7 @@ impl TransactionManager {
     /// write and this commit — the conflict, if any, was already caught
     /// immediately at `Heap::update`/`delete` time via `try_acquire_write`.
     /// This is stronger than needing a distinct commit-time check.
-    pub fn commit(&self, xid: Xid, wal: &mut Wal, lock_mgr: &mut LockManager) -> Result<()> {
+    pub fn commit(&self, xid: Xid, wal: &Wal, lock_mgr: &LockManager) -> Result<()> {
         // SSI (P1.d): a serializable pivot must not commit — it would seal a
         // non-serializable schedule (e.g. write-skew). Refuse *before* removing
         // it from `active`, leaving it live for the caller to roll back
@@ -493,7 +493,7 @@ impl TransactionManager {
         pool: &mut BufferPool,
         heap: &mut Heap,
         wal: &mut Wal,
-        lock_mgr: &mut LockManager,
+        lock_mgr: &LockManager,
     ) -> Result<()> {
         let txn = self
             .lock()
@@ -562,21 +562,21 @@ mod tests {
     #[test]
     fn begin_assigns_increasing_xids() {
         let dir = tempdir().unwrap();
-        let (_pool, _heap, mut wal) = setup(dir.path());
+        let (_pool, _heap, wal) = setup(dir.path());
         let mgr = TransactionManager::new();
-        let a = mgr.begin(IsolationLevel::ReadCommitted, &mut wal).unwrap();
-        let b = mgr.begin(IsolationLevel::ReadCommitted, &mut wal).unwrap();
+        let a = mgr.begin(IsolationLevel::ReadCommitted, &wal).unwrap();
+        let b = mgr.begin(IsolationLevel::ReadCommitted, &wal).unwrap();
         assert!(b > a);
     }
 
     #[test]
     fn read_committed_recomputes_snapshot_each_statement() {
         let dir = tempdir().unwrap();
-        let (_pool, _heap, mut wal) = setup(dir.path());
+        let (_pool, _heap, wal) = setup(dir.path());
         let mgr = TransactionManager::new();
-        let a = mgr.begin(IsolationLevel::ReadCommitted, &mut wal).unwrap();
+        let a = mgr.begin(IsolationLevel::ReadCommitted, &wal).unwrap();
         let snap1 = mgr.snapshot_for_statement(a).unwrap();
-        let b = mgr.begin(IsolationLevel::ReadCommitted, &mut wal).unwrap();
+        let b = mgr.begin(IsolationLevel::ReadCommitted, &wal).unwrap();
         let snap2 = mgr.snapshot_for_statement(a).unwrap();
         // b's begin bumped next_xid, so a's second statement sees a wider xmax.
         assert!(snap2.xmax > snap1.xmax);
@@ -586,11 +586,11 @@ mod tests {
     #[test]
     fn repeatable_read_keeps_fixed_snapshot() {
         let dir = tempdir().unwrap();
-        let (_pool, _heap, mut wal) = setup(dir.path());
+        let (_pool, _heap, wal) = setup(dir.path());
         let mgr = TransactionManager::new();
-        let a = mgr.begin(IsolationLevel::RepeatableRead, &mut wal).unwrap();
+        let a = mgr.begin(IsolationLevel::RepeatableRead, &wal).unwrap();
         let snap1 = mgr.snapshot_for_statement(a).unwrap();
-        mgr.begin(IsolationLevel::ReadCommitted, &mut wal).unwrap();
+        mgr.begin(IsolationLevel::ReadCommitted, &wal).unwrap();
         let snap2 = mgr.snapshot_for_statement(a).unwrap();
         assert_eq!(snap1.xmax, snap2.xmax);
     }
@@ -598,11 +598,11 @@ mod tests {
     #[test]
     fn commit_marks_committed_and_removes_from_active() {
         let dir = tempdir().unwrap();
-        let (_pool, _heap, mut wal) = setup(dir.path());
+        let (_pool, _heap, wal) = setup(dir.path());
         let mgr = TransactionManager::new();
-        let mut lock_mgr = LockManager::new();
-        let a = mgr.begin(IsolationLevel::ReadCommitted, &mut wal).unwrap();
-        mgr.commit(a, &mut wal, &mut lock_mgr).unwrap();
+        let lock_mgr = LockManager::new();
+        let a = mgr.begin(IsolationLevel::ReadCommitted, &wal).unwrap();
+        mgr.commit(a, &wal, &lock_mgr).unwrap();
         assert!(!mgr.is_active(a));
         assert!(mgr.is_committed(a));
     }
@@ -612,8 +612,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let (mut pool, mut heap, mut wal) = setup(dir.path());
         let mgr = TransactionManager::new();
-        let mut lock_mgr = LockManager::new();
-        let a = mgr.begin(IsolationLevel::ReadCommitted, &mut wal).unwrap();
+        let lock_mgr = LockManager::new();
+        let a = mgr.begin(IsolationLevel::ReadCommitted, &wal).unwrap();
         let rid = heap.insert(b"oops", a, &mut pool, &mut wal).unwrap();
         mgr.record_undo(
             a,
@@ -623,7 +623,7 @@ mod tests {
             },
         )
         .unwrap();
-        mgr.abort(a, &mut pool, &mut heap, &mut wal, &mut lock_mgr)
+        mgr.abort(a, &mut pool, &mut heap, &mut wal, &lock_mgr)
             .unwrap();
         assert!(!mgr.is_active(a));
         assert!(mgr.is_aborted(a));
@@ -638,13 +638,13 @@ mod tests {
     #[test]
     fn double_commit_is_an_error() {
         let dir = tempdir().unwrap();
-        let (_pool, _heap, mut wal) = setup(dir.path());
+        let (_pool, _heap, wal) = setup(dir.path());
         let mgr = TransactionManager::new();
-        let mut lock_mgr = LockManager::new();
-        let a = mgr.begin(IsolationLevel::ReadCommitted, &mut wal).unwrap();
-        mgr.commit(a, &mut wal, &mut lock_mgr).unwrap();
+        let lock_mgr = LockManager::new();
+        let a = mgr.begin(IsolationLevel::ReadCommitted, &wal).unwrap();
+        mgr.commit(a, &wal, &lock_mgr).unwrap();
         assert!(matches!(
-            mgr.commit(a, &mut wal, &mut lock_mgr),
+            mgr.commit(a, &wal, &lock_mgr),
             Err(DbError::TxnNotActive { .. })
         ));
     }
@@ -677,23 +677,23 @@ mod tests {
     #[test]
     fn long_lived_rr_txn_pins_the_horizon() {
         let dir = tempdir().unwrap();
-        let (_pool, _heap, mut wal) = setup(dir.path());
+        let (_pool, _heap, wal) = setup(dir.path());
         let mgr = TransactionManager::new();
-        let mut lock_mgr = LockManager::new();
+        let lock_mgr = LockManager::new();
 
         // A long-lived RR reader takes its snapshot early and never finishes.
-        let rr = mgr.begin(IsolationLevel::RepeatableRead, &mut wal).unwrap();
+        let rr = mgr.begin(IsolationLevel::RepeatableRead, &wal).unwrap();
         // Later transactions come and go.
         for _ in 0..5 {
-            let x = mgr.begin(IsolationLevel::ReadCommitted, &mut wal).unwrap();
-            mgr.commit(x, &mut wal, &mut lock_mgr).unwrap();
+            let x = mgr.begin(IsolationLevel::ReadCommitted, &wal).unwrap();
+            mgr.commit(x, &wal, &lock_mgr).unwrap();
         }
         // The horizon is still pinned to rr's fixed snapshot xmin — a version
         // a later transaction deleted is NOT yet reclaimable while rr lives.
         let pinned = mgr.snapshot_for_statement(rr).unwrap().xmin;
         assert_eq!(mgr.vacuum_horizon(), pinned);
 
-        mgr.commit(rr, &mut wal, &mut lock_mgr).unwrap();
+        mgr.commit(rr, &wal, &lock_mgr).unwrap();
         // Once rr finishes, the horizon advances past where rr held it.
         assert!(mgr.vacuum_horizon() > pinned);
     }
@@ -701,14 +701,14 @@ mod tests {
     #[test]
     fn concurrent_reader_registration_holds_horizon_back() {
         let dir = tempdir().unwrap();
-        let (_pool, _heap, mut wal) = setup(dir.path());
+        let (_pool, _heap, wal) = setup(dir.path());
         let mgr = TransactionManager::new();
-        let mut lock_mgr = LockManager::new();
+        let lock_mgr = LockManager::new();
 
         // Advance next_xid past 1 by running a couple of transactions.
         for _ in 0..3 {
-            let x = mgr.begin(IsolationLevel::ReadCommitted, &mut wal).unwrap();
-            mgr.commit(x, &mut wal, &mut lock_mgr).unwrap();
+            let x = mgr.begin(IsolationLevel::ReadCommitted, &wal).unwrap();
+            mgr.commit(x, &wal, &lock_mgr).unwrap();
         }
         let shared = mgr.shared();
         // With nothing live, the horizon is next_xid.
@@ -723,5 +723,143 @@ mod tests {
         // Dropping the registration releases the hold.
         drop(reg);
         assert_eq!(mgr.vacuum_horizon(), free_horizon);
+    }
+
+    // ── P5.c: concurrency stress / linearizability ───────────────────────────
+    //
+    // Exercise the transaction manager, WAL, and lock manager through the
+    // `&self` surfaces P5.a/P5.b/P5.c established, under many real OS threads.
+    // These share `&mgr`/`&wal`/`&lock_mgr` via scoped threads (all `Sync`
+    // now), so a data race is a compile error; an accounting or lock-ordering
+    // bug surfaces as a wrong count, a violated invariant, or a hang.
+
+    #[test]
+    fn concurrent_begin_commit_allocate_unique_monotonic_xids() {
+        use std::collections::HashSet;
+        let dir = tempdir().unwrap();
+        let (_pool, _heap, wal) = setup(dir.path());
+        let mgr = TransactionManager::new();
+        let lock_mgr = LockManager::new();
+
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 100;
+        let all: Vec<Xid> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    s.spawn(|| {
+                        let mut mine = Vec::with_capacity(PER_THREAD);
+                        for _ in 0..PER_THREAD {
+                            let x = mgr.begin(IsolationLevel::ReadCommitted, &wal).unwrap();
+                            mine.push(x);
+                            mgr.commit(x, &wal, &lock_mgr).unwrap();
+                        }
+                        mine
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+
+        // Every begin under contention handed out a distinct xid...
+        assert_eq!(all.len(), THREADS * PER_THREAD);
+        let unique: HashSet<Xid> = all.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            all.len(),
+            "xids must be unique across threads"
+        );
+        // ...the counter ended exactly one past the highest issued...
+        assert_eq!(mgr.next_xid(), all.iter().copied().max().unwrap() + 1);
+        // ...and once quiescent, nothing is active and the horizon collapses.
+        assert_eq!(mgr.active_count(), 0);
+        assert_eq!(mgr.vacuum_horizon(), mgr.next_xid());
+    }
+
+    #[test]
+    fn concurrent_reader_pins_horizon_under_writer_churn() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempdir().unwrap();
+        let (_pool, _heap, wal) = setup(dir.path());
+        let mgr = TransactionManager::new();
+        let lock_mgr = LockManager::new();
+
+        // Warm up so next_xid > 1, then take a long-lived reader registration.
+        for _ in 0..4 {
+            let x = mgr.begin(IsolationLevel::ReadCommitted, &wal).unwrap();
+            mgr.commit(x, &wal, &lock_mgr).unwrap();
+        }
+        let shared = mgr.shared();
+        let (snap, _self_xid, reg) = super::read_snapshot(&shared);
+        let pinned = snap.xmin;
+
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            // Writers churn transactions while the reader registration is live.
+            for _ in 0..4 {
+                s.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        let x = mgr.begin(IsolationLevel::ReadCommitted, &wal).unwrap();
+                        mgr.commit(x, &wal, &lock_mgr).unwrap();
+                    }
+                });
+            }
+            // Sampler: the horizon must NEVER pass the live reader's xmin, no
+            // matter how many versions the writers churn behind it.
+            s.spawn(|| {
+                for _ in 0..20_000 {
+                    assert!(
+                        mgr.vacuum_horizon() <= pinned,
+                        "vacuum horizon advanced past a live reader's snapshot"
+                    );
+                }
+                stop.store(true, Ordering::Relaxed);
+            });
+        });
+
+        // With writers stopped but the reader still live, the horizon is exactly
+        // pinned; releasing the registration lets it finally advance.
+        assert_eq!(mgr.vacuum_horizon(), pinned);
+        drop(reg);
+        assert!(mgr.vacuum_horizon() > pinned);
+    }
+
+    #[test]
+    fn concurrent_lock_manager_admits_one_writer_per_row() {
+        use crate::lockmgr::RecordId;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let lock_mgr = LockManager::new();
+        let row = RecordId::row(7, 3);
+
+        const THREADS: usize = 16;
+        let wins = AtomicUsize::new(0);
+        let conflicts = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            let (wins, conflicts, lm) = (&wins, &conflicts, &lock_mgr);
+            for t in 0..THREADS {
+                let xid = (t + 1) as Xid; // each racer is a distinct xid
+                s.spawn(move || match lm.try_acquire_write(row, xid) {
+                    Ok(()) => {
+                        wins.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(DbError::WriteConflict { .. }) => {
+                        conflicts.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => panic!("unexpected lock error: {e:?}"),
+                });
+            }
+        });
+        // Exactly one writer holds a row's write intent; the rest see a clean
+        // WriteConflict — never two winners (which would be a lost update).
+        assert_eq!(wins.load(Ordering::Relaxed), 1);
+        assert_eq!(conflicts.load(Ordering::Relaxed), THREADS - 1);
+
+        // The winner releasing lets a fresh writer take the row.
+        let winner = lock_mgr.holder(row).unwrap();
+        lock_mgr.release_all(winner);
+        assert_eq!(lock_mgr.holder(row), None);
+        assert!(lock_mgr.try_acquire_write(row, 999).is_ok());
     }
 }

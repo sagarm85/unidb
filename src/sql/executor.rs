@@ -2064,14 +2064,12 @@ mod tests {
 
         fn begin(&mut self) -> Xid {
             self.txn_mgr
-                .begin(IsolationLevel::ReadCommitted, &mut self.wal)
+                .begin(IsolationLevel::ReadCommitted, &self.wal)
                 .unwrap()
         }
 
         fn commit(&mut self, xid: Xid) {
-            self.txn_mgr
-                .commit(xid, &mut self.wal, &mut self.lock_mgr)
-                .unwrap();
+            self.txn_mgr.commit(xid, &self.wal, &self.lock_mgr).unwrap();
         }
     }
 

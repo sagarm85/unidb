@@ -20,6 +20,7 @@
 // is nothing to recover here.
 
 use std::collections::HashMap;
+use std::sync::{Mutex, MutexGuard};
 
 use crate::{
     error::{DbError, Result},
@@ -48,9 +49,16 @@ impl RecordId {
     }
 }
 
+/// Write-lock table (M1.b). **P5.c** moved its state behind a `Mutex` and made
+/// every method `&self`, so an `Arc<LockManager>` can be shared across the
+/// concurrent writer threads P5.e introduces (an owned `&mut LockManager` on
+/// the single-writer path still works unchanged — `&mut` derefs to `&`). The
+/// policy is unchanged: abort-on-conflict, no waiting. **P5.d** will add lock
+/// modes, real blocking wait queues, and wait-for-graph deadlock detection on
+/// top of this same `&self` surface.
 #[derive(Default)]
 pub struct LockManager {
-    write_locks: HashMap<RecordId, Xid>,
+    write_locks: Mutex<HashMap<RecordId, Xid>>,
 }
 
 impl LockManager {
@@ -58,26 +66,34 @@ impl LockManager {
         Self::default()
     }
 
+    /// Poison-safe access to the lock table: a prior panic-while-locked leaves
+    /// the map usable as-is (consistent with `txn.rs`/`wal.rs`), so a single
+    /// poisoned mutation never cascades into a crash on every later lock op.
+    fn lock(&self) -> MutexGuard<'_, HashMap<RecordId, Xid>> {
+        self.write_locks.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Attempt to acquire (or re-acquire, if `xid` already holds it) a write
     /// intent on `id`. Fails immediately with `WriteConflict` if another
     /// *active* xid already holds it — no waiting.
-    pub fn try_acquire_write(&mut self, id: RecordId, xid: Xid) -> Result<()> {
-        match self.write_locks.get(&id) {
+    pub fn try_acquire_write(&self, id: RecordId, xid: Xid) -> Result<()> {
+        let mut locks = self.lock();
+        match locks.get(&id) {
             Some(&holder) if holder != xid => Err(DbError::WriteConflict { holder_xid: holder }),
             _ => {
-                self.write_locks.insert(id, xid);
+                locks.insert(id, xid);
                 Ok(())
             }
         }
     }
 
     /// Release every write lock held by `xid` (called on commit or abort).
-    pub fn release_all(&mut self, xid: Xid) {
-        self.write_locks.retain(|_, holder| *holder != xid);
+    pub fn release_all(&self, xid: Xid) {
+        self.lock().retain(|_, holder| *holder != xid);
     }
 
     pub fn holder(&self, id: RecordId) -> Option<Xid> {
-        self.write_locks.get(&id).copied()
+        self.lock().get(&id).copied()
     }
 }
 
@@ -87,7 +103,7 @@ mod tests {
 
     #[test]
     fn acquire_succeeds_when_free() {
-        let mut lm = LockManager::new();
+        let lm = LockManager::new();
         let r = RecordId::row(1, 0);
         assert!(lm.try_acquire_write(r, 1).is_ok());
         assert_eq!(lm.holder(r), Some(1));
@@ -95,7 +111,7 @@ mod tests {
 
     #[test]
     fn second_acquire_by_different_xid_conflicts() {
-        let mut lm = LockManager::new();
+        let lm = LockManager::new();
         let r = RecordId::row(1, 0);
         lm.try_acquire_write(r, 1).unwrap();
         let err = lm.try_acquire_write(r, 2);
@@ -104,7 +120,7 @@ mod tests {
 
     #[test]
     fn same_xid_reacquiring_is_idempotent() {
-        let mut lm = LockManager::new();
+        let lm = LockManager::new();
         let r = RecordId::row(1, 0);
         lm.try_acquire_write(r, 1).unwrap();
         assert!(lm.try_acquire_write(r, 1).is_ok());
@@ -112,7 +128,7 @@ mod tests {
 
     #[test]
     fn release_all_frees_locks_for_others() {
-        let mut lm = LockManager::new();
+        let lm = LockManager::new();
         let r = RecordId::row(1, 0);
         lm.try_acquire_write(r, 1).unwrap();
         lm.release_all(1);
@@ -122,7 +138,7 @@ mod tests {
 
     #[test]
     fn release_all_only_affects_the_given_xid() {
-        let mut lm = LockManager::new();
+        let lm = LockManager::new();
         let r1 = RecordId::row(1, 0);
         let r2 = RecordId::row(1, 1);
         lm.try_acquire_write(r1, 1).unwrap();
@@ -134,7 +150,7 @@ mod tests {
 
     #[test]
     fn different_kinds_or_ids_do_not_collide() {
-        let mut lm = LockManager::new();
+        let lm = LockManager::new();
         let a = RecordId::row(1, 0);
         let b = RecordId::row(1, 1);
         let c = RecordId::row(2, 0);
