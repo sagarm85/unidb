@@ -4,7 +4,7 @@
 > gap to a real database, and the phased path to close it. Correctness and
 > performance are gates, not features. Distills `CLAUDE.md` / `MEMORY.md` /
 > `PROGRESS.md` — when it disagrees with them, they win.
-> **Last updated: 2026-07-08.** Supersedes the earlier per-milestone backlog
+> **Last updated: 2026-07-09.** Supersedes the earlier per-milestone backlog
 > docs (now shipped and recorded in `PROGRESS.md`, or folded into a phase below).
 
 ---
@@ -111,6 +111,31 @@ Phase 6 delivers the single-node + read-replica target.
 [`phase5_concurrency.md`](phase5_concurrency.md) ·
 [`phase6_ops_ha.md`](phase6_ops_ha.md).
 
+**Phases 1–6 are all shipped** (see `PROGRESS.md` / `MEMORY.md`), plus the
+commit-time-fsync default (PR #24) and the Postgres baseline comparison (PR #25).
+The §2/§3 tables below predate the Phase 4–6 completions and are kept for
+historical shape — `MEMORY.md` is authoritative for current state.
+
+### 4.1 Next up — hardening items filed post-Phase-6
+
+Two engine (Core-lane) items filed from the **Postgres baseline comparison**
+(`pg_baseline_comparison.md`, PR #25) — the two honest gaps it surfaced. Both are
+`src/` work, each its own PR; neither reopens a §3 locked decision.
+
+| Item | Why (evidence) | Severity | Spec |
+|---|---|---|---|
+| **Durable FSM + O(1) table-page representation** | SQL bulk-load hits `HeapFull` at ~145k rows — the catalog stores `TableDef.pages` as an unbounded `Vec<PageId>` in a single-page JSON blob (O(heap-pages) cap). Raw insert is immune (builds 5M linearly). | **Correctness/scale** (a real ceiling, not perf) | [`durable_fsm_catalog_pagelist.md`](durable_fsm_catalog_pagelist.md) |
+| **Autovacuum** | Under 30× update churn, point reads degrade 6.8→35 µs with no autovacuum; a manual `Engine::vacuum()` restores 5.85 µs. Automation gap, not capability (M10 reclamation already exists). | **Perf/ops** (steady-state bloat) | [`autovacuum.md`](autovacuum.md) |
+
+Sequencing: the **durable FSM** is the higher-severity item (removes a hard cap
+and, done right, also kills the SQL path's per-statement FSM rebuild — it subsumes
+the cheap "cache the Heap" stopgap); ship it as a Core-lane checkpoint (F1 extents
+first → F2 durable FSM). **Autovacuum** is smaller (AV1 copies the existing
+`maybe_auto_checkpoint` trigger pattern, no new thread; AV2 promotes it to a
+background worker for the server) and can land in parallel — it touches
+vacuum/commit, disjoint from the FSM's catalog/page work, though both share
+free-space accounting and should not drift.
+
 ---
 
 ## 5. Parallel-worktree lane model
@@ -181,6 +206,20 @@ status, same discipline as M10.
 ---
 
 ## 8. Decision & session log (newest first)
+
+### 2026-07-09 — Postgres baseline comparison shipped; two hardening items filed
+- Ran the standard-vs-standard fitness check (unidb vs PostgreSQL 18.4, both as
+  shipped, both durability lenses; PR #25, `pg_baseline_comparison.md`). Verdict:
+  a **solid, SQLite-class-and-then-some foundation** — parity on durable commits
+  at matched F_FULLFSYNC durability, ~5× win on embedded point reads, concurrent
+  writes scale on both raw and SQL paths (refuting a filed prediction). Lens-1's
+  ~40× Postgres lead is a macOS `open_datasync` durability illusion.
+- Two honest gaps surfaced → filed as §4.1 Next-up items (both Core-lane, own PRs):
+  (1) **durable FSM + O(1) table-page representation** — the SQL bulk-load
+  `HeapFull` at ~145k rows is an O(heap-pages) catalog-blob cap (not the "lazy FSM"
+  the first pass claimed; corrected inline in `PROGRESS.md`/`MEMORY.md`),
+  `durable_fsm_catalog_pagelist.md`; (2) **autovacuum** — closes the churn/bloat
+  automation gap, `autovacuum.md`. Neither reopens a §3 decision.
 
 ### 2026-07-08 — Phase 3 P3.d (large-object storage) shipped
 - Large objects are stored **out-of-line, chunked (~7 KiB), and streamed**: a
