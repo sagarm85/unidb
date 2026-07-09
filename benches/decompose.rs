@@ -545,10 +545,170 @@ fn pg_churn_bench(
     });
 }
 
+// -------------------------- B3: concurrency --------------------------------
+
+/// unidb raw-CRUD writers: N threads over one `Arc<Engine>`, each committing
+/// `per_thread` single-row insert transactions. Returns committed txns/sec.
+/// This is the path that scales (heap page latches + group commit).
+fn unidb_raw_concurrency(writers: usize, per_thread: usize) -> f64 {
+    let dir = tempdir().unwrap();
+    let engine = Arc::new(Engine::open(dir.path(), 0).unwrap());
+    let barrier = Arc::new(Barrier::new(writers + 1));
+    let committed = Arc::new(AtomicUsize::new(0));
+    let payload = [0xABu8; 64];
+    let mut handles = Vec::new();
+    for _ in 0..writers {
+        let (engine, barrier, committed) = (engine.clone(), barrier.clone(), committed.clone());
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            for _ in 0..per_thread {
+                let xid = engine.begin().unwrap();
+                engine.insert(xid, &payload).unwrap();
+                engine.commit(xid).unwrap();
+            }
+            committed.fetch_add(per_thread, Ordering::Relaxed);
+        }));
+    }
+    barrier.wait();
+    let start = Instant::now();
+    for h in handles {
+        h.join().unwrap();
+    }
+    committed.load(Ordering::Relaxed) as f64 / start.elapsed().as_secs_f64()
+}
+
+/// unidb SQL writers: N threads over one `Arc<Engine>`, each committing
+/// `per_thread` single-row SQL INSERTs. This is the path the spec predicts
+/// will NOT scale — every `execute_sql` takes the catalog RwLock in write mode
+/// (documented Phase 5 limitation). Recorded regardless.
+fn unidb_sql_concurrency(writers: usize, per_thread: usize) -> f64 {
+    let dir = tempdir().unwrap();
+    let engine = Arc::new(Engine::open(dir.path(), 0).unwrap());
+    let x = engine.begin().unwrap();
+    engine
+        .execute_sql(x, "CREATE TABLE t (id INT, body TEXT)")
+        .unwrap();
+    engine.commit(x).unwrap();
+    let barrier = Arc::new(Barrier::new(writers + 1));
+    let committed = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::new();
+    for w in 0..writers {
+        let (engine, barrier, committed) = (engine.clone(), barrier.clone(), committed.clone());
+        handles.push(thread::spawn(move || {
+            let ins = engine
+                .prepare("INSERT INTO t (id, body) VALUES ($1, $2)")
+                .unwrap();
+            barrier.wait();
+            for i in 0..per_thread {
+                let id = (w * per_thread + i) as i64;
+                let xid = engine.begin().unwrap();
+                engine
+                    .execute_prepared(
+                        xid,
+                        &ins,
+                        &[Literal::Int(id), Literal::Text(format!("b{id}"))],
+                    )
+                    .unwrap();
+                engine.commit(xid).unwrap();
+            }
+            committed.fetch_add(per_thread, Ordering::Relaxed);
+        }));
+    }
+    barrier.wait();
+    let start = Instant::now();
+    for h in handles {
+        h.join().unwrap();
+    }
+    committed.load(Ordering::Relaxed) as f64 / start.elapsed().as_secs_f64()
+}
+
+/// Postgres writers: N connections, each committing `per_thread` autocommit
+/// single-row INSERTs (durable — lens 2). Returns committed txns/sec.
+fn pg_concurrency(url: &str, writers: usize, per_thread: usize) -> Option<f64> {
+    // Fresh table under lens 2.
+    let (mut admin, _) = pg_open_lens(url, true)?;
+    admin
+        .batch_execute("DROP TABLE IF EXISTS c; CREATE TABLE c (id INT, body TEXT)")
+        .unwrap();
+    drop(admin);
+    let barrier = Arc::new(Barrier::new(writers + 1));
+    let committed = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::new();
+    for w in 0..writers {
+        let (url, barrier, committed) = (url.to_string(), barrier.clone(), committed.clone());
+        handles.push(thread::spawn(move || {
+            let mut client = Client::connect(&url, NoTls).unwrap();
+            let stmt = client
+                .prepare("INSERT INTO c (id, body) VALUES ($1, $2)")
+                .unwrap();
+            barrier.wait();
+            for i in 0..per_thread {
+                let id = (w * per_thread + i) as i32;
+                client.execute(&stmt, &[&id, &format!("b{id}")]).unwrap();
+            }
+            committed.fetch_add(per_thread, Ordering::Relaxed);
+        }));
+    }
+    barrier.wait();
+    let start = Instant::now();
+    for h in handles {
+        h.join().unwrap();
+    }
+    Some(committed.load(Ordering::Relaxed) as f64 / start.elapsed().as_secs_f64())
+}
+
+/// B3: concurrent-writer scaling at N ∈ {1,2,4,8}. Prints its own table (this
+/// is the checkpoint most likely to produce the unflattering unidb-SQL number;
+/// it ships regardless — spec prediction 3). Postgres columns are lens 2.
+fn bench_pg_concurrency() {
+    const PER: usize = 500;
+    let url = pg_url();
+    println!("\n=== B3: concurrent writers (commits/sec, higher is better) ===");
+    if url.is_none() {
+        println!("[pg] PG_URL unset — Postgres column skipped, unidb only");
+    } else {
+        println!("[pg] Postgres under lens 2 (fsync_writethrough)");
+    }
+    println!(
+        "{:>6}  {:>16}  {:>16}  {:>16}",
+        "N", "unidb_raw", "unidb_sql", "postgres"
+    );
+    let (mut raw_base, mut sql_base, mut pg_base) = (0.0f64, 0.0f64, 0.0f64);
+    for &n in &[1usize, 2, 4, 8] {
+        let raw = unidb_raw_concurrency(n, PER);
+        let sql = unidb_sql_concurrency(n, PER);
+        let pg = url.as_deref().and_then(|u| pg_concurrency(u, n, PER));
+        if n == 1 {
+            raw_base = raw;
+            sql_base = sql;
+            pg_base = pg.unwrap_or(0.0);
+        }
+        let fmt = |v: f64, base: f64| {
+            if base > 0.0 {
+                format!("{v:>10.0} ({:.2}x)", v / base)
+            } else {
+                format!("{v:>10.0}")
+            }
+        };
+        let pg_s = match pg {
+            Some(v) => fmt(v, pg_base),
+            None => "        n/a".to_string(),
+        };
+        println!(
+            "{:>6}  {:>16}  {:>16}  {:>16}",
+            n,
+            fmt(raw, raw_base),
+            fmt(sql, sql_base),
+            pg_s
+        );
+    }
+}
+
 fn main() {
     let mut criterion = Criterion::default().configure_from_args();
     bench_ladder(&mut criterion);
     bench_pg_ladder(&mut criterion);
     bench_pg_crud(&mut criterion);
     criterion.final_summary();
+    bench_pg_concurrency();
 }
