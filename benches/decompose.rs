@@ -21,7 +21,13 @@
 //
 // Run with: cargo bench --bench decompose
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use criterion::{BenchmarkId, Criterion, Throughput};
+use postgres::{Client, NoTls};
 use rusqlite::Connection;
 use tempfile::tempdir;
 use unidb::sql::logical::Literal;
@@ -29,6 +35,9 @@ use unidb::Engine;
 
 const DIM: usize = 128;
 const ROWS: u64 = 100;
+
+/// Table size for the keyed CRUD tests (point SELECT / UPDATE / churn).
+const KEYED_ROWS: u64 = 1_000;
 
 fn embedding(seed: u64) -> Vec<f32> {
     (0..DIM)
@@ -166,5 +175,657 @@ fn bench_ladder(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_ladder);
-criterion_main!(benches);
+// ---------------------------------------------------------------------------
+// Postgres baseline comparison (spec: docs/backlog/pg_baseline_comparison.md).
+//
+// A fitness check — engine vs engine, both as shipped, on the CRUD both can do.
+// PG_URL-gated: when unset, every Postgres path logs a skip line and returns, so
+// a plain `cargo bench` is unaffected. When set, we report TWO durability lenses
+// side by side, never one alone (the spec's core honesty rule):
+//
+//   lens 1 "default"  — wal_sync_method = open_datasync (macOS PG default, NOT
+//                       flush-to-platter durable on macOS)
+//   lens 2 "durable"  — wal_sync_method = fsync_writethrough (F_FULLFSYNC),
+//                       matching unidb's Rust File::sync_all default. Headline
+//                       numbers come from this lens.
+//
+// wal_sync_method is a `sighup` GUC (not settable per-session), so we flip it
+// server-wide via ALTER SYSTEM + pg_reload_conf() (superuser; native local
+// setup) and VERIFY it took effect with SHOW — the printed bench id carries the
+// actual method in force, so a mislabelled number is impossible.
+// ---------------------------------------------------------------------------
+
+/// The `PG_URL` connection string, or `None` (→ skip the Postgres paths).
+fn pg_url() -> Option<String> {
+    std::env::var("PG_URL").ok()
+}
+
+fn pg_connect(url: &str) -> Option<Client> {
+    match Client::connect(url, NoTls) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!("  [pg] WARNING: PG_URL set but connect failed ({e}) — skipping");
+            None
+        }
+    }
+}
+
+/// Flip the server-wide durability lens, then open a fresh work connection that
+/// is guaranteed to observe the reloaded setting. Returns `(client, method)`
+/// where `method` is the `wal_sync_method` actually in force (verified). `None`
+/// on any failure (unreachable, or non-superuser → ALTER SYSTEM denied), after
+/// logging — the caller then skips this config cleanly.
+fn pg_open_lens(url: &str, durable: bool) -> Option<(Client, String)> {
+    let want = if durable {
+        "fsync_writethrough"
+    } else {
+        "open_datasync"
+    };
+    let mut admin = pg_connect(url)?;
+    if let Err(e) = admin.batch_execute(&format!("ALTER SYSTEM SET wal_sync_method = '{want}'")) {
+        eprintln!("  [pg] WARNING: ALTER SYSTEM denied ({e}) — need superuser; skipping lens");
+        return None;
+    }
+    admin.batch_execute("SELECT pg_reload_conf()").ok()?;
+    drop(admin);
+    // pg_reload_conf() signals the postmaster; a *fresh* backend is the reliable
+    // way to read the applied value. Small settle delay first.
+    thread::sleep(Duration::from_millis(600));
+    let mut client = pg_connect(url)?;
+    let actual: String = client.query_one("SHOW wal_sync_method", &[]).ok()?.get(0);
+    if actual != want {
+        eprintln!("  [pg] WARNING: wanted wal_sync_method={want}, got {actual} — labelling actual");
+    }
+    Some((client, actual))
+}
+
+// ------------------------------ B1: ladder ---------------------------------
+
+/// One Postgres ladder iteration: TRUNCATE, then `n` autocommit single-row
+/// INSERTs via a prepared statement (each its own durable transaction — matches
+/// unidb's per-row begin/insert/commit). Schema is created once by the caller.
+fn pg_run_ladder(client: &mut Client, stmt: &postgres::Statement, n: u64) {
+    client.batch_execute("TRUNCATE t").unwrap();
+    for i in 0..n {
+        client
+            .execute(stmt, &[&(i as i32), &format!("body-{i}")])
+            .unwrap();
+    }
+}
+
+/// Register the four B1 configs (pg_w0/w1 × default/durable) plus the unidb W0/W1
+/// counterparts re-measured here so the group reads side by side.
+fn bench_pg_ladder(c: &mut Criterion) {
+    let Some(url) = pg_url() else {
+        eprintln!("[pg] PG_URL unset — skipping Postgres ladder (B1)");
+        return;
+    };
+    let mut group = c.benchmark_group("pg_ladder");
+    group.sample_size(10);
+    group.throughput(Throughput::Elements(ROWS));
+
+    // unidb side (as-shipped default = group-committed force-log-at-commit).
+    for (name, rung) in [("unidb_w0", 0u8), ("unidb_w1", 1u8)] {
+        group.bench_function(BenchmarkId::new(name, ROWS), |b| {
+            b.iter(|| run_unidb_rung(rung, false, ROWS));
+        });
+    }
+
+    // Postgres side, both lenses. w0 = PRIMARY KEY table (spec: a PG table always
+    // has a PK); w1 = + a secondary btree, so w1-w0 = secondary-index maintenance.
+    for (name, durable, with_index) in [
+        ("pg_w0_default", false, false),
+        ("pg_w1_default", false, true),
+        ("pg_w0_durable", true, false),
+        ("pg_w1_durable", true, true),
+    ] {
+        let Some((mut client, method)) = pg_open_lens(&url, durable) else {
+            continue;
+        };
+        client
+            .batch_execute("DROP TABLE IF EXISTS t; CREATE TABLE t (id INT PRIMARY KEY, body TEXT)")
+            .unwrap();
+        if with_index {
+            client.batch_execute("CREATE INDEX ib ON t (body)").unwrap();
+        }
+        let stmt = client
+            .prepare("INSERT INTO t (id, body) VALUES ($1, $2)")
+            .unwrap();
+        group.bench_function(BenchmarkId::new(format!("{name} [{method}]"), ROWS), |b| {
+            b.iter(|| pg_run_ladder(&mut client, &stmt, ROWS));
+        });
+    }
+    group.finish();
+}
+
+// ------------------------------ B2: CRUD -----------------------------------
+
+/// Build a keyed unidb table of `n` rows with a BTREE index on `id`; return the
+/// engine (kept alive by the caller) plus a prepared point-SELECT.
+fn unidb_build_keyed(dir: &std::path::Path, n: u64) -> Engine {
+    let engine = Engine::open(dir, 0).unwrap();
+    let x = engine.begin().unwrap();
+    engine
+        .execute_sql(x, "CREATE TABLE t (id INT, body TEXT)")
+        .unwrap();
+    engine
+        .execute_sql(x, "CREATE INDEX ib ON t USING BTREE (id)")
+        .unwrap();
+    engine.commit(x).unwrap();
+    // Bulk-load in BATCHED transactions — the size sweep builds tables of up to
+    // millions of rows. Per-row durable commit (~3.5 ms each) would take hours;
+    // one giant transaction overflows the heap's per-statement FSM at ~1e5+ rows
+    // (a documented SQL-path bulk-insert limitation). Batching (commit every
+    // BATCH rows) is both fast and correct — load speed is not what any keyed
+    // test measures.
+    const BATCH: u64 = 2_000;
+    let ins = engine
+        .prepare("INSERT INTO t (id, body) VALUES ($1, $2)")
+        .unwrap();
+    let mut x = engine.begin().unwrap();
+    for i in 0..n {
+        engine
+            .execute_prepared(
+                x,
+                &ins,
+                &[Literal::Int(i as i64), Literal::Text(format!("b{i}"))],
+            )
+            .unwrap();
+        if (i + 1) % BATCH == 0 {
+            engine.commit(x).unwrap();
+            x = engine.begin().unwrap();
+        }
+    }
+    engine.commit(x).unwrap();
+    engine
+}
+
+/// Build a keyed Postgres table of `n` rows (PK on id) via a fast bulk load
+/// (one transaction) — table content, not load speed, is what this sets up.
+fn pg_build_keyed(client: &mut Client, n: u64) {
+    client
+        .batch_execute("DROP TABLE IF EXISTS t; CREATE TABLE t (id INT PRIMARY KEY, body TEXT)")
+        .unwrap();
+    let stmt = client
+        .prepare("INSERT INTO t (id, body) VALUES ($1, $2)")
+        .unwrap();
+    let mut txn = client.transaction().unwrap();
+    for i in 0..n {
+        txn.execute(&stmt, &[&(i as i32), &format!("b{i}")])
+            .unwrap();
+    }
+    txn.commit().unwrap();
+}
+
+/// B2: point SELECT by key, MVCC UPDATE, and churn-then-remeasure — unidb vs
+/// both Postgres lenses. Reads don't fsync, so the lens is irrelevant to SELECT
+/// throughput (we still run under lens 2, the matched-durability environment,
+/// and note it); UPDATE and the churn re-measure are durability-sensitive.
+fn bench_pg_crud(c: &mut Criterion) {
+    let Some(url) = pg_url() else {
+        eprintln!("[pg] PG_URL unset — skipping Postgres CRUD suite (B2)");
+        return;
+    };
+    let mut group = c.benchmark_group("pg_crud");
+    group.sample_size(20);
+    group.throughput(Throughput::Elements(1));
+
+    // ---- unidb (embedded, as-shipped default) ----
+    let udir = tempdir().unwrap();
+    let engine = unidb_build_keyed(udir.path(), KEYED_ROWS);
+    let sel = engine
+        .prepare("SELECT id, body FROM t WHERE id = $1")
+        .unwrap();
+    let upd = engine
+        .prepare("UPDATE t SET body = $1 WHERE id = $2")
+        .unwrap();
+    // point SELECT by key (embedded index path — the no-IPC advantage)
+    group.bench_function("unidb_point_select", |b| {
+        let mut i = 0u64;
+        b.iter(|| {
+            let x = engine.begin().unwrap();
+            let key = (i % KEYED_ROWS) as i64;
+            engine
+                .execute_prepared(x, &sel, &[Literal::Int(key)])
+                .unwrap();
+            engine.commit(x).unwrap();
+            i += 1;
+        });
+    });
+    // MVCC UPDATE by key (new version + xmax stamp)
+    group.bench_function("unidb_update", |b| {
+        let mut i = 0u64;
+        b.iter(|| {
+            let x = engine.begin().unwrap();
+            let key = (i % KEYED_ROWS) as i64;
+            engine
+                .execute_prepared(
+                    x,
+                    &upd,
+                    &[Literal::Text(format!("u{i}")), Literal::Int(key)],
+                )
+                .unwrap();
+            engine.commit(x).unwrap();
+            i += 1;
+        });
+    });
+    drop(sel);
+    drop(upd);
+    drop(engine);
+    drop(udir);
+
+    // ---- unidb churn: read latency fresh vs after heavy update churn, and
+    // after a manual VACUUM (M10) — the bloat-management maturity check ----
+    unidb_churn_bench(&mut group);
+
+    // ---- Postgres (lens 2, matched durability) ----
+    let Some((mut client, method)) = pg_open_lens(&url, true) else {
+        group.finish();
+        return;
+    };
+    eprintln!("[pg] CRUD suite running under wal_sync_method={method} (lens 2)");
+    pg_build_keyed(&mut client, KEYED_ROWS);
+    let sel = client
+        .prepare("SELECT id, body FROM t WHERE id = $1")
+        .unwrap();
+    let upd = client
+        .prepare("UPDATE t SET body = $1 WHERE id = $2")
+        .unwrap();
+    group.bench_function(format!("pg_point_select [{method}]"), |b| {
+        let mut i = 0i32;
+        b.iter(|| {
+            let key = i % KEYED_ROWS as i32;
+            client.query(&sel, &[&key]).unwrap();
+            i += 1;
+        });
+    });
+    group.bench_function(format!("pg_update [{method}]"), |b| {
+        let mut i = 0i32;
+        b.iter(|| {
+            let key = i % KEYED_ROWS as i32;
+            client.execute(&upd, &[&format!("u{i}"), &key]).unwrap();
+            i += 1;
+        });
+    });
+    pg_churn_bench(&mut group, &mut client, &method);
+    group.finish();
+}
+
+/// unidb churn: measure point-read latency on a fresh table, then after
+/// `CHURN_ROUNDS` full-table update passes (heavy version accumulation), then
+/// after a manual `Engine::vacuum()`. Fresh vs churned exposes MVCC bloat;
+/// churned vs vacuumed shows M10 reclaiming it.
+fn unidb_churn_bench(group: &mut criterion::BenchmarkGroup<criterion::measurement::WallTime>) {
+    const CHURN_ROUNDS: u64 = 30;
+    let dir = tempdir().unwrap();
+    let engine = unidb_build_keyed(dir.path(), KEYED_ROWS);
+    let sel = engine
+        .prepare("SELECT id, body FROM t WHERE id = $1")
+        .unwrap();
+    let read = |i: &mut u64| {
+        let x = engine.begin().unwrap();
+        let key = (*i % KEYED_ROWS) as i64;
+        engine
+            .execute_prepared(x, &sel, &[Literal::Int(key)])
+            .unwrap();
+        engine.commit(x).unwrap();
+        *i += 1;
+    };
+
+    group.bench_function("unidb_read_fresh", |b| {
+        let mut i = 0u64;
+        b.iter(|| read(&mut i));
+    });
+
+    // Heavy update churn: rewrite every row CHURN_ROUNDS times.
+    let upd = engine
+        .prepare("UPDATE t SET body = $1 WHERE id = $2")
+        .unwrap();
+    for r in 0..CHURN_ROUNDS {
+        for k in 0..KEYED_ROWS {
+            let x = engine.begin().unwrap();
+            engine
+                .execute_prepared(
+                    x,
+                    &upd,
+                    &[Literal::Text(format!("c{r}-{k}")), Literal::Int(k as i64)],
+                )
+                .unwrap();
+            engine.commit(x).unwrap();
+        }
+    }
+    group.bench_function("unidb_read_after_churn", |b| {
+        let mut i = 0u64;
+        b.iter(|| read(&mut i));
+    });
+
+    engine.vacuum().unwrap();
+    group.bench_function("unidb_read_after_vacuum", |b| {
+        let mut i = 0u64;
+        b.iter(|| read(&mut i));
+    });
+}
+
+/// Postgres churn: same shape (fresh read, then heavy update churn with
+/// autovacuum on, then re-measure). No manual VACUUM — autovacuum is the point.
+fn pg_churn_bench(
+    group: &mut criterion::BenchmarkGroup<criterion::measurement::WallTime>,
+    client: &mut Client,
+    method: &str,
+) {
+    const CHURN_ROUNDS: u64 = 30;
+    pg_build_keyed(client, KEYED_ROWS);
+    let sel = client
+        .prepare("SELECT id, body FROM t WHERE id = $1")
+        .unwrap();
+    group.bench_function(format!("pg_read_fresh [{method}]"), |b| {
+        let mut i = 0i32;
+        b.iter(|| {
+            let key = i % KEYED_ROWS as i32;
+            client.query(&sel, &[&key]).unwrap();
+            i += 1;
+        });
+    });
+
+    let upd = client
+        .prepare("UPDATE t SET body = $1 WHERE id = $2")
+        .unwrap();
+    for r in 0..CHURN_ROUNDS {
+        for k in 0..KEYED_ROWS as i32 {
+            client.execute(&upd, &[&format!("c{r}-{k}"), &k]).unwrap();
+        }
+    }
+    group.bench_function(format!("pg_read_after_churn [{method}]"), |b| {
+        let mut i = 0i32;
+        b.iter(|| {
+            let key = i % KEYED_ROWS as i32;
+            client.query(&sel, &[&key]).unwrap();
+            i += 1;
+        });
+    });
+}
+
+// -------------------------- B3: concurrency --------------------------------
+
+/// unidb raw-CRUD writers: N threads over one `Arc<Engine>`, each committing
+/// `per_thread` single-row insert transactions. Returns committed txns/sec.
+/// This is the path that scales (heap page latches + group commit).
+fn unidb_raw_concurrency(writers: usize, per_thread: usize) -> f64 {
+    let dir = tempdir().unwrap();
+    let engine = Arc::new(Engine::open(dir.path(), 0).unwrap());
+    let barrier = Arc::new(Barrier::new(writers + 1));
+    let committed = Arc::new(AtomicUsize::new(0));
+    let payload = [0xABu8; 64];
+    let mut handles = Vec::new();
+    for _ in 0..writers {
+        let (engine, barrier, committed) = (engine.clone(), barrier.clone(), committed.clone());
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            for _ in 0..per_thread {
+                let xid = engine.begin().unwrap();
+                engine.insert(xid, &payload).unwrap();
+                engine.commit(xid).unwrap();
+            }
+            committed.fetch_add(per_thread, Ordering::Relaxed);
+        }));
+    }
+    barrier.wait();
+    let start = Instant::now();
+    for h in handles {
+        h.join().unwrap();
+    }
+    committed.load(Ordering::Relaxed) as f64 / start.elapsed().as_secs_f64()
+}
+
+/// unidb SQL writers: N threads over one `Arc<Engine>`, each committing
+/// `per_thread` single-row SQL INSERTs. This is the path the spec predicts
+/// will NOT scale — every `execute_sql` takes the catalog RwLock in write mode
+/// (documented Phase 5 limitation). Recorded regardless.
+fn unidb_sql_concurrency(writers: usize, per_thread: usize) -> f64 {
+    let dir = tempdir().unwrap();
+    let engine = Arc::new(Engine::open(dir.path(), 0).unwrap());
+    let x = engine.begin().unwrap();
+    engine
+        .execute_sql(x, "CREATE TABLE t (id INT, body TEXT)")
+        .unwrap();
+    engine.commit(x).unwrap();
+    let barrier = Arc::new(Barrier::new(writers + 1));
+    let committed = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::new();
+    for w in 0..writers {
+        let (engine, barrier, committed) = (engine.clone(), barrier.clone(), committed.clone());
+        handles.push(thread::spawn(move || {
+            let ins = engine
+                .prepare("INSERT INTO t (id, body) VALUES ($1, $2)")
+                .unwrap();
+            barrier.wait();
+            for i in 0..per_thread {
+                let id = (w * per_thread + i) as i64;
+                let xid = engine.begin().unwrap();
+                engine
+                    .execute_prepared(
+                        xid,
+                        &ins,
+                        &[Literal::Int(id), Literal::Text(format!("b{id}"))],
+                    )
+                    .unwrap();
+                engine.commit(xid).unwrap();
+            }
+            committed.fetch_add(per_thread, Ordering::Relaxed);
+        }));
+    }
+    barrier.wait();
+    let start = Instant::now();
+    for h in handles {
+        h.join().unwrap();
+    }
+    committed.load(Ordering::Relaxed) as f64 / start.elapsed().as_secs_f64()
+}
+
+/// Postgres writers: N connections, each committing `per_thread` autocommit
+/// single-row INSERTs (durable — lens 2). Returns committed txns/sec.
+fn pg_concurrency(url: &str, writers: usize, per_thread: usize) -> Option<f64> {
+    // Fresh table under lens 2.
+    let (mut admin, _) = pg_open_lens(url, true)?;
+    admin
+        .batch_execute("DROP TABLE IF EXISTS c; CREATE TABLE c (id INT, body TEXT)")
+        .unwrap();
+    drop(admin);
+    let barrier = Arc::new(Barrier::new(writers + 1));
+    let committed = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::new();
+    for w in 0..writers {
+        let (url, barrier, committed) = (url.to_string(), barrier.clone(), committed.clone());
+        handles.push(thread::spawn(move || {
+            let mut client = Client::connect(&url, NoTls).unwrap();
+            let stmt = client
+                .prepare("INSERT INTO c (id, body) VALUES ($1, $2)")
+                .unwrap();
+            barrier.wait();
+            for i in 0..per_thread {
+                let id = (w * per_thread + i) as i32;
+                client.execute(&stmt, &[&id, &format!("b{id}")]).unwrap();
+            }
+            committed.fetch_add(per_thread, Ordering::Relaxed);
+        }));
+    }
+    barrier.wait();
+    let start = Instant::now();
+    for h in handles {
+        h.join().unwrap();
+    }
+    Some(committed.load(Ordering::Relaxed) as f64 / start.elapsed().as_secs_f64())
+}
+
+/// B3: concurrent-writer scaling at N ∈ {1,2,4,8}. Prints its own table (this
+/// is the checkpoint most likely to produce the unflattering unidb-SQL number;
+/// it ships regardless — spec prediction 3). Postgres columns are lens 2.
+fn bench_pg_concurrency() {
+    const PER: usize = 500;
+    let url = pg_url();
+    println!("\n=== B3: concurrent writers (commits/sec, higher is better) ===");
+    if url.is_none() {
+        println!("[pg] PG_URL unset — Postgres column skipped, unidb only");
+    } else {
+        println!("[pg] Postgres under lens 2 (fsync_writethrough)");
+    }
+    println!(
+        "{:>6}  {:>16}  {:>16}  {:>16}",
+        "N", "unidb_raw", "unidb_sql", "postgres"
+    );
+    let (mut raw_base, mut sql_base, mut pg_base) = (0.0f64, 0.0f64, 0.0f64);
+    for &n in &[1usize, 2, 4, 8] {
+        let raw = unidb_raw_concurrency(n, PER);
+        let sql = unidb_sql_concurrency(n, PER);
+        let pg = url.as_deref().and_then(|u| pg_concurrency(u, n, PER));
+        if n == 1 {
+            raw_base = raw;
+            sql_base = sql;
+            pg_base = pg.unwrap_or(0.0);
+        }
+        let fmt = |v: f64, base: f64| {
+            if base > 0.0 {
+                format!("{v:>10.0} ({:.2}x)", v / base)
+            } else {
+                format!("{v:>10.0}")
+            }
+        };
+        let pg_s = match pg {
+            Some(v) => fmt(v, pg_base),
+            None => "        n/a".to_string(),
+        };
+        println!(
+            "{:>6}  {:>16}  {:>16}  {:>16}",
+            n,
+            fmt(raw, raw_base),
+            fmt(sql, sql_base),
+            pg_s
+        );
+    }
+}
+
+// --------------------------- B4: size sweep --------------------------------
+
+/// B4: does anything bend with table size? Build to size S via bulk load, then
+/// measure marginal durable-insert throughput and point-read latency at that
+/// size, for both engines. Sizes are env-overridable (`PG_SWEEP_SIZES`, comma
+/// list) so a plain `cargo bench` stays quick; the script drives the full run.
+fn bench_size_sweep() {
+    let sizes: Vec<u64> = std::env::var("PG_SWEEP_SIZES")
+        .ok()
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![10_000, 100_000]);
+    let url = pg_url();
+    println!("\n=== B4: size sweep (insert µs/op, point-read µs/op) ===");
+    if url.is_none() {
+        println!("[pg] PG_URL unset — Postgres columns skipped, unidb only");
+    }
+    println!(
+        "{:>10}  {:>22}  {:>22}",
+        "rows", "unidb ins/read µs", "pg ins/read µs (lens2)"
+    );
+    // Set lens 2 once for the whole sweep.
+    let mut pg_lens: Option<(Client, String)> = url.as_deref().and_then(|u| pg_open_lens(u, true));
+    for &s in &sizes {
+        let (u_ins, u_read) = unidb_sweep_point(s);
+        let pg_cell = match pg_lens.as_mut() {
+            Some((client, _)) => {
+                let (p_ins, p_read) = pg_sweep_point(client, s);
+                format!("{p_ins:>9.1} / {p_read:>9.1}")
+            }
+            None => "            n/a".to_string(),
+        };
+        println!(
+            "{:>10}  {:>9.1} / {:>9.1}      {:>22}",
+            s, u_ins, u_read, pg_cell
+        );
+    }
+}
+
+const SWEEP_SAMPLE: u64 = 200;
+
+/// Build a unidb heap of `size` rows via the RAW CRUD path, then return
+/// (marginal durable insert µs/op, point-read µs/op) at that size.
+///
+/// Why the raw path (not SQL) here: this test *is* the P1.c flatness claim
+/// (`benches/scale.rs`), and the SQL insert path's per-statement lazy FSM caps
+/// bulk SQL loads at ~145k rows in one transaction (a documented limitation —
+/// `Engine::insert` keeps the FSM warm and scales, SQL does not). Point reads
+/// are raw `get(row_id)` — the embedded no-IPC read compared against Postgres's
+/// keyed SELECT. Load itself is batched (undo/WAL bounded); the *measured* ops
+/// are per-row durable.
+fn unidb_sweep_point(size: u64) -> (f64, f64) {
+    const BATCH: u64 = 5_000;
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
+    let mut rids = Vec::with_capacity(size as usize);
+    let mut x = engine.begin().unwrap();
+    for i in 0..size {
+        rids.push(engine.insert(x, &i.to_le_bytes()).unwrap());
+        if (i + 1) % BATCH == 0 {
+            engine.commit(x).unwrap();
+            x = engine.begin().unwrap();
+        }
+    }
+    engine.commit(x).unwrap();
+
+    // marginal durable insert throughput at this size
+    let start = Instant::now();
+    for j in 0..SWEEP_SAMPLE {
+        let x = engine.begin().unwrap();
+        engine.insert(x, &(size + j).to_le_bytes()).unwrap();
+        engine.commit(x).unwrap();
+    }
+    let ins_us = start.elapsed().as_micros() as f64 / SWEEP_SAMPLE as f64;
+
+    // point read (embedded get by row id) at this size
+    let step = (size / SWEEP_SAMPLE).max(1);
+    let start = Instant::now();
+    for j in 0..SWEEP_SAMPLE {
+        let rid = rids[((j * step) % size) as usize];
+        let x = engine.begin().unwrap();
+        engine.get(x, rid).unwrap();
+        engine.commit(x).unwrap();
+    }
+    let read_us = start.elapsed().as_micros() as f64 / SWEEP_SAMPLE as f64;
+    (ins_us, read_us)
+}
+
+/// Same for Postgres (lens set by the caller). Bulk-builds to `size`, then
+/// measures marginal durable insert + point read.
+fn pg_sweep_point(client: &mut Client, size: u64) -> (f64, f64) {
+    pg_build_keyed(client, size);
+    let ins = client
+        .prepare("INSERT INTO t (id, body) VALUES ($1, $2)")
+        .unwrap();
+    let start = Instant::now();
+    for j in 0..SWEEP_SAMPLE {
+        let id = (size + j) as i32;
+        client.execute(&ins, &[&id, &format!("b{id}")]).unwrap();
+    }
+    let ins_us = start.elapsed().as_micros() as f64 / SWEEP_SAMPLE as f64;
+    let sel = client
+        .prepare("SELECT id, body FROM t WHERE id = $1")
+        .unwrap();
+    let start = Instant::now();
+    for j in 0..SWEEP_SAMPLE {
+        let key = (j * (size / SWEEP_SAMPLE).max(1)) as i32 % size as i32;
+        client.query(&sel, &[&key]).unwrap();
+    }
+    let read_us = start.elapsed().as_micros() as f64 / SWEEP_SAMPLE as f64;
+    (ins_us, read_us)
+}
+
+fn main() {
+    // Criterion-measured groups: the ladder (existing) + B1 pg ladder + B2 CRUD.
+    let mut criterion = Criterion::default().configure_from_args();
+    bench_ladder(&mut criterion);
+    bench_pg_ladder(&mut criterion);
+    bench_pg_crud(&mut criterion);
+    criterion.final_summary();
+
+    // Manual throughput sweeps that print their own tables: B3 concurrency, B4
+    // size sweep. Skipped-Postgres-column handling is internal.
+    bench_pg_concurrency();
+    bench_size_sweep();
+}
