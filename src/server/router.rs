@@ -76,13 +76,29 @@ pub fn build_router(
             jwt_config,
             crate::server::auth::require_jwt,
         ))
-        .with_state(state);
+        .with_state(state.clone());
 
+    // `/metrics` (P6.g): the axum-prometheus HTTP metrics plus the app-level
+    // autovacuum gauges (A4), refreshed from `Engine::stats()` on each scrape so
+    // a Prometheus target sees dead-tuple pressure, run count, and last-run time.
+    let metrics_state = state;
     let public = Router::new().route(
         "/metrics",
         get(move || {
             let handle = metric_handle.clone();
-            async move { handle.render() }
+            let state = metrics_state.clone();
+            async move {
+                if let Ok(stats) = state.engine.stats().await {
+                    metrics::gauge!("unidb_autovacuum_runs_total").set(stats.autovacuums as f64);
+                    metrics::gauge!("unidb_dead_tuple_estimate")
+                        .set(stats.dead_tuple_estimate as f64);
+                    metrics::gauge!("unidb_live_tuple_estimate")
+                        .set(stats.live_tuple_estimate as f64);
+                    metrics::gauge!("unidb_autovacuum_last_run_epoch_secs")
+                        .set(stats.last_autovacuum_epoch_secs as f64);
+                }
+                handle.render()
+            }
         }),
     );
 

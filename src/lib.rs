@@ -39,6 +39,10 @@
 
 pub mod audit;
 pub mod authz;
+/// Autovacuum (A3) — the background launcher thread that auto-triggers the
+/// existing M10 `Engine::vacuum`. See the module doc for why concurrent
+/// background vacuum needs no new locking.
+pub mod autovacuum;
 pub mod backup;
 pub mod btree_index;
 pub mod bufferpool;
@@ -136,6 +140,14 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn env_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(default)
+}
+
 /// Auto-checkpoint policy (P1.e). A checkpoint bounds WAL growth (and the P1.a
 /// full-page-image volume); before P1.e it was manual-only, so the WAL grew
 /// unbounded. The engine runs the existing checkpoint path inline on the writer
@@ -161,6 +173,59 @@ impl Default for AutoCheckpointConfig {
             timeout: Duration::from_secs(env_u64("UNIDB_CHECKPOINT_TIMEOUT_SECS", 60)),
             max_wal_size: env_u64("UNIDB_MAX_WAL_SIZE_BYTES", 64 * 1024 * 1024),
         }
+    }
+}
+
+/// Autovacuum policy (A2), mirroring [`AutoCheckpointConfig`]'s shape and its
+/// auto-trigger precedent (P1.e). A background thread (A3) wakes every
+/// `naptime`, and when the Postgres-style trigger fires
+///
+/// ```text
+/// dead_tuple_estimate > threshold + scale_factor * live_tuple_estimate
+/// ```
+///
+/// it calls the existing, already-safe [`Engine::vacuum`] (M10) — autovacuum
+/// only auto-*triggers* reclamation; it does not re-implement it, nor touch the
+/// vacuum horizon (which stays correct under concurrency, P5.c, and pinned by
+/// replication slots, P6.b). Default on with conservative Postgres-like
+/// thresholds so an idle or light workload never triggers it.
+#[derive(Debug, Clone, Copy)]
+pub struct AutoVacuumConfig {
+    /// Master switch. Defaults on (env `UNIDB_AUTOVACUUM_ENABLED=0` disables).
+    pub enabled: bool,
+    /// Minimum dead-tuple count before a vacuum is even considered (env
+    /// `UNIDB_AUTOVACUUM_THRESHOLD`, default 50 — Postgres's default).
+    pub threshold: u64,
+    /// Fraction of the live-tuple estimate added to `threshold` so larger tables
+    /// tolerate more churn before vacuuming (env `UNIDB_AUTOVACUUM_SCALE_FACTOR`,
+    /// default 0.2 — Postgres's default).
+    pub scale_factor: f64,
+    /// How long the background launcher sleeps between policy checks (env
+    /// `UNIDB_AUTOVACUUM_NAPTIME_SECS`, default 60 s — Postgres's default).
+    pub naptime: Duration,
+}
+
+impl Default for AutoVacuumConfig {
+    fn default() -> Self {
+        Self {
+            enabled: std::env::var("UNIDB_AUTOVACUUM_ENABLED").as_deref() != Ok("0"),
+            threshold: env_u64("UNIDB_AUTOVACUUM_THRESHOLD", 50),
+            scale_factor: env_f64("UNIDB_AUTOVACUUM_SCALE_FACTOR", 0.2),
+            naptime: Duration::from_secs(env_u64("UNIDB_AUTOVACUUM_NAPTIME_SECS", 60).max(1)),
+        }
+    }
+}
+
+impl AutoVacuumConfig {
+    /// The Postgres-style trigger: `dead > threshold + scale_factor * live`.
+    /// Pure function of the config + the two estimates, so it is trivially
+    /// testable and the launcher (A3) and any caller evaluate it identically.
+    pub fn should_vacuum(&self, dead: u64, live: u64) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let trigger = self.threshold as f64 + self.scale_factor * live as f64;
+        dead as f64 > trigger
     }
 }
 
@@ -237,6 +302,37 @@ pub struct Engine {
     auto_checkpoint: Mutex<AutoCheckpointConfig>,
     last_checkpoint: Mutex<Instant>,
     checkpoints_triggered: AtomicU64,
+    /// Approximate count of **dead tuple versions** created since the last
+    /// vacuum (A1). Incremented once per `xmax` stamp — every UPDATE (the old
+    /// version dies) and every DELETE — and reset to 0 by `vacuum_inner`. This
+    /// is the autovacuum trigger's numerator (A2). Approximate by design, like
+    /// Postgres's `n_dead_tup`: it counts at the raw-CRUD and SQL-statement
+    /// chokepoints (not the `heap.rs` mutation itself, which recovery redo also
+    /// drives — recovery must not count), so an aborted UPDATE/DELETE over-counts
+    /// until the next vacuum refreshes the estimate.
+    dead_tuples: AtomicU64,
+    /// Approximate count of **live tuples** (Postgres `reltuples`) — the
+    /// trigger's `live` term (A2). Incremented on INSERT, decremented on DELETE
+    /// (UPDATE leaves it unchanged: one visible version replaces another), and
+    /// re-set exactly to the scanned live-slot count at the end of every vacuum
+    /// (`vacuum_inner`), so vacuum corrects any accumulated drift — again
+    /// mirroring how Postgres refreshes its estimate on (auto)vacuum/analyze.
+    live_tuples: AtomicU64,
+    /// Autovacuum policy (A2). Behind `Mutex` (like `auto_checkpoint`) for
+    /// `&self` mutation. The background launcher (A3) reads this each naptime.
+    autovacuum: Mutex<AutoVacuumConfig>,
+    /// How many autovacuum passes the background launcher has run this session
+    /// (A4 observability). Distinct from manual `Engine::vacuum` calls.
+    autovacuums_triggered: AtomicU64,
+    /// Wall-clock (seconds since the Unix epoch) of the last autovacuum pass,
+    /// 0 if none yet (A4 observability). Coarse timestamp for `/metrics`.
+    last_autovacuum_epoch_secs: AtomicU64,
+    /// The background autovacuum launcher (A3), present once `spawn_autovacuum`
+    /// has been called on an `Arc<Engine>`. `None` for a bare `Engine::open`
+    /// handle (which cannot host a `Weak`-holding worker) or when the policy is
+    /// disabled. Dropping the engine drops this, whose `Drop` stops the thread —
+    /// the clean-shutdown hook.
+    autovacuum_handle: Mutex<Option<crate::autovacuum::AutoVacuumHandle>>,
     /// Serializes the non-CRUD write paths that do a *non-atomic*
     /// read-catalog-then-mutate-a-shared-secondary-index sequence — graph edges
     /// (the `__edges__.from_id` `DiskBTree` + page list), large objects (the
@@ -299,6 +395,15 @@ pub struct EngineStats {
     pub data_pages: u32,
     /// The most recent slow queries (bounded).
     pub recent_slow_queries: Vec<SlowQuery>,
+    /// Autovacuum passes run by the background launcher this session (A4).
+    pub autovacuums: u64,
+    /// Estimated dead tuple versions since the last vacuum (A1/A4) — the
+    /// autovacuum trigger's numerator.
+    pub dead_tuple_estimate: u64,
+    /// Estimated live tuples (A1/A4) — the trigger's `live` term.
+    pub live_tuple_estimate: u64,
+    /// Unix-epoch seconds of the last autovacuum pass, 0 if none yet (A4).
+    pub last_autovacuum_epoch_secs: u64,
 }
 
 /// `Engine` must be safely **shareable** across threads (P5.e: a pool of N
@@ -412,12 +517,32 @@ fn ctrl_lock_lc(m: &Mutex<Instant>) -> std::sync::MutexGuard<'_, Instant> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Poison-tolerant lock of the autovacuum policy `Mutex` (A2).
+fn ctrl_lock_av(m: &Mutex<AutoVacuumConfig>) -> std::sync::MutexGuard<'_, AutoVacuumConfig> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 impl Engine {
     /// Open (or create) a database at `dir`. Pass `page_size = 0` to use the
     /// default. The buffer-pool capacity comes from `UNIDB_BUFFER_POOL_PAGES`
     /// or the [`DEFAULT_POOL_CAPACITY`] default (P1.c).
     pub fn open(dir: &Path, page_size: u32) -> Result<Self> {
         Self::open_with_pool_capacity(dir, page_size, configured_pool_capacity())
+    }
+
+    /// Open (or create) a database and return it wrapped in an `Arc` with the
+    /// background **autovacuum launcher started** (A3) — the "default-on"
+    /// deployment/embedded-primary entry point. Equivalent to
+    /// `let e = Arc::new(Engine::open(..)?); e.spawn_autovacuum(); e`.
+    ///
+    /// `Engine::open` itself returns a bare `Engine` with no background thread
+    /// (a `Weak`-holding worker needs an `Arc`); use this when you want
+    /// autovacuum without managing the `Arc`/`spawn_autovacuum` dance yourself.
+    /// Honors the A2 policy: no thread is spawned if autovacuum is disabled.
+    pub fn open_arc(dir: &Path, page_size: u32) -> Result<Arc<Self>> {
+        let engine = Arc::new(Self::open(dir, page_size)?);
+        engine.spawn_autovacuum();
+        Ok(engine)
     }
 
     /// Open (or create) a database with an explicit buffer-pool capacity in
@@ -565,6 +690,12 @@ impl Engine {
             auto_checkpoint: Mutex::new(AutoCheckpointConfig::default()),
             last_checkpoint: Mutex::new(Instant::now()),
             checkpoints_triggered: AtomicU64::new(0),
+            dead_tuples: AtomicU64::new(0),
+            live_tuples: AtomicU64::new(0),
+            autovacuum: Mutex::new(AutoVacuumConfig::default()),
+            autovacuums_triggered: AtomicU64::new(0),
+            last_autovacuum_epoch_secs: AtomicU64::new(0),
+            autovacuum_handle: Mutex::new(None),
             write_serial: Mutex::new(()),
             replication,
             authz,
@@ -791,6 +922,10 @@ impl Engine {
             max_replication_lag,
             data_pages: self.pool.page_count(),
             recent_slow_queries,
+            autovacuums: self.autovacuums_triggered.load(Ordering::Relaxed),
+            dead_tuple_estimate: self.dead_tuples.load(Ordering::Relaxed),
+            live_tuple_estimate: self.live_tuples.load(Ordering::Relaxed),
+            last_autovacuum_epoch_secs: self.last_autovacuum_epoch_secs.load(Ordering::Relaxed),
         }
     }
 
@@ -820,7 +955,10 @@ impl Engine {
                 next_event_seq: &self.next_event_seq,
             };
             match executor::execute(plan, &mut ctx) {
-                Ok(result) => results.push(result),
+                Ok(result) => {
+                    self.note_dml_result(&result); // A1: dead/live-tuple accounting.
+                    results.push(result);
+                }
                 Err(e) => {
                     drop(catalog);
                     self.restore_catalog_root(saved_catalog_root)?;
@@ -921,7 +1059,10 @@ impl Engine {
                 next_event_seq: &self.next_event_seq,
             };
             match executor::execute(plan, &mut ctx) {
-                Ok(result) => results.push(result),
+                Ok(result) => {
+                    self.note_dml_result(&result); // A1: dead/live-tuple accounting.
+                    results.push(result);
+                }
                 Err(e) => {
                     drop(catalog);
                     self.restore_catalog_root(saved_catalog_root)?;
@@ -1614,6 +1755,90 @@ impl Engine {
         self.checkpoints_triggered.load(Ordering::SeqCst)
     }
 
+    /// Current autovacuum policy (A2).
+    pub fn autovacuum_config(&self) -> AutoVacuumConfig {
+        *ctrl_lock_av(&self.autovacuum)
+    }
+
+    /// Replace the autovacuum policy (A2). Takes effect on the launcher's next
+    /// naptime wake-up.
+    pub fn set_autovacuum_config(&self, cfg: AutoVacuumConfig) {
+        *ctrl_lock_av(&self.autovacuum) = cfg;
+    }
+
+    /// How many autovacuum passes the background launcher has run this session
+    /// (A4) — distinct from manual `Engine::vacuum` calls.
+    pub fn autovacuums_triggered(&self) -> u64 {
+        self.autovacuums_triggered.load(Ordering::Relaxed)
+    }
+
+    /// Whether the autovacuum trigger currently fires for the live estimates
+    /// (A2): `dead > threshold + scale_factor * live`, and the policy is
+    /// enabled. The background launcher (A3) calls this each naptime; exposed so
+    /// tests can assert the policy without waiting on the thread.
+    pub fn autovacuum_should_run(&self) -> bool {
+        self.autovacuum_config()
+            .should_vacuum(self.dead_tuple_estimate(), self.live_tuple_estimate())
+    }
+
+    /// Estimated dead tuple versions accumulated since the last vacuum (A1).
+    /// The autovacuum trigger's numerator; an approximation, like Postgres's
+    /// `n_dead_tup` (see the `dead_tuples` field).
+    pub fn dead_tuple_estimate(&self) -> u64 {
+        self.dead_tuples.load(Ordering::Relaxed)
+    }
+
+    /// Estimated live tuple count (A1) — Postgres `reltuples`. The autovacuum
+    /// trigger's `live` term; refreshed exactly at each vacuum.
+    pub fn live_tuple_estimate(&self) -> u64 {
+        self.live_tuples.load(Ordering::Relaxed)
+    }
+
+    /// Record `n` freshly-dead versions (one `xmax` stamp each) for the
+    /// autovacuum estimate (A1). Called from the raw-CRUD and SQL-statement
+    /// chokepoints — never from `heap.rs`/recovery redo, which must not count.
+    fn note_dead_tuples(&self, n: u64) {
+        if n != 0 {
+            self.dead_tuples.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Fold one successful SQL statement's row-count into the autovacuum
+    /// estimates (A1). Mirrors the raw-CRUD chokepoints: UPDATE stamps dead
+    /// versions, DELETE stamps dead versions and drops live rows, INSERT adds
+    /// live rows. Other statement kinds don't churn tuples.
+    fn note_dml_result(&self, result: &ExecResult) {
+        match result {
+            ExecResult::Updated { count } => self.note_dead_tuples(*count as u64),
+            ExecResult::Deleted { count } => {
+                self.note_dead_tuples(*count as u64);
+                self.note_live_delta(-(*count as i64));
+            }
+            ExecResult::Inserted { count } => self.note_live_delta(*count as i64),
+            _ => {}
+        }
+    }
+
+    /// Adjust the live-tuple estimate by `delta` (A1): `+n` on INSERT, `-n` on
+    /// DELETE, 0 on UPDATE (a new version replaces the old). Saturates at 0 so a
+    /// drifted estimate can never wrap.
+    fn note_live_delta(&self, delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        // `fetch_update` keeps the saturating-subtract atomic against the
+        // concurrent writers that share this counter (P5.e).
+        let _ = self
+            .live_tuples
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(if delta >= 0 {
+                    cur.saturating_add(delta as u64)
+                } else {
+                    cur.saturating_sub((-delta) as u64)
+                })
+            });
+    }
+
     /// A cloneable, `Send + Sync` handle for concurrent reads that run off the
     /// single writer thread (6b). Derived from the buffer pool's shared mmap
     /// and the shared transaction snapshot state, so many readers execute in
@@ -1680,6 +1905,7 @@ impl Engine {
                 slot: rid.slot,
             },
         )?;
+        self.note_live_delta(1); // A1: one new live tuple.
         Ok(rid)
     }
 
@@ -1714,6 +1940,7 @@ impl Engine {
                 slot: new_rid.slot,
             },
         )?;
+        self.note_dead_tuples(1); // A1: old version now dead; live count unchanged.
         Ok(new_rid)
     }
 
@@ -1729,6 +1956,8 @@ impl Engine {
                 slot: row_id.slot,
             },
         )?;
+        self.note_dead_tuples(1); // A1: deleted version now dead …
+        self.note_live_delta(-1); // … and no longer live.
         Ok(())
     }
 
@@ -2036,6 +2265,22 @@ impl Engine {
         // frontier), but the durability *claim* on return does. Cheap when
         // nothing was reclaimed (the WAL is already at its frontier).
         self.sync_wal()?;
+
+        // A1: refresh the autovacuum estimates. `live` is now exactly the scanned
+        // live-slot count (corrects any accumulated drift). `dead` drops by what
+        // we physically reclaimed — normally to 0, but if the horizon was held
+        // back (a long-lived reader / replication slot) the un-reclaimable
+        // remainder stays counted, so the trigger re-fires once the horizon
+        // advances rather than losing the signal (Postgres keeps not-yet-removable
+        // dead tuples counted too).
+        self.live_tuples
+            .store(report.rows_scanned as u64, Ordering::Relaxed);
+        let reclaimed = report.versions_reclaimed as u64;
+        let _ = self
+            .dead_tuples
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_sub(reclaimed))
+            });
 
         tracing::info!(
             horizon,
@@ -4105,6 +4350,288 @@ mod tests {
         // The current version still reads correctly after compaction.
         let x = engine.begin().unwrap();
         assert_eq!(engine.get(x, rid).unwrap(), b"v19");
+    }
+
+    // ── A1: dead-tuple accounting ─────────────────────────────────────────────
+
+    #[test]
+    fn dead_tuple_estimate_tracks_raw_crud_and_resets_on_vacuum() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        assert_eq!(engine.dead_tuple_estimate(), 0);
+        assert_eq!(engine.live_tuple_estimate(), 0);
+
+        // INSERT bumps live only.
+        let x = engine.begin().unwrap();
+        let rid = engine.insert(x, b"v0").unwrap();
+        engine.commit(x).unwrap();
+        assert_eq!(engine.live_tuple_estimate(), 1);
+        assert_eq!(engine.dead_tuple_estimate(), 0);
+
+        // Each UPDATE stamps one dead version; live unchanged.
+        let mut rid = rid;
+        for i in 0..5 {
+            let x = engine.begin().unwrap();
+            rid = engine.update(x, rid, format!("v{i}").as_bytes()).unwrap();
+            engine.commit(x).unwrap();
+        }
+        assert_eq!(engine.dead_tuple_estimate(), 5);
+        assert_eq!(engine.live_tuple_estimate(), 1);
+
+        // DELETE: one more dead, live back to 0.
+        let x = engine.begin().unwrap();
+        engine.delete(x, rid).unwrap();
+        engine.commit(x).unwrap();
+        assert_eq!(engine.dead_tuple_estimate(), 6);
+        assert_eq!(engine.live_tuple_estimate(), 0);
+
+        // Vacuum reclaims the dead versions and refreshes both estimates.
+        let report = engine.vacuum().unwrap();
+        assert!(report.versions_reclaimed >= 6, "{report:?}");
+        assert_eq!(engine.dead_tuple_estimate(), 0);
+        assert_eq!(engine.live_tuple_estimate() as usize, report.rows_scanned);
+    }
+
+    #[test]
+    fn autovacuum_policy_fires_at_the_postgres_threshold() {
+        let cfg = AutoVacuumConfig {
+            enabled: true,
+            threshold: 50,
+            scale_factor: 0.2,
+            naptime: Duration::from_secs(60),
+        };
+        // trigger = 50 + 0.2 * 1000 = 250.
+        assert!(!cfg.should_vacuum(250, 1000), "at the boundary: not yet");
+        assert!(cfg.should_vacuum(251, 1000), "just over the boundary");
+        assert!(!cfg.should_vacuum(49, 0), "below the flat threshold");
+        assert!(cfg.should_vacuum(51, 0), "above the flat threshold");
+
+        // Disabled ⇒ never fires, however much churn.
+        let off = AutoVacuumConfig {
+            enabled: false,
+            ..cfg
+        };
+        assert!(!off.should_vacuum(1_000_000, 0));
+    }
+
+    #[test]
+    fn autovacuum_should_run_reflects_live_estimates() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        engine.set_autovacuum_config(AutoVacuumConfig {
+            enabled: true,
+            threshold: 5,
+            scale_factor: 0.0,
+            naptime: Duration::from_secs(60),
+        });
+        assert!(!engine.autovacuum_should_run(), "no churn yet");
+
+        let x = engine.begin().unwrap();
+        let mut rid = engine.insert(x, b"v0").unwrap();
+        engine.commit(x).unwrap();
+        for i in 0..6 {
+            let x = engine.begin().unwrap();
+            rid = engine.update(x, rid, format!("v{i}").as_bytes()).unwrap();
+            engine.commit(x).unwrap();
+        }
+        assert!(
+            engine.autovacuum_should_run(),
+            "6 dead > threshold 5: {} dead",
+            engine.dead_tuple_estimate()
+        );
+        engine.vacuum().unwrap();
+        assert!(
+            !engine.autovacuum_should_run(),
+            "vacuum reset the dead estimate"
+        );
+    }
+
+    /// Poll `cond` up to `timeout`, sleeping briefly between checks. Returns
+    /// whether it became true — for asserting an *asynchronous* background event.
+    fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        cond()
+    }
+
+    #[test]
+    fn autovacuum_launcher_reclaims_without_a_manual_vacuum_call() {
+        let dir = tempdir().unwrap();
+        // Set an aggressive policy BEFORE spawning so the launcher's first nap
+        // already uses the short naptime.
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        engine.set_autovacuum_config(AutoVacuumConfig {
+            enabled: true,
+            threshold: 10,
+            scale_factor: 0.0,
+            naptime: Duration::from_millis(25),
+        });
+        let engine = Arc::new(engine);
+        engine.spawn_autovacuum();
+        assert!(engine.autovacuum_running());
+
+        // Churn one row hard: 40 dead versions, no manual vacuum() anywhere.
+        let x = engine.begin().unwrap();
+        let mut rid = engine.insert(x, b"v0").unwrap();
+        engine.commit(x).unwrap();
+        for i in 0..40 {
+            let x = engine.begin().unwrap();
+            rid = engine.update(x, rid, format!("v{i}").as_bytes()).unwrap();
+            engine.commit(x).unwrap();
+        }
+
+        // The launcher must fire and drive the dead estimate back down on its
+        // own — the defining autovacuum behaviour.
+        let fired = wait_until(Duration::from_secs(5), || {
+            engine.autovacuums_triggered() > 0 && engine.dead_tuple_estimate() <= 10
+        });
+        assert!(
+            fired,
+            "autovacuum did not reclaim: runs={}, dead={}",
+            engine.autovacuums_triggered(),
+            engine.dead_tuple_estimate()
+        );
+
+        // Data is intact after background reclamation.
+        let x = engine.begin().unwrap();
+        assert_eq!(engine.get(x, rid).unwrap(), b"v39");
+    }
+
+    #[test]
+    fn autovacuum_launcher_shuts_down_cleanly_on_drop() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        engine.set_autovacuum_config(AutoVacuumConfig {
+            enabled: true,
+            threshold: 5,
+            scale_factor: 0.0,
+            naptime: Duration::from_millis(25),
+        });
+        let engine = Arc::new(engine);
+        engine.spawn_autovacuum();
+        assert!(engine.autovacuum_running());
+
+        // A Weak witness: after dropping the only strong Arc, the engine must be
+        // freed — proving the worker holds no strong reference (no cycle leak).
+        let witness = Arc::downgrade(&engine);
+        assert!(witness.upgrade().is_some());
+        drop(engine); // engine field-drop stops + joins the worker (bounded)
+
+        assert!(
+            wait_until(Duration::from_secs(5), || witness.upgrade().is_none()),
+            "engine was not freed after drop — the launcher leaked a strong ref"
+        );
+    }
+
+    #[test]
+    fn autovacuum_respects_the_horizon_held_by_a_repeatable_read_reader() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        engine.set_autovacuum_config(AutoVacuumConfig {
+            enabled: true,
+            threshold: 10,
+            scale_factor: 0.0,
+            naptime: Duration::from_millis(25),
+        });
+        let engine = Arc::new(engine);
+
+        // Seed one row, then open a REPEATABLE READ transaction whose BEGIN-time
+        // snapshot pins the vacuum horizon (M10.a / P5.c).
+        let x = engine.begin().unwrap();
+        let mut rid = engine.insert(x, b"v0").unwrap();
+        engine.commit(x).unwrap();
+        let v0_rid = rid; // v0's version never moves; updates create new versions
+        let reader = engine
+            .begin_with_isolation(IsolationLevel::RepeatableRead)
+            .unwrap();
+        assert_eq!(engine.get(reader, v0_rid).unwrap(), b"v0"); // establish the snapshot
+
+        // Churn hard AFTER the reader's snapshot: every dead version's xmax is
+        // above the reader's xmin, so none is reclaimable while the reader lives.
+        for i in 0..40 {
+            let x = engine.begin().unwrap();
+            rid = engine.update(x, rid, format!("v{i}").as_bytes()).unwrap();
+            engine.commit(x).unwrap();
+        }
+        engine.spawn_autovacuum();
+
+        // The launcher fires (dead=40 > threshold 10) but the horizon blocks it:
+        // it runs yet reclaims nothing, so the dead estimate stays high.
+        assert!(
+            wait_until(Duration::from_secs(5), || engine.autovacuums_triggered()
+                > 0),
+            "autovacuum should still *run* while blocked"
+        );
+        std::thread::sleep(Duration::from_millis(100)); // let a few more passes run
+        assert!(
+            engine.dead_tuple_estimate() >= 40,
+            "a live RR reader must block reclamation: dead={}",
+            engine.dead_tuple_estimate()
+        );
+        // The reader still sees its snapshot — the versions it needs are intact.
+        assert_eq!(engine.get(reader, v0_rid).unwrap(), b"v0");
+
+        // Release the horizon: the reader commits. Now autovacuum can reclaim.
+        engine.commit(reader).unwrap();
+        assert!(
+            wait_until(Duration::from_secs(5), || engine.dead_tuple_estimate()
+                <= 10),
+            "after the reader commits, autovacuum must reclaim: dead={}",
+            engine.dead_tuple_estimate()
+        );
+    }
+
+    #[test]
+    fn disabled_policy_starts_no_launcher() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        engine.set_autovacuum_config(AutoVacuumConfig {
+            enabled: false,
+            ..AutoVacuumConfig::default()
+        });
+        let engine = Arc::new(engine);
+        engine.spawn_autovacuum();
+        assert!(
+            !engine.autovacuum_running(),
+            "disabled ⇒ no background thread"
+        );
+    }
+
+    #[test]
+    fn dead_tuple_estimate_tracks_sql_dml() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE t (id INT, v INT)")
+            .unwrap();
+        for i in 0..10 {
+            engine
+                .execute_sql(x, &format!("INSERT INTO t VALUES ({i}, 0)"))
+                .unwrap();
+        }
+        engine.commit(x).unwrap();
+        assert_eq!(engine.live_tuple_estimate(), 10);
+        assert_eq!(engine.dead_tuple_estimate(), 0);
+
+        // UPDATE of 10 rows → 10 dead versions; live unchanged.
+        let x = engine.begin().unwrap();
+        engine.execute_sql(x, "UPDATE t SET v = 1").unwrap();
+        engine.commit(x).unwrap();
+        assert_eq!(engine.dead_tuple_estimate(), 10);
+        assert_eq!(engine.live_tuple_estimate(), 10);
+
+        // DELETE of 4 rows → 4 more dead, live 10 → 6.
+        let x = engine.begin().unwrap();
+        engine.execute_sql(x, "DELETE FROM t WHERE id < 4").unwrap();
+        engine.commit(x).unwrap();
+        assert_eq!(engine.dead_tuple_estimate(), 14);
+        assert_eq!(engine.live_tuple_estimate(), 6);
     }
 
     #[test]

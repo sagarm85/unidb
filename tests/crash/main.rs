@@ -54,6 +54,13 @@
 //         open txn; Pc a torn unsynced tail stops replay cleanly (committed
 //         prefix survives); Pd eviction-forced-sync D5 ordering holds on crash.
 //         The valid-prefix property test also runs under BOTH policies.
+//   P26 – crash after an autovacuum pass (A3/A4): a background-style
+//         `run_autovacuum_pass` reclaims churn (WAL_VACUUM self-synced durable),
+//         then the engine is dropped with no checkpoint. Recovery redoes the
+//         reclamation at the Engine level (real table, durable index scrub,
+//         compaction) — the current row survives, reclaimed versions stay
+//         reclaimed, and a re-vacuum finds nothing new (idempotent). Distinct
+//         from P10, which exercises the raw-Heap mark at a lower level.
 
 use tempfile::tempdir;
 use unidb::{Engine, RowId};
@@ -1471,4 +1478,79 @@ fn pd_eviction_forced_sync_preserves_d5_on_crash() {
             "Pd: row {i} must recover after an eviction-forced-sync crash"
         );
     }
+}
+
+// ── P26: crash after an autovacuum pass (A3/A4) ──────────────────────────────
+//
+// Autovacuum auto-triggers the same M10 `Engine::vacuum` a manual call runs, so
+// its WAL_VACUUM records are redo-only/idempotent and self-synced durable during
+// the pass. This test drives the churn through a real SQL table + a durable
+// index (so the pass exercises the index-scrub + page-compaction path, not just
+// the raw-Heap mark P10 covers), runs one `run_autovacuum_pass`, then "crashes"
+// (drop, no checkpoint) and reopens: the live row must survive, the reclaimed
+// versions must stay reclaimed, and re-vacuuming must find nothing new.
+#[test]
+fn p26_crash_after_autovacuum_pass_recovers() {
+    use unidb::VacuumReport;
+
+    let dir = tempdir().unwrap();
+    let (final_v, before): (i64, VacuumReport) = {
+        let engine = open(dir.path());
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE t (id INT, v INT)")
+            .unwrap();
+        engine
+            .execute_sql(x, "CREATE INDEX idx ON t USING BTREE (id)")
+            .unwrap();
+        engine
+            .execute_sql(x, "INSERT INTO t VALUES (1, 0)")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        // Churn the row 30× → 30 committed dead versions.
+        for i in 1..=30 {
+            let x = engine.begin().unwrap();
+            engine
+                .execute_sql(x, &format!("UPDATE t SET v = {i}"))
+                .unwrap();
+            engine.commit(x).unwrap();
+        }
+        assert_eq!(engine.dead_tuple_estimate(), 30);
+
+        // One autovacuum pass reclaims (WAL_VACUUM self-synced durable).
+        let before = engine.run_autovacuum_pass().unwrap();
+        assert!(
+            before.versions_reclaimed >= 25,
+            "P26: the pass must reclaim the churn: {before:?}"
+        );
+        // "Crash": drop with no checkpoint. WAL_VACUUM is durable; pages may not
+        // be flushed and must be redone from the WAL on reopen.
+        drop(engine);
+        (30, before)
+    };
+
+    let engine = open(dir.path());
+    // (i) the current committed row survives the mid-autovacuum-durability crash.
+    let x = engine.begin().unwrap();
+    let rows = engine
+        .execute_sql(x, "SELECT v FROM t WHERE id = 1")
+        .unwrap();
+    match &rows[0] {
+        unidb::SqlResult::Rows(r) => assert_eq!(
+            r,
+            &vec![vec![unidb::sql::logical::Literal::Int(final_v)]],
+            "P26: the live row must survive with its latest value"
+        ),
+        other => panic!("expected Rows, got {other:?}"),
+    }
+    engine.commit(x).unwrap();
+
+    // (ii) re-running vacuum after recovery reclaims nothing new — the earlier
+    // reclamation was redone cleanly and is idempotent.
+    let after = engine.vacuum().unwrap();
+    assert_eq!(
+        after.versions_reclaimed, 0,
+        "P26: reclaimed versions must stay reclaimed after recovery (before={before:?}, after={after:?})"
+    );
 }

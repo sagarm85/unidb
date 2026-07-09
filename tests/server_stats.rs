@@ -34,4 +34,10 @@ async fn stats_endpoint_reports_activity() {
     assert_eq!(body["active_transactions"].as_u64().unwrap(), 0);
     assert!(body["data_pages"].as_u64().unwrap() > 0);
     assert!(body["recent_slow_queries"].is_array());
+    // Autovacuum observability (A4): the fields exist and are sane. The served
+    // instance starts the launcher; one INSERT of one row leaves ~1 live tuple.
+    assert!(body["autovacuums"].is_u64(), "autovacuums reported");
+    assert!(body["dead_tuple_estimate"].is_u64());
+    assert_eq!(body["live_tuple_estimate"].as_u64().unwrap(), 1);
+    assert!(body["last_autovacuum_epoch_secs"].is_u64());
 }

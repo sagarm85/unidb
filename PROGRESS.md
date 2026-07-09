@@ -3072,3 +3072,98 @@ tokio/reqwest/axum/postgres); `cargo build --workspace`, `cargo test -p unidb`
 **Locked-decision changes:** none.
 
 **Postgres baseline comparison is COMPLETE.**
+
+---
+
+## Autovacuum — auto-triggered background MVCC vacuum   [done]   2026-07-09
+
+**PR:** _(this branch: `autovacuum`, checkpoints A1–A4 as ordered commits)_
+**Summary:** Closes the one automation gap the Postgres baseline surfaced —
+under sustained update churn, bloat grew because M10 `Engine::vacuum` was
+manual-only. A background `std::thread` launcher now **auto-triggers that same,
+already-safe M10 vacuum** on a Postgres-shape policy, so bloat stays bounded with
+no human in the loop. No reclamation logic re-implemented and the vacuum horizon
+is untouched (it stays reader/replication-slot-correct); autovacuum only decides
+*when* to run. Deliberately a `std::thread`, **not** tokio — the engine core
+stays synchronous (§4).
+
+**Benchmarks** (`benches/vacuum.rs`, debug one-shot, Apple M-series; logical heap
+pages as the bloat metric since physical file size is quantized to P1.c's 4 MiB
+mmap-grow chunks):
+
+| Workload (200 keys × 30 update rounds) | Heap pages (logical bloat) | vs unbounded |
+|----------------------------------------|----------------------------|--------------|
+| Churn, **no vacuum** (unbounded)       | 82 pages                   | 1.0×         |
+| Churn, **background autovacuum** (no manual call) | 35 pages        | **2.3× fewer** |
+| Churn, manual `vacuum()` every round   | 17 pages                   | 4.8× fewer   |
+
+Autovacuum bounds bloat vs unbounded on its own; it is looser than
+vacuum-after-every-round because it fires on `naptime`, not per commit — the
+expected background-daemon tradeoff. A single M10 `vacuum()` over the full 6000
+dead versions reclaims ~517 KB in-page in ~34 ms (unchanged from M10).
+
+**Crash harness:** 25 → **26** (new **P26**: crash after an autovacuum pass
+through a real SQL table + durable BTREE index — exercises the index-scrub +
+page-compaction path end-to-end, distinct from P10's raw-`Heap` mark; reopen,
+live row survives, reclaimed stays reclaimed, re-vacuum idempotent). All green.
+
+**What changed:**
+- **A1 — dead-tuple accounting.** Global `dead_tuples` / `live_tuples` atomic
+  estimates on `Engine` (Postgres `n_dead_tup`/`reltuples`-style, approximate).
+  Counted at the raw-CRUD (`insert`/`update`/`delete`) and SQL-statement
+  (`note_dml_result` off `ExecResult` in both execute paths) chokepoints — never
+  in `heap.rs`, which recovery redo also drives. `vacuum_inner` refreshes them:
+  `live` = scanned live-slot count, `dead` −= reclaimed (a horizon-blocked
+  remainder stays counted). Accessors `dead_tuple_estimate`/`live_tuple_estimate`.
+- **A2 — policy + config.** `AutoVacuumConfig { enabled, threshold, scale_factor,
+  naptime }` mirroring `AutoCheckpointConfig`, with the pure/testable
+  `should_vacuum(dead, live)` = `dead > threshold + scale_factor·live`. Env knobs
+  `UNIDB_AUTOVACUUM_ENABLED` / `_THRESHOLD` / `_SCALE_FACTOR` / `_NAPTIME_SECS`;
+  default-on with Postgres defaults (50 / 0.2 / 60 s).
+- **A3 — background launcher** (`src/autovacuum.rs`). A `std::thread` that sleeps
+  `naptime` (condvar-interruptible), evaluates the policy, and runs
+  `Engine::vacuum` when it fires. **Why safe with no new locking** (M3.b-style):
+  `Engine` is `Send + Sync` (P5.e), `vacuum` already serializes with the other
+  structure-mutating writers via `write_serial` and mutates pages under the same
+  per-page latches (M10), so a background pass interleaves exactly as a *manual*
+  `vacuum()` already does; the horizon is min-`xmin` over live writers **and**
+  live `ReadHandle` readers (P5.c/M10.a) and is held back by replication slots
+  (P6.b), which the background caller observes unchanged; `WAL_VACUUM` is
+  redo-only/idempotent (P10) so crash-during-autovacuum recovers identically.
+  **Lifetime:** the worker holds a `Weak<Engine>` (a strong `Arc` would form a
+  refcount cycle that prevents `Engine::Drop`); the `AutoVacuumHandle` is an
+  engine field, so field-drop signals shutdown + bounded-joins the thread
+  (M2.b-style), with a `worker_id` self-join guard for the external-drop-mid-pass
+  race. `spawn_autovacuum(&Arc<Engine>)` + `open_arc()` convenience (default-on);
+  the server's `EngineHandle` starts it. A bare `Engine::open` handle is
+  thread-free by construction (deterministic for tests; manual `vacuum()` stays).
+- **A4 — observability + tests + benchmark.** `EngineStats` (+`/stats`) gains
+  `autovacuums` / `dead_tuple_estimate` / `live_tuple_estimate` /
+  `last_autovacuum_epoch_secs`; `/metrics` exposes them as gauges refreshed per
+  scrape. `run_autovacuum_pass` public (force a counted pass). Tests: policy
+  boundary; update-heavy table reclaimed with no manual call; a live
+  `REPEATABLE READ` reader holds the horizon and blocks reclamation until it
+  commits; clean shutdown via a `Weak` witness; `/stats` fields present + served
+  launcher started.
+
+**Known limitations / tech debt:**
+- **Global** (not per-table) dead/live estimates and a **whole-engine** pass;
+  per-table accounting + `Engine::vacuum_table` + a cost-based throttle
+  (PG-style `autovacuum_vacuum_cost_limit`) remain the documented follow-up
+  (`docs/backlog/autovacuum.md`).
+- No bounded-K-per-call throttle: a pass is whole-engine, but runs off the
+  foreground thread, so it is not a *commit-path* stall.
+- The estimates are approximate (aborted DML / system-table churn drift them
+  until the next vacuum refresh — like Postgres until ANALYZE).
+- A long-lived RR reader / replication slot that holds the horizon makes the
+  launcher re-run and reclaim nothing until it advances (naptime-bounded,
+  surfaced via `VacuumReport.horizon_blocked`) — the same footgun M10 documents.
+
+**Deferred to later:** per-table granularity + `vacuum_table`, cost-based I/O
+throttle, freeze/anti-wraparound (xid is `u64` — not a near-term concern).
+
+**Locked-decision changes:** none. §4 "engine stays sync — no tokio in core"
+upheld (`std::thread`; `cargo tree -p unidb --no-default-features --edges normal`
+free of tokio/reqwest/axum). No `FORMAT_VERSION` bump.
+
+**Autovacuum is COMPLETE.**

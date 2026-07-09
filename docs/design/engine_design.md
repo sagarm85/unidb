@@ -64,6 +64,7 @@ Module map (what each layer became in code):
 | Graph (M3, M7) | `graph/{edges,index,logical,parser,executor}.rs` |
 | Event queue (M4) | `queue/{mod,payload}.rs` |
 | Server (M5, feature-gated) | `server/{engine_handle,error,dto,handlers,router,auth,sse}.rs`, `bin/unidb-server.rs` |
+| Autovacuum (A1–A4) | `autovacuum.rs` (background `std::thread` launcher: `Weak<Engine>`, threshold policy, clean-shutdown handle) |
 | Engine facade | `lib.rs` (`Engine` — the sole entry point) |
 | Attach client (M8, separate workspace crate) | `unidb-attach/src/lib.rs` (`AttachClient`, `AttachError`) |
 
@@ -989,10 +990,16 @@ compaction + slot reuse). Its index-vacuum pass also scrubs the reclaimed
 too — and, more importantly, must be scrubbed *before* a slot is reused, or a
 stale entry would alias a live, wrong row (the M10.c aliasing hazard).
 `CsrIndex` is deliberately left un-scrubbed (no incremental remove; not
-consulted by any read path; rebuilt on open). Still open: this is **manual**
-vacuum only (no autovacuum), catalog-page and cross-page/`VACUUM FULL`
-reclamation are not done, and index structures shrink only by entry removal,
-not physical rebuild — see `docs/backlog/m10_heap_vacuum_gc.md`.
+consulted by any read path; rebuilt on open). Vacuum is now **auto-triggered**
+by a background launcher (Autovacuum A1–A4, branch `autovacuum`): a
+`std::thread` holding `Weak<Engine>` wakes every `naptime`, and when
+`dead > threshold + scale_factor · live` (Postgres-shape policy over global
+dead/live estimates) fires the same `Engine::vacuum` pass — safe without new
+locking (`Engine` is `Send + Sync`, vacuum already takes `write_serial` +
+per-page latches, horizon is reader/slot-correct). Still open: per-table
+accounting + `vacuum_table` + a cost-based throttle, catalog-page and
+cross-page/`VACUUM FULL` reclamation, and physical index rebuild — see
+`docs/backlog/autovacuum.md` and `docs/backlog/m10_heap_vacuum_gc.md`.
 
 **CSR is not currently consulted by any query path** (added post-M7,
 corrected during M8 merge) — it is built, kept warm on every live edge
@@ -1030,8 +1037,11 @@ Phase 5); catalog DDL not transactional; SQL grammar gaps (no OR/ORDER
 BY/LIMIT/aggregates/joins/subqueries/`IN` — parked as Phase 2); no
 full-text SQL operator; single-column indexes only; no cost-based index
 selection; Cypher is single-hop read-only, nodes are opaque i64s; no CSR
-reverse (`to_id`) traversal; RLS is Rust-API-only; manual heap vacuum only
-(`Engine::vacuum()`, M10) — no *automatic*/threshold-driven autovacuum.
+reverse (`to_id`) traversal; RLS is Rust-API-only; ~~manual heap vacuum only
+(`Engine::vacuum()`, M10) — no *automatic*/threshold-driven autovacuum~~
+(**fixed by Autovacuum A1–A4** — a background `std::thread` launcher
+threshold-triggers `Engine::vacuum`; per-table granularity + a cost throttle
+remain future work, `docs/backlog/autovacuum.md`).
 
 Server gaps: no multi-request transaction sessions; no TLS (reverse-proxy
 assumption); verify-only JWT with no scopes (any valid token can hit
