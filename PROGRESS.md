@@ -3167,3 +3167,110 @@ upheld (`std::thread`; `cargo tree -p unidb --no-default-features --edges normal
 free of tokio/reqwest/axum). No `FORMAT_VERSION` bump.
 
 **Autovacuum is COMPLETE.**
+
+---
+
+## Durable on-disk FSM + catalog page-list (branch `durable-fsm`, 2026-07-10)
+
+**One PR; ordered commits B1 → B2 → B-accept + docs.** Closes the SQL-path
+`HeapFull { size: 8138 }` scaling ceiling the Postgres baseline (PR #25)
+root-caused, and the §12 "durable on-disk FSM fork" tech-debt item. Spec:
+`docs/backlog/durable_fsm_catalog_pagelist.md`.
+
+**Root cause (recap).** `TableDef.pages: Vec<PageId>` lived inline in the single
+JSON catalog blob; the SQL insert path rewrote the whole list into that blob on
+every heap-page alloc (`persist_pages_if_changed` → `set_pages`). At ~900–1,450
+pages the encoded list overflowed one 8 KiB page and the next INSERT failed — an
+O(heap-pages) *catalog*-size cap, not a data limit. (The raw `Engine::insert`
+path never rewrites the catalog, so it was immune and built 5M rows linearly.)
+
+**Fix.** The page **directory** moves into a per-table durable free-space map
+built on the existing `DiskBTree` (keyed `page_id → free_bytes`; its keys are the
+directory). Its stable meta page id is stored once in `TableDef.fsm_meta`
+(`#[serde(default)]`; `pages` kept as a legacy fallback — **no data-dir
+migration, no `FORMAT_VERSION` bump**). WAL-logged and crash-recovered by
+inheritance (`WAL_INDEX` full-page images); `Engine::open` stays O(1).
+
+- **B1** (`c6bb225`) — directory off the catalog blob. `DiskBTree::max_entry`
+  (O(log n) append tail) + `page_directory` (leaf walk over any `PageReader` —
+  pool or the concurrent-read mmap). `Heap::open` is O(1); insert appends at the
+  durable tail; `persist_pages_if_changed`/`set_pages` are no-ops for FSM-backed
+  tables. **Removes the ceiling.**
+- **B2** (`4f4a69c`) — durable free-space + atomic grow. The FSM value's slot
+  carries free bytes, so `ensure_directory` warms the free map from the tree on
+  reopen (no cold re-probe). `DiskBTree::insert_in_txn` folds the new page's init
+  and its FSM directory entry into **one** WAL mini-txn (crash mid-grow →
+  no orphan). `DiskBTree::set_value` (in-place, no split) lets vacuum's
+  `compact_page` record reclaimed free durably (autovacuum integration; P26 still
+  green). Hot per-row inserts do **not** write the tree (a full-page-image
+  `WAL_INDEX` per row would bloat the WAL) — free-space is persisted at alloc and
+  by vacuum only.
+
+**Crash harness 26 → 28.** P27 (durable FSM directory survives a no-checkpoint
+crash: a multi-page table's full scan recovers every row via the WAL-rebuilt
+directory, and the reopened heap appends at the recovered tail), P28 (atomic
+grow leaves no orphan: rows on freshly grown pages survive a crash byte-intact).
+
+### B-accept — validated against the benchmark that found the bug
+
+Re-ran the SQL-path build at the scale that exposed the ceiling, before (`main`
+`ecd2f1e`) vs after (this branch), via a new `benches/decompose.rs` section
+(`UNIDB_BENCH=fsm`, native macOS 26.4, Apple M5 Pro). This gate can fail — item
+3 legitimately shows **no improvement** and is reported as such.
+
+**(1) Correctness (primary pass/fail): PASS.** Marginal SQL-insert build, one
+transaction, ~4 rows/8 KiB page:
+
+| ~pages | before (main) µs/row | after (durable-fsm) µs/row |
+|-------:|---------------------:|---------------------------:|
+|    250 |                 65.3 |                       27.9 |
+|    500 |                108.4 |                       23.2 |
+|    750 |                173.4 |                       26.8 |
+|    876 | **ERROR HeapFull(8141)** |                      — |
+|   1000 |                    — |                       19.2 |
+|   1500 |                    — |                       23.1 |
+|   2000 |                    — |                       17.1 |
+
+Before dies at ~876 pages with `heap is full: no space for tuple of 8141 bytes`
+(the catalog blob); after builds clean to ≥2,000 pages. The unit test
+`sql_insert_path_clears_old_catalog_pagelist_ceiling` also builds >1,450 pages
+via the SQL path and reads every row back.
+
+**(2) Improvement — insert cost at scale: LARGE.** Before, marginal SQL-insert
+cost **rises with table size** — 65 → 108 → 173 µs/row — the O(pages) catalog
+blob rewrite per page-growth. After it is **flat ~17–28 µs/row**. At ~750 pages
+that is **~6.5× faster** (26.8 vs 173.4), and before cannot continue at all.
+`Engine::open` stays O(1) (directory read from the FSM meta page, never a
+rescan — the moat, unchanged).
+
+**(3) Concurrent SQL writes (the 2026-07-10 refinement) — NO MEASURABLE
+IMPROVEMENT (honest finding).** B3 (`benches/decompose.rs`, N unidb SQL-writer
+threads vs N Postgres connections, matched durability `fsync_writethrough`,
+PER=500), commits/sec at N=8, four runs each:
+
+| | N=1 | N=2 | N=4 | N=8 (median of 4) |
+|--|--:|--:|--:|--:|
+| unidb_sql **before** (main) | ~311 | ~321 | ~635 | ~1020 / 1195 / 1181 / 1231 (**~1188**) |
+| unidb_sql **after** (durable-fsm) | ~313 | ~320 | ~640 | ~1165 / 1160 / 1135 / 1207 (**~1162**) |
+| postgres | ~314 | ~325 | ~647 | ~1220–1280 |
+
+The before/after SQL curves are **statistically indistinguishable** (~1150–1230
+commits/s at 8 writers, ~3.3–4.0× scaling both), well within run-to-run variance
+(the *raw* path, which the FSM change does not touch, moved a similar ±10% between
+runs). **Why:** the B3 table stays tiny (~4,000 rows ≈ 40 pages), so `set_pages`
+— the catalog write-lock B1 removed — fired only on the rare page-growth, not on
+the hot path. The concurrent-write bottleneck is elsewhere and unchanged: the
+**group-commit fsync** and the **per-statement catalog `RwLock`** (as the
+pg-baseline entry already found — concurrent SQL writes *already* scaled). The
+`set_pages` contention this milestone removes only bites at **large** table sizes
+(hundreds of pages, frequent growth) — exactly where the (2) fsm-scale numbers
+show the win — not in this small-table concurrency microbench. **Next
+serialization point to attack for concurrent-SQL scaling: the catalog `RwLock` +
+group-commit fsync, not the page-list write.**
+
+**Peak RSS:** unchanged (~35 MB class; the FSM tree is a handful of pages).
+**Locked decisions:** none changed. Sync invariant holds (`cargo tree -p unidb
+--no-default-features --edges normal` free of tokio/reqwest/axum). No
+`FORMAT_VERSION` bump.
+
+**Durable on-disk FSM + catalog page-list is COMPLETE.**

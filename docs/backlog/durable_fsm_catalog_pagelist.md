@@ -1,6 +1,6 @@
 # Durable free-space map + O(1) table-page representation
 
-## Status as of 2026-07-10: IN PROGRESS (Core lane, branch `durable-fsm`). **B1 landed** (page directory off the catalog blob → `HeapFull` ceiling removed); **B2 + B-accept next.** See "Implementation (B1 / B2)" and "B-accept" below.
+## Status as of 2026-07-10: **SHIPPED** (Core lane, branch `durable-fsm`; one PR, commits B1 → B2 → B-accept + docs). The `HeapFull` ceiling is removed; page directory + free-space map are a per-table durable `DiskBTree`. Metrics + verdict in `PROGRESS.md`'s "Durable on-disk FSM + catalog page-list" entry. See "Implementation (B1 / B2)" and "B-accept" below.
 
 Filed from the Postgres baseline comparison (`pg_baseline_comparison.md`, PR #25),
 which root-caused a hard scaling limit in the SQL insert path. This is the fix.

@@ -816,7 +816,93 @@ fn pg_sweep_point(client: &mut Client, size: u64) -> (f64, f64) {
     (ins_us, read_us)
 }
 
+/// Durable-FSM B-accept: marginal SQL-insert cost as a single table grows, in
+/// one open transaction (so there is no per-row fsync masking the CPU cost). The
+/// segment µs/row includes each page-growth's amortized bookkeeping. On `main`
+/// (before), every growth rewrote the whole `TableDef.pages` list into the
+/// catalog blob (O(pages)), and at ~1,450 pages that blob overflowed an 8 KiB
+/// page → `HeapFull { size: 8138 }` (printed as ERROR — the ceiling). With the
+/// durable FSM (after), the directory lives in the FSM tree (an O(log n) tail
+/// probe and one node write per new page), so the cost stays flat and the build
+/// sails past the old ceiling. Rows overridable via `FSM_ROWS`.
+fn bench_fsm_scale() {
+    use unidb::sql::logical::Literal;
+    println!(
+        "\n=== FSM B-accept: marginal SQL-insert cost vs table size (one txn, ~4 rows/page) ==="
+    );
+    println!(
+        "  {:>8}  {:>8}  {:>14}  status",
+        "rows", "~pages", "us/row(seg)"
+    );
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
+    let x0 = engine.begin().unwrap();
+    engine
+        .execute_sql(x0, "CREATE TABLE t (id INT, body TEXT)")
+        .unwrap();
+    engine.commit(x0).unwrap();
+    let body = "x".repeat(1900); // ~4 rows per 8 KiB page
+    let ins = engine
+        .prepare("INSERT INTO t (id, body) VALUES ($1, $2)")
+        .unwrap();
+    let target: u64 = std::env::var("FSM_ROWS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8_000);
+    let milestone = 1_000u64;
+    let x = engine.begin().unwrap();
+    let mut seg_start = Instant::now();
+    let mut seg_rows = 0u64;
+    for i in 0..target {
+        match engine.execute_prepared(
+            x,
+            &ins,
+            &[Literal::Int(i as i64), Literal::Text(body.clone())],
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                println!("  {:>8}  {:>8}  {:>14}  ERROR: {e}", i, i / 4, "-");
+                return; // the ceiling (before) — no commit; txn is abandoned
+            }
+        }
+        seg_rows += 1;
+        if (i + 1) % milestone == 0 {
+            let us = seg_start.elapsed().as_micros() as f64 / seg_rows as f64;
+            println!("  {:>8}  {:>8}  {:>14.1}  ok", i + 1, (i + 1) / 4, us);
+            seg_start = Instant::now();
+            seg_rows = 0;
+        }
+    }
+    engine.commit(x).unwrap();
+}
+
 fn main() {
+    // `UNIDB_BENCH` selects a subset so a single section can be re-run quickly
+    // (e.g. the durable-FSM B-accept re-runs just B3/B4 before vs after without
+    // paying for the full criterion ladders): "b3", "b4", or "b3b4". Unset =
+    // the full suite.
+    let only = std::env::var("UNIDB_BENCH").unwrap_or_default();
+    match only.as_str() {
+        "b3" => {
+            bench_pg_concurrency();
+            return;
+        }
+        "b4" => {
+            bench_size_sweep();
+            return;
+        }
+        "b3b4" => {
+            bench_pg_concurrency();
+            bench_size_sweep();
+            return;
+        }
+        "fsm" => {
+            bench_fsm_scale();
+            return;
+        }
+        _ => {}
+    }
+
     // Criterion-measured groups: the ladder (existing) + B1 pg ladder + B2 CRUD.
     let mut criterion = Criterion::default().configure_from_args();
     bench_ladder(&mut criterion);

@@ -12,6 +12,46 @@
 
 ## Current status
 
+- **Durable on-disk FSM + catalog page-list — COMPLETE (2026-07-10), on branch
+  `durable-fsm` (one PR; ordered commits B1 → B2 → B-accept + docs).** Closes the
+  SQL-path `HeapFull{8138}` scaling ceiling the Postgres baseline (PR #25)
+  root-caused, and the §12 "durable on-disk FSM fork" tech-debt item. **Root
+  cause:** `TableDef.pages: Vec<PageId>` lived inline in the single JSON catalog
+  blob, and the SQL insert path rewrote the whole list into it on every heap-page
+  alloc (`persist_pages_if_changed` → `set_pages`); at ~900–1,450 pages the blob
+  overflowed one 8 KiB page → next INSERT failed. **Fix:** the page directory +
+  free-space map become a per-table durable `DiskBTree` keyed `page_id →
+  free_bytes` (keys = the directory), meta page id in `TableDef.fsm_meta`
+  (`#[serde(default)]`; `pages` kept as legacy fallback — **no data-dir
+  migration, no `FORMAT_VERSION` bump**). WAL-logged + crash-recovered by
+  inheritance (`WAL_INDEX`); `Engine::open` stays O(1). **B1** (`c6bb225`):
+  directory off the blob — `DiskBTree::max_entry` (O(log n) append tail) +
+  `page_directory` (leaf walk over any `PageReader` — pool *or* concurrent-read
+  mmap); `Heap::open` O(1); `persist_pages_if_changed`/`set_pages` no-ops for
+  FSM-backed tables (`Heap::is_fsm_backed`); all ~24 `from_pages` sites →
+  `Heap::open`; the legacy raw-CRUD `self.heap` is unchanged (no fsm_meta).
+  **B2** (`4f4a69c`): free-space durable (value's slot = free bytes;
+  `ensure_directory` warms the free map on reopen — no cold re-probe);
+  `DiskBTree::insert_in_txn` makes the heap grow atomic (page init + FSM entry in
+  ONE mini-txn → **no orphan on crash mid-grow**); `DiskBTree::set_value`
+  (in-place, no split) lets vacuum `compact_page` persist reclaimed free durably
+  (autovacuum integration; P26 still green). **Throughput guard:** the hot
+  per-row insert path does NOT write the tree (a full-page-image `WAL_INDEX` per
+  row would bloat the WAL) — free-space persisted at alloc + vacuum only.
+  **Crash harness 26 → 28** (P27 durable FSM directory survives a no-checkpoint
+  crash + reopened heap appends at the recovered tail; P28 atomic grow leaves no
+  orphan). **B-accept** (`benches/decompose.rs`, `UNIDB_BENCH=fsm`/`b3`, native
+  M5 Pro, vs `main` `ecd2f1e`): **(1) correctness PASS** — before dies at ~876
+  pages (`HeapFull 8141`), after builds clean to ≥2,000 pages; **(2) insert cost
+  at scale** — before rises 65→108→173 µs/row (O(pages) blob rewrite) then
+  errors, after flat ~17–28 µs/row (~6.5× faster at 750 pages); **(3) concurrent
+  SQL writes (the requested refinement) — NO measurable improvement** (before/
+  after B3 indistinguishable ~1150–1230 commits/s @ 8 writers): the microbench
+  table is ~40 pages so `set_pages` rarely fired; the bottleneck is group-commit
+  fsync + the per-statement catalog `RwLock`, unchanged — the `set_pages` win
+  only bites at large table sizes (the (2) numbers). Full detail +
+  before/after tables in `PROGRESS.md`'s "Durable on-disk FSM" entry;
+  spec/status in `docs/backlog/durable_fsm_catalog_pagelist.md`.
 - **Autovacuum — COMPLETE (2026-07-09), on branch `autovacuum` (one PR,
   checkpoints A1–A4 as ordered commits).** Closes the one automation gap the
   Postgres baseline surfaced: M10 `Engine::vacuum` was manual-only, so sustained
@@ -385,7 +425,7 @@
   parked Phase 2 SQL capability plan (`docs/backlog/
   phase2_sql_capability_expansion.md`). See Open questions below for
   what's still unresolved from M1-M5.
-- **Last updated:** 2026-07-09
+- **Last updated:** 2026-07-10
 
 ### Phase 1 — ACID & storage foundation (Core lane, branch `acid-hardening`)
 
