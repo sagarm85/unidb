@@ -54,6 +54,7 @@ pub fn build_router(
             "/indexes/{table}/{column}/status",
             get(handlers::get_index_status),
         )
+        .route("/tables", get(handlers::get_tables))
         .route("/tables/{table}/events", post(handlers::post_enable_events))
         .route("/events/subscribe", get(sse::get_events_subscribe))
         .route("/events/ack", post(handlers::post_events_ack))

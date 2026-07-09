@@ -747,7 +747,9 @@ Surface (see `docs/REST_API.md` for contracts): `POST /sql` (atomic
 `;`-separated multi-statement transactions — free, since `execute_sql`
 already runs a whole string under one xid), `POST /cypher`, raw row CRUD
 (`/rows...`), graph routes (`/edges...`), indexing
-(`POST /indexes`, status), events (`POST /tables/{t}/events`,
+(`POST /indexes`, status), schema introspection
+(`GET /tables` — user tables + columns, internal `__…__` tables hidden, S1),
+events (`POST /tables/{t}/events`,
 `GET /events/subscribe` SSE, `POST /events/ack`), `POST /checkpoint`,
 `GET /metrics` (Prometheus), `POST /txn/begin` (introspection only — no
 multi-request transaction sessions exist). Auth is **verify-only JWT**

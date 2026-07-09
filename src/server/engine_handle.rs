@@ -250,6 +250,11 @@ impl EngineHandle {
         self.on_engine(|e| e.checkpoint()).await
     }
 
+    /// Snapshot every table's schema for `GET /tables` introspection (S1).
+    pub async fn table_defs(&self) -> Result<Vec<crate::catalog::TableDef>> {
+        self.on_engine(|e| Ok(e.table_defs())).await
+    }
+
     /// A `pg_stat_*`-style activity + counter snapshot (P6.g).
     pub async fn stats(&self) -> Result<crate::EngineStats> {
         self.on_engine(|e| Ok(e.stats())).await

@@ -19,9 +19,10 @@ use crate::{
     heap::RowId,
     server::{
         dto::{
-            exec_result_to_json, slot_to_json, AckEventsRequest, AdvanceSlotRequest,
-            CreateEdgeRequest, CreateSlotRequest, CypherRequest, DeleteEdgeRequest, RowIdResponse,
-            SetIndexRequest, SqlRequest, StreamQuery,
+            exec_result_to_json, is_internal_table, slot_to_json, table_def_to_info,
+            AckEventsRequest, AdvanceSlotRequest, CreateEdgeRequest, CreateSlotRequest,
+            CypherRequest, DeleteEdgeRequest, RowIdResponse, SetIndexRequest, SqlRequest,
+            StreamQuery, TableInfo,
         },
         engine_handle::EngineHandle,
         error::ApiError,
@@ -281,6 +282,28 @@ pub async fn get_stats(
 ) -> std::result::Result<Json<serde_json::Value>, ApiError> {
     let stats = state.engine.stats().await.map_err(ApiError)?;
     Ok(Json(serde_json::to_value(stats).unwrap_or_default()))
+}
+
+/// Schema introspection (S1): list every **user** table with its columns.
+/// Internal engine tables (`__events__`/`__edges__`/`__lobs__`/`__consumers__`)
+/// are omitted. No row counts — a count is a full scan, deliberately out of
+/// scope for v1 (see `docs/REST_API.md`). Auth-gated exactly like every other
+/// data-plane route.
+pub async fn get_tables(
+    State(state): State<AppState>,
+) -> std::result::Result<Json<Vec<TableInfo>>, ApiError> {
+    let mut tables: Vec<TableInfo> = state
+        .engine
+        .table_defs()
+        .await?
+        .iter()
+        .filter(|def| !is_internal_table(&def.name))
+        .map(table_def_to_info)
+        .collect();
+    // `Catalog::tables` yields tables in `HashMap` order; sort by name so the
+    // response is deterministic (stable for clients, tests, and diffs).
+    tables.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(Json(tables))
 }
 
 // ── replication (P6.b) ─────────────────────────────────────────────────────

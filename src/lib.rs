@@ -1153,6 +1153,15 @@ impl Engine {
         col.index.map(|_| IndexStatus::Ready)
     }
 
+    /// Snapshot every table's schema for introspection (`GET /tables`, S1).
+    /// Returns owned clones so the caller never holds the catalog read lock,
+    /// in no particular order (mirrors `Catalog::tables`). Includes the
+    /// internal `__…__` tables; callers that want only user tables filter by
+    /// name themselves (the REST layer does — see `server/dto.rs`).
+    pub fn table_defs(&self) -> Vec<TableDef> {
+        cat_read(&self.catalog).tables().cloned().collect()
+    }
+
     // ── M4.a: event capture opt-in ──────────────────────────────────────────
 
     /// Opt a table into event capture (M4): from this point on, every
