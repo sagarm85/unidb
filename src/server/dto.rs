@@ -194,6 +194,43 @@ pub struct AckEventsRequest {
     pub up_to_seq: i64,
 }
 
+// ── replication (P6.b) ─────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct CreateSlotRequest {
+    pub name: String,
+    /// `true` for a synchronous slot (commit waits for the consumer, P6.c);
+    /// defaults to async.
+    #[serde(default)]
+    pub sync: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdvanceSlotRequest {
+    /// The LSN the consumer has durably applied up to.
+    pub lsn: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StreamQuery {
+    /// Ship records strictly after this LSN (default 0 = from the beginning of
+    /// retained WAL).
+    #[serde(default)]
+    pub from_lsn: u64,
+}
+
+/// JSON view of a replication slot.
+pub fn slot_to_json(info: &crate::replication::SlotInfo) -> serde_json::Value {
+    serde_json::json!({
+        "name": info.name,
+        "restart_lsn": info.restart_lsn,
+        "kind": match info.kind {
+            crate::replication::SlotKind::Async => "async",
+            crate::replication::SlotKind::Sync => "sync",
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

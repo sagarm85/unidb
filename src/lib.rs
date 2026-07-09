@@ -63,6 +63,7 @@ pub mod query_limits;
 pub mod queue;
 pub mod read_handle;
 pub mod recovery;
+pub mod replication;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod sql;
@@ -82,7 +83,7 @@ use crate::{
     control::ControlData,
     disk_vector::DiskIvfIndex,
     error::Result,
-    format::{PageId, Xid, DEFAULT_PAGE_SIZE},
+    format::{Lsn, PageId, Xid, DEFAULT_PAGE_SIZE},
     graph::{
         edges::{self, Edge},
         executor as graph_executor,
@@ -247,6 +248,11 @@ pub struct Engine {
     /// low-frequency write paths — correctness first; finer-grained index
     /// concurrency (latch-coupled B-tree writes) is future work.
     write_serial: Mutex<()>,
+    /// Replication slots (P6.b). Each slot pins a `restart_lsn` the WAL must be
+    /// retained from; the checkpoint truncation floor is
+    /// `min(checkpoint_lsn, min slot restart_lsn)` so a consumer's segments are
+    /// never deleted before it has streamed them. Persisted in `slots.json`.
+    replication: Arc<crate::replication::SlotRegistry>,
 }
 
 /// `Engine` must be safely **shareable** across threads (P5.e: a pool of N
@@ -406,6 +412,9 @@ impl Engine {
             derive_next_lob_id(&catalog, &txn_mgr, &pool, &wal, &lock_mgr, page_size_usize)?;
         let next_event_seq =
             derive_next_event_seq(&catalog, &txn_mgr, &pool, &wal, &lock_mgr, page_size_usize)?;
+        // Replication slots (P6.b): persisted retention positions loaded from
+        // `slots.json` — they hold the WAL truncation floor back at checkpoint.
+        let replication = Arc::new(crate::replication::SlotRegistry::open(dir)?);
 
         // Phase 3: every secondary index is durable and crash-recovered — the
         // B-Tree/full-text/edge indexes as `DiskBTree`s (P3.a/P3.b), the vector
@@ -432,6 +441,7 @@ impl Engine {
             last_checkpoint: Mutex::new(Instant::now()),
             checkpoints_triggered: AtomicU64::new(0),
             write_serial: Mutex::new(()),
+            replication,
         })
     }
 
@@ -1380,18 +1390,65 @@ impl Engine {
     /// `xid`, is not part of any user transaction's lifecycle, and is safe
     /// to call at any time (it only touches already-committed state).
     pub fn checkpoint(&self) -> Result<()> {
+        // P6.b: hold the WAL truncation floor back to the minimum replication
+        // slot position so a consumer's un-streamed segments survive the
+        // checkpoint. No slots → `Lsn::MAX` → truncate freely to the ckpt LSN.
+        let wal_retain_lsn = self.replication.min_restart_lsn().unwrap_or(Lsn::MAX);
         checkpoint::run(
             &self.pool,
             &self.wal,
             &self.control_path,
             &self.control,
             self.txn_mgr.next_xid(),
+            wal_retain_lsn,
         )
     }
 
     /// Flush all dirty pages without a full checkpoint (used in tests).
     pub fn flush(&self) -> Result<()> {
         self.pool.flush_all(self.wal.durable_lsn())
+    }
+
+    // ── Replication slots + WAL shipping (P6.b) ────────────────────────────────
+
+    /// Create a replication slot starting at the current WAL tail — the consumer
+    /// (read replica, archiver) streams everything committed from now on and the
+    /// slot pins the WAL so those records survive a checkpoint until confirmed.
+    pub fn create_replication_slot(
+        &self,
+        name: &str,
+        kind: replication::SlotKind,
+    ) -> Result<replication::SlotInfo> {
+        let start = self.wal.current_lsn();
+        self.replication.create(name, start, kind)
+    }
+
+    /// Drop a replication slot, releasing its WAL retention (a dropped slot no
+    /// longer holds the checkpoint truncation floor back).
+    pub fn drop_replication_slot(&self, name: &str) -> Result<()> {
+        self.replication.drop_slot(name)
+    }
+
+    /// Advance a slot's confirmed position after a consumer has durably applied
+    /// up to `lsn`. Monotonic — a stale confirmation never rewinds retention.
+    pub fn advance_replication_slot(&self, name: &str, lsn: Lsn) -> Result<()> {
+        self.replication.advance(name, lsn)
+    }
+
+    /// Snapshot of every replication slot (for the REST layer + monitoring).
+    pub fn replication_slots(&self) -> Vec<replication::SlotInfo> {
+        self.replication.list()
+    }
+
+    /// The current WAL tail LSN — a replica's starting point for streaming.
+    pub fn wal_current_lsn(&self) -> Lsn {
+        self.wal.current_lsn()
+    }
+
+    /// Ship every WAL record after `from_lsn` as a framed byte stream (P6.b) the
+    /// replica decodes with [`crate::wal::decode_stream`] and applies via redo.
+    pub fn ship_wal(&self, from_lsn: Lsn) -> Result<Vec<u8>> {
+        self.wal.ship_from(from_lsn)
     }
 
     /// Reclaim physical space held by dead tuple versions (M10) — the explicit,

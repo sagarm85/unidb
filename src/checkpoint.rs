@@ -8,7 +8,7 @@ use crate::{
     bufferpool::BufferPool,
     control::{self, ControlData},
     error::Result,
-    format::Xid,
+    format::{Lsn, Xid},
     wal::Wal,
 };
 
@@ -18,12 +18,18 @@ use crate::{
 /// the WAL may no longer contain any `WAL_TXN_BEGIN` record for
 /// `Engine::open`'s recovery scan to find. See `format.rs`'s v2->v3 note
 /// and `control.rs`'s module doc for the bug this closes.
+/// `wal_retain_lsn` (P6.b) is the WAL retention floor demanded by replication
+/// slots — the minimum `restart_lsn` across all slots. The WAL is truncated to
+/// `min(checkpoint_lsn, wal_retain_lsn)` so a slot's un-streamed segments are
+/// never deleted. `Lsn::MAX` means "no slot floor" (truncate freely to the
+/// checkpoint LSN).
 pub fn run(
     pool: &BufferPool,
     wal: &Wal,
     control_path: &Path,
     control: &Mutex<ControlData>,
     next_xid: Xid,
+    wal_retain_lsn: Lsn,
 ) -> Result<()> {
     tracing::info!("checkpoint started");
 
@@ -51,10 +57,17 @@ pub fn run(
         control::write(control_path, &control)?;
     }
 
-    // 4. Truncate WAL: records before ckpt_lsn are now redundant.
-    wal.truncate_before(ckpt_lsn)?;
+    // 4. Truncate WAL: records before the truncation floor are now redundant.
+    //    The floor is the checkpoint LSN, held back by any replication slot's
+    //    retained position (P6.b) so a consumer's WAL is never removed early.
+    let truncate_to = ckpt_lsn.min(wal_retain_lsn);
+    wal.truncate_before(truncate_to)?;
 
-    tracing::info!(checkpoint_lsn = ckpt_lsn, "checkpoint complete");
+    tracing::info!(
+        checkpoint_lsn = ckpt_lsn,
+        truncate_to,
+        "checkpoint complete"
+    );
     Ok(())
 }
 
@@ -80,7 +93,7 @@ mod tests {
 
         heap.insert(b"checkpoint_test", 1, &pool, &wal).unwrap();
 
-        run(&pool, &wal, &ctrl_path, &ctrl, 7).unwrap();
+        run(&pool, &wal, &ctrl_path, &ctrl, 7, Lsn::MAX).unwrap();
         let ckpt_lsn = ctrl.lock().unwrap().checkpoint_lsn;
         assert!(ckpt_lsn > INVALID_LSN);
 

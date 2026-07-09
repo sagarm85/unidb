@@ -453,7 +453,7 @@ fn p11_torn_page_restored_from_full_page_image() {
         // modification opens a fresh interval and must log a full-page image.
         let r1 = heap.insert(b"r1_committed", 1, &pool, &wal).unwrap();
         pool.flush_all(wal.durable_lsn()).unwrap();
-        checkpoint::run(&pool, &wal, &ctrl_p, &control, 2).unwrap();
+        checkpoint::run(&pool, &wal, &ctrl_p, &control, 2, u64::MAX).unwrap();
 
         // R2 lands on the SAME page (small rows share a page): the insert logs
         // WAL_FPI(page, the clean image still holding only R1) then the

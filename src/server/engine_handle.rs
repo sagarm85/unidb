@@ -226,6 +226,39 @@ impl EngineHandle {
         self.on_engine(|e| e.checkpoint()).await
     }
 
+    // ── Replication slots + WAL shipping (P6.b) ────────────────────────────────
+
+    pub async fn create_replication_slot(
+        &self,
+        name: String,
+        kind: crate::replication::SlotKind,
+    ) -> Result<crate::replication::SlotInfo> {
+        self.on_engine(move |e| e.create_replication_slot(&name, kind))
+            .await
+    }
+
+    pub async fn drop_replication_slot(&self, name: String) -> Result<()> {
+        self.on_engine(move |e| e.drop_replication_slot(&name))
+            .await
+    }
+
+    pub async fn advance_replication_slot(&self, name: String, lsn: u64) -> Result<()> {
+        self.on_engine(move |e| e.advance_replication_slot(&name, lsn))
+            .await
+    }
+
+    pub async fn replication_slots(&self) -> Result<Vec<crate::replication::SlotInfo>> {
+        self.on_engine(|e| Ok(e.replication_slots())).await
+    }
+
+    /// Ship the WAL record stream after `from_lsn` as framed bytes (P6.b), for a
+    /// replica to decode + apply. Returns the primary's current tail LSN too, so
+    /// the caller knows where the batch ends without decoding it.
+    pub async fn ship_wal(&self, from_lsn: u64) -> Result<(u64, Vec<u8>)> {
+        self.on_engine(move |e| Ok((e.wal_current_lsn(), e.ship_wal(from_lsn)?)))
+            .await
+    }
+
     /// Release the shared engine. Every write already made itself durable at
     /// commit (group commit forces the WAL fsync before `commit` returns), so
     /// there is nothing to flush here; dropping the last `Arc<Engine>` closes

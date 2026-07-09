@@ -120,6 +120,11 @@ pub enum DbError {
     /// restart, not retrying against the same `EngineHandle`.
     #[error("engine is unavailable: the writer thread has stopped responding")]
     EngineUnavailable,
+
+    /// Replication / slot management error (P6.b): e.g. a slot name already
+    /// exists, is unknown, or a slots-file (de)serialization failed.
+    #[error("replication error: {0}")]
+    Replication(String),
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;

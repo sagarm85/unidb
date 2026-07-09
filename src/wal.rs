@@ -755,6 +755,51 @@ impl Wal {
         }
         Ok(records)
     }
+
+    /// WAL shipping (P6.b): every record strictly after `from_lsn`, in LSN order
+    /// — what a replica or archiver needs to catch up from its last-applied LSN.
+    /// v1 scans all segments then filters; skipping already-consumed segments by
+    /// their base LSN is a future optimization.
+    pub fn records_from(&self, from_lsn: Lsn) -> Result<Vec<WalRecord>> {
+        let dir = self.lock().dir.clone();
+        let mut recs = Self::scan_file(&dir)?;
+        recs.retain(|r| r.lsn > from_lsn);
+        Ok(recs)
+    }
+
+    /// Serialize every record after `from_lsn` into a framed byte stream that a
+    /// replica applies via [`decode_stream`] + redo (the P6.c consumer side).
+    pub fn ship_from(&self, from_lsn: Lsn) -> Result<Vec<u8>> {
+        Ok(encode_stream(&self.records_from(from_lsn)?))
+    }
+}
+
+/// Frame a list of WAL records into a `[len:u32][record]...` byte stream (the
+/// WAL-shipping wire format, P6.b) — the same framing used inside a segment.
+pub fn encode_stream(records: &[WalRecord]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for r in records {
+        let encoded = encode_record(r);
+        out.extend_from_slice(&u32_to_le(encoded.len() as u32));
+        out.extend_from_slice(&encoded);
+    }
+    out
+}
+
+/// Decode a framed WAL-shipping byte stream back into records (P6.c consumer).
+pub fn decode_stream(bytes: &[u8]) -> Result<Vec<WalRecord>> {
+    let mut records = Vec::new();
+    let mut pos = 0usize;
+    while pos + 4 <= bytes.len() {
+        let len = u32_from_le(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        if pos + len > bytes.len() {
+            return Err(DbError::WalCorrupt { lsn: 0 });
+        }
+        records.push(decode_record(&bytes[pos..pos + len])?);
+        pos += len;
+    }
+    Ok(records)
 }
 
 /// Read every record from a single segment file, skipping its header. Stops at
