@@ -136,6 +136,14 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn env_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(default)
+}
+
 /// Auto-checkpoint policy (P1.e). A checkpoint bounds WAL growth (and the P1.a
 /// full-page-image volume); before P1.e it was manual-only, so the WAL grew
 /// unbounded. The engine runs the existing checkpoint path inline on the writer
@@ -161,6 +169,59 @@ impl Default for AutoCheckpointConfig {
             timeout: Duration::from_secs(env_u64("UNIDB_CHECKPOINT_TIMEOUT_SECS", 60)),
             max_wal_size: env_u64("UNIDB_MAX_WAL_SIZE_BYTES", 64 * 1024 * 1024),
         }
+    }
+}
+
+/// Autovacuum policy (A2), mirroring [`AutoCheckpointConfig`]'s shape and its
+/// auto-trigger precedent (P1.e). A background thread (A3) wakes every
+/// `naptime`, and when the Postgres-style trigger fires
+///
+/// ```text
+/// dead_tuple_estimate > threshold + scale_factor * live_tuple_estimate
+/// ```
+///
+/// it calls the existing, already-safe [`Engine::vacuum`] (M10) — autovacuum
+/// only auto-*triggers* reclamation; it does not re-implement it, nor touch the
+/// vacuum horizon (which stays correct under concurrency, P5.c, and pinned by
+/// replication slots, P6.b). Default on with conservative Postgres-like
+/// thresholds so an idle or light workload never triggers it.
+#[derive(Debug, Clone, Copy)]
+pub struct AutoVacuumConfig {
+    /// Master switch. Defaults on (env `UNIDB_AUTOVACUUM_ENABLED=0` disables).
+    pub enabled: bool,
+    /// Minimum dead-tuple count before a vacuum is even considered (env
+    /// `UNIDB_AUTOVACUUM_THRESHOLD`, default 50 — Postgres's default).
+    pub threshold: u64,
+    /// Fraction of the live-tuple estimate added to `threshold` so larger tables
+    /// tolerate more churn before vacuuming (env `UNIDB_AUTOVACUUM_SCALE_FACTOR`,
+    /// default 0.2 — Postgres's default).
+    pub scale_factor: f64,
+    /// How long the background launcher sleeps between policy checks (env
+    /// `UNIDB_AUTOVACUUM_NAPTIME_SECS`, default 60 s — Postgres's default).
+    pub naptime: Duration,
+}
+
+impl Default for AutoVacuumConfig {
+    fn default() -> Self {
+        Self {
+            enabled: std::env::var("UNIDB_AUTOVACUUM_ENABLED").as_deref() != Ok("0"),
+            threshold: env_u64("UNIDB_AUTOVACUUM_THRESHOLD", 50),
+            scale_factor: env_f64("UNIDB_AUTOVACUUM_SCALE_FACTOR", 0.2),
+            naptime: Duration::from_secs(env_u64("UNIDB_AUTOVACUUM_NAPTIME_SECS", 60).max(1)),
+        }
+    }
+}
+
+impl AutoVacuumConfig {
+    /// The Postgres-style trigger: `dead > threshold + scale_factor * live`.
+    /// Pure function of the config + the two estimates, so it is trivially
+    /// testable and the launcher (A3) and any caller evaluate it identically.
+    pub fn should_vacuum(&self, dead: u64, live: u64) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let trigger = self.threshold as f64 + self.scale_factor * live as f64;
+        dead as f64 > trigger
     }
 }
 
@@ -253,6 +314,12 @@ pub struct Engine {
     /// (`vacuum_inner`), so vacuum corrects any accumulated drift — again
     /// mirroring how Postgres refreshes its estimate on (auto)vacuum/analyze.
     live_tuples: AtomicU64,
+    /// Autovacuum policy (A2). Behind `Mutex` (like `auto_checkpoint`) for
+    /// `&self` mutation. The background launcher (A3) reads this each naptime.
+    autovacuum: Mutex<AutoVacuumConfig>,
+    /// How many autovacuum passes the background launcher has run this session
+    /// (A4 observability). Distinct from manual `Engine::vacuum` calls.
+    autovacuums_triggered: AtomicU64,
     /// Serializes the non-CRUD write paths that do a *non-atomic*
     /// read-catalog-then-mutate-a-shared-secondary-index sequence — graph edges
     /// (the `__edges__.from_id` `DiskBTree` + page list), large objects (the
@@ -428,6 +495,11 @@ fn ctrl_lock_lc(m: &Mutex<Instant>) -> std::sync::MutexGuard<'_, Instant> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Poison-tolerant lock of the autovacuum policy `Mutex` (A2).
+fn ctrl_lock_av(m: &Mutex<AutoVacuumConfig>) -> std::sync::MutexGuard<'_, AutoVacuumConfig> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 impl Engine {
     /// Open (or create) a database at `dir`. Pass `page_size = 0` to use the
     /// default. The buffer-pool capacity comes from `UNIDB_BUFFER_POOL_PAGES`
@@ -583,6 +655,8 @@ impl Engine {
             checkpoints_triggered: AtomicU64::new(0),
             dead_tuples: AtomicU64::new(0),
             live_tuples: AtomicU64::new(0),
+            autovacuum: Mutex::new(AutoVacuumConfig::default()),
+            autovacuums_triggered: AtomicU64::new(0),
             write_serial: Mutex::new(()),
             replication,
             authz,
@@ -1636,6 +1710,32 @@ impl Engine {
     /// observability.
     pub fn checkpoints_triggered(&self) -> u64 {
         self.checkpoints_triggered.load(Ordering::SeqCst)
+    }
+
+    /// Current autovacuum policy (A2).
+    pub fn autovacuum_config(&self) -> AutoVacuumConfig {
+        *ctrl_lock_av(&self.autovacuum)
+    }
+
+    /// Replace the autovacuum policy (A2). Takes effect on the launcher's next
+    /// naptime wake-up.
+    pub fn set_autovacuum_config(&self, cfg: AutoVacuumConfig) {
+        *ctrl_lock_av(&self.autovacuum) = cfg;
+    }
+
+    /// How many autovacuum passes the background launcher has run this session
+    /// (A4) — distinct from manual `Engine::vacuum` calls.
+    pub fn autovacuums_triggered(&self) -> u64 {
+        self.autovacuums_triggered.load(Ordering::Relaxed)
+    }
+
+    /// Whether the autovacuum trigger currently fires for the live estimates
+    /// (A2): `dead > threshold + scale_factor * live`, and the policy is
+    /// enabled. The background launcher (A3) calls this each naptime; exposed so
+    /// tests can assert the policy without waiting on the thread.
+    pub fn autovacuum_should_run(&self) -> bool {
+        self.autovacuum_config()
+            .should_vacuum(self.dead_tuple_estimate(), self.live_tuple_estimate())
     }
 
     /// Estimated dead tuple versions accumulated since the last vacuum (A1).
@@ -4247,6 +4347,60 @@ mod tests {
         assert!(report.versions_reclaimed >= 6, "{report:?}");
         assert_eq!(engine.dead_tuple_estimate(), 0);
         assert_eq!(engine.live_tuple_estimate() as usize, report.rows_scanned);
+    }
+
+    #[test]
+    fn autovacuum_policy_fires_at_the_postgres_threshold() {
+        let cfg = AutoVacuumConfig {
+            enabled: true,
+            threshold: 50,
+            scale_factor: 0.2,
+            naptime: Duration::from_secs(60),
+        };
+        // trigger = 50 + 0.2 * 1000 = 250.
+        assert!(!cfg.should_vacuum(250, 1000), "at the boundary: not yet");
+        assert!(cfg.should_vacuum(251, 1000), "just over the boundary");
+        assert!(!cfg.should_vacuum(49, 0), "below the flat threshold");
+        assert!(cfg.should_vacuum(51, 0), "above the flat threshold");
+
+        // Disabled ⇒ never fires, however much churn.
+        let off = AutoVacuumConfig {
+            enabled: false,
+            ..cfg
+        };
+        assert!(!off.should_vacuum(1_000_000, 0));
+    }
+
+    #[test]
+    fn autovacuum_should_run_reflects_live_estimates() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        engine.set_autovacuum_config(AutoVacuumConfig {
+            enabled: true,
+            threshold: 5,
+            scale_factor: 0.0,
+            naptime: Duration::from_secs(60),
+        });
+        assert!(!engine.autovacuum_should_run(), "no churn yet");
+
+        let x = engine.begin().unwrap();
+        let mut rid = engine.insert(x, b"v0").unwrap();
+        engine.commit(x).unwrap();
+        for i in 0..6 {
+            let x = engine.begin().unwrap();
+            rid = engine.update(x, rid, format!("v{i}").as_bytes()).unwrap();
+            engine.commit(x).unwrap();
+        }
+        assert!(
+            engine.autovacuum_should_run(),
+            "6 dead > threshold 5: {} dead",
+            engine.dead_tuple_estimate()
+        );
+        engine.vacuum().unwrap();
+        assert!(
+            !engine.autovacuum_should_run(),
+            "vacuum reset the dead estimate"
+        );
     }
 
     #[test]
