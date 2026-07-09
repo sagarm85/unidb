@@ -34,7 +34,7 @@ use crate::{
 };
 
 mod replica;
-pub use replica::Replica;
+pub use replica::{copy_db_dir, Replica};
 
 /// The primary control-file state a replica must adopt to interpret the shipped
 /// WAL (P6.c). The catalog *content* rides the WAL (a `WAL_INSERT` on the

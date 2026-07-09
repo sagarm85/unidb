@@ -44,6 +44,10 @@
 //         and redoes them all, so every committed row is present on reopen.
 //         Whole-segment truncation then deletes only fully-consumed segments and
 //         the retained data still recovers.
+//   P19 – backup + PITR (P6.d): after a base backup, more committed writes are
+//         archived; the primary is lost ("crash"), and a restore of base +
+//         archived WAL into a fresh directory recovers every committed row —
+//         the backup/restore drill as a recovery path.
 
 use tempfile::tempdir;
 use unidb::{Engine, RowId};
@@ -1215,4 +1219,61 @@ fn p18_segmented_wal_recovers_across_multiple_segments() {
             "P18: row {i} must survive whole-segment truncation"
         );
     }
+}
+
+// ── P19: backup + PITR restore recovers after primary loss (P6.d) ────────────
+//
+// Take a base backup, commit more rows and archive the WAL, then lose the
+// primary directory entirely. Restoring base + archived WAL into a fresh
+// directory reconstructs every committed row — the backup/restore drill acting
+// as a recovery path.
+#[test]
+fn p19_backup_and_pitr_restore_after_primary_loss() {
+    use unidb::backup;
+    use unidb::sql::executor::ExecResult;
+
+    let src = tempdir().unwrap();
+    let base = tempdir().unwrap();
+    let archive = tempdir().unwrap();
+
+    {
+        let engine = open(src.path());
+        let xid = engine.begin().unwrap();
+        engine.execute_sql(xid, "CREATE TABLE t (id INT)").unwrap();
+        engine
+            .execute_sql(xid, "INSERT INTO t (id) VALUES (1)")
+            .unwrap();
+        engine.commit(xid).unwrap();
+        // Base backup (checkpoints internally), then more committed writes.
+        engine.base_backup(base.path()).unwrap();
+        for id in 2..=5 {
+            let xid = engine.begin().unwrap();
+            engine
+                .execute_sql(xid, &format!("INSERT INTO t (id) VALUES ({id})"))
+                .unwrap();
+            engine.commit(xid).unwrap();
+        }
+        engine.archive_wal(archive.path()).unwrap();
+        drop(engine);
+    }
+
+    // "Lose" the primary directory.
+    std::fs::remove_dir_all(src.path()).unwrap();
+
+    // Restore base + archived WAL into a fresh directory.
+    let dest = tempdir().unwrap();
+    backup::restore(base.path(), archive.path(), dest.path(), None).unwrap();
+
+    let restored = open(dest.path());
+    let xid = restored.begin().unwrap();
+    let rows = restored.execute_sql(xid, "SELECT id FROM t").unwrap();
+    restored.commit(xid).unwrap();
+    let n = match &rows[0] {
+        ExecResult::Rows(r) => r.len(),
+        other => panic!("expected rows, got {other:?}"),
+    };
+    assert_eq!(
+        n, 5,
+        "P19: restore must recover every committed row after primary loss"
+    );
 }

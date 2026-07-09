@@ -37,6 +37,7 @@
 // unsafe_code is denied crate-wide; mmap.rs is the sole exception (CLAUDE.md §4).
 #![deny(unsafe_code)]
 
+pub mod backup;
 pub mod btree_index;
 pub mod bufferpool;
 pub mod catalog;
@@ -1445,6 +1446,12 @@ impl Engine {
         self.wal.current_lsn()
     }
 
+    /// The database directory (parent of the control file) — used by backup and
+    /// base-snapshot tooling (P6.d).
+    pub fn data_dir(&self) -> &Path {
+        self.control_path.parent().unwrap_or_else(|| Path::new("."))
+    }
+
     /// The control-file state a replica must adopt alongside the shipped WAL
     /// (P6.c): the live catalog root and next-xid counter (the catalog *content*
     /// rides the WAL, but its root pointer + xid counter are control-file state).
@@ -1467,6 +1474,27 @@ impl Engine {
     /// replica decodes with [`crate::wal::decode_stream`] and applies via redo.
     pub fn ship_wal(&self, from_lsn: Lsn) -> Result<Vec<u8>> {
         self.wal.ship_from(from_lsn)
+    }
+
+    // ── Backups + PITR (P6.d) ──────────────────────────────────────────────────
+
+    /// Take an online **base backup** into `dest`: checkpoint (flush all pages +
+    /// truncate WAL to a consistent point), then copy the DB directory. The
+    /// result is directly openable (restore-to-base) and is the starting point
+    /// for point-in-time recovery via [`crate::backup::restore`]. Returns the
+    /// WAL LSN the backup is consistent as of.
+    pub fn base_backup(&self, dest: &Path) -> Result<Lsn> {
+        self.checkpoint()?;
+        crate::backup::base_backup_dir(self.data_dir(), dest)?;
+        Ok(self.wal_current_lsn())
+    }
+
+    /// Archive the WAL segment files into `archive_dir` (P6.d) for point-in-time
+    /// recovery — a plain copy of the append-only segments. Re-run to pick up
+    /// newly written records. Returns the number of segments archived.
+    pub fn archive_wal(&self, archive_dir: &Path) -> Result<usize> {
+        let wal_dir = self.data_dir().join("db.wal");
+        crate::backup::archive_wal_dir(&wal_dir, archive_dir)
     }
 
     /// The synchronous-replica durability option (P6.c): block until every
