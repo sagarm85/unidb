@@ -8,7 +8,7 @@
 //   [16..24] mini_txn_id u64
 //   [24]     rec_type    u8     (WAL_BEGIN / WAL_COMMIT / ABORT / INSERT / UPDATE / DELETE / CHECKPOINT)
 //   [25..27] _pad        u8 x2
-//   [27..29] page_id     u32    (for data records; 0 for control records — stored as u32)
+//   [27..33] page_id     u32    (for data records; 0 for control records — stored as u32)
 //   [31..33] slot        u16    (for data records; 0 for control records)
 //   [33..37] redo_len    u32
 //   [37..41] undo_len    u32
@@ -17,11 +17,23 @@
 //   last 4   crc32       u32    (over all bytes before crc field)
 //
 // Fixed header size: 41 bytes + redo_len + undo_len + 4 (crc)
+//
+// P5.b — CONCURRENT APPEND. All mutable state (the buffered file writer, the
+// LSN and mini-txn counters, the WAL-size counter, the durable frontier, the
+// deferred-sync/poison flags) lives under one `Mutex<WalInner>`, so the `Wal`
+// is `Sync` and every method takes `&self`. LSN allocation and the physical
+// append happen together under that lock, so many concurrent appenders produce
+// a correctly-ordered, non-interleaved log (monotonic LSNs, no torn records).
+// Group commit is unchanged: in `deferred_sync` mode appends skip the per-call
+// fsync, and one later `sync()` forces a single fsync covering every record
+// appended by every thread since — the amortization that makes throughput scale
+// with cores rather than fsyncs.
 
 use std::{
     fs::{File, OpenOptions},
     io::{BufWriter, Read, Seek, SeekFrom, Write},
     path::Path,
+    sync::{Mutex, MutexGuard},
 };
 
 use crate::{
@@ -106,38 +118,35 @@ fn decode_record(buf: &[u8]) -> Result<WalRecord> {
     })
 }
 
-pub struct Wal {
+/// The mutable WAL state guarded by one mutex (P5.b). LSN allocation and the
+/// physical append both happen while this is held, so concurrent appenders
+/// never interleave a partial record or hand out a duplicate/out-of-order LSN.
+struct WalInner {
     writer: BufWriter<File>,
     path: std::path::PathBuf,
     next_lsn: Lsn,
     next_mini_txn: u64,
-    /// Framed bytes currently in the WAL file (P1.e). Grows on every append,
-    /// reset to the kept size after `truncate_before` — so it is the WAL size
-    /// since the last checkpoint, the signal the `max_wal_size` auto-checkpoint
-    /// trigger watches. A running counter (no `stat` syscall on the hot path).
+    /// Framed bytes currently in the WAL file (P1.e) — the WAL size since the
+    /// last checkpoint, the signal the `max_wal_size` auto-checkpoint trigger
+    /// watches. A running counter (no `stat` syscall on the hot path).
     wal_bytes: u64,
     /// LSN of the last fsync'd record (the durable WAL frontier).
-    pub durable_lsn: Lsn,
-    /// Group-commit mode (M9). When `true`, `commit_mini_txn`/`abort_mini_txn`
-    /// /`commit_user_txn`/`abort_user_txn` append their records but skip the
-    /// per-call fsync; durability is forced explicitly by a later [`Self::sync`]
-    /// call. Off by default so the embedded API and the crash-injection harness
-    /// keep their per-statement durability guarantee. Only the server writer
-    /// thread — which owns the sole `Engine` handle and issues one `sync` per
-    /// drained request batch — turns this on.
+    durable_lsn: Lsn,
+    /// Group-commit mode (M9). When `true`, commit/abort records are appended
+    /// without a per-call fsync; durability is forced explicitly by a later
+    /// [`Wal::sync`]. Off by default so the embedded API and the crash harness
+    /// keep per-statement durability.
     deferred_sync: bool,
-    /// Set once an `fsync` has failed (or a fault was injected) — P1.b
-    /// (fsyncgate). A failed `fsync` may leave the OS having dropped the dirty
-    /// data while clearing its dirty bit, so retrying could falsely succeed.
-    /// Once poisoned, every durability call ([`Self::sync`] / the commit
-    /// fsyncs) returns [`DbError::DurabilityFailure`] instead of ever
-    /// reporting success again; the session is unrecoverable and must restart.
+    /// Set once an `fsync` has failed (P1.b, fsyncgate). Once poisoned every
+    /// durability call returns [`DbError::DurabilityFailure`]; the session is
+    /// unrecoverable and must restart.
     poisoned: bool,
-    /// Test/fault-injection hook (P1.b): when armed, the next `fsync` fails
-    /// (and poisons the WAL) *without* touching the real file, so a test can
-    /// deterministically prove the engine refuses to report durability on a
-    /// failed flush. Armed via [`Self::arm_fsync_fault`].
+    /// Test/fault-injection hook (P1.b): the next `fsync` fails and poisons.
     fsync_fault_armed: bool,
+}
+
+pub struct Wal {
+    inner: Mutex<WalInner>,
 }
 
 impl Wal {
@@ -148,92 +157,114 @@ impl Wal {
         } else {
             start_lsn + 1
         };
-        // Seed the WAL-size counter from the existing file (P1.e), so a reopen
-        // with a large pre-existing WAL still triggers `max_wal_size` promptly.
+        // Seed the WAL-size counter from the existing file (P1.e).
         let wal_bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
         tracing::info!(path = %path.display(), next_lsn, "WAL opened");
         Ok(Self {
-            writer: BufWriter::new(file),
-            path: path.to_path_buf(),
-            next_lsn,
-            next_mini_txn: 1,
-            wal_bytes,
-            durable_lsn: INVALID_LSN,
-            deferred_sync: false,
-            poisoned: false,
-            fsync_fault_armed: false,
+            inner: Mutex::new(WalInner {
+                writer: BufWriter::new(file),
+                path: path.to_path_buf(),
+                next_lsn,
+                next_mini_txn: 1,
+                wal_bytes,
+                durable_lsn: INVALID_LSN,
+                deferred_sync: false,
+                poisoned: false,
+                fsync_fault_armed: false,
+            }),
         })
     }
 
-    /// Framed bytes in the WAL since the last checkpoint truncation (P1.e) —
-    /// the signal the `max_wal_size` auto-checkpoint trigger watches.
+    fn lock(&self) -> MutexGuard<'_, WalInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The durable WAL frontier (LSN of the last fsync'd record). Accessor —
+    /// was a public field before P5.b's interior-mutability rework.
+    pub fn durable_lsn(&self) -> Lsn {
+        self.lock().durable_lsn
+    }
+
+    /// Framed bytes in the WAL since the last checkpoint truncation (P1.e).
     pub fn wal_bytes(&self) -> u64 {
-        self.wal_bytes
+        self.lock().wal_bytes
     }
 
     /// Arm a one-shot fsync fault (P1.b fault injection). The next `fsync`
-    /// fails and poisons the WAL, without writing the real file — for tests
-    /// that assert the engine never reports success on a failed flush.
-    pub fn arm_fsync_fault(&mut self) {
-        self.fsync_fault_armed = true;
+    /// fails and poisons the WAL, without writing the real file.
+    pub fn arm_fsync_fault(&self) {
+        self.lock().fsync_fault_armed = true;
     }
 
     /// Whether the WAL has latched into the poisoned state (an fsync failed).
     pub fn is_poisoned(&self) -> bool {
-        self.poisoned
+        self.lock().poisoned
     }
 
-    pub fn begin_mini_txn(&mut self) -> Result<(u64, Lsn)> {
-        let txn_id = self.next_mini_txn;
-        self.next_mini_txn += 1;
-        let lsn = self.append_raw(txn_id, INVALID_LSN, WAL_BEGIN, 0, 0, &[], &[])?;
+    pub fn begin_mini_txn(&self) -> Result<(u64, Lsn)> {
+        let mut inner = self.lock();
+        let txn_id = inner.next_mini_txn;
+        inner.next_mini_txn += 1;
+        let lsn = append_locked(&mut inner, txn_id, INVALID_LSN, WAL_BEGIN, 0, 0, &[], &[])?;
         tracing::debug!(mini_txn_id = txn_id, lsn, "WAL BEGIN");
         Ok((txn_id, lsn))
     }
 
-    pub fn commit_mini_txn(&mut self, txn_id: u64, prev_lsn: Lsn) -> Result<Lsn> {
-        let lsn = self.append_raw(txn_id, prev_lsn, WAL_COMMIT, 0, 0, &[], &[])?;
-        if !self.deferred_sync {
-            self.fsync()?;
+    pub fn commit_mini_txn(&self, txn_id: u64, prev_lsn: Lsn) -> Result<Lsn> {
+        let mut inner = self.lock();
+        let lsn = append_locked(&mut inner, txn_id, prev_lsn, WAL_COMMIT, 0, 0, &[], &[])?;
+        if !inner.deferred_sync {
+            fsync_locked(&mut inner)?;
         }
         tracing::debug!(
             mini_txn_id = txn_id,
             lsn,
-            deferred = self.deferred_sync,
+            deferred = inner.deferred_sync,
             "WAL COMMIT"
         );
         Ok(lsn)
     }
 
-    pub fn abort_mini_txn(&mut self, txn_id: u64, prev_lsn: Lsn) -> Result<Lsn> {
-        let lsn = self.append_raw(txn_id, prev_lsn, WAL_ABORT, 0, 0, &[], &[])?;
-        if !self.deferred_sync {
-            self.fsync()?;
+    pub fn abort_mini_txn(&self, txn_id: u64, prev_lsn: Lsn) -> Result<Lsn> {
+        let mut inner = self.lock();
+        let lsn = append_locked(&mut inner, txn_id, prev_lsn, WAL_ABORT, 0, 0, &[], &[])?;
+        if !inner.deferred_sync {
+            fsync_locked(&mut inner)?;
         }
         tracing::debug!(
             mini_txn_id = txn_id,
             lsn,
-            deferred = self.deferred_sync,
+            deferred = inner.deferred_sync,
             "WAL ABORT"
         );
         Ok(lsn)
     }
 
     pub fn log_insert(
-        &mut self,
+        &self,
         txn_id: u64,
         prev_lsn: Lsn,
         page_id: PageId,
         slot: u16,
         redo: &[u8],
     ) -> Result<Lsn> {
-        let lsn = self.append_raw(txn_id, prev_lsn, WAL_INSERT, page_id, slot, redo, &[])?;
+        let mut inner = self.lock();
+        let lsn = append_locked(
+            &mut inner,
+            txn_id,
+            prev_lsn,
+            WAL_INSERT,
+            page_id,
+            slot,
+            redo,
+            &[],
+        )?;
         tracing::trace!(mini_txn_id = txn_id, lsn, page_id, slot, "WAL INSERT");
         Ok(lsn)
     }
 
     pub fn log_update(
-        &mut self,
+        &self,
         txn_id: u64,
         prev_lsn: Lsn,
         page_id: PageId,
@@ -241,71 +272,112 @@ impl Wal {
         redo: &[u8],
         undo: &[u8],
     ) -> Result<Lsn> {
-        let lsn = self.append_raw(txn_id, prev_lsn, WAL_UPDATE, page_id, slot, redo, undo)?;
+        let mut inner = self.lock();
+        let lsn = append_locked(
+            &mut inner, txn_id, prev_lsn, WAL_UPDATE, page_id, slot, redo, undo,
+        )?;
         tracing::trace!(mini_txn_id = txn_id, lsn, page_id, slot, "WAL UPDATE");
         Ok(lsn)
     }
 
     pub fn log_delete(
-        &mut self,
+        &self,
         txn_id: u64,
         prev_lsn: Lsn,
         page_id: PageId,
         slot: u16,
         undo: &[u8],
     ) -> Result<Lsn> {
-        let lsn = self.append_raw(txn_id, prev_lsn, WAL_DELETE, page_id, slot, &[], undo)?;
+        let mut inner = self.lock();
+        let lsn = append_locked(
+            &mut inner,
+            txn_id,
+            prev_lsn,
+            WAL_DELETE,
+            page_id,
+            slot,
+            &[],
+            undo,
+        )?;
         tracing::trace!(mini_txn_id = txn_id, lsn, page_id, slot, "WAL DELETE");
         Ok(lsn)
     }
 
-    /// Log a vacuum mutation (M10), redo-only (no undo payload — reclaiming
+    /// Log a vacuum mutation (M10), redo-only (no undo — reclaiming
     /// already-dead-and-committed space is idempotent on replay). `slot !=
     /// u16::MAX` with an empty `redo` marks that one line pointer DEAD (M10.b);
     /// `slot == u16::MAX` with `redo` = a full compacted page image restores
     /// the page on replay (M10.d). See `format::WAL_VACUUM`.
     pub fn log_vacuum(
-        &mut self,
+        &self,
         txn_id: u64,
         prev_lsn: Lsn,
         page_id: PageId,
         slot: u16,
         redo: &[u8],
     ) -> Result<Lsn> {
-        let lsn = self.append_raw(txn_id, prev_lsn, WAL_VACUUM, page_id, slot, redo, &[])?;
+        let mut inner = self.lock();
+        let lsn = append_locked(
+            &mut inner,
+            txn_id,
+            prev_lsn,
+            WAL_VACUUM,
+            page_id,
+            slot,
+            redo,
+            &[],
+        )?;
         tracing::trace!(mini_txn_id = txn_id, lsn, page_id, slot, "WAL VACUUM");
         Ok(lsn)
     }
 
     /// Log a full-page image for torn-page protection (P1.a). `image` is the
-    /// entire clean page (`page_size` bytes) as it stood *before* the first
-    /// modification of `page_id` in the current checkpoint interval. Redo-only
-    /// (no undo — recovery uses it as the clean base and replays subsequent
-    /// incremental records on top). `slot` is `u16::MAX`: a whole-page record.
-    /// See `format::WAL_FPI` and `BufferPool::maybe_log_fpi`.
+    /// entire clean page as it stood *before* the first modification of
+    /// `page_id` in the current checkpoint interval. Redo-only. `slot` is
+    /// `u16::MAX`: a whole-page record. See `format::WAL_FPI`.
     pub fn log_fpi(
-        &mut self,
+        &self,
         txn_id: u64,
         prev_lsn: Lsn,
         page_id: PageId,
         image: &[u8],
     ) -> Result<Lsn> {
-        let lsn = self.append_raw(txn_id, prev_lsn, WAL_FPI, page_id, u16::MAX, image, &[])?;
+        let mut inner = self.lock();
+        let lsn = append_locked(
+            &mut inner,
+            txn_id,
+            prev_lsn,
+            WAL_FPI,
+            page_id,
+            u16::MAX,
+            image,
+            &[],
+        )?;
         tracing::trace!(mini_txn_id = txn_id, lsn, page_id, "WAL FPI");
         Ok(lsn)
     }
 
     /// Log a full B-Tree node/meta page image (P3.a — durable B-Tree).
-    /// Redo-only (no undo — see `format::WAL_INDEX`). `image` is the entire node
-    /// page (`page_size` bytes); `slot` is `u16::MAX` (a whole-page record).
+    /// Redo-only (see `format::WAL_INDEX`). `image` is the entire node page;
+    /// `slot` is `u16::MAX` (a whole-page record).
     pub fn log_index(
-        &mut self,
+        &self,
         txn_id: u64,
         prev_lsn: Lsn,
         page_id: PageId,
         image: &[u8],
     ) -> Result<Lsn> {
-        let lsn = self.append_raw(txn_id, prev_lsn, WAL_INDEX, page_id, u16::MAX, image, &[])?;
+        let mut inner = self.lock();
+        let lsn = append_locked(
+            &mut inner,
+            txn_id,
+            prev_lsn,
+            WAL_INDEX,
+            page_id,
+            u16::MAX,
+            image,
+            &[],
+        )?;
         tracing::trace!(mini_txn_id = txn_id, lsn, page_id, "WAL INDEX");
         Ok(lsn)
     }
@@ -315,133 +387,83 @@ impl Wal {
     // wire-format `mini_txn_id` field, so the on-disk record shape is
     // unchanged. Recovery distinguishes the two by `rec_type`.
 
-    pub fn begin_user_txn(&mut self, xid: Xid) -> Result<Lsn> {
-        let lsn = self.append_raw(xid, INVALID_LSN, WAL_TXN_BEGIN, 0, 0, &[], &[])?;
+    pub fn begin_user_txn(&self, xid: Xid) -> Result<Lsn> {
+        let mut inner = self.lock();
+        let lsn = append_locked(&mut inner, xid, INVALID_LSN, WAL_TXN_BEGIN, 0, 0, &[], &[])?;
         tracing::debug!(xid, lsn, "WAL TXN_BEGIN");
         Ok(lsn)
     }
 
-    pub fn commit_user_txn(&mut self, xid: Xid, prev_lsn: Lsn) -> Result<Lsn> {
-        let lsn = self.append_raw(xid, prev_lsn, WAL_TXN_COMMIT, 0, 0, &[], &[])?;
-        if !self.deferred_sync {
-            self.fsync()?;
+    pub fn commit_user_txn(&self, xid: Xid, prev_lsn: Lsn) -> Result<Lsn> {
+        let mut inner = self.lock();
+        let lsn = append_locked(&mut inner, xid, prev_lsn, WAL_TXN_COMMIT, 0, 0, &[], &[])?;
+        if !inner.deferred_sync {
+            fsync_locked(&mut inner)?;
         }
-        tracing::debug!(xid, lsn, deferred = self.deferred_sync, "WAL TXN_COMMIT");
+        tracing::debug!(xid, lsn, deferred = inner.deferred_sync, "WAL TXN_COMMIT");
         Ok(lsn)
     }
 
-    pub fn abort_user_txn(&mut self, xid: Xid, prev_lsn: Lsn) -> Result<Lsn> {
-        let lsn = self.append_raw(xid, prev_lsn, WAL_TXN_ABORT, 0, 0, &[], &[])?;
-        if !self.deferred_sync {
-            self.fsync()?;
+    pub fn abort_user_txn(&self, xid: Xid, prev_lsn: Lsn) -> Result<Lsn> {
+        let mut inner = self.lock();
+        let lsn = append_locked(&mut inner, xid, prev_lsn, WAL_TXN_ABORT, 0, 0, &[], &[])?;
+        if !inner.deferred_sync {
+            fsync_locked(&mut inner)?;
         }
-        tracing::debug!(xid, lsn, deferred = self.deferred_sync, "WAL TXN_ABORT");
+        tracing::debug!(xid, lsn, deferred = inner.deferred_sync, "WAL TXN_ABORT");
         Ok(lsn)
     }
 
-    /// Enable/disable group-commit deferral (M9). See the `deferred_sync`
-    /// field doc. When turning it **off**, callers should normally call
-    /// [`Self::sync`] first to make anything appended-but-unsynced durable.
-    pub fn set_deferred_sync(&mut self, deferred: bool) {
-        self.deferred_sync = deferred;
+    /// Enable/disable group-commit deferral (M9). When turning it **off**,
+    /// callers should normally call [`Self::sync`] first to make anything
+    /// appended-but-unsynced durable.
+    pub fn set_deferred_sync(&self, deferred: bool) {
+        self.lock().deferred_sync = deferred;
     }
 
     /// Force every record appended so far to durable storage and advance the
-    /// durable frontier. In group-commit mode the writer thread calls this
-    /// exactly once per drained batch, amortizing one fsync across every
-    /// transaction that committed in that batch.
-    pub fn sync(&mut self) -> Result<()> {
-        self.fsync()
+    /// durable frontier. In group-commit mode the caller invokes this once per
+    /// drained batch, amortizing one fsync across every transaction that
+    /// committed in that batch — the P5.b/M9 win.
+    pub fn sync(&self) -> Result<()> {
+        let mut inner = self.lock();
+        fsync_locked(&mut inner)
     }
 
-    pub fn log_checkpoint(&mut self) -> Result<Lsn> {
+    pub fn log_checkpoint(&self) -> Result<Lsn> {
+        let mut inner = self.lock();
         let txn_id = 0;
-        let lsn = self.append_raw(txn_id, INVALID_LSN, WAL_CHECKPOINT, 0, 0, &[], &[])?;
-        self.fsync()?;
+        let lsn = append_locked(
+            &mut inner,
+            txn_id,
+            INVALID_LSN,
+            WAL_CHECKPOINT,
+            0,
+            0,
+            &[],
+            &[],
+        )?;
+        fsync_locked(&mut inner)?;
         tracing::info!(lsn, "WAL CHECKPOINT written");
         Ok(lsn)
     }
 
     pub fn current_lsn(&self) -> Lsn {
-        self.next_lsn - 1
-    }
-
-    #[allow(clippy::too_many_arguments)] // internal low-level WAL primitive
-    fn append_raw(
-        &mut self,
-        mini_txn_id: u64,
-        prev_lsn: Lsn,
-        rec_type: u8,
-        page_id: PageId,
-        slot: u16,
-        redo: &[u8],
-        undo: &[u8],
-    ) -> Result<Lsn> {
-        let lsn = self.next_lsn;
-        self.next_lsn += 1;
-        let rec = WalRecord {
-            lsn,
-            prev_lsn,
-            mini_txn_id,
-            rec_type,
-            page_id,
-            slot,
-            redo: redo.to_vec(),
-            undo: undo.to_vec(),
-        };
-        let encoded = encode_record(&rec);
-        let len = encoded.len() as u32;
-        self.writer.write_all(&u32_to_le(len))?;
-        self.writer.write_all(&encoded)?;
-        self.wal_bytes += 4 + encoded.len() as u64; // P1.e: track WAL size
-        Ok(lsn)
-    }
-
-    fn fsync(&mut self) -> Result<()> {
-        // P1.b: once poisoned, never report success again — a prior fsync
-        // failure means we cannot trust the durable frontier.
-        if self.poisoned {
-            return Err(DbError::DurabilityFailure(
-                "WAL is poisoned by an earlier fsync failure; session is unrecoverable".into(),
-            ));
-        }
-        // Fault injection: fail before touching the file, and poison. Crucially
-        // `durable_lsn` is NOT advanced.
-        if self.fsync_fault_armed {
-            self.fsync_fault_armed = false;
-            self.poisoned = true;
-            tracing::error!("WAL fsync fault injected — poisoning session (P1.b)");
-            return Err(DbError::DurabilityFailure(
-                "injected WAL fsync failure".into(),
-            ));
-        }
-        // Real path: on any failure, poison and surface a fatal error *before*
-        // advancing the durable frontier or letting a caller believe the WAL
-        // is durable. The OS may have dropped the buffered write on error.
-        if let Err(e) = self.writer.flush() {
-            self.poisoned = true;
-            return Err(DbError::DurabilityFailure(format!(
-                "WAL buffer flush failed: {e}"
-            )));
-        }
-        if let Err(e) = self.writer.get_ref().sync_all() {
-            self.poisoned = true;
-            return Err(DbError::DurabilityFailure(format!("WAL fsync failed: {e}")));
-        }
-        self.durable_lsn = self.next_lsn - 1;
-        Ok(())
+        self.lock().next_lsn - 1
     }
 
     /// Truncate WAL up to (but not including) `keep_from_lsn`.
     /// Simple impl: rewrite the file keeping only records with LSN >= keep_from_lsn.
-    pub fn truncate_before(&mut self, keep_from_lsn: Lsn) -> Result<()> {
-        self.writer.flush()?;
-        let records = Self::scan_file(&self.path)?;
+    pub fn truncate_before(&self, keep_from_lsn: Lsn) -> Result<()> {
+        let mut inner = self.lock();
+        inner.writer.flush()?;
+        let path = inner.path.clone();
+        let records = Self::scan_file(&path)?;
         let kept: Vec<_> = records
             .into_iter()
             .filter(|r| r.lsn >= keep_from_lsn)
             .collect();
-        let tmp = self.path.with_extension("wal_tmp");
+        let tmp = path.with_extension("wal_tmp");
         {
             let mut f = BufWriter::new(File::create(&tmp)?);
             for r in &kept {
@@ -452,11 +474,11 @@ impl Wal {
             f.flush()?;
             f.get_ref().sync_all()?;
         }
-        std::fs::rename(&tmp, &self.path)?;
-        let file = OpenOptions::new().append(true).open(&self.path)?;
+        std::fs::rename(&tmp, &path)?;
+        let file = OpenOptions::new().append(true).open(&path)?;
         // P1.e: the WAL-size counter now reflects only the kept records.
-        self.wal_bytes = kept.iter().map(|r| 4 + encode_record(r).len() as u64).sum();
-        self.writer = BufWriter::new(file);
+        inner.wal_bytes = kept.iter().map(|r| 4 + encode_record(r).len() as u64).sum();
+        inner.writer = BufWriter::new(file);
         tracing::info!(keep_from_lsn, "WAL truncated");
         Ok(())
     }
@@ -496,6 +518,80 @@ impl Wal {
     }
 }
 
+/// Compile-time proof the WAL is shareable across threads (P5.b).
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Wal>();
+};
+
+/// Allocate the next LSN and physically append one record, all while the WAL
+/// lock is held (P5.b). Serializing allocation + append together is what makes
+/// concurrent appends correct: LSNs are monotonic and records never interleave.
+#[allow(clippy::too_many_arguments)] // internal low-level WAL primitive
+fn append_locked(
+    inner: &mut WalInner,
+    mini_txn_id: u64,
+    prev_lsn: Lsn,
+    rec_type: u8,
+    page_id: PageId,
+    slot: u16,
+    redo: &[u8],
+    undo: &[u8],
+) -> Result<Lsn> {
+    let lsn = inner.next_lsn;
+    inner.next_lsn += 1;
+    let rec = WalRecord {
+        lsn,
+        prev_lsn,
+        mini_txn_id,
+        rec_type,
+        page_id,
+        slot,
+        redo: redo.to_vec(),
+        undo: undo.to_vec(),
+    };
+    let encoded = encode_record(&rec);
+    let len = encoded.len() as u32;
+    inner.writer.write_all(&u32_to_le(len))?;
+    inner.writer.write_all(&encoded)?;
+    inner.wal_bytes += 4 + encoded.len() as u64; // P1.e: track WAL size
+    Ok(lsn)
+}
+
+/// Flush + fsync the WAL and advance the durable frontier (P1.b/P5.b), while
+/// the WAL lock is held. On any failure the WAL latches poisoned and the
+/// frontier is NOT advanced — a failed fsync may have dropped buffered data.
+fn fsync_locked(inner: &mut WalInner) -> Result<()> {
+    // P1.b: once poisoned, never report success again.
+    if inner.poisoned {
+        return Err(DbError::DurabilityFailure(
+            "WAL is poisoned by an earlier fsync failure; session is unrecoverable".into(),
+        ));
+    }
+    // Fault injection: fail before touching the file, and poison. `durable_lsn`
+    // is NOT advanced.
+    if inner.fsync_fault_armed {
+        inner.fsync_fault_armed = false;
+        inner.poisoned = true;
+        tracing::error!("WAL fsync fault injected — poisoning session (P1.b)");
+        return Err(DbError::DurabilityFailure(
+            "injected WAL fsync failure".into(),
+        ));
+    }
+    if let Err(e) = inner.writer.flush() {
+        inner.poisoned = true;
+        return Err(DbError::DurabilityFailure(format!(
+            "WAL buffer flush failed: {e}"
+        )));
+    }
+    if let Err(e) = inner.writer.get_ref().sync_all() {
+        inner.poisoned = true;
+        return Err(DbError::DurabilityFailure(format!("WAL fsync failed: {e}")));
+    }
+    inner.durable_lsn = inner.next_lsn - 1;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,7 +601,7 @@ mod tests {
     fn begin_commit_roundtrip() {
         let dir = tempdir().unwrap();
         let p = dir.path().join("test.wal");
-        let mut wal = Wal::open(&p, INVALID_LSN).unwrap();
+        let wal = Wal::open(&p, INVALID_LSN).unwrap();
         let (txn_id, begin_lsn) = wal.begin_mini_txn().unwrap();
         let _ins_lsn = wal
             .log_insert(txn_id, begin_lsn, 1, 0, b"row_data")
@@ -522,7 +618,7 @@ mod tests {
     fn insert_redo_payload_preserved() {
         let dir = tempdir().unwrap();
         let p = dir.path().join("test.wal");
-        let mut wal = Wal::open(&p, INVALID_LSN).unwrap();
+        let wal = Wal::open(&p, INVALID_LSN).unwrap();
         let (txn_id, begin_lsn) = wal.begin_mini_txn().unwrap();
         let ins_lsn = wal
             .log_insert(txn_id, begin_lsn, 5, 3, b"hello world")
@@ -539,7 +635,7 @@ mod tests {
     fn user_txn_records_round_trip() {
         let dir = tempdir().unwrap();
         let p = dir.path().join("test.wal");
-        let mut wal = Wal::open(&p, INVALID_LSN).unwrap();
+        let wal = Wal::open(&p, INVALID_LSN).unwrap();
         let xid: Xid = 7;
         let begin_lsn = wal.begin_user_txn(xid).unwrap();
         wal.commit_user_txn(xid, begin_lsn).unwrap();
@@ -555,7 +651,7 @@ mod tests {
     fn user_txn_abort_records_round_trip() {
         let dir = tempdir().unwrap();
         let p = dir.path().join("test.wal");
-        let mut wal = Wal::open(&p, INVALID_LSN).unwrap();
+        let wal = Wal::open(&p, INVALID_LSN).unwrap();
         let xid: Xid = 3;
         let begin_lsn = wal.begin_user_txn(xid).unwrap();
         wal.abort_user_txn(xid, begin_lsn).unwrap();
@@ -567,12 +663,9 @@ mod tests {
 
     #[test]
     fn mini_txn_and_user_txn_ids_are_independent_spaces() {
-        // A mini-txn (statement) nested inside a user-txn shares the wire
-        // format but not the ID space: mini_txn_id counters and xids can
-        // collide numerically without meaning the same thing.
         let dir = tempdir().unwrap();
         let p = dir.path().join("test.wal");
-        let mut wal = Wal::open(&p, INVALID_LSN).unwrap();
+        let wal = Wal::open(&p, INVALID_LSN).unwrap();
         let xid: Xid = 1;
         wal.begin_user_txn(xid).unwrap();
         let (mini_id, begin_lsn) = wal.begin_mini_txn().unwrap();
@@ -587,15 +680,15 @@ mod tests {
 
     /// P1.b: an injected fsync failure poisons the WAL — the commit returns a
     /// `DurabilityFailure`, the durable frontier does NOT advance, and every
-    /// later durability call keeps failing (never falsely reports success).
+    /// later durability call keeps failing.
     #[test]
     fn fsync_failure_poisons_and_never_reports_success() {
         let dir = tempdir().unwrap();
         let p = dir.path().join("test.wal");
-        let mut wal = Wal::open(&p, INVALID_LSN).unwrap();
+        let wal = Wal::open(&p, INVALID_LSN).unwrap();
         let (txn_id, begin_lsn) = wal.begin_mini_txn().unwrap();
         let ins_lsn = wal.log_insert(txn_id, begin_lsn, 1, 0, b"x").unwrap();
-        let durable_before = wal.durable_lsn;
+        let durable_before = wal.durable_lsn();
 
         wal.arm_fsync_fault();
         let res = wal.commit_mini_txn(txn_id, ins_lsn);
@@ -608,11 +701,11 @@ mod tests {
             "WAL must latch poisoned after fsync failure"
         );
         assert_eq!(
-            wal.durable_lsn, durable_before,
+            wal.durable_lsn(),
+            durable_before,
             "durable frontier must NOT advance on a failed fsync"
         );
 
-        // A later durability call must keep failing — no false success.
         assert!(matches!(wal.sync(), Err(DbError::DurabilityFailure(_))));
     }
 
@@ -620,9 +713,10 @@ mod tests {
     fn corrupt_record_stops_scan() {
         let dir = tempdir().unwrap();
         let p = dir.path().join("test.wal");
-        let mut wal = Wal::open(&p, INVALID_LSN).unwrap();
+        let wal = Wal::open(&p, INVALID_LSN).unwrap();
         let (txn_id, begin_lsn) = wal.begin_mini_txn().unwrap();
         wal.log_insert(txn_id, begin_lsn, 1, 0, b"x").unwrap();
+        wal.sync().unwrap();
         drop(wal);
         // corrupt last bytes of file
         let mut bytes = std::fs::read(&p).unwrap();
@@ -632,5 +726,49 @@ mod tests {
         let records = Wal::scan_file(&p).unwrap();
         // only begin record survives (or zero if corruption hit it)
         assert!(records.len() <= 2);
+    }
+
+    /// P5.b: many threads appending concurrently produce a correctly-ordered,
+    /// non-interleaved WAL — every LSN unique and contiguous, every record
+    /// decodable, and the total count exactly what was appended.
+    #[test]
+    fn concurrent_appends_are_ordered_and_intact() {
+        use std::sync::Arc;
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("test.wal");
+        let wal = Arc::new(Wal::open(&p, INVALID_LSN).unwrap());
+        wal.set_deferred_sync(true);
+
+        let threads = 8;
+        let per = 200;
+        let mut handles = Vec::new();
+        for t in 0..threads {
+            let wal = Arc::clone(&wal);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..per {
+                    let (id, begin) = wal.begin_mini_txn().unwrap();
+                    let payload = format!("t{t}-i{i}");
+                    let ins = wal
+                        .log_insert(id, begin, t as u32, 0, payload.as_bytes())
+                        .unwrap();
+                    wal.commit_mini_txn(id, ins).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        wal.sync().unwrap();
+        drop(wal);
+
+        let records = Wal::scan_file(&p).unwrap();
+        // 3 records per mini-txn (begin/insert/commit).
+        assert_eq!(records.len(), threads * per * 3);
+        // LSNs are a contiguous 1..=N with no gaps or duplicates.
+        let mut lsns: Vec<Lsn> = records.iter().map(|r| r.lsn).collect();
+        lsns.sort_unstable();
+        for (i, lsn) in lsns.iter().enumerate() {
+            assert_eq!(*lsn, (i as u64) + 1, "LSNs must be contiguous 1..=N");
+        }
     }
 }

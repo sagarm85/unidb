@@ -59,6 +59,9 @@ pub enum DbError {
     #[error("could not serialize access due to concurrent update (xid {xid})")]
     SerializationFailure { xid: u64 },
 
+    #[error("deadlock detected: transaction {xid} chosen as victim to break a wait-for cycle")]
+    Deadlock { xid: u64 },
+
     #[error("transaction {xid} is not active")]
     TxnNotActive { xid: u64 },
 

@@ -27,7 +27,7 @@ pub fn run(
     tracing::info!("checkpoint started");
 
     // 1. Flush all dirty pages. D5 is enforced inside flush_page.
-    pool.flush_all(wal.durable_lsn)?;
+    pool.flush_all(wal.durable_lsn())?;
 
     // P1.a: with every dirty page now durably flushed, the on-disk image of
     // every page is clean, so the current interval's full-page images are no

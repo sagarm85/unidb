@@ -2064,14 +2064,12 @@ mod tests {
 
         fn begin(&mut self) -> Xid {
             self.txn_mgr
-                .begin(IsolationLevel::ReadCommitted, &mut self.wal)
+                .begin(IsolationLevel::ReadCommitted, &self.wal)
                 .unwrap()
         }
 
         fn commit(&mut self, xid: Xid) {
-            self.txn_mgr
-                .commit(xid, &mut self.wal, &mut self.lock_mgr)
-                .unwrap();
+            self.txn_mgr.commit(xid, &self.wal, &self.lock_mgr).unwrap();
         }
     }
 
@@ -2234,7 +2232,7 @@ mod tests {
             h.exec_as(xid, "CREATE TABLE t (id INT)").unwrap();
             h.exec_as(xid, "INSERT INTO t (id) VALUES (42)").unwrap();
             h.commit(xid);
-            h.pool.flush_all(h.wal.durable_lsn).unwrap();
+            h.pool.flush_all(h.wal.durable_lsn()).unwrap();
             root_page = h.control.catalog_root;
             rid_data = h.catalog.lookup("t").unwrap().pages.clone();
         }
@@ -2623,7 +2621,7 @@ mod tests {
             )
             .unwrap();
             h.commit(xid);
-            h.pool.flush_all(h.wal.durable_lsn).unwrap();
+            h.pool.flush_all(h.wal.durable_lsn()).unwrap();
         }
 
         let mut pool =

@@ -1135,7 +1135,7 @@ impl Engine {
     /// D10). The returned `xid` must eventually reach [`Self::commit`] or
     /// [`Self::abort`] — there is no timeout or automatic cleanup.
     pub fn begin_with_isolation(&mut self, isolation: IsolationLevel) -> Result<Xid> {
-        self.txn_mgr.begin(isolation, &mut self.wal)
+        self.txn_mgr.begin(isolation, &self.wal)
     }
 
     /// Commit `xid`, releasing every lock it held. `xid` is finished after
@@ -1148,7 +1148,7 @@ impl Engine {
     /// the error — so the caller just sees `SerializationFailure` on a fully
     /// cleaned-up transaction, and should retry.
     pub fn commit(&mut self, xid: Xid) -> Result<()> {
-        match self.txn_mgr.commit(xid, &mut self.wal, &mut self.lock_mgr) {
+        match self.txn_mgr.commit(xid, &self.wal, &self.lock_mgr) {
             Err(DbError::SerializationFailure { xid }) => {
                 self.abort(xid)?;
                 return Err(DbError::SerializationFailure { xid });
@@ -1240,7 +1240,7 @@ impl Engine {
     /// steal any now-durable dirty page.
     pub fn sync_wal(&mut self) -> Result<()> {
         self.wal.sync()?;
-        self.pool.set_durable_wal_lsn(self.wal.durable_lsn);
+        self.pool.set_durable_wal_lsn(self.wal.durable_lsn());
         Ok(())
     }
 
@@ -1252,7 +1252,7 @@ impl Engine {
             &mut self.pool,
             &mut self.heap,
             &mut self.wal,
-            &mut self.lock_mgr,
+            &self.lock_mgr,
         )
     }
 
@@ -1348,7 +1348,7 @@ impl Engine {
 
     /// Flush all dirty pages without a full checkpoint (used in tests).
     pub fn flush(&mut self) -> Result<()> {
-        self.pool.flush_all(self.wal.durable_lsn)
+        self.pool.flush_all(self.wal.durable_lsn())
     }
 
     /// Reclaim physical space held by dead tuple versions (M10) — the explicit,
