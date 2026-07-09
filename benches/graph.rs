@@ -21,14 +21,14 @@ use unidb::wal::Wal;
 /// return every `RowId`, a ready `BufferPool`, and a snapshot that sees
 /// them all.
 fn build_hot_hub(dir: &std::path::Path, n: u64) -> (Heap, BufferPool, Vec<RowId>, Snapshot) {
-    let mut pool = BufferPool::open(&dir.join("data.db"), DEFAULT_PAGE_SIZE as usize, 256).unwrap();
-    let mut wal = Wal::open(&dir.join("db.wal"), INVALID_LSN).unwrap();
-    let mut heap = Heap::new(DEFAULT_PAGE_SIZE as usize);
+    let pool = BufferPool::open(&dir.join("data.db"), DEFAULT_PAGE_SIZE as usize, 256).unwrap();
+    let wal = Wal::open(&dir.join("db.wal"), INVALID_LSN).unwrap();
+    let heap = Heap::new(DEFAULT_PAGE_SIZE as usize);
 
     let mut ids = Vec::with_capacity(n as usize);
     for i in 0..n {
         let encoded = encode_row(&edge_row(1, i as i64, "KNOWS", "{}"));
-        let rid = heap.insert(&encoded, 1, &mut pool, &mut wal).unwrap();
+        let rid = heap.insert(&encoded, 1, &pool, &wal).unwrap();
         ids.push(rid);
     }
     let snapshot = Snapshot::new(2, 2, vec![]);

@@ -295,20 +295,20 @@ fn p9_crash_mid_undo_still_converges_to_fully_undone() {
 
     let xid = 5;
     let (r1, r2) = {
-        let mut pool =
+        let pool =
             unidb::bufferpool::BufferPool::open(&data_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
-        let mut wal = Wal::open(&wal_p, INVALID_LSN).unwrap();
-        let mut heap = Heap::new(DEFAULT_PAGE_SIZE as usize);
+        let wal = Wal::open(&wal_p, INVALID_LSN).unwrap();
+        let heap = Heap::new(DEFAULT_PAGE_SIZE as usize);
 
         wal.begin_user_txn(xid).unwrap();
-        let r1 = heap.insert(b"p9_row1", xid, &mut pool, &mut wal).unwrap();
-        let r2 = heap.insert(b"p9_row2", xid, &mut pool, &mut wal).unwrap();
+        let r1 = heap.insert(b"p9_row1", xid, &pool, &wal).unwrap();
+        let r2 = heap.insert(b"p9_row2", xid, &pool, &wal).unwrap();
 
         // Simulate runtime abort getting partway through its undo_log
         // (reverse order: r2 first, then r1) before crashing — here we
         // apply only the r2 half, leaving r1 untouched, then "crash"
         // without ever writing WAL_TXN_ABORT.
-        heap.undo_insert(r2.page_id, r2.slot, xid, &mut pool, &mut wal)
+        heap.undo_insert(r2.page_id, r2.slot, xid, &pool, &wal)
             .unwrap();
 
         pool.flush_all(wal.durable_lsn()).unwrap();
@@ -366,21 +366,20 @@ fn p10_crash_mid_vacuum_redoes_cleanly_and_loses_no_committed_row() {
     control::create(&ctrl_p, DEFAULT_PAGE_SIZE).unwrap();
 
     let (keep, dead) = {
-        let mut pool = BufferPool::open(&data_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
-        let mut wal = Wal::open(&wal_p, INVALID_LSN).unwrap();
-        let mut heap = Heap::new(DEFAULT_PAGE_SIZE as usize);
-        let mut lock = LockManager::new();
+        let pool = BufferPool::open(&data_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
+        let wal = Wal::open(&wal_p, INVALID_LSN).unwrap();
+        let heap = Heap::new(DEFAULT_PAGE_SIZE as usize);
+        let lock = LockManager::new();
 
         // Two committed rows (each insert/delete is its own durably-fsynced
         // mini-txn), one of which is then deleted so it becomes reclaimable.
-        let keep = heap.insert(b"keep", 1, &mut pool, &mut wal).unwrap();
-        let dead = heap.insert(b"dead", 1, &mut pool, &mut wal).unwrap();
-        heap.delete(dead, 1, &mut pool, &mut wal, &mut lock)
-            .unwrap();
+        let keep = heap.insert(b"keep", 1, &pool, &wal).unwrap();
+        let dead = heap.insert(b"dead", 1, &pool, &wal).unwrap();
+        heap.delete(dead, 1, &pool, &wal, &lock).unwrap();
 
         // Vacuum marks `dead` DEAD (WAL_VACUUM durable). "Crash" here: do NOT
         // flush pages, drop — recovery must redo the mark from the WAL.
-        heap.mark_dead(dead, &mut pool, &mut wal).unwrap();
+        heap.mark_dead(dead, &pool, &wal).unwrap();
         drop(pool);
         drop(wal);
         (keep, dead)
@@ -441,14 +440,12 @@ fn p11_torn_page_restored_from_full_page_image() {
     let (r1, r2) = {
         let mut pool = BufferPool::open(&data_p, page_size, 64).unwrap();
         let mut wal = Wal::open(&wal_p, INVALID_LSN).unwrap();
-        let mut heap = Heap::new(page_size);
+        let heap = Heap::new(page_size);
 
         // R1 committed, its page flushed to disk, then a checkpoint: the page
         // is now clean on disk and FPI tracking is reset, so the next
         // modification opens a fresh interval and must log a full-page image.
-        let r1 = heap
-            .insert(b"r1_committed", 1, &mut pool, &mut wal)
-            .unwrap();
+        let r1 = heap.insert(b"r1_committed", 1, &pool, &wal).unwrap();
         pool.flush_all(wal.durable_lsn()).unwrap();
         checkpoint::run(&mut pool, &mut wal, &ctrl_p, &mut control, 2).unwrap();
 
@@ -456,9 +453,7 @@ fn p11_torn_page_restored_from_full_page_image() {
         // WAL_FPI(page, the clean image still holding only R1) then the
         // incremental INSERT for R2, all durably fsynced. The in-memory page now
         // holds R1+R2 but is deliberately NOT flushed.
-        let r2 = heap
-            .insert(b"r2_committed", 1, &mut pool, &mut wal)
-            .unwrap();
+        let r2 = heap.insert(b"r2_committed", 1, &pool, &wal).unwrap();
         assert_eq!(r1.page_id, r2.page_id, "both rows must share a page");
         drop(pool);
         drop(wal);
@@ -534,15 +529,15 @@ fn p12_fsync_failure_refuses_to_report_success() {
     // (a) WAL commit fsync fails → the row's mini-txn commit is fatal, the
     //     durable frontier does not advance, and the WAL stays poisoned.
     {
-        let mut pool = BufferPool::open(&dir.path().join("a.db"), page_size, 64).unwrap();
-        let mut wal = Wal::open(&dir.path().join("a.wal"), INVALID_LSN).unwrap();
-        let mut heap = Heap::new(page_size);
+        let pool = BufferPool::open(&dir.path().join("a.db"), page_size, 64).unwrap();
+        let wal = Wal::open(&dir.path().join("a.wal"), INVALID_LSN).unwrap();
+        let heap = Heap::new(page_size);
         // First insert commits normally (durable frontier advances).
-        heap.insert(b"durable", 1, &mut pool, &mut wal).unwrap();
+        heap.insert(b"durable", 1, &pool, &wal).unwrap();
         let durable_before = wal.durable_lsn();
         // Arm a fault: the *next* fsync (this insert's mini-txn commit) fails.
         wal.arm_fsync_fault();
-        let res = heap.insert(b"never_durable", 1, &mut pool, &mut wal);
+        let res = heap.insert(b"never_durable", 1, &pool, &wal);
         assert!(
             matches!(res, Err(DbError::DurabilityFailure(_))),
             "P12: a failed WAL fsync must surface a fatal DurabilityFailure, got {res:?}"

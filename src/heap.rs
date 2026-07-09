@@ -53,8 +53,16 @@ pub struct RowId {
     pub slot: u16,
 }
 
-pub struct Heap {
-    page_size: usize,
+/// The heap's mutable free-space state (P5.e). Held behind one `Mutex` on
+/// [`Heap`] so every heap method is `&self` and an `Arc<Heap>` is shareable
+/// across concurrent writer threads. **Invariant:** this lock is only ever
+/// held for brief in-memory FSM decisions — **never across a page-latch
+/// acquisition or WAL I/O** — so it can form no lock-ordering cycle with the
+/// buffer pool's per-page latches (P5.a). Writers still contend on this one
+/// lock for page *selection*; finer-grained FSM partitioning for maximum write
+/// scaling is a noted P5.e tuning follow-up, not a correctness gap.
+#[derive(Default)]
+struct HeapFsm {
     /// Ordered list of page IDs belonging to this heap.
     pages: Vec<PageId>,
     /// Free-space map (P1.c): cached free bytes per known page, so
@@ -68,12 +76,16 @@ pub struct Heap {
     free_map: std::collections::HashMap<PageId, usize>,
 }
 
+pub struct Heap {
+    page_size: usize,
+    fsm: std::sync::Mutex<HeapFsm>,
+}
+
 impl Heap {
     pub fn new(page_size: usize) -> Self {
         Self {
             page_size,
-            pages: Vec::new(),
-            free_map: std::collections::HashMap::new(),
+            fsm: std::sync::Mutex::new(HeapFsm::default()),
         }
     }
 
@@ -84,35 +96,39 @@ impl Heap {
     pub fn from_pages(page_size: usize, pages: Vec<PageId>) -> Self {
         Self {
             page_size,
-            pages,
-            free_map: std::collections::HashMap::new(),
+            fsm: std::sync::Mutex::new(HeapFsm {
+                pages,
+                free_map: std::collections::HashMap::new(),
+            }),
         }
     }
 
-    /// The heap's current page list, so callers (the SQL executor) can
-    /// detect growth and persist the updated list back to the catalog.
-    pub fn page_ids(&self) -> &[PageId] {
-        &self.pages
+    /// Poison-safe access to the FSM (P5.e). Consistent with `wal.rs`/`txn.rs`:
+    /// a prior panic-while-locked leaves the map usable as-is.
+    fn lock_fsm(&self) -> std::sync::MutexGuard<'_, HeapFsm> {
+        self.fsm.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A snapshot of the heap's current page list, so callers (the SQL
+    /// executor) can detect growth and persist the updated list to the catalog.
+    /// P5.e: returns an owned `Vec` (the list now lives behind a lock); the one
+    /// caller already copies it.
+    pub fn page_ids(&self) -> Vec<PageId> {
+        self.lock_fsm().pages.clone()
     }
 
     /// INSERT: create a brand-new live row, owned by `xid`.
-    pub fn insert(
-        &mut self,
-        data: &[u8],
-        xid: Xid,
-        pool: &mut BufferPool,
-        wal: &mut Wal,
-    ) -> Result<RowId> {
+    pub fn insert(&self, data: &[u8], xid: Xid, pool: &BufferPool, wal: &Wal) -> Result<RowId> {
         self.insert_version(data, xid, None, pool, wal)
     }
 
     fn insert_version(
-        &mut self,
+        &self,
         data: &[u8],
         xid: Xid,
         prev: Option<(PageId, u16)>,
-        pool: &mut BufferPool,
-        wal: &mut Wal,
+        pool: &BufferPool,
+        wal: &Wal,
     ) -> Result<RowId> {
         let needed = crate::page::SLOT_SIZE + crate::page::TUPLE_HEADER_SIZE + data.len();
         let page_id = self.find_or_alloc_page(needed, pool, wal)?;
@@ -129,8 +145,9 @@ impl Heap {
         let ins_lsn = wal.log_insert(txn_id, prev_lsn, page_id, slot, &redo)?;
         page.set_lsn(ins_lsn);
         pool.write_page(&page)?;
-        self.note_free_space(page_id, &page); // P1.c: keep the FSM exact
+        let free = page.free_space(); // capture before releasing the page latch
         pool.unpin(page_id);
+        self.note_free_space(page_id, free); // P1.c: FSM lock taken after unpin
         wal.commit_mini_txn(txn_id, ins_lsn)?;
         Ok(RowId { page_id, slot })
     }
@@ -195,13 +212,13 @@ impl Heap {
     /// that has since *committed and released its lock* — a distinct
     /// failure mode the lock table alone can't see once the holder is gone.
     pub fn update(
-        &mut self,
+        &self,
         row_id: RowId,
         new_data: &[u8],
         xid: Xid,
-        pool: &mut BufferPool,
-        wal: &mut Wal,
-        lock_mgr: &mut LockManager,
+        pool: &BufferPool,
+        wal: &Wal,
+        lock_mgr: &LockManager,
     ) -> Result<RowId> {
         lock_mgr.try_acquire_write(RecordId::row(row_id.page_id, row_id.slot), xid)?;
 
@@ -249,8 +266,9 @@ impl Heap {
         let ins_lsn = wal.log_insert(txn_id, ins_prev, new_page_id, new_slot, &insert_redo)?;
         new_page.set_lsn(ins_lsn);
         pool.write_page(&new_page)?;
-        self.note_free_space(new_page_id, &new_page); // P1.c: keep the FSM exact
+        let new_free = new_page.free_space(); // capture before releasing the latch
         pool.unpin(new_page_id);
+        self.note_free_space(new_page_id, new_free); // P1.c: FSM lock after unpin
 
         wal.commit_mini_txn(txn_id, ins_lsn)?;
         Ok(RowId {
@@ -264,12 +282,12 @@ impl Heap {
     /// `update`'s doc comment for why both a lock-manager check and an
     /// `xmax != 0` check are needed.
     pub fn delete(
-        &mut self,
+        &self,
         row_id: RowId,
         xid: Xid,
-        pool: &mut BufferPool,
-        wal: &mut Wal,
-        lock_mgr: &mut LockManager,
+        pool: &BufferPool,
+        wal: &Wal,
+        lock_mgr: &LockManager,
     ) -> Result<()> {
         lock_mgr.try_acquire_write(RecordId::row(row_id.page_id, row_id.slot), xid)?;
 
@@ -309,11 +327,11 @@ impl Heap {
     /// abort/rollback (txn.rs) and by recovery's incomplete-user-txn undo
     /// pass (recovery.rs).
     pub fn undo_xmax_stamp(
-        &mut self,
+        &self,
         page_id: PageId,
         slot: u16,
-        pool: &mut BufferPool,
-        wal: &mut Wal,
+        pool: &BufferPool,
+        wal: &Wal,
     ) -> Result<()> {
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
         let mut page = pool.fetch_page_for_write(page_id, wal)?;
@@ -346,12 +364,12 @@ impl Heap {
     /// ordinary row that was inserted and later deleted by the same
     /// (by-then-finished) transaction.
     pub fn undo_insert(
-        &mut self,
+        &self,
         page_id: PageId,
         slot: u16,
         xid: Xid,
-        pool: &mut BufferPool,
-        wal: &mut Wal,
+        pool: &BufferPool,
+        wal: &Wal,
     ) -> Result<()> {
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
         let mut page = pool.fetch_page_for_write(page_id, wal)?;
@@ -385,7 +403,7 @@ impl Heap {
         reader: &P,
     ) -> Result<Vec<(RowId, Vec<u8>)>> {
         let mut out = Vec::new();
-        for &page_id in &self.pages {
+        for page_id in self.lock_fsm().pages.clone() {
             let page = reader.read_page(page_id)?;
             let sc = page.slot_count_pub();
             for slot in 0..sc {
@@ -409,8 +427,11 @@ impl Heap {
 
     /// Record a page's current free space in the FSM (P1.c). Call after any
     /// mutation that changes free space, with the page in hand.
-    fn note_free_space(&mut self, page_id: PageId, page: &SlottedPage) {
-        self.free_map.insert(page_id, page.free_space());
+    /// Record a page's free space in the FSM (P1.c). Takes the value, not the
+    /// `&SlottedPage`, so the caller records it *after* dropping the page latch
+    /// — the FSM lock is never held while a page latch is (P5.e).
+    fn note_free_space(&self, page_id: PageId, free: usize) {
+        self.lock_fsm().free_map.insert(page_id, free);
     }
 
     /// Find a page with room for `needed` bytes, or allocate a new one (P1.c —
@@ -420,32 +441,33 @@ impl Heap {
     /// `from_pages` heap) are fetched — and those from the end backward
     /// (append locality), stopping at the first fit and caching every probe —
     /// so the common append case costs at most one fetch instead of O(pages).
-    fn find_or_alloc_page(
-        &mut self,
-        needed: usize,
-        pool: &mut BufferPool,
-        wal: &mut Wal,
-    ) -> Result<PageId> {
-        // 1. Known pages that fit — pure integer comparison, no fetch.
-        for &pid in &self.pages {
-            if self.free_map.get(&pid).is_some_and(|&free| free >= needed) {
-                return Ok(pid);
+    fn find_or_alloc_page(&self, needed: usize, pool: &BufferPool, wal: &Wal) -> Result<PageId> {
+        // 1. Known pages that fit — pure integer comparison under the FSM lock,
+        //    no page fetch; the lock is released the moment we have an answer or
+        //    the list of pages still needing a probe.
+        let unknown: Vec<PageId> = {
+            let fsm = self.lock_fsm();
+            for &pid in &fsm.pages {
+                if fsm.free_map.get(&pid).is_some_and(|&free| free >= needed) {
+                    return Ok(pid);
+                }
             }
-        }
-        // 2. Unknown pages: probe from the end (most recent = most likely to
-        //    have room), caching each result so a later probe is free.
-        let unknown: Vec<PageId> = self
-            .pages
-            .iter()
-            .rev()
-            .filter(|pid| !self.free_map.contains_key(pid))
-            .copied()
-            .collect();
+            // Unknown pages, newest first (append locality). Collected here, but
+            // probed below with the FSM lock RELEASED — a fetch takes a page
+            // latch, which must never nest under the FSM lock (P5.e invariant).
+            fsm.pages
+                .iter()
+                .rev()
+                .filter(|pid| !fsm.free_map.contains_key(pid))
+                .copied()
+                .collect()
+        };
+        // 2. Probe unknown pages with the FSM lock NOT held; cache each result.
         for pid in unknown {
             let page = pool.fetch_page_for_write(pid, wal)?;
             let free = page.free_space();
             pool.unpin(pid);
-            self.free_map.insert(pid, free);
+            self.note_free_space(pid, free);
             if free >= needed {
                 return Ok(pid);
             }
@@ -454,7 +476,7 @@ impl Heap {
         self.alloc_heap_page(pool, wal)
     }
 
-    fn alloc_heap_page(&mut self, pool: &mut BufferPool, wal: &mut Wal) -> Result<PageId> {
+    fn alloc_heap_page(&self, pool: &BufferPool, wal: &Wal) -> Result<PageId> {
         let pid = pool.alloc_page()?;
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
         let alloc_lsn = wal.log_insert(txn_id, begin_lsn, pid, u16::MAX, &[])?;
@@ -462,9 +484,15 @@ impl Heap {
         page.set_lsn(alloc_lsn);
         wal.commit_mini_txn(txn_id, alloc_lsn)?;
         pool.write_page(&page)?;
+        let free = page.free_space();
         pool.unpin(pid);
-        self.pages.push(pid);
-        self.note_free_space(pid, &page);
+        // Register the new page — FSM lock taken only now, after all page I/O
+        // (no latch is held), so it forms no cycle with the pool's latches.
+        {
+            let mut fsm = self.lock_fsm();
+            fsm.pages.push(pid);
+            fsm.free_map.insert(pid, free);
+        }
         tracing::debug!(page_id = pid, "heap page allocated");
         Ok(pid)
     }
@@ -482,7 +510,7 @@ impl Heap {
         reader: &P,
     ) -> Result<Vec<RowId>> {
         let mut out = Vec::new();
-        for &page_id in &self.pages {
+        for page_id in self.lock_fsm().pages.clone() {
             let page = reader.read_page(page_id)?;
             let sc = page.slot_count_pub();
             for slot in 0..sc {
@@ -504,7 +532,7 @@ impl Heap {
     /// index pass promotes it (M10.c/d). WAL-logged as a redo-only, idempotent
     /// mini-txn (D2/D5); no undo, since re-freeing already-dead space on
     /// recovery replay is a no-op.
-    pub fn mark_dead(&mut self, row_id: RowId, pool: &mut BufferPool, wal: &mut Wal) -> Result<()> {
+    pub fn mark_dead(&self, row_id: RowId, pool: &BufferPool, wal: &Wal) -> Result<()> {
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
         let mut page = pool.fetch_page_for_write(row_id.page_id, wal)?;
         // P1.a: full-page image before this page's first change of the interval
@@ -528,12 +556,7 @@ impl Heap {
     /// (`slot == u16::MAX`), idempotent on replay via the page LSN check.
     /// Returns the number of bytes reclaimed. **Only** call this after the
     /// index-clean pass (M10.c), since it makes reclaimed slots reusable.
-    pub fn compact_page(
-        &mut self,
-        page_id: PageId,
-        pool: &mut BufferPool,
-        wal: &mut Wal,
-    ) -> Result<usize> {
+    pub fn compact_page(&self, page_id: PageId, pool: &BufferPool, wal: &Wal) -> Result<usize> {
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
         let mut page = pool.fetch_page_for_write(page_id, wal)?;
         let reclaimed = page.compact();
@@ -543,8 +566,9 @@ impl Heap {
         let lsn = wal.log_vacuum(txn_id, begin_lsn, page_id, u16::MAX, &image)?;
         page.set_lsn(lsn);
         pool.write_page(&page)?;
-        self.note_free_space(page_id, &page); // P1.c: compaction freed space
+        let free = page.free_space(); // capture before releasing the latch
         pool.unpin(page_id);
+        self.note_free_space(page_id, free); // P1.c: FSM lock after unpin
         wal.commit_mini_txn(txn_id, lsn)?;
         // P1.a: this WAL_VACUUM record already carries a full clean page image
         // (its own torn-page protection), so no separate FPI is needed for a
@@ -611,9 +635,9 @@ mod tests {
     #[test]
     fn insert_and_get() {
         let dir = tempdir().unwrap();
-        let (mut heap, mut pool, mut wal, _lock_mgr) = setup(dir.path());
+        let (heap, pool, wal, _lock_mgr) = setup(dir.path());
         let xid = 1;
-        let rid = heap.insert(b"hello", xid, &mut pool, &mut wal).unwrap();
+        let rid = heap.insert(b"hello", xid, &pool, &wal).unwrap();
         let snap = solo_snapshot(xid);
         let data = heap.get(rid, &snap, xid, &pool).unwrap();
         assert_eq!(data, b"hello");
@@ -622,9 +646,9 @@ mod tests {
     #[test]
     fn insert_invisible_to_other_active_txn() {
         let dir = tempdir().unwrap();
-        let (mut heap, mut pool, mut wal, _lock_mgr) = setup(dir.path());
+        let (heap, pool, wal, _lock_mgr) = setup(dir.path());
         let xid_a = 1;
-        let rid = heap.insert(b"hello", xid_a, &mut pool, &mut wal).unwrap();
+        let rid = heap.insert(b"hello", xid_a, &pool, &wal).unwrap();
         // xid_b's snapshot considers xid_a still active.
         let snap_b = Snapshot::new(xid_a, 3, vec![xid_a]);
         assert!(matches!(
@@ -636,9 +660,9 @@ mod tests {
     #[test]
     fn insert_visible_once_committed() {
         let dir = tempdir().unwrap();
-        let (mut heap, mut pool, mut wal, _lock_mgr) = setup(dir.path());
+        let (heap, pool, wal, _lock_mgr) = setup(dir.path());
         let xid_a = 1;
-        let rid = heap.insert(b"hello", xid_a, &mut pool, &mut wal).unwrap();
+        let rid = heap.insert(b"hello", xid_a, &pool, &wal).unwrap();
         // Fresh snapshot after xid_a "committed": xid_a no longer active.
         let snap_after = Snapshot::new(2, 2, vec![]);
         assert_eq!(heap.get(rid, &snap_after, 2, &pool).unwrap(), b"hello");
@@ -647,11 +671,11 @@ mod tests {
     #[test]
     fn update_creates_new_version_and_hides_old() {
         let dir = tempdir().unwrap();
-        let (mut heap, mut pool, mut wal, mut lock_mgr) = setup(dir.path());
+        let (heap, pool, wal, lock_mgr) = setup(dir.path());
         let xid = 1;
-        let rid = heap.insert(b"old_value", xid, &mut pool, &mut wal).unwrap();
+        let rid = heap.insert(b"old_value", xid, &pool, &wal).unwrap();
         let new_rid = heap
-            .update(rid, b"new_value", xid, &mut pool, &mut wal, &mut lock_mgr)
+            .update(rid, b"new_value", xid, &pool, &wal, &lock_mgr)
             .unwrap();
         let snap = solo_snapshot(xid);
         // The old RowId is a specific physical version, now superseded by
@@ -668,9 +692,9 @@ mod tests {
     #[test]
     fn other_txn_sees_old_version_until_update_commits() {
         let dir = tempdir().unwrap();
-        let (mut heap, mut pool, mut wal, mut lock_mgr) = setup(dir.path());
+        let (heap, pool, wal, lock_mgr) = setup(dir.path());
         let xid_a = 1;
-        let rid = heap.insert(b"v1", xid_a, &mut pool, &mut wal).unwrap();
+        let rid = heap.insert(b"v1", xid_a, &pool, &wal).unwrap();
         // xid_b begins (RR) right after xid_a committed: fixed snapshot
         // sees everything below xid 2 as committed, nothing at/above as
         // committed yet.
@@ -680,7 +704,7 @@ mod tests {
         // snapshot was already fixed.
         let xid_c = 3;
         let _new_rid = heap
-            .update(rid, b"v2", xid_c, &mut pool, &mut wal, &mut lock_mgr)
+            .update(rid, b"v2", xid_c, &pool, &wal, &lock_mgr)
             .unwrap();
         // xid_b's fixed snapshot predates xid_c's update, so it still sees v1.
         assert_eq!(
@@ -692,11 +716,10 @@ mod tests {
     #[test]
     fn delete_hides_row_from_later_snapshot() {
         let dir = tempdir().unwrap();
-        let (mut heap, mut pool, mut wal, mut lock_mgr) = setup(dir.path());
+        let (heap, pool, wal, lock_mgr) = setup(dir.path());
         let xid = 1;
-        let rid = heap.insert(b"to_delete", xid, &mut pool, &mut wal).unwrap();
-        heap.delete(rid, xid, &mut pool, &mut wal, &mut lock_mgr)
-            .unwrap();
+        let rid = heap.insert(b"to_delete", xid, &pool, &wal).unwrap();
+        heap.delete(rid, xid, &pool, &wal, &lock_mgr).unwrap();
         let snap_after = Snapshot::new(2, 2, vec![]);
         assert!(matches!(
             heap.get(rid, &snap_after, 2, &pool),
@@ -707,27 +730,26 @@ mod tests {
     #[test]
     fn concurrent_update_conflict_is_rejected() {
         let dir = tempdir().unwrap();
-        let (mut heap, mut pool, mut wal, mut lock_mgr) = setup(dir.path());
+        let (heap, pool, wal, lock_mgr) = setup(dir.path());
         let xid_a = 1;
-        let rid = heap.insert(b"row", xid_a, &mut pool, &mut wal).unwrap();
-        heap.update(rid, b"a-wins", xid_a, &mut pool, &mut wal, &mut lock_mgr)
+        let rid = heap.insert(b"row", xid_a, &pool, &wal).unwrap();
+        heap.update(rid, b"a-wins", xid_a, &pool, &wal, &lock_mgr)
             .unwrap();
         // A second writer trying to update the now-superseded old version
         // hits the xmax already set by xid_a.
         let xid_b = 2;
-        let err = heap.update(rid, b"b-loses", xid_b, &mut pool, &mut wal, &mut lock_mgr);
+        let err = heap.update(rid, b"b-loses", xid_b, &pool, &wal, &lock_mgr);
         assert!(matches!(err, Err(DbError::WriteConflict { holder_xid }) if holder_xid == xid_a));
     }
 
     #[test]
     fn scan_returns_only_visible_rows() {
         let dir = tempdir().unwrap();
-        let (mut heap, mut pool, mut wal, mut lock_mgr) = setup(dir.path());
+        let (heap, pool, wal, lock_mgr) = setup(dir.path());
         let xid = 1;
-        heap.insert(b"row1", xid, &mut pool, &mut wal).unwrap();
-        let r2 = heap.insert(b"row2", xid, &mut pool, &mut wal).unwrap();
-        heap.delete(r2, xid, &mut pool, &mut wal, &mut lock_mgr)
-            .unwrap();
+        heap.insert(b"row1", xid, &pool, &wal).unwrap();
+        let r2 = heap.insert(b"row2", xid, &pool, &wal).unwrap();
+        heap.delete(r2, xid, &pool, &wal, &lock_mgr).unwrap();
         let snap = solo_snapshot(xid);
         let rows: Vec<Vec<u8>> = heap
             .scan(&snap, xid, &pool)
@@ -741,10 +763,10 @@ mod tests {
     #[test]
     fn undo_insert_makes_row_permanently_invisible() {
         let dir = tempdir().unwrap();
-        let (mut heap, mut pool, mut wal, _lock_mgr) = setup(dir.path());
+        let (heap, pool, wal, _lock_mgr) = setup(dir.path());
         let xid = 1;
-        let rid = heap.insert(b"oops", xid, &mut pool, &mut wal).unwrap();
-        heap.undo_insert(rid.page_id, rid.slot, xid, &mut pool, &mut wal)
+        let rid = heap.insert(b"oops", xid, &pool, &wal).unwrap();
+        heap.undo_insert(rid.page_id, rid.slot, xid, &pool, &wal)
             .unwrap();
         // Even to xid itself, the row is gone.
         let snap = solo_snapshot(xid);
@@ -763,12 +785,11 @@ mod tests {
     #[test]
     fn undo_xmax_stamp_restores_visibility() {
         let dir = tempdir().unwrap();
-        let (mut heap, mut pool, mut wal, mut lock_mgr) = setup(dir.path());
+        let (heap, pool, wal, lock_mgr) = setup(dir.path());
         let xid = 1;
-        let rid = heap.insert(b"row", xid, &mut pool, &mut wal).unwrap();
-        heap.delete(rid, xid, &mut pool, &mut wal, &mut lock_mgr)
-            .unwrap();
-        heap.undo_xmax_stamp(rid.page_id, rid.slot, &mut pool, &mut wal)
+        let rid = heap.insert(b"row", xid, &pool, &wal).unwrap();
+        heap.delete(rid, xid, &pool, &wal, &lock_mgr).unwrap();
+        heap.undo_xmax_stamp(rid.page_id, rid.slot, &pool, &wal)
             .unwrap();
         let snap = solo_snapshot(xid);
         assert_eq!(heap.get(rid, &snap, xid, &pool).unwrap(), b"row");
@@ -777,11 +798,11 @@ mod tests {
     #[test]
     fn multiple_rows() {
         let dir = tempdir().unwrap();
-        let (mut heap, mut pool, mut wal, _lock_mgr) = setup(dir.path());
+        let (heap, pool, wal, _lock_mgr) = setup(dir.path());
         let xid = 1;
-        let r1 = heap.insert(b"row1", xid, &mut pool, &mut wal).unwrap();
-        let r2 = heap.insert(b"row2", xid, &mut pool, &mut wal).unwrap();
-        let r3 = heap.insert(b"row3", xid, &mut pool, &mut wal).unwrap();
+        let r1 = heap.insert(b"row1", xid, &pool, &wal).unwrap();
+        let r2 = heap.insert(b"row2", xid, &pool, &wal).unwrap();
+        let r3 = heap.insert(b"row3", xid, &pool, &wal).unwrap();
         let snap = solo_snapshot(xid);
         assert_eq!(heap.get(r1, &snap, xid, &pool).unwrap(), b"row1");
         assert_eq!(heap.get(r2, &snap, xid, &pool).unwrap(), b"row2");
@@ -793,12 +814,11 @@ mod tests {
     #[test]
     fn collect_reclaimable_finds_only_committed_deleted_below_horizon() {
         let dir = tempdir().unwrap();
-        let (mut heap, mut pool, mut wal, mut lock_mgr) = setup(dir.path());
+        let (heap, pool, wal, lock_mgr) = setup(dir.path());
         let xid = 1;
-        let live = heap.insert(b"live", xid, &mut pool, &mut wal).unwrap();
-        let dead = heap.insert(b"dead", xid, &mut pool, &mut wal).unwrap();
-        heap.delete(dead, xid, &mut pool, &mut wal, &mut lock_mgr)
-            .unwrap();
+        let live = heap.insert(b"live", xid, &pool, &wal).unwrap();
+        let dead = heap.insert(b"dead", xid, &pool, &wal).unwrap();
+        heap.delete(dead, xid, &pool, &wal, &lock_mgr).unwrap();
 
         // Horizon below the deleter (xid=1): nothing reclaimable yet.
         assert!(heap.collect_reclaimable(1, &pool).unwrap().is_empty());
@@ -812,15 +832,14 @@ mod tests {
     #[test]
     fn mark_dead_removes_version_and_survives_visibility() {
         let dir = tempdir().unwrap();
-        let (mut heap, mut pool, mut wal, mut lock_mgr) = setup(dir.path());
+        let (heap, pool, wal, lock_mgr) = setup(dir.path());
         let xid = 1;
-        let keep = heap.insert(b"keep", xid, &mut pool, &mut wal).unwrap();
-        let gone = heap.insert(b"gone", xid, &mut pool, &mut wal).unwrap();
-        heap.delete(gone, xid, &mut pool, &mut wal, &mut lock_mgr)
-            .unwrap();
+        let keep = heap.insert(b"keep", xid, &pool, &wal).unwrap();
+        let gone = heap.insert(b"gone", xid, &pool, &wal).unwrap();
+        heap.delete(gone, xid, &pool, &wal, &lock_mgr).unwrap();
 
         for rid in heap.collect_reclaimable(5, &pool).unwrap() {
-            heap.mark_dead(rid, &mut pool, &mut wal).unwrap();
+            heap.mark_dead(rid, &pool, &wal).unwrap();
         }
         // The kept row is still visible; the vacuumed one is gone from scan.
         let snap = Snapshot::new(5, 5, vec![]);
@@ -837,18 +856,15 @@ mod tests {
     #[test]
     fn compact_page_reclaims_space() {
         let dir = tempdir().unwrap();
-        let (mut heap, mut pool, mut wal, mut lock_mgr) = setup(dir.path());
+        let (heap, pool, wal, lock_mgr) = setup(dir.path());
         let xid = 1;
         let big = vec![b'z'; 400];
-        let dead = heap.insert(&big, xid, &mut pool, &mut wal).unwrap();
-        heap.insert(b"survivor", xid, &mut pool, &mut wal).unwrap();
-        heap.delete(dead, xid, &mut pool, &mut wal, &mut lock_mgr)
-            .unwrap();
-        heap.mark_dead(dead, &mut pool, &mut wal).unwrap();
+        let dead = heap.insert(&big, xid, &pool, &wal).unwrap();
+        heap.insert(b"survivor", xid, &pool, &wal).unwrap();
+        heap.delete(dead, xid, &pool, &wal, &lock_mgr).unwrap();
+        heap.mark_dead(dead, &pool, &wal).unwrap();
 
-        let reclaimed = heap
-            .compact_page(dead.page_id, &mut pool, &mut wal)
-            .unwrap();
+        let reclaimed = heap.compact_page(dead.page_id, &pool, &wal).unwrap();
         assert!(reclaimed >= 400, "compaction must reclaim the dead body");
 
         let snap = Snapshot::new(5, 5, vec![]);
@@ -866,14 +882,11 @@ mod tests {
     #[test]
     fn fsm_packs_small_rows_and_reuses_pages() {
         let dir = tempdir().unwrap();
-        let (mut heap, mut pool, mut wal, _lock) = setup(dir.path());
+        let (heap, pool, wal, _lock) = setup(dir.path());
         let xid = 1;
         let mut rids = Vec::new();
         for i in 0u32..200 {
-            rids.push(
-                heap.insert(&i.to_le_bytes(), xid, &mut pool, &mut wal)
-                    .unwrap(),
-            );
+            rids.push(heap.insert(&i.to_le_bytes(), xid, &pool, &wal).unwrap());
         }
         // 200 tiny rows fit in only a handful of 8 KiB pages — the FSM must
         // keep filling a page with room rather than allocating one per row.
@@ -897,20 +910,16 @@ mod tests {
     #[test]
     fn fsm_reuses_compacted_space() {
         let dir = tempdir().unwrap();
-        let (mut heap, mut pool, mut wal, mut lock) = setup(dir.path());
+        let (heap, pool, wal, lock) = setup(dir.path());
         let xid = 1;
         let big = vec![b'x'; 4000]; // ~half a page
-        let dead = heap.insert(&big, xid, &mut pool, &mut wal).unwrap();
-        heap.delete(dead, xid, &mut pool, &mut wal, &mut lock)
-            .unwrap();
-        heap.mark_dead(dead, &mut pool, &mut wal).unwrap();
-        heap.compact_page(dead.page_id, &mut pool, &mut wal)
-            .unwrap();
+        let dead = heap.insert(&big, xid, &pool, &wal).unwrap();
+        heap.delete(dead, xid, &pool, &wal, &lock).unwrap();
+        heap.mark_dead(dead, &pool, &wal).unwrap();
+        heap.compact_page(dead.page_id, &pool, &wal).unwrap();
         let pages_before = heap.page_ids().len();
         // A row that fits in the reclaimed space must reuse the compacted page.
-        let reused = heap
-            .insert(&vec![b'y'; 3000], xid, &mut pool, &mut wal)
-            .unwrap();
+        let reused = heap.insert(&vec![b'y'; 3000], xid, &pool, &wal).unwrap();
         assert_eq!(
             reused.page_id, dead.page_id,
             "insert must reuse freed space"

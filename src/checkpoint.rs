@@ -69,10 +69,9 @@ mod tests {
         let mut pool =
             BufferPool::open(&dir.path().join("data.db"), DEFAULT_PAGE_SIZE as usize, 16).unwrap();
         let mut wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
-        let mut heap = Heap::new(DEFAULT_PAGE_SIZE as usize);
+        let heap = Heap::new(DEFAULT_PAGE_SIZE as usize);
 
-        heap.insert(b"checkpoint_test", 1, &mut pool, &mut wal)
-            .unwrap();
+        heap.insert(b"checkpoint_test", 1, &pool, &wal).unwrap();
 
         run(&mut pool, &mut wal, &ctrl_path, &mut ctrl, 7).unwrap();
         assert!(ctrl.checkpoint_lsn > INVALID_LSN);

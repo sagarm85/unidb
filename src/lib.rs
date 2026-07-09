@@ -698,7 +698,7 @@ impl Engine {
     pub fn ack_events(&mut self, xid: Xid, consumer: &str, up_to_seq: i64) -> Result<()> {
         let page_size = self.control.page_size as usize;
         let consumers_def = cat_read(&self.catalog).lookup(CONSUMERS_TABLE)?.clone();
-        let mut heap = Heap::from_pages(page_size, consumers_def.pages.clone());
+        let heap = Heap::from_pages(page_size, consumers_def.pages.clone());
         let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
         let existing =
             queue::find_consumer_offset(&heap, &snapshot, xid, &mut self.pool, consumer)?;
@@ -706,14 +706,8 @@ impl Engine {
         let encoded = executor::encode_row(&queue::consumer_row(consumer, up_to_seq));
         match existing {
             Some((row_id, _)) => {
-                let new_row_id = heap.update(
-                    row_id,
-                    &encoded,
-                    xid,
-                    &mut self.pool,
-                    &mut self.wal,
-                    &mut self.lock_mgr,
-                )?;
+                let new_row_id =
+                    heap.update(row_id, &encoded, xid, &self.pool, &self.wal, &self.lock_mgr)?;
                 self.txn_mgr.record_undo(
                     xid,
                     UndoAction::XmaxStamp {
@@ -730,7 +724,7 @@ impl Engine {
                 )?;
             }
             None => {
-                let row_id = heap.insert(&encoded, xid, &mut self.pool, &mut self.wal)?;
+                let row_id = heap.insert(&encoded, xid, &self.pool, &self.wal)?;
                 self.txn_mgr.record_undo(
                     xid,
                     UndoAction::Insert {
@@ -787,7 +781,7 @@ impl Engine {
         };
 
         let events_def = cat_read(&self.catalog).lookup(EVENTS_TABLE)?.clone();
-        let mut events_heap = Heap::from_pages(page_size, events_def.pages.clone());
+        let events_heap = Heap::from_pages(page_size, events_def.pages.clone());
         let to_reclaim: Vec<RowId> = events_heap
             .scan(&snapshot, xid, &self.pool)?
             .into_iter()
@@ -802,13 +796,7 @@ impl Engine {
 
         let mut reclaimed = 0usize;
         for row_id in to_reclaim {
-            events_heap.delete(
-                row_id,
-                xid,
-                &mut self.pool,
-                &mut self.wal,
-                &mut self.lock_mgr,
-            )?;
+            events_heap.delete(row_id, xid, &self.pool, &self.wal, &self.lock_mgr)?;
             self.txn_mgr.record_undo(
                 xid,
                 UndoAction::XmaxStamp {
@@ -837,10 +825,10 @@ impl Engine {
     ) -> Result<RowId> {
         let page_size = self.control.page_size as usize;
         let table_def = cat_read(&self.catalog).lookup(edges::EDGES_TABLE)?.clone();
-        let mut heap = Heap::from_pages(page_size, table_def.pages.clone());
+        let heap = Heap::from_pages(page_size, table_def.pages.clone());
 
         let encoded = executor::encode_row(&edges::edge_row(from_id, to_id, edge_type, props));
-        let row_id = heap.insert(&encoded, xid, &mut self.pool, &mut self.wal)?;
+        let row_id = heap.insert(&encoded, xid, &self.pool, &self.wal)?;
         self.txn_mgr.record_undo(
             xid,
             UndoAction::Insert {
@@ -885,15 +873,9 @@ impl Engine {
     pub fn delete_edge(&mut self, xid: Xid, row_id: RowId, from_id: i64) -> Result<()> {
         let page_size = self.control.page_size as usize;
         let table_def = cat_read(&self.catalog).lookup(edges::EDGES_TABLE)?.clone();
-        let mut heap = Heap::from_pages(page_size, table_def.pages.clone());
+        let heap = Heap::from_pages(page_size, table_def.pages.clone());
 
-        heap.delete(
-            row_id,
-            xid,
-            &mut self.pool,
-            &mut self.wal,
-            &mut self.lock_mgr,
-        )?;
+        heap.delete(row_id, xid, &self.pool, &self.wal, &self.lock_mgr)?;
         self.txn_mgr.record_undo(
             xid,
             UndoAction::XmaxStamp {
@@ -1262,7 +1244,7 @@ impl Engine {
     /// or abort anything — the caller owns the transaction's whole
     /// lifetime, exactly like every other method taking an `xid` parameter.
     pub fn insert(&mut self, xid: Xid, data: &[u8]) -> Result<RowId> {
-        let rid = self.heap.insert(data, xid, &mut self.pool, &mut self.wal)?;
+        let rid = self.heap.insert(data, xid, &self.pool, &self.wal)?;
         self.txn_mgr.record_undo(
             xid,
             UndoAction::Insert {
@@ -1287,14 +1269,9 @@ impl Engine {
     /// creates a new tuple version rather than overwriting in place, so the
     /// physical location may change; re-resolve via the returned RowId).
     pub fn update(&mut self, xid: Xid, row_id: RowId, new_data: &[u8]) -> Result<RowId> {
-        let new_rid = self.heap.update(
-            row_id,
-            new_data,
-            xid,
-            &mut self.pool,
-            &mut self.wal,
-            &mut self.lock_mgr,
-        )?;
+        let new_rid =
+            self.heap
+                .update(row_id, new_data, xid, &self.pool, &self.wal, &self.lock_mgr)?;
         self.txn_mgr.record_undo(
             xid,
             UndoAction::XmaxStamp {
@@ -1315,13 +1292,8 @@ impl Engine {
     /// Delete one row by `RowId`. Requires an already-open `xid`; does not
     /// commit or abort it.
     pub fn delete(&mut self, xid: Xid, row_id: RowId) -> Result<()> {
-        self.heap.delete(
-            row_id,
-            xid,
-            &mut self.pool,
-            &mut self.wal,
-            &mut self.lock_mgr,
-        )?;
+        self.heap
+            .delete(row_id, xid, &self.pool, &self.wal, &self.lock_mgr)?;
         self.txn_mgr.record_undo(
             xid,
             UndoAction::XmaxStamp {
@@ -1390,7 +1362,7 @@ impl Engine {
         // separately below.
         let table_defs: Vec<TableDef> = cat_read(&self.catalog).tables().cloned().collect();
         for table in &table_defs {
-            let mut heap = Heap::from_pages(page_size, table.pages.clone());
+            let heap = Heap::from_pages(page_size, table.pages.clone());
             report.rows_scanned += count_live_slots(&heap, &self.pool)?;
             let reclaimable = heap.collect_reclaimable(horizon, &self.pool)?;
             if reclaimable.is_empty() {
@@ -1451,7 +1423,7 @@ impl Engine {
 
             // (b) Mark every reclaimable version DEAD (not yet reusable).
             for rid in &reclaimable {
-                heap.mark_dead(*rid, &mut self.pool, &mut self.wal)?;
+                heap.mark_dead(*rid, &self.pool, &self.wal)?;
             }
 
             // (c) The aliasing gate: scrub the reclaimed RowIds from every
@@ -1473,7 +1445,7 @@ impl Engine {
             // (d) Compact each touched page: drop dead bodies, coalesce free
             // space, promote DEAD→UNUSED.
             for pid in unique_pages(&reclaimable) {
-                report.bytes_reclaimed += heap.compact_page(pid, &mut self.pool, &mut self.wal)?;
+                report.bytes_reclaimed += heap.compact_page(pid, &self.pool, &self.wal)?;
             }
             report.versions_reclaimed += reclaimable.len();
             report.slots_freed += reclaimable.len();
@@ -1485,11 +1457,10 @@ impl Engine {
         let raw_reclaimable = self.heap.collect_reclaimable(horizon, &self.pool)?;
         if !raw_reclaimable.is_empty() {
             for rid in &raw_reclaimable {
-                self.heap.mark_dead(*rid, &mut self.pool, &mut self.wal)?;
+                self.heap.mark_dead(*rid, &self.pool, &self.wal)?;
             }
             for pid in unique_pages(&raw_reclaimable) {
-                report.bytes_reclaimed +=
-                    self.heap.compact_page(pid, &mut self.pool, &mut self.wal)?;
+                report.bytes_reclaimed += self.heap.compact_page(pid, &self.pool, &self.wal)?;
             }
             report.versions_reclaimed += raw_reclaimable.len();
             report.slots_freed += raw_reclaimable.len();
@@ -1520,7 +1491,7 @@ fn unique_pages(rows: &[RowId]) -> Vec<PageId> {
 /// `rows_scanned`), tolerating reclaimed (DEAD/UNUSED) slots.
 fn count_live_slots(heap: &Heap, pool: &BufferPool) -> Result<usize> {
     let mut n = 0;
-    for &page_id in heap.page_ids() {
+    for page_id in heap.page_ids() {
         let page = pool.read_page(page_id)?;
         let sc = page.slot_count_pub();
         for slot in 0..sc {

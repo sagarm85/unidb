@@ -406,11 +406,11 @@ mod tests {
         let (ctrl_p, data_p, wal_p) = paths(dir.path());
 
         control::create(&ctrl_p, DEFAULT_PAGE_SIZE).unwrap();
-        let mut pool = BufferPool::open(&data_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
-        let mut wal = Wal::open(&wal_p, INVALID_LSN).unwrap();
-        let mut heap = Heap::new(DEFAULT_PAGE_SIZE as usize);
+        let pool = BufferPool::open(&data_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
+        let wal = Wal::open(&wal_p, INVALID_LSN).unwrap();
+        let heap = Heap::new(DEFAULT_PAGE_SIZE as usize);
 
-        let rid = heap.insert(b"persistent", 1, &mut pool, &mut wal).unwrap();
+        let rid = heap.insert(b"persistent", 1, &pool, &wal).unwrap();
         pool.flush_all(wal.durable_lsn()).unwrap();
         drop(pool);
         drop(wal);
@@ -428,14 +428,12 @@ mod tests {
         control::create(&ctrl_p, DEFAULT_PAGE_SIZE).unwrap();
 
         let rid = {
-            let mut pool = BufferPool::open(&data_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
-            let mut wal = Wal::open(&wal_p, INVALID_LSN).unwrap();
-            let mut heap = Heap::new(DEFAULT_PAGE_SIZE as usize);
+            let pool = BufferPool::open(&data_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
+            let wal = Wal::open(&wal_p, INVALID_LSN).unwrap();
+            let heap = Heap::new(DEFAULT_PAGE_SIZE as usize);
             let xid = 7;
             wal.begin_user_txn(xid).unwrap();
-            let rid = heap
-                .insert(b"never_committed", xid, &mut pool, &mut wal)
-                .unwrap();
+            let rid = heap.insert(b"never_committed", xid, &pool, &wal).unwrap();
             // No WAL_TXN_COMMIT — simulates a crash mid-user-transaction.
             // The statement's own mini-txn is already durably committed
             // (D2), but the user transaction as a whole never finished.
@@ -466,12 +464,12 @@ mod tests {
         control::create(&ctrl_p, DEFAULT_PAGE_SIZE).unwrap();
 
         let rid = {
-            let mut pool = BufferPool::open(&data_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
-            let mut wal = Wal::open(&wal_p, INVALID_LSN).unwrap();
-            let mut heap = Heap::new(DEFAULT_PAGE_SIZE as usize);
+            let pool = BufferPool::open(&data_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
+            let wal = Wal::open(&wal_p, INVALID_LSN).unwrap();
+            let heap = Heap::new(DEFAULT_PAGE_SIZE as usize);
             let xid = 7;
             let begin_lsn = wal.begin_user_txn(xid).unwrap();
-            let rid = heap.insert(b"survives", xid, &mut pool, &mut wal).unwrap();
+            let rid = heap.insert(b"survives", xid, &pool, &wal).unwrap();
             wal.commit_user_txn(xid, begin_lsn).unwrap();
             pool.flush_all(wal.durable_lsn()).unwrap();
             drop(pool);
@@ -495,10 +493,10 @@ mod tests {
 
         control::create(&ctrl_p, DEFAULT_PAGE_SIZE).unwrap();
         {
-            let mut pool = BufferPool::open(&data_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
-            let mut wal = Wal::open(&wal_p, INVALID_LSN).unwrap();
-            let mut heap = Heap::new(DEFAULT_PAGE_SIZE as usize);
-            heap.insert(b"survived", 1, &mut pool, &mut wal).unwrap();
+            let pool = BufferPool::open(&data_p, DEFAULT_PAGE_SIZE as usize, 64).unwrap();
+            let wal = Wal::open(&wal_p, INVALID_LSN).unwrap();
+            let heap = Heap::new(DEFAULT_PAGE_SIZE as usize);
+            heap.insert(b"survived", 1, &pool, &wal).unwrap();
             // Simulate crash: do NOT flush page to disk.
             drop(wal);
             drop(pool);

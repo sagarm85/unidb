@@ -54,10 +54,10 @@ fn bench_insert_scaling() {
     let dir = tempdir().unwrap();
     let ps = DEFAULT_PAGE_SIZE as usize;
     // Large pool so eviction is rare; deferred WAL so no per-statement fsync.
-    let mut pool = BufferPool::open(&dir.path().join("data.db"), ps, 8192).unwrap();
-    let mut wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
+    let pool = BufferPool::open(&dir.path().join("data.db"), ps, 8192).unwrap();
+    let wal = Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap();
     wal.set_deferred_sync(true);
-    let mut heap = Heap::new(ps);
+    let heap = Heap::new(ps);
 
     let payload = [0xABu8; 48];
     let window = 50_000u32;
@@ -66,7 +66,7 @@ fn bench_insert_scaling() {
     for w in 0..windows {
         let start = Instant::now();
         for i in 0..window {
-            let rid = heap.insert(&payload, 1, &mut pool, &mut wal).unwrap();
+            let rid = heap.insert(&payload, 1, &pool, &wal).unwrap();
             if i % 5000 == 0 {
                 sample_rids.push(rid);
             }
