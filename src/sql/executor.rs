@@ -151,7 +151,7 @@ fn send_event_capture(
     }
     let payload = queue::payload::row_to_json(row, &table_def.columns);
     let events_def = ctx.catalog.lookup(EVENTS_TABLE)?.clone();
-    let mut heap = Heap::from_pages(ctx.page_size, events_def.pages.clone());
+    let heap = Heap::from_pages(ctx.page_size, events_def.pages.clone());
 
     let seq = *ctx.next_event_seq;
     *ctx.next_event_seq += 1;
@@ -500,7 +500,7 @@ fn exec_insert(
     // FK (M11): only referenced-table existence is enforced, and it's a
     // schema-level property — check it once per statement, not per row.
     enforce_referenced_tables_exist(&table_def, ctx.catalog)?;
-    let mut heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+    let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
 
     let mut count = 0;
     for row_values in values {
@@ -839,7 +839,7 @@ fn exec_update(
 ) -> Result<ExecResult> {
     let table_def = ctx.catalog.lookup(table)?.clone();
     enforce_referenced_tables_exist(&table_def, ctx.catalog)?;
-    let mut heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+    let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
 
     let matching = matching_rows(&heap, &snapshot, ctx, &table_def, predicate)?;
@@ -904,7 +904,7 @@ fn exec_update(
 
 fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Result<ExecResult> {
     let table_def = ctx.catalog.lookup(table)?.clone();
-    let mut heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
+    let heap = Heap::from_pages(ctx.page_size, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
 
     let matching = matching_rows(&heap, &snapshot, ctx, &table_def, predicate)?;

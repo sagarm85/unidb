@@ -66,6 +66,32 @@ adversarially.
   parallelize across cores.**
 - Files: `server/engine_handle.rs`, `lib.rs`.
 
+**Step 1 — DONE** (branch `p5e-concurrent-writers`, commit `75eaaa1`): `Heap` is
+now interior-mutable `&self`, so **every** storage component is `&self`. The
+`Sync`-Engine foundation is complete.
+
+**Step 2+ — measured execution plan (surveyed 2026-07-09, not yet started).**
+The remaining work is large but mechanical; the exact surface is known:
+- **`Engine` → `&self`/`Sync` (`lib.rs`).** Only **6 fields are mutated** and
+  need interior mutability; everything else is already `&self`:
+  - `control: ControlData` → `Mutex<ControlData>` — **~44 access sites** (the
+    bulk of the work; it's read all over and written in `checkpoint`/`open`).
+    Watch lock scope: never hold the `control` lock across an fsync.
+  - `next_lob_id` (2 sites), `checkpoints_triggered` (2), `next_event_seq` (3)
+    → `AtomicI64`/`AtomicU64`.
+  - `auto_checkpoint` (3), `last_checkpoint` (3) → `Mutex<_>`.
+  - Then flip the **27 `&mut self` methods** to `&self`; the compiler +
+    `cargo clippy --fix` propagate the `&mut`→`&` reborrows through call sites
+    and tests (same technique used in P5.c/P5.e-1).
+- **Writer/connection pool (`server/engine_handle.rs`, ~674 lines).** Today one
+  dedicated OS thread owns the `Engine` and serves a channel (M5.a bridge).
+  Replace with a pool of N worker threads sharing `Arc<Engine>` (now possible
+  once `Engine: Sync`), keeping the read fast-path. This is a real rewrite of
+  that module, not a tweak.
+- **Then:** concurrent-writer stress + linearizability tests (no lost updates /
+  torn state / deadlock hangs) and the **headline benchmark: write throughput
+  scales with cores** → `PROGRESS.md`.
+
 ### P5.f — Resource control
 - Query timeouts, cancellation, per-query memory limits (a `work_mem` budget the
   hash-join/sort spills respect).

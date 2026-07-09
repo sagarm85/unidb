@@ -28,21 +28,28 @@
     policy; +4 multi-threaded tests incl. a genuine 2-thread deadlock). Crash
     harness still **19/19**; sync-invariant holds (no tokio/reqwest/axum in the
     default engine). **Every storage component EXCEPT `Heap` is now `&self`.**
-  - **NEXT — P5.e (the payoff) on `p5e-concurrent-writers`:** (1) make `Heap`'s
-    free-space map interior-mutable `&self` (the last `&mut` storage component;
-    relax `Heap::insert/update/delete/undo_*` to `&BufferPool`/`&Wal` and
-    `txn::abort`'s `&mut Heap`/`&mut BufferPool` accordingly — clippy `--fix`
-    propagates the `&mut`→`&` reborrows, as in P5.c); (2) make `Engine` `Sync`
-    (hold `Arc<_>` components, `&self` write methods); (3) replace the M5.a
-    single-writer-thread bridge (`server/engine_handle.rs`) with a writer/
-    connection pool + admission control; (4) concurrent-writer stress +
-    linearizability tests (no lost updates/torn state/deadlock hangs) and the
-    **headline benchmark: write throughput scales with cores** → `PROGRESS.md`.
-    Then **P5.f** (query timeouts, cancellation, per-query `work_mem`) and docs
-    closeout (README status line, `docs/design/engine_design.md`, flip
-    `docs/backlog/phase5_concurrency.md` to done). Spec:
-    `docs/backlog/phase5_concurrency.md`. Human sign-off to reverse the
-    single-writer design is recorded in `PROGRESS.md` (2026-07-09).
+  - **P5.e step 1 — `Heap` → interior-mutable `&self` — DONE** (branch
+    `p5e-concurrent-writers`, commit `75eaaa1`; green: crash harness 19/19,
+    clippy/fmt/sync-invariant clean). Free-space map + page list now live behind
+    a `Mutex<HeapFsm>`; **critical invariant** — that lock is *never* held across
+    a page-latch acquisition or WAL I/O, so no lock-ordering cycle with the P5.a
+    per-page latches (`find_or_alloc_page` probes with the lock released;
+    `note_free_space` records the free *value* captured after unpin;
+    `alloc_heap_page` does all page I/O before taking the lock). `page_ids()`
+    now returns an owned `Vec`; `txn::abort` now takes `&Heap`/`&BufferPool`.
+    **Every storage component is now `&self`/shareable — the `Sync` Engine
+    foundation is complete.**
+  - **NEXT — P5.e step 2+ (the payoff), on `p5e-concurrent-writers`:** (2) make
+    `Engine` `Sync` — hold `Arc<_>` components and convert its write methods to
+    `&self` (the big `lib.rs` change); (3) replace the M5.a single-writer-thread
+    bridge (`server/engine_handle.rs`) with a writer/connection pool + admission
+    control; (4) concurrent-writer stress + linearizability tests (no lost
+    updates/torn state/deadlock hangs) and the **headline benchmark: write
+    throughput scales with cores** → `PROGRESS.md`. Then **P5.f** (query
+    timeouts, cancellation, per-query `work_mem`) and docs closeout (README,
+    `docs/design/engine_design.md`, flip `docs/backlog/phase5_concurrency.md` to
+    done). Spec: `docs/backlog/phase5_concurrency.md`. Human sign-off to reverse
+    the single-writer design is recorded in `PROGRESS.md` (2026-07-09).
 - **Milestone: M0-M8 are ALL DONE.** Every milestone on CLAUDE.md's
   original roadmap (M0-M5) shipped; M6-M8 are a user-approved follow-on
   set (B-Tree indexing, CSR graph, an "attach" Rust client over REST)

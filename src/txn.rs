@@ -614,7 +614,7 @@ mod tests {
         let mgr = TransactionManager::new();
         let lock_mgr = LockManager::new();
         let a = mgr.begin(IsolationLevel::ReadCommitted, &wal).unwrap();
-        let rid = heap.insert(b"oops", a, &mut pool, &mut wal).unwrap();
+        let rid = heap.insert(b"oops", a, &pool, &wal).unwrap();
         mgr.record_undo(
             a,
             UndoAction::Insert {
