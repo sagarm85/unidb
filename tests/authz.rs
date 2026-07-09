@@ -118,6 +118,32 @@ fn role_grants_inherited_and_persist() {
     engine.abort(x).unwrap();
 }
 
+// The security audit trail (P6.f) records auth DDL + named-user decisions.
+#[test]
+fn audit_trail_written() {
+    let dir = tempdir().unwrap();
+    {
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        let x = engine.begin().unwrap();
+        engine.execute_sql(x, "CREATE TABLE t (id INT)").unwrap();
+        engine.commit(x).unwrap();
+        // Auth DDL is audited (even for the embedded superuser).
+        let x = engine.begin().unwrap();
+        engine.execute_sql_as(None, x, "CREATE USER bob").unwrap();
+        engine.commit(x).unwrap();
+        // A denied named-user access is audited.
+        let x = engine.begin().unwrap();
+        let _ = engine.execute_sql_as(Some("bob"), x, "SELECT id FROM t");
+        engine.abort(x).unwrap();
+    }
+    let audit = std::fs::read_to_string(dir.path().join("audit.log")).unwrap();
+    assert!(audit.contains("create_user"), "auth DDL must be audited");
+    assert!(
+        audit.contains("\"user\":\"bob\"") && audit.contains("\"allowed\":false"),
+        "the denied access must be audited: {audit}"
+    );
+}
+
 // A named SUPERUSER can administer + read/write everything.
 #[test]
 fn named_superuser_has_full_access() {

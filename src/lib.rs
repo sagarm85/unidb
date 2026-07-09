@@ -37,6 +37,7 @@
 // unsafe_code is denied crate-wide; mmap.rs is the sole exception (CLAUDE.md §4).
 #![deny(unsafe_code)]
 
+pub mod audit;
 pub mod authz;
 pub mod backup;
 pub mod btree_index;
@@ -260,6 +261,9 @@ pub struct Engine {
     /// superuser (identity `None`); named users go through `execute_sql_as` with
     /// per-table privilege checks. Persisted in `roles.json`.
     authz: Arc<crate::authz::RoleStore>,
+    /// Security audit trail (P6.f) — auth DDL + named-user access decisions,
+    /// appended to `audit.log`.
+    audit: Arc<crate::audit::AuditLog>,
 }
 
 /// `Engine` must be safely **shareable** across threads (P5.e: a pool of N
@@ -288,6 +292,35 @@ fn cat_read(c: &RwLock<Catalog>) -> RwLockReadGuard<'_, Catalog> {
 
 fn cat_write(c: &RwLock<Catalog>) -> RwLockWriteGuard<'_, Catalog> {
     c.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Map an auth-DDL statement to an `(action, object)` pair for the audit log
+/// (P6.f).
+fn auth_stmt_audit(stmt: &crate::authz::AuthStmt) -> (&'static str, String) {
+    use crate::authz::AuthStmt as A;
+    match stmt {
+        A::CreateUser { name, .. } => ("create_user", name.clone()),
+        A::DropUser(name) => ("drop_user", name.clone()),
+        A::CreateRole(name) => ("create_role", name.clone()),
+        A::DropRole(name) => ("drop_role", name.clone()),
+        A::GrantPrivs { table, grantee, .. } => ("grant", format!("{table} to {grantee}")),
+        A::RevokePrivs { table, grantee, .. } => ("revoke", format!("{table} from {grantee}")),
+        A::GrantRole { role, grantee } => ("grant_role", format!("{role} to {grantee}")),
+        A::RevokeRole { role, grantee } => ("revoke_role", format!("{role} from {grantee}")),
+    }
+}
+
+/// A short audit action verb for a data/DDL plan (P6.f).
+fn plan_audit_action(plan: &LogicalPlan) -> &'static str {
+    match plan {
+        LogicalPlan::Select { .. } | LogicalPlan::Query(_) | LogicalPlan::Explain { .. } => {
+            "select"
+        }
+        LogicalPlan::Insert { .. } => "insert",
+        LogicalPlan::Update { .. } => "update",
+        LogicalPlan::Delete { .. } => "delete",
+        _ => "ddl",
+    }
 }
 
 /// The base tables a Phase-4 query reads (P6.e privilege check): every
@@ -453,6 +486,8 @@ impl Engine {
         let replication = Arc::new(crate::replication::SlotRegistry::open(dir)?);
         // Users / roles / privileges (P6.e), loaded from `roles.json`.
         let authz = Arc::new(crate::authz::RoleStore::open(dir)?);
+        // Security audit trail (P6.f).
+        let audit = Arc::new(crate::audit::AuditLog::open(dir)?);
 
         // Phase 3: every secondary index is durable and crash-recovered — the
         // B-Tree/full-text/edge indexes as `DiskBTree`s (P3.a/P3.b), the vector
@@ -481,6 +516,7 @@ impl Engine {
             write_serial: Mutex::new(()),
             replication,
             authz,
+            audit,
         })
     }
 
@@ -522,20 +558,38 @@ impl Engine {
     ) -> Result<Vec<ExecResult>> {
         // Auth DDL (whole-statement) is handled here, not by the SQL executor.
         if let Some(stmt) = crate::authz::parse_auth_stmt(sql)? {
-            self.require_superuser(user)?;
-            self.authz.apply(&stmt)?;
-            return Ok(vec![ExecResult::Rows(Vec::new())]);
-        }
-        // A named non-superuser must hold the matching privilege on every table
-        // each statement touches (an effective superuser skips all checks).
-        if let Some(u) = user {
-            if !self.is_effective_superuser(Some(u)) {
-                for plan in parse_sql(sql)? {
-                    self.check_plan_privileges(u, &plan)?;
+            let (action, object) = auth_stmt_audit(&stmt);
+            match self
+                .require_superuser(user)
+                .and_then(|()| self.authz.apply(&stmt))
+            {
+                Ok(()) => {
+                    self.audit.record_admin(user, action, &object, true);
+                    Ok(vec![ExecResult::Rows(Vec::new())])
+                }
+                Err(e) => {
+                    self.audit.record_admin(user, action, &object, false);
+                    Err(e)
                 }
             }
+        } else {
+            // A named non-superuser must hold the matching privilege on every
+            // table each statement touches (an effective superuser skips checks).
+            if let Some(u) = user {
+                if !self.is_effective_superuser(Some(u)) {
+                    for plan in parse_sql(sql)? {
+                        if let Err(e) = self.check_plan_privileges(u, &plan) {
+                            self.audit
+                                .record(Some(u), plan_audit_action(&plan), "", false);
+                            return Err(e);
+                        }
+                        self.audit
+                            .record(Some(u), plan_audit_action(&plan), "", true);
+                    }
+                }
+            }
+            self.execute_sql(xid, sql)
         }
-        self.execute_sql(xid, sql)
     }
 
     /// Privilege pre-check for `sql` as `user`, without executing (P6.e). Used by

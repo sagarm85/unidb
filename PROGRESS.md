@@ -2624,5 +2624,17 @@ Two §3 decisions are touched by Phase 6. Both were flagged to the human and
   charter is unchanged** — async (or optional sync) read replicas, *not*
   consensus; no multi-primary, no sharded writes (both remain parked, roadmap §7).
 
-Encryption-at-rest (P6.f) will touch **D9** (page CRC + LSN + on-disk format);
-that sign-off will be recorded here when P6.f is reached, not assumed now.
+- **D9 (on-disk page format) / encryption-at-rest — DEFERRED, sign-off-gated
+  (flagged at P6.f, 2026-07-09).** P6.f ships native **TLS** (rustls) and an
+  **audit log** — neither touches the on-disk format. **Encryption-at-rest was
+  deliberately NOT implemented:** it would change the D9 page format (encrypting
+  page bytes vs. the current plaintext + CRC32 + LSN layout) **and** is
+  fundamentally at odds with this engine's `memmap2`-based page store —
+  transparent block encryption can't compose with mmap page-faults without a
+  decrypt-on-read buffer layer or moving off mmap entirely (a storage-core
+  re-architecture). Per §3, a D9 change needs explicit human sign-off; that
+  sign-off has **not** been given, so encryption-at-rest is recorded here as a
+  documented, sign-off-gated follow-up rather than assumed. TLS-on-the-wire +
+  audit trail satisfy the deployable-security bar for v1; at-rest encryption is
+  typically provided by full-disk/volume encryption (LUKS/FileVault) underneath,
+  which needs no engine change.
