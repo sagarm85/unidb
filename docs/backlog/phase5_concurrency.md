@@ -1,6 +1,14 @@
 # Phase 5 — Concurrency & performance (Core lane)
 
-## Status as of 2026-07-08: NOT STARTED.
+## Status as of 2026-07-09: IN PROGRESS — part 1 (P5.a–P5.d) shipped to `main` (PR #14).
+
+P5.a (buffer-pool latching), P5.b (concurrent WAL append), P5.c (concurrent
+transaction manager), and P5.d (real lock manager — modes, blocking waits,
+wait-for-graph deadlock detection) are merged and green (crash harness 19/19).
+These are the concurrency *infrastructure*; single-writer behavior is unchanged.
+Remaining, on branch `p5e-concurrent-writers`: **P5.e** (Heap → `&self`, then
+`Engine` → `Sync` + writer/connection pool + admission control — the
+scales-with-cores payoff and its benchmark) and **P5.f** (resource control).
 
 The single-writer → concurrent-writers unlock. **The biggest and highest-risk
 phase** — it reverses the M5 "single writer thread, `Engine` is `!Sync`"

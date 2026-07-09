@@ -12,6 +12,37 @@
 
 ## Current status
 
+- **Phase 5 (concurrency & performance) — IN PROGRESS. Part 1 (P5.a–P5.d)
+  shipped to `main` 2026-07-09** via PR #14 (merge `30109d9`); a fresh branch
+  `p5e-concurrent-writers` is cut off updated `main` for the rest.
+  - **What shipped (concurrency infrastructure — non-breaking; single-writer
+    behavior is unchanged, these just make the internal components
+    concurrency-capable):** P5.a concurrent buffer-pool latching (`Mutex<PoolState>`
+    frames, mmap behind `Arc<RwLock>`, hand-rolled `unsafe`-free per-page S/X
+    latch table; D5 preserved); P5.b concurrent WAL append (`Mutex<WalInner>`,
+    `&self`, serialized LSN + group-batched flush); P5.c concurrent txn manager
+    (`&self` `LockManager`, txn write path takes `&Wal`/`&LockManager`, +3
+    concurrency stress tests); P5.d real lock manager (shared/exclusive modes,
+    blocking `Condvar` wait queues, **wait-for-graph deadlock detection** →
+    `DbError::Deadlock` → 409; SI first-committer-wins kept as the `NoWait`
+    policy; +4 multi-threaded tests incl. a genuine 2-thread deadlock). Crash
+    harness still **19/19**; sync-invariant holds (no tokio/reqwest/axum in the
+    default engine). **Every storage component EXCEPT `Heap` is now `&self`.**
+  - **NEXT — P5.e (the payoff) on `p5e-concurrent-writers`:** (1) make `Heap`'s
+    free-space map interior-mutable `&self` (the last `&mut` storage component;
+    relax `Heap::insert/update/delete/undo_*` to `&BufferPool`/`&Wal` and
+    `txn::abort`'s `&mut Heap`/`&mut BufferPool` accordingly — clippy `--fix`
+    propagates the `&mut`→`&` reborrows, as in P5.c); (2) make `Engine` `Sync`
+    (hold `Arc<_>` components, `&self` write methods); (3) replace the M5.a
+    single-writer-thread bridge (`server/engine_handle.rs`) with a writer/
+    connection pool + admission control; (4) concurrent-writer stress +
+    linearizability tests (no lost updates/torn state/deadlock hangs) and the
+    **headline benchmark: write throughput scales with cores** → `PROGRESS.md`.
+    Then **P5.f** (query timeouts, cancellation, per-query `work_mem`) and docs
+    closeout (README status line, `docs/design/engine_design.md`, flip
+    `docs/backlog/phase5_concurrency.md` to done). Spec:
+    `docs/backlog/phase5_concurrency.md`. Human sign-off to reverse the
+    single-writer design is recorded in `PROGRESS.md` (2026-07-09).
 - **Milestone: M0-M8 are ALL DONE.** Every milestone on CLAUDE.md's
   original roadmap (M0-M5) shipped; M6-M8 are a user-approved follow-on
   set (B-Tree indexing, CSR graph, an "attach" Rust client over REST)

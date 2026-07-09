@@ -2547,8 +2547,10 @@ tokio/reqwest/axum (rusqlite is a dev-dep, outside the normal graph).
 
 ## Phase 5 — Concurrency & performance   [IN PROGRESS]   2026-07-09
 
-**Branch:** `phase5-concurrency` (one branch, one PR for the whole phase).
-**PR:** _pending._
+**Branches / PRs:** landing incrementally. **Part 1 — P5.a–P5.d (concurrency
+infrastructure) merged to `main` 2026-07-09 via [PR #14] (`30109d9`).** The
+remainder (P5.e/P5.f + the scaling benchmark) continues on branch
+`p5e-concurrent-writers` off updated `main`, in a follow-up PR.
 
 **Locked-decision sign-off (CLAUDE.md §3, required before any work):** Phase 5
 reverses the M5 "single writer thread, `Engine` is `!Sync`" simplification —
@@ -2560,7 +2562,14 @@ concurrency (D5 preserved by page latching; D11/D12 completed by real wait
 queues + deadlock detection replacing abort-only). No other §3 decision is
 touched.
 
-**Summary:** _in progress — checkpoints P5.a→P5.f. Metrics table (write
-throughput scaling with cores) + peak-memory note recorded at phase close._
+**Summary:** _in progress. Part 1 (concurrency infrastructure) shipped and
+green; the scales-with-cores payoff (P5.e) plus its metrics table and
+peak-memory note land at phase close._
 
-**Checkpoint status:** _updated as each lands._
+**Checkpoint status:**
+- **P5.a — buffer-pool latching — DONE.** Concurrent pool (`Mutex<PoolState>` frames, mmap behind `Arc<RwLock>`), hand-rolled `unsafe`-free per-page shared/exclusive latch table; D5 (WAL-before-page) preserved under concurrency.
+- **P5.b — concurrent WAL append — DONE.** `Mutex<WalInner>`, all methods `&self`; serialized LSN allocation + group-batched flush.
+- **P5.c — concurrent transaction manager — DONE.** `&self` `LockManager`; txn write path takes `&Wal`/`&LockManager`; 3 adversarial concurrency tests (unique-xid allocation, vacuum-horizon soundness under writer churn, single-winner row locking).
+- **P5.d — real lock manager — DONE.** Shared/exclusive modes, blocking `Condvar` wait queues, wait-for-graph deadlock detection (`DbError::Deadlock` → 409). SI first-committer-wins kept as the `NoWait` policy. 4 multi-threaded tests incl. a genuine 2-thread deadlock. Crash harness 19/19; sync-invariant holds.
+- **P5.e — multiple writers — NEXT.** `Heap` → interior-mutable `&self`, then `Engine` → `Sync`, writer/connection pool + admission control. The scales-with-cores payoff and headline benchmark.
+- **P5.f — resource control — pending.** Query timeouts, cancellation, per-query memory limits.
