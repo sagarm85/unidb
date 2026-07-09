@@ -59,6 +59,7 @@ pub mod lockmgr;
 pub mod mmap;
 pub mod mvcc;
 pub mod page;
+pub mod query_limits;
 pub mod queue;
 pub mod read_handle;
 pub mod recovery;
@@ -432,6 +433,24 @@ impl Engine {
             checkpoints_triggered: AtomicU64::new(0),
             write_serial: Mutex::new(()),
         })
+    }
+
+    /// Like [`Engine::execute_sql`], but under per-query resource limits (P5.f):
+    /// a wall-clock **timeout**, a cooperative **cancellation** token, and/or a
+    /// **`work_mem`** row budget the `ORDER BY`/hash-join spill operators respect.
+    /// The limits are installed on the current thread for the duration of the
+    /// call (a query runs on one worker thread, P5.e-3) and cleared on return, so
+    /// a long scan/sort/join aborts with [`DbError::QueryTimeout`] /
+    /// [`DbError::QueryCancelled`] at its next check point instead of running
+    /// unbounded. `QueryLimits::default()` imposes no limit.
+    pub fn execute_sql_with_limits(
+        &self,
+        xid: Xid,
+        sql: &str,
+        limits: crate::query_limits::QueryLimits,
+    ) -> Result<Vec<ExecResult>> {
+        let _guard = crate::query_limits::install(limits);
+        self.execute_sql(xid, sql)
     }
 
     /// Parse and execute one or more `;`-separated SQL statements under

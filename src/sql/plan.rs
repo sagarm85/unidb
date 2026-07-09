@@ -953,11 +953,12 @@ pub fn key_ord(a: &[Literal], b: &[Literal]) -> Option<std::cmp::Ordering> {
 /// Overridable via `UNIDB_HASH_JOIN_MEM_ROWS` (tests force spill with a small
 /// value). Not a memory cap in bytes — a row count, deliberately coarse.
 pub fn hash_join_mem_rows() -> usize {
-    std::env::var("UNIDB_HASH_JOIN_MEM_ROWS")
+    let default = std::env::var("UNIDB_HASH_JOIN_MEM_ROWS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(1_000_000)
+        .unwrap_or(1_000_000);
+    crate::query_limits::work_mem_rows(default)
 }
 
 #[cfg(test)]

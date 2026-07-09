@@ -290,7 +290,16 @@ impl Runner<'_, '_> {
         let table_def = self.ctx.catalog.lookup(table)?.clone();
         let heap = Heap::from_pages(self.ctx.page_size, table_def.pages.clone());
         let mut rows = Vec::new();
-        for (_, bytes) in heap.scan(&self.snapshot, self.ctx.xid, self.ctx.pool)? {
+        for (i, (_, bytes)) in heap
+            .scan(&self.snapshot, self.ctx.xid, self.ctx.pool)?
+            .into_iter()
+            .enumerate()
+        {
+            // P5.f: honor query timeout / cancellation, batched every 1024 rows
+            // so the check itself is free on the hot path.
+            if i % 1024 == 0 {
+                crate::query_limits::check()?;
+            }
             let full = decode_row(&bytes, &table_def.columns)?;
             rows.push(visible_row(&full, &table_def));
         }

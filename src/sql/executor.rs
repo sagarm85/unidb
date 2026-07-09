@@ -568,7 +568,14 @@ fn exec_select(
 
     let mut out = Vec::new();
     let mut read_ids = Vec::new();
-    for (row_id, bytes) in heap.scan(&snapshot, ctx.xid, ctx.pool)? {
+    for (i, (row_id, bytes)) in heap
+        .scan(&snapshot, ctx.xid, ctx.pool)?
+        .into_iter()
+        .enumerate()
+    {
+        if i % 1024 == 0 {
+            crate::query_limits::check()?; // P5.f: timeout / cancellation
+        }
         let row = decode_row(&bytes, &table_def.columns)?;
         if predicate_matches(predicate, &table_def.columns, &row)? {
             // P1.d: this row is part of the statement's read set (an SSI
@@ -600,7 +607,14 @@ pub(crate) fn exec_select_readonly<P: PageReader>(
     let table_def = catalog.lookup(table)?.clone();
     let heap = Heap::from_pages(reader.page_size(), table_def.pages.clone());
     let mut out = Vec::new();
-    for (_, bytes) in heap.scan(snapshot, self_xid, reader)? {
+    for (i, (_, bytes)) in heap
+        .scan(snapshot, self_xid, reader)?
+        .into_iter()
+        .enumerate()
+    {
+        if i % 1024 == 0 {
+            crate::query_limits::check()?; // P5.f: timeout / cancellation
+        }
         let row = decode_row(&bytes, &table_def.columns)?;
         if predicate_matches(predicate, &table_def.columns, &row)? {
             out.push(project_row(projection, &table_def.columns, &row)?);
