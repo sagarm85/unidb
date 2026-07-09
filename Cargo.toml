@@ -166,3 +166,8 @@ required-features = ["server"]
 name = "server_replication"
 path = "tests/server_replication.rs"
 required-features = ["server"]
+
+[[test]]
+name = "server_authz"
+path = "tests/server_authz.rs"
+required-features = ["server"]

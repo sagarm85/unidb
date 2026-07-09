@@ -53,9 +53,18 @@ impl JwtConfig {
 /// (see the known-limitations note in `PROGRESS.md`/`MEMORY.md`).
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
+    /// The subject = the unidb username (P6.e). Absent ⇒ an anonymous but
+    /// authenticated client, treated as the implicit superuser (backward
+    /// compatible with pre-P6.e tokens that carry no `sub`).
+    sub: Option<String>,
     #[serde(flatten)]
     _extra: std::collections::HashMap<String, serde_json::Value>,
 }
+
+/// The authenticated user carried through request extensions (P6.e). `None`
+/// (no `sub` claim) is the implicit superuser.
+#[derive(Clone, Debug)]
+pub struct CurrentUser(pub Option<String>);
 
 #[derive(Serialize)]
 struct AuthErrorBody {
@@ -99,7 +108,15 @@ pub async fn require_jwt(
     metrics::histogram!("unidb_jwt_verify_seconds").record(start.elapsed().as_secs_f64());
 
     match result {
-        Ok(_) => next.run(request).await,
+        Ok(data) => {
+            // Carry the authenticated username to handlers for per-user
+            // privilege checks (P6.e).
+            let mut request = request;
+            request
+                .extensions_mut()
+                .insert(CurrentUser(data.claims.sub));
+            next.run(request).await
+        }
         Err(e) => unauthorized(format!("invalid token: {e}")),
     }
 }

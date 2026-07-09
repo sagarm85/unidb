@@ -62,9 +62,36 @@ pub async fn post_txn_begin(
 // ── SQL / Cypher ─────────────────────────────────────────────────────────
 
 pub async fn post_sql(
+    axum::Extension(current_user): axum::Extension<crate::server::auth::CurrentUser>,
     State(state): State<AppState>,
     Json(body): Json<SqlRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    let user = current_user.0;
+    // Auth DDL (CREATE USER / GRANT / REVOKE, P6.e) isn't `sqlparser` grammar —
+    // route it through the writer thread's `execute_sql_as`, which intercepts it
+    // and requires superuser.
+    if crate::authz::parse_auth_stmt(&body.sql)
+        .map_err(ApiError)?
+        .is_some()
+    {
+        let xid = state.engine.begin(None).await?;
+        let result = state
+            .engine
+            .execute_sql_as(user.clone(), xid, body.sql.clone())
+            .await;
+        let results = finish(&state.engine, xid, result).await?;
+        let json_results: Vec<_> = results.iter().map(exec_result_to_json).collect();
+        return Ok(Json(json!({ "results": json_results })));
+    }
+
+    // Enforce per-user privileges (a no-op for the superuser / `None`) before the
+    // fast-path dispatch below runs the statement.
+    state
+        .engine
+        .authorize_sql(user.clone(), body.sql.clone())
+        .await
+        .map_err(ApiError)?;
+
     // Parameterized requests (P2.e) always go through the writer thread with
     // the values bound as data — the injection-safe path.
     let results = if !body.params.is_empty() {

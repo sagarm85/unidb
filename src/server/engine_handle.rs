@@ -158,6 +158,24 @@ impl EngineHandle {
         self.on_engine(move |e| e.execute_cypher(xid, &query)).await
     }
 
+    /// Execute SQL as a named user (P6.e), enforcing privileges + handling auth
+    /// DDL. `user == None` is the embedded superuser.
+    pub async fn execute_sql_as(
+        &self,
+        user: Option<String>,
+        xid: Xid,
+        sql: String,
+    ) -> Result<Vec<ExecResult>> {
+        self.on_engine(move |e| e.execute_sql_as(user.as_deref(), xid, &sql))
+            .await
+    }
+
+    /// Privilege pre-check for the read/param fast paths (P6.e).
+    pub async fn authorize_sql(&self, user: Option<String>, sql: String) -> Result<()> {
+        self.on_engine(move |e| e.authorize_sql(user.as_deref(), &sql))
+            .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn create_edge(
         &self,

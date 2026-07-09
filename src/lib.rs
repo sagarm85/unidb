@@ -37,6 +37,7 @@
 // unsafe_code is denied crate-wide; mmap.rs is the sole exception (CLAUDE.md §4).
 #![deny(unsafe_code)]
 
+pub mod authz;
 pub mod backup;
 pub mod btree_index;
 pub mod bufferpool;
@@ -99,6 +100,7 @@ use crate::{
         executor::{self, ExecCtx, ExecResult},
         logical::{apply_rls, bind_params, Expr, Literal, LogicalPlan},
         parser::parse_sql,
+        query::{FromNode, QuerySpec},
     },
     txn::{IsolationLevel, TransactionManager, UndoAction},
     wal::Wal,
@@ -254,6 +256,10 @@ pub struct Engine {
     /// `min(checkpoint_lsn, min slot restart_lsn)` so a consumer's segments are
     /// never deleted before it has streamed them. Persisted in `slots.json`.
     replication: Arc<crate::replication::SlotRegistry>,
+    /// Users / roles / privileges (P6.e). The embedded API runs as an implicit
+    /// superuser (identity `None`); named users go through `execute_sql_as` with
+    /// per-table privilege checks. Persisted in `roles.json`.
+    authz: Arc<crate::authz::RoleStore>,
 }
 
 /// `Engine` must be safely **shareable** across threads (P5.e: a pool of N
@@ -282,6 +288,35 @@ fn cat_read(c: &RwLock<Catalog>) -> RwLockReadGuard<'_, Catalog> {
 
 fn cat_write(c: &RwLock<Catalog>) -> RwLockWriteGuard<'_, Catalog> {
     c.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The base tables a Phase-4 query reads (P6.e privilege check): every
+/// `FROM` table across the query and its CTE bodies, excluding CTE names (which
+/// are derived relations, not base tables). Subquery-only references are not
+/// walked in v1 (a documented approximation — such a query from a non-superuser
+/// simply isn't over-granted; it may need broader grants).
+fn query_base_tables(spec: &QuerySpec) -> Vec<String> {
+    fn walk(node: &FromNode, ctes: &std::collections::HashSet<String>, out: &mut Vec<String>) {
+        match node {
+            FromNode::Table(t) => {
+                if !ctes.contains(&t.table) {
+                    out.push(t.table.clone());
+                }
+            }
+            FromNode::Join { left, right, .. } => {
+                walk(left, ctes, out);
+                walk(right, ctes, out);
+            }
+        }
+    }
+    let cte_names: std::collections::HashSet<String> =
+        spec.with.iter().map(|(n, _)| n.clone()).collect();
+    let mut out = Vec::new();
+    walk(&spec.from, &cte_names, &mut out);
+    for (_, cte) in &spec.with {
+        out.extend(query_base_tables(cte));
+    }
+    out
 }
 
 /// Lock the control-metadata `Mutex`, recovering from poisoning rather than
@@ -416,6 +451,8 @@ impl Engine {
         // Replication slots (P6.b): persisted retention positions loaded from
         // `slots.json` — they hold the WAL truncation floor back at checkpoint.
         let replication = Arc::new(crate::replication::SlotRegistry::open(dir)?);
+        // Users / roles / privileges (P6.e), loaded from `roles.json`.
+        let authz = Arc::new(crate::authz::RoleStore::open(dir)?);
 
         // Phase 3: every secondary index is durable and crash-recovered — the
         // B-Tree/full-text/edge indexes as `DiskBTree`s (P3.a/P3.b), the vector
@@ -443,6 +480,7 @@ impl Engine {
             checkpoints_triggered: AtomicU64::new(0),
             write_serial: Mutex::new(()),
             replication,
+            authz,
         })
     }
 
@@ -462,6 +500,117 @@ impl Engine {
     ) -> Result<Vec<ExecResult>> {
         let _guard = crate::query_limits::install(limits);
         self.execute_sql(xid, sql)
+    }
+
+    /// The authorization store (P6.e) — users/roles/privileges.
+    pub fn authz(&self) -> &crate::authz::RoleStore {
+        &self.authz
+    }
+
+    /// Execute SQL **as** a named user (P6.e), enforcing per-table privileges.
+    /// `user == None` is the implicit **superuser** (the embedded API), so
+    /// `execute_sql` is exactly `execute_sql_as(None, ..)` and is unrestricted.
+    ///
+    /// Also the entry point for auth DDL (`CREATE USER`/`ROLE`, `GRANT`,
+    /// `REVOKE`) — those are intercepted here (they aren't `sqlparser` grammar),
+    /// require superuser, and mutate the role store rather than the catalog.
+    pub fn execute_sql_as(
+        &self,
+        user: Option<&str>,
+        xid: Xid,
+        sql: &str,
+    ) -> Result<Vec<ExecResult>> {
+        // Auth DDL (whole-statement) is handled here, not by the SQL executor.
+        if let Some(stmt) = crate::authz::parse_auth_stmt(sql)? {
+            self.require_superuser(user)?;
+            self.authz.apply(&stmt)?;
+            return Ok(vec![ExecResult::Rows(Vec::new())]);
+        }
+        // A named non-superuser must hold the matching privilege on every table
+        // each statement touches (an effective superuser skips all checks).
+        if let Some(u) = user {
+            if !self.is_effective_superuser(Some(u)) {
+                for plan in parse_sql(sql)? {
+                    self.check_plan_privileges(u, &plan)?;
+                }
+            }
+        }
+        self.execute_sql(xid, sql)
+    }
+
+    /// Privilege pre-check for `sql` as `user`, without executing (P6.e). Used by
+    /// the server's read/param fast paths, which don't route through
+    /// [`Engine::execute_sql_as`]. A superuser / embedded (`None`) always passes.
+    /// Auth DDL requires superuser here too.
+    pub fn authorize_sql(&self, user: Option<&str>, sql: &str) -> Result<()> {
+        if crate::authz::parse_auth_stmt(sql)?.is_some() {
+            return self.require_superuser(user);
+        }
+        if self.is_effective_superuser(user) {
+            return Ok(());
+        }
+        let u = user.expect("effective superuser covers None");
+        for plan in parse_sql(sql)? {
+            self.check_plan_privileges(u, &plan)?;
+        }
+        Ok(())
+    }
+
+    /// An **effective** superuser skips all privilege checks: the embedded API
+    /// (`None`), a named `SUPERUSER`, or *any* identity while the role store has
+    /// no registered users (open / bootstrap mode — see [`RoleStore::has_users`]).
+    fn is_effective_superuser(&self, user: Option<&str>) -> bool {
+        match user {
+            None => true,
+            Some(u) => self.authz.is_superuser(u) || !self.authz.has_users(),
+        }
+    }
+
+    /// Superuser gate for auth/schema DDL (P6.e).
+    fn require_superuser(&self, user: Option<&str>) -> Result<()> {
+        if self.is_effective_superuser(user) {
+            Ok(())
+        } else {
+            Err(DbError::PermissionDenied(format!(
+                "user '{}' must be a superuser for this operation",
+                user.unwrap_or("?")
+            )))
+        }
+    }
+
+    /// Enforce that non-superuser `user` may run `plan` (P6.e).
+    fn check_plan_privileges(&self, user: &str, plan: &LogicalPlan) -> Result<()> {
+        use crate::authz::Privilege as P;
+        let reqs: Vec<(String, P)> = match plan {
+            LogicalPlan::Select { table, .. } => vec![(table.clone(), P::Select)],
+            LogicalPlan::Insert { table, .. } => vec![(table.clone(), P::Insert)],
+            LogicalPlan::Update { table, .. } => vec![(table.clone(), P::Update)],
+            LogicalPlan::Delete { table, .. } => vec![(table.clone(), P::Delete)],
+            LogicalPlan::Query(spec) | LogicalPlan::Explain { spec, .. } => query_base_tables(spec)
+                .into_iter()
+                .map(|t| (t, P::Select))
+                .collect(),
+            // Schema DDL requires superuser in v1.
+            LogicalPlan::CreateTable { .. }
+            | LogicalPlan::CreateIndex { .. }
+            | LogicalPlan::AlterTableAddColumn { .. }
+            | LogicalPlan::AlterTableDropColumn { .. }
+            | LogicalPlan::DropTable { .. }
+            | LogicalPlan::Truncate { .. }
+            | LogicalPlan::Analyze { .. } => {
+                return Err(DbError::PermissionDenied(
+                    "schema DDL requires a superuser".into(),
+                ));
+            }
+        };
+        for (table, priv_) in reqs {
+            if !self.authz.has_privilege(user, &table, priv_) {
+                return Err(DbError::PermissionDenied(format!(
+                    "{priv_:?} on '{table}' for user '{user}'"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Parse and execute one or more `;`-separated SQL statements under
