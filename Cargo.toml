@@ -68,6 +68,10 @@ path = "src/bin/unidb-server.rs"
 required-features = ["server"]
 
 [[bench]]
+name = "phase6_ops"
+harness = false
+
+[[bench]]
 name = "load"
 harness = false
 

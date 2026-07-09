@@ -1124,4 +1124,45 @@ reads run concurrently). P5.f: per-query **timeouts / cancellation / `work_mem`*
 (`query_limits.rs`, `Engine::execute_sql_with_limits`). Crash harness stays
 **19/19**; sync invariant holds; no `FORMAT_VERSION` bump. See
 `docs/backlog/phase5_concurrency.md` + `PROGRESS.md`'s Phase 5 entry.
+
+**Phase 6 COMPLETE (2026-07-09, branch `phase6-ops-ha`): operations & HA** —
+the roadmap's final phase, delivering a deployable single primary + read
+replicas. **P6.a segmented WAL:** `db.wal/` is now a directory of fixed-size
+16 MiB segment files (`seg-*.wal`, each with a base-LSN header); the active
+segment seals + rotates on the size boundary, recovery scans all segments in
+LSN order, and truncation deletes whole consumed segments instead of the old
+rewrite-to-truncate — the enabler for concurrent WAL readers. Evolves **D6**
+(data store stays single-file; WAL is now segmented — human sign-off recorded in
+`PROGRESS.md`). **P6.b replication slots + WAL shipping:** a persisted
+`SlotRegistry` (`slots.json`) pins a `restart_lsn`; the checkpoint truncation
+floor becomes `min(checkpoint_lsn, min slot restart_lsn)`; `Wal::ship_from` /
+`decode_stream` serialize the record stream a replica applies. **P6.c read
+replicas + failover:** `replication::Replica` seeds from a **base snapshot** and
+applies shipped WAL **incrementally on top** via the crash-recovery redo path
+(no wipe — incremental redo on a populated store is normal crash recovery);
+`promote()` opens it read-write for failover; `wait_for_sync_replicas` is the
+optional synchronous-commit gate. (Documented limit: a page first allocated
+*after* the base isn't full-page-image-covered, so roll-forward reconstructs
+pages present in the base — re-base regularly.) **P6.d backups + PITR:**
+`Engine::base_backup` (checkpoint + copy) + `archive_wal`, and
+`backup::restore(base, archive, dest, target_lsn)` for point-in-time recovery
+**by LSN** (time-based needs commit timestamps — a follow-up). **P6.e
+users/roles/GRANT:** `authz::RoleStore` (`roles.json`) with transitive role
+membership + per-table privileges; `Engine::execute_sql_as(user, ..)` enforces
+them and intercepts the auth-DDL grammar (parsed in `authz`, not `sqlparser`);
+the embedded API (`None`) is the implicit superuser, the server maps the JWT
+`sub` claim to a user, and an empty role store is open/bootstrap mode
+(backward compatible). **P6.f security:** native **TLS** (rustls via
+`axum-server`, `server/tls.rs`) and an append-only **audit log** (`audit.log`);
+**encryption-at-rest is DEFERRED** as a D9-sign-off-gated follow-up (it would
+change the on-disk page format *and* fights the mmap page store). **P6.g
+observability:** `Engine::stats()` (`pg_stat_*`-style: commits/aborts/
+checkpoints/active-txns/WAL bytes/replication lag/data pages/recent slow
+queries) + `GET /stats`, a slow-query log, and `docs/ops_runbook.md`. Crash
+harness **19 → 21** (P18 segmented-WAL multi-segment recovery + truncation; P19
+backup+PITR restore after primary loss). No `FORMAT_VERSION` bump; sync
+invariant holds (no tokio/reqwest/axum/rustls in the default build). Benchmarks
+(base backup 7 ms, restore 72 ms, PITR 43 ms, failover 26 ms at 5k rows) +
+per-checkpoint detail in `PROGRESS.md`'s Phase 6 entry; ops in
+`docs/backlog/phase6_ops_ha.md` and `docs/ops_runbook.md`.
 Update alongside the next milestone's closeout.*

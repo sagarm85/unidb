@@ -2638,3 +2638,69 @@ Two §3 decisions are touched by Phase 6. Both were flagged to the human and
   audit trail satisfy the deployable-security bar for v1; at-rest encryption is
   typically provided by full-disk/volume encryption (LUKS/FileVault) underneath,
   which needs no engine change.
+
+### Phase 6 checkpoints — SHIPPED (2026-07-09)
+
+One PR for all of Phase 6 (branch `phase6-ops-ha`), checkpoints P6.a→P6.g as
+separate commits. Delivers the confirmed scale target — a strong single primary
++ read replicas, deployable and operable.
+
+- **P6.a — segmented WAL** (`8f2fdf3`): WAL is now a directory of fixed-size
+  16 MiB segment files (seal + rotate; truncation deletes whole consumed
+  segments, no rewrite). Recovery scans segments in LSN order. New crash point
+  **P18** (harness 19→20). D6 evolution signed off (above).
+- **P6.b — replication slots + WAL shipping** (`6e83fa7`): persisted
+  `SlotRegistry` (`slots.json`); checkpoint truncation floor =
+  `min(checkpoint_lsn, min slot restart_lsn)`; `Wal::records_from`/`ship_from` +
+  `encode_stream`/`decode_stream`; REST `/replication/{slots,stream}`.
+- **P6.c — read replicas + failover** (`aab4a06`): `replication::Replica` —
+  base snapshot + incremental WAL apply (`apply_stream`), `promote()` failover,
+  `wait_for_sync_replicas` sync option. Fixed a self-deadlock in
+  `primary_control` (double control-lock in one statement).
+- **P6.d — backups + PITR** (`d4f76c7`): `Engine::base_backup`/`archive_wal`,
+  `backup::restore(base, archive, dest, target_lsn)` — PITR **by LSN**. New
+  crash point **P19** (harness 20→21).
+- **P6.e — users/roles/GRANT** (`c8109ed`): `authz::RoleStore` (`roles.json`),
+  transitive role membership, per-table privileges, `execute_sql_as` enforcement,
+  per-user JWT (`sub` claim) with open/bootstrap mode. RLS-over-SQL deferred.
+- **P6.f — security** (`22f9539`): native TLS (rustls via `axum-server`), audit
+  log (`audit.log`). Encryption-at-rest DEFERRED, D9 sign-off-gated (above).
+- **P6.g — observability** (`afb2d37`): `Engine::stats()` (`pg_stat_*`-style) +
+  `GET /stats`, slow-query log, ops runbook (`docs/ops_runbook.md`). EXPLAIN was
+  already shipped (P4.e).
+
+**Benchmarks** (release build, Apple Silicon macOS; `benches/phase6_ops.rs`,
+5,000-row table):
+
+| Operation                          | Time                    |
+|------------------------------------|-------------------------|
+| Base backup (5,000 rows)           | 7.1 ms                  |
+| Restore to latest                  | 72.1 ms                 |
+| PITR restore (to a target LSN)     | 42.8 ms                 |
+| Replica apply (100 shipped updates)| 40.2 ms (~2,490 rows/s) |
+| WAL ship batch size (100 updates)  | 40,980 bytes            |
+| Failover (promote → read-write)    | 26.3 ms                 |
+
+Honest notes: replica apply is O(WAL) per batch (v1 re-materializes via the
+recovery path — a re-base is the documented mitigation), so ~2.5k rows/s is a
+correctness-first figure, not a tuned steady-state number. Backup/restore/PITR
+and failover are sub-100 ms at this scale.
+
+**Crash harness:** 19 → **21** (P18 segmented-WAL multi-segment recovery +
+truncation; P19 backup+PITR restore after primary loss). All green.
+**Gates:** `cargo test -p unidb` + `--features server` + `--test crash` (21/21),
+`clippy --workspace --all-targets` (default + server), `fmt`, and the sync
+invariant (`cargo tree -p unidb --no-default-features --edges normal` has no
+tokio/reqwest/axum/rustls) all pass. No `FORMAT_VERSION` bump.
+
+**Locked-decision changes:** D6 evolved (segmented WAL) + §1 "no cloud control
+plane" relaxed for ops — both signed off 2026-07-09 (recorded above). D9 /
+encryption-at-rest deferred pending sign-off.
+
+**Known limitations / deferred:** incremental replica/PITR roll-forward
+reconstructs pages present in the base (fresh pages aren't FPI-covered — take
+base backups regularly / re-base); PITR is by-LSN (time-based needs commit
+timestamps); RLS-over-SQL (`CREATE POLICY`); encryption-at-rest (D9-gated);
+automatic failover coordinator (manual promotion in v1); S3 archiving.
+
+**Phase 6 is COMPLETE — the roadmap's 6-phase plan is fully delivered.**

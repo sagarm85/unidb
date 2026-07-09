@@ -4,7 +4,9 @@ A single embedded storage/transaction engine in Rust that unifies relational CRU
 
 The competitive edge is eliminating the multi-system dual-write tax. "Save row + embedding + graph edge + event" is one WAL append and one commit here, versus 3–4 network round-trips with no shared transaction across Postgres + a vector store + a graph DB + Kafka.
 
-**Status: M0–M11 shipped; hardening phases 1–5 complete.** Single-file storage core, MVCC transactions + SQL subset, vector/full-text search, a graph layer with a Cypher subset, a WAL-derived event queue, an optional REST/JWT/SSE/metrics server, a B-Tree secondary index, a CSR graph index, a Rust attach client (`unidb-attach`), group-commit + concurrent reads, semantic search (cosine metric + embedding CLI), SQL constraints, and heap vacuum/GC are all implemented, tested, and benchmarked. The follow-on hardening roadmap (`docs/backlog/roadmap.md`) is also complete: Phase 1 (ACID hardening), Phase 2/4 (SQL types + query power), Phase 3 (durable multi-model storage), and **Phase 5 (concurrency — concurrent writers that scale with cores)**. See `PROGRESS.md` for milestone-by-milestone benchmark tables and `MEMORY.md` for current implementation state and known tech debt.
+**Status: M0–M11 shipped; hardening/ops phases 1–6 complete.** Single-file storage core, MVCC transactions + SQL subset, vector/full-text search, a graph layer with a Cypher subset, a WAL-derived event queue, an optional REST/JWT/SSE/metrics server, a B-Tree secondary index, a CSR graph index, a Rust attach client (`unidb-attach`), group-commit + concurrent reads, semantic search (cosine metric + embedding CLI), SQL constraints, and heap vacuum/GC are all implemented, tested, and benchmarked. The follow-on roadmap (`docs/backlog/roadmap.md`) is **complete**: Phase 1 (ACID hardening), Phase 2/4 (SQL types + query power), Phase 3 (durable multi-model storage), Phase 5 (concurrency — writers that scale with cores), and **Phase 6 (operations & HA — segmented WAL, replication slots + read replicas + failover, backups + PITR, users/roles/GRANT, TLS + audit, observability)**. See `PROGRESS.md` for milestone-by-milestone benchmark tables and `MEMORY.md` for current implementation state and known tech debt.
+
+**Operations & HA (Phase 6): deployable single primary + read replicas.** The WAL is a directory of fixed-size 16 MiB **segments** (seal + rotate; truncation deletes whole consumed segments), which is what makes **replication slots** and WAL shipping possible: a replica seeds from a **base backup** and applies the streamed WAL incrementally (`replication::Replica`), can be **promoted** on failover, and an optional **synchronous slot** avoids losing acknowledged commits. **Online base backups + WAL archiving** give point-in-time recovery (`backup::restore(..., target_lsn)`, PITR by LSN). Access control adds **users/roles/GRANT** (`authz`, per-table privileges, transitive role membership) with per-user JWT identity, plus a security **audit log** and native **TLS** (rustls). Observability adds a `pg_stat_*`-style `GET /stats`, a slow-query log, and an ops runbook (`docs/ops_runbook.md`). The crash harness grew 19 → **21** (P18 segmented WAL, P19 backup+PITR restore); the sync invariant still holds (no async runtime / TLS in the default embedded build). Encryption-at-rest is a documented, D9-sign-off-gated follow-up. See `docs/backlog/phase6_ops_ha.md` and `PROGRESS.md`'s Phase 6 entry.
 
 **Concurrency (Phase 5): writers scale with cores.** `Engine` is now `Send + Sync`, so the server shares one `Arc<Engine>` across a pool of worker threads (a tokio blocking pool) instead of funneling every write through one dedicated writer thread. Every heap read-modify-write holds the page's exclusive latch (no lost updates), the transaction/lock manager runs real blocking wait queues with wait-for-graph deadlock detection, and durability uses **group commit**: the leader runs its `fsync` with the WAL append lock *released*, so concurrent committers coalesce behind a single fsync. Measured (`benches/concurrent_writers.rs`, 8 logical cores): **1→325, 2→330, 4→647 (1.99×), 8→1197 commits/s (3.68×)** — write throughput scales with concurrent writers instead of the flat single-writer ceiling. *Raw CRUD* scales; SQL/graph/large-object writes still serialize (catalog `RwLock` / a coarse write lock) — finer-grained index concurrency is future work. Per-query **timeouts, cancellation, and `work_mem`** are available via `Engine::execute_sql_with_limits` (P5.f). Reads stay on the concurrent `ReadHandle` path (point reads + read-only `SELECT` run in parallel with writers via MVCC snapshots). The crash-injection harness stays green (19/19) under the concurrent model, and the sync invariant (no async runtime in the default embedded engine) holds. See `docs/backlog/phase5_concurrency.md`.
 
@@ -296,17 +298,23 @@ src/
   large_object.rs  — P3.d: out-of-line chunked + streamed large objects (__lobs__ rows + durable lob_id index); Engine::{put,read,delete}_large_object
   graph/           — edges.rs, index.rs, logical.rs, parser.rs, executor.rs (Cypher subset)
   queue/           — mod.rs (event capture, poll/ack/vacuum), payload.rs
-  checkpoint.rs    — flush dirty pages → checkpoint record (+ next_xid) → truncate WAL
-  recovery.rs      — ARIES-style redo + undo on open
-  server/          — optional REST/JWT/SSE/metrics server (feature = "server")
-  bin/unidb-server.rs — the server binary (required-features = ["server"])
-  lib.rs           — Engine public API, init_tracing()
+  replication/     — P6.b/c: SlotRegistry (slots.json) + Replica (base snapshot + incremental WAL apply, promote/failover)
+  backup/          — P6.d: base backup, WAL archiving, and restore/PITR (by target LSN)
+  authz/           — P6.e: RoleStore (roles.json) — users/roles/GRANT, per-table privileges, auth-DDL parser
+  audit/           — P6.f: append-only security audit trail (audit.log)
+  checkpoint.rs    — flush dirty pages → checkpoint record (+ next_xid) → truncate WAL (segment-aware, slot-floored — P6.a/b)
+  recovery.rs      — ARIES-style redo + undo on open (scans all WAL segments in LSN order)
+  wal.rs           — segmented append-only log (16 MiB segments, P6.a); redo+undo payloads; mini-txn bracketing; ship/decode-stream
+  server/          — optional REST/JWT/SSE/metrics server (feature = "server"); tls.rs (rustls termination, P6.f)
+  bin/unidb-server.rs — the server binary (required-features = ["server"]); HTTPS when UNIDB_TLS_CERT/KEY are set
+  lib.rs           — Engine public API, init_tracing(); Engine::stats() + slow-query log (P6.g)
 tests/
-  crash/           — crash-injection harness (P1–P12 injection points + property test)
-  server_*.rs      — REST server integration tests (feature = "server")
+  crash/           — crash-injection harness (P1–P19 injection points + property test; 21 tests)
+  server_*.rs      — REST server integration tests (feature = "server"); server_{replication,authz,tls,stats}.rs (Phase 6)
+  authz.rs, observability.rs, replication.rs — Phase 6 engine-level integration tests
   graph_*.rs, vector_mvcc.rs, queue_*.rs, index_rebuild.rs, btree_mvcc.rs — per-milestone integration tests
 benches/
-  load.rs, vector.rs, graph.rs, queue.rs, server.rs, btree.rs — criterion benchmarks per milestone
+  load.rs, vector.rs, graph.rs, queue.rs, server.rs, btree.rs, phase6_ops.rs — benchmarks per milestone/phase
 scripts/
   bench_server.sh  — plain-shell perf smoke test against a running server (no Rust toolchain)
   gen_jwt.sh       — generate a verify-only HS256 JWT (bash + openssl, no Python/PyJWT)
@@ -352,6 +360,13 @@ Phase 4 query power is next for the SQL lane). Metrics tables are in
 | P3.b — durable full-text + edge index | done | Full-text (inverted) and edge-adjacency indexes are durable `DiskBTree`s too (no rebuild on open); CSR retired; new `Engine::search_fulltext` read path |
 | P3.c — on-disk vector index | done | Durable on-disk IVF-Flat (`DiskIvfIndex`): posting lists = durable `DiskBTree`, centroids in a WAL-logged meta page; `CREATE INDEX ... USING HNSW\|IVF` builds it, `NEAR` reads it, async worker retired, **no rebuild on open**; recall@10=1.0 matches HNSW (crash point P17) |
 | P3.d — large-object storage | done | Out-of-line chunked + streamed big files (`__lobs__` rows + durable `DiskBTree` index); atomic with the txn, crash-recovered, vacuum-reclaimable; `Engine::{put,read,delete}_large_object` — multi-GB without OOM |
+| P6.a — segmented WAL | done | `db.wal/` is a directory of fixed-size 16 MiB segments; seal + rotate; truncation deletes whole consumed segments (no rewrite). Enables concurrent WAL readers (crash point P18) |
+| P6.b — replication slots + WAL shipping | done | Persisted `SlotRegistry` (`slots.json`) holds the WAL truncation floor; `ship_wal`/`decode_stream`; REST `/replication/{slots,stream}` |
+| P6.c — read replicas + failover | done | `replication::Replica`: base snapshot + incremental WAL apply, `promote()` failover, `wait_for_sync_replicas` synchronous option |
+| P6.d — backups + PITR | done | `Engine::base_backup`/`archive_wal`, `backup::restore(base, archive, dest, target_lsn)` — point-in-time recovery by LSN (crash point P19) |
+| P6.e — users/roles/GRANT | done | `authz::RoleStore` (`roles.json`): users/roles/privileges, transitive membership, `execute_sql_as` enforcement, per-user JWT `sub` (open/bootstrap mode) |
+| P6.f — security | done | Native TLS (rustls/`axum-server`) + audit log (`audit.log`). Encryption-at-rest deferred (D9 sign-off-gated) |
+| P6.g — observability | done | `Engine::stats()` + `GET /stats` (`pg_stat_*`-style), slow-query log, ops runbook (`docs/ops_runbook.md`); EXPLAIN from P4.e |
 
 ---
 
@@ -364,8 +379,8 @@ Phase 4 query power is next for the SQL lane). Metrics tables are in
 | D3 | Control file holds magic, version, page_size, checkpoint LSN, WAL tail, next_xid |
 | D4 | Tuple header reserves xmin/xmax now; in-place UPDATE in M0, MVCC in M1 |
 | D5 | WAL-before-page invariant: no dirty page flushed while page.LSN > durable WAL LSN |
-| D6 | Single-file storage for M0 (WAL may be a separate file) |
-| D7 | Crash-injection harness: kill at defined points, reopen, assert recovered state (grows with each new durability mechanism — P1–P12 today) |
+| D6 | Single-file *data* storage; the WAL may be separate. **Evolved (P6.a, signed off 2026-07-09):** the WAL is now a directory of 16 MiB segment files. The data store stays a single file |
+| D7 | Crash-injection harness: kill at defined points, reopen, assert recovered state (grows with each new durability mechanism — P1–P19 today, 21 tests) |
 | D8 | Page size 8 KiB default, config-overridable at init, fixed after creation |
 | D9 | On-disk format is fixed little-endian; every page carries CRC32 + LSN |
 | D10 | Default isolation: READ COMMITTED; REPEATABLE READ + SERIALIZABLE (SSI, P1.d) available |
