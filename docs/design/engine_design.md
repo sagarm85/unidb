@@ -500,10 +500,13 @@ guarding a different failure mode.
 > are themselves a `DiskBTree` and whose centroids live in a WAL-logged meta
 > page. All are updated inline on the write path
 > (`apply_durable_index_writes`, `graph/edges::ensure_edge_index`) and read from
-> their stable meta pages. Since Phase 5 these index-maintaining write paths are
-> serialized by a coarse write lock (SQL by the catalog `RwLock`, graph/LOB by
-> `Engine::write_serial`) rather than by a single owner thread — concurrent
-> latch-coupled B-tree writes are future work. The M7 **CSR index was retired** in P3.b; the
+> their stable meta pages. The graph/LOB write paths are serialized by
+> `Engine::write_serial`. The SQL write path was, through Phase 5, serialized by
+> the catalog `RwLock`; the **index-write-concurrency** milestone (default-off
+> `UNIDB_CONCURRENT_SQL_WRITES` toggle) lets catalog-non-mutating SQL DML take a
+> *shared* catalog lock and made `DiskBTree` writes safe under concurrent writers
+> via **latch-coupled ("crabbing") descent with safe-node early release** — so
+> two writers now maintain the same index in parallel (§5.4). The M7 **CSR index was retired** in P3.b; the
 > **async index worker was retired entirely** in P3.c (its last user was the
 > in-RAM HNSW). So §5.1 below is historical — there is no background index
 > thread anymore. See §5.2 and §5.4.
@@ -572,6 +575,30 @@ from its meta page in O(1) — the durability win benchmarked in `PROGRESS.md`'s
 P3.a entry. Vacuum scrubs it directly (`DiskBTree::remove`, reading each dead
 row's key via `Heap::get_raw` before the slot is reused). v1 leaves underfull
 nodes un-merged (tree only grows) and pays one fsync per key insert.
+
+**Concurrent writers (index-write-concurrency milestone).** Two writer threads
+can now insert into the *same* tree at once (before, the SQL catalog write lock
+serialized them). `insert_in_txn` descends with **latch coupling ("crabbing")**
+over the buffer pool's per-page exclusive latches: it latches each child before
+releasing the parent, and drops all ancestor + meta latches at the first *safe*
+node (one that cannot overflow on a single-entry insert, so it will not split —
+`node_is_insert_safe`, exact for `Int`/`Bool` keys, conservative for `Text`).
+The still-modifiable path suffix stays latched, a split propagates up through it,
+and only a root split repoints the meta page (root never released ⇒ meta still
+held). Latches are taken strictly root→leaf, so inserts cannot deadlock.
+`set_value`/`remove` re-read the target leaf *under* its exclusive latch (never
+writing back bytes read before latching, which a concurrent split could have
+superseded). Reads stay latch-free (owned per-page copies + right-linked leaves +
+MVCC re-validation make a transiently stale read self-correcting). The protocol
+is validated by a structural validator (`DiskBTree::validate`), deterministic
+split-contention + concurrent-stress tests, and a `loom` model of the latch
+ordering (`loom-crabbing` crate). It is gated behind the default-off
+`UNIDB_CONCURRENT_SQL_WRITES` toggle: off ⇒ the catalog write lock serializes SQL
+writers exactly as before (crabbing latches are uncontended, behavior unchanged).
+Follow-up: optimistic *shared*-latch descent + a Lehman-Yao B-link (right-linked
+internal nodes, format-bump-gated) would let even same-subtree descents overlap.
+See `PROGRESS.md`'s "Index & heap write concurrency" entry for the acceptance
+numbers.
 
 ### 5.5 Durable vector index — on-disk IVF-Flat (P3.c)
 

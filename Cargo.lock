@@ -1360,6 +1360,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "loom-crabbing"
+version = "0.0.0"
+dependencies = [
+ "loom",
+]
+
+[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

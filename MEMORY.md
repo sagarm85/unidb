@@ -12,6 +12,57 @@
 
 ## Current status
 
+- **Index & heap write concurrency (0a + 0c + Item A) — COMPLETE (2026-07-10),
+  branch `index-write-concurrency`.** Raises the concurrent **indexed** SQL-write
+  ceiling, behind a **default-off `UNIDB_CONCURRENT_SQL_WRITES` toggle**
+  (`AtomicBool`; `Engine::set_concurrent_sql_writes` flips it at runtime — the
+  revert-in-the-field safety net). Spec/DoD: `docs/backlog/index_write_concurrency.md`
+  (flipped to SHIPPED). **The first landed unit is exactly 0a + 0c + Item A; 0b
+  (per-table lock registry) and Item B (heap-tail spread) are deferred/unlanded.**
+  - **0a** — `ExecCtx.catalog` is now `CatalogHandle{Shared(&Catalog),
+    Exclusive(&mut Catalog)}` (Deref for reads; `.exclusive()?` for the 8 catalog-
+    write sites — a `Shared` handle erroring there is a routing tripwire).
+    `Engine::execute_one_plan`/`stmt_uses_shared_catalog` route catalog-non-mutating
+    DML (SELECT/INSERT/UPDATE/DELETE on an FSM-backed, non-SERIAL table) → `cat_read`;
+    DDL + catalog-mutating DML → `cat_write`. **Toggle off ⇒ everything is
+    `cat_write`, byte-for-byte the old behavior** (all default + server + crash
+    tests green with the toggle off).
+  - **0c** — INSERT into a SERIAL/identity table, or any DML on a legacy pre-FSM
+    (`fsm_meta==None`) table, *escalates* to the exclusive path (those mutate the
+    catalog). The SQL DML path already did NOT take `write_serial` (audited); graph/
+    LOB/event keep it (out of scope). Atomic-counter/batched SERIAL is a filed
+    follow-up (not needed — acceptance table has no SERIAL).
+  - **Item A** — `DiskBTree` writes are race-safe under concurrent writers via
+    **latch-coupled ("crabbing") descent with safe-node early release** (`insert_in_txn`
+    rewritten iterative; recursive `insert_into` removed). Latch each child before the
+    parent over the P5.a per-page exclusive latches; drop all ancestor+meta latches at
+    the first `node_is_insert_safe` node (exact for Int/Bool keys, conservative for
+    Text); the `retained` frame-stack suffix stays latched; only a root split repoints
+    the meta page (root never released ⇒ meta held). Latches strictly root→leaf ⇒
+    deadlock-free. `set_value`/`remove` **re-read the leaf under its exclusive latch**
+    (never clobber a concurrent split with pre-latch bytes). Reads stay latch-free
+    (owned per-page copies + right-linked leaves + MVCC re-validation self-correct).
+    Recovery unchanged (redo-only `WAL_INDEX`, one mini-txn/insert) → **crash harness
+    still 28/28**. No `FORMAT_VERSION` bump.
+  - **Validation:** `DiskBTree::validate` structural validator; `btree_index`
+    concurrent-stress (8×500, disjoint+overlap) + deterministic split-contention
+    tests; `tests/concurrent_writers.rs` end-to-end indexed 8-writer (toggle on AND
+    off), vacuum-interleaved (M10.c aliasing), 2-thread deadlock-no-hang;
+    `TableDef.generation` tripwire (DDL bumps, DML `debug_assert`s stable); **`loom`
+    model** in isolated `loom-crabbing` crate (`RUSTFLAGS="--cfg loom" cargo test -p
+    loom-crabbing` — kept separate so `--cfg loom` never reaches tokio/postgres
+    dev-deps). TSan is the documented CI hook (Linux; dev machine is Apple silicon).
+  - **Acceptance (Table C, `UNIDB_BENCH=hiconc HICONC_ONLY=c`, 200k pregrow,
+    native):** indexed 8-writer **768 (off) → 1058 (on) commits/s (+38%)**, toward the
+    ~1260 unindexed floor; unindexed unchanged (fsync-bound); **toggle-off reproduces
+    768.** Residual gap = `WAL_INDEX` full-page-image append contention (WAL-format-
+    inherent), not tree latching. (Spec's `904 → ~1290` was a different machine; same
+    mechanism/direction.) Full before/after: `PROGRESS.md` "Index & heap write
+    concurrency" entry; `engine_design.md` §5.4 updated; `README.md` Phase-5 line
+    updated; `high_scale_concurrency.md` Table C post-fix note added.
+  - **Follow-up:** a later commit flips the toggle **default-on** after a soak,
+    recorded in `PROGRESS.md`. Optimistic shared-latch descent + full Lehman-Yao
+    B-link (format-bump-gated) to overlap same-subtree descents; 0b; Item B.
 - **Coordinator housekeeping (2026-07-10) — `main` fully green.** `GET /tables`
   merged (PR #28); studio-UI spec closed as not-needed (PR #27); **build hotfix**:
   registered `tests/server_tables.rs` behind `required-features = ["server"]` in

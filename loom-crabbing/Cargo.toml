@@ -1,0 +1,24 @@
+# Isolated crate for the loom model of the DiskBTree crabbing latch protocol
+# (index-write-concurrency, Validation §3). Kept separate from the `unidb`
+# package so the `RUSTFLAGS="--cfg loom"` build — which loom requires — applies
+# ONLY to this crate + loom, and never to `unidb`'s other dev-dependencies
+# (e.g. `postgres`/`tokio`, whose modules are gated `#![cfg(not(loom))]` and so
+# fail to compile under a global `--cfg loom`). Run with:
+#
+#   RUSTFLAGS="--cfg loom" cargo test -p loom-crabbing
+[package]
+name = "loom-crabbing"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+loom = "0.7"
+
+# `cfg(loom)` is a custom cfg set via `RUSTFLAGS="--cfg loom"` (loom's required
+# build mode). Declare it so a normal `cargo clippy -D warnings` build does not
+# flag `#[cfg(loom)]` as an unexpected-cfg condition.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

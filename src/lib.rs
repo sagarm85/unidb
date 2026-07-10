@@ -133,6 +133,17 @@ fn configured_pool_capacity() -> usize {
         .unwrap_or(DEFAULT_POOL_CAPACITY)
 }
 
+/// A default-off boolean env flag: true only when set to `1`/`true`/`on`/`yes`
+/// (case-insensitive). Any other value — including unset — is false. Used for
+/// `UNIDB_CONCURRENT_SQL_WRITES` (index-write-concurrency): ships dark, so the
+/// default must be off and only an explicit opt-in enables it.
+fn env_flag(key: &str) -> bool {
+    matches!(
+        std::env::var(key).ok().as_deref().map(str::trim),
+        Some("1") | Some("true") | Some("TRUE") | Some("on") | Some("ON") | Some("yes")
+    )
+}
+
 fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)
         .ok()
@@ -273,6 +284,25 @@ pub struct Engine {
     /// Immutable page size (bytes), cached from the control file at open so the
     /// hot paths don't lock `control` just to read it.
     page_size: usize,
+    /// Concurrent-SQL-writes toggle (index-write-concurrency, Item 0a).
+    /// **Default off.** When `false`, every SQL statement runs under the
+    /// engine-wide catalog *write* lock (`cat_write`), exactly as before — so
+    /// SQL writers are serialized before they reach the heap/index and the
+    /// known-safe behavior is unchanged. When `true`, row-DML
+    /// (`INSERT`/`UPDATE`/`DELETE`/`SELECT`) that needs no catalog mutation runs
+    /// under a *shared* catalog lock (`cat_read`) so writers to a table overlap
+    /// and only the storage/index layer serializes them (see the `DiskBTree`
+    /// crabbing protocol, Item A). DDL, and DML that must mutate the catalog
+    /// (SERIAL bump / legacy non-FSM page-list persist), still take `cat_write`.
+    /// Read once from `UNIDB_CONCURRENT_SQL_WRITES` at open. Ships dark; flipping
+    /// it back to the serialized path is one env var, no code revert (the
+    /// residual-race safety net for the crabbing change).
+    ///
+    /// An `AtomicBool` (not a plain `bool`) so it can be flipped at runtime via
+    /// [`Engine::set_concurrent_sql_writes`] — the field-level realization of the
+    /// safety net: if a residual race ever surfaces, flip back to the known-safe
+    /// serialized path in-process, no reopen. Initialized from the env flag.
+    concurrent_sql_writes: std::sync::atomic::AtomicBool,
     pool: BufferPool,
     wal: Wal,
     heap: Heap,
@@ -675,6 +705,9 @@ impl Engine {
         Ok(Self {
             control,
             page_size: page_size_usize,
+            concurrent_sql_writes: std::sync::atomic::AtomicBool::new(env_flag(
+                "UNIDB_CONCURRENT_SQL_WRITES",
+            )),
             pool,
             wal,
             heap,
@@ -933,7 +966,6 @@ impl Engine {
     }
 
     fn execute_sql_inner(&self, xid: Xid, sql: &str) -> Result<Vec<ExecResult>> {
-        let page_size = self.page_size;
         let plans = parse_sql(sql)?;
         // Snapshot the catalog root so DDL (which the catalog persists
         // immediately, not on user-txn commit) from earlier statements of a
@@ -944,26 +976,12 @@ impl Engine {
         let mut results = Vec::with_capacity(plans.len());
         for plan in plans {
             let plan = apply_rls(plan, &cat_read(&self.catalog));
-            let mut catalog = cat_write(&self.catalog);
-            let mut ctx = ExecCtx {
-                catalog: &mut catalog,
-                txn_mgr: &self.txn_mgr,
-                pool: &self.pool,
-                wal: &self.wal,
-                lock_mgr: &self.lock_mgr,
-                control_path: &self.control_path,
-                control: &self.control,
-                page_size,
-                xid,
-                next_event_seq: &self.next_event_seq,
-            };
-            match executor::execute(plan, &mut ctx) {
+            match self.execute_one_plan(xid, plan) {
                 Ok(result) => {
                     self.note_dml_result(&result); // A1: dead/live-tuple accounting.
                     results.push(result);
                 }
                 Err(e) => {
-                    drop(catalog);
                     self.restore_catalog_root(saved_catalog_root)?;
                     return Err(e);
                 }
@@ -1040,7 +1058,6 @@ impl Engine {
         plans: Vec<LogicalPlan>,
         params: &[Literal],
     ) -> Result<Vec<ExecResult>> {
-        let page_size = self.page_size;
         let saved_catalog_root = ctrl_lock(&self.control).catalog_root;
         let mut results = Vec::with_capacity(plans.len());
         for mut plan in plans {
@@ -1048,9 +1065,38 @@ impl Engine {
             // interpreted as SQL structure.
             bind_params(&mut plan, params)?;
             let plan = apply_rls(plan, &cat_read(&self.catalog));
-            let mut catalog = cat_write(&self.catalog);
+            match self.execute_one_plan(xid, plan) {
+                Ok(result) => {
+                    self.note_dml_result(&result); // A1: dead/live-tuple accounting.
+                    results.push(result);
+                }
+                Err(e) => {
+                    self.restore_catalog_root(saved_catalog_root)?;
+                    return Err(e);
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Execute one already-RLS-applied plan, choosing the catalog-lock mode
+    /// (index-write-concurrency, Item 0a). When the `UNIDB_CONCURRENT_SQL_WRITES`
+    /// toggle is on and the statement mutates no catalog state (a plain
+    /// read/INSERT/UPDATE/DELETE on an FSM-backed, non-SERIAL table), it runs
+    /// under the **shared** catalog lock so concurrent writers to the table
+    /// overlap and only the storage/index layer (heap page latches + the
+    /// `DiskBTree` crabbing protocol) serializes them. Otherwise it takes the
+    /// **exclusive** catalog lock — DDL, catalog-mutating DML (SERIAL bump /
+    /// legacy non-FSM page-list persist), and *every* statement when the toggle
+    /// is off (reproducing the pre-existing serialized behavior exactly).
+    fn execute_one_plan(&self, xid: Xid, plan: LogicalPlan) -> Result<ExecResult> {
+        let page_size = self.page_size;
+        // Decide the lock mode under a brief read lock, then take the real guard.
+        let shared = self.stmt_uses_shared_catalog(&plan);
+        if shared {
+            let catalog = cat_read(&self.catalog);
             let mut ctx = ExecCtx {
-                catalog: &mut catalog,
+                catalog: crate::sql::executor::CatalogHandle::Shared(&catalog),
                 txn_mgr: &self.txn_mgr,
                 pool: &self.pool,
                 wal: &self.wal,
@@ -1061,19 +1107,68 @@ impl Engine {
                 xid,
                 next_event_seq: &self.next_event_seq,
             };
-            match executor::execute(plan, &mut ctx) {
-                Ok(result) => {
-                    self.note_dml_result(&result); // A1: dead/live-tuple accounting.
-                    results.push(result);
-                }
-                Err(e) => {
-                    drop(catalog);
-                    self.restore_catalog_root(saved_catalog_root)?;
-                    return Err(e);
-                }
-            }
+            executor::execute(plan, &mut ctx)
+        } else {
+            let mut catalog = cat_write(&self.catalog);
+            let mut ctx = ExecCtx {
+                catalog: crate::sql::executor::CatalogHandle::Exclusive(&mut catalog),
+                txn_mgr: &self.txn_mgr,
+                pool: &self.pool,
+                wal: &self.wal,
+                lock_mgr: &self.lock_mgr,
+                control_path: &self.control_path,
+                control: &self.control,
+                page_size,
+                xid,
+                next_event_seq: &self.next_event_seq,
+            };
+            executor::execute(plan, &mut ctx)
         }
-        Ok(results)
+    }
+
+    /// Whether one SQL statement may run under the **shared** catalog lock on the
+    /// concurrent-write path (Item 0a). Returns `true` only when the toggle is on
+    /// *and* the statement mutates no catalog state. A DML statement that would
+    /// mutate the catalog — a SERIAL bump on a table with an identity column, or
+    /// the legacy page-list persist on a pre-FSM (`fsm_meta == None`) table —
+    /// escalates to the exclusive path instead (returns `false`), where the
+    /// `CatalogHandle::exclusive()` capability is available. DDL is always
+    /// exclusive.
+    fn stmt_uses_shared_catalog(&self, plan: &LogicalPlan) -> bool {
+        if !self
+            .concurrent_sql_writes
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return false;
+        }
+        let catalog = cat_read(&self.catalog);
+        match plan {
+            // Pure reads never touch the catalog.
+            LogicalPlan::Select { .. } | LogicalPlan::Query(_) | LogicalPlan::Explain { .. } => {
+                true
+            }
+            // An INSERT mutates the catalog only for a SERIAL bump (identity
+            // column) or a legacy non-FSM page-list persist.
+            LogicalPlan::Insert { table, .. } => catalog
+                .lookup(table)
+                .map(|t| {
+                    t.fsm_meta.is_some()
+                        && !t
+                            .columns
+                            .iter()
+                            .any(|c| c.constraints.identity && !c.dropped)
+                })
+                .unwrap_or(false),
+            // UPDATE/DELETE mutate the catalog only via the legacy non-FSM
+            // page-list persist; FSM-backed tables self-persist the directory.
+            LogicalPlan::Update { table, .. } | LogicalPlan::Delete { table, .. } => catalog
+                .lookup(table)
+                .map(|t| t.fsm_meta.is_some())
+                .unwrap_or(false),
+            // DDL (CREATE/ALTER/DROP/TRUNCATE/CREATE INDEX) always mutates the
+            // catalog → exclusive.
+            _ => false,
+        }
     }
 
     /// Parse and execute one Cypher query (M3.c): `MATCH (a)-[:TYPE]->(b)
@@ -1086,7 +1181,7 @@ impl Engine {
         let parsed = parse_cypher(query)?;
         let mut catalog = cat_write(&self.catalog);
         let mut ctx = ExecCtx {
-            catalog: &mut catalog,
+            catalog: crate::sql::executor::CatalogHandle::Exclusive(&mut catalog),
             txn_mgr: &self.txn_mgr,
             pool: &self.pool,
             wal: &self.wal,
@@ -1891,6 +1986,26 @@ impl Engine {
     #[doc(hidden)]
     pub fn set_deferred_sync(&self, deferred: bool) {
         self.wal.set_deferred_sync(deferred);
+    }
+
+    /// Enable/disable the concurrent-SQL-writes path at runtime
+    /// (index-write-concurrency, Item 0a). Off by default (or per the
+    /// `UNIDB_CONCURRENT_SQL_WRITES` env flag at open). When on, row-DML that
+    /// mutates no catalog state runs under a shared catalog lock so concurrent
+    /// writers to a table overlap (see [`DiskBTree`](crate) crabbing); DDL and
+    /// catalog-mutating DML still serialize on the exclusive lock. Exposed so a
+    /// deployment can flip the toggle in-process — including flipping it *back*
+    /// to the known-safe serialized path with no reopen, the residual-race
+    /// safety net for the crabbing change.
+    pub fn set_concurrent_sql_writes(&self, on: bool) {
+        self.concurrent_sql_writes
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the concurrent-SQL-writes path is currently enabled (Item 0a).
+    pub fn concurrent_sql_writes_enabled(&self) -> bool {
+        self.concurrent_sql_writes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Force the WAL to durable storage — the single fsync a group-commit

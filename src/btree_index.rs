@@ -54,9 +54,49 @@
 //   pays one fsync per row. Batching is a later perf item.
 // * Pages freed by `DROP INDEX` leak until the FSM/large-object work reclaims
 //   them, exactly like `DROP TABLE` heap pages today.
+//
+// ## Concurrency (index-write-concurrency, Item A)
+//
+// Under the concurrent-SQL-writes toggle, two writer threads can insert into the
+// *same* tree at once (before, the SQL catalog write lock serialized them). The
+// write paths are made race-safe by **latch coupling ("crabbing")** over the
+// buffer pool's per-page exclusive latches (`latch_exclusive`, P5.a):
+//
+// * `insert` (`insert_in_txn`) descends latching each child before releasing the
+//   parent, but drops **all** ancestor latches (and the meta latch) the moment it
+//   reaches a node that is *safe* — one where adding a single entry cannot
+//   overflow it, so it will not split and no ancestor can be modified
+//   (`node_is_insert_safe`). The still-modifiable suffix of the path (the
+//   `retained` frame stack) stays latched; a split propagates up through exactly
+//   those nodes, and only a root split (root never released ⇒ meta still held)
+//   repoints the meta page. Every node is read and rewritten under a stable
+//   latch, so a concurrent insert can never observe or clobber a half-applied
+//   split; latches are taken strictly root→leaf, so inserts cannot deadlock (a
+//   single global order). Safe-node early release lets inserts into different
+//   subtrees/leaves proceed in parallel (only same-leaf inserts and the brief
+//   root/meta touch serialize) — that is what recovers the indexed concurrent-
+//   write throughput toward the unindexed floor. The safe predicate is exact for
+//   fixed-size (`Int`/`Bool`) keys; for variable-length `Text` keys it is
+//   conservative (an internal node is never deemed safe, so more of the path is
+//   held) — always correct, just less concurrent for text-keyed indexes.
+// * `set_value`/`remove` (single-leaf rewrites, used by vacuum) locate the leaf
+//   unlatched, then **re-read it under its exclusive latch** and recompute the
+//   modification from the freshly-read bytes — so they never write back stale
+//   pre-latch contents over a concurrent split.
+// * Reads (`search_eq`/`search_range`/`find_leaf`/`max_entry`/`page_directory`)
+//   stay **latch-free**: the buffer pool returns an owned per-page copy under its
+//   mmap lock (no torn single-node read), the leaves are right-linked so a scan
+//   that lands on a just-split leaf walks rightward to migrated keys, and every
+//   returned RowId is only a *hint* re-validated against MVCC downstream — so a
+//   transiently stale read is corrected, never wrong. Keeping reads unlatched
+//   avoids readers blocking the writers whose throughput this change targets.
+//
+// Recovery is unchanged (A3): nodes stay full-page redo-only `WAL_INDEX` images
+// and each insert is still one mini-txn — crabbing changes *who* writes a node,
+// not *how* it recovers.
 
 use crate::{
-    bufferpool::{BufferPool, PageReader},
+    bufferpool::{BufferPool, ExclusiveLatch, PageReader},
     error::{DbError, Result},
     format::{
         u16_from_le, u16_to_le, u32_from_le, u32_to_le, u64_from_le, u64_to_le, Lsn, PageId,
@@ -314,6 +354,63 @@ impl Node {
             }
             _ => Err(corrupt()),
         }
+    }
+}
+
+/// One node on the crabbing insert descent (index-write-concurrency, Item A):
+/// its page id, the exclusive latch we hold on it, an owned snapshot of its
+/// contents (read under that latch), and — for an internal node — the child
+/// index we routed through (so a separator propagated up from a child split is
+/// inserted at the right position). Held in the `retained` stack, which keeps
+/// only the contiguous suffix of the path that may still be modified.
+struct DescentFrame {
+    pid: PageId,
+    latch: ExclusiveLatch,
+    node: Node,
+    route_idx: usize,
+}
+
+/// Which child an *insert* of `value` routes to in an internal node's `keys`.
+/// Uses strict `<` (not `<=`, which the read-path `find_leaf` uses): a new
+/// duplicate key appends *after* existing ones, so an inserter descends into the
+/// rightmost subtree whose separator is `<= value`. Matches the pre-crabbing
+/// recursive routing exactly.
+fn route_insert_child(keys: &[OrderedValue], value: &OrderedValue) -> usize {
+    for (i, k) in keys.iter().enumerate() {
+        if value < k {
+            return i;
+        }
+    }
+    keys.len()
+}
+
+/// Whether inserting one entry for `value` into `node` cannot overflow it — so
+/// the node will not split and (transitively) no ancestor can be modified by
+/// this insert. Used for **safe-node early release** during the crabbing descent:
+/// on the first safe node we drop all ancestor + meta latches.
+///
+/// * **Leaf:** exact — we know the entry being added is `(value, rid)`, so the
+///   growth is `encoded_key_len(value) + ROWID_LEN`.
+/// * **Internal:** a child split pushes up one `(separator, child_ptr)` entry.
+///   The separator is an existing key of the tree, so its size is the tree's key
+///   type's size. For fixed-size key types (`Int`/`Bool`) that is exact; for
+///   variable-length `Text` we cannot cheaply bound it, so we conservatively
+///   report **unsafe** (the node is retained, never released early) — always
+///   correct, just less concurrent for text-keyed indexes.
+fn node_is_insert_safe(node: &Node, value: &OrderedValue, cap: usize) -> bool {
+    match node {
+        Node::Leaf { .. } => node.body_len() + encoded_key_len(value) + ROWID_LEN <= cap,
+        Node::Internal { keys, .. } => match keys.first() {
+            // child pointer is 4 bytes; key is fixed-size for Int/Bool.
+            Some(OrderedValue::Int(_)) => {
+                node.body_len() + encoded_key_len(&OrderedValue::Int(0)) + 4 <= cap
+            }
+            Some(OrderedValue::Bool(_)) => {
+                node.body_len() + encoded_key_len(&OrderedValue::Bool(false)) + 4 <= cap
+            }
+            // Text keys (variable length) or an empty node → conservative.
+            _ => false,
+        },
     }
 }
 
@@ -646,11 +743,121 @@ impl DiskBTree {
         txn_id: u64,
         prev_lsn: &mut Lsn,
     ) -> Result<()> {
+        // Latch-coupled ("crabbing") descent with **safe-node early release**
+        // (index-write-concurrency, Item A). The meta page holds the root pointer;
+        // a root split rewrites it, so it is the top of the latch chain and is
+        // held while reading the root pointer + latching the root (atomic against
+        // a concurrent root split). We then descend, latching each child before
+        // releasing... — but crucially, the moment we latch a node that is *safe*
+        // for this insert (adding one entry cannot overflow it, so it will not
+        // split and no ancestor can be modified), we drop **all** ancestor latches
+        // (and the meta latch): different inserts can then descend into different
+        // subtrees fully in parallel. `retained` holds the contiguous suffix from
+        // the highest node that might still be modified down to the current node,
+        // each with its exclusive latch and the child index we routed through
+        // (needed to place a propagated separator). Latches are always acquired
+        // strictly top-down (meta → root → leaf), so concurrent inserts cannot
+        // deadlock (A3). Reads stay latch-free (see `find_leaf`).
+        let cap = body_capacity(self.page_size);
+        // `meta_guard` is held until we prove the root will not be replaced (i.e.
+        // we retained a safe node below the root, or the root itself is safe).
+        let mut meta_guard = Some(pool.latch_exclusive(self.meta_page));
         let root = self.root_page(pool)?;
-        let split = self.insert_into(root, value, rid, pool, wal, txn_id, prev_lsn)?;
-        if let Some((sep_key, new_child)) = split {
-            // Root split: build a new internal root over the two halves and
-            // repoint the meta page — all in this same mini-txn.
+        let mut retained: Vec<DescentFrame> = Vec::new();
+        retained.push(DescentFrame {
+            pid: root,
+            latch: pool.latch_exclusive(root),
+            node: self.read_node(root, pool)?,
+            route_idx: 0,
+        });
+        // Descend to the target leaf, releasing ancestors past each safe node.
+        loop {
+            let top = retained.last().unwrap();
+            let Node::Internal { keys, children } = &top.node else {
+                break; // reached the leaf
+            };
+            let idx = route_insert_child(keys, &value);
+            let child = children[idx];
+            retained.last_mut().unwrap().route_idx = idx;
+            let child_latch = pool.latch_exclusive(child);
+            let child_node = self.read_node(child, pool)?;
+            if node_is_insert_safe(&child_node, &value, cap) {
+                // Nothing at or above `child` can be modified by this insert →
+                // release the meta latch and every retained ancestor.
+                meta_guard = None;
+                retained.clear();
+            }
+            retained.push(DescentFrame {
+                pid: child,
+                latch: child_latch,
+                node: child_node,
+                route_idx: 0,
+            });
+        }
+        // Apply the insert at the leaf and propagate any split up through the
+        // retained (still-latched) ancestors.
+        let mut pending: Option<(OrderedValue, PageId)> = None;
+        while let Some(frame) = retained.pop() {
+            let _latch = frame.latch; // keep this node latched for its rewrite
+            match frame.node {
+                Node::Leaf { mut entries, next } => {
+                    let probe = (value.clone(), rowid_key(rid));
+                    match entries.binary_search_by(|(k, r)| (k.clone(), rowid_key(*r)).cmp(&probe))
+                    {
+                        Ok(_) => return Ok(()), // exact (key,rid) duplicate — no-op
+                        Err(pos) => entries.insert(pos, (value.clone(), rid)),
+                    }
+                    let leaf = Node::Leaf { entries, next };
+                    if leaf.body_len() <= cap {
+                        *prev_lsn = write_node(
+                            pool,
+                            wal,
+                            txn_id,
+                            *prev_lsn,
+                            frame.pid,
+                            &leaf,
+                            self.page_size,
+                        )?;
+                        return Ok(()); // absorbed — remaining ancestor latches drop
+                    }
+                    pending = Some(self.split_leaf(leaf, frame.pid, pool, wal, txn_id, prev_lsn)?);
+                }
+                Node::Internal {
+                    mut keys,
+                    mut children,
+                } => {
+                    let (sep_key, new_child) = pending.take().expect(
+                        "an internal frame is only popped to absorb a split propagated from below",
+                    );
+                    keys.insert(frame.route_idx, sep_key);
+                    children.insert(frame.route_idx + 1, new_child);
+                    let internal = Node::Internal { keys, children };
+                    if internal.body_len() <= cap {
+                        *prev_lsn = write_node(
+                            pool,
+                            wal,
+                            txn_id,
+                            *prev_lsn,
+                            frame.pid,
+                            &internal,
+                            self.page_size,
+                        )?;
+                        return Ok(()); // absorbed
+                    }
+                    pending = Some(
+                        self.split_internal(internal, frame.pid, pool, wal, txn_id, prev_lsn)?,
+                    );
+                }
+            }
+        }
+        // The topmost retained node split. It can only be the root (a safe node
+        // absorbs and returns above), so the meta latch is still held — build a
+        // new root over the two halves and repoint the meta page in this mini-txn.
+        if let Some((sep_key, new_child)) = pending {
+            debug_assert!(
+                meta_guard.is_some(),
+                "root split without the meta latch held — crabbing invariant violated"
+            );
             let new_root_page = pool.alloc_page()?;
             let new_root = Node::Internal {
                 keys: vec![sep_key],
@@ -668,7 +875,104 @@ impl DiskBTree {
             let meta = meta_bytes(self.meta_page, new_root_page, self.page_size);
             *prev_lsn = write_raw(pool, wal, txn_id, *prev_lsn, self.meta_page, meta)?;
         }
+        drop(meta_guard);
         Ok(())
+    }
+
+    /// Fetch + deserialize one node while the caller already holds its exclusive
+    /// latch (Item A). The pin is dropped immediately; the caller's latch keeps
+    /// the bytes stable (no other writer can be mid-mutation of a latched node),
+    /// so the returned owned `Node` is a consistent snapshot to modify and write
+    /// back under the same latch.
+    fn read_node(&self, pid: PageId, pool: &BufferPool) -> Result<Node> {
+        let page = pool.fetch_page(pid)?;
+        let node = Node::deserialize(&page)?;
+        pool.unpin(pid);
+        Ok(node)
+    }
+
+    /// Split a full leaf `pid` in half: the right half moves to a fresh page and
+    /// becomes `pid`'s right sibling (`next_leaf`), both written in `txn_id`.
+    /// Returns the separator + new page for the parent to absorb.
+    fn split_leaf(
+        &self,
+        leaf: Node,
+        pid: PageId,
+        pool: &BufferPool,
+        wal: &Wal,
+        txn_id: u64,
+        prev_lsn: &mut Lsn,
+    ) -> Result<(OrderedValue, PageId)> {
+        let Node::Leaf { entries, next } = leaf else {
+            unreachable!()
+        };
+        let mid = entries.len() / 2;
+        let right_entries = entries[mid..].to_vec();
+        let left_entries = entries[..mid].to_vec();
+        let sep_key = right_entries[0].0.clone();
+        let right_page = pool.alloc_page()?;
+        let right = Node::Leaf {
+            entries: right_entries,
+            next,
+        };
+        let left = Node::Leaf {
+            entries: left_entries,
+            next: right_page,
+        };
+        *prev_lsn = write_node(
+            pool,
+            wal,
+            txn_id,
+            *prev_lsn,
+            right_page,
+            &right,
+            self.page_size,
+        )?;
+        *prev_lsn = write_node(pool, wal, txn_id, *prev_lsn, pid, &left, self.page_size)?;
+        Ok((sep_key, right_page))
+    }
+
+    /// Split a full internal node `pid`: the middle key rises to the parent, the
+    /// right half of keys/children moves to a fresh page. Returns the rising
+    /// separator + new page.
+    fn split_internal(
+        &self,
+        internal: Node,
+        pid: PageId,
+        pool: &BufferPool,
+        wal: &Wal,
+        txn_id: u64,
+        prev_lsn: &mut Lsn,
+    ) -> Result<(OrderedValue, PageId)> {
+        let Node::Internal { keys, children } = internal else {
+            unreachable!()
+        };
+        let mid = keys.len() / 2;
+        let up_key = keys[mid].clone();
+        let left_keys = keys[..mid].to_vec();
+        let right_keys = keys[mid + 1..].to_vec();
+        let left_children = children[..=mid].to_vec();
+        let right_children = children[mid + 1..].to_vec();
+        let right_page = pool.alloc_page()?;
+        let right = Node::Internal {
+            keys: right_keys,
+            children: right_children,
+        };
+        let left = Node::Internal {
+            keys: left_keys,
+            children: left_children,
+        };
+        *prev_lsn = write_node(
+            pool,
+            wal,
+            txn_id,
+            *prev_lsn,
+            right_page,
+            &right,
+            self.page_size,
+        )?;
+        *prev_lsn = write_node(pool, wal, txn_id, *prev_lsn, pid, &left, self.page_size)?;
+        Ok((up_key, right_page))
     }
 
     /// Update the value (`RowId`) of the entry with key `value` in place, if it
@@ -686,10 +990,22 @@ impl DiskBTree {
         pool: &BufferPool,
         wal: &Wal,
     ) -> Result<bool> {
+        // Locate the leaf unlatched, then re-read it *under* its exclusive latch
+        // (index-write-concurrency, Item A): a concurrent insert may have split
+        // the leaf between locating and latching it, so the modification must be
+        // computed from the latched-and-freshly-read node, never from bytes read
+        // before the latch (that would clobber a concurrent split). If the key
+        // migrated to the split's right sibling it is simply absent here and we
+        // return `false` — the caller (vacuum's free-space update) treats a lost
+        // update as a safe stale-low free hint, corrected by the next vacuum.
         let pid = self.find_leaf(value, pool)?;
-        let page = pool.fetch_page(pid)?;
-        let node = Node::deserialize(&page)?;
-        pool.unpin(pid);
+        let _latch = pool.latch_exclusive(pid);
+        let node = {
+            let page = pool.fetch_page(pid)?;
+            let n = Node::deserialize(&page)?;
+            pool.unpin(pid);
+            n
+        };
         let Node::Leaf { mut entries, next } = node else {
             return Ok(false);
         };
@@ -702,123 +1018,6 @@ impl DiskBTree {
         let lsn = write_node(pool, wal, txn_id, begin_lsn, pid, &leaf, self.page_size)?;
         wal.commit_mini_txn(txn_id, lsn)?;
         Ok(true)
-    }
-
-    /// Recursive insert. Returns `Some((separator_key, new_right_page))` when
-    /// `pid` split and the caller must insert that separator one level up.
-    #[allow(clippy::too_many_arguments)]
-    fn insert_into(
-        &self,
-        pid: PageId,
-        value: OrderedValue,
-        rid: RowId,
-        pool: &BufferPool,
-        wal: &Wal,
-        txn_id: u64,
-        prev_lsn: &mut Lsn,
-    ) -> Result<Option<(OrderedValue, PageId)>> {
-        let page = pool.fetch_page(pid)?;
-        let node = Node::deserialize(&page)?;
-        pool.unpin(pid);
-        match node {
-            Node::Leaf { mut entries, next } => {
-                let probe = (value.clone(), rowid_key(rid));
-                let at = entries.binary_search_by(|(k, r)| (k.clone(), rowid_key(*r)).cmp(&probe));
-                match at {
-                    Ok(_) => return Ok(None), // exact (key,rid) duplicate — no-op
-                    Err(pos) => entries.insert(pos, (value, rid)),
-                }
-                let leaf = Node::Leaf { entries, next };
-                if leaf.body_len() <= body_capacity(self.page_size) {
-                    *prev_lsn =
-                        write_node(pool, wal, txn_id, *prev_lsn, pid, &leaf, self.page_size)?;
-                    return Ok(None);
-                }
-                // Split the leaf in half; the right half moves to a new page and
-                // becomes the current leaf's right sibling.
-                let Node::Leaf { entries, next } = leaf else {
-                    unreachable!()
-                };
-                let mid = entries.len() / 2;
-                let right_entries = entries[mid..].to_vec();
-                let left_entries = entries[..mid].to_vec();
-                let sep_key = right_entries[0].0.clone();
-                let right_page = pool.alloc_page()?;
-                let right = Node::Leaf {
-                    entries: right_entries,
-                    next,
-                };
-                let left = Node::Leaf {
-                    entries: left_entries,
-                    next: right_page,
-                };
-                *prev_lsn = write_node(
-                    pool,
-                    wal,
-                    txn_id,
-                    *prev_lsn,
-                    right_page,
-                    &right,
-                    self.page_size,
-                )?;
-                *prev_lsn = write_node(pool, wal, txn_id, *prev_lsn, pid, &left, self.page_size)?;
-                Ok(Some((sep_key, right_page)))
-            }
-            Node::Internal { keys, children } => {
-                let mut idx = keys.len();
-                for (i, k) in keys.iter().enumerate() {
-                    if &value < k {
-                        idx = i;
-                        break;
-                    }
-                }
-                let child = children[idx];
-                let split = self.insert_into(child, value, rid, pool, wal, txn_id, prev_lsn)?;
-                let Some((sep_key, new_child)) = split else {
-                    return Ok(None);
-                };
-                let mut keys = keys;
-                let mut children = children;
-                keys.insert(idx, sep_key);
-                children.insert(idx + 1, new_child);
-                let internal = Node::Internal { keys, children };
-                if internal.body_len() <= body_capacity(self.page_size) {
-                    *prev_lsn =
-                        write_node(pool, wal, txn_id, *prev_lsn, pid, &internal, self.page_size)?;
-                    return Ok(None);
-                }
-                // Split the internal node: the middle key rises to the parent.
-                let Node::Internal { keys, children } = internal else {
-                    unreachable!()
-                };
-                let mid = keys.len() / 2;
-                let up_key = keys[mid].clone();
-                let left_keys = keys[..mid].to_vec();
-                let right_keys = keys[mid + 1..].to_vec();
-                let left_children = children[..=mid].to_vec();
-                let right_children = children[mid + 1..].to_vec();
-                let right_page = pool.alloc_page()?;
-                let right = Node::Internal {
-                    keys: right_keys,
-                    children: right_children,
-                };
-                let left = Node::Internal {
-                    keys: left_keys,
-                    children: left_children,
-                };
-                *prev_lsn = write_node(
-                    pool,
-                    wal,
-                    txn_id,
-                    *prev_lsn,
-                    right_page,
-                    &right,
-                    self.page_size,
-                )?;
-                *prev_lsn = write_node(pool, wal, txn_id, *prev_lsn, pid, &left, self.page_size)?;
-                Ok(Some((up_key, right_page)))
-            }
-        }
     }
 
     /// Remove one `(value, rid)` entry if present. No rebalance (v1). One WAL
@@ -837,9 +1036,19 @@ impl DiskBTree {
         // start), stopping once we pass `value`.
         let mut pid = self.find_leaf(value, pool)?;
         loop {
-            let page = pool.fetch_page(pid)?;
-            let node = Node::deserialize(&page)?;
-            pool.unpin(pid);
+            // Re-read each leaf *under* its exclusive latch (index-write-
+            // concurrency, Item A) so the retain/rewrite is computed from current
+            // bytes — never from a copy read before the latch, which a concurrent
+            // insert/split could have superseded. Remove is best-effort (a missing
+            // entry is a no-op; MVCC re-check filters stale candidates anyway), so
+            // an entry that migrated across a concurrent split is simply skipped.
+            let _latch = pool.latch_exclusive(pid);
+            let node = {
+                let page = pool.fetch_page(pid)?;
+                let n = Node::deserialize(&page)?;
+                pool.unpin(pid);
+                n
+            };
             let Node::Leaf { mut entries, next } = node else {
                 return Ok(());
             };
@@ -856,8 +1065,86 @@ impl DiskBTree {
             if past || next == INVALID_PAGE_ID {
                 return Ok(()); // not present
             }
+            drop(_latch);
             pid = next;
         }
+    }
+
+    /// Structural validator (index-write-concurrency, Validation §1). Walks the
+    /// whole tree over any [`PageReader`] and returns every `(key, rid)` entry in
+    /// leaf-chain order, asserting the tree's structural invariants along the
+    /// way — turning silent index corruption a concurrent-write race might cause
+    /// into a hard, loud failure. Run it as the assertion at the end of every
+    /// concurrency stress test. Checks:
+    ///
+    /// 1. the leaf chain is fully linked from the leftmost leaf and terminates;
+    /// 2. entries are globally non-decreasing across the whole chain (each leaf
+    ///    sorted, and every leaf's first key ≥ the previous leaf's last key);
+    /// 3. every internal separator is consistent with the leaf ordering
+    ///    (implied by (2) plus the descent landing on the leftmost leaf);
+    /// 4. no cycle in the leaf chain (bounded by a visited-page guard).
+    ///
+    /// It does **not** validate MVCC visibility (entries are hints) — only that
+    /// the B+tree itself is well-formed and lost/duplicated no entries.
+    /// Returns the entries so a caller can additionally assert set-equality with
+    /// what it inserted (no lost or duplicated `(key, rid)` pairs).
+    pub fn validate<P: PageReader>(&self, reader: &P) -> Result<Vec<(OrderedValue, RowId)>> {
+        // Descend to the leftmost leaf.
+        let meta = reader.read_page(self.meta_page)?;
+        let mbody = &meta.as_bytes()[PAGE_HEADER_SIZE..];
+        if mbody.first().copied() != Some(NODE_META) {
+            return Err(DbError::Recovery(
+                "validate: meta page is not a meta node".into(),
+            ));
+        }
+        let mut pid = u32_from_le(mbody[1..5].try_into().unwrap());
+        loop {
+            let page = reader.read_page(pid)?;
+            match Node::deserialize(&page)? {
+                Node::Leaf { .. } => break,
+                Node::Internal { children, .. } => {
+                    if children.is_empty() {
+                        return Err(DbError::Recovery(
+                            "validate: internal node with no children".into(),
+                        ));
+                    }
+                    pid = children[0];
+                }
+            }
+        }
+        // Walk the leaf chain, collecting entries and checking global order.
+        let mut out: Vec<(OrderedValue, RowId)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut last_key: Option<OrderedValue> = None;
+        loop {
+            if !seen.insert(pid) {
+                return Err(DbError::Recovery(format!(
+                    "validate: cycle in leaf chain at page {pid}"
+                )));
+            }
+            let page = reader.read_page(pid)?;
+            let Node::Leaf { entries, next } = Node::deserialize(&page)? else {
+                return Err(DbError::Recovery(
+                    "validate: leaf-chain walk hit a non-leaf".into(),
+                ));
+            };
+            for (k, rid) in entries {
+                if let Some(prev) = &last_key {
+                    if &k < prev {
+                        return Err(DbError::Recovery(format!(
+                            "validate: leaf entries out of order ({prev:?} then {k:?}) at page {pid}"
+                        )));
+                    }
+                }
+                last_key = Some(k.clone());
+                out.push((k, rid));
+            }
+            if next == INVALID_PAGE_ID {
+                break;
+            }
+            pid = next;
+        }
+        Ok(out)
     }
 }
 
@@ -1195,6 +1482,165 @@ mod tests {
             t.search_eq(&OrderedValue::Int(2), &e.pool).unwrap().len(),
             dup as usize - 1
         );
+    }
+
+    /// Item A crabbing: N threads insert disjoint *and* overlapping key ranges
+    /// into ONE shared tree at once; afterwards the structural validator must
+    /// report a well-formed tree containing exactly the inserted set — no lost or
+    /// duplicated entries, leaf chain sorted and linked. This is the module-level
+    /// proof that the latch-coupled descent is race-safe (the whole point of
+    /// Item A). Deterministic assertion (validator §1) over a nondeterministic
+    /// schedule; run many keys to force splits under contention.
+    #[test]
+    fn concurrent_inserts_stay_structurally_valid() {
+        use std::sync::Arc;
+        let dir = tempdir().unwrap();
+        let pool = Arc::new(
+            BufferPool::open(&dir.path().join("data.db"), DEFAULT_PAGE_SIZE as usize, 512).unwrap(),
+        );
+        let wal = Arc::new(Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap());
+        let tree = Arc::new(DiskBTree::create(&pool, &wal).unwrap());
+
+        let threads = 8;
+        let per = 500i64;
+        // Half the threads write a disjoint block; half write into a *shared*
+        // overlapping range so many duplicate keys straddle leaf splits under
+        // concurrency (the hardest case for the leaf-chain / split path).
+        let barrier = Arc::new(std::sync::Barrier::new(threads));
+        let mut handles = Vec::new();
+        for t in 0..threads {
+            let (tree, pool, wal, barrier) =
+                (tree.clone(), pool.clone(), wal.clone(), barrier.clone());
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..per {
+                    let key = if t % 2 == 0 {
+                        (t as i64) * per + i // disjoint block
+                    } else {
+                        i % 50 // shared overlapping range → heavy duplicates
+                    };
+                    tree.insert(OrderedValue::Int(key), rid(t as u32, i as u16), &pool, &wal)
+                        .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Structural validity + exact set membership.
+        let entries = tree.validate(&*pool).unwrap();
+        let mut expected = std::collections::HashSet::new();
+        for t in 0..threads {
+            for i in 0..per {
+                let key = if t % 2 == 0 {
+                    (t as i64) * per + i
+                } else {
+                    i % 50
+                };
+                expected.insert((key, t as u32, i as u16));
+            }
+        }
+        let got: std::collections::HashSet<_> = entries
+            .iter()
+            .map(|(k, r)| {
+                let OrderedValue::Int(n) = k else { panic!() };
+                (*n, r.page_id, r.slot)
+            })
+            .collect();
+        assert_eq!(got.len(), entries.len(), "no duplicated (key,rid) entries");
+        assert_eq!(got, expected, "every inserted entry present, none extra");
+        // Every key still resolvable via the normal read path.
+        for key in 0..50i64 {
+            assert!(
+                !tree
+                    .search_eq(&OrderedValue::Int(key), &pool)
+                    .unwrap()
+                    .is_empty(),
+                "shared key {key} missing after concurrent inserts"
+            );
+        }
+    }
+
+    /// Deterministic split-contention (index-write-concurrency, Validation §2).
+    /// Pre-fill the tree right up to a leaf-split boundary, then release two
+    /// threads *simultaneously* (a barrier) to insert into the hot region — so
+    /// the schedule is forced onto the dangerous path where concurrent inserts
+    /// race a leaf/root split. Because the crabbing descent holds the path's
+    /// exclusive latches, one writer always completes its split before the other
+    /// observes the node — the structural validator afterwards must find a
+    /// well-formed tree with exactly the inserted set (no half-applied split, no
+    /// lost/duplicated entry). Repeated a few times to vary the interleaving.
+    #[test]
+    fn two_writers_splitting_hot_region_stay_valid() {
+        use std::sync::Arc;
+        for round in 0..5u32 {
+            let dir = tempdir().unwrap();
+            let pool = Arc::new(
+                BufferPool::open(&dir.path().join("data.db"), DEFAULT_PAGE_SIZE as usize, 256)
+                    .unwrap(),
+            );
+            let wal = Arc::new(Wal::open(&dir.path().join("db.wal"), INVALID_LSN).unwrap());
+            let tree = Arc::new(DiskBTree::create(&pool, &wal).unwrap());
+
+            // Pre-fill enough int keys to build a multi-leaf tree, leaving the
+            // top of the key space open for both threads to pile into the same
+            // rightmost leaves and force splits there.
+            let prefill = 900i64;
+            for i in 0..prefill {
+                tree.insert(OrderedValue::Int(i), rid(i as u32, 0), &pool, &wal)
+                    .unwrap();
+            }
+
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let mut handles = Vec::new();
+            for t in 0..2u32 {
+                let (tree, pool, wal, barrier) =
+                    (tree.clone(), pool.clone(), wal.clone(), barrier.clone());
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    // Interleave the two threads' keys in the hot (high) region so
+                    // both drive splits of the same leaves.
+                    for j in 0..200i64 {
+                        let key = prefill + j * 2 + t as i64;
+                        tree.insert(
+                            OrderedValue::Int(key),
+                            rid(1_000_000 + t, j as u16),
+                            &pool,
+                            &wal,
+                        )
+                        .unwrap();
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            let entries = tree.validate(&*pool).unwrap();
+            let got: std::collections::BTreeSet<i64> = entries
+                .iter()
+                .map(|(k, _)| match k {
+                    OrderedValue::Int(n) => *n,
+                    _ => panic!(),
+                })
+                .collect();
+            let mut expected: std::collections::BTreeSet<i64> = (0..prefill).collect();
+            for t in 0..2i64 {
+                for j in 0..200i64 {
+                    expected.insert(prefill + j * 2 + t);
+                }
+            }
+            assert_eq!(
+                got, expected,
+                "round {round}: split contention lost/added keys"
+            );
+            assert_eq!(
+                entries.len(),
+                expected.len(),
+                "round {round}: duplicated entry"
+            );
+        }
     }
 
     /// The tree survives being reconstructed from just its meta page id — the

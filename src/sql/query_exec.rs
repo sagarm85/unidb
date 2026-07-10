@@ -59,7 +59,7 @@ pub fn exec_explain(spec: &QuerySpec, analyze: bool, ctx: &mut ExecCtx) -> Resul
         subquery_cache: HashMap::new(),
     };
     let node = runner.materialize_ctes_and_plan(spec)?;
-    let mut lines = crate::sql::explain::render_estimated(&node, runner.ctx.catalog);
+    let mut lines = crate::sql::explain::render_estimated(&node, runner.ctx.catalog.get());
     if analyze {
         let start = std::time::Instant::now();
         let batch = runner.run(&node)?;
@@ -90,12 +90,12 @@ impl Runner<'_, '_> {
     /// plan the main query with those CTE schemas in scope.
     fn materialize_ctes_and_plan(&mut self, spec: &QuerySpec) -> Result<PlanNode> {
         for (name, cte_spec) in &spec.with {
-            let cte_plan = plan_query(cte_spec, self.ctx.catalog, &self.cte_schemas)?;
+            let cte_plan = plan_query(cte_spec, self.ctx.catalog.get(), &self.cte_schemas)?;
             let batch = self.run(&cte_plan)?;
             self.cte_schemas.insert(name.clone(), batch.schema.clone());
             self.cte_batches.insert(name.clone(), batch);
         }
-        plan_query(spec, self.ctx.catalog, &self.cte_schemas)
+        plan_query(spec, self.ctx.catalog.get(), &self.cte_schemas)
     }
 
     fn run(&mut self, node: &PlanNode) -> Result<Batch> {
@@ -583,7 +583,7 @@ impl Runner<'_, '_> {
         outer_row: &[Literal],
     ) -> Result<QuerySpec> {
         let inner_schema =
-            plan::plan_from_schema(&subquery.from, self.ctx.catalog, &self.cte_schemas)?;
+            plan::plan_from_schema(&subquery.from, self.ctx.catalog.get(), &self.cte_schemas)?;
         let mut bound = subquery.clone();
         let subst =
             |e: &mut QExpr| substitute_correlated(e, &inner_schema, outer_schema, outer_row);

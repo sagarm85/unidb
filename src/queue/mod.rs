@@ -93,6 +93,7 @@ pub fn events_table_def() -> TableDef {
         events_enabled: false,
         serial_next: Default::default(),
         constraints: Default::default(),
+        generation: 0,
     }
 }
 
@@ -123,6 +124,7 @@ pub fn consumers_table_def() -> TableDef {
         events_enabled: false,
         serial_next: Default::default(),
         constraints: Default::default(),
+        generation: 0,
     }
 }
 
