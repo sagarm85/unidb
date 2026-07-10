@@ -122,7 +122,7 @@
     bytes, survives truncation) + `Engine::rows_decoded_total` (a `ROWS_DECODED`
     atomic in `decode_row`); `decompose.rs` Table 3 gained WAL-B/row + dec/row
     columns. New crash point **P29**. Full before/after in `PROGRESS.md`'s "CRUD
-    performance — Phase A" entry; spec `docs/backlog/crud_performance_phaseA_B.md`
+    performance — Phase A" entry; spec `docs/backlog/crud_performance.md`
     (status flipped, with an inline correction block).
 - **Docker fair-fsync report + Table 3 remark & Table 3.1 bulk stress — DONE
   (2026-07-10), branch `bench-docker-fair-fsync-report` (commit `c5c150c`), PR
@@ -2798,7 +2798,7 @@ performance — Phase B" entry + the Current-status bullet above.
 
 ### 2026-07-10 — CRUD performance Phase A (write path), branch `crud-perf-phaseA`
 
-Executed Phase A of `docs/backlog/crud_performance_phaseA_B.md` (C1 → A1 → A3 →
+Executed Phase A of `docs/backlog/crud_performance.md` (C1 → A1 → A3 →
 A4; A2 deferred). Commits: `7ba6aad` C1 instrumentation, `da1194c` A1 coalesce,
 `c63a509` A3+A4, `c8c9c1c` bench ANALYZE. Full detail in `PROGRESS.md`'s "CRUD
 performance — Phase A" entry and the Current-status bullet above.

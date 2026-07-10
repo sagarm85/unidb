@@ -142,8 +142,9 @@ cargo fmt --all             # format gate
 
 ## 9. PR / commit workflow
 
+- **Backlog docs follow `docs/backlog/CONVENTIONS.md`; `docs/backlog/README.md` is the numbered index** (the at-a-glance pending/completed tracker + where the next number comes from). Read both before creating a backlog file. In short: every effort is one of **Phase / Milestone / Improvement / Performance**; **new files are named `NN_<slug>.md`** where `NN` is the next free stable ID in the index (no `phase` in the slug, no internal sub-parts like `_phaseA_B` — name those inside the doc). Register each new file in `README.md`. Each file opens with a `**Type:**` + `**Status:**` header; metrics live in `PROGRESS.md`, not the backlog file. (Existing files keep their un-numbered names; the historical `phase<N>_` files are the roadmap's numbered phases.)
 - **One PR per milestone.** The PR description **must** contain the benchmark metrics table (§6) and a note on peak memory.
-- Conventional commits (`feat:`, `fix:`, `test:`, `bench:`, `docs:`, `refactor:`).
+- Conventional commits (`feat:`, `fix:`, `test:`, `bench:`, `docs:`, `refactor:`, `perf:`).
 - Every PR: `cargo fmt` clean, `clippy -D warnings` clean, all tests + crash harness green, benchmarks recorded.
 - Update `PROGRESS.md` (milestone entry with metrics + PR link) and `MEMORY.md` (current state) in the same PR.
 - **Before every push or PR, check `README.md` and every file under `docs/` for staleness — not just `PROGRESS.md`/`MEMORY.md`.** `PROGRESS.md` gets updated reliably because it's part of the per-milestone habit; `README.md` and `docs/` (`docs/design/engine_design.md`, `docs/REST_API.md`, `docs/backlog/*.md`) do not update themselves and have gone stale in the past (e.g. a design doc left claiming a shipped milestone was "not started," and once documenting a policy that had since been reverted as a bug fix). Concretely, for any change that touches the public surface (new/changed API, new module, new deployment mode, a reverted design decision, a milestone opened or closed):

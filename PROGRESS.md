@@ -3463,7 +3463,7 @@ publishable absolute durability; a matched **bulk** INSERT path in Table 3
 ## CRUD performance — Phase A (write path)   [SHIPPED]   2026-07-10
 
 **PR:** #34 (merged `e6fd0cb`, 2026-07-10) — branch `crud-perf-phaseA`
-**Spec:** `docs/backlog/crud_performance_phaseA_B.md` (status flipped to
+**Spec:** `docs/backlog/crud_performance.md` (status flipped to
 Phase-A-SHIPPED, with an inline correction block — see below).
 **Summary:** Closes the Table-3 UPDATE-bulk CRUD-stress gap the multi-model
 report surfaced (`benches/decompose.rs`) against a matched-durability Postgres
@@ -3573,7 +3573,7 @@ the existing P3.a "index entry is a re-validated hint" invariant).
 ## CRUD performance — Phase B (read path)   [SHIPPED]   2026-07-10
 
 **PR:** _pending_ — branch `crud-perf-phaseB`
-**Spec:** `docs/backlog/crud_performance_phaseA_B.md` (reviewed under a
+**Spec:** `docs/backlog/crud_performance.md` (reviewed under a
 senior-DB-architect lens before implementation — ordered by real ROI, parallel
 scan split out as its own milestone).
 **Summary:** Closes the read-path decode waste Phase A left: the executor decoded
