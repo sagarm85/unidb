@@ -1113,6 +1113,12 @@ fn exec_update(
     // leaf instead of one per row (RC2). Correctness is unchanged: every entry is
     // still inserted (see `stage_row_index_writes`).
     let mut index_batches = init_index_batches(&table_def);
+    // A4: whether any UNIQUE/PRIMARY KEY set exists at all — computed once, not
+    // per row. When there are none, the loop skips both the per-row
+    // `snapshot_for_statement` allocation *and* `enforce_unique`'s full-heap
+    // scan (which would otherwise fire per row → RC5's O(N²)); the check is a
+    // no-op in that case (`enforce_unique` early-returns on empty active sets).
+    let has_unique = !unique_column_sets(&table_def)?.is_empty();
     let mut count = 0;
     for (row_id, mut row) in matching {
         for (col, expr) in assignments {
@@ -1125,17 +1131,20 @@ fn exec_update(
         // UNIQUE (M11): exclude the row's *current* version — the old tuple
         // is still visible to this snapshot until `heap.update` supersedes
         // it, so without the exclusion an unchanged unique value would
-        // collide with itself.
-        let usnap = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
-        enforce_unique(
-            &table_def,
-            &coerced,
-            &heap,
-            &usnap,
-            ctx.xid,
-            ctx.pool,
-            Some(row_id),
-        )?;
+        // collide with itself. Skipped entirely when the table has no UNIQUE
+        // set (A4).
+        if has_unique {
+            let usnap = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+            enforce_unique(
+                &table_def,
+                &coerced,
+                &heap,
+                &usnap,
+                ctx.xid,
+                ctx.pool,
+                Some(row_id),
+            )?;
+        }
         let encoded = encode_row(&coerced);
         let new_row_id =
             match heap.update(row_id, &encoded, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr) {
@@ -1225,13 +1234,79 @@ fn classify_conflict(err: DbError, ctx: &ExecCtx) -> DbError {
     }
 }
 
+/// Rows selected for an UPDATE/DELETE: each decoded row paired with its RowId.
+type MatchedRows = Vec<(RowId, Vec<Literal>)>;
+
+/// A range predicate must be estimated to touch no more than this fraction of
+/// the table before the index-driven [`matching_rows`] path is worth its
+/// random-access cost over a sequential scan (A3). Chosen from the measured
+/// crossover between a 25%-selective UPDATE (index wins) and a 50%-selective
+/// DELETE (scan wins) on this engine.
+const INDEX_RANGE_SELECTIVITY_MAX: f64 = 0.3;
+
+/// Whether UPDATE/DELETE should serve `hit` from the B-tree rather than a full
+/// scan (A3 gate). Equality is always taken (a point/low-cardinality lookup is
+/// inherently selective). A range is taken only when ANALYZE statistics
+/// (P4.d) estimate it selective enough — with no stats, the conservative choice
+/// is the sequential scan, which never regresses the non-selective case.
+fn index_lookup_is_selective(
+    table_def: &TableDef,
+    hit: (&str, CmpOp, &Literal),
+    ctx: &ExecCtx,
+) -> bool {
+    let (column, op, literal) = hit;
+    if matches!(op, CmpOp::Eq) {
+        return true;
+    }
+    let Some(stats) = ctx.catalog.table_stats(&table_def.name) else {
+        return false; // no ANALYZE evidence → prefer the sequential scan
+    };
+    let Some(col_stats) = stats.columns.get(column) else {
+        return false;
+    };
+    matches!(
+        col_stats.selectivity(op, literal, stats.row_count),
+        Some(frac) if frac <= INDEX_RANGE_SELECTIVITY_MAX
+    )
+}
+
 fn matching_rows(
     heap: &Heap,
     snapshot: &crate::mvcc::Snapshot,
     ctx: &mut ExecCtx,
     table_def: &TableDef,
     predicate: &Option<Expr>,
-) -> Result<Vec<(RowId, Vec<Literal>)>> {
+) -> Result<MatchedRows> {
+    // A3: when the predicate is a *selective* sargable range/equality on a
+    // BTree-indexed column, drive row lookup from the durable B+tree instead of
+    // a whole-heap scan — the same fast path SELECT already uses
+    // (`try_exec_select_btree`), now shared by UPDATE/DELETE (fixes RC1: a
+    // selective `DELETE … WHERE k = x` no longer decodes every row to find its
+    // matches). Every live row carries a B-tree entry for its key (insert + the
+    // A1 coalesced update both maintain it), so the index scan is complete;
+    // candidates are re-checked against the full predicate + MVCC visibility, so
+    // the result is identical to a scan.
+    //
+    // The `index_lookup_is_selective` gate matters: for a *non*-selective range
+    // (e.g. `k >= N/2`, matching half the table) the index-driven path does one
+    // random `heap.get` per match, which is slower than a single sequential full
+    // scan — so only equality (inherently selective) or an ANALYZE-proven
+    // selective range takes the index; everything else falls through to the scan
+    // (measured: forcing the index on a 50%-selective DELETE regressed it).
+    if let Some(hit) = predicate
+        .as_ref()
+        .and_then(|e| find_indexable_btree_predicate(e, table_def))
+    {
+        if index_lookup_is_selective(table_def, hit, ctx) {
+            if let Some(rows) = index_matching_rows(heap, snapshot, ctx, table_def, predicate, hit)?
+            {
+                return Ok(rows);
+            }
+        }
+    }
+
+    // Full-scan fallback — always correct (non-sargable predicate, no index, or
+    // a non-orderable literal).
     heap.scan(snapshot, ctx.xid, ctx.pool)?
         .into_iter()
         .map(|(row_id, bytes)| Ok((row_id, decode_row(&bytes, &table_def.columns)?)))
@@ -1245,6 +1320,59 @@ fn matching_rows(
             },
         )
         .collect()
+}
+
+/// Index-driven half of [`matching_rows`] (A3): resolve a sargable B-tree
+/// predicate to `(RowId, row)` pairs via the durable B+tree, re-checking every
+/// candidate against MVCC visibility and the *full* predicate (so an AND'd
+/// non-indexed term still filters). Returns `Ok(None)` when the index cannot
+/// serve this predicate (non-orderable literal, `Ne`, or the column has no
+/// built index) so the caller falls back to a full scan — never an error, never
+/// a wrong result. Candidate RowIds are de-duplicated so a row can never be
+/// handed to the caller (and thus updated/deleted) twice.
+fn index_matching_rows(
+    heap: &Heap,
+    snapshot: &crate::mvcc::Snapshot,
+    ctx: &mut ExecCtx,
+    table_def: &TableDef,
+    predicate: &Option<Expr>,
+    hit: (&str, CmpOp, &Literal),
+) -> Result<Option<MatchedRows>> {
+    let (column, op, literal) = hit;
+    let Ok(value) = OrderedValue::try_from(literal) else {
+        return Ok(None);
+    };
+    let Some(meta_page) = table_def
+        .columns
+        .iter()
+        .find(|c| c.name == column)
+        .and_then(|c| c.index_root)
+    else {
+        return Ok(None);
+    };
+    let tree = DiskBTree::new(meta_page, ctx.page_size);
+    let candidate_ids = match tree.search(op, &value, ctx.pool)? {
+        Some(ids) => ids,
+        None => return Ok(None),
+    };
+
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for row_id in candidate_ids {
+        if !seen.insert((row_id.page_id, row_id.slot)) {
+            continue; // a rowid resolved once is enough (dedup superseded/dup entries)
+        }
+        let bytes = match heap.get(row_id, snapshot, ctx.xid, ctx.pool) {
+            Ok(b) => b,
+            Err(DbError::NoVisibleVersion { .. }) => continue, // superseded / aborted hint
+            Err(e) => return Err(e),
+        };
+        let row = decode_row(&bytes, &table_def.columns)?;
+        if predicate_matches(predicate, &table_def.columns, &row)? {
+            out.push((row_id, row));
+        }
+    }
+    Ok(Some(out))
 }
 
 // ── row value handling ──────────────────────────────────────────────────────
@@ -3277,6 +3405,97 @@ mod tests {
             h.exec_as(xid, "DROP TABLE __events__"),
             Err(DbError::SqlPlan(_))
         ));
+    }
+
+    // ── A3: index-driven UPDATE/DELETE (crud-perf Phase A) ───────────────────
+
+    /// An equality UPDATE on a BTree-indexed column goes through the A3
+    /// index-driven `matching_rows` path (`index_lookup_is_selective` takes Eq)
+    /// and must update exactly the matching rows, leaving the row resolvable via
+    /// the index at its new key and the untouched rows unchanged.
+    #[test]
+    fn a3_equality_update_via_index_is_correct() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, k INT)").unwrap();
+        h.exec_as(xid, "CREATE INDEX t_k ON t USING BTREE (k)")
+            .unwrap();
+        for i in 0..50 {
+            h.exec_as(xid, &format!("INSERT INTO t (id, k) VALUES ({i}, {i})"))
+                .unwrap();
+        }
+        h.commit(xid);
+
+        // Equality UPDATE of the indexed column itself (also exercises A1's
+        // coalesced index write for the changed key).
+        let xid = h.begin();
+        let n = match h.exec_as(xid, "UPDATE t SET k = 999 WHERE k = 25").unwrap() {
+            ExecResult::Updated { count } => count,
+            o => panic!("{o:?}"),
+        };
+        h.commit(xid);
+        assert_eq!(n, 1, "exactly one row matches k = 25");
+
+        let ids_at = |h: &mut Harness, k: i64| -> Vec<i64> {
+            let xid = h.begin();
+            let r = h
+                .exec_as(xid, &format!("SELECT id FROM t WHERE k = {k}"))
+                .unwrap();
+            h.commit(xid);
+            match r {
+                ExecResult::Rows { rows, .. } => rows
+                    .iter()
+                    .filter_map(|row| match row[0] {
+                        Literal::Int(v) => Some(v),
+                        _ => None,
+                    })
+                    .collect(),
+                o => panic!("{o:?}"),
+            }
+        };
+        assert!(ids_at(&mut h, 25).is_empty(), "old key must be gone");
+        assert_eq!(ids_at(&mut h, 999), vec![25], "row resolves at its new key");
+        assert_eq!(ids_at(&mut h, 24), vec![24], "neighbor row untouched");
+    }
+
+    /// An equality DELETE on a BTree-indexed column goes through the A3 index
+    /// path and removes exactly the matching row; the rest survive and stay
+    /// index-resolvable.
+    #[test]
+    fn a3_equality_delete_via_index_is_correct() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, k INT)").unwrap();
+        h.exec_as(xid, "CREATE INDEX t_k ON t USING BTREE (k)")
+            .unwrap();
+        for i in 0..50 {
+            h.exec_as(xid, &format!("INSERT INTO t (id, k) VALUES ({i}, {i})"))
+                .unwrap();
+        }
+        h.commit(xid);
+
+        let xid = h.begin();
+        let n = match h.exec_as(xid, "DELETE FROM t WHERE k = 30").unwrap() {
+            ExecResult::Deleted { count } => count,
+            o => panic!("{o:?}"),
+        };
+        h.commit(xid);
+        assert_eq!(n, 1);
+
+        let xid = h.begin();
+        let gone = h.exec_as(xid, "SELECT id FROM t WHERE k = 30").unwrap();
+        let survivor = h.exec_as(xid, "SELECT id FROM t WHERE k = 31").unwrap();
+        h.commit(xid);
+        assert!(
+            matches!(gone, ExecResult::Rows { ref rows, .. } if rows.is_empty()),
+            "deleted row must not resolve via the index"
+        );
+        assert!(
+            matches!(survivor, ExecResult::Rows { ref rows, .. } if rows.len() == 1),
+            "neighbor survives and stays index-resolvable"
+        );
     }
 
     // ── P2.d: SERIAL / sequences ─────────────────────────────────────────────
