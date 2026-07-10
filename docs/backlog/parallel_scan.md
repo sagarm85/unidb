@@ -1,11 +1,28 @@
 # Parallel scan workers (Postgres-style) — design doc
 
-## Status as of 2026-07-10: **NOT STARTED** (filed during CRUD-perf Phase B)
+## Status as of 2026-07-10: **SHIPPED** (P-a + P-b), branch `parallel-scan`
 
-Filed as its own milestone (not a Phase-B checkpoint) because parallel query is a
-major feature with a real correctness landmine — it deserves a design doc + PR of
-its own, not a rider in a decode-pushdown PR. Sequenced after Phase B (decode
-pushdown), which makes each worker's per-row cost cheaper.
+Shipped 2026-07-10 — see `PROGRESS.md`'s "Milestone P — parallel scan workers"
+entry. **The gating "correctness landmine" below turned out not to exist**: unidb
+is mmap-as-storage (owned-copy reads under the mmap read-lock always see current
+committed data), so parallel scan was clean to build. Result: unfiltered
+`SELECT COUNT(*)` **3.82× parallel speedup** (now ~5–8× faster than Postgres);
+filtered scan 1.59× (base-scan only — see the follow-up).
+
+**Filed follow-ups (not in the first PR):**
+- **Partial aggregate — the lever for the *filtered* scan gap.** `COUNT(*) WHERE …`
+  plans as Aggregate → Filter → Scan; only the base Scan is parallel today, so the
+  Filter + Aggregate are a serial Amdahl tail (1.59× instead of near-linear). Push
+  the predicate + `COUNT`/`SUM`/`GROUP BY` into the workers (needs the Filter
+  `QExpr` evaluated by a `Sync` closure, not a `Runner` method) and gather-merge.
+- `LIMIT` early-stop across workers (shared done-flag).
+- `exec_select_readonly` (server `ReadHandle`) parallelism — its reader is a
+  generic `P: PageReader`; needs a `SharedPageReader`-specific path.
+- A visibility-map fast count (the true COUNT accelerator; a storage feature).
+
+---
+
+## Original design doc (below, as filed during Phase B)
 
 ## Why
 
