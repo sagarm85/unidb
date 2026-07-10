@@ -273,6 +273,62 @@ impl Runner<'_, '_> {
                             rows: vec![row],
                         });
                     }
+
+                    // Partial aggregate: `COUNT(*)` over a `Filter` (subquery-free
+                    // predicate) over a `Scan` — push the scan + filter + count
+                    // ALL into the workers, so the whole thing is parallel instead
+                    // of just the base scan (the fix for the filtered-scan Amdahl
+                    // tail). A subquery predicate needs the `Runner` → fall back.
+                    if let PlanNode::Filter {
+                        input: filter_input,
+                        predicate,
+                        ..
+                    } = input.as_ref()
+                    {
+                        if let PlanNode::Scan {
+                            table,
+                            output: scan_output,
+                            ..
+                        } = filter_input.as_ref()
+                        {
+                            if !predicate.has_subquery() {
+                                let table_def = self.ctx.catalog.lookup(table)?.clone();
+                                let heap = Heap::open(
+                                    self.ctx.page_size,
+                                    table_def.fsm_meta,
+                                    table_def.pages.clone(),
+                                );
+                                let pages = heap.scan_pages(self.ctx.pool)?;
+                                if let Some(degree) =
+                                    crate::sql::parallel_scan::degree_for(pages.len())
+                                {
+                                    let cols = &table_def.columns;
+                                    let matches = |bytes: &[u8]| -> Result<bool> {
+                                        let full = decode_row(bytes, cols)?;
+                                        let row = visible_row(&full, &table_def);
+                                        executor::as_bool(&eval_qexpr(
+                                            predicate,
+                                            scan_output,
+                                            &row,
+                                        )?)
+                                    };
+                                    let count = crate::sql::parallel_scan::parallel_count_matching(
+                                        &pages,
+                                        &self.ctx.pool.shared_reader(),
+                                        &self.snapshot,
+                                        self.ctx.xid,
+                                        degree,
+                                        &matches,
+                                    )?;
+                                    let row = vec![Literal::Int(count as i64); aggs.len()];
+                                    return Ok(Batch {
+                                        schema: output.clone(),
+                                        rows: vec![row],
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
                 let batch = self.run(input)?;
                 crate::sql::aggregate::aggregate(batch, group_exprs, aggs, output)

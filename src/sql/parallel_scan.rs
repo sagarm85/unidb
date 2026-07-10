@@ -136,6 +136,73 @@ pub fn parallel_count(
     Ok(total.load(Ordering::Relaxed))
 }
 
+/// Parallel filtered `COUNT(*)` — **partial aggregate** (Milestone P follow-up):
+/// each worker scans its page slice, evaluates `matches` on every visible tuple,
+/// and counts the survivors; the gather **sums** the partials. This is the lever
+/// that lifts a `COUNT(*) WHERE <predicate>` from the base-scan-only speedup
+/// (Filter + Aggregate were a serial Amdahl tail) toward the near-linear speedup
+/// the unfiltered count already gets — the whole scan → filter → count runs in
+/// the workers. `matches` must be `Sync` (a subquery-free predicate over the
+/// pure `eval_qexpr`); it returns `Err` to abort.
+pub fn parallel_count_matching<F>(
+    pages: &[PageId],
+    reader: &SharedPageReader,
+    snapshot: &Snapshot,
+    self_xid: Xid,
+    degree: usize,
+    matches: &F,
+) -> Result<usize>
+where
+    F: Fn(&[u8]) -> Result<bool> + Sync,
+{
+    let cursor = AtomicUsize::new(0);
+    let total = AtomicUsize::new(0);
+    let err: Mutex<Option<DbError>> = Mutex::new(None);
+    let stop = AtomicBool::new(false);
+
+    std::thread::scope(|s| {
+        for _ in 0..degree {
+            let reader = reader.clone();
+            let (cursor, total, err, stop, pages) = (&cursor, &total, &err, &stop, pages);
+            s.spawn(move || {
+                let mut local = 0usize;
+                let mut page_buf: Vec<(RowId, Vec<u8>)> = Vec::new();
+                'outer: while !stop.load(Ordering::Relaxed) {
+                    let i = cursor.fetch_add(1, Ordering::Relaxed);
+                    if i >= pages.len() {
+                        break;
+                    }
+                    page_buf.clear();
+                    if let Err(e) =
+                        scan_page_into(&reader, pages[i], snapshot, self_xid, &mut page_buf)
+                    {
+                        *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                        stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    for (_, bytes) in page_buf.drain(..) {
+                        match matches(&bytes) {
+                            Ok(true) => local += 1,
+                            Ok(false) => {}
+                            Err(e) => {
+                                *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                                stop.store(true, Ordering::Relaxed);
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+                total.fetch_add(local, Ordering::Relaxed);
+            });
+        }
+    });
+
+    if let Some(e) = err.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        return Err(e);
+    }
+    Ok(total.load(Ordering::Relaxed))
+}
+
 /// Parallel scan + filter + project (P-b): each worker scans its page slice and
 /// runs `per_row` (the caller's B2 deform + predicate + project) on every
 /// visible tuple, keeping the survivors. Results are **concatenated**
