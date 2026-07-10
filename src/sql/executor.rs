@@ -224,6 +224,109 @@ fn apply_durable_index_writes(
     Ok(())
 }
 
+/// A per-column accumulator for **coalesced** index maintenance (A1). Each
+/// `DiskBTree`-backed indexed column (BTree or FullText) collects its
+/// `(key, RowId)` pairs across every row an UPDATE touches, then flushes once
+/// via [`DiskBTree::insert_many`] so each dirtied leaf is WAL-logged **once**
+/// instead of once per row. This is the fix for RC2: a `body`-only bulk UPDATE
+/// re-inserts each row's *unchanged* `k` as a new version — correctness demands
+/// the entry (an index scan resolves to the live RowId; skipping it loses the
+/// row), but per-row logging emitted one ~8 KiB `WAL_INDEX` image *per row*.
+/// Coalescing keeps every entry and collapses the WAL to one image per leaf.
+///
+/// Hnsw (vector) is deliberately *not* batched here — it is not the bulk-update
+/// hot path and uses different index machinery ([`DiskIvfIndex`]); it stays on
+/// the per-row path, matching [`apply_durable_index_writes`].
+struct IndexColBatch {
+    col_idx: usize,
+    meta_page: PageId,
+    is_fulltext: bool,
+    entries: Vec<(OrderedValue, RowId)>,
+}
+
+/// One empty [`IndexColBatch`] per BTree/FullText indexed column of `table_def`.
+fn init_index_batches(table_def: &TableDef) -> Vec<IndexColBatch> {
+    let mut batches = Vec::new();
+    for (col_idx, col) in table_def.columns.iter().enumerate() {
+        if col.dropped {
+            continue;
+        }
+        let Some(meta_page) = col.index_root else {
+            continue;
+        };
+        match col.index {
+            Some(IndexKind::BTree) => batches.push(IndexColBatch {
+                col_idx,
+                meta_page,
+                is_fulltext: false,
+                entries: Vec::new(),
+            }),
+            Some(IndexKind::FullText) => batches.push(IndexColBatch {
+                col_idx,
+                meta_page,
+                is_fulltext: true,
+                entries: Vec::new(),
+            }),
+            _ => {}
+        }
+    }
+    batches
+}
+
+/// Stage one updated row's index maintenance (A1): BTree/FullText entries are
+/// appended to `batches` (flushed coalesced by [`flush_index_batches`] after the
+/// UPDATE loop); Hnsw is applied inline per row, exactly as
+/// [`apply_durable_index_writes`] does. Every indexed column is maintained — no
+/// column is skipped (skipping would lose the live row from index scans in this
+/// insert-new-version heap; the win comes from WAL coalescing, not omission).
+fn stage_row_index_writes(
+    table_def: &TableDef,
+    new_row_id: RowId,
+    row: &[Literal],
+    batches: &mut [IndexColBatch],
+    ctx: &mut ExecCtx,
+) -> Result<()> {
+    for b in batches.iter_mut() {
+        let val = &row[b.col_idx];
+        if b.is_fulltext {
+            if let Literal::Text(text) = val {
+                for token in crate::fulltext::tokenize(text) {
+                    b.entries.push((OrderedValue::Text(token), new_row_id));
+                }
+            }
+        } else if let Ok(value) = OrderedValue::try_from(val) {
+            b.entries.push((value, new_row_id));
+        }
+    }
+    for (idx, col) in table_def.columns.iter().enumerate() {
+        if col.dropped {
+            continue;
+        }
+        let Some(meta_page) = col.index_root else {
+            continue;
+        };
+        if let Some(IndexKind::Hnsw) = col.index {
+            if let Literal::Vector(v) = &row[idx] {
+                DiskIvfIndex::open(meta_page, ctx.page_size)
+                    .insert(new_row_id, v, ctx.pool, ctx.wal)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Flush every staged [`IndexColBatch`] with one coalesced [`DiskBTree::insert_many`]
+/// per column (A1). Called once after an UPDATE's row loop, on success.
+fn flush_index_batches(batches: &[IndexColBatch], ctx: &mut ExecCtx) -> Result<()> {
+    for b in batches {
+        if b.entries.is_empty() {
+            continue;
+        }
+        DiskBTree::new(b.meta_page, ctx.page_size).insert_many(&b.entries, ctx.pool, ctx.wal)?;
+    }
+    Ok(())
+}
+
 /// If `table_def` has events enabled, durably capture one event row in
 /// `__events__` under `ctx.xid` — a synchronous `heap.insert` followed
 /// immediately by `record_undo`, exactly the two-line shape every other
@@ -1005,6 +1108,11 @@ fn exec_update(
     let read_ids: Vec<RowId> = matching.iter().map(|(rid, _)| *rid).collect();
     ctx.txn_mgr.ssi_note_reads(ctx.xid, &read_ids);
 
+    // A1: accumulate BTree/FullText index entries across every updated row, then
+    // flush them coalesced after the loop — one WAL_INDEX page image per dirtied
+    // leaf instead of one per row (RC2). Correctness is unchanged: every entry is
+    // still inserted (see `stage_row_index_writes`).
+    let mut index_batches = init_index_batches(&table_def);
     let mut count = 0;
     for (row_id, mut row) in matching {
         for (col, expr) in assignments {
@@ -1051,10 +1159,12 @@ fn exec_update(
                 slot: new_row_id.slot,
             },
         )?;
-        apply_durable_index_writes(&table_def, new_row_id, &coerced, ctx)?;
+        stage_row_index_writes(&table_def, new_row_id, &coerced, &mut index_batches, ctx)?;
         send_event_capture(&table_def, "update", &coerced, ctx)?;
         count += 1;
     }
+    // Coalesced index maintenance for the whole statement (A1).
+    flush_index_batches(&index_batches, ctx)?;
 
     persist_pages_if_changed(table, &heap, &table_def.pages, ctx)?;
     assert_schema_stable(ctx, table, table_def.generation);

@@ -879,6 +879,168 @@ impl DiskBTree {
         Ok(())
     }
 
+    /// Batch-insert `entries` in the caller's mini-txn, **coalescing WAL** so a
+    /// leaf touched by many entries is logged **once** (a single full-page
+    /// `WAL_INDEX` image carrying all of them) instead of once per entry — the
+    /// A1 UPDATE index-maintenance win. A bulk UPDATE re-inserts each row's
+    /// *existing* key as a new version, so thousands of entries land in a few
+    /// dozen leaves; per-entry logging emits one ~8 KiB page image *per row*
+    /// (RC2), while this emits one *per leaf touched*.
+    ///
+    /// Correctness is identical to calling [`Self::insert_in_txn`] once per
+    /// entry: every `(key, rowid)` is inserted into the same sorted leaf, and a
+    /// duplicate key spanning leaves is still fully collected by `search_eq`'s
+    /// rightward walk. Only entries that fall inside a leaf's current
+    /// `[min_key, max_key]` span **and** fit without a split are coalesced; a
+    /// boundary/new key, an overflow (would split), or an unexpected shape falls
+    /// back to the proven per-entry crabbing insert. The per-leaf exclusive
+    /// latch is held across read-modify-write (re-reading under the latch, never
+    /// clobbering a concurrent split with pre-latch bytes — the `set_value`
+    /// discipline) and dropped before any fallback, so the crabbing path
+    /// acquires its own latches top-down (no lock-order cycle, deadlock-free).
+    pub fn insert_many_in_txn(
+        &self,
+        entries: &[(OrderedValue, RowId)],
+        pool: &BufferPool,
+        wal: &Wal,
+        txn_id: u64,
+        prev_lsn: &mut Lsn,
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let cap = body_capacity(self.page_size);
+        // Sort so entries destined for the same leaf are contiguous (a run).
+        let mut sorted: Vec<(OrderedValue, RowId)> = entries.to_vec();
+        sorted.sort_by_key(|(k, r)| (k.clone(), rowid_key(*r)));
+
+        let mut i = 0usize;
+        while i < sorted.len() {
+            let leaf_pid = self.find_leaf(&sorted[i].0, pool)?;
+            // Exclusive latch across read-modify-write; re-read under it so a
+            // concurrent split's bytes are never clobbered.
+            let latch = pool.latch_exclusive(leaf_pid);
+            let node = self.read_node(leaf_pid, pool)?;
+            let Node::Leaf { mut entries, next } = node else {
+                // A find_leaf result should always be a leaf; be defensive.
+                drop(latch);
+                self.insert_in_txn(
+                    sorted[i].0.clone(),
+                    sorted[i].1,
+                    pool,
+                    wal,
+                    txn_id,
+                    prev_lsn,
+                )?;
+                i += 1;
+                continue;
+            };
+            // Need a key span to test membership; an empty leaf is transient —
+            // let the crabbing path handle it.
+            let (Some(min_key), Some(max_key)) = (
+                entries.first().map(|(k, _)| k.clone()),
+                entries.last().map(|(k, _)| k.clone()),
+            ) else {
+                drop(latch);
+                self.insert_in_txn(
+                    sorted[i].0.clone(),
+                    sorted[i].1,
+                    pool,
+                    wal,
+                    txn_id,
+                    prev_lsn,
+                )?;
+                i += 1;
+                continue;
+            };
+
+            // Running body size so the fit check stays O(1) per entry.
+            let mut cur_body: usize = 7 + entries
+                .iter()
+                .map(|(k, _)| encoded_key_len(k) + ROWID_LEN)
+                .sum::<usize>();
+            let mut absorbed = 0usize;
+            let mut j = i;
+            while j < sorted.len() {
+                let (k, r) = (sorted[j].0.clone(), sorted[j].1);
+                // Only absorb keys this leaf definitively owns. A key past
+                // `max_key` may belong to a right sibling (route via find_leaf).
+                if k < min_key || k > max_key {
+                    break;
+                }
+                let probe = (k.clone(), rowid_key(r));
+                match entries.binary_search_by(|(ek, er)| (ek.clone(), rowid_key(*er)).cmp(&probe))
+                {
+                    Ok(_) => {
+                        // exact (key,rid) duplicate — a no-op, matching
+                        // insert_in_txn, but consumed by the batch.
+                        j += 1;
+                        absorbed += 1;
+                        continue;
+                    }
+                    Err(pos) => {
+                        let added = encoded_key_len(&k) + ROWID_LEN;
+                        if cur_body + added > cap {
+                            break; // would split — stop; the remainder falls through
+                        }
+                        entries.insert(pos, (k, r));
+                        cur_body += added;
+                    }
+                }
+                j += 1;
+                absorbed += 1;
+            }
+
+            if absorbed == 0 {
+                // Head entry couldn't be coalesced here (boundary or an
+                // already-full leaf) — let the crabbing insert place/split it.
+                drop(latch);
+                self.insert_in_txn(
+                    sorted[i].0.clone(),
+                    sorted[i].1,
+                    pool,
+                    wal,
+                    txn_id,
+                    prev_lsn,
+                )?;
+                i += 1;
+                continue;
+            }
+
+            // One WAL_INDEX image for every entry absorbed into this leaf.
+            let leaf = Node::Leaf { entries, next };
+            *prev_lsn = write_node(
+                pool,
+                wal,
+                txn_id,
+                *prev_lsn,
+                leaf_pid,
+                &leaf,
+                self.page_size,
+            )?;
+            drop(latch);
+            i = j;
+        }
+        Ok(())
+    }
+
+    /// [`Self::insert_many_in_txn`] wrapped in its own mini-txn.
+    pub fn insert_many(
+        &self,
+        entries: &[(OrderedValue, RowId)],
+        pool: &BufferPool,
+        wal: &Wal,
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
+        let mut prev_lsn = begin_lsn;
+        self.insert_many_in_txn(entries, pool, wal, txn_id, &mut prev_lsn)?;
+        wal.commit_mini_txn(txn_id, prev_lsn)?;
+        Ok(())
+    }
+
     /// Fetch + deserialize one node while the caller already holds its exclusive
     /// latch (Item A). The pin is dropped immediately; the caller's latch keeps
     /// the bytes stable (no other writer can be mid-mutation of a latched node),
