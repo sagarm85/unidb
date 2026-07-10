@@ -538,21 +538,7 @@ impl Heap {
         self.ensure_directory(reader)?; // FSM-backed: load the page directory
         let mut out = Vec::new();
         for page_id in self.lock_fsm().pages.clone() {
-            let page = reader.read_page(page_id)?;
-            let sc = page.slot_count_pub();
-            for slot in 0..sc {
-                // Skip line pointers a vacuum has reclaimed (DEAD/UNUSED,
-                // M10) — they carry no resolvable tuple body.
-                if !matches!(page.slot_state(slot), Ok(SlotState::Live)) {
-                    continue;
-                }
-                let th = page.tuple_header(slot)?;
-                if is_visible(th.xmin, th.xmax, snapshot, self_xid) {
-                    let row_id = RowId { page_id, slot };
-                    on_read(self_xid, row_id);
-                    out.push((row_id, page.get(slot)?.to_vec()));
-                }
-            }
+            scan_page_into(reader, page_id, snapshot, self_xid, &mut out)?;
         }
         Ok(out)
     }
@@ -579,20 +565,17 @@ impl Heap {
             if i % 256 == 0 {
                 crate::query_limits::check()?; // P5.f: timeout / cancellation
             }
-            let page = reader.read_page(page_id)?;
-            let sc = page.slot_count_pub();
-            for slot in 0..sc {
-                if !matches!(page.slot_state(slot), Ok(SlotState::Live)) {
-                    continue;
-                }
-                let th = page.tuple_header(slot)?;
-                if is_visible(th.xmin, th.xmax, snapshot, self_xid) {
-                    on_read(self_xid, RowId { page_id, slot });
-                    count += 1;
-                }
-            }
+            count += count_page_visible(reader, page_id, snapshot, self_xid)?;
         }
         Ok(count)
+    }
+
+    /// The table's current page list — the unit of work a parallel scan
+    /// partitions across workers (Milestone P). FSM-backed heaps need the
+    /// directory loaded first; a legacy heap already has its list inline.
+    pub fn scan_pages<P: PageReader>(&self, reader: &P) -> Result<Vec<PageId>> {
+        self.ensure_directory(reader)?;
+        Ok(self.lock_fsm().pages.clone())
     }
 
     // ── FSM ──────────────────────────────────────────────────────────────────
@@ -823,6 +806,61 @@ impl Heap {
         }
         Ok(reclaimed)
     }
+}
+
+/// Append every tuple on `page_id` visible to `snapshot` into `out` as
+/// `(RowId, body bytes)`. The per-page core of [`Heap::scan`], extracted so a
+/// **parallel** scan worker (Milestone P) can run it on its own page slice with
+/// a `Send + Sync` reader while sharing the exact visibility rule. Reads an
+/// owned page copy under the mmap read-lock (safe across concurrent writers and
+/// remaps), so it needs no `&Heap`/FSM lock.
+pub(crate) fn scan_page_into<P: PageReader>(
+    reader: &P,
+    page_id: PageId,
+    snapshot: &Snapshot,
+    self_xid: Xid,
+    out: &mut Vec<(RowId, Vec<u8>)>,
+) -> Result<()> {
+    let page = reader.read_page(page_id)?;
+    let sc = page.slot_count_pub();
+    for slot in 0..sc {
+        // Skip line pointers a vacuum has reclaimed (DEAD/UNUSED, M10).
+        if !matches!(page.slot_state(slot), Ok(SlotState::Live)) {
+            continue;
+        }
+        let th = page.tuple_header(slot)?;
+        if is_visible(th.xmin, th.xmax, snapshot, self_xid) {
+            let row_id = RowId { page_id, slot };
+            on_read(self_xid, row_id);
+            out.push((row_id, page.get(slot)?.to_vec()));
+        }
+    }
+    Ok(())
+}
+
+/// Count the tuples on `page_id` visible to `snapshot` via the tuple headers
+/// only — the per-page core of [`Heap::count_visible`], extracted for the
+/// parallel `COUNT(*)` path (Milestone P). No body decode.
+pub(crate) fn count_page_visible<P: PageReader>(
+    reader: &P,
+    page_id: PageId,
+    snapshot: &Snapshot,
+    self_xid: Xid,
+) -> Result<usize> {
+    let page = reader.read_page(page_id)?;
+    let sc = page.slot_count_pub();
+    let mut count = 0usize;
+    for slot in 0..sc {
+        if !matches!(page.slot_state(slot), Ok(SlotState::Live)) {
+            continue;
+        }
+        let th = page.tuple_header(slot)?;
+        if is_visible(th.xmin, th.xmax, snapshot, self_xid) {
+            on_read(self_xid, RowId { page_id, slot });
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 /// Encode a versioned-INSERT WAL redo payload: `[xmin:8][prev_page:4][prev_slot:2][payload]`.

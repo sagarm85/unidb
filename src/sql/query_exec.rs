@@ -252,8 +252,21 @@ impl Runner<'_, '_> {
                             table_def.fsm_meta,
                             table_def.pages.clone(),
                         );
-                        let count =
-                            heap.count_visible(&self.snapshot, self.ctx.xid, self.ctx.pool)?;
+                        // P-a: parallelize the count across worker threads when
+                        // the table is large enough (else the serial header scan).
+                        let pages = heap.scan_pages(self.ctx.pool)?;
+                        let count = match crate::sql::parallel_scan::degree_for(pages.len()) {
+                            Some(degree) => crate::sql::parallel_scan::parallel_count(
+                                &pages,
+                                &self.ctx.pool.shared_reader(),
+                                &self.snapshot,
+                                self.ctx.xid,
+                                degree,
+                            )?,
+                            None => {
+                                heap.count_visible(&self.snapshot, self.ctx.xid, self.ctx.pool)?
+                            }
+                        };
                         let row = vec![Literal::Int(count as i64); aggs.len()];
                         return Ok(Batch {
                             schema: output.clone(),
@@ -325,6 +338,33 @@ impl Runner<'_, '_> {
             table_def.fsm_meta,
             table_def.pages.clone(),
         );
+        let decode_visible = |bytes: &[u8]| -> Result<Option<Vec<Literal>>> {
+            Ok(Some(visible_row(
+                &decode_row(bytes, &table_def.columns)?,
+                &table_def,
+            )))
+        };
+
+        // P-b: parallelize the base scan across worker threads when the table is
+        // large (Milestone P). This is the scan feeding Filter/Aggregate — the
+        // Table 3.1 `COUNT(*) WHERE …` / grouped-scan hot path. A base Scan is
+        // unordered (any `ORDER BY` is a Sort node above), so concat is correct.
+        let pages = heap.scan_pages(self.ctx.pool)?;
+        if let Some(degree) = crate::sql::parallel_scan::degree_for(pages.len()) {
+            let (rows, _ids) = crate::sql::parallel_scan::parallel_filter_project(
+                &pages,
+                &self.ctx.pool.shared_reader(),
+                &self.snapshot,
+                self.ctx.xid,
+                degree,
+                &|_rid, bytes| decode_visible(bytes),
+            )?;
+            return Ok(Batch {
+                schema: output.to_vec(),
+                rows,
+            });
+        }
+
         let mut rows = Vec::new();
         for (i, (_, bytes)) in heap
             .scan(&self.snapshot, self.ctx.xid, self.ctx.pool)?
@@ -336,8 +376,9 @@ impl Runner<'_, '_> {
             if i % 1024 == 0 {
                 crate::query_limits::check()?;
             }
-            let full = decode_row(&bytes, &table_def.columns)?;
-            rows.push(visible_row(&full, &table_def));
+            if let Some(row) = decode_visible(&bytes)? {
+                rows.push(row);
+            }
         }
         Ok(Batch {
             schema: output.to_vec(),
