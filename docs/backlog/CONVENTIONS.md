@@ -4,30 +4,34 @@
 > **all new work** and when you touch an existing backlog file. Referenced from
 > `CLAUDE.md` §9; the roadmap of *numbered* phases lives in `roadmap.md`.
 
-There are four kinds of work. Pick one before you create the file.
+There are four kinds of work. Pick one before you create the file. **Every new
+file is numbered `NN_<slug>.md`** (the next free ID in [`README.md`](README.md)),
+whatever its type — the `Type` is declared in the header, not the filename.
 
-| Type | What it is | Filename | Tracked in |
-|------|------------|----------|------------|
-| **Phase** | A **numbered** item on the roadmap (large, sequenced) | `phase<N>_<slug>.md` | `roadmap.md` + `PROGRESS.md` |
-| **Milestone** | A large, independently-shippable **named** unit *not* on the numbered roadmap (its own design doc + PR(s)) | `<slug>.md` | `PROGRESS.md` |
-| **Improvement** | A targeted feature / behavior / correctness change | `<slug>.md` | `PROGRESS.md` |
-| **Performance** | A perf-focused effort measured against a baseline | `<slug>.md` | `PROGRESS.md` |
+| Type | What it is | Tracked in |
+|------|------------|------------|
+| **Phase** | A **numbered** item on the roadmap (large, sequenced) | `roadmap.md` + `PROGRESS.md` |
+| **Milestone** | A large, independently-shippable **named** unit *not* on the numbered roadmap (its own design doc + PR(s)) | `PROGRESS.md` |
+| **Improvement** | A targeted feature / behavior / correctness change | `PROGRESS.md` |
+| **Performance** | A perf-focused effort measured against a baseline | `PROGRESS.md` |
 
 ## Filename rule (the thing that was inconsistent)
 
-- **`phase<N>_` is RESERVED for numbered roadmap phases** (`phase1_acid_hardening.md`
-  … `phase6_ops_ha.md`). `<N>` is the roadmap number; `<slug>` is a short
-  `snake_case` description.
-- **Every other file uses a plain descriptive `snake_case` slug — no `phase` in
-  the name.** e.g. `parallel_scan.md`, `autovacuum.md`, `crud_performance.md`,
-  `commit_time_fsync.md`.
-- **Never encode internal sub-parts in the filename.** A Performance/Milestone
-  effort with sub-stages names them *inside* the doc — "Phase A / Phase B",
-  "checkpoints A1 / B2", "P-a / P-b" — not `..._phaseA_B.md`. (This is exactly why
-  `crud_performance_phaseA_B.md` was renamed to `crud_performance.md`: it is
-  *Performance* work with internal Phase A/B stages, not a numbered roadmap phase.)
-- Meta docs keep bare names: `roadmap.md`, `CONVENTIONS.md`,
-  `engine_internals_doc_prompt.md`.
+- **New backlog files are numbered: `NN_<slug>.md`** — `NN` is the **next free
+  number in [`README.md`](README.md)** (the backlog index), a **stable ID assigned
+  once and never renumbered** (so links stay valid; priority/order lives in the
+  index's *Next up* section, not the number). `<slug>` is a short `snake_case`
+  description — **no `phase` in it, and no internal sub-parts** (name "Phase A/B",
+  "checkpoints A1/B2", "P-a/P-b" *inside* the doc, never `..._phaseA_B.md`).
+- **Register every new file in [`README.md`](README.md)** (# / title / type /
+  status) — that index is the single at-a-glance pending-vs-completed tracker and
+  where the next number comes from.
+- **Existing files keep their current (un-numbered) names** — the index maps them
+  to numbers; don't rename them. The historical `phase<N>_` files keep their names
+  (`<N>` there is the roadmap phase number); `phase<N>_` is not a prefix for *new*
+  files (use `NN_<slug>.md`).
+- Meta docs stay unnumbered with bare names: `README.md`, `roadmap.md`,
+  `CONVENTIONS.md`, `engine_internals_doc_prompt.md`.
 
 ## Header (every backlog file starts with this)
 
