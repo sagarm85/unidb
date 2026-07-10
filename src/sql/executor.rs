@@ -1059,6 +1059,37 @@ fn try_exec_select_btree(
     let (full_needed, full_upto) = needed_mask(&full_cols, ncols);
     let has_pred = predicate.is_some();
 
+    // The B2 two-phase decode as a closure, shared by the serial and parallel
+    // candidate-resolution paths.
+    let per_candidate = |bytes: &[u8]| -> Result<Option<Vec<Literal>>> {
+        if has_pred {
+            let prow = deform_row(bytes, cols, pred_upto, &pred_needed)?;
+            if !predicate_matches(predicate, cols, &prow)? {
+                return Ok(None);
+            }
+        }
+        let row = deform_row(bytes, cols, full_upto, &full_needed)?;
+        Ok(Some(project_row(projection, cols, &row)?))
+    };
+
+    // Parallelize resolution across worker threads when the candidate list is
+    // large (Milestone P follow-up — the filtered-SELECT gap). Order is
+    // unspecified (no `ORDER BY` here), so concat is correct.
+    if let Some(degree) = crate::sql::parallel_scan::degree_for(candidate_ids.len()) {
+        let rows = crate::sql::parallel_scan::parallel_resolve_candidates(
+            &candidate_ids,
+            &ctx.pool.shared_reader(),
+            &snapshot,
+            ctx.xid,
+            degree,
+            &|_rid, bytes| per_candidate(bytes),
+        )?;
+        return Ok(Some(ExecResult::Rows {
+            columns: output_columns(projection, &table_def.columns),
+            rows,
+        }));
+    }
+
     let mut out = Vec::new();
     for row_id in candidate_ids {
         let bytes = match heap.get(row_id, &snapshot, ctx.xid, ctx.pool) {
@@ -1066,14 +1097,9 @@ fn try_exec_select_btree(
             Err(DbError::NoVisibleVersion { .. }) => continue,
             Err(e) => return Err(e),
         };
-        if has_pred {
-            let prow = deform_row(&bytes, cols, pred_upto, &pred_needed)?;
-            if !predicate_matches(predicate, cols, &prow)? {
-                continue;
-            }
+        if let Some(row) = per_candidate(&bytes)? {
+            out.push(row);
         }
-        let row = deform_row(&bytes, cols, full_upto, &full_needed)?;
-        out.push(project_row(projection, cols, &row)?);
     }
     Ok(Some(ExecResult::Rows {
         columns: output_columns(projection, &table_def.columns),
