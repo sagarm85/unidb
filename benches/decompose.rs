@@ -1385,6 +1385,232 @@ fn bench_hiconc() {
     println!("\n########## END HIGH-SCALE CONCURRENCY EXPERIMENT ##########");
 }
 
+// ============ Multi-model at-scale report (UNIDB_BENCH=mmreport) =============
+//
+// A self-contained report generator: the W0→W4 decomposition ladder pre-grown to
+// increasing table sizes, so the question "does the ~1.2× multi-model tax hold at
+// scale?" is answered by measurement, not reasoning. Emits a complete markdown
+// body (definitions + tables + caveats); `scripts/multi_model_report.sh` wraps it
+// with a machine/date/RSS header and writes the file. Driven by `scripts/`, but a
+// bare `UNIDB_BENCH=mmreport` run prints the same body to stdout.
+
+/// One ladder point: a fresh engine carrying `rung`'s full schema, pre-grown to
+/// `size` rows at that rung (batched commits), then the marginal **ms per durable
+/// commit** measured over `sample` further single-row transactions AT that size.
+/// Every commit is one group-coalesced fsync (deferred-sync), so the number is the
+/// per-commit cost the async-derivation design targets — not a bulk-load average.
+fn mm_ladder_point(rung: u8, size: u64, sample: u64) -> f64 {
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
+    engine.set_deferred_sync(true); // group commit: one fsync per commit
+    let setup = engine.begin().unwrap();
+    let create = if rung >= 2 {
+        "CREATE TABLE t (id INT, body TEXT, embedding VECTOR(128))"
+    } else {
+        "CREATE TABLE t (id INT, body TEXT)"
+    };
+    engine.execute_sql(setup, create).unwrap();
+    if rung >= 1 {
+        engine
+            .execute_sql(setup, "CREATE INDEX ib ON t USING BTREE (id)")
+            .unwrap();
+    }
+    if rung >= 2 {
+        engine
+            .execute_sql(setup, "CREATE INDEX iv ON t USING HNSW (embedding)")
+            .unwrap();
+    }
+    engine.commit(setup).unwrap();
+    if rung >= 4 {
+        engine.enable_events("t").unwrap(); // inserts now auto-capture events
+    }
+    let ins = if rung >= 2 {
+        engine
+            .prepare("INSERT INTO t (id, body, embedding) VALUES ($1, $2, $3)")
+            .unwrap()
+    } else {
+        engine
+            .prepare("INSERT INTO t (id, body) VALUES ($1, $2)")
+            .unwrap()
+    };
+    let do_row = |xid: u64, i: u64| {
+        let mut params = vec![Literal::Int(i as i64), Literal::Text(format!("b{i}"))];
+        if rung >= 2 {
+            params.push(Literal::Vector(embedding(i)));
+        }
+        engine.execute_prepared(xid, &ins, &params).unwrap();
+        if rung >= 3 {
+            engine
+                .create_edge(xid, i as i64, (i as i64) + 1, "rel", "{}")
+                .unwrap();
+        }
+    };
+    // Pre-grow (batched — not timed).
+    let mut x = engine.begin().unwrap();
+    for i in 0..size {
+        do_row(x, i);
+        if (i + 1) % 2_000 == 0 {
+            engine.commit(x).unwrap();
+            x = engine.begin().unwrap();
+        }
+    }
+    engine.commit(x).unwrap();
+    // Measure marginal per-commit cost at this size.
+    let start = Instant::now();
+    for j in 0..sample {
+        let xid = engine.begin().unwrap();
+        do_row(xid, size + j);
+        engine.commit(xid).unwrap();
+    }
+    start.elapsed().as_secs_f64() * 1000.0 / sample as f64
+}
+
+fn bench_mm_report() {
+    let sizes: Vec<u64> = std::env::var("MM_SIZES")
+        .ok()
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![1_000, 10_000, 100_000]);
+    let sample = env_u64("MM_SAMPLE", 200);
+    let url = pg_url();
+
+    println!("## What this measures (self-contained — no other docs needed)\n");
+    println!(
+        "The **W0→W4 decomposition ladder**: one durable transaction, adding one data\n\
+         model at a time, so the multi-model write tax is read by subtraction. Every\n\
+         commit is one group-coalesced `F_FULLFSYNC` (matched durability). The number\n\
+         reported is **marginal ms per durable commit** at each pre-grown table size\n\
+         (`MM_SAMPLE={sample}` commits averaged; pre-grow not timed).\n"
+    );
+    println!("| Rung | What the single transaction does |");
+    println!("|------|----------------------------------|");
+    println!("| **W0** | plain relational row INSERT (WAL + heap + fsync) |");
+    println!("| **W1** | W0 + a B-tree secondary index entry |");
+    println!("| **W2** | W1 + a `VECTOR(128)` value + its ANN index (HNSW) |");
+    println!("| **W3** | W2 + a graph edge + adjacency-index maintenance |");
+    println!("| **W4** | W3 + event-queue capture — **the full four-model commit** |");
+    println!(
+        "\n`W4−W0` is the total multi-model tax; `W4/W0` is the multiplier. The thesis:\n\
+         one shared fsync makes W4 ≈ W0 (not N×), and it should stay that way as rows\n\
+         grow. A rising `W4/W0` means per-model index CPU (esp. HNSW) is eroding it.\n"
+    );
+
+    // ---- Table 1: cost vs size, and collect for Table 2 ----
+    println!("## Table 1 — Multi-model commit cost vs table size (ms/commit)\n");
+    println!("| rows | W0 | W1 | W2 | W3 | W4 | W4−W0 | W4/W0 |");
+    println!("|-----:|---:|---:|---:|---:|---:|------:|------:|");
+    let mut all: Vec<(u64, [f64; 5])> = Vec::new();
+    for &size in &sizes {
+        eprintln!("[mmreport] ladder at {size} rows…");
+        let mut w = [0.0f64; 5];
+        for (r, wr) in w.iter_mut().enumerate() {
+            *wr = mm_ladder_point(r as u8, size, sample);
+        }
+        println!(
+            "| {} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2}× |",
+            size,
+            w[0],
+            w[1],
+            w[2],
+            w[3],
+            w[4],
+            w[4] - w[0],
+            w[4] / w[0]
+        );
+        all.push((size, w));
+    }
+
+    // ---- Table 2: per-model marginal deltas ----
+    println!("\n## Table 2 — Per-model marginal maintenance vs size (ms added per commit)\n");
+    println!("| rows | Δ btree (W1−W0) | Δ vector (W2−W1) | Δ edge (W3−W2) | Δ event (W4−W3) |");
+    println!("|-----:|----------------:|-----------------:|---------------:|----------------:|");
+    for (size, w) in &all {
+        println!(
+            "| {} | {:+.2} | {:+.2} | {:+.2} | {:+.2} |",
+            size,
+            w[1] - w[0],
+            w[2] - w[1],
+            w[3] - w[2],
+            w[4] - w[3]
+        );
+    }
+    println!(
+        "\n*(small-size deltas are near-noise — every rung sits within a few hundred µs\n\
+         of the fsync floor; the vector column is the one expected to separate as rows\n\
+         grow, since HNSW insert is O(log n) distance computations.)*\n"
+    );
+
+    // ---- Table 3: single-model relational vs Postgres (measured, PG_URL-gated) ----
+    println!("## Table 3 — Single-model relational: unidb vs Postgres (concurrent, commits/sec)\n");
+    println!(
+        "The honest apples-to-apples peer workload (plain INSERT), the only rung\n\
+         Postgres can run. W2–W4 have **no Postgres column by design** — Postgres\n\
+         cannot do a vector / graph / event write in the same transaction (that is the\n\
+         whole point; see Table 4).\n"
+    );
+    let pg_method = url.as_deref().and_then(pg_ensure_lens);
+    if let Some(ref m) = pg_method {
+        println!("_Postgres durability lens: `wal_sync_method={m}` (reset to default after)._\n");
+        println!("| writers | unidb_sql | postgres |");
+        println!("|--------:|----------:|---------:|");
+        let per = 1_000usize;
+        let u = url.as_deref().unwrap();
+        pg_build_table(u, "mm", 100_000, false);
+        let sdir = tempdir().unwrap();
+        let se = Arc::new(Engine::open(sdir.path(), 0).unwrap());
+        se.set_deferred_sync(true);
+        build_sql_table(&se, 100_000, 96, false);
+        let mut idb = 1_000_000_000i64;
+        for &n in &[1usize, 4, 8] {
+            let s = measure_sql_writers(&se, n, per, idb);
+            let p = pg_measure_table(u, "mm", n, per, idb).unwrap_or(0.0);
+            idb += (n * per) as i64;
+            println!("| {} | {:.0} | {:.0} |", n, s, p);
+        }
+        pg_reset_lens(u);
+    } else {
+        println!("_`PG_URL` unset → Postgres column skipped. Set it (superuser conn) to fill this table:_");
+        println!("_`PG_URL=\"host=/tmp port=5432 user=<you> dbname=postgres\"`._\n");
+    }
+
+    // ---- Table 4: the replaced-stack framing ----
+    let (last_size, last_w) = all.last().copied().unwrap_or((0, [0.0; 5]));
+    println!("\n## Table 4 — One atomic transaction vs the replaced stack (the moat)\n");
+    println!(
+        "The comparison that matters is **not** unidb-multi-model vs unidb-single-model\n\
+         — it is unidb's one transaction vs the **stack you would otherwise run**\n\
+         (Postgres + a vector store + a graph DB + a queue) with app glue and no shared\n\
+         transaction. That stack pays a separate durable sync and round-trip per system\n\
+         and cannot roll back atomically.\n"
+    );
+    println!("| metric | unidb (1 txn) | PG + vector + graph + queue (4 systems) |");
+    println!("|--------|--------------:|----------------------------------------:|");
+    println!("| durable syncs / commit | **1** | 4 |");
+    println!("| network round-trips | 0 (embedded) | 4 |");
+    println!("| atomic rollback across models | **yes** | no |");
+    println!(
+        "| ms per multi-model write | **{:.2}** (measured @ {} rows) | ~15–20 (est., 4 systems) |",
+        last_w[4], last_size
+    );
+    println!(
+        "\n*(the four external systems are not wired here — that headline is the standing\n\
+         CLAUDE.md §6 follow-up; the unidb cell is measured, the stack cell is an\n\
+         estimate of 4 independent durable round-trips.)*\n"
+    );
+
+    // ---- Caveats ----
+    println!("## Caveats\n");
+    println!(
+        "- Single node, macOS `F_FULLFSYNC`, group-commit on. The per-commit floor is\n\
+         this storage's fsync latency.\n\
+         - Sizes swept: `{sizes:?}` (`MM_SIZES` to override — e.g. millions). W2–W4 build\n\
+         the ANN/graph indexes synchronously, so large pre-grows are slow **by design**\n\
+         — that cost is exactly what the async-derivation design (parked) would move off\n\
+         the commit path if `W4/W0` is seen rising.\n\
+         - Marginal-commit sample = {sample} (`MM_SAMPLE`); numbers carry a few-percent\n\
+         noise, the *trend across sizes* is the signal.\n"
+    );
+}
+
 fn main() {
     // `UNIDB_BENCH` selects a subset so a single section can be re-run quickly
     // (e.g. the durable-FSM B-accept re-runs just B3/B4 before vs after without
@@ -1415,6 +1641,10 @@ fn main() {
         }
         "hiconc" => {
             bench_hiconc();
+            return;
+        }
+        "mmreport" => {
+            bench_mm_report();
             return;
         }
         _ => {}
