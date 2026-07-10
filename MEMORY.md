@@ -12,8 +12,8 @@
 
 ## Current status
 
-- **CRUD performance — Phase A (write path) — SHIPPED (2026-07-10), branch
-  `crud-perf-phaseA`, PR pending.** Closes the Table-3 UPDATE-bulk CRUD-stress
+- **CRUD performance — Phase A (write path) — SHIPPED (2026-07-10), merged to
+  `main` via PR #34 (`e6fd0cb`).** Closes the Table-3 UPDATE-bulk CRUD-stress
   gap vs matched-durability Postgres 18.4. **Headline: UPDATE bulk 0.11× →
   0.34×** (3.3× faster) by collapsing index-maintenance WAL **8868 → 619 B/row
   (14×)**; DELETE selected no regression; INSERT/SELECT untouched; crash harness
