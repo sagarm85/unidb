@@ -22,7 +22,7 @@ use std::sync::{Mutex, Once};
 use crate::bufferpool::SharedPageReader;
 use crate::error::{DbError, Result};
 use crate::format::{PageId, Xid};
-use crate::heap::{count_page_visible, scan_page_into, RowId};
+use crate::heap::{count_page_visible, get_visible, scan_page_into, RowId};
 use crate::mvcc::Snapshot;
 use crate::sql::logical::Literal;
 
@@ -134,6 +134,76 @@ pub fn parallel_count(
         return Err(e);
     }
     Ok(total.load(Ordering::Relaxed))
+}
+
+/// Parallel index-candidate resolution: partition a B-tree/index candidate
+/// `RowId` list across `degree` workers, each resolving its slice
+/// (`get_visible` → `per_candidate` = the B2 deform + predicate re-check +
+/// project) and keeping the survivors; gather = **concat** (order-agnostic —
+/// the caller has no `ORDER BY`). This is the filtered-`SELECT` hot path: a range
+/// predicate is served by the index, so the query is a *candidate* list to
+/// resolve (random `heap.get` + `body` decode per row), not a page scan — and
+/// that per-candidate work parallelizes just like the page scan does.
+pub fn parallel_resolve_candidates<F>(
+    candidates: &[RowId],
+    reader: &SharedPageReader,
+    snapshot: &Snapshot,
+    self_xid: Xid,
+    degree: usize,
+    per_candidate: &F,
+) -> Result<Vec<Vec<Literal>>>
+where
+    F: Fn(RowId, &[u8]) -> Result<Option<Vec<Literal>>> + Sync,
+{
+    let cursor = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let err: Mutex<Option<DbError>> = Mutex::new(None);
+    let parts: Mutex<Vec<Vec<Vec<Literal>>>> = Mutex::new(Vec::new());
+
+    std::thread::scope(|s| {
+        for _ in 0..degree {
+            let reader = reader.clone();
+            let (cursor, stop, err, parts, candidates) = (&cursor, &stop, &err, &parts, candidates);
+            s.spawn(move || {
+                let mut rows: Vec<Vec<Literal>> = Vec::new();
+                while !stop.load(Ordering::Relaxed) {
+                    let i = cursor.fetch_add(1, Ordering::Relaxed);
+                    if i >= candidates.len() {
+                        break;
+                    }
+                    let rid = candidates[i];
+                    let bytes = match get_visible(&reader, rid, snapshot, self_xid) {
+                        Ok(Some(b)) => b,
+                        Ok(None) => continue, // superseded / vacuumed / uncommitted hint
+                        Err(e) => {
+                            *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                            stop.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    };
+                    match per_candidate(rid, &bytes) {
+                        Ok(Some(row)) => rows.push(row),
+                        Ok(None) => {}
+                        Err(e) => {
+                            *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                            stop.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
+                parts.lock().unwrap_or_else(|p| p.into_inner()).push(rows);
+            });
+        }
+    });
+
+    if let Some(e) = err.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        return Err(e);
+    }
+    let mut all_rows = Vec::new();
+    for rows in parts.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        all_rows.extend(rows);
+    }
+    Ok(all_rows)
 }
 
 /// Parallel filtered `COUNT(*)` — **partial aggregate** (Milestone P follow-up):

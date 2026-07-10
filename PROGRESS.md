@@ -3726,3 +3726,36 @@ with the toggle **forced on**; clippy/fmt clean.
 (filed):** `SUM`/`AVG`/`GROUP BY` partial aggregate (only `COUNT(*)` is pushed so
 far); `LIMIT` early-stop; `exec_select_readonly` (server) parallelism; a
 visibility-map fast count. **Locked-decision changes:** none.
+
+## Milestone P follow-up — parallel filtered SELECT   [SHIPPED]   2026-07-11
+
+**PR:** _pending_ — branch `parallel-index-select`
+**Summary:** Closes the worst remaining ÷PG gap the suite still had — **filtered
+`SELECT … WHERE k …` at ~0.14× vs Postgres**. It routes through the B-tree
+index-candidate path (`try_exec_select_btree`), which resolved candidates
+**serially** (random `heap.get` + `body` decode per row); that per-candidate work
+now partitions across worker threads, the same way the page scan does. Read-only;
+crash harness stays 29; no `FORMAT_VERSION` bump; default-off toggle.
+
+**Benchmark** (release, native macOS 26.4, Apple M5 Pro — **18 cores**; 500k-row
+indexed table, `SELECT id, body FROM t WHERE k >= 250000`, returns 250k rows):
+
+| | serial | parallel | speedup |
+|---|--------|----------|---------|
+| filtered `SELECT id, body WHERE k ≥ …` | 995k rec/s | **6,385k rec/s** | **6.41×** |
+
+**What changed:**
+- `src/heap.rs` — extracted `get_visible` (per-`RowId` visibility resolve, the
+  core of `Heap::get`, which now delegates) so a worker resolves candidates with a
+  `Send + Sync` reader, no `&Heap`.
+- `src/sql/parallel_scan.rs` — `parallel_resolve_candidates`: partition the
+  candidate `RowId` list (shared cursor), each worker `get_visible` + the caller's
+  B2 per-row closure (deform + predicate re-check + project), concat.
+- `src/sql/executor.rs` — `try_exec_select_btree` takes the parallel path when the
+  candidate count clears the threshold; the serial loop is byte-for-byte unchanged
+  with the toggle off.
+
+**Crash harness:** **29** (unchanged — read-only). **Tests:** `tests/parallel_scan.rs`
+gains an index-served filtered-`SELECT` case (parallel matches serial as a set,
+same `build` table now has a B-tree on `k`); full lib (373) green with the toggle
+**forced on**; clippy/fmt clean. **Locked-decision changes:** none.

@@ -12,6 +12,17 @@
 
 ## Current status
 
+- **Milestone P follow-up — parallel filtered SELECT — SHIPPED (2026-07-11),
+  branch `parallel-index-select`, PR pending.** Closes the worst remaining ÷PG
+  gap: filtered `SELECT … WHERE k …` (~0.14× vs PG) routes through the B-tree
+  index-candidate path (`try_exec_select_btree`), which resolved candidates
+  serially (random `heap.get` + `body` decode per row) — now the candidate
+  `RowId` list is partitioned across workers (`parallel_resolve_candidates`;
+  `heap::get_visible` extracted so a worker resolves with a Send+Sync reader).
+  **Measured: 6.41×** (500k rows, `SELECT id,body WHERE k>=250000`: 995k → 6.4M
+  rec/s). Read-only; crash 29; default-off toggle. `tests/parallel_scan.rs` now
+  has an index-served filtered-SELECT case. Full detail in `PROGRESS.md`'s
+  "Milestone P follow-up — parallel filtered SELECT" entry.
 - **Milestone P — parallel scan workers — SHIPPED (2026-07-10), branch
   `parallel-scan`, PR pending.** Partitions a table's pages across
   `std::thread::scope` workers (NOT tokio — §4) reading the shared mmap.
@@ -2722,6 +2733,19 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-11 — Parallel filtered SELECT, branch `parallel-index-select`
+
+Milestone P follow-up. Commit `78f63a1`. After PR #37 merged, picked the *honest*
+highest-value remainder — **not** SUM/GROUP BY (I'd over-stated its ROI; GROUP BY
+is already ~0.8–0.9× vs PG), but the filtered `SELECT` which was still the worst
+÷PG in the suite (~0.14×). It routes through `try_exec_select_btree`'s serial
+candidate loop; parallelized it via `parallel_resolve_candidates` (partition the
+candidate RowIds) + `heap::get_visible` (extracted per-RowId resolve). **6.41×**
+at 500k rows. Same primitive shape as the filtered COUNT that got 6.6× — the B2
+per-row closure reused directly. Read-only; crash 29; default-off. Lesson
+reinforced: re-check ROI honestly before grinding the thing you named earlier
+(see [[critical-architect-review]]).
 
 ### 2026-07-10 — Milestone P: parallel scan workers, branch `parallel-scan`
 

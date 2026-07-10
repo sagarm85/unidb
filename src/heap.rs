@@ -288,26 +288,12 @@ impl Heap {
         self_xid: Xid,
         reader: &P,
     ) -> Result<Vec<u8>> {
-        let page = reader.read_page(row_id.page_id)?;
-        // A slot vacuum has reclaimed (DEAD/UNUSED, M10) resolves to "no
-        // visible version" under any snapshot, not a hard error — a stale
-        // secondary-index candidate pointing at a reclaimed slot is filtered
-        // out here exactly like a superseded version.
-        if !matches!(page.slot_state(row_id.slot), Ok(SlotState::Live)) {
-            return Err(DbError::NoVisibleVersion {
+        match get_visible(reader, row_id, snapshot, self_xid)? {
+            Some(bytes) => Ok(bytes),
+            None => Err(DbError::NoVisibleVersion {
                 page_id: row_id.page_id,
                 slot: row_id.slot,
-            });
-        }
-        let th = page.tuple_header(row_id.slot)?;
-        if is_visible(th.xmin, th.xmax, snapshot, self_xid) {
-            on_read(self_xid, row_id);
-            Ok(page.get(row_id.slot)?.to_vec())
-        } else {
-            Err(DbError::NoVisibleVersion {
-                page_id: row_id.page_id,
-                slot: row_id.slot,
-            })
+            }),
         }
     }
 
@@ -836,6 +822,34 @@ pub(crate) fn scan_page_into<P: PageReader>(
         }
     }
     Ok(())
+}
+
+/// Resolve one `RowId` to its body bytes if the version there is visible to
+/// `snapshot`, else `Ok(None)` (superseded, deleted, vacuumed, or never
+/// committed — e.g. a stale secondary-index candidate). The core of
+/// [`Heap::get`], extracted so a **parallel** index-candidate resolver
+/// (`parallel_resolve_candidates`, Milestone P) can call it on its own candidate
+/// slice with a `Send + Sync` reader. Needs no `&Heap` (reads an owned page copy
+/// under the mmap read-lock).
+pub(crate) fn get_visible<P: PageReader>(
+    reader: &P,
+    row_id: RowId,
+    snapshot: &Snapshot,
+    self_xid: Xid,
+) -> Result<Option<Vec<u8>>> {
+    let page = reader.read_page(row_id.page_id)?;
+    // A slot a vacuum reclaimed (DEAD/UNUSED, M10) resolves to "no visible
+    // version" under any snapshot, exactly like a superseded version.
+    if !matches!(page.slot_state(row_id.slot), Ok(SlotState::Live)) {
+        return Ok(None);
+    }
+    let th = page.tuple_header(row_id.slot)?;
+    if is_visible(th.xmin, th.xmax, snapshot, self_xid) {
+        on_read(self_xid, row_id);
+        Ok(Some(page.get(row_id.slot)?.to_vec()))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Count the tuples on `page_id` visible to `snapshot` via the tuple headers

@@ -49,6 +49,11 @@ fn build(engine: &Arc<Engine>) {
     engine
         .execute_sql(x, "CREATE TABLE t (id INT, k INT, body TEXT)")
         .unwrap();
+    // A B-tree on k so a `WHERE k >= …` SELECT routes through the index-candidate
+    // path (`try_exec_select_btree`) — the filtered-SELECT parallel path.
+    engine
+        .execute_sql(x, "CREATE INDEX t_k ON t USING BTREE (k)")
+        .unwrap();
     engine.commit(x).unwrap();
     let ins = engine
         .prepare("INSERT INTO t (id, k, body) VALUES ($1, $2, $3)")
@@ -88,6 +93,8 @@ fn parallel_scan_matches_serial() {
     let s_count = count(&engine, "SELECT COUNT(*) FROM t");
     let s_all = select(&engine, "SELECT id FROM t");
     let s_grouped_count = count(&engine, "SELECT COUNT(*) FROM t WHERE body <> 'x'");
+    // Index-served filtered SELECT (the `try_exec_select_btree` candidate path).
+    let s_filtered = select(&engine, "SELECT id FROM t WHERE k >= 2000");
 
     // Parallel on, threshold 1 so a multi-page table always engages it.
     engine.set_parallel_scan(true);
@@ -95,6 +102,7 @@ fn parallel_scan_matches_serial() {
     let p_count = count(&engine, "SELECT COUNT(*) FROM t");
     let p_all = select(&engine, "SELECT id FROM t");
     let p_grouped_count = count(&engine, "SELECT COUNT(*) FROM t WHERE body <> 'x'");
+    let p_filtered = select(&engine, "SELECT id FROM t WHERE k >= 2000");
 
     assert_eq!(s_count, ROWS, "serial count");
     assert_eq!(p_count, s_count, "parallel COUNT(*) matches serial");
@@ -108,6 +116,11 @@ fn parallel_scan_matches_serial() {
         "parallel filtered COUNT (base-scan path) matches serial"
     );
     assert_eq!(s_grouped_count, ROWS);
+    assert_eq!(
+        p_filtered, s_filtered,
+        "parallel index-candidate SELECT matches serial (as a set)"
+    );
+    assert_eq!(s_filtered.len() as i64, ROWS - 2000);
 }
 
 /// A parallel scan running **while a writer mutates the same table** must never
