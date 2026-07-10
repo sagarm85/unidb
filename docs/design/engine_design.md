@@ -1103,11 +1103,13 @@ a table's pages are partitioned across `std::thread::scope` workers (not tokio,
 flagged does not exist** — unidb is mmap-as-storage (`Frame` = eviction metadata
 only; `write_page` writes into the mmap; `read_page` returns an owned copy under
 the read-lock), so a worker always sees committed data. Result: unfiltered
-`SELECT COUNT(*)` **3.82× faster** in parallel (1M rows, 18 cores). Read-only, so
-the crash harness is unchanged. **Remaining read-path debt (deferred):** the
-*filtered* scan is only 1.59× (only the base Scan is parallel; Filter+Aggregate
-are a serial Amdahl tail) — **partial aggregate** (push predicate+count into
-workers) is the lever, filed in `parallel_scan.md`; `query_exec` scan projection
+`SELECT COUNT(*)` **3.82× faster** in parallel, and filtered `COUNT(*) WHERE …`
+**6.6× faster** via **partial aggregate** (the whole scan→filter→count runs in the
+workers via `parallel_count_matching` + a `QExpr::has_subquery` gate; Postgres's
+lead +540% → +82%) — all at 1M rows, 18 cores. Read-only, so the crash harness is
+unchanged. **Remaining read-path debt (deferred):** `SUM`/`GROUP BY` partial
+aggregate + `LIMIT` early-stop (only `COUNT(*)` is pushed into workers so far);
+`query_exec` scan projection
 needs planner column pruning; a **visibility map** / index-only scan is the true
 COUNT accelerator at large scale; `ORDER BY…LIMIT` early-stop and streaming (B3)
 are filed. See `PROGRESS.md`'s Phase B + Milestone P entries.

@@ -30,10 +30,12 @@
     `AtomicUsize` page cursor, not static slices). `src/sql/parallel_scan.rs` new;
     `heap.rs` extracted `scan_page_into`/`count_page_visible`/`scan_pages`.
   - **Results (1M rows, 18 cores):** unfiltered `SELECT COUNT(*)` **3.82×**
-    (77M → 295M rec/s, now ~5–8× faster than Postgres); filtered scan
-    (`COUNT(*) WHERE`) only **1.59×** — Amdahl-limited (only the base Scan is
-    parallel; Filter+Aggregate serial). **Partial aggregate** (push
-    predicate+count into workers) is the filed lever for the filtered gap.
+    (77M → 295M rec/s, now ~5–8× faster than Postgres); filtered
+    `COUNT(*) WHERE` **6.6×** (5.37M → 35.4M rec/s, PG lead +540% → +82%, ÷PG
+    0.16× → 0.55×) via **partial aggregate** — `parallel_count_matching` +
+    `QExpr::has_subquery` push the whole scan→filter→count into workers
+    (subquery predicates fall back). (Base-scan-only was 1.59× before that.)
+    `SUM`/`GROUP BY` partial aggregate + `LIMIT` early-stop still filed.
   - `tests/parallel_scan.rs`: parallel matches serial, honors MVCC, torn-read-free
     under a concurrent writer. Full detail: `PROGRESS.md` "Milestone P" entry;
     `docs/backlog/parallel_scan.md` (SHIPPED + follow-ups).

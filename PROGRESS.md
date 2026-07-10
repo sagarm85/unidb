@@ -3678,22 +3678,24 @@ So a worker always sees current committed data — exactly what the shipped
 **Benchmarks** (release, native macOS 26.4, Apple M5 Pro — **18 cores**; serial =
 toggle off, parallel = toggle on):
 
-| workload (1M rows) | serial | parallel | speedup |
-|--------------------|--------|----------|---------|
-| **`SELECT COUNT(*)`** (unfiltered — `parallel_count`) | 77.2M rec/s | **294.9M rec/s** | **3.82×** |
-| `COUNT(*) WHERE body<>'x'` (filtered — base scan only) | 5.37M rec/s | 8.54M rec/s | 1.59× |
+| workload (1M rows) | serial | parallel | speedup | ÷PG |
+|--------------------|--------|----------|---------|-----|
+| **`SELECT COUNT(*)`** (unfiltered — `parallel_count`) | 77.2M rec/s | **294.9M rec/s** | **3.82×** | ~5–8× *faster* |
+| **`COUNT(*) WHERE body<>'x'`** (filtered — **partial aggregate**) | 5.37M rec/s | **35.4M rec/s** | **6.6×** | 0.16× → **0.55×** |
 
-- **Unfiltered `COUNT(*)` is the headline: 3.82× — ~295M rec/s, now ~5–8×
-  *faster* than Postgres** (PG ~34–56M/s on the same box). Workers do the whole
-  count (header-only, no decode); the speedup is bounded by mmap read-lock
-  contention + memory bandwidth, not a serial tail.
-- **The filtered scan is only 1.59× — and that's the honest limit of *this* PR.**
-  `COUNT(*) WHERE …` plans as Aggregate → **Filter** → Scan; only the base **Scan**
-  (decode) is parallelized, so the Filter + Aggregate run serially over the
-  materialized 1M rows (Amdahl). Pushing the predicate + partial aggregate **into**
-  the workers is the next lever — filed (`parallel_scan.md`), not done here (the
-  Filter predicate is a `QExpr` evaluated via a `Runner` method, not yet a `Sync`
-  closure).
+- **Unfiltered `COUNT(*)`: 3.82× — ~295M rec/s, now ~5–8× *faster* than
+  Postgres** (PG ~34–56M/s on the same box). Workers do the whole count
+  (header-only, no decode); bounded by mmap read-lock contention + memory
+  bandwidth, not a serial tail.
+- **Filtered `COUNT(*) WHERE …`: 6.6×** (5.37M → 35.4M rec/s) — Postgres's lead
+  collapsed from **+540% → +82%** (÷PG 0.16× → 0.55×), nearly the plan's `≤ ~2×`
+  scan target. Landed via **partial aggregate**: the query plans as Aggregate →
+  Filter → Scan, and now the *whole* scan → filter → count runs in the workers
+  (`parallel_count_matching` + a `QExpr::has_subquery` gate — a subquery-free
+  predicate evaluates via the pure `eval_qexpr`; subquery predicates fall back to
+  base-scan-parallel + serial filter). Its 6.6× *beats* the unfiltered 3.82×
+  because there is more per-row work (decode + predicate eval) to parallelize
+  against the fixed overhead. (Base-scan-only, before partial aggregate: 1.59×.)
 
 **Peak RSS:** ~18–20 MB (bounded) — workers concat to the same total row set a
 serial scan produces (COUNT is trivial), plus N thread stacks.
@@ -3720,7 +3722,7 @@ filtered), honors MVCC across UPDATE/DELETE, and runs torn-read-free concurrentl
 with a writer (owned-copy reads under the mmap read-lock). Full lib (373) green
 with the toggle **forced on**; clippy/fmt clean.
 
-**Deferred (filed):** partial aggregate — push the predicate + `COUNT`/`SUM`/
-`GROUP BY` into the workers (the lever for the *filtered* scan gap); `LIMIT`
-early-stop; `exec_select_readonly` (server) parallelism; a visibility-map fast
-count. **Locked-decision changes:** none.
+**Partial aggregate — DONE** (filtered `COUNT(*) WHERE …` above, 6.6×). **Deferred
+(filed):** `SUM`/`AVG`/`GROUP BY` partial aggregate (only `COUNT(*)` is pushed so
+far); `LIMIT` early-stop; `exec_select_readonly` (server) parallelism; a
+visibility-map fast count. **Locked-decision changes:** none.
