@@ -2117,6 +2117,21 @@ fn bench_mm_report() {
             }),
             phased("t3_insert_pg", || pg_crud_insert(u, n, base)),
         );
+        // Refresh statistics on both engines now the table is at full size, so
+        // each planner makes a stats-informed choice for the UPDATE/DELETE below
+        // — unidb's A3 index-vs-scan gate (a selective range takes the B-tree, a
+        // non-selective one the sequential scan) and Postgres's planner alike.
+        // This is the realistic production state and fairer than comparing an
+        // analyzed engine against an un-analyzed one. Untimed setup, like the
+        // pre-grow.
+        phased("t3_analyze", || {
+            let ax = se.begin().unwrap();
+            let _ = se.execute_sql(ax, "ANALYZE t");
+            se.commit(ax).unwrap();
+            if let Ok(mut c) = Client::connect(u, NoTls) {
+                let _ = c.batch_execute("ANALYZE t");
+            }
+        });
         crud_row_c1(
             "SELECT filtered (k<N)",
             phased("t3_selfilt_unidb", || {
