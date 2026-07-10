@@ -557,6 +557,44 @@ impl Heap {
         Ok(out)
     }
 
+    /// Count the rows visible to `snapshot` **without decoding any tuple body**
+    /// (B1): the fast path for `SELECT COUNT(*)`. Mirrors [`Self::scan`]'s
+    /// visibility exactly (a `Live` slot whose header `is_visible`) and calls
+    /// `on_read` per counted row so SSI read-set tracking (D11) is identical to a
+    /// full scan — only the `page.get` + `decode_row` are skipped. One version
+    /// per chain is visible, so this counts logical rows correctly.
+    ///
+    /// Honest ceiling: this still visits every page's slot headers (O(pages)) —
+    /// it is *not* a Postgres visibility-map / index-only fast count; those are a
+    /// separate storage feature (filed).
+    pub fn count_visible<P: PageReader>(
+        &self,
+        snapshot: &Snapshot,
+        self_xid: Xid,
+        reader: &P,
+    ) -> Result<usize> {
+        self.ensure_directory(reader)?;
+        let mut count = 0usize;
+        for (i, page_id) in self.lock_fsm().pages.clone().into_iter().enumerate() {
+            if i % 256 == 0 {
+                crate::query_limits::check()?; // P5.f: timeout / cancellation
+            }
+            let page = reader.read_page(page_id)?;
+            let sc = page.slot_count_pub();
+            for slot in 0..sc {
+                if !matches!(page.slot_state(slot), Ok(SlotState::Live)) {
+                    continue;
+                }
+                let th = page.tuple_header(slot)?;
+                if is_visible(th.xmin, th.xmax, snapshot, self_xid) {
+                    on_read(self_xid, RowId { page_id, slot });
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+
     // ── FSM ──────────────────────────────────────────────────────────────────
 
     /// Record a page's current free space in the FSM (P1.c). Call after any

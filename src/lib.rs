@@ -2186,6 +2186,14 @@ impl Engine {
         crate::sql::executor::ROWS_DECODED.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Cumulative count of column *values* materialized into a `Literal` since
+    /// process start (C1′, measurement-only). Diff around an op for `cols/row`
+    /// — the direct proof of Phase B's decode pushdown (it falls as unreferenced
+    /// columns, especially TEXT, stop being materialized). Process-global.
+    pub fn cols_decoded_total() -> u64 {
+        crate::sql::executor::COLS_DECODED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The database directory (parent of the control file) — used by backup and
     /// base-snapshot tooling (P6.d).
     pub fn data_dir(&self) -> &Path {

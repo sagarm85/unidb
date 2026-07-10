@@ -67,6 +67,14 @@ use super::logical::{CmpOp, Expr, Literal, LogicalPlan};
 /// obligations; the few-ns cost is negligible next to a per-row decode.
 pub static ROWS_DECODED: AtomicU64 = AtomicU64::new(0);
 
+/// Measurement-only (Phase B C1′): total number of column *values* materialized
+/// into a `Literal` since process start. A full-row `decode_row` bumps this once
+/// per column; the projection-pushdown `deform_row` (B2) bumps it only for the
+/// columns actually needed. Diffed around an op, `cols/row` (this ÷ records) is
+/// the direct proof of the decode-pushdown win — it falls as unreferenced
+/// columns (esp. TEXT) stop being materialized. `Relaxed`, like `ROWS_DECODED`.
+pub static COLS_DECODED: AtomicU64 = AtomicU64::new(0);
+
 /// How the executor holds the catalog for one statement (index-write-concurrency
 /// Item 0a). Every SQL statement that changes no schema reads the catalog only
 /// (it `lookup(table)?.clone()`s the `TableDef` and works off the owned clone),
@@ -793,6 +801,23 @@ fn exec_select(
     let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
 
+    // B2 projection/qual decode pushdown: materialize only the predicate columns
+    // to test the filter, and only materialize projection columns for surviving
+    // rows — so a large `TEXT`/`Bytea` value nobody projects, or a row the
+    // predicate rejects, never pays its `String` allocation.
+    let cols = &table_def.columns;
+    let ncols = cols.len();
+    let proj_cols = projection_columns(&table_def, projection);
+    let mut pred_cols = Vec::new();
+    if let Some(pred) = predicate {
+        expr_columns(pred, &table_def, &mut pred_cols);
+    }
+    let (pred_needed, pred_upto) = needed_mask(&pred_cols, ncols);
+    let mut full_cols = proj_cols;
+    full_cols.extend_from_slice(&pred_cols);
+    let (full_needed, full_upto) = needed_mask(&full_cols, ncols);
+    let has_pred = predicate.is_some();
+
     let mut out = Vec::new();
     let mut read_ids = Vec::new();
     for (i, (row_id, bytes)) in heap
@@ -803,13 +828,19 @@ fn exec_select(
         if i % 1024 == 0 {
             crate::query_limits::check()?; // P5.f: timeout / cancellation
         }
-        let row = decode_row(&bytes, &table_def.columns)?;
-        if predicate_matches(predicate, &table_def.columns, &row)? {
-            // P1.d: this row is part of the statement's read set (an SSI
-            // rw-antidependency source). No-op unless `xid` is serializable.
-            read_ids.push(row_id);
-            out.push(project_row(projection, &table_def.columns, &row)?);
+        // Phase 1: evaluate the predicate on just its columns.
+        if has_pred {
+            let prow = deform_row(&bytes, cols, pred_upto, &pred_needed)?;
+            if !predicate_matches(predicate, cols, &prow)? {
+                continue;
+            }
         }
+        // Phase 2: materialize projection (+ predicate) columns for output.
+        let row = deform_row(&bytes, cols, full_upto, &full_needed)?;
+        // P1.d: this row is part of the statement's read set (an SSI
+        // rw-antidependency source). No-op unless `xid` is serializable.
+        read_ids.push(row_id);
+        out.push(project_row(projection, cols, &row)?);
     }
     ctx.txn_mgr.ssi_note_reads(ctx.xid, &read_ids);
     Ok(ExecResult::Rows {
@@ -840,6 +871,20 @@ pub(crate) fn exec_select_readonly<P: PageReader>(
         table_def.fsm_meta,
         table_def.pages.clone(),
     );
+    // B2 decode pushdown (same as `exec_select`, for the concurrent-read path).
+    let cols = &table_def.columns;
+    let ncols = cols.len();
+    let proj_cols = projection_columns(&table_def, projection);
+    let mut pred_cols = Vec::new();
+    if let Some(pred) = predicate {
+        expr_columns(pred, &table_def, &mut pred_cols);
+    }
+    let (pred_needed, pred_upto) = needed_mask(&pred_cols, ncols);
+    let mut full_cols = proj_cols;
+    full_cols.extend_from_slice(&pred_cols);
+    let (full_needed, full_upto) = needed_mask(&full_cols, ncols);
+    let has_pred = predicate.is_some();
+
     let mut out = Vec::new();
     for (i, (_, bytes)) in heap
         .scan(snapshot, self_xid, reader)?
@@ -849,10 +894,14 @@ pub(crate) fn exec_select_readonly<P: PageReader>(
         if i % 1024 == 0 {
             crate::query_limits::check()?; // P5.f: timeout / cancellation
         }
-        let row = decode_row(&bytes, &table_def.columns)?;
-        if predicate_matches(predicate, &table_def.columns, &row)? {
-            out.push(project_row(projection, &table_def.columns, &row)?);
+        if has_pred {
+            let prow = deform_row(&bytes, cols, pred_upto, &pred_needed)?;
+            if !predicate_matches(predicate, cols, &prow)? {
+                continue;
+            }
         }
+        let row = deform_row(&bytes, cols, full_upto, &full_needed)?;
+        out.push(project_row(projection, cols, &row)?);
     }
     Ok(ExecResult::Rows {
         columns: output_columns(projection, &table_def.columns),
@@ -965,6 +1014,24 @@ fn try_exec_select_btree(
 
     let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+
+    // B2 decode pushdown on the index-resolved candidates (the SELECT-filtered
+    // hot path, since a range predicate is served here, not by the full scan):
+    // materialize the predicate columns to re-check the row, and the projection
+    // columns only for survivors.
+    let cols = &table_def.columns;
+    let ncols = cols.len();
+    let proj_cols = projection_columns(table_def, projection);
+    let mut pred_cols = Vec::new();
+    if let Some(pred) = predicate {
+        expr_columns(pred, table_def, &mut pred_cols);
+    }
+    let (pred_needed, pred_upto) = needed_mask(&pred_cols, ncols);
+    let mut full_cols = proj_cols;
+    full_cols.extend_from_slice(&pred_cols);
+    let (full_needed, full_upto) = needed_mask(&full_cols, ncols);
+    let has_pred = predicate.is_some();
+
     let mut out = Vec::new();
     for row_id in candidate_ids {
         let bytes = match heap.get(row_id, &snapshot, ctx.xid, ctx.pool) {
@@ -972,10 +1039,14 @@ fn try_exec_select_btree(
             Err(DbError::NoVisibleVersion { .. }) => continue,
             Err(e) => return Err(e),
         };
-        let row = decode_row(&bytes, &table_def.columns)?;
-        if predicate_matches(predicate, &table_def.columns, &row)? {
-            out.push(project_row(projection, &table_def.columns, &row)?);
+        if has_pred {
+            let prow = deform_row(&bytes, cols, pred_upto, &pred_needed)?;
+            if !predicate_matches(predicate, cols, &prow)? {
+                continue;
+            }
         }
+        let row = deform_row(&bytes, cols, full_upto, &full_needed)?;
+        out.push(project_row(projection, cols, &row)?);
     }
     Ok(Some(ExecResult::Rows {
         columns: output_columns(projection, &table_def.columns),
@@ -1306,20 +1377,29 @@ fn matching_rows(
     }
 
     // Full-scan fallback — always correct (non-sargable predicate, no index, or
-    // a non-orderable literal).
-    heap.scan(snapshot, ctx.xid, ctx.pool)?
-        .into_iter()
-        .map(|(row_id, bytes)| Ok((row_id, decode_row(&bytes, &table_def.columns)?)))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .filter_map(
-            |(row_id, row)| match predicate_matches(predicate, &table_def.columns, &row) {
-                Ok(true) => Some(Ok((row_id, row))),
-                Ok(false) => None,
-                Err(e) => Some(Err(e)),
-            },
-        )
-        .collect()
+    // a non-orderable literal). B2: evaluate the predicate on just its columns,
+    // and only fully decode (UPDATE/DELETE need the whole row) rows that match —
+    // so a `DELETE … WHERE k >= lo` no longer materializes every rejected row's
+    // `body` `String`.
+    let cols = &table_def.columns;
+    let mut pred_cols = Vec::new();
+    if let Some(pred) = predicate {
+        expr_columns(pred, table_def, &mut pred_cols);
+    }
+    let (pred_needed, pred_upto) = needed_mask(&pred_cols, cols.len());
+    let has_pred = predicate.is_some();
+
+    let mut out = Vec::new();
+    for (row_id, bytes) in heap.scan(snapshot, ctx.xid, ctx.pool)? {
+        if has_pred {
+            let prow = deform_row(&bytes, cols, pred_upto, &pred_needed)?;
+            if !predicate_matches(predicate, cols, &prow)? {
+                continue;
+            }
+        }
+        out.push((row_id, decode_row(&bytes, cols)?));
+    }
+    Ok(out)
 }
 
 /// Index-driven half of [`matching_rows`] (A3): resolve a sargable B-tree
@@ -1351,10 +1431,16 @@ fn index_matching_rows(
         return Ok(None);
     };
     let tree = DiskBTree::new(meta_page, ctx.page_size);
-    let candidate_ids = match tree.search(op, &value, ctx.pool)? {
+    let mut candidate_ids = match tree.search(op, &value, ctx.pool)? {
         Some(ids) => ids,
         None => return Ok(None),
     };
+    // B5: resolve candidates in physical (page, slot) order so `heap.get` walks
+    // the heap sequentially-ish instead of randomly — the bitmap-heap-scan idea
+    // that softens the A3 random-access cost on a fragmented table (index/key
+    // order can scatter across pages after updates). Order doesn't matter for
+    // UPDATE/DELETE, which touch every matched row.
+    candidate_ids.sort_unstable_by_key(|r| (r.page_id, r.slot));
 
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -2222,6 +2308,9 @@ pub fn encode_row(values: &[Literal]) -> Vec<u8> {
 
 pub fn decode_row(bytes: &[u8], columns: &[ColumnDef]) -> Result<Vec<Literal>> {
     ROWS_DECODED.fetch_add(1, Ordering::Relaxed); // C1 measurement
+                                                  // C1′: a full decode materializes every column (the baseline `cols/row` that
+                                                  // B2's `deform_row` drives down by materializing only referenced columns).
+    COLS_DECODED.fetch_add(columns.len() as u64, Ordering::Relaxed);
     let mut out = Vec::with_capacity(columns.len());
     let mut pos = 0usize;
     for col in columns {
@@ -2230,18 +2319,182 @@ pub fn decode_row(bytes: &[u8], columns: &[ColumnDef]) -> Result<Vec<Literal>> {
         // coerced DEFAULT (so `ADD COLUMN ... DEFAULT x` shows `x` for old
         // rows) or NULL — no heap rewrite needed.
         if pos >= bytes.len() {
-            let lit = match &col.constraints.default {
-                Some(default) => coerce_value("", col, default.clone()).unwrap_or(Literal::Null),
-                None => Literal::Null,
-            };
-            out.push(lit);
+            out.push(missing_column_default(col));
             continue;
         }
-        let tag = *bytes
-            .get(pos)
-            .ok_or_else(|| DbError::SqlPlan("row decode error: truncated tag".into()))?;
-        pos += 1;
-        let lit = match tag {
+        out.push(decode_value_at(bytes, &mut pos, col)?);
+    }
+    Ok(out)
+}
+
+/// The value a column takes when its bytes are absent (a row written before an
+/// `ALTER TABLE ADD COLUMN`): the coerced DEFAULT, or NULL (P2.c).
+fn missing_column_default(col: &ColumnDef) -> Literal {
+    match &col.constraints.default {
+        Some(default) => coerce_value("", col, default.clone()).unwrap_or(Literal::Null),
+        None => Literal::Null,
+    }
+}
+
+/// **Projection/qual decode pushdown (B2).** Like [`decode_row`], but
+/// materializes a `Literal` only for columns where `needed[i]`, and **stops
+/// after `upto`** (the highest needed index — mirrors Postgres
+/// `heap_deform_tuple`'s `natts` limit: columns after `upto` are never touched,
+/// not even their length prefix). Skipped columns (unneeded, or beyond `upto`)
+/// hold `Literal::Null`, so the result stays full-width and positional
+/// `predicate_matches`/`project_row` are unchanged. The win: the `TEXT`/`Bytea`
+/// `String`/`Vec` allocations for unreferenced columns never happen — decode the
+/// predicate columns, test, and decode projection columns only on a match.
+pub fn deform_row(
+    bytes: &[u8],
+    columns: &[ColumnDef],
+    upto: usize,
+    needed: &[bool],
+) -> Result<Vec<Literal>> {
+    let mut out = vec![Literal::Null; columns.len()];
+    let mut pos = 0usize;
+    for (i, col) in columns.iter().enumerate() {
+        if i > upto {
+            break; // nothing at or past here is needed — stop entirely
+        }
+        if pos >= bytes.len() {
+            if needed[i] {
+                out[i] = missing_column_default(col);
+                COLS_DECODED.fetch_add(1, Ordering::Relaxed);
+            }
+            continue;
+        }
+        if needed[i] {
+            out[i] = decode_value_at(bytes, &mut pos, col)?;
+            COLS_DECODED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            skip_value_at(bytes, &mut pos)?; // advance past it, no allocation
+        }
+    }
+    Ok(out)
+}
+
+/// Collect the column indices a predicate `Expr` references (B2) into `out` —
+/// which columns `deform_row` must materialize to evaluate it. Exhaustive over
+/// `Expr` (a new variant forces a compile error here, so the set can't silently
+/// under-report). An unresolvable column name is skipped — the eventual
+/// `predicate_matches` reports it, and decoding a *superset* is always safe.
+fn expr_columns(expr: &Expr, table_def: &TableDef, out: &mut Vec<usize>) {
+    match expr {
+        Expr::Column(name) => {
+            if let Ok(idx) = column_index(table_def, name) {
+                out.push(idx);
+            }
+        }
+        Expr::Literal(_) => {}
+        Expr::BinOp { lhs, rhs, .. } => {
+            expr_columns(lhs, table_def, out);
+            expr_columns(rhs, table_def, out);
+        }
+        Expr::And(l, r) => {
+            expr_columns(l, table_def, out);
+            expr_columns(r, table_def, out);
+        }
+        Expr::JsonExtract { expr, .. } | Expr::JsonExtractText { expr, .. } => {
+            expr_columns(expr, table_def, out);
+        }
+        Expr::Near { column, .. } => {
+            if let Ok(idx) = column_index(table_def, column) {
+                out.push(idx);
+            }
+        }
+    }
+}
+
+/// Build a `deform_row` `(needed, upto)` pair from a set of column indices.
+/// `needed[i]` marks a column to materialize; `upto` is the highest such index
+/// (decode stops after it). An empty set → `upto = 0` with an all-false mask
+/// (caller should skip the deform entirely).
+fn needed_mask(cols: &[usize], ncols: usize) -> (Vec<bool>, usize) {
+    let mut needed = vec![false; ncols];
+    let mut upto = 0usize;
+    for &c in cols {
+        if c < ncols {
+            needed[c] = true;
+            upto = upto.max(c);
+        }
+    }
+    (needed, upto)
+}
+
+/// The column indices a projection references. Empty projection = `SELECT *` =
+/// every non-dropped column. A name that doesn't resolve widens to *all*
+/// columns (safe: decode a superset rather than risk under-decoding).
+fn projection_columns(table_def: &TableDef, projection: &[String]) -> Vec<usize> {
+    let all: Vec<usize> = (0..table_def.columns.len())
+        .filter(|&i| !table_def.columns[i].dropped)
+        .collect();
+    if projection.is_empty() {
+        return all;
+    }
+    let mut out = Vec::with_capacity(projection.len());
+    for name in projection {
+        match column_index(table_def, name) {
+            Ok(idx) => out.push(idx),
+            Err(_) => return all, // unresolved (e.g. an expression) → decode everything
+        }
+    }
+    out
+}
+
+/// Advance `*pos` past one encoded column value (the tag byte is at `*pos`)
+/// without materializing it — the skip path for [`deform_row`]. Reads the tag +
+/// any length prefix only; never allocates. Must stay in lockstep with the tag
+/// lengths in `encode_row`/[`decode_value_at`].
+fn skip_value_at(bytes: &[u8], pos: &mut usize) -> Result<()> {
+    let tag = *bytes
+        .get(*pos)
+        .ok_or_else(|| DbError::SqlPlan("row decode error: truncated tag".into()))?;
+    *pos += 1;
+    let read_len = |pos: &mut usize| -> Result<usize> {
+        let raw: [u8; 4] = bytes
+            .get(*pos..*pos + 4)
+            .ok_or_else(|| DbError::SqlPlan("row decode error: truncated length".into()))?
+            .try_into()
+            .unwrap();
+        *pos += 4;
+        Ok(u32::from_le_bytes(raw) as usize)
+    };
+    match tag {
+        0 => {}                      // Null — no bytes
+        3 => *pos += 1,              // Bool
+        11 => *pos += 4,             // Date (i32)
+        1 | 7 | 8 | 12 => *pos += 8, // Int / Timestamp / Float / Time
+        9 => *pos += 16,             // Uuid
+        6 => *pos += 17,             // Decimal (i128 + 1-byte scale)
+        2 | 4 | 10 => {
+            let len = read_len(pos)?;
+            *pos += len;
+        } // Text / Json / Bytea
+        5 => {
+            let dim = read_len(pos)?;
+            *pos += dim * 4;
+        } // Vector (dim * f32)
+        other => {
+            return Err(DbError::SqlPlan(format!(
+                "row decode error: unknown tag {other}"
+            )))
+        }
+    }
+    Ok(())
+}
+
+/// Decode one column value (tag byte at `*pos`), advancing `*pos` past it.
+/// `col` supplies type context for `Vector`/`Decimal` validation. Shared by
+/// [`decode_row`] (full) and [`deform_row`] (selective).
+fn decode_value_at(bytes: &[u8], pos_ref: &mut usize, col: &ColumnDef) -> Result<Literal> {
+    let mut pos = *pos_ref;
+    let tag = *bytes
+        .get(pos)
+        .ok_or_else(|| DbError::SqlPlan("row decode error: truncated tag".into()))?;
+    pos += 1;
+    let lit = {
+        match tag {
             0 => Literal::Null,
             1 => {
                 let end = pos + 8;
@@ -2414,10 +2667,10 @@ pub fn decode_row(bytes: &[u8], columns: &[ColumnDef]) -> Result<Vec<Literal>> {
                     "row decode error: unknown tag {other}"
                 )))
             }
-        };
-        out.push(lit);
-    }
-    Ok(out)
+        }
+    };
+    *pos_ref = pos;
+    Ok(lit)
 }
 
 #[cfg(test)]
@@ -3496,6 +3749,130 @@ mod tests {
             matches!(survivor, ExecResult::Rows { ref rows, .. } if rows.len() == 1),
             "neighbor survives and stays index-resolvable"
         );
+    }
+
+    // ── B2: projection / qual decode pushdown (crud-perf Phase B) ────────────
+
+    /// `deform_row` (selective decode) must produce results byte-identical to a
+    /// full decode across projection subsets, predicate-only columns, and
+    /// `SELECT *` — even when the projected/predicate columns are not the ones a
+    /// row's large `TEXT` value sits in.
+    #[test]
+    fn b2_projection_pushdown_matches_full_decode() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, k INT, g INT, body TEXT)")
+            .unwrap();
+        for i in 0..20 {
+            h.exec_as(
+                xid,
+                &format!(
+                    "INSERT INTO t (id, k, g, body) VALUES ({i}, {i}, {}, 'body-value-{i}')",
+                    i % 3
+                ),
+            )
+            .unwrap();
+        }
+        h.commit(xid);
+
+        let rows = |h: &mut Harness, sql: &str| -> Vec<Vec<Literal>> {
+            let xid = h.begin();
+            let r = h.exec_as(xid, sql).unwrap();
+            h.commit(xid);
+            match r {
+                ExecResult::Rows { rows, .. } => rows,
+                o => panic!("{o:?}"),
+            }
+        };
+
+        // Projection subset, predicate on a *different* column (body never
+        // projected → the deform must skip it, but the filter on k is exact).
+        let got = rows(&mut h, "SELECT id FROM t WHERE k >= 5 AND k < 10");
+        let want: Vec<Vec<Literal>> = (5..10).map(|i| vec![Literal::Int(i)]).collect();
+        assert_eq!(got, want, "projection subset + qual on other column");
+
+        // Projection that *does* include the TEXT column, predicate on k.
+        let got = rows(&mut h, "SELECT id, body FROM t WHERE k = 7");
+        assert_eq!(
+            got,
+            vec![vec![Literal::Int(7), Literal::Text("body-value-7".into())]],
+            "projected TEXT materialized for the matching row"
+        );
+
+        // SELECT * (empty projection → all columns) must be unchanged.
+        let got = rows(&mut h, "SELECT * FROM t WHERE k = 3");
+        assert_eq!(
+            got,
+            vec![vec![
+                Literal::Int(3),
+                Literal::Int(3),
+                Literal::Int(0),
+                Literal::Text("body-value-3".into())
+            ]],
+            "SELECT * still returns every column"
+        );
+
+        // Predicate that references only the TEXT column.
+        let got = rows(&mut h, "SELECT id FROM t WHERE body = 'body-value-12'");
+        assert_eq!(got, vec![vec![Literal::Int(12)]], "qual on TEXT column");
+    }
+
+    /// B1: `SELECT COUNT(*)` (the `count_visible` fast path, no decode) must
+    /// agree with a decode-based count across inserts, an UPDATE (new version +
+    /// superseded old must count once), and a DELETE (removed row uncounted);
+    /// and a filtered/`GROUP BY` count must still be correct (falls back).
+    #[test]
+    fn b1_count_star_matches_mvcc_visibility() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, k INT)").unwrap();
+        for i in 0..10 {
+            h.exec_as(xid, &format!("INSERT INTO t (id, k) VALUES ({i}, {i})"))
+                .unwrap();
+        }
+        h.commit(xid);
+
+        let count = |h: &mut Harness, sql: &str| -> i64 {
+            let xid = h.begin();
+            let r = h.exec_as(xid, sql).unwrap();
+            h.commit(xid);
+            match r {
+                ExecResult::Rows { rows, .. } => match rows[0][0] {
+                    Literal::Int(n) => n,
+                    ref o => panic!("{o:?}"),
+                },
+                o => panic!("{o:?}"),
+            }
+        };
+
+        assert_eq!(count(&mut h, "SELECT COUNT(*) FROM t"), 10);
+
+        // UPDATE creates a new version + supersedes the old — still one logical
+        // row, so the count is unchanged.
+        let xid = h.begin();
+        h.exec_as(xid, "UPDATE t SET k = 100 WHERE id = 3").unwrap();
+        h.commit(xid);
+        assert_eq!(count(&mut h, "SELECT COUNT(*) FROM t"), 10);
+
+        // DELETE removes one logical row.
+        let xid = h.begin();
+        h.exec_as(xid, "DELETE FROM t WHERE id = 7").unwrap();
+        h.commit(xid);
+        assert_eq!(count(&mut h, "SELECT COUNT(*) FROM t"), 9);
+
+        // Filtered / grouped counts (normal path) still correct.
+        assert_eq!(count(&mut h, "SELECT COUNT(*) FROM t WHERE k < 5"), 4);
+        let xid = h.begin();
+        let r = h
+            .exec_as(xid, "SELECT COUNT(*) FROM t GROUP BY id")
+            .unwrap();
+        h.commit(xid);
+        match r {
+            ExecResult::Rows { rows, .. } => assert_eq!(rows.len(), 9),
+            o => panic!("{o:?}"),
+        }
     }
 
     // ── P2.d: SERIAL / sequences ─────────────────────────────────────────────

@@ -12,6 +12,35 @@
 
 ## Current status
 
+- **CRUD performance — Phase B (read path) — SHIPPED (2026-07-10), branch
+  `crud-perf-phaseB`, PR pending.** Read-path decode-pushdown; **read-only, no
+  write/recovery/format change → crash harness stays 29, no `FORMAT_VERSION`
+  bump.** Reviewed under a senior-DB-architect lens before implementation
+  (ordered by real ROI; parallel scan split into its own milestone).
+  - **B2 (projection/qual decode pushdown) LEADS** — `decode_row` refactored into
+    `decode_value_at` + `skip_value_at`; new `deform_row(bytes, cols, upto,
+    needed)` materializes only referenced columns and **stops after the last
+    needed index** (PG `heap_deform_tuple` `natts` limit). Two-phase decode
+    (predicate cols → test → projection cols only on match) in `exec_select`,
+    `exec_select_readonly`, `matching_rows`, and **`try_exec_select_btree`** (the
+    SELECT-filtered hot path — a range predicate is served there, not the full
+    scan). Result: SELECT filtered `dec/row 2.00 → 0.00`, `cols/row 8.00 → 5.00`,
+    +28% absolute.
+  - **B1 (`SELECT COUNT(*)` count-visible-slots)** — `Heap::count_visible` (header-
+    only, `on_read` for SSI parity, no decode); routed in `query_exec` for
+    `COUNT(*)`-only aggregates over a plain Scan. **Result: unidb 81.4M rec/s vs
+    PG 29.0M — unidb 2.81× FASTER** (rare single-model win). Honest ceiling:
+    O(pages) header scan, no visibility-map shortcut at large scale (filed).
+  - **B5** — `index_matching_rows` sorts candidates by `(page, slot)` before
+    `heap.get` (bitmap-style sequential access; softens the A3 random-access
+    cliff). SELECT-path reorder + `ORDER BY…LIMIT` early-stop filed as follow-ups.
+  - **Acceptance:** COUNT gap `≤2×` **exceeded** (unidb 2.81× faster); filtered
+    SELECT `≥0.5×` **not met** (~0.17× / +28% absolute) — that query projects
+    `body` (still materialized for matches) and PG's tight scan leads; the scan
+    gap needs **parallel scan (Milestone P, `docs/backlog/parallel_scan.md`)**.
+    C1′ added a `cols/row` bench column. Peak RSS 17.5 MB. `query_exec` scan
+    projection is a filed follow-up (needs planner column pruning). Full detail
+    in `PROGRESS.md`'s "CRUD performance — Phase B" entry.
 - **CRUD performance — Phase A (write path) — SHIPPED (2026-07-10), merged to
   `main` via PR #34 (`e6fd0cb`).** Closes the Table-3 UPDATE-bulk CRUD-stress
   gap vs matched-durability Postgres 18.4. **Headline: UPDATE bulk 0.11× →
@@ -2666,6 +2695,32 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-10 — CRUD performance Phase B (read path), branch `crud-perf-phaseB`
+
+Executed Phase B (C1′ → B2 → B1 → B5). Commits: `73f8a93` C1′ (cols/row),
+`c03eab0` B2, `f47859c` B1, `88115bc` B5. Full detail in `PROGRESS.md`'s "CRUD
+performance — Phase B" entry + the Current-status bullet above.
+
+- **User asked me to review the plan as a 20+yr DB architect** (see
+  [[critical-architect-review]]) — reordered by real ROI (B2 leads, not B1),
+  fixed B2 to the PG `heap_deform_tuple` `natts` stop, split parallel scan into
+  its own milestone (`docs/backlog/parallel_scan.md`) with the pool/mmap
+  read-consistency landmine surfaced, and added B5 (bitmap-style access) for the
+  OLTP pattern the microbench hides.
+- **B1 over-delivered: `SELECT COUNT(*)` beats Postgres 2.81×** (81.4M vs 29.0M
+  rec/s) by counting visible slots via headers, decoding nothing.
+- **B2 works but the filtered-SELECT ≥0.5× target isn't met** — dec/row 2→0,
+  cols/row 8→5, +28% absolute, but the query projects `body` (still materialized
+  for matches) and PG's tight scan leads; the scan gap needs parallel scan.
+- **Implementation gotcha:** Table 3's `SELECT … WHERE k>=0` routes through
+  `try_exec_select_btree` (the index picks up the sargable `k>=0`), NOT the
+  full-scan `exec_select` loop — so B2 had to be wired into the btree candidate
+  path too, not just `exec_select`.
+- Measurement: PG-side variance is large (SELECT filtered PG swung 1.9M→6.9M
+  rec/s), so trust unidb absolute + dec/row/cols/row over a single-run ÷PG (see
+  [[unidb-benchmark-measurement-hygiene]]). Crash harness 29 unchanged
+  (read-only). No `FORMAT_VERSION` bump; no §3 decision touched.
 
 ### 2026-07-10 — CRUD performance Phase A (write path), branch `crud-perf-phaseA`
 

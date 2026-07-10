@@ -3569,3 +3569,89 @@ the existing P3.a "index entry is a re-validated hint" invariant).
   not the whole row incl. TEXT) and the SELECT/COUNT gap. Not started.
 **Locked-decision changes:** none (§3 untouched). Two Phase-A-scoped sign-offs
 (A1 approach; acceptance revision) recorded above.
+
+## CRUD performance — Phase B (read path)   [SHIPPED]   2026-07-10
+
+**PR:** _pending_ — branch `crud-perf-phaseB`
+**Spec:** `docs/backlog/crud_performance_phaseA_B.md` (reviewed under a
+senior-DB-architect lens before implementation — ordered by real ROI, parallel
+scan split out as its own milestone).
+**Summary:** Closes the read-path decode waste Phase A left: the executor decoded
+the **whole row** (every column incl. the `TEXT body` `String`) for **every**
+scanned row, even rows a predicate rejects and columns nobody projects. Ships
+**B2** projection/qual decode pushdown (the foundational win), **B1** a
+count-visible-slots fast path for `SELECT COUNT(*)`, and **B5** bitmap-style
+candidate sorting on the index write path. **Read-only — no write/recovery/
+format change; crash harness stays 29, no `FORMAT_VERSION` bump.**
+
+**Benchmarks** (release, native macOS 26.4, Apple M5 Pro; unidb `F_FULLFSYNC`
+vs Postgres 18.4 `fsync_writethrough`; 20k-row table grown to 40k, `ANALYZE`d).
+C1′ added a **`cols/row`** column (column values materialized ÷ records) — the
+decode-pushdown proof.
+
+| operation | unidb rec/s | PG rec/s | unidb ÷ PG | dec/row before → after | cols/row before → after |
+|-----------|-------------|----------|------------|------------------------|-------------------------|
+| **SELECT COUNT(*) (all)** | **81,417,975** | 28,973,246 | **2.81× (unidb FASTER)** | — → **0.00** | — → **0.00** |
+| SELECT filtered (k<N) | 266k → **340k** | ~2.0M¹ | 0.14× → ~0.17׹ | **2.00 → 0.00** | **8.00 → 5.00** |
+| DELETE selected (k≥N) | ~226k | ~534k | 0.22× → **0.42×** | **2.00 → 1.00** | 8.00 → 6.00 |
+| INSERT / UPDATE | unchanged (write path) | — | — | — | — |
+
+¹ SELECT filtered's `÷PG` is dominated by **Postgres-side run variance** — PG
+swung 1.9M → 6.9M rec/s across runs for the same query (parallel/cache), so a
+single-run ratio is unreliable. The robust signals are unidb's **absolute** gain
+(266k → 340k, +28%) and **dec/row 2.00 → 0.00** (no full decode) + **cols/row
+8.00 → 5.00** (fewer column materializations). See below on why ≥0.5× isn't met.
+
+**Headline: `SELECT COUNT(*)` now BEATS Postgres (2.81×)** — B1 counts visible
+slots via tuple headers only, decoding nothing (a rare single-model win, §1).
+**Honest caveat:** at 40k rows this reflects unidb's low fixed overhead; the loop
+is O(pages), so at large scale it lacks Postgres's visibility-map / index-only
+shortcut (filed as a storage feature).
+
+**Acceptance vs the plan:**
+- `COUNT` scan gap `≤ ~2×`: **exceeded** — unidb is 2.81× *faster*.
+- filtered SELECT `≥ 0.5×`: **not met** (~0.17× representative; +28% absolute).
+  The removable waste (full decode + `body` `String` for rejected rows) is gone
+  (dec/row → 0), but this query **projects `body`**, so every matching row still
+  materializes it, and Postgres's tight scan keeps the lead. B2's larger payoff
+  is on projection-light / **wide-row** queries (understated by Table 3's 4 tiny
+  columns); closing the scan-throughput gap needs **parallel scan (Milestone P)**.
+  Reported honestly rather than chasing a lucky PG-slow run.
+
+**Peak RSS:** 17.5 MB — selective decode allocates *less* than full
+decode, so the read-path memory profile is unchanged/lower.
+
+**What changed:**
+- **C1′** — `Engine::cols_decoded_total` (`COLS_DECODED` atomic per materialized
+  column value); `benches/decompose.rs` `cols/row` column + a `SELECT COUNT(*)`
+  row (B1 wasn't otherwise exercised — Table 3.1's COUNT is *filtered*).
+- **B2** — `decode_row` refactored into `decode_value_at` + a new `skip_value_at`
+  (advance past a value, no alloc); new `deform_row(bytes, columns, upto, needed)`
+  materializes only needed columns and **stops after the last needed index** (PG
+  `heap_deform_tuple` `natts` limit). Two-phase decode (predicate cols → test →
+  projection cols only on a match) wired into `exec_select`,
+  `exec_select_readonly`, `matching_rows`, and **`try_exec_select_btree`** (the
+  SELECT-filtered hot path — a range predicate is served there, not the full
+  scan). `query_exec` (GROUP BY/COUNT) scan projection needs planner column
+  pruning → filed follow-up.
+- **B1** — `Heap::count_visible` (Live+visible slot count via headers, `on_read`
+  for SSI parity, no decode); `query_exec` routes `COUNT(*)`-only aggregates over
+  a plain Scan through it.
+- **B5** — `index_matching_rows` sorts candidate RowIds by `(page, slot)` before
+  `heap.get` (sequential-ish heap access; softens the A3 random-access cliff on a
+  fragmented table). SELECT read-path reordering + `ORDER BY…LIMIT` early-stop
+  (keyset pagination) filed as follow-ups (would change result order / need a
+  planner rewrite + lazy ordered btree iterator).
+
+**Crash harness:** **29** (unchanged — read-only, no storage-format change).
+**Tests:** `b2_projection_pushdown_matches_full_decode`,
+`b1_count_star_matches_mvcc_visibility`; full lib (373) + differential
+(join/explain) + crash green; clippy/fmt clean.
+
+**Deferred (filed):** `query_exec` scan projection (planner column pruning);
+`ORDER BY <indexed> LIMIT n` early-stop; SELECT-path bitmap reorder; **parallel
+scan workers** — its own design doc `docs/backlog/parallel_scan.md` + PR (the
+lever for the raw scan-throughput gap; carries a pool/mmap read-consistency
+landmine); visibility map / index-only scans (the true COUNT accelerator at
+scale) and streaming operators (B3) — the honest ceiling.
+**Locked-decision changes:** none (§3 untouched); no `FORMAT_VERSION` bump.

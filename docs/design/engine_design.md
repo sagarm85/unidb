@@ -1088,6 +1088,21 @@ Postgres uses **HOT** (in-place, same page, no index touch) — closing it needs
 forward-chained heap / RowId-preserving update (**A2**, fiddly against the MVCC
 model), and DELETE/scan cost needs decode-pushdown + parallelism (**Phase B**).
 See `docs/backlog/crud_performance_phaseA_B.md` and `PROGRESS.md`'s Phase A entry.
+**Read path — crud-perf Phase B (2026-07-10):** ~~the executor decoded the whole
+row (every column incl. the `TEXT body` `String`) for every scanned row~~
+(**fixed**: `deform_row` materializes only the predicate/projection columns and
+stops after the last needed attribute — the PG `heap_deform_tuple` `natts` limit —
+wired as two-phase decode into `exec_select`/`matching_rows`/`try_exec_select_btree`;
+SELECT-filtered `dec/row 2.00 → 0.00`, `cols/row 8.00 → 5.00`); ~~`SELECT COUNT(*)`
+decoded every row into `Literal`s it discarded~~ (**fixed**: `Heap::count_visible`
+counts Live+visible slots via headers only — **now 2.81× faster than Postgres**).
+**Remaining read-path debt (deferred):** the raw scan-throughput gap
+(`SELECT-all`, filtered SELECT at scale) is Postgres's **parallelism** — the lever
+is a **parallel scan** (`docs/backlog/parallel_scan.md`, its own milestone; carries
+a pool/mmap read-consistency landmine); `query_exec` (GROUP BY/COUNT) scan
+projection needs planner column pruning; a **visibility map** / index-only scan is
+the true COUNT accelerator at large scale; `ORDER BY…LIMIT` early-stop (keyset
+pagination) and streaming operators (B3) are filed. See `PROGRESS.md`'s Phase B entry.
 
 Functional gaps (deliberate scope, tracked): ~~RC re-evaluation
 (EvalPlanQual) unimplemented~~ and ~~SSI is a no-op seam~~ (**both fixed P1.d**
