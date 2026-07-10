@@ -2168,6 +2168,24 @@ impl Engine {
         self.wal.durable_lsn()
     }
 
+    /// Cumulative framed WAL bytes ever appended, surviving checkpoint
+    /// truncation (C1, measurement-only). Diff two readings around a window of
+    /// operations to attribute WAL volume per operation — the proof metric for
+    /// the Phase A index-skip work (a `body`-only UPDATE should append ~0 index
+    /// bytes once unchanged indexed columns are skipped).
+    pub fn wal_total_bytes_appended(&self) -> u64 {
+        self.wal.total_bytes_appended()
+    }
+
+    /// Cumulative count of full-row heap decodes since process start (C1,
+    /// measurement-only). Diff two readings around an operation to attribute
+    /// "rows decoded per op" — the metric that exposes the write path's
+    /// full-scan-the-heap cost (a selective UPDATE/DELETE that decodes every
+    /// row is doing RC1/RC3 waste). Process-global, not per-engine.
+    pub fn rows_decoded_total() -> u64 {
+        crate::sql::executor::ROWS_DECODED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The database directory (parent of the control file) — used by backup and
     /// base-snapshot tooling (P6.d).
     pub fn data_dir(&self) -> &Path {

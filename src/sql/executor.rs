@@ -58,6 +58,15 @@ const IVF_TRAIN_ITERS: usize = 8;
 use super::datetime;
 use super::logical::{CmpOp, Expr, Literal, LogicalPlan};
 
+/// Measurement-only (Phase A C1): total number of `decode_row` calls since
+/// process start. Every full-row decode (a heap scan materializing a row into
+/// `Vec<Literal>`) bumps this by one. A benchmark diffs it around an operation
+/// to attribute "rows decoded per op" — the metric that exposes the write
+/// path's full-scan-the-heap cost (RC1/RC3) and, later, decode pushdown wins
+/// (Phase B). `Relaxed` because it is a pure statistic with no ordering
+/// obligations; the few-ns cost is negligible next to a per-row decode.
+pub static ROWS_DECODED: AtomicU64 = AtomicU64::new(0);
+
 /// How the executor holds the catalog for one statement (index-write-concurrency
 /// Item 0a). Every SQL statement that changes no schema reads the catalog only
 /// (it `lookup(table)?.clone()`s the `TableDef` and works off the owned clone),
@@ -1974,6 +1983,7 @@ pub fn encode_row(values: &[Literal]) -> Vec<u8> {
 }
 
 pub fn decode_row(bytes: &[u8], columns: &[ColumnDef]) -> Result<Vec<Literal>> {
+    ROWS_DECODED.fetch_add(1, Ordering::Relaxed); // C1 measurement
     let mut out = Vec::with_capacity(columns.len());
     let mut pos = 0usize;
     for col in columns {
