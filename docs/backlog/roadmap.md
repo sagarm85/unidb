@@ -126,6 +126,7 @@ Two engine (Core-lane) items filed from the **Postgres baseline comparison**
 |---|---|---|---|
 | **Durable FSM + O(1) table-page representation** | SQL bulk-load hits `HeapFull` at ~145k rows — the catalog stores `TableDef.pages` as an unbounded `Vec<PageId>` in a single-page JSON blob (O(heap-pages) cap). Raw insert is immune (builds 5M linearly). | **Correctness/scale** (a real ceiling, not perf) | [`durable_fsm_catalog_pagelist.md`](durable_fsm_catalog_pagelist.md) |
 | **Autovacuum** | Under 30× update churn, point reads degrade 6.8→35 µs with no autovacuum; a manual `Engine::vacuum()` restores 5.85 µs. Automation gap, not capability (M10 reclamation already exists). | **Perf/ops** (steady-state bloat) | [`autovacuum.md`](autovacuum.md) |
+| **CRUD perf — Phase A (write) + Phase B (scan)** *(filed 2026-07-10, NOT STARTED)* | Multi-model CRUD stress vs matched-durability PG: **UPDATE 0.11×** (re-indexes unchanged columns, 1 full-page `WAL_INDEX`/row — `apply_durable_index_writes`), DELETE 0.20× / filtered SELECT 0.15× (UPDATE/DELETE full-scan, never use the index; whole-row decode; per-row re-snapshot), COUNT scan ~8×. All CPU/WAL-volume, not fsync. | **Perf** (single-model CRUD) | [`crud_performance_phaseA_B.md`](crud_performance_phaseA_B.md) |
 
 Sequencing: the **durable FSM** is the higher-severity item (removes a hard cap
 and, done right, also kills the SQL path's per-statement FSM rebuild — it subsumes
@@ -206,6 +207,22 @@ status, same discipline as M10.
 ---
 
 ## 8. Decision & session log (newest first)
+
+### 2026-07-10 — CRUD-perf Phase A + Phase B filed (write + scan path)
+- Multi-model CRUD-stress report (`benches/decompose.rs` Table 3/3.1) vs
+  matched-durability PG 18.4 surfaced large single-model losses: UPDATE 0.11×,
+  DELETE 0.20×, filtered SELECT 0.15×, COUNT scan ~8×. Each op is one
+  `begin…commit` (one fsync/op) ⇒ the gap is **CPU + WAL volume, not durability**.
+- Root causes traced to lines: **RC2** `apply_durable_index_writes`
+  (`executor.rs:178`) re-indexes unchanged columns, one full-page `WAL_INDEX`/row
+  (the 0.11× UPDATE killer); **RC1** `matching_rows` (`executor.rs:1109`) full-scans
+  for UPDATE/DELETE, never uses the index; **RC3** whole-row `Vec<Literal>` decode +
+  per-row re-snapshot; **RC4** COUNT decodes columns it discards.
+- Filed as **[`crud_performance_phaseA_B.md`](crud_performance_phaseA_B.md)**
+  (Core-lane, two PRs). Phase A = write path (A1 skip-unchanged-index is the
+  recommended first commit — largest single win), Phase B = decode pushdown.
+  No §3 decision reopened; INSERT (fsync-bound, at parity) explicitly out of scope.
+  **To be run in a later session.**
 
 ### 2026-07-10 — Durable on-disk FSM + catalog page-list shipped; index/heap write-concurrency filed
 - Shipped the durable FSM (branch `durable-fsm`, PR #29): the SQL page directory +

@@ -166,7 +166,7 @@ unidb = { path = "../unidb" }
 
 ```bash
 UNIDB_JWT_SECRET=dev-secret \
-UNIDB_DATA_DIR=./unidb-data \
+UNIDB_DATA_DIR=/tmp/unidb \
 UNIDB_BIND_ADDR=127.0.0.1:8080 \
 cargo run --bin unidb-server --features server
 ```
@@ -176,7 +176,7 @@ cargo run --bin unidb-server --features server
 | Var | Default | Purpose |
 |---|---|---|
 | `UNIDB_JWT_SECRET` | — (**required**) | HMAC secret for verify-only JWT auth. No default — the server refuses to start without one. |
-| `UNIDB_DATA_DIR` | `./unidb-data` | Storage directory — holds `control`/`data.db`/`db.wal`, nothing else. |
+| `UNIDB_DATA_DIR` | `/tmp/unidb` | Storage directory — holds `control`/`data.db`/`db.wal`, nothing else. Defaults under `/tmp` so local/dev runs never write DB files into the repo; `/tmp` is ephemeral across reboots, so set this to a real volume for anything persistent. |
 | `UNIDB_LOG_DIR` | `<UNIDB_DATA_DIR>/logs` | Rolling daily log files (`unidb.log.YYYY-MM-DD`). Independently overridable so logs can live on a different volume than data. |
 | `UNIDB_BIND_ADDR` | `127.0.0.1:8080` | Listen address. |
 | `UNIDB_PAGE_SIZE` | `0` (engine default) | Page size, fixed at first open (D8). |

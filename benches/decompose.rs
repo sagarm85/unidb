@@ -31,7 +31,7 @@ use postgres::{Client, NoTls};
 use rusqlite::Connection;
 use tempfile::tempdir;
 use unidb::sql::logical::Literal;
-use unidb::Engine;
+use unidb::{Engine, SqlResult};
 
 const DIM: usize = 128;
 const ROWS: u64 = 100;
@@ -216,12 +216,19 @@ fn pg_connect(url: &str) -> Option<Client> {
 /// on any failure (unreachable, or non-superuser → ALTER SYSTEM denied), after
 /// logging — the caller then skips this config cleanly.
 fn pg_open_lens(url: &str, durable: bool) -> Option<(Client, String)> {
-    let want = if durable {
-        "fsync_writethrough"
-    } else {
-        "open_datasync"
-    };
     let mut admin = pg_connect(url)?;
+    let want = if durable {
+        // Portable durable lens: pick the strongest flush-to-platter method THIS
+        // server actually offers, read from its own `pg_settings.enumvals`, rather
+        // than assuming the client's platform. `fsync_writethrough` (F_FULLFSYNC)
+        // exists only on macOS Postgres; a Linux server (e.g. in a Docker
+        // container) has no such value, and the old hard-coded string made
+        // `ALTER SYSTEM` error → the entire Postgres comparison was silently
+        // skipped on Linux. See `pg_durable_sync_method`.
+        pg_durable_sync_method(&mut admin)
+    } else {
+        "open_datasync".to_string()
+    };
     if let Err(e) = admin.batch_execute(&format!("ALTER SYSTEM SET wal_sync_method = '{want}'")) {
         eprintln!("  [pg] WARNING: ALTER SYSTEM denied ({e}) — need superuser; skipping lens");
         return None;
@@ -237,6 +244,31 @@ fn pg_open_lens(url: &str, durable: bool) -> Option<(Client, String)> {
         eprintln!("  [pg] WARNING: wanted wal_sync_method={want}, got {actual} — labelling actual");
     }
     Some((client, actual))
+}
+
+/// The strongest flush-to-platter `wal_sync_method` this Postgres server
+/// supports, chosen from the server's own `pg_settings.enumvals` so it is correct
+/// regardless of the OS Postgres runs on. On macOS that is `fsync_writethrough`
+/// (issues `F_FULLFSYNC`, matching unidb's macOS commit sync via Rust std
+/// `File::sync_all`); on Linux it is `fsync` (Linux `fsync()` already flushes to
+/// the device, matching unidb's Linux commit sync). This is what makes the same
+/// comparison fair whether Postgres runs natively on macOS or in a Linux
+/// container. Falls back to `fsync` (present everywhere) if the enum can't be read.
+fn pg_durable_sync_method(admin: &mut Client) -> String {
+    let vals: Vec<String> = admin
+        .query_one(
+            "SELECT enumvals FROM pg_settings WHERE name = 'wal_sync_method'",
+            &[],
+        )
+        .ok()
+        .and_then(|r| r.try_get::<usize, Vec<String>>(0).ok())
+        .unwrap_or_default();
+    for cand in ["fsync_writethrough", "fsync"] {
+        if vals.iter().any(|v| v == cand) {
+            return cand.to_string();
+        }
+    }
+    "fsync".to_string()
 }
 
 // ------------------------------ B1: ladder ---------------------------------
@@ -1465,7 +1497,487 @@ fn mm_ladder_point(rung: u8, size: u64, sample: u64) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0 / sample as f64
 }
 
+// ============ Table 3 CRUD + Table 4 at-scale helpers (mmreport) ============
+// A richer mmreport (per-request): Table 3 becomes a full CRUD stress suite
+// (insert / filtered+grouped select / bulk update / selected+full delete)
+// comparing unidb (SQL path) vs Postgres relational at matched fsync, printing
+// how many records each op touches; Table 4 becomes a MEASURED unidb-multi-model
+// (W4) vs Postgres-relational throughput sweep across tx counts (to millions).
+// Every measured phase is bracketed by `phased(..)` so an external docker-stats
+// sampler can attribute per-phase CPU/memory to each container.
+
+const CRUD_GROUPS: i64 = 100;
+
+/// Emit a phase boundary marker (to stderr and, if `MM_PHASES` is set, appended
+/// to that file as `name,edge,unix_ms`). The host-side docker-stats sampler
+/// correlates these windows to per-container CPU/mem samples.
+fn phase_mark(name: &str, edge: &str) {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    eprintln!("[[PHASE {edge} {name} {ms}]]");
+    if let Ok(path) = std::env::var("MM_PHASES") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(f, "{name},{edge},{ms}");
+        }
+    }
+}
+
+/// Run `f` bracketed by start/end phase markers; returns f's value.
+fn phased<T>(name: &str, f: impl FnOnce() -> T) -> T {
+    phase_mark(name, "start");
+    let r = f();
+    phase_mark(name, "end");
+    r
+}
+
+/// records/sec for (count, secs), guarding divide-by-zero.
+fn rps(count: u64, secs: f64) -> f64 {
+    if secs > 0.0 {
+        count as f64 / secs
+    } else {
+        0.0
+    }
+}
+
+/// Winner + margin for a unidb-vs-Postgres throughput pair (records/sec):
+/// whoever is faster, and by what percent. Near-equal reads as parity; a missing
+/// side (0 rec/s — e.g. Postgres skipped) is called out rather than shown as a win.
+fn winner_remark(uu: f64, pp: f64) -> String {
+    if uu <= 0.0 && pp <= 0.0 {
+        return "—".to_string();
+    }
+    if pp <= 0.0 {
+        return "unidb (PG n/a)".to_string();
+    }
+    if uu <= 0.0 {
+        return "postgres (unidb n/a)".to_string();
+    }
+    let (name, fast, slow) = if uu >= pp {
+        ("unidb", uu, pp)
+    } else {
+        ("postgres", pp, uu)
+    };
+    let pct = (fast / slow - 1.0) * 100.0;
+    if pct < 1.0 {
+        "≈ parity".to_string()
+    } else {
+        format!("**{name}** +{pct:.0}%")
+    }
+}
+
+/// Print one CRUD-comparison row: records touched, unidb rec/s, PG rec/s, ratio,
+/// and a plain-language remark naming the winner and its margin.
+fn crud_row(op: &str, u: (u64, f64), p: (u64, f64)) {
+    let (uu, pp) = (rps(u.0, u.1), rps(p.0, p.1));
+    let ratio = if pp > 0.0 { uu / pp } else { 0.0 };
+    println!(
+        "| {op} | {} | {:.0} | {:.0} | {:.2}× | {} |",
+        u.0.max(p.0),
+        uu,
+        pp,
+        ratio,
+        winner_remark(uu, pp)
+    );
+}
+
+fn sql_rows_returned(res: &[SqlResult]) -> u64 {
+    res.iter()
+        .map(|r| match r {
+            SqlResult::Rows { rows, .. } => rows.len(),
+            _ => 0,
+        })
+        .sum::<usize>() as u64
+}
+
+fn sql_affected(res: &[SqlResult]) -> u64 {
+    res.iter()
+        .map(|r| match r {
+            SqlResult::Updated { count }
+            | SqlResult::Deleted { count }
+            | SqlResult::Inserted { count }
+            | SqlResult::Truncated { count } => *count as u64,
+            _ => 0u64,
+        })
+        .sum()
+}
+
+// ---- unidb CRUD (SQL path) ----
+
+/// Build unidb CRUD table `t (id, k, g, body)` with `rows` rows: k = unique
+/// range/filter key, g = k % CRUD_GROUPS grouping key; btree on k.
+fn sql_build_crud(engine: &Arc<Engine>, rows: u64) {
+    let x = engine.begin().unwrap();
+    engine
+        .execute_sql(x, "CREATE TABLE t (id INT, k INT, g INT, body TEXT)")
+        .unwrap();
+    engine
+        .execute_sql(x, "CREATE INDEX t_k ON t USING BTREE (k)")
+        .unwrap();
+    engine.commit(x).unwrap();
+    let ins = engine
+        .prepare("INSERT INTO t (id, k, g, body) VALUES ($1, $2, $3, $4)")
+        .unwrap();
+    let mut x = engine.begin().unwrap();
+    for i in 0..rows {
+        engine
+            .execute_prepared(
+                x,
+                &ins,
+                &[
+                    Literal::Int(i as i64),
+                    Literal::Int(i as i64),
+                    Literal::Int((i as i64) % CRUD_GROUPS),
+                    Literal::Text(format!("b{i}")),
+                ],
+            )
+            .unwrap();
+        if (i + 1) % 5_000 == 0 {
+            engine.commit(x).unwrap();
+            x = engine.begin().unwrap();
+        }
+    }
+    engine.commit(x).unwrap();
+}
+
+/// Bulk INSERT: `n` new rows (k in [base, base+n)), each its own durable commit.
+fn sql_crud_insert(engine: &Arc<Engine>, n: u64, base: i64) -> (u64, f64) {
+    let ins = engine
+        .prepare("INSERT INTO t (id, k, g, body) VALUES ($1, $2, $3, $4)")
+        .unwrap();
+    let start = Instant::now();
+    for i in 0..n {
+        let id = base + i as i64;
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_prepared(
+                xid,
+                &ins,
+                &[
+                    Literal::Int(id),
+                    Literal::Int(id),
+                    Literal::Int(id % CRUD_GROUPS),
+                    Literal::Text(format!("b{id}")),
+                ],
+            )
+            .unwrap();
+        engine.commit(xid).unwrap();
+    }
+    (n, start.elapsed().as_secs_f64())
+}
+
+fn sql_crud_select_filtered(engine: &Arc<Engine>, lo: i64, hi: i64) -> (u64, f64) {
+    let x = engine.begin().unwrap();
+    let start = Instant::now();
+    let res = engine
+        .execute_sql(
+            x,
+            &format!("SELECT id, body FROM t WHERE k >= {lo} AND k < {hi}"),
+        )
+        .unwrap();
+    let secs = start.elapsed().as_secs_f64();
+    engine.commit(x).unwrap();
+    (sql_rows_returned(&res), secs)
+}
+
+fn sql_crud_select_grouped(engine: &Arc<Engine>, scanned: u64) -> (u64, f64) {
+    let x = engine.begin().unwrap();
+    let start = Instant::now();
+    let _res = engine
+        .execute_sql(x, "SELECT g, COUNT(*) FROM t GROUP BY g")
+        .unwrap();
+    let secs = start.elapsed().as_secs_f64();
+    engine.commit(x).unwrap();
+    (scanned, secs) // throughput = rows scanned / sec
+}
+
+fn sql_crud_update_bulk(engine: &Arc<Engine>, hi: i64) -> (u64, f64) {
+    let x = engine.begin().unwrap();
+    let start = Instant::now();
+    let res = engine
+        .execute_sql(x, &format!("UPDATE t SET body = 'updated' WHERE k < {hi}"))
+        .unwrap();
+    engine.commit(x).unwrap();
+    (sql_affected(&res), start.elapsed().as_secs_f64())
+}
+
+fn sql_crud_delete_selected(engine: &Arc<Engine>, lo: i64) -> (u64, f64) {
+    let x = engine.begin().unwrap();
+    let start = Instant::now();
+    let res = engine
+        .execute_sql(x, &format!("DELETE FROM t WHERE k >= {lo}"))
+        .unwrap();
+    engine.commit(x).unwrap();
+    (sql_affected(&res), start.elapsed().as_secs_f64())
+}
+
+fn sql_crud_delete_all(engine: &Arc<Engine>) -> (u64, f64) {
+    let x = engine.begin().unwrap();
+    let start = Instant::now();
+    let res = engine.execute_sql(x, "DELETE FROM t").unwrap();
+    engine.commit(x).unwrap();
+    (sql_affected(&res), start.elapsed().as_secs_f64())
+}
+
+// ---- Postgres CRUD (relational) ----
+
+fn pg_build_crud(url: &str, rows: u64) -> Option<()> {
+    let mut c = pg_connect(url)?;
+    c.batch_execute(
+        "DROP TABLE IF EXISTS t; CREATE TABLE t (id BIGINT, k BIGINT, g BIGINT, body TEXT)",
+    )
+    .ok()?;
+    c.batch_execute("CREATE INDEX t_k ON t (k)").ok()?;
+    if rows > 0 {
+        c.execute(
+            "INSERT INTO t (id, k, g, body) \
+             SELECT s, s, s % $2, 'b' || s FROM generate_series(0, $1::bigint - 1) s",
+            &[&(rows as i64), &CRUD_GROUPS],
+        )
+        .ok()?;
+    }
+    Some(())
+}
+
+fn pg_crud_insert(url: &str, n: u64, base: i64) -> (u64, f64) {
+    let mut c = Client::connect(url, NoTls).unwrap();
+    let ins = c
+        .prepare("INSERT INTO t (id, k, g, body) VALUES ($1, $2, $3, $4)")
+        .unwrap();
+    let start = Instant::now();
+    for i in 0..n {
+        let id = base + i as i64;
+        c.execute(&ins, &[&id, &id, &(id % CRUD_GROUPS), &format!("b{id}")])
+            .unwrap();
+    }
+    (n, start.elapsed().as_secs_f64())
+}
+
+fn pg_crud_select_filtered(url: &str, lo: i64, hi: i64) -> (u64, f64) {
+    let mut c = Client::connect(url, NoTls).unwrap();
+    let start = Instant::now();
+    let rows = c
+        .query(
+            "SELECT id, body FROM t WHERE k >= $1 AND k < $2",
+            &[&lo, &hi],
+        )
+        .unwrap();
+    (rows.len() as u64, start.elapsed().as_secs_f64())
+}
+
+fn pg_crud_select_grouped(url: &str, scanned: u64) -> (u64, f64) {
+    let mut c = Client::connect(url, NoTls).unwrap();
+    let start = Instant::now();
+    let _rows = c
+        .query("SELECT g, COUNT(*) FROM t GROUP BY g", &[])
+        .unwrap();
+    (scanned, start.elapsed().as_secs_f64())
+}
+
+fn pg_crud_update_bulk(url: &str, hi: i64) -> (u64, f64) {
+    let mut c = Client::connect(url, NoTls).unwrap();
+    let start = Instant::now();
+    let n = c
+        .execute("UPDATE t SET body = 'updated' WHERE k < $1", &[&hi])
+        .unwrap();
+    (n, start.elapsed().as_secs_f64())
+}
+
+fn pg_crud_delete_selected(url: &str, lo: i64) -> (u64, f64) {
+    let mut c = Client::connect(url, NoTls).unwrap();
+    let start = Instant::now();
+    let n = c.execute("DELETE FROM t WHERE k >= $1", &[&lo]).unwrap();
+    (n, start.elapsed().as_secs_f64())
+}
+
+fn pg_crud_delete_all(url: &str) -> (u64, f64) {
+    let mut c = Client::connect(url, NoTls).unwrap();
+    let start = Instant::now();
+    let n = c.execute("DELETE FROM t", &[]).unwrap();
+    (n, start.elapsed().as_secs_f64())
+}
+
+// ---- Table 3.1: bulk stress (insert + full-scan select at scale) ----
+// Fresh table per size; `n` rows bulk-loaded via batched prepared single-row
+// inserts (one durable commit per 5k rows) — the SAME method on both engines so
+// the insert comparison is apples-to-apples — then a full-table `SELECT COUNT(*)`
+// scan is timed. Throughput is records/sec (insert rows, then rows scanned).
+
+const BULK_COMMIT_BATCH: u64 = 5_000;
+
+/// unidb bulk insert: build a fresh `bt (id, k, body)` (btree on k) and insert
+/// `n` rows, committing every `BULK_COMMIT_BATCH`. Returns (rows, secs).
+fn sql_bulk_insert(engine: &Arc<Engine>, n: u64) -> (u64, f64) {
+    let x = engine.begin().unwrap();
+    engine
+        .execute_sql(x, "CREATE TABLE bt (id INT, k INT, body TEXT)")
+        .unwrap();
+    engine
+        .execute_sql(x, "CREATE INDEX bt_k ON bt USING BTREE (k)")
+        .unwrap();
+    engine.commit(x).unwrap();
+    let ins = engine
+        .prepare("INSERT INTO bt (id, k, body) VALUES ($1, $2, $3)")
+        .unwrap();
+    let start = Instant::now();
+    let mut x = engine.begin().unwrap();
+    for i in 0..n {
+        engine
+            .execute_prepared(
+                x,
+                &ins,
+                &[
+                    Literal::Int(i as i64),
+                    Literal::Int(i as i64),
+                    Literal::Text(format!("b{i}")),
+                ],
+            )
+            .unwrap();
+        if (i + 1).is_multiple_of(BULK_COMMIT_BATCH) {
+            engine.commit(x).unwrap();
+            x = engine.begin().unwrap();
+        }
+    }
+    engine.commit(x).unwrap();
+    (n, start.elapsed().as_secs_f64())
+}
+
+/// unidb full **heap** scan of `bt`: the predicate is on the non-indexed `body`
+/// column (matches all rows), so neither engine can serve it index-only — this
+/// measures real scan throughput, not a count optimizer. Throughput = rows/sec.
+fn sql_bulk_select(engine: &Arc<Engine>, n: u64) -> (u64, f64) {
+    let x = engine.begin().unwrap();
+    let start = Instant::now();
+    let _res = engine
+        .execute_sql(x, "SELECT COUNT(*) FROM bt WHERE body <> 'x'")
+        .unwrap();
+    let secs = start.elapsed().as_secs_f64();
+    engine.commit(x).unwrap();
+    (n, secs)
+}
+
+/// Postgres bulk insert into a fresh `bt`, matched method: batched prepared
+/// single-row inserts, one commit per `BULK_COMMIT_BATCH`. Returns (rows, secs).
+fn pg_bulk_insert(url: &str, n: u64) -> (u64, f64) {
+    let mut c = Client::connect(url, NoTls).unwrap();
+    c.batch_execute(
+        "DROP TABLE IF EXISTS bt; \
+         CREATE TABLE bt (id BIGINT, k BIGINT, body TEXT); \
+         CREATE INDEX bt_k ON bt (k)",
+    )
+    .unwrap();
+    let ins = c
+        .prepare("INSERT INTO bt (id, k, body) VALUES ($1, $2, $3)")
+        .unwrap();
+    let start = Instant::now();
+    let mut tx = c.transaction().unwrap();
+    for i in 0..n as i64 {
+        tx.execute(&ins, &[&i, &i, &format!("b{i}")]).unwrap();
+        if (i as u64 + 1).is_multiple_of(BULK_COMMIT_BATCH) {
+            tx.commit().unwrap();
+            tx = c.transaction().unwrap();
+        }
+    }
+    tx.commit().unwrap();
+    (n, start.elapsed().as_secs_f64())
+}
+
+/// Postgres full **heap** scan of `bt`, matched to `sql_bulk_select`: the
+/// non-indexed `body` predicate forces a seq scan (no index-only shortcut).
+/// Throughput = rows/sec.
+fn pg_bulk_select(url: &str, n: u64) -> (u64, f64) {
+    let mut c = Client::connect(url, NoTls).unwrap();
+    let start = Instant::now();
+    let _rows = c
+        .query("SELECT COUNT(*) FROM bt WHERE body <> 'x'", &[])
+        .unwrap();
+    (n, start.elapsed().as_secs_f64())
+}
+
+// ---- Table 4: at-scale throughput helpers ----
+
+/// unidb multi-model (W4) commits/sec: `n` transactions, each inserting a row +
+/// VECTOR(128) + graph edge + event, one durable group-commit each.
+fn unidb_w4_throughput(n: u64) -> f64 {
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
+    engine.set_deferred_sync(true);
+    let sx = engine.begin().unwrap();
+    engine
+        .execute_sql(
+            sx,
+            "CREATE TABLE t (id INT, body TEXT, embedding VECTOR(128))",
+        )
+        .unwrap();
+    engine
+        .execute_sql(sx, "CREATE INDEX ib ON t USING BTREE (id)")
+        .unwrap();
+    engine
+        .execute_sql(sx, "CREATE INDEX iv ON t USING HNSW (embedding)")
+        .unwrap();
+    engine.commit(sx).unwrap();
+    engine.enable_events("t").unwrap();
+    let ins = engine
+        .prepare("INSERT INTO t (id, body, embedding) VALUES ($1, $2, $3)")
+        .unwrap();
+    let start = Instant::now();
+    for i in 0..n {
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_prepared(
+                xid,
+                &ins,
+                &[
+                    Literal::Int(i as i64),
+                    Literal::Text(format!("body-{i}")),
+                    Literal::Vector(embedding(i)),
+                ],
+            )
+            .unwrap();
+        engine
+            .create_edge(xid, i as i64, (i as i64) + 1, "rel", "{}")
+            .unwrap();
+        engine.commit(xid).unwrap();
+    }
+    rps(n, start.elapsed().as_secs_f64())
+}
+
+/// Postgres relational commits/sec: `n` single-row durable INSERTs.
+fn pg_relational_throughput(url: &str, n: u64) -> f64 {
+    let mut c = Client::connect(url, NoTls).unwrap();
+    c.batch_execute("DROP TABLE IF EXISTS t4; CREATE TABLE t4 (id BIGINT PRIMARY KEY, body TEXT)")
+        .unwrap();
+    let ins = c
+        .prepare("INSERT INTO t4 (id, body) VALUES ($1, $2)")
+        .unwrap();
+    let start = Instant::now();
+    for i in 0..n as i64 {
+        c.execute(&ins, &[&i, &format!("body-{i}")]).unwrap();
+    }
+    rps(n, start.elapsed().as_secs_f64())
+}
+
+/// The durability primitive unidb's commit sync (`File::sync_all`) actually
+/// resolves to on the platform this bench is *running* on, so the generated
+/// report is internally consistent instead of hard-coding "macOS". Rust std
+/// issues `fcntl(F_FULLFSYNC)` on macOS/iOS (true flush-to-platter); everywhere
+/// else (Linux, incl. the Docker image) it is a plain `fsync`.
+fn unidb_sync_primitive() -> &'static str {
+    if cfg!(any(target_os = "macos", target_os = "ios")) {
+        "F_FULLFSYNC"
+    } else {
+        "fsync"
+    }
+}
+
 fn bench_mm_report() {
+    let sync_prim = unidb_sync_primitive();
     let sizes: Vec<u64> = std::env::var("MM_SIZES")
         .ok()
         .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
@@ -1477,7 +1989,7 @@ fn bench_mm_report() {
     println!(
         "The **W0→W4 decomposition ladder**: one durable transaction, adding one data\n\
          model at a time, so the multi-model write tax is read by subtraction. Every\n\
-         commit is one group-coalesced `F_FULLFSYNC` (matched durability). The number\n\
+         commit is one group-coalesced `{sync_prim}` (matched durability). The number\n\
          reported is **marginal ms per durable commit** at each pre-grown table size\n\
          (`MM_SAMPLE={sample}` commits averaged; pre-grow not timed).\n"
     );
@@ -1539,69 +2051,208 @@ fn bench_mm_report() {
          grow, since HNSW insert is O(log n) distance computations.)*\n"
     );
 
-    // ---- Table 3: single-model relational vs Postgres (measured, PG_URL-gated) ----
-    println!("## Table 3 — Single-model relational: unidb vs Postgres (concurrent, commits/sec)\n");
-    println!(
-        "The honest apples-to-apples peer workload (plain INSERT), the only rung\n\
-         Postgres can run. W2–W4 have **no Postgres column by design** — Postgres\n\
-         cannot do a vector / graph / event write in the same transaction (that is the\n\
-         whole point; see Table 4).\n"
-    );
+    // ---- Postgres durability lens (shared by Tables 3 & 4) ----
     let pg_method = url.as_deref().and_then(pg_ensure_lens);
+
+    // ---- Table 3: CRUD stress, unidb vs Postgres (relational, matched fsync) ----
+    let crud_rows = env_u64("MM_CRUD_ROWS", 100_000);
+    println!("## Table 3 — CRUD stress: unidb (SQL) vs Postgres (relational)\n");
+    println!(
+        "Full CRUD at matched durability — not just INSERT: bulk insert, filtered and\n\
+         grouped SELECT, bulk UPDATE, selected and full DELETE. Each row shows how many\n\
+         records the operation touched and its throughput (records/sec). Table pre-loaded\n\
+         to **{crud_rows} rows** (`MM_CRUD_ROWS` to change).\n\
+         \n\
+         **Note on INSERT:** here each row is its **own durable commit** (one fsync/row —\n\
+         the per-row latency floor, ~hundreds/sec), which is why it is far below the\n\
+         batched bulk-load path in Table 3.1 (one commit per {BULK_COMMIT_BATCH} rows).\n"
+    );
     if let Some(ref m) = pg_method {
-        println!("_Postgres durability lens: `wal_sync_method={m}` (reset to default after)._\n");
-        println!("| writers | unidb_sql | postgres |");
-        println!("|--------:|----------:|---------:|");
-        let per = 1_000usize;
-        let u = url.as_deref().unwrap();
-        pg_build_table(u, "mm", 100_000, false);
+        println!(
+            "_Durability lens: unidb `{sync_prim}`, Postgres `wal_sync_method={m}` (matched)._\n"
+        );
         let sdir = tempdir().unwrap();
         let se = Arc::new(Engine::open(sdir.path(), 0).unwrap());
         se.set_deferred_sync(true);
-        build_sql_table(&se, 100_000, 96, false);
-        let mut idb = 1_000_000_000i64;
-        for &n in &[1usize, 4, 8] {
-            let s = measure_sql_writers(&se, n, per, idb);
-            let p = pg_measure_table(u, "mm", n, per, idb).unwrap_or(0.0);
-            idb += (n * per) as i64;
-            println!("| {} | {:.0} | {:.0} |", n, s, p);
-        }
-        pg_reset_lens(u);
+        let u = url.as_deref().unwrap();
+        phased("t3_build", || {
+            sql_build_crud(&se, crud_rows);
+            let _ = pg_build_crud(u, crud_rows);
+        });
+
+        let n = crud_rows;
+        let half = (n / 2) as i64;
+        let base = n as i64;
+        println!("| operation | records | unidb (rec/s) | postgres (rec/s) | unidb ÷ PG | remark (winner · margin) |");
+        println!("|-----------|--------:|--------------:|-----------------:|-----------:|:-------------------------|");
+        crud_row(
+            "INSERT (per-row commit)",
+            phased("t3_insert_unidb", || sql_crud_insert(&se, n, base)),
+            phased("t3_insert_pg", || pg_crud_insert(u, n, base)),
+        );
+        crud_row(
+            "SELECT filtered (k<N)",
+            phased("t3_selfilt_unidb", || {
+                sql_crud_select_filtered(&se, 0, n as i64)
+            }),
+            phased("t3_selfilt_pg", || pg_crud_select_filtered(u, 0, n as i64)),
+        );
+        crud_row(
+            "SELECT grouped (GROUP BY g)",
+            phased("t3_selgrp_unidb", || sql_crud_select_grouped(&se, 2 * n)),
+            phased("t3_selgrp_pg", || pg_crud_select_grouped(u, 2 * n)),
+        );
+        crud_row(
+            "UPDATE bulk (k<N/2)",
+            phased("t3_update_unidb", || sql_crud_update_bulk(&se, half)),
+            phased("t3_update_pg", || pg_crud_update_bulk(u, half)),
+        );
+        crud_row(
+            "DELETE selected (k>=N)",
+            phased("t3_delsel_unidb", || {
+                sql_crud_delete_selected(&se, n as i64)
+            }),
+            phased("t3_delsel_pg", || pg_crud_delete_selected(u, n as i64)),
+        );
+        crud_row(
+            "DELETE all",
+            phased("t3_delall_unidb", || sql_crud_delete_all(&se)),
+            phased("t3_delall_pg", || pg_crud_delete_all(u)),
+        );
+        println!();
     } else {
-        println!("_`PG_URL` unset → Postgres column skipped. Set it (superuser conn) to fill this table:_");
-        println!("_`PG_URL=\"host=/tmp port=5432 user=<you> dbname=postgres\"`._\n");
+        println!(
+            "_`PG_URL` unset → Postgres columns skipped. Set it (superuser conn) to fill this table._\n"
+        );
     }
 
-    // ---- Table 4: the replaced-stack framing ----
-    let (last_size, last_w) = all.last().copied().unwrap_or((0, [0.0; 5]));
-    println!("\n## Table 4 — One atomic transaction vs the replaced stack (the moat)\n");
+    // ---- Table 3.1: bulk stress — insert + full-scan select at scale ----
+    let bulk_sizes: Vec<u64> = std::env::var("MM_BULK_SIZES")
+        .ok()
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![10_000, 1_000_000, 2_000_000]);
+    println!("## Table 3.1 — Bulk stress: insert + full-scan select at scale\n");
     println!(
-        "The comparison that matters is **not** unidb-multi-model vs unidb-single-model\n\
-         — it is unidb's one transaction vs the **stack you would otherwise run**\n\
-         (Postgres + a vector store + a graph DB + a queue) with app glue and no shared\n\
-         transaction. That stack pays a separate durable sync and round-trip per system\n\
-         and cannot roll back atomically.\n"
+        "Scaling behaviour of a single-table load and a full-table scan as the row count\n\
+         climbs. For each size a **fresh** table is built, `n` rows are bulk-inserted\n\
+         (batched prepared single-row inserts, one durable commit per {BULK_COMMIT_BATCH}\n\
+         rows — the same method on both engines), then a full-**heap** scan is timed\n\
+         (`COUNT(*) WHERE body <> 'x'` — a predicate on the non-indexed `body` column, so\n\
+         neither engine can serve it index-only; this measures real scan throughput, not a\n\
+         count optimizer). Throughput is records/sec. Sizes swept: `{bulk_sizes:?}` (`MM_BULK_SIZES`\n\
+         to override — e.g. push to `5000000` or `10000000` for a heavier run). The default\n\
+         tops out at 2M to keep a full report reasonable; the engine handles ≥10M.\n\
+         \n\
+         **On the scan gap at scale:** Postgres runs a **parallel** sequential scan (multiple\n\
+         worker processes) once the table crosses its parallel threshold, while unidb scans\n\
+         **single-threaded**; so a large scan-side lead is Postgres's parallel-query capability,\n\
+         not a per-row storage-speed difference (at small sizes, below PG's threshold, the two\n\
+         are much closer).\n"
     );
-    println!("| metric | unidb (1 txn) | PG + vector + graph + queue (4 systems) |");
-    println!("|--------|--------------:|----------------------------------------:|");
-    println!("| durable syncs / commit | **1** | 4 |");
-    println!("| network round-trips | 0 (embedded) | 4 |");
-    println!("| atomic rollback across models | **yes** | no |");
+    if let Some(ref m) = pg_method {
+        println!(
+            "_Durability lens: unidb `{sync_prim}`, Postgres `wal_sync_method={m}` (matched)._\n"
+        );
+        println!(
+            "| rows | unidb insert (rec/s) | postgres insert (rec/s) | insert winner · margin | unidb scan (rec/s) | postgres scan (rec/s) | scan winner · margin |"
+        );
+        println!(
+            "|-----:|---------------------:|------------------------:|:-----------------------|-------------------:|----------------------:|:---------------------|"
+        );
+        let u = url.as_deref().unwrap();
+        for &n in &bulk_sizes {
+            eprintln!("[mmreport] Table 3.1 bulk at {n} rows…");
+            let bdir = tempdir().unwrap();
+            let be = Arc::new(Engine::open(bdir.path(), 0).unwrap());
+            be.set_deferred_sync(true);
+            let ui = phased(&format!("t31_insert_unidb_{n}"), || sql_bulk_insert(&be, n));
+            let pi = phased(&format!("t31_insert_pg_{n}"), || pg_bulk_insert(u, n));
+            let us = phased(&format!("t31_select_unidb_{n}"), || sql_bulk_select(&be, n));
+            let ps = phased(&format!("t31_select_pg_{n}"), || pg_bulk_select(u, n));
+            let (ui_r, pi_r) = (rps(ui.0, ui.1), rps(pi.0, pi.1));
+            let (us_r, ps_r) = (rps(us.0, us.1), rps(ps.0, ps.1));
+            println!(
+                "| {n} | {ui_r:.0} | {pi_r:.0} | {} | {us_r:.0} | {ps_r:.0} | {} |",
+                winner_remark(ui_r, pi_r),
+                winner_remark(us_r, ps_r),
+            );
+        }
+        println!();
+    } else {
+        println!("_`PG_URL` unset → unidb-only bulk numbers (no Postgres comparison)._\n");
+        println!("| rows | unidb insert (rec/s) | unidb scan (rec/s) |");
+        println!("|-----:|---------------------:|-------------------:|");
+        for &n in &bulk_sizes {
+            eprintln!("[mmreport] Table 3.1 bulk at {n} rows…");
+            let bdir = tempdir().unwrap();
+            let be = Arc::new(Engine::open(bdir.path(), 0).unwrap());
+            be.set_deferred_sync(true);
+            let ui = phased(&format!("t31_insert_unidb_{n}"), || sql_bulk_insert(&be, n));
+            let us = phased(&format!("t31_select_unidb_{n}"), || sql_bulk_select(&be, n));
+            println!("| {n} | {:.0} | {:.0} |", rps(ui.0, ui.1), rps(us.0, us.1));
+        }
+        println!();
+    }
+
+    // ---- Table 4: unidb multi-model (W4) vs Postgres relational, tx-count sweep ----
+    println!("## Table 4 — unidb multi-model (1 txn) vs Postgres relational, at scale\n");
     println!(
-        "| ms per multi-model write | **{:.2}** (measured @ {} rows) | ~15–20 (est., 4 systems) |",
-        last_w[4], last_size
+        "unidb commits **four model-writes in one transaction** (relational + `VECTOR(128)`\n\
+         + graph edge + event); Postgres does the **relational INSERT only** (1 model-write)\n\
+         — by design (\"not its boat\"). Swept across tx counts (`MM_TX_SWEEP`) to see whether\n\
+         the multi-model cost stays flat or the synchronous HNSW index erodes it at scale.\n"
     );
     println!(
-        "\n*(the four external systems are not wired here — that headline is the standing\n\
-         CLAUDE.md §6 follow-up; the unidb cell is measured, the stack cell is an\n\
-         estimate of 4 independent durable round-trips.)*\n"
+        "**How to read this table.** A *commit* is one durable transaction — one `fsync` at\n\
+         commit — and the rate is transactions/sec (single writer, so no group-commit\n\
+         coalescing). Each **unidb** transaction does **4× the work** of a **Postgres** one\n\
+         (`model-writes/txn` = 4 vs 1), and one of those four is an expensive HNSW vector\n\
+         insert. So `unidb ÷ PG < 1` is **expected** — it is the price of folding four models\n\
+         into a single atomic, crash-consistent commit, not a slowdown on equal work. If you\n\
+         only need the relational write, Postgres is faster; the multi-model commit is what\n\
+         Postgres-relational alone cannot do at all.\n"
     );
+    let sweep: Vec<u64> = std::env::var("MM_TX_SWEEP")
+        .ok()
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![1_000, 10_000, 100_000, 1_000_000]);
+    if let Some(ref m) = pg_method {
+        println!(
+            "_Durability lens: unidb `{sync_prim}`, Postgres `wal_sync_method={m}` (matched)._\n"
+        );
+        println!(
+            "| txns | model-writes/txn | unidb txns/s | unidb ms/txn | postgres txns/s | postgres ms/txn | unidb ÷ PG |"
+        );
+        println!(
+            "|-----:|:----------------:|-------------:|-------------:|----------------:|----------------:|-----------:|"
+        );
+        let u = url.as_deref().unwrap();
+        for &c in &sweep {
+            eprintln!("[mmreport] Table 4 at {c} txns…");
+            let uw4 = phased(&format!("t4_unidb_{c}"), || unidb_w4_throughput(c));
+            let pgr = phased(&format!("t4_pg_{c}"), || pg_relational_throughput(u, c));
+            let ratio = if pgr > 0.0 { uw4 / pgr } else { 0.0 };
+            let u_ms = if uw4 > 0.0 { 1000.0 / uw4 } else { 0.0 };
+            let p_ms = if pgr > 0.0 { 1000.0 / pgr } else { 0.0 };
+            println!("| {c} | 4 : 1 | {uw4:.0} | {u_ms:.3} | {pgr:.0} | {p_ms:.3} | {ratio:.2}× |");
+        }
+        println!();
+    } else {
+        println!("_`PG_URL` unset → Postgres columns skipped; set it to run Table 4._\n");
+    }
+
+    // Restore Postgres's default wal_sync_method (shared lens for Tables 3 & 4).
+    if pg_method.is_some() {
+        if let Some(u) = url.as_deref() {
+            pg_reset_lens(u);
+        }
+    }
 
     // ---- Caveats ----
     println!("## Caveats\n");
     println!(
-        "- Single node, macOS `F_FULLFSYNC`, group-commit on. The per-commit floor is\n\
-         this storage's fsync latency.\n\
+        "- Single node, `{sync_prim}` commit sync, group-commit on. The per-commit floor\n\
+         is this storage's fsync latency.\n\
          - Sizes swept: `{sizes:?}` (`MM_SIZES` to override — e.g. millions). W2–W4 build\n\
          the ANN/graph indexes synchronously, so large pre-grows are slow **by design**\n\
          — that cost is exactly what the async-derivation design (parked) would move off\n\

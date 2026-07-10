@@ -1,0 +1,54 @@
+# Fair-fsync comparison: unidb bench + Postgres, both on Linux, same fsync().
+#
+# Run via `scripts/docker_report.sh` (recommended) or directly:
+#   cd docker && docker compose up --build --abort-on-container-exit --exit-code-from bench
+#
+# The report lands in docker/out/. NOTE: on Docker Desktop for macOS both
+# containers share one Linux VM disk, so the unidb÷PG *ratio* is fair (uniform
+# fsync for both), but absolute "flushed to physical platter" is VM-bound. Run
+# this same compose on a native Linux host for publishable absolute durability.
+name: unidb-fair-bench
+
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_PASSWORD: bench
+      POSTGRES_DB: postgres
+    # Postgres writes to the container's writable layer (real host-backed disk
+    # via overlayfs — NOT tmpfs, so fsync is a genuine durable sync). Deliberately
+    # NO named volume: each run starts from a clean initdb, which keeps the
+    # comparison reproducible and sidesteps the postgres:18 data-dir/mount-point
+    # migration checks that a persisted volume trips.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+
+  bench:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Superuser conn (rust-postgres key=value form) — mmreport needs superuser
+      # for ALTER SYSTEM SET wal_sync_method.
+      PG_URL: "host=postgres port=5432 user=postgres password=bench dbname=postgres"
+      PG_HOST: postgres
+      PG_USER: postgres
+      # Overridable from the host env via docker_report.sh.
+      MM_SIZES: "${MM_SIZES:-1000,10000,100000}"
+      MM_SAMPLE: "${MM_SAMPLE:-200}"
+      MM_CRUD_ROWS: "${MM_CRUD_ROWS:-100000}"
+      MM_BULK_SIZES: "${MM_BULK_SIZES:-10000,1000000,2000000}"
+      MM_TX_SWEEP: "${MM_TX_SWEEP:-1000,10000,100000,1000000}"
+      # Phase-window file on the shared /out volume — the host docker-stats
+      # sampler correlates these windows to per-container CPU/mem (Part 2).
+      MM_PHASES: "/out/phases.csv"
+      GIT_COMMIT: "${GIT_COMMIT:-}"
+      GIT_BRANCH: "${GIT_BRANCH:-}"
+    volumes:
+      - ./out:/out

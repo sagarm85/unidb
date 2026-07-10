@@ -40,11 +40,18 @@ fi
 
 # Environment header facts (best-effort; blank if a tool is missing).
 DATE="$(date '+%Y-%m-%d %H:%M:%S %Z')"
-GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo '?')"
-GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+GIT_COMMIT="${GIT_COMMIT:-$(git rev-parse --short HEAD 2>/dev/null || echo '?')}"
+GIT_BRANCH="${GIT_BRANCH:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')}"
 CPU="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m)"
 NCPU="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo '?')"
 OS="$(uname -sr)"
+# unidb's commit sync primitive on THIS platform: macOS resolves File::sync_all
+# to F_FULLFSYNC (flush-to-platter); Linux (incl. the Docker image) uses plain
+# fsync. Detect it so the header matches where the bench actually ran.
+case "$(uname -s)" in
+  Darwin) SYNC_PRIM="F_FULLFSYNC" ;;
+  *)      SYNC_PRIM="fsync" ;;
+esac
 SIZES_SHOWN="${MM_SIZES:-1000,10000,100000}"
 SAMPLE_SHOWN="${MM_SAMPLE:-200}"
 PG_SHOWN="$([[ -n "${PG_URL:-}" ]] && echo 'set (Postgres column measured)' || echo 'unset (Postgres column skipped)')"
@@ -53,13 +60,19 @@ BODY="$(mktemp)"; TIMEFILE="$(mktemp)"
 trap 'rm -f "$BODY" "$TIMEFILE"' EXIT
 
 echo "[multi_model_report] running ladder (sizes=$SIZES_SHOWN, sample=$SAMPLE_SHOWN)…" >&2
-# /usr/bin/time -l gives peak RSS on macOS; fall back to plain run elsewhere.
+# Peak RSS is captured out-of-band. macOS BSD `time -l` reports it in BYTES;
+# GNU `time -v` (Linux, incl. the Docker image) reports "Maximum resident set
+# size (kbytes)". Try each; fall back to a plain run (RSS n/a) if neither works.
+RSS_BYTES=""
 if /usr/bin/time -l true >/dev/null 2>&1; then
   UNIDB_BENCH=mmreport /usr/bin/time -l "$BIN" >"$BODY" 2>"$TIMEFILE" || true
-  RSS_BYTES="$(grep -i 'maximum resident set size' "$TIMEFILE" | awk '{print $1}' | head -1 || true)"
+  RSS_BYTES="$(awk '/maximum resident set size/{print $1; exit}' "$TIMEFILE")"
+elif /usr/bin/time -v true >/dev/null 2>&1; then
+  UNIDB_BENCH=mmreport /usr/bin/time -v "$BIN" >"$BODY" 2>"$TIMEFILE" || true
+  RSS_KB="$(awk -F': ' '/Maximum resident set size/{print $2; exit}' "$TIMEFILE")"
+  [[ -n "${RSS_KB:-}" ]] && RSS_BYTES=$(( RSS_KB * 1024 ))
 else
   UNIDB_BENCH=mmreport "$BIN" >"$BODY" 2>"$TIMEFILE" || true
-  RSS_BYTES=""
 fi
 if [[ -n "${RSS_BYTES:-}" ]]; then
   RSS_MIB="$(awk -v b="$RSS_BYTES" 'BEGIN{printf "%.0f MiB", b/1048576}')"
@@ -77,7 +90,7 @@ fi
   echo "| Date | $DATE |"
   echo "| Commit | \`$GIT_COMMIT\` (branch \`$GIT_BRANCH\`) |"
   echo "| Machine | $CPU · $NCPU cores · $OS |"
-  echo "| Build | \`--release\`, group-commit (one \`F_FULLFSYNC\` per commit) |"
+  echo "| Build | \`--release\`, group-commit (one \`$SYNC_PRIM\` per commit) |"
   echo "| Sizes swept | $SIZES_SHOWN |"
   echo "| Marginal sample | $SAMPLE_SHOWN commits/point |"
   echo "| Postgres | $PG_SHOWN |"

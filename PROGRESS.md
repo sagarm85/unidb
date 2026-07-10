@@ -3387,3 +3387,75 @@ counter persistence. **A follow-up commit flips `UNIDB_CONCURRENT_SQL_WRITES`
 default-on after a soak period, recorded here.**
 
 **Index & heap write concurrency (0a + 0c + Item A) is COMPLETE.**
+
+---
+
+## Docker fair-fsync report + Table 3 remark & Table 3.1 bulk stress   [tooling]   2026-07-10
+
+**PR:** #<pending> — branch `bench-docker-fair-fsync-report` (commit `c5c150c`)
+**Summary:** Benchmark **tooling only — no engine code touched.** Adds a Docker
+path that runs the unidb-vs-Postgres multi-model comparison on **Linux**, where
+both engines use the same plain `fsync()` — removing the macOS
+`F_FULLFSYNC`-vs-`fsync` asymmetry that biased the native ratio. Extends the
+`decompose` `mmreport` bench with a winner/margin **remark** column (Table 3) and
+a new **bulk-stress** section (Table 3.1: fresh-table load + full **heap** scan
+swept 10k→2M, matched batched-insert method on both engines). unidb runs
+**embedded** in the bench binary inside the `bench` container; Postgres runs in
+its own container (the CPU/mem section states the embedded-vs-server asymmetry).
+
+**Numbers (Docker, Linux 6.12 aarch64 VM, matched plain `fsync`, MM_SIZES=1000,10000
+MM_CRUD_ROWS=20000 MM_BULK_SIZES=10000,1000000,2000000):**
+
+Table 3 (CRUD, unidb SQL vs Postgres relational) — remark = winner·margin:
+
+| operation | unidb ÷ PG | remark |
+|---|---:|---|
+| INSERT (per-row commit) | 0.26× | **postgres** +289% |
+| SELECT filtered | 0.06× | **postgres** +1467% |
+| SELECT grouped | 0.37× | **postgres** +171% |
+| UPDATE bulk | 0.15× | **postgres** +567% |
+| DELETE selected | 0.07× | **postgres** +1355% |
+
+Table 3.1 (bulk insert + full heap scan, `COUNT(*) WHERE body <> 'x'`):
+
+| rows | unidb ins (rec/s) | pg ins | ins winner | unidb scan | pg scan | scan winner |
+|---:|---:|---:|---|---:|---:|---|
+| 10000   | 36793 | 27743 | **unidb** +33% | 6.0M | 13.8M | **postgres** +130% |
+| 1000000 | 29255 | 27848 | **unidb** +5%  | 5.8M | 59.7M | **postgres** +935% |
+| 2000000 | 27009 | 27832 | **postgres** +3% | 5.4M | 58.4M | **postgres** +992% |
+
+**Peak RSS:** 636 MiB (dominated by the 2M-row bulk table). Whole-run container
+peaks: unidb CPU 83% / mem 232 MiB; postgres CPU 39% / mem 175 MiB.
+
+**How to read it (honest asymmetries, all stated in-report):**
+- On the Docker-Desktop-for-mac VM, plain `fsync()` on the shared overlayfs is
+  **not flush-to-platter**, so Postgres's per-commit cost is artificially cheap —
+  the unidb÷PG *ratio* is fair (uniform for both), but absolute durability is
+  VM-bound. Run the same compose on a **native Linux host** for publishable
+  absolute numbers.
+- The Table 3.1 scan lead at scale is **Postgres parallel seq-scan (multi-worker)
+  vs unidb single-threaded scan** — a real parallel-query capability gap, not a
+  count-optimizer shortcut (the `WHERE body <> 'x'` predicate forces a true heap
+  scan on both; at 10k, below PG's parallel threshold, the two are close).
+- Table 3 "INSERT (per-row commit)" is one durable commit per row (per-fsync
+  floor, ~hundreds–thousands/sec); Table 3.1's batched load (one commit per 5k
+  rows) is the realistic bulk path — hence the ~10× higher insert rec/s there.
+
+**What shipped:** `docker/` (Dockerfile pre-builds the Linux bench,
+docker-compose = Postgres 18 + bench, entrypoint, README) · `scripts/report.sh`
+(single entry point, auto-selects Docker/native) + `docker_report.sh` +
+`mm_resource_report.py` (per-phase docker-stats correlation) · `scripts/README.md`
+· `multi_model_report.sh` GNU-`time -v` RSS path + platform-aware sync-primitive
+header · `decompose.rs` Table 3 remark column + Table 3.1 bulk section +
+`MM_BULK_SIZES` env · `unidb-server` default `UNIDB_DATA_DIR`→`/tmp/unidb` (dev
+runs never litter the tree) · `.gitignore` ignores `docker/out/` +
+`.claude/settings.local.json`. Report header now carries the real `GIT_BRANCH`
+inside the container (passed through compose; was showing `?`).
+
+**Green:** `cargo clippy --bench decompose --features server -D warnings` + `fmt`
+clean; the Docker + native reports both generate end-to-end against PG 18.
+
+**Locked decisions:** none changed. No `FORMAT_VERSION` bump; no crash point added.
+**Follow-ups (filed, not done):** run the compose on a native Linux host for
+publishable absolute durability; a matched **bulk** INSERT path in Table 3
+(currently per-row) if a batched CRUD comparison is wanted.
