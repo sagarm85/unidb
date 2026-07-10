@@ -142,8 +142,9 @@ cargo fmt --all             # format gate
 
 ## 9. PR / commit workflow
 
+- **Backlog docs follow `docs/backlog/CONVENTIONS.md`** — read it before creating or renaming a backlog file. In short: every effort is one of **Phase / Milestone / Improvement / Performance**; the `phase<N>_` filename prefix is **reserved** for `roadmap.md`'s numbered phases, everything else is a plain descriptive `snake_case` slug (no `phase` in the name, no internal sub-parts like `_phaseA_B` in the filename — name those inside the doc). Each file opens with a `**Type:**` + `**Status:**` header; metrics live in `PROGRESS.md`, not the backlog file.
 - **One PR per milestone.** The PR description **must** contain the benchmark metrics table (§6) and a note on peak memory.
-- Conventional commits (`feat:`, `fix:`, `test:`, `bench:`, `docs:`, `refactor:`).
+- Conventional commits (`feat:`, `fix:`, `test:`, `bench:`, `docs:`, `refactor:`, `perf:`).
 - Every PR: `cargo fmt` clean, `clippy -D warnings` clean, all tests + crash harness green, benchmarks recorded.
 - Update `PROGRESS.md` (milestone entry with metrics + PR link) and `MEMORY.md` (current state) in the same PR.
 - **Before every push or PR, check `README.md` and every file under `docs/` for staleness — not just `PROGRESS.md`/`MEMORY.md`.** `PROGRESS.md` gets updated reliably because it's part of the per-milestone habit; `README.md` and `docs/` (`docs/design/engine_design.md`, `docs/REST_API.md`, `docs/backlog/*.md`) do not update themselves and have gone stale in the past (e.g. a design doc left claiming a shipped milestone was "not started," and once documenting a policy that had since been reverted as a bug fix). Concretely, for any change that touches the public surface (new/changed API, new module, new deployment mode, a reverted design decision, a milestone opened or closed):

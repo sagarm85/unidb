@@ -1087,7 +1087,7 @@ heap version + xmax stamp + a fresh index entry per row, ~619 B/row WAL) where
 Postgres uses **HOT** (in-place, same page, no index touch) — closing it needs a
 forward-chained heap / RowId-preserving update (**A2**, fiddly against the MVCC
 model), and DELETE/scan cost needs decode-pushdown + parallelism (**Phase B**).
-See `docs/backlog/crud_performance_phaseA_B.md` and `PROGRESS.md`'s Phase A entry.
+See `docs/backlog/crud_performance.md` and `PROGRESS.md`'s Phase A entry.
 **Read path — crud-perf Phase B (2026-07-10):** ~~the executor decoded the whole
 row (every column incl. the `TEXT body` `String`) for every scanned row~~
 (**fixed**: `deform_row` materializes only the predicate/projection columns and

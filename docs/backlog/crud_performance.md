@@ -1,4 +1,12 @@
-# CRUD performance — Phase A (write path) + Phase B (scan/read path)
+# CRUD performance — write path + scan/read path
+
+**Type:** Performance
+**Status:** SHIPPED (→ PROGRESS.md "CRUD performance — Phase A" + "… — Phase B")
+
+> Filename note (backlog `CONVENTIONS.md`): this is **Performance** work with
+> internal *Phase A/B* stages — it is **not** a numbered roadmap phase, so the
+> file is `crud_performance.md` (renamed from `crud_performance_phaseA_B.md`; the
+> reserved `phase<N>_` prefix is only for `roadmap.md`'s numbered phases).
 
 ## Status as of 2026-07-10: **Phase A SHIPPED** · **Phase B SHIPPED**
 

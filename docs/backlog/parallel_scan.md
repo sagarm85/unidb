@@ -1,5 +1,8 @@
 # Parallel scan workers (Postgres-style) — design doc
 
+**Type:** Milestone
+**Status:** SHIPPED (→ PROGRESS.md "Milestone P — parallel scan workers")
+
 ## Status as of 2026-07-10: **SHIPPED** (P-a + P-b), branch `parallel-scan`
 
 Shipped 2026-07-10 — see `PROGRESS.md`'s "Milestone P — parallel scan workers"
