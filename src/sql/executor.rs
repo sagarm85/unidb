@@ -1431,10 +1431,16 @@ fn index_matching_rows(
         return Ok(None);
     };
     let tree = DiskBTree::new(meta_page, ctx.page_size);
-    let candidate_ids = match tree.search(op, &value, ctx.pool)? {
+    let mut candidate_ids = match tree.search(op, &value, ctx.pool)? {
         Some(ids) => ids,
         None => return Ok(None),
     };
+    // B5: resolve candidates in physical (page, slot) order so `heap.get` walks
+    // the heap sequentially-ish instead of randomly — the bitmap-heap-scan idea
+    // that softens the A3 random-access cost on a fragmented table (index/key
+    // order can scatter across pages after updates). Order doesn't matter for
+    // UPDATE/DELETE, which touch every matched row.
+    candidate_ids.sort_unstable_by_key(|r| (r.page_id, r.slot));
 
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
