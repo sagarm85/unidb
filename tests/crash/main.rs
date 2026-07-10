@@ -1052,6 +1052,136 @@ fn p13_durable_btree_recovered_from_wal_after_total_data_loss() {
     }
 }
 
+// ── P29: coalesced UPDATE index maintenance survives a crash (A1) ────────────
+//
+// A1 (crud_performance_phaseA) changed UPDATE to accumulate every touched row's
+// B-tree entries and flush them **coalesced** (`DiskBTree::insert_many` — one
+// full-page `WAL_INDEX` image per dirtied leaf instead of one per row). This is
+// a new WAL pattern on the write+index path, so it gets its own crash point:
+//
+//   (a) A committed bulk UPDATE that leaves the indexed column *unchanged*
+//       (`body`-only) must, after a crash with no checkpoint, still resolve
+//       every row through the B-tree at its key — i.e. the coalesced index
+//       images were fsynced and are replayed by recovery (no rebuild).
+//   (b) An UPDATE that *changes* the indexed key must, after the same crash,
+//       resolve the row at its NEW key and not its old one.
+//   (c) An *incomplete* UPDATE (mutations WAL-appended, never committed → the
+//       drop is the crash) must leave no trace: recovery undoes the heap
+//       versions, and any redo-only index image that replayed is a stale hint
+//       filtered by MVCC re-validation — so a point lookup returns the
+//       pre-update row exactly, never a phantom.
+#[test]
+fn p29_coalesced_update_index_survives_crash() {
+    let dir = tempdir().unwrap();
+    let n = 400i64;
+
+    // Build an indexed table and commit it (case a/b setup).
+    {
+        let engine = open(dir.path());
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, k INT, body TEXT)")
+            .unwrap();
+        engine
+            .execute_sql(xid, "CREATE INDEX t_k ON t USING BTREE (k)")
+            .unwrap();
+        for i in 0..n {
+            engine
+                .execute_sql(
+                    xid,
+                    &format!("INSERT INTO t (id, k, body) VALUES ({i}, {i}, 'orig')"),
+                )
+                .unwrap();
+        }
+        engine.commit(xid).unwrap();
+
+        // (a) Bulk UPDATE of a non-indexed column over most of the table — this
+        // exercises the coalesced multi-entry-per-leaf WAL_INDEX path.
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(
+                xid,
+                &format!("UPDATE t SET body = 'changed' WHERE k < {}", n - 1),
+            )
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        // (b) Change one indexed key.
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "UPDATE t SET k = 100000 WHERE k = 50")
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        drop(engine); // "crash" — no checkpoint; index lives only in the WAL
+    }
+
+    let ids_where = |engine: &Engine, sql: &str| -> Vec<i64> {
+        let xid = engine.begin().unwrap();
+        let res = engine.execute_sql(xid, sql).unwrap();
+        engine.commit(xid).unwrap();
+        let mut out = Vec::new();
+        for r in res {
+            if let unidb::SqlResult::Rows { rows, .. } = r {
+                for row in rows {
+                    if let Some(unidb::sql::logical::Literal::Int(v)) = row.first() {
+                        out.push(*v);
+                    }
+                }
+            }
+        }
+        out
+    };
+
+    {
+        let engine = open(dir.path());
+        // (a) every unchanged-key row still resolves via the B-tree.
+        for k in [0i64, 1, 49, 51, 200, n - 1] {
+            assert_eq!(
+                ids_where(&engine, &format!("SELECT id FROM t WHERE k = {k}")),
+                vec![k],
+                "P29(a): row k={k} must resolve via the WAL-recovered coalesced index"
+            );
+        }
+        // (b) the re-keyed row moved.
+        assert!(
+            ids_where(&engine, "SELECT id FROM t WHERE k = 50").is_empty(),
+            "P29(b): old key must be gone after a committed key change + crash"
+        );
+        assert_eq!(
+            ids_where(&engine, "SELECT id FROM t WHERE k = 100000"),
+            vec![50],
+            "P29(b): row must resolve at its new key after recovery"
+        );
+        drop(engine);
+    }
+
+    // (c) An incomplete UPDATE leaves no phantom.
+    {
+        let engine = open(dir.path());
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, &format!("UPDATE t SET k = 200000 WHERE k < {}", n - 1))
+            .unwrap();
+        // No commit — the drop is the crash. Its heap versions + coalesced index
+        // images are WAL-appended but the user txn never reached COMMIT.
+        drop(engine);
+    }
+    {
+        let engine = open(dir.path());
+        assert!(
+            ids_where(&engine, "SELECT id FROM t WHERE k = 200000").is_empty(),
+            "P29(c): an uncommitted UPDATE must leave no row at the phantom key"
+        );
+        // The pre-crash committed state is intact.
+        assert_eq!(
+            ids_where(&engine, "SELECT id FROM t WHERE k = 0"),
+            vec![0],
+            "P29(c): the committed row must remain resolvable at its original key"
+        );
+    }
+}
+
 // ── P17: durable vector index survives a crash (P3.c) ────────────────────────
 //
 // The vector index is a durable on-disk IVF-Flat (P3.c): its centroid/meta pages

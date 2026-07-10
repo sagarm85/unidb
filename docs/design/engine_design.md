@@ -1074,7 +1074,20 @@ durable_fsm_catalog_pagelist.md`); ~~256-frame buffer pool + `BufferPoolFull` at
 ~~`alloc_page` remaps the whole file per page~~ (**fixed P1.c**: chunked
 growth); ~~HNSW full rebuild per upsert~~ (**fixed P3.c**: durable IVF-Flat, O(1)
 open); ~~CSR full rebuild per debounce pass~~ (retired in P3.b); `poll_events`
-full-scan (needs a `seq` index); SSE poll-per-subscriber.
+full-scan (needs a `seq` index); SSE poll-per-subscriber; ~~UPDATE re-indexed
+every row with a full-page `WAL_INDEX` image *per row*~~ (**fixed by
+crud-perf Phase A, 2026-07-10**: `exec_update` now accumulates every touched
+row's B-tree entries and flushes them **coalesced** via `DiskBTree::insert_many`
+— one leaf image per statement, not per row — dropping index-maintenance WAL
+from ~8868 to ~619 B/row, UPDATE-bulk 0.11× → 0.34× vs Postgres; a selectivity-
+gated `index_matching_rows` also drives *selective* UPDATE/DELETE off the B-tree
+instead of a full scan). **Remaining write-path debt (the path to UPDATE
+*parity*, deferred):** UPDATE still pays the insert-new-version MVCC cost (a new
+heap version + xmax stamp + a fresh index entry per row, ~619 B/row WAL) where
+Postgres uses **HOT** (in-place, same page, no index touch) — closing it needs a
+forward-chained heap / RowId-preserving update (**A2**, fiddly against the MVCC
+model), and DELETE/scan cost needs decode-pushdown + parallelism (**Phase B**).
+See `docs/backlog/crud_performance_phaseA_B.md` and `PROGRESS.md`'s Phase A entry.
 
 Functional gaps (deliberate scope, tracked): ~~RC re-evaluation
 (EvalPlanQual) unimplemented~~ and ~~SSI is a no-op seam~~ (**both fixed P1.d**

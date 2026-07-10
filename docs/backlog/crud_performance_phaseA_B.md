@@ -1,6 +1,49 @@
 # CRUD performance — Phase A (write path) + Phase B (scan/read path)
 
-## Status as of 2026-07-10: **NOT STARTED** (planned)
+## Status as of 2026-07-10: **Phase A SHIPPED** · Phase B not started
+
+Phase A shipped 2026-07-10 (branch `crud-perf-phaseA`) — see `PROGRESS.md`'s
+"CRUD performance — Phase A" entry for the full before/after tables. **Phase B
+(scan/read path) is not started.**
+
+> **Correction (2026-07-10) — the evidence-based ethos of §0.5/§6 applied to
+> this doc, not a silent rewrite.** Two things below did not survive contact
+> with the code and were corrected during implementation:
+>
+> 1. **A1 as originally specified ("skip index maintenance for unchanged
+>    indexed columns") is incorrect on this engine and was NOT shipped as
+>    written.** The doc assumed an in-place update; the engine does
+>    insert-new-version (`heap.update` writes a *new* RowId, backward-only
+>    version chain, and `heap.get` does not walk forward). Skipping the index
+>    entry therefore leaves the live row **unfindable by any index scan** —
+>    verified empirically (a point `SELECT … WHERE k = x` returned `[]` after a
+>    non-key UPDATE with the index write skipped). What actually shipped as A1
+>    is **WAL coalescing**: every entry is still inserted (correctness), but
+>    `DiskBTree::insert_many` logs each dirtied leaf **once per statement**
+>    instead of a full-page `WAL_INDEX` image per row. This delivers the same
+>    RC2 WAL win (8868 → 619 B/row, 14×) *without* the correctness bug. Human
+>    sign-off recorded in `PROGRESS.md`.
+> 2. **A2 (HOT-style same-page update) was NOT attempted — it is genuinely
+>    "fiddly against the MVCC version model."** True HOT needs a forward-chained
+>    heap + a stable index target + reader forward-walk (an on-disk-format and
+>    recovery change), or an in-place overwrite that is unsafe for concurrent
+>    snapshots. Deferred as a follow-up (it is the real path to UPDATE *parity*).
+> 3. **A3 is shipped but *gated by selectivity* (`index_lookup_is_selective`).**
+>    Measured: unconditionally driving UPDATE/DELETE from the index *regressed*
+>    a 50%-selective DELETE (random heap access loses to a sequential scan when
+>    matches are not few). So equality always takes the index; a range takes it
+>    only when ANALYZE stats estimate selectivity ≤ 0.3.
+> 4. **Acceptance revised (human sign-off in `PROGRESS.md`).** The original
+>    ≥0.8× write-path target is architecturally unreachable in Phase A's scope —
+>    the residual gap after A1 is the insert-new-version MVCC cost (needs HOT/A2)
+>    and PG's parallel/tight-C scan+mark-delete (needs Phase-B decode-pushdown +
+>    parallelism), **not removable waste**. The achieved, honest result: UPDATE
+>    bulk **0.11× → 0.34×** (index-WAL waste eliminated, 14× less WAL), DELETE
+>    selected **no regression**, INSERT/SELECT unchanged, crash harness **29/29**.
+
+---
+
+## Original plan (below, as written before implementation)
 
 Core-lane performance work. Closes the CRUD-stress gap surfaced by the
 multi-model report (`benches/decompose.rs`, Table 3 + Table 3.1) against a

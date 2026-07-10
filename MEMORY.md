@@ -12,6 +12,51 @@
 
 ## Current status
 
+- **CRUD performance — Phase A (write path) — SHIPPED (2026-07-10), branch
+  `crud-perf-phaseA`, PR pending.** Closes the Table-3 UPDATE-bulk CRUD-stress
+  gap vs matched-durability Postgres 18.4. **Headline: UPDATE bulk 0.11× →
+  0.34×** (3.3× faster) by collapsing index-maintenance WAL **8868 → 619 B/row
+  (14×)**; DELETE selected no regression; INSERT/SELECT untouched; crash harness
+  **28 → 29**. Ordered checkpoints C1 → A1 → A3 → A4 (each its own commit). **Two
+  sign-offs (recorded in `PROGRESS.md`):**
+  - **A1 shipped as WAL *coalescing*, NOT the plan's "skip unchanged-column
+    index maintenance" — the plan's skip is provably incorrect here.** This
+    engine does insert-new-version (`heap.update` → new RowId, backward-only
+    chain; `heap.get` never walks forward), so the B-tree is the ONLY
+    forward-resolution mechanism; skipping an entry makes the live row
+    **unfindable by any index scan** (verified: a point `SELECT … WHERE k=x`
+    returned `[]` after a non-key UPDATE with the write skipped). What shipped:
+    `DiskBTree::insert_many` logs each dirtied leaf **once per statement**
+    (per-leaf latch, re-read under latch, fallback to per-entry crabbing insert
+    on split/boundary), keeping every entry. Same RC2 win, no bug. Redo-only
+    `WAL_INDEX` unchanged; no `FORMAT_VERSION` bump.
+  - **A2 (HOT same-page update) NOT attempted** — genuinely fiddly against the
+    MVCC model (needs forward-chained heap + stable index target + reader
+    forward-walk = format + recovery change; naive in-place is unsafe for
+    concurrent snapshots). It is the real path to UPDATE *parity* — filed.
+  - **A3 (index-driven UPDATE/DELETE via `index_matching_rows`) is
+    selectivity-GATED** (`index_lookup_is_selective`): equality always uses the
+    index; a range only when ANALYZE (P4.d) stats say selectivity ≤ 0.3. Measured:
+    forcing the index on a 50%-selective DELETE **regressed** it (random heap
+    access loses to a sequential scan when matches aren't few). The bench now
+    `ANALYZE`s both engines before UPDATE/DELETE so each planner is stats-informed
+    (fair + demonstrates the gate: 25% UPDATE → index dec/row 1.00, 50% DELETE →
+    scan dec/row 2.00).
+  - **A4** — `exec_update` computes `has_unique` once and skips the per-row
+    `snapshot_for_statement` + `enforce_unique` scan when the table has no UNIQUE
+    set (was allocated per row).
+  - **Acceptance revised (sign-off):** the original ≥0.8× write-path target is
+    architecturally unreachable in scope — after A1 removed the *removable*
+    index-WAL waste, the residual is the insert-new-version MVCC cost (needs
+    HOT/A2) and PG's parallel/tight-C scan+mark-delete (needs Phase-B
+    decode-pushdown). Shipped the measured win; filed A2 + Phase B as the path to
+    parity. **Phase B (scan/read path) not started.**
+  - **C1 measurement infra:** `Engine::wal_total_bytes_appended` (cumulative WAL
+    bytes, survives truncation) + `Engine::rows_decoded_total` (a `ROWS_DECODED`
+    atomic in `decode_row`); `decompose.rs` Table 3 gained WAL-B/row + dec/row
+    columns. New crash point **P29**. Full before/after in `PROGRESS.md`'s "CRUD
+    performance — Phase A" entry; spec `docs/backlog/crud_performance_phaseA_B.md`
+    (status flipped, with an inline correction block).
 - **Docker fair-fsync report + Table 3 remark & Table 3.1 bulk stress — DONE
   (2026-07-10), branch `bench-docker-fair-fsync-report` (commit `c5c150c`), PR
   raised.** **Benchmark tooling only — NO engine code touched; no
@@ -2621,6 +2666,37 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-10 — CRUD performance Phase A (write path), branch `crud-perf-phaseA`
+
+Executed Phase A of `docs/backlog/crud_performance_phaseA_B.md` (C1 → A1 → A3 →
+A4; A2 deferred). Commits: `7ba6aad` C1 instrumentation, `da1194c` A1 coalesce,
+`c63a509` A3+A4, `c8c9c1c` bench ANALYZE. Full detail in `PROGRESS.md`'s "CRUD
+performance — Phase A" entry and the Current-status bullet above.
+
+- **Discovered the plan's A1 ("skip unchanged-column index maintenance") is
+  incorrect on this engine** and proved it empirically (a point `SELECT WHERE
+  k=x` returned `[]` after a non-key UPDATE with the index write skipped —
+  because `heap.update` writes a new RowId, the chain is backward-only, and
+  `heap.get` never walks forward, so the B-tree is the only forward resolver).
+  Paused, showed the user the evidence, and shipped the correct alternative
+  (WAL coalescing via `DiskBTree::insert_many`) — same RC2 win (WAL 8868 → 619
+  B/row, 14×), no correctness bug.
+- **Discovered the ≥0.8× write-path acceptance is architecturally unreachable
+  in scope** (residual UPDATE gap = insert-new-version MVCC cost → needs HOT/A2;
+  DELETE gap = PG parallel/tight-C scan+mark-delete → needs Phase-B
+  decode-pushdown). Paused, the user chose to ship the measured win + revise the
+  acceptance + file A2 and Phase B as the path to parity.
+- **A3 gated by selectivity** after measuring that an ungated index path
+  *regressed* a 50%-selective DELETE; bench now `ANALYZE`s both engines so the
+  gate routes correctly (UPDATE 25% → index, DELETE 50% → scan).
+- **Measurement discipline note:** two early "regression" runs were contaminated
+  by *stray `criterion` bench processes left alive from earlier background runs*
+  (load avg ~5, 2–3 concurrent `decompose` procs). Lesson: `pkill -f decompose`
+  and confirm a single process before trusting a bench delta — criterion does
+  not exit when the parent shell is killed.
+- Crash harness 28 → **29** (P29). No `FORMAT_VERSION` bump; no §3 decision
+  reopened. Peak RSS ~18.5 MB (buffer-pool-bounded, unchanged).
 
 ### 2026-07-10 — Coordinator: post-merge verify + main-unbreak hotfix
 

@@ -3459,3 +3459,113 @@ clean; the Docker + native reports both generate end-to-end against PG 18.
 **Follow-ups (filed, not done):** run the compose on a native Linux host for
 publishable absolute durability; a matched **bulk** INSERT path in Table 3
 (currently per-row) if a batched CRUD comparison is wanted.
+
+## CRUD performance — Phase A (write path)   [SHIPPED]   2026-07-10
+
+**PR:** _pending_ — branch `crud-perf-phaseA`
+**Spec:** `docs/backlog/crud_performance_phaseA_B.md` (status flipped to
+Phase-A-SHIPPED, with an inline correction block — see below).
+**Summary:** Closes the Table-3 UPDATE-bulk CRUD-stress gap the multi-model
+report surfaced (`benches/decompose.rs`) against a matched-durability Postgres
+18.4 baseline. The single biggest win — eliminating a full-page `WAL_INDEX`
+image *per updated row* for the index maintenance an UPDATE performs — lands as
+**WAL coalescing** (one image per dirtied B-tree leaf per statement), plus a
+selectivity-gated index-driven UPDATE/DELETE path and a de-looped update loop.
+INSERT (fsync-bound, at parity) was not touched. Checkpoints C1 → A1 → A3 → A4
+(A2 deferred — see below).
+
+**Two locked-in decisions with human sign-off (2026-07-10):**
+1. **A1 shipped as WAL coalescing, NOT the plan's "skip unchanged-column index
+   maintenance."** The plan's skip is *incorrect* on this engine — proven
+   empirically. `heap.update` does insert-new-version (a new RowId, backward-only
+   chain) and `heap.get` never walks forward, so the index is the *only*
+   forward-resolution mechanism; skipping an entry makes the live row
+   unfindable by an index scan (a point `SELECT … WHERE k = x` returned `[]`
+   after a non-key UPDATE with the write skipped). The user was shown the
+   evidence and chose the correct alternative: keep every entry, coalesce the
+   WAL. Same RC2 win, no correctness bug.
+2. **Phase A acceptance revised from ≥0.8× to the honest achievable result.**
+   The original ≥0.8× write-path target is architecturally unreachable in Phase
+   A's scope: after A1 removed the *removable* index-WAL waste, the residual
+   UPDATE gap is the **insert-new-version MVCC cost itself** (a new heap version
+   + xmax stamp + a fresh index entry per row — Postgres uses HOT, in-place, no
+   index touch), and the DELETE gap is Postgres's **parallel seq-scan +
+   tight-C mark-delete**. Closing them needs HOT (**A2**) and Phase-B
+   decode-pushdown + parallelism — not removable waste. The user approved
+   shipping the measured win and filing those as the path to parity.
+
+**Benchmarks** (release, native macOS 26.4, Apple M5 Pro; unidb `F_FULLFSYNC`
+vs Postgres 18.4 `wal_sync_method=fsync_writethrough` — **matched durability**;
+20,000-row table pre-loaded, grown to 40,000 by the INSERT phase, then
+`ANALYZE`d on both engines; one `begin…commit` per op, so per-row cost is CPU +
+WAL volume, not fsync). C1 added two proof columns: **WAL B/row** (cumulative
+WAL bytes ÷ records) and **dec/row** (full-row heap decodes ÷ records).
+
+| operation | unidb rec/s before → after | ÷PG before → after | WAL B/row before → after | dec/row before → after |
+|-----------|----------------------------|--------------------|--------------------------|------------------------|
+| INSERT (per-row commit) | 302 → 302 | 0.98× → 0.99× | 8833 (unchanged) | 0 |
+| SELECT filtered (k<N) | 266,519 → 265,238 | 0.14× → 0.14×¹ | 0 | 2.00 |
+| SELECT grouped (GROUP BY) | 4,350,999 → 4,827,760 | 0.79× → 0.79×¹ | 0 | 1.00 |
+| **UPDATE bulk (k<N/2, 25%)** | **34,833 → 114,485** | **0.11× → 0.34×** | **8868 → 619** | **4.00 → 1.00** |
+| **DELETE selected (k≥N, 50%)** | 300,594 → 297,668 | 0.23× → 0.22× | 230 | 2.00 |
+| DELETE all | 301,871 → 314,009 | 0.20× → 0.24× | 196 | 1.00 |
+
+¹ SELECT is **not touched by Phase A** (it is Phase B, the read path); unidb's
+absolute SELECT throughput is unchanged. Individual `÷PG` cells vary run-to-run
+because the Postgres side is measured on the same loaded machine and had a
+faster run in one measurement (e.g. filtered SELECT PG 1.96M → 5.46M rec/s while
+unidb held ~265k) — the ratio wobble is Postgres-side variance, not a unidb
+change. The write-path rows (UPDATE/DELETE) are the Phase-A signal.
+
+**Peak RSS:** ~18.5 MB (buffer-pool-bounded). Phase A adds only bounded
+per-statement allocations (the coalesced index-entry batch and the candidate
+de-dup set, both O(rows the statement touches)), so the memory profile is
+unchanged from the pre-Phase-A engine.
+
+**Headline:** **UPDATE bulk 0.11× → 0.34×** — a 3.3× throughput gain driven by
+collapsing index-maintenance WAL from **8868 → 619 B/row (14× less)**; the
+residual 619 B/row is the heap new-version cost, not index waste. **DELETE
+selected has no regression** (the A3 gate correctly keeps a 50%-selective range
+on the sequential scan). INSERT and SELECT unchanged.
+
+**What changed:**
+- **C1 (measurement first, per §6)** — `Wal::total_bytes_appended` (cumulative,
+  survives checkpoint truncation) + `Engine::wal_total_bytes_appended`; a
+  `ROWS_DECODED` atomic bumped in `decode_row` + `Engine::rows_decoded_total`;
+  `benches/decompose.rs` Table 3 gained WAL-B/row + dec/row columns.
+- **A1 — `DiskBTree::insert_many{,_in_txn}`** (coalesced batch insert: one
+  full-page `WAL_INDEX` image per dirtied leaf per statement; per-leaf exclusive
+  latch across read-modify-write, re-read under latch, dropped before any
+  split/boundary fallback to the proven per-entry crabbing insert → deadlock-free,
+  redo-only `WAL_INDEX` unchanged, no `FORMAT_VERSION` bump). `exec_update`
+  accumulates BTree/FullText entries across all rows (`IndexColBatch` /
+  `stage_row_index_writes`) and flushes them coalesced (`flush_index_batches`);
+  Hnsw stays per-row.
+- **A3 — index-driven `matching_rows`** (`index_matching_rows`: B-tree candidates
+  → `heap.get` → full predicate + MVCC re-check → identical result to a scan;
+  RowIds de-duplicated). **Gated** by `index_lookup_is_selective`: equality
+  always, a range only when ANALYZE (P4.d) stats estimate selectivity ≤ 0.3 —
+  because measured, forcing the index on a 50%-selective DELETE *regressed* it
+  (random heap access loses to a sequential scan when matches are not few).
+- **A4 — de-loop `exec_update`**: compute `has_unique` once; when the table has
+  no UNIQUE set, skip the per-row `snapshot_for_statement` + `enforce_unique`
+  scan entirely (was allocated per row).
+
+**Crash harness:** 28 → **29** (P29: a committed bulk UPDATE with coalesced
+index writes + an indexed-key change survive a no-checkpoint crash and resolve
+via the WAL-recovered index; an incomplete UPDATE leaves no phantom).
+**Tests:** `a3_equality_update/delete_via_index_is_correct` cover the A3 index
+path; full lib suite (371) + all integration + concurrent + crash green;
+clippy/fmt clean; no `FORMAT_VERSION` bump; no §3 decision reopened (A1 relies on
+the existing P3.a "index entry is a re-validated hint" invariant).
+
+**Deferred (filed, the path to write-path *parity*):**
+- **A2 — HOT-style same-page update.** Genuinely fiddly against the MVCC version
+  model (needs a forward-chained heap + stable index target + reader
+  forward-walk, i.e. an on-disk-format + recovery change; a naive in-place
+  overwrite is unsafe for concurrent snapshots). The real path to UPDATE parity.
+- **Phase B — scan/read path** (decode pushdown for COUNT/projection, streaming
+  operators). Closes the DELETE full-scan cost (decode only the predicate column,
+  not the whole row incl. TEXT) and the SELECT/COUNT gap. Not started.
+**Locked-decision changes:** none (§3 untouched). Two Phase-A-scoped sign-offs
+(A1 approach; acceptance revision) recorded above.

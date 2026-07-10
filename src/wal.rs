@@ -246,6 +246,11 @@ struct WalInner {
     /// last checkpoint, the signal the `max_wal_size` auto-checkpoint trigger
     /// watches. A running counter (no `stat` syscall on the hot path).
     wal_bytes: u64,
+    /// Cumulative framed bytes ever appended to the WAL — never reset by a
+    /// checkpoint truncation, unlike `wal_bytes`. Measurement-only (Phase A C1):
+    /// lets a benchmark diff WAL volume across a window of operations even when
+    /// an auto-checkpoint truncates the log mid-run.
+    total_bytes_appended: u64,
     /// LSN of the last fsync'd record (the durable WAL frontier).
     durable_lsn: Lsn,
     /// Group-commit mode (M9). When `true`, commit/abort records are appended
@@ -335,6 +340,7 @@ impl Wal {
                 next_lsn,
                 next_mini_txn: 1,
                 wal_bytes,
+                total_bytes_appended: 0,
                 durable_lsn: INVALID_LSN,
                 deferred_sync: false,
                 poisoned: false,
@@ -363,6 +369,13 @@ impl Wal {
     /// Framed bytes in the WAL since the last checkpoint truncation (P1.e).
     pub fn wal_bytes(&self) -> u64 {
         self.lock().wal_bytes
+    }
+
+    /// Cumulative framed bytes ever appended, across all segments and surviving
+    /// checkpoint truncation (C1, measurement-only). Diff two readings to get
+    /// the WAL volume produced by a window of operations.
+    pub fn total_bytes_appended(&self) -> u64 {
+        self.lock().total_bytes_appended
     }
 
     /// Arm a one-shot fsync fault (P1.b fault injection). The next `fsync`
@@ -949,6 +962,7 @@ fn write_framed_locked(inner: &mut WalInner, encoded: &[u8], base_lsn: Lsn) -> R
     inner.writer.write_all(encoded)?;
     inner.active_bytes += framed;
     inner.wal_bytes += framed; // P1.e: track WAL size
+    inner.total_bytes_appended += framed; // C1: cumulative, survives truncation
     Ok(())
 }
 

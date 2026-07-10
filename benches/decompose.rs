@@ -1572,18 +1572,36 @@ fn winner_remark(uu: f64, pp: f64) -> String {
     }
 }
 
-/// Print one CRUD-comparison row: records touched, unidb rec/s, PG rec/s, ratio,
-/// and a plain-language remark naming the winner and its margin.
-fn crud_row(op: &str, u: (u64, f64), p: (u64, f64)) {
+/// C1 measurement: run a unidb CRUD op bracketed by cumulative WAL-bytes and
+/// rows-decoded reads, returning `(records, secs, wal_bytes_delta,
+/// rows_decoded_delta)`. `wal_total_bytes_appended` survives auto-checkpoint
+/// truncation, so the delta is the true WAL volume the op produced.
+fn measured_unidb(engine: &Arc<Engine>, f: impl FnOnce() -> (u64, f64)) -> (u64, f64, u64, u64) {
+    let wal0 = engine.wal_total_bytes_appended();
+    let dec0 = Engine::rows_decoded_total();
+    let (count, secs) = f();
+    let wal = engine.wal_total_bytes_appended().saturating_sub(wal0);
+    let dec = Engine::rows_decoded_total().saturating_sub(dec0);
+    (count, secs, wal, dec)
+}
+
+/// Print one CRUD row plus the C1 proof columns (unidb WAL bytes/row and rows
+/// decoded/row). `u` carries the measured deltas from [`measured_unidb`].
+fn crud_row_c1(op: &str, u: (u64, f64, u64, u64), p: (u64, f64)) {
     let (uu, pp) = (rps(u.0, u.1), rps(p.0, p.1));
     let ratio = if pp > 0.0 { uu / pp } else { 0.0 };
+    let per = u.0.max(1);
+    let wal_per_row = u.2 as f64 / per as f64;
+    let dec_per_row = u.3 as f64 / per as f64;
     println!(
-        "| {op} | {} | {:.0} | {:.0} | {:.2}× | {} |",
+        "| {op} | {} | {:.0} | {:.0} | {:.2}× | {} | {:.0} | {:.2} |",
         u.0.max(p.0),
         uu,
         pp,
         ratio,
-        winner_remark(uu, pp)
+        winner_remark(uu, pp),
+        wal_per_row,
+        dec_per_row,
     );
 }
 
@@ -2083,40 +2101,70 @@ fn bench_mm_report() {
         let n = crud_rows;
         let half = (n / 2) as i64;
         let base = n as i64;
-        println!("| operation | records | unidb (rec/s) | postgres (rec/s) | unidb ÷ PG | remark (winner · margin) |");
-        println!("|-----------|--------:|--------------:|-----------------:|-----------:|:-------------------------|");
-        crud_row(
+        println!(
+            "Extra columns (C1, unidb only): **WAL B/row** = cumulative WAL bytes the op\n\
+             appended ÷ records touched (the index-maintenance proof — a `body`-only UPDATE\n\
+             should append ~0 index bytes once unchanged indexed columns are skipped);\n\
+             **dec/row** = full-row heap decodes ÷ records touched (exposes full-scan waste\n\
+             on the write path — a selective op that decodes every row shows dec/row ≫ 1).\n"
+        );
+        println!("| operation | records | unidb (rec/s) | postgres (rec/s) | unidb ÷ PG | remark (winner · margin) | WAL B/row | dec/row |");
+        println!("|-----------|--------:|--------------:|-----------------:|-----------:|:-------------------------|----------:|--------:|");
+        crud_row_c1(
             "INSERT (per-row commit)",
-            phased("t3_insert_unidb", || sql_crud_insert(&se, n, base)),
+            phased("t3_insert_unidb", || {
+                measured_unidb(&se, || sql_crud_insert(&se, n, base))
+            }),
             phased("t3_insert_pg", || pg_crud_insert(u, n, base)),
         );
-        crud_row(
+        // Refresh statistics on both engines now the table is at full size, so
+        // each planner makes a stats-informed choice for the UPDATE/DELETE below
+        // — unidb's A3 index-vs-scan gate (a selective range takes the B-tree, a
+        // non-selective one the sequential scan) and Postgres's planner alike.
+        // This is the realistic production state and fairer than comparing an
+        // analyzed engine against an un-analyzed one. Untimed setup, like the
+        // pre-grow.
+        phased("t3_analyze", || {
+            let ax = se.begin().unwrap();
+            let _ = se.execute_sql(ax, "ANALYZE t");
+            se.commit(ax).unwrap();
+            if let Ok(mut c) = Client::connect(u, NoTls) {
+                let _ = c.batch_execute("ANALYZE t");
+            }
+        });
+        crud_row_c1(
             "SELECT filtered (k<N)",
             phased("t3_selfilt_unidb", || {
-                sql_crud_select_filtered(&se, 0, n as i64)
+                measured_unidb(&se, || sql_crud_select_filtered(&se, 0, n as i64))
             }),
             phased("t3_selfilt_pg", || pg_crud_select_filtered(u, 0, n as i64)),
         );
-        crud_row(
+        crud_row_c1(
             "SELECT grouped (GROUP BY g)",
-            phased("t3_selgrp_unidb", || sql_crud_select_grouped(&se, 2 * n)),
+            phased("t3_selgrp_unidb", || {
+                measured_unidb(&se, || sql_crud_select_grouped(&se, 2 * n))
+            }),
             phased("t3_selgrp_pg", || pg_crud_select_grouped(u, 2 * n)),
         );
-        crud_row(
+        crud_row_c1(
             "UPDATE bulk (k<N/2)",
-            phased("t3_update_unidb", || sql_crud_update_bulk(&se, half)),
+            phased("t3_update_unidb", || {
+                measured_unidb(&se, || sql_crud_update_bulk(&se, half))
+            }),
             phased("t3_update_pg", || pg_crud_update_bulk(u, half)),
         );
-        crud_row(
+        crud_row_c1(
             "DELETE selected (k>=N)",
             phased("t3_delsel_unidb", || {
-                sql_crud_delete_selected(&se, n as i64)
+                measured_unidb(&se, || sql_crud_delete_selected(&se, n as i64))
             }),
             phased("t3_delsel_pg", || pg_crud_delete_selected(u, n as i64)),
         );
-        crud_row(
+        crud_row_c1(
             "DELETE all",
-            phased("t3_delall_unidb", || sql_crud_delete_all(&se)),
+            phased("t3_delall_unidb", || {
+                measured_unidb(&se, || sql_crud_delete_all(&se))
+            }),
             phased("t3_delall_pg", || pg_crud_delete_all(u)),
         );
         println!();
