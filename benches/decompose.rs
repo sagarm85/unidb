@@ -972,6 +972,419 @@ fn bench_conc_scale() {
     }
 }
 
+// ----------------- High-scale concurrency experiment (millions) ------------
+//
+// The first "millions of records" concurrency run. It exists to answer two
+// questions with data rather than instinct:
+//
+//   Q1 — Do concurrent SQL writes scale at high table sizes, and how much
+//        headroom is there vs the raw path (which already scales)? The raw
+//        column is "what good looks like"; the gap is the prize for fixing the
+//        SQL path.
+//   Q2 — Is today's binding constraint the per-statement catalog `RwLock` or
+//        B-tree latch contention? (i.e. would latch-coupled "crabbing" B-tree
+//        descent help *now*, or only after the catalog lock is split?)
+//
+// All three tables share the same measured phase: N writer threads over one
+// `Arc<Engine>`, each committing `per` durable single-row INSERTs, group-commit
+// on. The tables are pre-grown ONCE to a large size so page count / tree depth
+// are realistic; the pre-grow is not timed.
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Bulk-load a SQL table to `rows` rows through the SQL insert path (batched
+/// commits so undo/WAL stay bounded). `body_len` sets row width. If `indexed`,
+/// a secondary B-tree index on `k` is maintained on every insert.
+fn build_sql_table(engine: &Arc<Engine>, rows: u64, body_len: usize, indexed: bool) {
+    let x = engine.begin().unwrap();
+    engine
+        .execute_sql(x, "CREATE TABLE t (id INT, k INT, body TEXT)")
+        .unwrap();
+    if indexed {
+        engine
+            .execute_sql(x, "CREATE INDEX t_k ON t USING BTREE (k)")
+            .unwrap();
+    }
+    engine.commit(x).unwrap();
+    let body = "d".repeat(body_len);
+    let ins = engine
+        .prepare("INSERT INTO t (id, k, body) VALUES ($1, $2, $3)")
+        .unwrap();
+    let mut x = engine.begin().unwrap();
+    for i in 0..rows {
+        engine
+            .execute_prepared(
+                x,
+                &ins,
+                &[
+                    Literal::Int(-(i as i64) - 1),
+                    Literal::Int(i as i64),
+                    Literal::Text(body.clone()),
+                ],
+            )
+            .unwrap();
+        if (i + 1) % 5_000 == 0 {
+            engine.commit(x).unwrap();
+            x = engine.begin().unwrap();
+        }
+    }
+    engine.commit(x).unwrap();
+}
+
+/// Measured phase: `writers` threads each commit `per` durable single-row SQL
+/// INSERTs into the pre-grown `t`. `id_base` keeps ids distinct across repeated
+/// runs on the same engine. Returns commits/sec.
+fn measure_sql_writers(engine: &Arc<Engine>, writers: usize, per: usize, id_base: i64) -> f64 {
+    let barrier = Arc::new(Barrier::new(writers + 1));
+    let committed = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::new();
+    for w in 0..writers {
+        let (engine, barrier, committed) = (engine.clone(), barrier.clone(), committed.clone());
+        handles.push(thread::spawn(move || {
+            let ins = engine
+                .prepare("INSERT INTO t (id, k, body) VALUES ($1, $2, $3)")
+                .unwrap();
+            barrier.wait();
+            for i in 0..per {
+                let id = id_base + (w * per + i) as i64;
+                let xid = engine.begin().unwrap();
+                engine
+                    .execute_prepared(
+                        xid,
+                        &ins,
+                        &[
+                            Literal::Int(id),
+                            Literal::Int(id),
+                            Literal::Text(format!("b{id}")),
+                        ],
+                    )
+                    .unwrap();
+                engine.commit(xid).unwrap();
+            }
+            committed.fetch_add(per, Ordering::Relaxed);
+        }));
+    }
+    barrier.wait();
+    let start = Instant::now();
+    for h in handles {
+        h.join().unwrap();
+    }
+    committed.load(Ordering::Relaxed) as f64 / start.elapsed().as_secs_f64()
+}
+
+/// Measured phase for the RAW CRUD path over a pre-grown heap: `writers` threads
+/// each commit `per` durable single-row `Engine::insert`s. Returns commits/sec.
+fn measure_raw_writers(engine: &Arc<Engine>, writers: usize, per: usize) -> f64 {
+    let barrier = Arc::new(Barrier::new(writers + 1));
+    let committed = Arc::new(AtomicUsize::new(0));
+    let payload = [0xCDu8; 64];
+    let mut handles = Vec::new();
+    for _ in 0..writers {
+        let (engine, barrier, committed) = (engine.clone(), barrier.clone(), committed.clone());
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            for _ in 0..per {
+                let xid = engine.begin().unwrap();
+                engine.insert(xid, &payload).unwrap();
+                engine.commit(xid).unwrap();
+            }
+            committed.fetch_add(per, Ordering::Relaxed);
+        }));
+    }
+    barrier.wait();
+    let start = Instant::now();
+    for h in handles {
+        h.join().unwrap();
+    }
+    committed.load(Ordering::Relaxed) as f64 / start.elapsed().as_secs_f64()
+}
+
+/// Put the server on the matched-durability lens (lens 2, `fsync_writethrough`
+/// = F_FULLFSYNC, the only macOS setting that truly flushes to platter — the
+/// honest apples-to-apples vs unidb's `File::sync_all`). Returns the
+/// `wal_sync_method` actually in force (for labelling), or `None` to skip. This
+/// is a SERVER-WIDE `ALTER SYSTEM` change; the caller MUST call [`pg_reset_lens`]
+/// afterward so the user's Postgres is left as it was found. Set once per run.
+fn pg_ensure_lens(url: &str) -> Option<String> {
+    let (admin, method) = pg_open_lens(url, true)?;
+    drop(admin);
+    Some(method)
+}
+
+/// Build a pre-grown Postgres table `name` (dropping any prior one), optionally
+/// with a secondary B-tree index on `k`. Pre-grow is one server-side
+/// `generate_series` load (one txn, one fsync), so it is fast even at millions.
+/// Assumes [`pg_ensure_lens`] already set the durability lens. Returns `None`
+/// on any failure (→ the caller skips the Postgres cell cleanly).
+fn pg_build_table(url: &str, name: &str, rows: u64, indexed: bool) -> Option<()> {
+    let mut c = pg_connect(url)?;
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS {name}; CREATE TABLE {name} (id BIGINT, k BIGINT, body TEXT)"
+    ))
+    .ok()?;
+    if indexed {
+        c.batch_execute(&format!("CREATE INDEX {name}_k ON {name} (k)"))
+            .ok()?;
+    }
+    if rows > 0 {
+        c.execute(
+            &format!(
+                "INSERT INTO {name} (id, k, body) \
+                 SELECT -g - 1, g, repeat('d', 96) FROM generate_series(0, $1::bigint - 1) g"
+            ),
+            &[&(rows as i64)],
+        )
+        .ok()?;
+    }
+    Some(())
+}
+
+/// Measured phase for Postgres over the pre-grown table `name`: `writers`
+/// connections, each committing `per` durable autocommit single-row INSERTs.
+/// `id_base` keeps ids distinct across repeated runs. Returns commits/sec.
+fn pg_measure_table(
+    url: &str,
+    name: &str,
+    writers: usize,
+    per: usize,
+    id_base: i64,
+) -> Option<f64> {
+    let barrier = Arc::new(Barrier::new(writers + 1));
+    let committed = Arc::new(AtomicUsize::new(0));
+    let mut handles = Vec::new();
+    for w in 0..writers {
+        let (url, name, barrier, committed) = (
+            url.to_string(),
+            name.to_string(),
+            barrier.clone(),
+            committed.clone(),
+        );
+        handles.push(thread::spawn(move || {
+            let mut client = Client::connect(&url, NoTls).unwrap();
+            let ins = client
+                .prepare(&format!(
+                    "INSERT INTO {name} (id, k, body) VALUES ($1, $2, $3)"
+                ))
+                .unwrap();
+            barrier.wait();
+            for i in 0..per {
+                let id = id_base + (w * per + i) as i64;
+                client
+                    .execute(&ins, &[&id, &id, &format!("b{id}")])
+                    .unwrap();
+            }
+            committed.fetch_add(per, Ordering::Relaxed);
+        }));
+    }
+    barrier.wait();
+    let start = Instant::now();
+    for h in handles {
+        h.join().unwrap();
+    }
+    Some(committed.load(Ordering::Relaxed) as f64 / start.elapsed().as_secs_f64())
+}
+
+/// Undo the server-wide lens change from [`pg_ensure_lens`], restoring the
+/// default `wal_sync_method`. Best-effort — a failure here only means the setting
+/// stays at lens 2, which the run already reported.
+fn pg_reset_lens(url: &str) {
+    if let Some(mut c) = pg_connect(url) {
+        let _ = c.batch_execute("ALTER SYSTEM RESET wal_sync_method");
+        let _ = c.batch_execute("SELECT pg_reload_conf()");
+    }
+}
+
+fn bench_hiconc() {
+    let pregrow = env_u64("HICONC_PREGROW", 2_000_000);
+    let per = env_u64("HICONC_PER", 400) as usize;
+    let idx_pregrow = env_u64("HICONC_IDX_PREGROW", 200_000);
+    let cores = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let writers = [1usize, 2, 4, 8];
+    // Optional selector, e.g. HICONC_ONLY=c to re-run just Table C.
+    let only = std::env::var("HICONC_ONLY").unwrap_or_default();
+    let run = |t: &str| only.is_empty() || only.contains(t);
+    println!("\n########## HIGH-SCALE CONCURRENCY EXPERIMENT ({cores} logical cores) ##########");
+    println!(
+        "pregrow(sql/raw)={pregrow} rows, indexed pregrow={idx_pregrow} rows, per-writer burst={per} commits, group-commit on\n"
+    );
+
+    // Postgres comparison is optional (PG_URL-gated) and shares ONE server-wide
+    // durability-lens change across all three tables: set here, reset at the end.
+    let url = pg_url();
+    let pg_method = match url.as_deref() {
+        Some(u) => pg_ensure_lens(u),
+        None => {
+            println!("  [pg] PG_URL unset — Postgres columns skipped\n");
+            None
+        }
+    };
+    if let Some(ref m) = pg_method {
+        println!(
+            "  [pg] Postgres durability lens: wal_sync_method={m} (reset to default at end)\n"
+        );
+    }
+    // Some(&str) only when the lens is genuinely in force, so a cell is emitted.
+    let pg_on = || pg_method.as_ref().and(url.as_deref());
+
+    // ---- Table A: SQL vs raw writer-count scaling at a large table ----
+    if run("a") {
+        println!(
+            "=== A. Writer-count scaling at {pregrow}-row table (commits/sec, speedup vs 1) ==="
+        );
+        let sql_dir = tempdir().unwrap();
+        let sql_engine = Arc::new(Engine::open(sql_dir.path(), 0).unwrap());
+        sql_engine.set_deferred_sync(true);
+        eprintln!("[hiconc] building {pregrow}-row SQL table…");
+        build_sql_table(&sql_engine, pregrow, 96, false);
+
+        let raw_dir = tempdir().unwrap();
+        let raw_engine = Arc::new(Engine::open(raw_dir.path(), 0).unwrap());
+        raw_engine.set_deferred_sync(true);
+        eprintln!("[hiconc] building {pregrow}-row raw heap…");
+        {
+            let payload = [0xABu8; 96];
+            let mut x = raw_engine.begin().unwrap();
+            for i in 0..pregrow {
+                raw_engine.insert(x, &payload).unwrap();
+                if (i + 1) % 20_000 == 0 {
+                    raw_engine.commit(x).unwrap();
+                    x = raw_engine.begin().unwrap();
+                }
+            }
+            raw_engine.commit(x).unwrap();
+        }
+
+        // Postgres column (matched-durability lens), pre-grown to the same size.
+        if let Some(u) = pg_on() {
+            eprintln!("[hiconc] building {pregrow}-row Postgres table…");
+            pg_build_table(u, "hc", pregrow, false);
+        }
+
+        println!(
+            "  {:>7}  {:>20}  {:>20}  {:>20}",
+            "writers", "unidb_sql", "unidb_raw", "postgres"
+        );
+        let (mut sql_base, mut raw_base, mut pg_base) = (0.0f64, 0.0f64, 0.0f64);
+        let mut id_base = 1_000_000_000i64;
+        for &n in &writers {
+            let sql = measure_sql_writers(&sql_engine, n, per, id_base);
+            let raw = measure_raw_writers(&raw_engine, n, per);
+            let pg = pg_on().and_then(|u| pg_measure_table(u, "hc", n, per, id_base));
+            id_base += (n * per) as i64;
+            if n == 1 {
+                sql_base = sql;
+                raw_base = raw;
+                pg_base = pg.unwrap_or(0.0);
+            }
+            let cell = |v: f64, base: f64| format!("{v:>10.0} ({:>4.2}x)", v / base);
+            let pg_cell = match pg {
+                Some(v) => cell(v, pg_base),
+                None => format!("{:>18}", "n/a"),
+            };
+            println!(
+                "  {:>7}  {}  {}  {}",
+                n,
+                cell(sql, sql_base),
+                cell(raw, raw_base),
+                pg_cell
+            );
+        }
+        drop(sql_engine);
+        drop(raw_engine);
+    }
+
+    // ---- Table B: SQL size-independence at 8 writers (unidb_sql vs Postgres) ----
+    if run("b") {
+        println!("\n=== B. Concurrent-write throughput vs table size (8 writers, commits/sec) ===");
+        println!(
+            "  {:>12}  {:>16}  {:>16}",
+            "table_rows", "unidb_sql", "postgres"
+        );
+        let sizes: Vec<u64> = std::env::var("HICONC_SIZES")
+            .ok()
+            .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![100_000, 500_000, 1_000_000, 2_000_000]);
+        for &sz in &sizes {
+            let dir = tempdir().unwrap();
+            let engine = Arc::new(Engine::open(dir.path(), 0).unwrap());
+            engine.set_deferred_sync(true);
+            eprintln!("[hiconc] size-sweep building {sz}-row unidb table…");
+            build_sql_table(&engine, sz, 96, false);
+            let tput = measure_sql_writers(&engine, 8, per, 1_000_000_000);
+            let pg = pg_on().and_then(|u| {
+                eprintln!("[hiconc] size-sweep building {sz}-row Postgres table…");
+                pg_build_table(u, "hb", sz, false)?;
+                pg_measure_table(u, "hb", 8, per, 1_000_000_000)
+            });
+            let pg_cell = match pg {
+                Some(v) => format!("{v:>16.0}"),
+                None => format!("{:>16}", "n/a"),
+            };
+            println!("  {:>12}  {:>16.0}  {}", sz, tput, pg_cell);
+        }
+    }
+
+    // ---- Table C: indexed vs unindexed (Q2 — is B-tree latch the constraint?) ----
+    if run("c") {
+        println!(
+            "\n=== C. Indexed vs unindexed insert (does index maintenance change scaling?) ==="
+        );
+        println!(
+            "  {:>10}  {:>7}  {:>16}  {:>16}",
+            "schema", "writers", "unidb_sql", "postgres"
+        );
+        for &indexed in &[false, true] {
+            let dir = tempdir().unwrap();
+            let engine = Arc::new(Engine::open(dir.path(), 0).unwrap());
+            engine.set_deferred_sync(true);
+            let label = if indexed { "indexed" } else { "no-index" };
+            eprintln!("[hiconc] table C building {idx_pregrow}-row {label} unidb table…");
+            build_sql_table(&engine, idx_pregrow, 96, indexed);
+            let pg_name = if indexed { "hc_idx" } else { "hc_noidx" };
+            if let Some(u) = pg_on() {
+                eprintln!("[hiconc] table C building {idx_pregrow}-row {label} Postgres table…");
+                pg_build_table(u, pg_name, idx_pregrow, indexed);
+            }
+            let (mut base, mut pg_base) = (0.0f64, 0.0f64);
+            let mut id_base = 2_000_000_000i64;
+            for &n in &[1usize, 8] {
+                let tput = measure_sql_writers(&engine, n, per, id_base);
+                let pg = pg_on().and_then(|u| pg_measure_table(u, pg_name, n, per, id_base));
+                id_base += (n * per) as i64;
+                if n == 1 {
+                    base = tput;
+                    pg_base = pg.unwrap_or(0.0);
+                }
+                let pg_cell = match pg {
+                    Some(v) => format!("{v:>10.0} ({:>4.2}x)", v / pg_base),
+                    None => format!("{:>16}", "n/a"),
+                };
+                println!(
+                    "  {:>10}  {:>7}  {:>10.0} ({:>4.2}x)  {}",
+                    label,
+                    n,
+                    tput,
+                    tput / base,
+                    pg_cell
+                );
+            }
+        }
+    }
+
+    // Restore the server-wide durability lens we set at the top.
+    if let Some(u) = url.as_deref() {
+        pg_reset_lens(u);
+    }
+    println!("\n########## END HIGH-SCALE CONCURRENCY EXPERIMENT ##########");
+}
+
 fn main() {
     // `UNIDB_BENCH` selects a subset so a single section can be re-run quickly
     // (e.g. the durable-FSM B-accept re-runs just B3/B4 before vs after without
@@ -998,6 +1411,10 @@ fn main() {
         }
         "cscale" => {
             bench_conc_scale();
+            return;
+        }
+        "hiconc" => {
+            bench_hiconc();
             return;
         }
         _ => {}
