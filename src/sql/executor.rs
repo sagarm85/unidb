@@ -67,6 +67,14 @@ use super::logical::{CmpOp, Expr, Literal, LogicalPlan};
 /// obligations; the few-ns cost is negligible next to a per-row decode.
 pub static ROWS_DECODED: AtomicU64 = AtomicU64::new(0);
 
+/// Measurement-only (Phase B C1′): total number of column *values* materialized
+/// into a `Literal` since process start. A full-row `decode_row` bumps this once
+/// per column; the projection-pushdown `deform_row` (B2) bumps it only for the
+/// columns actually needed. Diffed around an op, `cols/row` (this ÷ records) is
+/// the direct proof of the decode-pushdown win — it falls as unreferenced
+/// columns (esp. TEXT) stop being materialized. `Relaxed`, like `ROWS_DECODED`.
+pub static COLS_DECODED: AtomicU64 = AtomicU64::new(0);
+
 /// How the executor holds the catalog for one statement (index-write-concurrency
 /// Item 0a). Every SQL statement that changes no schema reads the catalog only
 /// (it `lookup(table)?.clone()`s the `TableDef` and works off the owned clone),
@@ -2222,6 +2230,9 @@ pub fn encode_row(values: &[Literal]) -> Vec<u8> {
 
 pub fn decode_row(bytes: &[u8], columns: &[ColumnDef]) -> Result<Vec<Literal>> {
     ROWS_DECODED.fetch_add(1, Ordering::Relaxed); // C1 measurement
+    // C1′: a full decode materializes every column (the baseline `cols/row` that
+    // B2's `deform_row` drives down by materializing only referenced columns).
+    COLS_DECODED.fetch_add(columns.len() as u64, Ordering::Relaxed);
     let mut out = Vec::with_capacity(columns.len());
     let mut pos = 0usize;
     for col in columns {

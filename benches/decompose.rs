@@ -1576,25 +1576,32 @@ fn winner_remark(uu: f64, pp: f64) -> String {
 /// rows-decoded reads, returning `(records, secs, wal_bytes_delta,
 /// rows_decoded_delta)`. `wal_total_bytes_appended` survives auto-checkpoint
 /// truncation, so the delta is the true WAL volume the op produced.
-fn measured_unidb(engine: &Arc<Engine>, f: impl FnOnce() -> (u64, f64)) -> (u64, f64, u64, u64) {
+fn measured_unidb(
+    engine: &Arc<Engine>,
+    f: impl FnOnce() -> (u64, f64),
+) -> (u64, f64, u64, u64, u64) {
     let wal0 = engine.wal_total_bytes_appended();
     let dec0 = Engine::rows_decoded_total();
+    let cols0 = Engine::cols_decoded_total();
     let (count, secs) = f();
     let wal = engine.wal_total_bytes_appended().saturating_sub(wal0);
     let dec = Engine::rows_decoded_total().saturating_sub(dec0);
-    (count, secs, wal, dec)
+    let cols = Engine::cols_decoded_total().saturating_sub(cols0);
+    (count, secs, wal, dec, cols)
 }
 
-/// Print one CRUD row plus the C1 proof columns (unidb WAL bytes/row and rows
-/// decoded/row). `u` carries the measured deltas from [`measured_unidb`].
-fn crud_row_c1(op: &str, u: (u64, f64, u64, u64), p: (u64, f64)) {
+/// Print one CRUD row plus the proof columns: unidb WAL bytes/row (C1),
+/// rows-decoded/row (C1), and columns-materialized/row (C1′, the Phase-B decode-
+/// pushdown proof). `u` carries the measured deltas from [`measured_unidb`].
+fn crud_row_c1(op: &str, u: (u64, f64, u64, u64, u64), p: (u64, f64)) {
     let (uu, pp) = (rps(u.0, u.1), rps(p.0, p.1));
     let ratio = if pp > 0.0 { uu / pp } else { 0.0 };
     let per = u.0.max(1);
     let wal_per_row = u.2 as f64 / per as f64;
     let dec_per_row = u.3 as f64 / per as f64;
+    let cols_per_row = u.4 as f64 / per as f64;
     println!(
-        "| {op} | {} | {:.0} | {:.0} | {:.2}× | {} | {:.0} | {:.2} |",
+        "| {op} | {} | {:.0} | {:.0} | {:.2}× | {} | {:.0} | {:.2} | {:.2} |",
         u.0.max(p.0),
         uu,
         pp,
@@ -1602,6 +1609,7 @@ fn crud_row_c1(op: &str, u: (u64, f64, u64, u64), p: (u64, f64)) {
         winner_remark(uu, pp),
         wal_per_row,
         dec_per_row,
+        cols_per_row,
     );
 }
 
@@ -2106,10 +2114,13 @@ fn bench_mm_report() {
              appended ÷ records touched (the index-maintenance proof — a `body`-only UPDATE\n\
              should append ~0 index bytes once unchanged indexed columns are skipped);\n\
              **dec/row** = full-row heap decodes ÷ records touched (exposes full-scan waste\n\
-             on the write path — a selective op that decodes every row shows dec/row ≫ 1).\n"
+             on the write path — a selective op that decodes every row shows dec/row ≫ 1);\n\
+             **cols/row** = column *values* materialized into a Literal ÷ records touched\n\
+             (Phase B decode-pushdown proof — falls as unreferenced columns, esp. TEXT,\n\
+             stop being materialized).\n"
         );
-        println!("| operation | records | unidb (rec/s) | postgres (rec/s) | unidb ÷ PG | remark (winner · margin) | WAL B/row | dec/row |");
-        println!("|-----------|--------:|--------------:|-----------------:|-----------:|:-------------------------|----------:|--------:|");
+        println!("| operation | records | unidb (rec/s) | postgres (rec/s) | unidb ÷ PG | remark (winner · margin) | WAL B/row | dec/row | cols/row |");
+        println!("|-----------|--------:|--------------:|-----------------:|-----------:|:-------------------------|----------:|--------:|---------:|");
         crud_row_c1(
             "INSERT (per-row commit)",
             phased("t3_insert_unidb", || {
