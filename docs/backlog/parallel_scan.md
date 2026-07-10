@@ -1,0 +1,61 @@
+# Parallel scan workers (Postgres-style) — design doc
+
+## Status as of 2026-07-10: **NOT STARTED** (filed during CRUD-perf Phase B)
+
+Filed as its own milestone (not a Phase-B checkpoint) because parallel query is a
+major feature with a real correctness landmine — it deserves a design doc + PR of
+its own, not a rider in a decode-pushdown PR. Sequenced after Phase B (decode
+pushdown), which makes each worker's per-row cost cheaper.
+
+## Why
+
+The scan-throughput gap at scale (Table 3.1 `COUNT`/`SELECT-all` ~8× behind
+Postgres at 1–2M rows) **is Postgres's parallelism** — a single-threaded scan
+cannot close it, and decode pushdown (Phase B) only cuts per-row CPU, not scan
+parallelism. This is the lever that makes that gap removable.
+
+## Feasibility (favorable)
+
+- `Engine` is `Send + Sync` (Phase 5); the mmap read path is concurrent
+  (`Arc<RwLock>`, P5.a); off-thread snapshot reads are already proven by
+  `read_handle.rs` (6b). A read runs under a **fixed MVCC snapshot**, so workers
+  need no coordination.
+- Uses **`std::thread::scope`** (NOT tokio — §4 sync-core invariant), matching the
+  autovacuum / index-worker precedent.
+- **Read-only** → no crash/recovery/format change; the crash-harness count is
+  unchanged.
+
+## The gating correctness question (solve first)
+
+unidb splits authoritative state between **buffer-pool frames (dirty, current)**
+and the **mmap (may be stale)**. A worker reading the *raw mmap* can read a
+pre-modification page for a committed-but-unflushed row → **wrong results**.
+Workers MUST use the same reconciling, pool-aware read path `ReadHandle` uses,
+**not** a raw mmap read. Confirm/extend that path to N concurrent readers before
+building anything on top.
+
+## Design (once the read path is confirmed pool-consistent)
+
+- **Dynamic block assignment**: workers grab the next page from a shared
+  `AtomicUsize` cursor — **not** static `page_ids` slices, which skew on
+  visible-row density / tuple width / match rate (the PG parallel-seqscan lesson).
+- One **shared MVCC snapshot + one `ReadRegistration`** for the whole scan (holds
+  the vacuum horizon correctly, M10).
+- Per-worker: B2 selective decode + predicate + a **partial aggregate**; a
+  **gather** step combines — `COUNT`=Σ, `SUM`=Σ, `GROUP BY`=merge partial hash
+  maps, plain `SELECT`=concat.
+- **Cost gate**: parallelize only above a page-count threshold (small scans keep
+  the serial fast path); degree from cores, capped/configurable
+  (`UNIDB_MAX_PARALLEL_WORKERS`). Never inside the writer path; never per-row
+  (correlated subqueries stay serial).
+- **`LIMIT` early-stop** across workers via a shared done-flag.
+- **Peak RSS**: N partial batches — must be bounded and reported.
+- **Fair benchmarking**: unidb-parallel vs Postgres-parallel (both parallel), and
+  report the serial number too so the parallel speedup is isolated.
+
+## Verification (when built)
+- Differential-vs-SQLite unchanged (result order is nondeterministic without
+  `ORDER BY` — compare as sets).
+- `cargo test --test crash` unchanged (read-only).
+- Table 3.1 `COUNT`/`SELECT-all` at 1–2M: parallel speedup toward `≤ ~2×` of
+  Postgres; report serial + parallel + peak RSS.

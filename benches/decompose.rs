@@ -1723,6 +1723,17 @@ fn sql_crud_select_grouped(engine: &Arc<Engine>, scanned: u64) -> (u64, f64) {
     (scanned, secs) // throughput = rows scanned / sec
 }
 
+/// Unfiltered `SELECT COUNT(*)` — the B1 count-visible-slots fast path (decodes
+/// nothing). Throughput = rows counted / sec.
+fn sql_crud_count_all(engine: &Arc<Engine>, scanned: u64) -> (u64, f64) {
+    let x = engine.begin().unwrap();
+    let start = Instant::now();
+    let _res = engine.execute_sql(x, "SELECT COUNT(*) FROM t").unwrap();
+    let secs = start.elapsed().as_secs_f64();
+    engine.commit(x).unwrap();
+    (scanned, secs)
+}
+
 fn sql_crud_update_bulk(engine: &Arc<Engine>, hi: i64) -> (u64, f64) {
     let x = engine.begin().unwrap();
     let start = Instant::now();
@@ -1803,6 +1814,13 @@ fn pg_crud_select_grouped(url: &str, scanned: u64) -> (u64, f64) {
     let _rows = c
         .query("SELECT g, COUNT(*) FROM t GROUP BY g", &[])
         .unwrap();
+    (scanned, start.elapsed().as_secs_f64())
+}
+
+fn pg_crud_count_all(url: &str, scanned: u64) -> (u64, f64) {
+    let mut c = Client::connect(url, NoTls).unwrap();
+    let start = Instant::now();
+    let _rows = c.query("SELECT COUNT(*) FROM t", &[]).unwrap();
     (scanned, start.elapsed().as_secs_f64())
 }
 
@@ -2156,6 +2174,13 @@ fn bench_mm_report() {
                 measured_unidb(&se, || sql_crud_select_grouped(&se, 2 * n))
             }),
             phased("t3_selgrp_pg", || pg_crud_select_grouped(u, 2 * n)),
+        );
+        crud_row_c1(
+            "SELECT COUNT(*) (all)",
+            phased("t3_countall_unidb", || {
+                measured_unidb(&se, || sql_crud_count_all(&se, 2 * n))
+            }),
+            phased("t3_countall_pg", || pg_crud_count_all(u, 2 * n)),
         );
         crud_row_c1(
             "UPDATE bulk (k<N/2)",

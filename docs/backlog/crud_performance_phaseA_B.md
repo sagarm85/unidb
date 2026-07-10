@@ -1,10 +1,28 @@
 # CRUD performance — Phase A (write path) + Phase B (scan/read path)
 
-## Status as of 2026-07-10: **Phase A SHIPPED** · Phase B not started
+## Status as of 2026-07-10: **Phase A SHIPPED** · **Phase B SHIPPED**
 
-Phase A shipped 2026-07-10 (branch `crud-perf-phaseA`) — see `PROGRESS.md`'s
-"CRUD performance — Phase A" entry for the full before/after tables. **Phase B
-(scan/read path) is not started.**
+Phase A shipped 2026-07-10 (branch `crud-perf-phaseA`, PR #34) — see
+`PROGRESS.md`'s "CRUD performance — Phase A" entry. **Phase B shipped 2026-07-10
+(branch `crud-perf-phaseB`)** — see `PROGRESS.md`'s "CRUD performance — Phase B"
+entry.
+
+> **Phase B note (2026-07-10) — reviewed under a senior-DB-architect lens before
+> implementation, so the shipped shape differs from the draft below:**
+> - **Ordered by real ROI**, not the draft's B1-first: **B2** (projection/qual
+>   decode pushdown, `deform_row` with the PG `heap_deform_tuple` `natts` stop)
+>   leads; **B1** (`COUNT(*)` count-visible-slots) is a rider; **B5** (bitmap-style
+>   candidate sort on the write path) added for the common OLTP pattern the
+>   microbench hides.
+> - **Parallel scan split out** into its own milestone + design doc
+>   (`docs/backlog/parallel_scan.md`) — it carries a pool/mmap read-consistency
+>   landmine and is the real lever for the raw scan-throughput gap.
+> - **Result: `SELECT COUNT(*)` now beats Postgres 2.81×** (B1); SELECT filtered
+>   `dec/row 2.00 → 0.00`, `cols/row 8.00 → 5.00`, +28% absolute (B2). The draft's
+>   `filtered SELECT ≥ 0.5×` target is **not met** — that query projects `body`, so
+>   matching rows still materialize it, and closing the scan gap needs parallel
+>   scan (Milestone P). `query_exec` scan projection, `ORDER BY…LIMIT` early-stop,
+>   visibility-map COUNT, and streaming (B3) are filed follow-ups.
 
 > **Correction (2026-07-10) — the evidence-based ethos of §0.5/§6 applied to
 > this doc, not a silent rewrite.** Two things below did not survive contact
