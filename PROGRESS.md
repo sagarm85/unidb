@@ -3462,7 +3462,7 @@ publishable absolute durability; a matched **bulk** INSERT path in Table 3
 
 ## CRUD performance — Phase A (write path)   [SHIPPED]   2026-07-10
 
-**PR:** _pending_ — branch `crud-perf-phaseA`
+**PR:** #34 (merged `e6fd0cb`, 2026-07-10) — branch `crud-perf-phaseA`
 **Spec:** `docs/backlog/crud_performance_phaseA_B.md` (status flipped to
 Phase-A-SHIPPED, with an inline correction block — see below).
 **Summary:** Closes the Table-3 UPDATE-bulk CRUD-stress gap the multi-model
