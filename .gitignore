@@ -15,6 +15,11 @@
 # OS
 .DS_Store
 
+# Scratch bench/measurement logs (kept out of the tree; the durable numbers live
+# in PROGRESS.md and the generated report under docs/performance/)
+*.log
+*.err
+
 # Python bytecode (bench report tooling)
 __pycache__/
 *.pyc
