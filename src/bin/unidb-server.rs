@@ -1,7 +1,10 @@
 //! `unidb-server`: the optional REST/JWT/SSE/metrics server binary (M5).
 //! Config comes from environment variables (no config file in v1):
-//! - `UNIDB_DATA_DIR` (default `./unidb-data`): directory `Engine::open`s —
-//!   holds `control`/`data.db`/`db.wal`, nothing else.
+//! - `UNIDB_DATA_DIR` (default `/tmp/unidb`): directory `Engine::open`s —
+//!   holds `control`/`data.db`/`db.wal`, nothing else. The default lives under
+//!   `/tmp` so a local/dev run never litters the working tree with data files
+//!   (and they are never committed). `/tmp` is ephemeral across reboots — a
+//!   persistent deployment must set this to a real data volume.
 //! - `UNIDB_LOG_DIR` (default `<UNIDB_DATA_DIR>/logs`): directory for
 //!   rolling daily log files (`unidb.log.YYYY-MM-DD`). Independently
 //!   overridable so a deployment can put logs on a different volume than
@@ -61,7 +64,7 @@ fn init_logging(log_dir: &str) -> tracing_appender::non_blocking::WorkerGuard {
 
 #[tokio::main]
 async fn main() {
-    let data_dir = std::env::var("UNIDB_DATA_DIR").unwrap_or_else(|_| "./unidb-data".to_string());
+    let data_dir = std::env::var("UNIDB_DATA_DIR").unwrap_or_else(|_| "/tmp/unidb".to_string());
     let log_dir = std::env::var("UNIDB_LOG_DIR").unwrap_or_else(|_| format!("{data_dir}/logs"));
     // Held for the whole process lifetime — see `init_logging`'s doc comment.
     let _log_guard = init_logging(&log_dir);

@@ -1,5 +1,11 @@
 /target
+# Local engine/server data. The server now defaults to /tmp/unidb, but this
+# stays as a guard in case UNIDB_DATA_DIR is pointed back into the tree.
 /unidb-data
+
+# Claude Code: commit shared settings.json, ignore the personal/local overrides
+# (machine-specific permission grants — session paths, PIDs, local psql, etc.)
+.claude/settings.local.json
 
 # Editor / IDE
 .idea/
@@ -15,3 +21,8 @@ __pycache__/
 
 # Generated benchmark reports (produced by scripts/multi_model_report.sh)
 /docs/performance/multi_model_report_*.md
+
+# Generated Docker report output (reports, logs, phase/stats CSVs from
+# scripts/report.sh --docker). The docker/ image + compose files ARE committed;
+# only their run output under docker/out/ is not.
+/docker/out/

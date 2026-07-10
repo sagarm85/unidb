@@ -1,0 +1,8 @@
+# Keep the Docker build context small and force a clean Linux build of the bench.
+# `target/` holds macOS-built artifacts that must NOT leak into the Linux image;
+# excluding it makes `cargo build` inside the image compile fresh for Linux.
+target
+.git
+docker/out
+**/__pycache__
+bench/logs-*
