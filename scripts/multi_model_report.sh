@@ -41,7 +41,7 @@ fi
 # Environment header facts (best-effort; blank if a tool is missing).
 DATE="$(date '+%Y-%m-%d %H:%M:%S %Z')"
 GIT_COMMIT="${GIT_COMMIT:-$(git rev-parse --short HEAD 2>/dev/null || echo '?')}"
-GIT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+GIT_BRANCH="${GIT_BRANCH:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')}"
 CPU="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m)"
 NCPU="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo '?')"
 OS="$(uname -sr)"

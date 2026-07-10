@@ -23,8 +23,10 @@ if ! command -v docker >/dev/null; then
   exit 2
 fi
 
-# Pass the host's real git commit into the container (its context excludes .git).
+# Pass the host's real git commit + branch into the container (its context
+# excludes .git, so it cannot derive these itself — the header would show '?').
 export GIT_COMMIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo '?')"
+export GIT_BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
 export MM_SIZES="${MM_SIZES:-1000,10000,100000}"
 export MM_SAMPLE="${MM_SAMPLE:-200}"
 

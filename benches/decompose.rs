@@ -2141,7 +2141,13 @@ fn bench_mm_report() {
          neither engine can serve it index-only; this measures real scan throughput, not a\n\
          count optimizer). Throughput is records/sec. Sizes swept: `{bulk_sizes:?}` (`MM_BULK_SIZES`\n\
          to override — e.g. push to `5000000` or `10000000` for a heavier run). The default\n\
-         tops out at 2M to keep a full report reasonable; the engine handles ≥10M.\n"
+         tops out at 2M to keep a full report reasonable; the engine handles ≥10M.\n\
+         \n\
+         **On the scan gap at scale:** Postgres runs a **parallel** sequential scan (multiple\n\
+         worker processes) once the table crosses its parallel threshold, while unidb scans\n\
+         **single-threaded**; so a large scan-side lead is Postgres's parallel-query capability,\n\
+         not a per-row storage-speed difference (at small sizes, below PG's threshold, the two\n\
+         are much closer).\n"
     );
     if let Some(ref m) = pg_method {
         println!(

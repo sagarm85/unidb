@@ -49,5 +49,6 @@ services:
       # sampler correlates these windows to per-container CPU/mem (Part 2).
       MM_PHASES: "/out/phases.csv"
       GIT_COMMIT: "${GIT_COMMIT:-}"
+      GIT_BRANCH: "${GIT_BRANCH:-}"
     volumes:
       - ./out:/out

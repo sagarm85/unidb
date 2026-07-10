@@ -12,6 +12,31 @@
 
 ## Current status
 
+- **Docker fair-fsync report + Table 3 remark & Table 3.1 bulk stress — DONE
+  (2026-07-10), branch `bench-docker-fair-fsync-report` (commit `c5c150c`), PR
+  raised.** **Benchmark tooling only — NO engine code touched; no
+  `FORMAT_VERSION` bump, no crash point, no §3 decision.** Adds a **Docker** path
+  (`docker/` + `scripts/report.sh` auto-selects Docker/native) that runs the
+  unidb-vs-Postgres multi-model comparison on **Linux**, where both engines share
+  plain `fsync()` — removing the macOS `F_FULLFSYNC`-vs-`fsync` asymmetry.
+  **unidb runs EMBEDDED in the `decompose` bench binary inside the `bench`
+  container** (it's a library, not a server — there is no separate "unidb
+  container"); Postgres runs in its own container. `decompose.rs` `mmreport`
+  gained: **Table 3** a winner·margin **remark** column (+ INSERT row relabelled
+  "per-row commit" with a per-fsync-floor note); **Table 3.1** a new bulk-stress
+  section — fresh-table load + full **heap** scan (`COUNT(*) WHERE body <> 'x'`, a
+  non-indexed predicate so neither engine serves it index-only), swept 10k→2M by
+  default (`MM_BULK_SIZES`; 5M/10M opt-in — engine verified to ≥5M, ~2.7 min
+  insert/engine, flat ~30k rec/s, no `HeapFull`). Also: `unidb-server` default
+  `UNIDB_DATA_DIR`→`/tmp/unidb`; `mm_resource_report.py` correlates docker-stats
+  to phase windows; `GIT_BRANCH` now passed through compose (header was `?`).
+  **Two honest asymmetries stated in-report:** (1) Docker-Desktop-for-mac VM
+  `fsync` is not flush-to-platter → PG per-commit is artificially cheap, ratio is
+  fair but absolute durability is VM-bound (run on native Linux for publishable
+  numbers); (2) Table 3.1 scan lead at scale = PG **parallel** seq-scan vs unidb
+  **single-threaded** scan (real capability gap, not a count shortcut). Full
+  numbers + before/after in `PROGRESS.md`'s "Docker fair-fsync report" entry;
+  latest generated report (git-ignored) `docker/out/multi_model_report_20260710_065526.md`.
 - **Index & heap write concurrency (0a + 0c + Item A) — COMPLETE (2026-07-10),
   branch `index-write-concurrency`.** Raises the concurrent **indexed** SQL-write
   ceiling, behind a **default-off `UNIDB_CONCURRENT_SQL_WRITES` toggle**
