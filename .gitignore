@@ -8,3 +8,10 @@
 
 # OS
 .DS_Store
+
+# Python bytecode (bench report tooling)
+__pycache__/
+*.pyc
+
+# Generated benchmark reports (produced by scripts/multi_model_report.sh)
+/docs/performance/multi_model_report_*.md
