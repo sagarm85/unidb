@@ -3812,6 +3812,63 @@ mod tests {
         assert_eq!(got, vec![vec![Literal::Int(12)]], "qual on TEXT column");
     }
 
+    /// B1: `SELECT COUNT(*)` (the `count_visible` fast path, no decode) must
+    /// agree with a decode-based count across inserts, an UPDATE (new version +
+    /// superseded old must count once), and a DELETE (removed row uncounted);
+    /// and a filtered/`GROUP BY` count must still be correct (falls back).
+    #[test]
+    fn b1_count_star_matches_mvcc_visibility() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, k INT)").unwrap();
+        for i in 0..10 {
+            h.exec_as(xid, &format!("INSERT INTO t (id, k) VALUES ({i}, {i})"))
+                .unwrap();
+        }
+        h.commit(xid);
+
+        let count = |h: &mut Harness, sql: &str| -> i64 {
+            let xid = h.begin();
+            let r = h.exec_as(xid, sql).unwrap();
+            h.commit(xid);
+            match r {
+                ExecResult::Rows { rows, .. } => match rows[0][0] {
+                    Literal::Int(n) => n,
+                    ref o => panic!("{o:?}"),
+                },
+                o => panic!("{o:?}"),
+            }
+        };
+
+        assert_eq!(count(&mut h, "SELECT COUNT(*) FROM t"), 10);
+
+        // UPDATE creates a new version + supersedes the old — still one logical
+        // row, so the count is unchanged.
+        let xid = h.begin();
+        h.exec_as(xid, "UPDATE t SET k = 100 WHERE id = 3").unwrap();
+        h.commit(xid);
+        assert_eq!(count(&mut h, "SELECT COUNT(*) FROM t"), 10);
+
+        // DELETE removes one logical row.
+        let xid = h.begin();
+        h.exec_as(xid, "DELETE FROM t WHERE id = 7").unwrap();
+        h.commit(xid);
+        assert_eq!(count(&mut h, "SELECT COUNT(*) FROM t"), 9);
+
+        // Filtered / grouped counts (normal path) still correct.
+        assert_eq!(count(&mut h, "SELECT COUNT(*) FROM t WHERE k < 5"), 4);
+        let xid = h.begin();
+        let r = h
+            .exec_as(xid, "SELECT COUNT(*) FROM t GROUP BY id")
+            .unwrap();
+        h.commit(xid);
+        match r {
+            ExecResult::Rows { rows, .. } => assert_eq!(rows.len(), 9),
+            o => panic!("{o:?}"),
+        }
+    }
+
     // ── P2.d: SERIAL / sequences ─────────────────────────────────────────────
 
     #[test]

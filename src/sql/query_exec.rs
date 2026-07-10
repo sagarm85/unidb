@@ -27,7 +27,7 @@ use crate::sql::logical::{CmpOp, Literal};
 use crate::sql::plan::{
     self, eval_qexpr, plan_query, resolve_column, Batch, ColumnRef, CteSchemas, PlanNode,
 };
-use crate::sql::query::{JoinType, QExpr, QuerySpec};
+use crate::sql::query::{AggFunc, JoinType, QExpr, QuerySpec};
 
 pub fn exec_query(spec: &QuerySpec, ctx: &mut ExecCtx) -> Result<ExecResult> {
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
@@ -233,6 +233,34 @@ impl Runner<'_, '_> {
                 aggs,
                 output,
             } => {
+                // B1: `SELECT COUNT(*) FROM t` — no GROUP BY, every aggregate a
+                // plain `COUNT(*)` (no arg, not DISTINCT), directly over a full
+                // `Scan` (no filter between) — counts visible slots via
+                // `Heap::count_visible`, decoding nothing. Any deviation
+                // (`COUNT(col)`, `SUM`, `GROUP BY`, a Filter/IndexScan input)
+                // falls through to the normal decode-and-aggregate path.
+                if group_exprs.is_empty()
+                    && !aggs.is_empty()
+                    && aggs
+                        .iter()
+                        .all(|a| matches!(a.func, AggFunc::Count) && a.arg.is_none() && !a.distinct)
+                {
+                    if let PlanNode::Scan { table, .. } = input.as_ref() {
+                        let table_def = self.ctx.catalog.lookup(table)?.clone();
+                        let heap = Heap::open(
+                            self.ctx.page_size,
+                            table_def.fsm_meta,
+                            table_def.pages.clone(),
+                        );
+                        let count =
+                            heap.count_visible(&self.snapshot, self.ctx.xid, self.ctx.pool)?;
+                        let row = vec![Literal::Int(count as i64); aggs.len()];
+                        return Ok(Batch {
+                            schema: output.clone(),
+                            rows: vec![row],
+                        });
+                    }
+                }
                 let batch = self.run(input)?;
                 crate::sql::aggregate::aggregate(batch, group_exprs, aggs, output)
             }
