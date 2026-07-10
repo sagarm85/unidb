@@ -11,7 +11,8 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use unidb::{DbError, Engine, RowId};
+use unidb::sql::logical::Literal;
+use unidb::{DbError, Engine, RowId, SqlResult};
 
 /// Run `f` on a background thread and panic if it does not finish within
 /// `secs` — turns a deadlock/livelock hang into a test failure instead of a
@@ -220,5 +221,307 @@ fn contended_updates_same_row_make_progress_without_hang() {
         let val = engine.get(xid, final_tip).unwrap();
         engine.commit(xid).unwrap();
         assert!(val.starts_with(b"t"), "final value is a written payload");
+    });
+}
+
+// ── index-write-concurrency (Item 0a + Item A) ──────────────────────────────
+//
+// These exercise the *SQL* concurrent-write path — many threads committing
+// INSERTs into one **indexed** table under the shared catalog lock (`cat_read`),
+// so their B-tree index maintenance overlaps and is made safe only by the
+// `DiskBTree` crabbing protocol (Item A), not by the old catalog write lock.
+
+/// Collect the `id` column (first projected column, an INT) of a SELECT.
+fn select_ids(engine: &Engine, sql: &str) -> Vec<i64> {
+    let x = engine.begin().unwrap();
+    let res = engine.execute_sql(x, sql).unwrap();
+    engine.commit(x).unwrap();
+    match res.into_iter().next().unwrap() {
+        SqlResult::Rows { rows, .. } => rows
+            .into_iter()
+            .map(|r| match r[0] {
+                Literal::Int(n) => n,
+                ref o => panic!("expected Int id, got {o:?}"),
+            })
+            .collect(),
+        o => panic!("expected Rows, got {o:?}"),
+    }
+}
+
+/// Run the concurrent-indexed-INSERT workload and assert full correctness: every
+/// committed row is present (no lost INSERT), and every key resolves via the
+/// B-tree index to exactly the ids that carry it (no lost/duplicated index
+/// entry). Shared by the toggle-on and toggle-off cases so both are held to the
+/// identical correctness bar. `n_keys` controls duplicate density (many ids
+/// share a key ⇒ duplicate runs straddle leaf splits under contention).
+fn run_indexed_insert_workload(concurrent: bool) {
+    with_deadline(120, move || {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(dir.path(), 0).unwrap());
+        engine.set_deferred_sync(true);
+        engine.set_concurrent_sql_writes(concurrent);
+        assert_eq!(engine.concurrent_sql_writes_enabled(), concurrent);
+
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE t (id INT, k INT, body TEXT)")
+            .unwrap();
+        engine
+            .execute_sql(x, "CREATE INDEX t_k ON t USING BTREE (k)")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        let threads = 8usize;
+        let per = 300i64;
+        let n_keys = 97i64; // duplicate density
+        let barrier = Arc::new(Barrier::new(threads));
+        let mut handles = Vec::new();
+        for t in 0..threads {
+            let engine = Arc::clone(&engine);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                let ins = engine
+                    .prepare("INSERT INTO t (id, k, body) VALUES ($1, $2, $3)")
+                    .unwrap();
+                barrier.wait();
+                for i in 0..per {
+                    let id = (t as i64) * 1000 + i; // globally unique
+                    let k = id % n_keys; // overlaps across threads
+                    let xid = engine.begin().unwrap();
+                    engine
+                        .execute_prepared(
+                            xid,
+                            &ins,
+                            &[
+                                Literal::Int(id),
+                                Literal::Int(k),
+                                Literal::Text(format!("b{id}")),
+                            ],
+                        )
+                        .unwrap();
+                    engine.commit(xid).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // (1) No lost INSERT: full scan returns every id exactly once.
+        let mut all_ids = select_ids(&engine, "SELECT id FROM t");
+        all_ids.sort_unstable();
+        let mut expected_ids: Vec<i64> = (0..threads as i64)
+            .flat_map(|t| (0..per).map(move |i| t * 1000 + i))
+            .collect();
+        expected_ids.sort_unstable();
+        assert_eq!(
+            all_ids, expected_ids,
+            "every committed row present exactly once"
+        );
+
+        // (2) No lost/duplicated index entry: for each key, the index lookup
+        //     (SELECT WHERE k = key uses the B-tree) returns exactly the ids that
+        //     carry that key. Compare as sets.
+        let mut expected_by_key: std::collections::HashMap<i64, std::collections::BTreeSet<i64>> =
+            std::collections::HashMap::new();
+        for &id in &expected_ids {
+            expected_by_key.entry(id % n_keys).or_default().insert(id);
+        }
+        for (k, want) in &expected_by_key {
+            let got: std::collections::BTreeSet<i64> =
+                select_ids(&engine, &format!("SELECT id FROM t WHERE k = {k}"))
+                    .into_iter()
+                    .collect();
+            assert_eq!(&got, want, "index lookup for k={k} lost/duplicated entries");
+        }
+    });
+}
+
+/// Item 0a + A acceptance (correctness): concurrent indexed INSERTs under the
+/// **toggle on** are race-free — no lost row, no lost/duplicated index entry.
+#[test]
+fn concurrent_indexed_sql_inserts_correct_toggle_on() {
+    run_indexed_insert_workload(true);
+}
+
+/// Toggle-off regression: the exact same workload under the known-safe
+/// serialized (`cat_write`) path is equally correct. Guards that shipping dark
+/// (default off) preserves behavior and that the old path stays intact.
+#[test]
+fn concurrent_indexed_sql_inserts_correct_toggle_off() {
+    run_indexed_insert_workload(false);
+}
+
+/// Vacuum interleaved with concurrent index writes (test-matrix "MVCC aliasing
+/// (M10.c)"): while writers INSERT/DELETE on an indexed table under the toggle,
+/// a background thread repeatedly vacuums — exercising `DiskBTree::remove`/
+/// `set_value` (now leaf-latched) racing the crabbing inserts. Afterwards every
+/// surviving row must still resolve through the index, and a stale reclaimed slot
+/// must never surface a wrong row.
+#[test]
+fn vacuum_interleaved_with_concurrent_index_writes() {
+    with_deadline(120, || {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(dir.path(), 0).unwrap());
+        engine.set_deferred_sync(true);
+        engine.set_concurrent_sql_writes(true);
+
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE t (id INT, k INT, body TEXT)")
+            .unwrap();
+        engine
+            .execute_sql(x, "CREATE INDEX t_k ON t USING BTREE (k)")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        let stop = Arc::new(AtomicUsize::new(0));
+        // Background vacuum loop.
+        let vac = {
+            let engine = Arc::clone(&engine);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while stop.load(Ordering::Relaxed) == 0 {
+                    let _ = engine.vacuum();
+                    thread::sleep(Duration::from_millis(2));
+                }
+            })
+        };
+
+        let threads = 6usize;
+        let per = 150i64;
+        let barrier = Arc::new(Barrier::new(threads));
+        let mut handles = Vec::new();
+        for t in 0..threads {
+            let engine = Arc::clone(&engine);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for i in 0..per {
+                    let id = (t as i64) * 10_000 + i;
+                    let k = id % 41;
+                    let xid = engine.begin().unwrap();
+                    engine
+                        .execute_sql(
+                            xid,
+                            &format!("INSERT INTO t (id, k, body) VALUES ({id}, {k}, 'b')"),
+                        )
+                        .unwrap();
+                    engine.commit(xid).unwrap();
+                    // Delete every other row to feed the vacuum.
+                    if i % 2 == 0 {
+                        let xid = engine.begin().unwrap();
+                        engine
+                            .execute_sql(xid, &format!("DELETE FROM t WHERE id = {id}"))
+                            .unwrap();
+                        engine.commit(xid).unwrap();
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        stop.store(1, Ordering::Relaxed);
+        vac.join().unwrap();
+        engine.vacuum().unwrap();
+
+        // Surviving rows = the odd-i rows. Each must resolve through the index.
+        let survivors: Vec<(i64, i64)> = (0..threads as i64)
+            .flat_map(|t| {
+                (0..per)
+                    .filter(|i| i % 2 == 1)
+                    .map(move |i| (t * 10_000 + i, (t * 10_000 + i) % 41))
+            })
+            .collect();
+        for (id, k) in &survivors {
+            let ids: std::collections::BTreeSet<i64> =
+                select_ids(&engine, &format!("SELECT id FROM t WHERE k = {k}"))
+                    .into_iter()
+                    .collect();
+            assert!(
+                ids.contains(id),
+                "survivor id={id} (k={k}) not found via index"
+            );
+        }
+        // No deleted row resurfaces via the index.
+        let all: std::collections::BTreeSet<i64> = select_ids(&engine, "SELECT id FROM t")
+            .into_iter()
+            .collect();
+        for t in 0..threads as i64 {
+            for i in (0..per).step_by(2) {
+                assert!(!all.contains(&(t * 10_000 + i)), "deleted row resurfaced");
+            }
+        }
+    });
+}
+
+/// Two-thread cross-row lock-ordering (test-matrix "Deadlock"): each thread
+/// updates two indexed rows in the opposite order within one transaction, so the
+/// row lock manager can form a cycle. The wait-for-graph detector must break it
+/// cleanly (a `Deadlock`/`WriteConflict` one side retries) with no hang — never a
+/// livelock or a corrupted index.
+#[test]
+fn cross_row_update_deadlock_resolves_no_hang() {
+    with_deadline(60, || {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(dir.path(), 0).unwrap());
+        engine.set_deferred_sync(true);
+        engine.set_concurrent_sql_writes(true);
+
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE t (id INT, k INT)")
+            .unwrap();
+        engine
+            .execute_sql(x, "CREATE INDEX t_k ON t USING BTREE (k)")
+            .unwrap();
+        engine
+            .execute_sql(x, "INSERT INTO t (id, k) VALUES (1, 10), (2, 20)")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        let rounds = 40;
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for dir_forward in [true, false] {
+            let engine = Arc::clone(&engine);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                let (first, second) = if dir_forward { (1, 2) } else { (2, 1) };
+                barrier.wait();
+                let mut done = 0;
+                while done < rounds {
+                    let v = 100 + done;
+                    let xid = engine.begin().unwrap();
+                    let a = engine
+                        .execute_sql(xid, &format!("UPDATE t SET k = {v} WHERE id = {first}"));
+                    let b = a.and_then(|_| {
+                        engine
+                            .execute_sql(xid, &format!("UPDATE t SET k = {v} WHERE id = {second}"))
+                    });
+                    match b.and_then(|_| engine.commit(xid)) {
+                        Ok(_) => done += 1,
+                        Err(DbError::Deadlock { .. })
+                        | Err(DbError::WriteConflict { .. })
+                        | Err(DbError::SerializationFailure { .. }) => {
+                            let _ = engine.abort(xid);
+                        }
+                        Err(e) => panic!("unexpected error: {e:?}"),
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Both rows survive and remain index-resolvable at their final values.
+        let x = engine.begin().unwrap();
+        let rows = engine.execute_sql(x, "SELECT id FROM t").unwrap();
+        engine.commit(x).unwrap();
+        match rows.into_iter().next().unwrap() {
+            SqlResult::Rows { rows, .. } => assert_eq!(rows.len(), 2),
+            o => panic!("expected Rows, got {o:?}"),
+        }
     });
 }

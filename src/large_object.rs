@@ -76,6 +76,7 @@ pub fn lobs_table_def() -> TableDef {
         events_enabled: false,
         serial_next: Default::default(),
         constraints: Default::default(),
+        generation: 0,
     }
 }
 

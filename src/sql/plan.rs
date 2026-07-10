@@ -989,6 +989,7 @@ mod tests {
             events_enabled: false,
             constraints: Default::default(),
             serial_next: Default::default(),
+            generation: 0,
         }
     }
 

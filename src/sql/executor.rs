@@ -58,9 +58,66 @@ const IVF_TRAIN_ITERS: usize = 8;
 use super::datetime;
 use super::logical::{CmpOp, Expr, Literal, LogicalPlan};
 
+/// How the executor holds the catalog for one statement (index-write-concurrency
+/// Item 0a). Every SQL statement that changes no schema reads the catalog only
+/// (it `lookup(table)?.clone()`s the `TableDef` and works off the owned clone),
+/// so DML can run under a **shared** catalog lock and overlap concurrent
+/// writers. DDL — and the two DML mutations that touch the catalog (a SERIAL
+/// bump, or a legacy non-FSM table's page-list persist) — need **exclusive**
+/// access. This handle lets one `ExecCtx` type carry either:
+///
+/// * `Shared(&Catalog)` — the concurrent DML path (`cat_read`). `exclusive()`
+///   returns an error, which is a *tripwire*: the routing in `lib.rs` must never
+///   send a catalog-mutating statement down this path (it escalates to
+///   `cat_write` instead), so hitting it means a routing bug, caught as a clean
+///   error rather than silent corruption.
+/// * `Exclusive(&mut Catalog)` — DDL, and all DML when the toggle is off
+///   (`cat_write`, today's behavior verbatim).
+///
+/// Read access goes through `Deref`, so every existing `ctx.catalog.lookup(..)`
+/// call site is unchanged.
+pub enum CatalogHandle<'a> {
+    Shared(&'a Catalog),
+    Exclusive(&'a mut Catalog),
+}
+
+impl std::ops::Deref for CatalogHandle<'_> {
+    type Target = Catalog;
+    fn deref(&self) -> &Catalog {
+        match self {
+            CatalogHandle::Shared(c) => c,
+            CatalogHandle::Exclusive(c) => c,
+        }
+    }
+}
+
+impl CatalogHandle<'_> {
+    /// Borrow the catalog for a *read* as an explicit `&Catalog` — for the few
+    /// call sites that pass it to a function expecting `&Catalog` (where `Deref`
+    /// coercion on a field place isn't automatic).
+    pub fn get(&self) -> &Catalog {
+        self
+    }
+
+    /// Borrow the catalog for a *mutation*. Succeeds only for `Exclusive`; a
+    /// `Shared` handle means a catalog-mutating statement was mis-routed onto the
+    /// concurrent (`cat_read`) path — a bug, surfaced as an error, never a
+    /// corrupting write under a shared lock.
+    pub fn exclusive(&mut self) -> Result<&mut Catalog> {
+        match self {
+            CatalogHandle::Exclusive(c) => Ok(c),
+            CatalogHandle::Shared(_) => Err(DbError::SqlPlan(
+                "catalog mutation attempted under a shared (concurrent-DML) lock; \
+                 this statement should have been routed to the exclusive path"
+                    .into(),
+            )),
+        }
+    }
+}
+
 /// Everything the executor needs, bundled to avoid a long parameter list.
 pub struct ExecCtx<'a> {
-    pub catalog: &'a mut Catalog,
+    pub catalog: CatalogHandle<'a>,
     pub txn_mgr: &'a TransactionManager,
     pub pool: &'a BufferPool,
     pub wal: &'a Wal,
@@ -94,6 +151,30 @@ pub struct ExecCtx<'a> {
 /// scrubs — exactly how the heap keeps the old version until vacuum. A NULL /
 /// non-orderable value is skipped. A column flagged but never built (no
 /// `index_root`) is skipped — queries fall back to a full scan, never wrong.
+/// Schema-generation tripwire (index-write-concurrency, Validation §5). A DML
+/// statement clones its `TableDef` up front and works off that owned copy; this
+/// asserts, at write time, that the catalog's live generation for the table is
+/// still the one it cloned. Under the concurrent (`cat_read`) path the whole
+/// statement holds a shared catalog lock, so no DDL (which needs `cat_write`)
+/// can interleave — the generation MUST be stable. A firing assert means the
+/// lock discipline regressed and a statement is about to write against a stale
+/// schema; a `debug_assert!` so it costs nothing in release but turns the
+/// dangerous window into a hard failure under test / stress / TSan. `gen0` is
+/// the fallback so a table that is genuinely absent (never the case mid-DML
+/// under a held lock) does not itself trip the assert.
+#[inline]
+fn assert_schema_stable(ctx: &ExecCtx, table: &str, gen0: u64) {
+    debug_assert_eq!(
+        ctx.catalog
+            .lookup(table)
+            .map(|t| t.generation)
+            .unwrap_or(gen0),
+        gen0,
+        "table '{table}' schema generation changed during a running DML statement — \
+         catalog lock discipline violated (index-write-concurrency tripwire)"
+    );
+}
+
 fn apply_durable_index_writes(
     table_def: &TableDef,
     row_id: RowId,
@@ -286,7 +367,9 @@ fn reject_system_table(table: &str) -> Result<()> {
 fn exec_alter_add_column(table: &str, column: ColumnDef, ctx: &mut ExecCtx) -> Result<ExecResult> {
     reject_system_table(table)?;
     let mut cctx = catalog_ctx!(ctx);
-    ctx.catalog.add_column(table, column, &mut cctx)?;
+    ctx.catalog
+        .exclusive()?
+        .add_column(table, column, &mut cctx)?;
     Ok(ExecResult::AlteredTable)
 }
 
@@ -298,7 +381,11 @@ fn exec_alter_drop_column(
 ) -> Result<ExecResult> {
     reject_system_table(table)?;
     let mut cctx = catalog_ctx!(ctx);
-    match ctx.catalog.drop_column(table, column, &mut cctx) {
+    match ctx
+        .catalog
+        .exclusive()?
+        .drop_column(table, column, &mut cctx)
+    {
         Ok(()) => Ok(ExecResult::AlteredTable),
         // `IF EXISTS`: a missing column is not an error.
         Err(DbError::ColumnNotFound { .. }) if if_exists => Ok(ExecResult::AlteredTable),
@@ -309,7 +396,7 @@ fn exec_alter_drop_column(
 fn exec_drop_table(table: &str, if_exists: bool, ctx: &mut ExecCtx) -> Result<ExecResult> {
     reject_system_table(table)?;
     let mut cctx = catalog_ctx!(ctx);
-    match ctx.catalog.drop_table(table, &mut cctx) {
+    match ctx.catalog.exclusive()?.drop_table(table, &mut cctx) {
         Ok(()) => Ok(ExecResult::DroppedTable),
         Err(DbError::TableNotFound(_)) if if_exists => Ok(ExecResult::DroppedTable),
         Err(e) => Err(e),
@@ -329,7 +416,9 @@ fn exec_analyze(table: &str, ctx: &mut ExecCtx) -> Result<ExecResult> {
     }
     let stats = crate::sql::statistics::compute(&rows, &table_def.columns);
     let mut cctx = catalog_ctx!(ctx);
-    ctx.catalog.set_table_stats(table, stats, &mut cctx)?;
+    ctx.catalog
+        .exclusive()?
+        .set_table_stats(table, stats, &mut cctx)?;
     Ok(ExecResult::Rows {
         columns: Vec::new(),
         rows: Vec::new(),
@@ -345,7 +434,7 @@ fn exec_truncate(table: &str, ctx: &mut ExecCtx) -> Result<ExecResult> {
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
     let count = heap.scan(&snapshot, ctx.xid, ctx.pool)?.len();
     let mut cctx = catalog_ctx!(ctx);
-    ctx.catalog.truncate(table, &mut cctx)?;
+    ctx.catalog.exclusive()?.truncate(table, &mut cctx)?;
     Ok(ExecResult::Truncated { count })
 }
 
@@ -378,9 +467,10 @@ fn exec_create_table(
         events_enabled: false,
         serial_next,
         constraints,
+        generation: 0,
     };
     let mut cctx = catalog_ctx!(ctx);
-    ctx.catalog.create_table(def, &mut cctx)?;
+    ctx.catalog.exclusive()?.create_table(def, &mut cctx)?;
     Ok(ExecResult::CreatedTable)
 }
 
@@ -418,6 +508,7 @@ fn exec_create_index(
 
     let mut cctx = catalog_ctx!(ctx);
     ctx.catalog
+        .exclusive()?
         .set_column_index(table, column, Some(kind), &mut cctx)?;
 
     let table_def = ctx.catalog.lookup(table)?.clone();
@@ -485,6 +576,7 @@ fn exec_create_index(
 
     let mut cctx = catalog_ctx!(ctx);
     ctx.catalog
+        .exclusive()?
         .set_column_index_root(table, column, Some(meta_page), &mut cctx)?;
     Ok(ExecResult::CreatedIndex)
 }
@@ -508,7 +600,9 @@ fn persist_pages_if_changed(
     if heap.page_ids() != original {
         let new_pages = heap.page_ids().to_vec();
         let mut cctx = catalog_ctx!(ctx);
-        ctx.catalog.set_pages(table, new_pages, &mut cctx)?;
+        ctx.catalog
+            .exclusive()?
+            .set_pages(table, new_pages, &mut cctx)?;
     }
     Ok(())
 }
@@ -522,7 +616,7 @@ fn exec_insert(
     let table_def = ctx.catalog.lookup(table)?.clone();
     // FK (M11): only referenced-table existence is enforced, and it's a
     // schema-level property — check it once per statement, not per row.
-    enforce_referenced_tables_exist(&table_def, ctx.catalog)?;
+    enforce_referenced_tables_exist(&table_def, ctx.catalog.get())?;
     let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
 
     let mut count = 0;
@@ -559,6 +653,7 @@ fn exec_insert(
     }
 
     persist_pages_if_changed(table, &heap, &table_def.pages, ctx)?;
+    assert_schema_stable(ctx, table, table_def.generation);
     Ok(ExecResult::Inserted { count })
 }
 
@@ -892,7 +987,7 @@ fn exec_update(
     ctx: &mut ExecCtx,
 ) -> Result<ExecResult> {
     let table_def = ctx.catalog.lookup(table)?.clone();
-    enforce_referenced_tables_exist(&table_def, ctx.catalog)?;
+    enforce_referenced_tables_exist(&table_def, ctx.catalog.get())?;
     let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
 
@@ -953,6 +1048,7 @@ fn exec_update(
     }
 
     persist_pages_if_changed(table, &heap, &table_def.pages, ctx)?;
+    assert_schema_stable(ctx, table, table_def.generation);
     Ok(ExecResult::Updated { count })
 }
 
@@ -989,6 +1085,7 @@ fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Resu
     }
 
     persist_pages_if_changed(table, &heap, &table_def.pages, ctx)?;
+    assert_schema_stable(ctx, table, table_def.generation);
     Ok(ExecResult::Deleted { count })
 }
 
@@ -1319,7 +1416,10 @@ fn fill_serials(
     for (i, col) in table_def.columns.iter().enumerate() {
         if col.constraints.identity && !col.dropped && matches!(row[i], Literal::Null) {
             let mut cctx = catalog_ctx!(ctx);
-            let value = ctx.catalog.alloc_serial(table, &col.name, &mut cctx)?;
+            let value = ctx
+                .catalog
+                .exclusive()?
+                .alloc_serial(table, &col.name, &mut cctx)?;
             row[i] = Literal::Int(value);
         }
     }
@@ -2117,7 +2217,7 @@ mod tests {
             assert_eq!(plans.len(), 1, "expected exactly one statement");
             let plan = plans.remove(0);
             let mut ctx = ExecCtx {
-                catalog: &mut self.catalog,
+                catalog: CatalogHandle::Exclusive(&mut self.catalog),
                 txn_mgr: &self.txn_mgr,
                 pool: &self.pool,
                 wal: &self.wal,
@@ -2458,6 +2558,7 @@ mod tests {
             events_enabled: false,
             serial_next: Default::default(),
             constraints: Default::default(),
+            generation: 0,
         };
         let err = coerce_and_validate_row(&table, vec![Literal::Vector(vec![0.1, 0.2, 0.3])]);
         assert!(matches!(err, Err(DbError::SqlPlan(_))));

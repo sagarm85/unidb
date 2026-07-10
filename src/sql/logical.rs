@@ -352,6 +352,7 @@ mod tests {
             events_enabled: false,
             serial_next: Default::default(),
             constraints: Default::default(),
+            generation: 0,
         });
         catalog
     }

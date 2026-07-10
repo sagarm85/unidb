@@ -267,6 +267,17 @@ pub struct TableDef {
     /// via the same WAL-logged page write as any catalog change) and monotonic.
     #[serde(default)]
     pub serial_next: HashMap<String, i64>,
+    /// Schema-shape generation counter (index-write-concurrency, Validation §5).
+    /// Bumped by every DDL that changes this table's shape (column set, index
+    /// attachment/root, TRUNCATE). A DML statement captures it when it clones the
+    /// `TableDef` and `debug_assert!`s it is unchanged at write time: under the
+    /// concurrent (`cat_read`) path the whole statement runs under a shared
+    /// catalog lock, so no DDL can interleave and the counter must be stable —
+    /// making this a cheap tripwire that turns a lock-discipline regression into a
+    /// test/stress panic instead of a silent stale-schema write. `#[serde(default)]`
+    /// so pre-existing catalog blobs deserialize with 0.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 /// Everything `Catalog` needs to durably persist itself, bundled so
@@ -428,6 +439,7 @@ impl Catalog {
                 column: column.to_string(),
             })?;
         col.index = kind;
+        t.generation = t.generation.wrapping_add(1);
         self.persist(ctx)
     }
 
@@ -454,6 +466,7 @@ impl Catalog {
                 column: column.to_string(),
             })?;
         col.index_root = index_root;
+        t.generation = t.generation.wrapping_add(1);
         self.persist(ctx)
     }
 
@@ -538,6 +551,7 @@ impl Catalog {
             )));
         }
         t.columns.push(col);
+        t.generation = t.generation.wrapping_add(1);
         self.persist(ctx)
     }
 
@@ -578,6 +592,7 @@ impl Catalog {
         col.dropped = true;
         col.index = None;
         col.constraints = ColumnConstraints::default();
+        t.generation = t.generation.wrapping_add(1);
         self.persist(ctx)
     }
 
@@ -618,6 +633,7 @@ impl Catalog {
         if let Some(meta) = fresh_fsm {
             t.fsm_meta = Some(meta);
         }
+        t.generation = t.generation.wrapping_add(1);
         // Row set is now empty; previously gathered stats are stale.
         self.stats.remove(table);
         self.persist(ctx)
@@ -708,6 +724,7 @@ mod tests {
             events_enabled: false,
             serial_next: Default::default(),
             constraints: Default::default(),
+            generation: 0,
         };
         let mut ctx = CatalogCtx {
             pool: &pool,
@@ -735,6 +752,7 @@ mod tests {
             events_enabled: false,
             serial_next: Default::default(),
             constraints: Default::default(),
+            generation: 0,
         };
         let mut ctx = CatalogCtx {
             pool: &pool,
@@ -779,6 +797,7 @@ mod tests {
             events_enabled: false,
             serial_next: Default::default(),
             constraints: Default::default(),
+            generation: 0,
         };
         {
             let mut ctx = CatalogCtx {
@@ -829,6 +848,7 @@ mod tests {
             events_enabled: false,
             serial_next: Default::default(),
             constraints: Default::default(),
+            generation: 0,
         };
         {
             let mut ctx = CatalogCtx {
@@ -862,6 +882,7 @@ mod tests {
             events_enabled: false,
             serial_next: Default::default(),
             constraints: Default::default(),
+            generation: 0,
         };
         let policy = Expr::BinOp {
             op: CmpOp::Eq,

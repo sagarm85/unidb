@@ -3274,3 +3274,116 @@ group-commit fsync, not the page-list write.**
 `FORMAT_VERSION` bump.
 
 **Durable on-disk FSM + catalog page-list is COMPLETE.**
+
+---
+
+## Index & heap write concurrency (0a + 0c + Item A)   [SHIPPED]   2026-07-10
+
+**PR:** _(branch `index-write-concurrency`)_
+**Spec:** `docs/backlog/index_write_concurrency.md` (status flipped to SHIPPED).
+**Summary:** Raised the concurrent **indexed** SQL-write ceiling. Two things
+landed as one unit behind a **default-off `UNIDB_CONCURRENT_SQL_WRITES` toggle**:
+(0a/0c) catalog-non-mutating SQL DML now takes a **shared** catalog lock instead
+of the engine-wide write lock, so writers to a table overlap; and (Item A) the
+`DiskBTree` insert path is made race-safe under concurrent writers by
+**latch-coupled ("crabbing") descent with safe-node early release**. Before,
+`DiskBTree` had no intra-tree concurrency control and correctness rested entirely
+on the SQL catalog `RwLock` serializing all writers — so indexed 8-writer INSERT
+fell *below* the group-commit fsync floor (all index maintenance serial). This
+recovers it toward the unindexed floor. **No `FORMAT_VERSION` bump; no §3 decision
+reopened.** Ships dark — the toggle (an `AtomicBool`, also runtime-settable via
+`Engine::set_concurrent_sql_writes`) bounds the residual crabbing-race risk to one
+env var, no code revert.
+
+**What shipped**
+
+- **0a — DML/DDL catalog-lock split.** `ExecCtx.catalog` became a
+  `CatalogHandle{Shared(&Catalog), Exclusive(&mut Catalog)}` (Deref for the ~30
+  read sites; `.exclusive()?` for the 8 catalog-write sites — a `Shared` handle
+  erroring there is itself a routing tripwire). `Engine::execute_one_plan` routes
+  by statement: catalog-non-mutating DML (`SELECT`/`INSERT`/`UPDATE`/`DELETE` on
+  an FSM-backed, non-SERIAL table) → `cat_read`; DDL and catalog-mutating DML →
+  `cat_write`. Toggle off ⇒ everything takes `cat_write` (today's behavior, byte
+  for byte).
+- **0c — SERIAL/legacy escalation.** An INSERT into a table with an identity
+  column, or any DML on a legacy pre-FSM (`fsm_meta == None`) table, routes to the
+  exclusive path (it mutates the catalog: SERIAL bump / page-list persist). The
+  SQL DML path already did **not** take `write_serial` (audited), so nothing was
+  removed there; graph/LOB/event paths keep `write_serial` (out of scope).
+- **Item A — `DiskBTree` crabbing.** `insert_in_txn` descends latching each child
+  before the parent (buffer-pool per-page exclusive latches, P5.a), dropping all
+  ancestor + meta latches at the first **safe** node (`node_is_insert_safe` —
+  exact for `Int`/`Bool` keys, conservative for `Text`). The still-modifiable path
+  suffix (`retained` frame stack) stays latched; a split propagates up through it;
+  only a root split repoints the meta page (root never released ⇒ meta held).
+  Latches strictly root→leaf ⇒ deadlock-free. `set_value`/`remove` re-read the
+  target leaf **under** its exclusive latch (never write back pre-latch bytes over
+  a concurrent split). Reads stay latch-free (owned per-page copies + right-linked
+  leaves + MVCC re-validation ⇒ a transiently stale read self-corrects). Recovery
+  unchanged (full-page redo-only `WAL_INDEX`, one mini-txn per insert).
+
+**Validation (per the spec's strategy)**
+
+- **Structural validator** `DiskBTree::validate` — walks the whole tree, asserts
+  leaf chain sorted+linked, no cycle, no lost/dup entry; run at the end of every
+  concurrency test.
+- **Concurrent stress** (`btree_index` unit): 8 threads × 500 inserts (disjoint +
+  heavy-overlap) into one tree → validator + exact set equality; run 5× clean.
+- **Deterministic split-contention** (`btree_index` unit): pre-fill to a split
+  boundary, release 2 threads simultaneously onto the hot region, validate (×5).
+- **End-to-end** (`tests/concurrent_writers.rs`): indexed 8-writer SQL INSERT with
+  overlapping keys → every row present, every `WHERE k = ?` index lookup resolves
+  to exactly the right ids (toggle **on** and **off**); vacuum interleaved with
+  concurrent indexed writes (M10.c aliasing gate holds); 2-thread cross-row
+  deadlock resolves with no hang.
+- **`loom`** (`loom-crabbing` crate, `RUSTFLAGS="--cfg loom" cargo test -p
+  loom-crabbing`): exhaustive interleaving of the meta→root→leaf latch protocol —
+  deadlock-free, mutually exclusive, no lost update. Isolated crate so `--cfg
+  loom` never reaches `unidb`'s other dev-deps (tokio/postgres gate on
+  `not(loom)`).
+- **Schema-generation tripwire** (`TableDef.generation`, bumped by DDL,
+  `debug_assert`ed stable at DML write time) — catches a lock-discipline
+  regression as a test panic, never a silent stale-schema write.
+- **ThreadSanitizer** — the CI hook is the indexed `concurrent_writers` stress
+  under `-Zsanitizer=thread` on `x86_64-unknown-linux-gnu` (documented run
+  command; local dev is Apple silicon).
+
+**Benchmark — acceptance (Table C, `benches/decompose.rs`,
+`UNIDB_BENCH=hiconc HICONC_ONLY=c HICONC_IDX_PREGROW=200000`, native Apple
+silicon, group-commit on, per-commit-durable):**
+
+| schema   | writers | toggle OFF (commits/s) | toggle ON (commits/s) |
+|----------|---------|------------------------|-----------------------|
+| no-index | 1       | 327                    | 317                   |
+| no-index | 8       | 1263 (3.86×)           | 1260 (3.97×)          |
+| indexed  | 1       | 298                    | 283                   |
+| indexed  | 8       | **768 (2.57×)**        | **1058 (3.74×)**      |
+
+**Read:** *unindexed* 8-writer is the group-commit fsync floor (~1260) and is
+unchanged by the toggle (as expected — those writers were already fsync-bound).
+*Indexed* 8-writer is where the win lands: **768 → 1058 commits/s (+38%, 2.57× →
+3.74×)**, recovering the indexed shortfall from ~61% to ~84% of the unindexed
+floor. The residual gap to the floor is WAL-append contention from the
+full-node-page-image `WAL_INDEX` logging (inherent to the redo-only WAL format),
+not tree-latch serialization. **Toggle off reproduces the pre-change indexed
+number (768)** — the known-safe serialized path is intact. (The spec's headline
+`904 → ~1290` was measured on a different machine/run — an M5 Pro; the
+mechanism, direction, and magnitude reproduce here. `docs/performance/high_scale_concurrency.md`
+Table C carries the post-fix numbers.)
+
+**Peak RSS:** unchanged (~35 MB class — crabbing adds no persistent state, just
+transient latch guards).
+
+**Green:** crash harness **28/28** (P13/P14/P15 durable-index recovery unchanged);
+`cargo test -p unidb` default + `--features server` pass; `clippy -D warnings` +
+`fmt` clean; `loom-crabbing` exhaustive model passes; sync invariant holds (`cargo
+tree -p unidb --no-default-features --edges normal` free of tokio/axum/loom).
+
+**Locked decisions:** none changed. **Follow-ups (filed, not done):** Item 0b
+(per-table lock registry — DDL-on-X stops blocking DML-on-Y) deferred; optimistic
+shared-latch descent + a full Lehman-Yao B-link tree (right-linked internal nodes,
+`FORMAT_VERSION`-bump-gated) to overlap same-subtree descents; batched SERIAL
+counter persistence. **A follow-up commit flips `UNIDB_CONCURRENT_SQL_WRITES`
+default-on after a soak period, recorded here.**
+
+**Index & heap write concurrency (0a + 0c + Item A) is COMPLETE.**

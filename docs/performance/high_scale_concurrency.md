@@ -101,6 +101,26 @@ section**, so the extra per-insert B-tree work enlarges the serial fraction and
 eats into the group-commit win. **This gap (904 → 1243, ~1.4×) is the concrete
 prize for the catalog-lock split + latch-coupled B-tree work — see Q2.**
 
+> **Post-fix update (2026-07-10, index-write-concurrency SHIPPED).** The
+> catalog-lock split (0a/0c) + latch-coupled ("crabbing") `DiskBTree` descent
+> (Item A) landed behind the default-off `UNIDB_CONCURRENT_SQL_WRITES` toggle. A
+> re-run of Table C (native Apple silicon, `HICONC_IDX_PREGROW=200000`, per-commit
+> durable) shows the indexed 8-writer prize **realized**:
+>
+> | schema   | writers | toggle OFF | toggle ON |
+> |----------|--------:|-----------:|----------:|
+> | no-index | 8       | 1263 (3.86×) | 1260 (3.97×) |
+> | indexed  | 8       | **768 (2.57×)** | **1058 (3.74×)** |
+>
+> Indexed 8-writer recovers **768 → 1058 commits/s (+38%)**, from ~61% to ~84% of
+> the unindexed floor; unindexed is unchanged (already fsync-bound); toggle off
+> reproduces the serialized baseline. The residual gap to the floor is
+> `WAL_INDEX` full-node-page-image append contention (WAL-format-inherent), not
+> tree-latch serialization. (Absolute numbers here are lower than the 904/1243
+> above because this re-run is on a different machine; the *mechanism* and
+> *direction* match.) Full detail: `PROGRESS.md`'s "Index & heap write
+> concurrency" entry.
+
 ---
 
 ## Interpretation — where the ceiling actually is

@@ -1,6 +1,6 @@
 # Index & heap write concurrency — latch-coupled B-tree + spread insertion targets
 
-## Status as of 2026-07-10: PLANNED (Core-lane) — implementation plan in §"Implementation plan" below. Filed from the durable-FSM concurrency experiment; scoped after the high-scale (millions-of-rows) unidb-vs-Postgres run.
+## Status as of 2026-07-10: **SHIPPED** (Core-lane, branch `index-write-concurrency`) — the first landed unit **0a + 0c + Item A** is implemented behind the default-off `UNIDB_CONCURRENT_SQL_WRITES` toggle, validated per the strategy below (structural validator + split-injection + loom + generation tripwire; TSan is the documented CI hook), and accepted on Table C (indexed 8-writer **768 → 1058 commits/s** with the toggle on, toggle-off reproducing the baseline). See `PROGRESS.md`'s "Index & heap write concurrency (0a + 0c + Item A)" entry for the full before/after and `docs/design/engine_design.md` §5.4. **0b (per-table lock registry) remains deferred/optional; Item B (heap-tail spread) not landed here.** Original PLAN retained below for the record.
 
 > **Correction (2026-07-10, high-scale concurrency experiment — millions of rows,
 > unidb vs Postgres head-to-head; `docs/performance/high_scale_concurrency.md`).**
