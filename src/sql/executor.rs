@@ -818,6 +818,40 @@ fn exec_select(
     let (full_needed, full_upto) = needed_mask(&full_cols, ncols);
     let has_pred = predicate.is_some();
 
+    // The two-phase B2 decode as a closure, shared by the serial and parallel
+    // paths: predicate columns → test → projection columns only on a match.
+    let per_row = |bytes: &[u8]| -> Result<Option<Vec<Literal>>> {
+        if has_pred {
+            let prow = deform_row(bytes, cols, pred_upto, &pred_needed)?;
+            if !predicate_matches(predicate, cols, &prow)? {
+                return Ok(None);
+            }
+        }
+        let row = deform_row(bytes, cols, full_upto, &full_needed)?;
+        Ok(Some(project_row(projection, cols, &row)?))
+    };
+
+    // P-b: parallelize the full scan across worker threads when the table is
+    // large enough (Milestone P). A plain `SELECT` has no `ORDER BY` (that routes
+    // through the Query engine), so the concat of per-worker results is correct;
+    // SSI read-set tracking is preserved by noting the gathered `read_ids`.
+    let pages = heap.scan_pages(ctx.pool)?;
+    if let Some(degree) = crate::sql::parallel_scan::degree_for(pages.len()) {
+        let (rows, read_ids) = crate::sql::parallel_scan::parallel_filter_project(
+            &pages,
+            &ctx.pool.shared_reader(),
+            &snapshot,
+            ctx.xid,
+            degree,
+            &|_rid, bytes| per_row(bytes),
+        )?;
+        ctx.txn_mgr.ssi_note_reads(ctx.xid, &read_ids);
+        return Ok(ExecResult::Rows {
+            columns: output_columns(projection, &table_def.columns),
+            rows,
+        });
+    }
+
     let mut out = Vec::new();
     let mut read_ids = Vec::new();
     for (i, (row_id, bytes)) in heap
@@ -828,19 +862,12 @@ fn exec_select(
         if i % 1024 == 0 {
             crate::query_limits::check()?; // P5.f: timeout / cancellation
         }
-        // Phase 1: evaluate the predicate on just its columns.
-        if has_pred {
-            let prow = deform_row(&bytes, cols, pred_upto, &pred_needed)?;
-            if !predicate_matches(predicate, cols, &prow)? {
-                continue;
-            }
+        if let Some(row) = per_row(&bytes)? {
+            // P1.d: this row is part of the statement's read set (an SSI
+            // rw-antidependency source). No-op unless `xid` is serializable.
+            read_ids.push(row_id);
+            out.push(row);
         }
-        // Phase 2: materialize projection (+ predicate) columns for output.
-        let row = deform_row(&bytes, cols, full_upto, &full_needed)?;
-        // P1.d: this row is part of the statement's read set (an SSI
-        // rw-antidependency source). No-op unless `xid` is serializable.
-        read_ids.push(row_id);
-        out.push(project_row(projection, cols, &row)?);
     }
     ctx.txn_mgr.ssi_note_reads(ctx.xid, &read_ids);
     Ok(ExecResult::Rows {

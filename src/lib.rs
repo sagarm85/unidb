@@ -2002,6 +2002,25 @@ impl Engine {
             .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Enable/disable **parallel scan** (Milestone P) at runtime. Read-only large
+    /// `SELECT`/`COUNT(*)` scans partition their pages across worker threads
+    /// (`std::thread`, not tokio). Default off (env `UNIDB_PARALLEL_SCAN=1` also
+    /// enables); `UNIDB_PARALLEL_MIN_PAGES` / `UNIDB_PARALLEL_MAX_WORKERS` tune the
+    /// page threshold and worker cap. Correct by construction — reads take owned
+    /// mmap copies under the read-lock and filter by the statement snapshot — so
+    /// this is purely a throughput knob; flipping it off reverts to the serial
+    /// path with no reopen.
+    pub fn set_parallel_scan(&self, on: bool) {
+        crate::sql::parallel_scan::set_enabled(on);
+    }
+
+    /// Tune the parallel-scan page threshold and worker cap (Milestone P);
+    /// `max_workers = 0` uses `available_parallelism`.
+    pub fn set_parallel_scan_config(&self, min_pages: usize, max_workers: usize) {
+        crate::sql::parallel_scan::set_min_pages(min_pages);
+        crate::sql::parallel_scan::set_max_workers(max_workers);
+    }
+
     /// Whether the concurrent-SQL-writes path is currently enabled (Item 0a).
     pub fn concurrent_sql_writes_enabled(&self) -> bool {
         self.concurrent_sql_writes

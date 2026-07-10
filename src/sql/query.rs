@@ -280,6 +280,26 @@ impl QExpr {
             QExpr::Exists { .. } | QExpr::ScalarSubquery(_) => false,
         }
     }
+
+    /// Whether this expression contains a subquery (`EXISTS` / `IN (subquery)` /
+    /// scalar subquery). Such predicates need the query `Runner` (`run_subquery`)
+    /// to evaluate, so they cannot be pushed into a parallel scan worker
+    /// (Milestone P partial aggregate) — a subquery-free predicate evaluates via
+    /// the pure `eval_qexpr`.
+    pub fn has_subquery(&self) -> bool {
+        match self {
+            QExpr::Exists { .. } | QExpr::InSubquery { .. } | QExpr::ScalarSubquery(_) => true,
+            QExpr::Column { .. } | QExpr::Literal(_) => false,
+            QExpr::Compare { lhs, rhs, .. } | QExpr::And(lhs, rhs) | QExpr::Or(lhs, rhs) => {
+                lhs.has_subquery() || rhs.has_subquery()
+            }
+            QExpr::Not(e) | QExpr::IsNull { expr: e, .. } => e.has_subquery(),
+            QExpr::Aggregate { arg, .. } => arg.as_ref().is_some_and(|a| a.has_subquery()),
+            QExpr::InList { expr, list, .. } => {
+                expr.has_subquery() || list.iter().any(|e| e.has_subquery())
+            }
+        }
+    }
 }
 
 impl QuerySpec {

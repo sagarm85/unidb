@@ -12,6 +12,33 @@
 
 ## Current status
 
+- **Milestone P — parallel scan workers — SHIPPED (2026-07-10), branch
+  `parallel-scan`, PR pending.** Partitions a table's pages across
+  `std::thread::scope` workers (NOT tokio — §4) reading the shared mmap.
+  **Read-only → crash harness stays 29, no `FORMAT_VERSION` bump, no §3
+  decision.** Default-off toggle (`Engine::set_parallel_scan` /
+  `UNIDB_PARALLEL_SCAN`) pending a soak.
+  - **The Phase-B "correctness landmine" does NOT exist here** (investigated +
+    resolved): unidb is **mmap-as-storage** (`Frame` = eviction metadata only;
+    `write_page` writes into the mmap under its write-lock; `read_page` returns an
+    **owned copy** under the read-lock), so a worker always sees current committed
+    data — what `ReadHandle` (6b) already relies on. My Phase-B architect-review
+    flag was a Postgres-shaped hazard that doesn't apply to DuckDB-style mmap storage.
+  - **P-a** `parallel_count` (partition + sum) → B1 COUNT route. **P-b**
+    `parallel_filter_project` (partition + concat, order-agnostic) → `exec_select`
+    full scan + `query_exec::scan`. Config: dynamic block assignment (shared
+    `AtomicUsize` page cursor, not static slices). `src/sql/parallel_scan.rs` new;
+    `heap.rs` extracted `scan_page_into`/`count_page_visible`/`scan_pages`.
+  - **Results (1M rows, 18 cores):** unfiltered `SELECT COUNT(*)` **3.82×**
+    (77M → 295M rec/s, now ~5–8× faster than Postgres); filtered
+    `COUNT(*) WHERE` **6.6×** (5.37M → 35.4M rec/s, PG lead +540% → +82%, ÷PG
+    0.16× → 0.55×) via **partial aggregate** — `parallel_count_matching` +
+    `QExpr::has_subquery` push the whole scan→filter→count into workers
+    (subquery predicates fall back). (Base-scan-only was 1.59× before that.)
+    `SUM`/`GROUP BY` partial aggregate + `LIMIT` early-stop still filed.
+  - `tests/parallel_scan.rs`: parallel matches serial, honors MVCC, torn-read-free
+    under a concurrent writer. Full detail: `PROGRESS.md` "Milestone P" entry;
+    `docs/backlog/parallel_scan.md` (SHIPPED + follow-ups).
 - **CRUD performance — Phase B (read path) — SHIPPED (2026-07-10), branch
   `crud-perf-phaseB`, PR pending.** Read-path decode-pushdown; **read-only, no
   write/recovery/format change → crash harness stays 29, no `FORMAT_VERSION`
@@ -2695,6 +2722,29 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-10 — Milestone P: parallel scan workers, branch `parallel-scan`
+
+Built parallel scan (P-primitive → P-a → P-b). Commit `9a82d97`. Detail in
+`PROGRESS.md`'s "Milestone P" entry + the Current-status bullet.
+
+- **De-risked the gating question first** (per my own Phase-B architect review):
+  read `read_handle.rs` + `bufferpool.rs` and found the pool-vs-mmap staleness
+  landmine **does not exist** — unidb is mmap-as-storage (owned-copy reads under
+  the mmap read-lock), so parallel workers always see committed data. My earlier
+  flag was a Postgres-shaped hazard that doesn't apply here. Lesson: verify the
+  storage model before importing another engine's hazards.
+- **The wiring gotcha:** the bench's scan workloads route through `query_exec`
+  (filtered COUNT → Scan→Filter→Aggregate) and `try_exec_select_btree`, NOT the
+  bare `exec_select` full scan — so I had to parallelize `query_exec::scan`, not
+  just `exec_select`, to touch the actual scan gap.
+- **Honest ROI:** unfiltered `COUNT(*)` **3.82×** (parallel_count does the whole
+  count in workers) — strong, beats PG. Filtered scan only **1.59×** because only
+  the base Scan is parallel and Filter+Aggregate are a serial Amdahl tail; partial
+  aggregate (predicate+count into workers) is the filed next lever, not forced in.
+- `std::thread::scope` (not tokio, §4); `rayon` seen in `cargo tree` is
+  `instant-distance`'s, pre-existing + sync. Crash 29 (read-only). Default-off
+  toggle pending a soak. See [[unidb-benchmark-measurement-hygiene]].
 
 ### 2026-07-10 — CRUD performance Phase B (read path), branch `crud-perf-phaseB`
 

@@ -3655,3 +3655,74 @@ lever for the raw scan-throughput gap; carries a pool/mmap read-consistency
 landmine); visibility map / index-only scans (the true COUNT accelerator at
 scale) and streaming operators (B3) — the honest ceiling.
 **Locked-decision changes:** none (§3 untouched); no `FORMAT_VERSION` bump.
+
+## Milestone P — parallel scan workers   [SHIPPED]   2026-07-10
+
+**PR:** _pending_ — branch `parallel-scan`
+**Spec:** `docs/backlog/parallel_scan.md` (status flipped to SHIPPED).
+**Summary:** The one place unidb was clearly behind Postgres was raw scan
+throughput at scale (Postgres runs a parallel sequential scan). This partitions a
+table's pages across `std::thread::scope` workers (NOT tokio — §4) reading the
+shared mmap. **Read-only — no write/recovery/on-disk-format change; crash harness
+stays 29, no `FORMAT_VERSION` bump, no §3 decision touched.** Default-off behind a
+runtime toggle (`Engine::set_parallel_scan` / `UNIDB_PARALLEL_SCAN`) pending a soak.
+
+**The Phase-B "correctness landmine" does not exist here (investigated, resolved).**
+I had flagged a Postgres-shaped pool-vs-mmap staleness hazard; unidb is
+**mmap-as-storage** (DuckDB-style): `Frame` holds only eviction metadata (no data
+buffer), `BufferPool::write_page` writes directly into the mmap under its
+write-lock, and `read_page_locked` returns an **owned copy** under the read-lock.
+So a worker always sees current committed data — exactly what the shipped
+`ReadHandle` (6b) relies on. Parallel scan was therefore *clean* to build.
+
+**Benchmarks** (release, native macOS 26.4, Apple M5 Pro — **18 cores**; serial =
+toggle off, parallel = toggle on):
+
+| workload (1M rows) | serial | parallel | speedup | ÷PG |
+|--------------------|--------|----------|---------|-----|
+| **`SELECT COUNT(*)`** (unfiltered — `parallel_count`) | 77.2M rec/s | **294.9M rec/s** | **3.82×** | ~5–8× *faster* |
+| **`COUNT(*) WHERE body<>'x'`** (filtered — **partial aggregate**) | 5.37M rec/s | **35.4M rec/s** | **6.6×** | 0.16× → **0.55×** |
+
+- **Unfiltered `COUNT(*)`: 3.82× — ~295M rec/s, now ~5–8× *faster* than
+  Postgres** (PG ~34–56M/s on the same box). Workers do the whole count
+  (header-only, no decode); bounded by mmap read-lock contention + memory
+  bandwidth, not a serial tail.
+- **Filtered `COUNT(*) WHERE …`: 6.6×** (5.37M → 35.4M rec/s) — Postgres's lead
+  collapsed from **+540% → +82%** (÷PG 0.16× → 0.55×), nearly the plan's `≤ ~2×`
+  scan target. Landed via **partial aggregate**: the query plans as Aggregate →
+  Filter → Scan, and now the *whole* scan → filter → count runs in the workers
+  (`parallel_count_matching` + a `QExpr::has_subquery` gate — a subquery-free
+  predicate evaluates via the pure `eval_qexpr`; subquery predicates fall back to
+  base-scan-parallel + serial filter). Its 6.6× *beats* the unfiltered 3.82×
+  because there is more per-row work (decode + predicate eval) to parallelize
+  against the fixed overhead. (Base-scan-only, before partial aggregate: 1.59×.)
+
+**Peak RSS:** ~18–20 MB (bounded) — workers concat to the same total row set a
+serial scan produces (COUNT is trivial), plus N thread stacks.
+
+**What changed:**
+- `src/sql/parallel_scan.rs` (NEW) — dynamic block assignment (a shared
+  `AtomicUsize` page cursor, *not* static slices — the PG parallel-seqscan skew
+  lesson) + `std::thread::scope` workers each with a cloned `SharedPageReader`;
+  `parallel_count` (sum) and `parallel_filter_project` (concat, order-agnostic).
+  Config: default-off toggle + `UNIDB_PARALLEL_SCAN` / `_MIN_PAGES` / `_MAX_WORKERS`.
+- `src/heap.rs` — extracted `scan_page_into` / `count_page_visible` (the per-page
+  cores of `scan` / `count_visible`) + `scan_pages`; serial paths delegate.
+- Wired (gated on page count): `parallel_count` into the B1 COUNT route
+  (`query_exec`); `parallel_filter_project` into `exec_select` (full scan) and
+  `query_exec::scan` (the filtered-scan base). `exec_select_readonly` (generic
+  reader) deferred — needs a `SharedPageReader`-specific path.
+- `src/lib.rs` — `Engine::set_parallel_scan` / `set_parallel_scan_config`.
+
+**Crash harness:** **29** (unchanged — read-only). Sync invariant holds
+(`std::thread`, not tokio — `cargo tree` tokio-free; `rayon` is `instant-distance`'s,
+pre-existing + sync).
+**Tests:** `tests/parallel_scan.rs` — parallel matches serial (COUNT / SELECT /
+filtered), honors MVCC across UPDATE/DELETE, and runs torn-read-free concurrently
+with a writer (owned-copy reads under the mmap read-lock). Full lib (373) green
+with the toggle **forced on**; clippy/fmt clean.
+
+**Partial aggregate — DONE** (filtered `COUNT(*) WHERE …` above, 6.6×). **Deferred
+(filed):** `SUM`/`AVG`/`GROUP BY` partial aggregate (only `COUNT(*)` is pushed so
+far); `LIMIT` early-stop; `exec_select_readonly` (server) parallelism; a
+visibility-map fast count. **Locked-decision changes:** none.

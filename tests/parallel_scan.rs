@@ -1,0 +1,186 @@
+//! Parallel scan (Milestone P) correctness: a parallel scan must return the
+//! **same set** of rows / the same count as the serial scan, and must honor the
+//! MVCC snapshot across an UPDATE/DELETE. Tables here are built large enough to
+//! span many heap pages so the parallel path actually engages.
+
+use std::sync::Arc;
+use unidb::sql::logical::Literal;
+use unidb::{Engine, SqlResult};
+
+const ROWS: i64 = 5_000; // ~25+ heap pages at this row size
+
+fn ints(res: &[SqlResult]) -> Vec<i64> {
+    let mut out = Vec::new();
+    for r in res {
+        if let SqlResult::Rows { rows, .. } = r {
+            for row in rows {
+                if let Some(Literal::Int(n)) = row.first() {
+                    out.push(*n);
+                }
+            }
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
+fn count(engine: &Arc<Engine>, sql: &str) -> i64 {
+    let x = engine.begin().unwrap();
+    let res = engine.execute_sql(x, sql).unwrap();
+    engine.commit(x).unwrap();
+    match &res[0] {
+        SqlResult::Rows { rows, .. } => match rows[0][0] {
+            Literal::Int(n) => n,
+            ref o => panic!("{o:?}"),
+        },
+        o => panic!("{o:?}"),
+    }
+}
+
+fn select(engine: &Arc<Engine>, sql: &str) -> Vec<i64> {
+    let x = engine.begin().unwrap();
+    let res = engine.execute_sql(x, sql).unwrap();
+    engine.commit(x).unwrap();
+    ints(&res)
+}
+
+fn build(engine: &Arc<Engine>) {
+    let x = engine.begin().unwrap();
+    engine
+        .execute_sql(x, "CREATE TABLE t (id INT, k INT, body TEXT)")
+        .unwrap();
+    engine.commit(x).unwrap();
+    let ins = engine
+        .prepare("INSERT INTO t (id, k, body) VALUES ($1, $2, $3)")
+        .unwrap();
+    let mut x = engine.begin().unwrap();
+    for i in 0..ROWS {
+        engine
+            .execute_prepared(
+                x,
+                &ins,
+                &[
+                    Literal::Int(i),
+                    Literal::Int(i),
+                    Literal::Text(format!("body-value-number-{i}")),
+                ],
+            )
+            .unwrap();
+        if (i + 1) % 1000 == 0 {
+            engine.commit(x).unwrap();
+            x = engine.begin().unwrap();
+        }
+    }
+    engine.commit(x).unwrap();
+}
+
+/// Parallel scan returns identical results to the serial scan for COUNT(*),
+/// full SELECT, and a filtered SELECT (that routes through the query engine's
+/// base scan).
+#[test]
+fn parallel_scan_matches_serial() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::open(dir.path(), 0).unwrap());
+    build(&engine);
+
+    // Baseline: serial (default off).
+    engine.set_parallel_scan(false);
+    let s_count = count(&engine, "SELECT COUNT(*) FROM t");
+    let s_all = select(&engine, "SELECT id FROM t");
+    let s_grouped_count = count(&engine, "SELECT COUNT(*) FROM t WHERE body <> 'x'");
+
+    // Parallel on, threshold 1 so a multi-page table always engages it.
+    engine.set_parallel_scan(true);
+    engine.set_parallel_scan_config(1, 4);
+    let p_count = count(&engine, "SELECT COUNT(*) FROM t");
+    let p_all = select(&engine, "SELECT id FROM t");
+    let p_grouped_count = count(&engine, "SELECT COUNT(*) FROM t WHERE body <> 'x'");
+
+    assert_eq!(s_count, ROWS, "serial count");
+    assert_eq!(p_count, s_count, "parallel COUNT(*) matches serial");
+    assert_eq!(
+        p_all, s_all,
+        "parallel full SELECT matches serial (as a set)"
+    );
+    assert_eq!(p_all.len() as i64, ROWS);
+    assert_eq!(
+        p_grouped_count, s_grouped_count,
+        "parallel filtered COUNT (base-scan path) matches serial"
+    );
+    assert_eq!(s_grouped_count, ROWS);
+}
+
+/// A parallel scan running **while a writer mutates the same table** must never
+/// tear a read or panic — reads take owned page copies under the mmap read-lock,
+/// so they always see a consistent page. The scan's own snapshot is fixed, so
+/// each count is a valid point-in-time value (bounded by the row count).
+#[test]
+fn parallel_scan_concurrent_with_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::open(dir.path(), 0).unwrap());
+    engine.set_concurrent_sql_writes(true);
+    build(&engine);
+    engine.set_parallel_scan(true);
+    engine.set_parallel_scan_config(1, 4);
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let engine = Arc::clone(&engine);
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut n = 0i64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let v = 100 + (n % 50);
+                let x = engine.begin().unwrap();
+                let _ = engine.execute_sql(x, &format!("UPDATE t SET body = 'w{v}' WHERE k = {v}"));
+                let _ = engine.commit(x);
+                n += 1;
+            }
+        })
+    };
+
+    // Concurrent parallel scans while the writer churns.
+    for _ in 0..200 {
+        let c = count(&engine, "SELECT COUNT(*) FROM t");
+        assert_eq!(c, ROWS, "row count is stable under an UPDATE-only writer");
+        let ids = select(&engine, "SELECT id FROM t WHERE k >= 4000");
+        assert_eq!(ids.len() as i64, ROWS - 4000);
+    }
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    writer.join().unwrap();
+}
+
+/// A parallel scan honors the statement snapshot exactly across an UPDATE (new
+/// version + superseded old counts once) and a DELETE (removed row uncounted).
+#[test]
+fn parallel_scan_honors_mvcc() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::open(dir.path(), 0).unwrap());
+    build(&engine);
+    engine.set_parallel_scan(true);
+    engine.set_parallel_scan_config(1, 4);
+
+    // Update every row's body (new version + superseded old) — count unchanged.
+    let x = engine.begin().unwrap();
+    engine
+        .execute_sql(x, "UPDATE t SET body = 'updated' WHERE k < 3000")
+        .unwrap();
+    engine.commit(x).unwrap();
+    assert_eq!(
+        count(&engine, "SELECT COUNT(*) FROM t"),
+        ROWS,
+        "count unchanged after UPDATE (one visible version per row)"
+    );
+
+    // Delete a chunk — count drops by exactly that many.
+    let x = engine.begin().unwrap();
+    engine
+        .execute_sql(x, "DELETE FROM t WHERE k < 1000")
+        .unwrap();
+    engine.commit(x).unwrap();
+    assert_eq!(count(&engine, "SELECT COUNT(*) FROM t"), ROWS - 1000);
+    let ids = select(&engine, "SELECT id FROM t");
+    assert_eq!(ids.len() as i64, ROWS - 1000);
+    assert_eq!(ids.first().copied(), Some(1000), "deleted prefix gone");
+}

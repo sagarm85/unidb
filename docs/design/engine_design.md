@@ -1096,13 +1096,23 @@ wired as two-phase decode into `exec_select`/`matching_rows`/`try_exec_select_bt
 SELECT-filtered `dec/row 2.00 → 0.00`, `cols/row 8.00 → 5.00`); ~~`SELECT COUNT(*)`
 decoded every row into `Literal`s it discarded~~ (**fixed**: `Heap::count_visible`
 counts Live+visible slots via headers only — **now 2.81× faster than Postgres**).
-**Remaining read-path debt (deferred):** the raw scan-throughput gap
-(`SELECT-all`, filtered SELECT at scale) is Postgres's **parallelism** — the lever
-is a **parallel scan** (`docs/backlog/parallel_scan.md`, its own milestone; carries
-a pool/mmap read-consistency landmine); `query_exec` (GROUP BY/COUNT) scan
-projection needs planner column pruning; a **visibility map** / index-only scan is
-the true COUNT accelerator at large scale; `ORDER BY…LIMIT` early-stop (keyset
-pagination) and streaming operators (B3) are filed. See `PROGRESS.md`'s Phase B entry.
+~~**Scan-throughput gap** (`SELECT-all`, filtered SELECT at scale) is Postgres's
+parallelism~~ (**addressed by Milestone P, 2026-07-10 — parallel scan workers**):
+a table's pages are partitioned across `std::thread::scope` workers (not tokio,
+§4) each reading the shared mmap. The **pool/mmap read-consistency "landmine" I
+flagged does not exist** — unidb is mmap-as-storage (`Frame` = eviction metadata
+only; `write_page` writes into the mmap; `read_page` returns an owned copy under
+the read-lock), so a worker always sees committed data. Result: unfiltered
+`SELECT COUNT(*)` **3.82× faster** in parallel, and filtered `COUNT(*) WHERE …`
+**6.6× faster** via **partial aggregate** (the whole scan→filter→count runs in the
+workers via `parallel_count_matching` + a `QExpr::has_subquery` gate; Postgres's
+lead +540% → +82%) — all at 1M rows, 18 cores. Read-only, so the crash harness is
+unchanged. **Remaining read-path debt (deferred):** `SUM`/`GROUP BY` partial
+aggregate + `LIMIT` early-stop (only `COUNT(*)` is pushed into workers so far);
+`query_exec` scan projection
+needs planner column pruning; a **visibility map** / index-only scan is the true
+COUNT accelerator at large scale; `ORDER BY…LIMIT` early-stop and streaming (B3)
+are filed. See `PROGRESS.md`'s Phase B + Milestone P entries.
 
 Functional gaps (deliberate scope, tracked): ~~RC re-evaluation
 (EvalPlanQual) unimplemented~~ and ~~SSI is a no-op seam~~ (**both fixed P1.d**

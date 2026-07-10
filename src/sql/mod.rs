@@ -5,6 +5,7 @@ pub mod explain;
 pub mod join;
 pub mod logical;
 pub mod optimizer;
+pub mod parallel_scan;
 pub mod parser;
 pub mod plan;
 pub mod query;
