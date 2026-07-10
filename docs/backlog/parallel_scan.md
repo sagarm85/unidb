@@ -15,6 +15,13 @@ into the workers — `parallel_count_matching` + `QExpr::has_subquery` (a
 subquery-free predicate evaluates via the pure `eval_qexpr`; subquery predicates
 fall back). Result: **6.6×** at 1M rows.
 
+**Parallel filtered `SELECT` — DONE (2026-07-11, branch `parallel-index-select`):**
+a filtered `SELECT … WHERE k …` (was ~0.14× vs PG, the worst ÷PG in the suite) is
+served by the B-tree index-candidate path (`try_exec_select_btree`), which
+resolved candidates serially. `parallel_resolve_candidates` partitions the
+candidate `RowId` list across workers (`heap::get_visible` + the B2 per-row
+closure). Result: **6.41×** at 500k rows.
+
 **Filed follow-ups (not yet done):**
 - `SUM`/`AVG`/`GROUP BY` partial aggregate (only `COUNT(*)` is pushed into workers
   so far — needs per-worker partial states + a gather-merge).
