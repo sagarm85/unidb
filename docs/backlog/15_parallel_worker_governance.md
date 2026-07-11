@@ -1,7 +1,7 @@
 # Parallel worker governance
 
 **Type:** Improvement
-**Status:** IN PROGRESS (branch `parallel-worker-governance`)
+**Status:** SHIPPED (→ PROGRESS.md "Parallel worker governance (item 15)")
 
 ## Context
 

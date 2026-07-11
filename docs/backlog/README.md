@@ -28,7 +28,7 @@
 | 12 | `rest_api_enrichment.md` | Improvement | ⬜ NOT STARTED |
 | 13 | `crud_performance.md` | Performance | ✅ SHIPPED (PROGRESS: CRUD performance — Phase A + B) |
 | 14 | `parallel_scan.md` | Milestone | ✅ SHIPPED (PROGRESS: Milestone P + follow-ups) |
-| 15 | `15_parallel_worker_governance.md` | Improvement | 🔄 IN PROGRESS (branch `parallel-worker-governance`) |
+| 15 | `15_parallel_worker_governance.md` | Improvement | ✅ SHIPPED (PROGRESS: Parallel worker governance) |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
@@ -46,8 +46,8 @@ file yet — each is *filed inside* an existing doc until started.
 2. **`12` `rest_api_enrichment.md`** — the one already-filed NOT-STARTED item.
 3. **Parallel-scan follow-ups** (filed in `parallel_scan.md`, lower ROI):
    `SUM`/`AVG`/`GROUP BY` partial aggregate; `LIMIT` early-stop; server
-   `ReadHandle` parallelism; a visibility-map fast count. Flip the parallel-scan
-   toggle **default-on** after a soak.
+   `ReadHandle` parallelism; a visibility-map fast count. (Default-on + worker
+   governance already shipped as #15.)
 
 ## How to update this file
 
