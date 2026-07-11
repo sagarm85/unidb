@@ -255,13 +255,13 @@ impl Runner<'_, '_> {
                         // P-a: parallelize the count across worker threads when
                         // the table is large enough (else the serial header scan).
                         let pages = heap.scan_pages(self.ctx.pool)?;
-                        let count = match crate::sql::parallel_scan::degree_for(pages.len()) {
-                            Some(degree) => crate::sql::parallel_scan::parallel_count(
+                        let count = match crate::sql::parallel_scan::acquire(pages.len()) {
+                            Some(lease) => crate::sql::parallel_scan::parallel_count(
                                 &pages,
                                 &self.ctx.pool.shared_reader(),
                                 &self.snapshot,
                                 self.ctx.xid,
-                                degree,
+                                lease.degree(),
                             )?,
                             None => {
                                 heap.count_visible(&self.snapshot, self.ctx.xid, self.ctx.pool)?
@@ -299,8 +299,7 @@ impl Runner<'_, '_> {
                                     table_def.pages.clone(),
                                 );
                                 let pages = heap.scan_pages(self.ctx.pool)?;
-                                if let Some(degree) =
-                                    crate::sql::parallel_scan::degree_for(pages.len())
+                                if let Some(lease) = crate::sql::parallel_scan::acquire(pages.len())
                                 {
                                     let cols = &table_def.columns;
                                     let matches = |bytes: &[u8]| -> Result<bool> {
@@ -317,7 +316,7 @@ impl Runner<'_, '_> {
                                         &self.ctx.pool.shared_reader(),
                                         &self.snapshot,
                                         self.ctx.xid,
-                                        degree,
+                                        lease.degree(),
                                         &matches,
                                     )?;
                                     let row = vec![Literal::Int(count as i64); aggs.len()];
@@ -406,13 +405,13 @@ impl Runner<'_, '_> {
         // Table 3.1 `COUNT(*) WHERE …` / grouped-scan hot path. A base Scan is
         // unordered (any `ORDER BY` is a Sort node above), so concat is correct.
         let pages = heap.scan_pages(self.ctx.pool)?;
-        if let Some(degree) = crate::sql::parallel_scan::degree_for(pages.len()) {
+        if let Some(lease) = crate::sql::parallel_scan::acquire(pages.len()) {
             let (rows, _ids) = crate::sql::parallel_scan::parallel_filter_project(
                 &pages,
                 &self.ctx.pool.shared_reader(),
                 &self.snapshot,
                 self.ctx.xid,
-                degree,
+                lease.degree(),
                 &|_rid, bytes| decode_visible(bytes),
             )?;
             return Ok(Batch {

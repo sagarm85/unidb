@@ -13,7 +13,8 @@
 
 Phases 1–6 of the roadmap are complete: ACID hardening, data-model depth, durable
 multi-model storage (the O(1)-open moat), query power, concurrency &
-performance, and operations/HA. Milestone P added parallel scans. The engine is
+performance, and operations/HA. Milestone P added parallel scans (default-on with a global
+worker cap and cancellation since backlog item 15). The engine is
 a deployable single-primary system with replicas, backups/PITR, auth, and
 observability — at SQLite-parity durable writes, several-fold-faster embedded
 reads, and honest, measured gaps (bulk UPDATE, large single-model scans).
@@ -50,7 +51,7 @@ flowchart LR
 | **HOT-style same-page updates (A2)** | The real path to UPDATE parity: forward-chained heap + stable index target; needs format + recovery change (gated) | Phase-A closeout |
 | Parallel `SUM`/`GROUP BY` partial aggregates; `LIMIT`/`ORDER BY…LIMIT` early-stop | extend the Milestone-P pattern to the remaining serial tails | `docs/backlog/parallel_scan.md` |
 | Planner column pruning for `query_exec` scans | decode pushdown for the Query route (fast path already has it) | Phase-B closeout |
-| Soak → **default-on** for `UNIDB_PARALLEL_SCAN` and `UNIDB_CONCURRENT_SQL_WRITES` | both shipped default-off with revert switches; flipping is a recorded decision | `MEMORY.md` |
+| ~~Soak → default-on for `UNIDB_PARALLEL_SCAN`~~ **DONE 2026-07-11** (backlog item 15: global worker cap + cancellation, then flipped default-ON) · remaining: soak → default-on for `UNIDB_CONCURRENT_SQL_WRITES` | shipped default-off with a revert switch; flipping is a recorded decision | `MEMORY.md`, `15_parallel_worker_governance.md` |
 | B-link/optimistic descent (Lehman-Yao), per-table lock registry (0b), heap-tail spread (Item B), atomic/batched SERIAL | residual write-concurrency items; B-link is format-bump-gated | `index_write_concurrency.md` |
 | Visibility-map-style shortcut for `COUNT(*)` | removes the O(pages) header-scan ceiling at large scale | Phase-B notes |
 

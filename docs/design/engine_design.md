@@ -1109,7 +1109,17 @@ workers via `parallel_count_matching` + a `QExpr::has_subquery` gate; Postgres's
 lead +540% → +82%), and filtered `SELECT … WHERE k …` **6.41× faster** via
 `parallel_resolve_candidates` (partitioning the B-tree index-candidate `RowId`
 list — `try_exec_select_btree` was the worst ÷PG at ~0.14×). Read-only, so the
-crash harness is unchanged. **Remaining read-path debt (deferred):** `SUM`/`GROUP
+crash harness is unchanged. **Worker governance + default-on (item 15,
+2026-07-11):** parallel scan originally shipped default-*off* pending governance;
+item 15 added a process-wide worker budget (`WorkerLease` RAII admission — total
+live workers never exceed `UNIDB_PARALLEL_MAX_TOTAL_WORKERS`, extra queries
+degrade to serial rather than oversubscribing M×N threads) plus
+timeout/cancellation propagation (`query_limits::snapshot_deadline()`, checked
+every few pages → `QueryTimeout`/`QueryCancelled`), then flipped it **default-on**
+(`UNIDB_PARALLEL_SCAN=0` / `set_parallel_scan(false)` remain the field revert).
+This also fixed "`report.sh` shows no parallel improvement": the bench never set
+the toggle, so it ran serial — default-on it now reports the parallel numbers
+(Table 3.1 @1M ~5.6M → ~35.7M rec/s). **Remaining read-path debt (deferred):** `SUM`/`GROUP
 BY` partial aggregate + `LIMIT` early-stop (only `COUNT(*)` is pushed into workers
 so far);
 `query_exec` scan projection

@@ -2014,11 +2014,21 @@ impl Engine {
         crate::sql::parallel_scan::set_enabled(on);
     }
 
-    /// Tune the parallel-scan page threshold and worker cap (Milestone P);
-    /// `max_workers = 0` uses `available_parallelism`.
+    /// Tune the parallel-scan **per-query** page threshold and worker cap
+    /// (Milestone P); `max_workers = 0` uses `available_parallelism`.
     pub fn set_parallel_scan_config(&self, min_pages: usize, max_workers: usize) {
         crate::sql::parallel_scan::set_min_pages(min_pages);
         crate::sql::parallel_scan::set_max_workers(max_workers);
+    }
+
+    /// The **global** worker budget (governance, item 15): the total number of
+    /// parallel-scan worker threads that may be live across *all* concurrent
+    /// queries at once (env `UNIDB_PARALLEL_MAX_TOTAL_WORKERS`; `0` →
+    /// `available_parallelism`). This is the safety net that bounds
+    /// oversubscription on a busy server — extra concurrent scans degrade to
+    /// serial rather than spawning an unbounded thread count.
+    pub fn set_parallel_scan_max_total_workers(&self, n: usize) {
+        crate::sql::parallel_scan::set_max_total_workers(n);
     }
 
     /// Whether the concurrent-SQL-writes path is currently enabled (Item 0a).

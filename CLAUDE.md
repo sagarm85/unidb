@@ -13,6 +13,68 @@
 3. Do the work for the **current milestone only** (see §5). Do not pull features forward from the backlog.
 4. **At session end, update `MEMORY.md`** (current state + session log entry) and, if a milestone shipped, `PROGRESS.md`. **Before pushing or raising a PR, also check `README.md` and `docs/` for staleness** (see §9) — these do not update themselves the way `PROGRESS.md` does as part of the per-milestone habit.
 5. **Dates:** always stamp entries with the *actual current system date*. Never copy a date from an earlier session or from this file. If unsure of the date, get it from the system, not from context.
+6. **Work under the expert lens below (§0.6) for EVERY action** — plans, code changes, performance work, benchmarks, and reviews alike. It is not reserved for "big" designs, and it includes **initiating stress tests and benchmarks yourself** (§0.6 item 0) — the user should never have to ask for them.
+
+### 0.6 Expert lens — senior database architect & designer (every session, every action)
+
+**Why this is a standing rule — the honest history:** we did NOT discover the
+CRUD performance gap ourselves. The **user had to ask for stress testing** vs
+Postgres and supply the details before `scripts/report.sh` was built at all;
+only then did it show us badly behind on CRUD. The user then had to ask for the
+work to be **reviewed as a 20+ year database-internals architect** would review
+it before implementation (CRUD Phase A/B, Milestone P, worker governance — see
+`PROGRESS.md`), and *that* turned the losses into measured wins (`SELECT
+COUNT(*)` 2.81× faster than PG; filtered scans 6.4–6.6× via parallel workers,
+default-on). Both steps worked — and both had to be prompted. That is the
+failure this section fixes: **the stress test and the expert review are now
+initiated by YOU, unprompted, every session and every action** — never wait for
+the user to ask or to supply the workload details.
+
+0. **Initiate stress testing and benchmarking yourself.** Whenever a feature,
+   optimization, or storage-touching change ships — and periodically for the
+   system as a whole — YOU design and run the adversarial validation without
+   being asked: scale sweeps (10k → millions of rows), concurrency (multiple
+   writers/readers), churn/bloat, crash points, and the honest baseline
+   comparison per §6 (`scripts/report.sh` / `benches/decompose.rs`). Surface the
+   gaps in-report even when they are embarrassing, then propose the follow-up
+   plan yourself. A shipped feature that has not been stress-tested at scale
+   against a baseline is NOT done — treat "the user asked for a stress test" as
+   a process failure on your part.
+
+Before implementing ANY plan, feature, fix, or optimization, review it with
+senior database architecture & design expertise (Postgres/SQLite/DuckDB/ARIES
+internals depth) and a skeptical designer's eye:
+
+1. **Re-derive the ROI order yourself.** Never execute a draft plan's ordering on
+   trust — rank items by measured impact on the actual gap, and re-check ROI
+   honestly before grinding an item you named earlier. (Phase B: B2 had to lead,
+   not B1; the filtered-SELECT follow-up beat the over-stated SUM/GROUP-BY item.)
+2. **Verify THIS engine's storage model before importing another engine's hazards
+   or optimizations.** unidb is mmap-as-storage with insert-new-version MVCC —
+   Postgres-shaped ideas can be wrong here in *both* directions: the feared
+   pool-vs-mmap staleness landmine did not exist, while "skip unchanged-column
+   index maintenance" was provably incorrect (the B-tree is the only forward
+   resolver; skipping made live rows unfindable).
+3. **Find the real code path and the real config first.** Confirm which executor
+   route the workload actually exercises, and which toggles are in force, before
+   optimizing or trusting a number. (Table 3's filtered SELECT routed through
+   `try_exec_select_btree`, not the full scan; `report.sh` showed "no parallel
+   win" because the toggle defaulted off — the bench measured the serial path.)
+4. **Prove, don't assume.** Any correctness-relevant claim gets an empirical test
+   before shipping; any performance claim gets a clean measurement — one bench
+   process (`pkill` strays first), and trust absolute numbers + internal
+   counters (dec/row, cols/row, WAL B/row) over noisy single-run ÷PG ratios.
+5. **Gate optimizations by measured conditions**, never apply them
+   unconditionally. (A3's selectivity gate: forcing the index path *regressed* a
+   50%-selective DELETE.)
+6. **Escalate honestly.** When a plan step is provably wrong or a target is
+   architecturally unreachable in scope, pause, show the evidence, get sign-off,
+   and revise the plan/acceptance — never ship the bug, and never chase a lucky
+   run to hit a target.
+
+The same lens applies when *reporting* results: state honest caveats and
+asymmetries in-report (§6), and record corrections inline, never as silent
+rewrites (§9).
 
 ---
 

@@ -13,8 +13,8 @@
 ## Current status
 
 - **Processing-engines design-doc collection — ADDED (2026-07-11), branch
-  `claude/processing-engines-design-docs-dtcp16`. Docs only — NO engine code
-  touched; no format/crash/§3 impact.** New `docs/design/processing-engines/`
+  `claude/processing-engines-design-docs-dtcp16`, PR #42. Docs only — NO engine
+  code touched; no format/crash/§3 impact.** New `docs/design/processing-engines/`
   (12 documents + index, registered in `docs/design/README.md`): per-engine
   deep dives (storage core, WAL & recovery, MVCC/txn, SQL, indexing, vector,
   graph, event queue, parallelism + benchmark/metrics analysis,
@@ -22,7 +22,28 @@
   on-disk layouts, border-case tables, measured numbers distilled from
   `PROGRESS.md`, and a **proposal-status** future roadmap
   (`12_future_roadmap.md` — explicitly not authorization to start work;
-  backlog conventions still apply).
+  backlog conventions still apply). Updated on merge with `main` so docs 10
+  and 12 reflect item 15 (parallel scan default-ON + worker governance).
+- **Parallel worker governance (backlog item 15) — SHIPPED (2026-07-11), branch
+  `parallel-worker-governance`, PR pending.** Closed the two real blockers that
+  kept parallel scan default-off, then **flipped it default-ON**. This also
+  explains why `report.sh` showed no parallel win — the bench never set
+  `UNIDB_PARALLEL_SCAN`, so it ran serial; default-on now shows it (Table 3.1 @1M
+  scan 5.6M → **35.7M rec/s** with no env). Read-only → crash **29**, no format
+  bump, no §3.
+  - **G1 global cap:** process-wide worker budget (`GLOBAL_MAX`/`AVAILABLE`) +
+    `WorkerLease` RAII admission (`acquire()` CAS-takes `min(degree, available)`,
+    releases on Drop even on `?`; `<2` → serial). **Total live workers never
+    exceed the cap across all concurrent queries** — no more M×N oversubscription.
+    `UNIDB_PARALLEL_MAX_TOTAL_WORKERS` / `Engine::set_parallel_scan_max_total_workers`.
+  - **G2 timeout/cancel:** `query_limits::snapshot_deadline()` (Send+Sync deadline
+    + CancelToken); workers check every few pages → `QueryTimeout`/`QueryCancelled`.
+    A runaway parallel scan is now interruptible like the serial path.
+  - **G4 default-ON** (`ENABLED = true`); `UNIDB_PARALLEL_SCAN=0` /
+    `set_parallel_scan(false)` remain the field revert. Tests:
+    `parallel_scan_global_cap_bounds_concurrency`, `parallel_scan_honors_cancellation`.
+    Full lib (373) + crash (29) green default-on. Detail: `PROGRESS.md` "Parallel
+    worker governance (item 15)"; `docs/backlog/15_parallel_worker_governance.md`.
 - **Milestone P follow-up — parallel filtered SELECT — SHIPPED (2026-07-11),
   branch `parallel-index-select`, PR pending.** Closes the worst remaining ÷PG
   gap: filtered `SELECT … WHERE k …` (~0.14× vs PG) routes through the B-tree
@@ -2744,6 +2765,50 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-11 — Expert lens codified in CLAUDE.md §0.6, branch `claude/report-script-performance-efcszq`
+
+Docs-only; no engine code touched. User request, in two rounds:
+
+- **Round 1 — added CLAUDE.md §0 step 6 + §0.6 "Expert lens — senior database
+  architect & designer (every session, every action)."** Distills the six
+  practices that produced the `report.sh`-arc wins, each anchored to a real
+  incident: re-derive ROI order (Phase B's B2-leads reorder), verify THIS
+  engine's storage model before importing another engine's hazards/optimizations
+  (the nonexistent pool-vs-mmap landmine; the provably-incorrect index-skip),
+  find the real code path + config (`try_exec_select_btree`; the default-off
+  parallel toggle behind "no parallel win"), prove empirically with clean
+  measurement, gate by measured conditions (A3 selectivity), and escalate
+  honestly with sign-off.
+- **Round 2 — the user corrected my first draft's history, and the correction IS
+  the lesson:** `report.sh` was not built proactively — the **user had to ask
+  for the stress testing** (and supply the details), and separately had to ask
+  for the architect-level review. Rewrote §0.6's preamble to state that honest
+  history, and added **item 0: initiate stress testing/benchmarking yourself,
+  unprompted** — scale sweeps, concurrency, churn, crash points, baseline
+  comparison per §6 — for every shipped change and periodically for the whole
+  system. "The user asked for a stress test" is now defined as a process
+  failure on my part. §0 step 6 updated to say the same.
+- Section numbered **§0.6** (a subsection of §0) so existing §0.5/§3/§6/§9
+  cross-references elsewhere in the docs stay valid — no renumbering.
+
+Backlog item 15 (`15_parallel_worker_governance.md`). Commit `df068bb`.
+
+- **Root-caused a user report** ("report.sh shows no parallel improvement"):
+  verified in code that parallel scan was `ENABLED = false` (default-off) AND
+  nothing in `decompose.rs`/`scripts/`/`docker/` set `UNIDB_PARALLEL_SCAN` — so
+  `report.sh` ran the *serial* path. Reproduced both: serial 5.6M vs parallel 35M
+  at 1M, same code path. **Neither the report nor my earlier metrics were wrong —
+  different configs** (the toggle). Lesson: a shipped-but-dark feature is invisible
+  to the canonical benchmark; wire the bench (or default-on) so it reflects reality.
+- **The user pushed on "why off?"** — the honest answer was real governance gaps
+  (verified: no global worker cap → M×N oversubscription; no timeout propagation
+  into workers), not caution. Built the governance: G1 global cap (WorkerLease
+  admission), G2 deadline/cancel snapshot into workers, G3 load-tests, G4 flip
+  default-on. Now `report.sh` shows the win by default.
+- First backlog item under the new numbering convention: created
+  `15_parallel_worker_governance.md`, registered #15 in `docs/backlog/README.md`.
+  Read-only; crash 29; default-on but `UNIDB_PARALLEL_SCAN=0` reverts.
 
 ### 2026-07-11 — Parallel filtered SELECT, branch `parallel-index-select`
 

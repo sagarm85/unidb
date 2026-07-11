@@ -836,13 +836,13 @@ fn exec_select(
     // through the Query engine), so the concat of per-worker results is correct;
     // SSI read-set tracking is preserved by noting the gathered `read_ids`.
     let pages = heap.scan_pages(ctx.pool)?;
-    if let Some(degree) = crate::sql::parallel_scan::degree_for(pages.len()) {
+    if let Some(lease) = crate::sql::parallel_scan::acquire(pages.len()) {
         let (rows, read_ids) = crate::sql::parallel_scan::parallel_filter_project(
             &pages,
             &ctx.pool.shared_reader(),
             &snapshot,
             ctx.xid,
-            degree,
+            lease.degree(),
             &|_rid, bytes| per_row(bytes),
         )?;
         ctx.txn_mgr.ssi_note_reads(ctx.xid, &read_ids);
@@ -1075,13 +1075,13 @@ fn try_exec_select_btree(
     // Parallelize resolution across worker threads when the candidate list is
     // large (Milestone P follow-up — the filtered-SELECT gap). Order is
     // unspecified (no `ORDER BY` here), so concat is correct.
-    if let Some(degree) = crate::sql::parallel_scan::degree_for(candidate_ids.len()) {
+    if let Some(lease) = crate::sql::parallel_scan::acquire(candidate_ids.len()) {
         let rows = crate::sql::parallel_scan::parallel_resolve_candidates(
             &candidate_ids,
             &ctx.pool.shared_reader(),
             &snapshot,
             ctx.xid,
-            degree,
+            lease.degree(),
             &|_rid, bytes| per_candidate(bytes),
         )?;
         return Ok(Some(ExecResult::Rows {

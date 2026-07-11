@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `15_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `16_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -28,6 +28,7 @@
 | 12 | `rest_api_enrichment.md` | Improvement | ⬜ NOT STARTED |
 | 13 | `crud_performance.md` | Performance | ✅ SHIPPED (PROGRESS: CRUD performance — Phase A + B) |
 | 14 | `parallel_scan.md` | Milestone | ✅ SHIPPED (PROGRESS: Milestone P + follow-ups) |
+| 15 | `15_parallel_worker_governance.md` | Improvement | ✅ SHIPPED (PROGRESS: Parallel worker governance) |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
@@ -37,7 +38,7 @@ Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 Ordered by my current ROI read; reorder as priorities change. None has its own
 file yet — each is *filed inside* an existing doc until started.
 
-1. **`15_hot_update.md` — A2 / HOT-style update** (write-path parity; UPDATE is
+1. **`16_hot_update.md` — A2 / HOT-style update** (write-path parity; UPDATE is
    ~0.34× vs PG). The biggest *remaining* single lever, but the highest risk:
    heap version-model + **on-disk format** (`FORMAT_VERSION` bump, D4 sign-off) +
    recovery + new crash points; honest gain only ~0.34× → ~0.42×. Filed in
@@ -45,8 +46,8 @@ file yet — each is *filed inside* an existing doc until started.
 2. **`12` `rest_api_enrichment.md`** — the one already-filed NOT-STARTED item.
 3. **Parallel-scan follow-ups** (filed in `parallel_scan.md`, lower ROI):
    `SUM`/`AVG`/`GROUP BY` partial aggregate; `LIMIT` early-stop; server
-   `ReadHandle` parallelism; a visibility-map fast count. Flip the parallel-scan
-   toggle **default-on** after a soak.
+   `ReadHandle` parallelism; a visibility-map fast count. (Default-on + worker
+   governance already shipped as #15.)
 
 ## How to update this file
 

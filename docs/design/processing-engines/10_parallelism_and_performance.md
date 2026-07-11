@@ -75,9 +75,22 @@ flowchart TB
   | `parallel_filter_project` | full-scan SELECT | concat + RowIds (SSI read set) |
   | `parallel_resolve_candidates` | B-tree candidate resolution (filtered SELECT hot path) | concat |
 - **Fallbacks:** subquery predicates run serial (they need executor storage
-  access); small tables (< 64 pages) stay serial; the whole engine is
-  default-off behind `Engine::set_parallel_scan` / `UNIDB_PARALLEL_SCAN` pending
-  a soak — read-only, no format change, crash harness untouched.
+  access); small tables (< 64 pages) stay serial. Read-only, no format change,
+  crash harness untouched.
+- **Governance (backlog item 15, shipped 2026-07-11) — and default-ON.** Two
+  blockers were closed and the toggle flipped on by default:
+  - **Global worker cap:** a process-wide worker budget with `WorkerLease` RAII
+    admission (CAS-takes `min(degree, available)`, releases on Drop, < 2 →
+    serial) — total live workers never exceed the cap across all concurrent
+    queries, eliminating M×N oversubscription
+    (`UNIDB_PARALLEL_MAX_TOTAL_WORKERS` / `set_parallel_scan_max_total_workers`).
+  - **Timeout/cancellation:** workers snapshot a `Send + Sync` deadline +
+    cancel token and check every few pages — a runaway parallel scan is
+    interruptible exactly like the serial path.
+  - `UNIDB_PARALLEL_SCAN=0` / `set_parallel_scan(false)` remain the field
+    revert. Default-on also fixed a benchmark trap: `report.sh` previously
+    showed "no parallel win" because it never set the env var and measured the
+    serial path (Table 3.1 @1 M scan: 5.6 M → **35.7 M rows/s** with no env).
 
 Measured (Apple M5 Pro, 18 cores, 1 M rows):
 
@@ -165,5 +178,7 @@ HOT — filed, not hand-waved).
 | SSI under parallel scan | workers return RowIds; read set noted exactly as serial |
 | Subquery in predicate | serial fallback |
 | Tiny table | `MIN_PAGES` threshold keeps thread cost off small scans |
+| Many concurrent parallel queries | global worker cap + `WorkerLease` admission — no M×N thread explosion; over-budget queries degrade to serial |
+| Runaway/cancelled parallel scan | per-worker deadline + cancel-token checks every few pages |
 | Toggle flipped mid-flight | atomics read per statement; no reopen needed |
 | Group-commit leader's fsync fails | poisoning (doc 3 §2) — followers get `DurabilityFailure`, never false success |
