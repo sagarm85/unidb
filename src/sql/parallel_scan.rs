@@ -127,11 +127,12 @@ fn take_from_pool(want: usize) -> usize {
     }
 }
 
-/// Admission control (replaces a bare `degree_for` at call sites): gate on config
-/// + the page/candidate threshold, then reserve workers from the **global**
-/// budget. Returns a lease with `>= 2` workers (released on drop), or `None` to
-/// run serial — disabled, below threshold, or the global pool is busy right now
-/// (so a flood of concurrent scans stays bounded instead of oversubscribing).
+/// Admission control (replaces a bare `degree_for` at call sites): gate on
+/// config plus the page/candidate threshold, then reserve workers from the
+/// **global** budget. Returns a lease with `>= 2` workers (released on drop),
+/// or `None` to run serial — disabled, below threshold, or the global pool is
+/// busy right now — so a flood of concurrent scans stays bounded instead of
+/// oversubscribing.
 pub fn acquire(n_units: usize) -> Option<WorkerLease> {
     let want = degree_for(n_units)?;
     let granted = take_from_pool(want);

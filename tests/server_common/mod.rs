@@ -20,7 +20,9 @@ use axum_prometheus::{metrics_exporter_prometheus::PrometheusHandle, PrometheusM
 use jsonwebtoken::{encode, EncodingKey, Header};
 use serde::Serialize;
 use tempfile::TempDir;
-use unidb::server::{auth::JwtConfig, engine_handle::EngineHandle, router::build_router, AppState};
+use unidb::server::{
+    auth::JwtConfig, engine_handle::EngineHandle, router::build_router, AppState, SessionConfig,
+};
 
 pub const TEST_JWT_SECRET: &str = "test-secret-for-unidb-server-integration-tests";
 
@@ -49,11 +51,16 @@ pub struct TestServer {
 
 impl TestServer {
     pub async fn spawn() -> Self {
+        Self::spawn_with_sessions(SessionConfig::default()).await
+    }
+
+    /// [`TestServer::spawn`] with explicit transaction-session / cursor idle
+    /// deadlines (R1/R4 tests need short timeouts without touching
+    /// process-global env vars).
+    pub async fn spawn_with_sessions(config: SessionConfig) -> Self {
         let tempdir = tempfile::tempdir().unwrap();
         let engine = EngineHandle::spawn(tempdir.path(), 0).unwrap();
-        let state = AppState {
-            engine: Arc::new(engine),
-        };
+        let state = AppState::with_config(Arc::new(engine), config);
         let jwt_config = JwtConfig::new(TEST_JWT_SECRET);
         let (prometheus_layer, metric_handle) = metrics_pair().clone();
         let router = build_router(state, jwt_config, prometheus_layer, metric_handle);

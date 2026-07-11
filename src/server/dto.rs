@@ -123,6 +123,92 @@ pub struct SqlRequest {
     /// is the injection-safe way to pass user data.
     #[serde(default)]
     pub params: Vec<Json>,
+    /// Optional isolation level for a **one-shot** statement (R2): the
+    /// request runs as a single transaction at this level without opening a
+    /// session. Rejected on a request that also carries `X-Txn-Id` —
+    /// isolation is fixed at `POST /txn/begin` for sessions.
+    #[serde(default)]
+    pub isolation: Option<IsolationDto>,
+    /// `true` (R4) buffers the query's `rows` result server-side and returns
+    /// a `cursor_id` instead of the rows, for paging via
+    /// `GET /sql/cursor/{id}?limit=N`. Requires the request to produce
+    /// exactly one `rows`-shaped result.
+    #[serde(default)]
+    pub cursor: bool,
+}
+
+/// Wire form of [`IsolationLevel`] (R1/R2). Snake-case strings on the wire:
+/// `"read_committed"`, `"repeatable_read"`, `"serializable"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationDto {
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
+impl IsolationDto {
+    pub fn to_engine(self) -> crate::txn::IsolationLevel {
+        use crate::txn::IsolationLevel as I;
+        match self {
+            IsolationDto::ReadCommitted => I::ReadCommitted,
+            IsolationDto::RepeatableRead => I::RepeatableRead,
+            IsolationDto::Serializable => I::Serializable,
+        }
+    }
+
+    pub fn from_engine(level: crate::txn::IsolationLevel) -> Self {
+        use crate::txn::IsolationLevel as I;
+        match level {
+            I::ReadCommitted => IsolationDto::ReadCommitted,
+            I::RepeatableRead => IsolationDto::RepeatableRead,
+            I::Serializable => IsolationDto::Serializable,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IsolationDto::ReadCommitted => "read_committed",
+            IsolationDto::RepeatableRead => "repeatable_read",
+            IsolationDto::Serializable => "serializable",
+        }
+    }
+}
+
+/// Body of `POST /txn/begin` (R1). The body itself is optional — an empty
+/// body opens a `read_committed` session.
+#[derive(Debug, Default, Deserialize)]
+pub struct BeginTxnRequest {
+    #[serde(default)]
+    pub isolation: Option<IsolationDto>,
+}
+
+/// Body of `PUT /tables/{table}/rls` (R3): the policy as a SQL predicate
+/// string (the same AND-only comparison subset `WHERE` accepts), e.g.
+/// `"tenant_id = 7"`. Chosen over a JSON policy DSL so the existing SQL
+/// parser is the single grammar — see the backlog spec's blocker note.
+#[derive(Debug, Deserialize)]
+pub struct RlsRequest {
+    pub predicate: String,
+}
+
+/// Body of `POST /rows/batch` (R4): raw row payloads, base64-encoded (rows
+/// are opaque bytes and JSON cannot carry them verbatim).
+#[derive(Debug, Deserialize)]
+pub struct BatchInsertRequest {
+    pub rows: Vec<String>,
+}
+
+/// Query string of `GET /sql/cursor/{id}` (R4).
+#[derive(Debug, Deserialize)]
+pub struct CursorQuery {
+    /// Rows per page; default 1000, capped at 10 000.
+    #[serde(default = "default_cursor_limit")]
+    pub limit: usize,
+}
+
+fn default_cursor_limit() -> usize {
+    1000
 }
 
 /// Convert a REST JSON bind-parameter value to a [`Literal`] (P2.e). The value

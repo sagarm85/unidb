@@ -7,12 +7,85 @@ use axum::{http::StatusCode, response::IntoResponse, Json};
 use serde::Serialize;
 
 use crate::error::DbError;
+use crate::server::{cursor::CursorError, txn_session::SessionError};
 
-pub struct ApiError(pub DbError);
+/// A response-ready error: either an engine [`DbError`] (mapped through
+/// [`map_status`]) or a server-layer error with its own status + code —
+/// transaction-session and cursor failures (R1/R4) are HTTP-protocol
+/// concepts the engine's error enum deliberately knows nothing about.
+pub enum ApiError {
+    Db(DbError),
+    Api {
+        status: StatusCode,
+        code: &'static str,
+        message: String,
+    },
+}
+
+impl ApiError {
+    /// A `400 Bad Request` with a server-layer code (bad header syntax,
+    /// oversized batch, …).
+    pub fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
+        ApiError::Api {
+            status: StatusCode::BAD_REQUEST,
+            code,
+            message: message.into(),
+        }
+    }
+}
 
 impl From<DbError> for ApiError {
     fn from(err: DbError) -> Self {
-        ApiError(err)
+        ApiError::Db(err)
+    }
+}
+
+impl From<SessionError> for ApiError {
+    fn from(err: SessionError) -> Self {
+        let (status, code, message) = match err {
+            SessionError::NotFound(xid) => (
+                StatusCode::NOT_FOUND,
+                "TXN_NOT_FOUND",
+                format!("no open transaction session {xid} (finished, expired, or never begun — session ids do not survive a restart)"),
+            ),
+            SessionError::Busy(xid) => (
+                StatusCode::CONFLICT,
+                "TXN_BUSY",
+                format!("transaction session {xid} is executing another request; a session runs one statement at a time"),
+            ),
+            SessionError::Forbidden(xid) => (
+                StatusCode::FORBIDDEN,
+                "TXN_FORBIDDEN",
+                format!("transaction session {xid} belongs to a different principal"),
+            ),
+        };
+        ApiError::Api {
+            status,
+            code,
+            message,
+        }
+    }
+}
+
+impl From<CursorError> for ApiError {
+    fn from(err: CursorError) -> Self {
+        let (status, code, message) = match err {
+            CursorError::NotFound(id) => (
+                StatusCode::NOT_FOUND,
+                "CURSOR_NOT_FOUND",
+                format!("no open cursor {id} (exhausted, expired, or never created)"),
+            ),
+            CursorError::Forbidden(id) => (
+                StatusCode::FORBIDDEN,
+                "CURSOR_FORBIDDEN",
+                format!("cursor {id} belongs to a different principal"),
+            ),
+        };
+        ApiError::Api {
+            status,
+            code,
+            message,
+        }
     }
 }
 
@@ -94,11 +167,17 @@ fn map_status(err: &DbError) -> (StatusCode, &'static str) {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        let (status, code) = map_status(&self.0);
-        let body = ErrorBody {
-            error: self.0.to_string(),
-            code,
+        let (status, code, error) = match self {
+            ApiError::Db(err) => {
+                let (status, code) = map_status(&err);
+                (status, code, err.to_string())
+            }
+            ApiError::Api {
+                status,
+                code,
+                message,
+            } => (status, code, message),
         };
-        (status, Json(body)).into_response()
+        (status, Json(ErrorBody { error, code })).into_response()
     }
 }

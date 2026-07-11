@@ -250,6 +250,30 @@ impl EngineHandle {
         self.on_engine(|e| e.checkpoint()).await
     }
 
+    /// Superuser gate for admin routes (R3): `Ok` for the implicit superuser
+    /// (no `sub`), a named `SUPERUSER`, or open/bootstrap mode.
+    pub async fn ensure_superuser(&self, user: Option<String>) -> Result<()> {
+        self.on_engine(move |e| e.ensure_superuser(user.as_deref()))
+            .await
+    }
+
+    /// Install an RLS policy from a SQL predicate string (R3).
+    pub async fn set_rls_policy_sql(&self, table: String, predicate: String) -> Result<()> {
+        self.on_engine(move |e| e.set_rls_policy_sql(&table, &predicate))
+            .await
+    }
+
+    /// `POST /admin/flush` (R3): force the WAL durable, then flush every
+    /// dirty page. The WAL sync first keeps D5 satisfiable for pages whose
+    /// records were deferred by group commit.
+    pub async fn flush(&self) -> Result<()> {
+        self.on_engine(|e| {
+            e.sync_wal()?;
+            e.flush()
+        })
+        .await
+    }
+
     /// Snapshot every table's schema for `GET /tables` introspection (S1).
     pub async fn table_defs(&self) -> Result<Vec<crate::catalog::TableDef>> {
         self.on_engine(|e| Ok(e.table_defs())).await

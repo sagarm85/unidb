@@ -1,6 +1,23 @@
 # REST API enrichment — transaction sessions & full-surface coverage
 
-## Status as of 2026-07-09: NOT STARTED. **Sequenced AFTER Phase 6 merges.**
+**Type:** Improvement
+**Status:** ✅ SHIPPED (2026-07-11) — all four checkpoints (R1–R4), branch
+`claude/rest-api-enrichment-vly934`. Metrics + full detail in `PROGRESS.md`'s
+"REST API enrichment (item 12)" entry; route contracts in `docs/REST_API.md`.
+Every verification gate below passed (server suite grew by 24 integration
+tests across `tests/server_txn.rs` + `tests/server_enrich.rs`; crash harness
+untouched at 29 — no storage-path change). Deviations from this spec, decided
+during implementation and documented in `REST_API.md`: DDL (catalog + auth) is
+**rejected** inside a session (engine DDL rollback is request-scoped, P2.c —
+rejecting beats silently-unrollbackable); a failed *mutating* session
+statement auto-aborts the session (Postgres-without-savepoints), while failed
+pure reads leave it open; large results shipped as a **cursor**
+(`POST /sql {"cursor": true}` → `GET /sql/cursor/{id}?limit=`), not NDJSON —
+with the documented honest caveat that rows stay buffered (decoded)
+server-side because the executor is sync; the attach client stays one-shot
+(follow-up unchanged).
+
+## Original status as of 2026-07-09: NOT STARTED. Sequenced AFTER Phase 6 merges.
 
 Phase 6 (ops/HA) is actively rewriting `server/*` (P6.e users/roles/GRANT, P6.f
 security, P6.g observability). This work touches the same files (router, auth

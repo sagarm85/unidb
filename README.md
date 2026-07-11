@@ -4,7 +4,7 @@ A single embedded storage/transaction engine in Rust that unifies relational CRU
 
 The competitive edge is eliminating the multi-system dual-write tax. "Save row + embedding + graph edge + event" is one WAL append and one commit here, versus 3–4 network round-trips with no shared transaction across Postgres + a vector store + a graph DB + Kafka.
 
-**Status: M0–M11 shipped; hardening/ops phases 1–6 complete; commit-time WAL fsync, autovacuum, a durable on-disk free-space map, and CRUD perf (Phase A write path — coalesced UPDATE index WAL, 8868 → 619 B/row, UPDATE-bulk 0.11× → 0.34× vs Postgres; Phase B read path — projection/qual decode pushdown, and `SELECT COUNT(*)` now **2.81× faster than Postgres** via a count-visible-slots fast path; Milestone P — **parallel scan workers** (`std::thread`, not tokio): unfiltered `SELECT COUNT(*)` **3.82×**, filtered `COUNT(*) WHERE …` **6.6×**, and filtered `SELECT … WHERE k …` **6.41×** faster in parallel, cutting Postgres's scan lead from +540% to +82%; **parallel scan is now default-on** with a global worker cap and timeout/cancellation-aware workers — item 15 governance) landed.** Single-file storage core, MVCC transactions + SQL subset, vector/full-text search, a graph layer with a Cypher subset, a WAL-derived event queue, an optional REST/JWT/SSE/metrics server, a B-Tree secondary index, a CSR graph index, a Rust attach client (`unidb-attach`), group-commit + concurrent reads, semantic search (cosine metric + embedding CLI), SQL constraints, and heap vacuum/GC with a background **autovacuum** launcher are all implemented, tested, and benchmarked. The follow-on roadmap (`docs/backlog/roadmap.md`) is **complete**: Phase 1 (ACID hardening), Phase 2/4 (SQL types + query power), Phase 3 (durable multi-model storage), Phase 5 (concurrency — writers that scale with cores), and **Phase 6 (operations & HA — segmented WAL, replication slots + read replicas + failover, backups + PITR, users/roles/GRANT, TLS + audit, observability)**. See `PROGRESS.md` for milestone-by-milestone benchmark tables and `MEMORY.md` for current implementation state and known tech debt.
+**Status: M0–M11 shipped; hardening/ops phases 1–6 complete; commit-time WAL fsync, autovacuum, a durable on-disk free-space map, and CRUD perf (Phase A write path — coalesced UPDATE index WAL, 8868 → 619 B/row, UPDATE-bulk 0.11× → 0.34× vs Postgres; Phase B read path — projection/qual decode pushdown, and `SELECT COUNT(*)` now **2.81× faster than Postgres** via a count-visible-slots fast path; Milestone P — **parallel scan workers** (`std::thread`, not tokio): unfiltered `SELECT COUNT(*)` **3.82×**, filtered `COUNT(*) WHERE …` **6.6×**, and filtered `SELECT … WHERE k …` **6.41×** faster in parallel, cutting Postgres's scan lead from +540% to +82%; **parallel scan is now default-on** with a global worker cap and timeout/cancellation-aware workers — item 15 governance; and **REST API enrichment (item 12)** — multi-request **transaction sessions** over HTTP (`X-Txn-Id`, per-session isolation, busy/principal/idle-reaper protection), one-shot isolation selection, RLS + events-vacuum + flush admin routes, atomic batch insert, and large-result cursors) landed.** Single-file storage core, MVCC transactions + SQL subset, vector/full-text search, a graph layer with a Cypher subset, a WAL-derived event queue, an optional REST/JWT/SSE/metrics server, a B-Tree secondary index, a CSR graph index, a Rust attach client (`unidb-attach`), group-commit + concurrent reads, semantic search (cosine metric + embedding CLI), SQL constraints, and heap vacuum/GC with a background **autovacuum** launcher are all implemented, tested, and benchmarked. The follow-on roadmap (`docs/backlog/roadmap.md`) is **complete**: Phase 1 (ACID hardening), Phase 2/4 (SQL types + query power), Phase 3 (durable multi-model storage), Phase 5 (concurrency — writers that scale with cores), and **Phase 6 (operations & HA — segmented WAL, replication slots + read replicas + failover, backups + PITR, users/roles/GRANT, TLS + audit, observability)**. See `PROGRESS.md` for milestone-by-milestone benchmark tables and `MEMORY.md` for current implementation state and known tech debt.
 
 **Durability: group-committed force-log-at-commit (default).** Statement mini-transactions inside a user transaction append their WAL records without a per-statement fsync; `Engine::commit` forces the transaction's commit record durable via a group-coalesced `sync_up_to` — **one fsync per transaction** (ARIES force-log-at-commit; fulfills D1, D2/D5 unchanged). A commit is never acknowledged until its commit LSN is synced, so ACID durability is exact. Eviction that finds only not-yet-durable dirty pages forces a WAL sync rather than failing (safe under memory pressure), and WAL shipping is capped at the durable frontier so a replica can never get ahead of the primary on failover. Measured on the decomposition ladder (`benches/decompose.rs`): the full multi-model commit (row + B-tree + vector + edge + event) drops from ~33.1 ms/commit (old per-statement default) to **~4.4 ms/commit — ~7.5×** — with a plain-row commit at SQLite parity (~3.6 ms). Crash harness grew 21 → **25**; the valid-prefix recovery property test runs under both durability policies. See `docs/backlog/commit_time_fsync.md`.
 
@@ -180,6 +180,8 @@ cargo run --bin unidb-server --features server
 | `UNIDB_LOG_DIR` | `<UNIDB_DATA_DIR>/logs` | Rolling daily log files (`unidb.log.YYYY-MM-DD`). Independently overridable so logs can live on a different volume than data. |
 | `UNIDB_BIND_ADDR` | `127.0.0.1:8080` | Listen address. |
 | `UNIDB_PAGE_SIZE` | `0` (engine default) | Page size, fixed at first open (D8). |
+| `UNIDB_TXN_IDLE_TIMEOUT_SECS` | `60` | Idle deadline for HTTP transaction sessions (R1) — an abandoned open session is auto-aborted by the reaper (it holds locks + pins the vacuum horizon). |
+| `UNIDB_CURSOR_IDLE_TIMEOUT_SECS` | `60` | Idle deadline for `POST /sql` result cursors (R4). |
 
 For a real deployment, set `UNIDB_DATA_DIR`/`UNIDB_LOG_DIR` to explicit
 absolute paths rather than relying on the relative defaults, which resolve
@@ -245,8 +247,11 @@ let rows = client.execute_sql("SELECT * FROM t")?;
 It is Rust-only in v1 (other languages tracked in `docs/backlog/`), uses a
 blocking `reqwest` client (no tokio runtime, no background thread), and
 covers CRUD, SQL, Cypher, graph edges, indexing, and events — the full
-REST surface except `vacuum_events`/`set_rls_policy`/`flush`, which have
-no REST route to call (also tracked in `docs/backlog/`). See
+pre-enrichment REST surface. The REST-enrichment routes (item 12 —
+transaction sessions via `X-Txn-Id`, `/events/vacuum`,
+`/tables/{table}/rls`, `/admin/flush`, `/rows/batch`, `/sql` cursors) now
+exist on the server but are not yet wrapped by the client (an optional
+follow-up; sessions are just a header on the existing calls). See
 [`unidb-attach/src/lib.rs`](unidb-attach/src/lib.rs) for the full method
 list and [`docs/REST_API.md`](docs/REST_API.md) for the underlying wire
 contract.
@@ -311,7 +316,7 @@ src/
   checkpoint.rs    — flush dirty pages → checkpoint record (+ next_xid) → truncate WAL (segment-aware, slot-floored — P6.a/b)
   recovery.rs      — ARIES-style redo + undo on open (scans all WAL segments in LSN order)
   wal.rs           — segmented append-only log (16 MiB segments, P6.a); redo+undo payloads; mini-txn bracketing; ship/decode-stream
-  server/          — optional REST/JWT/SSE/metrics server (feature = "server"); tls.rs (rustls termination, P6.f)
+  server/          — optional REST/JWT/SSE/metrics server (feature = "server"); tls.rs (rustls termination, P6.f); txn_session.rs (multi-request transaction sessions, R1) + cursor.rs (large-result cursors, R4) — REST enrichment, item 12
   bin/unidb-server.rs — the server binary (required-features = ["server"]); HTTPS when UNIDB_TLS_CERT/KEY are set
   lib.rs           — Engine public API, init_tracing(); Engine::stats() + slow-query log (P6.g)
 tests/

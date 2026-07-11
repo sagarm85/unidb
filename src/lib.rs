@@ -1196,6 +1196,38 @@ impl Engine {
         Ok(vec![result])
     }
 
+    /// [`Self::set_rls_policy`] from a SQL predicate string (R3): parse
+    /// `predicate` with the ordinary SQL parser (by planning
+    /// `SELECT * FROM <table> WHERE <predicate>`) and install the resulting
+    /// expression as the table's RLS policy. Reusing the parser keeps one
+    /// grammar — the policy language is exactly the AND-only comparison
+    /// subset `WHERE` accepts; anything that plans to a richer query shape
+    /// (joins, subqueries, OR) is rejected as unsupported. This is the
+    /// `Expr`↔wire design the REST route needed (there is deliberately no
+    /// JSON encoding of `Expr` — its serde derive is load-bearing for the
+    /// catalog's on-disk format, see `server/dto.rs`).
+    pub fn set_rls_policy_sql(&self, table: &str, predicate: &str) -> Result<()> {
+        let sql = format!("SELECT * FROM {table} WHERE {predicate}");
+        let plans = parse_sql(&sql)?;
+        match plans.as_slice() {
+            [LogicalPlan::Select {
+                predicate: Some(expr),
+                ..
+            }] => self.set_rls_policy(table, expr.clone()),
+            _ => Err(DbError::SqlUnsupported(
+                "an RLS policy must be a single AND-only comparison predicate".into(),
+            )),
+        }
+    }
+
+    /// Public superuser gate (P6.e semantics) for server-side admin routes
+    /// (R3: `POST /admin/flush`, `PUT /tables/{table}/rls`). `None` (the
+    /// embedded API / a token without `sub`) and open/bootstrap mode pass;
+    /// a named non-superuser gets [`DbError::PermissionDenied`].
+    pub fn ensure_superuser(&self, user: Option<&str>) -> Result<()> {
+        self.require_superuser(user)
+    }
+
     /// Attach a row-level-security policy to a table (M1: Rust API only,
     /// no `CREATE POLICY` SQL surface — see catalog.rs's module doc).
     pub fn set_rls_policy(&self, table: &str, policy: Expr) -> Result<()> {

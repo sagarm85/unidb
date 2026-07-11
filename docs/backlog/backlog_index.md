@@ -25,7 +25,7 @@
 | 09 | `autovacuum.md` | Improvement | ✅ SHIPPED (PROGRESS: Autovacuum) |
 | 10 | `durable_fsm_catalog_pagelist.md` | Improvement | ✅ SHIPPED (PROGRESS: Durable on-disk FSM) |
 | 11 | `index_write_concurrency.md` | Improvement | ✅ SHIPPED (PROGRESS: Index & heap write concurrency) |
-| 12 | `rest_api_enrichment.md` | Improvement | ⬜ NOT STARTED |
+| 12 | `rest_api_enrichment.md` | Improvement | ✅ SHIPPED (PROGRESS: REST API enrichment) |
 | 13 | `crud_performance.md` | Performance | ✅ SHIPPED (PROGRESS: CRUD performance — Phase A + B) |
 | 14 | `parallel_scan.md` | Milestone | ✅ SHIPPED (PROGRESS: Milestone P + follow-ups) |
 | 15 | `15_parallel_worker_governance.md` | Improvement | ✅ SHIPPED (PROGRESS: Parallel worker governance) |
@@ -38,16 +38,31 @@ Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 Ordered by my current ROI read; reorder as priorities change. None has its own
 file yet — each is *filed inside* an existing doc until started.
 
-1. **`16_hot_update.md` — A2 / HOT-style update** (write-path parity; UPDATE is
+1. **`16_concurrent_sql_writes_visibility_anomaly.md` — pre-existing MVCC
+   anomaly under `UNIDB_CONCURRENT_SQL_WRITES`** (found 2026-07-11 while
+   verifying item 12, NOT caused by it — reproduced on unmodified `main`):
+   under CPU contention, `tests/concurrent_writers.rs::
+   cross_row_update_deadlock_resolves_no_hang` intermittently ends with
+   **3 visible rows instead of 2** after cross-row UPDATE churn on an indexed
+   table (a superseded/aborted version stays visible). Repro: run the
+   `concurrent_writers` test binary 6× in parallel, filter `cross_row` —
+   fails ~1–5 of 6 instances per round on `main` (dc93931) and on the item-12
+   branch alike; passes in isolation. Correctness bug in item 11's
+   default-OFF toggle path (the test enables it explicitly) — must be
+   root-caused before that toggle's planned default-ON flip. Filed in
+   `index_write_concurrency.md`'s follow-ups; the toggle stays default-off.
+2. **`17_hot_update.md` — A2 / HOT-style update** (write-path parity; UPDATE is
    ~0.34× vs PG). The biggest *remaining* single lever, but the highest risk:
    heap version-model + **on-disk format** (`FORMAT_VERSION` bump, D4 sign-off) +
    recovery + new crash points; honest gain only ~0.34× → ~0.42×. Filed in
    `crud_performance.md`.
-2. **`12` `rest_api_enrichment.md`** — the one already-filed NOT-STARTED item.
 3. **Parallel-scan follow-ups** (filed in `parallel_scan.md`, lower ROI):
    `SUM`/`AVG`/`GROUP BY` partial aggregate; `LIMIT` early-stop; server
    `ReadHandle` parallelism; a visibility-map fast count. (Default-on + worker
    governance already shipped as #15.)
+4. **Attach-client session support** (filed in `rest_api_enrichment.md`,
+   shipped item 12's one optional follow-up): wrap `X-Txn-Id` sessions +
+   `/rows/batch` + cursors in `unidb-attach`.
 
 ## How to update this file
 

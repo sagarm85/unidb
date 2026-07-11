@@ -37,9 +37,16 @@ pub fn build_router(
 ) -> Router {
     let protected = Router::new()
         .route("/txn/begin", post(handlers::post_txn_begin))
+        .route("/txn/{txn_id}/commit", post(handlers::post_txn_commit))
+        .route("/txn/{txn_id}/rollback", post(handlers::post_txn_rollback))
         .route("/sql", post(handlers::post_sql))
+        .route(
+            "/sql/cursor/{cursor_id}",
+            get(handlers::get_sql_cursor).delete(handlers::delete_sql_cursor),
+        )
         .route("/cypher", post(handlers::post_cypher))
         .route("/rows", post(handlers::post_row))
+        .route("/rows/batch", post(handlers::post_rows_batch))
         .route(
             "/rows/{page_id}/{slot}",
             get(handlers::get_row)
@@ -56,9 +63,15 @@ pub fn build_router(
         )
         .route("/tables", get(handlers::get_tables))
         .route("/tables/{table}/events", post(handlers::post_enable_events))
+        .route(
+            "/tables/{table}/rls",
+            axum::routing::put(handlers::put_table_rls),
+        )
         .route("/events/subscribe", get(sse::get_events_subscribe))
         .route("/events/ack", post(handlers::post_events_ack))
+        .route("/events/vacuum", post(handlers::post_events_vacuum))
         .route("/checkpoint", post(handlers::post_checkpoint))
+        .route("/admin/flush", post(handlers::post_admin_flush))
         .route("/stats", get(handlers::get_stats))
         .route(
             "/replication/slots",

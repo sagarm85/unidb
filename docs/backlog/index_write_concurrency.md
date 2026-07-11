@@ -370,3 +370,19 @@ are future work") and the Phase 5 known-limitations line updated · no §3 decis
 reopened without recorded sign-off. **Ship with `UNIDB_CONCURRENT_SQL_WRITES`
 default-off; a follow-up commit flips the default on after a soak period, recorded
 in `PROGRESS.md`.**
+
+## Known issue found post-ship (2026-07-11, during item 12 verification)
+
+**MVCC visibility anomaly under the toggle, exposed by CPU contention — NOT a
+regression from item 12** (reproduced on unmodified `main` @ `dc93931`):
+`tests/concurrent_writers.rs::cross_row_update_deadlock_resolves_no_hang`
+(which sets `set_concurrent_sql_writes(true)`) intermittently finishes with
+**3 visible rows instead of 2** after two threads churn cross-row UPDATEs on a
+B-tree-indexed table — a superseded or aborted row version remains visible to
+a subsequent scan. Repro (Linux, 18 cores, debug build): run the test binary
+6× in parallel filtered to `cross_row`; ~1–5 of 6 instances fail per round on
+both `main` and the item-12 branch; the test passes reliably in isolation
+(which is why the per-PR gate never caught it). **This must be root-caused and
+fixed before the planned default-ON flip of `UNIDB_CONCURRENT_SQL_WRITES`;
+until then the toggle stays default-off** (production default unaffected).
+Tracked as backlog "Next up" item 16 in `backlog_index.md`.
