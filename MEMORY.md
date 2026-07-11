@@ -641,7 +641,7 @@
   parked Phase 2 SQL capability plan (`docs/backlog/
   phase2_sql_capability_expansion.md`). See Open questions below for
   what's still unresolved from M1-M5.
-- **Last updated:** 2026-07-10
+- **Last updated:** 2026-07-11
 
 ### Phase 1 — ACID & storage foundation (Core lane, branch `acid-hardening`)
 
@@ -2754,7 +2754,23 @@ plain reporting.
 
 ## Session log (append newest at top; use the real current date)
 
-### 2026-07-11 — Parallel worker governance + default-on, branch `parallel-worker-governance`
+### 2026-07-11 — Expert lens codified in CLAUDE.md §0.6, branch `claude/report-script-performance-efcszq`
+
+Docs-only; no engine code touched. User request: the `report.sh` performance
+story (poor numbers → expert database-architect review → measured wins) worked,
+so make that review the standing method rather than a per-effort ask.
+
+- **Added CLAUDE.md §0 step 6 + §0.6 "Expert lens — senior database architect &
+  designer (every session, every action)."** Distills the six practices that
+  actually produced the wins, each anchored to a real incident: re-derive ROI
+  order (Phase B's B2-leads reorder), verify THIS engine's storage model before
+  importing another engine's hazards/optimizations (the nonexistent pool-vs-mmap
+  landmine; the provably-incorrect index-skip), find the real code path + config
+  (`try_exec_select_btree`; the default-off parallel toggle behind "no parallel
+  win"), prove empirically with clean measurement, gate by measured conditions
+  (A3 selectivity), and escalate honestly with sign-off.
+- Section numbered **§0.6** (a subsection of §0) so existing §0.5/§3/§6/§9
+  cross-references elsewhere in the docs stay valid — no renumbering.
 
 Backlog item 15 (`15_parallel_worker_governance.md`). Commit `df068bb`.
 
