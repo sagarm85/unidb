@@ -3911,3 +3911,70 @@ sessions block quiescence-gated auto-checkpoint while open (inherent to
 open transactions, mitigated by the idle reaper; documented).
 **Locked-decision changes:** none (no §3 decision touched; engine stays
 sync — all new async code is behind the `server` feature).
+
+## Cross-domain headline — unidb (1 atomic commit) vs the replaced stack (item 17)   [SHIPPED]   2026-07-11
+
+**PR:** [#45](https://github.com/sagarm85/unidb/pull/45) — branch `mm-replaced-stack-headline`
+**Spec:** `docs/backlog/17_mm_replaced_stack_headline.md`.
+**Summary:** Made the §6 headline (Table 4) honest. It *claimed* to be "one atomic
+transaction vs the replaced stack" but compared unidb's four-model commit (row +
+`VECTOR(128)`+HNSW + graph edge + event) against `pg_relational_throughput` — **a
+single Postgres relational row and nothing else** (4-model work vs 1-model work,
+indefensible either way). Replaced that with a real **replaced-stack** baseline:
+the *same four writes* run as **four independent PG systems with no shared
+transaction** (Postgres row + pgvector+HNSW + a graph adjacency table + an outbox
+queue), each its own connection + own durable commit → 4 `fsync`s, 4 round-trips,
+no cross-system atomicity. Benches + docs only; no engine/format change; no §3.
+(This is why HOT/A2 was **deferred** — see backlog / `crud_performance.md`.)
+
+**Headline result — the throughput win is real, and durability-cost-dependent.**
+The "4 `fsync`s → 1" advantage only shows when a durable sync is *expensive*, so
+the lens matters and **both are reported**:
+
+- **Native, real flush-to-platter (unidb `F_FULLFSYNC` vs Postgres
+  `fsync_writethrough`, matched), macOS:**
+
+  | txns | unidb txns/s | unidb ms/txn | stack (4-sys) txns/s | stack ms/txn | **unidb ÷ stack** | PG relational-only floor |
+  |----:|----:|----:|----:|----:|:--:|----:|
+  | 1000 | 250 | 4.00 | 69 | 14.44 | **3.61×** | 325 |
+  | 5000 | 250 | 4.00 | 69 | 14.46 | **3.61×** | 317 |
+
+  Stable **3.61×**. Mechanism is exactly the thesis: unidb pays one ~4 ms sync,
+  the stack pays ~four (14.4 ms ≈ 4×3.6). Framing: unidb commits **all four models
+  atomically at ~77% the speed Postgres commits one** (250 vs 325/s), and **3.6×**
+  the four-system dual-write.
+
+- **Docker fair-fsync (both Linux, `wal_sync_method=fsync`):** ~parity, noisy
+  (`unidb ÷ stack` ranged 0.89×–1.57× across runs at 1k–50k txns). The VM's
+  `fsync` is cheap/buffered for both engines, so the sync-collapse saves little in
+  absolute ms and per-model HNSW CPU (paid on both sides) dominates. Documents the
+  boundary: the win is proportional to real durable-sync cost; it is **not** a
+  free lunch on platforms where `fsync` is cheap.
+
+**Crash-consistency — the unconditional win (no `fsync` setting changes it).**
+unidb folds the four writes into one user txn, so recovery is all-or-nothing;
+proven CI-side in `tests/crash` (harness **29 → 31**):
+`item16_incomplete_four_model_txn_leaves_zero_orphans` (crash before
+`WAL_TXN_COMMIT` ⇒ recovery undoes row + vector + edge + event, **0 orphans**) and
+`item16_committed_four_model_txn_survives_intact` (all four present). The
+replaced-stack side (`pg_stack_torn_record_demo`) shows the opposite: four
+independent commits leave a durable **orphan row** (embedding/edge/event absent)
+that nothing rolls back.
+
+**How to run:** `MM_REPLACED_STACK=1 scripts/docker_report.sh` (fair fsync, uses
+the `pgvector/pgvector:pg18` image), or native
+`PG_URL=… MM_REPLACED_STACK=1 UNIDB_BENCH=mmreport cargo bench --bench decompose`
+against a pgvector Postgres for the real-durability lens.
+
+**Honest caveats.** The PG-roles proxy is a **conservative floor** — real
+Neo4j/Kafka/Qdrant are heavier than PG tables, so the true tax is larger. Sizes
+here are small (`MM_SAMPLE` low); the *native 3.61×* is stable, the *Docker* ratio
+is noisy and best read as "≈ parity under cheap fsync." Peak RSS not cleanly
+separable (unidb embedded/one process vs PG client-server; a real 4-system stack
+would run four server footprints). **Locked-decision changes:** none.
+
+**Deferred / follow-ups.** Real polyglot infra (Neo4j/Kafka/Qdrant); a native
+Linux host run for publishable *absolute* durable numbers; larger `MM_SAMPLE` to
+tighten the Docker curve. Moat B (log-as-source-of-truth / derived consumers) is a
+separate design — the WAL is physical and WAL-derived streams were rejected
+(`queue/mod.rs`); B's substrate is a generalization of M4's `__events__`.

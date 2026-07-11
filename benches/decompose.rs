@@ -2007,6 +2007,144 @@ fn pg_relational_throughput(url: &str, n: u64) -> f64 {
     rps(n, start.elapsed().as_secs_f64())
 }
 
+/// Format an f32 slice as a pgvector text literal `[x,y,z]` (cast to `::vector`
+/// on insert). pgvector has no native Rust `postgres` type, so text-with-cast is
+/// the standard bind path.
+fn pg_vector_literal(v: &[f32]) -> String {
+    let mut s = String::with_capacity(v.len() * 6 + 2);
+    s.push('[');
+    for (i, x) in v.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&x.to_string());
+    }
+    s.push(']');
+    s
+}
+
+/// The **replaced stack** (CLAUDE.md §6): the *same* four model-writes unidb's W4
+/// folds into ONE atomic commit, executed here as **four independent durable
+/// operations with no shared transaction** — Postgres (row) + a vector store
+/// (pgvector + HNSW) + a graph store (adjacency) + a queue (outbox). Each of the
+/// four is its **own connection** and its **own auto-committed statement**, so
+/// each incurs its own `fsync` and the four cannot group-commit-coalesce — this
+/// *is* the dual-write tax: 4 fsyncs / 4 round-trips per record, and (unlike
+/// unidb) **no cross-system atomicity** — a crash mid-sequence leaves a torn
+/// record. Returns commits/sec, or `None` if pgvector is unavailable (column then
+/// skipped, exactly like `PG_URL` unset). Conservative floor: real Neo4j/Kafka are
+/// heavier than PG tables, so the true tax (and unidb's win) is larger.
+fn pg_replaced_stack_throughput(url: &str, n: u64) -> Option<f64> {
+    // Four "systems", four connections — no shared transaction between them.
+    let mut rel = pg_connect(url)?; // relational
+    let mut vec = pg_connect(url)?; // vector store
+    let mut grf = pg_connect(url)?; // graph store
+    let mut que = pg_connect(url)?; // queue / outbox
+
+    // pgvector availability gate — skip the whole replaced-stack column if absent
+    // (needs the `pgvector/pgvector` image, not stock `postgres`).
+    if vec
+        .batch_execute("CREATE EXTENSION IF NOT EXISTS vector")
+        .is_err()
+    {
+        eprintln!("  [pg] pgvector extension unavailable — replaced-stack column skipped");
+        return None;
+    }
+    rel.batch_execute(
+        "DROP TABLE IF EXISTS rs_rel; CREATE TABLE rs_rel (id BIGINT PRIMARY KEY, body TEXT)",
+    )
+    .ok()?;
+    // HNSW to mirror unidb's W4 vector index (per-insert ANN maintenance is the
+    // fair cost). Index created before inserts so each insert maintains the graph.
+    vec.batch_execute(&format!(
+        "DROP TABLE IF EXISTS rs_vec; CREATE TABLE rs_vec (id BIGINT PRIMARY KEY, embedding vector({DIM})); \
+         CREATE INDEX rs_vec_ann ON rs_vec USING hnsw (embedding vector_cosine_ops)"
+    ))
+    .ok()?;
+    grf.batch_execute(
+        "DROP TABLE IF EXISTS rs_edge; \
+         CREATE TABLE rs_edge (from_id BIGINT, to_id BIGINT, edge_type TEXT); \
+         CREATE INDEX rs_edge_from ON rs_edge (from_id)",
+    )
+    .ok()?;
+    que.batch_execute(
+        "DROP TABLE IF EXISTS rs_out; \
+         CREATE TABLE rs_out (seq BIGSERIAL PRIMARY KEY, kind TEXT, payload TEXT)",
+    )
+    .ok()?;
+
+    let ins_rel = rel
+        .prepare("INSERT INTO rs_rel (id, body) VALUES ($1, $2)")
+        .ok()?;
+    // `$2::text::vector`, not `$2::vector`: the latter makes Postgres infer `$2`
+    // as type `vector` (no Rust `ToSql` for it → WrongType panic). Forcing the
+    // param to `text` first lets us bind the pgvector literal as a `String`.
+    let ins_vec = vec
+        .prepare("INSERT INTO rs_vec (id, embedding) VALUES ($1, $2::text::vector)")
+        .ok()?;
+    let ins_grf = grf
+        .prepare("INSERT INTO rs_edge (from_id, to_id, edge_type) VALUES ($1, $2, $3)")
+        .ok()?;
+    let ins_que = que
+        .prepare("INSERT INTO rs_out (kind, payload) VALUES ($1, $2)")
+        .ok()?;
+
+    let start = Instant::now();
+    for i in 0..n as i64 {
+        // Four separate durable commits — the point of the comparison.
+        rel.execute(&ins_rel, &[&i, &format!("body-{i}")]).unwrap();
+        let lit = pg_vector_literal(&embedding(i as u64));
+        vec.execute(&ins_vec, &[&i, &lit]).unwrap();
+        grf.execute(&ins_grf, &[&i, &(i + 1), &"rel"]).unwrap();
+        que.execute(&ins_que, &[&"insert", &format!("body-{i}")])
+            .unwrap();
+    }
+    Some(rps(n, start.elapsed().as_secs_f64()))
+}
+
+/// The crash-consistency face, replaced-stack side. Because the four writes are
+/// four independent commits with no shared transaction, an interruption **after
+/// the relational commit** durably keeps the row while the embedding/edge/event
+/// never land — a **torn record** that no recovery rolls back (contrast unidb's
+/// all-or-nothing: `tests/crash/item16_incomplete_four_model_txn_leaves_zero_orphans`).
+/// Returns `Some(true)` if the orphan is observed on a *fresh* connection (i.e.
+/// durably, as after a restart). Requires the tables from a prior
+/// `pg_replaced_stack_throughput` setup; safe no-op skip if pgvector is absent.
+fn pg_stack_torn_record_demo(url: &str) -> Option<bool> {
+    let orphan_id: i64 = -777; // outside the 0..n throughput range
+    {
+        // "System 1" commits the row durably…
+        let mut rel = pg_connect(url)?;
+        rel.execute(
+            "INSERT INTO rs_rel (id, body) VALUES ($1, $2)",
+            &[&orphan_id, &"torn-record-demo"],
+        )
+        .ok()?;
+        // …then the process is "interrupted" before systems 2–4 run. (We simply
+        // do not issue the other three commits — the honest structural point:
+        // there is no transaction spanning them to undo the row.)
+    }
+    // Fresh connections = "after restart": the row is durably present, but the
+    // embedding / edge / event are absent → a torn record.
+    let mut c = pg_connect(url)?;
+    let row_present: i64 = c
+        .query_one("SELECT count(*) FROM rs_rel WHERE id = $1", &[&orphan_id])
+        .ok()?
+        .get(0);
+    let vec_present: i64 = c
+        .query_one("SELECT count(*) FROM rs_vec WHERE id = $1", &[&orphan_id])
+        .ok()?
+        .get(0);
+    let edge_present: i64 = c
+        .query_one(
+            "SELECT count(*) FROM rs_edge WHERE from_id = $1",
+            &[&orphan_id],
+        )
+        .ok()?
+        .get(0);
+    Some(row_present == 1 && vec_present == 0 && edge_present == 0)
+}
+
 /// The durability primitive unidb's commit sync (`File::sync_all`) actually
 /// resolves to on the platform this bench is *running* on, so the generated
 /// report is internally consistent instead of hard-coding "macOS". Rust std
@@ -2278,49 +2416,126 @@ fn bench_mm_report() {
         println!();
     }
 
-    // ---- Table 4: unidb multi-model (W4) vs Postgres relational, tx-count sweep ----
-    println!("## Table 4 — unidb multi-model (1 txn) vs Postgres relational, at scale\n");
-    println!(
-        "unidb commits **four model-writes in one transaction** (relational + `VECTOR(128)`\n\
-         + graph edge + event); Postgres does the **relational INSERT only** (1 model-write)\n\
-         — by design (\"not its boat\"). Swept across tx counts (`MM_TX_SWEEP`) to see whether\n\
-         the multi-model cost stays flat or the synchronous HNSW index erodes it at scale.\n"
-    );
-    println!(
-        "**How to read this table.** A *commit* is one durable transaction — one `fsync` at\n\
-         commit — and the rate is transactions/sec (single writer, so no group-commit\n\
-         coalescing). Each **unidb** transaction does **4× the work** of a **Postgres** one\n\
-         (`model-writes/txn` = 4 vs 1), and one of those four is an expensive HNSW vector\n\
-         insert. So `unidb ÷ PG < 1` is **expected** — it is the price of folding four models\n\
-         into a single atomic, crash-consistent commit, not a slowdown on equal work. If you\n\
-         only need the relational write, Postgres is faster; the multi-model commit is what\n\
-         Postgres-relational alone cannot do at all.\n"
-    );
+    // ---- Table 4: unidb multi-model (1 txn) vs the replaced stack, tx-count sweep ----
+    // `MM_REPLACED_STACK=1` adds the honest §6 headline column: the SAME four
+    // model-writes run across four independent PG systems (row + pgvector + graph
+    // + queue) with no shared transaction. Without it, only the PG-relational
+    // reference floor is shown (back-compat).
+    let replaced_stack = std::env::var("MM_REPLACED_STACK").ok().as_deref() == Some("1");
+    println!("## Table 4 — unidb multi-model (1 atomic txn) vs the replaced stack, at scale\n");
+    if replaced_stack {
+        println!(
+            "The §6 headline. unidb commits **four model-writes in ONE atomic transaction**\n\
+             (relational + `VECTOR(128)`+HNSW + graph edge + event) — **1 `fsync`, all-or-\n\
+             nothing**. The **replaced stack** does the *same four writes* as **four\n\
+             independent systems with no shared transaction** (Postgres row + pgvector\n\
+             +HNSW + a graph adjacency table + an outbox queue), each its own connection and\n\
+             its own durable commit — **4 `fsync`s, 4 round-trips, and NO cross-system\n\
+             atomicity** (a crash mid-sequence leaves a torn record; see the\n\
+             crash-consistency test). The `PG relational only` column is the stack's\n\
+             single-model *floor* (one write), kept for reference — it is **not** the\n\
+             baseline. This is a **conservative** proxy: real Neo4j/Kafka/Qdrant are heavier\n\
+             than PG tables, so the true stack tax is larger.\n"
+        );
+    } else {
+        println!(
+            "unidb commits **four model-writes in one atomic transaction** (relational +\n\
+             `VECTOR(128)` + graph edge + event); the `PG relational only` column does the\n\
+             **relational INSERT only** (1 model-write) — the stack's single-model floor, not\n\
+             the real baseline. Set **`MM_REPLACED_STACK=1`** (needs a pgvector-enabled\n\
+             Postgres) to add the honest §6 replaced-stack column: the same four writes across\n\
+             four independent systems with no shared transaction.\n"
+        );
+    }
     let sweep: Vec<u64> = std::env::var("MM_TX_SWEEP")
         .ok()
         .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
         .unwrap_or_else(|| vec![1_000, 10_000, 100_000, 1_000_000]);
     if let Some(ref m) = pg_method {
         println!(
-            "_Durability lens: unidb `{sync_prim}`, Postgres `wal_sync_method={m}` (matched)._\n"
-        );
-        println!(
-            "| txns | model-writes/txn | unidb txns/s | unidb ms/txn | postgres txns/s | postgres ms/txn | unidb ÷ PG |"
-        );
-        println!(
-            "|-----:|:----------------:|-------------:|-------------:|----------------:|----------------:|-----------:|"
+            "_Durability lens: unidb `{sync_prim}`, Postgres `wal_sync_method={m}` (matched);\n\
+             single writer, so no group-commit coalescing on either side._\n"
         );
         let u = url.as_deref().unwrap();
-        for &c in &sweep {
-            eprintln!("[mmreport] Table 4 at {c} txns…");
-            let uw4 = phased(&format!("t4_unidb_{c}"), || unidb_w4_throughput(c));
-            let pgr = phased(&format!("t4_pg_{c}"), || pg_relational_throughput(u, c));
-            let ratio = if pgr > 0.0 { uw4 / pgr } else { 0.0 };
-            let u_ms = if uw4 > 0.0 { 1000.0 / uw4 } else { 0.0 };
-            let p_ms = if pgr > 0.0 { 1000.0 / pgr } else { 0.0 };
-            println!("| {c} | 4 : 1 | {uw4:.0} | {u_ms:.3} | {pgr:.0} | {p_ms:.3} | {ratio:.2}× |");
+        if replaced_stack {
+            println!(
+                "| txns | unidb txns/s | unidb ms/txn | stack (4-sys) txns/s | stack ms/txn | **unidb ÷ stack** | PG relational only txns/s |"
+            );
+            println!(
+                "|-----:|-------------:|-------------:|---------------------:|-------------:|:-----------------:|--------------------------:|"
+            );
+            for &c in &sweep {
+                eprintln!("[mmreport] Table 4 at {c} txns…");
+                let uw4 = phased(&format!("t4_unidb_{c}"), || unidb_w4_throughput(c));
+                let stack = phased(&format!("t4_stack_{c}"), || {
+                    pg_replaced_stack_throughput(u, c)
+                });
+                let pgr = phased(&format!("t4_pg_{c}"), || pg_relational_throughput(u, c));
+                let u_ms = if uw4 > 0.0 { 1000.0 / uw4 } else { 0.0 };
+                match stack {
+                    Some(s) if s > 0.0 => {
+                        let ratio = uw4 / s;
+                        let s_ms = 1000.0 / s;
+                        println!(
+                            "| {c} | {uw4:.0} | {u_ms:.3} | {s:.0} | {s_ms:.3} | **{ratio:.2}×** | {pgr:.0} |"
+                        );
+                    }
+                    _ => {
+                        println!(
+                            "| {c} | {uw4:.0} | {u_ms:.3} | _(pgvector n/a)_ | — | — | {pgr:.0} |"
+                        );
+                    }
+                }
+            }
+            println!();
+            println!(
+                "`unidb ÷ stack > 1` means unidb's single atomic commit beats the four-system\n\
+                 dual-write on throughput. **The throughput edge is `fsync`-cost-dependent:**\n\
+                 unidb pays 1 durable sync per record, the stack 4 — but that advantage only\n\
+                 dominates when a durable sync is *expensive*. Under Docker's shared-VM `fsync`\n\
+                 (cheap, buffered — see the durability caveat) the per-model HNSW/index CPU\n\
+                 paid on **both** sides dominates instead, so the ratio sits near parity and\n\
+                 the win narrows; on a native host with a real flush-to-platter sync the\n\
+                 4→1 collapse is worth far more. The **unconditional** win is the crash-\n\
+                 consistency below — one atomic commit vs four with no shared transaction —\n\
+                 which no `fsync` setting changes.\n"
+            );
+            // Crash-consistency face: the qualitative half no fsync tuning fixes.
+            match pg_stack_torn_record_demo(u) {
+                Some(true) => println!(
+                    "**Crash-consistency:** the replaced stack recovered a **torn record** — the\n\
+                     relational row is durably present while its embedding/edge/event are absent\n\
+                     (no transaction spans the four systems to undo it). unidb recovers **0\n\
+                     orphans** by construction — a crash before `WAL_TXN_COMMIT` undoes all four,\n\
+                     proven in `tests/crash` (`item16_incomplete_four_model_txn_leaves_zero_orphans`,\n\
+                     `item16_committed_four_model_txn_survives_intact`). No fsync setting buys the\n\
+                     stack this.\n"
+                ),
+                Some(false) => println!(
+                    "_Crash-consistency demo inconclusive on this run (state unexpectedly clean)._\n"
+                ),
+                None => {}
+            }
+        } else {
+            println!(
+                "| txns | model-writes/txn | unidb txns/s | unidb ms/txn | PG relational only txns/s | postgres ms/txn | unidb ÷ PG-floor |"
+            );
+            println!(
+                "|-----:|:----------------:|-------------:|-------------:|--------------------------:|----------------:|-----------------:|"
+            );
+            for &c in &sweep {
+                eprintln!("[mmreport] Table 4 at {c} txns…");
+                let uw4 = phased(&format!("t4_unidb_{c}"), || unidb_w4_throughput(c));
+                let pgr = phased(&format!("t4_pg_{c}"), || pg_relational_throughput(u, c));
+                let ratio = if pgr > 0.0 { uw4 / pgr } else { 0.0 };
+                let u_ms = if uw4 > 0.0 { 1000.0 / uw4 } else { 0.0 };
+                let p_ms = if pgr > 0.0 { 1000.0 / pgr } else { 0.0 };
+                println!(
+                    "| {c} | 4 : 1 | {uw4:.0} | {u_ms:.3} | {pgr:.0} | {p_ms:.3} | {ratio:.2}× |"
+                );
+            }
+            println!();
         }
-        println!();
     } else {
         println!("_`PG_URL` unset → Postgres columns skipped; set it to run Table 4._\n");
     }

@@ -17,6 +17,9 @@
 #   MM_SIZES    comma list of pre-grow row counts   (default 1000,10000,100000)
 #   MM_SAMPLE   marginal-commit sample per point     (default 200)
 #   PG_URL      superuser Postgres conn string       (default: Postgres table skipped)
+#   MM_REPLACED_STACK=1  Table 4 adds the §6 replaced-stack column (row + pgvector
+#               + graph + queue, four independent commits) + crash-consistency
+#               verdict. Needs a pgvector-enabled Postgres (CREATE EXTENSION vector).
 #
 # NOTE: W2–W4 build the vector (HNSW) and graph indexes synchronously, so large
 # MM_SIZES are slow by design — that cost is the whole point of the measurement.

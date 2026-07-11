@@ -33,6 +33,7 @@ Force a mode with `scripts/report.sh --docker` or `--native`; `--help` prints us
 | `MM_CRUD_ROWS` | `100000` | Rows pre-loaded for the CRUD suite (Table 3). |
 | `MM_BULK_SIZES` | `10000,1000000,2000000` | Row counts for the bulk insert+scan stress sweep (Table 3.1). Default tops out at 2M; push to `5000000`/`10000000` for a heavier run (5M ≈ 2.7 min insert/engine). |
 | `MM_TX_SWEEP` | `1000,10000,100000,1000000` | Tx counts for the multi-model-vs-Postgres sweep (Table 4). |
+| `MM_REPLACED_STACK` | _(unset)_ | `1` → Table 4 adds the §6 replaced-stack column (row + pgvector + graph + queue as four independent commits, no shared txn) + a crash-consistency verdict. Needs a pgvector-enabled Postgres (`CREATE EXTENSION vector`); the Docker image already has it. |
 
 ```bash
 # Push the multi-model sweep to millions (slow — synchronous HNSW at scale):

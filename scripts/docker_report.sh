@@ -8,6 +8,7 @@
 # Usage:
 #   scripts/docker_report.sh                              # default sizes
 #   MM_SIZES=100000,1000000 scripts/docker_report.sh      # push to millions
+#   MM_REPLACED_STACK=1 scripts/docker_report.sh          # §6 headline column
 #
 # Output: docker/out/multi_model_report_<timestamp>.md
 #
@@ -29,6 +30,10 @@ export GIT_COMMIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || e
 export GIT_BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
 export MM_SIZES="${MM_SIZES:-1000,10000,100000}"
 export MM_SAMPLE="${MM_SAMPLE:-200}"
+# MM_REPLACED_STACK=1 → Table 4 adds the §6 replaced-stack column (row + pgvector
+# + graph + queue as four independent commits) + a crash-consistency verdict.
+# The compose file uses the pgvector image so the vector role can run.
+export MM_REPLACED_STACK="${MM_REPLACED_STACK:-}"
 
 mkdir -p "$REPO_ROOT/docker/out"
 cd "$REPO_ROOT/docker"

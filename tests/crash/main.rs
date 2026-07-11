@@ -669,6 +669,141 @@ fn incomplete_user_txn_leaves_no_trace_across_two_tables() {
     );
 }
 
+// ── item 16: four-model atomicity — the §6 crash-consistency proof ───────────
+//
+// The headline claim behind the "replaced stack" comparison: unidb folds all
+// four model-writes (relational row + `VECTOR(128)` + graph edge + event) of a
+// logical record into ONE user transaction, so recovery is all-or-nothing —
+// there is **no torn record**. The replaced stack (Postgres + a vector store +
+// a graph store + a queue) has four independent WALs/commits and NO shared
+// transaction, so a crash mid-sequence durably keeps the already-committed row
+// while the embedding/edge/event are lost — a permanent orphan nothing rolls
+// back. These two tests pin unidb's side of that asymmetry: a crash *before*
+// `WAL_TXN_COMMIT` leaves **0 orphans** across all four models; a *committed*
+// four-model txn survives with all four present. There is no third state.
+
+fn build_four_model_table(engine: &Engine) {
+    let xid = engine.begin().unwrap();
+    engine
+        .execute_sql(
+            xid,
+            "CREATE TABLE t (id INT, body TEXT, embedding VECTOR(128))",
+        )
+        .unwrap();
+    engine
+        .execute_sql(xid, "CREATE INDEX iv ON t USING HNSW (embedding)")
+        .unwrap();
+    engine.commit(xid).unwrap();
+    engine.enable_events("t").unwrap();
+}
+
+#[test]
+fn item16_incomplete_four_model_txn_leaves_zero_orphans() {
+    use unidb::sql::logical::Literal;
+    let dir = tempdir().unwrap();
+    {
+        let engine = open(dir.path());
+        // Per-statement policy (see `p6_...`): each mini-txn fsyncs immediately
+        // so `flush()` can push all four models' pages to disk while the user
+        // txn stays incomplete — the strongest test of the undo pass.
+        engine.set_deferred_sync(false);
+        build_four_model_table(&engine);
+
+        let ins = engine
+            .prepare("INSERT INTO t (id, body, embedding) VALUES ($1, $2, $3)")
+            .unwrap();
+        let xid = engine.begin().unwrap();
+        // (1) relational row + (2) its VECTOR value/index + (4) auto-captured event
+        engine
+            .execute_prepared(
+                xid,
+                &ins,
+                &[
+                    Literal::Int(1),
+                    Literal::Text("orphan-body".into()),
+                    Literal::Vector(vec![0.25f32; 128]),
+                ],
+            )
+            .unwrap();
+        // (3) graph edge — same xid, same WAL, same undo log
+        engine.create_edge(xid, 1, 2, "rel", "{}").unwrap();
+        // Every model-write's mini-txn is durably logged, but xid never reaches
+        // WAL_TXN_COMMIT. "Crash" here — no engine.commit(xid).
+        engine.flush().unwrap();
+        drop(engine);
+    }
+
+    // Recovery's incomplete-user-txn undo must reverse ALL FOUR — 0 orphans.
+    let engine = open(dir.path());
+    let xid = engine.begin().unwrap();
+    match &engine.execute_sql(xid, "SELECT * FROM t").unwrap()[0] {
+        unidb::sql::executor::ExecResult::Rows { rows, .. } => {
+            assert!(
+                rows.is_empty(),
+                "orphan row (relational + embedding) survived a torn txn"
+            );
+        }
+        other => panic!("expected Rows, got {other:?}"),
+    }
+    assert!(
+        engine.edges_from(xid, 1).unwrap().is_empty(),
+        "orphan graph edge survived a torn txn"
+    );
+    assert!(
+        engine.poll_events(xid, "any", 10).unwrap().is_empty(),
+        "orphan event survived a torn txn"
+    );
+}
+
+#[test]
+fn item16_committed_four_model_txn_survives_intact() {
+    use unidb::sql::logical::Literal;
+    let dir = tempdir().unwrap();
+    {
+        let engine = open(dir.path());
+        build_four_model_table(&engine);
+        let ins = engine
+            .prepare("INSERT INTO t (id, body, embedding) VALUES ($1, $2, $3)")
+            .unwrap();
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_prepared(
+                xid,
+                &ins,
+                &[
+                    Literal::Int(1),
+                    Literal::Text("kept-body".into()),
+                    Literal::Vector(vec![0.5f32; 128]),
+                ],
+            )
+            .unwrap();
+        engine.create_edge(xid, 1, 2, "rel", "{}").unwrap();
+        engine.commit(xid).unwrap(); // fsyncs WAL_TXN_COMMIT — the atomic switch
+                                     // "Crash" before any page flush.
+        drop(engine);
+    }
+
+    // All four models present after redo — the other side of "no third state".
+    let engine = open(dir.path());
+    let xid = engine.begin().unwrap();
+    match &engine.execute_sql(xid, "SELECT id FROM t").unwrap()[0] {
+        unidb::sql::executor::ExecResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1, "committed relational row must survive");
+        }
+        other => panic!("expected Rows, got {other:?}"),
+    }
+    assert_eq!(
+        engine.edges_from(xid, 1).unwrap().len(),
+        1,
+        "committed graph edge must survive"
+    );
+    assert_eq!(
+        engine.poll_events(xid, "any", 10).unwrap().len(),
+        1,
+        "committed event must survive"
+    );
+}
+
 // ── property: committed set is a prefix of operations ────────────────────────
 
 #[test]

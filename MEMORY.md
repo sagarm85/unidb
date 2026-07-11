@@ -12,6 +12,20 @@
 
 ## Current status
 
+- **Cross-domain headline vs the replaced stack (backlog item 17) — SHIPPED
+  (2026-07-11), branch `mm-replaced-stack-headline`, PR pending.** Made §6 Table 4
+  honest: it *claimed* "one atomic txn vs the replaced stack" but compared unidb's
+  4-model commit against a single PG relational row. Added a real replaced-stack
+  baseline (`pg_replaced_stack_throughput`) — the same four writes as four
+  independent PG commits (row + pgvector+HNSW + graph adjacency + outbox), no
+  shared txn — behind `MM_REPLACED_STACK=1`. **Result: unidb's one atomic commit
+  is 3.61× faster under real flush-to-platter fsync** (F_FULLFSYNC vs
+  fsync_writethrough, 250 vs 69 txns/s); **~parity under Docker's cheap VM fsync**
+  (the win is durability-cost-dependent — critical measurement-hygiene point).
+  **Unconditional win: crash-consistency** — 0 orphans vs torn record, proven by
+  two new `tests/crash` `item16_*` tests (harness 29 → **31**). Benches+docs only,
+  no §3. HOT/A2 **deferred** (ROI vs §1). See [[unidb-moat-and-wal-model]],
+  PROGRESS "Cross-domain headline", `docs/backlog/17_mm_replaced_stack_headline.md`.
 - **REST API enrichment (backlog item 12) — SHIPPED (2026-07-11), branch
   `claude/rest-api-enrichment-vly934`, PR #43 (merged).** The last filed
   NOT-STARTED backlog item; **server-layer only** (engine gains just two
@@ -2827,6 +2841,33 @@ plain reporting.
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-07-11 — Cross-domain headline vs replaced stack (item 17), branch `mm-replaced-stack-headline`
+
+Redirected from HOT/A2 after a critical-lens review: HOT reopened locked decision
+D4 for ~0.42× on a single-model bench §1 says we should lose — **deferred it**.
+Instead sharpened the §6 differentiator (backlog item 17; the crash tests are named
+`item16_*` — written before a rebase renumbered the backlog entry 16 → 17 to avoid
+colliding with main's already-merged item-16 MVCC-anomaly follow-up).
+
+- **Found the headline was dishonest:** Table 4 ("one atomic txn vs the replaced
+  stack") actually compared unidb's 4-model commit against a *single PG relational
+  row*. Replaced with a real replaced-stack baseline (row + pgvector+HNSW + graph
+  adjacency + outbox, four independent commits, no shared txn).
+- **Measurement-hygiene catch (the session's key lesson):** the first fair-Docker
+  run showed **~parity** (0.9–1.6×, noisy) — I did NOT headline it. Root cause:
+  Docker VM `fsync` is cheap/buffered for both, masking unidb's "1 sync vs 4"
+  edge. The *correct* lens is matched **AND expensive** durable sync. Native run
+  (unidb `F_FULLFSYNC` vs local pgvector Postgres `fsync_writethrough`) → stable
+  **3.61×** (250 vs 69 txns/s). Both lenses reported honestly in PROGRESS/README.
+  My original ~3–4× prediction was right — it just needed the expensive-sync lens.
+- **Crash-consistency proof (unconditional win):** 2 new `tests/crash` tests
+  (`item16_incomplete_four_model_txn_leaves_zero_orphans`,
+  `item16_committed_four_model_txn_survives_intact`) — harness **29 → 31**. Stack
+  side (`pg_stack_torn_record_demo`) shows the torn record.
+- Fixed a real bug found by running it: `$2::vector` made PG infer the param as
+  `vector` (WrongType panic) → `$2::text::vector`. Infra: `pgvector/pgvector:pg18`
+  image + `MM_REPLACED_STACK=1` toggle. Benches + docs only; no §3; clippy/fmt clean.
+
 ### 2026-07-11 — REST API enrichment (item 12) shipped, branch `claude/rest-api-enrichment-vly934`
 
 - Implemented all four checkpoints of `docs/backlog/rest_api_enrichment.md`
@@ -2882,6 +2923,8 @@ Docs-only; no engine code touched. User request, in two rounds:
   failure on my part. §0 step 6 updated to say the same.
 - Section numbered **§0.6** (a subsection of §0) so existing §0.5/§3/§6/§9
   cross-references elsewhere in the docs stay valid — no renumbering.
+
+### 2026-07-11 — Parallel worker governance + default-on, branch `parallel-worker-governance`
 
 Backlog item 15 (`15_parallel_worker_governance.md`). Commit `df068bb`.
 
