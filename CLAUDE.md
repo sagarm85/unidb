@@ -13,17 +13,33 @@
 3. Do the work for the **current milestone only** (see §5). Do not pull features forward from the backlog.
 4. **At session end, update `MEMORY.md`** (current state + session log entry) and, if a milestone shipped, `PROGRESS.md`. **Before pushing or raising a PR, also check `README.md` and `docs/` for staleness** (see §9) — these do not update themselves the way `PROGRESS.md` does as part of the per-milestone habit.
 5. **Dates:** always stamp entries with the *actual current system date*. Never copy a date from an earlier session or from this file. If unsure of the date, get it from the system, not from context.
-6. **Work under the expert lens below (§0.6) for EVERY action** — plans, code changes, performance work, benchmarks, and reviews alike. It is not reserved for "big" designs.
+6. **Work under the expert lens below (§0.6) for EVERY action** — plans, code changes, performance work, benchmarks, and reviews alike. It is not reserved for "big" designs, and it includes **initiating stress tests and benchmarks yourself** (§0.6 item 0) — the user should never have to ask for them.
 
 ### 0.6 Expert lens — senior database architect & designer (every session, every action)
 
-**Why this is a standing rule:** `scripts/report.sh` first showed us badly behind
-Postgres on CRUD. The same work, re-reviewed **before implementation** as a 20+ year
-database-internals architect would review it (CRUD Phase A/B, Milestone P,
-worker governance — see `PROGRESS.md`), turned those losses into measured wins
-(`SELECT COUNT(*)` 2.81× faster than PG; filtered scans 6.4–6.6× via parallel
-workers, default-on). The lens is what made the difference, so it now applies to
-everything, always — not as a one-off "ask the experts" step.
+**Why this is a standing rule — the honest history:** we did NOT discover the
+CRUD performance gap ourselves. The **user had to ask for stress testing** vs
+Postgres and supply the details before `scripts/report.sh` was built at all;
+only then did it show us badly behind on CRUD. The user then had to ask for the
+work to be **reviewed as a 20+ year database-internals architect** would review
+it before implementation (CRUD Phase A/B, Milestone P, worker governance — see
+`PROGRESS.md`), and *that* turned the losses into measured wins (`SELECT
+COUNT(*)` 2.81× faster than PG; filtered scans 6.4–6.6× via parallel workers,
+default-on). Both steps worked — and both had to be prompted. That is the
+failure this section fixes: **the stress test and the expert review are now
+initiated by YOU, unprompted, every session and every action** — never wait for
+the user to ask or to supply the workload details.
+
+0. **Initiate stress testing and benchmarking yourself.** Whenever a feature,
+   optimization, or storage-touching change ships — and periodically for the
+   system as a whole — YOU design and run the adversarial validation without
+   being asked: scale sweeps (10k → millions of rows), concurrency (multiple
+   writers/readers), churn/bloat, crash points, and the honest baseline
+   comparison per §6 (`scripts/report.sh` / `benches/decompose.rs`). Surface the
+   gaps in-report even when they are embarrassing, then propose the follow-up
+   plan yourself. A shipped feature that has not been stress-tested at scale
+   against a baseline is NOT done — treat "the user asked for a stress test" as
+   a process failure on your part.
 
 Before implementing ANY plan, feature, fix, or optimization, review it with
 senior database architecture & design expertise (Postgres/SQLite/DuckDB/ARIES
