@@ -113,6 +113,50 @@ pub fn check() -> Result<()> {
     })
 }
 
+/// A `Send + Sync` snapshot of the current query's deadline + cancel token, so a
+/// **parallel-scan worker** (running on a *different* thread, without the
+/// thread-local) can honor the query's timeout/cancellation exactly like
+/// [`check`] does on the query thread. Cheap; a no-op if no limits are installed.
+#[derive(Clone, Debug, Default)]
+pub struct DeadlineSnapshot {
+    deadline: Option<Instant>,
+    cancel: Option<CancelToken>,
+    limit_ms: u64,
+}
+
+impl DeadlineSnapshot {
+    /// Same verdict as [`check`], from captured state (no thread-local read).
+    /// Workers call this every N pages/candidates.
+    pub fn check(&self) -> Result<()> {
+        if let Some(c) = &self.cancel {
+            if c.is_cancelled() {
+                return Err(DbError::QueryCancelled);
+            }
+        }
+        if let Some(d) = self.deadline {
+            if Instant::now() >= d {
+                return Err(DbError::QueryTimeout {
+                    limit_ms: self.limit_ms,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Snapshot the current thread's deadline + cancel token for propagation to
+/// worker threads. Call it on the query thread *before* spawning workers.
+pub fn snapshot_deadline() -> DeadlineSnapshot {
+    CURRENT.with(|c| match c.borrow().as_ref() {
+        Some(l) => DeadlineSnapshot {
+            deadline: l.deadline,
+            cancel: l.cancel.clone(),
+            limit_ms: l.timeout.map(|d| d.as_millis() as u64).unwrap_or(0),
+        },
+        None => DeadlineSnapshot::default(),
+    })
+}
+
 /// The effective `work_mem` row budget: the current query's override if set,
 /// else `default` (which the caller derives from its env var / constant).
 pub fn work_mem_rows(default: usize) -> usize {

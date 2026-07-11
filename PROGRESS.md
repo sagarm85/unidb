@@ -3759,3 +3759,53 @@ indexed table, `SELECT id, body FROM t WHERE k >= 250000`, returns 250k rows):
 gains an index-served filtered-`SELECT` case (parallel matches serial as a set,
 same `build` table now has a B-tree on `k`); full lib (373) green with the toggle
 **forced on**; clippy/fmt clean. **Locked-decision changes:** none.
+
+## Parallel worker governance (item 15)   [SHIPPED]   2026-07-11
+
+**PR:** _pending_ — branch `parallel-worker-governance`
+**Spec:** `docs/backlog/15_parallel_worker_governance.md` (SHIPPED).
+**Summary:** Parallel scan (Milestone P) shipped **default-off** because its
+resource governance under concurrent load was immature — the real blockers to
+default-on. This closes them and flips it **default-on**. It also explains why
+`report.sh` showed no parallel improvement: the bench never set
+`UNIDB_PARALLEL_SCAN`, so it ran the serial path; with default-on it now shows the
+win with no env. Read-only — crash harness **29**, no `FORMAT_VERSION` bump, no §3.
+
+**What changed:**
+- **G1 — global worker cap (the safety net).** A process-wide budget
+  (`GLOBAL_MAX`/`AVAILABLE`) + a `WorkerLease` RAII: `acquire()` takes
+  `min(per-query degree, available)` via CAS and **releases on `Drop`** (even on an
+  early `?` error); `< 2` → `None` → serial. **Total live parallel-scan workers can
+  never exceed the cap across all concurrent queries** — a flood of scans degrades
+  to serial instead of the old M×N oversubscription. Env
+  `UNIDB_PARALLEL_MAX_TOTAL_WORKERS` / `Engine::set_parallel_scan_max_total_workers`
+  (default `available_parallelism`). All five call sites use
+  `acquire()` + `lease.degree()` instead of the bare `degree_for()`.
+- **G2 — timeout/cancellation propagation.** `query_limits::snapshot_deadline()`
+  returns a `Send + Sync` (`deadline`, `CancelToken`) snapshot; each worker checks
+  it every few pages/candidates → `DbError::QueryTimeout`/`QueryCancelled` via the
+  shared stop flag. A runaway/large parallel scan is now interruptible exactly like
+  the serial path (which was a real operational hazard before).
+- **G4 — default-ON.** `ENABLED = true`; the governance makes it safe.
+  `UNIDB_PARALLEL_SCAN=0` / `Engine::set_parallel_scan(false)` remain the
+  field-revert net.
+
+**Benchmark** (native, Apple M5 Pro, 18 cores; `decompose` mmreport, **no
+`UNIDB_PARALLEL_SCAN` env** — i.e. what `report.sh` runs):
+
+| Table 3.1 scan @1M (`COUNT(*) WHERE body<>'x'`) | before (default-off ⇒ serial) | after (default-on) |
+|---|---|---|
+| unidb scan rec/s | 5.6M (PG +556%) | **35.7M (PG +82%)** |
+
+So `report.sh` reflects the parallel capability by default now.
+
+**Crash harness:** **29** (read-only). **Tests:**
+`parallel_scan_global_cap_bounds_concurrency` (8 concurrent scans with a global cap
+of 2 — all correct, no hang/oversubscription), `parallel_scan_honors_cancellation`
+(pre-cancelled token → `QueryCancelled`). Full lib (373) + crash green **default-on**;
+clippy/fmt clean; `cargo tree` tokio-free (`std::thread`).
+
+**Deferred (unchanged):** a real thread **pool** (spawn reuse — minor overhead,
+not a safety issue); `SUM`/`GROUP BY` partial aggregate; `LIMIT` early-stop;
+per-query fair-share of the global pool (today first-come; extras go serial).
+**Locked-decision changes:** none.

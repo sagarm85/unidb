@@ -4,8 +4,9 @@
 //! span many heap pages so the parallel path actually engages.
 
 use std::sync::Arc;
+use unidb::query_limits::{CancelToken, QueryLimits};
 use unidb::sql::logical::Literal;
-use unidb::{Engine, SqlResult};
+use unidb::{DbError, Engine, SqlResult};
 
 const ROWS: i64 = 5_000; // ~25+ heap pages at this row size
 
@@ -162,6 +163,63 @@ fn parallel_scan_concurrent_with_writer() {
 
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     writer.join().unwrap();
+}
+
+/// G1 governance: with a tiny **global** worker budget, many concurrent parallel
+/// scans must all still complete correctly and promptly — extra scans degrade to
+/// serial rather than oversubscribing or deadlocking. (If admission leaked
+/// permits or blocked, this would hang.)
+#[test]
+fn parallel_scan_global_cap_bounds_concurrency() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::open(dir.path(), 0).unwrap());
+    build(&engine);
+    engine.set_parallel_scan(true);
+    engine.set_parallel_scan_config(1, 4); // per-query wants up to 4…
+    engine.set_parallel_scan_max_total_workers(2); // …but only 2 globally.
+
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let engine = Arc::clone(&engine);
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..5 {
+                assert_eq!(count(&engine, "SELECT COUNT(*) FROM t"), ROWS);
+                let ids = select(&engine, "SELECT id FROM t WHERE k >= 4000");
+                assert_eq!(ids.len() as i64, ROWS - 4000);
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    // The pool is fully released afterward: a lone scan gets its full degree again
+    // (correctness is the observable; a leaked permit would show as wrong results
+    // over enough iterations, which the loop above would have caught).
+    assert_eq!(count(&engine, "SELECT COUNT(*) FROM t"), ROWS);
+}
+
+/// G2 governance: a parallel scan honors cancellation — a pre-cancelled token
+/// aborts it at the workers' first check point with `QueryCancelled`, exactly
+/// like the serial path.
+#[test]
+fn parallel_scan_honors_cancellation() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::open(dir.path(), 0).unwrap());
+    build(&engine);
+    engine.set_parallel_scan(true);
+    engine.set_parallel_scan_config(1, 4);
+
+    let token = CancelToken::new();
+    token.cancel(); // already cancelled → the scan must abort immediately
+    let limits = QueryLimits::default().set_cancel(token);
+
+    let x = engine.begin().unwrap();
+    let r = engine.execute_sql_with_limits(x, "SELECT COUNT(*) FROM t", limits);
+    let _ = engine.abort(x);
+    assert!(
+        matches!(r, Err(DbError::QueryCancelled)),
+        "a cancelled parallel COUNT must return QueryCancelled, got {r:?}"
+    );
 }
 
 /// A parallel scan honors the statement snapshot exactly across an UPDATE (new

@@ -25,6 +25,18 @@ resolved candidates serially. `parallel_resolve_candidates` partitions the
 candidate `RowId` list across workers (`heap::get_visible` + the B2 per-row
 closure). Result: **6.41×** at 500k rows.
 
+**Worker governance + default-ON — DONE (2026-07-11, item 15,
+`15_parallel_worker_governance.md`):** parallel scan shipped **default-off**
+because it lacked a global worker cap and didn't propagate timeout/cancellation
+into workers. Item 15 added a process-wide worker budget (`WorkerLease` RAII
+admission — total live workers never exceed `UNIDB_PARALLEL_MAX_TOTAL_WORKERS`,
+extra queries degrade to serial) and a `snapshot_deadline()` that workers check
+every few pages (`QueryTimeout`/`QueryCancelled`), then **flipped it default-ON**
+(`ENABLED = true`; `UNIDB_PARALLEL_SCAN=0` / `set_parallel_scan(false)` remain the
+field revert). This is also why `report.sh` previously showed no parallel win —
+the bench never set the toggle, so it ran serial; default-on the bench now shows
+it (Table 3.1 @1M ~5.6M → **~35.7M rec/s**).
+
 **Filed follow-ups (not yet done):**
 - `SUM`/`AVG`/`GROUP BY` partial aggregate (only `COUNT(*)` is pushed into workers
   so far — needs per-worker partial states + a gather-merge).

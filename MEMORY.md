@@ -12,6 +12,26 @@
 
 ## Current status
 
+- **Parallel worker governance (backlog item 15) — SHIPPED (2026-07-11), branch
+  `parallel-worker-governance`, PR pending.** Closed the two real blockers that
+  kept parallel scan default-off, then **flipped it default-ON**. This also
+  explains why `report.sh` showed no parallel win — the bench never set
+  `UNIDB_PARALLEL_SCAN`, so it ran serial; default-on now shows it (Table 3.1 @1M
+  scan 5.6M → **35.7M rec/s** with no env). Read-only → crash **29**, no format
+  bump, no §3.
+  - **G1 global cap:** process-wide worker budget (`GLOBAL_MAX`/`AVAILABLE`) +
+    `WorkerLease` RAII admission (`acquire()` CAS-takes `min(degree, available)`,
+    releases on Drop even on `?`; `<2` → serial). **Total live workers never
+    exceed the cap across all concurrent queries** — no more M×N oversubscription.
+    `UNIDB_PARALLEL_MAX_TOTAL_WORKERS` / `Engine::set_parallel_scan_max_total_workers`.
+  - **G2 timeout/cancel:** `query_limits::snapshot_deadline()` (Send+Sync deadline
+    + CancelToken); workers check every few pages → `QueryTimeout`/`QueryCancelled`.
+    A runaway parallel scan is now interruptible like the serial path.
+  - **G4 default-ON** (`ENABLED = true`); `UNIDB_PARALLEL_SCAN=0` /
+    `set_parallel_scan(false)` remain the field revert. Tests:
+    `parallel_scan_global_cap_bounds_concurrency`, `parallel_scan_honors_cancellation`.
+    Full lib (373) + crash (29) green default-on. Detail: `PROGRESS.md` "Parallel
+    worker governance (item 15)"; `docs/backlog/15_parallel_worker_governance.md`.
 - **Milestone P follow-up — parallel filtered SELECT — SHIPPED (2026-07-11),
   branch `parallel-index-select`, PR pending.** Closes the worst remaining ÷PG
   gap: filtered `SELECT … WHERE k …` (~0.14× vs PG) routes through the B-tree
@@ -2733,6 +2753,26 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-11 — Parallel worker governance + default-on, branch `parallel-worker-governance`
+
+Backlog item 15 (`15_parallel_worker_governance.md`). Commit `df068bb`.
+
+- **Root-caused a user report** ("report.sh shows no parallel improvement"):
+  verified in code that parallel scan was `ENABLED = false` (default-off) AND
+  nothing in `decompose.rs`/`scripts/`/`docker/` set `UNIDB_PARALLEL_SCAN` — so
+  `report.sh` ran the *serial* path. Reproduced both: serial 5.6M vs parallel 35M
+  at 1M, same code path. **Neither the report nor my earlier metrics were wrong —
+  different configs** (the toggle). Lesson: a shipped-but-dark feature is invisible
+  to the canonical benchmark; wire the bench (or default-on) so it reflects reality.
+- **The user pushed on "why off?"** — the honest answer was real governance gaps
+  (verified: no global worker cap → M×N oversubscription; no timeout propagation
+  into workers), not caution. Built the governance: G1 global cap (WorkerLease
+  admission), G2 deadline/cancel snapshot into workers, G3 load-tests, G4 flip
+  default-on. Now `report.sh` shows the win by default.
+- First backlog item under the new numbering convention: created
+  `15_parallel_worker_governance.md`, registered #15 in `docs/backlog/README.md`.
+  Read-only; crash 29; default-on but `UNIDB_PARALLEL_SCAN=0` reverts.
 
 ### 2026-07-11 — Parallel filtered SELECT, branch `parallel-index-select`
 
