@@ -13,7 +13,7 @@
 ## Current status
 
 - **REST API enrichment (backlog item 12) — SHIPPED (2026-07-11), branch
-  `claude/rest-api-enrichment-vly934`, PR pending.** The last filed
+  `claude/rest-api-enrichment-vly934`, PR #43 (merged).** The last filed
   NOT-STARTED backlog item; **server-layer only** (engine gains just two
   delegating pub methods: `set_rls_policy_sql` — RLS policy parsed from a SQL
   predicate string via the ordinary parser, no `Expr` wire format —
@@ -2852,7 +2852,9 @@ plain reporting.
   rows instead of 2 in `cross_row_update_deadlock_resolves_no_hang`; filed
   as item 16 + known-issue in `index_write_concurrency.md`; blocks that
   toggle's default-ON flip. Production default (off) unaffected.
-- **Next:** raise the PR; candidates: item 16 (root-cause the anomaly),
+- PR #43 raised and merged same day (squash, `9635f7f`); the PR-reference
+  docs fix landed as an immediate follow-up PR.
+- **Next** candidates: item 16 (root-cause the anomaly),
   17 HOT update, parallel-scan follow-ups, attach-client sessions.
 
 ### 2026-07-11 — Expert lens codified in CLAUDE.md §0.6, branch `claude/report-script-performance-efcszq`

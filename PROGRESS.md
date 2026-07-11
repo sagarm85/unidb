@@ -3812,7 +3812,7 @@ per-query fair-share of the global pool (today first-come; extras go serial).
 
 ## REST API enrichment (item 12) — transaction sessions & full-surface coverage   [SHIPPED]   2026-07-11
 
-**PR:** branch `claude/rest-api-enrichment-vly934` (PR pending)
+**PR:** [#43](https://github.com/sagarm85/unidb/pull/43) — merged 2026-07-11 (squash, `9635f7f`), branch `claude/rest-api-enrichment-vly934`
 **Summary:** Closes backlog item 12 (`docs/backlog/rest_api_enrichment.md`) —
 the last NOT-STARTED filed item. The REST layer gains real **multi-request
 transaction sessions** (R1: `POST /txn/begin` → statements carrying
