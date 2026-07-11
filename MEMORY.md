@@ -15,7 +15,7 @@
 - **Processing-engines design-doc collection — ADDED (2026-07-11), branch
   `claude/processing-engines-design-docs-dtcp16`, PR #42. Docs only — NO engine
   code touched; no format/crash/§3 impact.** New `docs/design/processing-engines/`
-  (12 documents + index, registered in `docs/design/README.md`): per-engine
+  (12 documents + index, registered in `docs/design/design_index.md`): per-engine
   deep dives (storage core, WAL & recovery, MVCC/txn, SQL, indexing, vector,
   graph, event queue, parallelism + benchmark/metrics analysis,
   server/replication/ops) with Mermaid architecture/flow diagrams, exact
@@ -2807,7 +2807,7 @@ Backlog item 15 (`15_parallel_worker_governance.md`). Commit `df068bb`.
   admission), G2 deadline/cancel snapshot into workers, G3 load-tests, G4 flip
   default-on. Now `report.sh` shows the win by default.
 - First backlog item under the new numbering convention: created
-  `15_parallel_worker_governance.md`, registered #15 in `docs/backlog/README.md`.
+  `15_parallel_worker_governance.md`, registered #15 in `docs/backlog/backlog_index.md`.
   Read-only; crash 29; default-on but `UNIDB_PARALLEL_SCAN=0` reverts.
 
 ### 2026-07-11 — Parallel filtered SELECT, branch `parallel-index-select`
@@ -3137,7 +3137,7 @@ performance — Phase A" entry and the Current-status bullet above.
   `README.md` (comparison + §5 Postgres head-to-heads, reusing M2/M3/M4
   recorded PG numbers incl. the ~100× queue-poll win), `raw-results.md`
   (provenance), `pgvector_bench.sql` (reproducer). Added a `performance/`
-  pointer to `docs/README.md`. No milestone opened/closed; `PROGRESS.md`
+  pointer to `docs/documentation_index.md`. No milestone opened/closed; `PROGRESS.md`
   untouched (no feature shipped).
 
 ### 2026-07-07 — M8 (attach client) merged from worktree; M7 CSR-traversal bug found and fixed; M0-M8 all shipped

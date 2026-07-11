@@ -5,7 +5,7 @@
 > `CLAUDE.md` §9; the roadmap of *numbered* phases lives in `roadmap.md`.
 
 There are four kinds of work. Pick one before you create the file. **Every new
-file is numbered `NN_<slug>.md`** (the next free ID in [`README.md`](README.md)),
+file is numbered `NN_<slug>.md`** (the next free ID in [`backlog_index.md`](backlog_index.md)),
 whatever its type — the `Type` is declared in the header, not the filename.
 
 | Type | What it is | Tracked in |
@@ -18,19 +18,19 @@ whatever its type — the `Type` is declared in the header, not the filename.
 ## Filename rule (the thing that was inconsistent)
 
 - **New backlog files are numbered: `NN_<slug>.md`** — `NN` is the **next free
-  number in [`README.md`](README.md)** (the backlog index), a **stable ID assigned
+  number in [`backlog_index.md`](backlog_index.md)** (the backlog index), a **stable ID assigned
   once and never renumbered** (so links stay valid; priority/order lives in the
   index's *Next up* section, not the number). `<slug>` is a short `snake_case`
   description — **no `phase` in it, and no internal sub-parts** (name "Phase A/B",
   "checkpoints A1/B2", "P-a/P-b" *inside* the doc, never `..._phaseA_B.md`).
-- **Register every new file in [`README.md`](README.md)** (# / title / type /
+- **Register every new file in [`backlog_index.md`](backlog_index.md)** (# / title / type /
   status) — that index is the single at-a-glance pending-vs-completed tracker and
   where the next number comes from.
 - **Existing files keep their current (un-numbered) names** — the index maps them
   to numbers; don't rename them. The historical `phase<N>_` files keep their names
   (`<N>` there is the roadmap phase number); `phase<N>_` is not a prefix for *new*
   files (use `NN_<slug>.md`).
-- Meta docs stay unnumbered with bare names: `README.md`, `roadmap.md`,
+- Meta docs stay unnumbered with bare names: `backlog_index.md`, `roadmap.md`,
   `CONVENTIONS.md`, `engine_internals_doc_prompt.md`.
 
 ## Header (every backlog file starts with this)

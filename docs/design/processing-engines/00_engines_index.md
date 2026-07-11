@@ -40,7 +40,7 @@ points, Phases 1–6 + Milestone P shipped).
 - **Evaluating the multi-model thesis?** Docs 1, 7, 8, 9 and the benchmark
   analysis in doc 10.
 - **Planning future work?** Doc 12, cross-referenced against
-  `docs/backlog/README.md`.
+  `docs/backlog/backlog_index.md`.
 
 ## Conventions used throughout
 
