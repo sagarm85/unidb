@@ -12,6 +12,55 @@
 
 ## Current status
 
+- **REST API enrichment (backlog item 12) — SHIPPED (2026-07-11), branch
+  `claude/rest-api-enrichment-vly934`, PR pending.** The last filed
+  NOT-STARTED backlog item; **server-layer only** (engine gains just two
+  delegating pub methods: `set_rls_policy_sql` — RLS policy parsed from a SQL
+  predicate string via the ordinary parser, no `Expr` wire format —
+  and `ensure_superuser`). No format bump, **crash harness untouched at 29**,
+  sync invariant holds (`base64` is server-feature-gated).
+  - **R1 transaction sessions:** `POST /txn/begin` (201: txn_id/isolation/
+    expires_at) opens a real client-held txn; `/sql`, `/cypher`, `/rows`
+    (+`/rows/batch`), `/edges` accept `X-Txn-Id` and don't auto-commit;
+    `POST /txn/{id}/commit|rollback` finish. `server/txn_session.rs` registry
+    enforces the spec's hard points: per-session busy try-lock (2nd concurrent
+    request → **409 TXN_BUSY**), JWT-principal binding (**403**), **idle
+    reaper** (Weak-ref tokio task; `UNIDB_TXN_IDLE_TIMEOUT_SECS` default 60)
+    auto-aborts abandoned sessions → horizon un-pinned (verified via `/stats`),
+    stale ids → **404 TXN_NOT_FOUND**. Sessions reject DDL (`DDL_IN_SESSION` —
+    engine DDL rollback is request-scoped per P2.c, so allowing it would break
+    session rollback); a failed mutating statement aborts the session
+    (Postgres-without-savepoints); failed pure reads keep it open.
+  - **R2:** optional `isolation` on one-shot `POST /sql` (rc/rr/serializable;
+    takes the transactional path so the level governs). Write-skew over HTTP
+    (session + one-shot serializable) rejected 409 — SSI participation proven.
+  - **R3:** `POST /events/vacuum` (M4 all-consumers contract), superuser-gated
+    `PUT /tables/{table}/rls` + `POST /admin/flush`.
+  - **R4:** `POST /rows/batch` (base64, ≤10k rows/32 MiB, decode-validated
+    before any insert, atomic, session-aware) and result cursors
+    (`POST /sql {"cursor": true}` → `GET /sql/cursor/{id}?limit=`,
+    principal-bound, idle-expiring; honest caveat documented: decoded rows
+    stay buffered server-side — the sync executor materializes; the cursor
+    bounds each response's JSON).
+  - **Measured (release, Linux container, `benches/server.rs`
+    `rest_enrichment`): 100 INSERTs 161.3 ms one-shot → 33.9 ms in a session
+    (4.8×, 100 fsyncs → 1); 500 raw rows 718.4 ms singles → 35.0 ms batched
+    (20.5×).** Peak RSS 43 MB.
+  - +24 integration tests (`tests/server_txn.rs`, `tests/server_enrich.rs`,
+    both registered with `required-features` — the #28 lesson); `ApiError` is
+    now an enum (Db | server-layer Api codes). §9 staleness fixed in passing:
+    `REST_API.md` intro (still described the retired writer-thread design) +
+    error table (missing P5.d/P5.f/P6.b/P6.e codes); `engine_design.md`
+    §8/§9/RLS/module-map/footer; README status/env/layout/attach notes.
+  - **⚠ Found during verification, NOT caused by this work (reproduced on
+    unmodified `main` @ dc93931): pre-existing MVCC visibility anomaly under
+    `UNIDB_CONCURRENT_SQL_WRITES`** — `cross_row_update_deadlock_resolves_
+    no_hang` under CPU contention (6 parallel test-binary instances) can end
+    with 3 visible rows instead of 2 (~1–5/6 fail per round; always green in
+    isolation, so per-PR gates never saw it). Filed: backlog_index "Next up"
+    item 16 + a known-issue section in `index_write_concurrency.md`. **Blocks
+    item 11's planned default-ON flip**; production default (off) unaffected.
+  - Follow-ups filed: attach-client session support (optional); item 16 above.
 - **Processing-engines design-doc collection — ADDED (2026-07-11), branch
   `claude/processing-engines-design-docs-dtcp16`, PR #42. Docs only — NO engine
   code touched; no format/crash/§3 impact.** New `docs/design/processing-engines/`
@@ -2622,6 +2671,18 @@ plain reporting.
 
 ## Known issues / tech debt
 
+- **MVCC visibility anomaly under `UNIDB_CONCURRENT_SQL_WRITES` (item 11's
+  default-OFF toggle) — OPEN, found 2026-07-11 during item-12 verification,
+  NOT caused by it (reproduced on unmodified `main` @ `dc93931`).**
+  `tests/concurrent_writers.rs::cross_row_update_deadlock_resolves_no_hang`
+  under CPU contention (run the test binary 6× in parallel, filter
+  `cross_row`) intermittently ends with **3 visible rows instead of 2** after
+  two threads churn cross-row UPDATEs on a B-tree-indexed table — a
+  superseded/aborted version stays visible to a later scan. ~1–5/6 parallel
+  instances fail per round (Linux, 18 cores, debug); always green in
+  isolation, so per-PR gates never caught it. **Blocks the toggle's planned
+  default-ON flip.** Filed: `backlog_index.md` "Next up" item 16 + known-issue
+  section in `docs/backlog/index_write_concurrency.md`.
 - ~~**Read-only transactions pay a full commit fsync for nothing**~~
   **FIXED 2026-07-08** (branch `m9-group-commit`): `TransactionManager::
   commit` skips `commit_user_txn` when `undo_log.is_empty()`. Point SELECT
@@ -2765,6 +2826,34 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-11 — REST API enrichment (item 12) shipped, branch `claude/rest-api-enrichment-vly934`
+
+- Implemented all four checkpoints of `docs/backlog/rest_api_enrichment.md`
+  (the last NOT-STARTED item): R1 transaction sessions (`X-Txn-Id`,
+  begin/commit/rollback, busy→409, principal→403, idle reaper, stale→404),
+  R2 one-shot `isolation` on `/sql`, R3 `POST /events/vacuum` +
+  superuser-gated `PUT /tables/{t}/rls` (`Engine::set_rls_policy_sql`,
+  SQL-predicate-string policy) + `POST /admin/flush`, R4 `POST /rows/batch`
+  + principal-bound idle-expiring result cursors. Server-layer only; crash
+  harness stays 29; sync invariant clean.
+- +24 integration tests (`server_txn.rs`, `server_enrich.rs`, registered
+  with `required-features`); `ApiError` → enum; unit tests for the session
+  registry + cursor store. Full battery green: 373 default + 29 crash +
+  server suites, clippy/fmt/workspace clean.
+- Self-initiated benchmark (§0.6): sessions amortize commit fsyncs — 100
+  INSERTs 161.3→33.9 ms (**4.8×**); batch insert 500 rows 718.4→35.0 ms
+  (**20.5×**); peak RSS 43 MB. Recorded in `PROGRESS.md`.
+- §9 staleness fixed in passing: `REST_API.md` intro (retired writer-thread
+  description) + incomplete error table; `engine_design.md` §8/§9/RLS/
+  module-map/footer; README status/env-table/layout/attach-client notes.
+- **Found (and proved pre-existing on `main`): MVCC visibility anomaly under
+  `UNIDB_CONCURRENT_SQL_WRITES` when the box is CPU-contended** — 3 visible
+  rows instead of 2 in `cross_row_update_deadlock_resolves_no_hang`; filed
+  as item 16 + known-issue in `index_write_concurrency.md`; blocks that
+  toggle's default-ON flip. Production default (off) unaffected.
+- **Next:** raise the PR; candidates: item 16 (root-cause the anomaly),
+  17 HOT update, parallel-scan follow-ups, attach-client sessions.
 
 ### 2026-07-11 — Expert lens codified in CLAUDE.md §0.6, branch `claude/report-script-performance-efcszq`
 

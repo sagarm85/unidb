@@ -2,12 +2,18 @@
 
 Covers the optional `unidb-server` binary (M5, gated behind the `server`
 Cargo feature). Source of truth for this document: `src/server/router.rs`,
-`handlers.rs`, `dto.rs`, `auth.rs`, `sse.rs`, `error.rs`.
+`handlers.rs`, `dto.rs`, `auth.rs`, `sse.rs`, `error.rs`,
+`txn_session.rs` (transaction sessions, R1), `cursor.rs` (result cursors,
+R4).
 
-This is a thin HTTP wrapper over the embedded `Engine`. Every mutating
-route runs exactly one `begin -> execute -> commit-or-abort` cycle on a
-single dedicated writer thread (`src/server/engine_handle.rs`; see
-`CLAUDE.md` §2 for the overall layer stack). It is **not** a
+This is a thin HTTP wrapper over the embedded `Engine`. By default every
+mutating route runs exactly one `begin -> execute -> commit-or-abort`
+cycle; since Phase 5 (P5.e-3) requests execute **concurrently** over one
+shared `Arc<Engine>` via `spawn_blocking` (`src/server/engine_handle.rs`;
+an earlier version of this document described the retired M5
+single-writer-thread design). Requests may instead join a client-held
+**transaction session** via the `X-Txn-Id` header — see
+[Transaction sessions](#transaction-sessions). It is **not** a
 resource-oriented, auto-generated API in the PostgREST sense — `/sql` and
 `/cypher` accept raw query text in the request body.
 
@@ -29,11 +35,13 @@ resource-oriented, auto-generated API in the PostgREST sense — `/sql` and
   ```
 
   See [Error codes](#error-codes) for the full status/code table.
-- **Transactions**: nearly every route is a single, complete, self-contained
-  transaction. `POST /txn/begin` exists for introspection/debugging only —
-  there is no way to later `commit`/`abort` that `xid` over a separate HTTP
-  request. Multi-statement atomicity is available today via one
-  `;`-separated `/sql` body, not via separate begin/commit calls.
+- **Transactions**: with no `X-Txn-Id` header, every route is a single,
+  complete, self-contained transaction (multi-statement atomicity in one
+  request via a `;`-separated `/sql` body). With an `X-Txn-Id` header, the
+  request runs inside an open [transaction session](#transaction-sessions)
+  and does **not** auto-commit. (Historical note: before the REST-enrichment
+  work, `POST /txn/begin` was introspection-only with no way to commit over
+  a later request — that limitation is gone.)
 
 ---
 
@@ -70,21 +78,88 @@ in production instead).
 
 ---
 
-## Routes
+## Transaction sessions
+
+A **transaction session** is a real, client-held engine transaction spanning
+multiple HTTP requests (REST enrichment R1).
 
 ### `POST /txn/begin`
 
-Open a transaction for introspection/debugging. Not part of the primary
-request flow (see [Conventions](#conventions)).
-
-**Payload**: none.
-
-**Response** `200 OK`:
+**Payload** (optional; empty body = `read_committed`):
 ```json
-{ "xid": 42 }
+{ "isolation": "read_committed" | "repeatable_read" | "serializable" }
 ```
 
+**Response** `201 Created`:
+```json
+{
+  "txn_id": 42,
+  "xid": 42,
+  "isolation": "read_committed",
+  "idle_timeout_secs": 60,
+  "expires_at": "2026-07-11 12:34:56"
+}
+```
+`xid` is a compatibility alias for `txn_id` (the field name of the old
+introspection-only route). `expires_at` is the **sliding** idle deadline:
+every completed request on the session pushes it out by
+`idle_timeout_secs` again.
+
+### Statements inside a session
+
+`POST /sql`, `POST /cypher`, `POST /rows`, `POST /rows/batch`,
+`GET/PUT/DELETE /rows/{page_id}/{slot}`, `POST /edges`,
+`DELETE /edges/{page_id}/{slot}`, and `GET /edges/from/{from_id}` accept:
+
+```
+X-Txn-Id: <txn_id>
+```
+
+The operation then runs under that transaction and does **not**
+auto-commit. The session sees its own uncommitted writes; a
+`repeatable_read`/`serializable` session keeps one stable snapshot across
+all its requests.
+
+### `POST /txn/{txn_id}/commit` · `POST /txn/{txn_id}/rollback`
+
+Finish the session. `200 OK` with `{"txn_id": 42, "state": "committed"}`
+(or `"rolled_back"`). Either way the `txn_id` is gone afterwards — a
+`SERIALIZATION_FAILURE` on commit (SSI, P1.d) reports `409` on an
+already-rolled-back, fully cleaned-up transaction; the client just
+re-begins and retries.
+
+### Session rules (the contract)
+
+- **One statement at a time.** A session's transaction state is not safe
+  for concurrent requests; a second request while one is executing gets
+  `409 TXN_BUSY` (other sessions and one-shot requests are unaffected —
+  they run concurrently).
+- **Idle sessions are reaped.** An abandoned open transaction holds row
+  locks and pins the MVCC vacuum horizon, so a background reaper
+  auto-aborts any session idle longer than `UNIDB_TXN_IDLE_TIMEOUT_SECS`
+  (default 60). A reaped/finished/unknown `txn_id` returns
+  `404 TXN_NOT_FOUND`.
+- **Principal-bound.** The session belongs to the JWT `sub` that created
+  it; another principal presenting the id gets `403 TXN_FORBIDDEN`.
+- **Ephemeral.** Session ids do not survive a server restart (recovery
+  aborts in-flight transactions).
+- **No DDL.** Catalog DDL (`CREATE/ALTER/DROP/TRUNCATE/ANALYZE`) and auth
+  DDL are rejected inside a session with `400 DDL_IN_SESSION` — the
+  engine's DDL rollback is request-scoped (P2.c), not transaction-scoped.
+  Run DDL as one-shot requests.
+- **A failed mutating statement aborts the session** (it may have left
+  partial effects): the transaction is rolled back and the `txn_id`
+  destroyed — Postgres-without-savepoints semantics. Failed *pure reads*
+  (`GET /rows/…`, `GET /edges/from/…`) leave the session open; requests
+  rejected before execution (busy, DDL, authorization) also leave it open.
+- **Isolation is fixed at begin**; an `isolation` field on a session
+  statement returns `400 ISOLATION_IN_SESSION`.
+- An open session blocks the quiescence-gated auto-checkpoint (P1.e) like
+  any open transaction — another reason the idle reaper is non-negotiable.
+
 ---
+
+## Routes
 
 ### `POST /sql`
 
@@ -113,6 +188,24 @@ never re-parsed as SQL:
 A JSON string binds as text (later coerced to the column's type — UUID,
 TIMESTAMP, etc.), a number as int/float, a numeric array as a vector. Omitting
 `params` (or an empty array) runs the SQL as-is.
+
+**One-shot isolation (R2)** — optional `isolation` field
+(`"read_committed"` | `"repeatable_read"` | `"serializable"`) runs the
+request as a single transaction at that level without opening a session
+(e.g. a lone `serializable` statement participates in SSI conflict
+detection and can be refused with `409 SERIALIZATION_FAILURE`). An
+explicit level takes the transactional path (skipping the concurrent-read
+fast path) so the chosen level actually governs the statement. Rejected
+inside a session (`400 ISOLATION_IN_SESSION`).
+
+**Cursor mode (R4)** — `"cursor": true` requires the request to be exactly
+one rows-producing statement (SELECT/query/EXPLAIN — validated **before**
+execution, `400 CURSOR_NOT_ROWS` otherwise), buffers the result
+server-side, and responds with a cursor instead of the rows:
+```json
+{ "cursor_id": 7, "columns": ["id", "body"], "row_count": 120000 }
+```
+Page it with [`GET /sql/cursor/{id}`](#get-sqlcursorcursor_id--delete-sqlcursorcursor_id).
 
 **Response** `200 OK` — one result object per statement, in order:
 ```json
@@ -170,6 +263,32 @@ HTTP 404
 
 ---
 
+### `GET /sql/cursor/{cursor_id}` · `DELETE /sql/cursor/{cursor_id}`
+
+Page (or drop) a cursor opened by `POST /sql` with `"cursor": true` (R4).
+
+**Query parameters**: `limit` — rows per page, default 1000, capped at
+10 000.
+
+**Response** `200 OK`:
+```json
+{ "columns": ["id"], "rows": [[1], [2]], "done": false, "remaining": 118000 }
+```
+The final page reports `"done": true` and the cursor is dropped; fetching
+it again returns `404 CURSOR_NOT_FOUND`. Cursors are bound to the creating
+principal (`403 CURSOR_FORBIDDEN` otherwise) and expire after
+`UNIDB_CURSOR_IDLE_TIMEOUT_SECS` (default 60) of inactivity. `DELETE`
+drops a cursor early (`204`).
+
+**Honest cost model:** the engine's executor is synchronous and returns a
+fully-materialized result, so the decoded rows stay buffered server-side
+for the cursor's lifetime. What a cursor avoids is serializing (and
+transferring) one giant JSON array in a single response — every individual
+response stays bounded. True incremental executor streaming would be an
+engine change, deliberately out of scope (the engine stays sync, §4).
+
+---
+
 ### `POST /cypher`
 
 Execute a Cypher subset query (`MATCH ... WHERE ... RETURN ...`) against
@@ -202,6 +321,29 @@ Insert one raw row. Body is opaque bytes — unidb does not interpret them
 ```json
 { "row_id": { "page_id": 3, "slot": 0 } }
 ```
+
+---
+
+### `POST /rows/batch`
+
+Insert up to 10 000 raw rows atomically in one transaction (R4): all inserts
+succeed and commit together, or nothing lands. Row payloads are
+**base64-encoded** (they are opaque bytes; JSON cannot carry them
+verbatim). Every entry is decoded and bounds-checked (32 MiB total decoded)
+*before* the first insert runs, so a malformed entry rejects the whole
+request up front. Session-aware via `X-Txn-Id`.
+
+**Payload**:
+```json
+{ "rows": ["aGVsbG8=", "d29ybGQ="] }
+```
+
+**Response** `201 Created`:
+```json
+{ "row_ids": [ { "page_id": 3, "slot": 0 }, { "page_id": 3, "slot": 1 } ] }
+```
+
+**Errors**: `400 EMPTY_BATCH` / `400 BAD_BASE64` / `400 BATCH_TOO_LARGE`.
 
 ---
 
@@ -445,6 +587,55 @@ redelivered on a future subscribe/poll.
 
 ---
 
+### `POST /events/vacuum`
+
+Reclaim fully-consumed events (R3): deletes every `__events__` row whose
+`seq` is at or below the **minimum** acked offset across *all* registered
+consumers — the M4 slow-consumer durability contract (an event outlives
+vacuum until its slowest consumer has durably acked past it; with no
+consumer registered, nothing is reclaimable).
+
+**Payload**: none.
+
+**Response** `200 OK`:
+```json
+{ "reclaimed": 17 }
+```
+
+---
+
+### `PUT /tables/{table}/rls`
+
+Attach a row-level-security policy to a table (R3), as a **SQL predicate
+string** — the same AND-only comparison subset `WHERE` accepts, parsed by
+the ordinary SQL parser (chosen over a JSON policy DSL so there is exactly
+one grammar). The policy is AND-rewritten into every query on the table.
+**Superuser-gated** (P6.e semantics): RLS is an access-control boundary.
+
+**Payload**:
+```json
+{ "predicate": "tenant_id = 7" }
+```
+
+**Response**: `204 No Content`. `400 SQL_PARSE_ERROR`/`SQL_UNSUPPORTED`
+for a malformed or non-AND-only predicate (e.g. `OR`), `404
+TABLE_NOT_FOUND`, `403 PERMISSION_DENIED` for a non-superuser.
+
+---
+
+### `POST /admin/flush`
+
+Force the WAL durable, then flush every dirty page (`Engine::flush`,
+previously test-only; R3). **Superuser-gated** — an I/O-amplification
+lever, not a data-plane operation. In open/bootstrap mode (no registered
+users) any authenticated principal passes, matching every other P6.e gate.
+
+**Payload**: none.
+
+**Response**: `204 No Content`.
+
+---
+
 ### `POST /checkpoint`
 
 Trigger `Engine::checkpoint()` manually: flush dirty pages, write a
@@ -467,9 +658,12 @@ A `pg_stat_*`-style activity snapshot.
   "commits": 42, "aborts": 3, "checkpoints": 1,
   "active_transactions": 0, "wal_bytes": 81920,
   "replication_slots": 1, "max_replication_lag": 128,
-  "data_pages": 37, "recent_slow_queries": [{"sql": "...", "micros": 4210}]
+  "data_pages": 37, "recent_slow_queries": [{"sql": "...", "micros": 4210}],
+  "open_txn_sessions": 0, "open_cursors": 0
 }
 ```
+`open_txn_sessions` / `open_cursors` are server-layer gauges (R1/R4) added
+alongside the engine counters.
 
 ---
 
@@ -526,45 +720,80 @@ Every error maps through `src/server/error.rs::map_status`. Client-facing
 else (low-level storage/recovery errors a well-formed request should never
 trigger) falls into one grouped 500.
 
+Server-layer codes (transaction sessions R1, cursors/batch R4) are emitted
+by `server/error.rs`'s `ApiError` directly, not by a `DbError` variant.
+
+> **Correction (R-enrichment docs pass, 2026-07-11):** this table had gone
+> stale — `DEADLOCK`, `QUERY_TIMEOUT`/`QUERY_CANCELLED`,
+> `REPLICATION_ERROR`, `AUTHZ_ERROR`, and `PERMISSION_DENIED` shipped with
+> P5.d/P5.f/P6.b/P6.e but were only mentioned in prose (or not at all).
+> They are listed properly below.
+
 | HTTP status | `code` | Triggered by |
 |---|---|---|
 | 404 | `TABLE_NOT_FOUND` | Referenced table doesn't exist |
 | 404 | `COLUMN_NOT_FOUND` | Referenced column doesn't exist |
 | 404 | `NOT_FOUND` | Row has no MVCC-visible version (deleted/never existed) |
+| 404 | `TXN_NOT_FOUND` | Unknown/finished/reaped transaction session id (R1) |
+| 404 | `CURSOR_NOT_FOUND` | Unknown/exhausted/expired cursor id (R4) |
 | 409 | `TABLE_ALREADY_EXISTS` | `CREATE TABLE` on an existing name |
 | 409 | `WRITE_CONFLICT` | Concurrent write conflict (lock manager) |
-| 409 | `SERIALIZATION_FAILURE` | Snapshot-isolation abort-on-conflict |
+| 409 | `SERIALIZATION_FAILURE` | Snapshot-isolation / SSI abort-on-conflict |
+| 409 | `DEADLOCK` | Wait-for-graph deadlock victim (P5.d) |
+| 409 | `TXN_BUSY` | Second concurrent request on one session (R1) |
+| 409 | `UNIQUE_VIOLATION` | Write duplicated a `UNIQUE`/`PRIMARY KEY` value (M11) |
+| 408 | `QUERY_TIMEOUT` / `QUERY_CANCELLED` | Per-query time budget / cancellation (P5.f) |
+| 403 | `TXN_FORBIDDEN` | Session belongs to a different JWT principal (R1) |
+| 403 | `CURSOR_FORBIDDEN` | Cursor belongs to a different JWT principal (R4) |
+| 403 | `PERMISSION_DENIED` | Missing per-user privilege / superuser gate (P6.e) |
 | 400 | `SQL_PARSE_ERROR` | Malformed SQL |
 | 400 | `SQL_PLAN_ERROR` | SQL that parses but doesn't plan (e.g. bad rewrite) |
 | 400 | `SQL_UNSUPPORTED` | Valid SQL outside unidb's supported subset |
 | 400 | `NOT_NULL_VIOLATION` | Write left a `NOT NULL`/PK column NULL (M11) |
-| 409 | `UNIQUE_VIOLATION` | Write duplicated a `UNIQUE`/`PRIMARY KEY` value (M11) |
 | 400 | `CHECK_VIOLATION` | Write failed a `CHECK` constraint (M11) |
 | 400 | `FOREIGN_KEY_VIOLATION` | `FOREIGN KEY` references a table that doesn't exist (M11) |
 | 400 | `TXN_NOT_ACTIVE` | Operation on a transaction that isn't active |
 | 400 | `TXN_ALREADY_FINISHED` | Operation on an already committed/aborted txn |
 | 400 | `BAD_PAGE_SIZE` | Invalid page size at open |
+| 400 | `BAD_TXN_ID` | Malformed `X-Txn-Id` header (R1) |
+| 400 | `DDL_IN_SESSION` | Catalog/auth DDL inside a transaction session (R1) |
+| 400 | `ISOLATION_IN_SESSION` | `isolation` field on a session statement (R1/R2) |
+| 400 | `BAD_REQUEST_BODY` | Malformed `POST /txn/begin` body (R1) |
+| 400 | `CURSOR_NOT_ROWS` | Cursor mode on a non-rows statement (R4) |
+| 400 | `EMPTY_BATCH` / `BAD_BASE64` / `BATCH_TOO_LARGE` | Invalid `POST /rows/batch` payload (R4) |
+| 400 | `REPLICATION_ERROR` | Bad slot request — duplicate/unknown name (P6.b) |
+| 400 | `AUTHZ_ERROR` | Malformed users/roles/GRANT statement (P6.e) |
 | 401 | `UNAUTHORIZED` | Missing/malformed/wrong-signature/expired JWT |
 | 503 | `DURABILITY_FAILURE` | An `fsync`/`msync` failed (P1.b, fsyncgate); the engine can no longer guarantee durability and must be restarted (session is poisoned) |
-| 500 | `INTERNAL_ERROR` | I/O, checksum, WAL corruption, control-file corruption, catalog corruption, buffer pool exhaustion, or a dead writer thread (`EngineUnavailable`) |
+| 500 | `INTERNAL_ERROR` | I/O, checksum, WAL corruption, control-file corruption, catalog corruption, buffer pool exhaustion, or an unavailable engine (`EngineUnavailable`) |
 
 ---
 
 ## Known limitations
 
-See `PROGRESS.md`'s M5 entry for the full, current list (multi-request
-transaction sessions, RLS-over-REST, gRPC, TLS termination, connection
-pooling — all explicitly out of scope for v1, not oversights).
+Formerly-listed v1 gaps now closed by the REST-enrichment work (item 12):
+multi-request **transaction sessions** (R1), **RLS-over-REST** (R3),
+`vacuum_events`/`flush` routes (R3), batch insert + large-result cursors
+(R4). TLS termination shipped earlier with P6.f.
+
+Still out of scope (deliberate, not oversights): gRPC / a Postgres wire
+protocol (parked), server-side connection pooling, cursor results that
+stream incrementally from the executor (the engine is sync; cursors buffer
+decoded rows server-side — see the cursor cost model above), and session
+support in the Rust attach client (below).
 
 ---
 
 ## Rust attach client
 
-`unidb-attach` (M8) is a Rust crate wrapping every route above in a
-one-shot, blocking method call (`AttachClient::execute_sql`, `insert`,
+`unidb-attach` (M8) is a Rust crate wrapping the one-shot routes above in
+blocking method calls (`AttachClient::execute_sql`, `insert`,
 `create_edge`, `edges_from`, `set_column_index`, `enable_events`, etc.) —
 no new wire format, just `reqwest::blocking` + the same JSON shapes
-documented in this file. It does not expose `vacuum_events`, `vacuum`
-(M10 heap GC), `set_rls_policy`, or `flush`, since none of those have a
-REST route to call. See the repo root [`README.md`](../README.md#rust-attach-client-unidb-attach-m8)
-and [`unidb-attach/src/lib.rs`](../unidb-attach/src/lib.rs).
+documented in this file. It stays **one-shot**: it does not yet expose the
+R1 transaction sessions (an optional follow-up — the wire surface is just
+the `X-Txn-Id` header), nor the newer R3/R4 routes (`/events/vacuum`,
+`/tables/{table}/rls`, `/admin/flush`, `/rows/batch`, `/sql` cursors) or
+M10 heap `vacuum` (which still has no route). See the repo root
+[`README.md`](../README.md#rust-attach-client-unidb-attach-m8) and
+[`unidb-attach/src/lib.rs`](../unidb-attach/src/lib.rs).

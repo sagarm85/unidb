@@ -3809,3 +3809,105 @@ clippy/fmt clean; `cargo tree` tokio-free (`std::thread`).
 not a safety issue); `SUM`/`GROUP BY` partial aggregate; `LIMIT` early-stop;
 per-query fair-share of the global pool (today first-come; extras go serial).
 **Locked-decision changes:** none.
+
+## REST API enrichment (item 12) — transaction sessions & full-surface coverage   [SHIPPED]   2026-07-11
+
+**PR:** branch `claude/rest-api-enrichment-vly934` (PR pending)
+**Summary:** Closes backlog item 12 (`docs/backlog/rest_api_enrichment.md`) —
+the last NOT-STARTED filed item. The REST layer gains real **multi-request
+transaction sessions** (R1: `POST /txn/begin` → statements carrying
+`X-Txn-Id` on `/sql`, `/cypher`, `/rows(+batch)`, `/edges` → `POST
+/txn/{id}/commit|rollback`), one-shot **isolation selection** on `POST /sql`
+(R2), the deferred M8 admin routes (R3: `POST /events/vacuum`,
+superuser-gated `PUT /tables/{table}/rls` via new
+`Engine::set_rls_policy_sql`, superuser-gated `POST /admin/flush`), and
+**atomic batch insert + large-result cursors** (R4: `POST /rows/batch`,
+`POST /sql {"cursor": true}` + `GET/DELETE /sql/cursor/{id}`). Server-layer
+only: the engine gains exactly two delegating public methods
+(`set_rls_policy_sql` — parses the policy as a SQL predicate string through
+the ordinary parser, so no `Expr` wire format exists; `ensure_superuser`).
+New modules `server/txn_session.rs` (registry: per-session busy try-lock →
+`409 TXN_BUSY`; principal binding → `403`; **idle reaper** on a `Weak`-ref
+background task auto-aborts abandoned sessions so a dropped client cannot
+pin the MVCC vacuum horizon — verified via `/stats
+active_transactions == 0` after expiry) and `server/cursor.rs`
+(principal-bound, idle-expiring buffered result pages). `ApiError` became a
+two-variant enum so server-layer codes don't pollute the engine's `DbError`.
+
+**Design decisions made in-implementation (documented in `REST_API.md`):**
+DDL (catalog + auth) is **rejected in sessions** (`400 DDL_IN_SESSION`) —
+the engine's DDL rollback is request-scoped (P2.c), so allowing DDL in a
+session would make `rollback` silently not roll it back; a failed
+*mutating* session statement auto-aborts the session
+(Postgres-without-savepoints; partial statement effects must not be
+committable) while failed pure reads leave it open; cursors were chosen
+over NDJSON streaming, with the honest caveat **in the route doc** that
+decoded rows stay buffered server-side (the executor is sync — what the
+cursor bounds is each response's JSON, not engine-side materialization).
+
+**Benchmarks** (release, Linux 6.18 container, 18 cores; `benches/server.rs`
+`rest_enrichment` group, criterion, 10 samples; ratios are the meaningful
+signal — container fsync is not flush-to-platter, but both sides pay it):
+
+| Workload (per iteration)          | Before (one-shot)     | After (enriched)       | Speed-up |
+|-----------------------------------|-----------------------|------------------------|----------|
+| 100 INSERT stmts over HTTP        | 161.3 ms (1.61 ms/stmt, 100 group-committed fsyncs) | 33.9 ms in one session + commit (0.34 ms/stmt, 1 fsync) | **4.8×** |
+| 500 raw rows over HTTP            | 718.4 ms (500 × `POST /rows`, 1.44 ms/row) | 35.0 ms (one `POST /rows/batch`, 0.070 ms/row) | **20.5×** |
+
+Peak RSS of the whole bench process: **43 MB**. Cursor paging is covered by
+integration tests (25-row/3-page exhaustion, expiry, principal binding);
+its throughput was not separately benchmarked — the win is bounded
+per-response JSON, and the buffering cost model is documented rather than
+claimed away. HTTP-layer overhead vs direct engine calls is unchanged
+(no engine-path change; M5.d numbers stand).
+
+**Tests:** +24 integration tests in two new suites (registered in
+`Cargo.toml` with `required-features = ["server"]` — the PR-#28 lesson):
+`tests/server_txn.rs` (14: multi-request atomic commit/rollback, RR stable
+snapshot across requests, idle auto-abort + horizon release, busy → 409
+(deterministic: a 3000-statement body occupies the session while a probe
+hits it), cross-principal → 403, stale/malformed ids, DDL rejection with
+session survival, failed-statement abort, read-miss leniency, raw-CRUD
+session visibility, per-level one-shot isolation, **serializable
+write-skew rejected 409** — the canonical P1.d doctors schedule with one
+side a session and the other a one-shot two-statement serializable request,
+proving the R2 field participates in SSI) and `tests/server_enrich.rs`
+(10: events-vacuum honors the M4 all-consumers contract (0 reclaimed with
+no consumer, then exactly 2), RLS-over-REST filters + rejects OR/malformed
+predicates + 404s unknown tables + 403s non-superusers, flush gates,
+batch round-trip/bounds/atomicity/session-rollback, cursor
+pagination-to-exhaustion/expiry/early-drop/principal-binding/non-rows
+rejection). `txn_session.rs`/`cursor.rs` carry focused unit tests (busy,
+claim-vs-busy races, sliding idle clock, page math).
+
+**Gates:** default suite 373 + crash harness **29/29** (untouched — no
+storage-path change) + `--features server` suite (incl. the 24 new) green;
+`clippy --workspace --all-targets -D warnings` + `fmt` clean; sync
+invariant holds (`cargo tree -p unidb --no-default-features --edges
+normal` free of tokio/axum/reqwest/base64 — `base64` is server-feature-
+gated only). Stale docs corrected per §9 while passing through:
+`REST_API.md`'s intro still described the retired M5 single-writer-thread
+design (fixed to the P5.e-3 `Arc<Engine>`/`spawn_blocking` shape), and its
+error table was missing P5.d/P5.f/P6.b/P6.e codes (correction note inline);
+`engine_design.md` §8/§9 + RLS section + module map + version footer
+updated.
+
+**Found during verification (NOT caused by this work — reproduced on
+unmodified `main` @ `dc93931`):** a pre-existing MVCC visibility anomaly
+under `UNIDB_CONCURRENT_SQL_WRITES` (item 11's default-OFF toggle):
+`cross_row_update_deadlock_resolves_no_hang` intermittently ends with 3
+visible rows instead of 2 when the machine is under CPU contention (runs
+6× in parallel → ~1–5/6 instances fail per round on main and branch alike;
+always passes in isolation, which is why per-PR gates never caught it).
+Filed as backlog "Next up" item 16 + a known-issue section in
+`index_write_concurrency.md`; **blocks that toggle's planned default-ON
+flip**. Production default (toggle off) unaffected.
+
+**Known limitations / deferred:** attach client stays one-shot (follow-up
+filed); cursors buffer decoded rows server-side (sync executor — by
+design); no Postgres wire protocol (parked); `POST /events/ack`/`vacuum`
+not session-aware (deliberate scope cut — they are operational calls);
+sessions block quiescence-gated auto-checkpoint while open (inherent to
+open transactions, mitigated by the idle reaper; documented).
+**Locked-decision changes:** none (no §3 decision touched; engine stays
+sync — all new async code is behind the `server` feature).

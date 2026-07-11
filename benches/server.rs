@@ -322,11 +322,131 @@ fn bench_concurrent_read_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+/// (6) REST enrichment (R1/R4): what the new surface actually buys.
+/// - `oneshot_100_inserts` vs `session_100_inserts`: 100 INSERT statements
+///   as 100 auto-commit requests (100 group-committed fsyncs) vs 100
+///   requests inside one transaction session + one commit (one fsync).
+/// - `single_500_post_rows` vs `batch_500_rows`: 500 raw rows as 500
+///   `POST /rows` (500 txns) vs one `POST /rows/batch` (one txn).
+fn bench_rest_enrichment(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rest_enrichment");
+    let rt = tokio_rt();
+    let base_url = spawn_bench_server(&rt);
+    let client = reqwest::Client::new();
+    let auth = format!("Bearer {}", bench_token());
+
+    rt.block_on(async {
+        client
+            .post(format!("{base_url}/sql"))
+            .header("Authorization", &auth)
+            .json(&serde_json::json!({"sql": "CREATE TABLE enrich (id INT)"}))
+            .send()
+            .await
+            .unwrap();
+    });
+
+    group.bench_function("oneshot_100_inserts", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                for i in 0..100 {
+                    let resp = client
+                        .post(format!("{base_url}/sql"))
+                        .header("Authorization", &auth)
+                        .json(&serde_json::json!(
+                            {"sql": format!("INSERT INTO enrich (id) VALUES ({i})")}
+                        ))
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(resp.status().as_u16(), 200);
+                }
+            });
+        });
+    });
+
+    group.bench_function("session_100_inserts", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let resp = client
+                    .post(format!("{base_url}/txn/begin"))
+                    .header("Authorization", &auth)
+                    .send()
+                    .await
+                    .unwrap();
+                let txn = resp.json::<serde_json::Value>().await.unwrap()["txn_id"]
+                    .as_u64()
+                    .unwrap();
+                for i in 0..100 {
+                    let resp = client
+                        .post(format!("{base_url}/sql"))
+                        .header("Authorization", &auth)
+                        .header("X-Txn-Id", txn.to_string())
+                        .json(&serde_json::json!(
+                            {"sql": format!("INSERT INTO enrich (id) VALUES ({i})")}
+                        ))
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(resp.status().as_u16(), 200);
+                }
+                let resp = client
+                    .post(format!("{base_url}/txn/{txn}/commit"))
+                    .header("Authorization", &auth)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status().as_u16(), 200);
+            });
+        });
+    });
+
+    use base64::Engine as _;
+    let encoded: Vec<String> = (0..500)
+        .map(|i| {
+            base64::engine::general_purpose::STANDARD.encode(format!("bench-row-{i}").as_bytes())
+        })
+        .collect();
+
+    group.bench_function("single_500_post_rows", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                for i in 0..500 {
+                    let resp = client
+                        .post(format!("{base_url}/rows"))
+                        .header("Authorization", &auth)
+                        .body(format!("bench-row-{i}"))
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(resp.status().as_u16(), 201);
+                }
+            });
+        });
+    });
+
+    group.bench_function("batch_500_rows", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                let resp = client
+                    .post(format!("{base_url}/rows/batch"))
+                    .header("Authorization", &auth)
+                    .json(&serde_json::json!({ "rows": encoded }))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status().as_u16(), 201);
+            });
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(10);
     targets = bench_insert_direct_vs_http, bench_jwt_verification,
               bench_sse_polling_overhead, bench_concurrent_http_throughput,
-              bench_concurrent_read_throughput
+              bench_concurrent_read_throughput, bench_rest_enrichment
 }
 criterion_main!(benches);
