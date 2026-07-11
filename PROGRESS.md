@@ -3444,7 +3444,7 @@ peaks: unidb CPU 83% / mem 232 MiB; postgres CPU 39% / mem 175 MiB.
 **What shipped:** `docker/` (Dockerfile pre-builds the Linux bench,
 docker-compose = Postgres 18 + bench, entrypoint, README) · `scripts/report.sh`
 (single entry point, auto-selects Docker/native) + `docker_report.sh` +
-`mm_resource_report.py` (per-phase docker-stats correlation) · `scripts/README.md`
+`mm_resource_report.py` (per-phase docker-stats correlation) · `scripts/scripts_guide.md`
 · `multi_model_report.sh` GNU-`time -v` RSS path + platform-aware sync-primitive
 header · `decompose.rs` Table 3 remark column + Table 3.1 bulk section +
 `MM_BULK_SIZES` env · `unidb-server` default `UNIDB_DATA_DIR`→`/tmp/unidb` (dev

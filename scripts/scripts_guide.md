@@ -68,7 +68,7 @@ it is a run artifact, not source.
 - **CPU / Memory** — per-phase `docker stats` for the unidb and Postgres
   containers (Docker mode), with the embedded-vs-server asymmetry stated plainly.
 
-The fair-fsync rationale and its caveats live in [`../docker/README.md`](../docker/README.md).
+The fair-fsync rationale and its caveats live in [`../docker/fair_fsync_benchmark.md`](../docker/fair_fsync_benchmark.md).
 
 ---
 
