@@ -12,6 +12,17 @@
 
 ## Current status
 
+- **Processing-engines design-doc collection — ADDED (2026-07-11), branch
+  `claude/processing-engines-design-docs-dtcp16`. Docs only — NO engine code
+  touched; no format/crash/§3 impact.** New `docs/design/processing-engines/`
+  (12 documents + index, registered in `docs/design/README.md`): per-engine
+  deep dives (storage core, WAL & recovery, MVCC/txn, SQL, indexing, vector,
+  graph, event queue, parallelism + benchmark/metrics analysis,
+  server/replication/ops) with Mermaid architecture/flow diagrams, exact
+  on-disk layouts, border-case tables, measured numbers distilled from
+  `PROGRESS.md`, and a **proposal-status** future roadmap
+  (`12_future_roadmap.md` — explicitly not authorization to start work;
+  backlog conventions still apply).
 - **Milestone P follow-up — parallel filtered SELECT — SHIPPED (2026-07-11),
   branch `parallel-index-select`, PR pending.** Closes the worst remaining ÷PG
   gap: filtered `SELECT … WHERE k …` (~0.14× vs PG) routes through the B-tree
@@ -621,7 +632,7 @@
   parked Phase 2 SQL capability plan (`docs/backlog/
   phase2_sql_capability_expansion.md`). See Open questions below for
   what's still unresolved from M1-M5.
-- **Last updated:** 2026-07-10
+- **Last updated:** 2026-07-11
 
 ### Phase 1 — ACID & storage foundation (Core lane, branch `acid-hardening`)
 
