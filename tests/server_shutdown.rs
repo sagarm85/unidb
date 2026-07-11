@@ -23,9 +23,9 @@ use unidb::{
 async fn graceful_shutdown_drains_in_flight_requests_and_preserves_committed_data() {
     let dir = tempdir().unwrap();
     let engine = EngineHandle::spawn(dir.path(), 0).unwrap();
-    let state = AppState {
-        engine: Arc::new(engine),
-    };
+    // `AppState::new` spawns the session reaper holding only `Weak` refs, so
+    // it cannot keep the engine alive past the graceful shutdown below.
+    let state = AppState::new(Arc::new(engine));
     let jwt_config = JwtConfig::new(server_common::TEST_JWT_SECRET);
     let (prometheus_layer, metric_handle) = PrometheusMetricLayer::pair();
     let router = build_router(state, jwt_config, prometheus_layer, metric_handle);

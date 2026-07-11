@@ -25,9 +25,7 @@ async fn https_round_trip_with_self_signed_cert() {
     // Build the real router over a fresh temp-dir engine.
     let tempdir = tempfile::tempdir().unwrap();
     let engine = EngineHandle::spawn(tempdir.path(), 0).unwrap();
-    let state = AppState {
-        engine: Arc::new(engine),
-    };
+    let state = AppState::new(Arc::new(engine));
     let jwt = JwtConfig::new(TEST_JWT_SECRET);
     // This test binary is its own process, so `pair()` is called exactly once.
     let (layer, handle) = PrometheusMetricLayer::pair();

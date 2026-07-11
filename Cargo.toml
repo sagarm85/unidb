@@ -38,13 +38,15 @@ tracing-appender = { version = "0.2", optional = true }
 # P6.f: native TLS termination for the server (rustls, no OpenSSL). Server-only.
 axum-server = { version = "0.7", optional = true, features = ["tls-rustls"] }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["aws_lc_rs"] }
+# R4: `POST /rows/batch` carries opaque row bytes as base64 in JSON. Server-only.
+base64 = { version = "0.22", optional = true }
 
 [features]
 server = [
     "dep:tokio", "dep:axum", "dep:tower", "dep:tower-http",
     "dep:jsonwebtoken", "dep:metrics", "dep:metrics-exporter-prometheus",
     "dep:axum-prometheus", "dep:async-stream", "dep:futures-util",
-    "dep:tracing-appender", "dep:axum-server", "dep:rustls",
+    "dep:tracing-appender", "dep:axum-server", "dep:rustls", "dep:base64",
 ]
 
 [dev-dependencies]
@@ -61,6 +63,9 @@ futures-util = "0.3"
 rusqlite = { version = "0.32", features = ["bundled"] }
 # P6.f: generate a self-signed cert in the TLS integration test (dev-only).
 rcgen = "0.13"
+# R4: encode raw row payloads in the /rows/batch integration tests (dev-only;
+# the server itself gets it via the optional feature-gated dependency above).
+base64 = "0.22"
 # Postgres baseline comparison (benches/decompose.rs, PG_URL-gated). Sync
 # client, dev-dependency ONLY (same precedent as rusqlite/reqwest) — it never
 # enters the engine's normal-edge graph, so the "engine stays sync" invariant
@@ -204,4 +209,14 @@ required-features = ["server"]
 [[test]]
 name = "server_tables"
 path = "tests/server_tables.rs"
+required-features = ["server"]
+
+[[test]]
+name = "server_txn"
+path = "tests/server_txn.rs"
+required-features = ["server"]
+
+[[test]]
+name = "server_enrich"
+path = "tests/server_enrich.rs"
 required-features = ["server"]

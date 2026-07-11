@@ -51,9 +51,7 @@ impl TestServer {
 
         let base_url = rt.block_on(async move {
             let engine = EngineHandle::spawn(&dir_path, 0).unwrap();
-            let state = AppState {
-                engine: Arc::new(engine),
-            };
+            let state = AppState::new(Arc::new(engine));
             let jwt_config = JwtConfig::new(JWT_SECRET);
             let (layer, handle) = metrics_pair().clone();
             let router = build_router(state, jwt_config, layer, handle);
