@@ -29,7 +29,7 @@
 | 13 | `crud_performance.md` | Performance | ✅ SHIPPED (PROGRESS: CRUD performance — Phase A + B) |
 | 14 | `parallel_scan.md` | Milestone | ✅ SHIPPED (PROGRESS: Milestone P + follow-ups) |
 | 15 | `15_parallel_worker_governance.md` | Improvement | ✅ SHIPPED (PROGRESS: Parallel worker governance) |
-| 16 | `16_concurrent_sql_writes_visibility_anomaly.md` | Improvement | ⬜ NOT STARTED (reserved — see Next up) |
+| 16 | `16_concurrent_sql_writes_visibility_anomaly.md` | Improvement | ⬜ NOT STARTED |
 | 17 | `17_mm_replaced_stack_headline.md` | Performance | ✅ SHIPPED (PROGRESS: Cross-domain headline vs replaced stack) |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
@@ -37,22 +37,18 @@ Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 
 ## Next up (candidates — pick one, then create `NN_<slug>.md`)
 
-Ordered by my current ROI read; reorder as priorities change. None has its own
-file yet — each is *filed inside* an existing doc until started.
+Ordered by my current ROI read; reorder as priorities change. Item 16 has its
+spec file (create the others' `NN_<slug>.md` when started — until then each is
+*filed inside* an existing doc).
 
-1. **`16_concurrent_sql_writes_visibility_anomaly.md` — pre-existing MVCC
-   anomaly under `UNIDB_CONCURRENT_SQL_WRITES`** (found 2026-07-11 while
-   verifying item 12, NOT caused by it — reproduced on unmodified `main`):
-   under CPU contention, `tests/concurrent_writers.rs::
-   cross_row_update_deadlock_resolves_no_hang` intermittently ends with
-   **3 visible rows instead of 2** after cross-row UPDATE churn on an indexed
-   table (a superseded/aborted version stays visible). Repro: run the
-   `concurrent_writers` test binary 6× in parallel, filter `cross_row` —
-   fails ~1–5 of 6 instances per round on `main` (dc93931) and on the item-12
-   branch alike; passes in isolation. Correctness bug in item 11's
-   default-OFF toggle path (the test enables it explicitly) — must be
-   root-caused before that toggle's planned default-ON flip. Filed in
-   `index_write_concurrency.md`'s follow-ups; the toggle stays default-off.
+1. **Item 16 — MVCC visibility anomaly under concurrent SQL writes**
+   (`16_concurrent_sql_writes_visibility_anomaly.md` — full spec, evidence,
+   repro commands, and DoD live THERE, not here). Top priority: the
+   2026-07-12 concurrency-correctness matrix showed the anomaly family is
+   **not** gated on the `UNIDB_CONCURRENT_SQL_WRITES` toggle — the
+   production default is affected (short/torn reads; persistent duplicate
+   ids after vacuum; plus a D5-violation error and a hang with the toggle
+   on). Blocks item 11's default-ON flip.
 2. **A2 / HOT-style update — DEFERRED (ROI vs §1), not filed.** Would reopen
    locked decision D4 (`FORMAT_VERSION` bump) + recovery + new crash points for a
    ~0.34× → ~0.42× UPDATE-bulk gain on a **single-model** CRUD bench that §1 says
