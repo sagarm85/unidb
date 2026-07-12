@@ -23,7 +23,8 @@ Three stacked mechanisms, each independently toggleable/observable:
    never held across latch/WAL work; a coarse `write_serial` mutex covers only
    the structural paths (DDL, vacuum, edges/LOBs/events enablement). Raw CRUD
    and reads are fully concurrent.
-3. **Concurrent SQL writes (default-off toggle `UNIDB_CONCURRENT_SQL_WRITES`).**
+3. **Concurrent SQL writes (`UNIDB_CONCURRENT_SQL_WRITES` — default-ON since the
+   item-11 flip 2026-07-13; `=0`/`false`/`off` forces the serialized fallback).**
    `CatalogHandle::{Shared, Exclusive}` routes catalog-non-mutating DML
    (SELECT / INSERT-into-FSM-backed-non-SERIAL / UPDATE / DELETE) through a
    shared catalog read lock; DDL and catalog-mutating DML take the write lock.

@@ -103,7 +103,9 @@ prize for the catalog-lock split + latch-coupled B-tree work — see Q2.**
 
 > **Post-fix update (2026-07-10, index-write-concurrency SHIPPED).** The
 > catalog-lock split (0a/0c) + latch-coupled ("crabbing") `DiskBTree` descent
-> (Item A) landed behind the default-off `UNIDB_CONCURRENT_SQL_WRITES` toggle. A
+> (Item A) landed behind the `UNIDB_CONCURRENT_SQL_WRITES` toggle (shipped dark,
+> default-off; **flipped default-ON 2026-07-13, backlog item 11** — see the note
+> after this table). A
 > re-run of Table C (native Apple silicon, `HICONC_IDX_PREGROW=200000`, per-commit
 > durable) shows the indexed 8-writer prize **realized**:
 >
@@ -120,6 +122,16 @@ prize for the catalog-lock split + latch-coupled B-tree work — see Q2.**
 > above because this re-run is on a different machine; the *mechanism* and
 > *direction* match.) Full detail: `PROGRESS.md`'s "Index & heap write
 > concurrency" entry.
+>
+> **Default-ON flip (2026-07-13, backlog item 11).** After the toggle soaked dark
+> and the item-16 MVCC visibility anomaly (the soak blocker) was fixed (PR #50),
+> `UNIDB_CONCURRENT_SQL_WRITES` was flipped **default-ON**; the 28-cell
+> concurrency correctness matrix passes 28/28 at `CONC_REPEATS=10` (toggle on and
+> off). Table C re-measured on the flipped default (no env var, native Apple
+> silicon, `HICONC_IDX_PREGROW=200000`): indexed 8-writer **811 → 1016 commits/s**
+> (+25% on this machine vs the serialized `=0` fallback; the +38% direction of the
+> original ship reproduces). `=0`/`false`/`off` still forces the serialized path —
+> one env var, no code revert.
 
 ---
 

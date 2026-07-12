@@ -84,8 +84,10 @@ flowchart TB
 Measured: indexed 8-writer SQL throughput 768 → 1,058 commits/s (+38 %) with
 crabbing enabled, approaching the ~1,260 unindexed fsync floor; the residual gap
 is `WAL_INDEX` full-page-image append contention (format-inherent), not tree
-latching. The toggle (`UNIDB_CONCURRENT_SQL_WRITES`) is default-off with a
-runtime revert switch — the field-safety net.
+latching. The toggle (`UNIDB_CONCURRENT_SQL_WRITES`) is **default-ON since the item-11 flip
+(2026-07-13)** — `=0`/`false`/`off` (or `set_concurrent_sql_writes(false)`) forces
+the serialized fallback, the runtime revert switch / field-safety net. Re-measured
+on the flipped default: indexed 8-writer 811 → 1,016 commits/s.
 
 ## 6.4 Write amplification — per-leaf WAL coalescing (A1)
 

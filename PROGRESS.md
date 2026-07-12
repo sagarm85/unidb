@@ -3384,7 +3384,9 @@ tree -p unidb --no-default-features --edges normal` free of tokio/axum/loom).
 shared-latch descent + a full Lehman-Yao B-link tree (right-linked internal nodes,
 `FORMAT_VERSION`-bump-gated) to overlap same-subtree descents; batched SERIAL
 counter persistence. **A follow-up commit flips `UNIDB_CONCURRENT_SQL_WRITES`
-default-on after a soak period, recorded here.**
+default-on after a soak period, recorded here.** ✅ **DONE 2026-07-13** — see the
+"UNIDB_CONCURRENT_SQL_WRITES default-ON flip" entry below (soak blocker was item
+16, fixed PR #50; 28/28 matrix; Table C 811 → 1016 commits/s).
 
 **Index & heap write concurrency (0a + 0c + Item A) is COMPLETE.**
 
@@ -4039,3 +4041,59 @@ toggle-on 10/10); the flip itself remains a separate item.
 **Locked-decision changes:** none. D5 was **not** reopened — the D5-flush symptom
 was a downstream effect of the abort-ordering corruption and does not recur once
 it is fixed.
+
+---
+
+## UNIDB_CONCURRENT_SQL_WRITES default-ON flip (backlog item 11 follow-up)   [SHIPPED]   2026-07-13
+
+**Summary:** Completed the soak-complete default-ON flip that item 11's
+"Index & heap write concurrency" entry promised. The concurrent SQL-write path
+(catalog-lock split 0a/0c + latch-coupled "crabbing" `DiskBTree` descent, Item A)
+shipped dark behind `UNIDB_CONCURRENT_SQL_WRITES` (default-off) to soak. The soak
+blocker was **item 16** (the MVCC visibility anomaly), root-caused and fixed in
+PR #50; the 28-cell concurrency correctness matrix then passed **28/28 at
+`CONC_REPEATS=10`** with contention spinners, toggle on **and** off (committed
+report `docs/performance/conc_matrix_20260713_*.md`). With correctness proven, the
+default is now **ON**. The revert path is unchanged and one env var: set
+`UNIDB_CONCURRENT_SQL_WRITES=0`/`false`/`off` (or call
+`Engine::set_concurrent_sql_writes(false)` at runtime) to force the serialized
+`cat_write` fallback; the old path stays compiled in and its regression test
+(`concurrent_indexed_sql_inserts_correct_toggle_off`) still passes.
+
+**What changed (one env-var default, no behavior rewrite):** `env_flag` →
+`env_flag_default_on` (unset ⇒ true; only `0`/`false`/`off`/`no` force off);
+field/setter/env doc comments un-"ships dark"; the conc_matrix bench legend now
+names *on* as the production default; README, `engine_design.md` §5.2/§5.4 +
+footer, the processing-engines design notes, and `high_scale_concurrency.md`
+updated.
+
+**Table C acceptance — re-measured on the flipped default (`benches/decompose.rs`,
+`UNIDB_BENCH=hiconc HICONC_ONLY=c`, release, 18 logical cores, native macOS,
+`idx_pregrow=200000`, per-writer burst 400, group-commit on, single bench process,
+PG columns off):**
+
+| schema (8 writers) | serialized (`=0`) | concurrent (default-ON, no env) | Δ |
+|--------------------|------------------:|--------------------------------:|---|
+| indexed            | 811 commits/s     | **1016 commits/s**              | **+25%** |
+| no-index (control) | 1261 commits/s    | 1277 commits/s                  | ~flat (already fsync-bound) |
+
+Default-with-no-env (1016) matches the explicit toggle-ON baseline (1013), and the
+`=0` override drops indexed 8-writer back to the serialized regime (741–811) —
+confirming the flip and the revert both take effect. **Honesty note:** the gain is
+**+25% on this machine**, not the +38% (768 → 1058) of the original ship; same
+mechanism and direction, absolute numbers vary by machine/run — reporting the
+measured number, not the lucky one. 1-writer is unchanged (~272–278, no
+contention to relieve), as expected.
+
+**Peak RSS:** ~31.4 MB for the whole Table C bench process (`/usr/bin/time -l`:
+`maximum resident set size` 32,882,688 B — builds a 200k-row indexed table + 8
+writer threads). Buffer-pool bounded and **unchanged by the flip** (same code
+path, only the default differs).
+
+**Green:** `cargo test -p unidb` (default + `--features server`) pass; crash
+harness **31/31**; `cargo test --workspace` pass; `clippy --all-targets --features
+server -D warnings` clean; `fmt` clean; concurrency matrix **28/28 @
+`CONC_REPEATS=10`**.
+
+**Locked-decision changes:** none. No format change, no crash-point change, no §3
+decision reopened. This closes item 11's filed follow-up.

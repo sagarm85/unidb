@@ -12,6 +12,26 @@
 
 ## Current status
 
+- **`UNIDB_CONCURRENT_SQL_WRITES` default-ON flip (backlog item 11 follow-up) —
+  SHIPPED (2026-07-13), branch `11-concurrent-writes-default-on`, PR pending.**
+  The concurrent SQL-write path (catalog-lock split 0a/0c + latch-coupled
+  "crabbing" `DiskBTree` descent) soaked dark behind the default-off toggle; its
+  soak blocker was item 16 (fixed PR #50), and the 28-cell concurrency matrix now
+  passes **28/28 at `CONC_REPEATS=10`** toggle on AND off. So the default is now
+  **ON**. Mechanism: `env_flag` → `env_flag_default_on` (unset ⇒ on; only
+  `0`/`false`/`off`/`no` force off); `Engine::set_concurrent_sql_writes(false)`
+  still overrides at runtime; toggle-off regression test + serialized `cat_write`
+  path stay compiled in. **Revert is one env var** (`UNIDB_CONCURRENT_SQL_WRITES=0`).
+  **Table C re-measured on the flipped default (no env):** indexed 8-writer
+  **811 → 1016 commits/s (+25%** on this machine; original ship was +38%,
+  768 → 1058 — same mechanism/direction, absolute varies by machine); `=0`
+  override drops back to ~741–811 (serialized). Peak RSS ~31.4 MB (bench process,
+  unchanged by the flip). Gates: `-p unidb` + `--features server` + `--workspace`
+  pass, crash **31/31**, clippy/fmt clean, matrix 28/28. No §3 decision reopened,
+  no format change. Docs closed out (README, engine_design §5.2/§5.4 + footer,
+  processing-engines notes, high_scale_concurrency, backlog index + item-11/16
+  docs, conc_matrix legend). See PROGRESS "UNIDB_CONCURRENT_SQL_WRITES default-ON
+  flip". **This closes item 11's filed follow-up.**
 - **MVCC visibility anomaly under concurrent SQL writes (backlog item 16) —
   ROOT-CAUSED + FIXED (2026-07-12), branch `16-visibility-fix`, PR pending.**
   **Root cause (one bug, all three symptom classes):** `TransactionManager::
@@ -2912,6 +2932,32 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-13 — `UNIDB_CONCURRENT_SQL_WRITES` default-ON flip (item 11 follow-up), branch `11-concurrent-writes-default-on`
+
+- Completed item 11's filed follow-up: flipped `UNIDB_CONCURRENT_SQL_WRITES`
+  **default-ON**. Measurement + docs only; no correctness work (item 16 was the
+  soak blocker and is fixed/merged, PR #50; matrix already 28/28 on main).
+- **Baseline first (unflipped build), Table C:** indexed 8-writer 811 (toggle
+  off) vs 1013 (toggle on) — confirmed the win exists before touching the default.
+- **Flip mechanism:** `env_flag` → `env_flag_default_on` (unset ⇒ true; only
+  `0`/`false`/`off`/`no` force off). Field/setter/env doc comments un-"ships
+  dark"; conc_matrix bench legend now names *on* as production default; toggle-off
+  test doc updated. Runtime setter + serialized `cat_write` path unchanged.
+- **Flipped Table C (no env):** indexed 8-writer **1016** (matches toggle-on
+  baseline 1013 ⇒ default is ON); `=0` override → 741 (serialized regime ⇒ revert
+  works). **+25% vs +38% prior art — reported honestly** (same mechanism, absolute
+  varies by machine; not chasing the lucky run).
+- **Gates:** `-p unidb` + `--features server` + `--workspace` pass; crash **31/31**;
+  clippy `--all-targets --features server -D warnings` clean; fmt clean.
+  Concurrency matrix **28/28 @ `CONC_REPEATS=10`** (committed dated report). Peak
+  RSS ~31.4 MB (bench process, unchanged by flip).
+- **Docs closeout (§9):** README, engine_design §5.2/§5.4 + doc-version footer,
+  processing-engines 06/10 notes, high_scale_concurrency, backlog `index_write_
+  concurrency` (flip note + DoD ✅) + `backlog_index` item 1 + item-16 DoD line +
+  PROGRESS (new entry + item-11 promise ✅) + this MEMORY entry.
+- **Next:** push, open PR (backlog item 11 follow-up + item 16 spec, measurement
+  table, one-env-var revert story), STOP for review. Do not merge.
 
 ### 2026-07-13 — Post-item-16 full QA battery on merged `main` — PASS (production-ready gates)
 

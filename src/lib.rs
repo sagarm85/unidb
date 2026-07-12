@@ -135,12 +135,17 @@ fn configured_pool_capacity() -> usize {
 
 /// A default-off boolean env flag: true only when set to `1`/`true`/`on`/`yes`
 /// (case-insensitive). Any other value — including unset — is false. Used for
-/// `UNIDB_CONCURRENT_SQL_WRITES` (index-write-concurrency): ships dark, so the
-/// default must be off and only an explicit opt-in enables it.
-fn env_flag(key: &str) -> bool {
-    matches!(
+/// `UNIDB_CONCURRENT_SQL_WRITES` (index-write-concurrency): **default-ON** as of
+/// the item-11 flip. The concurrent-write path soaked dark behind this flag and
+/// is now the default after item 16's MVCC visibility anomaly was fixed (PR #50)
+/// and the 28-cell concurrency matrix passed 28/28 at `CONC_REPEATS=10`. The
+/// serialized path stays compiled in: set the var to `0`/`false`/`off`/`no` to
+/// force it back off at open, or call [`Engine::set_concurrent_sql_writes(false)`]
+/// at runtime — the residual-race safety net is still one env var, no code revert.
+fn env_flag_default_on(key: &str) -> bool {
+    !matches!(
         std::env::var(key).ok().as_deref().map(str::trim),
-        Some("1") | Some("true") | Some("TRUE") | Some("on") | Some("ON") | Some("yes")
+        Some("0") | Some("false") | Some("FALSE") | Some("off") | Some("OFF") | Some("no")
     )
 }
 
@@ -285,7 +290,9 @@ pub struct Engine {
     /// hot paths don't lock `control` just to read it.
     page_size: usize,
     /// Concurrent-SQL-writes toggle (index-write-concurrency, Item 0a).
-    /// **Default off.** When `false`, every SQL statement runs under the
+    /// **Default on** (item-11 flip; soak-complete after item 16 fixed the MVCC
+    /// visibility anomaly and the 28-cell concurrency matrix passed 28/28).
+    /// When `false`, every SQL statement runs under the
     /// engine-wide catalog *write* lock (`cat_write`), exactly as before — so
     /// SQL writers are serialized before they reach the heap/index and the
     /// known-safe behavior is unchanged. When `true`, row-DML
@@ -294,9 +301,10 @@ pub struct Engine {
     /// and only the storage/index layer serializes them (see the `DiskBTree`
     /// crabbing protocol, Item A). DDL, and DML that must mutate the catalog
     /// (SERIAL bump / legacy non-FSM page-list persist), still take `cat_write`.
-    /// Read once from `UNIDB_CONCURRENT_SQL_WRITES` at open. Ships dark; flipping
-    /// it back to the serialized path is one env var, no code revert (the
-    /// residual-race safety net for the crabbing change).
+    /// Read once from `UNIDB_CONCURRENT_SQL_WRITES` at open (default-on; set the
+    /// var to `0`/`false`/`off` to force the serialized path). Flipping it back is
+    /// one env var, no code revert (the residual-race safety net for the crabbing
+    /// change).
     ///
     /// An `AtomicBool` (not a plain `bool`) so it can be flipped at runtime via
     /// [`Engine::set_concurrent_sql_writes`] — the field-level realization of the
@@ -705,7 +713,7 @@ impl Engine {
         Ok(Self {
             control,
             page_size: page_size_usize,
-            concurrent_sql_writes: std::sync::atomic::AtomicBool::new(env_flag(
+            concurrent_sql_writes: std::sync::atomic::AtomicBool::new(env_flag_default_on(
                 "UNIDB_CONCURRENT_SQL_WRITES",
             )),
             pool,
@@ -2021,8 +2029,9 @@ impl Engine {
     }
 
     /// Enable/disable the concurrent-SQL-writes path at runtime
-    /// (index-write-concurrency, Item 0a). Off by default (or per the
-    /// `UNIDB_CONCURRENT_SQL_WRITES` env flag at open). When on, row-DML that
+    /// (index-write-concurrency, Item 0a). On by default as of the item-11 flip
+    /// (or per the `UNIDB_CONCURRENT_SQL_WRITES` env flag at open — set it to
+    /// `0`/`false`/`off` to force the serialized path). When on, row-DML that
     /// mutates no catalog state runs under a shared catalog lock so concurrent
     /// writers to a table overlap (see [`DiskBTree`](crate) crabbing); DDL and
     /// catalog-mutating DML still serialize on the exclusive lock. Exposed so a

@@ -151,7 +151,9 @@ crash harness is untouched (recovery's single-threaded undo was never exposed).
 - Only then may item 11's planned `UNIDB_CONCURRENT_SQL_WRITES` default-ON
   flip proceed (it stays **default-off** until this ships). The toggle-off
   findings mean the fix is a production-correctness item, not just a
-  flip-blocker.
+  flip-blocker. ✅ **This fix SHIPPED (PR #50); item 11's default-ON flip then
+  proceeded and SHIPPED 2026-07-13** — 28/28 matrix at `CONC_REPEATS=10`, Table C
+  811 → 1016 commits/s (see `index_write_concurrency.md` flip note + `PROGRESS.md`).
 
 ## Cross-references
 

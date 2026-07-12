@@ -529,8 +529,10 @@ guarding a different failure mode.
 > (`apply_durable_index_writes`, `graph/edges::ensure_edge_index`) and read from
 > their stable meta pages. The graph/LOB write paths are serialized by
 > `Engine::write_serial`. The SQL write path was, through Phase 5, serialized by
-> the catalog `RwLock`; the **index-write-concurrency** milestone (default-off
-> `UNIDB_CONCURRENT_SQL_WRITES` toggle) lets catalog-non-mutating SQL DML take a
+> the catalog `RwLock`; the **index-write-concurrency** milestone (the
+> `UNIDB_CONCURRENT_SQL_WRITES` toggle, **default-ON as of the item-11 flip
+> 2026-07-13** — set it to `0`/`false`/`off` for the serialized fallback) lets
+> catalog-non-mutating SQL DML take a
 > *shared* catalog lock and made `DiskBTree` writes safe under concurrent writers
 > via **latch-coupled ("crabbing") descent with safe-node early release** — so
 > two writers now maintain the same index in parallel (§5.4). The M7 **CSR index was retired** in P3.b; the
@@ -619,9 +621,11 @@ superseded). Reads stay latch-free (owned per-page copies + right-linked leaves 
 MVCC re-validation make a transiently stale read self-correcting). The protocol
 is validated by a structural validator (`DiskBTree::validate`), deterministic
 split-contention + concurrent-stress tests, and a `loom` model of the latch
-ordering (`loom-crabbing` crate). It is gated behind the default-off
-`UNIDB_CONCURRENT_SQL_WRITES` toggle: off ⇒ the catalog write lock serializes SQL
-writers exactly as before (crabbing latches are uncontended, behavior unchanged).
+ordering (`loom-crabbing` crate). It is gated behind the
+`UNIDB_CONCURRENT_SQL_WRITES` toggle (**default-ON since the item-11 flip
+2026-07-13**): set the toggle to `0`/`false`/`off` ⇒ the catalog write lock
+serializes SQL writers exactly as before (crabbing latches are uncontended,
+behavior unchanged) — the residual-race revert path, one env var, no code revert.
 Follow-up: optimistic *shared*-latch descent + a Lehman-Yao B-link (right-linked
 internal nodes, format-bump-gated) would let even same-subtree descents overlap.
 See `PROGRESS.md`'s "Index & heap write concurrency" entry for the acceptance
@@ -1410,4 +1414,11 @@ not-yet-undone writes as committed (§4.1/§4.3 corrections). Root cause of the
 item-16 MVCC visibility anomaly family (duplicate/missing rows, plus the
 downstream D5-flush error and >120 s hang). No format change; crash harness
 unchanged. See `docs/backlog/16_concurrent_sql_writes_visibility_anomaly.md`.**
+**`UNIDB_CONCURRENT_SQL_WRITES` default-ON flip (2026-07-13, item 11, branch
+`11-concurrent-writes-default-on`):** the concurrent SQL-write path soaked dark
+behind the toggle; with the item-16 blocker fixed and the 28-cell concurrency
+matrix green 28/28 at `CONC_REPEATS=10` (toggle on **and** off), the default is
+now ON. `=0`/`false`/`off` (or `set_concurrent_sql_writes(false)`) forces the
+serialized `cat_write` fallback. Table C re-measured on the flipped default:
+indexed 8-writer 811 → 1016 commits/s. No format change; §5.2/§5.4 updated.
 Update alongside the next milestone's closeout.*

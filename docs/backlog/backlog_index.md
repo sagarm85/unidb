@@ -41,11 +41,14 @@ Ordered by my current ROI read; reorder as priorities change. Create each
 candidate's `NN_<slug>.md` when started — until then each is *filed inside* an
 existing doc.
 
-1. **Item 11 `UNIDB_CONCURRENT_SQL_WRITES` default-ON flip — now unblocked on
-   correctness grounds.** Item 16 (below) root-caused and fixed the MVCC
-   visibility anomaly; the 2026-07-12 correctness matrix passes 28/28 toggle-on
-   at `CONC_REPEATS=10`. The flip itself (default change + a throughput
-   re-measure) is the remaining work. **Item 16 — MVCC visibility anomaly under
+1. **Item 11 `UNIDB_CONCURRENT_SQL_WRITES` default-ON flip — ✅ SHIPPED
+   2026-07-13** (branch `11-concurrent-writes-default-on`). Item 16 (below)
+   root-caused and fixed the soak blocker (MVCC visibility anomaly); the
+   concurrency matrix passes 28/28 toggle-on **and** toggle-off at
+   `CONC_REPEATS=10`. Default is now ON (`=0`/`false`/`off` forces the serialized
+   fallback); Table C re-measured on the flipped default: indexed 8-writer
+   **811 → 1016 commits/s** (+25%). Flip note in `index_write_concurrency.md`,
+   metrics in `PROGRESS.md`. **Item 16 — MVCC visibility anomaly under
    concurrent SQL writes — is ✅ SHIPPED** (2026-07-12, branch
    `16-visibility-fix`); root cause (abort dropped the xid from `active` before
    undo), fix, and evidence live in
