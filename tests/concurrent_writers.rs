@@ -345,8 +345,10 @@ fn concurrent_indexed_sql_inserts_correct_toggle_on() {
 }
 
 /// Toggle-off regression: the exact same workload under the known-safe
-/// serialized (`cat_write`) path is equally correct. Guards that shipping dark
-/// (default off) preserves behavior and that the old path stays intact.
+/// serialized (`cat_write`) path is equally correct. Now that the concurrent
+/// path is default-on (item-11 flip), this guards that the serialized fallback
+/// still exists and stays correct — the residual-race revert path via
+/// `UNIDB_CONCURRENT_SQL_WRITES=0` / `set_concurrent_sql_writes(false)`.
 #[test]
 fn concurrent_indexed_sql_inserts_correct_toggle_off() {
     run_indexed_insert_workload(false);

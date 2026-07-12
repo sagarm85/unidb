@@ -9,7 +9,7 @@
 // invariant oracle afterwards (and, for reader cells, *during* the run). The
 // matrix sweeps the permutations that matter:
 //
-//   toggle    UNIDB_CONCURRENT_SQL_WRITES off (production default) / on
+//   toggle    UNIDB_CONCURRENT_SQL_WRITES on (production default) / off (fallback)
 //   index     B-tree-indexed table / unindexed (isolates the index write path)
 //   isolation reader snapshots at READ COMMITTED / REPEATABLE READ / SERIALIZABLE
 //   workload  insert storm · cross-row UPDATE churn (the item-16 shape) ·
@@ -1038,8 +1038,8 @@ fn main() {
     );
     println!();
     println!(
-        "- toggle = `UNIDB_CONCURRENT_SQL_WRITES` (**off is the production \
-         default**; on is the backlog-item-16 flip candidate)"
+        "- toggle = `UNIDB_CONCURRENT_SQL_WRITES` (**on is the production \
+         default** as of the item-11 flip; off forces the serialized fallback)"
     );
     println!(
         "- CPU contention: {spinners} spinner threads oversubscribing {ncpu} cores \
@@ -1125,10 +1125,11 @@ fn main() {
         println!();
     }
     println!(
-        "_How to read this: rows with toggle **off** are the shipping production \
-         default — any FAIL there is a release blocker. Rows with toggle *on* \
-         exercise the `UNIDB_CONCURRENT_SQL_WRITES` path (item 11's default-ON \
-         flip candidate). The item-16 MVCC visibility anomaly this matrix was \
+        "_How to read this: rows with toggle **on** are the shipping production \
+         default (as of item 11's default-ON flip) — any FAIL there is a release \
+         blocker. Rows with toggle *off* exercise the serialized `cat_write` \
+         fallback (`UNIDB_CONCURRENT_SQL_WRITES=0`), the residual-race revert \
+         path. The item-16 MVCC visibility anomaly this matrix was \
          built to catch (abort dropped the xid from `active` before undo) was \
          root-caused and FIXED 2026-07-12 — see \
          `docs/backlog/16_concurrent_sql_writes_visibility_anomaly.md`; these \

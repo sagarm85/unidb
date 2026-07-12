@@ -1,6 +1,17 @@
 # Index & heap write concurrency — latch-coupled B-tree + spread insertion targets
 
-## Status as of 2026-07-10: **SHIPPED** (Core-lane, branch `index-write-concurrency`) — the first landed unit **0a + 0c + Item A** is implemented behind the default-off `UNIDB_CONCURRENT_SQL_WRITES` toggle, validated per the strategy below (structural validator + split-injection + loom + generation tripwire; TSan is the documented CI hook), and accepted on Table C (indexed 8-writer **768 → 1058 commits/s** with the toggle on, toggle-off reproducing the baseline). See `PROGRESS.md`'s "Index & heap write concurrency (0a + 0c + Item A)" entry for the full before/after and `docs/design/engine_design.md` §5.4. **0b (per-table lock registry) remains deferred/optional; Item B (heap-tail spread) not landed here.** Original PLAN retained below for the record.
+## Status as of 2026-07-10: **SHIPPED** (Core-lane, branch `index-write-concurrency`) — the first landed unit **0a + 0c + Item A** is implemented behind the `UNIDB_CONCURRENT_SQL_WRITES` toggle, validated per the strategy below (structural validator + split-injection + loom + generation tripwire; TSan is the documented CI hook), and accepted on Table C (indexed 8-writer **768 → 1058 commits/s** with the toggle on, toggle-off reproducing the baseline). See `PROGRESS.md`'s "Index & heap write concurrency (0a + 0c + Item A)" entry for the full before/after and `docs/design/engine_design.md` §5.4. **0b (per-table lock registry) remains deferred/optional; Item B (heap-tail spread) not landed here.** Original PLAN retained below for the record.
+
+> **Default-ON flip DONE (2026-07-13, backlog item 11).** The toggle shipped dark
+> (default-off) to soak; the soak blocker was item 16 (MVCC visibility anomaly),
+> which was root-caused and FIXED (PR #50) and the 28-cell concurrency matrix
+> passed 28/28 at `CONC_REPEATS=10` with contention spinners. `UNIDB_CONCURRENT_SQL_WRITES`
+> is now **default-ON**; set it to `0`/`false`/`off` (or call
+> `Engine::set_concurrent_sql_writes(false)`) to force the serialized `cat_write`
+> fallback — the residual-race revert is still one env var, no code revert. Table C
+> re-measured on the flipped default (no env): indexed 8-writer **811 → 1016
+> commits/s** (+25% on this machine; prior art +38%). See the "UNIDB_CONCURRENT_SQL_WRITES
+> default-ON flip" entry in `PROGRESS.md`.
 
 > **Correction (2026-07-10, high-scale concurrency experiment — millions of rows,
 > unidb vs Postgres head-to-head; `docs/performance/high_scale_concurrency.md`).**
@@ -369,7 +380,9 @@ at the `PROGRESS.md` entry · `engine_design.md` §5.4 ("latch-coupled B-tree wr
 are future work") and the Phase 5 known-limitations line updated · no §3 decision
 reopened without recorded sign-off. **Ship with `UNIDB_CONCURRENT_SQL_WRITES`
 default-off; a follow-up commit flips the default on after a soak period, recorded
-in `PROGRESS.md`.**
+in `PROGRESS.md`.** ✅ **DONE 2026-07-13 (backlog item 11):** default flipped ON
+after the item-16 soak blocker was fixed; 28/28 matrix, Table C 811 → 1016
+commits/s — see the flip note at the top of this doc and `PROGRESS.md`.
 
 ## Known issue found post-ship (2026-07-11, during item 12 verification)
 
@@ -386,6 +399,7 @@ both `main` and the item-12 branch; the test passes reliably in isolation
 fixed before the planned default-ON flip of `UNIDB_CONCURRENT_SQL_WRITES`;
 until then the toggle stays default-off** (production default unaffected).
 Tracked as backlog "Next up" item 16 in `backlog_index.md`.
+**RESOLVED 2026-07-11 (PR #50); default-ON flip completed 2026-07-13 (item 11).**
 
 ### Update (2026-07-12): matrix harness widens the finding — NOT toggle-gated
 
