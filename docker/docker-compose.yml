@@ -11,7 +11,10 @@ name: unidb-fair-bench
 
 services:
   postgres:
-    image: postgres:18
+    # pgvector-enabled Postgres 18 so the replaced-stack baseline's vector role
+    # (`MM_REPLACED_STACK=1` → `CREATE EXTENSION vector` + an HNSW index) can run.
+    # Drop-in for stock `postgres:18` — same server, plus the `vector` extension.
+    image: pgvector/pgvector:pg18
     environment:
       POSTGRES_PASSWORD: bench
       POSTGRES_DB: postgres
@@ -45,6 +48,9 @@ services:
       MM_CRUD_ROWS: "${MM_CRUD_ROWS:-100000}"
       MM_BULK_SIZES: "${MM_BULK_SIZES:-10000,1000000,2000000}"
       MM_TX_SWEEP: "${MM_TX_SWEEP:-1000,10000,100000,1000000}"
+      # Table 4 headline: add the §6 replaced-stack column (row + pgvector + graph
+      # + queue, four independent commits) when set to 1. Needs the pgvector image.
+      MM_REPLACED_STACK: "${MM_REPLACED_STACK:-}"
       # Phase-window file on the shared /out volume — the host docker-stats
       # sampler correlates these windows to per-container CPU/mem (Part 2).
       MM_PHASES: "/out/phases.csv"

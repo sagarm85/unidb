@@ -940,8 +940,16 @@ tests that remain.
 All numbers from `PROGRESS.md` (release builds, Apple Silicon macOS, real
 fsync). Baselines per CLAUDE.md §6: SQLite for M0/M1 (honest embedded
 analog), Postgres+extension proxies from M2 on. The full four-system
-"replaced stack" benchmark is possible since M4 but remains a deferred,
-dedicated follow-up.
+"replaced stack" benchmark **shipped in item 17** (was a deferred follow-up):
+`benches/decompose.rs` Table 4 under `MM_REPLACED_STACK=1` runs the same
+four-model write as four independent PG commits (row + pgvector+HNSW + a graph
+adjacency table + an outbox queue, no shared transaction) — **unidb's one atomic
+commit is 3.61× faster under real flush-to-platter durability** (`F_FULLFSYNC` vs
+`fsync_writethrough`; 250 vs 69 txns/s = 1 sync vs 4), narrowing to ~parity under
+a cheap/buffered VM `fsync` (the win is proportional to real durable-sync cost).
+The **unconditional** win is crash-consistency: unidb recovers 0 orphans where the
+stack recovers a torn record (`tests/crash` `item16_*`, harness 29 → 31). Real
+polyglot infra (Neo4j/Kafka/Qdrant) stays a heavier follow-up.
 
 ### 10.1 The one bottleneck that explains almost everything
 

@@ -40,7 +40,14 @@ Output: `docker/out/multi_model_report_<timestamp>.md`.
   of adding vector + graph + event to a relational write, in one transaction).
 - **Table 3:** single-model relational — **unidb (SQL) vs Postgres** — the honest
   peer workload, now both on Linux `fsync`.
-- **Table 4:** the "one atomic transaction vs the replaced stack" framing.
+- **Table 4:** the "one atomic transaction vs the replaced stack" framing. Set
+  `MM_REPLACED_STACK=1` for the honest §6 headline — unidb's ONE atomic commit vs
+  the **replaced stack** (Postgres row + pgvector + a graph table + an outbox
+  queue) run as **four independent commits with no shared transaction** (4
+  `fsync`s, no cross-system atomicity), plus a crash-consistency verdict (the
+  stack recovers a torn record; unidb recovers 0 orphans — `tests/crash` item16
+  proofs). The pgvector image ships the `vector` extension the vector role needs.
+  Without the flag, Table 4 shows only the PG-relational single-model floor.
 
 ## Important caveat: absolute vs relative durability
 

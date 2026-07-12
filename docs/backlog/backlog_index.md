@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `16_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `18_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -29,6 +29,8 @@
 | 13 | `crud_performance.md` | Performance | ✅ SHIPPED (PROGRESS: CRUD performance — Phase A + B) |
 | 14 | `parallel_scan.md` | Milestone | ✅ SHIPPED (PROGRESS: Milestone P + follow-ups) |
 | 15 | `15_parallel_worker_governance.md` | Improvement | ✅ SHIPPED (PROGRESS: Parallel worker governance) |
+| 16 | `16_concurrent_sql_writes_visibility_anomaly.md` | Improvement | ⬜ NOT STARTED (reserved — see Next up) |
+| 17 | `17_mm_replaced_stack_headline.md` | Performance | ✅ SHIPPED (PROGRESS: Cross-domain headline vs replaced stack) |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
@@ -51,11 +53,12 @@ file yet — each is *filed inside* an existing doc until started.
    default-OFF toggle path (the test enables it explicitly) — must be
    root-caused before that toggle's planned default-ON flip. Filed in
    `index_write_concurrency.md`'s follow-ups; the toggle stays default-off.
-2. **`17_hot_update.md` — A2 / HOT-style update** (write-path parity; UPDATE is
-   ~0.34× vs PG). The biggest *remaining* single lever, but the highest risk:
-   heap version-model + **on-disk format** (`FORMAT_VERSION` bump, D4 sign-off) +
-   recovery + new crash points; honest gain only ~0.34× → ~0.42×. Filed in
-   `crud_performance.md`.
+2. **A2 / HOT-style update — DEFERRED (ROI vs §1), not filed.** Would reopen
+   locked decision D4 (`FORMAT_VERSION` bump) + recovery + new crash points for a
+   ~0.34× → ~0.42× UPDATE-bulk gain on a **single-model** CRUD bench that §1 says
+   we should lose anyway. Not worth a locked-decision change; effort redirected to
+   #17 (the §6 cross-domain headline). Filed rationale in `crud_performance.md`; if
+   ever picked up it takes the next free number (`18_…`).
 3. **Parallel-scan follow-ups** (filed in `parallel_scan.md`, lower ROI):
    `SUM`/`AVG`/`GROUP BY` partial aggregate; `LIMIT` early-stop; server
    `ReadHandle` parallelism; a visibility-map fast count. (Default-on + worker
