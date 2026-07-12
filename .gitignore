@@ -26,6 +26,7 @@ __pycache__/
 
 # Generated benchmark reports (produced by scripts/multi_model_report.sh)
 /docs/performance/multi_model_report_*.md
+/docs/performance/conc_matrix_*.md
 
 # Generated Docker report output (reports, logs, phase/stats CSVs from
 # scripts/report.sh --docker). The docker/ image + compose files ARE committed;

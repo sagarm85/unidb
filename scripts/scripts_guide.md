@@ -24,6 +24,20 @@ It **auto-selects the environment**:
 
 Force a mode with `scripts/report.sh --docker` or `--native`; `--help` prints usage.
 
+**Every report also gets a “Concurrency correctness matrix” section appended** —
+a pass/fail table of production-shaped concurrent read/write border cases
+(cross-row UPDATE churn = the backlog-item-16 anomaly shape, readers-during-writes
+at RC/RR/SERIALIZABLE, same-row contention, mixed CRUD, balance-transfer sum
+invariance, vacuum interleaved with churn, delete+reinsert slot reuse), swept
+across the `UNIDB_CONCURRENT_SQL_WRITES` toggle and indexed/unindexed tables,
+under CPU contention with repeats. It always runs natively on the host (it
+checks correctness invariants, not fsync-fair timing). Run it standalone with:
+
+```bash
+scripts/report.sh --conc            # matrix only → docs/performance/conc_matrix_<ts>.md
+CONC_REPEATS=10 scripts/report.sh --conc   # tighten the intermittency net
+```
+
 ### Tuning the workload (env vars)
 
 | Var | Default | Controls |
@@ -34,6 +48,12 @@ Force a mode with `scripts/report.sh --docker` or `--native`; `--help` prints us
 | `MM_BULK_SIZES` | `10000,1000000,2000000` | Row counts for the bulk insert+scan stress sweep (Table 3.1). Default tops out at 2M; push to `5000000`/`10000000` for a heavier run (5M ≈ 2.7 min insert/engine). |
 | `MM_TX_SWEEP` | `1000,10000,100000,1000000` | Tx counts for the multi-model-vs-Postgres sweep (Table 4). |
 | `MM_REPLACED_STACK` | _(unset)_ | `1` → Table 4 adds the §6 replaced-stack column (row + pgvector + graph + queue as four independent commits, no shared txn) + a crash-consistency verdict. Needs a pgvector-enabled Postgres (`CREATE EXTENSION vector`); the Docker image already has it. |
+| `CONC_REPEATS` | `3` | Repeats per concurrency-matrix cell (a cell FAILs if any repeat violates its oracle). |
+| `CONC_SPIN` | `= cores` | CPU-contention spinner threads during the matrix (`0` disables). |
+| `CONC_ROUNDS` | `1` | Concurrency-matrix workload-size multiplier. |
+| `CONC_ONLY` | _(unset)_ | Substring filter on matrix scenario ids (e.g. `churn`). |
+| `CONC_SKIP` | _(unset)_ | `1` skips the matrix (perf-only report). |
+| `CONC_STRICT` | _(unset)_ | `1` makes the script exit nonzero if any matrix cell fails (CI). |
 
 ```bash
 # Push the multi-model sweep to millions (slow — synchronous HNSW at scale):
@@ -68,6 +88,8 @@ it is a run artifact, not source.
   event) vs Postgres relational, swept across tx counts to millions.
 - **CPU / Memory** — per-phase `docker stats` for the unidb and Postgres
   containers (Docker mode), with the embedded-vs-server asymmetry stated plainly.
+- **Concurrency correctness matrix** — the pass/fail border-case table described
+  above (`benches/conc_matrix.rs`), appended to every report unless `CONC_SKIP=1`.
 
 The fair-fsync rationale and its caveats live in [`../docker/fair_fsync_benchmark.md`](../docker/fair_fsync_benchmark.md).
 

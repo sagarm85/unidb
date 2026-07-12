@@ -127,6 +127,10 @@ name = "concurrent_writers"
 harness = false
 
 [[bench]]
+name = "conc_matrix"
+harness = false
+
+[[bench]]
 name = "decompose"
 harness = false
 

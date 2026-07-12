@@ -12,6 +12,46 @@
 
 ## Current status
 
+- **Concurrency correctness matrix (item-16 tooling) — ADDED (2026-07-12),
+  branch `conc-correctness-matrix` (bench + scripts + docs only; NO engine
+  code touched).**
+  `benches/conc_matrix.rs`: 28 production-shaped concurrent read/write
+  correctness cells (insert storm · cross-row UPDATE churn = the item-16 shape ·
+  same-row contention · mixed CRUD · readers-during-churn at RC/RR/SER ·
+  parallel-scan readers · balance-transfer sum invariant · vacuum×churn ·
+  delete+reinsert) × `UNIDB_CONCURRENT_SQL_WRITES` on/off × indexed/unindexed,
+  with pass/fail oracles (exact visible-id set, no dup ids in any snapshot,
+  COUNT(*) agreement, repeatable re-reads, sum invariance, index-vs-scan
+  agreement), CPU-contention spinners, per-cell repeats, and a per-repeat hang
+  deadline (a deadlock becomes a FAIL row, worker abandoned, matrix continues).
+  `scripts/report.sh` now appends the matrix table to EVERY report (both
+  modes, native execution) and gained `--conc` (matrix-only →
+  `docs/performance/conc_matrix_<ts>.md`, git-ignored) + CONC_* knobs
+  (`scripts_guide.md` updated).
+  - **⚠ FINDINGS (release, native macOS M5 Pro, commit `0c09a70`) — item 16 is
+    WORSE than filed and NOT toggle-gated.** Toggle **OFF (production
+    default)**: transfer-sum readers see a short/torn RC statement snapshot
+    **7/10** runs; vacuum racing cross-row churn leaves **persistent duplicate
+    visible ids after quiescence + final vacuum** **3/10**; 8w×8rows cross-row
+    churn leaves post-quiescence duplicates **1/6**. Toggle **ON**: same shapes
+    to **10/10**; a **D5 violation at commit** (`Recovery("D5 violation on
+    flush: page LSN > durable WAL LSN")`) in 8w indexed churn; one run **hung
+    >120 s** (deadlock/livelock) under spinner contention. 2w×2rows (the
+    original test geometry) passes without spinners — the shipped test was too
+    small to catch this reliably; **with spinners it fails 2/3 too.** Official
+    full-matrix run (3 repeats, 18 spinners): **17 PASS · 11 FAIL of 28** —
+    toggle-off FAILs: reader `COUNT(*)=7` mid-churn (2/3), transfer-sum short
+    RC snapshot (1/3); toggle-on adds reader `COUNT(*)=9` (the extra-row
+    signature), RR/SER readers missing a live row, a parallel-scan reader
+    missing a row, vacuum×churn persistent duplicates.
+    Recorded in `backlog_index.md` item-16 entry (update block)
+    and `index_write_concurrency.md` known-issue section (results table +
+    focused repro commands). **Item 16 root-cause is now the top backlog
+    priority; symptom family = scan concurrent with cross-row-UPDATE commit
+    sees superseded version (dup id) or misses the live row (short scan).**
+    Note: PR #45's body says "backlog item 16" in places — stale labels from
+    before that work was renumbered to **17**; PR #45 is item 17
+    (replaced-stack headline), unrelated to this anomaly.
 - **Cross-domain headline vs the replaced stack (backlog item 17) — SHIPPED
   (2026-07-11), branch `mm-replaced-stack-headline`, PR pending.** Made §6 Table 4
   honest: it *claimed* "one atomic txn vs the replaced stack" but compared unidb's
@@ -716,7 +756,7 @@
   parked Phase 2 SQL capability plan (`docs/backlog/
   phase2_sql_capability_expansion.md`). See Open questions below for
   what's still unresolved from M1-M5.
-- **Last updated:** 2026-07-11
+- **Last updated:** 2026-07-12
 
 ### Phase 1 — ACID & storage foundation (Core lane, branch `acid-hardening`)
 
@@ -2840,6 +2880,35 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-12 — Concurrency correctness matrix built; item 16 found to be toggle-independent + worse
+
+- User asked (reacting to the item-16 intermittent failure) for `scripts/
+  report.sh` to be enriched with border-case concurrent read/write testing,
+  all meaningful permutations, tabular pass/fail output, under the §0.6 lens.
+- Built `benches/conc_matrix.rs` (28 correctness cells: 9 workload families ×
+  toggle × index × reader isolation; oracles = exact visible-id set, no dup
+  ids in any snapshot, COUNT(*) agreement, RR/SER repeatable re-reads, sum
+  invariance, index-vs-scan agreement; spinner-based CPU contention; repeats;
+  hang deadline → FAIL row, matrix continues). Wired into `report.sh` (matrix
+  appended to every report; `--conc` fast path; CONC_* knobs; `.gitignore` +
+  `scripts_guide.md` updated). clippy `-D warnings` + fmt clean.
+- **Findings (release, macOS native, `main` @ `0c09a70`): the item-16 MVCC
+  anomaly family reproduces with the toggle OFF — the production default is
+  affected**, contradicting the 2026-07-11 "production default unaffected"
+  note (corrected in `backlog_index.md` + `index_write_concurrency.md`, as an
+  inline correction per §9): transfer-sum short RC snapshot 7/10; vacuum×churn
+  persistent post-quiescence duplicate ids 3/10; 8w cross-row churn dup ids
+  1/6. Toggle ON: up to 10/10, plus a **D5-violation commit error** and a
+  **>120 s hang** under contention — three distinct symptom classes for the
+  item-16 root-cause to explain (visibility, WAL/flush ordering, deadlock).
+  Official full-matrix run: **17 PASS · 11 FAIL of 28**; with spinners even
+  the original 2w×2rows geometry fails 2/3 (without them it passes 6/6 —
+  why the shipped test looked reliable).
+- Committed on branch `conc-correctness-matrix`, rebased onto `main` after
+  PR #45 (item 17) merged. Note: PR #45's *body* still says "backlog item
+  16" — stale pre-renumber labels; that PR is item **17** (replaced-stack
+  headline), unrelated to this anomaly.
 
 ### 2026-07-11 — Cross-domain headline vs replaced stack (item 17), branch `mm-replaced-stack-headline`
 
