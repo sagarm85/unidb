@@ -246,9 +246,12 @@ async fn concurrent_request_on_busy_session_is_409_txn_busy() {
     let server = TestServer::spawn().await;
     sql(&server, None, json!({"sql": "CREATE TABLE t (id INT)"})).await;
 
-    // Occupy the session with one long multi-statement request (a few
-    // thousand INSERT statements comfortably outlasts the probe below in a
-    // debug build), then hit the same session concurrently.
+    // Occupy the session with one long multi-statement request. The original
+    // shape slept a fixed 200 ms and probed ONCE — flaky the day the batch
+    // finished inside the window. Two fixes, no timers on the critical path:
+    // the probe starts immediately and loops until it observes the busy
+    // window, and the batch request retries pure TXN_BUSY bounces (a probe
+    // holding the try-lock at its arrival instant must not eject it).
     let txn = begin_txn(&server, None).await;
     let long_body: String = (0..3000)
         .map(|i| format!("INSERT INTO t (id) VALUES ({i})"))
@@ -256,29 +259,53 @@ async fn concurrent_request_on_busy_session_is_409_txn_busy() {
         .join("; ");
     let server_url = server.url("/sql");
     let in_flight = tokio::spawn(async move {
-        let resp = client()
-            .post(server_url)
-            .header("Authorization", format!("Bearer {}", valid_token()))
-            .header("X-Txn-Id", txn.to_string())
-            .json(&json!({ "sql": long_body }))
-            .send()
-            .await
-            .unwrap();
-        resp.status().as_u16()
+        loop {
+            let resp = client()
+                .post(server_url.as_str())
+                .header("Authorization", format!("Bearer {}", valid_token()))
+                .header("X-Txn-Id", txn.to_string())
+                .json(&json!({ "sql": long_body }))
+                .send()
+                .await
+                .unwrap();
+            let status = resp.status().as_u16();
+            let body: Value = resp.json().await.unwrap_or(Value::Null);
+            if status == 409 && body["code"] == "TXN_BUSY" {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                continue;
+            }
+            return (status, body);
+        }
     });
 
-    // Wait until the long statement is inside the engine, then probe the
-    // busy session: it must conflict rather than corrupt the transaction.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let (status, body) = sql(&server, Some(txn), json!({"sql": "SELECT * FROM t"})).await;
-    assert_eq!(status, 409, "busy session must conflict: {body}");
-    assert_eq!(body["code"], "TXN_BUSY");
+    // Probe until the busy conflict is observed: the batch executes for far
+    // longer than the probe cadence, so once it wins the session's try-lock
+    // some probe lands inside its window and must conflict rather than
+    // corrupt the transaction.
+    let mut saw_busy = false;
+    for _ in 0..500 {
+        let (status, body) = sql(&server, Some(txn), json!({"sql": "SELECT * FROM t"})).await;
+        if status == 409 {
+            assert_eq!(
+                body["code"], "TXN_BUSY",
+                "busy session must conflict: {body}"
+            );
+            saw_busy = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        saw_busy,
+        "never observed TXN_BUSY while the batch was in flight"
+    );
 
-    // The long request finishes fine, the session survives the 409, and the
-    // whole batch commits atomically.
-    assert_eq!(in_flight.await.unwrap(), 200);
-    let (s, _) = commit(&server, txn).await;
-    assert_eq!(s, 200);
+    // The batch finishes fine, the session survives the 409, and the whole
+    // batch commits atomically.
+    let (in_status, in_body) = in_flight.await.unwrap();
+    assert_eq!(in_status, 200, "in-flight batch: {in_body}");
+    let (s, b) = commit(&server, txn).await;
+    assert_eq!(s, 200, "session commit: {b}");
     let (_, rows) = sql(&server, None, json!({"sql": "SELECT * FROM t"})).await;
     assert_eq!(rows_of(&rows).as_array().unwrap().len(), 3000);
 }
