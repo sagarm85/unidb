@@ -3070,6 +3070,46 @@ plain reporting.
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-07-13 — Engine-architecture PDF reference added to `docs/design/` (docs-only), branch `claude/engine-architecture-pdf-doc-ft0k64`, PR #56
+
+- Added **`docs/design/unidb_engine_architecture.pdf`** (+ its
+  `unidb_engine_architecture.html` source for regeneration): a shareable,
+  self-contained architecture reference distilled from
+  `engine_design.md`/`CLAUDE.md`/`PROGRESS.md`/`positioning.md`/`roadmap.md`.
+  Contents: all components with 8 diagrams (layer stack, deployment/HA
+  topology, page/tuple layout, write path + group commit, ARIES recovery,
+  MVCC version chain, IVF-Flat `NEAR` flow, moat-vs-replaced-stack), how each
+  subsystem works, the measured performance-improvements ledger (group commit
+  ~7.7×, COUNT 2.81× vs PG, parallel scan 6.4–6.6×, crabbing +25%, replaced
+  stack 3.61×, W4/W0 1.12–1.20×), locked decisions D1–D13, the honest
+  limitations registry, and a **future-scope section aligning against Postgres
+  (tiers P0–P3: transactional DDL/savepoints/full SSI → SQL surface → perf
+  parity → wire protocol/ops) and Supabase (auth platform, SDKs, PostgREST-style
+  API, push realtime, dashboard; edge functions kept a non-goal)** for
+  production readiness.
+- Docs-only: **no engine code touched, no §3 decision reopened, no tests/bench
+  affected.** Registered in `docs/design/design_index.md` +
+  `docs/documentation_index.md` (with the headless-Chromium regeneration
+  command). The PDF is a distilled snapshot — `CLAUDE.md`/`PROGRESS.md` win on
+  disagreement.
+- **Rebased onto post-merge `main` (PRs #57–#59) and refreshed for staleness**
+  before landing: one index-file conflict resolved (kept Milestone 18's
+  `engine_access_guide.md` entry alongside the PDF entry); the PDF/HTML updated
+  so it isn't stale on arrival — `JOIN … USING` moved from out-of-scope to
+  shipped (§5.3/§13/§14, PR #58), Milestone 18's `information_schema.*` /
+  `unidb_catalog.*` introspection contract noted in §5.1 (PR #57), and the
+  §14.2 Supabase tracks annotated as now-filed backlog items 20–24 (PR #59).
+- **Second pass — folded in the four PRs that merged later the same day**
+  (#60–#63, rebased onto `72b98f1`): **Milestone 20** realtime dispatcher (new
+  §8.1 — ephemeral SSE resume + `unidb-dispatch` fan-out with proven
+  at-least-once/zero-loss-across-crash + webhook→dead-letter), **item 21**
+  observability metrics and **item 22** logs surface (new §9.1.1 + §9 table +
+  §10 ops bullet — lock-free chokepoint metrics via `stats()`/`/metrics`, JSON
+  logs + `request_id` correlation + bounded `GET /logs`). §14.2 Supabase table
+  flipped: items 20/21/22 now **SHIPPED** (with a shipped tag), 23/24 remain
+  filed. Cover "Covers:" line + footer updated. Still docs-only; **no engine
+  code, no §3 decision, no format/crash-surface touched.**
+
 ### 2026-07-13 — `UNIDB_CONCURRENT_SQL_WRITES` default-ON flip (item 11 follow-up), branch `11-concurrent-writes-default-on`
 
 - Completed item 11's filed follow-up: flipped `UNIDB_CONCURRENT_SQL_WRITES`

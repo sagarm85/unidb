@@ -3,7 +3,11 @@
 - [design/](design/) — consolidated architecture/design reference
   (`engine_design.md`), distilling `CLAUDE.md`/`MEMORY.md`/`PROGRESS.md`
   into one readable document. Kept current milestone-by-milestone; when it
-  disagrees with `CLAUDE.md`/`PROGRESS.md`, those win.
+  disagrees with `CLAUDE.md`/`PROGRESS.md`, those win. Also holds
+  `unidb_engine_architecture.pdf` (added 2026-07-13) — the shareable PDF
+  architecture reference with diagrams, flows, the measured performance
+  ledger, and the Postgres/Supabase-alignment future-scope plan; regenerate
+  it from the adjacent `.html` source (see `design/design_index.md`).
 - [engine_access_guide.md](engine_access_guide.md) — **the Application
   Builder's Guide** (Milestone 18): one task-oriented document for building an
   app *on* the engine — connect (embed/attach/server) → query (the SQL surface
