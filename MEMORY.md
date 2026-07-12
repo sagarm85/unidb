@@ -12,6 +12,36 @@
 
 ## Current status
 
+- **MVCC visibility anomaly under concurrent SQL writes (backlog item 16) —
+  ROOT-CAUSED + FIXED (2026-07-12), branch `16-visibility-fix`, PR pending.**
+  **Root cause (one bug, all three symptom classes):** `TransactionManager::
+  abort` (`src/txn.rs`) removed the aborting xid from the `active` set **before**
+  physically undoing its heap writes. Visibility has no "aborted" state
+  (`mvcc::is_committed_at_snapshot` = not-active-and-below-`next_xid` ⇒
+  committed), so during the undo window a concurrent snapshot saw the aborting
+  txn's doomed new UPDATE version as committed (visible) and its superseded old
+  version as invisible — a wrong reader result, and (since the new version's
+  RowId is unlocked — `heap.update` locks only the *old* version) a concurrent
+  writer could chain onto it, after which undo restored the old version ⇒ **two
+  live versions of one id (persistent duplicate) or none (missing row)**. The D5
+  flush error and the >120 s hang were **downstream** of this corruption, not
+  separate bugs. **Fix (single-site):** keep the xid `active` (and its row locks
+  held) through the whole physical undo; drop from `active` / mark aborted /
+  `release_all` only after. `commit()`'s early remove-from-active is intentional
+  and correct (its data *is* committed) — only `abort` needed reordering.
+  **Evidence:** deterministic `txn.rs::
+  aborting_txn_new_version_never_visible_to_concurrent_snapshot` (barrier pins an
+  observer scan to the abort midpoint — pre-fix reads doomed `"v2"`, post-fix
+  `"v1"`) + `tests/concurrent_writers.rs::
+  item16_readers_during_cross_row_churn_{off,on}` (8w×8rows+2r, fails pre-fix
+  without external load — lost/gained row, COUNT disagree, >90 s hang — passes
+  post-fix). **Matrix: 17 PASS/11 FAIL → 28 PASS/0 FAIL** at `CONC_REPEATS=10`,
+  18 spinners, toggle off AND on. Gates: lib 374 + all integration green, crash
+  harness **31** (unchanged — recovery undo is single-threaded, window never
+  exposed), clippy/fmt clean. Peak RSS ~9.7 MB (buffer-pool bounded). **No §3
+  decision reopened (D5 not touched).** Item 11's default-ON flip is now
+  unblocked on correctness. See `docs/backlog/16_…`, PROGRESS "MVCC visibility
+  anomaly under concurrent SQL writes", engine_design §4.1/§4.3.
 - **Concurrency correctness matrix (item-16 tooling) — ADDED (2026-07-12),
   branch `conc-correctness-matrix` (bench + scripts + docs only; NO engine
   code touched).**
@@ -49,6 +79,8 @@
     focused repro commands). **Item 16 root-cause is now the top backlog
     priority; symptom family = scan concurrent with cross-row-UPDATE commit
     sees superseded version (dup id) or misses the live row (short scan).**
+    _(RESOLVED 2026-07-12 — root cause was abort dropping the xid from `active`
+    before physical undo; fixed in `txn.rs`. See the top "Current status" entry.)_
     Note: PR #45's body says "backlog item 16" in places — stale labels from
     before that work was renumbered to **17**; PR #45 is item 17
     (replaced-stack headline), unrelated to this anomaly.
@@ -2880,6 +2912,41 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-12 — Item 16 root-caused + fixed (abort ordering); matrix 17/11 → 28/0
+
+- Worked backlog item 16 end-to-end on branch `16-visibility-fix` (worktree).
+  Read the spec, MEMORY, and the MVCC/txn/heap/bufferpool/lockmgr/executor
+  paths under the §0.6 lens before touching anything.
+- **Root cause (one bug for all 3 symptom classes):** `TransactionManager::
+  abort` removed the aborting xid from `active` *before* physically undoing its
+  heap writes. Because visibility has no "aborted" state (not-active-and-in-range
+  ⇒ committed), a concurrent snapshot in that window saw the aborting txn's
+  doomed new UPDATE version as committed (and the old one it superseded as
+  invisible). The new version's RowId is unlocked (`heap.update` locks only the
+  old version), so a concurrent writer could chain onto it → undo then restores
+  the old version → **two live versions of one id (persistent dup) or none
+  (missing row)**. D5-flush error + >120 s hang were downstream of this, not
+  separate bugs.
+- **Instrument-first, per plan.** Added a `#[cfg(test)]` abort-midpoint seam +
+  a deterministic unit test (`aborting_txn_new_version_never_visible_to_
+  concurrent_snapshot`) that pins an observer scan to the abort midpoint —
+  proved pre-fix it reads doomed `"v2"`, not a plausible story. Also temporarily
+  re-introduced the bug to confirm the SQL-level regression test
+  (`item16_readers_during_cross_row_churn_{off,on}`, 8w×8rows+2r) fails pre-fix
+  without external load (lost/gained row, COUNT disagree, >90 s hang), then
+  restored.
+- **Fix (single-site, `txn.rs::abort`):** undo + WAL-abort while the xid is
+  still `active`; remove from `active` / mark aborted / `release_all` only after.
+  Toggle-off byte-behavior unchanged otherwise; no format change; crash harness
+  untouched (recovery undo is single-threaded — window never exposed there).
+- **Validation:** conc matrix **28 PASS/0 FAIL** at `CONC_REPEATS=10`, 18
+  spinners, toggle off AND on (was 17/11). D5 + hang did not recur. Gates: lib
+  374 + all integration green, crash harness 31, clippy `-D warnings` + fmt
+  clean. Peak RSS ~9.7 MB. **No §3 decision reopened (D5 not touched).**
+- Docs: spec file dated root-cause + Status→SHIPPED; `backlog_index.md` row 16 +
+  "Next up" (item 11 flip now unblocked); `PROGRESS.md` entry (before/after
+  matrix + peak RSS); `engine_design.md` §4.1/§4.3 + footer inline corrections.
 
 ### 2026-07-12 — Concurrency correctness matrix built; item 16 found to be toggle-independent + worse
 

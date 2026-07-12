@@ -461,6 +461,147 @@ fn vacuum_interleaved_with_concurrent_index_writes() {
 /// row lock manager can form a cycle. The wait-for-graph detector must break it
 /// cleanly (a `Deadlock`/`WriteConflict` one side retries) with no hang — never a
 /// livelock or a corrupted index.
+/// Item-16 regression (MVCC visibility anomaly under concurrent SQL writes).
+/// Eight writers churn paired cross-row UPDATEs (opposite lock order, so
+/// conflicts + aborts are constant) while two readers repeatedly scan. The
+/// logical row set never changes, so **every** reader snapshot must see exactly
+/// ids 1..=8 — no duplicate id (an aborting txn's superseded version wrongly
+/// visible alongside its successor), no missing id (its restored version
+/// wrongly hidden), and `COUNT(*)` == 8 — and the final quiescent state must be
+/// exactly those 8 rows (no persistent duplicate). Before the abort-ordering fix
+/// in `txn.rs` this fails at this geometry *without* external CPU load (the
+/// matrix's 8w×8rows + readers cell); it is the standalone reproducer the
+/// item-16 spec asks for. Run under both toggle settings — the anomaly is not
+/// gated on `UNIDB_CONCURRENT_SQL_WRITES`.
+fn readers_during_cross_row_churn(toggle_on: bool) {
+    with_deadline(90, move || {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(dir.path(), 0).unwrap());
+        engine.set_deferred_sync(true);
+        engine.set_concurrent_sql_writes(toggle_on);
+
+        let rows: i64 = 8;
+        {
+            let x = engine.begin().unwrap();
+            engine
+                .execute_sql(x, "CREATE TABLE t (id INT, k INT)")
+                .unwrap();
+            engine
+                .execute_sql(x, "CREATE INDEX t_k ON t USING BTREE (k)")
+                .unwrap();
+            let vals: Vec<String> = (1..=rows).map(|i| format!("({i}, {})", 10 * i)).collect();
+            engine
+                .execute_sql(
+                    x,
+                    &format!("INSERT INTO t (id, k) VALUES {}", vals.join(", ")),
+                )
+                .unwrap();
+            engine.commit(x).unwrap();
+        }
+
+        let expected: Vec<i64> = (1..=rows).collect();
+        let done = Arc::new(AtomicUsize::new(0));
+        let writers = 8usize;
+        let rounds = 120i64;
+        let barrier = Arc::new(Barrier::new(writers));
+
+        let mut readers = Vec::new();
+        for _ in 0..2 {
+            let engine = Arc::clone(&engine);
+            let done = Arc::clone(&done);
+            let expected = expected.clone();
+            readers.push(thread::spawn(move || {
+                while done.load(Ordering::Relaxed) == 0 {
+                    let x = engine.begin().unwrap();
+                    let mut ids = select_ids(&engine, "SELECT id FROM t");
+                    // In-snapshot oracle: exactly the seeded id set, no duplicates.
+                    ids.sort_unstable();
+                    let n = ids.len();
+                    ids.dedup();
+                    assert_eq!(ids.len(), n, "duplicate id visible in one snapshot");
+                    assert_eq!(ids, expected, "reader snapshot lost/gained a live row");
+                    let c = match engine
+                        .execute_sql(x, "SELECT COUNT(*) FROM t")
+                        .unwrap()
+                        .into_iter()
+                        .next()
+                        .unwrap()
+                    {
+                        SqlResult::Rows { rows, .. } => match rows[0][0] {
+                            Literal::Int(n) => n,
+                            ref o => panic!("expected Int, got {o:?}"),
+                        },
+                        o => panic!("expected Rows, got {o:?}"),
+                    };
+                    assert_eq!(c, rows, "COUNT(*) disagrees with the invariant row count");
+                    engine.commit(x).unwrap();
+                }
+            }));
+        }
+
+        let mut handles = Vec::new();
+        for w in 0..writers {
+            let engine = Arc::clone(&engine);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                for r in 0..rounds {
+                    let a = (r + w as i64) % rows + 1;
+                    let b = (r + w as i64 + 1) % rows + 1;
+                    let (first, second) = if w % 2 == 0 { (a, b) } else { (b, a) };
+                    let v = 100 + r;
+                    loop {
+                        let xid = engine.begin().unwrap();
+                        let step = engine
+                            .execute_sql(xid, &format!("UPDATE t SET k = {v} WHERE id = {first}"))
+                            .and_then(|_| {
+                                engine.execute_sql(
+                                    xid,
+                                    &format!("UPDATE t SET k = {v} WHERE id = {second}"),
+                                )
+                            })
+                            .and_then(|_| engine.commit(xid));
+                        match step {
+                            Ok(_) => break,
+                            Err(DbError::Deadlock { .. })
+                            | Err(DbError::WriteConflict { .. })
+                            | Err(DbError::SerializationFailure { .. }) => {
+                                let _ = engine.abort(xid);
+                            }
+                            Err(e) => panic!("unexpected error: {e:?}"),
+                        }
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        done.store(1, Ordering::Relaxed);
+        for h in readers {
+            h.join().unwrap();
+        }
+
+        // Quiescent state: exactly the 8 seeded ids, no persistent duplicate.
+        let mut final_ids = select_ids(&engine, "SELECT id FROM t");
+        final_ids.sort_unstable();
+        assert_eq!(
+            final_ids, expected,
+            "final state is not exactly the seeded rows"
+        );
+    });
+}
+
+#[test]
+fn item16_readers_during_cross_row_churn_toggle_off() {
+    readers_during_cross_row_churn(false);
+}
+
+#[test]
+fn item16_readers_during_cross_row_churn_toggle_on() {
+    readers_during_cross_row_churn(true);
+}
+
 #[test]
 fn cross_row_update_deadlock_resolves_no_hang() {
     with_deadline(60, || {

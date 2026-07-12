@@ -3978,3 +3978,64 @@ Linux host run for publishable *absolute* durable numbers; larger `MM_SAMPLE` to
 tighten the Docker curve. Moat B (log-as-source-of-truth / derived consumers) is a
 separate design — the WAL is physical and WAL-derived streams were rejected
 (`queue/mod.rs`); B's substrate is a generalization of M4's `__events__`.
+
+---
+
+## MVCC visibility anomaly under concurrent SQL writes (backlog item 16)   [DONE]   2026-07-12
+
+**PR:** _pending (branch `16-visibility-fix`)_
+**Summary:** Root-caused and fixed the item-16 MVCC visibility anomaly. A single
+abort-ordering bug in `TransactionManager::abort` — removing the aborting xid
+from the `active` set **before** physically undoing its heap writes — let a
+concurrent snapshot classify an aborting transaction's still-present versions as
+committed (visibility has no "aborted" state by design). That produced wrong
+reader results and, via a concurrent writer chaining onto the unlocked
+new-version RowId, **persistent** duplicate/missing rows after quiescence. The
+fix keeps the xid `active` (and its row locks held) through the whole physical
+undo, removing it only afterward. Single-site change in `src/txn.rs`; no on-disk
+format change; toggle-off behavior unchanged except for this ordering.
+
+**Metric — concurrency correctness matrix** (`benches/conc_matrix.rs` via
+`scripts/report.sh --conc`; release, native macOS M5 Pro 18 cores, 18 CPU-
+contention spinners). This is a **correctness** oracle, not throughput — a cell
+FAILs if any repeat shows a duplicate/missing id, a `COUNT(*)` disagreement, a
+sum-invariant break, an index-vs-scan mismatch, a D5 error, or a hang:
+
+| Run | Repeats/cell | Spinners | Result | Peak RSS |
+|-----|--------------|----------|--------|----------|
+| Before (`main` @ `0c09a70`) | 3  | 18 | **17 PASS · 11 FAIL of 28** | — |
+| After  (`16-visibility-fix`) | 10 | 18 | **28 PASS · 0 FAIL of 28** | ~9.7 MB |
+
+All previously-failing cells now pass 10/10, **toggle off (production default)
+and on**: cross-row churn (8w×8rows, indexed *and* unindexed), readers-during-
+churn (RC/RR/SER), parallel-scan readers, transfer-sum, vacuum×churn, and
+delete-reinsert. The intermittent D5-flush error and the >120 s hang did **not**
+recur — they were downstream of the corruption, not separate bugs. Peak RSS is
+buffer-pool bounded (~9.7 MB, unchanged by the fix; `/usr/bin/time -l` on a
+focused churn run).
+
+**Root-cause evidence (the failing interleaving, not a story):**
+- `src/txn.rs::aborting_txn_new_version_never_visible_to_concurrent_snapshot` —
+  deterministic: a barrier pins an observer scan to the exact abort midpoint.
+  Pre-fix it reads the doomed `"v2"`; post-fix `"v1"`.
+- `tests/concurrent_writers.rs::item16_readers_during_cross_row_churn_{off,on}`
+  — the 8w×8rows + 2-reader geometry. Fails pre-fix without external CPU load
+  (`reader snapshot lost/gained a live row`, `COUNT(*) disagrees`, and a >90 s
+  hang); passes post-fix, standalone, repeatedly.
+
+**Crash harness:** unchanged at **31** — all green. Recovery's undo is
+single-threaded, so the concurrency window this fixes was never exposed there;
+no crash-path change was needed.
+**What changed:** `src/txn.rs::abort` reordered (undo + WAL-abort while the xid
+is still `active`; drop from `active` / mark aborted / `release_all` only after);
+docstring on `abort` and `mvcc.rs`'s invariant re-stated;
+`docs/design/engine_design.md` §4.1/§4.3 + footer corrected inline.
+**Known limitations / tech debt:** none new. `commit()`'s early
+remove-from-`active` is intentional and correct (its data *is* committed and
+already durable on the heap) — only `abort` needed reordering.
+**Deferred to later milestones:** item 11's `UNIDB_CONCURRENT_SQL_WRITES`
+default-ON flip is now unblocked on correctness grounds (the matrix passes
+toggle-on 10/10); the flip itself remains a separate item.
+**Locked-decision changes:** none. D5 was **not** reopened — the D5-flush symptom
+was a downstream effect of the abort-ordering corruption and does not recur once
+it is fixed.
