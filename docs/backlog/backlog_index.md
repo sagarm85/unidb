@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `18_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `19_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -31,6 +31,7 @@
 | 15 | `15_parallel_worker_governance.md` | Improvement | ✅ SHIPPED (PROGRESS: Parallel worker governance) |
 | 16 | `16_concurrent_sql_writes_visibility_anomaly.md` | Improvement | ✅ SHIPPED (PROGRESS: MVCC visibility anomaly under concurrent SQL writes) |
 | 17 | `17_mm_replaced_stack_headline.md` | Performance | ✅ SHIPPED (PROGRESS: Cross-domain headline vs replaced stack) |
+| 18 | `18_engine_access_contract.md` | Milestone | ⏳ NOT STARTED |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
@@ -40,6 +41,13 @@ Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 Ordered by my current ROI read; reorder as priorities change. Create each
 candidate's `NN_<slug>.md` when started — until then each is *filed inside* an
 existing doc.
+
+0. **Item 18 — Engine access & introspection contract (`18_engine_access_contract.md`,
+   already filed, NOT STARTED).** Application-driven: the `unidb-studio` console
+   needs real PK/FK/DDL introspection. Deliver it as an `information_schema`-style
+   **queryable catalog** + a documented access/query/type surface — *not* as new
+   app REST endpoints. Core is Epic C (catalog relations for PK/FK/indexes/DDL).
+   High ROI: unblocks any tool built on the engine, studio first.
 
 1. **Item 11 `UNIDB_CONCURRENT_SQL_WRITES` default-ON flip — ✅ SHIPPED
    2026-07-13** (branch `11-concurrent-writes-default-on`). Item 16 (below)
