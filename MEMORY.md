@@ -788,7 +788,7 @@
   parked Phase 2 SQL capability plan (`docs/backlog/
   phase2_sql_capability_expansion.md`). See Open questions below for
   what's still unresolved from M1-M5.
-- **Last updated:** 2026-07-12
+- **Last updated:** 2026-07-13
 
 ### Phase 1 — ACID & storage foundation (Core lane, branch `acid-hardening`)
 
@@ -2912,6 +2912,36 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-13 — Post-item-16 full QA battery on merged `main` — PASS (production-ready gates)
+
+- Ran the complete validation battery as three sequential tiers on `main`
+  @ `fb33c4d` (item-16 fix merged), per CLAUDE.md §7/§8:
+  - **Tier 1 (functional/regression):** default suite, crash harness 31/31,
+    server suite, workspace (attach/embed), `concurrent_writers` standalone
+    ×7 (M7 lesson), loom model, clippy `-D warnings`, fmt — all green.
+  - **Tier 2 (concurrency stress):** full 28-cell matrix at
+    `CONC_REPEATS=10` + 18 spinners — **28 PASS · 0 FAIL** (280 clean
+    executions, toggle off AND on). Report committed:
+    `docs/performance/conc_matrix_20260713_041032.md`. The item-16 fix
+    holds at its acceptance gate; matrix legend updated (anomaly fixed —
+    cells are now its permanent regression gate).
+  - **Tier 3 (load/scale):** native multi-model report, baseline-matched
+    knobs vs the committed 2026-07-10 report — ladder W0/W4 within noise
+    (no regression from the abort-ordering fix); bulk scan **improved
+    2.7×** at ≥1M rows (17.5M vs 6.2M rec/s — item-15 parallel scan
+    default-ON now visible). PG column skipped (`PG_URL` unset) — absolute
+    unidb numbers are the regression signal. Report committed:
+    `docs/performance/multi_model_report_20260713_041622.md`.
+- **One defect found & fixed (test, not engine):** `server_txn::concurrent_
+  request_on_busy_session_is_409_txn_busy` failed 8/8 standalone — a timing
+  knife-edge (3000-statement batch vs fixed 200 ms probe), proven
+  pre-existing on pre-fix `main` (187986c), NOT an item-16 regression.
+  Rewritten with probe-until-busy loop + TXN_BUSY-aware retry; 12/12 green;
+  merged PR #51 (`f3df160`). Diagnosis recorded an engine fact: the SQL
+  session path takes row locks **NoWait** (waiter gets WRITE_CONFLICT, not
+  a park) — documented in the test for future authors.
+- Item-16 lane worktree `../unidb-item16` removed post-merge.
 
 ### 2026-07-12 — Item 16 root-caused + fixed (abort ordering); matrix 17/11 → 28/0
 

@@ -1127,14 +1127,14 @@ fn main() {
     println!(
         "_How to read this: rows with toggle **off** are the shipping production \
          default — any FAIL there is a release blocker. Rows with toggle *on* \
-         exercise the `UNIDB_CONCURRENT_SQL_WRITES` path that backlog item 16 \
-         must clear before its planned default-ON flip; the known item-16 MVCC \
-         visibility anomaly (a superseded row version remaining visible after \
-         cross-row UPDATE churn) is expected to surface intermittently in the \
-         toggle-on churn/reader cells until it is root-caused and fixed. \
-         Intermittency caveat: a PASS here is evidence, not proof — the anomaly \
-         reproduced ~1–5 times per 6 contended runs on Linux/debug; raise \
-         `CONC_REPEATS` (and run alongside other load) to tighten the net._"
+         exercise the `UNIDB_CONCURRENT_SQL_WRITES` path (item 11's default-ON \
+         flip candidate). The item-16 MVCC visibility anomaly this matrix was \
+         built to catch (abort dropped the xid from `active` before undo) was \
+         root-caused and FIXED 2026-07-12 — see \
+         `docs/backlog/16_concurrent_sql_writes_visibility_anomaly.md`; these \
+         cells now stand as its permanent regression gate. Intermittency \
+         caveat: a PASS is evidence, not proof — raise `CONC_REPEATS` (and run \
+         alongside other load) to tighten the net._"
     );
 
     if n_fail > 0 && std::env::var("CONC_STRICT").as_deref() == Ok("1") {
