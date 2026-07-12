@@ -232,6 +232,36 @@ fn lock_txn(shared: &SharedTxn) -> MutexGuard<'_, TxnInner> {
     shared.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+// Test-only seam (item-16 regression): invoked inside `abort` at the instant
+// undo is about to begin. A test installs a hook here to observe the
+// heap/visibility state at exactly that moment — the point where the pre-fix
+// code had already dropped the aborting xid from `active` (making its
+// not-yet-undone writes look committed). A no-op, zero-cost in normal builds.
+#[cfg(test)]
+thread_local! {
+    static ABORT_MIDPOINT_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Install (or clear) the abort-midpoint hook on the current thread (test-only).
+#[cfg(test)]
+pub(crate) fn set_abort_midpoint_hook(hook: Option<Box<dyn FnMut()>>) {
+    ABORT_MIDPOINT_HOOK.with(|h| *h.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+fn run_abort_midpoint_hook() {
+    ABORT_MIDPOINT_HOOK.with(|h| {
+        if let Some(f) = h.borrow_mut().as_mut() {
+            f();
+        }
+    });
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn run_abort_midpoint_hook() {}
+
 pub struct TransactionManager {
     inner: SharedTxn,
 }
@@ -493,6 +523,25 @@ impl TransactionManager {
     /// "still active," so a merely-flagged-aborted xid whose tuples were
     /// left untouched would look committed to any snapshot taken after the
     /// abort. See MEMORY.md's design note for the full reasoning.
+    ///
+    /// **Ordering (item-16 root-cause fix).** The xid stays in `active` for the
+    /// *entire* physical undo, and its row locks are released only after undo
+    /// completes. This is load-bearing, not incidental: `mvcc::is_visible`
+    /// classifies any xid that is not in `active` (and below `next_xid`) as
+    /// committed. If `abort` removed the xid from `active` *before* reversing its
+    /// heap writes — as it did before this fix — then during the undo window a
+    /// concurrent snapshot would treat the aborting transaction's still-present
+    /// UPDATE/INSERT versions as committed: its new version becomes visible while
+    /// the old version it superseded (xmax = this xid) becomes invisible. A
+    /// concurrent reader then sees a doomed version (a wrong count / an extra or
+    /// missing row); worse, a concurrent writer can acquire the *unlocked*
+    /// new-version RowId and build a fresh version chain on top of it, after
+    /// which undo reverts the old version to live — leaving two live versions of
+    /// one logical row (a persistent duplicate) or none (a persistent missing
+    /// row). Keeping the xid `active` (and its locks held) until undo is complete
+    /// makes the whole rollback atomic to every other snapshot: they see the
+    /// pre-abort committed state throughout, then the restored state — never the
+    /// half-undone middle.
     pub fn abort(
         &self,
         xid: Xid,
@@ -501,12 +550,19 @@ impl TransactionManager {
         wal: &Wal,
         lock_mgr: &LockManager,
     ) -> Result<()> {
-        let txn = self
-            .lock()
-            .active
-            .remove(&xid)
-            .ok_or(DbError::TxnNotActive { xid })?;
-        for action in txn.undo_log.iter().rev() {
+        // Read the undo actions + WAL chain tail WITHOUT leaving `active`: the
+        // xid must remain "active" (its not-yet-undone tuples correctly invisible
+        // to other snapshots) for the whole physical reversal below (item 16).
+        let (undo_log, last_lsn) = {
+            let inner = self.lock();
+            let txn = inner
+                .active
+                .get(&xid)
+                .ok_or(DbError::TxnNotActive { xid })?;
+            (txn.undo_log.clone(), txn.last_lsn)
+        };
+        run_abort_midpoint_hook();
+        for action in undo_log.iter().rev() {
             match *action {
                 UndoAction::Insert { page_id, slot } => {
                     heap.undo_insert(page_id, slot, xid, pool, wal)?;
@@ -516,9 +572,14 @@ impl TransactionManager {
                 }
             }
         }
-        wal.abort_user_txn(xid, txn.last_lsn)?;
+        wal.abort_user_txn(xid, last_lsn)?;
+        // Undo is physically complete: only now drop the xid from `active` and
+        // record it aborted. From this point `mvcc::is_visible` treating it as
+        // committed is correct — its inserts are self-stamped invisible and its
+        // xmax stamps are reverted, so no live tuple bears this xid any longer.
         {
             let mut inner = self.lock();
+            inner.active.remove(&xid);
             inner.aborted.insert(xid);
             // SSI (P1.d): an aborted txn's writes are physically undone, so it
             // never enters `committed_ser`; drop committed-ser state once
@@ -527,6 +588,8 @@ impl TransactionManager {
                 inner.committed_ser.clear();
             }
         }
+        // Locks released last: while undo was reversing this xid's versions, a
+        // concurrent writer must not be able to acquire the row it is restoring.
         lock_mgr.release_all(xid);
         tracing::info!(xid, "transaction abort");
         Ok(())
@@ -638,6 +701,104 @@ mod tests {
             heap.get(rid, &snap_after, a + 1, &pool),
             Err(DbError::NoVisibleVersion { .. })
         ));
+    }
+
+    /// Item-16 root-cause proof: while a transaction is aborting, no other
+    /// snapshot may see the version it inserted (its writes are being physically
+    /// undone). The observer thread scans at the exact instant `abort` is about
+    /// to run undo — the moment the pre-fix code had already dropped the xid from
+    /// `active`, which made `mvcc::is_visible` treat the aborting xid's tuples as
+    /// committed. Pre-fix this scan sees the doomed new version ("v2"); the fix
+    /// keeps the xid `active` through undo so the observer only ever sees the
+    /// restored committed value ("v1"). Deterministic — the barrier pins the
+    /// observation to the abort midpoint, no timing luck required.
+    #[test]
+    fn aborting_txn_new_version_never_visible_to_concurrent_snapshot() {
+        use std::sync::{Arc, Barrier, Mutex as StdMutex};
+        let dir = tempdir().unwrap();
+        let (pool, heap, wal) = setup(dir.path());
+        let mgr = TransactionManager::new();
+        let lock_mgr = LockManager::new();
+        let shared = mgr.shared();
+
+        // Seed a committed row "v1".
+        let x0 = mgr.begin(IsolationLevel::ReadCommitted, &wal).unwrap();
+        let rid1 = heap.insert(b"v1", x0, &pool, &wal).unwrap();
+        mgr.record_undo(
+            x0,
+            UndoAction::Insert {
+                page_id: rid1.page_id,
+                slot: rid1.slot,
+            },
+        )
+        .unwrap();
+        mgr.commit(x0, &wal, &lock_mgr).unwrap();
+
+        // xid_a updates it to "v2" but will abort.
+        let xa = mgr.begin(IsolationLevel::ReadCommitted, &wal).unwrap();
+        let new_rid = heap
+            .update(rid1, b"v2", xa, &pool, &wal, &lock_mgr)
+            .unwrap();
+        mgr.record_undo(
+            xa,
+            UndoAction::XmaxStamp {
+                page_id: rid1.page_id,
+                slot: rid1.slot,
+            },
+        )
+        .unwrap();
+        mgr.record_undo(
+            xa,
+            UndoAction::Insert {
+                page_id: new_rid.page_id,
+                slot: new_rid.slot,
+            },
+        )
+        .unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let observed: Arc<StdMutex<Vec<Vec<u8>>>> = Arc::default();
+
+        std::thread::scope(|s| {
+            let obs = {
+                let barrier = Arc::clone(&barrier);
+                let observed = Arc::clone(&observed);
+                let shared = shared.clone();
+                let (heap, pool) = (&heap, &pool);
+                s.spawn(move || {
+                    barrier.wait(); // wait until abort reaches its undo midpoint
+                    let (snap, self_xid, _reg) = super::read_snapshot(&shared);
+                    let rows: Vec<Vec<u8>> = heap
+                        .scan(&snap, self_xid, pool)
+                        .unwrap()
+                        .into_iter()
+                        .map(|(_, d)| d)
+                        .collect();
+                    *observed.lock().unwrap() = rows;
+                    barrier.wait(); // let abort proceed to finish undo
+                })
+            };
+
+            // Pause abort at the undo midpoint so the observer can scan there.
+            {
+                let barrier = Arc::clone(&barrier);
+                super::set_abort_midpoint_hook(Some(Box::new(move || {
+                    barrier.wait();
+                    barrier.wait();
+                })));
+            }
+            mgr.abort(xa, &pool, &heap, &wal, &lock_mgr).unwrap();
+            super::set_abort_midpoint_hook(None);
+            obs.join().unwrap();
+        });
+
+        let seen = observed.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![b"v1".to_vec()],
+            "a concurrent snapshot must see the restored committed row 'v1', never \
+             the aborting transaction's doomed version 'v2' (item-16 abort ordering)"
+        );
     }
 
     #[test]

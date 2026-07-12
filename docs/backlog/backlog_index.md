@@ -29,7 +29,7 @@
 | 13 | `crud_performance.md` | Performance | ✅ SHIPPED (PROGRESS: CRUD performance — Phase A + B) |
 | 14 | `parallel_scan.md` | Milestone | ✅ SHIPPED (PROGRESS: Milestone P + follow-ups) |
 | 15 | `15_parallel_worker_governance.md` | Improvement | ✅ SHIPPED (PROGRESS: Parallel worker governance) |
-| 16 | `16_concurrent_sql_writes_visibility_anomaly.md` | Improvement | ⬜ NOT STARTED |
+| 16 | `16_concurrent_sql_writes_visibility_anomaly.md` | Improvement | ✅ SHIPPED (PROGRESS: MVCC visibility anomaly under concurrent SQL writes) |
 | 17 | `17_mm_replaced_stack_headline.md` | Performance | ✅ SHIPPED (PROGRESS: Cross-domain headline vs replaced stack) |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
@@ -37,18 +37,19 @@ Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 
 ## Next up (candidates — pick one, then create `NN_<slug>.md`)
 
-Ordered by my current ROI read; reorder as priorities change. Item 16 has its
-spec file (create the others' `NN_<slug>.md` when started — until then each is
-*filed inside* an existing doc).
+Ordered by my current ROI read; reorder as priorities change. Create each
+candidate's `NN_<slug>.md` when started — until then each is *filed inside* an
+existing doc.
 
-1. **Item 16 — MVCC visibility anomaly under concurrent SQL writes**
-   (`16_concurrent_sql_writes_visibility_anomaly.md` — full spec, evidence,
-   repro commands, and DoD live THERE, not here). Top priority: the
-   2026-07-12 concurrency-correctness matrix showed the anomaly family is
-   **not** gated on the `UNIDB_CONCURRENT_SQL_WRITES` toggle — the
-   production default is affected (short/torn reads; persistent duplicate
-   ids after vacuum; plus a D5-violation error and a hang with the toggle
-   on). Blocks item 11's default-ON flip.
+1. **Item 11 `UNIDB_CONCURRENT_SQL_WRITES` default-ON flip — now unblocked on
+   correctness grounds.** Item 16 (below) root-caused and fixed the MVCC
+   visibility anomaly; the 2026-07-12 correctness matrix passes 28/28 toggle-on
+   at `CONC_REPEATS=10`. The flip itself (default change + a throughput
+   re-measure) is the remaining work. **Item 16 — MVCC visibility anomaly under
+   concurrent SQL writes — is ✅ SHIPPED** (2026-07-12, branch
+   `16-visibility-fix`); root cause (abort dropped the xid from `active` before
+   undo), fix, and evidence live in
+   `16_concurrent_sql_writes_visibility_anomaly.md`; metrics in `PROGRESS.md`.
 2. **A2 / HOT-style update — DEFERRED (ROI vs §1), not filed.** Would reopen
    locked decision D4 (`FORMAT_VERSION` bump) + recovery + new crash points for a
    ~0.34× → ~0.42× UPDATE-bulk gain on a **single-model** CRUD bench that §1 says

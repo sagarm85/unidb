@@ -1,7 +1,8 @@
 # MVCC visibility anomaly under concurrent SQL writes (root-cause + fix)
 
 **Type:** Improvement
-**Status:** NOT STARTED
+**Status:** ✅ SHIPPED (2026-07-12, branch `16-visibility-fix`) — root cause below;
+metrics in `PROGRESS.md` "MVCC visibility anomaly under concurrent SQL writes".
 
 > **Naming note (why "#16" appears in several places).** This is backlog item
 > **16** in [`backlog_index.md`](backlog_index.md). It is **unrelated to PR
@@ -78,6 +79,64 @@ CONC_ONLY=readers-during CONC_REPEATS=10 scripts/report.sh --conc   # fastest lo
 CONC_ONLY=transfer      CONC_REPEATS=10 scripts/report.sh --conc    # toggle-OFF 7/10
 CONC_ONLY=vacuum-churn  CONC_REPEATS=10 scripts/report.sh --conc    # persistent-corruption case
 ```
+
+## Root cause (2026-07-12) — abort dropped the xid from `active` before undo
+
+All three symptom classes share **one** cause: `TransactionManager::abort`
+(`src/txn.rs`) removed the aborting xid from the `active` set **before** it
+physically reversed the transaction's heap mutations (and before releasing its
+row locks):
+
+```
+let txn = self.lock().active.remove(&xid)…;   // (1) xid no longer "active"
+for action in txn.undo_log.iter().rev() { heap.undo_* }   // (2) heap still holds its writes
+…
+lock_mgr.release_all(xid);                     // (last) locks freed
+```
+
+Visibility has **no "aborted" state** by design: `mvcc::is_committed_at_snapshot`
+treats any xid that is *not in `active`* and *below `next_xid`* as **committed**
+(the `mvcc.rs` header states this is sound only because an aborted txn's writes
+are physically undone). Step (1) breaks that premise: between (1) and the end of
+(2) the aborting xid is neither active nor undone, so a concurrent snapshot
+classifies its still-present writes as committed —
+
+- its new UPDATE version (`xmin` = aborting xid) becomes **visible**, and
+- the old version it superseded (`xmax` = aborting xid) becomes **invisible**.
+
+A concurrent reader therefore sees the doomed version — a wrong `COUNT(*)`, an
+extra id, or (when it sees the hidden old + not-yet-inserted new) a missing id.
+Worse for durability: the new version's `RowId` is **not** locked (`heap.update`
+only locks the *old* version), so a concurrent writer can supersede it and build
+a fresh version chain on top — after which undo reverts the old version to live,
+leaving **two live versions of one logical row** (the persistent post-vacuum
+duplicate) or, symmetrically, **none** (the persistent missing row).
+
+- **Symptom class 1** (visibility / duplicate / missing) is this directly.
+- **Symptom class 2** (D5 "page LSN > durable WAL LSN" on flush) and
+  **class 3** (>120 s hang) were **downstream** of the corruption, not separate
+  bugs: they did **not** reproduce across the full matrix at `CONC_REPEATS=10`
+  once the ordering was fixed (28/28 PASS, toggle off *and* on, 18 spinners).
+  **No §3 locked decision (D5 especially) was reopened.**
+
+**Fix (single-site, `src/txn.rs::abort`).** Read the undo actions while the xid
+is still in `active`, run the physical undo + WAL abort, and only *then* remove
+the xid from `active` / mark it aborted / `release_all`. The whole rollback is
+now atomic to every other snapshot: they see the pre-abort committed state
+throughout, then the restored state — never the half-undone middle. Toggle-off
+behavior is unchanged except for this ordering; no on-disk format change; the
+crash harness is untouched (recovery's single-threaded undo was never exposed).
+
+**Evidence (the failing interleaving, not a story).**
+- `src/txn.rs::aborting_txn_new_version_never_visible_to_concurrent_snapshot` —
+  a deterministic unit test that pins an observer scan to the exact abort
+  midpoint via a barrier. Pre-fix it reads the doomed `"v2"`; post-fix `"v1"`.
+- `tests/concurrent_writers.rs::item16_readers_during_cross_row_churn_{off,on}`
+  — the 8w×8rows + 2-reader geometry. Fails pre-fix **without** external CPU
+  load (observed `reader snapshot lost/gained a live row`, `COUNT(*)
+  disagrees`, and a >90 s hang); passes post-fix, standalone, repeatedly.
+- `benches/conc_matrix.rs` via `scripts/report.sh --conc`: **17 PASS/11 FAIL →
+  28 PASS/0 FAIL** at `CONC_REPEATS=10`.
 
 ## Definition of done
 

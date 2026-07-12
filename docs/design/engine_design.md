@@ -322,7 +322,10 @@ fsync-failure (poison) path.
 and `is_visible(tuple, snapshot)`. There is deliberately **no "aborted"
 state** in visibility: `is_committed_at_snapshot` treats
 not-in-active-set-and-in-range as committed. Abort therefore requires
-**physical undo** (§4.3).
+**physical undo** (§4.3) — *and* that undo must run while the aborting xid is
+still in the active set (§4.3, item-16 correction 2026-07-12): the "no aborted
+state" shortcut is only sound if a transaction's tuples are physically gone
+before other snapshots stop seeing it as active.
 
 ### 4.2 Isolation levels (D10, D12; SSI completed P1.d)
 
@@ -385,6 +388,25 @@ not-in-active-set-and-in-range as committed. Abort therefore requires
   abort-path code. The corresponding risk (a forgotten `record_undo` is a
   *silent* visibility bug) is guarded by per-feature abort-visibility
   tests (§10).
+- **Abort ordering (item-16 correction, 2026-07-12 — was a concurrency bug,
+  not a tradeoff).** `abort()` must keep the xid in the `active` set (and keep
+  its row locks held) for the *entire* physical undo, dropping it and releasing
+  locks only afterward. The pre-fix code removed the xid from `active` *first*
+  and then undid the heap — opening a window in which, because visibility has no
+  "aborted" state (§4.1), a concurrent snapshot classified the still-present
+  writes of the aborting txn as *committed*: its doomed UPDATE version became
+  visible while the old version it superseded became invisible. A concurrent
+  reader then returned a wrong row/count; worse, a concurrent writer could
+  acquire the *unlocked* new-version `RowId` and build a fresh chain on top of
+  it, after which undo restored the old version — leaving two live versions of
+  one logical row (a persistent duplicate) or none (a persistent missing row).
+  This was the root cause of backlog item 16's whole symptom family (including
+  the intermittent D5-flush error and the >120 s hang, which were downstream of
+  the corruption). Proven by a deterministic pin-the-midpoint test
+  (`txn.rs::aborting_txn_new_version_never_visible_to_concurrent_snapshot`) and
+  a contended geometry regression
+  (`tests/concurrent_writers.rs::item16_readers_during_cross_row_churn_*`); see
+  `docs/backlog/16_concurrent_sql_writes_visibility_anomaly.md`.
 
 ### 4.4 Transaction manager
 
@@ -1380,4 +1402,12 @@ HTTP (`X-Txn-Id`, per-session isolation, busy/principal/idle-reaper protection �
 idle-expiring result cursors. Server-layer only — no format change, crash
 harness stays 29; §8/§9 updated (including the stale writer-thread description,
 corrected to the P5.e-3 `Arc<Engine>`/`spawn_blocking` shape).**
+**MVCC abort-ordering fix (2026-07-12, item 16, branch `16-visibility-fix`):
+`TransactionManager::abort` now keeps the aborting xid in the `active` set (and
+its row locks held) for the whole physical undo, dropping it only afterward —
+closing the window in which a concurrent snapshot classified an aborting txn's
+not-yet-undone writes as committed (§4.1/§4.3 corrections). Root cause of the
+item-16 MVCC visibility anomaly family (duplicate/missing rows, plus the
+downstream D5-flush error and >120 s hang). No format change; crash harness
+unchanged. See `docs/backlog/16_concurrent_sql_writes_visibility_anomaly.md`.**
 Update alongside the next milestone's closeout.*
