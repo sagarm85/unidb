@@ -386,3 +386,46 @@ both `main` and the item-12 branch; the test passes reliably in isolation
 fixed before the planned default-ON flip of `UNIDB_CONCURRENT_SQL_WRITES`;
 until then the toggle stays default-off** (production default unaffected).
 Tracked as backlog "Next up" item 16 in `backlog_index.md`.
+
+### Update (2026-07-12): matrix harness widens the finding — NOT toggle-gated
+
+A dedicated concurrency-correctness matrix now exists to chase exactly this
+class of bug: `benches/conc_matrix.rs` (28 production-shaped concurrent
+read/write cells × toggle × index × reader isolation, pass/fail oracles,
+CPU-contention spinners, repeats), appended to every `scripts/report.sh`
+report and runnable standalone as `scripts/report.sh --conc`. First release
+runs (native macOS, M5 Pro 18 cores, **no spinners needed**) show the
+2026-07-11 sentence "production default (off) unaffected" was **too
+optimistic — evidence-based correction, not a rewrite**:
+
+| shape (release, repeats shown) | toggle | observed |
+|---|---|---|
+| balance transfers (6w, 8 accts, RR writers) + RC/RR/SER readers | **off** | **7/10 FAIL** — one RC statement `SELECT` misses an account (7 rows / sum 699) |
+| continuous vacuum racing cross-row churn (4w × 8 rows) | **off** | **3/10 FAIL** — **duplicate visible ids persist after quiescence + final vacuum** |
+| cross-row churn 8w × 8 rows, indexed | **off** | **1/6 FAIL** — post-quiescence duplicate ids |
+| cross-row churn 8w × 8 rows, indexed | on | **6/6 FAIL**, incl. one **`Recovery("D5 violation on flush: page LSN > durable WAL LSN")` at commit** |
+| readers-during-churn (RC/RR/SER) | on | 5–6/6 FAIL — a live row vanishes from one snapshot |
+| readers-during-churn (RC/RR/SER) | **off** | 6/6 PASS |
+| same shapes at 2w × 2 rows (the original test geometry) | both | PASS — the original test was simply too small to catch it reliably |
+
+Symptom family: a scan concurrent with a cross-row multi-UPDATE commit either
+**also sees the superseded version** (duplicate id — the original
+3-rows-instead-of-2) or **misses the live row** (short scan / torn sum), and
+under vacuum churn the duplicates **persist at quiescence** (real corruption).
+The unindexed 8w churn cell also fails toggle-on (5/6), so the crabbing B-tree
+is not the (only) culprit; the common thread is MVCC visibility around
+commit-during-scan on the multi-statement UPDATE path. The D5 flush violation
+is possibly a separate second bug — triage together in item 16.
+
+**Official full-matrix run (2026-07-12, release, 3 repeats/cell, 18 contention
+spinners): 17 PASS · 11 FAIL of 28 cells.** Toggle-**off** FAILs (production
+default): readers-during-churn RC reader `COUNT(*)=7` instead of 8 (2/3);
+transfer-sum short RC snapshot, 7 accounts / sum 699 (1/3). Toggle-**on**:
+the **exact original 2w×2rows item-16 geometry now fails 2/3** under spinners
+(duplicate id = the 3-rows-instead-of-2); 8w churn 3/3 (indexed AND
+unindexed); readers see `COUNT(*)=9` (the extra-row signature, 3/3) and
+RR/SER readers miss a live row (2–3/3); a parallel-scan-path reader missed a
+row (1/3); vacuum×churn persistent duplicates (2/3). One earlier run also
+hung >120 s in 8w indexed churn (recorded above). Regenerate the table any
+time with `scripts/report.sh --conc` (report lands in
+`docs/performance/conc_matrix_<ts>.md`, git-ignored).
