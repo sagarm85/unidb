@@ -101,6 +101,7 @@ CONC_ONLY=vacuum-churn  CONC_REPEATS=10 scripts/report.sh --conc    # persistent
   validation strategy).
 - `benches/conc_matrix.rs` + `scripts/report.sh --conc` (PR #46) — the
   reproducer/regression harness; report lands in
-  `docs/performance/conc_matrix_<ts>.md` (git-ignored).
+  `docs/performance/conc_matrix_<ts>.md` (committed — the dated reports under
+  `docs/performance/` are the durable measurement record).
 - `PROGRESS.md` "Index & heap write concurrency" — the item-11 unit whose
   toggle path first exposed the family.

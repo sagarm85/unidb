@@ -70,8 +70,9 @@ MM_SIZES=1000 MM_SAMPLE=30 MM_CRUD_ROWS=5000 MM_BULK_SIZES=10000,100000 MM_TX_SW
 | **Docker** | `docker/out/multi_model_report_<timestamp>.md` (+ `phases.csv`, `stats.csv`, run logs) |
 | **Native** | `docs/performance/multi_model_report_<timestamp>.md` |
 
-All generated output (`docker/out/`, the dated native reports) is **git-ignored** —
-it is a run artifact, not source.
+Docker-run output (`docker/out/`) is **git-ignored** (run artifact). The dated
+**native** reports under `docs/performance/` **are committed** — the durable
+measurement record alongside `PROGRESS.md`.
 
 ### What the report contains
 
