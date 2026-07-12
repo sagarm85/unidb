@@ -24,9 +24,8 @@
 __pycache__/
 *.pyc
 
-# Generated benchmark reports (produced by scripts/multi_model_report.sh)
-/docs/performance/multi_model_report_*.md
-/docs/performance/conc_matrix_*.md
+# Dated benchmark reports under docs/performance/ ARE committed (kept as the
+# measurement record). Only Docker-run output stays ignored (docker/out/ below).
 
 # Generated Docker report output (reports, logs, phase/stats CSVs from
 # scripts/report.sh --docker). The docker/ image + compose files ARE committed;
