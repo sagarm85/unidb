@@ -9,11 +9,10 @@
   auth model, error codes, and known limitations. Also documents the
   Rust attach client (M8).
 - [performance/](performance/) — benchmark evaluations against external
-  systems. `fssdb/` holds the head-to-head comparison against the FFS
-  database's published evals (<https://ffsdb.com/evals>), unidb's fresh
-  `cargo bench` numbers, and a same-machine Postgres + pgvector run — with
-  the architectural caveats that make the ratios meaningful (raw index
-  primitives vs a durable transactional engine).
+  systems (plus the git-ignored dated reports `scripts/report.sh` writes).
+  The retired FFS/ffsdb head-to-head comparison (`fssdb/`, removed
+  2026-07-12) lives in git history; its conclusions fed the M6–M8 milestone
+  set recorded in `PROGRESS.md`.
 - [backlog/](backlog/) — [`roadmap.md`](backlog/roadmap.md) is the **single
   forward plan**: positioning, the honest gap-to-a-real-database inventory,
   the 6-phase ACID-first scaling plan, the parallel-worktree lane model
