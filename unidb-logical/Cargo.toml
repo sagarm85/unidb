@@ -1,0 +1,22 @@
+[package]
+name = "unidb-logical"
+version = "0.1.0"
+edition = "2021"
+description = "Logical replication for unidb (backlog item 28, R2). Consumes the item-26 event stream from a primary engine and applies row-level changes (INSERT/UPDATE/DELETE) to a target engine. Reuses item-20's Dispatcher for at-least-once, offset-durable delivery."
+
+# `unidb-logical` is an APP-LAYER crate. It drives the existing
+# `poll_events`/`ack_events` API (via `unidb-dispatch`) and executes SQL on a
+# target `Arc<Engine>`. tokio lives here, not in the engine crate — the
+# "engine stays sync" invariant (CLAUDE.md) is preserved.
+[dependencies]
+unidb = { path = ".." }
+unidb-dispatch = { path = "../unidb-dispatch" }
+tokio = { version = "1.52", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+serde_json = "1.0"
+tracing = "0.1"
+async-trait = "0.1"
+thiserror = "1.0"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "time", "sync"] }

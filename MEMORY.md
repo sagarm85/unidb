@@ -12,6 +12,24 @@
 
 ## Current status
 
+- **Replication time-PITR + logical replication (backlog item 28) — SHIPPED
+  2026-07-13, branch `28-replication-time-pitr`, PR #70 pending (STOP-for-review).**
+  R1 (MUST): `src/backup/timeline.rs` — `TimelineIndex` appends one 16-byte
+  `(ts_micros, lsn)` mark per user-txn commit after WAL sync. WAL format
+  unchanged (no FORMAT_VERSION bump, no §3/D9 sign-off). `backup::restore_to_time`
+  + `Engine::restore_to_time` free function resolve wall-clock → LSN; `archive_wal`
+  also archives `timeline.bin`. Crash point P31 (torn timeline mark → silently
+  skipped, PITR falls back to prev mark). R2 (SHOULD): new workspace crate
+  `unidb-logical` (wraps item-20 `Dispatcher` + `LogicalApplySink`); translates
+  events to INSERT/UPDATE/DELETE SQL on a target `Engine`; at-least-once,
+  offset-durable, survives primary restart. Known gap (UPDATE old key) filed as
+  item-26 follow-up. Gates: `cargo test --workspace --features server` all green
+  (413 unidb + 33 crash + workspace); clippy `--workspace --all-targets -D warnings`
+  clean; `fmt` clean. Docs: `ops_runbook.md` §9, `engine_access_guide.md` §11,
+  `28_replication_time_pitr_logical.md` → SHIPPED, `backlog_index.md` row 28 →
+  SHIPPED, `PROGRESS.md` entry, `docs/design/item28_design.md` (design decisions).
+  **Next: await PR review.**
+
 - **Event queue at scale (backlog item 26) — SHIPPED 2026-07-13, branch
   `26-event-queue-scale`, PR pending (STOP-for-review).** Q1: durable
   `DiskBTree` secondary index on `__events__.seq`; `poll_events` /

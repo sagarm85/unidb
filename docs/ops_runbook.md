@@ -172,3 +172,87 @@ scrape_configs:
 - Put `UNIDB_LOG_DIR` on its own volume if log volume competes with data I/O.
 - Both stdout and the files are JSON, so a `docker logs`/journald → agent path
   works identically to tailing the files.
+
+---
+
+## 9. Time-based PITR (item 28, R1)
+
+### How it works
+
+Every user-transaction commit appends a 16-byte mark `(ts_micros, lsn)` to
+`timeline.bin` in the data directory. `restore_to_time` reads the timeline from
+the archive and resolves the target timestamp to the highest committed LSN at or
+before it.
+
+**Time is advisory; LSN is authoritative.** Resolution granularity = one mark per
+committed transaction. Clock skew (NTP step-back, VM migration) is handled: the
+algorithm picks `max(lsn)` where `mark.ts ≤ target`.
+
+### Archiving (required before PITR)
+
+```bash
+# Periodic archive run — archive WAL segments AND timeline in one call.
+# Run as a cron job or after taking a base backup.
+# (Embedded API)
+engine.archive_wal("/path/to/archive")?;
+```
+
+`archive_wal` now archives both WAL segment files and `timeline.bin` to the same
+archive directory.
+
+### Taking a base backup
+
+```bash
+# (Embedded API)
+engine.base_backup("/path/to/base")?;
+```
+
+The base backup includes `timeline.bin` so marks written before the backup base
+are available on restore.
+
+### Restoring to a wall-clock time
+
+```rust
+use unidb::Engine;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+// Target: 2026-07-13T14:30:00 UTC in microseconds.
+let target_ts_micros: u64 = 1_752_411_000_000_000;
+
+Engine::restore_to_time(
+    "/path/to/base",     // base backup directory
+    "/path/to/archive",  // archived WAL + timeline
+    "/path/to/restored", // fresh destination (created if absent)
+    target_ts_micros,
+)?;
+
+// Then open the restored directory normally.
+let engine = Engine::open("/path/to/restored", 0)?;
+```
+
+The call fails if no timeline mark exists at or before `target_ts_micros`
+(target is before the first recorded commit in the archive).
+
+### Resolution precision statement
+
+PITR resolution is one mark per committed transaction. For a workload
+committing 1 000 txn/s the typical resolution is ≤ 1 ms. For low-throughput
+workloads (one commit every 10 s), resolution is ≤ 10 s. Operators who need
+sub-second precision can increase commit rate or accept that the restored
+database reflects the most recent commit at or before the target.
+
+### Torn-mark crash safety (P31)
+
+A crash mid-append of a 16-byte mark leaves a partial record. On load it is
+silently skipped. PITR resolution falls back to the previous valid mark, not an
+error. Database durability is unaffected (the WAL is the source of truth).
+
+### Logical replication (item 28, R2)
+
+See `unidb-logical` crate README and `docs/engine_access_guide.md` §11 for the
+logical-replication subscriber setup. The key invariants are:
+
+- At-least-once delivery — deduplicate on event `seq` if exact-once is required.
+- Offset is durably stored in `__consumers__` on the primary — the subscriber
+  resumes from the correct position after a primary restart.
+- Target schema must be pre-created; the logical replicator applies DML only.

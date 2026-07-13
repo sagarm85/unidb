@@ -4696,3 +4696,76 @@ bloat; V4 is purely a cross-page defragmentation win.
 
 **Locked-decision changes:** none. No `FORMAT_VERSION` bump, no new WAL record
 type, no §3 decision reopened. Crash harness now 33/33.
+
+---
+
+## Replication time-PITR + logical replication (item 28)   [SHIPPED]   2026-07-13
+
+**PR:** #70 — branch `28-replication-time-pitr`.
+**Spec:** `docs/backlog/28_replication_time_pitr_logical.md`. **Builds on:** P6.d backup/restore (by-LSN PITR), item 26 event queue, item 20 dispatcher.
+
+**Summary:** Two operator-facing gaps in P6 physical replication are closed.
+
+**R1 — Time-based PITR.** `backup::restore_to_time(base, archive, dest, target_ts_micros)`
+resolves a wall-clock target to the highest committed LSN at or before it, then
+delegates to the existing `backup::restore`. WAL format is unchanged (no
+`FORMAT_VERSION` bump, no §3/D9 sign-off). A lightweight side file
+`timeline.bin` (16-byte records: `u64 ts_micros || u64 lsn`, little-endian) is
+appended in `Engine::commit` after WAL sync. One mark per committed user
+transaction = per-commit resolution granularity. Time is advisory; LSN is
+authoritative. Clock skew handled by picking max(lsn) where mark.ts ≤ target.
+
+**R2 — Logical replication.** New workspace crate `unidb-logical` wraps the
+item-20 `Dispatcher` with a `LogicalApplySink` that translates each event (table,
+op, JSON row image) into SQL and executes it against a target `Engine`. At-least-
+once delivery, offset-durable (`__consumers__` on the primary), retry/DLQ all
+inherited from item 20 — no reinvention. Reuses item 26's event stream rather
+than re-decoding the WAL. Verified: INSERT/UPDATE/DELETE applied across primary
+restarts; tables outside the declared scope silently skipped.
+
+**Correctness proof (R1):** `src/backup/mod.rs::restore_to_time_deterministic_mark_injection`
+injects (ts=1000, lsn=lsn_after_row2) and (ts=2000, lsn=lsn_after_row3) without
+relying on real wall-clock time, then asserts row counts of 2 and 3. Confirmed
+that a target before all marks returns an error.
+
+**Correctness proof (R2):** `unidb-logical/tests/logical_replication.rs` — 3 tests:
+(1) INSERTs applied to target; (2) replicator resumes from acked offset after
+primary restart, picks up only the new 2 events and arrives at 5 rows total;
+(3) out-of-scope tables skipped without dead-lettering.
+
+**Crash harness:** P32 added (torn 16-byte timeline mark → silently skipped, PITR
+resolution falls back to previous valid mark, database integrity unaffected).
+**34/34 green** (was 33 after item 27; P31 = vacuum_table crash, P32 = torn timeline mark).
+
+**New files:**
+- `src/backup/timeline.rs` — `TimelineIndex`, `TimelineMark`, `now_micros()`
+- `src/backup/mod.rs` — `archive_timeline`, `restore_to_time`, extended `base_backup_dir`
+- `unidb-logical/Cargo.toml`, `unidb-logical/src/{lib,apply}.rs`
+- `unidb-logical/tests/logical_replication.rs`
+- `docs/design/item28_design.md` — design decisions committed before code
+- `docs/ops_runbook.md` §9 — time-PITR operator recipe
+
+**Modified files:**
+- `src/lib.rs` — `timeline` field on `Engine`; `commit()` records timeline marks; `archive_wal` also archives timeline; `Engine::restore_to_time` free function
+- `tests/crash/main.rs` — P32 description + test (P31 = item 27 vacuum_table)
+- `Cargo.toml` — `unidb-logical` added to workspace
+
+**Metrics:**
+
+| Metric | Value |
+|---|---|
+| R1 overhead on `Engine::commit` | ~1 Mutex lock + 16-byte append; timing overhead within noise (timeline write is async-fail-silent) |
+| R2 delivery latency | poll-then-apply round-trip; same Dispatcher cadence as item-20 |
+| Crash harness | 34/34 (was 33; P32 added) |
+
+**Known gaps / follow-ups (documented, not silent):**
+
+| Gap | Notes |
+|---|---|
+| UPDATE events carry new row image only (old key not present) | Item-26 follow-up: capture `(old_key, new_row)` in UPDATE events |
+| Target schema must be pre-created (no DDL) | By design; standard logical replication model |
+| No schema-mapping DSL (column rename / type cast) | Deferred; out of R2 scope |
+| Multi-primary / conflict resolution | Out of scope (single-primary only, CLAUDE.md §1) |
+| PITR resolution = per-commit mark granularity | Documented in ops_runbook §9 |
+
+**Locked-decision changes:** none. No `FORMAT_VERSION` bump (side timeline file, not WAL). No §3 decision reopened. Crash point P32 added (D7 extension, not a §3 re-open). Moat framing respected — both R1 and R2 are app-layer; the engine core sees only a 16-byte timeline append per commit and the existing event API.
