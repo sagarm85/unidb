@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `20_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `25_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -33,6 +33,11 @@
 | 17 | `17_mm_replaced_stack_headline.md` | Performance | ✅ SHIPPED (PROGRESS: Cross-domain headline vs replaced stack) |
 | 18 | `18_engine_access_contract.md` | Milestone | ✅ SHIPPED (PROGRESS: Engine access & introspection contract (Milestone 18)) |
 | 19 | `19_sql_surface_gaps.md` | Improvement | ⏳ NOT STARTED |
+| 20 | `20_events_realtime_dispatcher.md` | Milestone | ⏳ NOT STARTED |
+| 21 | `21_observability_metrics.md` | Improvement | ⏳ NOT STARTED |
+| 22 | `22_logs_surface.md` | Improvement | ⏳ NOT STARTED |
+| 23 | `23_storage_service.md` | Milestone | ⏳ NOT STARTED |
+| 24 | `24_authz_v2_policies.md` | Milestone | ⏳ NOT STARTED |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
@@ -70,7 +75,7 @@ existing doc.
    ~0.34× → ~0.42× UPDATE-bulk gain on a **single-model** CRUD bench that §1 says
    we should lose anyway. Not worth a locked-decision change; effort redirected to
    #17 (the §6 cross-domain headline). Filed rationale in `crud_performance.md`; if
-   ever picked up it takes the next free number (`20_…`).
+   ever picked up it takes the next free number (`25_…`).
 3. **Parallel-scan follow-ups** (filed in `parallel_scan.md`, lower ROI):
    `SUM`/`AVG`/`GROUP BY` partial aggregate; `LIMIT` early-stop; server
    `ReadHandle` parallelism; a visibility-map fast count. (Default-on + worker
@@ -83,9 +88,18 @@ existing doc.
    desugars to the now-supported `USING`), window funcs / recursive CTEs (G7,
    milestone-sized), `SELECT` without `FROM` (G8). Pick individual gaps as focused
    improvements; the doc carries a per-gap scope/ROI read.
-4. **Attach-client session support** (filed in `rest_api_enrichment.md`,
+5. **Attach-client session support** (filed in `rest_api_enrichment.md`,
    shipped item 12's one optional follow-up): wrap `X-Txn-Id` sessions +
    `/rows/batch` + cursors in `unidb-attach`.
+6. **Supabase-track service milestones (filed 2026-07-13, ordered by
+   recommended build sequence — each has its own spec file):**
+   **#20 events/realtime dispatcher** (~80% exists in-engine via M4; highest
+   demo value; unblocks #23's outbox) → **#21 observability metrics
+   enrichment** (small engine surface; the horizon-age gauge is the item-16
+   lesson) → **#22 logs surface** (JSON + correlation ids + bounded `/logs`) →
+   **#23 storage service** (MinIO/S3 over engine metadata + LOB tiering;
+   service layer, engine unchanged) → **#24 authz v2** (per-op RLS policies +
+   `WITH CHECK` + SQL-native roles; deliberately last — deepest semantics).
 
 ## How to update this file
 
