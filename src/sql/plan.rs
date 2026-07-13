@@ -13,7 +13,7 @@
 use crate::catalog::{Catalog, ColumnType, IndexKind};
 use crate::error::{DbError, Result};
 use crate::sql::executor;
-use crate::sql::logical::Literal;
+use crate::sql::logical::{CmpOp, Literal};
 use crate::sql::query::{AggFunc, FromNode, JoinType, OrderKey, Projection, QExpr, QuerySpec};
 
 /// One output column of an operator: the relation qualifier it came from, its
@@ -592,12 +592,90 @@ pub(crate) fn plan_from(node: &FromNode, catalog: &Catalog, ctes: &CteSchemas) -
             right,
             join_type,
             on,
+            using,
         } => {
             let left = plan_from(left, catalog, ctes)?;
             let right = plan_from(right, catalog, ctes)?;
+            if !using.is_empty() {
+                return plan_using_join(left, right, *join_type, using, catalog);
+            }
             plan_join(left, right, *join_type, on.clone(), catalog)
         }
     }
+}
+
+/// Plan a `JOIN … USING (c1, …)`. `USING` is desugared to the equi-`ON`
+/// `left.ci = right.ci AND …` (resolving each shared column's qualifier on both
+/// sides), then — per standard SQL — each shared column is **merged** so it
+/// appears once in the output: a coalescing [`PlanNode::Projection`] drops the
+/// duplicate copy. For `INNER`/`LEFT`/`CROSS` the preserved value is the left
+/// side's; for `RIGHT` it is the right side's (the outer-preserved side), so the
+/// merged column is non-NULL on the preserved rows without needing a `COALESCE`
+/// expression. (`FULL OUTER`, which would need true `COALESCE`, is unsupported.)
+fn plan_using_join(
+    left: PlanNode,
+    right: PlanNode,
+    join_type: JoinType,
+    using: &[String],
+    catalog: &Catalog,
+) -> Result<PlanNode> {
+    let left_schema = left.output().to_vec();
+    let right_schema = right.output().to_vec();
+
+    // Synthesize the equi-`ON` from the shared columns' resolved qualifiers.
+    let mut on: Option<QExpr> = None;
+    for col in using {
+        let li = resolve_column(&left_schema, None, col)?;
+        let ri = resolve_column(&right_schema, None, col)?;
+        let eq = QExpr::Compare {
+            op: CmpOp::Eq,
+            lhs: Box::new(QExpr::Column {
+                qualifier: Some(left_schema[li].qualifier.clone()),
+                name: col.clone(),
+            }),
+            rhs: Box::new(QExpr::Column {
+                qualifier: Some(right_schema[ri].qualifier.clone()),
+                name: col.clone(),
+            }),
+        };
+        on = Some(match on {
+            None => eq,
+            Some(prev) => QExpr::And(Box::new(prev), Box::new(eq)),
+        });
+    }
+
+    let join = plan_join(left, right, join_type, on, catalog)?;
+
+    // Merge each shared column: keep it from the outer-preserved side (right for
+    // RIGHT joins, else left) and drop the other side's copy. `drop_right` names
+    // which side's copies of the `using` columns are dropped from the output.
+    let drop_right = !matches!(join_type, JoinType::Right);
+    let mut items = Vec::new();
+    let mut output = Vec::new();
+    for (i, col) in join.output().iter().enumerate() {
+        let is_shared = using.iter().any(|u| u == &col.name);
+        if is_shared {
+            let from_left = i < left_schema.len();
+            // Drop this copy if it is on the side we merge away.
+            if (drop_right && !from_left) || (!drop_right && from_left) {
+                continue;
+            }
+        }
+        items.push(ProjItem {
+            expr: QExpr::Column {
+                qualifier: Some(col.qualifier.clone()),
+                name: col.name.clone(),
+            },
+            name: col.name.clone(),
+        });
+        output.push(col.clone());
+    }
+
+    Ok(PlanNode::Projection {
+        input: Box::new(join),
+        items,
+        output,
+    })
 }
 
 fn plan_join(
@@ -1038,6 +1116,7 @@ mod tests {
                         name: "customer_id".into(),
                     }),
                 }),
+                using: vec![],
             },
             selection: None,
             projection: vec![Projection::Wildcard],

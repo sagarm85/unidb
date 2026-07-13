@@ -909,6 +909,7 @@ fn convert_from(items: &[TableWithJoins]) -> Result<FromNode> {
             right: Box::new(right),
             join_type: JoinType::Cross,
             on: None,
+            using: Vec::new(),
         };
     }
     Ok(node)
@@ -918,12 +919,13 @@ fn convert_table_with_joins(twj: &TableWithJoins) -> Result<FromNode> {
     let mut node = FromNode::Table(table_ref_from_factor(&twj.relation)?);
     for join in &twj.joins {
         let right = FromNode::Table(table_ref_from_factor(&join.relation)?);
-        let (join_type, on) = convert_join_operator(&join.join_operator)?;
+        let (join_type, on, using) = convert_join_operator(&join.join_operator)?;
         node = FromNode::Join {
             left: Box::new(node),
             right: Box::new(right),
             join_type,
             on,
+            using,
         };
     }
     Ok(node)
@@ -941,7 +943,10 @@ fn table_ref_from_factor(rel: &TableFactor) -> Result<TableRef> {
     }
 }
 
-fn convert_join_operator(op: &JoinOperator) -> Result<(JoinType, Option<QExpr>)> {
+/// Returns `(join_type, ON expr, USING columns)`. `USING (c1, …)` yields the
+/// column names (desugared to an equi-`ON` at plan time, see `plan::plan_join`);
+/// `ON`/cross joins yield an empty `using`.
+fn convert_join_operator(op: &JoinOperator) -> Result<(JoinType, Option<QExpr>, Vec<String>)> {
     let (ty, constraint) = match op {
         JoinOperator::Inner(c) | JoinOperator::Join(c) => (JoinType::Inner, Some(c)),
         JoinOperator::LeftOuter(c) | JoinOperator::Left(c) => (JoinType::Left, Some(c)),
@@ -949,21 +954,26 @@ fn convert_join_operator(op: &JoinOperator) -> Result<(JoinType, Option<QExpr>)>
         JoinOperator::CrossJoin(_) => (JoinType::Cross, None),
         other => {
             return Err(DbError::SqlUnsupported(format!(
-                "unsupported join type: {other:?} (FULL OUTER / USING / NATURAL arrive later)"
+                "unsupported join type: {other:?} (FULL OUTER / NATURAL arrive later)"
             )))
         }
     };
-    let on = match constraint {
-        None => None,
-        Some(JoinConstraint::On(expr)) => Some(convert_qexpr(expr)?),
-        Some(JoinConstraint::None) => None,
+    let (on, using) = match constraint {
+        None => (None, Vec::new()),
+        Some(JoinConstraint::On(expr)) => (Some(convert_qexpr(expr)?), Vec::new()),
+        Some(JoinConstraint::Using(cols)) => {
+            // `USING (a, b)` — each entry is a bare column name.
+            let names = cols.iter().map(|c| c.to_string()).collect::<Vec<_>>();
+            (None, names)
+        }
+        Some(JoinConstraint::None) => (None, Vec::new()),
         Some(other) => {
             return Err(DbError::SqlUnsupported(format!(
-                "unsupported join constraint: {other:?} (only ON <expr> in P4.a)"
+                "unsupported join constraint: {other:?} (only ON <expr> / USING (cols))"
             )))
         }
     };
-    Ok((ty, on))
+    Ok((ty, on, using))
 }
 
 fn convert_query_projection(items: Vec<SelectItem>) -> Result<Vec<Projection>> {

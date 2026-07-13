@@ -120,8 +120,9 @@ any access path; the same parser/planner/executor runs underneath all three.
   USING {BTREE|HNSW|FULLTEXT}`, `ALTER TABLE ADD/DROP COLUMN`, `DROP TABLE`,
   `TRUNCATE`, `ANALYZE`.
 - **DML**: `INSERT` (multi-row), `UPDATE`, `DELETE`, all `WHERE`-filtered.
-- **SELECT**: projections, `WHERE`, `INNER`/`LEFT`/`RIGHT`/`CROSS JOIN` **with
-  `ON <expr>`**, `GROUP BY` / `HAVING`, aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/
+- **SELECT**: projections, `WHERE`, `INNER`/`LEFT`/`RIGHT`/`CROSS JOIN` with
+  `ON <expr>` **or `USING (cols)`** (shared columns merged per standard SQL),
+  `GROUP BY` / `HAVING`, aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/
   `MAX`), `DISTINCT`, `ORDER BY`, `LIMIT`/`OFFSET`, subqueries (`IN`, `EXISTS`,
   scalar, correlated), and CTEs (`WITH`).
 - **Transactions**: `READ COMMITTED` (default), `REPEATABLE READ`,
@@ -134,10 +135,9 @@ any access path; the same parser/planner/executor runs underneath all three.
 
 **Not supported yet** — so you don't guess:
 
-- `JOIN … USING (col)` and `NATURAL JOIN` — use the equivalent `JOIN … ON
-  a.col = b.col` form. (The catalog worked example in [§4](#4-introspect-the-system-catalog)
-  is written in `ON` form for exactly this reason.)
-- `FULL OUTER JOIN`.
+- `NATURAL JOIN` — use explicit `JOIN … USING (cols)` or `ON`.
+- `FULL OUTER JOIN` (needed for a true `COALESCE`-merged `USING` column on both
+  outer sides; `INNER`/`LEFT`/`RIGHT` `USING` are supported).
 - `ORDER BY` on an expression that is **not** in the SELECT output list (order by
   a projected column name/alias or ordinal position).
 - Set operations (`UNION`/`INTERSECT`/`EXCEPT`), window functions, `RETURNING`.
@@ -216,9 +216,9 @@ WHERE  table_schema = 'public';
 ```
 
 Enumerate real foreign keys to draw ERD edges + FK badges — **no name-heuristic
-guessing.** Written in `ON` form (unidb has no `JOIN … USING` yet); the
-`ccu.ordinal_position = kcu.position_in_unique_constraint` conjunct aligns each
-FK column with its referenced column for **composite** keys:
+guessing.** Shown in `ON` form here; `JOIN … USING (constraint_name)` also works.
+The `ccu.ordinal_position = kcu.position_in_unique_constraint` conjunct aligns
+each FK column with its referenced column for **composite** keys:
 
 ```sql
 SELECT tc.table_name  AS from_table, kcu.column_name AS from_col,
@@ -382,7 +382,8 @@ distinctions as typed `DbError` variants.
   constraint, not the index.
 - **One schema, one database per server.** `'public'` / `'unidb'` are constants;
   there is no schema namespacing and no multi-db addressing.
-- **No `JOIN … USING` / `NATURAL JOIN` / `FULL OUTER JOIN`** (see [§2](#2-query-the-sql-surface)).
+- **No `NATURAL JOIN` / `FULL OUTER JOIN`** (`JOIN … USING` *is* supported —
+  `INNER`/`LEFT`/`RIGHT`; see [§2](#2-query-the-sql-surface)).
 
 ---
 

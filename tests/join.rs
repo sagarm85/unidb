@@ -225,3 +225,96 @@ fn hash_join_spill_matches_sqlite() {
     );
     std::env::remove_var("UNIDB_HASH_JOIN_MEM_ROWS");
 }
+
+// ── JOIN … USING (planner desugar + shared-column merge) ────────────────────
+// USING desugars to the equi-ON `left.c = right.c` and merges each shared
+// column so it appears once (standard SQL). Checked differentially against
+// SQLite, which implements USING — including `SELECT *` (row width proves the
+// dedup) and unqualified references to the merged column.
+
+fn using_setup() -> Vec<&'static str> {
+    vec![
+        "CREATE TABLE emp (id INT, dept_id INT, name TEXT)",
+        "CREATE TABLE dept (dept_id INT, dept_name TEXT)",
+        "INSERT INTO emp (id, dept_id, name) VALUES (1, 10, 'alice')",
+        "INSERT INTO emp (id, dept_id, name) VALUES (2, 10, 'bob')",
+        "INSERT INTO emp (id, dept_id, name) VALUES (3, 20, 'carol')",
+        "INSERT INTO emp (id, dept_id, name) VALUES (4, 99, 'dave')", // dept 99 missing
+        "INSERT INTO dept (dept_id, dept_name) VALUES (10, 'eng')",
+        "INSERT INTO dept (dept_id, dept_name) VALUES (20, 'sales')",
+        "INSERT INTO dept (dept_id, dept_name) VALUES (30, 'ops')", // no employees
+    ]
+}
+
+#[test]
+fn inner_join_using_matches_sqlite() {
+    assert_same(
+        &using_setup(),
+        "SELECT emp.name, dept.dept_name FROM emp JOIN dept USING (dept_id)",
+    );
+}
+
+#[test]
+fn inner_join_using_star_dedups_shared_column() {
+    // SELECT * must show dept_id exactly once; row width mismatch would fail.
+    assert_same(
+        &using_setup(),
+        "SELECT * FROM emp JOIN dept USING (dept_id)",
+    );
+}
+
+#[test]
+fn inner_join_using_unqualified_shared_column() {
+    // The merged column is referenceable unqualified (not ambiguous).
+    assert_same(
+        &using_setup(),
+        "SELECT dept_id, name, dept_name FROM emp JOIN dept USING (dept_id)",
+    );
+}
+
+#[test]
+fn left_join_using_matches_sqlite() {
+    // dave (dept 99) survives; merged dept_id shows the (present) left value.
+    assert_same(
+        &using_setup(),
+        "SELECT name, dept_id, dept_name FROM emp LEFT JOIN dept USING (dept_id)",
+    );
+}
+
+#[test]
+fn right_join_using_matches_sqlite() {
+    // dept 30 (ops) has no employees; merged dept_id shows the (present) right value.
+    assert_same(
+        &using_setup(),
+        "SELECT name, dept_id, dept_name FROM emp RIGHT JOIN dept USING (dept_id)",
+    );
+}
+
+fn composite_using_setup() -> Vec<&'static str> {
+    vec![
+        "CREATE TABLE a (x INT, y INT, av INT)",
+        "CREATE TABLE b (x INT, y INT, bv INT)",
+        "INSERT INTO a (x, y, av) VALUES (1, 1, 100)",
+        "INSERT INTO a (x, y, av) VALUES (1, 2, 200)",
+        "INSERT INTO a (x, y, av) VALUES (2, 1, 300)",
+        "INSERT INTO b (x, y, bv) VALUES (1, 1, 11)",
+        "INSERT INTO b (x, y, bv) VALUES (1, 2, 22)",
+        "INSERT INTO b (x, y, bv) VALUES (2, 2, 33)", // (2,2) has no match in a
+    ]
+}
+
+#[test]
+fn composite_using_matches_sqlite() {
+    assert_same(
+        &composite_using_setup(),
+        "SELECT av, bv, x, y FROM a JOIN b USING (x, y)",
+    );
+}
+
+#[test]
+fn composite_using_star_dedups_both_shared_columns() {
+    assert_same(
+        &composite_using_setup(),
+        "SELECT * FROM a JOIN b USING (x, y)",
+    );
+}

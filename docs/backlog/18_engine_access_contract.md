@@ -302,6 +302,16 @@ points, plus a guard on the `COUNT(*)` parallel fast path.
   yet". No AC weakened: the ERD queries run against a live instance and return
   correct composite PK/FK rows (differential test).
 
+  > **Update (2026-07-13, post-merge follow-up):** `JOIN … USING (cols)` was
+  > subsequently **implemented in the planner** at the user's request —
+  > `plan.rs::plan_using_join` desugars it to the equi-`ON` and merges the shared
+  > columns per standard SQL (INNER/LEFT/RIGHT; FULL OUTER still needs a true
+  > `COALESCE`). The spec's original `USING`-form worked example now runs verbatim
+  > (`tests/information_schema.rs::worked_example_fk_join_using_form_runs`), and
+  > `USING` is checked differentially against SQLite (`tests/join.rs`). Only
+  > `NATURAL JOIN` remains unsupported; the guide's B1/limitations lists are
+  > updated accordingly.
+
 ### 2 — C5 object DDL: reconstruct from metadata, do not store CREATE text
 
 **Decision:** unidb does **not** retain original `CREATE …` text (verified: the

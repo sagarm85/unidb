@@ -475,12 +475,14 @@ supported: `OR`/`ORDER BY`/`LIMIT`/aggregates/joins/subqueries/`IN`" list is
 filter/project is routed by the parser into a new `LogicalPlan::Query`
 (carrying a `QuerySpec`) that the Phase-4 planner turns into a physical
 operator tree; the flat single-table `SELECT` path is unchanged (it still
-feeds the concurrent-read fast path). Supported: inner/left/right/cross joins,
+feeds the concurrent-read fast path). Supported: inner/left/right/cross joins
+(join condition as `ON <expr>` or `USING (cols)` — the latter desugared +
+shared-column-merged in `plan.rs::plan_using_join` since Milestone 18),
 `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`/`HAVING`, `ORDER BY`/`DISTINCT`/
 `LIMIT`/`OFFSET`, scalar/`IN`/`EXISTS` subqueries (correlated + uncorrelated),
 `IN (list)`, non-recursive `WITH` CTEs, `ANALYZE`, and `EXPLAIN [ANALYZE]`.
 Still out of scope (documented Phase-4 limits): window functions, recursive
-CTEs, `FULL OUTER`/`USING`/`NATURAL` joins, and columnar/vectorized execution.
+CTEs, `FULL OUTER`/`NATURAL` joins, and columnar/vectorized execution.
 
 **Constraints (M11, `sql-constraints` branch — pending merge):** `CREATE
 TABLE` column options and table constraints — `PRIMARY KEY`, `FOREIGN KEY` /
@@ -1311,7 +1313,9 @@ join,aggregate,sort,optimizer,statistics,explain}.rs`). Correctness checked
 differentially against SQLite. No `FORMAT_VERSION` bump, no new crash point
 (no new storage mechanism — stats ride the existing catalog page), no locked
 decision reversed. Known limits: window functions / recursive CTEs / `FULL
-OUTER`+`USING`+`NATURAL` joins unsupported; the catalog (all TableDefs + stats)
+OUTER`+`NATURAL` joins unsupported (`JOIN … USING` **is** supported since
+Milestone 18 — desugared + shared-column-merged in `sql/plan.rs::plan_using_join`);
+the catalog (all TableDefs + stats)
 is still a single ~8 KiB page blob, so a very wide analyzed schema can overflow
 it (multi-page catalog is tracked tech debt). See `docs/backlog/
 phase4_query_power.md` + `PROGRESS.md`'s Phase 4 entry.

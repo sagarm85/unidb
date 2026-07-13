@@ -165,8 +165,14 @@ fn flatten_inner(node: &FromNode, tables: &mut Vec<TableRef>, on: &mut Vec<QExpr
             right,
             join_type,
             on: cond,
+            using,
         } => {
             if !matches!(join_type, JoinType::Inner | JoinType::Cross) {
+                return false;
+            }
+            // `USING` needs the shared-column merge the rule-based planner does
+            // (`plan_join`'s coalescing projection); bail so it takes that path.
+            if !using.is_empty() {
                 return false;
             }
             if let Some(c) = cond {

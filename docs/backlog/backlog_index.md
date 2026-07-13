@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `19_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `20_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -32,6 +32,7 @@
 | 16 | `16_concurrent_sql_writes_visibility_anomaly.md` | Improvement | ✅ SHIPPED (PROGRESS: MVCC visibility anomaly under concurrent SQL writes) |
 | 17 | `17_mm_replaced_stack_headline.md` | Performance | ✅ SHIPPED (PROGRESS: Cross-domain headline vs replaced stack) |
 | 18 | `18_engine_access_contract.md` | Milestone | ✅ SHIPPED (PROGRESS: Engine access & introspection contract (Milestone 18)) |
+| 19 | `19_sql_surface_gaps.md` | Improvement | ⏳ NOT STARTED |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
@@ -69,11 +70,19 @@ existing doc.
    ~0.34× → ~0.42× UPDATE-bulk gain on a **single-model** CRUD bench that §1 says
    we should lose anyway. Not worth a locked-decision change; effort redirected to
    #17 (the §6 cross-domain headline). Filed rationale in `crud_performance.md`; if
-   ever picked up it takes the next free number (`19_…`).
+   ever picked up it takes the next free number (`20_…`).
 3. **Parallel-scan follow-ups** (filed in `parallel_scan.md`, lower ROI):
    `SUM`/`AVG`/`GROUP BY` partial aggregate; `LIMIT` early-stop; server
    `ReadHandle` parallelism; a visibility-map fast count. (Default-on + worker
    governance already shipped as #15.)
+4. **Item 19 — SQL surface gaps (`19_sql_surface_gaps.md`, NOT STARTED).** The
+   tracked list of unsupported query constructs surfaced by Milestone 18's guide:
+   `CASE`/`COALESCE` (G1, and the blocker for `FULL OUTER … USING`), `FULL OUTER
+   JOIN` (G2), set ops `UNION`/`INTERSECT`/`EXCEPT` (G3), `ORDER BY` on a
+   non-projected expr (G4), `RETURNING` (G5), `NATURAL JOIN` (G6, low ROI —
+   desugars to the now-supported `USING`), window funcs / recursive CTEs (G7,
+   milestone-sized), `SELECT` without `FROM` (G8). Pick individual gaps as focused
+   improvements; the doc carries a per-gap scope/ROI read.
 4. **Attach-client session support** (filed in `rest_api_enrichment.md`,
    shipped item 12's one optional follow-up): wrap `X-Txn-Id` sessions +
    `/rows/batch` + cursors in `unidb-attach`.
