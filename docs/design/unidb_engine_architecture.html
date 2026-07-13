@@ -113,7 +113,9 @@ loses <b>zero</b> data on a crash where the four-system stack tears a record.
         <li><a href="#s6-2">Vector similarity search</a></li>
         <li><a href="#s6-3">Full-text search</a></li>
         <li><a href="#s6-4">Graph relationships</a></li></ol></li>
-  <li><a href="#s7">Real-time events &amp; streaming</a></li>
+  <li><a href="#s7">Real-time events &amp; streaming</a>
+    <ol><li><a href="#s7-1">Delivery performance</a></li>
+        <li><a href="#s7-2">Change-data-capture (CDC) compatibility</a></li></ol></li>
   <li><a href="#s8">The REST server — full API reference</a>
     <ol><li><a href="#s8-1">Getting started</a></li>
         <li><a href="#s8-2">Running SQL</a></li>
@@ -468,6 +470,10 @@ produces the same result.
 <li><b>Vacuum &amp; autovacuum.</b> Because updates create new row versions,
   superseded versions are reclaimed in the background once no transaction can
   still see them, keeping tables compact automatically (see Section 9).</li>
+<li><b>No practical schema-size limit.</b> Your table and column definitions are
+  stored durably and can spill across as many pages as needed, so wide schemas —
+  many tables, many columns, heavy use of statistics — grow without hitting an
+  artificial ceiling.</li>
 </ul>
 
 <!-- ================= 4 ================= -->
@@ -764,12 +770,49 @@ transactional capture gives you properties an external message queue cannot:
   dead-letter table) or broadcast rooms — the durable-by-default alternative to
   a typical realtime layer.</li>
 </ul>
+
+<h3 id="s7-1">7.1 Delivery performance — flat latency, push-based</h3>
 <p>
-Measured, unidb's <code>poll_events</code> cycle runs in tens to hundreds of
-microseconds versus a few milliseconds for the equivalent Postgres
-<code>SKIP LOCKED</code> pattern (see Section 12 for the honest caveat on very
-large backlogs).
+Event delivery is backed by its own durable index, so polling cost stays flat
+no matter how large the event history grows — a table with 300,000 accumulated
+events polls exactly as fast as one with 10,000 (all in the tens of
+microseconds). Reclaiming acknowledged events keeps that index itself compact,
+so the two never work against each other.
 </p>
+<p>
+New events also <b>push</b> a wake-up to waiting subscribers the instant their
+transaction commits, instead of waiting for the next fixed poll tick — an idle
+subscriber costs zero CPU and sees a new event in well under a millisecond,
+rather than up to the old half-second poll interval. Polling remains as an
+automatic fallback, so nothing changes for existing consumers.
+</p>
+<p>
+Measured, unidb's event-poll cycle runs in tens of microseconds — flat, at any
+table size — versus a few milliseconds for the equivalent Postgres
+<code>SKIP LOCKED</code> pattern.
+</p>
+
+<h3 id="s7-2">7.2 Change-data-capture (CDC) compatibility</h3>
+<p>
+Every captured event carries the full <b>before</b> and <b>after</b> row image
+(for an INSERT, only <code>after</code>; for a DELETE, only <code>before</code>;
+for an UPDATE, both) plus a millisecond timestamp — the same shape a dedicated
+CDC pipeline (Debezium-style) is built to produce, but generated inline with no
+extra moving parts. This turns unidb into a self-contained change feed: no
+separate log-tailing connector to deploy, and nothing to keep in sync with the
+engine's own storage format.
+</p>
+<ul>
+<li><b>Drop-in wire formats.</b> <code>GET /events/subscribe</code> accepts a
+  <code>format</code> parameter — <code>native</code>, <code>debezium</code>, or
+  <code>supabase</code> — so existing Debezium- or Supabase-shaped consumers can
+  point at unidb without rewriting their event handlers.</li>
+<li><b>Lag observability out of the box.</b> Per-consumer lag (how many events
+  behind, and how old the oldest unconsumed event is) is queryable as an
+  ordinary table, exposed on <code>/stats</code>, and published as Prometheus
+  metrics — so a consumer falling behind is something you can alert on, not
+  something you discover after the fact.</li>
+</ul>
 
 <!-- ================= 8 ================= -->
 <h2 id="s8" class="pagebreak">8. The REST server — full API reference</h2>
@@ -951,7 +994,8 @@ data. All accept <code>X-Txn-Id</code> to join a session.</p>
 </table>
 <div class="ep">
 <h4><span class="method m-get">GET</span> <code>/events/subscribe</code> &nbsp;(Server-Sent Events)</h4>
-<p>Stream new events as SSE frames. Two modes:</p>
+<p>Stream new events as SSE frames — pushed the instant a matching transaction
+commits, with polling as an automatic fallback. Two modes:</p>
 <ul>
 <li><b>Durable consumer</b> (<code>consumer</code> set): at-least-once, resumes
   from that consumer's acked offset; un-acked events are re-yielded until acked.</li>
@@ -961,13 +1005,30 @@ data. All accept <code>X-Txn-Id</code> to join a session.</p>
 </ul>
 <p><b>Query params:</b> <code>consumer</code>, <code>from_seq</code>,
 <code>table</code> (filter), <code>limit</code> (per poll, default 100),
-<code>interval_ms</code> (poll interval, default 500).</p>
-<p><b>Response</b> <code>200 OK</code>, <code>text/event-stream</code>:</p>
+<code>interval_ms</code> (poll fallback interval, default 500),
+<code>format</code> — <code>native</code> (default), <code>debezium</code>, or
+<code>supabase</code>.</p>
+<p><b>Response</b> <code>200 OK</code>, <code>text/event-stream</code> (native format):</p>
 <pre>id: 17
 event: insert
-data: {"seq":17,"xid":42,"table_name":"orders","op":"insert","payload":{"id":1,"total":9.99}}</pre>
-<p class="small">Acknowledge separately via <code>POST /events/ack</code> — acks
-are not sent over the stream.</p>
+data: {"seq":17,"xid":42,"table_name":"orders","op":"insert","ts_ms":1752400000123,
+       "before":null,"after":{"id":1,"total":9.99},"payload":{"id":1,"total":9.99}}</pre>
+<p class="small">
+<code>before</code>/<code>after</code> are the pre- and post-image of the row
+(an INSERT has no <code>before</code>, a DELETE has no <code>after</code>); the
+flat <code>payload</code> field is kept for existing consumers. Passing
+<code>?format=debezium</code> or <code>?format=supabase</code> reshapes the same
+event into that ecosystem's on-wire envelope. Acknowledge separately via
+<code>POST /events/ack</code> — acks are not sent over the stream.</p>
+</div>
+
+<div class="ep">
+<h4><span class="method m-get">GET</span> <code>/stats</code> &nbsp;— subscription lag</h4>
+<p>Per-consumer lag is included in the standard stats snapshot (and as
+Prometheus gauges on <code>/metrics</code>) — how many unacknowledged events a
+consumer is behind, and the age in seconds of its oldest unconsumed event. The
+same numbers are queryable as an ordinary table via
+<code>SELECT * FROM unidb_catalog.subscription_lag</code> over <code>/sql</code>.</p>
 </div>
 
 <h3 id="s8-6">8.6 Admin, stats, logs &amp; metrics</h3>
@@ -1057,13 +1118,26 @@ cursors. Example fragment:</p>
   to read-write, with an optional synchronous-commit gate for zero-loss
   failover.</li>
 <li><b>Backups &amp; point-in-time restore.</b> Take a base backup plus archived
-  log and restore to a chosen point. Measured on a sample database: base backup
-  7&nbsp;ms, restore 72&nbsp;ms, failover 26&nbsp;ms.</li>
-<li><b>Autovacuum.</b> A background worker reclaims dead row versions once no
-  reader (including replicas) can still see them, scrubbing every index before
-  space is reused. Under heavy churn it keeps a table compact automatically
-  (bounded at ~35 pages vs ~82 unvacuumed in one test) and keeps point reads
-  fast.</li>
+  log and restore to a chosen point — either <b>by wall-clock time</b> ("restore
+  to 2:14 pm yesterday") or by exact log position for byte-precise control. A
+  restore-to-time request resolves the nearest safe commit at or before that
+  moment, so you never overshoot into an uncommitted change. Measured on a
+  sample database: base backup 7&nbsp;ms, restore 72&nbsp;ms, failover 26&nbsp;ms.</li>
+<li><b>Logical replication.</b> Beyond byte-for-byte physical replicas, unidb
+  can replicate at the row level into a different target database — translating
+  each captured change back into SQL and applying it there. This is the
+  foundation for migrating into unidb from elsewhere, keeping a reporting copy
+  in sync, or fanning changes out to a differently-shaped downstream schema; it
+  reuses the same durable, at-least-once event delivery as the realtime stream
+  (Section 7), so a restarted replication process resumes exactly where it left
+  off rather than re-copying or dropping data.</li>
+<li><b>Autovacuum.</b> A background worker tracks dead-row buildup <b>per
+  table</b> and reclaims space table by table, so one churn-heavy table doesn't
+  force a scan of every other table. A cost-based throttle caps how much
+  background I/O a vacuum pass is allowed to use, so cleanup never competes hard
+  enough with live traffic to matter. It scrubs every index before space is
+  reused, and under heavy churn keeps a table compact automatically (bounded at
+  ~35 pages vs ~82 unvacuumed in one test) while keeping point reads fast.</li>
 <li><b>Security &amp; observability.</b> Users, roles and privileges; verified
   JWT identities; native TLS; an append-only audit log; lock-free health metrics
   over <code>/stats</code> and <code>/metrics</code>; and structured JSON logs
@@ -1095,7 +1169,7 @@ the places it still trails.
 <tr><th>Workload</th><th>Result vs. Postgres</th></tr>
 <tr><td><code>SELECT COUNT(*)</code></td><td><b>2.81× faster</b></td></tr>
 <tr><td>Filtered scans (parallel workers, on by default)</td><td><b>6.4–6.6× faster</b>; full scan up to ~35.7M rows/s at 1M rows</td></tr>
-<tr><td>Event polling (<code>poll_events</code> vs <code>SKIP LOCKED</code>)</td><td>~20–980&nbsp;µs vs ~2.6–3.1&nbsp;ms</td></tr>
+<tr><td>Event polling (vs Postgres <code>SKIP LOCKED</code>)</td><td>Tens of µs, <b>flat regardless of table size</b>, vs ~2.6–3.1&nbsp;ms</td></tr>
 <tr><td>Embedded point reads</td><td>~5× faster (~1.09&nbsp;µs)</td></tr>
 <tr><td>Graph adjacency (hot vertex)</td><td>Parity (~94&nbsp;µs vs ~98&nbsp;µs at 1k edges)</td></tr>
 </table>
@@ -1110,6 +1184,7 @@ the places it still trails.
 <tr><td>Durable free-space map</td><td>Per-table space tracking; instant open</td><td>Insert cost flat ~17–28&nbsp;µs/row into the millions (was degrading, then failing)</td></tr>
 <tr><td>Batched graph resolution</td><td>Fetch a vertex's edges grouped by page (~128 edges/page)</td><td>~9× over naive; parity with Postgres</td></tr>
 <tr><td>Durable vector index</td><td>Similarity index kept on disk, never recomputed on open</td><td>recall@10 = 1.000; open instant (vs 30&nbsp;s in-memory rebuild)</td></tr>
+<tr><td>Indexed event polling</td><td>A durable index on event order replaces a linear scan; commits push a wake-up instead of waiting for the next poll</td><td>Poll latency flat (~30&nbsp;µs) from 10k to 300k+ queued events; idle-subscriber delivery drops from up to 500&nbsp;ms to sub-millisecond</td></tr>
 </table>
 
 <h3 id="s10-4">10.4 Scale</h3>
@@ -1186,9 +1261,9 @@ when it should be accepted.
 <tr><td>Serializable isolation</td><td>Row-granularity only — no predicate locks, so no phantom protection; sound but occasionally over-conservative</td><td><span class="tag high">High</span></td><td><span class="tag tracked">Tracked</span></td></tr>
 <tr><td>Auth platform</td><td>The server verifies tokens but does not issue them — no built-in sign-up/login/OAuth</td><td><span class="tag high">High</span></td><td><span class="tag planned">Planned — next phase</span></td></tr>
 <tr><td>SQL surface</td><td>No window functions, recursive CTEs, FULL OUTER / NATURAL joins, views, triggers, or stored procedures; single-column indexes only</td><td><span class="tag medium">Medium</span></td><td><span class="tag planned">Planned — next phase</span></td></tr>
-<tr><td>Event queue at scale</td><td>Polling cost grows with table size (no sequence index yet); realtime is poll-per-subscriber rather than push</td><td><span class="tag medium">Medium</span></td><td><span class="tag planned">Planned — next phase</span></td></tr>
-<tr><td>Vacuum</td><td>Engine-global (not per-table) accounting; no cost-based throttle; no whole-table compaction</td><td><span class="tag medium">Medium</span></td><td><span class="tag tracked">Tracked</span></td></tr>
-<tr><td>Replication</td><td>Point-in-time restore is by log position, not wall-clock time; no logical replication yet</td><td><span class="tag medium">Medium</span></td><td><span class="tag tracked">Tracked</span></td></tr>
+<tr><td>Event/CDC row-level security</td><td>The event and change-data-capture stream is not yet filtered by a table's row-level-security policy — a subscriber sees every row's change on a table it has access to poll, not only the rows its policy would allow through ordinary SQL</td><td><span class="tag medium">Medium</span></td><td><span class="tag tracked">Tracked</span></td></tr>
+<tr><td>Vacuum</td><td>Per-table cleanup and a background I/O throttle are in place; still no whole-table compaction (cross-page defragmentation) to shrink a table back down after heavy churn</td><td><span class="tag low">Low</span></td><td><span class="tag tracked">Tracked</span></td></tr>
+<tr><td>Logical replication</td><td>Row-level replication into another database requires the target schema to already exist (no automatic schema creation) and has no column-remapping between source and target</td><td><span class="tag low">Low</span></td><td><span class="tag tracked">Tracked</span></td></tr>
 <tr><td>Updates</td><td>An UPDATE writes a new row version (more write volume than Postgres's in-place update path); measured ~0.34× of Postgres on bulk updates</td><td><span class="tag low">Low</span></td><td><span class="tag planned">Planned — next phase</span></td></tr>
 <tr><td>Encryption at rest</td><td>Not yet available</td><td><span class="tag low">Low</span></td><td><span class="tag planned">Planned — next phase</span></td></tr>
 <tr><td>Graph</td><td>Cypher is single-hop, read-only; no reverse-direction traversal yet</td><td><span class="tag low">Low</span></td><td><span class="tag tracked">Tracked</span></td></tr>
@@ -1209,8 +1284,8 @@ and <b>Supabase</b> (as a backend platform).
 <tr><th>Theme</th><th>What's coming</th></tr>
 <tr><td>Transactional completeness</td><td>Transaction-scoped, crash-safe DDL; savepoints and nested rollback; full serializable isolation with phantom protection; complete foreign-key actions (<code>ON DELETE / UPDATE CASCADE</code>, etc.)</td></tr>
 <tr><td>SQL surface</td><td>Views and materialized views; window functions; triggers and stored procedures; recursive CTEs and remaining join types; richer types (arrays, ENUM, INTERVAL, ranges); multi-column, partial, and expression indexes</td></tr>
-<tr><td>Performance parity</td><td>In-place (HOT-style) updates to close the update gap; more query work pushed onto parallel workers; a sequence index for the event queue</td></tr>
-<tr><td>Ecosystem &amp; operations</td><td>A PostgreSQL wire-protocol listener so existing drivers, ORMs, and BI tools connect unchanged; time-based point-in-time restore; logical replication / change-data-capture connectors; encryption at rest</td></tr>
+<tr><td>Performance parity</td><td>In-place (HOT-style) updates to close the update gap; more query work pushed onto parallel workers</td></tr>
+<tr><td>Ecosystem &amp; operations</td><td>A PostgreSQL wire-protocol listener so existing drivers, ORMs, and BI tools connect unchanged; encryption at rest</td></tr>
 </table>
 
 <h3 id="s13-2">13.2 Toward a backend-in-a-box (Supabase-style platform)</h3>
@@ -1224,6 +1299,8 @@ and <b>Supabase</b> (as a backend platform).
 <tr><td>Client SDKs</td><td>REST + Rust attach client</td><td><span class="tag planned">Planned</span> — TypeScript SDK first, then Python, generated from the REST contract</td></tr>
 <tr><td>Auto REST richness</td><td>Hand-built routes; SQL over HTTP</td><td><span class="tag planned">Planned</span> — PostgREST-style filtering / ordering / embedding, OpenAPI generation</td></tr>
 <tr><td>Object storage</td><td>Transactional large objects inside the engine (multi-GB), tiered to S3/MinIO-compatible storage with presigned upload/download and automatic reconciliation</td><td><span class="tag done">Shipped</span></td></tr>
+<tr><td>Change-data-capture</td><td>Before/after row images on every event, Debezium- and Supabase-compatible wire formats, and per-consumer lag observability (queryable, on <code>/stats</code>, and as Prometheus metrics)</td><td><span class="tag done">Shipped</span> — drop-in for teams already standardized on a Debezium- or Supabase-shaped consumer</td></tr>
+<tr><td>Time-based point-in-time restore</td><td>Restore to a wall-clock time, not just a log position; row-level logical replication into another database</td><td><span class="tag done">Shipped</span></td></tr>
 <tr><td>Dashboard / studio</td><td>—</td><td><span class="tag planned">Planned</span> — a web console: schema browser, SQL editor with EXPLAIN, metrics, RLS/role editor</td></tr>
 <tr><td>Migrations tooling</td><td>SQL DDL + docs</td><td><span class="tag planned">Planned</span> — versioned migration files and a CLI once transactional DDL lands</td></tr>
 <tr><td>Edge functions / hosting</td><td>—</td><td><span class="tag non">Not planned</span> — no cloud control plane by design; run unidb embedded inside your own function runtime</td></tr>
