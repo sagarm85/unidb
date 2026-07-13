@@ -33,6 +33,26 @@ impl ApiError {
         }
     }
 
+    /// A `409 Conflict` — used for bucket-not-empty and other precondition
+    /// failures at the storage layer.
+    pub fn conflict(code: &'static str, message: impl Into<String>) -> Self {
+        ApiError::Api {
+            status: StatusCode::CONFLICT,
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// A `503 Service Unavailable` — used when the storage service is not
+    /// configured (item 31's 503 contract).
+    pub fn service_unavailable(code: &'static str, message: impl Into<String>) -> Self {
+        ApiError::Api {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code,
+            message: message.into(),
+        }
+    }
+
     /// A `500 Internal Server Error` for a server-side failure that isn't a
     /// `DbError` (e.g. a log-file read error behind `GET /logs`).
     pub fn internal(code: &'static str, message: impl Into<String>) -> Self {
@@ -40,6 +60,39 @@ impl ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code,
             message: message.into(),
+        }
+    }
+}
+
+/// Map `StorageApiError` → HTTP status for the `/storage/*` handlers (item 31).
+/// `StorageApiError` is the trait-layer error type from `crate::storage_api` —
+/// no `unidb-storage` dep needed here.
+impl From<crate::storage_api::StorageApiError> for ApiError {
+    fn from(err: crate::storage_api::StorageApiError) -> Self {
+        use crate::storage_api::StorageApiError as SE;
+        match err {
+            SE::Engine(msg) => ApiError::internal("INTERNAL_ERROR", msg),
+            SE::NotFound(msg) => ApiError::Api {
+                status: StatusCode::NOT_FOUND,
+                code: "STORAGE_NOT_FOUND",
+                message: msg,
+            },
+            SE::BucketNotEmpty(name) => ApiError::Api {
+                status: StatusCode::CONFLICT,
+                code: "BUCKET_NOT_EMPTY",
+                message: format!("bucket '{name}' still contains objects"),
+            },
+            SE::Config(msg) => ApiError::Api {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "STORAGE_CONFIG_ERROR",
+                message: msg,
+            },
+            SE::Store(msg) => ApiError::Api {
+                status: StatusCode::BAD_GATEWAY,
+                code: "OBJECT_STORE_ERROR",
+                message: msg,
+            },
+            SE::Join => ApiError::internal("INTERNAL_ERROR", "storage task join failure"),
         }
     }
 }

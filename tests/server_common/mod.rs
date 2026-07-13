@@ -34,7 +34,7 @@ pub const TEST_JWT_SECRET: &str = "test-secret-for-unidb-server-integration-test
 /// once per process and reused across every test-local server, mirroring
 /// how `unidb-server`'s own `main()` calls `pair()` exactly once at
 /// startup (see `router.rs`'s module doc for the full reasoning).
-fn metrics_pair() -> &'static (PrometheusMetricLayer<'static>, PrometheusHandle) {
+pub fn metrics_pair() -> &'static (PrometheusMetricLayer<'static>, PrometheusHandle) {
     static PAIR: OnceLock<(PrometheusMetricLayer<'static>, PrometheusHandle)> = OnceLock::new();
     PAIR.get_or_init(PrometheusMetricLayer::pair)
 }

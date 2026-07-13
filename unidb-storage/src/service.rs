@@ -42,6 +42,13 @@ pub struct UploadTicket {
     pub presigned_put_url: String,
 }
 
+/// Result of [`StorageService::list_objects`]: direct-child objects plus any
+/// virtual-folder prefixes produced by the delimiter split.
+pub struct ListObjectsResult {
+    pub objects: Vec<ObjectRow>,
+    pub prefixes: Vec<String>,
+}
+
 /// The storage service. Cheap to clone-share (`Arc` inside).
 pub struct StorageService {
     engine: Arc<Engine>,
@@ -99,6 +106,102 @@ impl StorageService {
                 metadata::insert_bucket(&engine, xid, &name, created_by.as_deref())
             })();
             match res {
+                Ok(()) => engine.commit(xid),
+                Err(e) => {
+                    let _ = engine.abort(xid);
+                    Err(e)
+                }
+            }
+        })
+        .await
+    }
+
+    /// List all buckets.
+    pub async fn list_buckets(&self) -> Result<Vec<crate::metadata::BucketRow>> {
+        let engine = self.engine.clone();
+        spawn_engine(move || {
+            let xid = engine.begin()?;
+            let rows = metadata::list_buckets(&engine, xid);
+            let _ = engine.commit(xid);
+            rows
+        })
+        .await
+    }
+
+    /// List objects in `bucket`, applying an optional S3-style prefix filter and
+    /// delimiter split. When `delimiter` is `Some("/")` and `prefix` is
+    /// `"photos/"`, direct-child keys become `objects` and keys that contain
+    /// another `/` after the prefix become `prefixes` (virtual folders).
+    pub async fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        delimiter: Option<&str>,
+    ) -> Result<ListObjectsResult> {
+        let engine = self.engine.clone();
+        let bucket_str = bucket.to_string();
+        let all = spawn_engine(move || {
+            let xid = engine.begin()?;
+            let rows = metadata::list_objects_in_bucket(&engine, xid, &bucket_str);
+            let _ = engine.commit(xid);
+            rows
+        })
+        .await?;
+
+        let prefix = prefix.unwrap_or("");
+        let filtered: Vec<ObjectRow> = all
+            .into_iter()
+            .filter(|o| o.object_key.starts_with(prefix))
+            .collect();
+
+        let Some(delim) = delimiter else {
+            return Ok(ListObjectsResult {
+                objects: filtered,
+                prefixes: vec![],
+            });
+        };
+
+        let mut objects = Vec::new();
+        let mut prefix_set = std::collections::BTreeSet::new();
+        for obj in filtered {
+            let suffix = &obj.object_key[prefix.len()..];
+            if let Some(pos) = suffix.find(delim) {
+                let vfolder = format!("{}{}", prefix, &suffix[..pos + delim.len()]);
+                prefix_set.insert(vfolder);
+            } else {
+                objects.push(obj);
+            }
+        }
+
+        Ok(ListObjectsResult {
+            objects,
+            prefixes: prefix_set.into_iter().collect(),
+        })
+    }
+
+    /// Delete a bucket. Returns `Err(StorageError::BucketNotEmpty)` (→ HTTP
+    /// 409) if the bucket still has object rows. Deleting a non-existent
+    /// bucket is a no-op (idempotent).
+    pub async fn delete_bucket(&self, name: &str) -> Result<()> {
+        let engine = self.engine.clone();
+        let name_str = name.to_string();
+        let has_objects = spawn_engine(move || {
+            let xid = engine.begin()?;
+            let rows = metadata::list_objects_in_bucket(&engine, xid, &name_str);
+            let _ = engine.commit(xid);
+            rows.map(|v| !v.is_empty())
+        })
+        .await?;
+
+        if has_objects {
+            return Err(crate::StorageError::BucketNotEmpty(name.to_string()));
+        }
+
+        let engine = self.engine.clone();
+        let name_str = name.to_string();
+        spawn_engine(move || {
+            let xid = engine.begin()?;
+            match metadata::delete_bucket_row(&engine, xid, &name_str) {
                 Ok(()) => engine.commit(xid),
                 Err(e) => {
                     let _ = engine.abort(xid);

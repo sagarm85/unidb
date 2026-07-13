@@ -112,11 +112,16 @@ async fn main() {
     let jwt_secret = std::env::var("UNIDB_JWT_SECRET")
         .expect("UNIDB_JWT_SECRET must be set (verify-only JWT auth has no default secret)");
 
-    let engine = EngineHandle::spawn(std::path::Path::new(&data_dir), page_size)
+    let engine_handle = EngineHandle::spawn(std::path::Path::new(&data_dir), page_size)
         .unwrap_or_else(|e| panic!("failed to open unidb engine at {data_dir}: {e}"));
     // Builds the session/cursor registries and spawns the idle reaper (R1);
     // deadlines come from UNIDB_TXN_IDLE_TIMEOUT_SECS / _CURSOR_ (default 60).
-    let state = AppState::new(Arc::new(engine)).with_log_dir(std::path::PathBuf::from(&log_dir));
+    // Item 31: storage is None here (binary can't depend on unidb-storage
+    // without a crate cycle). A custom embedding binary that depends on both
+    // `unidb` and `unidb-storage` can call `.with_storage(Some(Arc::new(svc)))`.
+    // All /storage/* routes return 503 when state.storage is None.
+    let state =
+        AppState::new(Arc::new(engine_handle)).with_log_dir(std::path::PathBuf::from(&log_dir));
     let jwt_config = JwtConfig::new(&jwt_secret);
     let (prometheus_layer, metric_handle) = PrometheusMetricLayer::pair();
 

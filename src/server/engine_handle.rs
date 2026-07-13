@@ -78,6 +78,13 @@ impl EngineHandle {
             .ok_or(DbError::EngineUnavailable)
     }
 
+    /// Expose the shared engine `Arc` for app-layer services (e.g.
+    /// `unidb-storage` in item 31) that need the same `Arc<Engine>` instance.
+    /// Returns `Err(EngineUnavailable)` after shutdown.
+    pub fn engine_arc(&self) -> Result<Arc<Engine>> {
+        self.engine()
+    }
+
     /// Run one blocking `Engine` call on a tokio blocking-pool thread. This is
     /// the single choke point that turns every synchronous `Engine` method into
     /// a concurrency-safe async one; N of these run in parallel across the pool.

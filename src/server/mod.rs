@@ -32,6 +32,7 @@ pub mod handlers;
 pub mod logs;
 pub mod router;
 pub mod sse;
+pub mod storage;
 pub mod tls;
 pub mod txn_session;
 
@@ -83,7 +84,7 @@ impl Default for SessionConfig {
 
 /// Shared state threaded through every handler via axum's `State`
 /// extractor: the engine bridge plus the transaction-session and cursor
-/// registries. Cloning per-request is cheap (three `Arc`s).
+/// registries. Cloning per-request is cheap (four `Arc`s).
 #[derive(Clone)]
 pub struct AppState {
     pub engine: Arc<EngineHandle>,
@@ -94,6 +95,12 @@ pub struct AppState {
     /// `unidb-server`'s own resolution) so it points at the same files the
     /// server is writing.
     pub log_dir: Arc<PathBuf>,
+    /// Item 31: optional storage service. `None` when `STORAGE_BACKEND` is not
+    /// set or when init failed at startup (graceful degradation — server boots
+    /// cleanly without storage). All `/storage/*` handlers return 503 when this
+    /// is `None`. Held as `dyn StorageApi` so `unidb` need not depend on
+    /// `unidb-storage` (which already depends on `unidb`) — no crate cycle.
+    pub storage: Option<std::sync::Arc<dyn crate::storage_api::StorageApi>>,
 }
 
 /// Resolve the log directory the same way `src/bin/unidb-server.rs` does, so
@@ -130,6 +137,7 @@ impl AppState {
             sessions,
             cursors,
             log_dir: Arc::new(default_log_dir()),
+            storage: None,
         }
     }
 
@@ -137,6 +145,16 @@ impl AppState {
     /// its resolved `UNIDB_LOG_DIR`; tests point it at a temp dir).
     pub fn with_log_dir(mut self, dir: PathBuf) -> Self {
         self.log_dir = Arc::new(dir);
+        self
+    }
+
+    /// Attach a storage service (item 31). Pass `None` when storage is not
+    /// configured; all `/storage/*` routes return 503 in that case.
+    pub fn with_storage(
+        mut self,
+        svc: Option<std::sync::Arc<dyn crate::storage_api::StorageApi>>,
+    ) -> Self {
+        self.storage = svc;
         self
     }
 }

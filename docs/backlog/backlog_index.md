@@ -44,23 +44,12 @@
 | 28 | `28_replication_time_pitr_logical.md` | Milestone | ✅ SHIPPED 2026-07-13 (R1: side timeline index + restore_to_time; R2: unidb-logical crate) |
 | 29 | `29_subscription_cdc_envelope_lag.md` | Improvement | ✅ SHIPPED 2026-07-13 (before/after CDC, canonical envelope, format adapters, lag observability) |
 | 30 | `30_studio_api_readiness.md` | Improvement | ✅ SHIPPED 2026-07-14 (G9 LIKE/ILIKE, G11 MATCH/sql, ERP integration guide §12) |
-| 31 | `31_storage_http_routes.md` | Milestone | ⏳ NOT STARTED |
+| 31 | `31_storage_http_routes.md` | Milestone | ✅ SHIPPED 2026-07-14 (StorageApi trait + 7 /storage/* routes + 503 contract + 5 integration tests) |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
 
 ## Next up (candidates — pick one, then create `NN_<slug>.md`)
-
-**#31 — Storage HTTP route layer (`31_storage_http_routes.md`, NOT STARTED, 19 SP)**
-Wire the shipped `unidb-storage` crate (item 23) into the engine HTTP server.
-Four phases: (A) add missing `list_buckets`/`list_objects`/`delete_bucket` to
-`metadata.rs` + `StorageService` (2 SP); (B) add optional `Arc<StorageService>`
-to `AppState`, bootstrapped from `STORAGE_BACKEND` env vars (2 SP); (C) 7 HTTP
-handlers in `handlers.rs` + route registration in `router.rs` under
-`/storage/*` (10 SP); (D) integration tests — in-process for bucket CRUD +
-virtual-folder listing, `#[ignore]`-gated for MinIO round-trips (5 SP). All
-routes return 503 + `"storage not available"` when unconfigured — no panic.
-Unblocks the `unidb-studio` Storage tab (PR #8) end-to-end.
 
 Ordered by my current ROI read; reorder as priorities change. Create each
 candidate's `NN_<slug>.md` when started — until then each is *filed inside* an

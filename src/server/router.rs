@@ -21,13 +21,13 @@
 
 use axum::{
     http::StatusCode,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use axum_prometheus::{metrics_exporter_prometheus::PrometheusHandle, PrometheusMetricLayer};
 use tower_http::{cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer};
 
-use crate::server::{auth::JwtConfig, handlers, sse, AppState};
+use crate::server::{auth::JwtConfig, handlers, sse, storage, AppState};
 
 pub fn build_router(
     state: AppState,
@@ -87,6 +87,28 @@ pub fn build_router(
             post(handlers::post_replication_slot_advance),
         )
         .route("/replication/stream", get(handlers::get_replication_stream))
+        // ── Item 31: storage service routes (/storage/*) ──────────────────
+        // All 7 routes return 503 when AppState::storage is None (unconfigured).
+        // C1 list / C2 create buckets
+        .route(
+            "/storage/buckets",
+            get(storage::list_buckets).post(storage::create_bucket),
+        )
+        // C3 delete bucket (409 if non-empty)
+        .route("/storage/buckets/{name}", delete(storage::delete_bucket))
+        // C4 list objects with prefix + delimiter virtual-folder support
+        .route("/storage/{bucket}/objects", get(storage::list_objects))
+        // C5 put object (inline ≤ threshold; larger → presigned PUT ticket)
+        // C6 delete object
+        .route(
+            "/storage/{bucket}/objects/{*key}",
+            put(storage::put_object).delete(storage::delete_object),
+        )
+        // C7 presigned GET URL for direct browser download
+        .route(
+            "/storage/{bucket}/presign/{*key}",
+            get(storage::presign_get),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             jwt_config,
             crate::server::auth::require_jwt,

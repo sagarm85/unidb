@@ -75,6 +75,13 @@ pub mod queue;
 pub mod read_handle;
 pub mod recovery;
 pub mod replication;
+// Item 31: abstract async storage API — trait + types only, no feature gate.
+// `unidb-storage` implements `StorageApi` for `StorageService` without
+// enabling the `server` feature (avoids the circular crate dep `unidb` →
+// `unidb-storage` → `unidb`). The HTTP handlers in `server::storage` consume
+// `dyn StorageApi` and live behind the `server` feature as usual.
+pub mod storage_api;
+
 #[cfg(feature = "server")]
 pub mod server;
 pub mod sql;
