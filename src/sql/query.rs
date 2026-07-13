@@ -99,8 +99,15 @@ pub enum FromNode {
         left: Box<FromNode>,
         right: Box<FromNode>,
         join_type: JoinType,
-        /// `None` for a `CROSS JOIN` / comma join.
+        /// `None` for a `CROSS JOIN` / comma join, or for a `USING` join (whose
+        /// equi-condition is synthesized from `using` at plan time).
         on: Option<QExpr>,
+        /// `JOIN … USING (c1, c2, …)` column names. Empty for `ON`/cross joins.
+        /// Desugared to an equi-`ON` (`left.ci = right.ci`) in `plan.rs::plan_join`,
+        /// which also merges each shared column so it appears once in the output
+        /// (standard `USING` semantics). Mutually exclusive with `on`.
+        #[serde(default)]
+        using: Vec<String>,
     },
 }
 

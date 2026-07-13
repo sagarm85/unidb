@@ -246,6 +246,45 @@ fn worked_example_fk_join_pairs_composite_columns() {
     );
 }
 
+/// The spec's ERD FK query in its **original `USING (constraint_name)` form** —
+/// now that the planner desugars `JOIN … USING`, it runs verbatim (composite
+/// keys still pair correctly via the explicit ordinal-alignment conjunct).
+#[test]
+fn worked_example_fk_join_using_form_runs() {
+    let (engine, _d) = fresh();
+    seed_erd(&engine);
+
+    let (_c, mut rows) = query(
+        &engine,
+        "SELECT tc.table_name AS from_table, kcu.column_name AS from_col, \
+                ccu.table_name AS to_table, ccu.column_name AS to_col \
+         FROM information_schema.table_constraints tc \
+         JOIN information_schema.key_column_usage kcu USING (constraint_name) \
+         JOIN information_schema.referential_constraints rc USING (constraint_name) \
+         JOIN information_schema.key_column_usage ccu \
+              ON ccu.constraint_name = rc.unique_constraint_name \
+             AND ccu.ordinal_position = kcu.position_in_unique_constraint \
+         WHERE tc.constraint_type = 'FOREIGN KEY'",
+    );
+    rows.sort();
+    let mut expected = vec![
+        vec![
+            "line_items".to_string(),
+            "o_order_no".to_string(),
+            "orders".to_string(),
+            "order_no".to_string(),
+        ],
+        vec![
+            "line_items".to_string(),
+            "o_region".to_string(),
+            "orders".to_string(),
+            "region".to_string(),
+        ],
+    ];
+    expected.sort();
+    assert_eq!(rows, expected);
+}
+
 #[test]
 fn worked_example_columns_query_runs() {
     let (engine, _d) = fresh();
