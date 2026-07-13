@@ -3902,6 +3902,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "unidb-server-full"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "axum-prometheus",
+ "tokio",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "unidb",
+ "unidb-storage",
+]
+
+[[package]]
 name = "unidb-storage"
 version = "0.1.0"
 dependencies = [
