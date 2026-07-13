@@ -7,7 +7,12 @@
   `unidb_engine_architecture.pdf` (added 2026-07-13) — the shareable PDF
   architecture reference with diagrams, flows, the measured performance
   ledger, and the Postgres/Supabase-alignment future-scope plan; regenerate
-  it from the adjacent `.html` source (see `design/design_index.md`).
+  it from the adjacent `.html` source (see `design/design_index.md`). Also
+  holds [`design/how_unidb_stores_data.md`](design/how_unidb_stores_data.md)
+  — a byte-level, diagram-heavy walkthrough of one order moving through the
+  real engine (schema, WAL, buffer pool, MVCC, vector search, background
+  workers), written for any reader and making the explicit case for why the
+  architecture beats a stitched-together multi-system stack.
 - [engine_access_guide.md](engine_access_guide.md) — **the Application
   Builder's Guide** (Milestone 18 + item 30): one task-oriented document for
   building an app *on* the engine — connect (embed/attach/server) → query (the
