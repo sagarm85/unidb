@@ -1,7 +1,7 @@
 # Observability metrics enrichment + Studio Observability tab
 
 **Type:** Improvement
-**Status:** SHIPPED (2026-07-13) — branch `21-observability-metrics`. Metrics live
+**Status:** SHIPPED (2026-07-13) — PR #62, branch `21-observability-metrics`. Metrics live
 in `PROGRESS.md` → "Observability metrics enrichment (item 21)". Studio
 Observability tab is out of scope for the engine repo (the tab consumes the
 documented `/stats` + `/metrics` surfaces this item ships; no engine change

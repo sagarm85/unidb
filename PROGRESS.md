@@ -4102,7 +4102,7 @@ decision reopened. This closes item 11's filed follow-up.
 
 ## Observability metrics enrichment (item 21)   [SHIPPED]   2026-07-13
 
-**PR:** _pending (branch `21-observability-metrics`)_
+**PR:** #62 — https://github.com/sagarm85/unidb/pull/62 (branch `21-observability-metrics`)
 **Backlog:** `docs/backlog/21_observability_metrics.md` (spec + AC).
 
 **Summary:** Enriched the `pg_stat_*`-style observability surface (P6.g) with
