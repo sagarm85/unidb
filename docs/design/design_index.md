@@ -8,18 +8,22 @@ architecture reference — when they disagree, `CLAUDE.md`/`PROGRESS.md`
 win.
 
 - [`unidb_engine_architecture.pdf`](unidb_engine_architecture.pdf) — **the
-  shareable architecture reference (PDF, added 2026-07-13)**: full component
-  breakdown with diagrams (layer stack, deployment/HA topology, page/tuple
-  layout, write path + group commit, ARIES recovery, MVCC versioning, IVF-Flat
-  `NEAR` path, the moat vs the replaced stack), how every subsystem works, the
-  measured performance-improvements ledger, locked decisions D1–D13, the honest
-  limitations registry, and a future-scope section aligning against Postgres
-  (engine completeness, tiers P0–P3) and Supabase (platform surface) for
-  production readiness. Generated from
+  shareable, end-user architecture & product guide (PDF)**: what unidb is, how
+  data is stored and kept safe (incl. crash recovery), transactions &
+  concurrency, the SQL layer (supported data types + query examples), search /
+  indexing / graph, the event stream, a full REST API reference (endpoints,
+  params, payloads, responses, error codes), operations & HA, measured
+  performance vs Postgres, correctness/testing, known limitations, and roadmap.
+  Written for **users**, not engine engineers — no internal milestone / phase /
+  decision / item codes. First page is the title + a clickable table of
+  contents (no cover); every page carries a footer page number. Generated from
   [`unidb_engine_architecture.html`](unidb_engine_architecture.html) — edit the
-  HTML, then re-render with headless Chromium:
-  `chromium --headless --no-pdf-header-footer
-  --print-to-pdf=unidb_engine_architecture.pdf unidb_engine_architecture.html`.
+  HTML, then re-render:
+  `node render_pdf.mjs unidb_engine_architecture.html unidb_engine_architecture.pdf`
+  (headless Google Chrome over DevTools, for the page-number footer; see
+  [`render_pdf.mjs`](render_pdf.mjs)). Provenance, source material, and coverage
+  notes live in
+  [`unidb_engine_architecture_context.md`](unidb_engine_architecture_context.md).
   A distilled snapshot: when it disagrees with `CLAUDE.md`/`PROGRESS.md`, those
   win.
 
