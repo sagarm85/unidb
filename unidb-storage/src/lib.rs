@@ -26,6 +26,7 @@
 //! shipped public API. `tokio` + the AWS SDK live here, never in the engine's
 //! default build — the "engine stays sync" invariant is untouched.
 
+pub mod api_impl;
 pub mod config;
 pub mod metadata;
 pub mod outbox;
@@ -34,8 +35,9 @@ pub mod service;
 pub mod store;
 
 pub use config::{Backend, StorageConfig};
+pub use metadata::BucketRow;
 pub use reconcile::{ReconcileReport, Reconciler};
-pub use service::{PutOutcome, StorageService, UploadTicket};
+pub use service::{ListObjectsResult, PutOutcome, StorageService, UploadTicket};
 pub use store::{
     MemoryObjectStore, ObjectEntry, ObjectMeta, ObjectStore, S3ObjectStore, StoreError,
 };
@@ -49,6 +51,8 @@ pub enum StorageError {
     Store(#[from] StoreError),
     #[error("object not found: {0}")]
     NotFound(String),
+    #[error("bucket not empty: {0}")]
+    BucketNotEmpty(String),
     #[error("configuration error: {0}")]
     Config(String),
     #[error("blocking engine task failed to join")]

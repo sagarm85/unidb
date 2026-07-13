@@ -5018,3 +5018,53 @@ passes (all existing tests + 23 new `like_match.rs` tests). Crash harness:
 
 **Locked-decision changes:** none. No storage/format/recovery change. Crash
 harness unchanged at 35/35.
+
+
+---
+
+## Item 31 — Storage HTTP routes (2026-07-14)
+
+**Branch:** `31-storage-http-routes`
+
+Surfaces the `unidb-storage` app-layer crate (item 23) as 7 protected REST
+endpoints under `/storage/*`.
+
+**Architecture (cycle-free):** `unidb-storage` already depends on `unidb`.
+Adding `unidb-storage` to `unidb`'s `[dependencies]` would create a cycle
+(`unidb → unidb-storage → unidb`). Resolution: define a `StorageApi` trait +
+value types at `unidb` crate root (`src/storage_api.rs`, no feature gate);
+`unidb-storage` implements it in `src/api_impl.rs` (already depends on `unidb`,
+just adds the impl); `unidb-storage` goes in `[dev-dependencies]` only.
+`AppState::storage: Option<Arc<dyn StorageApi>>` — `None` → 503 on all routes.
+
+**New files / key changes:**
+- `src/storage_api.rs` — trait + types, no feature gate, no cycle
+- `src/server/storage.rs` — 7 handlers via `dyn StorageApi`
+- `src/server/error.rs` — `From<StorageApiError>` for ApiError
+- `src/server/mod.rs` — `storage: Option<Arc<dyn StorageApi>>` + `with_storage`
+- `src/server/router.rs` — 7 routes in the JWT-protected sub-router
+- `unidb-storage/src/api_impl.rs` — `impl StorageApi for StorageService`
+- `unidb-storage/src/metadata.rs` — `list_buckets`, `list_objects_in_bucket`, `delete_bucket_row`
+- `unidb-storage/src/service.rs` — `list_buckets`, `list_objects`, `delete_bucket`; `ListObjectsResult`
+- `unidb-storage/src/lib.rs` — `BucketNotEmpty` error variant, re-exports
+- `tests/storage_routes.rs` — 5 integration tests (Phase D)
+- `docs/backlog/31_storage_http_routes.md` — spec
+- `docs/REST_API.md` — 7 routes + 503-when-unconfigured contract
+
+**503 contract:** all `/storage/*` handlers return `503 STORAGE_NOT_AVAILABLE`
+when `AppState::storage` is `None`. No 500, no panic. Server boots cleanly
+without storage configured.
+
+**Gates:**
+
+| Gate | Result |
+|------|--------|
+| `cargo test -p unidb --features server --test storage_routes` | ✅ 5/5 pass |
+| `cargo test --workspace --features server` | ✅ all pass |
+| crash harness | ✅ 35/35 (unchanged — server-layer only, no engine change) |
+| `clippy --workspace --all-targets --features server -D warnings` | ✅ clean |
+| `cargo fmt --all` | ✅ clean |
+| sync invariant (`cargo tree … --no-default-features … \| grep -i tokio`) | ✅ empty |
+| `cargo build` (no features) | ✅ clean |
+
+**Locked-decision changes:** none. No storage/format/recovery/WAL change.

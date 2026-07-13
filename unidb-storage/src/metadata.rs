@@ -166,6 +166,48 @@ pub fn bucket_exists(engine: &Engine, xid: Xid, name: &str) -> Result<bool, DbEr
     Ok(!rows.is_empty())
 }
 
+/// A row of the `buckets` table.
+#[derive(Debug, Clone)]
+pub struct BucketRow {
+    pub name: String,
+    pub created_by: Option<String>,
+    pub created_at_ms: i64,
+}
+
+/// List all buckets.
+pub fn list_buckets(engine: &Engine, xid: Xid) -> Result<Vec<BucketRow>, DbError> {
+    let sql = format!("SELECT name, created_by, created_at_ms FROM {BUCKETS_TABLE}");
+    let rows = rows_of(engine.execute_sql(xid, &sql)?);
+    Ok(rows
+        .into_iter()
+        .map(|r| BucketRow {
+            name: as_text(&r[0]),
+            created_by: as_opt_text(&r[1]),
+            created_at_ms: as_int(&r[2]),
+        })
+        .collect())
+}
+
+/// All objects in `bucket` (used by list_objects and the non-empty guard).
+pub fn list_objects_in_bucket(
+    engine: &Engine,
+    xid: Xid,
+    bucket: &str,
+) -> Result<Vec<ObjectRow>, DbError> {
+    let sql = format!("{SELECT_COLS} WHERE bucket = $1");
+    let rows =
+        rows_of(engine.execute_sql_params(xid, &sql, &[Literal::Text(bucket.to_string())])?);
+    Ok(rows.into_iter().map(decode_object).collect())
+}
+
+/// Delete a bucket row. Caller is responsible for verifying the bucket is
+/// empty (via [`list_objects_in_bucket`]) before calling this.
+pub fn delete_bucket_row(engine: &Engine, xid: Xid, name: &str) -> Result<(), DbError> {
+    let sql = format!("DELETE FROM {BUCKETS_TABLE} WHERE name = $1");
+    engine.execute_sql_params(xid, &sql, &[Literal::Text(name.to_string())])?;
+    Ok(())
+}
+
 /// Insert an `objects` row. When events are enabled on `objects`, this emits the
 /// atomic "upload-pending"/"ready" outbox event in the same transaction.
 pub fn insert_object(engine: &Engine, xid: Xid, row: &ObjectRow) -> Result<(), DbError> {

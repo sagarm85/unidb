@@ -872,6 +872,138 @@ by `server/error.rs`'s `ApiError` directly, not by a `DbError` variant.
 
 ---
 
+---
+
+## Storage service routes (item 31)
+
+Seven routes surface the `unidb-storage` app-layer crate as protected REST
+endpoints. All require a JWT bearer token. All return
+`503 {"error":"…","code":"STORAGE_NOT_AVAILABLE"}` when storage is not
+configured (`STORAGE_BACKEND` env var absent or init failed at startup) — the
+server boots cleanly without storage.
+
+### 503-when-unconfigured contract
+
+Every handler calls `require_storage` before touching the service. If
+`AppState::storage` is `None`, the response is always:
+
+```
+HTTP/1.1 503 Service Unavailable
+{"error":"storage service is not configured (STORAGE_BACKEND not set or init failed)","code":"STORAGE_NOT_AVAILABLE"}
+```
+
+No 500, no panic, regardless of the request body or path params.
+
+### C1 — List buckets
+
+```
+GET /storage/buckets
+Authorization: Bearer <token>
+
+→ 200 { "buckets": [ { "name": "…", "created_by": "…"|null, "created_at_ms": N } ] }
+→ 503 STORAGE_NOT_AVAILABLE
+```
+
+### C2 — Create bucket
+
+```
+POST /storage/buckets
+Authorization: Bearer <token>
+Content-Type: application/json
+{ "name": "my-bucket" }
+
+→ 201 (empty body)
+→ 503 STORAGE_NOT_AVAILABLE
+```
+
+### C3 — Delete bucket
+
+```
+DELETE /storage/buckets/{name}
+Authorization: Bearer <token>
+
+→ 204 (empty body)
+→ 409 { "error":"bucket 'name' still contains objects", "code":"BUCKET_NOT_EMPTY" }
+→ 503 STORAGE_NOT_AVAILABLE
+```
+
+Returns 409 if the bucket has any object rows. Delete all objects first.
+
+### C4 — List objects (virtual-folder aware)
+
+```
+GET /storage/{bucket}/objects[?prefix=photos/&delimiter=/]
+Authorization: Bearer <token>
+
+→ 200 {
+    "objects":  [ { "object_key":"…", "size":N, "etag":"…"|null, "content_type":"…"|null,
+                    "status":"ready"|"pending", "tier":"inline"|"s3",
+                    "created_at_ms":N } ],
+    "prefixes": [ "photos/vacation/" ]   // virtual folders
+  }
+→ 503 STORAGE_NOT_AVAILABLE
+```
+
+With `prefix` + `delimiter`, objects whose key suffix (after the prefix) contains
+the delimiter are folded into `prefixes` (virtual folders); the rest appear in
+`objects`. Standard S3-style listing semantics.
+
+### C5 — Put object (inline or presigned)
+
+```
+PUT /storage/{bucket}/objects/{*key}
+Authorization: Bearer <token>
+Content-Type: <mime-type>           (optional)
+<body bytes>
+
+→ 201 { "tier":"inline", "size":N, "etag":"…"|null }   // body.len() < inline_threshold
+→ 200 { "presigned_put_url":"https://…", "storage_key":"…" }  // body.len() >= threshold
+→ 503 STORAGE_NOT_AVAILABLE
+```
+
+The split point is `StorageConfig::inline_threshold` (default 1 MiB). When the
+body is below threshold, bytes are stored as an engine LOB in one transaction
+(response 201). When at or above threshold, a pending metadata row is created and
+a presigned PUT URL is returned (response 200); the client must PUT the bytes
+directly to that URL.
+
+### C6 — Delete object
+
+```
+DELETE /storage/{bucket}/objects/{*key}
+Authorization: Bearer <token>
+
+→ 204 (empty body)
+→ 404 STORAGE_NOT_FOUND
+→ 503 STORAGE_NOT_AVAILABLE
+```
+
+### C7 — Presigned GET URL
+
+```
+GET /storage/{bucket}/presign/{*key}
+Authorization: Bearer <token>
+
+→ 200 { "presigned_get_url": "https://…" }
+→ 404 STORAGE_NOT_FOUND
+→ 503 STORAGE_NOT_AVAILABLE
+```
+
+Returns a time-limited URL for direct browser/client download without exposing
+app credentials.
+
+### Storage error codes
+
+| HTTP | code | meaning |
+|------|------|---------|
+| 503 | `STORAGE_NOT_AVAILABLE` | storage service not configured |
+| 404 | `STORAGE_NOT_FOUND` | bucket or object does not exist |
+| 409 | `BUCKET_NOT_EMPTY` | delete-bucket blocked by existing objects |
+| 503 | `STORAGE_CONFIG_ERROR` | backend config error (bad env vars) |
+| 502 | `OBJECT_STORE_ERROR` | upstream S3/MinIO error |
+
+---
+
 ## Known limitations
 
 Formerly-listed v1 gaps now closed by the REST-enrichment work (item 12):

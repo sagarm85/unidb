@@ -54,6 +54,11 @@ server = [
 ]
 
 [dev-dependencies]
+# Item 31: storage HTTP routes integration tests. unidb-storage depends on
+# unidb, so placing it in [dependencies] would create a cycle. In dev-
+# dependencies Cargo allows this cross-reference: the test binary links to
+# both without a cycle in the normal-edge graph.
+unidb-storage = { path = "unidb-storage" }
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
@@ -243,4 +248,10 @@ required-features = ["server"]
 [[test]]
 name = "logs_correlation"
 path = "tests/logs_correlation.rs"
+required-features = ["server"]
+
+# Item 31: storage HTTP routes integration tests (Phase D).
+[[test]]
+name = "storage_routes"
+path = "tests/storage_routes.rs"
 required-features = ["server"]

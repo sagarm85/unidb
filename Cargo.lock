@@ -3839,6 +3839,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "unidb-storage",
  "zerocopy 0.7.35",
 ]
 
