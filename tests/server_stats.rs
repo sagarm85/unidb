@@ -40,4 +40,17 @@ async fn stats_endpoint_reports_activity() {
     assert!(body["dead_tuple_estimate"].is_u64());
     assert_eq!(body["live_tuple_estimate"].as_u64().unwrap(), 1);
     assert!(body["last_autovacuum_epoch_secs"].is_u64());
+
+    // Item 21: the enriched engine metrics + server-session gauges are present.
+    assert!(body["statement_latency"]["insert"]["count"].is_u64());
+    assert!(body["bufferpool"]["hits"].is_u64());
+    assert!(body["wal_fsyncs"].is_u64());
+    assert!(body["locks"]["waits"].is_u64());
+    assert!(body["horizon_age_secs"].is_number());
+    assert!(body["parallel_workers"]["global_max"].is_u64());
+    assert!(body["tables"].is_array(), "per-table stats array present");
+    // Server-layer session panel (merged in the handler, not the engine).
+    assert!(body["open_txn_sessions"].is_u64());
+    assert!(body["open_cursors"].is_u64());
+    assert!(body["idle_reaper_aborts"].is_u64());
 }

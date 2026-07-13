@@ -31,7 +31,10 @@ use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
     path::Path,
-    sync::{Arc, Condvar, Mutex, MutexGuard, RwLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Condvar, Mutex, MutexGuard, RwLock,
+    },
 };
 
 use crate::{
@@ -282,6 +285,24 @@ pub struct BufferPool {
     /// orders concurrent physical access to that page only, so distinct pages
     /// never contend here.
     latches: Mutex<HashMap<PageId, Arc<PageLatchInner>>>,
+    /// Cache-efficiency counters (item 21). Lock-free `Relaxed` atomics — a
+    /// `fetch_add` outside the state mutex, so the read/write hot paths that
+    /// hit an already-resident frame never pay for observability. `hits` when
+    /// `fetch_page` finds the page resident, `misses` when it must fault it in,
+    /// `evictions` each time a resident page is displaced from a frame.
+    hits: AtomicU64,
+    misses: AtomicU64,
+    evictions: AtomicU64,
+}
+
+/// Cache-efficiency snapshot (item 21) — the buffer-pool half of `stats()`.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct BufferPoolStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+    /// `hits / (hits + misses)`, `0.0` before the first access.
+    pub hit_ratio: f64,
 }
 
 impl BufferPool {
@@ -340,7 +361,27 @@ impl BufferPool {
                 flush_fault_armed: false,
             }),
             latches: Mutex::new(HashMap::new()),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
         })
+    }
+
+    /// A cold-path readout of the cache-efficiency counters (item 21).
+    pub fn pool_stats(&self) -> BufferPoolStats {
+        let hits = self.hits.load(Ordering::Relaxed);
+        let misses = self.misses.load(Ordering::Relaxed);
+        let total = hits + misses;
+        BufferPoolStats {
+            hits,
+            misses,
+            evictions: self.evictions.load(Ordering::Relaxed),
+            hit_ratio: if total == 0 {
+                0.0
+            } else {
+                hits as f64 / total as f64
+            },
+        }
     }
 
     fn lock_state(&self) -> MutexGuard<'_, PoolState> {
@@ -548,14 +589,18 @@ impl BufferPool {
                 st.frames[frame_idx].pin_count += 1;
                 st.frames[frame_idx].clock_ref = true;
                 drop(st);
+                self.hits.fetch_add(1, Ordering::Relaxed); // item 21: cache hit
                 return self.read_page_from_mmap(page_id);
             }
 
-            // Page not in pool — find a victim frame (may flush a durable dirty
-            // page back, all under the same state lock).
+            // Page not in pool — a cache miss; find a victim frame (may flush a
+            // durable dirty page back, all under the same state lock).
+            self.misses.fetch_add(1, Ordering::Relaxed); // item 21: cache miss
             let frame_idx = self.find_victim(&mut st)?;
 
             if let Some(old_pid) = st.frames[frame_idx].page_id {
+                // A resident page is being displaced to make room (item 21).
+                self.evictions.fetch_add(1, Ordering::Relaxed);
                 st.frame_index.remove(&old_pid);
             }
             st.frames[frame_idx].page_id = Some(page_id);

@@ -20,7 +20,7 @@
 //! (`snapshot_deadline`). `UNIDB_PARALLEL_SCAN=0` / `Engine::set_parallel_scan(false)`
 //! remain the field-revert net.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, Once};
 
 use crate::bufferpool::SharedPageReader;
@@ -47,6 +47,44 @@ static MAX_WORKERS: AtomicUsize = AtomicUsize::new(0); // per-query cap; 0 → c
 static GLOBAL_MAX: AtomicUsize = AtomicUsize::new(0);
 static AVAILABLE: AtomicUsize = AtomicUsize::new(0);
 static INIT: Once = Once::new();
+
+// ── worker-governance observability (item 21) ────────────────────────────────
+// Lifetime counters, lock-free. `PARALLEL_SCANS` = scans that ran with >=2
+// workers; `WORKERS_GRANTED` = total worker-threads leased across them (so the
+// mean degree is `WORKERS_GRANTED / PARALLEL_SCANS`); `SERIAL_FALLBACKS` = scans
+// that degraded to serial because the global budget was exhausted at admission
+// (the governance signal — how often the `GLOBAL_MAX` cap actually bit).
+static PARALLEL_SCANS: AtomicU64 = AtomicU64::new(0);
+static WORKERS_GRANTED: AtomicU64 = AtomicU64::new(0);
+static SERIAL_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// Worker-governance snapshot (item 21) — the worker half of `stats()`.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct WorkerStats {
+    /// The global worker budget (`GLOBAL_MAX`) — the ceiling on live workers
+    /// across all concurrent scans (0 until the first scan initializes it).
+    pub global_max: usize,
+    /// Permits free right now (`GLOBAL_MAX` minus in-flight leases).
+    pub available: usize,
+    /// Scans that ran parallel (>=2 workers) this session.
+    pub parallel_scans: u64,
+    /// Total worker threads leased across those scans.
+    pub workers_granted: u64,
+    /// Scans that degraded to serial because the budget was exhausted.
+    pub serial_fallbacks: u64,
+}
+
+/// Cold-path readout of worker governance (item 21).
+pub fn worker_stats() -> WorkerStats {
+    init_from_env();
+    WorkerStats {
+        global_max: GLOBAL_MAX.load(Ordering::Relaxed),
+        available: AVAILABLE.load(Ordering::Relaxed),
+        parallel_scans: PARALLEL_SCANS.load(Ordering::Relaxed),
+        workers_granted: WORKERS_GRANTED.load(Ordering::Relaxed),
+        serial_fallbacks: SERIAL_FALLBACKS.load(Ordering::Relaxed),
+    }
+}
 
 fn cores() -> usize {
     std::thread::available_parallelism()
@@ -134,14 +172,24 @@ fn take_from_pool(want: usize) -> usize {
 /// busy right now — so a flood of concurrent scans stays bounded instead of
 /// oversubscribing.
 pub fn acquire(n_units: usize) -> Option<WorkerLease> {
-    let want = degree_for(n_units)?;
+    let Some(want) = degree_for(n_units) else {
+        // Disabled or below the page threshold — not a governance fallback, so
+        // it isn't counted (only budget-exhaustion of an eligible scan is).
+        return None;
+    };
     let granted = take_from_pool(want);
     if granted >= 2 {
+        // item 21: a real parallel scan of `granted` workers.
+        PARALLEL_SCANS.fetch_add(1, Ordering::Relaxed);
+        WORKERS_GRANTED.fetch_add(granted as u64, Ordering::Relaxed);
         Some(WorkerLease { granted })
     } else {
         if granted > 0 {
             AVAILABLE.fetch_add(granted, Ordering::Relaxed);
         }
+        // Eligible to parallelize but the global budget was exhausted — the
+        // governance cap biting, degrading to serial (item 21).
+        SERIAL_FALLBACKS.fetch_add(1, Ordering::Relaxed);
         None
     }
 }

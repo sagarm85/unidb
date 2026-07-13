@@ -673,9 +673,12 @@ route — same auth as everything else in v1 (no admin-only scope).
 
 ---
 
-### `GET /stats` (P6.g)
+### `GET /stats` (P6.g + item 21)
 
-A `pg_stat_*`-style activity snapshot.
+A `pg_stat_*`-style activity snapshot. Item 21 enriches it with production-grade
+metrics captured lock-free at existing chokepoints (per-statement-kind latency,
+WAL-fsync cost, buffer-pool efficiency, lock contention, the vacuum-horizon-age
+gauge, per-table page counts, and worker-governance utilization).
 
 **Response** `200 OK`:
 ```json
@@ -684,11 +687,28 @@ A `pg_stat_*`-style activity snapshot.
   "active_transactions": 0, "wal_bytes": 81920,
   "replication_slots": 1, "max_replication_lag": 128,
   "data_pages": 37, "recent_slow_queries": [{"sql": "...", "micros": 4210}],
-  "open_txn_sessions": 0, "open_cursors": 0
+  "autovacuums": 2, "dead_tuple_estimate": 5, "live_tuple_estimate": 40,
+  "last_autovacuum_epoch_secs": 1752345600,
+  "statement_latency": {
+    "insert": {"count": 50, "p50_us": 32, "p99_us": 256, "mean_us": 41},
+    "update": {"count": 1, "p50_us": 64, "p99_us": 64, "mean_us": 60},
+    "delete": {"count": 1, "p50_us": 64, "p99_us": 64, "mean_us": 55},
+    "select": {"count": 3, "p50_us": 16, "p99_us": 32, "mean_us": 18}
+  },
+  "wal_fsyncs": 12, "wal_fsync_latency": {"count": 12, "p50_us": 512, "p99_us": 2048, "mean_us": 640},
+  "bufferpool": {"hits": 980, "misses": 40, "evictions": 3, "hit_ratio": 0.9607},
+  "locks": {"waits": 0, "deadlocks": 0, "wait": {"count": 0, "p50_us": 0, "p99_us": 0, "mean_us": 0}},
+  "horizon_age_secs": 0.0,
+  "parallel_workers": {"global_max": 8, "available": 8, "parallel_scans": 0, "workers_granted": 0, "serial_fallbacks": 0},
+  "tables": [{"name": "t", "pages": 3}],
+  "open_txn_sessions": 0, "open_cursors": 0, "idle_reaper_aborts": 0
 }
 ```
-`open_txn_sessions` / `open_cursors` are server-layer gauges (R1/R4) added
-alongside the engine counters.
+`open_txn_sessions` / `open_cursors` / `idle_reaper_aborts` are server-layer
+gauges (R1/R4 + item 21) added alongside the engine counters — the engine can't
+see HTTP sessions. Percentiles are log-bucket **estimates** (the `le`
+convention); the full metric ↔ widget map is
+`docs/engine_access_guide.md` §9 (widget-traceability table).
 
 ---
 
@@ -781,7 +801,18 @@ axum_http_requests_total{method="POST",path="/sql",status="200"} 12
 unidb_jwt_verify_seconds_sum 0.000012
 unidb_sse_poll_cycles_total 340
 unidb_sse_events_delivered_total 17
+# item 21: engine metrics republished from stats() on each scrape
+unidb_commits_total 42
+unidb_statement_latency_p99_us{kind="insert"} 256
+unidb_bufferpool_hit_ratio 0.9607
+unidb_wal_fsyncs_total 12
+unidb_horizon_age_seconds 0
+unidb_parallel_worker_budget 8
+unidb_table_pages{table="t"} 3
+unidb_open_txn_sessions 0
 ```
+Every item-21 metric name (and the widget it drives) is documented in
+`docs/engine_access_guide.md` §9.
 
 ---
 

@@ -93,9 +93,13 @@ pub fn build_router(
         ))
         .with_state(state.clone());
 
-    // `/metrics` (P6.g): the axum-prometheus HTTP metrics plus the app-level
-    // autovacuum gauges (A4), refreshed from `Engine::stats()` on each scrape so
-    // a Prometheus target sees dead-tuple pressure, run count, and last-run time.
+    // `/metrics` (P6.g + item 21): the axum-prometheus HTTP metrics plus the
+    // app-level engine gauges, refreshed from `Engine::stats()` on each scrape.
+    // The engine captures everything lock-free into atomics/histograms on the
+    // hot paths; this scrape handler is the only place that reads them back and
+    // republishes them through the Prometheus facade (`metrics` crate), so a
+    // scrape never perturbs the write path. Every metric name emitted here is
+    // documented with its driven widget in `docs/engine_access_guide.md`.
     let metrics_state = state;
     let public = Router::new().route(
         "/metrics",
@@ -104,13 +108,13 @@ pub fn build_router(
             let state = metrics_state.clone();
             async move {
                 if let Ok(stats) = state.engine.stats().await {
-                    metrics::gauge!("unidb_autovacuum_runs_total").set(stats.autovacuums as f64);
-                    metrics::gauge!("unidb_dead_tuple_estimate")
-                        .set(stats.dead_tuple_estimate as f64);
-                    metrics::gauge!("unidb_live_tuple_estimate")
-                        .set(stats.live_tuple_estimate as f64);
-                    metrics::gauge!("unidb_autovacuum_last_run_epoch_secs")
-                        .set(stats.last_autovacuum_epoch_secs as f64);
+                    publish_engine_metrics(&stats);
+                    // Server-session panel (item 12/21) — reads AppState, not
+                    // the engine, so it lives here rather than in `stats()`.
+                    metrics::gauge!("unidb_open_txn_sessions").set(state.sessions.len() as f64);
+                    metrics::gauge!("unidb_open_cursors").set(state.cursors.len() as f64);
+                    metrics::gauge!("unidb_idle_reaper_aborts_total")
+                        .set(state.sessions.reaper_aborts() as f64);
                 }
                 handle.render()
             }
@@ -134,4 +138,69 @@ pub fn build_router(
             StatusCode::REQUEST_TIMEOUT,
             std::time::Duration::from_secs(30),
         ))
+}
+
+/// Republish a `stats()` snapshot through the Prometheus facade (item 21).
+/// Called only on a `/metrics` scrape — the engine already captured everything
+/// lock-free into atomics/histograms on its hot paths, so this is a pure
+/// read-and-set. Metric names (and the widget each drives) are catalogued in
+/// `docs/engine_access_guide.md`'s widget-traceability table; keep the two in
+/// sync when adding a metric here.
+fn publish_engine_metrics(stats: &crate::EngineStats) {
+    use metrics::gauge;
+
+    // Commit-rate + durability-cost panel.
+    gauge!("unidb_commits_total").set(stats.commits as f64);
+    gauge!("unidb_aborts_total").set(stats.aborts as f64);
+    gauge!("unidb_checkpoints_total").set(stats.checkpoints as f64);
+    gauge!("unidb_wal_bytes").set(stats.wal_bytes as f64);
+    gauge!("unidb_wal_fsyncs_total").set(stats.wal_fsyncs as f64);
+    gauge!("unidb_wal_fsync_p50_us").set(stats.wal_fsync_latency.p50_us as f64);
+    gauge!("unidb_wal_fsync_p99_us").set(stats.wal_fsync_latency.p99_us as f64);
+
+    // Query-latency panel: one p50/p99 pair per statement kind.
+    let sl = &stats.statement_latency;
+    for (kind, h) in [
+        ("insert", &sl.insert),
+        ("update", &sl.update),
+        ("delete", &sl.delete),
+        ("select", &sl.select),
+    ] {
+        gauge!("unidb_statement_latency_p50_us", "kind" => kind).set(h.p50_us as f64);
+        gauge!("unidb_statement_latency_p99_us", "kind" => kind).set(h.p99_us as f64);
+        gauge!("unidb_statement_count", "kind" => kind).set(h.count as f64);
+    }
+
+    // Cache-efficiency panel.
+    let bp = &stats.bufferpool;
+    gauge!("unidb_bufferpool_hits_total").set(bp.hits as f64);
+    gauge!("unidb_bufferpool_misses_total").set(bp.misses as f64);
+    gauge!("unidb_bufferpool_evictions_total").set(bp.evictions as f64);
+    gauge!("unidb_bufferpool_hit_ratio").set(bp.hit_ratio);
+
+    // Contention panel.
+    gauge!("unidb_lock_waits_total").set(stats.locks.waits as f64);
+    gauge!("unidb_deadlocks_total").set(stats.locks.deadlocks as f64);
+    gauge!("unidb_lock_wait_p50_us").set(stats.locks.wait.p50_us as f64);
+    gauge!("unidb_lock_wait_p99_us").set(stats.locks.wait.p99_us as f64);
+
+    // Bloat-risk gauge (the item-16 postmortem metric — alert on this).
+    gauge!("unidb_horizon_age_seconds").set(stats.horizon_age_secs);
+
+    // Autovacuum / table-health.
+    gauge!("unidb_autovacuum_runs_total").set(stats.autovacuums as f64);
+    gauge!("unidb_dead_tuple_estimate").set(stats.dead_tuple_estimate as f64);
+    gauge!("unidb_live_tuple_estimate").set(stats.live_tuple_estimate as f64);
+    gauge!("unidb_autovacuum_last_run_epoch_secs").set(stats.last_autovacuum_epoch_secs as f64);
+    for t in &stats.tables {
+        gauge!("unidb_table_pages", "table" => t.name.clone()).set(t.pages as f64);
+    }
+
+    // Worker-governance panel (item 15).
+    let w = &stats.parallel_workers;
+    gauge!("unidb_parallel_worker_budget").set(w.global_max as f64);
+    gauge!("unidb_parallel_workers_available").set(w.available as f64);
+    gauge!("unidb_parallel_scans_total").set(w.parallel_scans as f64);
+    gauge!("unidb_parallel_workers_granted_total").set(w.workers_granted as f64);
+    gauge!("unidb_parallel_serial_fallbacks_total").set(w.serial_fallbacks as f64);
 }

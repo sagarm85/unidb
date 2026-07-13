@@ -35,12 +35,26 @@
 // deferred tuning, not correctness.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
+use std::time::Instant;
 
 use crate::{
     error::{DbError, Result},
     format::{PageId, Xid},
+    metrics::{AtomicHistogram, HistogramSnapshot},
 };
+
+/// Contention snapshot (item 21) — the lock-manager half of `stats()`.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct LockStats {
+    /// Acquisitions that had to block at least once before being granted.
+    pub waits: u64,
+    /// Acquisitions aborted as the deadlock victim.
+    pub deadlocks: u64,
+    /// Wall-clock a blocked acquire spent parked before it was granted.
+    pub wait: HistogramSnapshot,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RecordKind {
@@ -199,6 +213,14 @@ impl LockTable {
 pub struct LockManager {
     table: Mutex<LockTable>,
     cvar: Condvar,
+    /// Contention observability (item 21). Lock-free atomics updated outside
+    /// the deadlock-detection critical path: `waits` counts blocking acquires,
+    /// `deadlocks` counts victim aborts, `wait_latency` records how long a
+    /// parked waiter blocked before being granted. The no-wait (SI) path never
+    /// touches these, so the default concurrent-write path pays nothing.
+    waits: AtomicU64,
+    deadlocks: AtomicU64,
+    wait_latency: AtomicHistogram,
 }
 
 impl Default for LockManager {
@@ -212,6 +234,18 @@ impl LockManager {
         Self {
             table: Mutex::new(LockTable::default()),
             cvar: Condvar::new(),
+            waits: AtomicU64::new(0),
+            deadlocks: AtomicU64::new(0),
+            wait_latency: AtomicHistogram::new(),
+        }
+    }
+
+    /// Cold-path contention readout (item 21).
+    pub fn lock_stats(&self) -> LockStats {
+        LockStats {
+            waits: self.waits.load(Ordering::Relaxed),
+            deadlocks: self.deadlocks.load(Ordering::Relaxed),
+            wait: self.wait_latency.snapshot(),
         }
     }
 
@@ -234,11 +268,19 @@ impl LockManager {
         policy: WaitPolicy,
     ) -> Result<()> {
         let mut t = self.lock();
+        // Wall-clock the *first* park to this grant (item 21 contention panel).
+        // `None` until this acquire actually blocks, so an uncontended grant
+        // records nothing and the lock-free counters stay untouched.
+        let mut blocked_since: Option<Instant> = None;
         loop {
             if t.can_grant(id, xid, mode) {
                 t.grant(id, xid, mode);
                 // A grant can make queued (e.g. shared) waiters grantable too.
                 self.cvar.notify_all();
+                drop(t);
+                if let Some(since) = blocked_since {
+                    self.wait_latency.record(since.elapsed().as_micros() as u64);
+                }
                 return Ok(());
             }
             match policy {
@@ -257,8 +299,15 @@ impl LockManager {
                         t.waits_for.remove(&xid);
                         t.gc();
                         self.cvar.notify_all();
+                        self.deadlocks.fetch_add(1, Ordering::Relaxed); // item 21
                         tracing::info!(xid, "deadlock: chosen as victim");
                         return Err(DbError::Deadlock { xid });
+                    }
+                    // First time this acquire blocks: count the wait and start
+                    // its clock (item 21). Subsequent spurious wake-ups reuse it.
+                    if blocked_since.is_none() {
+                        blocked_since = Some(Instant::now());
+                        self.waits.fetch_add(1, Ordering::Relaxed);
                     }
                     t = self.cvar.wait(t).unwrap_or_else(|e| e.into_inner());
                 }

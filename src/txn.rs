@@ -16,6 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 use crate::{
     bufferpool::BufferPool,
@@ -70,6 +71,12 @@ pub struct Transaction {
     pub snapshot: Snapshot,
     pub begin_lsn: Lsn,
     pub last_lsn: Lsn,
+    /// Wall-clock instant this transaction began (item 21). Feeds the
+    /// oldest-snapshot / vacuum-horizon **age** gauge: a long-lived (esp.
+    /// idle `REPEATABLE READ`) transaction pins the horizon, and this is how
+    /// long it has done so. Not persisted — a purely in-memory observability
+    /// field, reset to "no live snapshot" once the transaction ends.
+    pub begin_at: Instant,
     pub undo_log: Vec<UndoAction>,
     /// SSI rw-antidependency tracking (P1.d), populated only for
     /// `Serializable` transactions. `None` for RC/RR (no overhead).
@@ -118,7 +125,10 @@ pub struct TxnInner {
     /// still needs. Each entry is a live read snapshot's `xmin`, keyed by a
     /// registration id so it can be dropped when the read finishes (see
     /// [`ReadRegistration`]). Held only for the duration of one read call.
-    read_registrations: HashMap<u64, Xid>,
+    /// Each entry pairs the snapshot `xmin` with the wall-clock instant the
+    /// read began, so a long-running concurrent scan contributes to the
+    /// horizon-age gauge (item 21) just as a long writer transaction does.
+    read_registrations: HashMap<u64, (Xid, Instant)>,
     next_reg_id: u64,
     /// SSI state of `Serializable` transactions that have **committed** but may
     /// still be concurrent with a live serializable transaction (P1.d), kept so
@@ -147,8 +157,24 @@ impl TxnInner {
     /// when nothing is live (everything below it is then reclaimable).
     fn vacuum_horizon(&self) -> Xid {
         let writers = self.active.values().map(|t| t.snapshot.xmin);
-        let readers = self.read_registrations.values().copied();
+        let readers = self.read_registrations.values().map(|(xmin, _)| *xmin);
         writers.chain(readers).min().unwrap_or(self.next_xid)
+    }
+
+    /// Age of the **oldest live snapshot** (item 21): the wall-clock time the
+    /// earliest-begun live writer transaction or concurrent reader has been
+    /// holding the vacuum horizon back. `0` when nothing is live (the horizon
+    /// is free to advance). This is the item-16 postmortem metric — a pinned
+    /// horizon is the #1 silent bloat cause — surfaced as an alertable gauge:
+    /// an idle `REPEATABLE READ` session makes it climb, and its commit/abort
+    /// (which drops the txn from `active`) resets it to 0.
+    fn oldest_snapshot_age(&self) -> std::time::Duration {
+        let writers = self.active.values().map(|t| t.begin_at);
+        let readers = self.read_registrations.values().map(|(_, since)| *since);
+        match writers.chain(readers).min() {
+            Some(oldest) => oldest.elapsed(),
+            None => std::time::Duration::ZERO,
+        }
     }
 
     /// The snapshot a statement inside `xid` should read under: fresh for
@@ -215,7 +241,9 @@ pub fn read_snapshot(shared: &SharedTxn) -> (Snapshot, Xid, ReadRegistration) {
     let self_xid = inner.next_xid;
     let id = inner.next_reg_id;
     inner.next_reg_id += 1;
-    inner.read_registrations.insert(id, snapshot.xmin);
+    inner
+        .read_registrations
+        .insert(id, (snapshot.xmin, Instant::now()));
     (
         snapshot,
         self_xid,
@@ -337,6 +365,7 @@ impl TransactionManager {
                 snapshot,
                 begin_lsn,
                 last_lsn: begin_lsn,
+                begin_at: Instant::now(),
                 undo_log: Vec::new(),
                 ssi: if isolation == IsolationLevel::Serializable {
                     Some(SsiState::default())
@@ -360,6 +389,13 @@ impl TransactionManager {
     /// concurrent readers (6b `ReadHandle`s).
     pub fn vacuum_horizon(&self) -> Xid {
         self.lock().vacuum_horizon()
+    }
+
+    /// Wall-clock age of the oldest live snapshot pinning the vacuum horizon —
+    /// see [`TxnInner::oldest_snapshot_age`] (item 21). `Duration::ZERO` when no
+    /// transaction or reader is live.
+    pub fn oldest_snapshot_age(&self) -> std::time::Duration {
+        self.lock().oldest_snapshot_age()
     }
 
     /// Record a mutation for possible later rollback. Called by the Engine
@@ -674,6 +710,47 @@ mod tests {
         mgr.commit(a, &wal, &lock_mgr).unwrap();
         assert!(!mgr.is_active(a));
         assert!(mgr.is_committed(a));
+    }
+
+    /// Item 21 acceptance: the oldest-snapshot / vacuum-horizon **age** gauge
+    /// grows while an idle `REPEATABLE READ` session is held, and resets the
+    /// moment that session commits or aborts (dropping it from `active`). Uses
+    /// a real elapsed-time observation rather than mocking the clock.
+    #[test]
+    fn horizon_age_grows_while_rr_idle_and_resets_on_commit() {
+        let dir = tempdir().unwrap();
+        let (_pool, _heap, wal) = setup(dir.path());
+        let mgr = TransactionManager::new();
+        let lock_mgr = LockManager::new();
+
+        // No live snapshot: horizon is free, age is exactly zero.
+        assert_eq!(mgr.oldest_snapshot_age(), std::time::Duration::ZERO);
+
+        // An idle RR session pins the horizon; its age must climb over time.
+        let rr = mgr.begin(IsolationLevel::RepeatableRead, &wal).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let age1 = mgr.oldest_snapshot_age();
+        assert!(
+            age1 >= std::time::Duration::from_millis(15),
+            "idle RR session should have aged ~20ms, saw {age1:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            mgr.oldest_snapshot_age() > age1,
+            "an idle RR session's horizon age must keep growing"
+        );
+
+        // Commit resets the horizon (nothing live) → age back to zero.
+        mgr.commit(rr, &wal, &lock_mgr).unwrap();
+        assert_eq!(mgr.oldest_snapshot_age(), std::time::Duration::ZERO);
+
+        // Abort resets it too (the item-16 postmortem shape: an abandoned txn
+        // reaped by the idle-session reaper un-pins the horizon).
+        let rr2 = mgr.begin(IsolationLevel::RepeatableRead, &wal).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(mgr.oldest_snapshot_age() > std::time::Duration::ZERO);
+        mgr.abort(rr2, &_pool, &_heap, &wal, &lock_mgr).unwrap();
+        assert_eq!(mgr.oldest_snapshot_age(), std::time::Duration::ZERO);
     }
 
     #[test]

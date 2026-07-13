@@ -35,8 +35,14 @@ use std::{
     fs::{File, OpenOptions},
     io::{BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex, MutexGuard,
+    },
+    time::Instant,
 };
+
+use crate::metrics::{AtomicHistogram, HistogramSnapshot};
 
 use crate::{
     error::{DbError, Result},
@@ -278,6 +284,15 @@ pub struct Wal {
     /// fsync entirely. That coalescing is what makes write throughput scale
     /// with concurrent writers instead of paying one fsync per commit.
     flush_lock: Mutex<()>,
+    /// Durability-cost observability (item 21). Recorded around the actual
+    /// `sync_all` in both fsync paths — deliberately **outside** the `inner`
+    /// lock (in `group_fsync` the fsync itself runs lock-free), so the
+    /// histogram add never lengthens the commit critical section. `fsyncs`
+    /// counts only fsyncs that actually reached the platter (fast-path skips
+    /// and coalesced followers are not counted), so `commits / fsyncs`
+    /// exposes the group-commit amortization ratio.
+    fsyncs: AtomicU64,
+    fsync_latency: AtomicHistogram,
 }
 
 impl Wal {
@@ -347,7 +362,27 @@ impl Wal {
                 fsync_fault_armed: false,
             }),
             flush_lock: Mutex::new(()),
+            fsyncs: AtomicU64::new(0),
+            fsync_latency: AtomicHistogram::new(),
         })
+    }
+
+    /// Durable-fsync count + latency snapshot (item 21). `count` is fsyncs that
+    /// actually hit the platter (not coalesced followers), so a healthy
+    /// group-commit workload shows far fewer fsyncs than commits.
+    pub fn fsync_stats(&self) -> (u64, HistogramSnapshot) {
+        (
+            self.fsyncs.load(Ordering::Relaxed),
+            self.fsync_latency.snapshot(),
+        )
+    }
+
+    /// Record one durable fsync's wall-clock cost (item 21). Called only on the
+    /// success path of an actual `sync_all`; lock-free.
+    #[inline]
+    fn note_fsync(&self, elapsed: std::time::Duration) {
+        self.fsyncs.fetch_add(1, Ordering::Relaxed);
+        self.fsync_latency.record(elapsed.as_micros() as u64);
     }
 
     /// Number of segment files currently on disk (observability + tests).
@@ -617,8 +652,14 @@ impl Wal {
     /// drained batch, amortizing one fsync across every transaction that
     /// committed in that batch — the P5.b/M9 win.
     pub fn sync(&self) -> Result<()> {
+        let start = Instant::now();
         let mut inner = self.lock();
-        fsync_locked(&mut inner)
+        fsync_locked(&mut inner)?;
+        drop(inner);
+        // `fsync_locked` returns `Ok` only after a real `sync_all` reached the
+        // platter (poison/fault return `Err`) — item 21 durability-cost panel.
+        self.note_fsync(start.elapsed());
+        Ok(())
     }
 
     /// Group-commit durability barrier (P5.e-3): return once every record up to
@@ -684,11 +725,15 @@ impl Wal {
             (inner.next_lsn - 1, file)
         };
         // The slow part, with the append lock RELEASED so appends coalesce.
+        let fsync_start = Instant::now();
         if let Err(e) = file.sync_all() {
             let mut inner = self.lock();
             inner.poisoned = true;
             return Err(DbError::DurabilityFailure(format!("WAL fsync failed: {e}")));
         }
+        // Item 21: one recorded fsync covers every commit it made durable, so
+        // `commits / fsyncs` reads out the group-commit amortization directly.
+        self.note_fsync(fsync_start.elapsed());
         let mut inner = self.lock();
         if inner.durable_lsn < flushed_lsn {
             inner.durable_lsn = flushed_lsn;

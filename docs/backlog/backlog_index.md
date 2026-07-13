@@ -34,7 +34,7 @@
 | 18 | `18_engine_access_contract.md` | Milestone | ✅ SHIPPED (PROGRESS: Engine access & introspection contract (Milestone 18)) |
 | 19 | `19_sql_surface_gaps.md` | Improvement | ⏳ NOT STARTED |
 | 20 | `20_events_realtime_dispatcher.md` | Milestone | ✅ SHIPPED (PROGRESS: Events / realtime dispatcher (Milestone 20)) |
-| 21 | `21_observability_metrics.md` | Improvement | ⏳ NOT STARTED |
+| 21 | `21_observability_metrics.md` | Improvement | ✅ SHIPPED (PROGRESS: Observability metrics enrichment (item 21)) |
 | 22 | `22_logs_surface.md` | Improvement | ✅ SHIPPED (PROGRESS: Logs surface — JSON structured logs, correlation ids, bounded /logs tail) |
 | 23 | `23_storage_service.md` | Milestone | ⏳ NOT STARTED |
 | 24 | `24_authz_v2_policies.md` | Milestone | ⏳ NOT STARTED |
@@ -95,8 +95,11 @@ existing doc.
    recommended build sequence — each has its own spec file):**
    **#20 events/realtime dispatcher** (~80% exists in-engine via M4; highest
    demo value; unblocks #23's outbox) → **#21 observability metrics
-   enrichment** (small engine surface; the horizon-age gauge is the item-16
-   lesson) → **#22 logs surface** (JSON + correlation ids + bounded `/logs`) →
+   enrichment — ✅ SHIPPED 2026-07-13** (branch `21-observability-metrics`;
+   lock-free per-chokepoint metrics via `stats()`/`GET /stats` + `/metrics`;
+   the horizon-age gauge is the item-16 lesson; widget-traceability table in
+   `docs/engine_access_guide.md` §9) → **#22 logs surface** (JSON + correlation
+   ids + bounded `/logs`) →
    **#23 storage service** (MinIO/S3 over engine metadata + LOB tiering;
    service layer, engine unchanged) → **#24 authz v2** (per-op RLS policies +
    `WITH CHECK` + SQL-native roles; deliberately last — deepest semantics).
