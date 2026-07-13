@@ -12,6 +12,22 @@
 
 ## Current status
 
+- **Studio API readiness (backlog item 30) — SHIPPED 2026-07-14, branch
+  `30-studio-api-readiness`, PR TBD (STOP-for-review).** E1 (G9): `Expr::Like`
+  + `QExpr::Like` added to both expression paths (single-table fast path and
+  multi-table planner path); `like_match()` Unicode-correct pattern matcher
+  (`%` = any run, `_` = one char, NULL propagation); ILIKE = `case_insensitive:
+  true`; differential-tested against rusqlite (`PRAGMA case_sensitive_like = ON`
+  for LIKE; `lower(col) LIKE lower(pattern)` for ILIKE). E2 (G11): `Expr::Match`
+  + `QExpr::Match`; `find_match()` + `exec_select_match()` over-fetch-then-filter
+  via FULLTEXT DiskBTree (mirrors NEAR exactly); `plan_is_concurrent_read` updated
+  to exclude MATCH; QExpr path uses inline tokenize check. `MATCH(col, 'text')` is
+  now a usable WHERE predicate over `/sql`, no new REST routes. E3: §12 ERP app
+  walkthrough added to `engine_access_guide.md` with concrete curl payloads for
+  auth, schema+FK, ERD introspection, atomic multi-model txn (one WAL commit),
+  realtime events, NEAR+MATCH search, LIKE record browser, cursor paging.
+  23 new `tests/like_match.rs` differential + MATCH tests. Crash harness:
+  **35/35** (unchanged). All gates green: build, workspace tests, clippy, fmt.
 - **Multi-page catalog (backlog item 25) — SHIPPED 2026-07-13, branch
   `25-multipage-catalog`, PR #73 (MERGED).** `Catalog::persist`
   chains the JSON blob across N pages (4-byte magic + 4-byte next_page_id
@@ -3177,6 +3193,32 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-14 — Studio API readiness (item 30), branch `30-studio-api-readiness`
+
+- **E1 (G9 LIKE/ILIKE):** `Expr::Like` + `QExpr::Like` on both expression paths.
+  `like_match()` / `like_match_chars()` Unicode-correct matcher. `eval_expr`,
+  `eval_qexpr`, `Runner::eval` all handle `Like`. All traversal functions updated
+  (`bind_expr`, `collect_columns`, `validate_expr`, etc.). NULL propagation
+  correct. `plan_is_concurrent_read` unchanged (LIKE runs on both paths).
+- **E2 (G11 MATCH):** `Expr::Match` + `QExpr::Match`. `find_match()`. 
+  `exec_select_match()` via FULLTEXT DiskBTree (over-fetch-then-filter, mirrors
+  `exec_select_near`). `plan_is_concurrent_read` updated to exclude MATCH.
+  `eval_expr` returns `Bool(true)` for re-check. QExpr path uses inline
+  `fulltext::tokenize` check (no index on planner path).
+- **Bug fixed:** `unidb-logical/src/apply.rs` `make_event` test helper missing
+  `before`/`after`/`ts_ms` fields from item-29 Event struct.
+- **Tests:** 23 new `tests/like_match.rs` (differential LIKE/NOT LIKE/ILIKE +
+  MATCH coverage; LIKE uses `PRAGMA case_sensitive_like = ON` in SQLite; ILIKE
+  uses `lower(col) LIKE lower(pattern)` SQLite equivalent).
+- **E3 (integration guide):** §12 "ERP app walkthrough" added to
+  `engine_access_guide.md`; §2 "Supported" updated for LIKE+MATCH+ILIKE. 
+  `documentation_index.md` updated. Spec `30_studio_api_readiness.md` →
+  SHIPPED; `backlog_index.md` row 30 → ✅; `19_sql_surface_gaps.md` G9+G11
+  already annotated "(Delivered under item 30)"; PROGRESS.md entry added.
+- **Gates:** `cargo test -p unidb` ✓, `--features server` ✓, `--workspace` ✓,
+  crash 35/35 ✓, `clippy --workspace --all-targets -D warnings` ✓, `fmt` ✓.
+- **Next:** push, open PR — STOP for review, do not merge.
 
 ### 2026-07-13 — Engine-architecture PDF reference added to `docs/design/` (docs-only), branch `claude/engine-architecture-pdf-doc-ft0k64`, PR #56
 

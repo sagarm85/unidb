@@ -4910,3 +4910,111 @@ section; `MEMORY.md` current state.
 reopened. Crash harness remains green (+1 P33). The item-23 service-layer
 workaround (compact schema, DDL up front) can now be relaxed — the engine
 supports runtime DDL and wider schemas without overflowing the catalog.
+
+---
+
+## Studio API readiness (item 30) — 2026-07-14
+
+**Branch:** `30-studio-api-readiness` | **PR:** TBD (STOP-for-review)
+
+### E1 — G9: LIKE / NOT LIKE / ILIKE
+
+Added `Expr::Like` (single-table `LogicalPlan::Select` fast path) and
+`QExpr::Like` (multi-table `LogicalPlan::Query` planner path) with uniform
+semantics on both paths. Key implementation pieces:
+
+- `like_match(text, pattern, case_insensitive)` — Unicode-correct (char slices,
+  not bytes) recursive backtracking matcher; `%` = any run, `_` = one char.
+- `NULL LIKE x → NULL → false` in `WHERE` (propagated via `Literal::Null`
+  shortcircuit in `eval_expr`).
+- `ILIKE` mapped to `case_insensitive: true` in the `Like` variant.
+- Both `Expr::Like` and `QExpr::Like` added to all traversal functions
+  (`bind_expr`, `collect_columns`, `validate_expr`, `collect_aggs`,
+  `rewrite_over_agg`, `qualify_policy`, `substitute_correlated`).
+- `eval_qexpr` (pure planner evaluator) handles `QExpr::Like` inline.
+- Runner's `eval` in `query_exec.rs` handles `QExpr::Like` in the ctx-aware path.
+
+**Differential test coverage** (`tests/like_match.rs`, 23 tests):
+- `%` prefix / suffix / infix / double-`%` / exact / empty-suffix.
+- `_` single-char / prefix / mixed.
+- `NOT LIKE` with `%` and `_`.
+- NULL LHS (both LIKE and NOT LIKE → no row).
+- `ILIKE` prefix, upper+lower match, NOT ILIKE.
+- QExpr path via JOIN filter (LIKE and ILIKE).
+- All LIKE/NOT LIKE cases differential-validated against `rusqlite` with
+  `PRAGMA case_sensitive_like = ON`; ILIKE cases compared against
+  `lower(col) LIKE lower(pattern)` in SQLite (SQLite has no ILIKE keyword).
+
+**No storage impact.** Crash harness: **35/35** (unchanged).
+
+### E2 — G11: MATCH full-text predicate over SQL
+
+Added `Expr::Match { column, query }` and `QExpr::Match { column, query }`. The
+implementation mirrors `NEAR` exactly:
+
+- `find_match(expr)` — detects `Expr::Match` in a predicate tree (parallel to
+  `find_near`).
+- `plan_is_concurrent_read` updated to exclude MATCH as well as NEAR (both need
+  pool/ExecCtx access).
+- `exec_select_match()` — over-fetch-then-filter via the FULLTEXT `DiskBTree`,
+  AND-intersect posting lists, MVCC visibility check, full predicate re-check
+  (where `Expr::Match` returns `true` in the re-check path, same as `NEAR`).
+- `eval_expr` returns `Literal::Bool(true)` for `Expr::Match` (candidates are
+  pre-filtered before re-check).
+- `QExpr::Match` in the multi-table path does inline text-contains-all-tokens
+  evaluation using `crate::fulltext::tokenize` (no index acceleration on the
+  planner path — semantically equivalent to AND-all-tokens).
+
+**Syntax:** `SELECT … WHERE MATCH(column, 'query text')`. Multi-word query =
+AND semantics (`'invoice overdue'` = rows containing both tokens). Requires an
+existing `FULLTEXT` index (returns `SQL_UNSUPPORTED` otherwise). Works over
+`/sql` automatically — no new REST routes (Milestone-18 boundary honored).
+
+**Test coverage** (`tests/like_match.rs`):
+- Single-token match: rows with the token returned, rows without excluded.
+- Two-token AND: only rows with both tokens match.
+- Zero results for absent token.
+- Single-table filter: correct row returned.
+- MATCH combined with LIKE in same WHERE clause.
+
+**No storage impact.** Crash harness: **35/35** (unchanged).
+
+### E3 — Studio API integration guide
+
+New section §12 added to `docs/engine_access_guide.md`: "ERP app walkthrough —
+concrete payloads." Walks an ERP schema (customers/products/sales_orders/
+order_items/invoices/payments, PK/FK-linked, with `VECTOR(128)` and `FULLTEXT`
+columns) end-to-end with real `curl` request bodies and response shapes:
+
+1. **Auth** — `Authorization: Bearer <JWT>`, verify-only server.
+2. **Schema + FK** — full `CREATE TABLE … REFERENCES …` DDL in one atomic `/sql` body.
+3. **ERD introspection** — `information_schema.referential_constraints` join + `unidb_catalog.indexes` badge query with real response shape.
+4. **Atomic multi-model transaction** — `POST /txn/begin` → N× `POST /sql` (with `X-Txn-Id`) inserting row + 128-d `VECTOR` + order + invoice → `POST /txn/{id}/commit`. Explicit comparison table: unidb (one WAL commit) vs. PG + pgvector + Debezium (three systems, three failure domains, no atomicity).
+5. **Realtime events** — `POST /tables/invoices/events` → SSE subscribe `?format=supabase` with example frames → ack → lag via `subscription_lag`.
+6. **Search** — `NEAR(embedding, $1, 5)` vector search and `MATCH(body, 'invoice overdue')` full-text, both over `/sql`.
+7. **Record browser** — `LIKE $1` (starts-with), `ILIKE $1` (case-insensitive contains), `NOT LIKE`, cursor paging with `"cursor":true`.
+
+Also updated §2 "Supported" list to include `LIKE`/`ILIKE` and `MATCH(col, …)`
+(item 30, G9 + G11), and updated `documentation_index.md` to reference §12.
+
+**Metrics (throughput — pure query surface, no storage change):**
+
+No throughput regression introduced. `cargo test --workspace --features server`
+passes (all existing tests + 23 new `like_match.rs` tests). Crash harness:
+**35/35** unchanged.
+
+| Gate | Result |
+|------|--------|
+| `cargo test -p unidb` | ✅ pass |
+| `cargo test --features server` | ✅ pass |
+| `cargo test --workspace` | ✅ pass |
+| crash harness | ✅ 35/35 (unchanged) |
+| `clippy --workspace --all-targets -D warnings` | ✅ clean |
+| `cargo fmt --all` | ✅ clean |
+
+**Doc updates:** `30_studio_api_readiness.md` → SHIPPED; `backlog_index.md` row
+30 → ✅; `engine_access_guide.md` §2 + §12; `documentation_index.md`;
+`19_sql_surface_gaps.md` G9 + G11 already annotated "(Delivered under item 30)."
+
+**Locked-decision changes:** none. No storage/format/recovery change. Crash
+harness unchanged at 35/35.

@@ -161,6 +161,9 @@ mod tests {
             table_name: table.to_string(),
             op: op.to_string(),
             payload,
+            before: None,
+            after: None,
+            ts_ms: 0,
         }
     }
 

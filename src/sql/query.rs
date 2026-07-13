@@ -190,6 +190,22 @@ pub enum QExpr {
     /// A scalar subquery used as a value (P4.c): must return at most one row /
     /// one column; yields that value or NULL when empty.
     ScalarSubquery(Box<QuerySpec>),
+    /// `expr [NOT] [I]LIKE pattern` in the multi-relation query path (G9,
+    /// item 30). Evaluated inline per-row by `eval_qexpr`.
+    Like {
+        expr: Box<QExpr>,
+        pattern: Box<QExpr>,
+        negated: bool,
+        case_insensitive: bool,
+    },
+    /// `MATCH(column, 'query text')` in the multi-relation query path (G11,
+    /// item 30). Evaluated per-row as a text-contains-all-tokens check
+    /// (without index acceleration) — the FULLTEXT index path is taken only
+    /// on the single-table `LogicalPlan::Select` fast path via `exec_select`.
+    Match {
+        column: Box<QExpr>,
+        query: Box<QExpr>,
+    },
 }
 
 impl QExpr {
@@ -267,6 +283,14 @@ impl QExpr {
                 }
                 Ok(())
             }
+            QExpr::Like { expr, pattern, .. } => {
+                expr.bind_params(params)?;
+                pattern.bind_params(params)
+            }
+            QExpr::Match { column, query } => {
+                column.bind_params(params)?;
+                query.bind_params(params)
+            }
         }
     }
 
@@ -285,6 +309,8 @@ impl QExpr {
                 expr.has_aggregate() || list.iter().any(|e| e.has_aggregate())
             }
             QExpr::Exists { .. } | QExpr::ScalarSubquery(_) => false,
+            QExpr::Like { expr, pattern, .. } => expr.has_aggregate() || pattern.has_aggregate(),
+            QExpr::Match { column, query } => column.has_aggregate() || query.has_aggregate(),
         }
     }
 
@@ -305,6 +331,8 @@ impl QExpr {
             QExpr::InList { expr, list, .. } => {
                 expr.has_subquery() || list.iter().any(|e| e.has_subquery())
             }
+            QExpr::Like { expr, pattern, .. } => expr.has_subquery() || pattern.has_subquery(),
+            QExpr::Match { column, query } => column.has_subquery() || query.has_subquery(),
         }
     }
 }
@@ -410,6 +438,24 @@ fn qualify_policy(policy: Expr, qualifier: &str) -> QExpr {
             Box::new(qualify_policy(*lhs, qualifier)),
             Box::new(qualify_policy(*rhs, qualifier)),
         ),
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+            case_insensitive,
+        } => QExpr::Like {
+            expr: Box::new(qualify_policy(*expr, qualifier)),
+            pattern: Box::new(qualify_policy(*pattern, qualifier)),
+            negated,
+            case_insensitive,
+        },
+        Expr::Match { column, query } => QExpr::Match {
+            column: Box::new(QExpr::Column {
+                qualifier: Some(qualifier.to_string()),
+                name: column,
+            }),
+            query: Box::new(qualify_policy(*query, qualifier)),
+        },
         // JSON extraction and NEAR are not valid RLS policy shapes; treat as a
         // permissive no-op rather than inventing semantics for them here.
         Expr::JsonExtract { .. } | Expr::JsonExtractText { .. } | Expr::Near { .. } => {
