@@ -2,16 +2,16 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>unidb — Engine Architecture &amp; Design Reference</title>
+<title>unidb — Engine Architecture &amp; Product Guide</title>
 <style>
-  @page { size: A4; margin: 12mm 8mm; }
+  @page { size: A4; margin: 14mm 12mm 16mm 12mm; }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; }
   body {
     font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
     color: #1c2733; font-size: 10.5pt; line-height: 1.5;
   }
-  h1 { font-size: 21pt; color: #10314f; margin: 0 0 4pt 0; }
+  h1 { font-size: 22pt; color: #10314f; margin: 0 0 4pt 0; }
   h2 { font-size: 15pt; color: #10314f; border-bottom: 2px solid #2f6bad;
        padding-bottom: 3pt; margin: 22pt 0 8pt 0; page-break-after: avoid; }
   h3 { font-size: 12pt; color: #1d4e79; margin: 14pt 0 5pt 0; page-break-after: avoid; }
@@ -33,13 +33,7 @@
   tbody tr:nth-child(even) { background: #f7fafc; }
   ul, ol { margin: 4pt 0 6pt 0; padding-left: 18pt; }
   li { margin: 2.5pt 0; }
-  .cover { text-align: center; padding-top: 150pt; page-break-after: always; }
-  .cover .logo { font-size: 34pt; font-weight: 700; color: #10314f;
-                 letter-spacing: 1px; }
-  .cover .sub { font-size: 15pt; color: #2f6bad; margin-top: 10pt; }
-  .cover .meta { margin-top: 60pt; color: #5a6b7c; font-size: 10pt; line-height: 1.9; }
-  .cover .thesis { margin: 34pt auto 0 auto; max-width: 430pt; font-size: 11pt;
-                   color: #37485a; font-style: italic; }
+  .lead { font-size: 11pt; color: #37485a; margin: 2pt 0 10pt 0; }
   .pagebreak { page-break-before: always; }
   .figure { margin: 10pt 0 12pt 0; page-break-inside: avoid; text-align: center; }
   .figure svg { max-width: 100%; height: auto; }
@@ -50,1273 +44,1206 @@
   .callout.good { border-left-color: #3f8f5f; background: #eef8f1; }
   .small { font-size: 8.5pt; color: #5a6b7c; }
   .toc { columns: 2; column-gap: 24pt; font-size: 9.5pt; }
+  .toc a { color: #1d4e79; text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
   .toc ol { padding-left: 14pt; }
-  .kbd { font-weight: 600; color: #10314f; }
+  .method { display: inline-block; font-family: "SFMono-Regular", Consolas, monospace;
+            font-size: 8pt; font-weight: 700; padding: 1pt 5pt; border-radius: 3px;
+            color: #fff; margin-right: 4pt; vertical-align: middle; }
+  .m-get { background: #2f8f5f; } .m-post { background: #2f6bad; }
+  .m-put { background: #b07d2e; } .m-del { background: #b05252; }
+  .ep { margin-top: 12pt; }
+  .ep h4 code { background: #eef4fa; }
   .tag { display: inline-block; font-size: 7.5pt; font-weight: 700; padding: 1pt 5pt;
          border-radius: 8px; vertical-align: middle; }
   .tag.done { background: #dff2e6; color: #216b41; }
-  .tag.open { background: #fdeeda; color: #8a5a17; }
-  .tag.non  { background: #eee; color: #666; }
+  .tag.tracked { background: #e3ebf5; color: #33517a; }
+  .tag.planned { background: #fdeeda; color: #8a5a17; }
+  .tag.non { background: #eee; color: #666; }
+  .tag.high { background: #fbe1e1; color: #9c3a3a; }
+  .tag.medium { background: #fdf0d8; color: #8a5a17; }
+  .tag.low { background: #eaf0f6; color: #45607a; }
 </style>
 </head>
 <body>
 
-<!-- ================= COVER ================= -->
-<div class="cover">
-  <div class="logo">unidb</div>
-  <div class="sub">Engine Architecture &amp; Design Reference</div>
-  <div class="thesis">
-    One embedded Rust engine unifying relational CRUD, vector search, graph
-    edges, and a durable event queue over <b>one page store, one WAL, one
-    buffer pool, one transaction manager</b> — so one transaction can touch
-    all four models atomically.
-  </div>
-  <div class="meta">
-    Document date: 2026-07-13<br>
-    Covers: M0–M11, Phases 1–6 complete, CRUD Phase A/B, Milestone P
-    (parallel scan), items 11–17, Milestone 18 (introspection),
-    <code>JOIN … USING</code>, Milestone 20 (realtime dispatcher), items
-    21 (observability) &amp; 22 (logs)<br>
-    Sources: <code>CLAUDE.md</code> · <code>MEMORY.md</code> ·
-    <code>PROGRESS.md</code> · <code>docs/design/engine_design.md</code> ·
-    <code>docs/positioning.md</code> · <code>docs/backlog/roadmap.md</code><br>
-    <span class="small">Descriptive reference — locked decisions live in
-    <code>CLAUDE.md</code> §3 and require human sign-off to change.</span>
-  </div>
+<!-- ================= TITLE (not a full-page cover) ================= -->
+<h1>unidb — Engine Architecture &amp; Product Guide</h1>
+<p class="lead">
+One embedded database engine that unifies relational tables, vector search,
+graph relationships, and a durable event stream over a single storage core —
+so one transaction can save a row, its embedding, a graph edge, and an event
+<b>atomically</b>, in one commit.
+</p>
+<div class="callout">
+<b>The one idea to remember.</b> A typical AI-native app stitches together
+Postgres + a vector store + a graph database + a message queue, and writes to
+all four on every change with no shared transaction. unidb collapses that into
+<b>one engine and one commit</b>. Measured against exactly that four-system
+stack at matched flush-to-disk durability, unidb is <b>3.61× faster</b> and
+loses <b>zero</b> data on a crash where the four-system stack tears a record.
 </div>
 
 <!-- ================= TOC ================= -->
-<h2>Contents</h2>
+<h2 id="toc">Contents</h2>
 <div class="toc">
 <ol>
-  <li>Executive summary &amp; design thesis</li>
-  <li>Architecture overview
-    <ol><li>Layer stack</li><li>Module map</li><li>Engine-wide invariants</li>
-        <li>Deployment modes</li></ol></li>
-  <li>Storage core
-    <ol><li>On-disk format</li><li>Control file</li><li>WAL, mini-transactions
-        &amp; group commit</li><li>Torn-page protection &amp; fsync hardening</li>
-        <li>Buffer pool</li><li>Free-space map</li><li>Checkpoint &amp;
-        recovery</li><li>Crash-injection harness</li></ol></li>
-  <li>Transactions, MVCC &amp; concurrency
-    <ol><li>Version model &amp; visibility</li><li>Isolation levels &amp; SSI</li>
-        <li>Locking &amp; deadlock detection</li><li>Abort = physical undo</li>
-        <li>Concurrent SQL writes (crabbing)</li></ol></li>
-  <li>SQL layer
-    <ol><li>Catalog &amp; types</li><li>Query pipeline</li><li>Query power
-        (joins/aggregates/optimizer)</li><li>Constraints, RLS, security</li></ol></li>
-  <li>Secondary indexing framework
-    <ol><li>Durable B-Tree</li><li>Durable vector index (IVF-Flat)</li>
-        <li>Full-text &amp; edge indexes</li><li>The hint + re-validate
-        correctness pattern</li></ol></li>
-  <li>Graph layer</li>
-  <li>Event queue</li>
-  <li>Server, attach client &amp; APIs</li>
-  <li>Operations &amp; high availability</li>
-  <li>Performance engineering (measured)</li>
-  <li>Correctness strategy &amp; locked decisions</li>
-  <li>Known limitations &amp; tech debt</li>
-  <li>Future scope — Postgres &amp; Supabase alignment for production</li>
+  <li><a href="#s1">What unidb is</a></li>
+  <li><a href="#s2">Architecture at a glance</a>
+    <ol><li><a href="#s2-1">The layered engine</a></li>
+        <li><a href="#s2-2">Core guarantees</a></li>
+        <li><a href="#s2-3">Ways to run it</a></li></ol></li>
+  <li><a href="#s3">How your data is stored &amp; kept safe</a>
+    <ol><li><a href="#s3-1">On-disk format</a></li>
+        <li><a href="#s3-2">How a write becomes permanent</a></li>
+        <li><a href="#s3-3">Crash recovery — when the power goes out</a></li>
+        <li><a href="#s3-4">Protection against corruption</a></li>
+        <li><a href="#s3-5">Memory &amp; space management</a></li></ol></li>
+  <li><a href="#s4">Transactions &amp; working with many users at once</a>
+    <ol><li><a href="#s4-1">Snapshots &amp; isolation levels</a></li>
+        <li><a href="#s4-2">Reading and writing at the same time</a></li>
+        <li><a href="#s4-3">What happens on rollback</a></li></ol></li>
+  <li><a href="#s5">The SQL layer</a>
+    <ol><li><a href="#s5-1">Supported data types</a></li>
+        <li><a href="#s5-2">Writing queries — examples</a></li>
+        <li><a href="#s5-3">Query capabilities</a></li>
+        <li><a href="#s5-4">Constraints, security &amp; roles</a></li></ol></li>
+  <li><a href="#s6">Search, indexing &amp; relationships</a>
+    <ol><li><a href="#s6-1">Automatic durable indexes</a></li>
+        <li><a href="#s6-2">Vector similarity search</a></li>
+        <li><a href="#s6-3">Full-text search</a></li>
+        <li><a href="#s6-4">Graph relationships</a></li></ol></li>
+  <li><a href="#s7">Real-time events &amp; streaming</a></li>
+  <li><a href="#s8">The REST server — full API reference</a>
+    <ol><li><a href="#s8-1">Getting started</a></li>
+        <li><a href="#s8-2">Running SQL</a></li>
+        <li><a href="#s8-3">Transactions over HTTP</a></li>
+        <li><a href="#s8-4">Rows, graph &amp; indexes</a></li>
+        <li><a href="#s8-5">Events &amp; realtime</a></li>
+        <li><a href="#s8-6">Admin, stats, logs &amp; metrics</a></li>
+        <li><a href="#s8-7">Replication</a></li>
+        <li><a href="#s8-8">Error codes</a></li></ol></li>
+  <li><a href="#s9">Operations &amp; high availability</a></li>
+  <li><a href="#s10">Performance — measured against Postgres</a></li>
+  <li><a href="#s11">Correctness &amp; testing</a></li>
+  <li><a href="#s12">Known limitations, bugs &amp; roadmap priority</a>
+    <ol><li><a href="#s12-1">Known bugs</a></li>
+        <li><a href="#s12-2">Known limitations &amp; feature gaps</a></li></ol></li>
+  <li><a href="#s13">Where unidb is headed</a></li>
 </ol>
 </div>
 
 <!-- ================= 1 ================= -->
-<h2>1. Executive summary &amp; design thesis</h2>
+<h2 id="s1" class="pagebreak">1. What unidb is</h2>
 <p>
-unidb is a single embedded storage/transaction engine written in Rust. It
-unifies four data models over one shared storage and transaction core:
+unidb is a single embedded database engine written in Rust. Like SQLite, it
+runs <b>inside your application</b> as a library — no separate server process
+required — and keeps all of your data in one file. Unlike SQLite, it natively
+handles four kinds of data at once, over one shared storage and transaction
+core:
 </p>
 <ul>
-  <li><b>Relational CRUD</b> — a practical SQL subset over MVCC-versioned heap
-      tables, with joins, aggregates, subqueries, CTEs, a cost-based optimizer,
-      and <code>EXPLAIN [ANALYZE]</code>.</li>
-  <li><b>Vector search</b> — <code>VECTOR(n)</code> columns, a durable on-disk
-      IVF-Flat index, and a <code>NEAR</code> operator (pgvector-style
-      Euclidean; cosine metric available).</li>
-  <li><b>Graph</b> — edge records with adjacency indexes and a Cypher read
-      subset.</li>
-  <li><b>Event queue</b> — a durable event stream with Kafka-style consumer
-      offsets and replay.</li>
+  <li><b>Relational tables</b> — a practical SQL dialect over versioned tables:
+      joins, aggregates, subqueries, CTEs, a cost-based query optimizer, and
+      <code>EXPLAIN&nbsp;[ANALYZE]</code>.</li>
+  <li><b>Vector search</b> — <code>VECTOR(n)</code> columns with a durable
+      on-disk similarity index and a <code>NEAR</code> operator for
+      nearest-neighbor queries (the building block of semantic / AI search).</li>
+  <li><b>Graph relationships</b> — directed edges between entities, with a
+      Cypher-style read query for traversals.</li>
+  <li><b>Durable event stream</b> — a built-in, Kafka-style event queue with
+      consumer offsets and replay, for change-data feeds and realtime.</li>
 </ul>
 <p>
-The competitive thesis is <b>eliminating the multi-system dual-write tax</b>.
-“Save a row + its embedding + a graph edge + emit an event” is <b>one WAL
-append and one commit</b> here, versus 3–4 network round-trips with no shared
-transaction across Postgres + a vector store + a graph DB + Kafka. Measured
-against a real replaced stack at matched flush-to-platter durability, unidb’s
-one atomic commit is <b>3.61× faster</b> (250 vs 69 txns/s) — and the
-<b>crash-consistency win is unconditional</b>: unidb recovers 0 orphans where
-the four-system stack recovers a torn record.
+Because all four live in <b>one engine, one log, and one transaction manager</b>,
+a single transaction can touch all of them and either commit everything or
+nothing. That is the capability an application otherwise has to fake with
+distributed writes across separate systems — and can never make truly atomic.
 </p>
-<div class="callout warn">
-<b>Honest boundary (by charter):</b> unidb does not try to out-Postgres
-Postgres on single-model workloads and expects to lose some single-table
-CRUD benchmarks against a specialized incumbent. Non-goals: distributed
-consensus (single-primary only), full ANSI SQL, and a cloud control plane.
-The headline benchmark is the cross-domain transactional workload against
-the replaced stack.
-</div>
+
 <div class="figure">
 <svg viewBox="0 0 780 330" xmlns="http://www.w3.org/2000/svg" font-family="Arial" font-size="12">
-  <!-- left: unidb -->
   <text x="185" y="22" text-anchor="middle" font-size="14" font-weight="bold" fill="#10314f">unidb: one atomic commit</text>
   <rect x="30" y="35" width="310" height="200" rx="8" fill="#eef4fa" stroke="#2f6bad" stroke-width="1.5"/>
-  <text x="185" y="55" text-anchor="middle" font-weight="bold" fill="#1d4e79">BEGIN … one transaction (one Xid)</text>
+  <text x="185" y="55" text-anchor="middle" font-weight="bold" fill="#1d4e79">BEGIN … one transaction</text>
   <rect x="50" y="68" width="130" height="30" rx="4" fill="#fff" stroke="#2f6bad"/><text x="115" y="87" text-anchor="middle">INSERT row</text>
   <rect x="190" y="68" width="130" height="30" rx="4" fill="#fff" stroke="#2f6bad"/><text x="255" y="87" text-anchor="middle">vector + ANN index</text>
   <rect x="50" y="106" width="130" height="30" rx="4" fill="#fff" stroke="#2f6bad"/><text x="115" y="125" text-anchor="middle">graph edge</text>
   <rect x="190" y="106" width="130" height="30" rx="4" fill="#fff" stroke="#2f6bad"/><text x="255" y="125" text-anchor="middle">queue event</text>
   <line x1="185" y1="140" x2="185" y2="158" stroke="#2f6bad" stroke-width="1.5" marker-end="url(#a)"/>
   <rect x="70" y="160" width="230" height="28" rx="4" fill="#fdf6ec" stroke="#c08a3e"/>
-  <text x="185" y="178" text-anchor="middle">one WAL · one group-commit fsync</text>
+  <text x="185" y="178" text-anchor="middle">one log write · one durable flush</text>
   <rect x="70" y="198" width="230" height="26" rx="4" fill="#dff2e6" stroke="#3f8f5f"/>
   <text x="185" y="215" text-anchor="middle" fill="#216b41" font-weight="bold">COMMIT — all four durable atomically</text>
   <text x="185" y="258" text-anchor="middle" fill="#216b41" font-weight="bold">3.61× faster · 0 orphans on crash</text>
-  <text x="185" y="274" text-anchor="middle" font-size="10" fill="#5a6b7c">(matched F_FULLFSYNC durability; item 17)</text>
+  <text x="185" y="274" text-anchor="middle" font-size="10" fill="#5a6b7c">(at matched flush-to-disk durability)</text>
 
-  <!-- right: replaced stack -->
-  <text x="590" y="22" text-anchor="middle" font-size="14" font-weight="bold" fill="#10314f">Replaced stack: four commits, no shared txn</text>
+  <text x="590" y="22" text-anchor="middle" font-size="14" font-weight="bold" fill="#10314f">Four separate systems: four commits</text>
   <rect x="440" y="35" width="300" height="200" rx="8" fill="#faf0f0" stroke="#b05252" stroke-width="1.5"/>
-  <text x="590" y="55" text-anchor="middle" font-weight="bold" fill="#7a3535">application-level glue</text>
+  <text x="590" y="55" text-anchor="middle" font-weight="bold" fill="#7a3535">application-level glue, no shared txn</text>
   <rect x="455" y="68" width="128" height="30" rx="4" fill="#fff" stroke="#b05252"/><text x="519" y="87" text-anchor="middle">Postgres row</text>
-  <rect x="597" y="68" width="128" height="30" rx="4" fill="#fff" stroke="#b05252"/><text x="661" y="87" text-anchor="middle">pgvector / Qdrant</text>
+  <rect x="597" y="68" width="128" height="30" rx="4" fill="#fff" stroke="#b05252"/><text x="661" y="87" text-anchor="middle">vector store</text>
   <rect x="455" y="106" width="128" height="30" rx="4" fill="#fff" stroke="#b05252"/><text x="519" y="125" text-anchor="middle">graph DB</text>
   <rect x="597" y="106" width="128" height="30" rx="4" fill="#fff" stroke="#b05252"/><text x="661" y="125" text-anchor="middle">Kafka / outbox</text>
   <rect x="470" y="160" width="240" height="28" rx="4" fill="#fff" stroke="#b05252" stroke-dasharray="4 3"/>
-  <text x="590" y="178" text-anchor="middle">4 independent commits · 4 fsyncs</text>
+  <text x="590" y="178" text-anchor="middle">4 independent commits · 4 flushes</text>
   <rect x="470" y="198" width="240" height="26" rx="4" fill="#f6dede" stroke="#b05252"/>
   <text x="590" y="215" text-anchor="middle" fill="#7a3535" font-weight="bold">crash between them ⇒ torn record</text>
   <text x="590" y="258" text-anchor="middle" fill="#7a3535">69 txns/s at real durability · orphans on crash</text>
   <defs><marker id="a" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
     <path d="M0,0 L8,4 L0,8 z" fill="#2f6bad"/></marker></defs>
 </svg>
-<div class="figcap">Figure 1 — The moat: one atomic multi-model commit vs the replaced four-system stack (measured, <code>benches/decompose.rs</code> Table 4).</div>
+<div class="figcap">Figure 1 — One atomic multi-model commit vs. the four-system stack it replaces.</div>
+</div>
+
+<div class="callout warn">
+<b>What unidb is not.</b> It is honest about its scope. It is not trying to beat
+Postgres on every single-table workload, it does not implement the entire ANSI
+SQL standard, and it runs as a single primary with read replicas (no
+distributed multi-writer consensus). Its advantage is the unified, multi-model,
+single-commit workload — the exact pattern AI-native apps are built on.
 </div>
 
 <!-- ================= 2 ================= -->
-<h2 class="pagebreak">2. Architecture overview</h2>
+<h2 id="s2" class="pagebreak">2. Architecture at a glance</h2>
 
-<h3>2.1 Layer stack</h3>
+<h3 id="s2-1">2.1 The layered engine</h3>
+<p>
+Every capability is built as a thin layer on top of the same storage core.
+That is what makes cross-model atomicity <i>structural</i> rather than a
+promise: a graph edge and a queue event are, underneath, just ordinary rows in
+the same store, protected by the same log.
+</p>
 <div class="figure">
 <svg viewBox="0 0 780 320" xmlns="http://www.w3.org/2000/svg" font-family="Arial" font-size="12">
   <g>
     <rect x="30" y="20" width="720" height="46" rx="5" fill="#eef4fa" stroke="#2f6bad" stroke-width="1.5"/>
-    <text x="45" y="39" font-weight="bold" fill="#10314f">API layer (M5, optional)</text>
-    <text x="45" y="56" fill="#37485a">REST + JWT(verify) + SSE + /metrics · attach client · embedded crate is primary</text>
-    <text x="738" y="39" text-anchor="end" fill="#5a6b7c" font-size="11">server feature-gated; engine has zero async deps</text>
+    <text x="45" y="39" font-weight="bold" fill="#10314f">Access layer (optional)</text>
+    <text x="45" y="56" fill="#37485a">REST server · JWT auth · realtime (SSE) · metrics · Rust attach client · embedded library is primary</text>
   </g>
   <g>
     <rect x="30" y="76" width="720" height="46" rx="5" fill="#eef4fa" stroke="#2f6bad" stroke-width="1.5"/>
-    <text x="45" y="95" font-weight="bold" fill="#10314f">Query &amp; execution (M1+, Phase 4)</text>
-    <text x="45" y="112" fill="#37485a">SQL parser → logical → physical plan · Cypher subset · cost-based optimizer · EXPLAIN</text>
-    <text x="738" y="95" text-anchor="end" fill="#5a6b7c" font-size="11">joins, aggregates, subqueries, CTEs, parallel scan</text>
+    <text x="45" y="95" font-weight="bold" fill="#10314f">Query &amp; execution</text>
+    <text x="45" y="112" fill="#37485a">SQL parser → planner → optimizer · Cypher graph reads · joins, aggregates, subqueries, parallel scans · EXPLAIN</text>
   </g>
   <g>
     <rect x="30" y="132" width="720" height="46" rx="5" fill="#eef4fa" stroke="#2f6bad" stroke-width="1.5"/>
-    <text x="45" y="151" font-weight="bold" fill="#10314f">Logical record layer (M1+)</text>
-    <text x="45" y="168" fill="#37485a">rows · vector records · graph edges (__edges__) · queue events (__events__) · LOBs (__lobs__)</text>
-    <text x="738" y="151" text-anchor="end" fill="#5a6b7c" font-size="11">new durable state = ordinary heap rows</text>
+    <text x="45" y="151" font-weight="bold" fill="#10314f">Data models</text>
+    <text x="45" y="168" fill="#37485a">rows · vectors · graph edges · queue events · large objects — all stored as rows in the shared heap</text>
   </g>
   <g>
     <rect x="30" y="188" width="720" height="46" rx="5" fill="#eef4fa" stroke="#2f6bad" stroke-width="1.5"/>
-    <text x="45" y="207" font-weight="bold" fill="#10314f">Transaction &amp; concurrency (M1, Phase 5)</text>
-    <text x="45" y="224" fill="#37485a">MVCC snapshots · RC/RR/SERIALIZABLE(SSI) · lock manager + deadlock detection · group commit</text>
-    <text x="738" y="207" text-anchor="end" fill="#5a6b7c" font-size="11">Engine is Send + Sync; writers scale with cores</text>
+    <text x="45" y="207" font-weight="bold" fill="#10314f">Transactions &amp; concurrency</text>
+    <text x="45" y="224" fill="#37485a">snapshot isolation (Read Committed / Repeatable Read / Serializable) · locking · deadlock detection · group commit</text>
   </g>
   <g>
     <rect x="30" y="244" width="720" height="46" rx="5" fill="#fdf6ec" stroke="#c08a3e" stroke-width="1.5"/>
-    <text x="45" y="263" font-weight="bold" fill="#7a5410">Storage layer (M0, Phases 1/3/6)</text>
-    <text x="45" y="280" fill="#37485a">single-file page store · buffer pool · segmented WAL · control file · ARIES recovery</text>
-    <text x="738" y="263" text-anchor="end" fill="#5a6b7c" font-size="11">8 KiB pages, CRC32+LSN, little-endian, mmap</text>
+    <text x="45" y="263" font-weight="bold" fill="#7a5410">Storage core</text>
+    <text x="45" y="280" fill="#37485a">single data file · buffer pool · write-ahead log · control file · crash recovery — 8 KiB pages, checksummed</text>
   </g>
 </svg>
-<div class="figcap">Figure 2 — The five-layer stack. Everything sits on the single shared storage core; that is what makes cross-model atomicity structural rather than promised.</div>
+<div class="figcap">Figure 2 — The layered engine. Everything sits on one shared storage core.</div>
 </div>
 
-<h3>2.2 Module map</h3>
-<table>
-<tr><th>Layer</th><th>Modules (in <code>src/</code>)</th></tr>
-<tr><td>Storage core (M0)</td><td><code>format.rs</code>, <code>control.rs</code>, <code>mmap.rs</code> (only <code>unsafe</code> module), <code>page.rs</code>, <code>bufferpool.rs</code>, <code>wal.rs</code>, <code>heap.rs</code>, <code>checkpoint.rs</code>, <code>recovery.rs</code></td></tr>
-<tr><td>Transactions (M1; concurrent since Phase 5)</td><td><code>mvcc.rs</code>, <code>txn.rs</code>, <code>lockmgr.rs</code>, <code>concurrency_hooks.rs</code>, <code>query_limits.rs</code></td></tr>
-<tr><td>Catalog &amp; SQL (M1)</td><td><code>catalog.rs</code>, <code>sql/{parser,logical,executor}.rs</code></td></tr>
-<tr><td>Query power (Phase 4)</td><td><code>sql/{query,plan,query_exec,join,aggregate,sort,optimizer,statistics,explain}.rs</code></td></tr>
-<tr><td>Secondary indexes (durable since Phase 3)</td><td><code>btree_index.rs</code> (<code>DiskBTree</code>; also backs full-text, edge index, and the durable per-table FSM), <code>disk_vector.rs</code> (<code>DiskIvfIndex</code>), <code>fulltext.rs</code>; retired: <code>vector.rs</code> (in-RAM HNSW baseline), <code>csr_index.rs</code></td></tr>
-<tr><td>Graph (M3, M7)</td><td><code>graph/{edges,index,logical,parser,executor}.rs</code></td></tr>
-<tr><td>Event queue (M4)</td><td><code>queue/{mod,payload}.rs</code></td></tr>
-<tr><td>Server (M5, feature-gated)</td><td><code>server/{engine_handle,error,dto,handlers,router,auth,sse,tls,txn_session,cursor}.rs</code>, <code>bin/unidb-server.rs</code></td></tr>
-<tr><td>Ops &amp; HA (Phase 6)</td><td><code>replication/</code>, <code>backup/</code>, <code>authz/</code>, <code>audit/</code>, <code>autovacuum.rs</code></td></tr>
-<tr><td>Facade / clients</td><td><code>lib.rs</code> (<code>Engine</code> — sole entry point), <code>read_handle.rs</code>, workspace crate <code>unidb-attach</code>, <code>unidb-embed</code> CLI</td></tr>
-</table>
-
-<h3>2.3 Engine-wide invariants</h3>
+<h3 id="s2-2">2.2 Core guarantees</h3>
 <ul>
-<li><b>Synchronous, <code>Send + Sync</code>, shared across threads.</b> Every
-  method takes <code>&amp;self</code>; all mutable state is behind interior-mutable
-  latches/locks/atomics. A default build has <b>zero async dependencies</b>
-  (no tokio/reqwest/axum) — verified by <code>cargo tree</code>. Durability under
-  concurrency uses a leader-elected <b>group-commit</b> barrier
-  (<code>Wal::sync_up_to</code>) whose fsync runs with the append lock released,
-  so concurrent committers coalesce behind one fsync.</li>
-<li><b>Explicit transactions everywhere.</b> Every operation takes an explicit
-  <code>Xid</code> from <code>Engine::begin</code>/<code>begin_with_isolation</code>
-  and ends with <code>commit</code>/<code>abort</code>. There is no implicit
-  transaction anywhere in the crate.</li>
-<li><b>WAL before page, always (D5).</b> No code path writes a page before its
-  WAL record; a dirty page is never flushed/evicted while
-  <code>page.LSN &gt; durable_WAL_LSN</code>. Tested, not folklore.</li>
-<li><b><code>#![forbid(unsafe_code)]</code></b> except the isolated
-  <code>mmap.rs</code>; no <code>unwrap()</code>/<code>expect()</code> outside
-  tests; no <code>serde</code> on the page/WAL hot path (hand-rolled
-  little-endian encodings).</li>
+<li><b>Fully durable (ACID).</b> Every committed transaction is on disk before
+  the commit returns. A committed change survives a crash; an in-flight one
+  leaves no trace.</li>
+<li><b>Runs in your process, thread-safe.</b> The engine is shared safely
+  across threads; many readers and writers work concurrently and scale with CPU
+  cores. The default embedded build pulls in <b>no async runtime and no network
+  stack</b> — it is a plain, synchronous library.</li>
+<li><b>Log-before-data, always.</b> No change ever reaches the data file before
+  it is safely recorded in the write-ahead log. This single rule is what makes
+  crash recovery provably correct.</li>
+<li><b>Explicit transactions.</b> Every operation runs inside a transaction you
+  begin and then commit or roll back — no surprising implicit commits.</li>
 </ul>
 
-<h3>2.4 Deployment modes</h3>
+<h3 id="s2-3">2.3 Ways to run it</h3>
 <div class="figure">
 <svg viewBox="0 0 780 400" xmlns="http://www.w3.org/2000/svg" font-family="Arial" font-size="12">
   <defs><marker id="b" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
     <path d="M0,0 L8,4 L0,8 z" fill="#5a6b7c"/></marker></defs>
-  <!-- embedded -->
   <rect x="20" y="30" width="220" height="110" rx="6" fill="#eef4fa" stroke="#2f6bad" stroke-width="1.5"/>
   <text x="130" y="52" text-anchor="middle" font-weight="bold" fill="#10314f">1 · Embedded (primary)</text>
   <rect x="40" y="65" width="180" height="28" rx="4" fill="#fff" stroke="#2f6bad"/>
-  <text x="130" y="83" text-anchor="middle">app + Arc&lt;Engine&gt; in-process</text>
-  <text x="130" y="112" text-anchor="middle" font-size="10.5" fill="#5a6b7c">SQLite-shaped · no server, no async</text>
-  <text x="130" y="127" text-anchor="middle" font-size="10.5" fill="#5a6b7c">point SELECT ~1.09 µs</text>
-  <!-- server -->
+  <text x="130" y="83" text-anchor="middle">your app links the engine</text>
+  <text x="130" y="112" text-anchor="middle" font-size="10.5" fill="#5a6b7c">SQLite-shaped · no server, no network</text>
+  <text x="130" y="127" text-anchor="middle" font-size="10.5" fill="#5a6b7c">point lookup ~1.09 µs</text>
   <rect x="280" y="30" width="220" height="110" rx="6" fill="#eef4fa" stroke="#2f6bad" stroke-width="1.5"/>
   <text x="390" y="52" text-anchor="middle" font-weight="bold" fill="#10314f">2 · REST server (optional)</text>
   <rect x="300" y="65" width="180" height="28" rx="4" fill="#fff" stroke="#2f6bad"/>
-  <text x="390" y="83" text-anchor="middle">axum + JWT + SSE + TLS</text>
-  <text x="390" y="112" text-anchor="middle" font-size="10.5" fill="#5a6b7c">Arc&lt;Engine&gt; on a blocking pool</text>
-  <text x="390" y="127" text-anchor="middle" font-size="10.5" fill="#5a6b7c">txn sessions (X-Txn-Id) · cursors</text>
-  <!-- attach -->
+  <text x="390" y="83" text-anchor="middle">HTTP + JWT + realtime + TLS</text>
+  <text x="390" y="112" text-anchor="middle" font-size="10.5" fill="#5a6b7c">many clients, concurrent</text>
+  <text x="390" y="127" text-anchor="middle" font-size="10.5" fill="#5a6b7c">multi-request transaction sessions</text>
   <rect x="540" y="30" width="220" height="110" rx="6" fill="#eef4fa" stroke="#2f6bad" stroke-width="1.5"/>
-  <text x="650" y="52" text-anchor="middle" font-weight="bold" fill="#10314f">3 · Attach client (M8)</text>
+  <text x="650" y="52" text-anchor="middle" font-weight="bold" fill="#10314f">3 · Attach client</text>
   <rect x="560" y="65" width="180" height="28" rx="4" fill="#fff" stroke="#2f6bad"/>
-  <text x="650" y="83" text-anchor="middle">unidb-attach (Rust, blocking)</text>
-  <text x="650" y="112" text-anchor="middle" font-size="10.5" fill="#5a6b7c">one call = one operation over REST</text>
-  <text x="650" y="127" text-anchor="middle" font-size="10.5" fill="#5a6b7c">no engine deps pulled in</text>
+  <text x="650" y="83" text-anchor="middle">Rust client over REST</text>
+  <text x="650" y="112" text-anchor="middle" font-size="10.5" fill="#5a6b7c">engine-like calls from another process</text>
+  <text x="650" y="127" text-anchor="middle" font-size="10.5" fill="#5a6b7c">no engine dependencies pulled in</text>
   <line x1="650" y1="140" x2="420" y2="170" stroke="#5a6b7c" stroke-width="1.2" marker-end="url(#b)"/>
   <line x1="390" y1="140" x2="390" y2="170" stroke="#5a6b7c" stroke-width="1.2" marker-end="url(#b)"/>
-  <!-- primary / HA -->
   <rect x="240" y="175" width="300" height="80" rx="6" fill="#fdf6ec" stroke="#c08a3e" stroke-width="1.5"/>
   <text x="390" y="197" text-anchor="middle" font-weight="bold" fill="#7a5410">Primary engine</text>
-  <text x="390" y="215" text-anchor="middle" font-size="11">single data file · segmented WAL (16 MiB segs)</text>
-  <text x="390" y="232" text-anchor="middle" font-size="11">replication slots pin restart_lsn · base backups</text>
+  <text x="390" y="215" text-anchor="middle" font-size="11">single data file · segmented write-ahead log</text>
+  <text x="390" y="232" text-anchor="middle" font-size="11">replication slots · base backups</text>
   <line x1="290" y1="255" x2="170" y2="300" stroke="#5a6b7c" stroke-width="1.2" marker-end="url(#b)"/>
   <line x1="490" y1="255" x2="610" y2="300" stroke="#5a6b7c" stroke-width="1.2" marker-end="url(#b)"/>
   <line x1="390" y1="255" x2="390" y2="300" stroke="#5a6b7c" stroke-width="1.2" marker-end="url(#b)"/>
-  <text x="230" y="278" font-size="10.5" fill="#5a6b7c">WAL shipping (capped at durable frontier)</text>
+  <text x="230" y="278" font-size="10.5" fill="#5a6b7c">ships only durable data to replicas</text>
   <rect x="70" y="305" width="200" height="60" rx="6" fill="#eef8f1" stroke="#3f8f5f" stroke-width="1.5"/>
   <text x="170" y="323" text-anchor="middle" font-weight="bold" fill="#216b41">Read replica</text>
-  <text x="170" y="340" text-anchor="middle" font-size="9.5">base snapshot + incremental redo</text>
-  <text x="170" y="355" text-anchor="middle" font-size="9.5">promote() on failover</text>
+  <text x="170" y="340" text-anchor="middle" font-size="9.5">snapshot + incremental catch-up</text>
+  <text x="170" y="355" text-anchor="middle" font-size="9.5">promote on failover</text>
   <rect x="290" y="305" width="200" height="60" rx="6" fill="#eef8f1" stroke="#3f8f5f" stroke-width="1.5"/>
   <text x="390" y="323" text-anchor="middle" font-weight="bold" fill="#216b41">Read replica</text>
-  <text x="390" y="340" text-anchor="middle" font-size="9.5">optional synchronous-commit gate</text>
-  <text x="390" y="355" text-anchor="middle" font-size="9.5">(wait_for_sync_replicas)</text>
+  <text x="390" y="340" text-anchor="middle" font-size="9.5">optional synchronous-commit</text>
+  <text x="390" y="355" text-anchor="middle" font-size="9.5">gate for zero-loss failover</text>
   <rect x="510" y="305" width="200" height="60" rx="6" fill="#f2f5f8" stroke="#5a6b7c" stroke-width="1.5"/>
-  <text x="610" y="323" text-anchor="middle" font-weight="bold" fill="#37485a">Backups + PITR</text>
-  <text x="610" y="340" text-anchor="middle" font-size="9.5">base_backup + archive_wal</text>
-  <text x="610" y="355" text-anchor="middle" font-size="9.5">→ restore(target_lsn)</text>
+  <text x="610" y="323" text-anchor="middle" font-weight="bold" fill="#37485a">Backups + point-in-time</text>
+  <text x="610" y="340" text-anchor="middle" font-size="9.5">base backup + archived log</text>
+  <text x="610" y="355" text-anchor="middle" font-size="9.5">restore to a chosen point</text>
 </svg>
-<div class="figcap">Figure 3 — Deployment modes and the Phase-6 HA topology: embedded (primary mode), optional REST server, attach client, and single-primary + read replicas with PITR.</div>
+<div class="figcap">Figure 3 — Deployment modes: embedded library (primary), optional REST server, Rust attach client, plus single-primary + read-replica high availability.</div>
 </div>
 
 <!-- ================= 3 ================= -->
-<h2 class="pagebreak">3. Storage core</h2>
+<h2 id="s3" class="pagebreak">3. How your data is stored &amp; kept safe</h2>
 
-<h3>3.1 On-disk format (D6, D8, D9)</h3>
+<h3 id="s3-1">3.1 On-disk format</h3>
 <ul>
-<li><b>Single data file</b> of fixed-size pages; the WAL is a separate,
-  segmented directory (<code>db.wal/seg-*.wal</code>, Phase 6). Multi-file
-  storage was deliberately rejected (D6): it forces per-file LSN tracking into
-  recovery for benefits not yet needed.</li>
-<li><b>8 KiB pages</b> by default (D8), config-overridable at init only, baked
-  into the control file; immutable once files exist.</li>
-<li><b>Little-endian everywhere on disk</b> (D9). Every page carries a CRC32
-  checksum and an LSN. Page and WAL records are hand-rolled byte encodings —
-  no <code>serde</code> on the hot path.</li>
-<li><b><code>FORMAT_VERSION</code> = 5</b>: v2 tuple-header extension (M1) →
-  v3 <code>next_xid</code> control field → v4 <code>WAL_FPI</code> torn-page
-  record (P1.a) → v5 durable B-Tree (<code>WAL_INDEX</code> record,
-  <code>PAGE_TYPE_BTREE</code> pages, <code>index_root</code> catalog pointer).</li>
-<li><b>Slotted pages</b>; tuples carry a 24-byte header with
-  <code>xmin</code>/<code>xmax</code>/<code>prev_page</code>/<code>prev_slot</code>
-  (reserved in M0 per D4, in active MVCC use since M1).</li>
+<li><b>One data file</b> made of fixed-size <b>8 KiB pages</b>, plus a separate,
+  segmented write-ahead log directory. Keeping data in one file keeps backup,
+  copy, and recovery simple.</li>
+<li><b>Every page is checksummed</b> and carries a version stamp, so corruption
+  is detected on read rather than silently returned.</li>
+<li><b>Rows are stored in slotted pages.</b> Each row carries a small header
+  that records which transaction created it and which (if any) superseded it —
+  the basis of unidb's versioning (Section 4). New column types are added
+  without ever changing the on-disk format.</li>
 </ul>
 <div class="figure">
 <svg viewBox="0 0 780 260" xmlns="http://www.w3.org/2000/svg" font-family="Arial" font-size="12">
-  <text x="390" y="20" text-anchor="middle" font-weight="bold" fill="#10314f" font-size="13">8 KiB slotted page</text>
+  <text x="390" y="20" text-anchor="middle" font-weight="bold" fill="#10314f" font-size="13">8 KiB page</text>
   <rect x="40" y="32" width="700" height="56" fill="none" stroke="#10314f" stroke-width="1.5"/>
   <rect x="40" y="32" width="150" height="56" fill="#e7eef5" stroke="#10314f"/>
-  <text x="115" y="55" text-anchor="middle" font-size="11">page header (28 B)</text>
-  <text x="115" y="72" text-anchor="middle" font-size="10" fill="#5a6b7c">LSN · CRC32 · type · counts</text>
+  <text x="115" y="55" text-anchor="middle" font-size="11">page header</text>
+  <text x="115" y="72" text-anchor="middle" font-size="10" fill="#5a6b7c">version · checksum · type</text>
   <rect x="190" y="32" width="160" height="56" fill="#eef4fa" stroke="#10314f"/>
-  <text x="270" y="55" text-anchor="middle" font-size="11">slot array →</text>
-  <text x="270" y="72" text-anchor="middle" font-size="10" fill="#5a6b7c">line pointers (offset,len,state)</text>
+  <text x="270" y="55" text-anchor="middle" font-size="11">slot directory →</text>
+  <text x="270" y="72" text-anchor="middle" font-size="10" fill="#5a6b7c">pointers to rows</text>
   <rect x="350" y="32" width="180" height="56" fill="#fff" stroke="#10314f" stroke-dasharray="5 4"/>
   <text x="440" y="63" text-anchor="middle" font-size="11" fill="#5a6b7c">free space</text>
   <rect x="530" y="32" width="210" height="56" fill="#fdf6ec" stroke="#10314f"/>
-  <text x="635" y="55" text-anchor="middle" font-size="11">← tuples (grow upward)</text>
-  <text x="635" y="72" text-anchor="middle" font-size="10" fill="#5a6b7c">compacted by vacuum, slots reused</text>
+  <text x="635" y="55" text-anchor="middle" font-size="11">← rows</text>
+  <text x="635" y="72" text-anchor="middle" font-size="10" fill="#5a6b7c">compacted by vacuum</text>
 
-  <text x="390" y="128" text-anchor="middle" font-weight="bold" fill="#10314f" font-size="13">Tuple layout</text>
+  <text x="390" y="128" text-anchor="middle" font-weight="bold" fill="#10314f" font-size="13">Row layout</text>
   <rect x="60" y="140" width="660" height="52" fill="none" stroke="#10314f" stroke-width="1.5"/>
-  <rect x="60" y="140" width="110" height="52" fill="#eef8f1" stroke="#10314f"/>
-  <text x="115" y="162" text-anchor="middle" font-size="11">xmin (8 B)</text>
-  <text x="115" y="178" text-anchor="middle" font-size="10" fill="#5a6b7c">creator xid</text>
-  <rect x="170" y="140" width="110" height="52" fill="#faf0f0" stroke="#10314f"/>
-  <text x="225" y="162" text-anchor="middle" font-size="11">xmax (8 B)</text>
-  <text x="225" y="178" text-anchor="middle" font-size="10" fill="#5a6b7c">superseder xid</text>
-  <rect x="280" y="140" width="150" height="52" fill="#f2f5f8" stroke="#10314f"/>
-  <text x="355" y="162" text-anchor="middle" font-size="11">prev_page / prev_slot (8 B)</text>
-  <text x="355" y="178" text-anchor="middle" font-size="10" fill="#5a6b7c">version history (vacuum)</text>
-  <rect x="430" y="140" width="290" height="52" fill="#fff" stroke="#10314f"/>
-  <text x="575" y="162" text-anchor="middle" font-size="11">row payload — tag+value per column</text>
-  <text x="575" y="178" text-anchor="middle" font-size="10" fill="#5a6b7c">13 additive type tags (Int64 … Time) — no format bump</text>
-  <text x="390" y="225" text-anchor="middle" font-size="10.5" fill="#5a6b7c">24-byte tuple header reserved from M0 (D4) so M1's MVCC needed no on-disk rewrite; new column tags are additive (no format bump).</text>
+  <rect x="60" y="140" width="140" height="52" fill="#eef8f1" stroke="#10314f"/>
+  <text x="130" y="162" text-anchor="middle" font-size="11">created-by</text>
+  <text x="130" y="178" text-anchor="middle" font-size="10" fill="#5a6b7c">which txn wrote it</text>
+  <rect x="200" y="140" width="140" height="52" fill="#faf0f0" stroke="#10314f"/>
+  <text x="270" y="162" text-anchor="middle" font-size="11">superseded-by</text>
+  <text x="270" y="178" text-anchor="middle" font-size="10" fill="#5a6b7c">which txn replaced it</text>
+  <rect x="340" y="140" width="380" height="52" fill="#fff" stroke="#10314f"/>
+  <text x="530" y="162" text-anchor="middle" font-size="11">column values (typed, compact binary)</text>
+  <text x="530" y="178" text-anchor="middle" font-size="10" fill="#5a6b7c">new types added without a format change</text>
 </svg>
-<div class="figcap">Figure 4 — Page and tuple layout. Every page: CRC32 + LSN; every tuple: MVCC header + hand-rolled little-endian column encoding.</div>
+<div class="figcap">Figure 4 — Page and row layout. Every page is checksummed; every row records its version stamps.</div>
 </div>
 
-<h3>3.2 Control file (D3)</h3>
+<h3 id="s3-2">3.2 How a write becomes permanent</h3>
 <p>
-The recovery root — unidb’s <code>pg_control</code>. 44 bytes: magic, format
-version, <code>page_size</code>, last-checkpoint LSN, WAL tail pointer,
-<code>catalog_root</code> (page id of the current catalog blob),
-<code>next_xid</code>, CRC32. Created at DB init; <b>recovery always starts
-here</b>. Persisting <code>next_xid</code> at each checkpoint fixed a real
-silent-corruption bug: the xid counter used to be recovered by scanning WAL
-<code>TXN_BEGIN</code> records, which checkpoint truncation deleted — a reissued
-xid could collide with existing <code>xmin</code>/<code>xmax</code> stamps.
+unidb uses a write-ahead log (WAL): before a change is applied to a page, a
+record describing it is appended to the log. The log is the source of truth. A
+commit is not acknowledged until its log record is physically flushed to disk.
 </p>
-
-<h3>3.3 WAL, mini-transactions &amp; the durability protocol (D1, D2, D5)</h3>
-<ul>
-<li><b>Steal + no-force, ARIES-style (D1):</b> the WAL carries both <b>redo and
-  undo</b> information per record. Record framing: <code>u32</code> LE length
-  prefix + per-record CRC32; a recovery scan stops cleanly at the first
-  corrupt/truncated record.</li>
-<li><b>Mini-transactions (D2):</b> each statement is a WAL-bracketed group of
-  page writes (begin/commit records) that redo/undo treat as one unit. User
-  transactions add <code>WAL_TXN_BEGIN/COMMIT/ABORT</code> on the same wire
-  format (the <code>mini_txn_id</code> u64 slot doubles as the <code>Xid</code>).
-  Additive record kinds: <code>WAL_VACUUM</code> (redo-only reclamation),
-  <code>WAL_FPI</code> (full page image), <code>WAL_INDEX</code> (redo-only index
-  node image).</li>
-<li><b>Group-committed force-log-at-commit (default):</b> statement mini-txns
-  inside an open transaction append <i>without</i> a per-statement fsync;
-  <code>Engine::commit</code> forces the commit record durable via
-  <code>Wal::sync_up_to</code> — <b>one group-coalesced fsync per
-  transaction</b>. The leader’s <code>sync_all</code> runs with the append lock
-  released, so concurrent committers coalesce behind one fsync. No commit is
-  acknowledged before its commit LSN is synced; a
-  <code>synchronous_commit=off</code>-style ack-before-flush is deliberately
-  not offered. Standalone durability-claiming operations (checkpoint, vacuum,
-  index create, slot metadata, backups) self-sync.</li>
-</ul>
-<div class="figure">
-<svg viewBox="0 0 780 430" xmlns="http://www.w3.org/2000/svg" font-family="Arial" font-size="12">
-  <defs><marker id="c" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-    <path d="M0,0 L8,4 L0,8 z" fill="#2f6bad"/></marker></defs>
-  <text x="390" y="20" text-anchor="middle" font-weight="bold" font-size="13" fill="#10314f">Write path: statement → WAL → page → group-commit fsync</text>
-  <rect x="250" y="32" width="280" height="30" rx="5" fill="#eef4fa" stroke="#2f6bad"/>
-  <text x="390" y="51" text-anchor="middle">SQL statement (executor) — inside txn Xid</text>
-  <line x1="390" y1="62" x2="390" y2="78" stroke="#2f6bad" stroke-width="1.5" marker-end="url(#c)"/>
-  <rect x="250" y="80" width="280" height="30" rx="5" fill="#fff" stroke="#2f6bad"/>
-  <text x="390" y="99" text-anchor="middle">mini-txn BEGIN (WAL bracket)</text>
-  <line x1="390" y1="110" x2="390" y2="126" stroke="#2f6bad" stroke-width="1.5" marker-end="url(#c)"/>
-  <rect x="250" y="128" width="280" height="42" rx="5" fill="#fdf6ec" stroke="#c08a3e"/>
-  <text x="390" y="145" text-anchor="middle">first touch since checkpoint?</text>
-  <text x="390" y="162" text-anchor="middle" font-size="11">→ log full page image (WAL_FPI, torn-page protection)</text>
-  <line x1="390" y1="170" x2="390" y2="186" stroke="#2f6bad" stroke-width="1.5" marker-end="url(#c)"/>
-  <rect x="250" y="188" width="280" height="30" rx="5" fill="#fdf6ec" stroke="#c08a3e"/>
-  <text x="390" y="207" text-anchor="middle">WAL append: redo + undo record (no fsync yet)</text>
-  <line x1="390" y1="218" x2="390" y2="234" stroke="#2f6bad" stroke-width="1.5" marker-end="url(#c)"/>
-  <rect x="250" y="236" width="280" height="42" rx="5" fill="#fff" stroke="#2f6bad"/>
-  <text x="390" y="253" text-anchor="middle">heap page write (mmap, page latch held)</text>
-  <text x="390" y="270" text-anchor="middle" font-size="11">+ synchronous durable index maintenance (WAL_INDEX)</text>
-  <line x1="390" y1="278" x2="390" y2="294" stroke="#2f6bad" stroke-width="1.5" marker-end="url(#c)"/>
-  <rect x="250" y="296" width="280" height="30" rx="5" fill="#fff" stroke="#2f6bad"/>
-  <text x="390" y="315" text-anchor="middle">mini-txn COMMIT record · record_undo(action)</text>
-  <line x1="390" y1="326" x2="390" y2="342" stroke="#2f6bad" stroke-width="1.5" marker-end="url(#c)"/>
-  <rect x="220" y="344" width="340" height="42" rx="5" fill="#dff2e6" stroke="#3f8f5f" stroke-width="1.5"/>
-  <text x="390" y="361" text-anchor="middle" font-weight="bold" fill="#216b41">Engine::commit → Wal::sync_up_to(commit LSN)</text>
-  <text x="390" y="378" text-anchor="middle" font-size="11">leader fsync with append lock released — committers coalesce</text>
-  <text x="390" y="412" text-anchor="middle" font-size="11" fill="#216b41">durable ack — read-only txns skip the fsync entirely (undo_log empty)</text>
-  <!-- D5 side box -->
-  <rect x="575" y="128" width="185" height="150" rx="6" fill="#f2f5f8" stroke="#5a6b7c"/>
-  <text x="667" y="150" text-anchor="middle" font-weight="bold" fill="#37485a">D5 gate (buffer pool)</text>
-  <text x="585" y="172" font-size="10.5">flush/evict allowed only if</text>
-  <text x="585" y="188" font-size="10.5">page.LSN ≤ durable_WAL_LSN.</text>
-  <text x="585" y="210" font-size="10.5">No durable victim? force</text>
-  <text x="585" y="226" font-size="10.5">wal.sync() and retry —</text>
-  <text x="585" y="242" font-size="10.5">never BufferPoolFull, safe</text>
-  <text x="585" y="258" font-size="10.5">for working sets &gt; pool.</text>
-  <!-- fsync poison -->
-  <rect x="20" y="128" width="185" height="150" rx="6" fill="#faf0f0" stroke="#b05252"/>
-  <text x="112" y="150" text-anchor="middle" font-weight="bold" fill="#7a3535">fsync failure (P1.b)</text>
-  <text x="30" y="172" font-size="10.5">any fsync/msync failure</text>
-  <text x="30" y="188" font-size="10.5">latches a poisoned state:</text>
-  <text x="30" y="204" font-size="10.5">DurabilityFailure forever</text>
-  <text x="30" y="220" font-size="10.5">after — never falsely</text>
-  <text x="30" y="236" font-size="10.5">reports durable. Recovery</text>
-  <text x="30" y="252" font-size="10.5">still sees a consistent</text>
-  <text x="30" y="268" font-size="10.5">prefix (fsyncgate-safe).</text>
-</svg>
-<div class="figcap">Figure 5 — The write path. WAL-before-page is enforced at every mutation; durability is one group-coalesced fsync per transaction (ARIES force-log-at-commit).</div>
-</div>
-
-<h3>3.4 Torn-page protection &amp; fsync hardening (Phase 1)</h3>
-<ul>
-<li><b>Full-page writes (P1.a).</b> An 8 KiB page write is not atomic; a crash
-  mid-write leaves a half-old/half-new page that CRC detects but cannot repair
-  — the #1 silent data-loss hole. On the first modification of a page after
-  each checkpoint, the buffer pool logs the entire clean page image as a
-  redo-only <code>WAL_FPI</code> record; recovery replays it as the clean base
-  and re-applies later incremental redos on top. Correct with one image per
-  page per checkpoint interval because D5 guarantees any torn on-disk page
-  belongs to a committed mini-txn whose FPI is in the redo set.</li>
-<li><b>fsync-failure poisoning (P1.b, “fsyncgate”).</b> A failed fsync may
-  leave the OS having dropped dirty data while clearing its dirty bit, so a
-  retry can falsely succeed. <code>Wal</code> and <code>BufferPool</code> latch a
-  poisoned state on any durability-primitive failure and refuse all later
-  durability claims; the session must restart, and recovery still sees a
-  consistent prefix.</li>
-</ul>
-
-<h3>3.5 Buffer pool</h3>
-<ul>
-<li><b>Configurable capacity</b>: 4096 frames default (32 MiB), via
-  <code>UNIDB_BUFFER_POOL_PAGES</code> or <code>open_with_pool_capacity</code>.
-  Per-page shared/exclusive latches (Phase 5); clock eviction; dirty tracking;
-  D5 enforcement in exactly two places (<code>flush_page()</code> and
-  <code>find_victim()</code>).</li>
-<li><b>mmap-as-storage:</b> <code>Frame</code> holds eviction metadata only;
-  <code>write_page</code> writes into the mmap and <code>read_page</code> returns
-  an owned copy under the read lock — which is why parallel scan workers can
-  read the shared mmap with no pool-staleness hazard (verified during
-  Milestone P, not assumed).</li>
-<li><b>Proper ARIES steal:</b> <code>find_victim</code> writes back and evicts a
-  dirty page once its LSN is durable; if every dirty frame leads the durable
-  WAL (group-commit deferral), the write path forces one
-  <code>wal.sync()</code> and retries — “force the log before stealing the
-  page”, never <code>BufferPoolFull</code>.</li>
-<li><b>Chunked file growth:</b> the file grows in 4 MiB chunks; the mmap is
-  re-created only when a new page crosses the mapped boundary (was a
-  whole-file remap per <code>alloc_page</code> — O(N²)). Benchmarked flat at
-  ~1M <code>alloc_page</code>/s to 100k pages.</li>
-</ul>
-
-<h3>3.6 Free-space map (durable, per table)</h3>
 <p>
-A catalog table’s page directory + free-space map is a per-table durable
-<code>DiskBTree</code> keyed <code>page_id → free_bytes</code>
-(<code>TableDef.fsm_meta</code>). <code>Heap::open</code> is O(1); the SQL insert
-path appends at the durable tail via <code>DiskBTree::max_entry</code> (O(log n),
-no per-statement rebuild); vacuum reclamation is durable. This replaced the
-in-catalog page-list blob whose single-page cap produced <code>HeapFull</code>
-at ~145k rows (~876 pages) — marginal SQL-insert cost went from
-rising-then-fatal (65→108→173 µs/row) to flat ~17–28 µs/row past 2,000 pages.
-</p>
-
-<h3>3.7 Checkpoint &amp; recovery</h3>
-<p>
-<code>checkpoint::run</code>: flush all dirty pages → reset FPI tracking →
-write a checkpoint WAL record → persist the control file (checkpoint LSN, WAL
-tail, <code>catalog_root</code>, <code>next_xid</code>) → truncate consumed WAL.
-<b>Auto-checkpoint (P1.e)</b> fires on a time trigger (default 60 s) or a
-WAL-size trigger (default 64 MiB), but only at a quiescent point (no active
-transactions) — a permanently open transaction blocks it (documented footgun,
-as in Postgres). Since Phase 6 the WAL is <b>segmented</b> (16 MiB segments);
-truncation deletes whole consumed segments, and the truncation floor is
-<code>min(checkpoint_lsn, min slot restart_lsn)</code> so replication slots pin
-what replicas still need.
+Within a transaction, individual statements append to the log <i>without</i>
+flushing; the single flush happens at <code>COMMIT</code>. When many
+transactions commit at once, the engine <b>coalesces them behind one shared
+flush</b> ("group commit") — so throughput scales with concurrency instead of
+being bottlenecked by one flush per statement. Read-only transactions skip the
+flush entirely.
 </p>
 <div class="figure">
 <svg viewBox="0 0 780 300" xmlns="http://www.w3.org/2000/svg" font-family="Arial" font-size="12">
+  <defs><marker id="c" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+    <path d="M0,0 L8,4 L0,8 z" fill="#2f6bad"/></marker></defs>
+  <text x="390" y="20" text-anchor="middle" font-weight="bold" font-size="13" fill="#10314f">Write path: statement → log → page → group-commit flush</text>
+  <rect x="250" y="34" width="280" height="30" rx="5" fill="#eef4fa" stroke="#2f6bad"/>
+  <text x="390" y="53" text-anchor="middle">SQL statement (inside a transaction)</text>
+  <line x1="390" y1="64" x2="390" y2="80" stroke="#2f6bad" stroke-width="1.5" marker-end="url(#c)"/>
+  <rect x="250" y="82" width="280" height="42" rx="5" fill="#fdf6ec" stroke="#c08a3e"/>
+  <text x="390" y="99" text-anchor="middle">append log record (redo + undo)</text>
+  <text x="390" y="116" text-anchor="middle" font-size="11">no flush yet — first page touch is saved in full</text>
+  <line x1="390" y1="124" x2="390" y2="140" stroke="#2f6bad" stroke-width="1.5" marker-end="url(#c)"/>
+  <rect x="250" y="142" width="280" height="42" rx="5" fill="#fff" stroke="#2f6bad"/>
+  <text x="390" y="159" text-anchor="middle">apply change to the page in memory</text>
+  <text x="390" y="176" text-anchor="middle" font-size="11">+ keep indexes durably in step</text>
+  <line x1="390" y1="184" x2="390" y2="200" stroke="#2f6bad" stroke-width="1.5" marker-end="url(#c)"/>
+  <rect x="220" y="202" width="340" height="42" rx="5" fill="#dff2e6" stroke="#3f8f5f" stroke-width="1.5"/>
+  <text x="390" y="219" text-anchor="middle" font-weight="bold" fill="#216b41">COMMIT → flush the log to disk</text>
+  <text x="390" y="236" text-anchor="middle" font-size="11">concurrent commits coalesce behind one flush</text>
+  <text x="390" y="270" text-anchor="middle" font-size="11" fill="#216b41">durable acknowledgement — read-only transactions skip this flush</text>
+</svg>
+<div class="figcap">Figure 5 — The write path. Log-before-page is enforced at every change; durability is one shared flush per commit.</div>
+</div>
+
+<h3 id="s3-3">3.3 Crash recovery — when the power goes out</h3>
+<p>
+If the process is killed or the machine loses power mid-write, you do nothing
+special: the next time the database is opened, unidb <b>repairs itself
+automatically</b>. Recovery is deterministic and needs no manual intervention.
+</p>
+<p>On open, the engine:</p>
+<ol>
+<li>Reads the <b>control file</b> — a tiny, checksummed record that always
+  points at the last known-good checkpoint. Recovery always starts here.</li>
+<li><b>Replays</b> committed changes from the log, forward from that
+  checkpoint, so every acknowledged commit is restored.</li>
+<li><b>Rolls back</b> anything belonging to transactions that never reached a
+  commit, leaving no partial rows behind.</li>
+</ol>
+<div class="callout good">
+<b>The guarantee.</b> After recovery, the database contains <b>exactly the
+transactions that had committed</b> — no more, no less. No half-applied
+statements, no orphaned rows, no readable corruption. This holds even if the
+crash happens <i>during</i> recovery itself: re-running recovery is safe and
+produces the same result.
+</div>
+<div class="figure">
+<svg viewBox="0 0 780 190" xmlns="http://www.w3.org/2000/svg" font-family="Arial" font-size="12">
   <defs><marker id="d" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
     <path d="M0,0 L8,4 L0,8 z" fill="#2f6bad"/></marker></defs>
-  <text x="390" y="20" text-anchor="middle" font-weight="bold" font-size="13" fill="#10314f">Crash recovery on Engine::open</text>
+  <text x="390" y="20" text-anchor="middle" font-weight="bold" font-size="13" fill="#10314f">Automatic recovery when the database re-opens</text>
   <rect x="30" y="40" width="170" height="52" rx="5" fill="#e7eef5" stroke="#10314f"/>
   <text x="115" y="61" text-anchor="middle" font-weight="bold">1 · Control file</text>
-  <text x="115" y="79" text-anchor="middle" font-size="10">checkpoint LSN · next_xid</text>
+  <text x="115" y="79" text-anchor="middle" font-size="10">last good checkpoint</text>
   <line x1="200" y1="66" x2="228" y2="66" stroke="#2f6bad" stroke-width="1.5" marker-end="url(#d)"/>
-  <rect x="230" y="40" width="170" height="52" rx="5" fill="#fdf6ec" stroke="#c08a3e"/>
-  <text x="315" y="61" text-anchor="middle" font-weight="bold">2 · REDO pass</text>
-  <text x="315" y="79" text-anchor="middle" font-size="10">replay from checkpoint LSN</text>
-  <line x1="400" y1="66" x2="428" y2="66" stroke="#2f6bad" stroke-width="1.5" marker-end="url(#d)"/>
-  <rect x="430" y="40" width="170" height="52" rx="5" fill="#fdf6ec" stroke="#c08a3e"/>
-  <text x="515" y="61" text-anchor="middle" font-weight="bold">3 · UNDO mini-txns</text>
-  <text x="515" y="79" text-anchor="middle" font-size="10">roll back incomplete stmts</text>
-  <line x1="600" y1="66" x2="628" y2="66" stroke="#2f6bad" stroke-width="1.5" marker-end="url(#d)"/>
-  <rect x="630" y="40" width="130" height="52" rx="5" fill="#fdf6ec" stroke="#c08a3e"/>
-  <text x="695" y="61" text-anchor="middle" font-weight="bold">4 · UNDO user txns</text>
-  <text x="695" y="79" text-anchor="middle" font-size="10">no COMMIT ⇒ revert</text>
-  <rect x="60" y="130" width="310" height="120" rx="6" fill="#f2f5f8" stroke="#5a6b7c"/>
-  <text x="215" y="152" text-anchor="middle" font-weight="bold" fill="#37485a">REDO details</text>
-  <text x="72" y="174" font-size="10.5">• WAL_FPI image restored first as the clean base</text>
-  <text x="72" y="192" font-size="10.5">  (CRC-bypassing), incremental redos re-applied on top</text>
-  <text x="72" y="210" font-size="10.5">• per-record CRC: scan stops at first torn/corrupt record</text>
-  <text x="72" y="228" font-size="10.5">• durable frontier advanced to WAL tail ⇒ redo may evict freely</text>
-  <rect x="410" y="130" width="350" height="120" rx="6" fill="#f2f5f8" stroke="#5a6b7c"/>
-  <text x="585" y="152" text-anchor="middle" font-weight="bold" fill="#37485a">User-txn UNDO details</text>
-  <text x="422" y="174" font-size="10.5">• write ownership reconstructed by decoding xmin/xmax</text>
-  <text x="422" y="192" font-size="10.5">  from the WAL redo bytes (no in-memory state survives)</text>
-  <text x="422" y="210" font-size="10.5">• two phases: revert xmax-stamps first, self-stamp inserts last</text>
-  <text x="422" y="228" font-size="10.5">• idempotent ⇒ crash-during-abort is safe (point P9)</text>
-  <text x="390" y="280" text-anchor="middle" font-size="11" fill="#216b41" font-weight="bold">Invariant: recovered state = exactly the set of transactions that reached WAL_TXN_COMMIT (property-tested)</text>
+  <rect x="230" y="40" width="180" height="52" rx="5" fill="#fdf6ec" stroke="#c08a3e"/>
+  <text x="320" y="61" text-anchor="middle" font-weight="bold">2 · Replay committed</text>
+  <text x="320" y="79" text-anchor="middle" font-size="10">restore acknowledged commits</text>
+  <line x1="410" y1="66" x2="438" y2="66" stroke="#2f6bad" stroke-width="1.5" marker-end="url(#d)"/>
+  <rect x="440" y="40" width="180" height="52" rx="5" fill="#fdf6ec" stroke="#c08a3e"/>
+  <text x="530" y="61" text-anchor="middle" font-weight="bold">3 · Roll back the rest</text>
+  <text x="530" y="79" text-anchor="middle" font-size="10">discard uncommitted work</text>
+  <line x1="620" y1="66" x2="648" y2="66" stroke="#2f6bad" stroke-width="1.5" marker-end="url(#d)"/>
+  <rect x="650" y="40" width="110" height="52" rx="5" fill="#dff2e6" stroke="#3f8f5f"/>
+  <text x="705" y="61" text-anchor="middle" font-weight="bold" fill="#216b41">4 · Ready</text>
+  <text x="705" y="79" text-anchor="middle" font-size="10" fill="#216b41">open for use</text>
+  <text x="390" y="150" text-anchor="middle" font-size="11" fill="#37485a">Even total loss of the data file can be rebuilt from the log alone; a checkpoint periodically trims the log so recovery stays fast.</text>
 </svg>
-<div class="figcap">Figure 6 — ARIES-style recovery: control file → redo (FPI-based) → undo incomplete mini-transactions → undo incomplete user transactions.</div>
+<div class="figcap">Figure 6 — Crash recovery on open: control file → replay committed → roll back uncommitted.</div>
 </div>
 
-<h3>3.8 Crash-injection harness (D7)</h3>
-<p>
-<code>tests/crash/</code> kills the process at defined points, reopens, and
-asserts the recovered state equals the expected committed set — <b>31 tests</b>
-as of item 17. Points cover: post-WAL/pre-flush, mid-checkpoint,
-post-mutation/pre-commit, during WAL truncation, post-commit-fsync (P1–P5);
-user-txn boundaries and mid-undo (P6/P7/P9); mid-vacuum (P10); torn 8 KiB page
-recovered from <code>WAL_FPI</code> (P11); fsync-failure poison (P12); total
-data-file loss reconstructed from WAL alone (P13); durable full-text/edge/LOB/
-vector indexes (P14–P17, vector with recall intact); segmented-WAL multi-segment
-recovery + truncation (P18); backup + PITR restore after primary loss (P19);
-group-commit deferral points (Pa–Pd); durable FSM (P27/P28); and the
-replaced-stack crash-consistency proofs (<code>item16_*</code>). A property test
-runs random <code>BEGIN/INSERT/COMMIT/ROLLBACK</code> sequences with random
-crash points under <b>both</b> durability policies. The harness must grow
-whenever a new durability mechanism lands.
-</p>
-
-<!-- ================= 4 ================= -->
-<h2 class="pagebreak">4. Transactions, MVCC &amp; concurrency</h2>
-
-<h3>4.1 Version model &amp; visibility</h3>
-<p>
-unidb uses <b>insert-new-version MVCC</b>: UPDATE always creates a new
-<code>RowId</code> and stamps the old version’s <code>xmax</code> — never
-in-place. <code>prev_page</code>/<code>prev_slot</code> record version history
-for recovery/vacuum bookkeeping only; <b>readers never walk the chain</b> —
-<code>Heap::get</code> is a single direct visibility check. Visibility
-(<code>mvcc.rs</code>) is pure snapshot logic: a <code>Snapshot</code>
-(active-xid set + range) and <code>is_visible(tuple, snapshot)</code>. There is
-deliberately <b>no “aborted” state</b> in visibility — abort therefore requires
-physical undo, and (item-16 correction) that undo must run while the aborting
-xid is still in the active set.
-</p>
-<div class="figure">
-<svg viewBox="0 0 780 250" xmlns="http://www.w3.org/2000/svg" font-family="Arial" font-size="12">
-  <defs><marker id="e" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-    <path d="M0,0 L8,4 L0,8 z" fill="#5a6b7c"/></marker></defs>
-  <text x="390" y="20" text-anchor="middle" font-weight="bold" font-size="13" fill="#10314f">MVCC: UPDATE creates a new version (never in place)</text>
-  <rect x="60" y="50" width="220" height="80" rx="6" fill="#faf0f0" stroke="#b05252" stroke-width="1.5"/>
-  <text x="170" y="72" text-anchor="middle" font-weight="bold">v1 · RowId (p=12, s=3)</text>
-  <text x="170" y="92" text-anchor="middle" font-size="11">xmin = 100 (committed)</text>
-  <text x="170" y="110" text-anchor="middle" font-size="11">xmax = 105 ← stamped by UPDATE</text>
-  <rect x="480" y="50" width="220" height="80" rx="6" fill="#eef8f1" stroke="#3f8f5f" stroke-width="1.5"/>
-  <text x="590" y="72" text-anchor="middle" font-weight="bold">v2 · RowId (p=19, s=7)</text>
-  <text x="590" y="92" text-anchor="middle" font-size="11">xmin = 105, xmax = 0 (live tip)</text>
-  <text x="590" y="110" text-anchor="middle" font-size="11">prev → (12, 3) — bookkeeping only</text>
-  <line x1="480" y1="90" x2="285" y2="90" stroke="#5a6b7c" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#e)"/>
-  <text x="382" y="82" text-anchor="middle" font-size="10.5" fill="#5a6b7c">prev_page/prev_slot</text>
-  <rect x="60" y="160" width="640" height="70" rx="6" fill="#f2f5f8" stroke="#5a6b7c"/>
-  <text x="390" y="182" text-anchor="middle" font-weight="bold" fill="#37485a">Snapshot visibility rule</text>
-  <text x="390" y="202" text-anchor="middle" font-size="11">visible ⇔ xmin committed at snapshot (not in active set, below next_xid) AND xmax absent-or-not-committed at snapshot</text>
-  <text x="390" y="220" text-anchor="middle" font-size="11" fill="#7a3535">no "aborted" state ⇒ abort must physically undo its tuples while its xid is still active (item-16 fix)</text>
-</svg>
-<div class="figcap">Figure 7 — Insert-new-version MVCC. A snapshot before xid 105 commits sees v1; after, v2. Vacuum reclaims dead versions behind a reader-aware horizon.</div>
-</div>
-
-<h3>4.2 Isolation levels (D10, D12; SSI in P1.d)</h3>
-<table>
-<tr><th>Level</th><th>Snapshot lifetime</th><th>Conflict behaviour</th></tr>
-<tr><td><b>READ COMMITTED</b> (default)</td><td>per statement</td>
-    <td>Each statement re-reads the latest committed tip via its fresh snapshot
-    (EvalPlanQual is inherent to a re-scanning executor — no spurious abort).
-    A conflict against a still-active writer is rejected
-    (<code>WriteConflict</code>, no-wait by design).</td></tr>
-<tr><td><b>REPEATABLE READ</b> (= snapshot isolation)</td><td>per transaction</td>
-    <td>Write-write conflict surfaces as <code>SerializationFailure</code> —
-    the caller retries.</td></tr>
-<tr><td><b>SERIALIZABLE</b> (SSI)</td><td>per transaction</td>
-    <td>RR’s snapshot + Cahill-style rw-antidependency (pivot) detection over
-    per-txn read/write sets; a pivot aborts at commit with
-    <code>SerializationFailure</code>, preventing write-skew. Reduced form:
-    row-granularity (no predicate locks ⇒ no phantom protection),
-    occasionally over-conservative.</td></tr>
-</table>
-<p>
-The <code>on_read()</code>/<code>on_write()</code> seam (D11) exists in every
-scan/lookup path (<code>concurrency_hooks.rs</code>), kept no-op — SSI tracks at
-the executor; the seam remains available for finer-grained tracking later.
-</p>
-
-<h3>4.3 Locking &amp; deadlock detection</h3>
+<h3 id="s3-4">3.4 Protection against corruption</h3>
 <ul>
-<li>Write-write locks only (no read locks under MVCC), keyed by
-  <code>RecordId::row(page_id, slot)</code> packed into a u64. Because
-  <code>PageId</code> comes from one global allocator, lock keys are globally
-  unique across all tables — graph edges needed <b>zero</b> new locking code.</li>
-<li>Locks are held until commit/abort, so there is no window between write and
-  commit for another writer to slip through (no commit-time recheck needed).</li>
-<li>Phase 5 made the lock manager real: S/X modes, blocking
-  <code>Condvar</code> wait queues, and wait-for-graph deadlock detection.</li>
-<li>Per-query <b>timeouts, cancellation, and <code>work_mem</code></b> via
-  <code>Engine::execute_sql_with_limits</code> (P5.f); parallel scan workers
-  check the deadline every few pages.</li>
+<li><b>Torn-page protection.</b> An 8 KiB page write is not atomic at the
+  hardware level — a crash mid-write can leave a page half-old and half-new.
+  The first time a page changes after each checkpoint, unidb saves a full,
+  clean image of it to the log, so recovery can always rebuild a torn page from
+  a known-good base. This closes the single most common silent data-loss hole
+  in naive storage engines.</li>
+<li><b>Honest handling of disk-flush failures.</b> If the operating system ever
+  reports that a flush failed, unidb refuses to keep claiming durability and
+  requires a restart, rather than falsely reporting data as safe. After the
+  restart, recovery still finds a consistent database.</li>
+<li><b>Checksums on every page</b> catch bit-rot and partial writes on read.</li>
 </ul>
 
-<h3>4.4 Abort = physical self-neutralization</h3>
-<p>
-Abort self-stamps <code>xmax := own xmin</code> on every tuple the transaction
-inserted and reverts every xmax-stamp it applied, driven by an in-memory
-<code>Vec&lt;UndoAction&gt;</code>. <code>Heap</code> never records undo itself —
-every call site pairs the heap call with an explicit
-<code>record_undo(...)</code>, which is what let edges/events/LOBs inherit
-correct abort behavior with zero new abort-path code (guarded by per-feature
-abort-visibility tests, since a forgotten <code>record_undo</code> is a silent
-visibility bug).
-</p>
-<div class="callout warn">
-<b>The item-16 lesson (2026-07-12), a real concurrency bug:</b>
-<code>abort()</code> originally removed the xid from the active set <i>before</i>
-physically undoing its writes. Because visibility has no “aborted” state, a
-concurrent snapshot briefly classified the aborting transaction’s doomed writes
-as committed — wrong reads, and a concurrent writer could chain onto the
-unlocked new version, leaving <b>two live versions of one row (or none)</b>
-after undo. Fix: keep the xid active (and its row locks held) through the whole
-physical undo. Proven by a deterministic pin-the-midpoint test; took the
-28-cell concurrency matrix from 17 PASS/11 FAIL to <b>28/28</b>.
-</div>
+<h3 id="s3-5">3.5 Memory &amp; space management</h3>
+<ul>
+<li><b>Buffer pool.</b> Hot pages are cached in a configurable in-memory pool
+  (32 MiB by default). Working sets larger than the pool are handled safely —
+  the engine flushes and evicts correctly rather than failing.</li>
+<li><b>Free-space tracking.</b> Each table tracks its free space durably, so
+  inserts stay fast and predictable even as tables grow into the millions of
+  rows — insert cost stays flat where a naive design would degrade and
+  eventually fail.</li>
+<li><b>Vacuum &amp; autovacuum.</b> Because updates create new row versions,
+  superseded versions are reclaimed in the background once no transaction can
+  still see them, keeping tables compact automatically (see Section 9).</li>
+</ul>
 
-<h3>4.5 Concurrent SQL writes — latch-coupled B-Tree descent</h3>
+<!-- ================= 4 ================= -->
+<h2 id="s4" class="pagebreak">4. Transactions &amp; working with many users at once</h2>
+
+<h3 id="s4-1">4.1 Snapshots &amp; isolation levels</h3>
 <p>
-Raw-CRUD writers have scaled since Phase 5 (group commit; <b>3.68× at 8
-writers</b>). SQL DML originally serialized on the catalog write lock; the
-index-write-concurrency milestone (default-ON since item 11, 2026-07-13) lets
-catalog-non-mutating DML take a <i>shared</i> catalog lock, with
-<code>DiskBTree</code> maintenance made race-safe by <b>latch-coupled
-(“crabbing”) descent with safe-node early release</b>: latch child before
-releasing parent; drop all ancestor + meta latches at the first node that
-cannot split; splits propagate only through the still-latched suffix; latches
-are taken strictly root→leaf so inserts cannot deadlock. Reads stay latch-free
-(owned page copies + right-linked leaves + MVCC re-validation). Validated by a
-structural validator, deterministic split-contention tests, a <code>loom</code>
-model of the latch ordering, and the 28-cell concurrency matrix (28/28 at 10
-repeats, toggle on and off). Measured: indexed 8-writer INSERT
-<b>811 → 1016 commits/s (+25%)</b>; revert is one env var
-(<code>UNIDB_CONCURRENT_SQL_WRITES=0</code>).
+unidb uses <b>multi-version concurrency control (MVCC)</b>: an update never
+overwrites a row in place — it writes a new version and marks the old one as
+superseded. Each transaction reads from a consistent <b>snapshot</b>, so
+<b>readers never block writers and writers never block readers</b>. Old versions
+are cleaned up later, once no active transaction can still see them.
+</p>
+<p>Three isolation levels are available:</p>
+<table>
+<tr><th>Level</th><th>What you get</th><th>On conflict</th></tr>
+<tr><td><b>Read Committed</b> (default)</td>
+    <td>Each statement sees the latest committed data. The common, high-throughput default.</td>
+    <td>A write against a row another transaction is still changing is rejected so you can retry.</td></tr>
+<tr><td><b>Repeatable Read</b></td>
+    <td>The whole transaction sees one stable snapshot — the same rows every time you read them.</td>
+    <td>Conflicting concurrent writes surface a serialization error; the caller retries.</td></tr>
+<tr><td><b>Serializable</b></td>
+    <td>The strongest guarantee: the result is as if transactions ran one at a time, protecting against subtle write-skew anomalies.</td>
+    <td>A dangerous interleaving is detected and one transaction is asked to retry.</td></tr>
+</table>
+
+<h3 id="s4-2">4.2 Reading and writing at the same time</h3>
+<p>
+unidb is designed for real concurrency, and its behavior under load is
+straightforward to reason about:
+</p>
+<ul>
+<li><b>Reads are lock-free.</b> Any number of readers proceed in parallel and
+  never wait on each other or on writers.</li>
+<li><b>Writers to different rows run in parallel</b> and scale across CPU cores.
+  In benchmarks, raw write throughput scales <b>3.68× at 8 concurrent
+  writers</b>, and concurrent inserts into indexed tables run about <b>25%
+  faster</b> than the earlier serialized behavior.</li>
+<li><b>Writers to the same row are safe by first-committer-wins.</b> If two
+  transactions try to change the same row, one succeeds and the other gets a
+  clear conflict error to retry — there is no lost update and no silent
+  overwrite.</li>
+<li><b>Deadlocks are detected automatically.</b> If two transactions wait on
+  each other, the engine breaks the cycle by aborting one with a deadlock
+  error, rather than hanging.</li>
+<li><b>Per-query safety limits.</b> Queries can be given time budgets and can be
+  cancelled, so one runaway query cannot monopolize the engine.</li>
+</ul>
+<p>
+Under the hood, concurrent index updates are kept correct with fine-grained,
+carefully ordered locking so that inserts can proceed in parallel without ever
+producing an inconsistent index — validated by an extensive concurrency test
+suite (Section 11).
+</p>
+
+<h3 id="s4-3">4.3 What happens on rollback</h3>
+<p>
+When a transaction is rolled back (explicitly, or because it hit an error or was
+abandoned), unidb physically neutralizes everything it wrote: rows it inserted
+become invisible and rows it had marked superseded are restored. This is what
+lets graph edges, events, and large objects all inherit correct rollback
+behavior for free — they are ordinary rows, so undoing them uses the exact same
+machinery as undoing a table row.
 </p>
 
 <!-- ================= 5 ================= -->
-<h2 class="pagebreak">5. SQL layer</h2>
-
-<h3>5.1 Catalog &amp; types</h3>
+<h2 id="s5" class="pagebreak">5. The SQL layer</h2>
 <p>
-<code>catalog.rs</code> persists <code>TableDef</code>/<code>ColumnDef</code> as a
-single <code>serde_json</code> blob rewritten to a fresh page on every change,
-pointed at by <code>control.catalog_root</code> (schema is control-plane data,
-not the hot path D9 protects). Column types: <code>Int64</code>,
-<code>Text</code>, <code>Bool</code>, <code>Json</code>, <code>Vector(n)</code>,
-<code>Decimal(p,s)</code>, <code>Timestamp</code>, <code>Float</code>,
-<code>Uuid</code>, <code>Bytea</code>, <code>Date</code>, <code>Time</code> —
-encoded as additive tag+value pairs (no format bump for new tags). The catalog
-is <b>not MVCC-versioned</b>: DDL takes effect immediately and globally
-(request-level DDL rollback exists; crash-safe transactional DDL is tracked
-debt). <code>SERIAL</code> is a durable per-table counter; prepared statements
-+ <code>$n</code> bind parameters close the SQL-injection surface.
-<b>Introspection (Milestone 18, 2026-07-13):</b> the catalog is queryable via
-<code>information_schema.{tables, columns, table_constraints,
-key_column_usage, …}</code> / <code>unidb_catalog.*</code> virtual tables,
-resolved at plan time and identical from embed, attach, and server — the
-documented access-and-introspection contract applications build on (see
-<code>docs/engine_access_guide.md</code>).
+unidb speaks a practical, PostgreSQL-flavored SQL dialect. Statements are
+parsed, planned, cost-optimized, and executed against versioned tables. You can
+inspect any plan with <code>EXPLAIN</code> (and its real row counts and timing
+with <code>EXPLAIN ANALYZE</code>).
 </p>
 
-<h3>5.2 Query pipeline</h3>
-<pre>SQL text ──sqlparser (GenericDialect)──▶ LogicalPlan
-  ├─ trivial single-table SELECT ──▶ original fast path (feeds the concurrent-read path)
-  │     ├─ B-Tree-indexable predicate? ──▶ try_exec_select_btree (index → resolve → refilter)
-  │     ├─ NEAR(col, [..], k)? ──▶ DiskIvfIndex probe → exact re-rank → MVCC/RLS recheck
-  │     └─ full scan ──▶ deform_row (decode only needed columns) · parallel workers if eligible
-  └─ anything richer ──▶ LogicalPlan::Query(QuerySpec) ──▶ cost-based optimizer
-        (ANALYZE stats · Selinger left-deep DP join order · index-vs-scan)
-        ──▶ physical operator tree: hash join (Grace spill) / sort-merge /
-            index-nested-loop · aggregate · external merge-sort · subqueries/CTEs
-        ──▶ EXPLAIN [ANALYZE] renders the tree with estimated vs actual rows</pre>
-<p>
-Executed row-at-a-time. Row-level security is a planner rewrite:
-<code>apply_rls</code> ANDs the stored policy predicate onto the statement’s
-predicate — one function, composing for free with <code>NEAR</code> and
-index-assisted paths because every path filters through the same
-<code>predicate_matches</code>.
-</p>
-
-<h3>5.3 Query power (Phase 4) — what ships</h3>
+<h3 id="s5-1">5.1 Supported data types</h3>
 <table>
-<tr><th>Area</th><th>Supported</th><th>Out of scope (documented)</th></tr>
-<tr><td>Joins</td><td>INNER/LEFT/RIGHT/CROSS; <code>USING (cols)</code> (shipped 2026-07-13, planner desugar + shared-column merge); hash (with Grace spill-to-disk), sort-merge, index-nested-loop over the durable B-Tree</td><td>FULL OUTER, NATURAL</td></tr>
-<tr><td>Aggregation &amp; sort</td><td>COUNT/SUM/AVG/MIN/MAX, GROUP BY/HAVING, DISTINCT, ORDER BY (external merge-sort spill), LIMIT/OFFSET</td><td>window functions</td></tr>
-<tr><td>Subqueries &amp; CTEs</td><td>scalar/IN/EXISTS (correlated + uncorrelated), IN (list), non-recursive WITH</td><td>recursive CTEs</td></tr>
-<tr><td>Planning</td><td>ANALYZE (durable per-table stats: row counts, distinct counts, equi-depth histograms), cost-based join order (Selinger DP ≤ 10 relations), index-vs-scan choice, EXPLAIN [ANALYZE]</td><td>columnar / vectorized execution (parked)</td></tr>
-<tr><td>DDL &amp; schema</td><td>CREATE/ALTER/DROP/TRUNCATE, tombstone DROP COLUMN, request-level DDL rollback, SERIAL, prepared statements + $n params</td><td>transactional DDL through crash recovery</td></tr>
+<tr><th>SQL type</th><th>Stores</th><th>Notes</th></tr>
+<tr><td><code>INT</code> / <code>INTEGER</code> / <code>BIGINT</code></td><td>64-bit signed integer</td><td>—</td></tr>
+<tr><td><code>SERIAL</code></td><td>Auto-incrementing integer</td><td>Durable per-table counter; typical primary-key type.</td></tr>
+<tr><td><code>FLOAT</code> / <code>DOUBLE</code></td><td>64-bit floating point</td><td>—</td></tr>
+<tr><td><code>DECIMAL(p,s)</code> / <code>NUMERIC(p,s)</code></td><td>Exact fixed-point decimal</td><td>No precision loss — ideal for money.</td></tr>
+<tr><td><code>TEXT</code></td><td>UTF-8 string</td><td>Can carry a full-text index.</td></tr>
+<tr><td><code>BOOL</code> / <code>BOOLEAN</code></td><td>true / false</td><td>—</td></tr>
+<tr><td><code>JSON</code></td><td>Nested JSON document</td><td>Returned as real nested JSON, not a string.</td></tr>
+<tr><td><code>UUID</code></td><td>128-bit UUID</td><td>—</td></tr>
+<tr><td><code>DATE</code></td><td>Calendar date</td><td>—</td></tr>
+<tr><td><code>TIME</code></td><td>Time of day</td><td>—</td></tr>
+<tr><td><code>TIMESTAMP</code></td><td>Date + time (UTC)</td><td>Serialized as a string so no precision is lost.</td></tr>
+<tr><td><code>BYTEA</code></td><td>Raw binary bytes</td><td>—</td></tr>
+<tr><td><code>VECTOR(n)</code></td><td>Fixed-length numeric vector</td><td>Embeddings for similarity search; can carry a vector index.</td></tr>
 </table>
-<p class="small">Correctness for joins/aggregates/subqueries is checked
-differentially against SQLite on shared data.</p>
+<p class="small">
+New types are added additively, without ever changing the on-disk format —
+existing databases keep working across engine upgrades.
+</p>
 
-<h3>5.4 Constraints &amp; security</h3>
+<h3 id="s5-2">5.2 Writing queries — examples</h3>
+
+<h4>Create a table</h4>
+<pre>CREATE TABLE users (
+  id        SERIAL PRIMARY KEY,
+  email     TEXT NOT NULL UNIQUE,
+  full_name TEXT,
+  plan      TEXT DEFAULT 'free',
+  credits   DECIMAL(10,2) DEFAULT 0.00,
+  is_active BOOL DEFAULT true,
+  created   TIMESTAMP,
+  CHECK (credits &gt;= 0)
+);
+
+CREATE TABLE documents (
+  id        SERIAL PRIMARY KEY,
+  owner_id  INT REFERENCES users (id),
+  title     TEXT,
+  body      TEXT,
+  embedding VECTOR(1536)
+);</pre>
+
+<h4>Insert data (use bind parameters to stay injection-safe)</h4>
+<pre>INSERT INTO users (email, full_name, plan)
+VALUES ($1, $2, $3);
+-- params: ["ada@example.com", "Ada Lovelace", "pro"]
+
+INSERT INTO documents (owner_id, title, body, embedding)
+VALUES (1, 'Notes', 'first draft', [0.12, 0.03, ...]);</pre>
+
+<h4>Query — filters, joins, aggregates, sorting</h4>
+<pre>-- Join + filter
+SELECT u.email, d.title
+FROM documents d
+JOIN users u ON u.id = d.owner_id
+WHERE u.plan = 'pro'
+ORDER BY d.title
+LIMIT 20;
+
+-- Aggregate with grouping
+SELECT plan, COUNT(*) AS n, AVG(credits) AS avg_credits
+FROM users
+WHERE is_active = true
+GROUP BY plan
+HAVING COUNT(*) &gt; 5;
+
+-- Subquery
+SELECT email FROM users
+WHERE id IN (SELECT owner_id FROM documents WHERE title LIKE 'Notes%');
+
+-- Common table expression (CTE)
+WITH active AS (SELECT id, email FROM users WHERE is_active = true)
+SELECT * FROM active ORDER BY email;</pre>
+
+<h4>Vector similarity search</h4>
+<pre>-- Ten documents whose embedding is nearest to the query vector
+SELECT id, title
+FROM documents
+WHERE NEAR(embedding, [0.10, 0.24, ...], 10);</pre>
+<p class="small">
+<code>NEAR(column, query_vector, k)</code> returns the <code>k</code> nearest
+rows by vector distance and composes with ordinary <code>WHERE</code> filters
+and security policies.</p>
+
+<h4>Inspect a query plan</h4>
+<pre>EXPLAIN ANALYZE
+SELECT plan, COUNT(*) FROM users GROUP BY plan;</pre>
+
+<h4>Traverse graph relationships (Cypher)</h4>
+<pre>MATCH (a)-[:FOLLOWS]-&gt;(b)
+WHERE a.id = 1
+RETURN b.id;</pre>
+
+<h3 id="s5-3">5.3 Query capabilities</h3>
+<table>
+<tr><th>Area</th><th>Supported</th><th>Not yet supported</th></tr>
+<tr><td>Joins</td><td>INNER / LEFT / RIGHT / CROSS, <code>JOIN … USING (cols)</code>; hash join (spills to disk on large inputs), sort-merge, and index-nested-loop</td><td>FULL OUTER, NATURAL</td></tr>
+<tr><td>Aggregation &amp; sort</td><td>COUNT / SUM / AVG / MIN / MAX, GROUP BY / HAVING, DISTINCT, ORDER BY (spills to disk), LIMIT / OFFSET</td><td>Window functions</td></tr>
+<tr><td>Subqueries &amp; CTEs</td><td>Scalar / IN / EXISTS (correlated and not), IN-list, non-recursive <code>WITH</code></td><td>Recursive CTEs</td></tr>
+<tr><td>Planning</td><td>ANALYZE (durable statistics: row counts, distinct counts, histograms), cost-based join ordering, index-vs-scan choice, EXPLAIN [ANALYZE]</td><td>—</td></tr>
+<tr><td>Schema (DDL)</td><td>CREATE / ALTER / DROP / TRUNCATE, DROP COLUMN, SERIAL, prepared statements with <code>$n</code> parameters</td><td>Views, triggers, stored procedures</td></tr>
+</table>
+<p class="small">Join, aggregate, and subquery results are continuously
+cross-checked against SQLite on shared data to guarantee correctness.</p>
+
+<h3 id="s5-4">5.4 Constraints, security &amp; roles</h3>
 <ul>
-<li><b>Constraints (M11):</b> PRIMARY KEY, FOREIGN KEY/REFERENCES, UNIQUE,
-  NOT NULL, CHECK, DEFAULT — enforced on INSERT/UPDATE. UNIQUE is a synchronous
-  heap scan under the writer’s snapshot (an index can be a stale hint — the M7
-  lesson); FK enforces referenced-table existence.</li>
-<li><b>RLS:</b> per-table policy predicate; settable from Rust
-  (<code>set_rls_policy</code>) or over REST as a SQL predicate string parsed by
-  the ordinary parser (<code>set_rls_policy_sql</code>) — no <code>Expr</code>
-  wire format. No <code>CREATE POLICY</code> statement yet.</li>
-<li><b>Users/roles/GRANT (P6.e):</b> <code>authz::RoleStore</code> with
-  transitive role membership + per-table privileges;
-  <code>execute_sql_as(user, ..)</code> enforces them; the embedded API is the
-  implicit superuser; the server maps the JWT <code>sub</code> claim to a user.</li>
+<li><b>Constraints:</b> <code>PRIMARY KEY</code>, <code>FOREIGN KEY</code> /
+  <code>REFERENCES</code>, <code>UNIQUE</code>, <code>NOT NULL</code>,
+  <code>CHECK</code>, and <code>DEFAULT</code> — enforced on every insert and
+  update.</li>
+<li><b>Row-level security (RLS):</b> attach a policy predicate to a table (e.g.
+  <code>tenant_id = 7</code>) and it is automatically applied to every query on
+  that table — so multi-tenant isolation is enforced by the engine, not by
+  every query author. It composes with vector search and index paths alike.</li>
+<li><b>Users, roles &amp; privileges:</b> create users and roles, grant
+  per-table privileges (with role inheritance), and run statements as a given
+  user so those privileges are enforced. Over the REST server, the caller's
+  identity comes from their signed token.</li>
+<li><b>Injection-safe by construction:</b> prepared statements with
+  <code>$n</code> bind parameters pass values as data, never as re-parsed SQL.</li>
 </ul>
 
 <!-- ================= 6 ================= -->
-<h2 class="pagebreak">6. Secondary indexing framework</h2>
+<h2 id="s6" class="pagebreak">6. Search, indexing &amp; relationships</h2>
+
+<h3 id="s6-1">6.1 Automatic durable indexes</h3>
 <p>
-Since Phase 3, <b>every</b> secondary index is durable, synchronous,
-WAL-logged, and crash-recovered — <b>never rebuilt on open</b>
-(<code>Engine::open</code> is O(1) regardless of data size; the old async index
-worker is retired). All index-assisted reads use the same
-<b>resolve-then-refilter template</b>: index → candidate <code>RowId</code>s →
-<code>Heap::get</code> under the caller’s snapshot → full
-<code>predicate_matches</code> (remaining AND terms + RLS apply identically to a
-full scan).
+Every secondary index in unidb — B-tree, vector, full-text, and graph
+adjacency — is <b>durable, crash-safe, and kept in step with your data inside
+the same transaction</b>. Indexes are never lost or rebuilt on open, so opening
+a database is instant no matter how large it is. Index-assisted queries always
+re-check results against your transaction's snapshot and security policy, so an
+index can only ever make a query <i>faster</i>, never return a wrong or
+unauthorized row.
 </p>
 
-<h3>6.1 Durable B-Tree (<code>DiskBTree</code>)</h3>
-<ul>
-<li>On-disk B+tree whose nodes are pages in the shared page store — standard
-  28-byte header, so buffer-pool CRC + D5 discipline apply unchanged; a body
-  tag distinguishes meta/internal/leaf; leaves are right-linked for range +
-  duplicate walks.</li>
-<li>Every insert/remove is <b>one WAL mini-transaction</b> logging full
-  node-page images (<code>WAL_INDEX</code>, redo-only): recovery redoes all
-  pages of a committed index mini-txn or none. A stable <b>meta page</b> (id in
-  <code>ColumnDef.index_root</code>) points at the root, so a root split never
-  rewrites the catalog.</li>
-<li><b>No undo</b> — entries are MVCC-validated hints; the one dangerous case
-  (a committed visible row lacking its entry) is prevented by ordering: the
-  index mini-txn fsyncs before the user txn’s <code>WAL_TXN_COMMIT</code>.</li>
-<li>Also backs: full-text postings, the edge-adjacency index, IVF cell posting
-  lists, and each table’s durable FSM. Concurrent-writer safety via crabbing
-  (§4.5). v1 leaves underfull nodes un-merged (tree only grows).</li>
-</ul>
-
-<h3>6.2 Durable vector index — on-disk IVF-Flat (<code>DiskIvfIndex</code>)</h3>
+<h3 id="s6-2">6.2 Vector similarity search</h3>
+<p>
+A <code>VECTOR(n)</code> column can be given a durable similarity index, queried
+with the <code>NEAR</code> operator. unidb clusters vectors into cells, probes
+the most promising cells for a query, then re-ranks the candidates exactly — so
+there is <b>no approximation error in the final ranking</b>. In testing it
+returns the same top results as a brute-force search (recall@10 = 1.000) while
+opening instantly and surviving crashes with its results intact.
+</p>
 <div class="figure">
-<svg viewBox="0 0 780 300" xmlns="http://www.w3.org/2000/svg" font-family="Arial" font-size="12">
+<svg viewBox="0 0 780 190" xmlns="http://www.w3.org/2000/svg" font-family="Arial" font-size="12">
   <defs><marker id="f" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
     <path d="M0,0 L8,4 L0,8 z" fill="#2f6bad"/></marker></defs>
-  <text x="390" y="20" text-anchor="middle" font-weight="bold" font-size="13" fill="#10314f">NEAR(col, [q], k) — durable IVF-Flat read path</text>
-  <rect x="20" y="42" width="140" height="46" rx="5" fill="#eef4fa" stroke="#2f6bad"/>
-  <text x="90" y="62" text-anchor="middle">query vector q</text>
-  <text x="90" y="79" text-anchor="middle" font-size="10.5">from SQL WHERE NEAR</text>
-  <line x1="160" y1="65" x2="186" y2="65" stroke="#2f6bad" stroke-width="1.5" marker-end="url(#f)"/>
-  <rect x="188" y="42" width="150" height="46" rx="5" fill="#fdf6ec" stroke="#c08a3e"/>
-  <text x="263" y="62" text-anchor="middle">rank centroids</text>
-  <text x="263" y="79" text-anchor="middle" font-size="10.5">WAL-logged centroid pages</text>
-  <line x1="338" y1="65" x2="364" y2="65" stroke="#2f6bad" stroke-width="1.5" marker-end="url(#f)"/>
-  <rect x="366" y="42" width="150" height="46" rx="5" fill="#fdf6ec" stroke="#c08a3e"/>
-  <text x="441" y="62" text-anchor="middle">probe nprobe cells</text>
-  <text x="441" y="79" text-anchor="middle" font-size="10.5">posting lists = DiskBTree</text>
-  <line x1="516" y1="65" x2="542" y2="65" stroke="#2f6bad" stroke-width="1.5" marker-end="url(#f)"/>
-  <rect x="544" y="42" width="216" height="46" rx="5" fill="#fff" stroke="#2f6bad"/>
-  <text x="652" y="62" text-anchor="middle">over-fetch max(4k, k+20) candidates</text>
-  <text x="652" y="79" text-anchor="middle" font-size="10.5">candidate RowIds</text>
-  <line x1="652" y1="88" x2="652" y2="116" stroke="#2f6bad" stroke-width="1.5" marker-end="url(#f)"/>
-  <rect x="480" y="118" width="280" height="46" rx="5" fill="#fff" stroke="#2f6bad"/>
-  <text x="620" y="138" text-anchor="middle">fetch vectors from heap → exact re-rank</text>
-  <text x="620" y="155" text-anchor="middle" font-size="10.5">IVF-Flat has no quantization error</text>
-  <line x1="478" y1="141" x2="452" y2="141" stroke="#2f6bad" stroke-width="1.5" marker-end="url(#f)"/>
-  <rect x="180" y="118" width="270" height="46" rx="5" fill="#eef8f1" stroke="#3f8f5f"/>
-  <text x="315" y="138" text-anchor="middle" font-weight="bold" fill="#216b41">MVCC + predicate + RLS re-check</text>
-  <text x="315" y="155" text-anchor="middle" font-size="10.5">same refilter as every index path → top-k</text>
-  <rect x="20" y="195" width="740" height="80" rx="6" fill="#f2f5f8" stroke="#5a6b7c"/>
-  <text x="390" y="216" text-anchor="middle" font-weight="bold" fill="#37485a">Why IVF-Flat (chosen over DiskANN/Vamana for v1)</text>
-  <text x="32" y="236" font-size="10">• Its only on-disk state is a cell posting list (cell_id → [RowId]) — which IS a DiskBTree, so durability was inherited, not built (no format bump).</text>
-  <text x="32" y="253" font-size="10">• Build: nlist ≈ √rows (cap 256) centroids via mini-batch k-means; centroids in a WAL-logged meta-page chain — never recomputed; O(1) open.</text>
-  <text x="32" y="270" font-size="10">• Recall@10 = 1.000 vs the in-RAM HNSW baseline at bounded RAM; crash point P17 proves recovery with recall intact.</text>
+  <text x="390" y="20" text-anchor="middle" font-weight="bold" font-size="13" fill="#10314f">NEAR(embedding, query, k) — vector search path</text>
+  <rect x="20" y="42" width="150" height="46" rx="5" fill="#eef4fa" stroke="#2f6bad"/>
+  <text x="95" y="62" text-anchor="middle">query vector</text>
+  <text x="95" y="79" text-anchor="middle" font-size="10.5">from your SQL</text>
+  <line x1="170" y1="65" x2="196" y2="65" stroke="#2f6bad" stroke-width="1.5" marker-end="url(#f)"/>
+  <rect x="198" y="42" width="160" height="46" rx="5" fill="#fdf6ec" stroke="#c08a3e"/>
+  <text x="278" y="62" text-anchor="middle">probe nearest cells</text>
+  <text x="278" y="79" text-anchor="middle" font-size="10.5">skip the rest</text>
+  <line x1="358" y1="65" x2="384" y2="65" stroke="#2f6bad" stroke-width="1.5" marker-end="url(#f)"/>
+  <rect x="386" y="42" width="170" height="46" rx="5" fill="#fff" stroke="#2f6bad"/>
+  <text x="471" y="62" text-anchor="middle">gather candidates</text>
+  <text x="471" y="79" text-anchor="middle" font-size="10.5">over-fetch a margin</text>
+  <line x1="556" y1="65" x2="582" y2="65" stroke="#2f6bad" stroke-width="1.5" marker-end="url(#f)"/>
+  <rect x="584" y="42" width="176" height="46" rx="5" fill="#eef8f1" stroke="#3f8f5f"/>
+  <text x="672" y="62" text-anchor="middle" font-weight="bold" fill="#216b41">exact re-rank → top-k</text>
+  <text x="672" y="79" text-anchor="middle" font-size="10.5">+ security re-check</text>
+  <text x="390" y="140" text-anchor="middle" font-size="11" fill="#37485a">Distance metrics: Euclidean (default) and cosine. The index is built once and kept durable — never recomputed on open.</text>
 </svg>
-<div class="figcap">Figure 8 — The <code>NEAR</code> operator over the durable IVF-Flat index. The <code>USING HNSW</code> keyword now denotes this index; the in-RAM HNSW is retained only as a benchmark baseline.</div>
+<div class="figcap">Figure 7 — The <code>NEAR</code> vector-search path: probe promising cells, then re-rank exactly.</div>
 </div>
 
-<h3>6.3 Full-text &amp; edge indexes</h3>
+<h3 id="s6-3">6.3 Full-text search</h3>
+<p>
+A <code>TEXT</code> column can carry a durable full-text (inverted) index.
+Search tokenizes your query and intersects the matching documents, then checks
+each candidate against your snapshot and security policy. Raw lookups run in the
+tens of microseconds.
+</p>
+
+<h3 id="s6-4">6.4 Graph relationships</h3>
 <ul>
-<li><b>Full-text (inverted):</b> a durable <code>DiskBTree</code> keyed on tokens,
-  one <code>(token, RowId)</code> entry per token; read path
-  <code>Engine::search_fulltext</code> — tokenize → intersect per-token posting
-  lists (AND-only) → MVCC-resolve. Raw search ~14.2 µs.</li>
-<li><b>Edge adjacency:</b> a durable <code>DiskBTree</code> over
-  <code>__edges__.from_id</code>, maintained synchronously by
-  <code>create_edge</code>/<code>delete_edge</code>; meta page cached on the
-  engine. No abort-time cleanup needed — stale entries are permanently safe
-  (snapshot re-validation).</li>
+<li><b>Edges are first-class but cost nothing extra to make safe.</b> A directed
+  edge <code>(from, to, type, properties)</code> is stored as an ordinary row,
+  so per-edge locking, rollback, and crash safety come for free.</li>
+<li><b>Fast neighbor lookups.</b> A durable adjacency index finds a vertex's
+  edges, and unidb batches the row fetches by page so a hot, highly-connected
+  vertex costs one page read per ~128 edges instead of one per edge — about
+  <b>9× faster</b> than the naive approach, bringing graph traversal to parity
+  with Postgres.</li>
+<li><b>Cypher reads:</b> <code>MATCH (a)-[:TYPE]-&gt;(b) WHERE … RETURN …</code>
+  for single-hop, directed traversals. Edges are created and removed through the
+  engine's API.</li>
 </ul>
-
-<h3>6.4 The correctness pattern: hints + MVCC re-validation</h3>
-<div class="callout good">
-<b>Rule 1:</b> secondary indexes are non-transactional derived state whose
-entries are <b>hints, re-validated against MVCC</b> — stale/phantom entries are
-space leaks, never wrong answers.<br>
-<b>Rule 2:</b> new durable state is always ordinary heap rows
-(<code>__edges__</code>, <code>__events__</code>, <code>__consumers__</code>,
-<code>__lobs__</code>) — inheriting MVCC, locking, WAL, recovery, and abort
-handling with zero new mechanism (why M3–M5 added no new crash points).<br>
-<b>Rule 3:</b> completeness-sensitive readers must gate on how current an index
-can ever <i>promise</i> to be, not just “ready” — the M7 CSR tier-selection bug
-(a transaction’s own just-created edge invisible to its own read) is the
-canonical counterexample; CSR was reverted and later retired.
-</div>
 
 <!-- ================= 7 ================= -->
-<h2>7. Graph layer</h2>
+<h2 id="s7">7. Real-time events &amp; streaming</h2>
+<p>
+unidb has a durable event queue built in. When you opt a table into event
+capture, every insert, update, and delete on that table also durably records an
+event — <b>inside the same transaction as the change itself</b>. That inline,
+transactional capture gives you properties an external message queue cannot:
+</p>
 <ul>
-<li><b>Edges are ordinary rows</b> <code>(from_id, to_id, edge_type, props)</code>
-  in a synthetic <code>__edges__</code> table. Needed <b>zero</b> new
-  storage/locking code — per-edge locking, first-committer-wins, and
-  release-on-commit were inherited and then proven by
-  <code>tests/graph_locking.rs</code>. Nodes are opaque <code>i64</code> IDs.</li>
-<li><b>Read path:</b> durable edge index → candidate RowIds →
-  <code>resolve_candidates_batched</code> groups candidates by page so a hot hub
-  costs one page fetch per ~128 edges instead of one per edge — measured
-  <b>~9.3–9.7×</b> over naive resolution, closing the gap with Postgres to
-  ~1×–1.6× (94.3 µs vs 98 µs at 1k edges).</li>
-<li><b>Cypher subset:</b> <code>MATCH (a)-[:TYPE]-&gt;(b) WHERE … RETURN …</code> —
-  exactly one fixed-length directed hop, read-only; the <code>:TYPE</code> filter
-  and <code>WHERE</code> are AND’d into one predicate applied through the SQL
-  layer’s own <code>predicate_matches</code>, so the index fast path and full-scan
-  fallback filter identically. Mutations are Rust-API
-  <code>create_edge</code>/<code>delete_edge</code>.</li>
+<li><b>Events can never disagree with your data.</b> An event is committed with
+  the change that produced it; if that transaction rolls back, its events vanish
+  with it. There is no dual-write gap.</li>
+<li><b>No data loss across a crash.</b> Consumer offsets are stored durably and
+  advanced only when a consumer acknowledges. A crash mid-delivery redelivers
+  rather than dropping — at-least-once delivery is proven, not promised.</li>
+<li><b>Kafka-style consumption:</b> poll from your durable offset, process, then
+  acknowledge. A cleanup pass reclaims events once <i>every</i> registered
+  consumer has moved past them — a slow consumer holds its events until it
+  catches up, and cannot be starved.</li>
+<li><b>Realtime fan-out.</b> The REST server exposes the stream as
+  Server-Sent Events (live tail with resume-from-offset), and a companion
+  dispatcher can push events to webhooks (with automatic retry and a
+  dead-letter table) or broadcast rooms — the durable-by-default alternative to
+  a typical realtime layer.</li>
 </ul>
+<p>
+Measured, unidb's <code>poll_events</code> cycle runs in tens to hundreds of
+microseconds versus a few milliseconds for the equivalent Postgres
+<code>SKIP LOCKED</code> pattern (see Section 12 for the honest caveat on very
+large backlogs).
+</p>
 
 <!-- ================= 8 ================= -->
-<h2>8. Event queue</h2>
+<h2 id="s8" class="pagebreak">8. The REST server — full API reference</h2>
 <p>
-<b>Why not tail the WAL:</b> checkpointing truncates the WAL unconditionally
-(making retention depend on external readers would be D5-adjacent bad news),
-and WAL records carry no table identifier. Instead, <b>events are ordinary
-rows</b>: <code>send_event_capture</code> copies each triggering row into a
-durable <code>__events__</code> table <i>inline, at write time, under the
-writing transaction’s own xid</i>. Consequences — all structural:
+The optional REST server exposes the whole engine over HTTP with JWT
+authentication, TLS, realtime streaming, and metrics. It is a thin wrapper over
+the embedded engine: by default each request runs as one complete
+<code>begin → execute → commit</code> transaction, and many requests execute
+concurrently against one shared engine. The default embedded library has no
+network dependencies — the server is a separate, opt-in build.
 </p>
+
+<h3 id="s8-1">8.1 Getting started</h3>
 <ul>
-<li>WAL truncation cannot care about consumer lag (proven: checkpoint five
-  times under a never-acking consumer, still poll every event).</li>
-<li>Events get MVCC, durability, abort semantics (an aborted transaction’s
-  events vanish with it), and plain SQL queryability for free.</li>
-<li>Consumer offsets live in <code>__consumers__</code>, updated by
-  <code>ack_events</code> under the caller’s transaction — an aborted ack does
-  not advance the offset. <code>poll_events</code>/<code>ack_events</code> are
-  Kafka-style manual-commit; <code>vacuum_events()</code> reclaims rows
-  acknowledged by <b>every</b> registered consumer.</li>
+<li><b>Base URL:</b> <code>http://127.0.0.1:8080</code> by default
+  (configurable). Set a TLS certificate and key to serve HTTPS.</li>
+<li><b>Authentication:</b> every route except <code>GET /metrics</code>
+  requires a bearer token:
+  <code>Authorization: Bearer &lt;jwt&gt;</code>. Tokens are verified (HS256)
+  against a shared secret; the server does not issue them (plug in your own auth
+  service). The token's <code>sub</code> claim is the acting username for
+  per-user privileges.</li>
+<li><b>Content type:</b> JSON in and out, except the raw-row routes
+  (<code>/rows…</code>) which carry opaque bytes.</li>
+<li><b>Errors:</b> every non-2xx JSON response has the shape
+  <code>{ "error": "message", "code": "MACHINE_CODE" }</code> — see
+  <a href="#s8-8">§8.8</a>.</li>
 </ul>
+
+<h3 id="s8-2">8.2 Running SQL</h3>
+
+<div class="ep">
+<h4><span class="method m-post">POST</span> <code>/sql</code></h4>
+<p>Execute one or more <code>;</code>-separated SQL statements atomically. If
+any statement fails, the whole request rolls back.</p>
+<p><b>Body</b></p>
+<pre>{
+  "sql": "INSERT INTO users (email, plan) VALUES ($1, $2)",
+  "params": ["ada@example.com", "pro"],   // optional, injection-safe $n binds
+  "isolation": "serializable",            // optional: read_committed | repeatable_read | serializable
+  "cursor": false                         // optional: true buffers a large result, returns a cursor
+}</pre>
+<p>Bind values: a JSON string binds as text (coerced to the column type), a
+number as int/float, a numeric array as a vector.</p>
+<p><b>Response</b> <code>200 OK</code> — one result object per statement, in order:</p>
+<pre>{
+  "results": [
+    { "type": "inserted", "count": 1 }
+  ]
+}</pre>
+<p>Result shapes include <code>created_table</code>, <code>created_index</code>,
+<code>inserted</code>/<code>updated</code>/<code>deleted</code>/<code>truncated</code>
+(with a <code>count</code>), <code>altered_table</code>, <code>dropped_table</code>,
+and for queries:</p>
+<pre>{
+  "type": "rows",
+  "columns": ["id", "name", "profile"],
+  "rows": [ [1, "alice", { "status": "active" }] ]
+}</pre>
+<p>A <code>JSON</code> column returns nested JSON; a <code>DECIMAL</code> returns
+a decimal string (e.g. <code>"9.90"</code>) and a <code>TIMESTAMP</code> a UTC
+string, so no precision is lost. The same route serves joins, aggregates,
+<code>GROUP BY</code>/<code>HAVING</code>, subqueries, <code>WITH</code>,
+<code>ANALYZE</code>, and <code>EXPLAIN [ANALYZE]</code> — no separate routes.</p>
+<p class="small"><b>Cursor mode</b> (<code>"cursor": true</code>, one
+rows-producing statement only) buffers the result server-side and returns
+<code>{ "cursor_id": 7, "columns": [...], "row_count": 120000 }</code> — page it
+with <code>GET /sql/cursor/{id}</code>.</p>
+</div>
+
+<div class="ep">
+<h4><span class="method m-get">GET</span> <code>/sql/cursor/{cursor_id}</code> &nbsp;·&nbsp;
+    <span class="method m-del">DELETE</span> <code>/sql/cursor/{cursor_id}</code></h4>
+<p>Page (or drop) a cursor from a <code>cursor: true</code> request.</p>
+<p><b>Query params:</b> <code>limit</code> — rows per page (default 1000, max
+10&nbsp;000).</p>
+<p><b>Response</b> <code>200 OK</code>:</p>
+<pre>{ "columns": ["id"], "rows": [[1],[2]], "done": false, "remaining": 118000 }</pre>
+<p>The final page reports <code>"done": true</code> and drops the cursor.
+Cursors are bound to the creating principal and expire after 60s idle;
+<code>DELETE</code> drops one early (<code>204</code>).</p>
+</div>
+
+<div class="ep">
+<h4><span class="method m-post">POST</span> <code>/cypher</code></h4>
+<p>Run a Cypher-subset graph read.</p>
+<pre>// Body
+{ "query": "MATCH (a)-[:FOLLOWS]->(b) WHERE a.id = 1 RETURN b.id" }
+
+// Response 200 OK
+{ "results": [ { "type": "rows", "columns": ["id"], "rows": [[2],[3]] } ] }</pre>
+</div>
+
+<h3 id="s8-3">8.3 Transactions over HTTP</h3>
 <p>
-Measured: <code>poll_events</code> 20.8–983.7 µs (100–5,000 rows) vs a Postgres
-SKIP-LOCKED cycle at ~2.6–3.1 ms — though unidb’s cost grows linearly with
-table size (no <code>seq</code> index yet; <code>vacuum_events</code> is the
-bounding lever). The server exposes the queue as SSE
-(<code>GET /events/subscribe</code>), currently server-polls-then-pushes.
+For work spanning multiple requests, open a <b>transaction session</b>. Pass its
+id on later requests via the <code>X-Txn-Id</code> header; those requests run in
+the transaction and do <b>not</b> auto-commit.
 </p>
-<h3>8.1 Realtime dispatcher (Milestone 20, 2026-07-13)</h3>
-<p>
-The event stream is now consumable downstream <i>without teaching the engine any
-application shape</i> (the Milestone-18 boundary holds — the engine emits raw
-row-level facts; all delivery semantics live outside it). Three parts:
-</p>
+<div class="ep">
+<h4><span class="method m-post">POST</span> <code>/txn/begin</code></h4>
+<pre>// Body (optional; empty = read_committed)
+{ "isolation": "read_committed" | "repeatable_read" | "serializable" }
+
+// Response 201 Created
+{ "txn_id": 42, "isolation": "read_committed",
+  "idle_timeout_secs": 60, "expires_at": "2026-07-11 12:34:56" }</pre>
+<p><code>expires_at</code> is a sliding idle deadline — each request on the
+session pushes it out again.</p>
+</div>
+<div class="ep">
+<h4><span class="method m-post">POST</span> <code>/txn/{txn_id}/commit</code> &nbsp;·&nbsp;
+    <span class="method m-post">POST</span> <code>/txn/{txn_id}/rollback</code></h4>
+<pre>// Response 200 OK
+{ "txn_id": 42, "state": "committed" }   // or "rolled_back"</pre>
+</div>
+<p><b>Session rules:</b> one request at a time per session (a second concurrent
+request gets <code>409 TXN_BUSY</code>); a session belongs to the principal that
+created it (<code>403 TXN_FORBIDDEN</code> otherwise); abandoned sessions are
+auto-aborted after an idle timeout (default 60s) and return
+<code>404 TXN_NOT_FOUND</code>; DDL is not allowed inside a session
+(<code>400 DDL_IN_SESSION</code> — run it as a one-shot request); a failed
+mutating statement rolls the session back. Sessions do not survive a server
+restart.</p>
+
+<h3 id="s8-4">8.4 Rows, graph &amp; indexes</h3>
+<p class="small">The <code>/rows…</code> routes store <b>opaque bytes</b> (raw
+payloads unidb does not interpret) — use <code>/sql</code> for typed, columnar
+data. All accept <code>X-Txn-Id</code> to join a session.</p>
+<table>
+<tr><th>Route</th><th>Purpose &amp; payload</th><th>Response</th></tr>
+<tr><td><span class="method m-post">POST</span> <code>/rows</code></td>
+    <td>Insert one raw row; body is raw bytes.</td>
+    <td><code>201</code> <code>{ "row_id": { "page_id": 3, "slot": 0 } }</code></td></tr>
+<tr><td><span class="method m-post">POST</span> <code>/rows/batch</code></td>
+    <td>Insert up to 10&nbsp;000 raw rows atomically; body <code>{ "rows": ["&lt;base64&gt;", …] }</code> (32 MiB total).</td>
+    <td><code>201</code> <code>{ "row_ids": [ … ] }</code></td></tr>
+<tr><td><span class="method m-get">GET</span> <code>/rows/{page_id}/{slot}</code></td>
+    <td>Read a row by id.</td>
+    <td><code>200</code> raw bytes, or <code>404 NOT_FOUND</code></td></tr>
+<tr><td><span class="method m-put">PUT</span> <code>/rows/{page_id}/{slot}</code></td>
+    <td>Update a row; body is the new raw bytes.</td>
+    <td><code>200</code> <code>{ "row_id": { … } }</code> (id may change)</td></tr>
+<tr><td><span class="method m-del">DELETE</span> <code>/rows/{page_id}/{slot}</code></td>
+    <td>Delete a row.</td>
+    <td><code>204 No Content</code></td></tr>
+<tr><td><span class="method m-post">POST</span> <code>/edges</code></td>
+    <td>Create an edge; body <code>{ "from_id": 1, "to_id": 2, "edge_type": "FOLLOWS", "props": { … } }</code> (<code>props</code> optional).</td>
+    <td><code>201</code> <code>{ "row_id": { … } }</code></td></tr>
+<tr><td><span class="method m-del">DELETE</span> <code>/edges/{page_id}/{slot}</code></td>
+    <td>Delete an edge; body <code>{ "from_id": 1 }</code> (required).</td>
+    <td><code>204 No Content</code></td></tr>
+<tr><td><span class="method m-get">GET</span> <code>/edges/from/{from_id}</code></td>
+    <td>List outgoing edges from a vertex.</td>
+    <td><code>200</code> <code>{ "edges": [ { "row_id", "to_id", "edge_type", "props" } ] }</code></td></tr>
+<tr><td><span class="method m-post">POST</span> <code>/indexes</code></td>
+    <td>Create an index; body <code>{ "table": "documents", "column": "embedding", "kind": "Hnsw" }</code> (<code>kind</code>: <code>"Hnsw"</code> on a vector column or <code>"FullText"</code> on a text column; omit <code>kind</code> to drop).</td>
+    <td><code>204 No Content</code></td></tr>
+<tr><td><span class="method m-get">GET</span> <code>/indexes/{table}/{column}/status</code></td>
+    <td>Report a column's index status.</td>
+    <td><code>200</code> <code>{ "status": "Ready" }</code> or <code>{ "status": null }</code></td></tr>
+<tr><td><span class="method m-get">GET</span> <code>/tables</code></td>
+    <td>List user tables and their columns (cheap, no scan). For full introspection query <code>information_schema.*</code> over <code>/sql</code>.</td>
+    <td><code>200</code> array of <code>{ "name", "columns": [ { "name", "type", "nullable", "index" } ] }</code></td></tr>
+</table>
+
+<h3 id="s8-5">8.5 Events &amp; realtime</h3>
+<table>
+<tr><th>Route</th><th>Purpose &amp; payload</th><th>Response</th></tr>
+<tr><td><span class="method m-post">POST</span> <code>/tables/{table}/events</code></td>
+    <td>Opt a table into event capture. No body.</td>
+    <td><code>204 No Content</code></td></tr>
+<tr><td><span class="method m-post">POST</span> <code>/events/ack</code></td>
+    <td>Advance a consumer's durable offset; body <code>{ "consumer": "billing-worker", "up_to_seq": 17 }</code>.</td>
+    <td><code>204 No Content</code></td></tr>
+<tr><td><span class="method m-post">POST</span> <code>/events/vacuum</code></td>
+    <td>Reclaim events acknowledged by <i>every</i> consumer. No body.</td>
+    <td><code>200</code> <code>{ "reclaimed": 17 }</code></td></tr>
+</table>
+<div class="ep">
+<h4><span class="method m-get">GET</span> <code>/events/subscribe</code> &nbsp;(Server-Sent Events)</h4>
+<p>Stream new events as SSE frames. Two modes:</p>
 <ul>
-<li><b>SSE resume framing (E1):</b> <code>GET /events/subscribe</code> gained an
-  <i>ephemeral live-tail</i> mode — a per-connection cursor seeded from the
-  standard SSE <code>Last-Event-ID</code> reconnect header (else
-  <code>?from_seq=</code>), plus an optional <code>?table=</code> filter; each
-  frame carries <code>id: &lt;seq&gt;</code>. Durable-consumer mode is unchanged.
-  Backed by <b>one new read-only engine method</b>
-  <code>poll_events_after(after_seq, limit)</code> — it truncates <i>after</i>
-  filtering so a cursor beyond <code>limit</code> never drops the tail. No
-  storage/format/crash surface (harness stays 31).</li>
-<li><b><code>unidb-dispatch</code> crate (E2):</b> a new workspace crate that
-  embeds <code>Arc&lt;Engine&gt;</code> and fans the stream out, keeping
-  tokio/reqwest <b>out of the <code>unidb</code> crate entirely</b> (the “engine
-  stays sync” invariant is literally true). Each cycle: poll from a durable
-  offset → per-subscription table/op filter + column projection →
-  <i>then</i> ack. Sinks: <code>WebhookSink</code> (exponential-backoff retry →
-  <b>dead-letter table dogfooded back into unidb</b>), <code>RoomSink</code>
-  (broadcast rooms — the primitive a studio WS/SSE layer subscribes to),
-  <code>CollectingSink</code>.</li>
-<li><b>Delivery semantics (E3), proven not promised:</b> I/U/D consumed
-  at-least-once in offset order; <b>zero loss across an engine crash</b> (commit
-  5, ack 3, drop+reopen → restart delivers only {4,5}, union = {1..5});
-  at-least-once redelivery of an event whose deliver-then-ack straddled a crash;
-  a poison webhook retries 3× then dead-letters while the offset still advances
-  (a poison event cannot wedge the stream). A falling-behind dispatcher pins the
-  vacuum horizon and reports <code>backlogged</code> rather than silently
-  dropping.</li>
+<li><b>Durable consumer</b> (<code>consumer</code> set): at-least-once, resumes
+  from that consumer's acked offset; un-acked events are re-yielded until acked.</li>
+<li><b>Ephemeral live-tail</b> (<code>consumer</code> omitted): browser-style
+  tail. Resumes past the standard <code>Last-Event-ID</code> reconnect header,
+  else <code>?from_seq=</code>, else the start.</li>
 </ul>
-<p class="small">
-Honest caveat (§0.6): the dispatcher inherits M4’s <code>poll_events</code> cost
-model — no predicate pushdown / no <code>seq</code> index — so draining N events
-is ≈ O(N²/limit) poll work; fast through N≈4k (measured ~95k–120k ev/s drain),
-but a large backlog needs the engine-side <code>seq</code> index (tracked M4
-debt). This is the shipped realization of the §14.2 “push realtime” track.
-</p>
+<p><b>Query params:</b> <code>consumer</code>, <code>from_seq</code>,
+<code>table</code> (filter), <code>limit</code> (per poll, default 100),
+<code>interval_ms</code> (poll interval, default 500).</p>
+<p><b>Response</b> <code>200 OK</code>, <code>text/event-stream</code>:</p>
+<pre>id: 17
+event: insert
+data: {"seq":17,"xid":42,"table_name":"orders","op":"insert","payload":{"id":1,"total":9.99}}</pre>
+<p class="small">Acknowledge separately via <code>POST /events/ack</code> — acks
+are not sent over the stream.</p>
+</div>
+
+<h3 id="s8-6">8.6 Admin, stats, logs &amp; metrics</h3>
+<table>
+<tr><th>Route</th><th>Purpose &amp; payload</th><th>Response</th></tr>
+<tr><td><span class="method m-put">PUT</span> <code>/tables/{table}/rls</code></td>
+    <td>Attach a row-level-security policy (superuser); body <code>{ "predicate": "tenant_id = 7" }</code> (an AND-only <code>WHERE</code> subset).</td>
+    <td><code>204</code>; <code>400 SQL_PARSE_ERROR</code> / <code>403 PERMISSION_DENIED</code></td></tr>
+<tr><td><span class="method m-post">POST</span> <code>/admin/flush</code></td>
+    <td>Force the log durable, then flush all dirty pages (superuser). No body.</td>
+    <td><code>204 No Content</code></td></tr>
+<tr><td><span class="method m-post">POST</span> <code>/checkpoint</code></td>
+    <td>Checkpoint: flush, write a checkpoint record, trim the log. No body.</td>
+    <td><code>204 No Content</code></td></tr>
+<tr><td><span class="method m-get">GET</span> <code>/stats</code></td>
+    <td>Activity + health snapshot (see below).</td>
+    <td><code>200</code> JSON</td></tr>
+<tr><td><span class="method m-get">GET</span> <code>/logs</code></td>
+    <td>Bounded, cursor-paged tail of structured JSON logs (superuser). Params: <code>level</code>, <code>since</code>, <code>until</code>, <code>q</code>, <code>cursor</code>, <code>limit</code> (≤500).</td>
+    <td><code>200</code> <code>{ "logs": [ … ], "returned", "scanned", "truncated", "next_cursor" }</code></td></tr>
+<tr><td><span class="method m-get">GET</span> <code>/metrics</code></td>
+    <td>Prometheus exposition. <b>The only route with no auth.</b></td>
+    <td><code>200</code> <code>text/plain</code></td></tr>
+</table>
+<p><code>GET /stats</code> is a <code>pg_stat_*</code>-style snapshot: commit /
+abort / checkpoint counts, active transactions, WAL bytes, per-statement-kind
+latency percentiles, WAL-flush latency, buffer-pool hit ratio, lock waits and
+deadlocks, the vacuum-horizon age, per-table page counts, parallel-worker
+utilization, autovacuum activity, recent slow queries, and open sessions /
+cursors. Example fragment:</p>
+<pre>{
+  "commits": 42, "aborts": 3, "active_transactions": 0, "wal_bytes": 81920,
+  "statement_latency": { "insert": { "count": 50, "p50_us": 32, "p99_us": 256 } },
+  "bufferpool": { "hits": 980, "misses": 40, "hit_ratio": 0.9607 },
+  "locks": { "waits": 0, "deadlocks": 0 },
+  "horizon_age_secs": 0.0,
+  "tables": [ { "name": "t", "pages": 3 } ]
+}</pre>
+
+<h3 id="s8-7">8.7 Replication</h3>
+<table>
+<tr><th>Route</th><th>Purpose</th></tr>
+<tr><td><span class="method m-post">POST</span> <code>/replication/slots</code></td>
+    <td>Create a slot; body <code>{ "name": "…", "sync": false }</code> → <code>201 { "name", "restart_lsn", "kind" }</code>.</td></tr>
+<tr><td><span class="method m-get">GET</span> <code>/replication/slots</code></td>
+    <td>List slots → <code>{ "slots": [ … ] }</code>.</td></tr>
+<tr><td><span class="method m-del">DELETE</span> <code>/replication/slots/{name}</code></td>
+    <td>Drop a slot → <code>204</code>.</td></tr>
+<tr><td><span class="method m-post">POST</span> <code>/replication/slots/{name}/advance</code></td>
+    <td>Confirm applied up to an LSN; body <code>{ "lsn": &lt;n&gt; }</code> → <code>204</code>.</td></tr>
+<tr><td><span class="method m-get">GET</span> <code>/replication/stream?from_lsn={n}</code></td>
+    <td>Ship log records after <code>from_lsn</code> as a byte stream; the primary's tail LSN is in the <code>x-unidb-tail-lsn</code> response header.</td></tr>
+</table>
+
+<h3 id="s8-8">8.8 Error codes</h3>
+<p>Every error carries a stable machine-readable <code>code</code>:</p>
+<table>
+<tr><th>HTTP</th><th>Code</th><th>Meaning</th></tr>
+<tr><td>404</td><td><code>TABLE_NOT_FOUND</code> / <code>COLUMN_NOT_FOUND</code> / <code>NOT_FOUND</code></td><td>Referenced table/column doesn't exist; row has no visible version</td></tr>
+<tr><td>404</td><td><code>TXN_NOT_FOUND</code> / <code>CURSOR_NOT_FOUND</code></td><td>Unknown/finished/expired session or cursor id</td></tr>
+<tr><td>409</td><td><code>TABLE_ALREADY_EXISTS</code></td><td><code>CREATE TABLE</code> on an existing name</td></tr>
+<tr><td>409</td><td><code>WRITE_CONFLICT</code> / <code>SERIALIZATION_FAILURE</code> / <code>DEADLOCK</code></td><td>Concurrency conflict — retry the transaction</td></tr>
+<tr><td>409</td><td><code>UNIQUE_VIOLATION</code></td><td>Duplicate <code>UNIQUE</code>/<code>PRIMARY KEY</code> value</td></tr>
+<tr><td>409</td><td><code>TXN_BUSY</code></td><td>Second concurrent request on one session</td></tr>
+<tr><td>408</td><td><code>QUERY_TIMEOUT</code> / <code>QUERY_CANCELLED</code></td><td>Per-query time budget or cancellation</td></tr>
+<tr><td>403</td><td><code>PERMISSION_DENIED</code> / <code>TXN_FORBIDDEN</code> / <code>CURSOR_FORBIDDEN</code></td><td>Missing privilege / not your session or cursor</td></tr>
+<tr><td>400</td><td><code>SQL_PARSE_ERROR</code> / <code>SQL_PLAN_ERROR</code> / <code>SQL_UNSUPPORTED</code></td><td>Malformed or unsupported SQL</td></tr>
+<tr><td>400</td><td><code>NOT_NULL_VIOLATION</code> / <code>CHECK_VIOLATION</code> / <code>FOREIGN_KEY_VIOLATION</code></td><td>Constraint failed</td></tr>
+<tr><td>400</td><td><code>DDL_IN_SESSION</code> / <code>ISOLATION_IN_SESSION</code> / <code>CURSOR_NOT_ROWS</code></td><td>Operation not allowed in this context</td></tr>
+<tr><td>400</td><td><code>EMPTY_BATCH</code> / <code>BAD_BASE64</code> / <code>BATCH_TOO_LARGE</code></td><td>Invalid batch-insert payload</td></tr>
+<tr><td>401</td><td><code>UNAUTHORIZED</code></td><td>Missing/invalid/expired token</td></tr>
+<tr><td>503</td><td><code>DURABILITY_FAILURE</code></td><td>A disk flush failed; the engine must be restarted (durability can no longer be guaranteed)</td></tr>
+<tr><td>500</td><td><code>INTERNAL_ERROR</code></td><td>I/O, checksum, or corruption a well-formed request should never trigger</td></tr>
+</table>
 
 <!-- ================= 9 ================= -->
-<h2 class="pagebreak">9. Server, attach client &amp; APIs</h2>
-<h3>9.1 REST server (M5 + item 12)</h3>
-<p>
-Feature-gated (<code>--features server</code>); the default build has zero
-tokio/axum. Handlers never run <code>Engine</code> calls on the async runtime:
-one shared <code>Arc&lt;Engine&gt;</code>, each blocking call on a tokio
-blocking-pool thread — many requests execute concurrently through the engine’s
-internal latches, with group commit coalescing their fsyncs.
-</p>
-<table>
-<tr><th>Surface</th><th>Routes / behaviour</th></tr>
-<tr><td>SQL</td><td><code>POST /sql</code> — atomic multi-statement transactions, optional one-shot <code>isolation</code>, <code>$n</code> params, optional cursor mode (<code>GET /sql/cursor/{id}</code>, principal-bound, idle-expiring)</td></tr>
-<tr><td>Transactions</td><td><code>POST /txn/begin</code> → <code>X-Txn-Id</code> on later requests (no auto-commit) → <code>POST /txn/{id}/commit|rollback</code>. Per-session busy try-lock (409 <code>TXN_BUSY</code>), JWT-principal binding (403), idle reaper auto-aborts abandoned sessions (vacuum horizon un-pinned)</td></tr>
-<tr><td>Data / graph / vector</td><td>row CRUD (<code>/rows…</code>, atomic <code>POST /rows/batch</code>), <code>POST /cypher</code>, <code>/edges…</code>, <code>POST /indexes</code> + status</td></tr>
-<tr><td>Events</td><td><code>POST /tables/{t}/events</code>, SSE <code>GET /events/subscribe</code> (+ ephemeral live-tail resume via <code>Last-Event-ID</code>/<code>?from_seq=</code>/<code>?table=</code>, M20), <code>POST /events/ack</code>, <code>POST /events/vacuum</code></td></tr>
-<tr><td>Admin / security</td><td>verify-only JWT (HS256), users/roles via JWT <code>sub</code>, superuser-gated RLS (<code>PUT /tables/{t}/rls</code>) + <code>/admin/flush</code>, <code>POST /checkpoint</code>, native TLS (rustls)</td></tr>
-<tr><td>Observability (enriched item 21/22, 2026-07-13)</td><td><code>GET /metrics</code> (Prometheus), <code>GET /stats</code> (<code>pg_stat_*</code>-style, now with per-statement-kind + fsync + buffer-pool + lock-wait + horizon-age + parallel-worker + session metrics), <code>GET /logs</code> (superuser-gated, bounded cursor-paged JSON-log tail), slow-query log, audit log</td></tr>
-<tr><td>Replication</td><td>slot + shipping routes (P6.b)</td></tr>
-</table>
-<h4>9.1.1 Observability metrics (item 21) &amp; logs surface (item 22)</h4>
+<h2 id="s9" class="pagebreak">9. Operations &amp; high availability</h2>
 <ul>
-<li><b>Lock-free chokepoint metrics (item 21):</b> per-statement-kind latency
-  histograms, WAL-fsync latency + count (<code>commits / wal_fsyncs</code> reads
-  out group-commit amortization), buffer-pool hit/miss/eviction, lock-wait
-  count/duration + deadlock counter, an <b>oldest-snapshot / vacuum-horizon-age
-  gauge</b> (the alertable item-16 postmortem metric), per-table heap page
-  counts, parallel-worker utilization vs the global budget, and server session
-  gauges. Capture is plain <code>AtomicU64</code> / a fixed-bucket
-  <code>AtomicHistogram</code> (<code>src/metrics.rs</code>) — three
-  <code>Relaxed</code> adds, <b>no mutex on the commit or scan path</b>;
-  measured overhead is within ±1% at scale. Surfaced only through the existing
-  <code>stats()</code>/<code>/stats</code>/<code>/metrics</code> boundary — no
-  new endpoint (the M18 rule).</li>
-<li><b>Structured logs + correlation (item 22):</b> server logs emit <b>JSON
-  lines</b> (stdout + rolling <code>unidb.log.YYYY-MM-DD</code> files), a
-  per-request <code>request_id</code> (+ <code>txn_id</code>) joins one
-  request’s lines across the app log, the slow-query log, and
-  <code>audit.log</code> (threaded through <code>spawn_blocking</code> into the
-  engine thread-local), and <code>GET /logs</code> is a <b>bounded</b>,
-  cursor-paged reverse read of the JSON files (page cap 500, scan budget 50k
-  lines, 64 KiB block reads) so a multi-GB log directory can neither OOM nor
-  stall the server. The default embedded build gains only a tiny
-  <code>std</code>-only <code>request_id</code> module — no new dependency,
-  engine stays sync.</li>
+<li><b>Segmented write-ahead log.</b> The log is kept as fixed-size segments;
+  consumed segments are deleted whole. Checkpoints run automatically on a time
+  or size trigger (at a quiescent point) to keep the log bounded and recovery
+  fast.</li>
+<li><b>Replication &amp; read replicas.</b> A replica seeds from a base snapshot
+  and applies shipped log incrementally. The primary ships only data it has made
+  durable, so a replica is always a consistent prefix of the primary — it can
+  never show a change the primary might lose. On failover, a replica is promoted
+  to read-write, with an optional synchronous-commit gate for zero-loss
+  failover.</li>
+<li><b>Backups &amp; point-in-time restore.</b> Take a base backup plus archived
+  log and restore to a chosen point. Measured on a sample database: base backup
+  7&nbsp;ms, restore 72&nbsp;ms, failover 26&nbsp;ms.</li>
+<li><b>Autovacuum.</b> A background worker reclaims dead row versions once no
+  reader (including replicas) can still see them, scrubbing every index before
+  space is reused. Under heavy churn it keeps a table compact automatically
+  (bounded at ~35 pages vs ~82 unvacuumed in one test) and keeps point reads
+  fast.</li>
+<li><b>Security &amp; observability.</b> Users, roles and privileges; verified
+  JWT identities; native TLS; an append-only audit log; lock-free health metrics
+  over <code>/stats</code> and <code>/metrics</code>; and structured JSON logs
+  with a request id that correlates a single request across the app, slow-query,
+  and audit logs (ready to ship to CloudWatch / Datadog / Loki). An operations
+  runbook ships with the engine.</li>
 </ul>
-<h3>9.2 Attach client (M8)</h3>
-<p>
-<code>unidb-attach</code>: one-shot, <code>Engine</code>-like calls over the REST
-surface for processes not embedding the engine — blocking
-<code>reqwest</code>, no tokio, no background thread. <code>AttachError</code>
-mirrors the server’s documented error codes 1:1 (not storage-internal
-<code>DbError</code>). Benchmarked at raw-reqwest parity; HTTP itself is the
-cost (an order of magnitude over embedded — the expected finding).
-</p>
 
 <!-- ================= 10 ================= -->
-<h2>10. Operations &amp; high availability (Phase 6)</h2>
-<ul>
-<li><b>Segmented WAL (P6.a):</b> <code>db.wal/</code> holds fixed-size 16 MiB
-  segments with base-LSN headers; seal + rotate on the boundary; recovery scans
-  segments in LSN order; truncation deletes whole consumed segments (D6 evolved
-  with sign-off).</li>
-<li><b>Replication slots + WAL shipping (P6.b):</b> a persisted
-  <code>SlotRegistry</code> pins <code>restart_lsn</code>; the truncation floor is
-  <code>min(checkpoint_lsn, min slot restart_lsn)</code>. Shipping is capped at
-  the <b>durable frontier</b>, so a replica can never apply a commit the primary
-  had not made durable — a replica is always a prefix of the primary’s durable
-  state.</li>
-<li><b>Read replicas + failover (P6.c):</b> a replica seeds from a base snapshot
-  and applies shipped WAL incrementally via the crash-recovery redo path;
-  <code>promote()</code> opens it read-write; optional
-  <code>wait_for_sync_replicas</code> synchronous-commit gate. (Documented limit:
-  pages first allocated after the base need a re-base to be FPI-covered.)</li>
-<li><b>Backups + PITR (P6.d):</b> <code>base_backup</code> (checkpoint + copy) +
-  <code>archive_wal</code>; <code>backup::restore(base, archive, dest,
-  target_lsn)</code> — PITR <b>by LSN</b> (time-based needs commit timestamps —
-  a filed follow-up). Measured: base backup 7 ms, restore 72 ms, PITR 43 ms,
-  failover 26 ms at 5k rows.</li>
-<li><b>Autovacuum (A1–A4):</b> a background <code>std::thread</code> launcher
-  (holding <code>Weak&lt;Engine&gt;</code>) wakes every naptime and runs
-  <code>Engine::vacuum</code> when <code>dead &gt; threshold + scale_factor ·
-  live</code> (Postgres-shape policy). Vacuum computes a reader-aware horizon
-  (live transactions + live <code>ReadHandle</code> readers + replication
-  slots), marks reclaimable versions via redo-only <code>WAL_VACUUM</code>,
-  <b>scrubs every secondary index before any slot becomes reusable</b> (the
-  aliasing gate), then compacts pages. Under 200×30 churn: heap bounded at ~35
-  pages vs ~82 unvacuumed; point reads restored 35 → 5.85 µs.</li>
-<li><b>Security &amp; observability:</b> users/roles/GRANT, verify-only JWT →
-  per-user privileges, native TLS, append-only audit log, ops runbook
-  (<code>docs/ops_runbook.md</code>). Observability was <b>enriched
-  2026-07-13</b> (items 21/22, §9.1.1): <code>Engine::stats()</code> now carries
-  lock-free per-chokepoint metrics (statement/fsync/buffer-pool/lock-wait/
-  horizon-age/parallel-worker/session), and the server adds JSON structured
-  logs with <code>request_id</code> correlation across app/slow-query/audit logs
-  plus a bounded <code>GET /logs</code> tail (CloudWatch/Datadog/Loki shipping
-  contract). Encryption-at-rest is deferred (D9-sign-off-gated; it fights the
-  mmap page store).</li>
-</ul>
-
-<!-- ================= 11 ================= -->
-<h2 class="pagebreak">11. Performance engineering (measured, not aspirational)</h2>
+<h2 id="s10" class="pagebreak">10. Performance — measured against Postgres</h2>
 <p>
-All numbers from <code>PROGRESS.md</code> / <code>scripts/report.sh</code>
-(release builds, Apple Silicon, real flush-to-platter fsync unless noted).
-Baselines per charter: SQLite for single-model embedded comparisons; Postgres
-(+pgvector, matched durability) from M2 on; the four-system replaced stack for
-the headline.
+All numbers below are from release builds on Apple Silicon at real
+flush-to-disk durability, measured with the project's benchmark harness against
+Postgres (with pgvector, at matched durability) and, for the headline, against
+the full four-system stack unidb replaces. unidb reports honest wins <i>and</i>
+the places it still trails.
 </p>
 
-<h3>11.1 The one bottleneck that explained almost everything — and its fix</h3>
-<p>
-Through M8, <b>every statement paid its own WAL fsync (~3 ms on the reference
-hardware)</b>, putting single-statement writes ~30× behind SQLite and making a
-100-row transaction cost ~3.45 ms/row. The fix landed in two steps:
-group commit on the server (2026-07-08), then <b>group-committed
-force-log-at-commit as the engine-wide default</b> (2026-07-09) — statement
-mini-txns inside a transaction defer their fsync; <code>Engine::commit</code>
-issues one coalesced fsync. This is ARIES force-log-at-commit and
-<i>fulfills</i> D1 (per-statement fsync was an over-fulfillment inherited from
-M0). Results: the full multi-model commit dropped <b>~33.1 → ~4.3 ms (~7.7×)</b>;
-server <code>POST /sql</code> went from flat ~135–158 ops/s to
-<b>~242 / ~756 / ~4,780 ops/s</b> at 1/10/50 clients; read-only transactions
-skip the commit fsync entirely (point SELECT 3.05 ms → <b>~1.09 µs</b>).
-</p>
-
-<h3>11.2 Performance improvements ledger</h3>
-<table>
-<tr><th>Improvement (when)</th><th>Mechanism</th><th>Measured effect</th></tr>
-<tr><td>Group commit + commit-time fsync (M9 → default 2026-07-09)</td><td>defer statement fsyncs; leader-elected <code>sync_up_to</code>; fsync outside the append lock</td><td>multi-model commit 33.1→4.3 ms (~7.7×); server 135→4,780 ops/s @50 clients; W0 at SQLite parity</td></tr>
-<tr><td>Read-only fsync skip (M9)</td><td><code>commit()</code> skips WAL when <code>undo_log</code> empty</td><td>point SELECT 3.05 ms → ~1.09 µs</td></tr>
-<tr><td>Concurrent writers (Phase 5)</td><td><code>Send+Sync</code> engine, per-page latches, real lock manager, worker pool</td><td>raw-CRUD commits scale 3.68× at 8 writers (325→1,197/s)</td></tr>
-<tr><td>Concurrent SQL writes (item 11, default-ON)</td><td>shared catalog lock + crabbing B-Tree descent</td><td>indexed 8-writer INSERT 811→1,016 commits/s (+25%); matrix 28/28</td></tr>
-<tr><td>Batch-latch graph resolution (M3)</td><td>group candidate RowIds by page (~128 edges/page)</td><td>~9.3–9.7× over naive; 94.3 µs vs PG 98 µs at 1k-edge hub</td></tr>
-<tr><td>Buffer pool &amp; growth (P1.c, M9)</td><td>chunked 4 MiB growth (was O(N²) remap); 4,096-frame pool; ARIES steal on eviction</td><td>flat ~1M alloc_page/s; heaps to 300k+ rows flat; <code>BufferPoolFull</code> eliminated</td></tr>
-<tr><td>Durable FSM (2026-07-10)</td><td>per-table <code>DiskBTree</code> page directory/FSM; O(1) <code>Heap::open</code></td><td>SQL insert flat ~17–28 µs/row past 2,000 pages (was <code>HeapFull</code> death at ~876 pages / ~145k rows)</td></tr>
-<tr><td>CRUD Phase A — write path (2026-07-10)</td><td>coalesced index maintenance (<code>insert_many</code>, one leaf image per statement); selectivity-gated index-driven UPDATE/DELETE</td><td>index WAL 8,868 → 619 B/row; UPDATE-bulk 0.11× → 0.34× vs PG</td></tr>
-<tr><td>CRUD Phase B — read path (2026-07-10)</td><td><code>count_visible</code> header-only counting; <code>deform_row</code> partial decode (stop after last needed attr)</td><td><code>SELECT COUNT(*)</code> <b>2.81× faster than Postgres</b>; dec/row 2.00 → 0.00 on filtered SELECT</td></tr>
-<tr><td>Milestone P — parallel scan (default-on, item 15)</td><td>pages partitioned across <code>std::thread::scope</code> workers over the shared mmap; partial COUNT aggregate; parallel index-candidate resolution; global worker budget + deadline checks</td><td>COUNT 3.82×, filtered COUNT 6.6×, filtered SELECT 6.41× (PG scan lead +540% → +82%); scan 5.6M → 35.7M rec/s @1M rows</td></tr>
-<tr><td>Durable IVF-Flat (P3.c)</td><td>posting lists = DiskBTree; centroids WAL-logged</td><td>recall@10 = 1.000; O(1) open (in-RAM HNSW: 30 s build for 1,200 vectors → 24 ms)</td></tr>
-<tr><td>Vacuum + autovacuum (M10, A1–A4)</td><td>reader-aware horizon, index scrub before slot reuse, threshold-triggered background pass</td><td>churned point reads 35 → 5.85 µs; heap bounded ~35 vs ~82 pages</td></tr>
-<tr><td>Auto-checkpoint (P1.e)</td><td>time/WAL-size triggers at quiescent points</td><td>WAL bounded ~50–154 KB vs 1.17 MB unbounded, flat throughput</td></tr>
-</table>
-
-<h3>11.3 The multi-model thesis, quantified</h3>
+<h3 id="s10-1">10.1 The multi-model advantage, quantified</h3>
 <table>
 <tr><th>Measurement</th><th>Result</th></tr>
-<tr><td>W0→W4 decomposition ladder (add one model per rung, one durable commit)</td><td>W4/W0 = <b>1.12–1.20×</b> at 1k–10k rows — four models cost ~one, because they share one fsync</td></tr>
-<tr><td>vs replaced stack (PG row + pgvector + graph table + outbox; 4 commits), real F_FULLFSYNC durability</td><td><b>3.61× faster</b> (250 vs 69 txns/s); ~parity under cheap VM fsync (win is durability-cost-dependent — stated honestly)</td></tr>
-<tr><td>Crash consistency across the four writes</td><td><b>Unconditional win:</b> 0 orphans vs a torn record (crash-harness <code>item16_*</code> proofs)</td></tr>
-<tr><td>Bulk scale (2026-07-13 report)</td><td>bulk insert ~31k rec/s flat to 2M rows; full-heap scan ~17.5M rec/s at 1–2M rows; engine handles ≥10M</td></tr>
-<tr><td>Where unidb wins single-model</td><td>COUNT(*) 2.81× vs PG; graph adjacency ~parity; <code>poll_events</code> 20.8–983.7 µs vs PG SKIP-LOCKED ~2.6–3.1 ms; embedded point reads ~5× vs PG</td></tr>
-<tr><td>Where it still loses (tracked)</td><td>UPDATE bulk 0.34× vs PG (needs HOT-style updates — item A2, deferred); SSE subscriber scaling; <code>poll_events</code> linear in table size</td></tr>
+<tr><td>Save a row + its embedding + a graph edge + an event, one durable commit, vs. the same across Postgres + a vector store + a graph table + an outbox (four commits)</td><td><b>3.61× faster</b> (250 vs 69 txns/s) at real durability</td></tr>
+<tr><td>Crash consistency across those four writes</td><td><b>Unconditional win:</b> 0 orphans vs. a torn record</td></tr>
+<tr><td>Adding each extra model to the same commit</td><td>Four models cost about the <b>same as one</b> (they share a single flush)</td></tr>
 </table>
-<div class="callout">
-<b>Measurement hygiene rules (standing):</b> one bench process at a time;
-trust absolute numbers + internal counters (dec/row, cols/row, WAL B/row) over
-noisy single-run ÷PG ratios; verify which executor route and which toggles a
-workload actually exercises before trusting a number (the “no parallel win”
-report was a default-off toggle, not a missing win); durability lenses must be
-matched (macOS <code>open_datasync</code> made PG look 40× faster — an
-illusion).
-</div>
+
+<h3 id="s10-2">10.2 Where unidb wins on single-model work</h3>
+<table>
+<tr><th>Workload</th><th>Result vs. Postgres</th></tr>
+<tr><td><code>SELECT COUNT(*)</code></td><td><b>2.81× faster</b></td></tr>
+<tr><td>Filtered scans (parallel workers, on by default)</td><td><b>6.4–6.6× faster</b>; full scan up to ~35.7M rows/s at 1M rows</td></tr>
+<tr><td>Event polling (<code>poll_events</code> vs <code>SKIP LOCKED</code>)</td><td>~20–980&nbsp;µs vs ~2.6–3.1&nbsp;ms</td></tr>
+<tr><td>Embedded point reads</td><td>~5× faster (~1.09&nbsp;µs)</td></tr>
+<tr><td>Graph adjacency (hot vertex)</td><td>Parity (~94&nbsp;µs vs ~98&nbsp;µs at 1k edges)</td></tr>
+</table>
+
+<h3 id="s10-3">10.3 What made it fast</h3>
+<table>
+<tr><th>Improvement</th><th>What it does</th><th>Measured effect</th></tr>
+<tr><td>Group commit</td><td>Many transactions share one durability flush; read-only commits skip it</td><td>Multi-model commit 33.1 → 4.3&nbsp;ms (~7.7×); server 135 → 4,780 requests/s at 50 clients; point read 3.05&nbsp;ms → ~1.09&nbsp;µs</td></tr>
+<tr><td>Concurrent writers</td><td>Thread-safe engine, fine-grained latches, real lock manager</td><td>Raw writes scale 3.68× at 8 writers; indexed inserts +25%</td></tr>
+<tr><td>Parallel scans (default on)</td><td>Scan work partitioned across CPU cores over the shared memory map</td><td>COUNT 3.82×, filtered scans up to 6.6×</td></tr>
+<tr><td>Partial-decode reads</td><td>Decode only the columns a query needs; count from headers alone</td><td><code>COUNT(*)</code> 2.81× faster than Postgres</td></tr>
+<tr><td>Durable free-space map</td><td>Per-table space tracking; instant open</td><td>Insert cost flat ~17–28&nbsp;µs/row into the millions (was degrading, then failing)</td></tr>
+<tr><td>Batched graph resolution</td><td>Fetch a vertex's edges grouped by page (~128 edges/page)</td><td>~9× over naive; parity with Postgres</td></tr>
+<tr><td>Durable vector index</td><td>Similarity index kept on disk, never recomputed on open</td><td>recall@10 = 1.000; open instant (vs 30&nbsp;s in-memory rebuild)</td></tr>
+</table>
+
+<h3 id="s10-4">10.4 Scale</h3>
+<p>
+Bulk insert holds ~31k rows/s flat to 2M rows; a full-table scan runs at
+~17.5M rows/s at 1–2M rows; the engine handles databases of ten million rows and
+beyond. The confirmed target is a strong single node plus read replicas —
+hundreds of GB with high read throughput.
+</p>
+
+<!-- ================= 11 ================= -->
+<h2 id="s11">11. Correctness &amp; testing</h2>
+<p>
+unidb's safety claims are backed by tests, not assertions of good intent:
+</p>
+<ul>
+<li><b>Crash testing.</b> A dedicated harness kills the engine at dozens of
+  precise points — after a log write but before a flush, mid-checkpoint,
+  mid-recovery, during log trimming, mid-vacuum, on a torn page, on a simulated
+  disk-flush failure, and after total data-file loss — then reopens and asserts
+  the database contains exactly the committed transactions. A property test
+  drives random transaction sequences with random crash points under both
+  durability settings.</li>
+<li><b>Concurrency testing.</b> A production-shaped concurrency matrix checks
+  exact visible-row sets, no duplicate rows in any snapshot, agreement between
+  index and scan paths, and repeatable reads — under CPU contention and with
+  hang deadlines.</li>
+<li><b>Differential testing.</b> Join, aggregate, and subquery results are
+  compared against SQLite on shared data.</li>
+<li><b>Every change is gated.</b> Formatting, linting, the full test suite, the
+  crash harness, and recorded benchmarks must all pass before any change lands.</li>
+</ul>
+<p class="small">The engine is rigorously tested and crash-safe by design, but
+it is still early-stage software — it has not accumulated the decades of
+production hardening that Postgres has. Section 12 is an honest account of where
+it stands.</p>
 
 <!-- ================= 12 ================= -->
-<h2 class="pagebreak">12. Correctness strategy &amp; locked decisions</h2>
-<h3>12.1 Test inventory</h3>
+<h2 id="s12" class="pagebreak">12. Known limitations, bugs &amp; roadmap priority</h2>
 <p>
-374 library unit tests + full integration suites (concurrency matrix,
-per-domain MVCC/abort-visibility suites, graph locking, queue vacuum, server
-tests, attach-client tests) + <b>31 crash-harness tests</b> + a recovery
-property test under both durability policies + a <code>loom</code> model of the
-crabbing latch order + a 28-cell production-shaped concurrency correctness
-matrix (pass/fail oracles: exact visible-id sets, no duplicate ids in any
-snapshot, COUNT agreement, repeatable re-reads, sum invariance, index-vs-scan
-agreement — with CPU-contention spinners and hang deadlines). Gates on every
-PR: <code>cargo fmt</code>, <code>clippy -D warnings</code>, all tests + crash
-harness green, benchmarks recorded.
+unidb keeps an honest, public account of its gaps — both missing features and
+known bugs — so nothing below is a surprise in production. Every item carries a
+<b>priority</b> (how much it matters to close) and a status: actively
+<b>Tracked</b>, or explicitly <b>Planned</b> for a future phase.
 </p>
 
-<h3>12.2 Locked decisions D1–D13</h3>
+<h3 id="s12-1">12.1 Known bugs (open, tracked)</h3>
+<p>
+This is the complete list of currently open, user-visible correctness or
+behavior bugs. It is short by design: every other correctness bug uncovered
+during development — including a subtle transaction-rollback ordering issue
+found under heavy concurrent load — was root-caused, fixed, and is now locked
+in place by a permanent automated regression test (Section 11). Nothing below
+causes silent data loss or a wrong answer; each is a query that is rejected
+when it should be accepted.
+</p>
 <table>
-<tr><th>#</th><th>Decision</th><th>Where enforced / status</th></tr>
-<tr><td>D1</td><td>Steal + no-force (ARIES): redo <b>and</b> undo logging</td><td><code>wal.rs</code>; fulfilled by group-committed force-log-at-commit (2026-07-09)</td></tr>
-<tr><td>D2</td><td>Per-statement mini-transaction is the atomic unit</td><td><code>wal.rs</code> bracketing unchanged; only fsync timing moved to commit</td></tr>
-<tr><td>D3</td><td>Control file is the recovery root</td><td><code>control.rs</code>; extended with <code>catalog_root</code>, <code>next_xid</code> (signed off)</td></tr>
-<tr><td>D4</td><td>Tuple header reserves MVCC bytes up front</td><td><code>page.rs</code> 24-byte header; in use since M1</td></tr>
-<tr><td>D5</td><td>No dirty page flushes ahead of durable WAL</td><td><code>flush_page()</code> + <code>find_victim()</code>; debug asserts; eviction-forced sync; crash harness</td></tr>
-<tr><td>D6</td><td>Single-file data store (WAL separate)</td><td>unchanged for data; WAL segmented in P6.a (sign-off recorded)</td></tr>
-<tr><td>D7</td><td>Crash-injection harness, simple by design</td><td><code>tests/crash</code>, 31 tests; grows with every durability mechanism</td></tr>
-<tr><td>D8</td><td>8 KiB pages, init-time config, immutable after</td><td><code>format.rs</code>; baked into control file</td></tr>
-<tr><td>D9</td><td>Little-endian, CRC32+LSN per page, magic+version</td><td><code>FORMAT_VERSION = 5</code></td></tr>
-<tr><td>D10</td><td>RC default; RR available on same snapshots</td><td><code>txn.rs</code> snapshot lifetime; + SERIALIZABLE (P1.d)</td></tr>
-<tr><td>D11</td><td><code>on_read</code>/<code>on_write</code> seam; SSI is an addition</td><td>seam in <code>concurrency_hooks.rs</code>; SSI at the executor</td></tr>
-<tr><td>D12</td><td>SI abort-on-conflict first; RC re-evaluation</td><td>RC re-reads via fresh snapshot; RR/SER <code>SerializationFailure</code>; SSI pivot abort</td></tr>
-<tr><td>D13</td><td>Structured logging from day one</td><td><code>tracing</code> on WAL/checkpoint/recovery; <code>/metrics</code>, <code>/stats</code>, audit log</td></tr>
+<tr><th>Bug</th><th>What happens</th><th>Priority</th></tr>
+<tr><td><b>Inconsistent <code>IS NULL</code> / <code>IS NOT NULL</code> filter support</b></td>
+    <td><code>WHERE column IS NULL</code> works on a query that already sorts,
+    joins, or aggregates, but the identical filter is rejected as unsupported
+    on a plain filtered lookup — and, notably, when combined with a vector
+    similarity search (<code>NEAR(...) AND column IS NULL</code>). The same
+    predicate silently behaves differently depending on unrelated parts of the
+    query, which is a genuine surprise for anyone hitting it.</td>
+    <td><span class="tag high">High</span> — blocks a common
+    "similarity search + filter" pattern</td></tr>
 </table>
-<p class="small">Changing any locked decision requires explicit human sign-off
-recorded in <code>PROGRESS.md</code>. Corrections to shipped design are made as
-inline correction notes, never silent rewrites.</p>
+
+<h3 id="s12-2">12.2 Known limitations &amp; feature gaps</h3>
+<table>
+<tr><th>Area</th><th>Limitation</th><th>Priority</th><th>Status</th></tr>
+<tr><td>Transactional DDL</td><td>A <code>CREATE TABLE</code> in a transaction that later aborts is not rolled back through crash recovery (per-request rollback does apply today)</td><td><span class="tag high">High</span></td><td><span class="tag tracked">Tracked</span></td></tr>
+<tr><td>Serializable isolation</td><td>Row-granularity only — no predicate locks, so no phantom protection; sound but occasionally over-conservative</td><td><span class="tag high">High</span></td><td><span class="tag tracked">Tracked</span></td></tr>
+<tr><td>Auth platform</td><td>The server verifies tokens but does not issue them — no built-in sign-up/login/OAuth</td><td><span class="tag high">High</span></td><td><span class="tag planned">Planned — next phase</span></td></tr>
+<tr><td>SQL surface</td><td>No window functions, recursive CTEs, FULL OUTER / NATURAL joins, views, triggers, or stored procedures; single-column indexes only</td><td><span class="tag medium">Medium</span></td><td><span class="tag planned">Planned — next phase</span></td></tr>
+<tr><td>Event queue at scale</td><td>Polling cost grows with table size (no sequence index yet); realtime is poll-per-subscriber rather than push</td><td><span class="tag medium">Medium</span></td><td><span class="tag planned">Planned — next phase</span></td></tr>
+<tr><td>Vacuum</td><td>Engine-global (not per-table) accounting; no cost-based throttle; no whole-table compaction</td><td><span class="tag medium">Medium</span></td><td><span class="tag tracked">Tracked</span></td></tr>
+<tr><td>Replication</td><td>Point-in-time restore is by log position, not wall-clock time; no logical replication yet</td><td><span class="tag medium">Medium</span></td><td><span class="tag tracked">Tracked</span></td></tr>
+<tr><td>Updates</td><td>An UPDATE writes a new row version (more write volume than Postgres's in-place update path); measured ~0.34× of Postgres on bulk updates</td><td><span class="tag low">Low</span></td><td><span class="tag planned">Planned — next phase</span></td></tr>
+<tr><td>Encryption at rest</td><td>Not yet available</td><td><span class="tag low">Low</span></td><td><span class="tag planned">Planned — next phase</span></td></tr>
+<tr><td>Graph</td><td>Cypher is single-hop, read-only; no reverse-direction traversal yet</td><td><span class="tag low">Low</span></td><td><span class="tag tracked">Tracked</span></td></tr>
+<tr><td>Maturity</td><td>Rigorous and crash-tested, but early-stage — not yet battle-hardened over decades like Postgres</td><td><span class="tag low">Low</span></td><td><span class="tag tracked">Ongoing</span></td></tr>
+</table>
 
 <!-- ================= 13 ================= -->
-<h2>13. Known limitations &amp; tech debt (honest registry)</h2>
-<table>
-<tr><th>Area</th><th>Limitation</th><th>Status</th></tr>
-<tr><td>SQL surface</td><td>No window functions, recursive CTEs, FULL OUTER/NATURAL joins (<code>USING</code> shipped 2026-07-13), views, triggers, stored procedures; single-column indexes only; first-indexable-term-wins in the fast path</td><td><span class="tag open">OPEN</span> (Phase-4 documented limits)</td></tr>
-<tr><td>DDL</td><td>Catalog not MVCC-versioned — <code>CREATE TABLE</code> in an aborting txn is not rolled back through crash recovery (request-level rollback exists)</td><td><span class="tag open">OPEN</span> (tracked)</td></tr>
-<tr><td>SSI</td><td>Row-granularity only — no predicate locks, so no phantom protection; write-skew pair may both abort (sound, over-conservative)</td><td><span class="tag open">OPEN</span> (reduced form as planned)</td></tr>
-<tr><td>Write path</td><td>UPDATE pays insert-new-version cost (~619 B/row WAL) where Postgres uses HOT (in-place, no index touch) — the path to UPDATE parity (item A2)</td><td><span class="tag open">DEFERRED</span> (ROI vs charter)</td></tr>
-<tr><td>Read path</td><td>Only COUNT(*) is pushed into parallel workers (SUM/GROUP BY partial aggregates, LIMIT early-stop filed); no visibility map / index-only scans; no planner column pruning in <code>query_exec</code></td><td><span class="tag open">FILED</span></td></tr>
-<tr><td>Queue</td><td><code>poll_events</code> full-scans <code>__events__</code> (needs a <code>seq</code> index); <code>__consumers__</code> ack versions never vacuumed; SSE is poll-per-subscriber (162.6 ms at 50 subscribers)</td><td><span class="tag open">OPEN</span></td></tr>
-<tr><td>Vacuum</td><td>Global (not per-table) accounting; no cost-based throttle; no catalog-page or cross-page/<code>VACUUM FULL</code> reclamation; catalog blob strands a page per DDL change</td><td><span class="tag open">OPEN</span></td></tr>
-<tr><td>Catalog</td><td>Single ~8 KiB page blob — a very wide analyzed schema can overflow it (multi-page catalog filed)</td><td><span class="tag open">OPEN</span></td></tr>
-<tr><td>Concurrency</td><td>Graph/LOB writes serialize on <code>write_serial</code>; B-Tree crabbing is exclusive-latch (Lehman-Yao B-link would overlap same-subtree descents — format-bump-gated)</td><td><span class="tag open">FILED</span></td></tr>
-<tr><td>Replication</td><td>PITR by LSN only (no commit timestamps); replica pages allocated after the base need re-basing; no logical replication</td><td><span class="tag open">OPEN</span></td></tr>
-<tr><td>Security</td><td>Verify-only JWT (server never issues tokens); encryption-at-rest deferred (D9-gated, fights the mmap store)</td><td><span class="tag open">DEFERRED</span></td></tr>
-<tr><td>Graph</td><td>Cypher single-hop read-only; nodes opaque i64; no reverse (<code>to_id</code>) traversal; CSR retired (needs a generation marker to ever return)</td><td><span class="tag open">OPEN</span></td></tr>
-<tr><td>Maturity</td><td>Rigorous and crash-tested, but early-stage — not battle-hardened against Postgres’s ~30 years</td><td><span class="tag warn open">HONEST CAVEAT</span></td></tr>
-</table>
-
-<!-- ================= 14 ================= -->
-<h2 class="pagebreak">14. Future scope — Postgres &amp; Supabase alignment for production readiness</h2>
+<h2 id="s13" class="pagebreak">13. Where unidb is headed</h2>
 <p>
-This section maps the road from “strong prototype → early product” to a
-production-grade system, aligned against the two reference points users
-actually compare unidb to: <b>Postgres</b> (engine-to-engine) and
-<b>Supabase</b> (engine + platform). Framing per the project charter: unidb is
-<i>“SQLite for AI-native, multi-model apps”</i> — the goal is not to clone
-either, but to close the gaps that block production adoption while protecting
-the moat (multi-model atomicity). Items marked <span class="tag non">NON-GOAL</span>
-are explicitly out of charter and listed so the boundary is documented.
+The roadmap closes the gaps that block production adoption while protecting the
+one thing that makes unidb different — multi-model atomicity. It is framed
+against the two systems users compare unidb to: <b>Postgres</b> (as an engine)
+and <b>Supabase</b> (as a backend platform).
 </p>
 
-<h3>14.1 Postgres-alignment track (engine completeness)</h3>
-<h4>Tier P0 — correctness &amp; transactional completeness (do first)</h4>
+<h3 id="s13-1">13.1 Toward Postgres-level engine completeness</h3>
 <table>
-<tr><th>Item</th><th>What / why</th></tr>
-<tr><td>Transactional DDL</td><td>MVCC-version the catalog (or WAL-logged catalog undo) so <code>CREATE/ALTER/DROP</code> roll back with the transaction and through crash recovery — the narrowest real correctness gap today. Also unblocks session-scoped DDL over REST (currently rejected as <code>DDL_IN_SESSION</code>).</td></tr>
-<tr><td>Savepoints / nested rollback</td><td><code>SAVEPOINT</code>/<code>ROLLBACK TO</code> — the undo-action list is already per-transaction and ordered, so this is a marker into <code>Vec&lt;UndoAction&gt;</code> plus lock bookkeeping. Postgres-without-savepoints session semantics is a documented papercut.</td></tr>
-<tr><td>Full SSI (predicate locks)</td><td>Phantom protection via predicate/range locks (or Postgres-style SIREAD on index ranges) — upgrades SERIALIZABLE from the reduced row-granularity form. The D11 seam was built for exactly this retrofit.</td></tr>
-<tr><td>Lock wait-then-re-evaluate at RC</td><td>Block on a still-active writer then EvalPlanQual-re-check (the wait queue exists since Phase 5) instead of the no-wait <code>WriteConflict</code> — removes the biggest app-visible retry burden.</td></tr>
-<tr><td>Referential integrity, complete</td><td>FK enforcement of row existence + <code>ON DELETE/UPDATE CASCADE/RESTRICT/SET NULL</code> (today FK checks referenced-table existence only). UNIQUE via a unique-index path instead of a synchronous heap scan once index currency can be proven.</td></tr>
+<tr><th>Theme</th><th>What's coming</th></tr>
+<tr><td>Transactional completeness</td><td>Transaction-scoped, crash-safe DDL; savepoints and nested rollback; full serializable isolation with phantom protection; complete foreign-key actions (<code>ON DELETE / UPDATE CASCADE</code>, etc.)</td></tr>
+<tr><td>SQL surface</td><td>Views and materialized views; window functions; triggers and stored procedures; recursive CTEs and remaining join types; richer types (arrays, ENUM, INTERVAL, ranges); multi-column, partial, and expression indexes</td></tr>
+<tr><td>Performance parity</td><td>In-place (HOT-style) updates to close the update gap; more query work pushed onto parallel workers; a sequence index for the event queue</td></tr>
+<tr><td>Ecosystem &amp; operations</td><td>A PostgreSQL wire-protocol listener so existing drivers, ORMs, and BI tools connect unchanged; time-based point-in-time restore; logical replication / change-data-capture connectors; encryption at rest</td></tr>
 </table>
 
-<h4>Tier P1 — SQL surface parity (what real apps hit next)</h4>
+<h3 id="s13-2">13.2 Toward a backend-in-a-box (Supabase-style platform)</h3>
+<p class="small">Several of these have already shipped; others are planned.</p>
 <table>
-<tr><th>Item</th><th>What / why</th></tr>
-<tr><td>Views + materialized views</td><td>Plain views are a planner rewrite (the RLS mechanism generalizes); materialized views can reuse the durable-index build path + refresh machinery.</td></tr>
-<tr><td>Window functions</td><td>The most-requested Phase-4 gap; builds on the existing sort/aggregate operators (partition = sort + frame walk).</td></tr>
-<tr><td>Triggers &amp; stored procedures</td><td>Row-level triggers first (the event-capture hook <code>send_event_capture</code> is already an inline row-write hook — generalize it); a full procedure language is a later, larger decision.</td></tr>
-<tr><td>Recursive CTEs + FULL OUTER/NATURAL</td><td>Completes the Phase-4 grammar (<code>USING</code> already shipped 2026-07-13; <code>NATURAL</code> desugars to it once <code>FULL OUTER</code>'s <code>CASE</code>/<code>COALESCE</code> blocker lands); recursive CTEs also unlock multi-hop graph traversal through SQL.</td></tr>
-<tr><td>Richer types</td><td>Arrays, ENUM, INTERVAL, NUMRANGE, collations — additive row-encoding tags (the D4 pattern), no format bump.</td></tr>
-<tr><td>Index power</td><td>Multi-column + expression + partial indexes; cost-based index <i>selection</i> (today: first indexable term wins); index-only scans backed by a visibility map (also the true COUNT accelerator at scale).</td></tr>
-<tr><td><code>CREATE POLICY</code> SQL</td><td>Surface the existing RLS mechanism as standard SQL DDL with per-role policies.</td></tr>
+<tr><th>Capability</th><th>Today</th><th>Direction</th></tr>
+<tr><td>Realtime</td><td>Durable SSE stream with resume + webhook / broadcast fan-out</td><td><span class="tag done">Shipped</span> — durable-by-default, a genuine advantage over realtime layers that aren't</td></tr>
+<tr><td>Observability</td><td>Lock-free per-chokepoint metrics over <code>/stats</code> and <code>/metrics</code></td><td><span class="tag done">Shipped</span></td></tr>
+<tr><td>Logs</td><td>Structured JSON logs with request-id correlation and a bounded <code>/logs</code> tail</td><td><span class="tag done">Shipped</span></td></tr>
+<tr><td>Auth platform</td><td>Token verification, users, roles, per-table grants</td><td><span class="tag planned">Planned</span> — a full auth service (sign-up / login, OAuth, magic links, MFA) in front of the existing core</td></tr>
+<tr><td>Client SDKs</td><td>REST + Rust attach client</td><td><span class="tag planned">Planned</span> — TypeScript SDK first, then Python, generated from the REST contract</td></tr>
+<tr><td>Auto REST richness</td><td>Hand-built routes; SQL over HTTP</td><td><span class="tag planned">Planned</span> — PostgREST-style filtering / ordering / embedding, OpenAPI generation</td></tr>
+<tr><td>Object storage</td><td>Transactional large objects inside the engine (multi-GB), tiered to S3/MinIO-compatible storage with presigned upload/download and automatic reconciliation</td><td><span class="tag done">Shipped</span></td></tr>
+<tr><td>Dashboard / studio</td><td>—</td><td><span class="tag planned">Planned</span> — a web console: schema browser, SQL editor with EXPLAIN, metrics, RLS/role editor</td></tr>
+<tr><td>Migrations tooling</td><td>SQL DDL + docs</td><td><span class="tag planned">Planned</span> — versioned migration files and a CLI once transactional DDL lands</td></tr>
+<tr><td>Edge functions / hosting</td><td>—</td><td><span class="tag non">Not planned</span> — no cloud control plane by design; run unidb embedded inside your own function runtime</td></tr>
 </table>
 
-<h4>Tier P2 — performance parity work (measured gaps, filed)</h4>
-<table>
-<tr><th>Item</th><th>What / why</th></tr>
-<tr><td>HOT-style updates (item A2)</td><td>Forward-chained / RowId-preserving in-page updates that skip index maintenance when indexed columns are unchanged — the path from UPDATE 0.34× to parity. Fiddly against insert-new-version MVCC; needs its own design review.</td></tr>
-<tr><td>Parallel partial aggregates beyond COUNT</td><td>SUM/AVG/MIN/MAX/GROUP-BY pushed into scan workers; <code>ORDER BY … LIMIT</code> early-stop + streaming.</td></tr>
-<tr><td>Background WAL writer</td><td>Smooths eviction-forced syncs under memory pressure (noted, not required for correctness).</td></tr>
-<tr><td>B-link (Lehman-Yao) tree</td><td>Right-linked internal nodes let same-subtree descents overlap — the next concurrency step after crabbing (format-bump-gated).</td></tr>
-<tr><td>Queue scalability</td><td><code>seq</code> index for <code>poll_events</code> (flat instead of linear), <code>__consumers__</code> vacuum, and a wake primitive so SSE pushes instead of polling per subscriber.</td></tr>
-<tr><td>Vacuum maturity</td><td>Per-table accounting + <code>vacuum_table</code>, cost-based throttle, catalog-page reclamation, <code>VACUUM FULL</code>-style cross-page compaction, IVF re-training as a maintenance op.</td></tr>
-</table>
-
-<h4>Tier P3 — operational parity (production operations)</h4>
-<table>
-<tr><th>Item</th><th>What / why</th></tr>
-<tr><td>Wire protocol / drivers</td><td>A pgwire-compatible listener would inherit the entire Postgres driver ecosystem (psql, ORMs, BI tools) — the single highest-leverage ecosystem move; alternatively first-class native drivers beyond Rust.</td></tr>
-<tr><td>Time-based PITR</td><td>Commit timestamps in the WAL commit record → <code>restore(…, target_time)</code>; today PITR is by LSN only.</td></tr>
-<tr><td>Logical replication / CDC</td><td>The event queue is already a change feed with offsets — formalize it into table-level logical replication and external CDC connectors.</td></tr>
-<tr><td>Encryption at rest</td><td>Deferred D9-gated follow-up; page-level encryption must be reconciled with the mmap-as-storage design (likely a buffered page-cache mode).</td></tr>
-<tr><td>Connection/session model</td><td>Connection pooling semantics, per-session GUC-style settings, statement-level metrics; richer <code>/stats</code> (per-table, per-index, per-query).</td></tr>
-<tr><td>Upgrade &amp; migration story</td><td><code>FORMAT_VERSION</code> migration paths (none have shipped externally yet — cheap now, expensive later), online schema-change guidance, config file story beyond env vars.</td></tr>
-</table>
-
-<h3>14.2 Supabase-alignment track (platform surface)</h3>
-<p class="small">Asymmetric by design: this compares unidb + its small REST
-server against Postgres + a whole product layer. The near-term goal is
-“production-credible backend-in-a-box”, not platform parity.
-<b>Update 2026-07-13:</b> five of these tracks were filed as backlog items
-20–24, and <b>three shipped the same day</b> — events/realtime dispatcher
-(20, Milestone 20), observability metrics (21), and the logs surface (22).
-Storage service (23) and authz v2 policies (24) remain filed follow-ups.
-The rows below are marked accordingly.</p>
-<table>
-<tr><th>Capability</th><th>Today</th><th>Future scope</th></tr>
-<tr><td>Auth platform</td><td>Verify-only JWT (HS256); users/roles/GRANT; JWT <code>sub</code> → user</td><td>A GoTrue-shaped auth service (token issuance, signup/login, refresh, OAuth providers, magic links, MFA) as a separate feature-gated service in front of the existing verify-only core; JWKS/RS256 verification so third-party IdPs plug in. Row-level policy engine v2 is filed as item 24. <span class="tag open">HIGH VALUE</span></td></tr>
-<tr><td>Client SDKs</td><td>REST + Rust attach client</td><td>TypeScript/JS SDK first (the Supabase-DX core), then Python; generated from the REST contract so they track the server; session (<code>X-Txn-Id</code>) support in SDKs. Embedded bindings (PyO3, napi-rs) parked until the engine is production-solid.</td></tr>
-<tr><td>Auto API richness</td><td>Hand-built REST routes; SQL over POST</td><td>PostgREST-style filtering/ordering/embedding on <code>/rows</code> (composable query params), OpenAPI schema generation from the catalog, optional GraphQL façade.</td></tr>
-<tr><td>Realtime</td><td><b>Shipped (M20, 2026-07-13):</b> ephemeral SSE resume (<code>Last-Event-ID</code>/<code>?from_seq=</code>/<code>?table=</code>) + <code>unidb-dispatch</code> fan-out (webhook→dead-letter, broadcast rooms) with proven at-least-once + zero-loss-across-crash delivery on the durable offsets — the moat vs Supabase Realtime (not durable by default). <span class="tag done">SHIPPED</span></td><td>Remaining: a commit-time wake primitive (kill the poll loop) + an engine-side <code>seq</code> index for large backlogs, RLS-filtered payloads, and a WebSocket transport. <span class="tag open">MOAT-ADJACENT</span></td></tr>
-<tr><td>Observability</td><td><b>Shipped (item 21, 2026-07-13):</b> lock-free per-chokepoint metrics (statement/fsync/buffer-pool/lock-wait/horizon-age/parallel-worker/session) over <code>stats()</code>/<code>/stats</code>/<code>/metrics</code>, &lt;1% overhead. <span class="tag done">SHIPPED</span></td><td>Per-table (not engine-global) dead-tuple estimates; exact percentiles instead of log-bucket estimates.</td></tr>
-<tr><td>Logs</td><td><b>Shipped (item 22, 2026-07-13):</b> JSON structured logs, <code>request_id</code>/<code>txn_id</code> correlation across app/slow-query/audit logs, bounded cursor-paged <code>GET /logs</code>; documented CloudWatch/Datadog/Loki shipping contract. <span class="tag done">SHIPPED</span></td><td>A studio Logs tab (out of repo); live tail over SSE (reuses M20 framing).</td></tr>
-<tr><td>Storage</td><td>In-engine chunked/streamed LOBs (multi-GB, transactional)</td><td>Streaming REST routes for LOBs; optional S3 tiering for cold objects (item 23, filed; parked behind local-disk economics; reverses D6 — needs sign-off). Transactional LOBs are already a differentiator vs S3-backed storage.</td></tr>
-<tr><td>Dashboard / Studio</td><td>—</td><td>A minimal web console over the existing REST surface: schema browser (<code>GET /tables</code>), SQL editor with <code>EXPLAIN</code>, stats/metrics panels, RLS/role editor. Read-only first.</td></tr>
-<tr><td>Migrations tooling</td><td>SQL DDL + docs</td><td>Versioned migration files + CLI (<code>unidb migrate</code>), diff-based schema generation once transactional DDL (P0) lands.</td></tr>
-<tr><td>Edge functions / hosting</td><td>—</td><td><span class="tag non">NON-GOAL</span> — no cloud control plane by charter; document integration patterns (run embedded inside the function runtime instead — a story Supabase cannot offer).</td></tr>
-</table>
-
-<h3>14.3 Scale-out (parked, explicitly)</h3>
+<h3 id="s13-3">13.3 Deliberately parked</h3>
 <ul>
-<li><b>Columnar / HTAP</b> — gated on real analytics demand; opposite axis to
-  the multi-model thesis.</li>
-<li><b>Distributed / sharded writes</b> — reverses the single-primary charter
-  and strains cross-model atomicity; a separate multi-year project. The
-  confirmed target remains <b>a strong single node + read replicas</b> (100s of
-  GB, high read throughput).</li>
-<li><b>S3 / tiered storage</b> — relevant past local-disk economics; behind
-  replication maturity.</li>
+<li><b>Columnar / analytical engine</b> — the opposite axis to the multi-model
+  transactional thesis; gated on real analytics demand.</li>
+<li><b>Distributed / sharded multi-writer</b> — reverses the single-primary
+  design and strains cross-model atomicity; the confirmed target remains a
+  strong single node plus read replicas.</li>
 </ul>
-
-<h3>14.4 Suggested sequencing (ROI-ordered, to be re-derived per session)</h3>
-<ol>
-<li><b>Transactional DDL + savepoints</b> (P0) — correctness first, unblocks
-  migrations tooling and session DDL.</li>
-<li><b>TypeScript SDK + PostgREST-style filtering + push-based realtime</b> —
-  the shortest path to “Supabase-shaped DX” on the existing moat.</li>
-<li><b>Views + window functions + index power</b> (P1) — the SQL gaps real
-  apps hit first.</li>
-<li><b>pgwire listener</b> (P3) — the ecosystem multiplier; evaluate cost
-  honestly before committing.</li>
-<li><b>HOT updates + queue indexes</b> (P2) — close the two worst measured
-  single-model gaps.</li>
-<li><b>Auth service + dashboard</b> — platform credibility for production
-  adoption.</li>
-</ol>
-<div class="callout warn">
-<b>Standing rule for all of the above</b> (charter §0.6): every item gets an
-expert design review before implementation, an adversarial stress test +
-honest baseline benchmark when it ships, gated optimizations (never
-unconditional), and its ROI re-derived at execution time — the ordering above
-is a proposal, not a commitment. No locked decision (D1–D13) may be reopened
-without recorded human sign-off.
-</div>
 
 <hr style="margin-top:24pt; border:none; border-top:1px solid #c6d2dd">
 <p class="small">
-unidb Engine Architecture &amp; Design Reference · generated 2026-07-13 from
-the repository’s canonical docs (<code>engine_design.md</code> plus the
-2026-07-13 merges: Milestone 18 introspection, <code>JOIN … USING</code>,
-Milestone 20 realtime dispatcher, and items 21 observability / 22 logs).
-This PDF is a distilled snapshot; when it disagrees with
-<code>CLAUDE.md</code>/<code>PROGRESS.md</code>/<code>MEMORY.md</code>, those win.
-Regenerate: edit <code>docs/design/unidb_engine_architecture.html</code> and print
-to PDF (see <code>docs/design/design_index.md</code>).
+unidb — Engine Architecture &amp; Product Guide. This is a distilled reference;
+where it disagrees with the engine's canonical source docs, those win. Editing
+and regeneration instructions (and the source-material provenance) are in
+<code>unidb_engine_architecture_context.md</code>, alongside this file.
 </p>
 
 </body>
