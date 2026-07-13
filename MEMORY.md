@@ -12,6 +12,23 @@
 
 ## Current status
 
+- **Event queue at scale (backlog item 26) — SHIPPED 2026-07-13, branch
+  `26-event-queue-scale`, PR pending (STOP-for-review).** Q1: durable
+  `DiskBTree` secondary index on `__events__.seq`; `poll_events` /
+  `poll_events_after` now O(log n + returned) via `search_range_limit` +
+  MVCC re-check. Flat-latency proven (`benches/poll_events.rs`): 10k→30 µs,
+  100k→28 µs, 300k→36 µs with limit=20. Q2: `EventWake` condvar (committed
+  in Engine after WAL sync, P5.e-compliant); `Engine::commit` notifies;
+  SSE route blocks on `wait_event_commit` instead of spinning; dispatcher
+  builder takes optional `event_wake`. Q3: `vacuum_events` removes seq index
+  entries on reclaim — index never pins retention. Crash point P30 added
+  (seq index torn mid-append; reopen recovers); crash harness 32/32. Gates:
+  `cargo test --workspace --features server` all green (385 + 32 crash +
+  other workspace crates); clippy `--workspace --all-targets -D warnings`
+  clean; `fmt` clean; conc-matrix 28/28 (1 repeat). Docs: `engine_design.md`
+  §6.2 + §6.3 + tech-debt corrected, `26_event_queue_scale.md` → SHIPPED,
+  `backlog_index.md` row 26 → SHIPPED, `PROGRESS.md` entry. **Next: await
+  PR review.**
 - **Object storage service (backlog item 23) — SHIPPED + MERGED (2026-07-13),
   branch `23-storage-service`, PR #64.** New
   **app-layer** crate `unidb-storage` (workspace member; adds **no engine
@@ -4416,6 +4433,29 @@ performance — Phase A" entry and the Current-status bullet above.
   harness tests all green.
 - **Next:** Run benchmarks (`cargo bench --release`), record results in
   `PROGRESS.md`, mark M0 done.
+
+### 2026-07-13 — Item 26: event queue at scale
+
+- **Q1:** Added `DiskBTree::search_range_limit` in `src/btree_index.rs`; wired
+  `ensure_event_seq_index` (mirrors `ensure_edge_index`, migration-safe) in
+  `Engine::open`; `poll_events` / `poll_events_after` rewritten to use index +
+  MVCC re-check; `ExecCtx.event_seq_index_meta` threads meta page into
+  `send_event_capture` for index insert on every event append.
+- **Q2:** `EventWake` (condvar + generation counter) added to `src/lib.rs`;
+  `Engine::commit` notifies after `sync_up_to` (P5.e clean); dispatcher builder
+  accepts `event_wake`; SSE route uses `wait_event_commit` loop.
+- **Q3:** `vacuum_events` collects `(row_id, seq)` pairs and removes seq index
+  entries after heap delete — no retention pinning.
+- **Crash point P30:** seq index torn mid-append; crash harness now 32/32.
+- **Bench:** `benches/poll_events.rs` + `[[bench]] poll_events` in `Cargo.toml`;
+  flat-latency proven 10k→100k→300k rows.
+- Fixed clippy `too_many_arguments` on `ensure_event_seq_index` with
+  `#[allow(clippy::too_many_arguments)]` (mirrors `ensure_edge_index`).
+- Docs: `engine_design.md` §6.2/§6.3/tech-debt corrected; spec + backlog index
+  row 26 flipped to SHIPPED; PROGRESS.md entry with bench numbers.
+- **Gates:** cargo test --workspace --features server green (385 + 32 crash);
+  clippy/fmt clean; conc-matrix 28/28.
+- **Next:** await PR review — do not merge.
 
 ### 2026-07-06 — Project initialization
 - Architecture design doc reviewed; six foundational gaps identified and resolved.

@@ -607,6 +607,57 @@ impl DiskBTree {
         Ok(out)
     }
 
+    /// Like [`search_range`] but stops after collecting `limit` `RowId`s,
+    /// giving O(log n + limit) time rather than O(log n + all_past_cursor).
+    /// Used by `poll_events`/`poll_events_after` so a consumer that is nearly
+    /// caught up pays only O(log n + batch_size) even on a 1M-row table.
+    pub fn search_range_limit(
+        &self,
+        op: RangeOp,
+        value: &OrderedValue,
+        limit: usize,
+        pool: &BufferPool,
+    ) -> Result<Vec<RowId>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let start = match op {
+            RangeOp::Lt | RangeOp::Le => self.leftmost_leaf(pool)?,
+            RangeOp::Gt | RangeOp::Ge => self.find_leaf(value, pool)?,
+        };
+        let mut pid = start;
+        let mut out = Vec::with_capacity(limit);
+        'outer: loop {
+            let page = pool.fetch_page(pid)?;
+            let node = Node::deserialize(&page)?;
+            pool.unpin(pid);
+            let Node::Leaf { entries, next } = node else {
+                break;
+            };
+            for (k, rid) in &entries {
+                let admit = match op {
+                    RangeOp::Lt => k < value,
+                    RangeOp::Le => k <= value,
+                    RangeOp::Gt => k > value,
+                    RangeOp::Ge => k >= value,
+                };
+                if admit {
+                    out.push(*rid);
+                    if out.len() >= limit {
+                        break 'outer;
+                    }
+                } else if matches!(op, RangeOp::Lt | RangeOp::Le) && k >= value {
+                    break 'outer;
+                }
+            }
+            if next == INVALID_PAGE_ID {
+                break;
+            }
+            pid = next;
+        }
+        Ok(out)
+    }
+
     fn leftmost_leaf(&self, pool: &BufferPool) -> Result<PageId> {
         let mut pid = self.root_page(pool)?;
         loop {

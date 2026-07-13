@@ -1,7 +1,7 @@
 # Event queue at scale — sequence index + push (vs poll-per-subscriber)
 
 **Type:** Improvement
-**Status:** NOT STARTED
+**Status:** ✅ SHIPPED 2026-07-13 (branch `26-event-queue-scale`; PROGRESS.md: "Event queue at scale — seq index + push (item 26)")
 
 > Limitation surfaced by the architecture guide + Milestone 20's known-limits:
 > "polling cost grows with table size (no sequence index yet); realtime is
@@ -41,7 +41,7 @@
 
 ## Acceptance
 
-- [ ] Poll latency flat as enabled-table size grows (Q1 bench).
-- [ ] Idle subscribers do no work until a commit wakes them (Q2).
-- [ ] Crash harness green; event index recovers; retention still bounded.
-- [ ] Item-20 dispatcher + server SSE consume the push path with poll fallback.
+- [x] Poll latency flat as enabled-table size grows (Q1 bench): 10k→30 µs, 100k→28 µs, 300k→36 µs — flat.
+- [x] Idle subscribers do no work until a commit wakes them (Q2): EventWake condvar; SSE uses `wait_event_commit`.
+- [x] Crash harness green (32/32); event index recovers (P30); retention still bounded (Q3 vacuum removes seq index entries).
+- [x] Item-20 dispatcher + server SSE consume the push path with poll fallback.

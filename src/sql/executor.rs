@@ -152,6 +152,12 @@ pub struct ExecCtx<'a> {
     /// shared `&self` engine can hand out `__events__` sequence numbers from
     /// concurrent writer threads without a lock.
     pub next_event_seq: &'a AtomicU64,
+    /// Meta page of the durable `__events__.seq` B-tree index (item 26, Q1).
+    /// `Some(meta)` on a fully-opened Engine (always the case from lib.rs);
+    /// `None` in unit tests that build their own `ExecCtx` without a full
+    /// engine (the tests don't exercise event capture, so the index is never
+    /// needed there).
+    pub event_seq_index_meta: Option<crate::format::PageId>,
 }
 
 /// Insert `row`'s durable-index column values into their on-disk structures
@@ -375,6 +381,21 @@ fn send_event_capture(
             slot: row_id.slot,
         },
     )?;
+
+    // Q1 (item 26): maintain the durable seq index so poll_events is O(log n + returned).
+    // Uses the same standalone-mini-txn insert as apply_durable_index_writes — the index
+    // entry is WAL-logged before WAL_TXN_COMMIT, so it is always crash-consistent with
+    // the heap row (both durable if the user txn commits; both absent if it aborts under
+    // deferred sync). A stale entry from an aborted txn is harmless: MVCC re-check in
+    // resolve_event_candidates filters it via NoVisibleVersion.
+    if let Some(meta_page) = ctx.event_seq_index_meta {
+        DiskBTree::new(meta_page, ctx.page_size).insert(
+            OrderedValue::Int(seq as i64),
+            row_id,
+            ctx.pool,
+            ctx.wal,
+        )?;
+    }
 
     persist_pages_if_changed(EVENTS_TABLE, &heap, &events_def.pages, ctx)?;
     Ok(())
@@ -2781,6 +2802,7 @@ mod tests {
                 page_size: self.page_size,
                 xid,
                 next_event_seq: &self.next_event_seq,
+                event_seq_index_meta: None,
             };
             execute(plan, &mut ctx)
         }

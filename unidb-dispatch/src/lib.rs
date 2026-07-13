@@ -48,7 +48,7 @@ use std::sync::{
 use std::time::Duration;
 
 use tracing::warn;
-use unidb::{queue::Event, DbError, Engine};
+use unidb::{queue::Event, DbError, Engine, EventWake};
 
 pub mod dlq;
 pub mod filter;
@@ -129,6 +129,10 @@ pub struct DispatcherBuilder {
     retry: RetryPolicy,
     dlq_table: String,
     lag_warn_threshold: usize,
+    /// Q2 (item 26): optional push-notification handle. When set, `run` blocks
+    /// on the condvar (with `poll_interval` as a timeout fallback) instead of
+    /// sleeping on a fixed timer — idle dispatchers do zero polling work.
+    event_wake: Option<Arc<EventWake>>,
 }
 
 impl DispatcherBuilder {
@@ -168,6 +172,15 @@ impl DispatcherBuilder {
         self
     }
 
+    /// Q2 (item 26): enable push-notification wake. Pass `engine.event_wake()`
+    /// so the dispatcher blocks on the condvar instead of sleeping on a timer —
+    /// idle dispatchers do zero polling work, and commit→delivery latency drops.
+    /// `poll_interval` remains the maximum wait duration (fallback/catch-up).
+    pub fn event_wake(mut self, wake: Arc<EventWake>) -> Self {
+        self.event_wake = Some(wake);
+        self
+    }
+
     pub fn build(self) -> Dispatcher {
         Dispatcher {
             engine: self.engine,
@@ -178,6 +191,7 @@ impl DispatcherBuilder {
             retry: self.retry,
             dlq_table: self.dlq_table,
             lag_warn_threshold: self.lag_warn_threshold,
+            event_wake: self.event_wake,
             stats: Arc::new(DispatchStats {
                 last_acked_seq: AtomicI64::new(-1),
                 ..Default::default()
@@ -197,6 +211,7 @@ pub struct Dispatcher {
     retry: RetryPolicy,
     dlq_table: String,
     lag_warn_threshold: usize,
+    event_wake: Option<Arc<EventWake>>,
     stats: Arc<DispatchStats>,
     dlq_ensured: Arc<AtomicBool>,
 }
@@ -212,6 +227,7 @@ impl Dispatcher {
             retry: RetryPolicy::default(),
             dlq_table: "dispatch_dead_letter".to_string(),
             lag_warn_threshold: 0,
+            event_wake: None,
         }
     }
 
@@ -278,17 +294,53 @@ impl Dispatcher {
         Ok(report)
     }
 
-    /// Drive [`run_once`](Self::run_once) on `poll_interval` until `shutdown`
-    /// resolves. Engine errors are logged and retried next tick rather than
-    /// tearing the loop down.
+    /// Drive [`run_once`](Self::run_once) until `shutdown` resolves.
+    ///
+    /// **Q2 (item 26) push mode** — if an [`EventWake`] handle was wired via
+    /// [`DispatcherBuilder::event_wake`], the loop blocks on the engine's
+    /// commit condvar instead of sleeping on a fixed timer. The condvar wait
+    /// uses `poll_interval` as a maximum timeout (the fallback/catch-up path),
+    /// so the fallback poll still fires even when no commit arrives.
+    ///
+    /// **Poll-only mode** — without an `EventWake` handle the behaviour is
+    /// unchanged from the pre-Q2 dispatcher: one `run_once` every
+    /// `poll_interval`. Existing callers that don't call `.event_wake()` are
+    /// unaffected.
     pub async fn run(&self, shutdown: impl Future<Output = ()>) {
         tokio::pin!(shutdown);
-        loop {
-            tokio::select! {
-                _ = &mut shutdown => break,
-                _ = tokio::time::sleep(self.poll_interval) => {
+        match &self.event_wake {
+            None => {
+                // Poll-only path: unchanged from pre-Q2.
+                loop {
+                    tokio::select! {
+                        _ = &mut shutdown => break,
+                        _ = tokio::time::sleep(self.poll_interval) => {
+                            if let Err(e) = self.run_once().await {
+                                warn!(consumer = %self.consumer, error = %e, "dispatch cycle failed; retrying next tick");
+                            }
+                        }
+                    }
+                }
+            }
+            Some(wake) => {
+                // Q2 push-notification path: block on condvar, run on wake.
+                // `poll_interval` is the timeout so we fall back to polling
+                // even when no commit arrives (catch-up / idle correctness).
+                let mut known_gen = wake.generation();
+                loop {
+                    let wake_clone = wake.clone();
+                    let timeout = self.poll_interval;
+                    // Wrap the blocking condvar wait in spawn_blocking so the
+                    // tokio reactor stays free during the wait.
+                    let next_gen = tokio::select! {
+                        _ = &mut shutdown => break,
+                        g = tokio::task::spawn_blocking(move || {
+                            wake_clone.wait_blocking(known_gen, timeout)
+                        }) => g.unwrap_or(known_gen),
+                    };
+                    known_gen = next_gen;
                     if let Err(e) = self.run_once().await {
-                        warn!(consumer = %self.consumer, error = %e, "dispatch cycle failed; retrying next tick");
+                        warn!(consumer = %self.consumer, error = %e, "dispatch cycle failed; retrying next wake");
                     }
                 }
             }
