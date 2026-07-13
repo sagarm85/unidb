@@ -1,0 +1,18 @@
+[package]
+name = "unidb-server-full"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "unidb-server-full"
+path = "src/main.rs"
+
+[dependencies]
+unidb         = { path = "..", features = ["server"] }
+unidb-storage = { path = "../unidb-storage" }
+tokio         = { version = "1.52", features = ["rt-multi-thread", "macros", "signal"] }
+axum          = "0.8"
+tracing       = "0.1"
+tracing-subscriber  = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender    = "0.2"
+axum-prometheus     = "0.10"
