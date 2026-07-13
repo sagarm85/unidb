@@ -291,6 +291,94 @@ impl AutoVacuumConfig {
     }
 }
 
+/// Vacuum cost-budget configuration (V3, item 27). Mirrors Postgres's
+/// `vacuum_cost_*` GUCs. A background pass accumulates cost per page touched;
+/// when the budget (`cost_limit`) is exhausted the pass naps for
+/// `cost_delay_ms` and resets the counter, bounding the I/O it can consume on
+/// a busy system. Default-on with Postgres-like values.
+#[derive(Debug, Clone, Copy)]
+pub struct VacuumCostConfig {
+    /// Master switch. Default on; set `UNIDB_VACUUM_COST_ENABLED=0` to disable.
+    pub enabled: bool,
+    /// Cost units per nap. Default 200 (Postgres default).
+    pub cost_limit: u32,
+    /// Nap duration in milliseconds when the budget is spent. Default 2 ms.
+    pub cost_delay_ms: u64,
+    /// Cost charged per page read during vacuum. Default 1.
+    pub page_hit_cost: u32,
+    /// Cost charged per page written (compacted) during vacuum. Default 20.
+    pub page_dirty_cost: u32,
+}
+
+impl Default for VacuumCostConfig {
+    fn default() -> Self {
+        Self {
+            enabled: std::env::var("UNIDB_VACUUM_COST_ENABLED").as_deref() != Ok("0"),
+            cost_limit: 200,
+            cost_delay_ms: 2,
+            page_hit_cost: 1,
+            page_dirty_cost: 20,
+        }
+    }
+}
+
+/// Per-table dead/live tuple estimates (V1, item 27). Stored in the
+/// `per_table_estimates` map on `Engine`, keyed by table name. Updated at DML
+/// chokepoints; reset/corrected when `vacuum_table` or `vacuum` scans the
+/// table. Approximate by design (same guarantees as the global counters).
+#[derive(Debug, Default, Clone, Copy)]
+struct PerTableEstimates {
+    dead: u64,
+    live: u64,
+}
+
+/// Accumulates vacuum I/O cost and sleeps when the budget is spent (V3,
+/// item 27). Lives on the stack inside `vacuum_inner` / `vacuum_table`.
+struct VacuumThrottle {
+    enabled: bool,
+    cost_limit: u32,
+    cost_delay: std::time::Duration,
+    page_hit_cost: u32,
+    page_dirty_cost: u32,
+    accumulated: u32,
+}
+
+impl VacuumThrottle {
+    fn from_config(cfg: VacuumCostConfig) -> Self {
+        Self {
+            enabled: cfg.enabled,
+            cost_limit: cfg.cost_limit,
+            cost_delay: std::time::Duration::from_millis(cfg.cost_delay_ms),
+            page_hit_cost: cfg.page_hit_cost,
+            page_dirty_cost: cfg.page_dirty_cost,
+            accumulated: 0,
+        }
+    }
+
+    fn charge_read(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        self.accumulated = self.accumulated.saturating_add(self.page_hit_cost);
+        self.maybe_nap();
+    }
+
+    fn charge_dirty(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        self.accumulated = self.accumulated.saturating_add(self.page_dirty_cost);
+        self.maybe_nap();
+    }
+
+    fn maybe_nap(&mut self) {
+        if self.accumulated >= self.cost_limit {
+            std::thread::sleep(self.cost_delay);
+            self.accumulated = 0;
+        }
+    }
+}
+
 /// A parsed-but-not-yet-bound statement (P2.e), produced by
 /// [`Engine::prepare`] and run with [`Engine::execute_prepared`]. Holds the
 /// logical plans so a query is parsed once and executed many times with
@@ -425,6 +513,16 @@ pub struct Engine {
     /// disabled. Dropping the engine drops this, whose `Drop` stops the thread —
     /// the clean-shutdown hook.
     autovacuum_handle: Mutex<Option<crate::autovacuum::AutoVacuumHandle>>,
+    /// Per-table dead/live tuple estimates (V1, item 27). Keyed by table name.
+    /// Updated at every SQL DML chokepoint; reset/corrected by `vacuum_table`
+    /// and `vacuum`. Behind a `Mutex` (never held across page-latch or WAL I/O,
+    /// so no lock-ordering risk). The raw-CRUD `Engine::insert/update/delete`
+    /// API has no table name, so it only updates the global counters above.
+    per_table_estimates: Mutex<std::collections::HashMap<String, PerTableEstimates>>,
+    /// Vacuum cost-budget configuration (V3, item 27). Read at the start of
+    /// each vacuum pass to build a `VacuumThrottle`; write-locked only when
+    /// `set_vacuum_cost_config` is called, so the hot path never blocks.
+    vacuum_cost: Mutex<VacuumCostConfig>,
     /// Serializes the non-CRUD write paths that do a *non-atomic*
     /// read-catalog-then-mutate-a-shared-secondary-index sequence — graph edges
     /// (the `__edges__.from_id` `DiskBTree` + page list), large objects (the
@@ -543,14 +641,21 @@ pub struct StatementLatency {
     pub select: crate::metrics::HistogramSnapshot,
 }
 
-/// One row of the per-table health list (item 21). `pages` is the table's heap
-/// page count (its on-disk size in pages); dead-tuple pressure is engine-wide
-/// (`EngineStats::dead_tuple_estimate`) in v1 — a documented limitation, since
-/// the dead/live estimators are global counters, not per-table.
+/// One row of the per-table health list (item 21 + item 27). `pages` is the
+/// table's heap page count; `dead_tuple_estimate`/`live_tuple_estimate` are
+/// per-table accounting counters (V1, item 27) — incremented at DML
+/// chokepoints and corrected by `vacuum_table`/`vacuum`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TableStat {
     pub name: String,
     pub pages: u32,
+    /// Approximate dead tuple versions since the last vacuum of this table
+    /// (V1, item 27). Autovacuum uses this to target only the table that
+    /// actually churned.
+    pub dead_tuple_estimate: u64,
+    /// Approximate live tuple count for this table (V1, item 27). Corrected
+    /// at each `vacuum_table` or full `vacuum` pass.
+    pub live_tuple_estimate: u64,
 }
 
 /// `Engine` must be safely **shareable** across threads (P5.e: a pool of N
@@ -858,6 +963,8 @@ impl Engine {
             autovacuums_triggered: AtomicU64::new(0),
             last_autovacuum_epoch_secs: AtomicU64::new(0),
             autovacuum_handle: Mutex::new(None),
+            per_table_estimates: Mutex::new(std::collections::HashMap::new()),
+            vacuum_cost: Mutex::new(VacuumCostConfig::default()),
             write_serial: Mutex::new(()),
             replication,
             authz,
@@ -1158,6 +1265,12 @@ impl Engine {
                 .map(|t| (t.name.clone(), t.fsm_meta, t.pages.clone()))
                 .collect()
         };
+        // Snapshot per-table estimates once — brief lock, not held across I/O.
+        let estimates = self
+            .per_table_estimates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let mut out: Vec<TableStat> = defs
             .into_iter()
             .map(|(name, fsm_meta, pages)| {
@@ -1167,9 +1280,12 @@ impl Engine {
                 } else {
                     0
                 };
+                let est = estimates.get(&name).copied().unwrap_or_default();
                 TableStat {
                     name,
                     pages: page_count,
+                    dead_tuple_estimate: est.dead,
+                    live_tuple_estimate: est.live,
                 }
             })
             .collect();
@@ -1188,9 +1304,13 @@ impl Engine {
         let mut results = Vec::with_capacity(plans.len());
         for plan in plans {
             let plan = apply_rls(plan, &cat_read(&self.catalog));
+            // V1 (item 27): extract table name before the plan is moved into
+            // the executor. `plan_dml_table` returns `None` for non-DML
+            // statements (DDL, SELECT), so those don't touch per-table counters.
+            let dml_table = plan_dml_table(&plan).map(|s| s.to_owned());
             match self.execute_one_plan(xid, plan) {
                 Ok(result) => {
-                    self.note_dml_result(&result); // A1: dead/live-tuple accounting.
+                    self.note_dml_result(&result, dml_table.as_deref()); // A1 + V1
                     results.push(result);
                 }
                 Err(e) => {
@@ -1277,9 +1397,10 @@ impl Engine {
             // interpreted as SQL structure.
             bind_params(&mut plan, params)?;
             let plan = apply_rls(plan, &cat_read(&self.catalog));
+            let dml_table = plan_dml_table(&plan).map(|s| s.to_owned()); // V1
             match self.execute_one_plan(xid, plan) {
                 Ok(result) => {
-                    self.note_dml_result(&result); // A1: dead/live-tuple accounting.
+                    self.note_dml_result(&result, dml_table.as_deref()); // A1 + V1
                     results.push(result);
                 }
                 Err(e) => {
@@ -2292,6 +2413,209 @@ impl Engine {
         self.live_tuples.load(Ordering::Relaxed)
     }
 
+    // ── V1/V2 — per-table estimates and targeted vacuum (item 27) ────────────
+
+    /// Per-table dead-tuple estimate for `table` (V1, item 27). Returns 0
+    /// when no DML has been observed for this table this session.
+    pub fn per_table_dead_estimate(&self, table: &str) -> u64 {
+        self.per_table_estimates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(table)
+            .map(|e| e.dead)
+            .unwrap_or(0)
+    }
+
+    /// Per-table live-tuple estimate for `table` (V1, item 27). Returns 0
+    /// when no inserts have been observed for this table this session.
+    pub fn per_table_live_estimate(&self, table: &str) -> u64 {
+        self.per_table_estimates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(table)
+            .map(|e| e.live)
+            .unwrap_or(0)
+    }
+
+    /// Tables whose per-table dead/live estimates fire the autovacuum policy
+    /// (V1, item 27). Returns table names in an arbitrary order; the autovacuum
+    /// worker calls `vacuum_table` for each one. An empty result means either
+    /// no SQL DML has been tracked yet or no table has crossed the threshold.
+    pub fn tables_needing_vacuum(&self) -> Vec<String> {
+        let cfg = self.autovacuum_config();
+        if !cfg.enabled {
+            return Vec::new();
+        }
+        let map = self
+            .per_table_estimates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.iter()
+            .filter(|(_, e)| cfg.should_vacuum(e.dead, e.live))
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Current vacuum cost-budget configuration (V3, item 27).
+    pub fn vacuum_cost_config(&self) -> VacuumCostConfig {
+        *self.vacuum_cost.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Replace the vacuum cost-budget configuration (V3, item 27). Takes
+    /// effect on the next vacuum pass (the configuration is read once per pass,
+    /// not on every page).
+    pub fn set_vacuum_cost_config(&self, cfg: VacuumCostConfig) {
+        *self.vacuum_cost.lock().unwrap_or_else(|e| e.into_inner()) = cfg;
+    }
+
+    /// Vacuum a single named table (V2, item 27). Uses the same M10
+    /// reclamation logic as [`Engine::vacuum`] but scopes the pass to one
+    /// table only, leaving every other table untouched. Applies the cost
+    /// throttle (V3).
+    ///
+    /// Called by the autovacuum worker when only one table's per-table
+    /// estimate has fired the trigger (V1); available as a manual operator
+    /// action.
+    pub fn vacuum_table(&self, name: &str) -> Result<VacuumReport> {
+        self.vacuum_table_inner(name, true)
+    }
+
+    fn vacuum_table_inner(&self, name: &str, clean_indexes: bool) -> Result<VacuumReport> {
+        let _ws = serial_lock(&self.write_serial);
+        let horizon = self.txn_mgr.vacuum_horizon();
+        let page_size = self.page_size;
+        let mut throttle = VacuumThrottle::from_config(self.vacuum_cost_config());
+        let mut report = VacuumReport {
+            horizon,
+            horizon_blocked: horizon < self.txn_mgr.next_xid(),
+            ..Default::default()
+        };
+
+        // Look up the table definition.
+        let table_def = cat_read(&self.catalog)
+            .tables()
+            .find(|t| t.name == name)
+            .cloned();
+        let table = table_def.ok_or_else(|| DbError::TableNotFound(name.to_owned()))?;
+
+        let heap = Heap::open(page_size, table.fsm_meta, table.pages.clone());
+        report.rows_scanned += count_live_slots(&heap, &self.pool)?;
+        let reclaimable = heap.collect_reclaimable(horizon, &self.pool)?;
+        if reclaimable.is_empty() {
+            self.sync_wal()?;
+            return Ok(report);
+        }
+
+        // Collect index keys before marking slots dead (M10.c aliasing gate).
+        let mut durable_removals: Vec<(PageId, OrderedValue, RowId)> = Vec::new();
+        let mut ivf_removals: Vec<(PageId, Vec<f32>, RowId)> = Vec::new();
+        let has_durable = table
+            .columns
+            .iter()
+            .any(|c| !c.dropped && c.index_root.is_some());
+        if clean_indexes && has_durable {
+            for rid in &reclaimable {
+                let Ok(bytes) = heap.get_raw(*rid, &self.pool) else {
+                    continue;
+                };
+                let row = executor::decode_row(&bytes, &table.columns)?;
+                for (i, col) in table.columns.iter().enumerate() {
+                    let Some(root) = (if col.dropped { None } else { col.index_root }) else {
+                        continue;
+                    };
+                    match col.index {
+                        Some(IndexKind::BTree) => {
+                            if let Ok(v) = OrderedValue::try_from(&row[i]) {
+                                durable_removals.push((root, v, *rid));
+                            }
+                        }
+                        Some(IndexKind::FullText) => {
+                            if let Literal::Text(text) = &row[i] {
+                                for token in fulltext::tokenize(text) {
+                                    durable_removals.push((root, OrderedValue::Text(token), *rid));
+                                }
+                            }
+                        }
+                        Some(IndexKind::Hnsw) => {
+                            if let Literal::Vector(v) = &row[i] {
+                                ivf_removals.push((root, v.clone(), *rid));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Mark reclaimable slots DEAD; charge a read cost per page touched.
+        for rid in &reclaimable {
+            heap.mark_dead(*rid, &self.pool, &self.wal)?;
+            throttle.charge_read();
+        }
+
+        // Scrub secondary-index entries (M10.c aliasing gate).
+        if clean_indexes {
+            for (root, value, rid) in &durable_removals {
+                let tree = DiskBTree::new(*root, page_size);
+                tree.remove(value, *rid, &self.pool, &self.wal)?;
+            }
+            for (root, vector, rid) in &ivf_removals {
+                let ivf = DiskIvfIndex::open(*root, page_size);
+                ivf.remove(*rid, vector, &self.pool, &self.wal)?;
+            }
+        }
+
+        // Compact each touched page; charge a dirty cost per page.
+        for pid in unique_pages(&reclaimable) {
+            report.bytes_reclaimed += heap.compact_page(pid, &self.pool, &self.wal)?;
+            throttle.charge_dirty();
+        }
+        report.versions_reclaimed += reclaimable.len();
+        report.slots_freed += reclaimable.len();
+
+        self.sync_wal()?;
+
+        // V1: refresh per-table estimates for this table.
+        {
+            let mut map = self
+                .per_table_estimates
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let est = map.entry(name.to_owned()).or_default();
+            est.live = report.rows_scanned as u64;
+            let reclaimed = report.versions_reclaimed as u64;
+            est.dead = est.dead.saturating_sub(reclaimed);
+        }
+        // Also reduce the global dead counter so `autovacuum_should_run` stays
+        // accurate for the raw-CRUD heap's share of the global estimate.
+        let reclaimed = report.versions_reclaimed as u64;
+        let _ = self
+            .dead_tuples
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_sub(reclaimed))
+            });
+
+        tracing::info!(
+            table = name,
+            horizon,
+            versions_reclaimed = report.versions_reclaimed,
+            bytes_reclaimed = report.bytes_reclaimed,
+            horizon_blocked = report.horizon_blocked,
+            "vacuum_table complete"
+        );
+        Ok(report)
+    }
+
+    /// Autovacuum-bookkeeping wrapper for `vacuum_table` (V2, item 27): runs
+    /// the per-table pass and increments the autovacuum run counters.
+    pub fn run_autovacuum_pass_for_table(&self, name: &str) -> Result<VacuumReport> {
+        let report = self.vacuum_table(name)?;
+        self.autovacuums_triggered.fetch_add(1, Ordering::Relaxed);
+        self.last_autovacuum_epoch_secs
+            .store(crate::autovacuum::now_epoch_secs(), Ordering::Relaxed);
+        Ok(report)
+    }
+
     /// Record `n` freshly-dead versions (one `xmax` stamp each) for the
     /// autovacuum estimate (A1). Called from the raw-CRUD and SQL-statement
     /// chokepoints — never from `heap.rs`/recovery redo, which must not count.
@@ -2302,18 +2626,67 @@ impl Engine {
     }
 
     /// Fold one successful SQL statement's row-count into the autovacuum
-    /// estimates (A1). Mirrors the raw-CRUD chokepoints: UPDATE stamps dead
-    /// versions, DELETE stamps dead versions and drops live rows, INSERT adds
-    /// live rows. Other statement kinds don't churn tuples.
-    fn note_dml_result(&self, result: &ExecResult) {
+    /// estimates (A1 + V1). Mirrors the raw-CRUD chokepoints: UPDATE stamps
+    /// dead versions, DELETE stamps dead versions and drops live rows, INSERT
+    /// adds live rows. `table` is `Some(name)` for SQL DML (the name is known
+    /// from the logical plan before execution); `None` for internal callers
+    /// that don't carry a table context (not currently used, but preserves the
+    /// raw-CRUD pattern for safety). Both global and per-table counters are
+    /// updated when a table name is present.
+    fn note_dml_result(&self, result: &ExecResult, table: Option<&str>) {
         match result {
-            ExecResult::Updated { count } => self.note_dead_tuples(*count as u64),
+            ExecResult::Updated { count } => {
+                self.note_dead_tuples(*count as u64);
+                if let Some(name) = table {
+                    self.note_table_dead(name, *count as u64);
+                }
+            }
             ExecResult::Deleted { count } => {
                 self.note_dead_tuples(*count as u64);
                 self.note_live_delta(-(*count as i64));
+                if let Some(name) = table {
+                    self.note_table_dead(name, *count as u64);
+                    self.note_table_live_delta(name, -(*count as i64));
+                }
             }
-            ExecResult::Inserted { count } => self.note_live_delta(*count as i64),
+            ExecResult::Inserted { count } => {
+                self.note_live_delta(*count as i64);
+                if let Some(name) = table {
+                    self.note_table_live_delta(name, *count as i64);
+                }
+            }
             _ => {}
+        }
+    }
+
+    /// Increment the per-table dead-tuple estimate (V1, item 27). Brief lock;
+    /// never held across page-latch or WAL I/O.
+    fn note_table_dead(&self, name: &str, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let mut map = self
+            .per_table_estimates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.entry(name.to_owned()).or_default().dead += n;
+    }
+
+    /// Adjust the per-table live-tuple estimate by `delta` (V1, item 27).
+    /// Saturating at 0; never held across page-latch or WAL I/O.
+    fn note_table_live_delta(&self, name: &str, delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        let mut map = self
+            .per_table_estimates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let est = map.entry(name.to_owned()).or_default();
+        if delta >= 0 {
+            est.live = est.live.saturating_add(delta as u64);
+        } else {
+            est.live = est.live.saturating_sub((-delta) as u64);
         }
     }
 
@@ -2714,6 +3087,8 @@ impl Engine {
         let _ws = serial_lock(&self.write_serial);
         let horizon = self.txn_mgr.vacuum_horizon();
         let page_size = self.page_size;
+        // V3: one throttle budget for the whole full-engine pass.
+        let mut throttle = VacuumThrottle::from_config(self.vacuum_cost_config());
         let mut report = VacuumReport {
             horizon,
             horizon_blocked: horizon < self.txn_mgr.next_xid(),
@@ -2727,7 +3102,8 @@ impl Engine {
         let table_defs: Vec<TableDef> = cat_read(&self.catalog).tables().cloned().collect();
         for table in &table_defs {
             let heap = Heap::open(page_size, table.fsm_meta, table.pages.clone());
-            report.rows_scanned += count_live_slots(&heap, &self.pool)?;
+            let live_before = count_live_slots(&heap, &self.pool)?;
+            report.rows_scanned += live_before;
             let reclaimable = heap.collect_reclaimable(horizon, &self.pool)?;
             if reclaimable.is_empty() {
                 continue;
@@ -2788,6 +3164,7 @@ impl Engine {
             // (b) Mark every reclaimable version DEAD (not yet reusable).
             for rid in &reclaimable {
                 heap.mark_dead(*rid, &self.pool, &self.wal)?;
+                throttle.charge_read(); // V3: one read per page touch
             }
 
             // (c) The aliasing gate: scrub the reclaimed RowIds from every
@@ -2810,9 +3187,22 @@ impl Engine {
             // space, promote DEAD→UNUSED.
             for pid in unique_pages(&reclaimable) {
                 report.bytes_reclaimed += heap.compact_page(pid, &self.pool, &self.wal)?;
+                throttle.charge_dirty(); // V3: one write per compacted page
             }
             report.versions_reclaimed += reclaimable.len();
             report.slots_freed += reclaimable.len();
+
+            // V1: refresh per-table estimates for this table after the pass.
+            {
+                let reclaimed_here = reclaimable.len() as u64;
+                let mut map = self
+                    .per_table_estimates
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let est = map.entry(table.name.clone()).or_default();
+                est.live = live_before as u64;
+                est.dead = est.dead.saturating_sub(reclaimed_here);
+            }
         }
 
         // The raw-CRUD heap: no secondary indexes reference it, so no index
@@ -2822,9 +3212,11 @@ impl Engine {
         if !raw_reclaimable.is_empty() {
             for rid in &raw_reclaimable {
                 self.heap.mark_dead(*rid, &self.pool, &self.wal)?;
+                throttle.charge_read();
             }
             for pid in unique_pages(&raw_reclaimable) {
                 report.bytes_reclaimed += self.heap.compact_page(pid, &self.pool, &self.wal)?;
+                throttle.charge_dirty();
             }
             report.versions_reclaimed += raw_reclaimable.len();
             report.slots_freed += raw_reclaimable.len();
@@ -2864,6 +3256,18 @@ impl Engine {
             "vacuum complete"
         );
         Ok(report)
+    }
+}
+
+/// Extract the target table name from a DML logical plan (V1, item 27) so
+/// the dead/live accounting can attribute churn to the right table. Returns
+/// `None` for non-DML statements (DDL, SELECT, etc.) which don't churn tuples.
+fn plan_dml_table(plan: &LogicalPlan) -> Option<&str> {
+    match plan {
+        LogicalPlan::Insert { table, .. }
+        | LogicalPlan::Update { table, .. }
+        | LogicalPlan::Delete { table, .. } => Some(table.as_str()),
+        _ => None,
     }
 }
 
@@ -5448,5 +5852,346 @@ mod tests {
         let got = engine.get(reader, rids[last]).unwrap();
         assert_eq!(&got[..4], &(last as u32).to_le_bytes());
         engine.commit(reader).unwrap();
+    }
+
+    // ── item 27: V1/V2/V3 vacuum-per-table tests ─────────────────────────────
+
+    /// V1 AC: churning one table accumulates dead-tuple pressure only for THAT
+    /// table; the quiet table has zero per-table dead estimate.
+    #[test]
+    fn per_table_estimates_track_churn_independently() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE t_churn (id INT, v INT)")
+            .unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE t_quiet (id INT, v INT)")
+            .unwrap();
+        for i in 0..5 {
+            engine
+                .execute_sql(x, &format!("INSERT INTO t_churn VALUES ({i}, 0)"))
+                .unwrap();
+            engine
+                .execute_sql(x, &format!("INSERT INTO t_quiet VALUES ({i}, 0)"))
+                .unwrap();
+        }
+        engine.commit(x).unwrap();
+        // After inserts only, no dead tuples anywhere.
+        assert_eq!(engine.per_table_dead_estimate("t_churn"), 0);
+        assert_eq!(engine.per_table_dead_estimate("t_quiet"), 0);
+        assert_eq!(engine.per_table_live_estimate("t_churn"), 5);
+        assert_eq!(engine.per_table_live_estimate("t_quiet"), 5);
+
+        // Update t_churn 10× — creates 10 dead versions on t_churn only.
+        for i in 1..=10 {
+            let x = engine.begin().unwrap();
+            engine
+                .execute_sql(x, &format!("UPDATE t_churn SET v = {i}"))
+                .unwrap();
+            engine.commit(x).unwrap();
+        }
+        // t_churn: 10 dead versions (one per UPDATE * 5 rows = 50? no, 10 UPDATEs each affect 5 rows)
+        // Actually: 10 UPDATE statements each touching 5 rows → 50 dead versions
+        assert!(
+            engine.per_table_dead_estimate("t_churn") > 0,
+            "t_churn should have dead tuples after churning"
+        );
+        assert_eq!(
+            engine.per_table_dead_estimate("t_quiet"),
+            0,
+            "t_quiet must not accumulate dead tuples from t_churn's churn"
+        );
+    }
+
+    /// V2 AC: `vacuum_table("t_churn")` reclaims only t_churn; t_other still
+    /// has its dead rows untouched.
+    #[test]
+    fn vacuum_table_scopes_to_one_table_only() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE t_churn (id INT, v INT)")
+            .unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE t_other (id INT, v INT)")
+            .unwrap();
+        for i in 0..3 {
+            engine
+                .execute_sql(x, &format!("INSERT INTO t_churn VALUES ({i}, 0)"))
+                .unwrap();
+            engine
+                .execute_sql(x, &format!("INSERT INTO t_other VALUES ({i}, 0)"))
+                .unwrap();
+        }
+        engine.commit(x).unwrap();
+
+        // Churn both tables.
+        let x = engine.begin().unwrap();
+        engine.execute_sql(x, "UPDATE t_churn SET v = 1").unwrap();
+        engine.execute_sql(x, "UPDATE t_other SET v = 1").unwrap();
+        engine.commit(x).unwrap();
+        assert!(engine.per_table_dead_estimate("t_churn") > 0);
+        assert!(engine.per_table_dead_estimate("t_other") > 0);
+
+        // Vacuum only t_churn.
+        let report = engine.vacuum_table("t_churn").unwrap();
+        assert!(
+            report.versions_reclaimed > 0,
+            "vacuum_table must reclaim t_churn's dead rows"
+        );
+        // t_churn's per-table estimate resets.
+        assert_eq!(
+            engine.per_table_dead_estimate("t_churn"),
+            0,
+            "t_churn dead estimate must reset after vacuum_table"
+        );
+        // t_other's dead versions remain — we only vacuumed t_churn.
+        assert!(
+            engine.per_table_dead_estimate("t_other") > 0,
+            "t_other must still have its dead versions after vacuum_table(t_churn)"
+        );
+    }
+
+    /// V1 trigger: churning one table fires `tables_needing_vacuum` for exactly
+    /// that table while the quiet table is not in the list.
+    #[test]
+    fn per_table_trigger_fires_only_for_churned_table() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        // Lower the threshold so we don't have to insert thousands of rows.
+        engine.set_autovacuum_config(AutoVacuumConfig {
+            threshold: 5,
+            scale_factor: 0.0,
+            ..AutoVacuumConfig::default()
+        });
+
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE hot (id INT, v INT)")
+            .unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE cold (id INT, v INT)")
+            .unwrap();
+        for i in 0..20 {
+            engine
+                .execute_sql(x, &format!("INSERT INTO hot VALUES ({i}, 0)"))
+                .unwrap();
+        }
+        engine
+            .execute_sql(x, "INSERT INTO cold VALUES (0, 0)")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        // Churn hot, leave cold untouched.
+        let x = engine.begin().unwrap();
+        engine.execute_sql(x, "UPDATE hot SET v = 99").unwrap();
+        engine.commit(x).unwrap();
+
+        let needs_vacuum = engine.tables_needing_vacuum();
+        assert!(
+            needs_vacuum.contains(&"hot".to_owned()),
+            "hot must need vacuum after churn: {needs_vacuum:?}"
+        );
+        assert!(
+            !needs_vacuum.contains(&"cold".to_owned()),
+            "cold must NOT need vacuum: {needs_vacuum:?}"
+        );
+    }
+
+    /// V2: manual `vacuum()` still does all tables (backward compatibility).
+    #[test]
+    fn manual_vacuum_covers_all_tables() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE a (id INT, v INT)")
+            .unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE b (id INT, v INT)")
+            .unwrap();
+        for i in 0..5 {
+            engine
+                .execute_sql(x, &format!("INSERT INTO a VALUES ({i}, 0)"))
+                .unwrap();
+            engine
+                .execute_sql(x, &format!("INSERT INTO b VALUES ({i}, 0)"))
+                .unwrap();
+        }
+        engine.commit(x).unwrap();
+        let x = engine.begin().unwrap();
+        engine.execute_sql(x, "UPDATE a SET v = 1").unwrap();
+        engine.execute_sql(x, "UPDATE b SET v = 1").unwrap();
+        engine.commit(x).unwrap();
+
+        // Full engine vacuum reclaims both tables.
+        let report = engine.vacuum().unwrap();
+        assert!(
+            report.versions_reclaimed >= 10,
+            "full vacuum must reclaim both tables: {report:?}"
+        );
+        assert_eq!(engine.per_table_dead_estimate("a"), 0);
+        assert_eq!(engine.per_table_dead_estimate("b"), 0);
+    }
+
+    /// V3: cost throttle fires (at least one nap budget should be consumed
+    /// under a heavy vacuum pass when the cost limit is set very low). We prove
+    /// the mechanism is wired by checking the pass succeeds and reclaims rows
+    /// even with an aggressive cost limit.
+    #[test]
+    fn vacuum_cost_throttle_reclaims_correctly_under_tight_budget() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        // Tiny limit so the throttle fires on each dirty page.
+        engine.set_vacuum_cost_config(VacuumCostConfig {
+            enabled: true,
+            cost_limit: 1,
+            cost_delay_ms: 0, // 0ms delay so test doesn't slow down
+            page_hit_cost: 1,
+            page_dirty_cost: 1,
+        });
+
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE t (id INT, v INT)")
+            .unwrap();
+        for i in 0..10 {
+            engine
+                .execute_sql(x, &format!("INSERT INTO t VALUES ({i}, 0)"))
+                .unwrap();
+        }
+        engine.commit(x).unwrap();
+        let x = engine.begin().unwrap();
+        engine.execute_sql(x, "UPDATE t SET v = 99").unwrap();
+        engine.commit(x).unwrap();
+        assert!(engine.per_table_dead_estimate("t") > 0);
+
+        // vacuum_table must succeed even with a very tight cost budget.
+        let report = engine.vacuum_table("t").unwrap();
+        assert!(
+            report.versions_reclaimed > 0,
+            "throttled vacuum_table must still reclaim rows: {report:?}"
+        );
+        assert_eq!(
+            engine.per_table_dead_estimate("t"),
+            0,
+            "per-table estimate must reset after throttled vacuum_table"
+        );
+    }
+
+    /// V2: `vacuum_table` on an unknown table returns an error.
+    #[test]
+    fn vacuum_table_unknown_table_returns_error() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        let err = engine.vacuum_table("nonexistent").unwrap_err();
+        assert!(
+            matches!(err, DbError::TableNotFound(_)),
+            "expected TableNotFound, got {err:?}"
+        );
+    }
+
+    /// Item-27 measurement: bloat reclamation + throttle overhead (run with
+    /// `cargo test --release -- item27_measurement --nocapture` to see numbers).
+    #[test]
+    fn item27_measurement_bloat_and_throttle() {
+        let n_rows = 200usize;
+        let n_churns = 10usize;
+
+        // ── Bloat / reclamation numbers ──────────────────────────────────────
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE hot (id INT, v INT)")
+            .unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE cold (id INT, v INT)")
+            .unwrap();
+        for i in 0..n_rows {
+            engine
+                .execute_sql(x, &format!("INSERT INTO hot VALUES ({i}, 0)"))
+                .unwrap();
+        }
+        engine
+            .execute_sql(x, "INSERT INTO cold VALUES (0, 99)")
+            .unwrap();
+        engine.commit(x).unwrap();
+        for c in 1..=n_churns {
+            let x = engine.begin().unwrap();
+            engine
+                .execute_sql(x, &format!("UPDATE hot SET v = {c}"))
+                .unwrap();
+            engine.commit(x).unwrap();
+        }
+        let dead_before = engine.per_table_dead_estimate("hot");
+        let dead_cold = engine.per_table_dead_estimate("cold");
+        let report = engine.vacuum_table("hot").unwrap();
+        let dead_after = engine.per_table_dead_estimate("hot");
+        eprintln!(
+            "\n[item27 bloat] rows={n_rows} churns={n_churns}: \
+             dead_before={dead_before} cold_untouched={dead_cold} \
+             reclaimed={} dead_after={dead_after}",
+            report.versions_reclaimed
+        );
+
+        // ── V3 throttle overhead ─────────────────────────────────────────────
+        let dir2 = tempdir().unwrap();
+        let engine2 = Engine::open(dir2.path(), 0).unwrap();
+        let x = engine2.begin().unwrap();
+        engine2
+            .execute_sql(x, "CREATE TABLE t (id INT, v INT)")
+            .unwrap();
+        for i in 0..n_rows {
+            engine2
+                .execute_sql(x, &format!("INSERT INTO t VALUES ({i}, 0)"))
+                .unwrap();
+        }
+        engine2.commit(x).unwrap();
+
+        // Helper to churn + measure vacuum_table time
+        let churn = |e: &Engine, from: usize, to: usize| {
+            for c in from..=to {
+                let x = e.begin().unwrap();
+                e.execute_sql(x, &format!("UPDATE t SET v = {c}")).unwrap();
+                e.commit(x).unwrap();
+            }
+        };
+
+        churn(&engine2, 1, n_churns);
+        engine2.set_vacuum_cost_config(VacuumCostConfig {
+            enabled: true,
+            cost_limit: 50,
+            cost_delay_ms: 2,
+            page_hit_cost: 1,
+            page_dirty_cost: 20,
+        });
+        let t0 = std::time::Instant::now();
+        let rpt_throttled = engine2.vacuum_table("t").unwrap();
+        let throttled_us = t0.elapsed().as_micros();
+
+        churn(&engine2, n_churns + 1, n_churns * 2);
+        engine2.set_vacuum_cost_config(VacuumCostConfig {
+            enabled: false,
+            ..VacuumCostConfig::default()
+        });
+        let t0 = std::time::Instant::now();
+        let rpt_unthrottled = engine2.vacuum_table("t").unwrap();
+        let unthrottled_us = t0.elapsed().as_micros();
+
+        let ratio = throttled_us as f64 / unthrottled_us.max(1) as f64;
+        eprintln!(
+            "[item27 throttle] throttled={throttled_us}µs (reclaim={}) \
+             unthrottled={unthrottled_us}µs (reclaim={}) ratio={ratio:.1}×",
+            rpt_throttled.versions_reclaimed,
+            rpt_unthrottled.versions_reclaimed,
+        );
+
+        // Sanity: both passes reclaimed rows.
+        assert!(rpt_throttled.versions_reclaimed > 0);
+        assert!(rpt_unthrottled.versions_reclaimed > 0);
     }
 }

@@ -390,7 +390,7 @@ Phase 4 query power is next for the SQL lane). Metrics tables are in
 | M7 — CSR graph index | retired (P3.b) | Compressed Sparse Row adjacency; consulted by no read path after the M7 traversal revert, superseded by the durable edge index — retired from the runtime in P3.b |
 | M8 — Attach client | done | `unidb-attach`: Rust blocking-`reqwest` client over the REST API, no new protocol |
 | M10 — Heap vacuum / GC | done | `Engine::vacuum()`: reader-aware horizon, crash-safe `WAL_VACUUM`, secondary-index vacuum gate, page compaction + slot reuse |
-| Autovacuum (A1–A4) | done | Background `std::thread` launcher auto-triggers `Engine::vacuum` via a Postgres-shape policy (`dead > threshold + scale_factor·live`); dead/live estimates, `/stats` + `/metrics`, clean shutdown, crash point P26; bounds bloat with no manual call |
+| Autovacuum (A1–A4 + item 27) | done | Background `std::thread` launcher auto-triggers vacuum via Postgres-shape policy; **per-table** dead/live estimates (`Engine::per_table_dead_estimate`, `tables_needing_vacuum`), `Engine::vacuum_table` scoped pass, `VacuumCostConfig` cost throttle (page-hit/dirty accounting + nap), `/stats` + `/metrics`, clean shutdown, crash points P26 + P30 |
 | M11 — SQL constraints | done | `PRIMARY KEY` / `FOREIGN KEY` / `UNIQUE` / `NOT NULL` / `CHECK` / `DEFAULT` on `CREATE TABLE`, enforced on INSERT/UPDATE |
 | P2.a — DECIMAL + TIMESTAMP | done | Exact fixed-point `DECIMAL(p, s)` (money) and UTC `TIMESTAMP` (time) column types, with round-trip + ordering + constraint support (Phase 2, SQL lane) |
 | P2.b — FLOAT/UUID/BYTEA/DATE/TIME | done | Five more scalar types on the same encoding/coercion/comparison machinery |

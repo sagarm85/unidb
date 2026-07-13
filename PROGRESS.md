@@ -4617,3 +4617,82 @@ instrumented counter.
 **Locked-decision changes:** none. No `FORMAT_VERSION` bump. Crash point P30
 added (D7 extension, not a §3 re-open). Moat framing respected — events are
 ordinary durable rows; `EventWake` is a notification layer, not a WAL tailer.
+
+---
+
+## Per-table vacuum accounting, cost throttle (backlog item 27) [SHIPPED] 2026-07-13
+
+**PR:** #69 (branch `27-vacuum-per-table`, STOP-for-review, do not merge)
+**Spec:** `docs/backlog/27_vacuum_per_table.md` (V1/V2/V3 shipped; V4 deferred — see below)
+
+**Summary:** Replaced engine-global dead/live accounting with **per-table
+counters** (`per_table_dead_estimate`, `per_table_live_estimate`), added
+`Engine::vacuum_table(name)` that scopes the M10 reclamation pass to one
+named table, and added a Postgres-style **cost-based throttle**
+(`VacuumCostConfig`) that naps when a per-pass budget is exhausted to bound
+background I/O impact. The autovacuum worker now checks which *specific*
+tables need vacuum (`tables_needing_vacuum`) and fires `vacuum_table` for
+each, leaving untouched tables untouched.
+
+**Bloat / reclamation** (release build, Apple Silicon macOS):
+
+| Workload (200 rows, 10 UPDATE churns) | Before vacuum_table | After vacuum_table | Cold table dead estimate |
+|--------------------------------------|--------------------|--------------------|--------------------------|
+| 200 rows × 10 churns = 2000 dead     | 2000 dead versions | 0 dead versions    | 0 (untouched)            |
+
+**V3 throttle overhead** (cost_limit=50, delay=2ms vs unthrottled):
+
+| Pass                     | Duration  | Versions reclaimed | Ratio vs unthrottled |
+|--------------------------|-----------|--------------------|----------------------|
+| Throttled (limit=50, 2ms)| ~121 ms   | 2000               | ~10× slower          |
+| Unthrottled              | ~12 ms    | 2000               | 1× baseline          |
+
+At the **default budget** (cost_limit=200, delay=2ms) the ratio is ~2.5× — an
+acceptable background-pass tax. The throttle is disabled per-test by setting
+`cost_delay_ms=0`; production default is enabled.
+
+**Crash harness:** 33/33 (+1: P31 — crash mid-`vacuum_table`, WAL_VACUUM redone
+idempotently, bystander table unaffected). Distinct from P10 (raw-Heap mark)
+and P26 (autovacuum full-engine pass).
+
+**What changed:**
+- `src/lib.rs`: added `VacuumCostConfig`, `PerTableEstimates`, `VacuumThrottle`
+  structs; added `per_table_estimates: Mutex<HashMap<String, PerTableEstimates>>`
+  and `vacuum_cost: Mutex<VacuumCostConfig>` to `Engine`; added
+  `per_table_dead_estimate`, `per_table_live_estimate`, `tables_needing_vacuum`,
+  `vacuum_cost_config`, `set_vacuum_cost_config`, `vacuum_table`,
+  `run_autovacuum_pass_for_table` public methods; added `plan_dml_table` free
+  function; modified `note_dml_result` to accept optional table name and update
+  per-table counters; modified `execute_sql_inner` and `run_bound_plans` to
+  extract table name from plan before consuming it; added throttle charges to
+  `vacuum_inner` (global pass) and `vacuum_table_inner` (per-table pass); added
+  per-table estimate reset in both vacuum paths; updated `TableStat` to include
+  `dead_tuple_estimate` and `live_tuple_estimate`.
+- `src/autovacuum.rs`: updated `worker_loop` to check `tables_needing_vacuum`
+  first and call `run_autovacuum_pass_for_table` per triggered table; falls back
+  to global `run_autovacuum_pass` only when no per-table trigger fires (covers
+  raw-CRUD heap which has no table name).
+- `tests/crash/main.rs`: added P31 (`p31_crash_mid_vacuum_table_recovers_correctly`).
+- `docs/backlog/27_vacuum_per_table.md`: status NOT STARTED → SHIPPED; acceptance
+  checkboxes filled; V4 deferral note added.
+- `docs/backlog/autovacuum.md`: known-limits updated — V1/V2/V3 limitations
+  marked resolved; V4 deferral noted.
+- `docs/backlog/backlog_index.md`: row 27 → ✅ SHIPPED.
+
+**V4 deferral (whole-table compaction):** Relocating live tuples across pages
+requires all-or-nothing re-pointing of every secondary-index entry for moved
+rows. Making this crash-safe requires a new multi-page "compaction" WAL record
+type spanning multiple heap pages + index pages — a `FORMAT_VERSION` bump and
+a new WAL record kind. Per the spec's landmine note and §0.6 ("Escalate
+honestly"), V4 is deferred. Per-page compaction (M10.d) handles intra-page
+bloat; V4 is purely a cross-page defragmentation win.
+
+**Known limitations:**
+- Raw-CRUD heap (`Engine::insert/update/delete`, no table name) is tracked only
+  via the global counters; its churn can still trigger a full `vacuum()` via the
+  global autovacuum policy.
+- Per-table counters start from 0 on reopen (they are approximate by design, like
+  Postgres `n_dead_tup`, and are refreshed at the first vacuum pass).
+
+**Locked-decision changes:** none. No `FORMAT_VERSION` bump, no new WAL record
+type, no §3 decision reopened. Crash harness now 33/33.

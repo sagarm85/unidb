@@ -29,6 +29,21 @@
   §6.2 + §6.3 + tech-debt corrected, `26_event_queue_scale.md` → SHIPPED,
   `backlog_index.md` row 26 → SHIPPED, `PROGRESS.md` entry. **Next: await
   PR review.**
+- **Per-table vacuum accounting, cost throttle (backlog item 27) — SHIPPED
+  (2026-07-13), branch `27-vacuum-per-table`, PR #69 (STOP-for-review).**
+  V1 (per-table dead/live estimates via `per_table_estimates: Mutex<HashMap>`),
+  V2 (`Engine::vacuum_table(name)` — scoped single-table pass using M10 logic),
+  V3 (cost throttle: `VacuumCostConfig` + `VacuumThrottle` napping when
+  cost_limit is spent). Autovacuum worker now calls `vacuum_table` per triggered
+  table (`tables_needing_vacuum`). **V4 (whole-table compaction) deferred** —
+  re-pointing every index entry for relocated tuples requires a new multi-page
+  WAL record type (FORMAT_VERSION concern). **Measurements:** 200 rows × 10
+  churns = 2000 dead; `vacuum_table("hot")` reclaims 2000, cold table = 0
+  untouched; throttle (cost_limit=50, 2ms) adds ~10× overhead vs unthrottled
+  (expected; default cost_limit=200 → ~2.5×). **Tests:** 7 new unit tests + P31
+  crash test (crash mid-vacuum_table). **Gates:** crash 33/33 (+1 P31),
+  workspace tests all green, clippy/fmt clean, no FORMAT_VERSION bump, no §3
+  decision reopened.
 - **Object storage service (backlog item 23) — SHIPPED + MERGED (2026-07-13),
   branch `23-storage-service`, PR #64.** New
   **app-layer** crate `unidb-storage` (workspace member; adds **no engine

@@ -1,7 +1,7 @@
 # Vacuum — per-table accounting, cost throttle, whole-table compaction
 
 **Type:** Improvement
-**Status:** NOT STARTED
+**Status:** IN PROGRESS → SHIPPED 2026-07-13 (branch `27-vacuum-per-table`, PR pending)
 
 > Limitation from the architecture guide + `autovacuum.md` known-limits:
 > "engine-global (not per-table) accounting; no cost-based throttle; no
@@ -44,8 +44,28 @@
 
 ## Acceptance
 
-- [ ] Per-table trigger + `vacuum_table` proven (V1/V2).
-- [ ] Throttle bounds foreground impact (V3 measured).
-- [ ] Compaction releases trailing pages, crash-safe, index-correct (V4) — or
-      V4 deferred with a dated note if the re-point needs a format change.
-- [ ] Crash harness green; PROGRESS.md before/after bloat numbers.
+- [x] Per-table trigger + `vacuum_table` proven (V1/V2). See tests
+      `per_table_estimates_track_churn_independently`,
+      `per_table_trigger_fires_only_for_churned_table`,
+      `vacuum_table_scopes_to_one_table_only`, `manual_vacuum_covers_all_tables`.
+- [x] Throttle bounds foreground impact (V3 measured). See test
+      `vacuum_cost_throttle_reclaims_correctly_under_tight_budget` +
+      `item27_measurement_bloat_and_throttle`.
+- [x] V4 deferred — see §V4 deferral note below.
+- [x] Crash harness green (33/33, +1 for P31 crash-mid-vacuum_table).
+      PROGRESS.md entry with bloat numbers.
+
+## V4 deferral note (2026-07-13)
+
+Whole-table compaction (relocating live tuples to pack pages) requires that
+every secondary-index entry for a moved row be re-pointed atomically to the
+new RowId. Making this crash-safe in a single mini-txn requires bracketing the
+WAL_INSERT (new location), WAL_VACUUM (old slot), and WAL_INDEX updates for all
+affected indexes inside ONE redo/undo unit spanning multiple heap pages and
+index pages — which needs a new multi-page "compaction" WAL record type. That
+is a `FORMAT_VERSION` bump and a new WAL record kind. Per the spec's landmine
+note ("may defer V4 if it needs a format concern") and CLAUDE.md §6 ("Escalate
+honestly"), V4 is deferred until the multi-page compaction WAL record is
+designed and signed off. The per-page compaction that already ships (M10.d,
+`compact_page`) handles intra-page dead-slot reclamation; V4 is purely a
+cross-page defragmentation win and is not needed for correctness.

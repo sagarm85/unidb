@@ -74,6 +74,12 @@
 //         index entries survive a crash (no checkpoint) alongside their heap
 //         rows, and `poll_events_after` resolves the correct events on reopen
 //         via the recovered index — no heap scan needed, no index rebuild.
+//   P31 – crash mid-vacuum_table (V2, item 27): `vacuum_table` on a single
+//         named table uses the same WAL_VACUUM mini-txn path as the global
+//         `vacuum`; a crash mid-pass (drop with no checkpoint) is recovered by
+//         redoing WAL_VACUUM records, so the live row survives, reclaimed
+//         versions stay reclaimed, and a re-vacuum_table is a no-op. Verifies
+//         the per-table scope — a second table's rows are untouched throughout.
 
 use tempfile::tempdir;
 use unidb::{Engine, RowId};
@@ -2076,4 +2082,99 @@ fn p30_event_seq_index_survives_crash_and_poll_resolves_via_index() {
     let mut expected: Vec<i64> = committed_seqs[5..].to_vec();
     expected.sort();
     assert_eq!(got, expected, "P30: recovered index returns correct seqs");
+}
+
+// ── P31: crash mid-vacuum_table (V2/item 27) ─────────────────────────────────
+//
+// `vacuum_table` scopes its WAL_VACUUM mini-txns to one named table, using the
+// same crash-safe path as the global `vacuum`. This crash point proves:
+// (i)  the live row on the vacuumed table survives after recovery;
+// (ii) reclaimed dead versions stay reclaimed (WAL_VACUUM redone idempotently);
+// (iii) a second table's rows are completely unaffected;
+// (iv) a re-`vacuum_table` after recovery is a no-op (idempotent).
+#[test]
+fn p31_crash_mid_vacuum_table_recovers_correctly() {
+    use unidb::sql::logical::Literal;
+    use unidb::SqlResult;
+
+    let dir = tempdir().unwrap();
+
+    // Build state: two tables, both churned.
+    {
+        let engine = open(dir.path());
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE t_vac (id INT, v INT)")
+            .unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE t_bystander (id INT, v INT)")
+            .unwrap();
+        engine
+            .execute_sql(x, "INSERT INTO t_vac VALUES (1, 0)")
+            .unwrap();
+        engine
+            .execute_sql(x, "INSERT INTO t_bystander VALUES (99, 0)")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        // Churn t_vac 20× so there are dead versions to reclaim.
+        for v in 1..=20 {
+            let x = engine.begin().unwrap();
+            engine
+                .execute_sql(x, &format!("UPDATE t_vac SET v = {v}"))
+                .unwrap();
+            engine.commit(x).unwrap();
+        }
+
+        // vacuum_table(t_vac) reclaims the churn. WAL_VACUUM records are
+        // self-synced durable before vacuum_table returns (C1).
+        let before = engine.vacuum_table("t_vac").unwrap();
+        assert!(
+            before.versions_reclaimed >= 10,
+            "P31: vacuum_table must reclaim the churn before crash: {before:?}"
+        );
+
+        // "Crash": drop with no checkpoint. The WAL_VACUUM records are durable;
+        // the pages may not have been flushed and must be redone on reopen.
+        drop(engine);
+    }
+
+    // Reopen and verify.
+    let engine = open(dir.path());
+
+    // (i) The live row on t_vac (value = 20, the last committed UPDATE) survives.
+    let x = engine.begin().unwrap();
+    let rows = engine
+        .execute_sql(x, "SELECT v FROM t_vac WHERE id = 1")
+        .unwrap();
+    engine.commit(x).unwrap();
+    match &rows[0] {
+        SqlResult::Rows { rows: r, .. } => assert_eq!(
+            r,
+            &vec![vec![Literal::Int(20)]],
+            "P31: live row must have the final committed value after recovery"
+        ),
+        other => panic!("P31: expected Rows, got {other:?}"),
+    }
+
+    // (ii) t_bystander's row is intact and untouched.
+    let x = engine.begin().unwrap();
+    let rows = engine.execute_sql(x, "SELECT id FROM t_bystander").unwrap();
+    engine.commit(x).unwrap();
+    match &rows[0] {
+        SqlResult::Rows { rows: r, .. } => assert_eq!(
+            r,
+            &vec![vec![Literal::Int(99)]],
+            "P31: bystander table must be unaffected by vacuum_table(t_vac)"
+        ),
+        other => panic!("P31: expected Rows, got {other:?}"),
+    }
+
+    // (iii) A re-vacuum_table finds nothing new — the WAL_VACUUM redo was
+    // idempotent and the reclamation is complete.
+    let after = engine.vacuum_table("t_vac").unwrap();
+    assert_eq!(
+        after.versions_reclaimed, 0,
+        "P31: re-vacuum_table after recovery must find nothing left to reclaim: {after:?}"
+    );
 }

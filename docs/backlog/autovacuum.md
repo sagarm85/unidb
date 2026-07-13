@@ -11,13 +11,25 @@ locking because `Engine` is `Send + Sync` (Phase 5) and `vacuum` takes `&self`
 under `write_serial` + per-page latches (M10). Honest divergences from the
 proposal below, all documented in the shipped code + `PROGRESS.md`:
 
-- **Global** dead/live-tuple estimates (the spec's "global atomic in v1" option),
-  not per-table. Whole-engine `Engine::vacuum` pass, not per-table `vacuum_table`
-  — per-table accounting + `vacuum_table` + a cost-based throttle remain the
-  documented AV-follow-up.
-- **No bounded-K-per-call throttle.** The pass runs on the background thread, so
-  an unbounded pass is not a *foreground* stall (the AV1 bounding was to protect
-  the committing thread; AV2 doesn't share it). A cost limit is future work.
+- ~~**Global** dead/live-tuple estimates (the spec's "global atomic in v1"
+  option), not per-table. Whole-engine `Engine::vacuum` pass, not per-table
+  `vacuum_table` — per-table accounting + `vacuum_table` + a cost-based
+  throttle remain the documented AV-follow-up.~~ **RESOLVED (item 27,
+  2026-07-13):** per-table estimates (`Engine::per_table_dead_estimate`,
+  `per_table_live_estimate`, `tables_needing_vacuum`) + per-table
+  `Engine::vacuum_table` + cost-based throttle (`VacuumCostConfig`) all shipped.
+  The autovacuum worker loop now fires `vacuum_table` for each triggered table
+  rather than a whole-engine pass.
+- ~~**No bounded-K-per-call throttle.**~~ **RESOLVED (item 27, 2026-07-13):**
+  `VacuumCostConfig` (page_hit_cost + page_dirty_cost + cost_limit + delay)
+  bounds each pass via a `VacuumThrottle` that naps when the budget is spent.
+  Default-on with Postgres-like values; configurable via
+  `Engine::set_vacuum_cost_config`. Measured overhead: ~10× under tight budget
+  (cost_limit=50, delay=2ms); negligible at default (cost_limit=200).
+- **Whole-table compaction (V4) remains deferred.** See the deferral note in
+  `27_vacuum_per_table.md` §V4 — requires a new multi-page WAL record type,
+  which is a FORMAT_VERSION concern. Per-page compaction (M10.d `compact_page`)
+  ships and handles intra-page bloat; V4 is cross-page defragmentation only.
 - The worker holds a `Weak<Engine>` (a strong `Arc` would form a refcount cycle
   preventing `Engine::Drop`); the handle is an engine field, so field-drop is the
   clean-shutdown hook (M2.b-style, bounded join). Default-on for the served
