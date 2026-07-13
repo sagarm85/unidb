@@ -33,7 +33,7 @@
 | 17 | `17_mm_replaced_stack_headline.md` | Performance | ✅ SHIPPED (PROGRESS: Cross-domain headline vs replaced stack) |
 | 18 | `18_engine_access_contract.md` | Milestone | ✅ SHIPPED (PROGRESS: Engine access & introspection contract (Milestone 18)) |
 | 19 | `19_sql_surface_gaps.md` | Improvement | ⏳ NOT STARTED |
-| 20 | `20_events_realtime_dispatcher.md` | Milestone | ⏳ NOT STARTED |
+| 20 | `20_events_realtime_dispatcher.md` | Milestone | ✅ SHIPPED (PROGRESS: Events / realtime dispatcher (Milestone 20)) |
 | 21 | `21_observability_metrics.md` | Improvement | ⏳ NOT STARTED |
 | 22 | `22_logs_surface.md` | Improvement | ✅ SHIPPED (PROGRESS: Logs surface — JSON structured logs, correlation ids, bounded /logs tail) |
 | 23 | `23_storage_service.md` | Milestone | ⏳ NOT STARTED |

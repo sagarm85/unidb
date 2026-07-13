@@ -24,7 +24,8 @@
 5. [Results, types & paging](#5-results-types--paging)
 6. [Recipe: a schema explorer in 30 lines](#6-recipe-a-schema-explorer-in-30-lines)
 7. [Errors](#7-errors)
-8. [Honest limitations](#8-honest-limitations)
+8. [Consume the event stream (change events)](#8-consume-the-event-stream-change-events)
+9. [Honest limitations](#9-honest-limitations)
 
 ---
 
@@ -365,7 +366,105 @@ distinctions as typed `DbError` variants.
 
 ---
 
-## 8. Honest limitations
+## 8. Consume the event stream (change events)
+
+*(Milestone 20, Epic E.)* Opt a table into **event capture** and every
+committed `INSERT`/`UPDATE`/`DELETE` on it also appends a change event —
+**captured atomically in the very same WAL append/commit as the write itself**.
+There is no Debezium-style log tailer, no separate CDC connector, and therefore
+no split-brain or capture lag: if the row is committed, its event is committed,
+in one transaction, in one log. This is the primitive the studio "Events" tab
+and any downstream service consume.
+
+Enable it once per table:
+
+| Path | Call |
+|---|---|
+| **Embed** | `engine.enable_events("orders")` |
+| **Attach** | `client.enable_events("orders")` |
+| **Server** | `POST /tables/orders/events` |
+
+### 8.1 The event payload (the stable contract)
+
+Every event is a row of the engine-managed `__events__` table, delivered as this
+JSON object. These field names are the contract:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `seq` | integer | **Monotonic per-database offset**, assigned in commit order. This *is* the cursor/"LSN" of the stream: consumers resume from, ack, and dedupe on `seq`. Dense and gap-free across enabled tables. |
+| `xid` | integer | Transaction id that produced the event. All events sharing an `xid` were committed atomically together (use it to reassemble a multi-row/multi-table transaction). |
+| `table_name` | string | Source table. |
+| `op` | string | `"insert"`, `"update"`, or `"delete"`. |
+| `payload` | object | **Full row image** keyed by column name — the post-image for insert/update, the pre-image for delete. Typed exactly as [§5](#5-results-types--paging) describes (decimals/timestamps as canonical strings, JSON columns embedded not double-encoded, vectors as arrays). |
+
+> **Honest scope of the contract.** `seq` is the ordering key and offset — unidb
+> does **not** expose the physical WAL byte-LSN as a separate event field (it
+> would leak a storage-internal number with no consumer use that `seq` doesn't
+> already serve), and there is **no wall-clock `timestamp` column** on the event
+> today: the stream carries commit *order*, not commit *time*. A consumer that
+> needs receipt time stamps it on arrival; a producer that needs event time puts
+> it in its own row column, where it rides through in `payload`. The engine emits
+> raw row-level facts and transforms nothing — all shaping is consumer-side.
+
+### 8.2 Consuming: durable consumers vs. live tail
+
+Two models, one stream:
+
+- **Durable consumer (at-least-once).** Poll with a named consumer; the engine
+  tracks that consumer's **durable** offset. Process the batch, then `ack` up to
+  the last `seq` you handled. A crash before ack ⇒ redelivery (dedupe on `seq`).
+  This is the Kafka manual-commit shape.
+  - Embed: `poll_events(xid, "billing", limit)` → process → `ack_events(xid, "billing", up_to_seq)`.
+  - Server: `GET /events/subscribe?consumer=billing` (SSE) → `POST /events/ack`.
+    Acks travel over `/events/ack`, never over the SSE connection.
+- **Ephemeral live tail (at-most-once).** For a browser `EventSource` that just
+  wants to watch a table: `GET /events/subscribe` with **no** `consumer`. Nothing
+  is written to the consumer registry. Resume-from-offset on reconnect is the
+  standard SSE `Last-Event-ID` header (each frame carries `id: <seq>`), or an
+  explicit `?from_seq=<seq>` for offset scrubbing / replay-from-offset. An
+  optional `?table=<name>` filters to one table. Heartbeats keep the idle
+  connection open.
+
+### 8.3 Replay & the vacuum-horizon contract
+
+Events are ordinary durable rows, so **replay is just reading from an earlier
+offset**: a durable consumer that acks a lower `seq` (or a fresh consumer that
+never acked) re-receives history; an ephemeral tail replays from any `from_seq`.
+
+Retention is bounded by the **all-consumers vacuum horizon**: `vacuum_events`
+(embed) / `POST /events/vacuum` (server) reclaims only events every *registered*
+consumer has already acked past — never automatically. The consequences a
+consumer must respect:
+
+- A **slow or stopped durable consumer pins retention**: its un-acked events
+  cannot be vacuumed, so `__events__` grows until it catches up. Monitor lag and
+  surface "consumer too far behind" loudly (the reference dispatcher does — see
+  below); a consumer you will never resume should be dropped so it stops holding
+  the horizon.
+- **Vacuuming past an offset makes that history unreplayable.** Don't vacuum
+  below the earliest offset any consumer (or planned replay) still needs.
+- A **not-yet-registered** consumer has no offset, so `vacuum_events` cannot
+  account for it — register (first `ack`) before you rely on full history.
+
+### 8.4 The reference dispatcher (`unidb-dispatch`)
+
+`unidb-dispatch` (workspace crate) is the app-layer fan-out service: it embeds
+the engine, consumes from a **durable offset**, and fans events out to webhooks
+(retry with exponential backoff, then **dead-letter into a unidb table** —
+dogfood) and in-process rooms (the primitive a WebSocket/SSE room layer
+subscribes to), with per-subscription table/op filters and column projection.
+It adds **no engine surface** — it only drives the calls above — and it keeps
+`tokio`/`reqwest` out of the engine's default (sync) build. Delivery is
+at-least-once; a failing endpoint is retried then dead-lettered while the offset
+still advances, so a poison event cannot wedge the stream.
+
+> The studio **"Events" tab** (live viewer, offset scrubbing, replay-from-offset,
+> per-table enable/disable) is built on exactly these routes and lives in the
+> `unidb-studio` repo — out of scope for the engine, by design.
+
+---
+
+## 9. Honest limitations
 
 - **FK is metadata-only (M11).** Foreign keys parse, persist, and introspect, but
   only referenced-*table* existence is enforced — not referenced-*row* existence,
@@ -389,4 +488,6 @@ distinctions as typed `DbError` variants.
 
 *Milestone 18 (engine access & introspection contract). See
 `docs/backlog/18_engine_access_contract.md` for the spec + design note, and
-`docs/REST_API.md` for the exhaustive HTTP route/error reference.*
+`docs/REST_API.md` for the exhaustive HTTP route/error reference. §8 (event
+stream / change events) was added by Milestone 20 —
+`docs/backlog/20_events_realtime_dispatcher.md`.*

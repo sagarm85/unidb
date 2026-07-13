@@ -292,7 +292,7 @@ default embedded build stays sync with no new dependency.
 
 ## Project layout
 
-The repo root is a Cargo workspace with two members: `unidb` (the embedded engine — everything below stays at the repo root, unaffected by the workspace split) and `unidb-attach` (the REST attach client, M8).
+The repo root is a Cargo workspace: `unidb` (the embedded engine — everything below stays at the repo root, unaffected by the workspace split) plus `unidb-attach` (the REST attach client, M8), `unidb-embed` (client-side embedding CLI), and `unidb-dispatch` (the downstream event dispatcher, Milestone 20 — embeds the engine, fans the event stream out to webhooks/rooms; keeps `tokio`/`reqwest` out of the engine's default sync build).
 
 ```
 src/
@@ -317,7 +317,7 @@ src/
   disk_vector.rs   — P3.c: durable on-disk IVF-Flat vector index (DiskIvfIndex); posting lists = durable DiskBTree, centroids in a WAL-logged meta page; backs CREATE INDEX ... USING HNSW|IVF and NEAR, no rebuild on open
   large_object.rs  — P3.d: out-of-line chunked + streamed large objects (__lobs__ rows + durable lob_id index); Engine::{put,read,delete}_large_object
   graph/           — edges.rs, index.rs, logical.rs, parser.rs, executor.rs (Cypher subset)
-  queue/           — mod.rs (event capture, poll/ack/vacuum), payload.rs
+  queue/           — mod.rs (event capture, poll/ack/vacuum + poll_events_after live-tail cursor, M20 E1), payload.rs
   replication/     — P6.b/c: SlotRegistry (slots.json) + Replica (base snapshot + incremental WAL apply, promote/failover)
   backup/          — P6.d: base backup, WAL archiving, and restore/PITR (by target LSN)
   authz/           — P6.e: RoleStore (roles.json) — users/roles/GRANT, per-table privileges, auth-DDL parser
@@ -349,6 +349,12 @@ unidb-attach/
   src/lib.rs       — AttachClient: blocking reqwest client over the REST API (M8), Rust-only v1
   tests/           — attach_crud.rs, attach_sql.rs, attach_graph.rs, attach_extras.rs
   benches/attach.rs — attach-client call overhead vs. direct embedded Engine calls
+unidb-dispatch/    — Milestone 20 (E2): downstream event dispatcher (own workspace crate, embeds Arc<Engine>)
+  src/lib.rs       — Dispatcher: durable-offset poll→fan-out→ack loop, at-least-once, lag/vacuum-horizon warning
+  src/sink.rs      — Sink trait + WebhookSink (retry→dead-letter), RoomSink (broadcast rooms), CollectingSink
+  src/filter.rs    — per-subscription table/op filter + column projection (consumer-side; engine transforms nothing)
+  src/dlq.rs       — dead-letter table dogfooded back into unidb (create + $n-bound insert)
+  tests/           — dispatch_delivery.rs (at-least-once + resume + crash/replay zero-loss), dispatch_webhook_dlq.rs
 ```
 
 ---
@@ -369,7 +375,8 @@ Phase 4 query power is next for the SQL lane). Metrics tables are in
 | M2 — Vector & Text search | done | `VECTOR(n)` type, async HNSW index, `NEAR` operator, full-text inverted index |
 | M3 — Graph | done | Edge records, edge-list index, Cypher subset |
 | M4 — Event queue | done | WAL-derived stream, durable consumer offsets, `vacuum_events` |
-| M5 — API / server | done | Optional REST server (`docs/REST_API.md`) + verify-only JWT auth + SSE subscribe + `/metrics` |
+| M5 — API / server | done | Optional REST server (`docs/REST_API.md`) + verify-only JWT auth + SSE subscribe (durable-consumer *and* ephemeral live-tail with `Last-Event-ID`/`from_seq` resume + `table` filter, M20 E1) + `/metrics` |
+| M20 — Events dispatcher | done | E1 SSE framing/resume; E2 `unidb-dispatch` crate — durable-offset fan-out to webhooks (retry→dead-letter table, dogfood) + rooms, at-least-once, crash/replay zero-loss; E3 event-schema contract in `docs/engine_access_guide.md` |
 | M6 — B-Tree index | done | General-purpose secondary index for equality/range `WHERE` predicates, index-assisted `SELECT` |
 | M7 — CSR graph index | retired (P3.b) | Compressed Sparse Row adjacency; consulted by no read path after the M7 traversal revert, superseded by the durable edge index — retired from the runtime in P3.b |
 | M8 — Attach client | done | `unidb-attach`: Rust blocking-`reqwest` client over the REST API, no new protocol |

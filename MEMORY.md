@@ -50,6 +50,40 @@
   ops_runbook §8, README, engine_design (§8 + module map + footer), backlog
   index + item-22 doc → SHIPPED, PROGRESS entry. **This closes item 22 (L1–L3,
   L5); L4 is studio-side.**
+- **Events / realtime dispatcher (backlog Milestone 20) — SHIPPED (2026-07-13),
+  branch `20-events-dispatcher`, PR pending.** Makes M4's atomically-captured
+  event stream consumable downstream **without any new engine application
+  shape** (M18 boundary holds). **E1 (framing only):** `GET /events/subscribe`
+  gained an ephemeral live-tail mode (no durable consumer) resuming from the
+  standard SSE `Last-Event-ID` header / `?from_seq=` / `?table=` filter, backed
+  by one **read-only** engine method `poll_events_after(after_seq, limit)`
+  (`src/lib.rs`, also on `server::engine_handle`); durable-consumer at-least-once
+  mode unchanged. **E2:** new workspace crate **`unidb-dispatch`** (`src/{lib,
+  sink,filter,dlq}.rs`) — embeds `Arc<Engine>`, polls a durable offset, fans out
+  to `WebhookSink` (retry→**dead-letter table dogfooded into unidb**) + `RoomSink`
+  (broadcast rooms) with per-sub table/op filter + column projection, then acks;
+  at-least-once, crash/replay zero-loss. **Justification for own crate (not a
+  server module):** keeps `tokio`/`reqwest` OUT of the `unidb` crate — `cargo
+  tree -p unidb --no-default-features --edges normal` shows no async runtime, so
+  "engine stays sync" is literally true. **E3:** event-schema + replay/
+  vacuum-horizon contract in `docs/engine_access_guide.md §8`. **E4 (studio tab)
+  = out of repo.** Acceptance proven: `unidb-dispatch/tests/dispatch_delivery.rs`
+  (I/U/D once-each, resume-from-durable-offset with **zero loss across
+  drop+reopen**, crash-between-deliver-and-ack **redelivers**) +
+  `dispatch_webhook_dlq.rs` (500-endpoint retried 3×→dead-lettered, offset still
+  advances) + `tests/server_events.rs` ephemeral-resume tests. **Honest caveat
+  (§0.6):** inherits M4 `poll_events` O(total-events)/no-`seq`-index cost →
+  ≈O(N²/limit) drain; fast through N=4k (~95–120k ev/s drain; ingest fsync-bound
+  ~300 ev/s), bites at large backlog — fix = engine-side `seq` index (M4 tech
+  debt, not opened). Dispatcher pins the vacuum horizon if it falls behind →
+  `CycleReport.backlogged` + `WARN`. **No `FORMAT_VERSION` bump, crash harness
+  stays 31/31, no §3 decision reopened, moat framing respected** (events stay
+  ordinary durable rows; dispatcher consumes the table, not the WAL). Gates
+  (post-rebase onto item 22): `-p unidb` 380 + `--features server` (all bins,
+  incl. item-22 server_logs/logs_correlation) + `-p unidb-dispatch` (6+4) all
+  green, crash 31/31, clippy/fmt clean, sync invariant (no tokio in engine). See
+  PROGRESS "Events / realtime dispatcher (Milestone
+  20)", `docs/backlog/20_events_realtime_dispatcher.md`.
 - **Engine access & introspection contract (backlog Milestone 18) — SHIPPED
   (2026-07-13), branch `18-engine-access-contract-impl`, PR pending.** Delivered
   a SQL-queryable **system catalog** as synthesized virtual relations over the

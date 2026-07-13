@@ -232,6 +232,18 @@ impl EngineHandle {
             .await
     }
 
+    /// E1 ephemeral live-tail cursor (item 20): events past `after_seq`, no
+    /// durable consumer touched. Backs `Last-Event-ID`/`from_seq` resume.
+    pub async fn poll_events_after(
+        &self,
+        xid: Xid,
+        after_seq: i64,
+        limit: usize,
+    ) -> Result<Vec<Event>> {
+        self.on_engine(move |e| e.poll_events_after(xid, after_seq, limit))
+            .await
+    }
+
     pub async fn ack_events(&self, xid: Xid, consumer: String, up_to_seq: i64) -> Result<()> {
         self.on_engine(move |e| e.ack_events(xid, &consumer, up_to_seq))
             .await

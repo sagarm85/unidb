@@ -1,0 +1,29 @@
+[package]
+name = "unidb-dispatch"
+version = "0.1.0"
+edition = "2021"
+description = "Downstream event dispatcher for unidb's M4 WAL-derived event stream (backlog item 20, Epic E2). Subscribes from a durable consumer offset and fans events out to webhooks (with retry + a dead-letter table dogfooded back into unidb) and in-process rooms."
+
+# `unidb-dispatch` is an APP-LAYER crate. It embeds the engine (`Arc<Engine>`)
+# and drives the existing M4 queue API (`enable_events`/`poll_events`/
+# `ack_events`/`vacuum_events`) — it adds NO engine surface. tokio/reqwest live
+# HERE, never in the `unidb` engine crate, so the "no async runtime in the
+# default engine build" invariant (CLAUDE.md; `cargo tree -p unidb
+# --no-default-features --edges normal` shows no tokio) is preserved: this crate
+# depends on `unidb` with its default (sync) features only.
+[dependencies]
+unidb = { path = ".." }
+tokio = { version = "1.52", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+async-trait = "0.1"
+thiserror = "1.0"
+
+[dev-dependencies]
+tempfile = "3"
+# The webhook DLQ test spins a tiny in-process HTTP endpoint (returns 500) to
+# prove retry→dead-letter, so the test binary needs tokio's net + io-util on
+# top of the lib's runtime features. Dev-only; the lib itself stays minimal.
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }

@@ -1,5 +1,5 @@
 [workspace]
-members = ["unidb-attach", "unidb-embed", "loom-crabbing"]
+members = ["unidb-attach", "unidb-embed", "loom-crabbing", "unidb-dispatch"]
 resolver = "2"
 
 [package]

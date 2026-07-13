@@ -4298,3 +4298,96 @@ warnings`); `fmt --check` clean. Default-build dependency graph unchanged.
 
 **Locked-decision changes:** none. No on-disk format change, no crash-point
 change, no §3 decision reopened.
+## Events / realtime dispatcher (Milestone 20)   [SHIPPED]   2026-07-13
+
+**PR:** _pending (branch `20-events-dispatcher`)_
+**Backlog:** `docs/backlog/20_events_realtime_dispatcher.md`.
+
+**Summary:** Make M4's WAL-derived event stream — CDC captured **atomically with
+the commit** (one WAL, no Debezium-style lag/split-brain) — consumable
+downstream, **without teaching the engine any application shape** (the M18
+boundary holds: the engine emits raw row-level facts, all delivery semantics
+live outside it). Three epics shipped (E4, the studio "Events" tab, is
+out-of-repo by design): **E1** SSE framing + resume on the existing subscribe
+route; **E2** a new workspace crate `unidb-dispatch` that fans the stream out;
+**E3** the event-schema + replay/vacuum-horizon contract in
+`docs/engine_access_guide.md §8`.
+
+**E1 (engine-server, framing only).** `GET /events/subscribe` gained an
+*ephemeral live-tail* mode (no durable consumer): a per-connection cursor seeded
+from the standard SSE `Last-Event-ID` reconnect header, else `?from_seq=`, plus
+an optional `?table=` filter; each frame already carries `id: <seq>`.
+Durable-consumer mode (at-least-once, resumes from the acked offset) is
+unchanged. Backed by **one new read-only engine method** `poll_events_after(
+after_seq, limit)` (`src/lib.rs`) — it truncates *after* filtering so a cursor
+beyond `limit` never drops the tail. **No storage/format/crash surface** (harness
+stays **31**).
+
+**E2 (app layer — own crate `unidb-dispatch`, justified).** Chosen over a
+server-feature module so the dispatcher can *embed* `Arc<Engine>` and dogfood the
+DLQ write in the same engine, while keeping `tokio`/`reqwest` **out of the
+`unidb` crate entirely** — `cargo tree -p unidb --no-default-features --edges
+normal` shows **no async runtime** (the "engine stays sync" invariant is
+literally true, not merely feature-off). It adds **zero engine surface**: it
+drives the existing `poll_events`/`ack_events`/`vacuum_events` calls on the
+tokio blocking pool (same choke-point pattern as `server::engine_handle`). Each
+cycle: poll from a durable offset → fan out to every matching subscription
+(per-sub table/op **filter** + column **projection**, consumer-side) → **then**
+ack. Sinks: `WebhookSink` (retry with exponential backoff → **dead-letter table
+dogfooded back into unidb**), `RoomSink` (broadcast rooms — the primitive a
+studio WS/SSE layer subscribes to), `CollectingSink` (demo/test consumer).
+
+**Delivery-semantics evidence (the acceptance):**
+
+| Property | Proof (test) | Result |
+|---|---|---|
+| I/U/D consumed, once each, in offset order | `dispatch_delivery::consumes_iud_at_least_once_and_acks` | insert/update/delete delivered, ack→offset 3, no redelivery |
+| **Zero loss across an engine crash (replay proof)** | `dispatch_delivery::resumes_from_durable_offset_with_zero_loss_across_crash` | commit 5, ack 3, **drop+reopen**; restart delivers only {4,5}, union = {1..5}, none lost |
+| **At-least-once** (crash between deliver & ack) | `dispatch_delivery::crash_between_deliver_and_ack_redelivers` | un-acked event **redelivered** after restart |
+| **Webhook retry → dead-letter** | `dispatch_webhook_dlq::failing_webhook_retries_then_dead_letters` | 500-endpoint hit **3×**, event dead-lettered into `dispatch_dead_letter` (seq/op/sink/attempts=3/error≈"500"/payload), **offset still advanced** (poison event cannot wedge the stream) |
+| Ephemeral SSE resume | `server_events::ephemeral_tail_resumes_from_{seq,last_event_id_header}` | `from_seq=1`→{2,3}; `Last-Event-ID: 2`→{3} |
+
+**Metrics** (release, macOS M5 Pro; throughput probe
+`dispatch_throughput_scale`, `--ignored`):
+
+| Workload | Rate | Notes |
+|---|---|---|
+| Dispatcher **drain** (fan-out+ack), N=1k/2k/4k, limit=512 | ~95k–120k ev/s | throughput ≈ flat/rising with N at this scale |
+| Event **ingest** (1 durable INSERT+capture per txn) | ~300 ev/s | fsync-bound single-row commits (the write path, not the dispatcher); each triggering write pays a second synchronous heap insert for capture (M4 design) |
+| Peak RSS (test process, N=4k + tokio MT runtime + 4k retained event clones) | ~83 MB | engine footprint itself buffer-pool-bounded (~10 MB, consistent with prior milestones); dispatcher adds only the poll batch + in-flight clones |
+
+No baseline-stack headline here (§6 reserves that for the cross-domain workload,
+shipped as item 17): this milestone is a **consumability + delivery-semantics**
+deliverable, and the honest metric is the semantics table above, not ops/s vs an
+incumbent.
+
+**Honest caveat (surfaced, not hidden — §0.6):** the dispatcher inherits M4's
+`poll_events` cost model — **no predicate pushdown / no `seq` index**, so each
+poll pass is O(total `__events__` rows) and draining N events costs ≈ O(N²/limit)
+poll work. Measured drain stays fast through N=4k (fixed per-cycle overhead
+dominates the quadratic term at this scale), but at large backlog it will bite;
+the fix is an engine-side `seq` index, tracked as M4 tech debt (not opened here —
+E1 framing only). The dispatcher also **pins the vacuum horizon** if it falls
+behind (a full poll batch ⇒ un-acked events can't be vacuumed); `run_once`
+reports `backlogged` and the loop logs a `WARN` — the spec's "consumer too far
+behind" signal.
+
+**Green:** `cargo test -p unidb` (default, **380**) + `--features server`
+integration (all test binaries green, incl. item-22 `server_logs`/`logs_correlation`
++ this milestone's `server_events`) + `-p unidb-dispatch` (6 unit + 4
+integration) pass; crash harness **31/31** (unchanged — no storage touched);
+`clippy --workspace --all-targets --features server -D warnings` clean; `fmt`
+clean; sync invariant (`cargo tree -p unidb --no-default-features --edges
+normal`) shows no tokio.
+
+**Locked-decision changes:** none. No `FORMAT_VERSION` bump, no crash-point
+change, no §3 decision reopened. The moat framing (`MEMORY.md`: unified atomic
+multi-model commit; WAL-derived *streams* rejected) is respected — events remain
+**ordinary durable rows** (M4), and the dispatcher is a *consumer of that table*,
+not a WAL tailer.
+
+**Acceptance (spec checklist):** all three boxes ticked — downstream demo
+consumes I/U/D at-least-once + resume-after-restart + zero-loss-across-crash;
+webhook fan-out retries into the dead-letter table; engine surface unchanged
+beyond E1 framing (one read-only method), no app REST in the engine. E4 (studio
+tab) stays out of repo.

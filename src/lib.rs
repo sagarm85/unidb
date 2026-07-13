@@ -1423,6 +1423,61 @@ impl Engine {
         Ok(events)
     }
 
+    /// Fetch up to `limit` events with `seq` strictly greater than
+    /// `after_seq`, ascending by `seq` — the **offset-cursor** read behind
+    /// E1's ephemeral SSE tail (item 20). Unlike [`poll_events`] this touches
+    /// no `__consumers__` row at all: the caller (a reconnecting browser
+    /// `EventSource` carrying `Last-Event-ID`, or the studio scrubbing to an
+    /// explicit offset) supplies its own cursor and this returns everything
+    /// past it, without registering a durable consumer or advancing any
+    /// offset. Pure read; shares [`poll_events`]'s full-scan cost profile
+    /// (no predicate pushdown — see queue/mod.rs) but truncates *after*
+    /// filtering so a cursor beyond `limit` events never silently drops the
+    /// tail. Durable consumers (with ack) remain the at-least-once path; this
+    /// is the at-most-once live-tail path.
+    pub fn poll_events_after(
+        &self,
+        xid: Xid,
+        after_seq: i64,
+        limit: usize,
+    ) -> Result<Vec<queue::Event>> {
+        let page_size = self.page_size;
+        let events_def = cat_read(&self.catalog).lookup(EVENTS_TABLE)?.clone();
+        let events_heap = Heap::open(page_size, events_def.fsm_meta, events_def.pages.clone());
+        let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
+
+        let mut events = Vec::new();
+        for (_, bytes) in events_heap.scan(&snapshot, xid, &self.pool)? {
+            let row = executor::decode_row(&bytes, &events_def.columns)?;
+            let (
+                Literal::Int(seq),
+                Literal::Int(row_xid),
+                Literal::Text(table_name),
+                Literal::Text(op),
+            ) = (&row[0], &row[1], &row[2], &row[3])
+            else {
+                continue;
+            };
+            if *seq <= after_seq {
+                continue;
+            }
+            let payload = match &row[4] {
+                Literal::Json(s) => serde_json::from_str(s).unwrap_or(serde_json::Value::Null),
+                _ => serde_json::Value::Null,
+            };
+            events.push(queue::Event {
+                seq: *seq,
+                xid: *row_xid,
+                table_name: table_name.clone(),
+                op: op.clone(),
+                payload,
+            });
+        }
+        events.sort_by_key(|e| e.seq);
+        events.truncate(limit);
+        Ok(events)
+    }
+
     /// Durably advance `consumer`'s offset to `up_to_seq` — the only
     /// operation in M4.b that writes to `__consumers__`. If the consumer
     /// has never acked before, this is where its row is created

@@ -561,13 +561,27 @@ calls `poll_events` on an interval and forwards results as SSE frames; see
 poll_events's own linear-in-table-size cost`, quantified in the M5
 benchmark table in `PROGRESS.md`).
 
+Two modes (M20 E1), selected by whether `consumer` is present:
+
+- **Durable consumer** (`consumer` set): at-least-once, resumes from that
+  consumer's durable acked offset. Un-acked events are re-yielded until acked.
+- **Ephemeral live-tail** (`consumer` omitted): at-most-once browser tail, no
+  durable offset written. Resumes strictly past the standard `Last-Event-ID`
+  reconnect header (each frame carries `id: <seq>`), else `from_seq`, else `0`.
+
 **Query parameters**:
 
 | Param | Required | Default | Meaning |
 |---|---|---|---|
-| `consumer` | yes | — | Durable consumer name; offset is tracked per name |
+| `consumer` | no | — | Durable consumer name → at-least-once mode. Omit for the ephemeral live-tail mode |
+| `from_seq` | no | — | Ephemeral mode only: start strictly after this offset (offset scrubbing / replay-from-offset). Overridden by the `Last-Event-ID` header |
+| `table` | no | — | Deliver only events for this table |
 | `limit` | no | `100` | Max events fetched per poll tick |
 | `interval_ms` | no | `500` | Poll interval in milliseconds |
+
+**Request headers**: `Last-Event-ID: <seq>` (ephemeral mode) — standard SSE
+reconnect cursor; the stream resumes strictly after `<seq>`. Wins over
+`from_seq`.
 
 **Response**: `200 OK`, `Content-Type: text/event-stream`, one frame per
 new event:
@@ -578,7 +592,9 @@ data: {"seq":17,"xid":42,"table_name":"orders","op":"insert","payload":{"id":1,"
 
 ```
 Acks are **not** sent over this connection — call `POST /events/ack`
-separately (below) once events are durably processed.
+separately (below) once events are durably processed. Downstream fan-out
+(webhooks/rooms with retry + dead-letter) is the `unidb-dispatch` crate
+(M20 E2), not an engine route — see `docs/engine_access_guide.md §8`.
 
 ---
 

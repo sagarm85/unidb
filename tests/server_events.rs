@@ -119,6 +119,88 @@ async fn subscribe_delivers_a_committed_insert() {
     assert_eq!(event["payload"]["id"], 42);
 }
 
+/// E1 (item 20): the ephemeral live-tail (no `consumer`) resumes strictly past
+/// an explicit `from_seq` cursor without touching any durable consumer offset —
+/// the studio's offset-scrubbing / replay-from-offset primitive.
+#[tokio::test]
+async fn ephemeral_tail_resumes_from_seq() {
+    let server = TestServer::spawn().await;
+    setup_events_enabled_table(&server).await;
+    for id in 1..=3 {
+        assert_eq!(
+            post_json(
+                &server,
+                "/sql",
+                serde_json::json!({"sql": format!("INSERT INTO t (id) VALUES ({id})")})
+            )
+            .await,
+            200
+        );
+    }
+
+    // from_seq=1 → only the events with seq > 1 (the 2nd and 3rd inserts).
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(server.url("/events/subscribe?from_seq=1&interval_ms=100"))
+        .header("Authorization", format!("Bearer {}", valid_token()))
+        .send()
+        .await
+        .unwrap();
+    let lines = collect_sse_data_lines(resp, Duration::from_secs(3), 2).await;
+    let seqs: Vec<i64> = lines
+        .iter()
+        .map(|l| {
+            serde_json::from_str::<Value>(l).unwrap()["seq"]
+                .as_i64()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(
+        seqs,
+        vec![2, 3],
+        "ephemeral tail resumed strictly past from_seq"
+    );
+}
+
+/// E1 (item 20): a reconnecting browser `EventSource` replays its last-seen id
+/// in the standard `Last-Event-ID` header; the server resumes strictly after
+/// it (and it wins over `from_seq`).
+#[tokio::test]
+async fn ephemeral_tail_resumes_from_last_event_id_header() {
+    let server = TestServer::spawn().await;
+    setup_events_enabled_table(&server).await;
+    for id in 1..=3 {
+        assert_eq!(
+            post_json(
+                &server,
+                "/sql",
+                serde_json::json!({"sql": format!("INSERT INTO t (id) VALUES ({id})")})
+            )
+            .await,
+            200
+        );
+    }
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(server.url("/events/subscribe?interval_ms=100"))
+        .header("Authorization", format!("Bearer {}", valid_token()))
+        .header("Last-Event-ID", "2")
+        .send()
+        .await
+        .unwrap();
+    let lines = collect_sse_data_lines(resp, Duration::from_secs(3), 1).await;
+    let seqs: Vec<i64> = lines
+        .iter()
+        .map(|l| {
+            serde_json::from_str::<Value>(l).unwrap()["seq"]
+                .as_i64()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(seqs, vec![3], "resumed past Last-Event-ID=2");
+}
+
 #[tokio::test]
 async fn ack_prevents_replay_on_a_fresh_subscribe() {
     let server = TestServer::spawn().await;
