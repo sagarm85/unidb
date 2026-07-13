@@ -87,6 +87,65 @@
   check.
 - **Scope:** a one-row synthetic input for a FROM-less select. Small. Low ROI.
 
+### G9 — `LIKE` / `NOT LIKE` (and `ILIKE`) pattern matching
+- **ROI: high** — despite the G9 id (ids are stable, the list is not renumbered),
+  this belongs near the **top**. Substring/prefix search is one of the most common
+  filter operations a console offers.
+- **What:** SQL `LIKE` / `NOT LIKE` with `%` / `_` wildcards (and case-insensitive
+  `ILIKE`). Rejected today on **both** expression paths — there is no
+  `SqlExpr::Like` arm in the simple row path (`convert_expr`) *or* the query
+  planner path (`convert_qexpr`), so any `col LIKE …` returns `SQL_UNSUPPORTED`
+  whether the pattern is a literal or a bound `$n` param.
+- **Why it matters:** surfaced by the **`unidb-studio` record browser** (2026-07-13):
+  its Supabase-style *contains / starts with / ends with* filter operators all
+  compiled to `LIKE` and every query failed, so the studio had to **remove those
+  operators**. Full-text (`FULLTEXT` index + search) is word-oriented and is *not*
+  a substitute for substring/prefix `LIKE`.
+- **Scope:** add a `QExpr::Like { expr, pattern, negated, case_insensitive }`
+  variant (+ the row-path `Expr` equivalent so it works with and without the
+  planner) + parser mapping from `SqlExpr::Like`/`ILike` + an evaluator
+  implementing LIKE semantics (`%` = any run, `_` = one char, `ESCAPE`). Pattern
+  may be a literal or a `$n` param (binds as text). No storage/format impact.
+  Medium. Optional optimization: a pure-prefix pattern (`'abc%'`, no leading
+  wildcard) can use an existing B-Tree as a range scan; otherwise scan-and-filter.
+
+### G10 — Row-path predicate parity: `IS NULL` / `IS NOT NULL` (and G9) off the planner path
+- **What:** `IS NULL` / `IS NOT NULL` parse on the **planner** path
+  (`convert_qexpr`) but **not** the simple **row** path (`convert_expr`). So
+  `SELECT * FROM t WHERE c IS NULL` works only when the statement *also* has
+  something (ORDER BY, aggregate, join, …) that forces the planner path; a bare
+  filtered select — and, notably, the `NEAR()` vector path, which evaluates its
+  AND'd filters on the row engine — reject it as `SQL_UNSUPPORTED`.
+- **Why it matters:** same studio finding (2026-07-13) — the record browser's
+  `IS NULL` filter works while browsing (its queries carry `ORDER BY`) but cannot
+  compose with **"Find similar"** (`NEAR(...) AND c IS NULL`), forcing a
+  client-side workaround. The inconsistency is surprising: the same predicate
+  works or not depending on unrelated clauses.
+- **Scope:** bring the row path's predicate coverage to parity with the planner
+  path — add `IsNull`/`IsNotNull` (and G9's `Like`) to `convert_expr` +
+  `eval_expr`, so filters behave identically regardless of which plan the query
+  takes (including under `NEAR`). Small–medium; no storage impact. Best done
+  alongside G9 (same evaluator surface).
+
+### G11 — Full-text search has no SQL / REST surface (embed-only today)
+- **What:** you can `CREATE INDEX … USING FULLTEXT (col)`, but there is **no way
+  to query it over `/sql`** — no `MATCH`/`@@`/search predicate in the parser
+  (0 refs to full-text in `src/sql/`). Search is only reachable from Rust via
+  `Engine::search_fulltext`, so any out-of-process client (the studio, attach over
+  HTTP, any non-Rust app) can build the index but never use it.
+- **Why it matters:** surfaced by `unidb-studio` (2026-07-13). With `LIKE`
+  unsupported (G9), full-text is the intended substitute for text search — but it
+  isn't reachable over the one surface a browser has (`POST /sql`), so the studio
+  can offer neither substring nor word search. The engine advertises full-text as
+  a domain extension (guide §2) yet it's inaccessible to every documented access
+  path except embed.
+- **Scope:** expose full-text as a SQL predicate that routes to the existing
+  `Engine::search_fulltext` — e.g. a `MATCH(col, $1)` / `col @@ $1` expression the
+  planner lowers to an inverted-index probe (mirroring how `NEAR(...)` maps to the
+  vector index in `exec_select_near`). Parser arm + logical/physical node +
+  executor wiring; no storage change (the index already exists). Medium; pairs
+  naturally with G9/G10's predicate work.
+
 ## Explicitly *not* in this file (tracked elsewhere — don't duplicate)
 
 - **Row-level FK enforcement + `ON DELETE`/`ON UPDATE` actions.** FK is parsed,
