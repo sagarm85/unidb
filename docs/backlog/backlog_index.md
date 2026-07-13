@@ -36,7 +36,7 @@
 | 20 | `20_events_realtime_dispatcher.md` | Milestone | ✅ SHIPPED (PROGRESS: Events / realtime dispatcher (Milestone 20)) |
 | 21 | `21_observability_metrics.md` | Improvement | ✅ SHIPPED (PROGRESS: Observability metrics enrichment (item 21)) |
 | 22 | `22_logs_surface.md` | Improvement | ✅ SHIPPED (PROGRESS: Logs surface — JSON structured logs, correlation ids, bounded /logs tail) |
-| 23 | `23_storage_service.md` | Milestone | ⏳ NOT STARTED |
+| 23 | `23_storage_service.md` | Milestone | ✅ SHIPPED (PROGRESS: Object storage service — MinIO/S3 tiering over engine metadata (item 23)) |
 | 24 | `24_authz_v2_policies.md` | Milestone | ⏳ NOT STARTED |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),

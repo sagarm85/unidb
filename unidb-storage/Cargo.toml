@@ -1,0 +1,33 @@
+[package]
+name = "unidb-storage"
+version = "0.1.0"
+edition = "2021"
+description = "Object storage service (backlog item 23): bucket/object metadata kept transactional in unidb, object bytes tiered between engine LOBs (small, ACID-inline) and an S3-wire object store (MinIO in dev, S3 in prod). App-layer — adds no engine surface."
+
+# `unidb-storage` is an APP-LAYER crate, exactly like `unidb-dispatch`. It embeds
+# the engine (`Arc<Engine>`) and drives only the shipped public API
+# (execute_sql/put_large_object/enable_events/...). tokio + the AWS SDK live HERE,
+# never in the `unidb` engine crate, so "no async runtime in the default engine
+# build" (CLAUDE.md; `cargo tree -p unidb --no-default-features --edges normal`)
+# is preserved — this crate depends on `unidb` with its default (sync) features.
+[dependencies]
+unidb = { path = ".." }
+# Reused for the optional ConfirmSink fast path (rides a real item-20
+# Dispatcher/Filter/Sink). The compensation dead-letter uses a compact
+# storage-native table instead of dispatch's 8-column DLQ (that schema overflows
+# unidb's single-page catalog blob — see docs/design/storage_service.md §4).
+unidb-dispatch = { path = "../unidb-dispatch" }
+tokio = { version = "1.52", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+# One S3-wire client for BOTH MinIO (dev) and S3 (prod): endpoint_url +
+# force_path_style select the backend. Chosen over object_store/rusoto for
+# first-class OFFLINE SigV4 presigning (see docs/design/storage_service.md §2).
+aws-sdk-s3 = "1"
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+thiserror = "1.0"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "time", "sync"] }

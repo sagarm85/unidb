@@ -4489,3 +4489,70 @@ consumes I/U/D at-least-once + resume-after-restart + zero-loss-across-crash;
 webhook fan-out retries into the dead-letter table; engine surface unchanged
 beyond E1 framing (one read-only method), no app REST in the engine. E4 (studio
 tab) stays out of repo.
+
+---
+
+## Object storage service (item 23)   [SHIPPED]   2026-07-13
+
+**PR:** _pending_ — branch `23-storage-service` (STOP-for-review, do not merge).
+**Spec:** `docs/backlog/23_storage_service.md`. **Design note:**
+`docs/design/storage_service.md`. **Builds on:** item 20 (`unidb-dispatch`).
+
+**Summary:** A Supabase-Storage analog as a new **app-layer** crate
+`unidb-storage` — bucket/object **metadata** in ordinary unidb tables, object
+**bytes** tiered between engine LOBs (small, ACID-inline) and an S3-wire object
+store (MinIO dev / S3 prod, one `S3ObjectStore` impl selected by config).
+Large-object consistency rides an **outbox** (metadata row + `objects` insert
+event commit atomically) with a **reconciler** that confirms uploads
+(`pending→ready`), compensates stale ones (`pending→failed` + dead-letter, never a
+dangling pending), and sweeps orphaned bytes. Presigned PUT/GET move browser
+bytes directly — the engine never proxies a large payload (§10). **No engine
+surface added; engine build stays sync.**
+
+**Landmine decisions (design note):**
+- **S3 crate = `aws-sdk-s3`** over `object_store`/`rusoto` — first-class
+  **offline** SigV4 presigning (unit-tested with no server) and explicit
+  endpoint + `force_path_style` control MinIO needs. `minio`/`s3` are one wire
+  impl, two config profiles.
+- **Outbox driver:** the confirm/compensate **authority is a reconciler keyed on
+  `created_at` age**, not the Dispatcher's tight in-cycle retry (the honest wall:
+  ms-scale retry ≠ an upload grace window). item-20 reuse that remains is real —
+  an optional `ConfirmSink` rides a genuine `unidb_dispatch::Dispatcher`+`Filter`.
+- **Engine constraint surfaced & worked around (not an engine change):** unidb
+  persists the whole catalog as **one ~8 KiB page blob**. The original schema
+  (`objects` w/ `storage_key` + the 8-col dispatch DLQ) overflows it
+  (`HeapFull{size:8883}`), and a *runtime* `CREATE TABLE` re-serializes a catalog
+  grown by row volume and overflows too. Fixes: dropped the derivable
+  `storage_key` column, used a **compact 4-col `object_dlq`**, and moved **all
+  DDL up front** into `StorageService::new`. Verified at scale
+  (`tests/scale.rs`: 1 000-object reconcile + reopen, no overflow).
+
+**No perf headline** — this is an access-pattern service, not an engine hot path;
+the §6 metric that matters is **crash-consistency**, proven below. Peak RSS
+unchanged (engine untouched); resident cost is one object's bytes at a time
+(inline uploads stream via P3.d LOB chunks; large uploads never touch the
+engine).
+
+**Acceptance evidence (all deterministic, no Docker):**
+
+| Acceptance item | Proof |
+|---|---|
+| Round-trip both tiers, one config switch; compose brings up MinIO | `tests/round_trip.rs` (inline LOB + s3-tier via memory store); `docker/docker-compose.minio.yml` + gated `live_store_round_trip_when_configured` |
+| Kill mid-upload — no metadata row without bytes | `crash_consistency::pending_without_bytes_is_compensated_and_dead_lettered` (pending→failed + 1 DLQ row) |
+| Kill mid-upload — no unreferenced bytes survive reconciler | `crash_consistency::orphan_bytes_without_metadata_are_swept` |
+| Reconciler doesn't sweep live bytes / confirms real uploads | `crash_consistency::pending_with_bytes_is_confirmed_not_compensated_or_swept` |
+| Sub-threshold LOB commit **and** rollback | `round_trip::inline_write_rolls_back_leaving_no_object_and_no_bytes` |
+| Outbox rides the item-20 dispatcher | `outbox_dispatcher::confirm_sink_confirms_pending_upload_via_dispatcher` |
+| Presign works on the MinIO/S3 path (offline) | `presign_and_config::s3_store_generates_offline_presigned_sigv4_urls` |
+| Scale — catalog survives volume | `scale::many_objects_reconcile_without_catalog_overflow` (1 000 objects) |
+| Studio "Storage" tab | out of repo (`unidb-studio`) — noted, not built |
+
+**Green:** `cargo test --workspace` all pass (incl. `unidb-storage`: 3 crash + 4
+round-trip + 1 outbox + 4 presign/config + 1 scale = **13**); crash harness
+**31/31** unchanged (no engine storage touched); `clippy --workspace
+--all-targets -D warnings` clean; `fmt` clean; sync invariant preserved (the AWS
+SDK/tokio live only in `unidb-storage`, never in `unidb`).
+
+**Locked-decision changes:** none. No `FORMAT_VERSION` bump, no crash-point
+change, no §3 decision reopened. Moat framing respected — objects/events are
+ordinary durable rows; the service consumes tables, not the WAL.
