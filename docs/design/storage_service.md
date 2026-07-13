@@ -125,8 +125,14 @@ the writer's transaction — that event stream **is the outbox** (§4).
 >   Verified: 1 000-object reconcile pass + reopen with no overflow
 >   (`tests/scale.rs`). `created_at` is stored as `created_at_ms INT` (epoch
 >   millis) so the reconciler can age pending rows directly.
-> The rest of §4 reads as originally written; treat the four bullets above as the
-> authoritative schema/DLQ details.
+> **[2026-07-13 update — item 25 shipped: ceiling lifted.]** `Catalog::persist`
+> now chains across multiple 8 KiB pages (one mini-txn, atomic catalog_root flip).
+> The `HeapFull` ceiling is gone. The workarounds above (derived `storage_key`,
+> compact 4-col DLQ, all DDL up front) were correct for the engine at item-23
+> time but are no longer required by an engine-level constraint — they can be
+> relaxed in a future iteration. The rest of §4 reads as originally written.
+> The service-layer tests still pass with the workarounds in place (no change
+> to `unidb-storage` in item 25 — the relaxation is an optional follow-up).
 
 ### 4.1 Two write paths, chosen by size threshold (`STORAGE_INLINE_THRESHOLD`, default 1 MiB)
 

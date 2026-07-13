@@ -86,6 +86,14 @@
 //         previous valid mark. Database consistency is unaffected (the WAL is
 //         the source of truth). This point tests that degraded precision, not
 //         data loss, is the outcome.
+//   P33 – crash mid-multi-page-catalog-write (item 25): `Catalog::persist`
+//         WAL-commits the new chain pages, then atomically flips `catalog_root`
+//         in the control file. A crash between WAL commit and the control-file
+//         flip leaves `catalog_root` pointing at the OLD catalog, which must
+//         still be readable on reopen (no torn chain visible). This test
+//         simulates that window by reverting `catalog_root` in the control file
+//         before dropping the engine, then verifying the old catalog survives
+//         recovery intact.
 
 use tempfile::tempdir;
 use unidb::{Engine, RowId};
@@ -2185,12 +2193,87 @@ fn p31_crash_mid_vacuum_table_recovers_correctly() {
     );
 }
 
-// ── P32: torn timeline mark — falls back to previous valid mark (item 28, R1) ─
-//
-// A crash mid-append of a 16-byte timeline mark leaves a partial record at the
-// end of timeline.bin. On load the partial record is silently skipped (the file
-// size is not a multiple of 16), and PITR resolves to the previous valid mark.
-// Database consistency is unaffected; only PITR resolution precision degrades.
+// ── P33: crash mid-multi-page-catalog-write (item 25) ────────────────────────
+
+#[test]
+fn p33_crash_mid_multipage_catalog_write_old_catalog_intact() {
+    use unidb::control;
+    use unidb::format::INVALID_PAGE_ID;
+
+    let dir = tempdir().unwrap();
+    let ctrl_p = dir.path().join("control");
+
+    // Phase 1: establish a small catalog (fits on one page).
+    {
+        let e = open(dir.path());
+        let xid = e.begin().unwrap();
+        e.execute_sql(xid, "CREATE TABLE sentinel (id INT, val TEXT)")
+            .unwrap();
+        e.commit(xid).unwrap();
+        drop(e); // no checkpoint, but WAL is fsynced per commit
+    }
+
+    // Record the catalog_root from Phase 1 (single-page catalog).
+    let old_catalog_root = control::read(&ctrl_p).unwrap().catalog_root;
+    assert_ne!(
+        old_catalog_root, INVALID_PAGE_ID,
+        "P33: Phase 1 must persist a catalog page"
+    );
+
+    // Phase 2: create a large schema to force a multi-page catalog chain.
+    // After the last CREATE TABLE, `persist` has WAL-committed the chain pages
+    // and written the new catalog_root to the control file.  We then revert
+    // catalog_root to the Phase 1 value to simulate the crash window
+    // (WAL fsynced, control-file flip crashed/not yet written).
+    {
+        let e = open(dir.path());
+        for i in 0..50 {
+            let xid = e.begin().unwrap();
+            e.execute_sql(
+                xid,
+                &format!(
+                    "CREATE TABLE chain_t{i} \
+                     (a TEXT, b TEXT, c TEXT, d TEXT, e TEXT, f TEXT, g TEXT, h TEXT, \
+                      i TEXT, j TEXT, k TEXT, l TEXT, m TEXT, n TEXT, o TEXT, p TEXT, \
+                      q TEXT, r TEXT, s TEXT, t TEXT)"
+                ),
+            )
+            .unwrap();
+            e.commit(xid).unwrap();
+        }
+        // Revert catalog_root to the Phase 1 single-page value before "crash".
+        let mut cd = control::read(&ctrl_p).unwrap();
+        cd.catalog_root = old_catalog_root;
+        control::write(&ctrl_p, &cd).unwrap();
+        drop(e); // "crash"
+    }
+
+    // Reopen: WAL recovery redoes all chain pages (they are WAL-durable), but
+    // catalog_root still points at the old single-page catalog.  Catalog::load
+    // must read the old catalog cleanly — no torn chain is exposed.
+    let e = open(dir.path());
+    // Sentinel table from Phase 1 must be present and queryable.
+    let xid = e.begin().unwrap();
+    let result = e.execute_sql(xid, "SELECT id FROM sentinel").unwrap();
+    e.commit(xid).unwrap();
+    match &result[0] {
+        unidb::SqlResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 0, "P33: sentinel table must have 0 rows")
+        }
+        _ => panic!("P33: expected Rows result from SELECT"),
+    }
+    // New tables from Phase 2 must NOT be visible (catalog_root was reverted).
+    let xid2 = e.begin().unwrap();
+    assert!(
+        e.execute_sql(xid2, "SELECT a FROM chain_t0").is_err(),
+        "P33: chain_t0 must not be visible after catalog_root reverted"
+    );
+    e.commit(xid2).ok(); // may have already been aborted by the error above
+    drop(e);
+}
+
+// ── P32: torn timeline mark ───────────────────────────────────────────────────
+
 #[test]
 fn p32_torn_timeline_mark_falls_back_to_previous_valid_mark() {
     use std::io::Write as _;

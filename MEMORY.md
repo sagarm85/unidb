@@ -12,6 +12,18 @@
 
 ## Current status
 
+- **Multi-page catalog (backlog item 25) — SHIPPED 2026-07-13, branch
+  `25-multipage-catalog`, PR TBD (STOP-for-review).** `Catalog::persist`
+  chains the JSON blob across N pages (4-byte magic + 4-byte next_page_id
+  chain header per page, 8128 bytes JSON per 8 KiB page); `Catalog::load`
+  detects magic vs. legacy raw JSON. One mini-txn covers all N chain pages;
+  `catalog_root` flip is the atomic commit point. No `FORMAT_VERSION` bump;
+  old single-page blobs open unchanged. Crash point P33 added (35/35).
+  Before: HeapFull at ~8.1 KiB (item-23 original layout hit HeapFull{8883});
+  after: unlimited schema size. 4 new catalog unit tests + 4 integration tests +
+  P33 crash test. Docs: spec → SHIPPED; backlog_index row 25 → ✅;
+  storage_service.md §4 ceiling note; engine_design.md §4.6 + footer;
+  PROGRESS.md entry. **Next: await PR review — do not merge.**
 - **Subscription CDC — canonical envelope, before/after, format adapters, lag
   observability (backlog item 29) — SHIPPED 2026-07-13, branch
   `29-subscription-cdc`, PR #72 (STOP-for-review).** C1: `before`/`after`/

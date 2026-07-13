@@ -4840,3 +4840,73 @@ no format bump; the event row's fate is unchanged by the envelope enrichment.
 
 **Locked-decision changes:** none. No `FORMAT_VERSION` bump, no new WAL record
 type, no §3 decision reopened. Crash harness remains 33/33.
+
+---
+
+## Multi-page catalog (item 25) — 2026-07-13
+
+**Branch:** `25-multipage-catalog` | **PR:** TBD (STOP-for-review)
+
+**Problem solved:** `Catalog::persist` serialized the entire catalog (all
+`TableDef`s + `TableStats`) as one JSON blob into a single slotted page. Any
+blob exceeding ~8 KiB (the max payload for an 8 KiB page after header/slot/tuple
+overhead) failed with `HeapFull`. Item 23 hit this at `CREATE TABLE` time with
+`objects`(11 cols incl. `storage_key`) + `object_dlq`(8 cols) and worked around
+it by dropping a column and front-loading all DDL. That workaround is now
+unnecessary.
+
+**Fix:** page chain with in-band magic detection. Each catalog page's slot-0
+payload starts with a 4-byte magic (`CATALOG_CHAIN_MAGIC = 0xC0DA7A10`), then a
+4-byte `next_page_id` (`INVALID_PAGE_ID` on the last page), then a JSON chunk.
+- **No `FORMAT_VERSION` bump** (D9 / §3 honored): magic first byte = 0x10, which
+  is not `{` (0x7B), so old JSON blobs are unambiguously distinguishable from new
+  chain pages. Old single-page catalogs open unchanged.
+- **Atomicity:** write-new-chain-then-flip pattern. All chain pages are
+  WAL-logged in one mini-txn, fsynced, then `catalog_root` in the control file is
+  updated as the single atomic commit point. Crash before the flip ⇒ old catalog
+  intact (P33 verifies this). Crash after ⇒ new chain is WAL-recovered.
+- **D5 (WAL-before-page):** each new page is WAL-logged before `pool.write_page`,
+  same discipline as before, extended across N pages in one mini-txn.
+
+**Before (pre-fix):** fails with `HeapFull` once JSON blob > ~8 KiB.
+- item-23 original layout (objects 11 cols + buckets 3 + DLQ 8): `HeapFull{8883}`
+- 3 tables + ~3 000 rows of stats growth: `HeapFull{9651}`
+- Any schema with ~18+ columns across 3+ tables: hits ceiling.
+
+**After (post-fix):** no ceiling (limited only by number of pages, which is
+bounded by buffer-pool capacity).
+- item-23 original layout (11-col objects with storage_key + full 8-col DLQ): ✅ CREATE TABLE, persist, reopen, and query all succeed.
+- 100 tables × 20 columns each: ✅ persists across a multi-page chain and reopens intact.
+- ANALYZE after 3 000 inserts into 5 tables: ✅ stats growth no longer overflows.
+- 30 tables with SERIAL columns, 50 inserts each: ✅ alloc_serial rewrites don't overflow.
+
+**Metrics (structural/correctness — this is a schema-limit fix, not a throughput optimization):**
+
+| Metric | Before fix | After fix |
+|---|---|---|
+| Max schema (8 KiB page) | ~18 cols across 3 tables | Unbounded (pages limited only by pool) |
+| item-23 original layout | HeapFull{8883} at CREATE TABLE | Creates, persists, reopens, queries ✓ |
+| 100 tables × 20 cols | HeapFull | Succeeds, multi-page chain ✓ |
+| Catalog write overhead (per persist) | alloc + WAL + pool write (1 page) | alloc + WAL + pool write (N pages, N=ceil(JSON/8128)) |
+| RSS impact | None | None (new chain pages are buffer-pool-managed) |
+
+For a 10 KiB catalog: 2 pages. For a 100 KiB catalog: 13 pages. Each page write
+is bounded by the same WAL-before-pool invariant as today.
+
+**Tests added / changed:**
+- `src/catalog.rs`: 4 new unit tests (`multipage_catalog_roundtrip`,
+  `catalog_just_over_page_boundary`, `legacy_single_page_catalog_backward_compat`,
+  `item23_original_schema_no_heap_full`). Total lib: 406 (was 402).
+- `tests/multipage_catalog.rs`: 4 integration tests (item-23 original layout,
+  100-table wide schema reopen, ANALYZE-after-inserts, SERIAL-inserts). All pass.
+- `tests/crash/main.rs`: P33 (crash mid-multi-page-catalog-write → old catalog
+  intact). Crash harness: **35/35** (was 34/34).
+
+**Doc updates:** `25_multipage_catalog.md` → SHIPPED; `backlog_index.md` row 25
+→ ✅; `storage_service.md` §4 ceiling-lift note; `engine_design.md` catalog
+section; `MEMORY.md` current state.
+
+**Locked-decision changes:** none. No `FORMAT_VERSION` bump. No §3 decision
+reopened. Crash harness remains green (+1 P33). The item-23 service-layer
+workaround (compact schema, DDL up front) can now be relaxed — the engine
+supports runtime DDL and wider schemas without overflowing the catalog.

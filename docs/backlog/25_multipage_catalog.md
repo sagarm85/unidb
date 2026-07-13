@@ -1,7 +1,38 @@
 # Multi-page catalog — lift the single ~8 KiB catalog-blob ceiling
 
 **Type:** Improvement
-**Status:** NOT STARTED
+**Status:** SHIPPED — see `PROGRESS.md` entry "Multi-page catalog (item 25)"
+
+## Design decisions (resolved before coding — 2026-07-13)
+
+### Landmine 1 — Format marker / version bump?
+**Decision: NO `FORMAT_VERSION` bump.** The multi-page layout is fully
+self-describing from the first catalog page's slot-0 payload. Each page in a
+chain begins with a 4-byte little-endian magic (`CATALOG_CHAIN_MAGIC =
+0xC0DA_7A10u32`). Detection in `Catalog::load`: if the first 4 bytes of slot 0
+equal the magic, follow the chain; otherwise fall back to the legacy raw-JSON
+path. Old JSON always starts with `{` (0x7B in ASCII); the magic's first LE byte
+is 0x10, so the two formats are unambiguously distinguishable without any version
+field. No §3/D9 sign-off ritual required.
+
+### Landmine 2 — Atomicity under crash
+**Decision: write-new-chain-then-flip pattern.** `persist` allocates all chain
+pages, WAL-logs and buffer-pool-writes them all in **one mini-txn**, and only
+**then** rewrites `catalog_root` in the control file. The control file is the
+single atomic commit point (a 44-byte write that is either present or not).
+Crash before the control file flip → old `catalog_root` intact, new pages are
+unreachable orphans (same trade-off as old catalog pages becoming garbage on
+each rewrite today). Crash after the flip → new chain is WAL-recovered and fully
+readable. The WAL commit (`commit_mini_txn` fsync) is also guaranteed to precede
+the control file write, so the chain is durable before it becomes reachable.
+Crash point P33 exercises this.
+
+### Landmine 3 — D5 compliance for multi-page write
+**Decision: same discipline as today, extended.** Each chain page is WAL-logged
+via `log_insert` (under the same mini-txn) before `pool.write_page`, preserving
+the WAL-before-page invariant (D5) for every new page. The single mini-txn that
+covers all N pages means the commit record is fsynced once, after all
+`log_insert` calls, before any of the pages could be evicted ahead of the WAL.
 
 > The whole catalog — **every `TableDef` plus every table's `TableStats`** — is
 > persisted as **one JSON blob in slot 0 of a single meta page** (`catalog.rs::
