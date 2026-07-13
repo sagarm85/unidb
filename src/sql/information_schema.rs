@@ -20,8 +20,15 @@
 //! `<table>_<col>_check`) because unidb does not retain named constraints —
 //! see [`pk_name`] / [`unique_name`] / [`fk_name`] / [`check_name`].
 
+use crate::btree_index::{DiskBTree, OrderedValue, RangeOp};
+use crate::bufferpool::BufferPool;
 use crate::catalog::{Catalog, ColumnType, ForeignKey, IndexKind, TableDef};
 use crate::error::Result;
+use crate::format::PageId;
+use crate::format::Xid;
+use crate::mvcc::Snapshot;
+use crate::queue::{consumers_table_def, events_table_def, CONSUMERS_TABLE, EVENTS_TABLE};
+use crate::sql::executor;
 use crate::sql::logical::Literal;
 use crate::sql::plan::ColumnRef;
 
@@ -42,6 +49,10 @@ pub const RELATIONS: &[&str] = &[
     "information_schema.key_column_usage",
     "information_schema.referential_constraints",
     "unidb_catalog.indexes",
+    // item 29 C3: per-consumer CDC lag (reads __consumers__ + __events__ via the
+    // heap, so virtual_rows cannot materialize it — query_exec.rs routes it to
+    // subscription_lag_rows which has access to pool+snapshot).
+    "unidb_catalog.subscription_lag",
 ];
 
 /// Is `name` one of the reserved introspection relations? Case-insensitive so
@@ -110,6 +121,15 @@ pub fn virtual_schema(name: &str) -> Option<Vec<ColumnRef>> {
             ("column_name", ColumnType::Text),
             ("index_type", ColumnType::Text),
             ("is_unique", ColumnType::Bool),
+        ],
+        // item 29 C3: per-consumer CDC lag (materialized by subscription_lag_rows).
+        "unidb_catalog.subscription_lag" => &[
+            ("consumer", ColumnType::Text),
+            ("offset", ColumnType::Int64),
+            ("max_seq", ColumnType::Int64),
+            ("lag_events", ColumnType::Int64),
+            ("oldest_unconsumed_ts_ms", ColumnType::Int64),
+            ("lag_seconds", ColumnType::Float),
         ],
         _ => return None,
     };
@@ -536,6 +556,118 @@ fn render_decimal(unscaled: i128, scale: u8) -> String {
     } else {
         s
     }
+}
+
+/// Materialize `unidb_catalog.subscription_lag` rows (item 29, C3).
+/// Called from `query_exec::scan` rather than `virtual_rows` because it needs
+/// pool + snapshot access that the plain catalog path doesn't carry.
+///
+/// Columns (in order, matching `virtual_schema`):
+/// consumer, offset, max_seq, lag_events, oldest_unconsumed_ts_ms, lag_seconds
+pub fn subscription_lag_rows(
+    catalog: &Catalog,
+    pool: &BufferPool,
+    page_size: usize,
+    snapshot: &Snapshot,
+    xid: Xid,
+    event_seq_index_meta: Option<PageId>,
+) -> Result<Vec<Vec<Literal>>> {
+    use crate::heap::Heap;
+
+    let consumers_def = match catalog.lookup(CONSUMERS_TABLE) {
+        Ok(t) => t.clone(),
+        Err(_) => return Ok(Vec::new()),
+    };
+    let events_def = match catalog.lookup(EVENTS_TABLE) {
+        Ok(t) => t.clone(),
+        Err(_) => return Ok(Vec::new()),
+    };
+    let Some(index_meta) = event_seq_index_meta else {
+        return Ok(Vec::new());
+    };
+
+    let consumers_heap = Heap::open(
+        page_size,
+        consumers_def.fsm_meta,
+        consumers_def.pages.clone(),
+    );
+    let events_heap = Heap::open(page_size, events_def.fsm_meta, events_def.pages.clone());
+
+    // Max seq across all events (O(log n) via the B-tree's rightmost leaf).
+    let max_seq = DiskBTree::new(index_meta, page_size)
+        .max_entry(pool)
+        .unwrap_or(None)
+        .and_then(|(k, _)| {
+            if let OrderedValue::Int(s) = k {
+                Some(s)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    let consumer_bytes = consumers_heap.scan(snapshot, xid, pool).unwrap_or_default();
+    let mut rows = Vec::new();
+
+    for (_, bytes) in consumer_bytes {
+        let row = match executor::decode_row(&bytes, &consumers_table_def().columns) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let (name, offset) = match (&row[0], &row[1]) {
+            (Literal::Text(n), Literal::Int(o)) => (n.clone(), *o),
+            _ => continue,
+        };
+
+        // Oldest unacked event: first entry after `offset` in the seq index.
+        let candidates = DiskBTree::new(index_meta, page_size)
+            .search_range_limit(RangeOp::Gt, &OrderedValue::Int(offset), 1, pool)
+            .unwrap_or_default();
+
+        let (oldest_ts_ms, lag_seconds) = if let Some(&row_id) = candidates.first() {
+            let ts = events_heap
+                .get(row_id, snapshot, xid, pool)
+                .ok()
+                .and_then(|b| executor::decode_row(&b, &events_table_def().columns).ok())
+                .and_then(|r| match &r[4] {
+                    Literal::Json(s) => serde_json::from_str::<serde_json::Value>(s)
+                        .ok()
+                        .and_then(|v| v.get("ts_ms").and_then(|m| m.as_i64())),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            let lag_s = if ts > 0 && now_ms >= ts {
+                (now_ms - ts) as f64 / 1000.0
+            } else {
+                0.0
+            };
+            (ts, lag_s)
+        } else {
+            (0i64, 0.0f64)
+        };
+
+        let lag_events = (max_seq - offset).max(0);
+        rows.push(vec![
+            Literal::Text(name),
+            Literal::Int(offset),
+            Literal::Int(max_seq),
+            Literal::Int(lag_events),
+            Literal::Int(oldest_ts_ms),
+            Literal::Float(lag_seconds),
+        ]);
+    }
+
+    // Stable order by consumer name.
+    rows.sort_by(|a, b| match (&a[0], &b[0]) {
+        (Literal::Text(x), Literal::Text(y)) => x.cmp(y),
+        _ => std::cmp::Ordering::Equal,
+    });
+    Ok(rows)
 }
 
 #[cfg(test)]

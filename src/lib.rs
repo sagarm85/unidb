@@ -104,14 +104,14 @@ use crate::{
     heap::Heap,
     large_object::LobStore,
     lockmgr::LockManager,
-    queue::{CONSUMERS_TABLE, EVENTS_TABLE},
+    queue::{consumers_table_def, events_table_def, CONSUMERS_TABLE, EVENTS_TABLE},
     sql::{
         executor::{self, ExecCtx, ExecResult},
         logical::{apply_rls, bind_params, Expr, Literal, LogicalPlan},
         parser::parse_sql,
         query::{FromNode, QuerySpec},
     },
-    txn::{IsolationLevel, TransactionManager, UndoAction},
+    txn::{read_snapshot, IsolationLevel, TransactionManager, UndoAction},
     wal::Wal,
 };
 
@@ -632,6 +632,10 @@ pub struct EngineStats {
     /// catalog). Sorted by name; internal `__…__` tables included so the
     /// operator sees the event/edge/lob heaps too.
     pub tables: Vec<TableStat>,
+    /// Per-consumer CDC lag snapshot (item 29, C3). One entry per registered
+    /// consumer; empty when no consumer has ever acked. Matches
+    /// `unidb_catalog.subscription_lag`.
+    pub subscription_lag: Vec<SubscriptionLagEntry>,
 }
 
 /// Per-statement-kind latency snapshot (item 21), micros. Each field is a
@@ -659,6 +663,24 @@ pub struct TableStat {
     /// Approximate live tuple count for this table (V1, item 27). Corrected
     /// at each `vacuum_table` or full `vacuum` pass.
     pub live_tuple_estimate: u64,
+}
+
+/// Per-consumer CDC lag snapshot (item 29, C3). Surfaced by `Engine::stats()`
+/// and `GET /stats`, matches the `unidb_catalog.subscription_lag` virtual relation.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SubscriptionLagEntry {
+    /// Consumer name (durable consumer registered via `ack_events`).
+    pub consumer: String,
+    /// Durably acked offset (= max seq the consumer has processed).
+    pub offset: i64,
+    /// Max committed seq in `__events__` across all enabled tables.
+    pub max_seq: i64,
+    /// Events not yet acked: `max_seq − offset`.
+    pub lag_events: i64,
+    /// Epoch-ms of the oldest unacked event's capture timestamp (0 if unknown).
+    pub oldest_unconsumed_ts_ms: i64,
+    /// Seconds since the oldest unacked event was captured (0 if unknown).
+    pub lag_seconds: f64,
 }
 
 /// `Engine` must be safely **shareable** across threads (P5.e: a pool of N
@@ -1251,6 +1273,7 @@ impl Engine {
             horizon_age_secs: self.txn_mgr.oldest_snapshot_age().as_secs_f64(),
             parallel_workers: crate::sql::parallel_scan::worker_stats(),
             tables: self.table_page_stats(),
+            subscription_lag: self.subscription_lag_stats(),
         }
     }
 
@@ -1294,6 +1317,114 @@ impl Engine {
             })
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// Per-consumer CDC lag snapshot for `GET /stats` (item 29, C3).
+    /// Reads `__consumers__` + `__events__` under a fresh read-snapshot; never
+    /// writes. Returns an empty Vec when no consumer has ever acked.
+    fn subscription_lag_stats(&self) -> Vec<SubscriptionLagEntry> {
+        use crate::btree_index::RangeOp;
+
+        let page_size = self.page_size;
+        let (consumers_def, events_def) = {
+            let cat = cat_read(&self.catalog);
+            let c = match cat.lookup(CONSUMERS_TABLE) {
+                Ok(t) => t.clone(),
+                Err(_) => return Vec::new(),
+            };
+            let e = match cat.lookup(EVENTS_TABLE) {
+                Ok(t) => t.clone(),
+                Err(_) => return Vec::new(),
+            };
+            (c, e)
+        };
+
+        let (snapshot, self_xid, _reg) = read_snapshot(&self.txn_mgr.shared());
+
+        let consumers_heap = Heap::open(
+            page_size,
+            consumers_def.fsm_meta,
+            consumers_def.pages.clone(),
+        );
+        let events_heap = Heap::open(page_size, events_def.fsm_meta, events_def.pages.clone());
+
+        // Max seq from the events B-tree index (O(1) leaf walk).
+        let max_seq = DiskBTree::new(self.event_seq_index_meta, page_size)
+            .max_entry(&self.pool)
+            .ok()
+            .flatten()
+            .and_then(|(k, _)| {
+                if let OrderedValue::Int(s) = k {
+                    Some(s)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        // Scan consumers — brief, bounded by the number of registered consumers.
+        let consumer_rows = consumers_heap
+            .scan(&snapshot, self_xid, &self.pool)
+            .unwrap_or_default();
+
+        let mut out = Vec::new();
+        for (_, bytes) in consumer_rows {
+            let row = match executor::decode_row(&bytes, &consumers_table_def().columns) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let (name, offset) = match (&row[0], &row[1]) {
+                (Literal::Text(n), Literal::Int(o)) => (n.clone(), *o),
+                _ => continue,
+            };
+
+            // Oldest unacked event: first in the seq index after `offset`.
+            let (oldest_ts_ms, lag_seconds) = {
+                let candidates = DiskBTree::new(self.event_seq_index_meta, page_size)
+                    .search_range_limit(RangeOp::Gt, &OrderedValue::Int(offset), 1, &self.pool)
+                    .unwrap_or_default();
+                if let Some(&row_id) = candidates.first() {
+                    // Fetch the event row and extract ts_ms from the envelope.
+                    let ts = events_heap
+                        .get(row_id, &snapshot, self_xid, &self.pool)
+                        .ok()
+                        .and_then(|bytes| {
+                            executor::decode_row(&bytes, &events_table_def().columns).ok()
+                        })
+                        .and_then(|r| match &r[4] {
+                            Literal::Json(s) => serde_json::from_str::<serde_json::Value>(s)
+                                .ok()
+                                .and_then(|v| v.get("ts_ms").and_then(|m| m.as_i64())),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    let lag_s = if ts > 0 && now_ms >= ts {
+                        (now_ms - ts) as f64 / 1000.0
+                    } else {
+                        0.0
+                    };
+                    (ts, lag_s)
+                } else {
+                    (0, 0.0)
+                }
+            };
+
+            out.push(SubscriptionLagEntry {
+                consumer: name,
+                offset,
+                max_seq,
+                lag_events: (max_seq - offset).max(0),
+                oldest_unconsumed_ts_ms: oldest_ts_ms,
+                lag_seconds,
+            });
+        }
+        out.sort_by(|a, b| a.consumer.cmp(&b.consumer));
         out
     }
 
@@ -1758,9 +1889,24 @@ impl Engine {
             else {
                 continue;
             };
-            let payload = match &row[4] {
+            // Decode the stored JSON column — may be old (flat row) or new
+            // (canonical envelope with "payload"/"before"/"after"/"ts_ms" keys).
+            let stored = match &row[4] {
                 Literal::Json(s) => serde_json::from_str(s).unwrap_or(serde_json::Value::Null),
                 _ => serde_json::Value::Null,
+            };
+            // C1 (item 29): detect format by presence of the "payload" key.
+            // Old events store only the flat row; new ones store the envelope.
+            let (payload, before, after, ts_ms) = if let Some(p) = stored.get("payload") {
+                (
+                    p.clone(),
+                    stored.get("before").filter(|v| !v.is_null()).cloned(),
+                    stored.get("after").filter(|v| !v.is_null()).cloned(),
+                    stored.get("ts_ms").and_then(|v| v.as_i64()).unwrap_or(0),
+                )
+            } else {
+                // Pre-item-29 event: whole stored JSON is the flat row.
+                (stored, None, None, 0)
             };
             events.push(queue::Event {
                 seq: *seq,
@@ -1768,6 +1914,9 @@ impl Engine {
                 table_name: table_name.clone(),
                 op: op.clone(),
                 payload,
+                before,
+                after,
+                ts_ms,
             });
         }
         Ok(events)
@@ -5142,12 +5291,18 @@ mod tests {
         let rows = events_for_table(&mut engine, "t");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][3], Literal::Text("insert".to_string()));
-        let Literal::Json(payload) = &rows[0][4] else {
+        // C1 (item 29): canonical envelope stored in payload column.
+        let Literal::Json(raw) = &rows[0][4] else {
             panic!("expected Json payload, got {:?}", rows[0][4]);
         };
-        let parsed: serde_json::Value = serde_json::from_str(payload).unwrap();
-        assert_eq!(parsed["id"], serde_json::json!(1));
-        assert_eq!(parsed["name"], serde_json::json!("alice"));
+        let env: serde_json::Value = serde_json::from_str(raw).unwrap();
+        // Back-compat field: payload = after row.
+        assert_eq!(env["payload"]["id"], serde_json::json!(1));
+        assert_eq!(env["payload"]["name"], serde_json::json!("alice"));
+        // New fields: INSERT has after, no before.
+        assert_eq!(env["after"]["id"], serde_json::json!(1));
+        assert!(env["before"].is_null());
+        assert!(env["ts_ms"].as_i64().unwrap_or(0) > 0);
     }
 
     #[test]
@@ -5173,11 +5328,16 @@ mod tests {
         let rows = events_for_table(&mut engine, "t");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][3], Literal::Text("update".to_string()));
-        let Literal::Json(payload) = &rows[0][4] else {
+        // C1 (item 29): canonical envelope.
+        let Literal::Json(raw) = &rows[0][4] else {
             panic!("expected Json payload");
         };
-        let parsed: serde_json::Value = serde_json::from_str(payload).unwrap();
-        assert_eq!(parsed["balance"], serde_json::json!(200));
+        let env: serde_json::Value = serde_json::from_str(raw).unwrap();
+        // Back-compat: payload = after.
+        assert_eq!(env["payload"]["balance"], serde_json::json!(200));
+        // New: UPDATE has both before and after.
+        assert_eq!(env["before"]["balance"], serde_json::json!(100));
+        assert_eq!(env["after"]["balance"], serde_json::json!(200));
     }
 
     #[test]
@@ -5203,11 +5363,16 @@ mod tests {
         let rows = events_for_table(&mut engine, "t");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][3], Literal::Text("delete".to_string()));
-        let Literal::Json(payload) = &rows[0][4] else {
+        // C1 (item 29): canonical envelope.
+        let Literal::Json(raw) = &rows[0][4] else {
             panic!("expected Json payload");
         };
-        let parsed: serde_json::Value = serde_json::from_str(payload).unwrap();
-        assert_eq!(parsed["name"], serde_json::json!("alice"));
+        let env: serde_json::Value = serde_json::from_str(raw).unwrap();
+        // Back-compat: payload = before (pre-image) for DELETE.
+        assert_eq!(env["payload"]["name"], serde_json::json!("alice"));
+        // New: DELETE has before, no after.
+        assert_eq!(env["before"]["name"], serde_json::json!("alice"));
+        assert!(env["after"].is_null());
     }
 
     #[test]
@@ -5390,6 +5555,172 @@ mod tests {
             ),
             other => panic!("expected Rows, got {other:?}"),
         }
+    }
+
+    // ── item 29: CDC envelope + lag observability ────────────────────────────
+
+    /// C1: UPDATE event carries both before and after images; INSERT has only
+    /// after; DELETE has only before. Verified via `poll_events` (Event struct).
+    #[test]
+    fn cdc_c1_before_after_images_per_op() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        let xid0 = engine.begin().unwrap();
+        engine
+            .execute_sql(xid0, "CREATE TABLE orders (id INT, status TEXT)")
+            .unwrap();
+        engine.commit(xid0).unwrap();
+        engine.enable_events("orders").unwrap();
+
+        // INSERT: after only.
+        let xid1 = engine.begin().unwrap();
+        engine
+            .execute_sql(
+                xid1,
+                "INSERT INTO orders (id, status) VALUES (1, 'pending')",
+            )
+            .unwrap();
+        engine.commit(xid1).unwrap();
+
+        // UPDATE: both images.
+        let xid2 = engine.begin().unwrap();
+        engine
+            .execute_sql(xid2, "UPDATE orders SET status = 'shipped' WHERE id = 1")
+            .unwrap();
+        engine.commit(xid2).unwrap();
+
+        // DELETE: before only.
+        let xid3 = engine.begin().unwrap();
+        engine
+            .execute_sql(xid3, "DELETE FROM orders WHERE id = 1")
+            .unwrap();
+        engine.commit(xid3).unwrap();
+
+        let xid4 = engine.begin().unwrap();
+        let events = engine.poll_events(xid4, "c1-test", 10).unwrap();
+        engine.commit(xid4).unwrap();
+
+        assert_eq!(events.len(), 3);
+
+        // INSERT: after only, no before.
+        let ins = &events[0];
+        assert_eq!(ins.op, "insert");
+        assert!(ins.before.is_none(), "INSERT must not have before");
+        assert_eq!(ins.after.as_ref().unwrap()["status"], "pending");
+        assert_eq!(ins.payload["status"], "pending"); // back-compat
+        assert!(ins.ts_ms > 0, "ts_ms must be set");
+
+        // UPDATE: both images.
+        let upd = &events[1];
+        assert_eq!(upd.op, "update");
+        assert_eq!(upd.before.as_ref().unwrap()["status"], "pending");
+        assert_eq!(upd.after.as_ref().unwrap()["status"], "shipped");
+        assert_eq!(upd.payload["status"], "shipped"); // back-compat: after
+
+        // DELETE: before only, no after.
+        let del = &events[2];
+        assert_eq!(del.op, "delete");
+        assert_eq!(del.before.as_ref().unwrap()["status"], "shipped");
+        assert!(del.after.is_none(), "DELETE must not have after");
+        assert_eq!(del.payload["status"], "shipped"); // back-compat: before
+    }
+
+    /// C3: subscription_lag virtual relation returns correct lag_events and
+    /// lag_seconds for a consumer held behind the tip.
+    #[test]
+    fn cdc_c3_subscription_lag_virtual_relation() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        let x0 = engine.begin().unwrap();
+        engine.execute_sql(x0, "CREATE TABLE t (id INT)").unwrap();
+        engine.commit(x0).unwrap();
+        engine.enable_events("t").unwrap();
+
+        // Insert 3 events.
+        for i in 1..=3i64 {
+            let x = engine.begin().unwrap();
+            engine
+                .execute_sql(x, &format!("INSERT INTO t (id) VALUES ({i})"))
+                .unwrap();
+            engine.commit(x).unwrap();
+        }
+
+        // Ack only the first event (offset = seq 1).
+        let xa = engine.begin().unwrap();
+        let events = engine.poll_events(xa, "lag-test", 10).unwrap();
+        engine.commit(xa).unwrap();
+        assert_eq!(events.len(), 3);
+
+        let xa2 = engine.begin().unwrap();
+        engine.ack_events(xa2, "lag-test", events[0].seq).unwrap();
+        engine.commit(xa2).unwrap();
+
+        // Query the virtual relation (SELECT * to avoid reserved-word `offset`).
+        let xq = engine.begin().unwrap();
+        let result = engine
+            .execute_sql(xq, "SELECT * FROM unidb_catalog.subscription_lag")
+            .unwrap();
+        engine.commit(xq).unwrap();
+
+        let SqlResult::Rows { rows, columns, .. } = &result[0] else {
+            panic!("expected rows");
+        };
+        assert_eq!(rows.len(), 1, "one consumer registered");
+        let row = &rows[0];
+
+        // Find column indices by name.
+        let idx = |name: &str| columns.iter().position(|c| c == name).unwrap();
+        let ci_consumer = idx("consumer");
+        let ci_offset = idx("offset");
+        let ci_max_seq = idx("max_seq");
+        let ci_lag = idx("lag_events");
+
+        assert_eq!(row[ci_consumer], Literal::Text("lag-test".into()));
+        let Literal::Int(offset) = row[ci_offset] else {
+            panic!("offset not int");
+        };
+        let Literal::Int(max_seq) = row[ci_max_seq] else {
+            panic!("max_seq not int");
+        };
+        let Literal::Int(lag) = row[ci_lag] else {
+            panic!("lag_events not int");
+        };
+        assert_eq!(lag, max_seq - offset, "lag_events = max_seq - offset");
+        assert!(lag > 0, "consumer is behind");
+    }
+
+    /// C3: stats() subscription_lag entry matches the virtual relation.
+    #[test]
+    fn cdc_c3_stats_subscription_lag_matches_virtual_relation() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        let x0 = engine.begin().unwrap();
+        engine.execute_sql(x0, "CREATE TABLE t (id INT)").unwrap();
+        engine.commit(x0).unwrap();
+        engine.enable_events("t").unwrap();
+
+        for i in 1..=5i64 {
+            let x = engine.begin().unwrap();
+            engine
+                .execute_sql(x, &format!("INSERT INTO t (id) VALUES ({i})"))
+                .unwrap();
+            engine.commit(x).unwrap();
+        }
+
+        // Ack 3 of 5.
+        let xa = engine.begin().unwrap();
+        let events = engine.poll_events(xa, "stats-test", 10).unwrap();
+        engine.commit(xa).unwrap();
+        let xa2 = engine.begin().unwrap();
+        engine.ack_events(xa2, "stats-test", events[2].seq).unwrap();
+        engine.commit(xa2).unwrap();
+
+        let stats = engine.stats();
+        assert_eq!(stats.subscription_lag.len(), 1);
+        let lag_entry = &stats.subscription_lag[0];
+        assert_eq!(lag_entry.consumer, "stats-test");
+        assert_eq!(lag_entry.lag_events, lag_entry.max_seq - lag_entry.offset);
+        assert!(lag_entry.lag_events > 0);
     }
 
     // ── M10: heap vacuum / GC ────────────────────────────────────────────────
@@ -6218,8 +6549,7 @@ mod tests {
         eprintln!(
             "[item27 throttle] throttled={throttled_us}µs (reclaim={}) \
              unthrottled={unthrottled_us}µs (reclaim={}) ratio={ratio:.1}×",
-            rpt_throttled.versions_reclaimed,
-            rpt_unthrottled.versions_reclaimed,
+            rpt_throttled.versions_reclaimed, rpt_unthrottled.versions_reclaimed,
         );
 
         // Sanity: both passes reclaimed rows.

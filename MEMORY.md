@@ -12,8 +12,20 @@
 
 ## Current status
 
+- **Subscription CDC — canonical envelope, before/after, format adapters, lag
+  observability (backlog item 29) — SHIPPED 2026-07-13, branch
+  `29-subscription-cdc`, PR #72 (STOP-for-review).** C1: `before`/`after`/
+  `ts_ms` row images in every CDC event; canonical envelope in `__events__.payload`
+  back-compat with old flat events. C2: Debezium + Supabase format adapters via
+  `?format=` on SSE subscribe (`src/server/event_format.rs`). C3:
+  `unidb_catalog.subscription_lag` virtual relation + `/stats` JSON +
+  Prometheus `unidb_subscription_lag_events{consumer}` /
+  `unidb_subscription_lag_seconds{consumer}`. C4: guide §8 (§8.1–§8.6)
+  updated with contract, three format examples, and lag detection guidance.
+  Gates: workspace tests all green (crash 33/33 unchanged); clippy/fmt clean.
+  **Next: await PR review — do not merge.**
 - **Replication time-PITR + logical replication (backlog item 28) — SHIPPED
-  2026-07-13, branch `28-replication-time-pitr`, PR #70 pending (STOP-for-review).**
+  2026-07-13, branch `28-replication-time-pitr`, PR #70 (MERGED).**
   R1 (MUST): `src/backup/timeline.rs` — `TimelineIndex` appends one 16-byte
   `(ts_micros, lsn)` mark per user-txn commit after WAL sync. WAL format
   unchanged (no FORMAT_VERSION bump, no §3/D9 sign-off). `backup::restore_to_time`
@@ -23,13 +35,7 @@
   `unidb-logical` (wraps item-20 `Dispatcher` + `LogicalApplySink`); translates
   events to INSERT/UPDATE/DELETE SQL on a target `Engine`; at-least-once,
   offset-durable, survives primary restart. Known gap (UPDATE old key) filed as
-  item-26 follow-up. Gates: `cargo test --workspace --features server` all green
-  (413 unidb + 33 crash + workspace); clippy `--workspace --all-targets -D warnings`
-  clean; `fmt` clean. Docs: `ops_runbook.md` §9, `engine_access_guide.md` §11,
-  `28_replication_time_pitr_logical.md` → SHIPPED, `backlog_index.md` row 28 →
-  SHIPPED, `PROGRESS.md` entry, `docs/design/item28_design.md` (design decisions).
-  **Next: await PR review.**
-
+  item-26 follow-up.
 - **Event queue at scale (backlog item 26) — SHIPPED 2026-07-13, branch
   `26-event-queue-scale`, PR pending (STOP-for-review).** Q1: durable
   `DiskBTree` secondary index on `__events__.seq`; `poll_events` /
@@ -4489,6 +4495,49 @@ performance — Phase A" entry and the Current-status bullet above.
 - **Gates:** cargo test --workspace --features server green (385 + 32 crash);
   clippy/fmt clean; conc-matrix 28/28.
 - **Next:** await PR review — do not merge.
+
+### 2026-07-13 — Item 29: subscription CDC — canonical envelope, before/after, format adapters, lag observability
+
+- **C1 (before/after capture):** `Event` struct gained `before: Option<Value>`,
+  `after: Option<Value>`, `ts_ms: i64` (skip-if-none). `send_event_capture`
+  signature changed to `(table_def, op, before: Option<&[Literal]>,
+  after: Option<&[Literal]>, ctx)`. UPDATE now clones `before_row` prior to
+  `set_column`; INSERT passes `(None, Some(&coerced))`; DELETE `(Some(&row), None)`.
+  Canonical envelope stored in `__events__.payload`:
+  `{payload:<compat>, before, after, ts_ms, source:{seq,txId,table,schema}}`.
+  Back-compat: `payload` key contains the old flat row; `resolve_event_candidates`
+  detects old events (no "payload" key) and reads them transparently.
+- **C2 (format adapters):** New file `src/server/event_format.rs` —
+  `format_event(event, format)` dispatching to `format_debezium` /
+  `format_supabase` / native (default). `SubscribeParams.format` field added
+  to SSE route. 7 unit tests covering all three ops × all three formats.
+- **C3 (lag observability):** `SubscriptionLagEntry` struct + `subscription_lag`
+  field in `EngineStats`; `subscription_lag_stats()` method on `Engine` using
+  `read_snapshot`, `DiskBTree::max_entry()` (O(log n)), `search_range_limit`
+  for oldest unconsumed ts_ms. `unidb_catalog.subscription_lag` added to
+  `information_schema.rs` (schema + `subscription_lag_rows()` with
+  pool+snapshot context, special-cased in `query_exec.rs`). Prometheus gauges:
+  `unidb_subscription_lag_events{consumer}` + `unidb_subscription_lag_seconds{consumer}`
+  in `router.rs` `publish_engine_metrics`.
+- **C4 (docs):** `engine_access_guide.md` §8 updated — §8.1 new fields + ts_ms;
+  §8.2 wire formats (native/debezium/supabase examples); §8.3 Consuming (old §8.2,
+  + format note); §8.4 Replay/vacuum (old §8.3); §8.5 dispatcher (old §8.4);
+  §8.6 lag observability (virtual relation, /stats, Prometheus, alert guidance).
+- **Tests:** 3 existing CDC tests updated (use `env["payload"]["col"]`);
+  3 new tests: `cdc_c1_before_after_images_per_op`,
+  `cdc_c3_subscription_lag_virtual_relation`,
+  `cdc_c3_stats_subscription_lag_matches_virtual_relation`.
+- **Dispatch crate:** `unidb-dispatch` test helpers in `filter.rs` / `sink.rs`
+  updated for new Event fields — all dispatch tests green.
+- **Gates:** `cargo test --workspace --features server` all green; crash 33/33
+  (unchanged); `clippy --workspace --all-targets -D warnings` clean; `fmt` clean.
+  No FORMAT_VERSION bump, no WAL record type changes, no §3 decision reopened.
+- **Docs / tracking:** `29_subscription_cdc_envelope_lag.md` → SHIPPED
+  (acceptance checkboxes filled); `backlog_index.md` row 29 → SHIPPED;
+  `PROGRESS.md` item 29 entry added; `README.md` status line + milestone table
+  updated.
+- **Next:** push branch, open PR referencing spec + items 20/26/18/21 —
+  STOP for review, do not merge.
 
 ### 2026-07-06 — Project initialization
 - Architecture design doc reviewed; six foundational gaps identified and resolved.

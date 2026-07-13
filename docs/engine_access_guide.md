@@ -387,7 +387,7 @@ Enable it once per table:
 ### 8.1 The event payload (the stable contract)
 
 Every event is a row of the engine-managed `__events__` table, delivered as this
-JSON object. These field names are the contract:
+JSON object. These field names are the contract (item 29, C1):
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -395,18 +395,87 @@ JSON object. These field names are the contract:
 | `xid` | integer | Transaction id that produced the event. All events sharing an `xid` were committed atomically together (use it to reassemble a multi-row/multi-table transaction). |
 | `table_name` | string | Source table. |
 | `op` | string | `"insert"`, `"update"`, or `"delete"`. |
-| `payload` | object | **Full row image** keyed by column name — the post-image for insert/update, the pre-image for delete. Typed exactly as [§5](#5-results-types--paging) describes (decimals/timestamps as canonical strings, JSON columns embedded not double-encoded, vectors as arrays). |
+| `payload` | object | **Back-compat flat row image**: post-image for INSERT/UPDATE, pre-image for DELETE. New consumers should prefer `before`/`after` below. |
+| `before` | object \| null | **Pre-mutation row image** (null for INSERT). Present for UPDATE and DELETE. |
+| `after` | object \| null | **Post-mutation row image** (null for DELETE). Present for INSERT and UPDATE. |
+| `ts_ms` | integer | Capture wall-clock in Unix epoch milliseconds. 0 for events written before item 29. |
+
+> **Back-compat note.** `payload` is kept for consumers written against the
+> pre-item-29 contract — it holds the same flat `{col: val}` object it always
+> did. No existing consumer that reads `event.payload.col` needs to change.
+> New consumers should read `before`/`after` for correct before/after semantics
+> on UPDATE (today `payload` = after for UPDATE, which was always ambiguous for
+> a consumer that needs the old value too).
 
 > **Honest scope of the contract.** `seq` is the ordering key and offset — unidb
 > does **not** expose the physical WAL byte-LSN as a separate event field (it
 > would leak a storage-internal number with no consumer use that `seq` doesn't
-> already serve), and there is **no wall-clock `timestamp` column** on the event
-> today: the stream carries commit *order*, not commit *time*. A consumer that
-> needs receipt time stamps it on arrival; a producer that needs event time puts
-> it in its own row column, where it rides through in `payload`. The engine emits
-> raw row-level facts and transforms nothing — all shaping is consumer-side.
+> already serve). `source.lsn` is a documented follow-up if commit-time wiring
+> is added. The engine emits raw row-level facts and transforms nothing — all
+> shaping is consumer-side.
 
-### 8.2 Consuming: durable consumers vs. live tail
+### 8.2 Wire formats (item 29, C2)
+
+`GET /events/subscribe` accepts `?format=<name>` to request one of three wire
+shapes. **`seq` stays the SSE `id:` frame in every format.** Format is
+per-connection, not per-event.
+
+#### `?format=native` (default)
+
+The full `Event` struct as JSON. Carries every field including `before`, `after`,
+and `ts_ms`. Recommended for new consumers — no information loss.
+
+```json
+{
+  "seq": 42, "xid": 1017, "table_name": "orders", "op": "update",
+  "payload": {"id": 1, "status": "shipped"},
+  "before": {"id": 1, "status": "pending"},
+  "after":  {"id": 1, "status": "shipped"},
+  "ts_ms": 1752000000000
+}
+```
+
+#### `?format=debezium`
+
+Debezium-compatible envelope. Single-char op (`c`/`u`/`d`). Compatible with
+Kafka-Connect Debezium sinks that consume the Debezium JSON payload format.
+
+```json
+{
+  "payload": {
+    "op": "u",
+    "ts_ms": 1752000000000,
+    "before": {"id": 1, "status": "pending"},
+    "after":  {"id": 1, "status": "shipped"},
+    "source": {"seq": 42, "txId": 1017, "table": "orders", "schema": "public"}
+  }
+}
+```
+
+Op mapping: `insert` → `c`, `update` → `u`, `delete` → `d`.
+
+#### `?format=supabase`
+
+Supabase Realtime-compatible flat envelope. Compatible with consumers written
+against the Supabase CDC wire format.
+
+```json
+{
+  "eventType": "UPDATE",
+  "new": {"id": 1, "status": "shipped"},
+  "old": {"id": 1, "status": "pending"},
+  "schema": "public",
+  "table": "orders",
+  "commit_timestamp": "2026-07-13T12:00:00.000Z"
+}
+```
+
+#### Non-goals (V1)
+- Kafka transport: not a goal; SSE + `unidb-dispatch` webhook cover it.
+- Subscription-level RLS (row filtering by subscriber policy): depends on item 24.
+- `source.lsn`: requires commit-time wiring; `seq` is the ordering cursor for V1.
+
+### 8.3 Consuming: durable consumers vs. live tail
 
 Two models, one stream:
 
@@ -417,6 +486,8 @@ Two models, one stream:
   - Embed: `poll_events(xid, "billing", limit)` → process → `ack_events(xid, "billing", up_to_seq)`.
   - Server: `GET /events/subscribe?consumer=billing` (SSE) → `POST /events/ack`.
     Acks travel over `/events/ack`, never over the SSE connection.
+    Append `?format=debezium` or `?format=supabase` to switch wire format (§8.2);
+    `seq` remains the SSE `id:` frame and the ack cursor in all formats.
 - **Ephemeral live tail (at-most-once).** For a browser `EventSource` that just
   wants to watch a table: `GET /events/subscribe` with **no** `consumer`. Nothing
   is written to the consumer registry. Resume-from-offset on reconnect is the
@@ -425,7 +496,7 @@ Two models, one stream:
   optional `?table=<name>` filters to one table. Heartbeats keep the idle
   connection open.
 
-### 8.3 Replay & the vacuum-horizon contract
+### 8.4 Replay & the vacuum-horizon contract
 
 Events are ordinary durable rows, so **replay is just reading from an earlier
 offset**: a durable consumer that acks a lower `seq` (or a fresh consumer that
@@ -446,7 +517,7 @@ consumer must respect:
 - A **not-yet-registered** consumer has no offset, so `vacuum_events` cannot
   account for it — register (first `ack`) before you rely on full history.
 
-### 8.4 The reference dispatcher (`unidb-dispatch`)
+### 8.5 The reference dispatcher (`unidb-dispatch`)
 
 `unidb-dispatch` (workspace crate) is the app-layer fan-out service: it embeds
 the engine, consumes from a **durable offset**, and fans events out to webhooks
@@ -461,6 +532,56 @@ still advances, so a poison event cannot wedge the stream.
 > The studio **"Events" tab** (live viewer, offset scrubbing, replay-from-offset,
 > per-table enable/disable) is built on exactly these routes and lives in the
 > `unidb-studio` repo — out of scope for the engine, by design.
+
+### 8.6 Lag observability & detection (item 29, C3)
+
+The engine exposes per-consumer lag through three surfaces that all read the
+same underlying counters:
+
+**Virtual relation (embed or SQL):**
+
+```sql
+SELECT * FROM unidb_catalog.subscription_lag;
+-- consumer | offset | max_seq | lag_events | oldest_unconsumed_ts_ms | lag_seconds
+```
+
+| Column | Description |
+|---|---|
+| `consumer` | registered consumer name |
+| `offset` | last acked `seq` |
+| `max_seq` | highest seq in `__events__` (O(log n) B-tree lookup) |
+| `lag_events` | `max_seq − offset` |
+| `oldest_unconsumed_ts_ms` | `ts_ms` of the first un-acked event (0 if caught up) |
+| `lag_seconds` | `(now − oldest_unconsumed_ts_ms) / 1000.0` (0.0 if caught up) |
+
+**`/stats` JSON (server, item 21):**
+
+```json
+{
+  "subscription_lag": [
+    { "consumer": "billing", "offset": 41, "max_seq": 50,
+      "lag_events": 9, "oldest_unconsumed_ts_ms": 1720000000000,
+      "lag_seconds": 3.7 }
+  ]
+}
+```
+
+**Prometheus gauges (scraped from `/metrics`):**
+
+```
+unidb_subscription_lag_events{consumer="billing"} 9
+unidb_subscription_lag_seconds{consumer="billing"} 3.7
+```
+
+**Alert guidance.** A useful starting point:
+
+- Alert on `unidb_subscription_lag_events{consumer="X"} > 1000` for latency-sensitive
+  consumers.
+- Alert on `unidb_subscription_lag_seconds{consumer="X"} > 30` for near-real-time
+  pipelines.
+- A consumer that has stopped acking but whose offset is still referenced by
+  `vacuum_events` will pin the `__events__` table indefinitely — drop it
+  (`DELETE FROM __consumers__ WHERE name = 'X'`) if it will never resume.
 
 ---
 
