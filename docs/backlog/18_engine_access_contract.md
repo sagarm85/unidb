@@ -1,7 +1,11 @@
 # Engine access & introspection contract — "build your app on the engine"
 
 **Type:** Milestone
-**Status:** NOT STARTED
+**Status:** SHIPPED (2026-07-13) — see `PROGRESS.md` "Engine access &
+introspection contract (Milestone 18)". The Must set (A1, B1, B2, B3, C1, C2,
+C3, D1, E1) plus the Should items that fell out cheaply (A2, B4, C4, C5, D2)
+landed; the studio-switchover acceptance box below stays **unticked** — it
+closes from the `unidb-studio` repo, not here.
 
 > **Vision.** unidb is an *engine*, like Postgres. It does **not** ship
 > application-shaped REST resources. It ships a documented **access + query +
@@ -211,14 +215,20 @@ WHERE  tc.constraint_type = 'FOREIGN KEY';
 
 ## Milestone acceptance
 
-- [ ] Epics A, B, C(C1–C3), D1, E1 complete (the **Must** set).
-- [ ] The catalog queries in the worked example run against a live instance and
-      return correct PK/FK data for a schema with real foreign keys.
+- [x] Epics A, B, C(C1–C3), D1, E1 complete (the **Must** set). Should items
+      A2/B4/C4/C5/D2 also folded in (documented in the guide; C4 =
+      `unidb_catalog.indexes`; C5 = documented reconstruction rules).
+- [x] The catalog queries in the worked example run against a live instance and
+      return correct PK/FK data for a schema with real foreign keys —
+      `tests/information_schema.rs::worked_example_fk_join_pairs_composite_columns`
+      proves it on **composite** PK/FK, columns correctly paired.
 - [ ] `unidb-studio` switches its schema visualizer from inferred edges to catalog
       foreign keys **with no engine change beyond this milestone** — the proof the
-      surface is complete and app-owned.
-- [ ] `documentation_index.md` links the new guide; `PROGRESS.md` carries the
-      closeout entry (no metrics duplicated here).
+      surface is complete and app-owned. **(Unticked here by design — this box
+      closes from the `unidb-studio` repo. The engine surface it needs is
+      complete and proven by the differential + parity tests.)**
+- [x] `documentation_index.md` links the new guide (`docs/engine_access_guide.md`);
+      `PROGRESS.md` carries the closeout entry (no metrics duplicated here).
 
 ## Open questions / landmines (surface first, per CONVENTIONS "de-risk")
 

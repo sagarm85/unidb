@@ -482,6 +482,15 @@ or, if no index exists on that column:
 
 ### `GET /tables`
 
+> **Superseded (Milestone 18), kept for back-compat.** The documented source of
+> truth for introspection is now the SQL-queryable system catalog — `SELECT`
+> from `information_schema.tables` / `information_schema.columns` (and
+> `table_constraints` / `key_column_usage` / `referential_constraints` /
+> `unidb_catalog.indexes`) over `POST /sql`. That catalog exposes primary keys,
+> foreign keys, and indexes this flat route never did, and is reachable from
+> embed/attach/server alike. See `docs/engine_access_guide.md`. `GET /tables`
+> stays for existing clients; new tools should use the catalog.
+
 Schema introspection (S1, studio UI). List every **user** table with its
 columns — built from the in-memory catalog, so it is cheap (no heap scan).
 

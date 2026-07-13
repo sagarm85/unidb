@@ -60,6 +60,7 @@ Module map (what each layer became in code):
 | Transactions (M1; concurrent since Phase 5) | `mvcc.rs`, `txn.rs`, `lockmgr.rs`, `concurrency_hooks.rs`, `query_limits.rs` (P5.f timeouts/cancel/`work_mem`) |
 | Catalog & SQL (M1) | `catalog.rs`, `sql/{parser,logical,executor}.rs` |
 | Query power (Phase 4) | `sql/{query,plan,query_exec,join,aggregate,sort,optimizer,statistics,explain}.rs` — joins (hash+Grace-spill / sort-merge / index-nested-loop), aggregation + sort, subqueries/CTEs, `ANALYZE` + cost-based optimizer, `EXPLAIN` |
+| System catalog introspection (Milestone 18) | `sql/information_schema.rs` — `information_schema.*` / `unidb_catalog.*` as synthesized virtual relations SELECTable over the query surface (resolved at plan time in `sql/plan.rs`, rows materialized in `sql/query_exec.rs::Runner::scan`); read-only projection of `catalog.rs` metadata, no storage. See `docs/engine_access_guide.md` |
 | Secondary indexes (M2, M6, M7; all durable since Phase 3) | `btree_index.rs` (durable `DiskBTree`, also backs full-text + edge, and the per-table durable **free-space map / page directory** since the durable-FSM milestone), `disk_vector.rs` (durable IVF-Flat `DiskIvfIndex`), `fulltext.rs` (tokenizer), `vector.rs` (retired in-RAM HNSW baseline), `csr_index.rs` (retired) |
 | Graph (M3, M7) | `graph/{edges,index,logical,parser,executor}.rs` |
 | Event queue (M4) | `queue/{mod,payload}.rs` |
@@ -1421,4 +1422,17 @@ matrix green 28/28 at `CONC_REPEATS=10` (toggle on **and** off), the default is
 now ON. `=0`/`false`/`off` (or `set_concurrent_sql_writes(false)`) forces the
 serialized `cat_write` fallback. Table C re-measured on the flipped default:
 indexed 8-writer 811 → 1016 commits/s. No format change; §5.2/§5.4 updated.
+**Engine access & introspection contract (2026-07-13, Milestone 18, branch
+`18-engine-access-contract-impl`):** the system catalog is now queryable as
+synthesized virtual relations over the ordinary SQL surface —
+`information_schema.{tables,columns,table_constraints,key_column_usage,
+referential_constraints}` + `unidb_catalog.indexes` (`sql/information_schema.rs`;
+resolved at plan time in `sql/plan.rs`, rows materialized in
+`sql/query_exec.rs`). Read-only projection of existing `catalog.rs` metadata
+(FK/PK/UNIQUE/CHECK already parse+persist since M11) — no storage, no crash
+surface (harness stays 31), no `FORMAT_VERSION` bump. Reachable identically from
+embed/attach/server. New reference doc `docs/engine_access_guide.md` (Application
+Builder's Guide) stitches the access/query/type/error surface together; `GET
+/tables` is superseded-but-kept. See
+`docs/backlog/18_engine_access_contract.md` + `PROGRESS.md`.
 Update alongside the next milestone's closeout.*

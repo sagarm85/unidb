@@ -12,6 +12,39 @@
 
 ## Current status
 
+- **Engine access & introspection contract (backlog Milestone 18) — SHIPPED
+  (2026-07-13), branch `18-engine-access-contract-impl`, PR pending.** Delivered
+  a SQL-queryable **system catalog** as synthesized virtual relations over the
+  ordinary query surface — `information_schema.{tables,columns,table_constraints,
+  key_column_usage,referential_constraints}` (C1–C3) + `unidb_catalog.indexes`
+  (C4) — in `src/sql/information_schema.rs`. Routing: reserved names resolve to a
+  fixed synthetic schema in `sql/plan.rs::plan_from`; rows materialize from the
+  live catalog in `sql/query_exec.rs::Runner::scan`; the parser forces a SELECT
+  over an introspection relation onto the Phase-4 Query path so one virtual-scan
+  impl serves single-table *and* multi-way JOINs; the two `COUNT(*)` parallel
+  fast paths are guarded against `Heap::open` on a virtual relation. **Pure
+  read-side projection** — FK/PK/UNIQUE/CHECK already parse+persist (M11), so **no
+  catalog schema change, no `FORMAT_VERSION` bump, no crash surface (harness stays
+  31)**. Constraint names synthesized Postgres-style (`<t>_pkey`/`_key`/`_fkey`/
+  `_check`), stable across reopen. C5 object-DDL = documented reconstruction rules
+  (no stored `CREATE` text, no table-function syntax). **Honesty notes:**
+  `JOIN…USING`/`NATURAL` unsupported → worked-example ERD query rewritten to
+  equivalent `ON` form (composite-key alignment via `ordinal_position =
+  position_in_unique_constraint`); FK is metadata-only (M11 referenced-table
+  existence, `update/delete_rule = NO ACTION`); no `unidb://` DSN parsed (attach =
+  base URL + Bearer JWT, one db/server). Docs: new `docs/engine_access_guide.md`
+  (Application Builder's Guide — A1/A2/B1–B4/C/D1/D2/E1, "schema explorer in 30
+  lines"), linked from `documentation_index.md`; `GET /tables` marked
+  superseded-but-kept in REST_API.md; engine_design module map + footer, README,
+  backlog_index row 18, PROGRESS entry all updated. **Parity proven** across embed
+  (`tests/information_schema.rs`), attach
+  (`unidb-attach/tests/attach_sql.rs::information_schema_fk_join_over_attach`), and
+  server `/sql` (`tests/server_sql.rs::information_schema_over_sql_route`) — same
+  query, same rows; differential test runs the 4-way ERD join over a composite
+  PK/FK schema. Gates green: `-p unidb` (default + `--features server`), crash
+  **31/31**, `--workspace --features server`, clippy `-D warnings`, fmt. No §3
+  decision reopened. See PROGRESS "Engine access & introspection contract
+  (Milestone 18)", `docs/backlog/18_engine_access_contract.md`.
 - **`UNIDB_CONCURRENT_SQL_WRITES` default-ON flip (backlog item 11 follow-up) —
   SHIPPED (2026-07-13), branch `11-concurrent-writes-default-on`, PR pending.**
   The concurrent SQL-write path (catalog-lock split 0a/0c + latch-coupled
