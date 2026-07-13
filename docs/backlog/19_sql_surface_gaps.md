@@ -87,7 +87,7 @@
   check.
 - **Scope:** a one-row synthetic input for a FROM-less select. Small. Low ROI.
 
-### G9 — `LIKE` / `NOT LIKE` (and `ILIKE`) pattern matching
+### G9 — `LIKE` / `NOT LIKE` (and `ILIKE`) pattern matching **(Delivered under item 30 — Studio API readiness.)**
 - **ROI: high** — despite the G9 id (ids are stable, the list is not renumbered),
   this belongs near the **top**. Substring/prefix search is one of the most common
   filter operations a console offers.
@@ -127,7 +127,7 @@
   takes (including under `NEAR`). Small–medium; no storage impact. Best done
   alongside G9 (same evaluator surface).
 
-### G11 — Full-text search has no SQL / REST surface (embed-only today)
+### G11 — Full-text search has no SQL / REST surface (embed-only today) **(Delivered under item 30 — Studio API readiness.)**
 - **What:** you can `CREATE INDEX … USING FULLTEXT (col)`, but there is **no way
   to query it over `/sql`** — no `MATCH`/`@@`/search predicate in the parser
   (0 refs to full-text in `src/sql/`). Search is only reachable from Rust via
