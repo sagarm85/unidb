@@ -63,7 +63,8 @@ Module map (what each layer became in code):
 | System catalog introspection (Milestone 18) | `sql/information_schema.rs` — `information_schema.*` / `unidb_catalog.*` as synthesized virtual relations SELECTable over the query surface (resolved at plan time in `sql/plan.rs`, rows materialized in `sql/query_exec.rs::Runner::scan`); read-only projection of `catalog.rs` metadata, no storage. See `docs/engine_access_guide.md` |
 | Secondary indexes (M2, M6, M7; all durable since Phase 3) | `btree_index.rs` (durable `DiskBTree`, also backs full-text + edge, and the per-table durable **free-space map / page directory** since the durable-FSM milestone), `disk_vector.rs` (durable IVF-Flat `DiskIvfIndex`), `fulltext.rs` (tokenizer), `vector.rs` (retired in-RAM HNSW baseline), `csr_index.rs` (retired) |
 | Graph (M3, M7) | `graph/{edges,index,logical,parser,executor}.rs` |
-| Event queue (M4) | `queue/{mod,payload}.rs` |
+| Event queue (M4; downstream consumption M20) | `queue/{mod,payload}.rs` (incl. `poll_events_after` live-tail cursor, M20 E1) |
+| Event dispatcher (M20 E2, separate workspace crate) | `unidb-dispatch/src/{lib,sink,filter,dlq}.rs` (`Dispatcher`, `WebhookSink`/`RoomSink`, embeds `Arc<Engine>`, no engine surface) |
 | Server (M5, feature-gated; REST enrichment item 12; logs surface item 22) | `server/{engine_handle,error,dto,handlers,router,auth,sse,tls,txn_session,cursor,correlation,logs}.rs`, `bin/unidb-server.rs` |
 | Logs surface (item 22) | `server/correlation.rs` (request_id middleware + task-local), `server/logs.rs` (bounded reverse-seek `GET /logs`), `observability.rs` (default-build request_id thread-local read by `audit.rs`/slow-query) |
 | Autovacuum (A1–A4) | `autovacuum.rs` (background `std::thread` launcher: `Weak<Engine>`, threshold policy, clean-shutdown handle) |
@@ -704,6 +705,34 @@ consumer (`min(offsets)`), and is the only current lever bounding
 `poll_events`'s cost, which scales linearly with `__events__`'s total size
 (no predicate pushdown / no `seq` index yet — measured, §11). Nothing
 calls vacuum automatically.
+
+### 6.3 Making the stream consumable downstream (Milestone 20)
+
+M20 makes the M4 stream consumable **without teaching the engine any
+application shape** — the M18 boundary holds: the engine keeps emitting raw
+row-level facts, all delivery semantics live outside it.
+
+- **E1 (engine-server, framing only).** The M5 `GET /events/subscribe` SSE
+  route gained an *ephemeral live-tail* mode (no durable consumer): a
+  per-connection cursor seeded from the standard `Last-Event-ID` reconnect
+  header, else `?from_seq=`, plus an optional `?table=` filter. It is backed by
+  one new **read-only** engine method, `poll_events_after(after_seq, limit)` —
+  no storage/format/crash surface (harness stays 31). Durable-consumer mode
+  (at-least-once, resumes from the acked offset) is unchanged.
+- **E2 (app layer, own crate `unidb-dispatch`).** A downstream dispatcher that
+  *embeds* `Arc<Engine>` and drives the existing `poll/ack/vacuum` calls —
+  **zero engine surface added**. It polls from a durable offset, fans out to
+  sinks (webhooks with retry→**dead-letter table dogfooded back into unidb**;
+  in-process broadcast rooms), applies per-subscription table/op filters +
+  column projection consumer-side, then acks. Delivery is **at-least-once**
+  (crash between fan-out and ack ⇒ redelivery; a failing endpoint is retried
+  then dead-lettered while the offset still advances — a poison event cannot
+  wedge the stream). It surfaces "consumer too far behind" (a full poll batch
+  pins the vacuum horizon) as a `WARN`. Crucially, `tokio`/`reqwest` live in
+  *that* crate only, so `cargo tree -p unidb --no-default-features --edges
+  normal` still shows **no async runtime** — the engine's default build stays
+  sync. Contract documented in `docs/engine_access_guide.md §8`; E4 (studio
+  "Events" tab) is out of this repo.
 
 ---
 
@@ -1470,4 +1499,13 @@ server-feature-gated (`tracing-subscriber/json` under `server` only; no new
 default-build dep); no format change, harness stays 31. §8, §2 module map.
 `ops_runbook.md` §8 documents shipping the JSON files to CW/Datadog (L5). See
 `docs/backlog/22_logs_surface.md` + `PROGRESS.md`.
+**Milestone 20 — events / realtime dispatcher (2026-07-13, branch
+`20-events-dispatcher`): make the M4 stream consumable downstream** — E1 SSE
+ephemeral live-tail + resume (`Last-Event-ID`/`from_seq`/`table`) backed by the
+new read-only `poll_events_after`; E2 the `unidb-dispatch` workspace crate
+(durable-offset fan-out to webhooks with retry→dead-letter table + rooms,
+at-least-once, crash/replay zero-loss); E3 the event-schema contract in
+`docs/engine_access_guide.md §8`. No engine storage/format/crash surface (harness
+stays 31), engine default build stays sync (no tokio). See §6.3 and
+`docs/backlog/20_events_realtime_dispatcher.md` + `PROGRESS.md`.
 Update alongside the next milestone's closeout.*

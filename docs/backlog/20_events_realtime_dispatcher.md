@@ -1,7 +1,9 @@
 # Events / Realtime dispatcher — consume the WAL-derived event stream downstream
 
 **Type:** Milestone
-**Status:** NOT STARTED
+**Status:** ✅ SHIPPED (2026-07-13, branch `20-events-dispatcher`; PROGRESS:
+"Events / realtime dispatcher (Milestone 20)"). E1–E3 delivered; E4 (studio tab)
+is out of this repo by design.
 
 > Supabase-"Realtime" analog over a primitive Supabase does not have: unidb's M4
 > event queue is CDC captured **atomically with the commit** (one WAL — no
@@ -38,11 +40,18 @@
 
 ## Acceptance
 
-- [ ] A downstream demo service consumes INSERT/UPDATE/DELETE events for an
+- [x] A downstream demo service consumes INSERT/UPDATE/DELETE events for an
       enabled table with at-least-once delivery + resume after restart
       (offset-durable), zero events lost across an engine crash (replay proof).
-- [ ] Webhook fan-out retries into the dead-letter table on a failing endpoint.
-- [ ] Engine surface unchanged beyond E1 framing; no app REST in the engine.
+      — `unidb-dispatch/tests/dispatch_delivery.rs` (`consumes_iud_at_least_once_and_acks`,
+      `resumes_from_durable_offset_with_zero_loss_across_crash`,
+      `crash_between_deliver_and_ack_redelivers`).
+- [x] Webhook fan-out retries into the dead-letter table on a failing endpoint.
+      — `unidb-dispatch/tests/dispatch_webhook_dlq.rs::failing_webhook_retries_then_dead_letters`
+      (500-endpoint retried 3×, dead-lettered into `dispatch_dead_letter`, offset still advances).
+- [x] Engine surface unchanged beyond E1 framing; no app REST in the engine.
+      — one read-only method `poll_events_after` (E1 SSE resume); the dispatcher
+      is a separate crate embedding `Arc<Engine>`, adding no engine route.
 
 ## Notes / landmines
 
