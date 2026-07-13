@@ -12,6 +12,42 @@
 
 ## Current status
 
+- **Object storage service (backlog item 23) — SHIPPED (2026-07-13), branch
+  `23-storage-service`, PR pending. STOP-for-review (do not merge).** New
+  **app-layer** crate `unidb-storage` (workspace member; adds **no engine
+  surface**, keeps tokio + `aws-sdk-s3` out of the engine's sync build). Bucket/
+  object **metadata** in ordinary unidb tables (`buckets`, `objects`,
+  `object_dlq`); object **bytes** tiered: `< inline_threshold` (1 MiB) → engine
+  **LOB in the same txn as the metadata row** (ACID; commit/rollback proof); ≥ →
+  an **S3-wire store** — one `S3ObjectStore` (aws-sdk-s3) for **both** MinIO
+  (dev) & S3 (prod), selected by config (`STORAGE_BACKEND`), plus a
+  `MemoryObjectStore` Docker-free test double. Large-object consistency = an
+  **outbox** (`objects` insert event commits atomically with the pending row,
+  events enabled on `objects`) + a **`Reconciler`** that confirms
+  (`pending→ready`), compensates (`pending→failed` + compact-DLQ row, never a
+  dangling pending), and **sweeps orphaned bytes**. **Presigned PUT/GET** move
+  browser bytes directly — engine never proxies large payloads (§10).
+  **Design-note decisions** (`docs/design/storage_service.md`): (1) `aws-sdk-s3`
+  over object_store/rusoto for **offline SigV4 presigning** + MinIO
+  endpoint/path-style control; (2) confirm/compensate authority is a
+  **reconciler keyed on `created_at` age**, NOT the item-20 Dispatcher's tight
+  in-cycle retry (documented **wall**: ms retry ≠ upload grace window) — genuine
+  item-20 reuse remains via an optional `ConfirmSink` on a real
+  `Dispatcher`+`Filter`. **Engine constraint surfaced & worked around (NOT an
+  engine change):** unidb persists the whole catalog as **one ~8 KiB page blob**;
+  `objects`+`storage_key`+the 8-col dispatch DLQ overflows it
+  (`HeapFull{size:8883}`), and a *runtime* `CREATE TABLE` re-serializes a
+  row-volume-grown catalog and overflows too → dropped the **derivable**
+  `storage_key` column, used a compact 4-col `object_dlq`, and moved **all DDL
+  up front into `StorageService::new`** (reconciler does zero DDL). Verified at
+  scale (`tests/scale.rs`: 1 000 objects + reopen, no overflow). **Gates:**
+  `cargo test --workspace` green (storage: 3 crash + 4 round-trip + 1 outbox + 4
+  presign/config + 1 scale = 13); crash harness **31/31 unchanged**; `clippy
+  --workspace --all-targets -D warnings` + `fmt` clean; sync invariant intact.
+  Docker: `docker/docker-compose.minio.yml` (dev); live test gated behind
+  `STORAGE_S3_ENDPOINT`. Docs: crate README, engine_access_guide §10, design
+  note + design_index, backlog index row 23, spec→SHIPPED, PROGRESS "Object
+  storage service (item 23)". **Studio "Storage" tab = out of repo.**
 - **Logs surface (backlog item 22) — SHIPPED (2026-07-13), branch
   `22-logs-surface`, PR pending. STOP-for-review (do not merge).** Made the
   server's structured logs queryable + shippable without a log database.

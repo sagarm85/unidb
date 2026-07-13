@@ -104,6 +104,30 @@ the writer's transaction — that event stream **is the outbox** (§4).
 
 ## 4. Decision B — tiering + outbox + reconciler (the consistency core)
 
+> **Correction (2026-07-13, during implementation — evidence-based, per §9).**
+> Two things in this note's original sketch changed on contact with a real
+> engine constraint: **unidb persists the entire catalog (every `TableDef`) as
+> one ~8 KiB page blob.** Measurements while building this crate:
+> - The `objects` schema above with a `storage_key TEXT` column **plus** the
+>   8-column `unidb_dispatch::dlq` table **overflows** that blob
+>   (`HeapFull { size: 8883 }`). So (a) `storage_key` was **dropped** — it is
+>   always `"<bucket>/<object_key>"`, derived not stored (`service::storage_key`);
+>   and (b) compensation uses a **compact storage-native 4-column DLQ**
+>   (`object_dlq`) instead of reusing `dlq::ensure_dlq_table`/`insert_dead_letter`
+>   verbatim. The item-20 reuse that remains is real and load-bearing: the
+>   optional `ConfirmSink` rides a genuine `unidb_dispatch::Dispatcher` +
+>   `Filter` + `Sink`.
+> - The catalog blob is only rewritten on a *catalog* mutation (DDL /
+>   `enable_events`), and its in-memory size grows with row volume; a **runtime**
+>   `CREATE TABLE` re-serializes the grown catalog and can overflow. So **all**
+>   DDL (buckets, objects, object_dlq) + `enable_events` happens **up front in
+>   `StorageService::new`**, before any data — the reconciler does **zero** DDL.
+>   Verified: 1 000-object reconcile pass + reopen with no overflow
+>   (`tests/scale.rs`). `created_at` is stored as `created_at_ms INT` (epoch
+>   millis) so the reconciler can age pending rows directly.
+> The rest of §4 reads as originally written; treat the four bullets above as the
+> authoritative schema/DLQ details.
+
 ### 4.1 Two write paths, chosen by size threshold (`STORAGE_INLINE_THRESHOLD`, default 1 MiB)
 
 **Small object (`size < threshold`) → engine LOB, fully ACID, no outbox needed.**

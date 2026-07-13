@@ -31,6 +31,11 @@ win.
   proposed future roadmap — each with architecture/flow diagrams, exact data
   structures, border cases, and measured numbers. Start at its
   [index](processing-engines/00_engines_index.md).
+- [`storage_service.md`](storage_service.md) — **object storage service
+  (`unidb-storage`, backlog item 23)**: the design note for the Supabase-Storage
+  analog — S3 client choice (`aws-sdk-s3`, one wire impl for MinIO+S3), hybrid
+  LOB/S3 tiering, the outbox + reconciler consistency model, and the dated
+  correction recording the single-page catalog ceiling that shaped the schema.
 - [`engine_design.md`](engine_design.md) — the engine as shipped through
   **M0–M8** (storage core, MVCC + SQL, vector/full-text indexes, graph +
   CSR, event queue, REST server, B-Tree index, Rust attach client).

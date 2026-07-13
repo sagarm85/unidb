@@ -1,9 +1,10 @@
 # Object storage service — MinIO (dev) / S3 (prod) over engine metadata
 
 **Type:** Milestone
-**Status:** IN PROGRESS (started 2026-07-13, branch `23-storage-service`) — design
-note in `docs/design/storage_service.md`; implementation in the new
-`unidb-storage` crate.
+**Status:** SHIPPED (2026-07-13, branch `23-storage-service`, PR pending —
+STOP-for-review, do not merge). Implemented as the new app-layer `unidb-storage`
+crate; design note `docs/design/storage_service.md`; metrics/evidence in
+`PROGRESS.md` ("Object storage service (item 23)").
 
 > Supabase-Storage analog, honoring the Milestone-18 boundary and §10 ("no S3
 > tiering in the engine"): a **separate service layer** (`unidb-storage` crate
@@ -31,15 +32,25 @@ note in `docs/design/storage_service.md`; implementation in the new
 
 ## Acceptance
 
-- [ ] Upload/download/delete round-trip on both backends via one config switch;
-      docker-compose brings up MinIO for dev.
-- [ ] Kill the service mid-upload: no metadata row without bytes (outbox
-      compensation) and no unreferenced bytes surviving the reconciler.
-- [ ] Sub-threshold object round-trips as a LOB inside a user transaction
-      (commit/rollback proof).
-- [ ] Studio "Storage" tab: bucket browser, upload, presigned-link copy.
+- [x] Upload/download/delete round-trip on both backends via one config switch;
+      docker-compose brings up MinIO for dev. — `tests/round_trip.rs`
+      (memory/inline + s3-tier); the same `S3ObjectStore` serves MinIO & S3 by
+      config; `docker/docker-compose.minio.yml` + gated
+      `live_store_round_trip_when_configured`.
+- [x] Kill the service mid-upload: no metadata row without bytes (outbox
+      compensation) and no unreferenced bytes surviving the reconciler. —
+      `tests/crash_consistency.rs` proves **both** directions deterministically
+      (compensate pending→failed+DLQ; orphan-byte sweep) + `tests/scale.rs`.
+- [x] Sub-threshold object round-trips as a LOB inside a user transaction
+      (commit/rollback proof). — `tests/round_trip.rs`
+      `inline_write_rolls_back_leaving_no_object_and_no_bytes` (abort leaves no
+      row **and** no readable LOB; commit persists).
+- [ ] Studio "Storage" tab: bucket browser, upload, presigned-link copy. —
+      **out of this repo** (`unidb-studio`), by design; noted, not built.
 
 ## Depends on
 
-- Item 20 (dispatcher/outbox). Engine changes: none expected — this is the
-  proof the Milestone-18 contract is sufficient for a real service.
+- Item 20 (dispatcher/outbox). Engine changes: **none** — proven. The one
+  engine constraint hit (single-page catalog blob ceiling) was worked *around*
+  in the service layer (compact schema, all DDL up front), not by changing the
+  engine. See the dated correction in `docs/design/storage_service.md` §4.

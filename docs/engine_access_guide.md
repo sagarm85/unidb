@@ -541,8 +541,43 @@ idle-session reaper caps the worst case and increments
 
 ---
 
+## 10. Store objects (the storage service)
+
+*(Item 23.)* Storing files is an **access pattern over the engine**, not an engine
+feature: the `unidb-storage` app-layer crate keeps bucket/object **metadata** in
+ordinary unidb tables and tiers object **bytes** between engine LOBs (small,
+ACID-inline) and an S3-wire object store (MinIO/S3, large). It adds **no** engine
+surface — same boundary as `unidb-dispatch`.
+
+- **Two tiers, one API.** `put_object` routes by size: `< inline_threshold`
+  (default 1 MiB) → an engine **LOB written in the same transaction as the
+  metadata row** (commit/rollback atomic — the P3.d edge); larger → the object
+  store. `get_object`/`delete_object` are tier-transparent.
+- **Presigned URLs.** For large objects a browser moves bytes **directly**:
+  `begin_upload` returns a presigned PUT (and writes a `pending` metadata row);
+  `presign_get` returns a download URL. The engine never proxies a large payload.
+- **Outbox + reconciler (consistency).** The `pending` metadata row and its
+  `objects` **insert event** commit atomically (§8) — that event *is* the outbox.
+  A `Reconciler` then **confirms** uploads (`pending → ready` once the bytes
+  land), **compensates** stale pending rows (`pending → failed` + a dead-letter
+  row — never a dangling pending), and **sweeps** orphaned store bytes. So a
+  crash mid-upload leaves neither a metadata row without bytes nor unreferenced
+  bytes.
+- **Consuming the confirm stream.** Because `objects` has events enabled, a
+  downstream service can subscribe to it exactly like any other table (§8) — the
+  reference `ConfirmSink` does this via a real `unidb_dispatch::Dispatcher`.
+
+Config, env vars, and the (Docker-free) testing story live in
+`unidb-storage/README.md`; the design rationale (S3 client choice, the
+outbox/reconciler decision, and the single-page **catalog ceiling** that shaped
+the schema) is in `docs/design/storage_service.md`. The studio **"Storage" tab**
+is out of this repo (like Events/Logs), by design.
+
+---
+
 *Milestone 18 (engine access & introspection contract) + item 21 (observability
 metrics enrichment, §9). See `docs/backlog/18_engine_access_contract.md` and
 `docs/backlog/21_observability_metrics.md` for the specs, and `docs/REST_API.md`
 for the exhaustive HTTP route/error reference. §8 (event stream / change events)
-was added by Milestone 20 — `docs/backlog/20_events_realtime_dispatcher.md`.*
+was added by Milestone 20 — `docs/backlog/20_events_realtime_dispatcher.md`; §10
+(object storage) by item 23 — `docs/backlog/23_storage_service.md`.*
