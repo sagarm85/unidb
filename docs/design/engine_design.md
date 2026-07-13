@@ -443,10 +443,22 @@ sign-off, recorded in `PROGRESS.md`.
 `catalog.rs`: `TableDef`/`ColumnDef`/`ColumnType`
 (`Int64`/`Text`/`Bool`/`Json`/`Vector(n)`/`Decimal(p,s)`/`Timestamp`/`Float`/
 `Uuid`/`Bytea`/`Date`/`Time` — everything past `Vector(n)` added across Phase 2
-P2.a–P2.b), persisted as a single
-`serde_json` blob rewritten to a fresh page on every change, pointed at by
-`control.catalog_root`. Using `serde` here is deliberate — schema is
-infrequent control-plane data, not the hot path D9 protects.
+P2.a–P2.b), persisted as a **multi-page chain** (item 25, 2026-07-13) rewritten
+on every change, with `control.catalog_root` pointing at the chain head.
+
+**Chain format (item 25):** each catalog page's slot-0 payload starts with a
+4-byte LE magic (`CATALOG_CHAIN_MAGIC = 0xC0DA7A10`) + a 4-byte `next_page_id`
+(`INVALID_PAGE_ID` on the last page) + a JSON chunk. All chain pages are
+WAL-logged in one mini-txn, then `catalog_root` is updated as the atomic commit
+point (write-new-chain-then-flip). Old single-page catalogs (magic first byte
+0x10 ≠ `{` = 0x7B) are detected and loaded unchanged — no `FORMAT_VERSION`
+bump, no data-dir migration. This removes the single-page ~8 KiB `HeapFull`
+ceiling that item 23 had to work around (see §12 tech debt for the full history).
+Crash point P33 (crash harness) verifies that a crash between WAL commit and the
+`catalog_root` flip leaves the old catalog intact.
+
+Using `serde` here is deliberate — schema is infrequent control-plane data,
+not the hot path D9 protects.
 `TableDef.fsm_meta: Option<PageId>` holds the stable meta page of each table's
 **durable free-space map** (a `DiskBTree` keyed `page_id → free_bytes` whose keys
 are the page directory — durable-FSM milestone); the executor reconstructs a
@@ -454,12 +466,12 @@ are the page directory — durable-FSM milestone); the executor reconstructs a
 until a full scan needs it). The legacy `TableDef.pages: Vec<PageId>` field is
 retained only as a `#[serde(default)]` fallback for pre-FSM catalogs (no
 migration). Storing the page list *inline in the catalog blob* was the
-O(heap-pages) `HeapFull` ceiling this milestone removed (§12).
+O(heap-pages) `HeapFull` ceiling removed by the durable-FSM milestone (§12).
 
 **Catalog is not MVCC-versioned**: DDL takes effect immediately and
 globally; `CREATE TABLE` inside a transaction that later aborts is *not*
 rolled back. A real, narrow, tracked correctness gap (§12). Each catalog
-rewrite also leaves the previous blob's page behind (same
+rewrite also leaves the previous chain's pages behind (same
 no-vacuum story as the heap).
 
 ### 4.7 SQL subset
@@ -1543,3 +1555,11 @@ per-table heap page counts, and parallel-worker utilization — via a new
 overhead within noise (<1%). No `FORMAT_VERSION` bump, crash harness unchanged.
 See `docs/backlog/21_observability_metrics.md` + `PROGRESS.md`.
 Update alongside the next milestone's closeout.*
+
+**Multi-page catalog (2026-07-13, item 25, branch `25-multipage-catalog`):**
+`Catalog::persist` and `Catalog::load` rewritten to chain across N 8 KiB pages
+instead of a single page. Each chain page begins with `CATALOG_CHAIN_MAGIC`
+(4 B LE) + `next_page_id` (4 B LE) + JSON chunk; old single-page blobs open
+unchanged. No `FORMAT_VERSION` bump; no §3 decision reopened. Crash point P33
+added to the harness (35/35). Removes the ~8 KiB `HeapFull` ceiling that
+item 23 had to work around. See §4.6 and `PROGRESS.md` entry for metrics.

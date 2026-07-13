@@ -34,12 +34,20 @@ use crate::{
     bufferpool::BufferPool,
     control::{self, ControlData},
     error::{DbError, Result},
-    format::{PageId, INVALID_PAGE_ID, PAGE_TYPE_META},
+    format::{u32_from_le, u32_to_le, PageId, INVALID_PAGE_ID, PAGE_TYPE_META},
     heap::encode_insert_redo,
-    page::SlottedPage,
+    page::{SlottedPage, PAGE_HEADER_SIZE, SLOT_SIZE, TUPLE_HEADER_SIZE},
     sql::logical::{Expr, Literal},
     wal::Wal,
 };
+
+/// Magic prefix for chain-format catalog pages (4 bytes LE = 0xC0DA7A10).
+/// The first LE byte is 0x10, which is not '{' (0x7B), so a page starting with
+/// this magic is unambiguously a new-format chain page, not a legacy JSON blob.
+const CATALOG_CHAIN_MAGIC: u32 = 0xC0DA_7A10;
+
+/// Bytes used by the per-page chain header (magic u32 + next_page_id u32).
+const CHAIN_HEADER_SIZE: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColumnType {
@@ -330,25 +338,78 @@ impl Catalog {
 
     /// Load the catalog from `control.catalog_root`, or return an empty
     /// catalog if this is a fresh database.
+    ///
+    /// Supports two on-disk formats:
+    /// - **Chain format** (item 25): slot 0 starts with `CATALOG_CHAIN_MAGIC`
+    ///   (4 bytes LE), followed by `next_page_id` (4 bytes LE), then a JSON
+    ///   chunk. Multiple pages are followed until `next_page_id ==
+    ///   INVALID_PAGE_ID`, then the chunks are concatenated and parsed.
+    /// - **Legacy format**: slot 0 is a raw JSON blob (no magic prefix). This
+    ///   covers both the pre-P4.d bare `{name: TableDef}` map and the P4.d
+    ///   `{tables, stats}` wrapper. Both are read unchanged.
     pub fn load(control: &ControlData, pool: &BufferPool) -> Result<Self> {
         if control.catalog_root == INVALID_PAGE_ID {
             return Ok(Self::new());
         }
         let page = pool.fetch_page(control.catalog_root)?;
-        let payload = page.get(0)?.to_vec();
+        let first_payload = page.get(0)?.to_vec();
         pool.unpin(control.catalog_root);
+
+        // Detect chain format: first 4 bytes must equal CATALOG_CHAIN_MAGIC.
+        if first_payload.len() >= CHAIN_HEADER_SIZE {
+            let magic = u32_from_le(first_payload[0..4].try_into().unwrap());
+            if magic == CATALOG_CHAIN_MAGIC {
+                let json = Self::collect_chain(first_payload, pool)?;
+                return Self::parse_blob(&json);
+            }
+        }
+
+        // Legacy single-page format (pre-item-25 blobs open unchanged).
+        Self::parse_blob(&first_payload)
+    }
+
+    /// Reassemble the JSON from a page chain, given the first page's payload.
+    fn collect_chain(first_payload: Vec<u8>, pool: &BufferPool) -> Result<Vec<u8>> {
+        let mut json = Vec::new();
+        let mut payload = first_payload;
+        loop {
+            if payload.len() < CHAIN_HEADER_SIZE {
+                return Err(DbError::CatalogCorrupt(
+                    "catalog chain page too short to hold header".into(),
+                ));
+            }
+            let magic = u32_from_le(payload[0..4].try_into().unwrap());
+            if magic != CATALOG_CHAIN_MAGIC {
+                return Err(DbError::CatalogCorrupt(
+                    "catalog chain page has wrong magic".into(),
+                ));
+            }
+            let next_page_id = u32_from_le(payload[4..8].try_into().unwrap());
+            json.extend_from_slice(&payload[CHAIN_HEADER_SIZE..]);
+            if next_page_id == INVALID_PAGE_ID {
+                break;
+            }
+            let page = pool.fetch_page(next_page_id)?;
+            payload = page.get(0)?.to_vec();
+            pool.unpin(next_page_id);
+        }
+        Ok(json)
+    }
+
+    /// Parse a complete JSON blob as a `PersistedCatalog`, with backward
+    /// compatibility for the pre-P4.d bare `{name: TableDef}` map format.
+    fn parse_blob(blob: &[u8]) -> Result<Self> {
         // Backward compatible: a pre-P4.d catalog is a bare `{name: TableDef}`
         // map; the P4.d format wraps it as `{tables, stats}`. Try the old shape
-        // first (it fails to parse the new one, since "tables"/"stats" aren't
-        // TableDefs), then the new one.
-        if let Ok(tables) = serde_json::from_slice::<HashMap<String, TableDef>>(&payload) {
+        // first (it fails to parse the new one), then the new one.
+        if let Ok(tables) = serde_json::from_slice::<HashMap<String, TableDef>>(blob) {
             return Ok(Self {
                 tables,
                 stats: HashMap::new(),
             });
         }
         let p: PersistedCatalog =
-            serde_json::from_slice(&payload).map_err(|e| DbError::CatalogCorrupt(e.to_string()))?;
+            serde_json::from_slice(blob).map_err(|e| DbError::CatalogCorrupt(e.to_string()))?;
         Ok(Self {
             tables: p.tables,
             stats: p.stats,
@@ -646,21 +707,67 @@ impl Catalog {
         };
         let encoded =
             serde_json::to_vec(&blob).map_err(|e| DbError::CatalogCorrupt(e.to_string()))?;
-        let page_id = ctx.pool.alloc_page()?;
+
+        // Maximum JSON bytes per catalog page. Each page's slot-0 payload is:
+        //   [CHAIN_HEADER_SIZE bytes chain header][json chunk bytes]
+        // The SlottedPage overhead per slot is PAGE_HEADER_SIZE + SLOT_SIZE +
+        // TUPLE_HEADER_SIZE, so the maximum payload (chain header + json chunk)
+        // is page_size minus those three. Subtracting CHAIN_HEADER_SIZE gives
+        // the max JSON chunk per page.
+        let max_payload = ctx
+            .page_size
+            .saturating_sub(PAGE_HEADER_SIZE + SLOT_SIZE + TUPLE_HEADER_SIZE);
+        let max_json = max_payload.saturating_sub(CHAIN_HEADER_SIZE);
+
+        // Collect chunk slices (may be just one for small catalogs).
+        let chunks: Vec<&[u8]> = if max_json == 0 {
+            // Pathological tiny page size — keep old behavior.
+            vec![encoded.as_slice()]
+        } else {
+            encoded.chunks(max_json).collect()
+        };
+
+        // Allocate all page IDs up front so we can embed forward next_page_id
+        // pointers in each page before writing any of them.
+        let page_ids: Vec<PageId> = (0..chunks.len())
+            .map(|_| ctx.pool.alloc_page())
+            .collect::<Result<_>>()?;
+
+        // WAL-log all chain pages in one mini-txn, then flip catalog_root.
+        // Crash before the control-file flip leaves old catalog_root intact;
+        // crash after = new chain is fully WAL-recovered. (Landmine 2 decision.)
         let (txn_id, begin_lsn) = ctx.wal.begin_mini_txn()?;
-        let mut page = SlottedPage::new(page_id, PAGE_TYPE_META, ctx.page_size);
-        let slot = page.insert(&encoded)?;
-        debug_assert_eq!(slot, 0, "catalog page must hold exactly one blob at slot 0");
-        let redo = encode_insert_redo(0, None, &encoded);
-        let lsn = ctx
-            .wal
-            .log_insert(txn_id, begin_lsn, page_id, slot, &redo)?;
-        page.set_lsn(lsn);
-        ctx.pool.write_page(&page)?;
-        ctx.wal.commit_mini_txn(txn_id, lsn)?;
+        let mut prev_lsn = begin_lsn;
+        for (i, (chunk, &page_id)) in chunks.iter().zip(page_ids.iter()).enumerate() {
+            let next_page_id = if i + 1 < page_ids.len() {
+                page_ids[i + 1]
+            } else {
+                INVALID_PAGE_ID
+            };
+            // Build per-page payload: chain header + JSON chunk.
+            let mut payload = Vec::with_capacity(CHAIN_HEADER_SIZE + chunk.len());
+            payload.extend_from_slice(&u32_to_le(CATALOG_CHAIN_MAGIC));
+            payload.extend_from_slice(&u32_to_le(next_page_id));
+            payload.extend_from_slice(chunk);
+
+            let mut page = SlottedPage::new(page_id, PAGE_TYPE_META, ctx.page_size);
+            let slot = page.insert(&payload)?;
+            debug_assert_eq!(
+                slot, 0,
+                "catalog chain page must hold exactly one blob at slot 0"
+            );
+            let redo = encode_insert_redo(0, None, &payload);
+            let lsn = ctx.wal.log_insert(txn_id, prev_lsn, page_id, slot, &redo)?;
+            page.set_lsn(lsn);
+            ctx.pool.write_page(&page)?;
+            prev_lsn = lsn;
+        }
+        ctx.wal.commit_mini_txn(txn_id, prev_lsn)?;
+
+        // Atomic commit point: flip catalog_root to the head of the new chain.
         {
             let mut control = ctx.control.lock().unwrap_or_else(|e| e.into_inner());
-            control.catalog_root = page_id;
+            control.catalog_root = page_ids[0];
             control::write(ctx.control_path, &control)?;
         }
         Ok(())
@@ -905,5 +1012,188 @@ mod tests {
 
         let reloaded = Catalog::load(&control.lock().unwrap(), &pool).unwrap();
         assert_eq!(reloaded.lookup("t").unwrap().rls_policy, Some(policy));
+    }
+
+    // ── item 25: multi-page catalog ──────────────────────────────────────────
+
+    /// Helper: build a TableDef with `ncols` columns named col0..colN.
+    fn wide_table(name: &str, ncols: usize) -> TableDef {
+        let columns = (0..ncols)
+            .map(|i| ColumnDef {
+                name: format!("col{i}"),
+                ty: ColumnType::Text,
+                index: None,
+                index_root: None,
+                dropped: false,
+                constraints: Default::default(),
+            })
+            .collect();
+        TableDef {
+            name: name.to_string(),
+            columns,
+            pages: vec![],
+            fsm_meta: None,
+            rls_policy: None,
+            events_enabled: false,
+            serial_next: Default::default(),
+            constraints: Default::default(),
+            generation: 0,
+        }
+    }
+
+    /// A catalog with enough tables/columns to overflow one 8 KiB page must
+    /// persist and reload intact without HeapFull.
+    #[test]
+    fn multipage_catalog_roundtrip() {
+        let dir = tempdir().unwrap();
+        let (pool, wal, cp, control) = setup(dir.path());
+        let mut catalog = Catalog::new();
+        let mut ctx = CatalogCtx {
+            pool: &pool,
+            wal: &wal,
+            control_path: &cp,
+            control: &control,
+            page_size: DEFAULT_PAGE_SIZE as usize,
+        };
+        // 50 tables × 20 columns each → blob well past 8 KiB.
+        for i in 0..50 {
+            catalog
+                .create_table(wide_table(&format!("t{i}"), 20), &mut ctx)
+                .unwrap();
+        }
+        // Reload and verify all tables survive.
+        let reloaded = Catalog::load(&control.lock().unwrap(), &pool).unwrap();
+        for i in 0..50 {
+            let t = reloaded.lookup(&format!("t{i}")).unwrap();
+            assert_eq!(t.columns.len(), 20, "table t{i} should have 20 columns");
+        }
+    }
+
+    /// A catalog whose serialized JSON just barely exceeds one page triggers
+    /// a two-page chain and reloads correctly.
+    #[test]
+    fn catalog_just_over_page_boundary() {
+        let dir = tempdir().unwrap();
+        let (pool, wal, cp, control) = setup(dir.path());
+        let mut catalog = Catalog::new();
+        let mut ctx = CatalogCtx {
+            pool: &pool,
+            wal: &wal,
+            control_path: &cp,
+            control: &control,
+            page_size: DEFAULT_PAGE_SIZE as usize,
+        };
+        // 30 tables × 15 columns → ~9–11 KiB, forces a two-page chain.
+        for i in 0..30 {
+            catalog
+                .create_table(wide_table(&format!("u{i}"), 15), &mut ctx)
+                .unwrap();
+        }
+        let reloaded = Catalog::load(&control.lock().unwrap(), &pool).unwrap();
+        assert_eq!(reloaded.tables().count(), 30);
+        for i in 0..30 {
+            assert!(reloaded.lookup(&format!("u{i}")).is_ok());
+        }
+    }
+
+    /// Legacy single-page catalog blob (no chain header) still opens unchanged.
+    /// We write a raw JSON blob directly to a page (bypassing the new persist
+    /// path) and confirm that load() falls back to the legacy parser.
+    #[test]
+    fn legacy_single_page_catalog_backward_compat() {
+        let dir = tempdir().unwrap();
+        let (pool, wal, cp, control) = setup(dir.path());
+
+        // Build a legacy-style encoded blob (no CATALOG_CHAIN_MAGIC prefix).
+        let legacy_tables: HashMap<String, TableDef> = {
+            let mut m = HashMap::new();
+            m.insert(
+                "legacy".to_string(),
+                TableDef {
+                    name: "legacy".to_string(),
+                    columns: vec![ColumnDef {
+                        name: "id".to_string(),
+                        ty: ColumnType::Int64,
+                        index: None,
+                        index_root: None,
+                        dropped: false,
+                        constraints: Default::default(),
+                    }],
+                    pages: vec![],
+                    fsm_meta: None,
+                    rls_policy: None,
+                    events_enabled: false,
+                    serial_next: Default::default(),
+                    constraints: Default::default(),
+                    generation: 0,
+                },
+            );
+            m
+        };
+        // P4.d `{tables, stats}` shape (legacy format without chain header)
+        #[derive(serde::Serialize)]
+        struct LegacyBlob<'a> {
+            tables: &'a HashMap<String, TableDef>,
+            stats: HashMap<String, ()>,
+        }
+        let blob = serde_json::to_vec(&LegacyBlob {
+            tables: &legacy_tables,
+            stats: HashMap::new(),
+        })
+        .unwrap();
+
+        // Write legacy blob directly to a page (old persist path).
+        let page_id = pool.alloc_page().unwrap();
+        let (txn_id, begin_lsn) = wal.begin_mini_txn().unwrap();
+        let mut page = SlottedPage::new(page_id, PAGE_TYPE_META, DEFAULT_PAGE_SIZE as usize);
+        let slot = page.insert(&blob).unwrap();
+        let redo = encode_insert_redo(0, None, &blob);
+        let lsn = wal
+            .log_insert(txn_id, begin_lsn, page_id, slot, &redo)
+            .unwrap();
+        page.set_lsn(lsn);
+        pool.write_page(&page).unwrap();
+        wal.commit_mini_txn(txn_id, lsn).unwrap();
+        {
+            let mut ctrl = control.lock().unwrap();
+            ctrl.catalog_root = page_id;
+            control::write(&cp, &ctrl).unwrap();
+        }
+
+        // Reload via the new Catalog::load — must fall back to legacy path.
+        let reloaded = Catalog::load(&control.lock().unwrap(), &pool).unwrap();
+        assert!(reloaded.lookup("legacy").is_ok());
+        assert_eq!(reloaded.lookup("legacy").unwrap().columns.len(), 1);
+    }
+
+    /// The item-23 original layout (objects with storage_key + full 8-col DLQ)
+    /// that previously hit HeapFull must now succeed.
+    #[test]
+    fn item23_original_schema_no_heap_full() {
+        let dir = tempdir().unwrap();
+        let (pool, wal, cp, control) = setup(dir.path());
+        let mut catalog = Catalog::new();
+        let mut ctx = CatalogCtx {
+            pool: &pool,
+            wal: &wal,
+            control_path: &cp,
+            control: &control,
+            page_size: DEFAULT_PAGE_SIZE as usize,
+        };
+        // buckets(3 cols) + objects(11 cols incl. storage_key) + 8-col DLQ
+        // These are exactly the tables that overflowed before item 25.
+        let buckets = wide_table("buckets", 3);
+        let objects = wide_table("objects", 11); // includes storage_key
+        let dlq = wide_table("object_dlq", 8);
+        catalog.create_table(buckets, &mut ctx).unwrap();
+        catalog.create_table(objects, &mut ctx).unwrap();
+        catalog.create_table(dlq, &mut ctx).unwrap();
+
+        // Reload and confirm all three tables present.
+        let reloaded = Catalog::load(&control.lock().unwrap(), &pool).unwrap();
+        assert!(reloaded.lookup("buckets").is_ok());
+        assert!(reloaded.lookup("objects").is_ok());
+        assert!(reloaded.lookup("object_dlq").is_ok());
+        assert_eq!(reloaded.lookup("objects").unwrap().columns.len(), 11);
     }
 }
