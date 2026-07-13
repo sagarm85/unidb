@@ -1,0 +1,36 @@
+# Multi-stage build: unidb-server-full (HTTP server with optional storage).
+#
+# Usage (from the unidb repo root):
+#   docker build -f docker/Dockerfile.server -t unidb-server .
+#
+# Or via docker-compose.demo.yml (in unidb-studio/demo/):
+#   docker compose -f ../unidb-studio/demo/docker-compose.demo.yml up -d
+FROM rust:1-bookworm AS builder
+
+WORKDIR /src
+COPY . .
+
+# Build the server binary (--release; skip tests).
+RUN cargo build --release -p unidb-server-full
+
+# ── Runtime image ────────────────────────────────────────────────────────────
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /src/target/release/unidb-server-full /usr/local/bin/
+
+# Defaults — all overridable via docker-compose environment:
+ENV UNIDB_DATA_DIR=/data
+ENV UNIDB_BIND_ADDR=0.0.0.0:8080
+ENV UNIDB_LOG_FORMAT=text
+
+VOLUME /data
+EXPOSE 8080
+
+HEALTHCHECK --interval=5s --timeout=5s --retries=20 \
+  CMD curl -sf http://localhost:8080/stats || exit 1
+
+CMD ["unidb-server-full"]
