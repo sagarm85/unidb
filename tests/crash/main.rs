@@ -70,6 +70,10 @@
 //         and its FSM directory entry in one WAL mini-txn, so a crash mid-grow
 //         leaves both or neither — never an orphan page absent from the
 //         directory. Rows on freshly grown pages survive a crash byte-intact.
+//   P30 – event seq index (item 26, Q1): the durable `__events__.seq` B-tree
+//         index entries survive a crash (no checkpoint) alongside their heap
+//         rows, and `poll_events_after` resolves the correct events on reopen
+//         via the recovered index — no heap scan needed, no index rebuild.
 
 use tempfile::tempdir;
 use unidb::{Engine, RowId};
@@ -1988,4 +1992,88 @@ fn p28_atomic_heap_grow_leaves_no_orphan_on_crash() {
         "P28: the last grown page's row must survive byte-intact (atomic grow, not torn)"
     );
     engine.commit(x).unwrap();
+}
+
+// ── P30: event seq index survives crash and poll resolves via index ───────────
+
+#[test]
+fn p30_event_seq_index_survives_crash_and_poll_resolves_via_index() {
+    // Insert events, drop (crash), reopen, assert that poll_events_after returns
+    // the correct events via the recovered seq index (no heap full-scan needed).
+    let dir = tempdir().unwrap();
+
+    let committed_seqs: Vec<i64>;
+    {
+        let engine = open(dir.path());
+        let x = engine.begin().unwrap();
+        engine.execute_sql(x, "CREATE TABLE t (val INT)").unwrap();
+        engine.commit(x).unwrap();
+
+        let x = engine.begin().unwrap();
+        engine.enable_events("t").unwrap();
+        engine.commit(x).unwrap();
+
+        // Insert 10 rows in 3 separate committed transactions.
+        let mut seqs = Vec::new();
+        for batch in [vec![1i64, 2, 3], vec![4, 5, 6], vec![7, 8, 9, 10]] {
+            let x = engine.begin().unwrap();
+            for v in batch {
+                engine
+                    .execute_sql(x, &format!("INSERT INTO t (val) VALUES ({})", v))
+                    .unwrap();
+            }
+            engine.commit(x).unwrap();
+        }
+        // Collect committed seqs.
+        let x = engine.begin().unwrap();
+        let events = engine.poll_events_after(x, 0, 100).unwrap();
+        engine.commit(x).unwrap();
+        for e in &events {
+            seqs.push(e.seq);
+        }
+        committed_seqs = seqs;
+        assert_eq!(
+            committed_seqs.len(),
+            10,
+            "should have 10 events before crash"
+        );
+
+        // Crash immediately — no checkpoint; index pages only in WAL.
+        drop(engine);
+    }
+
+    // Reopen (recovery redoes the WAL_INDEX records).
+    let engine = open(dir.path());
+
+    // poll_events_after from the beginning: must return all 10 events.
+    let x = engine.begin().unwrap();
+    let events_after = engine.poll_events_after(x, 0, 100).unwrap();
+    engine.commit(x).unwrap();
+    assert_eq!(
+        events_after.len(),
+        10,
+        "P30: all 10 events must survive crash via recovered seq index"
+    );
+
+    // Cursor-based: poll_events_after from mid-stream.
+    let mid = committed_seqs[4]; // seq of the 5th event
+    let x = engine.begin().unwrap();
+    let tail = engine.poll_events_after(x, mid, 100).unwrap();
+    engine.commit(x).unwrap();
+    assert_eq!(
+        tail.len(),
+        5,
+        "P30: poll_events_after(mid) must return the 5 events after the cursor"
+    );
+    // All returned seqs are > mid.
+    assert!(
+        tail.iter().all(|e| e.seq > mid),
+        "P30: all returned events must have seq > cursor"
+    );
+    // Returned seqs match the second half.
+    let mut got: Vec<i64> = tail.iter().map(|e| e.seq).collect();
+    got.sort();
+    let mut expected: Vec<i64> = committed_seqs[5..].to_vec();
+    expected.sort();
+    assert_eq!(got, expected, "P30: recovered index returns correct seqs");
 }

@@ -244,6 +244,28 @@ impl EngineHandle {
             .await
     }
 
+    /// Q2 (item 26): current commit generation — callers snapshot this before
+    /// processing a batch so they can detect the NEXT commit even if it fires
+    /// before the `wait_event_commit` call.
+    pub fn event_commit_gen(&self) -> u64 {
+        self.engine
+            .as_ref()
+            .map(|e| e.event_commit_gen())
+            .unwrap_or(0)
+    }
+
+    /// Q2 (item 26): block (on a spawn_blocking thread) until a new commit
+    /// occurs or `timeout` elapses, then return the new generation. Use this
+    /// instead of a fixed sleep to reduce latency and CPU on idle streams.
+    pub async fn wait_event_commit(&self, known_gen: u64, timeout: std::time::Duration) -> u64 {
+        let Ok(engine) = self.engine() else {
+            return known_gen;
+        };
+        tokio::task::spawn_blocking(move || engine.wait_event_commit_blocking(known_gen, timeout))
+            .await
+            .unwrap_or(known_gen)
+    }
+
     pub async fn ack_events(&self, xid: Xid, consumer: String, up_to_seq: i64) -> Result<()> {
         self.on_engine(move |e| e.ack_events(xid, &consumer, up_to_seq))
             .await

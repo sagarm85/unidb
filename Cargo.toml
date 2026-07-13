@@ -148,6 +148,10 @@ harness = false
 required-features = ["server"]
 
 [[bench]]
+name = "poll_events"
+harness = false
+
+[[bench]]
 name = "tpch"
 harness = false
 

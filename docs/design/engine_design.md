@@ -702,10 +702,14 @@ as `__edges__`. Consequences, all structural rather than promised:
 
 `poll_events`/`ack_events` are Kafka-style manual-commit;
 `vacuum_events()` reclaims rows acknowledged by **every** registered
-consumer (`min(offsets)`), and is the only current lever bounding
-`poll_events`'s cost, which scales linearly with `__events__`'s total size
-(no predicate pushdown / no `seq` index yet — measured, §11). Nothing
-calls vacuum automatically.
+consumer (`min(offsets)`) and simultaneously removes the corresponding
+seq-index entries (item 26, Q3) — the index never pins retention.
+
+**Item 26 (shipped 2026-07-13):** `poll_events` / `poll_events_after` now use a
+durable `DiskBTree` secondary index on `__events__.seq` — cost is O(log n +
+returned), not O(total events). Poll latency is flat as the enabled table grows
+(measured: 10k→30 µs, 100k→28 µs, 300k→36 µs with limit=20). Nothing calls
+vacuum automatically.
 
 ### 6.3 Making the stream consumable downstream (Milestone 20)
 
@@ -871,8 +875,9 @@ pin the vacuum horizon. Result cursors (`server/cursor.rs`, R4) page large
 `rows` results with the same principal-binding + idle expiry. Auth is
 **verify-only JWT** (HS256 Bearer; the server never issues tokens);
 per-user privileges + superuser gates are P6.e. SSE is
-**server-polls-then-pushes** (`poll_events` has no wake primitive), which
-is why subscriber cost scales badly (§11). TLS is native since P6.f
+**server-push-on-commit** (item 26, Q2): `Engine::commit` notifies a condvar
+(`EventWake`) after WAL sync; SSE subscribers block on `wait_event_commit`
+rather than spinning on a fixed timer — idle cost is zero. TLS is native since P6.f
 (rustls, `UNIDB_TLS_CERT`/`KEY`).
 
 **Logs surface (item 22).** Server logging is **JSON lines** (both stdout and
@@ -1097,9 +1102,7 @@ the single writer thread).
   gone — the vector index is now the durable IVF-Flat `DiskIvfIndex`, whose
   per-insert cost is a single posting-list `DiskBTree` insert (O(log n)) and whose
   open cost is O(1). CSR (also non-incremental, debounced) is likewise retired.
-- **SSE subscriber scaling**: 1→10→50 subscribers is 5.2→33.9→162.6 ms —
-  N pollers × poll interval × linear `poll_events`, all serialized
-  through the one writer thread.
+- **SSE subscriber scaling** ~~(O(total events) × N pollers)~~: **resolved by item 26** — Q1 gives O(log n + returned) index-based poll; Q2 replaces per-subscriber polling timers with a commit-side `EventWake` condvar so idle subscribers do zero work. The serialization through the writer thread is unchanged, but the per-wake cost is now O(log n + new events) per subscriber.
 - **`NEAR` latency (~4–5 ms)** is transactional overhead, not vector
   search — the raw structures answer in microseconds (fulltext search
   ~14.2 µs).

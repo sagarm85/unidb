@@ -39,7 +39,7 @@
 | 23 | `23_storage_service.md` | Milestone | ✅ SHIPPED (PROGRESS: Object storage service — MinIO/S3 tiering over engine metadata (item 23)) |
 | 24 | `24_authz_v2_policies.md` | Milestone | ⏳ NOT STARTED |
 | 25 | `25_multipage_catalog.md` | Improvement | ⏳ NOT STARTED |
-| 26 | `26_event_queue_scale.md` | Improvement | ⏳ NOT STARTED |
+| 26 | `26_event_queue_scale.md` | Improvement | ✅ SHIPPED 2026-07-13 (seq index, EventWake push, Q3 vacuum-correct) |
 | 27 | `27_vacuum_per_table.md` | Improvement | ⏳ NOT STARTED |
 | 28 | `28_replication_time_pitr_logical.md` | Milestone | ⏳ NOT STARTED |
 

@@ -1,16 +1,18 @@
-//! `GET /events/subscribe` (M5.c; E1 framing, item 20): a server-side polling
-//! loop that calls into the M4 event queue on an interval and forwards new
-//! events as SSE frames.
+//! `GET /events/subscribe` (M5.c; E1 framing, item 20): a server-side loop that
+//! calls into the M4 event queue and forwards new events as SSE frames.
 //!
-//! **State this plainly: this is "server polls, pushes to client," not
-//! true WAL-level push.** `poll_events` has no wake primitive — there is
-//! no way for the storage layer to notify anyone when a new event
-//! commits — so "subscribe" here means the server pays the queue read's
-//! own cost (linear in `__events__`'s total size, no predicate pushdown,
-//! per M4's benchmark finding) once per polling interval, per connected
-//! subscriber. That is a real, multiplicative cost — `N` subscribers ×
-//! poll interval × read cost — not a free abstraction, and is quantified
-//! directly in M5.d's benchmarks rather than left as a qualitative concern.
+//! **Q2 (item 26): push notification.** The loop now blocks on the engine's
+//! commit condvar (`wait_event_commit`) instead of spinning on a fixed timer.
+//! The stream wakes on each commit (via `EventWake`), polls `poll_events`/
+//! `poll_events_after`, and forwards new events immediately. `interval_ms` is
+//! retained as the maximum wait (fallback for idle periods and reconnect
+//! catch-up). Combined with Q1's O(log n + returned) seq-index poll, an idle
+//! subscriber blocks on the condvar at zero CPU cost; a busy one processes
+//! each commit's events with single-digit-millisecond latency.
+//!
+//! Per-subscriber cost is now O(log n + new events per commit) instead of
+//! O(total __events__ rows) × N subscribers × ticks per second — the
+//! multiplicative cost that was the M4/item-20 known limitation.
 //!
 //! ## Two modes, one route (E1)
 //!
@@ -87,19 +89,18 @@ pub async fn get_events_subscribe(
         .and_then(|s| s.parse::<i64>().ok());
 
     let stream = async_stream::stream! {
-        let mut interval = tokio::time::interval(Duration::from_millis(params.interval_ms.max(1)));
+        let fallback = Duration::from_millis(params.interval_ms.max(1));
         // Ephemeral cursor: Last-Event-ID header > from_seq query > 0.
         let mut cursor = last_event_id.or(params.from_seq).unwrap_or(0);
+        // Q2: snapshot the generation before the first wait so we don't miss
+        // a commit that happens between stream creation and the first wait.
+        let mut known_gen = state.engine.event_commit_gen();
         loop {
-            interval.tick().await;
+            // Q2 push: block until a new commit or fallback timeout. An idle
+            // stream blocks here at zero CPU; a busy one wakes per commit.
+            known_gen = state.engine.wait_event_commit(known_gen, fallback).await;
 
-            // Each poll is its own short-lived read-only transaction — the
-            // queue read requires an xid/snapshot like every other Engine
-            // method, but there is no multi-tick session to keep open. A
-            // transient EngineUnavailable/begin failure here just means "try
-            // again next tick," not a fatal stream error — matching the
-            // general engine-availability posture of this server (a dead
-            // writer thread is an out-of-scope-for-v1 failure mode).
+            // Each poll is its own short-lived read-only transaction.
             let Ok(xid) = state.engine.begin(None).await else {
                 continue;
             };

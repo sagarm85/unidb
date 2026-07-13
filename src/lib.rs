@@ -84,7 +84,7 @@ pub mod wal;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Condvar, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use crate::{
@@ -120,6 +120,48 @@ pub use crate::heap::RowId;
 pub use crate::read_handle::ReadHandle;
 pub use crate::sql::executor::ExecResult as SqlResult;
 pub use crate::txn::IsolationLevel as Isolation;
+
+/// Lightweight commit-time wake primitive for Q2 push notification (item 26).
+/// The Engine bumps `generation` (under the mutex) and broadcasts on every
+/// commit so subscribers can block cheaply on `wait_blocking` rather than
+/// spinning on a timer. The Condvar is notified AFTER `WAL::sync_up_to` so
+/// a woken subscriber is guaranteed to see the newly-durable events when it
+/// calls `poll_events`. No latch is held across the notify (P5.e safe).
+pub struct EventWake {
+    generation: Mutex<u64>,
+    cond: Condvar,
+}
+
+impl EventWake {
+    fn new() -> Self {
+        Self {
+            generation: Mutex::new(0),
+            cond: Condvar::new(),
+        }
+    }
+
+    fn notify(&self) {
+        *self.generation.lock().unwrap() += 1;
+        self.cond.notify_all();
+    }
+
+    /// Current generation (cheap poll, no blocking).
+    pub fn generation(&self) -> u64 {
+        *self.generation.lock().unwrap()
+    }
+
+    /// Block until the generation advances past `known_gen` or `timeout`
+    /// elapses. Returns the current generation either way. Callers in async
+    /// code wrap this in `spawn_blocking`.
+    pub fn wait_blocking(&self, known_gen: u64, timeout: Duration) -> u64 {
+        let guard = self.generation.lock().unwrap();
+        let (guard, _) = self
+            .cond
+            .wait_timeout_while(guard, timeout, |g| *g == known_gen)
+            .unwrap();
+        *guard
+    }
+}
 
 /// Default buffer-pool capacity in frames (P1.c). Raised from 256 (2 MiB at
 /// the 8 KiB default page size) to 4096 (32 MiB) — far fewer evictions at
@@ -332,6 +374,11 @@ pub struct Engine {
     /// `edges_from`/Cypher reconstruct the tree without a catalog lookup on
     /// every call. Crash-recovered, never rebuilt on open.
     edge_index_meta: PageId,
+    /// Meta page id of the durable event-sequence index (item 26, Q1) — a
+    /// `DiskBTree` over `__events__.seq`. Cached like `edge_index_meta`.
+    /// Makes `poll_events`/`poll_events_after` O(log n + returned) instead of
+    /// O(total events). Crash-recovered via WAL_INDEX redo, never rebuilt.
+    event_seq_index_meta: PageId,
     /// Meta page id of the `__lobs__` large-object chunk index (P3.d) — a durable
     /// `DiskBTree` on `lob_id`, cached like `edge_index_meta`.
     lob_index_meta: PageId,
@@ -340,6 +387,9 @@ pub struct Engine {
     /// Atomic (P5.e) so `put_large_object` can hand out ids from `&self`.
     next_lob_id: AtomicI64,
     next_event_seq: AtomicU64,
+    /// Push-notification condvar for Q2 (item 26). Bumped on every commit so
+    /// the dispatcher and SSE subscribers can block-wait instead of spinning.
+    event_wake: Arc<EventWake>,
     /// Auto-checkpoint policy + state (P1.e). Behind `Mutex` (P5.e) for `&self`.
     auto_checkpoint: Mutex<AutoCheckpointConfig>,
     last_checkpoint: Mutex<Instant>,
@@ -724,6 +774,16 @@ impl Engine {
             &control,
             page_size_usize,
         )?;
+        let event_seq_index_meta = ensure_event_seq_index(
+            &mut catalog,
+            &txn_mgr,
+            &pool,
+            &wal,
+            &lock_mgr,
+            &ctrl_p,
+            &control,
+            page_size_usize,
+        )?;
         let lob_index_meta = large_object::ensure_lobs_table(
             &mut catalog,
             &txn_mgr,
@@ -784,9 +844,11 @@ impl Engine {
             control_path: ctrl_p,
             _wal_path: wal_p,
             edge_index_meta,
+            event_seq_index_meta,
             lob_index_meta,
             next_lob_id: AtomicI64::new(next_lob_id),
             next_event_seq: AtomicU64::new(next_event_seq),
+            event_wake: Arc::new(EventWake::new()),
             auto_checkpoint: Mutex::new(AutoCheckpointConfig::default()),
             last_checkpoint: Mutex::new(Instant::now()),
             checkpoints_triggered: AtomicU64::new(0),
@@ -1283,6 +1345,7 @@ impl Engine {
                 page_size,
                 xid,
                 next_event_seq: &self.next_event_seq,
+                event_seq_index_meta: Some(self.event_seq_index_meta),
             };
             executor::execute(plan, &mut ctx)
         } else {
@@ -1298,6 +1361,7 @@ impl Engine {
                 page_size,
                 xid,
                 next_event_seq: &self.next_event_seq,
+                event_seq_index_meta: Some(self.event_seq_index_meta),
             };
             executor::execute(plan, &mut ctx)
         }
@@ -1368,6 +1432,7 @@ impl Engine {
             page_size,
             xid,
             next_event_seq: &self.next_event_seq,
+            event_seq_index_meta: Some(self.event_seq_index_meta),
         };
         let result = graph_executor::execute(parsed, &mut ctx, self.edge_index_meta)?;
         Ok(vec![result])
@@ -1500,18 +1565,96 @@ impl Engine {
         self.sync_wal()
     }
 
+    // ── Q2 (item 26): push notification for subscribers ─────────────────────
+
+    /// Clone the shared [`EventWake`] handle so a [`unidb_dispatch::Dispatcher`]
+    /// or the server's SSE handler can block-wait on it instead of polling on a
+    /// fixed timer. The dispatcher passes this handle to
+    /// [`DispatcherBuilder::event_wake`]; the SSE handler uses
+    /// [`wait_event_commit_blocking`] via `spawn_blocking`.
+    pub fn event_wake(&self) -> Arc<EventWake> {
+        self.event_wake.clone()
+    }
+
+    /// Current commit generation (cheap, no blocking). Callers save this before
+    /// processing a batch so they can detect the next commit even if it happens
+    /// before they call [`wait_event_commit_blocking`].
+    pub fn event_commit_gen(&self) -> u64 {
+        self.event_wake.generation()
+    }
+
+    /// Block until a new commit occurs (generation > `known_gen`) or `timeout`
+    /// elapses. Returns the current generation. Wrap this in `spawn_blocking`
+    /// from async code. The wait releases the internal Mutex while blocked so
+    /// concurrent operations are not affected (P5.e safe).
+    pub fn wait_event_commit_blocking(&self, known_gen: u64, timeout: Duration) -> u64 {
+        self.event_wake.wait_blocking(known_gen, timeout)
+    }
+
     /// Fetch up to `limit` events with `seq` greater than `consumer`'s
     /// durable offset, ascending by `seq`. A pure read: an unregistered
     /// consumer is treated as offset 0 in-memory only — no
     /// `__consumers__` row is written here. Only `ack_events` durably
     /// advances a consumer's progress (M4.b), mirroring Kafka's manual-
     /// commit model: if offsets advanced on fetch, a crash between fetch
-    /// and the caller actually processing the batch would silently skip
-    /// events. No predicate pushdown exists — cost scales with
-    /// `__events__`'s total row count, not with consumer lag or `limit`
-    /// (see queue/mod.rs's module doc and `Engine::vacuum_events`, M4.c,
-    /// which is the actual lever for this cost).
+    /// Q1 (item 26): resolve index-candidate `RowId`s into [`queue::Event`]s.
+    /// The seq index returns RowIds in ascending seq order; we fetch each row
+    /// by id with MVCC visibility so stale index entries (aborted txns) are
+    /// silently skipped (`NoVisibleVersion`). Returns at most `limit` events;
+    /// because `search_range_limit` already caps the candidate list, the heap
+    /// fetches are bounded O(limit).
+    fn resolve_event_candidates(
+        &self,
+        candidates: &[crate::heap::RowId],
+        events_heap: &Heap,
+        events_def: &crate::catalog::TableDef,
+        snapshot: &crate::mvcc::Snapshot,
+        xid: Xid,
+        limit: usize,
+    ) -> Result<Vec<queue::Event>> {
+        use crate::error::DbError;
+        let mut events = Vec::with_capacity(candidates.len().min(limit));
+        for &row_id in candidates {
+            if events.len() >= limit {
+                break;
+            }
+            let bytes = match events_heap.get(row_id, snapshot, xid, &self.pool) {
+                Ok(b) => b,
+                Err(DbError::NoVisibleVersion { .. }) => continue,
+                Err(e) => return Err(e),
+            };
+            let row = executor::decode_row(&bytes, &events_def.columns)?;
+            let (
+                Literal::Int(seq),
+                Literal::Int(row_xid),
+                Literal::Text(table_name),
+                Literal::Text(op),
+            ) = (&row[0], &row[1], &row[2], &row[3])
+            else {
+                continue;
+            };
+            let payload = match &row[4] {
+                Literal::Json(s) => serde_json::from_str(s).unwrap_or(serde_json::Value::Null),
+                _ => serde_json::Value::Null,
+            };
+            events.push(queue::Event {
+                seq: *seq,
+                xid: *row_xid,
+                table_name: table_name.clone(),
+                op: op.clone(),
+                payload,
+            });
+        }
+        Ok(events)
+    }
+
+    /// Fetch up to `limit` events with `seq` greater than `consumer`'s
+    /// durable offset, ascending by `seq`. Q1 (item 26): backed by the
+    /// durable `__events__.seq` B-tree index — cost is O(log n + returned),
+    /// independent of the enabled table's total row count. A pure read: an
+    /// unregistered consumer is treated as offset 0 in-memory only.
     pub fn poll_events(&self, xid: Xid, consumer: &str, limit: usize) -> Result<Vec<queue::Event>> {
+        use crate::btree_index::RangeOp;
         let page_size = self.page_size;
         let events_def = cat_read(&self.catalog).lookup(EVENTS_TABLE)?.clone();
         let consumers_def = cat_read(&self.catalog).lookup(CONSUMERS_TABLE)?.clone();
@@ -1528,91 +1671,56 @@ impl Engine {
                 .map(|(_, offset)| offset)
                 .unwrap_or(0);
 
-        let mut events = Vec::new();
-        for (_, bytes) in events_heap.scan(&snapshot, xid, &self.pool)? {
-            let row = executor::decode_row(&bytes, &events_def.columns)?;
-            let (
-                Literal::Int(seq),
-                Literal::Int(row_xid),
-                Literal::Text(table_name),
-                Literal::Text(op),
-            ) = (&row[0], &row[1], &row[2], &row[3])
-            else {
-                continue;
-            };
-            if *seq <= offset {
-                continue;
-            }
-            let payload = match &row[4] {
-                Literal::Json(s) => serde_json::from_str(s).unwrap_or(serde_json::Value::Null),
-                _ => serde_json::Value::Null,
-            };
-            events.push(queue::Event {
-                seq: *seq,
-                xid: *row_xid,
-                table_name: table_name.clone(),
-                op: op.clone(),
-                payload,
-            });
-        }
-        events.sort_by_key(|e| e.seq);
-        events.truncate(limit);
-        Ok(events)
+        // Q1: O(log n + limit) via the durable seq index.
+        let candidates = DiskBTree::new(self.event_seq_index_meta, page_size).search_range_limit(
+            RangeOp::Gt,
+            &OrderedValue::Int(offset),
+            limit,
+            &self.pool,
+        )?;
+        self.resolve_event_candidates(
+            &candidates,
+            &events_heap,
+            &events_def,
+            &snapshot,
+            xid,
+            limit,
+        )
     }
 
     /// Fetch up to `limit` events with `seq` strictly greater than
     /// `after_seq`, ascending by `seq` — the **offset-cursor** read behind
-    /// E1's ephemeral SSE tail (item 20). Unlike [`poll_events`] this touches
-    /// no `__consumers__` row at all: the caller (a reconnecting browser
-    /// `EventSource` carrying `Last-Event-ID`, or the studio scrubbing to an
-    /// explicit offset) supplies its own cursor and this returns everything
-    /// past it, without registering a durable consumer or advancing any
-    /// offset. Pure read; shares [`poll_events`]'s full-scan cost profile
-    /// (no predicate pushdown — see queue/mod.rs) but truncates *after*
-    /// filtering so a cursor beyond `limit` events never silently drops the
-    /// tail. Durable consumers (with ack) remain the at-least-once path; this
-    /// is the at-most-once live-tail path.
+    /// E1's ephemeral SSE tail (item 20). Q1 (item 26): backed by the
+    /// durable `__events__.seq` B-tree index — O(log n + returned), not
+    /// O(total events). The caller supplies its own cursor (no durable
+    /// consumer row touched).
     pub fn poll_events_after(
         &self,
         xid: Xid,
         after_seq: i64,
         limit: usize,
     ) -> Result<Vec<queue::Event>> {
+        use crate::btree_index::RangeOp;
         let page_size = self.page_size;
         let events_def = cat_read(&self.catalog).lookup(EVENTS_TABLE)?.clone();
         let events_heap = Heap::open(page_size, events_def.fsm_meta, events_def.pages.clone());
         let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
 
-        let mut events = Vec::new();
-        for (_, bytes) in events_heap.scan(&snapshot, xid, &self.pool)? {
-            let row = executor::decode_row(&bytes, &events_def.columns)?;
-            let (
-                Literal::Int(seq),
-                Literal::Int(row_xid),
-                Literal::Text(table_name),
-                Literal::Text(op),
-            ) = (&row[0], &row[1], &row[2], &row[3])
-            else {
-                continue;
-            };
-            if *seq <= after_seq {
-                continue;
-            }
-            let payload = match &row[4] {
-                Literal::Json(s) => serde_json::from_str(s).unwrap_or(serde_json::Value::Null),
-                _ => serde_json::Value::Null,
-            };
-            events.push(queue::Event {
-                seq: *seq,
-                xid: *row_xid,
-                table_name: table_name.clone(),
-                op: op.clone(),
-                payload,
-            });
-        }
-        events.sort_by_key(|e| e.seq);
-        events.truncate(limit);
-        Ok(events)
+        // Q1: O(log n + limit) via the durable seq index.
+        let candidates = DiskBTree::new(self.event_seq_index_meta, page_size).search_range_limit(
+            RangeOp::Gt,
+            &OrderedValue::Int(after_seq),
+            limit,
+            &self.pool,
+        )?;
+        self.resolve_event_candidates(
+            &candidates,
+            &events_heap,
+            &events_def,
+            &snapshot,
+            xid,
+            limit,
+        )
     }
 
     /// Durably advance `consumer`'s offset to `up_to_seq` — the only
@@ -1716,20 +1824,22 @@ impl Engine {
 
         let events_def = cat_read(&self.catalog).lookup(EVENTS_TABLE)?.clone();
         let events_heap = Heap::open(page_size, events_def.fsm_meta, events_def.pages.clone());
-        let to_reclaim: Vec<RowId> = events_heap
+        // Collect (row_id, seq) so we can remove the seq-index entry too (Q3/Q1).
+        let to_reclaim: Vec<(RowId, i64)> = events_heap
             .scan(&snapshot, xid, &self.pool)?
             .into_iter()
             .filter_map(|(row_id, bytes)| {
                 let row = executor::decode_row(&bytes, &events_def.columns).ok()?;
                 match row[0] {
-                    Literal::Int(seq) if seq <= min_offset => Some(row_id),
+                    Literal::Int(seq) if seq <= min_offset => Some((row_id, seq)),
                     _ => None,
                 }
             })
             .collect();
 
+        let seq_index = DiskBTree::new(self.event_seq_index_meta, page_size);
         let mut reclaimed = 0usize;
-        for row_id in to_reclaim {
+        for (row_id, seq) in to_reclaim {
             events_heap.delete(row_id, xid, &self.pool, &self.wal, &self.lock_mgr)?;
             self.txn_mgr.record_undo(
                 xid,
@@ -1738,6 +1848,8 @@ impl Engine {
                     slot: row_id.slot,
                 },
             )?;
+            // Q3 (item 26): remove the seq-index entry so it does not pin retention.
+            seq_index.remove(&OrderedValue::Int(seq), row_id, &self.pool, &self.wal)?;
             reclaimed += 1;
         }
         Ok(reclaimed)
@@ -2085,6 +2197,9 @@ impl Engine {
         if let Some(lsn) = commit_lsn {
             self.wal.sync_up_to(lsn)?;
         }
+        // Q2 (item 26): wake any blocked subscribers AFTER WAL sync so they see
+        // durable events. No latch is held at this point (P5.e safe).
+        self.event_wake.notify();
         // P1.e: a commit is a quiescence boundary — the natural point to run an
         // auto-checkpoint if a trigger has fired.
         self.maybe_auto_checkpoint()?;
@@ -2846,6 +2961,58 @@ fn ensure_edge_index(
         Some(tree.meta_page()),
         &mut cctx,
     )?;
+    Ok(tree.meta_page())
+}
+
+/// Ensure the durable `__events__.seq` B-tree index exists (item 26, Q1).
+/// Mirrors `ensure_edge_index` exactly: on a fresh database (or an upgrade
+/// from a pre-item-26 engine) it creates the tree, backfills committed events,
+/// and persists the meta page in the catalog; on subsequent opens it finds the
+/// meta page already there and returns it directly — no heap scan, O(1).
+#[allow(clippy::too_many_arguments)] // open-time wiring, mirrors ensure_edge_index
+fn ensure_event_seq_index(
+    catalog: &mut Catalog,
+    txn_mgr: &TransactionManager,
+    pool: &BufferPool,
+    wal: &Wal,
+    lock_mgr: &LockManager,
+    control_path: &Path,
+    control: &Mutex<ControlData>,
+    page_size: usize,
+) -> Result<PageId> {
+    let existing = catalog
+        .lookup(EVENTS_TABLE)?
+        .columns
+        .iter()
+        .find(|c| c.name == "seq")
+        .and_then(|c| c.index_root);
+    if let Some(meta) = existing {
+        return Ok(meta);
+    }
+
+    // First open (or upgrade): create the tree and backfill committed events.
+    let tree = DiskBTree::create(pool, wal)?;
+    let table = catalog.lookup(EVENTS_TABLE)?.clone();
+    let heap = Heap::open(page_size, table.fsm_meta, table.pages.clone());
+    let xid = txn_mgr.begin(IsolationLevel::ReadCommitted, wal)?;
+    let snapshot = txn_mgr.snapshot_for_statement(xid)?;
+    for (row_id, bytes) in heap.scan(&snapshot, xid, pool)? {
+        let row = executor::decode_row(&bytes, &table.columns)?;
+        if let Literal::Int(seq) = row[0] {
+            tree.insert(OrderedValue::Int(seq), row_id, pool, wal)?;
+        }
+    }
+    txn_mgr.commit(xid, wal, lock_mgr)?;
+
+    let mut cctx = CatalogCtx {
+        pool,
+        wal,
+        control_path,
+        control,
+        page_size,
+    };
+    catalog.set_column_index(EVENTS_TABLE, "seq", Some(IndexKind::BTree), &mut cctx)?;
+    catalog.set_column_index_root(EVENTS_TABLE, "seq", Some(tree.meta_page()), &mut cctx)?;
     Ok(tree.meta_page())
 }
 

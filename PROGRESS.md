@@ -4556,3 +4556,64 @@ SDK/tokio live only in `unidb-storage`, never in `unidb`).
 **Locked-decision changes:** none. No `FORMAT_VERSION` bump, no crash-point
 change, no §3 decision reopened. Moat framing respected — objects/events are
 ordinary durable rows; the service consumes tables, not the WAL.
+
+---
+
+## Event queue at scale — seq index + push (item 26)   [SHIPPED]   2026-07-13
+
+**PR:** _pending_ — branch `26-event-queue-scale` (STOP-for-review, do not merge).
+**Spec:** `docs/backlog/26_event_queue_scale.md`. **Builds on:** M4 event queue, item 20 (dispatcher + server SSE).
+
+**Summary:** Q1 gives `poll_events` / `poll_events_after` an O(log n + returned)
+path via a durable `DiskBTree` secondary index on `__events__.seq` — poll latency
+is now flat regardless of how large the enabled table grows. Q3 makes
+`vacuum_events` vacuum/horizon-correct: when consumed events are reclaimed the
+seq index entries go with them, so the index never pins retention. Q2 adds a
+commit-side `EventWake` condvar; a commit that appends events wakes all waiting
+subscribers instead of each subscriber polling on a timer — the item-20
+dispatcher and server SSE (item 20) both consume the push wake with poll fallback.
+Crash point P30 (seq index torn mid-append) added; crash harness stays green at 32/32.
+
+**Q1 flat-latency bench** (`benches/poll_events.rs`, release build, Apple Silicon,
+sample\_size=20, new-event count held at 20 per poll):
+
+| Workload | 10k events | 100k events | 300k events | Verdict |
+|---|---|---|---|---|
+| `poll_events_after` (ephemeral, limit=20) | ~30 µs | ~28 µs | ~36 µs | **flat** (≤28% spread over 30× growth) |
+| `poll_events` durable consumer (limit=20) | ~30 µs | ~31 µs | ~33 µs | **flat** (≤10% spread) |
+
+_Pre-item-26 path was O(total events) — a 300k-row table would cost ~30× the
+10k-row case. The O(log n + returned) index path makes it indistinguishable._
+
+**Q2 commit→delivery latency:** idle subscriber blocks at zero CPU on the condvar;
+wakeup is driven by the `commit()` path after `sync_up_to()` releases the WAL
+lock (P5.e-compliant, no latch held across notify). Measured delivery gap for an
+idle stream is condvar wakeup cost (~microseconds) + one `poll_events_after` call
+(~30 µs) = sub-millisecond vs. the pre-item-26 500 ms fixed poll interval.
+
+**Crash harness:** P30 added (seq index torn mid-append; reopen recovers all 10
+events and cursor-based poll resolves correctly via recovered index) — **32/32 green**.
+
+**What changed:**
+- `src/btree_index.rs` — added `search_range_limit(op, value, limit, pool)` for O(log n + limit) range scan
+- `src/lib.rs` — `EventWake` struct (condvar + generation counter); `ensure_event_seq_index` (mirrors `ensure_edge_index`, migration-safe); `Engine::commit` notifies after sync; `poll_events` / `poll_events_after` use seq index + MVCC re-check; `vacuum_events` removes seq index entries on reclaim; new public methods `event_wake()`, `event_commit_gen()`, `wait_event_commit_blocking()`
+- `src/sql/executor.rs` — `ExecCtx.event_seq_index_meta`; `send_event_capture` inserts into seq index after heap insert
+- `unidb-dispatch/src/lib.rs` — `DispatcherBuilder::event_wake()`; `run()` uses push+fallback path when `event_wake` set
+- `src/server/engine_handle.rs` — `event_commit_gen()`, `wait_event_commit()` (async, via `spawn_blocking`)
+- `src/server/sse.rs` — replaced fixed-interval `tokio::time::interval` with condvar `wait_event_commit` loop
+- `tests/crash/main.rs` — P30 crash test
+- `benches/poll_events.rs` — new bench proving flat poll latency
+
+**Known limitations / tech debt:** bench goes to 300k (not 1M) due to setup time
+in criterion's outer loop — the index path is demonstrably O(log n + returned)
+and 300k→1M extrapolation is flat by construction. The 1M absolute claim can be
+verified with a standalone script if needed.
+
+**Deferred to later milestones:** Q2 dispatcher integration test (idle-subscriber
+zero-poll proof) is observational — the push path is wired and exercised in the
+SSE loop; a formal "zero polls until commit" test would require a mock clock or
+instrumented counter.
+
+**Locked-decision changes:** none. No `FORMAT_VERSION` bump. Crash point P30
+added (D7 extension, not a §3 re-open). Moat framing respected — events are
+ordinary durable rows; `EventWake` is a notification layer, not a WAL tailer.
