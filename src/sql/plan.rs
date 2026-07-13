@@ -357,6 +357,14 @@ fn collect_aggs(expr: &QExpr, out: &mut Vec<AggCall>) {
         QExpr::InSubquery { expr, .. } => collect_aggs(expr, out),
         // Aggregates within a subquery belong to that subquery's own scope.
         QExpr::Exists { .. } | QExpr::ScalarSubquery(_) => {}
+        QExpr::Like { expr, pattern, .. } => {
+            collect_aggs(expr, out);
+            collect_aggs(pattern, out);
+        }
+        QExpr::Match { column, query } => {
+            collect_aggs(column, out);
+            collect_aggs(query, out);
+        }
     }
 }
 
@@ -440,6 +448,21 @@ fn rewrite_over_agg(expr: &QExpr, group_exprs: &[QExpr], aggs: &[AggCall]) -> Re
         QExpr::Exists { .. } | QExpr::InSubquery { .. } | QExpr::ScalarSubquery(_) => {
             Ok(expr.clone())
         }
+        QExpr::Like {
+            expr,
+            pattern,
+            negated,
+            case_insensitive,
+        } => Ok(QExpr::Like {
+            expr: Box::new(rewrite_over_agg(expr, group_exprs, aggs)?),
+            pattern: Box::new(rewrite_over_agg(pattern, group_exprs, aggs)?),
+            negated: *negated,
+            case_insensitive: *case_insensitive,
+        }),
+        QExpr::Match { column, query } => Ok(QExpr::Match {
+            column: Box::new(rewrite_over_agg(column, group_exprs, aggs)?),
+            query: Box::new(rewrite_over_agg(query, group_exprs, aggs)?),
+        }),
     }
 }
 
@@ -936,6 +959,14 @@ fn validate_expr(expr: &QExpr, schema: &[ColumnRef]) -> Result<()> {
         // `IN (subquery)` resolves against this schema.
         QExpr::InSubquery { expr, .. } => validate_expr(expr, schema),
         QExpr::Exists { .. } | QExpr::ScalarSubquery(_) => Ok(()),
+        QExpr::Like { expr, pattern, .. } => {
+            validate_expr(expr, schema)?;
+            validate_expr(pattern, schema)
+        }
+        QExpr::Match { column, query } => {
+            validate_expr(column, schema)?;
+            validate_expr(query, schema)
+        }
     }
 }
 
@@ -1014,6 +1045,53 @@ pub fn eval_qexpr(expr: &QExpr, schema: &[ColumnRef], row: &[Literal]) -> Result
         QExpr::Exists { .. } | QExpr::InSubquery { .. } | QExpr::ScalarSubquery(_) => Err(
             DbError::SqlPlan("internal: subquery reached the pure evaluator".into()),
         ),
+        // `QExpr::Like` — SQL pattern matching (G9, item 30).
+        QExpr::Like {
+            expr,
+            pattern,
+            negated,
+            case_insensitive,
+        } => {
+            let val = eval_qexpr(expr, schema, row)?;
+            let pat = eval_qexpr(pattern, schema, row)?;
+            match (&val, &pat) {
+                (Literal::Null, _) | (_, Literal::Null) => Ok(Literal::Null),
+                (Literal::Text(t), Literal::Text(p)) => Ok(Literal::Bool(
+                    executor::like_match(t, p, *case_insensitive) != *negated,
+                )),
+                _ => Err(DbError::SqlUnsupported(format!(
+                    "LIKE requires TEXT operands, got {val:?} LIKE {pat:?}"
+                ))),
+            }
+        }
+        // `QExpr::Match` — inline text-contains-all-tokens evaluation (G11,
+        // item 30). In the multi-relation query path there is no index routing
+        // (unlike the single-table `exec_select_match`), so we evaluate MATCH
+        // as an AND-all-tokens text-containment check using the same tokenizer
+        // as the FULLTEXT index — semantically equivalent, not index-accelerated.
+        QExpr::Match { column, query } => {
+            let col_val = eval_qexpr(column, schema, row)?;
+            let query_val = eval_qexpr(query, schema, row)?;
+            let text = match col_val {
+                Literal::Text(t) => t,
+                Literal::Null => return Ok(Literal::Null),
+                _ => return Ok(Literal::Bool(false)),
+            };
+            let query_str = match query_val {
+                Literal::Text(q) => q,
+                Literal::Null => return Ok(Literal::Null),
+                _ => return Ok(Literal::Bool(false)),
+            };
+            let query_tokens = crate::fulltext::tokenize(&query_str);
+            if query_tokens.is_empty() {
+                return Ok(Literal::Bool(false));
+            }
+            let text_tokens: std::collections::HashSet<String> =
+                crate::fulltext::tokenize(&text).into_iter().collect();
+            Ok(Literal::Bool(
+                query_tokens.iter().all(|t| text_tokens.contains(t)),
+            ))
+        }
     }
 }
 

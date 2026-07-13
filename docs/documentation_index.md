@@ -9,11 +9,13 @@
   ledger, and the Postgres/Supabase-alignment future-scope plan; regenerate
   it from the adjacent `.html` source (see `design/design_index.md`).
 - [engine_access_guide.md](engine_access_guide.md) — **the Application
-  Builder's Guide** (Milestone 18): one task-oriented document for building an
-  app *on* the engine — connect (embed/attach/server) → query (the SQL surface
-  + the honest not-supported list) → bind `$n` params → introspect via the
+  Builder's Guide** (Milestone 18 + item 30): one task-oriented document for
+  building an app *on* the engine — connect (embed/attach/server) → query (the
+  SQL surface + the honest not-supported list, including `LIKE`/`ILIKE` and
+  `MATCH` added in item 30) → bind `$n` params → introspect via the
   `information_schema.*` / `unidb_catalog.*` system catalog → map types → page →
-  handle errors, plus a "schema explorer in 30 lines" recipe. Start here to
+  handle errors, plus a "schema explorer in 30 lines" recipe and a **full
+  ERP-app walkthrough with concrete payloads** (§12, item 30). Start here to
   build around unidb "like Postgres."
 - [REST_API.md](REST_API.md) — full HTTP route reference for the optional
   `unidb-server` binary (M5): every route's payload and response shape,

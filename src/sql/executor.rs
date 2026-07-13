@@ -849,6 +849,19 @@ fn exec_select(
         return exec_select_near(&table_def, projection, predicate, near, ctx);
     }
 
+    if let Some((column, query_expr)) = predicate.as_ref().and_then(find_match) {
+        let query_str = match query_expr {
+            Expr::Literal(Literal::Text(q)) => q.clone(),
+            other => {
+                return Err(DbError::SqlUnsupported(format!(
+                    "MATCH: query argument must be a TEXT literal or a bound $n parameter; \
+                     got {other:?}"
+                )))
+            }
+        };
+        return exec_select_match(&table_def, projection, predicate, column, &query_str, ctx);
+    }
+
     if let Some(hit) = predicate
         .as_ref()
         .and_then(|e| find_indexable_btree_predicate(e, &table_def))
@@ -997,11 +1010,14 @@ pub(crate) fn exec_select_readonly<P: PageReader>(
 }
 
 /// Whether `plan` may run on the concurrent read path (6b): a plain `SELECT`
-/// with no NEAR term. Everything else (writes, DDL, NEAR) routes to the
-/// single writer thread, unchanged.
+/// with no NEAR or MATCH term. NEAR needs the HNSW index; MATCH needs the
+/// FULLTEXT index — both require `ExecCtx` and must stay on the writer path.
 pub(crate) fn plan_is_concurrent_read(plan: &LogicalPlan) -> bool {
     match plan {
-        LogicalPlan::Select { predicate, .. } => predicate.as_ref().and_then(find_near).is_none(),
+        LogicalPlan::Select { predicate, .. } => {
+            let pred = predicate.as_ref();
+            pred.and_then(find_near).is_none() && pred.and_then(find_match).is_none()
+        }
         _ => false,
     }
 }
@@ -1015,6 +1031,50 @@ pub(crate) fn find_near(expr: &Expr) -> Option<(&str, &[f32], usize)> {
         Expr::Near { column, query, k } => Some((column.as_str(), query.as_slice(), *k)),
         Expr::And(lhs, rhs) => find_near(lhs).or_else(|| find_near(rhs)),
         _ => None,
+    }
+}
+
+/// Find a top-level (or top-level-AND'd) `Expr::Match` in a predicate (G11,
+/// item 30). Same walk as `find_near` — AND-only grammar, no `OR`/nesting.
+pub(crate) fn find_match(expr: &Expr) -> Option<(&str, &Expr)> {
+    match expr {
+        Expr::Match { column, query } => Some((column.as_str(), query.as_ref())),
+        Expr::And(lhs, rhs) => find_match(lhs).or_else(|| find_match(rhs)),
+        _ => None,
+    }
+}
+
+/// SQL `[I]LIKE` pattern matching (G9, item 30).
+///
+/// `%` = any run of characters (including empty), `_` = exactly one character,
+/// every other character matches itself literally. `case_insensitive = true`
+/// folds both sides to lowercase before matching (ILIKE semantics).
+///
+/// The algorithm is a straightforward recursive backtrack over char slices —
+/// O(n·m) worst-case, sufficient for V1. Pure-prefix optimisation (`'abc%'` →
+/// B-tree range) is tracked as a follow-up in the item-30 spec.
+pub(crate) fn like_match(text: &str, pattern: &str, case_insensitive: bool) -> bool {
+    if case_insensitive {
+        let t: Vec<char> = text.chars().flat_map(|c| c.to_lowercase()).collect();
+        let p: Vec<char> = pattern.chars().flat_map(|c| c.to_lowercase()).collect();
+        like_match_chars(&t, &p)
+    } else {
+        let t: Vec<char> = text.chars().collect();
+        let p: Vec<char> = pattern.chars().collect();
+        like_match_chars(&t, &p)
+    }
+}
+
+fn like_match_chars(text: &[char], pattern: &[char]) -> bool {
+    match pattern.first() {
+        None => text.is_empty(),
+        Some('%') => {
+            // `%` matches any sequence — try consuming zero or more text chars.
+            like_match_chars(text, &pattern[1..])
+                || (!text.is_empty() && like_match_chars(&text[1..], pattern))
+        }
+        Some('_') => !text.is_empty() && like_match_chars(&text[1..], &pattern[1..]),
+        Some(&c) => !text.is_empty() && text[0] == c && like_match_chars(&text[1..], &pattern[1..]),
     }
 }
 
@@ -1244,6 +1304,81 @@ fn exec_select_near(
     Ok(ExecResult::Rows {
         columns: output_columns(projection, &table_def.columns),
         rows: scored.into_iter().map(|(_, r)| r).collect(),
+    })
+}
+
+/// `MATCH`'s over-fetch-then-filter execution (G11, item 30): probe the
+/// FULLTEXT index for each query token's posting list, intersect them
+/// (AND-all-tokens semantics, same as `Engine::search_fulltext`), then run
+/// each surviving candidate through the full predicate for MVCC / RLS / other
+/// AND'd WHERE terms. `eval_expr`'s `Expr::Match` arm returns `true` so the
+/// predicate check passes for matched candidates.
+fn exec_select_match(
+    table_def: &TableDef,
+    projection: &[String],
+    predicate: &Option<Expr>,
+    column: &str,
+    query: &str,
+    ctx: &mut ExecCtx,
+) -> Result<ExecResult> {
+    let col = table_def
+        .columns
+        .iter()
+        .find(|c| c.name == column && !c.dropped)
+        .ok_or_else(|| DbError::ColumnNotFound {
+            table: table_def.name.clone(),
+            column: column.to_string(),
+        })?;
+    let meta = match (col.index, col.index_root) {
+        (Some(IndexKind::FullText), Some(m)) => m,
+        _ => {
+            return Err(DbError::SqlPlan(format!(
+                "MATCH: column '{column}' has no FULLTEXT index; \
+                 create one with CREATE INDEX … USING FULLTEXT ({column})"
+            )))
+        }
+    };
+    let tokens = crate::fulltext::tokenize(query);
+    if tokens.is_empty() {
+        return Ok(ExecResult::Rows {
+            columns: output_columns(projection, &table_def.columns),
+            rows: Vec::new(),
+        });
+    }
+    let tree = DiskBTree::new(meta, ctx.page_size);
+    let mut posting_lists: Vec<Vec<RowId>> = Vec::with_capacity(tokens.len());
+    for token in &tokens {
+        posting_lists.push(tree.search_eq(&OrderedValue::Text(token.clone()), ctx.pool)?);
+    }
+    // AND-intersect: start from the shortest posting list so the result shrinks fastest.
+    posting_lists.sort_by_key(|l| l.len());
+    let mut candidates: std::collections::HashSet<RowId> =
+        posting_lists[0].iter().copied().collect();
+    for list in &posting_lists[1..] {
+        let set: std::collections::HashSet<RowId> = list.iter().copied().collect();
+        candidates.retain(|r| set.contains(r));
+        if candidates.is_empty() {
+            break;
+        }
+    }
+    let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
+    let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+    let mut out = Vec::new();
+    for rid in candidates {
+        let bytes = match heap.get(rid, &snapshot, ctx.xid, ctx.pool) {
+            Ok(b) => b,
+            Err(DbError::NoVisibleVersion { .. }) => continue,
+            Err(e) => return Err(e),
+        };
+        let row = decode_row(&bytes, &table_def.columns)?;
+        if !predicate_matches(predicate, &table_def.columns, &row)? {
+            continue;
+        }
+        out.push(project_row(projection, &table_def.columns, &row)?);
+    }
+    Ok(ExecResult::Rows {
+        columns: output_columns(projection, &table_def.columns),
+        rows: out,
     })
 }
 
@@ -2172,6 +2307,31 @@ pub(crate) fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Literal]) -> 
         // through the exact same `predicate_matches` path a normal scan
         // uses — see `exec_select_near`.
         Expr::Near { .. } => Ok(Literal::Bool(true)),
+        // `Expr::Like` — SQL pattern matching (G9, item 30). NULL on either
+        // operand produces NULL (the predicate evaluator treats NULL as false).
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+            case_insensitive,
+        } => {
+            let val = eval_expr(expr, columns, row)?;
+            let pat = eval_expr(pattern, columns, row)?;
+            match (&val, &pat) {
+                (Literal::Null, _) | (_, Literal::Null) => Ok(Literal::Null),
+                (Literal::Text(t), Literal::Text(p)) => Ok(Literal::Bool(
+                    like_match(t, p, *case_insensitive) != *negated,
+                )),
+                _ => Err(DbError::SqlUnsupported(format!(
+                    "LIKE requires TEXT operands, got {val:?} LIKE {pat:?}"
+                ))),
+            }
+        }
+        // `Expr::Match` — same convention as `Expr::Near`: candidates were
+        // pre-filtered by `exec_select_match` via the FULLTEXT index, so the
+        // per-row re-check returns true and lets other AND'd WHERE terms apply
+        // through `predicate_matches` unchanged.
+        Expr::Match { .. } => Ok(Literal::Bool(true)),
     }
 }
 
@@ -2514,10 +2674,14 @@ fn expr_columns(expr: &Expr, table_def: &TableDef, out: &mut Vec<usize>) {
         Expr::JsonExtract { expr, .. } | Expr::JsonExtractText { expr, .. } => {
             expr_columns(expr, table_def, out);
         }
-        Expr::Near { column, .. } => {
+        Expr::Near { column, .. } | Expr::Match { column, .. } => {
             if let Ok(idx) = column_index(table_def, column) {
                 out.push(idx);
             }
+        }
+        Expr::Like { expr, pattern, .. } => {
+            expr_columns(expr, table_def, out);
+            expr_columns(pattern, table_def, out);
         }
     }
 }

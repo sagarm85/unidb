@@ -125,6 +125,11 @@ fn bind_expr(expr: &mut Expr, params: &[Literal]) -> Result<()> {
         Expr::JsonExtract { expr, .. } | Expr::JsonExtractText { expr, .. } => {
             bind_expr(expr, params)
         }
+        Expr::Like { expr, pattern, .. } => {
+            bind_expr(expr, params)?;
+            bind_expr(pattern, params)
+        }
+        Expr::Match { query, .. } => bind_expr(query, params),
         Expr::Column(_) | Expr::Near { .. } => Ok(()),
     }
 }
@@ -191,6 +196,24 @@ pub enum Expr {
         column: String,
         query: Vec<f32>,
         k: usize,
+    },
+    /// `expr [NOT] [I]LIKE pattern` — SQL-standard pattern matching (G9,
+    /// item 30). `%` = any run of characters, `_` = exactly one character.
+    /// `case_insensitive = true` for `ILIKE`. NULL on either operand → NULL
+    /// (treated as false by the predicate evaluator, same as other NULLs).
+    Like {
+        expr: Box<Expr>,
+        pattern: Box<Expr>,
+        negated: bool,
+        case_insensitive: bool,
+    },
+    /// `MATCH(column, 'query text')` — boolean full-text predicate (G11,
+    /// item 30). In `exec_select` this routes to the FULLTEXT index
+    /// (over-fetch-then-filter, same as `Near`); in `eval_expr` it returns
+    /// `true` because the caller already filtered via the index.
+    Match {
+        column: String,
+        query: Box<Expr>,
     },
 }
 

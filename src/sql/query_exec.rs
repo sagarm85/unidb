@@ -694,6 +694,49 @@ impl Runner<'_, '_> {
                 }
                 Ok(Literal::Bool(found != *negated))
             }
+            // Like / Match may contain correlated column refs in their
+            // sub-expressions, so recurse through the ctx-aware evaluator.
+            QExpr::Like {
+                expr,
+                pattern,
+                negated,
+                case_insensitive,
+            } => {
+                let val = self.eval(expr, schema, row)?;
+                let pat = self.eval(pattern, schema, row)?;
+                match (&val, &pat) {
+                    (Literal::Null, _) | (_, Literal::Null) => Ok(Literal::Null),
+                    (Literal::Text(t), Literal::Text(p)) => Ok(Literal::Bool(
+                        executor::like_match(t, p, *case_insensitive) != *negated,
+                    )),
+                    _ => Err(crate::error::DbError::SqlUnsupported(format!(
+                        "LIKE requires TEXT operands, got {val:?} LIKE {pat:?}"
+                    ))),
+                }
+            }
+            QExpr::Match { column, query } => {
+                let col_val = self.eval(column, schema, row)?;
+                let query_val = self.eval(query, schema, row)?;
+                let text = match col_val {
+                    Literal::Text(t) => t,
+                    Literal::Null => return Ok(Literal::Null),
+                    _ => return Ok(Literal::Bool(false)),
+                };
+                let query_str = match query_val {
+                    Literal::Text(q) => q,
+                    Literal::Null => return Ok(Literal::Null),
+                    _ => return Ok(Literal::Bool(false)),
+                };
+                let query_tokens = crate::fulltext::tokenize(&query_str);
+                if query_tokens.is_empty() {
+                    return Ok(Literal::Bool(false));
+                }
+                let text_tokens: std::collections::HashSet<String> =
+                    crate::fulltext::tokenize(&text).into_iter().collect();
+                Ok(Literal::Bool(
+                    query_tokens.iter().all(|t| text_tokens.contains(t)),
+                ))
+            }
             // No subquery below here: the pure evaluator handles it.
             QExpr::Column { .. }
             | QExpr::Literal(_)
@@ -820,6 +863,14 @@ fn substitute_correlated(
         QExpr::InSubquery { expr, .. } => substitute_correlated(expr, inner, outer, outer_row),
         // Deeper subqueries bind against their own immediate outer at run time.
         QExpr::Exists { .. } | QExpr::ScalarSubquery(_) => Ok(()),
+        QExpr::Like { expr, pattern, .. } => {
+            substitute_correlated(expr, inner, outer, outer_row)?;
+            substitute_correlated(pattern, inner, outer, outer_row)
+        }
+        QExpr::Match { column, query } => {
+            substitute_correlated(column, inner, outer, outer_row)?;
+            substitute_correlated(query, inner, outer, outer_row)
+        }
     }
 }
 

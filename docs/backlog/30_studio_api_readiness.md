@@ -1,7 +1,7 @@
 # Studio API readiness — browser search/filter surface + integration guide
 
 **Type:** Improvement
-**Status:** NOT STARTED
+**Status:** SHIPPED 2026-07-14 (branch `30-studio-api-readiness`; metrics in PROGRESS.md)
 
 > A `unidb-studio`-driven bundle: close the two gaps that stop a **browser** from
 > offering text search/filter over the generic `POST /sql` surface, and ship the

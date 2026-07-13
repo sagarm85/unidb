@@ -362,6 +362,14 @@ fn collect_columns(expr: &QExpr, out: &mut Vec<(Option<String>, String)>) {
         // Subqueries carry their own scope; correlated refs are handled at run
         // time, not here (a subquery-bearing conjunct becomes residual).
         QExpr::InSubquery { .. } | QExpr::Exists { .. } | QExpr::ScalarSubquery(_) => {}
+        QExpr::Like { expr, pattern, .. } => {
+            collect_columns(expr, out);
+            collect_columns(pattern, out);
+        }
+        QExpr::Match { column, query } => {
+            collect_columns(column, out);
+            collect_columns(query, out);
+        }
     }
 }
 

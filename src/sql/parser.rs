@@ -1042,6 +1042,9 @@ fn convert_qexpr(e: &SqlExpr) -> Result<QExpr> {
             expr,
         } => Ok(QExpr::Not(Box::new(convert_qexpr(expr)?))),
         SqlExpr::BinaryOp { left, op, right } => convert_qbinary_op(left, op, right),
+        SqlExpr::Function(func) if func.name.to_string().eq_ignore_ascii_case("match") => {
+            convert_match_qexpr(func)
+        }
         SqlExpr::Function(f) => convert_aggregate(f),
         SqlExpr::Exists { subquery, negated } => Ok(QExpr::Exists {
             subquery: Box::new(query_to_spec((**subquery).clone())?),
@@ -1068,10 +1071,85 @@ fn convert_qexpr(e: &SqlExpr) -> Result<QExpr> {
             list: list.iter().map(convert_qexpr).collect::<Result<Vec<_>>>()?,
             negated: *negated,
         }),
+        SqlExpr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            ..
+        } => {
+            if *any {
+                return Err(DbError::SqlUnsupported(
+                    "LIKE ANY is not supported in v1".into(),
+                ));
+            }
+            Ok(QExpr::Like {
+                expr: Box::new(convert_qexpr(expr)?),
+                pattern: Box::new(convert_qexpr(pattern)?),
+                negated: *negated,
+                case_insensitive: false,
+            })
+        }
+        SqlExpr::ILike {
+            negated,
+            any,
+            expr,
+            pattern,
+            ..
+        } => {
+            if *any {
+                return Err(DbError::SqlUnsupported(
+                    "ILIKE ANY is not supported in v1".into(),
+                ));
+            }
+            Ok(QExpr::Like {
+                expr: Box::new(convert_qexpr(expr)?),
+                pattern: Box::new(convert_qexpr(pattern)?),
+                negated: *negated,
+                case_insensitive: true,
+            })
+        }
         other => Err(DbError::SqlUnsupported(format!(
             "unsupported expression in query: {other:?}"
         ))),
     }
+}
+
+/// `MATCH(column, query)` in the planner `QExpr` representation (G11, item 30).
+fn convert_match_qexpr(func: &ast::Function) -> Result<QExpr> {
+    let args = match &func.args {
+        ast::FunctionArguments::List(list) => &list.args,
+        _ => {
+            return Err(DbError::SqlUnsupported(
+                "MATCH requires (column, query) arguments".into(),
+            ))
+        }
+    };
+    if args.len() != 2 {
+        return Err(DbError::SqlUnsupported(
+            "MATCH requires exactly 2 arguments: MATCH(column, 'query text')".into(),
+        ));
+    }
+    let column = match &args[0] {
+        ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => convert_qexpr(e)?,
+        other => {
+            return Err(DbError::SqlUnsupported(format!(
+                "MATCH's first argument must be a column name, got {other:?}"
+            )))
+        }
+    };
+    let query = match &args[1] {
+        ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => convert_qexpr(e)?,
+        other => {
+            return Err(DbError::SqlUnsupported(format!(
+                "MATCH's second argument must be a query string or $n, got {other:?}"
+            )))
+        }
+    };
+    Ok(QExpr::Match {
+        column: Box::new(column),
+        query: Box::new(query),
+    })
 }
 
 /// Convert an aggregate function call (`COUNT(*)`, `SUM(x)`, `AVG(DISTINCT x)`,
@@ -1248,10 +1326,91 @@ fn convert_expr(e: &SqlExpr) -> Result<Expr> {
         SqlExpr::Function(func) if func.name.to_string().eq_ignore_ascii_case("near") => {
             convert_near(func)
         }
+        SqlExpr::Function(func) if func.name.to_string().eq_ignore_ascii_case("match") => {
+            convert_match_expr(func)
+        }
+        SqlExpr::Like {
+            negated,
+            any,
+            expr,
+            pattern,
+            ..
+        } => {
+            if *any {
+                return Err(DbError::SqlUnsupported(
+                    "LIKE ANY is not supported in v1".into(),
+                ));
+            }
+            Ok(Expr::Like {
+                expr: Box::new(convert_expr(expr)?),
+                pattern: Box::new(convert_expr(pattern)?),
+                negated: *negated,
+                case_insensitive: false,
+            })
+        }
+        SqlExpr::ILike {
+            negated,
+            any,
+            expr,
+            pattern,
+            ..
+        } => {
+            if *any {
+                return Err(DbError::SqlUnsupported(
+                    "ILIKE ANY is not supported in v1".into(),
+                ));
+            }
+            Ok(Expr::Like {
+                expr: Box::new(convert_expr(expr)?),
+                pattern: Box::new(convert_expr(pattern)?),
+                negated: *negated,
+                case_insensitive: true,
+            })
+        }
         other => Err(DbError::SqlUnsupported(format!(
             "unsupported expression: {other:?}"
         ))),
     }
+}
+
+/// `MATCH(column, query)` in the row-path `Expr` representation (G11,
+/// item 30). Column must be a bare identifier; query may be a literal or `$n`.
+fn convert_match_expr(func: &ast::Function) -> Result<Expr> {
+    let args = match &func.args {
+        ast::FunctionArguments::List(list) => &list.args,
+        _ => {
+            return Err(DbError::SqlUnsupported(
+                "MATCH requires (column, query) arguments".into(),
+            ))
+        }
+    };
+    if args.len() != 2 {
+        return Err(DbError::SqlUnsupported(
+            "MATCH requires exactly 2 arguments: MATCH(column, 'query text')".into(),
+        ));
+    }
+    let column = match &args[0] {
+        ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(SqlExpr::Identifier(ident))) => {
+            ident.value.clone()
+        }
+        other => {
+            return Err(DbError::SqlUnsupported(format!(
+                "MATCH's first argument must be a column name, got {other:?}"
+            )))
+        }
+    };
+    let query = match &args[1] {
+        ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => convert_expr(e)?,
+        other => {
+            return Err(DbError::SqlUnsupported(format!(
+                "MATCH's second argument must be a query string or $n, got {other:?}"
+            )))
+        }
+    };
+    Ok(Expr::Match {
+        column,
+        query: Box::new(query),
+    })
 }
 
 /// `NEAR(column, [0.1, 0.2, ...], k)` parses today, unmodified, as an
