@@ -176,6 +176,40 @@ fn ivf_sweep(c: &Corpus, ivf: &DiskIvfIndex, pool: &BufferPool, probes: &[usize]
 }
 
 fn main() {
+    // ── (Z) ffs-comparison workload (env-gated): match ffsdb.com/evals so
+    //        unidb's own vector index is measured at THEIR exact params
+    //        (10k × 128d, k=10) — the one axis that's apples-to-apples with
+    //        ffs::Hnsw / pgvector / LanceDB query-latency numbers. Bench-only.
+    //        Run: VEC_FFS=1 cargo bench --bench vector_recall
+    if std::env::var("VEC_FFS").is_ok() {
+        let n: usize = std::env::var("VEC_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10_000);
+        let d: usize = std::env::var("VEC_DIM")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(128);
+        let nq: usize = std::env::var("VEC_Q")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1_000);
+        let nlist = (n as f64).sqrt() as usize; // Faiss rule-of-thumb
+        let c = build_corpus(n, d, 200, 10, nq, 0xf5_f5_f5_f5_f5_f5_f5_f5);
+        println!(
+            "== (Z) ffs-comparison workload: {n} vecs × {d}d, k={}, {nq} queries, nlist={nlist} ==",
+            c.k
+        );
+        let dir = tempdir().unwrap();
+        let (ivf, pool, _wal, build) = build_ivf(&c, nlist, 8, dir.path());
+        println!(
+            "IVF-Flat (on-disk, durable) build={:.1}ms:",
+            build.as_secs_f64() * 1e3
+        );
+        ivf_sweep(&c, &ivf, &pool, &[1, 4, 8, 16, 32]);
+        return;
+    }
+
     // ── (A) small corpus: IVF-Flat vs. the in-RAM HNSW baseline ─────────────
     let small = build_corpus(1_200, 32, 30, 10, 100, 0x1234_5678_9abc_def0);
     let nlist_small = 32usize;
