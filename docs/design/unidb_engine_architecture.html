@@ -723,6 +723,41 @@ opening instantly and surviving crashes with its results intact.
 <div class="figcap">Figure 7 — The <code>NEAR</code> vector-search path: probe promising cells, then re-rank exactly.</div>
 </div>
 
+<h4>Embedding search over stored files</h4>
+<p>
+unidb does not read file formats or generate embeddings itself — turning a
+stored PDF, document, or image into a vector is an application step, the same
+as anywhere else vector search is used. What unidb removes is the plumbing
+around it: because object metadata already lives in ordinary tables, adding
+embedding search is a plain schema addition, not a new subsystem.
+</p>
+<pre>-- One extra column alongside your file metadata
+CREATE TABLE file_embeddings (
+  bucket      TEXT,
+  object_key  TEXT,
+  embedding   VECTOR(1536)
+);
+
+-- After your app extracts the file's text and calls an embedding model:
+INSERT INTO file_embeddings (bucket, object_key, embedding)
+VALUES ('docs', 'reports/q3.pdf', [0.02, 0.44, ...]);
+
+-- Search by meaning, then join back to get the file
+SELECT o.bucket, o.object_key, o.content_type
+FROM   file_embeddings e
+JOIN   objects o ON o.bucket = e.bucket AND o.object_key = e.object_key
+WHERE  NEAR(e.embedding, [0.03, 0.41, ...], 10);</pre>
+<p class="small">
+For a small file stored inline, the embedding insert can share the same
+transaction as the upload's metadata write, so "save the file + its
+embedding" is one atomic commit. For a large file tiered to external storage,
+the bytes move by a direct presigned upload outside the engine transaction —
+tie the embedding write to your upload-confirmation step instead. If what you
+need is exact keyword matching over extracted text rather than similarity
+search, index it as full text instead (below) — the same store-then-index
+pattern applies either way.
+</p>
+
 <h3 id="s6-3">6.3 Full-text search</h3>
 <p>
 A <code>TEXT</code> column can carry a durable full-text (inverted) index.
