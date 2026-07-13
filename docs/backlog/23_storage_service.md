@@ -1,7 +1,9 @@
 # Object storage service — MinIO (dev) / S3 (prod) over engine metadata
 
 **Type:** Milestone
-**Status:** NOT STARTED
+**Status:** IN PROGRESS (started 2026-07-13, branch `23-storage-service`) — design
+note in `docs/design/storage_service.md`; implementation in the new
+`unidb-storage` crate.
 
 > Supabase-Storage analog, honoring the Milestone-18 boundary and §10 ("no S3
 > tiering in the engine"): a **separate service layer** (`unidb-storage` crate
