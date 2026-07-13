@@ -86,8 +86,14 @@ existing doc.
    JOIN` (G2), set ops `UNION`/`INTERSECT`/`EXCEPT` (G3), `ORDER BY` on a
    non-projected expr (G4), `RETURNING` (G5), `NATURAL JOIN` (G6, low ROI —
    desugars to the now-supported `USING`), window funcs / recursive CTEs (G7,
-   milestone-sized), `SELECT` without `FROM` (G8). Pick individual gaps as focused
-   improvements; the doc carries a per-gap scope/ROI read.
+   milestone-sized), `SELECT` without `FROM` (G8), **`LIKE`/`ILIKE` pattern
+   matching (G9, high ROI — the studio record browser lost contains/starts/ends
+   filters to it)**, and **row-path predicate parity for `IS NULL`/`LIKE` so
+   filters work off the planner path incl. under `NEAR` (G10)**. Pick individual
+   row-path predicate parity for `IS NULL`/`LIKE` (G10), and **full-text search
+   has no SQL/REST surface — embed-only `Engine::search_fulltext`, unusable from a
+   browser (G11)**. Pick individual gaps as focused improvements; the doc carries
+   a per-gap scope/ROI read.
 5. **Attach-client session support** (filed in `rest_api_enrichment.md`,
    shipped item 12's one optional follow-up): wrap `X-Txn-Id` sessions +
    `/rows/batch` + cursors in `unidb-attach`.
