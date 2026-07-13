@@ -3887,6 +3887,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "unidb-logical"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "unidb",
+ "unidb-dispatch",
+]
+
+[[package]]
 name = "unidb-storage"
 version = "0.1.0"
 dependencies = [

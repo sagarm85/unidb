@@ -80,6 +80,12 @@
 //         redoing WAL_VACUUM records, so the live row survives, reclaimed
 //         versions stay reclaimed, and a re-vacuum_table is a no-op. Verifies
 //         the per-table scope — a second table's rows are untouched throughout.
+//   P32 – torn timeline mark (item 28, R1): a crash mid-append of a 16-byte
+//         timeline mark leaves a partial record at the end of `timeline.bin`.
+//         On load the partial record is silently skipped; PITR resolves to the
+//         previous valid mark. Database consistency is unaffected (the WAL is
+//         the source of truth). This point tests that degraded precision, not
+//         data loss, is the outcome.
 
 use tempfile::tempdir;
 use unidb::{Engine, RowId};
@@ -2177,4 +2183,65 @@ fn p31_crash_mid_vacuum_table_recovers_correctly() {
         after.versions_reclaimed, 0,
         "P31: re-vacuum_table after recovery must find nothing left to reclaim: {after:?}"
     );
+}
+
+// ── P32: torn timeline mark — falls back to previous valid mark (item 28, R1) ─
+//
+// A crash mid-append of a 16-byte timeline mark leaves a partial record at the
+// end of timeline.bin. On load the partial record is silently skipped (the file
+// size is not a multiple of 16), and PITR resolves to the previous valid mark.
+// Database consistency is unaffected; only PITR resolution precision degrades.
+#[test]
+fn p32_torn_timeline_mark_falls_back_to_previous_valid_mark() {
+    use std::io::Write as _;
+    use unidb::backup::timeline::{TimelineIndex, TimelineMark, TIMELINE_FILE};
+
+    let dir = tempdir().unwrap();
+    let tl_path = dir.path().join(TIMELINE_FILE);
+
+    // Write two valid 16-byte marks and then 7 bytes (torn third mark).
+    let m1 = TimelineMark {
+        ts_micros: 1000,
+        lsn: 10,
+    };
+    let m2 = TimelineMark {
+        ts_micros: 2000,
+        lsn: 20,
+    };
+    {
+        let mut f = std::fs::File::create(&tl_path).unwrap();
+        f.write_all(&m1.to_bytes()).unwrap();
+        f.write_all(&m2.to_bytes()).unwrap();
+        f.write_all(&[0u8; 7]).unwrap(); // torn: 7 bytes of a 16-byte record
+    }
+
+    // Load must return only the two complete marks.
+    let marks = TimelineIndex::load_from(&tl_path);
+    assert_eq!(
+        marks.len(),
+        2,
+        "P32: torn mark must be silently skipped on load"
+    );
+    assert_eq!(marks[0], m1);
+    assert_eq!(marks[1], m2);
+
+    // Resolve: target after the torn mark → falls back to lsn 20 (m2).
+    assert_eq!(
+        TimelineIndex::resolve(&marks, 9999),
+        Some(20),
+        "P32: resolve falls back to last valid mark when torn mark is skipped"
+    );
+
+    // Resolve: target between m1 and m2 → lsn 10 (only m1 eligible).
+    assert_eq!(
+        TimelineIndex::resolve(&marks, 1500),
+        Some(10),
+        "P32: resolve(1500) must return m1's lsn"
+    );
+
+    // Verify the engine still opens cleanly on a dir that has a torn timeline —
+    // database integrity is unaffected.
+    let engine = open(dir.path());
+    // No table was created, but the engine opens cleanly.
+    drop(engine);
 }

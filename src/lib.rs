@@ -569,6 +569,9 @@ pub struct Engine {
     stmt_latency_update: crate::metrics::AtomicHistogram,
     stmt_latency_delete: crate::metrics::AtomicHistogram,
     stmt_latency_select: crate::metrics::AtomicHistogram,
+    /// Time-based PITR timeline index (item 28, R1). Records one (ts, lsn) mark
+    /// per committed user transaction after WAL sync, enabling `restore_to_time`.
+    timeline: crate::backup::timeline::TimelineIndex,
 }
 
 /// One slow-query-log entry (P6.g).
@@ -977,6 +980,7 @@ impl Engine {
             stmt_latency_update: crate::metrics::AtomicHistogram::new(),
             stmt_latency_delete: crate::metrics::AtomicHistogram::new(),
             stmt_latency_select: crate::metrics::AtomicHistogram::new(),
+            timeline: crate::backup::timeline::TimelineIndex::open(dir)?,
         })
     }
 
@@ -2317,6 +2321,11 @@ impl Engine {
         // A read-only transaction (`None`) wrote no commit record and skips it.
         if let Some(lsn) = commit_lsn {
             self.wal.sync_up_to(lsn)?;
+            // R1 (item 28): record a (timestamp, LSN) mark for time-based PITR.
+            // Done after WAL sync so the LSN is durable before the mark is written.
+            // Time is advisory; a write failure is logged but never blocks a commit.
+            self.timeline
+                .record(crate::backup::timeline::now_micros(), lsn);
         }
         // Q2 (item 26): wake any blocked subscribers AFTER WAL sync so they see
         // durable events. No latch is held at this point (P5.e safe).
@@ -3020,11 +3029,34 @@ impl Engine {
     }
 
     /// Archive the WAL segment files into `archive_dir` (P6.d) for point-in-time
-    /// recovery — a plain copy of the append-only segments. Re-run to pick up
-    /// newly written records. Returns the number of segments archived.
+    /// recovery — a plain copy of the append-only segments. Also archives the
+    /// time-based PITR timeline index so `restore_to_time` can resolve a
+    /// wall-clock target to an LSN. Re-run to pick up newly written records.
+    /// Returns the number of WAL segments archived.
     pub fn archive_wal(&self, archive_dir: &Path) -> Result<usize> {
         let wal_dir = self.data_dir().join("db.wal");
-        crate::backup::archive_wal_dir(&wal_dir, archive_dir)
+        let n = crate::backup::archive_wal_dir(&wal_dir, archive_dir)?;
+        // R1 (item 28): archive the timeline alongside the WAL so restore_to_time
+        // has the (ts, lsn) marks for every commit up to this archive point.
+        crate::backup::archive_timeline(self.data_dir(), archive_dir)?;
+        Ok(n)
+    }
+
+    /// Restore a database to the highest committed LSN at or before
+    /// `target_ts_micros` (Unix epoch microseconds). Reads the archived timeline
+    /// index to resolve the timestamp to an LSN, then calls
+    /// [`crate::backup::restore`] with that LSN.
+    ///
+    /// This is a **free function** (not `&self`) — it operates on archived
+    /// directories, not a live engine. Time is advisory; LSN is authoritative.
+    /// Resolution granularity is one mark per committed transaction.
+    pub fn restore_to_time(
+        base: &Path,
+        archive: &Path,
+        dest: &Path,
+        target_ts_micros: u64,
+    ) -> Result<()> {
+        crate::backup::restore_to_time(base, archive, dest, target_ts_micros)
     }
 
     /// The synchronous-replica durability option (P6.c): block until every
