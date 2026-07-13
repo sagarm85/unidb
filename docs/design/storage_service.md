@@ -21,7 +21,18 @@ CLAUDE.md §10 forbids "S3 tiering **in** the engine". So `unidb-storage` is a n
   surface (`execute_sql[_params]`, `begin`/`commit`/`abort`,
   `put_large_object`/`read_large_object`/`delete_large_object`,
   `enable_events`/`poll_events`/`ack_events`). It adds **no** engine method and
-  **no** new engine REST route.
+  **no** route to the engine **core** (the generic `/sql` surface).
+
+> **Update (2026-07-14, item 31 — `31_storage_http_routes.md`, SHIPPED).** The
+> HTTP surface for this service now exists: the **server** exposes 7 `/storage/*`
+> routes (`src/server/storage.rs`) that consume the crate through a std-only
+> `StorageApi` trait (`src/storage_api.rs`), with `unidb-storage` linked as a
+> **dev-dependency** for the integration tests. This does **not** weaken the
+> boundary above: the routes are **app-layer service** routes on the server (like
+> the storage crate itself), not additions to the engine core; the engine's
+> default build stays async-runtime-free (verified — `cargo tree` shows no tokio).
+> So "no new engine route" holds for the **core**; the **server** now has
+> `/storage/*`.
 - `tokio` + the AWS SDK live in *this* crate only. The engine's default build
   stays sync (`cargo tree -p unidb --no-default-features --edges normal` shows no
   async runtime — unchanged by this crate).
@@ -269,6 +280,11 @@ the *signing* itself is unit-tested offline against `S3ObjectStore` (§6).
   is unset the test returns early (skips). `docker/docker-compose.yml` gains a
   `minio` service so a developer can set the var and run it. The gate mechanism is
   documented in `unidb-storage/README.md`.
+- **HTTP-route tests (item 31): `tests/storage_routes.rs`** — the server's
+  `/storage/*` layer is covered by 5 in-process tests (503-when-unconfigured,
+  bucket CRUD + 409-on-non-empty-delete, inline object round-trip, presigned-PUT
+  ticket shape, virtual-folder listing); the live-MinIO round-trip there is
+  `#[ignore]`-gated the same way.
 
 ---
 
@@ -276,4 +292,7 @@ the *signing* itself is unit-tested offline against `S3ObjectStore` (§6).
 
 - The studio **"Storage" tab** (bucket browser, upload UI, presigned-link copy)
   lives in the `unidb-studio` repo, like the Events/Logs tabs before it.
-- Multipart upload, lifecycle policies, per-object RLS (item 24), CDN signing.
+  **Backend-unblocked as of item 31 (2026-07-14):** the `/storage/*` HTTP routes
+  the tab consumes now ship — only the studio UI remains to build.
+- Multipart upload, lifecycle policies, per-object RLS (item 24), CDN signing —
+  still not built (item 31 added the route layer, none of these).

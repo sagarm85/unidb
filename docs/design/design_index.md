@@ -27,6 +27,17 @@ win.
   A distilled snapshot: when it disagrees with `CLAUDE.md`/`PROGRESS.md`, those
   win.
 
+- [`how_unidb_stores_data.md`](how_unidb_stores_data.md) — **"Inside unidb:
+  One Order, Start to Finish"** — a byte-level walkthrough of one order moving
+  through the real engine (schema → durable insert → buffer pool → versioned
+  update → read → vector search → background workers), diagram-heavy, with
+  file/line citations back to the actual source and an explicit "why this
+  beats the alternative" case at every step. Written for **any** reader,
+  technical or not — no prior database-internals knowledge assumed. Start
+  here if you want to understand *why* unidb is built the way it is, not just
+  what it does; it's the same ground as `processing-engines/` but as one
+  linear worked example instead of organized by subsystem.
+
 - [`processing-engines/`](processing-engines/00_engines_index.md) — **the detailed
   per-engine design collection** (added 2026-07-11): twelve documents covering
   every processing engine — storage core, WAL & recovery, MVCC/transactions,
