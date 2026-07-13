@@ -41,7 +41,7 @@
 | 25 | `25_multipage_catalog.md` | Improvement | ⏳ NOT STARTED |
 | 26 | `26_event_queue_scale.md` | Improvement | ✅ SHIPPED 2026-07-13 (seq index, EventWake push, Q3 vacuum-correct) |
 | 27 | `27_vacuum_per_table.md` | Improvement | ✅ SHIPPED 2026-07-13 |
-| 28 | `28_replication_time_pitr_logical.md` | Milestone | ⏳ NOT STARTED |
+| 28 | `28_replication_time_pitr_logical.md` | Milestone | ✅ SHIPPED 2026-07-13 (R1: side timeline index + restore_to_time; R2: unidb-logical crate) |
 | 29 | `29_subscription_cdc_envelope_lag.md` | Improvement | ⏳ NOT STARTED |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),

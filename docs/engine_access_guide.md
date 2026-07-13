@@ -581,3 +581,73 @@ metrics enrichment, §9). See `docs/backlog/18_engine_access_contract.md` and
 for the exhaustive HTTP route/error reference. §8 (event stream / change events)
 was added by Milestone 20 — `docs/backlog/20_events_realtime_dispatcher.md`; §10
 (object storage) by item 23 — `docs/backlog/23_storage_service.md`.*
+
+---
+
+## 11. Logical replication and time-based PITR (item 28)
+
+### Time-based PITR
+
+Point-in-time restore to a wall-clock timestamp (not just a raw LSN) is
+available via `Engine::restore_to_time`. See `docs/ops_runbook.md §9` for the
+operator recipe, including the archive-wal + restore workflow.
+
+Key facts for builders:
+- `archive_wal(archive_dir)` now archives both WAL segments **and**
+  `timeline.bin` (the (ts, lsn) mark file).
+- `Engine::restore_to_time(base, archive, dest, target_ts_micros)` is a free
+  function (no live engine required).
+- Resolution: one mark per committed user transaction.
+- Time is advisory; LSN is authoritative.
+
+### Logical replication (unidb-logical crate)
+
+The `unidb-logical` workspace crate allows applying a table-subset of
+`INSERT`/`UPDATE`/`DELETE` changes from a primary engine to a target engine,
+building on the item-26 event stream and item-20 dispatcher.
+
+```rust
+use std::sync::Arc;
+use unidb::Engine;
+use unidb_logical::{LogicalReplicator, TableSpec};
+
+let primary = Arc::new(Engine::open("primary_dir", 0)?);
+let target  = Arc::new(Engine::open("target_dir",  0)?);
+
+// Enable events on the tables you want to replicate (primary side).
+primary.enable_events("orders")?;
+
+// Target schema must be pre-created — the replicator applies DML only.
+
+let replicator = LogicalReplicator::builder(
+    primary.clone(),
+    target.clone(),
+    "my-replica-consumer",   // unique per replication target
+    vec![TableSpec {
+        table:      "orders".to_string(),
+        key_column: "id".to_string(),   // for UPDATE/DELETE identification
+    }],
+)
+.build();
+
+// In an async context: drive one poll-apply-ack cycle.
+replicator.run_once().await?;
+
+// Or drive continuously until shutdown.
+let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+replicator.run(async { let _ = shutdown_rx.await; }).await;
+```
+
+**Delivery semantics:** at-least-once. The consumer offset is durably stored in
+`__consumers__` on the primary. After a primary restart, resume with the same
+`consumer_name` and the replicator picks up from the last acked event — no
+committed change is lost.
+
+**UPDATE events:** carry the new row image only (old key not present). The
+logical apply reconstructs via `DELETE WHERE key = new_key + INSERT new_row`.
+This is correct when the key column is immutable. If key-column-updates are
+required, an item-26 follow-up (capturing `(old_key, new_row)` in UPDATE events)
+will close the gap without a WAL format change.
+
+**Tables not in scope:** events for tables not listed in `TableSpec` are silently
+skipped — they are polled and acked normally but cause no write on the target.

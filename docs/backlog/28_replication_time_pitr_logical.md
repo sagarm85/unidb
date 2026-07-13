@@ -1,7 +1,7 @@
 # Replication — time-based PITR + logical replication
 
 **Type:** Milestone
-**Status:** NOT STARTED
+**Status:** SHIPPED 2026-07-13 — see PROGRESS.md "Replication time-PITR + logical (item 28)"
 
 > Limitation from the architecture guide + Phase-6 follow-ups: "point-in-time
 > restore is by log position, not wall-clock time; no logical replication yet."
@@ -39,7 +39,10 @@
 
 ## Acceptance
 
-- [ ] `restore(target_time)` proven against a known commit timeline (R1).
-- [ ] Logical subscriber applies a table subset, survives primary restart (R2)
-      — or R2 split into its own milestone if it grows past this scope.
-- [ ] Crash harness green; no §3 decision reopened without recorded sign-off.
+- [x] `restore(target_time)` proven against a known commit timeline (R1).
+      `backup::restore_to_time` + deterministic mark injection test in
+      `src/backup/mod.rs::restore_to_time_deterministic_mark_injection`.
+- [x] Logical subscriber applies a table subset, survives primary restart (R2).
+      `unidb-logical/tests/logical_replication.rs` — 3 tests pass.
+- [x] Crash harness green; no §3 decision reopened without sign-off.
+      33/33 crash tests pass (P31 added for torn timeline marks).
