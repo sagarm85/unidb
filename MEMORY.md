@@ -13,7 +13,7 @@
 ## Current status
 
 - **Multi-page catalog (backlog item 25) — SHIPPED 2026-07-13, branch
-  `25-multipage-catalog`, PR TBD (STOP-for-review).** `Catalog::persist`
+  `25-multipage-catalog`, PR #73 (MERGED).** `Catalog::persist`
   chains the JSON blob across N pages (4-byte magic + 4-byte next_page_id
   chain header per page, 8128 bytes JSON per 8 KiB page); `Catalog::load`
   detects magic vs. legacy raw JSON. One mini-txn covers all N chain pages;
@@ -23,10 +23,10 @@
   after: unlimited schema size. 4 new catalog unit tests + 4 integration tests +
   P33 crash test. Docs: spec → SHIPPED; backlog_index row 25 → ✅;
   storage_service.md §4 ceiling note; engine_design.md §4.6 + footer;
-  PROGRESS.md entry. **Next: await PR review — do not merge.**
+  PROGRESS.md entry. **PR #73 merged.**
 - **Subscription CDC — canonical envelope, before/after, format adapters, lag
   observability (backlog item 29) — SHIPPED 2026-07-13, branch
-  `29-subscription-cdc`, PR #72 (STOP-for-review).** C1: `before`/`after`/
+  `29-subscription-cdc`, PR #72 (MERGED).** C1: `before`/`after`/
   `ts_ms` row images in every CDC event; canonical envelope in `__events__.payload`
   back-compat with old flat events. C2: Debezium + Supabase format adapters via
   `?format=` on SSE subscribe (`src/server/event_format.rs`). C3:
@@ -35,7 +35,7 @@
   `unidb_subscription_lag_seconds{consumer}`. C4: guide §8 (§8.1–§8.6)
   updated with contract, three format examples, and lag detection guidance.
   Gates: workspace tests all green (crash 33/33 unchanged); clippy/fmt clean.
-  **Next: await PR review — do not merge.**
+  **PR #72 merged.**
 - **Replication time-PITR + logical replication (backlog item 28) — SHIPPED
   2026-07-13, branch `28-replication-time-pitr`, PR #70 (MERGED).**
   R1 (MUST): `src/backup/timeline.rs` — `TimelineIndex` appends one 16-byte
@@ -49,7 +49,7 @@
   offset-durable, survives primary restart. Known gap (UPDATE old key) filed as
   item-26 follow-up.
 - **Event queue at scale (backlog item 26) — SHIPPED 2026-07-13, branch
-  `26-event-queue-scale`, PR pending (STOP-for-review).** Q1: durable
+  `26-event-queue-scale`, PR #68 (MERGED).** Q1: durable
   `DiskBTree` secondary index on `__events__.seq`; `poll_events` /
   `poll_events_after` now O(log n + returned) via `search_range_limit` +
   MVCC re-check. Flat-latency proven (`benches/poll_events.rs`): 10k→30 µs,
