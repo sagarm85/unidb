@@ -160,13 +160,36 @@ fn worker_loop(engine: Weak<Engine>, shutdown: Arc<Shutdown>) {
             }
         }
 
-        // Evaluate the policy and, if it fires, run one pass. Hold the strong
-        // ref only for this critical section, then release it before sleeping
-        // again so the worker is not the engine's owner while idle.
+        // Evaluate the policy and, if it fires, run one or more passes. Hold
+        // the strong ref only for this critical section, then release it before
+        // sleeping again so the worker is not the engine's owner while idle.
         let Some(e) = engine.upgrade() else {
             break;
         };
-        if e.autovacuum_should_run() {
+
+        // V1/V2 (item 27): prefer per-table passes — vacuum only the table(s)
+        // that actually churned, leaving others untouched. Fall back to the
+        // whole-engine pass only when no per-table trigger fires but the global
+        // estimate crosses the threshold (which covers the raw-CRUD heap, which
+        // has no table name and is only tracked via the global counter).
+        let per_table_targets = e.tables_needing_vacuum();
+        if !per_table_targets.is_empty() {
+            for table in &per_table_targets {
+                match e.run_autovacuum_pass_for_table(table) {
+                    Ok(report) => tracing::debug!(
+                        table = %table,
+                        versions_reclaimed = report.versions_reclaimed,
+                        horizon_blocked = report.horizon_blocked,
+                        "autovacuum per-table pass complete"
+                    ),
+                    Err(err) => tracing::warn!(
+                        table = %table,
+                        error = %err,
+                        "autovacuum per-table pass failed"
+                    ),
+                }
+            }
+        } else if e.autovacuum_should_run() {
             match e.run_autovacuum_pass() {
                 Ok(report) => tracing::debug!(
                     versions_reclaimed = report.versions_reclaimed,

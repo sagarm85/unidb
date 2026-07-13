@@ -40,7 +40,7 @@
 | 24 | `24_authz_v2_policies.md` | Milestone | ⏳ NOT STARTED |
 | 25 | `25_multipage_catalog.md` | Improvement | ⏳ NOT STARTED |
 | 26 | `26_event_queue_scale.md` | Improvement | ✅ SHIPPED 2026-07-13 (seq index, EventWake push, Q3 vacuum-correct) |
-| 27 | `27_vacuum_per_table.md` | Improvement | ⏳ NOT STARTED |
+| 27 | `27_vacuum_per_table.md` | Improvement | ✅ SHIPPED 2026-07-13 |
 | 28 | `28_replication_time_pitr_logical.md` | Milestone | ⏳ NOT STARTED |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),

@@ -67,7 +67,7 @@ Module map (what each layer became in code):
 | Event dispatcher (M20 E2, separate workspace crate) | `unidb-dispatch/src/{lib,sink,filter,dlq}.rs` (`Dispatcher`, `WebhookSink`/`RoomSink`, embeds `Arc<Engine>`, no engine surface) |
 | Server (M5, feature-gated; REST enrichment item 12; logs surface item 22) | `server/{engine_handle,error,dto,handlers,router,auth,sse,tls,txn_session,cursor,correlation,logs}.rs`, `bin/unidb-server.rs` |
 | Logs surface (item 22) | `server/correlation.rs` (request_id middleware + task-local), `server/logs.rs` (bounded reverse-seek `GET /logs`), `observability.rs` (default-build request_id thread-local read by `audit.rs`/slow-query) |
-| Autovacuum (A1–A4) | `autovacuum.rs` (background `std::thread` launcher: `Weak<Engine>`, threshold policy, clean-shutdown handle) |
+| Autovacuum (A1–A4 + item 27) | `autovacuum.rs` (background `std::thread` launcher: `Weak<Engine>`, per-table threshold policy, clean-shutdown handle); per-table dead/live estimates + `vacuum_table` + `VacuumCostConfig` cost throttle in `lib.rs` |
 | Observability metrics (item 21) | `metrics.rs` (lock-free `AtomicHistogram` + counter snapshots); capture points in `bufferpool.rs`/`wal.rs`/`lockmgr.rs`/`txn.rs`/`sql/parallel_scan.rs`/`lib.rs::execute_one_plan`; surfaced via `lib.rs::stats()` + `server/router.rs::publish_engine_metrics`. See `docs/engine_access_guide.md` §9 |
 | Engine facade | `lib.rs` (`Engine` — the sole entry point) |
 | Attach client (M8, separate workspace crate) | `unidb-attach/src/lib.rs` (`AttachClient`, `AttachError`) |
@@ -1149,13 +1149,17 @@ stale entry would alias a live, wrong row (the M10.c aliasing hazard).
 consulted by any read path; rebuilt on open). Vacuum is now **auto-triggered**
 by a background launcher (Autovacuum A1–A4, branch `autovacuum`): a
 `std::thread` holding `Weak<Engine>` wakes every `naptime`, and when
-`dead > threshold + scale_factor · live` (Postgres-shape policy over global
-dead/live estimates) fires the same `Engine::vacuum` pass — safe without new
-locking (`Engine` is `Send + Sync`, vacuum already takes `write_serial` +
-per-page latches, horizon is reader/slot-correct). Still open: per-table
-accounting + `vacuum_table` + a cost-based throttle, catalog-page and
-cross-page/`VACUUM FULL` reclamation, and physical index rebuild — see
-`docs/backlog/autovacuum.md` and `docs/backlog/m10_heap_vacuum_gc.md`.
+`dead > threshold + scale_factor · live` (Postgres-shape policy over **per-table**
+dead/live estimates — item 27, 2026-07-13) fires `vacuum_table` for each
+triggered table (falling back to the whole-engine `Engine::vacuum` pass for
+raw-CRUD writes that carry no table name) — safe without new locking
+(`Engine` is `Send + Sync`, vacuum already takes `write_serial` + per-page
+latches, horizon is reader/slot-correct). **Item 27 (2026-07-13):** per-table
+accounting (`Engine::per_table_dead_estimate`, `per_table_live_estimate`,
+`tables_needing_vacuum`), `Engine::vacuum_table`, and `VacuumCostConfig`
+cost-based throttle all shipped. Still open: cross-page/`VACUUM FULL`
+compaction (V4, deferred — needs multi-page compaction WAL record) and
+physical index rebuild — see `docs/backlog/27_vacuum_per_table.md`.
 
 **CSR is not currently consulted by any query path** (added post-M7,
 corrected during M8 merge) — it is built, kept warm on every live edge
@@ -1252,8 +1256,9 @@ selection; Cypher is single-hop read-only, nodes are opaque i64s; no CSR
 reverse (`to_id`) traversal; RLS is Rust-API-only; ~~manual heap vacuum only
 (`Engine::vacuum()`, M10) — no *automatic*/threshold-driven autovacuum~~
 (**fixed by Autovacuum A1–A4** — a background `std::thread` launcher
-threshold-triggers `Engine::vacuum`; per-table granularity + a cost throttle
-remain future work, `docs/backlog/autovacuum.md`).
+threshold-triggers `Engine::vacuum`; ~~per-table granularity + a cost throttle
+remain future work~~ **RESOLVED (item 27, 2026-07-13):** per-table
+estimates + `vacuum_table` + `VacuumCostConfig` throttle shipped).
 
 Server gaps: no multi-request transaction sessions; no TLS (reverse-proxy
 assumption); verify-only JWT with no scopes (any valid token can hit
