@@ -13,7 +13,13 @@ An **end-user-facing** architecture & product guide for unidb: what the engine
 is, how it stores and protects data, how transactions and concurrency behave,
 the SQL layer (types + query examples), search/indexing/graph, the event
 stream, the full REST API reference, operations/HA, measured performance vs
-Postgres, correctness/testing, known limitations, and roadmap.
+Postgres, correctness/testing, known limitations, roadmap, and (§14) an
+alphabetical glossary of every abbreviation used in the guide (ACID, MVCC,
+WAL, CDC, JWT, RLS, etc.) in book-appendix style.
+
+When a new section introduces an abbreviation not already in §14, add it there
+too — keep the glossary exhaustive over the guide's own vocabulary, not a fixed
+list.
 
 Audience: prospective and current **users** (application developers, technical
 evaluators) — not unidb engine engineers. Accordingly the guide avoids internal

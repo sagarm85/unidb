@@ -132,6 +132,7 @@ loses <b>zero</b> data on a crash where the four-system stack tears a record.
     <ol><li><a href="#s12-1">Known bugs</a></li>
         <li><a href="#s12-2">Known limitations &amp; feature gaps</a></li></ol></li>
   <li><a href="#s13">Where unidb is headed</a></li>
+  <li><a href="#s14">Glossary of terms &amp; abbreviations</a></li>
 </ol>
 </div>
 
@@ -1314,6 +1315,42 @@ and <b>Supabase</b> (as a backend platform).
   design and strains cross-model atomicity; the confirmed target remains a
   strong single node plus read replicas.</li>
 </ul>
+
+<!-- ================= 14 ================= -->
+<h2 id="s14" class="pagebreak">14. Glossary of terms &amp; abbreviations</h2>
+<p>
+Plain-language definitions for every abbreviation used in this guide, in the
+sense it is used here — alphabetical, appendix-style.
+</p>
+<table>
+<tr><th>Term</th><th>Meaning</th></tr>
+<tr><td><b>ACID</b></td><td>Atomicity, Consistency, Isolation, Durability — the four guarantees a transaction gets: all its changes happen together or not at all, the data stays valid, concurrent transactions don't corrupt each other's view, and a commit survives a crash.</td></tr>
+<tr><td><b>ANN</b></td><td>Approximate Nearest Neighbor — the general family of techniques vector similarity search belongs to. unidb's index re-ranks candidates exactly before returning them, so results carry no approximation error despite the family name.</td></tr>
+<tr><td><b>API</b></td><td>Application Programming Interface — the programmatic surface (embedded library calls, or REST routes) an application uses to talk to unidb.</td></tr>
+<tr><td><b>BI</b></td><td>Business Intelligence — reporting and dashboarding tools that connect to a database over a standard driver.</td></tr>
+<tr><td><b>CDC</b></td><td>Change Data Capture — a stream of before/after row images describing every insert, update, and delete, meant for downstream consumers to replay or react to.</td></tr>
+<tr><td><b>CPU</b></td><td>Central Processing Unit — a processor core; parallel table scans split work across CPU cores.</td></tr>
+<tr><td><b>CTE</b></td><td>Common Table Expression — a named subquery introduced with <code>WITH</code>, reusable elsewhere in the same SQL statement.</td></tr>
+<tr><td><b>DDL</b></td><td>Data Definition Language — schema-changing statements (<code>CREATE</code>, <code>ALTER</code>, <code>DROP</code>, <code>TRUNCATE</code>), as distinct from statements that only read or write rows.</td></tr>
+<tr><td><b>GB / MB / KiB / MiB</b></td><td>Gigabyte / Megabyte / Kibibyte / Mebibyte — units of data size. The "i" (kibi-, mebi-) units are the exact binary sizes (multiples of 1,024) unidb uses internally for page and buffer-pool sizing.</td></tr>
+<tr><td><b>HTTP / HTTPS</b></td><td>Hypertext Transfer (Secure) Protocol — the protocol the REST server speaks; HTTPS is HTTP encrypted with TLS.</td></tr>
+<tr><td><b>I/O</b></td><td>Input/Output — reads and writes to disk. Vacuum's cost-based throttle bounds how much background I/O a cleanup pass is allowed to use.</td></tr>
+<tr><td><b>JSON</b></td><td>JavaScript Object Notation — the data format the REST API sends and receives, and the format stored by the <code>JSON</code> column type.</td></tr>
+<tr><td><b>JWT</b></td><td>JSON Web Token — the signed bearer-token format used to authenticate REST requests.</td></tr>
+<tr><td><b>LSN</b></td><td>Log Sequence Number — a strictly increasing position in the write-ahead log. Log-position-based point-in-time restore targets an LSN, as opposed to a wall-clock time.</td></tr>
+<tr><td><b>MFA</b></td><td>Multi-Factor Authentication — signing in with more than a password; a planned addition to the auth platform.</td></tr>
+<tr><td><b>MVCC</b></td><td>Multi-Version Concurrency Control — unidb's concurrency model: an update creates a new row version rather than overwriting in place, so readers and writers never block each other.</td></tr>
+<tr><td><b>OAuth</b></td><td>Open Authorization — a standard for delegated sign-in (e.g. "Sign in with Google"); planned for the auth platform.</td></tr>
+<tr><td><b>ORM</b></td><td>Object-Relational Mapper — an application-side library that maps database rows to objects in your programming language.</td></tr>
+<tr><td><b>REST</b></td><td>Representational State Transfer — the architectural style of unidb's optional HTTP API.</td></tr>
+<tr><td><b>RLS</b></td><td>Row-Level Security — a policy attached to a table that automatically filters every query down to the rows a given caller is allowed to see.</td></tr>
+<tr><td><b>SQL</b></td><td>Structured Query Language — the query language unidb's relational layer speaks.</td></tr>
+<tr><td><b>SSE</b></td><td>Server-Sent Events — a one-way HTTP streaming format used for the realtime event subscription.</td></tr>
+<tr><td><b>TLS</b></td><td>Transport Layer Security — the encryption protocol behind HTTPS; native support ships with the REST server.</td></tr>
+<tr><td><b>UUID</b></td><td>Universally Unique Identifier — a 128-bit identifier type that can be generated independently and still be, in practice, globally unique.</td></tr>
+<tr><td><b>UTC</b></td><td>Coordinated Universal Time — the timezone unidb stores and returns <code>TIMESTAMP</code> values in.</td></tr>
+<tr><td><b>WAL</b></td><td>Write-Ahead Log — the durability log every change is recorded to before it is applied to the data file; the foundation of crash recovery (Section 3).</td></tr>
+</table>
 
 <hr style="margin-top:24pt; border:none; border-top:1px solid #c6d2dd">
 <p class="small">
