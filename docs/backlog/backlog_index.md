@@ -66,7 +66,7 @@ existing doc.
    ~0.34× → ~0.42× UPDATE-bulk gain on a **single-model** CRUD bench that §1 says
    we should lose anyway. Not worth a locked-decision change; effort redirected to
    #17 (the §6 cross-domain headline). Filed rationale in `crud_performance.md`; if
-   ever picked up it takes the next free number (`18_…`).
+   ever picked up it takes the next free number (`19_…`).
 3. **Parallel-scan follow-ups** (filed in `parallel_scan.md`, lower ROI):
    `SUM`/`AVG`/`GROUP BY` partial aggregate; `LIMIT` early-stop; server
    `ReadHandle` parallelism; a visibility-map fast count. (Default-on + worker
