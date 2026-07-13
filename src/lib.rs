@@ -63,6 +63,9 @@ pub mod heap;
 /// P3.d — chunked, streamed, out-of-line large-object storage.
 pub mod large_object;
 pub mod lockmgr;
+/// Lock-free observability capture (backlog item 21): the atomic latency
+/// histogram + counter snapshot types surfaced via `Engine::stats()`.
+pub mod metrics;
 pub mod mmap;
 pub mod mvcc;
 pub mod observability;
@@ -407,6 +410,17 @@ pub struct Engine {
     /// **micros**; 0 disables (default), settable via `set_slow_query_threshold`.
     slow_query_threshold_us: AtomicU64,
     slow_queries: Mutex<std::collections::VecDeque<SlowQuery>>,
+    /// Per-statement-kind latency histograms (item 21). Recorded around each
+    /// SQL statement's execution in `execute_one_plan` — the one chokepoint
+    /// every INSERT/UPDATE/DELETE/SELECT flows through. Lock-free
+    /// [`AtomicHistogram`]s, so the concurrent-write hot path pays only three
+    /// `Relaxed` atomic adds per statement. DDL and other kinds are not
+    /// bucketed here (they are rare and not what the query-latency panel
+    /// tracks).
+    stmt_latency_insert: crate::metrics::AtomicHistogram,
+    stmt_latency_update: crate::metrics::AtomicHistogram,
+    stmt_latency_delete: crate::metrics::AtomicHistogram,
+    stmt_latency_select: crate::metrics::AtomicHistogram,
 }
 
 /// One slow-query-log entry (P6.g).
@@ -443,6 +457,50 @@ pub struct EngineStats {
     pub live_tuple_estimate: u64,
     /// Unix-epoch seconds of the last autovacuum pass, 0 if none yet (A4).
     pub last_autovacuum_epoch_secs: u64,
+    // ── item 21: production-grade metrics at existing chokepoints ────────────
+    /// Per-statement-kind latency histograms (INSERT/UPDATE/DELETE/SELECT),
+    /// micros. The query-latency panel.
+    pub statement_latency: StatementLatency,
+    /// Durable WAL fsyncs that actually reached the platter (coalesced
+    /// group-commit followers excluded) + their latency. `commits / fsyncs`
+    /// reads out the group-commit amortization. The durability-cost panel.
+    pub wal_fsyncs: u64,
+    pub wal_fsync_latency: crate::metrics::HistogramSnapshot,
+    /// Buffer-pool hit/miss/eviction counters. The cache-efficiency panel.
+    pub bufferpool: crate::bufferpool::BufferPoolStats,
+    /// Lock-wait count/duration + deadlock victims. The contention panel.
+    pub locks: crate::lockmgr::LockStats,
+    /// Age (seconds) of the oldest live snapshot pinning the vacuum horizon —
+    /// the item-16 postmortem metric, alertable. Grows while a long/idle
+    /// transaction is held; 0 when the horizon is free. The bloat-risk gauge.
+    pub horizon_age_secs: f64,
+    /// Parallel-scan worker utilization vs the `GLOBAL_MAX` budget (item 15).
+    /// The worker-governance panel.
+    pub parallel_workers: crate::sql::parallel_scan::WorkerStats,
+    /// Per-table size (pages) — the table-health list (joins the item-18
+    /// catalog). Sorted by name; internal `__…__` tables included so the
+    /// operator sees the event/edge/lob heaps too.
+    pub tables: Vec<TableStat>,
+}
+
+/// Per-statement-kind latency snapshot (item 21), micros. Each field is a
+/// bucketed p50/p99/mean readout of one [`crate::metrics::AtomicHistogram`].
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct StatementLatency {
+    pub insert: crate::metrics::HistogramSnapshot,
+    pub update: crate::metrics::HistogramSnapshot,
+    pub delete: crate::metrics::HistogramSnapshot,
+    pub select: crate::metrics::HistogramSnapshot,
+}
+
+/// One row of the per-table health list (item 21). `pages` is the table's heap
+/// page count (its on-disk size in pages); dead-tuple pressure is engine-wide
+/// (`EngineStats::dead_tuple_estimate`) in v1 — a documented limitation, since
+/// the dead/live estimators are global counters, not per-table.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TableStat {
+    pub name: String,
+    pub pages: u32,
 }
 
 /// `Engine` must be safely **shareable** across threads (P5.e: a pool of N
@@ -746,6 +804,10 @@ impl Engine {
             aborts: AtomicU64::new(0),
             slow_query_threshold_us: AtomicU64::new(0),
             slow_queries: Mutex::new(std::collections::VecDeque::new()),
+            stmt_latency_insert: crate::metrics::AtomicHistogram::new(),
+            stmt_latency_update: crate::metrics::AtomicHistogram::new(),
+            stmt_latency_delete: crate::metrics::AtomicHistogram::new(),
+            stmt_latency_select: crate::metrics::AtomicHistogram::new(),
         })
     }
 
@@ -988,6 +1050,7 @@ impl Engine {
             .iter()
             .cloned()
             .collect();
+        let (wal_fsyncs, wal_fsync_latency) = self.wal.fsync_stats();
         EngineStats {
             commits: self.commits.load(Ordering::Relaxed),
             aborts: self.aborts.load(Ordering::Relaxed),
@@ -1002,7 +1065,54 @@ impl Engine {
             dead_tuple_estimate: self.dead_tuples.load(Ordering::Relaxed),
             live_tuple_estimate: self.live_tuples.load(Ordering::Relaxed),
             last_autovacuum_epoch_secs: self.last_autovacuum_epoch_secs.load(Ordering::Relaxed),
+            statement_latency: StatementLatency {
+                insert: self.stmt_latency_insert.snapshot(),
+                update: self.stmt_latency_update.snapshot(),
+                delete: self.stmt_latency_delete.snapshot(),
+                select: self.stmt_latency_select.snapshot(),
+            },
+            wal_fsyncs,
+            wal_fsync_latency,
+            bufferpool: self.pool.pool_stats(),
+            locks: self.lock_mgr.lock_stats(),
+            horizon_age_secs: self.txn_mgr.oldest_snapshot_age().as_secs_f64(),
+            parallel_workers: crate::sql::parallel_scan::worker_stats(),
+            tables: self.table_page_stats(),
         }
+    }
+
+    /// Per-table heap page counts for the table-health list (item 21). Opens
+    /// each table's heap from the catalog and counts its page directory. A
+    /// cold-path call (`stats()` only), so the per-table FSM-directory load is
+    /// acceptable; never touched on a hot path. Sorted by name for a stable,
+    /// diff-friendly response. A table whose directory can't be read (e.g. a
+    /// transient catalog race) is skipped rather than failing the whole call.
+    fn table_page_stats(&self) -> Vec<TableStat> {
+        let page_size = self.page_size;
+        let defs: Vec<(String, Option<PageId>, Vec<PageId>)> = {
+            let catalog = cat_read(&self.catalog);
+            catalog
+                .tables()
+                .map(|t| (t.name.clone(), t.fsm_meta, t.pages.clone()))
+                .collect()
+        };
+        let mut out: Vec<TableStat> = defs
+            .into_iter()
+            .map(|(name, fsm_meta, pages)| {
+                let heap = Heap::open(page_size, fsm_meta, pages);
+                let page_count = if heap.ensure_directory(&self.pool).is_ok() {
+                    heap.page_ids().len() as u32
+                } else {
+                    0
+                };
+                TableStat {
+                    name,
+                    pages: page_count,
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
     }
 
     fn execute_sql_inner(&self, xid: Xid, sql: &str) -> Result<Vec<ExecResult>> {
@@ -1130,6 +1240,33 @@ impl Engine {
     /// legacy non-FSM page-list persist), and *every* statement when the toggle
     /// is off (reproducing the pre-existing serialized behavior exactly).
     fn execute_one_plan(&self, xid: Xid, plan: LogicalPlan) -> Result<ExecResult> {
+        // Item 21: classify + time this statement for the per-kind query-latency
+        // panel. Classify before we move `plan` into the executor; record after,
+        // regardless of Ok/Err (a failed statement still consumed latency).
+        let latency_hist = self.stmt_latency_for(&plan);
+        let started = latency_hist.map(|_| Instant::now());
+        let result = self.execute_one_plan_inner(xid, plan);
+        if let (Some(hist), Some(started)) = (latency_hist, started) {
+            hist.record(started.elapsed().as_micros() as u64);
+        }
+        result
+    }
+
+    /// The latency histogram for a statement kind (item 21), or `None` for
+    /// kinds outside the four the query-latency panel tracks (DDL, auth, etc.).
+    fn stmt_latency_for(&self, plan: &LogicalPlan) -> Option<&crate::metrics::AtomicHistogram> {
+        match plan {
+            LogicalPlan::Select { .. } | LogicalPlan::Query(_) | LogicalPlan::Explain { .. } => {
+                Some(&self.stmt_latency_select)
+            }
+            LogicalPlan::Insert { .. } => Some(&self.stmt_latency_insert),
+            LogicalPlan::Update { .. } => Some(&self.stmt_latency_update),
+            LogicalPlan::Delete { .. } => Some(&self.stmt_latency_delete),
+            _ => None,
+        }
+    }
+
+    fn execute_one_plan_inner(&self, xid: Xid, plan: LogicalPlan) -> Result<ExecResult> {
         let page_size = self.page_size;
         // Decide the lock mode under a brief read lock, then take the real guard.
         let shared = self.stmt_uses_shared_catalog(&plan);

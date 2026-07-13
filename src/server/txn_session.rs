@@ -31,7 +31,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -95,6 +98,11 @@ impl Drop for SessionGuard {
 pub struct TxnSessions {
     inner: Mutex<HashMap<Xid, Arc<TxnSession>>>,
     idle_timeout: Duration,
+    /// Lifetime count of sessions the idle reaper has auto-aborted (item 21).
+    /// The server-session panel's health signal — a climbing count means
+    /// clients are abandoning open transactions (each of which pinned the
+    /// vacuum horizon until reaped). Incremented by [`Self::note_reaped`].
+    reaper_aborts: AtomicU64,
 }
 
 impl TxnSessions {
@@ -102,11 +110,24 @@ impl TxnSessions {
         Self {
             inner: Mutex::new(HashMap::new()),
             idle_timeout,
+            reaper_aborts: AtomicU64::new(0),
         }
     }
 
     pub fn idle_timeout(&self) -> Duration {
         self.idle_timeout
+    }
+
+    /// Record that the background reaper auto-aborted an idle session (item 21).
+    pub fn note_reaped(&self, n: u64) {
+        if n > 0 {
+            self.reaper_aborts.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Lifetime idle-reaper auto-aborts (item 21 server-session panel).
+    pub fn reaper_aborts(&self) -> u64 {
+        self.reaper_aborts.load(Ordering::Relaxed)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Xid, Arc<TxnSession>>> {

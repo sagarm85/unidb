@@ -484,10 +484,65 @@ still advances, so a poison event cannot wedge the stream.
 - **No `NATURAL JOIN` / `FULL OUTER JOIN`** (`JOIN … USING` *is* supported —
   `INNER`/`LEFT`/`RIGHT`; see [§2](#2-query-the-sql-surface)).
 
+- **Per-table dead-tuple estimate is engine-wide, not per-table (item 21).**
+  The table-health list gives real per-table **page counts**
+  (`tables[].pages` / `unidb_table_pages{table=…}`); dead/live-tuple pressure
+  is reported once for the whole engine (`dead_tuple_estimate` /
+  `live_tuple_estimate`), because the estimators are global counters. Splitting
+  them per table is a filed follow-up, not shipped here.
+- **Histogram percentiles are log-bucket estimates, not exact quantiles**
+  (item 21). `p50_us`/`p99_us` are the **upper bound** of the power-of-two
+  bucket the rank falls in (the Prometheus `le` convention) — a safe
+  over-estimate for an SLO panel, never an under-estimate.
+
 ---
 
-*Milestone 18 (engine access & introspection contract). See
-`docs/backlog/18_engine_access_contract.md` for the spec + design note, and
-`docs/REST_API.md` for the exhaustive HTTP route/error reference. §8 (event
-stream / change events) was added by Milestone 20 —
-`docs/backlog/20_events_realtime_dispatcher.md`.*
+## 9. Observe (metrics & health)
+
+*(Item 21.)* Every production metric is captured **lock-free** on the hot path
+(plain atomics + a fixed-bucket atomic histogram — no mutex on the commit or
+scan path) and surfaced **only** through the documented boundaries:
+
+- **`Engine::stats()`** (embed) / **`GET /stats`** (server) — one JSON snapshot,
+  the `EngineStats` shape. The server adds three session gauges the engine can't
+  see (`open_txn_sessions`, `open_cursors`, `idle_reaper_aborts`).
+- **`GET /metrics`** (server) — the same values republished through the
+  Prometheus facade on each scrape (a scrape never perturbs the write path).
+
+A Studio "Observability" tab renders the widgets below from these two surfaces
+alone — no bespoke endpoint (the Milestone-18 boundary).
+
+### Widget-traceability table
+
+Every widget maps to a named, documented metric. `stats()` JSON path on the
+left, Prometheus metric on the right; units are microseconds unless noted.
+
+| Widget (panel) | `stats()` JSON field | Prometheus metric | Captured at |
+|---|---|---|---|
+| Query latency — per kind | `statement_latency.{insert,update,delete,select}.{p50_us,p99_us,mean_us,count}` | `unidb_statement_latency_p50_us{kind}`, `unidb_statement_latency_p99_us{kind}`, `unidb_statement_count{kind}` | `execute_one_plan` (per SQL statement) |
+| Commits/s | `commits`, `aborts` | `unidb_commits_total`, `unidb_aborts_total` | `Engine::commit`/`abort` |
+| Durability cost | `wal_fsyncs`, `wal_fsync_latency.{p50_us,p99_us}` | `unidb_wal_fsyncs_total`, `unidb_wal_fsync_p50_us`, `unidb_wal_fsync_p99_us` | `Wal::sync` / `group_fsync` (around `sync_all`) |
+| Cache efficiency | `bufferpool.{hits,misses,evictions,hit_ratio}` | `unidb_bufferpool_hits_total`, `unidb_bufferpool_misses_total`, `unidb_bufferpool_evictions_total`, `unidb_bufferpool_hit_ratio` | `BufferPool::fetch_page`/`find_victim` |
+| Contention | `locks.{waits,deadlocks,wait.p50_us,wait.p99_us}` | `unidb_lock_waits_total`, `unidb_deadlocks_total`, `unidb_lock_wait_p50_us`, `unidb_lock_wait_p99_us` | `LockManager::acquire` (blocking-wait path) |
+| **Bloat risk (alertable)** | `horizon_age_secs` | `unidb_horizon_age_seconds` | `TransactionManager` (oldest live snapshot age) |
+| Table health | `tables[].{name,pages}`, `dead_tuple_estimate`, `live_tuple_estimate` | `unidb_table_pages{table}`, `unidb_dead_tuple_estimate`, `unidb_live_tuple_estimate` | catalog + heap page directory (cold, on read) |
+| Autovacuum | `autovacuums`, `last_autovacuum_epoch_secs` | `unidb_autovacuum_runs_total`, `unidb_autovacuum_last_run_epoch_secs` | autovacuum launcher (A4) |
+| Worker governance | `parallel_workers.{global_max,available,parallel_scans,workers_granted,serial_fallbacks}` | `unidb_parallel_worker_budget`, `unidb_parallel_workers_available`, `unidb_parallel_scans_total`, `unidb_parallel_workers_granted_total`, `unidb_parallel_serial_fallbacks_total` | `parallel_scan::acquire` (admission) |
+| Server sessions | `open_txn_sessions`, `open_cursors`, `idle_reaper_aborts` *(server-only)* | `unidb_open_txn_sessions`, `unidb_open_cursors`, `unidb_idle_reaper_aborts_total` | session/cursor registries + idle reaper |
+| Replication lag | `replication_slots`, `max_replication_lag` | *(via `/stats`)* | slot registry |
+
+**The horizon-age gauge is the one to alert on.** A pinned vacuum horizon (an
+idle `REPEATABLE READ` session, an abandoned open transaction, a slow reader) is
+the #1 silent cause of table bloat and scan slowdown — the item-16 postmortem
+metric. `horizon_age_secs` climbs for as long as the oldest live snapshot is
+held and drops to `0` the instant it commits/aborts; on the server, the
+idle-session reaper caps the worst case and increments
+`idle_reaper_aborts` when it does.
+
+---
+
+*Milestone 18 (engine access & introspection contract) + item 21 (observability
+metrics enrichment, §9). See `docs/backlog/18_engine_access_contract.md` and
+`docs/backlog/21_observability_metrics.md` for the specs, and `docs/REST_API.md`
+for the exhaustive HTTP route/error reference. §8 (event stream / change events)
+was added by Milestone 20 — `docs/backlog/20_events_realtime_dispatcher.md`.*

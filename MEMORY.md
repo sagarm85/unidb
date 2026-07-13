@@ -50,6 +50,38 @@
   ops_runbook §8, README, engine_design (§8 + module map + footer), backlog
   index + item-22 doc → SHIPPED, PROGRESS entry. **This closes item 22 (L1–L3,
   L5); L4 is studio-side.**
+- **Observability metrics enrichment (backlog item 21) — SHIPPED (2026-07-13),
+  branch `21-observability-metrics`, PR #62.** Enriched the P6.g
+  observability surface with production-grade metrics captured **lock-free** at
+  existing chokepoints, surfaced only via `Engine::stats()`/`GET /stats` +
+  Prometheus `/metrics` (no new endpoint). New `src/metrics.rs` = a lock-free
+  `AtomicHistogram` (48 power-of-two buckets, `record` = 3 `Relaxed` fetch_adds;
+  `le`-convention percentile **estimates** read on the cold `stats()` path) +
+  counter snapshots. Capture sites: per-statement-kind latency
+  (`lib.rs::execute_one_plan`), WAL-fsync latency+count (`wal.rs::sync`/
+  `group_fsync` around `sync_all`), buffer-pool hit/miss/evict
+  (`bufferpool.rs::fetch_page`/`find_victim`), lock-wait dur/count + deadlocks
+  (`lockmgr.rs::acquire` blocking path), the alertable **vacuum-horizon-age
+  gauge** (`txn.rs` — each live writer/reader carries a begin `Instant`;
+  `oldest_snapshot_age()`), per-table heap page counts (cold FSM-dir walk in
+  `stats()`), parallel-worker utilization vs `GLOBAL_MAX`
+  (`sql/parallel_scan::acquire`), and server session gauges (open sessions/
+  cursors + idle-reaper aborts, merged in `get_stats`). **No mutex on the
+  commit/scan path.** Horizon-age proven by
+  `txn::tests::horizon_age_grows_while_rr_idle_and_resets_on_commit` (idle RR
+  grows it; commit/abort resets to 0). **Overhead A/B (HEAD vs `main`@842bb12
+  clone, quiet machine, single bench process, PG off):** single-threaded
+  `mmreport` Table 3.1 within ±1% at scale (bulk insert −0.65%/−0.86% @1M/2M;
+  full-scan select ±0.28% @1M/2M — the buffer-pool-atomic path); W0→W4 ladder
+  indistinguishable; Table C 8-writer ~2–3% mean but fully inside its ±8%
+  run-to-run band (distributions overlap) → noise, not regression. **Honest
+  limitation:** per-table *dead-tuple* estimate stays engine-global (estimators
+  are global counters) — table-health widget uses real per-table `pages` +
+  engine-global dead-tuple pressure. Gates: `-p unidb --features server` +
+  `--workspace` pass, crash **31/31**, conc-matrix **28/28** (toggle on+off, 18
+  spinners), clippy/fmt clean. No `FORMAT_VERSION` bump, no §3 decision reopened.
+  Widget-traceability table: `docs/engine_access_guide.md` §9. See PROGRESS
+  "Observability metrics enrichment (item 21)".
 - **Events / realtime dispatcher (backlog Milestone 20) — SHIPPED (2026-07-13),
   branch `20-events-dispatcher`, PR pending.** Makes M4's atomically-captured
   event stream consumable downstream **without any new engine application

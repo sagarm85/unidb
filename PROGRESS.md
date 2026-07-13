@@ -4100,6 +4100,104 @@ decision reopened. This closes item 11's filed follow-up.
 
 ---
 
+## Observability metrics enrichment (item 21)   [SHIPPED]   2026-07-13
+
+**PR:** _pending (branch `21-observability-metrics`)_
+**Backlog:** `docs/backlog/21_observability_metrics.md` (spec + AC).
+
+**Summary:** Enriched the `pg_stat_*`-style observability surface (P6.g) with
+production-grade metrics captured **lock-free** at existing chokepoints, and
+surfaced them **only** through the documented boundaries — `Engine::stats()` /
+`GET /stats` (JSON) and the Prometheus `/metrics` scrape — plus a
+widget-traceability table in `docs/engine_access_guide.md` §9. No new endpoint
+(the Milestone-18 boundary), no `FORMAT_VERSION` bump, no crash-surface change
+(harness stays 31), no §3 decision reopened.
+
+**What shipped (metric → capture site, all lock-free):**
+- **Per-statement-kind latency histograms** (INSERT/UPDATE/DELETE/SELECT) —
+  `lib.rs::execute_one_plan` (the one SQL-statement chokepoint).
+- **WAL-fsync latency histogram + count** — `wal.rs::sync`/`group_fsync`, timed
+  around the actual `sync_all` (outside the append lock in the group path);
+  `commits / wal_fsyncs` reads out the group-commit amortization.
+- **Buffer-pool hit/miss/eviction** — `bufferpool.rs::fetch_page`/`find_victim`.
+- **Lock-wait count/duration + deadlock counter** — `lockmgr.rs::acquire`
+  (blocking-wait path only; the no-wait SI path pays nothing).
+- **Oldest-snapshot / vacuum-horizon-age gauge** (the item-16 postmortem
+  metric, alertable) — `txn.rs` tracks each live writer/reader's begin instant;
+  `oldest_snapshot_age()` is the age of the horizon-pinning snapshot.
+- **Per-table heap page counts** — cold-path walk of each table's FSM directory
+  in `stats()` (dead/live-tuple estimate stays engine-global — a documented
+  limitation, since the estimators are global counters).
+- **Parallel-worker utilization vs `GLOBAL_MAX`** — `sql/parallel_scan::acquire`
+  (parallel scans / workers granted / serial fallbacks + budget/available).
+- **Session gauges** (server-only, merged in the handler) — open sessions,
+  open cursors, and idle-reaper auto-aborts (`server/txn_session.rs` +
+  `server/mod.rs` reaper).
+
+Capture is a plain `AtomicU64` / a fixed-bucket `AtomicHistogram`
+(`src/metrics.rs`: 48 power-of-two buckets, `record` = three `Relaxed`
+`fetch_add`s; percentiles are `le`-convention bucket upper-bound **estimates**,
+read only on the cold `stats()` path). **No mutex on the commit or scan path.**
+
+**Horizon-age gauge proof (AC):**
+`txn::tests::horizon_age_grows_while_rr_idle_and_resets_on_commit` — an idle
+`REPEATABLE READ` session makes the gauge climb over real elapsed time, and its
+commit **and** abort each reset it to zero (the item-16 abandoned-txn shape).
+
+**Overhead AC — honest A/B, quiet machine, single bench process, PG off
+(`benches/decompose.rs`, release, 18 logical cores, native macOS M5 Pro):**
+HEAD (metrics compiled in) vs a fresh `main`@`842bb12` clone (no metrics). The
+low-variance single-threaded `mmreport` ladder is the discriminator:
+
+| mmreport Table 3.1 (single-threaded) | main (no metrics) | HEAD (metrics in) | Δ |
+|--------------------------------------|------------------:|------------------:|---|
+| bulk insert @1M rows (rec/s)         | 31,580            | 31,308            | **−0.86%** |
+| bulk insert @2M rows (rec/s)         | 31,232            | 31,028            | **−0.65%** |
+| full-scan select @1M rows (rec/s)*   | 35,605,245        | 35,697,286        | **+0.26%** |
+| full-scan select @2M rows (rec/s)*   | 35,449,496        | 35,349,039        | **−0.28%** |
+
+*the scan path is where the buffer-pool hit/miss atomics fire — the most
+per-fetch-sensitive path, and it lands within ±0.28% at scale.* The W0→W4
+multi-model commit ladder (fsync-dominated, ~3 ms/commit) is likewise
+indistinguishable (W4/W0 main 1.21–1.30× vs HEAD 1.22–1.28×). **All within ±1%
+at scale — no measurable overhead**, exactly as a lock-free 3-atomic-add capture
+predicts (≈5 ns on an ≈18 µs/row path ≈ 0.03%).
+
+**Table C (`HICONC_ONLY=c`, 8-writer, `idx_pregrow=200000`, per=400) — 3 paired
+runs each (this path is high-variance):**
+
+| schema (8 writers) | main runs (commits/s)   | HEAD runs (commits/s)   | mean Δ |
+|--------------------|-------------------------|-------------------------|--------|
+| no-index           | 1285 / 1256 / 1289      | 1244 / 1284 / 1231      | ~−2% |
+| indexed            | 1163 / 1187 / 1089      | 1081 / 1165 / 1084      | ~−3% |
+
+The distributions fully overlap (indexed: main 1089–1187 vs HEAD 1081–1165 —
+each dips and peaks inside the other's range); the ~8% intra-config run-to-run
+spread swamps any per-statement atomic cost, so the ~2–3% mean gap is
+noise-dominated, not a systematic regression. Reporting the measured spread, not
+a lucky single run (§0.6 / measurement hygiene).
+
+**Peak RSS:** unchanged. The added state is fixed-size (a handful of `AtomicU64`
+per component + ~10 `AtomicHistogram`s × 48×8 B ≈ 4 KB total) — negligible next
+to the buffer-pool-bounded working set (~31 MB for the Table C process, per the
+item-11 measurement on the same machine).
+
+**Green:** `cargo test -p unidb --features server` + `cargo test --workspace
+--features server` pass; crash harness **31/31**; concurrency correctness matrix
+**28 PASS · 0 FAIL** (`CONC_REPEATS=3`, 18 spinners, toggle on **and** off —
+proves the txn/lock-path instrumentation preserves correctness);
+`clippy --workspace --features server -D warnings` clean; `fmt` clean. New tests:
+`txn.rs` horizon-age proof, `tests/observability.rs::item21_*`,
+`tests/server_stats.rs` + `tests/server_metrics.rs` item-21 assertions.
+
+**Known limitations / tech debt:** per-table **dead-tuple** estimate is
+engine-global, not per-table (documented in the guide §8); percentiles are
+log-bucket estimates (the `le` convention), not exact quantiles.
+
+**Locked-decision changes:** none.
+
+---
+
 ## Engine access & introspection contract (Milestone 18)   [SHIPPED]   2026-07-13
 
 **PR:** _pending (branch `18-engine-access-contract-impl`)_

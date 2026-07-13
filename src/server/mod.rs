@@ -181,12 +181,16 @@ fn spawn_reaper(
             // busy lock held, so no request is (or can start) mid-flight on
             // it; aborting releases its row locks and un-pins the vacuum
             // horizon.
+            let mut reaped = 0u64;
             for (session, _busy) in sessions.claim_expired() {
                 match engine.abort(session.xid).await {
-                    Ok(()) => tracing::info!(
-                        xid = session.xid,
-                        "auto-aborted idle transaction session (reaper)"
-                    ),
+                    Ok(()) => {
+                        reaped += 1;
+                        tracing::info!(
+                            xid = session.xid,
+                            "auto-aborted idle transaction session (reaper)"
+                        )
+                    }
                     Err(e) => tracing::warn!(
                         xid = session.xid,
                         error = %e,
@@ -194,6 +198,8 @@ fn spawn_reaper(
                     ),
                 }
             }
+            // item 21: surface abandoned-transaction churn on the session panel.
+            sessions.note_reaped(reaped);
         }
     });
 }

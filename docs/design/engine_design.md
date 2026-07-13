@@ -68,6 +68,7 @@ Module map (what each layer became in code):
 | Server (M5, feature-gated; REST enrichment item 12; logs surface item 22) | `server/{engine_handle,error,dto,handlers,router,auth,sse,tls,txn_session,cursor,correlation,logs}.rs`, `bin/unidb-server.rs` |
 | Logs surface (item 22) | `server/correlation.rs` (request_id middleware + task-local), `server/logs.rs` (bounded reverse-seek `GET /logs`), `observability.rs` (default-build request_id thread-local read by `audit.rs`/slow-query) |
 | Autovacuum (A1–A4) | `autovacuum.rs` (background `std::thread` launcher: `Weak<Engine>`, threshold policy, clean-shutdown handle) |
+| Observability metrics (item 21) | `metrics.rs` (lock-free `AtomicHistogram` + counter snapshots); capture points in `bufferpool.rs`/`wal.rs`/`lockmgr.rs`/`txn.rs`/`sql/parallel_scan.rs`/`lib.rs::execute_one_plan`; surfaced via `lib.rs::stats()` + `server/router.rs::publish_engine_metrics`. See `docs/engine_access_guide.md` §9 |
 | Engine facade | `lib.rs` (`Engine` — the sole entry point) |
 | Attach client (M8, separate workspace crate) | `unidb-attach/src/lib.rs` (`AttachClient`, `AttachError`) |
 
@@ -1419,7 +1420,20 @@ the embedded API (`None`) is the implicit superuser, the server maps the JWT
 change the on-disk page format *and* fights the mmap page store). **P6.g
 observability:** `Engine::stats()` (`pg_stat_*`-style: commits/aborts/
 checkpoints/active-txns/WAL bytes/replication lag/data pages/recent slow
-queries) + `GET /stats`, a slow-query log, and `docs/ops_runbook.md`. Crash
+queries) + `GET /stats`, a slow-query log, and `docs/ops_runbook.md`.
+**Item 21 enrichment (2026-07-13):** production-grade metrics captured
+**lock-free** at existing chokepoints — per-statement-kind latency histograms
+(`execute_one_plan`), a WAL-fsync latency histogram (`Wal::sync`/`group_fsync`),
+buffer-pool hit/miss/eviction counters (`BufferPool::fetch_page`/`find_victim`),
+lock-wait + deadlock counters (`LockManager::acquire`), the alertable
+**vacuum-horizon-age gauge** (`TransactionManager` — the item-16 postmortem
+metric), per-table heap page counts, and parallel-worker utilization vs the
+`GLOBAL_MAX` budget. Capture is a plain atomic / a fixed-bucket
+`AtomicHistogram` (`src/metrics.rs`) — no mutex on the commit or scan path — and
+is surfaced only via `stats()`/`GET /stats` + the Prometheus `/metrics` scrape
+(republished in `server/router.rs::publish_engine_metrics`). Widget-traceability
+table: `docs/engine_access_guide.md` §9. Measured overhead within noise (<1%),
+per `PROGRESS.md`. Crash
 harness **19 → 21** (P18 segmented-WAL multi-segment recovery + truncation; P19
 backup+PITR restore after primary loss). No `FORMAT_VERSION` bump; sync
 invariant holds (no tokio/reqwest/axum/rustls in the default build). Benchmarks
@@ -1508,4 +1522,16 @@ at-least-once, crash/replay zero-loss); E3 the event-schema contract in
 `docs/engine_access_guide.md §8`. No engine storage/format/crash surface (harness
 stays 31), engine default build stays sync (no tokio). See §6.3 and
 `docs/backlog/20_events_realtime_dispatcher.md` + `PROGRESS.md`.
+**Observability metrics enrichment (2026-07-13, item 21, branch
+`21-observability-metrics`):** production-grade metrics captured **lock-free**
+at existing chokepoints — per-statement-kind latency histograms, WAL-fsync
+latency, buffer-pool hit/miss/eviction, lock-wait + deadlock counters, the
+alertable **vacuum-horizon-age gauge** (the item-16 postmortem metric),
+per-table heap page counts, and parallel-worker utilization — via a new
+`src/metrics.rs` (`AtomicHistogram` + snapshots). Surfaced only through
+`Engine::stats()`/`GET /stats` + Prometheus `/metrics`
+(`server/router.rs::publish_engine_metrics`); widget-traceability table in
+`docs/engine_access_guide.md` §9. No mutex on the commit/scan path; measured
+overhead within noise (<1%). No `FORMAT_VERSION` bump, crash harness unchanged.
+See `docs/backlog/21_observability_metrics.md` + `PROGRESS.md`.
 Update alongside the next milestone's closeout.*

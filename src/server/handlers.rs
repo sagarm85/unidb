@@ -837,6 +837,11 @@ pub async fn get_stats(
     if let serde_json::Value::Object(map) = &mut value {
         map.insert("open_txn_sessions".into(), json!(state.sessions.len()));
         map.insert("open_cursors".into(), json!(state.cursors.len()));
+        // item 21 server-session panel: abandoned-transaction reaper churn.
+        map.insert(
+            "idle_reaper_aborts".into(),
+            json!(state.sessions.reaper_aborts()),
+        );
     }
     Ok(Json(value))
 }

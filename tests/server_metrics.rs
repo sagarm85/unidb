@@ -44,4 +44,23 @@ async fn metrics_endpoint_returns_prometheus_text_after_traffic() {
         body.contains("axum_http_requests_total"),
         "expected the auto-instrumented HTTP counter, got:\n{body}"
     );
+
+    // Item 21: the engine-level gauges are republished on scrape. Spot-check
+    // one metric from each panel so a regression in `publish_engine_metrics`
+    // (or a renamed metric) trips the test.
+    for name in [
+        "unidb_commits_total",
+        "unidb_statement_latency_p99_us",
+        "unidb_bufferpool_hit_ratio",
+        "unidb_wal_fsyncs_total",
+        "unidb_horizon_age_seconds",
+        "unidb_lock_waits_total",
+        "unidb_parallel_worker_budget",
+        "unidb_open_txn_sessions",
+    ] {
+        assert!(
+            body.contains(name),
+            "expected item-21 metric `{name}` in /metrics body, got:\n{body}"
+        );
+    }
 }
