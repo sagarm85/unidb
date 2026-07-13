@@ -12,8 +12,8 @@
 
 ## Current status
 
-- **Object storage service (backlog item 23) — SHIPPED (2026-07-13), branch
-  `23-storage-service`, PR pending. STOP-for-review (do not merge).** New
+- **Object storage service (backlog item 23) — SHIPPED + MERGED (2026-07-13),
+  branch `23-storage-service`, PR #64.** New
   **app-layer** crate `unidb-storage` (workspace member; adds **no engine
   surface**, keeps tokio + `aws-sdk-s3` out of the engine's sync build). Bucket/
   object **metadata** in ordinary unidb tables (`buckets`, `objects`,
@@ -48,6 +48,10 @@
   `STORAGE_S3_ENDPOINT`. Docs: crate README, engine_access_guide §10, design
   note + design_index, backlog index row 23, spec→SHIPPED, PROGRESS "Object
   storage service (item 23)". **Studio "Storage" tab = out of repo.**
+  **Follow-up filed:** item 25 (`25_multipage_catalog.md`, Improvement, NOT
+  STARTED) — lift the single ~8 KiB catalog-blob ceiling (table defs + stats)
+  this work hit; extends item 10; once shipped, the storage-layer workaround
+  (compact schema, DDL up front) can be relaxed.
 - **Logs surface (backlog item 22) — SHIPPED (2026-07-13), branch
   `22-logs-surface`, PR pending. STOP-for-review (do not merge).** Made the
   server's structured logs queryable + shippable without a log database.

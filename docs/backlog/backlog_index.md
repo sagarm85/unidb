@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `25_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `26_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -38,6 +38,7 @@
 | 22 | `22_logs_surface.md` | Improvement | ✅ SHIPPED (PROGRESS: Logs surface — JSON structured logs, correlation ids, bounded /logs tail) |
 | 23 | `23_storage_service.md` | Milestone | ✅ SHIPPED (PROGRESS: Object storage service — MinIO/S3 tiering over engine metadata (item 23)) |
 | 24 | `24_authz_v2_policies.md` | Milestone | ⏳ NOT STARTED |
+| 25 | `25_multipage_catalog.md` | Improvement | ⏳ NOT STARTED |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
@@ -106,9 +107,17 @@ existing doc.
    the horizon-age gauge is the item-16 lesson; widget-traceability table in
    `docs/engine_access_guide.md` §9) → **#22 logs surface** (JSON + correlation
    ids + bounded `/logs`) →
-   **#23 storage service** (MinIO/S3 over engine metadata + LOB tiering;
-   service layer, engine unchanged) → **#24 authz v2** (per-op RLS policies +
-   `WITH CHECK` + SQL-native roles; deliberately last — deepest semantics).
+   **#23 storage service — ✅ SHIPPED 2026-07-13** (branch `23-storage-service`,
+   PR #64; `unidb-storage` crate — MinIO/S3 over engine metadata + LOB tiering,
+   outbox/reconciler, presigned URLs; engine unchanged) → **#24 authz v2**
+   (per-op RLS policies + `WITH CHECK` + SQL-native roles; deliberately last —
+   deepest semantics).
+7. **#25 multi-page catalog** (`25_multipage_catalog.md`, Improvement, NOT
+   STARTED) — **surfaced by #23**: the whole catalog (table defs + stats) is one
+   ~8 KiB page blob, so a wide schema / accumulated stats overflow with
+   `HeapFull`; #23 had to work around it (compact schema, DDL up front). Extends
+   item 10 (which moved page-lists out). Recommended first cut: split `stats`
+   out of the blob; then evaluate multi-page vs self-hosting catalog.
 
 ## How to update this file
 
