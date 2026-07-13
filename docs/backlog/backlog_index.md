@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `26_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `29_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -39,6 +39,9 @@
 | 23 | `23_storage_service.md` | Milestone | ✅ SHIPPED (PROGRESS: Object storage service — MinIO/S3 tiering over engine metadata (item 23)) |
 | 24 | `24_authz_v2_policies.md` | Milestone | ⏳ NOT STARTED |
 | 25 | `25_multipage_catalog.md` | Improvement | ⏳ NOT STARTED |
+| 26 | `26_event_queue_scale.md` | Improvement | ⏳ NOT STARTED |
+| 27 | `27_vacuum_per_table.md` | Improvement | ⏳ NOT STARTED |
+| 28 | `28_replication_time_pitr_logical.md` | Milestone | ⏳ NOT STARTED |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
@@ -98,6 +101,15 @@ existing doc.
 5. **Attach-client session support** (filed in `rest_api_enrichment.md`,
    shipped item 12's one optional follow-up): wrap `X-Txn-Id` sessions +
    `/rows/batch` + cursors in `unidb-attach`.
+7. **Storage/recovery follow-ups (filed 2026-07-13 from the guide's limitations
+   table; engine-internal, so higher risk than the service lanes — crash
+   harness is the hard gate):** **#26 event queue at scale** (sequence index →
+   O(new events) polling + push-vs-poll; highest ROI, directly improves item
+   20's dispatcher), **#27 vacuum** (per-table accounting + cost throttle +
+   whole-table compaction; most self-contained), **#28 replication**
+   (time-based PITR + logical replication; milestone-sized). **Parallel note:
+   #26 and #28 both edit `lib.rs`+`wal.rs` — do NOT run them concurrently; #27
+   (`autovacuum.rs`+`heap.rs`) is safe to run alongside either.**
 6. **Supabase-track service milestones (filed 2026-07-13, ordered by
    recommended build sequence — each has its own spec file):**
    **#20 events/realtime dispatcher** (~80% exists in-engine via M4; highest
