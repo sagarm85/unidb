@@ -793,6 +793,39 @@ pub async fn post_admin_flush(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `GET /logs` (item 22, L3): a **superuser-gated**, bounded, cursor-paged tail
+/// over the rotated JSON log files. Not a log database — a filtered reverse read
+/// only (see `server::logs`). The file scan is blocking IO, so it runs on the
+/// blocking pool; both the page size and the per-request scan are hard-capped so
+/// a multi-GB log directory can neither OOM nor stall the server.
+pub async fn get_logs(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+    Query(params): Query<crate::server::logs::LogQueryParams>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    state
+        .engine
+        .ensure_superuser(current_user.0)
+        .await
+        .map_err(ApiError::from)?;
+
+    let query: crate::server::logs::LogQuery = params.into();
+    let log_dir = state.log_dir.clone();
+    let page =
+        tokio::task::spawn_blocking(move || crate::server::logs::read_logs(&log_dir, &query))
+            .await
+            .map_err(|_| ApiError::internal("LOG_READ_TASK", "log read task panicked"))?
+            .map_err(|e| ApiError::internal("LOG_READ", format!("failed to read logs: {e}")))?;
+
+    Ok(Json(json!({
+        "logs": page.logs,
+        "returned": page.logs.len(),
+        "scanned": page.scanned,
+        "truncated": page.truncated,
+        "next_cursor": page.next_cursor,
+    })))
+}
+
 /// `pg_stat_*`-style activity view (P6.g): commits/aborts/checkpoints, active
 /// sessions, WAL pressure, replication lag, and recent slow queries.
 pub async fn get_stats(

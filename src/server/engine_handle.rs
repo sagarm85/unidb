@@ -87,9 +87,15 @@ impl EngineHandle {
         T: Send + 'static,
     {
         let engine = self.engine()?;
-        tokio::task::spawn_blocking(move || f(&engine))
-            .await
-            .map_err(|_| DbError::EngineUnavailable)?
+        // Carry the request's correlation id onto the blocking pool thread so
+        // engine-core logging (slow-query, audit) can tag it (item 22, L2).
+        let request_id = crate::server::correlation::current_request_id();
+        tokio::task::spawn_blocking(move || {
+            let _corr = crate::observability::set_request_id(request_id);
+            f(&engine)
+        })
+        .await
+        .map_err(|_| DbError::EngineUnavailable)?
     }
 
     /// Read one row by [`RowId`] on the concurrent read path (6b): no xid, no
@@ -97,9 +103,13 @@ impl EngineHandle {
     /// state.
     pub async fn get_row(&self, row_id: RowId) -> Result<Vec<u8>> {
         let read = self.read.clone();
-        tokio::task::spawn_blocking(move || read.get(row_id))
-            .await
-            .map_err(|_| DbError::EngineUnavailable)?
+        let request_id = crate::server::correlation::current_request_id();
+        tokio::task::spawn_blocking(move || {
+            let _corr = crate::observability::set_request_id(request_id);
+            read.get(row_id)
+        })
+        .await
+        .map_err(|_| DbError::EngineUnavailable)?
     }
 
     /// Execute read-only SQL (`SELECT`) on the concurrent read path (6b). The
@@ -108,9 +118,13 @@ impl EngineHandle {
     /// returns [`DbError::SqlPlan`].
     pub async fn execute_sql_read(&self, sql: String) -> Result<Vec<ExecResult>> {
         let read = self.read.clone();
-        tokio::task::spawn_blocking(move || read.execute_sql(&sql))
-            .await
-            .map_err(|_| DbError::EngineUnavailable)?
+        let request_id = crate::server::correlation::current_request_id();
+        tokio::task::spawn_blocking(move || {
+            let _corr = crate::observability::set_request_id(request_id);
+            read.execute_sql(&sql)
+        })
+        .await
+        .map_err(|_| DbError::EngineUnavailable)?
     }
 
     pub async fn begin(&self, isolation: Option<IsolationLevel>) -> Result<Xid> {

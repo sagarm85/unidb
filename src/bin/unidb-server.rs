@@ -26,6 +26,13 @@
 //! deliberately implemented here rather than in `lib.rs` so the default,
 //! non-`server` embedded build stays untouched.
 //!
+//! **Format (item 22, L1):** both sinks emit **JSON lines** by default —
+//! `{ts, level, target, message, request_id, txn_id, …}` — the form any log
+//! platform (CloudWatch, Datadog, Loki) ingests directly, and the form
+//! `GET /logs` reads back (see `server::logs`, `ops_runbook.md`). Set
+//! `UNIDB_LOG_FORMAT=text` for the older human-readable console format when
+//! developing locally.
+//!
 //! Startup order: open the `Engine` via `EngineHandle::spawn` (synchronous,
 //! surfaces any open/recovery failure immediately — see `engine_handle.rs`'s
 //! module doc), build the router, bind, serve. `axum::serve`'s graceful
@@ -54,10 +61,37 @@ fn init_logging(log_dir: &str) -> tracing_appender::non_blocking::WorkerGuard {
 
     let env_filter =
         || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    // JSON lines by default (item 22, L1) — the shipping contract for CW/Datadog
+    // and the format `GET /logs` reads back. `UNIDB_LOG_FORMAT=text` restores the
+    // human-readable console format for local development.
+    let json = std::env::var("UNIDB_LOG_FORMAT")
+        .map(|v| !v.eq_ignore_ascii_case("text"))
+        .unwrap_or(true);
+
+    let (stdout_layer, file_layer) = if json {
+        (
+            fmt::layer().json().boxed(),
+            fmt::layer()
+                .json()
+                .with_writer(file_writer)
+                .with_ansi(false)
+                .boxed(),
+        )
+    } else {
+        (
+            fmt::layer().boxed(),
+            fmt::layer()
+                .with_writer(file_writer)
+                .with_ansi(false)
+                .boxed(),
+        )
+    };
+
     tracing_subscriber::registry()
         .with(env_filter())
-        .with(fmt::layer())
-        .with(fmt::layer().with_writer(file_writer).with_ansi(false))
+        .with(stdout_layer)
+        .with(file_layer)
         .init();
     guard
 }
@@ -82,7 +116,7 @@ async fn main() {
         .unwrap_or_else(|e| panic!("failed to open unidb engine at {data_dir}: {e}"));
     // Builds the session/cursor registries and spawns the idle reaper (R1);
     // deadlines come from UNIDB_TXN_IDLE_TIMEOUT_SECS / _CURSOR_ (default 60).
-    let state = AppState::new(Arc::new(engine));
+    let state = AppState::new(Arc::new(engine)).with_log_dir(std::path::PathBuf::from(&log_dir));
     let jwt_config = JwtConfig::new(&jwt_secret);
     let (prometheus_layer, metric_handle) = PrometheusMetricLayer::pair();
 

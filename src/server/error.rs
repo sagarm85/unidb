@@ -32,6 +32,16 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    /// A `500 Internal Server Error` for a server-side failure that isn't a
+    /// `DbError` (e.g. a log-file read error behind `GET /logs`).
+    pub fn internal(code: &'static str, message: impl Into<String>) -> Self {
+        ApiError::Api {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code,
+            message: message.into(),
+        }
+    }
 }
 
 impl From<DbError> for ApiError {

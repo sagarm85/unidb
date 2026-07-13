@@ -45,6 +45,8 @@ fn metrics_pair() -> &'static (PrometheusMetricLayer<'static>, PrometheusHandle)
 /// clone and runs `EngineHandle`'s own bounded-timeout shutdown via `Drop`.
 pub struct TestServer {
     pub addr: SocketAddr,
+    data_dir: std::path::PathBuf,
+    log_dir: std::path::PathBuf,
     _tempdir: TempDir,
     _server_task: tokio::task::JoinHandle<()>,
 }
@@ -59,8 +61,13 @@ impl TestServer {
     /// process-global env vars).
     pub async fn spawn_with_sessions(config: SessionConfig) -> Self {
         let tempdir = tempfile::tempdir().unwrap();
+        let data_dir = tempdir.path().to_path_buf();
+        // Point `GET /logs` (item 22) at a dedicated logs subdir so a test can
+        // drop synthetic rotated JSON files there without racing the data files.
+        let log_dir = data_dir.join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
         let engine = EngineHandle::spawn(tempdir.path(), 0).unwrap();
-        let state = AppState::with_config(Arc::new(engine), config);
+        let state = AppState::with_config(Arc::new(engine), config).with_log_dir(log_dir.clone());
         let jwt_config = JwtConfig::new(TEST_JWT_SECRET);
         let (prometheus_layer, metric_handle) = metrics_pair().clone();
         let router = build_router(state, jwt_config, prometheus_layer, metric_handle);
@@ -73,6 +80,8 @@ impl TestServer {
 
         Self {
             addr,
+            data_dir,
+            log_dir,
             _tempdir: tempdir,
             _server_task: server_task,
         }
@@ -80,6 +89,17 @@ impl TestServer {
 
     pub fn url(&self, path: &str) -> String {
         format!("http://{}{}", self.addr, path)
+    }
+
+    /// The database directory (holds `audit.log`, `control`, `data.db`, …).
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
+    }
+
+    /// The directory `GET /logs` reads (item 22) — tests drop synthetic rotated
+    /// JSON log files here.
+    pub fn log_dir(&self) -> &std::path::Path {
+        &self.log_dir
     }
 }
 
