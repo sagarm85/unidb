@@ -73,6 +73,7 @@ pub fn build_router(
         .route("/checkpoint", post(handlers::post_checkpoint))
         .route("/admin/flush", post(handlers::post_admin_flush))
         .route("/stats", get(handlers::get_stats))
+        .route("/logs", get(handlers::get_logs))
         .route(
             "/replication/slots",
             post(handlers::post_replication_slot).get(handlers::get_replication_slots),
@@ -121,6 +122,13 @@ pub fn build_router(
         .merge(public)
         .layer(prometheus_layer)
         .layer(TraceLayer::new_for_http())
+        // Outermost app layer (item 22, L2): assign a `request_id` before auth
+        // so even a rejected request is traceable, scope it as a task-local for
+        // the engine bridge, and echo it back as `x-request-id`. Sits inside the
+        // CORS/timeout tower layers but outside everything else.
+        .layer(axum::middleware::from_fn(
+            crate::server::correlation::assign_request_id,
+        ))
         .layer(CorsLayer::permissive())
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,

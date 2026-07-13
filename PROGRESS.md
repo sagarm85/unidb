@@ -4185,3 +4185,116 @@ items (A2, B4, C4, C5, D2) complete. The `unidb-studio` schema-visualizer
 switchover box stays **unticked** in the spec — it closes from the studio repo;
 the engine surface it needs is complete and proven by the differential + parity
 tests.
+
+---
+
+## Logs surface — JSON structured logs, correlation ids, bounded /logs tail (backlog item 22)   [SHIPPED]   2026-07-13
+
+**PR:** (branch `22-logs-surface`, PR pending)
+**Summary:** Made the server's existing structured logs queryable enough for a
+studio Logs tab and shippable to any real log platform, without building a log
+database. Three pieces: **L1** — server logging emits **JSON lines** (both
+stdout and the rolling `unidb.log.YYYY-MM-DD` files); **L2** — a per-request
+`request_id` (+ `txn_id`) that joins one request's lines across the app log, the
+slow-query log, and `audit.log`; **L3** — `GET /logs` (superuser-gated), a
+bounded, cursor-paged **reverse read of the JSON files** with a hard page cap
+and a scan budget so a multi-GB log directory can neither OOM nor stall the
+server. **L5** — `ops_runbook.md` documents the JSON files as the shipping
+contract (CloudWatch/Datadog/Loki agent configs). **L4** (studio Logs tab) is
+out of this repo — noted only.
+
+**All logging stays server-feature-gated.** The default (embedded) build gains
+one tiny `std`-only module (`src/observability.rs`: a thread-local `request_id`)
+and one `tracing` span in `Engine::execute_sql` — **no new dependency**, engine
+stays sync. JSON formatting is enabled via `tracing-subscriber/json` **only under
+the `server` feature**; `cargo tree` for the default build is unchanged.
+
+**Correlation mechanism (L2), end to end:**
+- Middleware assigns `request_id` before auth (so even a 401/403 is traceable),
+  scopes it as a tokio **task-local**, enters an `http_request` `tracing` span,
+  and echoes it back as the `x-request-id` response header.
+- `EngineHandle`'s `spawn_blocking` choke points copy the task-local onto the
+  blocking pool thread into the engine-core thread-local — that is how the
+  slow-query log and `audit.log` (written deep in the synchronous engine) get
+  the id. `txn_id` (the xid) is threaded directly.
+- `Engine::execute_sql` wraps execution in a span tagged `txn_id`/`request_id`,
+  so the slow-query `warn` (and any executor event) carries both. `audit.log`
+  records gained `txn_id`+`request_id` fields, plus an app-log `tracing` mirror.
+
+**Metrics — JSON logging overhead ladder** (debug build, M4 MBP, real
+`F_FULLFSYNC` per commit; `--test logs_correlation -- --ignored`, 4 000 single-
+INSERT txns):
+
+| Config          | commits/s | vs text |
+|-----------------|-----------|---------|
+| no subscriber   | 280       | —       |
+| text logging    | 233       | baseline|
+| JSON logging    | 282       | +21%    |
+
+**Honest read (measurement hygiene, §6/§0.6):** these three are **within
+run-to-run noise** — the per-commit durable fsync (~3.5 ms) dominates entirely,
+so the log *format* is not measurable on this workload (JSON came out slightly
+faster than text here, i.e. noise, not a real win). That is exactly the
+acceptance bar ("ladder within noise with JSON logging on"): server log volume
+is ~2 lines/txn (begin/commit), not per-row, so formatting cost is lost against
+real DB work. No throughput/latency headline is claimed — this is an
+observability surface, not a perf change; peak RSS unchanged (buffer-pool
+bounded; the `/logs` reader is block-bounded, one 64 KiB chunk live).
+
+**`/logs` safety bounds (proven, not asserted):** page cap **500**, scan budget
+**50 000 lines/request**, reverse block reads (64 KiB) — a file is never loaded
+whole. `tests/server::logs::scan_budget_bounds_work_on_a_needle_in_a_haystack`
+writes a >55 k-line file with the only match at the oldest end and asserts one
+request scans **exactly the budget** (not the file), returns a resume cursor,
+and the needle is still reachable by paging. Cursor pagination is filename+offset
+anchored (stable across a fresh newest file rotating in), proven complete + dup-
+free over multi-file corpora.
+
+**Correlation proof (acceptance #1):** `tests/logs_correlation.rs::
+one_request_id_joins_app_slow_and_audit_logs` drives the engine as the server
+bridge does (set `request_id`, run under one txn) with a JSON capture
+subscriber, and asserts the one `request_id` (+ `txn_id`) appears on the
+slow-query line, the audit app-log mirror, and the `audit.log` file. Over HTTP,
+`tests/server_logs.rs::request_id_flows_to_response_header_and_audit_log` shows
+the `x-request-id` header value landing verbatim in `audit.log`.
+
+**What changed:**
+- `src/observability.rs` (new, default build): thread-local `request_id` +
+  RAII guard.
+- `src/audit/mod.rs`: `AuditEvent` gains `txn_id`/`request_id`; `record`/
+  `record_admin` take `txn_id`; app-log mirror event.
+- `src/lib.rs`: `execute_sql` correlation span; slow-query `warn` enriched with
+  `sql`/`txn_id`/`request_id`; audit call sites pass `xid`.
+- `src/server/correlation.rs` (new): task-local + middleware + id generator.
+- `src/server/logs.rs` (new): bounded reverse-seek reader + filters + cursor.
+- `src/server/{engine_handle,router,handlers,mod,error}.rs`: propagate the id
+  through `spawn_blocking`; wire `GET /logs` (superuser-gated) + the
+  outermost `assign_request_id` layer; `AppState.log_dir`; `ApiError::internal`.
+- `src/bin/unidb-server.rs`: JSON log layers (default; `UNIDB_LOG_FORMAT=text`
+  opt-out); pass resolved `log_dir` to `AppState`.
+- Docs: `docs/REST_API.md` (`GET /logs`), `docs/ops_runbook.md` (§8 logs + L5
+  shipping), `README.md`, `docs/design/engine_design.md`, backlog index + item
+  doc status.
+
+**Known limitations / tech debt:**
+- `request_id` is process-local (seed + counter), not a UUID — unique within one
+  server's retention window and greppable, sufficient for single-node (§1). A
+  multi-node fleet dedups on `x-request-id` + hostname at the log platform.
+- `since`/`until` compare the RFC3339-UTC `timestamp` **lexically** (correct for
+  the fixed UTC format `tracing` emits; not a general date parser).
+- The concurrent read path (`ReadHandle::execute_sql`) is not wrapped in the
+  `execute_sql` correlation span (it has no slow-query/audit surface); its lines
+  still carry `request_id` via the thread-local when driven by a request.
+- `/logs` cursor `file_idx` anchors on filename; a file rotated out of retention
+  mid-pagination ends that page's walk (returns empty) rather than erroring.
+
+**Deferred:** L4 studio Logs tab (out of repo); live tail over SSE (would reuse
+item-20 framing) is L4-side.
+
+**Green:** `cargo test` (default) **380 + crash 31/31**; `cargo test --workspace
+--features server` green incl. new `server_logs` (3) + `logs_correlation` (1);
+`clippy --all-targets` and `--all-targets --features server` clean (`-D
+warnings`); `fmt --check` clean. Default-build dependency graph unchanged.
+
+**Locked-decision changes:** none. No on-disk format change, no crash-point
+change, no §3 decision reopened.

@@ -114,6 +114,61 @@ REVOKE reader FROM analyst;
   `active_transactions`, `wal_bytes`, `replication_slots`,
   `max_replication_lag`, `data_pages`, `recent_slow_queries`.
 - **Slow-query log:** `Engine::set_slow_query_threshold(Duration)`; slower
-  statements are `tracing::warn`ed and kept in the bounded ring shown by
-  `/stats`.
+  statements are `tracing::warn`ed (tagged with `txn_id`/`request_id`) and kept
+  in the bounded ring shown by `/stats`.
 - `EXPLAIN` / `EXPLAIN ANALYZE <query>` for plan diagnosis (P4.e).
+
+## 8. Logs — JSON lines, correlation ids, shipping (item 22)
+
+**Format (L1).** The server logs **JSON lines** to both stdout and the rolling
+daily files under `UNIDB_LOG_DIR` (`unidb.log.YYYY-MM-DD`). Each line carries
+`timestamp` (RFC3339 UTC), `level`, `target`, the `message`, and — inside a
+request — the correlation ids. Set `UNIDB_LOG_FORMAT=text` for the older
+human-readable console format when developing locally; leave it unset (JSON) in
+production.
+
+**Correlation ids (L2).** Every HTTP request is stamped with a `request_id`
+(returned in the `x-request-id` response header). The SQL path additionally
+tags `txn_id` (the xid). Both flow through to the app log, the slow-query log,
+and `audit.log`, so **one request's lines join across all three by
+`request_id`** (and audit/slow-query lines also carry `txn_id`). To trace a
+request end-to-end: grep the `request_id` from `x-request-id` across the JSON
+log and `audit.log`.
+
+**Built-in tail (L3).** `GET /logs?level=&since=&until=&q=&cursor=&limit=`
+(superuser-gated) is a bounded, cursor-paged reverse read of those JSON files —
+the local/single-node "Logs tab" experience. It is **not** a log store: page
+size is capped at 500 and each request examines at most 50 000 lines, so it
+never OOMs or stalls on a multi-GB directory (it returns a `next_cursor` to
+resume). Use it for quick incident triage on one node; use a real platform for
+fleet-wide search and retention.
+
+**Shipping to CloudWatch / Datadog / Loki (L5) — the production contract.** The
+JSON files under `UNIDB_LOG_DIR` *are* the shipping interface; point your log
+agent at them (they need no parser — one JSON object per line):
+
+```bash
+# CloudWatch agent (logs section)
+{ "logs": { "logs_collected": { "files": { "collect_list": [
+  { "file_path": "/var/lib/unidb/logs/unidb.log.*",
+    "log_group_name": "unidb", "log_stream_name": "{hostname}" } ] } } } }
+
+# Datadog agent (conf.d/unidb.d/conf.yaml)
+logs:
+  - type: file
+    path: /var/lib/unidb/logs/unidb.log.*
+    service: unidb
+    source: unidb            # JSON is auto-parsed; request_id/txn_id become facets
+
+# Promtail → Loki
+scrape_configs:
+  - job_name: unidb
+    static_configs: [{ targets: [localhost], labels: { job: unidb, __path__: /var/lib/unidb/logs/unidb.log.* } }]
+    pipeline_stages: [{ json: { expressions: { level: level, request_id: request_id, txn_id: txn_id } } }]
+```
+
+- **Rotation & retention** are `tracing-appender`'s daily files; unidb does not
+  prune them — let the log agent (or logrotate) own deletion after shipping.
+- Put `UNIDB_LOG_DIR` on its own volume if log volume competes with data I/O.
+- Both stdout and the files are JSON, so a `docker logs`/journald → agent path
+  works identically to tailing the files.

@@ -22,16 +22,19 @@
 //! logic beyond one `PrometheusMetricLayer::pair()` call.
 
 pub mod auth;
+pub mod correlation;
 pub mod cursor;
 pub mod dto;
 pub mod engine_handle;
 pub mod error;
 pub mod handlers;
+pub mod logs;
 pub mod router;
 pub mod sse;
 pub mod tls;
 pub mod txn_session;
 
+use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -85,6 +88,22 @@ pub struct AppState {
     pub engine: Arc<EngineHandle>,
     pub sessions: Arc<TxnSessions>,
     pub cursors: Arc<CursorStore>,
+    /// Directory the rolling JSON log files live in — the source `GET /logs`
+    /// (item 22, L3) reads. Defaults from `UNIDB_LOG_DIR` (mirroring
+    /// `unidb-server`'s own resolution) so it points at the same files the
+    /// server is writing.
+    pub log_dir: Arc<PathBuf>,
+}
+
+/// Resolve the log directory the same way `src/bin/unidb-server.rs` does, so
+/// `GET /logs` reads exactly the files being written (`UNIDB_LOG_DIR`, else
+/// `<UNIDB_DATA_DIR>/logs`).
+fn default_log_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("UNIDB_LOG_DIR") {
+        return PathBuf::from(dir);
+    }
+    let data_dir = std::env::var("UNIDB_DATA_DIR").unwrap_or_else(|_| "/tmp/unidb".to_string());
+    PathBuf::from(format!("{data_dir}/logs"))
 }
 
 impl AppState {
@@ -109,7 +128,15 @@ impl AppState {
             engine,
             sessions,
             cursors,
+            log_dir: Arc::new(default_log_dir()),
         }
+    }
+
+    /// Point `GET /logs` at an explicit log directory (the server binary passes
+    /// its resolved `UNIDB_LOG_DIR`; tests point it at a temp dir).
+    pub fn with_log_dir(mut self, dir: PathBuf) -> Self {
+        self.log_dir = Arc::new(dir);
+        self
     }
 }
 

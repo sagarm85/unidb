@@ -676,6 +676,53 @@ alongside the engine counters.
 
 ---
 
+### `GET /logs` (item 22)
+
+**Superuser-gated.** A bounded, cursor-paged tail over the rotated JSON log
+files the server writes (`unidb.log.YYYY-MM-DD`). This is **not** a log
+database — it is a filtered *reverse read of the files*, so a real deployment
+still ships those files to CloudWatch/Datadog (see `ops_runbook.md`); the
+endpoint is the local/single-node convenience (and the studio Logs tab's
+backend).
+
+**Query params** (all optional):
+
+| param    | meaning |
+|----------|---------|
+| `level`  | minimum severity — `ERROR` > `WARN` > `INFO` > `DEBUG` > `TRACE`; a line at or above it passes |
+| `since`  | inclusive lower bound on the line's RFC3339-UTC `timestamp` (lexical compare) |
+| `until`  | inclusive upper bound on the `timestamp` |
+| `q`      | case-sensitive substring the raw line must contain (e.g. a `request_id`) |
+| `cursor` | opaque resume token from a prior page's `next_cursor` |
+| `limit`  | page size, **clamped to 500** |
+
+**Response** `200 OK`:
+```json
+{
+  "logs": [ { "timestamp": "...", "level": "INFO", "request_id": "req-...", "...": "..." } ],
+  "returned": 42,
+  "scanned": 137,
+  "truncated": false,
+  "next_cursor": "b64-opaque-or-null"
+}
+```
+- `logs` are newest-first, each the parsed JSON line (or `{"raw": "..."}` for a
+  non-JSON line, which only a bare `q` passes).
+- `next_cursor` is `null` at the end; otherwise pass it back to fetch the next
+  (older) page.
+- **Bounds that keep a multi-GB log directory safe:** at most 500 lines are
+  returned, at most 50 000 are *examined* per request, and files are read from
+  the end backward one block at a time — never loaded whole. `truncated: true`
+  means the per-request scan budget stopped the walk before the page filled
+  (there is more behind `next_cursor`), not that the corpus ended.
+
+**Correlation (L2):** every request is stamped with a `request_id` (echoed in
+the `x-request-id` response header). It appears on the request's app-log lines,
+its slow-query log line, and its `audit.log` entries (alongside `txn_id`), so
+one request's lines are retrievable across all three by that id.
+
+---
+
 ### Replication (P6.b)
 
 - `POST /replication/slots` — create a slot. Body `{"name": "...", "sync": false}`.

@@ -12,6 +12,44 @@
 
 ## Current status
 
+- **Logs surface (backlog item 22) — SHIPPED (2026-07-13), branch
+  `22-logs-surface`, PR pending. STOP-for-review (do not merge).** Made the
+  server's structured logs queryable + shippable without a log database.
+  **L1:** `unidb-server` logs **JSON lines** to stdout + rolling `unidb.log.*`
+  files (`UNIDB_LOG_FORMAT=text` opt-out); enabled via `tracing-subscriber/json`
+  **under the `server` feature only** — default build dep graph unchanged.
+  **L2 correlation:** middleware (`server/correlation.rs`) assigns a
+  `request_id` before auth, scopes it as a tokio **task-local**, enters an
+  `http_request` span, echoes `x-request-id`. `EngineHandle`'s `spawn_blocking`
+  choke points copy the task-local into an engine-core **thread-local**
+  (`src/observability.rs` — default build, `std`-only, no new dep) that the
+  synchronous slow-query log + `audit.log` read; `Engine::execute_sql` wraps a
+  span tagged `txn_id`/`request_id`. `audit.log` records gained
+  `txn_id`+`request_id` + an app-log mirror. So one request's lines join across
+  app log, slow-query log, audit log by `request_id`. **L3:** `GET /logs`
+  (`server/logs.rs`, superuser-gated via `ensure_superuser`) — bounded,
+  cursor-paged **reverse read** of the JSON files: page cap 500, per-request
+  scan budget 50 000 lines, 64 KiB reverse blocks (never loads a file whole),
+  filename+offset opaque cursor. Proven not to OOM/stall on a huge dir
+  (`tests/server::logs::scan_budget_bounds_work_on_a_needle_in_a_haystack`:
+  >55k-line file, match only at oldest end → scans exactly the budget, returns
+  resume cursor, needle reachable by paging). **L5:** `ops_runbook.md` §8 =
+  CW/Datadog/Loki agent configs (the JSON files are the shipping contract).
+  **L4** (studio Logs tab) out of repo — noted only. **Metrics:** JSON-overhead
+  ladder within noise (bare 280 / text 233 / json 282 commits/s @ real fsync —
+  per-commit fsync dominates, format is noise; acceptance "ladder within noise"
+  met); no perf headline (observability surface); RSS unchanged. **Files:** new
+  `src/observability.rs`, `src/server/{correlation,logs}.rs`, `tests/{server_logs,
+  logs_correlation}.rs`; touched `audit/mod.rs`, `lib.rs` (execute_sql span +
+  slow-query enrich + audit call sites pass xid), `server/{engine_handle,router,
+  handlers,mod,error}.rs`, `bin/unidb-server.rs`, `Cargo.toml`. **Gates green:**
+  `cargo test` default **380 + crash 31/31**; `--workspace --features server`
+  green (incl. new server_logs 3 + logs_correlation 1); clippy `-D warnings`
+  clean (default + server `--all-targets`); fmt clean. No §3 decision reopened,
+  no on-disk format change, no crash-point change. Docs: REST_API `GET /logs`,
+  ops_runbook §8, README, engine_design (§8 + module map + footer), backlog
+  index + item-22 doc → SHIPPED, PROGRESS entry. **This closes item 22 (L1–L3,
+  L5); L4 is studio-side.**
 - **Engine access & introspection contract (backlog Milestone 18) — SHIPPED
   (2026-07-13), branch `18-engine-access-contract-impl`, PR pending.** Delivered
   a SQL-queryable **system catalog** as synthesized virtual relations over the

@@ -47,6 +47,10 @@ server = [
     "dep:jsonwebtoken", "dep:metrics", "dep:metrics-exporter-prometheus",
     "dep:axum-prometheus", "dep:async-stream", "dep:futures-util",
     "dep:tracing-appender", "dep:axum-server", "dep:rustls", "dep:base64",
+    # Item 22, L1: JSON-lines log formatting. Enabled only under `server` so the
+    # default embedded build's `tracing-subscriber` stays minimal (the `json`
+    # feature just pulls serde_json — already present — into the subscriber).
+    "tracing-subscriber/json",
 ]
 
 [dev-dependencies]
@@ -223,4 +227,16 @@ required-features = ["server"]
 [[test]]
 name = "server_enrich"
 path = "tests/server_enrich.rs"
+required-features = ["server"]
+
+[[test]]
+name = "server_logs"
+path = "tests/server_logs.rs"
+required-features = ["server"]
+
+# Item 22, L2: correlation-id proof. Uses `tracing-subscriber`'s `json`
+# feature (server-only) to capture and assert the app/slow-query/audit join.
+[[test]]
+name = "logs_correlation"
+path = "tests/logs_correlation.rs"
 required-features = ["server"]

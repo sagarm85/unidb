@@ -64,7 +64,8 @@ Module map (what each layer became in code):
 | Secondary indexes (M2, M6, M7; all durable since Phase 3) | `btree_index.rs` (durable `DiskBTree`, also backs full-text + edge, and the per-table durable **free-space map / page directory** since the durable-FSM milestone), `disk_vector.rs` (durable IVF-Flat `DiskIvfIndex`), `fulltext.rs` (tokenizer), `vector.rs` (retired in-RAM HNSW baseline), `csr_index.rs` (retired) |
 | Graph (M3, M7) | `graph/{edges,index,logical,parser,executor}.rs` |
 | Event queue (M4) | `queue/{mod,payload}.rs` |
-| Server (M5, feature-gated; REST enrichment item 12) | `server/{engine_handle,error,dto,handlers,router,auth,sse,tls,txn_session,cursor}.rs`, `bin/unidb-server.rs` |
+| Server (M5, feature-gated; REST enrichment item 12; logs surface item 22) | `server/{engine_handle,error,dto,handlers,router,auth,sse,tls,txn_session,cursor,correlation,logs}.rs`, `bin/unidb-server.rs` |
+| Logs surface (item 22) | `server/correlation.rs` (request_id middleware + task-local), `server/logs.rs` (bounded reverse-seek `GET /logs`), `observability.rs` (default-build request_id thread-local read by `audit.rs`/slow-query) |
 | Autovacuum (A1–A4) | `autovacuum.rs` (background `std::thread` launcher: `Weak<Engine>`, threshold policy, clean-shutdown handle) |
 | Engine facade | `lib.rs` (`Engine` — the sole entry point) |
 | Attach client (M8, separate workspace crate) | `unidb-attach/src/lib.rs` (`AttachClient`, `AttachError`) |
@@ -844,6 +845,25 @@ per-user privileges + superuser gates are P6.e. SSE is
 is why subscriber cost scales badly (§11). TLS is native since P6.f
 (rustls, `UNIDB_TLS_CERT`/`KEY`).
 
+**Logs surface (item 22).** Server logging is **JSON lines** (both stdout and
+the rolling `unidb.log.*` files; `UNIDB_LOG_FORMAT=text` for a dev console).
+An outermost `assign_request_id` middleware (`server/correlation.rs`) stamps
+each request with a `request_id` — before auth, so even a rejected request is
+traceable — scopes it as a **tokio task-local**, enters an `http_request`
+`tracing` span, and echoes `x-request-id`. The critical detail is crossing the
+sync boundary: `EngineHandle`'s `spawn_blocking` choke points copy the
+task-local into an engine-core **thread-local** (`src/observability.rs`, a
+default-build `std`-only primitive — no new dep), which the synchronous
+slow-query log and `audit.log` read when they emit; `Engine::execute_sql` also
+wraps execution in a span carrying `txn_id`/`request_id`. That is how one
+request's lines join across the app log, slow-query log, and `audit.log` by a
+single id. `GET /logs` (`server/logs.rs`, superuser-gated) is a **bounded,
+cursor-paged reverse read** of those JSON files — page cap 500, per-request scan
+budget 50 000 lines, 64 KiB reverse block reads (a file is never loaded whole),
+filename+offset cursor — so it cannot OOM or stall on a multi-GB log directory.
+It is explicitly **not** a log store; a real deployment ships the JSON files to
+CloudWatch/Datadog (`docs/ops_runbook.md` §8).
+
 ---
 
 ## 9. Attach client (M8)
@@ -1439,4 +1459,15 @@ embed/attach/server. New reference doc `docs/engine_access_guide.md` (Applicatio
 Builder's Guide) stitches the access/query/type/error surface together; `GET
 /tables` is superseded-but-kept. See
 `docs/backlog/18_engine_access_contract.md` + `PROGRESS.md`.
+**Logs surface (2026-07-13, item 22, branch `22-logs-surface`):** server logging
+is now **JSON lines** (L1); a per-request `request_id` (+ `txn_id`) correlates
+the app log, slow-query log, and `audit.log` (L2) via a default-build
+`request_id` thread-local (`src/observability.rs`) that the server sets across
+its `spawn_blocking` boundary; superuser-gated `GET /logs` (L3, `server/logs.rs`)
+is a bounded, cursor-paged reverse read of the JSON files (page cap 500, scan
+budget 50 000, 64 KiB reverse blocks — no OOM/stall on a multi-GB dir). All
+server-feature-gated (`tracing-subscriber/json` under `server` only; no new
+default-build dep); no format change, harness stays 31. §8, §2 module map.
+`ops_runbook.md` §8 documents shipping the JSON files to CW/Datadog (L5). See
+`docs/backlog/22_logs_surface.md` + `PROGRESS.md`.
 Update alongside the next milestone's closeout.*

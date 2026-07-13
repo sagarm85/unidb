@@ -65,6 +65,7 @@ pub mod large_object;
 pub mod lockmgr;
 pub mod mmap;
 pub mod mvcc;
+pub mod observability;
 pub mod page;
 pub mod query_limits;
 pub mod queue;
@@ -792,14 +793,16 @@ impl Engine {
                 .and_then(|()| self.authz.apply(&stmt))
             {
                 Ok(()) => {
-                    self.audit.record_admin(user, action, &object, true);
+                    self.audit
+                        .record_admin(user, Some(xid), action, &object, true);
                     Ok(vec![ExecResult::Rows {
                         columns: Vec::new(),
                         rows: Vec::new(),
                     }])
                 }
                 Err(e) => {
-                    self.audit.record_admin(user, action, &object, false);
+                    self.audit
+                        .record_admin(user, Some(xid), action, &object, false);
                     Err(e)
                 }
             }
@@ -810,12 +813,17 @@ impl Engine {
                 if !self.is_effective_superuser(Some(u)) {
                     for plan in parse_sql(sql)? {
                         if let Err(e) = self.check_plan_privileges(u, &plan) {
-                            self.audit
-                                .record(Some(u), plan_audit_action(&plan), "", false);
+                            self.audit.record(
+                                Some(u),
+                                Some(xid),
+                                plan_audit_action(&plan),
+                                "",
+                                false,
+                            );
                             return Err(e);
                         }
                         self.audit
-                            .record(Some(u), plan_audit_action(&plan), "", true);
+                            .record(Some(u), Some(xid), plan_audit_action(&plan), "", true);
                     }
                 }
             }
@@ -903,6 +911,20 @@ impl Engine {
     /// rewrite before execution. Returns one result per statement. Wraps the
     /// executor with slow-query timing (P6.g).
     pub fn execute_sql(&self, xid: Xid, sql: &str) -> Result<Vec<ExecResult>> {
+        // Correlation span (item 22, L2): tag `txn_id` (and the server's
+        // `request_id`, if this call is being driven by an HTTP request) onto
+        // every log line the executor emits under it — including the slow-query
+        // warn in `note_query_time` — so an app-log line joins its slow-query
+        // and audit entries on one id. `request_id` is read from the per-thread
+        // correlation context the server sets on the blocking call; it is `None`
+        // for the embedded API, which just leaves the field off.
+        let request_id = crate::observability::current_request_id();
+        let span = tracing::info_span!(
+            "execute_sql",
+            txn_id = xid,
+            request_id = request_id.as_deref()
+        );
+        let _entered = span.enter();
         let start = Instant::now();
         let result = self.execute_sql_inner(xid, sql);
         self.note_query_time(sql, start.elapsed());
@@ -929,7 +951,17 @@ impl Engine {
         if micros < threshold {
             return;
         }
-        tracing::warn!(micros, threshold_us = threshold, "slow query");
+        // Emitted under the `execute_sql` correlation span, so this slow-query
+        // line already carries `txn_id`/`request_id` (item 22, L2). The `sql` is
+        // truncated to keep a pathological statement from bloating the log line.
+        let sql_excerpt: String = sql.chars().take(200).collect();
+        tracing::warn!(
+            target: "unidb::slow_query",
+            micros,
+            threshold_us = threshold,
+            sql = %sql_excerpt,
+            "slow query"
+        );
         let entry = SlowQuery {
             sql: sql.chars().take(500).collect(),
             micros,

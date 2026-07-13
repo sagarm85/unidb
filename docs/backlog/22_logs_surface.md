@@ -1,7 +1,10 @@
 # Logs surface — JSON structured logs, correlation ids, bounded /logs tail
 
 **Type:** Improvement
-**Status:** NOT STARTED
+**Status:** SHIPPED (2026-07-13) — branch `22-logs-surface`. L1–L3 + L5 landed;
+L4 (studio Logs tab) is out of this repo, noted only. Metrics + evidence in
+`PROGRESS.md` ("Logs surface — JSON structured logs, correlation ids, bounded
+/logs tail").
 
 > CloudWatch/Datadog-*like* local experience without rebuilding either: the
 > engine already logs structured `tracing` events (D13) plus `audit.log` and a

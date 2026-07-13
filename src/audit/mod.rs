@@ -38,6 +38,17 @@ struct AuditEvent<'a> {
     object: &'a str,
     /// Whether the action was permitted.
     allowed: bool,
+    /// The transaction id the statement ran under (item 22, L2). `None` for
+    /// auth DDL evaluated outside a data transaction. Correlates an audit line
+    /// with the app log's `txn_id` span field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    txn_id: Option<u64>,
+    /// The originating HTTP `request_id` (item 22, L2), read from the
+    /// per-thread correlation context the server sets on the blocking call.
+    /// Absent for the embedded API (no request). Lets a security review pull a
+    /// request's app-log, slow-query, and audit lines by one id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
 }
 
 /// Append-only audit trail. `Send + Sync` for the shared `Engine`.
@@ -58,29 +69,62 @@ impl AuditLog {
     }
 
     /// Record one access decision. `user == None` (the embedded superuser) is a
-    /// no-op — only named users and auth DDL are audited.
-    pub fn record(&self, user: Option<&str>, action: &str, object: &str, allowed: bool) {
+    /// no-op — only named users and auth DDL are audited. `txn_id` is the
+    /// transaction the statement ran under (item 22, L2).
+    pub fn record(
+        &self,
+        user: Option<&str>,
+        txn_id: Option<u64>,
+        action: &str,
+        object: &str,
+        allowed: bool,
+    ) {
         let Some(user) = user else { return };
-        self.write_event(user, action, object, allowed);
+        self.write_event(user, txn_id, action, object, allowed);
     }
 
     /// Record an auth-DDL event (always logged, even for the embedded superuser,
     /// since changing the authorization graph is itself security-relevant).
-    pub fn record_admin(&self, user: Option<&str>, action: &str, object: &str, allowed: bool) {
-        self.write_event(user.unwrap_or("<embedded>"), action, object, allowed);
+    pub fn record_admin(
+        &self,
+        user: Option<&str>,
+        txn_id: Option<u64>,
+        action: &str,
+        object: &str,
+        allowed: bool,
+    ) {
+        self.write_event(
+            user.unwrap_or("<embedded>"),
+            txn_id,
+            action,
+            object,
+            allowed,
+        );
     }
 
-    fn write_event(&self, user: &str, action: &str, object: &str, allowed: bool) {
+    fn write_event(
+        &self,
+        user: &str,
+        txn_id: Option<u64>,
+        action: &str,
+        object: &str,
+        allowed: bool,
+    ) {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_micros())
             .unwrap_or(0);
+        // Correlation id from the server's per-thread context (item 22, L2);
+        // `None` for the embedded API.
+        let request_id = crate::observability::current_request_id();
         let event = AuditEvent {
             ts,
             user,
             action,
             object,
             allowed,
+            txn_id,
+            request_id: request_id.clone(),
         };
         if let Ok(mut line) = serde_json::to_vec(&event) {
             line.push(b'\n');
@@ -92,6 +136,20 @@ impl AuditLog {
                 tracing::error!(error = %e, "audit log write failed");
             }
         }
+        // Also mirror the decision as a structured `tracing` event so it lands
+        // in the app log under the current request/txn span — the audit trail is
+        // then retrievable by `request_id` from the app log too, not only from
+        // `audit.log` (item 22, L2 correlation).
+        tracing::info!(
+            target: "unidb::audit",
+            user,
+            action,
+            object,
+            allowed,
+            txn_id,
+            request_id = request_id.as_deref(),
+            "audit event"
+        );
     }
 }
 
@@ -110,15 +168,19 @@ mod tests {
     fn records_named_users_not_embedded() {
         let dir = tempdir().unwrap();
         let audit = AuditLog::open(dir.path()).unwrap();
-        audit.record(Some("bob"), "select", "accounts", true);
-        audit.record(Some("bob"), "insert", "accounts", false);
-        audit.record(None, "select", "accounts", true); // embedded → skipped
-        audit.record_admin(None, "create_user", "carol", true); // admin → logged
+        audit.record(Some("bob"), Some(7), "select", "accounts", true);
+        audit.record(Some("bob"), Some(7), "insert", "accounts", false);
+        audit.record(None, Some(7), "select", "accounts", true); // embedded → skipped
+        audit.record_admin(None, None, "create_user", "carol", true); // admin → logged
 
         let contents = std::fs::read_to_string(dir.path().join("audit.log")).unwrap();
         let lines: Vec<&str> = contents.lines().collect();
         assert_eq!(lines.len(), 3, "embedded read is not audited; the rest are");
         assert!(lines[0].contains("\"user\":\"bob\"") && lines[0].contains("\"allowed\":true"));
+        assert!(
+            lines[0].contains("\"txn_id\":7"),
+            "txn_id correlation is written"
+        );
         assert!(lines[1].contains("\"allowed\":false"));
         assert!(lines[2].contains("create_user") && lines[2].contains("<embedded>"));
     }
@@ -128,10 +190,10 @@ mod tests {
         let dir = tempdir().unwrap();
         {
             let a = AuditLog::open(dir.path()).unwrap();
-            a.record(Some("x"), "select", "t", true);
+            a.record(Some("x"), Some(1), "select", "t", true);
         }
         let a = AuditLog::open(dir.path()).unwrap();
-        a.record(Some("y"), "delete", "t", true);
+        a.record(Some("y"), Some(2), "delete", "t", true);
         let contents = std::fs::read_to_string(dir.path().join("audit.log")).unwrap();
         assert_eq!(contents.lines().count(), 2);
     }

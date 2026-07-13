@@ -35,7 +35,7 @@
 | 19 | `19_sql_surface_gaps.md` | Improvement | ⏳ NOT STARTED |
 | 20 | `20_events_realtime_dispatcher.md` | Milestone | ⏳ NOT STARTED |
 | 21 | `21_observability_metrics.md` | Improvement | ⏳ NOT STARTED |
-| 22 | `22_logs_surface.md` | Improvement | ⏳ NOT STARTED |
+| 22 | `22_logs_surface.md` | Improvement | ✅ SHIPPED (PROGRESS: Logs surface — JSON structured logs, correlation ids, bounded /logs tail) |
 | 23 | `23_storage_service.md` | Milestone | ⏳ NOT STARTED |
 | 24 | `24_authz_v2_policies.md` | Milestone | ⏳ NOT STARTED |
 
