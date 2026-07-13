@@ -633,6 +633,15 @@ fn convert_query(q: ast::Query) -> Result<LogicalPlan> {
     let projection_has_agg = select.projection.iter().any(select_item_has_aggregate);
     let has_subquery = select.selection.as_ref().is_some_and(expr_has_subquery)
         || select.projection.iter().any(select_item_has_subquery);
+    // Milestone 18, Epic C: a SELECT over an `information_schema.*` /
+    // `unidb_catalog.*` virtual relation is routed through the Phase-4 query
+    // path so a single, virtual-scan-aware executor serves it — the row-at-a-time
+    // `LogicalPlan::Select` path has no notion of synthesized relations.
+    let from_is_introspection = select.from.first().is_some_and(|t| {
+        table_name_from_relation(&t.relation)
+            .map(|n| crate::sql::information_schema::is_virtual_relation(&n))
+            .unwrap_or(false)
+    });
     let needs_query = has_join
         || group_by_present
         || select.having.is_some()
@@ -641,7 +650,8 @@ fn convert_query(q: ast::Query) -> Result<LogicalPlan> {
         || limit_clause.is_some()
         || with.is_some()
         || projection_has_agg
-        || has_subquery;
+        || has_subquery
+        || from_is_introspection;
     if needs_query {
         return convert_query_spec(select, with, order_by, limit_clause);
     }

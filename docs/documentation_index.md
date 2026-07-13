@@ -4,6 +4,13 @@
   (`engine_design.md`), distilling `CLAUDE.md`/`MEMORY.md`/`PROGRESS.md`
   into one readable document. Kept current milestone-by-milestone; when it
   disagrees with `CLAUDE.md`/`PROGRESS.md`, those win.
+- [engine_access_guide.md](engine_access_guide.md) — **the Application
+  Builder's Guide** (Milestone 18): one task-oriented document for building an
+  app *on* the engine — connect (embed/attach/server) → query (the SQL surface
+  + the honest not-supported list) → bind `$n` params → introspect via the
+  `information_schema.*` / `unidb_catalog.*` system catalog → map types → page →
+  handle errors, plus a "schema explorer in 30 lines" recipe. Start here to
+  build around unidb "like Postgres."
 - [REST_API.md](REST_API.md) — full HTTP route reference for the optional
   `unidb-server` binary (M5): every route's payload and response shape,
   auth model, error codes, and known limitations. Also documents the

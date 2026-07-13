@@ -549,6 +549,27 @@ pub(crate) fn plan_from(node: &FromNode, catalog: &Catalog, ctes: &CteSchemas) -
                     output,
                 });
             }
+            // Milestone 18, Epic C: an `information_schema.*` / `unidb_catalog.*`
+            // reference resolves to a synthesized virtual relation, not a base
+            // table. Its fixed schema comes from the introspection module; the
+            // rows are materialized from the catalog at scan time
+            // (`query_exec::Runner::scan`). The table name is preserved on the
+            // `Scan` node so the runner can dispatch on it.
+            if let Some(vcols) = crate::sql::information_schema::virtual_schema(&tref.table) {
+                let output = vcols
+                    .into_iter()
+                    .map(|c| ColumnRef {
+                        qualifier: qualifier.clone(),
+                        name: c.name,
+                        ty: c.ty,
+                    })
+                    .collect();
+                return Ok(PlanNode::Scan {
+                    table: tref.table.clone(),
+                    qualifier,
+                    output,
+                });
+            }
             let def = catalog.lookup(&tref.table)?;
             let output = def
                 .columns

@@ -87,3 +87,36 @@ async fn multi_statement_body_is_atomic_failing_statement_rolls_back_row_data() 
         "the INSERT from the aborted multi-statement request must not be visible"
     );
 }
+
+// ── Milestone 18, Epic C: catalog introspection over the server /sql route ──
+// Parity landmine (spec #3): the same `information_schema.*` query must work
+// over the HTTP `/sql` route, not only embed/attach. `columns` (D1) also
+// carries the output column names, proving a grid can render without a second
+// call.
+#[tokio::test]
+async fn information_schema_over_sql_route() {
+    let server = TestServer::spawn().await;
+    post_sql(
+        &server,
+        "CREATE TABLE orders (region TEXT NOT NULL, order_no INT NOT NULL, \
+         PRIMARY KEY (region, order_no))",
+    )
+    .await;
+
+    let (status, body) = post_sql(
+        &server,
+        "SELECT constraint_name, constraint_type FROM information_schema.table_constraints \
+         WHERE table_name = 'orders'",
+    )
+    .await;
+    assert_eq!(status, 200);
+    // D1: result carries column metadata (names).
+    assert_eq!(
+        body["results"][0]["columns"],
+        serde_json::json!(["constraint_name", "constraint_type"])
+    );
+    assert_eq!(
+        body["results"][0]["rows"],
+        serde_json::json!([["orders_pkey", "PRIMARY KEY"]])
+    );
+}
