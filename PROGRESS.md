@@ -4097,3 +4097,91 @@ server -D warnings` clean; `fmt` clean; concurrency matrix **28/28 @
 
 **Locked-decision changes:** none. No format change, no crash-point change, no §3
 decision reopened. This closes item 11's filed follow-up.
+
+---
+
+## Engine access & introspection contract (Milestone 18)   [SHIPPED]   2026-07-13
+
+**PR:** _pending (branch `18-engine-access-contract-impl`)_
+**Backlog:** `docs/backlog/18_engine_access_contract.md` (spec + dated design note).
+
+**Summary:** unidb is an *engine* — it must expose a documented access + query +
+**introspection** surface an application builds on, not app-shaped REST
+resources. The forcing function was the `unidb-studio` console (schema
+visualizer/ERD, DDL viewer), which previously had to *infer* table relationships
+from column-name heuristics because only a flat `GET /tables` existed. This
+milestone delivers the fix as a **SQL-queryable system catalog** — Postgres's
+lever, not more endpoints.
+
+**Epic C (core — the only real engine work):** the system catalog is now
+queryable as **synthesized virtual relations** over the ordinary SQL surface:
+`information_schema.{tables, columns, table_constraints, key_column_usage,
+referential_constraints}` (C1–C3) + `unidb_catalog.indexes` (C4), in
+`src/sql/information_schema.rs`. They are resolved at plan time (`sql/plan.rs`
+supplies the fixed schema for the reserved names) and materialized from the live
+in-memory catalog at scan time (`sql/query_exec.rs::Runner::scan`) — **always
+current, zero storage, no vacuum/MVCC interaction, no crash surface** (harness
+stays **31**). A SELECT over an introspection relation is forced onto the Phase-4
+query path in the parser so one virtual-scan implementation serves both
+single-table and multi-way-JOIN queries; the `COUNT(*)` parallel fast paths are
+guarded so they never `Heap::open` a virtual relation.
+
+This is **pure read-side projection**: FK / PK / UNIQUE / CHECK all already parse
+and persist on the catalog (M11), so there is **no catalog schema change, no
+`FORMAT_VERSION` bump, no new persisted field**. Constraint names are synthesized
+Postgres-style (`<table>_pkey`/`_key`/`_fkey`/`_check`), stable across reopens.
+C5 (object DDL) is satisfied by its documented-reconstruction AC branch — the
+guide specifies how to rebuild canonical DDL from C1–C4 (unidb does not retain
+`CREATE` text; there is no table-function syntax).
+
+**Epics A/B/D/E (documentation of the existing surface):** new
+`docs/engine_access_guide.md` — the Application Builder's Guide — stitches the
+surface into one task-oriented document: connect (A1 access-token URL / DSN /
+Bearer, embed·attach·server; A2 session vs one-shot) → query (B1 SQL surface +
+the honest not-supported list) → bind `$n` params (B2) → introspect (Epic C
+recipes + C5 reconstruction rules) → results/types/paging (D1 column metadata,
+B3 type↔JSON mapping table, D2 cursors) → errors (B4). Includes the **"schema
+explorer in 30 lines"** recipe using only the documented surface. Linked from
+`documentation_index.md`.
+
+**Honesty notes recorded in-doc (not silently smoothed over):**
+- `JOIN … USING` / `NATURAL JOIN` are not in the SQL surface — the worked-example
+  ERD query is written in the equivalent explicit-`ON` form (with the
+  `ordinal_position = position_in_unique_constraint` conjunct that composite-key
+  alignment needs). This is a syntax gap, not a virtual-relation-join gap; listed
+  under B1 not-supported + a dated note in the spec's design note (landmine 1a).
+- FK is metadata-only (M11 enforces referenced-*table* existence, not
+  referenced-*row*; `update_rule`/`delete_rule` report `NO ACTION`,
+  `match_option` `NONE`). Row-level FK enforcement remains a filed follow-up.
+- No `unidb://user:token@host/db` DSN is parsed — attach takes base URL + JWT
+  separately; auth is `Authorization: Bearer` only (no `?token=`); one database
+  per server. Documented as-is.
+
+**Parity (spec landmine 3 — proven, not glued):** the catalog is reachable
+identically from **embed** (`tests/information_schema.rs`), **attach**
+(`unidb-attach/tests/attach_sql.rs::information_schema_fk_join_over_attach`), and
+the **server `/sql` route** (`tests/server_sql.rs::information_schema_over_sql_route`)
+— all three funnel through the same executor. The differential test runs the
+worked-example 4-way ERD join over a **composite** PK/FK schema and asserts the
+FK columns pair to their referents correctly, and that it survives reopen.
+
+**Metrics:** none headlined — this milestone adds a documentation + read-side
+introspection surface, not a throughput/latency change. The catalog relations
+are computed from the in-memory catalog (no heap scan), so they are cheap by
+construction; no benchmark table applies (§6). The executor grew one routing
+branch; the concurrency matrix was re-run as a no-regression check (28/28 @
+default repeats).
+
+**Green:** `cargo test -p unidb` (default + `--features server`) pass; crash
+harness **31/31** (unchanged — read-only relations, no storage); `cargo test
+--workspace --features server` pass; `clippy --all-targets --features server -D
+warnings` clean; `fmt` clean.
+
+**Locked-decision changes:** none. No format change, no crash-point change, no §3
+decision reopened.
+
+**Acceptance:** Must set (A1, B1, B2, B3, C1, C2, C3, D1, E1) + cheap Should
+items (A2, B4, C4, C5, D2) complete. The `unidb-studio` schema-visualizer
+switchover box stays **unticked** in the spec — it closes from the studio repo;
+the engine surface it needs is complete and proven by the differential + parity
+tests.

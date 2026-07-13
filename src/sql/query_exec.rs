@@ -246,32 +246,34 @@ impl Runner<'_, '_> {
                         .all(|a| matches!(a.func, AggFunc::Count) && a.arg.is_none() && !a.distinct)
                 {
                     if let PlanNode::Scan { table, .. } = input.as_ref() {
-                        let table_def = self.ctx.catalog.lookup(table)?.clone();
-                        let heap = Heap::open(
-                            self.ctx.page_size,
-                            table_def.fsm_meta,
-                            table_def.pages.clone(),
-                        );
-                        // P-a: parallelize the count across worker threads when
-                        // the table is large enough (else the serial header scan).
-                        let pages = heap.scan_pages(self.ctx.pool)?;
-                        let count = match crate::sql::parallel_scan::acquire(pages.len()) {
-                            Some(lease) => crate::sql::parallel_scan::parallel_count(
-                                &pages,
-                                &self.ctx.pool.shared_reader(),
-                                &self.snapshot,
-                                self.ctx.xid,
-                                lease.degree(),
-                            )?,
-                            None => {
-                                heap.count_visible(&self.snapshot, self.ctx.xid, self.ctx.pool)?
-                            }
-                        };
-                        let row = vec![Literal::Int(count as i64); aggs.len()];
-                        return Ok(Batch {
-                            schema: output.clone(),
-                            rows: vec![row],
-                        });
+                        if !crate::sql::information_schema::is_virtual_relation(table) {
+                            let table_def = self.ctx.catalog.lookup(table)?.clone();
+                            let heap = Heap::open(
+                                self.ctx.page_size,
+                                table_def.fsm_meta,
+                                table_def.pages.clone(),
+                            );
+                            // P-a: parallelize the count across worker threads when
+                            // the table is large enough (else the serial header scan).
+                            let pages = heap.scan_pages(self.ctx.pool)?;
+                            let count = match crate::sql::parallel_scan::acquire(pages.len()) {
+                                Some(lease) => crate::sql::parallel_scan::parallel_count(
+                                    &pages,
+                                    &self.ctx.pool.shared_reader(),
+                                    &self.snapshot,
+                                    self.ctx.xid,
+                                    lease.degree(),
+                                )?,
+                                None => {
+                                    heap.count_visible(&self.snapshot, self.ctx.xid, self.ctx.pool)?
+                                }
+                            };
+                            let row = vec![Literal::Int(count as i64); aggs.len()];
+                            return Ok(Batch {
+                                schema: output.clone(),
+                                rows: vec![row],
+                            });
+                        }
                     }
 
                     // Partial aggregate: `COUNT(*)` over a `Filter` (subquery-free
@@ -291,7 +293,9 @@ impl Runner<'_, '_> {
                             ..
                         } = filter_input.as_ref()
                         {
-                            if !predicate.has_subquery() {
+                            if !predicate.has_subquery()
+                                && !crate::sql::information_schema::is_virtual_relation(table)
+                            {
                                 let table_def = self.ctx.catalog.lookup(table)?.clone();
                                 let heap = Heap::open(
                                     self.ctx.page_size,
@@ -387,6 +391,16 @@ impl Runner<'_, '_> {
     }
 
     fn scan(&mut self, table: &str, output: &[ColumnRef]) -> Result<Batch> {
+        // Milestone 18, Epic C: a virtual `information_schema.*` / `unidb_catalog.*`
+        // relation has no heap — its rows are synthesized from the live catalog.
+        // (Row order matches the `virtual_schema` used to build `output`.)
+        if crate::sql::information_schema::is_virtual_relation(table) {
+            let rows = crate::sql::information_schema::virtual_rows(table, self.ctx.catalog.get())?;
+            return Ok(Batch {
+                schema: output.to_vec(),
+                rows,
+            });
+        }
         let table_def = self.ctx.catalog.lookup(table)?.clone();
         let heap = Heap::open(
             self.ctx.page_size,

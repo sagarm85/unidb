@@ -31,7 +31,7 @@
 | 15 | `15_parallel_worker_governance.md` | Improvement | ✅ SHIPPED (PROGRESS: Parallel worker governance) |
 | 16 | `16_concurrent_sql_writes_visibility_anomaly.md` | Improvement | ✅ SHIPPED (PROGRESS: MVCC visibility anomaly under concurrent SQL writes) |
 | 17 | `17_mm_replaced_stack_headline.md` | Performance | ✅ SHIPPED (PROGRESS: Cross-domain headline vs replaced stack) |
-| 18 | `18_engine_access_contract.md` | Milestone | ⏳ NOT STARTED |
+| 18 | `18_engine_access_contract.md` | Milestone | ✅ SHIPPED (PROGRESS: Engine access & introspection contract (Milestone 18)) |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
@@ -42,12 +42,15 @@ Ordered by my current ROI read; reorder as priorities change. Create each
 candidate's `NN_<slug>.md` when started — until then each is *filed inside* an
 existing doc.
 
-0. **Item 18 — Engine access & introspection contract (`18_engine_access_contract.md`,
-   already filed, NOT STARTED).** Application-driven: the `unidb-studio` console
-   needs real PK/FK/DDL introspection. Deliver it as an `information_schema`-style
-   **queryable catalog** + a documented access/query/type surface — *not* as new
-   app REST endpoints. Core is Epic C (catalog relations for PK/FK/indexes/DDL).
-   High ROI: unblocks any tool built on the engine, studio first.
+0. **Item 18 — Engine access & introspection contract — ✅ SHIPPED 2026-07-13**
+   (branch `18-engine-access-contract-impl`). Delivered the `information_schema`-
+   style **queryable catalog** (`information_schema.{tables,columns,
+   table_constraints,key_column_usage,referential_constraints}` +
+   `unidb_catalog.indexes`) as synthesized virtual relations SELECTable over the
+   normal query surface — no app REST endpoints — plus the Application Builder's
+   Guide (`docs/engine_access_guide.md`) stitching the access/query/type/error
+   surface together. Pure read-side projection over metadata that already
+   parses+persists (M11); no format bump. Metrics/closeout in `PROGRESS.md`.
 
 1. **Item 11 `UNIDB_CONCURRENT_SQL_WRITES` default-ON flip — ✅ SHIPPED
    2026-07-13** (branch `11-concurrent-writes-default-on`). Item 16 (below)

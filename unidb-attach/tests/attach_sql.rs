@@ -125,3 +125,73 @@ fn execute_cypher_returns_matching_edges() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0], serde_json::json!(20), "to_id must be 20");
 }
+
+// ── Milestone 18, Epic C: catalog introspection reachable over attach ───────
+// Parity landmine (spec #3): the `information_schema.*` catalog must be
+// queryable identically from embed, attach, and server. This test drives it
+// over the **attach → server /sql** path (both non-embed access paths at once)
+// and asserts the same worked-example FK pairing the embed test asserts.
+
+#[test]
+fn information_schema_fk_join_over_attach() {
+    let server = TestServer::spawn();
+    let c = client(&server);
+
+    c.execute_sql(
+        "CREATE TABLE orders (region TEXT NOT NULL, order_no INT NOT NULL, \
+         customer TEXT, PRIMARY KEY (region, order_no))",
+    )
+    .unwrap();
+    c.execute_sql(
+        "CREATE TABLE line_items (id INT PRIMARY KEY, o_region TEXT, o_order_no INT, \
+         FOREIGN KEY (o_region, o_order_no) REFERENCES orders (region, order_no))",
+    )
+    .unwrap();
+
+    // tables relation lists user tables.
+    let r = c
+        .execute_sql("SELECT table_name FROM information_schema.tables")
+        .unwrap();
+    let ExecResult::Rows { rows, .. } = &r[0] else {
+        panic!("expected Rows");
+    };
+    let names: Vec<&str> = rows.iter().map(|row| row[0].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["line_items", "orders"]);
+
+    // The worked-example ERD FK join (explicit-ON form) over composite keys.
+    let r = c
+        .execute_sql(
+            "SELECT kcu.column_name AS from_col, ccu.column_name AS to_col \
+             FROM information_schema.table_constraints tc \
+             JOIN information_schema.key_column_usage kcu \
+                  ON kcu.constraint_name = tc.constraint_name \
+             JOIN information_schema.referential_constraints rc \
+                  ON rc.constraint_name = tc.constraint_name \
+             JOIN information_schema.key_column_usage ccu \
+                  ON ccu.constraint_name = rc.unique_constraint_name \
+                 AND ccu.ordinal_position = kcu.position_in_unique_constraint \
+             WHERE tc.constraint_type = 'FOREIGN KEY'",
+        )
+        .unwrap();
+    let ExecResult::Rows { rows, .. } = &r[0] else {
+        panic!("expected Rows");
+    };
+    let mut pairs: Vec<(String, String)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row[0].as_str().unwrap().to_string(),
+                row[1].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    pairs.sort();
+    assert_eq!(
+        pairs,
+        vec![
+            ("o_order_no".to_string(), "order_no".to_string()),
+            ("o_region".to_string(), "region".to_string()),
+        ],
+        "composite FK columns paired to referents, identically over attach"
+    );
+}
