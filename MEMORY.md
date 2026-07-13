@@ -13,7 +13,7 @@
 ## Current status
 
 - **Replication time-PITR + logical replication (backlog item 28) — SHIPPED
-  2026-07-13, branch `28-replication-time-pitr`, PR pending (STOP-for-review).**
+  2026-07-13, branch `28-replication-time-pitr`, PR #70 pending (STOP-for-review).**
   R1 (MUST): `src/backup/timeline.rs` — `TimelineIndex` appends one 16-byte
   `(ts_micros, lsn)` mark per user-txn commit after WAL sync. WAL format
   unchanged (no FORMAT_VERSION bump, no §3/D9 sign-off). `backup::restore_to_time`
