@@ -351,27 +351,65 @@ fn flush_index_batches(batches: &[IndexColBatch], ctx: &mut ExecCtx) -> Result<(
 /// statement row, "zero cost if not opted in": this write is synchronous and
 /// durable, since the event must commit atomically with the triggering write
 /// (see queue/mod.rs's module doc for why a WAL-tailing design was rejected).
+/// C1 (item 29): build and store the canonical CDC envelope for one DML event.
+///
+/// `before` = pre-mutation image (None for INSERT).
+/// `after`  = post-mutation image (None for DELETE).
+///
+/// **Back-compat**: `payload` in the stored JSON equals `after` (INSERT/UPDATE)
+/// or `before` (DELETE) — the same flat row object existing consumers read from
+/// `event.payload["col"]`. The new `before`/`after` fields are additive.
+/// Old events that predate item 29 store only the flat row; `resolve_event_candidates`
+/// detects the absence of a `"payload"` key and falls back transparently.
 fn send_event_capture(
     table_def: &TableDef,
     op: &str,
-    row: &[Literal],
+    before: Option<&[Literal]>,
+    after: Option<&[Literal]>,
     ctx: &mut ExecCtx,
 ) -> Result<()> {
     if !table_def.events_enabled {
         return Ok(());
     }
-    let payload = queue::payload::row_to_json(row, &table_def.columns);
+    let before_json = before.map(|r| queue::payload::row_to_json(r, &table_def.columns));
+    let after_json = after.map(|r| queue::payload::row_to_json(r, &table_def.columns));
+    // Back-compat payload = after for INSERT/UPDATE, before for DELETE.
+    let compat_payload = after_json
+        .as_ref()
+        .or(before_json.as_ref())
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
     let events_def = ctx.catalog.lookup(EVENTS_TABLE)?.clone();
     let heap = Heap::open(ctx.page_size, events_def.fsm_meta, events_def.pages.clone());
 
     let seq = ctx.next_event_seq.fetch_add(1, Ordering::SeqCst);
 
+    // Canonical envelope stored in the payload JSON column (item 29, C1).
+    // "payload" = back-compat flat row; "before"/"after"/"ts_ms"/"source" are new.
+    // Consumers reading event.payload["col"] see the same flat object as before.
+    let envelope = serde_json::json!({
+        "payload": compat_payload,
+        "before": before_json,
+        "after": after_json,
+        "ts_ms": ts_ms,
+        "source": {
+            "seq": seq,
+            "txId": ctx.xid,
+            "table": table_def.name,
+            "schema": "public"
+        }
+    });
     let encoded = encode_row(&queue::event_row(
         seq as i64,
         ctx.xid as i64,
         &table_def.name,
         op,
-        &payload,
+        &envelope,
     ));
     let row_id = heap.insert(&encoded, ctx.xid, ctx.pool, ctx.wal)?;
     ctx.txn_mgr.record_undo(
@@ -789,7 +827,8 @@ fn exec_insert(
             },
         )?;
         apply_durable_index_writes(&table_def, row_id, &coerced, ctx)?;
-        send_event_capture(&table_def, "insert", &coerced, ctx)?;
+        // C1 (item 29): INSERT has after-only; no pre-image.
+        send_event_capture(&table_def, "insert", None, Some(&coerced), ctx)?;
         count += 1;
     }
 
@@ -1266,6 +1305,8 @@ fn exec_update(
     let has_unique = !unique_column_sets(&table_def)?.is_empty();
     let mut count = 0;
     for (row_id, mut row) in matching {
+        // C1 (item 29): snapshot the pre-mutation image before set_column overwrites it.
+        let before_row = row.clone();
         for (col, expr) in assignments {
             let new_val = eval_expr(expr, &table_def.columns, &row)?;
             set_column(&table_def.columns, &mut row, col, new_val)?;
@@ -1314,7 +1355,8 @@ fn exec_update(
             },
         )?;
         stage_row_index_writes(&table_def, new_row_id, &coerced, &mut index_batches, ctx)?;
-        send_event_capture(&table_def, "update", &coerced, ctx)?;
+        // C1 (item 29): UPDATE carries both before (pre-mutation) and after (post-mutation).
+        send_event_capture(&table_def, "update", Some(&before_row), Some(&coerced), ctx)?;
         count += 1;
     }
     // Coalesced index maintenance for the whole statement (A1).
@@ -1337,9 +1379,9 @@ fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Resu
 
     let mut count = 0;
     for (row_id, row) in matching {
-        // Captured before `heap.delete` runs — once the row is deleted
-        // there is nothing left to build a payload from.
-        send_event_capture(&table_def, "delete", &row, ctx)?;
+        // C1 (item 29): DELETE carries before-only; captured before heap.delete
+        // runs — once deleted there is nothing left to build a payload from.
+        send_event_capture(&table_def, "delete", Some(&row), None, ctx)?;
         if let Err(e @ DbError::WriteConflict { .. }) =
             heap.delete(row_id, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr)
         {

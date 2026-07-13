@@ -190,6 +190,9 @@ mod tests {
             table_name: "t".into(),
             op: "insert".into(),
             payload: serde_json::json!({"id": seq}),
+            before: None,
+            after: None,
+            ts_ms: 0,
         }
     }
 

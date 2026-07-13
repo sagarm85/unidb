@@ -395,7 +395,20 @@ impl Runner<'_, '_> {
         // relation has no heap — its rows are synthesized from the live catalog.
         // (Row order matches the `virtual_schema` used to build `output`.)
         if crate::sql::information_schema::is_virtual_relation(table) {
-            let rows = crate::sql::information_schema::virtual_rows(table, self.ctx.catalog.get())?;
+            // C3 (item 29): subscription_lag reads __consumers__ + __events__ heaps
+            // and needs pool + snapshot — handled separately from the catalog-only path.
+            let rows = if table.eq_ignore_ascii_case("unidb_catalog.subscription_lag") {
+                crate::sql::information_schema::subscription_lag_rows(
+                    self.ctx.catalog.get(),
+                    self.ctx.pool,
+                    self.ctx.page_size,
+                    &self.snapshot,
+                    self.ctx.xid,
+                    self.ctx.event_seq_index_meta,
+                )?
+            } else {
+                crate::sql::information_schema::virtual_rows(table, self.ctx.catalog.get())?
+            };
             return Ok(Batch {
                 schema: output.to_vec(),
                 rows,

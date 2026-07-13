@@ -66,6 +66,14 @@ pub struct SubscribeParams {
     pub limit: usize,
     #[serde(default = "default_interval_ms")]
     pub interval_ms: u64,
+    /// C2 (item 29): wire format. `"native"` (default) = full Event JSON;
+    /// `"debezium"` = Debezium envelope; `"supabase"` = Supabase Realtime shape.
+    #[serde(default = "default_format")]
+    pub format: String,
+}
+
+fn default_format() -> String {
+    "native".into()
 }
 
 fn default_limit() -> usize {
@@ -146,7 +154,9 @@ pub async fn get_events_subscribe(
                     cursor = cursor.max(seq);
                 }
                 let op = event.op.clone();
-                let payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".into());
+                // C2 (item 29): serialize in the requested format.
+                let payload =
+                    crate::server::event_format::format_event(&event, &params.format);
                 yield Ok(SseEvent::default().id(seq.to_string()).event(op).data(payload));
             }
         }

@@ -39,7 +39,21 @@ pub struct Event {
     pub xid: i64,
     pub table_name: String,
     pub op: String,
+    /// Back-compat flat row image: post-image for INSERT/UPDATE, pre-image
+    /// for DELETE. Consumers reading `event.payload["col"]` continue to work.
+    /// New consumers should prefer `event.before`/`event.after`.
     pub payload: serde_json::Value,
+    /// Pre-mutation row image. `None` for INSERT; present for UPDATE/DELETE.
+    /// (item 29, C1)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<serde_json::Value>,
+    /// Post-mutation row image. `None` for DELETE; present for INSERT/UPDATE.
+    /// (item 29, C1)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<serde_json::Value>,
+    /// Capture wall-clock, Unix epoch milliseconds.
+    /// 0 for events written before item 29 was deployed.
+    pub ts_ms: i64,
 }
 
 pub fn events_table_def() -> TableDef {

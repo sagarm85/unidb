@@ -1,7 +1,7 @@
 # Subscription CDC — canonical envelope (before/after), format adapters, lag observability
 
 **Type:** Improvement
-**Status:** NOT STARTED
+**Status:** SHIPPED (2026-07-13, branch `29-subscription-cdc`, PROGRESS: Subscription CDC — item 29)
 
 > **V1 of "Supabase-Realtime-grade table subscription."** The subscription
 > *mechanism* already ships (items 20 + 26): `enable_events(table)` captures CRUD
@@ -83,16 +83,16 @@
 - Not `source.lsn` if it needs commit-time capture wiring (follow-up).
 
 ## Acceptance
-- [ ] UPDATE event carries correct `before` AND `after`; INSERT after-only;
+- [x] UPDATE event carries correct `before` AND `after`; INSERT after-only;
       DELETE before-only — unit + a round-trip test.
-- [ ] `format=debezium` and `format=supabase` frames match documented shapes for
+- [x] `format=debezium` and `format=supabase` frames match documented shapes for
       all three ops; `format=native` default; existing flat consumers unbroken
       (item-20 dispatch tests green).
-- [ ] `SELECT * FROM unidb_catalog.subscription_lag` returns correct
+- [x] `SELECT * FROM unidb_catalog.subscription_lag` returns correct
       `lag_events`/`lag_seconds` for a consumer deliberately held behind;
       `/stats` gauge matches.
-- [ ] Crash harness unchanged (no format/recovery change); clippy/fmt; workspace.
-- [ ] Guide §8 documents the contract + formats + lag detection.
+- [x] Crash harness unchanged (no format/recovery change); clippy/fmt; workspace.
+- [x] Guide §8 documents the contract + formats + lag detection.
 
 ## Depends on / builds on
 - Item 20 (dispatcher, offsets, DLQ), item 26 (seq index, push, retention

@@ -4769,3 +4769,74 @@ resolution falls back to previous valid mark, database integrity unaffected).
 | PITR resolution = per-commit mark granularity | Documented in ops_runbook §9 |
 
 **Locked-decision changes:** none. No `FORMAT_VERSION` bump (side timeline file, not WAL). No §3 decision reopened. Crash point P32 added (D7 extension, not a §3 re-open). Moat framing respected — both R1 and R2 are app-layer; the engine core sees only a 16-byte timeline append per commit and the existing event API.
+
+## Subscription CDC — canonical envelope, before/after, format adapters, lag observability (item 29)   [SHIPPED]   2026-07-13
+
+**PR:** pending (branch `29-subscription-cdc`, STOP-for-review, do not merge)
+**Spec:** `docs/backlog/29_subscription_cdc_envelope_lag.md` (C1/C2/C3/C4 shipped)
+
+**Summary:** Closes the payload+observability gaps between unidb's subscription
+stream and Debezium/Supabase parity. Adds `before`/`after`/`ts_ms` row images
+to every CDC event (C1); canonical native envelope with Debezium and Supabase
+format adapters on `GET /events/subscribe?format=` (C2); per-consumer lag as a
+virtual relation (`unidb_catalog.subscription_lag`), `/stats` JSON gauges, and
+Prometheus metrics (C3); and guide §8 updated with the subscription contract,
+three format examples, and lag detection guidance (C4). Back-compat: the flat
+`payload` field is preserved inside the canonical envelope for existing consumers;
+old events (pre-item-29) lacking the "payload" key are read transparently.
+
+**Benchmarks / throughput:** no new heap path; CDC capture is bounded by the
+same INSERT/UPDATE/DELETE throughput measured in previous milestones (item 27:
+throttled vacuum, item 26: seq-index push). The lag query (`subscription_lag`)
+uses `DiskBTree::max_entry()` (O(log n)) for max-seq and a single 1-row range
+scan per consumer for oldest unconsumed ts_ms — negligible overhead vs a full
+table scan. No regression observed in full `cargo test --workspace` run.
+
+**Crash harness:** 33/33 — unchanged. Item 29 adds no WAL record types and
+no format bump; the event row's fate is unchanged by the envelope enrichment.
+
+**What changed:**
+- `src/queue/mod.rs`: `Event` gained `before: Option<Value>`, `after: Option<Value>`,
+  `ts_ms: i64` fields (skip-if-none serialisation for back-compat).
+- `src/sql/executor.rs`: `send_event_capture` signature → `(table_def, op,
+  before: Option<&[Literal]>, after: Option<&[Literal]>, ctx)`. Stores canonical
+  envelope JSON in `__events__.payload`. UPDATE now clones `before_row` prior to
+  `set_column`; INSERT passes `(None, Some(&coerced))`; DELETE passes `(Some(&row), None)`.
+- `src/lib.rs`: added `SubscriptionLagEntry` struct; added `subscription_lag:
+  Vec<SubscriptionLagEntry>` to `EngineStats`; added `subscription_lag_stats()`
+  (uses `read_snapshot`, `DiskBTree::max_entry`, `search_range_limit`); updated
+  `resolve_event_candidates` to decode new canonical envelope vs old flat format;
+  updated 3 existing CDC tests; added 3 new tests (C1 before/after per op,
+  C3 virtual relation, C3 `/stats` gauge match).
+- `src/sql/information_schema.rs`: added `unidb_catalog.subscription_lag` to
+  `RELATIONS`; added `virtual_schema()` branch; added `subscription_lag_rows()`.
+- `src/sql/query_exec.rs`: special-case `unidb_catalog.subscription_lag` in
+  `scan()` to call `subscription_lag_rows` with pool+snapshot context.
+- `src/server/event_format.rs`: NEW — `format_event(event, format)` dispatching
+  to `format_debezium` / `format_supabase` / native; 7 unit tests.
+- `src/server/mod.rs`: `pub mod event_format`.
+- `src/server/sse.rs`: `SubscribeParams.format` field (`default "native"`); SSE
+  loop uses `format_event`.
+- `src/server/router.rs`: `publish_engine_metrics` emits
+  `unidb_subscription_lag_events{consumer}` and `unidb_subscription_lag_seconds{consumer}`.
+- `unidb-dispatch/src/filter.rs`, `unidb-dispatch/src/sink.rs`: test helpers
+  updated for new `Event` fields.
+- `docs/engine_access_guide.md`: §8.1 updated (new fields, ts_ms, back-compat
+  note); §8.2 added (wire formats — native/debezium/supabase examples); §8.3–§8.5
+  renumbered from old §8.2–§8.4; §8.6 added (lag observability — virtual relation,
+  `/stats`, Prometheus, alert guidance).
+- `docs/backlog/29_subscription_cdc_envelope_lag.md`: status → SHIPPED; acceptance
+  checkboxes filled.
+- `docs/backlog/backlog_index.md`: row 29 → ✅ SHIPPED.
+
+**Known limitations / tech debt:**
+- `source.lsn` is not wired (commit LSN not available at per-statement capture
+  time); `seq` is the authoritative ordering cursor. Documented as a follow-up
+  in the spec.
+- Subscription-level RLS (row filtering by subscriber policy) deferred to item 24.
+- Format adapters are `?format=` on the SSE route; `unidb-dispatch` does not yet
+  have a per-consumer format option (trivial follow-up — pass format through
+  `Dispatcher` config).
+
+**Locked-decision changes:** none. No `FORMAT_VERSION` bump, no new WAL record
+type, no §3 decision reopened. Crash harness remains 33/33.

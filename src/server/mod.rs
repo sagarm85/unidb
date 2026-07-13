@@ -27,6 +27,7 @@ pub mod cursor;
 pub mod dto;
 pub mod engine_handle;
 pub mod error;
+pub mod event_format;
 pub mod handlers;
 pub mod logs;
 pub mod router;

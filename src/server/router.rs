@@ -203,4 +203,12 @@ fn publish_engine_metrics(stats: &crate::EngineStats) {
     gauge!("unidb_parallel_scans_total").set(w.parallel_scans as f64);
     gauge!("unidb_parallel_workers_granted_total").set(w.workers_granted as f64);
     gauge!("unidb_parallel_serial_fallbacks_total").set(w.serial_fallbacks as f64);
+
+    // CDC subscription lag per consumer (item 29, C3).
+    // Alert on unidb_subscription_lag_events{consumer="…"} > threshold.
+    for lag in &stats.subscription_lag {
+        let c = lag.consumer.clone();
+        gauge!("unidb_subscription_lag_events", "consumer" => c.clone()).set(lag.lag_events as f64);
+        gauge!("unidb_subscription_lag_seconds", "consumer" => c).set(lag.lag_seconds);
+    }
 }
