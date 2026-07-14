@@ -5509,3 +5509,94 @@ heap scan (documented; no composite PK index exists). Secondary BTree on the
 child FK column (if present via a UNIQUE constraint on that column) speeds up
 the RESTRICT scan to O(log n); plain FK columns without a secondary index use
 O(n) heap scan (documented limitation).
+
+## Default buffer-pool capacity raised 4096 -> 65536 frames (2026-07-14)
+
+**Branch:** `bump-default-buffer-pool-capacity`
+**PR:** _pending review_
+
+### Problem
+
+Found while root-causing a "poor performance" report on the `unidb-studio`
+demo, *after* items 35/36 were confirmed shipped and correct. The default
+buffer pool (`DEFAULT_POOL_CAPACITY = 4096` frames = 32 MiB) is exhausted by a
+single table well before demo-scale seeding finishes — `customers` alone hits
+~4,300 pages (~34 MiB) around 30k rows. Once the pool is full with no
+free/evictable frame, `fetch_page_for_write` forces a **synchronous
+`wal.sync()`** on every subsequent write (`BufferPoolFull -> wal.sync()`),
+independent of and in addition to the normal size-based checkpoint trigger.
+Measured on the demo: 93 checkpoints for 211 commits at the default capacity,
+insert throughput collapsing from ~25k rows/s to ~1.2-1.7k rows/s — indistinguishable
+from a regression even though the fix code (items 35/36) was correct and current.
+
+### Investigation — corrected an assumption before shipping a fix
+
+Initially assumed this was a Postgres `shared_buffers`-style RAM tradeoff and
+recommended a conservative pool size (~800 MiB) accordingly. **That assumption
+was wrong for this engine's architecture** — unidb is mmap-backed, so page
+bytes already live in the OS page cache "for free"; the buffer pool is *pure
+pin/dirty-tracking metadata* (`struct Frame { page_id, pin_count, dirty,
+clock_ref }`, ~24 bytes), not a page-data cache. Verified directly:
+
+| Pool capacity | Frame-table cost | 1.5M-row seed result |
+|---:|---:|---|
+| 4,096 (old default) | ~0.1 MiB | 93 checkpoints/211 commits, customers ~1.2-1.7k rows/s, degrading |
+| 100,000 | ~2.4 MiB | 0 evictions, customers flat ~23-25k rows/s |
+| 1,000,000 | ~24 MiB | 0 evictions, 250 MiB total RSS, customers flat ~23-25k rows/s |
+
+Confirmed at the full `unidb-studio` `--size 5M` preset (largest demo preset,
+6 tables, 4,077,283 rows) with `UNIDB_BUFFER_POOL_PAGES=1000000`: **0
+evictions**, 586 MiB total process RSS, insert p99 128µs, 0 deadlocks —
+`customers` flat 25,861 -> 22,444 rows/s, `orders` flat 4,967 -> 4,273 rows/s,
+`invoices` flat 6,798 -> 5,542 rows/s.
+
+### The default itself: modest bump, not the full fix
+
+The frame table is allocated **eagerly** at open
+(`(0..capacity).map(|_| Frame::empty()).collect()` in `BufferPool::open`), so
+raising the *default* penalizes every `Engine::open()` — including the ~50
+test files and any tiny embedded consumer — not just large-bulk-load use.
+Measured the actual per-open cost directly (200 iterations, release build):
+
+| Capacity | Per-`Engine::open()` cost |
+|---:|---:|
+| 4,096 (old default) | 2.9 µs |
+| 65,536 (new default) | ~35 µs (extrapolated; linear in capacity) |
+| 1,000,000 | 530 µs |
+
+Chose **65,536 frames (512 MiB ceiling)** as the new default — 16x the old
+ceiling, ~35µs/open (negligible even across the full test suite), following
+the same evidence-based-modest-bump precedent as P1.c's own 256->4096 raise.
+**Not** raising to 1,000,000+ as the compiled default: that cost (530µs/open)
+is real once multiplied across ~50 test files and every tiny embedded open,
+for a case (multi-million-row bulk loads) that should opt in via
+`UNIDB_BUFFER_POOL_PAGES`, not become everyone's default cost. A **follow-up
+backlog item is filed** for making frame allocation lazy/growable, which would
+remove this tradeoff entirely and let a much larger ceiling be the default
+without penalizing small opens.
+
+### Changed
+
+- `src/lib.rs` — `DEFAULT_POOL_CAPACITY: usize = 4096` -> `65536`, doc comment
+  rewritten with the full reasoning (not a Postgres RAM-budget model; why not
+  1,000,000+; pointer to the lazy-growth follow-up).
+- `docs/design/engine_design.md` §3.4 — current-state description updated to
+  the new default and the mmap-vs-shared_buffers distinction. Historical
+  entries elsewhere in the doc (the M6 `BufferPoolFull` discovery narrative,
+  the tech-debt registry, the Phase 1 changelog) describe P1.c's 4096 default
+  accurately as of when it shipped — left unchanged, not rewritten, per §9.
+- `README.md` — no change; its Phase 1 paragraph is a historical record of
+  P1.c's 256->4096 raise, still accurate as history.
+- No `FORMAT_VERSION` bump — a runtime tuning constant, not an on-disk format
+  change. No locked-decision (§3) change.
+
+### Gates
+
+| Gate | Result |
+|------|--------|
+| `cargo build --release` | ✅ clean |
+| sync invariant (`cargo tree -p unidb --no-default-features --edges normal \| grep tokio`) | ✅ empty |
+| `cargo fmt --all --check` | ✅ clean |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ✅ clean |
+| crash harness (`cargo test --test crash`) | ✅ **37/37** |
+| `cargo test --workspace` | ✅ all green (excl. the pre-existing, unrelated `slow_query_captured_after_threshold_set` timing flake, confirmed pre-existing before this change too) |

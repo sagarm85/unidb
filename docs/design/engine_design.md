@@ -208,9 +208,18 @@ starts here** — it is the single source of recovery truth.
 
 ### 3.4 Buffer pool
 
-**Configurable** capacity (P1.c): `DEFAULT_POOL_CAPACITY = 4096` frames
-(32 MiB at 8 KiB pages, raised from the old fixed 256), overridable via the
-`UNIDB_BUFFER_POOL_PAGES` env var or `Engine::open_with_pool_capacity`.
+**Configurable** capacity: `DEFAULT_POOL_CAPACITY = 65536` frames (512 MiB at
+8 KiB pages; raised 256 -> 4096 in P1.c, then 4096 -> 65536 after a demo-scale
+bulk load showed a single ~30k-row table exceeding 32 MiB and collapsing
+insert throughput ~15-20x via forced synchronous WAL fsyncs on every
+`BufferPoolFull`). This is bookkeeping cost, not a page-data cache — unidb is
+mmap-backed, so page bytes live in the OS page cache regardless of pool size; a
+frame is ~24 bytes (pin/dirty/clock-bit metadata), so 65536 frames costs ~1.5
+MiB, not 512 MiB. Overridable via the `UNIDB_BUFFER_POOL_PAGES` env var or
+`Engine::open_with_pool_capacity`. The frame table is allocated eagerly at
+open (`(0..capacity).map(...).collect()`), which is why the default stays
+modest rather than jumping to millions of frames — see the follow-up backlog
+item for lazy/growable frame allocation, which would remove that tradeoff.
 Pin/unpin, clock eviction, dirty tracking, D5 enforcement on flush/evict.
 `fetch_page` returns a per-call page copy — cheap for point access,
 measurably expensive for hot-hub scans, which is what motivated the graph
