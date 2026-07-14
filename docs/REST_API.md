@@ -732,12 +732,17 @@ route — same auth as everything else in v1 (no admin-only scope).
 
 ---
 
-### `GET /stats` (P6.g + item 21)
+### `GET /stats` (P6.g + item 21, enriched by items 26/27/29)
 
 A `pg_stat_*`-style activity snapshot. Item 21 enriches it with production-grade
 metrics captured lock-free at existing chokepoints (per-statement-kind latency,
 WAL-fsync cost, buffer-pool efficiency, lock contention, the vacuum-horizon-age
-gauge, per-table page counts, and worker-governance utilization).
+gauge, per-table page counts, and worker-governance utilization). The same
+boundary — no new endpoint, per the Milestone-18 rule — later grew two more
+fields: item 27 broke `dead_tuple_estimate`/`live_tuple_estimate` out **per
+table** (in addition to the engine-global totals, which remain for backward
+compatibility), and item 29 added a `subscription_lag` array for CDC/event
+consumers.
 
 **Response** `200 OK`:
 ```json
@@ -759,15 +764,41 @@ gauge, per-table page counts, and worker-governance utilization).
   "locks": {"waits": 0, "deadlocks": 0, "wait": {"count": 0, "p50_us": 0, "p99_us": 0, "mean_us": 0}},
   "horizon_age_secs": 0.0,
   "parallel_workers": {"global_max": 8, "available": 8, "parallel_scans": 0, "workers_granted": 0, "serial_fallbacks": 0},
-  "tables": [{"name": "t", "pages": 3}],
+  "tables": [{"name": "t", "pages": 3, "dead_tuple_estimate": 2, "live_tuple_estimate": 118}],
+  "subscription_lag": [
+    {"consumer": "billing-worker", "offset": 41, "max_seq": 42, "lag_events": 1, "oldest_unconsumed_ts_ms": 1752345600123, "lag_seconds": 3.4}
+  ],
   "open_txn_sessions": 0, "open_cursors": 0, "idle_reaper_aborts": 0
 }
 ```
 `open_txn_sessions` / `open_cursors` / `idle_reaper_aborts` are server-layer
 gauges (R1/R4 + item 21) added alongside the engine counters — the engine can't
 see HTTP sessions. Percentiles are log-bucket **estimates** (the `le`
-convention); the full metric ↔ widget map is
-`docs/engine_access_guide.md` §9 (widget-traceability table).
+convention).
+
+**Per-table vs. engine-global (item 27).** Each `tables[]` entry now carries
+its own `dead_tuple_estimate`/`live_tuple_estimate` (V1/V2/V3, autovacuum's
+per-table trigger), correcting an earlier stated limitation that this pressure
+was only ever available engine-wide — it wasn't split out per table until
+item 27 shipped. The flat top-level `dead_tuple_estimate`/`live_tuple_estimate`
+fields remain and still cover **raw-CRUD heap** writes (`Engine::insert`/
+`update`/`delete` with no table name), which have no per-table home to
+attribute to; SQL-path writes are reflected in both the per-table and the
+engine-global numbers. Per-table counters reset to `0` on reopen (approximate
+by design, like Postgres `n_dead_tup`) and refresh at the next vacuum pass for
+that table.
+
+**Subscription lag (item 29).** `subscription_lag` has one entry per consumer
+that has ever called `POST /events/ack`; a consumer that has never acked is
+absent, not zeroed. `lag_events` is `max_seq − offset` across every
+event-enabled table; `lag_seconds` is the age of the oldest unacknowledged
+event. The same numbers are queryable as an ordinary table via
+`SELECT * FROM unidb_catalog.subscription_lag` and published as Prometheus
+gauges (see `GET /metrics` below) — alert on `lag_seconds`, not `lag_events`,
+since event size/rate varies per table.
+
+The full metric ↔ widget map is `docs/engine_access_guide.md` §10
+(widget-traceability table).
 
 ---
 
@@ -869,9 +900,18 @@ unidb_horizon_age_seconds 0
 unidb_parallel_worker_budget 8
 unidb_table_pages{table="t"} 3
 unidb_open_txn_sessions 0
+# item 27: per-table vacuum accounting — engine-global scalars only on this
+# facade (see the note under GET /stats above; the per-table breakdown is
+# JSON-only via tables[].dead_tuple_estimate/live_tuple_estimate)
+unidb_dead_tuple_estimate 5
+unidb_live_tuple_estimate 40
+# item 29: per-consumer CDC/event lag — alert on the seconds gauge
+unidb_subscription_lag_events{consumer="billing-worker"} 1
+unidb_subscription_lag_seconds{consumer="billing-worker"} 3.4
 ```
-Every item-21 metric name (and the widget it drives) is documented in
-`docs/engine_access_guide.md` §9.
+Every metric name (and the widget it drives) is documented in
+`docs/engine_access_guide.md` §10 (grown since item 21's original enrichment
+by items 27 and 29, on the same boundary — no new endpoint).
 
 ---
 
