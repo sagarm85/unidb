@@ -173,11 +173,30 @@ impl EventWake {
     }
 }
 
-/// Default buffer-pool capacity in frames (P1.c). Raised from 256 (2 MiB at
-/// the 8 KiB default page size) to 4096 (32 MiB) — far fewer evictions at
-/// 100k+ rows per table. Override with the `UNIDB_BUFFER_POOL_PAGES` env var
-/// or [`Engine::open_with_pool_capacity`].
-const DEFAULT_POOL_CAPACITY: usize = 4096;
+/// Default buffer-pool capacity in frames. Raised 256 (2 MiB) -> 4096 (32 MiB)
+/// in P1.c, then 4096 -> 65536 (512 MiB) after a demo-scale bulk load exposed
+/// the real cost of running out of frames: `fetch_page_for_write` forces a
+/// **synchronous WAL fsync** on every write once the pool is full and no frame
+/// is free/evictable (see `BufferPoolFull` handling below) — a single table
+/// past ~30k rows already exceeded the 32 MiB ceiling, collapsing insert
+/// throughput from ~25k rows/s to ~1-2k rows/s well before any table-size
+/// concern kicks in. This is not a Postgres `shared_buffers`-style RAM budget:
+/// unidb is mmap-backed, so page bytes already live in the OS page cache for
+/// free — a frame is ~24 bytes of pin/dirty-tracking metadata, not a page-data
+/// copy, so 65536 frames costs ~1.5 MiB of bookkeeping, not 512 MiB of RAM.
+/// Measured: at this capacity a 4M-row bulk load (6 tables, `unidb-studio`
+/// demo `--size 5M`) produced 0 evictions and ~85 MiB RSS at open, ~586 MiB
+/// after the full load. A much larger capacity (millions of frames) is even
+/// cheaper per-open-cost-wise in absolute frame-table terms but was not made
+/// the *default* because `BufferPool::open` allocates the frame table eagerly
+/// (`(0..capacity).map(...).collect()`), so the default has to stay cheap for
+/// the common case — tiny embedded databases and the ~50 test files that call
+/// `Engine::open()` — not just the large-bulk-load case. A follow-up item
+/// tracks making frame allocation lazy/growable so a much larger ceiling can
+/// be the default without penalizing small opens at all.
+/// Override with the `UNIDB_BUFFER_POOL_PAGES` env var or
+/// [`Engine::open_with_pool_capacity`].
+const DEFAULT_POOL_CAPACITY: usize = 65536;
 
 /// The configured buffer-pool capacity: `UNIDB_BUFFER_POOL_PAGES` if it parses
 /// to a sane value (>= 16 frames), else [`DEFAULT_POOL_CAPACITY`].

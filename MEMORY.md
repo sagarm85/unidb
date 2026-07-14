@@ -12,6 +12,22 @@
 
 ## Current status
 
+- **Default buffer-pool capacity raised 4096 -> 65536 frames — 2026-07-14,
+  branch `bump-default-buffer-pool-capacity`, PR #105.**
+  Found via `unidb-studio` demo debugging (post items 35/36): the old default
+  (32 MiB) is exhausted by a single ~30k-row table, and `fetch_page_for_write`
+  forces a synchronous `wal.sync()` on every write once full
+  (`BufferPoolFull`) — throughput collapsed to ~1-2k rows/s, indistinguishable
+  from a regression. Corrected an initial Postgres-`shared_buffers` mental
+  model along the way: unidb is mmap-backed, so the pool is pin/dirty-tracking
+  metadata (~24 B/frame), not a page-data cache — page bytes already live in
+  the OS page cache. New default (65536 frames = 512 MiB ceiling, ~1.5 MiB
+  actual cost) chosen as a modest, measured bump (matches P1.c's own
+  256->4096 precedent) rather than jumping to a huge number, because the frame
+  table is allocated **eagerly** at open — a huge default would tax every
+  `Engine::open()`, including ~50 test files and tiny embedded use. Follow-up
+  backlog item filed for lazy/growable frame allocation, which would remove
+  that tradeoff. No `FORMAT_VERSION` bump.
 - **FK row-level enforcement (backlog item 36) — SHIPPED 2026-07-14, branch
   `36-foreign-key-row-enforcement`, PR #103.**
   Child INSERT/UPDATE verifies referenced parent key via `unique_index_root`
@@ -3253,6 +3269,36 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-14 — Default buffer-pool capacity 4096 -> 65536 frames
+
+- Debugged a "poor demo performance" report that surfaced *after* items 35/36
+  were confirmed shipped and correct — two separate causes found in sequence
+  (`unidb-studio` `DEMO_GUIDE.md` PRs #11, #12): a debug-vs-release build
+  default, then this buffer-pool sizing gap.
+- Root cause: `DEFAULT_POOL_CAPACITY = 4096` (32 MiB) is exhausted by a single
+  demo table well before seeding finishes; `fetch_page_for_write` forces a
+  synchronous `wal.sync()` on `BufferPoolFull`, independent of the normal
+  size-based checkpoint trigger — measured 93 checkpoints for 211 commits at
+  the old default, throughput collapsing ~15-20x.
+- Self-corrected an initial recommendation: first assumed a
+  Postgres-`shared_buffers`-style RAM tradeoff and suggested a conservative
+  pool size. Verified against source (`struct Frame`, `BufferPool::open`) that
+  this is wrong for unidb's mmap-backed architecture — the pool is pure
+  pin/dirty-tracking metadata, not a page-data cache. Measured directly (RSS,
+  micro-benchmark of `Engine::open()` cost at several capacities, a full
+  `unidb-studio --size 5M` run: 4,077,283 rows, 0 evictions, 586 MiB RSS).
+- Chose 65536 (512 MiB ceiling, ~35µs/open) as a modest default bump —
+  matches the P1.c 256->4096 precedent — rather than a much larger number,
+  because the frame table is allocated eagerly at open and a huge default
+  would tax every `Engine::open()` including ~50 test files and tiny embedded
+  use. Filed a follow-up backlog item for lazy/growable frame allocation to
+  remove that tradeoff properly.
+- Gates: build clean, sync invariant empty, fmt/clippy clean, crash harness
+  37/37, `cargo test --workspace` all green (excl. the pre-existing unrelated
+  `slow_query_captured_after_threshold_set` timing flake).
+- `PROGRESS.md` entry added. Branch `bump-default-buffer-pool-capacity`, PR
+  pending.
 
 ### 2026-07-14 — Item 35 follow-up: concurrent-INSERT PK race fix, PR #102 MERGED
 
