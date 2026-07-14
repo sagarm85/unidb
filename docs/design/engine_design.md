@@ -68,7 +68,7 @@ Module map (what each layer became in code):
 | Server (M5, feature-gated; REST enrichment item 12; logs surface item 22) | `server/{engine_handle,error,dto,handlers,router,auth,sse,tls,txn_session,cursor,correlation,logs}.rs`, `bin/unidb-server.rs` |
 | Logs surface (item 22) | `server/correlation.rs` (request_id middleware + task-local), `server/logs.rs` (bounded reverse-seek `GET /logs`), `observability.rs` (default-build request_id thread-local read by `audit.rs`/slow-query) |
 | Autovacuum (A1–A4 + item 27) | `autovacuum.rs` (background `std::thread` launcher: `Weak<Engine>`, per-table threshold policy, clean-shutdown handle); per-table dead/live estimates + `vacuum_table` + `VacuumCostConfig` cost throttle in `lib.rs` |
-| Observability metrics (item 21) | `metrics.rs` (lock-free `AtomicHistogram` + counter snapshots); capture points in `bufferpool.rs`/`wal.rs`/`lockmgr.rs`/`txn.rs`/`sql/parallel_scan.rs`/`lib.rs::execute_one_plan`; surfaced via `lib.rs::stats()` + `server/router.rs::publish_engine_metrics`. See `docs/engine_access_guide.md` §9 |
+| Observability metrics (item 21) | `metrics.rs` (lock-free `AtomicHistogram` + counter snapshots); capture points in `bufferpool.rs`/`wal.rs`/`lockmgr.rs`/`txn.rs`/`sql/parallel_scan.rs`/`lib.rs::execute_one_plan`; surfaced via `lib.rs::stats()` + `server/router.rs::publish_engine_metrics`. See `docs/engine_access_guide.md` §10 |
 | Engine facade | `lib.rs` (`Engine` — the sole entry point) |
 | Attach client (M8, separate workspace crate) | `unidb-attach/src/lib.rs` (`AttachClient`, `AttachError`) |
 
@@ -1452,7 +1452,7 @@ metric), per-table heap page counts, and parallel-worker utilization vs the
 `AtomicHistogram` (`src/metrics.rs`) — no mutex on the commit or scan path — and
 is surfaced only via `stats()`/`GET /stats` + the Prometheus `/metrics` scrape
 (republished in `server/router.rs::publish_engine_metrics`). Widget-traceability
-table: `docs/engine_access_guide.md` §9. Measured overhead within noise (<1%),
+table: `docs/engine_access_guide.md` §10. Measured overhead within noise (<1%),
 per `PROGRESS.md`. Crash
 harness **19 → 21** (P18 segmented-WAL multi-segment recovery + truncation; P19
 backup+PITR restore after primary loss). No `FORMAT_VERSION` bump; sync
@@ -1551,7 +1551,7 @@ per-table heap page counts, and parallel-worker utilization — via a new
 `src/metrics.rs` (`AtomicHistogram` + snapshots). Surfaced only through
 `Engine::stats()`/`GET /stats` + Prometheus `/metrics`
 (`server/router.rs::publish_engine_metrics`); widget-traceability table in
-`docs/engine_access_guide.md` §9. No mutex on the commit/scan path; measured
+`docs/engine_access_guide.md` §10. No mutex on the commit/scan path; measured
 overhead within noise (<1%). No `FORMAT_VERSION` bump, crash harness unchanged.
 See `docs/backlog/21_observability_metrics.md` + `PROGRESS.md`.
 Update alongside the next milestone's closeout.*

@@ -26,6 +26,9 @@
 7. [Errors](#7-errors)
 8. [Consume the event stream (change events)](#8-consume-the-event-stream-change-events)
 9. [Honest limitations](#9-honest-limitations)
+10. [Observe (metrics & health)](#10-observe-metrics--health)
+11. [Store objects (the storage service)](#11-store-objects-the-storage-service)
+12. [Logical replication and time-based PITR](#12-logical-replication-and-time-based-pitr-item-28)
 
 ---
 
@@ -608,12 +611,17 @@ unidb_subscription_lag_seconds{consumer="billing"} 3.7
 - **No `NATURAL JOIN` / `FULL OUTER JOIN`** (`JOIN … USING` *is* supported —
   `INNER`/`LEFT`/`RIGHT`; see [§2](#2-query-the-sql-surface)).
 
-- **Per-table dead-tuple estimate is engine-wide, not per-table (item 21).**
-  The table-health list gives real per-table **page counts**
-  (`tables[].pages` / `unidb_table_pages{table=…}`); dead/live-tuple pressure
-  is reported once for the whole engine (`dead_tuple_estimate` /
-  `live_tuple_estimate`), because the estimators are global counters. Splitting
-  them per table is a filed follow-up, not shipped here.
+- **Correction (item 27, supersedes the item-21-era limitation formerly stated
+  here):** dead/live-tuple pressure **is now per table** —
+  `tables[].{dead_tuple_estimate,live_tuple_estimate}` in `GET /stats`/
+  `Engine::stats()`, and `Engine::vacuum_table(name)`/`tables_needing_vacuum()`
+  let autovacuum target only the table that churned instead of a full-engine
+  pass. What's still engine-global, honestly: (1) the flat top-level
+  `dead_tuple_estimate`/`live_tuple_estimate` fields, which now cover only
+  raw-CRUD heap writes with no table name to attribute to; (2) the Prometheus
+  `/metrics` facade, which republishes those two as engine-global gauges only
+  — the per-table breakdown is JSON-only via `GET /stats`/`Engine::stats()`
+  today, not yet mirrored as per-table Prometheus gauges.
 - **Histogram percentiles are log-bucket estimates, not exact quantiles**
   (item 21). `p50_us`/`p99_us` are the **upper bound** of the power-of-two
   bucket the rank falls in (the Prometheus `le` convention) — a safe
@@ -621,11 +629,14 @@ unidb_subscription_lag_seconds{consumer="billing"} 3.7
 
 ---
 
-## 9. Observe (metrics & health)
+## 10. Observe (metrics & health)
 
-*(Item 21.)* Every production metric is captured **lock-free** on the hot path
-(plain atomics + a fixed-bucket atomic histogram — no mutex on the commit or
-scan path) and surfaced **only** through the documented boundaries:
+*(Item 21, grown by items 27 and 29.)* Every production metric is captured
+**lock-free** on the hot path (plain atomics + a fixed-bucket atomic
+histogram — no mutex on the commit or scan path) and surfaced **only**
+through the documented boundaries — item 21's original chokepoint metrics,
+item 27's per-table vacuum accounting, and item 29's per-consumer CDC lag all
+grew the *same* two surfaces below; none of them opened a new endpoint:
 
 - **`Engine::stats()`** (embed) / **`GET /stats`** (server) — one JSON snapshot,
   the `EngineStats` shape. The server adds three session gauges the engine can't
@@ -649,11 +660,12 @@ left, Prometheus metric on the right; units are microseconds unless noted.
 | Cache efficiency | `bufferpool.{hits,misses,evictions,hit_ratio}` | `unidb_bufferpool_hits_total`, `unidb_bufferpool_misses_total`, `unidb_bufferpool_evictions_total`, `unidb_bufferpool_hit_ratio` | `BufferPool::fetch_page`/`find_victim` |
 | Contention | `locks.{waits,deadlocks,wait.p50_us,wait.p99_us}` | `unidb_lock_waits_total`, `unidb_deadlocks_total`, `unidb_lock_wait_p50_us`, `unidb_lock_wait_p99_us` | `LockManager::acquire` (blocking-wait path) |
 | **Bloat risk (alertable)** | `horizon_age_secs` | `unidb_horizon_age_seconds` | `TransactionManager` (oldest live snapshot age) |
-| Table health | `tables[].{name,pages}`, `dead_tuple_estimate`, `live_tuple_estimate` | `unidb_table_pages{table}`, `unidb_dead_tuple_estimate`, `unidb_live_tuple_estimate` | catalog + heap page directory (cold, on read) |
-| Autovacuum | `autovacuums`, `last_autovacuum_epoch_secs` | `unidb_autovacuum_runs_total`, `unidb_autovacuum_last_run_epoch_secs` | autovacuum launcher (A4) |
+| Table health | `tables[].{name,pages,dead_tuple_estimate,live_tuple_estimate}` (per-table, item 27) | `unidb_table_pages{table}` (per-table); dead/live-tuple gauges are **engine-global only** on this facade — `unidb_dead_tuple_estimate`, `unidb_live_tuple_estimate` | catalog + heap page directory (cold, on read) |
+| Autovacuum | `autovacuums`, `last_autovacuum_epoch_secs` | `unidb_autovacuum_runs_total`, `unidb_autovacuum_last_run_epoch_secs` | autovacuum launcher (A4); item 27 added `Engine::vacuum_table` so a trigger can target one table without a full pass |
 | Worker governance | `parallel_workers.{global_max,available,parallel_scans,workers_granted,serial_fallbacks}` | `unidb_parallel_worker_budget`, `unidb_parallel_workers_available`, `unidb_parallel_scans_total`, `unidb_parallel_workers_granted_total`, `unidb_parallel_serial_fallbacks_total` | `parallel_scan::acquire` (admission) |
 | Server sessions | `open_txn_sessions`, `open_cursors`, `idle_reaper_aborts` *(server-only)* | `unidb_open_txn_sessions`, `unidb_open_cursors`, `unidb_idle_reaper_aborts_total` | session/cursor registries + idle reaper |
 | Replication lag | `replication_slots`, `max_replication_lag` | *(via `/stats`)* | slot registry |
+| **CDC/event lag (item 29)** | `subscription_lag[].{consumer,offset,max_seq,lag_events,oldest_unconsumed_ts_ms,lag_seconds}` | `unidb_subscription_lag_events{consumer}`, `unidb_subscription_lag_seconds{consumer}` | computed on read from `__consumers__` + the durable event-order index; also queryable directly as `unidb_catalog.subscription_lag` |
 
 **The horizon-age gauge is the one to alert on.** A pinned vacuum horizon (an
 idle `REPEATABLE READ` session, an abandoned open transaction, a slow reader) is
@@ -665,7 +677,7 @@ idle-session reaper caps the worst case and increments
 
 ---
 
-## 10. Store objects (the storage service)
+## 11. Store objects (the storage service)
 
 *(Item 23.)* Storing files is an **access pattern over the engine**, not an engine
 feature: the `unidb-storage` app-layer crate keeps bucket/object **metadata** in
@@ -700,15 +712,16 @@ is out of this repo (like Events/Logs), by design.
 ---
 
 *Milestone 18 (engine access & introspection contract) + item 21 (observability
-metrics enrichment, §9). See `docs/backlog/18_engine_access_contract.md` and
+metrics enrichment, §10, since grown by items 27 and 29). See
+`docs/backlog/18_engine_access_contract.md` and
 `docs/backlog/21_observability_metrics.md` for the specs, and `docs/REST_API.md`
 for the exhaustive HTTP route/error reference. §8 (event stream / change events)
-was added by Milestone 20 — `docs/backlog/20_events_realtime_dispatcher.md`; §10
+was added by Milestone 20 — `docs/backlog/20_events_realtime_dispatcher.md`; §11
 (object storage) by item 23 — `docs/backlog/23_storage_service.md`.*
 
 ---
 
-## 11. Logical replication and time-based PITR (item 28)
+## 12. Logical replication and time-based PITR (item 28)
 
 ### Time-based PITR
 

@@ -1092,16 +1092,17 @@ same numbers are queryable as an ordinary table via
 <p><code>GET /stats</code> is a <code>pg_stat_*</code>-style snapshot: commit /
 abort / checkpoint counts, active transactions, WAL bytes, per-statement-kind
 latency percentiles, WAL-flush latency, buffer-pool hit ratio, lock waits and
-deadlocks, the vacuum-horizon age, per-table page counts, parallel-worker
-utilization, autovacuum activity, recent slow queries, and open sessions /
-cursors. Example fragment:</p>
+deadlocks, the vacuum-horizon age, per-table page counts <i>and</i> per-table
+cleanup pressure, parallel-worker utilization, autovacuum activity, recent
+slow queries, open sessions/cursors, and per-consumer event-stream lag.
+Example fragment:</p>
 <pre>{
   "commits": 42, "aborts": 3, "active_transactions": 0, "wal_bytes": 81920,
   "statement_latency": { "insert": { "count": 50, "p50_us": 32, "p99_us": 256 } },
   "bufferpool": { "hits": 980, "misses": 40, "hit_ratio": 0.9607 },
   "locks": { "waits": 0, "deadlocks": 0 },
   "horizon_age_secs": 0.0,
-  "tables": [ { "name": "t", "pages": 3 } ]
+  "tables": [ { "name": "t", "pages": 3, "dead_tuple_estimate": 2, "live_tuple_estimate": 118 } ]
 }</pre>
 
 <h3 id="s8-7">8.7 Replication</h3>
