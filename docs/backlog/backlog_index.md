@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `39_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `40_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -52,10 +52,13 @@
 | 36 | `36_foreign_key_row_enforcement.md` | Improvement | ✅ SHIPPED 2026-07-14 — full row-level FK enforcement: child INSERT/UPDATE checks parent key via unique_index_root (O(log n)); parent DELETE/UPDATE RESTRICT rejects when visible child references the key; RecordKind::FkKey phantom lock prevents concurrent parent-delete/child-insert race; 9 new tests + conc_matrix cell 10/10 PASS. See PROGRESS.md |
 | 37 | `37_lazy_buffer_pool_growth.md` | Improvement | ⏳ NOT STARTED — buffer pool frame table is allocated eagerly at open (`(0..capacity).map(...).collect()`), forcing one static `capacity` to serve both cheap-small-opens and generous-bulk-load goals at once. Follows up the 4096→65536 default-bump (`PROGRESS.md`); lazy/growable allocation would let a much larger ceiling be the default without taxing small/embedded opens |
 | 38 | `38_param_type_coercion.md` | Improvement | ⏳ NOT STARTED — engine rejects `WHERE int_col = $1` when `$1` is bound as `Text("20")`; should coerce losslessly to the column type (standard SQL behaviour; PostgreSQL/SQLite/MySQL all do this). Studio workaround (`bindForColumn` in RecordBrowser) applied 2026-07-15 but does not cover other clients or expression contexts. |
+| 39 | `39_pk_fk_relational_stress_bench.md` | Performance | ✅ SHIPPED — new Table 5 in `scripts/report.sh`'s multi-model report: a real `customers`/`orders` PK/FK schema (previously the whole report had zero `FOREIGN KEY` usage anywhere), throughput vs Postgres, plus pass/fail correctness proofs that both engines reject an invalid FK and RESTRICT a still-referenced DELETE. Made fair by item 36 (FK row-level enforcement, shipped the same day). See PROGRESS.md |
+
+| 40 | `40_btree_bulk_build.md` | Performance | ⏳ NOT STARTED — `CREATE INDEX USING BTREE` does one unsorted WAL write per row during backfill; 540k-row table takes several minutes. Fix: collect all (key, row_id) pairs, sort, then bulk-insert in key order — eliminates page splits, reduces WAL appends from N to num_pages, expected ≥5× speedup. |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `38_…`.**
+**Next new file → `41_…`.**
 
 ## Next up (candidates — pick one, then create `NN_<slug>.md`)
 
