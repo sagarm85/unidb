@@ -12,6 +12,11 @@
 
 ## Current status
 
+- **B-tree index sort-then-bulk-load (item 40) — SHIPPED 2026-07-15, branch
+  `40-btree-bulk-build`, PR pending.**
+  `CREATE INDEX USING BTREE` on 540k rows: 134.2 s → 12.0 s (11.2×). Fix:
+  collect (key, row_id) pairs, sort, `DiskBTree::insert_many` (one WAL
+  mini-txn / one fsync). P40 crash test added (38/38). No FORMAT_VERSION bump.
 - **Default buffer-pool capacity raised 4096 -> 65536 frames — 2026-07-14,
   branch `bump-default-buffer-pool-capacity`, PR #105.**
   Found via `unidb-studio` demo debugging (post items 35/36): the old default
@@ -3269,6 +3274,30 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-15 — Item 40: B-tree index sort-then-bulk-load backfill
+
+- **Baseline measured first (CLAUDE.md §0.6.4):** 134.2 s for `CREATE INDEX
+  USING BTREE (customer_id)` on 540k randomised-order rows, release build,
+  `UNIDB_BUFFER_POOL_PAGES=1000000`. Root cause: N = 540k individual
+  `DiskBTree::insert` calls → N mini-txns → N fsyncs.
+- **Fix:** three-phase sort-then-bulk-load in `exec_create_index`
+  (BTree+FullText paths; HNSW already collects into a Vec — untouched):
+  Phase 1 collect (key, row_id) into `Vec`; Phase 2 `sort_unstable_by key`;
+  Phase 3 `tree.insert_many(&pairs, pool, wal)` — one WAL mini-txn, one fsync.
+  `insert_many` already existed for the coalesced-UPDATE path (A1/item 14).
+- **After: 12.0 s — 11.2× speedup** (acceptance ≥ 5×, met).
+- **Architecture verification (§0.6.2):** confirmed sorted input → rightmost-leaf
+  inserts → pages fill to ~90-95%; one fsync vs 540k is the dominant win.
+  MVCC: existing `snapshot_for_statement` before heap scan is unchanged and
+  correct. Crash-safety: bulk mini-txn is all-or-nothing; catalog update is
+  after. No new FORMAT_VERSION.
+- **P40 crash test added** (`tests/crash/main.rs`): (a) heap rows committed
+  before CREATE INDEX survive a no-checkpoint crash; (b) committed bulk-built
+  index survives no-checkpoint crash and is queryable on reopen. 38/38 total.
+- Gates: fmt/clippy clean, `cargo test --workspace` all green, crash 38/38.
+- `PROGRESS.md` entry added. `docs/backlog/40_btree_bulk_build.md` → SHIPPED.
+- Branch `40-btree-bulk-build`, PR pending.
 
 ### 2026-07-14 — Default buffer-pool capacity 4096 -> 65536 frames
 

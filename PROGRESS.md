@@ -5600,3 +5600,96 @@ without penalizing small opens.
 | `cargo clippy --workspace --all-targets -- -D warnings` | ✅ clean |
 | crash harness (`cargo test --test crash`) | ✅ **37/37** |
 | `cargo test --workspace` | ✅ all green (excl. the pre-existing, unrelated `slow_query_captured_after_threshold_set` timing flake, confirmed pre-existing before this change too) |
+
+---
+
+## Item 40 — B-tree index sort-then-bulk-load backfill   [SHIPPED]   2026-07-15
+
+**Branch:** `40-btree-bulk-build`
+**PR:** _pending_
+
+### Problem
+
+`CREATE INDEX ... USING BTREE` on a large pre-populated table was prohibitively
+slow. Measured baseline on a 540k-row table (`orders.customer_id`, randomised
+key order, release build, `UNIDB_BUFFER_POOL_PAGES=1000000`):
+
+**134.2 s** (2 min 14 s)
+
+Root cause: `exec_create_index` (BTree/FullText path) called `DiskBTree::insert`
+once per row. Each insert is its own WAL mini-txn → one `fsync` per row.
+540,000 rows = 540,000 fsyncs. Unsorted heap order also caused ~270k B-tree
+splits, leaving pages ~50% full and doubling WAL volume.
+
+### Fix
+
+Sort-then-bulk-load (Phase 1 / collect → Phase 2 / sort → Phase 3 / insert):
+
+1. **Phase 1 — collect:** scan the heap once, push `(OrderedValue, RowId)` pairs
+   into a `Vec`. For `orders.customer_id` (INT): ~13 MiB working set (24 bytes ×
+   540k); freed immediately after Phase 3.
+2. **Phase 2 — sort:** `sort_unstable_by key` — O(N log N) in-memory, cheap.
+3. **Phase 3 — bulk insert:** `DiskBTree::insert_many`, which already existed for
+   the coalesced-UPDATE path (A1 / item 14). One WAL mini-txn → **one fsync** for
+   all pairs. Sorted input drives keys rightward, pages fill to ~90-95%, splits
+   only at leaf-full boundaries.
+
+Implementation: 15-line change in `sql/executor.rs::exec_create_index`, replacing
+the per-row `tree.insert(...)` loop with the three-phase pattern for both the
+BTree and FullText index paths. HNSW already collected into a Vec; untouched.
+
+### Verification (§0.6.2)
+
+**(a) Does the existing `insert_many` support efficient sequential insert?**
+Yes. `DiskBTree::insert_many` sorts internally and coalesces WAL writes per leaf
+page (one `WAL_INDEX` image per dirtied leaf). Pre-sorting before calling it
+makes the internal sort O(N) on already-sorted input rather than O(N log N).
+
+**(b) MVCC correctness — snapshot isolation during backfill:**
+`exec_create_index` takes a snapshot (`snapshot_for_statement`) before the heap
+scan. Concurrent INSERTs after the snapshot are not in the snapshot → they write
+their own index entry via the normal INSERT path. No race: the index is not
+registered in the catalog until `set_column_index_root` (after the bulk commit).
+
+**(c) Crash-safety:**
+Three committed mini-txns in sequence:
+1. `DiskBTree::create` — empty tree (meta + empty leaf)
+2. `insert_many` — all pairs in one mini-txn (new: atomically all-or-nothing)
+3. `set_column_index_root` — registers index in catalog
+
+Crash before (3) → orphaned tree pages, no index registered, table readable.
+Crash mid (2) → WAL mini-txn incomplete → recovery aborts → no pages committed.
+Both outcomes are safe. New crash test **P40** added to `tests/crash/main.rs`:
+(a) heap rows committed before CREATE INDEX survive a crash; (b) committed
+CREATE INDEX survives no-checkpoint crash and is queryable via WAL-recovered
+index on reopen.
+
+**(d) Memory bound:**
+`sizeof(OrderedValue::Int) + sizeof(RowId)` ≈ 16 + 8 = 24 bytes/pair.
+540k × 24 ≈ 13 MiB. For the largest demo preset (8M orders rows): ~192 MiB
+transient working set — acceptable as a build-time cost, freed immediately.
+FullText: bounded by token count per document; for typical short text columns
+the multiplier is small (≤10 tokens/row).
+
+**No `FORMAT_VERSION` bump** — on-disk page format is unchanged; only the
+INSERT order and mini-txn batching changed.
+
+### Before / after
+
+| Workload | Before | After | Speedup |
+|---|---|---|---|
+| CREATE INDEX BTREE, `orders.customer_id`, 540k rows, release, `UNIDB_BUFFER_POOL_PAGES=1000000` | **134.2 s** | **12.0 s** | **11.2×** |
+
+Acceptance criterion: ≥ 5× — **met (11.2×)**.
+
+### Gates
+
+| Gate | Result |
+|------|--------|
+| `cargo fmt --all --check` | ✅ clean |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ✅ clean |
+| `cargo test --workspace` | ✅ **all green** |
+| crash harness (`cargo test --test crash`) | ✅ **38/38** (P40 added) |
+| `btree_assisted_select_matches_full_scan_equality_and_range` | ✅ passes |
+| No `FORMAT_VERSION` bump | ✅ confirmed |
+| No locked-decision (§3) change | ✅ none |

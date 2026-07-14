@@ -630,7 +630,9 @@ fsyncing before the user txn's `WAL_TXN_COMMIT`. `Engine::open` reads the tree
 from its meta page in O(1) — the durability win benchmarked in `PROGRESS.md`'s
 P3.a entry. Vacuum scrubs it directly (`DiskBTree::remove`, reading each dead
 row's key via `Heap::get_raw` before the slot is reused). v1 leaves underfull
-nodes un-merged (tree only grows) and pays one fsync per key insert.
+nodes un-merged (tree only grows). Single-row inserts (via the normal INSERT
+path) pay one fsync per key; `CREATE INDEX` backfill uses `insert_many` (one
+WAL mini-txn / one fsync for all pairs) since item 40 — see `PROGRESS.md`.
 
 **Concurrent writers (index-write-concurrency milestone).** Two writer threads
 can now insert into the *same* tree at once (before, the SQL catalog write lock
