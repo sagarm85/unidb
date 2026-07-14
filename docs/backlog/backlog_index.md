@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `35_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `36_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -47,17 +47,32 @@
 | 31 | `31_storage_http_routes.md` | Milestone | ✅ SHIPPED 2026-07-14 (StorageApi trait + 7 /storage/* routes + 503 contract + 5 integration tests) |
 | 32 | `32_bulk_load_api.md` | Performance | ✅ SHIPPED 2026-07-14 — POST /tables/{name}/bulk NDJSON endpoint; **measured ~12k–31k rows/sec** (index-dependent; ~20–50× over ~640/sec per-row); below the 50k–200k target — follow-up filed. See PROGRESS.md |
 | 33 | `33_cdc_management_api.md` | Improvement | ✅ SHIPPED 2026-07-14 — `GET /tables/{name}/events` (CDC status), `DELETE /tables/{name}/events` (disable, idempotent), `GET /events/head` (current seq without streaming); P34 crash test; 6 integration tests |
-| 34 | `34_observability_api_gaps.md` | Improvement | 🚀 IN PROGRESS (branch `34-observability-api-gaps`) — `UNIDB_SLOW_QUERY_MS` env var; `PUT /config/slow_query_threshold_ms`; `GET /stats/history` 300-point ring |
+| 34 | `34_observability_api_gaps.md` | Improvement | ✅ SHIPPED 2026-07-14 — `UNIDB_SLOW_QUERY_MS` env var; `PUT /config/slow_query_threshold_ms`; `GET /stats/history` 300-point ring buffer with server-computed rate fields |
+| 35 | `35_unique_constraint_full_scan.md` | Improvement | ⏳ NOT STARTED — **critical**: `enforce_unique()` full heap-scans on every INSERT/UPDATE for any `PRIMARY KEY`/`UNIQUE` table; O(n²) bulk load. Measured >100× slower than a no-PK table at just 15k rows |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `35_…`.**
+**Next new file → `36_…`.**
 
 ## Next up (candidates — pick one, then create `NN_<slug>.md`)
 
 Ordered by my current ROI read; reorder as priorities change. Create each
 candidate's `NN_<slug>.md` when started — until then each is *filed inside* an
 existing doc.
+
+**#35 — Unique-constraint full heap scan (`35_unique_constraint_full_scan.md`,
+NOT STARTED) — TOP PRIORITY.** `enforce_unique()` (`src/sql/executor.rs:2145`)
+enforces every `PRIMARY KEY`/`UNIQUE` constraint by scanning and decoding
+**every row already in the table**, once per INSERT/UPDATE — `PRIMARY KEY` has
+no backing index in this engine. O(n²) bulk load. Found via a `unidb-studio`
+demo run (`seed.py` seeding `customers`, `id INTEGER PRIMARY KEY`) and confirmed
+in-engine: identical schema minus the PK stays flat at ~115k rows/s through
+15,000 rows; **with** the PK it degrades 4,955 → 1,685 → 1,013 rows/s
+(**>100× slower**, still falling). Affects INSERT unconditionally and UPDATE
+whenever any unique constraint exists (the existing `has_unique` gate only
+helps when there is *no* constraint). Hits nearly every real schema, not a
+niche path — see the spec for the root-cause chain and open fix-design
+questions.
 
 0. **Item 18 — Engine access & introspection contract — ✅ SHIPPED 2026-07-13**
    (branch `18-engine-access-contract-impl`). Delivered the `information_schema`-
