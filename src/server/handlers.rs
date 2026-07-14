@@ -38,8 +38,8 @@ use crate::{
             exec_result_to_json, is_internal_table, json_to_literal, literal_to_json, slot_to_json,
             table_def_to_info, AckEventsRequest, AdvanceSlotRequest, BatchInsertRequest,
             BeginTxnRequest, CreateEdgeRequest, CreateSlotRequest, CursorQuery, CypherRequest,
-            DeleteEdgeRequest, IsolationDto, RlsRequest, RowIdResponse, SetIndexRequest,
-            SqlRequest, StreamQuery, TableInfo,
+            DeleteEdgeRequest, HistoryQuery, IsolationDto, RlsRequest, RowIdResponse,
+            SetIndexRequest, SlowQueryThresholdRequest, SqlRequest, StreamQuery, TableInfo,
         },
         engine_handle::EngineHandle,
         error::ApiError,
@@ -995,4 +995,50 @@ pub async fn get_replication_stream(
             .unwrap_or_else(|_| header::HeaderValue::from_static("0")),
     );
     Ok(resp)
+}
+
+// ── Observability extras (item 34) ────────────────────────────────────────
+
+/// `PUT /config/slow_query_threshold_ms` (item 34, Part A): update the
+/// slow-query threshold at runtime without a restart. Superuser-gated (same
+/// gate as `PUT /tables/{table}/rls` and `POST /admin/flush`). `204 No Content`.
+/// The threshold is an `AtomicU64` — no lock contention.
+pub async fn put_config_slow_query_threshold_ms(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+    Json(body): Json<SlowQueryThresholdRequest>,
+) -> std::result::Result<StatusCode, ApiError> {
+    state
+        .engine
+        .ensure_superuser(current_user.0)
+        .await
+        .map_err(ApiError::from)?;
+    state
+        .engine
+        .set_slow_query_threshold(body.threshold_ms)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /stats/history` (item 34, Part B): return the ring-buffered stats
+/// history. Rate fields (`commits_per_sec`, `wal_bytes_per_sec`) are computed
+/// server-side from consecutive ring entries — the Studio reads them directly
+/// without client-side delta math. Points are oldest-first. An empty array is
+/// returned on a fresh engine (not an error).
+pub async fn get_stats_history(
+    State(state): State<AppState>,
+    Query(params): Query<HistoryQuery>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    let n = params.points.unwrap_or(60).min(300) as usize;
+    let interval_ms = params.interval_ms.unwrap_or(5000);
+    let points = state
+        .engine
+        .stats_history(n)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({
+        "interval_ms": interval_ms,
+        "points": points,
+    })))
 }

@@ -13,7 +13,7 @@
 ## Current status
 
 - **CDC Management API (backlog item 33) — SHIPPED 2026-07-14, branch
-  `33-cdc-management-api`, PR pending (STOP-for-review — NOT merged).**
+  `33-cdc-management-api`, PR #96 (MERGED).**
   Three new JWT-protected routes: `GET /tables/{name}/events` (CDC status —
   `{ "enabled": bool }`; 404 if table absent), `DELETE /tables/{name}/events`
   (disable CDC — idempotent 204), `GET /events/head` (current max committed seq
@@ -22,7 +22,15 @@
   catalog-write path), `events_head_seq` (DiskBTree::max_entry). P34 crash test
   added (36/36 pass). 6 new integration tests (10/10 total for server_events).
   Workspace tests all green. Clippy/fmt clean.
-
+- **Observability API gaps (backlog item 34) — IN PROGRESS 2026-07-14, branch
+  `34-observability-api-gaps`, PR #97 open — STOP for review.** Part A: `UNIDB_SLOW_QUERY_MS`
+  env var + `PUT /config/slow_query_threshold_ms` (superuser-gated); wires the
+  existing `set_slow_query_threshold` atomic. Part B: `StatsPoint` ring buffer
+  (300 points, `Mutex<VecDeque>`); `src/stats_ticker.rs` background thread
+  (autovacuum pattern: Weak<Engine>, condvar, bounded-join); `GET /stats/history`
+  returns oldest-first points with server-side rate fields. Gates: crash 36/36
+  unchanged (item 33 added P34; item 34 adds none); workspace tests 0 failures;
+  clippy/fmt clean.
 - **Bulk Load HTTP API (backlog item 32) — SHIPPED 2026-07-14, branch
   `32-bulk-load-api`, PR pending (STOP-for-review — NOT merged).**
   `POST /tables/{name}/bulk`: JWT-protected NDJSON body, one transaction for the
@@ -3224,6 +3232,57 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-14 — Observability API gaps (item 34), branch `34-observability-api-gaps`
+
+**Part A — Slow-query threshold configuration:**
+- `UNIDB_SLOW_QUERY_MS` env var wired in `src/bin/unidb-server.rs`: read at
+  startup, calls `EngineHandle::set_slow_query_threshold(ms).await` before
+  `AppState::new()`. 0 or absent = disabled (existing default preserved).
+- `PUT /config/slow_query_threshold_ms` route added: superuser-gated (same
+  `ensure_superuser` gate as `PUT /tables/{table}/rls` and `POST /admin/flush`),
+  calls same `set_slow_query_threshold` setter, returns 204. Already atomic
+  (`AtomicU64`) — no lock contention.
+- `SlowQueryThresholdRequest` added to `src/server/dto.rs`.
+- `EngineHandle::set_slow_query_threshold(threshold_ms: u64)` async method added.
+- No new capture machinery — `Engine::note_query_time` / `slow_queries` ring
+  already existed (P6.g); this change merely wires the setter that was always there.
+
+**Part B — Stats-history ring buffer:**
+- `StatsPoint` (raw capture struct, `pub(crate)`) + `StatsHistoryPoint` (`pub`,
+  serde-serializable, with rate fields) added to `src/lib.rs`.
+- `STATS_HISTORY_MAX = 300` constant. `stats_history: Mutex<VecDeque<StatsPoint>>`
+  + `stats_ticker_handle: Mutex<Option<StatsTickerHandle>>` fields added to `Engine`.
+- `Engine::capture_stats_point(&self)` (`pub`): captures current counters into
+  ring, pops oldest if len > 300.
+- `Engine::stats_history_snapshot(n: usize) -> Vec<StatsHistoryPoint>`: takes last
+  n entries, computes `commits_per_sec`/`wal_bytes_per_sec` from consecutive dt_ms
+  delta; first point rates = 0.0; oldest-first; empty Vec on fresh engine.
+- `src/stats_ticker.rs` — new file, exact autovacuum pattern: `Shutdown` condvar,
+  `StatsTickerHandle` (Weak<Engine>, bounded-join Drop, self-join guard),
+  `worker_loop` (5 s interruptible sleep), `Engine::spawn_stats_ticker`.
+- `EngineHandle::spawn` calls `engine.spawn_stats_ticker()` after
+  `spawn_autovacuum()` — ticker never starts for bare `Engine::open()`.
+- `GET /stats/history?points=60&interval_ms=5000` handler + route added.
+- `HistoryQuery` added to `src/server/dto.rs`.
+- `EngineHandle::stats_history(n: usize)` async method added.
+
+**Tests:** `tests/server_observability.rs` — 9 tests:
+- HTTP: PUT returns 204; slow query captured after threshold=1ms; threshold=0
+  disables capture; GET /stats/history empty on fresh engine; interval_ms echoed;
+  points param capped at 300.
+- Engine unit: rate-fields-correct (two-capture sequence with commit; validates
+  first-point rates = 0, second-point commits_per_sec > 0, oldest-first order);
+  ring caps at 300; snapshot(n < len) returns most-recent n.
+
+**Gates:** crash harness 35/35 UNCHANGED (pure in-memory ring, no WAL/format
+touch); `cargo test --workspace --features server` all green (0 failures);
+`clippy --workspace --all-targets -- -D warnings` clean; `cargo fmt --all` clean.
+No §3 decision reopened; no tokio on engine core; ticker uses std::thread only.
+
+**Docs:** `docs/REST_API.md` — two new route sections; `docs/engine_access_guide.md`
+§13 added; `docs/backlog/34_observability_api_gaps.md` → IN PROGRESS;
+`backlog_index.md` row 34 → IN PROGRESS. PR open — STOP for review.
 
 ### 2026-07-14 — Studio API readiness (item 30), branch `30-studio-api-readiness`
 

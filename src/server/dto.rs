@@ -192,6 +192,22 @@ pub struct RlsRequest {
     pub predicate: String,
 }
 
+/// Body of `PUT /config/slow_query_threshold_ms` (item 34, Part A).
+/// `threshold_ms: 0` disables slow-query logging; positive values enable it.
+#[derive(Debug, Deserialize)]
+pub struct SlowQueryThresholdRequest {
+    pub threshold_ms: u64,
+}
+
+/// Query params for `GET /stats/history` (item 34, Part B).
+#[derive(Debug, Default, Deserialize)]
+pub struct HistoryQuery {
+    /// Number of points to return; default 60, max 300.
+    pub points: Option<u32>,
+    /// Resolution hint echoed back in the response (ms); default 5000.
+    pub interval_ms: Option<u64>,
+}
+
 /// Body of `POST /rows/batch` (R4): raw row payloads, base64-encoded (rows
 /// are opaque bytes and JSON cannot carry them verbatim).
 #[derive(Debug, Deserialize)]

@@ -114,6 +114,24 @@ async fn main() {
 
     let engine_handle = EngineHandle::spawn(std::path::Path::new(&data_dir), page_size)
         .unwrap_or_else(|e| panic!("failed to open unidb engine at {data_dir}: {e}"));
+
+    // Item 34 Part A: optionally enable slow-query logging at startup.
+    // 0 or absent = disabled (the engine default). Positive values enable it.
+    if let Some(ms) = std::env::var("UNIDB_SLOW_QUERY_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+    {
+        engine_handle
+            .set_slow_query_threshold(ms)
+            .await
+            .unwrap_or_else(|e| panic!("failed to set slow_query_threshold: {e}"));
+        tracing::info!(
+            threshold_ms = ms,
+            "slow-query logging enabled (UNIDB_SLOW_QUERY_MS)"
+        );
+    }
+
     // Builds the session/cursor registries and spawns the idle reaper (R1);
     // deadlines come from UNIDB_TXN_IDLE_TIMEOUT_SECS / _CURSOR_ (default 60).
     // Item 31: storage is None here (binary can't depend on unidb-storage

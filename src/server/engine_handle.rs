@@ -63,6 +63,9 @@ impl EngineHandle {
         // (default-on, policy-gated). The worker holds a `Weak<Engine>`, so this
         // Arc's eventual drop still tears the engine down cleanly.
         engine.spawn_autovacuum();
+        // Item 34: start the stats-history ticker (5 s snapshot interval, 300-point
+        // ring). Same Weak<Engine> / bounded-join pattern as autovacuum.
+        engine.spawn_stats_ticker();
         Ok(Self {
             engine: Some(engine),
             read,
@@ -349,6 +352,23 @@ impl EngineHandle {
     /// A `pg_stat_*`-style activity + counter snapshot (P6.g).
     pub async fn stats(&self) -> Result<crate::EngineStats> {
         self.on_engine(|e| Ok(e.stats())).await
+    }
+
+    // ── Observability extras (item 34) ────────────────────────────────────────
+
+    /// Update the slow-query threshold at runtime (item 34, Part A). Zero disables.
+    pub async fn set_slow_query_threshold(&self, threshold_ms: u64) -> Result<()> {
+        self.on_engine(move |e| {
+            e.set_slow_query_threshold(std::time::Duration::from_millis(threshold_ms));
+            Ok(())
+        })
+        .await
+    }
+
+    /// Return up to `n` most-recent stats-history points (item 34, Part B).
+    pub async fn stats_history(&self, n: usize) -> Result<Vec<crate::StatsHistoryPoint>> {
+        self.on_engine(move |e| Ok(e.stats_history_snapshot(n)))
+            .await
     }
 
     // ── Replication slots + WAL shipping (P6.b) ────────────────────────────────
