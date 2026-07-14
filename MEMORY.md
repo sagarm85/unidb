@@ -4948,3 +4948,31 @@ Composite FK without secondary index on child FK column uses O(n) heap scan for
 RESTRICT (documented). No FORMAT_VERSION bump; no §3 decision change.
 
 **Next up:** Open PR #103. After merge, identify next backlog item (check item 37+).
+
+### 2026-07-14 — Guide: new §11 "Configuration & performance tuning" in the PDF, branch `claude/config-options-docs-rn6phg`
+
+**Docs-only, no code/behavior change.** User asked for a section in
+`docs/design/unidb_engine_architecture.pdf` covering every engine/server
+config option that can be tuned for performance, with purpose + impact.
+
+- `docs/design/unidb_engine_architecture.html` — new §11 "Configuration &
+  performance tuning" inserted after §10 (Performance), with 5 subsections
+  (11.1 memory/storage, 11.2 WAL/durability, 11.3 query execution/concurrency,
+  11.4 vacuum, 11.5 REST server timeouts) tabulating every `UNIDB_*` env var
+  found in source (`lib.rs`, `sql/parallel_scan.rs`, `sql/sort.rs`,
+  `sql/plan.rs`, `wal.rs`, `server/mod.rs`, `server/router.rs`,
+  `bin/unidb-server.rs`): default, purpose, and measured/architectural
+  performance impact (e.g. the buffer-pool mmap-vs-shared_buffers distinction
+  and its measured collapse-to-1.2k-rows/s story from the 2026-07-14
+  buffer-pool-bump entry above). Old §11–§14 renumbered to §12–§15 throughout
+  (TOC, anchors, and the handful of in-body "Section N" cross-references);
+  verified via rendered screenshots, no orphaned anchors.
+- `docs/design/unidb_engine_architecture.pdf` regenerated via
+  `render_pdf.mjs` (headless Chrome needed `--no-sandbox` in this container —
+  not committed, just a local invocation flag).
+- `docs/design/unidb_engine_architecture_context.md` and
+  `docs/design/design_index.md` updated to describe the new section and its
+  renumbering (coverage snapshot, §-reference fixes, source-material list).
+
+**Next up:** none pending from this session — resume backlog item 37+ per the
+prior entry.
