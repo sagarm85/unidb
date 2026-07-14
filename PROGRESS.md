@@ -5513,7 +5513,7 @@ O(n) heap scan (documented limitation).
 ## Default buffer-pool capacity raised 4096 -> 65536 frames (2026-07-14)
 
 **Branch:** `bump-default-buffer-pool-capacity`
-**PR:** _pending review_
+**PR:** #105
 
 ### Problem
 

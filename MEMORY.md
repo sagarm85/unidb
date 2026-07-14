@@ -13,7 +13,7 @@
 ## Current status
 
 - **Default buffer-pool capacity raised 4096 -> 65536 frames — 2026-07-14,
-  branch `bump-default-buffer-pool-capacity`, PR pending review.**
+  branch `bump-default-buffer-pool-capacity`, PR #105.**
   Found via `unidb-studio` demo debugging (post items 35/36): the old default
   (32 MiB) is exhausted by a single ~30k-row table, and `fetch_page_for_write`
   forces a synchronous `wal.sync()` on every write once full
