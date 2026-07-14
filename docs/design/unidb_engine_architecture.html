@@ -115,7 +115,8 @@ loses <b>zero</b> data on a crash where the four-system stack tears a record.
         <li><a href="#s6-4">Graph relationships</a></li></ol></li>
   <li><a href="#s7">Real-time events &amp; streaming</a>
     <ol><li><a href="#s7-1">Delivery performance</a></li>
-        <li><a href="#s7-2">Change-data-capture (CDC) compatibility</a></li></ol></li>
+        <li><a href="#s7-2">Offsets, multiple consumers &amp; falling behind</a></li>
+        <li><a href="#s7-3">Change-data-capture (CDC) compatibility</a></li></ol></li>
   <li><a href="#s8">The REST server — full API reference</a>
     <ol><li><a href="#s8-1">Getting started</a></li>
         <li><a href="#s8-2">Running SQL</a></li>
@@ -876,7 +877,61 @@ table size — versus a few milliseconds for the equivalent Postgres
 <code>SKIP LOCKED</code> pattern.
 </p>
 
-<h3 id="s7-2">7.2 Change-data-capture (CDC) compatibility</h3>
+<h3 id="s7-2">7.2 Offsets, multiple consumers &amp; falling behind</h3>
+<p>
+Each named consumer tracks its own durable position in the stream — a single
+number, its <b>offset</b> — advanced only when that consumer explicitly
+acknowledges what it processed. Polling never moves the offset by itself: you
+poll to read, then separately acknowledge to say "I've safely handled
+everything up through here." A crash between the two just redelivers the same
+events next time — nothing is lost, and duplicates are safe to detect by each
+event's own sequence number.
+</p>
+
+<h4>Multiple consumers, fully independent</h4>
+<p>
+Any number of named consumers can read the same stream at their own pace,
+each with its own offset — a billing worker three events behind and an
+analytics job three million events behind coexist without affecting each
+other. Neither can starve or block the other; there's no shared "head of
+line."
+</p>
+
+<h4>What happens if a consumer falls behind</h4>
+<p>
+Falling behind never slows anything down — polling stays fast regardless of
+how large the backlog grows (Section 7.1). What it affects is <b>cleanup</b>:
+old events are only reclaimed once <i>every</i> registered consumer has
+acknowledged past them, so one stuck consumer holds the whole table's cleanup
+hostage — the event history keeps growing until that consumer catches up, or
+is removed.
+</p>
+<p>
+That makes lag worth watching, not something that silently breaks anything:
+</p>
+<ul>
+<li><b>Check it directly</b> — <code>SELECT * FROM unidb_catalog.subscription_lag</code>
+  returns, per consumer, how many events behind it is and how old the oldest
+  unprocessed one is.</li>
+<li><b>Or watch it continuously</b> — the same numbers are on <code>GET /stats</code>
+  and published as Prometheus gauges (<code>unidb_subscription_lag_events</code>,
+  <code>unidb_subscription_lag_seconds</code>) — alert at whatever threshold
+  makes sense for that consumer: seconds for a near-real-time pipeline,
+  thousands of events for a batch job.</li>
+<li><b>If a consumer is never coming back, remove its registration</b> — that's
+  what releases the events it was pinning.</li>
+</ul>
+<p>
+Two delivery modes exist depending on whether this durability is what you
+need: a <b>named, durable consumer</b> gets everything above (at-least-once,
+survives a crash, tracked and alertable); an <b>ephemeral live tail</b> (no
+consumer name — the shape a browser tab watching a table live would use)
+keeps no server-side offset at all and simply resumes from wherever the
+connection tells it to on reconnect. Choose durable when losing an event
+matters; choose ephemeral when you only care what happens next.
+</p>
+
+<h3 id="s7-3">7.3 Change-data-capture (CDC) compatibility</h3>
 <p>
 Every captured event carries the full <b>before</b> and <b>after</b> row image
 (for an INSERT, only <code>after</code>; for a DELETE, only <code>before</code>;
