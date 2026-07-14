@@ -442,11 +442,102 @@ fn bench_rest_enrichment(c: &mut Criterion) {
     group.finish();
 }
 
+/// (7) Bulk-load throughput (item 32): `POST /tables/{name}/bulk` with NDJSON
+/// bodies of increasing sizes. Reports rows/sec for a table with one B-tree
+/// index (id column) and for a table with no secondary index, so the index-
+/// count dependency is visible. Compare against the existing `oneshot_100_inserts`
+/// (one HTTP call per row = ~1.5 ms/row) to confirm the amortisation win.
+fn bench_bulk_load(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bulk_load");
+    let rt = tokio_rt();
+    let base_url = spawn_bench_server(&rt);
+    let client = reqwest::Client::new();
+    let auth = format!("Bearer {}", bench_token());
+
+    // Create two tables: one with a B-tree index on id, one without.
+    rt.block_on(async {
+        client
+            .post(format!("{base_url}/sql"))
+            .header("Authorization", &auth)
+            .json(&serde_json::json!({"sql": "CREATE TABLE bulk_no_idx (id INT, name TEXT)"}))
+            .send()
+            .await
+            .unwrap();
+        client
+            .post(format!("{base_url}/sql"))
+            .header("Authorization", &auth)
+            .json(&serde_json::json!({"sql": "CREATE TABLE bulk_with_idx (id INT, name TEXT)"}))
+            .send()
+            .await
+            .unwrap();
+        // Build a B-tree on bulk_with_idx.id
+        client
+            .post(format!("{base_url}/indexes"))
+            .header("Authorization", &auth)
+            .json(&serde_json::json!({"table":"bulk_with_idx","column":"id","kind":"btree"}))
+            .send()
+            .await
+            .unwrap();
+    });
+
+    for &n_rows in &[1_000usize, 10_000, 50_000] {
+        let ndjson_no_idx: String = (0..n_rows)
+            .map(|i| format!("{{\"id\":{i},\"name\":\"user_{i}\"}}\n"))
+            .collect();
+        let ndjson_with_idx = ndjson_no_idx.clone();
+
+        group.throughput(criterion::Throughput::Elements(n_rows as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("no_index", n_rows),
+            &ndjson_no_idx,
+            |b, body| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let resp = client
+                            .post(format!("{base_url}/tables/bulk_no_idx/bulk"))
+                            .header("Authorization", &auth)
+                            .header("Content-Type", "application/x-ndjson")
+                            .body(body.clone())
+                            .send()
+                            .await
+                            .unwrap();
+                        assert_eq!(resp.status().as_u16(), 200);
+                    });
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("with_btree_index", n_rows),
+            &ndjson_with_idx,
+            |b, body| {
+                b.iter(|| {
+                    rt.block_on(async {
+                        let resp = client
+                            .post(format!("{base_url}/tables/bulk_with_idx/bulk"))
+                            .header("Authorization", &auth)
+                            .header("Content-Type", "application/x-ndjson")
+                            .body(body.clone())
+                            .send()
+                            .await
+                            .unwrap();
+                        assert_eq!(resp.status().as_u16(), 200);
+                    });
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(10);
     targets = bench_insert_direct_vs_http, bench_jwt_verification,
               bench_sse_polling_overhead, bench_concurrent_http_throughput,
-              bench_concurrent_read_throughput, bench_rest_enrichment
+              bench_concurrent_read_throughput, bench_rest_enrichment,
+              bench_bulk_load
 }
 criterion_main!(benches);

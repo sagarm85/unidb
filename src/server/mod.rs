@@ -22,6 +22,7 @@
 //! logic beyond one `PrometheusMetricLayer::pair()` call.
 
 pub mod auth;
+pub mod bulk;
 pub mod correlation;
 pub mod cursor;
 pub mod dto;

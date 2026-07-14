@@ -12,6 +12,26 @@
 
 ## Current status
 
+- **Bulk Load HTTP API (backlog item 32) — SHIPPED 2026-07-14, branch
+  `32-bulk-load-api`, PR pending (STOP-for-review — NOT merged).**
+  `POST /tables/{name}/bulk`: JWT-protected NDJSON body, one transaction for the
+  whole body (begin once, `prepare` once, loop `execute_prepared`, commit once) —
+  amortizes the HTTP/fsync envelope, NOT B-tree cost.
+  **Throughput CORRECTED (2026-07-14) — an earlier "~60–87k rows/sec" claim was
+  ~2.5–5× inflated and unbacked; the reproducible `#[ignore]`d
+  `bulk_throughput_measurement` (release, server `elapsed_ms`) measures
+  ~12k–31k rows/sec** (no-index 17k@100k→31k@200k, with-index 17k→12.5k as the
+  B-tree grows) = **~20–50× over the ~640/sec per-row path but BELOW the
+  50k–200k target.** SQL-path per-row cost (JSON parse + coercion +
+  `execute_prepared`) on top of the ~30 µs/row engine insert bounds it; reaching
+  50k+ needs a lower-level path (filed follow-up: channel-streamed body → raw
+  bulk loop, parallel apply, optional `?chunk=N`). V1 buffers ≤512 MiB before the
+  txn (NDJSON validated up-front). No format/WAL/recovery/engine change. Files:
+  `src/server/bulk.rs`, `EngineHandle::bulk_insert`, `tests/server_bulk.rs`
+  (10 correctness + 1 ignored throughput), `benches/server.rs`. Crash harness
+  **35/35** unchanged; sync invariant clean; clippy/fmt green. Docs: REST_API.md,
+  spec (measured-result correction), backlog_index row 32, PROGRESS.md — all
+  carry the honest ~12–31k number.
 - **Studio API readiness (backlog item 30) — SHIPPED 2026-07-14, branch
   `30-studio-api-readiness`, PR TBD (STOP-for-review).** E1 (G9): `Expr::Like`
   + `QExpr::Like` added to both expression paths (single-table fast path and

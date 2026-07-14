@@ -4,7 +4,7 @@
 |--------------|----------------------------------------------------|
 | **Type**     | Performance / Feature                              |
 | **Priority** | High                                               |
-| **Status**   | 🟡 BACKLOG                                         |
+| **Status**   | ✅ SHIPPED — branch `32-bulk-load-api` (see `PROGRESS.md`) |
 | **Blocks**   | Demo seeding > 200k rows; data-migration tooling   |
 
 ---
@@ -105,11 +105,32 @@ Response (streaming progress or final summary):
 | Auth | Same Bearer JWT as every other route |
 | Idempotency | Not guaranteed; caller should truncate first if re-running |
 
-### Expected performance gain
+### Expected performance gain (target)
 
 Eliminating per-call HTTP overhead and processing rows in a tight server loop
-should yield **50 k–200 k rows/second** (10–100× improvement), consistent with
-what PostgreSQL achieves with its `COPY` path.
+was *targeted* at **50 k–200 k rows/second**, consistent with PostgreSQL's
+`COPY` path.
+
+### Measured result (2026-07-14) — honest correction, target not reached
+
+The shipped endpoint achieves **~12 k–31 k rows/sec**, reproducibly measured
+(release; the `#[ignore]`d `tests/server_bulk.rs::bulk_throughput_measurement`,
+server-reported `elapsed_ms`):
+
+| Rows | No secondary index | With a B-tree index |
+|-----:|-------------------:|--------------------:|
+| 100 k | 17.2 k rows/sec | 16.6 k rows/sec |
+| 200 k | **30.6 k** (amortizes toward the ~33 k engine batched ceiling) | **12.5 k** (degrades — B-tree cost grows with the tree) |
+
+That is a **~20–50× win over the ~640 rows/sec per-row `/sql` path**, but
+**below the 50 k–200 k target**. Why: each row still pays JSON parse +
+type-coercion + a `execute_prepared` call on top of the engine's ~30 µs/row
+insert, and a B-tree index's per-insert cost rises as the table grows. The
+engine's own batched insert ceiling (~31 k–34 k rows/sec, single-threaded, with
+one index) *bounds* the SQL-path approach — reaching 50 k+ needs a lower-level
+path. **Follow-up filed:** channel-streamed body → a lower-level bulk-insert
+loop (bypassing per-row SQL parse/coercion) and/or parallel apply; an optional
+`?chunk=N` commit mode to bound the whole-body undo/horizon footprint.
 
 ---
 

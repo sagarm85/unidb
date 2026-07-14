@@ -372,6 +372,55 @@ impl EngineHandle {
             .await
     }
 
+    /// Bulk-insert `rows` into `table` in one transaction (item 32).
+    ///
+    /// Builds a parameterized `INSERT INTO {table} ({cols}) VALUES ($1, …)`
+    /// once, then loops `execute_prepared` for each row, and commits once.
+    /// Returns the count of inserted rows. On any engine error the transaction
+    /// is aborted — the entire batch is atomic (all-or-nothing).
+    ///
+    /// The column names and rows are validated by the caller (`bulk.rs`) before
+    /// this is called, so identifiers here are already safe to interpolate.
+    pub async fn bulk_insert(
+        &self,
+        table: String,
+        columns: Vec<String>,
+        rows: Vec<Vec<crate::sql::logical::Literal>>,
+    ) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        self.on_engine(move |engine| {
+            let placeholders = (1..=columns.len())
+                .map(|i| format!("${i}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let col_list = columns.join(", ");
+            let sql = format!("INSERT INTO {table} ({col_list}) VALUES ({placeholders})");
+            let prepared = engine.prepare(&sql)?;
+            let xid = engine.begin()?;
+            let mut inserted = 0u64;
+            let result: Result<()> = (|| {
+                for params in &rows {
+                    engine.execute_prepared(xid, &prepared, params)?;
+                    inserted += 1;
+                }
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    engine.commit(xid)?;
+                    Ok(inserted)
+                }
+                Err(e) => {
+                    let _ = engine.abort(xid);
+                    Err(e)
+                }
+            }
+        })
+        .await
+    }
+
     /// Release the shared engine. Every write already made itself durable at
     /// commit (group commit forces the WAL fsync before `commit` returns), so
     /// there is nothing to flush here; dropping the last `Arc<Engine>` closes
