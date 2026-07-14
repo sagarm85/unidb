@@ -5400,5 +5400,29 @@ W4/W0 ~1.3× (within historical band; the fix does not touch the W0–W4 ladder)
 | `pk_update_throughput_is_flat` | ✅ pass |
 | MVCC invariants (3 tests) | ✅ pass |
 | `null_distinctness_preserved_with_implicit_index` | ✅ pass |
+| `pk-unique-race` (conc_matrix, CONC_REPEATS=10) | ✅ **10/10 PASS** (toggle off + on) |
 
 **No FORMAT_VERSION bump.** `unique_index_root` is in catalog JSON (not binary storage format); `#[serde(default)]` makes pre-item-35 databases open cleanly. No §3 locked-decision change. Composite keys remain out of scope (forward-compatible key encoding ready for future extension).
+
+### Follow-up fix — concurrent-INSERT PK race (2026-07-14)
+
+**Root cause:** Two concurrent INSERT transactions racing the same PK/UNIQUE value could
+both pass `enforce_unique` (neither saw the other's uncommitted row under MVCC) and both
+commit — producing a visible duplicate. This is the class of bug item 16 exposed for
+plain row contention, now applied to uniqueness enforcement.
+
+**Fix:** `RecordKind::UniqueKey` phantom lock added to the lock manager. `exec_insert`
+acquires an exclusive `UniqueKey` lock (keyed by a stable hash of `table + col + value`)
+via `WaitPolicy::Wait` **before** calling `snapshot_for_statement`. The losing concurrent
+inserter blocks; when the winner commits and releases all locks, the waiter unblocks, takes
+a fresh snapshot that includes the committed row, and `enforce_unique` returns
+`UniqueViolation`. No duplicate is ever committed. Lock released automatically via
+`LockManager::release_all` at commit/abort.
+
+**New conc_matrix cell:** `pk-unique-race` — 6 writers race `INSERT` the same PK key per
+round (20 rounds per repeat). Asserts exactly 1 commits per round and no duplicate is
+visible in a subsequent `SELECT`. Run at `CONC_REPEATS=10`: **10/10 PASS** on both
+`toggle=off` and `toggle=on`. This closes the missing acceptance-criteria checkbox from
+the spec correction in PR #101.
+
+**Commit:** `e91f120` — pushed to branch `35-unique-index-enforcement` as part of PR #102.
