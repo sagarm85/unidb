@@ -4,6 +4,15 @@
 **Status:** NOT STARTED
 **Priority:** Critical — hits nearly every real schema (any table with a `PRIMARY KEY`), not a niche path
 
+> **Correction (2026-07-14, §9):** Phase 2 invariant 3 (concurrent inserters
+> racing the same key) always required `benches/conc_matrix.rs` proof, but the
+> Acceptance Criteria checklist below did not carry an explicit checkbox for
+> it — a session following only the checklist could skip the one test this
+> fix is most at risk of needing, since it rides the same MVCC-under-
+> concurrency class of bug item 16 broke and fixed. Added below as its own
+> checkbox. If your worktree branched before this correction, add that test
+> before opening the PR.
+
 ---
 
 ## Problem
@@ -199,6 +208,13 @@ within the same order of magnitude as no-PK / as PG," not a headline PG win.
       enforcement. Include a same-statement-duplicate test (two rows with the
       same PK value in one multi-row INSERT/bulk batch) to lock in point 2
       above.
+- [ ] **New `benches/conc_matrix.rs` cell: concurrent inserters racing the same
+      PK/UNIQUE value.** Two or more writers concurrently attempt to insert the
+      same key; exactly one must commit, the rest must abort/retry with the
+      constraint violation (or an equivalent conflict), and no duplicate key
+      must ever become visible — under `CONC_REPEATS=10` like the rest of the
+      matrix. This locks in Phase 2 invariant 3 and is the direct test for the
+      class of bug item 16 broke and fixed; do not ship without it.
 - [ ] Crash harness unaffected — unless an implicit index is added, in which
       case: a new crash point proving recovery of the implicit index, and an
       explicit §3 sign-off recorded in `PROGRESS.md` if a `FORMAT_VERSION`
