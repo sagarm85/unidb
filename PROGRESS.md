@@ -5693,3 +5693,70 @@ Acceptance criterion: ≥ 5× — **met (11.2×)**.
 | `btree_assisted_select_matches_full_scan_equality_and_range` | ✅ passes |
 | No `FORMAT_VERSION` bump | ✅ confirmed |
 | No locked-decision (§3) change | ✅ none |
+
+## Item 41 — NEAR() vec_distance virtual column   [SHIPPED]   2026-07-14
+
+**Branch:** `claude/near-vec-distance-docs-ysqyvn`
+**Spec:** `docs/backlog/41_near_vec_distance.md`
+
+### Problem
+
+`WHERE NEAR(embedding, [...], k)` ranks and returns the k nearest rows by
+Euclidean distance but never exposed that distance to the caller —
+`SELECT id, title, vec_distance FROM documents WHERE NEAR(...)` returned
+`COLUMN_NOT_FOUND · column 'vec_distance' not found on table ''` even though
+`exec_select_near` (`src/sql/executor.rs`) already computes the exact
+re-ranked distance for every candidate to sort them. Every other vector
+database (pgvector's `<->` operator, Qdrant/Pinecone's payload `score` field)
+exposes this; unidb's `NEAR` result rows were otherwise indistinguishable in
+relevance quality.
+
+### Fix
+
+`exec_select_near` now carries its already-computed `f32` distance through to
+projection instead of discarding it after sorting. A new helper,
+`project_row_near` (alongside the existing `project_row`), resolves each
+projected name normally *except* the reserved virtual column name
+`vec_distance` (`VEC_DISTANCE_COL` constant), which it substitutes with
+`Literal::Float(distance as f64)` — no catalog column, no table storage, no
+`ColumnDef` change. `SELECT *` (empty projection) falls through unchanged to
+`project_row`, so the virtual column never appears unless explicitly named,
+matching the convention every other engine uses for computed columns.
+
+Outside a `NEAR` predicate, `vec_distance` was never added to any table's
+catalog columns, so `project_row`/`eval_expr`'s existing column-lookup
+already returns `COLUMN_NOT_FOUND` for it — the second acceptance criterion
+required no code change at all, only a regression test to prove it stays true.
+
+### Spec correction (§9 — inline, not silent)
+
+The spec's fourth acceptance criterion asked to update `vector_demo.py` to
+print `id, title, vec_distance`. Grepped the entire repository (including
+`unidb-attach`, `unidb-embed`, `scripts/`, `docs/`) for `vector_demo.py` or
+any Python demo script — **none exists**. This criterion describes a file
+that isn't part of this codebase (likely carried over from a different
+project template when the spec was written). Nothing to update; substituted
+with an equivalent integration test (below) that seeds the exact
+id/title/distance corpus from the spec's own example table and asserts the
+same ascending order and values.
+
+### New files / key changes
+
+- `src/sql/executor.rs`: `VEC_DISTANCE_COL` constant, `project_row_near`
+  helper, `exec_select_near` threads `dist` through to projection.
+- `tests/vec_distance.rs` (3 new tests): `vec_distance_returned_ascending_for_known_corpus`
+  (seeds the spec's example rows, asserts exact distance values + ascending
+  order + `k`-truncation), `vec_distance_outside_near_context_is_column_not_found`,
+  `select_star_never_includes_vec_distance`.
+
+### Gates
+
+| Gate | Result |
+|------|--------|
+| `cargo fmt --all --check` | ✅ clean |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ✅ clean |
+| `cargo test --workspace` | ✅ all green (3 new tests) |
+| crash harness (`cargo test --test crash`) | ✅ unchanged (no storage/WAL/format change) |
+| No `FORMAT_VERSION` bump | ✅ confirmed — purely a projection-layer read |
+| No locked-decision (§3) change | ✅ none |
+| No API/catalog changes | ✅ confirmed — matches spec's declared scope |

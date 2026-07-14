@@ -1938,7 +1938,10 @@ fn exec_select_near(
             Literal::Vector(v) => ivf_exact_distance(metric, query, v),
             _ => continue,
         };
-        scored.push((dist, project_row(projection, &table_def.columns, &row)?));
+        scored.push((
+            dist,
+            project_row_near(projection, &table_def.columns, &row, dist)?,
+        ));
     }
     scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(k);
@@ -2981,6 +2984,47 @@ pub(crate) fn output_columns(projection: &[String], columns: &[ColumnDef]) -> Ve
     } else {
         projection.to_vec()
     }
+}
+
+/// Virtual computed-column name exposed only inside a `NEAR(...)` query's
+/// projection (item 41): the Euclidean distance the HNSW/IVF-Flat scan
+/// already computed for re-ranking (see [`exec_select_near`]). It is not a
+/// real catalog column, so [`project_row`]'s normal column lookup would
+/// reject it with `COLUMN_NOT_FOUND` — which is exactly the desired behavior
+/// outside a `NEAR` context.
+pub(crate) const VEC_DISTANCE_COL: &str = "vec_distance";
+
+/// [`project_row`] plus the `vec_distance` virtual column (item 41): every
+/// projected name is resolved as a real column, *except* `vec_distance`,
+/// which substitutes `distance` directly. `SELECT *` (empty projection) never
+/// includes it — a virtual column only surfaces when explicitly named, same
+/// as every other SQL engine's computed-expression convention.
+fn project_row_near(
+    projection: &[String],
+    columns: &[ColumnDef],
+    row: &[Literal],
+    distance: f32,
+) -> Result<Vec<Literal>> {
+    if projection.is_empty() {
+        return project_row(projection, columns, row);
+    }
+    projection
+        .iter()
+        .map(|name| {
+            if name == VEC_DISTANCE_COL {
+                Ok(Literal::Float(distance as f64))
+            } else {
+                let idx = columns
+                    .iter()
+                    .position(|c| &c.name == name && !c.dropped)
+                    .ok_or_else(|| DbError::ColumnNotFound {
+                        table: String::new(),
+                        column: name.clone(),
+                    })?;
+                Ok(row[idx].clone())
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn project_row(

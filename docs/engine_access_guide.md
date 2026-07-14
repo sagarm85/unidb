@@ -139,6 +139,14 @@ any access path; the same parser/planner/executor runs underneath all three.
   search (index via `CREATE INDEX … USING FULLTEXT`; predicate via `MATCH(col,
   'text')` in `WHERE`), graph edges (Cypher subset via a separate entry point), a
   WAL-derived event queue.
+- **`NEAR` relevance score (item 41):** project the virtual column
+  `vec_distance` alongside a `NEAR(...)` predicate to get the exact
+  re-ranked Euclidean distance for each row — `SELECT id, title, vec_distance
+  FROM documents WHERE NEAR(embedding, [...], k)` returns rows ascending by
+  distance (closest first) as `Float`. It only resolves inside a `NEAR`
+  query's projection; `SELECT vec_distance FROM t` without a `NEAR` predicate,
+  or `SELECT *`, never surfaces it (`COLUMN_NOT_FOUND`/omitted respectively) —
+  it is not a real catalog column.
 
 **Not supported yet** — so you don't guess:
 

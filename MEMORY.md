@@ -12,6 +12,18 @@
 
 ## Current status
 
+- **NEAR() vec_distance virtual column (item 41) — SHIPPED 2026-07-14, branch
+  `claude/near-vec-distance-docs-ysqyvn`.**
+  `exec_select_near` (`src/sql/executor.rs`) already computed the exact
+  re-ranked Euclidean distance for every `NEAR` candidate to sort it, but
+  never exposed it — `SELECT id, vec_distance FROM t WHERE NEAR(...)` returned
+  `COLUMN_NOT_FOUND`. New `project_row_near` helper substitutes the reserved
+  virtual column name `vec_distance` with the computed `Literal::Float`
+  distance; `SELECT *` never includes it; outside a `NEAR` predicate the
+  existing column lookup already returns `COLUMN_NOT_FOUND` (no code change
+  needed for that half). 3 new tests in `tests/vec_distance.rs`. No
+  catalog/API/format change. Spec's `vector_demo.py` acceptance item corrected
+  inline — no such file exists anywhere in this repo.
 - **B-tree index sort-then-bulk-load (item 40) — SHIPPED 2026-07-15, branch
   `40-btree-bulk-build`, PR #107 (MERGED).**
   `CREATE INDEX USING BTREE` on 540k rows: 134.2 s → 12.0 s (11.2×). Fix:
@@ -3274,6 +3286,40 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-14 — Item 41: NEAR() vec_distance virtual column
+
+- **Problem:** `SELECT id, title, vec_distance FROM t WHERE NEAR(...)`
+  returned `COLUMN_NOT_FOUND` — `exec_select_near` (`src/sql/executor.rs`)
+  already computes the exact re-ranked Euclidean distance for every
+  candidate to sort them, but discarded it after sorting instead of
+  threading it through to projection.
+- **Fix:** new `project_row_near` helper (alongside `project_row`) resolves
+  every projected name normally except the reserved virtual name
+  `vec_distance` (`VEC_DISTANCE_COL` const), which it substitutes with
+  `Literal::Float(distance as f64)`. `SELECT *` (empty projection) still
+  falls through to plain `project_row`, so the virtual column never leaks
+  into `SELECT *` output. Outside a `NEAR` predicate nothing changed —
+  `vec_distance` was never added to any catalog, so the existing column
+  lookup already raises `COLUMN_NOT_FOUND` there.
+- **Spec correction (inline, §9):** the spec's 4th acceptance criterion asked
+  to update `vector_demo.py`; grepped the whole repo — no such file (or any
+  Python demo) exists anywhere in this codebase. Marked as N/A with a dated
+  note in `41_near_vec_distance.md` rather than silently dropping it;
+  substituted an equivalent integration test that seeds the spec's own
+  example corpus and asserts the same values/order.
+- **Tests:** `tests/vec_distance.rs`, 3 new tests — ascending order + exact
+  distance values for a known corpus (mirrors the spec's example table),
+  `COLUMN_NOT_FOUND` outside `NEAR`, `SELECT *` never includes it.
+- Gates: `cargo fmt --all --check` clean, `cargo clippy --workspace
+  --all-targets -- -D warnings` clean, `cargo test --workspace --features
+  server` green. No storage/WAL/format touch → crash harness unaffected, no
+  new crash point needed. No `FORMAT_VERSION` bump, no §3 decision touched,
+  no API/catalog change (matches the spec's declared scope).
+- Docs: `41_near_vec_distance.md` → SHIPPED; `backlog_index.md` row 41 →
+  SHIPPED; `PROGRESS.md` item 41 entry added; `engine_access_guide.md` §2
+  SQL-surface list gained a `vec_distance` bullet.
+- Branch `claude/near-vec-distance-docs-ysqyvn`.
 
 ### 2026-07-15 — Item 40: B-tree index sort-then-bulk-load backfill
 
