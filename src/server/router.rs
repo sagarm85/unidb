@@ -162,8 +162,19 @@ pub fn build_router(
         .layer(CorsLayer::permissive())
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
-            std::time::Duration::from_secs(30),
+            router_timeout(),
         ))
+}
+
+/// Global request timeout, overridable via `UNIDB_REQUEST_TIMEOUT_SECS`.
+/// Default: 120 s — large enough for 100k-row bulk payloads on the `/tables/{name}/bulk`
+/// endpoint (item 32). Set to 0 to disable entirely (development / local bulk tooling).
+pub(crate) fn router_timeout() -> std::time::Duration {
+    let secs: u64 = std::env::var("UNIDB_REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120);
+    std::time::Duration::from_secs(secs)
 }
 
 /// Republish a `stats()` snapshot through the Prometheus facade (item 21).
