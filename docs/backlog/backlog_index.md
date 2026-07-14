@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `36_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `37_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -49,10 +49,11 @@
 | 33 | `33_cdc_management_api.md` | Improvement | ✅ SHIPPED 2026-07-14 — `GET /tables/{name}/events` (CDC status), `DELETE /tables/{name}/events` (disable, idempotent), `GET /events/head` (current seq without streaming); P34 crash test; 6 integration tests |
 | 34 | `34_observability_api_gaps.md` | Improvement | ✅ SHIPPED 2026-07-14 — `UNIDB_SLOW_QUERY_MS` env var; `PUT /config/slow_query_threshold_ms`; `GET /stats/history` 300-point ring buffer with server-computed rate fields |
 | 35 | `35_unique_constraint_full_scan.md` | Improvement | ⏳ NOT STARTED — **critical**: `enforce_unique()` full heap-scans on every INSERT/UPDATE for any `PRIMARY KEY`/`UNIQUE` table; O(n²) bulk load. Measured >100× slower than a no-PK table at just 15k rows |
+| 36 | `36_foreign_key_row_enforcement.md` | Improvement | ⏳ NOT STARTED — FK enforces referenced-*table* existence only, not row-level referential integrity (dangling child refs accepted; no RESTRICT/CASCADE). Documented M11-deferred scope; **depends on item 35** (reuses the parent PK index — cheap after 35, O(n²) before) |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `36_…`.**
+**Next new file → `37_…`.**
 
 ## Next up (candidates — pick one, then create `NN_<slug>.md`)
 
@@ -73,6 +74,17 @@ whenever any unique constraint exists (the existing `has_unique` gate only
 helps when there is *no* constraint). Hits nearly every real schema, not a
 niche path — see the spec for the root-cause chain and open fix-design
 questions.
+
+**#36 — Foreign keys enforce table existence only, not row-level integrity
+(`36_foreign_key_row_enforcement.md`, NOT STARTED) — do AFTER #35.**
+`enforce_referenced_tables_exist()` (`src/sql/executor.rs:2090`, the sole
+`ForeignKeyViolation` site at `:2093`) checks only that the referenced *table*
+exists — a child row referencing a non-existent parent key is accepted, and
+parent deletes neither block nor cascade. A documented, deliberate M11-deferred
+scope (`src/catalog.rs:132-140`), not an accidental bug. **Depends on item 35:**
+the row-existence check is a point lookup into the parent's `PRIMARY KEY` index —
+exactly what #35 builds — so it is O(log n) after #35 and a fresh O(n²) mistake
+before it. Ship #35 first, then reuse its index machinery here.
 
 0. **Item 18 — Engine access & introspection contract — ✅ SHIPPED 2026-07-13**
    (branch `18-engine-access-contract-impl`). Delivered the `information_schema`-
