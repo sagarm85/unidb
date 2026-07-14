@@ -75,6 +75,9 @@ pub mod queue;
 pub mod read_handle;
 pub mod recovery;
 pub mod replication;
+/// Stats-history ticker (item 34) — background thread that snapshots engine
+/// counters every 5 s into a 300-point ring, enabling `GET /stats/history`.
+pub mod stats_ticker;
 // Item 31: abstract async storage API — trait + types only, no feature gate.
 // `unidb-storage` implements `StorageApi` for `StorageService` without
 // enabling the `server` feature (avoids the circular crate dep `unidb` →
@@ -579,6 +582,15 @@ pub struct Engine {
     /// Time-based PITR timeline index (item 28, R1). Records one (ts, lsn) mark
     /// per committed user transaction after WAL sync, enabling `restore_to_time`.
     timeline: crate::backup::timeline::TimelineIndex,
+    /// Stats-history ring buffer (item 34): up to 300 timestamped `StatsPoint`
+    /// snapshots (~25 min at 5 s/tick). Populated by the background
+    /// `stats_ticker` thread; read by `GET /stats/history`. Pure in-memory —
+    /// no WAL/format touch; crash-harness count is unchanged.
+    stats_history: Mutex<std::collections::VecDeque<StatsPoint>>,
+    /// Background stats-ticker handle (item 34). `None` for a bare
+    /// `Engine::open()` handle; present after `spawn_stats_ticker` is called
+    /// on an `Arc<Engine>` (server path only — mirrors `autovacuum_handle`).
+    stats_ticker_handle: Mutex<Option<crate::stats_ticker::StatsTickerHandle>>,
 }
 
 /// One slow-query-log entry (P6.g).
@@ -586,6 +598,41 @@ pub struct Engine {
 pub struct SlowQuery {
     pub sql: String,
     pub micros: u64,
+}
+
+/// Maximum number of history points the ring buffer retains (item 34).
+/// 300 × 5 s = 25 min of history; ~72 KiB peak memory.
+const STATS_HISTORY_MAX: usize = 300;
+
+/// A raw counter snapshot at one instant — what the stats ticker stores in the
+/// ring buffer (item 34). Not serialized; [`StatsHistoryPoint`] is the
+/// JSON-facing shape with server-side rate fields added.
+#[derive(Debug, Clone)]
+struct StatsPoint {
+    /// Unix epoch milliseconds.
+    t_ms: u64,
+    commits: u64,
+    aborts: u64,
+    active_transactions: usize,
+    wal_bytes: u64,
+    bufferpool_hit_ratio: f64,
+}
+
+/// One element of the `GET /stats/history` response — raw counters plus
+/// server-side rate fields computed from consecutive ring entries (item 34).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StatsHistoryPoint {
+    /// Unix epoch milliseconds of the snapshot.
+    pub t: u64,
+    pub commits: u64,
+    pub aborts: u64,
+    pub active_transactions: usize,
+    pub wal_bytes: u64,
+    /// Commits per second since the previous ring entry; `0.0` for the first point.
+    pub commits_per_sec: f64,
+    /// WAL bytes per second since the previous ring entry; `0.0` for the first point.
+    pub wal_bytes_per_sec: f64,
+    pub bufferpool_hit_ratio: f64,
 }
 
 /// A point-in-time snapshot of engine activity + counters (P6.g) — the
@@ -1010,6 +1057,8 @@ impl Engine {
             stmt_latency_delete: crate::metrics::AtomicHistogram::new(),
             stmt_latency_select: crate::metrics::AtomicHistogram::new(),
             timeline: crate::backup::timeline::TimelineIndex::open(dir)?,
+            stats_history: Mutex::new(std::collections::VecDeque::new()),
+            stats_ticker_handle: Mutex::new(None),
         })
     }
 
@@ -1282,6 +1331,67 @@ impl Engine {
             tables: self.table_page_stats(),
             subscription_lag: self.subscription_lag_stats(),
         }
+    }
+
+    /// Capture one stats snapshot into the ring buffer (item 34). Called by the
+    /// background `stats_ticker` thread every 5 s. Lock-free on the hot paths —
+    /// reads atomics/pool stats, then takes the ring lock briefly to append.
+    pub fn capture_stats_point(&self) {
+        let t_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let bp = self.pool.pool_stats();
+        let point = StatsPoint {
+            t_ms,
+            commits: self.commits.load(Ordering::Relaxed),
+            aborts: self.aborts.load(Ordering::Relaxed),
+            active_transactions: self.txn_mgr.active_count(),
+            wal_bytes: self.wal.wal_bytes(),
+            bufferpool_hit_ratio: bp.hit_ratio,
+        };
+        let mut ring = self.stats_history.lock().unwrap_or_else(|e| e.into_inner());
+        ring.push_back(point);
+        while ring.len() > STATS_HISTORY_MAX {
+            ring.pop_front();
+        }
+    }
+
+    /// Return up to `n` most-recent history points (oldest-first) with
+    /// server-side rate fields derived from consecutive ring entries (item 34).
+    /// Returns an empty `Vec` on a fresh engine (not an error).
+    pub fn stats_history_snapshot(&self, n: usize) -> Vec<StatsHistoryPoint> {
+        let ring = self.stats_history.lock().unwrap_or_else(|e| e.into_inner());
+        let skip = ring.len().saturating_sub(n);
+        let pts: Vec<&StatsPoint> = ring.iter().skip(skip).collect();
+        let mut out = Vec::with_capacity(pts.len());
+        for (i, p) in pts.iter().enumerate() {
+            let (commits_per_sec, wal_bytes_per_sec) = if i == 0 {
+                (0.0_f64, 0.0_f64)
+            } else {
+                let prev = pts[i - 1];
+                let dt_ms = p.t_ms.saturating_sub(prev.t_ms);
+                if dt_ms == 0 {
+                    (0.0, 0.0)
+                } else {
+                    let dt_sec = dt_ms as f64 / 1000.0;
+                    let dc = p.commits.saturating_sub(prev.commits) as f64;
+                    let dw = p.wal_bytes.saturating_sub(prev.wal_bytes) as f64;
+                    (dc / dt_sec, dw / dt_sec)
+                }
+            };
+            out.push(StatsHistoryPoint {
+                t: p.t_ms,
+                commits: p.commits,
+                aborts: p.aborts,
+                active_transactions: p.active_transactions,
+                wal_bytes: p.wal_bytes,
+                commits_per_sec,
+                wal_bytes_per_sec,
+                bufferpool_hit_ratio: p.bufferpool_hit_ratio,
+            });
+        }
+        out
     }
 
     /// Per-table heap page counts for the table-health list (item 21). Opens

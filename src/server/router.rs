@@ -83,6 +83,11 @@ pub fn build_router(
         .route("/checkpoint", post(handlers::post_checkpoint))
         .route("/admin/flush", post(handlers::post_admin_flush))
         .route("/stats", get(handlers::get_stats))
+        .route("/stats/history", get(handlers::get_stats_history))
+        .route(
+            "/config/slow_query_threshold_ms",
+            put(handlers::put_config_slow_query_threshold_ms),
+        )
         .route("/logs", get(handlers::get_logs))
         .route(
             "/replication/slots",

@@ -1,7 +1,7 @@
 # Item 34 — Observability API gaps
 
 **Type:** Improvement  
-**Status:** ⏳ NOT STARTED  
+**Status:** 🚀 IN PROGRESS (branch `34-observability-api-gaps`)  
 **Priority:** High — Studio Observability tab charts reset on reload; slow-query panel is always blank
 
 ---

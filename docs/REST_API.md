@@ -845,6 +845,70 @@ The full metric ↔ widget map is `docs/engine_access_guide.md` §10
 
 ---
 
+### `GET /stats/history` (item 34)
+
+Returns the engine's 300-point ring buffer of timestamped stats snapshots, with
+server-side rate fields computed from consecutive entries — the Studio
+Observability tab prefills its charts from this endpoint on mount so they
+survive page reloads.
+
+**Query params:**
+
+| param | default | max | meaning |
+|-------|---------|-----|---------|
+| `points` | 60 | 300 | number of snapshots to return (most recent) |
+| `interval_ms` | 5000 | — | resolution hint; echoed back in response |
+
+Points are oldest-first. The ring is populated by a background thread every 5 s
+once the server starts (`Engine::open()` alone does **not** start the ticker,
+so deterministic tests that use bare `Engine::open()` see an empty ring until
+they call `Engine::capture_stats_point()` manually).
+
+**Response** `200 OK`:
+```json
+{
+  "interval_ms": 5000,
+  "points": [
+    {
+      "t": 1752350400000,
+      "commits": 42, "aborts": 3, "active_transactions": 0, "wal_bytes": 81920,
+      "commits_per_sec": 1.4, "wal_bytes_per_sec": 2048.0,
+      "bufferpool_hit_ratio": 0.96
+    }
+  ]
+}
+```
+
+`commits_per_sec` / `wal_bytes_per_sec` are derived from the delta between
+consecutive ring entries. The first point in the returned slice always has both
+rates as `0.0` (no predecessor). An empty `points: []` is returned on a fresh
+engine and is not an error.
+
+---
+
+### `PUT /config/slow_query_threshold_ms` (item 34)
+
+**Superuser-gated** (same gate as `PUT /tables/{table}/rls` and
+`POST /admin/flush`). Updates the slow-query threshold at runtime without a
+server restart.
+
+**Request body:**
+```json
+{ "threshold_ms": 100 }
+```
+
+`threshold_ms: 0` disables slow-query logging. Positive values enable it: any
+SQL statement whose wall-clock exceeds the threshold is logged via
+`tracing::warn` (target `unidb::slow_query`) and appended to the bounded ring
+surfaced by `GET /stats` → `recent_slow_queries`.
+
+The threshold can also be set at server startup via the `UNIDB_SLOW_QUERY_MS`
+environment variable (absent or `0` = disabled, the default).
+
+**Response** `204 No Content`.
+
+---
+
 ### `GET /logs` (item 22)
 
 **Superuser-gated.** A bounded, cursor-paged tail over the rotated JSON log

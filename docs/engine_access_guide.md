@@ -721,6 +721,46 @@ was added by Milestone 20 — `docs/backlog/20_events_realtime_dispatcher.md`; �
 
 ---
 
+## 13. Observability API gaps (item 34)
+
+### Slow-query threshold (Part A)
+
+Set at server startup via `UNIDB_SLOW_QUERY_MS=100` (absent or `0` = disabled,
+the default). Update at runtime without a restart:
+
+```
+PUT /config/slow_query_threshold_ms
+Authorization: Bearer <superuser-token>
+{ "threshold_ms": 100 }
+```
+
+Once enabled, every SQL statement whose wall-clock exceeds the threshold is:
+1. Emitted as `tracing::warn` (target `unidb::slow_query`), carrying the
+   `request_id`/`txn_id` correlation tags from item 22.
+2. Appended to the 32-entry bounded ring surfaced by `GET /stats` →
+   `recent_slow_queries[]`.
+
+### Stats-history ring buffer (Part B)
+
+The engine maintains a 300-point ring (≈ 25 min at the default 5 s tick).
+The background ticker is started by `EngineHandle::spawn` (the server path),
+so `Engine::open()` alone — used by all deterministic tests — never starts a
+background thread. Tests can inject snapshots manually with
+`engine.capture_stats_point()`.
+
+```
+GET /stats/history?points=60&interval_ms=5000
+Authorization: Bearer <token>
+```
+
+Returns `{ interval_ms, points: [{t, commits, aborts, active_transactions,
+wal_bytes, commits_per_sec, wal_bytes_per_sec, bufferpool_hit_ratio}] }`.
+Rate fields are computed server-side from consecutive ring entries so the
+Studio can replace its client-side delta math. Empty `points: []` on a fresh
+engine (not an error). Points are oldest-first.
+
+---
+
 ## 12. Logical replication and time-based PITR (item 28)
 
 ### Time-based PITR
