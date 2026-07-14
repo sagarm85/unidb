@@ -359,6 +359,54 @@ the same store, protected by the same log.
 <div class="figcap">Figure 4 — Page and row layout. Every page is checksummed; every row records its version stamps.</div>
 </div>
 
+<h4>What you'll actually see on disk</h4>
+<p>
+Point unidb at a directory and this is what appears inside it. Everything
+here is plain files and folders — nothing exotic, nothing that needs a
+special tool to inspect at the filesystem level.
+</p>
+<table>
+<tr><th>Name</th><th>Type</th><th>What it holds</th><th>How it grows</th></tr>
+<tr><td><code>control</code></td><td>File</td>
+    <td>A small pointer telling recovery exactly where to start — the page
+    size in use, where the schema lives, and the last safe checkpoint.</td>
+    <td>Fixed size; rewritten in place at every checkpoint, never grows.</td></tr>
+<tr><td><code>data.db</code></td><td>File</td>
+    <td>The database itself — every table's rows, every index, and the
+    schema, as the 8&nbsp;KiB pages described above.</td>
+    <td>Grows in small fixed-size chunks only as new space is actually
+    needed. No size ceiling.</td></tr>
+<tr><td><code>db.wal/</code></td><td>Folder</td>
+    <td>The write-ahead log — every change, recorded here before it's ever
+    applied to <code>data.db</code> (Section 3.2). Contains one or more
+    numbered log-segment files.</td>
+    <td>Each segment file is capped at a fixed size; once full, a new
+    segment starts. Old segments are deleted automatically once a checkpoint
+    confirms they're no longer needed for recovery.</td></tr>
+<tr><td><code>timeline.bin</code></td><td>File</td>
+    <td>A small marker appended for every committed transaction, used only
+    to resolve a "restore to this point in time" request to the right log
+    position (Section 9). Absent if you've never taken a backup.</td>
+    <td>Grows by a few bytes per commit; no automatic cleanup yet, so a very
+    long-running, high-commit-rate instance is worth keeping an eye on.</td></tr>
+<tr><td><code>audit.log</code></td><td>File</td>
+    <td>Security-relevant events — user, role, and permission changes —
+    appended as plain text. Empty until your first such change.</td>
+    <td>Append-only; grows with auth activity, not with ordinary data
+    traffic.</td></tr>
+<tr><td><code>logs/</code></td><td>Folder</td>
+    <td><i>REST server only</i> — the server's own operational log, not
+    something an embedded-only use creates.</td>
+    <td>One file per calendar day, rotated automatically at midnight.</td></tr>
+</table>
+<p class="small">
+If you find some other file sitting in the same directory — a stray
+<code>server.log</code> or similar — it likely isn't something unidb wrote
+there itself; it's usually just wherever a shell redirected that process's
+console output when it was started. Safe to move or delete independently of
+the files above.
+</p>
+
 <h3 id="s3-2">3.2 How a write becomes permanent</h3>
 <p>
 unidb uses a write-ahead log (WAL): before a change is applied to a page, a
