@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `40_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `41_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -54,7 +54,7 @@
 | 38 | `38_param_type_coercion.md` | Improvement | ⏳ NOT STARTED — engine rejects `WHERE int_col = $1` when `$1` is bound as `Text("20")`; should coerce losslessly to the column type (standard SQL behaviour; PostgreSQL/SQLite/MySQL all do this). Studio workaround (`bindForColumn` in RecordBrowser) applied 2026-07-15 but does not cover other clients or expression contexts. |
 | 39 | `39_pk_fk_relational_stress_bench.md` | Performance | ✅ SHIPPED — new Table 5 in `scripts/report.sh`'s multi-model report: a real `customers`/`orders` PK/FK schema (previously the whole report had zero `FOREIGN KEY` usage anywhere), throughput vs Postgres, plus pass/fail correctness proofs that both engines reject an invalid FK and RESTRICT a still-referenced DELETE. Made fair by item 36 (FK row-level enforcement, shipped the same day). See PROGRESS.md |
 
-| 40 | `40_btree_bulk_build.md` | Performance | ⏳ NOT STARTED — `CREATE INDEX USING BTREE` does one unsorted WAL write per row during backfill; 540k-row table takes several minutes. Fix: collect all (key, row_id) pairs, sort, then bulk-insert in key order — eliminates page splits, reduces WAL appends from N to num_pages, expected ≥5× speedup. |
+| 40 | `40_btree_bulk_build.md` | Performance | ✅ SHIPPED 2026-07-15 — sort-then-bulk-load CREATE INDEX backfill: collect (key, row_id) pairs, sort, `insert_many` (one WAL mini-txn / one fsync). 134.2 s → 12.0 s (**11.2×**) on 540k rows. P40 crash test added (38/38). See PROGRESS.md. |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).

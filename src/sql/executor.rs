@@ -1320,28 +1320,41 @@ fn exec_create_index(
         }
         ivf.meta_page()
     } else {
-        // P3.a/P3.b: a durable BTree/FullText index — a `DiskBTree` backfilled
-        // from every committed row.
+        // P3.a/P3.b: a durable BTree/FullText index — sort-then-bulk-load
+        // (item 40). Phase 1: collect (key, row_id) pairs from the heap.
+        // Phase 2: sort by key. Phase 3: bulk-insert via insert_many, which
+        // wraps the entire build in one WAL mini-txn (one fsync vs. one per
+        // row) and coalesces per-leaf WAL writes. Sorted input drives keys
+        // rightward, filling leaf pages to ~90-95% and eliminating random
+        // splits — the dominant cost in the unsorted path.
         let tree = DiskBTree::create(ctx.pool, ctx.wal)?;
         let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
+        // Phase 1: collect
+        let mut pairs: Vec<(OrderedValue, RowId)> = Vec::new();
         for (row_id, bytes) in heap.scan(&snapshot, ctx.xid, ctx.pool)? {
             let row = decode_row(&bytes, &table_def.columns)?;
             match kind {
                 IndexKind::BTree => {
                     if let Ok(value) = OrderedValue::try_from(&row[col_idx]) {
-                        tree.insert(value, row_id, ctx.pool, ctx.wal)?;
+                        pairs.push((value, row_id));
                     }
                 }
                 IndexKind::FullText => {
                     if let Literal::Text(text) = &row[col_idx] {
                         for token in crate::fulltext::tokenize(text) {
-                            tree.insert(OrderedValue::Text(token), row_id, ctx.pool, ctx.wal)?;
+                            pairs.push((OrderedValue::Text(token), row_id));
                         }
                     }
                 }
                 _ => unreachable!(),
             }
         }
+        // Phase 2: sort by key so rightmost-leaf inserts dominate and page
+        // fill approaches capacity (insert_many also sorts, but pre-sorting
+        // makes the internal sort O(N) on already-sorted input).
+        pairs.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+        // Phase 3: bulk insert — one WAL mini-txn, one fsync for all pairs.
+        tree.insert_many(&pairs, ctx.pool, ctx.wal)?;
         tree.meta_page()
     };
 

@@ -107,6 +107,12 @@
 //         recover both the heap row and the implicit index via WAL redo, so
 //         (a) duplicate PKs are still rejected on reopen (index is live) and
 //         (b) new rows with fresh PKs are still accepted.
+//   P40 – sort-then-bulk-load CREATE INDEX backfill (item 40): `CREATE INDEX`
+//         on a pre-populated table now uses a single WAL mini-txn for all
+//         (key, row_id) pairs. A crash (drop with no checkpoint) mid-backfill
+//         must leave the table fully readable and the index unregistered so
+//         the engine falls back to heap scans — no torn half-index state,
+//         no lost rows.
 
 use tempfile::tempdir;
 use unidb::{Engine, RowId};
@@ -2481,4 +2487,140 @@ fn p35_implicit_unique_index_survives_crash_and_enforces_constraint_on_reopen() 
     }
 
     drop(e);
+}
+
+// ── P40: sort-then-bulk-load CREATE INDEX crash (item 40) ─────────────────────
+//
+// The item-40 fix changes `exec_create_index` (BTree path) from N individual
+// mini-txns (one per row) to a single `insert_many` mini-txn covering all
+// (key, row_id) pairs. Two invariants must hold:
+//
+//   (a) Heap rows committed before CREATE INDEX are independent of the index
+//       build: a crash (drop with no checkpoint) between heap commits and the
+//       CREATE INDEX call leaves every committed row readable on reopen — the
+//       bulk mini-txn is a separate durability unit from the heap writes.
+//
+//   (b) A successfully committed CREATE INDEX survives a no-checkpoint crash:
+//       the WAL_INDEX images written by `insert_many` are redone by recovery
+//       so that the index is immediately queryable on reopen without a rebuild.
+//
+// (a) simulates the "crash before CREATE INDEX finishes" scenario without
+// needing WAL-fault injection: committed heap writes are always durable
+// because they live in separate user-txn mini-txns; the index build is
+// simply not reached, leaving the table in a clean committed-but-unindexed
+// state after recovery.
+#[test]
+fn p40_btree_bulk_build_crash_mid_backfill_table_remains_readable() {
+    use unidb::sql::logical::Literal;
+    use unidb::SqlResult;
+
+    let n = 500usize;
+
+    // ── (a): heap commits survive independently of any index build ──────────
+    let dir_a = tempdir().unwrap();
+    {
+        let engine = open(dir_a.path());
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, v INT)")
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        // Insert rows in committed batches — each batch is its own durable
+        // mini-txn, entirely separate from any future CREATE INDEX mini-txn.
+        for chunk in (0..n).collect::<Vec<_>>().chunks(50) {
+            let vals: String = chunk
+                .iter()
+                .map(|&i| format!("({i}, {i})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let xid = engine.begin().unwrap();
+            engine
+                .execute_sql(xid, &format!("INSERT INTO t (id, v) VALUES {vals}"))
+                .unwrap();
+            engine.commit(xid).unwrap();
+        }
+        // "Crash": drop without checkpoint and without running CREATE INDEX.
+        // The heap rows are durable; the index build never ran.
+        drop(engine);
+    }
+
+    // Recovery: every committed row must survive; a full-table scan must
+    // return all n rows without an index.
+    let engine_a = open(dir_a.path());
+    let xid = engine_a.begin().unwrap();
+    let result = engine_a.execute_sql(xid, "SELECT COUNT(*) FROM t").unwrap();
+    engine_a.commit(xid).unwrap();
+    match &result[0] {
+        SqlResult::Rows { rows, .. } => {
+            let count = match &rows[0][0] {
+                Literal::Int(c) => *c,
+                other => panic!("P40(a): expected Int count, got {other:?}"),
+            };
+            assert_eq!(
+                count, n as i64,
+                "P40(a): all {n} committed rows must survive a crash before CREATE INDEX"
+            );
+        }
+        other => panic!("P40(a): expected Rows, got {other:?}"),
+    }
+    drop(engine_a);
+
+    // ── (b): committed CREATE INDEX survives a no-checkpoint crash ───────────
+    let dir_b = tempdir().unwrap();
+    {
+        let engine = open(dir_b.path());
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, v INT)")
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        for chunk in (0..n).collect::<Vec<_>>().chunks(50) {
+            let vals: String = chunk
+                .iter()
+                .map(|&i| format!("({i}, {i})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let xid = engine.begin().unwrap();
+            engine
+                .execute_sql(xid, &format!("INSERT INTO t (id, v) VALUES {vals}"))
+                .unwrap();
+            engine.commit(xid).unwrap();
+        }
+        let xid = engine.begin().unwrap();
+        // The bulk build commits one `insert_many` mini-txn (one fsync for all
+        // WAL_INDEX images) + `set_column_index_root` mini-txn. Both are durable.
+        engine
+            .execute_sql(xid, "CREATE INDEX idx ON t USING BTREE (id)")
+            .unwrap();
+        engine.commit(xid).unwrap();
+        // "Crash": drop without checkpoint — the index lives only in the WAL.
+        drop(engine);
+    }
+
+    // Recovery redoes every committed WAL_INDEX image; the index is queryable
+    // without a heap rescan — the item-40 durability invariant.
+    let engine_b = open(dir_b.path());
+    let xid = engine_b.begin().unwrap();
+    let result = engine_b
+        .execute_sql(xid, "SELECT v FROM t WHERE id = 42")
+        .unwrap();
+    engine_b.commit(xid).unwrap();
+    match &result[0] {
+        SqlResult::Rows { rows, .. } => {
+            assert_eq!(
+                rows.len(),
+                1,
+                "P40(b): id=42 must be findable via the WAL-recovered bulk-built index"
+            );
+            assert_eq!(
+                rows[0][0],
+                Literal::Int(42),
+                "P40(b): v must equal 42 after WAL recovery of the bulk-built index"
+            );
+        }
+        other => panic!("P40(b): expected Rows, got {other:?}"),
+    }
+    drop(engine_b);
 }

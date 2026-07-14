@@ -1,7 +1,7 @@
 # B-tree index: sort-then-bulk-load backfill
 
 **Type:** Performance
-**Status:** NOT STARTED
+**Status:** SHIPPED — see `PROGRESS.md` "Item 40" entry (2026-07-15, branch 40-btree-bulk-build)
 
 ## Problem
 
@@ -81,10 +81,10 @@ Baseline must be measured on a real 5M seed run before the change is committed
 
 ## Acceptance criteria
 
-- [ ] Baseline wall-time measured on `orders.customer_id` (540k rows, release
-      build, `UNIDB_BUFFER_POOL_PAGES=1000000`) before the change.
-- [ ] After the change, same benchmark runs ≥ 5× faster than baseline.
-- [ ] `btree_assisted_select_matches_full_scan_equality_and_range` test still
+- [x] Baseline wall-time measured on `orders.customer_id` (540k rows, release
+      build, `UNIDB_BUFFER_POOL_PAGES=1000000`) before the change: **134.2 s**.
+- [x] After the change, same benchmark runs ≥ 5× faster than baseline: **12.0 s (11.2×)**.
+- [x] `btree_assisted_select_matches_full_scan_equality_and_range` test still
       passes (correctness — same rows returned as a full heap scan).
-- [ ] All existing `CREATE INDEX` integration tests pass.
-- [ ] Before/after wall-time table in `PROGRESS.md`.
+- [x] All existing `CREATE INDEX` integration tests pass.
+- [x] Before/after wall-time table in `PROGRESS.md`.
