@@ -1,7 +1,7 @@
 # NEAR(): expose vec_distance as a computed output column
 
 **Type:** Improvement
-**Status:** NOT STARTED
+**Status:** SHIPPED (→ PROGRESS.md "NEAR() vec_distance virtual column (item 41)")
 
 ## Problem
 
@@ -63,9 +63,35 @@ Suggested approach:
 
 ## Acceptance criteria
 
-- [ ] `SELECT id, vec_distance FROM t WHERE NEAR(embedding, [...], k)` returns
+- [x] `SELECT id, vec_distance FROM t WHERE NEAR(embedding, [...], k)` returns
       distances as `Float` values, ascending (closest first).
-- [ ] `SELECT vec_distance FROM t` (no NEAR predicate) returns `COLUMN_NOT_FOUND`.
-- [ ] Integration test: distances are in non-decreasing order for a known corpus.
-- [ ] `vector_demo.py` updated to `SELECT id, title, vec_distance` and distances
-      printed alongside titles.
+- [x] `SELECT vec_distance FROM t` (no NEAR predicate) returns `COLUMN_NOT_FOUND`.
+- [x] Integration test: distances are in non-decreasing order for a known corpus.
+- [x] ~~`vector_demo.py` updated~~ **Correction (2026-07-14):** no `vector_demo.py`
+      (or any Python demo script) exists anywhere in this repository — grepped
+      the whole tree, none found. This criterion describes a file that was never
+      part of this codebase; nothing to update. Covered instead by
+      `tests/vec_distance.rs::vec_distance_returned_ascending_for_known_corpus`,
+      which seeds the same id/title/distance corpus from the spec's example
+      table and asserts the exact ascending order + values.
+
+## Implementation (shipped 2026-07-14)
+
+- `src/sql/executor.rs`: `exec_select_near` now scores each NEAR candidate with
+  its exact re-ranked Euclidean distance (already computed for sorting) and
+  projects it via a new `project_row_near` helper — identical to `project_row`
+  except it recognizes the virtual column name `vec_distance` (new constant
+  `VEC_DISTANCE_COL`) and substitutes the computed `f32` distance as
+  `Literal::Float` instead of doing a catalog column lookup for it.
+  `SELECT *` (empty projection) falls through to the ordinary `project_row`
+  path, so `vec_distance` never appears unless explicitly named — same
+  convention as any other SQL engine's computed/virtual column.
+- Outside a `NEAR` predicate, `vec_distance` is not a real column anywhere in
+  the catalog, so the ordinary `project_row`/`eval_expr` column lookup already
+  returns `COLUMN_NOT_FOUND` — no special-casing needed for that half of the
+  contract.
+- `tests/vec_distance.rs` (3 new integration tests): ascending-order + exact
+  distance values for a known corpus (mirrors the spec's example table),
+  `COLUMN_NOT_FOUND` outside a `NEAR` context, and `SELECT *` never leaking the
+  virtual column.
+- No catalog/API changes; no `FORMAT_VERSION` bump.
