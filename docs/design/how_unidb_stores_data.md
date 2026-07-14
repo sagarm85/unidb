@@ -94,7 +94,85 @@ only at the moment a schema change is fully durable — never partway through.
 
 ---
 
-## 2. Saving one order — byte by byte
+## 2. How one file holds every table
+
+**In plain terms:** `data.db` isn't divided into per-table regions. It's one
+shared pool of numbered pages, and every table just keeps its own private
+list of which page numbers are its.
+
+```mermaid
+flowchart TB
+    CAT["Catalog"] -- "points to" --> D1["orders' directory\npages: 1, 3, 5"]
+    CAT -- "points to" --> D2["customers' directory\npages: 2, 4"]
+    subgraph FILE["data.db — one shared file"]
+        direction LR
+        P0["page 0\ncatalog"] --- P1["page 1\norders"] --- P2["page 2\ncustomers"] --- P3["page 3\norders"] --- P4["page 4\ncustomers"] --- P5["page 5\norders"]
+    end
+    D1 -.-> P1
+    D1 -.-> P3
+    D1 -.-> P5
+    D2 -.-> P2
+    D2 -.-> P4
+```
+
+**Under the hood.** Every table has its own small, durable **page
+directory** — literally a list of "which page numbers are mine." When a
+table needs more space it grabs the next free page anywhere in the file
+(the same allocator every table shares) and adds that number to its own
+directory. So `orders` and `customers` end up scattered through the same
+file in whatever order they happened to grow — never grouped into separate
+regions the way you might picture separate folders.
+
+Opening a table means: look it up in the catalog, follow its directory
+pointer, and now you have the exact list of pages it owns — confirmed
+directly in the read path: a full scan (`src/heap.rs`'s `scan`) walks
+exactly that list, touching nothing that belongs to any other table.
+
+> **Why this beats the alternative.** No table pre-reserves space, and
+> adding a thousandth table costs nothing upfront — it's still one shared
+> pool of pages, one allocator, one file to back up.
+
+### What you'll actually see on disk
+
+Point unidb at a directory and this appears inside it:
+
+| Name | Type | Holds | Grows how |
+|---|---|---|---|
+| `control` | File | Page size, the catalog's location, the last safe checkpoint | Fixed 44 bytes, always |
+| `data.db` | File | Every table's rows, indexes, and the schema itself | 4 MiB chunks, no cap |
+| `db.wal/` | Folder | The log — every change, recorded before it's applied | 16 MiB segments; old ones deleted once a checkpoint no longer needs them |
+| `timeline.bin` | File | One tiny mark per commit, for restoring to a point in time | A few bytes per commit, uncapped |
+| `audit.log` | File | Security-relevant events (grants, role changes) | Append-only; grows with auth activity only |
+| `logs/` | Folder | The REST server's own operational logs (server only) | One file per calendar day |
+
+Here's a real `control` file from this session, decoded byte for byte — the
+same 44-byte layout described above, with actual numbers instead of
+placeholders:
+
+```
+42 44 6e 55  05 00 00 00  00 20 00 00  0c 05 00 00
+d8 53 0f 00  00 00 00 00  d8 53 0f 00  00 00 00 00
+bd b1 06 00  00 00 00 00  1e d6 b5 2b
+```
+
+| Bytes | Field | Decoded |
+|---|---|---|
+| `42 44 6e 55` | magic | "UnDB" |
+| `05 00` | format version | 5 |
+| `00 20 00 00` | page size | 8192 |
+| `0c 05 00 00` | catalog root | page 1292 |
+| `d8 53 0f 00 00 00 00 00` | checkpoint LSN | 1,004,504 |
+| `d8 53 0f 00 00 00 00 00` | WAL tail LSN | 1,004,504 (equal — a clean checkpoint) |
+| `bd b1 06 00 00 00 00 00` | next transaction id | ~438,717 |
+| `1e d6 b5 2b` | checksum | — |
+
+If you spot some other file sitting in the same directory — a stray
+`server.log`, say — it likely isn't unidb's: it's usually just wherever a
+shell happened to redirect that process's console output. Safe to ignore.
+
+---
+
+## 3. Saving one order — byte by byte
 
 **In plain terms:** "durable" doesn't mean a function returned successfully.
 It means specific bytes reached disk, in a specific order, so that even a
@@ -138,7 +216,7 @@ flowchart TB
 
 The **24-byte version header** prepended to every stored row (`src/page.rs`)
 records who wrote it and what came before it — this is the machinery
-Section 4 uses:
+Section 5 uses:
 
 | Field | Bytes | Meaning |
 |---|---|---|
@@ -147,7 +225,12 @@ Section 4 uses:
 | `prev_page` / `prev_slot` | 4 + 2 | where the previous version lives, if any |
 
 **Stored cost of this one order: 73 bytes of tuple + 4 bytes of slot
-pointer = 77 bytes**, out of an 8,192-byte page.
+pointer = 77 bytes**, out of an 8,192-byte page. An 8 KiB page has
+8,192 − 28 (header) = 8,164 usable bytes, so **≈106 rows this size fit in a
+single page** — a page is a box holding roughly a hundred rows, never a row
+itself. One consequence: a single row is never split across two pages;
+anything too large to fit anywhere gets handled separately as a large
+object instead.
 
 ### What gets logged, in order
 
@@ -182,7 +265,7 @@ insert is structurally simple: "this slot never happened."
 
 ---
 
-## 3. Getting your order back into memory
+## 4. Getting your order back into memory
 
 **In plain terms:** a database can't keep every page in RAM, so it needs a
 rule for what to keep cached — and a rule that guarantees it never "forgets"
@@ -216,9 +299,20 @@ durably logged.** Default cache size: 4,096 pages = 32 MiB.
 > retries — it never returns a "pool full" error to your application instead
 > of just doing the safe thing.
 
+**One thing this pool does *not* cover:** the catalog and each table's page
+directory from §2 aren't part of this evictable pool at all. Both are loaded
+once, in full, and held in memory for as long as the engine stays open —
+confirmed directly in the code (the directory's `directory_loaded` flag is
+set once and never reset). That's a deliberate asymmetry: row *data* is
+explicitly built to exceed RAM (that's this section's whole job); the
+metadata that finds that data is built on the assumption that it will always
+stay small relative to the data itself — true for essentially every
+realistic schema, but a real assumption, not something that degrades
+gracefully if it were ever wrong.
+
 ---
 
-## 4. Changing an order's status
+## 5. Changing an order's status
 
 ```sql
 UPDATE orders SET status = 'shipped' WHERE id = 1;
@@ -266,7 +360,7 @@ so two concurrent updates can never deadlock on opposite lock ordering.
 
 ---
 
-## 5. Reading an order back
+## 6. Reading an order back
 
 ```sql
 SELECT * FROM orders WHERE id = 1;
@@ -285,14 +379,14 @@ flowchart LR
 ```
 
 That's the whole read path — a snapshot check against the 24-byte version
-header from Section 2, walking backward through `prev_page`/`prev_slot` only
+header from Section 3, walking backward through `prev_page`/`prev_slot` only
 if needed. The full isolation-level story (Read Committed / Repeatable Read
 / Serializable) is in
 [`processing-engines/04_transaction_engine.md`](processing-engines/04_transaction_engine.md).
 
 ---
 
-## 6. Finding similar orders — adding a vector column
+## 7. Finding similar orders — adding a vector column
 
 ```sql
 ALTER TABLE orders ADD COLUMN embedding VECTOR(4);
@@ -344,9 +438,15 @@ never which answer is correct.
 > that already existed. Add an embedding to `orders` and it becomes durable,
 > crash-safe, and transactional the same instant the row itself does.
 
+This also matters specifically for **embedded** use: since vector search is
+just another part of the same engine, running unidb as a linked-in library
+(no server) gets real semantic search with zero network round-trips —
+something a hosted vector database, being a separate network service by
+nature, cannot offer at all.
+
 ---
 
-## 7. What's actually running in the background
+## 8. What's actually running in the background
 
 **In plain terms:** a lot of database software runs continuous background
 maintenance you never see. The honest question is: how much, and is any of
@@ -374,7 +474,7 @@ flowchart TD
 | The old async vector-rebuild worker | **retired — doesn't exist anymore** | — | — |
 
 **A plain `unidb::Engine::open()` — no server, no extra crates — runs zero
-standing background threads.** The old version of your order from Section 4
+standing background threads.** The old version of your order from Section 5
 just sits on disk until you explicitly turn on cleanup.
 
 > **Why this beats the alternative.** For an embedded or resource-constrained
@@ -384,12 +484,13 @@ just sits on disk until you explicitly turn on cleanup.
 
 ---
 
-## 8. Bringing it together
+## 9. Bringing it together
 
-One order moved through this document as: a schema (§1), a durable insert
-(§2), a page pulled through the buffer pool (§3), a versioned update (§4), a
-consistent read (§5), a searchable embedding (§6) — and none of it required a
-background worker you didn't ask for (§7).
+One order moved through this document as: a schema (§1), a shared file
+holding it alongside every other table (§2), a durable insert (§3), a page
+pulled through the buffer pool (§4), a versioned update (§5), a consistent
+read (§6), a searchable embedding (§7) — and none of it required a
+background worker you didn't ask for (§8).
 
 The thesis from the top of this document is the same fact, restated now that
 you've seen the mechanism: **one WAL, one buffer pool, one transaction
@@ -420,10 +521,11 @@ sync, because there was never more than one system.
 | This section | Read next |
 |---|---|
 | §1 Catalog | [`processing-engines/02_storage_engine.md`](processing-engines/02_storage_engine.md) |
-| §2 WAL / durability | [`processing-engines/03_wal_and_recovery.md`](processing-engines/03_wal_and_recovery.md) |
-| §3 Buffer pool | [`processing-engines/02_storage_engine.md`](processing-engines/02_storage_engine.md) |
-| §4/§5 MVCC, isolation | [`processing-engines/04_transaction_engine.md`](processing-engines/04_transaction_engine.md) |
-| §6 Vector search | [`processing-engines/07_vector_engine.md`](processing-engines/07_vector_engine.md) |
-| §7 Background workers | [`processing-engines/04_transaction_engine.md`](processing-engines/04_transaction_engine.md) (vacuum), [`processing-engines/11_server_replication_operations.md`](processing-engines/11_server_replication_operations.md) (server) |
+| §2 Page ownership, data directory | [`processing-engines/02_storage_engine.md`](processing-engines/02_storage_engine.md), `docs/ops_runbook.md` |
+| §3 WAL / durability | [`processing-engines/03_wal_and_recovery.md`](processing-engines/03_wal_and_recovery.md) |
+| §4 Buffer pool | [`processing-engines/02_storage_engine.md`](processing-engines/02_storage_engine.md) |
+| §5/§6 MVCC, isolation | [`processing-engines/04_transaction_engine.md`](processing-engines/04_transaction_engine.md) |
+| §7 Vector search | [`processing-engines/07_vector_engine.md`](processing-engines/07_vector_engine.md) |
+| §8 Background workers | [`processing-engines/04_transaction_engine.md`](processing-engines/04_transaction_engine.md) (vacuum), [`processing-engines/11_server_replication_operations.md`](processing-engines/11_server_replication_operations.md) (server) |
 | Everything, exhaustively | [`engine_design.md`](engine_design.md) |
 | The polished, end-user version | [`unidb_engine_architecture.pdf`](unidb_engine_architecture.pdf) |
