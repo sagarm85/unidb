@@ -33,7 +33,7 @@ use crate::{
     error::{DbError, Result},
     format::{PageId, Xid},
     heap::{get_visible, Heap, RowId},
-    lockmgr::LockManager,
+    lockmgr::{LockManager, RecordId},
     mvcc::Snapshot,
     queue::{self, EVENTS_TABLE},
     txn::{IsolationLevel, TransactionManager, UndoAction},
@@ -54,6 +54,35 @@ fn ivf_params(nrows: usize) -> (usize, usize) {
 /// Lloyd's iterations for centroid training at `CREATE INDEX` — a handful
 /// suffices for a stable partition (validated in the P3.c recall sweep).
 const IVF_TRAIN_ITERS: usize = 8;
+
+/// Compute the `RecordId` for a `UniqueKey` phantom lock: a stable hash of
+/// `(table_name, col_name, key_value)`. Two distinct `OrderedValue` variants
+/// are distinguished by a tag byte so `Int(1)` ≠ `Bool(true)`.
+///
+/// Used by `exec_insert` to acquire the lock BEFORE taking the uniqueness
+/// snapshot, serializing concurrent inserters racing the same PK/UNIQUE value.
+fn unique_key_record_id(table: &str, col: &str, key: &OrderedValue) -> RecordId {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    table.hash(&mut h);
+    col.hash(&mut h);
+    match key {
+        OrderedValue::Int(n) => {
+            1u8.hash(&mut h);
+            n.hash(&mut h);
+        }
+        OrderedValue::Text(s) => {
+            2u8.hash(&mut h);
+            s.hash(&mut h);
+        }
+        OrderedValue::Bool(b) => {
+            3u8.hash(&mut h);
+            b.hash(&mut h);
+        }
+    }
+    RecordId::unique_key(h.finish())
+}
 
 use super::datetime;
 use super::logical::{CmpOp, Expr, Literal, LogicalPlan};
@@ -864,9 +893,29 @@ fn exec_insert(
         let coerced = coerce_and_validate_row(&table_def, filled)?;
         enforce_not_null(&table_def, &coerced)?;
         enforce_checks(&table_def, &coerced)?;
-        // UNIQUE (M11): scan under a fresh per-row snapshot so earlier rows
-        // inserted by *this same statement* (own writes, visible to own xid)
-        // are counted — a duplicate within one multi-row INSERT is caught.
+        // UNIQUE (M11) — two-step approach for concurrent-inserter safety
+        // (item 35, Phase 2 inv. 3):
+        //
+        // Step 1: acquire an exclusive phantom lock per indexable PK/UNIQUE
+        // column BEFORE taking the snapshot. Two writers racing the same key
+        // both reach this point; one acquires the lock and proceeds, the
+        // other blocks (WaitPolicy::Wait) until the first commits or aborts.
+        // When the waiter unblocks, step 2's fresh snapshot includes the
+        // winner's committed row, so enforce_unique correctly sees the duplicate
+        // and returns UniqueViolation. Without this lock the race is:
+        //   A & B both call enforce_unique → both pass (no committed row yet)
+        //   A & B both insert → both commit → duplicate key visible.
+        for (col_idx, col) in table_def.columns.iter().enumerate() {
+            if col.dropped || col.unique_index_root.is_none() {
+                continue;
+            }
+            if let Ok(key) = OrderedValue::try_from(&coerced[col_idx]) {
+                let lock_id = unique_key_record_id(&table_def.name, &col.name, &key);
+                ctx.lock_mgr.acquire_blocking(lock_id, ctx.xid)?;
+            }
+        }
+        // Step 2: take snapshot AFTER acquiring all unique key locks — any
+        // concurrent winner that committed while we waited is now visible.
         let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
         enforce_unique(
             &table_def, &coerced, &heap, &snapshot, ctx.xid, ctx.pool, None,

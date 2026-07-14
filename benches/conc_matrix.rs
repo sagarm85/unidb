@@ -844,6 +844,123 @@ fn w_delete_reinsert(toggle: bool) -> Result<(), String> {
     assert_index_agrees_with_scan(&engine, "t")
 }
 
+/// Wq — PK/UNIQUE concurrent-insert race (item 35, Phase 2 inv. 3).
+///
+/// N writers concurrently attempt to INSERT the SAME key into a
+/// `PRIMARY KEY` table. Exactly one must commit per key; the rest must get
+/// `UniqueViolation` (or a retryable conflict — the lock acquires with Wait
+/// so Deadlock is possible if the caller holds other locks, which it doesn't
+/// here, making WriteConflict the more likely retryable). No duplicate key
+/// may ever become visible.
+///
+/// Each round uses a fresh unique key so the table grows by one row per
+/// round; a final COUNT(*) verifies the total row count.
+fn w_pk_unique_race(toggle: bool) -> Result<(), String> {
+    let (_d, engine) = open_engine(toggle);
+    ddl(&engine, &["CREATE TABLE t (id INT PRIMARY KEY)"]);
+
+    let writers = 6usize;
+    let rounds = 20usize * rounds_mult();
+
+    for round in 0..rounds {
+        let key = round as i64 + 1;
+        let committed = Arc::new(AtomicUsize::new(0));
+        let rejected = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(writers));
+        let err: Shared = Arc::default();
+        let mut handles = Vec::new();
+
+        for _ in 0..writers {
+            let engine = Arc::clone(&engine);
+            let barrier = Arc::clone(&barrier);
+            let err = Arc::clone(&err);
+            let committed = Arc::clone(&committed);
+            let rejected = Arc::clone(&rejected);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                loop {
+                    let xid = match engine.begin() {
+                        Ok(x) => x,
+                        Err(e) => {
+                            note_err(&err, format!("begin: {e:?}"));
+                            return;
+                        }
+                    };
+                    match engine.execute_sql(xid, &format!("INSERT INTO t (id) VALUES ({key})")) {
+                        Ok(_) => match engine.commit(xid) {
+                            Ok(_) => {
+                                committed.fetch_add(1, Ordering::SeqCst);
+                                return;
+                            }
+                            Err(e) if retryable(&e) => {
+                                let _ = engine.abort(xid);
+                                continue;
+                            }
+                            Err(e) => {
+                                let _ = engine.abort(xid);
+                                note_err(&err, format!("commit: {e:?}"));
+                                return;
+                            }
+                        },
+                        Err(DbError::UniqueViolation { .. }) => {
+                            let _ = engine.abort(xid);
+                            rejected.fetch_add(1, Ordering::SeqCst);
+                            return;
+                        }
+                        Err(e) if retryable(&e) => {
+                            let _ = engine.abort(xid);
+                            continue;
+                        }
+                        Err(e) => {
+                            let _ = engine.abort(xid);
+                            note_err(&err, format!("insert: {e:?}"));
+                            return;
+                        }
+                    }
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().map_err(|_| "writer panicked".to_string())?;
+        }
+        take_err(&err)?;
+
+        let c = committed.load(Ordering::SeqCst);
+        let r = rejected.load(Ordering::SeqCst);
+        if c != 1 {
+            return Err(format!(
+                "round {round}: {c} writers committed key={key}, expected exactly 1 \
+                 (rejected={r}; duplicate key visible or all writers failed)"
+            ));
+        }
+        // Total outcomes must account for every writer.
+        if c + r != writers {
+            return Err(format!(
+                "round {round}: committed={c} + rejected={r} = {} ≠ {writers} \
+                 (some writer neither committed nor got UniqueViolation)",
+                c + r
+            ));
+        }
+        // Verify: exactly one row with this key is visible in a fresh snapshot.
+        let ids = select_i64s(&engine, &format!("SELECT id FROM t WHERE id = {key}"))?;
+        if ids != [key] {
+            return Err(format!(
+                "round {round}: SELECT id WHERE id={key} returned {ids:?}, expected [{key}]"
+            ));
+        }
+    }
+
+    // Final: exactly one row per round — no round produced a duplicate.
+    let total = count_star(&engine, None, "t")?;
+    if total != rounds as i64 {
+        return Err(format!(
+            "final COUNT(*)={total}, expected {rounds} (one committed row per round)"
+        ));
+    }
+    Ok(())
+}
+
 // ── matrix runner ────────────────────────────────────────────────────────────
 
 struct Cell {
@@ -967,6 +1084,18 @@ fn cells() -> Vec<Cell> {
             iso: "RC",
             shape: "4w × 24ids + 1r".into(),
             run: Arc::new(move || w_delete_reinsert(tg)),
+        });
+        // item 35, Phase 2 inv. 3: concurrent INSERT race on the same
+        // PK/UNIQUE key. Exactly one must commit per key; all others must
+        // get UniqueViolation (or a retryable conflict). No duplicate visible.
+        v.push(Cell {
+            id: "pk-unique-race",
+            workload: "6 writers race INSERT the same PK key; exactly 1 commits",
+            toggle: tg,
+            index: "implicit unique-enforcement btree (PK)",
+            iso: "RC",
+            shape: "6w × 20rounds".to_string(),
+            run: Arc::new(move || w_pk_unique_race(tg)),
         });
     }
     v
