@@ -961,6 +961,203 @@ fn w_pk_unique_race(toggle: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// FK parent-delete / child-insert race (item 36, invariant 3).
+///
+/// Each round: one parent row is inserted; then two writers race concurrently
+/// — one deletes the parent, one inserts a child referencing it. After both
+/// settle, assert that no committed child row references a non-existent parent.
+/// The `FkKey` phantom lock must ensure either:
+///   (a) child committed first → parent delete gets RESTRICT → fails, or
+///   (b) parent delete committed first → child sees deleted parent → FK violation.
+/// No dangling reference (child row with no parent) must ever be committed.
+fn w_fk_delete_insert_race(toggle: bool) -> Result<(), String> {
+    let (_d, engine) = open_engine(toggle);
+    ddl(
+        &engine,
+        &[
+            "CREATE TABLE orders (id INT PRIMARY KEY)",
+            "CREATE TABLE items (id INT PRIMARY KEY, order_id INT REFERENCES orders(id))",
+        ],
+    );
+
+    let rounds = 20usize * rounds_mult();
+
+    for round in 0..rounds {
+        let order_id = (round as i64) + 1;
+        let item_id = order_id + 1_000_000;
+
+        // Insert the parent row.
+        let xid = engine.begin().map_err(|e| format!("begin: {e:?}"))?;
+        engine
+            .execute_sql(xid, &format!("INSERT INTO orders (id) VALUES ({order_id})"))
+            .map_err(|e| format!("insert order: {e:?}"))?;
+        engine
+            .commit(xid)
+            .map_err(|e| format!("commit order: {e:?}"))?;
+
+        // Writer A: delete the parent.
+        let deleter_committed = Arc::new(AtomicUsize::new(0));
+        // Writer B: insert a child referencing the parent.
+        let child_committed = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(2));
+        let err: Shared = Arc::default();
+
+        let engine_a = Arc::clone(&engine);
+        let barrier_a = Arc::clone(&barrier);
+        let err_a = Arc::clone(&err);
+        let del_count = Arc::clone(&deleter_committed);
+        let h_del = thread::spawn(move || {
+            barrier_a.wait();
+            loop {
+                let xid = match engine_a.begin() {
+                    Ok(x) => x,
+                    Err(e) => {
+                        note_err(&err_a, format!("del begin: {e:?}"));
+                        return;
+                    }
+                };
+                match engine_a
+                    .execute_sql(xid, &format!("DELETE FROM orders WHERE id = {order_id}"))
+                {
+                    Ok(_) => match engine_a.commit(xid) {
+                        Ok(_) => {
+                            del_count.fetch_add(1, Ordering::SeqCst);
+                            return;
+                        }
+                        Err(e) if retryable(&e) => {
+                            let _ = engine_a.abort(xid);
+                            continue;
+                        }
+                        Err(e) => {
+                            let _ = engine_a.abort(xid);
+                            note_err(&err_a, format!("del commit: {e:?}"));
+                            return;
+                        }
+                    },
+                    // RESTRICT: child already committed first.
+                    Err(DbError::ForeignKeyViolation { .. }) => {
+                        let _ = engine_a.abort(xid);
+                        return;
+                    }
+                    Err(e) if retryable(&e) => {
+                        let _ = engine_a.abort(xid);
+                        continue;
+                    }
+                    Err(e) => {
+                        let _ = engine_a.abort(xid);
+                        note_err(&err_a, format!("del exec: {e:?}"));
+                        return;
+                    }
+                }
+            }
+        });
+
+        let engine_b = Arc::clone(&engine);
+        let barrier_b = Arc::clone(&barrier);
+        let err_b = Arc::clone(&err);
+        let ins_count = Arc::clone(&child_committed);
+        let h_ins = thread::spawn(move || {
+            barrier_b.wait();
+            loop {
+                let xid = match engine_b.begin() {
+                    Ok(x) => x,
+                    Err(e) => {
+                        note_err(&err_b, format!("ins begin: {e:?}"));
+                        return;
+                    }
+                };
+                match engine_b.execute_sql(
+                    xid,
+                    &format!("INSERT INTO items (id, order_id) VALUES ({item_id}, {order_id})"),
+                ) {
+                    Ok(_) => match engine_b.commit(xid) {
+                        Ok(_) => {
+                            ins_count.fetch_add(1, Ordering::SeqCst);
+                            return;
+                        }
+                        Err(e) if retryable(&e) => {
+                            let _ = engine_b.abort(xid);
+                            continue;
+                        }
+                        Err(e) => {
+                            let _ = engine_b.abort(xid);
+                            note_err(&err_b, format!("ins commit: {e:?}"));
+                            return;
+                        }
+                    },
+                    // FK violation: parent was already deleted.
+                    Err(DbError::ForeignKeyViolation { .. }) => {
+                        let _ = engine_b.abort(xid);
+                        return;
+                    }
+                    Err(e) if retryable(&e) => {
+                        let _ = engine_b.abort(xid);
+                        continue;
+                    }
+                    Err(e) => {
+                        let _ = engine_b.abort(xid);
+                        note_err(&err_b, format!("ins exec: {e:?}"));
+                        return;
+                    }
+                }
+            }
+        });
+
+        h_del.join().map_err(|_| "deleter panicked".to_string())?;
+        h_ins.join().map_err(|_| "inserter panicked".to_string())?;
+        take_err(&err)?;
+
+        let d = deleter_committed.load(Ordering::SeqCst);
+        let c = child_committed.load(Ordering::SeqCst);
+
+        // At most one of them can have committed (lock serializes them).
+        if d > 0 && c > 0 {
+            return Err(format!(
+                "round {round}: BOTH deleter AND child inserter committed (d={d}, c={c}) \
+                 — dangling FK reference possible"
+            ));
+        }
+
+        // If child committed, the parent must still exist (delete was RESTRICT'd).
+        if c > 0 {
+            let orders = select_i64s(
+                &engine,
+                &format!("SELECT id FROM orders WHERE id = {order_id}"),
+            )?;
+            if orders.is_empty() {
+                return Err(format!(
+                    "round {round}: child committed but parent order {order_id} not found \
+                     — dangling FK reference!"
+                ));
+            }
+            // Clean up for next round: delete child then parent.
+            let xid = engine
+                .begin()
+                .map_err(|e| format!("cleanup begin: {e:?}"))?;
+            engine
+                .execute_sql(xid, &format!("DELETE FROM items WHERE id = {item_id}"))
+                .map_err(|e| format!("cleanup del item: {e:?}"))?;
+            engine
+                .execute_sql(xid, &format!("DELETE FROM orders WHERE id = {order_id}"))
+                .map_err(|e| format!("cleanup del order: {e:?}"))?;
+            engine
+                .commit(xid)
+                .map_err(|e| format!("cleanup commit: {e:?}"))?;
+        }
+        // If deleter committed (or both failed), no child row should exist.
+        let dangling = select_i64s(
+            &engine,
+            &format!("SELECT id FROM items WHERE order_id = {order_id}"),
+        )?;
+        if !dangling.is_empty() {
+            return Err(format!(
+                "round {round}: dangling child rows {dangling:?} reference deleted parent {order_id}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 // ── matrix runner ────────────────────────────────────────────────────────────
 
 struct Cell {
@@ -1096,6 +1293,18 @@ fn cells() -> Vec<Cell> {
             iso: "RC",
             shape: "6w × 20rounds".to_string(),
             run: Arc::new(move || w_pk_unique_race(tg)),
+        });
+        // item 36, invariant 3: concurrent parent-delete / child-insert race.
+        // One deletes the parent, one inserts a child referencing it; the
+        // FkKey phantom lock ensures no dangling FK reference is ever committed.
+        v.push(Cell {
+            id: "fk-delete-insert-race",
+            workload: "parent DELETE races child INSERT on same FK key; no dangling ref",
+            toggle: tg,
+            index: "implicit unique-enforcement btree (PK) + FK",
+            iso: "RC",
+            shape: "2w × 20rounds".to_string(),
+            run: Arc::new(move || w_fk_delete_insert_race(tg)),
         });
     }
     v

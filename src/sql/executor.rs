@@ -84,6 +84,515 @@ fn unique_key_record_id(table: &str, col: &str, key: &OrderedValue) -> RecordId 
     RecordId::unique_key(h.finish())
 }
 
+/// Compute the `RecordId` for an `FkKey` phantom lock: a stable hash of
+/// `(parent_table, ref_col, key_value)`. Acquired Exclusive by both the child
+/// inserter (before its snapshot) and the parent deleter (before its RESTRICT
+/// scan), held through commit — closes the parent-delete / child-insert race.
+fn fk_key_record_id(parent_table: &str, ref_col: &str, key: &OrderedValue) -> RecordId {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    parent_table.hash(&mut h);
+    ref_col.hash(&mut h);
+    match key {
+        OrderedValue::Int(n) => {
+            1u8.hash(&mut h);
+            n.hash(&mut h);
+        }
+        OrderedValue::Text(s) => {
+            2u8.hash(&mut h);
+            s.hash(&mut h);
+        }
+        OrderedValue::Bool(b) => {
+            3u8.hash(&mut h);
+            b.hash(&mut h);
+        }
+    }
+    RecordId::fk_key(h.finish())
+}
+
+/// Resolve the parent column that a FK reference targets — either the
+/// explicitly named `ref_col`, or the single PK column inferred from
+/// `parent_def` when no column name was stored (SQL allows `REFERENCES t`
+/// with no column list, defaulting to `t`'s PK).
+fn resolve_fk_ref_col<'a>(
+    parent_def: &'a TableDef,
+    ref_col: Option<&str>,
+) -> Result<&'a ColumnDef> {
+    if let Some(name) = ref_col {
+        let idx = column_index(parent_def, name)?;
+        return Ok(&parent_def.columns[idx]);
+    }
+    // No explicit column: infer from parent's single-column PK.
+    let col_pks: Vec<_> = parent_def
+        .columns
+        .iter()
+        .filter(|c| !c.dropped && c.constraints.primary_key)
+        .collect();
+    if col_pks.len() == 1 {
+        return Ok(col_pks[0]);
+    }
+    if parent_def.constraints.primary_key.len() == 1 {
+        let idx = column_index(parent_def, &parent_def.constraints.primary_key[0])?;
+        return Ok(&parent_def.columns[idx]);
+    }
+    Err(DbError::SqlPlan(format!(
+        "FOREIGN KEY to '{}' specifies no column and the table has no single-column PK",
+        parent_def.name
+    )))
+}
+
+/// Format a `Literal` as a human-readable value string for error messages.
+fn literal_display(lit: &Literal) -> String {
+    match lit {
+        Literal::Int(n) => n.to_string(),
+        Literal::Text(s) => format!("'{s}'"),
+        Literal::Bool(b) => b.to_string(),
+        Literal::Float(f) => f.to_string(),
+        Literal::Json(s) => s.clone(),
+        Literal::Decimal(v, s) => format!(
+            "{}.{}",
+            v / 10i128.pow(*s as u32),
+            v.abs() % 10i128.pow(*s as u32)
+        ),
+        Literal::Timestamp(us) => format!("{us}µs"),
+        Literal::Uuid(b) => format!("{:032x}", u128::from_be_bytes(*b)),
+        Literal::Bytea(b) => format!("<{} bytes>", b.len()),
+        Literal::Date(d) => format!("date({d})"),
+        Literal::Time(t) => format!("time({t})"),
+        Literal::Vector(_) => "<vector>".to_string(),
+        Literal::Param(n) => format!("${n}"),
+        Literal::Null => "NULL".to_string(),
+    }
+}
+
+/// Returns true if any table in `catalog` carries a column-level or
+/// table-level FK that references `parent_table`. Used to gate the O(n)
+/// catalog scan in `exec_delete` / `exec_update` so tables that are never
+/// referenced pay zero overhead.
+fn table_has_fk_children(catalog: &Catalog, parent_table: &str) -> bool {
+    catalog.tables().any(|t| {
+        t.columns.iter().any(|c| {
+            c.constraints
+                .references
+                .as_ref()
+                .is_some_and(|r| r.table == parent_table)
+        }) || t
+            .constraints
+            .foreign_keys
+            .iter()
+            .any(|fk| fk.ref_table == parent_table)
+    })
+}
+
+/// Acquire exclusive `FkKey` phantom locks for every non-NULL FK column value
+/// in `row`. Must be called BEFORE `snapshot_for_statement` so the lock is held
+/// when the snapshot is taken, preventing the parent-delete / child-insert race.
+fn acquire_fk_key_locks(
+    table_def: &TableDef,
+    row: &[Literal],
+    xid: Xid,
+    lock_mgr: &LockManager,
+    catalog: &Catalog,
+) -> Result<()> {
+    for (col_idx, col) in table_def.columns.iter().enumerate() {
+        if col.dropped {
+            continue;
+        }
+        let Some(fk) = &col.constraints.references else {
+            continue;
+        };
+        if matches!(row[col_idx], Literal::Null) {
+            continue;
+        }
+        if let Ok(key) = OrderedValue::try_from(&row[col_idx]) {
+            // Resolve the actual ref-column name (handles `REFERENCES t` with no column).
+            let ref_col_name = if let Some(name) = fk.column.as_deref() {
+                name.to_string()
+            } else if let Ok(parent_def) = catalog.lookup(&fk.table) {
+                resolve_fk_ref_col(parent_def, None)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            lock_mgr.acquire_blocking(fk_key_record_id(&fk.table, &ref_col_name, &key), xid)?;
+        }
+    }
+    for fk in &table_def.constraints.foreign_keys {
+        if fk.columns.len() != 1 {
+            continue; // composite FK: no phantom lock (heap scan fallback)
+        }
+        let col_idx = match column_index(table_def, &fk.columns[0]) {
+            Ok(i) => i,
+            Err(_) => continue,
+        };
+        if matches!(row[col_idx], Literal::Null) {
+            continue;
+        }
+        if let Ok(key) = OrderedValue::try_from(&row[col_idx]) {
+            let ref_col = fk.ref_columns.first().map(String::as_str).unwrap_or("");
+            lock_mgr.acquire_blocking(fk_key_record_id(&fk.ref_table, ref_col, &key), xid)?;
+        }
+    }
+    Ok(())
+}
+
+/// Acquire exclusive `FkKey` phantom locks for the parent table's PK column
+/// values in `row`. Called BEFORE the RESTRICT scan in `exec_delete` /
+/// `exec_update`, so a concurrent child inserter either sees the lock and
+/// blocks (getting FK violation after the parent commits) or committed first
+/// and will be caught by the RESTRICT scan with a fresh snapshot.
+fn acquire_fk_key_locks_parent(
+    parent_def: &TableDef,
+    row: &[Literal],
+    xid: Xid,
+    lock_mgr: &LockManager,
+) -> Result<()> {
+    // Column-level PRIMARY KEY columns.
+    for (col_idx, col) in parent_def.columns.iter().enumerate() {
+        if col.dropped || !col.constraints.primary_key {
+            continue;
+        }
+        if let Ok(key) = OrderedValue::try_from(&row[col_idx]) {
+            lock_mgr.acquire_blocking(fk_key_record_id(&parent_def.name, &col.name, &key), xid)?;
+        }
+    }
+    // Table-level PRIMARY KEY columns (if not already covered above).
+    for pk_name in &parent_def.constraints.primary_key {
+        let col_idx = match column_index(parent_def, pk_name) {
+            Ok(i) => i,
+            Err(_) => continue,
+        };
+        if parent_def.columns[col_idx].constraints.primary_key {
+            continue; // already locked above
+        }
+        if let Ok(key) = OrderedValue::try_from(&row[col_idx]) {
+            lock_mgr.acquire_blocking(fk_key_record_id(&parent_def.name, pk_name, &key), xid)?;
+        }
+    }
+    Ok(())
+}
+
+/// Verify that every non-NULL FK value in `row` has a visible parent row.
+/// Called AFTER acquiring the `FkKey` phantom locks and taking the statement
+/// snapshot, so it sees committed parent rows including those inserted earlier
+/// in the same transaction (own-xid visibility via `get_visible`'s `self_xid`).
+fn enforce_fk_rows_exist(
+    table_def: &TableDef,
+    row: &[Literal],
+    snapshot: &Snapshot,
+    xid: Xid,
+    pool: &BufferPool,
+    catalog: &Catalog,
+) -> Result<()> {
+    // Column-level FKs.
+    for (col_idx, col) in table_def.columns.iter().enumerate() {
+        if col.dropped {
+            continue;
+        }
+        let Some(fk) = &col.constraints.references else {
+            continue;
+        };
+        let fk_val = &row[col_idx];
+        if matches!(fk_val, Literal::Null) {
+            continue;
+        }
+        check_fk_parent_exists(
+            &table_def.name,
+            &fk.table,
+            fk.column.as_deref(),
+            &col.name,
+            fk_val,
+            snapshot,
+            xid,
+            pool,
+            catalog,
+        )?;
+    }
+    // Table-level FKs.
+    for fk in &table_def.constraints.foreign_keys {
+        if fk.columns.len() == 1 {
+            let col_idx = column_index(table_def, &fk.columns[0])?;
+            let fk_val = &row[col_idx];
+            if matches!(fk_val, Literal::Null) {
+                continue;
+            }
+            let ref_col = fk.ref_columns.first().map(String::as_str);
+            check_fk_parent_exists(
+                &table_def.name,
+                &fk.ref_table,
+                ref_col,
+                &fk.columns[0],
+                fk_val,
+                snapshot,
+                xid,
+                pool,
+                catalog,
+            )?;
+        } else {
+            // Composite FK: heap scan of parent (O(n) — no composite PK index yet).
+            check_fk_parent_exists_composite(table_def, fk, row, snapshot, xid, pool, catalog)?;
+        }
+    }
+    Ok(())
+}
+
+/// Point-lookup variant: single-column FK, uses parent's `unique_index_root`
+/// (item 35) for O(log n) check. Falls back to a heap scan if the parent
+/// column has no implicit unique index (pre-item-35 tables or non-BTree types).
+#[allow(clippy::too_many_arguments)]
+fn check_fk_parent_exists(
+    child_table: &str,
+    ref_table: &str,
+    ref_col: Option<&str>,
+    child_col_name: &str,
+    fk_val: &Literal,
+    snapshot: &Snapshot,
+    xid: Xid,
+    pool: &BufferPool,
+    catalog: &Catalog,
+) -> Result<()> {
+    let parent_def = catalog.lookup(ref_table)?;
+    let parent_col = resolve_fk_ref_col(parent_def, ref_col)?;
+
+    // Fast path: parent PK/UNIQUE column has an implicit B-tree (item 35).
+    if let Some(uiq_meta) = parent_col.unique_index_root {
+        if let Ok(key) = OrderedValue::try_from(fk_val) {
+            let candidates = DiskBTree::new(uiq_meta, pool.page_size()).search_eq(&key, pool)?;
+            for rid in candidates {
+                if get_visible(pool, rid, snapshot, xid)?.is_some() {
+                    return Ok(());
+                }
+            }
+            return Err(DbError::ForeignKeyViolation {
+                table: child_table.to_string(),
+                ref_table: ref_table.to_string(),
+                column: Some(child_col_name.to_string()),
+                value: Some(literal_display(fk_val)),
+            });
+        }
+    }
+
+    // Fallback: heap scan of parent (no implicit unique index — pre-item-35
+    // table, or non-BTree-indexable type). O(n) in parent table size.
+    let ref_col_idx = column_index(parent_def, &parent_col.name)?;
+    let parent_heap = Heap::open(
+        pool.page_size(),
+        parent_def.fsm_meta,
+        parent_def.pages.clone(),
+    );
+    for (_, bytes) in parent_heap.scan(snapshot, xid, pool)? {
+        let parent_row = decode_row(&bytes, &parent_def.columns)?;
+        if parent_row[ref_col_idx] == *fk_val {
+            return Ok(());
+        }
+    }
+    Err(DbError::ForeignKeyViolation {
+        table: child_table.to_string(),
+        ref_table: ref_table.to_string(),
+        column: Some(child_col_name.to_string()),
+        value: Some(literal_display(fk_val)),
+    })
+}
+
+/// Composite-FK fallback: heap-scan parent for a row where every referenced
+/// column matches the child's FK column values. O(n) in parent table size;
+/// documented limitation — use a covering index on the parent's composite PK
+/// for large tables.
+fn check_fk_parent_exists_composite(
+    child_def: &TableDef,
+    fk: &crate::catalog::ForeignKey,
+    child_row: &[Literal],
+    snapshot: &Snapshot,
+    xid: Xid,
+    pool: &BufferPool,
+    catalog: &Catalog,
+) -> Result<()> {
+    let parent_def = catalog.lookup(&fk.ref_table)?;
+    // Map each child FK column → (parent_ref_col_idx, child_col_idx).
+    let pairs: Vec<(usize, usize)> = fk
+        .columns
+        .iter()
+        .zip(fk.ref_columns.iter())
+        .map(|(child_col, ref_col)| {
+            Ok((
+                column_index(parent_def, ref_col)?,
+                column_index(child_def, child_col)?,
+            ))
+        })
+        .collect::<Result<_>>()?;
+
+    let child_vals: Vec<&Literal> = pairs.iter().map(|(_, ci)| &child_row[*ci]).collect();
+    if child_vals.iter().any(|v| matches!(v, Literal::Null)) {
+        return Ok(()); // NULL in any part of a composite FK → unchecked
+    }
+
+    let parent_heap = Heap::open(
+        pool.page_size(),
+        parent_def.fsm_meta,
+        parent_def.pages.clone(),
+    );
+    for (_, bytes) in parent_heap.scan(snapshot, xid, pool)? {
+        let parent_row = decode_row(&bytes, &parent_def.columns)?;
+        if pairs
+            .iter()
+            .zip(child_vals.iter())
+            .all(|((pi, _), cv)| &parent_row[*pi] == *cv)
+        {
+            return Ok(());
+        }
+    }
+    Err(DbError::ForeignKeyViolation {
+        table: child_def.name.clone(),
+        ref_table: fk.ref_table.clone(),
+        column: Some(fk.columns.join(", ")),
+        value: Some(
+            child_vals
+                .iter()
+                .map(|v| literal_display(v))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+    })
+}
+
+/// RESTRICT: for a parent row about to be deleted/updated, verify that no
+/// visible child row references its PK value. Iterates all catalog tables
+/// for FK references to `parent_def.name`; uses the child FK column's
+/// secondary DiskBTree index if present, otherwise falls back to a heap scan.
+fn enforce_fk_restrict(
+    parent_def: &TableDef,
+    deleted_row: &[Literal],
+    snapshot: &Snapshot,
+    xid: Xid,
+    pool: &BufferPool,
+    catalog: &Catalog,
+) -> Result<()> {
+    for child_def in catalog.tables() {
+        // Column-level references.
+        for (child_col_idx, child_col) in child_def.columns.iter().enumerate() {
+            if child_col.dropped {
+                continue;
+            }
+            let Some(fk) = &child_col.constraints.references else {
+                continue;
+            };
+            if fk.table != parent_def.name {
+                continue;
+            }
+            let parent_col = match resolve_fk_ref_col(parent_def, fk.column.as_deref()) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let parent_col_idx = match column_index(parent_def, &parent_col.name) {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+            let pk_val = &deleted_row[parent_col_idx];
+            if matches!(pk_val, Literal::Null) {
+                continue;
+            }
+            check_restrict_child(
+                parent_def,
+                pk_val,
+                child_def,
+                child_col_idx,
+                snapshot,
+                xid,
+                pool,
+            )?;
+        }
+        // Table-level FK references (single-column fast path only).
+        for fk in &child_def.constraints.foreign_keys {
+            if fk.ref_table != parent_def.name {
+                continue;
+            }
+            if fk.columns.len() != 1 || fk.ref_columns.len() != 1 {
+                continue; // composite — skip (would need composite heap scan)
+            }
+            let child_col_idx = match column_index(child_def, &fk.columns[0]) {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+            let parent_col_idx = match column_index(parent_def, &fk.ref_columns[0]) {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+            let pk_val = &deleted_row[parent_col_idx];
+            if matches!(pk_val, Literal::Null) {
+                continue;
+            }
+            check_restrict_child(
+                parent_def,
+                pk_val,
+                child_def,
+                child_col_idx,
+                snapshot,
+                xid,
+                pool,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Inner RESTRICT check: does any visible row in `child_def` have `child_col`
+/// equal to `pk_val`? Uses the child column's secondary DiskBTree index for
+/// O(log n) if one exists; falls back to a full heap scan otherwise (O(n) —
+/// documented: add `CREATE INDEX ON child(fk_col)` to avoid).
+fn check_restrict_child(
+    parent_def: &TableDef,
+    pk_val: &Literal,
+    child_def: &TableDef,
+    child_col_idx: usize,
+    snapshot: &Snapshot,
+    xid: Xid,
+    pool: &BufferPool,
+) -> Result<()> {
+    let child_col = &child_def.columns[child_col_idx];
+
+    // Fast path: child FK column has an explicit secondary DiskBTree index.
+    if let Some(index_root) = child_col.index_root {
+        if matches!(child_col.index, Some(IndexKind::BTree)) {
+            if let Ok(key) = OrderedValue::try_from(pk_val) {
+                let candidates =
+                    DiskBTree::new(index_root, pool.page_size()).search_eq(&key, pool)?;
+                for rid in candidates {
+                    if get_visible(pool, rid, snapshot, xid)?.is_some() {
+                        return Err(DbError::ForeignKeyViolation {
+                            table: child_def.name.clone(),
+                            ref_table: parent_def.name.clone(),
+                            column: Some(child_col.name.clone()),
+                            value: Some(literal_display(pk_val)),
+                        });
+                    }
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    // Fallback: full heap scan of child (no index on FK column).
+    let child_heap = Heap::open(
+        pool.page_size(),
+        child_def.fsm_meta,
+        child_def.pages.clone(),
+    );
+    for (_, bytes) in child_heap.scan(snapshot, xid, pool)? {
+        let child_row = decode_row(&bytes, &child_def.columns)?;
+        if child_row[child_col_idx] == *pk_val {
+            return Err(DbError::ForeignKeyViolation {
+                table: child_def.name.clone(),
+                ref_table: parent_def.name.clone(),
+                column: Some(child_col.name.clone()),
+                value: Some(literal_display(pk_val)),
+            });
+        }
+    }
+    Ok(())
+}
+
 use super::datetime;
 use super::logical::{CmpOp, Expr, Literal, LogicalPlan};
 
@@ -893,18 +1402,14 @@ fn exec_insert(
         let coerced = coerce_and_validate_row(&table_def, filled)?;
         enforce_not_null(&table_def, &coerced)?;
         enforce_checks(&table_def, &coerced)?;
-        // UNIQUE (M11) — two-step approach for concurrent-inserter safety
-        // (item 35, Phase 2 inv. 3):
+        // UNIQUE + FK — two-step approach for concurrent-writer safety
+        // (item 35 inv. 3 / item 36 inv. 3): both phantom locks must be
+        // acquired BEFORE taking the snapshot so that any concurrent winner
+        // (another inserter racing the same unique key, or a parent deleter
+        // racing this child insert) is already committed and visible when the
+        // snapshot is taken.
         //
-        // Step 1: acquire an exclusive phantom lock per indexable PK/UNIQUE
-        // column BEFORE taking the snapshot. Two writers racing the same key
-        // both reach this point; one acquires the lock and proceeds, the
-        // other blocks (WaitPolicy::Wait) until the first commits or aborts.
-        // When the waiter unblocks, step 2's fresh snapshot includes the
-        // winner's committed row, so enforce_unique correctly sees the duplicate
-        // and returns UniqueViolation. Without this lock the race is:
-        //   A & B both call enforce_unique → both pass (no committed row yet)
-        //   A & B both insert → both commit → duplicate key visible.
+        // Step 1a: UniqueKey phantom locks (item 35).
         for (col_idx, col) in table_def.columns.iter().enumerate() {
             if col.dropped || col.unique_index_root.is_none() {
                 continue;
@@ -914,11 +1419,31 @@ fn exec_insert(
                 ctx.lock_mgr.acquire_blocking(lock_id, ctx.xid)?;
             }
         }
-        // Step 2: take snapshot AFTER acquiring all unique key locks — any
-        // concurrent winner that committed while we waited is now visible.
+        // Step 1b: FkKey phantom locks (item 36) — before snapshot so a
+        // concurrent parent deleter either already committed (FK violation
+        // follows) or blocks here and sees the committed child after we commit.
+        acquire_fk_key_locks(
+            &table_def,
+            &coerced,
+            ctx.xid,
+            ctx.lock_mgr,
+            ctx.catalog.get(),
+        )?;
+        // Step 2: take snapshot AFTER all phantom locks — every concurrent
+        // winner is now visible.
         let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
         enforce_unique(
             &table_def, &coerced, &heap, &snapshot, ctx.xid, ctx.pool, None,
+        )?;
+        // Step 3: FK row-existence check (item 36). NULL columns are
+        // skipped; own-xid rows (same-txn parent) are visible via get_visible.
+        enforce_fk_rows_exist(
+            &table_def,
+            &coerced,
+            &snapshot,
+            ctx.xid,
+            ctx.pool,
+            ctx.catalog.get(),
         )?;
         let encoded = encode_row(&coerced);
         let row_id = heap.insert(&encoded, ctx.xid, ctx.pool, ctx.wal)?;
@@ -1541,6 +2066,14 @@ fn exec_update(
     // scan (which would otherwise fire per row → RC5's O(N²)); the check is a
     // no-op in that case (`enforce_unique` early-returns on empty active sets).
     let has_unique = !unique_column_sets(&table_def)?.is_empty();
+    // Item 36: gate FK child-side check (new values reference valid parents).
+    let has_fk_refs = table_def
+        .columns
+        .iter()
+        .any(|c| !c.dropped && c.constraints.references.is_some())
+        || !table_def.constraints.foreign_keys.is_empty();
+    // Item 36: gate FK parent-side RESTRICT (does any child table reference us?).
+    let has_fk_children = table_has_fk_children(ctx.catalog.get(), table);
     let mut count = 0;
     for (row_id, mut row) in matching {
         // C1 (item 29): snapshot the pre-mutation image before set_column overwrites it.
@@ -1552,22 +2085,72 @@ fn exec_update(
         let coerced = coerce_and_validate_row(&table_def, row)?;
         enforce_not_null(&table_def, &coerced)?;
         enforce_checks(&table_def, &coerced)?;
-        // UNIQUE (M11): exclude the row's *current* version — the old tuple
-        // is still visible to this snapshot until `heap.update` supersedes
-        // it, so without the exclusion an unchanged unique value would
-        // collide with itself. Skipped entirely when the table has no UNIQUE
-        // set (A4).
-        if has_unique {
+        // UNIQUE + FK — acquire all phantom locks BEFORE taking a fresh
+        // snapshot, then run uniqueness + FK checks with it (items 35/36).
+        // RESTRICT on old PK also uses a fresh snapshot (after its lock).
+        if has_unique || has_fk_refs || has_fk_children {
+            // Step 1: acquire UniqueKey + FkKey (child-side) phantom locks.
+            if has_unique {
+                for (col_idx, col) in table_def.columns.iter().enumerate() {
+                    if col.dropped || col.unique_index_root.is_none() {
+                        continue;
+                    }
+                    if let Ok(key) = OrderedValue::try_from(&coerced[col_idx]) {
+                        let lock_id = unique_key_record_id(&table_def.name, &col.name, &key);
+                        ctx.lock_mgr.acquire_blocking(lock_id, ctx.xid)?;
+                    }
+                }
+            }
+            if has_fk_refs {
+                acquire_fk_key_locks(
+                    &table_def,
+                    &coerced,
+                    ctx.xid,
+                    ctx.lock_mgr,
+                    ctx.catalog.get(),
+                )?;
+            }
+            // Step 1b: FkKey parent lock for RESTRICT (old PK value).
+            if has_fk_children {
+                acquire_fk_key_locks_parent(&table_def, &before_row, ctx.xid, ctx.lock_mgr)?;
+            }
+            // Step 2: fresh snapshot AFTER all phantom locks.
             let usnap = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
-            enforce_unique(
-                &table_def,
-                &coerced,
-                &heap,
-                &usnap,
-                ctx.xid,
-                ctx.pool,
-                Some(row_id),
-            )?;
+            // UNIQUE: exclude the row's current version (old tuple still visible
+            // to this snapshot until heap.update supersedes it).
+            if has_unique {
+                enforce_unique(
+                    &table_def,
+                    &coerced,
+                    &heap,
+                    &usnap,
+                    ctx.xid,
+                    ctx.pool,
+                    Some(row_id),
+                )?;
+            }
+            // FK child-side: new values must reference a visible parent row.
+            if has_fk_refs {
+                enforce_fk_rows_exist(
+                    &table_def,
+                    &coerced,
+                    &usnap,
+                    ctx.xid,
+                    ctx.pool,
+                    ctx.catalog.get(),
+                )?;
+            }
+            // FK parent-side RESTRICT: old PK value must not be referenced.
+            if has_fk_children {
+                enforce_fk_restrict(
+                    &table_def,
+                    &before_row,
+                    &usnap,
+                    ctx.xid,
+                    ctx.pool,
+                    ctx.catalog.get(),
+                )?;
+            }
         }
         let encoded = encode_row(&coerced);
         let new_row_id =
@@ -1615,8 +2198,34 @@ fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Resu
     let read_ids: Vec<RowId> = matching.iter().map(|(rid, _)| *rid).collect();
     ctx.txn_mgr.ssi_note_reads(ctx.xid, &read_ids);
 
+    // Item 36: gate the RESTRICT scan — zero overhead when no table
+    // references this one (the common case).
+    let has_fk_children = table_has_fk_children(ctx.catalog.get(), table);
+
     let mut count = 0;
     for (row_id, row) in matching {
+        // Item 36 — FK RESTRICT: before deleting, verify no visible child
+        // row references this parent row's PK value.
+        // Protocol (closes the parent-delete / child-insert race):
+        //   1. Acquire FkKey phantom lock on parent PK value BEFORE snapshot.
+        //   2. Take fresh snapshot — sees any child that committed before us.
+        //   3. Scan referencing child tables; reject if any visible child found.
+        // A concurrent child inserter that hasn't committed yet must also
+        // acquire the same FkKey lock (item 36, child-side), so it either
+        // blocks here until we commit (then gets FK violation) or committed
+        // first and is caught by step 3.
+        if has_fk_children {
+            acquire_fk_key_locks_parent(&table_def, &row, ctx.xid, ctx.lock_mgr)?;
+            let restrict_snap = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+            enforce_fk_restrict(
+                &table_def,
+                &row,
+                &restrict_snap,
+                ctx.xid,
+                ctx.pool,
+                ctx.catalog.get(),
+            )?;
+        }
         // C1 (item 29): DELETE carries before-only; captured before heap.delete
         // runs — once deleted there is nothing left to build a payload from.
         send_event_capture(&table_def, "delete", Some(&row), None, ctx)?;
@@ -2196,6 +2805,8 @@ fn enforce_referenced_tables_exist(table_def: &TableDef, catalog: &Catalog) -> R
             return Err(DbError::ForeignKeyViolation {
                 table: table_def.name.clone(),
                 ref_table: ref_table.to_string(),
+                column: None,
+                value: None,
             });
         }
         Ok(())

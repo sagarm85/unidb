@@ -107,10 +107,16 @@ pub enum DbError {
     #[error("CHECK constraint violated on table '{table}'")]
     CheckViolation { table: String },
 
-    #[error(
-        "FOREIGN KEY constraint violated on table '{table}': referenced table '{ref_table}' does not exist"
-    )]
-    ForeignKeyViolation { table: String, ref_table: String },
+    #[error("{}", fk_violation_msg(table, ref_table, column, value))]
+    ForeignKeyViolation {
+        table: String,
+        ref_table: String,
+        /// Present for row-level violations (item 36); `None` for the legacy
+        /// table-existence-only check (keeps existing callers unbroken).
+        column: Option<String>,
+        /// String-encoded FK value that had no matching parent row.
+        value: Option<String>,
+    },
 
     /// Only ever produced by the optional M5 server layer
     /// (`src/server/engine_handle.rs`): the dedicated writer thread that
@@ -137,3 +143,21 @@ pub enum DbError {
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;
+
+fn fk_violation_msg(
+    table: &str,
+    ref_table: &str,
+    column: &Option<String>,
+    value: &Option<String>,
+) -> String {
+    match (column, value) {
+        (Some(col), Some(val)) => format!(
+            "FOREIGN KEY constraint violated on table '{table}': \
+             column '{col}' value {val} has no matching row in '{ref_table}'"
+        ),
+        _ => format!(
+            "FOREIGN KEY constraint violated on table '{table}': \
+             referenced table '{ref_table}' does not exist"
+        ),
+    }
+}

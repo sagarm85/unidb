@@ -277,28 +277,29 @@ fn table_level_check() {
     assert!(matches!(err, DbError::CheckViolation { .. }), "{err:?}");
 }
 
-// ── FOREIGN KEY (referenced-table existence only, M11 scope) ──────────────────
+// ── FOREIGN KEY ───────────────────────────────────────────────────────────────
 
 #[test]
 fn foreign_key_requires_referenced_table_to_exist() {
     let (mut engine, _dir) = fresh();
-    // The referenced table `users` does not exist yet — CREATE TABLE with a
-    // forward reference is allowed; enforcement happens on write.
+    // Forward reference is allowed at CREATE TABLE time; enforcement happens on write.
     run(
         &mut engine,
         "CREATE TABLE posts (id INT, author INT REFERENCES users(id))",
     )
     .unwrap();
 
+    // Table does not exist yet → ForeignKeyViolation on INSERT.
     let err = run(&mut engine, "INSERT INTO posts (id, author) VALUES (1, 1)").unwrap_err();
     assert!(
         matches!(err, DbError::ForeignKeyViolation { ref ref_table, .. } if ref_table == "users"),
         "expected ForeignKeyViolation referencing 'users', got {err:?}"
     );
 
-    // Once `users` exists, the insert succeeds (referenced-table existence is
-    // all M11 enforces — no referenced-row check).
-    run(&mut engine, "CREATE TABLE users (id INT)").unwrap();
+    // Table exists and referenced row exists → insert succeeds (item 36:
+    // row-level enforcement now active; table existence alone is not enough).
+    run(&mut engine, "CREATE TABLE users (id INT PRIMARY KEY)").unwrap();
+    run(&mut engine, "INSERT INTO users (id) VALUES (1)").unwrap();
     run(&mut engine, "INSERT INTO posts (id, author) VALUES (1, 1)").unwrap();
     assert_eq!(select_ints(&mut engine, "SELECT id FROM posts"), vec![1]);
 }
@@ -306,15 +307,273 @@ fn foreign_key_requires_referenced_table_to_exist() {
 #[test]
 fn table_level_foreign_key_referenced_table_existence() {
     let (mut engine, _dir) = fresh();
-    run(&mut engine, "CREATE TABLE users (id INT)").unwrap();
+    run(&mut engine, "CREATE TABLE users (id INT PRIMARY KEY)").unwrap();
     run(
         &mut engine,
         "CREATE TABLE posts (id INT, author INT, FOREIGN KEY (author) REFERENCES users(id))",
     )
     .unwrap();
-    // Referenced table exists → insert is accepted.
+    // Parent row must exist (item 36 row-level enforcement).
+    run(&mut engine, "INSERT INTO users (id) VALUES (42)").unwrap();
     run(&mut engine, "INSERT INTO posts (id, author) VALUES (1, 42)").unwrap();
     assert_eq!(select_ints(&mut engine, "SELECT id FROM posts"), vec![1]);
+}
+
+// ── FOREIGN KEY — row-level enforcement (item 36) ─────────────────────────────
+
+#[test]
+fn fk_row_existence_missing_parent_rejected() {
+    let (mut engine, _dir) = fresh();
+    run(&mut engine, "CREATE TABLE orders (id INT PRIMARY KEY)").unwrap();
+    run(
+        &mut engine,
+        "CREATE TABLE items (id INT PRIMARY KEY, order_id INT REFERENCES orders(id))",
+    )
+    .unwrap();
+    // Parent row id=99 does not exist → ForeignKeyViolation.
+    let err = run(
+        &mut engine,
+        "INSERT INTO items (id, order_id) VALUES (1, 99)",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            DbError::ForeignKeyViolation {
+                ref column,
+                ref value,
+                ..
+            } if column.as_deref() == Some("order_id") && value.as_deref() == Some("99")
+        ),
+        "expected ForeignKeyViolation for order_id=99, got {err:?}"
+    );
+    // No items inserted.
+    assert_eq!(
+        select_ints(&mut engine, "SELECT id FROM items"),
+        vec![0i64; 0]
+    );
+}
+
+#[test]
+fn fk_row_existence_valid_parent_accepted() {
+    let (mut engine, _dir) = fresh();
+    run(&mut engine, "CREATE TABLE orders (id INT PRIMARY KEY)").unwrap();
+    run(
+        &mut engine,
+        "CREATE TABLE items (id INT PRIMARY KEY, order_id INT REFERENCES orders(id))",
+    )
+    .unwrap();
+    run(&mut engine, "INSERT INTO orders (id) VALUES (1)").unwrap();
+    run(
+        &mut engine,
+        "INSERT INTO items (id, order_id) VALUES (10, 1)",
+    )
+    .unwrap();
+    assert_eq!(select_ints(&mut engine, "SELECT id FROM items"), vec![10]);
+}
+
+#[test]
+fn fk_null_column_not_checked() {
+    let (mut engine, _dir) = fresh();
+    run(&mut engine, "CREATE TABLE orders (id INT PRIMARY KEY)").unwrap();
+    run(
+        &mut engine,
+        "CREATE TABLE items (id INT PRIMARY KEY, order_id INT REFERENCES orders(id))",
+    )
+    .unwrap();
+    // NULL FK column is always accepted even when no parent row exists.
+    run(&mut engine, "INSERT INTO items (id) VALUES (1)").unwrap();
+    assert_eq!(select_ints(&mut engine, "SELECT id FROM items"), vec![1]);
+}
+
+#[test]
+fn fk_same_txn_parent_then_child_accepted() {
+    let (mut engine, _dir) = fresh();
+    run(&mut engine, "CREATE TABLE orders (id INT PRIMARY KEY)").unwrap();
+    run(
+        &mut engine,
+        "CREATE TABLE items (id INT PRIMARY KEY, order_id INT REFERENCES orders(id))",
+    )
+    .unwrap();
+    // Insert parent + child in one transaction (own-xid visibility via get_visible).
+    let xid = engine.begin().unwrap();
+    engine
+        .execute_sql(xid, "INSERT INTO orders (id) VALUES (5)")
+        .unwrap();
+    engine
+        .execute_sql(xid, "INSERT INTO items (id, order_id) VALUES (50, 5)")
+        .unwrap();
+    engine.commit(xid).unwrap();
+    assert_eq!(select_ints(&mut engine, "SELECT id FROM items"), vec![50]);
+}
+
+#[test]
+fn fk_restrict_blocks_parent_delete_with_children() {
+    let (mut engine, _dir) = fresh();
+    run(&mut engine, "CREATE TABLE orders (id INT PRIMARY KEY)").unwrap();
+    run(
+        &mut engine,
+        "CREATE TABLE items (id INT PRIMARY KEY, order_id INT REFERENCES orders(id))",
+    )
+    .unwrap();
+    run(&mut engine, "INSERT INTO orders (id) VALUES (1)").unwrap();
+    run(
+        &mut engine,
+        "INSERT INTO items (id, order_id) VALUES (10, 1)",
+    )
+    .unwrap();
+    // Parent delete blocked because child row references it (RESTRICT).
+    let err = run(&mut engine, "DELETE FROM orders WHERE id = 1").unwrap_err();
+    assert!(
+        matches!(
+            err,
+            DbError::ForeignKeyViolation {
+                ref ref_table,
+                ref column,
+                ..
+            } if ref_table == "orders" && column.as_deref() == Some("order_id")
+        ),
+        "expected RESTRICT ForeignKeyViolation, got {err:?}"
+    );
+    // Parent row still intact.
+    assert_eq!(select_ints(&mut engine, "SELECT id FROM orders"), vec![1]);
+}
+
+#[test]
+fn fk_restrict_allows_parent_delete_no_children() {
+    let (mut engine, _dir) = fresh();
+    run(&mut engine, "CREATE TABLE orders (id INT PRIMARY KEY)").unwrap();
+    run(
+        &mut engine,
+        "CREATE TABLE items (id INT PRIMARY KEY, order_id INT REFERENCES orders(id))",
+    )
+    .unwrap();
+    run(&mut engine, "INSERT INTO orders (id) VALUES (1)").unwrap();
+    run(&mut engine, "INSERT INTO orders (id) VALUES (2)").unwrap();
+    run(
+        &mut engine,
+        "INSERT INTO items (id, order_id) VALUES (10, 2)",
+    )
+    .unwrap();
+    // Delete order 1 (no children) — must succeed.
+    run(&mut engine, "DELETE FROM orders WHERE id = 1").unwrap();
+    assert_eq!(select_ints(&mut engine, "SELECT id FROM orders"), vec![2]);
+    // Delete order 2 (has child) — must fail.
+    let err = run(&mut engine, "DELETE FROM orders WHERE id = 2").unwrap_err();
+    assert!(
+        matches!(err, DbError::ForeignKeyViolation { .. }),
+        "expected RESTRICT, got {err:?}"
+    );
+}
+
+#[test]
+fn fk_table_level_constraint_enforced() {
+    let (mut engine, _dir) = fresh();
+    run(&mut engine, "CREATE TABLE users (id INT PRIMARY KEY)").unwrap();
+    run(
+        &mut engine,
+        "CREATE TABLE posts (id INT PRIMARY KEY, author INT, FOREIGN KEY (author) REFERENCES users(id))",
+    )
+    .unwrap();
+    // Missing parent → rejected.
+    let err = run(&mut engine, "INSERT INTO posts (id, author) VALUES (1, 99)").unwrap_err();
+    assert!(
+        matches!(err, DbError::ForeignKeyViolation { ref ref_table, .. } if ref_table == "users"),
+        "expected ForeignKeyViolation for users, got {err:?}"
+    );
+    // Valid parent → accepted.
+    run(&mut engine, "INSERT INTO users (id) VALUES (99)").unwrap();
+    run(&mut engine, "INSERT INTO posts (id, author) VALUES (1, 99)").unwrap();
+    assert_eq!(select_ints(&mut engine, "SELECT id FROM posts"), vec![1]);
+}
+
+#[test]
+fn fk_update_to_missing_parent_rejected() {
+    let (mut engine, _dir) = fresh();
+    run(&mut engine, "CREATE TABLE orders (id INT PRIMARY KEY)").unwrap();
+    run(
+        &mut engine,
+        "CREATE TABLE items (id INT PRIMARY KEY, order_id INT REFERENCES orders(id))",
+    )
+    .unwrap();
+    run(&mut engine, "INSERT INTO orders (id) VALUES (1)").unwrap();
+    run(
+        &mut engine,
+        "INSERT INTO items (id, order_id) VALUES (10, 1)",
+    )
+    .unwrap();
+    // Update child FK to a non-existent parent → rejected.
+    let err = run(&mut engine, "UPDATE items SET order_id = 999 WHERE id = 10").unwrap_err();
+    assert!(
+        matches!(err, DbError::ForeignKeyViolation { .. }),
+        "expected ForeignKeyViolation, got {err:?}"
+    );
+    // FK value is unchanged.
+    assert_eq!(
+        select_ints(&mut engine, "SELECT order_id FROM items WHERE id = 10"),
+        vec![1]
+    );
+}
+
+#[test]
+fn fk_child_insert_throughput_is_flat() {
+    // Regression: child-side FK enforcement must be O(log n) in parent size —
+    // not O(n) as a heap scan would be. Measure insert throughput into a child
+    // table at chunk1 (small parent) vs chunk3 (large parent); the ratio must
+    // not degrade like the pre-item-35 enforce_unique did.
+    let (dir, mut engine) = {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+        (dir, engine)
+    };
+    run(&mut engine, "CREATE TABLE orders (id INT PRIMARY KEY)").unwrap();
+    run(
+        &mut engine,
+        "CREATE TABLE items (id INT PRIMARY KEY, order_id INT REFERENCES orders(id))",
+    )
+    .unwrap();
+
+    // Insert a fixed parent row that all child chunks will reference.
+    run(&mut engine, "INSERT INTO orders (id) VALUES (1)").unwrap();
+
+    // Helper: grow the orders table then measure a child-insert chunk.
+    let measure = |engine: &mut Engine, base: i64, chunk: i64| -> f64 {
+        let pad_vals: String = (base + 1_000_000..base + 1_000_000 + chunk)
+            .map(|i| format!("({i})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        run(
+            engine,
+            &format!("INSERT INTO orders (id) VALUES {pad_vals}"),
+        )
+        .unwrap();
+        let vals: String = (base..base + chunk)
+            .map(|i| format!("({i}, 1)"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let t0 = Instant::now();
+        run(
+            engine,
+            &format!("INSERT INTO items (id, order_id) VALUES {vals}"),
+        )
+        .unwrap();
+        chunk as f64 / t0.elapsed().as_secs_f64()
+    };
+
+    let chunk = 1_000i64;
+    let r1 = measure(&mut engine, 0, chunk);
+    let r2 = measure(&mut engine, chunk, chunk);
+    let r3 = measure(&mut engine, chunk * 2, chunk);
+
+    // Ratio must stay above 0.5 — at most 2× slowdown chunk3 vs chunk1.
+    // Before fix (O(n) parent scan) the ratio was ~0.2 at these sizes.
+    let ratio3 = r3 / r1;
+    assert!(
+        ratio3 > 0.5,
+        "FK child insert chunk3/chunk1 ratio={ratio3:.2} — suspected O(n) parent scan \
+         (r1={r1:.0}/s, r2={r2:.0}/s, r3={r3:.0}/s)"
+    );
+    let _ = dir;
 }
 
 // ── persistence across reopen ─────────────────────────────────────────────────
