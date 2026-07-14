@@ -12,8 +12,10 @@ win.
   data is stored and kept safe (incl. crash recovery), transactions &
   concurrency, the SQL layer (supported data types + query examples), search /
   indexing / graph, the event stream, a full REST API reference (endpoints,
-  params, payloads, responses, error codes), operations & HA, measured
-  performance vs Postgres, correctness/testing, known limitations, and roadmap.
+  params, payloads, responses, error codes), operations & HA, a configuration
+  & performance-tuning reference (every overridable engine/server setting —
+  default, purpose, and measured performance impact), measured performance vs
+  Postgres, correctness/testing, known limitations, and roadmap.
   Written for **users**, not engine engineers — no internal milestone / phase /
   decision / item codes. First page is the title + a clickable table of
   contents (no cover); every page carries a footer page number. Generated from

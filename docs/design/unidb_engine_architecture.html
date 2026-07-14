@@ -128,12 +128,18 @@ loses <b>zero</b> data on a crash where the four-system stack tears a record.
         <li><a href="#s8-8">Error codes</a></li></ol></li>
   <li><a href="#s9">Operations &amp; high availability</a></li>
   <li><a href="#s10">Performance — measured against Postgres</a></li>
-  <li><a href="#s11">Correctness &amp; testing</a></li>
-  <li><a href="#s12">Known limitations, bugs &amp; roadmap priority</a>
-    <ol><li><a href="#s12-1">Known bugs</a></li>
-        <li><a href="#s12-2">Known limitations &amp; feature gaps</a></li></ol></li>
-  <li><a href="#s13">Where unidb is headed</a></li>
-  <li><a href="#s14">Glossary of terms &amp; abbreviations</a></li>
+  <li><a href="#s11">Configuration &amp; performance tuning</a>
+    <ol><li><a href="#s11-1">Memory &amp; storage layout</a></li>
+        <li><a href="#s11-2">Write durability &amp; the WAL</a></li>
+        <li><a href="#s11-3">Query execution &amp; concurrency</a></li>
+        <li><a href="#s11-4">Vacuum &amp; space reclamation</a></li>
+        <li><a href="#s11-5">REST server timeouts</a></li></ol></li>
+  <li><a href="#s12">Correctness &amp; testing</a></li>
+  <li><a href="#s13">Known limitations, bugs &amp; roadmap priority</a>
+    <ol><li><a href="#s13-1">Known bugs</a></li>
+        <li><a href="#s13-2">Known limitations &amp; feature gaps</a></li></ol></li>
+  <li><a href="#s14">Where unidb is headed</a></li>
+  <li><a href="#s15">Glossary of terms &amp; abbreviations</a></li>
 </ol>
 </div>
 
@@ -577,7 +583,7 @@ straightforward to reason about:
 Under the hood, concurrent index updates are kept correct with fine-grained,
 carefully ordered locking so that inserts can proceed in parallel without ever
 producing an inconsistent index — validated by an extensive concurrency test
-suite (Section 11).
+suite (Section 12).
 </p>
 
 <h3 id="s4-3">4.3 What happens on rollback</h3>
@@ -1336,7 +1342,230 @@ hundreds of GB with high read throughput.
 </p>
 
 <!-- ================= 11 ================= -->
-<h2 id="s11">11. Correctness &amp; testing</h2>
+<h2 id="s11" class="pagebreak">11. Configuration &amp; performance tuning</h2>
+<p>
+unidb ships with defaults chosen to be <b>safe for a first run</b>, not
+necessarily the fastest possible for every workload. Every setting below is an
+environment variable read once at engine (or server) start-up; the embedded
+crate also exposes most of them as explicit constructor/setter calls for
+programmatic control without touching the environment. Except where noted,
+the same variable governs both the embedded crate and the REST server, since
+the server is a thin wrapper over <code>Engine::open</code>.
+</p>
+<div class="callout warn">
+<b>The buffer pool is not a data cache — read this before tuning it.</b>
+unidb stores pages in a memory-mapped file, so page bytes already live in the
+OS page cache "for free," the same way they would for any other file the OS
+has read. The buffer pool (<code>UNIDB_BUFFER_POOL_PAGES</code>) only tracks
+<b>pin and dirty-tracking metadata</b> per page (~24 bytes/frame) — not a
+Postgres-style <code>shared_buffers</code> RAM cache of page contents. Sizing
+it like one (e.g. a large fraction of RAM) wastes memory on frame-table
+bookkeeping for no caching benefit; sizing it too small for your working set
+is the real hazard (see 11.1).
+</div>
+
+<h3 id="s11-1">11.1 Memory &amp; storage layout</h3>
+<table>
+<tr><th>Setting</th><th>Default</th><th>Purpose</th><th>Performance impact / when to override</th></tr>
+<tr><td><code>UNIDB_BUFFER_POOL_PAGES</code></td><td>65,536 frames
+    (~512&nbsp;MiB pin/dirty-tracking ceiling)</td>
+    <td>Caps how many pages may be simultaneously pinned/dirty in the buffer
+    pool.</td>
+    <td>Too small for a workload's concurrently-dirtied working set forces a
+    synchronous <code>wal.sync()</code> on every write once the pool fills
+    (<code>BufferPoolFull</code>) — measured on a demo seed this collapsed
+    insert throughput from a flat ~25k rows/s to ~1.2–1.7k rows/s (93
+    checkpoints for 211 commits) even though nothing else was wrong. Raise it
+    for large bulk loads across many tables — e.g. 1,000,000 frames costs
+    ~24&nbsp;MiB of frame-table memory and ~530&nbsp;µs extra per
+    <code>Engine::open()</code>, negligible against the throughput it
+    restores. Do not raise it expecting a page-data cache effect (see the
+    callout above) — its cost is a bigger frame table, not more cached
+    bytes.</td></tr>
+<tr><td><code>UNIDB_PAGE_SIZE</code></td><td><code>0</code> → engine default
+    (8&nbsp;KiB)</td>
+    <td>Page size baked into the control file at first database creation
+    (locked decision D8).</td>
+    <td><b>Fixed forever once any file exists</b> — only takes effect on a
+    brand-new data directory's first <code>Engine::open</code>; there is no
+    way to change it later short of dump/reload into a new database. A larger
+    page amortizes the page header over more rows per fetch (fewer page reads
+    for large sequential scans) at the cost of a bigger full-page WAL image
+    the first time a page is dirtied after each checkpoint — leave it at the
+    default unless you have measured a specific large-row or large-scan
+    workload that benefits.</td></tr>
+</table>
+
+<h3 id="s11-2">11.2 Write durability &amp; the WAL</h3>
+<table>
+<tr><th>Setting</th><th>Default</th><th>Purpose</th><th>Performance impact / when to override</th></tr>
+<tr><td><code>UNIDB_AUTO_CHECKPOINT</code></td><td>on</td>
+    <td>Master switch for automatic checkpointing, which bounds WAL growth and
+    recovery replay time.</td>
+    <td>Disabling it lets the WAL grow unbounded until a manual checkpoint —
+    never disable in production; it exists for tests that want deterministic
+    manual control over checkpoint timing.</td></tr>
+<tr><td><code>UNIDB_CHECKPOINT_TIMEOUT_SECS</code></td><td>60</td>
+    <td>Checkpoint at least this often once the engine is quiescent (no open
+    transaction).</td>
+    <td>Lowering it bounds worst-case recovery time and WAL disk usage more
+    tightly at the cost of more frequent checkpoint I/O (and more full-page
+    images re-logged after each one); raising it trades a longer potential
+    recovery replay for less checkpoint overhead on a write-heavy but
+    low-idle-time workload.</td></tr>
+<tr><td><code>UNIDB_MAX_WAL_SIZE_BYTES</code></td><td>64&nbsp;MiB</td>
+    <td>Checkpoint once the WAL since the last checkpoint reaches this many
+    bytes — the size-based trigger alongside the timeout above.</td>
+    <td>Lower it on a disk-constrained host to cap WAL size tightly; raise it
+    on a write-heavy host to amortize checkpoint cost over more writes,
+    accepting a larger WAL and longer recovery replay after a crash.</td></tr>
+<tr><td><code>UNIDB_WAL_SEGMENT_BYTES</code></td><td>16&nbsp;MiB</td>
+    <td>Size of each rotated WAL segment file; consumed segments are deleted
+    whole once no longer needed (including by replication slots).</td>
+    <td>Mostly an operational knob, not a throughput one: smaller segments
+    free disk space in finer-grained increments (useful when a replication
+    slot or slow consumer is holding segments back) at the cost of more file
+    handles/rotations; larger segments reduce rotation overhead on a
+    high-throughput write stream.</td></tr>
+</table>
+
+<h3 id="s11-3">11.3 Query execution &amp; concurrency</h3>
+<table>
+<tr><th>Setting</th><th>Default</th><th>Purpose</th><th>Performance impact / when to override</th></tr>
+<tr><td><code>UNIDB_PARALLEL_SCAN</code></td><td>on</td>
+    <td>Master switch for partitioning a table scan's pages across worker
+    threads instead of scanning serially.</td>
+    <td>Default-on because a governed global worker budget (below) prevents
+    oversubscription. Measured 3.82× on <code>COUNT(*)</code> and up to
+    6.4–6.6× on filtered scans. Turn off only as a rollback if parallel scans
+    ever regress a specific query (e.g. a workload dominated by many small
+    concurrent scans where thread hand-off cost outweighs the win).</td></tr>
+<tr><td><code>UNIDB_PARALLEL_MIN_PAGES</code></td><td>64 pages</td>
+    <td>Minimum table size before a scan is considered worth parallelizing at
+    all.</td>
+    <td>Raise it if small-table scans show thread-spin-up overhead in your
+    profile; lower it to parallelize smaller tables too (rarely a net win —
+    the fixed cost of coordinating workers dominates below a few dozen
+    pages).</td></tr>
+<tr><td><code>UNIDB_PARALLEL_MAX_WORKERS</code></td><td>0 → one worker per CPU
+    core</td>
+    <td>Per-query cap on how many workers a single scan may use.</td>
+    <td>Lower it to leave headroom for other concurrent work on the same
+    cores when one query shouldn't be allowed to claim the whole machine;
+    leave at the default (all cores) for a dedicated batch/analytics
+    workload.</td></tr>
+<tr><td><code>UNIDB_PARALLEL_MAX_TOTAL_WORKERS</code></td><td>= CPU core
+    count</td>
+    <td>The <b>global</b> ceiling on live parallel-scan worker threads across
+    <i>all</i> concurrent queries at once — extra scans degrade to serial
+    instead of oversubscribing the machine.</td>
+    <td>This is the actual oversubscription guard: lower it on a host shared
+    with other services (databases, app servers) so scans don't starve them;
+    raise it on a dedicated many-core box running mostly scan-heavy
+    analytical queries. The <code>/stats</code>/<code>/metrics</code> worker
+    counters (§8.6) show how often the global budget was actually exhausted
+    (<code>serial_fallbacks</code>) — a non-zero, growing count is the signal
+    to raise this.</td></tr>
+<tr><td><code>UNIDB_CONCURRENT_SQL_WRITES</code></td><td>on</td>
+    <td>Lets non-DDL DML statements from multiple writers take a
+    <i>shared</i> catalog lock and run concurrently, instead of serializing
+    all SQL writes behind one lock.</td>
+    <td>Default-on after passing a 28-cell concurrency correctness matrix
+    both ways; measured 8-writer indexed <code>INSERT</code> recovering from
+    ~811 to ~1016 commits/s toward the ~1275 commits/s unindexed floor. Set
+    to <code>0</code> only as an emergency rollback if a concurrency-related
+    correctness issue is ever suspected in production — it reproduces the
+    fully serialized path exactly, at a real throughput cost under concurrent
+    writers.</td></tr>
+<tr><td><code>UNIDB_SORT_MEM_ROWS</code></td><td>1,000,000 rows</td>
+    <td>In-memory row budget for an <code>ORDER BY</code> before it spills to
+    an external merge sort on disk.</td>
+    <td>Raise it on a memory-rich host to keep larger sorts fully in memory
+    (avoids spill I/O); lower it to bound peak memory per query on a
+    memory-constrained or highly concurrent host. Overridable per-query via
+    the engine's <code>work_mem</code> query-limits API without touching the
+    process-wide default.</td></tr>
+<tr><td><code>UNIDB_HASH_JOIN_MEM_ROWS</code></td><td>1,000,000 rows</td>
+    <td>In-memory row budget for a hash join's build side before it spills to
+    disk (Grace hash join).</td>
+    <td>Same trade-off as <code>UNIDB_SORT_MEM_ROWS</code> above, applied to
+    joins: raise for faster large joins if RAM allows, lower to bound memory,
+    or override per-query via <code>work_mem</code>.</td></tr>
+</table>
+
+<h3 id="s11-4">11.4 Vacuum &amp; space reclamation</h3>
+<table>
+<tr><th>Setting</th><th>Default</th><th>Purpose</th><th>Performance impact / when to override</th></tr>
+<tr><td><code>UNIDB_AUTOVACUUM_ENABLED</code></td><td>on</td>
+    <td>Master switch for the background worker that reclaims dead-row space
+    automatically, per table.</td>
+    <td>Disabling it stops automatic cleanup entirely — dead rows accumulate
+    until a manual vacuum, growing the table on disk and slowing scans over
+    time. Leave on in production; disable only for a benchmark that wants to
+    isolate a code path from background vacuum noise.</td></tr>
+<tr><td><code>UNIDB_AUTOVACUUM_THRESHOLD</code></td><td>50 dead rows</td>
+    <td>Minimum dead-tuple count before a vacuum is even considered for a
+    table (Postgres's own default).</td>
+    <td>Lower it to reclaim space more eagerly on small, high-churn tables;
+    raise it to avoid vacuuming very small tables at all.</td></tr>
+<tr><td><code>UNIDB_AUTOVACUUM_SCALE_FACTOR</code></td><td>0.2</td>
+    <td>Fraction of a table's live-row estimate added to the threshold above,
+    so larger tables tolerate proportionally more churn before vacuuming.</td>
+    <td>Lower it to vacuum large, high-churn tables more aggressively (more
+    background I/O, less bloat); raise it to let large tables tolerate more
+    dead space before paying for a vacuum pass.</td></tr>
+<tr><td><code>UNIDB_AUTOVACUUM_NAPTIME_SECS</code></td><td>60</td>
+    <td>How often the background launcher wakes to re-check the trigger
+    condition above, per table.</td>
+    <td>Lower it for faster reaction to sudden churn spikes at the cost of
+    more frequent (cheap) wake-ups; raise it to reduce background wake-up
+    overhead on an otherwise idle system.</td></tr>
+<tr><td><code>UNIDB_VACUUM_COST_ENABLED</code></td><td>on</td>
+    <td>Master switch for a cost-budget throttle (mirroring Postgres's
+    <code>vacuum_cost_*</code> settings) that caps how much I/O a vacuum pass
+    may consume before napping.</td>
+    <td>Keeps vacuum from competing hard enough with live traffic to matter —
+    a churn test held a table to ~35 pages vs ~82&nbsp;unvacuumed while
+    keeping point reads fast. Disabling it lets a vacuum pass run flat-out
+    (finishes reclaiming space sooner) but can visibly compete with
+    concurrent read/write I/O on a busy server — only disable for an
+    offline/maintenance-window vacuum where nothing else is running.</td></tr>
+</table>
+
+<h3 id="s11-5">11.5 REST server timeouts <span class="small">(server deployments only)</span></h3>
+<table>
+<tr><th>Setting</th><th>Default</th><th>Purpose</th><th>Performance impact / when to override</th></tr>
+<tr><td><code>UNIDB_REQUEST_TIMEOUT_SECS</code></td><td>120</td>
+    <td>Global HTTP request timeout applied to every route.</td>
+    <td>Sized to comfortably cover a 100k-row bulk-load payload by default.
+    Lower it to fail fast on a latency-sensitive API surface; raise it (or set
+    to <code>0</code> to disable entirely) for larger bulk-load jobs or local
+    development tooling where an open-ended request is expected.</td></tr>
+<tr><td><code>UNIDB_TXN_IDLE_TIMEOUT_SECS</code></td><td>60</td>
+    <td>Idle deadline for an HTTP transaction session before the reaper
+    auto-aborts it.</td>
+    <td>An abandoned open transaction holds locks and pins the vacuum
+    horizon (blocking space reclamation), so lowering it recovers those
+    resources faster from misbehaving/disconnected clients; raising it
+    accommodates a legitimately slow interactive client at the cost of
+    holding locks/horizon longer per idle session.</td></tr>
+<tr><td><code>UNIDB_CURSOR_IDLE_TIMEOUT_SECS</code></td><td>60</td>
+    <td>Idle deadline for a <code>POST /sql</code> result cursor before it is
+    reclaimed.</td>
+    <td>Same trade-off as the transaction timeout above, scoped to
+    server-side cursor memory instead of locks: lower to reclaim idle cursor
+    state sooner, raise for slow paginating clients.</td></tr>
+<tr><td><code>UNIDB_SLOW_QUERY_MS</code></td><td>unset (disabled)</td>
+    <td>Threshold above which a query is logged to the slow-query log with
+    its correlation id.</td>
+    <td>Not itself a performance lever, but the fastest way to <i>find</i>
+    the next tuning target: set it (e.g. to 100) in any environment where
+    query latency matters, and let the resulting slow-query log point at
+    which of the settings above actually needs changing.</td></tr>
+</table>
+
+<!-- ================= 12 ================= -->
+<h2 id="s12">12. Correctness &amp; testing</h2>
 <p>
 unidb's safety claims are backed by tests, not assertions of good intent:
 </p>
@@ -1359,11 +1588,11 @@ unidb's safety claims are backed by tests, not assertions of good intent:
 </ul>
 <p class="small">The engine is rigorously tested and crash-safe by design, but
 it is still early-stage software — it has not accumulated the decades of
-production hardening that Postgres has. Section 12 is an honest account of where
+production hardening that Postgres has. Section 13 is an honest account of where
 it stands.</p>
 
-<!-- ================= 12 ================= -->
-<h2 id="s12" class="pagebreak">12. Known limitations, bugs &amp; roadmap priority</h2>
+<!-- ================= 13 ================= -->
+<h2 id="s13" class="pagebreak">13. Known limitations, bugs &amp; roadmap priority</h2>
 <p>
 unidb keeps an honest, public account of its gaps — both missing features and
 known bugs — so nothing below is a surprise in production. Every item carries a
@@ -1371,13 +1600,13 @@ known bugs — so nothing below is a surprise in production. Every item carries 
 <b>Tracked</b>, or explicitly <b>Planned</b> for a future phase.
 </p>
 
-<h3 id="s12-1">12.1 Known bugs (open, tracked)</h3>
+<h3 id="s13-1">13.1 Known bugs (open, tracked)</h3>
 <p>
 This is the complete list of currently open, user-visible correctness or
 behavior bugs. It is short by design: every other correctness bug uncovered
 during development — including a subtle transaction-rollback ordering issue
 found under heavy concurrent load — was root-caused, fixed, and is now locked
-in place by a permanent automated regression test (Section 11). Nothing below
+in place by a permanent automated regression test (Section 12). Nothing below
 causes silent data loss or a wrong answer; each is a query that is rejected
 when it should be accepted.
 </p>
@@ -1394,7 +1623,7 @@ when it should be accepted.
     "similarity search + filter" pattern</td></tr>
 </table>
 
-<h3 id="s12-2">12.2 Known limitations &amp; feature gaps</h3>
+<h3 id="s13-2">13.2 Known limitations &amp; feature gaps</h3>
 <table>
 <tr><th>Area</th><th>Limitation</th><th>Priority</th><th>Status</th></tr>
 <tr><td>Transactional DDL</td><td>A <code>CREATE TABLE</code> in a transaction that later aborts is not rolled back through crash recovery (per-request rollback does apply today)</td><td><span class="tag high">High</span></td><td><span class="tag tracked">Tracked</span></td></tr>
@@ -1410,8 +1639,8 @@ when it should be accepted.
 <tr><td>Maturity</td><td>Rigorous and crash-tested, but early-stage — not yet battle-hardened over decades like Postgres</td><td><span class="tag low">Low</span></td><td><span class="tag tracked">Ongoing</span></td></tr>
 </table>
 
-<!-- ================= 13 ================= -->
-<h2 id="s13" class="pagebreak">13. Where unidb is headed</h2>
+<!-- ================= 14 ================= -->
+<h2 id="s14" class="pagebreak">14. Where unidb is headed</h2>
 <p>
 The roadmap closes the gaps that block production adoption while protecting the
 one thing that makes unidb different — multi-model atomicity. It is framed
@@ -1419,7 +1648,7 @@ against the two systems users compare unidb to: <b>Postgres</b> (as an engine)
 and <b>Supabase</b> (as a backend platform).
 </p>
 
-<h3 id="s13-1">13.1 Toward Postgres-level engine completeness</h3>
+<h3 id="s14-1">14.1 Toward Postgres-level engine completeness</h3>
 <table>
 <tr><th>Theme</th><th>What's coming</th></tr>
 <tr><td>Transactional completeness</td><td>Transaction-scoped, crash-safe DDL; savepoints and nested rollback; full serializable isolation with phantom protection; complete foreign-key actions (<code>ON DELETE / UPDATE CASCADE</code>, etc.)</td></tr>
@@ -1428,7 +1657,7 @@ and <b>Supabase</b> (as a backend platform).
 <tr><td>Ecosystem &amp; operations</td><td>A PostgreSQL wire-protocol listener so existing drivers, ORMs, and BI tools connect unchanged; encryption at rest</td></tr>
 </table>
 
-<h3 id="s13-2">13.2 Toward a backend-in-a-box (Supabase-style platform)</h3>
+<h3 id="s14-2">14.2 Toward a backend-in-a-box (Supabase-style platform)</h3>
 <p class="small">Several of these have already shipped; others are planned.</p>
 <table>
 <tr><th>Capability</th><th>Today</th><th>Direction</th></tr>
@@ -1446,7 +1675,7 @@ and <b>Supabase</b> (as a backend platform).
 <tr><td>Edge functions / hosting</td><td>—</td><td><span class="tag non">Not planned</span> — no cloud control plane by design; run unidb embedded inside your own function runtime</td></tr>
 </table>
 
-<h3 id="s13-3">13.3 Deliberately parked</h3>
+<h3 id="s14-3">14.3 Deliberately parked</h3>
 <ul>
 <li><b>Columnar / analytical engine</b> — the opposite axis to the multi-model
   transactional thesis; gated on real analytics demand.</li>
@@ -1455,8 +1684,8 @@ and <b>Supabase</b> (as a backend platform).
   strong single node plus read replicas.</li>
 </ul>
 
-<!-- ================= 14 ================= -->
-<h2 id="s14" class="pagebreak">14. Glossary of terms &amp; abbreviations</h2>
+<!-- ================= 15 ================= -->
+<h2 id="s15" class="pagebreak">15. Glossary of terms &amp; abbreviations</h2>
 <p>
 Plain-language definitions for every abbreviation used in this guide, in the
 sense it is used here — alphabetical, appendix-style.
