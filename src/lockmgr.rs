@@ -65,6 +65,15 @@ pub enum RecordKind {
     /// concurrent inserter racing the same key blocks here and sees the committed
     /// duplicate in its post-lock snapshot.
     UniqueKey,
+    /// Phantom lock for FK referential-integrity serialization (item 36).
+    /// Keyed by a hash of `(parent_table, ref_col, fk_value)`; acquired
+    /// Exclusive by both the child inserter (before the parent-row lookup)
+    /// and the parent deleter (before the RESTRICT scan), held through commit.
+    /// Prevents the classic parent-delete / child-insert race: the first party
+    /// to acquire the lock completes its check under a fresh snapshot; the
+    /// second sees the committed state and either finds a child (RESTRICT) or
+    /// finds no parent (FK violation), depending on which won.
+    FkKey,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -90,6 +99,17 @@ impl RecordId {
     pub fn unique_key(hash: u64) -> Self {
         Self {
             kind: RecordKind::UniqueKey,
+            id: hash,
+        }
+    }
+
+    /// FK-key phantom lock: an `FkKey` record keyed by `hash` (a stable hash of
+    /// `(parent_table, ref_col, fk_value)` computed by the caller). Used by
+    /// `exec_insert`/`exec_update` (child-side) and `exec_delete` (parent-side
+    /// RESTRICT) to prevent the parent-delete / child-insert race (item 36).
+    pub fn fk_key(hash: u64) -> Self {
+        Self {
+            kind: RecordKind::FkKey,
             id: hash,
         }
     }

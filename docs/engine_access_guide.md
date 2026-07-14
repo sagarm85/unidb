@@ -148,10 +148,9 @@ any access path; the same parser/planner/executor runs underneath all three.
 - `ORDER BY` on an expression that is **not** in the SELECT output list (order by
   a projected column name/alias or ordinal position).
 - Set operations (`UNION`/`INTERSECT`/`EXCEPT`), window functions, `RETURNING`.
-- Foreign-key enforcement at the **row** level: `FOREIGN KEY` **is parsed,
-  persisted, and introspectable** (see [§4](#4-introspect-the-system-catalog)),
-  but M11 enforces only that the *referenced table exists* — referenced-**row**
-  existence and `ON DELETE`/`ON UPDATE` actions are a filed follow-up.
+- `ON DELETE CASCADE / SET NULL / NO ACTION` and `ON UPDATE` FK actions — only
+  `RESTRICT` (the default) is enforced today. `CASCADE`/`SET NULL` are parsed
+  but not yet acted on.
 - `SELECT` without `FROM` (`SELECT 1` alone) over the row-at-a-time path.
 
 For the exhaustive, always-current truth, the parser (`src/sql/parser.rs`)
@@ -593,11 +592,14 @@ unidb_subscription_lag_seconds{consumer="billing"} 3.7
 
 ## 9. Honest limitations
 
-- **FK is metadata-only (M11).** Foreign keys parse, persist, and introspect, but
-  only referenced-*table* existence is enforced — not referenced-*row* existence,
-  and there are no `ON DELETE`/`ON UPDATE` actions yet. The catalog reports
-  `update_rule`/`delete_rule` as `NO ACTION` and `match_option` as `NONE`
-  accordingly.
+- **FK enforcement** (item 36): child INSERT/UPDATE verifies the referenced
+  parent key exists (O(log n) via the parent's implicit DiskBTree; heap-scan
+  fallback for composite FKs). Parent DELETE/UPDATE enforces **RESTRICT** — a
+  parent row cannot be deleted/updated while a visible child references it.
+  `ON DELETE CASCADE / SET NULL` and `ON UPDATE` actions are not yet
+  implemented; the catalog reports `update_rule`/`delete_rule` as `NO ACTION`.
+  A composite FK without a matching secondary index on the child FK column uses
+  an O(n) heap scan for the RESTRICT check (documented limitation).
 - **Constraint names are synthesized, not stored.** `<table>_pkey` etc. — stable
   and deterministic, but not names you declared (unidb has no named-constraint
   syntax).

@@ -1,7 +1,7 @@
 # Item 36 — Foreign keys enforce table existence only, not referential integrity
 
 **Type:** Improvement
-**Status:** NOT STARTED
+**Status:** ✅ SHIPPED 2026-07-14 — See PROGRESS.md for metrics and PR link.
 **Priority:** High — correctness/integrity, but **sequenced after item 35** (it
 reuses the parent-table PK index that item 35 builds; doing it before 35 would
 reintroduce the same O(n) per-row scan item 35 exists to remove).
