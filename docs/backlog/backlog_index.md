@@ -49,7 +49,7 @@
 | 33 | `33_cdc_management_api.md` | Improvement | ✅ SHIPPED 2026-07-14 — `GET /tables/{name}/events` (CDC status), `DELETE /tables/{name}/events` (disable, idempotent), `GET /events/head` (current seq without streaming); P34 crash test; 6 integration tests |
 | 34 | `34_observability_api_gaps.md` | Improvement | ✅ SHIPPED 2026-07-14 — `UNIDB_SLOW_QUERY_MS` env var; `PUT /config/slow_query_threshold_ms`; `GET /stats/history` 300-point ring buffer with server-computed rate fields |
 | 35 | `35_unique_constraint_full_scan.md` | Improvement | ✅ SHIPPED 2026-07-14 — implicit unique-enforcement B-tree per PK/UNIQUE column at CREATE TABLE; `enforce_unique()` now does O(1) point lookup + MVCC re-check; PK INSERT flat (was O(n²)); P35 crash test; 6 regression tests; ~23-26× faster at 15k rows. See PROGRESS.md |
-| 36 | `36_foreign_key_row_enforcement.md` | Improvement | ⏳ NOT STARTED — FK enforces referenced-*table* existence only, not row-level referential integrity (dangling child refs accepted; no RESTRICT/CASCADE). Documented M11-deferred scope; **depends on item 35** (reuses the parent PK index — cheap after 35, O(n²) before) |
+| 36 | `36_foreign_key_row_enforcement.md` | Improvement | ✅ SHIPPED 2026-07-14 — full row-level FK enforcement: child INSERT/UPDATE checks parent key via unique_index_root (O(log n)); parent DELETE/UPDATE RESTRICT rejects when visible child references the key; RecordKind::FkKey phantom lock prevents concurrent parent-delete/child-insert race; 9 new tests + conc_matrix cell 10/10 PASS. See PROGRESS.md |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
@@ -68,16 +68,11 @@ rows/s (was O(n²): 5k→1k/s degrading). P35 crash test; 6 regression tests;
 `unique_index_root` in `ColumnDef` with `#[serde(default)]` (no FORMAT_VERSION
 bump). See PROGRESS.md.
 
-**#36 — Foreign keys enforce table existence only, not row-level integrity
-(`36_foreign_key_row_enforcement.md`, NOT STARTED) — TOP PRIORITY (unblocked by #35).**
-`enforce_referenced_tables_exist()` (`src/sql/executor.rs:2090`, the sole
-`ForeignKeyViolation` site at `:2093`) checks only that the referenced *table*
-exists — a child row referencing a non-existent parent key is accepted, and
-parent deletes neither block nor cascade. A documented, deliberate M11-deferred
-scope (`src/catalog.rs:132-140`), not an accidental bug. **Depends on item 35:**
-the row-existence check is a point lookup into the parent's `PRIMARY KEY` index —
-exactly what #35 builds — so it is O(log n) after #35 and a fresh O(n²) mistake
-before it. Ship #35 first, then reuse its index machinery here.
+**#36 — Foreign keys: full row-level enforcement — ✅ SHIPPED 2026-07-14.** See
+`36_foreign_key_row_enforcement.md` and PROGRESS.md for details and metrics.
+Child INSERT/UPDATE verifies referenced parent key via unique_index_root (O(log
+n)); parent DELETE/UPDATE RESTRICT; FkKey phantom lock for concurrent-race
+safety; 9 new tests + conc_matrix cell 10/10 PASS.
 
 0. **Item 18 — Engine access & introspection contract — ✅ SHIPPED 2026-07-13**
    (branch `18-engine-access-contract-impl`). Delivered the `information_schema`-

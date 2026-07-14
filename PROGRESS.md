@@ -5426,3 +5426,86 @@ visible in a subsequent `SELECT`. Run at `CONC_REPEATS=10`: **10/10 PASS** on bo
 the spec correction in PR #101.
 
 **Commit:** `e91f120` — pushed to branch `35-unique-index-enforcement` as part of PR #102.
+
+---
+
+## Item 36 — FK row-level enforcement   [SHIPPED]   2026-07-14
+
+**PR:** #103 (branch `36-foreign-key-row-enforcement`, commit `b1b0c33`)
+**Summary:** Replaced table-existence-only FK enforcement with full row-level
+referential integrity. Child INSERT/UPDATE now verifies the referenced parent
+key via the parent's `unique_index_root` DiskBTree (O(log n), item 35). Parent
+DELETE/UPDATE enforces RESTRICT — rejected when any visible child row still
+references the key. A new `RecordKind::FkKey` phantom lock (exclusive, keyed by
+`hash(parent_table, ref_col, value)`) prevents the classic concurrent
+parent-delete / child-insert race. NULL FK values are skipped per SQL standard.
+Same-transaction parent+child insert works via own-xid visibility.
+
+**Benchmarks** — child INSERT throughput at scale (debug build, ratio test):
+
+| Rows in parent | FK child inserts | Throughput ratio (chunk3 / chunk1) | Result |
+|---------------:|:----------------:|-----------------------------------:|--------|
+| 1–5,000 | chunk1 | — (baseline) | — |
+| 5,001–10,000 | chunk2 | ≈1.0 | ✅ flat |
+| 10,001–15,000 | chunk3 | > 0.5 threshold | ✅ flat |
+
+O(log n) via `unique_index_root` — throughput does not degrade as parent grows.
+(Absolute rate not recorded here; varies by build mode / machine. The flatness
+ratio is the permanent regression guard, same contract as item 35.)
+
+**Concurrency cell — `fk-delete-insert-race`** (CONC_REPEATS=10, CONC_SPIN=4):
+
+| Toggle | Repeats | Result |
+|--------|--------:|--------|
+| off | 10 | ✅ 10/10 PASS |
+| on | 10 | ✅ 10/10 PASS |
+
+2 writers race per round: parent DELETE vs child INSERT on the same FK key.
+Asserts no dangling FK reference is ever committed (whichever party loses gets a
+`ForeignKeyViolation` or `ForeignKeyViolation`-RESTRICT — never silent success).
+
+### New files / key changes
+
+- `src/error.rs` — `ForeignKeyViolation` extended with `column: Option<String>`
+  + `value: Option<String>` fields; `fk_violation_msg` helper
+- `src/lockmgr.rs` — `RecordKind::FkKey` variant + `RecordId::fk_key(hash)`
+  constructor
+- `src/sql/executor.rs` — ~400 lines of FK helpers:
+  `acquire_fk_key_locks` (child-side, before snapshot),
+  `acquire_fk_key_locks_parent` (parent-side, before RESTRICT scan),
+  `enforce_fk_rows_exist` (child INSERT/UPDATE),
+  `check_fk_parent_exists` (O(log n) via unique_index_root; heap fallback),
+  `enforce_fk_restrict` (parent DELETE/UPDATE),
+  `check_restrict_child` (secondary BTree index when available; heap fallback);
+  `exec_insert`, `exec_update`, `exec_delete` wired to acquire FkKey locks
+  before snapshot, then call enforcement
+- `src/catalog.rs` — `ForeignKeyRef` doc updated: "informational" → enforced;
+  enforcement contract documented inline
+- `tests/constraints.rs` — 2 existing FK tests updated (now insert parent row);
+  9 new tests: row-existence rejection, null skip, same-txn, RESTRICT, table-
+  level FK, UPDATE rejection, throughput flatness proof
+- `benches/conc_matrix.rs` — `w_fk_delete_insert_race` workload + 2 cells
+  (toggle off + on)
+- `docs/backlog/36_foreign_key_row_enforcement.md` — status → SHIPPED
+- `docs/backlog/backlog_index.md` — row 36 → ✅ SHIPPED
+
+### Gates
+
+| Gate | Result |
+|------|--------|
+| crash harness (`cargo test --test crash`) | ✅ **37/37** |
+| `cargo test --test constraints` | ✅ **27/27** (9 new FK tests) |
+| `cargo test --workspace` | ✅ all green |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ✅ clean |
+| `cargo fmt --all --check` | ✅ clean |
+| `fk_child_insert_throughput_is_flat` | ✅ ratio > 0.5 |
+| `fk_restrict_blocks_parent_delete_with_children` | ✅ pass |
+| `fk_same_txn_parent_then_child_accepted` | ✅ pass |
+| `fk-delete-insert-race` (conc_matrix, CONC_REPEATS=10) | ✅ **10/10 PASS** (both toggles) |
+
+**No FORMAT_VERSION bump.** No locked-decision (§3) change. `ON DELETE CASCADE /
+SET NULL` is not yet implemented — RESTRICT only. Composite FK falls back to
+heap scan (documented; no composite PK index exists). Secondary BTree on the
+child FK column (if present via a UNIQUE constraint on that column) speeds up
+the RESTRICT scan to O(log n); plain FK columns without a secondary index use
+O(n) heap scan (documented limitation).

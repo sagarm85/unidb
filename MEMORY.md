@@ -12,7 +12,17 @@
 
 ## Current status
 
-- **Unique-index enforcement (backlog item 35) — SHIPPED 2026-07-14, PR #102 MERGED.**
+- **FK row-level enforcement (backlog item 36) — SHIPPED 2026-07-14, branch
+  `36-foreign-key-row-enforcement`, PR #103.**
+  Child INSERT/UPDATE verifies referenced parent key via `unique_index_root`
+  DiskBTree (O(log n), item 35); heap-scan fallback for composite FKs. Parent
+  DELETE/UPDATE enforces RESTRICT — rejected when a visible child references
+  the key. `RecordKind::FkKey` phantom lock prevents concurrent parent-delete /
+  child-insert race (10/10 PASS at CONC_REPEATS=10). NULL FK values unchecked.
+  Same-txn parent+child insert works via own-xid visibility. 9 new constraint
+  tests; 37/37 crash tests. No FORMAT_VERSION bump.
+- **Unique-index enforcement (backlog item 35) — SHIPPED 2026-07-14, branch
+  `35-unique-index-enforcement`, PR #102 MERGED.**
   `enforce_unique()` rewritten: implicit `DiskBTree` auto-created per
   `PRIMARY KEY`/`UNIQUE` column (INT64/TEXT/BOOL) at `CREATE TABLE` time;
   O(1) point lookup + MVCC re-check replaces O(n) heap scan per row.
@@ -23,7 +33,6 @@
   racing writers on same key. `pk-unique-race` conc_matrix cell (6w × 20rounds,
   CONC_REPEATS=10): 10/10 PASS. P35 crash test (37/37 total). 6 regression tests.
   Measured: PK INSERT flat ~27-30k rec/s (was 5k→1k/s O(n²)).
-  **Next: item 36** (FK row-level enforcement — reuses `unique_index_root`).
 - **CDC Management API (backlog item 33) — SHIPPED 2026-07-14, branch
   `33-cdc-management-api`, PR #96 (MERGED).**
   Three new JWT-protected routes: `GET /tables/{name}/events` (CDC status —
@@ -4767,3 +4776,54 @@ performance — Phase A" entry and the Current-status bullet above.
 - Isolation decided: RC default / RR available / SSI seam now (D10–D12).
 - Scope adjusted: single-file for M0 (D6); benchmark the replaced stack (§6).
 - `CLAUDE.md`, `PROGRESS.md`, `MEMORY.md` created.
+
+### 2026-07-14 — FK row-level enforcement (item 36), branch `36-foreign-key-row-enforcement`
+
+**Problem solved:** FK enforcement was table-existence-only (M11 deliberate scope).
+Dangling child references were silently accepted; parent deletes were never blocked.
+
+**Implementation:**
+
+- `src/error.rs` — `ForeignKeyViolation` gained `column: Option<String>` + `value:
+  Option<String>` for row-level error context; `fk_violation_msg` helper added.
+- `src/lockmgr.rs` — `RecordKind::FkKey` phantom lock + `RecordId::fk_key(hash)`.
+  Keyed by `hash(parent_table, ref_col, value)`; acquired Exclusive by both child
+  inserter (before snapshot) and parent deleter (before RESTRICT scan); held through
+  commit via `release_all`. Prevents parent-delete / child-insert race.
+- `src/sql/executor.rs` — ~400 lines of FK helpers:
+  - `acquire_fk_key_locks` — child-side exclusive FkKey lock, column-level and
+    single-column table-level FKs, before snapshot
+  - `acquire_fk_key_locks_parent` — parent-side FkKey lock on PK values, before
+    RESTRICT scan
+  - `enforce_fk_rows_exist` — child INSERT/UPDATE: calls `check_fk_parent_exists`
+    per FK column; O(log n) via `unique_index_root`; heap fallback for composite
+  - `enforce_fk_restrict` — parent DELETE/UPDATE: scans catalog for referencing
+    children; uses child secondary BTree if available, heap fallback otherwise
+  - `table_has_fk_children` — quick catalog gate to skip RESTRICT overhead
+  - `resolve_fk_ref_col` — resolves explicit or inferred parent column name
+  - `exec_insert`, `exec_update`, `exec_delete` updated: FkKey locks acquired
+    before snapshot; FK enforcement called after unique enforcement
+- `src/catalog.rs` — `ForeignKeyRef` doc updated from "informational" to enforced
+- `tests/constraints.rs` — 2 existing tests updated; 9 new tests:
+  `fk_row_existence_missing_parent_rejected`, `fk_row_existence_valid_parent_accepted`,
+  `fk_null_column_not_checked`, `fk_same_txn_parent_then_child_accepted`,
+  `fk_restrict_blocks_parent_delete_with_children`,
+  `fk_restrict_allows_parent_delete_no_children`,
+  `fk_table_level_constraint_enforced`,
+  `fk_update_to_missing_parent_rejected`,
+  `fk_child_insert_throughput_is_flat`
+- `benches/conc_matrix.rs` — `w_fk_delete_insert_race` + 2 cells (toggle off/on)
+
+**Gates:** fmt ✅, clippy ✅, workspace tests ✅, crash 37/37 ✅, constraints 27/27 ✅,
+`fk-delete-insert-race` CONC_REPEATS=10: **10/10 PASS** (both toggles).
+No FORMAT_VERSION bump. Commit `b1b0c33`.
+
+**Docs updated:** `36_foreign_key_row_enforcement.md` → SHIPPED; `backlog_index.md`
+row 36 → ✅ SHIPPED; `docs/engine_access_guide.md` §1 limitations + §9 FK enforcement
+note updated; `README.md` item 36 row added; `PROGRESS.md` item 36 entry appended.
+
+**Limitations:** `ON DELETE CASCADE/SET NULL` not implemented (RESTRICT only).
+Composite FK without secondary index on child FK column uses O(n) heap scan for
+RESTRICT (documented). No FORMAT_VERSION bump; no §3 decision change.
+
+**Next up:** Open PR #103. After merge, identify next backlog item (check item 37+).

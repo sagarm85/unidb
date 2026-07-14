@@ -130,20 +130,22 @@ pub enum IndexStatus {
 }
 
 /// A foreign-key reference recorded on a column (`REFERENCES table(column)`)
-/// or, for the table-level form, inside [`ForeignKey`] (M11). Enforcement in
-/// M11 is deliberately limited to **referenced-table existence** (see
-/// `sql/executor.rs::enforce_referenced_tables_exist` and this milestone's
-/// `PROGRESS.md` entry) — full referential integrity (referenced *row*
-/// existence, `ON DELETE`/`ON UPDATE` actions) is out of scope, since there
-/// is no `DROP TABLE` yet and row-level FK checks are a materially larger
-/// lift than the "you can't reference a table that isn't there" guard this
-/// milestone commits to.
+/// or, for the table-level form, inside [`ForeignKey`] (M11).
+///
+/// Enforcement as of item 36:
+/// - **Child INSERT/UPDATE**: the referenced parent key is verified to exist
+///   and be visible via the parent's `unique_index_root` DiskBTree (O(log n));
+///   falls back to a heap scan for composite FKs or missing secondary index.
+/// - **Parent DELETE/UPDATE (RESTRICT)**: rejected when a visible child row
+///   references the key being removed; uses the child's secondary BTree index
+///   when available, heap-scan fallback otherwise.
+/// - **NULL FK values** are not checked (SQL standard).
+/// - `ON DELETE CASCADE / SET NULL` is not yet implemented (RESTRICT only).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForeignKeyRef {
     /// Referenced table name.
     pub table: String,
-    /// Referenced column (informational in M11 — recorded for a future
-    /// row-existence check, but only the `table` is enforced today).
+    /// Referenced column — enforced via the parent's unique_index_root (item 36).
     pub column: Option<String>,
 }
 
