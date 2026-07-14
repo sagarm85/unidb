@@ -12,22 +12,18 @@
 
 ## Current status
 
-- **Unique-index enforcement (backlog item 35) — SHIPPED 2026-07-14, branch
-  `35-unique-index-enforcement`, PR pending review.**
+- **Unique-index enforcement (backlog item 35) — SHIPPED 2026-07-14, PR #102 MERGED.**
   `enforce_unique()` rewritten: implicit `DiskBTree` auto-created per
   `PRIMARY KEY`/`UNIQUE` column (INT64/TEXT/BOOL) at `CREATE TABLE` time;
   O(1) point lookup + MVCC re-check replaces O(n) heap scan per row.
   `unique_index_root: Option<PageId>` in `ColumnDef` with `#[serde(default)]`
   (no `FORMAT_VERSION` bump). UPDATE path maintained in `stage_row_index_writes`.
-  P35 crash test (37/37 total). 6 regression tests in `tests/constraints.rs`.
-  `benches/decompose.rs` `sql_bulk_insert` now uses `id INT PRIMARY KEY`
-  (closes the no-PK blind spot — Table 3.1 now exercises `enforce_unique`).
-  Measured: PK INSERT flat at ~27-30k rows/s (was 5k→1k/s degrading O(n²));
-  Table 3.1 after: 19,695/16,817/16,489 rec/s at 10k/1M/2M rows (flat =
-  O(log n)). W4/W0 ~1.29-1.30× (multi-model ladder unchanged, no PK on it).
-  Docs: `35_unique_constraint_full_scan.md` → SHIPPED; backlog_index row 35
-  → ✅, row 36 → TOP PRIORITY; engine_access_guide `is_unique` note updated;
-  README milestone table + D7 crash count (37 tests); PROGRESS.md entry.
+  Concurrent-INSERT PK race fixed: `RecordKind::UniqueKey` phantom lock
+  (WaitPolicy::Wait) acquired before snapshot in `exec_insert` — serializes
+  racing writers on same key. `pk-unique-race` conc_matrix cell (6w × 20rounds,
+  CONC_REPEATS=10): 10/10 PASS. P35 crash test (37/37 total). 6 regression tests.
+  Measured: PK INSERT flat ~27-30k rec/s (was 5k→1k/s O(n²)).
+  **Next: item 36** (FK row-level enforcement — reuses `unique_index_root`).
 - **CDC Management API (backlog item 33) — SHIPPED 2026-07-14, branch
   `33-cdc-management-api`, PR #96 (MERGED).**
   Three new JWT-protected routes: `GET /tables/{name}/events` (CDC status —
@@ -3248,6 +3244,23 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-14 — Item 35 follow-up: concurrent-INSERT PK race fix, PR #102 MERGED
+
+- Found that two concurrent INSERTs racing the same PK/UNIQUE value could both
+  pass `enforce_unique` (neither saw the other's uncommitted row under MVCC) and
+  both commit — visible duplicate.
+- Fix: `RecordKind::UniqueKey` phantom lock in `lockmgr.rs`. `exec_insert`
+  acquires exclusive lock (keyed by `hash(table, col, value)`) via
+  `WaitPolicy::Wait` BEFORE `snapshot_for_statement`. Loser blocks until winner
+  commits, then takes fresh snapshot → sees committed row → `UniqueViolation`.
+  Lock released via `release_all` at commit/abort.
+- New `pk-unique-race` conc_matrix cell: 6 writers × 20 rounds, CONC_REPEATS=10;
+  10/10 PASS (toggle off + on). Closes acceptance checkbox from spec correction
+  in PR #101.
+- `PROGRESS.md` updated with follow-up fix section.
+- **PR #102 MERGED** (commits `a0958e3` + `e91f120` + `fca5eda`).
+- **Next:** item 36 — FK row-level enforcement (reuses `unique_index_root`).
 
 ### 2026-07-14 — Unique-index enforcement (item 35), branch `35-unique-index-enforcement`
 
