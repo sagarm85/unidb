@@ -2160,6 +2160,215 @@ fn unidb_sync_primitive() -> &'static str {
     }
 }
 
+// ============ Table 5: PK/FK relational-integrity stress (mmreport) ========
+// `customers (id PK)` / `orders (id PK, customer_id FK -> customers.id)`.
+// Real row-level FK enforcement on both engines (unidb since item 36,
+// 2026-07-14: child INSERT/UPDATE verifies the parent key via the parent's
+// implicit unique-index B-tree, O(log n); parent DELETE/UPDATE enforces
+// RESTRICT) -- this is a genuinely fair apples-to-apples comparison now,
+// not the pre-item-36 "FK is metadata-only" era.
+const FK_CUSTOMERS: u64 = 20_000;
+
+fn sql_fk_setup(engine: &Arc<Engine>, customers: u64) {
+    let x = engine.begin().unwrap();
+    engine
+        .execute_sql(x, "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+    engine
+        .execute_sql(
+            x,
+            "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT REFERENCES customers(id), amount INT, status TEXT)",
+        )
+        .unwrap();
+    engine.commit(x).unwrap();
+    let ins = engine
+        .prepare("INSERT INTO customers (id, name) VALUES ($1, $2)")
+        .unwrap();
+    let mut x = engine.begin().unwrap();
+    for i in 0..customers {
+        engine
+            .execute_prepared(
+                x,
+                &ins,
+                &[
+                    Literal::Int(i as i64),
+                    Literal::Text(format!("customer{i}")),
+                ],
+            )
+            .unwrap();
+        if (i + 1) % 5_000 == 0 {
+            engine.commit(x).unwrap();
+            x = engine.begin().unwrap();
+        }
+    }
+    engine.commit(x).unwrap();
+}
+
+/// INSERT `n` valid orders, each its own durable commit, `customer_id`
+/// cycling through the pre-loaded customer set -- every insert pays a real
+/// FK existence check (item 35's implicit unique-index lookup), not a no-op.
+fn sql_fk_insert_valid(engine: &Arc<Engine>, n: u64, base: i64, customers: u64) -> (u64, f64) {
+    let ins = engine
+        .prepare("INSERT INTO orders (id, customer_id, amount, status) VALUES ($1, $2, $3, $4)")
+        .unwrap();
+    let start = Instant::now();
+    for i in 0..n {
+        let id = base + i as i64;
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_prepared(
+                xid,
+                &ins,
+                &[
+                    Literal::Int(id),
+                    Literal::Int(id % customers as i64),
+                    Literal::Int(id % 1000),
+                    Literal::Text("pending".to_string()),
+                ],
+            )
+            .unwrap();
+        engine.commit(xid).unwrap();
+    }
+    (n, start.elapsed().as_secs_f64())
+}
+
+/// Confirm a child INSERT referencing a non-existent parent key is rejected.
+fn sql_fk_rejects_invalid(engine: &Arc<Engine>) -> bool {
+    let xid = engine.begin().unwrap();
+    let res = engine.execute_sql(
+        xid,
+        "INSERT INTO orders (id, customer_id, amount, status) VALUES (999999999, 888888888, 1, 'x')",
+    );
+    let rejected = res.is_err();
+    let _ = engine.abort(xid);
+    rejected
+}
+
+/// Confirm deleting a still-referenced parent row is rejected (RESTRICT).
+fn sql_fk_restrict_blocks_delete(engine: &Arc<Engine>, referenced_customer_id: i64) -> bool {
+    let xid = engine.begin().unwrap();
+    let res = engine.execute_sql(
+        xid,
+        &format!("DELETE FROM customers WHERE id = {referenced_customer_id}"),
+    );
+    let blocked = res.is_err();
+    let _ = engine.abort(xid);
+    blocked
+}
+
+fn sql_fk_update_bulk(engine: &Arc<Engine>, hi: i64) -> (u64, f64) {
+    let x = engine.begin().unwrap();
+    let start = Instant::now();
+    let res = engine
+        .execute_sql(
+            x,
+            &format!("UPDATE orders SET status = 'shipped' WHERE id < {hi}"),
+        )
+        .unwrap();
+    engine.commit(x).unwrap();
+    (sql_affected(&res), start.elapsed().as_secs_f64())
+}
+
+/// A realistic FK-linked query: join child to parent, filtered.
+fn sql_fk_join_select(engine: &Arc<Engine>) -> (u64, f64) {
+    let x = engine.begin().unwrap();
+    let start = Instant::now();
+    let res = engine
+        .execute_sql(
+            x,
+            "SELECT orders.id, customers.name FROM orders \
+             JOIN customers ON orders.customer_id = customers.id \
+             WHERE orders.status = 'pending'",
+        )
+        .unwrap();
+    let secs = start.elapsed().as_secs_f64();
+    engine.commit(x).unwrap();
+    (sql_rows_returned(&res), secs)
+}
+
+// ---- Postgres FK (relational integrity) ----
+
+fn pg_fk_setup(url: &str, customers: u64) -> Option<()> {
+    let mut c = pg_connect(url)?;
+    c.batch_execute(
+        "DROP TABLE IF EXISTS orders; DROP TABLE IF EXISTS customers; \
+         CREATE TABLE customers (id BIGINT PRIMARY KEY, name TEXT); \
+         CREATE TABLE orders (id BIGINT PRIMARY KEY, customer_id BIGINT REFERENCES customers(id), amount BIGINT, status TEXT)",
+    )
+    .ok()?;
+    c.execute(
+        "INSERT INTO customers (id, name) \
+         SELECT s, 'customer' || s FROM generate_series(0, $1::bigint - 1) s",
+        &[&(customers as i64)],
+    )
+    .ok()?;
+    Some(())
+}
+
+fn pg_fk_insert_valid(url: &str, n: u64, base: i64, customers: u64) -> (u64, f64) {
+    let mut c = Client::connect(url, NoTls).unwrap();
+    let ins = c
+        .prepare("INSERT INTO orders (id, customer_id, amount, status) VALUES ($1, $2, $3, $4)")
+        .unwrap();
+    let start = Instant::now();
+    for i in 0..n {
+        let id = base + i as i64;
+        c.execute(
+            &ins,
+            &[&id, &(id % customers as i64), &(id % 1000), &"pending"],
+        )
+        .unwrap();
+    }
+    (n, start.elapsed().as_secs_f64())
+}
+
+fn pg_fk_rejects_invalid(url: &str) -> bool {
+    let mut c = match Client::connect(url, NoTls) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    c.execute(
+        "INSERT INTO orders (id, customer_id, amount, status) VALUES (999999999, 888888888, 1, 'x')",
+        &[],
+    )
+    .is_err()
+}
+
+fn pg_fk_restrict_blocks_delete(url: &str, referenced_customer_id: i64) -> bool {
+    let mut c = match Client::connect(url, NoTls) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    c.execute(
+        "DELETE FROM customers WHERE id = $1",
+        &[&referenced_customer_id],
+    )
+    .is_err()
+}
+
+fn pg_fk_update_bulk(url: &str, hi: i64) -> (u64, f64) {
+    let mut c = Client::connect(url, NoTls).unwrap();
+    let start = Instant::now();
+    let n = c
+        .execute("UPDATE orders SET status = 'shipped' WHERE id < $1", &[&hi])
+        .unwrap();
+    (n, start.elapsed().as_secs_f64())
+}
+
+fn pg_fk_join_select(url: &str) -> (u64, f64) {
+    let mut c = Client::connect(url, NoTls).unwrap();
+    let start = Instant::now();
+    let rows = c
+        .query(
+            "SELECT orders.id, customers.name FROM orders \
+             JOIN customers ON orders.customer_id = customers.id \
+             WHERE orders.status = 'pending'",
+            &[],
+        )
+        .unwrap();
+    (rows.len() as u64, start.elapsed().as_secs_f64())
+}
+
 fn bench_mm_report() {
     let sync_prim = unidb_sync_primitive();
     let sizes: Vec<u64> = std::env::var("MM_SIZES")
@@ -2549,6 +2758,141 @@ fn bench_mm_report() {
         }
     }
 
+    // ---- Table 5: PK/FK relational-integrity stress ----
+    let fk_orders = env_u64("MM_FK_ORDERS", 20_000);
+    println!("## Table 5 — PK/FK relational-integrity stress: unidb vs Postgres\n");
+    println!(
+        "A realistic two-table schema — `customers (id PRIMARY KEY, name)` and\n\
+         `orders (id PRIMARY KEY, customer_id REFERENCES customers(id), amount,\n\
+         status)` — pre-loaded with **{FK_CUSTOMERS} customers**, then\n\
+         **{fk_orders} orders** (`MM_FK_ORDERS` to change) each referencing a real\n\
+         customer. unidb enforces row-level FK existence via the parent's implicit\n\
+         unique-index B-tree (O(log n) per check, item 36, 2026-07-14) and RESTRICT\n\
+         on a still-referenced parent DELETE — the same shape of check Postgres has\n\
+         always done. Before item 36 this table would have been an unfair\n\
+         comparison (unidb only checked the *table* existed, not the *row*); now\n\
+         both sides pay a real, comparable integrity-check cost.\n"
+    );
+    let fk_pg_method = url.as_deref().and_then(pg_ensure_lens);
+    if let Some(ref m) = fk_pg_method {
+        println!(
+            "_Durability lens: unidb `{sync_prim}`, Postgres `wal_sync_method={m}` (matched)._\n"
+        );
+        let u = url.as_deref().unwrap();
+        let fdir = tempdir().unwrap();
+        let fe = Arc::new(Engine::open(fdir.path(), 0).unwrap());
+        fe.set_deferred_sync(true);
+        phased("t5_build", || {
+            sql_fk_setup(&fe, FK_CUSTOMERS);
+            let _ = pg_fk_setup(u, FK_CUSTOMERS);
+        });
+
+        println!(
+            "| operation | records | unidb (rec/s) | postgres (rec/s) | unidb ÷ PG | remark (winner · margin) |"
+        );
+        println!(
+            "|-----------|--------:|--------------:|-----------------:|-----------:|:-------------------------|"
+        );
+        let (uc, us) = phased("t5_insert_unidb", || {
+            sql_fk_insert_valid(&fe, fk_orders, 0, FK_CUSTOMERS)
+        });
+        let (pc, ps) = phased("t5_insert_pg", || {
+            pg_fk_insert_valid(u, fk_orders, 0, FK_CUSTOMERS)
+        });
+        let (uu, pp) = (rps(uc, us), rps(pc, ps));
+        println!(
+            "| INSERT valid FK (per-row commit) | {} | {uu:.0} | {pp:.0} | {:.2}× | {} |",
+            uc.max(pc),
+            if pp > 0.0 { uu / pp } else { 0.0 },
+            winner_remark(uu, pp),
+        );
+
+        let half = (fk_orders / 2) as i64;
+        let (uc, us) = phased("t5_update_unidb", || sql_fk_update_bulk(&fe, half));
+        let (pc, ps) = phased("t5_update_pg", || pg_fk_update_bulk(u, half));
+        let (uu, pp) = (rps(uc, us), rps(pc, ps));
+        println!(
+            "| UPDATE bulk (re-checks FK path) | {} | {uu:.0} | {pp:.0} | {:.2}× | {} |",
+            uc.max(pc),
+            if pp > 0.0 { uu / pp } else { 0.0 },
+            winner_remark(uu, pp),
+        );
+
+        let (uc, us) = phased("t5_join_unidb", || sql_fk_join_select(&fe));
+        let (pc, ps) = phased("t5_join_pg", || pg_fk_join_select(u));
+        let (uu, pp) = (rps(uc, us), rps(pc, ps));
+        println!(
+            "| SELECT JOIN orders/customers | {} | {uu:.0} | {pp:.0} | {:.2}× | {} |",
+            uc.max(pc),
+            if pp > 0.0 { uu / pp } else { 0.0 },
+            winner_remark(uu, pp),
+        );
+        println!();
+
+        println!("**Correctness (not a speed number — a pass/fail proof both engines enforce integrity):**\n");
+        let sql_rejects = phased("t5_reject_unidb", || sql_fk_rejects_invalid(&fe));
+        let pg_rejects = phased("t5_reject_pg", || pg_fk_rejects_invalid(u));
+        println!(
+            "- INSERT referencing a non-existent customer: unidb {}, Postgres {}",
+            if sql_rejects {
+                "**rejected** ✓"
+            } else {
+                "accepted ✗"
+            },
+            if pg_rejects {
+                "**rejected** ✓"
+            } else {
+                "accepted ✗"
+            },
+        );
+        let sql_restrict = phased("t5_restrict_unidb", || {
+            sql_fk_restrict_blocks_delete(&fe, 0)
+        });
+        let pg_restrict = phased("t5_restrict_pg", || pg_fk_restrict_blocks_delete(u, 0));
+        println!(
+            "- DELETE of a still-referenced customer: unidb {}, Postgres {}\n",
+            if sql_restrict {
+                "**blocked (RESTRICT)** ✓"
+            } else {
+                "allowed ✗"
+            },
+            if pg_restrict {
+                "**blocked (RESTRICT)** ✓"
+            } else {
+                "allowed ✗"
+            },
+        );
+    } else {
+        println!("_`PG_URL` unset → Postgres columns skipped; set it to run Table 5._\n");
+        let fdir = tempdir().unwrap();
+        let fe = Arc::new(Engine::open(fdir.path(), 0).unwrap());
+        fe.set_deferred_sync(true);
+        phased("t5_build_unidb_only", || sql_fk_setup(&fe, FK_CUSTOMERS));
+        let (uc, us) = phased("t5_insert_unidb_only", || {
+            sql_fk_insert_valid(&fe, fk_orders, 0, FK_CUSTOMERS)
+        });
+        println!("| operation | records | unidb (rec/s) |");
+        println!("|-----------|--------:|---------------:|");
+        println!(
+            "| INSERT valid FK (per-row commit) | {uc} | {:.0} |",
+            rps(uc, us)
+        );
+        let sql_rejects = phased("t5_reject_unidb_only", || sql_fk_rejects_invalid(&fe));
+        println!(
+            "\n- INSERT referencing a non-existent customer: unidb {}\n",
+            if sql_rejects {
+                "**rejected** ✓"
+            } else {
+                "accepted ✗"
+            },
+        );
+    }
+    if fk_pg_method.is_some() {
+        if let Some(u) = url.as_deref() {
+            pg_reset_lens(u);
+        }
+    }
+
     // ---- Caveats ----
     println!("## Caveats\n");
     println!(
@@ -2559,7 +2903,11 @@ fn bench_mm_report() {
          — that cost is exactly what the async-derivation design (parked) would move off\n\
          the commit path if `W4/W0` is seen rising.\n\
          - Marginal-commit sample = {sample} (`MM_SAMPLE`); numbers carry a few-percent\n\
-         noise, the *trend across sizes* is the signal.\n"
+         noise, the *trend across sizes* is the signal.\n\
+         - Table 5's order count = {fk_orders} (`MM_FK_ORDERS` to override); its FK\n\
+         check is single-column, point-lookup (item 35's implicit unique index) —\n\
+         a composite or non-indexable FK column falls back to an O(n) heap scan on\n\
+         unidb (documented limitation, not exercised by this table).\n"
     );
 }
 
