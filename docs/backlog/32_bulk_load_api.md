@@ -28,9 +28,11 @@ At 1.5 ms/row:
 - 1 M rows  → **~25 minutes**
 - 3 M rows  → **~75 minutes**
 
-This is a fundamental limitation of the REST/JSON path, not a tuning problem:
-each `/sql` call pays full HTTP overhead, JSON deserialization, and individual
-B-tree row insertions with no bulk-path short-circuit.
+This is a limitation of the **per-request REST/JSON path**, not the engine's
+insert speed: each `/sql` call pays full HTTP overhead + JSON deserialization +
+its own auto-commit, with no bulk-path short-circuit. (The engine's own batched
+insert — B-tree included — is ~30 µs/row / ~31k rows/sec; see the Root Cause
+attribution note.)
 
 For comparison, PostgreSQL's `COPY` protocol loads at **100 k–1 M rows/second**
 because it bypasses the per-call overhead entirely.
@@ -39,14 +41,32 @@ because it bypasses the per-call overhead entirely.
 
 ## Root Cause
 
-1. **HTTP overhead** — TCP + header parsing + JSON serialize/deserialize: ~2 ms per call.
-2. **Per-row B-tree cost** — each row requires an index insertion; there is no
-   bulk-sort-then-append path for sequential PK ranges.
-3. **WAL fsync per commit** — 4 ms per auto-commit batch (this is the *smaller*
-   cost, ~15% of total; the per-row processing dominates).
-4. **In-transaction inserts are SLOWER** — the MVCC versioning overhead makes
-   transactional batches cost *more* per row than auto-commit, so wrapping in
-   `/txn/begin` ... `/txn/commit` does not help bulk loading.
+> **Attribution correction (2026-07-14).** The ~1.5 ms/row is **not** engine
+> B-tree insert cost — do not read it that way. The engine inserts **~30 µs/row
+> *including* B-tree index maintenance** (measured: 31k–34k rows/sec batched,
+> 10k→2M rows, `docs/performance/multi_model_report_*.md` Table 3.1). The
+> ~1.5 ms/row is the **per-request HTTP + per-statement auto-commit path** — a
+> ~50× envelope *around* a fast engine insert. So the lever is amortizing the
+> HTTP/transaction boundary over many rows (this bulk API), **not** optimizing
+> the B-tree, which is already cheap. Corroboration: item 12 collapsed 500-row
+> HTTP inserts 718 ms → 35 ms (**20.5×**) by batching commits, with no B-tree
+> change.
+
+1. **HTTP overhead (dominant)** — TCP + header parsing + JSON serialize/
+   deserialize: ~2 ms per call. One `/sql` call per row means this is paid
+   per row.
+2. **Per-statement auto-commit / WAL fsync** — each auto-commit row is its own
+   durable transaction (group-committed ~4 ms fsync amortized across the
+   batch). Batching thousands of rows into **one** transaction removes almost
+   all of this.
+3. **B-tree index maintenance** — real but **small**: it is already included in
+   the ~30 µs/row batched figure, so it is *not* what creates the 50× HTTP-path
+   gap. A bulk-sort-then-append for sequential PK ranges is a possible *further*
+   micro-optimization, not the primary fix.
+4. **In-transaction inserts don't help via `/sql`** — wrapping per-row `/sql`
+   calls in `/txn/begin … /txn/commit` still pays per-call HTTP overhead, so it
+   does not close the gap; the win comes from **one server-side loop over a
+   streamed body**, which this endpoint provides.
 
 ---
 
