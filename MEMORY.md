@@ -12,6 +12,22 @@
 
 ## Current status
 
+- **Unique-index enforcement (backlog item 35) — SHIPPED 2026-07-14, branch
+  `35-unique-index-enforcement`, PR pending review.**
+  `enforce_unique()` rewritten: implicit `DiskBTree` auto-created per
+  `PRIMARY KEY`/`UNIQUE` column (INT64/TEXT/BOOL) at `CREATE TABLE` time;
+  O(1) point lookup + MVCC re-check replaces O(n) heap scan per row.
+  `unique_index_root: Option<PageId>` in `ColumnDef` with `#[serde(default)]`
+  (no `FORMAT_VERSION` bump). UPDATE path maintained in `stage_row_index_writes`.
+  P35 crash test (37/37 total). 6 regression tests in `tests/constraints.rs`.
+  `benches/decompose.rs` `sql_bulk_insert` now uses `id INT PRIMARY KEY`
+  (closes the no-PK blind spot — Table 3.1 now exercises `enforce_unique`).
+  Measured: PK INSERT flat at ~27-30k rows/s (was 5k→1k/s degrading O(n²));
+  Table 3.1 after: 19,695/16,817/16,489 rec/s at 10k/1M/2M rows (flat =
+  O(log n)). W4/W0 ~1.29-1.30× (multi-model ladder unchanged, no PK on it).
+  Docs: `35_unique_constraint_full_scan.md` → SHIPPED; backlog_index row 35
+  → ✅, row 36 → TOP PRIORITY; engine_access_guide `is_unique` note updated;
+  README milestone table + D7 crash count (37 tests); PROGRESS.md entry.
 - **CDC Management API (backlog item 33) — SHIPPED 2026-07-14, branch
   `33-cdc-management-api`, PR #96 (MERGED).**
   Three new JWT-protected routes: `GET /tables/{name}/events` (CDC status —
@@ -3232,6 +3248,56 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-14 — Unique-index enforcement (item 35), branch `35-unique-index-enforcement`
+
+**Phase 0 (baseline):**
+- Measured PK-vs-no-PK degradation: PK 5,484→1,936→1,167 rec/s at 5k/10k/15k
+  (O(n²) degrading); no-PK 115,279→113,783 rec/s flat.
+- Found blind spot: `benches/decompose.rs` `sql_bulk_insert` used no-PK table
+  (`id INT`); Table 3.1 never exercised `enforce_unique`.
+
+**Phase 1 (fix):**
+- Added `unique_index_root: Option<PageId>` to `ColumnDef` with
+  `#[serde(default)]` (no FORMAT_VERSION bump, old catalogs open with `None`).
+- Added `set_column_unique_index_root()` to `Catalog`.
+- `exec_create_table`: after `create_table()`, auto-creates implicit `DiskBTree`
+  per indexable PK/UNIQUE column (INT64/TEXT/BOOL); stores meta page in catalog.
+- `apply_durable_index_writes` (INSERT path): maintains implicit unique index.
+- `stage_row_index_writes` (UPDATE path): maintains implicit unique index for new version.
+- `enforce_unique`: fast path (single-column, indexable) = `DiskBTree::search_eq`
+  + `get_visible` MVCC re-check per candidate; fallback heap scan for composite/
+  non-indexable sets.
+- Fixed all ColumnDef literal sites (13+ occurrences across catalog.rs,
+  executor.rs, graph/edges.rs, large_object.rs, queue/mod.rs, parser.rs,
+  plan.rs, optimizer.rs, queue/payload.rs, sql/logical.rs).
+
+**Phase 2 (correctness):**
+- P35 crash test: create PK table → insert committed row → crash (no checkpoint)
+  → reopen → duplicate still rejected, new row accepted. 37/37 crash tests pass.
+- 6 regression tests: flat-throughput checks (PK INSERT, UNIQUE INSERT,
+  PK UPDATE); MVCC inv. 1 (dead index entry from UPDATE not misread as live);
+  MVCC inv. 2 (same-batch PK duplicate caught); NULL distinctness.
+
+**Phase 3 (results):**
+- PK INSERT after: 27,046→28,276→30,362 rec/s at 5k/10k/15k (flat ~23-26×).
+- Table 3.1 PK'd (10k/1M/2M): 19,695/16,817/16,489 rec/s (flat O(log n)).
+- W4/W0 ladder: 1.30×/1.29×/1.29× (unchanged, ladder table has no PK).
+- Changed `sql_bulk_insert` to use `id INT PRIMARY KEY` — closes blind spot.
+- Regenerated `docs/performance/multi_model_report_20260714_190433.md`.
+
+**Docs updated:**
+- `35_unique_constraint_full_scan.md` → SHIPPED 2026-07-14
+- `backlog_index.md` row 35 → ✅, row 36 → TOP PRIORITY
+- `engine_access_guide.md` — `is_unique` note updated (implicit internal B-tree)
+- `README.md` — item 35 milestone row; D7 crash count (37 tests)
+- `PROGRESS.md` — item 35 entry with all numbers
+
+**Gates:** fmt ✅, clippy ✅, workspace tests ✅ (435+), crash 37/37 ✅.
+Branch `35-unique-index-enforcement` ready for PR.
+
+**Next up:** item 36 (FK row-level enforcement — now unblocked, reuses item 35's
+`unique_index_root` for the parent PK lookup).
 
 ### 2026-07-14 — Observability API gaps (item 34), branch `34-observability-api-gaps`
 

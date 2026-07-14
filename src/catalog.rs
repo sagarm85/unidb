@@ -195,6 +195,15 @@ pub struct ColumnDef {
     /// still-rebuilt-on-open kinds (Hnsw/FullText/Csr) and un-indexed columns.
     #[serde(default)]
     pub index_root: Option<PageId>,
+    /// Stable meta page id of the **implicit** unique-enforcement B-tree,
+    /// auto-created at `CREATE TABLE` for every `PRIMARY KEY` or `UNIQUE`
+    /// column (item 35). Distinct from `index_root` (the explicit secondary
+    /// index) so a column can carry both without conflict. `None` for columns
+    /// without PK/UNIQUE constraints, and for tables predating this feature
+    /// (those fall back to the O(n) heap-scan path). `#[serde(default)]` so
+    /// pre-item-35 catalog blobs deserialize cleanly with no FORMAT_VERSION bump.
+    #[serde(default)]
+    pub unique_index_root: Option<PageId>,
     #[serde(default)]
     pub constraints: ColumnConstraints,
     /// Logically dropped by `ALTER TABLE DROP COLUMN` (P2.c). A dropped column
@@ -531,6 +540,34 @@ impl Catalog {
         self.persist(ctx)
     }
 
+    /// Record the stable meta page id of a column's implicit unique-enforcement
+    /// B-tree (item 35). Set once at `create_table` for each PK/UNIQUE column
+    /// whose type is indexable; `Engine::open` opens the tree from this id with
+    /// no heap rescan.
+    pub fn set_column_unique_index_root(
+        &mut self,
+        table: &str,
+        column: &str,
+        unique_index_root: Option<PageId>,
+        ctx: &mut CatalogCtx,
+    ) -> Result<()> {
+        let t = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
+        let col = t
+            .columns
+            .iter_mut()
+            .find(|c| c.name == column)
+            .ok_or_else(|| DbError::ColumnNotFound {
+                table: table.to_string(),
+                column: column.to_string(),
+            })?;
+        col.unique_index_root = unique_index_root;
+        t.generation = t.generation.wrapping_add(1);
+        self.persist(ctx)
+    }
+
     /// Update a table's stored page list (called by the executor after an
     /// INSERT/UPDATE allocates a new heap page for that table's data).
     pub fn set_pages(
@@ -821,6 +858,7 @@ mod tests {
                 name: "id".to_string(),
                 index: None,
                 index_root: None,
+                unique_index_root: None,
                 dropped: false,
                 constraints: Default::default(),
                 ty: ColumnType::Int64,
@@ -885,6 +923,7 @@ mod tests {
                     name: "id".to_string(),
                     index: None,
                     index_root: None,
+                    unique_index_root: None,
                     dropped: false,
                     constraints: Default::default(),
                     ty: ColumnType::Int64,
@@ -893,6 +932,7 @@ mod tests {
                     name: "data".to_string(),
                     index: None,
                     index_root: None,
+                    unique_index_root: None,
                     dropped: false,
                     constraints: Default::default(),
                     ty: ColumnType::Json,
@@ -937,6 +977,7 @@ mod tests {
                     ty: ColumnType::Int64,
                     index: None,
                     index_root: None,
+                    unique_index_root: None,
                     dropped: false,
                     constraints: Default::default(),
                 },
@@ -945,6 +986,7 @@ mod tests {
                     ty: ColumnType::Vector(384),
                     index: Some(IndexKind::Hnsw),
                     index_root: None,
+                    unique_index_root: None,
                     dropped: false,
                     constraints: Default::default(),
                 },
@@ -1024,6 +1066,7 @@ mod tests {
                 ty: ColumnType::Text,
                 index: None,
                 index_root: None,
+                unique_index_root: None,
                 dropped: false,
                 constraints: Default::default(),
             })
@@ -1116,6 +1159,7 @@ mod tests {
                         ty: ColumnType::Int64,
                         index: None,
                         index_root: None,
+                        unique_index_root: None,
                         dropped: false,
                         constraints: Default::default(),
                     }],

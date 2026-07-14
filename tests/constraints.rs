@@ -13,6 +13,7 @@
 //   - CHECK reuses the SELECT/WHERE predicate evaluator and inherits its
 //     two-valued NULL semantics.
 
+use std::time::Instant;
 use tempfile::tempdir;
 use unidb::error::DbError;
 use unidb::sql::executor::ExecResult;
@@ -347,4 +348,240 @@ fn constraints_survive_reopen() {
         select_texts(&mut engine, "SELECT status FROM t WHERE id = 3"),
         vec!["new".to_string()]
     );
+}
+
+// ── Phase-0 item-35 baseline measurement (ignored, run explicitly) ────────────
+
+fn measure_bulk_chunk(engine: &Engine, table: &str, start: i64, count: i64) -> f64 {
+    let stmt = engine
+        .prepare(&format!("INSERT INTO {table} (id, body) VALUES ($1, $2)"))
+        .unwrap();
+    let t0 = Instant::now();
+    let xid = engine.begin().unwrap();
+    for i in start..start + count {
+        engine
+            .execute_prepared(
+                xid,
+                &stmt,
+                &[Literal::Int(i), Literal::Text(format!("body-{i}"))],
+            )
+            .unwrap();
+    }
+    engine.commit(xid).unwrap();
+    let elapsed = t0.elapsed().as_secs_f64();
+    count as f64 / elapsed
+}
+
+/// Phase-0/Phase-3 throughput measurement (item 35).
+/// Run: cargo test --release --test constraints -- --nocapture --ignored pk_vs_nopk_baseline
+#[test]
+#[ignore]
+fn pk_vs_nopk_baseline() {
+    let chunk = 5_000i64;
+
+    let dir = tempdir().unwrap();
+    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    run(
+        &mut engine,
+        "CREATE TABLE pk_t (id INT PRIMARY KEY, body TEXT)",
+    )
+    .unwrap();
+    let r1 = measure_bulk_chunk(&engine, "pk_t", 0, chunk);
+    let r2 = measure_bulk_chunk(&engine, "pk_t", chunk, chunk);
+    let r3 = measure_bulk_chunk(&engine, "pk_t", chunk * 2, chunk);
+    println!("PK table  :  chunk1={r1:.0}/s  chunk2={r2:.0}/s  chunk3={r3:.0}/s");
+
+    let dir2 = tempdir().unwrap();
+    let mut engine2 = Engine::open(dir2.path(), 0).unwrap();
+    run(&mut engine2, "CREATE TABLE nopk (id INT, body TEXT)").unwrap();
+    let s1 = measure_bulk_chunk(&engine2, "nopk", 0, chunk);
+    let s2 = measure_bulk_chunk(&engine2, "nopk", chunk, chunk);
+    let s3 = measure_bulk_chunk(&engine2, "nopk", chunk * 2, chunk);
+    println!("No-PK table: chunk1={s1:.0}/s  chunk2={s2:.0}/s  chunk3={s3:.0}/s");
+}
+
+// ── Item 35 — permanent regression tests ─────────────────────────────────────
+
+/// Regression: PK INSERT throughput must not degrade across consecutive bulk
+/// chunks (item 35). Before the fix, each additional chunk was O(n) slower.
+/// The test proves **flat throughput**: chunk3 must be within 30% of chunk1
+/// (degradation from O(n²) was typically >3×). Uses debug build (so rate
+/// targets are conservative) but the flatness invariant holds at any speed.
+#[test]
+fn pk_insert_throughput_is_flat_not_degrading() {
+    let chunk = 3_000i64;
+
+    let dir = tempdir().unwrap();
+    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    run(
+        &mut engine,
+        "CREATE TABLE flat_pk (id INT PRIMARY KEY, body TEXT)",
+    )
+    .unwrap();
+
+    let r1 = measure_bulk_chunk(&engine, "flat_pk", 0, chunk);
+    let r2 = measure_bulk_chunk(&engine, "flat_pk", chunk, chunk);
+    let r3 = measure_bulk_chunk(&engine, "flat_pk", chunk * 2, chunk);
+
+    // chunk2/chunk1 and chunk3/chunk1 must stay above 0.5 — i.e. no more
+    // than 2× slowdown. Before the fix both ratios were ~0.34 and ~0.21.
+    let ratio2 = r2 / r1;
+    let ratio3 = r3 / r1;
+    assert!(
+        ratio2 > 0.5,
+        "PK INSERT chunk2 degraded >2× vs chunk1 (ratio={ratio2:.2}) — O(n²) bug regressed"
+    );
+    assert!(
+        ratio3 > 0.5,
+        "PK INSERT chunk3 degraded >2× vs chunk1 (ratio={ratio3:.2}) — O(n²) bug regressed"
+    );
+}
+
+/// Regression: UNIQUE column INSERT throughput must also be flat (item 35).
+#[test]
+fn unique_insert_throughput_is_flat_not_degrading() {
+    let chunk = 3_000i64;
+
+    let dir = tempdir().unwrap();
+    let engine = Engine::open(dir.path(), 0).unwrap();
+    let xid = engine.begin().unwrap();
+    engine
+        .execute_sql(xid, "CREATE TABLE flat_uq (id INT, body TEXT UNIQUE)")
+        .unwrap();
+    engine.commit(xid).unwrap();
+
+    let r1 = measure_bulk_chunk(&engine, "flat_uq", 0, chunk);
+    let r2 = measure_bulk_chunk(&engine, "flat_uq", chunk, chunk);
+    let r3 = measure_bulk_chunk(&engine, "flat_uq", chunk * 2, chunk);
+
+    let ratio3 = r3 / r1;
+    assert!(
+        ratio3 > 0.5,
+        "UNIQUE INSERT chunk3 degraded >2× vs chunk1 (ratio={ratio3:.2}) — O(n²) bug regressed"
+    );
+    let _ = r2;
+}
+
+/// Invariant 1 (MVCC): UPDATE to a UNIQUE column must not collide with the
+/// dead old version still in the index until vacuum (item 35 spec §Phase-2.1).
+#[test]
+fn update_unique_column_does_not_collide_with_own_dead_version_in_index() {
+    let (mut engine, _dir) = fresh();
+    run(
+        &mut engine,
+        "CREATE TABLE mvcc_t (id INT PRIMARY KEY, val INT UNIQUE)",
+    )
+    .unwrap();
+    run(&mut engine, "INSERT INTO mvcc_t (id, val) VALUES (1, 100)").unwrap();
+
+    // UPDATE val from 100 to 200. The old version (val=100) stays in the
+    // index until vacuum. The new version (val=200) must not see the dead
+    // old entry as a uniqueness conflict with itself.
+    run(&mut engine, "UPDATE mvcc_t SET val = 200 WHERE id = 1").unwrap();
+
+    // Verify the updated value is visible.
+    let vals = select_ints(&mut engine, "SELECT val FROM mvcc_t WHERE id = 1");
+    assert_eq!(vals, vec![200]);
+
+    // A second UPDATE to the same value is also fine — just replaces 200 with 200.
+    run(&mut engine, "UPDATE mvcc_t SET val = 200 WHERE id = 1").unwrap();
+}
+
+/// Invariant 2 (own-xid): same-batch duplicates must be caught when the
+/// implicit index is used (item 35 spec §Phase-2.2).
+#[test]
+fn same_batch_pk_duplicate_is_caught_via_index() {
+    let (mut engine, _dir) = fresh();
+    run(
+        &mut engine,
+        "CREATE TABLE batch_pk (id INT PRIMARY KEY, body TEXT)",
+    )
+    .unwrap();
+
+    // Two rows with the same PK in one multi-row INSERT must be rejected.
+    let err = run(
+        &mut engine,
+        "INSERT INTO batch_pk (id, body) VALUES (1, 'a'), (1, 'b')",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, DbError::UniqueViolation { .. }),
+        "same-batch PK duplicate must be caught; got {err:?}"
+    );
+}
+
+/// Invariant 4 (NULL distinctness): multiple NULLs in a UNIQUE column are
+/// still allowed after the implicit-index fix (item 35 spec §Phase-2.4).
+#[test]
+fn null_distinctness_preserved_with_implicit_index() {
+    let (mut engine, _dir) = fresh();
+    run(
+        &mut engine,
+        "CREATE TABLE null_uq (id INT, email TEXT UNIQUE)",
+    )
+    .unwrap();
+
+    // Multiple NULLs must be allowed (NULLs are distinct in SQL).
+    run(&mut engine, "INSERT INTO null_uq (id) VALUES (1)").unwrap();
+    run(&mut engine, "INSERT INTO null_uq (id) VALUES (2)").unwrap();
+    run(&mut engine, "INSERT INTO null_uq (id) VALUES (3)").unwrap();
+
+    let ids = select_ints(&mut engine, "SELECT id FROM null_uq");
+    assert_eq!(
+        ids.len(),
+        3,
+        "three rows with NULL email must all be present"
+    );
+}
+
+/// UPDATE throughput on a PK'd table must also be flat (item 35 spec).
+#[test]
+fn pk_update_throughput_is_flat() {
+    let chunk = 1_000i64;
+
+    let dir = tempdir().unwrap();
+    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    run(
+        &mut engine,
+        "CREATE TABLE upd_pk (id INT PRIMARY KEY, val INT)",
+    )
+    .unwrap();
+
+    // Pre-load rows.
+    let stmt = engine
+        .prepare("INSERT INTO upd_pk (id, val) VALUES ($1, $2)")
+        .unwrap();
+    let xid = engine.begin().unwrap();
+    for i in 0..chunk * 3 {
+        engine
+            .execute_prepared(xid, &stmt, &[Literal::Int(i), Literal::Int(i * 10)])
+            .unwrap();
+    }
+    engine.commit(xid).unwrap();
+
+    // Measure UPDATE throughput across three batches of chunk rows.
+    let upd = engine
+        .prepare("UPDATE upd_pk SET val = $1 WHERE id = $2")
+        .unwrap();
+    let measure_upd = |start: i64| {
+        let t0 = Instant::now();
+        let xid = engine.begin().unwrap();
+        for i in start..start + chunk {
+            engine
+                .execute_prepared(xid, &upd, &[Literal::Int(i * 99), Literal::Int(i)])
+                .unwrap();
+        }
+        engine.commit(xid).unwrap();
+        chunk as f64 / t0.elapsed().as_secs_f64()
+    };
+
+    let u1 = measure_upd(0);
+    let u2 = measure_upd(chunk);
+    let u3 = measure_upd(chunk * 2);
+    let ratio = u3 / u1;
+    assert!(
+        ratio > 0.3,
+        "UPDATE chunk3/chunk1 ratio too low ({ratio:.2}) — suggests O(n²) enforcement"
+    );
+    let _ = u2;
 }

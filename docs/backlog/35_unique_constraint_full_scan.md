@@ -1,7 +1,7 @@
 # Item 35 — Unique-constraint enforcement is a full heap scan (O(n²) INSERT/UPDATE)
 
 **Type:** Improvement
-**Status:** NOT STARTED
+**Status:** SHIPPED 2026-07-14 — see `PROGRESS.md` (item 35)
 **Priority:** Critical — hits nearly every real schema (any table with a `PRIMARY KEY`), not a niche path
 
 ---

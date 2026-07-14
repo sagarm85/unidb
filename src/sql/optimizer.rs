@@ -604,6 +604,7 @@ mod tests {
                 None
             },
             index_root: if indexed { Some(1) } else { None },
+            unique_index_root: None,
             constraints: ColumnConstraints::default(),
             dropped: false,
         }

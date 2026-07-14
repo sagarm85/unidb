@@ -1855,12 +1855,14 @@ fn pg_crud_delete_all(url: &str) -> (u64, f64) {
 
 const BULK_COMMIT_BATCH: u64 = 5_000;
 
-/// unidb bulk insert: build a fresh `bt (id, k, body)` (btree on k) and insert
-/// `n` rows, committing every `BULK_COMMIT_BATCH`. Returns (rows, secs).
+/// unidb bulk insert: build a fresh `bt (id INT PRIMARY KEY, k INT, body TEXT)`
+/// and insert `n` rows, committing every `BULK_COMMIT_BATCH`. The PRIMARY KEY
+/// exercises `enforce_unique` (item 35 fix — index-backed, not a heap scan).
+/// Returns (rows, secs).
 fn sql_bulk_insert(engine: &Arc<Engine>, n: u64) -> (u64, f64) {
     let x = engine.begin().unwrap();
     engine
-        .execute_sql(x, "CREATE TABLE bt (id INT, k INT, body TEXT)")
+        .execute_sql(x, "CREATE TABLE bt (id INT PRIMARY KEY, k INT, body TEXT)")
         .unwrap();
     engine
         .execute_sql(x, "CREATE INDEX bt_k ON bt USING BTREE (k)")

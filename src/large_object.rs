@@ -60,6 +60,7 @@ pub fn lobs_table_def() -> TableDef {
         ty,
         index: None,
         index_root: None,
+        unique_index_root: None,
         dropped: false,
         constraints: Default::default(),
     };

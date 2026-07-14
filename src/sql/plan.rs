@@ -1151,6 +1151,7 @@ mod tests {
             ty: ColumnType::Int64,
             index,
             index_root: root,
+            unique_index_root: None,
             constraints: ColumnConstraints::default(),
             dropped: false,
         }
