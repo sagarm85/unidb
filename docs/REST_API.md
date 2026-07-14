@@ -538,6 +538,65 @@ error codes.
 
 ---
 
+### `POST /tables/{table}/bulk` (item 32)
+
+Bulk-insert NDJSON rows into a table in **one transaction** — begin once,
+prepare the `INSERT` SQL once, loop over rows, commit once. This amortizes
+the per-row HTTP + per-statement fsync overhead (~1.5 ms/row on the `/sql`
+one-call-per-row path). **Measured (release, reproducible via the `#[ignore]`d
+`bulk_throughput_measurement` test): ~12k–31k rows/sec** — index-dependent
+(no secondary index amortizes toward ~31k at 200k rows; a B-tree index costs
+~12k–17k and degrades as it grows), a ~20–50× win over the ~640 rows/sec
+per-row path. This is **below** the 50k–200k aspiration; the path there
+(channel-streamed body + lower-level insert) is a filed follow-up. See
+`PROGRESS.md` item-32 entry.
+
+**Content-Type**: `application/x-ndjson` — one JSON object per line.
+All rows must share the same key set. The first row's key-iteration order
+becomes the INSERT column order; subsequent rows look up values by name
+(field order within an object does not matter). Missing keys become `NULL`.
+
+**Request**:
+```
+POST /tables/customers/bulk
+Authorization: Bearer <token>
+Content-Type: application/x-ndjson
+
+{"id":1,"name":"Alice","score":1.5,"active":true}
+{"id":2,"name":"Bob","score":2.0,"active":false}
+...
+```
+
+**Response**: `200 OK`
+```json
+{ "inserted": 200000, "errors": 0, "elapsed_ms": 2340 }
+```
+
+**Error behaviour**: any error (malformed NDJSON, type mismatch, table not
+found, constraint violation) rolls back the **whole batch** atomically.
+A partial insert is never left visible.
+
+**Atomicity note**: one transaction holds the undo log and pins the vacuum
+horizon for its entire duration. Very large batches (millions of rows) have
+a corresponding memory/WAL footprint. A `?chunk=N` commit-every-N mode is
+a documented follow-up for callers that prefer throughput over strict batch
+atomicity.
+
+**Body size**: the server buffers up to 512 MiB. Larger payloads are
+rejected with `400 BODY_TOO_LARGE`.
+
+**Error codes** (in addition to standard engine codes):
+
+| HTTP | code | meaning |
+|------|------|---------|
+| 400 | `MALFORMED_NDJSON` | body is not valid NDJSON (includes line number) |
+| 400 | `BODY_TOO_LARGE` | body exceeds 512 MiB limit |
+| 400 | `INVALID_TABLE_NAME` | table name contains characters outside `[A-Za-z_][A-Za-z0-9_]*` |
+| 400 | `INVALID_COLUMN_NAME` | a JSON key contains invalid SQL identifier characters |
+| 400 | `EMPTY_ROW` | first row has no keys |
+
+---
+
 ### `POST /tables/{table}/events`
 
 Opt a table into event capture (M4). From this point on, every

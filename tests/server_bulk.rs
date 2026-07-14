@@ -223,3 +223,57 @@ async fn bulk_coerces_int_text_float_bool_null() {
 // The fact that `cargo build` (without --features server) compiles cleanly and
 // `cargo tree -p unidb --no-default-features --edges normal | grep tokio` is
 // empty proves the server feature gate is honoured. Verified in CI gate table.
+
+// ── throughput measurement (perf gate; #[ignore] — run in release) ───────────
+//
+// Reproducible measurement behind the docs' "~60–87k rows/sec" claim, so it is
+// verifiable rather than asserted. Loads N rows into a table with NO secondary
+// index and one WITH a B-tree index (index count dominates per-row cost), prints
+// rows/sec computed from the server-reported `elapsed_ms`, and asserts a
+// conservative floor. Run:  cargo test -p unidb --features server --release \
+//   --test server_bulk throughput -- --ignored --nocapture
+#[tokio::test]
+#[ignore]
+async fn bulk_throughput_measurement() {
+    let server = TestServer::spawn().await;
+    let n: usize = std::env::var("BULK_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100_000);
+
+    for (_label, ddl) in [
+        (
+            "no index",
+            "CREATE TABLE bt_noidx (id INT, name TEXT, amt INT)",
+        ),
+        (
+            "btree index",
+            "CREATE TABLE bt_idx (id INT, name TEXT, amt INT)",
+        ),
+    ] {
+        let (s, _) = sql(&server, ddl).await;
+        assert_eq!(s, 200);
+    }
+    let (s, _) = sql(&server, "CREATE INDEX bt_idx_id ON bt_idx USING BTREE (id)").await;
+    assert_eq!(s, 200);
+
+    for (table, label) in [("bt_noidx", "no index"), ("bt_idx", "btree index")] {
+        let mut ndjson = String::with_capacity(n * 48);
+        for i in 0..n {
+            ndjson.push_str(&format!(
+                "{{\"id\":{i},\"name\":\"row{i}\",\"amt\":{}}}\n",
+                i * 3
+            ));
+        }
+        let (status, body) = bulk(&server, table, &ndjson).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["inserted"].as_u64().unwrap(), n as u64);
+        let ms = body["elapsed_ms"].as_u64().unwrap().max(1);
+        let rows_per_sec = (n as u64 * 1000) / ms;
+        println!("[throughput] {label:>12}: {n} rows in {ms} ms = {rows_per_sec} rows/sec");
+        assert!(
+            rows_per_sec > 10_000,
+            "{label}: {rows_per_sec} rows/sec is below the 10k floor — regression?"
+        );
+    }
+}
