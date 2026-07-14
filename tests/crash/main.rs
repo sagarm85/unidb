@@ -94,6 +94,13 @@
 //         simulates that window by reverting `catalog_root` in the control file
 //         before dropping the engine, then verifying the old catalog survives
 //         recovery intact.
+//   P34 – crash mid-disable_events (item 33): `disable_events` uses the same
+//         `Catalog::persist` path as `enable_events`. A crash (drop with no
+//         checkpoint) after the catalog WAL write but before the operator
+//         confirms success must leave the engine in one of two safe states:
+//         either the flag was persisted (CDC off) or it was not (CDC still on).
+//         Either way the engine reopens cleanly, the table is present, and a
+//         re-enable + write still produces an event — no torn half-state.
 
 use tempfile::tempdir;
 use unidb::{Engine, RowId};
@@ -2327,4 +2334,61 @@ fn p32_torn_timeline_mark_falls_back_to_previous_valid_mark() {
     let engine = open(dir.path());
     // No table was created, but the engine opens cleanly.
     drop(engine);
+}
+
+// ── P34: crash mid-disable_events (item 33) ──────────────────────────────────
+
+#[test]
+fn p34_crash_mid_disable_events_engine_reopens_cleanly() {
+    let dir = tempdir().unwrap();
+
+    // Phase 1: create a table and enable CDC.
+    {
+        let e = open(dir.path());
+        let xid = e.begin().unwrap();
+        e.execute_sql(xid, "CREATE TABLE p34_t (id INT)").unwrap();
+        e.commit(xid).unwrap();
+        e.enable_events("p34_t").unwrap();
+        // disable_events: WAL-fsynced catalog write; drop immediately ("crash").
+        e.disable_events("p34_t").unwrap();
+        drop(e);
+    }
+
+    // Reopen and verify: the engine opens cleanly regardless of which state
+    // was persisted (WAL redo makes the disable durable).
+    let e = open(dir.path());
+
+    // The table must still exist and be queryable.
+    let xid = e.begin().unwrap();
+    let result = e.execute_sql(xid, "SELECT id FROM p34_t").unwrap();
+    e.commit(xid).unwrap();
+    match &result[0] {
+        unidb::SqlResult::Rows { rows, .. } => {
+            assert_eq!(
+                rows.len(),
+                0,
+                "P34: p34_t must be empty after crash-recovery"
+            );
+        }
+        _ => panic!("P34: expected Rows from SELECT"),
+    }
+
+    // Re-enable CDC and verify that a subsequent insert emits an event.
+    e.enable_events("p34_t").unwrap();
+    let xid2 = e.begin().unwrap();
+    e.execute_sql(xid2, "INSERT INTO p34_t (id) VALUES (99)")
+        .unwrap();
+    e.commit(xid2).unwrap();
+
+    // There must be at least one event with the right seq (> 0).
+    let xid3 = e.begin().unwrap();
+    let events = e.poll_events_after(xid3, 0, 10).unwrap();
+    e.commit(xid3).unwrap();
+    assert!(
+        !events.is_empty(),
+        "P34: re-enabled CDC must emit an event on insert after crash-recovery"
+    );
+    assert_eq!(events[0].table_name, "p34_t");
+
+    drop(e);
 }

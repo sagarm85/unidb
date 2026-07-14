@@ -12,6 +12,17 @@
 
 ## Current status
 
+- **CDC Management API (backlog item 33) — SHIPPED 2026-07-14, branch
+  `33-cdc-management-api`, PR pending (STOP-for-review — NOT merged).**
+  Three new JWT-protected routes: `GET /tables/{name}/events` (CDC status —
+  `{ "enabled": bool }`; 404 if table absent), `DELETE /tables/{name}/events`
+  (disable CDC — idempotent 204), `GET /events/head` (current max committed seq
+  in `__events__`, O(1) via seq DiskBTree, or `{ "seq": 0 }` if empty).
+  Engine: `is_events_enabled`, `disable_events` (mirrors `enable_events`, same
+  catalog-write path), `events_head_seq` (DiskBTree::max_entry). P34 crash test
+  added (36/36 pass). 6 new integration tests (10/10 total for server_events).
+  Workspace tests all green. Clippy/fmt clean.
+
 - **Bulk Load HTTP API (backlog item 32) — SHIPPED 2026-07-14, branch
   `32-bulk-load-api`, PR pending (STOP-for-review — NOT merged).**
   `POST /tables/{name}/bulk`: JWT-protected NDJSON body, one transaction for the

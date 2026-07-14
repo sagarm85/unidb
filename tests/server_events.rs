@@ -252,3 +252,224 @@ async fn ack_prevents_replay_on_a_fresh_subscribe() {
         "acked event must not be redelivered to the same consumer: {lines:?}"
     );
 }
+
+// ── Item 33: CDC management API ──────────────────────────────────────────────
+
+async fn get_json(server: &TestServer, path: &str) -> (u16, Value) {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(server.url(path))
+        .header("Authorization", format!("Bearer {}", valid_token()))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    (status, body)
+}
+
+async fn delete_path(server: &TestServer, path: &str) -> u16 {
+    let client = reqwest::Client::new();
+    let resp = client
+        .delete(server.url(path))
+        .header("Authorization", format!("Bearer {}", valid_token()))
+        .send()
+        .await
+        .unwrap();
+    resp.status().as_u16()
+}
+
+/// GET /tables/{name}/events returns { "enabled": false } on a fresh table,
+/// true after enable, and false again after DELETE.
+#[tokio::test]
+async fn get_table_events_status_reflects_enable_disable_cycle() {
+    let server = TestServer::spawn().await;
+
+    // Create table.
+    assert_eq!(
+        post_json(
+            &server,
+            "/sql",
+            serde_json::json!({"sql": "CREATE TABLE cdc_test (id INT)"}),
+        )
+        .await,
+        200
+    );
+
+    // Initially disabled.
+    let (status, body) = get_json(&server, "/tables/cdc_test/events").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["enabled"], false);
+
+    // Enable CDC.
+    let client = reqwest::Client::new();
+    let en = client
+        .post(server.url("/tables/cdc_test/events"))
+        .header("Authorization", format!("Bearer {}", valid_token()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(en.status(), 204);
+
+    // Now enabled.
+    let (status, body) = get_json(&server, "/tables/cdc_test/events").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["enabled"], true);
+
+    // Disable CDC.
+    let dis = delete_path(&server, "/tables/cdc_test/events").await;
+    assert_eq!(dis, 204);
+
+    // Now disabled again.
+    let (status, body) = get_json(&server, "/tables/cdc_test/events").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["enabled"], false);
+}
+
+/// DELETE /tables/{name}/events is idempotent: calling when already disabled
+/// returns 204, not an error.
+#[tokio::test]
+async fn delete_table_events_is_idempotent() {
+    let server = TestServer::spawn().await;
+
+    assert_eq!(
+        post_json(
+            &server,
+            "/sql",
+            serde_json::json!({"sql": "CREATE TABLE idm (id INT)"}),
+        )
+        .await,
+        200
+    );
+
+    // CDC was never enabled — first DELETE still returns 204.
+    assert_eq!(delete_path(&server, "/tables/idm/events").await, 204);
+    // Second DELETE also 204.
+    assert_eq!(delete_path(&server, "/tables/idm/events").await, 204);
+}
+
+/// GET /tables/{name}/events returns 404 when the table does not exist.
+#[tokio::test]
+async fn get_table_events_status_404_for_unknown_table() {
+    let server = TestServer::spawn().await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(server.url("/tables/no_such_table/events"))
+        .header("Authorization", format!("Bearer {}", valid_token()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "TABLE_NOT_FOUND");
+}
+
+/// GET /events/head returns { "seq": 0 } when no events have been written.
+#[tokio::test]
+async fn get_events_head_returns_zero_when_empty() {
+    let server = TestServer::spawn().await;
+    let (status, body) = get_json(&server, "/events/head").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["seq"], 0);
+}
+
+/// GET /events/head returns the highest committed seq after inserts on a
+/// CDC-enabled table, and does NOT advance when a non-CDC table is written.
+#[tokio::test]
+async fn get_events_head_reflects_committed_events() {
+    let server = TestServer::spawn().await;
+
+    // Create and enable CDC.
+    assert_eq!(
+        post_json(
+            &server,
+            "/sql",
+            serde_json::json!({"sql": "CREATE TABLE head_test (id INT)"}),
+        )
+        .await,
+        200
+    );
+    let client = reqwest::Client::new();
+    client
+        .post(server.url("/tables/head_test/events"))
+        .header("Authorization", format!("Bearer {}", valid_token()))
+        .send()
+        .await
+        .unwrap();
+
+    // Insert three rows to produce seqs 1, 2, 3.
+    for id in 1..=3 {
+        assert_eq!(
+            post_json(
+                &server,
+                "/sql",
+                serde_json::json!({"sql": format!("INSERT INTO head_test (id) VALUES ({id})")}),
+            )
+            .await,
+            200
+        );
+    }
+
+    let (status, body) = get_json(&server, "/events/head").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["seq"], 3);
+}
+
+/// After disabling CDC, new inserts do NOT advance the head seq.
+#[tokio::test]
+async fn disable_events_stops_future_event_emission() {
+    let server = TestServer::spawn().await;
+
+    assert_eq!(
+        post_json(
+            &server,
+            "/sql",
+            serde_json::json!({"sql": "CREATE TABLE emit_test (id INT)"}),
+        )
+        .await,
+        200
+    );
+
+    // Enable and insert one row.
+    let client = reqwest::Client::new();
+    client
+        .post(server.url("/tables/emit_test/events"))
+        .header("Authorization", format!("Bearer {}", valid_token()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        post_json(
+            &server,
+            "/sql",
+            serde_json::json!({"sql": "INSERT INTO emit_test (id) VALUES (1)"}),
+        )
+        .await,
+        200
+    );
+
+    let (_, body) = get_json(&server, "/events/head").await;
+    let seq_before = body["seq"].as_i64().unwrap();
+    assert!(seq_before >= 1);
+
+    // Disable CDC.
+    assert_eq!(delete_path(&server, "/tables/emit_test/events").await, 204);
+
+    // Insert another row — must NOT advance head.
+    assert_eq!(
+        post_json(
+            &server,
+            "/sql",
+            serde_json::json!({"sql": "INSERT INTO emit_test (id) VALUES (2)"}),
+        )
+        .await,
+        200
+    );
+
+    let (_, body2) = get_json(&server, "/events/head").await;
+    assert_eq!(
+        body2["seq"].as_i64().unwrap(),
+        seq_before,
+        "head seq must not advance after CDC is disabled"
+    );
+}

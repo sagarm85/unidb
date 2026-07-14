@@ -611,6 +611,49 @@ for that table.
 
 ---
 
+### `GET /tables/{table}/events`
+
+Query CDC status for a table (item 33).
+
+**Response `200 OK`**:
+```json
+{ "enabled": true }
+```
+Returns `{ "enabled": false }` when the table exists but CDC is off.
+Returns `404 TABLE_NOT_FOUND` if the table does not exist.
+
+---
+
+### `DELETE /tables/{table}/events`
+
+Disable CDC on a table (item 33). Already-captured events in `__events__`
+are **not** drained — they remain until consumed and vacuumed. Only future
+writes stop emitting events.
+
+**Idempotency decision (item 33):** Returns `204` even when CDC was already
+off. This matches standard REST disable semantics and avoids the client
+needing a prior `GET` to avoid a spurious error.
+
+**Response**: `204 No Content` on success.  
+**Error**: `404 TABLE_NOT_FOUND` if the table does not exist.
+
+---
+
+### `GET /events/head`
+
+Return the current highest committed `seq` in `__events__` without opening a
+stream (item 33). Useful for "start from now" positioning — avoid replaying
+the full event history when subscribing fresh.
+
+**Response `200 OK`**:
+```json
+{ "seq": 134937 }
+```
+Returns `{ "seq": 0 }` if no events have ever been written. O(1) via the
+durable `__events__.seq` B-tree index — no heap scan.
+
+---
+
 ### `GET /events/subscribe`
 
 Server-Sent Events stream of new events on tables that have event capture
