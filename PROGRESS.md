@@ -5270,7 +5270,7 @@ accessors.
 ## Item 35 — Unique-index enforcement (2026-07-14)
 
 **Branch:** `35-unique-index-enforcement`
-**PR:** _pending review_
+**PR:** #102 (MERGED)
 **Spec:** `docs/backlog/35_unique_constraint_full_scan.md`
 
 ### Problem
