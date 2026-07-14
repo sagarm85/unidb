@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `37_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `38_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -50,10 +50,11 @@
 | 34 | `34_observability_api_gaps.md` | Improvement | ✅ SHIPPED 2026-07-14 — `UNIDB_SLOW_QUERY_MS` env var; `PUT /config/slow_query_threshold_ms`; `GET /stats/history` 300-point ring buffer with server-computed rate fields |
 | 35 | `35_unique_constraint_full_scan.md` | Improvement | ✅ SHIPPED 2026-07-14 — implicit unique-enforcement B-tree per PK/UNIQUE column at CREATE TABLE; `enforce_unique()` now does O(1) point lookup + MVCC re-check; PK INSERT flat (was O(n²)); P35 crash test; 6 regression tests; ~23-26× faster at 15k rows. See PROGRESS.md |
 | 36 | `36_foreign_key_row_enforcement.md` | Improvement | ✅ SHIPPED 2026-07-14 — full row-level FK enforcement: child INSERT/UPDATE checks parent key via unique_index_root (O(log n)); parent DELETE/UPDATE RESTRICT rejects when visible child references the key; RecordKind::FkKey phantom lock prevents concurrent parent-delete/child-insert race; 9 new tests + conc_matrix cell 10/10 PASS. See PROGRESS.md |
+| 37 | `37_lazy_buffer_pool_growth.md` | Improvement | ⏳ NOT STARTED — buffer pool frame table is allocated eagerly at open (`(0..capacity).map(...).collect()`), forcing one static `capacity` to serve both cheap-small-opens and generous-bulk-load goals at once. Follows up the 4096→65536 default-bump (`PROGRESS.md`); lazy/growable allocation would let a much larger ceiling be the default without taxing small/embedded opens |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `37_…`.**
+**Next new file → `38_…`.**
 
 ## Next up (candidates — pick one, then create `NN_<slug>.md`)
 
@@ -73,6 +74,20 @@ bump). See PROGRESS.md.
 Child INSERT/UPDATE verifies referenced parent key via unique_index_root (O(log
 n)); parent DELETE/UPDATE RESTRICT; FkKey phantom lock for concurrent-race
 safety; 9 new tests + conc_matrix cell 10/10 PASS.
+
+**#37 — Buffer pool frame table: lazy/growable allocation
+(`37_lazy_buffer_pool_growth.md`, NOT STARTED).** `BufferPool::open`
+eagerly allocates `capacity` frames up front (`src/bufferpool.rs`), forcing
+one static default to trade off cheap small/embedded opens against
+generous headroom for large bulk loads. The default was just bumped
+4096→65536 (`PROGRESS.md`, "Default buffer-pool capacity raised") after a
+demo-scale seed hit `BufferPoolFull` and collapsed throughput ~15-20x via
+forced synchronous `wal.sync()` calls — that bump is a modest, measured
+stopgap (chosen because eager allocation makes a larger default cost every
+`Engine::open()`, including ~50 test files), not the real fix. Making frame
+allocation grow on demand up to `capacity` (rather than pre-allocate it)
+would let a much larger ceiling be the default with no tax on small opens —
+removing the tradeoff entirely instead of just moving the wall.
 
 0. **Item 18 — Engine access & introspection contract — ✅ SHIPPED 2026-07-13**
    (branch `18-engine-access-contract-impl`). Delivered the `information_schema`-
