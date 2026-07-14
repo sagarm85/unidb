@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `38_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `39_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -51,6 +51,7 @@
 | 35 | `35_unique_constraint_full_scan.md` | Improvement | ✅ SHIPPED 2026-07-14 — implicit unique-enforcement B-tree per PK/UNIQUE column at CREATE TABLE; `enforce_unique()` now does O(1) point lookup + MVCC re-check; PK INSERT flat (was O(n²)); P35 crash test; 6 regression tests; ~23-26× faster at 15k rows. See PROGRESS.md |
 | 36 | `36_foreign_key_row_enforcement.md` | Improvement | ✅ SHIPPED 2026-07-14 — full row-level FK enforcement: child INSERT/UPDATE checks parent key via unique_index_root (O(log n)); parent DELETE/UPDATE RESTRICT rejects when visible child references the key; RecordKind::FkKey phantom lock prevents concurrent parent-delete/child-insert race; 9 new tests + conc_matrix cell 10/10 PASS. See PROGRESS.md |
 | 37 | `37_lazy_buffer_pool_growth.md` | Improvement | ⏳ NOT STARTED — buffer pool frame table is allocated eagerly at open (`(0..capacity).map(...).collect()`), forcing one static `capacity` to serve both cheap-small-opens and generous-bulk-load goals at once. Follows up the 4096→65536 default-bump (`PROGRESS.md`); lazy/growable allocation would let a much larger ceiling be the default without taxing small/embedded opens |
+| 38 | `38_param_type_coercion.md` | Improvement | ⏳ NOT STARTED — engine rejects `WHERE int_col = $1` when `$1` is bound as `Text("20")`; should coerce losslessly to the column type (standard SQL behaviour; PostgreSQL/SQLite/MySQL all do this). Studio workaround (`bindForColumn` in RecordBrowser) applied 2026-07-15 but does not cover other clients or expression contexts. |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
