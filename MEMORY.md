@@ -13,7 +13,7 @@
 ## Current status
 
 - **B-tree index sort-then-bulk-load (item 40) — SHIPPED 2026-07-15, branch
-  `40-btree-bulk-build`, PR pending.**
+  `40-btree-bulk-build`, PR #107 (MERGED).**
   `CREATE INDEX USING BTREE` on 540k rows: 134.2 s → 12.0 s (11.2×). Fix:
   collect (key, row_id) pairs, sort, `DiskBTree::insert_many` (one WAL
   mini-txn / one fsync). P40 crash test added (38/38). No FORMAT_VERSION bump.
@@ -3297,7 +3297,7 @@ plain reporting.
   index survives no-checkpoint crash and is queryable on reopen. 38/38 total.
 - Gates: fmt/clippy clean, `cargo test --workspace` all green, crash 38/38.
 - `PROGRESS.md` entry added. `docs/backlog/40_btree_bulk_build.md` → SHIPPED.
-- Branch `40-btree-bulk-build`, PR pending.
+- Branch `40-btree-bulk-build`, PR #107 (MERGED).
 
 ### 2026-07-14 — Default buffer-pool capacity 4096 -> 65536 frames
 

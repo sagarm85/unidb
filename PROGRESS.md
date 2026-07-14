@@ -5606,7 +5606,7 @@ without penalizing small opens.
 ## Item 40 — B-tree index sort-then-bulk-load backfill   [SHIPPED]   2026-07-15
 
 **Branch:** `40-btree-bulk-build`
-**PR:** _pending_
+**PR:** #107 (MERGED)
 
 ### Problem
 
