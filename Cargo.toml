@@ -255,3 +255,9 @@ required-features = ["server"]
 name = "storage_routes"
 path = "tests/storage_routes.rs"
 required-features = ["server"]
+
+# Item 32: bulk-load HTTP API integration tests.
+[[test]]
+name = "server_bulk"
+path = "tests/server_bulk.rs"
+required-features = ["server"]

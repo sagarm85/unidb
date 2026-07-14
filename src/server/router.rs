@@ -27,7 +27,7 @@ use axum::{
 use axum_prometheus::{metrics_exporter_prometheus::PrometheusHandle, PrometheusMetricLayer};
 use tower_http::{cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer};
 
-use crate::server::{auth::JwtConfig, handlers, sse, storage, AppState};
+use crate::server::{auth::JwtConfig, bulk, handlers, sse, storage, AppState};
 
 pub fn build_router(
     state: AppState,
@@ -62,6 +62,10 @@ pub fn build_router(
             get(handlers::get_index_status),
         )
         .route("/tables", get(handlers::get_tables))
+        // Item 32: NDJSON bulk-insert — one txn, one prepared stmt, N rows.
+        // Generic data-loading primitive consistent with the Milestone-18 boundary:
+        // operates on any user table, like Postgres COPY or /rows/batch.
+        .route("/tables/{table}/bulk", post(bulk::post_tables_bulk))
         .route("/tables/{table}/events", post(handlers::post_enable_events))
         .route(
             "/tables/{table}/rls",
