@@ -211,6 +211,7 @@ fn convert_column_def(c: ast::ColumnDef) -> Result<ColumnDef> {
         ty,
         index: None,
         index_root: None,
+        unique_index_root: None,
         dropped: false,
         constraints: cons,
     })

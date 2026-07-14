@@ -59,6 +59,12 @@ pub struct LockStats {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RecordKind {
     Row,
+    /// Phantom lock for `PRIMARY KEY`/`UNIQUE` concurrent-insert serialization
+    /// (item 35, Phase 2 inv. 3). Keyed by a hash of `(table, col, key_value)`;
+    /// held from before `enforce_unique` through transaction commit, so a
+    /// concurrent inserter racing the same key blocks here and sees the committed
+    /// duplicate in its post-lock snapshot.
+    UniqueKey,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -74,6 +80,17 @@ impl RecordId {
         Self {
             kind: RecordKind::Row,
             id: ((page_id as u64) << 16) | slot as u64,
+        }
+    }
+
+    /// Unique-key phantom lock: a `UniqueKey` record keyed by `hash` (a stable
+    /// hash of `(table_name, col_name, encoded_key_value)` computed by the
+    /// caller). Used by `exec_insert` to serialize concurrent inserters racing
+    /// the same `PRIMARY KEY`/`UNIQUE` value (item 35, Phase 2 inv. 3).
+    pub fn unique_key(hash: u64) -> Self {
+        Self {
+            kind: RecordKind::UniqueKey,
+            id: hash,
         }
     }
 }
@@ -320,6 +337,14 @@ impl LockManager {
     /// acquire`]. The single-writer path and every existing caller use this.
     pub fn try_acquire_write(&self, id: RecordId, xid: Xid) -> Result<()> {
         self.acquire(id, xid, LockMode::Exclusive, WaitPolicy::NoWait)
+    }
+
+    /// Acquire an exclusive lock on `id` with blocking wait + deadlock detection.
+    /// Used by `exec_insert` for `UniqueKey` phantom locks: the caller blocks
+    /// until the previous holder (the concurrent inserter racing the same key)
+    /// commits or aborts, then re-checks visibility in a fresh snapshot.
+    pub fn acquire_blocking(&self, id: RecordId, xid: Xid) -> Result<()> {
+        self.acquire(id, xid, LockMode::Exclusive, WaitPolicy::Wait)
     }
 
     /// Release every lock held (and any wait parked) by `xid` — called on

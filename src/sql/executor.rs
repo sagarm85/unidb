@@ -32,8 +32,8 @@ use crate::{
     disk_vector::DiskIvfIndex,
     error::{DbError, Result},
     format::{PageId, Xid},
-    heap::{Heap, RowId},
-    lockmgr::LockManager,
+    heap::{get_visible, Heap, RowId},
+    lockmgr::{LockManager, RecordId},
     mvcc::Snapshot,
     queue::{self, EVENTS_TABLE},
     txn::{IsolationLevel, TransactionManager, UndoAction},
@@ -54,6 +54,35 @@ fn ivf_params(nrows: usize) -> (usize, usize) {
 /// Lloyd's iterations for centroid training at `CREATE INDEX` — a handful
 /// suffices for a stable partition (validated in the P3.c recall sweep).
 const IVF_TRAIN_ITERS: usize = 8;
+
+/// Compute the `RecordId` for a `UniqueKey` phantom lock: a stable hash of
+/// `(table_name, col_name, key_value)`. Two distinct `OrderedValue` variants
+/// are distinguished by a tag byte so `Int(1)` ≠ `Bool(true)`.
+///
+/// Used by `exec_insert` to acquire the lock BEFORE taking the uniqueness
+/// snapshot, serializing concurrent inserters racing the same PK/UNIQUE value.
+fn unique_key_record_id(table: &str, col: &str, key: &OrderedValue) -> RecordId {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    table.hash(&mut h);
+    col.hash(&mut h);
+    match key {
+        OrderedValue::Int(n) => {
+            1u8.hash(&mut h);
+            n.hash(&mut h);
+        }
+        OrderedValue::Text(s) => {
+            2u8.hash(&mut h);
+            s.hash(&mut h);
+        }
+        OrderedValue::Bool(b) => {
+            3u8.hash(&mut h);
+            b.hash(&mut h);
+        }
+    }
+    RecordId::unique_key(h.finish())
+}
 
 use super::datetime;
 use super::logical::{CmpOp, Expr, Literal, LogicalPlan};
@@ -208,31 +237,38 @@ fn apply_durable_index_writes(
         if col.dropped {
             continue;
         }
-        let Some(meta_page) = col.index_root else {
-            continue;
-        };
-        match col.index {
-            Some(IndexKind::BTree) => {
-                if let Ok(value) = OrderedValue::try_from(&row[idx]) {
-                    DiskBTree::new(meta_page, ctx.page_size)
-                        .insert(value, row_id, ctx.pool, ctx.wal)?;
-                }
-            }
-            Some(IndexKind::FullText) => {
-                if let Literal::Text(text) = &row[idx] {
-                    let tree = DiskBTree::new(meta_page, ctx.page_size);
-                    for token in crate::fulltext::tokenize(text) {
-                        tree.insert(OrderedValue::Text(token), row_id, ctx.pool, ctx.wal)?;
+        // Explicit secondary index (CREATE INDEX).
+        if let Some(meta_page) = col.index_root {
+            match col.index {
+                Some(IndexKind::BTree) => {
+                    if let Ok(value) = OrderedValue::try_from(&row[idx]) {
+                        DiskBTree::new(meta_page, ctx.page_size)
+                            .insert(value, row_id, ctx.pool, ctx.wal)?;
                     }
                 }
-            }
-            Some(IndexKind::Hnsw) => {
-                if let Literal::Vector(v) = &row[idx] {
-                    DiskIvfIndex::open(meta_page, ctx.page_size)
-                        .insert(row_id, v, ctx.pool, ctx.wal)?;
+                Some(IndexKind::FullText) => {
+                    if let Literal::Text(text) = &row[idx] {
+                        let tree = DiskBTree::new(meta_page, ctx.page_size);
+                        for token in crate::fulltext::tokenize(text) {
+                            tree.insert(OrderedValue::Text(token), row_id, ctx.pool, ctx.wal)?;
+                        }
+                    }
                 }
+                Some(IndexKind::Hnsw) => {
+                    if let Literal::Vector(v) = &row[idx] {
+                        DiskIvfIndex::open(meta_page, ctx.page_size)
+                            .insert(row_id, v, ctx.pool, ctx.wal)?;
+                    }
+                }
+                _ => {}
             }
-            _ => {}
+        }
+        // Implicit unique-enforcement index (item 35): maintain on every INSERT
+        // so enforce_unique can do a point lookup instead of a heap scan.
+        if let Some(uiq_meta) = col.unique_index_root {
+            if let Ok(value) = OrderedValue::try_from(&row[idx]) {
+                DiskBTree::new(uiq_meta, ctx.page_size).insert(value, row_id, ctx.pool, ctx.wal)?;
+            }
         }
     }
     Ok(())
@@ -316,13 +352,20 @@ fn stage_row_index_writes(
         if col.dropped {
             continue;
         }
-        let Some(meta_page) = col.index_root else {
-            continue;
-        };
-        if let Some(IndexKind::Hnsw) = col.index {
-            if let Literal::Vector(v) = &row[idx] {
-                DiskIvfIndex::open(meta_page, ctx.page_size)
-                    .insert(new_row_id, v, ctx.pool, ctx.wal)?;
+        if let Some(meta_page) = col.index_root {
+            if let Some(IndexKind::Hnsw) = col.index {
+                if let Literal::Vector(v) = &row[idx] {
+                    DiskIvfIndex::open(meta_page, ctx.page_size)
+                        .insert(new_row_id, v, ctx.pool, ctx.wal)?;
+                }
+            }
+        }
+        // Implicit unique-enforcement index (item 35): insert the new version's
+        // key on UPDATE so the index stays current.
+        if let Some(uiq_meta) = col.unique_index_root {
+            if let Ok(value) = OrderedValue::try_from(&row[idx]) {
+                DiskBTree::new(uiq_meta, ctx.page_size)
+                    .insert(value, new_row_id, ctx.pool, ctx.wal)?;
             }
         }
     }
@@ -637,6 +680,23 @@ fn exec_create_table(
             serial_next.insert(col.name.clone(), 1);
         }
     }
+
+    // Collect PK/UNIQUE columns whose types support a BTree index before
+    // `name` and `columns` are moved into `def`.
+    let pk_unique_indexable: Vec<String> = columns
+        .iter()
+        .filter(|c| {
+            !c.dropped
+                && (c.constraints.primary_key || c.constraints.unique)
+                && matches!(
+                    c.ty,
+                    ColumnType::Int64 | ColumnType::Text | ColumnType::Bool
+                )
+        })
+        .map(|c| c.name.clone())
+        .collect();
+    let table_name = name.clone();
+
     let def = TableDef {
         name,
         columns,
@@ -650,6 +710,29 @@ fn exec_create_table(
     };
     let mut cctx = catalog_ctx!(ctx);
     ctx.catalog.exclusive()?.create_table(def, &mut cctx)?;
+
+    // Item 35: For every column with a PRIMARY KEY or UNIQUE constraint whose
+    // type is BTree-indexable (Int64/Text/Bool), create an implicit durable
+    // B-tree that `enforce_unique` can use for O(1) point-lookup enforcement
+    // instead of an O(n) heap scan. The tree is empty at creation (no rows
+    // yet); it is maintained by `apply_durable_index_writes` and
+    // `stage_row_index_writes` on every subsequent INSERT/UPDATE.
+    //
+    // Stored in `ColumnDef.unique_index_root` (separate from `index_root` for
+    // the explicit secondary index so both can coexist without conflict).
+    // `#[serde(default)]` on the field means pre-item-35 catalogs open with
+    // `None` and fall back to the heap-scan path — no FORMAT_VERSION bump.
+    for col_name in &pk_unique_indexable {
+        let tree = DiskBTree::create(ctx.pool, ctx.wal)?;
+        let mut cctx2 = catalog_ctx!(ctx);
+        ctx.catalog.exclusive()?.set_column_unique_index_root(
+            &table_name,
+            col_name,
+            Some(tree.meta_page()),
+            &mut cctx2,
+        )?;
+    }
+
     Ok(ExecResult::CreatedTable)
 }
 
@@ -810,9 +893,29 @@ fn exec_insert(
         let coerced = coerce_and_validate_row(&table_def, filled)?;
         enforce_not_null(&table_def, &coerced)?;
         enforce_checks(&table_def, &coerced)?;
-        // UNIQUE (M11): scan under a fresh per-row snapshot so earlier rows
-        // inserted by *this same statement* (own writes, visible to own xid)
-        // are counted — a duplicate within one multi-row INSERT is caught.
+        // UNIQUE (M11) — two-step approach for concurrent-inserter safety
+        // (item 35, Phase 2 inv. 3):
+        //
+        // Step 1: acquire an exclusive phantom lock per indexable PK/UNIQUE
+        // column BEFORE taking the snapshot. Two writers racing the same key
+        // both reach this point; one acquires the lock and proceeds, the
+        // other blocks (WaitPolicy::Wait) until the first commits or aborts.
+        // When the waiter unblocks, step 2's fresh snapshot includes the
+        // winner's committed row, so enforce_unique correctly sees the duplicate
+        // and returns UniqueViolation. Without this lock the race is:
+        //   A & B both call enforce_unique → both pass (no committed row yet)
+        //   A & B both insert → both commit → duplicate key visible.
+        for (col_idx, col) in table_def.columns.iter().enumerate() {
+            if col.dropped || col.unique_index_root.is_none() {
+                continue;
+            }
+            if let Ok(key) = OrderedValue::try_from(&coerced[col_idx]) {
+                let lock_id = unique_key_record_id(&table_def.name, &col.name, &key);
+                ctx.lock_mgr.acquire_blocking(lock_id, ctx.xid)?;
+            }
+        }
+        // Step 2: take snapshot AFTER acquiring all unique key locks — any
+        // concurrent winner that committed while we waited is now visible.
         let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
         enforce_unique(
             &table_def, &coerced, &heap, &snapshot, ctx.xid, ctx.pool, None,
@@ -2136,11 +2239,27 @@ fn names_to_indices(table_def: &TableDef, names: &[String]) -> Result<Vec<usize>
     names.iter().map(|n| column_index(table_def, n)).collect()
 }
 
-/// Enforce every UNIQUE/PRIMARY KEY set by scanning the heap under `snapshot`.
-/// A set with any NULL component in the new row is skipped (SQL treats NULLs
-/// as distinct, so such a row never conflicts). `exclude` is the row being
-/// updated in place, whose still-visible old version must not count as a
-/// conflict with itself.
+/// Enforce every UNIQUE/PRIMARY KEY set under `snapshot`.
+///
+/// For single-column sets whose column has an implicit unique-enforcement
+/// B-tree (`ColumnDef.unique_index_root`), a point lookup replaces the
+/// former O(n) heap scan — the fix for item 35. MVCC visibility is
+/// re-verified for every candidate RowId returned by the index (`get_visible`
+/// with the same snapshot + xid), so stale dead-version entries left by an
+/// UPDATE until vacuum are correctly filtered out and do not produce false
+/// conflicts. Own-xid rows (earlier insertions in the same multi-row INSERT
+/// or bulk batch) ARE visible via the `xmin == self_xid` branch of
+/// `is_visible`, which is intentional — same-batch duplicates are caught.
+///
+/// Sets with any NULL component in the new row are skipped (SQL treats NULLs
+/// as distinct, so such a row never conflicts). `exclude` is the RowId of the
+/// old version being replaced by an UPDATE — it must not count as a conflict
+/// with the new version that has the same key value.
+///
+/// For multi-column sets (composite keys, out of scope for item 35), or for
+/// single-column sets whose column type is not BTree-indexable (Decimal,
+/// Timestamp, etc.), this function falls back to the O(n) heap scan. That
+/// path is expected to be rare in practice.
 #[allow(clippy::too_many_arguments)]
 fn enforce_unique(
     table_def: &TableDef,
@@ -2161,28 +2280,67 @@ fn enforce_unique(
         return Ok(());
     }
 
-    for (row_id, bytes) in heap.scan(snapshot, xid, pool)? {
-        if Some(row_id) == exclude {
-            continue;
+    // Split active sets: those we can check via a fast index point lookup vs.
+    // those that still need a heap scan (composite sets or non-indexable types).
+    let mut heap_scan_sets: Vec<&Vec<usize>> = Vec::new();
+
+    for set in &active {
+        if set.len() == 1 {
+            let col_idx = set[0];
+            let col = &table_def.columns[col_idx];
+            if let Some(uiq_meta) = col.unique_index_root {
+                // Fast path: point lookup into the implicit unique B-tree.
+                // The index may contain stale entries for dead MVCC versions
+                // (UPDATE leaves the old key until vacuum), so we re-check
+                // visibility for every candidate RowId.
+                if let Ok(key) = OrderedValue::try_from(&new_row[col_idx]) {
+                    let page_size = pool.page_size();
+                    let candidates = DiskBTree::new(uiq_meta, page_size).search_eq(&key, pool)?;
+                    for rid in candidates {
+                        if Some(rid) == exclude {
+                            continue;
+                        }
+                        if get_visible(pool, rid, snapshot, xid)?.is_some() {
+                            return Err(DbError::UniqueViolation {
+                                table: table_def.name.clone(),
+                                columns: col.name.clone(),
+                            });
+                        }
+                    }
+                    continue; // this set is handled — do not add to heap_scan_sets
+                }
+            }
         }
-        let existing = decode_row(&bytes, &table_def.columns)?;
-        for set in &active {
-            // `existing[i] == new_row[i]` is false whenever `existing[i]` is
-            // NULL (different `Literal` variant), so existing NULLs never
-            // conflict — no special-casing needed.
-            if set.iter().all(|&i| existing[i] == new_row[i]) {
-                let columns = set
-                    .iter()
-                    .map(|&i| table_def.columns[i].name.clone())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(DbError::UniqueViolation {
-                    table: table_def.name.clone(),
-                    columns,
-                });
+        // Composite set, or column type not BTree-indexable: fall back to heap.
+        heap_scan_sets.push(set);
+    }
+
+    // Heap scan for the remaining sets (composite keys, or no implicit index).
+    if !heap_scan_sets.is_empty() {
+        for (row_id, bytes) in heap.scan(snapshot, xid, pool)? {
+            if Some(row_id) == exclude {
+                continue;
+            }
+            let existing = decode_row(&bytes, &table_def.columns)?;
+            for set in &heap_scan_sets {
+                // `existing[i] == new_row[i]` is false when `existing[i]` is
+                // NULL (different `Literal` variant) — existing NULLs never
+                // conflict, no special-casing needed.
+                if set.iter().all(|&i| existing[i] == new_row[i]) {
+                    let columns = set
+                        .iter()
+                        .map(|&i| table_def.columns[i].name.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(DbError::UniqueViolation {
+                        table: table_def.name.clone(),
+                        columns,
+                    });
+                }
             }
         }
     }
+
     Ok(())
 }
 
@@ -3235,6 +3393,7 @@ mod tests {
                 name: "a".to_string(),
                 index: None,
                 index_root: None,
+                unique_index_root: None,
                 dropped: false,
                 constraints: Default::default(),
                 ty: ColumnType::Int64,
@@ -3243,6 +3402,7 @@ mod tests {
                 name: "b".to_string(),
                 index: None,
                 index_root: None,
+                unique_index_root: None,
                 dropped: false,
                 constraints: Default::default(),
                 ty: ColumnType::Text,
@@ -3251,6 +3411,7 @@ mod tests {
                 name: "c".to_string(),
                 index: None,
                 index_root: None,
+                unique_index_root: None,
                 dropped: false,
                 constraints: Default::default(),
                 ty: ColumnType::Bool,
@@ -3259,6 +3420,7 @@ mod tests {
                 name: "d".to_string(),
                 index: None,
                 index_root: None,
+                unique_index_root: None,
                 dropped: false,
                 constraints: Default::default(),
                 ty: ColumnType::Json,
@@ -3281,6 +3443,7 @@ mod tests {
             name: "a".to_string(),
             index: None,
             index_root: None,
+            unique_index_root: None,
             dropped: false,
             constraints: Default::default(),
             ty: ColumnType::Int64,
@@ -3296,6 +3459,7 @@ mod tests {
             name: "embedding".to_string(),
             index: None,
             index_root: None,
+            unique_index_root: None,
             dropped: false,
             constraints: Default::default(),
             ty: ColumnType::Vector(4),
@@ -3312,6 +3476,7 @@ mod tests {
             name: "embedding".to_string(),
             index: None,
             index_root: None,
+            unique_index_root: None,
             dropped: false,
             constraints: Default::default(),
             ty: ColumnType::Vector(4),
@@ -3330,6 +3495,7 @@ mod tests {
                 name: "embedding".to_string(),
                 index: None,
                 index_root: None,
+                unique_index_root: None,
                 dropped: false,
                 constraints: Default::default(),
                 ty: ColumnType::Vector(4),
@@ -3353,6 +3519,7 @@ mod tests {
             name: name.to_string(),
             index: None,
             index_root: None,
+            unique_index_root: None,
             dropped: false,
             constraints: Default::default(),
             ty,

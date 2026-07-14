@@ -413,6 +413,7 @@ Phase 4 query power is next for the SQL lane). Metrics tables are in
 | Observability metrics (item 21) | done | Lock-free per-chokepoint metrics in `stats()`/`GET /stats` + `/metrics`: per-statement-kind latency histograms, WAL-fsync cost, buffer-pool hit/miss/evict, lock-wait + deadlock counters, the alertable **vacuum-horizon-age gauge** (item-16 lesson), per-table page counts, and worker-governance utilization. Widget-traceability table in `docs/engine_access_guide.md` §10 (grown since by items 27/29) |
 | Logs surface (item 22) | done | JSON-lines server logs; per-request `request_id`+`txn_id` correlation across app/slow-query/`audit.log`; superuser-gated `GET /logs` — bounded, cursor-paged reverse read (cap + scan budget, no OOM/stall); CW/Datadog shipping guidance |
 | Multi-page catalog (item 25) | done | `Catalog::persist`/`load` now chain across N 8 KiB pages (in-band magic detection, write-new-chain-then-flip atomicity, no `FORMAT_VERSION` bump, old blobs open unchanged); removes the ~8 KiB `HeapFull` ceiling item 23 had to work around — unlimited schema size, ANALYZE/SERIAL no longer overflow at runtime; crash point P33 |
+| Unique-index enforcement (item 35) | done | `enforce_unique()` now uses an O(1) B-tree point lookup + MVCC re-check (was O(n) heap scan per inserted row — O(n²) total). `CREATE TABLE` auto-creates an implicit `DiskBTree` per `PRIMARY KEY`/`UNIQUE` column (INT64/TEXT/BOOL); composite keys and non-indexable types fall back to the heap scan. `unique_index_root: Option<PageId>` in `ColumnDef` with `#[serde(default)]` — no `FORMAT_VERSION` bump. PK INSERT now flat at ~27-30k rows/s vs. 5k→1k/s degrading. P35 crash test; 6 regression tests; NULL distinctness preserved |
 
 ---
 
@@ -426,7 +427,7 @@ Phase 4 query power is next for the SQL lane). Metrics tables are in
 | D4 | Tuple header reserves xmin/xmax now; in-place UPDATE in M0, MVCC in M1 |
 | D5 | WAL-before-page invariant: no dirty page flushed while page.LSN > durable WAL LSN |
 | D6 | Single-file *data* storage; the WAL may be separate. **Evolved (P6.a, signed off 2026-07-09):** the WAL is now a directory of 16 MiB segment files. The data store stays a single file |
-| D7 | Crash-injection harness: kill at defined points, reopen, assert recovered state (grows with each new durability mechanism — P1–P19 today, 21 tests) |
+| D7 | Crash-injection harness: kill at defined points, reopen, assert recovered state (grows with each new durability mechanism — 37 tests, P1–P35 today) |
 | D8 | Page size 8 KiB default, config-overridable at init, fixed after creation |
 | D9 | On-disk format is fixed little-endian; every page carries CRC32 + LSN |
 | D10 | Default isolation: READ COMMITTED; REPEATABLE READ + SERIALIZABLE (SSI, P1.d) available |

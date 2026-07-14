@@ -605,7 +605,10 @@ unidb_subscription_lag_seconds{consumer="billing"} 3.7
 - **`is_unique` on `unidb_catalog.indexes`** reflects whether the indexed column
   carries a UNIQUE/PK *constraint*, not a property of the index itself — unidb
   secondary indexes are non-unique structures; uniqueness is enforced by the
-  constraint, not the index.
+  constraint, not the index. Each `PRIMARY KEY` / `UNIQUE` column also has an
+  **implicit internal B-tree** auto-created at `CREATE TABLE` time (item 35)
+  that backs the O(1) uniqueness check — this internal index is *not* surfaced
+  in `unidb_catalog.indexes` (only explicit `CREATE INDEX` indexes appear there).
 - **One schema, one database per server.** `'public'` / `'unidb'` are constants;
   there is no schema namespacing and no multi-db addressing.
 - **No `NATURAL JOIN` / `FULL OUTER JOIN`** (`JOIN … USING` *is* supported —

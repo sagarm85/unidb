@@ -101,6 +101,12 @@
 //         either the flag was persisted (CDC off) or it was not (CDC still on).
 //         Either way the engine reopens cleanly, the table is present, and a
 //         re-enable + write still produces an event — no torn half-state.
+//   P35 – implicit unique-enforcement index (item 35): `CREATE TABLE` with a
+//         `PRIMARY KEY` now creates an implicit durable BTree for O(1) unique
+//         enforcement. A crash (no checkpoint) after a committed insert must
+//         recover both the heap row and the implicit index via WAL redo, so
+//         (a) duplicate PKs are still rejected on reopen (index is live) and
+//         (b) new rows with fresh PKs are still accepted.
 
 use tempfile::tempdir;
 use unidb::{Engine, RowId};
@@ -2389,6 +2395,90 @@ fn p34_crash_mid_disable_events_engine_reopens_cleanly() {
         "P34: re-enabled CDC must emit an event on insert after crash-recovery"
     );
     assert_eq!(events[0].table_name, "p34_t");
+
+    drop(e);
+}
+
+// ── P35: implicit unique-enforcement index survives a crash ───────────────────
+//
+// Scenario (item 35): `CREATE TABLE` with a `PRIMARY KEY` now implicitly
+// creates a durable B-tree for unique enforcement. This point verifies that
+// the implicit index is WAL-logged and recovers fully from a crash (no
+// checkpoint), so after reopen:
+//   (a) the uniqueness constraint is still enforced correctly (duplicate
+//       insertions are rejected), and
+//   (b) new valid insertions can still be accepted — the index is live, not
+//       silently dropped by recovery.
+//
+// A secondary effect tested here: the pre-crash committed rows are still
+// visible on reopen (normal redo), and the implicit index's entries for those
+// rows are present so the uniqueness check uses the fast O(1) path.
+
+#[test]
+fn p35_implicit_unique_index_survives_crash_and_enforces_constraint_on_reopen() {
+    let dir = tempdir().unwrap();
+
+    // Phase 1: create a table with a PRIMARY KEY and insert a committed row.
+    // The implicit unique-enforcement BTree is created by CREATE TABLE and
+    // maintained by the INSERT. Drop the engine without a checkpoint — crash.
+    {
+        let e = open(dir.path());
+        let xid = e.begin().unwrap();
+        e.execute_sql(xid, "CREATE TABLE p35_t (id INT PRIMARY KEY, body TEXT)")
+            .unwrap();
+        e.commit(xid).unwrap();
+
+        let xid2 = e.begin().unwrap();
+        e.execute_sql(xid2, "INSERT INTO p35_t (id, body) VALUES (42, 'hello')")
+            .unwrap();
+        e.commit(xid2).unwrap();
+
+        drop(e); // crash — no explicit page flush
+    }
+
+    // Phase 2: reopen; redo recovers the heap row AND the implicit index pages.
+    let e = open(dir.path());
+
+    // (a) Duplicate PK must still be rejected — the implicit index is live.
+    let xid3 = e.begin().unwrap();
+    let dup_result = e.execute_sql(xid3, "INSERT INTO p35_t (id, body) VALUES (42, 'dup')");
+    let _ = e.abort(xid3);
+    assert!(
+        matches!(
+            dup_result,
+            Err(unidb::error::DbError::UniqueViolation { .. })
+        ),
+        "P35: duplicate PK insert must be rejected after crash-recovery; got {dup_result:?}"
+    );
+
+    // (b) A new row with a different PK must be accepted.
+    let xid4 = e.begin().unwrap();
+    e.execute_sql(xid4, "INSERT INTO p35_t (id, body) VALUES (99, 'new')")
+        .unwrap();
+    e.commit(xid4).unwrap();
+
+    // Both rows are visible on SELECT.
+    let xid5 = e.begin().unwrap();
+    let result = e.execute_sql(xid5, "SELECT id FROM p35_t").unwrap();
+    e.commit(xid5).unwrap();
+    match &result[0] {
+        unidb::SqlResult::Rows { rows, .. } => {
+            let mut ids: Vec<i64> = rows
+                .iter()
+                .map(|r| match &r[0] {
+                    unidb::sql::logical::Literal::Int(n) => *n,
+                    other => panic!("P35: expected Int, got {other:?}"),
+                })
+                .collect();
+            ids.sort_unstable();
+            assert_eq!(
+                ids,
+                vec![42, 99],
+                "P35: both committed rows must be visible after crash-recovery"
+            );
+        }
+        other => panic!("P35: expected Rows, got {other:?}"),
+    }
 
     drop(e);
 }

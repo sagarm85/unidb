@@ -66,6 +66,7 @@ mod tests {
             ty,
             index: None,
             index_root: None,
+            unique_index_root: None,
             dropped: false,
             constraints: Default::default(),
         }

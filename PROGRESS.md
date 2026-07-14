@@ -5264,3 +5264,165 @@ same path as P33; engine reopens cleanly, re-enable + insert still emits event).
 catalog-only (same code path as `enable_events`); `events_head_seq` is a pure
 read via the pre-existing seq index. Server-layer only beyond the three new engine
 accessors.
+
+---
+
+## Item 35 — Unique-index enforcement (2026-07-14)
+
+**Branch:** `35-unique-index-enforcement`
+**PR:** _pending review_
+**Spec:** `docs/backlog/35_unique_constraint_full_scan.md`
+
+### Problem
+
+`enforce_unique()` (`src/sql/executor.rs`) did a full `heap.scan()` per
+INSERT/UPDATE row — O(n) per row, O(n²) total for bulk loads. Any schema with
+`PRIMARY KEY` or `UNIQUE` (nearly every real table) paid this silently. The
+existing multi-model bench (Table 3.1) used a no-PK table and never triggered it.
+
+**Phase 0 — before baseline (micro-benchmark, 5k-row chunks):**
+
+| Table | 5k rows | +5k (10k cume) | +5k (15k cume) | shape |
+|-------|--------:|---------------:|---------------:|-------|
+| `id INTEGER PRIMARY KEY` | 5,484/s | 1,936/s | 1,167/s | O(n²), degrading |
+| `id INT` (no PK, reference) | 115,279/s | 113,783/s | — | flat |
+
+At 1M rows (extrapolating O(n²)): estimated ~1–2 rec/s (minutes to hang).
+
+### Fix (Phase 1)
+
+`CREATE TABLE` now auto-creates an **implicit `DiskBTree`** per every
+`PRIMARY KEY` / `UNIQUE` column (INT64, TEXT, BOOL — indexable types only;
+other types and composite sets fall back to the heap scan).
+
+`enforce_unique()` rewritten:
+- **Fast path (single-column, indexable):** `DiskBTree::search_eq()` point
+  lookup → O(1) candidates → MVCC re-check via `get_visible()` for each
+  (filters dead index entries from in-place updates until vacuum).
+- **Fallback:** heap scan — unchanged, used for composite sets and
+  non-indexable types.
+
+Catalog: `unique_index_root: Option<PageId>` added to `ColumnDef` with
+`#[serde(default)]` — old catalogs deserialize cleanly with `None` and fall
+back to heap scan. **No `FORMAT_VERSION` bump** (catalog JSON schema only, not
+binary storage format); §3 sign-off not needed.
+
+UPDATE path: `stage_row_index_writes` also maintains the implicit unique index
+for the new version's RowId. The old version's key stays until vacuum but
+is filtered by MVCC visibility check.
+
+### Correctness invariants (Phase 2)
+
+1. **MVCC visibility:** dead index entries (old MVCC versions until vacuum)
+   filtered by `get_visible(pool, rid, snapshot, xid)` — same pattern as
+   `try_exec_select_btree`. Reject only if a *visible* row holds the key.
+2. **Own-xid / same-batch duplicates:** `is_visible` returns own-xid rows as
+   visible, catching duplicate keys within a single multi-row INSERT batch.
+3. **NULL distinctness:** NULL values do not produce an `OrderedValue` key
+   (`OrderedValue::try_from` returns `Err` for NULL); `enforce_unique` skips
+   the fast path and the null-containing set, matching pre-existing heap-scan
+   NULL behavior.
+4. **Recovery:** implicit unique B-tree is WAL-logged (`WAL_INDEX` — same
+   redo-only record all `DiskBTree` indexes use). P35 crash test covers
+   create→insert→crash→reopen: duplicate still rejected, new distinct row
+   accepted.
+
+### Phase 3 — After baseline (same micro-benchmark):
+
+| Table | 5k rows | +5k (10k cume) | +5k (15k cume) | shape |
+|-------|--------:|---------------:|---------------:|-------|
+| `id INTEGER PRIMARY KEY` — **after** | 27,046/s | 28,276/s | 30,362/s | **flat** |
+| `id INT` (no PK, reference) | ~115k/s | ~115k/s | — | flat (unchanged) |
+
+**~23–26× improvement at 15k rows; flat scaling (was O(n²) degrading).**
+
+### Table 3.1 — Bulk insert at scale (regenerated with PK'd table, item-35 fix)
+
+Report: `docs/performance/multi_model_report_20260714_190433.md`
+Machine: Apple M5 Pro · 18 cores · Darwin 25.4.0 · release build · F_FULLFSYNC
+PK'd table (`id INT PRIMARY KEY` + explicit `BTREE` on `k`):
+
+| rows | unidb insert (rec/s) — **after** | unidb scan (rec/s) |
+|-----:|---------------------------------:|-------------------:|
+| 10,000 | **19,695** | 5,474,077 |
+| 1,000,000 | **16,817** | 35,875,244 |
+| 2,000,000 | **16,489** | 35,324,923 |
+
+Insert is **flat across 10k → 1M → 2M rows** (O(log n) B-tree insert, not O(n²)).
+Before fix (old no-PK report baseline): 34,056/31,004/30,902 rec/s — the PK'd
+case at 1M rows would have been unmeasurably slow (estimated ~1 rec/s, O(n²)).
+
+**Table 1 (multi-model tax, unchanged by fix — ladder table has no PK):**
+
+| rows | W0 (ms) | W4 (ms) | W4/W0 |
+|-----:|--------:|--------:|------:|
+| 1,000 | 3.11 | 4.04 | 1.30× |
+| 10,000 | 3.11 | 4.03 | 1.29× |
+| 100,000 | 3.14 | 4.06 | 1.29× |
+
+W4/W0 ~1.3× (within historical band; the fix does not touch the W0–W4 ladder).
+
+### New files / key changes
+
+- `src/catalog.rs` — `unique_index_root: Option<PageId>` in `ColumnDef`
+  (`#[serde(default)]`); `set_column_unique_index_root()` method
+- `src/sql/executor.rs` — `exec_create_table`: auto-creates implicit `DiskBTree`
+  per indexable PK/UNIQUE column; `apply_durable_index_writes` (INSERT) and
+  `stage_row_index_writes` (UPDATE) maintain the implicit unique index;
+  `enforce_unique` fast path replaces heap scan with B-tree point lookup + MVCC re-check
+- `tests/crash/main.rs` — P35: create PK table → insert committed row → crash
+  (no checkpoint) → reopen → duplicate still rejected, new row accepted; **37 crash tests total**
+- `tests/constraints.rs` — 6 new regression tests:
+  - `pk_insert_throughput_is_flat_not_degrading` (shape regression)
+  - `unique_insert_throughput_is_flat_not_degrading`
+  - `pk_update_throughput_is_flat`
+  - `update_unique_column_does_not_collide_with_own_dead_version_in_index` (MVCC inv. 1)
+  - `same_batch_pk_duplicate_is_caught_via_index` (MVCC inv. 2)
+  - `null_distinctness_preserved_with_implicit_index` (MVCC inv. 4)
+- `benches/decompose.rs` — `sql_bulk_insert` now uses `id INT PRIMARY KEY` (closes
+  the no-PK blind spot; Table 3.1 now exercises `enforce_unique`)
+- `docs/backlog/35_unique_constraint_full_scan.md` — status → SHIPPED
+- `docs/backlog/backlog_index.md` — row 35 → ✅ SHIPPED; row 36 → TOP PRIORITY
+- `docs/engine_access_guide.md` — `is_unique` limitation note updated to document
+  the implicit internal B-tree (not surfaced in `unidb_catalog.indexes`)
+- `README.md` — item 35 row in milestone table; D7 crash count updated (28 tests)
+
+### Gates
+
+| Gate | Result |
+|------|--------|
+| crash harness (`cargo test --test crash`) | ✅ **37/37** (36 prior + P35) |
+| `cargo test --workspace` | ✅ all green |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ✅ clean |
+| `cargo fmt --all --check` | ✅ clean |
+| `pk_insert_throughput_is_flat_not_degrading` | ✅ pass (chunk3/chunk1 > 0.5) |
+| `unique_insert_throughput_is_flat_not_degrading` | ✅ pass |
+| `pk_update_throughput_is_flat` | ✅ pass |
+| MVCC invariants (3 tests) | ✅ pass |
+| `null_distinctness_preserved_with_implicit_index` | ✅ pass |
+| `pk-unique-race` (conc_matrix, CONC_REPEATS=10) | ✅ **10/10 PASS** (toggle off + on) |
+
+**No FORMAT_VERSION bump.** `unique_index_root` is in catalog JSON (not binary storage format); `#[serde(default)]` makes pre-item-35 databases open cleanly. No §3 locked-decision change. Composite keys remain out of scope (forward-compatible key encoding ready for future extension).
+
+### Follow-up fix — concurrent-INSERT PK race (2026-07-14)
+
+**Root cause:** Two concurrent INSERT transactions racing the same PK/UNIQUE value could
+both pass `enforce_unique` (neither saw the other's uncommitted row under MVCC) and both
+commit — producing a visible duplicate. This is the class of bug item 16 exposed for
+plain row contention, now applied to uniqueness enforcement.
+
+**Fix:** `RecordKind::UniqueKey` phantom lock added to the lock manager. `exec_insert`
+acquires an exclusive `UniqueKey` lock (keyed by a stable hash of `table + col + value`)
+via `WaitPolicy::Wait` **before** calling `snapshot_for_statement`. The losing concurrent
+inserter blocks; when the winner commits and releases all locks, the waiter unblocks, takes
+a fresh snapshot that includes the committed row, and `enforce_unique` returns
+`UniqueViolation`. No duplicate is ever committed. Lock released automatically via
+`LockManager::release_all` at commit/abort.
+
+**New conc_matrix cell:** `pk-unique-race` — 6 writers race `INSERT` the same PK key per
+round (20 rounds per repeat). Asserts exactly 1 commits per round and no duplicate is
+visible in a subsequent `SELECT`. Run at `CONC_REPEATS=10`: **10/10 PASS** on both
+`toggle=off` and `toggle=on`. This closes the missing acceptance-criteria checkbox from
+the spec correction in PR #101.
+
+**Commit:** `e91f120` — pushed to branch `35-unique-index-enforcement` as part of PR #102.

@@ -48,7 +48,7 @@
 | 32 | `32_bulk_load_api.md` | Performance | ✅ SHIPPED 2026-07-14 — POST /tables/{name}/bulk NDJSON endpoint; **measured ~12k–31k rows/sec** (index-dependent; ~20–50× over ~640/sec per-row); below the 50k–200k target — follow-up filed. See PROGRESS.md |
 | 33 | `33_cdc_management_api.md` | Improvement | ✅ SHIPPED 2026-07-14 — `GET /tables/{name}/events` (CDC status), `DELETE /tables/{name}/events` (disable, idempotent), `GET /events/head` (current seq without streaming); P34 crash test; 6 integration tests |
 | 34 | `34_observability_api_gaps.md` | Improvement | ✅ SHIPPED 2026-07-14 — `UNIDB_SLOW_QUERY_MS` env var; `PUT /config/slow_query_threshold_ms`; `GET /stats/history` 300-point ring buffer with server-computed rate fields |
-| 35 | `35_unique_constraint_full_scan.md` | Improvement | ⏳ NOT STARTED — **critical**: `enforce_unique()` full heap-scans on every INSERT/UPDATE for any `PRIMARY KEY`/`UNIQUE` table; O(n²) bulk load. Measured >100× slower than a no-PK table at just 15k rows |
+| 35 | `35_unique_constraint_full_scan.md` | Improvement | ✅ SHIPPED 2026-07-14 — implicit unique-enforcement B-tree per PK/UNIQUE column at CREATE TABLE; `enforce_unique()` now does O(1) point lookup + MVCC re-check; PK INSERT flat (was O(n²)); P35 crash test; 6 regression tests; ~23-26× faster at 15k rows. See PROGRESS.md |
 | 36 | `36_foreign_key_row_enforcement.md` | Improvement | ⏳ NOT STARTED — FK enforces referenced-*table* existence only, not row-level referential integrity (dangling child refs accepted; no RESTRICT/CASCADE). Documented M11-deferred scope; **depends on item 35** (reuses the parent PK index — cheap after 35, O(n²) before) |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
@@ -61,22 +61,15 @@ Ordered by my current ROI read; reorder as priorities change. Create each
 candidate's `NN_<slug>.md` when started — until then each is *filed inside* an
 existing doc.
 
-**#35 — Unique-constraint full heap scan (`35_unique_constraint_full_scan.md`,
-NOT STARTED) — TOP PRIORITY.** `enforce_unique()` (`src/sql/executor.rs:2145`)
-enforces every `PRIMARY KEY`/`UNIQUE` constraint by scanning and decoding
-**every row already in the table**, once per INSERT/UPDATE — `PRIMARY KEY` has
-no backing index in this engine. O(n²) bulk load. Found via a `unidb-studio`
-demo run (`seed.py` seeding `customers`, `id INTEGER PRIMARY KEY`) and confirmed
-in-engine: identical schema minus the PK stays flat at ~115k rows/s through
-15,000 rows; **with** the PK it degrades 4,955 → 1,685 → 1,013 rows/s
-(**>100× slower**, still falling). Affects INSERT unconditionally and UPDATE
-whenever any unique constraint exists (the existing `has_unique` gate only
-helps when there is *no* constraint). Hits nearly every real schema, not a
-niche path — see the spec for the root-cause chain and open fix-design
-questions.
+**#35 — Unique-constraint full heap scan — ✅ SHIPPED 2026-07-14.** Implicit
+unique-enforcement B-tree per PK/UNIQUE column at CREATE TABLE; O(1) point
+lookup + MVCC re-check in `enforce_unique()`; PK INSERT now flat at ~27-30k
+rows/s (was O(n²): 5k→1k/s degrading). P35 crash test; 6 regression tests;
+`unique_index_root` in `ColumnDef` with `#[serde(default)]` (no FORMAT_VERSION
+bump). See PROGRESS.md.
 
 **#36 — Foreign keys enforce table existence only, not row-level integrity
-(`36_foreign_key_row_enforcement.md`, NOT STARTED) — do AFTER #35.**
+(`36_foreign_key_row_enforcement.md`, NOT STARTED) — TOP PRIORITY (unblocked by #35).**
 `enforce_referenced_tables_exist()` (`src/sql/executor.rs:2090`, the sole
 `ForeignKeyViolation` site at `:2093`) checks only that the referenced *table*
 exists — a child row referencing a non-existent parent key is accepted, and
