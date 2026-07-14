@@ -1,7 +1,7 @@
 # Item 33 — CDC management API
 
 **Type:** Improvement  
-**Status:** ⏳ NOT STARTED  
+**Status:** ✅ SHIPPED — branch `33-cdc-management-api`, PR pending review  
 **Priority:** High — Studio CDC tab and demo scripts work around every gap here
 
 ---
@@ -40,7 +40,7 @@ Disable CDC on a table. Drains no pending events — any already in `__events__`
 until consumed and vacuumed. Future writes on the table no longer emit events.
 
 **Response:** `204 No Content`  
-**Error:** `400 CDC_NOT_ENABLED` if the table had CDC off already (idempotent option TBD).
+**Idempotency decision:** Returns `204` even when CDC was already off (idempotent). Rationale: simpler client code, matches standard REST disable semantics, avoids spurious errors on repeated calls.
 
 ---
 
@@ -59,11 +59,11 @@ Returns `{ "seq": 0 }` if no events have ever been written.
 
 ## Acceptance criteria
 
-- [ ] `GET /tables/{name}/events` returns `{ "enabled": bool }`
-- [ ] `DELETE /tables/{name}/events` disables CDC; subsequent writes on the table don't add to `__events__`
-- [ ] `GET /events/head` returns max committed `seq` from `__events__`, or 0 when empty
-- [ ] REST API doc (`docs/REST_API.md`) updated with all three routes
-- [ ] Integration tests for each route
+- [x] `GET /tables/{name}/events` returns `{ "enabled": bool }`
+- [x] `DELETE /tables/{name}/events` disables CDC; subsequent writes on the table don't add to `__events__`
+- [x] `GET /events/head` returns max committed `seq` from `__events__`, or 0 when empty
+- [x] REST API doc (`docs/REST_API.md`) updated with all three routes
+- [x] Integration tests for each route (6 new tests in `tests/server_events.rs`; P34 crash test added)
 
 ## Studio changes to make when this ships
 

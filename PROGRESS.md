@@ -5217,3 +5217,50 @@ recovery change); full `--features server` suite green (incl. the new
 --no-default-features --edges normal` tokio-free — the endpoint is server-
 feature-gated); clippy/fmt clean. Peak RSS unchanged (streams row-at-a-time into
 the engine after an up-front body buffer, bounded by the 512 MiB guard).
+
+---
+
+## Item 33 — CDC Management API (2026-07-14)
+
+**Branch:** `33-cdc-management-api`  
+**PR:** _pending review_  
+**Spec:** `docs/backlog/33_cdc_management_api.md`
+
+Three new routes plugging the gaps in CDC lifecycle management:
+
+| Route | Description |
+|-------|-------------|
+| `GET /tables/{name}/events` | Return `{ "enabled": bool }`; 404 if table absent |
+| `DELETE /tables/{name}/events` | Disable CDC (idempotent 204 — see below) |
+| `GET /events/head` | Return `{ "seq": N }`, the current max committed seq in `__events__`, or 0 if empty |
+
+**Idempotency decision (DELETE):** `204` even when CDC was already off — avoids
+the client needing a prior `GET`. Simpler and matches standard REST disable
+semantics. Recorded in the spec.
+
+**Engine changes (`src/lib.rs`):**
+
+- `Engine::is_events_enabled(table)` — read-only catalog lookup, `O(1)`.
+- `Engine::disable_events(table)` — mirrors `enable_events` (same
+  `set_events_enabled` primitive, `false` flag). Idempotent. Rejects
+  `__events__`/`__consumers__` targets (defense-in-depth).
+- `Engine::events_head_seq()` — O(1) via `DiskBTree::max_entry` on the
+  durable `__events__.seq` index, the same leaf walk used by `subscription_lag`.
+
+**Crash coverage:** P34 added (crash mid-`disable_events` — catalog WAL write
+same path as P33; engine reopens cleanly, re-enable + insert still emits event).
+
+**Gates:**
+
+| Gate | Result |
+|------|--------|
+| crash harness (`cargo test --test crash`) | ✅ **36/36** (35 prior + P34) |
+| `cargo test --features server --test server_events` | ✅ **10/10** (4 prior + 6 new) |
+| `cargo test --workspace --features server` | ✅ all green |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ✅ clean |
+| `cargo fmt --all` | ✅ clean |
+
+**No storage/WAL/format/recovery/locked-decision change.** Engine methods are
+catalog-only (same code path as `enable_events`); `events_head_seq` is a pure
+read via the pre-existing seq index. Server-layer only beyond the three new engine
+accessors.

@@ -229,6 +229,18 @@ impl EngineHandle {
         self.on_engine(move |e| e.enable_events(&table)).await
     }
 
+    pub async fn is_events_enabled(&self, table: String) -> Result<bool> {
+        self.on_engine(move |e| e.is_events_enabled(&table)).await
+    }
+
+    pub async fn disable_events(&self, table: String) -> Result<()> {
+        self.on_engine(move |e| e.disable_events(&table)).await
+    }
+
+    pub async fn events_head_seq(&self) -> Result<i64> {
+        self.on_engine(|e| e.events_head_seq()).await
+    }
+
     pub async fn poll_events(
         &self,
         xid: Xid,

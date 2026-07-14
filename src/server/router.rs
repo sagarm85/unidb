@@ -66,11 +66,17 @@ pub fn build_router(
         // Generic data-loading primitive consistent with the Milestone-18 boundary:
         // operates on any user table, like Postgres COPY or /rows/batch.
         .route("/tables/{table}/bulk", post(bulk::post_tables_bulk))
-        .route("/tables/{table}/events", post(handlers::post_enable_events))
+        .route(
+            "/tables/{table}/events",
+            post(handlers::post_enable_events)
+                .get(handlers::get_table_events_status)
+                .delete(handlers::delete_table_events),
+        )
         .route(
             "/tables/{table}/rls",
             axum::routing::put(handlers::put_table_rls),
         )
+        .route("/events/head", get(handlers::get_events_head))
         .route("/events/subscribe", get(sse::get_events_subscribe))
         .route("/events/ack", post(handlers::post_events_ack))
         .route("/events/vacuum", post(handlers::post_events_vacuum))

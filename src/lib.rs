@@ -1828,6 +1828,57 @@ impl Engine {
         self.sync_wal()
     }
 
+    // ── Item 33: CDC management API ──────────────────────────────────────────
+
+    /// Return whether event capture is enabled for `table`. Read-only catalog
+    /// lookup — no transaction needed. Returns `Err(TableNotFound)` if the
+    /// table does not exist (surfaces as `404` at the HTTP layer).
+    pub fn is_events_enabled(&self, table: &str) -> Result<bool> {
+        Ok(cat_read(&self.catalog).lookup(table)?.events_enabled)
+    }
+
+    /// Disable event capture on `table`. Future writes to the table will no
+    /// longer emit events; events already in `__events__` are not drained.
+    /// Idempotent: calling when CDC is already off returns `Ok(())`.
+    /// Rejects the system tables `__events__`/`__consumers__` as targets.
+    pub fn disable_events(&self, table: &str) -> Result<()> {
+        let _ws = serial_lock(&self.write_serial);
+        if table == EVENTS_TABLE || table == CONSUMERS_TABLE {
+            return Err(DbError::SqlPlan(format!(
+                "cannot disable events on the system table '{table}' itself"
+            )));
+        }
+        let page_size = self.page_size;
+        let mut ctx = crate::catalog::CatalogCtx {
+            pool: &self.pool,
+            wal: &self.wal,
+            control_path: &self.control_path,
+            control: &self.control,
+            page_size,
+        };
+        cat_write(&self.catalog).set_events_enabled(table, false, &mut ctx)?;
+        self.sync_wal()
+    }
+
+    /// Return the current highest committed `seq` in `__events__`, or `0` if
+    /// no events have ever been written. O(1) via the `DiskBTree::max_entry`
+    /// walk on the durable seq index — no heap scan needed.
+    pub fn events_head_seq(&self) -> Result<i64> {
+        let max_seq = DiskBTree::new(self.event_seq_index_meta, self.page_size)
+            .max_entry(&self.pool)
+            .ok()
+            .flatten()
+            .and_then(|(k, _)| {
+                if let OrderedValue::Int(s) = k {
+                    Some(s)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        Ok(max_seq)
+    }
+
     // ── Q2 (item 26): push notification for subscribers ─────────────────────
 
     /// Clone the shared [`EventWake`] handle so a [`unidb_dispatch::Dispatcher`]

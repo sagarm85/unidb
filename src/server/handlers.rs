@@ -715,6 +715,49 @@ pub async fn post_enable_events(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Query CDC status for a table (item 33). Returns `{ "enabled": bool }`.
+/// `404 TABLE_NOT_FOUND` if the table does not exist.
+pub async fn get_table_events_status(
+    State(state): State<AppState>,
+    Path(table): Path<String>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    let enabled = state
+        .engine
+        .is_events_enabled(table)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "enabled": enabled })))
+}
+
+/// Disable CDC on a table (item 33). Idempotent — returns `204` even when
+/// CDC was already off. Already-captured events remain in `__events__` until
+/// consumed and vacuumed; only future writes stop emitting.
+pub async fn delete_table_events(
+    State(state): State<AppState>,
+    Path(table): Path<String>,
+) -> std::result::Result<StatusCode, ApiError> {
+    state
+        .engine
+        .disable_events(table)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Return the current highest committed `seq` in `__events__` (item 33).
+/// Returns `{ "seq": 0 }` if no events have ever been written.
+/// Useful for "start from now" positioning without opening an SSE stream.
+pub async fn get_events_head(
+    State(state): State<AppState>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    let seq = state
+        .engine
+        .events_head_seq()
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "seq": seq })))
+}
+
 pub async fn post_events_ack(
     State(state): State<AppState>,
     Json(body): Json<AckEventsRequest>,
