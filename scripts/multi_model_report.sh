@@ -20,6 +20,17 @@
 #   MM_REPLACED_STACK=1  Table 4 adds the §6 replaced-stack column (row + pgvector
 #               + graph + queue, four independent commits) + crash-consistency
 #               verdict. Needs a pgvector-enabled Postgres (CREATE EXTENSION vector).
+#   MM_FK_ORDERS  order count for Table 5's PK/FK relational-integrity stress
+#               (default 20000) — a customers/orders schema with a real
+#               REFERENCES constraint, row-level-enforced on both engines.
+#   UNIDB_BUFFER_POOL_PAGES  frames for every unidb engine THIS BENCH opens
+#               (default 2,000,000 -- set internally by bench_engine_open() in
+#               decompose.rs, not the library's own smaller default). Only
+#               raise this further for sweeps well beyond the default sizes
+#               below; the built-in default already covers them with
+#               headroom (item 42 -- without it, large MM_SIZES/MM_BULK_SIZES
+#               points silently hit BufferPoolFull and understate unidb's
+#               real throughput, not a correctness issue but a misleading one).
 #
 # NOTE: W2–W4 build the vector (HNSW) and graph indexes synchronously, so large
 # MM_SIZES are slow by design — that cost is the whole point of the measurement.
