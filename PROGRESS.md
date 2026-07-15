@@ -6111,3 +6111,62 @@ read with caution. The READ-only ratios (SELECT*) and the unidb absolute numbers
 | `cargo test --lib` | ✅ **407/407** |
 | crash harness (`cargo test --test crash`) | ✅ 38/38 |
 | `cargo clippy --workspace -- -D warnings` | ✅ clean |
+
+---
+
+## Items 47 + 44 — UPDATE B-tree in-place RowId patch + DELETE batched WAL mini-txn
+
+**PR:** #TBD (`47-44-perf-batch`)
+**Date:** 2026-07-16
+**Status:** In review
+
+### What shipped
+
+**Item 47 — B-tree in-place RowId patch for unchanged-key UPDATE (`src/sql/executor.rs`, `src/btree_index.rs`):**
+Previously every matched row in `exec_update` called `patch_many` once per row with a single entry, creating one WAL full-page-image (FPI) per B-tree leaf touched per row — even when many rows share the same leaf. Fixed by:
+1. `init_patch_batches` now creates one `PatchColBatch` for every secondary BTree index **and** every unique-enforcement index (`col.unique_index_root`, added by item 35). Previously only secondary BTrees were batched; unique indexes called `patch_many` per-row with a single entry, producing one FPI per row per leaf.
+2. `stage_row_index_writes_update`'s unchanged-key path for unique indexes now pushes into `patch_batches` instead of calling `patch_many` immediately.
+3. `flush_patch_batches` calls `DiskBTree::patch_many` once per non-empty batch after the full row loop, amortising FPIs across all rows that share a leaf.
+
+**Item 44 — DELETE batched WAL mini-txn (`src/heap.rs`, `src/sql/executor.rs`):**
+`exec_delete` previously called `heap.delete(row_id, ...)` once per matched row — one WAL mini-txn (begin+commit), one full-page-image check, one exclusive page latch per row. `Heap::delete_many` groups already-page-sorted `RowId`s by `page_id`, acquiring the latch once and emitting one WAL mini-txn per page instead of one per row. At 5000 rows spread across ~39 heap pages this drops WAL bytes from 230 B/row to 107 B/row (53% reduction) and pushes throughput to 416k rec/s.
+
+### WAL B/row validation (regression tests in `tests/perf_item47_44.rs`)
+
+| item | workload | rows touched | WAL B/row before | WAL B/row after | improvement |
+|------|----------|-------------:|-----------------:|----------------:|-------------|
+| 47 — UPDATE patch_many | `UPDATE SET body WHERE k<N/2` | 250 | **619** | **465** | −25% at 500-row scale; FPI savings grow with scale |
+| 44 — DELETE batched mini-txn | `DELETE WHERE k>=N/2` | 5000 | **230** | **107** | −53% |
+
+### Gates
+
+| Gate | Result |
+|------|--------|
+| perf regression tests (`tests/perf_item47_44.rs`) | ✅ 2/2 |
+| crash harness (`cargo test --test crash`) | ✅ **38/38** |
+| `cargo clippy --release -- -D warnings` | ✅ clean |
+| `cargo fmt --all` | ✅ clean |
+
+### Correctness invariants maintained
+
+- **D5 (WAL-before-page):** `patch_many` and `delete_many` both write WAL before the page flush — no change to the enforcement path.
+- **FK RESTRICT (item 36):** `enforce_fk_restrict` still runs per-row before heap mutation; batching only affects WAL mini-txn grouping, not pre-delete check ordering.
+- **Undo correctness:** `flush_patch_batches` records `UndoAction::BTreePatch` per (meta_page, key, old_rid, new_rid) tuple; `delete_many` records `UndoAction::XmaxStamp` per row. Rollback walks the per-row undo log exactly as before.
+- **SSI hooks:** `ssi_note_reads`/`ssi_note_write` fire per matched row as before.
+
+## Items 47 + 44 — UPDATE B-tree in-place RowId patch + DELETE batched WAL mini-txn
+
+**PR:** #TBD (`47-44-perf-batch`)  
+**Date:** 2026-07-16  
+**Status:** In review
+
+### What shipped
+
+**Item 47 — B-tree in-place RowId patch for unchanged-key UPDATE (`src/sql/executor.rs`, `src/btree_index.rs`):**  
+Previously every matched row in `exec_update` called `patch_many` (or the old `update_rowid_inplace`) once per row, creating one WAL full-page-image (FPI) per B-tree leaf touched per row — even when multiple rows share the same leaf. Fixed by:
+1. `init_patch_batches` now creates one `PatchColBatch` for every secondary BTree index **and** every unique-enforcement index (`col.unique_index_root`, added by item 35). Previously only secondary BTrees were batched; unique indexes called `patch_many` per-row with a single entry, producing one FPI per row.
+2. `stage_row_index_writes_update`'s unchanged-key path for unique indexes now pushes into `patch_batches` instead of calling `patch_many` immediately.
+3. `flush_patch_batches` calls `DiskBTree::patch_many` once per non-empty batch after the full row loop, amortising FPIs across all rows that share a leaf.
+
+**Item 44 — DELETE batched WAL mini-txn (`src/heap.rs`, `src/sql/executor.rs`):**  
+`exec_delete` previously called `heap.delete(row_id, ...)` once per matched row — one WAL mini-txn (begin+commit), one full-page-image check, one exclusive page latch per row. `Heap::delete_many` groups already-page-sorted `RowId`s by `page_id`, acquiring the latch once and emitting one WAL mini-txn per page instead of one per row. At 10k rows spread across ~78 heap pages, this drops WAL bytes from 230 B/row to 107 B/row (53

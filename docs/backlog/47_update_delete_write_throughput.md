@@ -1,7 +1,7 @@
 # UPDATE/DELETE write throughput: per-row WAL overhead, MVCC insert-new-version cost, and unchanged-index maintenance
 
 **Type:** Performance
-**Status:** NOT STARTED
+**Status:** SHIPPED — Phase A (in-place RowId patch for unchanged-key UPDATE) landed in PR #TBD (`47-44-perf-batch`, 2026-07-16). WAL B/row: 619 → 465 (−25% at 500-row scale; FPI savings grow with row count). See `PROGRESS.md` "Items 47 + 44" entry for full metrics. Phase B (vectorised predicate scan) and Phase C (HOT-equivalent chain) remain open follow-on items.
 **Priority:** High — UPDATE bulk at 0.17× PG (+481%), DELETE selected at 0.17× PG (+497%) are the largest remaining gaps. Root cause is structural: every matched row = one WAL mini-txn with full-page-image check + one B-tree update per indexed column. Item 44 addresses the batched-WAL angle for DELETE; this item addresses the scan and index-maintenance overhead that affects both UPDATE and DELETE.
 
 ---

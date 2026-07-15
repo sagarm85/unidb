@@ -621,9 +621,20 @@ impl TransactionManager {
                 // Reverse an in-place B-tree RowId patch: restore old_rid
                 // where new_rid currently sits so the index points back to
                 // the heap version that the XmaxStamp undo restores.
-                UndoAction::BTreePatch { meta_page, page_size, key, old_rid, new_rid } => {
-                    DiskBTree::new(*meta_page, *page_size)
-                        .update_rowid_inplace(key.clone(), *new_rid, *old_rid, pool, wal)?;
+                UndoAction::BTreePatch {
+                    meta_page,
+                    page_size,
+                    key,
+                    old_rid,
+                    new_rid,
+                } => {
+                    DiskBTree::new(*meta_page, *page_size).update_rowid_inplace(
+                        key.clone(),
+                        *new_rid,
+                        *old_rid,
+                        pool,
+                        wal,
+                    )?;
                 }
             }
         }

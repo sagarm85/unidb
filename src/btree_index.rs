@@ -827,7 +827,15 @@ impl DiskBTree {
                 }
             }
             if modified {
-                prev_lsn = write_node(pool, wal, txn_id, prev_lsn, pid, &Node::Leaf { entries, next }, self.page_size)?;
+                prev_lsn = write_node(
+                    pool,
+                    wal,
+                    txn_id,
+                    prev_lsn,
+                    pid,
+                    &Node::Leaf { entries, next },
+                    self.page_size,
+                )?;
                 break;
             }
             if next == INVALID_PAGE_ID {

@@ -489,7 +489,9 @@ impl Heap {
                 if th.xmax != 0 {
                     pool.unpin(page_id);
                     wal.abort_mini_txn(txn_id, begin_lsn)?;
-                    return Err(DbError::WriteConflict { holder_xid: th.xmax });
+                    return Err(DbError::WriteConflict {
+                        holder_xid: th.xmax,
+                    });
                 }
             }
 

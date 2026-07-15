@@ -850,11 +850,24 @@ fn init_patch_batches(table_def: &TableDef) -> Vec<PatchColBatch> {
         if col.dropped {
             continue;
         }
-        let Some(meta_page) = col.index_root else {
-            continue;
-        };
-        if matches!(col.index, Some(IndexKind::BTree)) {
-            out.push(PatchColBatch { col_idx, meta_page, patches: Vec::new() });
+        // Secondary BTree index.
+        if let Some(meta_page) = col.index_root {
+            if matches!(col.index, Some(IndexKind::BTree)) {
+                out.push(PatchColBatch {
+                    col_idx,
+                    meta_page,
+                    patches: Vec::new(),
+                });
+            }
+        }
+        // Unique-enforcement index — must also be batched, otherwise each row
+        // calls patch_many with a single entry (one FPI per row = no savings).
+        if let Some(meta_page) = col.unique_index_root {
+            out.push(PatchColBatch {
+                col_idx,
+                meta_page,
+                patches: Vec::new(),
+            });
         }
     }
     out
@@ -872,6 +885,7 @@ fn init_patch_batches(table_def: &TableDef) -> Vec<PatchColBatch> {
 ///
 /// Changed-key, FullText, and HNSW columns fall through to the standard
 /// insert/coalesce path (existing behaviour).
+#[allow(clippy::too_many_arguments)]
 fn stage_row_index_writes_update(
     table_def: &TableDef,
     old_row_id: RowId,
@@ -895,7 +909,10 @@ fn stage_row_index_writes_update(
         } else if old_val == new_val {
             if let Ok(key) = OrderedValue::try_from(new_val) {
                 // Find the corresponding patch batch by meta_page.
-                if let Some(pb) = patch_batches.iter_mut().find(|p| p.meta_page == ib.meta_page) {
+                if let Some(pb) = patch_batches
+                    .iter_mut()
+                    .find(|p| p.meta_page == ib.meta_page)
+                {
                     pb.patches.push((key, old_row_id, new_row_id));
                 }
             }
@@ -920,24 +937,12 @@ fn stage_row_index_writes_update(
         if let Some(uiq_meta) = col.unique_index_root {
             if before_row[idx] == new_row[idx] {
                 if let Ok(key) = OrderedValue::try_from(&new_row[idx]) {
-                    // Unique index for unchanged key: also patch in-place (batched).
-                    // Use a temporary single-entry call since unique indexes are not
-                    // in patch_batches (they are per-column, not per-index-kind).
-                    DiskBTree::new(uiq_meta, ctx.page_size).patch_many(
-                        &[(key.clone(), old_row_id, new_row_id)],
-                        ctx.pool,
-                        ctx.wal,
-                    )?;
-                    ctx.txn_mgr.record_undo(
-                        ctx.xid,
-                        crate::txn::UndoAction::BTreePatch {
-                            meta_page: uiq_meta,
-                            page_size: ctx.page_size,
-                            key,
-                            old_rid: old_row_id,
-                            new_rid: new_row_id,
-                        },
-                    )?;
+                    // Unique index, unchanged key: accumulate into patch_batches
+                    // (added by init_patch_batches). flush_patch_batches then calls
+                    // patch_many once per leaf, not once per row.
+                    if let Some(pb) = patch_batches.iter_mut().find(|p| p.meta_page == uiq_meta) {
+                        pb.patches.push((key, old_row_id, new_row_id));
+                    }
                 }
             } else if let Ok(value) = OrderedValue::try_from(&new_row[idx]) {
                 DiskBTree::new(uiq_meta, ctx.page_size)
