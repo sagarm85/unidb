@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `44_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `45_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -58,10 +58,11 @@
 | 41 | `41_near_vec_distance.md` | Improvement | ✅ SHIPPED 2026-07-14 — `exec_select_near` threads its already-computed re-rank distance through to projection as a virtual `vec_distance` column (`Literal::Float`, ascending); no catalog/format change. See PROGRESS.md. |
 | 42 | `42_bench_harness_buffer_pool.md` | Improvement | ✅ SHIPPED — `benches/decompose.rs` never sized its buffer pool, so any report sweeping into 1M+ rows silently hit `BufferPoolFull` and understated unidb's real throughput (measured 1,228 rec/s vs the true 15,905 rec/s at 1M rows, ~13× recovered). New `bench_engine_open()` helper opens every bench engine with a 2,000,000-frame pool. See PROGRESS.md |
 | 43 | `43_a3_gate_size_aware_selectivity.md` | Improvement | ⏳ NOT STARTED — unidb's scan-vs-index gate (`INDEX_RANGE_SELECTIVITY_MAX = 0.3`, `src/sql/executor.rs`) is a fixed selectivity threshold with no table-size term, unlike Postgres's real cost model. Found comparing two multi-model reports at different scales: same 50%-selective query, Postgres switches Seq Scan (2k rows) -> Index Scan (40k rows); unidb always takes the scan, regardless of size. Needs a size-aware fix, not a bigger constant (the current 0.3 already fixes a prior regression). |
+| 44 | `44_bulk_delete_batched_wal.md` | Performance | ⏳ NOT STARTED — unconditional/bulk `DELETE` pays one WAL mini-transaction per row (`Heap::delete`, `src/heap.rs:399`, self-contained `begin_mini_txn`/`commit_mini_txn` per call, looped once per matched row in `exec_delete`) — the same shape item 40 already fixed for `CREATE INDEX`. Measured `DELETE FROM t` (no predicate) at postgres +275%, `DELETE selected` at +409% (20k rows). `matching_rows` already sorts candidates into physical page order (B5) — the natural fix is a page-batched delete path reusing that ordering, one mini-txn per page instead of per row. |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `44_…`.**
+**Next new file → `45_…`.**
 
 ## Next up (candidates — pick one, then create `NN_<slug>.md`)
 
@@ -96,6 +97,20 @@ does. Not a quick constant bump: the current 0.3 already fixes a prior
 regression (forcing the index path regressed a 50%-selective DELETE) —
 needs a real size-aware cost model, re-derived and measured across a size
 sweep, not a single new fixed number.
+
+**#44 — Bulk DELETE pays one WAL mini-transaction per row
+(`44_bulk_delete_batched_wal.md`, NOT STARTED).** `Heap::delete`
+(`src/heap.rs:399`) is a self-contained mini-transaction per call
+(`begin_mini_txn`/`commit_mini_txn`, its own exclusive page latch, its own
+full-page-image check); `exec_delete` calls it once per matched row. A
+DELETE touching N rows performs N separate WAL mini-transactions — the exact
+same shape item 40 already fixed for `CREATE INDEX`. Measured: `DELETE FROM
+t` (no predicate) at postgres +275%, `DELETE selected (k>=N)` at +409%
+(20k rows, `multi_model_report_20260715_092725.md`). Distinct root cause from
+#43 (no predicate means no scan-vs-index decision at all) — the fix is
+batching deletes by page, reusing `matching_rows`'s existing physical-order
+sort (B5), following item 40's precedent (N mini-txns -> num_pages
+mini-txns).
 
 **#37 — Buffer pool frame table: lazy/growable allocation
 (`37_lazy_buffer_pool_growth.md`, NOT STARTED).** `BufferPool::open`
