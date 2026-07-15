@@ -15,15 +15,14 @@
 - **A3 gate size-aware selectivity (item 43) — SHIPPED 2026-07-15, branch
   `43-a3-gate-size-aware`, PR #115 (DO NOT MERGE without independent bench
   validation run).**
-  Three changes: (1) `page_count` in `TableStats` populated by ANALYZE; (2)
+  Four changes: (1) `page_count` in `TableStats` populated by ANALYZE; (2)
   size-aware cost model in `index_lookup_is_selective`; (3)
   `find_best_indexable_btree_predicate` picks the most selective AND arm; (4)
-  gate added to `exec_select`. Crossover at ~2600 rows for 50% selectivity.
-  3 new permanent tests in `tests/a3_gate.rs`. 435/435 tests, 38/38 crash.
-  Bench: 1.78M rec/s (after preceding 20k per-row fsyncs affect mmap state);
-  isolation probe: 4.02M rec/s with 18 workers (parallel_resolve_candidates
-  fires, 0 serial fallbacks). Remaining gap vs PG (4M vs 6.4M, 1.6×) is
-  per-row Vec<Literal>/String allocation + thread-spawn cost per query.
+  gate added to `exec_select`. Follow-up fix: `parallel: bool` param added —
+  `exec_select` passes `true` (parallel path, const=0.012), `matching_rows`
+  passes `false` (serial path, const=0.05). This keeps 50%-selective DELETE on
+  the scan path at ALL table sizes. 5 permanent tests in `tests/a3_gate.rs`.
+  38/38 crash harness. Full bench re-run needed before merge.
 - **Bench harness buffer-pool fix (item 42) + PK/FK relational-integrity
   stress bench (item 39) — SHIPPED 2026-07-15, branch
   `39-pk-fk-relational-stress-bench`, PR #111.**

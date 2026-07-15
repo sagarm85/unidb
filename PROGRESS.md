@@ -5994,10 +5994,16 @@ Large scale (MM_CRUD_ROWS=20 000, total 40 000 rows — **above crossover**, ind
 | operation | records | unidb (rec/s) | postgres (rec/s) | unidb ÷ PG |
 |---|---:|---:|---:|---:|
 | SELECT filtered (k<N) | 20 000 | 1 781 565 | 6 378 483 | 0.28× |
-| DELETE selected (k≥N) | 20 000 | 229 307 | 1 732 652 | 0.13× |
+| DELETE selected (k≥N) | 20 000 | *(re-run needed)* | 1 732 652 | — |
 
-**Honest gap analysis:** at large scale unidb's single-threaded B-tree + heap.get()
-loop is outrun by Postgres's parallel index scan.  The fix narrows the
+_DELETE selected number above (229 307) was measured before the serial-cost fix
+(item 43 follow-up: `parallel=false` branch, `HEAP_FETCH_SEQ_EQUIV_SERIAL=0.05`)
+and reflected the gate wrongly routing 50%-selective DELETE through the index path.
+After the fix, DELETE stays on the scan path at 50% selectivity, which restores
+the old throughput (~272 k vs 229 k); an independent re-run is needed to confirm._
+
+**Honest gap analysis:** at large scale unidb's B-tree candidate scan + parallel
+heap fetch is outrun by Postgres's parallel index scan.  The fix narrows the
 large-scale SELECT gap from PG +341% (old, non-selective B-tree fetching all rows)
 to PG +258% (new, selective B-tree fetching only matched rows) — a real
 improvement but not a win.
