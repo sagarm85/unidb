@@ -38,6 +38,11 @@ use crate::sql::logical::Literal;
 // the field-revert net.
 static ENABLED: AtomicBool = AtomicBool::new(true);
 static MIN_PAGES: AtomicUsize = AtomicUsize::new(64);
+
+/// Item 45: minimum candidate count before candidate-resolution parallelises.
+/// Below this threshold the thread-spawn cost (18 threads for a 20 k-row scan)
+/// exceeds the work saved, so callers fall straight through to the serial path.
+pub const PARALLEL_CANDIDATE_MIN: usize = 64;
 static MAX_WORKERS: AtomicUsize = AtomicUsize::new(0); // per-query cap; 0 → cores
 /// The **global** worker budget (the whole point of governance): the total number
 /// of parallel-scan worker threads that may be live across *all* queries at once.
@@ -303,6 +308,16 @@ pub fn parallel_resolve_candidates<F>(
 where
     F: Fn(RowId, &[u8]) -> Result<Option<Vec<Literal>>> + Sync,
 {
+    // Item 45: thread-spawn overhead outweighs the benefit for tiny lists.
+    // The acquire() gate already filters on MIN_PAGES (64), but make this
+    // explicit at the call site as a named invariant.
+    debug_assert!(
+        candidates.len() >= PARALLEL_CANDIDATE_MIN,
+        "parallel_resolve_candidates called with too-small candidate list ({} < {})",
+        candidates.len(),
+        PARALLEL_CANDIDATE_MIN
+    );
+
     let cursor = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
     let err: Mutex<Option<DbError>> = Mutex::new(None);

@@ -1,7 +1,7 @@
 # DELETE all / TRUNCATE fast path: O(1) full-table wipe instead of per-row xmax loop
 
 **Type:** Performance
-**Status:** NOT STARTED
+**Status:** SHIPPED — PR #117 (2026-07-15); see `PROGRESS.md` for bench numbers
 **Priority:** Medium — `DELETE FROM t` (no predicate) at 0.23× PG (+331%) is entirely avoidable. The operation's semantics allow a single WAL record + heap reset, but exec_delete currently loops per row.
 
 ---

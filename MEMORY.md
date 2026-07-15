@@ -3314,6 +3314,34 @@ plain reporting.
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-07-15 — Items 46 + 48: GROUP BY decode pushdown + DELETE all O(1) fast path (PR #117)
+
+- **Item 46**: Extended B2 partial-column decode to the aggregate path in
+  `src/sql/query_exec.rs`. `SELECT COUNT(*) GROUP BY g` now calls `deform_row`
+  with a 1-column mask instead of `decode_row` (all columns). Confirmed:
+  cols/row 4.00 → 1.00; unidb SELECT grouped: 4,947,561 → 6,611,524 rec/s (+34%).
+- **Item 48**: `exec_delete` with `predicate = None`, no FK children, no CDC
+  routes through `catalog.exclusive()?.truncate()` (O(pages)) instead of
+  xmax-stamping N rows. WAL B/row: 196 → 1. unidb DELETE all: 303,892 →
+  28,160,725 rec/s (92.7×). Now 7.35× faster than PG (was 0.23×, losing).
+- **Bug found and fixed**: `stmt_uses_shared_catalog` returned `true` for
+  no-predicate DELETE (shared DML lock), but the fast path calls
+  `catalog.exclusive()?.truncate()` (needs exclusive lock) → panic at runtime.
+  Fix: split Delete arm — `predicate: None` always takes exclusive path.
+  Confirmed: 407/407 lib tests pass.
+- **Item 45** (small-candidate guard): `MIN_PAGES=64` guard already existed as
+  `PARALLEL_CANDIDATE_MIN` in `parallel_scan.rs`. Named/documented in the
+  backlog; no code change needed.
+- Bench Postgres caveat: new `pg-bench` Docker container runs without
+  `wal_sync_method=fsync_writethrough`. PG write-op ratios (INSERT, UPDATE,
+  DELETE selected) are not comparable to prior matched-durability runs. Unidb
+  absolute numbers and read-op ratios are valid.
+- Branch: `48-46-45-perf-batch`, PR #117. Backlog items 46 and 48 flipped to
+  SHIPPED. PROGRESS.md updated with before/after table.
+- **Next**: items 47 (UPDATE skip unchanged-key B-tree re-insert, WAL B/row
+  618 → ~100) and 44 (per-page batched WAL for predicated DELETE) in a new
+  worktree from main after PR #117 merges.
+
 ### 2026-07-15 — Item 43: A3 gate size-aware selectivity (SHIPPED, PR pending)
 
 - Root-cause: `exec_select` had NO selectivity gate; it always called

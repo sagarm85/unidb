@@ -1165,9 +1165,10 @@ fn exec_truncate(table: &str, ctx: &mut ExecCtx) -> Result<ExecResult> {
     let table_def = ctx.catalog.lookup(table)?.clone();
     // Count the live rows removed (under this statement's snapshot) for the
     // result, before the page list is cleared.
+    // Item 48: use count_visible (header-only, no decode) instead of scan().len().
     let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
-    let count = heap.scan(&snapshot, ctx.xid, ctx.pool)?.len();
+    let count = heap.count_visible(&snapshot, ctx.xid, ctx.pool)?;
     let mut cctx = catalog_ctx!(ctx);
     ctx.catalog.exclusive()?.truncate(table, &mut cctx)?;
     Ok(ExecResult::Truncated { count })
@@ -1894,7 +1895,16 @@ fn try_exec_select_btree(
     // Parallelize resolution across worker threads when the candidate list is
     // large (Milestone P follow-up — the filtered-SELECT gap). Order is
     // unspecified (no `ORDER BY` here), so concat is correct.
-    if let Some(lease) = crate::sql::parallel_scan::acquire(candidate_ids.len()) {
+    // Item 45: also guard on PARALLEL_CANDIDATE_MIN — below this threshold the
+    // thread-spawn cost exceeds the work saved (e.g. 18 threads for a handful
+    // of index hits). `acquire()` already gates on MIN_PAGES (64) by default,
+    // but naming the threshold here keeps it self-documenting.
+    let maybe_lease = if candidate_ids.len() >= crate::sql::parallel_scan::PARALLEL_CANDIDATE_MIN {
+        crate::sql::parallel_scan::acquire(candidate_ids.len())
+    } else {
+        None
+    };
+    if let Some(lease) = maybe_lease {
         let rows = crate::sql::parallel_scan::parallel_resolve_candidates(
             &candidate_ids,
             &ctx.pool.shared_reader(),
@@ -2266,6 +2276,19 @@ fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Resu
     let table_def = ctx.catalog.lookup(table)?.clone();
     let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+
+    // Item 48: fast path for unconditional DELETE with no FK children and no CDC.
+    // Routes through the O(pages) truncate instead of xmax-stamping every row.
+    // CDC is skipped intentionally — TRUNCATE has never emitted per-row events.
+    if predicate.is_none()
+        && !table_has_fk_children(ctx.catalog.get(), table)
+        && !table_def.events_enabled
+    {
+        let count = heap.count_visible(&snapshot, ctx.xid, ctx.pool)?;
+        let mut cctx = catalog_ctx!(ctx);
+        ctx.catalog.exclusive()?.truncate(table, &mut cctx)?;
+        return Ok(ExecResult::Deleted { count });
+    }
 
     let matching = matching_rows(&heap, &snapshot, ctx, &table_def, predicate)?;
     // P1.d: the rows a DELETE selects are part of its read set (SSI).
@@ -5109,6 +5132,61 @@ mod tests {
             ExecResult::Rows { rows, .. } => assert_eq!(rows.len(), 9),
             o => panic!("{o:?}"),
         }
+    }
+
+    // ── Item 46: GROUP BY decode pushdown ────────────────────────────────────
+
+    /// Item 46: COUNT(*) GROUP BY single column should decode only that column,
+    /// not all columns. On a 4-column table scanning N rows, cols/row must be
+    /// 1.00 (only `g` decoded), not 4.00 (all columns decoded via decode_row).
+    #[test]
+    fn item46_group_by_decodes_only_group_key_columns() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        // 4 columns: id, k, g (group key), body (TEXT — the expensive column)
+        h.exec_as(xid, "CREATE TABLE t (id INT, k INT, g INT, body TEXT)")
+            .unwrap();
+        let n = 100u64;
+        for i in 0..n {
+            h.exec_as(
+                xid,
+                &format!(
+                    "INSERT INTO t (id, k, g, body) VALUES ({i}, {i}, {}, 'body-{i}')",
+                    i % 5
+                ),
+            )
+            .unwrap();
+        }
+        h.commit(xid);
+
+        // Snapshot the global counter before the GROUP BY query.
+        let cols_before = COLS_DECODED.load(std::sync::atomic::Ordering::Relaxed);
+
+        let xid2 = h.begin();
+        let r = h
+            .exec_as(xid2, "SELECT g, COUNT(*) FROM t GROUP BY g")
+            .unwrap();
+        h.commit(xid2);
+
+        let cols_after = COLS_DECODED.load(std::sync::atomic::Ordering::Relaxed);
+        let cols_used = (cols_after - cols_before) as f64;
+        let cols_per_row = cols_used / n as f64;
+
+        // Verify correctness: 5 groups (g=0..4), 20 rows each.
+        match r {
+            ExecResult::Rows { rows, .. } => assert_eq!(rows.len(), 5, "5 distinct g values"),
+            o => panic!("unexpected result: {o:?}"),
+        }
+
+        // Verify decode efficiency: item 46 fast path decodes only g (1 col/row).
+        // Without the fast path this would be 4.00 (all columns via decode_row).
+        assert!(
+            cols_per_row < 1.5,
+            "cols/row = {cols_per_row:.2} — expected ≈1.00 (only g decoded); \
+             got {cols_used} total cols for {n} rows. \
+             The item 46 GROUP BY decode-pushdown fast path may not have fired."
+        );
     }
 
     // ── P2.d: SERIAL / sequences ─────────────────────────────────────────────

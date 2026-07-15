@@ -21,7 +21,7 @@ use crate::catalog::IndexKind;
 use crate::error::{DbError, Result};
 use crate::heap::Heap;
 use crate::mvcc::Snapshot;
-use crate::sql::executor::{self, decode_row, ExecCtx, ExecResult};
+use crate::sql::executor::{self, decode_row, deform_row, ExecCtx, ExecResult};
 use crate::sql::join;
 use crate::sql::logical::{CmpOp, Literal};
 use crate::sql::plan::{
@@ -333,6 +333,77 @@ impl Runner<'_, '_> {
                         }
                     }
                 }
+                // Item 46: COUNT(*) GROUP BY <simple column refs> over a base Scan.
+                // Decode only the group-by columns via deform_row (B2 pushdown).
+                // Any complex expr (non-Column ref, subquery, virtual table) falls
+                // through to the generic decode-everything path below.
+                if !group_exprs.is_empty()
+                    && aggs
+                        .iter()
+                        .all(|a| matches!(a.func, AggFunc::Count) && a.arg.is_none() && !a.distinct)
+                {
+                    if let PlanNode::Scan { table, .. } = input.as_ref() {
+                        if !crate::sql::information_schema::is_virtual_relation(table) {
+                            let table_def = self.ctx.catalog.lookup(table)?.clone();
+                            let cols = &table_def.columns;
+                            let ncols = cols.len();
+
+                            // Extract column indices for each group_expr.
+                            // Any complex expression (non-Column) → fall through.
+                            let mut needed: Vec<usize> = Vec::new();
+                            let mut ok = true;
+                            for ge in group_exprs.iter() {
+                                if let QExpr::Column { name, .. } = ge {
+                                    if let Some(idx) =
+                                        cols.iter().position(|c| !c.dropped && &c.name == name)
+                                    {
+                                        if !needed.contains(&idx) {
+                                            needed.push(idx);
+                                        }
+                                    } else {
+                                        ok = false;
+                                        break;
+                                    }
+                                } else {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+
+                            if ok && !needed.is_empty() && needed.len() < ncols {
+                                let mut mask = vec![false; ncols];
+                                let mut upto = 0usize;
+                                for &i in &needed {
+                                    mask[i] = true;
+                                    upto = upto.max(i);
+                                }
+                                let heap = Heap::open(
+                                    self.ctx.page_size,
+                                    table_def.fsm_meta,
+                                    table_def.pages.clone(),
+                                );
+                                let mut rows: Vec<Vec<Literal>> = Vec::new();
+                                for (_, bytes) in
+                                    heap.scan(&self.snapshot, self.ctx.xid, self.ctx.pool)?
+                                {
+                                    let row = deform_row(&bytes, cols, upto, &mask)?;
+                                    rows.push(visible_row(&row, &table_def));
+                                }
+                                let batch = Batch {
+                                    schema: input.output().to_vec(),
+                                    rows,
+                                };
+                                return crate::sql::aggregate::aggregate(
+                                    batch,
+                                    group_exprs,
+                                    aggs,
+                                    output,
+                                );
+                            }
+                        }
+                    }
+                }
+
                 let batch = self.run(input)?;
                 crate::sql::aggregate::aggregate(batch, group_exprs, aggs, output)
             }
