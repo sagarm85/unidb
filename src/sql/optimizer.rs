@@ -674,6 +674,7 @@ mod tests {
             "t",
             TableStats {
                 row_count: 1000,
+                page_count: 0, // test: no page count → falls back to legacy gate
                 columns,
             },
         );

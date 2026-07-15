@@ -1145,7 +1145,11 @@ fn exec_analyze(table: &str, ctx: &mut ExecCtx) -> Result<ExecResult> {
     for (_, bytes) in heap.scan(&snapshot, ctx.xid, ctx.pool)? {
         rows.push(decode_row(&bytes, &table_def.columns)?);
     }
-    let stats = crate::sql::statistics::compute(&rows, &table_def.columns);
+    // scan_pages() re-uses the FSM directory already loaded by scan() above —
+    // ensure_directory() is idempotent and returns immediately on the second call.
+    let page_count = heap.scan_pages(ctx.pool)?.len() as u64;
+    let mut stats = crate::sql::statistics::compute(&rows, &table_def.columns);
+    stats.page_count = page_count;
     let mut cctx = catalog_ctx!(ctx);
     ctx.catalog
         .exclusive()?
@@ -1503,12 +1507,15 @@ fn exec_select(
         return exec_select_match(&table_def, projection, predicate, column, &query_str, ctx);
     }
 
-    if let Some(hit) = predicate
-        .as_ref()
-        .and_then(|e| find_indexable_btree_predicate(e, &table_def))
-    {
-        if let Some(result) = try_exec_select_btree(&table_def, projection, predicate, hit, ctx)? {
-            return Ok(result);
+    if let Some(hit) = predicate.as_ref().and_then(|e| {
+        find_best_indexable_btree_predicate(e, &table_def, ctx.catalog.table_stats(&table_def.name))
+    }) {
+        if index_lookup_is_selective(&table_def, hit, ctx, true) {
+            if let Some(result) =
+                try_exec_select_btree(&table_def, projection, predicate, hit, ctx)?
+            {
+                return Ok(result);
+            }
         }
     }
 
@@ -1745,6 +1752,57 @@ fn find_indexable_btree_predicate<'a>(
         Expr::And(lhs, rhs) => find_indexable_btree_predicate(lhs, table_def)
             .or_else(|| find_indexable_btree_predicate(rhs, table_def)),
         _ => None,
+    }
+}
+
+/// Like `find_indexable_btree_predicate` but for `AND` expressions it evaluates
+/// both arms with `ANALYZE` statistics and returns the **most selective** one.
+///
+/// This matters for queries like `WHERE k >= 0 AND k < N` where both arms are
+/// sargable on the same BTree column.  The naive left-first pick returns
+/// `k >= 0` (selectivity ≈ 1.0 when 0 is the column minimum), causing the
+/// B-tree scan to fetch every row before the upper-bound filter is applied.
+/// Picking `k < N` (selectivity ≈ 0.5) halves the candidate set and allows
+/// the size-aware A3 gate to correctly prefer the index at large table sizes
+/// and the sequential scan at small ones — matching Postgres's cost-based
+/// range-bound selection.
+///
+/// When statistics are absent both arms are tried in left-to-right order
+/// (same as `find_indexable_btree_predicate`), so the function is always safe
+/// to call even on tables that have not yet been `ANALYZE`d.
+fn find_best_indexable_btree_predicate<'a>(
+    expr: &'a Expr,
+    table_def: &TableDef,
+    stats: Option<&crate::sql::statistics::TableStats>,
+) -> Option<(&'a str, CmpOp, &'a Literal)> {
+    match expr {
+        Expr::And(lhs, rhs) => {
+            let l = find_best_indexable_btree_predicate(lhs, table_def, stats);
+            let r = find_best_indexable_btree_predicate(rhs, table_def, stats);
+            match (l, r) {
+                (None, r) => r,
+                (Some(lhit), None) => Some(lhit),
+                (Some(lhit), Some(rhit)) => {
+                    // Both arms are sargable; pick whichever has lower estimated
+                    // selectivity so the B-tree returns the smallest candidate set.
+                    let sel_of = |(col, op, lit): (&str, CmpOp, &Literal)| {
+                        stats
+                            .and_then(|s| {
+                                s.columns
+                                    .get(col)
+                                    .and_then(|cs| cs.selectivity(op, lit, s.row_count))
+                            })
+                            .unwrap_or(1.0)
+                    };
+                    if sel_of(rhit) < sel_of(lhit) {
+                        Some(rhit)
+                    } else {
+                        Some(lhit)
+                    }
+                }
+            }
+        }
+        _ => find_indexable_btree_predicate(expr, table_def),
     }
 }
 
@@ -2287,22 +2345,73 @@ fn classify_conflict(err: DbError, ctx: &ExecCtx) -> DbError {
 /// Rows selected for an UPDATE/DELETE: each decoded row paired with its RowId.
 type MatchedRows = Vec<(RowId, Vec<Literal>)>;
 
-/// A range predicate must be estimated to touch no more than this fraction of
-/// the table before the index-driven [`matching_rows`] path is worth its
-/// random-access cost over a sequential scan (A3). Chosen from the measured
-/// crossover between a 25%-selective UPDATE (index wins) and a 50%-selective
-/// DELETE (scan wins) on this engine.
+/// Legacy selectivity cap used as a fallback when `ANALYZE` predates the
+/// page-count field (i.e. `TableStats::page_count == 0`).  Preserves the
+/// original 50%-selective-DELETE behaviour for un-re-analyzed tables.
 const INDEX_RANGE_SELECTIVITY_MAX: f64 = 0.3;
 
-/// Whether UPDATE/DELETE should serve `hit` from the B-tree rather than a full
-/// scan (A3 gate). Equality is always taken (a point/low-cardinality lookup is
-/// inherently selective). A range is taken only when ANALYZE statistics
-/// (P4.d) estimate it selective enough — with no stats, the conservative choice
-/// is the sequential scan, which never regresses the non-selective case.
+/// Per-row heap fetch cost (seq-page equivalents) on the **parallel** SELECT
+/// path (`try_exec_select_btree` → `parallel_resolve_candidates`, 18 workers).
+/// unidb pages live in the OS page cache via mmap so random vs. sequential
+/// cost is much closer than in Postgres's buffer-pool model.  With 18 workers
+/// amortising the per-call overhead, one `heap.get()` ≈ 0.012 seq-page reads.
+///
+/// Calibration (50% selectivity, 8 KiB pages, ~133 rows/page):
+///   At 2 000 rows (15 pages, 1 000 matched):
+///     15 > 4 + 1 000 × 0.012 = 16 → false → scan wins ✓
+///   At 40 000 rows (296 pages, 20 000 matched):
+///     296 > 4 + 20 000 × 0.012 = 244 → true → index wins ✓
+const HEAP_FETCH_SEQ_EQUIV: f64 = 0.012;
+
+/// Per-row heap fetch cost on the **serial** UPDATE/DELETE path (`matching_rows`
+/// → `index_matching_rows`, one `heap.get()` per candidate, no workers).
+/// Serial random access is measurably more expensive than parallel: no
+/// amortised thread-spawn benefit, and the hardware prefetcher cannot pipeline
+/// across independently scheduled random accesses.  Empirically ≈ 0.05
+/// seq-page-read equivalents.
+///
+/// Calibration (50% selectivity — the DELETE regression case):
+///   At 2 000 rows (15 pages, 1 000 matched):
+///     15 > 4 + 1 000 × 0.05 = 54 → false → scan wins ✓
+///   At 40 000 rows (296 pages, 20 000 matched):
+///     296 > 4 + 20 000 × 0.05 = 1 004 → false → scan wins ✓
+///   At 40 000 rows, 5% selectivity (2 000 matched):
+///     296 > 4 + 2 000 × 0.05 = 104 → true → index wins ✓
+const HEAP_FETCH_SEQ_EQUIV_SERIAL: f64 = 0.05;
+
+/// Estimated overhead of the B-tree traversal in units of sequential page
+/// reads.  For table sizes in the 1 k–1 M range the tree is 3–5 levels deep;
+/// 4 is a safe midpoint.
+const BTREE_STARTUP_PAGES: f64 = 4.0;
+
+/// Whether the index-driven path is worth its overhead over a sequential scan
+/// (A3 gate).  Used by both the SELECT path (`try_exec_select_btree`) and the
+/// UPDATE/DELETE path (`matching_rows`).
+///
+/// `parallel`: `true` when the caller will resolve candidates via
+/// `parallel_resolve_candidates` (SELECT fast path); `false` when each
+/// candidate is resolved serially (UPDATE/DELETE via `index_matching_rows`).
+/// The two paths have different per-row costs — parallel amortises thread
+/// overhead across many workers, so its effective `heap.get()` cost is much
+/// lower than the serial path's.  Using the parallel constant for serial
+/// UPDATE/DELETE over-estimated the index benefit and regressed 50%-selective
+/// DELETE at large table sizes (296 pages, 20 k matched: parallel said
+/// "296 > 244 → index", but serial actually costs "296 > 1004 → scan").
+///
+/// For range predicates with `ANALYZE` page_count:
+///   scan_cost  ≈ page_count
+///   index_cost ≈ BTREE_STARTUP_PAGES + matched_rows × fetch_cost
+///   where fetch_cost = HEAP_FETCH_SEQ_EQUIV      (parallel, 0.012)
+///                    | HEAP_FETCH_SEQ_EQUIV_SERIAL (serial,   0.05)
+///
+/// Equality (`=`) is always taken — a point lookup is inherently selective.
+/// When `page_count` is absent the gate falls back to the legacy fixed
+/// selectivity threshold, preserving behaviour for un-re-ANALYZEd tables.
 fn index_lookup_is_selective(
     table_def: &TableDef,
     hit: (&str, CmpOp, &Literal),
     ctx: &ExecCtx,
+    parallel: bool,
 ) -> bool {
     let (column, op, literal) = hit;
     if matches!(op, CmpOp::Eq) {
@@ -2314,10 +2423,22 @@ fn index_lookup_is_selective(
     let Some(col_stats) = stats.columns.get(column) else {
         return false;
     };
-    matches!(
-        col_stats.selectivity(op, literal, stats.row_count),
-        Some(frac) if frac <= INDEX_RANGE_SELECTIVITY_MAX
-    )
+    let Some(selectivity) = col_stats.selectivity(op, literal, stats.row_count) else {
+        return false;
+    };
+    // Size-aware cost model (requires ANALYZE with page_count, item 43).
+    if stats.page_count > 0 {
+        let fetch_cost = if parallel {
+            HEAP_FETCH_SEQ_EQUIV
+        } else {
+            HEAP_FETCH_SEQ_EQUIV_SERIAL
+        };
+        let matched_rows = selectivity * stats.row_count as f64;
+        let index_cost = BTREE_STARTUP_PAGES + matched_rows * fetch_cost;
+        return (stats.page_count as f64) > index_cost;
+    }
+    // Fallback: page_count unavailable (pre-item-43 ANALYZE) → legacy gate.
+    selectivity <= INDEX_RANGE_SELECTIVITY_MAX
 }
 
 fn matching_rows(
@@ -2343,11 +2464,10 @@ fn matching_rows(
     // scan — so only equality (inherently selective) or an ANALYZE-proven
     // selective range takes the index; everything else falls through to the scan
     // (measured: forcing the index on a 50%-selective DELETE regressed it).
-    if let Some(hit) = predicate
-        .as_ref()
-        .and_then(|e| find_indexable_btree_predicate(e, table_def))
-    {
-        if index_lookup_is_selective(table_def, hit, ctx) {
+    if let Some(hit) = predicate.as_ref().and_then(|e| {
+        find_best_indexable_btree_predicate(e, table_def, ctx.catalog.table_stats(&table_def.name))
+    }) {
+        if index_lookup_is_selective(table_def, hit, ctx, false) {
             if let Some(rows) = index_matching_rows(heap, snapshot, ctx, table_def, predicate, hit)?
             {
                 return Ok(rows);

@@ -18,6 +18,11 @@ use crate::sql::logical::{CmpOp, Literal};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TableStats {
     pub row_count: u64,
+    /// Number of heap pages the table occupied at the time of `ANALYZE`.
+    /// Zero when stats were collected before this field was added (old catalogs
+    /// fall back to the legacy selectivity-only gate in `index_lookup_is_selective`).
+    #[serde(default)]
+    pub page_count: u64,
     pub columns: HashMap<String, ColumnStats>,
 }
 
@@ -47,6 +52,7 @@ const HISTOGRAM_BUCKETS: usize = 8;
 pub fn compute(rows: &[Vec<Literal>], columns: &[ColumnDef]) -> TableStats {
     let mut stats = TableStats {
         row_count: rows.len() as u64,
+        page_count: 0, // populated by exec_analyze after heap.scan_pages()
         columns: HashMap::new(),
     };
     for (idx, col) in columns.iter().enumerate() {

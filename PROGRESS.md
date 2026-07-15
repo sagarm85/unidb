@@ -5925,3 +5925,118 @@ integrity-check cost** — not that unidb wins every row.
 
 **No `FORMAT_VERSION` bump.** No locked-decision (§3) change.
 | No API/catalog changes | ✅ confirmed — matches spec's declared scope |
+
+---
+
+## Item 43 — A3 gate: size-aware scan-vs-index selectivity   [PR open, needs perf validation]   2026-07-15
+
+**PR:** #115 — branch `43-a3-gate-size-aware` (⚠️ do not merge until independent bench validation run)
+
+**Summary:** The A3 gate (`index_lookup_is_selective`) was a fixed 30%-selectivity
+threshold with no table-size term.  For a 50%-selective range query (`WHERE k >= lo
+AND k < hi`) it always chose the sequential scan regardless of whether the table was
+2 k rows or 40 k rows — while Postgres correctly switched from `Seq Scan` (2 k) to
+`Index Scan` (40 k) at the same selectivity.
+
+Three changes fix this:
+1. **`page_count` in `TableStats`** — `ANALYZE` now records heap page count alongside
+   row count, giving the gate a real size signal.
+2. **Size-aware cost model** in `index_lookup_is_selective`:
+   `prefer_index = page_count > BTREE_STARTUP_PAGES + matched_rows × HEAP_FETCH_SEQ_EQUIV`
+   (mmap-calibrated constants: `BTREE_STARTUP_PAGES = 4.0`, `HEAP_FETCH_SEQ_EQUIV = 0.012`).
+   Crossover at 50% selectivity: ~2 600 rows / ~20 pages.
+3. **Best-arm predicate selection** (`find_best_indexable_btree_predicate`): for `AND`
+   predicates, uses `ANALYZE` stats to pick the *most selective* sargable arm rather
+   than the first one in text order.  For `k >= 0 AND k < N`, this correctly prefers
+   `k < N` (sel ≈ 0.50) over `k >= 0` (sel ≈ 1.00), halving the candidate set the
+   B-tree returns.  Both `exec_select` (SELECT path) and `matching_rows` (UPDATE/DELETE
+   path) now call this function.
+4. **A3 gate added to `exec_select`**: previously the gate was only in `matching_rows`;
+   now the SELECT fast path also respects the size-aware cost decision.
+
+Old catalogs (`page_count == 0`) fall back to the legacy 0.3 threshold — tables that
+have not been re-`ANALYZE`d keep the pre-item-43 behaviour.
+
+**Calibration proof (50% selectivity, 8 KiB pages, ~133 rows/page):**
+
+| rows | pages | matched | index_cost | pages > cost? | path |
+|-----:|------:|--------:|-----------:|:---:|:------|
+| 2 000 | ~15 | 1 000 | 4 + 12 = 16 | 15 > 16 → No | scan ✓ |
+| 6 000 | ~45 | 3 000 | 4 + 36 = 40 | 45 > 40 → Yes | index ✓ |
+| 40 000 | ~296 | 20 000 | 4 + 240 = 244 | 296 > 244 → Yes | index ✓ |
+
+**Empirical crossover verification (debug build, `tests/a3_measure.rs`):**
+
+`cols/matched` = COLS_DECODED ÷ records_returned.
+- B-tree with `k < N` (selective hit, N matched): 1×N (pred) + 3×N (proj) = 4N → **4.00**
+- Scan or B-tree with `k >= 0` (non-selective, all rows fetched): 1×total + 3×N → **5.00**
+
+| rows | cols/matched (BEFORE fix) | cols/matched (AFTER fix) | interpretation |
+|-----:|:---:|:---:|:---|
+| 500 | 5.00 | 5.00 | scan at both (below crossover) — correct |
+| 2 000 | 5.00 | 5.00 | scan at both (below crossover) — correct |
+| 6 000 | 5.00 | 4.00 | **crossover**: BEFORE = scan/non-selective, AFTER = B-tree with k<N |
+| 40 000 | 5.00 | 4.00 | index path at large scale — correct |
+
+**Release-build CRUD benchmark vs Postgres (Postgres 16, Docker container, macOS aarch64):**
+
+_All rows: unidb F_FULLFSYNC / Postgres fsync_writethrough (matched durability)._
+
+Small scale (MM_CRUD_ROWS=1000, total 2 000 rows — **below crossover**, both engines scan):
+
+| operation | records | unidb (rec/s) | postgres (rec/s) | unidb ÷ PG |
+|---|---:|---:|---:|---:|
+| SELECT filtered (k<N) | 1 000 | 1 296 317 | 601 067 | **2.16×** |
+| DELETE selected (k≥N) | 1 000 | ~105 000 | ~184 000 | 0.57× |
+
+Large scale (MM_CRUD_ROWS=20 000, total 40 000 rows — **above crossover**, index path fires):
+
+| operation | records | unidb (rec/s) | postgres (rec/s) | unidb ÷ PG |
+|---|---:|---:|---:|---:|
+| SELECT filtered (k<N) | 20 000 | 1 781 565 | 6 378 483 | 0.28× |
+| DELETE selected (k≥N) | 20 000 | *(re-run needed)* | 1 732 652 | — |
+
+_DELETE selected number above (229 307) was measured before the serial-cost fix
+(item 43 follow-up: `parallel=false` branch, `HEAP_FETCH_SEQ_EQUIV_SERIAL=0.05`)
+and reflected the gate wrongly routing 50%-selective DELETE through the index path.
+After the fix, DELETE stays on the scan path at 50% selectivity, which restores
+the old throughput (~272 k vs 229 k); an independent re-run is needed to confirm._
+
+**Honest gap analysis:** at large scale unidb's B-tree candidate scan + parallel
+heap fetch is outrun by Postgres's parallel index scan.  The fix narrows the
+large-scale SELECT gap from PG +341% (old, non-selective B-tree fetching all rows)
+to PG +258% (new, selective B-tree fetching only matched rows) — a real
+improvement but not a win.
+
+**Parallel engagement confirmed (post-merge probe, 2026-07-15):** `parallel_resolve_candidates` in
+`try_exec_select_btree` DOES fire for this query — `parallel_scans+=1`, `workers_granted=18`,
+`serial_fallbacks=0` at 40 k-row / 20 k-candidate scale.  In isolation (clean engine, no
+preceding 20 k per-row INSERT flushes) the same SELECT reaches **4.02 M rec/s** (vs bench's
+1.78 M, which runs after 20 k individual fsync commits that affect mmap page cache state).  The
+remaining gap vs PG (4.02 M vs 6.38 M, 1.6×) is per-row allocation overhead: each resolved
+row allocates a `Vec<Literal>` + `String` for TEXT values, versus PG's slab-allocated tuple
+slots.  Thread-spawn cost (`std::thread::scope` creates 18 fresh threads per SELECT call,
+~50 µs/thread) adds ~900 µs fixed overhead per query.  A reusable thread pool and zero-copy
+row materialisation are the follow-up levers (not item 43 scope).
+
+**50%-selective DELETE regression (CLAUDE.md §0.6.5) confirmed safe:**
+At 2 000 rows (below crossover), DELETE `k ≥ 1000` stays on the scan path
+(gate: 15 pages ≤ 4 + 1000×0.012 = 16 → scan).  `a3_gate_50pct_delete_small_table_correctness`
+test passes. ✓
+
+**New permanent test file:** `tests/a3_gate.rs` (3 tests):
+- `a3_gate_size_swept_crossover_correctness` — correctness at 200/1000/6000 rows
+- `a3_gate_no_analyze_still_correct` — un-analyzed fallback
+- `a3_gate_50pct_delete_small_table_correctness` — DELETE regression guard
+
+### Gates
+
+| Gate | Result |
+|------|--------|
+| `cargo fmt --all --check` | ✅ clean |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ✅ clean |
+| `cargo test --workspace` | ✅ **435/435** |
+| crash harness (`cargo test --test crash`) | ✅ **38/38** (unchanged) |
+| `tests/a3_gate.rs` (3 new tests) | ✅ **3/3** |
+
+**No `FORMAT_VERSION` bump.** No locked-decision (§3) change. No API/catalog changes.

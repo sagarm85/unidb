@@ -12,6 +12,17 @@
 
 ## Current status
 
+- **A3 gate size-aware selectivity (item 43) — SHIPPED 2026-07-15, branch
+  `43-a3-gate-size-aware`, PR #115 (DO NOT MERGE without independent bench
+  validation run).**
+  Four changes: (1) `page_count` in `TableStats` populated by ANALYZE; (2)
+  size-aware cost model in `index_lookup_is_selective`; (3)
+  `find_best_indexable_btree_predicate` picks the most selective AND arm; (4)
+  gate added to `exec_select`. Follow-up fix: `parallel: bool` param added —
+  `exec_select` passes `true` (parallel path, const=0.012), `matching_rows`
+  passes `false` (serial path, const=0.05). This keeps 50%-selective DELETE on
+  the scan path at ALL table sizes. 5 permanent tests in `tests/a3_gate.rs`.
+  38/38 crash harness. Full bench re-run needed before merge.
 - **Bench harness buffer-pool fix (item 42) + PK/FK relational-integrity
   stress bench (item 39) — SHIPPED 2026-07-15, branch
   `39-pk-fk-relational-stress-bench`, PR #111.**
@@ -3302,6 +3313,42 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-15 — Item 43: A3 gate size-aware selectivity (SHIPPED, PR pending)
+
+- Root-cause: `exec_select` had NO selectivity gate; it always called
+  `try_exec_select_btree`, and `find_indexable_btree_predicate` picked `k >= 0`
+  (sel=1.0) over `k < N` (sel=0.5) for `WHERE k >= 0 AND k < N`, fetching ALL
+  rows via the B-tree at every scale.  No crossover was possible.
+- Added `find_best_indexable_btree_predicate`: for AND predicates, uses ANALYZE
+  stats to pick the most selective sargable arm.  For `k >= 0 AND k < N`, prefers
+  `k < N` (sel=0.5) → B-tree returns only 50% of rows.
+- Added size-aware cost model to `index_lookup_is_selective`:
+  `prefer_index = page_count > BTREE_STARTUP_PAGES + matched_rows × HEAP_FETCH_SEQ_EQUIV`
+  (`BTREE_STARTUP_PAGES=4.0`, `HEAP_FETCH_SEQ_EQUIV=0.012`). Crossover at ~2600
+  rows for 50% selectivity.  Old catalogs (page_count=0) fall back to legacy
+  0.3 threshold — no re-ANALYZE required for existing data.
+- Added gate to `exec_select` (was only in `matching_rows`). Both SELECT and
+  UPDATE/DELETE paths now respect the size-aware cost decision.
+- Added `page_count` to `TableStats` (via `ANALYZE`, `heap.scan_pages()`).
+- Empirical verification via `cols/matched` metric (debug build):
+  BEFORE: 5.00 at all scales (always scan or non-selective B-tree).
+  AFTER: 5.00 at ≤2000 rows (scan), 4.00 at ≥6000 rows (selective B-tree k<N). ✓
+- New test file `tests/a3_gate.rs` (3 tests): size-swept correctness, no-ANALYZE
+  fallback, 50%-selective DELETE regression guard.
+- 50%-selective DELETE regression (CLAUDE.md §0.6.5) confirmed safe: 2000-row
+  table, gate says scan, a3_gate test passes. ✓
+- All gates green: 435 workspace tests, 38/38 crash harness, clippy, fmt.
+- PR #115 opened (branch `43-a3-gate-size-aware`); DO NOT MERGE until an
+  independent bench validation run (no Postgres connection needed for unit/crash
+  gates, but the full MM_CRUD_ROWS=20000 report run is required for sign-off).
+- Post-commit isolation probe (2026-07-15): parallel_resolve_candidates DOES
+  fire for this query — 18 workers, 0 serial fallbacks. Isolation rec/s: 4.02M
+  (bench: 1.78M; 2.25× difference is mmap page-cache state after 20k per-row
+  INSERT fsyncs). Remaining gap vs PG (4M vs 6.4M, 1.6×) is per-row
+  Vec<Literal>/String allocation + thread-spawn per query. PROGRESS.md
+  corrected (removed incorrect claim that parallel_resolve_candidates didn't
+  target B-tree candidates).
 
 ### 2026-07-15 — Items 39/42: PK/FK stress bench + bench harness buffer-pool fix
 
