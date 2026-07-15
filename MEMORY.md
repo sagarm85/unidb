@@ -12,6 +12,22 @@
 
 ## Current status
 
+- **Bench harness buffer-pool fix (item 42) + PK/FK relational-integrity
+  stress bench (item 39) — SHIPPED 2026-07-15, branch
+  `39-pk-fk-relational-stress-bench`, PR pending review.**
+  Found while generating a full-scale report to verify item 39's Table 5:
+  `benches/decompose.rs` never sized its buffer pool (all 18 `Engine::open()`
+  call sites used the library default), so any report sweeping into 1M+ rows
+  silently hit `BufferPoolFull` and understated unidb's real throughput —
+  measured 1,228 rec/s vs the true 15,905 rec/s at 1M rows (~13× recovered)
+  after adding `bench_engine_open()` (2,000,000-frame pool, mirrors the
+  `unidb-studio` demo fix). Item 39 itself: new Table 5 in the multi-model
+  report — a real `customers`/`orders` PK/FK schema, made fair by item 36
+  (FK row-level enforcement). Both correctness proofs pass on both engines
+  (non-existent-parent INSERT rejected, still-referenced-parent DELETE
+  blocked/RESTRICT). Full report re-run small-sweep for turnaround
+  (`docs/performance/multi_model_report_20260715_091035.md`, 62 MiB peak
+  RSS, all 5 tables). No `FORMAT_VERSION` bump, bench/docs scope only.
 - **NEAR() vec_distance virtual column (item 41) — SHIPPED 2026-07-14, branch
   `claude/near-vec-distance-docs-ysqyvn`.**
   `exec_select_near` (`src/sql/executor.rs`) already computed the exact
@@ -3286,6 +3302,48 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-15 — Items 39/42: PK/FK stress bench + bench harness buffer-pool fix
+
+- Picked up item 39 (already committed by the user as `a6c56ba` on branch
+  `39-pk-fk-relational-stress-bench` — Table 5 PK/FK relational-integrity
+  stress in `benches/decompose.rs`) to verify with real numbers.
+- Generating the full-scale report exposed a second, more consequential bug:
+  `decompose.rs` never sizes its buffer pool (plain `Engine::open()` at all
+  18 call sites), so Table 3.1's 1,000,000-row point hit `BufferPoolFull`
+  and collapsed to 1,228 rec/s — the identical pathology diagnosed for the
+  `unidb-studio` demo earlier the same day, now found in the project's own
+  measurement tooling.
+- Fixed: `bench_engine_open()` helper routes every bench engine through
+  `Engine::open_with_pool_capacity` at 2,000,000 frames. Verified directly
+  (smoke test at the exact scale that exposed it): 1,228 -> 15,905 rec/s at
+  1M rows, ~13x, flat and consistent with the unaffected 10k-row point.
+  Filed as its own backlog item (42) since it's more consequential than
+  item 39 alone — past reports at large sweep sizes may have understated
+  unidb's real performance.
+- Encountered and cleaned up an orphaned duplicate report process (started
+  5:15am, ~2.5h runtime, from before this session segment) competing with a
+  fresh run for CPU — killed both, relaunched clean. Also killed an
+  unrelated stray `unidb-server-full` on port 8080 belonging to a different
+  session's checkout (`testing_unidb_engine_main`, not this one) at the
+  user's explicit instruction.
+- Full official-scale report (default MM_SIZES etc.) was still running after
+  Table 4's 100k-txn point alone took ~13 minutes combined (documented as
+  slow "by design" -- synchronous HNSW/graph index builds swept to
+  millions); switched to a small-sweep rerun (`MM_SIZES=100,1000`,
+  `MM_BULK_SIZES=1000,10000`, `MM_TX_SWEEP=100,1000`, `MM_CRUD_ROWS=1000`,
+  `MM_FK_ORDERS=1000`, `MM_SAMPLE=50`) for real, complete, fast numbers --
+  saved as `docs/performance/multi_model_report_20260715_091035.md` (62 MiB
+  peak RSS, all 5 tables, both Table 5 correctness proofs pass on both
+  engines).
+- Also fixed a stale `backlog_index.md` header inconsistency found along the
+  way (two conflicting "next new file" notes, 41 vs 42 — item 41 turned out
+  to already be registered by a separate parallel session; true next number
+  was 42, now 43).
+- Gates: build/clippy/fmt clean, `cargo test --workspace` all green, crash
+  harness 38/38 unchanged (bench-only change, no engine/WAL/format touched).
+- `PROGRESS.md` entries added for both items. Branch
+  `39-pk-fk-relational-stress-bench`, PR pending.
 
 ### 2026-07-14 — Item 41: NEAR() vec_distance virtual column
 

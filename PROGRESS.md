@@ -5759,4 +5759,169 @@ same ascending order and values.
 | crash harness (`cargo test --test crash`) | ✅ unchanged (no storage/WAL/format change) |
 | No `FORMAT_VERSION` bump | ✅ confirmed — purely a projection-layer read |
 | No locked-decision (§3) change | ✅ none |
+
+## Item 42 — Bench harness buffer-pool fix (2026-07-15)
+
+**Branch:** `39-pk-fk-relational-stress-bench`
+**PR:** _pending review_
+**Spec:** `docs/backlog/42_bench_harness_buffer_pool.md`
+
+### Problem
+
+While generating a full-scale multi-model report to verify item 39's Table 5,
+`benches/decompose.rs` was found to silently understate unidb's real
+performance at scale — the project's own official measurement tooling had a
+correctness-adjacent bug, not just item 39's table.
+
+Every one of the 18 `Engine::open()` call sites in the bench opened with the
+library's default buffer-pool capacity (65,536 frames / 512 MiB, per the
+earlier default-bump entry above). At 1,000,000-row scale (Table 3.1's
+bulk-insert-at-scale sweep), this exhausted the pool and forced a synchronous
+`wal.sync()` on every subsequent write (`BufferPoolFull` in
+`fetch_page_for_write`) — the identical pathology diagnosed for the
+`unidb-studio` demo earlier the same day, now found in the bench itself.
+
+**Measured before the fix**, Table 3.1 at 1,000,000 rows: **1,228 rec/s** —
+indistinguishable from a real regression, when items 35/36/40 should deliver
+15,000+ rec/s at that scale. This means any past report that swept
+`MM_SIZES`/`MM_BULK_SIZES`/`MM_CRUD_ROWS`/`MM_FK_ORDERS` into seven-figure row
+counts may have understated unidb's real throughput.
+
+### Fix
+
+A new `bench_engine_open()` helper (`benches/decompose.rs`, right after the
+imports) routes every engine open through `Engine::open_with_pool_capacity`
+with a 2,000,000-frame pool (~15.3 GiB working-set ceiling, ~48 MiB of actual
+frame-table bookkeeping — not RAM proportional to the ceiling, mmap-backed
+storage means page bytes already live in the OS page cache regardless of pool
+size), overridable via the same `UNIDB_BUFFER_POOL_PAGES` env var the engine
+and `unidb-studio` already use. All 18 raw `Engine::open(dir, 0).unwrap()`
+call sites replaced with `bench_engine_open(dir)` — a mechanical substitution,
+`Arc::new(...)` wrapping preserved everywhere it existed.
+
+**Deliberately not raised to the engine's own compiled default:** the frame
+table is allocated *eagerly* at open, so a large default would tax every
+`Engine::open()` in the codebase (measured: 2.9µs/open @ 4,096 frames,
+~35µs/open @ 65,536, 530µs/open @ 1,000,000 — see the default-bump entry
+above). A benchmark harness deliberately creating multi-million-row tables is
+exactly the case that tradeoff protects *other* callers from, so it opts in
+explicitly rather than moving the whole engine's default.
+
+### Before / after
+
+Smoke-tested directly at the exact scale that exposed the bug
+(`MM_BULK_SIZES=10000,1000000`, everything else minimized to isolate Table
+3.1):
+
+| Workload | Before | After | Recovery |
+|---|---:|---:|---:|
+| Table 3.1 bulk insert, 1,000,000 rows | **1,228 rec/s** | **15,905 rec/s** | **~13×** |
+| Table 3.1 bulk insert, 10,000 rows (reference, unaffected by the bug) | 17,991 rec/s | — | flat, consistent |
+
+The fixed number (15,905) is flat and consistent with the unaffected
+10,000-row point (17,991), confirming the scale-dependent collapse is gone,
+not just improved.
+
+### The three-tier buffer-pool config picture (for future reference)
+
+This fix completes a three-tier config story spread across the codebase, each
+tier already justified by direct measurement this session:
+
+| Tier | Consumer | Value | Ceiling | Open cost |
+|---|---|---:|---:|---:|
+| Light | Embedded/CLI/tests | compiled default (65,536) | 512 MiB | ~35µs |
+| Heavy (demo/prod) | `unidb-studio` (`DEMO_GUIDE.md`) | `UNIDB_BUFFER_POOL_PAGES=1,000,000` | ~7.6 GiB | ~530µs (once, at server startup) |
+| Heaviest (bench tooling) | `benches/decompose.rs` (`bench_engine_open`) | `2,000,000` | ~15.3 GiB | ~1ms (once per bench engine open) |
+
+The real long-term fix that would collapse these three tiers into one is item
+37 (lazy/growable frame allocation, filed, NOT STARTED).
+
+### Gates
+
+| Gate | Result |
+|------|--------|
+| `cargo build --release --bench decompose` | ✅ clean |
+| `cargo clippy --release --bench decompose -- -D warnings` | ✅ clean |
+| `cargo fmt --all --check` | ✅ clean |
+| `cargo test --workspace` | ✅ all green |
+| crash harness (`cargo test --test crash`) | ✅ **38/38** (unchanged — bench-only, no engine/WAL/format change) |
+| Sync invariant | ✅ empty |
+
+**No `FORMAT_VERSION` bump.** No locked-decision (§3) change — bench-harness
+scope only, no engine source touched.
+
+## Item 39 — PK/FK relational-integrity stress bench, Table 5 (2026-07-15)
+
+**Branch:** `39-pk-fk-relational-stress-bench`
+**PR:** _pending review_
+**Spec:** `docs/backlog/39_pk_fk_relational_stress_bench.md`
+
+### What it measures
+
+New Table 5 in `scripts/multi_model_report.sh`'s multi-model report: a real
+`customers (id PRIMARY KEY, name)` / `orders (id PRIMARY KEY, customer_id
+REFERENCES customers(id), amount, status)` schema, identical on both engines.
+Before item 36 (FK row-level enforcement, shipped the same day as this item)
+this comparison would have been unfair — unidb only checked the referenced
+*table* existed, not the referenced *row*. Every prior table in this bench had
+either no `PRIMARY KEY` at all or a PK with zero `FOREIGN KEY` constraints
+(grepped: zero `REFERENCES`/`FOREIGN KEY` hits across the whole 2000+ line
+bench before this item).
+
+### Measured (small-sweep run, `MM_FK_ORDERS=1000`, `docs/performance/multi_model_report_20260715_091035.md`)
+
+| operation | records | unidb (rec/s) | postgres (rec/s) | unidb ÷ PG | remark |
+|---|---:|---:|---:|---:|:---|
+| INSERT valid FK (per-row commit, real FK check every row) | 1000 | 283 | 274 | 1.03× | **unidb** +3% |
+| UPDATE bulk (re-checks FK path) | 500 | 13,806 | 69,080 | 0.20× | **postgres** +400% |
+| SELECT JOIN orders/customers | 500 | 64,340 | 185,917 | 0.35× | **postgres** +189% |
+
+**Correctness proofs (not speed — pass/fail, so a future regression in either
+engine's FK enforcement shows up as a flipped checkmark, not just a silently
+different number):**
+
+- INSERT referencing a non-existent customer: unidb **rejected** ✓, Postgres **rejected** ✓
+- DELETE of a still-referenced customer: unidb **blocked (RESTRICT)** ✓, Postgres **blocked (RESTRICT)** ✓
+
+Honest reporting, not cherry-picked: unidb wins the per-row-commit INSERT
+(the path item 35/36's index-backed checks were built for), Postgres wins
+bulk UPDATE and JOIN — expected, since Postgres has decades of query-planner
+and parallel-execution maturity this project isn't claiming to match (§1).
+The point of Table 5 is that **both engines now pay a real, comparable
+integrity-check cost** — not that unidb wins every row.
+
+### Verification
+
+- `cargo build --release --bench decompose`, clippy, fmt — clean.
+- Full report run end-to-end (`scripts/multi_model_report.sh`, small sweep for
+  turnaround — `MM_SIZES=100,1000`, `MM_BULK_SIZES=1000,10000`,
+  `MM_TX_SWEEP=100,1000`, `MM_CRUD_ROWS=1000`, `MM_FK_ORDERS=1000`,
+  `MM_SAMPLE=50`, `PG_URL` set): Peak RSS 62 MiB, all five tables completed,
+  both Table 5 correctness proofs pass on both engines.
+- Item 42 (above) fixes the buffer-pool sizing bug this run would otherwise
+  have silently hit at larger sweep sizes — Table 5 itself was never affected
+  by that bug (its scale, 1,000–20,000 rows, never approached the pool
+  ceiling), but the fix landing in the same PR makes any future larger-scale
+  rerun of this report trustworthy too.
+
+### Known limitations (documented in the report's own Caveats section)
+
+- Table 5's FK check is single-column, point-lookup (item 35's implicit
+  unique index). A composite or non-indexable FK column falls back to an O(n)
+  heap scan on unidb — not exercised by this table.
+- No `ON DELETE CASCADE`/`SET NULL` — RESTRICT only, matching unidb's current
+  FK feature set (item 36); Postgres in this bench is configured the same way
+  for a fair comparison.
+
+### Gates
+
+| Gate | Result |
+|------|--------|
+| `cargo build --release --bench decompose` | ✅ clean |
+| `cargo clippy --release --bench decompose -- -D warnings` | ✅ clean |
+| `cargo fmt --all --check` | ✅ clean |
+| `cargo test --workspace` | ✅ all green |
+| crash harness (`cargo test --test crash`) | ✅ **38/38** (unchanged) |
+
+**No `FORMAT_VERSION` bump.** No locked-decision (§3) change.
 | No API/catalog changes | ✅ confirmed — matches spec's declared scope |
