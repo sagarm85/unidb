@@ -14,7 +14,7 @@
 
 - **Bench harness buffer-pool fix (item 42) + PK/FK relational-integrity
   stress bench (item 39) — SHIPPED 2026-07-15, branch
-  `39-pk-fk-relational-stress-bench`, PR pending review.**
+  `39-pk-fk-relational-stress-bench`, PR #111.**
   Found while generating a full-scale report to verify item 39's Table 5:
   `benches/decompose.rs` never sized its buffer pool (all 18 `Engine::open()`
   call sites used the library default), so any report sweeping into 1M+ rows

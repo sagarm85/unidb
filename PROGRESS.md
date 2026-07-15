@@ -5763,7 +5763,7 @@ same ascending order and values.
 ## Item 42 — Bench harness buffer-pool fix (2026-07-15)
 
 **Branch:** `39-pk-fk-relational-stress-bench`
-**PR:** _pending review_
+**PR:** #111
 **Spec:** `docs/backlog/42_bench_harness_buffer_pool.md`
 
 ### Problem
@@ -5853,7 +5853,7 @@ scope only, no engine source touched.
 ## Item 39 — PK/FK relational-integrity stress bench, Table 5 (2026-07-15)
 
 **Branch:** `39-pk-fk-relational-stress-bench`
-**PR:** _pending review_
+**PR:** #111
 **Spec:** `docs/backlog/39_pk_fk_relational_stress_bench.md`
 
 ### What it measures
