@@ -1,7 +1,7 @@
 # SELECT grouped remaining gap: full-row decode on GROUP BY + no vectorised hash-aggregate
 
 **Type:** Performance
-**Status:** NOT STARTED
+**Status:** SHIPPED — PR #117 (2026-07-15); see `PROGRESS.md` for bench numbers
 **Priority:** Medium — GROUP BY g at 40k rows is 0.60× PG (+67%); after the read-path items (#45, #44) the aggregation path will be the next visible gap.
 
 ---

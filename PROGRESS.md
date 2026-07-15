@@ -6040,3 +6040,74 @@ test passes. ✓
 | `tests/a3_gate.rs` (3 new tests) | ✅ **3/3** |
 
 **No `FORMAT_VERSION` bump.** No locked-decision (§3) change. No API/catalog changes.
+
+---
+
+## Items 46 + 48 — GROUP BY decode pushdown + DELETE all O(1) fast path
+
+**PR:** #117 (`48-46-45-perf-batch`)  
+**Date:** 2026-07-15  
+**Status:** In review
+
+### What shipped
+
+**Item 46 — GROUP BY decode pushdown (`src/sql/query_exec.rs`):**  
+Extended the B2 partial-column decode to the aggregate path. `SELECT COUNT(*) GROUP BY g`
+now calls `deform_row` with a 1-column mask (just `g`) instead of `decode_row` (all 4
+columns). The path triggers when: `GROUP BY` is non-empty, all aggregates are `COUNT(*)`,
+and the scan target is a real (non-virtual) table.
+
+**Item 48 — DELETE all O(1) fast path (`src/sql/executor.rs`, `src/lib.rs`):**  
+`exec_delete` with `predicate = None`, no FK children, and no CDC now routes through
+`catalog.exclusive()?.truncate()` — the same O(pages) path TRUNCATE uses — instead of
+xmax-stamping every row. WAL writes drop from 1 per row to 1 total. Bug fixed:
+`stmt_uses_shared_catalog` now forces the exclusive catalog lock for all no-predicate
+DELETEs, preventing a lock-upgrade panic at runtime.
+
+### Bench results (MM_CRUD_ROWS=20000, release, macOS aarch64)
+
+_unidb internal metrics (WAL B/row, dec/row, cols/row) are trustworthy. Postgres
+comparison uses a fresh Docker container (pg-bench) without explicit
+`wal_sync_method=fsync_writethrough`, so PG write ops run with lighter durability —
+unidb/PG ratios for INSERT, UPDATE, DELETE selected reflect this asymmetry and should be
+read with caution. The READ-only ratios (SELECT*) and the unidb absolute numbers are valid._
+
+| operation | records | unidb (rec/s) | postgres (rec/s) | unidb ÷ PG | WAL B/row | dec/row | cols/row |
+|-----------|--------:|--------------:|-----------------:|-----------:|----------:|--------:|---------:|
+| INSERT (per-row commit) | 20000 | 264 | 2503 | 0.11× † | 8833 | 0.00 | 0.00 |
+| SELECT filtered (k<N) | 20000 | 4066108 | 6502039 | 0.63× | 0 | 0.00 | 4.00 |
+| SELECT grouped (GROUP BY g) | 40000 | **6611524** | 12799148 | 0.52× | 0 | 0.00 | **1.00** |
+| SELECT COUNT(*) (all) | 40000 | 126549039 | 28784744 | **4.40×** | 0 | 0.00 | 0.00 |
+| UPDATE bulk (k<N/2) | 10000 | 98325 | 828452 | 0.12× † | 618 | 1.00 | 8.00 |
+| DELETE selected (k>=N) | 20000 | 270106 | 4346763 | 0.06× † | 211 | 1.00 | 6.00 |
+| DELETE all | 20000 | **28160725** | 3832580 | **7.35×** | **1** | **0.00** | **0.00** |
+
+† PG running with lighter durability on fresh container — ratio not comparable to prior runs.
+
+### Before / after for shipped items
+
+**Item 46 — SELECT grouped:**
+
+| metric | before | after | improvement |
+|--------|-------:|------:|-------------|
+| unidb rec/s | 4,947,561 | 6,611,524 | +34% |
+| cols/row | 4.00 | **1.00** | 4× fewer columns materialised |
+| dec/row | 1.00 | **0.00** | full-row decode eliminated |
+
+**Item 48 — DELETE all:**
+
+| metric | before | after | improvement |
+|--------|-------:|------:|-------------|
+| unidb rec/s | 303,892 | **28,160,725** | **92.7×** |
+| WAL B/row | 196 | **1** | 196× less WAL |
+| dec/row | 1.00 | **0.00** | decode eliminated |
+| cols/row | 4.00 | **0.00** | materialisation eliminated |
+| unidb ÷ PG | 0.23× (losing) | **7.35×** (winning +635%) | flipped |
+
+### Gates
+
+| Gate | Result |
+|------|--------|
+| `cargo test --lib` | ✅ **407/407** |
+| crash harness (`cargo test --test crash`) | ✅ 38/38 |
+| `cargo clippy --workspace -- -D warnings` | ✅ clean |
