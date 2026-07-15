@@ -33,6 +33,28 @@ use tempfile::tempdir;
 use unidb::sql::logical::Literal;
 use unidb::{Engine, SqlResult};
 
+/// Every bench engine gets a generously-sized buffer pool, not the library's
+/// small default (`DEFAULT_POOL_CAPACITY`, 65536 frames / 512 MiB). That
+/// default is deliberately modest -- `BufferPool::open` allocates the frame
+/// table eagerly, so a huge default would tax every `Engine::open()` call in
+/// the codebase, including the ~50 workspace test files (measured: 530us/open
+/// at 1M frames vs 35us/open at 65536 -- see PROGRESS.md "Default buffer-pool
+/// capacity raised"). A benchmark that deliberately creates multi-million-row
+/// tables is exactly the case that tradeoff exists to protect *other* callers
+/// from, not itself, so every bench engine here opts into a much larger pool
+/// via `Engine::open_with_pool_capacity` instead of the library default.
+/// Without this, large-`MM_SIZES`/`MM_FK_ORDERS` runs silently hit
+/// `BufferPoolFull` and report misleadingly slow numbers that reflect pool
+/// exhaustion, not the engine's real throughput -- the same pathology found
+/// and fixed for the `unidb-studio` demo. Override with `UNIDB_BUFFER_POOL_PAGES`
+/// (same name as the engine's own env var); defaults to 2,000,000 frames
+/// (~16 GiB working-set ceiling, ~48 MiB of actual frame-table bookkeeping)
+/// if unset.
+fn bench_engine_open(dir: &std::path::Path) -> Engine {
+    let capacity = env_u64("UNIDB_BUFFER_POOL_PAGES", 2_000_000) as usize;
+    Engine::open_with_pool_capacity(dir, 0, capacity).unwrap()
+}
+
 const DIM: usize = 128;
 const ROWS: u64 = 100;
 
@@ -56,7 +78,7 @@ fn embedding(seed: u64) -> Vec<f32> {
 /// mid-transaction statement durability, which ACID never promised anyway.
 fn run_unidb_rung(rung: u8, one_fsync: bool, n: u64) {
     let dir = tempdir().unwrap();
-    let engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = bench_engine_open(dir.path());
     if one_fsync {
         engine.set_deferred_sync(true);
     }
@@ -335,7 +357,7 @@ fn bench_pg_ladder(c: &mut Criterion) {
 /// Build a keyed unidb table of `n` rows with a BTREE index on `id`; return the
 /// engine (kept alive by the caller) plus a prepared point-SELECT.
 fn unidb_build_keyed(dir: &std::path::Path, n: u64) -> Engine {
-    let engine = Engine::open(dir, 0).unwrap();
+    let engine = bench_engine_open(dir);
     let x = engine.begin().unwrap();
     engine
         .execute_sql(x, "CREATE TABLE t (id INT, body TEXT)")
@@ -584,7 +606,7 @@ fn pg_churn_bench(
 /// This is the path that scales (heap page latches + group commit).
 fn unidb_raw_concurrency(writers: usize, per_thread: usize) -> f64 {
     let dir = tempdir().unwrap();
-    let engine = Arc::new(Engine::open(dir.path(), 0).unwrap());
+    let engine = Arc::new(bench_engine_open(dir.path()));
     let barrier = Arc::new(Barrier::new(writers + 1));
     let committed = Arc::new(AtomicUsize::new(0));
     let payload = [0xABu8; 64];
@@ -615,7 +637,7 @@ fn unidb_raw_concurrency(writers: usize, per_thread: usize) -> f64 {
 /// (documented Phase 5 limitation). Recorded regardless.
 fn unidb_sql_concurrency(writers: usize, per_thread: usize) -> f64 {
     let dir = tempdir().unwrap();
-    let engine = Arc::new(Engine::open(dir.path(), 0).unwrap());
+    let engine = Arc::new(bench_engine_open(dir.path()));
     let x = engine.begin().unwrap();
     engine
         .execute_sql(x, "CREATE TABLE t (id INT, body TEXT)")
@@ -789,7 +811,7 @@ const SWEEP_SAMPLE: u64 = 200;
 fn unidb_sweep_point(size: u64) -> (f64, f64) {
     const BATCH: u64 = 5_000;
     let dir = tempdir().unwrap();
-    let engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = bench_engine_open(dir.path());
     let mut rids = Vec::with_capacity(size as usize);
     let mut x = engine.begin().unwrap();
     for i in 0..size {
@@ -867,7 +889,7 @@ fn bench_fsm_scale() {
         "rows", "~pages", "us/row(seg)"
     );
     let dir = tempdir().unwrap();
-    let engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = bench_engine_open(dir.path());
     let x0 = engine.begin().unwrap();
     engine
         .execute_sql(x0, "CREATE TABLE t (id INT, body TEXT)")
@@ -920,7 +942,7 @@ fn bench_fsm_scale() {
 /// phase only (the pre-grow is not timed).
 fn unidb_sql_conc_pregrown(writers: usize, per_thread: usize, pregrow_rows: u64) -> f64 {
     let dir = tempdir().unwrap();
-    let engine = Arc::new(Engine::open(dir.path(), 0).unwrap());
+    let engine = Arc::new(bench_engine_open(dir.path()));
     let x = engine.begin().unwrap();
     engine
         .execute_sql(x, "CREATE TABLE t (id INT, body TEXT)")
@@ -1271,13 +1293,13 @@ fn bench_hiconc() {
             "=== A. Writer-count scaling at {pregrow}-row table (commits/sec, speedup vs 1) ==="
         );
         let sql_dir = tempdir().unwrap();
-        let sql_engine = Arc::new(Engine::open(sql_dir.path(), 0).unwrap());
+        let sql_engine = Arc::new(bench_engine_open(sql_dir.path()));
         sql_engine.set_deferred_sync(true);
         eprintln!("[hiconc] building {pregrow}-row SQL table…");
         build_sql_table(&sql_engine, pregrow, 96, false);
 
         let raw_dir = tempdir().unwrap();
-        let raw_engine = Arc::new(Engine::open(raw_dir.path(), 0).unwrap());
+        let raw_engine = Arc::new(bench_engine_open(raw_dir.path()));
         raw_engine.set_deferred_sync(true);
         eprintln!("[hiconc] building {pregrow}-row raw heap…");
         {
@@ -1345,7 +1367,7 @@ fn bench_hiconc() {
             .unwrap_or_else(|| vec![100_000, 500_000, 1_000_000, 2_000_000]);
         for &sz in &sizes {
             let dir = tempdir().unwrap();
-            let engine = Arc::new(Engine::open(dir.path(), 0).unwrap());
+            let engine = Arc::new(bench_engine_open(dir.path()));
             engine.set_deferred_sync(true);
             eprintln!("[hiconc] size-sweep building {sz}-row unidb table…");
             build_sql_table(&engine, sz, 96, false);
@@ -1374,7 +1396,7 @@ fn bench_hiconc() {
         );
         for &indexed in &[false, true] {
             let dir = tempdir().unwrap();
-            let engine = Arc::new(Engine::open(dir.path(), 0).unwrap());
+            let engine = Arc::new(bench_engine_open(dir.path()));
             engine.set_deferred_sync(true);
             let label = if indexed { "indexed" } else { "no-index" };
             eprintln!("[hiconc] table C building {idx_pregrow}-row {label} unidb table…");
@@ -1433,7 +1455,7 @@ fn bench_hiconc() {
 /// per-commit cost the async-derivation design targets — not a bulk-load average.
 fn mm_ladder_point(rung: u8, size: u64, sample: u64) -> f64 {
     let dir = tempdir().unwrap();
-    let engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = bench_engine_open(dir.path());
     engine.set_deferred_sync(true); // group commit: one fsync per commit
     let setup = engine.begin().unwrap();
     let create = if rung >= 2 {
@@ -1952,7 +1974,7 @@ fn pg_bulk_select(url: &str, n: u64) -> (u64, f64) {
 /// VECTOR(128) + graph edge + event, one durable group-commit each.
 fn unidb_w4_throughput(n: u64) -> f64 {
     let dir = tempdir().unwrap();
-    let engine = Engine::open(dir.path(), 0).unwrap();
+    let engine = bench_engine_open(dir.path());
     engine.set_deferred_sync(true);
     let sx = engine.begin().unwrap();
     engine
@@ -2465,7 +2487,7 @@ fn bench_mm_report() {
             "_Durability lens: unidb `{sync_prim}`, Postgres `wal_sync_method={m}` (matched)._\n"
         );
         let sdir = tempdir().unwrap();
-        let se = Arc::new(Engine::open(sdir.path(), 0).unwrap());
+        let se = Arc::new(bench_engine_open(sdir.path()));
         se.set_deferred_sync(true);
         let u = url.as_deref().unwrap();
         phased("t3_build", || {
@@ -2596,7 +2618,7 @@ fn bench_mm_report() {
         for &n in &bulk_sizes {
             eprintln!("[mmreport] Table 3.1 bulk at {n} rows…");
             let bdir = tempdir().unwrap();
-            let be = Arc::new(Engine::open(bdir.path(), 0).unwrap());
+            let be = Arc::new(bench_engine_open(bdir.path()));
             be.set_deferred_sync(true);
             let ui = phased(&format!("t31_insert_unidb_{n}"), || sql_bulk_insert(&be, n));
             let pi = phased(&format!("t31_insert_pg_{n}"), || pg_bulk_insert(u, n));
@@ -2618,7 +2640,7 @@ fn bench_mm_report() {
         for &n in &bulk_sizes {
             eprintln!("[mmreport] Table 3.1 bulk at {n} rows…");
             let bdir = tempdir().unwrap();
-            let be = Arc::new(Engine::open(bdir.path(), 0).unwrap());
+            let be = Arc::new(bench_engine_open(bdir.path()));
             be.set_deferred_sync(true);
             let ui = phased(&format!("t31_insert_unidb_{n}"), || sql_bulk_insert(&be, n));
             let us = phased(&format!("t31_select_unidb_{n}"), || sql_bulk_select(&be, n));
@@ -2780,7 +2802,7 @@ fn bench_mm_report() {
         );
         let u = url.as_deref().unwrap();
         let fdir = tempdir().unwrap();
-        let fe = Arc::new(Engine::open(fdir.path(), 0).unwrap());
+        let fe = Arc::new(bench_engine_open(fdir.path()));
         fe.set_deferred_sync(true);
         phased("t5_build", || {
             sql_fk_setup(&fe, FK_CUSTOMERS);
@@ -2865,7 +2887,7 @@ fn bench_mm_report() {
     } else {
         println!("_`PG_URL` unset → Postgres columns skipped; set it to run Table 5._\n");
         let fdir = tempdir().unwrap();
-        let fe = Arc::new(Engine::open(fdir.path(), 0).unwrap());
+        let fe = Arc::new(bench_engine_open(fdir.path()));
         fe.set_deferred_sync(true);
         phased("t5_build_unidb_only", || sql_fk_setup(&fe, FK_CUSTOMERS));
         let (uc, us) = phased("t5_insert_unidb_only", || {
