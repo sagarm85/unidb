@@ -1165,9 +1165,10 @@ fn exec_truncate(table: &str, ctx: &mut ExecCtx) -> Result<ExecResult> {
     let table_def = ctx.catalog.lookup(table)?.clone();
     // Count the live rows removed (under this statement's snapshot) for the
     // result, before the page list is cleared.
+    // Item 48: use count_visible (header-only, no decode) instead of scan().len().
     let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
-    let count = heap.scan(&snapshot, ctx.xid, ctx.pool)?.len();
+    let count = heap.count_visible(&snapshot, ctx.xid, ctx.pool)?;
     let mut cctx = catalog_ctx!(ctx);
     ctx.catalog.exclusive()?.truncate(table, &mut cctx)?;
     Ok(ExecResult::Truncated { count })
@@ -1894,7 +1895,16 @@ fn try_exec_select_btree(
     // Parallelize resolution across worker threads when the candidate list is
     // large (Milestone P follow-up — the filtered-SELECT gap). Order is
     // unspecified (no `ORDER BY` here), so concat is correct.
-    if let Some(lease) = crate::sql::parallel_scan::acquire(candidate_ids.len()) {
+    // Item 45: also guard on PARALLEL_CANDIDATE_MIN — below this threshold the
+    // thread-spawn cost exceeds the work saved (e.g. 18 threads for a handful
+    // of index hits). `acquire()` already gates on MIN_PAGES (64) by default,
+    // but naming the threshold here keeps it self-documenting.
+    let maybe_lease = if candidate_ids.len() >= crate::sql::parallel_scan::PARALLEL_CANDIDATE_MIN {
+        crate::sql::parallel_scan::acquire(candidate_ids.len())
+    } else {
+        None
+    };
+    if let Some(lease) = maybe_lease {
         let rows = crate::sql::parallel_scan::parallel_resolve_candidates(
             &candidate_ids,
             &ctx.pool.shared_reader(),
@@ -2266,6 +2276,19 @@ fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Resu
     let table_def = ctx.catalog.lookup(table)?.clone();
     let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+
+    // Item 48: fast path for unconditional DELETE with no FK children and no CDC.
+    // Routes through the O(pages) truncate instead of xmax-stamping every row.
+    // CDC is skipped intentionally — TRUNCATE has never emitted per-row events.
+    if predicate.is_none()
+        && !table_has_fk_children(ctx.catalog.get(), table)
+        && !table_def.events_enabled
+    {
+        let count = heap.count_visible(&snapshot, ctx.xid, ctx.pool)?;
+        let mut cctx = catalog_ctx!(ctx);
+        ctx.catalog.exclusive()?.truncate(table, &mut cctx)?;
+        return Ok(ExecResult::Deleted { count });
+    }
 
     let matching = matching_rows(&heap, &snapshot, ctx, &table_def, predicate)?;
     // P1.d: the rows a DELETE selects are part of its read set (SSI).
