@@ -6000,10 +6000,18 @@ Large scale (MM_CRUD_ROWS=20 000, total 40 000 rows — **above crossover**, ind
 loop is outrun by Postgres's parallel index scan.  The fix narrows the
 large-scale SELECT gap from PG +341% (old, non-selective B-tree fetching all rows)
 to PG +258% (new, selective B-tree fetching only matched rows) — a real
-improvement but not a win.  The remaining gap is architectural: Postgres
-parallelises both the index traversal and the heap fetch; unidb's parallel-scan
-(`MIN_PAGES=64`) targets the full-heap-scan path, not the B-tree-candidate
-resolution path.  Closing this gap is a separate follow-up (not item 43 scope).
+improvement but not a win.
+
+**Parallel engagement confirmed (post-merge probe, 2026-07-15):** `parallel_resolve_candidates` in
+`try_exec_select_btree` DOES fire for this query — `parallel_scans+=1`, `workers_granted=18`,
+`serial_fallbacks=0` at 40 k-row / 20 k-candidate scale.  In isolation (clean engine, no
+preceding 20 k per-row INSERT flushes) the same SELECT reaches **4.02 M rec/s** (vs bench's
+1.78 M, which runs after 20 k individual fsync commits that affect mmap page cache state).  The
+remaining gap vs PG (4.02 M vs 6.38 M, 1.6×) is per-row allocation overhead: each resolved
+row allocates a `Vec<Literal>` + `String` for TEXT values, versus PG's slab-allocated tuple
+slots.  Thread-spawn cost (`std::thread::scope` creates 18 fresh threads per SELECT call,
+~50 µs/thread) adds ~900 µs fixed overhead per query.  A reusable thread pool and zero-copy
+row materialisation are the follow-up levers (not item 43 scope).
 
 **50%-selective DELETE regression (CLAUDE.md §0.6.5) confirmed safe:**
 At 2 000 rows (below crossover), DELETE `k ≥ 1000` stays on the scan path
