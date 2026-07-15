@@ -803,6 +803,16 @@ struct IndexColBatch {
     entries: Vec<(OrderedValue, RowId)>,
 }
 
+/// Staged in-place B-tree RowId patches for unchanged-key UPDATE (item 47).
+/// One per secondary BTree column.  Flushed coalesced after the UPDATE row
+/// loop so a leaf touched by many rows gets one WAL page-image, not one per row.
+struct PatchColBatch {
+    #[allow(dead_code)]
+    col_idx: usize,
+    meta_page: PageId,
+    patches: Vec<(OrderedValue, RowId, RowId)>, // (key, old_rid, new_rid)
+}
+
 /// One empty [`IndexColBatch`] per BTree/FullText indexed column of `table_def`.
 fn init_index_batches(table_def: &TableDef) -> Vec<IndexColBatch> {
     let mut batches = Vec::new();
@@ -832,50 +842,139 @@ fn init_index_batches(table_def: &TableDef) -> Vec<IndexColBatch> {
     batches
 }
 
-/// Stage one updated row's index maintenance (A1): BTree/FullText entries are
-/// appended to `batches` (flushed coalesced by [`flush_index_batches`] after the
-/// UPDATE loop); Hnsw is applied inline per row, exactly as
-/// [`apply_durable_index_writes`] does. Every indexed column is maintained — no
-/// column is skipped (skipping would lose the live row from index scans in this
-/// insert-new-version heap; the win comes from WAL coalescing, not omission).
-fn stage_row_index_writes(
-    table_def: &TableDef,
-    new_row_id: RowId,
-    row: &[Literal],
-    batches: &mut [IndexColBatch],
-    ctx: &mut ExecCtx,
-) -> Result<()> {
-    for b in batches.iter_mut() {
-        let val = &row[b.col_idx];
-        if b.is_fulltext {
-            if let Literal::Text(text) = val {
-                for token in crate::fulltext::tokenize(text) {
-                    b.entries.push((OrderedValue::Text(token), new_row_id));
-                }
+/// Initialise one [`PatchColBatch`] per secondary BTree column.
+/// Used by the item-47 UPDATE path alongside the existing [`init_index_batches`].
+fn init_patch_batches(table_def: &TableDef) -> Vec<PatchColBatch> {
+    let mut out = Vec::new();
+    for (col_idx, col) in table_def.columns.iter().enumerate() {
+        if col.dropped {
+            continue;
+        }
+        // Secondary BTree index.
+        if let Some(meta_page) = col.index_root {
+            if matches!(col.index, Some(IndexKind::BTree)) {
+                out.push(PatchColBatch {
+                    col_idx,
+                    meta_page,
+                    patches: Vec::new(),
+                });
             }
-        } else if let Ok(value) = OrderedValue::try_from(val) {
-            b.entries.push((value, new_row_id));
+        }
+        // Unique-enforcement index — must also be batched, otherwise each row
+        // calls patch_many with a single entry (one FPI per row = no savings).
+        if let Some(meta_page) = col.unique_index_root {
+            out.push(PatchColBatch {
+                col_idx,
+                meta_page,
+                patches: Vec::new(),
+            });
         }
     }
+    out
+}
+
+/// Item 47 Phase A — stage one row's index writes for UPDATE, routing
+/// unchanged-key columns into the per-leaf coalesced patch path and
+/// changed-key columns into the existing insert batch.
+///
+/// Unchanged-key secondary BTree: push `(key, old_rid, new_rid)` to
+/// `patch_batches` — flushed after the row loop with one WAL page-image per
+/// leaf instead of one per row.  Unique-enforcement indexes are handled
+/// inline (per-row) but their patch batches are also accumulated here via
+/// `unique_patches`.
+///
+/// Changed-key, FullText, and HNSW columns fall through to the standard
+/// insert/coalesce path (existing behaviour).
+#[allow(clippy::too_many_arguments)]
+fn stage_row_index_writes_update(
+    table_def: &TableDef,
+    old_row_id: RowId,
+    new_row_id: RowId,
+    before_row: &[Literal],
+    new_row: &[Literal],
+    index_batches: &mut [IndexColBatch],
+    patch_batches: &mut [PatchColBatch],
+    ctx: &mut ExecCtx,
+) -> Result<()> {
+    // Secondary BTree / FullText indexes.
+    for ib in index_batches.iter_mut() {
+        let old_val = &before_row[ib.col_idx];
+        let new_val = &new_row[ib.col_idx];
+        if ib.is_fulltext {
+            if let Literal::Text(text) = new_val {
+                for token in crate::fulltext::tokenize(text) {
+                    ib.entries.push((OrderedValue::Text(token), new_row_id));
+                }
+            }
+        } else if old_val == new_val {
+            if let Ok(key) = OrderedValue::try_from(new_val) {
+                // Find the corresponding patch batch by meta_page.
+                if let Some(pb) = patch_batches
+                    .iter_mut()
+                    .find(|p| p.meta_page == ib.meta_page)
+                {
+                    pb.patches.push((key, old_row_id, new_row_id));
+                }
+            }
+        } else if let Ok(value) = OrderedValue::try_from(new_val) {
+            ib.entries.push((value, new_row_id));
+        }
+    }
+
+    // Per-column: HNSW and unique-enforcement indexes.
     for (idx, col) in table_def.columns.iter().enumerate() {
         if col.dropped {
             continue;
         }
         if let Some(meta_page) = col.index_root {
             if let Some(IndexKind::Hnsw) = col.index {
-                if let Literal::Vector(v) = &row[idx] {
+                if let Literal::Vector(v) = &new_row[idx] {
                     DiskIvfIndex::open(meta_page, ctx.page_size)
                         .insert(new_row_id, v, ctx.pool, ctx.wal)?;
                 }
             }
         }
-        // Implicit unique-enforcement index (item 35): insert the new version's
-        // key on UPDATE so the index stays current.
         if let Some(uiq_meta) = col.unique_index_root {
-            if let Ok(value) = OrderedValue::try_from(&row[idx]) {
+            if before_row[idx] == new_row[idx] {
+                if let Ok(key) = OrderedValue::try_from(&new_row[idx]) {
+                    // Unique index, unchanged key: accumulate into patch_batches
+                    // (added by init_patch_batches). flush_patch_batches then calls
+                    // patch_many once per leaf, not once per row.
+                    if let Some(pb) = patch_batches.iter_mut().find(|p| p.meta_page == uiq_meta) {
+                        pb.patches.push((key, old_row_id, new_row_id));
+                    }
+                }
+            } else if let Ok(value) = OrderedValue::try_from(&new_row[idx]) {
                 DiskBTree::new(uiq_meta, ctx.page_size)
                     .insert(value, new_row_id, ctx.pool, ctx.wal)?;
             }
+        }
+    }
+    Ok(())
+}
+
+/// Flush the accumulated per-secondary-index patch batches (item 47).
+/// Applies all `(key, old_rid→new_rid)` patches with one WAL page-image per
+/// leaf (via [`DiskBTree::patch_many`]), then records a `BTreePatch` undo
+/// action per patch so user-tx abort can restore `old_rid`.
+fn flush_patch_batches(batches: &[PatchColBatch], ctx: &mut ExecCtx) -> Result<()> {
+    use crate::txn::UndoAction;
+    for b in batches {
+        if b.patches.is_empty() {
+            continue;
+        }
+        DiskBTree::new(b.meta_page, ctx.page_size).patch_many(&b.patches, ctx.pool, ctx.wal)?;
+        for (key, old_rid, new_rid) in &b.patches {
+            ctx.txn_mgr.record_undo(
+                ctx.xid,
+                UndoAction::BTreePatch {
+                    meta_page: b.meta_page,
+                    page_size: ctx.page_size,
+                    key: key.clone(),
+                    old_rid: *old_rid,
+                    new_rid: *new_rid,
+                },
+            )?;
         }
     }
     Ok(())
@@ -1230,7 +1329,7 @@ fn exec_create_table(
     // B-tree that `enforce_unique` can use for O(1) point-lookup enforcement
     // instead of an O(n) heap scan. The tree is empty at creation (no rows
     // yet); it is maintained by `apply_durable_index_writes` and
-    // `stage_row_index_writes` on every subsequent INSERT/UPDATE.
+    // `apply_durable_index_writes` / `stage_row_index_writes_update` on every subsequent INSERT/UPDATE.
     //
     // Stored in `ColumnDef.unique_index_root` (separate from `index_root` for
     // the explicit secondary index so both can coexist without conflict).
@@ -2142,8 +2241,10 @@ fn exec_update(
     // A1: accumulate BTree/FullText index entries across every updated row, then
     // flush them coalesced after the loop — one WAL_INDEX page image per dirtied
     // leaf instead of one per row (RC2). Correctness is unchanged: every entry is
-    // still inserted (see `stage_row_index_writes`).
+    // still inserted (see `stage_row_index_writes_update`).
     let mut index_batches = init_index_batches(&table_def);
+    // Item 47: per-secondary-BTree patch batches (unchanged-key in-place RowId patch).
+    let mut patch_batches = init_patch_batches(&table_def);
     // A4: whether any UNIQUE/PRIMARY KEY set exists at all — computed once, not
     // per row. When there are none, the loop skips both the per-row
     // `snapshot_for_statement` allocation *and* `enforce_unique`'s full-heap
@@ -2259,12 +2360,26 @@ fn exec_update(
                 slot: new_row_id.slot,
             },
         )?;
-        stage_row_index_writes(&table_def, new_row_id, &coerced, &mut index_batches, ctx)?;
+        // Item 47: unchanged-key columns use in-place RowId patch (no splits, 1
+        // WAL page-image); changed-key columns fall through to the batch insert.
+        stage_row_index_writes_update(
+            &table_def,
+            row_id,
+            new_row_id,
+            &before_row,
+            &coerced,
+            &mut index_batches,
+            &mut patch_batches,
+            ctx,
+        )?;
         // C1 (item 29): UPDATE carries both before (pre-mutation) and after (post-mutation).
         send_event_capture(&table_def, "update", Some(&before_row), Some(&coerced), ctx)?;
         count += 1;
     }
     // Coalesced index maintenance for the whole statement (A1).
+    // Item 47: flush unchanged-key patches first (one WAL page-image per leaf),
+    // then insert changed-key entries from the standard batch.
+    flush_patch_batches(&patch_batches, ctx)?;
     flush_index_batches(&index_batches, ctx)?;
 
     persist_pages_if_changed(table, &heap, &table_def.pages, ctx)?;
@@ -2298,50 +2413,63 @@ fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Resu
     // Item 36: gate the RESTRICT scan — zero overhead when no table
     // references this one (the common case).
     let has_fk_children = table_has_fk_children(ctx.catalog.get(), table);
+    let needs_per_row_checks = has_fk_children || table_def.events_enabled;
 
-    let mut count = 0;
-    for (row_id, row) in matching {
-        // Item 36 — FK RESTRICT: before deleting, verify no visible child
-        // row references this parent row's PK value.
-        // Protocol (closes the parent-delete / child-insert race):
-        //   1. Acquire FkKey phantom lock on parent PK value BEFORE snapshot.
-        //   2. Take fresh snapshot — sees any child that committed before us.
-        //   3. Scan referencing child tables; reject if any visible child found.
-        // A concurrent child inserter that hasn't committed yet must also
-        // acquire the same FkKey lock (item 36, child-side), so it either
-        // blocks here until we commit (then gets FK violation) or committed
-        // first and is caught by step 3.
-        if has_fk_children {
-            acquire_fk_key_locks_parent(&table_def, &row, ctx.xid, ctx.lock_mgr)?;
-            let restrict_snap = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
-            enforce_fk_restrict(
-                &table_def,
-                &row,
-                &restrict_snap,
-                ctx.xid,
-                ctx.pool,
-                ctx.catalog.get(),
-            )?;
+    // Item 44: two-pass DELETE — pre-check pass (per-row, unchanged semantics)
+    // then batched heap mutations (one WAL mini-txn per page instead of per row).
+    //
+    // Pre-check pass: FK RESTRICT and CDC event capture must still run per-row
+    // *before* any heap mutation (FK needs a fresh snapshot per row; CDC needs
+    // the row data, which is gone after deletion).  All write-locks are acquired
+    // inside `delete_many`, which runs after the pre-checks.
+    //
+    // When there are no per-row side-effects (no FK children, no CDC) we skip
+    // the pre-check pass entirely and go straight to the batch delete.
+    let row_ids: Vec<RowId> = if needs_per_row_checks {
+        let mut ids = Vec::with_capacity(matching.len());
+        for (row_id, row) in &matching {
+            if has_fk_children {
+                // Protocol (closes the parent-delete / child-insert race):
+                //   1. Acquire FkKey phantom lock on parent PK value BEFORE snapshot.
+                //   2. Take fresh snapshot — sees any child that committed before us.
+                //   3. Scan referencing child tables; reject if any visible child found.
+                acquire_fk_key_locks_parent(&table_def, row, ctx.xid, ctx.lock_mgr)?;
+                let restrict_snap = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+                enforce_fk_restrict(
+                    &table_def,
+                    row,
+                    &restrict_snap,
+                    ctx.xid,
+                    ctx.pool,
+                    ctx.catalog.get(),
+                )?;
+            }
+            // C1 (item 29): before-only; captured before heap mutation.
+            send_event_capture(&table_def, "delete", Some(row), None, ctx)?;
+            ids.push(*row_id);
         }
-        // C1 (item 29): DELETE carries before-only; captured before heap.delete
-        // runs — once deleted there is nothing left to build a payload from.
-        send_event_capture(&table_def, "delete", Some(&row), None, ctx)?;
-        if let Err(e @ DbError::WriteConflict { .. }) =
-            heap.delete(row_id, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr)
-        {
-            return Err(classify_conflict(e, ctx));
-        }
-        // P1.d: deleting supersedes the version at `row_id` (SSI write).
-        ctx.txn_mgr.ssi_note_write(ctx.xid, row_id);
+        ids
+    } else {
+        matching.iter().map(|(rid, _)| *rid).collect()
+    };
+
+    let deleted = match heap.delete_many(&row_ids, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr) {
+        Err(e @ DbError::WriteConflict { .. }) => return Err(classify_conflict(e, ctx)),
+        other => other?,
+    };
+
+    // P1.d: SSI write tracking + undo log — one entry per deleted row.
+    for rid in &deleted {
+        ctx.txn_mgr.ssi_note_write(ctx.xid, *rid);
         ctx.txn_mgr.record_undo(
             ctx.xid,
             UndoAction::XmaxStamp {
-                page_id: row_id.page_id,
-                slot: row_id.slot,
+                page_id: rid.page_id,
+                slot: rid.slot,
             },
         )?;
-        count += 1;
     }
+    let count = deleted.len();
 
     persist_pages_if_changed(table, &heap, &table_def.pages, ctx)?;
     assert_schema_stable(ctx, table, table_def.generation);

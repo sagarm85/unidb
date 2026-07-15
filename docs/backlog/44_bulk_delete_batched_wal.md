@@ -1,7 +1,7 @@
 # Unconditional/bulk DELETE pays one WAL mini-transaction per row
 
 **Type:** Performance
-**Status:** NOT STARTED
+**Status:** SHIPPED — `Heap::delete_many` landed in PR #TBD (`47-44-perf-batch`, 2026-07-16). WAL B/row: 230 → 107 (−53%); throughput 416k rec/s at 5000 rows. See `PROGRESS.md` "Items 47 + 44" entry for full metrics and invariant analysis.
 
 ---
 

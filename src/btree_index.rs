@@ -778,6 +778,79 @@ impl DiskBTree {
         Ok(())
     }
 
+    /// In-place RowId patch for unchanged-key UPDATE (item 47, Phase A).
+    ///
+    /// When UPDATE changes a non-indexed column but leaves the indexed column's
+    /// value the same, the key ordering in the leaf is preserved.  Instead of
+    /// inserting a new `(key, new_rid)` alongside the existing `(key, old_rid)`
+    /// (which fills leaves and causes splits → ≥2 page-image WAL records per
+    /// row), this replaces `old_rid` with `new_rid` in-place for a single
+    /// page-image WAL record and zero structural change.
+    ///
+    /// **Correctness / abort safety:** the caller MUST record a corresponding
+    /// `UndoAction::BTreePatch { .. old_rid, new_rid .. }` so that if the
+    /// enclosing user transaction aborts, `txn_mgr.abort()` restores `old_rid`
+    /// by calling this method in reverse before clearing the xmax stamp.
+    ///
+    /// Falls back to a regular insert of `(key, new_rid)` if `(key, old_rid)`
+    /// is not found (entry already cleaned up, or non-unique key).
+    pub fn update_rowid_inplace(
+        &self,
+        key: OrderedValue,
+        old_rid: RowId,
+        new_rid: RowId,
+        pool: &BufferPool,
+        wal: &Wal,
+    ) -> Result<()> {
+        let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
+        let mut prev_lsn = begin_lsn;
+
+        let mut pid = self.find_leaf(&key, pool)?;
+        let mut patched = false;
+        'outer: loop {
+            let page = pool.fetch_page(pid)?;
+            let node = Node::deserialize(&page)?;
+            pool.unpin(pid);
+            let Node::Leaf { mut entries, next } = node else {
+                break;
+            };
+            let mut modified = false;
+            for (k, rid) in entries.iter_mut() {
+                if *k > key {
+                    break 'outer;
+                }
+                if *k == key && *rid == old_rid {
+                    *rid = new_rid;
+                    modified = true;
+                    patched = true;
+                    break;
+                }
+            }
+            if modified {
+                prev_lsn = write_node(
+                    pool,
+                    wal,
+                    txn_id,
+                    prev_lsn,
+                    pid,
+                    &Node::Leaf { entries, next },
+                    self.page_size,
+                )?;
+                break;
+            }
+            if next == INVALID_PAGE_ID {
+                break;
+            }
+            pid = next;
+        }
+
+        if !patched {
+            self.insert_in_txn(key, new_rid, pool, wal, txn_id, &mut prev_lsn)?;
+        }
+        wal.commit_mini_txn(txn_id, prev_lsn)?;
+        Ok(())
+    }
+
     /// The body of [`Self::insert`], but participating in a **caller-supplied**
     /// mini-txn (`txn_id`, `prev_lsn`) instead of opening/committing its own.
     /// Lets a caller fold a tree insert into a larger atomic unit — the durable
@@ -1088,6 +1161,93 @@ impl DiskBTree {
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
         let mut prev_lsn = begin_lsn;
         self.insert_many_in_txn(entries, pool, wal, txn_id, &mut prev_lsn)?;
+        wal.commit_mini_txn(txn_id, prev_lsn)?;
+        Ok(())
+    }
+
+    /// Batch in-place RowId patch (item 47, Phase A).  Mirrors the coalescing
+    /// behaviour of [`Self::insert_many_in_txn`]: patches for the same leaf are
+    /// gathered and written as **one WAL page-image** instead of one per row.
+    /// `patches` is `(key, old_rid, new_rid)` — for each entry, `(key, old_rid)`
+    /// is located in the leaf and its RowId is overwritten with `new_rid`.
+    ///
+    /// Entries whose `(key, old_rid)` is not found in the leaf (already cleaned
+    /// up or a non-unique key collision) fall back to a regular insert of
+    /// `(key, new_rid)` so the new row version remains reachable.
+    pub fn patch_many(
+        &self,
+        patches: &[(OrderedValue, RowId, RowId)],
+        pool: &BufferPool,
+        wal: &Wal,
+    ) -> Result<()> {
+        if patches.is_empty() {
+            return Ok(());
+        }
+        let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
+        let mut prev_lsn = begin_lsn;
+        // Sort so patches for the same leaf are contiguous.
+        let mut sorted = patches.to_vec();
+        sorted.sort_by_key(|(k, old_r, _)| (k.clone(), rowid_key(*old_r)));
+
+        let mut i = 0usize;
+        while i < sorted.len() {
+            let leaf_pid = self.find_leaf(&sorted[i].0, pool)?;
+            let latch = pool.latch_exclusive(leaf_pid);
+            let node = self.read_node(leaf_pid, pool)?;
+            let Node::Leaf { mut entries, next } = node else {
+                drop(latch);
+                let (ref k, _, new_rid) = sorted[i];
+                self.insert_in_txn(k.clone(), new_rid, pool, wal, txn_id, &mut prev_lsn)?;
+                i += 1;
+                continue;
+            };
+            let (Some(min_key), Some(max_key)) = (
+                entries.first().map(|(k, _)| k.clone()),
+                entries.last().map(|(k, _)| k.clone()),
+            ) else {
+                drop(latch);
+                let (ref k, _, new_rid) = sorted[i];
+                self.insert_in_txn(k.clone(), new_rid, pool, wal, txn_id, &mut prev_lsn)?;
+                i += 1;
+                continue;
+            };
+
+            let mut modified = false;
+            let mut fallbacks: Vec<(OrderedValue, RowId)> = Vec::new();
+            let mut j = i;
+            while j < sorted.len() {
+                let (ref pk, pold, pnew) = sorted[j];
+                if pk < &min_key || pk > &max_key {
+                    break;
+                }
+                // Find the specific (pk, pold) entry and patch its RowId.
+                match entries.iter_mut().find(|(k, r)| k == pk && *r == pold) {
+                    Some((_, rid)) => {
+                        *rid = pnew;
+                        modified = true;
+                    }
+                    None => fallbacks.push((pk.clone(), pnew)),
+                }
+                j += 1;
+            }
+            if modified {
+                prev_lsn = write_node(
+                    pool,
+                    wal,
+                    txn_id,
+                    prev_lsn,
+                    leaf_pid,
+                    &Node::Leaf { entries, next },
+                    self.page_size,
+                )?;
+            }
+            drop(latch);
+            // Fallback inserts for patches whose old entry was not found.
+            for (k, new_r) in fallbacks {
+                self.insert_in_txn(k, new_r, pool, wal, txn_id, &mut prev_lsn)?;
+            }
+            i = j;
+        }
         wal.commit_mini_txn(txn_id, prev_lsn)?;
         Ok(())
     }

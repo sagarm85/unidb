@@ -12,6 +12,15 @@
 
 ## Current status
 
+- **UPDATE in-place B-tree patch + DELETE batched mini-txn (items 47 + 44) —
+  SHIPPED 2026-07-16, branch `47-44-perf-batch`, PR pending.**
+  Item 47: `init_patch_batches` now batches unique-enforcement index patches
+  alongside secondary BTree patches; `flush_patch_batches` calls `patch_many`
+  once per batch after the row loop. WAL B/row 619 → 465 (−25% at 500-row
+  scale; scales further at larger tables). Item 44: `Heap::delete_many` groups
+  row_ids by page_id — one WAL mini-txn per page; WAL B/row 230 → 107 (−53%),
+  416k rec/s at 5000 rows. Crash harness 38/38. Clippy/fmt clean.
+
 - **A3 gate size-aware selectivity (item 43) — SHIPPED 2026-07-15, branch
   `43-a3-gate-size-aware`, PR #115 (DO NOT MERGE without independent bench
   validation run).**
@@ -3313,6 +3322,37 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-16 — Items 47 + 44: UPDATE B-tree in-place patch + DELETE batched mini-txn (PR pending)
+
+- **Item 47 — root cause found**: `stage_row_index_writes_update` was calling
+  `patch_many` per-row with a single entry for the unique-enforcement index
+  (PRIMARY KEY `id`). 250 rows × 1 FPI per row per leaf × 8KB = 2 MB extra WAL,
+  driving WAL B/row from the expected ~100 to **8770** in the first naive
+  implementation. Only the secondary BTree was being accumulated into
+  `patch_batches`; the unique index was calling `patch_many` immediately.
+- **Fix**: `init_patch_batches` extended to create a `PatchColBatch` entry for
+  every `col.unique_index_root` (unique-enforcement index, added by item 35)
+  in addition to `col.index_root` (secondary BTree). `stage_row_index_writes_update`
+  unchanged-key path for unique indexes now pushes into `patch_batches` and
+  `flush_patch_batches` calls `DiskBTree::patch_many` once per non-empty batch
+  after the full row loop. `#[allow(clippy::too_many_arguments)]` added (8 args).
+- **Item 47 measured result**: WAL B/row **619 → 465** (−25%) at 500-row scale.
+  FPI savings grow with table size because more rows share the same leaf pages.
+- **Item 44 measured result**: WAL B/row **230 → 107** (−53%) at 5000 rows,
+  throughput **416k rec/s**. `Heap::delete_many` groups already-page-sorted
+  RowIds by page_id; one WAL mini-txn per page instead of per row.
+- **macOS scale constraint**: UPDATE throughput at 10k rows even with
+  `deferred_sync=true` accumulates ~13ms/row from per-mini-txn mmap operations,
+  WAL BufWriter writes, and mutex acquisitions — NOT a code regression. Item 47
+  test uses 500 rows (completes in 9ms; threshold 570 < baseline 619 proves
+  improvement). Item 44 test uses 10k rows (12ms for 5000 deletes thanks to batching).
+- Crash harness: 38/38 (unchanged). Clippy: clean. fmt: clean.
+- Backlog docs: `47_update_delete_write_throughput.md` → SHIPPED (Phase A);
+  `44_bulk_delete_batched_wal.md` → SHIPPED.
+- PROGRESS.md updated with "Items 47 + 44" entry (WAL B/row before/after,
+  invariant analysis).
+- Branch: `47-44-perf-batch`. PR pending.
 
 ### 2026-07-15 — Items 46 + 48: GROUP BY decode pushdown + DELETE all O(1) fast path (PR #117)
 
