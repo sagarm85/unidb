@@ -220,6 +220,9 @@ MiB, not 512 MiB. Overridable via the `UNIDB_BUFFER_POOL_PAGES` env var or
 open (`(0..capacity).map(...).collect()`), which is why the default stays
 modest rather than jumping to millions of frames — see the follow-up backlog
 item for lazy/growable frame allocation, which would remove that tradeoff.
+Full investigation, the demo-side and bench-harness fixes, and the three-tier
+config picture (embedded default / `unidb-studio` / bench tooling): see
+`docs/performance/buffer_pool_tuning.md`.
 Pin/unpin, clock eviction, dirty tracking, D5 enforcement on flush/evict.
 `fetch_page` returns a per-call page copy — cheap for point access,
 measurably expensive for hot-hub scans, which is what motivated the graph
