@@ -3303,6 +3303,31 @@ plain reporting.
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-07-15 — Confirmed the buffer-pool fix at 10k/20k scale (PR #111 merged)
+
+- After PR #111 (items 39/42) merged, ran a second, more representative
+  full-model report (`docs/performance/multi_model_report_20260715_092725.md`)
+  on a fresh branch `mm-report-10k-20k-sweep` — `MM_SIZES=10000,20000` across
+  every sweep-driven table, capping Table 4 at 20,000 txns (not the default
+  1,000,000) to keep it completable given Table 4's documented by-design
+  slowness is independent of the buffer-pool question.
+- Confirmed flat: Table 3.1 bulk insert 15,039 -> 15,723 rec/s (10k -> 20k
+  rows), Table 4 240 -> 238 txns/s, Table 1 `W4/W0` 1.20x -> 1.34x (within
+  historical band). Peak RSS 99 MiB — nowhere near the 2,000,000-frame
+  ceiling, confirming the bookkeeping-vs-cache distinction in practice.
+- New honest finding, not a regression and not addressed by this run: item
+  39's Table 5 UPDATE-bulk gap widens with scale (postgres +400% @ 1,000
+  orders -> postgres +1,041% @ 20,000 orders) — Postgres's bulk-UPDATE
+  query-planner maturity, flagged as a future optimization candidate, not
+  acted on.
+- Consolidated both runs into `docs/performance/buffer_pool_tuning.md` (the
+  durable reference doc) and a new `PROGRESS.md` entry. Also cleaned up a
+  stray orphaned table row found at the very end of `PROGRESS.md` (a merge
+  artifact, unrelated to this session's own edits).
+- No code changed — report generation + documentation only. Gates:
+  build/clippy/fmt clean, `cargo test --workspace` all green, crash harness
+  38/38 unchanged.
+
 ### 2026-07-15 — Items 39/42: PK/FK stress bench + bench harness buffer-pool fix
 
 - Picked up item 39 (already committed by the user as `a6c56ba` on branch

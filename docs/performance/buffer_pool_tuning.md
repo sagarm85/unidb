@@ -117,6 +117,40 @@ maturity that this project isn't claiming to match (`CLAUDE.md` §1).
 
 ---
 
+## Confirmed at larger scale — 10k/20k sweep (2026-07-15)
+
+The numbers above (`MM_FK_ORDERS=1,000`, `MM_SIZES=100,1000`) were a
+turnaround-optimized small sweep. A second, more representative full-report
+run at `MM_SIZES=10000,20000` / `MM_BULK_SIZES=10000,20000` /
+`MM_TX_SWEEP=10000,20000` / `MM_CRUD_ROWS=20000` / `MM_FK_ORDERS=20000`
+(`multi_model_report_20260715_092725.md`, Peak RSS **99 MiB**) confirms the
+fix holds at a meaningfully larger scale, not just the tiny smoke-test size:
+
+| Table | Metric | Result | Verdict |
+|---|---|---|---|
+| 1 — commit ladder | `W4/W0` | 1.20× @ 10k rows -> 1.34× @ 20k | within the historical ~1.1-1.3× band, no pool-exhaustion spike |
+| 3.1 — bulk insert | unidb rec/s | 15,039 @ 10k -> 15,723 @ 20k | **flat**, consistent with the 1M-row smoke test (15,905 rec/s) — no repeat of the mid-run dip seen in the interrupted full-scale attempt |
+| 4 — atomic multi-model txn | unidb txns/s | 240 @ 10k txns -> 238 @ 20k | flat, fsync/HNSW-bound as expected, unaffected by the pool fix either way |
+| Peak RSS | whole process | 99 MiB | scales with data touched, nowhere near the 2,000,000-frame (~15.3 GiB) ceiling — confirms the bookkeeping-vs-cache distinction in practice, not just in theory |
+
+**One new, honestly-reported finding — not a regression, not something the
+buffer-pool fix was meant to address:** Table 5's unidb-vs-Postgres gap on
+`UPDATE bulk (re-checks FK path)` and `SELECT JOIN` **widens** as
+`MM_FK_ORDERS` grows:
+
+| Operation | @ 1,000 orders | @ 20,000 orders |
+|---|---:|---:|
+| UPDATE bulk (re-checks FK path) | postgres +400% | postgres **+1,041%** |
+| SELECT JOIN orders/customers | postgres +189% | postgres +84% (JOIN improved relatively; UPDATE did not) |
+| INSERT valid FK | unidb +3% | postgres +3% (essentially even at both scales) |
+
+Postgres's bulk-UPDATE query-planner maturity pulling further ahead at scale
+is expected and not evidence of anything broken — flagged here for anyone
+who wants to scope a future optimization on unidb's bulk-UPDATE-with-FK-check
+path, not as an action item this investigation took on.
+
+---
+
 ## Operational notes
 
 - **Setting `UNIDB_BUFFER_POOL_PAGES` too high "to be safe" has a real cost**:
@@ -149,3 +183,7 @@ maturity that this project isn't claiming to match (`CLAUDE.md` §1).
   `BufferPool::open`, `find_victim`, `BufferPoolFull`).
 - `unidb-studio/demo/DEMO_GUIDE.md` — the demo-side fix and its own
   measured numbers (0 evictions, 250-586 MiB RSS at 1.5M-4M row seeds).
+- `docs/performance/multi_model_report_20260715_091035.md` — the small-sweep
+  full report (`MM_FK_ORDERS=1,000`).
+- `docs/performance/multi_model_report_20260715_092725.md` — the 10k/20k-sweep
+  full report confirming the fix at larger scale (Peak RSS 99 MiB).

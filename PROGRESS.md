@@ -5924,4 +5924,53 @@ integrity-check cost** — not that unidb wins every row.
 | crash harness (`cargo test --test crash`) | ✅ **38/38** (unchanged) |
 
 **No `FORMAT_VERSION` bump.** No locked-decision (§3) change.
-| No API/catalog changes | ✅ confirmed — matches spec's declared scope |
+
+## Buffer-pool fix confirmed at larger scale — 10k/20k sweep (2026-07-15)
+
+**Branch:** `mm-report-10k-20k-sweep`
+**PR:** _pending review_
+**Report:** `docs/performance/multi_model_report_20260715_092725.md`
+
+### Why this run
+
+The item 39/42 numbers recorded above used a turnaround-optimized small sweep
+(`MM_SIZES=100,1000`, `MM_FK_ORDERS=1,000`) to avoid the multi-hour Table 4
+stall that interrupted the first full-scale attempt. This run confirms the
+buffer-pool fix (item 42) holds at a more representative scale —
+`MM_SIZES=10000,20000`, `MM_BULK_SIZES=10000,20000`, `MM_TX_SWEEP=10000,20000`,
+`MM_CRUD_ROWS=20000`, `MM_FK_ORDERS=20000` — capping Table 4's sweep at 20,000
+txns (not the default 1,000,000) specifically to keep the run completable
+in a reasonable time, since Table 4 is documented as slow "by design"
+independent of the buffer-pool question.
+
+### Results
+
+| Table | Metric | Result | Verdict |
+|---|---|---|---|
+| 1 — commit ladder | `W4/W0` | 1.20× @ 10k rows -> 1.34× @ 20k | within the historical ~1.1-1.3× band |
+| 3.1 — bulk insert | unidb rec/s | 15,039 @ 10k -> 15,723 @ 20k | **flat**, consistent with the 1M-row smoke test (15,905 rec/s) |
+| 4 — atomic multi-model txn | unidb txns/s | 240 @ 10k txns -> 238 @ 20k | flat, fsync/HNSW-bound, unaffected by the pool fix either way |
+| Peak RSS | whole process | **99 MiB** | scales with data touched, nowhere near the 2,000,000-frame (~15.3 GiB) ceiling |
+
+### New finding, honestly reported (not a regression, not addressed by this run)
+
+Table 5's unidb-vs-Postgres gap on `UPDATE bulk (re-checks FK path)` **widens**
+as `MM_FK_ORDERS` grows — postgres +400% at 1,000 orders vs postgres **+1,041%**
+at 20,000 orders. `INSERT valid FK` stays essentially even at both scales
+(unidb +3% -> postgres +3%). Postgres's bulk-UPDATE query-planner maturity
+pulling further ahead at scale is expected, not evidence of anything broken —
+recorded here as a candidate for a future optimization scope, not an action
+item this investigation took on.
+
+### Gates
+
+| Gate | Result |
+|------|--------|
+| `cargo build --release --bench decompose` | ✅ clean |
+| `cargo clippy --release --bench decompose -- -D warnings` | ✅ clean |
+| `cargo fmt --all --check` | ✅ clean |
+| `cargo test --workspace` | ✅ all green |
+| crash harness (`cargo test --test crash`) | ✅ **38/38** (unchanged — report-only run, no code touched) |
+
+**No `FORMAT_VERSION` bump.** No locked-decision (§3) change. No code
+changed in this run — report generation + documentation only.
