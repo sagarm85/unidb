@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `45_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `49_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -59,10 +59,14 @@
 | 42 | `42_bench_harness_buffer_pool.md` | Improvement | ✅ SHIPPED — `benches/decompose.rs` never sized its buffer pool, so any report sweeping into 1M+ rows silently hit `BufferPoolFull` and understated unidb's real throughput (measured 1,228 rec/s vs the true 15,905 rec/s at 1M rows, ~13× recovered). New `bench_engine_open()` helper opens every bench engine with a 2,000,000-frame pool. See PROGRESS.md |
 | 43 | `43_a3_gate_size_aware_selectivity.md` | Improvement | ✅ SHIPPED 2026-07-15 — size-aware cost model (`page_count > BTREE_STARTUP + matched×HEAP_FETCH_SEQ_EQUIV`), best-arm predicate selection (`find_best_indexable_btree_predicate` prefers `k<N` over `k>=0`), and A3 gate added to exec_select. Crossover at ~2600 rows for 50% selectivity; 3 permanent regression tests. PR pending. |
 | 44 | `44_bulk_delete_batched_wal.md` | Performance | ⏳ NOT STARTED — unconditional/bulk `DELETE` pays one WAL mini-transaction per row (`Heap::delete`, `src/heap.rs:399`, self-contained `begin_mini_txn`/`commit_mini_txn` per call, looped once per matched row in `exec_delete`) — the same shape item 40 already fixed for `CREATE INDEX`. Measured `DELETE FROM t` (no predicate) at postgres +275%, `DELETE selected` at +409% (20k rows). `matching_rows` already sorts candidates into physical page order (B5) — the natural fix is a page-batched delete path reusing that ordering, one mini-txn per page instead of per row. |
+| 45 | `45_select_filtered_parallel_btree_scan.md` | Performance | ⏳ NOT STARTED — SELECT filtered (k<N) at 0.35× PG (+182%) after item 43; three structural levers: (1) serial B-tree range scan before any parallelism (all candidates collected before first worker starts), (2) per-query `std::thread::scope` spawn tax (~900 µs fixed), (3) per-row `Vec<Literal>` + `String` alloc. Fixes: partitioned B-tree range across workers; pre-spawned worker pool; arena-allocated row data. |
+| 46 | `46_select_grouped_hash_aggregate.md` | Performance | ⏳ NOT STARTED — SELECT grouped (GROUP BY g) at 0.60× PG (+67%); `cols/row = 4.00` proves full-row decode even though only `g` is needed. Fixes: extend B2 decode-pushdown into aggregate path (drop col mask to 1 for GROUP-BY-only); integer-keyed HashMap specialisation; partial-aggregate parallelism (per-worker local HashMap, merge at gather). |
+| 47 | `47_update_delete_write_throughput.md` | Performance | ⏳ NOT STARTED — UPDATE bulk at 0.17× PG (+481%), `WAL B/row = 619` (B-tree updated even for unchanged key). Root cause: tombstone+insert on B-tree update even when key value is unchanged (RowId changes, key doesn't). Fix (Phase A): in-place RowId patch in leaf node for unchanged-key UPDATE. Phase B: vectorised predicate scan on write path. Phase C (milestone-sized): HOT-equivalent update chain. |
+| 48 | `48_delete_all_truncate_fast_path.md` | Performance | ⏳ NOT STARTED — DELETE all at 0.23× PG (+331%), `dec/row = 1.00` (every row decoded), 20k per-row mini-txns for no-predicate delete. Fix: `TRUNCATE TABLE t` SQL + `Heap::truncate()` (single WAL record + heap reset + index root reset); opportunistic DELETE-all → truncate routing when no FK children and no CDC subscribers. |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `45_…`.**
+**Next new file → `49_…`.**
 
 ## Next up (candidates — pick one, then create `NN_<slug>.md`)
 
@@ -95,6 +99,18 @@ does. Not a quick constant bump: the current 0.3 already fixes a prior
 regression (forcing the index path regressed a 50%-selective DELETE) —
 needs a real size-aware cost model, re-derived and measured across a size
 sweep, not a single new fixed number.
+
+**#45 — SELECT filtered remaining gap: serial B-tree scan + thread-spawn + alloc
+(`45_select_filtered_parallel_btree_scan.md`, NOT STARTED).** After item 43 the gate is right (cols/row=4.00, parallel fires), but 0.35× PG remains. Three levers: (1) partitioned B-tree range across workers instead of serial candidate collection, (2) pre-spawned worker pool instead of `std::thread::scope` per query, (3) arena-allocated row data instead of per-row `Vec<Literal>` + `String`. Each is independent; (2) alone should recover most of the thread-spawn overhead.
+
+**#46 — SELECT grouped: full-row decode + row-at-a-time hash-aggregate
+(`46_select_grouped_hash_aggregate.md`, NOT STARTED).** 0.60× PG (+67%); `cols/row=4.00` shows B2 decode-pushdown not applied on the aggregate path. Extend column mask to GROUP-BY exprs only; specialize integer-key HashMap; partial-aggregate in workers.
+
+**#47 — UPDATE/DELETE write throughput: unchanged-key B-tree patch + vectorised predicate scan
+(`47_update_delete_write_throughput.md`, NOT STARTED).** Largest gaps: UPDATE 0.17×, DELETE selected 0.17×. Primary driver: `WAL B/row=619` for body-only UPDATE shows B-tree does tombstone+insert even when key is unchanged (RowId changes, key value doesn't). Phase A: in-place RowId patch in leaf node (valid when old_key==new_key). Phase B: vectorised predicate deform on `matching_rows` path. Phase C (milestone-sized): HOT-equivalent update chain.
+
+**#48 — DELETE all / TRUNCATE fast path
+(`48_delete_all_truncate_fast_path.md`, NOT STARTED).** 0.23× PG (+331%); `dec/row=1.00`, 20k per-row mini-txns for a no-predicate delete. Fix: `TRUNCATE TABLE t` + `Heap::truncate()` (single WAL record + heap+index reset); opportunistic DELETE-all routing. FK RESTRICT + CDC "truncate" event must be handled.
 
 **#44 — Bulk DELETE pays one WAL mini-transaction per row
 (`44_bulk_delete_batched_wal.md`, NOT STARTED).** `Heap::delete`
