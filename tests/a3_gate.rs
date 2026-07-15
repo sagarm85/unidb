@@ -163,6 +163,68 @@ fn a3_gate_no_analyze_still_correct() {
     );
 }
 
+/// Regression guard: a 50%-selective DELETE must stay on the scan path at
+/// LARGE table sizes too (above the parallel-SELECT crossover).  Before the
+/// serial-vs-parallel cost split, the gate used `HEAP_FETCH_SEQ_EQUIV = 0.012`
+/// (tuned for 18-worker parallel SELECT) for serial DELETE too — causing
+/// 50%-selective DELETE to wrongly take the index path at large tables.
+/// `HEAP_FETCH_SEQ_EQUIV_SERIAL = 0.05` keeps it on the scan path.
+///
+/// Path signal: `cols_decoded_total` delta.
+///   Scan path:  each row has its predicate column deformed (1 col × total_rows)
+///               plus all columns fully decoded for matched rows (3 cols × half):
+///               delta ≈ total_rows × 1 + half × 3
+///   Index path: only matched candidates are fully decoded (3 cols × half):
+///               delta ≈ half × 3
+///
+///   Schema has 3 columns (id, k, body), 1 predicate column (k), so:
+///   scan ≈ total + 3 × half;  index ≈ 3 × half
+///   Asserting delta > 4 × half distinguishes them cleanly.
+#[test]
+fn a3_gate_50pct_delete_large_table_stays_on_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open(&dir);
+
+    exec(&engine, "CREATE TABLE t (id INT, k INT, body TEXT)");
+    exec(&engine, "CREATE INDEX ki ON t USING BTREE (k)");
+
+    let total = 10_000_usize; // ~72 pages — well above the parallel-SELECT crossover
+    let xid = engine.begin().unwrap();
+    for i in 0..total {
+        engine
+            .execute_sql(
+                xid,
+                &format!("INSERT INTO t (id, k, body) VALUES ({i}, {i}, 'row{i}')"),
+            )
+            .unwrap();
+    }
+    engine.commit(xid).unwrap();
+    exec(&engine, "ANALYZE t");
+
+    let half = total / 2;
+    // cols_decoded: scan ≈ total×1 + half×3 = 10000+15000=25000
+    //               index ≈ half×3 = 15000
+    // threshold: 4×half = 20000 separates them
+    let cols0 = Engine::cols_decoded_total();
+    exec(&engine, &format!("DELETE FROM t WHERE k >= {half}"));
+    let cols_delta = Engine::cols_decoded_total().saturating_sub(cols0);
+
+    assert!(
+        cols_delta > (4 * half) as u64,
+        "50%-selective DELETE on large table appears to have taken the index path \
+         (cols_decoded delta={cols_delta}, expected >{} for scan path; \
+         index path would give ~{})",
+        4 * half,
+        3 * half
+    );
+
+    let remaining = query_count(&engine, "SELECT id FROM t");
+    assert_eq!(
+        remaining, half,
+        "50%-selective DELETE on large table: expected {half} rows remaining, got {remaining}"
+    );
+}
+
 /// Regression: a 50%-selective range DELETE on a small table must NOT take the
 /// B-tree path (which regressed it, per CLAUDE.md §0.6.5).  After ANALYZE with
 /// the size-aware gate, `page_count <= index_cost` → scan is chosen → no

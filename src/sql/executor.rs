@@ -1510,7 +1510,7 @@ fn exec_select(
     if let Some(hit) = predicate.as_ref().and_then(|e| {
         find_best_indexable_btree_predicate(e, &table_def, ctx.catalog.table_stats(&table_def.name))
     }) {
-        if index_lookup_is_selective(&table_def, hit, ctx) {
+        if index_lookup_is_selective(&table_def, hit, ctx, true) {
             if let Some(result) =
                 try_exec_select_btree(&table_def, projection, predicate, hit, ctx)?
             {
@@ -2350,25 +2350,34 @@ type MatchedRows = Vec<(RowId, Vec<Literal>)>;
 /// original 50%-selective-DELETE behaviour for un-re-analyzed tables.
 const INDEX_RANGE_SELECTIVITY_MAX: f64 = 0.3;
 
-/// How many sequential page reads one `heap.get()` call is equivalent to in
-/// unidb's mmap storage model.  unidb pages live in the OS page cache via
-/// mmap, so "random" vs. "sequential" access cost is much closer than in
-/// Postgres's buffer-pool model (which uses random_page_cost / seq_page_cost =
-/// 4.0).  The real overhead of one `heap.get()` is the per-call function
-/// overhead plus any TLB / hardware-prefetch disadvantage vs. a sequential
-/// page walk — empirically this lands around 0.012 seq-page-read equivalents.
+/// Per-row heap fetch cost (seq-page equivalents) on the **parallel** SELECT
+/// path (`try_exec_select_btree` → `parallel_resolve_candidates`, 18 workers).
+/// unidb pages live in the OS page cache via mmap so random vs. sequential
+/// cost is much closer than in Postgres's buffer-pool model.  With 18 workers
+/// amortising the per-call overhead, one `heap.get()` ≈ 0.012 seq-page reads.
 ///
-/// Calibration: crossover between scan-wins (≤ 2 000 rows, 50 % selectivity,
-/// ~15 pages) and index-wins (≥ 40 000 rows, 50 % selectivity, ~296 pages):
-///   scan_cost  = page_count
-///   index_cost = BTREE_STARTUP_PAGES + matched_rows * HEAP_FETCH_SEQ_EQUIV
-///   index wins ⟺ scan_cost > index_cost
-///
+/// Calibration (50% selectivity, 8 KiB pages, ~133 rows/page):
 ///   At 2 000 rows (15 pages, 1 000 matched):
 ///     15 > 4 + 1 000 × 0.012 = 16 → false → scan wins ✓
 ///   At 40 000 rows (296 pages, 20 000 matched):
 ///     296 > 4 + 20 000 × 0.012 = 244 → true → index wins ✓
 const HEAP_FETCH_SEQ_EQUIV: f64 = 0.012;
+
+/// Per-row heap fetch cost on the **serial** UPDATE/DELETE path (`matching_rows`
+/// → `index_matching_rows`, one `heap.get()` per candidate, no workers).
+/// Serial random access is measurably more expensive than parallel: no
+/// amortised thread-spawn benefit, and the hardware prefetcher cannot pipeline
+/// across independently scheduled random accesses.  Empirically ≈ 0.05
+/// seq-page-read equivalents.
+///
+/// Calibration (50% selectivity — the DELETE regression case):
+///   At 2 000 rows (15 pages, 1 000 matched):
+///     15 > 4 + 1 000 × 0.05 = 54 → false → scan wins ✓
+///   At 40 000 rows (296 pages, 20 000 matched):
+///     296 > 4 + 20 000 × 0.05 = 1 004 → false → scan wins ✓
+///   At 40 000 rows, 5% selectivity (2 000 matched):
+///     296 > 4 + 2 000 × 0.05 = 104 → true → index wins ✓
+const HEAP_FETCH_SEQ_EQUIV_SERIAL: f64 = 0.05;
 
 /// Estimated overhead of the B-tree traversal in units of sequential page
 /// reads.  For table sizes in the 1 k–1 M range the tree is 3–5 levels deep;
@@ -2379,26 +2388,30 @@ const BTREE_STARTUP_PAGES: f64 = 4.0;
 /// (A3 gate).  Used by both the SELECT path (`try_exec_select_btree`) and the
 /// UPDATE/DELETE path (`matching_rows`).
 ///
-/// Equality (`=`) is always taken — a point lookup is inherently selective and
-/// carries negligible overhead.  For range predicates we use a two-sided cost
-/// model when `ANALYZE` has recorded a page count for the table:
+/// `parallel`: `true` when the caller will resolve candidates via
+/// `parallel_resolve_candidates` (SELECT fast path); `false` when each
+/// candidate is resolved serially (UPDATE/DELETE via `index_matching_rows`).
+/// The two paths have different per-row costs — parallel amortises thread
+/// overhead across many workers, so its effective `heap.get()` cost is much
+/// lower than the serial path's.  Using the parallel constant for serial
+/// UPDATE/DELETE over-estimated the index benefit and regressed 50%-selective
+/// DELETE at large table sizes (296 pages, 20 k matched: parallel said
+/// "296 > 244 → index", but serial actually costs "296 > 1004 → scan").
 ///
-///   scan_cost  ≈ page_count               (one sequential read per page)
-///   index_cost ≈ BTREE_STARTUP_PAGES
-///              + matched_rows × HEAP_FETCH_SEQ_EQUIV
+/// For range predicates with `ANALYZE` page_count:
+///   scan_cost  ≈ page_count
+///   index_cost ≈ BTREE_STARTUP_PAGES + matched_rows × fetch_cost
+///   where fetch_cost = HEAP_FETCH_SEQ_EQUIV      (parallel, 0.012)
+///                    | HEAP_FETCH_SEQ_EQUIV_SERIAL (serial,   0.05)
 ///
-/// This creates the size-dependent crossover Postgres's planner also exhibits:
-/// at small tables the per-row `heap.get()` overhead outweighs the page
-/// savings; at large tables scanning the full page set becomes more expensive
-/// than the targeted index fetch.
-///
-/// When `page_count` is absent (stats pre-date this field) the gate falls back
-/// to the legacy fixed selectivity threshold, preserving existing behaviour for
-/// tables that have not been re-`ANALYZE`d.
+/// Equality (`=`) is always taken — a point lookup is inherently selective.
+/// When `page_count` is absent the gate falls back to the legacy fixed
+/// selectivity threshold, preserving behaviour for un-re-ANALYZEd tables.
 fn index_lookup_is_selective(
     table_def: &TableDef,
     hit: (&str, CmpOp, &Literal),
     ctx: &ExecCtx,
+    parallel: bool,
 ) -> bool {
     let (column, op, literal) = hit;
     if matches!(op, CmpOp::Eq) {
@@ -2415,8 +2428,13 @@ fn index_lookup_is_selective(
     };
     // Size-aware cost model (requires ANALYZE with page_count, item 43).
     if stats.page_count > 0 {
+        let fetch_cost = if parallel {
+            HEAP_FETCH_SEQ_EQUIV
+        } else {
+            HEAP_FETCH_SEQ_EQUIV_SERIAL
+        };
         let matched_rows = selectivity * stats.row_count as f64;
-        let index_cost = BTREE_STARTUP_PAGES + matched_rows * HEAP_FETCH_SEQ_EQUIV;
+        let index_cost = BTREE_STARTUP_PAGES + matched_rows * fetch_cost;
         return (stats.page_count as f64) > index_cost;
     }
     // Fallback: page_count unavailable (pre-item-43 ANALYZE) → legacy gate.
@@ -2449,7 +2467,7 @@ fn matching_rows(
     if let Some(hit) = predicate.as_ref().and_then(|e| {
         find_best_indexable_btree_predicate(e, table_def, ctx.catalog.table_stats(&table_def.name))
     }) {
-        if index_lookup_is_selective(table_def, hit, ctx) {
+        if index_lookup_is_selective(table_def, hit, ctx, false) {
             if let Some(rows) = index_matching_rows(heap, snapshot, ctx, table_def, predicate, hit)?
             {
                 return Ok(rows);
