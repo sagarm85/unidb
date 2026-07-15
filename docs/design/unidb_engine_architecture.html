@@ -125,7 +125,8 @@ loses <b>zero</b> data on a crash where the four-system stack tears a record.
         <li><a href="#s8-5">Events &amp; realtime</a></li>
         <li><a href="#s8-6">Admin, stats, logs &amp; metrics</a></li>
         <li><a href="#s8-7">Replication</a></li>
-        <li><a href="#s8-8">Error codes</a></li></ol></li>
+        <li><a href="#s8-8">Object storage</a></li>
+        <li><a href="#s8-9">Error codes</a></li></ol></li>
   <li><a href="#s9">Operations &amp; high availability</a></li>
   <li><a href="#s10">Performance — measured against Postgres</a></li>
   <li><a href="#s11">Configuration &amp; performance tuning</a>
@@ -1122,6 +1123,9 @@ data. All accept <code>X-Txn-Id</code> to join a session.</p>
 <tr><td><span class="method m-get">GET</span> <code>/tables</code></td>
     <td>List user tables and their columns (cheap, no scan). For full introspection query <code>information_schema.*</code> over <code>/sql</code>.</td>
     <td><code>200</code> array of <code>{ "name", "columns": [ { "name", "type", "nullable", "index" } ] }</code></td></tr>
+<tr><td><span class="method m-post">POST</span> <code>/tables/{table}/bulk</code></td>
+    <td>Bulk-insert NDJSON rows into a table in one transaction — one begin, one prepared <code>INSERT</code>, N rows, one commit. Content-Type <code>application/x-ndjson</code>, one JSON object per line; the first row's keys set the column order, missing keys become <code>NULL</code>. Any error (malformed line, type mismatch, constraint violation) rolls back the whole batch — a partial insert is never left visible.</td>
+    <td><code>200</code> <code>{ "inserted": N, "errors": 0, "elapsed_ms": N }</code></td></tr>
 </table>
 
 <h3 id="s8-5">8.5 Events &amp; realtime</h3>
@@ -1130,6 +1134,15 @@ data. All accept <code>X-Txn-Id</code> to join a session.</p>
 <tr><td><span class="method m-post">POST</span> <code>/tables/{table}/events</code></td>
     <td>Opt a table into event capture. No body.</td>
     <td><code>204 No Content</code></td></tr>
+<tr><td><span class="method m-get">GET</span> <code>/tables/{table}/events</code></td>
+    <td>Query whether event capture is on for a table.</td>
+    <td><code>200</code> <code>{ "enabled": true|false }</code></td></tr>
+<tr><td><span class="method m-del">DELETE</span> <code>/tables/{table}/events</code></td>
+    <td>Turn event capture off. Already-captured events are kept until consumed and vacuumed — only future writes stop emitting events. Returns success even if it was already off.</td>
+    <td><code>204 No Content</code></td></tr>
+<tr><td><span class="method m-get">GET</span> <code>/events/head</code></td>
+    <td>Return the current highest committed event sequence number without opening a stream — a cheap way to position a new subscriber at "now" instead of replaying full history.</td>
+    <td><code>200</code> <code>{ "seq": N }</code></td></tr>
 <tr><td><span class="method m-post">POST</span> <code>/events/ack</code></td>
     <td>Advance a consumer's durable offset; body <code>{ "consumer": "billing-worker", "up_to_seq": 17 }</code>.</td>
     <td><code>204 No Content</code></td></tr>
@@ -1191,6 +1204,12 @@ same numbers are queryable as an ordinary table via
 <tr><td><span class="method m-get">GET</span> <code>/stats</code></td>
     <td>Activity + health snapshot (see below).</td>
     <td><code>200</code> JSON</td></tr>
+<tr><td><span class="method m-get">GET</span> <code>/stats/history</code></td>
+    <td>A rolling window (up to 300 points) of timestamped stats snapshots, with commit/WAL rates computed between consecutive points — lets a dashboard prefill its charts on load instead of starting empty. Params: <code>points</code> (default 60), <code>interval_ms</code>.</td>
+    <td><code>200</code> <code>{ "interval_ms", "points": [ { "t", "commits", …, "commits_per_sec" } ] }</code></td></tr>
+<tr><td><span class="method m-put">PUT</span> <code>/config/slow_query_threshold_ms</code></td>
+    <td>Superuser. Adjust the slow-query logging threshold at runtime, no restart; body <code>{ "threshold_ms": N }</code> (<code>0</code> disables). Statements over the threshold are logged and appear in <code>GET /stats</code>'s <code>recent_slow_queries</code>.</td>
+    <td><code>204 No Content</code></td></tr>
 <tr><td><span class="method m-get">GET</span> <code>/logs</code></td>
     <td>Bounded, cursor-paged tail of structured JSON logs (superuser). Params: <code>level</code>, <code>since</code>, <code>until</code>, <code>q</code>, <code>cursor</code>, <code>limit</code> (≤500).</td>
     <td><code>200</code> <code>{ "logs": [ … ], "returned", "scanned", "truncated", "next_cursor" }</code></td></tr>
@@ -1229,7 +1248,40 @@ Example fragment:</p>
     <td>Ship log records after <code>from_lsn</code> as a byte stream; the primary's tail LSN is in the <code>x-unidb-tail-lsn</code> response header.</td></tr>
 </table>
 
-<h3 id="s8-8">8.8 Error codes</h3>
+<h3 id="s8-8">8.8 Object storage</h3>
+<p class="small">Seven routes expose the engine's built-in object store — large
+files tiered to S3/MinIO-compatible storage, with their metadata living in
+ordinary catalog tables (see §6.2 for the embedding-search-over-files
+pattern). All require a bearer token. If object storage isn't configured on
+this server, every route below returns
+<code>503 { "error": "…", "code": "STORAGE_NOT_AVAILABLE" }</code> rather than
+failing in a less predictable way.</p>
+<table>
+<tr><th>Route</th><th>Purpose &amp; payload</th><th>Response</th></tr>
+<tr><td><span class="method m-get">GET</span> <code>/storage/buckets</code></td>
+    <td>List buckets.</td>
+    <td><code>200</code> <code>{ "buckets": [ { "name", "created_by", "created_at_ms" } ] }</code></td></tr>
+<tr><td><span class="method m-post">POST</span> <code>/storage/buckets</code></td>
+    <td>Create a bucket; body <code>{ "name": "…" }</code>.</td>
+    <td><code>201</code></td></tr>
+<tr><td><span class="method m-del">DELETE</span> <code>/storage/buckets/{name}</code></td>
+    <td>Delete an empty bucket.</td>
+    <td><code>204</code>; <code>409</code> if the bucket still has objects</td></tr>
+<tr><td><span class="method m-get">GET</span> <code>/storage/{bucket}/objects</code></td>
+    <td>List objects, optionally scoped with <code>?prefix=</code> and folded into virtual folders with <code>&amp;delimiter=</code> (S3-style listing).</td>
+    <td><code>200</code> <code>{ "objects": [ { "object_key", "size", "etag", "content_type", "status", "tier" } ], "prefixes": [ … ] }</code></td></tr>
+<tr><td><span class="method m-put">PUT</span> <code>/storage/{bucket}/objects/{*key}</code></td>
+    <td>Upload an object. Below the inline threshold (default 1 MiB) the bytes are stored directly, in one transaction; at or above it, the response hands back a presigned URL and the client uploads the bytes straight to storage.</td>
+    <td><code>201</code> <code>{ "tier": "inline", "size", "etag" }</code> or <code>200</code> <code>{ "presigned_put_url", "storage_key" }</code></td></tr>
+<tr><td><span class="method m-del">DELETE</span> <code>/storage/{bucket}/objects/{*key}</code></td>
+    <td>Delete an object.</td>
+    <td><code>204</code>; <code>404</code> if not found</td></tr>
+<tr><td><span class="method m-get">GET</span> <code>/storage/{bucket}/presign/{*key}</code></td>
+    <td>Get a time-limited direct-download URL, so a browser or client can fetch the object without holding an app credential.</td>
+    <td><code>200</code> <code>{ "presigned_get_url": "…" }</code></td></tr>
+</table>
+
+<h3 id="s8-9">8.9 Error codes</h3>
 <p>Every error carries a stable machine-readable <code>code</code>:</p>
 <table>
 <tr><th>HTTP</th><th>Code</th><th>Meaning</th></tr>
@@ -1247,6 +1299,8 @@ Example fragment:</p>
 <tr><td>400</td><td><code>EMPTY_BATCH</code> / <code>BAD_BASE64</code> / <code>BATCH_TOO_LARGE</code></td><td>Invalid batch-insert payload</td></tr>
 <tr><td>401</td><td><code>UNAUTHORIZED</code></td><td>Missing/invalid/expired token</td></tr>
 <tr><td>503</td><td><code>DURABILITY_FAILURE</code></td><td>A disk flush failed; the engine must be restarted (durability can no longer be guaranteed)</td></tr>
+<tr><td>503</td><td><code>STORAGE_NOT_AVAILABLE</code></td><td>Object storage isn't configured on this server</td></tr>
+<tr><td>409</td><td><code>BUCKET_NOT_EMPTY</code></td><td>Bucket delete attempted while it still holds objects</td></tr>
 <tr><td>500</td><td><code>INTERNAL_ERROR</code></td><td>I/O, checksum, or corruption a well-formed request should never trigger</td></tr>
 </table>
 
