@@ -439,6 +439,92 @@ impl Heap {
         Ok(())
     }
 
+    /// Item 44: batched xmax-stamp for DELETE — one WAL mini-txn per *page*
+    /// instead of one per row.  `row_ids` MUST be sorted by `(page_id, slot)`
+    /// (guaranteed by `matching_rows`'s B5 physical-order sort).
+    ///
+    /// For each page group: acquire exclusive latch once, do FPI check once,
+    /// write one `log_update` WAL record per row (preserving per-row redo/undo
+    /// granularity), commit one mini-txn.  Returns the list of successfully
+    /// stamped `RowId`s in the same order as the input.
+    ///
+    /// Correctness invariants (per backlog doc 44):
+    /// - D5 (WAL-before-page): FPI + per-row log_update records are written
+    ///   within the mini-txn, before `pool.write_page`.
+    /// - Undo: caller records one `UndoAction::XmaxStamp` per returned RowId.
+    /// - WriteConflict: if any row on a page already has `xmax != 0`, abort the
+    ///   current page's mini-txn and return the error — undo log reverts any
+    ///   previously committed pages in the same user transaction.
+    pub fn delete_many(
+        &self,
+        row_ids: &[RowId],
+        xid: Xid,
+        pool: &BufferPool,
+        wal: &Wal,
+        lock_mgr: &LockManager,
+    ) -> Result<Vec<RowId>> {
+        if row_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Acquire per-row write locks upfront (same as delete()).
+        for rid in row_ids {
+            lock_mgr.try_acquire_write(RecordId::row(rid.page_id, rid.slot), xid)?;
+        }
+
+        let mut deleted = Vec::with_capacity(row_ids.len());
+        let mut i = 0;
+        while i < row_ids.len() {
+            let page_id = row_ids[i].page_id;
+            // Find the run of rows on this page.
+            let j = i + row_ids[i..].partition_point(|r| r.page_id == page_id);
+            let page_rows = &row_ids[i..j];
+
+            let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
+            let _wg = pool.latch_exclusive(page_id);
+            let mut page = pool.fetch_page_for_write(page_id, wal)?;
+
+            // Conflict-check all rows on this page before touching anything.
+            for rid in page_rows {
+                let th = page.tuple_header(rid.slot)?;
+                if th.xmax != 0 {
+                    pool.unpin(page_id);
+                    wal.abort_mini_txn(txn_id, begin_lsn)?;
+                    return Err(DbError::WriteConflict { holder_xid: th.xmax });
+                }
+            }
+
+            // One FPI check for the whole page.
+            let mut prev_lsn = pool
+                .maybe_log_fpi(page_id, wal, txn_id, begin_lsn)?
+                .unwrap_or(begin_lsn);
+
+            // One log_update per row (preserves per-row redo granularity).
+            for rid in page_rows {
+                on_write(xid, *rid);
+                let old_xmax = page.tuple_header(rid.slot)?.xmax;
+                let lsn = wal.log_update(
+                    txn_id,
+                    prev_lsn,
+                    rid.page_id,
+                    rid.slot,
+                    &u64_to_le(xid),
+                    &u64_to_le(old_xmax),
+                )?;
+                page.set_xmax(rid.slot, xid)?;
+                prev_lsn = lsn;
+            }
+
+            page.set_lsn(prev_lsn);
+            pool.write_page(&page)?;
+            pool.unpin(page_id);
+            wal.commit_mini_txn(txn_id, prev_lsn)?;
+
+            deleted.extend_from_slice(page_rows);
+            i = j;
+        }
+        Ok(deleted)
+    }
+
     /// Reverse a previously-applied xmax stamp (DELETE, or UPDATE's
     /// old-version half): revert back to 0 (live). Used by transaction
     /// abort/rollback (txn.rs) and by recovery's incomplete-user-txn undo

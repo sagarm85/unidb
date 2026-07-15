@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use crate::{
+    btree_index::{DiskBTree, OrderedValue},
     bufferpool::BufferPool,
     error::{DbError, Result},
     format::{Lsn, PageId, Xid},
@@ -54,7 +55,7 @@ pub enum TxnState {
 /// it. This is rebuilt from the WAL's redo payloads if recovery has to undo
 /// an incomplete transaction after a crash instead (see recovery.rs) — it
 /// does not need to be WAL-logged itself.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum UndoAction {
     /// A new tuple version this transaction inserted (INSERT, or an
     /// UPDATE's new-version half). Undo via `Heap::undo_insert`.
@@ -62,6 +63,17 @@ pub enum UndoAction {
     /// An existing tuple whose xmax this transaction stamped (DELETE, or an
     /// UPDATE's old-version half). Undo via `Heap::undo_xmax_stamp`.
     XmaxStamp { page_id: PageId, slot: u16 },
+    /// An in-place B-tree RowId patch applied by an unchanged-key UPDATE
+    /// (item 47).  Undo by calling `DiskBTree::update_rowid_inplace` in
+    /// reverse: replace `new_rid` back with `old_rid` so the index resolves
+    /// back to the restored heap version.
+    BTreePatch {
+        meta_page: PageId,
+        page_size: usize,
+        key: OrderedValue,
+        old_rid: RowId,
+        new_rid: RowId,
+    },
 }
 
 pub struct Transaction {
@@ -599,12 +611,19 @@ impl TransactionManager {
         };
         run_abort_midpoint_hook();
         for action in undo_log.iter().rev() {
-            match *action {
+            match action {
                 UndoAction::Insert { page_id, slot } => {
-                    heap.undo_insert(page_id, slot, xid, pool, wal)?;
+                    heap.undo_insert(*page_id, *slot, xid, pool, wal)?;
                 }
                 UndoAction::XmaxStamp { page_id, slot } => {
-                    heap.undo_xmax_stamp(page_id, slot, pool, wal)?;
+                    heap.undo_xmax_stamp(*page_id, *slot, pool, wal)?;
+                }
+                // Reverse an in-place B-tree RowId patch: restore old_rid
+                // where new_rid currently sits so the index points back to
+                // the heap version that the XmaxStamp undo restores.
+                UndoAction::BTreePatch { meta_page, page_size, key, old_rid, new_rid } => {
+                    DiskBTree::new(*meta_page, *page_size)
+                        .update_rowid_inplace(key.clone(), *new_rid, *old_rid, pool, wal)?;
                 }
             }
         }

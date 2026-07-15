@@ -2969,6 +2969,13 @@ fn main() {
             bench_mm_report();
             return;
         }
+        "b2" => {
+            // Run only the B2 CRUD criterion group (skips the slow ladder).
+            let mut criterion = Criterion::default().configure_from_args();
+            bench_pg_crud(&mut criterion);
+            criterion.final_summary();
+            return;
+        }
         _ => {}
     }
 
