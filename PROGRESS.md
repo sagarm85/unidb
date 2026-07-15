@@ -5930,7 +5930,7 @@ integrity-check cost** — not that unidb wins every row.
 
 ## Item 43 — A3 gate: size-aware scan-vs-index selectivity   [PR open, needs perf validation]   2026-07-15
 
-**PR:** (pending — commit + push, "needs performance validation before merge")
+**PR:** #115 — branch `43-a3-gate-size-aware` (⚠️ do not merge until independent bench validation run)
 
 **Summary:** The A3 gate (`index_lookup_is_selective`) was a fixed 30%-selectivity
 threshold with no table-size term.  For a 50%-selective range query (`WHERE k >= lo
