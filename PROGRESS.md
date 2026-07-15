@@ -5928,7 +5928,7 @@ integrity-check cost** — not that unidb wins every row.
 ## Buffer-pool fix confirmed at larger scale — 10k/20k sweep (2026-07-15)
 
 **Branch:** `mm-report-10k-20k-sweep`
-**PR:** _pending review_
+**PR:** #112
 **Report:** `docs/performance/multi_model_report_20260715_092725.md`
 
 ### Why this run
