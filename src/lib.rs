@@ -1792,9 +1792,21 @@ impl Engine {
                             .any(|c| c.constraints.identity && !c.dropped)
                 })
                 .unwrap_or(false),
-            // UPDATE/DELETE mutate the catalog only via the legacy non-FSM
+            // UPDATE mutates the catalog only via the legacy non-FSM
             // page-list persist; FSM-backed tables self-persist the directory.
-            LogicalPlan::Update { table, .. } | LogicalPlan::Delete { table, .. } => catalog
+            LogicalPlan::Update { table, .. } => catalog
+                .lookup(table)
+                .map(|t| t.fsm_meta.is_some())
+                .unwrap_or(false),
+            // DELETE with no predicate may route through the item-48 truncate
+            // fast path (catalog.exclusive().truncate()), which requires the
+            // exclusive catalog lock — force it here regardless of FSM status.
+            LogicalPlan::Delete {
+                predicate: None, ..
+            } => false,
+            // Predicated DELETE: same as UPDATE — shared lock is fine unless
+            // the table is a legacy non-FSM table needing a page-list persist.
+            LogicalPlan::Delete { table, .. } => catalog
                 .lookup(table)
                 .map(|t| t.fsm_meta.is_some())
                 .unwrap_or(false),
