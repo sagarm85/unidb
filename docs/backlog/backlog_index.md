@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `43_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `44_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -57,10 +57,11 @@
 | 40 | `40_btree_bulk_build.md` | Performance | ✅ SHIPPED 2026-07-15 — sort-then-bulk-load CREATE INDEX backfill: collect (key, row_id) pairs, sort, `insert_many` (one WAL mini-txn / one fsync). 134.2 s → 12.0 s (**11.2×**) on 540k rows. P40 crash test added (38/38). See PROGRESS.md. |
 | 41 | `41_near_vec_distance.md` | Improvement | ✅ SHIPPED 2026-07-14 — `exec_select_near` threads its already-computed re-rank distance through to projection as a virtual `vec_distance` column (`Literal::Float`, ascending); no catalog/format change. See PROGRESS.md. |
 | 42 | `42_bench_harness_buffer_pool.md` | Improvement | ✅ SHIPPED — `benches/decompose.rs` never sized its buffer pool, so any report sweeping into 1M+ rows silently hit `BufferPoolFull` and understated unidb's real throughput (measured 1,228 rec/s vs the true 15,905 rec/s at 1M rows, ~13× recovered). New `bench_engine_open()` helper opens every bench engine with a 2,000,000-frame pool. See PROGRESS.md |
+| 43 | `43_a3_gate_size_aware_selectivity.md` | Improvement | ⏳ NOT STARTED — unidb's scan-vs-index gate (`INDEX_RANGE_SELECTIVITY_MAX = 0.3`, `src/sql/executor.rs`) is a fixed selectivity threshold with no table-size term, unlike Postgres's real cost model. Found comparing two multi-model reports at different scales: same 50%-selective query, Postgres switches Seq Scan (2k rows) -> Index Scan (40k rows); unidb always takes the scan, regardless of size. Needs a size-aware fix, not a bigger constant (the current 0.3 already fixes a prior regression). |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `43_…`.**
+**Next new file → `44_…`.**
 
 ## Next up (candidates — pick one, then create `NN_<slug>.md`)
 
@@ -80,6 +81,21 @@ bump). See PROGRESS.md.
 Child INSERT/UPDATE verifies referenced parent key via unique_index_root (O(log
 n)); parent DELETE/UPDATE RESTRICT; FkKey phantom lock for concurrent-race
 safety; 9 new tests + conc_matrix cell 10/10 PASS.
+
+**#43 — A3 scan-vs-index gate is a fixed selectivity threshold, not
+size-aware (`43_a3_gate_size_aware_selectivity.md`, NOT STARTED).**
+`index_lookup_is_selective` (`src/sql/executor.rs:2302`,
+`INDEX_RANGE_SELECTIVITY_MAX = 0.3`) decides scan-vs-index purely on
+selectivity fraction, with no table-size term — found comparing two
+multi-model reports at different scales: the same 50%-selective `SELECT
+filtered` query flips from a unidb win (+167%, small table) to a Postgres
+win (+183%, larger table). Reproduced Postgres's real plan directly:
+`Seq Scan` at 2,000 rows -> `Index Scan` at 40,000 rows, same selectivity —
+its cost model factors in growing page count, unidb's fixed threshold never
+does. Not a quick constant bump: the current 0.3 already fixes a prior
+regression (forcing the index path regressed a 50%-selective DELETE) —
+needs a real size-aware cost model, re-derived and measured across a size
+sweep, not a single new fixed number.
 
 **#37 — Buffer pool frame table: lazy/growable allocation
 (`37_lazy_buffer_pool_growth.md`, NOT STARTED).** `BufferPool::open`
