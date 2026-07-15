@@ -1,7 +1,7 @@
 # A3 scan-vs-index gate is a fixed selectivity threshold, not a real cost model
 
 **Type:** Improvement
-**Status:** NOT STARTED
+**Status:** SHIPPED — see PROGRESS.md "Item 43" entry (2026-07-15); PR pending merge
 **Priority:** Medium — not a correctness issue and not urgent, but it's a
 real, measured gap between unidb's query planning and Postgres's that widens
 with table size, discovered while comparing two multi-model report runs at

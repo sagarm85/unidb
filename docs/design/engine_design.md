@@ -1223,7 +1223,11 @@ row's B-tree entries and flushes them **coalesced** via `DiskBTree::insert_many`
 — one leaf image per statement, not per row — dropping index-maintenance WAL
 from ~8868 to ~619 B/row, UPDATE-bulk 0.11× → 0.34× vs Postgres; a selectivity-
 gated `index_matching_rows` also drives *selective* UPDATE/DELETE off the B-tree
-instead of a full scan). **Remaining write-path debt (the path to UPDATE
+instead of a full scan; **updated item 43 (2026-07-15):** the gate is now
+*size-aware* — `page_count > BTREE_STARTUP + matched_rows × HEAP_FETCH_SEQ_EQUIV`
+— and also applies to the SELECT fast path (`exec_select`), with best-arm
+predicate selection (`find_best_indexable_btree_predicate`) preferring `k < N`
+over `k >= 0` for AND predicates; crossover at ~2 600 rows for 50% selectivity). **Remaining write-path debt (the path to UPDATE
 *parity*, deferred):** UPDATE still pays the insert-new-version MVCC cost (a new
 heap version + xmax stamp + a fresh index entry per row, ~619 B/row WAL) where
 Postgres uses **HOT** (in-place, same page, no index touch) — closing it needs a

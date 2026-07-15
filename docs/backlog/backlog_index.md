@@ -57,7 +57,7 @@
 | 40 | `40_btree_bulk_build.md` | Performance | ✅ SHIPPED 2026-07-15 — sort-then-bulk-load CREATE INDEX backfill: collect (key, row_id) pairs, sort, `insert_many` (one WAL mini-txn / one fsync). 134.2 s → 12.0 s (**11.2×**) on 540k rows. P40 crash test added (38/38). See PROGRESS.md. |
 | 41 | `41_near_vec_distance.md` | Improvement | ✅ SHIPPED 2026-07-14 — `exec_select_near` threads its already-computed re-rank distance through to projection as a virtual `vec_distance` column (`Literal::Float`, ascending); no catalog/format change. See PROGRESS.md. |
 | 42 | `42_bench_harness_buffer_pool.md` | Improvement | ✅ SHIPPED — `benches/decompose.rs` never sized its buffer pool, so any report sweeping into 1M+ rows silently hit `BufferPoolFull` and understated unidb's real throughput (measured 1,228 rec/s vs the true 15,905 rec/s at 1M rows, ~13× recovered). New `bench_engine_open()` helper opens every bench engine with a 2,000,000-frame pool. See PROGRESS.md |
-| 43 | `43_a3_gate_size_aware_selectivity.md` | Improvement | ⏳ NOT STARTED — unidb's scan-vs-index gate (`INDEX_RANGE_SELECTIVITY_MAX = 0.3`, `src/sql/executor.rs`) is a fixed selectivity threshold with no table-size term, unlike Postgres's real cost model. Found comparing two multi-model reports at different scales: same 50%-selective query, Postgres switches Seq Scan (2k rows) -> Index Scan (40k rows); unidb always takes the scan, regardless of size. Needs a size-aware fix, not a bigger constant (the current 0.3 already fixes a prior regression). |
+| 43 | `43_a3_gate_size_aware_selectivity.md` | Improvement | ✅ SHIPPED 2026-07-15 — size-aware cost model (`page_count > BTREE_STARTUP + matched×HEAP_FETCH_SEQ_EQUIV`), best-arm predicate selection (`find_best_indexable_btree_predicate` prefers `k<N` over `k>=0`), and A3 gate added to exec_select. Crossover at ~2600 rows for 50% selectivity; 3 permanent regression tests. PR pending. |
 | 44 | `44_bulk_delete_batched_wal.md` | Performance | ⏳ NOT STARTED — unconditional/bulk `DELETE` pays one WAL mini-transaction per row (`Heap::delete`, `src/heap.rs:399`, self-contained `begin_mini_txn`/`commit_mini_txn` per call, looped once per matched row in `exec_delete`) — the same shape item 40 already fixed for `CREATE INDEX`. Measured `DELETE FROM t` (no predicate) at postgres +275%, `DELETE selected` at +409% (20k rows). `matching_rows` already sorts candidates into physical page order (B5) — the natural fix is a page-batched delete path reusing that ordering, one mini-txn per page instead of per row. |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
@@ -83,16 +83,14 @@ Child INSERT/UPDATE verifies referenced parent key via unique_index_root (O(log
 n)); parent DELETE/UPDATE RESTRICT; FkKey phantom lock for concurrent-race
 safety; 9 new tests + conc_matrix cell 10/10 PASS.
 
-**#43 — A3 scan-vs-index gate is a fixed selectivity threshold, not
-size-aware (`43_a3_gate_size_aware_selectivity.md`, NOT STARTED).**
-`index_lookup_is_selective` (`src/sql/executor.rs:2302`,
-`INDEX_RANGE_SELECTIVITY_MAX = 0.3`) decides scan-vs-index purely on
-selectivity fraction, with no table-size term — found comparing two
-multi-model reports at different scales: the same 50%-selective `SELECT
-filtered` query flips from a unidb win (+167%, small table) to a Postgres
-win (+183%, larger table). Reproduced Postgres's real plan directly:
-`Seq Scan` at 2,000 rows -> `Index Scan` at 40,000 rows, same selectivity —
-its cost model factors in growing page count, unidb's fixed threshold never
+**#43 — A3 scan-vs-index gate is now size-aware (SHIPPED 2026-07-15,
+`43_a3_gate_size_aware_selectivity.md`).**
+Size-aware cost model + best-arm predicate selection + gate added to
+exec_select. Crossover at ~2600 rows for 50% selectivity; 3 permanent
+regression tests in `tests/a3_gate.rs`. PR pending. The remaining
+large-scale performance gap vs Postgres is architectural (PG parallel index
+scan vs unidb's single-threaded B-tree resolution) and is a separate
+follow-up item, not item 43 scope. Original problem was:
 does. Not a quick constant bump: the current 0.3 already fixes a prior
 regression (forcing the index path regressed a 50%-selective DELETE) —
 needs a real size-aware cost model, re-derived and measured across a size
