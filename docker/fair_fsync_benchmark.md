@@ -32,7 +32,7 @@ scripts/docker_report.sh                           # default sizes (1k,10k,100k)
 MM_SIZES=100000,1000000 scripts/docker_report.sh   # push to millions
 ```
 
-Output: `docker/out/multi_model_report_<timestamp>.md`.
+Output: `docker/out/report_<timestamp>.md`. Promoted reference runs are named `benchmark_<timestamp>.md`.
 
 ## What it measures
 

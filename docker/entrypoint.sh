@@ -20,7 +20,7 @@ for _ in $(seq 1 60); do
 done
 
 mkdir -p /out
-OUT="/out/multi_model_report_$(date +%Y%m%d_%H%M%S).md"
+OUT="/out/report_$(date +%Y%m%d_%H%M%S).md"
 
 # multi_model_report.sh reads PG_URL / MM_SIZES / MM_SAMPLE / GIT_COMMIT from the
 # environment (all set by docker-compose) and captures peak RSS via GNU time -v.
