@@ -208,20 +208,22 @@ starts here** — it is the single source of recovery truth.
 
 ### 3.4 Buffer pool
 
-**Configurable** capacity: `DEFAULT_POOL_CAPACITY = 65536` frames (512 MiB at
-8 KiB pages; raised 256 -> 4096 in P1.c, then 4096 -> 65536 after a demo-scale
-bulk load showed a single ~30k-row table exceeding 32 MiB and collapsing
-insert throughput ~15-20x via forced synchronous WAL fsyncs on every
-`BufferPoolFull`). This is bookkeeping cost, not a page-data cache — unidb is
-mmap-backed, so page bytes live in the OS page cache regardless of pool size; a
-frame is ~24 bytes (pin/dirty/clock-bit metadata), so 65536 frames costs ~1.5
-MiB, not 512 MiB. Overridable via the `UNIDB_BUFFER_POOL_PAGES` env var or
-`Engine::open_with_pool_capacity`. The frame table is allocated eagerly at
-open (`(0..capacity).map(...).collect()`), which is why the default stays
-modest rather than jumping to millions of frames — see the follow-up backlog
-item for lazy/growable frame allocation, which would remove that tradeoff.
-Full investigation, the demo-side and bench-harness fixes, and the three-tier
-config picture (embedded default / `unidb-studio` / bench tooling): see
+**Configurable** capacity (ceiling): `DEFAULT_POOL_CAPACITY = 2,000,000`
+frames (item 37 — raised from 65536; safe because allocation is now **lazy**).
+Frame allocation history: 256 → 4096 (P1.c) → 65536 (demo-scale bulk-load
+fix; a single ~30k-row table exceeded 32 MiB and collapsed insert throughput
+~15-20× via forced synchronous WAL fsyncs on `BufferPoolFull`) → 2,000,000
+(item 37, lazy growth). This is bookkeeping cost, not a page-data cache —
+unidb is mmap-backed; page bytes live in the OS page cache regardless of pool
+size. A frame is ~24 bytes (pin/dirty/clock-bit metadata). `Engine::open()`
+pre-allocates only 256 frames (a small initial slab via `INITIAL_SLAB_FRAMES`)
+and grows the table one frame at a time in `find_victim` up to `capacity` as a
+ceiling. Cost at open is always ~6 KiB of frame metadata regardless of the
+ceiling; the ceiling cost only materialises for workloads that actually grow
+into it (~48 MiB at 2 M frames fully grown). Overridable via
+`UNIDB_BUFFER_POOL_PAGES` env var or `Engine::open_with_pool_capacity`. Full
+investigation, the demo-side and bench-harness fixes, and the three-tier config
+picture (embedded default / `unidb-studio` / bench tooling): see
 `docs/performance/buffer_pool_tuning.md`.
 Pin/unpin, clock eviction, dirty tracking, D5 enforcement on flush/evict.
 `fetch_page` returns a per-call page copy — cheap for point access,

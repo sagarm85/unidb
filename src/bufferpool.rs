@@ -86,6 +86,12 @@ impl PageReader for SharedPageReader {
 /// slack: at the 8 KiB default page size this is 512 pages per grow.
 const GROW_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
+/// Number of frames pre-allocated at pool open (item 37 — lazy frame growth).
+/// Keeps `Engine::open()` cheap for small/embedded workloads while allowing a
+/// multi-million-frame `capacity` ceiling without paying for it up front.
+/// Actual frames are pushed on demand in `find_victim` up to `capacity`.
+const INITIAL_SLAB_FRAMES: usize = 256;
+
 fn lock_poisoned() -> DbError {
     DbError::Recovery("buffer pool mmap lock poisoned".into())
 }
@@ -328,7 +334,11 @@ impl BufferPool {
         // session so `alloc_page` reuses that slack instead of leaking a chunk.
         let file_page_count = logical_page_count(&mmap, page_size, mapped_pages)?;
 
-        let frames = (0..capacity).map(|_| Frame::empty()).collect();
+        // Item 37: allocate only a small initial slab; grow on demand in
+        // find_victim up to `capacity` as a ceiling. Keeps open() cheap for
+        // small/embedded callers even when capacity is in the millions.
+        let initial_frames = INITIAL_SLAB_FRAMES.min(capacity);
+        let frames: Vec<Frame> = (0..initial_frames).map(|_| Frame::empty()).collect();
 
         // Grow the file by ~4 MiB at a time (at least one page).
         let grow_chunk_pages = (GROW_CHUNK_BYTES / page_size).max(1) as u32;
@@ -337,6 +347,7 @@ impl BufferPool {
             path = %path.display(),
             page_size,
             capacity,
+            initial_frames,
             file_page_count,
             mapped_pages,
             grow_chunk_pages,
@@ -758,11 +769,18 @@ impl BufferPool {
     /// Find a victim frame, flushing a durable dirty page back first if needed.
     /// Assumes the caller holds the state lock (passed in as `st`) — so D5 is
     /// enforced atomically with the eviction decision.
+    ///
+    /// Item 37 (lazy growth): sweeps only the currently-allocated frames
+    /// (`st.frames.len()`), then grows the table by one frame if the ceiling
+    /// (`self.capacity`) has not been reached rather than returning
+    /// `BufferPoolFull` immediately. Growth is O(1) amortized (Vec doubling).
     fn find_victim(&self, st: &mut PoolState) -> Result<usize> {
-        let cap = self.capacity;
-        for _ in 0..cap * 2 {
-            let idx = st.clock_hand;
-            st.clock_hand = (st.clock_hand + 1) % cap;
+        let current = st.frames.len();
+        // Two full sweeps of the currently-allocated frame table (standard clock).
+        // `current` is captured before any potential growth so the loop stays bounded.
+        for _ in 0..current.saturating_mul(2) {
+            let idx = st.clock_hand % current;
+            st.clock_hand = (idx + 1) % current;
             let (pinned, referenced, dirty, page_id) = {
                 let f = &st.frames[idx];
                 (f.pin_count > 0, f.clock_ref, f.dirty, f.page_id)
@@ -794,6 +812,13 @@ impl BufferPool {
                 let durable = st.durable_wal_lsn;
                 self.flush_locked(st, pid, durable)?;
             }
+            return Ok(idx);
+        }
+        // All existing frames are occupied or undurable-dirty. Grow the table
+        // one frame if the ceiling allows (item 37 lazy growth).
+        if current < self.capacity {
+            let idx = current;
+            st.frames.push(Frame::empty());
             return Ok(idx);
         }
         Err(DbError::BufferPoolFull)
