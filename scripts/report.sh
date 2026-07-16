@@ -50,6 +50,19 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# Wall-clock start of this whole run (perf report + concurrency matrix) — see
+# fmt_duration below; surfaced both on stderr as it runs and appended to the
+# generated report itself, so "is this hung or just slow" always has a real
+# answer (item 50, docs/backlog/50_patch_many_infinite_loop.md, is exactly a
+# case where it used to be neither — a genuine hang with zero signal either
+# way).
+START_EPOCH="$(date +%s)"
+fmt_duration() {
+  local s="$1" m r
+  m=$(( s / 60 )); r=$(( s % 60 ))
+  if [[ "$m" -gt 0 ]]; then printf '%dm %ds' "$m" "$r"; else printf '%ds' "$r"; fi
+}
+
 MODE="auto"
 case "${1:-}" in
   --native) MODE="native"; shift ;;
@@ -65,6 +78,8 @@ docker_ok() { command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; 
 # does not exist yet — the --conc-only path).
 run_conc_matrix() {
   local out="$1"
+  local conc_start_epoch
+  conc_start_epoch="$(date +%s)"
   echo "[report] building concurrency matrix (release)…" >&2
   cargo build --release --bench conc_matrix >/dev/null 2>&1
   local bin
@@ -103,7 +118,15 @@ run_conc_matrix() {
     fi
     echo "[report] NOTE: concurrency matrix recorded failures (see table in report)." >&2
   fi
-  echo "[report] concurrency matrix appended to $out" >&2
+  local conc_elapsed conc_taken
+  conc_elapsed="$(( $(date +%s) - conc_start_epoch ))"
+  conc_taken="$(fmt_duration "$conc_elapsed")"
+  {
+    echo
+    echo "_Concurrency matrix generation time: $conc_taken (build + repeats=${CONC_REPEATS:-3} ×"
+    echo "the scenario cells listed above, deliberately CPU-saturating by design)._"
+  } >>"$out"
+  echo "[report] concurrency matrix appended to $out (took $conc_taken)" >&2
 }
 
 # ── concurrency-matrix-only fast path ────────────────────────────────────────
@@ -149,5 +172,16 @@ else
   run_conc_matrix "$REPORT"
 fi
 
-echo "[report] report: $REPORT" >&2
+TOTAL_ELAPSED="$(( $(date +%s) - START_EPOCH ))"
+TOTAL_TAKEN="$(fmt_duration "$TOTAL_ELAPSED")"
+{
+  echo
+  echo "---"
+  echo
+  echo "**Total report generation time (this run): $TOTAL_TAKEN** — from"
+  echo "\`scripts/report.sh\` invocation to this line, including every build step,"
+  echo "the perf tables above, and the concurrency matrix."
+} >>"$REPORT"
+
+echo "[report] report: $REPORT (total: $TOTAL_TAKEN)" >&2
 echo "$REPORT"

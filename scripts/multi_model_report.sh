@@ -40,6 +40,14 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# Wall-clock start, covers everything below (build + the bench run itself) —
+# reported in the header table as "Time taken" so a reader waiting on this
+# script has a real number instead of guessing whether it's hung (see item
+# 50, docs/backlog/50_patch_many_infinite_loop.md, for why that guess used to
+# matter: this exact phase could, before that fix, hang indefinitely instead
+# of just taking a while).
+START_EPOCH="$(date +%s)"
+
 OUT="${1:-docs/performance/multi_model_report_$(date +%Y%m%d).md}"
 mkdir -p "$(dirname "$OUT")"
 
@@ -94,6 +102,12 @@ else
   RSS_MIB="n/a"
 fi
 
+ELAPSED_SECS="$(( $(date +%s) - START_EPOCH ))"
+TIME_TAKEN="$(awk -v s="$ELAPSED_SECS" 'BEGIN{
+  m=int(s/60); r=s%60;
+  if (m>0) printf "%dm %ds", m, r; else printf "%ds", r
+}')"
+
 {
   echo "# Multi-model at-scale report"
   echo
@@ -109,11 +123,12 @@ fi
   echo "| Marginal sample | $SAMPLE_SHOWN commits/point |"
   echo "| Postgres | $PG_SHOWN |"
   echo "| Peak RSS | $RSS_MIB |"
+  echo "| Time taken | $TIME_TAKEN (build + Tables 1-5; excludes the concurrency matrix appended below, timed separately) |"
   echo
   echo "---"
   echo
   cat "$BODY"
 } >"$OUT"
 
-echo "[multi_model_report] wrote $OUT" >&2
+echo "[multi_model_report] wrote $OUT (took $TIME_TAKEN)" >&2
 echo "$OUT"
