@@ -43,6 +43,7 @@
 //! `#![deny(unsafe_code)]` (not `forbid`), so the `#[allow(unsafe_code)]` on
 //! the single function `transmute_job_lifetime` is permitted.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once, OnceLock};
 
@@ -606,6 +607,105 @@ where
         return Err(e);
     }
     Ok(total.load(Ordering::Relaxed))
+}
+
+/// Parallel GROUP BY partial aggregation for COUNT(*) (item 56 Step 1).
+///
+/// Each worker maintains a local `HashMap<key_bytes, (key_literals, count)>` and
+/// scans its page slice via the work-stealing cursor. After all workers finish,
+/// per-worker partials are merged (counts summed for matching keys).
+///
+/// `extract_key` receives raw tuple bytes (already visibility-filtered by
+/// `scan_page_into`) and returns `(hash_key_bytes, group_key_literals)`. The
+/// caller encodes the hash key — this keeps `parallel_scan` free of a
+/// dependency on `executor::encode_row`, which would create a module cycle.
+///
+/// Returns one `(key_literals, count)` entry per distinct group.
+pub fn parallel_group_count<F>(
+    pages: &[PageId],
+    reader: &SharedPageReader,
+    snapshot: &Snapshot,
+    self_xid: Xid,
+    degree: usize,
+    extract_key: &F,
+) -> Result<Vec<(Vec<Literal>, usize)>>
+where
+    F: Fn(&[u8]) -> Result<(Vec<u8>, Vec<Literal>)> + Sync,
+{
+    let cursor = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let err: Arc<Mutex<Option<DbError>>> = Arc::new(Mutex::new(None));
+    type GroupMap = HashMap<Vec<u8>, (Vec<Literal>, usize)>;
+    let partials: Arc<Mutex<Vec<GroupMap>>> = Arc::new(Mutex::new(Vec::new()));
+    let deadline = crate::query_limits::snapshot_deadline();
+    let pages: Arc<[PageId]> = Arc::from(pages);
+    let reader = reader.clone();
+    let snapshot = snapshot.clone();
+
+    run_in_pool(degree, {
+        let cursor = Arc::clone(&cursor);
+        let stop = Arc::clone(&stop);
+        let err = Arc::clone(&err);
+        let partials = Arc::clone(&partials);
+        let pages = Arc::clone(&pages);
+        move || {
+            let mut local: HashMap<Vec<u8>, (Vec<Literal>, usize)> = HashMap::new();
+            let mut page_buf: Vec<(RowId, Vec<u8>)> = Vec::new();
+            'outer: while !stop.load(Ordering::Relaxed) {
+                let i = cursor.fetch_add(1, Ordering::Relaxed);
+                if i >= pages.len() {
+                    break;
+                }
+                if i.is_multiple_of(4) {
+                    if let Err(e) = deadline.check() {
+                        *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                        stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                page_buf.clear();
+                if let Err(e) =
+                    scan_page_into(&reader, pages[i], &snapshot, self_xid, &mut page_buf)
+                {
+                    *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+                for (_, bytes) in page_buf.drain(..) {
+                    match extract_key(&bytes) {
+                        Ok((key_bytes, key_lits)) => {
+                            let entry = local.entry(key_bytes).or_insert_with(|| (key_lits, 0));
+                            entry.1 += 1;
+                        }
+                        Err(e) => {
+                            *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                            stop.store(true, Ordering::Relaxed);
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            partials
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(local);
+        }
+    });
+
+    let err_val = err.lock().unwrap_or_else(|p| p.into_inner()).take();
+    if let Some(e) = err_val {
+        return Err(e);
+    }
+
+    // Merge per-worker partials: for each group key, sum the worker counts.
+    let mut merged: HashMap<Vec<u8>, (Vec<Literal>, usize)> = HashMap::new();
+    for partial in std::mem::take(&mut *partials.lock().unwrap_or_else(|p| p.into_inner())) {
+        for (key_bytes, (key_lits, count)) in partial {
+            let entry = merged.entry(key_bytes).or_insert_with(|| (key_lits, 0));
+            entry.1 += count;
+        }
+    }
+    Ok(merged.into_values().collect())
 }
 
 /// Parallel scan + filter + project (P-b): each worker scans its page slice and

@@ -12,6 +12,23 @@
 
 ## Current status
 
+- **Item 56 Step 1 — Parallel GROUP BY partial aggregation — IN PROGRESS
+  2026-07-16, branch `56-crud-gap-write-batching-parallel-agg`.**
+  Implemented `parallel_group_count` in `src/sql/parallel_scan.rs`: each
+  worker holds a local `HashMap<key_bytes, (key_literals, count)>` and
+  scans pages via the work-stealing cursor; per-worker partials merged at
+  the end (counts summed). Replaced the item-46 materializing path in
+  `src/sql/query_exec.rs:373-452`: on the parallel path workers stream
+  directly into hash tables (no `Vec<Vec<Literal>>`); serial fallback is
+  a streaming fold (same hash structure, no per-row `Vec<Literal>`
+  materialization). Baseline: SELECT grouped 0.23× PG, 5.9M rows/s at
+  100k rows. Target: ≥0.45× (A2). All tests green (408 lib + all
+  integration suites); clippy/fmt clean; 38/38 crash harness unchanged
+  (read-only path, no WAL/storage change). Benchmark not yet run — needs
+  user approval per project protocol (`scripts/report.sh`).
+  Next: run the benchmark to verify the ≥0.45× target, then proceed to
+  Steps 2/3 (UPDATE/DELETE batching) per the item-56 ROI order.
+
 - **Item 53 — FK UPDATE skip enforcement when FK col not in SET — SHIPPED
   2026-07-16, branch `53-fk-update-skip-unchanged-recheck`.** PR pending.
   `exec_update` computes `has_fk_refs_in_set` before the row loop; skips

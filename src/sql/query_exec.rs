@@ -382,23 +382,73 @@ impl Runner<'_, '_> {
                                     table_def.fsm_meta,
                                     table_def.pages.clone(),
                                 );
-                                let mut rows: Vec<Vec<Literal>> = Vec::new();
-                                for (_, bytes) in
-                                    heap.scan(&self.snapshot, self.ctx.xid, self.ctx.pool)?
+
+                                // Item 56 Step 1: parallel GROUP BY partial aggregation.
+                                // Workers each hold a local hash table (key_bytes →
+                                // (key_literals, count)) and scan pages via a work-stealing
+                                // cursor. Merge partials at the end — no per-row Vec<Literal>
+                                // materialization on either the parallel or the serial path.
+                                //
+                                // Key encoding is done in the closure (not inside
+                                // parallel_scan) to avoid a module cycle.
+                                let extract_key =
+                                    |bytes: &[u8]| -> Result<(Vec<u8>, Vec<Literal>)> {
+                                        let row = deform_row(bytes, cols, upto, &mask)?;
+                                        let key: Vec<Literal> =
+                                            needed.iter().map(|&i| row[i].clone()).collect();
+                                        let key_bytes = executor::encode_row(&key);
+                                        Ok((key_bytes, key))
+                                    };
+
+                                let pages = heap.scan_pages(self.ctx.pool)?;
+                                let groups: Vec<(Vec<Literal>, usize)>;
+
+                                if let Some(lease) =
+                                    crate::sql::parallel_scan::acquire(pages.len())
                                 {
-                                    let row = deform_row(&bytes, cols, upto, &mask)?;
-                                    rows.push(visible_row(&row, &table_def));
+                                    groups = crate::sql::parallel_scan::parallel_group_count(
+                                        &pages,
+                                        &self.ctx.pool.shared_reader(),
+                                        &self.snapshot,
+                                        self.ctx.xid,
+                                        lease.degree(),
+                                        &extract_key,
+                                    )?;
+                                } else {
+                                    // Serial streaming fold: no full-row Vec materialization.
+                                    let mut local: std::collections::HashMap<
+                                        Vec<u8>,
+                                        (Vec<Literal>, usize),
+                                    > = std::collections::HashMap::new();
+                                    for (_, bytes) in
+                                        heap.scan(&self.snapshot, self.ctx.xid, self.ctx.pool)?
+                                    {
+                                        let (key_bytes, key_lits) = extract_key(&bytes)?;
+                                        let entry = local
+                                            .entry(key_bytes)
+                                            .or_insert_with(|| (key_lits, 0));
+                                        entry.1 += 1;
+                                    }
+                                    groups = local.into_values().collect();
                                 }
-                                let batch = Batch {
-                                    schema: input.output().to_vec(),
+
+                                // Assemble output rows: [group_key_cols..., count, ...].
+                                // All aggs are COUNT(*) (the guard above ensures this), so
+                                // every agg column gets the same per-group count.
+                                let rows: Vec<Vec<Literal>> = groups
+                                    .into_iter()
+                                    .map(|(key_lits, count)| {
+                                        let mut row = key_lits;
+                                        for _ in aggs {
+                                            row.push(Literal::Int(count as i64));
+                                        }
+                                        row
+                                    })
+                                    .collect();
+                                return Ok(Batch {
+                                    schema: output.to_vec(),
                                     rows,
-                                };
-                                return crate::sql::aggregate::aggregate(
-                                    batch,
-                                    group_exprs,
-                                    aggs,
-                                    output,
-                                );
+                                });
                             }
                         }
                     }
