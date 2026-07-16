@@ -1,7 +1,7 @@
 # CRUD gap closure — write-path batching + parallel aggregation
 
 **Type:** Performance
-**Status:** IN PROGRESS — Step 1 implemented (2026-07-16); pending benchmark run
+**Status:** IN PROGRESS — Step 1 SHIPPED 2026-07-16 (1.14× PG, see PROGRESS.md); Steps 2–4 pending
 
 > Design/planning story produced 2026-07-16 under the §0.6 expert lens
 > (senior DB-internals review, code paths verified in `src/sql/executor.rs`,
