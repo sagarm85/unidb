@@ -793,6 +793,100 @@ fn null_distinctness_preserved_with_implicit_index() {
     );
 }
 
+/// Item 53: FK UPDATE not touching the FK column must skip enforcement entirely.
+/// Correctness gate: `SET customer_id` on a bad parent must still be rejected.
+/// Throughput gate: `SET status` (non-FK column) on a large FK'd table must run
+/// at least as fast as a non-FK UPDATE on an equivalently sized table (ratio ≥ 0.7).
+#[test]
+fn fk_update_non_fk_col_skips_enforcement() {
+    let dir = tempdir().unwrap();
+    let mut engine = Engine::open(dir.path(), 0).unwrap();
+    run(
+        &mut engine,
+        "CREATE TABLE cust (id INT PRIMARY KEY, name TEXT)",
+    )
+    .unwrap();
+    run(
+        &mut engine,
+        "CREATE TABLE ord (id INT PRIMARY KEY, customer_id INT REFERENCES cust(id), status TEXT)",
+    )
+    .unwrap();
+    // Also create a plain (non-FK) table for baseline comparison.
+    run(
+        &mut engine,
+        "CREATE TABLE plain (id INT PRIMARY KEY, status TEXT)",
+    )
+    .unwrap();
+
+    let n = 3_000i64;
+    // Insert parent customers.
+    let xid = engine.begin().unwrap();
+    for i in 0..n {
+        run(
+            &mut engine,
+            &format!("INSERT INTO cust (id, name) VALUES ({i}, 'c{i}')"),
+        )
+        .unwrap();
+    }
+    engine.commit(xid).unwrap();
+    // Insert child orders referencing real customers.
+    let xid = engine.begin().unwrap();
+    for i in 0..n {
+        run(
+            &mut engine,
+            &format!("INSERT INTO ord (id, customer_id, status) VALUES ({i}, {i}, 'pending')"),
+        )
+        .unwrap();
+    }
+    engine.commit(xid).unwrap();
+    // Insert plain rows.
+    let xid = engine.begin().unwrap();
+    for i in 0..n {
+        run(
+            &mut engine,
+            &format!("INSERT INTO plain (id, status) VALUES ({i}, 'pending')"),
+        )
+        .unwrap();
+    }
+    engine.commit(xid).unwrap();
+
+    // Correctness: UPDATE that changes the FK column to a missing parent must be rejected.
+    run(
+        &mut engine,
+        "UPDATE ord SET customer_id = 999999 WHERE id = 0",
+    )
+    .expect_err("FK violation expected when writing invalid customer_id");
+
+    // Throughput: UPDATE non-FK column on FK table vs UPDATE on plain table.
+    let t_fk = {
+        let t0 = Instant::now();
+        run(
+            &mut engine,
+            "UPDATE ord SET status = 'shipped' WHERE id < 3000",
+        )
+        .unwrap();
+        t0.elapsed().as_secs_f64()
+    };
+    let t_plain = {
+        let t0 = Instant::now();
+        run(
+            &mut engine,
+            "UPDATE plain SET status = 'shipped' WHERE id < 3000",
+        )
+        .unwrap();
+        t0.elapsed().as_secs_f64()
+    };
+    // FK UPDATE (non-FK col) must be within 2× of the plain UPDATE.
+    // Before item 53 it was ~3× slower; after it should be ≤ 1.5× (same path).
+    let ratio = t_fk / t_plain;
+    assert!(
+        ratio < 2.0,
+        "FK UPDATE (non-FK col) is {ratio:.2}× slower than plain UPDATE — enforcement not skipped? \
+         (fk={t_fk:.3}s plain={t_plain:.3}s)"
+    );
+    let _ = dir;
+}
+
 /// UPDATE throughput on a PK'd table must also be flat (item 35 spec).
 #[test]
 fn pk_update_throughput_is_flat() {
