@@ -403,8 +403,7 @@ impl Runner<'_, '_> {
                                 let pages = heap.scan_pages(self.ctx.pool)?;
                                 let groups: Vec<(Vec<Literal>, usize)>;
 
-                                if let Some(lease) =
-                                    crate::sql::parallel_scan::acquire(pages.len())
+                                if let Some(lease) = crate::sql::parallel_scan::acquire(pages.len())
                                 {
                                     groups = crate::sql::parallel_scan::parallel_group_count(
                                         &pages,
@@ -424,9 +423,8 @@ impl Runner<'_, '_> {
                                         heap.scan(&self.snapshot, self.ctx.xid, self.ctx.pool)?
                                     {
                                         let (key_bytes, key_lits) = extract_key(&bytes)?;
-                                        let entry = local
-                                            .entry(key_bytes)
-                                            .or_insert_with(|| (key_lits, 0));
+                                        let entry =
+                                            local.entry(key_bytes).or_insert_with(|| (key_lits, 0));
                                         entry.1 += 1;
                                     }
                                     groups = local.into_values().collect();

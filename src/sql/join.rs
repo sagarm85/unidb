@@ -126,8 +126,7 @@ pub fn hash_join(
             );
 
         if use_i64_fast {
-            let mut table: HashMap<i64, Vec<usize>> =
-                HashMap::with_capacity(build.rows.len());
+            let mut table: HashMap<i64, Vec<usize>> = HashMap::with_capacity(build.rows.len());
             for (idx, row) in build.rows.iter().enumerate() {
                 if let Literal::Int(k) = eval_qexpr(&build_keys[0], &build.schema, row)? {
                     table.entry(k).or_default().push(idx);

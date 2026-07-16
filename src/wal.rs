@@ -50,7 +50,7 @@ use crate::{
         u16_from_le, u16_to_le, u32_from_le, u32_to_le, u64_from_le, u64_to_le, Lsn, PageId, Xid,
         INVALID_LSN, WAL_ABORT, WAL_BEGIN, WAL_CHECKPOINT, WAL_COMMIT, WAL_DELETE, WAL_FPI,
         WAL_INDEX, WAL_INSERT, WAL_TXN_ABORT, WAL_TXN_BEGIN, WAL_TXN_COMMIT, WAL_UPDATE,
-        WAL_VACUUM,
+        WAL_VACUUM, WAL_XMAX_BATCH,
     },
 };
 
@@ -602,6 +602,56 @@ impl Wal {
             &[],
         )?;
         tracing::trace!(mini_txn_id = txn_id, lsn, page_id, "WAL INDEX");
+        Ok(lsn)
+    }
+
+    /// Log a batched xmax-stamp for all `slots` on `page_id` (item 56, Step 3).
+    /// Replaces N `log_update` calls with one record, amortising the per-record
+    /// WAL header overhead over the whole page group.
+    ///
+    /// redo: `xid (8 B) || n_slots (2 B) || slot_0 (2 B) || ...`
+    /// undo: `n_slots (2 B) || slot_0 (2 B) || ...`  (old xmax provably 0)
+    ///
+    /// `slot` in the fixed header is set to `u16::MAX` (batch, no single slot).
+    pub fn log_xmax_batch(
+        &self,
+        txn_id: u64,
+        prev_lsn: Lsn,
+        page_id: PageId,
+        xid: Xid,
+        slots: &[u16],
+    ) -> Result<Lsn> {
+        debug_assert!(!slots.is_empty());
+        let n = slots.len();
+        let mut redo = Vec::with_capacity(10 + 2 * n);
+        redo.extend_from_slice(&u64_to_le(xid));
+        redo.extend_from_slice(&u16_to_le(n as u16));
+        for &s in slots {
+            redo.extend_from_slice(&u16_to_le(s));
+        }
+        let mut undo = Vec::with_capacity(2 + 2 * n);
+        undo.extend_from_slice(&u16_to_le(n as u16));
+        for &s in slots {
+            undo.extend_from_slice(&u16_to_le(s));
+        }
+        let mut inner = self.lock();
+        let lsn = append_locked(
+            &mut inner,
+            txn_id,
+            prev_lsn,
+            WAL_XMAX_BATCH,
+            page_id,
+            u16::MAX,
+            &redo,
+            &undo,
+        )?;
+        tracing::trace!(
+            mini_txn_id = txn_id,
+            lsn,
+            page_id,
+            n_slots = n,
+            "WAL XMAX_BATCH"
+        );
         Ok(lsn)
     }
 

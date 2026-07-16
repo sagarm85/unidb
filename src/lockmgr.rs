@@ -359,6 +359,33 @@ impl LockManager {
         self.acquire(id, xid, LockMode::Exclusive, WaitPolicy::NoWait)
     }
 
+    /// Batch variant of [`try_acquire_write`]: takes the mutex once and either
+    /// grants ALL locks or grants NONE (fail-fast on first conflict). Used by
+    /// `delete_many` (item 56 Step 3) to reduce N mutex acquisitions to 1.
+    pub fn try_acquire_write_many(&self, ids: &[RecordId], xid: Xid) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut t = self.lock();
+        // First pass: check every id for conflicts. If any fails, return before
+        // granting anything — no partial acquisition.
+        for &id in ids {
+            if !t.can_grant(id, xid, LockMode::Exclusive) {
+                let holder = t
+                    .blockers(id, xid, LockMode::Exclusive)
+                    .first()
+                    .copied()
+                    .unwrap_or(xid);
+                return Err(crate::error::DbError::WriteConflict { holder_xid: holder });
+            }
+        }
+        // Second pass: grant all (no conflict; all checks passed above).
+        for &id in ids {
+            t.grant(id, xid, LockMode::Exclusive);
+        }
+        Ok(())
+    }
+
     /// Acquire an exclusive lock on `id` with blocking wait + deadlock detection.
     /// Used by `exec_insert` for `UniqueKey` phantom locks: the caller blocks
     /// until the previous holder (the concurrent inserter racing the same key)

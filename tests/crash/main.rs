@@ -2624,3 +2624,324 @@ fn p40_btree_bulk_build_crash_mid_backfill_table_remains_readable() {
     }
     drop(engine_b);
 }
+
+// ── P56a: WAL_XMAX_BATCH redo — batch DELETE WAL durable, page not flushed ─
+//
+// item 56 Step 3 (D7 injection point a): the WAL_XMAX_BATCH record + its
+// mini-txn COMMIT are durable on disk, but the heap page carrying the xmax
+// stamps has not been explicitly flushed. Recovery's redo_record arm for
+// WAL_XMAX_BATCH must apply every slot's xmax stamp so that the committed
+// DELETE is visible on reopen.
+//
+// Design: INSERT and DELETE are done in ONE session so WAL LSNs are
+// monotonically increasing throughout — avoiding the LSN-restart collision
+// that would arise if we flushed pages in a first session and then reopened
+// (WAL restarts at 1; page LSNs from the flush are numerically higher;
+// WAL_XMAX_BATCH would be skipped by the page.lsn >= r.lsn gate).
+#[test]
+fn p56a_xmax_batch_wal_durable_page_not_flushed() {
+    use unidb::sql::logical::Literal;
+    use unidb::SqlResult;
+
+    let n = 200i64;
+    let dir = tempdir().unwrap();
+
+    // Single session: INSERT + committed DELETE — WAL_XMAX_BATCH fsynced, heap
+    // pages NOT explicitly flushed.  Drop simulates a crash.
+    {
+        let engine = open(dir.path());
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, k INT)")
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        for chunk in (0..n).collect::<Vec<_>>().chunks(50) {
+            let vals: String = chunk
+                .iter()
+                .map(|&i| format!("({i}, {i})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let xid = engine.begin().unwrap();
+            engine
+                .execute_sql(xid, &format!("INSERT INTO t (id, k) VALUES {vals}"))
+                .unwrap();
+            engine.commit(xid).unwrap();
+        }
+
+        // Batch-DELETE all rows; commit (WAL_XMAX_BATCH + mini-txn COMMIT
+        // durable via fsync).  Do NOT flush heap pages — simulates a crash
+        // between WAL durable and the OS writing dirty page frames to disk.
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "DELETE FROM t WHERE k >= 0")
+            .unwrap();
+        engine.commit(xid).unwrap();
+        // Drop without flush — "crash". WAL is synced; pages are not.
+        drop(engine);
+    }
+
+    // Recovery must redo every WAL_XMAX_BATCH record so the DELETE is visible
+    // — no row should be seen after reopen.
+    let engine = open(dir.path());
+    let xid = engine.begin().unwrap();
+    let result = engine.execute_sql(xid, "SELECT COUNT(*) FROM t").unwrap();
+    engine.commit(xid).unwrap();
+    drop(engine);
+
+    match &result[0] {
+        SqlResult::Rows { rows, .. } => {
+            let count = match &rows[0][0] {
+                Literal::Int(c) => *c,
+                other => panic!("P56a: expected Int count, got {other:?}"),
+            };
+            assert_eq!(
+                count, 0,
+                "P56a: WAL_XMAX_BATCH redo must make all {n} committed deletes visible on reopen"
+            );
+        }
+        other => panic!("P56a: expected Rows, got {other:?}"),
+    }
+}
+
+// ── P56b: WAL_XMAX_BATCH M1 undo — incomplete user txn reverts all xmax stamps
+//
+// item 56 Step 3 (D7 injection point b): mini-txns inside a batch DELETE each
+// commit durably (WAL_XMAX_BATCH records are on disk), but the enclosing user
+// transaction never reaches WAL_TXN_COMMIT. Recovery's M1 incomplete-user-txn
+// undo pass must reset every stamped slot's xmax back to 0 so the rows are
+// fully live again on reopen — no partial delete must remain.
+//
+// Design: INSERT and DELETE are done in ONE session so WAL LSNs are
+// monotonically increasing throughout — same rationale as P56a.  The
+// pre-drop flush pushes stamped pages to disk (worst case: page on disk with
+// xmax stamps, but user txn WAL_TXN_COMMIT absent).  Recovery must redo the
+// xmax stamps (the FPI then per-row inserts then WAL_XMAX_BATCH chain, all
+// with coherent LSNs) then M1-undo the incomplete user txn.
+#[test]
+fn p56b_xmax_batch_incomplete_user_txn_reverts_all_slots() {
+    use unidb::sql::logical::Literal;
+    use unidb::SqlResult;
+
+    let n = 200i64;
+    let dir = tempdir().unwrap();
+
+    // Single session: INSERT (committed) + user-txn DELETE (mini-txns durably
+    // committed) + flush stamped pages to disk + DROP WITHOUT user-txn commit.
+    {
+        let engine = open(dir.path());
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, k INT)")
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        for chunk in (0..n).collect::<Vec<_>>().chunks(50) {
+            let vals: String = chunk
+                .iter()
+                .map(|&i| format!("({i}, {i})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let xid = engine.begin().unwrap();
+            engine
+                .execute_sql(xid, &format!("INSERT INTO t (id, k) VALUES {vals}"))
+                .unwrap();
+            engine.commit(xid).unwrap();
+        }
+
+        // Begin user txn, DELETE all rows.  Per-statement fsync so each
+        // mini-txn's WAL_XMAX_BATCH + WAL_COMMIT are durable before we drop.
+        // The enclosing user txn does NOT commit — no WAL_TXN_COMMIT written.
+        engine.set_deferred_sync(false);
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "DELETE FROM t WHERE k >= 0")
+            .unwrap();
+        // Push the stamped heap pages to disk — worst case: page on disk with
+        // xmax stamps but WAL_TXN_COMMIT absent.  D5 is satisfied because each
+        // mini-txn WAL_COMMIT was fsynced above.
+        engine.flush().unwrap();
+        // "Crash" — user txn xid never committed.
+        drop(engine);
+    }
+
+    // Recovery: M1 pass scans WAL_XMAX_BATCH records, identifies the acting
+    // xid as belonging to an incomplete user txn, and resets every listed
+    // slot's xmax to 0. All n rows must be visible again on reopen.
+    let engine = open(dir.path());
+    let xid = engine.begin().unwrap();
+    let result = engine.execute_sql(xid, "SELECT COUNT(*) FROM t").unwrap();
+    engine.commit(xid).unwrap();
+    drop(engine);
+
+    match &result[0] {
+        SqlResult::Rows { rows, .. } => {
+            let count = match &rows[0][0] {
+                Literal::Int(c) => *c,
+                other => panic!("P56b: expected Int count, got {other:?}"),
+            };
+            assert_eq!(
+                count, n,
+                "P56b: M1 undo of WAL_XMAX_BATCH must restore all {n} rows after incomplete user txn"
+            );
+        }
+        other => panic!("P56b: expected Rows, got {other:?}"),
+    }
+}
+
+// ── P57a: update_many redo — committed batch UPDATE WAL durable, page not flushed
+//
+// item 56 Step 2 (D7 injection point a): WAL_XMAX_BATCH + WAL_INSERT records
+// for a batch UPDATE are durable, but the stamped old-version page and the new-
+// version fill page have not been explicitly flushed. Recovery must redo the
+// UPDATE so only new versions are visible.
+//
+// Design: INSERT + UPDATE in one session, commit without flush, drop.  Single
+// session keeps WAL LSNs monotonically increasing (same rationale as P56a/b).
+#[test]
+fn p57a_update_many_wal_durable_pages_not_flushed() {
+    use unidb::sql::logical::Literal;
+    use unidb::SqlResult;
+
+    let n = 200i64;
+    let dir = tempdir().unwrap();
+
+    // Single session: INSERT + batch UPDATE committed, no flush, then drop.
+    {
+        let engine = open(dir.path());
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, k INT)")
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        for chunk in (0..n).collect::<Vec<_>>().chunks(50) {
+            let vals: String = chunk
+                .iter()
+                .map(|&i| format!("({i},{i})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let xid = engine.begin().unwrap();
+            engine
+                .execute_sql(xid, &format!("INSERT INTO t (id, k) VALUES {vals}"))
+                .unwrap();
+            engine.commit(xid).unwrap();
+        }
+
+        // Batch UPDATE all rows (no UNIQUE/FK → update_many path).
+        // WAL_XMAX_BATCH + WAL_INSERT records committed+fsynced; pages not flushed.
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "UPDATE t SET k = 99 WHERE id >= 0")
+            .unwrap();
+        engine.commit(xid).unwrap();
+        // Drop without flush — simulates crash between WAL durable and page flush.
+        drop(engine);
+    }
+
+    // Recovery must redo the UPDATE — count = n, all k = 99.
+    let engine = open(dir.path());
+    let xid = engine.begin().unwrap();
+    let result = engine
+        .execute_sql(xid, "SELECT COUNT(*) FROM t WHERE k = 99")
+        .unwrap();
+    engine.commit(xid).unwrap();
+    drop(engine);
+
+    match &result[0] {
+        SqlResult::Rows { rows, .. } => {
+            let count = match &rows[0][0] {
+                Literal::Int(c) => *c,
+                other => panic!("P57a: expected Int count, got {other:?}"),
+            };
+            assert_eq!(
+                count, n,
+                "P57a: redo of update_many must make all {n} new versions visible on reopen"
+            );
+        }
+        other => panic!("P57a: expected Rows, got {other:?}"),
+    }
+}
+
+// ── P57b: update_many M1 undo — incomplete user txn reverts all Phase A stamps
+//
+// item 56 Step 2 (D7 injection point b): mini-txns inside a batch UPDATE each
+// commit durably (WAL_XMAX_BATCH + WAL_INSERT on disk), but the enclosing user
+// transaction never reaches WAL_TXN_COMMIT. Recovery must undo the xmax stamps
+// and the new-version inserts so all original rows are visible again.
+//
+// Design: single session — INSERT (committed) + user-txn UPDATE (mini-txns
+// committed) + flush (worst case: pages on disk with new versions) + drop
+// WITHOUT user-txn commit.  deferred_sync=false ensures each mini-txn WAL is
+// durable before the flush so D5 is satisfied.
+#[test]
+fn p57b_update_many_incomplete_user_txn_reverts_all_changes() {
+    use unidb::sql::logical::Literal;
+    use unidb::SqlResult;
+
+    let n = 200i64;
+    let dir = tempdir().unwrap();
+
+    // Single session: INSERT (committed) + user-txn UPDATE (mini-txns durably
+    // committed) + flush new-version pages + DROP WITHOUT user-txn commit.
+    {
+        let engine = open(dir.path());
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, k INT)")
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        for chunk in (0..n).collect::<Vec<_>>().chunks(50) {
+            let vals: String = chunk
+                .iter()
+                .map(|&i| format!("({i},{i})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let xid = engine.begin().unwrap();
+            engine
+                .execute_sql(xid, &format!("INSERT INTO t (id, k) VALUES {vals}"))
+                .unwrap();
+            engine.commit(xid).unwrap();
+        }
+
+        // Per-statement fsync ensures each mini-txn WAL is durable.
+        engine.set_deferred_sync(false);
+        // Begin user txn, UPDATE all rows (batch path) — mini-txns commit but
+        // WAL_TXN_COMMIT is never written.
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "UPDATE t SET k = 999 WHERE id >= 0")
+            .unwrap();
+        // Flush to disk (worst case: new-version pages on disk, WAL_TXN_COMMIT absent).
+        engine.flush().unwrap();
+        // "Crash" — user txn xid never committed.
+        drop(engine);
+    }
+
+    // Recovery must undo both Phase A (xmax stamps) and Phase B (new-version
+    // inserts) → old versions visible again, k = original values (0..n−1).
+    // No original row has k=999 (k was initialised to id, range 0..n), so
+    // COUNT WHERE k != 999 must equal n.
+    let engine = open(dir.path());
+    let xid = engine.begin().unwrap();
+    let result = engine
+        .execute_sql(xid, "SELECT COUNT(*) FROM t WHERE k != 999")
+        .unwrap();
+    engine.commit(xid).unwrap();
+    drop(engine);
+
+    match &result[0] {
+        SqlResult::Rows { rows, .. } => {
+            let count = match &rows[0][0] {
+                Literal::Int(c) => *c,
+                other => panic!("P57b: expected Int count, got {other:?}"),
+            };
+            assert_eq!(
+                count, n,
+                "P57b: M1 undo of update_many must restore all {n} original rows (k != 999)"
+            );
+        }
+        other => panic!("P57b: expected Rows, got {other:?}"),
+    }
+}

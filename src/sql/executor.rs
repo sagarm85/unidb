@@ -2365,6 +2365,7 @@ fn exec_update(
     // Item 36: gate FK parent-side RESTRICT (does any child table reference us?).
     let has_fk_children = table_has_fk_children(ctx.catalog.get(), table);
     let mut count = 0;
+
     for (row_id, bytes) in matching {
         let mut row = decode_row(&bytes, &table_def.columns)?;
         // C1 (item 29): snapshot the pre-mutation image before set_column overwrites it.
@@ -2408,8 +2409,8 @@ fn exec_update(
             }
             // Step 2: fresh snapshot AFTER all phantom locks.
             let usnap = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
-            // UNIQUE: exclude the row's current version (old tuple still visible
-            // to this snapshot until heap.update supersedes it).
+            // UNIQUE: exclude the row's current version (old tuple still
+            // visible to this snapshot until heap.update supersedes it).
             if has_unique {
                 enforce_unique(
                     &table_def,
