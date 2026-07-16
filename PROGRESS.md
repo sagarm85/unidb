@@ -6482,3 +6482,56 @@ Concurrency matrix: 32/32 PASS. FK cells 23 and 32 both 3/3 repeats clean.
 | `cargo test --release` (407 lib/bin + all suites) | **all pass** |
 
 No on-disk format, WAL record, catalog, or API change. No `FORMAT_VERSION` bump.
+
+---
+
+## Item 54 — SELECT filtered: arena alloc for row data (item 45 Lever 3)   [SHIPPED]   2026-07-16
+
+**Branch:** `54-select-filtered-arena-alloc`
+**PR:** #135
+**Date:** 2026-07-16
+**Status:** Shipped — 2026-07-16. Report: `docs/performance/report_20260716_130011.md` (commit 79ba6bb)
+
+### What shipped (Phase A)
+
+Three per-row allocation hot-spots eliminated on the parallel filtered-SELECT path:
+
+1. **`scan_page_visit` (`src/heap.rs`)** — new zero-copy page visitor. Replaces `scan_page_into`'s `.to_vec()` per visible row: the closure receives a `&[u8]` slice directly into the page buffer, removing one heap allocation per visible row.
+
+2. **`project_row_drain` (`src/sql/executor.rs`)** — replaces `project_row` on the SELECT hot path. Moves `Literal` values out of the decode buffer via `mem::replace` instead of cloning — `Literal::Text(String)` is moved, not copied, saving one `String` allocation per matched TEXT column.
+
+3. **`parallel_resolve_partitions` (`src/sql/parallel_scan.rs`)** — replaces the `std::thread::scope` block on the B-tree range partition path in `try_exec_select_btree` with the pre-spawned worker pool (`run_in_pool`), consistent with Lever 2's pool on the full-scan path.
+
+### Baseline (benchmark_20260716_205244.md, post items 51/52/53, Docker Linux fsync, 100k rows)
+
+| operation | records | unidb (rec/s) | PG (rec/s) | ratio | cols/row |
+|-----------|--------:|-------------:|----------:|:-----:|--------:|
+| SELECT filtered (k<N) | 100000 | 4,460,875 | 8,962,380 | **0.50×** | 4.00 |
+
+Peak RSS: 315 MiB.
+
+### After (report_20260716_130011.md, Docker Linux fsync, commit 79ba6bb)
+
+| operation | records | unidb (rec/s) | PG (rec/s) | ratio | cols/row |
+|-----------|--------:|-------------:|----------:|:-----:|--------:|
+| SELECT filtered (k<N) | 100000 | 5,531,483 | 9,789,365 | **0.57×** | 4.00 |
+
+Peak RSS: 296 MiB (−19 MiB).
+
+**+24% absolute rec/s (+1,070,608 rec/s); ratio 0.50× → 0.57×.** Acceptance target (≥0.48×) met. cols/row flat at 4.00 (B2 decode-pushdown intact). RSS improved.
+
+The backlog item estimated 0.50–0.58× after Lever 3; result (0.57×) is at the top of the predicted range.
+
+Concurrency matrix: 14/14 PASS.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| `cargo build --release` | clean |
+| `cargo clippy -- -D warnings` | clean |
+| `cargo fmt --all` | clean |
+| `cargo test` (full suite) | all pass |
+| `cargo test --test crash` | **38/38** |
+
+No on-disk format, WAL record, catalog, or API change. No `FORMAT_VERSION` bump.
