@@ -12,8 +12,28 @@
 
 ## Current status
 
+- **Bench harness Postgres connect-timeout fix (item 49) — SHIPPED 2026-07-16,
+  branch `49-pg-connect-timeout`.**
+  Investigated a report that `scripts/report.sh` "runs in indefinite mode."
+  Root cause: `benches/decompose.rs` opened every Postgres connection via
+  `Client::connect(url, NoTls)` with no `connect_timeout` — an unreachable
+  `PG_URL` (wrong host, firewalled, container still starting) blocks on the
+  OS TCP SYN-retry ceiling (confirmed empirically: ~2 min/attempt) across 24
+  call sites, with zero output. Ruled out as causes (audited, no bug found):
+  item 47/44's new per-page latching (single latch at a time, consistent
+  ordering), `lock_mgr.try_acquire_write` (non-blocking `WaitPolicy::NoWait`),
+  the parallel-scan worker governor item 15 (non-blocking admission, degrades
+  to serial), `conc_matrix`'s deadlock handling (already bounded to 120s/cell,
+  isolated per-cell tempdir engine). Fix: new `pg_dial()` helper sets
+  `connect_timeout` (default 10s, `PG_CONNECT_TIMEOUT_SECS`); all 24 call
+  sites route through it. Verified: unreachable `PG_URL` now fails the whole
+  report in 14.6s (was: indefinite hang) — reachable-Postgres runs unaffected
+  (numbers identical, timeout never fires). `cargo build`/`clippy -D warnings`
+  clean, bench-harness-only change (no engine/format/WAL touch). Full
+  1k/10k-row report re-generated with real Postgres columns on this branch to
+  hand off for the next optimization decision.
 - **UPDATE in-place B-tree patch + DELETE batched mini-txn (items 47 + 44) —
-  SHIPPED 2026-07-16, branch `47-44-perf-batch`, PR pending.**
+  SHIPPED 2026-07-16, branch `47-44-perf-batch`, PR #119 (MERGED to main).**
   Item 47: `init_patch_batches` now batches unique-enforcement index patches
   alongside secondary BTree patches; `flush_patch_batches` calls `patch_many`
   once per batch after the row loop. WAL B/row 619 → 465 (−25% at 500-row
@@ -3322,6 +3342,65 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-16 — Item 49: report.sh "indefinite hang" investigation + Postgres connect-timeout fix
+
+- **Trigger**: user observed "many metrics reports are not working and running
+  in indefinite mode especially reports.sh" and asked for a root-cause
+  investigation (script code, latest merged main changes, config adoption)
+  before generating the benchmark used to plan the next optimization pass.
+- **Investigated and ruled out** (expert-lens review per CLAUDE.md §0.6,
+  applied to the freshly-merged item 47/44 PR #119 first since it's the most
+  recent change to the write path): `DiskBTree::patch_many` and
+  `Heap::delete_many` both hold exactly one page/leaf latch at a time, drop it
+  before any fallback/recursive call, and process leaves in consistent
+  ascending-key order across concurrent callers — no self- or cross-txn
+  deadlock. `lock_mgr.try_acquire_write` is `WaitPolicy::NoWait` (aborts
+  instead of blocking, per the SI design in CLAUDE.md D12). The item-15
+  parallel-scan worker governor (`src/sql/parallel_scan.rs`) is non-blocking
+  admission control (`take_from_pool` never waits; degrades to serial).
+  `conc_matrix`'s `run_with_deadline` already bounds any real deadlock to a
+  120s-per-cell "HANG" verdict on an isolated, fresh, tempdir-scoped engine —
+  confirmed no cross-cell blast radius (`open_engine` opens a new `tempdir()`
+  per cell).
+- **Root cause found**: `benches/decompose.rs` opened every Postgres
+  connection via `postgres::Client::connect(url, NoTls)` — 24 call sites, zero
+  of them setting a `connect_timeout`. Empirically confirmed on this host: a
+  refused TCP connect fails in 5ms; a connect to a black-holed/unresponsive
+  address is still pending past 8s (`tcp_syn_retries=6` → ~2 min ceiling per
+  attempt). A `PG_URL` that's merely unreachable (not actively refused —
+  wrong host, firewalled, Postgres container mid-startup, a stale value left
+  from a prior session) silently stalls the entire report with no output,
+  exactly matching "indefinite mode."
+- **Fix**: new `pg_dial(url) -> Result<Client, Box<dyn Error + Send + Sync>>`
+  helper — parses `url` as `postgres::Config`, sets
+  `.connect_timeout(Duration)` (default 10s, `PG_CONNECT_TIMEOUT_SECS`
+  override) before `.connect(NoTls)`. All 24 raw `Client::connect` call sites
+  (mechanical `sed` + 2 manual `match` sites) now route through it. Same
+  `Result<Client, _>` shape, so `.unwrap()`/`.ok()`/`match` call sites needed
+  no further changes.
+- **Verified**: `UNIDB_BENCH=mmreport` run direct against a black-holed
+  `PG_URL` completed in **14.6s total** (prints `[pg] WARNING: ... connect
+  failed ... — skipping`, report finishes) — previously would have hung ~2min
+  on the first connect alone. Re-ran against a real local Postgres 16
+  (installed + started via the pre-existing `postgresql-16` apt package, root
+  access) — full report completes normally, numbers unaffected (timeout never
+  fires when the server responds).
+- Gates: `cargo build --release --bench decompose` clean; `cargo clippy
+  --release --bench decompose -- -D warnings` clean. Bench-harness-only —
+  no engine/format/WAL change, no crash-harness re-run needed.
+- Also fixed while touched: `PROGRESS.md`'s duplicate "Items 47 + 44" entry
+  was found truncated mid-sentence (pre-existing, part of PR #119 as merged)
+  — closed the sentence with a dated correction note (additive, not rewritten)
+  rather than building the new entry on top of a broken doc. `backlog_index.md`
+  rows for items 44/47 flipped from stale "NOT STARTED" to "SHIPPED (PR #119)"
+  since main already carries that work.
+- New full 1k/10k-row multi-model report generated on this branch with real
+  Postgres comparison columns (local Postgres 16, matched `fsync`/`fsync`
+  durability lens) — see `docs/performance/multi_model_report_20260716_*.md`
+  for the numbers used to decide the next optimization target.
+- Branch: `49-pg-connect-timeout` (based on latest `origin/main`, i.e. up to
+  and including PR #119).
 
 ### 2026-07-16 — Items 47 + 44: UPDATE B-tree in-place patch + DELETE batched mini-txn (PR pending)
 

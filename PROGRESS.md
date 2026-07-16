@@ -6169,4 +6169,60 @@ Previously every matched row in `exec_update` called `patch_many` (or the old `u
 3. `flush_patch_batches` calls `DiskBTree::patch_many` once per non-empty batch after the full row loop, amortising FPIs across all rows that share a leaf.
 
 **Item 44 — DELETE batched WAL mini-txn (`src/heap.rs`, `src/sql/executor.rs`):**  
-`exec_delete` previously called `heap.delete(row_id, ...)` once per matched row — one WAL mini-txn (begin+commit), one full-page-image check, one exclusive page latch per row. `Heap::delete_many` groups already-page-sorted `RowId`s by `page_id`, acquiring the latch once and emitting one WAL mini-txn per page instead of one per row. At 10k rows spread across ~78 heap pages, this drops WAL bytes from 230 B/row to 107 B/row (53
+`exec_delete` previously called `heap.delete(row_id, ...)` once per matched row — one WAL mini-txn (begin+commit), one full-page-image check, one exclusive page latch per row. `Heap::delete_many` groups already-page-sorted `RowId`s by `page_id`, acquiring the latch once and emitting one WAL mini-txn per page instead of one per row. At 10k rows spread across ~78 heap pages, this drops WAL bytes from 230 B/row to 107 B/row (53% reduction).
+
+_Correction, 2026-07-16: this entry duplicates the complete "Items 47 + 44" entry immediately above it and was found cut off mid-sentence at the point this note was added — left as-is (additive, not rewritten) per CLAUDE.md §9; the entry above carries the authoritative full writeup and gates. Found while investigating the `scripts/report.sh` hang (item 49, below)._
+
+## Item 49 — Bench harness Postgres connect-timeout fix (report.sh "indefinite hang")
+
+**PR:** #TBD (`49-pg-connect-timeout`)
+**Date:** 2026-07-16
+**Status:** Shipped
+
+### What shipped
+
+Investigated a report that `scripts/report.sh` "runs in indefinite mode." Root
+cause confirmed in `benches/decompose.rs`: every Postgres connection was opened
+via `postgres::Client::connect(url, NoTls)`, which applies **no connect
+timeout** unless one is present in the connection string. When `PG_URL` points
+at a target that doesn't actively refuse the connection (wrong host, firewalled
+port, a Postgres container still starting up, a stale `PG_URL` left from a
+previous session), the connect call blocks on the OS's TCP SYN-retry ceiling —
+confirmed empirically on this host: a refused connection fails in 5 ms, a
+black-holed address is still pending past 8 s (`tcp_syn_retries=6`, ~2 minutes
+per attempt). This bench dials Postgres from **24 separate call sites**, so a
+single bad `PG_URL` could stall the whole report generation for many minutes
+with zero output.
+
+Investigated and ruled out as contributing causes: item 47/44's new
+`patch_many`/`delete_many` per-page latching (single latch held at a time in
+both, consistent ascending-key leaf order, no self- or cross-transaction
+deadlock found); `lock_mgr.try_acquire_write` (`WaitPolicy::NoWait` — never
+blocks); the parallel-scan worker governor, item 15 (`acquire()` is
+non-blocking, degrades to serial instead of waiting); `conc_matrix`'s
+per-scenario deadlock handling (already bounded to a 120s-per-cell verdict on
+an isolated, fresh, tempdir-scoped engine — no cross-cell blast radius).
+
+**Fix:** new `pg_dial(url) -> Result<Client, Box<dyn Error + Send + Sync>>`
+(`benches/decompose.rs`) — the one place a Postgres connection is opened.
+Parses `url` into a `postgres::Config` and sets `.connect_timeout(Duration)`
+(default 10s, `PG_CONNECT_TIMEOUT_SECS` to override) before connecting. All 24
+`Client::connect(..., NoTls)` call sites now route through it.
+
+### Verification
+
+| Scenario | Before | After |
+|---|---|---|
+| `PG_URL` unreachable (black-holed address) | blocks ~2 min on first connect attempt, no output | whole `mmreport` run completes in **14.6 s**, prints a clear skip warning |
+| `PG_URL` reachable (real local Postgres 16) | completes normally | completes normally, identical numbers (timeout never fires when the server responds) |
+
+Gates: `cargo build --release --bench decompose` clean; `cargo clippy --release
+--bench decompose -- -D warnings` clean. No engine/format/WAL change — bench
+harness only.
+
+### Full report re-run (this branch, native mode, local Postgres 16, matched
+`fsync`/`fsync` durability lens)
+
+`MM_SIZES=1000,10000 MM_BULK_SIZES=1000,10000`, `docs/performance/multi_model_report_20260716_*.md`
+— see that file for the complete Table 1–5 + concurrency-matrix results used to
+plan the next optimization pass.
