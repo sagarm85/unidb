@@ -1,7 +1,7 @@
 # SELECT JOIN: hash join for equi-joins
 
 **Type:** Performance
-**Status:** NOT STARTED
+**Status:** PHASE A DONE (2026-07-16) — Phase B pending
 
 ## Measured gap (`030325`, Docker Linux fsync, 2026-07-16)
 
@@ -12,6 +12,17 @@
 Platform: aarch64 · 18 cores · Linux 6.12.76-linuxkit. Both engines `fsync` (matched durability).
 
 Estimated after hash join: **0.70–1.00×** PG (+140–245%). The gain is algorithmic — it does not depend on architecture or platform.
+
+## Result after Phase A (2026-07-16)
+
+**Shipped:** predicate pushdown into base scans + integer key fast path in hash join + reverted erroneous INLJ-via-unique_index_root routing. See `PROGRESS.md` item 51 entry for full details.
+
+| run | records | unidb (rec/s) | PG (rec/s) | unidb ÷ PG |
+|-----|--------:|--------------:|-----------:|:----------:|
+| 052432 (baseline, no optimizations) | 10000 | 729,772 | 2,367,074 | 0.31× |
+| 075853 (Phase A shipped) | 10000 | 608,759 | 1,029,345 | **0.59×** |
+
+**Phase A (≥0.50×): ACHIEVED.** Phase B (≥0.70×): not yet achieved.
 
 ## Root cause
 
