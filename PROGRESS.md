@@ -6299,5 +6299,44 @@ compile it unconditionally). Registered it. Doing so surfaced a genuine,
 **pre-existing, unrelated** test failure —
 `slow_query_captured_after_threshold_set` — confirmed via `git stash` to fail
 identically without any of this session's changes; not investigated or fixed
+
+---
+
+## Bench hygiene — calibrated Docker baseline (2026-07-16)
+
+**Commit:** `b065b00` on branch `bench/docker-post-items-37-45-122`
+**Report:** `docs/performance/multi_model_report_20260716_052432.md`
+
+**What changed:** Added `SET max_parallel_workers_per_gather = 2` to four
+Postgres SELECT functions in `benches/decompose.rs` (`pg_crud_select_filtered`,
+`pg_crud_select_grouped`, `pg_crud_count_all`, `pg_fk_join_select`). On an
+18-core ARM Mac, Postgres would otherwise use far more parallel workers than on
+a 4-core x86 reference machine, inflating PG's SELECT numbers and making
+cross-run comparisons misleading. Cap is per-session (not server-wide); Table
+3.1 uses the server default (documented in the note in the report).
+
+**Environment:** aarch64 · 18 cores · Linux 6.12.76-linuxkit (Docker Desktop
+on Apple M5 Pro). Both engines use plain `fsync` — matched durability.
+
+**Calibrated baseline — Table 3 at 100k rows (`MM_CRUD_ROWS=100000`):**
+
+| operation | unidb (rec/s) | PG (rec/s) | unidb ÷ PG | WAL B/row | cols/row |
+|-----------|-------------:|-----------:|-----------:|----------:|---------:|
+| INSERT (per-row commit) | 3,384 | 7,889 | 0.43× | 8,837 | 0.00 |
+| SELECT filtered (k<N) | 4,783,249 | 9,046,294 | 0.53× | 0 | 4.00 |
+| SELECT grouped (GROUP BY g) | 5,912,058 | 25,571,223 | 0.23× | 0 | 1.00 |
+| SELECT COUNT(*) (all) | 267,007,725 | 45,242,471 | **5.90× unidb** | 0 | 0.00 |
+| UPDATE bulk (k<N/2) | 37,201 | 797,291 | 0.05× | 530 | 8.00 |
+| DELETE selected (k>=N) | 272,318 | 5,539,501 | 0.05× | 133 | 6.00 |
+| DELETE all | 32,551,649 | 5,225,809 | **6.23× unidb** | 0 | 0.00 |
+
+**Table 1 W4/W0:** 5.26× at 1k rows · 1.65× at 10k · 2.13× at 100k.
+The 1k-row anomaly (W4/W0=5.26×) is the target of item 55 investigation.
+**Peak RSS:** 316 MiB (bench container). **Concurrency matrix:** 32/32 PASS.
+
+This report supersedes `030325` as the permanent calibrated baseline for items
+51–55 measurement. Key difference from `030325`: `030325` used `MM_CRUD_ROWS=10000`
+(10k rows); this run uses the default 100k rows. Items measuring "after" numbers
+must use the same row count for valid comparison.
 here (out of scope), but flagged in `docs/backlog/50_patch_many_infinite_loop.md`
 rather than silently passed over.
