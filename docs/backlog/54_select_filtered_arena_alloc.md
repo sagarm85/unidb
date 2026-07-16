@@ -1,7 +1,7 @@
 # SELECT filtered: arena allocation for row data on parallel scan path (item 45 Lever 3)
 
 **Type:** Performance
-**Status:** IN PROGRESS (Phase A implementation — `scan_page_visit` + `project_row_drain` + `parallel_resolve_partitions`; benchmark pending)
+**Status:** SHIPPED 2026-07-16 — Phase A: `scan_page_visit` + `project_row_drain` + `parallel_resolve_partitions`. SELECT filtered 0.50× → 0.57× PG at 100k rows (+24%); RSS 315 → 296 MiB. PR #135. See PROGRESS.md.
 
 _This is the official tracking item for item 45 Lever 3, deferred when Levers 1 (B-tree range partition, PR #125) and 2 (pre-spawned worker pool, PR #123) shipped._
 
