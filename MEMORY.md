@@ -12,6 +12,17 @@
 
 ## Current status
 
+- **Item 56 Step 1 — Parallel GROUP BY partial aggregation — SHIPPED
+  2026-07-16, branch `56-crud-gap-write-batching-parallel-agg`,
+  commit `51480e2`. PR pending user approval.**
+  `parallel_group_count` in `src/sql/parallel_scan.rs` + item-46 rewrite
+  in `src/sql/query_exec.rs:373-452`. Result (clean run, `benchmark_20260716_232744.md`):
+  SELECT grouped 5.9M → 28.3M rec/s (+381%), 0.23× → **1.14× PG** (unidb beats Postgres).
+  A2 (target ≥0.45×) and stretch (0.70×) both passed. All A7 regression
+  guards pass (W4/W0 at 100k = 1.70× ≤ 2.3× gate). 32/32 conc matrix; 38/38 crash harness.
+  Next: Steps 2/3 (UPDATE write-path batching + DELETE WAL record),
+  then Step 4 gated measurement. PR awaiting user approval.
+
 - **Item 53 — FK UPDATE skip enforcement when FK col not in SET — SHIPPED
   2026-07-16, branch `53-fk-update-skip-unchanged-recheck`.** PR pending.
   `exec_update` computes `has_fk_refs_in_set` before the row loop; skips

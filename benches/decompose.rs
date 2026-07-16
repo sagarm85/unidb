@@ -2425,9 +2425,6 @@ fn pg_fk_join_select(url: &str) -> (u64, f64) {
 }
 
 fn bench_mm_report() {
-    // Item 55 investigation: initialise a tracing subscriber so that the debug
-    // spans added to `send_event_capture` are visible when RUST_LOG=unidb=debug.
-    unidb::init_tracing();
     let sync_prim = unidb_sync_primitive();
     let sizes: Vec<u64> = std::env::var("MM_SIZES")
         .ok()

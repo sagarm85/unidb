@@ -6535,3 +6535,90 @@ Concurrency matrix: 14/14 PASS.
 | `cargo test --test crash` | **38/38** |
 
 No on-disk format, WAL record, catalog, or API change. No `FORMAT_VERSION` bump.
+
+---
+
+## Item 56 Step 1 — Parallel GROUP BY partial aggregation   [SHIPPED]   2026-07-16
+
+**Branch:** `56-crud-gap-write-batching-parallel-agg`
+**Commit:** `51480e2`
+**PR:** pending — stop and ask before raising
+**Date:** 2026-07-16
+
+### What shipped
+
+Two changes:
+
+1. **`parallel_group_count` (`src/sql/parallel_scan.rs`)** — new function that
+   partitions pages across the pre-spawned worker pool (items 15/21/45) and has
+   each worker maintain a local `HashMap<key_bytes, (key_literals, count)>` using
+   the work-stealing cursor. After `run_in_pool` returns, per-worker partials are
+   merged (counts summed) and returned as `Vec<(key_literals, count)>`. Closure
+   receives raw tuple bytes; caller supplies `(hash_key, key_literals)` from
+   `deform_row` + `encode_row` to avoid a module cycle.
+
+2. **Item-46 block rewrite (`src/sql/query_exec.rs:373-452`)** — replaced the
+   materializing loop + `aggregate()` call (which collected `Vec<Vec<Literal>>`
+   of all rows before aggregation) with:
+   - **Parallel path** (lease granted): `parallel_group_count` — workers stream
+     directly into per-worker hash tables; zero per-row `Vec<Literal>` materialization.
+   - **Serial streaming fallback** (no lease / small table): single-threaded
+     streaming fold into a local `HashMap` — same zero-materialisation property.
+   - **Output assembly** directly from `(key_lits, count)` pairs; `aggregate()`
+     call on this path eliminated.
+
+### Baseline (benchmark_20260716_205244.md, commit 0da8e2b, Docker Linux fsync, 100k rows)
+
+| operation | records | unidb (rec/s) | PG (rec/s) | ratio |
+|-----------|--------:|-------------:|----------:|:-----:|
+| SELECT grouped (GROUP BY g) | 200000 | 5,877,743 | 25,865,552 | **0.23×** |
+
+Peak RSS: 315 MiB.
+
+### After (benchmark_20260716_232744.md, commit 51480e2, Docker Linux fsync, 100k rows)
+
+| operation | records | unidb (rec/s) | PG (rec/s) | ratio |
+|-----------|--------:|-------------:|----------:|:-----:|
+| SELECT grouped (GROUP BY g) | 200000 | 28,285,711 | 24,704,573 | **1.14×** |
+
+Peak RSS: 287 MiB (−28 MiB vs baseline).
+
+**SELECT grouped 5.9M → 28.3M rec/s (+381%); ratio 0.23× → 1.14×. unidb now beats Postgres on this operation.**
+
+Acceptance criteria (A2):
+- Target ≥0.45× — **PASS** (1.14× ≫ 0.45×)
+- Stretch 0.70× — **PASS** (1.14× > 0.70×)
+
+### A7 regression guard check
+
+| guard | target | result | status |
+|-------|--------|--------|--------|
+| SELECT COUNT(*) | ≥5.0× | 6.74× | ✓ |
+| DELETE all | ≥5.0× | 6.45× | ✓ |
+| SELECT filtered | ≥0.50× | 0.59× | ✓ |
+| INSERT (per-row) | ≥0.40× | 0.44× | ✓ |
+| W4/W0 at 100k | ≤2.3× | 1.70× | ✓ |
+
+Step 1 is read-only (GROUP BY scan, zero WAL/write-path touch); W4/W0 measures
+INSERT+index maintenance and cannot be affected by it. Result confirmed clean.
+
+### Concurrency matrix
+
+32/32 PASS (3 repeats/cell, 18-core CPU saturation, both `UNIDB_CONCURRENT_SQL_WRITES` modes).
+
+### Verification
+
+| Check | Result |
+|---|---|
+| `cargo build --release` | clean |
+| `cargo clippy -- -D warnings` | clean |
+| `cargo fmt --all` | clean |
+| `cargo test --release` (full suite) | **408 tests** all pass |
+| `cargo test --test crash` | **38/38** (read-only path, no new crash points needed) |
+
+No on-disk format, WAL record, catalog, or API change. No `FORMAT_VERSION` bump.
+
+**Raw report:** `docs/performance/benchmark_20260716_232744.md` (clean run, no tracing
+log pollution; previous run `benchmark_20260716_223033.md` was corrupt due to
+an unconditional `init_tracing()` call in `bench_mm_report` — removed before
+this clean run).
