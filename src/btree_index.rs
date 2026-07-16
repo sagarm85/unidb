@@ -658,6 +658,99 @@ impl DiskBTree {
         Ok(out)
     }
 
+    /// Partition the qualifying range into `n` approximately equal slices and
+    /// return the collected `RowId`s pre-grouped by contiguous leaf-page run.
+    /// Each partition covers a contiguous key range; callers dispatch one
+    /// partition per worker for static (non-work-stealing) heap resolution,
+    /// giving each worker a focused heap-page footprint compared with the
+    /// interleaved access of a work-stealing cursor over a flat list.
+    ///
+    /// Used by `try_exec_select_btree` (item 45 Lever 1).
+    pub fn search_range_partition(
+        &self,
+        op: RangeOp,
+        value: &OrderedValue,
+        n: usize,
+        pool: &BufferPool,
+    ) -> Result<Vec<Vec<RowId>>> {
+        if n <= 1 {
+            return Ok(vec![self.search_range(op, value, pool)?]);
+        }
+
+        // Walk the leaf chain with the same admittance logic as `search_range`,
+        // collecting per-leaf RowId slices instead of one flat Vec.
+        let start = match op {
+            RangeOp::Lt | RangeOp::Le => self.leftmost_leaf(pool)?,
+            RangeOp::Gt | RangeOp::Ge => self.find_leaf(value, pool)?,
+        };
+        let mut leaf_slices: Vec<Vec<RowId>> = Vec::new();
+        let mut total = 0usize;
+        let mut pid = start;
+        let mut done = false;
+        while !done {
+            let page = pool.fetch_page(pid)?;
+            let node = Node::deserialize(&page)?;
+            pool.unpin(pid);
+            let Node::Leaf { entries, next } = node else {
+                break;
+            };
+            let mut leaf_rids: Vec<RowId> = Vec::new();
+            for (k, rid) in &entries {
+                let admit = match op {
+                    RangeOp::Lt => k < value,
+                    RangeOp::Le => k <= value,
+                    RangeOp::Gt => k > value,
+                    RangeOp::Ge => k >= value,
+                };
+                if admit {
+                    leaf_rids.push(*rid);
+                } else if matches!(op, RangeOp::Lt | RangeOp::Le) && k >= value {
+                    done = true;
+                    break;
+                }
+            }
+            total += leaf_rids.len();
+            if !leaf_rids.is_empty() {
+                leaf_slices.push(leaf_rids);
+            }
+            if done || next == INVALID_PAGE_ID {
+                break;
+            }
+            pid = next;
+        }
+
+        if total == 0 {
+            let mut out = Vec::with_capacity(n);
+            out.resize_with(n, Vec::new);
+            return Ok(out);
+        }
+
+        // Distribute into exactly `n` partitions by entry count, using leaf
+        // boundaries as natural split points so each partition is a contiguous
+        // key run. Overflow entries accumulate in the final partition.
+        let per_part = total.div_ceil(n);
+        let mut partitions: Vec<Vec<RowId>> = Vec::with_capacity(n);
+        let mut current: Vec<RowId> = Vec::with_capacity(per_part);
+        let mut in_current = 0usize;
+        for leaf_rids in leaf_slices {
+            for rid in leaf_rids {
+                current.push(rid);
+                in_current += 1;
+                if in_current >= per_part && partitions.len() + 1 < n {
+                    partitions.push(std::mem::take(&mut current));
+                    current = Vec::with_capacity(per_part);
+                    in_current = 0;
+                }
+            }
+        }
+        if !current.is_empty() {
+            partitions.push(current);
+        }
+        // Pad with empty slices so caller always gets exactly `n` entries.
+        partitions.resize_with(n, Vec::new);
+        Ok(partitions)
+    }
+
     fn leftmost_leaf(&self, pool: &BufferPool) -> Result<PageId> {
         let mut pid = self.root_page(pool)?;
         loop {
