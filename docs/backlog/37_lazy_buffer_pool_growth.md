@@ -1,7 +1,7 @@
 # Item 37 — Buffer pool frame table is eagerly allocated, not lazy/growable
 
 **Type:** Improvement
-**Status:** NOT STARTED
+**Status:** SHIPPED 2026-07-16 — see PROGRESS.md
 **Priority:** Medium — not a correctness issue and not urgent (the default-bump
 follow-up covers the immediate demo-scale pain), but it removes a real
 tradeoff that a static default can never fully resolve.

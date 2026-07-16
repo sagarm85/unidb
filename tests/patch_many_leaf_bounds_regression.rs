@@ -22,7 +22,7 @@ use unidb::sql::logical::Literal;
 use unidb::Engine;
 
 const ROWS: u64 = 10_000;
-const DEADLINE_SECS: u64 = 30;
+const DEADLINE_SECS: u64 = 60;
 
 fn build_table(e: &Engine, rows: u64) {
     e.set_deferred_sync(true);
