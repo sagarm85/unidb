@@ -9,9 +9,13 @@
 #   • Docker running  → fair-fsync comparison on Linux, where unidb AND Postgres
 #                       both use plain fsync() (the honest apples-to-apples ratio).
 #                       Recommended, and the default when Docker is available.
-#   • No Docker       → native run on this host. Still valid, but on macOS unidb
-#                       commits via F_FULLFSYNC while Postgres-default does not;
-#                       the report states this so the numbers aren't misread.
+#   • No Docker       → native run on this host. A throwaway Postgres cluster is
+#                       automatically started via initdb/pg_ctl (Homebrew Postgres)
+#                       if PG_URL is not already set — so the Postgres comparison
+#                       columns appear in every native report by default, no manual
+#                       setup needed. The cluster is torn down on exit.
+#                       On macOS, unidb commits via F_FULLFSYNC while Postgres uses
+#                       fsync; the report notes this durability asymmetry.
 #
 # EVERY report additionally gets a **concurrency correctness matrix** appended —
 # a pass/fail table of production-shaped concurrent read/write border cases
@@ -24,10 +28,11 @@
 # does not apply to it.
 #
 # Usage:
-#   scripts/report.sh                            # auto (Docker if available)
+#   scripts/report.sh                            # auto (Docker if available; native with auto-PG otherwise)
 #   MM_SIZES=100000,1000000 scripts/report.sh    # sweep to millions
 #   scripts/report.sh --docker                   # force Docker (fail if absent)
-#   scripts/report.sh --native                   # force native (skip Docker)
+#   scripts/report.sh --native                   # force native with auto-PG
+#   PG_URL=<conn> scripts/report.sh --native     # reuse an existing Postgres server
 #   scripts/report.sh --conc                     # concurrency matrix ONLY (fast)
 #   CONC_REPEATS=6 scripts/report.sh --conc      # tighten the intermittency net
 #   CONC_SKIP=1 scripts/report.sh                # skip the matrix (perf-only run)
@@ -72,6 +77,43 @@ case "${1:-}" in
 esac
 
 docker_ok() { command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------------------
+# Auto-managed throwaway Postgres for the native path.
+# If PG_URL is unset when we enter native mode we spin up a local cluster with
+# initdb (Homebrew Postgres), export PG_URL for the bench, and tear it down on
+# exit.  This makes Postgres columns appear in every native report by default —
+# the user never has to set PG_URL manually.
+# ---------------------------------------------------------------------------
+_PG_NATIVE_DATADIR=""
+_PG_NATIVE_SOCKDIR=""
+
+_teardown_pg() {
+  [[ -z "$_PG_NATIVE_DATADIR" ]] && return
+  echo "[report] stopping throwaway Postgres…" >&2
+  pg_ctl -D "$_PG_NATIVE_DATADIR" stop -m fast >/dev/null 2>&1 || true
+  rm -rf "$_PG_NATIVE_DATADIR" "$_PG_NATIVE_SOCKDIR"
+  _PG_NATIVE_DATADIR=""
+}
+
+bringup_pg_native() {
+  if ! command -v initdb >/dev/null 2>&1 || ! command -v pg_ctl >/dev/null 2>&1; then
+    echo "[report] NOTE: initdb/pg_ctl not found — Postgres column will be skipped." >&2
+    echo "[report]       Install Postgres (e.g. brew install postgresql) to enable it." >&2
+    return
+  fi
+  _PG_NATIVE_DATADIR="$(mktemp -d /tmp/unidb_pgdata.XXXXXX)"
+  _PG_NATIVE_SOCKDIR="$(mktemp -d /tmp/unidb_pgsock.XXXXXX)"
+  local port=5439
+  echo "[report] auto-starting throwaway native Postgres (port $port, Unix socket)…" >&2
+  initdb -D "$_PG_NATIVE_DATADIR" -U postgres --auth=trust >/dev/null 2>&1
+  pg_ctl -D "$_PG_NATIVE_DATADIR" -w \
+    -o "-k $_PG_NATIVE_SOCKDIR -p $port -c listen_addresses=''" \
+    start >/dev/null 2>&1
+  createdb -h "$_PG_NATIVE_SOCKDIR" -p "$port" -U postgres unidb_bench >/dev/null 2>&1
+  export PG_URL="host=$_PG_NATIVE_SOCKDIR port=$port user=postgres dbname=unidb_bench"
+  echo "[report] throwaway Postgres ready — PG_URL set automatically." >&2
+}
 
 # Build + run the concurrency correctness matrix, appending its markdown
 # section to the report file given as $1 (creating it with a small header if it
@@ -145,6 +187,9 @@ elif [[ "$MODE" == "auto" ]] && docker_ok; then
   use_docker=true
 fi
 
+# Register the PG teardown so it always fires on exit, even on error.
+trap '_teardown_pg' EXIT
+
 # Generate the base perf report; capture its path (both wrapped scripts print
 # the report path as their final stdout line).
 if $use_docker; then
@@ -153,8 +198,9 @@ if $use_docker; then
 else
   echo "[report] mode: NATIVE ($(uname -sr)). Tip: start Docker for the fair-fsync comparison." >&2
   if [[ -z "${PG_URL:-}" ]]; then
-    echo "[report] NOTE: PG_URL unset — the Postgres column will be skipped. Set PG_URL" >&2
-    echo "[report]       (superuser conn) or use Docker mode to include Postgres." >&2
+    # Auto-spin up a throwaway native Postgres so every native report includes
+    # the Postgres comparison columns without the user needing to set PG_URL.
+    bringup_pg_native
   fi
   OUT="docs/performance/multi_model_report_$(date +%Y%m%d_%H%M%S).md"
   REPORT="$("$REPO_ROOT/scripts/multi_model_report.sh" "$OUT" | tail -1)"
