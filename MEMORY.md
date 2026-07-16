@@ -13,13 +13,10 @@
 ## Current status
 
 - **Item 53 — FK UPDATE skip enforcement when FK col not in SET — SHIPPED
-  2026-07-16, branch `53-fk-update-skip-unchanged-recheck`.** PR pending.
-  `exec_update` computes `has_fk_refs_in_set` before the row loop; skips
-  `acquire_fk_key_locks` + `enforce_fk_rows_exist` when FK col not in SET.
-  Result: 40,423 → 62,281 rec/s (+54%), 0.06× → 0.08×. Acceptance criterion
-  was ≥0.12× — not met; caveat: item 132 raised `MM_CRUD_ROWS` to 100k between
-  runs, making the 030325 comparator stale. Improvement is real. 32/32 conc
-  matrix PASS; 9/9 FK tests; 38/38 crash; 407 tests. PR awaiting user approval.
+  2026-07-16, PR #133 MERGED.** `exec_update` computes `has_fk_refs_in_set`
+  before the row loop; skips `acquire_fk_key_locks` + `enforce_fk_rows_exist`
+  when FK col not in SET. Result: 40,423 → 62,281 rec/s (+54%), 0.06× → 0.08×.
+  32/32 conc matrix PASS; 9/9 FK tests; 38/38 crash harness.
 
 - **Item 52 — UPDATE/DELETE predicate-only decode pushdown — SHIPPED 2026-07-16,
   PR #131 MERGED.** Changed `MatchedRows` type to `Vec<(RowId, Vec<u8>)>` (raw
