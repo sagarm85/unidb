@@ -12,10 +12,18 @@
 
 ## Current status
 
+- **Item 52 — UPDATE/DELETE predicate-only decode pushdown — STEP 1 DONE 2026-07-16,
+  branch `52-update-delete-predicate-decode-pushdown`.** Changed `MatchedRows` type to
+  `Vec<(RowId, Vec<u8>)>` (raw bytes); DELETE common path now zero full-row decodes.
+  DELETE: cols/row 6.00 → 2.00, dec/row 1.00 → 0.00, throughput +10% (614k → 675k rec/s),
+  ratio holds at 0.16× PG (bottleneck is WAL xmax-stamp writes, 114 B/row, not decoding).
+  UPDATE: cols/row unchanged at 8.00 (old code already had deform_row for non-matching rows;
+  full decode of matched rows is unavoidable for MVCC). PR #131 open — awaiting merge.
+
 - **Item 51 — SELECT JOIN hash join + predicate pushdown — PHASE A DONE 2026-07-16,
   branch `51-select-join-hash-join`.** Predicate pushdown into base scans, integer key
   hash fast path, INLJ-via-unique_index_root revert. Result: 0.59× PG (Phase A ≥0.50×
-  ACHIEVED). Phase B (≥0.70×) not yet achieved. PR pending.
+  ACHIEVED). Phase B (≥0.70×) not yet achieved. PR #129/#130 MERGED.
 
 - **Item 45 Lever 1 — B-tree range partition for parallel workers — SHIPPED
   2026-07-16, branch `perf/45b-btree-partition`.**

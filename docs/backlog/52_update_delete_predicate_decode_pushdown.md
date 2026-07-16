@@ -1,7 +1,7 @@
 # UPDATE/DELETE: predicate-column decode pushdown on matching_rows (item 47 Phase B)
 
 **Type:** Performance
-**Status:** NOT STARTED
+**Status:** STEP 1 DONE (DELETE), STEP 2 NO-OP (UPDATE) — see correction note below
 
 _This is the official tracking item for item 47 Phase B, which was specified as an open follow-on in `47_update_delete_write_throughput.md` after Phase A shipped (PR #119, 2026-07-16)._
 
@@ -57,6 +57,24 @@ Run `scripts/report.sh` (Docker mode) with `MM_CRUD_ROWS=10000` and record the n
 - After Step 2: UPDATE bulk reaches ≥ 0.17× PG at 5k rows (from 0.14×).
 - All existing UPDATE/DELETE correctness tests pass; crash harness green.
 - No regression on SELECT cols/row (B2 SELECT path must remain unchanged).
+
+**Correction note (2026-07-16, post-measurement):** The criteria above were based on a wrong
+model of the old code. `matching_rows` already called `deform_row` (predicate-only decode)
+for non-matching rows before this item shipped — they were never paying the full-column
+decode cost. Consequently:
+
+- **DELETE Step 1 result:** `cols/row` 6.00 → **2.00** ✓ (theoretical floor at 50% selectivity:
+  scan visits 2N rows, N deleted, 1 pred col each → 2N÷N = 2.0; criterion `< 2.0` should
+  read `≤ 2.0`). `dec/row` 1.00 → **0.00** (full decodes eliminated). Throughput: 614k →
+  675k rec/s (+10%), ratio holds at **0.16× PG** — the real bottleneck is WAL xmax-stamp
+  writes (114 B/row), not column decoding. The `≥ 0.28× PG` criterion was wrong.
+- **UPDATE Step 2 result:** `cols/row` **8.00 → 8.00** (no change). The old code's
+  `deform_row` for non-matching rows already cost only 1 col each; the full decode of
+  matched rows is unavoidable (needed to compute new values). The `MatchedRows` type
+  change (raw bytes instead of `Vec<Literal>`) is architecturally sound and required by
+  the DELETE win, but produces no measurable change to UPDATE's cols/row metric.
+  The `< 5.0` criterion and `≥ 0.17×` throughput criterion are not achievable via this
+  approach — beating UPDATE cols/row requires Phase C (HOT chain, locked decision D4).
 
 ## Depends on / builds on
 

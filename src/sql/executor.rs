@@ -2363,7 +2363,8 @@ fn exec_update(
     // Item 36: gate FK parent-side RESTRICT (does any child table reference us?).
     let has_fk_children = table_has_fk_children(ctx.catalog.get(), table);
     let mut count = 0;
-    for (row_id, mut row) in matching {
+    for (row_id, bytes) in matching {
+        let mut row = decode_row(&bytes, &table_def.columns)?;
         // C1 (item 29): snapshot the pre-mutation image before set_column overwrites it.
         let before_row = row.clone();
         for (col, expr) in assignments {
@@ -2530,17 +2531,18 @@ fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Resu
     // the pre-check pass entirely and go straight to the batch delete.
     let row_ids: Vec<RowId> = if needs_per_row_checks {
         let mut ids = Vec::with_capacity(matching.len());
-        for (row_id, row) in &matching {
+        for (row_id, bytes) in &matching {
+            let row = decode_row(bytes, &table_def.columns)?;
             if has_fk_children {
                 // Protocol (closes the parent-delete / child-insert race):
                 //   1. Acquire FkKey phantom lock on parent PK value BEFORE snapshot.
                 //   2. Take fresh snapshot — sees any child that committed before us.
                 //   3. Scan referencing child tables; reject if any visible child found.
-                acquire_fk_key_locks_parent(&table_def, row, ctx.xid, ctx.lock_mgr)?;
+                acquire_fk_key_locks_parent(&table_def, &row, ctx.xid, ctx.lock_mgr)?;
                 let restrict_snap = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
                 enforce_fk_restrict(
                     &table_def,
-                    row,
+                    &row,
                     &restrict_snap,
                     ctx.xid,
                     ctx.pool,
@@ -2548,7 +2550,7 @@ fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Resu
                 )?;
             }
             // C1 (item 29): before-only; captured before heap mutation.
-            send_event_capture(&table_def, "delete", Some(row), None, ctx)?;
+            send_event_capture(&table_def, "delete", Some(&row), None, ctx)?;
             ids.push(*row_id);
         }
         ids
@@ -2596,8 +2598,10 @@ fn classify_conflict(err: DbError, ctx: &ExecCtx) -> DbError {
     }
 }
 
-/// Rows selected for an UPDATE/DELETE: each decoded row paired with its RowId.
-type MatchedRows = Vec<(RowId, Vec<Literal>)>;
+/// Rows selected for an UPDATE/DELETE: raw heap bytes paired with each RowId.
+/// Callers decode lazily — DELETE's common path (no FK children, no CDC) never
+/// needs column values at all (item 52 Phase B).
+type MatchedRows = Vec<(RowId, Vec<u8>)>;
 
 /// Legacy selectivity cap used as a fallback when `ANALYZE` predates the
 /// page-count field (i.e. `TableStats::page_count == 0`).  Preserves the
@@ -2750,7 +2754,7 @@ fn matching_rows(
                 continue;
             }
         }
-        out.push((row_id, decode_row(&bytes, cols)?));
+        out.push((row_id, bytes));
     }
     Ok(out)
 }
@@ -2795,6 +2799,16 @@ fn index_matching_rows(
     // UPDATE/DELETE, which touch every matched row.
     candidate_ids.sort_unstable_by_key(|r| (r.page_id, r.slot));
 
+    // Predicate-column mask for the re-check (mirrors matching_rows's B2 path):
+    // non-indexed AND terms (e.g. `k = 5 AND body LIKE 'x'`) only need their own
+    // columns materialised; the caller decodes the full row only if it needs it.
+    let cols = &table_def.columns;
+    let mut pred_cols_list = Vec::new();
+    if let Some(pred) = predicate {
+        expr_columns(pred, table_def, &mut pred_cols_list);
+    }
+    let (pred_needed, pred_upto) = needed_mask(&pred_cols_list, cols.len());
+
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for row_id in candidate_ids {
@@ -2806,9 +2820,9 @@ fn index_matching_rows(
             Err(DbError::NoVisibleVersion { .. }) => continue, // superseded / aborted hint
             Err(e) => return Err(e),
         };
-        let row = decode_row(&bytes, &table_def.columns)?;
-        if predicate_matches(predicate, &table_def.columns, &row)? {
-            out.push((row_id, row));
+        let prow = deform_row(&bytes, cols, pred_upto, &pred_needed)?;
+        if predicate_matches(predicate, cols, &prow)? {
+            out.push((row_id, bytes));
         }
     }
     Ok(Some(out))

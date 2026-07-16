@@ -171,15 +171,18 @@ fn a3_gate_no_analyze_still_correct() {
 /// `HEAP_FETCH_SEQ_EQUIV_SERIAL = 0.05` keeps it on the scan path.
 ///
 /// Path signal: `cols_decoded_total` delta.
-///   Scan path:  each row has its predicate column deformed (1 col × total_rows)
-///               plus all columns fully decoded for matched rows (3 cols × half):
-///               delta ≈ total_rows × 1 + half × 3
-///   Index path: only matched candidates are fully decoded (3 cols × half):
-///               delta ≈ half × 3
+///   After item 52 Phase B, DELETE's common path (no FK children, no CDC) never
+///   calls `decode_row` on matched rows — only `deform_row` for the predicate
+///   column(s). So both paths only materialise the 1 predicate column (k):
 ///
-///   Schema has 3 columns (id, k, body), 1 predicate column (k), so:
-///   scan ≈ total + 3 × half;  index ≈ 3 × half
-///   Asserting delta > 4 × half distinguishes them cleanly.
+///   Scan path:  every row is deformed (1 col × total_rows):
+///               delta ≈ total × 1
+///   Index path: only matched candidates are deformed (1 col × half):
+///               delta ≈ half × 1
+///
+///   Schema has 3 columns (id, k, body), 1 predicate column (k):
+///   scan ≈ total (= 10000);  index ≈ half (= 5000)
+///   Asserting delta > (total + half) / 2 = 7500 distinguishes them cleanly.
 #[test]
 fn a3_gate_50pct_delete_large_table_stays_on_scan() {
     let dir = tempfile::tempdir().unwrap();
@@ -202,20 +205,21 @@ fn a3_gate_50pct_delete_large_table_stays_on_scan() {
     exec(&engine, "ANALYZE t");
 
     let half = total / 2;
-    // cols_decoded: scan ≈ total×1 + half×3 = 10000+15000=25000
-    //               index ≈ half×3 = 15000
-    // threshold: 4×half = 20000 separates them
+    // cols_decoded (item 52 Phase B numbers):
+    //   scan  ≈ total × 1 = 10000  (deform pred col for every row; no full decode)
+    //   index ≈ half  × 1 = 5000   (deform pred col for matched rows only)
+    // threshold: (total + half) / 2 = 7500 — scan exceeds it, index falls below.
+    let threshold = (total + half) / 2;
     let cols0 = Engine::cols_decoded_total();
     exec(&engine, &format!("DELETE FROM t WHERE k >= {half}"));
     let cols_delta = Engine::cols_decoded_total().saturating_sub(cols0);
 
     assert!(
-        cols_delta > (4 * half) as u64,
+        cols_delta > threshold as u64,
         "50%-selective DELETE on large table appears to have taken the index path \
-         (cols_decoded delta={cols_delta}, expected >{} for scan path; \
+         (cols_decoded delta={cols_delta}, expected >{threshold} for scan path; \
          index path would give ~{})",
-        4 * half,
-        3 * half
+        half
     );
 
     let remaining = query_count(&engine, "SELECT id FROM t");
