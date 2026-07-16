@@ -872,6 +872,33 @@ fn ctrl_lock_av(m: &Mutex<AutoVacuumConfig>) -> std::sync::MutexGuard<'_, AutoVa
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Cap `slot_lsn` so a stale or abandoned replication slot cannot pin the WAL
+/// without bound. Default ceiling: 10 GiB, overridable via
+/// `UNIDB_MAX_WAL_RETAIN_BYTES`. When the slot lags beyond the ceiling a
+/// `WARN` is emitted — the operator must drop and recreate the slot to resume
+/// streaming from the new floor.
+fn cap_wal_retain_lsn(slot_lsn: Lsn, current_lsn: Lsn) -> Lsn {
+    const DEFAULT_MAX: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
+    let max_bytes = std::env::var("UNIDB_MAX_WAL_RETAIN_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MAX);
+    let floor = current_lsn.saturating_sub(max_bytes);
+    if slot_lsn < floor {
+        tracing::warn!(
+            slot_lsn,
+            current_lsn,
+            clamped_to = floor,
+            max_wal_retain_bytes = max_bytes,
+            "WAL retention cap exceeded: slot lags beyond limit; WAL will be \
+             truncated to the clamped floor. Drop and recreate the slot to reset."
+        );
+        floor
+    } else {
+        slot_lsn
+    }
+}
+
 impl Engine {
     /// Open (or create) a database at `dir`. Pass `page_size = 0` to use the
     /// default. The buffer-pool capacity comes from `UNIDB_BUFFER_POOL_PAGES`
@@ -3247,7 +3274,9 @@ impl Engine {
         // P6.b: hold the WAL truncation floor back to the minimum replication
         // slot position so a consumer's un-streamed segments survive the
         // checkpoint. No slots → `Lsn::MAX` → truncate freely to the ckpt LSN.
-        let wal_retain_lsn = self.replication.min_restart_lsn().unwrap_or(Lsn::MAX);
+        // Cap applied so a stale/abandoned slot cannot pin the WAL without bound.
+        let slot_lsn = self.replication.min_restart_lsn().unwrap_or(Lsn::MAX);
+        let wal_retain_lsn = cap_wal_retain_lsn(slot_lsn, self.wal.current_lsn());
         checkpoint::run(
             &self.pool,
             &self.wal,
