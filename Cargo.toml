@@ -208,6 +208,11 @@ path = "tests/server_metrics.rs"
 required-features = ["server"]
 
 [[test]]
+name = "server_observability"
+path = "tests/server_observability.rs"
+required-features = ["server"]
+
+[[test]]
 name = "server_replication"
 path = "tests/server_replication.rs"
 required-features = ["server"]

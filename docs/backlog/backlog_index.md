@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `49_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `51_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -64,10 +64,11 @@
 | 47 | `47_update_delete_write_throughput.md` | Performance | ✅ SHIPPED (Phase A) 2026-07-16 (PR #119) — B-tree in-place RowId patch for unchanged-key UPDATE (`patch_many` batched across secondary + unique-enforcement indexes). WAL B/row 619 → 465 (−25% at 500-row scale). Phase B (vectorised predicate scan) and Phase C (HOT-equivalent chain) remain open follow-ons. See PROGRESS.md "Items 47 + 44". |
 | 48 | `48_delete_all_truncate_fast_path.md` | Performance | ⏳ NOT STARTED — DELETE all at 0.23× PG (+331%), `dec/row = 1.00` (every row decoded), 20k per-row mini-txns for no-predicate delete. Fix: `TRUNCATE TABLE t` SQL + `Heap::truncate()` (single WAL record + heap reset + index root reset); opportunistic DELETE-all → truncate routing when no FK children and no CDC subscribers. |
 | 49 | `49_bench_pg_connect_no_timeout_hang.md` | Improvement | ✅ SHIPPED 2026-07-16 — `benches/decompose.rs` opened every Postgres connection with no `connect_timeout`; an unreachable/unresponsive `PG_URL` (wrong host, firewalled, container still starting) blocked on the OS TCP SYN-retry ceiling (~2 min/attempt, confirmed empirically) across 24 call sites with zero output — the real cause of `scripts/report.sh` reports "hanging indefinitely". New `pg_dial()` helper sets `connect_timeout` (default 10s, `PG_CONNECT_TIMEOUT_SECS`); all call sites route through it. Verified: unreachable PG_URL now fails the whole report in 14.6s instead of hanging. See PROGRESS.md. |
+| 50 | `50_patch_many_infinite_loop.md` | Improvement | ✅ SHIPPED 2026-07-16 — **critical**: `DiskBTree::patch_many` (item 47) genuinely infinite-loops, single-threaded, 100% CPU, on an unchanged-key `UPDATE` whenever the very first patch in a leaf-group has a key outside that leaf's *current* `entries.first()/last()` (plausible after any split) — the bounds check gated the first entry too, so the loop index never advanced. Confirmed live via `gdb -p <pid> -batch -ex bt` (identical stack twice). This is why it was never caught: Table 3 (the only report section touching this path) only runs when Postgres is reachable, and this session's item 49 fix was the first time that condition was met. Fixed: bounds check now only gates *additional* (`j > i`) batching, never `j == i`. New permanent regression test confirmed to catch the bug pre-fix (30s hang deadline) and pass post-fix (~1s). See PROGRESS.md. |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `50_…`.**
+**Next new file → `51_…`.**
 
 ## Next up (candidates — pick one, then create `NN_<slug>.md`)
 
