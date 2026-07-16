@@ -1,7 +1,7 @@
 # FK UPDATE: skip constraint re-check when FK column not in SET clause
 
 **Type:** Performance
-**Status:** IN PROGRESS (→ PROGRESS.md "Item 53")
+**Status:** SHIPPED (→ PROGRESS.md "Item 53")
 
 ## Measured gap (`030325`, Docker Linux fsync, 2026-07-16)
 

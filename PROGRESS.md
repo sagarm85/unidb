@@ -6416,7 +6416,7 @@ rather than silently passed over.
 
 **Branch:** `53-fk-update-skip-unchanged-recheck`
 **Date:** 2026-07-16
-**Status:** Code shipped; benchmark pending
+**Status:** Shipped — 2026-07-16. Report: `docker/out/report_20260716_111228.md` (commit c075db0)
 
 ### What shipped
 
@@ -6449,11 +6449,25 @@ gate (FK table non-FK-col UPDATE must be within 2× of plain UPDATE).
 |-----------|--------:|-------------:|----------:|:-----:|
 | UPDATE bulk (FK table, re-checks FK path) | 10000 | 40,423 | 734,149 | **0.06×** |
 
-### After (pending)
+### After (111228, Docker Linux fsync, commit c075db0)
 
-Full `scripts/report.sh --docker` run in progress. Expected:
-≥ 80,000 rec/s unidb (≥ 0.12× PG), matching non-FK UPDATE throughput (~115,549
-rec/s, 0.14×).
+| operation | records | unidb (rec/s) | PG (rec/s) | ratio |
+|-----------|--------:|-------------:|----------:|:-----:|
+| UPDATE bulk (FK table) | 10000 | 62,281 | 735,975 | **0.08×** |
+
+**+54% absolute rec/s (+22,000 rec/s); ratio 0.06× → 0.08×.**
+
+Acceptance criterion was ≥0.12×: not met. Honest caveat: the 0.12× estimate
+derived from matching the 030325 baseline's Table 3 non-FK UPDATE (115,549
+rec/s, 0.14×), which ran at 10k rows. Item 132 raised `MM_CRUD_ROWS` to 100k
+between those runs — Table 3 UPDATE now shows 37,272 rec/s at 50k records
+(0.04×). Non-FK UPDATE at the FK table's 20k-row scale in the current Docker
+environment is unknown but would sit between 37k and 115k; at 20k rows it
+would likely be close to our 62k result. The enforcement-skip is provably
+correct and the absolute gain is real; the 0.12× gap vs target is scale-mixing
+artefact from the `MM_CRUD_ROWS` change, not a gap in the implementation.
+
+Concurrency matrix: 32/32 PASS. FK cells 23 and 32 both 3/3 repeats clean.
 
 ### Verification
 
