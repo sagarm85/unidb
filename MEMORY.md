@@ -12,28 +12,32 @@
 
 ## Current status
 
+- **Item 45 Lever 1 — B-tree range partition for parallel workers — SHIPPED
+  2026-07-16, branch `perf/45b-btree-partition`.**
+  `DiskBTree::search_range_partition(op, value, n, pool) -> Vec<Vec<RowId>>`
+  added to `src/btree_index.rs`: walks the leaf chain once with the same
+  admittance logic as `search_range`, groups qualifying RowIds into `n`
+  contiguous-leaf-page slices, returns them pre-partitioned.
+  `try_exec_select_btree` in `src/sql/executor.rs` updated: acquires a worker
+  lease before the B-tree scan (usize::MAX bypasses MIN_PAGES gate), calls
+  `search_range_partition`, then dispatches each partition to exactly one
+  `std::thread::scope` worker (static assignment, no work-stealing cursor).
+  Workers own a contiguous key range → clustered heap-page access vs the
+  interleaved pattern of the prior work-stealing cursor. Falls back to serial
+  via already-collected RowIds when total < PARALLEL_CANDIDATE_MIN (no second
+  scan). Eq/Ne predicates unchanged. Merged main fixes first (patch_many
+  infinite loop #50, report-time surface #49). 38/38 crash harness.
+  Clippy/fmt clean.
+
 - **Item 45 lever 2: pre-spawned worker pool — SHIPPED 2026-07-16,
-  branch `perf/45-worker-pool`, commit 87ccfa2.**
+  branch `perf/45-worker-pool`, PR #123.**
   Replaced all four `std::thread::scope` calls in `src/sql/parallel_scan.rs`
   with a module-level pre-spawned thread pool (`OnceLock<Arc<PoolInner>>`).
   Workers park on `work_cond` condvar between queries; a caller increments the
   generation counter, sets `job`, and blocks on `done_cond` until `finished ==
   degree`. Pool size = `GLOBAL_MAX`, spawned once in `init_from_env`. Existing
   `WorkerLease` / `AVAILABLE` governance (items 15/21) still bounds the live
-  worker count — a leased slot is what triggers `run_in_pool`. Non-`'static`
-  closures (they capture `&[ColumnDef]`, `Option<&QExpr>`, etc.) handled via
-  controlled `unsafe` in `transmute_job_lifetime` (same technique as
-  `std::thread::scope`/`rayon::scope`; sound because `run_in_pool` holds the
-  `entry` mutex and blocks until all workers return before clearing `guard.job`).
-  `PoolInner::entry: Mutex<()>` serialises concurrent callers on the single
-  generation/finished slot. Four `Arc`-clone patterns replace the moved-closure
-  pattern in `parallel_count`, `parallel_resolve_candidates`,
-  `parallel_count_matching`, `parallel_filter_project`. Also: merged main
-  (fast-forward) which brought item 49 connect-timeout fix and item 50
-  `patch_many` infinite-loop fix. Gates: crash harness 38/38; workspace tests
-  green (one pre-existing timing flake `slow_query_captured_after_threshold_set`
-  in server_observability passes in isolation — confirmed not from this session's
-  changes); clippy/fmt clean. No engine/format/WAL change.
+  worker count. 38/38 crash harness. Clippy/fmt clean.
 
 - **`DiskBTree::patch_many` infinite loop (item 50) — SHIPPED 2026-07-16,
   branch `49-pg-connect-timeout`. Critical — the real dominant cause of the
