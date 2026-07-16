@@ -18,7 +18,7 @@
   DELETE: cols/row 6.00 → 2.00, dec/row 1.00 → 0.00, throughput +10% (614k → 675k rec/s),
   ratio holds at 0.16× PG (bottleneck is WAL xmax-stamp writes, 114 B/row, not decoding).
   UPDATE: cols/row unchanged at 8.00 (old code already had deform_row for non-matching rows;
-  full decode of matched rows is unavoidable for MVCC). PR ready — awaiting user approval.
+  full decode of matched rows is unavoidable for MVCC). PR #131 open — awaiting merge.
 
 - **Item 51 — SELECT JOIN hash join + predicate pushdown — PHASE A DONE 2026-07-16,
   branch `51-select-join-hash-join`.** Predicate pushdown into base scans, integer key
