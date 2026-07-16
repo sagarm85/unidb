@@ -12,8 +12,69 @@
 
 ## Current status
 
+- **`DiskBTree::patch_many` infinite loop (item 50) — SHIPPED 2026-07-16,
+  branch `49-pg-connect-timeout`. Critical — the real dominant cause of the
+  `scripts/report.sh` hang reports, bigger than item 49 below.**
+  Found while re-verifying item 49's fix against a *reachable* Postgres:
+  `UPDATE t SET body=... WHERE k<5000` on a 10k-row indexed table hung 29+
+  min at 100% CPU, one thread. `gdb -p <pid> -batch -ex bt` (2 samples)
+  showed an identical stack pinned inside `patch_many` (item 47's new
+  batched-leaf-patch code) both times — genuine infinite loop, not a lock
+  wait. Root cause: the leaf-group bounds check (`entries.first()/last()`,
+  the leaf's *current* live entries) gated even the first entry (`j == i`)
+  in each group; a leaf's live entries don't have to span its full
+  structural key range (e.g. right after a split), so when `sorted[i].0`
+  legitimately falls outside that range, the inner loop `break`s before `j`
+  ever increments, `i = j` is a no-op, and the outer loop repeats the
+  identical `find_leaf` → same leaf → same miss, forever. Fix: bounds check
+  now only gates *additional* (`j > i`) batching; `j == i` always processes
+  (falls back to the existing `insert_in_txn` path exactly like any other
+  not-found entry), so `j` — and `i` — always advances. Why never caught:
+  Table 3 (the only report section touching this path) is entirely gated on
+  a *reachable* Postgres — every earlier report in this project's history
+  without one skipped it silently, and item 47/44's own regression test
+  (500 rows) never reached a B-tree split. New permanent regression test
+  (`tests/patch_many_leaf_bounds_regression.rs`, 30s hang-deadline via
+  `mpsc::recv_timeout`) confirmed to catch the bug pre-fix and pass
+  post-fix. Also fixed: `tests/server_observability.rs` (item 34) was
+  missing its `Cargo.toml` `[[test]] required-features=["server"]`
+  registration, breaking plain `cargo test`; registering it surfaced one
+  pre-existing, unrelated test failure (`slow_query_captured_after_
+  threshold_set`) — confirmed via `git stash` to be unrelated to this
+  session's changes, flagged in the item 50 backlog doc, not fixed (out of
+  scope). Gates: crash harness 38/38, `cargo test --release` (default
+  features) 407 lib/bin + all integration suites green, clippy/fmt clean.
+  No format/WAL change. Full report re-generated with ALL FIVE row-count
+  knobs scoped (`MM_SIZES`, `MM_BULK_SIZES`, `MM_CRUD_ROWS`,
+  `MM_FK_ORDERS`, `MM_TX_SWEEP` — discovered these are independent, no
+  shared default) —
+  `docs/performance/multi_model_report_20260716_005004.md`, real Postgres
+  columns throughout, 32/32 conc matrix PASS, ready to hand off for the
+  next optimization decision.
+- **Bench harness Postgres connect-timeout fix (item 49) — SHIPPED 2026-07-16,
+  branch `49-pg-connect-timeout`.**
+  Investigated a report that `scripts/report.sh` "runs in indefinite mode."
+  Root cause: `benches/decompose.rs` opened every Postgres connection via
+  `Client::connect(url, NoTls)` with no `connect_timeout` — an unreachable
+  `PG_URL` (wrong host, firewalled, container still starting) blocks on the
+  OS TCP SYN-retry ceiling (confirmed empirically: ~2 min/attempt) across 24
+  call sites, with zero output. Ruled out as causes (audited, no bug found):
+  item 47/44's new per-page latching (single latch at a time, consistent
+  ordering), `lock_mgr.try_acquire_write` (non-blocking `WaitPolicy::NoWait`),
+  the parallel-scan worker governor item 15 (non-blocking admission, degrades
+  to serial), `conc_matrix`'s deadlock handling (already bounded to 120s/cell,
+  isolated per-cell tempdir engine). Fix: new `pg_dial()` helper sets
+  `connect_timeout` (default 10s, `PG_CONNECT_TIMEOUT_SECS`); all 24 call
+  sites route through it. Verified: unreachable `PG_URL` now fails the whole
+  report in 14.6s (was: indefinite hang) — reachable-Postgres runs unaffected
+  (numbers identical, timeout never fires). `cargo build`/`clippy -D warnings`
+  clean, bench-harness-only change (no engine/format/WAL touch). This fix
+  alone was not sufficient to get a clean full report — making Postgres
+  reachable exercised Table 3 for the first time and hit item 50 (above),
+  a second, more severe pre-existing bug in `patch_many`. See item 50 for
+  the report actually used to plan the next optimization decision.
 - **UPDATE in-place B-tree patch + DELETE batched mini-txn (items 47 + 44) —
-  SHIPPED 2026-07-16, branch `47-44-perf-batch`, PR pending.**
+  SHIPPED 2026-07-16, branch `47-44-perf-batch`, PR #119 (MERGED to main).**
   Item 47: `init_patch_batches` now batches unique-enforcement index patches
   alongside secondary BTree patches; `flush_patch_batches` calls `patch_many`
   once per batch after the row loop. WAL B/row 619 → 465 (−25% at 500-row
@@ -3322,6 +3383,137 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-16 — Item 50: `DiskBTree::patch_many` infinite loop (found re-verifying item 49)
+
+- Immediately after shipping item 49's connect-timeout fix, re-ran the full
+  1k/10k report against a real, reachable local Postgres 16 (installed via
+  the pre-existing `postgresql-16` apt package, started with `service
+  postgresql start`) to hand off real Postgres numbers as originally
+  requested. It hung: `t3_update_unidb` phase ran for 29+ minutes, process
+  state `R` (running, not `S`/sleeping) at ~97-100% CPU on a single thread —
+  a genuine spin, not a lock wait.
+- Diagnosed live rather than guessing: `gdb -p <pid> -batch -ex "bt" -ex
+  "detach" -ex "quit"`, taken twice ~3s apart, produced the **byte-identical**
+  stack trace both times, four frames deep in `DiskBTree::patch_many`
+  (`src/btree_index.rs`) via `flush_patch_batches` → `exec_update` — proof of
+  a tight loop with no progress, not intermittent contention.
+- **Root cause**: `patch_many`'s leaf-group loop uses
+  `entries.first()/last()` (a leaf's *current* live entries) as bounds to
+  decide which sorted patches piggyback onto one `find_leaf` lookup. That
+  bounds check also gated the *first* entry in each group (`j == i`) — but a
+  leaf's live entries don't have to span its full structural key range
+  (e.g. right after a split), so `sorted[i].0` can legitimately fall outside
+  them even though `find_leaf` correctly routed here. When that happens on
+  `j == i`, the inner loop `break`s before `j` increments, `i = j` is a
+  no-op, and the outer `while i < sorted.len()` loop repeats forever on the
+  same index.
+- **Why item 47's own tests missed it**: `tests/perf_item47_44.rs` uses 500
+  rows — never reaches a B-tree leaf split. And Table 3 (the only place in
+  this whole project's report tooling that exercises unchanged-key `UPDATE`
+  at scale) is entirely gated on `pg_method.is_some()` — every report ever
+  generated without a *reachable* Postgres (which appears to have been most
+  of them, including several earlier this session) silently skipped it.
+  Item 49's fix (making Postgres actually usable) is what first exercised
+  this path against real data volume.
+- **Fix**: restructured the loop so the bounds check can only terminate
+  *additional* (`j > i`) batching — `j == i` is now unconditionally
+  processed (falls back to the existing `insert_in_txn` path, exactly like
+  any other not-found entry, if the exact `(key, old_rid)` isn't in this
+  leaf), guaranteeing `j` — and therefore `i` — always advances.
+- **New regression test**: `tests/patch_many_leaf_bounds_regression.rs` — a
+  10k-row table indexed on `k` (forces splits), `UPDATE ... WHERE k < 5000`
+  (the exact hung shape) on a background thread with a 30s deadline via
+  `mpsc::Receiver::recv_timeout` (same hang-detection pattern
+  `benches/conc_matrix.rs::run_with_deadline` already uses). Verified the
+  test actually catches the bug: `git stash`-ed just `src/btree_index.rs`,
+  re-ran — failed at the 30s deadline with the expected `HANG:` message;
+  restored the fix — passes in ~1s.
+- **Also found and fixed while running the full verification gate**:
+  `tests/server_observability.rs` (item 34) had no `[[test]]` entry in
+  `Cargo.toml`, so plain `cargo test` (no `--features server`) tried to
+  compile it anyway and failed — added the missing
+  `required-features = ["server"]` registration. Doing so surfaced a real,
+  **pre-existing** test failure, `slow_query_captured_after_threshold_set`
+  — confirmed via `git stash` (full working tree) that it fails identically
+  with none of this session's changes present. Not investigated further or
+  fixed (out of scope) — flagged in `docs/backlog/50_patch_many_infinite_
+  loop.md` instead of silently omitted from the "tests green" claim.
+- Gates: crash harness 38/38; `cargo test --release` (default features) 407
+  lib/bin tests + every integration suite green; `cargo test --release
+  --features server` green except the one pre-existing unrelated failure
+  above; `cargo clippy --release -- -D warnings` clean; `cargo fmt --all
+  --check` clean. No `FORMAT_VERSION` bump — in-memory control-flow fix
+  only, WAL/undo output unchanged.
+- Final report — all five independent row-count knobs discovered and scoped
+  together (`MM_SIZES`, `MM_BULK_SIZES`, `MM_CRUD_ROWS`, `MM_FK_ORDERS`,
+  `MM_TX_SWEEP`; none share a default) —
+  `docs/performance/multi_model_report_20260716_005004.md`: real Postgres
+  columns across all 5 tables, 32/32 concurrency matrix PASS. Biggest
+  remaining gaps vs Postgres per this report: UPDATE bulk (0.27×, Table 3;
+  0.16×, Table 5's re-check path), DELETE selected (0.32×) — consistent with
+  already-filed backlog items 45/47(Phase B/C)/48.
+- Branch: `49-pg-connect-timeout` (same branch as item 49 — found while
+  verifying it, not a separate branch).
+
+### 2026-07-16 — Item 49: report.sh "indefinite hang" investigation + Postgres connect-timeout fix
+
+- **Trigger**: user observed "many metrics reports are not working and running
+  in indefinite mode especially reports.sh" and asked for a root-cause
+  investigation (script code, latest merged main changes, config adoption)
+  before generating the benchmark used to plan the next optimization pass.
+- **Investigated and ruled out** (expert-lens review per CLAUDE.md §0.6,
+  applied to the freshly-merged item 47/44 PR #119 first since it's the most
+  recent change to the write path): `DiskBTree::patch_many` and
+  `Heap::delete_many` both hold exactly one page/leaf latch at a time, drop it
+  before any fallback/recursive call, and process leaves in consistent
+  ascending-key order across concurrent callers — no self- or cross-txn
+  deadlock. `lock_mgr.try_acquire_write` is `WaitPolicy::NoWait` (aborts
+  instead of blocking, per the SI design in CLAUDE.md D12). The item-15
+  parallel-scan worker governor (`src/sql/parallel_scan.rs`) is non-blocking
+  admission control (`take_from_pool` never waits; degrades to serial).
+  `conc_matrix`'s `run_with_deadline` already bounds any real deadlock to a
+  120s-per-cell "HANG" verdict on an isolated, fresh, tempdir-scoped engine —
+  confirmed no cross-cell blast radius (`open_engine` opens a new `tempdir()`
+  per cell).
+- **Root cause found**: `benches/decompose.rs` opened every Postgres
+  connection via `postgres::Client::connect(url, NoTls)` — 24 call sites, zero
+  of them setting a `connect_timeout`. Empirically confirmed on this host: a
+  refused TCP connect fails in 5ms; a connect to a black-holed/unresponsive
+  address is still pending past 8s (`tcp_syn_retries=6` → ~2 min ceiling per
+  attempt). A `PG_URL` that's merely unreachable (not actively refused —
+  wrong host, firewalled, Postgres container mid-startup, a stale value left
+  from a prior session) silently stalls the entire report with no output,
+  exactly matching "indefinite mode."
+- **Fix**: new `pg_dial(url) -> Result<Client, Box<dyn Error + Send + Sync>>`
+  helper — parses `url` as `postgres::Config`, sets
+  `.connect_timeout(Duration)` (default 10s, `PG_CONNECT_TIMEOUT_SECS`
+  override) before `.connect(NoTls)`. All 24 raw `Client::connect` call sites
+  (mechanical `sed` + 2 manual `match` sites) now route through it. Same
+  `Result<Client, _>` shape, so `.unwrap()`/`.ok()`/`match` call sites needed
+  no further changes.
+- **Verified**: `UNIDB_BENCH=mmreport` run direct against a black-holed
+  `PG_URL` completed in **14.6s total** (prints `[pg] WARNING: ... connect
+  failed ... — skipping`, report finishes) — previously would have hung ~2min
+  on the first connect alone. Re-ran against a real local Postgres 16
+  (installed + started via the pre-existing `postgresql-16` apt package, root
+  access) — full report completes normally, numbers unaffected (timeout never
+  fires when the server responds).
+- Gates: `cargo build --release --bench decompose` clean; `cargo clippy
+  --release --bench decompose -- -D warnings` clean. Bench-harness-only —
+  no engine/format/WAL change, no crash-harness re-run needed.
+- Also fixed while touched: `PROGRESS.md`'s duplicate "Items 47 + 44" entry
+  was found truncated mid-sentence (pre-existing, part of PR #119 as merged)
+  — closed the sentence with a dated correction note (additive, not rewritten)
+  rather than building the new entry on top of a broken doc. `backlog_index.md`
+  rows for items 44/47 flipped from stale "NOT STARTED" to "SHIPPED (PR #119)"
+  since main already carries that work.
+- New full 1k/10k-row multi-model report generated on this branch with real
+  Postgres comparison columns (local Postgres 16, matched `fsync`/`fsync`
+  durability lens) — see `docs/performance/multi_model_report_20260716_*.md`
+  for the numbers used to decide the next optimization target.
+- Branch: `49-pg-connect-timeout` (based on latest `origin/main`, i.e. up to
+  and including PR #119).
 
 ### 2026-07-16 — Items 47 + 44: UPDATE B-tree in-place patch + DELETE batched mini-txn (PR pending)
 

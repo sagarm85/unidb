@@ -1215,9 +1215,23 @@ impl DiskBTree {
             let mut modified = false;
             let mut fallbacks: Vec<(OrderedValue, RowId)> = Vec::new();
             let mut j = i;
-            while j < sorted.len() {
+            loop {
+                // The min/max bounds check only gates whether ADDITIONAL
+                // (j > i) patches from the sorted batch also belong to this
+                // leaf, so it can never fire on the very first entry (j ==
+                // i) -- `find_leaf` is what put us on this page for that
+                // key, but a leaf's *current* entries don't have to span its
+                // full structural key range (e.g. right after a split), so
+                // `sorted[i].0` can legitimately fall outside
+                // `entries.first()/last()`. Gating on the bounds check for
+                // j == i would `break` before `j` ever advances, leaving
+                // `i = j` a no-op and looping forever on the same index.
+                // Always processing j == i here (falling back to
+                // `insert_in_txn` below if the exact (key, old_rid) entry
+                // isn't in this leaf, exactly like any other not-found case)
+                // guarantees `j` advances past `i` every iteration.
                 let (ref pk, pold, pnew) = sorted[j];
-                if pk < &min_key || pk > &max_key {
+                if j > i && (pk < &min_key || pk > &max_key) {
                     break;
                 }
                 // Find the specific (pk, pold) entry and patch its RowId.
@@ -1229,6 +1243,9 @@ impl DiskBTree {
                     None => fallbacks.push((pk.clone(), pnew)),
                 }
                 j += 1;
+                if j >= sorted.len() {
+                    break;
+                }
             }
             if modified {
                 prev_lsn = write_node(

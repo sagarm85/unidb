@@ -222,8 +222,31 @@ fn pg_url() -> Option<String> {
     std::env::var("PG_URL").ok()
 }
 
+/// `connect_timeout` (seconds) applied to every Postgres connection this bench
+/// opens. Override via `PG_CONNECT_TIMEOUT_SECS`.
+fn pg_connect_timeout() -> Duration {
+    Duration::from_secs(env_u64("PG_CONNECT_TIMEOUT_SECS", 10))
+}
+
+/// The one place this bench opens a Postgres connection — always through a
+/// parsed `Config` with an explicit `connect_timeout` (see above). Without it,
+/// `tokio_postgres`'s underlying `TcpStream::connect` has no timeout of its
+/// own: a `PG_URL` that is unreachable (wrong host/port, firewalled, container
+/// still starting) makes the connect call block on the OS TCP retry ceiling —
+/// empirically 2+ minutes per attempt on this host — with zero output, and
+/// this bench dials Postgres from 20+ call sites across the ladder/CRUD/bulk/FK
+/// suites, so a single unreachable `PG_URL` used to stall the entire report
+/// generation indefinitely instead of failing fast with a clear error. Same
+/// `Result<Client, _>` shape as `Client::connect` so every call site is a
+/// drop-in replacement.
+fn pg_dial(url: &str) -> std::result::Result<Client, Box<dyn std::error::Error + Send + Sync>> {
+    let mut cfg: postgres::Config = url.parse()?;
+    cfg.connect_timeout(pg_connect_timeout());
+    Ok(cfg.connect(NoTls)?)
+}
+
 fn pg_connect(url: &str) -> Option<Client> {
-    match Client::connect(url, NoTls) {
+    match pg_dial(url) {
         Ok(c) => Some(c),
         Err(e) => {
             eprintln!("  [pg] WARNING: PG_URL set but connect failed ({e}) — skipping");
@@ -691,7 +714,7 @@ fn pg_concurrency(url: &str, writers: usize, per_thread: usize) -> Option<f64> {
     for w in 0..writers {
         let (url, barrier, committed) = (url.to_string(), barrier.clone(), committed.clone());
         handles.push(thread::spawn(move || {
-            let mut client = Client::connect(&url, NoTls).unwrap();
+            let mut client = pg_dial(&url).unwrap();
             let stmt = client
                 .prepare("INSERT INTO c (id, body) VALUES ($1, $2)")
                 .unwrap();
@@ -1219,7 +1242,7 @@ fn pg_measure_table(
             committed.clone(),
         );
         handles.push(thread::spawn(move || {
-            let mut client = Client::connect(&url, NoTls).unwrap();
+            let mut client = pg_dial(&url).unwrap();
             let ins = client
                 .prepare(&format!(
                     "INSERT INTO {name} (id, k, body) VALUES ($1, $2, $3)"
@@ -1805,7 +1828,7 @@ fn pg_build_crud(url: &str, rows: u64) -> Option<()> {
 }
 
 fn pg_crud_insert(url: &str, n: u64, base: i64) -> (u64, f64) {
-    let mut c = Client::connect(url, NoTls).unwrap();
+    let mut c = pg_dial(url).unwrap();
     let ins = c
         .prepare("INSERT INTO t (id, k, g, body) VALUES ($1, $2, $3, $4)")
         .unwrap();
@@ -1819,7 +1842,7 @@ fn pg_crud_insert(url: &str, n: u64, base: i64) -> (u64, f64) {
 }
 
 fn pg_crud_select_filtered(url: &str, lo: i64, hi: i64) -> (u64, f64) {
-    let mut c = Client::connect(url, NoTls).unwrap();
+    let mut c = pg_dial(url).unwrap();
     let start = Instant::now();
     let rows = c
         .query(
@@ -1831,7 +1854,7 @@ fn pg_crud_select_filtered(url: &str, lo: i64, hi: i64) -> (u64, f64) {
 }
 
 fn pg_crud_select_grouped(url: &str, scanned: u64) -> (u64, f64) {
-    let mut c = Client::connect(url, NoTls).unwrap();
+    let mut c = pg_dial(url).unwrap();
     let start = Instant::now();
     let _rows = c
         .query("SELECT g, COUNT(*) FROM t GROUP BY g", &[])
@@ -1840,14 +1863,14 @@ fn pg_crud_select_grouped(url: &str, scanned: u64) -> (u64, f64) {
 }
 
 fn pg_crud_count_all(url: &str, scanned: u64) -> (u64, f64) {
-    let mut c = Client::connect(url, NoTls).unwrap();
+    let mut c = pg_dial(url).unwrap();
     let start = Instant::now();
     let _rows = c.query("SELECT COUNT(*) FROM t", &[]).unwrap();
     (scanned, start.elapsed().as_secs_f64())
 }
 
 fn pg_crud_update_bulk(url: &str, hi: i64) -> (u64, f64) {
-    let mut c = Client::connect(url, NoTls).unwrap();
+    let mut c = pg_dial(url).unwrap();
     let start = Instant::now();
     let n = c
         .execute("UPDATE t SET body = 'updated' WHERE k < $1", &[&hi])
@@ -1856,14 +1879,14 @@ fn pg_crud_update_bulk(url: &str, hi: i64) -> (u64, f64) {
 }
 
 fn pg_crud_delete_selected(url: &str, lo: i64) -> (u64, f64) {
-    let mut c = Client::connect(url, NoTls).unwrap();
+    let mut c = pg_dial(url).unwrap();
     let start = Instant::now();
     let n = c.execute("DELETE FROM t WHERE k >= $1", &[&lo]).unwrap();
     (n, start.elapsed().as_secs_f64())
 }
 
 fn pg_crud_delete_all(url: &str) -> (u64, f64) {
-    let mut c = Client::connect(url, NoTls).unwrap();
+    let mut c = pg_dial(url).unwrap();
     let start = Instant::now();
     let n = c.execute("DELETE FROM t", &[]).unwrap();
     (n, start.elapsed().as_secs_f64())
@@ -1933,7 +1956,7 @@ fn sql_bulk_select(engine: &Arc<Engine>, n: u64) -> (u64, f64) {
 /// Postgres bulk insert into a fresh `bt`, matched method: batched prepared
 /// single-row inserts, one commit per `BULK_COMMIT_BATCH`. Returns (rows, secs).
 fn pg_bulk_insert(url: &str, n: u64) -> (u64, f64) {
-    let mut c = Client::connect(url, NoTls).unwrap();
+    let mut c = pg_dial(url).unwrap();
     c.batch_execute(
         "DROP TABLE IF EXISTS bt; \
          CREATE TABLE bt (id BIGINT, k BIGINT, body TEXT); \
@@ -1960,7 +1983,7 @@ fn pg_bulk_insert(url: &str, n: u64) -> (u64, f64) {
 /// non-indexed `body` predicate forces a seq scan (no index-only shortcut).
 /// Throughput = rows/sec.
 fn pg_bulk_select(url: &str, n: u64) -> (u64, f64) {
-    let mut c = Client::connect(url, NoTls).unwrap();
+    let mut c = pg_dial(url).unwrap();
     let start = Instant::now();
     let _rows = c
         .query("SELECT COUNT(*) FROM bt WHERE body <> 'x'", &[])
@@ -2018,7 +2041,7 @@ fn unidb_w4_throughput(n: u64) -> f64 {
 
 /// Postgres relational commits/sec: `n` single-row durable INSERTs.
 fn pg_relational_throughput(url: &str, n: u64) -> f64 {
-    let mut c = Client::connect(url, NoTls).unwrap();
+    let mut c = pg_dial(url).unwrap();
     c.batch_execute("DROP TABLE IF EXISTS t4; CREATE TABLE t4 (id BIGINT PRIMARY KEY, body TEXT)")
         .unwrap();
     let ins = c
@@ -2328,7 +2351,7 @@ fn pg_fk_setup(url: &str, customers: u64) -> Option<()> {
 }
 
 fn pg_fk_insert_valid(url: &str, n: u64, base: i64, customers: u64) -> (u64, f64) {
-    let mut c = Client::connect(url, NoTls).unwrap();
+    let mut c = pg_dial(url).unwrap();
     let ins = c
         .prepare("INSERT INTO orders (id, customer_id, amount, status) VALUES ($1, $2, $3, $4)")
         .unwrap();
@@ -2345,7 +2368,7 @@ fn pg_fk_insert_valid(url: &str, n: u64, base: i64, customers: u64) -> (u64, f64
 }
 
 fn pg_fk_rejects_invalid(url: &str) -> bool {
-    let mut c = match Client::connect(url, NoTls) {
+    let mut c = match pg_dial(url) {
         Ok(c) => c,
         Err(_) => return false,
     };
@@ -2357,7 +2380,7 @@ fn pg_fk_rejects_invalid(url: &str) -> bool {
 }
 
 fn pg_fk_restrict_blocks_delete(url: &str, referenced_customer_id: i64) -> bool {
-    let mut c = match Client::connect(url, NoTls) {
+    let mut c = match pg_dial(url) {
         Ok(c) => c,
         Err(_) => return false,
     };
@@ -2369,7 +2392,7 @@ fn pg_fk_restrict_blocks_delete(url: &str, referenced_customer_id: i64) -> bool 
 }
 
 fn pg_fk_update_bulk(url: &str, hi: i64) -> (u64, f64) {
-    let mut c = Client::connect(url, NoTls).unwrap();
+    let mut c = pg_dial(url).unwrap();
     let start = Instant::now();
     let n = c
         .execute("UPDATE orders SET status = 'shipped' WHERE id < $1", &[&hi])
@@ -2378,7 +2401,7 @@ fn pg_fk_update_bulk(url: &str, hi: i64) -> (u64, f64) {
 }
 
 fn pg_fk_join_select(url: &str) -> (u64, f64) {
-    let mut c = Client::connect(url, NoTls).unwrap();
+    let mut c = pg_dial(url).unwrap();
     let start = Instant::now();
     let rows = c
         .query(
@@ -2528,7 +2551,7 @@ fn bench_mm_report() {
             let ax = se.begin().unwrap();
             let _ = se.execute_sql(ax, "ANALYZE t");
             se.commit(ax).unwrap();
-            if let Ok(mut c) = Client::connect(u, NoTls) {
+            if let Ok(mut c) = pg_dial(u) {
                 let _ = c.batch_execute("ANALYZE t");
             }
         });
