@@ -66,160 +66,56 @@
 | 49 | `49_bench_pg_connect_no_timeout_hang.md` | Improvement | ✅ SHIPPED 2026-07-16 — `benches/decompose.rs` opened every Postgres connection with no `connect_timeout`; an unreachable/unresponsive `PG_URL` (wrong host, firewalled, container still starting) blocked on the OS TCP SYN-retry ceiling (~2 min/attempt, confirmed empirically) across 24 call sites with zero output — the real cause of `scripts/report.sh` reports "hanging indefinitely". New `pg_dial()` helper sets `connect_timeout` (default 10s, `PG_CONNECT_TIMEOUT_SECS`); all call sites route through it. Verified: unreachable PG_URL now fails the whole report in 14.6s instead of hanging. See PROGRESS.md. |
 | 50 | `50_patch_many_infinite_loop.md` | Improvement | ✅ SHIPPED 2026-07-16 — **critical**: `DiskBTree::patch_many` (item 47) genuinely infinite-loops, single-threaded, 100% CPU, on an unchanged-key `UPDATE` whenever the very first patch in a leaf-group has a key outside that leaf's *current* `entries.first()/last()` (plausible after any split) — the bounds check gated the first entry too, so the loop index never advanced. Confirmed live via `gdb -p <pid> -batch -ex bt` (identical stack twice). This is why it was never caught: Table 3 (the only report section touching this path) only runs when Postgres is reachable, and this session's item 49 fix was the first time that condition was met. Fixed: bounds check now only gates *additional* (`j > i`) batching, never `j == i`. New permanent regression test confirmed to catch the bug pre-fix (30s hang deadline) and pass post-fix (~1s). See PROGRESS.md. |
 
+| 51 | `51_select_join_hash_join.md` | Performance | ⏳ NOT STARTED — SELECT JOIN 0.29× PG (17× behind on FK tables); O(n×m) nested loop → O(n+m) hash join or O(n log m) index-nested-loop. Estimated: 0.70–1.00× PG. |
+| 52 | `52_update_delete_predicate_decode_pushdown.md` | Performance | ⏳ NOT STARTED — item 47 Phase B: cols/row=8 on UPDATE, cols/row=6 on DELETE proves full decode on predicate-scan path. Extend B2 deform_row mask to matching_rows write path. DELETE: 0.16→0.30-0.40×; UPDATE: 0.14→0.18-0.22×. |
+| 53 | `53_fk_update_skip_unchanged_recheck.md` | Improvement | ⏳ NOT STARTED — FK UPDATE 0.06× PG (17× behind); executor re-checks FK constraint on every UPDATE row unconditionally even when FK column is not in SET clause. Skip when FK col not in SET. 0.06→0.12-0.18×. |
+| 54 | `54_select_filtered_arena_alloc.md` | Performance | ⏳ NOT STARTED — item 45 Lever 3: per-row Vec<Literal>+String allocation on parallel scan hot path. Per-query arena/bump allocator. SELECT filtered 0.42→0.50-0.58× PG. |
+| 55 | `55_event_queue_small_table_overhead.md` | Improvement | ⏳ NOT STARTED — W4/W0=3.93× at 1k rows (Δ event=1.29ms vs 0.12ms at 10k); 10× anomaly unexplained; investigate before optimising (vacuum threshold, sequence index, WAL group-commit). |
+
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `51_…`.**
+**Next new file → `56_…`.**
 
-## Next up (candidates — pick one, then create `NN_<slug>.md`)
+## Next up — priority order (2026-07-16, derived from `030325` Docker report)
 
-Ordered by my current ROI read; reorder as priorities change. Create each
-candidate's `NN_<slug>.md` when started — until then each is *filed inside* an
-existing doc.
+Ordered by measured ROI from `030325` (`docs/performance/multi_model_report_20260716_030325.md`).
+Each item has its own spec file (see Registry above). Reorder as new data arrives.
 
-**#35 — Unique-constraint full heap scan — ✅ SHIPPED 2026-07-14.** Implicit
-unique-enforcement B-tree per PK/UNIQUE column at CREATE TABLE; O(1) point
-lookup + MVCC re-check in `enforce_unique()`; PK INSERT now flat at ~27-30k
-rows/s (was O(n²): 5k→1k/s degrading). P35 crash test; 6 regression tests;
-`unique_index_root` in `ColumnDef` with `#[serde(default)]` (no FORMAT_VERSION
-bump). See PROGRESS.md.
+**#51 — SELECT JOIN hash join (`51_select_join_hash_join.md`) — highest ROI.**
+0.29× PG. Algorithmic gap: O(n×m) nested loop vs O(n+m) hash join / O(n log m) index-nested-loop.
+No WAL/storage change. Phase A (index-nested-loop, wires existing PK B-tree) can ship standalone.
+Independent of all other items below.
 
-**#36 — Foreign keys: full row-level enforcement — ✅ SHIPPED 2026-07-14.** See
-`36_foreign_key_row_enforcement.md` and PROGRESS.md for details and metrics.
-Child INSERT/UPDATE verifies referenced parent key via unique_index_root (O(log
-n)); parent DELETE/UPDATE RESTRICT; FkKey phantom lock for concurrent-race
-safety; 9 new tests + conc_matrix cell 10/10 PASS.
+**#52 — UPDATE/DELETE predicate decode pushdown (`52_update_delete_predicate_decode_pushdown.md`).**
+cols/row=8 (UPDATE) and cols/row=6 (DELETE) measured in `030325`: we decode all columns on the
+predicate-scan path when we only need the WHERE column(s). Extends B2 (`deform_row` mask) already
+shipped for SELECT. DELETE gets the larger gain (no write-step decode needed). UPDATE gain bounded by
+insert-new-version MVCC write cost. Can develop alongside #51 (different executor sections).
 
-**#43 — A3 scan-vs-index gate is now size-aware (SHIPPED 2026-07-15,
-`43_a3_gate_size_aware_selectivity.md`).**
-Size-aware cost model + best-arm predicate selection + gate added to
-exec_select. Crossover at ~2600 rows for 50% selectivity; 3 permanent
-regression tests in `tests/a3_gate.rs`. PR pending. The remaining
-large-scale performance gap vs Postgres is architectural (PG parallel index
-scan vs unidb's single-threaded B-tree resolution) and is a separate
-follow-up item, not item 43 scope. Original problem was:
-does. Not a quick constant bump: the current 0.3 already fixes a prior
-regression (forcing the index path regressed a 50%-selective DELETE) —
-needs a real size-aware cost model, re-derived and measured across a size
-sweep, not a single new fixed number.
+**#53 — FK UPDATE: skip re-check when FK col not in SET (`53_fk_update_skip_unchanged_recheck.md`).**
+0.06× PG = 17× behind. Trivial executor fix: skip `enforce_fk_child_insert_update` when the FK
+column is not in the SET clause. Independent of #51 and #52; can run in a parallel worktree.
 
-**#45 — SELECT filtered remaining gap: serial B-tree scan + thread-spawn + alloc
-(`45_select_filtered_parallel_btree_scan.md`, NOT STARTED).** After item 43 the gate is right (cols/row=4.00, parallel fires), but 0.35× PG remains. Three levers: (1) partitioned B-tree range across workers instead of serial candidate collection, (2) pre-spawned worker pool instead of `std::thread::scope` per query, (3) arena-allocated row data instead of per-row `Vec<Literal>` + `String`. Each is independent; (2) alone should recover most of the thread-spawn overhead.
+**#54 — SELECT filtered arena allocation (`54_select_filtered_arena_alloc.md`).**
+0.42× PG. Phase B decode already applied (cols/row=4.00). Per-row Vec<Literal>+String allocation
+is the remaining addressable cost. Residual gap beyond ~0.55× is Postgres's parallel worker count
+at 18 cores — architectural. Independent of all other items.
 
-**#46 — SELECT grouped: full-row decode + row-at-a-time hash-aggregate
-(`46_select_grouped_hash_aggregate.md`, NOT STARTED).** 0.60× PG (+67%); `cols/row=4.00` shows B2 decode-pushdown not applied on the aggregate path. Extend column mask to GROUP-BY exprs only; specialize integer-key HashMap; partial-aggregate in workers.
+**#55 — Event-queue 1k-row investigation (`55_event_queue_small_table_overhead.md`).**
+W4/W0=3.93× at 1k rows (Δ event=+1.29ms vs +0.12ms at 10k). Investigation-first item: profile
+before optimising. Does not block #51–54. Run in parallel with any of the above.
 
-**#47 — UPDATE/DELETE write throughput: unchanged-key B-tree patch + vectorised predicate scan
-(`47_update_delete_write_throughput.md`, NOT STARTED).** Largest gaps: UPDATE 0.17×, DELETE selected 0.17×. Primary driver: `WAL B/row=619` for body-only UPDATE shows B-tree does tombstone+insert even when key is unchanged (RowId changes, key value doesn't). Phase A: in-place RowId patch in leaf node (valid when old_key==new_key). Phase B: vectorised predicate deform on `matching_rows` path. Phase C (milestone-sized): HOT-equivalent update chain.
+**Parallel note:** #51 (executor join), #52 (matching_rows decode), #53 (FK check), #54 (arena
+alloc), #55 (event investigation) touch distinct code paths and can all run in separate worktrees
+simultaneously with no file-level conflicts. Recommended: start #51 + #53 in one session, #52 in
+a second, #54 in a third, #55 (investigation) in a fourth.
 
-**#48 — DELETE all / TRUNCATE fast path
-(`48_delete_all_truncate_fast_path.md`, NOT STARTED).** 0.23× PG (+331%); `dec/row=1.00`, 20k per-row mini-txns for a no-predicate delete. Fix: `TRUNCATE TABLE t` + `Heap::truncate()` (single WAL record + heap+index reset); opportunistic DELETE-all routing. FK RESTRICT + CDC "truncate" event must be handled.
-
-**#44 — Bulk DELETE pays one WAL mini-transaction per row
-(`44_bulk_delete_batched_wal.md`, NOT STARTED).** `Heap::delete`
-(`src/heap.rs:399`) is a self-contained mini-transaction per call
-(`begin_mini_txn`/`commit_mini_txn`, its own exclusive page latch, its own
-full-page-image check); `exec_delete` calls it once per matched row. A
-DELETE touching N rows performs N separate WAL mini-transactions — the exact
-same shape item 40 already fixed for `CREATE INDEX`. Measured: `DELETE FROM
-t` (no predicate) at postgres +275%, `DELETE selected (k>=N)` at +409%
-(20k rows, `multi_model_report_20260715_092725.md`). Distinct root cause from
-#43 (no predicate means no scan-vs-index decision at all) — the fix is
-batching deletes by page, reusing `matching_rows`'s existing physical-order
-sort (B5), following item 40's precedent (N mini-txns -> num_pages
-mini-txns).
-
-**#37 — Buffer pool frame table: lazy/growable allocation
-(`37_lazy_buffer_pool_growth.md`, NOT STARTED).** `BufferPool::open`
-eagerly allocates `capacity` frames up front (`src/bufferpool.rs`), forcing
-one static default to trade off cheap small/embedded opens against
-generous headroom for large bulk loads. The default was just bumped
-4096→65536 (`PROGRESS.md`, "Default buffer-pool capacity raised") after a
-demo-scale seed hit `BufferPoolFull` and collapsed throughput ~15-20x via
-forced synchronous `wal.sync()` calls — that bump is a modest, measured
-stopgap (chosen because eager allocation makes a larger default cost every
-`Engine::open()`, including ~50 test files), not the real fix. Making frame
-allocation grow on demand up to `capacity` (rather than pre-allocate it)
-would let a much larger ceiling be the default with no tax on small opens —
-removing the tradeoff entirely instead of just moving the wall.
-
-0. **Item 18 — Engine access & introspection contract — ✅ SHIPPED 2026-07-13**
-   (branch `18-engine-access-contract-impl`). Delivered the `information_schema`-
-   style **queryable catalog** (`information_schema.{tables,columns,
-   table_constraints,key_column_usage,referential_constraints}` +
-   `unidb_catalog.indexes`) as synthesized virtual relations SELECTable over the
-   normal query surface — no app REST endpoints — plus the Application Builder's
-   Guide (`docs/engine_access_guide.md`) stitching the access/query/type/error
-   surface together. Pure read-side projection over metadata that already
-   parses+persists (M11); no format bump. Metrics/closeout in `PROGRESS.md`.
-
-1. **Item 11 `UNIDB_CONCURRENT_SQL_WRITES` default-ON flip — ✅ SHIPPED
-   2026-07-13** (branch `11-concurrent-writes-default-on`). Item 16 (below)
-   root-caused and fixed the soak blocker (MVCC visibility anomaly); the
-   concurrency matrix passes 28/28 toggle-on **and** toggle-off at
-   `CONC_REPEATS=10`. Default is now ON (`=0`/`false`/`off` forces the serialized
-   fallback); Table C re-measured on the flipped default: indexed 8-writer
-   **811 → 1016 commits/s** (+25%). Flip note in `index_write_concurrency.md`,
-   metrics in `PROGRESS.md`. **Item 16 — MVCC visibility anomaly under
-   concurrent SQL writes — is ✅ SHIPPED** (2026-07-12, branch
-   `16-visibility-fix`); root cause (abort dropped the xid from `active` before
-   undo), fix, and evidence live in
-   `16_concurrent_sql_writes_visibility_anomaly.md`; metrics in `PROGRESS.md`.
-2. **A2 / HOT-style update — DEFERRED (ROI vs §1), not filed.** Would reopen
-   locked decision D4 (`FORMAT_VERSION` bump) + recovery + new crash points for a
-   ~0.34× → ~0.42× UPDATE-bulk gain on a **single-model** CRUD bench that §1 says
-   we should lose anyway. Not worth a locked-decision change; effort redirected to
-   #17 (the §6 cross-domain headline). Filed rationale in `crud_performance.md`; if
-   ever picked up it takes the next free number (`25_…`).
-3. **Parallel-scan follow-ups** (filed in `parallel_scan.md`, lower ROI):
-   `SUM`/`AVG`/`GROUP BY` partial aggregate; `LIMIT` early-stop; server
-   `ReadHandle` parallelism; a visibility-map fast count. (Default-on + worker
-   governance already shipped as #15.)
-4. **Item 19 — SQL surface gaps (`19_sql_surface_gaps.md`, NOT STARTED).** The
-   tracked list of unsupported query constructs surfaced by Milestone 18's guide:
-   `CASE`/`COALESCE` (G1, and the blocker for `FULL OUTER … USING`), `FULL OUTER
-   JOIN` (G2), set ops `UNION`/`INTERSECT`/`EXCEPT` (G3), `ORDER BY` on a
-   non-projected expr (G4), `RETURNING` (G5), `NATURAL JOIN` (G6, low ROI —
-   desugars to the now-supported `USING`), window funcs / recursive CTEs (G7,
-   milestone-sized), `SELECT` without `FROM` (G8), **`LIKE`/`ILIKE` pattern
-   matching (G9, high ROI — the studio record browser lost contains/starts/ends
-   filters to it)**, and **row-path predicate parity for `IS NULL`/`LIKE` so
-   filters work off the planner path incl. under `NEAR` (G10)**. Pick individual
-   row-path predicate parity for `IS NULL`/`LIKE` (G10), and **full-text search
-   has no SQL/REST surface — embed-only `Engine::search_fulltext`, unusable from a
-   browser (G11)**. Pick individual gaps as focused improvements; the doc carries
-   a per-gap scope/ROI read.
-5. **Attach-client session support** (filed in `rest_api_enrichment.md`,
-   shipped item 12's one optional follow-up): wrap `X-Txn-Id` sessions +
-   `/rows/batch` + cursors in `unidb-attach`.
-7. **Storage/recovery follow-ups (filed 2026-07-13 from the guide's limitations
-   table; engine-internal, so higher risk than the service lanes — crash
-   harness is the hard gate):** **#26 event queue at scale** (sequence index →
-   O(new events) polling + push-vs-poll; highest ROI, directly improves item
-   20's dispatcher), **#27 vacuum** (per-table accounting + cost throttle +
-   whole-table compaction; most self-contained), **#28 replication**
-   (time-based PITR + logical replication; milestone-sized). **Parallel note:
-   #26 and #28 both edit `lib.rs`+`wal.rs` — do NOT run them concurrently; #27
-   (`autovacuum.rs`+`heap.rs`) is safe to run alongside either.**
-6. **Supabase-track service milestones (filed 2026-07-13, ordered by
-   recommended build sequence — each has its own spec file):**
-   **#20 events/realtime dispatcher** (~80% exists in-engine via M4; highest
-   demo value; unblocks #23's outbox) → **#21 observability metrics
-   enrichment — ✅ SHIPPED 2026-07-13** (branch `21-observability-metrics`;
-   lock-free per-chokepoint metrics via `stats()`/`GET /stats` + `/metrics`;
-   the horizon-age gauge is the item-16 lesson; widget-traceability table in
-   `docs/engine_access_guide.md` §9) → **#22 logs surface** (JSON + correlation
-   ids + bounded `/logs`) →
-   **#23 storage service — ✅ SHIPPED 2026-07-13** (branch `23-storage-service`,
-   PR #64; `unidb-storage` crate — MinIO/S3 over engine metadata + LOB tiering,
-   outbox/reconciler, presigned URLs; engine unchanged) → **#24 authz v2**
-   (per-op RLS policies + `WITH CHECK` + SQL-native roles; deliberately last —
-   deepest semantics).
-7. **#25 multi-page catalog** (`25_multipage_catalog.md`, Improvement, NOT
-   STARTED) — **surfaced by #23**: the whole catalog (table defs + stats) is one
-   ~8 KiB page blob, so a wide schema / accumulated stats overflow with
-   `HeapFull`; #23 had to work around it (compact schema, DDL up front). Extends
-   item 10 (which moved page-lists out). Recommended first cut: split `stats`
-   out of the blob; then evaluate multi-page vs self-hosting catalog.
+**What is NOT in this list:**
+- Item 47 Phase C (HOT-equivalent chain): requires FORMAT_VERSION bump (locked decision D4).
+  Measure Phase B results first; file Phase C separately only if the gap after Phase B justifies
+  reopening a locked decision.
+- Per-row INSERT gap (0.24× PG): WAL FPI overhead, structural. Per §1, expected to lose this.
+- SQL surface gaps (item 19): non-performance; tracked separately.
 
 ## How to update this file
 
