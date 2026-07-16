@@ -1843,6 +1843,10 @@ fn pg_crud_insert(url: &str, n: u64, base: i64) -> (u64, f64) {
 
 fn pg_crud_select_filtered(url: &str, lo: i64, hi: i64) -> (u64, f64) {
     let mut c = pg_dial(url).unwrap();
+    // Cap to 2 workers so SELECT ratios don't vary with core count across environments
+    // (on an 18-core machine PG would otherwise use far more workers than on a 4-core).
+    c.batch_execute("SET max_parallel_workers_per_gather = 2")
+        .unwrap();
     let start = Instant::now();
     let rows = c
         .query(
@@ -1855,6 +1859,8 @@ fn pg_crud_select_filtered(url: &str, lo: i64, hi: i64) -> (u64, f64) {
 
 fn pg_crud_select_grouped(url: &str, scanned: u64) -> (u64, f64) {
     let mut c = pg_dial(url).unwrap();
+    c.batch_execute("SET max_parallel_workers_per_gather = 2")
+        .unwrap();
     let start = Instant::now();
     let _rows = c
         .query("SELECT g, COUNT(*) FROM t GROUP BY g", &[])
@@ -1864,6 +1870,8 @@ fn pg_crud_select_grouped(url: &str, scanned: u64) -> (u64, f64) {
 
 fn pg_crud_count_all(url: &str, scanned: u64) -> (u64, f64) {
     let mut c = pg_dial(url).unwrap();
+    c.batch_execute("SET max_parallel_workers_per_gather = 2")
+        .unwrap();
     let start = Instant::now();
     let _rows = c.query("SELECT COUNT(*) FROM t", &[]).unwrap();
     (scanned, start.elapsed().as_secs_f64())
@@ -2402,6 +2410,8 @@ fn pg_fk_update_bulk(url: &str, hi: i64) -> (u64, f64) {
 
 fn pg_fk_join_select(url: &str) -> (u64, f64) {
     let mut c = pg_dial(url).unwrap();
+    c.batch_execute("SET max_parallel_workers_per_gather = 2")
+        .unwrap();
     let start = Instant::now();
     let rows = c
         .query(
@@ -2621,11 +2631,11 @@ fn bench_mm_report() {
          to override — e.g. push to `5000000` or `10000000` for a heavier run). The default\n\
          tops out at 2M to keep a full report reasonable; the engine handles ≥10M.\n\
          \n\
-         **On the scan gap at scale:** Postgres runs a **parallel** sequential scan (multiple\n\
-         worker processes) once the table crosses its parallel threshold, while unidb scans\n\
-         **single-threaded**; so a large scan-side lead is Postgres's parallel-query capability,\n\
-         not a per-row storage-speed difference (at small sizes, below PG's threshold, the two\n\
-         are much closer).\n"
+         **On the scan gap at scale:** Postgres runs a **parallel** sequential scan once the\n\
+         table crosses its parallel threshold (`max_parallel_workers_per_gather` is capped at 2\n\
+         in Table 3 SELECT ops for cross-environment comparability; Table 3.1 uses the server\n\
+         default, so a large scan-side lead here reflects PG's parallel degree, not per-row\n\
+         storage speed).\n"
     );
     if let Some(ref m) = pg_method {
         println!(
