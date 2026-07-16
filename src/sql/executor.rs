@@ -2360,6 +2360,25 @@ fn exec_update(
         .iter()
         .any(|c| !c.dropped && c.constraints.references.is_some())
         || !table_def.constraints.foreign_keys.is_empty();
+    // Item 53: skip FK child-side enforcement when no FK column appears in the
+    // SET clause. The new row version copies the unchanged FK column value from
+    // the old version; the old version already satisfied the constraint, so the
+    // new one does identically. Conservative rule: any column named on the LHS
+    // of any assignment is "written" — `SET customer_id = other_col` is
+    // detected because `customer_id` is the explicit assignment target.
+    let has_fk_refs_in_set = has_fk_refs && {
+        let set_col_names: std::collections::HashSet<&str> =
+            assignments.iter().map(|(col, _)| col.as_str()).collect();
+        table_def.columns.iter().any(|c| {
+            !c.dropped
+                && c.constraints.references.is_some()
+                && set_col_names.contains(c.name.as_str())
+        }) || table_def.constraints.foreign_keys.iter().any(|fk| {
+            fk.columns
+                .iter()
+                .any(|col| set_col_names.contains(col.as_str()))
+        })
+    };
     // Item 36: gate FK parent-side RESTRICT (does any child table reference us?).
     let has_fk_children = table_has_fk_children(ctx.catalog.get(), table);
     let mut count = 0;
@@ -2375,9 +2394,9 @@ fn exec_update(
         enforce_not_null(&table_def, &coerced)?;
         enforce_checks(&table_def, &coerced)?;
         // UNIQUE + FK — acquire all phantom locks BEFORE taking a fresh
-        // snapshot, then run uniqueness + FK checks with it (items 35/36).
+        // snapshot, then run uniqueness + FK checks with it (items 35/36/53).
         // RESTRICT on old PK also uses a fresh snapshot (after its lock).
-        if has_unique || has_fk_refs || has_fk_children {
+        if has_unique || has_fk_refs_in_set || has_fk_children {
             // Step 1: acquire UniqueKey + FkKey (child-side) phantom locks.
             if has_unique {
                 for (col_idx, col) in table_def.columns.iter().enumerate() {
@@ -2390,7 +2409,8 @@ fn exec_update(
                     }
                 }
             }
-            if has_fk_refs {
+            // Item 53: skip FkKey phantom lock + enforce when FK col not in SET.
+            if has_fk_refs_in_set {
                 acquire_fk_key_locks(
                     &table_def,
                     &coerced,
@@ -2419,7 +2439,8 @@ fn exec_update(
                 )?;
             }
             // FK child-side: new values must reference a visible parent row.
-            if has_fk_refs {
+            // Item 53: skipped when FK column not in SET (value unchanged).
+            if has_fk_refs_in_set {
                 enforce_fk_rows_exist(
                     &table_def,
                     &coerced,

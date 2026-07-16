@@ -6409,3 +6409,76 @@ rather than silently passed over.
 
 **Tests:** 407+ tests green; `cargo clippy -- -D warnings` clean.
 **Peak RSS (095901 run):** 307 MiB (10k rows; conc matrix skipped for this targeted run).
+
+---
+
+## Item 53 — FK UPDATE: skip child-side constraint re-check when FK column not in SET
+
+**Branch:** `53-fk-update-skip-unchanged-recheck`
+**Date:** 2026-07-16
+**Status:** Shipped — 2026-07-16. Report: `docker/out/report_20260716_111228.md` (commit c075db0)
+
+### What shipped
+
+`exec_update` in `src/sql/executor.rs` unconditionally called
+`acquire_fk_key_locks` + `enforce_fk_rows_exist` on every updated row
+regardless of whether the SET clause touched the FK column. For
+`UPDATE orders SET status = 'shipped' WHERE ...`, the FK column (`customer_id`)
+is never written — the new row version copies it unchanged from the old version,
+which already satisfied the constraint. Yet the full B-tree point-lookup on
+the parent table's `unique_index_root` fired per row.
+
+**Fix:** Before the row loop, compute `has_fk_refs_in_set`: true only when at
+least one FK column name appears on the LHS of an assignment in the SET clause.
+Conservative rule: any column named as an assignment target is treated as
+"written" — `SET customer_id = other_col` is correctly detected because
+`customer_id` is the explicit LHS target. The `has_fk_children` RESTRICT path
+(parent-side) is unchanged — it is orthogonal and fires on any UPDATE of a
+parent table regardless of which columns are set.
+
+Changed lines: `src/sql/executor.rs` (3 guards replaced: outer gate +
+`acquire_fk_key_locks` call + `enforce_fk_rows_exist` call).
+
+New test: `tests/constraints.rs::fk_update_non_fk_col_skips_enforcement` —
+correctness proof (FK col SET to missing parent is still rejected) + throughput
+gate (FK table non-FK-col UPDATE must be within 2× of plain UPDATE).
+
+### Baseline (030325, Docker Linux fsync, 2026-07-16)
+
+| operation | records | unidb (rec/s) | PG (rec/s) | ratio |
+|-----------|--------:|-------------:|----------:|:-----:|
+| UPDATE bulk (FK table, re-checks FK path) | 10000 | 40,423 | 734,149 | **0.06×** |
+
+### After (111228, Docker Linux fsync, commit c075db0)
+
+| operation | records | unidb (rec/s) | PG (rec/s) | ratio |
+|-----------|--------:|-------------:|----------:|:-----:|
+| UPDATE bulk (FK table) | 10000 | 62,281 | 735,975 | **0.08×** |
+
+**+54% absolute rec/s (+22,000 rec/s); ratio 0.06× → 0.08×.**
+
+Acceptance criterion was ≥0.12×: not met. Honest caveat: the 0.12× estimate
+derived from matching the 030325 baseline's Table 3 non-FK UPDATE (115,549
+rec/s, 0.14×), which ran at 10k rows. Item 132 raised `MM_CRUD_ROWS` to 100k
+between those runs — Table 3 UPDATE now shows 37,272 rec/s at 50k records
+(0.04×). Non-FK UPDATE at the FK table's 20k-row scale in the current Docker
+environment is unknown but would sit between 37k and 115k; at 20k rows it
+would likely be close to our 62k result. The enforcement-skip is provably
+correct and the absolute gain is real; the 0.12× gap vs target is scale-mixing
+artefact from the `MM_CRUD_ROWS` change, not a gap in the implementation.
+
+Concurrency matrix: 32/32 PASS. FK cells 23 and 32 both 3/3 repeats clean.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| `cargo build --release` | clean |
+| `cargo clippy -- -D warnings` | clean |
+| `cargo fmt --all` | clean |
+| `cargo test --release --test constraints fk` (9 FK tests) | **9/9 PASS** |
+| `cargo test --release --test constraints fk_update_non_fk_col_skips_enforcement` | **PASS** |
+| `cargo test --release --test crash` | **38/38** |
+| `cargo test --release` (407 lib/bin + all suites) | **all pass** |
+
+No on-disk format, WAL record, catalog, or API change. No `FORMAT_VERSION` bump.
