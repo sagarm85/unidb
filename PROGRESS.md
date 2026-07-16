@@ -6379,3 +6379,33 @@ rather than silently passed over.
 **Phase B path (≥0.70×):** remaining gap is in row-decode cost (~120–150 ns/row × 30k heap rows = 4–6 ms) and is not algorithmic. Candidates: (a) late-materialization — only decode columns actually referenced by the query (most effective for orders, which has 4 columns but only `customer_id` and `status` are needed); (b) scan-side decode reuse — share the schema parse across rows in a batch. Neither is in current scope; flagged as a follow-up.
 
 **Peak RSS (075853 run):** 267 MiB. **Concurrency matrix:** 32/32 PASS.
+
+---
+
+## Item 52 — UPDATE/DELETE predicate-only decode pushdown (Phase B)   [STEP 1 DONE — Step 2 no-op]   2026-07-16
+
+**Report:** `docs/performance/multi_model_report_20260716_095901.md` (branch `52-update-delete-predicate-decode-pushdown`, commit `fd92571` + item-52 changes)
+**Baseline:** `docs/performance/multi_model_report_20260716_030325.md`
+
+**Summary:** Changed `MatchedRows` from `Vec<(RowId, Vec<Literal>)>` to `Vec<(RowId, Vec<u8>)>` so callers receive raw heap bytes and decode lazily. DELETE's common path (no FK children, no CDC) now exits `matching_rows` without ever calling `decode_row` on matched rows — only the predicate column is materialized via `deform_row`. `exec_delete`'s FK/CDC branch decodes at use. `exec_update` decodes matched rows at loop entry (required by insert-new-version MVCC). Also extended `index_matching_rows` to use `deform_row` for its predicate re-check instead of `decode_row`. A3 gate test updated for Phase B col counts (threshold 20000 → 7500).
+
+**Before (030325 baseline, 10k rows):**
+
+| operation | records | unidb (rec/s) | PG (rec/s) | unidb ÷ PG | WAL B/row | dec/row | cols/row |
+|-----------|--------:|--------------:|-----------:|:----------:|----------:|--------:|---------:|
+| UPDATE bulk (k<N/2) | 5000 | 115,549 | 832,680 | 0.14× | 528 | 1.00 | **8.00** |
+| DELETE selected (k>=N) | 10000 | 614,222 | 3,792,487 | 0.16× | 114 | 1.00 | **6.00** |
+
+**After (095901, 10k rows):**
+
+| operation | records | unidb (rec/s) | PG (rec/s) | unidb ÷ PG | WAL B/row | dec/row | cols/row |
+|-----------|--------:|--------------:|-----------:|:----------:|----------:|--------:|---------:|
+| UPDATE bulk (k<N/2) | 5000 | 119,869 | 877,366 | 0.14× | 528 | 1.00 | **8.00** |
+| DELETE selected (k>=N) | 10000 | 675,514 | 4,222,007 | 0.16× | 114 | **0.00** | **2.00** |
+
+**DELETE (Step 1): PROVEN.** `cols/row` 6.00 → 2.00 and `dec/row` 1.00 → 0.00 — full-row decodes on the scan phase eliminated. Throughput +10% (614k → 675k rec/s). PG ratio holds at 0.16× because the real bottleneck is WAL xmax-stamp writes (114 B/row), not column decoding. The theoretical minimum for `cols/row` at 50% selectivity is 2.0 (scan visits 2N rows, N deleted, 1 pred col per scan row → 2N÷N = 2.0). Acceptance criterion corrected to ≤ 2.0.
+
+**UPDATE (Step 2): no-op on metrics.** `cols/row` stays 8.00. Root cause: the old `matching_rows` already called `deform_row` for non-matching rows (predicate-only decode since the B2 SELECT pushdown); the full decode of matched rows is unavoidable in `exec_update` (needed to compute new values for insert-new-version MVCC). Moving `decode_row` from `matching_rows` into `exec_update` is correct architecture (raw bytes type is required by the DELETE win) but produces no change to COLS_DECODED total. Beating UPDATE cols/row requires Phase C (HOT chain, locked decision D4).
+
+**Tests:** 407+ tests green; `cargo clippy -- -D warnings` clean.
+**Peak RSS (095901 run):** 307 MiB (10k rows; conc matrix skipped for this targeted run).
