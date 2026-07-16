@@ -49,7 +49,7 @@ use std::sync::{Arc, Condvar, Mutex, Once, OnceLock};
 use crate::bufferpool::SharedPageReader;
 use crate::error::{DbError, Result};
 use crate::format::{PageId, Xid};
-use crate::heap::{count_page_visible, get_visible, scan_page_into, RowId};
+use crate::heap::{count_page_visible, get_visible, scan_page_into, scan_page_visit, RowId};
 use crate::mvcc::Snapshot;
 use crate::sql::logical::Literal;
 
@@ -643,10 +643,12 @@ where
         let err = Arc::clone(&err);
         let parts = Arc::clone(&parts);
         let pages = Arc::clone(&pages);
+        // Item 54 Phase A: scan_page_visit hands each row as a &[u8] slice into
+        // the owned page buffer — one allocation per page (8 KiB) instead of one
+        // per row, eliminating the per-row Vec<u8> copy from scan_page_into.
         move || {
             let mut rows: Vec<Vec<Literal>> = Vec::new();
             let mut ids: Vec<RowId> = Vec::new();
-            let mut page_buf: Vec<(RowId, Vec<u8>)> = Vec::new();
             'outer: while !stop.load(Ordering::Relaxed) {
                 let i = cursor.fetch_add(1, Ordering::Relaxed);
                 if i >= pages.len() {
@@ -659,27 +661,22 @@ where
                         break 'outer;
                     }
                 }
-                page_buf.clear();
                 if let Err(e) =
-                    scan_page_into(&reader, pages[i], &snapshot, self_xid, &mut page_buf)
+                    scan_page_visit(&reader, pages[i], &snapshot, self_xid, |rid, bytes| {
+                        match per_row(rid, bytes) {
+                            Ok(Some(row)) => {
+                                rows.push(row);
+                                ids.push(rid);
+                                Ok(())
+                            }
+                            Ok(None) => Ok(()),
+                            Err(e) => Err(e),
+                        }
+                    })
                 {
                     *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
                     stop.store(true, Ordering::Relaxed);
                     break;
-                }
-                for (rid, bytes) in page_buf.drain(..) {
-                    match per_row(rid, &bytes) {
-                        Ok(Some(row)) => {
-                            rows.push(row);
-                            ids.push(rid);
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
-                            stop.store(true, Ordering::Relaxed);
-                            break 'outer;
-                        }
-                    }
                 }
             }
             parts
@@ -700,4 +697,95 @@ where
         all_ids.extend(ids);
     }
     Ok((all_rows, all_ids))
+}
+
+/// Resolve pre-partitioned B-tree candidate lists via the pre-spawned pool
+/// (item 54 Phase A). Unlike [`parallel_resolve_candidates`] which work-steals
+/// individual `RowId`s from a flat list, this function work-steals whole
+/// *partitions* (contiguous key ranges from `search_range_partition`). Each
+/// partition covers a contiguous key range → contiguous leaf pages → improved
+/// heap-page cache locality per worker compared to interleaved work-stealing.
+///
+/// Replaces the `std::thread::scope` in `try_exec_select_btree`, paying the
+/// OS thread-spawn cost once at init time (lever 2) rather than per query.
+pub fn parallel_resolve_partitions<F>(
+    partitions: &[Vec<RowId>],
+    reader: &SharedPageReader,
+    snapshot: &Snapshot,
+    self_xid: Xid,
+    degree: usize,
+    per_candidate: &F,
+) -> Result<Vec<Vec<Literal>>>
+where
+    F: Fn(RowId, &[u8]) -> Result<Option<Vec<Literal>>> + Sync,
+{
+    let part_cursor = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let err: Arc<Mutex<Option<DbError>>> = Arc::new(Mutex::new(None));
+    let parts: Arc<Mutex<Vec<Vec<Vec<Literal>>>>> = Arc::new(Mutex::new(Vec::new()));
+    let deadline = crate::query_limits::snapshot_deadline();
+    let partitions: Arc<[Vec<RowId>]> = Arc::from(partitions);
+    let reader = reader.clone();
+    let snapshot = snapshot.clone();
+
+    run_in_pool(degree, {
+        let part_cursor = Arc::clone(&part_cursor);
+        let stop = Arc::clone(&stop);
+        let err = Arc::clone(&err);
+        let parts = Arc::clone(&parts);
+        let partitions = Arc::clone(&partitions);
+        move || {
+            let mut rows: Vec<Vec<Literal>> = Vec::new();
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let pi = part_cursor.fetch_add(1, Ordering::Relaxed);
+                let Some(part) = partitions.get(pi) else {
+                    break;
+                };
+                'part: for (i, &rid) in part.iter().enumerate() {
+                    if stop.load(Ordering::Relaxed) {
+                        break 'part;
+                    }
+                    if i.is_multiple_of(64) {
+                        if let Err(e) = deadline.check() {
+                            *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                            stop.store(true, Ordering::Relaxed);
+                            break 'part;
+                        }
+                    }
+                    let bytes = match get_visible(&reader, rid, &snapshot, self_xid) {
+                        Ok(Some(b)) => b,
+                        Ok(None) => continue,
+                        Err(e) => {
+                            *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                            stop.store(true, Ordering::Relaxed);
+                            break 'part;
+                        }
+                    };
+                    match per_candidate(rid, &bytes) {
+                        Ok(Some(row)) => rows.push(row),
+                        Ok(None) => {}
+                        Err(e) => {
+                            *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                            stop.store(true, Ordering::Relaxed);
+                            break 'part;
+                        }
+                    }
+                }
+            }
+            parts.lock().unwrap_or_else(|p| p.into_inner()).push(rows);
+        }
+    });
+
+    let err_val = err.lock().unwrap_or_else(|p| p.into_inner()).take();
+    if let Some(e) = err_val {
+        return Err(e);
+    }
+    let mut all_rows = Vec::new();
+    for part_rows in std::mem::take(&mut *parts.lock().unwrap_or_else(|p| p.into_inner())) {
+        all_rows.extend(part_rows);
+    }
+    Ok(all_rows)
 }

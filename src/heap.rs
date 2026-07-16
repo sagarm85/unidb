@@ -912,6 +912,42 @@ pub(crate) fn scan_page_into<P: PageReader>(
     Ok(())
 }
 
+/// Visit every visible tuple on `page_id` via a closure receiving `(RowId,
+/// &[u8])` — a direct slice into the owned page buffer rather than a per-row
+/// `Vec<u8>` copy. Eliminates one heap allocation per visible row compared to
+/// [`scan_page_into`]. Item 54 Phase A: reduces allocator pressure on the
+/// parallel filter-project path.
+///
+/// The `visitor` receives a `&[u8]` whose lifetime is tied to the page buffer
+/// owned by this function; returning from `visitor` ends that borrow. Returning
+/// `Err(e)` from `visitor` aborts the scan and propagates the error.
+pub(crate) fn scan_page_visit<P, F>(
+    reader: &P,
+    page_id: PageId,
+    snapshot: &Snapshot,
+    self_xid: Xid,
+    mut visitor: F,
+) -> Result<()>
+where
+    P: PageReader,
+    F: FnMut(RowId, &[u8]) -> Result<()>,
+{
+    let page = reader.read_page(page_id)?;
+    let sc = page.slot_count_pub();
+    for slot in 0..sc {
+        if !matches!(page.slot_state(slot), Ok(SlotState::Live)) {
+            continue;
+        }
+        let th = page.tuple_header(slot)?;
+        if is_visible(th.xmin, th.xmax, snapshot, self_xid) {
+            let row_id = RowId { page_id, slot };
+            on_read(self_xid, row_id);
+            visitor(row_id, page.get(slot)?)?;
+        }
+    }
+    Ok(())
+}
+
 /// Resolve one `RowId` to its body bytes if the version there is visible to
 /// `snapshot`, else `Ok(None)` (superseded, deleted, vacuumed, or never
 /// committed — e.g. a stale secondary-index candidate). The core of

@@ -19,7 +19,7 @@
 // M1.c proving SQL works end-to-end.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use serde_json::Value as JsonValue;
@@ -1641,6 +1641,8 @@ fn exec_select(
 
     // The two-phase B2 decode as a closure, shared by the serial and parallel
     // paths: predicate columns → test → projection columns only on a match.
+    // Item 54 Phase A: project_row_drain moves Literals (incl. Text Strings)
+    // instead of cloning, saving one String allocation per TEXT column per row.
     let per_row = |bytes: &[u8]| -> Result<Option<Vec<Literal>>> {
         if has_pred {
             let prow = deform_row(bytes, cols, pred_upto, &pred_needed)?;
@@ -1648,8 +1650,8 @@ fn exec_select(
                 return Ok(None);
             }
         }
-        let row = deform_row(bytes, cols, full_upto, &full_needed)?;
-        Ok(Some(project_row(projection, cols, &row)?))
+        let mut row = deform_row(bytes, cols, full_upto, &full_needed)?;
+        Ok(Some(project_row_drain(projection, cols, &mut row)?))
     };
 
     // P-b: parallelize the full scan across worker threads when the table is
@@ -1974,6 +1976,8 @@ fn try_exec_select_btree(
     let has_pred = predicate.is_some();
 
     // The B2 two-phase decode as a closure, shared by all resolution paths.
+    // Item 54 Phase A: project_row_drain moves Literals out of the decode buffer
+    // instead of cloning — saves one String allocation per TEXT column per row.
     let per_candidate = |bytes: &[u8]| -> Result<Option<Vec<Literal>>> {
         if has_pred {
             let prow = deform_row(bytes, cols, pred_upto, &pred_needed)?;
@@ -1981,8 +1985,8 @@ fn try_exec_select_btree(
                 return Ok(None);
             }
         }
-        let row = deform_row(bytes, cols, full_upto, &full_needed)?;
-        Ok(Some(project_row(projection, cols, &row)?))
+        let mut row = deform_row(bytes, cols, full_upto, &full_needed)?;
+        Ok(Some(project_row_drain(projection, cols, &mut row)?))
     };
 
     // Lever 1 (item 45): for range predicates, acquire workers optimistically
@@ -1993,6 +1997,9 @@ fn try_exec_select_btree(
     // than the interleaved access pattern of work-stealing over a flat list.
     // `usize::MAX` bypasses the MIN_PAGES floor in `acquire`; we enforce
     // PARALLEL_CANDIDATE_MIN ourselves after counting the collected total.
+    // Item 54 Phase A: parallel_resolve_partitions uses the pre-spawned pool
+    // (lever 2) instead of std::thread::scope, eliminating per-query OS thread
+    // spawn cost on the B-tree range path.
     let range_op = match op {
         CmpOp::Lt => Some(RangeOp::Lt),
         CmpOp::Le => Some(RangeOp::Le),
@@ -2009,61 +2016,14 @@ fn try_exec_select_btree(
 
             if total >= crate::sql::parallel_scan::PARALLEL_CANDIDATE_MIN {
                 let reader = ctx.pool.shared_reader();
-                let deadline = crate::query_limits::snapshot_deadline();
-                let stop = AtomicBool::new(false);
-                let err: Mutex<Option<DbError>> = Mutex::new(None);
-                let parts: Mutex<Vec<Vec<Vec<Literal>>>> = Mutex::new(Vec::new());
-                std::thread::scope(|s| {
-                    for part in &partitions {
-                        let reader = reader.clone();
-                        // Rebind shared state as references so the `move`
-                        // closure captures them by pointer, not by value.
-                        let (stop, err, deadline, parts) = (&stop, &err, &deadline, &parts);
-                        let (snapshot, per_candidate) = (&snapshot, &per_candidate);
-                        let xid = ctx.xid;
-                        s.spawn(move || {
-                            let mut rows: Vec<Vec<Literal>> = Vec::new();
-                            for (i, &rid) in part.iter().enumerate() {
-                                if stop.load(Ordering::Relaxed) {
-                                    break;
-                                }
-                                if i % 64 == 0 {
-                                    if let Err(e) = deadline.check() {
-                                        *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
-                                        stop.store(true, Ordering::Relaxed);
-                                        break;
-                                    }
-                                }
-                                let bytes = match get_visible(&reader, rid, snapshot, xid) {
-                                    Ok(Some(b)) => b,
-                                    Ok(None) => continue,
-                                    Err(e) => {
-                                        *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
-                                        stop.store(true, Ordering::Relaxed);
-                                        break;
-                                    }
-                                };
-                                match per_candidate(&bytes) {
-                                    Ok(Some(row)) => rows.push(row),
-                                    Ok(None) => {}
-                                    Err(e) => {
-                                        *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
-                                        stop.store(true, Ordering::Relaxed);
-                                        break;
-                                    }
-                                }
-                            }
-                            parts.lock().unwrap_or_else(|p| p.into_inner()).push(rows);
-                        });
-                    }
-                });
-                if let Some(e) = err.into_inner().unwrap_or_else(|p| p.into_inner()) {
-                    return Err(e);
-                }
-                let mut rows = Vec::new();
-                for part_rows in parts.into_inner().unwrap_or_else(|p| p.into_inner()) {
-                    rows.extend(part_rows);
-                }
+                let rows = crate::sql::parallel_scan::parallel_resolve_partitions(
+                    &partitions,
+                    &reader,
+                    &snapshot,
+                    ctx.xid,
+                    degree,
+                    &|_rid, bytes| per_candidate(bytes),
+                )?;
                 return Ok(Some(ExecResult::Rows {
                     columns: output_columns(projection, &table_def.columns),
                     rows,
@@ -3464,6 +3424,37 @@ pub(crate) fn project_row(
             Ok(row[idx].clone())
         })
         .collect()
+}
+
+/// Move-projection: like [`project_row`] but takes `row` by `&mut`, replacing
+/// each projected slot with `Literal::Null` via `mem::replace` instead of
+/// cloning. For `Literal::Text(String)` this moves the `String` (zero copy)
+/// rather than duplicating its heap allocation. Item 54 Phase A.
+fn project_row_drain(
+    projection: &[String],
+    columns: &[ColumnDef],
+    row: &mut [Literal],
+) -> Result<Vec<Literal>> {
+    if projection.is_empty() {
+        return Ok(row
+            .iter()
+            .zip(columns.iter())
+            .filter(|(_, c)| !c.dropped)
+            .map(|(v, _)| v.clone())
+            .collect());
+    }
+    let mut out = Vec::with_capacity(projection.len());
+    for name in projection {
+        let idx = columns
+            .iter()
+            .position(|c| &c.name == name && !c.dropped)
+            .ok_or_else(|| DbError::ColumnNotFound {
+                table: String::new(),
+                column: name.clone(),
+            })?;
+        out.push(std::mem::replace(&mut row[idx], Literal::Null));
+    }
+    Ok(out)
 }
 
 fn set_column(
