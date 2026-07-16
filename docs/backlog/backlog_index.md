@@ -71,6 +71,7 @@
 | 53 | `53_fk_update_skip_unchanged_recheck.md` | Improvement | ⏳ NOT STARTED — FK UPDATE 0.06× PG (17× behind); executor re-checks FK constraint on every UPDATE row unconditionally even when FK column is not in SET clause. Skip when FK col not in SET. 0.06→0.12-0.18×. |
 | 54 | `54_select_filtered_arena_alloc.md` | Performance | ⏳ NOT STARTED — item 45 Lever 3: per-row Vec<Literal>+String allocation on parallel scan hot path. Per-query arena/bump allocator. SELECT filtered 0.42→0.50-0.58× PG. |
 | 55 | `55_event_queue_small_table_overhead.md` | Improvement | ⏳ NOT STARTED — W4/W0=3.93× at 1k rows (Δ event=1.29ms vs 0.12ms at 10k); 10× anomaly unexplained; investigate before optimising (vacuum threshold, sequence index, WAL group-commit). |
+| 56 | `56_crud_gap_write_batching_parallel_agg.md` | Performance | ⏳ NOT STARTED — parallel GROUP BY (0.23×→≥0.45×), UPDATE batching (0.05×→≥0.12×), DELETE WAL batch (≥0.15×), gated logical B-tree WAL (INSERT 0.43×→≥0.60×). Fable-5 design 2026-07-16. |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
