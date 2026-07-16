@@ -610,9 +610,10 @@ impl Runner<'_, '_> {
             .find(|c| {
                 c.name == right_index_column
                     && !c.dropped
-                    && matches!(c.index, Some(IndexKind::BTree))
+                    && ((matches!(c.index, Some(IndexKind::BTree)) && c.index_root.is_some())
+                        || c.unique_index_root.is_some())
             })
-            .and_then(|c| c.index_root)
+            .and_then(|c| c.index_root.or(c.unique_index_root))
             .ok_or_else(|| {
                 DbError::SqlPlan(format!(
                     "index-nested-loop join lost the B-Tree on {right_qualifier}.{right_index_column}"

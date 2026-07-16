@@ -1240,4 +1240,21 @@ mod tests {
             PlanNode::HashJoin { .. }
         ));
     }
+
+    #[test]
+    fn planner_picks_hash_join_when_inner_has_only_unique_index() {
+        // unique_index_root (PRIMARY KEY / UNIQUE via item 35) is an enforcement
+        // index, not a join-optimization hint.  Without an explicit secondary
+        // BTree (index_root), the planner uses HashJoin — which for large tables
+        // has lower per-probe fetch_page cost than INLJ's random B-tree lookups.
+        let mut catalog = Catalog::new();
+        catalog.insert_for_test(table("customers", vec![col("id", None, None)]));
+        let mut orders_customer_id = col("customer_id", None, None);
+        orders_customer_id.unique_index_root = Some(42);
+        catalog.insert_for_test(table("orders", vec![orders_customer_id]));
+        assert!(matches!(
+            inner_join_node(&catalog),
+            PlanNode::HashJoin { .. }
+        ));
+    }
 }

@@ -113,28 +113,61 @@ pub fn hash_join(
     };
 
     if build.rows.len() <= mem_rows {
-        // In-memory: bucket build rows by key, then probe.
-        let mut table: HashMap<Vec<u8>, Vec<Vec<Literal>>> = HashMap::new();
-        for row in &build.rows {
-            let key = key_of(build_keys, &build.schema, row)?;
-            if let Some(bytes) = join_key_bytes(&key) {
-                table.entry(bytes).or_default().push(row.clone());
+        // Fast path: single integer key, inner join, no outer-unmatched emission.
+        // Uses HashMap<i64, Vec<usize>> (build-row indices) to avoid Vec<u8> key
+        // encoding and up-front row cloning into the hash table.
+        let use_i64_fast = !emit_unmatched_probe
+            && build_keys.len() == 1
+            && probe_keys.len() == 1
+            && !build.rows.is_empty()
+            && matches!(
+                eval_qexpr(&build_keys[0], &build.schema, &build.rows[0])?,
+                Literal::Int(_)
+            );
+
+        if use_i64_fast {
+            let mut table: HashMap<i64, Vec<usize>> =
+                HashMap::with_capacity(build.rows.len());
+            for (idx, row) in build.rows.iter().enumerate() {
+                if let Literal::Int(k) = eval_qexpr(&build_keys[0], &build.schema, row)? {
+                    table.entry(k).or_default().push(idx);
+                }
+                // NULL key: skip (SQL equi-join semantics)
             }
-        }
-        for prow in &probe.rows {
-            let key = key_of(probe_keys, &probe.schema, prow)?;
-            let mut matched = false;
-            if let Some(bytes) = join_key_bytes(&key) {
-                if let Some(bucket) = table.get(&bytes) {
-                    for brow in bucket {
-                        if emit(prow, Some(brow))? {
-                            matched = true;
+            for prow in &probe.rows {
+                if let Literal::Int(k) = eval_qexpr(&probe_keys[0], &probe.schema, prow)? {
+                    if let Some(indices) = table.get(&k) {
+                        for &idx in indices {
+                            emit(prow, Some(&build.rows[idx]))?;
                         }
                     }
                 }
+                // NULL probe key: no match
             }
-            if !matched && emit_unmatched_probe {
-                emit(prow, None)?;
+        } else {
+            // General in-memory path: encode keys as bytes, clone build rows.
+            let mut table: HashMap<Vec<u8>, Vec<Vec<Literal>>> = HashMap::new();
+            for row in &build.rows {
+                let key = key_of(build_keys, &build.schema, row)?;
+                if let Some(bytes) = join_key_bytes(&key) {
+                    table.entry(bytes).or_default().push(row.clone());
+                }
+            }
+            for prow in &probe.rows {
+                let key = key_of(probe_keys, &probe.schema, prow)?;
+                let mut matched = false;
+                if let Some(bytes) = join_key_bytes(&key) {
+                    if let Some(bucket) = table.get(&bytes) {
+                        for brow in bucket {
+                            if emit(prow, Some(brow))? {
+                                matched = true;
+                            }
+                        }
+                    }
+                }
+                if !matched && emit_unmatched_probe {
+                    emit(prow, None)?;
+                }
             }
         }
     } else {

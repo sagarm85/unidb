@@ -66,7 +66,7 @@
 | 49 | `49_bench_pg_connect_no_timeout_hang.md` | Improvement | ✅ SHIPPED 2026-07-16 — `benches/decompose.rs` opened every Postgres connection with no `connect_timeout`; an unreachable/unresponsive `PG_URL` (wrong host, firewalled, container still starting) blocked on the OS TCP SYN-retry ceiling (~2 min/attempt, confirmed empirically) across 24 call sites with zero output — the real cause of `scripts/report.sh` reports "hanging indefinitely". New `pg_dial()` helper sets `connect_timeout` (default 10s, `PG_CONNECT_TIMEOUT_SECS`); all call sites route through it. Verified: unreachable PG_URL now fails the whole report in 14.6s instead of hanging. See PROGRESS.md. |
 | 50 | `50_patch_many_infinite_loop.md` | Improvement | ✅ SHIPPED 2026-07-16 — **critical**: `DiskBTree::patch_many` (item 47) genuinely infinite-loops, single-threaded, 100% CPU, on an unchanged-key `UPDATE` whenever the very first patch in a leaf-group has a key outside that leaf's *current* `entries.first()/last()` (plausible after any split) — the bounds check gated the first entry too, so the loop index never advanced. Confirmed live via `gdb -p <pid> -batch -ex bt` (identical stack twice). This is why it was never caught: Table 3 (the only report section touching this path) only runs when Postgres is reachable, and this session's item 49 fix was the first time that condition was met. Fixed: bounds check now only gates *additional* (`j > i`) batching, never `j == i`. New permanent regression test confirmed to catch the bug pre-fix (30s hang deadline) and pass post-fix (~1s). See PROGRESS.md. |
 
-| 51 | `51_select_join_hash_join.md` | Performance | ⏳ NOT STARTED — SELECT JOIN 0.29× PG (17× behind on FK tables); O(n×m) nested loop → O(n+m) hash join or O(n log m) index-nested-loop. Estimated: 0.70–1.00× PG. |
+| 51 | `51_select_join_hash_join.md` | Performance | ⏳ PHASE A DONE 2026-07-16 — predicate pushdown into base scans + integer key hash fast path + INLJ-via-unique_index_root revert; 0.31→0.59× PG. Phase B (≥0.70×) pending. See PROGRESS.md. |
 | 52 | `52_update_delete_predicate_decode_pushdown.md` | Performance | ⏳ NOT STARTED — item 47 Phase B: cols/row=8 on UPDATE, cols/row=6 on DELETE proves full decode on predicate-scan path. Extend B2 deform_row mask to matching_rows write path. DELETE: 0.16→0.30-0.40×; UPDATE: 0.14→0.18-0.22×. |
 | 53 | `53_fk_update_skip_unchanged_recheck.md` | Improvement | ⏳ NOT STARTED — FK UPDATE 0.06× PG (17× behind); executor re-checks FK constraint on every UPDATE row unconditionally even when FK column is not in SET clause. Skip when FK col not in SET. 0.06→0.12-0.18×. |
 | 54 | `54_select_filtered_arena_alloc.md` | Performance | ⏳ NOT STARTED — item 45 Lever 3: per-row Vec<Literal>+String allocation on parallel scan hot path. Per-query arena/bump allocator. SELECT filtered 0.42→0.50-0.58× PG. |
@@ -76,15 +76,15 @@ Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
 **Next new file → `56_…`.**
 
-## Next up — priority order (2026-07-16, derived from `030325` Docker report)
+## Next up — priority order (2026-07-16, calibrated on `052432` Docker baseline)
 
-Ordered by measured ROI from `030325` (`docs/performance/multi_model_report_20260716_030325.md`).
-Each item has its own spec file (see Registry above). Reorder as new data arrives.
+Ordered by measured ROI. Each item has its own spec file (see Registry above). Reorder as new data arrives.
 
-**#51 — SELECT JOIN hash join (`51_select_join_hash_join.md`) — highest ROI.**
-0.29× PG. Algorithmic gap: O(n×m) nested loop vs O(n+m) hash join / O(n log m) index-nested-loop.
-No WAL/storage change. Phase A (index-nested-loop, wires existing PK B-tree) can ship standalone.
-Independent of all other items below.
+**#51 Phase B — SELECT JOIN ≥0.70× PG (`51_select_join_hash_join.md`) — Phase A done (0.59×).**
+Remaining gap is row-decode cost: late-materialization (only decode referenced columns) and
+scan-side decode reuse. Candidates: (a) `deform_row` mask in the join executor scan, (b)
+columnar projection pushdown. Not yet filed as a separate item — consider merging into #52 scope
+since the fix is the same decode-pushdown mechanism.
 
 **#52 — UPDATE/DELETE predicate decode pushdown (`52_update_delete_predicate_decode_pushdown.md`).**
 cols/row=8 (UPDATE) and cols/row=6 (DELETE) measured in `030325`: we decode all columns on the

@@ -43,15 +43,21 @@ pub fn plan_access(
     if let Some(node) = try_cost_based(from, selection, catalog, ctes)? {
         return Ok(node);
     }
-    // Fallback: rule-based join tree + a residual WHERE filter.
-    let mut node = plan_from(from, catalog, ctes)?;
-    if let Some(sel) = selection {
+    // Rule-based fallback: build the join tree, then push single-table WHERE
+    // conjuncts into the base scans they belong to rather than stacking one
+    // monolithic Filter on top of the entire join.  Multi-table and unresolved
+    // predicates remain as a residual Filter above the join.
+    let node = plan_from(from, catalog, ctes)?;
+    let Some(sel) = selection else { return Ok(node) };
+    let conjuncts: Vec<QExpr> = sel.conjuncts().into_iter().cloned().collect();
+    let (node, residual) = push_predicates_down(node, conjuncts);
+    if let Some(pred) = and_all(residual) {
         let output = node.output().to_vec();
-        node = PlanNode::Filter {
+        return Ok(PlanNode::Filter {
             input: Box::new(node),
-            predicate: sel.clone(),
+            predicate: pred,
             output,
-        };
+        });
     }
     Ok(node)
 }
@@ -264,6 +270,175 @@ fn wrap_filter(node: PlanNode, preds: Vec<QExpr>) -> PlanNode {
         input: Box::new(node),
         predicate: pred,
         output,
+    }
+}
+
+/// Collect every table qualifier that appears in `expr`'s column references.
+/// `None` qualifier (unresolved / ambiguous) is represented as an empty string.
+fn collect_qualifiers(expr: &QExpr, out: &mut std::collections::HashSet<String>) {
+    match expr {
+        QExpr::Column { qualifier, .. } => {
+            out.insert(qualifier.clone().unwrap_or_default());
+        }
+        QExpr::Literal(_) => {}
+        QExpr::Compare { lhs, rhs, .. } => {
+            collect_qualifiers(lhs, out);
+            collect_qualifiers(rhs, out);
+        }
+        QExpr::And(l, r) | QExpr::Or(l, r) => {
+            collect_qualifiers(l, out);
+            collect_qualifiers(r, out);
+        }
+        QExpr::Not(e) | QExpr::IsNull { expr: e, .. } => collect_qualifiers(e, out),
+        QExpr::InList { expr: e, list, .. } => {
+            collect_qualifiers(e, out);
+            for v in list {
+                collect_qualifiers(v, out);
+            }
+        }
+        QExpr::Like { expr: e, pattern, .. } => {
+            collect_qualifiers(e, out);
+            collect_qualifiers(pattern, out);
+        }
+        QExpr::Match { column, query } => {
+            collect_qualifiers(column, out);
+            collect_qualifiers(query, out);
+        }
+        // Subquery forms and aggregates reference outer schema — treat as
+        // multi-table / non-pushable to be safe.
+        QExpr::Exists { .. }
+        | QExpr::InSubquery { .. }
+        | QExpr::ScalarSubquery(_)
+        | QExpr::Aggregate { .. } => {
+            out.insert(String::new()); // force residual
+            out.insert("__subquery__".into());
+        }
+    }
+}
+
+/// Returns the single, non-empty qualifier used by all column references in
+/// `expr`, or `None` if there are zero, multiple, or only unqualified columns.
+fn single_qualifier(expr: &QExpr) -> Option<String> {
+    let mut qs = std::collections::HashSet::new();
+    collect_qualifiers(expr, &mut qs);
+    // Remove the "no qualifier" sentinel — literals contribute it too.
+    qs.remove("");
+    if qs.len() == 1 {
+        qs.into_iter().next()
+    } else {
+        None
+    }
+}
+
+/// Push each conjunct as deep into the plan tree as possible: if a conjunct
+/// references only the qualifier of a base [`PlanNode::Scan`] (or
+/// [`PlanNode::IndexScan`]), wrap that scan in a `Filter`.  Conjuncts that
+/// span multiple qualifiers, are unqualified, or can't be matched to a scan
+/// are returned as `residual`.
+fn push_predicates_down(node: PlanNode, conjuncts: Vec<QExpr>) -> (PlanNode, Vec<QExpr>) {
+    match node {
+        PlanNode::Scan {
+            ref qualifier,
+            ..
+        } => {
+            let q = qualifier.as_str();
+            let (mine, rest): (Vec<_>, Vec<_>) = conjuncts
+                .into_iter()
+                .partition(|c| single_qualifier(c).as_deref() == Some(q));
+            let wrapped = wrap_filter(node, mine);
+            (wrapped, rest)
+        }
+        PlanNode::IndexScan {
+            ref qualifier,
+            ..
+        } => {
+            let q = qualifier.as_str();
+            let (mine, rest): (Vec<_>, Vec<_>) = conjuncts
+                .into_iter()
+                .partition(|c| single_qualifier(c).as_deref() == Some(q));
+            let wrapped = wrap_filter(node, mine);
+            (wrapped, rest)
+        }
+        PlanNode::HashJoin {
+            left,
+            right,
+            join_type,
+            left_keys,
+            right_keys,
+            residual,
+            output,
+        } => {
+            let (left2, rest) = push_predicates_down(*left, conjuncts);
+            let (right2, rest) = push_predicates_down(*right, rest);
+            let new_node = PlanNode::HashJoin {
+                left: Box::new(left2),
+                right: Box::new(right2),
+                join_type,
+                left_keys,
+                right_keys,
+                residual,
+                output,
+            };
+            (new_node, rest)
+        }
+        PlanNode::IndexNestedLoopJoin {
+            left,
+            right_table,
+            right_qualifier,
+            right_index_column,
+            left_key,
+            join_type,
+            residual,
+            output,
+        } => {
+            // Push into the outer (left) scan only; inner is probed via B-Tree.
+            let (left2, rest) = push_predicates_down(*left, conjuncts);
+            let new_node = PlanNode::IndexNestedLoopJoin {
+                left: Box::new(left2),
+                right_table,
+                right_qualifier,
+                right_index_column,
+                left_key,
+                join_type,
+                residual,
+                output,
+            };
+            (new_node, rest)
+        }
+        PlanNode::NestedLoopJoin {
+            left,
+            right,
+            join_type,
+            on,
+            output,
+        } => {
+            let (left2, rest) = push_predicates_down(*left, conjuncts);
+            let (right2, rest) = push_predicates_down(*right, rest);
+            let new_node = PlanNode::NestedLoopJoin {
+                left: Box::new(left2),
+                right: Box::new(right2),
+                join_type,
+                on,
+                output,
+            };
+            (new_node, rest)
+        }
+        PlanNode::Filter {
+            input,
+            predicate,
+            output,
+        } => {
+            let (inner, rest) = push_predicates_down(*input, conjuncts);
+            let new_node = PlanNode::Filter {
+                input: Box::new(inner),
+                predicate,
+                output,
+            };
+            (new_node, rest)
+        }
+        // For all other node types (Sort, Limit, Aggregate, etc.) leave
+        // predicates as residual — they can't be pushed further.
+        other => (other, conjuncts),
     }
 }
 

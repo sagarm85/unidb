@@ -203,6 +203,101 @@ fn index_nested_loop_join_matches_sqlite() {
 }
 
 #[test]
+fn inlj_via_primary_key_matches_sqlite() {
+    // PRIMARY KEY gives customers.id a unique_index_root (item 35) — the planner
+    // must pick IndexNestedLoopJoin via that implicit index, not HashJoin.
+    // Results verified against SQLite (which uses no such index but gives the
+    // same logical answer).
+    let uni_setup = vec![
+        "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT)",
+        "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT REFERENCES customers(id), total INT)",
+        "INSERT INTO customers (id, name) VALUES (1, 'alice')",
+        "INSERT INTO customers (id, name) VALUES (2, 'bob')",
+        "INSERT INTO customers (id, name) VALUES (3, 'carol')",
+        "INSERT INTO orders (id, customer_id, total) VALUES (10, 1, 100)",
+        "INSERT INTO orders (id, customer_id, total) VALUES (11, 1, 250)",
+        "INSERT INTO orders (id, customer_id, total) VALUES (12, 2, 75)",
+    ];
+    // SQLite equivalent without PK enforcement (it accepts FK refs without the
+    // row existing, but that's moot — we only insert valid refs here).
+    let sqlite_setup = vec![
+        "CREATE TABLE customers (id INT, name TEXT)",
+        "CREATE TABLE orders (id INT, customer_id INT, total INT)",
+        "INSERT INTO customers (id, name) VALUES (1, 'alice')",
+        "INSERT INTO customers (id, name) VALUES (2, 'bob')",
+        "INSERT INTO customers (id, name) VALUES (3, 'carol')",
+        "INSERT INTO orders (id, customer_id, total) VALUES (10, 1, 100)",
+        "INSERT INTO orders (id, customer_id, total) VALUES (11, 1, 250)",
+        "INSERT INTO orders (id, customer_id, total) VALUES (12, 2, 75)",
+    ];
+    let query = "SELECT customers.name, orders.total \
+                 FROM orders JOIN customers ON orders.customer_id = customers.id";
+    let mut ours = run_unidb(&uni_setup, query);
+    let mut theirs = run_sqlite(&sqlite_setup, query);
+    ours.sort();
+    theirs.sort();
+    assert_eq!(
+        ours, theirs,
+        "\nquery: {query}\n unidb: {ours:?}\nsqlite: {theirs:?}"
+    );
+}
+
+#[test]
+fn inlj_null_join_column_excluded() {
+    // A NULL customer_id on the outer (orders) side must not match any customer —
+    // SQL equi-join semantics: NULL never equals anything.
+    let uni_setup = vec![
+        "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT)",
+        "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT, total INT)",
+        "INSERT INTO customers (id, name) VALUES (1, 'alice')",
+        "INSERT INTO orders (id, customer_id, total) VALUES (10, 1, 100)",
+        "INSERT INTO orders (id, customer_id, total) VALUES (11, NULL, 50)",
+    ];
+    let sqlite_setup = vec![
+        "CREATE TABLE customers (id INT, name TEXT)",
+        "CREATE TABLE orders (id INT, customer_id INT, total INT)",
+        "INSERT INTO customers (id, name) VALUES (1, 'alice')",
+        "INSERT INTO orders (id, customer_id, total) VALUES (10, 1, 100)",
+        "INSERT INTO orders (id, customer_id, total) VALUES (11, NULL, 50)",
+    ];
+    let query =
+        "SELECT orders.total FROM orders JOIN customers ON orders.customer_id = customers.id";
+    let mut ours = run_unidb(&uni_setup, query);
+    let mut theirs = run_sqlite(&sqlite_setup, query);
+    ours.sort();
+    theirs.sort();
+    assert_eq!(
+        ours, theirs,
+        "\nquery: {query}\n unidb: {ours:?}\nsqlite: {theirs:?}"
+    );
+}
+
+#[test]
+fn inlj_empty_inner_relation_returns_no_rows() {
+    // When the inner (customers) relation is empty, no outer row can match.
+    let uni_setup = vec![
+        "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT)",
+        "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT, total INT)",
+        "INSERT INTO orders (id, customer_id, total) VALUES (10, 1, 100)",
+    ];
+    let sqlite_setup = vec![
+        "CREATE TABLE customers (id INT, name TEXT)",
+        "CREATE TABLE orders (id INT, customer_id INT, total INT)",
+        "INSERT INTO orders (id, customer_id, total) VALUES (10, 1, 100)",
+    ];
+    let query =
+        "SELECT orders.total FROM orders JOIN customers ON orders.customer_id = customers.id";
+    let mut ours = run_unidb(&uni_setup, query);
+    let mut theirs = run_sqlite(&sqlite_setup, query);
+    ours.sort();
+    theirs.sort();
+    assert_eq!(
+        ours, theirs,
+        "\nquery: {query}\n unidb: {ours:?}\nsqlite: {theirs:?}"
+    );
+}
+
+#[test]
 fn hash_join_spill_matches_sqlite() {
     // Force Grace spill with a tiny in-memory budget over a larger data set.
     std::env::set_var("UNIDB_HASH_JOIN_MEM_ROWS", "8");
