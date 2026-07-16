@@ -1022,6 +1022,10 @@ fn send_event_capture(
     if !table_def.events_enabled {
         return Ok(());
     }
+    // Item 55 investigation: sub-step timing active under RUST_LOG=unidb=debug.
+    let _outer_span = tracing::debug_span!("event_queue_capture").entered();
+    let t0 = std::time::Instant::now();
+
     let before_json = before.map(|r| queue::payload::row_to_json(r, &table_def.columns));
     let after_json = after.map(|r| queue::payload::row_to_json(r, &table_def.columns));
     // Back-compat payload = after for INSERT/UPDATE, before for DELETE.
@@ -1062,7 +1066,12 @@ fn send_event_capture(
         op,
         &envelope,
     ));
+    let json_us = t0.elapsed().as_micros();
+
+    let t1 = std::time::Instant::now();
     let row_id = heap.insert(&encoded, ctx.xid, ctx.pool, ctx.wal)?;
+    let heap_us = t1.elapsed().as_micros();
+
     ctx.txn_mgr.record_undo(
         ctx.xid,
         UndoAction::Insert {
@@ -1077,6 +1086,7 @@ fn send_event_capture(
     // the heap row (both durable if the user txn commits; both absent if it aborts under
     // deferred sync). A stale entry from an aborted txn is harmless: MVCC re-check in
     // resolve_event_candidates filters it via NoVisibleVersion.
+    let t2 = std::time::Instant::now();
     if let Some(meta_page) = ctx.event_seq_index_meta {
         DiskBTree::new(meta_page, ctx.page_size).insert(
             OrderedValue::Int(seq as i64),
@@ -1085,8 +1095,21 @@ fn send_event_capture(
             ctx.wal,
         )?;
     }
+    let btree_us = t2.elapsed().as_micros();
 
+    let t3 = std::time::Instant::now();
     persist_pages_if_changed(EVENTS_TABLE, &heap, &events_def.pages, ctx)?;
+    let persist_us = t3.elapsed().as_micros();
+
+    tracing::debug!(
+        seq,
+        json_us,
+        heap_us,
+        btree_us,
+        persist_us,
+        payload_bytes = encoded.len(),
+        "event_capture_substeps"
+    );
     Ok(())
 }
 
