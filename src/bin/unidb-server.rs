@@ -11,6 +11,10 @@
 //!   data (a common ops pattern — e.g. a smaller, faster disk for data,
 //!   a larger/shared one for logs) while still defaulting to one
 //!   self-contained folder for local/dev use.
+//! - `UNIDB_LOG_RETAIN_DAYS` (default `7`): number of days of daily log files
+//!   to keep at startup. Files matching `unidb.log.*` older than this are
+//!   deleted before the new appender is created. Set to `0` to disable
+//!   cleanup entirely.
 //! - `UNIDB_PAGE_SIZE` (default `0`, meaning `Engine::open`'s own default).
 //! - `UNIDB_BIND_ADDR` (default `127.0.0.1:8080`).
 //! - `UNIDB_JWT_SECRET` (**required**): HMAC secret for verify-only JWT
@@ -49,6 +53,39 @@ use axum_prometheus::PrometheusMetricLayer;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use unidb::server::{auth::JwtConfig, engine_handle::EngineHandle, router::build_router, AppState};
 
+/// Delete `unidb.log.*` files in `log_dir` whose mtime is older than
+/// `retain_days`. Called before the appender starts so we never delete the
+/// file currently being written. No-ops silently on any I/O error (logging
+/// is not initialized yet, so failures go to stderr).
+fn cleanup_old_logs(log_dir: &std::path::Path, retain_days: u64) {
+    if retain_days == 0 {
+        return;
+    }
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(retain_days * 86_400))
+        .unwrap_or(std::time::UNIX_EPOCH);
+    let Ok(entries) = std::fs::read_dir(log_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Match daily-rotated files: "unidb.log.YYYY-MM-DD"
+        if !name.starts_with("unidb.log.") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        if modified < cutoff {
+            if let Err(e) = std::fs::remove_file(entry.path()) {
+                eprintln!("warn: failed to remove old log {:?}: {e}", entry.path());
+            }
+        }
+    }
+}
+
 /// Sets up dual stdout+file logging and returns the file appender's guard —
 /// the caller must keep it alive for the process lifetime (dropping it
 /// early silently stops flushing buffered log lines to the file, since
@@ -56,6 +93,11 @@ use unidb::server::{auth::JwtConfig, engine_handle::EngineHandle, router::build_
 fn init_logging(log_dir: &str) -> tracing_appender::non_blocking::WorkerGuard {
     std::fs::create_dir_all(log_dir)
         .unwrap_or_else(|e| panic!("failed to create log directory {log_dir}: {e}"));
+    let retain_days: u64 = std::env::var("UNIDB_LOG_RETAIN_DAYS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(7);
+    cleanup_old_logs(std::path::Path::new(log_dir), retain_days);
     let file_appender = tracing_appender::rolling::daily(log_dir, "unidb.log");
     let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
 
