@@ -2,18 +2,21 @@
 
 **Type:** Performance
 **Status:** NOT STARTED
-**Priority:** High — SELECT filtered (k<N) is the flagship filtered-read benchmark; after item 43 the gap narrowed from PG +564% to PG +182% but a 2.8× deficit at 40 k rows remains.
+**Priority:** High — after items 43 + 46 + 48 the gap has narrowed to 0.63× PG (was 0.35×); thread-spawn overhead is the biggest remaining lever and is the recommended entry point.
+**Recommended entry point:** Lever 2 (pre-spawned worker pool) first — eliminates the ~900 µs fixed per-query spawn tax without touching the B-tree or row-encoding layers. Lever 1 and 3 are follow-ons once lever 2 is measured.
 
 ---
 
-## Measured gap (2026-07-15, MM_CRUD_ROWS=20000, matched fsync)
+## Measured gap (updated 2026-07-16 post items 43 + 46 + 48, MM_CRUD_ROWS=20000)
 
 | engine | rec/s | ratio |
 |---|---:|---|
-| unidb | 2 595 212 | 0.35× |
-| Postgres | 7 316 962 | — |
+| unidb | 4 066 108 | 0.63× |
+| Postgres | 6 502 039 | — |
 
-`cols/row = 4.00` confirms the correct selective arm (`k < N`) is being picked and the parallel path fires (18 workers, 0 fallbacks). The deficit is structural, not a gate bug.
+_(Earlier measurement 2026-07-15 pre-item-43: unidb 2,595,212 vs PG 7,316,962 = 0.35×. The improvement is from item 43's correct predicate-arm selection + item 46's cols/row reduction on the aggregate path; the filtered-read path itself was not changed.)_
+
+`cols/row = 4.00` confirms the correct selective arm (`k < N`) is being picked and the parallel path fires. The deficit is structural: thread-spawn overhead is the dominant remaining cost.
 
 ## Root causes (three independent levers)
 

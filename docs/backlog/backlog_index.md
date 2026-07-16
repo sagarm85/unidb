@@ -70,6 +70,16 @@ Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 
 ## Next up (candidates — pick one, then create `NN_<slug>.md`)
 
+> **Top two open perf items (2026-07-16, post PR #119):**
+>
+> **#1 — Item 47 Phase B — vectorised predicate scan for UPDATE/DELETE (`47_update_delete_write_throughput.md`)**
+> File exists. Status: PHASE A SHIPPED, Phase B NOT STARTED.
+> Code path: `src/sql/executor.rs::matching_rows` — pass a pred-column mask to `deform_row` instead of `decode_row` (same pattern as B2 pushdown in `query_exec.rs`). `cols/row` target: 8.00 → 5.00. UPDATE rec/s target: 92k → 150k+. No WAL/format/crash-harness changes.
+>
+> **#2 — Item 45 — SELECT filtered: pre-spawned worker pool (`45_select_filtered_parallel_btree_scan.md`)**
+> File exists. Status: NOT STARTED. Entry point: Lever 2 (pre-spawned pool in `src/sql/parallel_scan.rs`) — eliminates ~900 µs fixed per-query thread-spawn tax. Current gap: 4,066,108 vs 6,502,039 PG = 0.63×. Target after lever 2: ~0.85×+.
+>
+
 Ordered by my current ROI read; reorder as priorities change. Create each
 candidate's `NN_<slug>.md` when started — until then each is *filed inside* an
 existing doc.

@@ -1,7 +1,17 @@
 # UPDATE/DELETE write throughput: per-row WAL overhead, MVCC insert-new-version cost, and unchanged-index maintenance
 
 **Type:** Performance
-**Status:** SHIPPED — Phase A (in-place RowId patch for unchanged-key UPDATE) landed in PR #TBD (`47-44-perf-batch`, 2026-07-16). WAL B/row: 619 → 465 (−25% at 500-row scale; FPI savings grow with row count). See `PROGRESS.md` "Items 47 + 44" entry for full metrics. Phase B (vectorised predicate scan) and Phase C (HOT-equivalent chain) remain open follow-on items.
+**Status:** PHASE A SHIPPED (PR #119, 2026-07-16) — Phase B (vectorised predicate scan on `matching_rows`) is the next open task. Phase C (HOT-equivalent chain) is deferred/milestone-sized.
+
+### Phase A result (shipped)
+WAL B/row: **619 → 465** (−25% at 500-row scale). `init_patch_batches` now covers both secondary BTree and unique-enforcement indexes; `flush_patch_batches` calls `patch_many` once per batch after the row loop. See `PROGRESS.md` "Items 47 + 44."
+
+### Phase B — next task
+**What:** Vectorised predicate scan — deform only the predicate column(s) during the `matching_rows` scan phase, not the full row. Full decode runs only on matched rows (unavoidable for producing the new version).
+**Where:** `src/sql/executor.rs::matching_rows` — pass the predicate column mask (same pattern as B2 pushdown in `src/sql/query_exec.rs`); call `deform_row(page, slot, &pred_col_mask)` instead of `decode_row`.
+**Signal to watch:** `cols/row` on UPDATE drops from 8.00 toward 5.00 (1 pred col × all scanned rows + 4 full cols × matched rows, normalized at 50% selectivity).
+**Expected gain:** UPDATE bulk ~92k → ~150k+ rec/s; ratio vs Postgres moves from ~0.17× toward ~0.28×.
+**Effort:** Low–medium. Single function change; no WAL/format/crash-harness impact.
 **Priority:** High — UPDATE bulk at 0.17× PG (+481%), DELETE selected at 0.17× PG (+497%) are the largest remaining gaps. Root cause is structural: every matched row = one WAL mini-txn with full-page-image check + one B-tree update per indexed column. Item 44 addresses the batched-WAL angle for DELETE; this item addresses the scan and index-maintenance overhead that affects both UPDATE and DELETE.
 
 ---
