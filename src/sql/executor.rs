@@ -19,13 +19,13 @@
 // M1.c proving SQL works end-to-end.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use serde_json::Value as JsonValue;
 
 use crate::{
-    btree_index::{DiskBTree, OrderedValue},
+    btree_index::{DiskBTree, OrderedValue, RangeOp},
     bufferpool::{BufferPool, PageReader},
     catalog::{Catalog, CatalogCtx, ColumnDef, ColumnType, IndexKind, TableConstraints, TableDef},
     control::ControlData,
@@ -1953,11 +1953,6 @@ fn try_exec_select_btree(
         return Ok(None);
     };
     let tree = DiskBTree::new(meta_page, ctx.page_size);
-    let candidate_ids: Vec<RowId> = match tree.search(op, &value, ctx.pool)? {
-        Some(ids) => ids,
-        None => return Ok(None),
-    };
-
     let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
 
@@ -1978,8 +1973,7 @@ fn try_exec_select_btree(
     let (full_needed, full_upto) = needed_mask(&full_cols, ncols);
     let has_pred = predicate.is_some();
 
-    // The B2 two-phase decode as a closure, shared by the serial and parallel
-    // candidate-resolution paths.
+    // The B2 two-phase decode as a closure, shared by all resolution paths.
     let per_candidate = |bytes: &[u8]| -> Result<Option<Vec<Literal>>> {
         if has_pred {
             let prow = deform_row(bytes, cols, pred_upto, &pred_needed)?;
@@ -1991,13 +1985,122 @@ fn try_exec_select_btree(
         Ok(Some(project_row(projection, cols, &row)?))
     };
 
-    // Parallelize resolution across worker threads when the candidate list is
-    // large (Milestone P follow-up — the filtered-SELECT gap). Order is
-    // unspecified (no `ORDER BY` here), so concat is correct.
-    // Item 45: also guard on PARALLEL_CANDIDATE_MIN — below this threshold the
-    // thread-spawn cost exceeds the work saved (e.g. 18 threads for a handful
-    // of index hits). `acquire()` already gates on MIN_PAGES (64) by default,
-    // but naming the threshold here keeps it self-documenting.
+    // Lever 1 (item 45): for range predicates, acquire workers optimistically
+    // before the B-tree scan and dispatch each pre-partitioned slice to exactly
+    // one worker (static assignment, no work-stealing cursor). Each partition
+    // covers a contiguous key range, so each worker's heap accesses are
+    // clustered by key-ordered insertion locality — lower page-cache pressure
+    // than the interleaved access pattern of work-stealing over a flat list.
+    // `usize::MAX` bypasses the MIN_PAGES floor in `acquire`; we enforce
+    // PARALLEL_CANDIDATE_MIN ourselves after counting the collected total.
+    let range_op = match op {
+        CmpOp::Lt => Some(RangeOp::Lt),
+        CmpOp::Le => Some(RangeOp::Le),
+        CmpOp::Gt => Some(RangeOp::Gt),
+        CmpOp::Ge => Some(RangeOp::Ge),
+        _ => None,
+    };
+    if let Some(rop) = range_op {
+        let maybe_lease = crate::sql::parallel_scan::acquire(usize::MAX);
+        if let Some(lease) = maybe_lease {
+            let degree = lease.degree();
+            let partitions = tree.search_range_partition(rop, &value, degree, ctx.pool)?;
+            let total: usize = partitions.iter().map(|p| p.len()).sum();
+
+            if total >= crate::sql::parallel_scan::PARALLEL_CANDIDATE_MIN {
+                let reader = ctx.pool.shared_reader();
+                let deadline = crate::query_limits::snapshot_deadline();
+                let stop = AtomicBool::new(false);
+                let err: Mutex<Option<DbError>> = Mutex::new(None);
+                let parts: Mutex<Vec<Vec<Vec<Literal>>>> = Mutex::new(Vec::new());
+                std::thread::scope(|s| {
+                    for part in &partitions {
+                        let reader = reader.clone();
+                        // Rebind shared state as references so the `move`
+                        // closure captures them by pointer, not by value.
+                        let (stop, err, deadline, parts) = (&stop, &err, &deadline, &parts);
+                        let (snapshot, per_candidate) = (&snapshot, &per_candidate);
+                        let xid = ctx.xid;
+                        s.spawn(move || {
+                            let mut rows: Vec<Vec<Literal>> = Vec::new();
+                            for (i, &rid) in part.iter().enumerate() {
+                                if stop.load(Ordering::Relaxed) {
+                                    break;
+                                }
+                                if i % 64 == 0 {
+                                    if let Err(e) = deadline.check() {
+                                        *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                                        stop.store(true, Ordering::Relaxed);
+                                        break;
+                                    }
+                                }
+                                let bytes = match get_visible(&reader, rid, snapshot, xid) {
+                                    Ok(Some(b)) => b,
+                                    Ok(None) => continue,
+                                    Err(e) => {
+                                        *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                                        stop.store(true, Ordering::Relaxed);
+                                        break;
+                                    }
+                                };
+                                match per_candidate(&bytes) {
+                                    Ok(Some(row)) => rows.push(row),
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                                        stop.store(true, Ordering::Relaxed);
+                                        break;
+                                    }
+                                }
+                            }
+                            parts.lock().unwrap_or_else(|p| p.into_inner()).push(rows);
+                        });
+                    }
+                });
+                if let Some(e) = err.into_inner().unwrap_or_else(|p| p.into_inner()) {
+                    return Err(e);
+                }
+                let mut rows = Vec::new();
+                for part_rows in parts.into_inner().unwrap_or_else(|p| p.into_inner()) {
+                    rows.extend(part_rows);
+                }
+                return Ok(Some(ExecResult::Rows {
+                    columns: output_columns(projection, &table_def.columns),
+                    rows,
+                }));
+            }
+
+            // Total below PARALLEL_CANDIDATE_MIN: reuse already-collected RowIds
+            // for the serial path — avoids a second B-tree scan.
+            // lease drops here, returning workers to the global pool.
+            let candidate_ids: Vec<RowId> = partitions.into_iter().flatten().collect();
+            drop(lease);
+            let mut out = Vec::new();
+            for row_id in candidate_ids {
+                let bytes = match heap.get(row_id, &snapshot, ctx.xid, ctx.pool) {
+                    Ok(b) => b,
+                    Err(DbError::NoVisibleVersion { .. }) => continue,
+                    Err(e) => return Err(e),
+                };
+                if let Some(row) = per_candidate(&bytes)? {
+                    out.push(row);
+                }
+            }
+            return Ok(Some(ExecResult::Rows {
+                columns: output_columns(projection, &table_def.columns),
+                rows: out,
+            }));
+        }
+        // Workers unavailable — fall through to the serial/Eq path below.
+    }
+
+    // Non-range predicates (Eq) or workers unavailable: serial B-tree scan.
+    // The existing parallel_resolve_candidates work-stealing path handles Eq
+    // with many duplicate keys; range fallback just goes fully serial.
+    let candidate_ids: Vec<RowId> = match tree.search(op, &value, ctx.pool)? {
+        Some(ids) => ids,
+        None => return Ok(None),
+    };
     let maybe_lease = if candidate_ids.len() >= crate::sql::parallel_scan::PARALLEL_CANDIDATE_MIN {
         crate::sql::parallel_scan::acquire(candidate_ids.len())
     } else {
