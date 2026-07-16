@@ -6384,7 +6384,7 @@ rather than silently passed over.
 
 ## Item 52 — UPDATE/DELETE predicate-only decode pushdown (Phase B)   [STEP 1 DONE — Step 2 no-op]   2026-07-16
 
-**Report:** `docs/performance/multi_model_report_20260716_095901.md` (branch `52-update-delete-predicate-decode-pushdown`, commit `fd92571` + item-52 changes)
+**Report:** `docs/performance/multi_model_report_20260716_095901.md` (PR #131, commit `79b38ea`, merged to main `05aff0a`)
 **Baseline:** `docs/performance/multi_model_report_20260716_030325.md`
 
 **Summary:** Changed `MatchedRows` from `Vec<(RowId, Vec<Literal>)>` to `Vec<(RowId, Vec<u8>)>` so callers receive raw heap bytes and decode lazily. DELETE's common path (no FK children, no CDC) now exits `matching_rows` without ever calling `decode_row` on matched rows — only the predicate column is materialized via `deform_row`. `exec_delete`'s FK/CDC branch decodes at use. `exec_update` decodes matched rows at loop entry (required by insert-new-version MVCC). Also extended `index_matching_rows` to use `deform_row` for its predicate re-check instead of `decode_row`. A3 gate test updated for Phase B col counts (threshold 20000 → 7500).
