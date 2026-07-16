@@ -48,7 +48,7 @@ cd "$REPO_ROOT"
 # of just taking a while).
 START_EPOCH="$(date +%s)"
 
-OUT="${1:-docs/performance/multi_model_report_$(date +%Y%m%d).md}"
+OUT="${1:-docs/performance/report_$(date +%Y%m%d).md}"
 mkdir -p "$(dirname "$OUT")"
 
 echo "[multi_model_report] building release bench…" >&2

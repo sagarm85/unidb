@@ -202,7 +202,7 @@ else
     # the Postgres comparison columns without the user needing to set PG_URL.
     bringup_pg_native
   fi
-  OUT="docs/performance/multi_model_report_$(date +%Y%m%d_%H%M%S).md"
+  OUT="docs/performance/report_$(date +%Y%m%d_%H%M%S).md"
   REPORT="$("$REPO_ROOT/scripts/multi_model_report.sh" "$OUT" | tail -1)"
 fi
 
@@ -230,4 +230,8 @@ TOTAL_TAKEN="$(fmt_duration "$TOTAL_ELAPSED")"
 } >>"$REPORT"
 
 echo "[report] report: $REPORT (total: $TOTAL_TAKEN)" >&2
+
+# Compare against latest benchmark and print delta (informational only).
+python3 "$REPO_ROOT/scripts/compare_bench.py" "$REPORT" || true
+
 echo "$REPORT"
