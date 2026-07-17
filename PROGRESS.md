@@ -6870,7 +6870,7 @@ This is accepted. The target for item 58 is ≥0.07× (from 0.04×).
 ## Item 58 — HOT-equivalent UPDATE   [SHIPPED]   2026-07-17
 
 **Branch:** `58-hot-update`  
-**PR:** pending (implementation complete, bench results below)
+**PR:** #141 — https://github.com/sagarm85/unidb/pull/141
 
 **Summary:** Same-page HOT update for non-indexed SET clause: when no indexed column
 appears in SET and the old page has free space, the new version is inserted on the same
