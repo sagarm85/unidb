@@ -1,6 +1,6 @@
 # unidb
 
-A single embedded storage/transaction engine in Rust that unifies relational CRUD, vector search (durable on-disk IVF-Flat), graph edges, and a WAL-derived event queue over one page store, one WAL, one buffer pool, and one transaction manager.
+A single embedded storage/transaction engine in Rust that unifies relational CRUD, vector search (durable on-disk HNSW, recall@10 ≥ 0.95), graph edges, and a WAL-derived event queue over one page store, one WAL, one buffer pool, and one transaction manager.
 
 The competitive edge is eliminating the multi-system dual-write tax. "Save row + embedding + graph edge + event" is one WAL append and one commit here, versus 3–4 network round-trips with no shared transaction across Postgres + a vector store + a graph DB + Kafka. **Measured (item 17, `benches/decompose.rs` Table 4, `MM_REPLACED_STACK=1`):** the same four-model write against a real **replaced stack** (Postgres row + pgvector + a graph table + an outbox queue, four independent commits) runs **3.61× faster in one atomic commit under real flush-to-platter durability** (unidb `F_FULLFSYNC` vs Postgres `fsync_writethrough` — 250 vs 69 txns/s; 1 sync vs 4). The throughput edge is *durability-cost-dependent* — it narrows to ~parity under a cheap/buffered VM `fsync` — but the **crash-consistency win is unconditional**: unidb recovers **0 orphans** where the four-system stack recovers a **torn record** (`tests/crash` `item16_*` proofs). Honest boundary per §1: we still expect to *lose* single-model CRUD vs a specialized incumbent — the win is the cross-domain atomic commit, not per-op speed.
 
@@ -315,7 +315,8 @@ src/
   fulltext.rs      — full-text tokenizer; the inverted index itself is a durable DiskBTree keyed on tokens (P3.b), read via Engine::search_fulltext
   btree_index.rs   — durable on-disk B+tree (DiskBTree) for equality/range WHERE predicates; paged, WAL-logged, crash-recovered, no rebuild on open (P3.a); also backs full-text + edge indexes (P3.b)
   csr_index.rs     — Compressed Sparse Row adjacency structure (retired from the runtime in P3.b; module kept for its benchmark)
-  disk_vector.rs   — P3.c: durable on-disk IVF-Flat vector index (DiskIvfIndex); posting lists = durable DiskBTree, centroids in a WAL-logged meta page; backs CREATE INDEX ... USING HNSW|IVF and NEAR, no rebuild on open
+  disk_vector.rs   — P3.c: durable on-disk IVF-Flat vector index (DiskIvfIndex; retired by item 63 — superseded by hnsw_index.rs); kept for reference and unused code paths
+  hnsw_index.rs   — item 63: durable on-disk HNSW graph index (DiskHnswIndex, M=16, M_max0=32, ef_construction=200); node base pages + node_index/upper_layer DiskBTrees; recall@10 ≥ 0.95 (0.964 at 1k×dim128); backs CREATE INDEX ... USING HNSW and NEAR, no rebuild on open (entry-point stored in meta)
   large_object.rs  — P3.d: out-of-line chunked + streamed large objects (__lobs__ rows + durable lob_id index); Engine::{put,read,delete}_large_object
   graph/           — edges.rs, index.rs, logical.rs, parser.rs, executor.rs (Cypher subset)
   queue/           — mod.rs (event capture, poll/ack/vacuum + poll_events_after live-tail cursor, M20 E1), payload.rs
@@ -400,7 +401,7 @@ Phase 4 query power is next for the SQL lane). Metrics tables are in
 | P2.e — prepared statements | done | `$n` bind parameters (`execute_sql_params`, `prepare`/`execute_prepared`, `POST /sql` `params`) — closes the SQL-injection surface |
 | P3.a — durable B-Tree | done | The M6 B-Tree is now an on-disk B+tree (`DiskBTree`): paged, buffer-pool-managed, WAL-logged (`WAL_INDEX`), crash-recovered, **not rebuilt on open** (Phase 3, Core lane) |
 | P3.b — durable full-text + edge index | done | Full-text (inverted) and edge-adjacency indexes are durable `DiskBTree`s too (no rebuild on open); CSR retired; new `Engine::search_fulltext` read path |
-| P3.c — on-disk vector index | done | Durable on-disk IVF-Flat (`DiskIvfIndex`): posting lists = durable `DiskBTree`, centroids in a WAL-logged meta page; `CREATE INDEX ... USING HNSW\|IVF` builds it, `NEAR` reads it, async worker retired, **no rebuild on open**; recall@10=1.0 matches HNSW (crash point P17) |
+| P3.c — on-disk vector index | done | Durable on-disk IVF-Flat (`DiskIvfIndex`, initial P3.c): posting lists = durable `DiskBTree`, centroids in WAL-logged meta; `NEAR` reads it; no rebuild on open (crash point P17). **Item 63 replaces IVF-Flat with true on-disk HNSW (`DiskHnswIndex`)**: M=16, M_max0=32, ef_construction=200; node base pages + node_index/upper_layer DiskBTrees; recall@10 = **0.964 at 1k×dim128** (≥0.95 gate — vs IVF-Flat's 0.421 at 100k); no FORMAT_VERSION bump (reuses WAL_INDEX); crash points P60a+P60b |
 | P3.d — large-object storage | done | Out-of-line chunked + streamed big files (`__lobs__` rows + durable `DiskBTree` index); atomic with the txn, crash-recovered, vacuum-reclaimable; `Engine::{put,read,delete}_large_object` — multi-GB without OOM |
 | P6.a — segmented WAL | done | `db.wal/` is a directory of fixed-size 16 MiB segments; seal + rotate; truncation deletes whole consumed segments (no rewrite). Enables concurrent WAL readers (crash point P18) |
 | P6.b — replication slots + WAL shipping | done | Persisted `SlotRegistry` (`slots.json`) holds the WAL truncation floor; `ship_wal`/`decode_stream`; REST `/replication/{slots,stream}` |

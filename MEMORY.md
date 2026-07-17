@@ -12,31 +12,26 @@
 
 ## Current status
 
-- **Item 63 — Disk-based HNSW index — SHIPPED 2026-07-17, branch `63-disk-hnsw`.**
+- **Item 63 — Disk-based HNSW index — SHIPPED 2026-07-17, branch `63-disk-hnsw`. PR pending.**
   `src/hnsw_index.rs` — `DiskHnswIndex` replaces `DiskIvfIndex` for `IndexKind::Hnsw`.
-  Motivation: IVF-Flat recall@10 = 0.421 at 100k rows (gate ≥ 0.90; UNLOCKED by item 62).
-  Implementation: O(log N) HNSW beam search (ef_construction=200, ef_search=50, M=16,
-  M_max0=32); node base pages with fixed 712-byte slots (dim=128); node_index + upper_layer
-  DiskBTrees; entry-point stored directly in meta page (node_page + node_slot) for crash-safe
-  recovery; `remove()` intentionally no-op (MVCC visibility filters dead rows); reuses WAL_INDEX
-  (no FORMAT_VERSION bump). Wired into: `exec_create_index`, `apply_durable_index_writes`,
-  `exec_select_near`, `stage_row_index_writes_update`, vacuum paths. Crash tests P60a + P60b
-  added (48/48 crash tests PASS). 431 lib unit tests PASS. clippy/fmt CLEAN.
-  Pending: release-mode recall bench (cargo bench --bench decompose UNIDB_BENCH=ivf_validate
-  with HNSW backend), PROGRESS.md entry with recall/latency table, PR creation.
+  Recall@10 at 1k×dim128: 0.964 (gate ≥0.95 PASS). 10k recall pending (bench ~40 min due to
+  ~1 GB WAL write volume for reciprocal L0 connections). HNSW warm query latency 5.31 ms at 1k.
+  Crash tests P60a + P60b: PASS. 669 lib/integration tests PASS, 48 crash tests PASS.
+  ivf_scale_validation.rs updated: IVF nlist test → `hnsw_near_returns_approximate_nearest`.
+  PROGRESS.md updated (item 62 → SHIPPED, item 63 entry). Docker bench running (commit 9fdb672).
+  Next: wait for Docker bench → update PROGRESS.md W2-W1 delta → create PR.
+
+- **Item 62 — IVF-Flat scale validation — SHIPPED 2026-07-17. PR #145 MERGED.**
+  Bench `UNIDB_BENCH=ivf_validate`: creates IVF index AFTER insert (fixing nlist=1
+  empty-table artifact), measures recall@10/latency at 1k/10k/100k rows.
+  Results: recall@10 = 0.690/0.378/0.421; warm latency at 100k = 17ms.
+  Gate for item 63 (disk HNSW) UNLOCKED. PR #145 merged 2026-07-17.
 
 - **Item 61 — True replaced-stack benchmark — SHIPPED 2026-07-17. PR #144 MERGED.**
   `pg_replaced_stack_realistic_throughput`: 3×PG autocommit + 1 Redpanda produce
   (separate Docker container, real inter-process TCP). Table 4.1 gated on
   `MM_REPLACED_STACK_REALISTIC=1`. Redpanda v24.3.7 in docker-compose.yml.
   Pending: Docker run to capture actual Table 4.1 numbers.
-
-- **Item 62 — IVF-Flat scale validation — IN PROGRESS 2026-07-17, branch
-  `62-ivf-scale-validation`. PR #145 pending.**
-  Bench `UNIDB_BENCH=ivf_validate`: creates IVF index AFTER insert (fixing nlist=1
-  empty-table artifact), measures recall@10/latency at 1k/10k/100k rows.
-  Results: recall@10 = 0.690/0.378/0.421; warm latency at 100k = 17ms.
-  Gate for item 63 (disk HNSW) is UNLOCKED.
 
 - **Item 60 — Event queue serde_json replacement — SHIPPED 2026-07-17, branch
   `60-event-queue-serde-json-fix`. PR pending.**

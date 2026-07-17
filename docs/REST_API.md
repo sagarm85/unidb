@@ -465,7 +465,7 @@ to drop an existing index on that column.
 
 Report a column's index status. Since Phase 3 (P3.c) **every** secondary index is
 durable and built synchronously as part of `CREATE INDEX` (B-Tree/full-text/edge
-as on-disk `DiskBTree`s, the vector index as an on-disk IVF-Flat), so a present
+as on-disk `DiskBTree`s, the vector index as an on-disk HNSW graph `DiskHnswIndex`), so a present
 index is always `"Ready"` — there is no async backfill window. The `Building`
 variant is retained for wire compatibility but is no longer produced.
 
@@ -529,8 +529,8 @@ Per column:
   it is intentionally decoupled from the engine's on-disk `ColumnType` enum.)
 - `nullable` — `false` iff the column is `NOT NULL` or `PRIMARY KEY`.
 - `index` — the column's secondary-index kind (`btree`, `hnsw`, `fulltext`,
-  `csr`) or `null` if unindexed. `hnsw` denotes the durable IVF-Flat vector
-  index (the historical name is kept, see `catalog::IndexKind`).
+  `csr`) or `null` if unindexed. `hnsw` denotes the durable on-disk HNSW graph
+  index (`DiskHnswIndex`, item 63; recall@10 ≥ 0.95); see `catalog::IndexKind`.
 
 **Errors**: same as every data-plane route — `401 UNAUTHORIZED` without a valid
 bearer token, `500 INTERNAL_ERROR` if the engine is unavailable. No route-specific

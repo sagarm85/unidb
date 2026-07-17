@@ -1,13 +1,12 @@
 # P3.c spike — on-disk vector index: approach selection & recall validation
 
-> **Status: SHIPPED — spike 2026-07-08, production 2026-07-09.** This document
-> records the spike the Phase-3 blueprint mandates ("SPIKE FIRST … validate
-> recall@k before committing") for the durable on-disk vector index. **The
-> production wiring is now shipped** (see "What the production follow-up PR adds"
-> below, all done): `CREATE INDEX … USING HNSW`/`IVF` builds a durable
-> `DiskIvfIndex`, `NEAR` routes through it, centroids persist in a WAL-logged meta
-> page, the async worker is retired, and crash point P17 covers it. Prototype →
-> production: `src/disk_vector.rs`; validation harness: `benches/vector_recall.rs`.
+> **Status: SUPERSEDED — spike 2026-07-08, production 2026-07-09; replaced by item 63, 2026-07-17.**
+> This document records the spike for P3.c (IVF-Flat, shipped). **Item 62 (2026-07-17)
+> measured IVF-Flat recall@10 = 0.421 at 100k rows on uniform-random 128-dim vectors (gate
+> ≥ 0.90 failed; root cause: nlist cap at 256 → 3.2% space probe at 1M rows). Item 63
+> replaced IVF-Flat with a true on-disk HNSW graph (`DiskHnswIndex`, `src/hnsw_index.rs`);
+> `disk_vector.rs`/`DiskIvfIndex` is retired.** The rest of this document is historical — it
+> was correct when written. Do not update it; read `engine_design.md` §5.5 for current state.
 
 ## Problem
 

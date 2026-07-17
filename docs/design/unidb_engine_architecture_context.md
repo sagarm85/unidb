@@ -53,7 +53,7 @@ win — refresh the guide.
 ## Coverage snapshot (for internal reference)
 
 As of the last regeneration, the guide reflects the engine through: storage
-core, MVCC + SQL, durable secondary indexes (B-tree, IVF-Flat vector,
+core, MVCC + SQL, durable secondary indexes (B-tree, on-disk HNSW graph vector,
 full-text, edge adjacency), graph, event queue + realtime dispatcher, REST
 server with transaction sessions / cursors / batch, catalog introspection
 (`information_schema`), `JOIN … USING`, observability metrics, structured logs,
