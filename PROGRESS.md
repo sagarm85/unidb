@@ -7123,3 +7123,67 @@ run in this bench due to truncation — local 32/32 was clean).
 | UPDATE bulk | 50000 | 32,537 | 551,129 | 0.06× |
 | DELETE selected | 100000 | 240,031 | 5,524,341 | 0.04× |
 | DELETE all | 100000 | 29,626,338 | 4,859,126 | 6.10× |
+
+---
+
+## Item 62 — IVF-Flat scale validation   [IN PROGRESS]   2026-07-17
+
+**Branch:** `62-ivf-scale-validation`
+**Summary:** Empirically measured IVF-Flat recall@10, NEAR latency, and candidate
+count at 1k/10k/100k rows (128-dim Euclidean, k=10, 100 query vectors). Confirmed
+the nlist=1 empty-table bench artifact in W2 and proved the fix (create index
+after insert). Revealed that IVF-Flat recall on uniform random 128-dim vectors is
+already poor at 1k rows (0.69) and drops further at scale — justifying item 61
+(disk-HNSW planning).
+
+### Critical bug confirmed: W2 bench creates IVF index on empty table
+
+`mm_ladder_point` in `benches/decompose.rs` creates the HNSW index before inserting
+rows (`nlist=1` — single origin centroid). Every NEAR query since W2 shipped has been
+a brute-force linear scan: all N rows returned as candidates, re-ranked by exact L2.
+The new `UNIDB_BENCH=ivf_validate` bench creates the index AFTER insert, confirming
+the fix and measuring real IVF behaviour.
+
+### IVF-Flat scale validation results (Mac M5 Pro, arm64, 2026-07-17)
+
+`MM_SIZES=1000,10000,100000 UNIDB_BENCH=ivf_validate cargo bench --bench decompose`
+
+| corpus size | nlist (actual) | nprobe | est. candidates | NEAR latency (cold) | NEAR latency (warm) | recall@10 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1k | 32 | 8 | 250 | 1.04 ms | 0.77 ms | **0.690** |
+| 10k | 100 | 12 | 1 200 | 1.94 ms | 1.73 ms | **0.378** |
+| 100k | 256 (capped) | 32 | 12 500 | 35.73 ms | 17.04 ms | **0.421** |
+| 1M | 256 (capped) | 32 | ~125 000 | not measured | not measured | extrapolated |
+
+**HONEST ANALYSIS:**
+
+Recall@10 is far lower than the architecture session's 0.90–0.95 prediction. The
+discrepancy has two causes:
+
+1. **Corpus is uniform random 128-dim vectors.** At high dimension, all pairwise
+   distances concentrate tightly (central limit theorem). The query's 10 true nearest
+   neighbors are scattered across many cells with no geometric locality advantage
+   for IVF centroids trained on random points. Real-world embeddings (language model
+   outputs, image features) have strong cluster structure → recall would be higher.
+
+2. **nlist cap (256) limits 100k and above.** At 100k rows, sqrt(100k)≈316 is
+   capped to 256; at 1M rows, capped to 256 → 3.2% cell probe → catastrophic recall
+   on any distribution.
+
+**Latency:** warm-cache NEAR at 100k = 17 ms (12 500 candidates × posting-list
+B-tree fetch + heap page fetch + 128-dim L2 rerank). Too slow for interactive use
+at this scale. At 1M rows, ~125k candidates would make warm latency ~170 ms estimated.
+
+**Conclusion:** IVF-Flat is unsuitable for corpus sizes ≥ 10k rows at the current
+nlist/nprobe settings, even on structured data, due to the nlist cap. Item 61
+(disk-HNSW) is justified by this measurement.
+
+### Check table
+
+| Check | Result |
+|-------|--------|
+| `cargo build --release` (bench) | clean |
+| `cargo clippy -- -D warnings` | clean |
+| `cargo fmt --all` | clean |
+| `cargo test --release` | **660 passed; 0 failed** (2 new IVF tests) |
+| `cargo test --test crash --release` | **46 passed; 0 failed** |

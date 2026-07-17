@@ -12,26 +12,18 @@
 
 ## Current status
 
-- **Item 61 — True replaced-stack benchmark (Postgres + Redpanda) — IN PROGRESS 2026-07-17,
-  branch `61-replaced-stack-bench`. PR #144: https://github.com/sagarm85/unidb/pull/144**
-  Lifts the item-17 conservative proxy (4×PG same server) to a genuinely separate
-  event-queue process. Ships:
-  - `pg_four_model_one_txn_throughput`: 4 model-writes in 1 PG txn (best-case reference).
-  - `pg_replaced_stack_realistic_throughput`: 3×PG autocommit + 1 Redpanda produce
-    (separate Docker container, real inter-process TCP, `rskafka 0.6` pure-Rust client,
-    single-thread tokio runtime per call; graceful skip when Redpanda unreachable).
-  - `redpanda_addr()` helper reads `REDPANDA_ADDR` env var (default `localhost:9092`).
-  - Table 4.1 in `bench_mm_report` (gated on `MM_REPLACED_STACK_REALISTIC=1`): shows
-    4 rows — unidb W4 / PG-all-in-one / conservative (item 17) / realistic (item 61) —
-    with `unidb÷each` ratio and atomicity column.
-  - `docker/docker-compose.yml`: Redpanda v24.3.7 service + bench depends_on healthy.
-  - `scripts/docker_report.sh` + `multi_model_report.sh`: new env vars forwarded.
-  - `docs/backlog/61_replaced_stack_bench.md`: spec + design choices + honest caveats.
-  - `docs/backlog/backlog_index.md`: item 61 registered; next free → 62.
-  Compiler/test gates: 424 unit + 46 crash PASS; clippy -D warnings clean; fmt clean;
-  cargo tree confirms engine normal-edge graph stays tokio-free.
-  Pending: Docker run with `MM_REPLACED_STACK=1 MM_REPLACED_STACK_REALISTIC=1` to
-  capture actual Table 4 + 4.1 numbers for PROGRESS.md.
+- **Item 61 — True replaced-stack benchmark — SHIPPED 2026-07-17. PR #144 MERGED.**
+  `pg_replaced_stack_realistic_throughput`: 3×PG autocommit + 1 Redpanda produce
+  (separate Docker container, real inter-process TCP). Table 4.1 gated on
+  `MM_REPLACED_STACK_REALISTIC=1`. Redpanda v24.3.7 in docker-compose.yml.
+  Pending: Docker run to capture actual Table 4.1 numbers.
+
+- **Item 62 — IVF-Flat scale validation — IN PROGRESS 2026-07-17, branch
+  `62-ivf-scale-validation`. PR #145 pending.**
+  Bench `UNIDB_BENCH=ivf_validate`: creates IVF index AFTER insert (fixing nlist=1
+  empty-table artifact), measures recall@10/latency at 1k/10k/100k rows.
+  Results: recall@10 = 0.690/0.378/0.421; warm latency at 100k = 17ms.
+  Gate for item 63 (disk HNSW) is UNLOCKED.
 
 - **Item 60 — Event queue serde_json replacement — SHIPPED 2026-07-17, branch
   `60-event-queue-serde-json-fix`. PR pending.**
