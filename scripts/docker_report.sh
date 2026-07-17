@@ -34,6 +34,13 @@ export MM_SAMPLE="${MM_SAMPLE:-200}"
 # + graph + queue as four independent commits) + a crash-consistency verdict.
 # The compose file uses the pgvector image so the vector role can run.
 export MM_REPLACED_STACK="${MM_REPLACED_STACK:-}"
+# MM_REPLACED_STACK_REALISTIC=1 → Table 4.1 (item 61): the TRUE replaced-stack:
+# Postgres (row + pgvector + graph adjacency, three separate autocommit
+# connections) + Redpanda (separate Docker container, real TCP inter-process
+# latency) as the event queue leg. Demonstrates the overhead the conservative
+# PG-only proxy (MM_REPLACED_STACK=1) understates. Requires the redpanda
+# service (always started in compose regardless of this flag).
+export MM_REPLACED_STACK_REALISTIC="${MM_REPLACED_STACK_REALISTIC:-}"
 
 mkdir -p "$REPO_ROOT/docker/out"
 cd "$REPO_ROOT/docker"

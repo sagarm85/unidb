@@ -23,6 +23,14 @@
 #   MM_FK_ORDERS  order count for Table 5's PK/FK relational-integrity stress
 #               (default 20000) — a customers/orders schema with a real
 #               REFERENCES constraint, row-level-enforced on both engines.
+#   MM_REPLACED_STACK_REALISTIC=1  Table 4.1 (item 61): TRUE replaced-stack —
+#               Postgres (row + pgvector + graph adjacency) as three separate
+#               autocommit connections + Redpanda (separate process, real TCP
+#               round-trip) as the event queue leg. Requires REDPANDA_ADDR and
+#               a running Redpanda instance (see docker/docker-compose.yml).
+#               Without this flag only the conservative PG-only proxy runs.
+#   REDPANDA_ADDR  Redpanda/Kafka bootstrap address for Table 4.1
+#               (default localhost:9092)
 #   UNIDB_BUFFER_POOL_PAGES  frames for every unidb engine THIS BENCH opens
 #               (default 2,000,000 -- set internally by bench_engine_open() in
 #               decompose.rs, not the library's own smaller default). Only
@@ -77,6 +85,7 @@ esac
 SIZES_SHOWN="${MM_SIZES:-1000,10000,100000}"
 SAMPLE_SHOWN="${MM_SAMPLE:-200}"
 PG_SHOWN="$([[ -n "${PG_URL:-}" ]] && echo 'set (Postgres column measured)' || echo 'unset (Postgres column skipped)')"
+REALISTIC_SHOWN="$([[ "${MM_REPLACED_STACK_REALISTIC:-}" == "1" ]] && echo 'set (Table 4.1 realistic stack measured)' || echo 'unset (Table 4.1 skipped)')"
 
 BODY="$(mktemp)"; TIMEFILE="$(mktemp)"
 trap 'rm -f "$BODY" "$TIMEFILE"' EXIT
@@ -122,6 +131,7 @@ TIME_TAKEN="$(awk -v s="$ELAPSED_SECS" 'BEGIN{
   echo "| Sizes swept | $SIZES_SHOWN |"
   echo "| Marginal sample | $SAMPLE_SHOWN commits/point |"
   echo "| Postgres | $PG_SHOWN |"
+  echo "| Realistic stack (Table 4.1) | $REALISTIC_SHOWN |"
   echo "| Peak RSS | $RSS_MIB |"
   echo "| Time taken | $TIME_TAKEN (build + Tables 1-5; excludes the concurrency matrix appended below, timed separately) |"
   echo

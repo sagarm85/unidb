@@ -29,12 +29,41 @@ services:
       timeout: 3s
       retries: 40
 
+  # Item 61: Redpanda — Kafka-compatible event queue (no JVM, ~250 MiB RAM).
+  # Used as the "queue" leg in the TRUE replaced-stack comparison (Table 4.1)
+  # when MM_REPLACED_STACK_REALISTIC=1. A separate process from Postgres means
+  # the bench pays real inter-process TCP latency for the event-queue write,
+  # unlike the conservative proxy (which simulated the queue as a PG outbox
+  # table on the same server). Lightweight single-broker dev mode: 1 shard, no
+  # dashboard, no topic auto-creation (the bench creates the topic itself).
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.3.7
+    command: >
+      redpanda start
+      --overprovisioned
+      --smp 1
+      --memory 256M
+      --reserve-memory 0M
+      --no-dashboard
+      --check=false
+      --kafka-addr 0.0.0.0:9092
+      --advertise-kafka-addr redpanda:9092
+    healthcheck:
+      # rpk exits 0 when the cluster is healthy, non-zero otherwise.
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy: true'"]
+      interval: 3s
+      timeout: 10s
+      retries: 40
+      start_period: 10s
+
   bench:
     build:
       context: ..
       dockerfile: docker/Dockerfile
     depends_on:
       postgres:
+        condition: service_healthy
+      redpanda:
         condition: service_healthy
     environment:
       # Superuser conn (rust-postgres key=value form) — mmreport needs superuser
@@ -51,6 +80,15 @@ services:
       # Table 4 headline: add the §6 replaced-stack column (row + pgvector + graph
       # + queue, four independent commits) when set to 1. Needs the pgvector image.
       MM_REPLACED_STACK: "${MM_REPLACED_STACK:-}"
+      # Table 4.1 (item 61): TRUE replaced-stack — Postgres (row + pgvector +
+      # graph adjacency) as three separate autocommit connections + Redpanda
+      # (separate process, real TCP round-trip) as the event queue leg.
+      # Demonstrates real inter-process overhead absent from the conservative proxy.
+      # Set to 1 to enable; requires the redpanda service (always started above).
+      MM_REPLACED_STACK_REALISTIC: "${MM_REPLACED_STACK_REALISTIC:-}"
+      # Redpanda bootstrap address — the bench resolves this via Docker's internal
+      # DNS. Only needs changing if running outside the compose network.
+      REDPANDA_ADDR: "redpanda:9092"
       # Phase-window file on the shared /out volume — the host docker-stats
       # sampler correlates these windows to per-container CPU/mem (Part 2).
       MM_PHASES: "/out/phases.csv"
