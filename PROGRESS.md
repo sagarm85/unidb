@@ -6911,6 +6911,7 @@ phases.csv spot measurement on `58-hot-update` branch, Docker Linux aarch64).
 
 **Crash harness:** P59a + P59b added; 46/46 total PASS.  
 **Unit tests:** 412/412 PASS.  
+**Concurrency matrix:** 32/32 PASS (`docs/performance/conc_matrix_20260717_152612.md`, commit `585d991`).  
 **Clippy/fmt:** clean.
 
 **What changed:**
