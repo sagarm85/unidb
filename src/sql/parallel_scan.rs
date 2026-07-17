@@ -609,6 +609,101 @@ where
     Ok(total.load(Ordering::Relaxed))
 }
 
+/// Parallel heap scan for DELETE selected — collects matching `(RowId, raw_bytes)`
+/// pairs across workers (item 66).
+///
+/// Pattern mirrors [`parallel_count_matching`] but accumulates matches rather
+/// than counting them. Each worker maintains a thread-local
+/// `Vec<(RowId, Vec<u8>)>` (no mutex in the hot loop) and pushes it into the
+/// shared `parts` accumulator after its page slice is exhausted. After the pool
+/// completes the caller concatenates per-worker Vecs and sorts by
+/// `(page_id, slot)` — required by `Heap::delete_many`'s page-grouped WAL
+/// mini-txn logic (item 44 B5 invariant).
+///
+/// `matches` receives raw tuple bytes (already visibility-filtered by
+/// `scan_page_into`) and returns `Ok(true)` to keep the row, `Ok(false)` to
+/// skip it.
+///
+/// **Caller responsibility:** sort the returned Vec by `(RowId.page_id,
+/// RowId.slot)` before passing it to `Heap::delete_many`. The parallel workers
+/// process pages in arbitrary work-steal order, so the output is NOT sorted.
+pub fn parallel_collect_matching<F>(
+    pages: &[PageId],
+    reader: &SharedPageReader,
+    snapshot: &Snapshot,
+    self_xid: Xid,
+    degree: usize,
+    matches: &F,
+) -> Result<Vec<(RowId, Vec<u8>)>>
+where
+    F: Fn(&[u8]) -> Result<bool> + Sync,
+{
+    type Parts = Arc<Mutex<Vec<Vec<(RowId, Vec<u8>)>>>>;
+    let cursor = Arc::new(AtomicUsize::new(0));
+    let err: Arc<Mutex<Option<DbError>>> = Arc::new(Mutex::new(None));
+    let stop = Arc::new(AtomicBool::new(false));
+    let deadline = crate::query_limits::snapshot_deadline();
+    let parts: Parts = Arc::new(Mutex::new(Vec::new()));
+    let pages: Arc<[PageId]> = Arc::from(pages);
+    let reader = reader.clone();
+    let snapshot = snapshot.clone();
+
+    run_in_pool(degree, {
+        let cursor = Arc::clone(&cursor);
+        let err = Arc::clone(&err);
+        let stop = Arc::clone(&stop);
+        let parts = Arc::clone(&parts);
+        let pages = Arc::clone(&pages);
+        move || {
+            let mut local: Vec<(RowId, Vec<u8>)> = Vec::new();
+            let mut page_buf: Vec<(RowId, Vec<u8>)> = Vec::new();
+            'outer: while !stop.load(Ordering::Relaxed) {
+                let i = cursor.fetch_add(1, Ordering::Relaxed);
+                if i >= pages.len() {
+                    break;
+                }
+                if i.is_multiple_of(4) {
+                    if let Err(e) = deadline.check() {
+                        *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                        stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                page_buf.clear();
+                if let Err(e) =
+                    scan_page_into(&reader, pages[i], &snapshot, self_xid, &mut page_buf)
+                {
+                    *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
+                for (rid, bytes) in page_buf.drain(..) {
+                    match matches(&bytes) {
+                        Ok(true) => local.push((rid, bytes)),
+                        Ok(false) => {}
+                        Err(e) => {
+                            *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                            stop.store(true, Ordering::Relaxed);
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+            parts.lock().unwrap_or_else(|p| p.into_inner()).push(local);
+        }
+    });
+
+    let err_val = err.lock().unwrap_or_else(|p| p.into_inner()).take();
+    if let Some(e) = err_val {
+        return Err(e);
+    }
+    let mut all = Vec::new();
+    for part in std::mem::take(&mut *parts.lock().unwrap_or_else(|p| p.into_inner())) {
+        all.extend(part);
+    }
+    Ok(all)
+}
+
 /// Parallel GROUP BY partial aggregation for COUNT(*) (item 56 Step 1).
 ///
 /// Each worker maintains a local `HashMap<key_bytes, (key_literals, count)>` and

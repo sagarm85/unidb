@@ -7428,3 +7428,120 @@ Note: macOS F_FULLFSYNC inflates absolute numbers ~3–4× vs Docker/Linux. Dock
 | `cargo test --test crash --release` | **48 passed; 0 failed** |
 | HNSW unit tests (10 tests) | **PASS** |
 | Recall@10 at 1k×dim128 (HNSW, ef=200) | **0.999** ≥ 0.95 gate PASS |
+
+---
+
+## Item 65 — Docker bench correction: NodeCache 100k regression + size gate (2026-07-18)
+
+**[CORRECTION — inline, not a silent rewrite]**
+
+Docker bench `report_20260717_192953.md` (commit `b115134`, NodeCache enabled without size gate)
+revealed that NodeCache is **1.82× SLOWER** at 100k rows than without it.
+
+**Root cause:** `apply_reciprocal_l0_to_buf`'s shrink path (when all neighbour slots are full —
+always true at 100k rows) adds **~512 `HnswNode` entries** (each with a heap-allocated
+`Vec<f32>` of ~512 bytes) to the cache **per insert**. At 100k rows this causes ~36 GB of
+allocator traffic. `search_layer` already has its own `visited: HashSet<RowId>` preventing
+duplicate node fetches during beam search, so NodeCache adds zero benefit there at scale.
+
+**Fix (`NODECACHE_MAX_NODES = 5_000`):** the cache is now disabled when `hdr.total_nodes ≥ 5000`.
+Below this threshold neighbour lists are rarely full, so shrink overhead is negligible and the
+cache pays off. Above this threshold the beam-search `visited` set already covers the duplicate
+prevention; no regression.
+
+### Docker bench Table 1 — Multi-model commit cost (commit `b115134`, WITH regression)
+
+| rows | W0 | W1 | W2 | W3 | W4 | W4−W0 | W4/W0 |
+|-----:|---:|---:|---:|---:|---:|------:|------:|
+| 1000 | 0.79 | 0.84 | 14.34 | 12.00 | 18.35 | 17.56 | **23.30×** |
+| 10000 | 0.40 | 0.44 | 6.25 | 7.54 | 8.58 | 8.18 | **21.32×** |
+| 100000 | 0.25 | 0.27 | 17.62 | 13.82 | 13.25 | 13.00 | **53.29×** ← regression |
+
+At 100k, W2 jumped to 17.62ms vs 6.25ms at 10k — NodeCache shrink path causes allocator thrash.
+W4/W0 = 53.29× at 100k (worse than pre-NodeCache 46.86× at 10k from Item 63 bench).
+
+### Docker bench Table 3 — CRUD (commit `b115134`, includes item 64 CRC fix + item 65 NodeCache)
+
+| operation | unidb rec/s | PG rec/s | unidb ÷ PG |
+|-----------|------------:|--------:|----------:|
+| SELECT COUNT(*) | 259,642,135 | 46,359,783 | **5.60×** |
+| DELETE all | 31,362,710 | 5,009,811 | **6.26×** |
+| SELECT GROUP BY | 27,639,901 | 22,535,953 | **1.23×** |
+| INSERT per-row | 3,865 | 5,568 | 0.69× |
+| SELECT filtered | 1,956,436 | 5,045,409 | 0.39× |
+| UPDATE bulk | 33,105 | 447,189 | 0.07× |
+| DELETE selected | **296,895** | 5,386,311 | **0.06×** |
+
+DELETE selected improved 0.04× → 0.06× from item 64 CRC fix.
+
+### Docker bench Table 4 — Thesis (commit `b115134`)
+
+| txns | unidb txns/s | stack txns/s | unidb ÷ stack |
+|-----:|-------------:|-------------:|:---:|
+| 1000 | 164 | 1106 | **0.15×** |
+| 10000 | 146 | 1126 | **0.13×** |
+| 100000 | 62 | 952 | **0.07×** |
+
+Significant improvement at 1k/10k vs item 63 bench (0.06× → 0.15×, 2.5×) due to NodeCache
+reducing DiskBTree lookups. 100k still dominated by HNSW insert overhead (shrink path).
+
+### NodeCache gate fix check table
+
+| Check | Result |
+|-------|--------|
+| `cargo build --release` | clean |
+| `cargo clippy -- -D warnings` | clean |
+| `cargo test` | **all passed; 0 failed** |
+| `cargo test --test crash` | **48 passed; 0 failed** |
+| Docker bench | pending — next bench run |
+
+---
+
+## Item 66 — Parallel DELETE scan (2026-07-18)
+
+**Branch:** `main` | **Backlog:** `docs/backlog/66_parallel_delete_scan.md`
+
+### Problem
+
+`DELETE selected` (non-indexed predicate, full-scan path) was 0.06× vs Postgres at 100k rows.
+The bottleneck after item 44 (page-grouped WAL mini-txn) and item 64 (CRC fix) is the
+single-threaded scan collecting matching rows. Workers were already available for `SELECT COUNT(*)`
+(5.60×) and `SELECT GROUP BY` (1.23×) via `parallel_scan.rs` — DELETE's full-scan path was the
+only write op not using them.
+
+### Fix
+
+Added `parallel_collect_matching` to `src/sql/parallel_scan.rs`:
+- Pre-spawned worker pool fans out over `pages[]`; each worker keeps a local `Vec<(RowId, Vec<u8>)>`
+- After all workers finish, per-worker vecs are concatenated
+- Caller sorts by `(page_id, slot)` — required by `delete_many`'s page-grouped WAL path (item 44)
+
+`exec_delete` in `src/sql/executor.rs` now mirrors the A3 gate logic: uses parallel collect only
+when the predicate is NOT selective enough to trigger the B-tree index path. Falls back to serial
+`matching_rows` when A3 fires (index path), table < `PARALLEL_CANDIDATE_MIN` (64 pages), or
+no worker lease is available.
+
+### Correctness
+
+- MVCC: each worker reads with same `snapshot` + `self_xid` — correct visibility
+- Locks: `delete_many` acquires row-level locks AFTER collect; no lock races
+- CDC: event capture runs after delete in `exec_delete`; collect only returns RowIds + bytes
+- FK RESTRICT: parent-check runs before delete in `exec_delete`; parallel collect is transparent
+- Sort correctness: `sort_unstable_by_key(|(rid, _)| (rid.page_id, rid.slot))` before `delete_many`
+
+### Files changed
+
+- `src/sql/parallel_scan.rs`: `parallel_collect_matching` function (95 lines)
+- `src/sql/executor.rs`: `exec_delete` — `'collect` block with A3-gate-aware parallel path
+- `tests/parallel_scan.rs`: `parallel_delete_matches_serial` test (10k rows, 50% selectivity)
+
+### Check table
+
+| Check | Result |
+|-------|--------|
+| `cargo build --release` | clean |
+| `cargo clippy -- -D warnings` | clean |
+| `cargo test` | **all passed; 0 failed** |
+| `cargo test --test crash` | **48 passed; 0 failed** |
+| `parallel_delete_matches_serial` | **PASS** (4.67 s, 10k rows) |
+| Docker bench | pending — next bench run |

@@ -2675,7 +2675,75 @@ fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Resu
         return Ok(ExecResult::Deleted { count });
     }
 
-    let matching = matching_rows(&heap, &snapshot, ctx, &table_def, predicate)?;
+    // Item 66: parallel full-scan for DELETE selected. We bypass `matching_rows`
+    // and go straight to the pre-spawned worker pool when:
+    //   (a) the A3 cost-model would route to a full scan (non-selective predicate),
+    //   (b) the heap is large enough to benefit (≥ PARALLEL_CANDIDATE_MIN pages),
+    //   (c) a worker lease is available (global budget not exhausted).
+    // On any of those conditions failing we fall through to the proven serial path
+    // (`matching_rows`), which handles both the A3 index path and full-scan fallback.
+    let matching = 'collect: {
+        // Mirror A3 gate: if the index path would fire, let matching_rows handle it.
+        let use_a3 = predicate
+            .as_ref()
+            .and_then(|e| {
+                find_best_indexable_btree_predicate(
+                    e,
+                    &table_def,
+                    ctx.catalog.table_stats(&table_def.name),
+                )
+            })
+            .is_some_and(|hit| index_lookup_is_selective(&table_def, hit, ctx, false));
+
+        if !use_a3 {
+            let pages = heap.scan_pages(ctx.pool)?;
+            if pages.len() >= crate::sql::parallel_scan::PARALLEL_CANDIDATE_MIN {
+                if let Some(lease) =
+                    crate::sql::parallel_scan::acquire(pages.len())
+                {
+                    // Build the predicate closure for parallel workers.  Workers
+                    // only need to evaluate the WHERE predicate — they never decode
+                    // the full row (that happens in the pre-check / CDC pass below,
+                    // only for the matched subset).  This mirrors matching_rows's B2
+                    // path: deform only up to the last predicate column.
+                    let cols = &table_def.columns;
+                    let mut pred_col_indices: Vec<usize> = Vec::new();
+                    if let Some(pred) = predicate {
+                        expr_columns(pred, &table_def, &mut pred_col_indices);
+                    }
+                    let (pred_needed, pred_upto) =
+                        needed_mask(&pred_col_indices, cols.len());
+                    let has_pred = predicate.is_some();
+
+                    let mut out =
+                        crate::sql::parallel_scan::parallel_collect_matching(
+                            &pages,
+                            &ctx.pool.shared_reader(),
+                            &snapshot,
+                            ctx.xid,
+                            lease.degree(),
+                            &|bytes| {
+                                if has_pred {
+                                    let prow =
+                                        deform_row(bytes, cols, pred_upto, &pred_needed)?;
+                                    Ok(predicate_matches(predicate, cols, &prow)?)
+                                } else {
+                                    Ok(true)
+                                }
+                            },
+                        )?;
+                    // delete_many (item 44) groups rows by page_id and requires
+                    // (page_id, slot) order — parallel workers process pages in
+                    // work-steal order so we must sort before proceeding.
+                    out.sort_unstable_by_key(|(rid, _)| (rid.page_id, rid.slot));
+                    break 'collect out;
+                }
+            }
+        }
+        // Serial fallback: A3 index path, table too small, or no lease available.
+        matching_rows(&heap, &snapshot, ctx, &table_def, predicate)?
+    };
+
     // P1.d: the rows a DELETE selects are part of its read set (SSI).
     let read_ids: Vec<RowId> = matching.iter().map(|(rid, _)| *rid).collect();
     ctx.txn_mgr.ssi_note_reads(ctx.xid, &read_ids);

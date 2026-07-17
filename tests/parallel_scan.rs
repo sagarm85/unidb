@@ -222,6 +222,93 @@ fn parallel_scan_honors_cancellation() {
     );
 }
 
+/// Item 66 — parallel DELETE scan produces the same set of surviving rows as
+/// the serial path.
+///
+/// Uses a 50%-selective predicate (`k >= ROWS/2`) on an indexed column.  At
+/// ROWS=10_000 the table spans ~75 heap pages, which exceeds
+/// `PARALLEL_CANDIDATE_MIN` (64).  A3's cost model routes 50%-selective
+/// deletes to the full-scan path (index cost > scan cost at that selectivity),
+/// so the parallel worker path is taken when `parallel_scan` is enabled.
+///
+/// The test verifies the survivor set is identical regardless of the execution
+/// path — correctness is row identity, not just count.
+#[test]
+fn parallel_delete_matches_serial() {
+    const PROWS: i64 = 10_000; // ~75 heap pages at this size → above PARALLEL_CANDIDATE_MIN
+
+    fn build_large(engine: &Arc<Engine>) {
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE t (id INT, k INT, body TEXT)")
+            .unwrap();
+        engine
+            .execute_sql(x, "CREATE INDEX t_k ON t USING BTREE (k)")
+            .unwrap();
+        engine.commit(x).unwrap();
+        let ins = engine
+            .prepare("INSERT INTO t (id, k, body) VALUES ($1, $2, $3)")
+            .unwrap();
+        let mut x = engine.begin().unwrap();
+        for i in 0..PROWS {
+            engine
+                .execute_prepared(
+                    x,
+                    &ins,
+                    &[
+                        Literal::Int(i),
+                        Literal::Int(i),
+                        Literal::Text(format!("body-{i}")),
+                    ],
+                )
+                .unwrap();
+            if (i + 1) % 1000 == 0 {
+                engine.commit(x).unwrap();
+                x = engine.begin().unwrap();
+            }
+        }
+        engine.commit(x).unwrap();
+    }
+
+    // ── Serial baseline ──────────────────────────────────────────────────────
+    let dir_s = tempfile::tempdir().unwrap();
+    let serial_eng = Arc::new(Engine::open(dir_s.path(), 0).unwrap());
+    build_large(&serial_eng);
+
+    serial_eng.set_parallel_scan(false);
+    let x = serial_eng.begin().unwrap();
+    serial_eng
+        .execute_sql(x, &format!("DELETE FROM t WHERE k >= {}", PROWS / 2))
+        .unwrap();
+    serial_eng.commit(x).unwrap();
+    let serial_survivors = select(&serial_eng, "SELECT id FROM t");
+
+    // ── Parallel execution ────────────────────────────────────────────────────
+    let dir_p = tempfile::tempdir().unwrap();
+    let par_eng = Arc::new(Engine::open(dir_p.path(), 0).unwrap());
+    build_large(&par_eng);
+
+    par_eng.set_parallel_scan(true);
+    par_eng.set_parallel_scan_config(1, 4);
+    let x = par_eng.begin().unwrap();
+    par_eng
+        .execute_sql(x, &format!("DELETE FROM t WHERE k >= {}", PROWS / 2))
+        .unwrap();
+    par_eng.commit(x).unwrap();
+    let par_survivors = select(&par_eng, "SELECT id FROM t");
+
+    // Both paths must leave exactly the same rows alive.
+    assert_eq!(
+        serial_survivors.len() as i64,
+        PROWS / 2,
+        "serial: wrong survivor count"
+    );
+    assert_eq!(
+        par_survivors, serial_survivors,
+        "parallel DELETE must leave the same survivors as serial DELETE"
+    );
+}
+
 /// A parallel scan honors the statement snapshot exactly across an UPDATE (new
 /// version + superseded old counts once) and a DELETE (removed row uncounted).
 #[test]
