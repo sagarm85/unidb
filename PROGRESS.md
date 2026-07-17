@@ -6627,7 +6627,7 @@ this clean run).
 
 ## Item 56 Step 3 — WAL_XMAX_BATCH DELETE WAL framing   [SHIPPED]   2026-07-17
 
-**Branch:** `56-step3-delete-wal-batch`  **PR:** #137  **Date:** 2026-07-17
+**Branch:** `56-step3-delete-wal-batch`  **PR:** #137 MERGED  **Date:** 2026-07-17
 
 > Step 2 (UPDATE batching via `exec_update` gate + `Heap::update_many` caller) was
 > benchmarked and reverted in the same session. `Heap::update_many` stays in

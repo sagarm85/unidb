@@ -1,7 +1,7 @@
 # CRUD gap closure — write-path batching + parallel aggregation
 
 **Type:** Performance
-**Status:** IN PROGRESS — Step 1 SHIPPED 2026-07-16 (1.14× PG); Steps 2+3 SHIPPED 2026-07-17 (branch `56-step3-delete-wal-batch`, benchmark_20260717_074259.md); A6 PASS (DELETE WAL 72 B/row); A3/A4/A5 honest-miss — see PROGRESS.md for root-cause analysis; Step 4 gated
+**Status:** IN PROGRESS — Step 1 SHIPPED 2026-07-16 PR #136 (1.14× PG); Step 3 SHIPPED 2026-07-17 PR #137 MERGED (WAL_XMAX_BATCH, A6 PASS DELETE WAL 72 B/row, FORMAT_VERSION→6); Step 2 UPDATE batch benchmarked + reverted (3-decode-pass regression; `Heap::update_many` kept in heap.rs); Step 4 gated — see PROGRESS.md
 
 > Design/planning story produced 2026-07-16 under the §0.6 expert lens
 > (senior DB-internals review, code paths verified in `src/sql/executor.rs`,

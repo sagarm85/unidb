@@ -12,15 +12,13 @@
 
 ## Current status
 
-- **Item 56 Steps 2+3 — Heap::update_many + WAL_XMAX_BATCH — SHIPPED
-  2026-07-17, branch `56-step3-delete-wal-batch`. PR pending.**
-  Docker bench complete (`docs/performance/benchmark_20260717_074259.md`).
-  FORMAT_VERSION bumped 5→6 (WAL_XMAX_BATCH type 14; old builds get BadVersion
-  rather than silent misrecovery). Honest-miss: A3/A4/A5 not met (UPDATE batch
-  path adds 3 decode passes/row vs 1 per-row; structural not fixable here).
-  A6 PASS: DELETE WAL 72 B/row (≤80 target); DELETE throughput +40% (276k→388k).
-  42/42 crash tests; 408 unit tests; 28/28 conc matrix; clippy/fmt clean.
-  Step 4 (logical B-tree index WAL records) gated — deferred per plan.
+- **Item 56 Step 3 — WAL_XMAX_BATCH DELETE WAL framing — SHIPPED 2026-07-17,
+  PR #137 MERGED.** `exec_update` per-row path restored (batch UPDATE gate
+  benchmarked, showed 3-decode-pass regression to 0.02×, reverted). `Heap::update_many`
+  kept in `src/heap.rs` for Step 4. FORMAT_VERSION bumped 5→6. A6 PASS: DELETE WAL
+  72 B/row; DELETE +40% throughput. 42/42 crash; 408 tests; 32/32 conc matrix.
+  **Next:** Step 4 (logical B-tree index WAL records — largest remaining WAL reduction)
+  or the next backlog item per ROI order.
 
 - **Item 56 Step 1 — Parallel GROUP BY partial aggregation — SHIPPED
   2026-07-16, branch `56-crud-gap-write-batching-parallel-agg`,
