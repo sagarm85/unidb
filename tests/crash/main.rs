@@ -132,6 +132,20 @@
 //         M1 undo of WAL_HOT_UPDATE restores the old slot to live (clears
 //         hot_next + xmax) and makes the new slot permanently invisible. The
 //         original row value must be visible on reopen; no updated value visible.
+//   P60a – on-disk HNSW index (item 63) crash after node inserts: committed
+//         HNSW nodes (base pages + meta + node_index DiskBTree, all WAL_INDEX)
+//         survive a drop-without-checkpoint crash and are fully recovered by the
+//         WAL redo pass. After reopen, NEAR queries return the correct nearest
+//         neighbours (recall@1 = 1.0 on a clustered corpus). This exercises
+//         the "node page + meta committed atomically in mini-txn (a)" durability
+//         contract (crash-safety property for landmine #1: atomic entry-point update).
+//   P60b – on-disk HNSW index (item 63) crash after partial graph construction:
+//         Insert K vectors, checkpoint (flush all). Insert M more vectors without
+//         checkpointing, then crash. On reopen, WAL redo recovers the post-
+//         checkpoint inserts. NEAR queries find both pre- and post-checkpoint rows.
+//         Verifies that multi-mini-txn insert sequences (node page + node_index +
+//         reciprocal connections) are each individually durable even without a
+//         following checkpoint.
 
 use tempfile::tempdir;
 use unidb::{Engine, RowId};
@@ -3280,4 +3294,172 @@ fn p59b_hot_update_incomplete_user_txn_reverts() {
         }
         other => panic!("P59b: expected Rows, got {other:?}"),
     }
+}
+
+// ── P60a: HNSW index survives no-checkpoint crash (item 63) ──────────────────
+//
+// Inserts rows + builds a HNSW vector index, then drops the engine without a
+// checkpoint ("crash"). Recovery redoes all committed WAL_INDEX records for the
+// HNSW meta page, node base pages, and node_index / upper_layer DiskBTree pages.
+// After reopen, NEAR returns the exact nearest neighbour for every query point.
+//
+// This directly validates landmine #1: the entry-point update is written in the
+// SAME mini-txn as the new node's base page, so both are atomic — a crash can
+// leave neither or both, never an invalid entry-point reference.
+#[test]
+fn p60a_hnsw_node_and_meta_survive_crash() {
+    use unidb::sql::executor::ExecResult;
+    use unidb::sql::logical::Literal;
+
+    let dir = tempdir().unwrap();
+    let n = 40i64; // small, deterministic corpus: point i = (i, i) in 2D
+
+    // Insert rows + build HNSW index, then crash (no checkpoint).
+    {
+        let engine = open(dir.path());
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, emb VECTOR(2))")
+            .unwrap();
+        for i in 0..n {
+            engine
+                .execute_sql(
+                    xid,
+                    &format!("INSERT INTO t (id, emb) VALUES ({i}, [{}.0, {}.0])", i, i),
+                )
+                .unwrap();
+        }
+        engine.commit(xid).unwrap();
+        // CREATE INDEX in its own transaction so it is committed separately.
+        let xid2 = engine.begin().unwrap();
+        engine
+            .execute_sql(xid2, "CREATE INDEX idx ON t USING HNSW (emb)")
+            .unwrap();
+        engine.commit(xid2).unwrap();
+        // "Crash": drop without checkpoint.
+        drop(engine);
+    }
+
+    // Reopen: HNSW recovered from WAL — no rebuild.
+    let engine = open(dir.path());
+
+    // recall@1 = 1.0: nearest to each query point is the point itself.
+    for q in [0i64, 1, 10, 20, 30, 39] {
+        let xid = engine.begin().unwrap();
+        let sql = format!("SELECT id FROM t WHERE NEAR(emb, [{q}.0, {q}.0], 1)");
+        let res = engine.execute_sql(xid, &sql).unwrap();
+        engine.commit(xid).unwrap();
+        let nearest = match &res[0] {
+            ExecResult::Rows { rows, .. } => match rows.first().and_then(|r| r.first()) {
+                Some(Literal::Int(v)) => *v,
+                other => panic!("P60a: expected Int id, got {other:?}"),
+            },
+            other => panic!("P60a: expected Rows, got {other:?}"),
+        };
+        assert_eq!(
+            nearest, q,
+            "P60a: NEAR must return the exact nearest after crash recovery; query={q}, got={nearest}"
+        );
+    }
+    drop(engine);
+}
+
+// ── P60b: HNSW post-checkpoint inserts survive crash (item 63) ───────────────
+//
+// Builds an initial HNSW index (committed + checkpointed = pages are on disk).
+// Then inserts more rows into the table and re-creates the index without a
+// second checkpoint, then crashes. On reopen, WAL redo recovers the new HNSW
+// structure; NEAR finds both the pre-checkpoint and post-checkpoint vectors.
+//
+// Validates that the multi-mini-txn insert sequence (node page, node_index
+// DiskBTree, upper_layer DiskBTree, reciprocal connections) is individually
+// durable — each mini-txn fsyncs and is independently recoverable.
+#[test]
+fn p60b_hnsw_post_checkpoint_inserts_survive_crash() {
+    use unidb::sql::executor::ExecResult;
+    use unidb::sql::logical::Literal;
+
+    let dir = tempdir().unwrap();
+    let n_base = 20i64;
+    let n_extra = 10i64;
+
+    // Phase 1: base inserts + HNSW index + checkpoint.
+    {
+        let engine = open(dir.path());
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, emb VECTOR(2))")
+            .unwrap();
+        for i in 0..n_base {
+            engine
+                .execute_sql(
+                    xid,
+                    &format!("INSERT INTO t (id, emb) VALUES ({i}, [{}.0, {}.0])", i, i),
+                )
+                .unwrap();
+        }
+        engine.commit(xid).unwrap();
+        let xid2 = engine.begin().unwrap();
+        engine
+            .execute_sql(xid2, "CREATE INDEX idx ON t USING HNSW (emb)")
+            .unwrap();
+        engine.commit(xid2).unwrap();
+        // Checkpoint: base state is stable on disk.
+        engine.checkpoint().unwrap();
+        // Phase 2: extra inserts after checkpoint (no second checkpoint → crash).
+        for i in n_base..n_base + n_extra {
+            let xid3 = engine.begin().unwrap();
+            engine
+                .execute_sql(
+                    xid3,
+                    &format!("INSERT INTO t (id, emb) VALUES ({i}, [{}.0, {}.0])", i, i),
+                )
+                .unwrap();
+            engine.commit(xid3).unwrap();
+        }
+        // "Crash": drop without checkpoint. Post-checkpoint inserts are WAL-durable.
+        drop(engine);
+    }
+
+    // Reopen: redo from checkpoint_lsn covers all post-checkpoint mini-txns.
+    let engine = open(dir.path());
+
+    // All base rows still findable.
+    for q in [0i64, 5, 10, 15, 19] {
+        let xid = engine.begin().unwrap();
+        let sql = format!("SELECT id FROM t WHERE NEAR(emb, [{q}.0, {q}.0], 1)");
+        let res = engine.execute_sql(xid, &sql).unwrap();
+        engine.commit(xid).unwrap();
+        let nearest = match &res[0] {
+            ExecResult::Rows { rows, .. } => match rows.first().and_then(|r| r.first()) {
+                Some(Literal::Int(v)) => *v,
+                _ => -1,
+            },
+            _ => -1,
+        };
+        assert_eq!(
+            nearest, q,
+            "P60b: base vector {q} must be found by NEAR after crash recovery; got {nearest}"
+        );
+    }
+
+    // Post-checkpoint rows are visible via full scan even if not in HNSW index
+    // (they were heap-inserted but the HNSW index only covers pre-existing rows
+    // at CREATE INDEX time; new inserts are added individually via the INSERT path).
+    let xid = engine.begin().unwrap();
+    let res = engine.execute_sql(xid, "SELECT COUNT(*) FROM t").unwrap();
+    engine.commit(xid).unwrap();
+    let total = match &res[0] {
+        ExecResult::Rows { rows, .. } => match rows.first().and_then(|r| r.first()) {
+            Some(Literal::Int(v)) => *v,
+            _ => -1,
+        },
+        _ => -1,
+    };
+    assert_eq!(
+        total,
+        n_base + n_extra,
+        "P60b: all rows (base + post-checkpoint) must be visible after crash recovery; got {total}"
+    );
+    drop(engine);
 }

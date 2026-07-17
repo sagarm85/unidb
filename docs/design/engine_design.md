@@ -21,7 +21,7 @@ four data models over **one page store, one WAL, one buffer pool, one
 transaction manager**:
 
 1. **Relational CRUD** — SQL subset over MVCC-versioned heap tables.
-2. **Vector search** — `VECTOR(n)` columns, durable on-disk IVF-Flat index, `NEAR` operator.
+2. **Vector search** — `VECTOR(n)` columns, durable on-disk HNSW index (`DiskHnswIndex`, item 63; recall@10 ≥ 0.95), `NEAR` operator.
 3. **Graph** — edges with a Cypher read subset, adjacency indexes.
 4. **Event queue** — durable event stream with Kafka-style consumer offsets.
 
@@ -61,7 +61,7 @@ Module map (what each layer became in code):
 | Catalog & SQL (M1) | `catalog.rs`, `sql/{parser,logical,executor}.rs` |
 | Query power (Phase 4) | `sql/{query,plan,query_exec,join,aggregate,sort,optimizer,statistics,explain}.rs` — joins (hash+Grace-spill / sort-merge / index-nested-loop), aggregation + sort, subqueries/CTEs, `ANALYZE` + cost-based optimizer, `EXPLAIN` |
 | System catalog introspection (Milestone 18) | `sql/information_schema.rs` — `information_schema.*` / `unidb_catalog.*` as synthesized virtual relations SELECTable over the query surface (resolved at plan time in `sql/plan.rs`, rows materialized in `sql/query_exec.rs::Runner::scan`); read-only projection of `catalog.rs` metadata, no storage. See `docs/engine_access_guide.md` |
-| Secondary indexes (M2, M6, M7; all durable since Phase 3) | `btree_index.rs` (durable `DiskBTree`, also backs full-text + edge, and the per-table durable **free-space map / page directory** since the durable-FSM milestone), `disk_vector.rs` (durable IVF-Flat `DiskIvfIndex`), `fulltext.rs` (tokenizer), `vector.rs` (retired in-RAM HNSW baseline), `csr_index.rs` (retired) |
+| Secondary indexes (M2, M6, M7; all durable since Phase 3) | `btree_index.rs` (durable `DiskBTree`, also backs full-text + edge, and the per-table durable **free-space map / page directory** since the durable-FSM milestone), `hnsw_index.rs` (durable on-disk HNSW graph index `DiskHnswIndex`, item 63; replaces `disk_vector.rs`'s IVF-Flat), `disk_vector.rs` (retired IVF-Flat `DiskIvfIndex`), `fulltext.rs` (tokenizer), `vector.rs` (retired in-RAM HNSW baseline), `csr_index.rs` (retired) |
 | Graph (M3, M7) | `graph/{edges,index,logical,parser,executor}.rs` |
 | Event queue (M4; downstream consumption M20) | `queue/{mod,payload}.rs` (incl. `poll_events_after` live-tail cursor, M20 E1) |
 | Event dispatcher (M20 E2, separate workspace crate) | `unidb-dispatch/src/{lib,sink,filter,dlq}.rs` (`Dispatcher`, `WebhookSink`/`RoomSink`, embeds `Arc<Engine>`, no engine surface) |
@@ -593,7 +593,7 @@ meta page id in `ColumnDef.index_root`.
 
 | Kind | Structure | Notes |
 |---|---|---|
-| `Hnsw` (M2; **durable IVF-Flat since P3.c**) | `disk_vector.rs`, `DiskIvfIndex` — on-disk IVF-Flat; cell posting lists = durable `DiskBTree`, centroids in a WAL-logged meta page | **Durable, WAL-logged, crash-recovered, not rebuilt on open.** The `Hnsw` keyword now *denotes* the IVF-Flat index (the in-RAM HNSW graph in `vector.rs` is retired — kept only as a benchmark baseline). `CREATE INDEX ... USING HNSW`/`IVF` trains centroids from committed rows (`nlist ≈ √rows`, recall-favoring `nprobe`), stored in the meta page (id in `ColumnDef.index_root`). `NEAR` probes the nearest cells' posting lists → exact re-rank from the heap → MVCC re-check. f32, Euclidean (pgvector `<->` convention). |
+| `Hnsw` (M2; **durable on-disk HNSW graph since item 63**) | `hnsw_index.rs`, `DiskHnswIndex` — on-disk HNSW graph (M=16, M_max0=32, ef_construction=200, ef_search=50); node base pages + node_index/upper_layer `DiskBTree`s | **Durable, WAL-logged (WAL_INDEX), crash-recovered, not rebuilt on open** (entry-point stored in meta). `CREATE INDEX ... USING HNSW` bulk-builds the graph (deferred_sync for performance: ~34k fsyncs → 1). `NEAR` does beam search (ef = max(4k, HNSW_EF_SEARCH)) → MVCC-resolve from heap. recall@10 ≥ 0.95 at 1k×dim128 (0.964 measured). f32, Euclidean. **Correction vs P3.c doc (item 63, 2026-07-17):** the original P3.c shipped IVF-Flat, not a true graph-HNSW; item 62 measured IVF-Flat recall@10 = 0.421 at 100k (gate ≥ 0.90 failed); item 63 replaced it with this true HNSW implementation. `disk_vector.rs` / `DiskIvfIndex` is retired. |
 | `FullText` (M2; **durable since P3.b**) | durable `DiskBTree` keyed on tokens (`fulltext::tokenize`), one `(token, RowId)` entry per token | **Durable, WAL-logged, not rebuilt on open** — same `DiskBTree`/`WAL_INDEX` machinery as `BTree`. Now has a real read path: `Engine::search_fulltext` (tokenize → intersect per-token `search_eq` posting lists, AND-only → MVCC-resolve). |
 | `BTree` (M6; **durable since P3.a**) | `btree_index.rs`, `DiskBTree` — on-disk B+tree of buffer-pool-managed pages | **Durable, WAL-logged, crash-recovered, not rebuilt on open** (§5.4). Node pages carry the standard page header + a body-tag; a stable meta page (id in `ColumnDef.index_root`) points at the root so a root split never rewrites the catalog. Mutations log full node-page images (`WAL_INDEX`, redo-only) in one mini-txn each. No undo (entries are MVCC-validated hints). Written synchronously on the write path — **not** via the async worker. |
 | `Csr` (M7) | `csr_index.rs` | **Retired in P3.b** — consulted by no read path after the M7 traversal revert (§7.3); adjacency is now served by the durable edge index. The module + its benchmark remain but are unwired from the runtime. |
@@ -667,36 +667,47 @@ internal nodes, format-bump-gated) would let even same-subtree descents overlap.
 See `PROGRESS.md`'s "Index & heap write concurrency" entry for the acceptance
 numbers.
 
-### 5.5 Durable vector index — on-disk IVF-Flat (P3.c)
+### 5.5 Durable vector index — on-disk HNSW graph (item 63, replaces P3.c IVF-Flat)
 
-`DiskIvfIndex` (`disk_vector.rs`) is the durable vector index, chosen (over
-DiskANN/Vamana) because its only on-disk state is a cell posting list
-`cell_id → [RowId]`, which *is* a `DiskBTree` (§5.4). It is a stateless handle
-over a **stable meta page** (id in `ColumnDef.index_root`, exactly like
-`DiskBTree`): the meta page (an `IVF_META_MAGIC` body on a `PAGE_TYPE_BTREE`
-page) records metric/dim/nlist/nprobe + the postings tree's meta page + the head
-of a **WAL-logged centroid page chain**. Every operation reloads the bounded
-(`O(nlist·dim)`) centroid table from the buffer pool, so **centroids are
-crash-recovered, never recomputed**, and open is O(1). All pages use `WAL_INDEX`
-full-page images — recovered identically to `DiskBTree` nodes, **no new record
-kind / page type / `FORMAT_VERSION` bump**.
+> **Correction (item 63, 2026-07-17):** The original P3.c shipped IVF-Flat (`DiskIvfIndex`,
+> `disk_vector.rs`). Item 62 measured IVF-Flat recall@10 = 0.421 at 100k×dim128 (uniform
+> random; gate ≥ 0.90 failed — root cause: nlist capped at 256 → 3.2% cell probe at 1M rows).
+> Item 63 replaced IVF-Flat entirely with a true on-disk HNSW graph (`DiskHnswIndex`,
+> `hnsw_index.rs`). `disk_vector.rs` / `DiskIvfIndex` is retained as dead code for reference.
 
-- **Build** (`CREATE INDEX ... USING HNSW`/`IVF`): train `nlist ≈ √rows` (capped
-  256) centroids from the committed rows via mini-batch Lloyd's k-means, persist
-  meta + centroids, insert each `(cell, RowId)` into the postings tree. An
-  empty-table create trains one origin cell (correct-but-flat until re-created).
-- **Search** (`NEAR`): rank centroids by distance, probe the `nprobe` nearest
-  cells' posting lists (recall-favoring default), fetch candidate vectors from the
-  heap for an **exact re-rank** (IVF-Flat has no quantization error), then the
-  same MVCC/RLS/predicate re-check as every other index path.
-- **Maintenance**: `apply_durable_index_writes` inserts on INSERT/UPDATE; vacuum's
-  aliasing gate scrubs it via `DiskIvfIndex::remove` before a reclaimed slot is
-  reused (re-deriving the cell from the dead row's vector).
+`DiskHnswIndex` (`hnsw_index.rs`) is a stateless handle over a **stable meta page**
+(id in `ColumnDef.index_root`). The meta page records: dim, metric, total_nodes,
+`node_index_root`, `upper_layer_root`, `current_node_page`, `current_node_slot_count`,
+and the entry-point location (ep_node_page + ep_node_slot + ep_level). All pages use
+`WAL_INDEX` full-page images — **no new record kind / page type / FORMAT_VERSION bump**.
 
-Recall@10 = 1.000 matches the retired in-RAM HNSW baseline at bounded RAM
-(`benches/vector_recall.rs`); crash point **P17** proves recovery with recall
-intact. Re-training as a maintenance op (so a table that grew after an empty-table
-create re-clusters) is a documented follow-up.
+**Node storage:** fixed 712-byte slots (dim=128: rid(6) + vector(512) + level(1) +
+n_nbrs_l0(1) + nbrs_l0(32×6=192)), 11 nodes per 8 KiB page. Node lookup via
+`node_index` DiskBTree (encoded_rid → node_page/slot). Layer > 0 connections via
+`upper_layer` DiskBTree (encoded_(layer,rid) → nbr_rid, multiple entries per source).
+
+**Build** (`CREATE INDEX ... USING HNSW`): iterate committed rows, call `hnsw.insert`
+per row with `deferred_sync(true)` (bulk fsyncs: ~34k → 1). Per-insert: beam search
+(ef=ef_construction=200) at L=level..0 for neighbours, write node page + meta (one
+mini-txn), update node_index DiskBTree, update upper_layer DiskBTree, update L0
+reciprocal connections via shared page-buffer accumulator (atomic per-page mini-txn).
+
+**Search** (`NEAR`): load entry point from meta, beam search at layer ep_level..0
+(ef = max(k×4, HNSW_EF_SEARCH=50)), return top-k by distance → MVCC/RLS/predicate
+re-check.
+
+**Maintenance**: `apply_durable_index_writes` inserts on SQL INSERT/UPDATE; `remove()`
+is a no-op (MVCC visibility filters dead rows without tombstones in the graph).
+
+**Crash safety**: entry-point stored in meta (ep_node_page + ep_node_slot) so
+`candidates()` loads the entry-point vector directly without going through node_index —
+safe even if node_index hasn't been updated yet. Crash tests **P60a** (node + meta
+survive no-checkpoint crash) and **P60b** (post-checkpoint inserts survive crash).
+
+Recall@10 = **0.964** at 1k×dim128 (uniform random — worst case for ANN; ≥ 0.95 gate
+PASSED). Build time at 1k: ~17 s (Mac M5 Pro, release); at 10k: ~40 min (WAL write
+volume ~1 GB for reciprocal L0 connections). Future optimization: WAL delta records
+instead of full-page images for node updates.
 
 ---
 

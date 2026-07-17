@@ -419,11 +419,12 @@ query — illustrated:
 **The single most important fact in this section:** despite this project's
 dependency list including one third-party nearest-neighbor library, that
 library is used *only* by a retired, disconnected benchmark baseline that no
-query ever touches. The real, production vector index (`DiskIvfIndex`,
-`src/disk_vector.rs`) is entirely hand-written Rust — including its own
-clustering algorithm and distance math — and its posting lists are **the
-exact same B-tree structure** that backs every ordinary secondary index and
-full-text search. It was never built as a second database.
+query ever touches. The real, production vector index (`DiskHnswIndex`,
+`src/hnsw_index.rs`, item 63; replaces `DiskIvfIndex`/`disk_vector.rs` from P3.c)
+is entirely hand-written Rust — including its own graph build and beam-search —
+and its node index / upper-layer index use **the exact same B-tree structure**
+that backs every ordinary secondary index and full-text search. It was never
+built as a second database.
 
 And however many cells get probed, the *ranking* is never approximate: every
 candidate's distance is recomputed against its real, stored vector before

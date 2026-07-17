@@ -12,18 +12,28 @@
 
 ## Current status
 
+- **Item 63 — Disk-based HNSW index — SHIPPED 2026-07-17, branch `63-disk-hnsw`. PR #146.**
+  `src/hnsw_index.rs` — `DiskHnswIndex` replaces `DiskIvfIndex` for `IndexKind::Hnsw`.
+  Cache fix (2026-07-17): two-pass `exec_create_index` — pre-scan heap → `HashMap<i64,Vec<f32>>`
+  build_cache, then `insert_with_cache` uses O(1) cache for vector fetches during beam search.
+  Eliminates O(n²·log n) DiskBTree bottleneck. ef_search 50 → 200 to meet recall gates.
+  Results: recall@10 = 0.999 at 1k×dim128 (≥0.95 gate PASS); 0.947 at 10k×dim128 (≥0.90 PASS).
+  10k build: 53+ min → 4.6 min (14× speedup). 100k build: timed out at 10 min (remaining
+  bottleneck: neighbour page I/O during beam search, not vector lookups). ef_search=200, warm
+  NEAR latency: 8.30 ms at 1k, 25.19 ms at 10k.
+  Crash tests P60a + P60b: PASS. 669 tests PASS, 48 crash tests PASS. PR #146.
+
+- **Item 62 — IVF-Flat scale validation — SHIPPED 2026-07-17. PR #145 MERGED.**
+  Bench `UNIDB_BENCH=ivf_validate`: creates IVF index AFTER insert (fixing nlist=1
+  empty-table artifact), measures recall@10/latency at 1k/10k/100k rows.
+  Results: recall@10 = 0.690/0.378/0.421; warm latency at 100k = 17ms.
+  Gate for item 63 (disk HNSW) UNLOCKED. PR #145 merged 2026-07-17.
+
 - **Item 61 — True replaced-stack benchmark — SHIPPED 2026-07-17. PR #144 MERGED.**
   `pg_replaced_stack_realistic_throughput`: 3×PG autocommit + 1 Redpanda produce
   (separate Docker container, real inter-process TCP). Table 4.1 gated on
   `MM_REPLACED_STACK_REALISTIC=1`. Redpanda v24.3.7 in docker-compose.yml.
   Pending: Docker run to capture actual Table 4.1 numbers.
-
-- **Item 62 — IVF-Flat scale validation — IN PROGRESS 2026-07-17, branch
-  `62-ivf-scale-validation`. PR #145 pending.**
-  Bench `UNIDB_BENCH=ivf_validate`: creates IVF index AFTER insert (fixing nlist=1
-  empty-table artifact), measures recall@10/latency at 1k/10k/100k rows.
-  Results: recall@10 = 0.690/0.378/0.421; warm latency at 100k = 17ms.
-  Gate for item 63 (disk HNSW) is UNLOCKED.
 
 - **Item 60 — Event queue serde_json replacement — SHIPPED 2026-07-17, branch
   `60-event-queue-serde-json-fix`. PR pending.**
