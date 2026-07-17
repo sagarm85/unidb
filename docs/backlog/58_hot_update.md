@@ -1,7 +1,7 @@
 # HOT-equivalent UPDATE (item 58)
 
 **Type:** Performance
-**Status:** IN PROGRESS
+**Status:** SHIPPED (→ PROGRESS.md "Item 58 — HOT-equivalent UPDATE")
 
 > D4 sign-off recorded in PROGRESS.md 2026-07-17. Implementation branch:
 > `58-hot-update`. Honest ceiling: 0.07–0.09× PG (from 0.04×). See

@@ -12,11 +12,15 @@
 
 ## Current status
 
-- **Item 58 — HOT-equivalent UPDATE — IN PROGRESS, branch `58-hot-update` (2026-07-17).**
-  Implementation complete: FORMAT_VERSION 7→8, WAL_HOT_UPDATE (type 16), hot_next tuple
-  header field, try_hot_insert/undo_hot_update, HOT chain follow in get_visible, vacuum
-  B-tree patch for HOT heads, P59a/P59b crash tests. 412 unit tests, 46 crash tests,
-  clippy/fmt clean. Docker bench running; target UPDATE ≥0.07× PG (from 0.04×). PR pending.
+- **Item 58 — HOT-equivalent UPDATE — SHIPPED 2026-07-17, branch `58-hot-update`. PR pending.**
+  FORMAT_VERSION 7→8, WAL_HOT_UPDATE (type 16), hot_next tuple header field,
+  try_hot_insert (with FSM pre-screen fast-path for full pages), undo_hot_update,
+  HOT chain follow in get_visible, vacuum B-tree patch for HOT heads, P59a/P59b crash tests.
+  412 unit tests, 46 crash tests, clippy/fmt clean.
+  HONEST RESULT: UPDATE 0.043× PG at 100k packed rows (HOT fires only when pages have
+  free space; the bench table is packed to capacity → FSM pre-screen returns Ok(None)
+  immediately; no improvement at 100k rows, no regression). Target ≥0.07× NOT MET in
+  bench scenario — architecturally correct (HOT requires page slack). See PROGRESS.md.
 
 - **Item 56 Steps 2+3 — Heap::update_many + WAL_XMAX_BATCH — SHIPPED
   2026-07-17, branch `56-step3-delete-wal-batch`. PR pending.**
@@ -3515,8 +3519,14 @@ Crash harness: 46/46 (was 44/44). Unit tests: 412/412. Clippy/fmt clean.
 - HOT is ~12% faster on Mac due to fsync floor domination; Docker aarch64 bench needed for
   the honest comparison (Docker report running as of 2026-07-17).
 
-**Docker bench:** pending (`scripts/report.sh --docker` running, will update PROGRESS.md
-when results arrive). Target: UPDATE bulk ≥0.07× PG (from 0.04×).
+**Docker bench (2026-07-17, `58-hot-update` branch, aarch64 Linux):**
+- UPDATE unidb: 34,199 rec/s; Postgres: 793,651 rec/s → **0.043× PG** (essentially baseline 0.04×)
+- Honest-miss: ≥0.07× target NOT met at 100k rows (packed pages → HOT doesn't fire)
+- FSM pre-screen (second commit) prevented regression from the initial double mini-txn bug
+- HOT fires only when pages have free space; the bench table is packed to capacity
+- Full multi-model report pending (Table 1/2 still running in Docker at time of entry)
+- PROGRESS.md updated with measured result and honest-miss note.
+- Backlog doc `58_hot_update.md` status: SHIPPED. Backlog index updated. PR pending.
 
 ### 2026-07-17 — Item 56 Step 3: WAL_XMAX_BATCH record type
 
