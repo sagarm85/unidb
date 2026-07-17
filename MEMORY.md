@@ -12,6 +12,19 @@
 
 ## Current status
 
+- **Item 63 — Disk-based HNSW index — SHIPPED 2026-07-17, branch `63-disk-hnsw`.**
+  `src/hnsw_index.rs` — `DiskHnswIndex` replaces `DiskIvfIndex` for `IndexKind::Hnsw`.
+  Motivation: IVF-Flat recall@10 = 0.421 at 100k rows (gate ≥ 0.90; UNLOCKED by item 62).
+  Implementation: O(log N) HNSW beam search (ef_construction=200, ef_search=50, M=16,
+  M_max0=32); node base pages with fixed 712-byte slots (dim=128); node_index + upper_layer
+  DiskBTrees; entry-point stored directly in meta page (node_page + node_slot) for crash-safe
+  recovery; `remove()` intentionally no-op (MVCC visibility filters dead rows); reuses WAL_INDEX
+  (no FORMAT_VERSION bump). Wired into: `exec_create_index`, `apply_durable_index_writes`,
+  `exec_select_near`, `stage_row_index_writes_update`, vacuum paths. Crash tests P60a + P60b
+  added (48/48 crash tests PASS). 431 lib unit tests PASS. clippy/fmt CLEAN.
+  Pending: release-mode recall bench (cargo bench --bench decompose UNIDB_BENCH=ivf_validate
+  with HNSW backend), PROGRESS.md entry with recall/latency table, PR creation.
+
 - **Item 61 — True replaced-stack benchmark — SHIPPED 2026-07-17. PR #144 MERGED.**
   `pg_replaced_stack_realistic_throughput`: 3×PG autocommit + 1 Redpanda produce
   (separate Docker container, real inter-process TCP). Table 4.1 gated on

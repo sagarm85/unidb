@@ -42,10 +42,7 @@ fn recall_at_k_computation_correct() {
     );
 
     // Four misses: IVF returned 10-13 instead of 6-9.
-    let found: HashSet<i64> = [0, 1, 2, 3, 4, 5, 10, 11, 12, 13]
-        .iter()
-        .copied()
-        .collect();
+    let found: HashSet<i64> = [0, 1, 2, 3, 4, 5, 10, 11, 12, 13].iter().copied().collect();
     let expected: HashSet<i64> = (0..10).collect();
     let recall = found.intersection(&expected).count() as f64 / k as f64;
     assert!(
@@ -103,7 +100,11 @@ fn nlist_correct_when_index_created_after_insert() {
         let x = angle.sin() as f32;
         let y = angle.cos() as f32;
         engine
-            .execute_prepared(xid, &ins, &[Literal::Int(i as i64), Literal::Vector(vec![x, y])])
+            .execute_prepared(
+                xid,
+                &ins,
+                &[Literal::Int(i as i64), Literal::Vector(vec![x, y])],
+            )
             .unwrap();
         if (i + 1) % 100 == 0 {
             engine.commit(xid).unwrap();

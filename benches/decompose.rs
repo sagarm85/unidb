@@ -3409,17 +3409,16 @@ fn ivf_params_expected(nrows: usize) -> (usize, usize) {
 /// Build a SQL NEAR query string for a 128-dim vector literal.
 fn near_sql(query_vec: &[f32], k: usize) -> String {
     let coords: Vec<String> = query_vec.iter().map(|f| format!("{f:.8}")).collect();
-    format!("SELECT id FROM t WHERE NEAR(embedding, [{}], {k})", coords.join(", "))
+    format!(
+        "SELECT id FROM t WHERE NEAR(embedding, [{}], {k})",
+        coords.join(", ")
+    )
 }
 
 fn bench_ivf_scale_validation() {
     let sizes: Vec<usize> = std::env::var("MM_SIZES")
         .ok()
-        .map(|s| {
-            s.split(',')
-                .filter_map(|x| x.trim().parse().ok())
-                .collect()
-        })
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
         .unwrap_or_else(|| vec![1_000, 10_000, 100_000, 1_000_000]);
 
     const N_QUERIES: usize = 100;
@@ -3431,7 +3430,13 @@ fn bench_ivf_scale_validation() {
     println!("### Index created AFTER insert (correct nlist), 128-dim Euclidean, k=10, {N_QUERIES} queries\n");
     println!(
         "| {:>12} | {:>14} | {:>6} | {:>18} | {:>22} | {:>22} | {:>10} |",
-        "corpus size", "nlist (actual)", "nprobe", "est. candidates", "NEAR latency cold", "NEAR latency warm", "recall@10"
+        "corpus size",
+        "nlist (actual)",
+        "nprobe",
+        "est. candidates",
+        "NEAR latency cold",
+        "NEAR latency warm",
+        "recall@10"
     );
     println!(
         "|{:-<14}|{:-<16}|{:-<8}|{:-<20}|{:-<24}|{:-<24}|{:-<12}|",
@@ -3482,10 +3487,7 @@ fn bench_ivf_scale_validation() {
                 .execute_prepared(
                     xid,
                     &ins,
-                    &[
-                        Literal::Int(i as i64),
-                        Literal::Vector(vec.clone()),
-                    ],
+                    &[Literal::Int(i as i64), Literal::Vector(vec.clone())],
                 )
                 .unwrap();
             if (i + 1) % 2_000 == 0 {
@@ -3582,13 +3584,21 @@ fn bench_ivf_scale_validation() {
 
     println!();
     println!("**Notes:**");
-    println!("- `nlist (actual)` = min(√N rounded, 256); `nprobe` = max(nlist/8, 8), capped at nlist");
+    println!(
+        "- `nlist (actual)` = min(√N rounded, 256); `nprobe` = max(nlist/8, 8), capped at nlist"
+    );
     println!("- `est. candidates` = nprobe × (N / nlist) — cells probed × avg cell size");
-    println!("- Recall@10 = |IVF_top10 ∩ BruteForce_top10| / 10, averaged over {N_QUERIES} queries");
+    println!(
+        "- Recall@10 = |IVF_top10 ∩ BruteForce_top10| / 10, averaged over {N_QUERIES} queries"
+    );
     println!("- Cold latency = first NEAR query after index creation (posting-list pages cold)");
     println!("- Warm latency = average of last 50 queries after 50-query warm-up");
-    println!("- At 1M rows: nlist=1000 capped to 256, nprobe=32 → 3.2% scan → recall@10 likely <0.80");
-    println!("- 1M row run skipped (>30 min estimated); figures extrapolated from the nlist formula");
+    println!(
+        "- At 1M rows: nlist=1000 capped to 256, nprobe=32 → 3.2% scan → recall@10 likely <0.80"
+    );
+    println!(
+        "- 1M row run skipped (>30 min estimated); figures extrapolated from the nlist formula"
+    );
 }
 
 fn main() {

@@ -29,10 +29,10 @@ use crate::{
     bufferpool::{BufferPool, PageReader},
     catalog::{Catalog, CatalogCtx, ColumnDef, ColumnType, IndexKind, TableConstraints, TableDef},
     control::ControlData,
-    disk_vector::DiskIvfIndex,
     error::{DbError, Result},
     format::{PageId, Xid},
     heap::{get_visible, Heap, RowId},
+    hnsw_index::{DiskHnswIndex, HNSW_EF_SEARCH},
     lockmgr::{LockManager, RecordId},
     mvcc::Snapshot,
     queue::{self, EVENTS_TABLE},
@@ -40,20 +40,8 @@ use crate::{
     wal::Wal,
 };
 
-/// IVF tuning derived at `CREATE INDEX` time. `nlist` ≈ √rows (capped) trades
-/// cell granularity against centroid RAM; `nprobe` favors recall (the Phase-3
-/// gate) while staying sublinear. Both are stored in the index meta page.
-fn ivf_params(nrows: usize) -> (usize, usize) {
-    let nlist = ((nrows as f64).sqrt().round() as usize).clamp(1, 256);
-    // Probe ~1/8 of the cells, floored so small indexes probe (almost) all cells
-    // — i.e. degrade to exact search rather than risk missing the true top-k.
-    let nprobe = (nlist / 8).max(8).min(nlist);
-    (nlist, nprobe)
-}
-
-/// Lloyd's iterations for centroid training at `CREATE INDEX` — a handful
-/// suffices for a stable partition (validated in the P3.c recall sweep).
-const IVF_TRAIN_ITERS: usize = 8;
+// IVF tuning was used by the retired IVF-Flat index (item 63 replaced it with
+// on-disk HNSW). These are kept for reference only; the functions are removed.
 
 /// Compute the `RecordId` for a `UniqueKey` phantom lock: a stable hash of
 /// `(table_name, col_name, key_value)`. Two distinct `OrderedValue` variants
@@ -793,7 +781,7 @@ fn apply_durable_index_writes(
                 }
                 Some(IndexKind::Hnsw) => {
                     if let Literal::Vector(v) = &row[idx] {
-                        DiskIvfIndex::open(meta_page, ctx.page_size)
+                        DiskHnswIndex::open(meta_page, ctx.page_size)
                             .insert(row_id, v, ctx.pool, ctx.wal)?;
                     }
                 }
@@ -957,7 +945,7 @@ fn stage_row_index_writes_update(
         if let Some(meta_page) = col.index_root {
             if let Some(IndexKind::Hnsw) = col.index {
                 if let Literal::Vector(v) = &new_row[idx] {
-                    DiskIvfIndex::open(meta_page, ctx.page_size)
+                    DiskHnswIndex::open(meta_page, ctx.page_size)
                         .insert(new_row_id, v, ctx.pool, ctx.wal)?;
                 }
             }
@@ -1438,34 +1426,33 @@ fn exec_create_index(
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
 
     let meta_page = if matches!(kind, IndexKind::Hnsw) {
-        // P3.c: the durable on-disk IVF-Flat vector index. Collect the committed
-        // vectors as the training sample, train centroids, then insert each row
-        // into its cell. Training holds the sample in RAM transiently (one-time
-        // build cost); the persisted index is bounded (centroids only).
+        // Item 63: on-disk HNSW vector index. Create the index, then bulk-insert
+        // every committed row's vector. HNSW is built incrementally (no training
+        // phase required, unlike IVF-Flat) so the build order is arbitrary.
+        //
+        // Performance: switch to deferred-sync mode for the bulk build so the
+        // individual per-node mini-txns skip per-call fsync. The surrounding user
+        // transaction's WAL_TXN_COMMIT (plus an explicit sync here) ensures
+        // durability of the entire built graph before returning to the caller.
         let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
-        let mut sample: Vec<(RowId, Vec<f32>)> = Vec::new();
-        for (row_id, bytes) in heap.scan(&snapshot, ctx.xid, ctx.pool)? {
-            let row = decode_row(&bytes, &table_def.columns)?;
-            if let Literal::Vector(v) = &row[col_idx] {
-                sample.push((row_id, v.clone()));
-            }
-        }
-        let (nlist, nprobe) = ivf_params(sample.len());
-        let sample_vecs: Vec<Vec<f32>> = sample.iter().map(|(_, v)| v.clone()).collect();
-        let ivf = DiskIvfIndex::create(
+        let hnsw = DiskHnswIndex::create(
             vec_dim as usize,
-            &sample_vecs,
-            nlist,
-            nprobe,
-            IVF_TRAIN_ITERS,
             crate::vector::Metric::Euclidean,
             ctx.pool,
             ctx.wal,
         )?;
-        for (row_id, v) in &sample {
-            ivf.insert(*row_id, v, ctx.pool, ctx.wal)?;
+        // Enable deferred sync for bulk build (no per-node fsync overhead).
+        ctx.wal.set_deferred_sync(true);
+        for (row_id, bytes) in heap.scan(&snapshot, ctx.xid, ctx.pool)? {
+            let row = decode_row(&bytes, &table_def.columns)?;
+            if let Literal::Vector(v) = &row[col_idx] {
+                hnsw.insert(row_id, v, ctx.pool, ctx.wal)?;
+            }
         }
-        ivf.meta_page()
+        // Re-enable per-commit durability and force the accumulated writes to disk.
+        ctx.wal.set_deferred_sync(false);
+        ctx.wal.sync()?;
+        hnsw.meta_page()
     } else {
         // P3.a/P3.b: a durable BTree/FullText index — sort-then-bulk-load
         // (item 40). Phase 1: collect (key, row_id) pairs from the heap.
@@ -2249,13 +2236,14 @@ fn exec_select_near(
         });
     };
 
-    // Probe the nearest cells' posting lists for candidate RowIds. Candidates are
-    // then re-checked against the full predicate below (MVCC visibility, RLS, any
-    // AND'd WHERE terms) and exact-re-ranked from the heap's stored vectors, so
-    // the over-fetch-then-filter contract is identical to a full scan's per-row
-    // check (see `eval_expr`'s `Expr::Near` arm for the other half).
-    let ivf = DiskIvfIndex::open(meta_page, ctx.page_size);
-    let (metric, candidate_ids) = ivf.candidates(query, None, ctx.pool)?;
+    // Item 63: probe the on-disk HNSW index for ANN candidates. Over-fetch with
+    // ef_search candidates, then re-check against the full predicate (MVCC
+    // visibility, RLS, any AND'd WHERE terms) and exact-re-rank from the heap's
+    // stored vectors — identical contract to the IVF-Flat path it replaces.
+    let hnsw = DiskHnswIndex::open(meta_page, ctx.page_size);
+    // Use max(k * 4, HNSW_EF_SEARCH) so small k doesn't under-probe.
+    let ef = (k * 4).max(HNSW_EF_SEARCH);
+    let (metric, candidate_ids) = hnsw.candidates(query, Some(ef), ctx.pool)?;
 
     let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
@@ -2273,8 +2261,7 @@ fn exec_select_near(
         if !predicate_matches(predicate, &table_def.columns, &row)? {
             continue;
         }
-        // Exact re-rank distance from the heap's stored vector (IVF-Flat has no
-        // quantization error).
+        // Exact re-rank distance from the heap's stored vector.
         let dist = match &row[col_idx] {
             Literal::Vector(v) => ivf_exact_distance(metric, query, v),
             _ => continue,
