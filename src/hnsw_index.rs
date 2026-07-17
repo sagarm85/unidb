@@ -476,6 +476,24 @@ impl Ord for DistRid {
     }
 }
 
+// ── Node cache (per-insert, scoped) ──────────────────────────────────────────
+
+/// Cache of decoded `HnswNode` structs keyed by encoded RowId
+/// (`rid.page_id as i64 * 65536 + rid.slot as i64`).
+///
+/// Created fresh for each `insert_incremental` call and dropped at its end.
+/// This eliminates repeated DiskBTree lookups + page fetches for nodes that
+/// are visited multiple times during beam search (ef_construction=200 visits
+/// O(ef·M) ≈ 3 200 node loads per insert; many are revisited across layers).
+///
+/// The cache is NEVER shared across insert calls: between separate transactions
+/// the graph may have changed and stale cached neighbours would be incorrect.
+type NodeCache = HashMap<i64, HnswNode>;
+
+fn encode_rid(rid: RowId) -> i64 {
+    (rid.page_id as i64) * 65536 + rid.slot as i64
+}
+
 // ── DiskHnswIndex ─────────────────────────────────────────────────────────────
 
 /// On-disk HNSW index. Stateless handle over its stable meta page id — holds no
@@ -602,29 +620,78 @@ impl DiskHnswIndex {
         }
     }
 
-    /// Fetch a vector, checking `build_cache` first (O(1)) before falling back
-    /// to the DiskBTree lookup (O(log n)).  The cache is keyed by the same
-    /// `i64` encoding as `encode_rid_key` but unwrapped to a plain integer for
-    /// direct HashMap access.
+    /// Fetch a vector, checking caches first before hitting disk.
+    ///
+    /// Priority:
+    /// 1. `build_cache` — the bulk-build vector HashMap (immutable; keyed by encoded RowId).
+    /// 2. `node_cache` — the per-insert node struct cache (mutable; populates on miss).
+    /// 3. Disk — DiskBTree lookup + page fetch, populates `node_cache` as a side effect.
+    ///
+    /// Populating `node_cache` on disk miss means each node is fetched at most once
+    /// per insert call: its full struct (vector + L0 nbrs) is cached so the subsequent
+    /// `get_l0_nbrs` call for the same node (when it becomes a candidate) is free.
     fn fetch_vector_cached(
         &self,
         rid: RowId,
         hdr: &HnswHeader,
         pool: &BufferPool,
         build_cache: Option<&HashMap<i64, Vec<f32>>>,
+        node_cache: Option<&mut NodeCache>,
     ) -> Result<Option<Vec<f32>>> {
+        let key = encode_rid(rid);
+        // 1. Vector build_cache (bulk build path, keyed by encoded RowId i64).
         if let Some(cache) = build_cache {
-            let key = (rid.page_id as i64) * 65536 + rid.slot as i64;
             if let Some(v) = cache.get(&key) {
                 return Ok(Some(v.clone()));
             }
+        }
+        // 2. Per-insert node cache (incremental insert path).
+        if let Some(cache) = node_cache {
+            if let Some(node) = cache.get(&key) {
+                return Ok(Some(node.vector.clone()));
+            }
+            // Cache miss: load full node from disk, store in cache for future use
+            // (both vector and L0 nbrs — when this node is later expanded as a
+            // candidate, get_l0_nbrs will find it already cached).
+            if let Some((np, ns)) = self.find_node_loc(rid, hdr.node_index_root, pool)? {
+                let node = self.load_node_at(np, ns, hdr.dim, pool)?;
+                let vec = node.vector.clone();
+                cache.insert(key, node);
+                return Ok(Some(vec));
+            }
+            return Ok(None);
         }
         self.fetch_vector_via_index(rid, hdr, pool)
     }
 
     // ── Layer-0 neighbour retrieval ─────────────────────────────────────────
 
-    fn get_l0_nbrs(&self, rid: RowId, hdr: &HnswHeader, pool: &BufferPool) -> Result<Vec<RowId>> {
+    /// Get layer-0 neighbours for `rid`, checking `node_cache` before hitting disk.
+    fn get_l0_nbrs(
+        &self,
+        rid: RowId,
+        hdr: &HnswHeader,
+        pool: &BufferPool,
+        node_cache: Option<&mut NodeCache>,
+    ) -> Result<Vec<RowId>> {
+        if let Some(cache) = node_cache {
+            // Use the cached node struct if available; populate it otherwise.
+            // `entry().or_insert_with()` can't be used here because the init
+            // is fallible (`?`), so we check + insert explicitly.
+            let key = encode_rid(rid);
+            #[allow(clippy::map_entry)]
+            if !cache.contains_key(&key) {
+                // Cache miss: fetch node and populate cache.
+                if let Some((np, ns)) = self.find_node_loc(rid, hdr.node_index_root, pool)? {
+                    let node = self.load_node_at(np, ns, hdr.dim, pool)?;
+                    cache.insert(key, node);
+                } else {
+                    return Ok(vec![]);
+                }
+            }
+            return Ok(cache.get(&key).map(|n| n.nbrs_l0.clone()).unwrap_or_default());
+        }
+        // No cache: plain disk lookup.
         match self.find_node_loc(rid, hdr.node_index_root, pool)? {
             Some((np, ns)) => Ok(self.load_node_at(np, ns, hdr.dim, pool)?.nbrs_l0),
             None => Ok(vec![]),
@@ -661,6 +728,11 @@ impl DiskHnswIndex {
     /// Returns at most `ef` nearest candidates, sorted ascending by distance.
     /// Entry point: (`entry`, `entry_dist`) — caller must have already computed
     /// this distance.
+    ///
+    /// `node_cache`: optional per-insert node struct cache (see `NodeCache`).
+    /// When `Some`, nodes are fetched once (DiskBTree + page) and stored; every
+    /// subsequent visit within the same insert's beam search returns from memory.
+    /// The cache accumulates nodes across all `search_layer` calls for one insert.
     #[allow(clippy::too_many_arguments)]
     fn search_layer(
         &self,
@@ -672,6 +744,7 @@ impl DiskHnswIndex {
         hdr: &HnswHeader,
         pool: &BufferPool,
         build_cache: Option<&HashMap<i64, Vec<f32>>>,
+        mut node_cache: Option<&mut NodeCache>,
     ) -> Result<Vec<(f32, RowId)>> {
         let mut visited: HashSet<RowId> = HashSet::new();
         visited.insert(entry);
@@ -701,7 +774,7 @@ impl DiskHnswIndex {
 
             // Expand cand_rid's neighbours at this layer.
             let nbrs = if layer == 0 {
-                self.get_l0_nbrs(cand_rid, hdr, pool)?
+                self.get_l0_nbrs(cand_rid, hdr, pool, node_cache.as_deref_mut())?
             } else {
                 self.get_upper_nbrs(cand_rid, layer, hdr.upper_layer_root, pool)?
             };
@@ -711,7 +784,10 @@ impl DiskHnswIndex {
                     continue;
                 }
                 visited.insert(nbr);
-                let vec = match self.fetch_vector_cached(nbr, hdr, pool, build_cache)? {
+                // fetch_vector_cached takes &mut NodeCache and populates it on miss.
+                // The mutable borrow from get_l0_nbrs (above) has ended (it returned
+                // an owned Vec), so reborrowing node_cache here is safe.
+                let vec = match self.fetch_vector_cached(nbr, hdr, pool, build_cache, node_cache.as_deref_mut())? {
                     Some(v) => v,
                     None => continue,
                 };
@@ -757,6 +833,7 @@ impl DiskHnswIndex {
         pool: &BufferPool,
         page_bufs: &mut HashMap<PageId, Vec<u8>>,
         build_cache: Option<&HashMap<i64, Vec<f32>>>,
+        mut node_cache: Option<&mut NodeCache>,
     ) -> Result<()> {
         let Some((node_page, slot_idx)) = self.find_node_loc(target, hdr.node_index_root, pool)?
         else {
@@ -788,17 +865,15 @@ impl DiskHnswIndex {
             node.nbrs_l0.push(new_rid);
         } else {
             // Heuristic shrink: keep M_max0 nearest neighbours.
-            let new_vec = self.fetch_vector_cached(new_rid, hdr, pool, build_cache)?;
-            let mut all: Vec<(f32, RowId)> = node
-                .nbrs_l0
-                .iter()
-                .filter_map(|&n| {
-                    self.fetch_vector_cached(n, hdr, pool, build_cache)
-                        .ok()
-                        .flatten()
-                        .map(|v| (hnsw_distance(hdr.metric, &node.vector, &v), n))
-                })
-                .collect();
+            // Fetch all vectors sequentially (not in a closure) to allow &mut borrows.
+            let new_vec = self.fetch_vector_cached(new_rid, hdr, pool, build_cache, node_cache.as_deref_mut())?;
+            let nbrs_snapshot: Vec<RowId> = node.nbrs_l0.clone();
+            let mut all: Vec<(f32, RowId)> = Vec::with_capacity(nbrs_snapshot.len() + 1);
+            for &n in &nbrs_snapshot {
+                if let Some(v) = self.fetch_vector_cached(n, hdr, pool, build_cache, node_cache.as_deref_mut())? {
+                    all.push((hnsw_distance(hdr.metric, &node.vector, &v), n));
+                }
+            }
             if let Some(nv) = new_vec {
                 let d_new = hnsw_distance(hdr.metric, &node.vector, &nv);
                 all.push((d_new, new_rid));
@@ -868,6 +943,15 @@ impl DiskHnswIndex {
             )));
         }
 
+        // Per-insert node cache: eliminates repeated DiskBTree lookups + page
+        // fetches for nodes visited multiple times during beam search.
+        // Only used on the incremental (non-bulk-build) path; when build_cache is
+        // Some, all vectors are already in memory so node-page fetches are rare.
+        // Dropped at end of this function — NEVER shared across insert calls.
+        let mut node_cache: NodeCache = NodeCache::new();
+        // nc is a convenience alias; only used when build_cache.is_none().
+        let use_node_cache = build_cache.is_none();
+
         let level = Self::assign_level(hdr.total_nodes);
 
         // ── Phase 1: greedy descent to find insertion entry point ─────────
@@ -886,8 +970,9 @@ impl DiskHnswIndex {
         // Descend from ep_level to level+1 (greedy, ef=1 per layer).
         if hdr.has_entry_point && level < hdr.ep_level as usize {
             for lyr in (level + 1..=hdr.ep_level as usize).rev() {
+                let nc_opt = if use_node_cache { Some(&mut node_cache) } else { None };
                 let result =
-                    self.search_layer(ep_rid, ep_dist, vector, 1, lyr, &hdr, pool, build_cache)?;
+                    self.search_layer(ep_rid, ep_dist, vector, 1, lyr, &hdr, pool, build_cache, nc_opt)?;
                 if let Some(&(d, r)) = result.first() {
                     if d < ep_dist {
                         ep_dist = d;
@@ -912,6 +997,7 @@ impl DiskHnswIndex {
 
         if hdr.has_entry_point {
             for lyr in (0..=top_layer).rev() {
+                let nc_opt = if use_node_cache { Some(&mut node_cache) } else { None };
                 let cands = self.search_layer(
                     ep_cur,
                     ep_d_cur,
@@ -921,6 +1007,7 @@ impl DiskHnswIndex {
                     &hdr,
                     pool,
                     build_cache,
+                    nc_opt,
                 )?;
                 let m_lim = if lyr == 0 { HNSW_M_MAX0 } else { HNSW_M };
                 let selected = Self::select_neighbours(&cands, m_lim);
@@ -1029,6 +1116,7 @@ impl DiskHnswIndex {
         {
             let mut reciprocal_bufs: HashMap<PageId, Vec<u8>> = HashMap::new();
             for &nbr_rid in &l0_nbrs {
+                let nc_opt: Option<&mut NodeCache> = if use_node_cache { Some(&mut node_cache) } else { None };
                 self.apply_reciprocal_l0_to_buf(
                     nbr_rid,
                     rid,
@@ -1036,6 +1124,7 @@ impl DiskHnswIndex {
                     pool,
                     &mut reciprocal_bufs,
                     build_cache,
+                    nc_opt,
                 )?;
             }
             for (rec_page, rec_buf) in reciprocal_bufs {
@@ -1062,20 +1151,19 @@ impl DiskHnswIndex {
                         upper.insert(encode_layer_rid_key(lyr, nbr_rid), rid, pool, wal)?;
                     } else {
                         // Heuristic shrink at upper layer.
-                        let nbr_vec =
-                            match self.fetch_vector_cached(nbr_rid, &hdr, pool, build_cache)? {
-                                Some(v) => v,
-                                None => continue,
-                            };
-                        let mut all: Vec<(f32, RowId)> = cur_nbrs
-                            .iter()
-                            .filter_map(|&n| {
-                                self.fetch_vector_cached(n, &hdr, pool, build_cache)
-                                    .ok()
-                                    .flatten()
-                                    .map(|v| (hnsw_distance(hdr.metric, &nbr_vec, &v), n))
-                            })
-                            .collect();
+                        // Fetch vectors sequentially (not in a closure) to allow &mut NodeCache.
+                        let nc_opt: Option<&mut NodeCache> = if use_node_cache { Some(&mut node_cache) } else { None };
+                        let nbr_vec = match self.fetch_vector_cached(nbr_rid, &hdr, pool, build_cache, nc_opt)? {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        let mut all: Vec<(f32, RowId)> = Vec::with_capacity(cur_nbrs.len() + 1);
+                        for &n in &cur_nbrs {
+                            let nc_opt2: Option<&mut NodeCache> = if use_node_cache { Some(&mut node_cache) } else { None };
+                            if let Some(v) = self.fetch_vector_cached(n, &hdr, pool, build_cache, nc_opt2)? {
+                                all.push((hnsw_distance(hdr.metric, &nbr_vec, &v), n));
+                            }
+                        }
                         let d_new = hnsw_distance(hdr.metric, &nbr_vec, vector);
                         all.push((d_new, rid));
                         all.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -1135,7 +1223,7 @@ impl DiskHnswIndex {
 
         // Greedy descent from ep_level to 1.
         for lyr in (1..=hdr.ep_level as usize).rev() {
-            let res = self.search_layer(ep, ep_dist, query, 1, lyr, &hdr, pool, None)?;
+            let res = self.search_layer(ep, ep_dist, query, 1, lyr, &hdr, pool, None, None)?;
             if let Some(&(d, r)) = res.first() {
                 if d < ep_dist {
                     ep_dist = d;
@@ -1145,7 +1233,7 @@ impl DiskHnswIndex {
         }
 
         // Beam search at layer 0.
-        let result = self.search_layer(ep, ep_dist, query, ef.max(1), 0, &hdr, pool, None)?;
+        let result = self.search_layer(ep, ep_dist, query, ef.max(1), 0, &hdr, pool, None, None)?;
         Ok((hdr.metric, result.into_iter().map(|(_, r)| r).collect()))
     }
 

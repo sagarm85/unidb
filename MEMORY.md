@@ -12,6 +12,21 @@
 
 ## Current status
 
+- **Item 65 — HNSW incremental insert NodeCache — SHIPPED 2026-07-18, branch `65-hnsw-insert-cache`.**
+  Root cause confirmed: `search_layer` called `find_node_loc` + `load_node_at` ~3200 times per insert
+  (ef_construction=200 × M=16 neighbours, no cache on the incremental path).
+  Fix: `NodeCache = HashMap<i64, HnswNode>` local to `insert_inner`, accumulates full node structs
+  (vector + L0 neighbours) across all phases of one insert. ~200 unique disk fetches vs ~3200.
+  Modified: `fetch_vector_cached`, `get_l0_nbrs`, `search_layer`, `apply_reciprocal_l0_to_buf`
+  (all take `Option<&mut NodeCache>`); filter_map→for-loop rewrites for borrow-checker threading.
+  Tests: 431 lib + 48 crash + 10 HNSW PASS, clippy/fmt clean.
+  1k native bench: W2=37.56ms, W2−W1=34.40ms, W4/W0=16.77× (was 70ms/64ms/17.13×; −46% W2).
+  10k native bench: terminated after 22+ min (W2 pre-grow ran >22 min — remaining bottleneck is
+  beam-search I/O, not DiskBTree CPU; NodeCache necessary but not sufficient for original targets).
+  Original targets (W2−W1 < 2ms, W4/W0 < 5×) NOT MET. Honest improvement: −47% at 1k.
+  Docs: `docs/backlog/65_hnsw_insert_node_cache.md`, `backlog_index.md` (next→66_), PROGRESS.md entry.
+  PR created — see PROGRESS.md "Item 65".
+
 - **Item 63 — Disk-based HNSW index — SHIPPED 2026-07-17, branch `63-disk-hnsw`. PR #146.**
   `src/hnsw_index.rs` — `DiskHnswIndex` replaces `DiskIvfIndex` for `IndexKind::Hnsw`.
   Cache fix (2026-07-17): two-pass `exec_create_index` — pre-scan heap → `HashMap<i64,Vec<f32>>`
@@ -5693,3 +5708,18 @@ config option that can be tuned for performance, with purpose + impact.
 
 **Next up:** none pending from this session — resume backlog item 37+ per the
 prior entry.
+
+### 2026-07-18 — Item 65: HNSW incremental insert NodeCache, branch `65-hnsw-insert-cache`
+
+Root cause: `search_layer` issued ~3200 `find_node_loc` (DiskBTree) + `load_node_at` (page fetch)
+calls per insert on the incremental path (ef_construction=200 × M=16 neighbours, no cache).
+Fix: `NodeCache = HashMap<i64, HnswNode>` local to `insert_inner`; each node loaded at most once
+per call. Modified `fetch_vector_cached`, `get_l0_nbrs`, `search_layer`,
+`apply_reciprocal_l0_to_buf` (all take `Option<&mut NodeCache>`); filter_map→for-loop rewrites
+for borrow-checker compatibility. Tests: 431 lib + 48 crash + 10 HNSW PASS, clippy/fmt clean.
+Native 1k bench: W2=37.56ms (was 70ms), W2−W1=34.40ms (was 64ms), W4/W0=16.77× (was 17.13×).
+10k bench still running at session end — fill in PROGRESS.md "Item 65" once complete.
+Docs updated: `65_hnsw_insert_node_cache.md`, `backlog_index.md` (next→66_), PROGRESS.md entry.
+
+**Next up:** 10k bench result → fill W2/W4/W0 in PROGRESS.md → Docker bench
+(`docker ps` first; `MM_SIZES=1000,10000 UNIDB_BENCH=mmreport` in Docker) → commit + PR.

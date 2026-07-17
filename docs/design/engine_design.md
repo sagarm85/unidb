@@ -691,6 +691,16 @@ per row with `deferred_sync(true)` (bulk fsyncs: ~34k → 1). Per-insert: beam s
 (ef=ef_construction=200) at L=level..0 for neighbours, write node page + meta (one
 mini-txn), update node_index DiskBTree, update upper_layer DiskBTree, update L0
 reciprocal connections via shared page-buffer accumulator (atomic per-page mini-txn).
+Bulk build uses a pre-scanned `HashMap<i64,Vec<f32>>` vector cache (O(1) lookup vs
+O(log n) DiskBTree per vector during beam search) — see `insert_with_cache`.
+
+**Incremental insert** (`apply_durable_index_writes` on SQL INSERT, item 65): each call
+to `insert_inner` creates a local `NodeCache = HashMap<i64, HnswNode>` (full node struct:
+vector + L0 neighbours). On first access to any node during beam search, the node is
+fetched from disk and cached; subsequent accesses in the same insert hit cache in O(1).
+Reduces DiskBTree lookups from ef×M ≈ 200×16 = **~3200 per insert** to **~200 unique
+fetches**. Cache is dropped at end of `insert_inner` — never shared across inserts
+(graph changes between transactions make stale nodes incorrect).
 
 **Search** (`NEAR`): load entry point from meta, beam search at layer ep_level..0
 (ef = max(k×4, HNSW_EF_SEARCH=50)), return top-k by distance → MVCC/RLS/predicate
@@ -704,10 +714,11 @@ is a no-op (MVCC visibility filters dead rows without tombstones in the graph).
 safe even if node_index hasn't been updated yet. Crash tests **P60a** (node + meta
 survive no-checkpoint crash) and **P60b** (post-checkpoint inserts survive crash).
 
-Recall@10 = **0.964** at 1k×dim128 (uniform random — worst case for ANN; ≥ 0.95 gate
-PASSED). Build time at 1k: ~17 s (Mac M5 Pro, release); at 10k: ~40 min (WAL write
-volume ~1 GB for reciprocal L0 connections). Future optimization: WAL delta records
-instead of full-page images for node updates.
+Recall@10 = **0.999** at 1k×dim128, **0.947** at 10k×dim128 (uniform random — worst
+case for ANN; ≥ 0.95 / ≥ 0.90 gates PASSED). Build time at 1k: ~17 s (Mac M5 Pro,
+release); at 10k: ~4.6 min (item 63 vector cache); at 100k: timed out at 10 min
+(remaining bottleneck: neighbour page I/O during beam search). Future optimization:
+WAL delta records instead of full-page images for node updates; offline bulk-build.
 
 ---
 
