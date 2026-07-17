@@ -74,6 +74,20 @@ pub enum UndoAction {
         old_rid: RowId,
         new_rid: RowId,
     },
+    /// An atomic HOT update (item 58): same-page xmax + hot_next on old_slot +
+    /// insert at new_slot. Undo calls `Heap::undo_hot_update` to restore both
+    /// slots in the correct two-phase order (new-slot deletion first, then
+    /// old-slot xmax/hot_next clear).
+    ///
+    /// Replaces the two separate `XmaxStamp + Insert` actions that a
+    /// cross-page UPDATE would generate — the page is shared, and the
+    /// clearing order must be new-slot-first, then old-slot (see P59b crash
+    /// test and recovery.rs undo for WAL_HOT_UPDATE).
+    HotUpdate {
+        page_id: PageId,
+        old_slot: u16,
+        new_slot: u16,
+    },
 }
 
 pub struct Transaction {
@@ -635,6 +649,16 @@ impl TransactionManager {
                         pool,
                         wal,
                     )?;
+                }
+                // Item 58 HOT update undo: new-slot first (make invisible),
+                // then old-slot (clear hot_next + restore to live). Order
+                // matters — see crash test P59b and recovery.rs undo comment.
+                UndoAction::HotUpdate {
+                    page_id,
+                    old_slot,
+                    new_slot,
+                } => {
+                    heap.undo_hot_update(*page_id, *old_slot, *new_slot, xid, pool, wal)?;
                 }
             }
         }

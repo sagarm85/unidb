@@ -49,8 +49,8 @@ use crate::{
     format::{
         u16_from_le, u16_to_le, u32_from_le, u32_to_le, u64_from_le, u64_to_le, Lsn, PageId, Xid,
         INVALID_LSN, WAL_ABORT, WAL_BEGIN, WAL_CHECKPOINT, WAL_COMMIT, WAL_DELETE, WAL_FPI,
-        WAL_INDEX, WAL_INDEX_INSERT, WAL_INSERT, WAL_TXN_ABORT, WAL_TXN_BEGIN, WAL_TXN_COMMIT,
-        WAL_UPDATE, WAL_VACUUM, WAL_XMAX_BATCH,
+        WAL_HOT_UPDATE, WAL_INDEX, WAL_INDEX_INSERT, WAL_INSERT, WAL_TXN_ABORT, WAL_TXN_BEGIN,
+        WAL_TXN_COMMIT, WAL_UPDATE, WAL_VACUUM, WAL_XMAX_BATCH,
     },
 };
 
@@ -689,6 +689,62 @@ impl Wal {
             page_id,
             n_slots = n,
             "WAL XMAX_BATCH"
+        );
+        Ok(lsn)
+    }
+
+    /// Log an atomic HOT update (item 58 — same-page xmax-stamp + HOT forwarding
+    /// pointer + new-version insert). `old_slot` is the chain-head slot (where
+    /// the B-tree still points). `new_slot` is the new version's slot on the
+    /// SAME page. `insert_redo` is the standard WAL_INSERT redo payload for the
+    /// new version (i.e. `encode_insert_redo(xid, prev, payload)`).
+    ///
+    /// WAL header `slot` = `old_slot` (the chain head).
+    ///
+    /// redo payload: xid (8 B LE) || old_slot (2 B LE) || new_slot (2 B LE)
+    ///               || insert_redo (variable)
+    ///
+    /// undo payload: old_slot (2 B LE) || new_slot (2 B LE)
+    ///   Undo: (1) delete new slot; (2) clear hot_next on old slot; (3) clear xmax on old slot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_hot_update(
+        &self,
+        txn_id: u64,
+        prev_lsn: Lsn,
+        page_id: PageId,
+        xid: Xid,
+        old_slot: u16,
+        new_slot: u16,
+        insert_redo: &[u8],
+    ) -> Result<Lsn> {
+        // redo: xid || old_slot || new_slot || insert_redo
+        let mut redo = Vec::with_capacity(12 + insert_redo.len());
+        redo.extend_from_slice(&u64_to_le(xid));
+        redo.extend_from_slice(&u16_to_le(old_slot));
+        redo.extend_from_slice(&u16_to_le(new_slot));
+        redo.extend_from_slice(insert_redo);
+        // undo: old_slot || new_slot
+        let mut undo = Vec::with_capacity(4);
+        undo.extend_from_slice(&u16_to_le(old_slot));
+        undo.extend_from_slice(&u16_to_le(new_slot));
+        let mut inner = self.lock();
+        let lsn = append_locked(
+            &mut inner,
+            txn_id,
+            prev_lsn,
+            WAL_HOT_UPDATE,
+            page_id,
+            old_slot,
+            &redo,
+            &undo,
+        )?;
+        tracing::trace!(
+            mini_txn_id = txn_id,
+            lsn,
+            page_id,
+            old_slot,
+            new_slot,
+            "WAL HOT_UPDATE"
         );
         Ok(lsn)
     }

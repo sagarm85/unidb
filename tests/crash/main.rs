@@ -122,6 +122,16 @@
 //         txn never commits. M1 undo self-stamps every inserted heap row so
 //         it is permanently invisible. Stale index entries are filtered by
 //         heap MVCC visibility — no rows visible on reopen.
+//   P59a – HOT update WAL durable, page not flushed (item 58): a HOT update
+//         (WAL_HOT_UPDATE durable via mini-txn commit fsync) "crashes" before
+//         the page is checkpointed. Recovery's WAL_HOT_UPDATE redo arm re-applies
+//         the xmax-stamp + hot_next + new slot, so a WHERE query via the B-tree
+//         follows the HOT chain and returns the updated row value.
+//   P59b – HOT update + incomplete user txn (item 58): per-stmt mini-txn commits
+//         (WAL_HOT_UPDATE durable), but the enclosing user txn never commits.
+//         M1 undo of WAL_HOT_UPDATE restores the old slot to live (clears
+//         hot_next + xmax) and makes the new slot permanently invisible. The
+//         original row value must be visible on reopen; no updated value visible.
 
 use tempfile::tempdir;
 use unidb::{Engine, RowId};
@@ -3110,5 +3120,164 @@ fn p58b_index_insert_incomplete_user_txn_rows_invisible() {
             );
         }
         other => panic!("P58b: expected Rows, got {other:?}"),
+    }
+}
+
+// ── P59a: HOT update WAL durable, page not flushed (item 58) ────────────────
+//
+// Insert a row in a table with an index on a non-updated column, HOT-update it,
+// then "crash" (WAL durable, page not flushed via no-checkpoint drop).
+// On reopen, recovery's WAL_HOT_UPDATE redo arm re-applies:
+//   (a) xmax stamp on old slot,
+//   (b) hot_next forwarding pointer on old slot,
+//   (c) new-version insert at new slot.
+// A subsequent query via the B-tree (index on `id`) follows the HOT chain and
+// returns the updated value.
+//
+// Pattern: single-session (INSERT + UPDATE in one Engine open).
+#[test]
+fn p59a_hot_update_wal_durable_page_not_flushed() {
+    use unidb::sql::logical::Literal;
+
+    let dir = tempdir().unwrap();
+
+    // Phase 1: insert a row + HOT-update it. Per-statement fsync: WAL durable.
+    {
+        let engine = open(dir.path());
+        let x = engine.begin().unwrap();
+        // Table: `id` is indexed (non-updated), `body` is not indexed (SET target).
+        engine
+            .execute_sql(x, "CREATE TABLE t (id INT, body TEXT)")
+            .unwrap();
+        // CREATE INDEX after table creation to match HOT eligibility setup.
+        engine.commit(x).unwrap();
+
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE INDEX idx ON t USING BTREE (id)")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        // Deferred sync OFF → each mini-txn commit fsyncs immediately.
+        engine.set_deferred_sync(false);
+
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "INSERT INTO t VALUES (42, 'original')")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        // HOT-eligible UPDATE: SET body (not indexed), WHERE id=42 (indexed → B-tree).
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "UPDATE t SET body = 'updated' WHERE id = 42")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        // "Crash": drop without checkpoint. WAL is durable; heap pages may not be.
+        drop(engine);
+    }
+
+    // Phase 2: reopen. Recovery replays WAL_HOT_UPDATE. B-tree still points to
+    // old slot; HOT chain follow in get_visible finds the new version.
+    let engine = open(dir.path());
+    let x = engine.begin().unwrap();
+    let result = engine
+        .execute_sql(x, "SELECT body FROM t WHERE id = 42")
+        .unwrap();
+    engine.commit(x).unwrap();
+    drop(engine);
+
+    match &result[0] {
+        unidb::SqlResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1, "P59a: expected exactly one row");
+            assert_eq!(
+                rows[0][0],
+                Literal::Text("updated".to_owned()),
+                "P59a: HOT-updated value must survive crash (WAL durable) and be found via B-tree chain"
+            );
+        }
+        other => panic!("P59a: expected Rows, got {other:?}"),
+    }
+}
+
+// ── P59b: HOT update + incomplete user txn (item 58) ────────────────────────
+//
+// Insert a committed row, then start a user transaction that HOT-updates it
+// (per-stmt mini-txn commits durably) but the user txn is never committed
+// (no WAL_TXN_COMMIT — simulates a crash mid-txn). On reopen, M1 undo of
+// the WAL_HOT_UPDATE restores the old slot to live (clears hot_next + xmax)
+// and makes the new slot permanently invisible.
+//
+// Assertion: the original value is visible on reopen; no updated value.
+//
+// Pattern: single-session (INSERT + incomplete UPDATE in one Engine open).
+#[test]
+fn p59b_hot_update_incomplete_user_txn_reverts() {
+    use unidb::sql::logical::Literal;
+
+    let dir = tempdir().unwrap();
+
+    // Phase 1: insert a committed row, then HOT-update inside an incomplete txn.
+    {
+        let engine = open(dir.path());
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE t (id INT, body TEXT)")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE INDEX idx ON t USING BTREE (id)")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        // Per-stmt fsync ON so WAL records are durable before we drop.
+        engine.set_deferred_sync(false);
+
+        // Committed insert: original value.
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "INSERT INTO t VALUES (7, 'original')")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        // Incomplete user txn: HOT update is WAL-durable but user txn is NOT committed.
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "UPDATE t SET body = 'should_be_invisible' WHERE id = 7")
+            .unwrap();
+        // No commit — "crash" with this user txn open. WAL_TXN_COMMIT never written.
+        drop(engine);
+    }
+
+    // Phase 2: reopen. Recovery runs M1 user-txn undo for the incomplete txn:
+    // - Deletes the new (HOT) slot → self-stamps it xmax = xid.
+    // - Clears hot_next on old slot (restores HOT_NEXT_NONE).
+    // - Clears xmax on old slot (restores to live).
+    // Result: old slot is live again; new slot is invisible.
+    let engine = open(dir.path());
+    let x = engine.begin().unwrap();
+    let result = engine
+        .execute_sql(x, "SELECT body FROM t WHERE id = 7")
+        .unwrap();
+    engine.commit(x).unwrap();
+    drop(engine);
+
+    match &result[0] {
+        unidb::SqlResult::Rows { rows, .. } => {
+            assert_eq!(
+                rows.len(),
+                1,
+                "P59b: expected exactly one row (the original)"
+            );
+            assert_eq!(
+                rows[0][0],
+                Literal::Text("original".to_owned()),
+                "P59b: original value must be restored after HOT undo; updated value must be invisible"
+            );
+        }
+        other => panic!("P59b: expected Rows, got {other:?}"),
     }
 }

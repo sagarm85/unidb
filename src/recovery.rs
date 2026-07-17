@@ -14,9 +14,10 @@ use crate::{
     control::{self, ControlData},
     error::{DbError, Result},
     format::{
-        u16_from_le, u32_from_le, u64_from_le, Xid, INVALID_LSN, WAL_ABORT, WAL_BEGIN,
-        WAL_CHECKPOINT, WAL_COMMIT, WAL_DELETE, WAL_FPI, WAL_INDEX, WAL_INDEX_INSERT, WAL_INSERT,
-        WAL_TXN_ABORT, WAL_TXN_BEGIN, WAL_TXN_COMMIT, WAL_UPDATE, WAL_VACUUM, WAL_XMAX_BATCH,
+        u16_from_le, u32_from_le, u64_from_le, Xid, HOT_NEXT_NONE, INVALID_LSN, WAL_ABORT,
+        WAL_BEGIN, WAL_CHECKPOINT, WAL_COMMIT, WAL_DELETE, WAL_FPI, WAL_HOT_UPDATE, WAL_INDEX,
+        WAL_INDEX_INSERT, WAL_INSERT, WAL_TXN_ABORT, WAL_TXN_BEGIN, WAL_TXN_COMMIT, WAL_UPDATE,
+        WAL_VACUUM, WAL_XMAX_BATCH,
     },
     heap::{decode_insert_redo, RowId},
     page::SlottedPage,
@@ -142,6 +143,7 @@ pub fn recover(
                 || r.rec_type == WAL_UPDATE
                 || r.rec_type == WAL_DELETE
                 || r.rec_type == WAL_XMAX_BATCH
+                || r.rec_type == WAL_HOT_UPDATE
         })
         .copied()
         .collect();
@@ -196,7 +198,9 @@ pub fn recover(
         // Handles both the per-row WAL_UPDATE path and the batched
         // WAL_XMAX_BATCH path (item 56 Step 3).
         for r in relevant.iter().filter(|r| {
-            (r.rec_type == WAL_UPDATE || r.rec_type == WAL_XMAX_BATCH)
+            (r.rec_type == WAL_UPDATE
+                || r.rec_type == WAL_XMAX_BATCH
+                || r.rec_type == WAL_HOT_UPDATE)
                 && committed.contains(&r.mini_txn_id)
         }) {
             if r.rec_type == WAL_UPDATE {
@@ -209,7 +213,7 @@ pub fn recover(
                         stats.records_undone += 1;
                     }
                 }
-            } else {
+            } else if r.rec_type == WAL_XMAX_BATCH {
                 // WAL_XMAX_BATCH: redo[0..8] = xid, redo[8..10] = n_slots,
                 // redo[10..] = slot array.
                 if let Ok((new_xmax, slots)) = decode_xmax_batch_redo(&r.redo) {
@@ -226,6 +230,33 @@ pub fn recover(
                         stats.records_undone += 1;
                     }
                 }
+            } else {
+                // WAL_HOT_UPDATE: redo[0..8] = xid, redo[8..10] = old_slot,
+                // redo[10..12] = new_slot. Undo: clear hot_next + xmax on old slot,
+                // delete new slot.
+                if let Ok((new_xmax, old_slot, new_slot, _)) = decode_hot_update_redo(&r.redo) {
+                    if incomplete_user_txns.contains(&new_xmax) {
+                        let mut page = fetch_or_create(&pool, r.page_id, page_size)?;
+                        // Delete new slot (phase 1 — make new version invisible).
+                        match page.delete(new_slot) {
+                            Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
+                            Err(e) => return Err(e),
+                        }
+                        // Clear hot_next on old slot (phase 2a).
+                        match page.set_hot_next(old_slot, HOT_NEXT_NONE) {
+                            Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
+                            Err(e) => return Err(e),
+                        }
+                        // Clear xmax on old slot (phase 2b — restore to live).
+                        match page.set_xmax(old_slot, 0) {
+                            Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
+                            Err(e) => return Err(e),
+                        }
+                        pool.write_page(&page)?;
+                        pool.unpin(r.page_id);
+                        stats.records_undone += 1;
+                    }
+                }
             }
         }
         // Phase 2: force-self-stamp every row this xid inserted (INSERT, or
@@ -234,6 +265,10 @@ pub fn recover(
         // later re-superseded within its own transaction ends up dead
         // (self-stamped) rather than incorrectly live (reverted to 0 by an
         // earlier phase-1 stamp targeting the same slot).
+        //
+        // Note: for WAL_HOT_UPDATE, the new version's xmin IS the acting xid;
+        // it was already handled in the loop above (we deleted the slot directly
+        // instead of self-stamping, which is equivalent). No separate entry here.
         for r in relevant.iter().filter(|r| {
             r.rec_type == WAL_INSERT && r.slot != u16::MAX && committed.contains(&r.mini_txn_id)
         }) {
@@ -393,6 +428,40 @@ fn redo_record(r: &WalRecord, pool: &BufferPool, page_size: usize) -> Result<()>
             pool.write_page(&page)?;
             pool.unpin(r.page_id);
         }
+        WAL_HOT_UPDATE => {
+            // item 58: atomic same-page HOT update. One WAL record covers:
+            //   (a) xmax stamp on old slot, (b) hot_next pointer in old slot,
+            //   (c) new-version insert at new slot — all on the same page.
+            //
+            // redo payload: xid (8 B) || old_slot (2 B) || new_slot (2 B)
+            //               || insert_redo (variable, same layout as WAL_INSERT redo)
+            //
+            // LSN-gated: skip if page.lsn() >= record.lsn.
+            let (xid, old_slot, new_slot, insert_redo) = decode_hot_update_redo(&r.redo)?;
+            let mut page = fetch_or_create(pool, r.page_id, page_size)?;
+            if page.lsn() >= r.lsn {
+                pool.unpin(r.page_id);
+                return Ok(());
+            }
+            // (a) xmax-stamp the old slot.
+            match page.set_xmax(old_slot, xid) {
+                Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
+                Err(e) => return Err(e),
+            }
+            // (b) set hot_next forwarding pointer on old slot.
+            match page.set_hot_next(old_slot, new_slot) {
+                Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
+                Err(e) => return Err(e),
+            }
+            // (c) insert the new version at new_slot (idempotent: slot-count guard).
+            if new_slot >= page.slot_count_pub() {
+                let (xmin, prev, payload) = decode_insert_redo(insert_redo)?;
+                page.insert_versioned(payload, xmin, 0, prev)?;
+            }
+            page.set_lsn(r.lsn);
+            pool.write_page(&page)?;
+            pool.unpin(r.page_id);
+        }
         WAL_INDEX_INSERT => {
             // item 56 Step 4: logical B-tree leaf insert, redo-only, LSN-gated.
             // A WAL_FPI for this leaf preceded this record (lower LSN, already
@@ -498,6 +567,44 @@ fn undo_record(r: &WalRecord, pool: &BufferPool, page_size: usize) -> Result<()>
             pool.write_page(&page)?;
             pool.unpin(r.page_id);
         }
+        WAL_HOT_UPDATE => {
+            // Undo an HOT update: two-phase, order-sensitive (see design note in
+            // format.rs WAL_HOT_UPDATE comment and crash test P59b).
+            //
+            // undo payload: old_slot (2 B LE) || new_slot (2 B LE)
+            //
+            // Phase 1 (new-slot first): delete the new-version slot — marks it
+            //   Unused so the B-tree candidate (which points to old_slot) will
+            //   see the old slot correctly after phase 2.
+            // Phase 2 (old-slot last): clear hot_next (set to HOT_NEXT_NONE),
+            //   then clear xmax = 0 — restoring the old slot to live.
+            //
+            // The ordering is critical: if we crash between phase 1 and phase 2,
+            // the old slot has xmax set but no hot_next pointer. Crash-test P59b
+            // verifies that undo is idempotent when re-run after such a crash:
+            // on re-open, recovery re-runs undo for the incomplete HOT mini-txn,
+            // which finds the new slot already deleted (idempotent delete) and
+            // completes the old-slot restore.
+            let (old_slot, new_slot) = decode_hot_update_undo(&r.undo)?;
+            let mut page = fetch_or_create(pool, r.page_id, page_size)?;
+            // Phase 1: delete new slot (idempotent — TupleDeleted is OK).
+            match page.delete(new_slot) {
+                Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
+                Err(e) => return Err(e),
+            }
+            // Phase 2a: clear hot_next on old slot (idempotent).
+            match page.set_hot_next(old_slot, HOT_NEXT_NONE) {
+                Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
+                Err(e) => return Err(e),
+            }
+            // Phase 2b: clear xmax on old slot (idempotent).
+            match page.set_xmax(old_slot, 0) {
+                Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
+                Err(e) => return Err(e),
+            }
+            pool.write_page(&page)?;
+            pool.unpin(r.page_id);
+        }
         _ => {}
     }
     Ok(())
@@ -541,6 +648,31 @@ fn decode_xmax_batch_undo(buf: &[u8]) -> Result<Vec<u16>> {
         .map(|i| u16_from_le(buf[2 + 2 * i..4 + 2 * i].try_into().unwrap()))
         .collect();
     Ok(slots)
+}
+
+/// Decode a WAL_HOT_UPDATE redo payload:
+///   `xid (8 B LE) || old_slot (2 B LE) || new_slot (2 B LE) || insert_redo (variable)`
+/// Returns `(xid, old_slot, new_slot, insert_redo_slice)`.
+fn decode_hot_update_redo(buf: &[u8]) -> Result<(u64, u16, u16, &[u8])> {
+    if buf.len() < 12 {
+        return Err(DbError::WalCorrupt { lsn: 0 });
+    }
+    let xid = u64_from_le(buf[0..8].try_into().unwrap());
+    let old_slot = u16_from_le(buf[8..10].try_into().unwrap());
+    let new_slot = u16_from_le(buf[10..12].try_into().unwrap());
+    let insert_redo = &buf[12..];
+    Ok((xid, old_slot, new_slot, insert_redo))
+}
+
+/// Decode a WAL_HOT_UPDATE undo payload:
+///   `old_slot (2 B LE) || new_slot (2 B LE)`
+fn decode_hot_update_undo(buf: &[u8]) -> Result<(u16, u16)> {
+    if buf.len() < 4 {
+        return Err(DbError::WalCorrupt { lsn: 0 });
+    }
+    let old_slot = u16_from_le(buf[0..2].try_into().unwrap());
+    let new_slot = u16_from_le(buf[2..4].try_into().unwrap());
+    Ok((old_slot, new_slot))
 }
 
 fn fetch_or_create(pool: &BufferPool, page_id: u32, page_size: usize) -> Result<SlottedPage> {

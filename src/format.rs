@@ -56,7 +56,24 @@ pub const MAGIC: u32 = 0x556E4442; // "UnDB"
 // not a safe no-op. The version bump causes older builds to produce BadVersion
 // rather than silently misrecovering. No migration path — no prior version has
 // shipped externally.
-pub const FORMAT_VERSION: u16 = 7;
+//
+// v7 -> v8 (item 58 — HOT-equivalent UPDATE, D4 sign-off 2026-07-17):
+// The `_pad u16` field at tuple-header offset [22..24] is repurposed as
+// `hot_next: u16`, a forwarding pointer from an old (xmax-stamped) tuple
+// version to a newer version on the SAME page. `HOT_TUPLE_FLAG` (bit 0 of
+// `flags`, a previously-unused byte inserted between xmax and prev_page) signals
+// that the slot is a HOT chain head — callers must follow `hot_next` to find
+// the current version rather than updating the B-tree entry. TUPLE_HEADER_SIZE
+// (24 bytes) is UNCHANGED: the flag byte and hot_next fit inside the existing
+// 24-byte budget (flags byte was implicit zero-padding before). A new WAL record
+// type `WAL_HOT_UPDATE` (type 16) carries the atomic (xmax-stamp old slot +
+// set HOT_FLAG/hot_next + insert new slot) operation under one mini-txn. An
+// older binary's recovery `_ => {}` catch-all would silently skip WAL_HOT_UPDATE,
+// leaving the HOT chain broken after crash recovery (B-tree points to xmax'd old
+// slot with no forward pointer → row unfindable). The version bump causes older
+// builds to produce BadVersion rather than silently misrecovering. No migration
+// path — no prior version has shipped externally.
+pub const FORMAT_VERSION: u16 = 8;
 
 /// Default page size: 8 KiB (D8). Baked into the control file at DB init.
 pub const DEFAULT_PAGE_SIZE: u32 = 8192;
@@ -176,6 +193,53 @@ pub const WAL_XMAX_BATCH: u8 = 14;
 //   inserts are tolerated: the heap MVCC visibility check on every index
 //   lookup filters them, and vacuum scrubs them (same behaviour as WAL_INDEX).
 pub const WAL_INDEX_INSERT: u8 = 15;
+
+// WAL HOT update record (item 58 — HOT-equivalent UPDATE, D4 sign-off).
+// One record covers the entire HOT operation on a single page atomically:
+// (a) stamp xmax = xid on the old slot, (b) set HOT_TUPLE_FLAG + hot_next
+// in the old slot's tuple header, (c) insert the new version at new_slot.
+//
+// WAL header fields: `page_id` = the shared page; `slot` = old_slot (the
+// chain head, where the B-tree still points).
+//
+// redo payload: xid (8 B LE) || old_slot (2 B LE) || new_slot (2 B LE)
+//   || insert_redo (variable — same layout as WAL_INSERT redo, i.e.
+//   xmin:8 || prev_page:4 || prev_slot:2 || payload)
+//   Redo: LSN-gated. Apply xmax=xid on old_slot; set HOT_TUPLE_FLAG + hot_next
+//   on old_slot; insert_versioned the new payload at new_slot (idempotent —
+//   slot-count guard prevents double-application).
+//
+// undo payload: old_slot (2 B LE) || new_slot (2 B LE)
+//   Undo: zero the new slot (Page::delete); clear HOT_TUPLE_FLAG and hot_next
+//   in old slot; clear xmax = 0 on old slot. Order: new-slot first, then old
+//   slot — this is a two-phase undo, intentional (see crash-test P59b).
+//
+// No B-tree update is emitted when a HOT update succeeds — the B-tree entry
+// stays pointing at old_slot (the chain head). Readers following a B-tree
+// candidate check HOT_TUPLE_FLAG and follow hot_next if set.
+//
+// An older binary's `_ => {}` catch-all would skip this record, leaving the
+// HOT chain broken after crash recovery. FORMAT_VERSION bump to 8 causes
+// older builds to produce BadVersion. No migration path.
+pub const WAL_HOT_UPDATE: u8 = 16;
+
+/// Bit 0 of the tuple-header `flags` byte: this slot is a HOT chain head.
+/// When set, the `hot_next` field (tuple-header offset [22..24]) holds the
+/// slot index of the newer version on the same page. `0xFFFF` means "not set"
+/// (used for the new version's own header where no further forwarding exists).
+///
+/// This flag is ONLY set on the OLD (xmax-stamped) slot. The new slot's
+/// `hot_next` is `0xFFFF` (no chain continuation from it).
+///
+/// Readers: when a B-tree candidate resolves to a slot with HOT_TUPLE_FLAG
+/// set and xmax != 0, follow `hot_next` to the new version on the same page,
+/// then evaluate MVCC visibility on that new slot.
+pub const HOT_TUPLE_FLAG: u8 = 0x01;
+
+/// Sentinel value for `hot_next` meaning "no forwarding" (not a HOT chain head
+/// or is the tail of the chain). Stored in the `_pad u16` field at tuple-header
+/// offset [22..24].
+pub const HOT_NEXT_NONE: u16 = 0xFFFF;
 
 // ── little-endian helpers ────────────────────────────────────────────────────
 
