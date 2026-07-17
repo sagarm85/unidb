@@ -1621,10 +1621,16 @@ fn winner_remark(uu: f64, pp: f64) -> String {
 /// rows-decoded reads, returning `(records, secs, wal_bytes_delta,
 /// rows_decoded_delta)`. `wal_total_bytes_appended` survives auto-checkpoint
 /// truncation, so the delta is the true WAL volume the op produced.
+///
+/// Item 59 Fix 1: enables `COLS_DECODED` diagnostics on first call (the flag
+/// is process-global; enabling it once is sufficient for the whole bench run).
 fn measured_unidb(
     engine: &Arc<Engine>,
     f: impl FnOnce() -> (u64, f64),
 ) -> (u64, f64, u64, u64, u64) {
+    // Enable the COLS_DECODED counter (gated by DIAGNOSTICS_ENABLED by default
+    // to avoid atomic overhead on the hot path in non-bench contexts).
+    Engine::enable_diagnostics();
     let wal0 = engine.wal_total_bytes_appended();
     let dec0 = Engine::rows_decoded_total();
     let cols0 = Engine::cols_decoded_total();
@@ -2618,7 +2624,7 @@ fn bench_mm_report() {
              \n\
              | operation | current ratio | ceiling | root cause | revisit when |\n\
              |---|---|---|---|---|\n\
-             | SELECT filtered | ~0.57× (was 100% selectivity bench — misleading) | TBD at 5% | **Bench fixed 2026-07-17**: previous query matched 100% of rows (k<N), the worst case for any filter optimisation. Re-benched at k<N/20 (5% selectivity). Real gap drivers: 4 heap allocs/row (42%), interpreted predicate column-name scan (27%), COLS_DECODED atomics (10%). SIMD NO-GO (scatter layout, nightly-only API). JIT NO-GO (Cranelift, unsafe, poor ROI). Addressable via: column pre-binding + remove COLS_DECODED + late materialisation. | Ship item 59 (column pre-binding + late materialisation) then re-measure. |\n\
+             | SELECT filtered | 0.39× at 5% selectivity (item 59, 2026-07-17) | ~0.40× | **B-tree index path dominates at 5% selectivity** (A3 gate correctly routes after ANALYZE). Item 59 (column pre-binding + COLS_DECODED gate + late materialisation) ships the full-scan path improvements; the B-tree candidate-resolution path now also gets column pre-binding (Fix 2). Remaining gap: PG parallel index scan + lower-overhead candidate resolution. cols/row stable at 4.00 (B-tree path: pred_cols=k + full_cols={id,k,body}). SIMD NO-GO (scatter layout, nightly-only API). | Parallel B-tree candidate resolution or HOT (less double-decode on update). |\n\
              | UPDATE bulk | ~0.04–0.07× | ~0.07–0.09× (with HOT) | B-tree per-row insert (~10–15 µs/row) dominates regardless of WAL batching — proved by item 56 Step 2 (2026-07-17): WAL savings −30% but throughput regressed due to staging pressure. Only HOT (D4 sign-off) changes this. | D4 sign-off granted in PROGRESS.md. |\n\
              | INSERT per-row | ~0.54× | ~0.55–0.60× | Per-row fsync floor + PG scale advantages. Step 4 (logical B-tree WAL, 8837→655 B/row) delivered the addressable gain (2026-07-17). | Batch-commit or group-commit mode. |\n\
              | DELETE selected | ~0.07× | ~0.07× | After Step 3 (WAL_XMAX_BATCH), bottleneck is `delete_many` page-write phase, not the scan. Parallel scan tried (item 57, 2026-07-17) — zero improvement at 50% selectivity. Only further WAL compression or HOT changes this. | New WAL record type reducing page-write overhead. |\n"

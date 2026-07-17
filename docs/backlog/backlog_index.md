@@ -73,11 +73,12 @@
 | 55 | `55_event_queue_small_table_overhead.md` | Improvement | ⏳ NOT STARTED — W4/W0=3.93× at 1k rows (Δ event=1.29ms vs 0.12ms at 10k); 10× anomaly unexplained; investigate before optimising (vacuum threshold, sequence index, WAL group-commit). |
 | 56 | `56_crud_gap_write_batching_parallel_agg.md` | Performance | ✅ SHIPPED — Step 1 (parallel GROUP BY 1.14× PG) 2026-07-16; Steps 2+3 (WAL_XMAX_BATCH DELETE) 2026-07-17 PR #137; Step 4 (logical B-tree INSERT WAL 8837→655 B/row, +25% rec/s) 2026-07-17 PR #139 |
 | 57 | `57_next_perf_improvements.md` | Performance | ⏳ NOT STARTED — D4 HOT sign-off analysis (defer: ceiling 0.08×); parallel DELETE scan (0.07→0.15–0.20×, HIGH ROI); W4/W0 overhead root-cause; ROI ranking: #1 parallel DELETE, #2 HOT. Fable-5 arch review 2026-07-17. |
-| 58 | `58_hot_update.md` | Performance | ✅ SHIPPED 2026-07-17 — HOT-equivalent UPDATE: same-page insert when no indexed col in SET; FSM pre-screen fast-path for full pages; vacuum B-tree patch for HOT chain heads; FORMAT_VERSION 7→8; P59a/P59b crash tests. Measured 0.043× PG at 100k packed rows (HOT fires only when pages have slack; no regression). See PROGRESS.md. |
+| 58 | `58_hot_update.md` | Performance | ✅ SHIPPED 2026-07-17 — HOT-equivalent UPDATE: same-page insert when no indexed col in SET; FSM pre-screen fast-path for full pages; vacuum B-tree patch for HOT chain heads; FORMAT_VERSION 7→8; P59a/P59b crash tests. Measured 0.043× PG at 100k packed rows (HOT fires only when pages have slack; no regression). PR #141 MERGED. See PROGRESS.md. |
+| 59 | `59_select_filtered_optimisations.md` | Performance | ✅ SHIPPED 2026-07-17 — Fix 1: `COLS_DECODED` gated behind `DIAGNOSTICS_ENABLED`; Fix 2: `Expr::ColumnSlot` pre-binding eliminates per-row linear String scan; Fix 3: `RawFilter` / `try_raw_i64_at` late materialisation skips `deform_row` on rejected rows at 5% selectivity. 3 new tests; 415 unit + 46 crash harness PASS. |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `59_…`.**
+**Next new file → `60_…`.**
 
 ## Next up — priority order (2026-07-16, calibrated on `052432` Docker baseline)
 

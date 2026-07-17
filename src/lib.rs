@@ -3434,8 +3434,24 @@ impl Engine {
     /// process start (C1′, measurement-only). Diff around an op for `cols/row`
     /// — the direct proof of Phase B's decode pushdown (it falls as unreferenced
     /// columns, especially TEXT, stop being materialized). Process-global.
+    ///
+    /// **Note:** the counter only increments when diagnostics are enabled (item 59
+    /// Fix 1). Call [`Engine::enable_diagnostics`] before sampling to activate it.
     pub fn cols_decoded_total() -> u64 {
         crate::sql::executor::COLS_DECODED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Item 59 Fix 1: enable the `COLS_DECODED` counter on the hot path.
+    ///
+    /// By default the counter is **disabled** (`false`) so the atomic write
+    /// inside `deform_row` does not fire on every decoded column in production.
+    /// Call this from benchmarks or tests that sample `cols_decoded_total()` to
+    /// ensure the counter increments.  The setting is process-global and
+    /// permanent for the process lifetime (no need to disable after sampling;
+    /// the overhead when enabled is a single `Relaxed` load + occasional `Relaxed`
+    /// store, still negligible compared to a per-row decode).
+    pub fn enable_diagnostics() {
+        crate::sql::executor::DIAGNOSTICS_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The database directory (parent of the control file) — used by backup and

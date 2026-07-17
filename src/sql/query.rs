@@ -458,8 +458,11 @@ fn qualify_policy(policy: Expr, qualifier: &str) -> QExpr {
         },
         // JSON extraction and NEAR are not valid RLS policy shapes; treat as a
         // permissive no-op rather than inventing semantics for them here.
-        Expr::JsonExtract { .. } | Expr::JsonExtractText { .. } | Expr::Near { .. } => {
-            QExpr::Literal(Literal::Bool(true))
-        }
+        // ColumnSlot is an executor-internal variant (item 59 Fix 2) that can
+        // never appear in an RLS policy; treat it the same way.
+        Expr::JsonExtract { .. }
+        | Expr::JsonExtractText { .. }
+        | Expr::Near { .. }
+        | Expr::ColumnSlot(_) => QExpr::Literal(Literal::Bool(true)),
     }
 }

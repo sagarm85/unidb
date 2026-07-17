@@ -130,7 +130,7 @@ fn bind_expr(expr: &mut Expr, params: &[Literal]) -> Result<()> {
             bind_expr(pattern, params)
         }
         Expr::Match { query, .. } => bind_expr(query, params),
-        Expr::Column(_) | Expr::Near { .. } => Ok(()),
+        Expr::Column(_) | Expr::ColumnSlot(_) | Expr::Near { .. } => Ok(()),
     }
 }
 
@@ -168,6 +168,12 @@ pub enum CmpOp {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Expr {
     Column(String),
+    /// Pre-bound column index: replaces `Expr::Column` after the binding pass
+    /// (`bind_predicate_columns` in executor.rs, item 59 Fix 2). Never appears
+    /// in parsed SQL or stored predicates — only created during execution.
+    /// Direct positional access eliminates the per-row linear `String` scan
+    /// that `Expr::Column` requires in `eval_expr`.
+    ColumnSlot(usize),
     Literal(Literal),
     BinOp {
         op: CmpOp,

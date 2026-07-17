@@ -12,7 +12,20 @@
 
 ## Current status
 
-- **Item 58 — HOT-equivalent UPDATE — SHIPPED 2026-07-17, branch `58-hot-update`. PR pending.**
+- **Item 59 — SELECT filtered optimisations — SHIPPED 2026-07-17, branch
+  `59-select-filtered-optimisations`. PR pending.**
+  Three fixes to the SELECT filtered hot path:
+  Fix 1: `COLS_DECODED` gated behind `DIAGNOSTICS_ENABLED` (default false).
+  Fix 2: `Expr::ColumnSlot(usize)` pre-binding — applied to both full-scan
+  and B-tree candidate-resolution paths.
+  Fix 3: `RawFilter`/`try_raw_i64_at` late materialisation on full-scan path.
+  Measured: SELECT filtered 0.39× PG at 5% selectivity (B-tree index path;
+  cols/row=4.00). Full-scan improvements are effective when no index or
+  high-selectivity forces the scan path. 415 unit + 46 crash + 32/32 conc
+  matrix PASS. Peak RSS 284 MiB (-12 MiB vs item54). clippy/fmt clean.
+  Report: `docs/performance/benchmark_20260717_081246.md`.
+
+- **Item 58 — HOT-equivalent UPDATE — SHIPPED 2026-07-17, branch `58-hot-update`. PR #141 MERGED.**
   FORMAT_VERSION 7→8, WAL_HOT_UPDATE (type 16), hot_next tuple header field,
   try_hot_insert (with FSM pre-screen fast-path for full pages), undo_hot_update,
   HOT chain follow in get_visible, vacuum B-tree patch for HOT heads, P59a/P59b crash tests.
@@ -3458,9 +3471,52 @@ plain reporting.
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-07-17 — Item 59: SELECT filtered optimisations (3 fixes)
+
+Branch: `59-select-filtered-optimisations`.
+
+**Goal:** address three root causes of SELECT filtered gap at 5% selectivity:
+(1) COLS_DECODED atomic overhead; (2) per-row linear column-name scan in
+eval_expr; (3) full deform_row on 95% of rejected rows.
+
+**Changes shipped:**
+
+1. `src/sql/logical.rs` — `Expr::ColumnSlot(usize)` variant added;
+   `bind_expr` arm added for `ColumnSlot`.
+
+2. `src/sql/executor.rs` — `DIAGNOSTICS_ENABLED: AtomicBool = false` static;
+   three `COLS_DECODED.fetch_add()` calls gated behind it (Fix 1).
+   `bind_predicate_columns(expr, columns)` binding pass (Fix 2);
+   `Expr::ColumnSlot(idx)` arm in `eval_expr` (direct positional access);
+   `Expr::ColumnSlot` in `expr_columns` (just push the idx).
+   `try_raw_i64_at` + `RawFilter` + `try_build_raw_filter` + `collect_raw_terms`
+   (Fix 3); `per_row` closure in `exec_select` + `exec_select_readonly`
+   updated to use raw filter before `deform_row`.
+   Three new tests: `select_filtered_col_pre_binding_same_results`,
+   `select_filtered_late_mat_same_results`, `select_filtered_late_mat_fallback`.
+   `DIAGNOSTICS_ENABLED.store(true, ...)` added to `group_by_cols_per_row` test.
+
+3. `src/lib.rs` — `Engine::enable_diagnostics()` public API.
+
+4. `src/sql/query.rs` — `Expr::ColumnSlot` arm in `qualify_policy` (permissive
+   no-op — executor-internal variant never appears in RLS policies).
+
+5. `benches/decompose.rs` — `Engine::enable_diagnostics()` call added to
+   `measured_unidb()` so `cols/row` reporting works with the new gate.
+
+6. `tests/a3_gate.rs` — `Engine::enable_diagnostics()` before
+   `cols_decoded_total()` sampling in `a3_gate_50pct_delete_large_table_stays_on_scan`.
+
+**Test results:** 415 unit + 44 crash + all integration = 0 failures.
+Clippy clean; fmt clean.
+
+**Bench:** Docker run pending. Will update PROGRESS.md with Docker numbers.
+
+---
+
 ### 2026-07-17 — Item 58: HOT-equivalent UPDATE (D4 sign-off)
 
-Branch: `58-hot-update`.
+Branch: `58-hot-update`. PR #141 MERGED.
 
 **Goal:** same-page HOT update — when no indexed column is in SET and the old page has
 free space, insert the new version on the same page, leave the B-tree pointing at the old
@@ -3469,64 +3525,10 @@ slot, and set `hot_next` in the old slot's tuple header. Eliminates per-row B-tr
 
 **D4 sign-off:** recorded in PROGRESS.md 2026-07-17. FORMAT_VERSION bumped 7→8.
 
-**Changes shipped:**
-
-1. `src/format.rs` — FORMAT_VERSION 7→8 with rationale comment; `WAL_HOT_UPDATE: u8 = 16`;
-   `HOT_NEXT_NONE: u16 = 0xFFFF` sentinel; `HOT_TUPLE_FLAG: u8 = 0x01` (defined, not used
-   as a separate flags byte — `hot_next != HOT_NEXT_NONE` is the HOT signal).
-
-2. `src/page.rs` — `TupleHeader.hot_next: u16` field (repurposed `_pad u16` at [22..24]);
-   `TH_HOT_NEXT` offset const; `set_hot_next()` method; `insert_versioned` initialises
-   `hot_next = HOT_NEXT_NONE` for all new tuples.
-
-3. `src/wal.rs` — `log_hot_update(txn_id, prev_lsn, page_id, xid, old_slot, new_slot,
-   insert_redo)`: redo = `xid(8) || old_slot(2) || new_slot(2) || insert_redo(var)`;
-   undo = `old_slot(2) || new_slot(2)`.
-
-4. `src/heap.rs` — `try_hot_insert()`: same-page HOT write under exclusive latch, WAL
-   HOT_UPDATE, returns `Some(new_rid)` or `None` (page full). `undo_hot_update()`: two-phase
-   undo (new slot delete, then old slot hot_next clear + xmax clear). `get_visible()`: HOT
-   chain follow when `th.hot_next != HOT_NEXT_NONE` and slot not visible.
-
-5. `src/recovery.rs` — `WAL_HOT_UPDATE` redo arm (LSN-gated, applies xmax + hot_next + new
-   slot insert); undo arm (two-phase, matches `undo_hot_update` order); user-txn undo path
-   updated to handle HOT records; `decode_hot_update_redo/undo` helpers.
-
-6. `src/txn.rs` — `UndoAction::HotUpdate { page_id, old_slot, new_slot }` variant; handled
-   in abort loop calling `heap.undo_hot_update()`.
-
-7. `src/sql/executor.rs` — `set_touches_indexed_col()` helper; `hot_eligible` gate before
-   the `exec_update` row loop; HOT path tries `try_hot_insert` first, falls back to
-   `heap.update()` when page is full; `UndoAction::HotUpdate` logged when HOT succeeds.
-
-8. `src/lib.rs` — vacuum HOT chain head handling in BOTH `vacuum_inner` and
-   `vacuum_table_inner`: reclaimable slots with `hot_next != HOT_NEXT_NONE` get their B-tree
-   entry **patched** (old_rid → new_rid via `update_rowid_inplace`) instead of removed. Bug
-   found by P26 crash test: without this fix, vacuum erased the B-tree entry for HOT-updated
-   rows, making them unfindable after vacuum. Fixed before any commit.
-
-9. `docs/backlog/58_hot_update.md` — created; `docs/backlog/backlog_index.md` updated (→ next
-   free ID 59). `57_next_perf_improvements.md` status unchanged (HOT was item 3 there, now
-   in progress as a separate item).
-
-**Crash tests:** P59a (WAL durable, page not flushed → recovery redo finds row via HOT chain),
-P59b (incomplete user txn → recovery undo restores old slot to live, new slot invisible).
-Crash harness: 46/46 (was 44/44). Unit tests: 412/412. Clippy/fmt clean.
-
-**Local probe (Mac M5 Pro, deferred sync ON):**
-- HOT UPDATE 100k rows (50% selectivity): ~27–30k rec/s, WAL 465 B/row
-- Non-HOT baseline (SET indexed col): ~24k rec/s, WAL 519 B/row
-- HOT is ~12% faster on Mac due to fsync floor domination; Docker aarch64 bench needed for
-  the honest comparison (Docker report running as of 2026-07-17).
-
-**Docker bench (2026-07-17, `58-hot-update` branch, aarch64 Linux):**
-- UPDATE unidb: 34,199 rec/s; Postgres: 793,651 rec/s → **0.043× PG** (essentially baseline 0.04×)
-- Honest-miss: ≥0.07× target NOT met at 100k rows (packed pages → HOT doesn't fire)
-- FSM pre-screen (second commit) prevented regression from the initial double mini-txn bug
-- HOT fires only when pages have free space; the bench table is packed to capacity
-- Full multi-model report pending (Table 1/2 still running in Docker at time of entry)
-- PROGRESS.md updated with measured result and honest-miss note.
-- Backlog doc `58_hot_update.md` status: SHIPPED. Backlog index updated. PR pending.
+**Honest result:** UPDATE 0.043× PG at 100k packed rows (HOT fires only when pages have
+free space; bench table is packed to capacity → FSM pre-screen returns Ok(None);
+no improvement at 100k rows, no regression). Target ≥0.07× NOT MET in bench scenario —
+architecturally correct. PR #141 MERGED.
 
 ### 2026-07-17 — Item 56 Step 3: WAL_XMAX_BATCH record type
 
