@@ -13,9 +13,9 @@ use crate::{
     control::{self, ControlData},
     error::{DbError, Result},
     format::{
-        u64_from_le, Xid, INVALID_LSN, WAL_ABORT, WAL_BEGIN, WAL_CHECKPOINT, WAL_COMMIT,
-        WAL_DELETE, WAL_FPI, WAL_INDEX, WAL_INSERT, WAL_TXN_ABORT, WAL_TXN_BEGIN, WAL_TXN_COMMIT,
-        WAL_UPDATE, WAL_VACUUM,
+        u16_from_le, u64_from_le, Xid, INVALID_LSN, WAL_ABORT, WAL_BEGIN, WAL_CHECKPOINT,
+        WAL_COMMIT, WAL_DELETE, WAL_FPI, WAL_INDEX, WAL_INSERT, WAL_TXN_ABORT, WAL_TXN_BEGIN,
+        WAL_TXN_COMMIT, WAL_UPDATE, WAL_VACUUM, WAL_XMAX_BATCH,
     },
     heap::decode_insert_redo,
     page::SlottedPage,
@@ -137,7 +137,10 @@ pub fn recover(
         .iter()
         .filter(|r| incomplete.contains(&r.mini_txn_id))
         .filter(|r| {
-            r.rec_type == WAL_INSERT || r.rec_type == WAL_UPDATE || r.rec_type == WAL_DELETE
+            r.rec_type == WAL_INSERT
+                || r.rec_type == WAL_UPDATE
+                || r.rec_type == WAL_DELETE
+                || r.rec_type == WAL_XMAX_BATCH
         })
         .copied()
         .collect();
@@ -188,17 +191,39 @@ pub fn recover(
     if !incomplete_user_txns.is_empty() {
         // Phase 1: revert xmax stamps this xid applied to pre-existing rows
         // (DELETE, or an UPDATE's old-version half) back to 0 (live).
-        for r in relevant
-            .iter()
-            .filter(|r| r.rec_type == WAL_UPDATE && committed.contains(&r.mini_txn_id))
-        {
-            if let Ok(new_xmax) = decode_xmax(&r.redo) {
-                if incomplete_user_txns.contains(&new_xmax) {
-                    let mut page = fetch_or_create(&pool, r.page_id, page_size)?;
-                    page.set_xmax(r.slot, 0)?;
-                    pool.write_page(&page)?;
-                    pool.unpin(r.page_id);
-                    stats.records_undone += 1;
+        //
+        // Handles both the per-row WAL_UPDATE path and the batched
+        // WAL_XMAX_BATCH path (item 56 Step 3).
+        for r in relevant.iter().filter(|r| {
+            (r.rec_type == WAL_UPDATE || r.rec_type == WAL_XMAX_BATCH)
+                && committed.contains(&r.mini_txn_id)
+        }) {
+            if r.rec_type == WAL_UPDATE {
+                if let Ok(new_xmax) = decode_xmax(&r.redo) {
+                    if incomplete_user_txns.contains(&new_xmax) {
+                        let mut page = fetch_or_create(&pool, r.page_id, page_size)?;
+                        page.set_xmax(r.slot, 0)?;
+                        pool.write_page(&page)?;
+                        pool.unpin(r.page_id);
+                        stats.records_undone += 1;
+                    }
+                }
+            } else {
+                // WAL_XMAX_BATCH: redo[0..8] = xid, redo[8..10] = n_slots,
+                // redo[10..] = slot array.
+                if let Ok((new_xmax, slots)) = decode_xmax_batch_redo(&r.redo) {
+                    if incomplete_user_txns.contains(&new_xmax) {
+                        let mut page = fetch_or_create(&pool, r.page_id, page_size)?;
+                        for slot in slots {
+                            match page.set_xmax(slot, 0) {
+                                Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
+                                Err(e) => return Err(e),
+                            }
+                        }
+                        pool.write_page(&page)?;
+                        pool.unpin(r.page_id);
+                        stats.records_undone += 1;
+                    }
                 }
             }
         }
@@ -348,6 +373,25 @@ fn redo_record(r: &WalRecord, pool: &BufferPool, page_size: usize) -> Result<()>
             }
             pool.unpin(r.page_id);
         }
+        WAL_XMAX_BATCH => {
+            // Redo: stamp xmax = xid on every listed slot. LSN-gated so
+            // re-running recovery is idempotent.
+            let (xid, slots) = decode_xmax_batch_redo(&r.redo)?;
+            let mut page = fetch_or_create(pool, r.page_id, page_size)?;
+            if page.lsn() >= r.lsn {
+                pool.unpin(r.page_id);
+                return Ok(());
+            }
+            for slot in slots {
+                match page.set_xmax(slot, xid) {
+                    Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            page.set_lsn(r.lsn);
+            pool.write_page(&page)?;
+            pool.unpin(r.page_id);
+        }
         _ => {}
     }
     Ok(())
@@ -379,6 +423,21 @@ fn undo_record(r: &WalRecord, pool: &BufferPool, page_size: usize) -> Result<()>
             pool.write_page(&page)?;
             pool.unpin(r.page_id);
         }
+        WAL_XMAX_BATCH => {
+            // Undo a batch xmax stamp = reset all listed slots' xmax to 0.
+            // Old xmax was provably 0 (conflict check enforces this before any
+            // stamp); undo payload carries the slot list to iterate.
+            let slots = decode_xmax_batch_undo(&r.undo)?;
+            let mut page = fetch_or_create(pool, r.page_id, page_size)?;
+            for slot in slots {
+                match page.set_xmax(slot, 0) {
+                    Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            pool.write_page(&page)?;
+            pool.unpin(r.page_id);
+        }
         WAL_DELETE => {
             // Undo a delete = re-insert the old tuple at same slot position.
             // Simple approach: insert anew (slot may differ, but for M0 this is fine).
@@ -397,6 +456,39 @@ fn undo_record(r: &WalRecord, pool: &BufferPool, page_size: usize) -> Result<()>
 fn decode_xmax(buf: &[u8]) -> Result<u64> {
     let arr: [u8; 8] = buf.try_into().map_err(|_| DbError::WalCorrupt { lsn: 0 })?;
     Ok(u64_from_le(arr))
+}
+
+/// Decode a WAL_XMAX_BATCH redo payload:
+///   `xid (8 B LE) || n_slots (2 B LE) || slot_0 (2 B LE) || ...`
+fn decode_xmax_batch_redo(buf: &[u8]) -> Result<(u64, Vec<u16>)> {
+    if buf.len() < 10 {
+        return Err(DbError::WalCorrupt { lsn: 0 });
+    }
+    let xid = u64_from_le(buf[0..8].try_into().unwrap());
+    let n = u16_from_le(buf[8..10].try_into().unwrap()) as usize;
+    if buf.len() < 10 + 2 * n {
+        return Err(DbError::WalCorrupt { lsn: 0 });
+    }
+    let slots = (0..n)
+        .map(|i| u16_from_le(buf[10 + 2 * i..12 + 2 * i].try_into().unwrap()))
+        .collect();
+    Ok((xid, slots))
+}
+
+/// Decode a WAL_XMAX_BATCH undo payload:
+///   `n_slots (2 B LE) || slot_0 (2 B LE) || ...`
+fn decode_xmax_batch_undo(buf: &[u8]) -> Result<Vec<u16>> {
+    if buf.len() < 2 {
+        return Err(DbError::WalCorrupt { lsn: 0 });
+    }
+    let n = u16_from_le(buf[0..2].try_into().unwrap()) as usize;
+    if buf.len() < 2 + 2 * n {
+        return Err(DbError::WalCorrupt { lsn: 0 });
+    }
+    let slots = (0..n)
+        .map(|i| u16_from_le(buf[2 + 2 * i..4 + 2 * i].try_into().unwrap()))
+        .collect();
+    Ok(slots)
 }
 
 fn fetch_or_create(pool: &BufferPool, page_id: u32, page_size: usize) -> Result<SlottedPage> {

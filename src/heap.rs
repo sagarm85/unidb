@@ -466,10 +466,12 @@ impl Heap {
         if row_ids.is_empty() {
             return Ok(Vec::new());
         }
-        // Acquire per-row write locks upfront (same as delete()).
-        for rid in row_ids {
-            lock_mgr.try_acquire_write(RecordId::row(rid.page_id, rid.slot), xid)?;
-        }
+        // Acquire all write locks in one mutex pass (item 56 Step 3 batching).
+        let record_ids: Vec<RecordId> = row_ids
+            .iter()
+            .map(|r| RecordId::row(r.page_id, r.slot))
+            .collect();
+        lock_mgr.try_acquire_write_many(&record_ids, xid)?;
 
         let mut deleted = Vec::with_capacity(row_ids.len());
         let mut i = 0;
@@ -496,35 +498,164 @@ impl Heap {
             }
 
             // One FPI check for the whole page.
-            let mut prev_lsn = pool
+            let prev_lsn = pool
                 .maybe_log_fpi(page_id, wal, txn_id, begin_lsn)?
                 .unwrap_or(begin_lsn);
 
-            // One log_update per row (preserves per-row redo granularity).
+            // One WAL_XMAX_BATCH record for the whole page group (Step 3).
+            let slots: Vec<u16> = page_rows.iter().map(|r| r.slot).collect();
+            let lsn = wal.log_xmax_batch(txn_id, prev_lsn, page_id, xid, &slots)?;
+
+            // Apply xmax stamps per-row (SSI seam + page mutation).
             for rid in page_rows {
                 on_write(xid, *rid);
-                let old_xmax = page.tuple_header(rid.slot)?.xmax;
-                let lsn = wal.log_update(
-                    txn_id,
-                    prev_lsn,
-                    rid.page_id,
-                    rid.slot,
-                    &u64_to_le(xid),
-                    &u64_to_le(old_xmax),
-                )?;
                 page.set_xmax(rid.slot, xid)?;
-                prev_lsn = lsn;
             }
 
-            page.set_lsn(prev_lsn);
+            page.set_lsn(lsn);
             pool.write_page(&page)?;
             pool.unpin(page_id);
-            wal.commit_mini_txn(txn_id, prev_lsn)?;
+            wal.commit_mini_txn(txn_id, lsn)?;
 
             deleted.extend_from_slice(page_rows);
             i = j;
         }
         Ok(deleted)
+    }
+
+    /// Batched UPDATE — one WAL mini-txn per old-version page group (Phase A)
+    /// and one mini-txn per new-version fill page (Phase B).
+    ///
+    /// `rows` must be sorted by `old_rid.page_id` (guaranteed by
+    /// `matching_rows`'s physical-order sort).  The caller must have already
+    /// verified that the table has no UNIQUE indexes, no FK child-side refs in
+    /// the SET clause, and no FK parent-side children — this is a CORRECTNESS
+    /// gate, not a tuning knob (batching heap writes across all rows would
+    /// break in-statement unique-key visibility; per-row uniqueness re-checks
+    /// inside the batch are not implemented here).
+    ///
+    /// **Phase A** groups old versions by page_id, stamps `xmax = xid` on
+    /// every slot in the group under one mini-txn with one WAL_XMAX_BATCH
+    /// record.  **Phase B** inserts new versions sequentially, packing as
+    /// many per fill page as fit under one mini-txn per fill page.  A single
+    /// physical page latch is held at a time (Phase A releases before Phase B
+    /// acquires), preventing deadlocks on inverse latch-order.
+    ///
+    /// Returns `(old_rid, new_rid)` pairs in input order.
+    pub fn update_many(
+        &self,
+        rows: &[(RowId, Vec<u8>)],
+        xid: Xid,
+        pool: &BufferPool,
+        wal: &Wal,
+        lock_mgr: &LockManager,
+    ) -> Result<Vec<(RowId, RowId)>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Phase A: stamp xmax on all old versions, one mini-txn per page group.
+        //
+        // Guaranteed progress: `i` advances by at least one page group per
+        // outer-loop iteration (`j > i` always because partition_point
+        // matches at least `rows[i]` itself).
+        let record_ids: Vec<RecordId> = rows
+            .iter()
+            .map(|(r, _)| RecordId::row(r.page_id, r.slot))
+            .collect();
+        lock_mgr.try_acquire_write_many(&record_ids, xid)?;
+
+        let mut i = 0;
+        while i < rows.len() {
+            let page_id = rows[i].0.page_id;
+            let j = i + rows[i..].partition_point(|(r, _)| r.page_id == page_id);
+            let group = &rows[i..j];
+
+            let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
+            let _wg = pool.latch_exclusive(page_id);
+            let mut page = pool.fetch_page_for_write(page_id, wal)?;
+
+            for (old_rid, _) in group {
+                let th = page.tuple_header(old_rid.slot)?;
+                if th.xmax != 0 {
+                    pool.unpin(page_id);
+                    wal.abort_mini_txn(txn_id, begin_lsn)?;
+                    return Err(DbError::WriteConflict {
+                        holder_xid: th.xmax,
+                    });
+                }
+            }
+
+            let prev_lsn = pool
+                .maybe_log_fpi(page_id, wal, txn_id, begin_lsn)?
+                .unwrap_or(begin_lsn);
+
+            let slots: Vec<u16> = group.iter().map(|(r, _)| r.slot).collect();
+            let lsn = wal.log_xmax_batch(txn_id, prev_lsn, page_id, xid, &slots)?;
+
+            for (old_rid, _) in group {
+                on_write(xid, *old_rid);
+                page.set_xmax(old_rid.slot, xid)?;
+            }
+
+            page.set_lsn(lsn);
+            pool.write_page(&page)?;
+            pool.unpin(page_id);
+            wal.commit_mini_txn(txn_id, lsn)?;
+
+            i = j;
+        }
+
+        // Phase B: insert new versions, packing as many per fill page as fit.
+        //
+        // Guaranteed progress: the outer loop always advances `i` by at least
+        // one row per fill page because `acquire_page_for_insert` ensures the
+        // first row of each batch fits, so the inner while can insert at least
+        // one row before breaking.
+        let mut result = Vec::with_capacity(rows.len());
+        let mut i = 0;
+        while i < rows.len() {
+            let (_, first_data) = &rows[i];
+            let needed = crate::page::SLOT_SIZE + crate::page::TUPLE_HEADER_SIZE + first_data.len();
+            let (fill_pid, _ng, mut fill_page) = self.acquire_page_for_insert(needed, pool, wal)?;
+
+            let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
+            let mut prev_lsn = pool
+                .maybe_log_fpi(fill_pid, wal, txn_id, begin_lsn)?
+                .unwrap_or(begin_lsn);
+            let mut last_lsn = prev_lsn;
+
+            while i < rows.len() {
+                let (old_rid, new_data) = &rows[i];
+                let needed =
+                    crate::page::SLOT_SIZE + crate::page::TUPLE_HEADER_SIZE + new_data.len();
+                if fill_page.free_space() < needed {
+                    break;
+                }
+                let prev_ptr = Some((old_rid.page_id, old_rid.slot));
+                let slot = fill_page.insert_versioned(new_data, xid, 0, prev_ptr)?;
+                let new_rid = RowId {
+                    page_id: fill_pid,
+                    slot,
+                };
+                on_write(xid, new_rid);
+                let redo = encode_insert_redo(xid, prev_ptr, new_data);
+                let ins_lsn = wal.log_insert(txn_id, prev_lsn, fill_pid, slot, &redo)?;
+                prev_lsn = ins_lsn;
+                last_lsn = ins_lsn;
+                result.push((*old_rid, new_rid));
+                i += 1;
+            }
+
+            fill_page.set_lsn(last_lsn);
+            pool.write_page(&fill_page)?;
+            let free = fill_page.free_space();
+            pool.unpin(fill_pid);
+            self.note_free_space(fill_pid, free);
+            wal.commit_mini_txn(txn_id, last_lsn)?;
+        }
+
+        Ok(result)
     }
 
     /// Reverse a previously-applied xmax stamp (DELETE, or UPDATE's

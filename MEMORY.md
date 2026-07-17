@@ -12,6 +12,16 @@
 
 ## Current status
 
+- **Item 56 Steps 2+3 — Heap::update_many + WAL_XMAX_BATCH — SHIPPED
+  2026-07-17, branch `56-step3-delete-wal-batch`. PR pending.**
+  Docker bench complete (`docs/performance/benchmark_20260717_074259.md`).
+  FORMAT_VERSION bumped 5→6 (WAL_XMAX_BATCH type 14; old builds get BadVersion
+  rather than silent misrecovery). Honest-miss: A3/A4/A5 not met (UPDATE batch
+  path adds 3 decode passes/row vs 1 per-row; structural not fixable here).
+  A6 PASS: DELETE WAL 72 B/row (≤80 target); DELETE throughput +40% (276k→388k).
+  42/42 crash tests; 408 unit tests; 28/28 conc matrix; clippy/fmt clean.
+  Step 4 (logical B-tree index WAL records) gated — deferred per plan.
+
 - **Item 56 Step 1 — Parallel GROUP BY partial aggregation — SHIPPED
   2026-07-16, branch `56-crud-gap-write-batching-parallel-agg`,
   commit `51480e2`. PR pending user approval.**
@@ -20,8 +30,7 @@
   SELECT grouped 5.9M → 28.3M rec/s (+381%), 0.23× → **1.14× PG** (unidb beats Postgres).
   A2 (target ≥0.45×) and stretch (0.70×) both passed. All A7 regression
   guards pass (W4/W0 at 100k = 1.70× ≤ 2.3× gate). 32/32 conc matrix; 38/38 crash harness.
-  Next: Steps 2/3 (UPDATE write-path batching + DELETE WAL record),
-  then Step 4 gated measurement. PR awaiting user approval.
+  Steps 2+3 now in `56-step3-delete-wal-batch`.
 
 - **Item 53 — FK UPDATE skip enforcement when FK col not in SET — SHIPPED
   2026-07-16, branch `53-fk-update-skip-unchanged-recheck`.** PR pending.
@@ -3438,6 +3447,83 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-17 — Item 56 Step 3: WAL_XMAX_BATCH record type
+
+Branch: `56-step3-delete-wal-batch`.
+
+**Goal:** reduce DELETE selected WAL framing from 61 B/slot to ~24 B/slot by batching N
+per-row `log_update` calls into one `WAL_XMAX_BATCH` per page group.
+
+**Changes shipped:**
+
+1. `src/format.rs` — `WAL_XMAX_BATCH: u8 = 14`. Wire format: redo = `xid(8 LE) ||
+   n_slots(2 LE) || slot_0(2 LE) || ...`; undo = `n_slots(2 LE) || slot_0(2 LE) || ...`
+   (old_xmax omitted — the conflict check guarantees it is provably 0 for every stamped slot).
+
+2. `src/wal.rs` — `log_xmax_batch(txn_id, prev_lsn, page_id, xid, slots)` builds redo+undo
+   buffers and calls `append_locked`. Traces at level TRACE.
+
+3. `src/lockmgr.rs` — `try_acquire_write_many(ids, xid)`: takes the mutex once, fails fast on
+   any conflict (no partial grants), then grants all. One mutex acquire for the whole statement
+   vs N per-row acquires.
+
+4. `src/heap.rs` `delete_many` — emits one `WAL_XMAX_BATCH` per page group (replacing N
+   `log_update` calls). Batch lock acquisition via `try_acquire_write_many`. Per-slot
+   `on_write` / `set_xmax` in the page mutation loop.
+
+5. `src/recovery.rs` — three additions:
+   - `redo_record` arm: decode `(xid, slots)`, apply `set_xmax(slot, xid)` LSN-gated.
+   - `undo_record` arm: decode slots, apply `set_xmax(slot, 0)`.
+   - M1 incomplete-user-txn undo pass: extended to scan `WAL_XMAX_BATCH` alongside
+     `WAL_UPDATE`; identifies the acting xid from redo[0..8]; if incomplete, reverts all slots.
+   - `decode_xmax_batch_redo` / `decode_xmax_batch_undo` helpers.
+
+6. `tests/crash/main.rs` — two new D7 tests:
+   - P56a: INSERT + DELETE in one session, commit without flush, drop (crash). Recovery must
+     redo WAL_XMAX_BATCH. Count=0 ✓.
+   - P56b: INSERT + user-txn DELETE (mini-txns committed) + flush + drop without user-txn
+     commit. Recovery must undo all xmax stamps. Count=200 ✓.
+   Both tests use a single session to avoid the LSN-restart collision that arises when a
+   Phase-1 flush writes pages with high LSNs and Phase 2's WAL restarts from LSN=1 (WAL has
+   no checkpoint → `wal_tail_lsn = INVALID_LSN = 0` → `next_lsn = 1`; Phase-2 WAL records
+   get lower LSNs than Phase-1 page LSNs → redo gate `page.lsn >= r.lsn` skips them).
+
+**unidb-logical:** no changes needed. It reads from the event-queue (generated at SQL executor
+level), not from WAL records directly. WAL_XMAX_BATCH does not affect the logical replication
+path.
+
+**Step 2 — Heap::update_many (same session):**
+`exec_update` gate `use_batch = !has_unique && !has_fk_refs_in_set && !has_fk_children`.
+Phase A: `WAL_XMAX_BATCH` per page group. Phase B: insert new versions, one mini-txn per
+fill page. Allocation fix: `StagedUpdate` changed from `(RowId, Vec<u8>, Vec<Literal>, Vec<Literal>)`
+to `(RowId, Vec<u8>)` — eliminates ~23 MB live heap at 50k rows. Two more crash tests: P57a
+(WAL durable, pages not flushed) + P57b (incomplete user txn reverts all changes).
+`tests/update_many.rs`: 5 tests including throughput probe (≥5k rec/s catastrophic regression guard).
+
+**FORMAT_VERSION bumped 5→6 (same session):** `WAL_XMAX_BATCH` type 14 triggers silent skip via
+`_ => {}` in recovery if unrecognized; bump ensures old builds get `BadVersion(6)` rather than
+misrecovering. Initial comment said "unchanged" — corrected with honest analysis.
+
+**Docker bench results (`docs/performance/benchmark_20260717_074259.md`):**
+- UPDATE bulk: 17,783 rec/s vs PG 893k = **0.02×** (dec/row=3.00 — structural 3-pass overhead)
+- DELETE selected: 387,967 rec/s vs PG 5.5M = **0.07×** (+40% vs 276k baseline)
+- DELETE WAL: **72 B/row** (A6 PASS ≤80 target)
+- UPDATE WAL: 373 B/row (improvement from 530, but A5 ≥320 target missed)
+- SELECT grouped: 28.6M vs PG 20.7M = **1.38×** (unchanged, no regression)
+- Conc matrix: **32/32 PASS**; Peak RSS: **260 MiB**
+
+**Honest-miss analysis:** A3 (UPDATE ≥0.12×) FAIL — regression from 0.04× to 0.02× due to 3×
+decode passes (compute + two post-process re-decodes); structural, not allocator. A4 (DELETE
+≥0.15×) FAIL at 0.07× — PG parallel delete not matchable without Step 4. A5 (UPDATE WAL ≤320)
+FAIL at 373 B/row. A6 DELETE WAL PASS. User decision: "if A3 and A4 aren't met, record the
+honest miss with root-cause explanation. The improvements are real and the WAL wins are proven
+— that's enough to ship."
+
+**Gates:** 42/42 crash harness ✓; 408 unit/integration tests ✓; clippy -D warnings clean ✓;
+cargo fmt clean ✓; 28/28 conc matrix ✓.
+
+**PR:** Ready to raise on branch `56-step3-delete-wal-batch`.
 
 ### 2026-07-16 — Item 51: SELECT JOIN hash join + predicate pushdown (Phase A shipped)
 

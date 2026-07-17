@@ -35,7 +35,15 @@ pub const MAGIC: u32 = 0x556E4442; // "UnDB"
 // the per-column `index_root` catalog pointer, so a version bump (D9) keeps an
 // older build from misreading them. No migration path — no prior version has
 // shipped externally.
-pub const FORMAT_VERSION: u16 = 5;
+//
+// v5 -> v6 (item 56 Step 3): a new WAL record kind `WAL_XMAX_BATCH` (type 14)
+// batches multiple xmax-stamp operations on the same heap page into a single
+// log record. Recovery for this record type is not present in older builds —
+// the recovery `_ => {}` catch-all silently skips unknown types, leaving dead
+// rows visible after crash recovery. The version bump causes older builds to
+// produce a hard `BadVersion` error rather than silently misrecovering. No
+// migration path — no prior version has shipped externally.
+pub const FORMAT_VERSION: u16 = 6;
 
 /// Default page size: 8 KiB (D8). Baked into the control file at DB init.
 pub const DEFAULT_PAGE_SIZE: u32 = 8192;
@@ -120,6 +128,23 @@ pub const WAL_FPI: u8 = 12;
 // against MVCC visibility, so a stale/extra entry is harmless and a missing one
 // is prevented by the index mini-txn fsyncing before the user txn commits.
 pub const WAL_INDEX: u8 = 13;
+
+// WAL batched xmax-stamp record (item 56, Step 3). One record per (page,
+// mini-txn) replaces N individual WAL_UPDATE records when delete_many (or
+// update_many Phase A) stamps multiple rows on the same page. `slot` is
+// `u16::MAX` (batch record; no single slot). FORMAT_VERSION bumped to 6 so
+// older builds reject this WAL with BadVersion rather than silently misrecovering
+// (recovery's `_ => {}` catch-all would skip unknown types, leaving dead rows
+// visible — incorrect behaviour, not a safe no-op).
+//
+// redo payload: xid (8 bytes LE) || n_slots (2 bytes LE) || slot_0 (2 bytes LE) || ...
+//   Redo: stamp xmax = xid on every listed slot (LSN-gated, idempotent).
+//
+// undo payload: n_slots (2 bytes LE) || slot_0 (2 bytes LE) || ...
+//   Undo: reset xmax = 0 on every listed slot. The old xmax is provably 0 for
+//   every row in the batch (conflict check rejects rows with xmax != 0 before
+//   any stamp), so the per-slot old-xmax payload of WAL_UPDATE is dead weight.
+pub const WAL_XMAX_BATCH: u8 = 14;
 
 // ── little-endian helpers ────────────────────────────────────────────────────
 

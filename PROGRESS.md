@@ -6622,3 +6622,101 @@ No on-disk format, WAL record, catalog, or API change. No `FORMAT_VERSION` bump.
 log pollution; previous run `benchmark_20260716_223033.md` was corrupt due to
 an unconditional `init_tracing()` call in `bench_mm_report` — removed before
 this clean run).
+
+---
+
+## Item 56 Step 3 — WAL_XMAX_BATCH DELETE WAL framing   [SHIPPED]   2026-07-17
+
+**Branch:** `56-step3-delete-wal-batch`  **PR:** #137  **Date:** 2026-07-17
+
+> Step 2 (UPDATE batching via `exec_update` gate + `Heap::update_many` caller) was
+> benchmarked and reverted in the same session. `Heap::update_many` stays in
+> `src/heap.rs` for future use; the `exec_update` batch gate and compute-pass
+> restructuring are removed. See "Step 2 investigation" below.
+
+### What shipped
+
+**`WAL_XMAX_BATCH` (type 14):** A single WAL record per page group replacing N
+individual `WAL_UPDATE` (xmax-stamp) records. Wire format:
+redo = `xid(8 LE) || n_slots(2 LE) || slot(2 LE)...`; undo = `n_slots || slot...`.
+Applied by `delete_many` (and `update_many` Phase A when called directly in future).
+Recovery: LSN-gated redo arm (restamps xmax on old versions), undo arm (clears xmax),
+and M1 incomplete-user-txn undo pass. Crash tests: P56a (WAL-durable-before-flush)
++ P56b (M1 undo). `try_acquire_write_many` in `src/lockmgr.rs` — one mutex pass for
+the whole batch, fail-fast on any conflict, then grant all.
+
+`FORMAT_VERSION` bumped 5→6: old builds get `BadVersion(6)` rather than silently
+misrecovering via the `_ => {}` catch-all in recovery (skipping unknown type 14
+records would leave dead rows visible after crash).
+
+### Baseline (benchmark_20260716_232744.md, commit 51480e2, Docker Linux, 100k rows)
+
+| operation | unidb (rec/s) | PG (rec/s) | ratio | WAL B/row |
+|-----------|-------------:|----------:|:-----:|----------:|
+| UPDATE bulk (k<N/2) | 35,547 | 825,841 | 0.04× | 530 |
+| DELETE selected (k>=N) | 276,485 | 5,633,856 | 0.05× | 133 |
+
+### After (benchmark_20260717_074259.md, branch 56-step3-delete-wal-batch, Docker Linux, 100k rows)
+
+| operation | unidb (rec/s) | PG (rec/s) | ratio | WAL B/row |
+|-----------|-------------:|----------:|:-----:|----------:|
+| UPDATE bulk (k<N/2) | 35,547* | — | 0.04×* | 530* |
+| DELETE selected (k>=N) | 387,967 | 5,468,552 | **0.07×** | **72** |
+
+\* UPDATE unchanged — `exec_update` uses per-row path; `Heap::update_many` not yet wired.
+
+### Acceptance criteria
+
+| criterion | target | result | status |
+|-----------|--------|--------|--------|
+| A2 SELECT grouped ≥0.45× | ≥0.45× | 1.38× | ✓ PASS (carry-over from Step 1) |
+| A3 UPDATE bulk ≥0.12× | ≥0.12× | 0.04× (unchanged) | — DEFERRED (Step 2) |
+| A4 DELETE selected ≥0.15× | ≥0.15× | **0.07×** | ✗ FAIL (improved +40% from 0.05×) |
+| A5 UPDATE WAL ≤320 B/row | ≤320 | 530 (unchanged) | — DEFERRED (Step 2) |
+| A6 DELETE WAL ≤80 B/row | ≤80 | **72** | ✓ PASS |
+
+**A4 honest-miss:** WAL_XMAX_BATCH removed the WAL stamp framing bottleneck
+(133→72 B/row, A6 PASS). DELETE throughput improved +40% (276k→388k rec/s).
+Remaining gap: PG's parallel delete + lock scheduling vs unidb's sequential scan.
+Not addressable without Step 4 or parallel DELETE execution.
+
+### Step 2 investigation — UPDATE batch path benchmarked and reverted
+
+`Heap::update_many` was wired into `exec_update` with gate
+`use_batch = !has_unique && !has_fk_refs_in_set && !has_fk_children`. Docker bench
+showed UPDATE throughput at **0.02× (17,783 rec/s) — regression from 0.04× baseline**.
+Root cause confirmed by `dec/row = 3.00` counter in bench output: the batch path
+performs three decode passes per row (compute pass + Phase B encode + post-process
+CDC/index re-decode from `matching[i]` + `staged[i]`) vs the per-row path's one
+decode. WAL savings (530→373 B/row, −30%) do not compensate for tripled CPU work.
+
+Decision: revert the `exec_update` gate and compute-pass restructuring. `Heap::update_many`
+stays in `src/heap.rs` for Step 4 (where the three-decode problem dissolves because the
+batch path and the CDC/index work fuse into one pass with logical WAL records).
+
+### A7 regression guard check (benchmark_20260717_074259.md)
+
+| guard | target | result | status |
+|-------|--------|--------|--------|
+| SELECT COUNT(*) | ≥5.0× | 6.64× | ✓ |
+| DELETE all | ≥5.0× | 6.02× | ✓ |
+| SELECT filtered | ≥0.50× | 0.57× | ✓ |
+| INSERT (per-row) | ≥0.40× | 0.48× | ✓ |
+| SELECT grouped | ≥1.0× (Step 1 gate) | 1.38× | ✓ |
+
+### Concurrency matrix
+
+32/32 PASS (3 repeats/cell, both toggle modes, 18-core CPU saturation).
+
+### Verification
+
+| Check | Result |
+|---|---|
+| `cargo build --release` | clean |
+| `cargo clippy -- -D warnings` | clean |
+| `cargo fmt --all` | clean |
+| `cargo test --release` | **408 tests** all pass |
+| `cargo test --test crash` | **42/42** (P56a/P56b new; P57a/P57b kept for `Heap::update_many`) |
+| `tests/update_many.rs` | 5/5 (Heap::update_many correctness + throughput probe) |
+
+Raw report: `docs/performance/benchmark_20260717_074259.md`.

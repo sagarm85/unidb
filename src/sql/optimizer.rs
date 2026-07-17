@@ -48,7 +48,9 @@ pub fn plan_access(
     // monolithic Filter on top of the entire join.  Multi-table and unresolved
     // predicates remain as a residual Filter above the join.
     let node = plan_from(from, catalog, ctes)?;
-    let Some(sel) = selection else { return Ok(node) };
+    let Some(sel) = selection else {
+        return Ok(node);
+    };
     let conjuncts: Vec<QExpr> = sel.conjuncts().into_iter().cloned().collect();
     let (node, residual) = push_predicates_down(node, conjuncts);
     if let Some(pred) = and_all(residual) {
@@ -296,7 +298,9 @@ fn collect_qualifiers(expr: &QExpr, out: &mut std::collections::HashSet<String>)
                 collect_qualifiers(v, out);
             }
         }
-        QExpr::Like { expr: e, pattern, .. } => {
+        QExpr::Like {
+            expr: e, pattern, ..
+        } => {
             collect_qualifiers(e, out);
             collect_qualifiers(pattern, out);
         }
@@ -337,10 +341,7 @@ fn single_qualifier(expr: &QExpr) -> Option<String> {
 /// are returned as `residual`.
 fn push_predicates_down(node: PlanNode, conjuncts: Vec<QExpr>) -> (PlanNode, Vec<QExpr>) {
     match node {
-        PlanNode::Scan {
-            ref qualifier,
-            ..
-        } => {
+        PlanNode::Scan { ref qualifier, .. } => {
             let q = qualifier.as_str();
             let (mine, rest): (Vec<_>, Vec<_>) = conjuncts
                 .into_iter()
@@ -348,10 +349,7 @@ fn push_predicates_down(node: PlanNode, conjuncts: Vec<QExpr>) -> (PlanNode, Vec
             let wrapped = wrap_filter(node, mine);
             (wrapped, rest)
         }
-        PlanNode::IndexScan {
-            ref qualifier,
-            ..
-        } => {
+        PlanNode::IndexScan { ref qualifier, .. } => {
             let q = qualifier.as_str();
             let (mine, rest): (Vec<_>, Vec<_>) = conjuncts
                 .into_iter()
