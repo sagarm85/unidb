@@ -76,10 +76,11 @@
 | 58 | `58_hot_update.md` | Performance | ✅ SHIPPED 2026-07-17 — HOT-equivalent UPDATE: same-page insert when no indexed col in SET; FSM pre-screen fast-path for full pages; vacuum B-tree patch for HOT chain heads; FORMAT_VERSION 7→8; P59a/P59b crash tests. Measured 0.043× PG at 100k packed rows (HOT fires only when pages have slack; no regression). PR #141 MERGED. See PROGRESS.md. |
 | 59 | `59_select_filtered_optimisations.md` | Performance | ✅ SHIPPED 2026-07-17 — Fix 1: `COLS_DECODED` gated behind `DIAGNOSTICS_ENABLED`; Fix 2: `Expr::ColumnSlot` pre-binding eliminates per-row linear String scan; Fix 3: `RawFilter` / `try_raw_i64_at` late materialisation skips `deform_row` on rejected rows at 5% selectivity. 3 new tests; 415 unit + 46 crash harness PASS. PR #142 MERGED. |
 | 60 | `60_event_queue_serde_json.md` | Performance | ✅ SHIPPED 2026-07-17 — replaced `serde_json::json!` + `row_to_json` (Value AST heap allocation) in `send_event_capture` with manual string builder (`build_event_envelope_str` + `write_row_json`); VECTOR(128) no longer boxes 128 `JsonValue::Number`s. W4/W0 at 100k: 1.70× → 1.49× (gate ≤1.50× MET). See PROGRESS.md. |
+| 61 | `61_replaced_stack_bench.md` | Performance | ⏳ IN PROGRESS — true replaced-stack benchmark: Postgres (row + pgvector + graph adjacency, 3 separate autocommit connections) + Redpanda (separate Docker container, real inter-process TCP, Kafka protocol via rskafka). Table 4.1 added to mmreport, gated on `MM_REPLACED_STACK_REALISTIC=1`. docker/docker-compose.yml updated with Redpanda service. |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `61_…`.**
+**Next new file → `62_…`.**
 
 ## Next up — priority order (2026-07-16, calibrated on `052432` Docker baseline)
 

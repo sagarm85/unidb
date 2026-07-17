@@ -2206,6 +2206,251 @@ fn pg_stack_torn_record_demo(url: &str) -> Option<bool> {
     Some(row_present == 1 && vec_present == 0 && edge_present == 0)
 }
 
+// ============ Item 61: TRUE replaced-stack helpers ==========================
+//
+// Two new helpers for Table 4.1, the headline M2 deliverable:
+//
+//   pg_four_model_one_txn_throughput  — all four model-writes in ONE Postgres
+//       transaction (best-case single-system reference: one PG commit, fully
+//       atomic within PG, but no Redpanda/graph-DB/Kafka). Shows that even the
+//       "best case for PG" pays client-server round-trip overhead on each write,
+//       whereas unidb is in-process.
+//
+//   pg_replaced_stack_realistic_throughput  — the TRUE replaced stack: three PG
+//       autocommit connections (row + pgvector + graph adjacency) + one Redpanda
+//       produce (separate Docker container, real inter-process TCP). The four
+//       writes have no shared transaction — a crash mid-sequence leaves a torn
+//       record. Compare vs unidb's single atomic commit.
+//
+// Both are gated on `MM_REPLACED_STACK_REALISTIC=1` at runtime; each skips
+// cleanly (returns None / prints a WARNING line) when the relevant service is
+// unreachable. They run under the same matched-durability Postgres lens already
+// established for Tables 3+4.
+
+/// Four model-writes in ONE Postgres transaction — the best-case reference for
+/// a single PG deployment that stores all four models in the same server. One
+/// `BEGIN`/`COMMIT` = one fsync, fully atomic within PG. Unlike the replaced-
+/// stack rows below, this is NOT the "replaced" scenario: a single PG txn
+/// cannot span Redpanda/Neo4j/Kafka. It answers "how fast is PG when we don't
+/// split across systems?" so the cost of splitting is visible by subtraction.
+///
+/// Returns commits/sec, or `None` if pgvector is absent (column then skipped).
+fn pg_four_model_one_txn_throughput(url: &str, n: u64) -> Option<f64> {
+    let mut c = pg_connect(url)?;
+    if c.batch_execute("CREATE EXTENSION IF NOT EXISTS vector")
+        .is_err()
+    {
+        eprintln!("  [pg] pgvector extension unavailable — PG one-txn column skipped");
+        return None;
+    }
+    c.batch_execute(&format!(
+        "DROP TABLE IF EXISTS pgt_rel, pgt_vec, pgt_edge, pgt_out; \
+         CREATE TABLE pgt_rel (id BIGINT PRIMARY KEY, body TEXT); \
+         CREATE TABLE pgt_vec (id BIGINT PRIMARY KEY, embedding vector({DIM})); \
+         CREATE INDEX pgt_vec_ann ON pgt_vec USING hnsw (embedding vector_cosine_ops); \
+         CREATE TABLE pgt_edge (from_id BIGINT, to_id BIGINT, edge_type TEXT); \
+         CREATE INDEX pgt_edge_from ON pgt_edge (from_id); \
+         CREATE TABLE pgt_out (seq BIGSERIAL PRIMARY KEY, kind TEXT, payload TEXT)"
+    ))
+    .ok()?;
+    let ins_rel = c
+        .prepare("INSERT INTO pgt_rel (id, body) VALUES ($1, $2)")
+        .ok()?;
+    let ins_vec = c
+        .prepare("INSERT INTO pgt_vec (id, embedding) VALUES ($1, $2::text::vector)")
+        .ok()?;
+    let ins_grf = c
+        .prepare("INSERT INTO pgt_edge (from_id, to_id, edge_type) VALUES ($1, $2, $3)")
+        .ok()?;
+    let ins_que = c
+        .prepare("INSERT INTO pgt_out (kind, payload) VALUES ($1, $2)")
+        .ok()?;
+    let start = Instant::now();
+    for i in 0..n as i64 {
+        // All four writes in one PG transaction — one fsync, one ACK.
+        let mut txn = c.transaction().unwrap();
+        let lit = pg_vector_literal(&embedding(i as u64));
+        txn.execute(&ins_rel, &[&i, &format!("body-{i}")]).unwrap();
+        txn.execute(&ins_vec, &[&i, &lit]).unwrap();
+        txn.execute(&ins_grf, &[&i, &(i + 1), &"rel"]).unwrap();
+        txn.execute(&ins_que, &[&"insert", &format!("body-{i}")])
+            .unwrap();
+        txn.commit().unwrap();
+    }
+    Some(rps(n, start.elapsed().as_secs_f64()))
+}
+
+/// The TRUE replaced stack (item 61, CLAUDE.md §6): three PG autocommit
+/// connections (relational row + pgvector+HNSW + graph adjacency, each its own
+/// durable commit) + one Redpanda produce per record (separate Docker container,
+/// real inter-process TCP round-trip, produce-ack waited before advancing).
+///
+/// This is what actually replaces unidb in production: the app talks to three
+/// systems (Postgres, and indirectly the same PG for graph, and Redpanda for
+/// the event queue). Three PG fsyncs + one Redpanda write-ack = four network
+/// round-trips per record, and — unlike unidb's single WAL_TXN_COMMIT — no
+/// shared transaction. A crash between any two commits leaves a torn record.
+///
+/// The difference from `pg_replaced_stack_throughput` (item 17, conservative):
+///   - Conservative: all four writes go to PG (same process, zero inter-process
+///     TCP); the "queue" is just a PG outbox table on the same server.
+///   - Realistic (this): the queue write goes to Redpanda, a separate process
+///     with a real TCP connection. The latency floor is higher by the
+///     Redpanda RTT (~1–2ms LAN, ~5–15ms Docker overlay) for every record.
+///
+/// Gated on `REDPANDA_ADDR` being reachable and pgvector being installed.
+/// Returns commits/sec or `None` to skip the column gracefully.
+fn pg_replaced_stack_realistic_throughput(
+    pg_url: &str,
+    redpanda_addr: &str,
+    n: u64,
+) -> Option<f64> {
+    use chrono::Utc;
+    use rskafka::{
+        client::{
+            partition::{Compression, UnknownTopicHandling},
+            ClientBuilder,
+        },
+        record::Record,
+    };
+
+    const TOPIC: &str = "item61.events";
+
+    // Tokio single-thread runtime for the async Redpanda client. Created once
+    // per function call; the benchmark loop uses block_on for each produce.
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "  [redpanda] WARNING: tokio runtime build failed ({e}) — realistic stack skipped"
+            );
+            return None;
+        }
+    };
+
+    // Connect to Redpanda broker.
+    let kafka_client = match rt
+        .block_on(ClientBuilder::new(vec![redpanda_addr.to_string()]).build())
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  [redpanda] WARNING: connect to {redpanda_addr} failed ({e}) — realistic stack skipped");
+            return None;
+        }
+    };
+
+    // Create the topic (idempotent — TopicAlreadyExists is not an error here).
+    let controller = match kafka_client.controller_client() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "  [redpanda] WARNING: controller_client failed ({e}) — realistic stack skipped"
+            );
+            return None;
+        }
+    };
+    // 1 partition, replication factor 1 (single-broker dev mode), 5s timeout.
+    // Ignore the result: the topic may already exist from a prior run.
+    let _ = rt.block_on(controller.create_topic(TOPIC, 1, 1, 5_000));
+
+    // Partition client with Retry: a race between topic creation and the first
+    // fetch of partition metadata can yield UnknownTopicOrPartition; Retry
+    // transparently retries until the leader is elected.
+    let partition_client =
+        match rt.block_on(kafka_client.partition_client(TOPIC, 0, UnknownTopicHandling::Retry)) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "  [redpanda] WARNING: partition_client failed ({e}) — realistic stack skipped"
+                );
+                return None;
+            }
+        };
+
+    // Three Postgres connections — each is its own "system" with its own fsync.
+    let mut rel = pg_connect(pg_url)?; // relational row store
+    let mut vec_c = pg_connect(pg_url)?; // vector store (pgvector + HNSW)
+    let mut grf = pg_connect(pg_url)?; // graph adjacency store
+
+    // pgvector gate — skip if extension absent (non-pgvector image).
+    if vec_c
+        .batch_execute("CREATE EXTENSION IF NOT EXISTS vector")
+        .is_err()
+    {
+        eprintln!("  [pg] pgvector extension unavailable — realistic stack skipped");
+        return None;
+    }
+
+    // Fresh tables (distinct prefix `rsr_` to avoid collision with item-17's
+    // `rs_` tables when both run in the same session).
+    rel.batch_execute(
+        "DROP TABLE IF EXISTS rsr_rel; \
+         CREATE TABLE rsr_rel (id BIGINT PRIMARY KEY, body TEXT)",
+    )
+    .ok()?;
+    vec_c
+        .batch_execute(&format!(
+            "DROP TABLE IF EXISTS rsr_vec; \
+             CREATE TABLE rsr_vec (id BIGINT PRIMARY KEY, embedding vector({DIM})); \
+             CREATE INDEX rsr_vec_ann ON rsr_vec USING hnsw (embedding vector_cosine_ops)"
+        ))
+        .ok()?;
+    grf.batch_execute(
+        "DROP TABLE IF EXISTS rsr_edge; \
+         CREATE TABLE rsr_edge (from_id BIGINT, to_id BIGINT, edge_type TEXT); \
+         CREATE INDEX rsr_edge_from ON rsr_edge (from_id)",
+    )
+    .ok()?;
+
+    let ins_rel = rel
+        .prepare("INSERT INTO rsr_rel (id, body) VALUES ($1, $2)")
+        .ok()?;
+    let ins_vec = vec_c
+        .prepare("INSERT INTO rsr_vec (id, embedding) VALUES ($1, $2::text::vector)")
+        .ok()?;
+    let ins_grf = grf
+        .prepare("INSERT INTO rsr_edge (from_id, to_id, edge_type) VALUES ($1, $2, $3)")
+        .ok()?;
+
+    let start = Instant::now();
+    for i in 0..n as i64 {
+        // 1. Relational row — PG autocommit, fsync #1.
+        rel.execute(&ins_rel, &[&i, &format!("body-{i}")]).unwrap();
+        // 2. Vector store (pgvector + HNSW) — PG autocommit, fsync #2.
+        let lit = pg_vector_literal(&embedding(i as u64));
+        vec_c.execute(&ins_vec, &[&i, &lit]).unwrap();
+        // 3. Graph adjacency — PG autocommit, fsync #3.
+        grf.execute(&ins_grf, &[&i, &(i + 1), &"rel"]).unwrap();
+        // 4. Event queue (Redpanda) — SEPARATE PROCESS, real inter-process TCP.
+        //    block_on waits for the produce ACK before advancing to the next
+        //    record, matching the semantics of the other three "wait for fsync"
+        //    calls. This is the true inter-process latency that the conservative
+        //    PG-outbox proxy does not pay.
+        rt.block_on(partition_client.produce(
+            vec![Record {
+                key: Some(i.to_le_bytes().to_vec()),
+                value: Some(
+                    format!(r#"{{"id":{i},"kind":"insert","body":"body-{i}"}}"#).into_bytes(),
+                ),
+                headers: Default::default(),
+                timestamp: Utc::now(),
+            }],
+            Compression::NoCompression,
+        ))
+        .unwrap();
+    }
+    Some(rps(n, start.elapsed().as_secs_f64()))
+}
+
+/// The `REDPANDA_ADDR` bootstrap address for the Redpanda/Kafka client, or
+/// `"localhost:9092"` when unset. Override via env when running outside Docker.
+fn redpanda_addr() -> String {
+    std::env::var("REDPANDA_ADDR").unwrap_or_else(|_| "localhost:9092".to_string())
+}
+
 /// The durability primitive unidb's commit sync (`File::sync_all`) actually
 /// resolves to on the platform this bench is *running* on, so the generated
 /// report is internally consistent instead of hard-coding "macOS". Rust std
@@ -2825,6 +3070,130 @@ fn bench_mm_report() {
         }
     } else {
         println!("_`PG_URL` unset → Postgres columns skipped; set it to run Table 4._\n");
+    }
+
+    // ---- Table 4.1: TRUE replaced-stack — PG (row+vec+graph) + Redpanda (item 61) ----
+    // Gated on MM_REPLACED_STACK_REALISTIC=1.  Runs under the same matched-
+    // durability lens as Tables 3+4 (pg_method already established above).
+    // The lens is reset for Table 5 after this block, so no extra lens flip needed.
+    let replaced_stack_realistic =
+        std::env::var("MM_REPLACED_STACK_REALISTIC").ok().as_deref() == Some("1");
+    let rp_addr = redpanda_addr();
+    if replaced_stack_realistic {
+        println!(
+            "## Table 4.1 — TRUE replaced-stack: Postgres (row + vec + graph) + Redpanda (event queue)\n"
+        );
+        println!(
+            "The **§6 headline benchmark** (CLAUDE.md §1/§6). Item 61 lifts the conservative\n\
+             PG-outbox proxy from item 17 to a **truly separate event-queue process**.\n\
+             \n\
+             Three systems, four writes per record, no shared transaction:\n\
+             \n\
+             | # | system | write | protocol | fsync? |\n\
+             |---|--------|-------|----------|--------|\n\
+             | 1 | Postgres (relational) | `INSERT INTO rsr_rel` | PG autocommit | ✅ own commit |\n\
+             | 2 | Postgres (pgvector + HNSW) | `INSERT INTO rsr_vec` | PG autocommit | ✅ own commit |\n\
+             | 3 | Postgres (graph adjacency) | `INSERT INTO rsr_edge` | PG autocommit | ✅ own commit |\n\
+             | 4 | Redpanda (event queue) | `produce(\"item61.events\")` | Kafka TCP | ✅ wait for ACK |\n\
+             \n\
+             **No shared transaction.** A crash between any two commits leaves a torn record.\n\
+             Contrast unidb W4: one `WAL_TXN_COMMIT`, one `{sync_prim}`, all-or-nothing.\n\
+             \n\
+             **Conservative vs realistic:** item 17's conservative baseline simulates the\n\
+             queue as a PG outbox table on the SAME server (no inter-process TCP). This\n\
+             table adds Redpanda in a SEPARATE Docker container — the true replaced-stack\n\
+             cost, including real inter-process TCP latency for the event leg.\n\
+             \n\
+             **PG all-in-one:** a single PG transaction over all four model-writes (no\n\
+             Redpanda) shows the best-case throughput for a PG-only deployment — one\n\
+             fsync, four round-trips within the same server. This is faster than the\n\
+             replaced-stack rows but still pays client-server round-trip overhead per\n\
+             write that unidb's embedded path does not.\n"
+        );
+        if let Some(ref m) = pg_method {
+            println!(
+                "_Durability lens: unidb `{sync_prim}`, Postgres `wal_sync_method={m}` (matched);\n\
+                 Redpanda: single-broker, produce ACK waited (acks=all). Redpanda at `{rp_addr}`._\n"
+            );
+            let u = url.as_deref().unwrap();
+            println!(
+                "| txns | system | txns/s | ms/txn | unidb ÷ this | atomicity |\n\
+                 |-----:|:-------|-------:|-------:|:------------:|:---------:|"
+            );
+            for &c in &sweep {
+                eprintln!("[mmreport] Table 4.1 at {c} txns…");
+                // unidb W4 — one atomic commit, already measured in Table 4 but
+                // re-measured here so all three rows use the same wall-clock window.
+                let uw4 = phased(&format!("t41_unidb_{c}"), || unidb_w4_throughput(c));
+                let u_ms = if uw4 > 0.0 { 1000.0 / uw4 } else { 0.0 };
+                println!("| {c} | **unidb W4** (1 atomic commit) | {uw4:.0} | {u_ms:.3} | 1.00× (baseline) | ✅ |");
+
+                // PG all-in-one (one PG transaction, four model-writes).
+                let pg1 = phased(&format!("t41_pg1txn_{c}"), || {
+                    pg_four_model_one_txn_throughput(u, c)
+                });
+                match pg1 {
+                    Some(s) if s > 0.0 => {
+                        let ratio = uw4 / s;
+                        let s_ms = 1000.0 / s;
+                        println!("| {c} | PG all-in-one (1 PG txn, same server) | {s:.0} | {s_ms:.3} | {ratio:.2}× | ✅ (within PG) |");
+                    }
+                    _ => {
+                        println!("| {c} | PG all-in-one (1 PG txn, same server) | _(pgvector n/a)_ | — | — | ✅ (within PG) |");
+                    }
+                }
+
+                // Conservative replaced-stack (item 17): 4×PG autocommit, same server.
+                let cons = phased(&format!("t41_cons_{c}"), || {
+                    pg_replaced_stack_throughput(u, c)
+                });
+                match cons {
+                    Some(s) if s > 0.0 => {
+                        let ratio = uw4 / s;
+                        let s_ms = 1000.0 / s;
+                        println!("| {c} | conservative stack (4×PG outbox, same server) | {s:.0} | {s_ms:.3} | {ratio:.2}× | ❌ |");
+                    }
+                    _ => {
+                        println!("| {c} | conservative stack (4×PG outbox, same server) | _(pgvector n/a)_ | — | — | ❌ |");
+                    }
+                }
+
+                // TRUE replaced-stack (item 61): 3×PG + Redpanda, separate process.
+                let real = phased(&format!("t41_real_{c}"), || {
+                    pg_replaced_stack_realistic_throughput(u, &rp_addr, c)
+                });
+                match real {
+                    Some(s) if s > 0.0 => {
+                        let ratio = uw4 / s;
+                        let s_ms = 1000.0 / s;
+                        println!("| {c} | **realistic stack (3×PG + Redpanda, 2 processes)** | {s:.0} | {s_ms:.3} | **{ratio:.2}×** | ❌ |");
+                    }
+                    _ => {
+                        println!("| {c} | **realistic stack (3×PG + Redpanda, 2 processes)** | _(Redpanda n/a)_ | — | — | ❌ |");
+                    }
+                }
+                println!("|   |   |   |   |   |   |");
+            }
+            println!();
+            println!(
+                "**Reading the table:**\n\
+                 - `unidb ÷ this > 1` = unidb is faster (embedded + 1 fsync wins).\n\
+                 - `unidb ÷ this < 1` = unidb is slower (the other system has lower overhead\n\
+                   for that workload size; honest — unidb is not a CRUD incumbent).\n\
+                 - The gap from `conservative` to `realistic` is the true inter-process\n\
+                   TCP tax of the Redpanda leg — the overhead the outbox proxy understates.\n\
+                 - The gap from `PG all-in-one` to `conservative` is the cost of splitting\n\
+                   the same four writes across four separate commits (no group-commit\n\
+                   coalescing between them).\n\
+                 - The atomicity column is the **unconditional** win: unidb guarantees\n\
+                   all-or-nothing regardless of `fsync` cost. No tuning buys the stack this.\n"
+            );
+        } else {
+            println!(
+                "_`PG_URL` unset → Table 4.1 skipped. Set `PG_URL` (superuser conn) and\n\
+                 `REDPANDA_ADDR` (default `localhost:9092`) to run this table._\n"
+            );
+        }
     }
 
     // Restore Postgres's default wal_sync_method (shared lens for Tables 3 & 4).

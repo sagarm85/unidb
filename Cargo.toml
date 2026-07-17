@@ -80,6 +80,18 @@ base64 = "0.22"
 # enters the engine's normal-edge graph, so the "engine stays sync" invariant
 # (`cargo tree -p unidb --no-default-features --edges normal`) still holds.
 postgres = "0.19"
+# Item 61: true replaced-stack benchmark — Redpanda (Kafka-compatible, no JVM)
+# as the event-queue leg of the four-system comparison. `rskafka` is pure Rust
+# (no librdkafka), async (needs tokio at bench time), gated on
+# `MM_REPLACED_STACK_REALISTIC=1` + `REDPANDA_ADDR` at runtime — skips
+# cleanly when Redpanda is unreachable, exactly like `PG_URL` unset.
+# `chrono` supplies `Utc::now()` for rskafka Record timestamps.
+# tokio is already an optional normal dep (server feature); adding it to
+# dev-deps activates `rt` + `rt-multi-thread` for bench-time use without
+# touching the library's sync-only normal-edge graph.
+rskafka = { version = "0.6", default-features = false }
+chrono = "0.4"
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 
 
 [[bin]]
