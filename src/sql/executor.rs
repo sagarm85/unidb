@@ -2364,214 +2364,126 @@ fn exec_update(
     };
     // Item 36: gate FK parent-side RESTRICT (does any child table reference us?).
     let has_fk_children = table_has_fk_children(ctx.catalog.get(), table);
-
-    // Item 56 Step 2: batch UPDATE path when there are no per-row constraint
-    // checks.  One decode per row in the compute pass; update_many stamps xmax
-    // on all old versions (one WAL mini-txn per page group) and inserts new
-    // versions (one per fill page).  Post-process uses staged literals — no
-    // re-decodes, so dec/row = 1.00 instead of the triple-decode regression.
-    let use_batch = !has_unique && !has_fk_refs_in_set && !has_fk_children;
-    let count = if use_batch {
-        struct StagedUpdate {
-            old_rid: RowId,
-            encoded_new: Vec<u8>,
-            before_row: Vec<Literal>,
-            after_row: Vec<Literal>,
+    let mut count = 0;
+    for (row_id, bytes) in matching {
+        let mut row = decode_row(&bytes, &table_def.columns)?;
+        // C1 (item 29): snapshot the pre-mutation image before set_column overwrites it.
+        let before_row = row.clone();
+        for (col, expr) in assignments {
+            let new_val = eval_expr(expr, &table_def.columns, &row)?;
+            set_column(&table_def.columns, &mut row, col, new_val)?;
         }
-        let mut staged: Vec<StagedUpdate> = Vec::with_capacity(matching.len());
-        for (row_id, bytes) in &matching {
-            let mut row = decode_row(bytes, &table_def.columns)?;
-            let before_row = row.clone();
-            for (col, expr) in assignments {
-                let new_val = eval_expr(expr, &table_def.columns, &row)?;
-                set_column(&table_def.columns, &mut row, col, new_val)?;
+        let coerced = coerce_and_validate_row(&table_def, row)?;
+        enforce_not_null(&table_def, &coerced)?;
+        enforce_checks(&table_def, &coerced)?;
+        // UNIQUE + FK — acquire all phantom locks BEFORE taking a fresh
+        // snapshot, then run uniqueness + FK checks with it (items 35/36/53).
+        // RESTRICT on old PK also uses a fresh snapshot (after its lock).
+        if has_unique || has_fk_refs_in_set || has_fk_children {
+            // Step 1: acquire UniqueKey + FkKey (child-side) phantom locks.
+            if has_unique {
+                for (col_idx, col) in table_def.columns.iter().enumerate() {
+                    if col.dropped || col.unique_index_root.is_none() {
+                        continue;
+                    }
+                    if let Ok(key) = OrderedValue::try_from(&coerced[col_idx]) {
+                        let lock_id = unique_key_record_id(&table_def.name, &col.name, &key);
+                        ctx.lock_mgr.acquire_blocking(lock_id, ctx.xid)?;
+                    }
+                }
             }
-            let coerced = coerce_and_validate_row(&table_def, row)?;
-            enforce_not_null(&table_def, &coerced)?;
-            enforce_checks(&table_def, &coerced)?;
-            staged.push(StagedUpdate {
-                old_rid: *row_id,
-                encoded_new: encode_row(&coerced),
-                before_row,
-                after_row: coerced,
-            });
+            // Item 53: skip FkKey phantom lock + enforce when FK col not in SET.
+            if has_fk_refs_in_set {
+                acquire_fk_key_locks(
+                    &table_def,
+                    &coerced,
+                    ctx.xid,
+                    ctx.lock_mgr,
+                    ctx.catalog.get(),
+                )?;
+            }
+            // Step 1b: FkKey parent lock for RESTRICT (old PK value).
+            if has_fk_children {
+                acquire_fk_key_locks_parent(&table_def, &before_row, ctx.xid, ctx.lock_mgr)?;
+            }
+            // Step 2: fresh snapshot AFTER all phantom locks.
+            let usnap = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+            // UNIQUE: exclude the row's current version (old tuple still visible
+            // to this snapshot until heap.update supersedes it).
+            if has_unique {
+                enforce_unique(
+                    &table_def,
+                    &coerced,
+                    &heap,
+                    &usnap,
+                    ctx.xid,
+                    ctx.pool,
+                    Some(row_id),
+                )?;
+            }
+            // FK child-side: new values must reference a visible parent row.
+            // Item 53: skipped when FK column not in SET (value unchanged).
+            if has_fk_refs_in_set {
+                enforce_fk_rows_exist(
+                    &table_def,
+                    &coerced,
+                    &usnap,
+                    ctx.xid,
+                    ctx.pool,
+                    ctx.catalog.get(),
+                )?;
+            }
+            // FK parent-side RESTRICT: old PK value must not be referenced.
+            if has_fk_children {
+                enforce_fk_restrict(
+                    &table_def,
+                    &before_row,
+                    &usnap,
+                    ctx.xid,
+                    ctx.pool,
+                    ctx.catalog.get(),
+                )?;
+            }
         }
-        // Move encoded bytes into pairs (no clone) — staged retains before/after literals.
-        let pairs: Vec<(RowId, Vec<u8>)> = staged
-            .iter_mut()
-            .map(|s| (s.old_rid, std::mem::take(&mut s.encoded_new)))
-            .collect();
-        let new_rids =
-            match heap.update_many(&pairs, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr) {
+        let encoded = encode_row(&coerced);
+        let new_row_id =
+            match heap.update(row_id, &encoded, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr) {
                 Err(e @ DbError::WriteConflict { .. }) => return Err(classify_conflict(e, ctx)),
                 other => other?,
             };
-        for (s, (_, new_rid)) in staged.iter().zip(new_rids.iter()) {
-            ctx.txn_mgr.ssi_note_write(ctx.xid, s.old_rid);
-            ctx.txn_mgr.record_undo(
-                ctx.xid,
-                UndoAction::XmaxStamp {
-                    page_id: s.old_rid.page_id,
-                    slot: s.old_rid.slot,
-                },
-            )?;
-            ctx.txn_mgr.record_undo(
-                ctx.xid,
-                UndoAction::Insert {
-                    page_id: new_rid.page_id,
-                    slot: new_rid.slot,
-                },
-            )?;
-            stage_row_index_writes_update(
-                &table_def,
-                s.old_rid,
-                *new_rid,
-                &s.before_row,
-                &s.after_row,
-                &mut index_batches,
-                &mut patch_batches,
-                ctx,
-            )?;
-            send_event_capture(
-                &table_def,
-                "update",
-                Some(&s.before_row),
-                Some(&s.after_row),
-                ctx,
-            )?;
-        }
-        staged.len()
-    } else {
-        let mut n = 0;
-        for (row_id, bytes) in matching {
-            let mut row = decode_row(&bytes, &table_def.columns)?;
-            // C1 (item 29): snapshot the pre-mutation image before set_column overwrites it.
-            let before_row = row.clone();
-            for (col, expr) in assignments {
-                let new_val = eval_expr(expr, &table_def.columns, &row)?;
-                set_column(&table_def.columns, &mut row, col, new_val)?;
-            }
-            let coerced = coerce_and_validate_row(&table_def, row)?;
-            enforce_not_null(&table_def, &coerced)?;
-            enforce_checks(&table_def, &coerced)?;
-            // UNIQUE + FK — acquire all phantom locks BEFORE taking a fresh
-            // snapshot, then run uniqueness + FK checks with it (items 35/36/53).
-            // RESTRICT on old PK also uses a fresh snapshot (after its lock).
-            if has_unique || has_fk_refs_in_set || has_fk_children {
-                // Step 1: acquire UniqueKey + FkKey (child-side) phantom locks.
-                if has_unique {
-                    for (col_idx, col) in table_def.columns.iter().enumerate() {
-                        if col.dropped || col.unique_index_root.is_none() {
-                            continue;
-                        }
-                        if let Ok(key) = OrderedValue::try_from(&coerced[col_idx]) {
-                            let lock_id =
-                                unique_key_record_id(&table_def.name, &col.name, &key);
-                            ctx.lock_mgr.acquire_blocking(lock_id, ctx.xid)?;
-                        }
-                    }
-                }
-                // Item 53: skip FkKey phantom lock + enforce when FK col not in SET.
-                if has_fk_refs_in_set {
-                    acquire_fk_key_locks(
-                        &table_def,
-                        &coerced,
-                        ctx.xid,
-                        ctx.lock_mgr,
-                        ctx.catalog.get(),
-                    )?;
-                }
-                // Step 1b: FkKey parent lock for RESTRICT (old PK value).
-                if has_fk_children {
-                    acquire_fk_key_locks_parent(
-                        &table_def,
-                        &before_row,
-                        ctx.xid,
-                        ctx.lock_mgr,
-                    )?;
-                }
-                // Step 2: fresh snapshot AFTER all phantom locks.
-                let usnap = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
-                // UNIQUE: exclude the row's current version (old tuple still
-                // visible to this snapshot until heap.update supersedes it).
-                if has_unique {
-                    enforce_unique(
-                        &table_def,
-                        &coerced,
-                        &heap,
-                        &usnap,
-                        ctx.xid,
-                        ctx.pool,
-                        Some(row_id),
-                    )?;
-                }
-                // FK child-side: new values must reference a visible parent row.
-                // Item 53: skipped when FK column not in SET (value unchanged).
-                if has_fk_refs_in_set {
-                    enforce_fk_rows_exist(
-                        &table_def,
-                        &coerced,
-                        &usnap,
-                        ctx.xid,
-                        ctx.pool,
-                        ctx.catalog.get(),
-                    )?;
-                }
-                // FK parent-side RESTRICT: old PK value must not be referenced.
-                if has_fk_children {
-                    enforce_fk_restrict(
-                        &table_def,
-                        &before_row,
-                        &usnap,
-                        ctx.xid,
-                        ctx.pool,
-                        ctx.catalog.get(),
-                    )?;
-                }
-            }
-            let encoded = encode_row(&coerced);
-            let new_row_id =
-                match heap.update(row_id, &encoded, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr) {
-                    Err(e @ DbError::WriteConflict { .. }) => {
-                        return Err(classify_conflict(e, ctx))
-                    }
-                    other => other?,
-                };
-            // P1.d: writing supersedes the version at `row_id` — an SSI write of the
-            // exact version a concurrent reader would have read.
-            ctx.txn_mgr.ssi_note_write(ctx.xid, row_id);
-            ctx.txn_mgr.record_undo(
-                ctx.xid,
-                UndoAction::XmaxStamp {
-                    page_id: row_id.page_id,
-                    slot: row_id.slot,
-                },
-            )?;
-            ctx.txn_mgr.record_undo(
-                ctx.xid,
-                UndoAction::Insert {
-                    page_id: new_row_id.page_id,
-                    slot: new_row_id.slot,
-                },
-            )?;
-            // Item 47: unchanged-key columns use in-place RowId patch (no splits, 1
-            // WAL page-image); changed-key columns fall through to the batch insert.
-            stage_row_index_writes_update(
-                &table_def,
-                row_id,
-                new_row_id,
-                &before_row,
-                &coerced,
-                &mut index_batches,
-                &mut patch_batches,
-                ctx,
-            )?;
-            // C1 (item 29): UPDATE carries both before (pre-mutation) and after (post-mutation).
-            send_event_capture(&table_def, "update", Some(&before_row), Some(&coerced), ctx)?;
-            n += 1;
-        }
-        n
-    };
+        // P1.d: writing supersedes the version at `row_id` — an SSI write of the
+        // exact version a concurrent reader would have read.
+        ctx.txn_mgr.ssi_note_write(ctx.xid, row_id);
+        ctx.txn_mgr.record_undo(
+            ctx.xid,
+            UndoAction::XmaxStamp {
+                page_id: row_id.page_id,
+                slot: row_id.slot,
+            },
+        )?;
+        ctx.txn_mgr.record_undo(
+            ctx.xid,
+            UndoAction::Insert {
+                page_id: new_row_id.page_id,
+                slot: new_row_id.slot,
+            },
+        )?;
+        // Item 47: unchanged-key columns use in-place RowId patch (no splits, 1
+        // WAL page-image); changed-key columns fall through to the batch insert.
+        stage_row_index_writes_update(
+            &table_def,
+            row_id,
+            new_row_id,
+            &before_row,
+            &coerced,
+            &mut index_batches,
+            &mut patch_batches,
+            ctx,
+        )?;
+        // C1 (item 29): UPDATE carries both before (pre-mutation) and after (post-mutation).
+        send_event_capture(&table_def, "update", Some(&before_row), Some(&coerced), ctx)?;
+        count += 1;
+    }
     // Coalesced index maintenance for the whole statement (A1).
     // Item 47: flush unchanged-key patches first (one WAL page-image per leaf),
     // then insert changed-key entries from the standard batch.
@@ -4359,6 +4271,15 @@ mod tests {
         fn commit(&mut self, xid: Xid) {
             self.txn_mgr.commit(xid, &self.wal, &self.lock_mgr).unwrap();
         }
+
+        fn abort(&mut self, xid: Xid) {
+            // A minimal empty Heap is sufficient: undo_xmax_stamp/undo_insert go
+            // directly to the buffer pool by page_id — they don't need the FSM.
+            let heap = Heap::open(self.page_size, None, vec![]);
+            self.txn_mgr
+                .abort(xid, &self.pool, &heap, &self.wal, &self.lock_mgr)
+                .unwrap();
+        }
     }
 
     #[test]
@@ -5838,5 +5759,171 @@ mod tests {
             .exec_as(xid, "SELECT * FROM t WHERE NEAR(name, [0.0, 0.0], 3)")
             .unwrap_err();
         assert!(matches!(err, DbError::SqlPlan(_)));
+    }
+
+    // ── Item 56 Step 2: update_many batch path ────────────────────────────────
+
+    #[test]
+    fn update_many_batch_produces_same_result_as_per_row() {
+        // Plain table (no unique/FK) takes the batch path; verify updated and
+        // unchanged rows all have the correct values after commit.
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE plain (id INT, v INT)")
+            .unwrap();
+        for i in 1..=20i64 {
+            h.exec_as(xid, &format!("INSERT INTO plain (id, v) VALUES ({i}, 0)"))
+                .unwrap();
+        }
+        h.commit(xid);
+
+        // Batch path: plain table has no unique/FK constraints.
+        let xid2 = h.begin();
+        let r = h
+            .exec_as(xid2, "UPDATE plain SET v = 100 WHERE id <= 10")
+            .unwrap();
+        assert_eq!(r, ExecResult::Updated { count: 10 });
+        h.commit(xid2);
+
+        let xid3 = h.begin();
+        let rows = match h
+            .exec_as(xid3, "SELECT id, v FROM plain WHERE id <= 10")
+            .unwrap()
+        {
+            ExecResult::Rows { rows: r, .. } => r,
+            o => panic!("{o:?}"),
+        };
+        // All 10 updated rows must have v = 100.
+        assert_eq!(rows.len(), 10);
+        for row in &rows {
+            assert_eq!(row[1], Literal::Int(100), "updated row must have v=100");
+        }
+        // Unchanged rows must still have v = 0.
+        let unchanged = match h
+            .exec_as(xid3, "SELECT id, v FROM plain WHERE id > 10")
+            .unwrap()
+        {
+            ExecResult::Rows { rows: r, .. } => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(unchanged.len(), 10);
+        for row in &unchanged {
+            assert_eq!(row[1], Literal::Int(0), "unmatched row must keep v=0");
+        }
+        h.commit(xid3);
+    }
+
+    #[test]
+    fn update_many_batch_abort_reverses_all_stamps() {
+        // If the user transaction is aborted after the batch UPDATE, all old
+        // versions must be restored (xmax cleared) and the original values visible.
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, v INT)").unwrap();
+        for i in 1..=5i64 {
+            h.exec_as(xid, &format!("INSERT INTO t (id, v) VALUES ({i}, 0)"))
+                .unwrap();
+        }
+        h.commit(xid);
+
+        // Batch UPDATE then abort.
+        let xid2 = h.begin();
+        let r = h.exec_as(xid2, "UPDATE t SET v = 999").unwrap();
+        assert_eq!(r, ExecResult::Updated { count: 5 });
+        h.abort(xid2);
+
+        // After abort: original values must be visible, not 999.
+        let xid3 = h.begin();
+        let rows = match h.exec_as(xid3, "SELECT v FROM t").unwrap() {
+            ExecResult::Rows { rows: r, .. } => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(rows.len(), 5);
+        for row in &rows {
+            assert_eq!(row[0], Literal::Int(0), "abort must restore original value");
+        }
+        h.commit(xid3);
+    }
+
+    #[test]
+    fn update_many_unique_table_stays_on_per_row_path_and_enforces_constraint() {
+        // A table with a UNIQUE/PK column must NOT take the batch path.
+        // Verify that a uniqueness violation on the per-row path is still caught:
+        // updating row id=1 to id=2 collides with the existing row id=2.
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE u (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+        h.exec_as(xid, "INSERT INTO u (id, v) VALUES (1, 10)")
+            .unwrap();
+        h.exec_as(xid, "INSERT INTO u (id, v) VALUES (2, 20)")
+            .unwrap();
+        h.commit(xid);
+
+        // id=1 → id=2 collides with the existing id=2 row.
+        let xid2 = h.begin();
+        let err = h
+            .exec_as(xid2, "UPDATE u SET id = 2 WHERE id = 1")
+            .unwrap_err();
+        assert!(
+            matches!(err, DbError::UniqueViolation { .. }),
+            "expected UniqueViolation, got {err:?}"
+        );
+        h.abort(xid2);
+    }
+
+    #[test]
+    fn update_many_page_boundary_crossing() {
+        // Regression for item-50-style infinite loop: updates spanning multiple
+        // heap pages must all succeed and each row must have the new value.
+        // We insert enough rows to span at least two pages, then update all of them.
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        // 256-byte body forces ~28-30 rows per 8 KiB page.
+        h.exec_as(xid, "CREATE TABLE t (id INT, body TEXT)")
+            .unwrap();
+        let body = "x".repeat(256);
+        let n = 80i64; // spans ≥3 pages
+        for i in 1..=n {
+            h.exec_as(
+                xid,
+                &format!("INSERT INTO t (id, body) VALUES ({i}, '{body}')"),
+            )
+            .unwrap();
+        }
+        h.commit(xid);
+
+        let xid2 = h.begin();
+        let r = h.exec_as(xid2, "UPDATE t SET body = 'updated'").unwrap();
+        assert_eq!(r, ExecResult::Updated { count: n as usize });
+        h.commit(xid2);
+
+        let xid3 = h.begin();
+        let rows = match h
+            .exec_as(xid3, "SELECT id FROM t WHERE body = 'updated'")
+            .unwrap()
+        {
+            ExecResult::Rows { rows: r, .. } => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(rows.len() as i64, n, "all {n} rows must show the new value");
+        // No row should still have the old body.
+        let old_rows = match h
+            .exec_as(xid3, &format!("SELECT id FROM t WHERE body = '{body}'"))
+            .unwrap()
+        {
+            ExecResult::Rows { rows: r, .. } => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(
+            old_rows.len(),
+            0,
+            "no rows should retain the old value after commit"
+        );
+        h.commit(xid3);
     }
 }
