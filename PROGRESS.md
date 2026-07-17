@@ -7299,3 +7299,53 @@ from item 62 bench available for comparison:
 | Recall@10 at 10k×dim128 (HNSW, ef=200) | **0.947** ≥ 0.90 gate PASS |
 | 10k build time (cache fix) | **4.6 min** (was 53+ min without completing; 14× speedup) |
 | Crash tests P60a + P60b | **PASS** (node data + meta survive no-checkpoint crash; post-checkpoint inserts survive crash) |
+
+---
+
+## Item 63 — M2 Closing Docker Bench   [HONEST REGRESSION RECORDED]   2026-07-18
+
+**Bench:** `report_20260717_151029.md` — first Docker bench with disk HNSW live (per-row incremental inserts).
+
+**Critical finding: HNSW per-insert cost is catastrophically high.**
+
+The bulk-build vector cache (item 63 perf fix) only helped `exec_create_index` (CREATE INDEX on existing rows).
+The per-row incremental path (`apply_durable_index_writes` → `DiskHnswIndex::insert`) still does ~3,200
+`pool.fetch_page` calls per insert (ef=200 candidates × 16 neighbours each) for node structure loading.
+
+### Table 1 — W4/W0 (HNSW, before per-insert node cache fix)
+
+| rows | W0 | W2 | W4 | W4/W0 | Δ vs IVF-Flat |
+|---:|---:|---:|---:|---:|---:|
+| 1k | 0.42 ms | 17.03 ms | 19.50 ms | **46.86×** | was 1.34× |
+| 10k | 0.46 ms | 15.39 ms | 16.66 ms | **36.51×** | was 2.29× |
+
+### Table 2 — Per-model marginal cost (HNSW vs IVF-Flat)
+
+| rows | Δ vector (W2−W1) HNSW | Δ vector (W2−W1) IVF-Flat |
+|---:|---:|---:|
+| 1k | **+16.59 ms** | +0.13 ms (127× worse) |
+| 10k | **+14.85 ms** | +0.11 ms (135× worse) |
+
+### Table 3 — CRUD (unchanged from IVF-Flat baseline, confirms HNSW doesn't affect CRUD)
+
+| operation | unidb rec/s | PG rec/s | ratio |
+|---|---|---|---|
+| SELECT COUNT(*) | 272M | 45.5M | **5.98×** |
+| DELETE all | 30.2M | 5.0M | **5.99×** |
+| SELECT grouped | 25.3M | 22.4M | **1.13×** |
+| INSERT per-row | 3,576 | 7,439 | 0.48× |
+| UPDATE bulk | 31,798 | 462,095 | 0.07× |
+| DELETE selected | 238,747 | 5.4M | 0.04× |
+
+Note: DELETE selected 0.04× does NOT yet include item 64 CRC fix (merged after this bench ran).
+
+### Table 4 — Thesis (BROKEN by HNSW insert cost)
+
+| txns | unidb txns/s | stack txns/s | unidb ÷ stack |
+|---:|---:|---:|---:|
+| 1k | 70 | 1,079 | **0.06×** |
+
+unidb is now 17× SLOWER than the 4-system replaced stack due to HNSW insert overhead.
+
+**Fix in progress: item 65 — per-insert node cache** (branch `65-hnsw-insert-cache`).
+Target: W2−W1 < 2ms, W4/W0 < 5×, Table 4 > 1.0×.
