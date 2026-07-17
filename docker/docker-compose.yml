@@ -64,7 +64,12 @@ services:
       postgres:
         condition: service_healthy
       redpanda:
-        condition: service_healthy
+        # Use service_started (not service_healthy) so the bench runs even if
+        # Redpanda fails — the bench handles unreachable Redpanda gracefully
+        # (pg_replaced_stack_realistic_throughput returns None and Table 4.1 is
+        # skipped). This prevents a Redpanda startup failure from aborting the
+        # standard CRUD bench entirely.
+        condition: service_started
     environment:
       # Superuser conn (rust-postgres key=value form) — mmreport needs superuser
       # for ALTER SYSTEM SET wal_sync_method.
