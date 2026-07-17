@@ -49,8 +49,8 @@ use crate::{
     format::{
         u16_from_le, u16_to_le, u32_from_le, u32_to_le, u64_from_le, u64_to_le, Lsn, PageId, Xid,
         INVALID_LSN, WAL_ABORT, WAL_BEGIN, WAL_CHECKPOINT, WAL_COMMIT, WAL_DELETE, WAL_FPI,
-        WAL_INDEX, WAL_INSERT, WAL_TXN_ABORT, WAL_TXN_BEGIN, WAL_TXN_COMMIT, WAL_UPDATE,
-        WAL_VACUUM, WAL_XMAX_BATCH,
+        WAL_INDEX, WAL_INDEX_INSERT, WAL_INSERT, WAL_TXN_ABORT, WAL_TXN_BEGIN, WAL_TXN_COMMIT,
+        WAL_UPDATE, WAL_VACUUM, WAL_XMAX_BATCH,
     },
 };
 
@@ -602,6 +602,44 @@ impl Wal {
             &[],
         )?;
         tracing::trace!(mini_txn_id = txn_id, lsn, page_id, "WAL INDEX");
+        Ok(lsn)
+    }
+
+    /// Log a logical B-tree leaf insert (item 56, Step 4 — `WAL_INDEX_INSERT`).
+    /// Replaces a full `WAL_INDEX` page image on the non-split single-insert
+    /// path. `slot` is the insertion position within the leaf's entry array;
+    /// `key_bytes` is the B-tree key encoded with [`btree_index::encode_key`];
+    /// `rid_page_id`/`rid_slot` are the heap `RowId`. Redo-only — no undo
+    /// payload. The caller must have already called `maybe_log_fpi` for
+    /// `page_id` within this checkpoint interval.
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_index_insert(
+        &self,
+        txn_id: u64,
+        prev_lsn: Lsn,
+        page_id: PageId,
+        slot: u16,
+        key_bytes: &[u8],
+        rid_page_id: PageId,
+        rid_slot: u16,
+    ) -> Result<Lsn> {
+        let mut redo = Vec::with_capacity(2 + key_bytes.len() + 6);
+        redo.extend_from_slice(&u16_to_le(key_bytes.len() as u16));
+        redo.extend_from_slice(key_bytes);
+        redo.extend_from_slice(&u32_to_le(rid_page_id));
+        redo.extend_from_slice(&u16_to_le(rid_slot));
+        let mut inner = self.lock();
+        let lsn = append_locked(
+            &mut inner,
+            txn_id,
+            prev_lsn,
+            WAL_INDEX_INSERT,
+            page_id,
+            slot,
+            &redo,
+            &[],
+        )?;
+        tracing::trace!(mini_txn_id = txn_id, lsn, page_id, slot, "WAL INDEX_INSERT");
         Ok(lsn)
     }
 

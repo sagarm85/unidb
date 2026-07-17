@@ -1019,22 +1019,41 @@ impl DiskBTree {
             match frame.node {
                 Node::Leaf { mut entries, next } => {
                     let probe = (value.clone(), rowid_key(rid));
-                    match entries.binary_search_by(|(k, r)| (k.clone(), rowid_key(*r)).cmp(&probe))
+                    let insert_pos = match entries
+                        .binary_search_by(|(k, r)| (k.clone(), rowid_key(*r)).cmp(&probe))
                     {
                         Ok(_) => return Ok(()), // exact (key,rid) duplicate — no-op
-                        Err(pos) => entries.insert(pos, (value.clone(), rid)),
-                    }
+                        Err(pos) => pos,
+                    };
+                    entries.insert(insert_pos, (value.clone(), rid));
                     let leaf = Node::Leaf { entries, next };
                     if leaf.body_len() <= cap {
-                        *prev_lsn = write_node(
-                            pool,
-                            wal,
+                        // Non-split single insert: FPI + logical WAL record.
+                        // frame.latch is still held (exclusive) on frame.pid —
+                        // safe for maybe_log_fpi (P5.a / item 56 Step 4).
+                        let _ = pool.fetch_page_for_write(frame.pid, wal)?;
+                        if let Some(fpi_lsn) =
+                            pool.maybe_log_fpi(frame.pid, wal, txn_id, *prev_lsn)?
+                        {
+                            *prev_lsn = fpi_lsn;
+                        }
+                        let mut key_bytes = Vec::new();
+                        encode_key(&value, &mut key_bytes);
+                        let lsn = wal.log_index_insert(
                             txn_id,
                             *prev_lsn,
                             frame.pid,
-                            &leaf,
-                            self.page_size,
+                            insert_pos as u16,
+                            &key_bytes,
+                            rid.page_id,
+                            rid.slot,
                         )?;
+                        let image = leaf.serialize(frame.pid, self.page_size);
+                        let mut sp = SlottedPage::from_bytes_unchecked(image);
+                        sp.set_lsn(lsn);
+                        pool.write_page(&sp)?;
+                        pool.unpin(frame.pid);
+                        *prev_lsn = lsn;
                         return Ok(()); // absorbed — remaining ancestor latches drop
                     }
                     pending = Some(self.split_leaf(leaf, frame.pid, pool, wal, txn_id, prev_lsn)?);
@@ -1677,6 +1696,40 @@ fn write_raw(
     pool.write_page(&sp)?;
     pool.unpin(page_id);
     Ok(lsn)
+}
+
+/// Apply a WAL_INDEX_INSERT logical redo record to a B-tree leaf page.
+/// Decodes the key from `key_bytes` (B-tree key encoding: type-tag byte +
+/// data), inserts (key, rid) at leaf entry position `slot`, and returns the
+/// re-serialized page with the entry inserted. Caller stamps the LSN and
+/// calls `pool.write_page`. Used exclusively by `recovery::redo_record`.
+pub fn redo_index_insert(
+    page: &SlottedPage,
+    slot: u16,
+    key_bytes: &[u8],
+    rid: RowId,
+    page_size: usize,
+) -> Result<SlottedPage> {
+    let mut node = Node::deserialize(page)?;
+    let Node::Leaf {
+        ref mut entries, ..
+    } = node
+    else {
+        return Err(DbError::Recovery(
+            "WAL_INDEX_INSERT redo: target page is not a B-tree leaf node".into(),
+        ));
+    };
+    let (key, _) = decode_key(key_bytes, 0)?;
+    let pos = slot as usize;
+    if pos > entries.len() {
+        return Err(DbError::Recovery(format!(
+            "WAL_INDEX_INSERT redo: slot {pos} out of range (leaf has {} entries)",
+            entries.len()
+        )));
+    }
+    entries.insert(pos, (key, rid));
+    let image = node.serialize(page.page_id(), page_size);
+    Ok(SlottedPage::from_bytes_unchecked(image))
 }
 
 #[cfg(test)]

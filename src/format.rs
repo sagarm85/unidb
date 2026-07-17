@@ -43,7 +43,20 @@ pub const MAGIC: u32 = 0x556E4442; // "UnDB"
 // rows visible after crash recovery. The version bump causes older builds to
 // produce a hard `BadVersion` error rather than silently misrecovering. No
 // migration path — no prior version has shipped externally.
-pub const FORMAT_VERSION: u16 = 6;
+//
+// v6 -> v7 (item 56 Step 4): WAL_INDEX_INSERT (type 15) replaces full-page
+// WAL_INDEX for single-row non-split leaf inserts. Torn-page safety is
+// provided by a WAL_FPI for the index leaf before the first logical record in
+// each checkpoint interval. Redo re-executes the key+RowId insert at the
+// recorded leaf slot (LSN-gated, idempotent). No undo arm — stale index
+// entries from aborted/incomplete inserts are filtered by heap visibility and
+// scrubbed by vacuum, matching existing behaviour for WAL_INDEX. An older
+// binary's recovery `_ => {}` catch-all would silently skip WAL_INDEX_INSERT,
+// leaving the index entry missing and the committed row unfindable — incorrect,
+// not a safe no-op. The version bump causes older builds to produce BadVersion
+// rather than silently misrecovering. No migration path — no prior version has
+// shipped externally.
+pub const FORMAT_VERSION: u16 = 7;
 
 /// Default page size: 8 KiB (D8). Baked into the control file at DB init.
 pub const DEFAULT_PAGE_SIZE: u32 = 8192;
@@ -145,6 +158,24 @@ pub const WAL_INDEX: u8 = 13;
 //   every row in the batch (conflict check rejects rows with xmax != 0 before
 //   any stamp), so the per-slot old-xmax payload of WAL_UPDATE is dead weight.
 pub const WAL_XMAX_BATCH: u8 = 14;
+
+// WAL logical B-tree leaf insert (item 56, Step 4). Redo-only, LSN-gated,
+// idempotent. Replaces WAL_INDEX (full page image) for single-row non-split
+// leaf inserts; splits, insert_many, and patch_many keep WAL_INDEX.
+//
+// WAL header fields used: `page_id` = leaf page; `slot` = insertion position
+// within the leaf's entry array (the index into `entries` after insertion).
+//
+// redo payload: key_len (2 B LE) || key_bytes (key_len B) || rid_page (4 B LE) || rid_slot (2 B LE)
+//   Redo: deserialize the leaf, insert (key, RowId) at position `slot`,
+//   re-serialize, stamp LSN. LSN-gated: skip if page.lsn() >= record.lsn.
+//   A WAL_FPI for the same leaf page precedes the first WAL_INDEX_INSERT in
+//   each checkpoint interval (torn-page safety, same as heap pages).
+//
+// undo payload: empty — no undo arm. Index entries for aborted/incomplete
+//   inserts are tolerated: the heap MVCC visibility check on every index
+//   lookup filters them, and vacuum scrubs them (same behaviour as WAL_INDEX).
+pub const WAL_INDEX_INSERT: u8 = 15;
 
 // ── little-endian helpers ────────────────────────────────────────────────────
 
