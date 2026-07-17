@@ -2364,127 +2364,214 @@ fn exec_update(
     };
     // Item 36: gate FK parent-side RESTRICT (does any child table reference us?).
     let has_fk_children = table_has_fk_children(ctx.catalog.get(), table);
-    let mut count = 0;
 
-    for (row_id, bytes) in matching {
-        let mut row = decode_row(&bytes, &table_def.columns)?;
-        // C1 (item 29): snapshot the pre-mutation image before set_column overwrites it.
-        let before_row = row.clone();
-        for (col, expr) in assignments {
-            let new_val = eval_expr(expr, &table_def.columns, &row)?;
-            set_column(&table_def.columns, &mut row, col, new_val)?;
+    // Item 56 Step 2: batch UPDATE path when there are no per-row constraint
+    // checks.  One decode per row in the compute pass; update_many stamps xmax
+    // on all old versions (one WAL mini-txn per page group) and inserts new
+    // versions (one per fill page).  Post-process uses staged literals — no
+    // re-decodes, so dec/row = 1.00 instead of the triple-decode regression.
+    let use_batch = !has_unique && !has_fk_refs_in_set && !has_fk_children;
+    let count = if use_batch {
+        struct StagedUpdate {
+            old_rid: RowId,
+            encoded_new: Vec<u8>,
+            before_row: Vec<Literal>,
+            after_row: Vec<Literal>,
         }
-        let coerced = coerce_and_validate_row(&table_def, row)?;
-        enforce_not_null(&table_def, &coerced)?;
-        enforce_checks(&table_def, &coerced)?;
-        // UNIQUE + FK — acquire all phantom locks BEFORE taking a fresh
-        // snapshot, then run uniqueness + FK checks with it (items 35/36/53).
-        // RESTRICT on old PK also uses a fresh snapshot (after its lock).
-        if has_unique || has_fk_refs_in_set || has_fk_children {
-            // Step 1: acquire UniqueKey + FkKey (child-side) phantom locks.
-            if has_unique {
-                for (col_idx, col) in table_def.columns.iter().enumerate() {
-                    if col.dropped || col.unique_index_root.is_none() {
-                        continue;
-                    }
-                    if let Ok(key) = OrderedValue::try_from(&coerced[col_idx]) {
-                        let lock_id = unique_key_record_id(&table_def.name, &col.name, &key);
-                        ctx.lock_mgr.acquire_blocking(lock_id, ctx.xid)?;
-                    }
-                }
+        let mut staged: Vec<StagedUpdate> = Vec::with_capacity(matching.len());
+        for (row_id, bytes) in &matching {
+            let mut row = decode_row(bytes, &table_def.columns)?;
+            let before_row = row.clone();
+            for (col, expr) in assignments {
+                let new_val = eval_expr(expr, &table_def.columns, &row)?;
+                set_column(&table_def.columns, &mut row, col, new_val)?;
             }
-            // Item 53: skip FkKey phantom lock + enforce when FK col not in SET.
-            if has_fk_refs_in_set {
-                acquire_fk_key_locks(
-                    &table_def,
-                    &coerced,
-                    ctx.xid,
-                    ctx.lock_mgr,
-                    ctx.catalog.get(),
-                )?;
-            }
-            // Step 1b: FkKey parent lock for RESTRICT (old PK value).
-            if has_fk_children {
-                acquire_fk_key_locks_parent(&table_def, &before_row, ctx.xid, ctx.lock_mgr)?;
-            }
-            // Step 2: fresh snapshot AFTER all phantom locks.
-            let usnap = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
-            // UNIQUE: exclude the row's current version (old tuple still
-            // visible to this snapshot until heap.update supersedes it).
-            if has_unique {
-                enforce_unique(
-                    &table_def,
-                    &coerced,
-                    &heap,
-                    &usnap,
-                    ctx.xid,
-                    ctx.pool,
-                    Some(row_id),
-                )?;
-            }
-            // FK child-side: new values must reference a visible parent row.
-            // Item 53: skipped when FK column not in SET (value unchanged).
-            if has_fk_refs_in_set {
-                enforce_fk_rows_exist(
-                    &table_def,
-                    &coerced,
-                    &usnap,
-                    ctx.xid,
-                    ctx.pool,
-                    ctx.catalog.get(),
-                )?;
-            }
-            // FK parent-side RESTRICT: old PK value must not be referenced.
-            if has_fk_children {
-                enforce_fk_restrict(
-                    &table_def,
-                    &before_row,
-                    &usnap,
-                    ctx.xid,
-                    ctx.pool,
-                    ctx.catalog.get(),
-                )?;
-            }
+            let coerced = coerce_and_validate_row(&table_def, row)?;
+            enforce_not_null(&table_def, &coerced)?;
+            enforce_checks(&table_def, &coerced)?;
+            staged.push(StagedUpdate {
+                old_rid: *row_id,
+                encoded_new: encode_row(&coerced),
+                before_row,
+                after_row: coerced,
+            });
         }
-        let encoded = encode_row(&coerced);
-        let new_row_id =
-            match heap.update(row_id, &encoded, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr) {
+        // Move encoded bytes into pairs (no clone) — staged retains before/after literals.
+        let pairs: Vec<(RowId, Vec<u8>)> = staged
+            .iter_mut()
+            .map(|s| (s.old_rid, std::mem::take(&mut s.encoded_new)))
+            .collect();
+        let new_rids =
+            match heap.update_many(&pairs, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr) {
                 Err(e @ DbError::WriteConflict { .. }) => return Err(classify_conflict(e, ctx)),
                 other => other?,
             };
-        // P1.d: writing supersedes the version at `row_id` — an SSI write of the
-        // exact version a concurrent reader would have read.
-        ctx.txn_mgr.ssi_note_write(ctx.xid, row_id);
-        ctx.txn_mgr.record_undo(
-            ctx.xid,
-            UndoAction::XmaxStamp {
-                page_id: row_id.page_id,
-                slot: row_id.slot,
-            },
-        )?;
-        ctx.txn_mgr.record_undo(
-            ctx.xid,
-            UndoAction::Insert {
-                page_id: new_row_id.page_id,
-                slot: new_row_id.slot,
-            },
-        )?;
-        // Item 47: unchanged-key columns use in-place RowId patch (no splits, 1
-        // WAL page-image); changed-key columns fall through to the batch insert.
-        stage_row_index_writes_update(
-            &table_def,
-            row_id,
-            new_row_id,
-            &before_row,
-            &coerced,
-            &mut index_batches,
-            &mut patch_batches,
-            ctx,
-        )?;
-        // C1 (item 29): UPDATE carries both before (pre-mutation) and after (post-mutation).
-        send_event_capture(&table_def, "update", Some(&before_row), Some(&coerced), ctx)?;
-        count += 1;
-    }
+        for (s, (_, new_rid)) in staged.iter().zip(new_rids.iter()) {
+            ctx.txn_mgr.ssi_note_write(ctx.xid, s.old_rid);
+            ctx.txn_mgr.record_undo(
+                ctx.xid,
+                UndoAction::XmaxStamp {
+                    page_id: s.old_rid.page_id,
+                    slot: s.old_rid.slot,
+                },
+            )?;
+            ctx.txn_mgr.record_undo(
+                ctx.xid,
+                UndoAction::Insert {
+                    page_id: new_rid.page_id,
+                    slot: new_rid.slot,
+                },
+            )?;
+            stage_row_index_writes_update(
+                &table_def,
+                s.old_rid,
+                *new_rid,
+                &s.before_row,
+                &s.after_row,
+                &mut index_batches,
+                &mut patch_batches,
+                ctx,
+            )?;
+            send_event_capture(
+                &table_def,
+                "update",
+                Some(&s.before_row),
+                Some(&s.after_row),
+                ctx,
+            )?;
+        }
+        staged.len()
+    } else {
+        let mut n = 0;
+        for (row_id, bytes) in matching {
+            let mut row = decode_row(&bytes, &table_def.columns)?;
+            // C1 (item 29): snapshot the pre-mutation image before set_column overwrites it.
+            let before_row = row.clone();
+            for (col, expr) in assignments {
+                let new_val = eval_expr(expr, &table_def.columns, &row)?;
+                set_column(&table_def.columns, &mut row, col, new_val)?;
+            }
+            let coerced = coerce_and_validate_row(&table_def, row)?;
+            enforce_not_null(&table_def, &coerced)?;
+            enforce_checks(&table_def, &coerced)?;
+            // UNIQUE + FK — acquire all phantom locks BEFORE taking a fresh
+            // snapshot, then run uniqueness + FK checks with it (items 35/36/53).
+            // RESTRICT on old PK also uses a fresh snapshot (after its lock).
+            if has_unique || has_fk_refs_in_set || has_fk_children {
+                // Step 1: acquire UniqueKey + FkKey (child-side) phantom locks.
+                if has_unique {
+                    for (col_idx, col) in table_def.columns.iter().enumerate() {
+                        if col.dropped || col.unique_index_root.is_none() {
+                            continue;
+                        }
+                        if let Ok(key) = OrderedValue::try_from(&coerced[col_idx]) {
+                            let lock_id =
+                                unique_key_record_id(&table_def.name, &col.name, &key);
+                            ctx.lock_mgr.acquire_blocking(lock_id, ctx.xid)?;
+                        }
+                    }
+                }
+                // Item 53: skip FkKey phantom lock + enforce when FK col not in SET.
+                if has_fk_refs_in_set {
+                    acquire_fk_key_locks(
+                        &table_def,
+                        &coerced,
+                        ctx.xid,
+                        ctx.lock_mgr,
+                        ctx.catalog.get(),
+                    )?;
+                }
+                // Step 1b: FkKey parent lock for RESTRICT (old PK value).
+                if has_fk_children {
+                    acquire_fk_key_locks_parent(
+                        &table_def,
+                        &before_row,
+                        ctx.xid,
+                        ctx.lock_mgr,
+                    )?;
+                }
+                // Step 2: fresh snapshot AFTER all phantom locks.
+                let usnap = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+                // UNIQUE: exclude the row's current version (old tuple still
+                // visible to this snapshot until heap.update supersedes it).
+                if has_unique {
+                    enforce_unique(
+                        &table_def,
+                        &coerced,
+                        &heap,
+                        &usnap,
+                        ctx.xid,
+                        ctx.pool,
+                        Some(row_id),
+                    )?;
+                }
+                // FK child-side: new values must reference a visible parent row.
+                // Item 53: skipped when FK column not in SET (value unchanged).
+                if has_fk_refs_in_set {
+                    enforce_fk_rows_exist(
+                        &table_def,
+                        &coerced,
+                        &usnap,
+                        ctx.xid,
+                        ctx.pool,
+                        ctx.catalog.get(),
+                    )?;
+                }
+                // FK parent-side RESTRICT: old PK value must not be referenced.
+                if has_fk_children {
+                    enforce_fk_restrict(
+                        &table_def,
+                        &before_row,
+                        &usnap,
+                        ctx.xid,
+                        ctx.pool,
+                        ctx.catalog.get(),
+                    )?;
+                }
+            }
+            let encoded = encode_row(&coerced);
+            let new_row_id =
+                match heap.update(row_id, &encoded, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr) {
+                    Err(e @ DbError::WriteConflict { .. }) => {
+                        return Err(classify_conflict(e, ctx))
+                    }
+                    other => other?,
+                };
+            // P1.d: writing supersedes the version at `row_id` — an SSI write of the
+            // exact version a concurrent reader would have read.
+            ctx.txn_mgr.ssi_note_write(ctx.xid, row_id);
+            ctx.txn_mgr.record_undo(
+                ctx.xid,
+                UndoAction::XmaxStamp {
+                    page_id: row_id.page_id,
+                    slot: row_id.slot,
+                },
+            )?;
+            ctx.txn_mgr.record_undo(
+                ctx.xid,
+                UndoAction::Insert {
+                    page_id: new_row_id.page_id,
+                    slot: new_row_id.slot,
+                },
+            )?;
+            // Item 47: unchanged-key columns use in-place RowId patch (no splits, 1
+            // WAL page-image); changed-key columns fall through to the batch insert.
+            stage_row_index_writes_update(
+                &table_def,
+                row_id,
+                new_row_id,
+                &before_row,
+                &coerced,
+                &mut index_batches,
+                &mut patch_batches,
+                ctx,
+            )?;
+            // C1 (item 29): UPDATE carries both before (pre-mutation) and after (post-mutation).
+            send_event_capture(&table_def, "update", Some(&before_row), Some(&coerced), ctx)?;
+            n += 1;
+        }
+        n
+    };
     // Coalesced index maintenance for the whole statement (A1).
     // Item 47: flush unchanged-key patches first (one WAL page-image per leaf),
     // then insert changed-key entries from the standard batch.
