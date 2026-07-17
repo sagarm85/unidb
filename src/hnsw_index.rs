@@ -948,9 +948,22 @@ impl DiskHnswIndex {
         // Only used on the incremental (non-bulk-build) path; when build_cache is
         // Some, all vectors are already in memory so node-page fetches are rare.
         // Dropped at end of this function — NEVER shared across insert calls.
+        //
+        // Size gate: at large table sizes the shrink path in
+        // `apply_reciprocal_l0_to_buf` adds ~512 HnswNode entries (each with a
+        // heap-allocated Vec<f32>) to the cache per insert when all neighbor
+        // slots are full.  At 100 k rows this causes ~36 GB of allocator
+        // traffic and makes HNSW inserts 1.82× *slower* than without the
+        // cache.  Below NODECACHE_MAX_NODES neighbor lists are rarely full so
+        // the shrink overhead is negligible and the cache pays off.
+        // `search_layer` already has its own `visited: HashSet<RowId>` that
+        // prevents duplicate node fetches during beam search, so the cache
+        // benefit above the threshold is near-zero anyway.
+        const NODECACHE_MAX_NODES: u32 = 5_000;
         let mut node_cache: NodeCache = NodeCache::new();
-        // nc is a convenience alias; only used when build_cache.is_none().
-        let use_node_cache = build_cache.is_none();
+        // nc is a convenience alias; only used when use_node_cache is true.
+        let use_node_cache =
+            build_cache.is_none() && hdr.total_nodes < NODECACHE_MAX_NODES;
 
         let level = Self::assign_level(hdr.total_nodes);
 
