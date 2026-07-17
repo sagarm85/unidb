@@ -208,6 +208,7 @@ pub fn recover(
                     if incomplete_user_txns.contains(&new_xmax) {
                         let mut page = fetch_or_create(&pool, r.page_id, page_size)?;
                         page.set_xmax(r.slot, 0)?;
+                        page.recompute_crc();
                         pool.write_page(&page)?;
                         pool.unpin(r.page_id);
                         stats.records_undone += 1;
@@ -225,6 +226,7 @@ pub fn recover(
                                 Err(e) => return Err(e),
                             }
                         }
+                        page.recompute_crc();
                         pool.write_page(&page)?;
                         pool.unpin(r.page_id);
                         stats.records_undone += 1;
@@ -252,6 +254,7 @@ pub fn recover(
                             Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
                             Err(e) => return Err(e),
                         }
+                        page.recompute_crc();
                         pool.write_page(&page)?;
                         pool.unpin(r.page_id);
                         stats.records_undone += 1;
@@ -276,6 +279,7 @@ pub fn recover(
                 if incomplete_user_txns.contains(&xmin) {
                     let mut page = fetch_or_create(&pool, r.page_id, page_size)?;
                     page.set_xmax(r.slot, xmin)?;
+                    page.recompute_crc();
                     pool.write_page(&page)?;
                     pool.unpin(r.page_id);
                     stats.records_undone += 1;
@@ -541,6 +545,7 @@ fn undo_record(r: &WalRecord, pool: &BufferPool, page_size: usize) -> Result<()>
                 Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
                 Err(e) => return Err(e),
             }
+            page.recompute_crc();
             pool.write_page(&page)?;
             pool.unpin(r.page_id);
         }
@@ -556,6 +561,7 @@ fn undo_record(r: &WalRecord, pool: &BufferPool, page_size: usize) -> Result<()>
                     Err(e) => return Err(e),
                 }
             }
+            page.recompute_crc();
             pool.write_page(&page)?;
             pool.unpin(r.page_id);
         }
@@ -602,6 +608,7 @@ fn undo_record(r: &WalRecord, pool: &BufferPool, page_size: usize) -> Result<()>
                 Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
                 Err(e) => return Err(e),
             }
+            page.recompute_crc();
             pool.write_page(&page)?;
             pool.unpin(r.page_id);
         }

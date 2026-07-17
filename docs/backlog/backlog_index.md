@@ -80,10 +80,11 @@
 
 | 63 | `63_disk_hnsw_planning.md` | Performance | ✅ SHIPPED 2026-07-17 — on-disk HNSW replaces IVF-Flat. recall@10=0.964 at 1k×dim128 (≥0.95 gate PASS). src/hnsw_index.rs; 48/48 crash tests (P60a+P60b); 669 tests; clippy/fmt clean. PR pending. |
 | 62 | `62_ivf_scale_validation.md` | Performance | ✅ SHIPPED 2026-07-17 — bench: IVF recall@10/latency at 1k/10k/100k; recall=0.421 at 100k unlocks item 63 gate. PR #145 MERGED. |
+| 64 | `64_delete_lazy_xmax.md` | Performance | 🔄 INVESTIGATION COMPLETE — two bottlenecks profiled: (1) CRC-per-mutation in `set_xmax` (807 ns/row, 87.5% at 25k scale); (2) `latch_fetch` blowup 1.2→611 µs/page at 100k (mmap/OS cold-page). Lazy xmax ruled infeasible (MVCC violation). Fix A (remove `write_crc()` from `set_xmax`) ready to implement. Fix B (latch+fetch root cause) needs diagnostic first. |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `64_…`.**
+**Next new file → `65_…`.**
 
 ## Next up — priority order (2026-07-16, calibrated on `052432` Docker baseline)
 
