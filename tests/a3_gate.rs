@@ -210,6 +210,9 @@ fn a3_gate_50pct_delete_large_table_stays_on_scan() {
     //   index ≈ half  × 1 = 5000   (deform pred col for matched rows only)
     // threshold: (total + half) / 2 = 7500 — scan exceeds it, index falls below.
     let threshold = (total + half) / 2;
+    // Item 59 Fix 1: enable diagnostics so the COLS_DECODED counter fires
+    // (gated behind DIAGNOSTICS_ENABLED by default to reduce hot-path overhead).
+    Engine::enable_diagnostics();
     let cols0 = Engine::cols_decoded_total();
     exec(&engine, &format!("DELETE FROM t WHERE k >= {half}"));
     let cols_delta = Engine::cols_decoded_total().saturating_sub(cols0);

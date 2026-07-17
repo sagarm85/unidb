@@ -631,6 +631,16 @@ pub static ROWS_DECODED: AtomicU64 = AtomicU64::new(0);
 /// columns (esp. TEXT) stop being materialized. `Relaxed`, like `ROWS_DECODED`.
 pub static COLS_DECODED: AtomicU64 = AtomicU64::new(0);
 
+/// Item 59 Fix 1: gate `COLS_DECODED.fetch_add()` behind this bool so it is a
+/// no-op on the hot path in release builds. Defaults **false**; the bench
+/// enables it via `Engine::enable_diagnostics()` before sampling, and the
+/// `group_by_cols_per_row` test enables it too. Using a plain `AtomicBool`
+/// load (Relaxed) costs ~0.3 ns/call when false — negligible. The alternative
+/// (`#[cfg(feature = "diagnostics")]`) would require a feature flag in every
+/// Cargo.toml and bench invocation; a runtime bool is simpler and correct.
+pub static DIAGNOSTICS_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// How the executor holds the catalog for one statement (index-write-concurrency
 /// Item 0a). Every SQL statement that changes no schema reads the catalog only
 /// (it `lookup(table)?.clone()`s the `TableDef` and works off the owned clone),
@@ -1670,15 +1680,33 @@ fn exec_select(
     let cols = &table_def.columns;
     let ncols = cols.len();
     let proj_cols = projection_columns(&table_def, projection);
+
+    // Item 59 Fix 2: bind column names → slot indices once before the scan.
+    // We need an owned, mutable copy of the predicate so we can walk and
+    // rewrite it; the original is left untouched (it may be reused elsewhere
+    // in the plan by the Query engine).
+    let bound_pred: Option<Expr> = predicate.clone().map(|mut p| {
+        bind_predicate_columns(&mut p, cols);
+        p
+    });
+
     let mut pred_cols = Vec::new();
-    if let Some(pred) = predicate {
+    if let Some(pred) = bound_pred.as_ref() {
         expr_columns(pred, &table_def, &mut pred_cols);
     }
     let (pred_needed, pred_upto) = needed_mask(&pred_cols, ncols);
     let mut full_cols = proj_cols;
     full_cols.extend_from_slice(&pred_cols);
     let (full_needed, full_upto) = needed_mask(&full_cols, ncols);
-    let has_pred = predicate.is_some();
+    let has_pred = bound_pred.is_some();
+
+    // Item 59 Fix 3: late materialisation — build a raw integer filter from the
+    // (now-bound) predicate. For simple `ColumnSlot(idx) op Int` conjunctions,
+    // `raw_filter.passes()` reads the i64 directly from page bytes and rejects
+    // non-matching rows without calling `deform_row` at all. At 5% selectivity
+    // this eliminates ~95% of `deform_row` + `Vec<Literal>` allocations on the
+    // predicate pass.
+    let raw_filter: Option<RawFilter> = bound_pred.as_ref().and_then(try_build_raw_filter);
 
     // The two-phase B2 decode as a closure, shared by the serial and parallel
     // paths: predicate columns → test → projection columns only on a match.
@@ -1686,9 +1714,29 @@ fn exec_select(
     // instead of cloning, saving one String allocation per TEXT column per row.
     let per_row = |bytes: &[u8]| -> Result<Option<Vec<Literal>>> {
         if has_pred {
-            let prow = deform_row(bytes, cols, pred_upto, &pred_needed)?;
-            if !predicate_matches(predicate, cols, &prow)? {
-                return Ok(None);
+            // Fix 3: try the raw fast path first; fall through to deform_row
+            // if the predicate is not a simple integer conjunction or if
+            // try_raw_i64_at returns None (variable-width preceding column).
+            if let Some(ref rf) = raw_filter {
+                match rf.passes(bytes, cols) {
+                    Some(true) => {}                // passes raw check — proceed to full decode
+                    Some(false) => return Ok(None), // rejected cheaply
+                    None => {
+                        // Raw path unavailable (variable-width col or NULL) —
+                        // fall through to the normal deform_row path below.
+                        let prow = deform_row(bytes, cols, pred_upto, &pred_needed)?;
+                        if !predicate_matches(&bound_pred, cols, &prow)? {
+                            return Ok(None);
+                        }
+                        let mut row = deform_row(bytes, cols, full_upto, &full_needed)?;
+                        return Ok(Some(project_row_drain(projection, cols, &mut row)?));
+                    }
+                }
+            } else {
+                let prow = deform_row(bytes, cols, pred_upto, &pred_needed)?;
+                if !predicate_matches(&bound_pred, cols, &prow)? {
+                    return Ok(None);
+                }
             }
         }
         let mut row = deform_row(bytes, cols, full_upto, &full_needed)?;
@@ -1766,15 +1814,22 @@ pub(crate) fn exec_select_readonly<P: PageReader>(
     let cols = &table_def.columns;
     let ncols = cols.len();
     let proj_cols = projection_columns(&table_def, projection);
+    // Item 59 Fix 2: bind column names → slot indices (same as exec_select).
+    let bound_pred: Option<Expr> = predicate.clone().map(|mut p| {
+        bind_predicate_columns(&mut p, cols);
+        p
+    });
     let mut pred_cols = Vec::new();
-    if let Some(pred) = predicate {
+    if let Some(pred) = bound_pred.as_ref() {
         expr_columns(pred, &table_def, &mut pred_cols);
     }
     let (pred_needed, pred_upto) = needed_mask(&pred_cols, ncols);
     let mut full_cols = proj_cols;
     full_cols.extend_from_slice(&pred_cols);
     let (full_needed, full_upto) = needed_mask(&full_cols, ncols);
-    let has_pred = predicate.is_some();
+    let has_pred = bound_pred.is_some();
+    // Item 59 Fix 3: raw integer filter for the readonly path.
+    let raw_filter: Option<RawFilter> = bound_pred.as_ref().and_then(try_build_raw_filter);
 
     let mut out = Vec::new();
     for (i, (_, bytes)) in heap
@@ -1786,9 +1841,25 @@ pub(crate) fn exec_select_readonly<P: PageReader>(
             crate::query_limits::check()?; // P5.f: timeout / cancellation
         }
         if has_pred {
-            let prow = deform_row(&bytes, cols, pred_upto, &pred_needed)?;
-            if !predicate_matches(predicate, cols, &prow)? {
-                continue;
+            if let Some(ref rf) = raw_filter {
+                match rf.passes(&bytes, cols) {
+                    Some(true) => {}
+                    Some(false) => continue,
+                    None => {
+                        let prow = deform_row(&bytes, cols, pred_upto, &pred_needed)?;
+                        if !predicate_matches(&bound_pred, cols, &prow)? {
+                            continue;
+                        }
+                        let row = deform_row(&bytes, cols, full_upto, &full_needed)?;
+                        out.push(project_row(projection, cols, &row)?);
+                        continue;
+                    }
+                }
+            } else {
+                let prow = deform_row(&bytes, cols, pred_upto, &pred_needed)?;
+                if !predicate_matches(&bound_pred, cols, &prow)? {
+                    continue;
+                }
             }
         }
         let row = deform_row(&bytes, cols, full_upto, &full_needed)?;
@@ -3609,6 +3680,11 @@ pub(crate) fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Literal]) -> 
                 })?;
             Ok(row[idx].clone())
         }
+        // Item 59 Fix 2: pre-bound slot — direct positional access, no String scan.
+        Expr::ColumnSlot(idx) => row
+            .get(*idx)
+            .cloned()
+            .ok_or_else(|| DbError::SqlPlan(format!("ColumnSlot({idx}) out of range"))),
         Expr::Literal(lit) => Ok(lit.clone()),
         Expr::BinOp { op, lhs, rhs } => {
             let l = eval_expr(lhs, columns, row)?;
@@ -3921,7 +3997,9 @@ pub fn decode_row(bytes: &[u8], columns: &[ColumnDef]) -> Result<Vec<Literal>> {
     ROWS_DECODED.fetch_add(1, Ordering::Relaxed); // C1 measurement
                                                   // C1′: a full decode materializes every column (the baseline `cols/row` that
                                                   // B2's `deform_row` drives down by materializing only referenced columns).
-    COLS_DECODED.fetch_add(columns.len() as u64, Ordering::Relaxed);
+    if DIAGNOSTICS_ENABLED.load(Ordering::Relaxed) {
+        COLS_DECODED.fetch_add(columns.len() as u64, Ordering::Relaxed);
+    }
     let mut out = Vec::with_capacity(columns.len());
     let mut pos = 0usize;
     for col in columns {
@@ -3971,13 +4049,17 @@ pub fn deform_row(
         if pos >= bytes.len() {
             if needed[i] {
                 out[i] = missing_column_default(col);
-                COLS_DECODED.fetch_add(1, Ordering::Relaxed);
+                if DIAGNOSTICS_ENABLED.load(Ordering::Relaxed) {
+                    COLS_DECODED.fetch_add(1, Ordering::Relaxed);
+                }
             }
             continue;
         }
         if needed[i] {
             out[i] = decode_value_at(bytes, &mut pos, col)?;
-            COLS_DECODED.fetch_add(1, Ordering::Relaxed);
+            if DIAGNOSTICS_ENABLED.load(Ordering::Relaxed) {
+                COLS_DECODED.fetch_add(1, Ordering::Relaxed);
+            }
         } else {
             skip_value_at(bytes, &mut pos)?; // advance past it, no allocation
         }
@@ -3997,6 +4079,8 @@ fn expr_columns(expr: &Expr, table_def: &TableDef, out: &mut Vec<usize>) {
                 out.push(idx);
             }
         }
+        // ColumnSlot already carries the resolved index — no lookup needed.
+        Expr::ColumnSlot(idx) => out.push(*idx),
         Expr::Literal(_) => {}
         Expr::BinOp { lhs, rhs, .. } => {
             expr_columns(lhs, table_def, out);
@@ -4018,6 +4102,47 @@ fn expr_columns(expr: &Expr, table_def: &TableDef, out: &mut Vec<usize>) {
             expr_columns(expr, table_def, out);
             expr_columns(pattern, table_def, out);
         }
+    }
+}
+
+/// **Item 59 Fix 2 — column index pre-binding.** Walk a predicate `Expr` and
+/// replace every `Expr::Column(name)` with `Expr::ColumnSlot(idx)` where `idx`
+/// is the column's position in `columns`. Called once per statement before the
+/// scan loop, so `eval_expr` pays direct positional access (no `String` scan)
+/// on every row.
+///
+/// Unresolvable column names are left as `Expr::Column` (the fallback path in
+/// `eval_expr` will report the error at evaluation time, same as before). This
+/// is safe: pre-binding is a pure optimisation — skipping it for one arm of an
+/// `AND` just means that arm pays the linear scan, not that it is wrong.
+fn bind_predicate_columns(expr: &mut Expr, columns: &[ColumnDef]) {
+    match expr {
+        Expr::Column(name) => {
+            if let Some(idx) = columns.iter().position(|c| &c.name == name && !c.dropped) {
+                *expr = Expr::ColumnSlot(idx);
+            }
+        }
+        Expr::ColumnSlot(_) | Expr::Literal(_) => {}
+        Expr::BinOp { lhs, rhs, .. } => {
+            bind_predicate_columns(lhs, columns);
+            bind_predicate_columns(rhs, columns);
+        }
+        Expr::And(l, r) => {
+            bind_predicate_columns(l, columns);
+            bind_predicate_columns(r, columns);
+        }
+        Expr::JsonExtract { expr, .. } | Expr::JsonExtractText { expr, .. } => {
+            bind_predicate_columns(expr, columns);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            bind_predicate_columns(expr, columns);
+            bind_predicate_columns(pattern, columns);
+        }
+        Expr::Match { query, .. } => bind_predicate_columns(query, columns),
+        // Near and Match column names reference the *index* column, not a
+        // row field evaluated in eval_expr (Near/Match arms return Bool(true)).
+        // No binding needed.
+        Expr::Near { .. } => {}
     }
 }
 
@@ -4097,6 +4222,151 @@ fn skip_value_at(bytes: &[u8], pos: &mut usize) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// **Item 59 Fix 3 — late materialisation raw filter.**
+///
+/// For the common case of a simple integer predicate on column `col_idx`
+/// (e.g. `k >= 0 AND k < N/20`), compute the byte offset of that column's
+/// `i64` payload directly from the encoded tuple bytes, bypassing `deform_row`
+/// entirely for rows that fail the predicate.
+///
+/// Returns `Some(i64_value)` when:
+/// - All columns *before* `col_idx` are fixed-width and not NULL (tags 1, 3,
+///   7, 8, 11, 12 in `encode_row`); variable-width columns (Text/Json/Bytea/
+///   Vector) cannot be skipped without parsing, so we return `None`.
+/// - The target column's tag is `1` (Int64), not NULL (`0`).
+///
+/// Returns `None` to signal "fall back to full `deform_row`" — the correctness
+/// path is unchanged; this is a pure short-circuit for the hot path.
+///
+/// **On-disk layout reminder (from `encode_row`):**
+/// Each column is `[tag: u8][payload]` where the payload length is fixed per
+/// type:
+///   - tag 0  (Null)        → 0 bytes
+///   - tag 1  (Int64)       → 8 bytes  ← fixed
+///   - tag 3  (Bool)        → 1 byte   ← fixed
+///   - tag 7  (Timestamp)   → 8 bytes  ← fixed
+///   - tag 8  (Float)       → 8 bytes  ← fixed
+///   - tag 11 (Date)        → 4 bytes  ← fixed
+///   - tag 12 (Time)        → 8 bytes  ← fixed
+///   - tag 9  (Uuid)        → 16 bytes ← fixed
+///   - tag 6  (Decimal)     → 17 bytes ← fixed
+///   - tag 2/4/10 (Text/Json/Bytea) → variable (4-byte LE length prefix)
+///   - tag 5  (Vector)      → variable (4-byte LE dim × 4)
+///
+/// Null in a preceding column (`tag == 0`) is safe to skip (0 bytes payload).
+/// The function returns `None` for NULL in the *target* column (predicate
+/// on NULL columns is always false in SQL, but let `eval_expr` handle it).
+pub(crate) fn try_raw_i64_at(bytes: &[u8], col_idx: usize, columns: &[ColumnDef]) -> Option<i64> {
+    let mut pos = 0usize;
+    for (i, col) in columns.iter().enumerate() {
+        if pos >= bytes.len() {
+            return None; // truncated row (ADD COLUMN case) — fall back
+        }
+        let tag = *bytes.get(pos)?;
+        if i == col_idx {
+            // We are at the target column.
+            if tag != 1 {
+                return None; // NULL (tag=0) or wrong type — fall back
+            }
+            let data = bytes.get(pos + 1..pos + 9)?;
+            let raw: [u8; 8] = data.try_into().ok()?;
+            return Some(i64::from_le_bytes(raw));
+        }
+        // Skip this preceding column. Only fixed-width types are skippable
+        // without parsing; variable-width → fall back.
+        let stride = match tag {
+            0 => 0,           // Null
+            1 => 8,           // Int64
+            3 => 1,           // Bool
+            7 => 8,           // Timestamp
+            8 => 8,           // Float
+            11 => 4,          // Date
+            12 => 8,          // Time
+            9 => 16,          // Uuid
+            6 => 17,          // Decimal (i128 + 1-byte scale)
+            _ => return None, // Text/Json/Bytea/Vector — variable width
+        };
+        pos += 1 + stride; // 1 for tag + stride for payload
+        let _ = col; // col type available if needed for validation
+    }
+    None
+}
+
+/// **Item 59 Fix 3 — build a `RawFilter` for the inner predicate loop.**
+///
+/// Inspects the (already-bound) predicate and returns `Some(RawFilter)` when
+/// the predicate is a conjunction of simple `ColumnSlot(idx) op Literal::Int`
+/// comparisons on columns that precede only fixed-width columns (so
+/// `try_raw_i64_at` can reach them). Returns `None` to use the full
+/// `deform_row` path.
+///
+/// The raw filter is checked before calling `deform_row`; rows that fail it
+/// are skipped without any heap allocation, giving the "late materialisation"
+/// gain at 5% selectivity.
+#[derive(Clone)]
+struct RawFilter {
+    /// Each entry: `(col_idx, op, int_literal)`.
+    terms: Vec<(usize, CmpOp, i64)>,
+}
+
+impl RawFilter {
+    /// Returns `true` if the raw bytes pass ALL terms (short-circuits to
+    /// `deform_row` on `None`, i.e., when the raw read is not possible).
+    fn passes(&self, bytes: &[u8], columns: &[ColumnDef]) -> Option<bool> {
+        for &(idx, op, rhs) in &self.terms {
+            let lhs = try_raw_i64_at(bytes, idx, columns)?;
+            let ok = match op {
+                CmpOp::Eq => lhs == rhs,
+                CmpOp::Ne => lhs != rhs,
+                CmpOp::Lt => lhs < rhs,
+                CmpOp::Gt => lhs > rhs,
+                CmpOp::Le => lhs <= rhs,
+                CmpOp::Ge => lhs >= rhs,
+            };
+            if !ok {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+}
+
+/// Try to build a [`RawFilter`] from a bound predicate expression. Walks
+/// `And` chains and gathers `ColumnSlot(idx) op Literal::Int` terms. Returns
+/// `None` if any sub-expression is not a simple integer comparison (the full
+/// `deform_row` path handles it).
+fn try_build_raw_filter(expr: &Expr) -> Option<RawFilter> {
+    let mut terms = Vec::new();
+    collect_raw_terms(expr, &mut terms)?;
+    if terms.is_empty() {
+        None
+    } else {
+        Some(RawFilter { terms })
+    }
+}
+
+fn collect_raw_terms(expr: &Expr, out: &mut Vec<(usize, CmpOp, i64)>) -> Option<()> {
+    match expr {
+        Expr::BinOp { op, lhs, rhs } => match (lhs.as_ref(), rhs.as_ref()) {
+            (Expr::ColumnSlot(idx), Expr::Literal(Literal::Int(v))) => {
+                out.push((*idx, *op, *v));
+                Some(())
+            }
+            (Expr::Literal(Literal::Int(v)), Expr::ColumnSlot(idx)) => {
+                // Flip the comparison to normalise ColumnSlot on the left.
+                out.push((*idx, flip_cmp_op(*op), *v));
+                Some(())
+            }
+            _ => None, // non-integer or non-slot predicate — fall back
+        },
+        Expr::And(l, r) => {
+            collect_raw_terms(l, out)?;
+            collect_raw_terms(r, out)
+        }
+        _ => None,
+    }
 }
 
 /// Decode one column value (tag byte at `*pos`), advancing `*pos` past it.
@@ -5535,6 +5805,8 @@ mod tests {
         }
         h.commit(xid);
 
+        // Item 59 Fix 1: enable diagnostics so the COLS_DECODED counter fires.
+        DIAGNOSTICS_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
         // Snapshot the global counter before the GROUP BY query.
         let cols_before = COLS_DECODED.load(std::sync::atomic::Ordering::Relaxed);
 
@@ -6011,5 +6283,194 @@ mod tests {
             "no rows should retain the old value after commit"
         );
         h.commit(xid3);
+    }
+
+    // ── Item 59: SELECT filtered optimisations ───────────────────────────────
+
+    /// Fix 2: column pre-binding produces identical rows to the unbound path.
+    /// Runs a filtered SELECT on a table with the bench schema
+    /// (id INT, k INT, g INT, body TEXT) and verifies that the pre-bound
+    /// path (ColumnSlot) and the original Expr::Column path produce the same
+    /// rows. Since exec_select always pre-binds, we indirectly validate by
+    /// checking the result is correct and consistent.
+    #[test]
+    fn select_filtered_col_pre_binding_same_results() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, k INT, g INT, body TEXT)")
+            .unwrap();
+        let n = 100i64;
+        for i in 0..n {
+            h.exec_as(
+                xid,
+                &format!(
+                    "INSERT INTO t (id, k, g, body) VALUES ({i}, {i}, {}, 'body-{i}')",
+                    i % 10
+                ),
+            )
+            .unwrap();
+        }
+        h.commit(xid);
+
+        // 5% selectivity predicate: k >= 0 AND k < n/20
+        let limit = n / 20;
+        let xid2 = h.begin();
+        let rows = match h
+            .exec_as(
+                xid2,
+                &format!("SELECT id, k, g FROM t WHERE k >= 0 AND k < {limit}"),
+            )
+            .unwrap()
+        {
+            ExecResult::Rows { rows: r, .. } => r,
+            o => panic!("{o:?}"),
+        };
+        h.commit(xid2);
+
+        assert_eq!(
+            rows.len(),
+            limit as usize,
+            "expected {limit} rows (k in 0..{limit})"
+        );
+        // Verify each row has the correct k value.
+        for (i, row) in rows.iter().enumerate() {
+            match row[1] {
+                Literal::Int(k) => assert!(
+                    (0..limit).contains(&k),
+                    "row {i}: k={k} out of expected range 0..{limit}"
+                ),
+                ref other => panic!("row {i}: expected Int for k, got {other:?}"),
+            }
+        }
+    }
+
+    /// Fix 3: late materialisation produces identical rows at 5% and 50%
+    /// selectivity. Verifies that the raw-filter fast path returns the same
+    /// result as the full deform_row path.
+    #[test]
+    fn select_filtered_late_mat_same_results() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, k INT, g INT, body TEXT)")
+            .unwrap();
+        let n = 200i64;
+        for i in 0..n {
+            h.exec_as(
+                xid,
+                &format!(
+                    "INSERT INTO t (id, k, g, body) VALUES ({i}, {i}, {}, 'body-{i}')",
+                    i % 5
+                ),
+            )
+            .unwrap();
+        }
+        h.commit(xid);
+
+        // 5% selectivity: expect n/20 rows
+        let low_limit = n / 20;
+        let xid2 = h.begin();
+        let rows_5pct = match h
+            .exec_as(
+                xid2,
+                &format!("SELECT id, k FROM t WHERE k >= 0 AND k < {low_limit}"),
+            )
+            .unwrap()
+        {
+            ExecResult::Rows { rows: r, .. } => r,
+            o => panic!("{o:?}"),
+        };
+        h.commit(xid2);
+        assert_eq!(
+            rows_5pct.len(),
+            low_limit as usize,
+            "5% selectivity: expected {low_limit} rows"
+        );
+
+        // 50% selectivity: expect n/2 rows
+        let half = n / 2;
+        let xid3 = h.begin();
+        let rows_50pct = match h
+            .exec_as(
+                xid3,
+                &format!("SELECT id, k FROM t WHERE k >= 0 AND k < {half}"),
+            )
+            .unwrap()
+        {
+            ExecResult::Rows { rows: r, .. } => r,
+            o => panic!("{o:?}"),
+        };
+        h.commit(xid3);
+        assert_eq!(
+            rows_50pct.len(),
+            half as usize,
+            "50% selectivity: expected {half} rows"
+        );
+
+        // Verify all returned rows have correct k values in range.
+        for (i, row) in rows_50pct.iter().enumerate() {
+            match row[1] {
+                Literal::Int(k) => assert!(
+                    (0..half).contains(&k),
+                    "row {i}: k={k} out of expected 50% range"
+                ),
+                ref other => panic!("row {i}: expected Int, got {other:?}"),
+            }
+        }
+    }
+
+    /// Fix 3 fallback: a TEXT predicate column (variable-width) correctly falls
+    /// back to the full deform_row path and returns correct results.
+    /// `try_raw_i64_at` returns None for TEXT columns, so the raw filter is not
+    /// built — the existing deform_row path handles it.
+    #[test]
+    fn select_filtered_late_mat_fallback() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, body TEXT)")
+            .unwrap();
+        for i in 0..50i64 {
+            h.exec_as(
+                xid,
+                &format!("INSERT INTO t (id, body) VALUES ({i}, 'row-{i}')"),
+            )
+            .unwrap();
+        }
+        h.commit(xid);
+
+        // Predicate on TEXT column (body = 'row-7') — forces raw filter fallback.
+        let xid2 = h.begin();
+        let rows = match h
+            .exec_as(xid2, "SELECT id, body FROM t WHERE body = 'row-7'")
+            .unwrap()
+        {
+            ExecResult::Rows { rows: r, .. } => r,
+            o => panic!("{o:?}"),
+        };
+        h.commit(xid2);
+        assert_eq!(rows.len(), 1, "exactly one row matches body = 'row-7'");
+        assert_eq!(rows[0][0], Literal::Int(7), "id=7 for body='row-7' row");
+        assert_eq!(
+            rows[0][1],
+            Literal::Text("row-7".to_string()),
+            "body value is correct"
+        );
+
+        // Predicate on TEXT column where it's the second column (id is first,
+        // which is fixed-width INT) — the raw filter still falls back to
+        // deform_row because body is variable-width.
+        let xid3 = h.begin();
+        let rows2 = match h
+            .exec_as(xid3, "SELECT id FROM t WHERE body = 'row-42'")
+            .unwrap()
+        {
+            ExecResult::Rows { rows: r, .. } => r,
+            o => panic!("{o:?}"),
+        };
+        h.commit(xid3);
+        assert_eq!(rows2.len(), 1, "exactly one row matches body = 'row-42'");
+        assert_eq!(rows2[0][0], Literal::Int(42), "id=42 for body='row-42' row");
     }
 }

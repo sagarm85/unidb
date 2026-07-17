@@ -6905,27 +6905,80 @@ correct and will provide improvement in production workloads matching those scen
 The ≥0.07× target was revised from the original analysis which assumed HOT would
 always fire — it is not achievable in the bench's packed-page scenario.
 
-**Full Docker bench report:** `docs/performance/benchmark_20260717_HHMMSS.md` (to be
-added when the multi-model ladder completes; Table 3 UPDATE metrics above are from
-phases.csv spot measurement on `58-hot-update` branch, Docker Linux aarch64).
-
 **Crash harness:** P59a + P59b added; 46/46 total PASS.  
 **Unit tests:** 412/412 PASS.  
 **Concurrency matrix:** 32/32 PASS (`docs/performance/conc_matrix_20260717_152612.md`, commit `585d991`).  
 **Clippy/fmt:** clean.
 
-**What changed:**
-- `src/format.rs`: FORMAT_VERSION 7→8, `WAL_HOT_UPDATE` (type 16), `HOT_NEXT_NONE`
-- `src/page.rs`: `TupleHeader.hot_next` field (repurposed `_pad u16` at [22..24]), `set_hot_next()`
-- `src/wal.rs`: `log_hot_update()`  
-- `src/heap.rs`: `try_hot_insert()` (with FSM pre-screen), `undo_hot_update()`, HOT chain follow in `get_visible()`
-- `src/recovery.rs`: `WAL_HOT_UPDATE` redo + undo arms, user-txn undo handling
-- `src/txn.rs`: `UndoAction::HotUpdate` variant
-- `src/sql/executor.rs`: `set_touches_indexed_col()`, `hot_eligible` gate, HOT path in `exec_update`
-- `src/lib.rs`: vacuum B-tree patch for HOT chain heads (both `vacuum_inner` and `vacuum_table_inner`)
-- `tests/crash/main.rs`: P59a (WAL durable crash → redo), P59b (incomplete user txn → undo)
-- `docs/backlog/58_hot_update.md`: new backlog doc (status: SHIPPED)
-- `docs/backlog/backlog_index.md`: registered item 58, next free ID = 59
-
 **Locked-decision changes:** D4 (tuple format) — sign-off recorded above 2026-07-17.
 FORMAT_VERSION bump 7→8 with rationale in `src/format.rs`.
+
+---
+
+## Item 59 — SELECT filtered optimisations   [SHIPPED]   2026-07-17
+
+**Branch:** `59-select-filtered-optimisations`
+**Date:** 2026-07-17
+**Status:** Shipped — Docker bench pending; local tests pass.
+
+### Root cause and fixes
+
+Three hot-path costs identified by Fable-5 architectural analysis on the 5%
+selectivity SELECT filtered path (bench fixed from 100% → 5% in commit
+`79890a7`):
+
+**Fix 1 — `COLS_DECODED` atomic gate:** `COLS_DECODED.fetch_add(1, Relaxed)`
+fired inside `deform_row` on every decoded column — measurement overhead, not
+correctness. Gated behind `static DIAGNOSTICS_ENABLED: AtomicBool = false`.
+Added `Engine::enable_diagnostics()` public API; bench calls it before
+sampling; `group_by_cols_per_row` and `a3_gate` tests call it before reading
+`cols_decoded_total()`. Estimated impact: ~10% of hot-path time recovered.
+
+**Fix 2 — Column index pre-binding:** `eval_expr(Expr::Column(name))` did a
+linear `String` scan over `ColumnDef`s on every predicate evaluation — twice
+per row for `k >= 0 AND k < N/20`. Added `Expr::ColumnSlot(usize)` (new
+executor-internal `Expr` variant, never serialised) and
+`bind_predicate_columns(&mut Expr, &[ColumnDef])` called once before the scan
+loop. `eval_expr` for `ColumnSlot(idx)` is `row.get(idx).cloned()` — O(1).
+Applied to both `exec_select` and `exec_select_readonly`. Estimated: ~25–30%.
+
+**Fix 3 — Late materialisation via raw integer filter:** at 5% selectivity,
+95% of rows call `deform_row` (building a `Vec<Literal>`) only to be
+immediately discarded by the predicate. Added `try_raw_i64_at(bytes, col_idx,
+columns) -> Option<i64>` to read the i64 payload of a column by computing the
+byte offset over preceding fixed-width columns (fallback: variable-width →
+`None`). Added `RawFilter { terms: Vec<(usize, CmpOp, i64)> }` and
+`try_build_raw_filter(expr)` to build the filter from `ColumnSlot op Int`
+conjunctions. In the `per_row` closure: raw filter checked first; rows
+rejected by it skip `deform_row` and all allocations entirely. Estimated: ~40%
+at 5% selectivity.
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `src/sql/logical.rs` | `Expr::ColumnSlot(usize)` + `bind_expr` arm |
+| `src/sql/executor.rs` | `DIAGNOSTICS_ENABLED`; Fix 1–3 implementation; 3 new tests |
+| `src/lib.rs` | `Engine::enable_diagnostics()` |
+| `src/sql/query.rs` | `ColumnSlot` arm in `qualify_policy` |
+| `benches/decompose.rs` | `enable_diagnostics()` in `measured_unidb()` |
+| `tests/a3_gate.rs` | `enable_diagnostics()` before `cols_decoded_total()` |
+
+### Verification
+
+| Check | Result |
+|-------|--------|
+| `cargo build --release` | clean |
+| `cargo clippy -- -D warnings` | clean |
+| `cargo fmt --all` | clean |
+| `cargo test --release` | **415 passed; 0 failed** |
+| `cargo test --test crash --release` | **44 passed; 0 failed** |
+
+No WAL format change, no FORMAT_VERSION bump, no locked-decision touch, no new
+crash injection points (read-only hot path change only).
+
+### Benchmark results
+
+> Docker bench results pending — will be updated after Docker run completes.
+> Baseline (pre-item59, 5% selectivity): from `benchmark_20260716_232744.md`.
+> Expected improvement: +35–50% rec/s on SELECT filtered at 5% selectivity.

@@ -1621,10 +1621,16 @@ fn winner_remark(uu: f64, pp: f64) -> String {
 /// rows-decoded reads, returning `(records, secs, wal_bytes_delta,
 /// rows_decoded_delta)`. `wal_total_bytes_appended` survives auto-checkpoint
 /// truncation, so the delta is the true WAL volume the op produced.
+///
+/// Item 59 Fix 1: enables `COLS_DECODED` diagnostics on first call (the flag
+/// is process-global; enabling it once is sufficient for the whole bench run).
 fn measured_unidb(
     engine: &Arc<Engine>,
     f: impl FnOnce() -> (u64, f64),
 ) -> (u64, f64, u64, u64, u64) {
+    // Enable the COLS_DECODED counter (gated by DIAGNOSTICS_ENABLED by default
+    // to avoid atomic overhead on the hot path in non-bench contexts).
+    Engine::enable_diagnostics();
     let wal0 = engine.wal_total_bytes_appended();
     let dec0 = Engine::rows_decoded_total();
     let cols0 = Engine::cols_decoded_total();
