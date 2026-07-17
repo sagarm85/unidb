@@ -113,6 +113,15 @@
 //         must leave the table fully readable and the index unregistered so
 //         the engine falls back to heap scans — no torn half-index state,
 //         no lost rows.
+//   P58a – WAL_INDEX_INSERT redo (item 56 Step 4): logical B-tree leaf insert
+//         record + its preceding WAL_FPI are durable, but the index leaf page
+//         was not flushed. Recovery's WAL_INDEX_INSERT redo arm re-applies the
+//         insert so every committed row is findable via the index on reopen.
+//   P58b – WAL_INDEX_INSERT + incomplete user txn (item 56 Step 4): per-stmt
+//         mini-txns commit (WAL_INDEX_INSERT durable), but the enclosing user
+//         txn never commits. M1 undo self-stamps every inserted heap row so
+//         it is permanently invisible. Stale index entries are filtered by
+//         heap MVCC visibility — no rows visible on reopen.
 
 use tempfile::tempdir;
 use unidb::{Engine, RowId};
@@ -2943,5 +2952,163 @@ fn p57b_update_many_incomplete_user_txn_reverts_all_changes() {
             );
         }
         other => panic!("P57b: expected Rows, got {other:?}"),
+    }
+}
+
+// ── P58a: WAL_INDEX_INSERT redo — logical record durable, leaf page not flushed
+//
+// item 56 Step 4 (D7 injection point a): the WAL_FPI for the index leaf +
+// WAL_INDEX_INSERT records are durable (fsynced via mini-txn commit), but the
+// index leaf page has not been explicitly flushed. Recovery's redo_record arm
+// for WAL_INDEX_INSERT must re-apply the logical insert so the committed row is
+// findable via the index on reopen.
+//
+// Design: INSERT and the index write happen in ONE session so WAL LSNs are
+// monotonically increasing throughout — avoiding the LSN-restart collision that
+// would arise if we flushed pages in a first session (page LSNs numerically
+// higher than the fresh WAL's LSNs) and then reopened (WAL_INDEX_INSERT skipped
+// by the page.lsn >= r.lsn gate). Pages are NOT explicitly flushed; drop
+// simulates a crash after WAL is synced.
+#[test]
+fn p58a_index_insert_wal_durable_page_not_flushed() {
+    use unidb::sql::logical::Literal;
+    use unidb::SqlResult;
+
+    let n = 200i64;
+    let dir = tempdir().unwrap();
+
+    // Single session: CREATE TABLE with a BTree index, INSERT rows.
+    // WAL (FPI + WAL_INDEX_INSERT) is fsynced at each mini-txn commit;
+    // index leaf pages are NOT flushed. Drop simulates a crash.
+    {
+        let engine = open(dir.path());
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT PRIMARY KEY, k INT)")
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE INDEX idx_k ON t USING BTREE (k)")
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        for chunk in (0..n).collect::<Vec<_>>().chunks(50) {
+            let vals: String = chunk
+                .iter()
+                .map(|&i| format!("({i}, {i})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let xid = engine.begin().unwrap();
+            engine
+                .execute_sql(xid, &format!("INSERT INTO t (id, k) VALUES {vals}"))
+                .unwrap();
+            engine.commit(xid).unwrap();
+        }
+        // Drop without flushing index pages — "crash".
+        // WAL (FPI + WAL_INDEX_INSERT per row) is already synced at each commit.
+        drop(engine);
+    }
+
+    // Recovery must redo every WAL_INDEX_INSERT so the index is consistent.
+    // A filtered SELECT via the index must return all n rows.
+    let engine = open(dir.path());
+    let xid = engine.begin().unwrap();
+    let result = engine
+        .execute_sql(xid, "SELECT COUNT(*) FROM t WHERE k >= 0")
+        .unwrap();
+    engine.commit(xid).unwrap();
+    drop(engine);
+
+    match &result[0] {
+        SqlResult::Rows { rows, .. } => {
+            let count = match &rows[0][0] {
+                Literal::Int(c) => *c,
+                other => panic!("P58a: expected Int count, got {other:?}"),
+            };
+            assert_eq!(
+                count, n,
+                "P58a: WAL_INDEX_INSERT redo must make all {n} committed rows findable on reopen"
+            );
+        }
+        other => panic!("P58a: expected Rows, got {other:?}"),
+    }
+}
+
+// ── P58b: WAL_INDEX_INSERT + incomplete user txn — stale index entries filtered
+//
+// item 56 Step 4 (D7 injection point b): WAL_INDEX_INSERT mini-txns commit
+// durably, but the enclosing user transaction never reaches WAL_TXN_COMMIT.
+// Recovery's M1 undo pass self-stamps every inserted row (xmax = xmin, making
+// it permanently invisible). Stale index entries from the incomplete insert
+// still exist on the leaf, but every heap visibility check filters them.
+// Assert: no rows visible after reopen.
+//
+// Design: INSERT and DROP are in ONE session (same LSN monotonicity rationale as
+// P58a). The user txn's WAL_TXN_COMMIT is never written — simulates a crash
+// mid-user-transaction after all per-statement mini-txns committed.
+#[test]
+fn p58b_index_insert_incomplete_user_txn_rows_invisible() {
+    use unidb::sql::logical::Literal;
+    use unidb::SqlResult;
+
+    let n = 100i64;
+    let dir = tempdir().unwrap();
+
+    // Single session: CREATE TABLE + index (committed), then INSERT inside a
+    // user txn whose WAL_TXN_COMMIT is never written. Per-statement mini-txn
+    // WAL (including WAL_INDEX_INSERT) is fsynced so each insert's index entry
+    // is durable — but the user txn is incomplete.
+    {
+        let engine = open(dir.path());
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT PRIMARY KEY, k INT)")
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE INDEX idx_k ON t USING BTREE (k)")
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        // Per-statement fsync: each mini-txn (including WAL_INDEX_INSERT) is
+        // durable before we drop, so index entries ARE on disk.
+        engine.set_deferred_sync(false);
+        let xid = engine.begin().unwrap();
+        for i in 0..n {
+            engine
+                .execute_sql(xid, &format!("INSERT INTO t (id, k) VALUES ({i}, {i})"))
+                .unwrap();
+        }
+        // No commit — WAL_TXN_COMMIT is never written. "Crash."
+        drop(engine);
+    }
+
+    // Recovery: M1 undo self-stamps every row inserted by the incomplete user
+    // txn (xmax = xmin). The index leaf may contain the entries, but heap
+    // visibility filters them. No row should be visible.
+    let engine = open(dir.path());
+    let xid = engine.begin().unwrap();
+    let result = engine
+        .execute_sql(xid, "SELECT COUNT(*) FROM t WHERE k >= 0")
+        .unwrap();
+    engine.commit(xid).unwrap();
+    drop(engine);
+
+    match &result[0] {
+        SqlResult::Rows { rows, .. } => {
+            let count = match &rows[0][0] {
+                Literal::Int(c) => *c,
+                other => panic!("P58b: expected Int count, got {other:?}"),
+            };
+            assert_eq!(
+                count, 0,
+                "P58b: rows from incomplete user txn must be invisible after reopen (got {count})"
+            );
+        }
+        other => panic!("P58b: expected Rows, got {other:?}"),
     }
 }

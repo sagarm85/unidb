@@ -9,15 +9,16 @@
 use std::{collections::HashSet, path::Path};
 
 use crate::{
+    btree_index::redo_index_insert,
     bufferpool::BufferPool,
     control::{self, ControlData},
     error::{DbError, Result},
     format::{
-        u16_from_le, u64_from_le, Xid, INVALID_LSN, WAL_ABORT, WAL_BEGIN, WAL_CHECKPOINT,
-        WAL_COMMIT, WAL_DELETE, WAL_FPI, WAL_INDEX, WAL_INSERT, WAL_TXN_ABORT, WAL_TXN_BEGIN,
-        WAL_TXN_COMMIT, WAL_UPDATE, WAL_VACUUM, WAL_XMAX_BATCH,
+        u16_from_le, u32_from_le, u64_from_le, Xid, INVALID_LSN, WAL_ABORT, WAL_BEGIN,
+        WAL_CHECKPOINT, WAL_COMMIT, WAL_DELETE, WAL_FPI, WAL_INDEX, WAL_INDEX_INSERT, WAL_INSERT,
+        WAL_TXN_ABORT, WAL_TXN_BEGIN, WAL_TXN_COMMIT, WAL_UPDATE, WAL_VACUUM, WAL_XMAX_BATCH,
     },
-    heap::decode_insert_redo,
+    heap::{decode_insert_redo, RowId},
     page::SlottedPage,
     wal::{Wal, WalRecord},
 };
@@ -390,6 +391,57 @@ fn redo_record(r: &WalRecord, pool: &BufferPool, page_size: usize) -> Result<()>
             }
             page.set_lsn(r.lsn);
             pool.write_page(&page)?;
+            pool.unpin(r.page_id);
+        }
+        WAL_INDEX_INSERT => {
+            // item 56 Step 4: logical B-tree leaf insert, redo-only, LSN-gated.
+            // A WAL_FPI for this leaf preceded this record (lower LSN, already
+            // replayed) restoring the clean pre-insert base; this record
+            // re-executes the entry insert. `r.slot` = insertion position.
+            //
+            // redo payload: key_len (2 B LE) || key_bytes || rid_page (4 B LE) || rid_slot (2 B LE)
+            let page = match pool.fetch_page(r.page_id) {
+                Ok(p) => p,
+                Err(DbError::PageNotFound { .. }) => {
+                    // FPI should have sized the file; skip gracefully.
+                    tracing::warn!(
+                        lsn = r.lsn,
+                        page_id = r.page_id,
+                        "WAL_INDEX_INSERT redo: index leaf page not found, skipping"
+                    );
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
+            if page.lsn() >= r.lsn {
+                pool.unpin(r.page_id);
+                return Ok(());
+            }
+            if r.redo.len() < 2 {
+                pool.unpin(r.page_id);
+                return Err(DbError::WalCorrupt { lsn: r.lsn });
+            }
+            let key_len = u16_from_le(r.redo[0..2].try_into().unwrap()) as usize;
+            if r.redo.len() < 2 + key_len + 6 {
+                pool.unpin(r.page_id);
+                return Err(DbError::WalCorrupt { lsn: r.lsn });
+            }
+            let key_bytes = &r.redo[2..2 + key_len];
+            let rid_page = u32_from_le(r.redo[2 + key_len..6 + key_len].try_into().unwrap());
+            let rid_slot = u16_from_le(r.redo[6 + key_len..8 + key_len].try_into().unwrap());
+            let rid = RowId {
+                page_id: rid_page,
+                slot: rid_slot,
+            };
+            match redo_index_insert(&page, r.slot, key_bytes, rid, page_size) {
+                Ok(mut new_page) => {
+                    new_page.set_lsn(r.lsn);
+                    pool.write_page(&new_page)?;
+                }
+                Err(e) => {
+                    tracing::warn!(lsn = r.lsn, error = %e, "WAL_INDEX_INSERT redo skipped");
+                }
+            }
             pool.unpin(r.page_id);
         }
         _ => {}

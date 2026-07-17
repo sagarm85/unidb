@@ -428,7 +428,7 @@ Phase 4 query power is next for the SQL lane). Metrics tables are in
 | D4 | Tuple header reserves xmin/xmax now; in-place UPDATE in M0, MVCC in M1 |
 | D5 | WAL-before-page invariant: no dirty page flushed while page.LSN > durable WAL LSN |
 | D6 | Single-file *data* storage; the WAL may be separate. **Evolved (P6.a, signed off 2026-07-09):** the WAL is now a directory of 16 MiB segment files. The data store stays a single file |
-| D7 | Crash-injection harness: kill at defined points, reopen, assert recovered state (grows with each new durability mechanism — 42 tests, P1–P57b today) |
+| D7 | Crash-injection harness: kill at defined points, reopen, assert recovered state (grows with each new durability mechanism — 44 tests, P1–P58b today) |
 | D8 | Page size 8 KiB default, config-overridable at init, fixed after creation |
 | D9 | On-disk format is fixed little-endian; every page carries CRC32 + LSN |
 | D10 | Default isolation: READ COMMITTED; REPEATABLE READ + SERIALIZABLE (SSI, P1.d) available |
