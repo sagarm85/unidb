@@ -30,13 +30,12 @@ services:
       retries: 40
 
   # Item 61: Redpanda — Kafka-compatible event queue (no JVM, ~250 MiB RAM).
-  # Used as the "queue" leg in the TRUE replaced-stack comparison (Table 4.1)
-  # when MM_REPLACED_STACK_REALISTIC=1. A separate process from Postgres means
-  # the bench pays real inter-process TCP latency for the event-queue write,
-  # unlike the conservative proxy (which simulated the queue as a PG outbox
-  # table on the same server). Lightweight single-broker dev mode: 1 shard, no
-  # dashboard, no topic auto-creation (the bench creates the topic itself).
+  # Only started when the `realistic` profile is active:
+  #   MM_REPLACED_STACK_REALISTIC=1 scripts/report.sh --docker
+  # This avoids consuming 256 MiB of Docker VM RAM on standard bench runs
+  # where Redpanda is not needed (Postgres OOM'd when Redpanda always started).
   redpanda:
+    profiles: ["realistic"]
     image: docker.redpanda.com/redpandadata/redpanda:v24.3.7
     command: >
       redpanda start
@@ -49,7 +48,6 @@ services:
       --kafka-addr 0.0.0.0:9092
       --advertise-kafka-addr redpanda:9092
     healthcheck:
-      # rpk exits 0 when the cluster is healthy, non-zero otherwise.
       test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy: true'"]
       interval: 3s
       timeout: 10s
@@ -63,13 +61,6 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      redpanda:
-        # Use service_started (not service_healthy) so the bench runs even if
-        # Redpanda fails — the bench handles unreachable Redpanda gracefully
-        # (pg_replaced_stack_realistic_throughput returns None and Table 4.1 is
-        # skipped). This prevents a Redpanda startup failure from aborting the
-        # standard CRUD bench entirely.
-        condition: service_started
     environment:
       # Superuser conn (rust-postgres key=value form) — mmreport needs superuser
       # for ALTER SYSTEM SET wal_sync_method.

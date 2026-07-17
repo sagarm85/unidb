@@ -85,13 +85,19 @@ sample_stats & SAMPLER_PID=$!
 # --exit-code-from bench propagates the bench's exit status. `|| true` so a
 # container-level failure (e.g. Postgres refusing to start) still reaches the
 # report-existence check below, which is the real success criterion.
-docker compose up --build --abort-on-container-exit --exit-code-from bench || true
+# Activate the 'realistic' profile (adds Redpanda) only when the true
+# replaced-stack bench is requested — avoids OOM-killing Postgres on standard runs.
+COMPOSE_PROFILES_ARG=""
+if [[ -n "${MM_REPLACED_STACK_REALISTIC:-}" ]]; then
+  COMPOSE_PROFILES_ARG="--profile realistic"
+fi
+docker compose $COMPOSE_PROFILES_ARG up --build --abort-on-container-exit --exit-code-from bench || true
 
 kill "$SAMPLER_PID" 2>/dev/null || true
 wait "$SAMPLER_PID" 2>/dev/null || true
 
 # Tear down containers (leave the report on the host).
-docker compose down -v >/dev/null 2>&1 || true
+docker compose $COMPOSE_PROFILES_ARG down -v >/dev/null 2>&1 || true
 
 AFTER="$(count_reports)"
 LATEST="$(find "$REPO_ROOT/docker/out" -maxdepth 1 -name '*.md' 2>/dev/null | xargs ls -1t 2>/dev/null | head -1 || true)"
