@@ -30,7 +30,7 @@ use crate::{
     error::{DbError, Result},
     format::{
         u16_from_le, u16_to_le, u32_from_le, u32_to_le, u64_from_le, u64_to_le, PageId, Xid,
-        INVALID_PAGE_ID, PAGE_TYPE_HEAP,
+        HOT_NEXT_NONE, INVALID_PAGE_ID, PAGE_TYPE_HEAP,
     },
     lockmgr::{LockManager, RecordId},
     mvcc::{is_reclaimable, is_visible, Snapshot},
@@ -392,6 +392,108 @@ impl Heap {
         })
     }
 
+    /// HOT UPDATE (item 58): attempt to insert the new version on the SAME page
+    /// as the old version, leaving the B-tree pointing at the old slot and
+    /// writing a forwarding pointer (`hot_next`) from old → new slot.
+    ///
+    /// Returns `Some(new_rid)` on success; `None` if the old page has
+    /// insufficient free space for the new version (caller falls back to the
+    /// standard cross-page insert + B-tree update).
+    ///
+    /// **HOT eligibility guard**: the caller must have verified that no indexed
+    /// column appears in the SET clause before calling this (see
+    /// `set_touches_indexed_col` in executor.rs). This function performs only the
+    /// physical HOT operation; it does NOT update secondary B-tree indexes.
+    ///
+    /// The entire operation (xmax-stamp old slot + set hot_next + insert new slot)
+    /// is covered by a single WAL_HOT_UPDATE record under one mini-txn, so redo
+    /// and undo are atomic at the mini-txn granularity (D2).
+    pub fn try_hot_insert(
+        &self,
+        old_rid: RowId,
+        new_data: &[u8],
+        xid: Xid,
+        pool: &BufferPool,
+        wal: &Wal,
+        lock_mgr: &LockManager,
+    ) -> Result<Option<RowId>> {
+        lock_mgr.try_acquire_write(RecordId::row(old_rid.page_id, old_rid.slot), xid)?;
+
+        let needed = crate::page::SLOT_SIZE + crate::page::TUPLE_HEADER_SIZE + new_data.len();
+
+        let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
+
+        // Acquire exclusive latch on the old page. Check free space WHILE holding
+        // the latch — after a conflict check, before committing to HOT.
+        let (_og, mut old_page) = {
+            let _og = pool.latch_exclusive(old_rid.page_id);
+            let page = pool.fetch_page_for_write(old_rid.page_id, wal)?;
+            (_og, page)
+        };
+
+        // Conflict check (same as update()).
+        let old_th = old_page.tuple_header(old_rid.slot)?;
+        if old_th.xmax != 0 {
+            pool.unpin(old_rid.page_id);
+            drop(_og);
+            wal.abort_mini_txn(txn_id, begin_lsn)?;
+            return Err(DbError::WriteConflict {
+                holder_xid: old_th.xmax,
+            });
+        }
+
+        // Check if the new version fits on the same page.
+        if old_page.free_space() < needed {
+            // Not enough space — fall back to the caller.
+            pool.unpin(old_rid.page_id);
+            drop(_og);
+            wal.abort_mini_txn(txn_id, begin_lsn)?;
+            return Ok(None);
+        }
+
+        on_write(xid, old_rid);
+
+        // P1.a: full-page image of the page before its first change in this interval.
+        let fpi_prev = pool
+            .maybe_log_fpi(old_rid.page_id, wal, txn_id, begin_lsn)?
+            .unwrap_or(begin_lsn);
+
+        // Insert the new version on the same page.
+        let prev_ptr = Some((old_rid.page_id, old_rid.slot));
+        let new_slot = old_page.insert_versioned(new_data, xid, 0, prev_ptr)?;
+        let new_rid = RowId {
+            page_id: old_rid.page_id,
+            slot: new_slot,
+        };
+        on_write(xid, new_rid);
+
+        // Stamp xmax on the old slot + set hot_next forwarding pointer.
+        old_page.set_xmax(old_rid.slot, xid)?;
+        old_page.set_hot_next(old_rid.slot, new_slot)?;
+
+        // Log the single WAL_HOT_UPDATE record covering all three mutations.
+        let insert_redo = encode_insert_redo(xid, prev_ptr, new_data);
+        let hot_lsn = wal.log_hot_update(
+            txn_id,
+            fpi_prev,
+            old_rid.page_id,
+            xid,
+            old_rid.slot,
+            new_slot,
+            &insert_redo,
+        )?;
+
+        old_page.set_lsn(hot_lsn);
+        pool.write_page(&old_page)?;
+        let new_free = old_page.free_space();
+        pool.unpin(old_rid.page_id);
+        drop(_og);
+        self.note_free_space(old_rid.page_id, new_free);
+
+        wal.commit_mini_txn(txn_id, hot_lsn)?;
+        Ok(Some(new_rid))
+    }
+
     /// DELETE: stamp xmax = `xid` on the current version. Physical removal
     /// is deferred to a future vacuum operation (not implemented in M1). See
     /// `update`'s doc comment for why both a lock-manager check and an
@@ -728,6 +830,80 @@ impl Heap {
         pool.write_page(&page)?;
         pool.unpin(page_id);
         wal.commit_mini_txn(txn_id, lsn)?;
+        Ok(())
+    }
+
+    /// Reverse an HOT update (item 58): undo both the new slot insertion and
+    /// the old slot's xmax+hot_next under one mini-txn (same page).
+    ///
+    /// Order (matches recovery.rs undo for WAL_HOT_UPDATE and crash-test P59b):
+    ///   Phase 1: self-stamp `new_slot` invisible (same as `undo_insert`).
+    ///   Phase 2a: clear `hot_next` on `old_slot` (restore to HOT_NEXT_NONE).
+    ///   Phase 2b: clear `xmax` on `old_slot` (restore to live).
+    ///
+    /// All mutations under one mini-txn — the WAL redo for this undo is the
+    /// standard WAL_UPDATE pair (one for each field change), which is idempotent
+    /// if replayed after a crash between the two phases.
+    pub fn undo_hot_update(
+        &self,
+        page_id: PageId,
+        old_slot: u16,
+        new_slot: u16,
+        xid: Xid,
+        pool: &BufferPool,
+        wal: &Wal,
+    ) -> Result<()> {
+        let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
+        let _wg = pool.latch_exclusive(page_id);
+        let mut page = pool.fetch_page_for_write(page_id, wal)?;
+        // P1.a: full-page image before the first change of this interval.
+        let mut prev_lsn = pool
+            .maybe_log_fpi(page_id, wal, txn_id, begin_lsn)?
+            .unwrap_or(begin_lsn);
+
+        // Phase 1: self-stamp new_slot invisible (xmax = xid).
+        let new_xmax_lsn = wal.log_update(
+            txn_id,
+            prev_lsn,
+            page_id,
+            new_slot,
+            &u64_to_le(xid),
+            &u64_to_le(0),
+        )?;
+        page.set_xmax(new_slot, xid)?;
+        prev_lsn = new_xmax_lsn;
+
+        // Phase 2a: clear hot_next on old slot.
+        // hot_next is NOT separately WAL-logged here — it is bundled with the
+        // page write that follows. This is safe under D5 because:
+        //   (a) If this process crashes between phase 2a and the phase 2b
+        //       WAL_UPDATE commit, the user txn's WAL_TXN_COMMIT was never
+        //       written → crash recovery replays the WAL_HOT_UPDATE undo arm
+        //       (recovery.rs), which atomically clears hot_next + xmax on old_slot
+        //       and deletes new_slot (idempotent even if phase 1's WAL_UPDATE
+        //       already self-stamped new_slot visible-until-committed).
+        //   (b) The page is written once after all three field changes (at the
+        //       end of this function), so the hot_next clear is flushed to the
+        //       buffer pool together with the WAL-logged xmax changes — the
+        //       WAL record for xmax is always written before the page flush (D5).
+        page.set_hot_next(old_slot, HOT_NEXT_NONE)?;
+
+        // Phase 2b: clear xmax on old_slot, logging as WAL_UPDATE redo=0.
+        let old_xmax = page.tuple_header(old_slot)?.xmax;
+        let old_xmax_lsn = wal.log_update(
+            txn_id,
+            prev_lsn,
+            page_id,
+            old_slot,
+            &u64_to_le(0),
+            &u64_to_le(old_xmax),
+        )?;
+        page.set_xmax(old_slot, 0)?;
+
+        page.set_lsn(old_xmax_lsn);
+        pool.write_page(&page)?;
+        pool.unpin(page_id);
+        wal.commit_mini_txn(txn_id, old_xmax_lsn)?;
         Ok(())
     }
 
@@ -1086,6 +1262,11 @@ where
 /// (`parallel_resolve_candidates`, Milestone P) can call it on its own candidate
 /// slice with a `Send + Sync` reader. Needs no `&Heap` (reads an owned page copy
 /// under the mmap read-lock).
+///
+/// Item 58 — HOT chain follow: when a B-tree candidate resolves to a slot
+/// with `hot_next != HOT_NEXT_NONE`, this slot is a HOT chain head (the
+/// B-tree still points here, but the current version is at `hot_next` on the
+/// same page). We follow the chain to find the visible version.
 pub(crate) fn get_visible<P: PageReader>(
     reader: &P,
     row_id: RowId,
@@ -1102,6 +1283,28 @@ pub(crate) fn get_visible<P: PageReader>(
     if is_visible(th.xmin, th.xmax, snapshot, self_xid) {
         on_read(self_xid, row_id);
         Ok(Some(page.get(row_id.slot)?.to_vec()))
+    } else if th.hot_next != HOT_NEXT_NONE {
+        // HOT chain follow (item 58): the B-tree still points at this old
+        // (xmax-stamped) slot; follow hot_next to the new version on the
+        // same page. We follow at most one hop — HOT chains in unidb are
+        // always length 1 (a second HOT update on the same row would go
+        // through the new slot, not this old one, because the B-tree patch
+        // would have been updated or a new HOT head created).
+        let new_slot = th.hot_next;
+        if !matches!(page.slot_state(new_slot), Ok(SlotState::Live)) {
+            return Ok(None);
+        }
+        let new_th = page.tuple_header(new_slot)?;
+        let new_rid = RowId {
+            page_id: row_id.page_id,
+            slot: new_slot,
+        };
+        if is_visible(new_th.xmin, new_th.xmax, snapshot, self_xid) {
+            on_read(self_xid, new_rid);
+            Ok(Some(page.get(new_slot)?.to_vec()))
+        } else {
+            Ok(None)
+        }
     } else {
         Ok(None)
     }

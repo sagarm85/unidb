@@ -166,6 +166,24 @@ fn literal_display(lit: &Literal) -> String {
     }
 }
 
+/// Returns `true` if any column named in `assignments` (the SET clause of an
+/// UPDATE) has either a secondary B-tree index (`index_root`) or a
+/// unique-enforcement B-tree index (`unique_index_root`). When this is `true`,
+/// a HOT update cannot be used — the B-tree entry must be updated to point at
+/// the new version (see CLAUDE.md §0.6.2 and item 58 design).
+///
+/// Columns in `assignments` are matched by name against `columns`, exactly as
+/// the executor does for FK column detection (item 53 pattern).
+fn set_touches_indexed_col(assignments: &[(String, Expr)], columns: &[ColumnDef]) -> bool {
+    let set_cols: std::collections::HashSet<&str> =
+        assignments.iter().map(|(col, _)| col.as_str()).collect();
+    columns.iter().any(|c| {
+        !c.dropped
+            && set_cols.contains(c.name.as_str())
+            && (c.index_root.is_some() || c.unique_index_root.is_some())
+    })
+}
+
 /// Returns true if any table in `catalog` carries a column-level or
 /// table-level FK that references `parent_table`. Used to gate the O(n)
 /// catalog scan in `exec_delete` / `exec_update` so tables that are never
@@ -2364,6 +2382,25 @@ fn exec_update(
     };
     // Item 36: gate FK parent-side RESTRICT (does any child table reference us?).
     let has_fk_children = table_has_fk_children(ctx.catalog.get(), table);
+
+    // Item 58 HOT eligibility: try same-page HOT update (no B-tree update)
+    // when all of the following hold:
+    //   1. No UNIQUE/PK index on this table (unique enforcement inserts new
+    //      B-tree entries pointing at the new slot — HOT would leave them
+    //      dangling at the old slot).
+    //   2. No FK columns in SET (FK key enforcement likewise inserts new
+    //      B-tree entries for the new value).
+    //   3. No FK children referencing this table (RESTRICT check reads the
+    //      old PK value, which must remain visible; HOT xmax-stamps it first,
+    //      but the check runs before any mutation, so this is fine — but if
+    //      the parent changes its PK value in SET, (1) above would fire).
+    //   4. No indexed column in SET (secondary B-tree must be updated to the
+    //      new RowId; skipping it makes the row unfindable — see §0.6.2).
+    let hot_eligible = !has_unique
+        && !has_fk_refs_in_set
+        && !has_fk_children
+        && !set_touches_indexed_col(assignments, &table_def.columns);
+
     let mut count = 0;
     for (row_id, bytes) in matching {
         let mut row = decode_row(&bytes, &table_def.columns)?;
@@ -2446,40 +2483,89 @@ fn exec_update(
             }
         }
         let encoded = encode_row(&coerced);
-        let new_row_id =
-            match heap.update(row_id, &encoded, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr) {
+
+        // Item 58: try HOT update (same-page, no B-tree cost) when eligible.
+        // Falls back to the standard cross-page update + B-tree maintenance if
+        // the old page is full.
+        let (new_row_id, used_hot) = if hot_eligible {
+            match heap.try_hot_insert(row_id, &encoded, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr) {
+                Err(e @ DbError::WriteConflict { .. }) => return Err(classify_conflict(e, ctx)),
+                Err(e) => return Err(e),
+                Ok(Some(nrid)) => (nrid, true),
+                Ok(None) => {
+                    // Page full — fall back to cross-page insert + B-tree update.
+                    let nrid = match heap.update(
+                        row_id,
+                        &encoded,
+                        ctx.xid,
+                        ctx.pool,
+                        ctx.wal,
+                        ctx.lock_mgr,
+                    ) {
+                        Err(e @ DbError::WriteConflict { .. }) => {
+                            return Err(classify_conflict(e, ctx))
+                        }
+                        other => other?,
+                    };
+                    (nrid, false)
+                }
+            }
+        } else {
+            let nrid = match heap.update(row_id, &encoded, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr)
+            {
                 Err(e @ DbError::WriteConflict { .. }) => return Err(classify_conflict(e, ctx)),
                 other => other?,
             };
+            (nrid, false)
+        };
+
         // P1.d: writing supersedes the version at `row_id` — an SSI write of the
         // exact version a concurrent reader would have read.
         ctx.txn_mgr.ssi_note_write(ctx.xid, row_id);
-        ctx.txn_mgr.record_undo(
-            ctx.xid,
-            UndoAction::XmaxStamp {
-                page_id: row_id.page_id,
-                slot: row_id.slot,
-            },
-        )?;
-        ctx.txn_mgr.record_undo(
-            ctx.xid,
-            UndoAction::Insert {
-                page_id: new_row_id.page_id,
-                slot: new_row_id.slot,
-            },
-        )?;
+        if used_hot {
+            // Item 58: HOT update — undo both mutations atomically with one action.
+            // The new version is on the same page as the old version; the ordering
+            // (new-slot-first, then old-slot) is enforced inside `undo_hot_update`.
+            ctx.txn_mgr.record_undo(
+                ctx.xid,
+                UndoAction::HotUpdate {
+                    page_id: row_id.page_id,
+                    old_slot: row_id.slot,
+                    new_slot: new_row_id.slot,
+                },
+            )?;
+        } else {
+            ctx.txn_mgr.record_undo(
+                ctx.xid,
+                UndoAction::XmaxStamp {
+                    page_id: row_id.page_id,
+                    slot: row_id.slot,
+                },
+            )?;
+            ctx.txn_mgr.record_undo(
+                ctx.xid,
+                UndoAction::Insert {
+                    page_id: new_row_id.page_id,
+                    slot: new_row_id.slot,
+                },
+            )?;
+        }
         // Item 47: unchanged-key columns use in-place RowId patch (no splits, 1
         // WAL page-image); changed-key columns fall through to the batch insert.
-        stage_row_index_writes_update(
-            &table_def,
-            row_id,
-            new_row_id,
-            &before_row,
-            &coerced,
-            &mut index_batches,
-            &mut patch_batches,
-            ctx,
-        )?;
+        // HOT path: B-tree NOT updated (no index cost, no patch needed) because
+        // no indexed column was in SET (guard: `hot_eligible`).
+        if !used_hot {
+            stage_row_index_writes_update(
+                &table_def,
+                row_id,
+                new_row_id,
+                &before_row,
+                &coerced,
+                &mut index_batches,
+                &mut patch_batches,
+                ctx,
+            )?;
+        }
         // C1 (item 29): UPDATE carries both before (pre-mutation) and after (post-mutation).
         send_event_capture(&table_def, "update", Some(&before_row), Some(&coerced), ctx)?;
         count += 1;

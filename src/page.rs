@@ -25,14 +25,20 @@
 //   [8..16]  xmax        u64   (deleting/superseding transaction's xid; 0 = live)
 //   [16..20] prev_page   u32   (page_id of prior version; INVALID_PAGE_ID = none)
 //   [20..22] prev_slot   u16   (slot of prior version)
-//   [22..24] _pad        u16
-// Tuple header size: 24 bytes
+//   [22..24] hot_next    u16   (item 58 HOT: slot of the new version on the same
+//                               page; HOT_NEXT_NONE (0xFFFF) = no forwarding.
+//                               When != 0xFFFF this slot is a HOT chain head —
+//                               the B-tree still points here but readers must
+//                               follow hot_next to find the current visible version.
+//                               Previously unused (_pad u16, always 0 in v7 and
+//                               earlier). FORMAT_VERSION bumped to 8.)
+// Tuple header size: 24 bytes (UNCHANGED — hot_next fits in the _pad bytes)
 
 use crate::{
     error::{DbError, Result},
     format::{
         u16_from_le, u16_to_le, u32_from_le, u32_to_le, u64_from_le, u64_to_le, Lsn, PageId, Xid,
-        INVALID_PAGE_ID,
+        HOT_NEXT_NONE, INVALID_PAGE_ID,
     },
 };
 
@@ -70,14 +76,22 @@ const TH_XMIN: usize = 0;
 const TH_XMAX: usize = 8;
 const TH_PREV_PAGE: usize = 16;
 const TH_PREV_SLOT: usize = 20;
+/// Offset of the `hot_next` forwarding-pointer field (item 58).
+/// Repurposed from the `_pad u16` at [22..24] (always-zero in v7 and earlier).
+const TH_HOT_NEXT: usize = 22;
 
 /// MVCC version-chain metadata read from a tuple header (M1).
+/// `hot_next` is `HOT_NEXT_NONE` (0xFFFF) when this slot is not a HOT chain
+/// head; otherwise it is the slot index of the newer version on the same page
+/// (item 58, v8 format).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TupleHeader {
     pub xmin: Xid,
     pub xmax: Xid,
     pub prev_page: PageId,
     pub prev_slot: u16,
+    /// Item 58 HOT: slot of the newer version on the same page, or `HOT_NEXT_NONE`.
+    pub hot_next: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -240,6 +254,9 @@ impl SlottedPage {
             .copy_from_slice(&u32_to_le(prev_page));
         self.data[new_fe + TH_PREV_SLOT..new_fe + TH_PREV_SLOT + 2]
             .copy_from_slice(&u16_to_le(prev_slot));
+        // hot_next: initialise to HOT_NEXT_NONE (no forwarding) for all new inserts.
+        self.data[new_fe + TH_HOT_NEXT..new_fe + TH_HOT_NEXT + 2]
+            .copy_from_slice(&u16_to_le(HOT_NEXT_NONE));
         // write payload
         self.data[th_end..th_end + payload.len()].copy_from_slice(payload);
 
@@ -383,7 +400,37 @@ impl SlottedPage {
                     .try_into()
                     .unwrap(),
             ),
+            hot_next: u16_from_le(
+                self.data[base + TH_HOT_NEXT..base + TH_HOT_NEXT + 2]
+                    .try_into()
+                    .unwrap(),
+            ),
         })
+    }
+
+    /// Set the HOT forwarding pointer in the old slot's tuple header (item 58).
+    /// `next_slot` is the slot index of the newer version on the same page.
+    /// Use `HOT_NEXT_NONE` (0xFFFF) to clear the forwarding pointer.
+    pub fn set_hot_next(&mut self, slot: u16, next_slot: u16) -> Result<()> {
+        let sc = self.slot_count();
+        if slot >= sc {
+            return Err(DbError::SlotOutOfRange {
+                page_id: self.page_id(),
+                slot,
+            });
+        }
+        let (offset, _) = self.read_slot(slot);
+        if offset == 0 {
+            return Err(DbError::TupleDeleted {
+                page_id: self.page_id(),
+                slot,
+            });
+        }
+        let base = offset as usize;
+        self.data[base + TH_HOT_NEXT..base + TH_HOT_NEXT + 2]
+            .copy_from_slice(&u16_to_le(next_slot));
+        self.write_crc();
+        Ok(())
     }
 
     /// Stamp `xmax` on the tuple at `slot` in place (M1 DELETE / UPDATE

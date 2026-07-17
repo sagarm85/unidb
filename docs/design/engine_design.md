@@ -107,15 +107,17 @@ Two invariants shape everything above the storage layer:
   checksum and an LSN. No `serde` on the page/WAL hot path — page and WAL
   records are hand-rolled / `zerocopy`-style byte encodings for exact byte
   control (`serde_json` is used only for control-plane data; see §4.6).
-- `FORMAT_VERSION` is currently **5**: v1→v2 for M1's tuple-header
-  extension, v2→v3 for the `next_xid` control-file field (§4.7), v3→v4 for
-  the `WAL_FPI` full-page-image record (P1.a torn-page protection, §3.3), v4→v5
-  for the durable B-Tree's `WAL_INDEX` record + `PAGE_TYPE_BTREE` node pages +
-  the per-column `index_root` catalog pointer (P3.a, §5.2). No migration paths —
+- `FORMAT_VERSION` is currently **8**: v1→v2 for M1's tuple-header extension,
+  v2→v3 for `next_xid` control-file field (§4.7), v3→v4 for `WAL_FPI`
+  (P1.a torn-page protection, §3.3), v4→v5 for durable B-Tree `WAL_INDEX` +
+  `PAGE_TYPE_BTREE` (P3.a, §5.2), v5→v6 for `WAL_XMAX_BATCH` (item 56 Step 3),
+  v6→v7 for `WAL_INDEX_INSERT` logical leaf-insert (item 56 Step 4),
+  v7→v8 for `WAL_HOT_UPDATE` + `hot_next` tuple-header forwarding pointer
+  (item 58 HOT-equivalent UPDATE, D4 sign-off 2026-07-17). No migration paths —
   no earlier version ever shipped externally.
 - Pages use a **slotted-page** layout; tuples carry a 24-byte header with
-  `xmin`/`xmax`/`prev_page`/`prev_slot` (reserved in M0 per D4, in active
-  MVCC use since M1).
+  `xmin`/`xmax`/`prev_page`/`prev_slot`/`hot_next` (D4, forward-compatible —
+  `hot_next` repurposes the `_pad u16` bytes; v8+ only; 0xFFFF in earlier rows).
 - `mmap.rs` (a thin `memmap2` wrapper) is the **only** module allowed
   `unsafe`; the rest of the crate denies it.
 
@@ -1328,7 +1330,7 @@ bound). `NEAR`/graph/queue reads remain writer-side for now (additive).
 | D6 | Single-file storage (WAL separate) | unchanged; revisit was gated post-M4, not yet re-opened |
 | D7 | Crash-injection harness, simple by design | `tests/crash/main.rs` P1–P12 (P10 = mid-vacuum M10, P11 = torn-page/`WAL_FPI` P1.a, P12 = fsync-failure poison P1.b) + property test |
 | D8 | 8 KiB pages, init-time config, immutable after | `format.rs`; baked into control file |
-| D9 | Little-endian, CRC32+LSN per page, magic+version | `format.rs`/`page.rs`/`wal.rs`; `FORMAT_VERSION = 4` (v3→v4 for `WAL_FPI`, P1.a) |
+| D9 | Little-endian, CRC32+LSN per page, magic+version | `format.rs`/`page.rs`/`wal.rs`; `FORMAT_VERSION = 8` (v7→v8 for `WAL_HOT_UPDATE` + `hot_next` tuple-header field, item 58, 2026-07-17) |
 | D10 | RC default, RR available, same snapshots | `txn.rs` snapshot lifetime |
 | D11 | `on_read`/`on_write` seam; SSI is an addition | seam in `concurrency_hooks.rs`; SSI landed at the executor + `txn.rs::SsiState` (P1.d) |
 | D12 | SI abort-on-conflict; RC re-eval; SSI | `lockmgr.rs` (no wait queue); RC re-reads via fresh snapshot + RR/SER `SerializationFailure` + SSI pivot abort (P1.d) |
