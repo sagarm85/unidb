@@ -429,7 +429,7 @@ impl SlottedPage {
         let base = offset as usize;
         self.data[base + TH_HOT_NEXT..base + TH_HOT_NEXT + 2]
             .copy_from_slice(&u16_to_le(next_slot));
-        self.write_crc();
+        // CRC deferred to set_lsn() — always called last before write_page().
         Ok(())
     }
 
@@ -452,7 +452,12 @@ impl SlottedPage {
         }
         let base = offset as usize;
         self.data[base + TH_XMAX..base + TH_XMAX + 8].copy_from_slice(&u64_to_le(xmax));
-        self.write_crc();
+        // CRC is intentionally NOT updated here. Every call site follows the
+        // pattern: set_xmax(...)* → set_lsn(...) → write_page(...), and
+        // set_lsn() always calls write_crc() as its final step. Computing CRC
+        // after each slot stamp is pure waste — with ~104 rows/page it means
+        // 104 × (8 KB clone + hash) per page group in delete_many, where only
+        // the last CRC (from set_lsn) is ever persisted.
         Ok(())
     }
 
@@ -537,6 +542,13 @@ impl SlottedPage {
     }
 
     // ── CRC ─────────────────────────────────────────────────────────────────
+
+    /// Recompute and write the page CRC. Called explicitly by recovery paths
+    /// that mutate a page via `set_xmax` without subsequently calling
+    /// `set_lsn` (which owns the CRC update on the normal write path).
+    pub fn recompute_crc(&mut self) {
+        self.write_crc();
+    }
 
     fn compute_crc(&self) -> u32 {
         let mut buf = self.data.clone();
