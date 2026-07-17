@@ -1,7 +1,9 @@
 # Post-Step-4 performance gap: architectural review and next-item recommendations
 
 **Type:** Performance
-**Status:** NOT STARTED
+**Status:** Section B (parallel DELETE scan) SHIPPED 2026-07-17, PR on `57-parallel-delete-scan`.
+A4 gate NOT MET: parallel scan runs but `delete_many` is the bottleneck post Step 4; DELETE stayed at 0.04× PG. See PROGRESS.md "Item 57" for analysis.
+Sections A (HOT) and C (W4/W0) and D (ROI order) remain NOT STARTED.
 
 > Senior DB-internals architectural review produced 2026-07-17 under the §0.6
 > expert lens. Calibrated against `docs/performance/benchmark_20260716_232744.md`

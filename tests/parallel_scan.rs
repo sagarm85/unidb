@@ -222,6 +222,78 @@ fn parallel_scan_honors_cancellation() {
     );
 }
 
+// ── Item 57: parallel DELETE scan ────────────────────────────────────────────
+
+/// Parallel DELETE (item 57): parallel and serial paths must produce identical
+/// committed row sets — same rows deleted, same survivors. Table spans many
+/// pages so the parallel path engages.
+#[test]
+fn parallel_delete_matches_serial() {
+    // Serial run: delete k >= ROWS/2 on a fresh table.
+    let dir_s = tempfile::tempdir().unwrap();
+    let serial = Arc::new(Engine::open(dir_s.path(), 0).unwrap());
+    serial.set_parallel_scan(false);
+    build(&serial);
+    let x = serial.begin().unwrap();
+    serial
+        .execute_sql(x, &format!("DELETE FROM t WHERE k >= {}", ROWS / 2))
+        .unwrap();
+    serial.commit(x).unwrap();
+    let serial_survivors: Vec<i64> = select(&serial, "SELECT id FROM t");
+
+    // Parallel run: same DELETE on a fresh table.
+    let dir_p = tempfile::tempdir().unwrap();
+    let parallel = Arc::new(Engine::open(dir_p.path(), 0).unwrap());
+    parallel.set_parallel_scan(true);
+    parallel.set_parallel_scan_config(1, 4);
+    build(&parallel);
+    let x = parallel.begin().unwrap();
+    parallel
+        .execute_sql(x, &format!("DELETE FROM t WHERE k >= {}", ROWS / 2))
+        .unwrap();
+    parallel.commit(x).unwrap();
+    let parallel_survivors: Vec<i64> = select(&parallel, "SELECT id FROM t");
+
+    assert_eq!(
+        serial_survivors, parallel_survivors,
+        "parallel DELETE must produce the same survivors as serial DELETE"
+    );
+    assert_eq!(
+        serial_survivors.len() as i64,
+        ROWS / 2,
+        "exactly ROWS/2 rows should survive"
+    );
+}
+
+/// Parallel DELETE across multiple pages: large table where all rows match —
+/// all must be deleted, none survive, committed state is empty.
+#[test]
+fn parallel_delete_all_matching_rows_large_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::open(dir.path(), 0).unwrap());
+    engine.set_parallel_scan(true);
+    engine.set_parallel_scan_config(1, 4);
+    build(&engine);
+
+    let before = count(&engine, "SELECT COUNT(*) FROM t");
+    assert_eq!(before, ROWS);
+
+    // Delete all rows via full-scan predicate (k >= 0 matches all; non-selective
+    // range so A3 gate correctly routes to the full-scan path).
+    let x = engine.begin().unwrap();
+    engine.execute_sql(x, "DELETE FROM t WHERE k >= 0").unwrap();
+    engine.commit(x).unwrap();
+
+    let after = count(&engine, "SELECT COUNT(*) FROM t");
+    assert_eq!(after, 0, "all rows must be deleted");
+
+    let survivors = select(&engine, "SELECT id FROM t");
+    assert!(
+        survivors.is_empty(),
+        "no survivors expected after DELETE all"
+    );
+}
+
 /// A parallel scan honors the statement snapshot exactly across an UPDATE (new
 /// version + superseded old counts once) and a DELETE (removed row uncounted).
 #[test]

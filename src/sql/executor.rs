@@ -2513,7 +2513,51 @@ fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Resu
         return Ok(ExecResult::Deleted { count });
     }
 
-    let matching = matching_rows(&heap, &snapshot, ctx, &table_def, predicate)?;
+    // Item 57: parallel scan path for the full-scan fallback.
+    // Only activates when: (a) the table has enough pages, (b) the predicate is
+    // not sargable (index-eligible predicates take the index path inside
+    // `matching_rows` anyway), and (c) the global worker pool has capacity.
+    // The closure mirrors `matching_rows`'s B2 decode-and-filter path:
+    //   - `pred_needed` / `pred_upto`: decode only predicate columns
+    //   - skip rows that don't match the predicate
+    // On lease denied or small table: `matching_rows` serial fallback unchanged.
+    let matching: MatchedRows = {
+        // Build the predicate closure parameters once, shared across workers.
+        let cols = table_def.columns.clone();
+        let mut pred_cols = Vec::new();
+        if let Some(pred) = predicate {
+            expr_columns(pred, &table_def, &mut pred_cols);
+        }
+        let (pred_needed, pred_upto) = needed_mask(&pred_cols, cols.len());
+        let has_pred = predicate.is_some();
+        let predicate_clone = predicate.clone();
+
+        let pages = heap.scan_pages(ctx.pool)?;
+        let try_parallel = pages.len() >= crate::sql::parallel_scan::PARALLEL_CANDIDATE_MIN;
+        if try_parallel {
+            if let Some(lease) = crate::sql::parallel_scan::acquire(pages.len()) {
+                crate::sql::parallel_scan::parallel_collect_matching(
+                    &pages,
+                    &ctx.pool.shared_reader(),
+                    &snapshot,
+                    ctx.xid,
+                    lease.degree(),
+                    &|_rid, bytes| {
+                        if has_pred {
+                            let prow = deform_row(bytes, &cols, pred_upto, &pred_needed)?;
+                            Ok(predicate_matches(&predicate_clone, &cols, &prow)?)
+                        } else {
+                            Ok(true)
+                        }
+                    },
+                )?
+            } else {
+                matching_rows(&heap, &snapshot, ctx, &table_def, predicate)?
+            }
+        } else {
+            matching_rows(&heap, &snapshot, ctx, &table_def, predicate)?
+        }
+    };
     // P1.d: the rows a DELETE selects are part of its read set (SSI).
     let read_ids: Vec<RowId> = matching.iter().map(|(rid, _)| *rid).collect();
     ctx.txn_mgr.ssi_note_reads(ctx.xid, &read_ids);

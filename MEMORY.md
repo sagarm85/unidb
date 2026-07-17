@@ -12,6 +12,16 @@
 
 ## Current status
 
+- **Item 57 — Parallel DELETE scan — SHIPPED 2026-07-17, branch
+  `57-parallel-delete-scan`. PR pending.**
+  `parallel_collect_matching` added to `src/sql/parallel_scan.rs`; wired into
+  `exec_delete` full-scan path. 32/32 conc matrix PASS; 44/44 crash; 412 tests.
+  Honest-miss: A4 gate (DELETE ≥0.15×) NOT met — DELETE stayed at 0.04× PG
+  (246k rec/s). Root cause: after Step 3 WAL_XMAX_BATCH, `delete_many` (write
+  phase) is the bottleneck, not scan. Parallel scan adds ~2ms overhead not
+  recovered because scan is not bottlenecked. Design doc's "65% scan time"
+  estimate wrong for the post-Step-3 world.
+
 - **Item 56 Steps 2+3 — Heap::update_many + WAL_XMAX_BATCH — SHIPPED
   2026-07-17, branch `56-step3-delete-wal-batch`. PR pending.**
   Docker bench complete (`docs/performance/benchmark_20260717_074259.md`).

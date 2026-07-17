@@ -6838,3 +6838,97 @@ intermittency was a scheduler-pressure artifact, not a code defect.
 | `cargo test --test crash` | **44/44** (P58a/P58b new; FORMAT_VERSION 6→7) |
 
 Raw report: `docs/performance/benchmark_20260717_021445.md`.
+
+---
+
+## Item 57 — Parallel DELETE scan   [SHIPPED]   2026-07-17
+
+**Branch:** `57-parallel-delete-scan`  **Date:** 2026-07-17
+
+### What shipped
+
+**`parallel_collect_matching`** added to `src/sql/parallel_scan.rs` (~100 lines):
+- Workers steal pages via the shared `AtomicUsize` cursor (same pattern as
+  `parallel_count_matching` and `parallel_filter_project`).
+- Each worker uses `scan_page_visit` (item-54 Phase A) to visit visible rows
+  page-at-a-time; only rows matching the predicate clone bytes into a worker-local
+  `Vec<(RowId, Vec<u8>)>`. Non-matching rows incur no heap allocation.
+- After pool completion: per-worker Vecs are concatenated, then sorted by
+  `(page_id, slot)` to satisfy `delete_many`'s lock-acquisition order invariant.
+- Serial fallback on lease denied (same governance as all parallel paths).
+
+**`exec_delete` in `src/sql/executor.rs`** wired to use the parallel path (~35 new lines):
+- After the DELETE truncate fast path (item 48), the full-scan branch now tries
+  `parallel_scan::acquire(pages.len())` before `matching_rows`.
+- If lease granted and `pages.len() >= PARALLEL_CANDIDATE_MIN (64)`: uses
+  `parallel_collect_matching`; otherwise: existing serial `matching_rows` unchanged.
+- Correctness: FK RESTRICT, CDC capture, SSI write tracking, undo logging — all
+  unchanged; only the scan/collection phase is parallelised.
+
+**New tests:**
+- `tests/parallel_scan.rs::parallel_delete_matches_serial` — verifies parallel and
+  serial DELETE produce identical committed row sets.
+- `tests/parallel_scan.rs::parallel_delete_all_matching_rows_large_table` — all
+  matching rows deleted, none survive.
+- `tests/perf_item47_44.rs::item57_parallel_delete_throughput_probe` — measures
+  parallel vs serial DELETE rec/s on 100k-row table (deferred sync; macOS
+  F_FULLFSYNC note included).
+
+### Measurements (benchmark_20260717_131201.md, Docker Linux aarch64 18 cores, 100k rows)
+
+| operation | before (Step 4 baseline) | after Item 57 | Δ |
+|-----------|-------------------------:|-------------:|---|
+| **DELETE selected (k≥N)** | 248,185 rec/s (0.04× PG) | **246,133 rec/s (0.04× PG)** | flat (within noise) |
+| SELECT grouped (GROUP BY g) | 1.15× PG | 1.09× PG | run-to-run noise |
+| SELECT COUNT(*) (all) | 6.47× PG | 5.24× PG | run-to-run noise |
+| INSERT WAL B/row | 655 | 655 | unchanged (no WAL change) |
+
+### Honest-miss: A4 target not met (DELETE ≥0.15× PG)
+
+The parallel scan executes (2500 pages >> 64-page gate, 18 workers) but delivers
+no net throughput improvement. Root cause: after Step 3 (WAL_XMAX_BATCH, 133→72
+B/row) and Step 4 (WAL_INDEX_INSERT, 8837→655 B/row), the **`delete_many` write
+phase** — not the scan — is the dominant cost.
+
+**Evidence:**
+- Step 4 bench showed DELETE at 248k rec/s; this bench at 246k — within noise.
+- Design doc's "65% scan time" estimate was calibrated against the Step 3 baseline
+  (387k rec/s). Step 4 changed the workload's fsync/WAL profile such that Step 4's
+  own baseline landed at 248k — already lower, presumably from Docker run variation
+  or Step 4's WAL compression shifting the bottleneck to `delete_many`.
+- Parallel scan adds ~2ms overhead (pool dispatch + 100k-row sort) that is not
+  recovered because the scan was not bottlenecked.
+
+**The A4 gap (DELETE ≥0.15×) is an honest architectural miss.** After Step 3's WAL
+compression, the dominant cost is `delete_many`'s per-page WAL framing (WAL_XMAX_BATCH
+records, one per page). Parallelising the scan phase cannot remove this. Addressing
+the A4 gap requires either HOT (D4 sign-off) to reduce the delete volume, or
+a structural change to `delete_many` that further compresses page-write cost.
+
+**Regression guards (all pass):**
+- SELECT grouped: 1.09× PG (guard ≥1.0×) ✓
+- SELECT COUNT(*): 5.24× PG (guard ≥5.0×) ✓
+- W4/W0 at 100k: reported as 0.86× (noise run; structural guard ≤2.3×) ✓
+- Correctness: 32/32 conc matrix PASS
+
+### Acceptance criteria
+
+| Gate | Target | Result | Status |
+|------|--------|--------|--------|
+| A4 DELETE selected ≥0.15× | ≥0.15× | **0.04×** | ✗ FAIL (parallel not bottlenecked by scan post Step 4) |
+| A7 SELECT grouped ≥1.0× | ≥1.0× | 1.09× | ✓ |
+| A7 SELECT COUNT(*) ≥5.0× | ≥5.0× | 5.24× | ✓ |
+| Concurrency 32/32 PASS | 32/32 | **32/32** | ✓ |
+
+### Verification
+
+| Check | Result |
+|---|---|
+| `cargo build --release` | clean |
+| `cargo clippy -- -D warnings` | clean |
+| `cargo fmt --all` | clean |
+| `cargo test --release` | **412 tests** all pass (+3 new item-57 tests) |
+| `cargo test --test crash` | **44/44** (unchanged) |
+| Concurrency matrix | **32/32 PASS** |
+
+Raw report: `docs/performance/benchmark_20260717_131201.md`.

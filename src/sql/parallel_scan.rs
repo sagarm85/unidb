@@ -889,3 +889,101 @@ where
     }
     Ok(all_rows)
 }
+
+/// Parallel scan + filter for DELETE/UPDATE: each worker scans its page slice,
+/// evaluates `matches` on every MVCC-visible tuple, and collects `(RowId,
+/// raw_bytes)` pairs for matching rows into a worker-local `Vec`. After all
+/// workers finish, the per-worker Vecs are concatenated into one flat result,
+/// then sorted by `(page_id, slot)` so callers can pass them to `delete_many`
+/// which groups mutations by page (lock-acquisition order = page order).
+///
+/// `matches` receives `(RowId, &[u8])` and returns `Ok(true)` to keep the row,
+/// `Ok(false)` to drop it, or `Err` to abort the whole scan. It must be `Sync`.
+///
+/// This is the scan-phase parallelisation for `exec_delete`'s full-scan path
+/// (Item 57). The predicate evaluation, MVCC visibility filtering, and row
+/// collection are parallelised; `delete_many` and all post-collection work
+/// (FK checks, CDC capture, SSI write tracking) remain serial in the coordinator.
+pub fn parallel_collect_matching<F>(
+    pages: &[PageId],
+    reader: &SharedPageReader,
+    snapshot: &Snapshot,
+    self_xid: Xid,
+    degree: usize,
+    matches: &F,
+) -> Result<Vec<(RowId, Vec<u8>)>>
+where
+    F: Fn(RowId, &[u8]) -> Result<bool> + Sync,
+{
+    let cursor = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let err: Arc<Mutex<Option<DbError>>> = Arc::new(Mutex::new(None));
+    #[allow(clippy::type_complexity)]
+    let parts: Arc<Mutex<Vec<Vec<(RowId, Vec<u8>)>>>> = Arc::new(Mutex::new(Vec::new()));
+    let deadline = crate::query_limits::snapshot_deadline();
+    let pages: Arc<[PageId]> = Arc::from(pages);
+    let reader = reader.clone();
+    let snapshot = snapshot.clone();
+
+    run_in_pool(degree, {
+        let cursor = Arc::clone(&cursor);
+        let stop = Arc::clone(&stop);
+        let err = Arc::clone(&err);
+        let parts = Arc::clone(&parts);
+        let pages = Arc::clone(&pages);
+        move || {
+            let mut local: Vec<(RowId, Vec<u8>)> = Vec::new();
+            // Use scan_page_visit (item 54 Phase A) instead of scan_page_into so
+            // that each row's bytes are a &[u8] slice into the owned page buffer —
+            // one 8 KiB allocation per page instead of one Vec<u8> per *visible*
+            // row. Non-matching rows never get their bytes cloned at all, halving
+            // allocator pressure compared to a scan_page_into + filter loop on a
+            // 50%-selective predicate at 200k rows.
+            'outer: while !stop.load(Ordering::Relaxed) {
+                let i = cursor.fetch_add(1, Ordering::Relaxed);
+                if i >= pages.len() {
+                    break;
+                }
+                if i.is_multiple_of(4) {
+                    if let Err(e) = deadline.check() {
+                        *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                        stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                if let Err(e) =
+                    scan_page_visit(&reader, pages[i], &snapshot, self_xid, |rid, bytes| {
+                        match matches(rid, bytes) {
+                            // Only clone bytes for rows that match the predicate.
+                            Ok(true) => {
+                                local.push((rid, bytes.to_vec()));
+                                Ok(())
+                            }
+                            Ok(false) => Ok(()),
+                            Err(e) => Err(e),
+                        }
+                    })
+                {
+                    *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                    stop.store(true, Ordering::Relaxed);
+                    break 'outer;
+                }
+            }
+            parts.lock().unwrap_or_else(|p| p.into_inner()).push(local);
+        }
+    });
+
+    let err_val = err.lock().unwrap_or_else(|p| p.into_inner()).take();
+    if let Some(e) = err_val {
+        return Err(e);
+    }
+
+    // Concat per-worker results, then sort by (page_id, slot) so delete_many's
+    // page-group grouping proceeds in page order (lock-acquisition order invariant).
+    let mut all: Vec<(RowId, Vec<u8>)> = Vec::new();
+    for part in std::mem::take(&mut *parts.lock().unwrap_or_else(|p| p.into_inner())) {
+        all.extend(part);
+    }
+    all.sort_unstable_by_key(|(rid, _)| (rid.page_id, rid.slot));
+    Ok(all)
+}
