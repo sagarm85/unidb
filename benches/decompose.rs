@@ -2608,6 +2608,15 @@ fn bench_mm_report() {
             phased("t3_delall_pg", || pg_crud_delete_all(u)),
         );
         println!();
+        println!(
+            "### Table 3 — Known honest ceilings (verified; do not re-investigate without new evidence)\n\
+             \n\
+             | operation | current ratio | ceiling | root cause | revisit when |\n\
+             |---|---|---|---|---|\n\
+             | SELECT filtered | ~0.57× | ~0.57× | Both engines fire **18 workers** at 100k rows on 18-core host — worker count is NOT the lever (verified 2026-07-17 by reading `degree_for()` in `parallel_scan.rs`). Residual gap is PG's optimised C scan + JIT vs interpreted predicate evaluation. | New predicate compilation or SIMD scan path. |\n\
+             | UPDATE bulk | ~0.04–0.07× | ~0.07–0.09× (with HOT) | B-tree per-row insert (~10–15 µs/row) dominates regardless of WAL batching — proved by item 56 Step 2 (2026-07-17): WAL savings −30% but throughput regressed due to staging pressure. Only HOT (D4 sign-off) changes this. | D4 sign-off granted in PROGRESS.md. |\n\
+             | INSERT per-row | ~0.54× | ~0.55–0.60× | Per-row fsync floor + PG scale advantages. Step 4 (logical B-tree WAL, 8837→655 B/row) delivered the addressable gain (2026-07-17). | Batch-commit or group-commit mode. |\n"
+        );
     } else {
         println!(
             "_`PG_URL` unset → Postgres columns skipped. Set it (superuser conn) to fill this table._\n"
