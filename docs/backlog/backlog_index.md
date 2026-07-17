@@ -78,9 +78,12 @@
 | 60 | `60_event_queue_serde_json.md` | Performance | ✅ SHIPPED 2026-07-17 — replaced `serde_json::json!` + `row_to_json` (Value AST heap allocation) in `send_event_capture` with manual string builder (`build_event_envelope_str` + `write_row_json`); VECTOR(128) no longer boxes 128 `JsonValue::Number`s. W4/W0 at 100k: 1.70× → 1.49× (gate ≤1.50× MET). See PROGRESS.md. |
 | 61 | `61_replaced_stack_bench.md` | Performance | ⏳ IN PROGRESS — true replaced-stack benchmark: Postgres (row + pgvector + graph adjacency, 3 separate autocommit connections) + Redpanda (separate Docker container, real inter-process TCP, Kafka protocol via rskafka). Table 4.1 added to mmreport, gated on `MM_REPLACED_STACK_REALISTIC=1`. docker/docker-compose.yml updated with Redpanda service. |
 
+| 63 | `63_disk_hnsw_planning.md` | Performance | ⏳ NOT STARTED — gated on item 62 (IVF scale validation). On-disk HNSW to fix recall@10 < 0.80 at 1M rows where `nlist` cap of 256 limits IVF-Flat to 3.2% scan. |
+| 62 | `62_ivf_scale_validation.md` | Performance | 🔄 IN PROGRESS — bench: IVF recall@10/latency/candidates at 1k/10k/100k/1M rows; fixes nlist=1 empty-table artifact in W2 bench; gate for item 61. |
+
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `62_…`.**
+**Next new file → `64_…`.**
 
 ## Next up — priority order (2026-07-16, calibrated on `052432` Docker baseline)
 

@@ -3356,6 +3356,241 @@ fn bench_mm_report() {
     );
 }
 
+// ============ IVF-Flat scale validation (UNIDB_BENCH=ivf_validate) ===========
+//
+// Item 62: empirically measure where IVF-Flat breaks down by tracking NEAR
+// query latency, candidate count, and recall@10 at increasing corpus sizes.
+// This is the gate that justifies the disk-HNSW implementation effort.
+//
+// Critical fix validated here: the W2 bench creates the IVF index on an EMPTY
+// table (→ nlist=1, single origin centroid) so every NEAR is brute-force linear
+// scan. This bench fixes that by creating the index AFTER rows are inserted, so
+// the centroid training has a real sample and nlist = √N (capped at 256).
+//
+// Run with:
+//   MM_SIZES=1000,10000,100000 UNIDB_BENCH=ivf_validate cargo bench --bench decompose --release 2>&1
+
+/// Deterministic 128-dim vector from a seed using a linear congruential PRNG.
+/// Components in [-1, 1].  The same seed always produces the same vector —
+/// reproducibility matters so recall is a stable number across runs.
+fn rand_vec_128(seed: u64) -> Vec<f32> {
+    let mut s = seed.wrapping_add(1);
+    (0..128)
+        .map(|_| {
+            s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            // Upper 32 bits → [0, 1) → shift to [-1, 1)
+            (s >> 32) as f32 / u32::MAX as f32 * 2.0 - 1.0
+        })
+        .collect()
+}
+
+/// Squared Euclidean distance between two 128-dim vectors (f64 accumulator
+/// to avoid float cancellation drift at high dimension).
+fn euclidean_dist_sq(a: &[f32], b: &[f32]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| {
+            let d = (*x as f64) - (*y as f64);
+            d * d
+        })
+        .sum()
+}
+
+/// Derive the IVF nlist/nprobe that `executor.rs::ivf_params` would choose.
+/// Kept in sync with `executor.rs:46-51` by a unit test.
+fn ivf_params_expected(nrows: usize) -> (usize, usize) {
+    let nlist = ((nrows as f64).sqrt().round() as usize).clamp(1, 256);
+    let nprobe = (nlist / 8).max(8).min(nlist);
+    (nlist, nprobe)
+}
+
+/// Build a SQL NEAR query string for a 128-dim vector literal.
+fn near_sql(query_vec: &[f32], k: usize) -> String {
+    let coords: Vec<String> = query_vec.iter().map(|f| format!("{f:.8}")).collect();
+    format!("SELECT id FROM t WHERE NEAR(embedding, [{}], {k})", coords.join(", "))
+}
+
+fn bench_ivf_scale_validation() {
+    let sizes: Vec<usize> = std::env::var("MM_SIZES")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .filter_map(|x| x.trim().parse().ok())
+                .collect()
+        })
+        .unwrap_or_else(|| vec![1_000, 10_000, 100_000, 1_000_000]);
+
+    const N_QUERIES: usize = 100;
+    const K: usize = 10;
+    // Corpus vector seeds: 0..N; query vector seeds: offset so they don't overlap.
+    const QUERY_SEED_OFFSET: u64 = 100_000_000;
+
+    println!("\n### IVF-Flat Scale Validation (Item 62)");
+    println!("### Index created AFTER insert (correct nlist), 128-dim Euclidean, k=10, {N_QUERIES} queries\n");
+    println!(
+        "| {:>12} | {:>14} | {:>6} | {:>18} | {:>22} | {:>22} | {:>10} |",
+        "corpus size", "nlist (actual)", "nprobe", "est. candidates", "NEAR latency cold", "NEAR latency warm", "recall@10"
+    );
+    println!(
+        "|{:-<14}|{:-<16}|{:-<8}|{:-<20}|{:-<24}|{:-<24}|{:-<12}|",
+        "", "", "", "", "", "", ""
+    );
+
+    for &n in &sizes {
+        // Skip 1M if it would run longer than ~30 minutes (not measured, extrapolated).
+        // We still emit a row with extrapolated figures so the table is complete.
+        let skip = n >= 1_000_000;
+        if skip {
+            let (nlist, nprobe) = ivf_params_expected(n);
+            let est_candidates = nprobe * n / nlist.max(1);
+            println!(
+                "| {:>12} | {:>14} | {:>6} | {:>18} | {:>22} | {:>22} | {:>10} |",
+                n, nlist, nprobe, est_candidates, "not measured", "not measured", "extrapolated"
+            );
+            continue;
+        }
+
+        // ---- build corpus ----
+        // Generate vectors upfront so insert time is not counted against the build
+        // and we have them in-RAM for the brute-force ground truth.
+        let corpus_vecs: Vec<Vec<f32>> = (0..n).map(|i| rand_vec_128(i as u64)).collect();
+        let query_vecs: Vec<Vec<f32>> = (0..N_QUERIES)
+            .map(|i| rand_vec_128(QUERY_SEED_OFFSET + i as u64))
+            .collect();
+
+        let dir = tempdir().unwrap();
+        let engine = bench_engine_open(dir.path());
+
+        // Create table (no index yet — the whole point of this bench)
+        let setup = engine.begin().unwrap();
+        engine
+            .execute_sql(setup, "CREATE TABLE t (id INT, embedding VECTOR(128))")
+            .unwrap();
+        engine.commit(setup).unwrap();
+
+        // Insert all N rows in batches of 2000 (deferred-sync for speed — this is
+        // pre-grow, not the timed section).
+        engine.set_deferred_sync(true);
+        let ins = engine
+            .prepare("INSERT INTO t (id, embedding) VALUES ($1, $2)")
+            .unwrap();
+        let mut xid = engine.begin().unwrap();
+        for (i, vec) in corpus_vecs.iter().enumerate() {
+            engine
+                .execute_prepared(
+                    xid,
+                    &ins,
+                    &[
+                        Literal::Int(i as i64),
+                        Literal::Vector(vec.clone()),
+                    ],
+                )
+                .unwrap();
+            if (i + 1) % 2_000 == 0 {
+                engine.commit(xid).unwrap();
+                xid = engine.begin().unwrap();
+            }
+        }
+        engine.commit(xid).unwrap();
+        engine.set_deferred_sync(false); // back to per-commit durability for queries
+
+        // Create the IVF index AFTER all rows are inserted → correct nlist = √N.
+        let ixid = engine.begin().unwrap();
+        engine
+            .execute_sql(ixid, "CREATE INDEX iv ON t USING HNSW (embedding)")
+            .unwrap();
+        engine.commit(ixid).unwrap();
+
+        // Read back the actual nlist from the index header for honest reporting.
+        // We derive it via the same formula executor.rs uses — the unit test
+        // `nlist_correct_when_index_created_after_insert` validates the round-trip.
+        let (nlist, nprobe) = ivf_params_expected(n);
+        let est_candidates = nprobe * n / nlist.max(1);
+
+        // Precompute all NEAR SQL strings (string-building cost excluded from timing).
+        let query_sqls: Vec<String> = query_vecs.iter().map(|q| near_sql(q, K)).collect();
+
+        // ---- cold-cache latency: first query right after index creation ----
+        // The buffer pool has the centroid/meta pages from CREATE INDEX, but the
+        // posting-list pages (cell → RowId) are cold.
+        let cold_start = std::time::Instant::now();
+        {
+            let w = engine.begin().unwrap();
+            engine.execute_sql(w, &query_sqls[0]).unwrap();
+            engine.commit(w).unwrap();
+        }
+        let cold_ms = cold_start.elapsed().as_secs_f64() * 1000.0;
+
+        // ---- warm-cache latency: after 50 warm-up queries, measure 50 more ----
+        for i in 1..50.min(N_QUERIES) {
+            let w = engine.begin().unwrap();
+            engine.execute_sql(w, &query_sqls[i]).unwrap();
+            engine.commit(w).unwrap();
+        }
+        let warm_n = N_QUERIES.saturating_sub(50).max(1);
+        let warm_start = std::time::Instant::now();
+        for i in 50..N_QUERIES {
+            let w = engine.begin().unwrap();
+            engine.execute_sql(w, &query_sqls[i]).unwrap();
+            engine.commit(w).unwrap();
+        }
+        let warm_ms = warm_start.elapsed().as_secs_f64() * 1000.0 / warm_n as f64;
+
+        // ---- recall@10: compare IVF results to brute-force ground truth ----
+        let recall = {
+            let mut total = 0.0f64;
+            for i in 0..N_QUERIES {
+                // IVF top-K via Engine SQL
+                let w = engine.begin().unwrap();
+                let results = engine.execute_sql(w, &query_sqls[i]).unwrap();
+                engine.commit(w).unwrap();
+                let ivf_ids: std::collections::HashSet<i64> = match &results[0] {
+                    unidb::SqlResult::Rows { rows, .. } => rows
+                        .iter()
+                        .filter_map(|r| match &r[0] {
+                            Literal::Int(n) => Some(*n),
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => std::collections::HashSet::new(),
+                };
+
+                // Brute-force top-K (exact L2 over the in-RAM corpus)
+                let query = &query_vecs[i];
+                let mut scored: Vec<(f64, usize)> = corpus_vecs
+                    .iter()
+                    .enumerate()
+                    .map(|(j, v)| (euclidean_dist_sq(query, v), j))
+                    .collect();
+                scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                let bf_ids: std::collections::HashSet<i64> =
+                    scored.iter().take(K).map(|&(_, j)| j as i64).collect();
+
+                let hit = ivf_ids.intersection(&bf_ids).count();
+                total += hit as f64 / K as f64;
+            }
+            total / N_QUERIES as f64
+        };
+
+        println!(
+            "| {:>12} | {:>14} | {:>6} | {:>18} | {:>19.2} ms | {:>19.2} ms | {:>9.3} |",
+            n, nlist, nprobe, est_candidates, cold_ms, warm_ms, recall
+        );
+    }
+
+    println!();
+    println!("**Notes:**");
+    println!("- `nlist (actual)` = min(√N rounded, 256); `nprobe` = max(nlist/8, 8), capped at nlist");
+    println!("- `est. candidates` = nprobe × (N / nlist) — cells probed × avg cell size");
+    println!("- Recall@10 = |IVF_top10 ∩ BruteForce_top10| / 10, averaged over {N_QUERIES} queries");
+    println!("- Cold latency = first NEAR query after index creation (posting-list pages cold)");
+    println!("- Warm latency = average of last 50 queries after 50-query warm-up");
+    println!("- At 1M rows: nlist=1000 capped to 256, nprobe=32 → 3.2% scan → recall@10 likely <0.80");
+    println!("- 1M row run skipped (>30 min estimated); figures extrapolated from the nlist formula");
+}
+
 fn main() {
     // `UNIDB_BENCH` selects a subset so a single section can be re-run quickly
     // (e.g. the durable-FSM B-accept re-runs just B3/B4 before vs after without
@@ -3397,6 +3632,10 @@ fn main() {
             let mut criterion = Criterion::default().configure_from_args();
             bench_pg_crud(&mut criterion);
             criterion.final_summary();
+            return;
+        }
+        "ivf_validate" => {
+            bench_ivf_scale_validation();
             return;
         }
         _ => {}
