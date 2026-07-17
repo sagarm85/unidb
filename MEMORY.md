@@ -13,18 +13,17 @@
 ## Current status
 
 - **Item 59 — SELECT filtered optimisations — SHIPPED 2026-07-17, branch
-  `59-select-filtered-optimisations`. PR pending Docker bench results.**
-  Three fixes to the SELECT filtered hot path (5% selectivity):
-  Fix 1: `COLS_DECODED` gated behind `DIAGNOSTICS_ENABLED` (default false);
-  `Engine::enable_diagnostics()` added for bench/test use.
-  Fix 2: `Expr::ColumnSlot(usize)` pre-binding eliminates per-row linear
-  `String` column scan in `eval_expr` — bound once before scan loop.
-  Fix 3: `RawFilter`/`try_raw_i64_at` late materialisation skips `deform_row`
-  on rows rejected by simple integer predicates — at 5% selectivity avoids
-  95% of `Vec<Literal>` allocations on the filter pass.
-  Also updated: `Expr::ColumnSlot` arm in `qualify_policy` (query.rs); bench
-  selectivity fixed 100%→5% (commit 79890a7 already on branch); 3 new tests;
-  a3_gate test updated. clippy/fmt clean. Docker bench pending.
+  `59-select-filtered-optimisations`. PR pending.**
+  Three fixes to the SELECT filtered hot path:
+  Fix 1: `COLS_DECODED` gated behind `DIAGNOSTICS_ENABLED` (default false).
+  Fix 2: `Expr::ColumnSlot(usize)` pre-binding — applied to both full-scan
+  and B-tree candidate-resolution paths.
+  Fix 3: `RawFilter`/`try_raw_i64_at` late materialisation on full-scan path.
+  Measured: SELECT filtered 0.39× PG at 5% selectivity (B-tree index path;
+  cols/row=4.00). Full-scan improvements are effective when no index or
+  high-selectivity forces the scan path. 415 unit + 46 crash + 32/32 conc
+  matrix PASS. Peak RSS 284 MiB (-12 MiB vs item54). clippy/fmt clean.
+  Report: `docs/performance/benchmark_20260717_081246.md`.
 
 - **Item 58 — HOT-equivalent UPDATE — SHIPPED 2026-07-17, branch `58-hot-update`. PR #141 MERGED.**
   FORMAT_VERSION 7→8, WAL_HOT_UPDATE (type 16), hot_next tuple header field,

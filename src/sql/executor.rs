@@ -2077,15 +2077,22 @@ fn try_exec_select_btree(
     let cols = &table_def.columns;
     let ncols = cols.len();
     let proj_cols = projection_columns(table_def, projection);
+    // Item 59 Fix 2: bind column names → slot indices for the per-candidate
+    // closure (same pass as exec_select, eliminates per-row linear String scan
+    // inside eval_expr for the B-tree candidate re-check path).
+    let bound_pred: Option<Expr> = predicate.clone().map(|mut p| {
+        bind_predicate_columns(&mut p, cols);
+        p
+    });
     let mut pred_cols = Vec::new();
-    if let Some(pred) = predicate {
+    if let Some(pred) = bound_pred.as_ref() {
         expr_columns(pred, table_def, &mut pred_cols);
     }
     let (pred_needed, pred_upto) = needed_mask(&pred_cols, ncols);
     let mut full_cols = proj_cols;
     full_cols.extend_from_slice(&pred_cols);
     let (full_needed, full_upto) = needed_mask(&full_cols, ncols);
-    let has_pred = predicate.is_some();
+    let has_pred = bound_pred.is_some();
 
     // The B2 two-phase decode as a closure, shared by all resolution paths.
     // Item 54 Phase A: project_row_drain moves Literals out of the decode buffer
@@ -2093,7 +2100,7 @@ fn try_exec_select_btree(
     let per_candidate = |bytes: &[u8]| -> Result<Option<Vec<Literal>>> {
         if has_pred {
             let prow = deform_row(bytes, cols, pred_upto, &pred_needed)?;
-            if !predicate_matches(predicate, cols, &prow)? {
+            if !predicate_matches(&bound_pred, cols, &prow)? {
                 return Ok(None);
             }
         }
