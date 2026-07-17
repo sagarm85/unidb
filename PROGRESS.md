@@ -6838,3 +6838,29 @@ intermittency was a scheduler-pressure artifact, not a code defect.
 | `cargo test --test crash` | **44/44** (P58a/P58b new; FORMAT_VERSION 6→7) |
 
 Raw report: `docs/performance/benchmark_20260717_021445.md`.
+
+---
+
+## D4 sign-off — HOT-equivalent UPDATE   [SIGNED OFF]   2026-07-17
+
+**Explicit human sign-off recorded per CLAUDE.md §3.**
+
+Decision: reopen locked decision D4 (tuple format) to implement
+HOT-equivalent UPDATE (heap-only tuple when no indexed column changes).
+
+**Evidence for sign-off:**
+- UPDATE bulk at 0.04× confirmed architectural ceiling without HOT (item 56 Step 2, 2026-07-17)
+- Bench UPDATE is `SET body = 'updated'` — `body` is unindexed, HOT fires on this workload
+- `_pad u16` at `src/page.rs:28` absorbs the forwarding pointer — no TUPLE_HEADER_SIZE change
+- Architecture session (Fable-5, 2026-07-17) estimated honest ceiling: 0.07–0.09× with HOT
+
+**Scope of change authorised:**
+- Add forwarding pointer to tuple header (`_pad u16` repurposed)
+- FORMAT_VERSION bump (7→8)
+- B-tree lookup follows HOT chain when indexed col unchanged
+- Recovery handles forwarding chains (undo unwinds chain)
+- New crash injection points (D7)
+- Implementation in new worktree, tracked as item 58
+
+**Ceiling acknowledged:** 0.07–0.09× PG (not the original A3 target of 0.12×).
+This is accepted. The target for item 58 is ≥0.07× (from 0.04×).
