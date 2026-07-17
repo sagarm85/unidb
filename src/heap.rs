@@ -417,9 +417,26 @@ impl Heap {
         wal: &Wal,
         lock_mgr: &LockManager,
     ) -> Result<Option<RowId>> {
-        lock_mgr.try_acquire_write(RecordId::row(old_rid.page_id, old_rid.slot), xid)?;
-
         let needed = crate::page::SLOT_SIZE + crate::page::TUPLE_HEADER_SIZE + new_data.len();
+
+        // FSM fast pre-screen: if the FSM says the page has insufficient free
+        // space, return None immediately — no lock, no mini-txn, no page fetch.
+        // The FSM can under-report (it lags behind page compactions), so a None
+        // here is safe (we fall back to the cross-page path). Over-reporting is
+        // also safe (the accurate check under the latch below is the gate). The
+        // FSM check eliminates the double mini-txn overhead on full pages, which
+        // was the dominant cost at 100k rows (pages near-full → nearly all HOT
+        // attempts would fail the accurate check → double the WAL overhead).
+        {
+            let fsm = self.lock_fsm();
+            if let Some(&fsm_free) = fsm.free_map.get(&old_rid.page_id) {
+                if fsm_free < needed {
+                    return Ok(None); // Fast path: FSM says page is full.
+                }
+            }
+        }
+
+        lock_mgr.try_acquire_write(RecordId::row(old_rid.page_id, old_rid.slot), xid)?;
 
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
 
@@ -442,7 +459,7 @@ impl Heap {
             });
         }
 
-        // Check if the new version fits on the same page.
+        // Accurate free-space check under the latch (handles FSM staleness).
         if old_page.free_space() < needed {
             // Not enough space — fall back to the caller.
             pool.unpin(old_rid.page_id);
