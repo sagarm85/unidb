@@ -1430,11 +1430,29 @@ fn exec_create_index(
         // every committed row's vector. HNSW is built incrementally (no training
         // phase required, unlike IVF-Flat) so the build order is arbitrary.
         //
-        // Performance: switch to deferred-sync mode for the bulk build so the
-        // individual per-node mini-txns skip per-call fsync. The surrounding user
-        // transaction's WAL_TXN_COMMIT (plus an explicit sync here) ensures
-        // durability of the entire built graph before returning to the caller.
+        // Performance (two-pass approach):
+        // Pass 1: scan heap once, collect all (heap_rid, vector) pairs into an
+        //   in-memory HashMap<i64, Vec<f32>> (build_cache).  This costs O(n) RAM
+        //   for the duration of the build (~dim*4 bytes per row; 50 MB at 100k×dim128).
+        // Pass 2: build HNSW using insert_with_cache so that every vector fetch
+        //   during beam search hits the O(1) HashMap instead of the O(log n)
+        //   DiskBTree.  Eliminates the O(n²·log n) DiskBTree lookup bottleneck
+        //   that made 10k rows take 53+ minutes: now build is O(n·ef·M) distance
+        //   comparisons on in-memory floats — expected <2 min at 10k, <10 min at 100k.
+        // WAL durability: deferred-sync collapses ~N fsyncs to 1 after the loop.
         let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
+
+        // Pass 1: collect all vectors into the build cache.
+        let mut build_cache: std::collections::HashMap<i64, Vec<f32>> =
+            std::collections::HashMap::new();
+        for (row_id, bytes) in heap.scan(&snapshot, ctx.xid, ctx.pool)? {
+            let row = decode_row(&bytes, &table_def.columns)?;
+            if let Literal::Vector(v) = &row[col_idx] {
+                let key = (row_id.page_id as i64) * 65536 + row_id.slot as i64;
+                build_cache.insert(key, v.clone());
+            }
+        }
+
         let hnsw = DiskHnswIndex::create(
             vec_dim as usize,
             crate::vector::Metric::Euclidean,
@@ -1443,10 +1461,11 @@ fn exec_create_index(
         )?;
         // Enable deferred sync for bulk build (no per-node fsync overhead).
         ctx.wal.set_deferred_sync(true);
+        // Pass 2: insert each row using the build cache for O(1) vector lookups.
         for (row_id, bytes) in heap.scan(&snapshot, ctx.xid, ctx.pool)? {
             let row = decode_row(&bytes, &table_def.columns)?;
             if let Literal::Vector(v) = &row[col_idx] {
-                hnsw.insert(row_id, v, ctx.pool, ctx.wal)?;
+                hnsw.insert_with_cache(row_id, v, &build_cache, ctx.pool, ctx.wal)?;
             }
         }
         // Re-enable per-commit durability and force the accumulated writes to disk.

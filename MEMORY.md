@@ -12,14 +12,16 @@
 
 ## Current status
 
-- **Item 63 — Disk-based HNSW index — SHIPPED 2026-07-17, branch `63-disk-hnsw`. PR pending.**
+- **Item 63 — Disk-based HNSW index — SHIPPED 2026-07-17, branch `63-disk-hnsw`. PR #146.**
   `src/hnsw_index.rs` — `DiskHnswIndex` replaces `DiskIvfIndex` for `IndexKind::Hnsw`.
-  Recall@10 at 1k×dim128: 0.964 (gate ≥0.95 PASS). 10k recall pending (bench ~40 min due to
-  ~1 GB WAL write volume for reciprocal L0 connections). HNSW warm query latency 5.31 ms at 1k.
-  Crash tests P60a + P60b: PASS. 669 lib/integration tests PASS, 48 crash tests PASS.
-  ivf_scale_validation.rs updated: IVF nlist test → `hnsw_near_returns_approximate_nearest`.
-  PROGRESS.md updated (item 62 → SHIPPED, item 63 entry). Docker bench running (commit 9fdb672).
-  Next: wait for Docker bench → update PROGRESS.md W2-W1 delta → create PR.
+  Cache fix (2026-07-17): two-pass `exec_create_index` — pre-scan heap → `HashMap<i64,Vec<f32>>`
+  build_cache, then `insert_with_cache` uses O(1) cache for vector fetches during beam search.
+  Eliminates O(n²·log n) DiskBTree bottleneck. ef_search 50 → 200 to meet recall gates.
+  Results: recall@10 = 0.999 at 1k×dim128 (≥0.95 gate PASS); 0.947 at 10k×dim128 (≥0.90 PASS).
+  10k build: 53+ min → 4.6 min (14× speedup). 100k build: timed out at 10 min (remaining
+  bottleneck: neighbour page I/O during beam search, not vector lookups). ef_search=200, warm
+  NEAR latency: 8.30 ms at 1k, 25.19 ms at 10k.
+  Crash tests P60a + P60b: PASS. 669 tests PASS, 48 crash tests PASS. PR #146.
 
 - **Item 62 — IVF-Flat scale validation — SHIPPED 2026-07-17. PR #145 MERGED.**
   Bench `UNIDB_BENCH=ivf_validate`: creates IVF index AFTER insert (fixing nlist=1
