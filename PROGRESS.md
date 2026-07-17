@@ -7349,3 +7349,82 @@ unidb is now 17× SLOWER than the 4-system replaced stack due to HNSW insert ove
 
 **Fix in progress: item 65 — per-insert node cache** (branch `65-hnsw-insert-cache`).
 Target: W2−W1 < 2ms, W4/W0 < 5×, Table 4 > 1.0×.
+
+---
+
+## Item 65 — HNSW incremental insert: per-insert NodeCache (2026-07-18)
+
+**Branch:** `65-hnsw-insert-cache` | **Backlog:** `docs/backlog/65_hnsw_insert_node_cache.md`
+
+### Problem
+
+Item 63 shipped `DiskHnswIndex` with a bulk-build cache (`HashMap<i64,Vec<f32>>`) for
+`CREATE INDEX`, but the incremental path (`insert` called from `apply_durable_index_writes`
+on every SQL INSERT) had no cache. During `search_layer` (ef_construction=200, M=16):
+
+- Each candidate expansion: `get_l0_nbrs` → `find_node_loc` (DiskBTree, O(log n)) + `load_node_at` (page fetch)
+- Each of up to 16 neighbours: `fetch_vector_cached` → `find_node_loc` + `load_node_at` again if not yet expanded
+
+Total DiskBTree lookups per insert: ef × M ≈ 200 × 16 = **3,200**. Each traverses 2–4 B-tree levels.
+Even with all pages in the buffer pool, the traversal CPU + pin/unpin overhead dominated.
+
+**Before fix (native macOS M5 Pro, F_FULLFSYNC):** W2=70ms, W2−W1=64ms at 1k rows; W4/W0=17.13×.
+**Before fix (Docker/Linux, item 63 notes):** W2−W1 ≈ 16ms at 1k rows; W4/W0=46.86×; Table 4: unidb 0.06× vs replaced stack.
+
+### Fix
+
+Added `NodeCache = HashMap<i64, HnswNode>` as a local variable in `insert_inner`, keyed by
+`encode_rid(rid) = (rid.page_id as i64) * 65536 + rid.slot as i64`. The cache accumulates full
+`HnswNode` structs (vector + level + L0 neighbours) across all phases of one insert call.
+
+- `fetch_vector_cached`: on cache miss, loads full node from disk AND stores it in cache
+- `get_l0_nbrs`: on cache miss, fetches node and stores in cache; both vector and L0 neighbours cached
+- `search_layer`, `apply_reciprocal_l0_to_buf`: take `Option<&mut NodeCache>` and thread through
+
+Result: each node fetched **at most once** per `insert_inner` call (~200 unique fetches vs ~3200).
+
+Cache is created fresh at start of `insert_inner`, dropped at end — NEVER shared across inserts.
+Only active when `build_cache.is_none()` (incremental path; bulk-build has vector HashMap already).
+
+### Files changed
+
+- `src/hnsw_index.rs`: `NodeCache` type alias + `encode_rid` helper; updated signatures for
+  `fetch_vector_cached`, `get_l0_nbrs`, `search_layer`, `apply_reciprocal_l0_to_buf`;
+  filter_map→sequential-for-loop rewrites in shrink paths (required to allow `&mut` borrow across iterations);
+  local `node_cache` in `insert_inner`.
+
+### Benchmark results (native macOS M5 Pro, F_FULLFSYNC, `MM_SAMPLE=200`)
+
+**Table 1 — Multi-model commit cost vs table size (ms/commit):**
+
+| rows | W0 | W1 | W2 | W3 | W4 | W4−W0 | W4/W0 |
+|-----:|---:|---:|---:|---:|---:|------:|------:|
+| 1000 | 3.10 | 3.16 | 37.56 | 43.75 | 51.96 | 48.86 | 16.77× |
+| 10000 | not measured (see note) | — | — | — | — | — | — |
+
+Before fix (native): W2=70ms, W2−W1=64ms, W4/W0=17.13× at 1k rows.
+After fix (native, 1k): W2=37.56ms, W2−W1=34.40ms, W4/W0=16.77× — **W2 −46%, W4/W0 −2%**.
+
+**10k note (honest finding):** The W2 pre-grow at 10k rows (10k incremental HNSW inserts via
+SQL INSERT path, macOS F_FULLFSYNC) ran for >22 minutes without completing and was terminated.
+NodeCache eliminates ~3200→~200 DiskBTree lookup calls per insert but the remaining bottleneck
+is I/O cost for fetching ~200 unique node pages per insert as the graph grows (10k nodes ×
+~18 pages/insert warm-set; F_FULLFSYNC amplifies each commit). This is the beam-search I/O
+gap documented in item 63's "remaining bottleneck at 100k" finding — now also confirmed at 10k
+on the incremental path. Original targets (W2−W1 < 2ms, W4/W0 < 5×) not met; the NodeCache
+fix is necessary but not sufficient for those targets.
+
+Note: macOS F_FULLFSYNC inflates absolute numbers ~3–4× vs Docker/Linux. Docker bench
+(Linux fdatasync) is the recommended validation environment for 10k numbers.
+
+### Check table
+
+| Check | Result |
+|-------|--------|
+| `cargo build --release` | clean |
+| `cargo clippy -- -D warnings` | clean |
+| `cargo fmt --all` | clean |
+| `cargo test --release` | **431 lib + integration passed; 0 failed** |
+| `cargo test --test crash --release` | **48 passed; 0 failed** |
+| HNSW unit tests (10 tests) | **PASS** |
+| Recall@10 at 1k×dim128 (HNSW, ef=200) | **0.999** ≥ 0.95 gate PASS |
