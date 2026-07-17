@@ -1054,14 +1054,9 @@ fn send_event_capture(
     let _outer_span = tracing::debug_span!("event_queue_capture").entered();
     let t0 = std::time::Instant::now();
 
-    let before_json = before.map(|r| queue::payload::row_to_json(r, &table_def.columns));
-    let after_json = after.map(|r| queue::payload::row_to_json(r, &table_def.columns));
-    // Back-compat payload = after for INSERT/UPDATE, before for DELETE.
-    let compat_payload = after_json
-        .as_ref()
-        .or(before_json.as_ref())
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
+    // Item 60: replaced serde_json::json! + row_to_json (Value tree) with a
+    // direct string builder.  No serde_json::Value is ever allocated; the
+    // envelope is built as a String and stored verbatim as Literal::Json.
     let ts_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1075,24 +1070,21 @@ fn send_event_capture(
     // Canonical envelope stored in the payload JSON column (item 29, C1).
     // "payload" = back-compat flat row; "before"/"after"/"ts_ms"/"source" are new.
     // Consumers reading event.payload["col"] see the same flat object as before.
-    let envelope = serde_json::json!({
-        "payload": compat_payload,
-        "before": before_json,
-        "after": after_json,
-        "ts_ms": ts_ms,
-        "source": {
-            "seq": seq,
-            "txId": ctx.xid,
-            "table": table_def.name,
-            "schema": "public"
-        }
-    });
+    let envelope_str = queue::payload::build_event_envelope_str(
+        op,
+        &table_def.name,
+        before.map(|r| (r, table_def.columns.as_slice())),
+        after.map(|r| (r, table_def.columns.as_slice())),
+        ts_ms,
+        seq,
+        ctx.xid,
+    );
     let encoded = encode_row(&queue::event_row(
         seq as i64,
         ctx.xid as i64,
         &table_def.name,
         op,
-        &envelope,
+        envelope_str,
     ));
     let json_us = t0.elapsed().as_micros();
 

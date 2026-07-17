@@ -149,19 +149,29 @@ pub fn consumers_table_def() -> TableDef {
     }
 }
 
+/// Build an `__events__` row.
+///
+/// `payload_json` must already be a valid JSON string — the caller is
+/// responsible for serialisation.  The string is stored verbatim as a
+/// `Literal::Json`; no re-serialisation is performed here.
+///
+/// Item 60: the old signature accepted `&serde_json::Value` and called
+/// `.to_string()` on it, which was a redundant serialise step on top of the
+/// `serde_json::json!` allocation in `send_event_capture`.  Both are now
+/// replaced by `payload::build_event_envelope_str`.
 pub fn event_row(
     seq: i64,
     xid: i64,
     table_name: &str,
     op: &str,
-    payload: &serde_json::Value,
+    payload_json: String,
 ) -> Vec<Literal> {
     vec![
         Literal::Int(seq),
         Literal::Int(xid),
         Literal::Text(table_name.to_string()),
         Literal::Text(op.to_string()),
-        Literal::Json(payload.to_string()),
+        Literal::Json(payload_json),
     ]
 }
 
