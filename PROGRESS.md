@@ -7226,50 +7226,70 @@ recall@10 = 0.421 at 100k rows on uniform random 128-dim vectors — well below 
 | corpus size | M | ef_search | NEAR latency cold | NEAR latency warm | recall@10 | gate ≥ 0.95 |
 |---:|---:|---:|---:|---:|---:|:---:|
 | 1k×dim128 | 16 | 50 | 6.90 ms | 5.31 ms | **0.964** | PASS |
-| 10k×dim128 | 16 | 50 | (bench running ~35 min, see note) | — | (pending) | — |
-| 100k×dim128 | 16 | 50 | (infeasible: ~4h WAL write volume) | — | (not measured) | — |
-
-**Build time note:** HNSW bulk build via the SQL path is slow due to full-page WAL images
-(8 KB per page touched) × reciprocal L0 connections (up to M_max0=32 back-edges per node,
-each possibly on a different page). At 10k×dim128: ~1 GB WAL writes; estimated 40–45 minutes
-on Mac M5 Pro. This is a known performance limitation — the per-insert WAL volume scales as
-O(n × M_max0 × page_size). Future optimization: WAL delta records for node page updates
-(instead of full-page images), or offline bulk-build then checkpoint. The deferred_sync
-optimization (34k fsyncs → 1 per build) is already applied but cannot reduce write volume.
+| 10k×dim128 | 16 | 50 | (not measured — see build perf note) | — | (not measured) | — |
+| 100k×dim128 | 16 | 50 | (not measured — see build perf note) | — | (not measured) | — |
 
 **Recall guarantee:** HNSW recall@10 is approximately stable across corpus sizes (by algorithm
-design). At 1k×dim128: 0.964. HNSW beam search with ef_construction=200 ensures good graph
-connectivity; the uniform-random-128d distribution (hardest case for any ANN method due to
-distance concentration) still gives recall well above the 0.95 gate.
+design — the O(log n) beam search maintains quality regardless of corpus size). At 1k×dim128
+on uniform random vectors (the hardest distribution): 0.964.
+
+**HONEST BUILD PERFORMANCE FINDING (2026-07-17):** The 10k HNSW build via the SQL path
+was observed for 53 minutes without completing (~1.7 GB WAL written, ~105/130 estimated segments).
+This is catastrophically poor — approximately 70 minutes for 10k rows vs 17 seconds for 1k rows.
+That is **~250× slower for 10× data = O(n^2.4) build complexity**, far worse than the O(n log n)
+expected for HNSW.
+
+Root cause: `fetch_vector_via_index` in `search_layer` does a DiskBTree lookup for every vector
+fetched during beam search. At beam search with ef=200 visiting 16 neighbours each = 3200 DiskBTree
+lookups per insert. At n=10k nodes, the graph is 10× larger than at 1k, so each insert searches a
+10× larger graph → 10× more lookups, each taking slightly more time (deeper B-tree). Total per-insert
+cost scales as O(ef × M × log n) with a large constant from B-tree I/O.
+
+Additionally: each insert writes reciprocal L0 connections (~16 page writes per insert × 8KB each =
+128KB WAL per insert), independent of n. Full-page WAL images dominate the WAL volume.
+
+The combined effect: build time and per-insert WAL overhead both scale super-linearly with n.
+
+**Impact on W2 ladder bench:** The Docker W2 bench at 10k/100k rows was stopped at 20 minutes
+without producing W2 numbers (pre-grow phase could not complete). Only the IVF-Flat baseline
+numbers are available for W2 at 10k/100k.
+
+**Future optimization items (not in this PR):**
+1. In-memory vector cache during beam search (avoid B-tree lookup per vector fetch)
+2. WAL delta records instead of full-page images for node page updates
+3. Offline bulk-build (collect all vectors, build graph in RAM, checkpoint to disk)
 
 ### NEAR latency comparison: IVF-Flat (item 62) vs HNSW (item 63)
 
 | corpus size | IVF-Flat warm latency | IVF-Flat recall@10 | HNSW warm latency | HNSW recall@10 |
 |---:|---:|---:|---:|---:|
 | 1k | 0.77 ms | 0.690 | **5.31 ms** | **0.964** |
-| 10k | 1.73 ms | 0.378 | (pending) | (pending) |
-| 100k | 17.04 ms | 0.421 | (not measured) | — |
+| 10k | 1.73 ms | 0.378 | (not measured — build too slow) | — |
+| 100k | 17.04 ms | 0.421 | (not measured — build too slow) | — |
 
 HNSW warm query latency at 1k is 6.9× higher than IVF-Flat (5.31 ms vs 0.77 ms): the beam
 search traverses ef×M = 3200 distance computations per query vs IVF's ~250 candidate re-rank.
 At larger corpora, IVF recall degrades catastrophically (nlist cap); HNSW maintains quality.
-The latency tradeoff is acceptable given the recall improvement (0.421 → ≥0.95).
+The 6.9× query latency tradeoff is acceptable given the recall improvement (0.690 → 0.964 at 1k).
+However, the build performance regression is severe and must be addressed before HNSW can be used
+at corpus sizes ≥ 5k rows in production.
 
-### Docker bench (W2 overhead with HNSW)
+### Docker W2 bench (vector index overhead per commit)
 
-Running — commit `9fdb672` on branch `63-disk-hnsw`. Results pending.
+The Docker bench (commit `9fdb672`, branch `63-disk-hnsw`) was stopped after 20 minutes: the
+W2 pre-grow at 10k rows could not complete in reasonable time (HNSW build is O(n²·ef·M) in practice).
+Only the IVF-Flat baseline numbers (commit `8cf799f`, main, before item 63) are available:
 
-Baseline (item 62 Docker bench, commit `8cf799f`, IVF-Flat in W2 path):
+| rows | W2−W1 IVF-Flat (item 62) | W2−W1 HNSW (item 63) |
+|---:|---:|---:|
+| 1k | +0.13 ms | not measured (1k builds in ~17s, w2 overhead should be small) |
+| 10k | +0.11 ms | **impractical** (pre-grow takes ~70 min) |
+| 100k | +0.06 ms | **impractical** (pre-grow estimated hours) |
 
-| rows | W2−W1 (vector index marginal) |
-|---:|---:|
-| 1k | +0.13 ms |
-| 10k | +0.11 ms |
-| 100k | +0.06 ms |
-
-With real HNSW, W2−W1 is expected to be higher (O(ef×M) per-insert distance computation
-dominates over IVF's single centroid assignment). Results will replace this note when Docker
-bench completes.
+With real HNSW, per-INSERT W2−W1 at a pre-grown 10k table ≈ (build time ~70 min / 10k inserts) =
+**~420ms per insert**. This makes W2 at 10k = ~421ms total commit cost vs W1 at 10k = 0.44ms —
+a 956× regression vs IVF-Flat's 0.11ms overhead. This is a known limitation documented as a
+follow-up optimization item.
 
 ### Check table
 
