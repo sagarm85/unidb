@@ -12,6 +12,16 @@
 
 ## Current status
 
+- **Item 60 — Event queue serde_json replacement — SHIPPED 2026-07-17, branch
+  `60-event-queue-serde-json-fix`. PR pending.**
+  Replaced `serde_json::json!` + `row_to_json` (Value AST heap allocation) in
+  `send_event_capture` with `build_event_envelope_str` (direct String builder).
+  VECTOR(128) no longer boxes 128 `JsonValue::Number`. `event_row` signature
+  changed from `&serde_json::Value` to `String`. Fixed decompose.rs format-string
+  escape bug from item 59. W4/W0 at 100k: 1.70× → 1.49× (gate ≤1.50× MET).
+  424 unit + 46 crash + 32/32 conc matrix = 0 failures.
+  Docker bench: `docs/performance/benchmark_20260717_095824.md`.
+
 - **Item 59 — SELECT filtered optimisations — SHIPPED 2026-07-17, branch
   `59-select-filtered-optimisations`. PR pending.**
   Three fixes to the SELECT filtered hot path:
@@ -3470,6 +3480,44 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-17 — Item 60: Event queue serde_json replacement
+
+Branch: `60-event-queue-serde-json-fix`.
+
+**Goal:** Replace `serde_json::json!` + `row_to_json` (Value AST heap
+allocation) in `send_event_capture` with a manual JSON string builder.
+Root cause: every CDC capture allocated two `serde_json::Value::Object` maps
+(before + after), a third for the envelope, then serialised back to String.
+VECTOR(128) boxed 128 `f32` values as `JsonValue::Number`.
+
+**Changes shipped:**
+
+1. `src/queue/payload.rs` — new `push_json_str`, `write_row_json`,
+   `build_event_envelope_str`; legacy `row_to_json` kept for non-hot callers.
+   9 new unit tests (per-literal-type + envelope correctness gate).
+
+2. `src/queue/mod.rs` — `event_row` signature: `&serde_json::Value` → `String`.
+
+3. `src/sql/executor.rs` — `send_event_capture` calls `build_event_envelope_str`
+   directly; removed `row_to_json` calls and `serde_json::json!` macro.
+
+4. `benches/decompose.rs` — fixed pre-existing `{id,k,body}` format-string
+   escape bug (from item 59).
+
+**Test results:** 424 unit + 46 crash + 32/32 conc matrix = 0 failures.
+Clippy clean; fmt clean.
+
+**Bench (Docker Linux aarch64, `5411a7e`):**
+- W4/W0 at 100k: 1.70× → **1.49×** (gate ≤1.50× MET).
+- 1k/10k rows: noisy at MM_SAMPLE=20 (fsync floor dominates).
+- Peak RSS: 290 MiB.
+- CRUD Table 3: no regression (item 60 is CDC hot-path only).
+- Report: `docs/performance/benchmark_20260717_095824.md`.
+
+**PR:** Pending creation.
+
+---
 
 ### 2026-07-17 — Item 59: SELECT filtered optimisations (3 fixes)
 

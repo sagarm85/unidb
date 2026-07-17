@@ -1,7 +1,7 @@
 # Item 60 — Event queue serde_json replacement
 
 **Type:** Performance
-**Status:** IN PROGRESS
+**Status:** SHIPPED (→ PROGRESS.md "Item 60 — Event queue serde_json replacement")
 
 ## Problem
 
