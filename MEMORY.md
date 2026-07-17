@@ -21,6 +21,7 @@
   escape bug from item 59. W4/W0 at 100k: 1.70× → 1.49× (gate ≤1.50× MET).
   424 unit + 46 crash + 32/32 conc matrix = 0 failures.
   Docker bench: `docs/performance/benchmark_20260717_095824.md`.
+  PR #143: https://github.com/sagarm85/unidb/pull/143
 
 - **Item 59 — SELECT filtered optimisations — SHIPPED 2026-07-17, branch
   `59-select-filtered-optimisations`. PR pending.**
@@ -3515,7 +3516,7 @@ Clippy clean; fmt clean.
 - CRUD Table 3: no regression (item 60 is CDC hot-path only).
 - Report: `docs/performance/benchmark_20260717_095824.md`.
 
-**PR:** Pending creation.
+**PR:** #143 RAISED — https://github.com/sagarm85/unidb/pull/143
 
 ---
 

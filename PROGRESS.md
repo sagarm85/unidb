@@ -7037,6 +7037,7 @@ genuine regression. The W4/W0 anomaly at 100k rows is pre-existing edge-cost var
 ## Item 60 — Event queue serde_json replacement   [SHIPPED]   2026-07-17
 
 **Branch:** `60-event-queue-serde-json-fix`
+**PR:** #143 — https://github.com/sagarm85/unidb/pull/143
 **Date:** 2026-07-17
 **Status:** Shipped — Docker bench complete.
 
