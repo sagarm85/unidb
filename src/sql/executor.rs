@@ -2365,7 +2365,6 @@ fn exec_update(
     // Item 36: gate FK parent-side RESTRICT (does any child table reference us?).
     let has_fk_children = table_has_fk_children(ctx.catalog.get(), table);
     let mut count = 0;
-
     for (row_id, bytes) in matching {
         let mut row = decode_row(&bytes, &table_def.columns)?;
         // C1 (item 29): snapshot the pre-mutation image before set_column overwrites it.
@@ -2409,8 +2408,8 @@ fn exec_update(
             }
             // Step 2: fresh snapshot AFTER all phantom locks.
             let usnap = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
-            // UNIQUE: exclude the row's current version (old tuple still
-            // visible to this snapshot until heap.update supersedes it).
+            // UNIQUE: exclude the row's current version (old tuple still visible
+            // to this snapshot until heap.update supersedes it).
             if has_unique {
                 enforce_unique(
                     &table_def,
@@ -4272,6 +4271,15 @@ mod tests {
         fn commit(&mut self, xid: Xid) {
             self.txn_mgr.commit(xid, &self.wal, &self.lock_mgr).unwrap();
         }
+
+        fn abort(&mut self, xid: Xid) {
+            // A minimal empty Heap is sufficient: undo_xmax_stamp/undo_insert go
+            // directly to the buffer pool by page_id — they don't need the FSM.
+            let heap = Heap::open(self.page_size, None, vec![]);
+            self.txn_mgr
+                .abort(xid, &self.pool, &heap, &self.wal, &self.lock_mgr)
+                .unwrap();
+        }
     }
 
     #[test]
@@ -5751,5 +5759,171 @@ mod tests {
             .exec_as(xid, "SELECT * FROM t WHERE NEAR(name, [0.0, 0.0], 3)")
             .unwrap_err();
         assert!(matches!(err, DbError::SqlPlan(_)));
+    }
+
+    // ── Item 56 Step 2: update_many batch path ────────────────────────────────
+
+    #[test]
+    fn update_many_batch_produces_same_result_as_per_row() {
+        // Plain table (no unique/FK) takes the batch path; verify updated and
+        // unchanged rows all have the correct values after commit.
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE plain (id INT, v INT)")
+            .unwrap();
+        for i in 1..=20i64 {
+            h.exec_as(xid, &format!("INSERT INTO plain (id, v) VALUES ({i}, 0)"))
+                .unwrap();
+        }
+        h.commit(xid);
+
+        // Batch path: plain table has no unique/FK constraints.
+        let xid2 = h.begin();
+        let r = h
+            .exec_as(xid2, "UPDATE plain SET v = 100 WHERE id <= 10")
+            .unwrap();
+        assert_eq!(r, ExecResult::Updated { count: 10 });
+        h.commit(xid2);
+
+        let xid3 = h.begin();
+        let rows = match h
+            .exec_as(xid3, "SELECT id, v FROM plain WHERE id <= 10")
+            .unwrap()
+        {
+            ExecResult::Rows { rows: r, .. } => r,
+            o => panic!("{o:?}"),
+        };
+        // All 10 updated rows must have v = 100.
+        assert_eq!(rows.len(), 10);
+        for row in &rows {
+            assert_eq!(row[1], Literal::Int(100), "updated row must have v=100");
+        }
+        // Unchanged rows must still have v = 0.
+        let unchanged = match h
+            .exec_as(xid3, "SELECT id, v FROM plain WHERE id > 10")
+            .unwrap()
+        {
+            ExecResult::Rows { rows: r, .. } => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(unchanged.len(), 10);
+        for row in &unchanged {
+            assert_eq!(row[1], Literal::Int(0), "unmatched row must keep v=0");
+        }
+        h.commit(xid3);
+    }
+
+    #[test]
+    fn update_many_batch_abort_reverses_all_stamps() {
+        // If the user transaction is aborted after the batch UPDATE, all old
+        // versions must be restored (xmax cleared) and the original values visible.
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, v INT)").unwrap();
+        for i in 1..=5i64 {
+            h.exec_as(xid, &format!("INSERT INTO t (id, v) VALUES ({i}, 0)"))
+                .unwrap();
+        }
+        h.commit(xid);
+
+        // Batch UPDATE then abort.
+        let xid2 = h.begin();
+        let r = h.exec_as(xid2, "UPDATE t SET v = 999").unwrap();
+        assert_eq!(r, ExecResult::Updated { count: 5 });
+        h.abort(xid2);
+
+        // After abort: original values must be visible, not 999.
+        let xid3 = h.begin();
+        let rows = match h.exec_as(xid3, "SELECT v FROM t").unwrap() {
+            ExecResult::Rows { rows: r, .. } => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(rows.len(), 5);
+        for row in &rows {
+            assert_eq!(row[0], Literal::Int(0), "abort must restore original value");
+        }
+        h.commit(xid3);
+    }
+
+    #[test]
+    fn update_many_unique_table_stays_on_per_row_path_and_enforces_constraint() {
+        // A table with a UNIQUE/PK column must NOT take the batch path.
+        // Verify that a uniqueness violation on the per-row path is still caught:
+        // updating row id=1 to id=2 collides with the existing row id=2.
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE u (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+        h.exec_as(xid, "INSERT INTO u (id, v) VALUES (1, 10)")
+            .unwrap();
+        h.exec_as(xid, "INSERT INTO u (id, v) VALUES (2, 20)")
+            .unwrap();
+        h.commit(xid);
+
+        // id=1 → id=2 collides with the existing id=2 row.
+        let xid2 = h.begin();
+        let err = h
+            .exec_as(xid2, "UPDATE u SET id = 2 WHERE id = 1")
+            .unwrap_err();
+        assert!(
+            matches!(err, DbError::UniqueViolation { .. }),
+            "expected UniqueViolation, got {err:?}"
+        );
+        h.abort(xid2);
+    }
+
+    #[test]
+    fn update_many_page_boundary_crossing() {
+        // Regression for item-50-style infinite loop: updates spanning multiple
+        // heap pages must all succeed and each row must have the new value.
+        // We insert enough rows to span at least two pages, then update all of them.
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        // 256-byte body forces ~28-30 rows per 8 KiB page.
+        h.exec_as(xid, "CREATE TABLE t (id INT, body TEXT)")
+            .unwrap();
+        let body = "x".repeat(256);
+        let n = 80i64; // spans ≥3 pages
+        for i in 1..=n {
+            h.exec_as(
+                xid,
+                &format!("INSERT INTO t (id, body) VALUES ({i}, '{body}')"),
+            )
+            .unwrap();
+        }
+        h.commit(xid);
+
+        let xid2 = h.begin();
+        let r = h.exec_as(xid2, "UPDATE t SET body = 'updated'").unwrap();
+        assert_eq!(r, ExecResult::Updated { count: n as usize });
+        h.commit(xid2);
+
+        let xid3 = h.begin();
+        let rows = match h
+            .exec_as(xid3, "SELECT id FROM t WHERE body = 'updated'")
+            .unwrap()
+        {
+            ExecResult::Rows { rows: r, .. } => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(rows.len() as i64, n, "all {n} rows must show the new value");
+        // No row should still have the old body.
+        let old_rows = match h
+            .exec_as(xid3, &format!("SELECT id FROM t WHERE body = '{body}'"))
+            .unwrap()
+        {
+            ExecResult::Rows { rows: r, .. } => r,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(
+            old_rows.len(),
+            0,
+            "no rows should retain the old value after commit"
+        );
+        h.commit(xid3);
     }
 }

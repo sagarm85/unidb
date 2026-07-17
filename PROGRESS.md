@@ -6632,7 +6632,9 @@ this clean run).
 > Step 2 (UPDATE batching via `exec_update` gate + `Heap::update_many` caller) was
 > benchmarked and reverted in the same session. `Heap::update_many` stays in
 > `src/heap.rs` for future use; the `exec_update` batch gate and compute-pass
-> restructuring are removed. See "Step 2 investigation" below.
+> restructuring are removed. Root cause was not a triple-decode (dec/row=1.00
+> confirmed) but 60 MB staging allocation thrashing CPU cache; A3 is an
+> architectural ceiling without HOT. See "Step 2 investigation" below.
 
 ### What shipped
 
@@ -6670,9 +6672,9 @@ records would leave dead rows visible after crash).
 | criterion | target | result | status |
 |-----------|--------|--------|--------|
 | A2 SELECT grouped ≥0.45× | ≥0.45× | 1.38× | ✓ PASS (carry-over from Step 1) |
-| A3 UPDATE bulk ≥0.12× | ≥0.12× | 0.04× (unchanged) | — DEFERRED (Step 2) |
+| A3 UPDATE bulk ≥0.12× | ≥0.12× | 0.04× (unchanged) | — architectural ceiling: B-tree per-row insert + no HOT; ≥0.12× unreachable without HOT chains (Step 2 confirmed) |
 | A4 DELETE selected ≥0.15× | ≥0.15× | **0.07×** | ✗ FAIL (improved +40% from 0.05×) |
-| A5 UPDATE WAL ≤320 B/row | ≤320 | 530 (unchanged) | — DEFERRED (Step 2) |
+| A5 UPDATE WAL ≤320 B/row | ≤320 | 530 per-row; 373 batch (reverted) | — architectural ceiling: batch WAL achieves 373 B/row but exec_update stays per-row (cache thrash outweighs savings) |
 | A6 DELETE WAL ≤80 B/row | ≤80 | **72** | ✓ PASS |
 
 **A4 honest-miss:** WAL_XMAX_BATCH removed the WAL stamp framing bottleneck
@@ -6683,16 +6685,38 @@ Not addressable without Step 4 or parallel DELETE execution.
 ### Step 2 investigation — UPDATE batch path benchmarked and reverted
 
 `Heap::update_many` was wired into `exec_update` with gate
-`use_batch = !has_unique && !has_fk_refs_in_set && !has_fk_children`. Docker bench
-showed UPDATE throughput at **0.02× (17,783 rec/s) — regression from 0.04× baseline**.
-Root cause confirmed by `dec/row = 3.00` counter in bench output: the batch path
-performs three decode passes per row (compute pass + Phase B encode + post-process
-CDC/index re-decode from `matching[i]` + `staged[i]`) vs the per-row path's one
-decode. WAL savings (530→373 B/row, −30%) do not compensate for tripled CPU work.
+`use_batch = !has_unique && !has_fk_refs_in_set && !has_fk_children`. A compute-pass
+accumulated all matched rows as `(RowId, encoded_bytes, before_row: Vec<Literal>,
+coerced_row: Vec<Literal>)` before calling `update_many`, so post-process CDC/index
+work consumed literals from staging — no re-decode needed.
+
+Docker bench (report_20260717_005749.md, 100k rows, 50k UPDATE, Linux):
+
+| path | unidb rec/s | PG rec/s | ratio | WAL B/row | dec/row |
+|------|------------|---------|-------|----------|--------|
+| per-row baseline | 35,547 | 825,841 | 0.04× | 530 | 1.00 |
+| batch path (this session) | 16,919 | 733,095 | 0.02× | **373** | 1.00 |
+
+`dec/row = 1.00` confirmed — not 3.00 as the earlier Step 3 note misdiagnosed. WAL
+savings: 530→373 B/row (−30%). Despite correct dec/row, batch path **regresses**
+throughput 35,547→16,919 rec/s (−52%).
+
+Root cause: staging all 50k rows simultaneously as `Vec<(RowId, bytes, Vec<Literal>,
+Vec<Literal>)>` allocates ~60 MB before any writes begin, thrashing CPU cache. The
+per-row path processes each row with O(1) working memory and better spatial locality.
+WAL savings (−30%) do not compensate for cache eviction overhead.
+
+Underlying architectural ceiling: the B-tree secondary index must insert a new entry
+for every updated row regardless of which columns change (the B-tree is the only
+forward resolver in unidb's insert-new-version MVCC — skipping maintenance makes live
+rows unfindable). At 50k rows the B-tree insert cost dominates (~500 ms), and neither
+batch WAL framing nor staging tricks can bypass it. Without HOT (in-place update chains
+that short-circuit the B-tree for non-indexed-column changes), the UPDATE ceiling is
+~0.04–0.06× PG. A3 is an architectural ceiling, not an implementation failure.
 
 Decision: revert the `exec_update` gate and compute-pass restructuring. `Heap::update_many`
-stays in `src/heap.rs` for Step 4 (where the three-decode problem dissolves because the
-batch path and the CDC/index work fuse into one pass with logical WAL records).
+stays in `src/heap.rs` for Step 4 (where a proper HOT chain can avoid the B-tree
+per-row cost on unchanged indexed columns).
 
 ### A7 regression guard check (benchmark_20260717_074259.md)
 
@@ -6715,8 +6739,9 @@ batch path and the CDC/index work fuse into one pass with logical WAL records).
 | `cargo build --release` | clean |
 | `cargo clippy -- -D warnings` | clean |
 | `cargo fmt --all` | clean |
-| `cargo test --release` | **408 tests** all pass |
+| `cargo test --release` | **412 tests** all pass (Step 2 PR: +4 `update_many.rs` tests) |
 | `cargo test --test crash` | **42/42** (P56a/P56b new; P57a/P57b kept for `Heap::update_many`) |
 | `tests/update_many.rs` | 5/5 (Heap::update_many correctness + throughput probe) |
 
-Raw report: `docs/performance/benchmark_20260717_074259.md`.
+Raw report (Step 3): `docs/performance/benchmark_20260717_074259.md`.
+Step 2 batch-path bench: `docker/out/report_20260717_005749.md` (branch 56-step2-update-batching-v2).
