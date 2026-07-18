@@ -1896,6 +1896,91 @@ pub(crate) fn batch_resolve_candidates<P: PageReader>(
     Ok(out)
 }
 
+/// Zero-copy RowId-only variant of [`batch_resolve_candidates`].
+///
+/// Walks the same sorted page groups as `batch_resolve_candidates` but
+/// passes a `&[u8]` slice (no allocation) to `matches`.  Only RowIds of
+/// rows where `matches` returns `true` are collected.  For DELETE selected
+/// this eliminates all per-row `Vec<u8>` allocations — rows that do not
+/// match the predicate are never heap-allocated at all.
+///
+/// `candidates` **must** be sorted by `(page_id, slot)` — B5 guarantees this.
+pub(crate) fn batch_resolve_candidates_visit<P, F>(
+    candidates: &[RowId],
+    snapshot: &Snapshot,
+    self_xid: Xid,
+    reader: &P,
+    matches: &F,
+) -> Result<Vec<RowId>>
+where
+    P: PageReader,
+    F: Fn(&[u8]) -> Result<bool>,
+{
+    let mut out = Vec::with_capacity(candidates.len() / 2);
+    let mut i = 0;
+    while i < candidates.len() {
+        let page_id = candidates[i].page_id;
+        let j = i + candidates[i..].partition_point(|r| r.page_id == page_id);
+        let group = &candidates[i..j];
+        i = j;
+
+        // ONE mmap read services every candidate in this page's group.
+        let page = reader.read_page(page_id)?;
+
+        let mut prev_slot: u16 = u16::MAX;
+        for &rid in group {
+            if rid.slot == prev_slot {
+                continue;
+            }
+            prev_slot = rid.slot;
+
+            if !matches!(page.slot_state(rid.slot), Ok(SlotState::Live)) {
+                continue;
+            }
+            let th = page.tuple_header(rid.slot)?;
+            if is_visible(th.xmin, th.xmax, snapshot, self_xid) {
+                on_read(self_xid, rid);
+                // Zero-copy predicate check: &[u8] slice directly from mmap
+                if matches(page.get(rid.slot)?)? {
+                    out.push(rid);
+                }
+            } else if th.hot_next == HOT_NEXT_XPAGE {
+                // Cross-page HOT chain: new version on another page (item 71).
+                let xpage_rid = RowId {
+                    page_id: th.prev_page,
+                    slot: th.prev_slot,
+                };
+                // This rare branch still reads the remote page once.
+                if let Some((visible_rid, bytes)) =
+                    get_visible_with_rid(reader, xpage_rid, snapshot, self_xid)?
+                {
+                    if matches(&bytes)? {
+                        out.push(visible_rid);
+                    }
+                }
+            } else if th.hot_next != HOT_NEXT_NONE {
+                // Same-page HOT chain (item 58): new version is already loaded.
+                let new_slot = th.hot_next;
+                if !matches!(page.slot_state(new_slot), Ok(SlotState::Live)) {
+                    continue;
+                }
+                let new_th = page.tuple_header(new_slot)?;
+                let new_rid = RowId {
+                    page_id: rid.page_id,
+                    slot: new_slot,
+                };
+                if is_visible(new_th.xmin, new_th.xmax, snapshot, self_xid) {
+                    on_read(self_xid, new_rid);
+                    if matches(page.get(new_slot)?)? {
+                        out.push(new_rid);
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Count the tuples on `page_id` visible to `snapshot` via the tuple headers
 /// only — the per-page core of [`Heap::count_visible`], extracted for the
 /// parallel `COUNT(*)` path (Milestone P). No body decode.

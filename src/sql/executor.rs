@@ -3129,10 +3129,10 @@ fn index_lookup_is_selective(
 /// Used when `needs_per_row_checks == false` AND the parallel threshold is
 /// not met (table too small) or no worker lease is available.
 ///
-/// For the A3/B-tree branch: calls `batch_resolve_candidates` which reads
-/// each heap page exactly once (one 8 KiB mmap copy per unique page, vs one
-/// per B-tree candidate in the old per-row path).  Row bytes are used only
-/// for the predicate re-check, then discarded — only RowIds are returned.
+/// For the A3/B-tree branch: calls `batch_resolve_candidates_visit` which
+/// reads each heap page exactly once (one 8 KiB mmap window per unique page)
+/// and calls the predicate closure with a `&[u8]` slice — **zero Vec<u8>
+/// allocations** for non-matching rows.  Only RowIds are returned.
 /// For the full-scan fallback: iterates `heap.scan` but discards bytes
 /// after predicate evaluation (small tables; overhead is negligible).
 fn collect_delete_row_ids_serial(
@@ -3166,12 +3166,14 @@ fn collect_delete_row_ids_serial(
             let Some(mut candidate_ids) = tree.search(op, &value, ctx.pool)? else {
                 return Ok(Vec::new());
             };
-            // B5: sort by (page_id, slot) so batch_resolve_candidates groups
+            // B5: sort by (page_id, slot) so batch_resolve_candidates_visit groups
             // candidates on the same page into a single mmap read.
             candidate_ids.sort_unstable_by_key(|r| (r.page_id, r.slot));
 
-            // Predicate re-check columns (for non-indexed AND terms such as
-            // `k >= N AND body LIKE '%foo%'`).
+            // Predicate re-check closure (covers non-indexed AND terms such as
+            // `k >= N AND body LIKE '%foo%'`).  For a simple `k >= N` that is
+            // fully covered by the B-tree, `predicate.is_none()` after stripping
+            // the indexed term — either way the closure runs only on visible rows.
             let cols = &table_def.columns;
             let mut pred_cols = Vec::new();
             if let Some(pred) = predicate {
@@ -3179,30 +3181,25 @@ fn collect_delete_row_ids_serial(
             }
             let (pred_needed, pred_upto) = needed_mask(&pred_cols, cols.len());
 
-            // batch_resolve_candidates: ONE mmap read per unique page_id.
-            // Returns (live_rid, bytes) pairs — bytes used only to re-check
-            // non-indexed AND terms, then immediately dropped.
-            // For a simple `k >= N` (fully covered by the B-tree) every row
-            // passes the re-check, so this loop is O(n) with no allocator
-            // pressure.
-            let resolved = crate::heap::batch_resolve_candidates(
+            // batch_resolve_candidates_visit: ONE mmap read per unique page_id,
+            // zero Vec<u8> allocs — passes &[u8] slice directly to the predicate.
+            // For rows that do not match, no allocation is made at all.
+            let pred_ref = predicate;
+            let row_ids = crate::heap::batch_resolve_candidates_visit(
                 &candidate_ids,
                 snapshot,
                 ctx.xid,
                 ctx.pool,
-            )?;
-            let mut out = Vec::with_capacity(resolved.len());
-            for (row_id, bytes) in resolved {
-                if predicate.is_some() {
-                    let prow = deform_row(&bytes, cols, pred_upto, &pred_needed)?;
-                    if !predicate_matches(predicate, cols, &prow)? {
-                        continue;
+                &|bytes: &[u8]| -> Result<bool> {
+                    if pred_ref.is_some() {
+                        let prow = deform_row(bytes, cols, pred_upto, &pred_needed)?;
+                        predicate_matches(pred_ref, cols, &prow)
+                    } else {
+                        Ok(true)
                     }
-                }
-                out.push(row_id);
-                // bytes is dropped here — only RowId is kept.
-            }
-            return Ok(out);
+                },
+            )?;
+            return Ok(row_ids);
         }
     }
     collect_delete_row_ids_serial_fullscan(heap, snapshot, ctx, table_def, predicate)
