@@ -76,16 +76,37 @@ fn delete_selected_probe() {
              (wal_post_uph - wal_pre_uph) as f64 / 1e6,
              (wal_post_uph - wal_pre_uph) as f64 / (n/2) as f64);
     
+    // UPDATE non-HOT: SET k = k+1 (indexed col → B-tree maintenance required)
     let wal_pre_upn = se.wal_total_bytes_appended();
     let t0 = Instant::now();
     let x = se.begin().unwrap();
     se.execute_sql(x, &format!("UPDATE t SET k = k + 1 WHERE k >= {n} AND k < {}", n as i64 + half)).unwrap();
+    let t_sql = t0.elapsed();
     se.commit(x).unwrap();
+    let t_total = t0.elapsed();
     let wal_post_upn = se.wal_total_bytes_appended();
-    println!("[probe] UPDATE non-HOT ({}k rows): {:.3}s | WAL delta {:.2} MB ({:.0} B/row)", 
-             n/2/1000, t0.elapsed().as_secs_f64(),
+    println!("[probe] UPDATE non-HOT ({}k rows): {:.3}s (sql={:.3}s commit={:.3}s) | WAL {:.2} MB ({:.0} B/row)",
+             n/2/1000, t_total.as_secs_f64(), t_sql.as_secs_f64(),
+             (t_total - t_sql).as_secs_f64(),
              (wal_post_upn - wal_pre_upn) as f64 / 1e6,
              (wal_post_upn - wal_pre_upn) as f64 / (n/2) as f64);
+
+    // UPDATE heap-only (SET g = g+1, g NOT indexed): isolates heap-write cost without B-tree
+    // Runs on the second batch (k=100001..150000 after the non-HOT update above).
+    let wal_pre_uph2 = se.wal_total_bytes_appended();
+    let t0 = Instant::now();
+    let x = se.begin().unwrap();
+    // Use g (not indexed) on the same row range — measures heap-only update cost
+    se.execute_sql(x, &format!("UPDATE t SET g = g + 1 WHERE k >= {} AND k < {}", n as i64 + 1, n as i64 + half + 1)).unwrap();
+    let t_sql2 = t0.elapsed();
+    se.commit(x).unwrap();
+    let t_total2 = t0.elapsed();
+    let wal_post_uph2 = se.wal_total_bytes_appended();
+    println!("[probe] UPDATE heap-only ({}k rows, no B-tree): {:.3}s (sql={:.3}s commit={:.3}s) | WAL {:.2} MB ({:.0} B/row)",
+             n/2/1000, t_total2.as_secs_f64(), t_sql2.as_secs_f64(),
+             (t_total2 - t_sql2).as_secs_f64(),
+             (wal_post_uph2 - wal_pre_uph2) as f64 / 1e6,
+             (wal_post_uph2 - wal_pre_uph2) as f64 / (n/2) as f64);
     
     let wal_before = se.wal_total_bytes_appended();
     let t0 = Instant::now();

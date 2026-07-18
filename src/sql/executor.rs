@@ -2651,6 +2651,95 @@ fn exec_update(
         });
     }
 
+    // ── Item 83: batch non-HOT UPDATE via update_many() ────────────────────
+    //
+    // When the SET clause touches an indexed column (hot_eligible=false) but
+    // there are no UNIQUE, FK, or CDC constraints, the heap update can be
+    // batched across all matching rows with a single call to update_many().
+    // This replaces O(rows) separate mini-txns (one per `heap.update()` call)
+    // with O(pages) Phase-A mini-txns + O(fill-pages) Phase-B mini-txns,
+    // cutting WAL record count from 4×N to ~2×(N/50) + 2×(N/100) for a
+    // table with ~50 rows/page — a ~48× reduction in mini-txn overhead.
+    //
+    // Correctness gate: update_many() pre-conditions (same as update_many's
+    // doc comment) — no UNIQUE indexes, no FK child-side refs in SET, no FK
+    // parent-side children. CDC (events_enabled) is handled below via
+    // send_event_capture() after update_many() returns, so no gate needed.
+    let can_batch_non_hot =
+        !hot_eligible && !has_unique && !has_fk_refs_in_set && !has_fk_children;
+
+    if can_batch_non_hot && !matching.is_empty() {
+        // Phase 1: decode / eval SET / encode for all matching rows.
+        // (Same per-row logic as the per-row loop below, minus constraint checks.)
+        type NonHotRow = (RowId, Vec<u8>, Vec<Literal>, Vec<Literal>);
+        let mut collected: Vec<NonHotRow> = Vec::with_capacity(matching.len());
+        for (row_id, bytes) in &matching {
+            let mut row = decode_row(bytes, &table_def.columns)?;
+            let before_row = row.clone();
+            for (col, expr) in assignments {
+                let new_val = eval_expr(expr, &table_def.columns, &row)?;
+                set_column(&table_def.columns, &mut row, col, new_val)?;
+            }
+            let coerced = coerce_and_validate_row(&table_def, row)?;
+            enforce_not_null(&table_def, &coerced)?;
+            enforce_checks(&table_def, &coerced)?;
+            let encoded = encode_row(&coerced);
+            collected.push((*row_id, encoded, before_row, coerced));
+        }
+
+        // Phase 2: batch heap Phase-A (xmax) + Phase-B (new versions).
+        let row_pairs: Vec<(RowId, Vec<u8>)> = collected
+            .iter()
+            .map(|(rid, enc, _, _)| (*rid, enc.clone()))
+            .collect();
+        let update_results =
+            match heap.update_many(&row_pairs, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr) {
+                Err(e @ DbError::WriteConflict { .. }) => return Err(classify_conflict(e, ctx)),
+                other => other?,
+            };
+
+        // Phase 3: per-pair SSI, undo, B-tree index staging, CDC.
+        let mut count = 0;
+        for (i, (old_rid, new_rid)) in update_results.iter().enumerate() {
+            let (_, _, ref before_row, ref after_row) = collected[i];
+            ctx.txn_mgr.ssi_note_write(ctx.xid, *old_rid);
+            ctx.txn_mgr.record_undo(
+                ctx.xid,
+                UndoAction::XmaxStamp {
+                    page_id: old_rid.page_id,
+                    slot: old_rid.slot,
+                },
+            )?;
+            ctx.txn_mgr.record_undo(
+                ctx.xid,
+                UndoAction::Insert {
+                    page_id: new_rid.page_id,
+                    slot: new_rid.slot,
+                },
+            )?;
+            stage_row_index_writes_update(
+                &table_def,
+                *old_rid,
+                *new_rid,
+                before_row,
+                after_row,
+                &mut index_batches,
+                &mut patch_batches,
+                ctx,
+            )?;
+            send_event_capture(&table_def, "update", Some(before_row), Some(after_row), ctx)?;
+            count += 1;
+        }
+
+        // Coalesced index maintenance (A1) — same flush path as per-row loop.
+        flush_patch_batches(&patch_batches, ctx)?;
+        flush_index_batches(&index_batches, ctx)?;
+
+        persist_pages_if_changed(table, &heap, &table_def.pages, ctx)?;
+        assert_schema_stable(ctx, table, table_def.generation);
+        return Ok(ExecResult::Updated { count });
+    }
+
     // ── Non-HOT / constrained path: per-row loop (unchanged) ────────────────
     let mut count = 0;
     for (row_id, bytes) in matching {
