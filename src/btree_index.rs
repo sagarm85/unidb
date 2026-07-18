@@ -1190,11 +1190,58 @@ impl DiskBTree {
                 continue;
             };
 
-            // Running body size so the fit check stays O(1) per entry.
-            let mut cur_body: usize = 7 + entries
+            // Compute existing leaf body once; reused by both the item-84 proactive
+            // check below and the absorption loop's capacity guard.
+            let existing_body: usize = 7 + entries
                 .iter()
                 .map(|(k, _)| encoded_key_len(k) + ROWID_LEN)
                 .sum::<usize>();
+
+            // Item 84 — Proactive batch check.
+            //
+            // Count ALL entries in sorted[i..] that belong to [min_key, max_key].
+            // If the combined body (existing leaf + all new entries) would overflow
+            // the page AND there are ≥2 new entries, skip absorption entirely and
+            // call insert_batch_in_txn. This replaces the two-phase
+            // "absorb until full (1 WAL_INDEX) + split 1 overflow entry via
+            // insert_in_txn (3 WAL_INDEX) = 4 WAL_INDEX" pattern with a single
+            // balanced merge-split (3 WAL_INDEX) for the whole batch.
+            //
+            // The original absorbed==0 check only fired when the FIRST new entry
+            // could not fit (leaf already at cap). Since item 84's own balanced
+            // splits create half-full leaves (~272 entries), the typical workload
+            // is: leaf has room → absorbs ~270 entries → fills → 1 overflow entry
+            // triggers absorbed==0 with n=1 → absorbed==0 path ran insert_in_txn.
+            // The proactive check catches the overflow BEFORE absorption begins.
+            {
+                let total_n = sorted[i..]
+                    .iter()
+                    .take_while(|(k, _)| k >= &min_key && k <= &max_key)
+                    .count();
+                if total_n >= 2 {
+                    let new_body: usize = sorted[i..i + total_n]
+                        .iter()
+                        .map(|(k, _)| encoded_key_len(k) + ROWID_LEN)
+                        .sum::<usize>();
+                    if existing_body + new_body > cap {
+                        // Would overflow: batch all total_n entries in one descent.
+                        drop(latch);
+                        let consumed = self.insert_batch_in_txn(
+                            &sorted[i..i + total_n],
+                            pool,
+                            wal,
+                            txn_id,
+                            prev_lsn,
+                        )?;
+                        i += consumed;
+                        continue;
+                    }
+                }
+            }
+
+            // Running body size so the fit check stays O(1) per entry.
+            // Reuse already-computed existing_body to avoid scanning entries twice.
+            let mut cur_body: usize = existing_body;
             let mut absorbed = 0usize;
             let mut j = i;
             while j < sorted.len() {
@@ -1228,18 +1275,36 @@ impl DiskBTree {
             }
 
             if absorbed == 0 {
-                // Head entry couldn't be coalesced here (boundary or an
-                // already-full leaf) — let the crabbing insert place/split it.
+                // Head entry couldn't be coalesced (leaf is full or boundary).
+                // Count entries in range for the single-entry fallback path —
+                // the proactive check above already handled the n≥2 overflow case.
+                let n = sorted[i..]
+                    .iter()
+                    .take_while(|(k, _)| k >= &min_key && k <= &max_key)
+                    .count();
                 drop(latch);
-                self.insert_in_txn(
-                    sorted[i].0.clone(),
-                    sorted[i].1,
-                    pool,
-                    wal,
-                    txn_id,
-                    prev_lsn,
-                )?;
-                i += 1;
+                if n >= 2 {
+                    // Reached here only when proactive check missed (combined body
+                    // estimate was too conservative). Use batch path anyway.
+                    let consumed = self.insert_batch_in_txn(
+                        &sorted[i..i + n],
+                        pool,
+                        wal,
+                        txn_id,
+                        prev_lsn,
+                    )?;
+                    i += consumed;
+                } else {
+                    self.insert_in_txn(
+                        sorted[i].0.clone(),
+                        sorted[i].1,
+                        pool,
+                        wal,
+                        txn_id,
+                        prev_lsn,
+                    )?;
+                    i += 1;
+                }
                 continue;
             }
 
@@ -1275,6 +1340,251 @@ impl DiskBTree {
         self.insert_many_in_txn(entries, pool, wal, txn_id, &mut prev_lsn)?;
         wal.commit_mini_txn(txn_id, prev_lsn)?;
         Ok(())
+    }
+
+    /// Item 84 — merge-split bulk path.
+    ///
+    /// `batch` is a pre-sorted (key-ascending) slice of entries that the caller
+    /// knows belong to a *single* leaf's current key range. This function does one
+    /// full crabbing descent to find that leaf, merges all `batch` entries into the
+    /// leaf (duplicate `(key, rid)` pairs are silently skipped), then:
+    ///
+    /// * if the combined entries fit in one page: writes the leaf in-place (1 WAL
+    ///   `WAL_INDEX` record), returns the number of entries consumed.
+    /// * if they overflow a single page: does a **balanced** 2-way split, writes
+    ///   both halves (2 `WAL_INDEX`), propagates the separator to the parent via
+    ///   the crabbing retained-ancestor stack (1 more `WAL_INDEX` for the parent),
+    ///   and returns the entries consumed.
+    ///
+    /// For entries that land outside the leaf's current range (rare: a concurrent
+    /// split shrank the range between the caller's count and our descent), the
+    /// function returns a smaller count; the caller then re-routes those via
+    /// subsequent [`Self::insert_many_in_txn`] iterations.
+    ///
+    /// **Why this beats the default**: `insert_many_in_txn` normally absorbs new
+    /// entries into a split leaf half until the half is exactly full (543 entries
+    /// for Int keys on 8 KiB pages), then the very next entry triggers a second
+    /// split (3 extra WAL_INDEX records). For a dense-overlap UPDATE (e.g.
+    /// `SET k=k+1`), every interior leaf in the update range triggers this cascade:
+    /// current = 8 WAL_INDEX/leaf, bulk-path = 3 WAL_INDEX/leaf — ~70% reduction
+    /// in B-tree WAL per UPDATE non-HOT statement.
+    fn insert_batch_in_txn(
+        &self,
+        batch: &[(OrderedValue, RowId)],
+        pool: &BufferPool,
+        wal: &Wal,
+        txn_id: u64,
+        prev_lsn: &mut Lsn,
+    ) -> Result<usize> {
+        debug_assert!(!batch.is_empty());
+        let cap = body_capacity(self.page_size);
+
+        // Crabbing descent — same as insert_in_txn but we do NOT apply the
+        // safe-node early-release: we don't know yet whether the leaf will split,
+        // so we hold the meta latch and every ancestor until we decide at the leaf.
+        let meta_guard = pool.latch_exclusive(self.meta_page);
+        let root = self.root_page(pool)?;
+        let mut retained: Vec<DescentFrame> = Vec::new();
+        retained.push(DescentFrame {
+            pid: root,
+            latch: pool.latch_exclusive(root),
+            node: self.read_node(root, pool)?,
+            route_idx: 0,
+        });
+        loop {
+            let top = retained.last().unwrap();
+            let Node::Internal { keys, children } = &top.node else {
+                break; // reached a leaf
+            };
+            let idx = route_insert_child(keys, &batch[0].0);
+            let child = children[idx];
+            retained.last_mut().unwrap().route_idx = idx;
+            retained.push(DescentFrame {
+                pid: child,
+                latch: pool.latch_exclusive(child),
+                node: self.read_node(child, pool)?,
+                route_idx: 0,
+            });
+        }
+
+        // N = number of batch entries that actually belong to this leaf's range.
+        // Re-check under the latch in case a concurrent split shrank the range.
+        // Extract what we need from the leaf frame before any borrow issues arise.
+        let (leaf_pid, old_entries, leaf_next) = {
+            let frame = retained.last().unwrap();
+            match &frame.node {
+                Node::Leaf { entries, next } => (frame.pid, entries.clone(), *next),
+                _ => {
+                    // Unexpected: should always be a leaf after crabbing descent.
+                    drop(retained);
+                    drop(meta_guard);
+                    self.insert_in_txn(
+                        batch[0].0.clone(),
+                        batch[0].1,
+                        pool,
+                        wal,
+                        txn_id,
+                        prev_lsn,
+                    )?;
+                    return Ok(1);
+                }
+            }
+        };
+
+        // Empty leaf is a transient state; fall back to single insert.
+        let (min_key, max_key) = match (
+            old_entries.first().map(|(k, _)| k),
+            old_entries.last().map(|(k, _)| k),
+        ) {
+            (Some(lo), Some(hi)) => (lo.clone(), hi.clone()),
+            _ => {
+                drop(retained);
+                drop(meta_guard);
+                self.insert_in_txn(
+                    batch[0].0.clone(),
+                    batch[0].1,
+                    pool,
+                    wal,
+                    txn_id,
+                    prev_lsn,
+                )?;
+                return Ok(1);
+            }
+        };
+
+        // Count entries from batch that still fall in [min_key, max_key].
+        let n = batch
+            .iter()
+            .take_while(|(k, _)| k >= &min_key && k <= &max_key)
+            .count();
+
+        if n == 0 {
+            // Range changed (concurrent split). Caller will re-route.
+            drop(retained);
+            drop(meta_guard);
+            return Ok(0);
+        }
+        let n_consumed = n;
+
+        // O(N+M) linear merge of two pre-sorted slices.
+        // Both old_entries (leaf) and batch[..n] are sorted by (key, rowid_key(rid)).
+        // The prior O(N²) Vec::insert loop caused ~295k element-shifts per leaf
+        // (543 inserts × 543 elements shifted) → 10-15× timing regression vs
+        // the correct merge; this version is O(N+M) with no shifting.
+        let old = old_entries;
+        let new_entries = &batch[..n];
+        let mut combined: Vec<(OrderedValue, RowId)> = Vec::with_capacity(old.len() + n);
+        let mut oi = 0usize;
+        let mut bi = 0usize;
+        while oi < old.len() && bi < n {
+            let cmp = {
+                let ok = (&old[oi].0, rowid_key(old[oi].1));
+                let bk = (&new_entries[bi].0, rowid_key(new_entries[bi].1));
+                ok.cmp(&bk)
+            };
+            match cmp {
+                std::cmp::Ordering::Less => {
+                    combined.push(old[oi].clone());
+                    oi += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    // Exact (key, rid) duplicate — keep old entry, skip new.
+                    combined.push(old[oi].clone());
+                    oi += 1;
+                    bi += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    combined.push((new_entries[bi].0.clone(), new_entries[bi].1));
+                    bi += 1;
+                }
+            }
+        }
+        combined.extend_from_slice(&old[oi..]);
+        for entry in &new_entries[bi..] {
+            combined.push((entry.0.clone(), entry.1));
+        }
+
+        let combined_body: usize = 7 + combined
+            .iter()
+            .map(|(k, _)| encoded_key_len(k) + ROWID_LEN)
+            .sum::<usize>();
+
+        // Decide: fits in one leaf, needs a 2-way split, or too large to batch.
+        let mut pending: Option<(OrderedValue, PageId)>;
+        if combined_body <= cap {
+            // All fit in one leaf: write in-place, no split.
+            // The leaf latch is still held via `retained.last()`.
+            let leaf = Node::Leaf {
+                entries: combined,
+                next: leaf_next,
+            };
+            *prev_lsn = write_node(pool, wal, txn_id, *prev_lsn, leaf_pid, &leaf, self.page_size)?;
+            // No separator to propagate; drop retained (releases latch).
+            drop(retained);
+            drop(meta_guard);
+            return Ok(n_consumed);
+        } else if combined_body <= 2 * cap {
+            // Balanced 2-way split: both halves fill to ≤ cap.
+            let mid = combined.len() / 2;
+            let right_entries = combined[mid..].to_vec();
+            let left_entries = combined[..mid].to_vec();
+            let sep_key = right_entries[0].0.clone();
+            let right_page = pool.alloc_page()?;
+            let right = Node::Leaf { entries: right_entries, next: leaf_next };
+            let left  = Node::Leaf { entries: left_entries,  next: right_page };
+            *prev_lsn = write_node(pool, wal, txn_id, *prev_lsn, right_page, &right, self.page_size)?;
+            *prev_lsn = write_node(pool, wal, txn_id, *prev_lsn, leaf_pid,   &left,  self.page_size)?;
+            pending = Some((sep_key, right_page));
+        } else {
+            // combined > 2 pages: more than 2 leaves needed (rare: >1086 entries
+            // for one leaf range with Int keys).  Fall back to single-entry path.
+            drop(retained);
+            drop(meta_guard);
+            self.insert_in_txn(batch[0].0.clone(), batch[0].1, pool, wal, txn_id, prev_lsn)?;
+            return Ok(1);
+        }
+
+        // Pop the leaf frame (latch drops when frame is dropped).
+        retained.pop();
+
+        // Propagate split separator up through the retained ancestor stack,
+        // exactly as insert_in_txn does.
+        while let Some(frame) = retained.pop() {
+            let _latch = frame.latch;
+            let Node::Internal { mut keys, mut children } = frame.node else {
+                unreachable!("non-leaf in ancestor retained stack")
+            };
+            let Some((sep_key, new_child)) = pending.take() else {
+                // No split to propagate — release the rest of the stack.
+                break;
+            };
+            keys.insert(frame.route_idx, sep_key);
+            children.insert(frame.route_idx + 1, new_child);
+            let internal = Node::Internal { keys, children };
+            if internal.body_len() <= cap {
+                *prev_lsn = write_node(pool, wal, txn_id, *prev_lsn, frame.pid, &internal, self.page_size)?;
+                pending = None;
+                break; // absorbed; remaining ancestors unchanged
+            }
+            pending = Some(self.split_internal(internal, frame.pid, pool, wal, txn_id, prev_lsn)?);
+        }
+
+        // If the root itself split, create a new root (same as insert_in_txn).
+        // meta_guard is still held here (we hold it for the whole function so that
+        // a root split — which rewrites the meta page — is atomic).
+        if let Some((sep_key, new_child)) = pending {
+            let root_pid = self.root_page(pool)?; // current root before the new root is written
+            let new_root_page = pool.alloc_page()?;
+            let new_root = Node::Internal {
+                keys: vec![sep_key],
+                children: vec![root_pid, new_child],
+            };
+            *prev_lsn = write_node(pool, wal, txn_id, *prev_lsn, new_root_page, &new_root, self.page_size)?;
+            let meta = meta_bytes(self.meta_page, new_root_page, self.page_size);
+            *prev_lsn = write_raw(pool, wal, txn_id, *prev_lsn, self.meta_page, meta)?;
+        }
+        drop(meta_guard);
+        Ok(n_consumed)
     }
 
     /// Batch in-place RowId patch (item 47, Phase A).  Mirrors the coalescing
@@ -1695,6 +2005,11 @@ fn write_raw(
     sp.set_lsn(lsn); // stamps LSN + recomputes CRC
     pool.write_page(&sp)?;
     pool.unpin(page_id);
+    // Item 84: WAL_INDEX already IS a full-page image, so this page's before-image
+    // is covered for this checkpoint interval. Mark it so that any subsequent
+    // log_index_insert (logical WAL) on the same page does not emit a redundant
+    // WAL_FPI. This is safe: recovery redoes from the WAL_INDEX record if needed.
+    pool.mark_fpi_logged(page_id);
     Ok(lsn)
 }
 
