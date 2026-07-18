@@ -704,6 +704,98 @@ where
     Ok(all)
 }
 
+/// Parallel full-scan that returns **only RowIds** — no row-body bytes are
+/// allocated or copied.
+///
+/// Used by the DELETE fast path when there are no FK children and no CDC
+/// events (i.e. `needs_per_row_checks == false`).  Compared to
+/// [`parallel_collect_matching`], this function eliminates:
+/// * One `Vec<u8>` allocation per visible row (including non-matching rows
+///   that `parallel_collect_matching` allocates then drops).
+/// * The `bytes.to_vec()` copy for each matching row.
+/// * The `(RowId, Vec<u8>)` pair in the output (now just `RowId`).
+///
+/// For 100 k rows with 50 % selectivity this saves ≈ 100 000 × Vec alloc and
+/// 50 000 × 50-byte copy (≈ 10–15 ms on Docker/Linux).
+///
+/// All other contracts are identical to [`parallel_collect_matching`]:
+/// workers use work-stealing over the page list, MVCC visibility is
+/// enforced via `scan_page_visit`, and results are NOT sorted (the caller is
+/// responsible for ordering before `delete_many`).
+pub fn parallel_collect_row_ids<F>(
+    pages: &[PageId],
+    reader: &SharedPageReader,
+    snapshot: &Snapshot,
+    self_xid: Xid,
+    degree: usize,
+    matches: &F,
+) -> Result<Vec<RowId>>
+where
+    F: Fn(&[u8]) -> Result<bool> + Sync,
+{
+    type Parts = Arc<Mutex<Vec<Vec<RowId>>>>;
+    let cursor = Arc::new(AtomicUsize::new(0));
+    let err: Arc<Mutex<Option<DbError>>> = Arc::new(Mutex::new(None));
+    let stop = Arc::new(AtomicBool::new(false));
+    let deadline = crate::query_limits::snapshot_deadline();
+    let parts: Parts = Arc::new(Mutex::new(Vec::new()));
+    let pages: Arc<[PageId]> = Arc::from(pages);
+    let reader = reader.clone();
+    let snapshot = snapshot.clone();
+
+    run_in_pool(degree, {
+        let cursor = Arc::clone(&cursor);
+        let err = Arc::clone(&err);
+        let stop = Arc::clone(&stop);
+        let parts = Arc::clone(&parts);
+        let pages = Arc::clone(&pages);
+        move || {
+            let mut local: Vec<RowId> = Vec::new();
+            'outer: while !stop.load(Ordering::Relaxed) {
+                let i = cursor.fetch_add(1, Ordering::Relaxed);
+                if i >= pages.len() {
+                    break;
+                }
+                if i.is_multiple_of(4) {
+                    if let Err(e) = deadline.check() {
+                        *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                        stop.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                // scan_page_visit provides &[u8] slices — no per-row Vec<u8>
+                // allocation.  We push only the RowId for matching rows.
+                let result = scan_page_visit(&reader, pages[i], &snapshot, self_xid, |rid, bytes| {
+                    match matches(bytes) {
+                        Ok(true) => {
+                            local.push(rid);
+                            Ok(())
+                        }
+                        Ok(false) => Ok(()),
+                        Err(e) => Err(e),
+                    }
+                });
+                if let Err(e) = result {
+                    *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+                    stop.store(true, Ordering::Relaxed);
+                    break 'outer;
+                }
+            }
+            parts.lock().unwrap_or_else(|p| p.into_inner()).push(local);
+        }
+    });
+
+    let err_val = err.lock().unwrap_or_else(|p| p.into_inner()).take();
+    if let Some(e) = err_val {
+        return Err(e);
+    }
+    let mut all = Vec::new();
+    for part in std::mem::take(&mut *parts.lock().unwrap_or_else(|p| p.into_inner())) {
+        all.extend(part);
+    }
+    Ok(all)
+}
+
 /// Parallel GROUP BY partial aggregation for COUNT(*) (item 56 Step 1).
 ///
 /// Each worker maintains a local `HashMap<key_bytes, (key_literals, count)>` and

@@ -1804,6 +1804,98 @@ pub(crate) fn get_visible_with_rid<P: PageReader>(
     }
 }
 
+/// Batch-resolve a sorted slice of B-tree candidate RowIds to visible
+/// `(live_rid, bytes)` pairs, reading each unique heap page **exactly once**.
+///
+/// # Performance contract
+///
+/// `candidates` **must** be sorted by `(page_id, slot)` — which B5 in
+/// `index_matching_rows` already guarantees.  With that invariant every
+/// candidate on the same page forms a contiguous group, so a single
+/// `read_page` call services the whole group.
+///
+/// For 200 k B-tree candidates on 1 000 unique heap pages the old per-row
+/// path called `read_page` 200 000 times (200 000 × 8 KiB = **1.6 GiB** of
+/// mmap copies).  This path calls it 1 000 times (8 MiB) — a **200× reduction**
+/// in the dominant cost.  This is the bitmap-heap-scan idea from Postgres:
+/// build a sorted set of candidate page+slot pairs first, then visit each page
+/// once in page order rather than once per candidate.
+///
+/// Cross-page HOT chain heads (`hot_next == HOT_NEXT_XPAGE`, item 71) still
+/// incur one extra `read_page` per head because the new version lives on a
+/// different fill page.  Those are uncommon (only rows HOT-updated across a
+/// checkpoint boundary).
+///
+/// Consecutive duplicates in the sorted input (rare; can arise from a
+/// multi-value index scan returning the same B-tree entry twice) are skipped
+/// inline; the caller need not pre-deduplicate.
+pub(crate) fn batch_resolve_candidates<P: PageReader>(
+    candidates: &[RowId],
+    snapshot: &Snapshot,
+    self_xid: Xid,
+    reader: &P,
+) -> Result<Vec<(RowId, Vec<u8>)>> {
+    let mut out = Vec::with_capacity(candidates.len());
+    let mut i = 0;
+    while i < candidates.len() {
+        let page_id = candidates[i].page_id;
+        // Find the end of the contiguous run for this page_id.
+        let j = i + candidates[i..].partition_point(|r| r.page_id == page_id);
+        let group = &candidates[i..j];
+        i = j;
+
+        // ONE mmap read services every candidate in this page's group.
+        let page = reader.read_page(page_id)?;
+
+        let mut prev_slot: u16 = u16::MAX; // sentinel; u16::MAX is never a valid slot
+        for &rid in group {
+            // Skip consecutive duplicates (rare B-tree index artefact).
+            if rid.slot == prev_slot {
+                continue;
+            }
+            prev_slot = rid.slot;
+
+            if !matches!(page.slot_state(rid.slot), Ok(SlotState::Live)) {
+                continue;
+            }
+            let th = page.tuple_header(rid.slot)?;
+            if is_visible(th.xmin, th.xmax, snapshot, self_xid) {
+                on_read(self_xid, rid);
+                out.push((rid, page.get(rid.slot)?.to_vec()));
+            } else if th.hot_next == HOT_NEXT_XPAGE {
+                // Cross-page HOT chain (item 71): new version lives on the page
+                // encoded in prev_page/prev_slot of this old slot.  We cannot
+                // avoid a separate read_page here, but this branch is rare.
+                let xpage_rid = RowId {
+                    page_id: th.prev_page,
+                    slot: th.prev_slot,
+                };
+                if let Some(pair) = get_visible_with_rid(reader, xpage_rid, snapshot, self_xid)? {
+                    out.push(pair);
+                }
+            } else if th.hot_next != HOT_NEXT_NONE {
+                // Same-page HOT chain (item 58): new version is on THIS page —
+                // already loaded, no extra read needed.
+                let new_slot = th.hot_next;
+                if !matches!(page.slot_state(new_slot), Ok(SlotState::Live)) {
+                    continue;
+                }
+                let new_th = page.tuple_header(new_slot)?;
+                let new_rid = RowId {
+                    page_id: rid.page_id,
+                    slot: new_slot,
+                };
+                if is_visible(new_th.xmin, new_th.xmax, snapshot, self_xid) {
+                    on_read(self_xid, new_rid);
+                    out.push((new_rid, page.get(new_slot)?.to_vec()));
+                }
+            }
+            // invisible & no chain → skip
+        }
+    }
+    Ok(out)
+}
+
 /// Count the tuples on `page_id` visible to `snapshot` via the tuple headers
 /// only — the per-page core of [`Heap::count_visible`], extracted for the
 /// parallel `COUNT(*)` path (Milestone P). No body decode.
