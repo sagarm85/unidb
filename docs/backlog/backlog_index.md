@@ -83,10 +83,11 @@
 | 64 | `64_delete_lazy_xmax.md` | Performance | 🔄 INVESTIGATION COMPLETE — two bottlenecks profiled: (1) CRC-per-mutation in `set_xmax` (807 ns/row, 87.5% at 25k scale); (2) `latch_fetch` blowup 1.2→611 µs/page at 100k (mmap/OS cold-page). Lazy xmax ruled infeasible (MVCC violation). Fix A (remove `write_crc()` from `set_xmax`) ready to implement. Fix B (latch+fetch root cause) needs diagnostic first. |
 | 65 | `65_hnsw_insert_node_cache.md` | Performance | ✅ SHIPPED 2026-07-18 — per-insert `NodeCache` eliminates repeated DiskBTree lookups during HNSW beam search (~3200 → ~200 unique node fetches per insert). See PROGRESS.md "Item 65". |
 | 66 | `66_parallel_delete_scan.md` | Performance | ✅ SHIPPED 2026-07-18 — `parallel_collect_matching` in `parallel_scan.rs`; A3-gate-aware `'collect` block in `exec_delete`; sort before `delete_many`; 48/48 crash PASS; `parallel_delete_matches_serial` PASS. Docker bench pending. See PROGRESS.md "Item 66". |
+| 67 | `67_async_hnsw_index_build.md` | Performance | 📋 PLANNED 2026-07-18 — async HNSW: decouple index build from commit critical path (W4/W0 → ~1.1×). ef_construction reduction ruled out (recall@10=0.937 at ef=100,10k — fails gate). See PROGRESS.md "Item 67 planning". |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `67_…`.**
+**Next new file → `68_…`.**
 
 ## Next up — priority order (2026-07-16, calibrated on `052432` Docker baseline)
 

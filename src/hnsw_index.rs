@@ -950,16 +950,27 @@ impl DiskHnswIndex {
         // Dropped at end of this function — NEVER shared across insert calls.
         //
         // Size gate: at large table sizes the shrink path in
-        // `apply_reciprocal_l0_to_buf` adds ~512 HnswNode entries (each with a
-        // heap-allocated Vec<f32>) to the cache per insert when all neighbor
-        // slots are full.  At 100 k rows this causes ~36 GB of allocator
-        // traffic and makes HNSW inserts 1.82× *slower* than without the
-        // cache.  Below NODECACHE_MAX_NODES neighbor lists are rarely full so
-        // the shrink overhead is negligible and the cache pays off.
-        // `search_layer` already has its own `visited: HashSet<RowId>` that
-        // prevents duplicate node fetches during beam search, so the cache
-        // benefit above the threshold is near-zero anyway.
-        const NODECACHE_MAX_NODES: u32 = 5_000;
+        // `apply_reciprocal_l0_to_buf` adds up to M_max0²=1024 HnswNode
+        // entries (each with a heap-allocated Vec<f32>) to the cache per
+        // insert when all neighbor slots are full — causing allocator thrash
+        // that erases the cache benefit.
+        //
+        // Measured data points:
+        //   •  10 k nodes: NodeCache 2.4× FASTER (lists not yet full → low shrink overhead)
+        //   • 100 k nodes: NodeCache 1.82× SLOWER (all lists full → every reciprocal-edge
+        //     triggers full-neighbor-load into cache, ~36 GB alloc traffic in pre-grow)
+        //
+        // Crossover (estimated via log-linear interpolation): ≈ 50 k nodes.
+        // Gate set conservatively below that to keep NodeCache active over the
+        // 1k-10k range where the t4_bench measures and disable before the
+        // regression kicks in.
+        //
+        // `search_layer` already has `visited: HashSet<RowId>` preventing
+        // duplicate traversals; the cache only adds value for nodes that are
+        // visited during beam search AND also referenced by `apply_reciprocal`
+        // (high at small N where the graph is dense relative to ef, low at
+        // large N where the two neighborhoods diverge).
+        const NODECACHE_MAX_NODES: u32 = 30_000;
         let mut node_cache: NodeCache = NodeCache::new();
         // nc is a convenience alias; only used when use_node_cache is true.
         let use_node_cache =
