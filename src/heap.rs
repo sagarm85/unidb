@@ -982,6 +982,8 @@ impl Heap {
                 .unwrap_or(begin_lsn);
             let mut last_lsn = prev_lsn;
 
+            // Accumulate (slot, insert_redo_blob) pairs for the batch WAL record.
+            let mut page_rows: Vec<(u16, Vec<u8>)> = Vec::new();
             while i < rows.len() {
                 let (old_rid, new_data) = &rows[i];
                 let needed =
@@ -997,12 +999,15 @@ impl Heap {
                 };
                 on_write(xid, new_rid);
                 let redo = encode_insert_redo(xid, prev_ptr, new_data);
-                let ins_lsn = wal.log_insert(txn_id, prev_lsn, fill_pid, slot, &redo)?;
-                prev_lsn = ins_lsn;
-                last_lsn = ins_lsn;
+                page_rows.push((slot, redo));
                 b_pairs.push((*old_rid, new_rid));
                 i += 1;
             }
+
+            // Item 79: one WAL_INSERT_BATCH per fill page instead of one
+            // WAL_INSERT per row — reduces WAL mutex passes from O(rows) to O(pages).
+            let batch_lsn = wal.log_insert_batch(txn_id, prev_lsn, fill_pid, xid, &page_rows)?;
+            last_lsn = batch_lsn;
 
             fill_page.set_lsn(last_lsn);
             pool.write_page(&fill_page)?;
@@ -1041,11 +1046,13 @@ impl Heap {
             }
 
             // One FPI check for the whole page group.
-            let mut prev_lsn = pool
+            let prev_lsn = pool
                 .maybe_log_fpi(page_id, wal, txn_id, begin_lsn)?
                 .unwrap_or(begin_lsn);
-            let mut last_lsn = prev_lsn;
 
+            // Accumulate entries for the batch WAL record.
+            // (old_slot, new_page_id, new_slot, saved_prev_page, saved_prev_slot)
+            let mut page_entries: Vec<(u16, u32, u16, u32, u16)> = Vec::with_capacity(group.len());
             for (old_rid, new_rid) in group {
                 // Read saved_prev before overwriting hot_next (under latch).
                 let th = page.tuple_header(old_rid.slot)?;
@@ -1059,28 +1066,26 @@ impl Heap {
                 // chain is no longer needed; those bytes hold the FORWARD pointer.
                 page.set_hot_xpage(old_rid.slot, new_rid.page_id, new_rid.slot)?;
 
-                let lsn = wal.log_hot_xpage_head(
-                    txn_id,
-                    prev_lsn,
-                    page_id,
-                    xid,
+                page_entries.push((
                     old_rid.slot,
                     new_rid.page_id,
                     new_rid.slot,
                     saved_prev_page,
                     saved_prev_slot,
-                )?;
-                prev_lsn = lsn;
-                last_lsn = lsn;
-
+                ));
                 result.push((*old_rid, *new_rid, saved_prev_page, saved_prev_slot));
             }
 
-            page.set_lsn(last_lsn);
+            // Item 80: one WAL_HOT_XPAGE_BATCH per old page instead of one
+            // WAL_HOT_XPAGE_HEAD per row — reduces WAL mutex passes from O(rows) to O(old_pages).
+            let batch_lsn =
+                wal.log_hot_xpage_batch(txn_id, prev_lsn, page_id, xid, &page_entries)?;
+
+            page.set_lsn(batch_lsn);
             pool.write_page(&page)?;
             let new_free = page.free_space();
             pool.unpin(page_id);
-            wal.commit_mini_txn(txn_id, last_lsn)?;
+            wal.commit_mini_txn(txn_id, batch_lsn)?;
             self.note_free_space(page_id, new_free);
 
             j = k;
