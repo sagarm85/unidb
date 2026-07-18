@@ -1511,6 +1511,16 @@ impl Heap {
         };
         wal.commit_mini_txn(txn_id, commit_lsn)?;
         pool.unpin(pid);
+        // Item 82: mark this freshly-allocated page as having its before-image
+        // already covered by the WAL_INSERT(slot=u16::MAX, alloc_lsn) record
+        // above.  Recovery will re-initialise the blank page from that record
+        // (see recovery.rs WAL_INSERT slot==u16::MAX handler), so an explicit
+        // WAL_FPI on the first Phase-B write to this page is redundant.
+        // This saves one 8 KiB FPI per new fill page in hot_update_many Phase B:
+        // ~385 pages × 8 KiB = ~3 MiB per 50k-row UPDATE HOT.
+        // Safety: if a checkpoint fires and clears fpi_logged BEFORE Phase B
+        // touches this page, maybe_log_fpi will write the FPI anyway — correct.
+        pool.mark_fpi_logged(pid);
         // Register the new page — FSM lock taken only now, after all page I/O
         // (no latch is held), so it forms no cycle with the pool's latches.
         {

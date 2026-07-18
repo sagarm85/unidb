@@ -14,8 +14,8 @@ use crate::{
     control::{self, ControlData},
     error::{DbError, Result},
     format::{
-        u16_from_le, u32_from_le, u64_from_le, Xid, HOT_NEXT_NONE, INVALID_LSN, WAL_ABORT,
-        WAL_BEGIN, WAL_CHECKPOINT, WAL_COMMIT, WAL_DELETE, WAL_FPI, WAL_HOT_UPDATE,
+        u16_from_le, u32_from_le, u64_from_le, Xid, HOT_NEXT_NONE, INVALID_LSN, PAGE_TYPE_HEAP,
+        WAL_ABORT, WAL_BEGIN, WAL_CHECKPOINT, WAL_COMMIT, WAL_DELETE, WAL_FPI, WAL_HOT_UPDATE,
         WAL_HOT_XPAGE_BATCH, WAL_HOT_XPAGE_HEAD, WAL_INDEX, WAL_INDEX_INSERT, WAL_INSERT,
         WAL_INSERT_BATCH, WAL_TXN_ABORT, WAL_TXN_BEGIN, WAL_TXN_COMMIT, WAL_UPDATE, WAL_VACUUM,
         WAL_XMAX_BATCH,
@@ -431,17 +431,36 @@ fn redo_record(r: &WalRecord, pool: &BufferPool, page_size: usize) -> Result<()>
         }
         WAL_INSERT => {
             if r.slot == u16::MAX {
-                // Page-allocation record — no tuple content to redo. Just size
-                // the page into the file. Crucially, do NOT go through
-                // `fetch_or_create`: that pins a frame, and returning here
-                // without unpinning would leak the pin. When recovered data
-                // spans more pages than the recovery buffer pool holds, those
-                // leaked pins exhaust the pool and every later redo fails with
-                // `BufferPoolFull` (silently swallowed as a warn) — the row is
-                // then lost. This surfaced under commit-time fsync's C2
-                // memory-pressure path (a large transaction dirties more pages
-                // than the pool); `ensure_page_allocated` sizes without pinning.
+                // Page-allocation sentinel (alloc_heap_page).  Item 82: we no
+                // longer write a WAL_FPI before the first Phase-B
+                // WAL_INSERT_BATCH for this page (heap.rs marks it fpi_logged
+                // on allocation).  Recovery must therefore initialise the page
+                // to its exact blank state here — so that a torn write of the
+                // subsequent Phase-B fill is caught by the CRC check inside
+                // fetch_or_create and a clean base is re-established.
+                //
+                // Implementation: `write_page` goes straight to mmap and is
+                // pin-free (it updates the frame's dirty flag if the frame
+                // happens to be in the pool, but does NOT pin/unpin).  We
+                // must NOT go through fetch_or_create (which would pin) and
+                // return without unpinning — see the original comment.
                 pool.ensure_page_allocated(r.page_id)?;
+                // Only re-initialise if the page's LSN is below alloc_lsn; if
+                // page.lsn() > r.lsn the page was already filled with rows by
+                // a later, fully-applied redo record — leave it alone.
+                let existing_lsn = {
+                    // read_page does not pin; it re-reads from mmap.
+                    match pool.read_page(r.page_id) {
+                        Ok(p) => p.lsn(),
+                        Err(_) => 0, // page not yet in pool — treat as uninitialised
+                    }
+                };
+                if existing_lsn < r.lsn {
+                    let mut blank =
+                        SlottedPage::new(r.page_id, PAGE_TYPE_HEAP, page_size);
+                    blank.set_lsn(r.lsn);
+                    pool.write_page(&blank)?;
+                }
                 return Ok(());
             }
             let mut page = fetch_or_create(pool, r.page_id, page_size)?;
@@ -1015,9 +1034,31 @@ fn decode_hot_xpage_batch_undo_entries(buf: &[u8]) -> Result<Vec<(u16, u32, u16)
 }
 
 fn fetch_or_create(pool: &BufferPool, page_id: u32, page_size: usize) -> Result<SlottedPage> {
-    use crate::format::PAGE_TYPE_HEAP;
     match pool.fetch_page(page_id) {
-        Ok(p) => Ok(p),
+        Ok(p) => {
+            // Item 82: CRC-based torn-page detection.  If the on-disk image has
+            // an invalid checksum the page was partially written at crash time
+            // (torn write).  Returning a blank page lets every redo handler
+            // re-apply its records from first principles rather than relying on
+            // a corrupted LSN field (which may falsely appear ≥ the record's
+            // LSN, causing redo to be incorrectly skipped).
+            //
+            // Note: `pool.fetch_page` calls `read_page_locked`, which already
+            // returns `from_bytes_unchecked` for all-zero pages (valid CRC by
+            // construction) and `from_bytes` (with CRC check) for non-zero
+            // pages.  A `ChecksumMismatch` propagates here as `Ok(torn_page)`
+            // only when the caller was `fetch_page` directly; the bufferpool's
+            // internal `read_page_from_mmap` re-uses the same path.  For
+            // safety we verify again here for any page that may have been
+            // partially written.
+            if p.verify_crc().is_err() {
+                // Torn page: decrement pin and return blank so redo rebuilds.
+                pool.unpin(page_id);
+                Ok(SlottedPage::new(page_id, PAGE_TYPE_HEAP, page_size))
+            } else {
+                Ok(p)
+            }
+        }
         Err(DbError::PageNotFound { .. }) => {
             // Grow the file to include this page when replaying into a
             // smaller-than-implied data file (e.g. a replica/restore applying WAL
