@@ -31,7 +31,7 @@ use postgres::{Client, NoTls};
 use rusqlite::Connection;
 use tempfile::tempdir;
 use unidb::sql::logical::Literal;
-use unidb::{Engine, SqlResult};
+use unidb::{AutoCheckpointConfig, Engine, SqlResult};
 
 /// Every bench engine gets a generously-sized buffer pool, not the library's
 /// small default (`DEFAULT_POOL_CAPACITY`, 65536 frames / 512 MiB). That
@@ -52,7 +52,23 @@ use unidb::{Engine, SqlResult};
 /// if unset.
 fn bench_engine_open(dir: &std::path::Path) -> Engine {
     let capacity = env_u64("UNIDB_BUFFER_POOL_PAGES", 2_000_000) as usize;
-    Engine::open_with_pool_capacity(dir, 0, capacity).unwrap()
+    let engine = Engine::open_with_pool_capacity(dir, 0, capacity).unwrap();
+    // Use 512 MiB checkpoint threshold so bench-setup WAL (~145 MiB for Table 3)
+    // does not trigger mid-run checkpoints.  Each checkpoint clears fpi_logged,
+    // forcing a Full-Page Image on the *next* write to every dirty page — that
+    // FPI tax lands on the *following* operation (DELETE selected in Table 3),
+    // inflating its WAL by 13× and its fsync time proportionally.  Postgres
+    // defaults to 1 GiB (max_wal_size); using 512 MiB here removes an
+    // asymmetric checkpoint-frequency penalty that is not a real engine
+    // capability difference.
+    engine.set_auto_checkpoint_config(AutoCheckpointConfig {
+        max_wal_size: env_u64(
+            "UNIDB_MAX_WAL_SIZE_BYTES",
+            512 * 1024 * 1024, // 512 MiB bench default (vs 64 MiB engine default)
+        ),
+        ..Default::default()
+    });
+    engine
 }
 
 const DIM: usize = 128;

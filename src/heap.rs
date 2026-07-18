@@ -977,10 +977,9 @@ impl Heap {
             let (fill_pid, _ng, mut fill_page) = self.acquire_page_for_insert(needed, pool, wal)?;
 
             let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
-            let mut prev_lsn = pool
+            let prev_lsn = pool
                 .maybe_log_fpi(fill_pid, wal, txn_id, begin_lsn)?
                 .unwrap_or(begin_lsn);
-            let mut last_lsn = prev_lsn;
 
             // Accumulate (slot, insert_redo_blob) pairs for the batch WAL record.
             let mut page_rows: Vec<(u16, Vec<u8>)> = Vec::new();
@@ -1006,8 +1005,7 @@ impl Heap {
 
             // Item 79: one WAL_INSERT_BATCH per fill page instead of one
             // WAL_INSERT per row — reduces WAL mutex passes from O(rows) to O(pages).
-            let batch_lsn = wal.log_insert_batch(txn_id, prev_lsn, fill_pid, xid, &page_rows)?;
-            last_lsn = batch_lsn;
+            let last_lsn = wal.log_insert_batch(txn_id, prev_lsn, fill_pid, xid, &page_rows)?;
 
             fill_page.set_lsn(last_lsn);
             pool.write_page(&fill_page)?;

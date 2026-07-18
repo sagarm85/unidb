@@ -965,10 +965,13 @@ fn decode_insert_batch_undo(buf: &[u8]) -> Result<Vec<u16>> {
         .collect())
 }
 
+/// `(old_slot, new_page_id, new_slot)` tuples decoded from a WAL_HOT_XPAGE_BATCH record.
+type HotXpageBatchEntries = Vec<(u16, u32, u16)>;
+
 /// Decode a WAL_HOT_XPAGE_BATCH redo payload.
 ///
 /// Redo format: `xid (8 B LE) || n_entries (2 B LE) || for each: old_slot (2 B LE) + new_page_id (4 B LE) + new_slot (2 B LE)`
-fn decode_hot_xpage_batch_redo(buf: &[u8]) -> Result<(Xid, Vec<(u16, u32, u16)>)> {
+fn decode_hot_xpage_batch_redo(buf: &[u8]) -> Result<(Xid, HotXpageBatchEntries)> {
     if buf.len() < 10 {
         return Err(DbError::WalCorrupt { lsn: 0 });
     }
