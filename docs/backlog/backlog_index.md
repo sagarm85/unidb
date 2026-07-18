@@ -88,10 +88,12 @@
 | 69 | `69_fill_factor.md` | Performance | ⏳ NOT STARTED — `CREATE TABLE … WITH (fill_factor=70)` reserves page slack for same-page HOT (item 58); INSERT stops at configured threshold; UPDATE-heavy tables avoid cross-page chains. |
 | 70 | `70_seq_scan_prefetch.md` | Performance | ⏳ NOT STARTED — `madvise(MADV_WILLNEED)` read-ahead hint during seqscan (N pages ahead of cursor); cold-cache seqscan latency improvement; no-op on unsupported platforms. |
 | 71 | `71_cross_page_hot.md` | Performance | ✅ SHIPPED 2026-07-18 — cross-page HOT chains; `HOT_NEXT_XPAGE=0xFFFE`; `WAL_HOT_XPAGE_HEAD` type 17; FORMAT_VERSION 8→9; B-tree not updated on full-page UPDATE; P_xhot_a + P_xhot_b crash tests; 50/50 crash + 431 unit PASS. See PROGRESS.md "Item 71". |
+| 72 | `72_hnsw_query_latency.md` | Performance | ⏳ NOT STARTED — in-memory L0 neighbour-list cache to collapse HNSW query latency from 25 ms → ≤5 ms at 10k vectors (ffsdb gap: 223×); lazy per-query warm-up; generation-based invalidation on insert; 256 MiB gate. |
+| 73 | `73_hnsw_vector_hot_cache.md` | Performance | ⏳ NOT STARTED (placeholder) — process-lifetime vector hot cache (node_id → Vec<f32>) eliminating ~100 KB random reads per NEAR query; follow-up to item 72. |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `72_…`.**
+**Next new file → `74_…`.**
 
 ## Next up — priority order (2026-07-16, calibrated on `052432` Docker baseline)
 
