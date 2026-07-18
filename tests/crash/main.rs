@@ -3617,3 +3617,132 @@ fn p_xhot_b_cross_page_hot_incomplete_user_txn_reverts() {
         other => panic!("P_xhot_b: expected Rows, got {other:?}"),
     }
 }
+
+// P74: item 74 batch HOT UPDATE crash safety.
+//
+// hot_update_many splits work into Phase B (new version inserts, committed
+// first) and Phase A (old slot xmax + HOT chain, committed second). A crash
+// between Phase B and Phase A leaves new versions durably written with
+// xmin = uncommitted xid. MVCC must make those new versions invisible; the
+// original rows must survive as live.
+//
+// This test exercises two crash scenarios:
+//   (a) Crash AFTER a fully committed batch HOT UPDATE — recovery replays
+//       both phases; rows must show the updated value.
+//   (b) Crash AFTER the batch Phase B mini-txns commit but BEFORE Phase A
+//       completes (simulated by an incomplete user transaction: the WAL
+//       has WAL_INSERT for new versions but no WAL_HOT_XPAGE_HEAD and no
+//       WAL_TXN_COMMIT) — old rows must be live and original values visible.
+#[test]
+fn p74_batch_hot_update_crash_between_phase_b_and_a() {
+    use unidb::sql::logical::Literal;
+    let dir = tempdir().unwrap();
+
+    // ── (a) Committed batch HOT UPDATE survives crash ─────────────────────
+    {
+        let engine = open(dir.path());
+        engine.set_deferred_sync(false);
+
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE t (id INT, body TEXT)")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        // Fill several pages worth of rows.
+        let x = engine.begin().unwrap();
+        for i in 0i64..100 {
+            engine
+                .execute_sql(
+                    x,
+                    &format!("INSERT INTO t (id, body) VALUES ({i}, 'original')"),
+                )
+                .unwrap();
+        }
+        engine.commit(x).unwrap();
+
+        // Committed batch HOT UPDATE (no unique/idx col in SET → hot_eligible).
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "UPDATE t SET body = 'updated'")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        drop(engine); // "crash": no checkpoint; WAL is the source of truth
+    }
+
+    {
+        let engine = open(dir.path());
+        let x = engine.begin().unwrap();
+        let res = engine
+            .execute_sql(x, "SELECT id, body FROM t WHERE id = 42")
+            .unwrap();
+        engine.commit(x).unwrap();
+        drop(engine);
+
+        match &res[0] {
+            unidb::SqlResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1, "P74(a): row id=42 must exist after recovery");
+                assert_eq!(
+                    rows[0][1],
+                    Literal::Text("updated".to_owned()),
+                    "P74(a): committed batch HOT UPDATE must be durable after crash"
+                );
+            }
+            other => panic!("P74(a): expected Rows, got {other:?}"),
+        }
+    }
+
+    // ── (b) Incomplete user txn leaves original rows visible ─────────────
+    // Simulate the "crash after Phase B" scenario: the user txn is never
+    // committed (drop = crash). Its new versions (xmin = uncommitted xid)
+    // must be invisible; the original rows must survive.
+    let dir2 = tempdir().unwrap();
+    {
+        let engine = open(dir2.path());
+        engine.set_deferred_sync(false);
+
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE t (id INT, body TEXT)")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        let x = engine.begin().unwrap();
+        for i in 0i64..60 {
+            engine
+                .execute_sql(x, &format!("INSERT INTO t (id, body) VALUES ({i}, 'base')"))
+                .unwrap();
+        }
+        engine.commit(x).unwrap();
+
+        // Begin batch HOT UPDATE — do NOT commit. Drop = crash.
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "UPDATE t SET body = 'phantom'")
+            .unwrap();
+        drop(engine); // WAL_TXN_COMMIT never written
+    }
+
+    {
+        let engine = open(dir2.path());
+        let x = engine.begin().unwrap();
+        let res = engine
+            .execute_sql(x, "SELECT body FROM t WHERE id = 30")
+            .unwrap();
+        engine.commit(x).unwrap();
+        drop(engine);
+
+        match &res[0] {
+            unidb::SqlResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1, "P74(b): row id=30 must survive crash");
+                assert_eq!(
+                    rows[0][0],
+                    Literal::Text("base".to_owned()),
+                    "P74(b): incomplete batch HOT UPDATE must leave original values visible"
+                );
+            }
+            other => panic!("P74(b): expected Rows, got {other:?}"),
+        }
+    }
+}

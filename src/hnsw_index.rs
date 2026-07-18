@@ -1454,8 +1454,18 @@ impl DiskHnswIndex {
         }
 
         // Beam search at layer 0 — this is the hot path; pass L0 cache.
-        let result =
-            self.search_layer(ep, ep_dist, query, ef.max(1), 0, &hdr, pool, None, None, l0_cache)?;
+        let result = self.search_layer(
+            ep,
+            ep_dist,
+            query,
+            ef.max(1),
+            0,
+            &hdr,
+            pool,
+            None,
+            None,
+            l0_cache,
+        )?;
         Ok((hdr.metric, result.into_iter().map(|(_, r)| r).collect()))
     }
 

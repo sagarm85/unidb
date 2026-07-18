@@ -2916,7 +2916,7 @@ fn bench_mm_report() {
              | operation | current ratio | ceiling | root cause | revisit when |\n\
              |---|---|---|---|---|\n\
              | SELECT filtered | 0.39× at 5% selectivity (item 59, 2026-07-17) | ~0.40× | **B-tree index path dominates at 5% selectivity** (A3 gate correctly routes after ANALYZE). Item 59 (column pre-binding + COLS_DECODED gate + late materialisation) ships the full-scan path improvements; the B-tree candidate-resolution path now also gets column pre-binding (Fix 2). Remaining gap: PG parallel index scan + lower-overhead candidate resolution. cols/row stable at 4.00 (B-tree path: pred_cols=k + full_cols={{id,k,body}}). SIMD NO-GO (scatter layout, nightly-only API). | Parallel B-tree candidate resolution or HOT (less double-decode on update). |\n\
-             | UPDATE HOT-eligible | 0.07× (item 66 baseline) | ~0.40–0.55× (item 71 cross-page HOT) | Before item 71: full-page fallback did insert-new-version + B-tree patch even when no indexed col in SET. Item 71 (cross-page HOT, 2026-07-18): old slot gets HOT_NEXT_XPAGE sentinel + forwarding pointer; B-tree NOT updated. Fsync bottleneck (Fable analysis) limits further gain without batch mini-txn. | Batch mini-txn (N rows per fsync) for next tier. |\n\
+             | UPDATE HOT-eligible | 0.05× (item 71 Docker bench, 100k rows) → Docker bench pending item 74 | ~0.20–0.40× (Fable 5 honest ceiling, 2026-07-18) | Pre-item-74: per-row mini-txn overhead (150k mutex/Vec/CRC32 passes for 50k rows). Item 74 (batch HOT UPDATE, 2026-07-18): `hot_update_many` Phase B+A reduces to ~2k mini-txn passes; 10k local bench shows 80k rec/s (deferred_sync=true, Mac M5). Docker bench at 100k rows needed for Table 3 ratio. | Docker bench. |\n\
              | UPDATE non-HOT | new row — baseline TBD | ~0.07× structural | SET k (indexed): B-tree patch always required; no HOT path. Ceiling governed by fsync + B-tree write cost. | batch mini-txn. |\n\
              | INSERT per-row | ~0.54× | ~0.55–0.60× | Per-row fsync floor + PG scale advantages. Step 4 (logical B-tree WAL, 8837→655 B/row) delivered the addressable gain (2026-07-17). | Batch-commit or group-commit mode. |\n\
              | DELETE selected | ~0.07× | ~0.07× | After Step 3 (WAL_XMAX_BATCH), bottleneck is `delete_many` page-write phase, not the scan. Parallel scan tried (item 57, 2026-07-17) — zero improvement at 50% selectivity. Only further WAL compression or HOT changes this. | New WAL record type reducing page-write overhead. |\n"
@@ -3670,11 +3670,7 @@ fn bench_hnsw_l0_cache() {
     println!("### 128-dim cosine, HNSW ef_search=200, k=10, corpus = dim=128 deterministic vecs\n");
     println!(
         "| {:>12} | {:>16} | {:>16} | {:>12} | {:>10} |",
-        "corpus rows",
-        "cold (1st query)",
-        "warm (avg last 30)",
-        "speedup",
-        "recall@10"
+        "corpus rows", "cold (1st query)", "warm (avg last 30)", "speedup", "recall@10"
     );
     println!(
         "|{:-<14}|{:-<18}|{:-<18}|{:-<14}|{:-<12}|",

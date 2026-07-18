@@ -909,6 +909,181 @@ impl Heap {
         Ok(result)
     }
 
+    /// Batched HOT UPDATE (item 74): two-phase, one mini-txn per page group.
+    ///
+    /// **Why two phases?**  Each `try_hot_insert` call today opens its own
+    /// `begin_mini_txn` → WAL record(s) → `commit_mini_txn` bracket: 3 mutex
+    /// lock/unlock cycles, 3 `Vec` allocations, and 3 CRC32 passes per row.
+    /// For 50k matched rows that is 150k such cycles. Batching reduces this to
+    /// ~O(pages_touched) — typically 50×–75× fewer mutex acquisitions.
+    ///
+    /// **Phase B first** (new versions, fill pages): pack as many new row
+    /// versions per fill page as fit, one mini-txn per fill page with one
+    /// `WAL_INSERT` per new row. Records `(old_rid, new_rid)` pairs in input
+    /// order. Fill-page latch is acquired and released before touching old pages.
+    ///
+    /// **Phase A second** (old versions, HOT chain): group by `old_rid.page_id`,
+    /// one mini-txn per group. Writes `xmax = xid` and `hot_next =
+    /// HOT_NEXT_XPAGE (0xFFFE)` on each old slot, logging one
+    /// `WAL_HOT_XPAGE_HEAD` per slot within the mini-txn. Reads
+    /// `saved_prev_page/slot` from the tuple header under the exclusive latch.
+    ///
+    /// **Correctness invariants** (D1/D2/D5):
+    /// - Phase B before Phase A preserves "new-before-old" latch ordering.
+    /// - Crash between Phase B commit and Phase A: new versions have
+    ///   `xmin = uncommitted xid` → invisible via MVCC; old versions live. ✓
+    /// - WAL_HOT_XPAGE_HEAD undo restores `xmax = 0` and `hot_next = saved_prev`
+    ///   on each old slot (existing undo path).
+    ///
+    /// `rows` MUST be sorted by `old_rid.page_id` (guaranteed by `matching_rows`).
+    /// **Gate**: caller must ensure `hot_eligible` — CORRECTNESS gate, not
+    /// a tuning knob (no unique/PK, no FK col in SET, no indexed col in SET).
+    ///
+    /// Returns `(old_rid, new_rid, saved_prev_page, saved_prev_slot)` in the
+    /// same order as input rows; caller uses these for `record_undo`.
+    pub fn hot_update_many(
+        &self,
+        rows: &[(RowId, Vec<u8>)],
+        xid: Xid,
+        pool: &BufferPool,
+        wal: &Wal,
+        lock_mgr: &LockManager,
+    ) -> Result<Vec<(RowId, RowId, PageId, u16)>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Acquire all write locks in one mutex pass before touching any page.
+        let record_ids: Vec<RecordId> = rows
+            .iter()
+            .map(|(r, _)| RecordId::row(r.page_id, r.slot))
+            .collect();
+        lock_mgr.try_acquire_write_many(&record_ids, xid)?;
+
+        // ── Phase B: insert new versions on fill pages ──────────────────────
+        // One mini-txn per fill page; pack as many rows as fit. Mirrors
+        // `update_many` Phase B exactly (new-before-old latch order).
+        let mut b_pairs: Vec<(RowId, RowId)> = Vec::with_capacity(rows.len());
+        let mut i = 0;
+        while i < rows.len() {
+            let (_, first_data) = &rows[i];
+            let needed = crate::page::SLOT_SIZE + crate::page::TUPLE_HEADER_SIZE + first_data.len();
+            let (fill_pid, _ng, mut fill_page) = self.acquire_page_for_insert(needed, pool, wal)?;
+
+            let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
+            let mut prev_lsn = pool
+                .maybe_log_fpi(fill_pid, wal, txn_id, begin_lsn)?
+                .unwrap_or(begin_lsn);
+            let mut last_lsn = prev_lsn;
+
+            while i < rows.len() {
+                let (old_rid, new_data) = &rows[i];
+                let needed =
+                    crate::page::SLOT_SIZE + crate::page::TUPLE_HEADER_SIZE + new_data.len();
+                if fill_page.free_space() < needed {
+                    break;
+                }
+                let prev_ptr = Some((old_rid.page_id, old_rid.slot));
+                let slot = fill_page.insert_versioned(new_data, xid, 0, prev_ptr)?;
+                let new_rid = RowId {
+                    page_id: fill_pid,
+                    slot,
+                };
+                on_write(xid, new_rid);
+                let redo = encode_insert_redo(xid, prev_ptr, new_data);
+                let ins_lsn = wal.log_insert(txn_id, prev_lsn, fill_pid, slot, &redo)?;
+                prev_lsn = ins_lsn;
+                last_lsn = ins_lsn;
+                b_pairs.push((*old_rid, new_rid));
+                i += 1;
+            }
+
+            fill_page.set_lsn(last_lsn);
+            pool.write_page(&fill_page)?;
+            let free = fill_page.free_space();
+            pool.unpin(fill_pid);
+            // _ng dropped here — fill-page latch released before old-page latch
+            self.note_free_space(fill_pid, free);
+            wal.commit_mini_txn(txn_id, last_lsn)?;
+        }
+
+        // ── Phase A: xmax + HOT_NEXT_XPAGE on old pages ────────────────────
+        // Group by old_rid.page_id (input already page-sorted). For each
+        // group: one mini-txn, one FPI check, N×WAL_HOT_XPAGE_HEAD records.
+        let mut result: Vec<(RowId, RowId, PageId, u16)> = Vec::with_capacity(rows.len());
+        let mut j = 0;
+        while j < b_pairs.len() {
+            let (old_rid0, _) = b_pairs[j];
+            let page_id = old_rid0.page_id;
+            // Find the contiguous run of rows on this old page.
+            let k = j + b_pairs[j..].partition_point(|(r, _)| r.page_id == page_id);
+            let group = &b_pairs[j..k];
+
+            let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
+            let _wg = pool.latch_exclusive(page_id);
+            let mut page = pool.fetch_page_for_write(page_id, wal)?;
+
+            // Conflict-check all old slots before touching anything.
+            for (old_rid, _) in group {
+                let th = page.tuple_header(old_rid.slot)?;
+                if th.xmax != 0 {
+                    pool.unpin(page_id);
+                    wal.abort_mini_txn(txn_id, begin_lsn)?;
+                    return Err(DbError::WriteConflict {
+                        holder_xid: th.xmax,
+                    });
+                }
+            }
+
+            // One FPI check for the whole page group.
+            let mut prev_lsn = pool
+                .maybe_log_fpi(page_id, wal, txn_id, begin_lsn)?
+                .unwrap_or(begin_lsn);
+            let mut last_lsn = prev_lsn;
+
+            for (old_rid, new_rid) in group {
+                // Read saved_prev before overwriting hot_next (under latch).
+                let th = page.tuple_header(old_rid.slot)?;
+                let (saved_prev_page, saved_prev_slot) = (th.prev_page, th.prev_slot);
+
+                on_write(xid, *old_rid);
+                page.set_xmax(old_rid.slot, xid)?;
+                // set_hot_xpage stores (new_page_id, new_slot) in prev_page/prev_slot
+                // AND sets hot_next = HOT_NEXT_XPAGE (0xFFFE). The prev_page/prev_slot
+                // reuse is intentional (item 71): on a superseded slot the backward
+                // chain is no longer needed; those bytes hold the FORWARD pointer.
+                page.set_hot_xpage(old_rid.slot, new_rid.page_id, new_rid.slot)?;
+
+                let lsn = wal.log_hot_xpage_head(
+                    txn_id,
+                    prev_lsn,
+                    page_id,
+                    xid,
+                    old_rid.slot,
+                    new_rid.page_id,
+                    new_rid.slot,
+                    saved_prev_page,
+                    saved_prev_slot,
+                )?;
+                prev_lsn = lsn;
+                last_lsn = lsn;
+
+                result.push((*old_rid, *new_rid, saved_prev_page, saved_prev_slot));
+            }
+
+            page.set_lsn(last_lsn);
+            pool.write_page(&page)?;
+            let new_free = page.free_space();
+            pool.unpin(page_id);
+            wal.commit_mini_txn(txn_id, last_lsn)?;
+            self.note_free_space(page_id, new_free);
+
+            j = k;
+        }
+
+        Ok(result)
+    }
+
     /// Reverse a previously-applied xmax stamp (DELETE, or UPDATE's
     /// old-version half): revert back to 0 (live). Used by transaction
     /// abort/rollback (txn.rs) and by recovery's incomplete-user-txn undo

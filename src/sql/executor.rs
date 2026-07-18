@@ -715,9 +715,8 @@ pub struct ExecCtx<'a> {
     /// Per-index L0 neighbour-list cache for NEAR queries (item 72).
     /// `Some` on a fully-opened Engine; `None` in unit tests that build bare
     /// `ExecCtx` structs (those tests don't exercise NEAR queries).
-    pub hnsw_l0_caches: Option<
-        &'a Mutex<std::collections::HashMap<crate::format::PageId, HnswL0Cache>>,
-    >,
+    pub hnsw_l0_caches:
+        Option<&'a Mutex<std::collections::HashMap<crate::format::PageId, HnswL0Cache>>>,
 }
 
 /// Insert `row`'s durable-index column values into their on-disk structures
@@ -2289,9 +2288,7 @@ fn exec_select_near(
         // Step 3: merge back into global cache
         {
             let mut guard = caches_mu.lock().unwrap();
-            let entry = guard
-                .entry(meta_page)
-                .or_insert_with(HnswL0Cache::new);
+            let entry = guard.entry(meta_page).or_insert_with(HnswL0Cache::new);
             entry.merge_from(local);
         }
 
@@ -2513,6 +2510,81 @@ fn exec_update(
         && !has_fk_children
         && !set_touches_indexed_col(assignments, &table_def.columns);
 
+    // Item 74: two-phase batch HOT UPDATE.
+    //
+    // When `hot_eligible` the per-row mini-txn overhead dominates: each
+    // `try_hot_insert` opens its own begin_mini_txn → WAL record(s) →
+    // commit_mini_txn bracket — 3 mutex lock/unlock + 3 Vec alloc + 3 CRC32
+    // per row. At 50k rows = 150k such cycles. This batch path reduces to
+    // ~O(pages_touched), typically 50–75× fewer mutex acquisitions.
+    //
+    // Phase 1 (per-row): decode / eval SET / encode / basic constraint checks.
+    //   Same CPU cost as before — unavoidable.
+    // Phase 2: heap.hot_update_many — batched writes, one mini-txn per page group.
+    // Phase 3: per-pair undo recording, SSI note, CDC event.
+    //
+    // Non-HOT rows (has_unique, fk, indexed col in SET) fall through to the
+    // existing per-row loop below, which is correctness-critical for those cases.
+    if hot_eligible && !matching.is_empty() {
+        // Phase 1: collect SQL logic for all matched rows.
+        // (before_row, after_row columns are Vec<Literal>; type alias avoids clippy::type_complexity)
+        type HotRow = (RowId, Vec<u8>, Vec<Literal>, Vec<Literal>);
+        #[allow(clippy::type_complexity)]
+        let mut collected: Vec<HotRow> = Vec::with_capacity(matching.len());
+        for (row_id, bytes) in &matching {
+            let mut row = decode_row(bytes, &table_def.columns)?;
+            let before_row = row.clone();
+            for (col, expr) in assignments {
+                let new_val = eval_expr(expr, &table_def.columns, &row)?;
+                set_column(&table_def.columns, &mut row, col, new_val)?;
+            }
+            let coerced = coerce_and_validate_row(&table_def, row)?;
+            enforce_not_null(&table_def, &coerced)?;
+            enforce_checks(&table_def, &coerced)?;
+            // No UNIQUE / FK enforcement: hot_eligible already gates those out.
+            let encoded = encode_row(&coerced);
+            collected.push((*row_id, encoded, before_row, coerced));
+        }
+
+        // Phase 2: batched heap writes.
+        let row_pairs: Vec<(RowId, Vec<u8>)> = collected
+            .iter()
+            .map(|(rid, enc, _, _)| (*rid, enc.clone()))
+            .collect();
+        let heap_results =
+            match heap.hot_update_many(&row_pairs, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr) {
+                Err(e @ DbError::WriteConflict { .. }) => return Err(classify_conflict(e, ctx)),
+                other => other?,
+            };
+
+        // Phase 3: per-pair SSI notes, undo actions, CDC events.
+        for (i, (old_rid, new_rid, saved_prev_page, saved_prev_slot)) in
+            heap_results.iter().enumerate()
+        {
+            let (_, _, ref before_row, ref after_row) = collected[i];
+            ctx.txn_mgr.ssi_note_write(ctx.xid, *old_rid);
+            ctx.txn_mgr.record_undo(
+                ctx.xid,
+                crate::txn::UndoAction::HotXpageUpdate {
+                    old_page_id: old_rid.page_id,
+                    old_slot: old_rid.slot,
+                    new_page_id: new_rid.page_id,
+                    new_slot: new_rid.slot,
+                    saved_prev_page: *saved_prev_page,
+                    saved_prev_slot: *saved_prev_slot,
+                },
+            )?;
+            send_event_capture(&table_def, "update", Some(before_row), Some(after_row), ctx)?;
+        }
+
+        persist_pages_if_changed(table, &heap, &table_def.pages, ctx)?;
+        assert_schema_stable(ctx, table, table_def.generation);
+        return Ok(ExecResult::Updated {
+            count: heap_results.len(),
+        });
+    }
+
+    // ── Non-HOT / constrained path: per-row loop (unchanged) ────────────────
     let mut count = 0;
     for (row_id, bytes) in matching {
         let mut row = decode_row(&bytes, &table_def.columns)?;
@@ -3808,15 +3880,15 @@ fn eval_arith(op: ArithOp, l: Literal, r: Literal) -> Result<Literal> {
     match (l, r) {
         (Literal::Int(a), Literal::Int(b)) => {
             let v = match op {
-                ArithOp::Add => a.checked_add(b).ok_or_else(|| {
-                    DbError::SqlPlan(format!("integer overflow: {a} + {b}"))
-                })?,
-                ArithOp::Sub => a.checked_sub(b).ok_or_else(|| {
-                    DbError::SqlPlan(format!("integer overflow: {a} - {b}"))
-                })?,
-                ArithOp::Mul => a.checked_mul(b).ok_or_else(|| {
-                    DbError::SqlPlan(format!("integer overflow: {a} * {b}"))
-                })?,
+                ArithOp::Add => a
+                    .checked_add(b)
+                    .ok_or_else(|| DbError::SqlPlan(format!("integer overflow: {a} + {b}")))?,
+                ArithOp::Sub => a
+                    .checked_sub(b)
+                    .ok_or_else(|| DbError::SqlPlan(format!("integer overflow: {a} - {b}")))?,
+                ArithOp::Mul => a
+                    .checked_mul(b)
+                    .ok_or_else(|| DbError::SqlPlan(format!("integer overflow: {a} * {b}")))?,
                 ArithOp::Div => {
                     if b == 0 {
                         return Err(DbError::SqlPlan("division by zero".into()));
@@ -5835,7 +5907,8 @@ mod tests {
         let mut h = Harness::new(dir.path());
         let xid = h.begin();
         h.exec_as(xid, "CREATE TABLE t (id INT, k INT)").unwrap();
-        h.exec_as(xid, "CREATE INDEX t_k ON t USING BTREE (k)").unwrap();
+        h.exec_as(xid, "CREATE INDEX t_k ON t USING BTREE (k)")
+            .unwrap();
         h.commit(xid);
 
         // Insert 100 rows: k=0..99
@@ -5906,14 +5979,20 @@ mod tests {
         // Insert 5 rows: id=0..4, k=10..14
         let xid = h.begin();
         for i in 0i64..5 {
-            h.exec_as(xid, &format!("INSERT INTO t (id, k) VALUES ({i}, {})", 10 + i))
-                .unwrap();
+            h.exec_as(
+                xid,
+                &format!("INSERT INTO t (id, k) VALUES ({i}, {})", 10 + i),
+            )
+            .unwrap();
         }
         h.commit(xid);
 
         // UPDATE SET k = k + 1 WHERE k = 12 (one row)
         let xid = h.begin();
-        let n = match h.exec_as(xid, "UPDATE t SET k = k + 1 WHERE k = 12").unwrap() {
+        let n = match h
+            .exec_as(xid, "UPDATE t SET k = k + 1 WHERE k = 12")
+            .unwrap()
+        {
             ExecResult::Updated { count } => count,
             o => panic!("expected Updated, got {o:?}"),
         };
@@ -5932,7 +6011,10 @@ mod tests {
         };
         h.commit(xid);
         assert_eq!(r12, 0, "k=12 must be gone (updated to 13)");
-        assert_eq!(r13, 2, "k=13: original row (id=3,k=13) + updated row (id=2,k=12→13)");
+        assert_eq!(
+            r13, 2,
+            "k=13: original row (id=3,k=13) + updated row (id=2,k=12→13)"
+        );
     }
 
     /// HOT path fires; B-tree must be patched for each new row version.
@@ -5950,8 +6032,11 @@ mod tests {
         // Pre-build 5k rows (k=[0,4999]) — matches bench's base table
         let mut xid = h.begin();
         for i in 0i64..5000 {
-            h.exec_as(xid, &format!("INSERT INTO t (id,k,body) VALUES ({i},{i},'b{i}')"))
-                .unwrap();
+            h.exec_as(
+                xid,
+                &format!("INSERT INTO t (id,k,body) VALUES ({i},{i},'b{i}')"),
+            )
+            .unwrap();
             if (i + 1) % 500 == 0 {
                 h.commit(xid);
                 xid = h.begin();
@@ -5962,8 +6047,11 @@ mod tests {
         // INSERT-bench 5k rows (k=[5000,9999])
         let mut xid = h.begin();
         for i in 5000i64..10000 {
-            h.exec_as(xid, &format!("INSERT INTO t (id,k,body) VALUES ({i},{i},'b{i}')"))
-                .unwrap();
+            h.exec_as(
+                xid,
+                &format!("INSERT INTO t (id,k,body) VALUES ({i},{i},'b{i}')"),
+            )
+            .unwrap();
             if (i + 1) % 500 == 0 {
                 h.commit(xid);
                 xid = h.begin();
@@ -5989,10 +6077,7 @@ mod tests {
         // k=5000: was updated to k=5001. No row contributes a new k=5000 (k=4999
         // is below the range). Must be 0 rows.
         let xid = h.begin();
-        let rows_at_k5000 = match h
-            .exec_as(xid, "SELECT id FROM t WHERE k = 5000")
-            .unwrap()
-        {
+        let rows_at_k5000 = match h.exec_as(xid, "SELECT id FROM t WHERE k = 5000").unwrap() {
             ExecResult::Rows { rows, .. } => rows.len(),
             o => panic!("{o:?}"),
         };
@@ -6002,39 +6087,39 @@ mod tests {
         // k=7499: original (7499→7500) moved out; new row from k=7498→7499
         // moved in → 1 row.
         let xid = h.begin();
-        let rows_at_k7499 = match h
-            .exec_as(xid, "SELECT id FROM t WHERE k = 7499")
-            .unwrap()
-        {
+        let rows_at_k7499 = match h.exec_as(xid, "SELECT id FROM t WHERE k = 7499").unwrap() {
             ExecResult::Rows { rows, .. } => rows.len(),
             o => panic!("{o:?}"),
         };
         h.commit(xid);
-        assert_eq!(rows_at_k7499, 1, "k=7499: filled by updated k=7498→7499 row");
+        assert_eq!(
+            rows_at_k7499, 1,
+            "k=7499: filled by updated k=7498→7499 row"
+        );
 
         // k=4999: pre-build row, outside WHERE range — must be unchanged (1 row).
         let xid = h.begin();
-        let rows_at_k4999 = match h
-            .exec_as(xid, "SELECT id FROM t WHERE k = 4999")
-            .unwrap()
-        {
+        let rows_at_k4999 = match h.exec_as(xid, "SELECT id FROM t WHERE k = 4999").unwrap() {
             ExecResult::Rows { rows, .. } => rows.len(),
             o => panic!("{o:?}"),
         };
         h.commit(xid);
-        assert_eq!(rows_at_k4999, 1, "k=4999 (pre-build, not updated) must still exist");
+        assert_eq!(
+            rows_at_k4999, 1,
+            "k=4999 (pre-build, not updated) must still exist"
+        );
 
         // k=7501: INSERT-bench row above the WHERE range — must be unchanged (1 row).
         let xid = h.begin();
-        let rows_at_k7501 = match h
-            .exec_as(xid, "SELECT id FROM t WHERE k = 7501")
-            .unwrap()
-        {
+        let rows_at_k7501 = match h.exec_as(xid, "SELECT id FROM t WHERE k = 7501").unwrap() {
             ExecResult::Rows { rows, .. } => rows.len(),
             o => panic!("{o:?}"),
         };
         h.commit(xid);
-        assert_eq!(rows_at_k7501, 1, "k=7501 (not in WHERE range) must be unchanged");
+        assert_eq!(
+            rows_at_k7501, 1,
+            "k=7501 (not in WHERE range) must be unchanged"
+        );
     }
 
     /// An equality DELETE on a BTree-indexed column goes through the A3 index
