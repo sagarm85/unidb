@@ -12,6 +12,14 @@
 
 ## Current status
 
+- **Item 71 — Cross-page HOT chains — SHIPPED 2026-07-18, on `main`.**
+  Extends same-page HOT (item 58) to full pages: old slot gets `HOT_NEXT_XPAGE=0xFFFE`
+  sentinel + cross-page chain pointer in repurposed `prev_page`/`prev_slot`; B-tree
+  NOT updated. FORMAT_VERSION 8→9, `WAL_HOT_XPAGE_HEAD` type 17.
+  Crash tests: P_xhot_a + P_xhot_b, 50/50 total PASS. 431 unit PASS. Clippy clean.
+  Backlog files 68–71 created; backlog_index.md updated (next→72_).
+  Docker bench pending (target: UPDATE 0.07× PG → 0.40–0.55× PG).
+
 - **Item 65 — HNSW incremental insert NodeCache — SHIPPED 2026-07-18, branch `65-hnsw-insert-cache`.**
   Root cause confirmed: `search_layer` called `find_node_loc` + `load_node_at` ~3200 times per insert
   (ef_construction=200 × M=16 neighbours, no cache on the incremental path).
@@ -3519,6 +3527,53 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-18 — Item 71: Cross-page HOT chains
+
+**Goal:** Extend same-page HOT (item 58) to fire when the target page is full.
+When no indexed column is in SET and the old page is full, insert the new version
+on any page with space and store a cross-page forwarding pointer in the old slot's
+repurposed `prev_page`/`prev_slot` fields (activated by sentinel
+`hot_next = HOT_NEXT_XPAGE = 0xFFFE`). B-tree is NOT updated — it still points
+at the old chain-head slot, which chains to the new live slot.
+
+**Changes shipped:**
+
+1. `src/format.rs` — FORMAT_VERSION 8→9; `HOT_NEXT_XPAGE: u16 = 0xFFFE`;
+   `WAL_HOT_XPAGE_HEAD: u8 = 17` (redo 16B, undo 8B).
+
+2. `src/page.rs` — `set_hot_xpage(slot, xpage_pid, xpage_slot)`;
+   `restore_prev_and_hot_next(slot, saved_prev_page, saved_prev_slot)`.
+
+3. `src/wal.rs` — `log_hot_xpage_head(...)` function; redo/undo payloads.
+
+4. `src/heap.rs` — `HotInsertResult { new_rid, saved_prev: Option<(PageId,u16)> }`;
+   `try_hot_insert` FSM pre-screen restructured (fsm_says_full → skip same-page →
+   cross-page directly); `get_visible` checks `HOT_NEXT_XPAGE` before `HOT_NEXT_NONE`;
+   `get_visible_with_rid` + `Heap::get_resolved` (returns resolved live RowId);
+   `undo_hot_xpage_update` (two-phase: new page xmax self-stamp, old page restore);
+   clippy: `.map_or(false, ...)` → `.is_some_and(...)`.
+
+5. `src/txn.rs` — `UndoAction::HotXpageUpdate { old_page_id, old_slot, new_page_id,
+   new_slot, saved_prev_page, saved_prev_slot }`.
+
+6. `src/sql/executor.rs` — `index_matching_rows` uses `heap.get_resolved(btree_rid, ...)`
+   to avoid re-mutating an already-xmax-stamped chain head (was WriteConflict bug).
+
+7. `src/recovery.rs` — `WAL_HOT_XPAGE_HEAD` redo + undo; M1 undo filter + handler.
+
+8. `src/lib.rs` — both vacuum passes follow `HOT_NEXT_XPAGE` chains.
+
+9. `tests/crash/main.rs` — `p_xhot_a` (WAL durable, page not flushed) + `p_xhot_b`
+   (incomplete user txn reverts); 50/50 crash PASS.
+
+10. `docs/backlog/` — files 68–71 created; backlog_index.md updated (next→72_).
+
+**Test results:** 431 unit + 50 crash (all suites) = 0 failures. Clippy clean. Fmt clean.
+
+**Target:** UPDATE 0.07× PG → 0.40–0.55× PG. Docker bench pending.
+
+---
 
 ### 2026-07-17 — Item 60: Event queue serde_json replacement
 

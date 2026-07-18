@@ -3463,3 +3463,157 @@ fn p60b_hnsw_post_checkpoint_inserts_survive_crash() {
     );
     drop(engine);
 }
+
+// ── P_xhot_a: cross-page HOT WAL durable, page not flushed (item 71) ─────────
+//
+// Fill a page so same-page HOT fails, then cross-page HOT update: WAL is
+// durable (per-mini-txn fsync), heap pages may not reach disk. On reopen,
+// recovery replays WAL_INSERT (new version) + WAL_HOT_XPAGE_HEAD (old page
+// chain pointer + xmax).  The B-tree still points at the old (chain-head)
+// slot; `get_visible` follows the XPAGE chain to the new version.
+//
+// Assertion: the updated value is visible after crash.
+#[test]
+fn p_xhot_a_cross_page_hot_wal_durable_page_not_flushed() {
+    use unidb::sql::logical::Literal;
+
+    let dir = tempdir().unwrap();
+
+    {
+        let engine = open(dir.path());
+        let x = engine.begin().unwrap();
+        // `id` is indexed (not in SET), `body` is not indexed (SET target).
+        engine
+            .execute_sql(x, "CREATE TABLE t (id INT, body TEXT)")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE INDEX idx ON t USING BTREE (id)")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        engine.set_deferred_sync(false);
+
+        // Pack the page: insert enough rows so the first page is full.
+        // 8 KiB page, ~50 B/row → ~160 rows/page.  Insert 200 to guarantee
+        // the target row is not near the end with spare space.
+        let x = engine.begin().unwrap();
+        for i in 0i64..200 {
+            engine
+                .execute_sql(
+                    x,
+                    &format!("INSERT INTO t (id, body) VALUES ({i}, 'original')"),
+                )
+                .unwrap();
+        }
+        engine.commit(x).unwrap();
+
+        // HOT-eligible UPDATE: body (not indexed).  The pages holding these
+        // rows are full (new version cannot fit same-page) → cross-page HOT.
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "UPDATE t SET body = 'xpage-updated' WHERE id = 50")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        drop(engine); // "crash": no checkpoint, WAL durable, pages maybe not flushed
+    }
+
+    // Reopen: recovery replays WAL_INSERT + WAL_HOT_XPAGE_HEAD.
+    let engine = open(dir.path());
+    let x = engine.begin().unwrap();
+    let result = engine
+        .execute_sql(x, "SELECT body FROM t WHERE id = 50")
+        .unwrap();
+    engine.commit(x).unwrap();
+    drop(engine);
+
+    match &result[0] {
+        unidb::SqlResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1, "P_xhot_a: expected exactly one row");
+            assert_eq!(
+                rows[0][0],
+                Literal::Text("xpage-updated".to_owned()),
+                "P_xhot_a: cross-page HOT updated value must survive crash via WAL recovery"
+            );
+        }
+        other => panic!("P_xhot_a: expected Rows, got {other:?}"),
+    }
+}
+
+// ── P_xhot_b: cross-page HOT incomplete user txn reverts (item 71) ──────────
+//
+// Same setup as P_xhot_a: pages full so cross-page HOT fires.  But the user
+// transaction is never committed (simulates crash mid-txn). On reopen, M1
+// undo of WAL_HOT_XPAGE_HEAD + WAL_INSERT restores the old slot to live and
+// makes the new version permanently invisible.
+//
+// Assertion: the original value is visible; the updated value is gone.
+#[test]
+fn p_xhot_b_cross_page_hot_incomplete_user_txn_reverts() {
+    use unidb::sql::logical::Literal;
+
+    let dir = tempdir().unwrap();
+
+    {
+        let engine = open(dir.path());
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE t (id INT, body TEXT)")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE INDEX idx ON t USING BTREE (id)")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        engine.set_deferred_sync(false);
+
+        // Fill page(s) with committed rows.
+        let x = engine.begin().unwrap();
+        for i in 0i64..200 {
+            engine
+                .execute_sql(
+                    x,
+                    &format!("INSERT INTO t (id, body) VALUES ({i}, 'original')"),
+                )
+                .unwrap();
+        }
+        engine.commit(x).unwrap();
+
+        // Begin user txn, cross-page HOT update (page full) — do NOT commit.
+        // Each mini-txn fsyncs, so WAL_HOT_XPAGE_HEAD is durable.
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "UPDATE t SET body = 'xpage-will-revert' WHERE id = 75")
+            .unwrap();
+        drop(engine); // "crash": WAL_TXN_COMMIT never written
+    }
+
+    // Reopen: M1 undo sees WAL_HOT_XPAGE_HEAD in incomplete user txn.
+    // Old slot → xmax cleared, chain pointer restored → live and visible.
+    // New version → xmin self-stamped dead → invisible.
+    let engine = open(dir.path());
+    let x = engine.begin().unwrap();
+    let result = engine
+        .execute_sql(x, "SELECT body FROM t WHERE id = 75")
+        .unwrap();
+    engine.commit(x).unwrap();
+    drop(engine);
+
+    match &result[0] {
+        unidb::SqlResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1, "P_xhot_b: expected exactly one row");
+            assert_eq!(
+                rows[0][0],
+                Literal::Text("original".to_owned()),
+                "P_xhot_b: cross-page HOT incomplete txn must leave the original value visible"
+            );
+        }
+        other => panic!("P_xhot_b: expected Rows, got {other:?}"),
+    }
+}

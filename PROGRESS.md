@@ -7545,3 +7545,64 @@ no worker lease is available.
 | `cargo test --test crash` | **48 passed; 0 failed** |
 | `parallel_delete_matches_serial` | **PASS** (4.67 s, 10k rows) |
 | Docker bench | pending — next bench run |
+
+---
+
+## Item 71 — Cross-page HOT chains (2026-07-18)
+
+**Branch:** `main` | **Backlog:** `docs/backlog/71_cross_page_hot.md`
+
+### Problem
+
+Same-page HOT (item 58) fires only when the target page has slack space. For
+packed tables under steady-state write load, pages are near-full and same-page
+HOT never fires — every UPDATE fell back to insert-new-version + O(log n) B-tree
+patch. Measured UPDATE throughput: **0.07× PG** (14× behind Postgres).
+
+### Solution
+
+When a page is full and the update is HOT-eligible (no indexed column in SET):
+1. Insert new version on any page with space (`acquire_page_for_insert`)
+2. Stamp `xmax` on old slot + write cross-page chain pointer into repurposed
+   `prev_page`/`prev_slot` fields, activated by sentinel `hot_next = HOT_NEXT_XPAGE = 0xFFFE`
+3. B-tree NOT updated — chain head (old slot) → live version (new slot) followed at read time
+
+Eliminates O(log n) B-tree patch on every UPDATE on a full page.
+
+### Files changed
+
+- `src/format.rs`: `FORMAT_VERSION` 8→9; `HOT_NEXT_XPAGE: u16 = 0xFFFE`; `WAL_HOT_XPAGE_HEAD: u8 = 17`
+- `src/page.rs`: `set_hot_xpage`, `restore_prev_and_hot_next`
+- `src/wal.rs`: `log_hot_xpage_head` (redo 16B: xid+old_slot+new_pid+new_slot; undo 8B: old_slot+saved_prev_page+saved_prev_slot)
+- `src/heap.rs`: `HotInsertResult`; `try_hot_insert` restructured; `get_visible` cross-page chain follow; `get_visible_with_rid`/`get_resolved`; `undo_hot_xpage_update`
+- `src/txn.rs`: `UndoAction::HotXpageUpdate`
+- `src/sql/executor.rs`: `index_matching_rows` uses `heap.get_resolved` to resolve live RowId from chain head
+- `src/recovery.rs`: `WAL_HOT_XPAGE_HEAD` redo + undo; M1 user txn undo handler
+- `src/lib.rs`: both vacuum passes handle `HOT_NEXT_XPAGE` chains
+- `tests/crash/main.rs`: `p_xhot_a` (WAL durable, page not flushed) + `p_xhot_b` (incomplete txn reverts)
+- `docs/backlog/`: files 68–71 created; `backlog_index.md` updated (next→72_)
+
+### WAL atomicity
+
+`WAL_INSERT` (new version) + `WAL_HOT_XPAGE_HEAD` (old page: xmax + chain pointer) in one mini-txn → D2 atomic commit. Recovery replays both or neither.
+
+### Latch ordering
+
+New-before-old: acquire new page latch (insert), release, then acquire old page latch (xmax + chain). No deadlock: no other code path holds both simultaneously.
+
+### Check table
+
+| Check | Result |
+|-------|--------|
+| `cargo build --release` | clean |
+| `cargo clippy -- -D warnings` | clean |
+| `cargo fmt --all` | clean |
+| `cargo test` | **431 passed; 0 failed** |
+| `cargo test --test crash` | **50 passed; 0 failed** |
+| P_xhot_a (cross-page WAL durability) | **PASS** |
+| P_xhot_b (cross-page incomplete txn reverts) | **PASS** |
+| Docker bench UPDATE improvement | **pending** |
+
+### Target
+
+UPDATE throughput: **0.07× PG → 0.40–0.55× PG** (6–8× improvement target; Docker bench pending).

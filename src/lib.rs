@@ -109,7 +109,7 @@ use crate::{
     catalog::{Catalog, CatalogCtx, IndexKind, IndexStatus, TableDef},
     control::ControlData,
     error::Result,
-    format::{Lsn, PageId, Xid, DEFAULT_PAGE_SIZE, HOT_NEXT_NONE},
+    format::{Lsn, PageId, Xid, DEFAULT_PAGE_SIZE, HOT_NEXT_NONE, HOT_NEXT_XPAGE},
     graph::{
         edges::{self, Edge},
         executor as graph_executor,
@@ -2912,14 +2912,20 @@ impl Engine {
                 let Ok(bytes) = heap.get_raw(*rid, &self.pool) else {
                     continue;
                 };
-                // Item 58: check if this is a HOT chain head (hot_next set).
-                // Read the page directly to get the tuple header's hot_next field.
+                // Items 58/71: check if this is a HOT chain head.
+                // Same-page HOT (item 58): hot_next holds the new slot on the same page.
+                // Cross-page HOT (item 71): hot_next == HOT_NEXT_XPAGE; target is in
+                //   prev_page/prev_slot of the old slot.
                 let hot_new_rid: Option<RowId> = {
                     match self.pool.fetch_page(rid.page_id) {
                         Ok(page) => {
                             let maybe_th = page.tuple_header(rid.slot);
                             self.pool.unpin(rid.page_id);
                             match maybe_th {
+                                Ok(th) if th.hot_next == HOT_NEXT_XPAGE => Some(RowId {
+                                    page_id: th.prev_page,
+                                    slot: th.prev_slot,
+                                }),
                                 Ok(th) if th.hot_next != HOT_NEXT_NONE => Some(RowId {
                                     page_id: rid.page_id,
                                     slot: th.hot_next,
@@ -3643,13 +3649,17 @@ impl Engine {
                     let Ok(bytes) = heap.get_raw(*rid, &self.pool) else {
                         continue;
                     };
-                    // Item 58: check for HOT chain head.
+                    // Items 58/71: check for HOT chain head.
                     let hot_new_rid: Option<RowId> = {
                         match self.pool.fetch_page(rid.page_id) {
                             Ok(page) => {
                                 let maybe_th = page.tuple_header(rid.slot);
                                 self.pool.unpin(rid.page_id);
                                 match maybe_th {
+                                    Ok(th) if th.hot_next == HOT_NEXT_XPAGE => Some(RowId {
+                                        page_id: th.prev_page,
+                                        slot: th.prev_slot,
+                                    }),
                                     Ok(th) if th.hot_next != HOT_NEXT_NONE => Some(RowId {
                                         page_id: rid.page_id,
                                         slot: th.hot_next,

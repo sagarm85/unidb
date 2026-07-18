@@ -73,7 +73,22 @@ pub const MAGIC: u32 = 0x556E4442; // "UnDB"
 // slot with no forward pointer → row unfindable). The version bump causes older
 // builds to produce BadVersion rather than silently misrecovering. No migration
 // path — no prior version has shipped externally.
-pub const FORMAT_VERSION: u16 = 8;
+//
+// v8 -> v9 (item 71 — cross-page HOT chains, 2026-07-18):
+// A new WAL record type `WAL_HOT_XPAGE_HEAD` (type 17) covers the old-page
+// portion of a cross-page HOT update: (a) xmax-stamp the old slot and (b) set
+// `hot_next = HOT_NEXT_XPAGE (0xFFFE)` plus overwrite the old slot's
+// `prev_page`/`prev_slot` fields (which are safe to repurpose on a superseded
+// version — those backward-chain fields are never read during forward scans)
+// with the cross-page target `(new_page_id, new_slot)`. The new version's
+// insert on `new_page_id` is logged via the existing `WAL_INSERT` in the same
+// mini-txn. TUPLE_HEADER_SIZE (24 bytes) is UNCHANGED — no field grows; only
+// the semantics of prev_page/prev_slot on a superseded-with-XPAGE slot changes.
+// An older binary's `_ => {}` catch-all would silently skip WAL_HOT_XPAGE_HEAD,
+// leaving the cross-page chain broken after crash recovery (B-tree points to
+// xmax'd old slot with hot_next=XPAGE but no restored chain → row unfindable).
+// The version bump causes older builds to produce BadVersion. No migration path.
+pub const FORMAT_VERSION: u16 = 9;
 
 /// Default page size: 8 KiB (D8). Baked into the control file at DB init.
 pub const DEFAULT_PAGE_SIZE: u32 = 8192;
@@ -223,6 +238,36 @@ pub const WAL_INDEX_INSERT: u8 = 15;
 // older builds to produce BadVersion. No migration path.
 pub const WAL_HOT_UPDATE: u8 = 16;
 
+// WAL cross-page HOT head record (item 71 — cross-page HOT chains).
+// Covers the OLD-page changes for a cross-page HOT update atomically:
+// (a) stamp xmax = xid on old_slot, and (b) overwrite old_slot's prev_page/
+// prev_slot with (new_page_id, new_slot) and set hot_next = HOT_NEXT_XPAGE.
+//
+// The new version's insert on new_page_id is logged via the existing WAL_INSERT
+// in the same mini-txn, giving the whole operation mini-txn atomicity (D2).
+// No B-tree update is emitted — the B-tree entry still points at old_slot, which
+// chains to the new version via the cross-page forwarding pointer. Vacuum patches
+// the B-tree lazily from old_slot → new_slot during reclaimable-slot processing.
+//
+// WAL header fields: `page_id` = old_page_id; `slot` = old_slot (the chain head,
+// where the B-tree still points).
+//
+// redo payload (old_page_id, 16 B):
+//   xid (8 B LE) || old_slot (2 B LE) || new_page_id (4 B LE) || new_slot (2 B LE)
+//   Redo: LSN-gated. Stamp xmax=xid; set hot_next=HOT_NEXT_XPAGE; overwrite
+//   prev_page/prev_slot with (new_page_id, new_slot) on old_slot.
+//
+// undo payload (old_page_id, 8 B):
+//   old_slot (2 B LE) || saved_prev_page (4 B LE) || saved_prev_slot (2 B LE)
+//   Undo: restore prev_page/prev_slot from saved values; clear hot_next =
+//   HOT_NEXT_NONE; clear xmax = 0 on old_slot.  The new version (on new_page_id,
+//   logged separately as WAL_INSERT) is handled by WAL_INSERT's own undo.
+//
+// An older binary's `_ => {}` catch-all would skip this record, leaving the
+// cross-page HOT chain broken after crash recovery. FORMAT_VERSION bump to 9
+// causes older builds to produce BadVersion. No migration path.
+pub const WAL_HOT_XPAGE_HEAD: u8 = 17;
+
 /// Bit 0 of the tuple-header `flags` byte: this slot is a HOT chain head.
 /// When set, the `hot_next` field (tuple-header offset [22..24]) holds the
 /// slot index of the newer version on the same page. `0xFFFF` means "not set"
@@ -240,6 +285,13 @@ pub const HOT_TUPLE_FLAG: u8 = 0x01;
 /// or is the tail of the chain). Stored in the `_pad u16` field at tuple-header
 /// offset [22..24].
 pub const HOT_NEXT_NONE: u16 = 0xFFFF;
+
+/// Sentinel value for `hot_next` indicating a cross-page HOT chain (item 71).
+/// When `hot_next == HOT_NEXT_XPAGE`, the forward target is on a different page;
+/// its `(page_id, slot)` are stored in the OLD slot's `prev_page`/`prev_slot`
+/// fields, which are safe to repurpose because the backward chain of a
+/// superseded version is never traversed during normal forward scans.
+pub const HOT_NEXT_XPAGE: u16 = 0xFFFE;
 
 // ── little-endian helpers ────────────────────────────────────────────────────
 

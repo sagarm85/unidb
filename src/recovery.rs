@@ -15,9 +15,9 @@ use crate::{
     error::{DbError, Result},
     format::{
         u16_from_le, u32_from_le, u64_from_le, Xid, HOT_NEXT_NONE, INVALID_LSN, WAL_ABORT,
-        WAL_BEGIN, WAL_CHECKPOINT, WAL_COMMIT, WAL_DELETE, WAL_FPI, WAL_HOT_UPDATE, WAL_INDEX,
-        WAL_INDEX_INSERT, WAL_INSERT, WAL_TXN_ABORT, WAL_TXN_BEGIN, WAL_TXN_COMMIT, WAL_UPDATE,
-        WAL_VACUUM, WAL_XMAX_BATCH,
+        WAL_BEGIN, WAL_CHECKPOINT, WAL_COMMIT, WAL_DELETE, WAL_FPI, WAL_HOT_UPDATE,
+        WAL_HOT_XPAGE_HEAD, WAL_INDEX, WAL_INDEX_INSERT, WAL_INSERT, WAL_TXN_ABORT, WAL_TXN_BEGIN,
+        WAL_TXN_COMMIT, WAL_UPDATE, WAL_VACUUM, WAL_XMAX_BATCH,
     },
     heap::{decode_insert_redo, RowId},
     page::SlottedPage,
@@ -144,6 +144,7 @@ pub fn recover(
                 || r.rec_type == WAL_DELETE
                 || r.rec_type == WAL_XMAX_BATCH
                 || r.rec_type == WAL_HOT_UPDATE
+                || r.rec_type == WAL_HOT_XPAGE_HEAD
         })
         .copied()
         .collect();
@@ -200,7 +201,8 @@ pub fn recover(
         for r in relevant.iter().filter(|r| {
             (r.rec_type == WAL_UPDATE
                 || r.rec_type == WAL_XMAX_BATCH
-                || r.rec_type == WAL_HOT_UPDATE)
+                || r.rec_type == WAL_HOT_UPDATE
+                || r.rec_type == WAL_HOT_XPAGE_HEAD)
                 && committed.contains(&r.mini_txn_id)
         }) {
             if r.rec_type == WAL_UPDATE {
@@ -232,7 +234,7 @@ pub fn recover(
                         stats.records_undone += 1;
                     }
                 }
-            } else {
+            } else if r.rec_type == WAL_HOT_UPDATE {
                 // WAL_HOT_UPDATE: redo[0..8] = xid, redo[8..10] = old_slot,
                 // redo[10..12] = new_slot. Undo: clear hot_next + xmax on old slot,
                 // delete new slot.
@@ -258,6 +260,44 @@ pub fn recover(
                         pool.write_page(&page)?;
                         pool.unpin(r.page_id);
                         stats.records_undone += 1;
+                    }
+                }
+            } else {
+                // WAL_HOT_XPAGE_HEAD (item 71): redo[0..8] = xid, redo[8..10] = old_slot,
+                // redo[10..14] = new_page_id, redo[14..16] = new_slot.
+                // undo[0..2] = old_slot, undo[2..6] = saved_prev_page, undo[6..8] = saved_prev_slot.
+                //
+                // Phase 1 (old page): restore prev_page/prev_slot + clear hot_next +
+                //   clear xmax on old_slot.
+                // Phase 2 (new page): handled by Phase 2 of the WAL_INSERT loop below
+                //   (xmin self-stamp makes new version permanently invisible).
+                if r.redo.len() >= 8 && r.undo.len() >= 8 {
+                    let xid = u64_from_le(r.redo[0..8].try_into().unwrap());
+                    if incomplete_user_txns.contains(&xid) {
+                        let old_slot = u16_from_le(r.undo[0..2].try_into().unwrap());
+                        let saved_prev_page = u32_from_le(r.undo[2..6].try_into().unwrap());
+                        let saved_prev_slot = u16_from_le(r.undo[6..8].try_into().unwrap());
+                        let mut page = fetch_or_create(&pool, r.page_id, page_size)?;
+                        // Restore prev_page/prev_slot + clear hot_next.
+                        match page.restore_prev_and_hot_next(
+                            old_slot,
+                            saved_prev_page,
+                            saved_prev_slot,
+                        ) {
+                            Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
+                            Err(e) => return Err(e),
+                        }
+                        // Clear xmax (restore old version as live).
+                        match page.set_xmax(old_slot, 0) {
+                            Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
+                            Err(e) => return Err(e),
+                        }
+                        page.recompute_crc();
+                        pool.write_page(&page)?;
+                        pool.unpin(r.page_id);
+                        stats.records_undone += 1;
+                        // New version on new_page_id is handled by Phase 2's
+                        // WAL_INSERT self-stamp loop.
                     }
                 }
             }
@@ -432,6 +472,42 @@ fn redo_record(r: &WalRecord, pool: &BufferPool, page_size: usize) -> Result<()>
             pool.write_page(&page)?;
             pool.unpin(r.page_id);
         }
+        WAL_HOT_XPAGE_HEAD => {
+            // item 71: cross-page HOT old-page head record. Redo:
+            //   (a) stamp xmax = xid on old_slot.
+            //   (b) set hot_next = HOT_NEXT_XPAGE + overwrite prev_page/prev_slot
+            //       with (new_page_id, new_slot) on old_slot.
+            //
+            // redo payload: xid (8 B) || old_slot (2 B) || new_page_id (4 B) || new_slot (2 B)
+            // LSN-gated (same pattern as WAL_HOT_UPDATE).
+            if r.redo.len() < 16 {
+                // Length check before fetch_or_create so we don't leak a pin.
+                return Err(DbError::WalCorrupt { lsn: r.lsn });
+            }
+            let xid = u64_from_le(r.redo[0..8].try_into().unwrap());
+            let old_slot = u16_from_le(r.redo[8..10].try_into().unwrap());
+            let new_page_id = u32_from_le(r.redo[10..14].try_into().unwrap());
+            let new_slot = u16_from_le(r.redo[14..16].try_into().unwrap());
+            let mut page = fetch_or_create(pool, r.page_id, page_size)?;
+            if page.lsn() >= r.lsn {
+                pool.unpin(r.page_id);
+                return Ok(());
+            }
+            // (a) xmax stamp
+            match page.set_xmax(old_slot, xid) {
+                Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
+                Err(e) => return Err(e),
+            }
+            // (b) cross-page forwarding pointer
+            match page.set_hot_xpage(old_slot, new_page_id, new_slot) {
+                Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
+                Err(e) => return Err(e),
+            }
+            page.set_lsn(r.lsn);
+            pool.write_page(&page)?;
+            pool.unpin(r.page_id);
+            // WAL_INSERT redo for new_page_id is handled separately (higher LSN).
+        }
         WAL_HOT_UPDATE => {
             // item 58: atomic same-page HOT update. One WAL record covers:
             //   (a) xmax stamp on old slot, (b) hot_next pointer in old slot,
@@ -570,6 +646,34 @@ fn undo_record(r: &WalRecord, pool: &BufferPool, page_size: usize) -> Result<()>
             // Simple approach: insert anew (slot may differ, but for M0 this is fine).
             let mut page = fetch_or_create(pool, r.page_id, page_size)?;
             page.insert(&r.undo)?;
+            pool.write_page(&page)?;
+            pool.unpin(r.page_id);
+        }
+        WAL_HOT_XPAGE_HEAD => {
+            // Undo the old-page portion of a cross-page HOT update (item 71).
+            // undo payload: old_slot (2 B LE) || saved_prev_page (4 B LE) || saved_prev_slot (2 B LE)
+            //
+            // The new version (on new_page_id, logged via WAL_INSERT) is handled
+            // by the WAL_INSERT undo arm in the same pass (mark_dead on that slot).
+            if r.undo.len() < 8 {
+                // Length check before fetch_or_create so we don't leak a pin.
+                return Err(DbError::WalCorrupt { lsn: r.lsn });
+            }
+            let old_slot = u16_from_le(r.undo[0..2].try_into().unwrap());
+            let saved_prev_page = u32_from_le(r.undo[2..6].try_into().unwrap());
+            let saved_prev_slot = u16_from_le(r.undo[6..8].try_into().unwrap());
+            let mut page = fetch_or_create(pool, r.page_id, page_size)?;
+            // Restore prev_page/prev_slot + clear hot_next (idempotent).
+            match page.restore_prev_and_hot_next(old_slot, saved_prev_page, saved_prev_slot) {
+                Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
+                Err(e) => return Err(e),
+            }
+            // Clear xmax (idempotent — TupleDeleted means slot already dead).
+            match page.set_xmax(old_slot, 0) {
+                Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
+                Err(e) => return Err(e),
+            }
+            page.recompute_crc();
             pool.write_page(&page)?;
             pool.unpin(r.page_id);
         }

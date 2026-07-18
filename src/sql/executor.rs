@@ -2560,16 +2560,19 @@ fn exec_update(
         }
         let encoded = encode_row(&coerced);
 
-        // Item 58: try HOT update (same-page, no B-tree cost) when eligible.
-        // Falls back to the standard cross-page update + B-tree maintenance if
-        // the old page is full.
-        let (new_row_id, used_hot) = if hot_eligible {
+        // Items 58/71: try HOT update (same-page first, cross-page fallback)
+        // when eligible — no B-tree cost in either HOT case.
+        // Falls back to the standard cross-page update + B-tree maintenance
+        // only when try_hot_insert returns Ok(None) (write conflict, which
+        // is unreachable here because the write lock was already acquired, or
+        // an internal error).
+        let (new_row_id, used_hot, hot_saved_prev) = if hot_eligible {
             match heap.try_hot_insert(row_id, &encoded, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr) {
                 Err(e @ DbError::WriteConflict { .. }) => return Err(classify_conflict(e, ctx)),
                 Err(e) => return Err(e),
-                Ok(Some(nrid)) => (nrid, true),
+                Ok(Some(result)) => (result.new_rid, true, result.saved_prev),
                 Ok(None) => {
-                    // Page full — fall back to cross-page insert + B-tree update.
+                    // Conflict detected by try_hot_insert — fall back to full update.
                     let nrid = match heap.update(
                         row_id,
                         &encoded,
@@ -2583,7 +2586,7 @@ fn exec_update(
                         }
                         other => other?,
                     };
-                    (nrid, false)
+                    (nrid, false, None)
                 }
             }
         } else {
@@ -2592,24 +2595,44 @@ fn exec_update(
                 Err(e @ DbError::WriteConflict { .. }) => return Err(classify_conflict(e, ctx)),
                 other => other?,
             };
-            (nrid, false)
+            (nrid, false, None)
         };
 
         // P1.d: writing supersedes the version at `row_id` — an SSI write of the
         // exact version a concurrent reader would have read.
         ctx.txn_mgr.ssi_note_write(ctx.xid, row_id);
         if used_hot {
-            // Item 58: HOT update — undo both mutations atomically with one action.
-            // The new version is on the same page as the old version; the ordering
-            // (new-slot-first, then old-slot) is enforced inside `undo_hot_update`.
-            ctx.txn_mgr.record_undo(
-                ctx.xid,
-                UndoAction::HotUpdate {
-                    page_id: row_id.page_id,
-                    old_slot: row_id.slot,
-                    new_slot: new_row_id.slot,
-                },
-            )?;
+            // HOT update — undo both mutations atomically with one action.
+            // Same-page (item 58): ordering (new-slot-first, then old-slot) is
+            //   enforced inside `undo_hot_update`.
+            // Cross-page (item 71): two separate pages; new page first, then old.
+            match hot_saved_prev {
+                None => {
+                    // Same-page HOT: new and old versions share the same page.
+                    ctx.txn_mgr.record_undo(
+                        ctx.xid,
+                        UndoAction::HotUpdate {
+                            page_id: row_id.page_id,
+                            old_slot: row_id.slot,
+                            new_slot: new_row_id.slot,
+                        },
+                    )?;
+                }
+                Some((saved_prev_page, saved_prev_slot)) => {
+                    // Cross-page HOT: new version is on a different page.
+                    ctx.txn_mgr.record_undo(
+                        ctx.xid,
+                        UndoAction::HotXpageUpdate {
+                            old_page_id: row_id.page_id,
+                            old_slot: row_id.slot,
+                            new_page_id: new_row_id.page_id,
+                            new_slot: new_row_id.slot,
+                            saved_prev_page,
+                            saved_prev_slot,
+                        },
+                    )?;
+                }
+            }
         } else {
             ctx.txn_mgr.record_undo(
                 ctx.xid,
@@ -2698,9 +2721,7 @@ fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Resu
         if !use_a3 {
             let pages = heap.scan_pages(ctx.pool)?;
             if pages.len() >= crate::sql::parallel_scan::PARALLEL_CANDIDATE_MIN {
-                if let Some(lease) =
-                    crate::sql::parallel_scan::acquire(pages.len())
-                {
+                if let Some(lease) = crate::sql::parallel_scan::acquire(pages.len()) {
                     // Build the predicate closure for parallel workers.  Workers
                     // only need to evaluate the WHERE predicate — they never decode
                     // the full row (that happens in the pre-check / CDC pass below,
@@ -2711,27 +2732,24 @@ fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Resu
                     if let Some(pred) = predicate {
                         expr_columns(pred, &table_def, &mut pred_col_indices);
                     }
-                    let (pred_needed, pred_upto) =
-                        needed_mask(&pred_col_indices, cols.len());
+                    let (pred_needed, pred_upto) = needed_mask(&pred_col_indices, cols.len());
                     let has_pred = predicate.is_some();
 
-                    let mut out =
-                        crate::sql::parallel_scan::parallel_collect_matching(
-                            &pages,
-                            &ctx.pool.shared_reader(),
-                            &snapshot,
-                            ctx.xid,
-                            lease.degree(),
-                            &|bytes| {
-                                if has_pred {
-                                    let prow =
-                                        deform_row(bytes, cols, pred_upto, &pred_needed)?;
-                                    Ok(predicate_matches(predicate, cols, &prow)?)
-                                } else {
-                                    Ok(true)
-                                }
-                            },
-                        )?;
+                    let mut out = crate::sql::parallel_scan::parallel_collect_matching(
+                        &pages,
+                        &ctx.pool.shared_reader(),
+                        &snapshot,
+                        ctx.xid,
+                        lease.degree(),
+                        &|bytes| {
+                            if has_pred {
+                                let prow = deform_row(bytes, cols, pred_upto, &pred_needed)?;
+                                Ok(predicate_matches(predicate, cols, &prow)?)
+                            } else {
+                                Ok(true)
+                            }
+                        },
+                    )?;
                     // delete_many (item 44) groups rows by page_id and requires
                     // (page_id, slot) order — parallel workers process pages in
                     // work-steal order so we must sort before proceeding.
@@ -3045,13 +3063,17 @@ fn index_matching_rows(
 
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for row_id in candidate_ids {
-        if !seen.insert((row_id.page_id, row_id.slot)) {
+    for btree_rid in candidate_ids {
+        if !seen.insert((btree_rid.page_id, btree_rid.slot)) {
             continue; // a rowid resolved once is enough (dedup superseded/dup entries)
         }
-        let bytes = match heap.get(row_id, snapshot, ctx.xid, ctx.pool) {
-            Ok(b) => b,
-            Err(DbError::NoVisibleVersion { .. }) => continue, // superseded / aborted hint
+        // Use get_resolved so that `row_id` in the returned pair is the LIVE
+        // version's slot, not the B-tree chain head.  This matters for HOT
+        // chains (items 58/71): the chain head already has xmax != 0, and
+        // passing it to heap.update/delete would cause a spurious WriteConflict.
+        let (row_id, bytes) = match heap.get_resolved(btree_rid, snapshot, ctx.xid, ctx.pool) {
+            Ok(Some(r)) => r,
+            Ok(None) => continue, // superseded / aborted hint
             Err(e) => return Err(e),
         };
         let prow = deform_row(&bytes, cols, pred_upto, &pred_needed)?;

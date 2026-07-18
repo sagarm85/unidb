@@ -88,6 +88,17 @@ pub enum UndoAction {
         old_slot: u16,
         new_slot: u16,
     },
+    /// A cross-page HOT update (item 71). The new version is on `new_page_id`
+    /// (different from `old_page_id`). Undo calls `Heap::undo_hot_xpage_update`
+    /// which restores old_slot to live and makes new_slot permanently invisible.
+    HotXpageUpdate {
+        old_page_id: PageId,
+        old_slot: u16,
+        new_page_id: PageId,
+        new_slot: u16,
+        saved_prev_page: PageId,
+        saved_prev_slot: u16,
+    },
 }
 
 pub struct Transaction {
@@ -659,6 +670,28 @@ impl TransactionManager {
                     new_slot,
                 } => {
                     heap.undo_hot_update(*page_id, *old_slot, *new_slot, xid, pool, wal)?;
+                }
+                // Item 71 cross-page HOT update undo: new page first (self-stamp),
+                // then old page (restore chain pointer + clear xmax).
+                UndoAction::HotXpageUpdate {
+                    old_page_id,
+                    old_slot,
+                    new_page_id,
+                    new_slot,
+                    saved_prev_page,
+                    saved_prev_slot,
+                } => {
+                    heap.undo_hot_xpage_update(
+                        *old_page_id,
+                        *old_slot,
+                        *new_page_id,
+                        *new_slot,
+                        *saved_prev_page,
+                        *saved_prev_slot,
+                        xid,
+                        pool,
+                        wal,
+                    )?;
                 }
             }
         }

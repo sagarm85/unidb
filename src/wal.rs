@@ -49,8 +49,8 @@ use crate::{
     format::{
         u16_from_le, u16_to_le, u32_from_le, u32_to_le, u64_from_le, u64_to_le, Lsn, PageId, Xid,
         INVALID_LSN, WAL_ABORT, WAL_BEGIN, WAL_CHECKPOINT, WAL_COMMIT, WAL_DELETE, WAL_FPI,
-        WAL_HOT_UPDATE, WAL_INDEX, WAL_INDEX_INSERT, WAL_INSERT, WAL_TXN_ABORT, WAL_TXN_BEGIN,
-        WAL_TXN_COMMIT, WAL_UPDATE, WAL_VACUUM, WAL_XMAX_BATCH,
+        WAL_HOT_UPDATE, WAL_HOT_XPAGE_HEAD, WAL_INDEX, WAL_INDEX_INSERT, WAL_INSERT, WAL_TXN_ABORT,
+        WAL_TXN_BEGIN, WAL_TXN_COMMIT, WAL_UPDATE, WAL_VACUUM, WAL_XMAX_BATCH,
     },
 };
 
@@ -745,6 +745,63 @@ impl Wal {
             old_slot,
             new_slot,
             "WAL HOT_UPDATE"
+        );
+        Ok(lsn)
+    }
+
+    /// WAL_HOT_XPAGE_HEAD (item 71): the old-page portion of a cross-page HOT
+    /// update — xmax stamp + cross-page forwarding pointer on `old_slot`.
+    ///
+    /// The new version insert on `new_page_id` is logged separately via
+    /// `log_insert` in the same mini-txn.
+    ///
+    /// redo payload (16 B): xid (8 B LE) || old_slot (2 B LE) ||
+    ///   new_page_id (4 B LE) || new_slot (2 B LE)
+    /// undo payload (8 B):  old_slot (2 B LE) || saved_prev_page (4 B LE) ||
+    ///   saved_prev_slot (2 B LE)
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_hot_xpage_head(
+        &self,
+        txn_id: u64,
+        prev_lsn: Lsn,
+        old_page_id: PageId,
+        xid: Xid,
+        old_slot: u16,
+        new_page_id: PageId,
+        new_slot: u16,
+        saved_prev_page: PageId,
+        saved_prev_slot: u16,
+    ) -> Result<Lsn> {
+        // redo: xid || old_slot || new_page_id || new_slot
+        let mut redo = Vec::with_capacity(16);
+        redo.extend_from_slice(&u64_to_le(xid));
+        redo.extend_from_slice(&u16_to_le(old_slot));
+        redo.extend_from_slice(&u32_to_le(new_page_id));
+        redo.extend_from_slice(&u16_to_le(new_slot));
+        // undo: old_slot || saved_prev_page || saved_prev_slot
+        let mut undo = Vec::with_capacity(8);
+        undo.extend_from_slice(&u16_to_le(old_slot));
+        undo.extend_from_slice(&u32_to_le(saved_prev_page));
+        undo.extend_from_slice(&u16_to_le(saved_prev_slot));
+        let mut inner = self.lock();
+        let lsn = append_locked(
+            &mut inner,
+            txn_id,
+            prev_lsn,
+            WAL_HOT_XPAGE_HEAD,
+            old_page_id,
+            old_slot,
+            &redo,
+            &undo,
+        )?;
+        tracing::trace!(
+            mini_txn_id = txn_id,
+            lsn,
+            old_page_id,
+            old_slot,
+            new_page_id,
+            new_slot,
+            "WAL HOT_XPAGE_HEAD"
         );
         Ok(lsn)
     }

@@ -38,7 +38,7 @@ use crate::{
     error::{DbError, Result},
     format::{
         u16_from_le, u16_to_le, u32_from_le, u32_to_le, u64_from_le, u64_to_le, Lsn, PageId, Xid,
-        HOT_NEXT_NONE, INVALID_PAGE_ID,
+        HOT_NEXT_NONE, HOT_NEXT_XPAGE, INVALID_PAGE_ID,
     },
 };
 
@@ -430,6 +430,84 @@ impl SlottedPage {
         self.data[base + TH_HOT_NEXT..base + TH_HOT_NEXT + 2]
             .copy_from_slice(&u16_to_le(next_slot));
         // CRC deferred to set_lsn() — always called last before write_page().
+        Ok(())
+    }
+
+    /// Cross-page HOT forwarding pointer (item 71): overwrite the OLD
+    /// (xmax-stamped) slot's `prev_page`/`prev_slot` fields with the
+    /// cross-page chain target `(xpage_pid, xpage_slot)`, and set
+    /// `hot_next = HOT_NEXT_XPAGE (0xFFFE)`.
+    ///
+    /// **Safety of field reuse**: the old slot is already xmax-stamped
+    /// (superseded). Its `prev_page`/`prev_slot` backward-chain fields are
+    /// never read during forward scans (only the new version's `prev_ptr`
+    /// matters). Repurposing them for the forward chain target avoids any
+    /// tuple-header growth (TUPLE_HEADER_SIZE stays 24 B, no version bump
+    /// to the on-disk row format).
+    ///
+    /// Call after `set_xmax`. CRC is deferred to `set_lsn()` like all
+    /// other header-field mutators.
+    pub fn set_hot_xpage(&mut self, slot: u16, xpage_pid: PageId, xpage_slot: u16) -> Result<()> {
+        let sc = self.slot_count();
+        if slot >= sc {
+            return Err(DbError::SlotOutOfRange {
+                page_id: self.page_id(),
+                slot,
+            });
+        }
+        let (offset, _) = self.read_slot(slot);
+        if offset == 0 {
+            return Err(DbError::TupleDeleted {
+                page_id: self.page_id(),
+                slot,
+            });
+        }
+        let base = offset as usize;
+        // Overwrite prev_page with target page id.
+        self.data[base + TH_PREV_PAGE..base + TH_PREV_PAGE + 4]
+            .copy_from_slice(&u32_to_le(xpage_pid));
+        // Overwrite prev_slot with target slot.
+        self.data[base + TH_PREV_SLOT..base + TH_PREV_SLOT + 2]
+            .copy_from_slice(&u16_to_le(xpage_slot));
+        // Set hot_next = HOT_NEXT_XPAGE (cross-page sentinel).
+        self.data[base + TH_HOT_NEXT..base + TH_HOT_NEXT + 2]
+            .copy_from_slice(&u16_to_le(HOT_NEXT_XPAGE));
+        // CRC deferred to set_lsn() (same pattern as set_hot_next).
+        Ok(())
+    }
+
+    /// Restore `prev_page`/`prev_slot` to their saved values and clear
+    /// `hot_next` back to `HOT_NEXT_NONE` — used by `undo_hot_xpage_update`
+    /// to reverse a cross-page chain pointer set by `set_hot_xpage` (item 71).
+    ///
+    /// CRC deferred to `set_lsn()` — always called last before `write_page`.
+    pub fn restore_prev_and_hot_next(
+        &mut self,
+        slot: u16,
+        saved_prev_page: PageId,
+        saved_prev_slot: u16,
+    ) -> Result<()> {
+        let sc = self.slot_count();
+        if slot >= sc {
+            return Err(DbError::SlotOutOfRange {
+                page_id: self.page_id(),
+                slot,
+            });
+        }
+        let (offset, _) = self.read_slot(slot);
+        if offset == 0 {
+            return Err(DbError::TupleDeleted {
+                page_id: self.page_id(),
+                slot,
+            });
+        }
+        let base = offset as usize;
+        self.data[base + TH_PREV_PAGE..base + TH_PREV_PAGE + 4]
+            .copy_from_slice(&u32_to_le(saved_prev_page));
+        self.data[base + TH_PREV_SLOT..base + TH_PREV_SLOT + 2]
+            .copy_from_slice(&u16_to_le(saved_prev_slot));
+        self.data[base + TH_HOT_NEXT..base + TH_HOT_NEXT + 2]
+            .copy_from_slice(&u16_to_le(HOT_NEXT_NONE));
         Ok(())
     }
 
