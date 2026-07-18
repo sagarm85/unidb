@@ -1795,6 +1795,22 @@ fn sql_crud_update_bulk(engine: &Arc<Engine>, hi: i64) -> (u64, f64) {
     (sql_affected(&res), start.elapsed().as_secs_f64())
 }
 
+/// Non-HOT UPDATE: SET k (indexed column) — B-tree MUST be patched, HOT never fires.
+/// Targets the INSERT-bench rows (k in [lo, hi)) to avoid disturbing the original
+/// pre-build range used by other ops.
+fn sql_crud_update_nonhot(engine: &Arc<Engine>, lo: i64, hi: i64) -> (u64, f64) {
+    let x = engine.begin().unwrap();
+    let start = Instant::now();
+    let res = engine
+        .execute_sql(
+            x,
+            &format!("UPDATE t SET k = k + 1 WHERE k >= {lo} AND k < {hi}"),
+        )
+        .unwrap();
+    engine.commit(x).unwrap();
+    (sql_affected(&res), start.elapsed().as_secs_f64())
+}
+
 fn sql_crud_delete_selected(engine: &Arc<Engine>, lo: i64) -> (u64, f64) {
     let x = engine.begin().unwrap();
     let start = Instant::now();
@@ -1888,6 +1904,19 @@ fn pg_crud_update_bulk(url: &str, hi: i64) -> (u64, f64) {
     let start = Instant::now();
     let n = c
         .execute("UPDATE t SET body = 'updated' WHERE k < $1", &[&hi])
+        .unwrap();
+    (n, start.elapsed().as_secs_f64())
+}
+
+/// Non-HOT UPDATE: SET k (indexed column) — forces full index update on both engines.
+fn pg_crud_update_nonhot(url: &str, lo: i64, hi: i64) -> (u64, f64) {
+    let mut c = pg_dial(url).unwrap();
+    let start = Instant::now();
+    let n = c
+        .execute(
+            "UPDATE t SET k = k + 1 WHERE k >= $1 AND k < $2",
+            &[&lo, &hi],
+        )
         .unwrap();
     (n, start.elapsed().as_secs_f64())
 }
@@ -2843,11 +2872,28 @@ fn bench_mm_report() {
             phased("t3_countall_pg", || pg_crud_count_all(u, 2 * n)),
         );
         crud_row_c1(
-            "UPDATE bulk (k<N/2)",
+            // HOT-eligible: SET body (not indexed) — cross-page HOT fires on full pages
+            // (item 71). B-tree NOT updated. WAL B/row drops vs non-HOT.
+            "UPDATE HOT-eligible (SET body, k<N/2)",
             phased("t3_update_unidb", || {
                 measured_unidb(&se, || sql_crud_update_bulk(&se, half))
             }),
             phased("t3_update_pg", || pg_crud_update_bulk(u, half)),
+        );
+        crud_row_c1(
+            // Non-HOT: SET k (indexed) — B-tree MUST be patched, HOT never fires.
+            // Targets INSERT-bench rows (k in [N, 3N/2)) so it doesn't disturb
+            // the pre-build range used by filtered SELECT / DELETE.
+            // k+1 keeps these rows in range [N+1, 3N/2+1), still caught by DELETE (k>=N).
+            "UPDATE non-HOT (SET k, k>=N AND k<3N/2)",
+            phased("t3_update_nonhot_unidb", || {
+                measured_unidb(&se, || {
+                    sql_crud_update_nonhot(&se, n as i64, n as i64 + half)
+                })
+            }),
+            phased("t3_update_nonhot_pg", || {
+                pg_crud_update_nonhot(u, n as i64, n as i64 + half)
+            }),
         );
         crud_row_c1(
             "DELETE selected (k>=N)",
@@ -2870,7 +2916,8 @@ fn bench_mm_report() {
              | operation | current ratio | ceiling | root cause | revisit when |\n\
              |---|---|---|---|---|\n\
              | SELECT filtered | 0.39× at 5% selectivity (item 59, 2026-07-17) | ~0.40× | **B-tree index path dominates at 5% selectivity** (A3 gate correctly routes after ANALYZE). Item 59 (column pre-binding + COLS_DECODED gate + late materialisation) ships the full-scan path improvements; the B-tree candidate-resolution path now also gets column pre-binding (Fix 2). Remaining gap: PG parallel index scan + lower-overhead candidate resolution. cols/row stable at 4.00 (B-tree path: pred_cols=k + full_cols={{id,k,body}}). SIMD NO-GO (scatter layout, nightly-only API). | Parallel B-tree candidate resolution or HOT (less double-decode on update). |\n\
-             | UPDATE bulk | ~0.04–0.07× | ~0.07–0.09× (with HOT) | B-tree per-row insert (~10–15 µs/row) dominates regardless of WAL batching — proved by item 56 Step 2 (2026-07-17): WAL savings −30% but throughput regressed due to staging pressure. Only HOT (D4 sign-off) changes this. | D4 sign-off granted in PROGRESS.md. |\n\
+             | UPDATE HOT-eligible | 0.07× (item 66 baseline) | ~0.40–0.55× (item 71 cross-page HOT) | Before item 71: full-page fallback did insert-new-version + B-tree patch even when no indexed col in SET. Item 71 (cross-page HOT, 2026-07-18): old slot gets HOT_NEXT_XPAGE sentinel + forwarding pointer; B-tree NOT updated. Fsync bottleneck (Fable analysis) limits further gain without batch mini-txn. | Batch mini-txn (N rows per fsync) for next tier. |\n\
+             | UPDATE non-HOT | new row — baseline TBD | ~0.07× structural | SET k (indexed): B-tree patch always required; no HOT path. Ceiling governed by fsync + B-tree write cost. | batch mini-txn. |\n\
              | INSERT per-row | ~0.54× | ~0.55–0.60× | Per-row fsync floor + PG scale advantages. Step 4 (logical B-tree WAL, 8837→655 B/row) delivered the addressable gain (2026-07-17). | Batch-commit or group-commit mode. |\n\
              | DELETE selected | ~0.07× | ~0.07× | After Step 3 (WAL_XMAX_BATCH), bottleneck is `delete_many` page-write phase, not the scan. Parallel scan tried (item 57, 2026-07-17) — zero improvement at 50% selectivity. Only further WAL compression or HOT changes this. | New WAL record type reducing page-write overhead. |\n"
         );
