@@ -7606,3 +7606,80 @@ New-before-old: acquire new page latch (insert), release, then acquire old page 
 ### Target
 
 UPDATE throughput: **0.07× PG → 0.40–0.55× PG** (6–8× improvement target; Docker bench pending).
+
+---
+
+## Item 74 — Batch mini-txn HOT UPDATE (2026-07-18)
+
+**Branch:** `main` (commit `4dd81ac`) | **Backlog:** `docs/backlog/74_hot_update_batch.md`
+
+### Problem
+
+Item 71 (cross-page HOT chains) eliminated the B-tree patch on HOT UPDATE but kept the per-row mini-txn overhead: 3 mutex acquisitions + 3 WAL record buffer allocations + 3 CRC32 passes per row. At 50k matched rows this is 150k passes through `Mutex<WalInner>`. Measured UPDATE HOT at 100k rows: **0.05× PG** (32,678 rec/s vs 623,769 rec/s) in Docker bench report `20260718_070809`.
+
+### Solution: `Heap::hot_update_many` (Phase B + Phase A)
+
+Mirrors the `update_many` pattern (items 44/56) but with cross-page HOT chain pointer setting:
+
+**Phase B — new versions on fill pages (one mini-txn per fill page):**
+- Pack as many new row versions as fit per page
+- Records `(old_rid, new_rid)` pairs
+
+**Phase A — old pages: xmax + HOT chain (one mini-txn per old-page group):**
+- Groups by `old_rid.page_id`
+- Calls `set_hot_xpage(slot, new_rid.page_id, new_rid.slot)` — sets `prev_page/prev_slot` = new location AND `hot_next = HOT_NEXT_XPAGE (0xFFFE)`
+
+Reduction in mini-txn overhead:
+| | Before (per-row) | After (Phase B+A) |
+|---|---|---|
+| Mutex acquisitions | 150k (3/row × 50k) | ~2k (2 × ~1k page groups) |
+| Vec allocations | 150k | ~2k |
+| CRC32 passes | 150k | ~2k |
+
+**`exec_update` fast path:** Phase 1 (SQL decode+eval, per-row, unchanged), Phase 2 (`hot_update_many`), Phase 3 (undo/SSI/CDC per-pair). Gated by `hot_eligible` (unchanged correctness gate).
+
+### Local bench (Mac M5 Pro, deferred_sync=true, matching Docker bench conditions)
+
+| Rows | Updated | rec/s (item 74) | Pre-item-74 Docker baseline (100k) |
+|-----:|--------:|----------------:|----------------------------------:|
+| 1k   | 500     | ~30k rec/s      | 32,678 rec/s at 100k (item 71)    |
+| 10k  | 5k      | ~81k rec/s      | 32,678 rec/s at 100k (item 71)    |
+
+(10k scales significantly better than 1k — mini-txn overhead reduction grows with batch size. Docker bench at 100k rows is the definitive measurement.)
+
+### Honest ceiling (Fable 5 architectural review, 2026-07-18)
+
+- Remaining per-row costs: `decode_row`, `eval_expr`, `encode_row`, `lock_mgr` write, `record_undo` — structurally required.
+- Conservative ceiling: **0.20–0.40× PG** (not the previously-stated 0.40–0.55×).
+- Non-HOT UPDATE: ~0.07× structural ceiling (B-tree patch overhead dominates).
+- DELETE selected: ~0.07× structural ceiling (page-write phase bottleneck).
+
+### Crash safety (ARIES correct)
+
+Crash between Phase B (committed) and Phase A (uncommitted): new versions have `xmin = uncommitted xid` → invisible via MVCC. Old versions: `xmax = 0`, `hot_next = HOT_NEXT_NONE` → live. Correct.
+
+### Files changed
+
+- `src/heap.rs`: `hot_update_many()` method (Phase B + Phase A)
+- `src/sql/executor.rs`: batch HOT UPDATE fast path between `hot_eligible` gate and per-row loop; `type HotRow` alias (clippy)
+- `tests/crash/main.rs`: P74 test — (a) committed batch survives crash; (b) incomplete txn leaves originals visible
+- `tests/perf_item74.rs`: 4 tests — throughput 1k/10k, chain-resolution, mixed HOT/non-HOT
+- `docs/backlog/74_hot_update_batch.md`: backlog item created
+- `docs/backlog/backlog_index.md`: item 74 registered; next→75_
+
+### Check table
+
+| Check | Result |
+|-------|--------|
+| `cargo build --release` | clean |
+| `cargo clippy -- -D warnings` | clean |
+| `cargo fmt --all` | clean |
+| `cargo test --lib` | **434 passed; 0 failed** |
+| `cargo test --test crash` | **51 passed; 0 failed** (P74 new) |
+| `cargo test --test perf_item74` | **4 passed; 0 failed** |
+| Local bench UPDATE HOT (10k, deferred_sync=true) | **80,749 rec/s** |
+| Docker bench UPDATE HOT improvement | **pending** |
+
+### Target
+
+UPDATE HOT: **0.05× PG → 0.20–0.40× PG** (Docker bench needed for official Table 3 number).
