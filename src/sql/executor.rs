@@ -2446,18 +2446,12 @@ fn exec_update(
     let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
 
-    let matching = matching_rows(&heap, &snapshot, ctx, &table_def, predicate)?;
-    // P1.d: the rows an UPDATE selects are part of its read set (SSI).
-    let read_ids: Vec<RowId> = matching.iter().map(|(rid, _)| *rid).collect();
-    ctx.txn_mgr.ssi_note_reads(ctx.xid, &read_ids);
-
-    // A1: accumulate BTree/FullText index entries across every updated row, then
-    // flush them coalesced after the loop — one WAL_INDEX page image per dirtied
-    // leaf instead of one per row (RC2). Correctness is unchanged: every entry is
-    // still inserted (see `stage_row_index_writes_update`).
-    let mut index_batches = init_index_batches(&table_def);
-    // Item 47: per-secondary-BTree patch batches (unchanged-key in-place RowId patch).
-    let mut patch_batches = init_patch_batches(&table_def);
+    // ── Item 76: early HOT eligibility gate + parallel matching ──────────────
+    // Compute hot_eligible *before* the scan: all four conditions are purely
+    // metadata-derived (table_def + assignments, no I/O).  Moving this up lets
+    // us choose the parallel collection path for HOT-eligible tables instead
+    // of always paying the serial heap.scan() cost.
+    //
     // A4: whether any UNIQUE/PRIMARY KEY set exists at all — computed once, not
     // per row. When there are none, the loop skips both the per-row
     // `snapshot_for_statement` allocation *and* `enforce_unique`'s full-heap
@@ -2509,6 +2503,79 @@ fn exec_update(
         && !has_fk_refs_in_set
         && !has_fk_children
         && !set_touches_indexed_col(assignments, &table_def.columns);
+
+    // Predicate closure for the parallel scan path (same pattern as exec_delete).
+    // Evaluates just predicate-referenced columns; the full row body comes back
+    // separately via scan_page_into inside parallel_collect_matching.
+    let cols_ref = &table_def.columns;
+    let mut pred_col_indices: Vec<usize> = Vec::new();
+    if let Some(pred) = predicate {
+        expr_columns(pred, &table_def, &mut pred_col_indices);
+    }
+    let (pred_needed, pred_upto) = needed_mask(&pred_col_indices, cols_ref.len());
+    let has_pred = predicate.is_some();
+    let pred_closure = |bytes: &[u8]| -> Result<bool> {
+        if has_pred {
+            let prow = deform_row(bytes, cols_ref, pred_upto, &pred_needed)?;
+            Ok(predicate_matches(predicate, cols_ref, &prow)?)
+        } else {
+            Ok(true)
+        }
+    };
+
+    // Collect matching rows.  For HOT-eligible tables we prefer the parallel
+    // full-scan when A3 would not fire and the table is large enough; any path
+    // that goes serial falls back to matching_rows (which handles A3 internally).
+    let matching: MatchedRows = if hot_eligible {
+        let use_a3 = predicate
+            .as_ref()
+            .and_then(|e| {
+                find_best_indexable_btree_predicate(
+                    e,
+                    &table_def,
+                    ctx.catalog.table_stats(&table_def.name),
+                )
+            })
+            .is_some_and(|hit| index_lookup_is_selective(&table_def, hit, ctx, false));
+
+        'collect_hot: {
+            if !use_a3 {
+                let pages = heap.scan_pages(ctx.pool)?;
+                if pages.len() >= crate::sql::parallel_scan::PARALLEL_CANDIDATE_MIN {
+                    if let Some(lease) = crate::sql::parallel_scan::acquire(pages.len()) {
+                        let mut out = crate::sql::parallel_scan::parallel_collect_matching(
+                            &pages,
+                            &ctx.pool.shared_reader(),
+                            &snapshot,
+                            ctx.xid,
+                            lease.degree(),
+                            &pred_closure,
+                        )?;
+                        // hot_update_many requires (page_id, slot) order.
+                        out.sort_unstable_by_key(|(rid, _)| (rid.page_id, rid.slot));
+                        break 'collect_hot out;
+                    }
+                }
+            }
+            // Serial fallback: A3 index path, table too small, or no lease.
+            matching_rows(&heap, &snapshot, ctx, &table_def, predicate)?
+        }
+    } else {
+        matching_rows(&heap, &snapshot, ctx, &table_def, predicate)?
+    };
+
+    // P1.d: the rows an UPDATE selects are part of its read set (SSI).
+    let read_ids: Vec<RowId> = matching.iter().map(|(rid, _)| *rid).collect();
+    ctx.txn_mgr.ssi_note_reads(ctx.xid, &read_ids);
+
+    // A1: accumulate BTree/FullText index entries across every updated row, then
+    // flush them coalesced after the loop — one WAL_INDEX page image per dirtied
+    // leaf instead of one per row (RC2). Correctness is unchanged: every entry is
+    // still inserted (see `stage_row_index_writes_update`).
+    let mut index_batches = init_index_batches(&table_def);
+    // Item 47: per-secondary-BTree patch batches (unchanged-key in-place RowId patch).
+    let mut patch_batches = init_patch_batches(&table_def);
+    // hot_eligible / has_unique / has_fk_* are already computed above.
 
     // Item 74: two-phase batch HOT UPDATE.
     //
@@ -2879,11 +2946,10 @@ fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Resu
         // P1.d: SSI read set.
         ctx.txn_mgr.ssi_note_reads(ctx.xid, &row_ids);
 
-        let deleted =
-            match heap.delete_many(&row_ids, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr) {
-                Err(e @ DbError::WriteConflict { .. }) => return Err(classify_conflict(e, ctx)),
-                other => other?,
-            };
+        let deleted = match heap.delete_many(&row_ids, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr) {
+            Err(e @ DbError::WriteConflict { .. }) => return Err(classify_conflict(e, ctx)),
+            other => other?,
+        };
         for rid in &deleted {
             ctx.txn_mgr.ssi_note_write(ctx.xid, *rid);
             ctx.txn_mgr.record_undo(

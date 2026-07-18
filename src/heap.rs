@@ -178,17 +178,22 @@ impl Heap {
         };
         let dir = tree.page_directory(reader)?; // FSM lock NOT held across tree I/O
         let mut fsm = self.lock_fsm();
-        for (pid, free) in dir {
-            if !fsm.pages.contains(&pid) {
+        // Collect into a temporary set for O(1) dedup instead of the old
+        // O(n²) `Vec::contains` scan on each entry.
+        let existing: std::collections::HashSet<PageId> = fsm.pages.iter().copied().collect();
+        for (pid, _free) in dir {
+            // Do NOT warm free_map from the B-tree value. The durable FSM only
+            // records each page's *initial* free space at alloc time (8152 bytes
+            // for a fresh 8 KiB page) and is never updated as rows are inserted.
+            // Inserting the stale 8152 value causes find_or_alloc_page step 1 to
+            // treat every page as "has space", triggering O(n) cold probe fetches
+            // before discovering all pages are packed — the superlinear UPDATE/
+            // DELETE bottleneck identified in item 77.  We only need the page-ID
+            // list here; step 2 (newest-first, capped probe) will measure actual
+            // free space on demand.
+            if !existing.contains(&pid) {
                 fsm.pages.push(pid);
             }
-            // Warm the free map from the durable FSM value (B2) — so a reopened
-            // heap knows each page's free space without re-fetching it. Do NOT
-            // clobber a fresher in-memory value recorded this session (the tree
-            // value is only refreshed at alloc + vacuum, so it can be stale-high
-            // for a page filled since; a stale-high hint is corrected by the
-            // insert retry loop, never an over-allocation).
-            fsm.free_map.entry(pid).or_insert(free);
         }
         fsm.pages.sort_unstable();
         fsm.directory_loaded = true;
@@ -963,6 +968,7 @@ impl Heap {
         // ── Phase B: insert new versions on fill pages ──────────────────────
         // One mini-txn per fill page; pack as many rows as fit. Mirrors
         // `update_many` Phase B exactly (new-before-old latch order).
+
         let mut b_pairs: Vec<(RowId, RowId)> = Vec::with_capacity(rows.len());
         let mut i = 0;
         while i < rows.len() {
@@ -1006,7 +1012,6 @@ impl Heap {
             self.note_free_space(fill_pid, free);
             wal.commit_mini_txn(txn_id, last_lsn)?;
         }
-
         // ── Phase A: xmax + HOT_NEXT_XPAGE on old pages ────────────────────
         // Group by old_rid.page_id (input already page-sorted). For each
         // group: one mini-txn, one FPI check, N×WAL_HOT_XPAGE_HEAD records.
@@ -1080,7 +1085,6 @@ impl Heap {
 
             j = k;
         }
-
         Ok(result)
     }
 
@@ -1397,7 +1401,12 @@ impl Heap {
         //    the list of pages still needing a probe.
         let unknown: Vec<PageId> = {
             let fsm = self.lock_fsm();
-            for &pid in &fsm.pages {
+            // Item 78b: scan newest→oldest (reverse).  Fill pages are always
+            // appended at the end of `fsm.pages` (largest page_id), so the
+            // hot-fill page is the last entry.  The forward scan was O(N)
+            // because it walked past all the packed older pages first.
+            // Reversing converts the common case to O(1).
+            for &pid in fsm.pages.iter().rev() {
                 if fsm.free_map.get(&pid).is_some_and(|&free| free >= needed) {
                     return Ok(pid);
                 }
@@ -1412,14 +1421,21 @@ impl Heap {
                 .copied()
                 .collect()
         };
-        // 2. Probe unknown pages with the FSM lock NOT held; cache each result.
-        for pid in unknown {
-            let page = pool.fetch_page_for_write(pid, wal)?;
+        // 2. Probe at most one unknown page (newest first): after the
+        // ensure_directory fix (item 77) the page list is fully populated but
+        // free_map is empty, so `unknown` is the entire heap.  Probing all of
+        // it would be O(n) cold fetches.  We only probe the single newest page
+        // because (a) insert-append locality means the tail is the only one
+        // that could have slack, and (b) step 2b below covers the tail via an
+        // O(log n) B-tree descent for the common case where even the tail is
+        // already in-memory from a prior iteration's note_free_space.
+        if let Some(&newest) = unknown.first() {
+            let page = pool.fetch_page_for_write(newest, wal)?;
             let free = page.free_space();
-            pool.unpin(pid);
-            self.note_free_space(pid, free);
+            pool.unpin(newest);
+            self.note_free_space(newest, free);
             if free >= needed {
-                return Ok(pid);
+                return Ok(newest);
             }
         }
         // 2b. FSM-backed heap: the in-memory `pages` above holds only pages
@@ -1439,7 +1455,10 @@ impl Heap {
                     pool.unpin(tail);
                     {
                         let mut fsm = self.lock_fsm();
-                        if !fsm.pages.contains(&tail) {
+                        // `pages` is kept sorted; `tail` is the B-tree maximum
+                        // so it belongs at the end.  O(1) dedup: check only the
+                        // last element rather than scanning the whole Vec.
+                        if fsm.pages.last() != Some(&tail) {
                             fsm.pages.push(tail);
                         }
                         fsm.free_map.insert(tail, free);

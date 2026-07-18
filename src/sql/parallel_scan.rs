@@ -765,16 +765,17 @@ where
                 }
                 // scan_page_visit provides &[u8] slices — no per-row Vec<u8>
                 // allocation.  We push only the RowId for matching rows.
-                let result = scan_page_visit(&reader, pages[i], &snapshot, self_xid, |rid, bytes| {
-                    match matches(bytes) {
-                        Ok(true) => {
-                            local.push(rid);
-                            Ok(())
+                let result =
+                    scan_page_visit(&reader, pages[i], &snapshot, self_xid, |rid, bytes| {
+                        match matches(bytes) {
+                            Ok(true) => {
+                                local.push(rid);
+                                Ok(())
+                            }
+                            Ok(false) => Ok(()),
+                            Err(e) => Err(e),
                         }
-                        Ok(false) => Ok(()),
-                        Err(e) => Err(e),
-                    }
-                });
+                    });
                 if let Err(e) = result {
                     *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
                     stop.store(true, Ordering::Relaxed);

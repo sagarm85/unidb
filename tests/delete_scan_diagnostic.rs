@@ -41,7 +41,8 @@ fn build_base_table(e: &Engine, rows: u64) {
     .unwrap();
     e.commit(x).unwrap();
     let x = e.begin().unwrap();
-    e.execute_sql(x, "CREATE INDEX ON t USING BTREE (k)").unwrap();
+    e.execute_sql(x, "CREATE INDEX ON t USING BTREE (k)")
+        .unwrap();
     e.commit(x).unwrap();
 
     const BATCH: u64 = 500;
@@ -126,7 +127,7 @@ fn delete_scenario_a_stale_stats() {
     build_base_table(&e, ROWS);
     analyze(&e); // ANALYZE at ROWS rows — k_max < ROWS
     insert_extra_rows(&e, ROWS, INSERT_EXTRA); // add rows k in [ROWS, 2*ROWS)
-    // No second ANALYZE — stats are stale; DELETE k >= ROWS looks ~0% selective.
+                                               // No second ANALYZE — stats are stale; DELETE k >= ROWS looks ~0% selective.
 
     let threshold = ROWS as i64;
     let (count, elapsed) = run_delete(&e, threshold);
@@ -167,7 +168,10 @@ fn delete_scenario_b_fresh_stats() {
         elapsed.as_secs_f64(),
         rec_s
     );
-    assert_eq!(count, INSERT_EXTRA as usize, "should delete exactly the extra rows");
+    assert_eq!(
+        count, INSERT_EXTRA as usize,
+        "should delete exactly the extra rows"
+    );
 }
 
 /// Scenario C: full-table DELETE (no predicate) → fast-path truncate.
