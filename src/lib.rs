@@ -610,6 +610,12 @@ pub struct Engine {
     /// `Engine::open()` handle; present after `spawn_stats_ticker` is called
     /// on an `Arc<Engine>` (server path only — mirrors `autovacuum_handle`).
     stats_ticker_handle: Mutex<Option<crate::stats_ticker::StatsTickerHandle>>,
+    /// Per-index L0 neighbour-list cache for NEAR queries (item 72).
+    /// Keyed by HNSW meta_page.  Populated lazily during beam search; invalidated
+    /// (cleared) when `hdr.total_nodes` changes — i.e. on any HNSW insert.
+    /// `Mutex` rather than `RwLock`: even the read path populates new entries.
+    hnsw_l0_caches:
+        Mutex<std::collections::HashMap<crate::format::PageId, crate::hnsw_index::HnswL0Cache>>,
 }
 
 /// One slow-query-log entry (P6.g).
@@ -1105,6 +1111,7 @@ impl Engine {
             timeline: crate::backup::timeline::TimelineIndex::open(dir)?,
             stats_history: Mutex::new(std::collections::VecDeque::new()),
             stats_ticker_handle: Mutex::new(None),
+            hnsw_l0_caches: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -1765,6 +1772,7 @@ impl Engine {
                 xid,
                 next_event_seq: &self.next_event_seq,
                 event_seq_index_meta: Some(self.event_seq_index_meta),
+                hnsw_l0_caches: Some(&self.hnsw_l0_caches),
             };
             executor::execute(plan, &mut ctx)
         } else {
@@ -1781,6 +1789,7 @@ impl Engine {
                 xid,
                 next_event_seq: &self.next_event_seq,
                 event_seq_index_meta: Some(self.event_seq_index_meta),
+                hnsw_l0_caches: Some(&self.hnsw_l0_caches),
             };
             executor::execute(plan, &mut ctx)
         }
@@ -1864,6 +1873,7 @@ impl Engine {
             xid,
             next_event_seq: &self.next_event_seq,
             event_seq_index_meta: Some(self.event_seq_index_meta),
+            hnsw_l0_caches: Some(&self.hnsw_l0_caches),
         };
         let result = graph_executor::execute(parsed, &mut ctx, self.edge_index_meta)?;
         Ok(vec![result])

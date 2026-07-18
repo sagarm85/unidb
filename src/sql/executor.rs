@@ -32,7 +32,7 @@ use crate::{
     error::{DbError, Result},
     format::{PageId, Xid},
     heap::{get_visible, Heap, RowId},
-    hnsw_index::{DiskHnswIndex, HNSW_EF_SEARCH},
+    hnsw_index::{DiskHnswIndex, HnswL0Cache, HNSW_EF_SEARCH},
     lockmgr::{LockManager, RecordId},
     mvcc::Snapshot,
     queue::{self, EVENTS_TABLE},
@@ -600,7 +600,7 @@ fn check_restrict_child(
 }
 
 use super::datetime;
-use super::logical::{CmpOp, Expr, Literal, LogicalPlan};
+use super::logical::{ArithOp, CmpOp, Expr, Literal, LogicalPlan};
 
 /// Measurement-only (Phase A C1): total number of `decode_row` calls since
 /// process start. Every full-row decode (a heap scan materializing a row into
@@ -712,6 +712,12 @@ pub struct ExecCtx<'a> {
     /// engine (the tests don't exercise event capture, so the index is never
     /// needed there).
     pub event_seq_index_meta: Option<crate::format::PageId>,
+    /// Per-index L0 neighbour-list cache for NEAR queries (item 72).
+    /// `Some` on a fully-opened Engine; `None` in unit tests that build bare
+    /// `ExecCtx` structs (those tests don't exercise NEAR queries).
+    pub hnsw_l0_caches: Option<
+        &'a Mutex<std::collections::HashMap<crate::format::PageId, HnswL0Cache>>,
+    >,
 }
 
 /// Insert `row`'s durable-index column values into their on-disk structures
@@ -2262,7 +2268,37 @@ fn exec_select_near(
     let hnsw = DiskHnswIndex::open(meta_page, ctx.page_size);
     // Use max(k * 4, HNSW_EF_SEARCH) so small k doesn't under-probe.
     let ef = (k * 4).max(HNSW_EF_SEARCH);
-    let (metric, candidate_ids) = hnsw.candidates(query, Some(ef), ctx.pool)?;
+
+    // Item 72: process-lifetime L0 cache — snapshot-then-merge pattern.
+    //   1. Lock, clone (or create fresh) the per-index cache entry, release lock.
+    //   2. Run beam search against the local clone (no lock held during page I/O).
+    //   3. Re-lock, merge new entries back; stale-generation detection clears stale data.
+    let (metric, candidate_ids) = if let Some(caches_mu) = ctx.hnsw_l0_caches {
+        // Step 1: snapshot
+        let mut local = {
+            let guard = caches_mu.lock().unwrap();
+            guard
+                .get(&meta_page)
+                .cloned()
+                .unwrap_or_else(HnswL0Cache::new)
+        };
+
+        // Step 2: beam search (candidates_cached updates local.generation + populates)
+        let result = hnsw.candidates_cached(query, Some(ef), ctx.pool, Some(&mut local))?;
+
+        // Step 3: merge back into global cache
+        {
+            let mut guard = caches_mu.lock().unwrap();
+            let entry = guard
+                .entry(meta_page)
+                .or_insert_with(HnswL0Cache::new);
+            entry.merge_from(local);
+        }
+
+        result
+    } else {
+        hnsw.candidates(query, Some(ef), ctx.pool)?
+    };
 
     let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
@@ -3763,6 +3799,77 @@ pub(crate) fn predicate_matches(
     }
 }
 
+/// Evaluate an arithmetic binary expression. Supports `Int op Int → Int`,
+/// `Float op Float → Float`, and mixed `Int`/`Float` (coerced to `Float`).
+/// Division and modulo by zero return an error rather than panicking.
+fn eval_arith(op: ArithOp, l: Literal, r: Literal) -> Result<Literal> {
+    // Coerce to a common numeric type: Int × Int stays Int; anything touching
+    // Float becomes Float.
+    match (l, r) {
+        (Literal::Int(a), Literal::Int(b)) => {
+            let v = match op {
+                ArithOp::Add => a.checked_add(b).ok_or_else(|| {
+                    DbError::SqlPlan(format!("integer overflow: {a} + {b}"))
+                })?,
+                ArithOp::Sub => a.checked_sub(b).ok_or_else(|| {
+                    DbError::SqlPlan(format!("integer overflow: {a} - {b}"))
+                })?,
+                ArithOp::Mul => a.checked_mul(b).ok_or_else(|| {
+                    DbError::SqlPlan(format!("integer overflow: {a} * {b}"))
+                })?,
+                ArithOp::Div => {
+                    if b == 0 {
+                        return Err(DbError::SqlPlan("division by zero".into()));
+                    }
+                    a / b
+                }
+                ArithOp::Mod => {
+                    if b == 0 {
+                        return Err(DbError::SqlPlan("modulo by zero".into()));
+                    }
+                    a % b
+                }
+            };
+            Ok(Literal::Int(v))
+        }
+        (lv, rv) => {
+            // Promote to f64 for any float operand (or non-integer types).
+            let a = lit_to_f64(&lv)?;
+            let b = lit_to_f64(&rv)?;
+            let v = match op {
+                ArithOp::Add => a + b,
+                ArithOp::Sub => a - b,
+                ArithOp::Mul => a * b,
+                ArithOp::Div => {
+                    if b == 0.0 {
+                        return Err(DbError::SqlPlan("division by zero".into()));
+                    }
+                    a / b
+                }
+                ArithOp::Mod => {
+                    if b == 0.0 {
+                        return Err(DbError::SqlPlan("modulo by zero".into()));
+                    }
+                    a % b
+                }
+            };
+            Ok(Literal::Float(v))
+        }
+    }
+}
+
+/// Coerce a literal to `f64` for mixed-type arithmetic.
+fn lit_to_f64(lit: &Literal) -> Result<f64> {
+    match lit {
+        Literal::Int(n) => Ok(*n as f64),
+        Literal::Float(f) => Ok(*f),
+        Literal::Decimal(u, s) => Ok(*u as f64 / 10f64.powi(*s as i32)),
+        other => Err(DbError::SqlPlan(format!(
+            "arithmetic requires a numeric operand, got {other:?}"
+        ))),
+    }
+}
+
 pub(crate) fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Literal]) -> Result<Literal> {
     match expr {
         Expr::Column(name) => {
@@ -3785,6 +3892,11 @@ pub(crate) fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Literal]) -> 
             let l = eval_expr(lhs, columns, row)?;
             let r = eval_expr(rhs, columns, row)?;
             Ok(Literal::Bool(compare(*op, &l, &r)?))
+        }
+        Expr::Arith { op, lhs, rhs } => {
+            let l = eval_expr(lhs, columns, row)?;
+            let r = eval_expr(rhs, columns, row)?;
+            eval_arith(*op, l, r)
         }
         Expr::And(lhs, rhs) => {
             let l = as_bool(&eval_expr(lhs, columns, row)?)?;
@@ -4177,7 +4289,7 @@ fn expr_columns(expr: &Expr, table_def: &TableDef, out: &mut Vec<usize>) {
         // ColumnSlot already carries the resolved index — no lookup needed.
         Expr::ColumnSlot(idx) => out.push(*idx),
         Expr::Literal(_) => {}
-        Expr::BinOp { lhs, rhs, .. } => {
+        Expr::BinOp { lhs, rhs, .. } | Expr::Arith { lhs, rhs, .. } => {
             expr_columns(lhs, table_def, out);
             expr_columns(rhs, table_def, out);
         }
@@ -4218,7 +4330,7 @@ fn bind_predicate_columns(expr: &mut Expr, columns: &[ColumnDef]) {
             }
         }
         Expr::ColumnSlot(_) | Expr::Literal(_) => {}
-        Expr::BinOp { lhs, rhs, .. } => {
+        Expr::BinOp { lhs, rhs, .. } | Expr::Arith { lhs, rhs, .. } => {
             bind_predicate_columns(lhs, columns);
             bind_predicate_columns(rhs, columns);
         }
@@ -4709,6 +4821,7 @@ mod tests {
                 xid,
                 next_event_seq: &self.next_event_seq,
                 event_seq_index_meta: None,
+                hnsw_l0_caches: None,
             };
             execute(plan, &mut ctx)
         }
@@ -5709,6 +5822,219 @@ mod tests {
         assert!(ids_at(&mut h, 25).is_empty(), "old key must be gone");
         assert_eq!(ids_at(&mut h, 999), vec![25], "row resolves at its new key");
         assert_eq!(ids_at(&mut h, 24), vec![24], "neighbor row untouched");
+    }
+
+    /// Range UPDATE on a BTree-indexed column at bench-like scale (10k rows):
+    /// reproduces the Table 3 "UPDATE non-HOT" bench scenario to verify no panic
+    /// or correctness regression at scale.  `k` changes (indexed column) so no
+    /// Arithmetic UPDATE on a BTree-indexed column at small scale (100 rows) —
+    /// validates that the index is correctly maintained for every row in the range.
+    #[test]
+    fn update_set_arith_with_btree_index() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, k INT)").unwrap();
+        h.exec_as(xid, "CREATE INDEX t_k ON t USING BTREE (k)").unwrap();
+        h.commit(xid);
+
+        // Insert 100 rows: k=0..99
+        let xid = h.begin();
+        for i in 0i64..100 {
+            h.exec_as(xid, &format!("INSERT INTO t (id, k) VALUES ({i}, {i})"))
+                .unwrap();
+        }
+        h.commit(xid);
+
+        // UPDATE k = k + 1 WHERE k >= 50 AND k < 75 (25 rows)
+        let xid = h.begin();
+        let n = match h
+            .exec_as(xid, "UPDATE t SET k = k + 1 WHERE k >= 50 AND k < 75")
+            .unwrap()
+        {
+            ExecResult::Updated { count } => count,
+            o => panic!("expected Updated, got {o:?}"),
+        };
+        h.commit(xid);
+        assert_eq!(n, 25, "25 rows updated");
+
+        // After SET k = k+1 WHERE k ∈ [50, 75): range shifts to [51, 76).
+        // The floor (k=50) loses its row because no k=49 contributes a k+1=50.
+        let xid = h.begin();
+        let r = match h.exec_as(xid, "SELECT id FROM t WHERE k = 50").unwrap() {
+            ExecResult::Rows { rows, .. } => rows.len(),
+            o => panic!("{o:?}"),
+        };
+        h.commit(xid);
+        assert_eq!(r, 0, "k=50 must be gone (moved to 51; no k=49 contributes)");
+
+        // k=74: original (74→75) moved out; new row from k=73→74 moved in → 1 row.
+        let xid = h.begin();
+        let r = match h.exec_as(xid, "SELECT id FROM t WHERE k = 74").unwrap() {
+            ExecResult::Rows { rows, .. } => rows.len(),
+            o => panic!("{o:?}"),
+        };
+        h.commit(xid);
+        assert_eq!(r, 1, "k=74: filled by updated k=73→74 row");
+
+        // k=49 (below range) must be unchanged (1 row).
+        let xid = h.begin();
+        let r49 = match h.exec_as(xid, "SELECT id FROM t WHERE k = 49").unwrap() {
+            ExecResult::Rows { rows, .. } => rows.len(),
+            o => panic!("{o:?}"),
+        };
+        // k=75 has 2 rows: original (k=75, not in range) + updated (k=74→75)
+        let r75 = match h.exec_as(xid, "SELECT id FROM t WHERE k = 75").unwrap() {
+            ExecResult::Rows { rows, .. } => rows.len(),
+            o => panic!("{o:?}"),
+        };
+        h.commit(xid);
+        assert_eq!(r49, 1, "k=49 (not in range) must be unchanged");
+        assert_eq!(r75, 2, "k=75: original row + updated row (k=74→75)");
+    }
+
+    /// Minimal smoke test for arithmetic in UPDATE SET: `SET k = k + 1` on a
+    /// small table. Verifies the value was changed and old value is gone.
+    #[test]
+    fn update_set_arith_basic() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, k INT)").unwrap();
+        h.commit(xid);
+
+        // Insert 5 rows: id=0..4, k=10..14
+        let xid = h.begin();
+        for i in 0i64..5 {
+            h.exec_as(xid, &format!("INSERT INTO t (id, k) VALUES ({i}, {})", 10 + i))
+                .unwrap();
+        }
+        h.commit(xid);
+
+        // UPDATE SET k = k + 1 WHERE k = 12 (one row)
+        let xid = h.begin();
+        let n = match h.exec_as(xid, "UPDATE t SET k = k + 1 WHERE k = 12").unwrap() {
+            ExecResult::Updated { count } => count,
+            o => panic!("expected Updated, got {o:?}"),
+        };
+        h.commit(xid);
+        assert_eq!(n, 1, "one row updated");
+
+        // k=12 must be gone, k=13 must have 2 rows (original + updated)
+        let xid = h.begin();
+        let r12 = match h.exec_as(xid, "SELECT id FROM t WHERE k = 12").unwrap() {
+            ExecResult::Rows { rows, .. } => rows.len(),
+            o => panic!("{o:?}"),
+        };
+        let r13 = match h.exec_as(xid, "SELECT id FROM t WHERE k = 13").unwrap() {
+            ExecResult::Rows { rows, .. } => rows.len(),
+            o => panic!("{o:?}"),
+        };
+        h.commit(xid);
+        assert_eq!(r12, 0, "k=12 must be gone (updated to 13)");
+        assert_eq!(r13, 2, "k=13: original row (id=3,k=13) + updated row (id=2,k=12→13)");
+    }
+
+    /// HOT path fires; B-tree must be patched for each new row version.
+    #[test]
+    fn update_nonhot_indexed_col_range_at_scale() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, k INT, body TEXT)")
+            .unwrap();
+        h.exec_as(xid, "CREATE INDEX t_k ON t USING BTREE (k)")
+            .unwrap();
+        h.commit(xid);
+
+        // Pre-build 5k rows (k=[0,4999]) — matches bench's base table
+        let mut xid = h.begin();
+        for i in 0i64..5000 {
+            h.exec_as(xid, &format!("INSERT INTO t (id,k,body) VALUES ({i},{i},'b{i}')"))
+                .unwrap();
+            if (i + 1) % 500 == 0 {
+                h.commit(xid);
+                xid = h.begin();
+            }
+        }
+        h.commit(xid);
+
+        // INSERT-bench 5k rows (k=[5000,9999])
+        let mut xid = h.begin();
+        for i in 5000i64..10000 {
+            h.exec_as(xid, &format!("INSERT INTO t (id,k,body) VALUES ({i},{i},'b{i}')"))
+                .unwrap();
+            if (i + 1) % 500 == 0 {
+                h.commit(xid);
+                xid = h.begin();
+            }
+        }
+        h.commit(xid);
+
+        // UPDATE non-HOT: SET k = k + 1 WHERE k >= 5000 AND k < 7500 (50% of INSERT rows)
+        let xid = h.begin();
+        let n = match h
+            .exec_as(xid, "UPDATE t SET k = k + 1 WHERE k >= 5000 AND k < 7500")
+            .unwrap()
+        {
+            ExecResult::Updated { count } => count,
+            o => panic!("expected Updated, got {o:?}"),
+        };
+        h.commit(xid);
+        assert_eq!(n, 2500, "2500 rows in [5000,7500) updated");
+
+        // After SET k = k+1 WHERE k ∈ [5000, 7500): rows shift from [5000,7500)
+        // to [5001,7501). Verify the floor boundary and out-of-range rows.
+        //
+        // k=5000: was updated to k=5001. No row contributes a new k=5000 (k=4999
+        // is below the range). Must be 0 rows.
+        let xid = h.begin();
+        let rows_at_k5000 = match h
+            .exec_as(xid, "SELECT id FROM t WHERE k = 5000")
+            .unwrap()
+        {
+            ExecResult::Rows { rows, .. } => rows.len(),
+            o => panic!("{o:?}"),
+        };
+        h.commit(xid);
+        assert_eq!(rows_at_k5000, 0, "k=5000 must be gone (shifted to 5001)");
+
+        // k=7499: original (7499→7500) moved out; new row from k=7498→7499
+        // moved in → 1 row.
+        let xid = h.begin();
+        let rows_at_k7499 = match h
+            .exec_as(xid, "SELECT id FROM t WHERE k = 7499")
+            .unwrap()
+        {
+            ExecResult::Rows { rows, .. } => rows.len(),
+            o => panic!("{o:?}"),
+        };
+        h.commit(xid);
+        assert_eq!(rows_at_k7499, 1, "k=7499: filled by updated k=7498→7499 row");
+
+        // k=4999: pre-build row, outside WHERE range — must be unchanged (1 row).
+        let xid = h.begin();
+        let rows_at_k4999 = match h
+            .exec_as(xid, "SELECT id FROM t WHERE k = 4999")
+            .unwrap()
+        {
+            ExecResult::Rows { rows, .. } => rows.len(),
+            o => panic!("{o:?}"),
+        };
+        h.commit(xid);
+        assert_eq!(rows_at_k4999, 1, "k=4999 (pre-build, not updated) must still exist");
+
+        // k=7501: INSERT-bench row above the WHERE range — must be unchanged (1 row).
+        let xid = h.begin();
+        let rows_at_k7501 = match h
+            .exec_as(xid, "SELECT id FROM t WHERE k = 7501")
+            .unwrap()
+        {
+            ExecResult::Rows { rows, .. } => rows.len(),
+            o => panic!("{o:?}"),
+        };
+        h.commit(xid);
+        assert_eq!(rows_at_k7501, 1, "k=7501 (not in WHERE range) must be unchanged");
     }
 
     /// An equality DELETE on a BTree-indexed column goes through the A3 index

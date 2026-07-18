@@ -21,7 +21,7 @@ use crate::{
     error::{DbError, Result},
 };
 
-use super::logical::{CmpOp, Expr, Literal, LogicalPlan};
+use super::logical::{ArithOp, CmpOp, Expr, Literal, LogicalPlan};
 use super::query::{AggFunc, FromNode, JoinType, OrderKey, Projection, QExpr, QuerySpec, TableRef};
 
 /// Parse a SQL string (possibly multiple `;`-separated statements) into
@@ -1536,6 +1536,33 @@ fn convert_binary_op(left: &SqlExpr, op: &BinaryOperator, right: &SqlExpr) -> Re
         BinaryOperator::Or => Err(DbError::SqlUnsupported(
             "OR is not supported in M1's WHERE subset (AND-only predicates)".into(),
         )),
+        // Arithmetic operators — used primarily in UPDATE SET clauses
+        // (e.g. `SET k = k + 1`) and valid anywhere `eval_expr` runs.
+        BinaryOperator::Plus => Ok(Expr::Arith {
+            op: ArithOp::Add,
+            lhs,
+            rhs,
+        }),
+        BinaryOperator::Minus => Ok(Expr::Arith {
+            op: ArithOp::Sub,
+            lhs,
+            rhs,
+        }),
+        BinaryOperator::Multiply => Ok(Expr::Arith {
+            op: ArithOp::Mul,
+            lhs,
+            rhs,
+        }),
+        BinaryOperator::Divide => Ok(Expr::Arith {
+            op: ArithOp::Div,
+            lhs,
+            rhs,
+        }),
+        BinaryOperator::Modulo => Ok(Expr::Arith {
+            op: ArithOp::Mod,
+            lhs,
+            rhs,
+        }),
         other => Err(DbError::SqlUnsupported(format!(
             "unsupported operator: {other}"
         ))),

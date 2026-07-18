@@ -118,7 +118,7 @@ fn bind_literal(lit: &mut Literal, params: &[Literal]) -> Result<()> {
 fn bind_expr(expr: &mut Expr, params: &[Literal]) -> Result<()> {
     match expr {
         Expr::Literal(lit) => bind_literal(lit, params),
-        Expr::BinOp { lhs, rhs, .. } | Expr::And(lhs, rhs) => {
+        Expr::BinOp { lhs, rhs, .. } | Expr::And(lhs, rhs) | Expr::Arith { lhs, rhs, .. } => {
             bind_expr(lhs, params)?;
             bind_expr(rhs, params)
         }
@@ -165,6 +165,18 @@ pub enum CmpOp {
     Ge,
 }
 
+/// Arithmetic operator for [`Expr::Arith`]. Used in UPDATE SET clauses
+/// (`SET k = k + 1`) and any other expression context that needs integer or
+/// floating-point arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Expr {
     Column(String),
@@ -177,6 +189,16 @@ pub enum Expr {
     Literal(Literal),
     BinOp {
         op: CmpOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+    /// Arithmetic binary expression: `lhs op rhs` where `op` is `+`, `-`,
+    /// `*`, `/`, or `%`. Primarily produced for UPDATE SET clauses
+    /// (`SET k = k + 1`) and valid anywhere [`eval_expr`] runs. The result
+    /// type matches the operands: `Int op Int → Int`, `Float op Float → Float`,
+    /// mixed `Int`/`Float` coerce to `Float`.
+    Arith {
+        op: ArithOp,
         lhs: Box<Expr>,
         rhs: Box<Expr>,
     },

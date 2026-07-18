@@ -490,6 +490,93 @@ impl Ord for DistRid {
 /// the graph may have changed and stale cached neighbours would be incorrect.
 type NodeCache = HashMap<i64, HnswNode>;
 
+// ── L0 query cache (item 72) ─────────────────────────────────────────────────
+
+/// Default size cap for the per-index L0 query cache (256 MiB).
+const DEFAULT_L0_CACHE_BYTES: usize = 256 * 1024 * 1024;
+
+/// Read `HNSW_L0_CACHE_MB` env var. Returns `DEFAULT_L0_CACHE_BYTES` on miss.
+fn l0_cache_max_bytes() -> usize {
+    std::env::var("HNSW_L0_CACHE_MB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(DEFAULT_L0_CACHE_BYTES)
+}
+
+/// Process-lifetime in-memory cache of L0 neighbour lists for NEAR queries.
+///
+/// Lives behind `Mutex<HashMap<PageId, HnswL0Cache>>` on `Engine`, one entry per
+/// HNSW index (keyed by meta_page). Populated lazily during beam search; stale
+/// when `generation` no longer matches `hdr.total_nodes` (any HNSW insert bumps
+/// `total_nodes`, which also rewrites some L0 neighbour lists via reciprocal edges).
+///
+/// Memory: 32 neighbours × 6 bytes/RowId = 192 bytes/node.
+/// At 256 MiB default cap → ~1.4 M nodes; graceful disk fallback above the cap.
+///
+/// Snapshot pattern (see `exec_select_near`):
+///   1. Lock, clone this entry, release lock.
+///   2. Run beam search against the clone (no lock held during I/O).
+///   3. Re-lock, call `merge_from(clone)` — merges new entries if generation
+///      still matches; clears and restarts if an insert raced with us.
+#[derive(Clone)]
+pub struct HnswL0Cache {
+    /// L0 neighbour lists.  Key = `encode_rid(heap_rid)`.
+    pub neighbours: HashMap<i64, Vec<RowId>>,
+    /// Approximate payload size in bytes (neighbour payload only).
+    pub size_bytes: usize,
+    /// Max bytes before new entries are silently dropped (graceful fallback).
+    pub max_bytes: usize,
+    /// `hdr.total_nodes` at the time this cache was last validated.
+    /// Inserts bump `total_nodes` → cache becomes stale.
+    pub generation: u64,
+}
+
+impl HnswL0Cache {
+    pub fn new() -> Self {
+        Self {
+            neighbours: HashMap::new(),
+            size_bytes: 0,
+            max_bytes: l0_cache_max_bytes(),
+            generation: 0,
+        }
+    }
+
+    /// Record one node's L0 neighbour list.  No-op if already cached or over cap.
+    pub fn insert_neighbours(&mut self, key: i64, nbrs: Vec<RowId>) {
+        if self.neighbours.contains_key(&key) {
+            return;
+        }
+        let entry_bytes = nbrs.len() * std::mem::size_of::<RowId>();
+        if self.size_bytes + entry_bytes > self.max_bytes {
+            return; // over cap — disk fallback on the next miss
+        }
+        self.size_bytes += entry_bytes;
+        self.neighbours.insert(key, nbrs);
+    }
+
+    /// Merge entries from `other` (a query-local snapshot) back into the global
+    /// cache.  If generations differ (a concurrent insert occurred), clears stale
+    /// data and accepts the fresh snapshot wholesale before merging.
+    pub fn merge_from(&mut self, other: HnswL0Cache) {
+        if self.generation != other.generation {
+            // A concurrent insert changed `total_nodes` — stale data must go.
+            self.neighbours.clear();
+            self.size_bytes = 0;
+            self.generation = other.generation;
+        }
+        for (k, v) in other.neighbours {
+            self.insert_neighbours(k, v);
+        }
+    }
+}
+
+impl Default for HnswL0Cache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn encode_rid(rid: RowId) -> i64 {
     (rid.page_id as i64) * 65536 + rid.slot as i64
 }
@@ -666,19 +753,41 @@ impl DiskHnswIndex {
 
     // ── Layer-0 neighbour retrieval ─────────────────────────────────────────
 
-    /// Get layer-0 neighbours for `rid`, checking `node_cache` before hitting disk.
+    /// Get layer-0 neighbours for `rid`.
+    ///
+    /// Cache priority (first hit wins):
+    ///   1. `l0_cache`  — process-lifetime cross-query cache (item 72, query path).
+    ///   2. `node_cache` — per-insert transient cache (insert path only).
+    ///   3. Disk — DiskBTree lookup + page fetch.
     fn get_l0_nbrs(
         &self,
         rid: RowId,
         hdr: &HnswHeader,
         pool: &BufferPool,
         node_cache: Option<&mut NodeCache>,
+        l0_cache: Option<&mut HnswL0Cache>,
     ) -> Result<Vec<RowId>> {
+        let key = encode_rid(rid);
+
+        // 1. Process-lifetime L0 cache (query path; insert path always passes None).
+        if let Some(cache) = l0_cache {
+            if let Some(nbrs) = cache.neighbours.get(&key) {
+                return Ok(nbrs.clone());
+            }
+            // Cache miss: load from disk, store for future queries.
+            let nbrs = match self.find_node_loc(rid, hdr.node_index_root, pool)? {
+                Some((np, ns)) => self.load_node_at(np, ns, hdr.dim, pool)?.nbrs_l0,
+                None => return Ok(vec![]),
+            };
+            cache.insert_neighbours(key, nbrs.clone());
+            return Ok(nbrs);
+        }
+
+        // 2. Per-insert node cache (insert path).
         if let Some(cache) = node_cache {
             // Use the cached node struct if available; populate it otherwise.
             // `entry().or_insert_with()` can't be used here because the init
             // is fallible (`?`), so we check + insert explicitly.
-            let key = encode_rid(rid);
             #[allow(clippy::map_entry)]
             if !cache.contains_key(&key) {
                 // Cache miss: fetch node and populate cache.
@@ -694,7 +803,8 @@ impl DiskHnswIndex {
                 .map(|n| n.nbrs_l0.clone())
                 .unwrap_or_default());
         }
-        // No cache: plain disk lookup.
+
+        // 3. Plain disk lookup (no cache provided).
         match self.find_node_loc(rid, hdr.node_index_root, pool)? {
             Some((np, ns)) => Ok(self.load_node_at(np, ns, hdr.dim, pool)?.nbrs_l0),
             None => Ok(vec![]),
@@ -748,6 +858,7 @@ impl DiskHnswIndex {
         pool: &BufferPool,
         build_cache: Option<&HashMap<i64, Vec<f32>>>,
         mut node_cache: Option<&mut NodeCache>,
+        mut l0_cache: Option<&mut HnswL0Cache>,
     ) -> Result<Vec<(f32, RowId)>> {
         let mut visited: HashSet<RowId> = HashSet::new();
         visited.insert(entry);
@@ -777,7 +888,13 @@ impl DiskHnswIndex {
 
             // Expand cand_rid's neighbours at this layer.
             let nbrs = if layer == 0 {
-                self.get_l0_nbrs(cand_rid, hdr, pool, node_cache.as_deref_mut())?
+                self.get_l0_nbrs(
+                    cand_rid,
+                    hdr,
+                    pool,
+                    node_cache.as_deref_mut(),
+                    l0_cache.as_deref_mut(),
+                )?
             } else {
                 self.get_upper_nbrs(cand_rid, layer, hdr.upper_layer_root, pool)?
             };
@@ -1025,6 +1142,7 @@ impl DiskHnswIndex {
                     pool,
                     build_cache,
                     nc_opt,
+                    None, // insert path: never touch query L0 cache
                 )?;
                 if let Some(&(d, r)) = result.first() {
                     if d < ep_dist {
@@ -1065,6 +1183,7 @@ impl DiskHnswIndex {
                     pool,
                     build_cache,
                     nc_opt,
+                    None, // insert path: never touch query L0 cache
                 )?;
                 let m_lim = if lyr == 0 { HNSW_M_MAX0 } else { HNSW_M };
                 let selected = Self::select_neighbours(&cands, m_lim);
@@ -1278,17 +1397,41 @@ impl DiskHnswIndex {
 
     /// Approximate nearest-neighbour search. Returns candidate RowIds sorted by
     /// approximate distance from `query` (before exact re-ranking by the caller).
-    pub fn candidates(
+    /// Inner query path shared by `candidates` and `candidates_cached`.
+    ///
+    /// `l0_cache`: optional mutable reference to a **query-local snapshot** of the
+    /// process-lifetime L0 cache (item 72).  When `Some`, `get_l0_nbrs` checks it
+    /// before hitting disk, and populates it on miss.  The caller owns the snapshot
+    /// and merges new entries back into the global cache after this call.
+    ///
+    /// Generation contract: the caller should set `l0_cache.generation` to the
+    /// `hdr.total_nodes` value seen when the snapshot was taken.  This function
+    /// re-reads the header, and if `total_nodes` differs (a concurrent insert raced
+    /// in), clears the snapshot and re-stamps it — so beam-search results are always
+    /// against the current graph state.
+    pub fn candidates_cached(
         &self,
         query: &[f32],
         ef_override: Option<usize>,
         pool: &BufferPool,
+        mut l0_cache: Option<&mut HnswL0Cache>,
     ) -> Result<(Metric, Vec<RowId>)> {
         let hdr = self.load_header(pool)?;
         if !hdr.has_entry_point {
             return Ok((hdr.metric, vec![]));
         }
         let ef = ef_override.unwrap_or(HNSW_EF_SEARCH);
+
+        // Validate / reset L0 cache generation against current total_nodes.
+        if let Some(ref mut cache) = l0_cache {
+            let gen = hdr.total_nodes as u64;
+            if cache.generation != gen {
+                // Stale (or fresh empty): clear and re-stamp.
+                cache.neighbours.clear();
+                cache.size_bytes = 0;
+                cache.generation = gen;
+            }
+        }
 
         // Load entry-point vector directly from meta's stored node location.
         let ep_vec = match self.load_node_at(hdr.ep_node_page, hdr.ep_node_slot, hdr.dim, pool) {
@@ -1298,9 +1441,10 @@ impl DiskHnswIndex {
         let mut ep = hdr.ep_heap_rid;
         let mut ep_dist = hnsw_distance(hdr.metric, query, &ep_vec);
 
-        // Greedy descent from ep_level to 1.
+        // Greedy descent from ep_level to 1 (upper layers have few nodes; no L0 cache).
         for lyr in (1..=hdr.ep_level as usize).rev() {
-            let res = self.search_layer(ep, ep_dist, query, 1, lyr, &hdr, pool, None, None)?;
+            let res =
+                self.search_layer(ep, ep_dist, query, 1, lyr, &hdr, pool, None, None, None)?;
             if let Some(&(d, r)) = res.first() {
                 if d < ep_dist {
                     ep_dist = d;
@@ -1309,9 +1453,21 @@ impl DiskHnswIndex {
             }
         }
 
-        // Beam search at layer 0.
-        let result = self.search_layer(ep, ep_dist, query, ef.max(1), 0, &hdr, pool, None, None)?;
+        // Beam search at layer 0 — this is the hot path; pass L0 cache.
+        let result =
+            self.search_layer(ep, ep_dist, query, ef.max(1), 0, &hdr, pool, None, None, l0_cache)?;
         Ok((hdr.metric, result.into_iter().map(|(_, r)| r).collect()))
+    }
+
+    /// ANN candidate search.  No L0 cache — use `candidates_cached` for the
+    /// process-lifetime warm-path (item 72).
+    pub fn candidates(
+        &self,
+        query: &[f32],
+        ef_override: Option<usize>,
+        pool: &BufferPool,
+    ) -> Result<(Metric, Vec<RowId>)> {
+        self.candidates_cached(query, ef_override, pool, None)
     }
 
     /// Convenience wrapper: fetch exact vectors via `fetch`, re-rank, return top-k.

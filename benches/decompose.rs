@@ -3648,6 +3648,164 @@ fn bench_ivf_scale_validation() {
     );
 }
 
+// ── Item 72: HNSW L0 cache latency bench ─────────────────────────────────────
+//
+// Measures NEAR query latency before and after the process-lifetime L0 cache
+// warms up.  The cold-to-warm gap is how much disk I/O the L0 cache avoids.
+//
+// Run with:
+//   MM_BULK_SIZES=1000,10000,100000 UNIDB_BENCH=hnsw_l0 cargo bench --bench decompose --release
+
+fn bench_hnsw_l0_cache() {
+    let sizes: Vec<usize> = std::env::var("MM_BULK_SIZES")
+        .ok()
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![1_000, 10_000]);
+
+    const N_QUERIES: usize = 50;
+    const K: usize = 10;
+    const WARM_RUNS: usize = 20; // queries used to warm the L0 cache
+
+    println!("\n### HNSW L0 Cache — Query Latency Before / After Warm (item 72)");
+    println!("### 128-dim cosine, HNSW ef_search=200, k=10, corpus = dim=128 deterministic vecs\n");
+    println!(
+        "| {:>12} | {:>16} | {:>16} | {:>12} | {:>10} |",
+        "corpus rows",
+        "cold (1st query)",
+        "warm (avg last 30)",
+        "speedup",
+        "recall@10"
+    );
+    println!(
+        "|{:-<14}|{:-<18}|{:-<18}|{:-<14}|{:-<12}|",
+        "", "", "", "", ""
+    );
+
+    for &n in &sizes {
+        let dir = tempdir().unwrap();
+        let engine = bench_engine_open(dir.path());
+
+        // Insert corpus
+        let setup_xid = engine.begin().unwrap();
+        engine
+            .execute_sql(
+                setup_xid,
+                "CREATE TABLE t (id INT PRIMARY KEY, embedding VECTOR(128))",
+            )
+            .unwrap();
+        engine.commit(setup_xid).unwrap();
+
+        for chunk in (0..n).collect::<Vec<_>>().chunks(500) {
+            let xid = engine.begin().unwrap();
+            for &i in chunk {
+                let v = rand_vec_128(i as u64);
+                let coords: Vec<String> = v.iter().map(|f| format!("{f:.8}")).collect();
+                engine
+                    .execute_sql(
+                        xid,
+                        &format!(
+                            "INSERT INTO t (id, embedding) VALUES ({i}, [{}])",
+                            coords.join(", ")
+                        ),
+                    )
+                    .unwrap();
+            }
+            engine.commit(xid).unwrap();
+        }
+
+        // Create HNSW index after insert (correct graph)
+        let ixid = engine.begin().unwrap();
+        engine
+            .execute_sql(ixid, "CREATE INDEX iv ON t USING HNSW (embedding)")
+            .unwrap();
+        engine.commit(ixid).unwrap();
+
+        // Build query strings
+        let query_vecs: Vec<Vec<f32>> = (0..N_QUERIES)
+            .map(|i| rand_vec_128((n as u64) + 100_000 + i as u64))
+            .collect();
+        let query_sqls: Vec<String> = query_vecs.iter().map(|q| near_sql(q, K)).collect();
+
+        // Cold: first query ever (L0 cache empty)
+        let cold_start = Instant::now();
+        {
+            let w = engine.begin().unwrap();
+            engine.execute_sql(w, &query_sqls[0]).unwrap();
+            engine.commit(w).unwrap();
+        }
+        let cold_ms = cold_start.elapsed().as_secs_f64() * 1000.0;
+
+        // Warm-up: WARM_RUNS queries populate the L0 cache
+        for i in 1..=WARM_RUNS.min(N_QUERIES - 1) {
+            let w = engine.begin().unwrap();
+            engine.execute_sql(w, &query_sqls[i]).unwrap();
+            engine.commit(w).unwrap();
+        }
+
+        // Warm: measure remaining queries (L0 cache hot)
+        let warm_n = (N_QUERIES - WARM_RUNS - 1).max(1);
+        let warm_start = Instant::now();
+        for i in (WARM_RUNS + 1)..N_QUERIES {
+            let w = engine.begin().unwrap();
+            engine.execute_sql(w, &query_sqls[i]).unwrap();
+            engine.commit(w).unwrap();
+        }
+        let warm_ms = warm_start.elapsed().as_secs_f64() * 1000.0 / warm_n as f64;
+
+        let speedup = cold_ms / warm_ms.max(0.001);
+
+        // Recall@10: compare HNSW results to brute-force on the in-mem corpus
+        let corpus_vecs: Vec<Vec<f32>> = (0..n).map(|i| rand_vec_128(i as u64)).collect();
+        let recall = {
+            let mut total = 0.0f64;
+            for i in 0..N_QUERIES.min(20) {
+                let w = engine.begin().unwrap();
+                let results = engine.execute_sql(w, &query_sqls[i]).unwrap();
+                engine.commit(w).unwrap();
+                let hnsw_ids: std::collections::HashSet<i64> = match &results[0] {
+                    unidb::SqlResult::Rows { rows, .. } => rows
+                        .iter()
+                        .filter_map(|r| match &r[0] {
+                            Literal::Int(n) => Some(*n),
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => std::collections::HashSet::new(),
+                };
+                let query = &query_vecs[i];
+                let mut scored: Vec<(f64, usize)> = corpus_vecs
+                    .iter()
+                    .enumerate()
+                    .map(|(j, v)| (euclidean_dist_sq(query, v), j))
+                    .collect();
+                scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                let bf_ids: std::collections::HashSet<i64> =
+                    scored.iter().take(K).map(|&(_, j)| j as i64).collect();
+                total += hnsw_ids.intersection(&bf_ids).count() as f64 / K as f64;
+            }
+            total / N_QUERIES.min(20) as f64
+        };
+
+        println!(
+            "| {:>12} | {:>13.2} ms | {:>13.2} ms | {:>10.1}× | {:>9.3} |",
+            n, cold_ms, warm_ms, speedup, recall
+        );
+    }
+
+    println!();
+    println!("**Notes:**");
+    println!("- Cold = first NEAR query after index creation (L0 cache empty)");
+    println!(
+        "- Warm = avg of last {} queries after {} warm-up queries (L0 cache populated)",
+        N_QUERIES - WARM_RUNS - 1,
+        WARM_RUNS
+    );
+    println!("- Speedup = cold_ms / warm_ms; shows how much disk I/O the L0 cache avoids");
+    println!("- Recall@10 must stay ≥ 0.94 — cache is correctness-transparent");
+    println!("- Target: warm ≤ 5 ms at 10k rows (from 25.19 ms baseline)");
+    println!("- HNSW_L0_CACHE_MB controls cache cap (default 256 MiB)");
+}
+
 fn main() {
     // `UNIDB_BENCH` selects a subset so a single section can be re-run quickly
     // (e.g. the durable-FSM B-accept re-runs just B3/B4 before vs after without
@@ -3693,6 +3851,10 @@ fn main() {
         }
         "ivf_validate" => {
             bench_ivf_scale_validation();
+            return;
+        }
+        "hnsw_l0" => {
+            bench_hnsw_l0_cache();
             return;
         }
         _ => {}
