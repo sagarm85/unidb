@@ -30,6 +30,10 @@ export GIT_COMMIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || e
 export GIT_BRANCH="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
 export MM_SIZES="${MM_SIZES:-1000,10000,100000}"
 export MM_SAMPLE="${MM_SAMPLE:-200}"
+# Cap the Table 4 multi-model sweep at 100k to prevent a 6h hang.
+# The compose default includes 1M, which takes 50+ min for unidb alone.
+# Override to 1M+ with: MM_TX_SWEEP=1000,10000,100000,1000000 scripts/docker_report.sh
+export MM_TX_SWEEP="${MM_TX_SWEEP:-1000,10000,100000}"
 # MM_REPLACED_STACK=1 → Table 4 adds the §6 replaced-stack column (row + pgvector
 # + graph + queue as four independent commits) + a crash-consistency verdict.
 # The compose file uses the pgvector image so the vector role can run.
