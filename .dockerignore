@@ -6,3 +6,5 @@ target
 docker/out
 **/__pycache__
 bench/logs-*
+# Claude Code session data — worktrees contain 77GB+ of Rust build artifacts
+.claude
