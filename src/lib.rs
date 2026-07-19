@@ -722,6 +722,15 @@ pub struct Engine {
     /// Lifetime count of plan-cache hits (parse calls skipped).  Exposed via
     /// [`Engine::plan_cache_hits`] for tests and `/stats`.
     plan_cache_hits: AtomicU64,
+    // ── Async HNSW background worker (item 67) ───────────────────────────────
+    /// Sender end of the HNSW worker channel.  `None` for a bare
+    /// `Engine::open()` handle (which can't host a background thread because
+    /// it hasn't been wrapped in an `Arc` yet).  Set by `spawn_hnsw_worker`.
+    /// The `ExecCtx` clones this `SyncSender` for each INSERT statement so the
+    /// executor can dispatch HNSW inserts without holding the engine lock.
+    hnsw_worker_tx: Mutex<Option<std::sync::mpsc::SyncSender<crate::hnsw_index::HnswMsg>>>,
+    /// Background HNSW worker thread handle (item 67).
+    hnsw_worker_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// One slow-query-log entry (P6.g).
@@ -1036,7 +1045,120 @@ impl Engine {
     pub fn open_arc(dir: &Path, page_size: u32) -> Result<Arc<Self>> {
         let engine = Arc::new(Self::open(dir, page_size)?);
         engine.spawn_autovacuum();
+        engine.spawn_hnsw_worker();
         Ok(engine)
+    }
+
+    // ── Async HNSW background worker (item 67) ───────────────────────────────
+
+    /// Spawn the HNSW background worker thread (item 67).
+    ///
+    /// Creates a bounded `sync_channel::<HnswMsg>(4096)` — 4096 slots so a
+    /// fast INSERT burst doesn't stall the writer while still bounding memory.
+    /// The worker thread:
+    /// 1. Receives `HnswMsg::Work` items and calls
+    ///    [`DiskHnswIndex::insert`] synchronously (the insert is durable /
+    ///    WAL-logged — exactly the same call that used to block the INSERT
+    ///    commit path, just moved off-thread).
+    /// 2. Receives `HnswMsg::Flush(ack)` items and replies on the oneshot
+    ///    channel, allowing callers (tests, `wait_hnsw_idle`) to drain the
+    ///    queue and confirm the worker is caught up.
+    ///
+    /// Idempotent: if the worker is already running, this is a no-op.
+    /// Called from `Engine::open_arc` and the server entry points so the
+    /// async path is available on all "normal" deployments; bare
+    /// `Engine::open()` gets `hnsw_worker_tx = None` and falls back to the
+    /// synchronous insert in `apply_durable_index_writes`.
+    ///
+    /// The worker is intentionally **not** `Weak`-based like autovacuum: it
+    /// holds `Arc<BufferPool>` and `Arc<Wal>` (both are already `Arc`s on
+    /// the engine), so the engine does not own the worker — the worker is
+    /// torn down by dropping the sender in `Engine::drop` (which the Mutex
+    /// field handles implicitly when the Engine is dropped).
+    pub fn spawn_hnsw_worker(self: &Arc<Self>) {
+        let mut tx_slot = self
+            .hnsw_worker_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if tx_slot.is_some() {
+            return; // already running
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel::<crate::hnsw_index::HnswMsg>(4096);
+
+        // Capture Arc-cloned handles — both BufferPool and Wal are Arc inside
+        // Engine (exposed via &self); we pass raw references here because the
+        // worker thread will not outlive the engine (the sender drop at engine
+        // teardown closes the channel, causing rx.recv() to return Err and the
+        // worker to exit).  We use raw pointers and unsafe to extend the
+        // lifetime for the thread — instead, take the Arc properly.
+        //
+        // BufferPool and Wal are NOT behind Arc on Engine; they are stored by
+        // value.  We therefore wrap them in Arc<> by cloning the engine Arc
+        // (a Weak reference) and upgrading per item inside the worker loop —
+        // the same pattern autovacuum uses.
+        let weak = Arc::downgrade(self);
+        let handle = std::thread::Builder::new()
+            .name("unidb-hnsw-worker".into())
+            .spawn(move || {
+                use crate::hnsw_index::{DiskHnswIndex, HnswMsg};
+                loop {
+                    match rx.recv() {
+                        Ok(HnswMsg::Work(item)) => {
+                            // Upgrade the weak ref to access pool + wal.
+                            // If the engine is gone, stop the worker.
+                            let Some(eng) = weak.upgrade() else { break };
+                            if let Err(err) = DiskHnswIndex::open(item.meta_page, item.page_size)
+                                .insert(item.row_id, &item.vector, &eng.pool, &eng.wal)
+                            {
+                                tracing::warn!(
+                                    error = %err,
+                                    meta_page = item.meta_page,
+                                    "HNSW background worker: insert failed"
+                                );
+                            }
+                        }
+                        Ok(HnswMsg::Flush(ack)) => {
+                            // The queue is now drained up to this point.
+                            // Reply to allow the caller to unblock.
+                            let _ = ack.send(());
+                        }
+                        Err(_) => {
+                            // Sender closed → engine is shutting down.
+                            break;
+                        }
+                    }
+                }
+                tracing::debug!("HNSW background worker exited");
+            })
+            .expect("failed to spawn HNSW worker thread");
+
+        *self
+            .hnsw_worker_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        *tx_slot = Some(tx);
+    }
+
+    /// Block until the HNSW background worker has processed all pending inserts
+    /// (item 67).  Used in tests to ensure the index is fully built before
+    /// issuing a `NEAR` query.
+    ///
+    /// If the worker is not running (`hnsw_worker_tx == None`) this is a no-op.
+    pub fn wait_hnsw_idle(&self) {
+        let tx = {
+            let slot = self
+                .hnsw_worker_tx
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            slot.as_ref().cloned()
+        };
+        let Some(tx) = tx else { return };
+        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel::<()>(0);
+        // Ignore send errors: the worker may have exited due to engine drop.
+        let _ = tx.send(crate::hnsw_index::HnswMsg::Flush(ack_tx));
+        // Wait for the ack; a disconnected channel means the worker exited —
+        // also fine (no pending inserts).
+        let _ = ack_rx.recv();
     }
 
     /// Open (or create) a database with an explicit buffer-pool capacity in
@@ -1241,6 +1363,8 @@ impl Engine {
             schema_epoch: AtomicU64::new(0),
             plan_cache: Mutex::new(PlanCache::new(PLAN_CACHE_CAPACITY)),
             plan_cache_hits: AtomicU64::new(0),
+            hnsw_worker_tx: Mutex::new(None),
+            hnsw_worker_handle: Mutex::new(None),
         })
     }
 
@@ -2160,6 +2284,13 @@ impl Engine {
         let page_size = self.page_size;
         // Decide the lock mode under a brief read lock, then take the real guard.
         let shared = self.stmt_uses_shared_catalog(&plan);
+        // Clone the HNSW worker sender once per statement (cheap: SyncSender is
+        // an Arc-cloned handle, not a full channel allocation).
+        let hnsw_tx = self
+            .hnsw_worker_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         if shared {
             let catalog = cat_read(&self.catalog);
             let mut ctx = ExecCtx {
@@ -2178,6 +2309,7 @@ impl Engine {
                 hnsw_vec_caches: Some(&self.hnsw_vec_caches),
                 authz: Some(&self.authz),
                 current_user: None,
+                hnsw_tx,
             };
             executor::execute(plan, &mut ctx)
         } else {
@@ -2198,6 +2330,7 @@ impl Engine {
                 hnsw_vec_caches: Some(&self.hnsw_vec_caches),
                 authz: Some(&self.authz),
                 current_user: None,
+                hnsw_tx,
             };
             executor::execute(plan, &mut ctx)
         }
@@ -2268,6 +2401,11 @@ impl Engine {
     pub fn execute_cypher(&self, xid: Xid, query: &str) -> Result<Vec<ExecResult>> {
         let page_size = self.page_size;
         let parsed = parse_cypher(query)?;
+        let hnsw_tx = self
+            .hnsw_worker_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let mut catalog = cat_write(&self.catalog);
         let mut ctx = ExecCtx {
             catalog: crate::sql::executor::CatalogHandle::Exclusive(&mut catalog),
@@ -2285,6 +2423,7 @@ impl Engine {
             hnsw_vec_caches: Some(&self.hnsw_vec_caches),
             authz: Some(&self.authz),
             current_user: None,
+            hnsw_tx,
         };
         let result = graph_executor::execute(parsed, &mut ctx, self.edge_index_meta)?;
         Ok(vec![result])
