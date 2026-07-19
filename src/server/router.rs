@@ -77,6 +77,9 @@ pub fn build_router(
             "/tables/{table}/rls",
             axum::routing::put(handlers::put_table_rls),
         )
+        // item-24 Z6: POST /auth/preview — run SQL as a named role, with RLS
+        // applied, so an admin can preview what a specific user sees.
+        .route("/auth/preview", post(handlers::post_auth_preview))
         .route("/events/head", get(handlers::get_events_head))
         .route("/events/subscribe", get(sse::get_events_subscribe))
         .route("/events/ack", post(handlers::post_events_ack))

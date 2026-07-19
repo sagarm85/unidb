@@ -36,11 +36,11 @@ use crate::{
         auth::CurrentUser,
         dto::{
             exec_result_to_json, is_internal_table, json_to_literal, literal_to_json, slot_to_json,
-            table_def_to_info, AckEventsRequest, AdvanceSlotRequest, BatchInsertRequest,
-            BatchSqlRequest, BatchSqlResponse, BeginTxnRequest, CreateEdgeRequest,
-            CreateSlotRequest, CursorQuery, CypherRequest, DeleteEdgeRequest, HistoryQuery,
-            IsolationDto, RlsRequest, RowIdResponse, SetIndexRequest, SlowQueryThresholdRequest,
-            SqlRequest, StreamQuery, TableInfo,
+            table_def_to_info, AckEventsRequest, AdvanceSlotRequest, AuthPreviewRequest,
+            BatchInsertRequest, BatchSqlRequest, BatchSqlResponse, BeginTxnRequest,
+            CreateEdgeRequest, CreateSlotRequest, CursorQuery, CypherRequest, DeleteEdgeRequest,
+            HistoryQuery, IsolationDto, RlsRequest, RowIdResponse, SetIndexRequest,
+            SlowQueryThresholdRequest, SqlRequest, StreamQuery, TableInfo,
         },
         engine_handle::EngineHandle,
         error::ApiError,
@@ -928,6 +928,40 @@ pub async fn put_table_rls(
         .await
         .map_err(ApiError::from)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /auth/preview` (item-24 Z6): run `sql` as `as_role` and return the
+/// row-filtered result, including RLS policies that reference `current_user()`.
+/// This is the "preview as user" surface: an admin can verify exactly what a
+/// given role sees without logging in as that role.
+///
+/// **Superuser-gated**: only a superuser may impersonate another role.
+/// Returns `403 FORBIDDEN` for a non-superuser caller when the engine has
+/// at least one user configured (bootstrap mode always passes, same gate as
+/// other admin routes).
+pub async fn post_auth_preview(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+    Json(body): Json<AuthPreviewRequest>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    // Superuser-only gate: only superusers may impersonate another role.
+    state
+        .engine
+        .ensure_superuser(current_user.0)
+        .await
+        .map_err(ApiError::from)?;
+
+    let xid = state.engine.begin(None).await?;
+    let result = state
+        .engine
+        .execute_sql_as(Some(body.as_role.clone()), xid, body.sql.clone())
+        .await;
+    let results = finish(&state.engine, xid, result).await?;
+    let first = results.into_iter().next().unwrap_or(ExecResult::Rows {
+        columns: vec![],
+        rows: vec![],
+    });
+    Ok(Json(exec_result_to_json(&first)))
 }
 
 // ── operational ──────────────────────────────────────────────────────────

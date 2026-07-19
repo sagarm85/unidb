@@ -131,7 +131,7 @@ fn bind_expr(expr: &mut Expr, params: &[Literal]) -> Result<()> {
         }
         Expr::Match { query, .. } => bind_expr(query, params),
         Expr::IsNull { expr, .. } => bind_expr(expr, params),
-        Expr::Column(_) | Expr::ColumnSlot(_) | Expr::Near { .. } => Ok(()),
+        Expr::Column(_) | Expr::ColumnSlot(_) | Expr::Near { .. } | Expr::CurrentUser => Ok(()),
     }
 }
 
@@ -251,6 +251,15 @@ pub enum Expr {
         expr: Box<Expr>,
         negated: bool,
     },
+    /// `current_user()` / `CURRENT_USER` — evaluates to the identity of the
+    /// executing user at query time. In RLS policies this lets you write
+    /// per-user row isolation without hardcoding values:
+    /// `USING (owner = current_user())`. Stored in catalog policies as-is;
+    /// substituted with the actual username by `substitute_current_user_in_plan`
+    /// in `execute_sql_inner_as` before execution. Falls back to `Literal::Null`
+    /// in `eval_expr` (the substitution should always run first; `Null` means
+    /// the embedded/superuser path correctly omits RLS when user is `None`).
+    CurrentUser,
 }
 
 #[derive(Debug, Clone)]
@@ -322,6 +331,161 @@ pub enum LogicalPlan {
     /// `EXPLAIN [ANALYZE] <query>` (P4.e): show the chosen plan tree with
     /// estimated rows/cost, and (with ANALYZE) the actual rows + execution time.
     Explain { analyze: bool, spec: QuerySpec },
+}
+
+// ─── current_user() substitution (item-24 Z6) ────────────────────────────────
+
+/// Recursively replace every [`Expr::CurrentUser`] leaf in `expr` with
+/// `Expr::Literal(Literal::Text(user.to_string()))`. Called by
+/// `substitute_current_user_in_plan` before the executor sees the plan,
+/// and by `exec_insert` for INSERT policy checks.
+pub fn substitute_current_user_in_expr(expr: &mut Expr, user: &str) {
+    match expr {
+        Expr::CurrentUser => {
+            *expr = Expr::Literal(Literal::Text(user.to_string()));
+        }
+        Expr::BinOp { lhs, rhs, .. } | Expr::Arith { lhs, rhs, .. } => {
+            substitute_current_user_in_expr(lhs, user);
+            substitute_current_user_in_expr(rhs, user);
+        }
+        Expr::And(lhs, rhs) => {
+            substitute_current_user_in_expr(lhs, user);
+            substitute_current_user_in_expr(rhs, user);
+        }
+        Expr::JsonExtract { expr, .. } | Expr::JsonExtractText { expr, .. } => {
+            substitute_current_user_in_expr(expr, user);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            substitute_current_user_in_expr(expr, user);
+            substitute_current_user_in_expr(pattern, user);
+        }
+        Expr::Match { query, .. } => substitute_current_user_in_expr(query, user),
+        Expr::IsNull { expr, .. } => substitute_current_user_in_expr(expr, user),
+        // Leaves with no sub-expressions — nothing to recurse into.
+        Expr::Column(_) | Expr::ColumnSlot(_) | Expr::Literal(_) | Expr::Near { .. } => {}
+    }
+}
+
+/// Walk the [`LogicalPlan`] and substitute every [`Expr::CurrentUser`] in
+/// predicates with `Literal::Text(user)`. Called twice in
+/// `execute_sql_inner_as`: once before `apply_rls` (for user-supplied SQL)
+/// and once after (for injected RLS policy expressions that also contain
+/// `CurrentUser`).
+pub fn substitute_current_user_in_plan(plan: &mut LogicalPlan, user: &str) {
+    let sub = |e: &mut Option<Expr>| {
+        if let Some(expr) = e {
+            substitute_current_user_in_expr(expr, user);
+        }
+    };
+    match plan {
+        LogicalPlan::Select { predicate, .. } => sub(predicate),
+        LogicalPlan::Update { predicate, .. } => sub(predicate),
+        LogicalPlan::Delete { predicate, .. } => sub(predicate),
+        // INSERT carries no predicate (its policy is handled inline in
+        // exec_insert via ExecCtx::current_user). DDL has no predicates.
+        _ => {}
+    }
+}
+
+/// Whether `expr` contains any [`Expr::CurrentUser`] node at any depth.
+/// Used to detect policies that require a user identity to evaluate correctly.
+pub fn expr_has_current_user_pub(expr: &Expr) -> bool {
+    expr_has_current_user(expr)
+}
+
+fn expr_has_current_user(expr: &Expr) -> bool {
+    match expr {
+        Expr::CurrentUser => true,
+        Expr::BinOp { lhs, rhs, .. } | Expr::Arith { lhs, rhs, .. } => {
+            expr_has_current_user(lhs) || expr_has_current_user(rhs)
+        }
+        Expr::And(lhs, rhs) => expr_has_current_user(lhs) || expr_has_current_user(rhs),
+        Expr::JsonExtract { expr, .. } | Expr::JsonExtractText { expr, .. } => {
+            expr_has_current_user(expr)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            expr_has_current_user(expr) || expr_has_current_user(pattern)
+        }
+        Expr::Match { query, .. } => expr_has_current_user(query),
+        Expr::IsNull { expr, .. } => expr_has_current_user(expr),
+        Expr::Column(_) | Expr::ColumnSlot(_) | Expr::Literal(_) | Expr::Near { .. } => false,
+    }
+}
+
+/// Like [`apply_rls`] but skips any policy that contains [`Expr::CurrentUser`].
+/// Used by the embedded/superuser path (`execute_sql_inner`) which has no user
+/// identity to substitute — a `CurrentUser` policy would evaluate to `Null`
+/// (false) and silently hide all rows from the superuser, which is wrong.
+/// Literal-value policies (no `CurrentUser`) are applied normally, preserving
+/// the existing embedded-path RLS behavior.
+pub fn apply_rls_skip_current_user(plan: LogicalPlan, catalog: &Catalog) -> LogicalPlan {
+    match plan {
+        LogicalPlan::Select {
+            table,
+            projection,
+            predicate,
+        } => {
+            let policy = policy_for_skip_current_user(catalog, &table);
+            let predicate = and_policy(predicate, policy);
+            LogicalPlan::Select {
+                table,
+                projection,
+                predicate,
+            }
+        }
+        LogicalPlan::Update {
+            table,
+            assignments,
+            predicate,
+            returning,
+        } => {
+            let policy = policy_for_skip_current_user(catalog, &table);
+            let predicate = and_policy(predicate, policy);
+            LogicalPlan::Update {
+                table,
+                assignments,
+                predicate,
+                returning,
+            }
+        }
+        LogicalPlan::Delete {
+            table,
+            predicate,
+            returning,
+        } => {
+            let policy = policy_for_skip_current_user(catalog, &table);
+            let predicate = and_policy(predicate, policy);
+            LogicalPlan::Delete {
+                table,
+                predicate,
+                returning,
+            }
+        }
+        LogicalPlan::Query(mut spec) => {
+            spec.apply_rls_from(&|table| policy_for_skip_current_user(catalog, table));
+            LogicalPlan::Query(spec)
+        }
+        LogicalPlan::Explain { analyze, mut spec } => {
+            spec.apply_rls_from(&|table| policy_for_skip_current_user(catalog, table));
+            LogicalPlan::Explain { analyze, spec }
+        }
+        other @ (LogicalPlan::CreateTable { .. }
+        | LogicalPlan::Insert { .. }
+        | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::AlterTableAddColumn { .. }
+        | LogicalPlan::AlterTableDropColumn { .. }
+        | LogicalPlan::DropTable { .. }
+        | LogicalPlan::Truncate { .. }
+        | LogicalPlan::Analyze { .. }) => other,
+    }
+}
+
+fn policy_for_skip_current_user(catalog: &Catalog, table: &str) -> Option<Expr> {
+    catalog
+        .lookup(table)
+        .ok()
+        .and_then(|t| t.rls_policy.clone())
+        .filter(|p| !expr_has_current_user(p))
 }
 
 /// AND the table's RLS policy (if any) into the plan's predicate. This is

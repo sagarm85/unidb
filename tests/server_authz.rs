@@ -112,3 +112,125 @@ async fn per_user_privileges_enforced() {
         403
     );
 }
+
+// ── POST /auth/preview (item-24 Z6) ─────────────────────────────────────────
+
+/// `POST /auth/preview` requires a superuser JWT. A non-superuser caller
+/// must receive 403 Forbidden.
+#[tokio::test]
+async fn post_auth_preview_requires_superuser() {
+    let server = TestServer::spawn().await;
+    let client = reqwest::Client::new();
+    let admin = valid_token();
+
+    // Bootstrap: create a superuser, a table, and a restricted user.
+    sql(
+        &client,
+        server.url("/sql"),
+        &admin,
+        "CREATE USER root SUPERUSER",
+    )
+    .await;
+    let root = token_for("root");
+    sql(
+        &client,
+        server.url("/sql"),
+        &root,
+        "CREATE TABLE t (id INT)",
+    )
+    .await;
+    sql(&client, server.url("/sql"), &root, "CREATE USER analyst").await;
+    sql(
+        &client,
+        server.url("/sql"),
+        &root,
+        "GRANT SELECT ON t TO analyst",
+    )
+    .await;
+
+    // analyst (non-superuser) calls /auth/preview → 403.
+    let analyst = token_for("analyst");
+    let resp = client
+        .post(server.url("/auth/preview"))
+        .header("Authorization", format!("Bearer {analyst}"))
+        .json(&serde_json::json!({ "as_role": "analyst", "sql": "SELECT id FROM t" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "non-superuser must get 403 for /auth/preview"
+    );
+}
+
+/// Superuser can call `POST /auth/preview` and sees results filtered by the
+/// named role's RLS policy (including `current_user()` substitution).
+#[tokio::test]
+async fn post_auth_preview_as_role() {
+    let server = TestServer::spawn().await;
+    let client = reqwest::Client::new();
+    let admin = valid_token();
+
+    // Bootstrap superuser.
+    sql(
+        &client,
+        server.url("/sql"),
+        &admin,
+        "CREATE USER root SUPERUSER",
+    )
+    .await;
+    let root = token_for("root");
+
+    // Table with an owner column.
+    sql(
+        &client,
+        server.url("/sql"),
+        &root,
+        "CREATE TABLE posts (id INT, owner TEXT)",
+    )
+    .await;
+
+    // Roles and grants.
+    sql(&client, server.url("/sql"), &root, "CREATE USER alice").await;
+    sql(
+        &client,
+        server.url("/sql"),
+        &root,
+        "GRANT SELECT ON posts TO alice",
+    )
+    .await;
+
+    // Insert rows as root.
+    sql(
+        &client,
+        server.url("/sql"),
+        &root,
+        "INSERT INTO posts (id, owner) VALUES (1, 'alice'), (2, 'root')",
+    )
+    .await;
+
+    // CREATE POLICY with current_user (bare keyword — parens form is not valid SQL here).
+    let policy_resp = sql(
+        &client,
+        server.url("/sql"),
+        &root,
+        "CREATE POLICY p ON posts FOR SELECT USING (owner = current_user)",
+    )
+    .await;
+    assert_eq!(policy_resp.status(), 200, "CREATE POLICY must succeed");
+
+    // Superuser calls /auth/preview as "alice" — should see only alice's row.
+    let resp = client
+        .post(server.url("/auth/preview"))
+        .header("Authorization", format!("Bearer {root}"))
+        .json(&serde_json::json!({ "as_role": "alice", "sql": "SELECT id, owner FROM posts" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "preview must succeed for superuser");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let rows = body["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "alice should see only 1 row: {body}");
+    assert_eq!(rows[0][1], "alice", "the visible row must belong to alice");
+}

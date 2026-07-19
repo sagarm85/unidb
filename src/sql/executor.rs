@@ -729,6 +729,11 @@ pub struct ExecCtx<'a> {
     /// `unidb_catalog.grants`. `None` in unit tests that build bare `ExecCtx`
     /// structs and don't exercise the AuthZ catalog views.
     pub authz: Option<&'a crate::authz::RoleStore>,
+    /// Identity of the executing user for `current_user()` resolution in RLS
+    /// predicates (item-24 Z6). `None` = superuser / embedded path (no
+    /// restriction). Set by `execute_sql_inner_as` before execution; `None`
+    /// in all other paths (superuser/embedded always bypass RLS anyway).
+    pub current_user: Option<String>,
 }
 
 /// Insert `row`'s durable-index column values into their on-disk structures
@@ -1660,12 +1665,25 @@ fn exec_insert(
         // Item-24 Z1: INSERT policy check. If a `FOR INSERT` (or `FOR ALL`)
         // RLS policy exists, evaluate the predicate against the new row before
         // writing — any row that would violate the predicate is rejected.
+        // Item-24 Z6: substitute `current_user` in the policy clone before
+        // evaluating, so per-user row isolation works on the INSERT path too.
+        // When `current_user` is None (embedded/superuser path), skip any
+        // policy that contains CurrentUser (same reasoning as `apply_rls_skip_current_user`).
         if let Some(ref ins_policy) = table_def.insert_policy {
-            if !check_passes(ins_policy, &table_def.columns, &coerced)? {
-                return Err(DbError::SqlPlan(format!(
-                    "new row violates policy for table \"{}\"",
-                    table_def.name
-                )));
+            let has_cu = crate::sql::logical::expr_has_current_user_pub(ins_policy);
+            if has_cu && ctx.current_user.is_none() {
+                // Superuser/embedded path — bypass CurrentUser-dependent INSERT policies.
+            } else {
+                let mut policy = ins_policy.clone();
+                if let Some(ref u) = ctx.current_user {
+                    crate::sql::logical::substitute_current_user_in_expr(&mut policy, u);
+                }
+                if !check_passes(&policy, &table_def.columns, &coerced)? {
+                    return Err(DbError::SqlPlan(format!(
+                        "new row violates policy for table \"{}\"",
+                        table_def.name
+                    )));
+                }
             }
         }
         // UNIQUE + FK — two-step approach for concurrent-writer safety
@@ -4620,6 +4638,13 @@ pub(crate) fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Literal]) -> 
             let is_null = matches!(v, Literal::Null);
             Ok(Literal::Bool(is_null != *negated))
         }
+        // `current_user()` (item-24 Z6): should have been substituted by
+        // `substitute_current_user_in_plan` before execution reaches here.
+        // The fallback `Null` means a policy containing `CurrentUser` will
+        // evaluate to false (predicate treats Null as false) — this is the
+        // correct safe-fallback for the embedded / superuser path, which
+        // bypasses RLS before `eval_expr` is ever called.
+        Expr::CurrentUser => Ok(Literal::Null),
     }
 }
 
@@ -5053,6 +5078,8 @@ fn expr_columns(expr: &Expr, table_def: &TableDef, out: &mut Vec<usize>) {
         }
         // G10 (item 19): IS [NOT] NULL.
         Expr::IsNull { expr, .. } => expr_columns(expr, table_def, out),
+        // item-24 Z6: CurrentUser has no column (it's a runtime constant).
+        Expr::CurrentUser => {}
     }
 }
 
@@ -5096,6 +5123,9 @@ fn bind_predicate_columns(expr: &mut Expr, columns: &[ColumnDef]) {
         Expr::Near { .. } => {}
         // G10 (item 19): IS [NOT] NULL.
         Expr::IsNull { expr, .. } => bind_predicate_columns(expr, columns),
+        // item-24 Z6: CurrentUser has no column slot — it is a runtime
+        // constant resolved before execution by `substitute_current_user_in_plan`.
+        Expr::CurrentUser => {}
     }
 }
 
@@ -5570,6 +5600,7 @@ mod tests {
                 hnsw_l0_caches: None,
                 hnsw_vec_caches: None,
                 authz: None,
+                current_user: None,
             };
             execute(plan, &mut ctx)
         }
@@ -7725,15 +7756,17 @@ mod tests {
             ExecResult::Inserted { count } => assert_eq!(count, 100),
             o => panic!("expected Inserted, got {o:?}"),
         }
-        // Expected: 1 (alloc mini-txn for the new heap page) + 1 (accumulating
-        // mini-txn for all 100 rows on that page, each with its own WAL_INSERT
-        // but all sharing ONE WAL_BEGIN/WAL_COMMIT bracket) = 2.
-        // Old code before item 98 would have delta = 101 (1 alloc + 100 rows,
-        // each with its own WAL_BEGIN/WAL_COMMIT).
+        // Expected mini-txn budget after items 97 + 98:
+        //   1 — heap-page alloc (alloc_heap_page, its own bracket)
+        //   1 — accumulating INSERT for all 100 rows sharing ONE WAL_BEGIN/WAL_COMMIT
+        //   1 — catalog row_count update (item 97: TableDef.row_count persisted to the
+        //       catalog page after every INSERT statement)
+        // Total = 3.  Before item 98 the delta was 101 (1 alloc + 100 per-row brackets).
+        // Before item 97 the delta was 2 (no catalog update).
         let delta = after - before;
         assert!(
-            delta <= 2,
-            "item 98: 100-row INSERT on one page must use ≤ 2 mini-txns (alloc + accumulating), got {delta}"
+            delta <= 3,
+            "item 98+97: 100-row INSERT on one page must use ≤ 3 mini-txns (alloc + accumulating + row_count catalog), got {delta}"
         );
     }
 

@@ -256,6 +256,14 @@ pub fn json_to_literal(v: &Json) -> Literal {
     }
 }
 
+/// Body of `POST /auth/preview` (item-24 Z6): run `sql` as `as_role` and
+/// return the result, including RLS filtering. Superuser-gated.
+#[derive(Debug, Deserialize)]
+pub struct AuthPreviewRequest {
+    pub as_role: String,
+    pub sql: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CypherRequest {
     pub query: String,
