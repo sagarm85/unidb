@@ -63,8 +63,12 @@ For local testing, generate a token with `scripts/gen_jwt.sh` (pure bash +
 TOKEN=$(UNIDB_JWT_SECRET=dev-secret ./scripts/gen_jwt.sh)
 ```
 
-Any validly-signed, unexpired token grants access to **every** data-plane
-route alike — there is no role/scope claim distinction in v1. Missing,
+A validly-signed, unexpired token is required on every data-plane route. The
+JWT `sub` claim is the acting username; a token with no `sub` is the implicit
+superuser. With no roles registered the server is in **open mode** (all users
+have full access — backward compatible). Once roles and grants are registered
+(see [Authorization — roles, grants, RLS](#authorization--roles-grants-and-rls-item-24)),
+a missing privilege returns `403 PERMISSION_DENIED`. Missing,
 malformed, wrong-signature, or expired tokens all return:
 
 ```
@@ -981,7 +985,104 @@ mode (backward compatible); once users exist, a missing privilege returns
 `403 PERMISSION_DENIED`. All auth DDL + named-user decisions are written to
 `audit.log`.
 
+See [Authorization — roles, grants, and RLS](#authorization--roles-grants-and-rls-item-24) below for the
+full SQL DDL surface added by item 24.
+
 **TLS (P6.f):** set `UNIDB_TLS_CERT`/`UNIDB_TLS_KEY` (PEM) to serve HTTPS.
+
+---
+
+### Authorization — roles, grants, and RLS (item 24)
+
+All auth DDL is sent as normal SQL via `POST /sql`. Auth DDL requires a **superuser** JWT
+(a token whose `sub` maps to a role with `SUPERUSER`, or a token with no `sub`). A
+non-superuser issuing auth DDL or schema DDL receives `403 PERMISSION_DENIED`.
+
+#### Roles
+
+```sql
+-- Create a role (regular or superuser)
+CREATE ROLE analyst;
+CREATE ROLE admin SUPERUSER;
+
+-- Drop a role
+DROP ROLE analyst;
+```
+
+#### Grants
+
+```sql
+-- Grant individual privileges on a table
+GRANT SELECT ON orders TO analyst;
+GRANT INSERT ON orders TO analyst;
+GRANT UPDATE ON orders TO analyst;
+GRANT DELETE ON orders TO analyst;
+
+-- Grant all privileges at once
+GRANT ALL ON orders TO analyst;
+
+-- Revoke privileges
+REVOKE SELECT ON orders FROM analyst;
+REVOKE ALL ON orders FROM analyst;
+```
+
+A non-superuser executing a SQL statement on a table for which they lack the corresponding
+privilege receives `403 PERMISSION_DENIED`.
+
+#### Row-level security (RLS) policies
+
+```sql
+-- Policy enforced on SELECT (AND-rewrite via apply_rls)
+CREATE POLICY my_select_policy ON orders FOR SELECT USING (tenant_id = 42);
+
+-- Policy enforced on INSERT (per-row check in exec_insert)
+CREATE POLICY my_insert_policy ON orders FOR INSERT USING (status = 'pending');
+
+-- Policy for UPDATE or DELETE
+CREATE POLICY my_update_policy ON orders FOR UPDATE USING (owner_id = 99);
+CREATE POLICY my_delete_policy ON orders FOR DELETE USING (archived = true);
+
+-- ALL applies the policy to every operation (INSERT enforcement + SELECT/UPDATE/DELETE rewrite)
+CREATE POLICY all_ops_policy ON orders FOR ALL USING (tenant_id = 42);
+
+-- Drop a policy
+DROP POLICY my_select_policy ON orders;
+```
+
+INSERT policies are enforced per-row in `exec_insert` via `insert_policy`. SELECT, UPDATE,
+and DELETE policies are applied as a predicate AND-rewrite via `apply_rls` at query planning
+time, regardless of which route invoked `execute_sql`. Policies persist across server restart
+(catalog-stored). Multiple policies on the same table and operation are combined with AND.
+
+#### Enforcement on server routes
+
+| Route | Enforcement |
+|---|---|
+| `POST /sql` (one-shot) | `authorize_sql(user, sql)` pre-checks privilege before execution |
+| `POST /sql` (session) | `authorize_sql(user, sql)` pre-checks privilege before execution |
+| `POST /tables/{name}/bulk` | `check_table_grant(user, table, Insert)` checked before reading body |
+| `GET /rows/*`, `PUT /rows/*` etc. | Intentionally unenforced — pre-SQL era routes with no table name |
+
+#### Catalog virtual relations
+
+The current roles, grants, and policies are queryable as virtual relations:
+
+```sql
+SELECT * FROM unidb_catalog.roles;
+SELECT * FROM unidb_catalog.grants;
+SELECT * FROM unidb_catalog.policies;
+```
+
+These are read-only virtual tables synthesized by the executor from the in-memory `RoleStore`
+(which is itself loaded from the persisted catalog at engine open). They do not correspond to
+heap pages on disk.
+
+#### Open-mode compatibility
+
+With no roles registered, the server runs in **open mode**: all validly-authenticated users
+have full access to all tables. Open mode is the default and maintains full backward
+compatibility with deployments that do not use per-user authorization. Once any role or grant
+is registered, the engine enforces privileges on all subsequent requests.
 
 ---
 
