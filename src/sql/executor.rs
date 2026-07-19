@@ -978,6 +978,11 @@ fn stage_row_index_writes_update(
                     }
                 }
             } else if let Ok(value) = OrderedValue::try_from(&new_row[idx]) {
+                // Changed unique key — insert inline (per-row) to preserve in-statement
+                // visibility for subsequent rows' enforce_unique checks.  Deferring this
+                // to a post-loop batch would let enforce_unique miss earlier in-flight
+                // entries and silently admit UNIQUE violations mid-statement.
+                // Safe batch only applies to the can_batch_non_hot path (has_unique=false).
                 DiskBTree::new(uiq_meta, ctx.page_size)
                     .insert(value, new_row_id, ctx.pool, ctx.wal)?;
             }

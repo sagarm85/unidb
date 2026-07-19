@@ -708,10 +708,8 @@ fn item85_cross_row_churn_no_index_no_hang() {
                     while done < rounds {
                         let v = 100 + done;
                         let xid = engine.begin().unwrap();
-                        let a = engine.execute_sql(
-                            xid,
-                            &format!("UPDATE t SET k = {v} WHERE id = {first}"),
-                        );
+                        let a = engine
+                            .execute_sql(xid, &format!("UPDATE t SET k = {v} WHERE id = {first}"));
                         let b = a.and_then(|_| {
                             engine.execute_sql(
                                 xid,

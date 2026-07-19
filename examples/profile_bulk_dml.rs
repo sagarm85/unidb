@@ -79,7 +79,10 @@ fn main() {
         let x = engine.begin().unwrap();
         let t1 = Instant::now();
         let _ = engine
-            .execute_sql(x, &format!("UPDATE t SET body = 'updated' WHERE k < {half}"))
+            .execute_sql(
+                x,
+                &format!("UPDATE t SET body = 'updated' WHERE k < {half}"),
+            )
             .unwrap();
         engine.commit(x).unwrap();
         let u = t1.elapsed().as_secs_f64();

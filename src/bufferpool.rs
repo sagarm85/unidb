@@ -619,8 +619,8 @@ impl BufferPool {
                 st.frames[frame_idx].clock_ref = true;
                 drop(st);
                 self.hits.fetch_add(1, Ordering::Relaxed); // item 21: cache hit
-                // Pool hit: page was CRC-verified when it entered the pool;
-                // skip re-verification (item 86).
+                                                           // Pool hit: page was CRC-verified when it entered the pool;
+                                                           // skip re-verification (item 86).
                 return self.read_page_from_mmap_unchecked(page_id);
             }
 
