@@ -2264,7 +2264,7 @@ impl Engine {
             .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
         t.rls_policy = rls_merged;
         t.insert_policy = ins_merged;
-        cat.persist_only(ctx)
+        cat.persist_only(ctx).map(|_| ())
     }
 
     /// Public superuser gate (P6.e semantics) for server-side admin routes
@@ -3053,6 +3053,11 @@ impl Engine {
     /// the error — so the caller just sees `SerializationFailure` on a fully
     /// cleaned-up transaction, and should retry.
     pub fn commit(&self, xid: Xid) -> Result<()> {
+        // Item 97: drain deferred row-count deltas BEFORE committing (commit
+        // removes `xid` from the active-transaction map). Empty for read-only
+        // or DDL-only transactions.
+        let row_count_deltas = self.txn_mgr.take_row_count_deltas(xid);
+
         let commit_lsn = match self.txn_mgr.commit(xid, &self.wal, &self.lock_mgr) {
             Err(DbError::SerializationFailure { xid }) => {
                 self.abort(xid)?;
@@ -3076,6 +3081,53 @@ impl Engine {
             self.timeline
                 .record(crate::backup::timeline::now_micros(), lsn);
         }
+
+        // Item 97: apply row-count deltas now that the transaction is committed
+        // and WAL-durable. This writes a new catalog page (mini-txn) so the
+        // updated row_count survives restart. A failure here is non-fatal: the
+        // heap data is durable; row_count just remains stale until the next DML
+        // commit re-persists it. The delta map is always empty for DDL/read-only
+        // transactions, so there is no overhead for those paths.
+        if !row_count_deltas.is_empty() {
+            let mut cat = cat_write(&self.catalog);
+            {
+                let tables = cat.tables_mut();
+                for (table, delta) in &row_count_deltas {
+                    if *delta == i64::MIN {
+                        // TRUNCATE sentinel — reset to 0.
+                        if let Some(t) = tables.get_mut(table.as_str()) {
+                            t.row_count = 0;
+                        }
+                    } else if *delta != 0 {
+                        if let Some(t) = tables.get_mut(table.as_str()) {
+                            t.row_count = t.row_count.saturating_add(*delta);
+                        }
+                    }
+                }
+            }
+            let mut ctx = CatalogCtx {
+                pool: &self.pool,
+                wal: &self.wal,
+                control_path: &self.control_path,
+                control: &self.control,
+                page_size: self.page_size,
+            };
+            match cat.persist_only(&mut ctx) {
+                Ok(catalog_lsn) => {
+                    // The catalog mini-txn was written under deferred-sync mode, so
+                    // `commit_mini_txn` did NOT advance `durable_lsn`. Advance it
+                    // now so `ship_wal` / `records_from` include the catalog pages
+                    // in the replication stream (item 97 fix).
+                    if let Err(e) = self.wal.sync_up_to(catalog_lsn) {
+                        tracing::warn!("item 97: WAL sync after catalog persist failed: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("item 97: row_count catalog write failed after commit: {e}");
+                }
+            }
+        }
+
         // Q2 (item 26): wake any blocked subscribers AFTER WAL sync so they see
         // durable events. No latch is held at this point (P5.e safe).
         self.event_wake.notify();

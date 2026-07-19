@@ -34,7 +34,7 @@ use crate::{
     bufferpool::BufferPool,
     control::{self, ControlData},
     error::{DbError, Result},
-    format::{u32_from_le, u32_to_le, PageId, INVALID_PAGE_ID, PAGE_TYPE_META},
+    format::{u32_from_le, u32_to_le, Lsn, PageId, INVALID_PAGE_ID, PAGE_TYPE_META},
     heap::encode_insert_redo,
     page::{SlottedPage, PAGE_HEADER_SIZE, SLOT_SIZE, TUPLE_HEADER_SIZE},
     sql::logical::{Expr, Literal},
@@ -315,6 +315,13 @@ pub struct TableDef {
     /// so pre-existing catalog blobs deserialize with 0.
     #[serde(default)]
     pub generation: u64,
+    /// Exact count of committed rows. Maintained on INSERT commit (+N) and
+    /// DELETE commit (-N). Initialized to 0 at CREATE TABLE. Reset to 0 by
+    /// TRUNCATE. Updated atomically under the catalog page latch. See item 97.
+    /// `#[serde(default)]` so pre-v11 catalog blobs deserialise with 0 (treated
+    /// as stale; recalibrated on the next DML commit that calls `persist_only`).
+    #[serde(default)]
+    pub row_count: i64,
 }
 
 /// Everything `Catalog` needs to durably persist itself, bundled so
@@ -468,8 +475,29 @@ impl Catalog {
     /// Persist the current catalog blob without any other mutation. Used when
     /// `Engine::drop_policy` has already mutated a `TableDef` in place via
     /// `tables_mut`.
-    pub fn persist_only(&mut self, ctx: &mut CatalogCtx) -> Result<()> {
+    ///
+    /// Returns the WAL commit LSN of the catalog mini-txn so callers that need
+    /// to advance `durable_lsn` (e.g. `Engine::commit` in item 97) can call
+    /// `wal.sync_up_to(lsn)` after this returns.
+    pub fn persist_only(&mut self, ctx: &mut CatalogCtx) -> Result<Lsn> {
         self.persist(ctx)
+    }
+
+    /// Apply a signed `delta` to `table.row_count` and durably persist the
+    /// catalog. Called inside a mini-txn at user-transaction commit time (item
+    /// 97). Saturating arithmetic guards against wrap-around on absurd inputs.
+    pub fn update_row_count(
+        &mut self,
+        table: &str,
+        delta: i64,
+        ctx: &mut CatalogCtx,
+    ) -> Result<()> {
+        let t = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
+        t.row_count = t.row_count.saturating_add(delta);
+        self.persist(ctx).map(|_| ())
     }
 
     pub fn create_table(&mut self, mut def: TableDef, ctx: &mut CatalogCtx) -> Result<()> {
@@ -485,7 +513,7 @@ impl Catalog {
             def.fsm_meta = Some(fsm.meta_page());
         }
         self.tables.insert(def.name.clone(), def);
-        self.persist(ctx)
+        self.persist(ctx).map(|_| ())
     }
 
     pub fn set_rls_policy(
@@ -499,7 +527,7 @@ impl Catalog {
             .get_mut(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
         t.rls_policy = Some(policy);
-        self.persist(ctx)
+        self.persist(ctx).map(|_| ())
     }
 
     /// Set the INSERT-only policy predicate (item-24 Z1: `CREATE POLICY … FOR INSERT`).
@@ -514,7 +542,7 @@ impl Catalog {
             .get_mut(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
         t.insert_policy = policy;
-        self.persist(ctx)
+        self.persist(ctx).map(|_| ())
     }
 
     /// Append a named RLS policy (item-24 Z1: `CREATE POLICY`). Rejects a
@@ -535,7 +563,7 @@ impl Catalog {
             )));
         }
         t.policies.push(policy);
-        self.persist(ctx)
+        self.persist(ctx).map(|_| ())
     }
 
     /// Remove a named RLS policy (item-24 Z1: `DROP POLICY`).
@@ -551,7 +579,7 @@ impl Catalog {
                 "policy '{name}' not found on table '{table}'"
             )));
         }
-        self.persist(ctx)
+        self.persist(ctx).map(|_| ())
     }
 
     /// Enable or disable event capture on a table (M4). `Engine::
@@ -569,7 +597,7 @@ impl Catalog {
             .get_mut(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
         t.events_enabled = enabled;
-        self.persist(ctx)
+        self.persist(ctx).map(|_| ())
     }
 
     /// Attach (or clear) a secondary-index kind on one column. `CREATE
@@ -597,7 +625,7 @@ impl Catalog {
             })?;
         col.index = kind;
         t.generation = t.generation.wrapping_add(1);
-        self.persist(ctx)
+        self.persist(ctx).map(|_| ())
     }
 
     /// Record the stable meta page id of a column's durable B-Tree (P3.a). Set
@@ -624,7 +652,7 @@ impl Catalog {
             })?;
         col.index_root = index_root;
         t.generation = t.generation.wrapping_add(1);
-        self.persist(ctx)
+        self.persist(ctx).map(|_| ())
     }
 
     /// Record the stable meta page id of a column's implicit unique-enforcement
@@ -652,7 +680,7 @@ impl Catalog {
             })?;
         col.unique_index_root = unique_index_root;
         t.generation = t.generation.wrapping_add(1);
-        self.persist(ctx)
+        self.persist(ctx).map(|_| ())
     }
 
     /// Update a table's stored page list (called by the executor after an
@@ -668,7 +696,7 @@ impl Catalog {
             .get_mut(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
         t.pages = pages;
-        self.persist(ctx)
+        self.persist(ctx).map(|_| ())
     }
 
     /// Store `ANALYZE`-computed statistics for a table and durably persist the
@@ -684,7 +712,7 @@ impl Catalog {
             return Err(DbError::TableNotFound(table.to_string()));
         }
         self.stats.insert(table.to_string(), stats);
-        self.persist(ctx)
+        self.persist(ctx).map(|_| ())
     }
 
     /// The stored statistics for a table, if it has been `ANALYZE`d (P4.d).
@@ -737,7 +765,7 @@ impl Catalog {
         }
         t.columns.push(col);
         t.generation = t.generation.wrapping_add(1);
-        self.persist(ctx)
+        self.persist(ctx).map(|_| ())
     }
 
     /// `ALTER TABLE DROP COLUMN` (P2.c). Logical tombstone: the column keeps its
@@ -778,7 +806,7 @@ impl Catalog {
         col.index = None;
         col.constraints = ColumnConstraints::default();
         t.generation = t.generation.wrapping_add(1);
-        self.persist(ctx)
+        self.persist(ctx).map(|_| ())
     }
 
     /// `DROP TABLE` (P2.c). Removes the table from the catalog. Its heap pages
@@ -790,7 +818,7 @@ impl Catalog {
             return Err(DbError::TableNotFound(table.to_string()));
         }
         self.stats.remove(table);
-        self.persist(ctx)
+        self.persist(ctx).map(|_| ())
     }
 
     /// `TRUNCATE` (P2.c). Drops every row by clearing the table's page list; the
@@ -819,12 +847,13 @@ impl Catalog {
             t.fsm_meta = Some(meta);
         }
         t.generation = t.generation.wrapping_add(1);
-        // Row set is now empty; previously gathered stats are stale.
+        t.row_count = 0; // item 97: TRUNCATE resets exact count
+                         // Row set is now empty; previously gathered stats are stale.
         self.stats.remove(table);
-        self.persist(ctx)
+        self.persist(ctx).map(|_| ())
     }
 
-    fn persist(&self, ctx: &mut CatalogCtx) -> Result<()> {
+    fn persist(&self, ctx: &mut CatalogCtx) -> Result<Lsn> {
         let blob = PersistedCatalogRef {
             tables: &self.tables,
             stats: &self.stats,
@@ -886,7 +915,7 @@ impl Catalog {
             ctx.pool.write_page(&page)?;
             prev_lsn = lsn;
         }
-        ctx.wal.commit_mini_txn(txn_id, prev_lsn)?;
+        let commit_lsn = ctx.wal.commit_mini_txn(txn_id, prev_lsn)?;
 
         // Atomic commit point: flip catalog_root to the head of the new chain.
         {
@@ -894,7 +923,7 @@ impl Catalog {
             control.catalog_root = page_ids[0];
             control::write(ctx.control_path, &control)?;
         }
-        Ok(())
+        Ok(commit_lsn)
     }
 
     #[cfg(test)]
@@ -959,6 +988,7 @@ mod tests {
             serial_next: Default::default(),
             constraints: Default::default(),
             generation: 0,
+            row_count: 0,
         };
         let mut ctx = CatalogCtx {
             pool: &pool,
@@ -989,6 +1019,7 @@ mod tests {
             serial_next: Default::default(),
             constraints: Default::default(),
             generation: 0,
+            row_count: 0,
         };
         let mut ctx = CatalogCtx {
             pool: &pool,
@@ -1038,6 +1069,7 @@ mod tests {
             serial_next: Default::default(),
             constraints: Default::default(),
             generation: 0,
+            row_count: 0,
         };
         {
             let mut ctx = CatalogCtx {
@@ -1093,6 +1125,7 @@ mod tests {
             serial_next: Default::default(),
             constraints: Default::default(),
             generation: 0,
+            row_count: 0,
         };
         {
             let mut ctx = CatalogCtx {
@@ -1129,6 +1162,7 @@ mod tests {
             serial_next: Default::default(),
             constraints: Default::default(),
             generation: 0,
+            row_count: 0,
         };
         let policy = Expr::BinOp {
             op: CmpOp::Eq,
@@ -1180,6 +1214,7 @@ mod tests {
             serial_next: Default::default(),
             constraints: Default::default(),
             generation: 0,
+            row_count: 0,
         }
     }
 
@@ -1271,6 +1306,7 @@ mod tests {
                     serial_next: Default::default(),
                     constraints: Default::default(),
                     generation: 0,
+                    row_count: 0,
                 },
             );
             m

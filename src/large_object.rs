@@ -80,6 +80,7 @@ pub fn lobs_table_def() -> TableDef {
         serial_next: Default::default(),
         constraints: Default::default(),
         generation: 0,
+        row_count: 0,
     }
 }
 

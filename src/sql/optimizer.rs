@@ -807,6 +807,7 @@ mod tests {
             constraints: Default::default(),
             serial_next: Default::default(),
             generation: 0,
+            row_count: 0,
         });
     }
 

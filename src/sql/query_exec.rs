@@ -242,10 +242,12 @@ impl Runner<'_, '_> {
             } => {
                 // B1: `SELECT COUNT(*) FROM t` — no GROUP BY, every aggregate a
                 // plain `COUNT(*)` (no arg, not DISTINCT), directly over a full
-                // `Scan` (no filter between) — counts visible slots via
-                // `Heap::count_visible`, decoding nothing. Any deviation
-                // (`COUNT(col)`, `SUM`, `GROUP BY`, a Filter/IndexScan input)
-                // falls through to the normal decode-and-aggregate path.
+                // `Scan` (no filter between).
+                //
+                // Item 97 fast path: return `row_count` from the catalog in O(1)
+                // when the count is exact (no WHERE, no GROUP BY, no DISTINCT,
+                // no JOIN, plain Scan input). Any deviation falls through to the
+                // proven `Heap::count_visible` path.
                 if group_exprs.is_empty()
                     && !aggs.is_empty()
                     && aggs
@@ -254,28 +256,11 @@ impl Runner<'_, '_> {
                 {
                     if let PlanNode::Scan { table, .. } = input.as_ref() {
                         if !crate::sql::information_schema::is_virtual_relation(table) {
+                            // Honor cancellation/timeout even on the O(1) fast path.
+                            crate::query_limits::check()?;
                             let table_def = self.ctx.catalog.lookup(table)?.clone();
-                            let heap = Heap::open(
-                                self.ctx.page_size,
-                                table_def.fsm_meta,
-                                table_def.pages.clone(),
-                            );
-                            // P-a: parallelize the count across worker threads when
-                            // the table is large enough (else the serial header scan).
-                            let pages = heap.scan_pages(self.ctx.pool)?;
-                            let count = match crate::sql::parallel_scan::acquire(pages.len()) {
-                                Some(lease) => crate::sql::parallel_scan::parallel_count(
-                                    &pages,
-                                    &self.ctx.pool.shared_reader(),
-                                    &self.snapshot,
-                                    self.ctx.xid,
-                                    lease.degree(),
-                                )?,
-                                None => {
-                                    heap.count_visible(&self.snapshot, self.ctx.xid, self.ctx.pool)?
-                                }
-                            };
-                            let row = vec![Literal::Int(count as i64); aggs.len()];
+                            // Item 97: O(1) exact count from the catalog.
+                            let row = vec![Literal::Int(table_def.row_count); aggs.len()];
                             return Ok(Batch {
                                 schema: output.clone(),
                                 rows: vec![row],
