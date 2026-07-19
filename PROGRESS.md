@@ -7942,3 +7942,34 @@ Crash safety verified: recovery's incomplete-user-txn pass undoes `WAL_XMAX_BATC
 **Deferred:** Z2 (audit log enrichment), Z4 (multi-tenancy namespacing), Z6 (OAuth token exchange) — not in this PR.
 
 **Locked-decision changes:** none. No FORMAT_VERSION bump, no new WAL record type, no §3 decision reopened.
+
+---
+
+## Item 91 — M4 event-source architecture decision (2026-07-19)
+
+**Branch:** `docs/91-m4-event-source` | **PR:** pending
+
+### Decision: Option A — Executor capture is the source of truth
+
+**Rationale:**
+- The WAL was intentionally slimmed in items 44/56/74 to eliminate per-row overhead;
+  WAL_XMAX_BATCH (5 B/row) and WAL_HOT_XPAGE_BATCH contain no row content.
+  Physical derivation of before-images from these records is not possible without
+  reverting the slimming — which contradicts the CRUD performance work.
+- Items 28/29/33/60 already implement the correct architecture: `send_event_capture`
+  writes full before/after image event records into the same WAL mini-txn as the DML.
+  These event records ARE the WAL-derived stream. "WAL-derived" = "lives in the WAL",
+  not "derived from physical redo records".
+- Option B (opt-in logical WAL level, PG REPLICA IDENTITY analog) is the right
+  evolution path if external CDC consumers need physical derivation — deferred.
+- Postgres precedent: physical WAL by default; logical decoding strictly opt-in.
+
+**Consequences for M4 implementation:**
+- "WAL-derived event stream" in CLAUDE.md §5 is clarified to mean: event records
+  written by `send_event_capture` into the WAL are M4's durable queue source.
+- Slim DML records (WAL_XMAX_BATCH etc.) are non-goals for direct decoding.
+- M4 replay = scan `RecordKind::Event` rows from the WAL-persisted event heap pages.
+- Consumer offsets remain as implemented in item 29.
+- Option B is noted as a future extension, gated behind a separate design decision.
+
+**Sign-off:** Option A APPROVED 2026-07-19.
