@@ -12,6 +12,17 @@
 
 ## Current status
 
+- **Item 85 — Cross-row-churn concurrency HANG — FIXED 2026-07-19, branch `fix/item-85-concurrency-hang`.**
+  Root cause: `hot_update_many` Phase B→A order. Phase B (new-version inserts, committed WAL
+  mini-txns per fill page) ran before Phase A (xmax conflict check). A WriteConflict on Phase A
+  left Phase B's committed tuples as permanent ghost rows (MVCC sees them as committed since xid
+  not in active_xids). Caused row-count violation + livelock under UNIDB_CONCURRENT_SQL_WRITES=on
+  with no secondary index (scenario 10). Scenario 9 (B-tree index, hot_eligible=false) was safe.
+  Fix: A→B→C order — Phase A detects conflicts before any Phase B insert; Phase C writes
+  HOT_NEXT_XPAGE forward pointer after Phase B produces new_rids.
+  Test: `item85_cross_row_churn_no_index_no_hang` (5 reps × 10 s deadline) PASS.
+  434 lib + 51 crash tests green. Clippy clean. PR pending.
+
 - **Item 71 — Cross-page HOT chains — SHIPPED 2026-07-18, on `main`.**
   Extends same-page HOT (item 58) to full pages: old slot gets `HOT_NEXT_XPAGE=0xFFFE`
   sentinel + cross-page chain pointer in repurposed `prev_page`/`prev_slot`; B-tree
