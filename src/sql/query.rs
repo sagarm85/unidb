@@ -109,6 +109,10 @@ pub enum FromNode {
         #[serde(default)]
         using: Vec<String>,
     },
+    /// G8 (item 19): `SELECT` without `FROM`. Synthesises a single empty row so
+    /// `SELECT 1`, `SELECT 'hello'`, `SELECT 1+1` etc. work. Has no columns
+    /// in its schema; the projection expressions are pure literals / arithmetic.
+    Dual,
 }
 
 /// A base-table reference with an optional alias. `alias` (or the table name
@@ -206,6 +210,15 @@ pub enum QExpr {
         column: Box<QExpr>,
         query: Box<QExpr>,
     },
+    /// Arithmetic binary expression in the multi-relation query path (G8):
+    /// `lhs op rhs` where op is `+`, `-`, `*`, `/`, or `%`. Enables
+    /// `SELECT 1+1`, `SELECT 3*4`, and arithmetic in projections and WHERE
+    /// clauses without a FROM clause (Dual) or across joins.
+    Arith {
+        op: crate::sql::logical::ArithOp,
+        lhs: Box<QExpr>,
+        rhs: Box<QExpr>,
+    },
 }
 
 impl QExpr {
@@ -291,6 +304,10 @@ impl QExpr {
                 column.bind_params(params)?;
                 query.bind_params(params)
             }
+            QExpr::Arith { lhs, rhs, .. } => {
+                lhs.bind_params(params)?;
+                rhs.bind_params(params)
+            }
         }
     }
 
@@ -311,6 +328,7 @@ impl QExpr {
             QExpr::Exists { .. } | QExpr::ScalarSubquery(_) => false,
             QExpr::Like { expr, pattern, .. } => expr.has_aggregate() || pattern.has_aggregate(),
             QExpr::Match { column, query } => column.has_aggregate() || query.has_aggregate(),
+            QExpr::Arith { lhs, rhs, .. } => lhs.has_aggregate() || rhs.has_aggregate(),
         }
     }
 
@@ -333,6 +351,7 @@ impl QExpr {
             }
             QExpr::Like { expr, pattern, .. } => expr.has_subquery() || pattern.has_subquery(),
             QExpr::Match { column, query } => column.has_subquery() || query.has_subquery(),
+            QExpr::Arith { lhs, rhs, .. } => lhs.has_subquery() || rhs.has_subquery(),
         }
     }
 }
@@ -385,7 +404,7 @@ impl QuerySpec {
 
 fn bind_from(node: &mut FromNode, params: &[Literal]) -> crate::error::Result<()> {
     match node {
-        FromNode::Table(_) => Ok(()),
+        FromNode::Table(_) | FromNode::Dual => Ok(()),
         FromNode::Join {
             left, right, on, ..
         } => {
@@ -414,6 +433,8 @@ fn collect_table_policies(
             collect_table_policies(left, policy_for, out);
             collect_table_policies(right, policy_for, out);
         }
+        // Dual has no base table, so no RLS policy applies.
+        FromNode::Dual => {}
     }
 }
 
@@ -455,6 +476,11 @@ fn qualify_policy(policy: Expr, qualifier: &str) -> QExpr {
                 name: column,
             }),
             query: Box::new(qualify_policy(*query, qualifier)),
+        },
+        // G10 (item 19): IS [NOT] NULL is a valid RLS policy shape.
+        Expr::IsNull { expr, negated } => QExpr::IsNull {
+            expr: Box::new(qualify_policy(*expr, qualifier)),
+            negated,
         },
         // JSON extraction, NEAR, and arithmetic are not valid RLS policy shapes;
         // treat as a permissive no-op rather than inventing semantics for them.

@@ -64,12 +64,17 @@ pub fn label(node: &PlanNode) -> String {
         PlanNode::Limit { limit, offset, .. } => {
             format!("Limit (limit={:?}, offset={offset})", limit)
         }
+        // G8: virtual single-row source for SELECT without FROM.
+        PlanNode::Dual => "Dual".to_string(),
     }
 }
 
 fn children(node: &PlanNode) -> Vec<&PlanNode> {
     match node {
-        PlanNode::Scan { .. } | PlanNode::IndexScan { .. } | PlanNode::CteScan { .. } => vec![],
+        PlanNode::Scan { .. }
+        | PlanNode::IndexScan { .. }
+        | PlanNode::CteScan { .. }
+        | PlanNode::Dual => vec![],
         PlanNode::NestedLoopJoin { left, right, .. }
         | PlanNode::HashJoin { left, right, .. }
         | PlanNode::MergeJoin { left, right, .. } => vec![left, right],
@@ -143,6 +148,8 @@ pub fn estimate_rows(node: &PlanNode, catalog: &Catalog) -> f64 {
                 None => n,
             }
         }
+        // G8: Dual emits exactly one row.
+        PlanNode::Dual => 1.0,
     }
 }
 

@@ -456,10 +456,13 @@ fn convert_insert(ins: ast::Insert) -> Result<LogicalPlan> {
             )))
         }
     };
+    // G5 (item 19): RETURNING clause.
+    let returning = convert_returning(ins.returning)?;
     Ok(LogicalPlan::Insert {
         table,
         columns,
         values: rows,
+        returning,
     })
 }
 
@@ -643,7 +646,11 @@ fn convert_query(q: ast::Query) -> Result<LogicalPlan> {
             .map(|n| crate::sql::information_schema::is_virtual_relation(&n))
             .unwrap_or(false)
     });
-    let needs_query = has_join
+    // G8 (item 19): SELECT without FROM — route to the Phase-4 path which can
+    // synthesize a single-row `FromNode::Dual` source. No storage access needed.
+    let no_from = select.from.is_empty();
+    let needs_query = no_from
+        || has_join
         || group_by_present
         || select.having.is_some()
         || select.distinct.is_some()
@@ -897,11 +904,13 @@ fn expr_to_usize(e: &SqlExpr) -> Result<usize> {
 
 /// Fold the FROM list into a left-deep [`FromNode`] tree. Comma-separated FROM
 /// items become `CROSS JOIN`s; each item's own `joins` are folded left-deep.
+/// An empty list (G8, item 19 — `SELECT` without `FROM`) returns `FromNode::Dual`.
 fn convert_from(items: &[TableWithJoins]) -> Result<FromNode> {
     let mut iter = items.iter();
-    let first = iter
-        .next()
-        .ok_or_else(|| DbError::SqlUnsupported("SELECT without FROM is not supported".into()))?;
+    let first = match iter.next() {
+        None => return Ok(FromNode::Dual),
+        Some(f) => f,
+    };
     let mut node = convert_table_with_joins(first)?;
     for twj in iter {
         let right = convert_table_with_joins(twj)?;
@@ -1230,6 +1239,13 @@ fn convert_qbinary_op(left: &SqlExpr, op: &BinaryOperator, right: &SqlExpr) -> R
             rhs: rhs.clone(),
         })
     };
+    let arith = |op: crate::sql::logical::ArithOp| {
+        Ok(QExpr::Arith {
+            op,
+            lhs: lhs.clone(),
+            rhs: rhs.clone(),
+        })
+    };
     match op {
         BinaryOperator::And => Ok(QExpr::And(lhs, rhs)),
         BinaryOperator::Or => Ok(QExpr::Or(lhs, rhs)),
@@ -1239,6 +1255,11 @@ fn convert_qbinary_op(left: &SqlExpr, op: &BinaryOperator, right: &SqlExpr) -> R
         BinaryOperator::Gt => cmp(CmpOp::Gt),
         BinaryOperator::LtEq => cmp(CmpOp::Le),
         BinaryOperator::GtEq => cmp(CmpOp::Ge),
+        BinaryOperator::Plus => arith(crate::sql::logical::ArithOp::Add),
+        BinaryOperator::Minus => arith(crate::sql::logical::ArithOp::Sub),
+        BinaryOperator::Multiply => arith(crate::sql::logical::ArithOp::Mul),
+        BinaryOperator::Divide => arith(crate::sql::logical::ArithOp::Div),
+        BinaryOperator::Modulo => arith(crate::sql::logical::ArithOp::Mod),
         other => Err(DbError::SqlUnsupported(format!(
             "unsupported operator in join query: {other}"
         ))),
@@ -1282,10 +1303,13 @@ fn convert_update(u: ast::Update) -> Result<LogicalPlan> {
         })
         .collect::<Result<Vec<_>>>()?;
     let predicate = u.selection.as_ref().map(convert_expr).transpose()?;
+    // G5 (item 19): RETURNING clause.
+    let returning = convert_returning(u.returning)?;
     Ok(LogicalPlan::Update {
         table,
         assignments,
         predicate,
+        returning,
     })
 }
 
@@ -1298,10 +1322,40 @@ fn convert_delete(d: ast::Delete) -> Result<LogicalPlan> {
         .ok_or_else(|| DbError::SqlUnsupported("DELETE without a table is not supported".into()))?;
     let table_name = table_name_from_relation(&table.relation)?;
     let predicate = d.selection.as_ref().map(convert_expr).transpose()?;
+    // G5 (item 19): RETURNING clause.
+    let returning = convert_returning(d.returning)?;
     Ok(LogicalPlan::Delete {
         table: table_name,
         predicate,
+        returning,
     })
+}
+
+/// G5 (item 19): parse a `RETURNING` clause into a column-name list.
+/// `None` input (no RETURNING) → `None` output.
+/// `Wildcard` → `Some(vec![])` (treated as "all columns" by the executor).
+/// Plain identifiers → `Some(vec![name, …])`.
+fn convert_returning(items: Option<Vec<SelectItem>>) -> Result<Option<Vec<String>>> {
+    let items = match items {
+        None => return Ok(None),
+        Some(v) => v,
+    };
+    let mut cols = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            SelectItem::Wildcard(_) => return Ok(Some(vec![])),
+            SelectItem::UnnamedExpr(SqlExpr::Identifier(ident)) => cols.push(ident.value),
+            SelectItem::UnnamedExpr(SqlExpr::CompoundIdentifier(parts)) => {
+                cols.push(column_name_from_parts(&parts));
+            }
+            other => {
+                return Err(DbError::SqlUnsupported(format!(
+                    "unsupported RETURNING item: {other:?}"
+                )))
+            }
+        }
+    }
+    Ok(Some(cols))
 }
 
 fn table_name_from_relation(rel: &TableFactor) -> Result<String> {
@@ -1368,6 +1422,15 @@ fn convert_expr(e: &SqlExpr) -> Result<Expr> {
                 case_insensitive: true,
             })
         }
+        // G10 (item 19): IS [NOT] NULL on the simple row path.
+        SqlExpr::IsNull(inner) => Ok(Expr::IsNull {
+            expr: Box::new(convert_expr(inner)?),
+            negated: false,
+        }),
+        SqlExpr::IsNotNull(inner) => Ok(Expr::IsNull {
+            expr: Box::new(convert_expr(inner)?),
+            negated: true,
+        }),
         other => Err(DbError::SqlUnsupported(format!(
             "unsupported expression: {other:?}"
         ))),
@@ -1885,6 +1948,7 @@ mod tests {
                 table,
                 columns,
                 values,
+                ..
             } => {
                 assert_eq!(table, "accounts");
                 assert_eq!(columns, Some(vec!["id".to_string(), "name".to_string()]));
@@ -1948,6 +2012,7 @@ mod tests {
                 table,
                 assignments,
                 predicate,
+                ..
             } => {
                 assert_eq!(table, "accounts");
                 assert_eq!(assignments.len(), 1);
@@ -1962,7 +2027,9 @@ mod tests {
     fn parses_delete() {
         let plan = parse_one("DELETE FROM accounts WHERE id = 1");
         match plan {
-            LogicalPlan::Delete { table, predicate } => {
+            LogicalPlan::Delete {
+                table, predicate, ..
+            } => {
                 assert_eq!(table, "accounts");
                 assert!(predicate.is_some());
             }

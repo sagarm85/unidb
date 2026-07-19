@@ -168,6 +168,9 @@ fn flatten_inner(node: &FromNode, tables: &mut Vec<TableRef>, on: &mut Vec<QExpr
             tables.push(tref.clone());
             true
         }
+        // G8 (item 19): Dual has no base tables; the optimizer falls back to
+        // plan_from which handles it as PlanNode::Dual.
+        FromNode::Dual => false,
         FromNode::Join {
             left,
             right,
@@ -307,6 +310,10 @@ fn collect_qualifiers(expr: &QExpr, out: &mut std::collections::HashSet<String>)
         QExpr::Match { column, query } => {
             collect_qualifiers(column, out);
             collect_qualifiers(query, out);
+        }
+        QExpr::Arith { lhs, rhs, .. } => {
+            collect_qualifiers(lhs, out);
+            collect_qualifiers(rhs, out);
         }
         // Subquery forms and aggregates reference outer schema — treat as
         // multi-table / non-pushable to be safe.
@@ -542,6 +549,10 @@ fn collect_columns(expr: &QExpr, out: &mut Vec<(Option<String>, String)>) {
         QExpr::Match { column, query } => {
             collect_columns(column, out);
             collect_columns(query, out);
+        }
+        QExpr::Arith { lhs, rhs, .. } => {
+            collect_columns(lhs, out);
+            collect_columns(rhs, out);
         }
     }
 }

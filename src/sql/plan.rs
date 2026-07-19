@@ -53,6 +53,10 @@ pub enum PlanNode {
         qualifier: String,
         output: Vec<ColumnRef>,
     },
+    /// G8 (item 19): `SELECT` without `FROM`. Yields exactly one row with zero
+    /// columns so the projection above it can evaluate pure literal / arithmetic
+    /// expressions. Analogous to Oracle's `DUAL` table or SQLite's virtual row.
+    Dual,
     /// Scan of a materialized CTE (P4.c): the executor reads its rows from the
     /// once-computed CTE batch rather than a heap.
     CteScan {
@@ -189,6 +193,8 @@ impl PlanNode {
             | PlanNode::Distinct { output, .. }
             | PlanNode::Sort { output, .. }
             | PlanNode::Limit { output, .. } => output,
+            // G8: Dual has zero input columns; projection above it supplies them.
+            PlanNode::Dual => &[],
         }
     }
 }
@@ -242,6 +248,19 @@ pub fn plan_query(spec: &QuerySpec, catalog: &Catalog, ctes: &CteSchemas) -> Res
         resolve_projection(&spec.projection, node.output())?
     };
 
+    // G4 (item 19): ORDER BY on a non-projected expression. Standard SQL
+    // requires sorting over the pre-projection schema when the ORDER BY key
+    // isn't in the SELECT list. Strategy: if any ORDER BY key resolves against
+    // the input schema but not the projected output, sort *before* projecting.
+    //
+    // For non-aggregate queries without DISTINCT, we resolve ORDER BY keys
+    // against both the input schema (pre-projection) and the projected output:
+    // - Keys found in the projected output: resolved by name/position as before.
+    // - Keys found only in the input: sort before the projection, then project.
+    //
+    // DISTINCT + ORDER BY on non-projected cols is not supported (SQL standard
+    // forbids it, Postgres rejects it too).
+    let pre_proj_schema = node.output().to_vec();
     let proj_output: Vec<ColumnRef> = items
         .iter()
         .map(|it| ColumnRef {
@@ -250,6 +269,38 @@ pub fn plan_query(spec: &QuerySpec, catalog: &Catalog, ctes: &CteSchemas) -> Res
             ty: ColumnType::Text, // projected type is not tracked past here
         })
         .collect();
+
+    if !spec.order_by.is_empty() && !has_agg && !spec.distinct {
+        // Check whether any ORDER BY key is absent from the projected output.
+        let needs_pre_proj_sort = spec
+            .order_by
+            .iter()
+            .any(|k| order_key_needs_pre_proj_sort(&k.expr, &proj_output, &pre_proj_schema));
+        if needs_pre_proj_sort {
+            // Sort over the pre-projection schema, then project.
+            let keys = resolve_order_by_pre_proj(&spec.order_by, &pre_proj_schema, &proj_output)?;
+            node = PlanNode::Sort {
+                input: Box::new(node),
+                keys,
+                output: pre_proj_schema.clone(),
+            };
+            node = PlanNode::Projection {
+                input: Box::new(node),
+                items,
+                output: proj_output.clone(),
+            };
+            if spec.limit.is_some() || spec.offset > 0 {
+                node = PlanNode::Limit {
+                    input: Box::new(node),
+                    limit: spec.limit,
+                    offset: spec.offset,
+                    output: proj_output,
+                };
+            }
+            return Ok(node);
+        }
+    }
+
     node = PlanNode::Projection {
         input: Box::new(node),
         items,
@@ -365,6 +416,10 @@ fn collect_aggs(expr: &QExpr, out: &mut Vec<AggCall>) {
             collect_aggs(column, out);
             collect_aggs(query, out);
         }
+        QExpr::Arith { lhs, rhs, .. } => {
+            collect_aggs(lhs, out);
+            collect_aggs(rhs, out);
+        }
     }
 }
 
@@ -463,6 +518,11 @@ fn rewrite_over_agg(expr: &QExpr, group_exprs: &[QExpr], aggs: &[AggCall]) -> Re
             column: Box::new(rewrite_over_agg(column, group_exprs, aggs)?),
             query: Box::new(rewrite_over_agg(query, group_exprs, aggs)?),
         }),
+        QExpr::Arith { op, lhs, rhs } => Ok(QExpr::Arith {
+            op: *op,
+            lhs: Box::new(rewrite_over_agg(lhs, group_exprs, aggs)?),
+            rhs: Box::new(rewrite_over_agg(rhs, group_exprs, aggs)?),
+        }),
     }
 }
 
@@ -534,6 +594,87 @@ fn resolve_order_by(order_by: &[OrderKey], output: &[ColumnRef]) -> Result<Vec<S
             _ => {
                 return Err(DbError::SqlUnsupported(
                     "ORDER BY supports an output column name or 1-based position in v1".into(),
+                ))
+            }
+        };
+        keys.push(SortKey { column, asc: k.asc });
+    }
+    Ok(keys)
+}
+
+/// G4 (item 19): determine whether an ORDER BY expression requires pre-projection
+/// sorting (i.e., the key is a column present in the input schema but absent from
+/// the projected output). Returns `true` if the key is a column name that exists
+/// in `pre_proj_schema` but NOT in `proj_output`.
+fn order_key_needs_pre_proj_sort(
+    expr: &QExpr,
+    proj_output: &[ColumnRef],
+    pre_proj_schema: &[ColumnRef],
+) -> bool {
+    match expr {
+        QExpr::Column { name, .. } => {
+            let in_proj = proj_output
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(name));
+            if in_proj {
+                return false;
+            }
+            // Present in pre-projection schema → needs pre-proj sort.
+            pre_proj_schema
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(name))
+        }
+        // Positional (ORDER BY 1) and other expressions: handled post-projection.
+        _ => false,
+    }
+}
+
+/// G4 (item 19): resolve ORDER BY keys against the pre-projection schema when
+/// any key refers to a column not in the projected output. Each key is resolved:
+/// - Column name in the projected output → index in projected output (will sort
+///   over pre_proj_schema at the matching pre-proj position).
+/// - Column name only in pre_proj_schema → index in pre_proj_schema.
+/// - Position literal → index into projected output (post-proj semantics).
+fn resolve_order_by_pre_proj(
+    order_by: &[OrderKey],
+    pre_proj_schema: &[ColumnRef],
+    proj_output: &[ColumnRef],
+) -> Result<Vec<SortKey>> {
+    let mut keys = Vec::new();
+    for k in order_by {
+        let column = match &k.expr {
+            QExpr::Literal(crate::sql::logical::Literal::Int(n)) => {
+                // Position is relative to projected output; find it in pre_proj_schema.
+                let proj_idx = (*n as usize)
+                    .checked_sub(1)
+                    .filter(|i| *i < proj_output.len())
+                    .ok_or_else(|| {
+                        DbError::SqlPlan(format!("ORDER BY position {n} is out of range"))
+                    })?;
+                let proj_name = &proj_output[proj_idx].name;
+                pre_proj_schema
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(proj_name))
+                    .unwrap_or(proj_idx)
+            }
+            QExpr::Column { name, qualifier } => {
+                // First look in pre-projection schema (wider set).
+                if let Some(idx) = pre_proj_schema.iter().position(|c| {
+                    c.name.eq_ignore_ascii_case(name)
+                        && qualifier
+                            .as_deref()
+                            .is_none_or(|q| c.qualifier.eq_ignore_ascii_case(q))
+                }) {
+                    idx
+                } else {
+                    return Err(DbError::SqlPlan(format!(
+                        "ORDER BY '{name}' is not a column in the FROM clause"
+                    )));
+                }
+            }
+            _ => {
+                return Err(DbError::SqlUnsupported(
+                    "ORDER BY supports a column name or 1-based position in v1".into(),
                 ))
             }
         };
@@ -624,6 +765,8 @@ pub(crate) fn plan_from(node: &FromNode, catalog: &Catalog, ctes: &CteSchemas) -
             }
             plan_join(left, right, *join_type, on.clone(), catalog)
         }
+        // G8 (item 19): SELECT without FROM — single empty row, no columns.
+        FromNode::Dual => Ok(PlanNode::Dual),
     }
 }
 
@@ -967,6 +1110,10 @@ fn validate_expr(expr: &QExpr, schema: &[ColumnRef]) -> Result<()> {
             validate_expr(column, schema)?;
             validate_expr(query, schema)
         }
+        QExpr::Arith { lhs, rhs, .. } => {
+            validate_expr(lhs, schema)?;
+            validate_expr(rhs, schema)
+        }
     }
 }
 
@@ -1091,6 +1238,12 @@ pub fn eval_qexpr(expr: &QExpr, schema: &[ColumnRef], row: &[Literal]) -> Result
             Ok(Literal::Bool(
                 query_tokens.iter().all(|t| text_tokens.contains(t)),
             ))
+        }
+        // Arithmetic in the query path (G8): enables `SELECT 1+1`, etc.
+        QExpr::Arith { op, lhs, rhs } => {
+            let l = eval_qexpr(lhs, schema, row)?;
+            let r = eval_qexpr(rhs, schema, row)?;
+            executor::eval_arith(*op, l, r)
         }
     }
 }

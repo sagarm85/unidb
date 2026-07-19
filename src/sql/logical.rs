@@ -130,6 +130,7 @@ fn bind_expr(expr: &mut Expr, params: &[Literal]) -> Result<()> {
             bind_expr(pattern, params)
         }
         Expr::Match { query, .. } => bind_expr(query, params),
+        Expr::IsNull { expr, .. } => bind_expr(expr, params),
         Expr::Column(_) | Expr::ColumnSlot(_) | Expr::Near { .. } => Ok(()),
     }
 }
@@ -243,6 +244,13 @@ pub enum Expr {
         column: String,
         query: Box<Expr>,
     },
+    /// `expr IS [NOT] NULL` (G10, item 19). Works on both the simple row path
+    /// (`eval_expr`) and under `NEAR`/`MATCH` predicate re-check. `negated =
+    /// true` for `IS NOT NULL`.
+    IsNull {
+        expr: Box<Expr>,
+        negated: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -260,6 +268,10 @@ pub enum LogicalPlan {
         /// `None` means "all columns, in table-definition order."
         columns: Option<Vec<String>>,
         values: Vec<Vec<Literal>>,
+        /// G5 (item 19): `RETURNING col1, col2, …`. `None` → old count-only
+        /// result; `Some(cols)` → `ExecResult::Rows` with the inserted rows.
+        /// An empty list means `RETURNING *` (all columns).
+        returning: Option<Vec<String>>,
     },
     Select {
         table: String,
@@ -277,10 +289,14 @@ pub enum LogicalPlan {
         table: String,
         assignments: Vec<(String, Expr)>,
         predicate: Option<Expr>,
+        /// G5 (item 19): `RETURNING col1, col2, …`.
+        returning: Option<Vec<String>>,
     },
     Delete {
         table: String,
         predicate: Option<Expr>,
+        /// G5 (item 19): `RETURNING col1, col2, …`.
+        returning: Option<Vec<String>>,
     },
     /// `CREATE INDEX ... ON table (column) USING HNSW|FULLTEXT` (M2.c). One
     /// column only in M2 — no composite secondary indexes.
@@ -329,17 +345,27 @@ pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog) -> LogicalPlan {
             table,
             assignments,
             predicate,
+            returning,
         } => {
             let predicate = and_policy(predicate, policy_for(catalog, &table));
             LogicalPlan::Update {
                 table,
                 assignments,
                 predicate,
+                returning,
             }
         }
-        LogicalPlan::Delete { table, predicate } => {
+        LogicalPlan::Delete {
+            table,
+            predicate,
+            returning,
+        } => {
             let predicate = and_policy(predicate, policy_for(catalog, &table));
-            LogicalPlan::Delete { table, predicate }
+            LogicalPlan::Delete {
+                table,
+                predicate,
+                returning,
+            }
         }
         LogicalPlan::Query(mut spec) => {
             // RLS for joins is the same planner rewrite: AND each base
@@ -445,6 +471,7 @@ mod tests {
         let plan = LogicalPlan::Delete {
             table: "t".to_string(),
             predicate: Some(user_pred.clone()),
+            returning: None,
         };
         let rewritten = apply_rls(plan, &catalog);
         match rewritten {
@@ -502,6 +529,7 @@ mod tests {
             table: "t".to_string(),
             columns: None,
             values: vec![vec![Literal::Param(2)]],
+            returning: None,
         };
         assert!(bind_params(&mut plan, &[Literal::Int(1)]).is_err());
     }
