@@ -1623,9 +1623,28 @@ fn exec_insert(
     enforce_referenced_tables_exist(&table_def, ctx.catalog.get())?;
     let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
 
-    // G5 (item 19): RETURNING — collect rows when requested.
-    let mut returned_rows: Vec<Vec<Literal>> = Vec::new();
-    let mut count = 0;
+    // Item 98: two-pass batch insert.
+    //
+    // Pass 1 — validate: run every per-row check (coercion, NOT NULL, CHECK,
+    // RLS policy, UNIQUE, FK) and collect the validated+encoded rows.  No heap
+    // writes happen here, so if any row fails validation the whole statement
+    // returns an error before any page is touched.
+    //
+    // Pass 2 — batch insert: hand all encoded rows to `Heap::insert_batch`,
+    // which packs them page-by-page with ONE `WAL_INSERT_BATCH` mini-txn per
+    // page instead of one mini-txn per row.  On a single-page batch this is
+    // exactly ONE WAL begin/commit for the entire statement.
+    //
+    // Pass 3 — post-process: register undo records, write index entries, and
+    // emit event captures for each row id returned by the batch insert.
+    //
+    // The snapshot for UNIQUE/FK checks is taken per-row AFTER all phantom
+    // locks for that row have been acquired — same ordering as the old single-
+    // row path, so concurrent-writer correctness (item 35 inv. 3 / item 36
+    // inv. 3) is preserved.
+    let n = values.len();
+    let mut validated: Vec<(Vec<u8>, Vec<Literal>)> = Vec::with_capacity(n);
+
     for row_values in values {
         let ordered = order_values_by_columns(&table_def, &columns, row_values)?;
         // SERIAL/identity fill (P2.d): allocate the next counter value for any
@@ -1692,7 +1711,18 @@ fn exec_insert(
             ctx.catalog.get(),
         )?;
         let encoded = encode_row(&coerced);
-        let row_id = heap.insert(&encoded, ctx.xid, ctx.pool, ctx.wal)?;
+        validated.push((encoded, coerced));
+    }
+
+    // Pass 2: batch-insert all validated rows.  One WAL mini-txn per heap page
+    // instead of one per row (item 98).
+    let encoded_rows: Vec<Vec<u8>> = validated.iter().map(|(enc, _)| enc.clone()).collect();
+    let row_ids = heap.insert_batch(&encoded_rows, ctx.xid, ctx.pool, ctx.wal)?;
+
+    // Pass 3: post-process — undo records, index writes, event captures.
+    // G5 (item 19): RETURNING — collect rows when requested.
+    let mut returned_rows: Vec<Vec<Literal>> = Vec::new();
+    for (row_id, (_, coerced)) in row_ids.iter().zip(validated) {
         ctx.txn_mgr.record_undo(
             ctx.xid,
             UndoAction::Insert {
@@ -1700,14 +1730,14 @@ fn exec_insert(
                 slot: row_id.slot,
             },
         )?;
-        apply_durable_index_writes(&table_def, row_id, &coerced, ctx)?;
+        apply_durable_index_writes(&table_def, *row_id, &coerced, ctx)?;
         // C1 (item 29): INSERT has after-only; no pre-image.
         send_event_capture(&table_def, "insert", None, Some(&coerced), ctx)?;
         if returning.is_some() {
             returned_rows.push(coerced);
         }
-        count += 1;
     }
+    let count = row_ids.len();
 
     persist_pages_if_changed(table, &heap, &table_def.pages, ctx)?;
     assert_schema_stable(ctx, table, table_def.generation);
@@ -7615,5 +7645,114 @@ mod tests {
         h.commit(xid3);
         assert_eq!(rows2.len(), 1, "exactly one row matches body = 'row-42'");
         assert_eq!(rows2[0][0], Literal::Int(42), "id=42 for body='row-42' row");
+    }
+
+    // ── Item 98: batch INSERT mini-txn tests ──────────────────────────────────
+
+    /// test_insert_batch_row_count — a 100-row VALUES INSERT must consume
+    /// O(heap-pages) WAL mini-txns, not O(rows).  For 100 small (INT, INT)
+    /// rows on a fresh 8 KiB page, the mini-txn delta from before to after the
+    /// INSERT is exactly 2: one for the heap-page allocation (alloc_heap_page
+    /// uses its own bracket, item 28/B2) and one WAL_INSERT_BATCH for all
+    /// 100 rows packed onto that page.  Before item 98 the delta was 101.
+    #[test]
+    fn test_insert_batch_row_count() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+
+        // Set up table.
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t (id INT, k INT)").unwrap();
+        h.commit(xid);
+
+        // Snapshot mini-txn count before the INSERT.
+        let before = h.wal.mini_txn_count();
+
+        // 100-row VALUES INSERT into an empty heap.
+        // Per-row sizes: type_tag(1) + i64(8) = 9 bytes, two columns = 18 B.
+        // Per-row page cost: SLOT_SIZE(4) + TUPLE_HEADER_SIZE(24) + 18 = 46 B.
+        // 100 × 46 = 4 600 B; 8 192 − PAGE_HEADER_SIZE(28) = 8 164 B usable
+        // → all 100 rows fit comfortably on one page, so delta = 2.
+        let vals: String = (0i64..100)
+            .map(|i| format!("({i}, {i})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let xid2 = h.begin();
+        let result = h
+            .exec_as(xid2, &format!("INSERT INTO t (id, k) VALUES {vals}"))
+            .unwrap();
+        h.commit(xid2);
+
+        let after = h.wal.mini_txn_count();
+        match result {
+            ExecResult::Inserted { count } => assert_eq!(count, 100),
+            o => panic!("expected Inserted, got {o:?}"),
+        }
+        // Expected: 1 (alloc mini-txn for the new heap page) + 1 (WAL_INSERT_BATCH
+        // for all 100 rows packed on that page) = 2.
+        // Old code before item 98 would have delta = 101 (1 alloc + 100 inserts).
+        let delta = after - before;
+        assert!(
+            delta <= 2,
+            "item 98: 100-row INSERT on one page must use ≤ 2 mini-txns (alloc + batch), got {delta}"
+        );
+    }
+
+    /// test_insert_batch_fk_enforcement — when one row in a multi-row VALUES
+    /// INSERT violates a FK, the whole statement must roll back and leave 0
+    /// rows in the table.  All validation happens before any heap write
+    /// (two-pass approach), so a per-row failure aborts with no partial inserts.
+    #[test]
+    fn test_insert_batch_fk_enforcement() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+
+        // Parent table with one row (id=1, id=2, id=3, id=4 — id=3 is absent).
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE parent (id INT PRIMARY KEY)")
+            .unwrap();
+        h.exec_as(xid, "INSERT INTO parent (id) VALUES (1), (2), (4), (5)")
+            .unwrap();
+        h.commit(xid);
+
+        // Child table with FK on parent.id.
+        let xid2 = h.begin();
+        h.exec_as(
+            xid2,
+            "CREATE TABLE child (id INT, pid INT REFERENCES parent(id))",
+        )
+        .unwrap();
+        h.commit(xid2);
+
+        // INSERT 5 rows where row 3 (pid=3) violates the FK.
+        let xid3 = h.begin();
+        let result = h.exec_as(
+            xid3,
+            "INSERT INTO child (id, pid) VALUES (10, 1), (20, 2), (30, 3), (40, 4), (50, 5)",
+        );
+        // Must fail — FK violation on row 3.
+        assert!(
+            result.is_err(),
+            "item 98 FK test: INSERT with a bad FK row must fail, but got Ok"
+        );
+        h.abort(xid3);
+
+        // No rows must be present in child.
+        let xid4 = h.begin();
+        let count_result = h.exec_as(xid4, "SELECT COUNT(*) FROM child").unwrap();
+        h.commit(xid4);
+        match count_result {
+            ExecResult::Rows { rows, .. } => {
+                let count = match &rows[0][0] {
+                    Literal::Int(c) => *c,
+                    o => panic!("expected Int count, got {o:?}"),
+                };
+                assert_eq!(
+                    count, 0,
+                    "item 98 FK test: all 5 rows must be absent after FK violation, got {count}"
+                );
+            }
+            o => panic!("expected Rows, got {o:?}"),
+        }
     }
 }

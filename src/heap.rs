@@ -227,6 +227,82 @@ impl Heap {
         self.insert_version(data, xid, None, pool, wal)
     }
 
+    /// INSERT multiple rows using the fewest possible mini-transactions.
+    ///
+    /// All rows are packed page-by-page: when a page fills up a new one is
+    /// acquired and a fresh mini-txn is opened.  Each page's mini-txn uses a
+    /// single `WAL_INSERT_BATCH` record (the same record type used by
+    /// `update_many`'s Phase B), so the WAL mutex is acquired once per page
+    /// rather than once per row.  In the common case where all rows fit on one
+    /// page this is exactly ONE mini-txn for the entire batch.
+    ///
+    /// Atomicity: within a single page's mini-txn all rows on that page are
+    /// either all committed or all rolled back on recovery.  Callers are
+    /// responsible for registering `UndoAction::Insert` for every returned
+    /// `RowId` so that an M1 user-transaction abort also reverts the inserts.
+    ///
+    /// Used by `exec_insert` (item 98) to collapse a multi-row VALUES INSERT
+    /// from one mini-txn per row down to one mini-txn per page.
+    pub fn insert_batch(
+        &self,
+        rows: &[Vec<u8>],
+        xid: Xid,
+        pool: &BufferPool,
+        wal: &Wal,
+    ) -> Result<Vec<RowId>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut all_row_ids: Vec<RowId> = Vec::with_capacity(rows.len());
+        let mut i = 0;
+
+        while i < rows.len() {
+            // Determine the minimum space needed for the first unplaced row so
+            // `acquire_page_for_insert` can guarantee at least one row fits.
+            let needed0 = crate::page::SLOT_SIZE + crate::page::TUPLE_HEADER_SIZE + rows[i].len();
+            let (page_id, _wg, mut page) = self.acquire_page_for_insert(needed0, pool, wal)?;
+
+            let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
+            // P1.a: full-page image before this page's first change of the interval.
+            let prev_lsn = pool
+                .maybe_log_fpi(page_id, wal, txn_id, begin_lsn)?
+                .unwrap_or(begin_lsn);
+
+            // Accumulate (slot, redo_blob) pairs for the batch WAL record.
+            let mut page_rows: Vec<(u16, Vec<u8>)> = Vec::new();
+
+            while i < rows.len() {
+                let data = &rows[i];
+                let needed = crate::page::SLOT_SIZE + crate::page::TUPLE_HEADER_SIZE + data.len();
+                if page.free_space() < needed {
+                    break; // This row goes onto the next page.
+                }
+                let slot = page.insert_versioned(data, xid, 0, None)?;
+                let row_id = RowId { page_id, slot };
+                on_write(xid, row_id);
+                let redo = encode_insert_redo(xid, None, data);
+                page_rows.push((slot, redo));
+                all_row_ids.push(row_id);
+                i += 1;
+            }
+
+            // One WAL_INSERT_BATCH record for all rows on this page — same
+            // record type as update_many Phase B (item 79).  Redo replay in
+            // recovery.rs already handles WAL_INSERT_BATCH.
+            let last_lsn = wal.log_insert_batch(txn_id, prev_lsn, page_id, xid, &page_rows)?;
+
+            page.set_lsn(last_lsn);
+            pool.write_page(&page)?;
+            let free = page.free_space();
+            pool.unpin(page_id);
+            self.note_free_space(page_id, free);
+            wal.commit_mini_txn(txn_id, last_lsn)?;
+        }
+
+        Ok(all_row_ids)
+    }
+
     fn insert_version(
         &self,
         data: &[u8],
