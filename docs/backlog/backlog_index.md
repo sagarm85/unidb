@@ -91,10 +91,12 @@
 | 72 | `72_hnsw_query_latency.md` | Performance | ✅ SHIPPED 2026-07-19 — `HnswL0Cache` L0 neighbour list cache (cd94d71) + item 73 vector hot cache together achieve warm ≤5 ms at 10k (2.38 ms measured, 11.2× speedup). See PROGRESS.md. |
 | 73 | `73_hnsw_vector_hot_cache.md` | Performance | ✅ SHIPPED 2026-07-19 — `HnswVecCache` (encoded_rid → Vec<f32>); snapshot-then-merge in `exec_select_near`; 10k warm 2.38 ms / 18.7× speedup at 1k; Docker bench pending. See PROGRESS.md. |
 | 74 | `74_hot_update_batch.md` | Performance | ✅ SHIPPED — commit 4dd81ac (hot_update_many Phase B+A) is below 7a25a5e; the items 75–84 Docker bench (report_20260718_232622.md) covers this binary: UPDATE HOT 453k rec/s / **0.62×** vs PG. No separate run needed — that IS item 74's bench. See PROGRESS.md items 75–84. |
+| 75–84 | (no separate files) | Performance | ✅ SHIPPED 2026-07-19 — DELETE + UPDATE perf sprint (PR #150). Items tracked as a bundle in PROGRESS.md "Items 75–84". |
+| 85 | `85_concurrency_hang_cross_row_churn.md` | Improvement | ✅ SHIPPED 2026-07-19 — production-default concurrency hang (cross-row UPDATE churn, toggle=on, no index); root cause: Phase B→A ordering in hot_update_many left orphaned tuples on WriteConflict; fix: swap to A→B→C. See PROGRESS.md "Item 85". |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `75_…`.**
+**Next new file → `86_…`.**
 
 ## Next up — priority order (2026-07-16, calibrated on `052432` Docker baseline)
 
