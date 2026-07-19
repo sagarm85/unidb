@@ -53,10 +53,11 @@ fn insert_rows(e: &Engine, table: &str, rows: usize, batch: usize, body: &str) {
     let mut i = 0;
     while i < rows {
         let end = (i + batch).min(rows);
-        let values: Vec<String> = (i..end)
-            .map(|j| format!("({j}, '{body}')"))
-            .collect();
-        let sql = format!("INSERT INTO {table} (id, body) VALUES {}", values.join(", "));
+        let values: Vec<String> = (i..end).map(|j| format!("({j}, '{body}')")).collect();
+        let sql = format!(
+            "INSERT INTO {table} (id, body) VALUES {}",
+            values.join(", ")
+        );
         exec(e, &sql);
         i = end;
     }
@@ -147,7 +148,10 @@ fn fill_factor_reserves_page_slack() {
 
     let dir50 = tempdir().unwrap();
     let e50 = open_engine(dir50.path());
-    exec(&e50, "CREATE TABLE t (id INT, body TEXT) WITH (fill_factor = 50)");
+    exec(
+        &e50,
+        "CREATE TABLE t (id INT, body TEXT) WITH (fill_factor = 50)",
+    );
     insert_rows(&e50, "t", ROWS, 50, &body);
     let pages50 = page_count_for(&e50, "t");
 
@@ -181,7 +185,10 @@ fn fill_factor_increases_same_page_hot_rate() {
     // fill_factor=70: INSERT leaves 30% slack per page.
     let dir70 = tempdir().unwrap();
     let e70 = open_engine(dir70.path());
-    exec(&e70, "CREATE TABLE t (id INT, body TEXT) WITH (fill_factor = 70)");
+    exec(
+        &e70,
+        "CREATE TABLE t (id INT, body TEXT) WITH (fill_factor = 70)",
+    );
     insert_rows(&e70, "t", ROWS, 50, &body_orig);
 
     // UPDATE all rows — body-only, no indexed column → hot_eligible.
@@ -266,13 +273,19 @@ fn fill_factor_100_denser_than_70() {
 
     let dir70 = tempdir().unwrap();
     let e70 = open_engine(dir70.path());
-    exec(&e70, "CREATE TABLE t (id INT, body TEXT) WITH (fill_factor = 70)");
+    exec(
+        &e70,
+        "CREATE TABLE t (id INT, body TEXT) WITH (fill_factor = 70)",
+    );
     insert_rows(&e70, "t", ROWS, 50, &body);
     let pages70 = page_count_for(&e70, "t");
 
     let dir100 = tempdir().unwrap();
     let e100 = open_engine(dir100.path());
-    exec(&e100, "CREATE TABLE t (id INT, body TEXT) WITH (fill_factor = 100)");
+    exec(
+        &e100,
+        "CREATE TABLE t (id INT, body TEXT) WITH (fill_factor = 100)",
+    );
     insert_rows(&e100, "t", ROWS, 50, &body);
     let pages100 = page_count_for(&e100, "t");
 
