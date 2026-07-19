@@ -178,17 +178,22 @@ impl Heap {
         };
         let dir = tree.page_directory(reader)?; // FSM lock NOT held across tree I/O
         let mut fsm = self.lock_fsm();
-        for (pid, free) in dir {
-            if !fsm.pages.contains(&pid) {
+        // Collect into a temporary set for O(1) dedup instead of the old
+        // O(n²) `Vec::contains` scan on each entry.
+        let existing: std::collections::HashSet<PageId> = fsm.pages.iter().copied().collect();
+        for (pid, _free) in dir {
+            // Do NOT warm free_map from the B-tree value. The durable FSM only
+            // records each page's *initial* free space at alloc time (8152 bytes
+            // for a fresh 8 KiB page) and is never updated as rows are inserted.
+            // Inserting the stale 8152 value causes find_or_alloc_page step 1 to
+            // treat every page as "has space", triggering O(n) cold probe fetches
+            // before discovering all pages are packed — the superlinear UPDATE/
+            // DELETE bottleneck identified in item 77.  We only need the page-ID
+            // list here; step 2 (newest-first, capped probe) will measure actual
+            // free space on demand.
+            if !existing.contains(&pid) {
                 fsm.pages.push(pid);
             }
-            // Warm the free map from the durable FSM value (B2) — so a reopened
-            // heap knows each page's free space without re-fetching it. Do NOT
-            // clobber a fresher in-memory value recorded this session (the tree
-            // value is only refreshed at alloc + vacuum, so it can be stale-high
-            // for a page filled since; a stale-high hint is corrected by the
-            // insert retry loop, never an over-allocation).
-            fsm.free_map.entry(pid).or_insert(free);
         }
         fsm.pages.sort_unstable();
         fsm.directory_loaded = true;
@@ -963,6 +968,7 @@ impl Heap {
         // ── Phase B: insert new versions on fill pages ──────────────────────
         // One mini-txn per fill page; pack as many rows as fit. Mirrors
         // `update_many` Phase B exactly (new-before-old latch order).
+
         let mut b_pairs: Vec<(RowId, RowId)> = Vec::with_capacity(rows.len());
         let mut i = 0;
         while i < rows.len() {
@@ -971,11 +977,12 @@ impl Heap {
             let (fill_pid, _ng, mut fill_page) = self.acquire_page_for_insert(needed, pool, wal)?;
 
             let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
-            let mut prev_lsn = pool
+            let prev_lsn = pool
                 .maybe_log_fpi(fill_pid, wal, txn_id, begin_lsn)?
                 .unwrap_or(begin_lsn);
-            let mut last_lsn = prev_lsn;
 
+            // Accumulate (slot, insert_redo_blob) pairs for the batch WAL record.
+            let mut page_rows: Vec<(u16, Vec<u8>)> = Vec::new();
             while i < rows.len() {
                 let (old_rid, new_data) = &rows[i];
                 let needed =
@@ -991,12 +998,14 @@ impl Heap {
                 };
                 on_write(xid, new_rid);
                 let redo = encode_insert_redo(xid, prev_ptr, new_data);
-                let ins_lsn = wal.log_insert(txn_id, prev_lsn, fill_pid, slot, &redo)?;
-                prev_lsn = ins_lsn;
-                last_lsn = ins_lsn;
+                page_rows.push((slot, redo));
                 b_pairs.push((*old_rid, new_rid));
                 i += 1;
             }
+
+            // Item 79: one WAL_INSERT_BATCH per fill page instead of one
+            // WAL_INSERT per row — reduces WAL mutex passes from O(rows) to O(pages).
+            let last_lsn = wal.log_insert_batch(txn_id, prev_lsn, fill_pid, xid, &page_rows)?;
 
             fill_page.set_lsn(last_lsn);
             pool.write_page(&fill_page)?;
@@ -1006,7 +1015,6 @@ impl Heap {
             self.note_free_space(fill_pid, free);
             wal.commit_mini_txn(txn_id, last_lsn)?;
         }
-
         // ── Phase A: xmax + HOT_NEXT_XPAGE on old pages ────────────────────
         // Group by old_rid.page_id (input already page-sorted). For each
         // group: one mini-txn, one FPI check, N×WAL_HOT_XPAGE_HEAD records.
@@ -1036,11 +1044,13 @@ impl Heap {
             }
 
             // One FPI check for the whole page group.
-            let mut prev_lsn = pool
+            let prev_lsn = pool
                 .maybe_log_fpi(page_id, wal, txn_id, begin_lsn)?
                 .unwrap_or(begin_lsn);
-            let mut last_lsn = prev_lsn;
 
+            // Accumulate entries for the batch WAL record.
+            // (old_slot, new_page_id, new_slot, saved_prev_page, saved_prev_slot)
+            let mut page_entries: Vec<(u16, u32, u16, u32, u16)> = Vec::with_capacity(group.len());
             for (old_rid, new_rid) in group {
                 // Read saved_prev before overwriting hot_next (under latch).
                 let th = page.tuple_header(old_rid.slot)?;
@@ -1054,33 +1064,30 @@ impl Heap {
                 // chain is no longer needed; those bytes hold the FORWARD pointer.
                 page.set_hot_xpage(old_rid.slot, new_rid.page_id, new_rid.slot)?;
 
-                let lsn = wal.log_hot_xpage_head(
-                    txn_id,
-                    prev_lsn,
-                    page_id,
-                    xid,
+                page_entries.push((
                     old_rid.slot,
                     new_rid.page_id,
                     new_rid.slot,
                     saved_prev_page,
                     saved_prev_slot,
-                )?;
-                prev_lsn = lsn;
-                last_lsn = lsn;
-
+                ));
                 result.push((*old_rid, *new_rid, saved_prev_page, saved_prev_slot));
             }
 
-            page.set_lsn(last_lsn);
+            // Item 80: one WAL_HOT_XPAGE_BATCH per old page instead of one
+            // WAL_HOT_XPAGE_HEAD per row — reduces WAL mutex passes from O(rows) to O(old_pages).
+            let batch_lsn =
+                wal.log_hot_xpage_batch(txn_id, prev_lsn, page_id, xid, &page_entries)?;
+
+            page.set_lsn(batch_lsn);
             pool.write_page(&page)?;
             let new_free = page.free_space();
             pool.unpin(page_id);
-            wal.commit_mini_txn(txn_id, last_lsn)?;
+            wal.commit_mini_txn(txn_id, batch_lsn)?;
             self.note_free_space(page_id, new_free);
 
             j = k;
         }
-
         Ok(result)
     }
 
@@ -1397,7 +1404,12 @@ impl Heap {
         //    the list of pages still needing a probe.
         let unknown: Vec<PageId> = {
             let fsm = self.lock_fsm();
-            for &pid in &fsm.pages {
+            // Item 78b: scan newest→oldest (reverse).  Fill pages are always
+            // appended at the end of `fsm.pages` (largest page_id), so the
+            // hot-fill page is the last entry.  The forward scan was O(N)
+            // because it walked past all the packed older pages first.
+            // Reversing converts the common case to O(1).
+            for &pid in fsm.pages.iter().rev() {
                 if fsm.free_map.get(&pid).is_some_and(|&free| free >= needed) {
                     return Ok(pid);
                 }
@@ -1412,14 +1424,21 @@ impl Heap {
                 .copied()
                 .collect()
         };
-        // 2. Probe unknown pages with the FSM lock NOT held; cache each result.
-        for pid in unknown {
-            let page = pool.fetch_page_for_write(pid, wal)?;
+        // 2. Probe at most one unknown page (newest first): after the
+        // ensure_directory fix (item 77) the page list is fully populated but
+        // free_map is empty, so `unknown` is the entire heap.  Probing all of
+        // it would be O(n) cold fetches.  We only probe the single newest page
+        // because (a) insert-append locality means the tail is the only one
+        // that could have slack, and (b) step 2b below covers the tail via an
+        // O(log n) B-tree descent for the common case where even the tail is
+        // already in-memory from a prior iteration's note_free_space.
+        if let Some(&newest) = unknown.first() {
+            let page = pool.fetch_page_for_write(newest, wal)?;
             let free = page.free_space();
-            pool.unpin(pid);
-            self.note_free_space(pid, free);
+            pool.unpin(newest);
+            self.note_free_space(newest, free);
             if free >= needed {
-                return Ok(pid);
+                return Ok(newest);
             }
         }
         // 2b. FSM-backed heap: the in-memory `pages` above holds only pages
@@ -1439,7 +1458,10 @@ impl Heap {
                     pool.unpin(tail);
                     {
                         let mut fsm = self.lock_fsm();
-                        if !fsm.pages.contains(&tail) {
+                        // `pages` is kept sorted; `tail` is the B-tree maximum
+                        // so it belongs at the end.  O(1) dedup: check only the
+                        // last element rather than scanning the whole Vec.
+                        if fsm.pages.last() != Some(&tail) {
                             fsm.pages.push(tail);
                         }
                         fsm.free_map.insert(tail, free);
@@ -1489,6 +1511,16 @@ impl Heap {
         };
         wal.commit_mini_txn(txn_id, commit_lsn)?;
         pool.unpin(pid);
+        // Item 82: mark this freshly-allocated page as having its before-image
+        // already covered by the WAL_INSERT(slot=u16::MAX, alloc_lsn) record
+        // above.  Recovery will re-initialise the blank page from that record
+        // (see recovery.rs WAL_INSERT slot==u16::MAX handler), so an explicit
+        // WAL_FPI on the first Phase-B write to this page is redundant.
+        // This saves one 8 KiB FPI per new fill page in hot_update_many Phase B:
+        // ~385 pages × 8 KiB = ~3 MiB per 50k-row UPDATE HOT.
+        // Safety: if a checkpoint fires and clears fpi_logged BEFORE Phase B
+        // touches this page, maybe_log_fpi will write the FPI anyway — correct.
+        pool.mark_fpi_logged(pid);
         // Register the new page — FSM lock taken only now, after all page I/O
         // (no latch is held), so it forms no cycle with the pool's latches.
         {
@@ -1802,6 +1834,183 @@ pub(crate) fn get_visible_with_rid<P: PageReader>(
     } else {
         Ok(None)
     }
+}
+
+/// Batch-resolve a sorted slice of B-tree candidate RowIds to visible
+/// `(live_rid, bytes)` pairs, reading each unique heap page **exactly once**.
+///
+/// # Performance contract
+///
+/// `candidates` **must** be sorted by `(page_id, slot)` — which B5 in
+/// `index_matching_rows` already guarantees.  With that invariant every
+/// candidate on the same page forms a contiguous group, so a single
+/// `read_page` call services the whole group.
+///
+/// For 200 k B-tree candidates on 1 000 unique heap pages the old per-row
+/// path called `read_page` 200 000 times (200 000 × 8 KiB = **1.6 GiB** of
+/// mmap copies).  This path calls it 1 000 times (8 MiB) — a **200× reduction**
+/// in the dominant cost.  This is the bitmap-heap-scan idea from Postgres:
+/// build a sorted set of candidate page+slot pairs first, then visit each page
+/// once in page order rather than once per candidate.
+///
+/// Cross-page HOT chain heads (`hot_next == HOT_NEXT_XPAGE`, item 71) still
+/// incur one extra `read_page` per head because the new version lives on a
+/// different fill page.  Those are uncommon (only rows HOT-updated across a
+/// checkpoint boundary).
+///
+/// Consecutive duplicates in the sorted input (rare; can arise from a
+/// multi-value index scan returning the same B-tree entry twice) are skipped
+/// inline; the caller need not pre-deduplicate.
+pub(crate) fn batch_resolve_candidates<P: PageReader>(
+    candidates: &[RowId],
+    snapshot: &Snapshot,
+    self_xid: Xid,
+    reader: &P,
+) -> Result<Vec<(RowId, Vec<u8>)>> {
+    let mut out = Vec::with_capacity(candidates.len());
+    let mut i = 0;
+    while i < candidates.len() {
+        let page_id = candidates[i].page_id;
+        // Find the end of the contiguous run for this page_id.
+        let j = i + candidates[i..].partition_point(|r| r.page_id == page_id);
+        let group = &candidates[i..j];
+        i = j;
+
+        // ONE mmap read services every candidate in this page's group.
+        let page = reader.read_page(page_id)?;
+
+        let mut prev_slot: u16 = u16::MAX; // sentinel; u16::MAX is never a valid slot
+        for &rid in group {
+            // Skip consecutive duplicates (rare B-tree index artefact).
+            if rid.slot == prev_slot {
+                continue;
+            }
+            prev_slot = rid.slot;
+
+            if !matches!(page.slot_state(rid.slot), Ok(SlotState::Live)) {
+                continue;
+            }
+            let th = page.tuple_header(rid.slot)?;
+            if is_visible(th.xmin, th.xmax, snapshot, self_xid) {
+                on_read(self_xid, rid);
+                out.push((rid, page.get(rid.slot)?.to_vec()));
+            } else if th.hot_next == HOT_NEXT_XPAGE {
+                // Cross-page HOT chain (item 71): new version lives on the page
+                // encoded in prev_page/prev_slot of this old slot.  We cannot
+                // avoid a separate read_page here, but this branch is rare.
+                let xpage_rid = RowId {
+                    page_id: th.prev_page,
+                    slot: th.prev_slot,
+                };
+                if let Some(pair) = get_visible_with_rid(reader, xpage_rid, snapshot, self_xid)? {
+                    out.push(pair);
+                }
+            } else if th.hot_next != HOT_NEXT_NONE {
+                // Same-page HOT chain (item 58): new version is on THIS page —
+                // already loaded, no extra read needed.
+                let new_slot = th.hot_next;
+                if !matches!(page.slot_state(new_slot), Ok(SlotState::Live)) {
+                    continue;
+                }
+                let new_th = page.tuple_header(new_slot)?;
+                let new_rid = RowId {
+                    page_id: rid.page_id,
+                    slot: new_slot,
+                };
+                if is_visible(new_th.xmin, new_th.xmax, snapshot, self_xid) {
+                    on_read(self_xid, new_rid);
+                    out.push((new_rid, page.get(new_slot)?.to_vec()));
+                }
+            }
+            // invisible & no chain → skip
+        }
+    }
+    Ok(out)
+}
+
+/// Zero-copy RowId-only variant of [`batch_resolve_candidates`].
+///
+/// Walks the same sorted page groups as `batch_resolve_candidates` but
+/// passes a `&[u8]` slice (no allocation) to `matches`.  Only RowIds of
+/// rows where `matches` returns `true` are collected.  For DELETE selected
+/// this eliminates all per-row `Vec<u8>` allocations — rows that do not
+/// match the predicate are never heap-allocated at all.
+///
+/// `candidates` **must** be sorted by `(page_id, slot)` — B5 guarantees this.
+pub(crate) fn batch_resolve_candidates_visit<P, F>(
+    candidates: &[RowId],
+    snapshot: &Snapshot,
+    self_xid: Xid,
+    reader: &P,
+    matches: &F,
+) -> Result<Vec<RowId>>
+where
+    P: PageReader,
+    F: Fn(&[u8]) -> Result<bool>,
+{
+    let mut out = Vec::with_capacity(candidates.len() / 2);
+    let mut i = 0;
+    while i < candidates.len() {
+        let page_id = candidates[i].page_id;
+        let j = i + candidates[i..].partition_point(|r| r.page_id == page_id);
+        let group = &candidates[i..j];
+        i = j;
+
+        // ONE mmap read services every candidate in this page's group.
+        let page = reader.read_page(page_id)?;
+
+        let mut prev_slot: u16 = u16::MAX;
+        for &rid in group {
+            if rid.slot == prev_slot {
+                continue;
+            }
+            prev_slot = rid.slot;
+
+            if !matches!(page.slot_state(rid.slot), Ok(SlotState::Live)) {
+                continue;
+            }
+            let th = page.tuple_header(rid.slot)?;
+            if is_visible(th.xmin, th.xmax, snapshot, self_xid) {
+                on_read(self_xid, rid);
+                // Zero-copy predicate check: &[u8] slice directly from mmap
+                if matches(page.get(rid.slot)?)? {
+                    out.push(rid);
+                }
+            } else if th.hot_next == HOT_NEXT_XPAGE {
+                // Cross-page HOT chain: new version on another page (item 71).
+                let xpage_rid = RowId {
+                    page_id: th.prev_page,
+                    slot: th.prev_slot,
+                };
+                // This rare branch still reads the remote page once.
+                if let Some((visible_rid, bytes)) =
+                    get_visible_with_rid(reader, xpage_rid, snapshot, self_xid)?
+                {
+                    if matches(&bytes)? {
+                        out.push(visible_rid);
+                    }
+                }
+            } else if th.hot_next != HOT_NEXT_NONE {
+                // Same-page HOT chain (item 58): new version is already loaded.
+                let new_slot = th.hot_next;
+                if !matches!(page.slot_state(new_slot), Ok(SlotState::Live)) {
+                    continue;
+                }
+                let new_th = page.tuple_header(new_slot)?;
+                let new_rid = RowId {
+                    page_id: rid.page_id,
+                    slot: new_slot,
+                };
+                if is_visible(new_th.xmin, new_th.xmax, snapshot, self_xid) {
+                    on_read(self_xid, new_rid);
+                    if matches(page.get(new_slot)?)? {
+                        out.push(new_rid);
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Count the tuples on `page_id` visible to `snapshot` via the tuple headers

@@ -2446,18 +2446,12 @@ fn exec_update(
     let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
 
-    let matching = matching_rows(&heap, &snapshot, ctx, &table_def, predicate)?;
-    // P1.d: the rows an UPDATE selects are part of its read set (SSI).
-    let read_ids: Vec<RowId> = matching.iter().map(|(rid, _)| *rid).collect();
-    ctx.txn_mgr.ssi_note_reads(ctx.xid, &read_ids);
-
-    // A1: accumulate BTree/FullText index entries across every updated row, then
-    // flush them coalesced after the loop — one WAL_INDEX page image per dirtied
-    // leaf instead of one per row (RC2). Correctness is unchanged: every entry is
-    // still inserted (see `stage_row_index_writes_update`).
-    let mut index_batches = init_index_batches(&table_def);
-    // Item 47: per-secondary-BTree patch batches (unchanged-key in-place RowId patch).
-    let mut patch_batches = init_patch_batches(&table_def);
+    // ── Item 76: early HOT eligibility gate + parallel matching ──────────────
+    // Compute hot_eligible *before* the scan: all four conditions are purely
+    // metadata-derived (table_def + assignments, no I/O).  Moving this up lets
+    // us choose the parallel collection path for HOT-eligible tables instead
+    // of always paying the serial heap.scan() cost.
+    //
     // A4: whether any UNIQUE/PRIMARY KEY set exists at all — computed once, not
     // per row. When there are none, the loop skips both the per-row
     // `snapshot_for_statement` allocation *and* `enforce_unique`'s full-heap
@@ -2509,6 +2503,79 @@ fn exec_update(
         && !has_fk_refs_in_set
         && !has_fk_children
         && !set_touches_indexed_col(assignments, &table_def.columns);
+
+    // Predicate closure for the parallel scan path (same pattern as exec_delete).
+    // Evaluates just predicate-referenced columns; the full row body comes back
+    // separately via scan_page_into inside parallel_collect_matching.
+    let cols_ref = &table_def.columns;
+    let mut pred_col_indices: Vec<usize> = Vec::new();
+    if let Some(pred) = predicate {
+        expr_columns(pred, &table_def, &mut pred_col_indices);
+    }
+    let (pred_needed, pred_upto) = needed_mask(&pred_col_indices, cols_ref.len());
+    let has_pred = predicate.is_some();
+    let pred_closure = |bytes: &[u8]| -> Result<bool> {
+        if has_pred {
+            let prow = deform_row(bytes, cols_ref, pred_upto, &pred_needed)?;
+            Ok(predicate_matches(predicate, cols_ref, &prow)?)
+        } else {
+            Ok(true)
+        }
+    };
+
+    // Collect matching rows.  For HOT-eligible tables we prefer the parallel
+    // full-scan when A3 would not fire and the table is large enough; any path
+    // that goes serial falls back to matching_rows (which handles A3 internally).
+    let matching: MatchedRows = if hot_eligible {
+        let use_a3 = predicate
+            .as_ref()
+            .and_then(|e| {
+                find_best_indexable_btree_predicate(
+                    e,
+                    &table_def,
+                    ctx.catalog.table_stats(&table_def.name),
+                )
+            })
+            .is_some_and(|hit| index_lookup_is_selective(&table_def, hit, ctx, false));
+
+        'collect_hot: {
+            if !use_a3 {
+                let pages = heap.scan_pages(ctx.pool)?;
+                if pages.len() >= crate::sql::parallel_scan::PARALLEL_CANDIDATE_MIN {
+                    if let Some(lease) = crate::sql::parallel_scan::acquire(pages.len()) {
+                        let mut out = crate::sql::parallel_scan::parallel_collect_matching(
+                            &pages,
+                            &ctx.pool.shared_reader(),
+                            &snapshot,
+                            ctx.xid,
+                            lease.degree(),
+                            &pred_closure,
+                        )?;
+                        // hot_update_many requires (page_id, slot) order.
+                        out.sort_unstable_by_key(|(rid, _)| (rid.page_id, rid.slot));
+                        break 'collect_hot out;
+                    }
+                }
+            }
+            // Serial fallback: A3 index path, table too small, or no lease.
+            matching_rows(&heap, &snapshot, ctx, &table_def, predicate)?
+        }
+    } else {
+        matching_rows(&heap, &snapshot, ctx, &table_def, predicate)?
+    };
+
+    // P1.d: the rows an UPDATE selects are part of its read set (SSI).
+    let read_ids: Vec<RowId> = matching.iter().map(|(rid, _)| *rid).collect();
+    ctx.txn_mgr.ssi_note_reads(ctx.xid, &read_ids);
+
+    // A1: accumulate BTree/FullText index entries across every updated row, then
+    // flush them coalesced after the loop — one WAL_INDEX page image per dirtied
+    // leaf instead of one per row (RC2). Correctness is unchanged: every entry is
+    // still inserted (see `stage_row_index_writes_update`).
+    let mut index_batches = init_index_batches(&table_def);
+    // Item 47: per-secondary-BTree patch batches (unchanged-key in-place RowId patch).
+    let mut patch_batches = init_patch_batches(&table_def);
+    // hot_eligible / has_unique / has_fk_* are already computed above.
 
     // Item 74: two-phase batch HOT UPDATE.
     //
@@ -2582,6 +2649,95 @@ fn exec_update(
         return Ok(ExecResult::Updated {
             count: heap_results.len(),
         });
+    }
+
+    // ── Item 83: batch non-HOT UPDATE via update_many() ────────────────────
+    //
+    // When the SET clause touches an indexed column (hot_eligible=false) but
+    // there are no UNIQUE, FK, or CDC constraints, the heap update can be
+    // batched across all matching rows with a single call to update_many().
+    // This replaces O(rows) separate mini-txns (one per `heap.update()` call)
+    // with O(pages) Phase-A mini-txns + O(fill-pages) Phase-B mini-txns,
+    // cutting WAL record count from 4×N to ~2×(N/50) + 2×(N/100) for a
+    // table with ~50 rows/page — a ~48× reduction in mini-txn overhead.
+    //
+    // Correctness gate: update_many() pre-conditions (same as update_many's
+    // doc comment) — no UNIQUE indexes, no FK child-side refs in SET, no FK
+    // parent-side children. CDC (events_enabled) is handled below via
+    // send_event_capture() after update_many() returns, so no gate needed.
+    let can_batch_non_hot =
+        !hot_eligible && !has_unique && !has_fk_refs_in_set && !has_fk_children;
+
+    if can_batch_non_hot && !matching.is_empty() {
+        // Phase 1: decode / eval SET / encode for all matching rows.
+        // (Same per-row logic as the per-row loop below, minus constraint checks.)
+        type NonHotRow = (RowId, Vec<u8>, Vec<Literal>, Vec<Literal>);
+        let mut collected: Vec<NonHotRow> = Vec::with_capacity(matching.len());
+        for (row_id, bytes) in &matching {
+            let mut row = decode_row(bytes, &table_def.columns)?;
+            let before_row = row.clone();
+            for (col, expr) in assignments {
+                let new_val = eval_expr(expr, &table_def.columns, &row)?;
+                set_column(&table_def.columns, &mut row, col, new_val)?;
+            }
+            let coerced = coerce_and_validate_row(&table_def, row)?;
+            enforce_not_null(&table_def, &coerced)?;
+            enforce_checks(&table_def, &coerced)?;
+            let encoded = encode_row(&coerced);
+            collected.push((*row_id, encoded, before_row, coerced));
+        }
+
+        // Phase 2: batch heap Phase-A (xmax) + Phase-B (new versions).
+        let row_pairs: Vec<(RowId, Vec<u8>)> = collected
+            .iter()
+            .map(|(rid, enc, _, _)| (*rid, enc.clone()))
+            .collect();
+        let update_results =
+            match heap.update_many(&row_pairs, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr) {
+                Err(e @ DbError::WriteConflict { .. }) => return Err(classify_conflict(e, ctx)),
+                other => other?,
+            };
+
+        // Phase 3: per-pair SSI, undo, B-tree index staging, CDC.
+        let mut count = 0;
+        for (i, (old_rid, new_rid)) in update_results.iter().enumerate() {
+            let (_, _, ref before_row, ref after_row) = collected[i];
+            ctx.txn_mgr.ssi_note_write(ctx.xid, *old_rid);
+            ctx.txn_mgr.record_undo(
+                ctx.xid,
+                UndoAction::XmaxStamp {
+                    page_id: old_rid.page_id,
+                    slot: old_rid.slot,
+                },
+            )?;
+            ctx.txn_mgr.record_undo(
+                ctx.xid,
+                UndoAction::Insert {
+                    page_id: new_rid.page_id,
+                    slot: new_rid.slot,
+                },
+            )?;
+            stage_row_index_writes_update(
+                &table_def,
+                *old_rid,
+                *new_rid,
+                before_row,
+                after_row,
+                &mut index_batches,
+                &mut patch_batches,
+                ctx,
+            )?;
+            send_event_capture(&table_def, "update", Some(before_row), Some(after_row), ctx)?;
+            count += 1;
+        }
+
+        // Coalesced index maintenance (A1) — same flush path as per-row loop.
+        flush_patch_batches(&patch_batches, ctx)?;
+        flush_index_batches(&index_batches, ctx)?;
+
+        persist_pages_if_changed(table, &heap, &table_def.pages, ctx)?;
+        assert_schema_stable(ctx, table, table_def.generation);
+        return Ok(ExecResult::Updated { count });
     }
 
     // ── Non-HOT / constrained path: per-row loop (unchanged) ────────────────
@@ -2806,6 +2962,100 @@ fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Resu
         return Ok(ExecResult::Deleted { count });
     }
 
+    // Item 36: gate the RESTRICT scan — compute up-front so the collection
+    // phase can skip row bytes when they are not needed (item 75 fast path).
+    let has_fk_children = table_has_fk_children(ctx.catalog.get(), table);
+    let needs_per_row_checks = has_fk_children || table_def.events_enabled;
+
+    // Item 75: When there are no per-row side-effects (no FK children, no CDC)
+    // we only need RowIds, not row-body bytes.  Separate fast and slow paths
+    // avoid allocating Vec<u8> per row for the common case.
+    //
+    // Helper: build the predicate closure for the parallel and serial paths.
+    // Captures only column metadata and the predicate; no heap allocation.
+    let cols = &table_def.columns;
+    let mut pred_col_indices: Vec<usize> = Vec::new();
+    if let Some(pred) = predicate {
+        expr_columns(pred, &table_def, &mut pred_col_indices);
+    }
+    let (pred_needed, pred_upto) = needed_mask(&pred_col_indices, cols.len());
+    let has_pred = predicate.is_some();
+    let pred_closure = |bytes: &[u8]| -> Result<bool> {
+        if has_pred {
+            let prow = deform_row(bytes, cols, pred_upto, &pred_needed)?;
+            Ok(predicate_matches(predicate, cols, &prow)?)
+        } else {
+            Ok(true)
+        }
+    };
+
+    if !needs_per_row_checks {
+        // ── RowId-only fast path (item 75) ───────────────────────────────────
+        // No FK children and no CDC: the only thing we need from the scan is
+        // the set of live RowIds to pass to delete_many.  Skip all Vec<u8>
+        // allocation: zero bytes-per-row alloc in both the B-tree and full-scan
+        // branches (batch_resolve_row_ids + parallel_collect_row_ids).
+        let use_a3 = predicate
+            .as_ref()
+            .and_then(|e| {
+                find_best_indexable_btree_predicate(
+                    e,
+                    &table_def,
+                    ctx.catalog.table_stats(&table_def.name),
+                )
+            })
+            .is_some_and(|hit| index_lookup_is_selective(&table_def, hit, ctx, false));
+
+        let row_ids: Vec<RowId> = if !use_a3 {
+            let pages = heap.scan_pages(ctx.pool)?;
+            if pages.len() >= crate::sql::parallel_scan::PARALLEL_CANDIDATE_MIN {
+                if let Some(lease) = crate::sql::parallel_scan::acquire(pages.len()) {
+                    let mut ids = crate::sql::parallel_scan::parallel_collect_row_ids(
+                        &pages,
+                        &ctx.pool.shared_reader(),
+                        &snapshot,
+                        ctx.xid,
+                        lease.degree(),
+                        &pred_closure,
+                    )?;
+                    // delete_many requires (page_id, slot) order.
+                    ids.sort_unstable_by_key(|r| (r.page_id, r.slot));
+                    ids
+                } else {
+                    collect_delete_row_ids_serial(&heap, &snapshot, ctx, &table_def, predicate)?
+                }
+            } else {
+                collect_delete_row_ids_serial(&heap, &snapshot, ctx, &table_def, predicate)?
+            }
+        } else {
+            // A3 index path: batch_resolve_row_ids reads each page once.
+            collect_delete_row_ids_serial(&heap, &snapshot, ctx, &table_def, predicate)?
+        };
+
+        // P1.d: SSI read set.
+        ctx.txn_mgr.ssi_note_reads(ctx.xid, &row_ids);
+
+        let deleted = match heap.delete_many(&row_ids, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr) {
+            Err(e @ DbError::WriteConflict { .. }) => return Err(classify_conflict(e, ctx)),
+            other => other?,
+        };
+        for rid in &deleted {
+            ctx.txn_mgr.ssi_note_write(ctx.xid, *rid);
+            ctx.txn_mgr.record_undo(
+                ctx.xid,
+                UndoAction::XmaxStamp {
+                    page_id: rid.page_id,
+                    slot: rid.slot,
+                },
+            )?;
+        }
+        let count = deleted.len();
+        persist_pages_if_changed(table, &heap, &table_def.pages, ctx)?;
+        assert_schema_stable(ctx, table, table_def.generation);
+        return Ok(ExecResult::Deleted { count });
+    }
+
+    // ── Slow path: FK children or CDC — must collect row bytes ───────────────
     // Item 66: parallel full-scan for DELETE selected. We bypass `matching_rows`
     // and go straight to the pre-spawned worker pool when:
     //   (a) the A3 cost-model would route to a full scan (non-selective predicate),
@@ -2830,33 +3080,13 @@ fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Resu
             let pages = heap.scan_pages(ctx.pool)?;
             if pages.len() >= crate::sql::parallel_scan::PARALLEL_CANDIDATE_MIN {
                 if let Some(lease) = crate::sql::parallel_scan::acquire(pages.len()) {
-                    // Build the predicate closure for parallel workers.  Workers
-                    // only need to evaluate the WHERE predicate — they never decode
-                    // the full row (that happens in the pre-check / CDC pass below,
-                    // only for the matched subset).  This mirrors matching_rows's B2
-                    // path: deform only up to the last predicate column.
-                    let cols = &table_def.columns;
-                    let mut pred_col_indices: Vec<usize> = Vec::new();
-                    if let Some(pred) = predicate {
-                        expr_columns(pred, &table_def, &mut pred_col_indices);
-                    }
-                    let (pred_needed, pred_upto) = needed_mask(&pred_col_indices, cols.len());
-                    let has_pred = predicate.is_some();
-
                     let mut out = crate::sql::parallel_scan::parallel_collect_matching(
                         &pages,
                         &ctx.pool.shared_reader(),
                         &snapshot,
                         ctx.xid,
                         lease.degree(),
-                        &|bytes| {
-                            if has_pred {
-                                let prow = deform_row(bytes, cols, pred_upto, &pred_needed)?;
-                                Ok(predicate_matches(predicate, cols, &prow)?)
-                            } else {
-                                Ok(true)
-                            }
-                        },
+                        &pred_closure,
                     )?;
                     // delete_many (item 44) groups rows by page_id and requires
                     // (page_id, slot) order — parallel workers process pages in
@@ -2874,11 +3104,6 @@ fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Resu
     let read_ids: Vec<RowId> = matching.iter().map(|(rid, _)| *rid).collect();
     ctx.txn_mgr.ssi_note_reads(ctx.xid, &read_ids);
 
-    // Item 36: gate the RESTRICT scan — zero overhead when no table
-    // references this one (the common case).
-    let has_fk_children = table_has_fk_children(ctx.catalog.get(), table);
-    let needs_per_row_checks = has_fk_children || table_def.events_enabled;
-
     // Item 44: two-pass DELETE — pre-check pass (per-row, unchanged semantics)
     // then batched heap mutations (one WAL mini-txn per page instead of per row).
     //
@@ -2886,10 +3111,7 @@ fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Resu
     // *before* any heap mutation (FK needs a fresh snapshot per row; CDC needs
     // the row data, which is gone after deletion).  All write-locks are acquired
     // inside `delete_many`, which runs after the pre-checks.
-    //
-    // When there are no per-row side-effects (no FK children, no CDC) we skip
-    // the pre-check pass entirely and go straight to the batch delete.
-    let row_ids: Vec<RowId> = if needs_per_row_checks {
+    let row_ids: Vec<RowId> = {
         let mut ids = Vec::with_capacity(matching.len());
         for (row_id, bytes) in &matching {
             let row = decode_row(bytes, &table_def.columns)?;
@@ -2914,8 +3136,6 @@ fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Resu
             ids.push(*row_id);
         }
         ids
-    } else {
-        matching.iter().map(|(rid, _)| *rid).collect()
     };
 
     let deleted = match heap.delete_many(&row_ids, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr) {
@@ -3059,6 +3279,117 @@ fn index_lookup_is_selective(
     selectivity <= INDEX_RANGE_SELECTIVITY_MAX
 }
 
+/// Serial RowId-only collection for the DELETE fast path (item 75).
+///
+/// Used when `needs_per_row_checks == false` AND the parallel threshold is
+/// not met (table too small) or no worker lease is available.
+///
+/// For the A3/B-tree branch: calls `batch_resolve_candidates_visit` which
+/// reads each heap page exactly once (one 8 KiB mmap window per unique page)
+/// and calls the predicate closure with a `&[u8]` slice — **zero Vec<u8>
+/// allocations** for non-matching rows.  Only RowIds are returned.
+/// For the full-scan fallback: iterates `heap.scan` but discards bytes
+/// after predicate evaluation (small tables; overhead is negligible).
+fn collect_delete_row_ids_serial(
+    heap: &Heap,
+    snapshot: &crate::mvcc::Snapshot,
+    ctx: &mut ExecCtx,
+    table_def: &TableDef,
+    predicate: &Option<Expr>,
+) -> Result<Vec<RowId>> {
+    if let Some(hit) = predicate.as_ref().and_then(|e| {
+        find_best_indexable_btree_predicate(e, table_def, ctx.catalog.table_stats(&table_def.name))
+    }) {
+        if index_lookup_is_selective(table_def, hit, ctx, false) {
+            let (column, op, literal) = hit;
+            let Ok(value) = crate::btree_index::OrderedValue::try_from(literal) else {
+                return collect_delete_row_ids_serial_fullscan(
+                    heap, snapshot, ctx, table_def, predicate,
+                );
+            };
+            let Some(meta_page) = table_def
+                .columns
+                .iter()
+                .find(|c| c.name == column)
+                .and_then(|c| c.index_root)
+            else {
+                return collect_delete_row_ids_serial_fullscan(
+                    heap, snapshot, ctx, table_def, predicate,
+                );
+            };
+            let tree = crate::btree_index::DiskBTree::new(meta_page, ctx.page_size);
+            let Some(mut candidate_ids) = tree.search(op, &value, ctx.pool)? else {
+                return Ok(Vec::new());
+            };
+            // B5: sort by (page_id, slot) so batch_resolve_candidates_visit groups
+            // candidates on the same page into a single mmap read.
+            candidate_ids.sort_unstable_by_key(|r| (r.page_id, r.slot));
+
+            // Predicate re-check closure (covers non-indexed AND terms such as
+            // `k >= N AND body LIKE '%foo%'`).  For a simple `k >= N` that is
+            // fully covered by the B-tree, `predicate.is_none()` after stripping
+            // the indexed term — either way the closure runs only on visible rows.
+            let cols = &table_def.columns;
+            let mut pred_cols = Vec::new();
+            if let Some(pred) = predicate {
+                expr_columns(pred, table_def, &mut pred_cols);
+            }
+            let (pred_needed, pred_upto) = needed_mask(&pred_cols, cols.len());
+
+            // batch_resolve_candidates_visit: ONE mmap read per unique page_id,
+            // zero Vec<u8> allocs — passes &[u8] slice directly to the predicate.
+            // For rows that do not match, no allocation is made at all.
+            let pred_ref = predicate;
+            let row_ids = crate::heap::batch_resolve_candidates_visit(
+                &candidate_ids,
+                snapshot,
+                ctx.xid,
+                ctx.pool,
+                &|bytes: &[u8]| -> Result<bool> {
+                    if pred_ref.is_some() {
+                        let prow = deform_row(bytes, cols, pred_upto, &pred_needed)?;
+                        predicate_matches(pred_ref, cols, &prow)
+                    } else {
+                        Ok(true)
+                    }
+                },
+            )?;
+            return Ok(row_ids);
+        }
+    }
+    collect_delete_row_ids_serial_fullscan(heap, snapshot, ctx, table_def, predicate)
+}
+
+/// Full-scan serial fallback for `collect_delete_row_ids_serial` — used for
+/// small tables or when no B-tree index covers the predicate.
+fn collect_delete_row_ids_serial_fullscan(
+    heap: &Heap,
+    snapshot: &crate::mvcc::Snapshot,
+    ctx: &mut ExecCtx,
+    table_def: &TableDef,
+    predicate: &Option<Expr>,
+) -> Result<Vec<RowId>> {
+    let cols = &table_def.columns;
+    let mut pred_cols = Vec::new();
+    if let Some(pred) = predicate {
+        expr_columns(pred, table_def, &mut pred_cols);
+    }
+    let (pred_needed, pred_upto) = needed_mask(&pred_cols, cols.len());
+    let has_pred = predicate.is_some();
+
+    let mut out = Vec::new();
+    for (row_id, bytes) in heap.scan(snapshot, ctx.xid, ctx.pool)? {
+        if has_pred {
+            let prow = deform_row(&bytes, cols, pred_upto, &pred_needed)?;
+            if !predicate_matches(predicate, cols, &prow)? {
+                continue;
+            }
+        }
+        out.push(row_id);
+    }
+    Ok(out)
+}
+
 fn matching_rows(
     heap: &Heap,
     snapshot: &crate::mvcc::Snapshot,
@@ -3128,7 +3459,7 @@ fn matching_rows(
 /// a wrong result. Candidate RowIds are de-duplicated so a row can never be
 /// handed to the caller (and thus updated/deleted) twice.
 fn index_matching_rows(
-    heap: &Heap,
+    _heap: &Heap,
     snapshot: &crate::mvcc::Snapshot,
     ctx: &mut ExecCtx,
     table_def: &TableDef,
@@ -3152,11 +3483,9 @@ fn index_matching_rows(
         Some(ids) => ids,
         None => return Ok(None),
     };
-    // B5: resolve candidates in physical (page, slot) order so `heap.get` walks
-    // the heap sequentially-ish instead of randomly — the bitmap-heap-scan idea
-    // that softens the A3 random-access cost on a fragmented table (index/key
-    // order can scatter across pages after updates). Order doesn't matter for
-    // UPDATE/DELETE, which touch every matched row.
+    // B5: sort candidates by (page_id, slot) for batch_resolve_candidates
+    // (item 75 bitmap-scan): consecutive candidates on the same page are
+    // grouped into one mmap read, eliminating the per-candidate 8 KiB copy.
     candidate_ids.sort_unstable_by_key(|r| (r.page_id, r.slot));
 
     // Predicate-column mask for the re-check (mirrors matching_rows's B2 path):
@@ -3169,21 +3498,18 @@ fn index_matching_rows(
     }
     let (pred_needed, pred_upto) = needed_mask(&pred_cols_list, cols.len());
 
+    // Bitmap-style batch scan (item 75): candidate_ids are already sorted by
+    // (page_id, slot) via B5 above.  batch_resolve_candidates reads each unique
+    // heap page ONCE, eliminating the per-candidate 8 KiB mmap copy that made
+    // large B-tree index scans expensive (200 k candidates on 1 000 pages:
+    // 200 000 × 8 KiB = 1.6 GiB → 1 000 × 8 KiB = 8 MiB, a 200× reduction).
+    // HOT chain following (same-page and cross-page) is handled inside
+    // batch_resolve_candidates; no external HashSet dedup is needed because
+    // consecutive duplicates in the sorted input are filtered inline.
+    let resolved =
+        crate::heap::batch_resolve_candidates(&candidate_ids, snapshot, ctx.xid, ctx.pool)?;
     let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for btree_rid in candidate_ids {
-        if !seen.insert((btree_rid.page_id, btree_rid.slot)) {
-            continue; // a rowid resolved once is enough (dedup superseded/dup entries)
-        }
-        // Use get_resolved so that `row_id` in the returned pair is the LIVE
-        // version's slot, not the B-tree chain head.  This matters for HOT
-        // chains (items 58/71): the chain head already has xmax != 0, and
-        // passing it to heap.update/delete would cause a spurious WriteConflict.
-        let (row_id, bytes) = match heap.get_resolved(btree_rid, snapshot, ctx.xid, ctx.pool) {
-            Ok(Some(r)) => r,
-            Ok(None) => continue, // superseded / aborted hint
-            Err(e) => return Err(e),
-        };
+    for (row_id, bytes) in resolved {
         let prow = deform_row(&bytes, cols, pred_upto, &pred_needed)?;
         if predicate_matches(predicate, cols, &prow)? {
             out.push((row_id, bytes));

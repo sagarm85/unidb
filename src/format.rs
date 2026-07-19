@@ -88,7 +88,7 @@ pub const MAGIC: u32 = 0x556E4442; // "UnDB"
 // leaving the cross-page chain broken after crash recovery (B-tree points to
 // xmax'd old slot with hot_next=XPAGE but no restored chain → row unfindable).
 // The version bump causes older builds to produce BadVersion. No migration path.
-pub const FORMAT_VERSION: u16 = 9;
+pub const FORMAT_VERSION: u16 = 10;
 
 /// Default page size: 8 KiB (D8). Baked into the control file at DB init.
 pub const DEFAULT_PAGE_SIZE: u32 = 8192;
@@ -267,6 +267,65 @@ pub const WAL_HOT_UPDATE: u8 = 16;
 // cross-page HOT chain broken after crash recovery. FORMAT_VERSION bump to 9
 // causes older builds to produce BadVersion. No migration path.
 pub const WAL_HOT_XPAGE_HEAD: u8 = 17;
+
+// WAL batch insert record (item 79 — Phase B of hot_update_many).
+// Replaces N individual WAL_INSERT records (one per row) with ONE record per
+// fill page, reducing WAL mutex acquisitions from O(rows) to O(fill_pages).
+//
+// WAL header fields: `page_id` = fill_page_id; `slot` = u16::MAX (batch sentinel).
+//
+// redo payload:
+//   xmin      u64 LE  — same xid for all rows in the batch
+//   n_rows    u16 LE
+//   for each row (in slot order):
+//     slot      u16 LE
+//     prev_page u32 LE  — INVALID_PAGE_ID if no prev-version pointer
+//     prev_slot u16 LE
+//     data_len  u32 LE
+//     data      [u8; data_len]
+//   Redo: LSN-gated. For each row whose slot >= page.slot_count_pub(), call
+//   insert_versioned(data, xmin, 0, prev). Idempotent: rows already present
+//   (slot < slot_count) are skipped.
+//
+// undo payload:
+//   n_slots   u16 LE
+//   slot_0 .. slot_N  u16 LE each
+//   Undo: page.delete(slot) for each listed slot (reverse order, idempotent).
+//
+// FORMAT_VERSION bumped to 10 — older builds reject with BadVersion rather
+// than silently skipping the record and leaving phantom live rows.
+pub const WAL_INSERT_BATCH: u8 = 18;
+
+// WAL batch cross-page HOT head record (item 80 — Phase A of hot_update_many).
+// Replaces N individual WAL_HOT_XPAGE_HEAD records (one per row) with ONE
+// record per old-page group, reducing Phase A WAL mutex acquisitions from
+// O(rows) to O(old_pages).
+//
+// WAL header fields: `page_id` = old_page_id; `slot` = u16::MAX (batch sentinel).
+//
+// redo payload:
+//   xid       u64 LE
+//   n_entries u16 LE
+//   for each entry:
+//     old_slot      u16 LE
+//     new_page_id   u32 LE
+//     new_slot      u16 LE
+//   Redo: LSN-gated. For each entry: stamp xmax=xid on old_slot; set
+//   hot_next=HOT_NEXT_XPAGE; overwrite prev_page/prev_slot with
+//   (new_page_id, new_slot). Idempotent (TupleDeleted arm ignored).
+//
+// undo payload:
+//   n_entries u16 LE
+//   for each entry (in forward order; undo applies in reverse order):
+//     old_slot         u16 LE
+//     saved_prev_page  u32 LE
+//     saved_prev_slot  u16 LE
+//   Undo: for each entry: restore_prev_and_hot_next(saved_prev_page,
+//   saved_prev_slot); clear xmax=0 on old_slot. Idempotent.
+//
+// FORMAT_VERSION 10 required — older builds would skip with `_ => {}`,
+// leaving the cross-page HOT chain broken after recovery.
+pub const WAL_HOT_XPAGE_BATCH: u8 = 19;
 
 /// Bit 0 of the tuple-header `flags` byte: this slot is a HOT chain head.
 /// When set, the `hot_next` field (tuple-header offset [22..24]) holds the

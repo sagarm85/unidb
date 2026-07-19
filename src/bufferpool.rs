@@ -235,6 +235,11 @@ struct Frame {
     pin_count: u32,
     dirty: bool,
     clock_ref: bool,
+    /// The LSN of the most-recent `write_page` on this frame (item 77: D5
+    /// fast-path).  Kept in sync by `write_page` so `find_victim` can check
+    /// `frame.lsn > durable_wal_lsn` without re-reading 8 KiB from mmap.
+    /// Zero for a newly allocated, unwritten frame (no WAL record yet).
+    lsn: Lsn,
 }
 
 impl Frame {
@@ -244,6 +249,7 @@ impl Frame {
             pin_count: 0,
             dirty: false,
             clock_ref: false,
+            lsn: 0,
         }
     }
 }
@@ -655,6 +661,9 @@ impl BufferPool {
         let mut st = self.lock_state();
         if let Some(&frame_idx) = st.frame_index.get(&page_id) {
             st.frames[frame_idx].dirty = true;
+            // Item 77: cache the page LSN in the frame so find_victim can
+            // check D5 without re-reading 8 KiB from mmap per dirty frame.
+            st.frames[frame_idx].lsn = page.lsn();
         }
         Ok(())
     }
@@ -776,7 +785,24 @@ impl BufferPool {
     /// `BufferPoolFull` immediately. Growth is O(1) amortized (Vec doubling).
     fn find_victim(&self, st: &mut PoolState) -> Result<usize> {
         let current = st.frames.len();
-        // Two full sweeps of the currently-allocated frame table (standard clock).
+        // Item 78: fast-path grow — if the pool is below capacity, push a new
+        // frame immediately without running the O(current) clock sweep.
+        //
+        // Rationale: the clock sweep is for *eviction* (i.e., reclaiming a
+        // slot when the pool is at capacity).  When current < capacity, we can
+        // always grow, so sweeping is wasted work.  For a 100k-row batch
+        // UPDATE that creates 383 fill pages, this changes Phase B from
+        // O(pages × 383) loop iterations to O(1) per alloc — a measurable
+        // speedup when many pages are already resident.  Eviction behaviour
+        // (at capacity) is completely unchanged: the sweep only runs when
+        // `current == capacity`.
+        if current < self.capacity {
+            let idx = current;
+            st.frames.push(Frame::empty());
+            return Ok(idx);
+        }
+        // Pool is full — run two full sweeps of the frame table to find a
+        // victim via the standard second-chance clock algorithm.
         // `current` is captured before any potential growth so the loop stays bounded.
         for _ in 0..current.saturating_mul(2) {
             let idx = st.clock_hand % current;
@@ -796,7 +822,12 @@ impl BufferPool {
                 let Some(pid) = page_id else {
                     return Ok(idx);
                 };
-                let page_lsn = self.read_page_from_mmap(pid).map(|p| p.lsn()).unwrap_or(0);
+                // Item 77: use the cached LSN from the frame rather than
+                // re-reading the full 8 KiB page just to extract its LSN.
+                // `frame.lsn` is set by every `write_page` call, so it is
+                // always current.  This eliminates O(dirty_frames) mmap reads
+                // per page fetch in the deferred-sync write workload.
+                let page_lsn = st.frames[idx].lsn;
                 // D5: a dirty page may be stolen only once its WAL is durable.
                 if st.durable_wal_lsn == INVALID_LSN || page_lsn > st.durable_wal_lsn {
                     continue;
@@ -812,13 +843,6 @@ impl BufferPool {
                 let durable = st.durable_wal_lsn;
                 self.flush_locked(st, pid, durable)?;
             }
-            return Ok(idx);
-        }
-        // All existing frames are occupied or undurable-dirty. Grow the table
-        // one frame if the ceiling allows (item 37 lazy growth).
-        if current < self.capacity {
-            let idx = current;
-            st.frames.push(Frame::empty());
             return Ok(idx);
         }
         Err(DbError::BufferPoolFull)

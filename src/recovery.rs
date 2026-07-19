@@ -14,10 +14,11 @@ use crate::{
     control::{self, ControlData},
     error::{DbError, Result},
     format::{
-        u16_from_le, u32_from_le, u64_from_le, Xid, HOT_NEXT_NONE, INVALID_LSN, WAL_ABORT,
-        WAL_BEGIN, WAL_CHECKPOINT, WAL_COMMIT, WAL_DELETE, WAL_FPI, WAL_HOT_UPDATE,
-        WAL_HOT_XPAGE_HEAD, WAL_INDEX, WAL_INDEX_INSERT, WAL_INSERT, WAL_TXN_ABORT, WAL_TXN_BEGIN,
-        WAL_TXN_COMMIT, WAL_UPDATE, WAL_VACUUM, WAL_XMAX_BATCH,
+        u16_from_le, u32_from_le, u64_from_le, Xid, HOT_NEXT_NONE, INVALID_LSN, PAGE_TYPE_HEAP,
+        WAL_ABORT, WAL_BEGIN, WAL_CHECKPOINT, WAL_COMMIT, WAL_DELETE, WAL_FPI, WAL_HOT_UPDATE,
+        WAL_HOT_XPAGE_BATCH, WAL_HOT_XPAGE_HEAD, WAL_INDEX, WAL_INDEX_INSERT, WAL_INSERT,
+        WAL_INSERT_BATCH, WAL_TXN_ABORT, WAL_TXN_BEGIN, WAL_TXN_COMMIT, WAL_UPDATE, WAL_VACUUM,
+        WAL_XMAX_BATCH,
     },
     heap::{decode_insert_redo, RowId},
     page::SlottedPage,
@@ -140,11 +141,13 @@ pub fn recover(
         .filter(|r| incomplete.contains(&r.mini_txn_id))
         .filter(|r| {
             r.rec_type == WAL_INSERT
+                || r.rec_type == WAL_INSERT_BATCH
                 || r.rec_type == WAL_UPDATE
                 || r.rec_type == WAL_DELETE
                 || r.rec_type == WAL_XMAX_BATCH
                 || r.rec_type == WAL_HOT_UPDATE
                 || r.rec_type == WAL_HOT_XPAGE_HEAD
+                || r.rec_type == WAL_HOT_XPAGE_BATCH
         })
         .copied()
         .collect();
@@ -202,7 +205,8 @@ pub fn recover(
             (r.rec_type == WAL_UPDATE
                 || r.rec_type == WAL_XMAX_BATCH
                 || r.rec_type == WAL_HOT_UPDATE
-                || r.rec_type == WAL_HOT_XPAGE_HEAD)
+                || r.rec_type == WAL_HOT_XPAGE_HEAD
+                || r.rec_type == WAL_HOT_XPAGE_BATCH)
                 && committed.contains(&r.mini_txn_id)
         }) {
             if r.rec_type == WAL_UPDATE {
@@ -262,7 +266,7 @@ pub fn recover(
                         stats.records_undone += 1;
                     }
                 }
-            } else {
+            } else if r.rec_type == WAL_HOT_XPAGE_HEAD {
                 // WAL_HOT_XPAGE_HEAD (item 71): redo[0..8] = xid, redo[8..10] = old_slot,
                 // redo[10..14] = new_page_id, redo[14..16] = new_slot.
                 // undo[0..2] = old_slot, undo[2..6] = saved_prev_page, undo[6..8] = saved_prev_slot.
@@ -278,7 +282,6 @@ pub fn recover(
                         let saved_prev_page = u32_from_le(r.undo[2..6].try_into().unwrap());
                         let saved_prev_slot = u16_from_le(r.undo[6..8].try_into().unwrap());
                         let mut page = fetch_or_create(&pool, r.page_id, page_size)?;
-                        // Restore prev_page/prev_slot + clear hot_next.
                         match page.restore_prev_and_hot_next(
                             old_slot,
                             saved_prev_page,
@@ -287,7 +290,6 @@ pub fn recover(
                             Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
                             Err(e) => return Err(e),
                         }
-                        // Clear xmax (restore old version as live).
                         match page.set_xmax(old_slot, 0) {
                             Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
                             Err(e) => return Err(e),
@@ -296,14 +298,43 @@ pub fn recover(
                         pool.write_page(&page)?;
                         pool.unpin(r.page_id);
                         stats.records_undone += 1;
-                        // New version on new_page_id is handled by Phase 2's
-                        // WAL_INSERT self-stamp loop.
+                    }
+                }
+            } else {
+                // WAL_HOT_XPAGE_BATCH (item 80): xid is in redo[0..8] (same
+                // layout as WAL_HOT_XPAGE_HEAD); undo payload is N×(old_slot +
+                // saved_prev_page + saved_prev_slot).
+                if r.redo.len() >= 8 {
+                    let xid = u64_from_le(r.redo[0..8].try_into().unwrap());
+                    if incomplete_user_txns.contains(&xid) {
+                        if let Ok(entries) = decode_hot_xpage_batch_undo_entries(&r.undo) {
+                            let mut page = fetch_or_create(&pool, r.page_id, page_size)?;
+                            for (old_slot, saved_prev_page, saved_prev_slot) in entries {
+                                match page.restore_prev_and_hot_next(
+                                    old_slot,
+                                    saved_prev_page,
+                                    saved_prev_slot,
+                                ) {
+                                    Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
+                                    Err(e) => return Err(e),
+                                }
+                                match page.set_xmax(old_slot, 0) {
+                                    Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
+                                    Err(e) => return Err(e),
+                                }
+                            }
+                            page.recompute_crc();
+                            pool.write_page(&page)?;
+                            pool.unpin(r.page_id);
+                            stats.records_undone += 1;
+                        }
                     }
                 }
             }
         }
-        // Phase 2: force-self-stamp every row this xid inserted (INSERT, or
-        // an UPDATE's new-version half) so it is permanently invisible.
+        // Phase 2: force-self-stamp every row this xid inserted (INSERT or
+        // WAL_INSERT_BATCH — the new-version half of a cross-page HOT update)
+        // so it is permanently invisible.
         // Runs *after* phase 1 so that a row this xid both inserted and
         // later re-superseded within its own transaction ends up dead
         // (self-stamped) rather than incorrectly live (reverted to 0 by an
@@ -313,16 +344,40 @@ pub fn recover(
         // it was already handled in the loop above (we deleted the slot directly
         // instead of self-stamping, which is equivalent). No separate entry here.
         for r in relevant.iter().filter(|r| {
-            r.rec_type == WAL_INSERT && r.slot != u16::MAX && committed.contains(&r.mini_txn_id)
+            (r.rec_type == WAL_INSERT && r.slot != u16::MAX
+                || r.rec_type == WAL_INSERT_BATCH)
+                && committed.contains(&r.mini_txn_id)
         }) {
-            if let Ok((xmin, _, _)) = decode_insert_redo(&r.redo) {
-                if incomplete_user_txns.contains(&xmin) {
-                    let mut page = fetch_or_create(&pool, r.page_id, page_size)?;
-                    page.set_xmax(r.slot, xmin)?;
-                    page.recompute_crc();
-                    pool.write_page(&page)?;
-                    pool.unpin(r.page_id);
-                    stats.records_undone += 1;
+            if r.rec_type == WAL_INSERT {
+                if let Ok((xmin, _, _)) = decode_insert_redo(&r.redo) {
+                    if incomplete_user_txns.contains(&xmin) {
+                        let mut page = fetch_or_create(&pool, r.page_id, page_size)?;
+                        page.set_xmax(r.slot, xmin)?;
+                        page.recompute_crc();
+                        pool.write_page(&page)?;
+                        pool.unpin(r.page_id);
+                        stats.records_undone += 1;
+                    }
+                }
+            } else {
+                // WAL_INSERT_BATCH: xmin is in redo[0..8]; self-stamp all slots.
+                if r.redo.len() >= 8 {
+                    let xmin = u64_from_le(r.redo[0..8].try_into().unwrap());
+                    if incomplete_user_txns.contains(&xmin) {
+                        if let Ok(batch_rows) = decode_insert_batch_redo(&r.redo) {
+                            let mut page = fetch_or_create(&pool, r.page_id, page_size)?;
+                            for (slot, _) in batch_rows {
+                                match page.set_xmax(slot, xmin) {
+                                    Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
+                                    Err(e) => return Err(e),
+                                }
+                            }
+                            page.recompute_crc();
+                            pool.write_page(&page)?;
+                            pool.unpin(r.page_id);
+                            stats.records_undone += 1;
+                        }
+                    }
                 }
             }
         }
@@ -376,17 +431,36 @@ fn redo_record(r: &WalRecord, pool: &BufferPool, page_size: usize) -> Result<()>
         }
         WAL_INSERT => {
             if r.slot == u16::MAX {
-                // Page-allocation record — no tuple content to redo. Just size
-                // the page into the file. Crucially, do NOT go through
-                // `fetch_or_create`: that pins a frame, and returning here
-                // without unpinning would leak the pin. When recovered data
-                // spans more pages than the recovery buffer pool holds, those
-                // leaked pins exhaust the pool and every later redo fails with
-                // `BufferPoolFull` (silently swallowed as a warn) — the row is
-                // then lost. This surfaced under commit-time fsync's C2
-                // memory-pressure path (a large transaction dirties more pages
-                // than the pool); `ensure_page_allocated` sizes without pinning.
+                // Page-allocation sentinel (alloc_heap_page).  Item 82: we no
+                // longer write a WAL_FPI before the first Phase-B
+                // WAL_INSERT_BATCH for this page (heap.rs marks it fpi_logged
+                // on allocation).  Recovery must therefore initialise the page
+                // to its exact blank state here — so that a torn write of the
+                // subsequent Phase-B fill is caught by the CRC check inside
+                // fetch_or_create and a clean base is re-established.
+                //
+                // Implementation: `write_page` goes straight to mmap and is
+                // pin-free (it updates the frame's dirty flag if the frame
+                // happens to be in the pool, but does NOT pin/unpin).  We
+                // must NOT go through fetch_or_create (which would pin) and
+                // return without unpinning — see the original comment.
                 pool.ensure_page_allocated(r.page_id)?;
+                // Only re-initialise if the page's LSN is below alloc_lsn; if
+                // page.lsn() > r.lsn the page was already filled with rows by
+                // a later, fully-applied redo record — leave it alone.
+                let existing_lsn = {
+                    // read_page does not pin; it re-reads from mmap.
+                    match pool.read_page(r.page_id) {
+                        Ok(p) => p.lsn(),
+                        Err(_) => 0, // page not yet in pool — treat as uninitialised
+                    }
+                };
+                if existing_lsn < r.lsn {
+                    let mut blank =
+                        SlottedPage::new(r.page_id, PAGE_TYPE_HEAP, page_size);
+                    blank.set_lsn(r.lsn);
+                    pool.write_page(&blank)?;
+                }
                 return Ok(());
             }
             let mut page = fetch_or_create(pool, r.page_id, page_size)?;
@@ -593,6 +667,50 @@ fn redo_record(r: &WalRecord, pool: &BufferPool, page_size: usize) -> Result<()>
             }
             pool.unpin(r.page_id);
         }
+        WAL_INSERT_BATCH => {
+            // Item 79: redo N inserts on the same fill page. LSN-gated.
+            // Per-row redo data = encode_insert_redo layout (xmin 8B + prev_page 4B +
+            // prev_slot 2B + payload); reuses decode_insert_redo for each row.
+            // Idempotent: skip rows whose slot already exists (slot < slot_count_pub).
+            let batch_rows = decode_insert_batch_redo(&r.redo)?;
+            let mut page = fetch_or_create(pool, r.page_id, page_size)?;
+            if page.lsn() >= r.lsn {
+                pool.unpin(r.page_id);
+                return Ok(());
+            }
+            for (slot, row_redo) in &batch_rows {
+                if *slot >= page.slot_count_pub() {
+                    let (row_xmin, prev, payload) = decode_insert_redo(row_redo)?;
+                    page.insert_versioned(payload, row_xmin, 0, prev)?;
+                }
+            }
+            page.set_lsn(r.lsn);
+            pool.write_page(&page)?;
+            pool.unpin(r.page_id);
+        }
+        WAL_HOT_XPAGE_BATCH => {
+            // Item 80: redo N (old_slot, new_page_id, new_slot) entries on the same
+            // old page. LSN-gated; idempotent via set_xmax/set_hot_xpage.
+            let (xid, entries) = decode_hot_xpage_batch_redo(&r.redo)?;
+            let mut page = fetch_or_create(pool, r.page_id, page_size)?;
+            if page.lsn() >= r.lsn {
+                pool.unpin(r.page_id);
+                return Ok(());
+            }
+            for &(old_slot, new_page_id, new_slot) in &entries {
+                match page.set_xmax(old_slot, xid) {
+                    Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
+                    Err(e) => return Err(e),
+                }
+                match page.set_hot_xpage(old_slot, new_page_id, new_slot) {
+                    Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            page.set_lsn(r.lsn);
+            pool.write_page(&page)?;
+            pool.unpin(r.page_id);
+        }
         _ => {}
     }
     Ok(())
@@ -672,6 +790,41 @@ fn undo_record(r: &WalRecord, pool: &BufferPool, page_size: usize) -> Result<()>
             match page.set_xmax(old_slot, 0) {
                 Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
                 Err(e) => return Err(e),
+            }
+            page.recompute_crc();
+            pool.write_page(&page)?;
+            pool.unpin(r.page_id);
+        }
+        WAL_INSERT_BATCH => {
+            // Undo N inserts on the same fill page: delete every slot in the batch.
+            // Undo payload: n_slots (2 B LE) || slot_0 (2 B LE) || ...
+            let slots = decode_insert_batch_undo(&r.undo)?;
+            let mut page = fetch_or_create(pool, r.page_id, page_size)?;
+            for slot in slots {
+                match page.delete(slot) {
+                    Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            pool.write_page(&page)?;
+            pool.unpin(r.page_id);
+        }
+        WAL_HOT_XPAGE_BATCH => {
+            // Undo N old-page HOT_XPAGE_HEAD stamps on the same old page.
+            // Undo payload: n_entries (2 B LE) || for each: old_slot (2 B LE) +
+            //   saved_prev_page (4 B LE) + saved_prev_slot (2 B LE).
+            // For each entry: restore_prev_and_hot_next + clear xmax = 0.
+            let entries = decode_hot_xpage_batch_undo_entries(&r.undo)?;
+            let mut page = fetch_or_create(pool, r.page_id, page_size)?;
+            for (old_slot, saved_prev_page, saved_prev_slot) in entries {
+                match page.restore_prev_and_hot_next(old_slot, saved_prev_page, saved_prev_slot) {
+                    Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
+                    Err(e) => return Err(e),
+                }
+                match page.set_xmax(old_slot, 0) {
+                    Ok(()) | Err(DbError::TupleDeleted { .. }) => {}
+                    Err(e) => return Err(e),
+                }
             }
             page.recompute_crc();
             pool.write_page(&page)?;
@@ -786,10 +939,126 @@ fn decode_hot_update_undo(buf: &[u8]) -> Result<(u16, u16)> {
     Ok((old_slot, new_slot))
 }
 
+/// Decode a WAL_INSERT_BATCH redo payload, returning per-row `(slot, row_redo_bytes)`.
+///
+/// Redo format: `xmin (8 B LE) || n_rows (2 B LE) || for each: slot (2 B LE) + redo_len (4 B LE) + redo_data`
+///
+/// `redo_data` per row = `encode_insert_redo` layout (xmin 8B + prev_page 4B + prev_slot 2B + payload).
+/// Decoded further by `decode_insert_redo` in the redo handler.
+fn decode_insert_batch_redo(buf: &[u8]) -> Result<Vec<(u16, Vec<u8>)>> {
+    if buf.len() < 10 {
+        return Err(DbError::WalCorrupt { lsn: 0 });
+    }
+    let n = u16_from_le(buf[8..10].try_into().unwrap()) as usize;
+    let mut rows = Vec::with_capacity(n);
+    let mut pos = 10;
+    for _ in 0..n {
+        if pos + 6 > buf.len() {
+            return Err(DbError::WalCorrupt { lsn: 0 });
+        }
+        let slot = u16_from_le(buf[pos..pos + 2].try_into().unwrap());
+        let redo_len = u32_from_le(buf[pos + 2..pos + 6].try_into().unwrap()) as usize;
+        pos += 6;
+        if pos + redo_len > buf.len() {
+            return Err(DbError::WalCorrupt { lsn: 0 });
+        }
+        rows.push((slot, buf[pos..pos + redo_len].to_vec()));
+        pos += redo_len;
+    }
+    Ok(rows)
+}
+
+/// Decode a WAL_INSERT_BATCH undo payload: slot list for deletion.
+///
+/// Undo format: `n_slots (2 B LE) || slot_0 (2 B LE) || ...`
+fn decode_insert_batch_undo(buf: &[u8]) -> Result<Vec<u16>> {
+    if buf.len() < 2 {
+        return Err(DbError::WalCorrupt { lsn: 0 });
+    }
+    let n = u16_from_le(buf[0..2].try_into().unwrap()) as usize;
+    if buf.len() < 2 + 2 * n {
+        return Err(DbError::WalCorrupt { lsn: 0 });
+    }
+    Ok((0..n)
+        .map(|i| u16_from_le(buf[2 + 2 * i..4 + 2 * i].try_into().unwrap()))
+        .collect())
+}
+
+/// `(old_slot, new_page_id, new_slot)` tuples decoded from a WAL_HOT_XPAGE_BATCH record.
+type HotXpageBatchEntries = Vec<(u16, u32, u16)>;
+
+/// Decode a WAL_HOT_XPAGE_BATCH redo payload.
+///
+/// Redo format: `xid (8 B LE) || n_entries (2 B LE) || for each: old_slot (2 B LE) + new_page_id (4 B LE) + new_slot (2 B LE)`
+fn decode_hot_xpage_batch_redo(buf: &[u8]) -> Result<(Xid, HotXpageBatchEntries)> {
+    if buf.len() < 10 {
+        return Err(DbError::WalCorrupt { lsn: 0 });
+    }
+    let xid = u64_from_le(buf[0..8].try_into().unwrap());
+    let n = u16_from_le(buf[8..10].try_into().unwrap()) as usize;
+    if buf.len() < 10 + 8 * n {
+        return Err(DbError::WalCorrupt { lsn: 0 });
+    }
+    let entries = (0..n)
+        .map(|i| {
+            let base = 10 + 8 * i;
+            let old_slot = u16_from_le(buf[base..base + 2].try_into().unwrap());
+            let new_page_id = u32_from_le(buf[base + 2..base + 6].try_into().unwrap());
+            let new_slot = u16_from_le(buf[base + 6..base + 8].try_into().unwrap());
+            (old_slot, new_page_id, new_slot)
+        })
+        .collect();
+    Ok((xid, entries))
+}
+
+/// Decode a WAL_HOT_XPAGE_BATCH undo payload.
+///
+/// Undo format: `n_entries (2 B LE) || for each: old_slot (2 B LE) + saved_prev_page (4 B LE) + saved_prev_slot (2 B LE)`
+fn decode_hot_xpage_batch_undo_entries(buf: &[u8]) -> Result<Vec<(u16, u32, u16)>> {
+    if buf.len() < 2 {
+        return Err(DbError::WalCorrupt { lsn: 0 });
+    }
+    let n = u16_from_le(buf[0..2].try_into().unwrap()) as usize;
+    if buf.len() < 2 + 8 * n {
+        return Err(DbError::WalCorrupt { lsn: 0 });
+    }
+    Ok((0..n)
+        .map(|i| {
+            let base = 2 + 8 * i;
+            let old_slot = u16_from_le(buf[base..base + 2].try_into().unwrap());
+            let saved_prev_page = u32_from_le(buf[base + 2..base + 6].try_into().unwrap());
+            let saved_prev_slot = u16_from_le(buf[base + 6..base + 8].try_into().unwrap());
+            (old_slot, saved_prev_page, saved_prev_slot)
+        })
+        .collect())
+}
+
 fn fetch_or_create(pool: &BufferPool, page_id: u32, page_size: usize) -> Result<SlottedPage> {
-    use crate::format::PAGE_TYPE_HEAP;
     match pool.fetch_page(page_id) {
-        Ok(p) => Ok(p),
+        Ok(p) => {
+            // Item 82: CRC-based torn-page detection.  If the on-disk image has
+            // an invalid checksum the page was partially written at crash time
+            // (torn write).  Returning a blank page lets every redo handler
+            // re-apply its records from first principles rather than relying on
+            // a corrupted LSN field (which may falsely appear ≥ the record's
+            // LSN, causing redo to be incorrectly skipped).
+            //
+            // Note: `pool.fetch_page` calls `read_page_locked`, which already
+            // returns `from_bytes_unchecked` for all-zero pages (valid CRC by
+            // construction) and `from_bytes` (with CRC check) for non-zero
+            // pages.  A `ChecksumMismatch` propagates here as `Ok(torn_page)`
+            // only when the caller was `fetch_page` directly; the bufferpool's
+            // internal `read_page_from_mmap` re-uses the same path.  For
+            // safety we verify again here for any page that may have been
+            // partially written.
+            if p.verify_crc().is_err() {
+                // Torn page: decrement pin and return blank so redo rebuilds.
+                pool.unpin(page_id);
+                Ok(SlottedPage::new(page_id, PAGE_TYPE_HEAP, page_size))
+            } else {
+                Ok(p)
+            }
+        }
         Err(DbError::PageNotFound { .. }) => {
             // Grow the file to include this page when replaying into a
             // smaller-than-implied data file (e.g. a replica/restore applying WAL

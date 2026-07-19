@@ -49,8 +49,9 @@ use crate::{
     format::{
         u16_from_le, u16_to_le, u32_from_le, u32_to_le, u64_from_le, u64_to_le, Lsn, PageId, Xid,
         INVALID_LSN, WAL_ABORT, WAL_BEGIN, WAL_CHECKPOINT, WAL_COMMIT, WAL_DELETE, WAL_FPI,
-        WAL_HOT_UPDATE, WAL_HOT_XPAGE_HEAD, WAL_INDEX, WAL_INDEX_INSERT, WAL_INSERT, WAL_TXN_ABORT,
-        WAL_TXN_BEGIN, WAL_TXN_COMMIT, WAL_UPDATE, WAL_VACUUM, WAL_XMAX_BATCH,
+        WAL_HOT_UPDATE, WAL_HOT_XPAGE_BATCH, WAL_HOT_XPAGE_HEAD, WAL_INDEX, WAL_INDEX_INSERT,
+        WAL_INSERT, WAL_INSERT_BATCH, WAL_TXN_ABORT, WAL_TXN_BEGIN, WAL_TXN_COMMIT, WAL_UPDATE,
+        WAL_VACUUM, WAL_XMAX_BATCH,
     },
 };
 
@@ -802,6 +803,111 @@ impl Wal {
             new_page_id,
             new_slot,
             "WAL HOT_XPAGE_HEAD"
+        );
+        Ok(lsn)
+    }
+
+    /// Item 79 — Phase B batch insert: one WAL record for N rows on the same
+    /// fill page. Reduces WAL mutex acquisitions from O(rows) to O(fill_pages).
+    ///
+    /// `rows`: `(slot, insert_redo)` pairs in slot order.
+    /// `insert_redo` is the standard `encode_insert_redo(xid, prev, payload)` blob.
+    pub fn log_insert_batch(
+        &self,
+        txn_id: u64,
+        prev_lsn: Lsn,
+        page_id: PageId,
+        xid: Xid,
+        rows: &[(u16, Vec<u8>)],
+    ) -> Result<Lsn> {
+        debug_assert!(!rows.is_empty());
+        let n = rows.len();
+        // redo: xmin (8) || n_rows (2) || for each: slot (2) + redo_data
+        let total_redo: usize = 10 + rows.iter().map(|(_, r)| 8 + r.len()).sum::<usize>();
+        let mut redo = Vec::with_capacity(total_redo);
+        redo.extend_from_slice(&u64_to_le(xid));
+        redo.extend_from_slice(&u16_to_le(n as u16));
+        for (slot, insert_redo) in rows {
+            redo.extend_from_slice(&u16_to_le(*slot));
+            redo.extend_from_slice(&u32_to_le(insert_redo.len() as u32));
+            redo.extend_from_slice(insert_redo);
+        }
+        // undo: n_slots (2) || slot... (2 each)
+        let mut undo = Vec::with_capacity(2 + 2 * n);
+        undo.extend_from_slice(&u16_to_le(n as u16));
+        for (slot, _) in rows {
+            undo.extend_from_slice(&u16_to_le(*slot));
+        }
+        let mut inner = self.lock();
+        let lsn = append_locked(
+            &mut inner,
+            txn_id,
+            prev_lsn,
+            WAL_INSERT_BATCH,
+            page_id,
+            u16::MAX,
+            &redo,
+            &undo,
+        )?;
+        tracing::trace!(
+            mini_txn_id = txn_id,
+            lsn,
+            page_id,
+            n_rows = n,
+            "WAL INSERT_BATCH"
+        );
+        Ok(lsn)
+    }
+
+    /// Item 80 — Phase A batch cross-page HOT head: one WAL record for N
+    /// (old_slot, new_page_id, new_slot) entries on the same old page.
+    /// Reduces Phase A WAL mutex acquisitions from O(rows) to O(old_pages).
+    ///
+    /// `entries`: (old_slot, new_page_id, new_slot, saved_prev_page, saved_prev_slot).
+    pub fn log_hot_xpage_batch(
+        &self,
+        txn_id: u64,
+        prev_lsn: Lsn,
+        old_page_id: PageId,
+        xid: Xid,
+        entries: &[(u16, PageId, u16, PageId, u16)],
+    ) -> Result<Lsn> {
+        debug_assert!(!entries.is_empty());
+        let n = entries.len();
+        // redo: xid (8) || n_entries (2) || for each: old_slot (2) + new_page_id (4) + new_slot (2)
+        let mut redo = Vec::with_capacity(10 + 8 * n);
+        redo.extend_from_slice(&u64_to_le(xid));
+        redo.extend_from_slice(&u16_to_le(n as u16));
+        for &(old_slot, new_page_id, new_slot, _, _) in entries {
+            redo.extend_from_slice(&u16_to_le(old_slot));
+            redo.extend_from_slice(&u32_to_le(new_page_id));
+            redo.extend_from_slice(&u16_to_le(new_slot));
+        }
+        // undo: n_entries (2) || for each: old_slot (2) + saved_prev_page (4) + saved_prev_slot (2)
+        let mut undo = Vec::with_capacity(2 + 8 * n);
+        undo.extend_from_slice(&u16_to_le(n as u16));
+        for &(old_slot, _, _, saved_prev_page, saved_prev_slot) in entries {
+            undo.extend_from_slice(&u16_to_le(old_slot));
+            undo.extend_from_slice(&u32_to_le(saved_prev_page));
+            undo.extend_from_slice(&u16_to_le(saved_prev_slot));
+        }
+        let mut inner = self.lock();
+        let lsn = append_locked(
+            &mut inner,
+            txn_id,
+            prev_lsn,
+            WAL_HOT_XPAGE_BATCH,
+            old_page_id,
+            u16::MAX,
+            &redo,
+            &undo,
+        )?;
+        tracing::trace!(
+            mini_txn_id = txn_id,
+            lsn,
+            old_page_id,
+            n_entries = n,
+            "WAL HOT_XPAGE_BATCH"
         );
         Ok(lsn)
     }
