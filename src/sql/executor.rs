@@ -1184,7 +1184,8 @@ pub fn execute(plan: LogicalPlan, ctx: &mut ExecCtx) -> Result<ExecResult> {
             table,
             columns,
             values,
-        } => exec_insert(&table, columns, values, ctx),
+            returning,
+        } => exec_insert(&table, columns, values, returning.as_deref(), ctx),
         LogicalPlan::Select {
             table,
             projection,
@@ -1194,8 +1195,13 @@ pub fn execute(plan: LogicalPlan, ctx: &mut ExecCtx) -> Result<ExecResult> {
             table,
             assignments,
             predicate,
-        } => exec_update(&table, &assignments, &predicate, ctx),
-        LogicalPlan::Delete { table, predicate } => exec_delete(&table, &predicate, ctx),
+            returning,
+        } => exec_update(&table, &assignments, &predicate, returning.as_deref(), ctx),
+        LogicalPlan::Delete {
+            table,
+            predicate,
+            returning,
+        } => exec_delete(&table, &predicate, returning.as_deref(), ctx),
         LogicalPlan::Query(spec) => crate::sql::query_exec::exec_query(&spec, ctx),
         LogicalPlan::CreateIndex {
             table,
@@ -1553,6 +1559,7 @@ fn exec_insert(
     table: &str,
     columns: Option<Vec<String>>,
     values: Vec<Vec<Literal>>,
+    returning: Option<&[String]>,
     ctx: &mut ExecCtx,
 ) -> Result<ExecResult> {
     let table_def = ctx.catalog.lookup(table)?.clone();
@@ -1561,6 +1568,8 @@ fn exec_insert(
     enforce_referenced_tables_exist(&table_def, ctx.catalog.get())?;
     let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
 
+    // G5 (item 19): RETURNING — collect rows when requested.
+    let mut returned_rows: Vec<Vec<Literal>> = Vec::new();
     let mut count = 0;
     for row_values in values {
         let ordered = order_values_by_columns(&table_def, &columns, row_values)?;
@@ -1628,11 +1637,23 @@ fn exec_insert(
         apply_durable_index_writes(&table_def, row_id, &coerced, ctx)?;
         // C1 (item 29): INSERT has after-only; no pre-image.
         send_event_capture(&table_def, "insert", None, Some(&coerced), ctx)?;
+        if returning.is_some() {
+            returned_rows.push(coerced);
+        }
         count += 1;
     }
 
     persist_pages_if_changed(table, &heap, &table_def.pages, ctx)?;
     assert_schema_stable(ctx, table, table_def.generation);
+
+    // G5 (item 19): emit RETURNING result if requested.
+    if let Some(ret_cols) = returning {
+        let (col_names, rows) = project_returning(&table_def, ret_cols, returned_rows)?;
+        return Ok(ExecResult::Rows {
+            columns: col_names,
+            rows,
+        });
+    }
     Ok(ExecResult::Inserted { count })
 }
 
@@ -2439,6 +2460,7 @@ fn exec_update(
     table: &str,
     assignments: &[(String, Expr)],
     predicate: &Option<Expr>,
+    returning: Option<&[String]>,
     ctx: &mut ExecCtx,
 ) -> Result<ExecResult> {
     let table_def = ctx.catalog.lookup(table)?.clone();
@@ -2646,6 +2668,18 @@ fn exec_update(
 
         persist_pages_if_changed(table, &heap, &table_def.pages, ctx)?;
         assert_schema_stable(ctx, table, table_def.generation);
+        // G5 (item 19): RETURNING for HOT batch path.
+        if let Some(ret_cols) = returning {
+            let after_rows: Vec<Vec<Literal>> = collected
+                .into_iter()
+                .map(|(_, _, _, after)| after)
+                .collect();
+            let (col_names, rows) = project_returning(&table_def, ret_cols, after_rows)?;
+            return Ok(ExecResult::Rows {
+                columns: col_names,
+                rows,
+            });
+        }
         return Ok(ExecResult::Updated {
             count: heap_results.len(),
         });
@@ -2665,8 +2699,7 @@ fn exec_update(
     // doc comment) — no UNIQUE indexes, no FK child-side refs in SET, no FK
     // parent-side children. CDC (events_enabled) is handled below via
     // send_event_capture() after update_many() returns, so no gate needed.
-    let can_batch_non_hot =
-        !hot_eligible && !has_unique && !has_fk_refs_in_set && !has_fk_children;
+    let can_batch_non_hot = !hot_eligible && !has_unique && !has_fk_refs_in_set && !has_fk_children;
 
     if can_batch_non_hot && !matching.is_empty() {
         // Phase 1: decode / eval SET / encode for all matching rows.
@@ -2737,10 +2770,24 @@ fn exec_update(
 
         persist_pages_if_changed(table, &heap, &table_def.pages, ctx)?;
         assert_schema_stable(ctx, table, table_def.generation);
+        // G5 (item 19): RETURNING for batch non-HOT path.
+        if let Some(ret_cols) = returning {
+            let after_rows: Vec<Vec<Literal>> = collected
+                .into_iter()
+                .map(|(_, _, _, after)| after)
+                .collect();
+            let (col_names, rows) = project_returning(&table_def, ret_cols, after_rows)?;
+            return Ok(ExecResult::Rows {
+                columns: col_names,
+                rows,
+            });
+        }
         return Ok(ExecResult::Updated { count });
     }
 
     // ── Non-HOT / constrained path: per-row loop (unchanged) ────────────────
+    // G5 (item 19): collect updated rows for RETURNING when requested.
+    let mut returned_rows: Vec<Vec<Literal>> = Vec::new();
     let mut count = 0;
     for (row_id, bytes) in matching {
         let mut row = decode_row(&bytes, &table_def.columns)?;
@@ -2931,6 +2978,9 @@ fn exec_update(
         }
         // C1 (item 29): UPDATE carries both before (pre-mutation) and after (post-mutation).
         send_event_capture(&table_def, "update", Some(&before_row), Some(&coerced), ctx)?;
+        if returning.is_some() {
+            returned_rows.push(coerced);
+        }
         count += 1;
     }
     // Coalesced index maintenance for the whole statement (A1).
@@ -2941,10 +2991,23 @@ fn exec_update(
 
     persist_pages_if_changed(table, &heap, &table_def.pages, ctx)?;
     assert_schema_stable(ctx, table, table_def.generation);
+    // G5 (item 19): emit RETURNING result if requested.
+    if let Some(ret_cols) = returning {
+        let (col_names, rows) = project_returning(&table_def, ret_cols, returned_rows)?;
+        return Ok(ExecResult::Rows {
+            columns: col_names,
+            rows,
+        });
+    }
     Ok(ExecResult::Updated { count })
 }
 
-fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Result<ExecResult> {
+fn exec_delete(
+    table: &str,
+    predicate: &Option<Expr>,
+    returning: Option<&[String]>,
+    ctx: &mut ExecCtx,
+) -> Result<ExecResult> {
     let table_def = ctx.catalog.lookup(table)?.clone();
     let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
@@ -2952,7 +3015,9 @@ fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Resu
     // Item 48: fast path for unconditional DELETE with no FK children and no CDC.
     // Routes through the O(pages) truncate instead of xmax-stamping every row.
     // CDC is skipped intentionally — TRUNCATE has never emitted per-row events.
-    if predicate.is_none()
+    // G5 (item 19): bypass fast path when RETURNING is requested (we need row data).
+    if returning.is_none()
+        && predicate.is_none()
         && !table_has_fk_children(ctx.catalog.get(), table)
         && !table_def.events_enabled
     {
@@ -2964,8 +3029,9 @@ fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Resu
 
     // Item 36: gate the RESTRICT scan — compute up-front so the collection
     // phase can skip row bytes when they are not needed (item 75 fast path).
+    // G5 (item 19): RETURNING also needs row bytes.
     let has_fk_children = table_has_fk_children(ctx.catalog.get(), table);
-    let needs_per_row_checks = has_fk_children || table_def.events_enabled;
+    let needs_per_row_checks = has_fk_children || table_def.events_enabled || returning.is_some();
 
     // Item 75: When there are no per-row side-effects (no FK children, no CDC)
     // we only need RowIds, not row-body bytes.  Separate fast and slow paths
@@ -3111,6 +3177,8 @@ fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Resu
     // *before* any heap mutation (FK needs a fresh snapshot per row; CDC needs
     // the row data, which is gone after deletion).  All write-locks are acquired
     // inside `delete_many`, which runs after the pre-checks.
+    // G5 (item 19): also collect rows for RETURNING when requested.
+    let mut returned_rows: Vec<Vec<Literal>> = Vec::new();
     let row_ids: Vec<RowId> = {
         let mut ids = Vec::with_capacity(matching.len());
         for (row_id, bytes) in &matching {
@@ -3133,6 +3201,9 @@ fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Resu
             }
             // C1 (item 29): before-only; captured before heap mutation.
             send_event_capture(&table_def, "delete", Some(&row), None, ctx)?;
+            if returning.is_some() {
+                returned_rows.push(row);
+            }
             ids.push(*row_id);
         }
         ids
@@ -3158,6 +3229,14 @@ fn exec_delete(table: &str, predicate: &Option<Expr>, ctx: &mut ExecCtx) -> Resu
 
     persist_pages_if_changed(table, &heap, &table_def.pages, ctx)?;
     assert_schema_stable(ctx, table, table_def.generation);
+    // G5 (item 19): emit RETURNING result if requested.
+    if let Some(ret_cols) = returning {
+        let (col_names, rows) = project_returning(&table_def, ret_cols, returned_rows)?;
+        return Ok(ExecResult::Rows {
+            columns: col_names,
+            rows,
+        });
+    }
     Ok(ExecResult::Deleted { count })
 }
 
@@ -3573,6 +3652,57 @@ fn column_index(table: &TableDef, name: &str) -> Result<usize> {
             table: table.name.clone(),
             column: name.to_string(),
         })
+}
+
+/// G5 (item 19): project rows for a RETURNING clause.
+/// `ret_cols` is the column-name list from the clause; empty = all columns.
+/// Returns `(col_names, rows)` in the order specified by `ret_cols`.
+fn project_returning(
+    table_def: &TableDef,
+    ret_cols: &[String],
+    rows: Vec<Vec<Literal>>,
+) -> Result<(Vec<String>, Vec<Vec<Literal>>)> {
+    // Resolve column indices once.
+    let live_cols: Vec<&crate::catalog::ColumnDef> =
+        table_def.columns.iter().filter(|c| !c.dropped).collect();
+
+    let (col_names, indices): (Vec<String>, Vec<usize>) = if ret_cols.is_empty() {
+        // RETURNING * — all non-dropped columns in definition order.
+        live_cols
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.name.clone(), i))
+            .unzip()
+    } else {
+        // Named columns — resolve each against the live column list.
+        let mut names = Vec::with_capacity(ret_cols.len());
+        let mut idxs = Vec::with_capacity(ret_cols.len());
+        for col_name in ret_cols {
+            let idx = live_cols
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                .ok_or_else(|| DbError::ColumnNotFound {
+                    table: table_def.name.clone(),
+                    column: col_name.clone(),
+                })?;
+            names.push(live_cols[idx].name.clone());
+            idxs.push(idx);
+        }
+        (names, idxs)
+    };
+
+    // Project each row.
+    let projected: Vec<Vec<Literal>> = rows
+        .into_iter()
+        .map(|row| {
+            indices
+                .iter()
+                .map(|&i| row.get(i).cloned().unwrap_or(Literal::Null))
+                .collect()
+        })
+        .collect();
+
+    Ok((col_names, projected))
 }
 
 fn coerce_and_validate_row(table: &TableDef, values: Vec<Literal>) -> Result<Vec<Literal>> {
@@ -4200,7 +4330,7 @@ pub(crate) fn predicate_matches(
 /// Evaluate an arithmetic binary expression. Supports `Int op Int → Int`,
 /// `Float op Float → Float`, and mixed `Int`/`Float` (coerced to `Float`).
 /// Division and modulo by zero return an error rather than panicking.
-fn eval_arith(op: ArithOp, l: Literal, r: Literal) -> Result<Literal> {
+pub(crate) fn eval_arith(op: ArithOp, l: Literal, r: Literal) -> Result<Literal> {
     // Coerce to a common numeric type: Int × Int stays Int; anything touching
     // Float becomes Float.
     match (l, r) {
@@ -4348,6 +4478,12 @@ pub(crate) fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Literal]) -> 
         // per-row re-check returns true and lets other AND'd WHERE terms apply
         // through `predicate_matches` unchanged.
         Expr::Match { .. } => Ok(Literal::Bool(true)),
+        // G10 (item 19): IS [NOT] NULL on the simple row path.
+        Expr::IsNull { expr, negated } => {
+            let v = eval_expr(expr, columns, row)?;
+            let is_null = matches!(v, Literal::Null);
+            Ok(Literal::Bool(is_null != *negated))
+        }
     }
 }
 
@@ -4456,8 +4592,80 @@ pub(crate) fn compare(op: CmpOp, l: &Literal, r: &Literal) -> Result<bool> {
         (Literal::Time(a), Literal::Time(b)) => Ok(apply_cmp(op, a.cmp(b))),
         (Literal::Time(a), Literal::Text(b)) => Ok(apply_cmp(op, a.cmp(&datetime::parse_time(b)?))),
         (Literal::Text(a), Literal::Time(b)) => Ok(apply_cmp(op, datetime::parse_time(a)?.cmp(b))),
+        // Item 38: implicit parameter type coercion (=, <, >, <=, >=, !=).
+        // When a bind parameter arrives as Text but the column is Int/Float/Bool
+        // (or vice-versa), attempt a lossless parse so `WHERE int_col = $1`
+        // with params=[Text("42")] works naturally, matching PostgreSQL/SQLite
+        // implicit coercion semantics. NOT applied to LIKE/MATCH (dedicated
+        // arms above).
+        //
+        // Text → Int: parse i64. Text → Float: parse f64 (dispatched through
+        // the Float arm). Int/Bool → Text: to_string (safe widening).
+        // Non-parseable value → clear error, never a panic.
+        (Literal::Text(s), Literal::Int(b)) => {
+            let a: i64 = s.parse().map_err(|_| {
+                DbError::SqlPlan(format!(
+                    "cannot coerce text '{s}' to integer for comparison"
+                ))
+            })?;
+            Ok(apply_cmp(op, a.cmp(b)))
+        }
+        (Literal::Int(a), Literal::Text(s)) => {
+            let b: i64 = s.parse().map_err(|_| {
+                DbError::SqlPlan(format!(
+                    "cannot coerce text '{s}' to integer for comparison"
+                ))
+            })?;
+            Ok(apply_cmp(op, a.cmp(&b)))
+        }
+        // Text → Bool: accept "true"/"false"/"1"/"0"/"t"/"f" (case-insensitive).
+        (Literal::Text(s), Literal::Bool(r_b)) => {
+            let a = parse_bool_text(s)?;
+            match op {
+                CmpOp::Eq => Ok(a == *r_b),
+                CmpOp::Ne => Ok(a != *r_b),
+                _ => Err(DbError::SqlUnsupported(
+                    "ordering comparisons are not supported on booleans".into(),
+                )),
+            }
+        }
+        (Literal::Bool(l_b), Literal::Text(s)) => {
+            let b = parse_bool_text(s)?;
+            match op {
+                CmpOp::Eq => Ok(*l_b == b),
+                CmpOp::Ne => Ok(*l_b != b),
+                _ => Err(DbError::SqlUnsupported(
+                    "ordering comparisons are not supported on booleans".into(),
+                )),
+            }
+        }
+        // Text → Float/Decimal: parse as f64, dispatch through float path.
+        (Literal::Text(s), _) if matches!(r, Literal::Float(_) | Literal::Decimal(_, _)) => {
+            let f: f64 = s.parse().map_err(|_| {
+                DbError::SqlPlan(format!("cannot coerce text '{s}' to float for comparison"))
+            })?;
+            compare(op, &Literal::Float(f), r)
+        }
+        (_, Literal::Text(s)) if matches!(l, Literal::Float(_) | Literal::Decimal(_, _)) => {
+            let f: f64 = s.parse().map_err(|_| {
+                DbError::SqlPlan(format!("cannot coerce text '{s}' to float for comparison"))
+            })?;
+            compare(op, l, &Literal::Float(f))
+        }
         (a, b) => Err(DbError::SqlUnsupported(format!(
             "cannot compare {a:?} with {b:?}"
+        ))),
+    }
+}
+
+/// Parse a text value as boolean for coercion (item 38).
+/// Accepts "true"/"false", "1"/"0", "t"/"f" (case-insensitive).
+fn parse_bool_text(s: &str) -> Result<bool> {
+    match s.trim().to_lowercase().as_str() {
+        "true" | "1" | "t" => Ok(true),
+        "false" | "0" | "f" => Ok(false),
+        _ => Err(DbError::SqlPlan(format!(
+            "cannot coerce text '{s}' to boolean for comparison"
         ))),
     }
 }
@@ -4707,6 +4915,8 @@ fn expr_columns(expr: &Expr, table_def: &TableDef, out: &mut Vec<usize>) {
             expr_columns(expr, table_def, out);
             expr_columns(pattern, table_def, out);
         }
+        // G10 (item 19): IS [NOT] NULL.
+        Expr::IsNull { expr, .. } => expr_columns(expr, table_def, out),
     }
 }
 
@@ -4748,6 +4958,8 @@ fn bind_predicate_columns(expr: &mut Expr, columns: &[ColumnDef]) {
         // row field evaluated in eval_expr (Near/Match arms return Bool(true)).
         // No binding needed.
         Expr::Near { .. } => {}
+        // G10 (item 19): IS [NOT] NULL.
+        Expr::IsNull { expr, .. } => bind_predicate_columns(expr, columns),
     }
 }
 
