@@ -1286,13 +1286,8 @@ impl DiskBTree {
                 if n >= 2 {
                     // Reached here only when proactive check missed (combined body
                     // estimate was too conservative). Use batch path anyway.
-                    let consumed = self.insert_batch_in_txn(
-                        &sorted[i..i + n],
-                        pool,
-                        wal,
-                        txn_id,
-                        prev_lsn,
-                    )?;
+                    let consumed =
+                        self.insert_batch_in_txn(&sorted[i..i + n], pool, wal, txn_id, prev_lsn)?;
                     i += consumed;
                 } else {
                     self.insert_in_txn(
@@ -1440,14 +1435,7 @@ impl DiskBTree {
             _ => {
                 drop(retained);
                 drop(meta_guard);
-                self.insert_in_txn(
-                    batch[0].0.clone(),
-                    batch[0].1,
-                    pool,
-                    wal,
-                    txn_id,
-                    prev_lsn,
-                )?;
+                self.insert_in_txn(batch[0].0.clone(), batch[0].1, pool, wal, txn_id, prev_lsn)?;
                 return Ok(1);
             }
         };
@@ -1518,7 +1506,15 @@ impl DiskBTree {
                 entries: combined,
                 next: leaf_next,
             };
-            *prev_lsn = write_node(pool, wal, txn_id, *prev_lsn, leaf_pid, &leaf, self.page_size)?;
+            *prev_lsn = write_node(
+                pool,
+                wal,
+                txn_id,
+                *prev_lsn,
+                leaf_pid,
+                &leaf,
+                self.page_size,
+            )?;
             // No separator to propagate; drop retained (releases latch).
             drop(retained);
             drop(meta_guard);
@@ -1530,10 +1526,32 @@ impl DiskBTree {
             let left_entries = combined[..mid].to_vec();
             let sep_key = right_entries[0].0.clone();
             let right_page = pool.alloc_page()?;
-            let right = Node::Leaf { entries: right_entries, next: leaf_next };
-            let left  = Node::Leaf { entries: left_entries,  next: right_page };
-            *prev_lsn = write_node(pool, wal, txn_id, *prev_lsn, right_page, &right, self.page_size)?;
-            *prev_lsn = write_node(pool, wal, txn_id, *prev_lsn, leaf_pid,   &left,  self.page_size)?;
+            let right = Node::Leaf {
+                entries: right_entries,
+                next: leaf_next,
+            };
+            let left = Node::Leaf {
+                entries: left_entries,
+                next: right_page,
+            };
+            *prev_lsn = write_node(
+                pool,
+                wal,
+                txn_id,
+                *prev_lsn,
+                right_page,
+                &right,
+                self.page_size,
+            )?;
+            *prev_lsn = write_node(
+                pool,
+                wal,
+                txn_id,
+                *prev_lsn,
+                leaf_pid,
+                &left,
+                self.page_size,
+            )?;
             pending = Some((sep_key, right_page));
         } else {
             // combined > 2 pages: more than 2 leaves needed (rare: >1086 entries
@@ -1551,7 +1569,11 @@ impl DiskBTree {
         // exactly as insert_in_txn does.
         while let Some(frame) = retained.pop() {
             let _latch = frame.latch;
-            let Node::Internal { mut keys, mut children } = frame.node else {
+            let Node::Internal {
+                mut keys,
+                mut children,
+            } = frame.node
+            else {
                 unreachable!("non-leaf in ancestor retained stack")
             };
             let Some((sep_key, new_child)) = pending.take() else {
@@ -1562,7 +1584,15 @@ impl DiskBTree {
             children.insert(frame.route_idx + 1, new_child);
             let internal = Node::Internal { keys, children };
             if internal.body_len() <= cap {
-                *prev_lsn = write_node(pool, wal, txn_id, *prev_lsn, frame.pid, &internal, self.page_size)?;
+                *prev_lsn = write_node(
+                    pool,
+                    wal,
+                    txn_id,
+                    *prev_lsn,
+                    frame.pid,
+                    &internal,
+                    self.page_size,
+                )?;
                 pending = None;
                 break; // absorbed; remaining ancestors unchanged
             }
@@ -1579,7 +1609,15 @@ impl DiskBTree {
                 keys: vec![sep_key],
                 children: vec![root_pid, new_child],
             };
-            *prev_lsn = write_node(pool, wal, txn_id, *prev_lsn, new_root_page, &new_root, self.page_size)?;
+            *prev_lsn = write_node(
+                pool,
+                wal,
+                txn_id,
+                *prev_lsn,
+                new_root_page,
+                &new_root,
+                self.page_size,
+            )?;
             let meta = meta_bytes(self.meta_page, new_root_page, self.page_size);
             *prev_lsn = write_raw(pool, wal, txn_id, *prev_lsn, self.meta_page, meta)?;
         }
