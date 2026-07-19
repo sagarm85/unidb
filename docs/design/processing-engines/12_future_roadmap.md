@@ -12,12 +12,23 @@
 ## 12.1 Where the engine stands
 
 Phases 1–6 of the roadmap are complete: ACID hardening, data-model depth, durable
-multi-model storage (the O(1)-open moat), query power, concurrency &
-performance, and operations/HA. Milestone P added parallel scans (default-on with a global
-worker cap and cancellation since backlog item 15). The engine is
-a deployable single-primary system with replicas, backups/PITR, auth, and
-observability — at SQLite-parity durable writes, several-fold-faster embedded
-reads, and honest, measured gaps (bulk UPDATE, large single-model scans).
+multi-model storage (the O(1)-open moat), query power, concurrency & performance,
+and operations/HA. Items 71–99 (CRUD performance sprint, HNSW caches, plan cache,
+O(1) COUNT(*), batch INSERT, batch-sql, SQL authz DDL) have shipped on top of
+that baseline. The engine is a deployable single-primary system with:
+
+- Replicas, backups, PITR by LSN, JWT auth, SQL DDL roles/grants/policies
+- Parallel scan workers (default-on; 5 primitives including parallel DELETE)
+- HOT UPDATE chains (same-page + cross-page) reaching **0.62× PG** (Docker bench)
+- DELETE selected at **0.81× PG**; GROUP BY at **1.44× PG**; COUNT(*) at **6.80× PG**
+- 1,024-entry plan cache (537–891× parse speedup)
+- O(1) COUNT(*) via catalog `row_count`
+- DiskHnswIndex with L0/vec caches (0.79 ms warm at 1k, 2.38 ms at 10k)
+- `POST /batch-sql`, `POST /bulk` (60–87k rows/s), CDC management API
+
+Honest gaps (as of 2026-07-19): INSERT per-row 0.55× PG; UPDATE HOT 0.62×;
+non-HOT UPDATE 0.42×; no GROUP COMMIT for SERIAL INSERTs; HNSW 21× behind
+ffsdb at 10k warm.
 
 ## 12.2 North-star goals
 

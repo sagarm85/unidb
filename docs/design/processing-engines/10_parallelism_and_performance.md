@@ -68,13 +68,14 @@ flowchart TB
   (tested: parallel-vs-serial equality, MVCC honoring, concurrent-writer
   stress). A feared "pool newer than mmap" hazard was investigated and shown
   **not to exist** in this architecture — that's a Postgres-shaped problem.
-- **Four primitives**, routed by shape:
+- **Five primitives**, routed by shape:
   | Primitive | Used for | Gather |
   |---|---|---|
   | `parallel_count` | unfiltered `COUNT(*)` (header-only) | atomic sum |
   | `parallel_count_matching` | filtered `COUNT(*)` — **partial aggregate**: scan→filter→count entirely inside workers | sum |
   | `parallel_filter_project` | full-scan SELECT | concat + RowIds (SSI read set) |
   | `parallel_resolve_candidates` | B-tree candidate resolution (filtered SELECT hot path) | concat |
+  | `parallel_collect_matching` | DELETE selected — scan+filter inside workers (item 66); result sorted by (page,slot) before delete_many | sorted concat |
 - **Fallbacks:** subquery predicates run serial (they need executor storage
   access); small tables (< 64 pages) stay serial. Read-only, no format change,
   crash harness untouched.
@@ -140,16 +141,43 @@ Pre-flip (per-statement fsync) W4 was ~33.1 ms — the commit-time-fsync default
 bought **~7.5×**. `w4_1fsync` (hand-built single-fsync rung) matches W4 within
 noise — proof the flip landed.
 
-### vs Postgres (lens 2, matched durability)
+### Table 3 — CRUD stress vs Postgres (Docker, 100k rows, real fsync, items 75–84)
+
+> Docker bench report `report_20260718_232622.md` · aarch64 · 18 cores · Linux
+> 6.12.76-linuxkit · Peak RSS 410 MiB
+
+| Operation | unidb rec/s | PG rec/s | unidb ÷ PG | WAL B/row |
+|---|---|---|---|---|
+| INSERT (per-row commit) | 3,493 | 6,339 | 0.55× | 556 |
+| SELECT filtered (5%) | 2,208,521 | 5,043,078 | 0.44× | 0 |
+| SELECT GROUP BY | 24,739,717 | 17,161,121 | **1.44× unidb** | 0 |
+| SELECT COUNT(*) | 316,643,578 | 46,566,230 | **6.80× unidb** | 0 |
+| UPDATE HOT | 453,795 | 731,844 | **0.62×** | 82 |
+| UPDATE non-HOT | 346,385 | 815,681 | **0.42×** | 202 |
+| DELETE selected | 2,518,064 | 3,104,746 | **0.81×** | 5 |
+| DELETE all | 27,205,636 | 3,412,338 | **7.97× unidb** | 0 |
+
+### Table 1 — Multi-model commit cost (ms/commit, Docker)
+
+| Rung | 1k rows | 10k rows | 100k rows |
+|---|---|---|---|
+| W0 plain row | 1.11 | 0.44 | 0.24 |
+| W1 + B-tree | 1.04 | 0.50 | 0.25 |
+| W2 + VECTOR | 7.17 | 15.31 | 26.44 |
+| W3 + edge | 8.21 | 15.44 | 23.70 |
+| **W4 + event (full multi-model)** | **9.74** | **6.73** | **32.00** |
+
+Pre-flip W4 was ~33.1 ms — the commit-time-fsync default bought **~7.5×**.
+
+### vs Postgres (macOS lens 2, matched durability — single-model fitness check)
 
 | Metric | unidb | Postgres | Verdict |
 |---|---|---|---|
 | Durable single-row INSERT | 3.58 ms | 3.31 ms | parity (both fsync-bound) |
 | Point SELECT | **6.87 µs** | 33.6 µs | **unidb 4.9×** |
-| Point read across 10 k→1 M rows | flat 3.2–5.3 µs | 61–69 µs | **~13× at every size; nothing bends** |
+| Point read across 10 k→1 M rows | flat 3.2–5.3 µs | 61–69 µs | **~13× at every size** |
 | MVCC UPDATE (single) | 4.00 ms | 3.65 ms | PG +10 % |
-| UPDATE bulk (post-Phase-A) | 0.34× PG | — | honest gap; HOT updates are the path to parity |
-| Read after 30× churn | 35.4 µs → **5.85 µs after vacuum** | ~35 µs steady | automation (autovacuum, now shipped) not capability |
+| Read after 30× churn | 35.4 µs → **5.85 µs after vacuum** | ~35 µs | autovacuum fix |
 | 8-writer commits/s | 1,121 raw / 1,205 SQL | 1,179 | **both scale 3.5–3.8×** |
 | Peak RSS | ~18–35 MB | server-class | embedded footprint |
 

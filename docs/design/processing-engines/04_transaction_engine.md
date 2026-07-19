@@ -5,6 +5,10 @@
 header), D10 (RC default, RR offered), D11 (`on_read`/`on_write` seam), D12
 (SI abort path before RC re-evaluation).
 
+> **Key shipped optimization (item 88):** bulk lock elision — xmax stamping *is*
+> the row lock for batch DML; per-row lock-table entries are skipped when the
+> caller batches many rows under the same xid. See §4.3.
+
 ---
 
 ## 4.1 Snapshots and visibility
@@ -98,6 +102,24 @@ flowchart LR
   transactions.
 - Row write locks are held for the whole transaction, so commit needs **no
   re-validation step** — conflicts were caught at write time.
+
+### Bulk lock elision (item 88)
+
+For batch DML (`delete_many`, `update_many`, `hot_update_many`), stamping
+`xmax = xid` on a tuple is itself the ownership claim: any concurrent writer
+attempting to stamp the same slot will observe `xmax != 0` and raise
+`WriteConflict`. Recording a separate entry in the lock table would be redundant.
+
+Bulk lock elision skips the per-row `lock_mgr.try_acquire_write` call for batch
+operations. **Undo still runs per-row:** the undo log records each
+`WAL_XMAX_BATCH` or `WAL_INSERT_BATCH` slot, and `abort(xid)` reverts them all
+in reverse order. The elision reduces lock-table mutex acquisitions from O(rows)
+to O(1) per batch — at 50k rows, this eliminates ~50,000 mutex round-trips.
+
+The correctness gate: elision is only valid when the batch is under a single xid
+and every slot check (`xmax == 0`) has already been done atomically under the
+page latch before stamping. `hot_update_many` Phase A performs this check —
+WriteConflict on any slot aborts the mini-txn before any stamps are committed.
 
 ## 4.4 Vacuum (M10) and the index-aliasing gate
 

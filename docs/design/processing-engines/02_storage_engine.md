@@ -1,9 +1,13 @@
-# 2. Storage Engine — Pages, Buffer Pool, Heap, FSM, Large Objects
+# 2. Storage Engine — Pages, Buffer Pool, Heap, HOT Chains, InsertAccum
 
 **Modules:** `format.rs`, `page.rs`, `mmap.rs`, `bufferpool.rs`, `control.rs`,
 `heap.rs`, `checkpoint.rs`, `large_object.rs`.
 **Locked decisions:** D3 (control file), D4 (tuple header), D5 (WAL-before-page),
 D6 (single file), D8 (8 KiB pages), D9 (little-endian + CRC + LSN).
+
+> **Note:** `FORMAT_VERSION` is now **11**. The version history embedded in
+> `format.rs` explains every bump — each one was mandatory to prevent older
+> binaries from silently misrecovering.
 
 ---
 
@@ -14,11 +18,12 @@ D6 (single file), D8 (8 KiB pages), D9 (little-endian + CRC + LSN).
 | Constant | Value | Notes |
 |---|---|---|
 | `MAGIC` | `0x556E4442` ("UnDB") | control file |
-| `FORMAT_VERSION` | `5` | v3: +`next_xid` (xid-reuse fix) · v4: +`WAL_FPI` · v5: +durable B-tree |
+| `FORMAT_VERSION` | `11` | v9: cross-page HOT (item 71) · v10: reserved · v11: `row_count` in catalog (item 97) |
 | `DEFAULT_PAGE_SIZE` | 8192 | power-of-two, 4 KiB–64 KiB allowed, baked into control file |
-| `INVALID_PAGE_ID` | `u32::MAX` | **page 0 is allocatable** — the sentinel is MAX, not 0 |
+| `INVALID_PAGE_ID` | `u32::MAX` | page 0 is allocatable — the sentinel is MAX, not 0 |
 | `INVALID_LSN` / `INVALID_XID` | 0 | |
 | Page types | HEAP=1, FREE=2, META=3, BTREE=4 | |
+| `HOT_NEXT_XPAGE` | `0xFFFE` | sentinel in `hot_next` field signalling cross-page HOT chain |
 
 ### Page layout (28-byte header + slotted body)
 
@@ -212,14 +217,96 @@ sequenceDiagram
   decode; powers the fast `COUNT(*)`), `scan_page_into` (owned page copies),
   with `query_limits::check()` every 256 pages for timeout/cancellation.
 
+### HOT update chains (items 71, 74, 85)
+
+Insert-new-version MVCC requires a B-tree update on every UPDATE when an indexed
+column is in the SET clause. For non-indexed column updates ("HOT-eligible"), the
+B-tree can be skipped if the chain is resolvable from the old slot.
+
+**Same-page HOT (item 58):** When a page has space, the new version is inserted
+on the *same page*; `hot_next` in the old slot's tuple header points forward to
+the new slot. Readers follow the chain; the B-tree entry remains unchanged.
+
+**Cross-page HOT (item 71):** When a page is full but the update is HOT-eligible:
+
+```mermaid
+flowchart LR
+    subgraph OldPage["Old page (packed full)"]
+        OS["Old slot\nxmax=xid · hot_next=XPAGE(0xFFFE)\nprev_page=new_page_id\nprev_slot=new_slot"]
+    end
+    subgraph NewPage["New page (has space)"]
+        NS["New slot\nxmin=xid · new version bytes"]
+    end
+    BT["B-tree entry\nstill points to old slot\n(NOT updated)"]
+    BT -->|"index_matching_rows\nresolves live version"| OS
+    OS -->|"hot_next=XPAGE sentinel\n→ follow prev_page/prev_slot"| NS
+```
+
+The `prev_page`/`prev_slot` fields in a superseded tuple header are safe to
+repurpose — backward-chain navigation only reads them on the *live* version, not
+the old one. The sentinel `HOT_NEXT_XPAGE = 0xFFFE` distinguishes cross-page
+chains from same-page chains (`hot_next` holds the slot offset otherwise).
+
+**Batch HOT update (`hot_update_many`, item 74) — Phase A→B→C ordering:**
+
+Phase ordering matters for crash safety. The correct order is:
+
+1. **Phase A (`WAL_XMAX_BATCH`)** — per old-page group: acquire latch, conflict-
+   check (`xmax == 0`), stamp xmax, commit mini-txn. Crash here: no new versions
+   exist, so MVCC correctly shows the old versions.
+2. **Phase B (`WAL_INSERT_BATCH`)** — insert new row versions on fill pages.
+   Crash after Phase A + Phase B but before Phase C: new versions have
+   `xmin = uncommitted xid` → invisible. Old versions xmax'd → also invisible.
+   Correct: the uncommitted transaction leaves no trace after recovery.
+3. **Phase C (`WAL_HOT_XPAGE_BATCH`)** — write forward chain pointers
+   (`set_hot_xpage`) on old slots. Crash recovery undoes Phase A + Phase C
+   (restores xmax=0, clears chain pointer), self-stamps Phase B tuples dead.
+
+The B→A order shipped in item 74 was a bug (item 85): Phase A failing after
+Phase B committed left orphaned new versions with no undo record. The A→B→C
+reorder makes failure modes correct at every phase boundary.
+
+### Fill-page cursor (item 87)
+
+`INSERT` used to re-probe the FSM on every row to find a page with space. Under
+a multi-row VALUES insert, this repeated the same O(log n) FSM lookup N times,
+returning the same page each time. The fill-page cursor tracks the current open
+page across rows within the same statement, re-probing only when the page fills.
+This is a statement-scoped optimization — it does not persist across transactions.
+
+### InsertAccum — streaming WAL batching for bulk INSERT (item 98)
+
+A multi-row `INSERT ... VALUES (r1), (r2), ..., (rN)` writes all rows to the
+heap, but the WAL overhead can dominate at large N: each page transition
+previously emitted a `WAL_BEGIN`/`WAL_COMMIT` bracket.
+
+`InsertAccum` accumulates rows into a page, flushing only when the page fills:
+
+```
+struct InsertAccum {
+    page_id:    PageId,      // current open page
+    mini_txn:   MiniTxnId,   // open WAL bracket for this page
+    row_count:  usize,       // rows accumulated on this page
+}
+```
+
+`Heap::insert_accumulating` writes each row under the open page's bracket.
+`Heap::flush_insert_accum` closes the final page's bracket after the last row.
+The result: **one `WAL_BEGIN`/`WAL_COMMIT` pair per heap page** across N rows,
+not one per row. UNIQUE constraint enforcement runs per-row before the row is
+written, so correctness is unaffected.
+
 ### Lock-ordering rules (why this can't deadlock)
 
 1. The FSM mutex is held only for brief in-memory decisions — **never across a
    page-latch acquisition, WAL I/O, or FSM-tree I/O**. Ordering is latch → FSM,
    never FSM → latch.
 2. UPDATE holds **at most one page latch at a time** (old released before new
-   acquired) — no inverse-order latch deadlock between concurrent updates.
-3. Page latches are never held across an fsync or a user transaction, so they
+   acquired, except in Phase B of hot_update_many where multiple fill pages may
+   be held — each separately committed before the next is acquired).
+3. Cross-page HOT latch ordering: new page acquired (Phase B), released, then old
+   page acquired (Phase A/C). No path holds both simultaneously — no deadlock.
+4. Page latches are never held across an fsync or a user transaction, so they
    cannot join a logical-lock cycle. Row-lock deadlocks are the lock manager's
    problem (doc 4 §3), detected on a wait-for graph.
 
