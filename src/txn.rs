@@ -118,6 +118,13 @@ pub struct Transaction {
     /// SSI rw-antidependency tracking (P1.d), populated only for
     /// `Serializable` transactions. `None` for RC/RR (no overhead).
     pub ssi: Option<SsiState>,
+    /// Deferred row-count deltas for catalog `row_count` maintenance (item 97).
+    /// Keyed by table name; signed delta accumulated during this transaction.
+    /// Applied to the catalog at commit time (NOT at statement time) so that
+    /// aborting or crashing a transaction never leaves a stale `row_count`.
+    /// `i64::MIN` is a sentinel meaning "TRUNCATE: reset to 0" (see
+    /// `record_row_count_delta`). Empty for read-only or DDL-only transactions.
+    pub row_count_deltas: HashMap<String, i64>,
 }
 
 /// Per-transaction SSI state (P1.d, Cahill-style rw-antidependency tracking).
@@ -409,6 +416,7 @@ impl TransactionManager {
                 } else {
                     None
                 },
+                row_count_deltas: HashMap::new(),
             },
         );
         tracing::info!(xid, ?isolation, "transaction begin");
@@ -531,6 +539,44 @@ impl TransactionManager {
             .and_then(|t| t.ssi.as_ref())
             .is_some_and(|s| s.is_pivot())
     }
+
+    // ── item 97: deferred row-count delta helpers ────────────────────────────
+
+    /// Record a signed row-count delta for `table` in this transaction's
+    /// deferred map. `delta > 0` for INSERT; `delta < 0` for DELETE.
+    /// `i64::MIN` is a sentinel meaning TRUNCATE (reset to 0).
+    /// Applied to the catalog exactly once, at user-transaction commit time.
+    pub fn record_row_count_delta(&self, xid: Xid, table: &str, delta: i64) -> Result<()> {
+        let mut inner = self.lock();
+        let txn = inner
+            .active
+            .get_mut(&xid)
+            .ok_or(DbError::TxnNotActive { xid })?;
+        let entry = txn.row_count_deltas.entry(table.to_string()).or_insert(0);
+        if delta == i64::MIN {
+            *entry = i64::MIN; // TRUNCATE sentinel — reset-to-0 wins over any prior delta
+        } else if *entry == i64::MIN {
+            // After TRUNCATE in same txn: absolute delta from the new origin.
+            *entry = delta;
+        } else {
+            *entry = entry.saturating_add(delta);
+        }
+        Ok(())
+    }
+
+    /// Drain and return the deferred row-count deltas for `xid`. Called by
+    /// `Engine::commit` *before* `txn_mgr.commit()` removes the transaction
+    /// from the active map.
+    pub fn take_row_count_deltas(&self, xid: Xid) -> HashMap<String, i64> {
+        let mut inner = self.lock();
+        if let Some(txn) = inner.active.get_mut(&xid) {
+            std::mem::take(&mut txn.row_count_deltas)
+        } else {
+            HashMap::new()
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
 
     /// Commit `xid`. Note on conflict detection (M1.b, D12): there is no
     /// separate "recheck at commit time" step. Because `LockManager` holds
