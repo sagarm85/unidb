@@ -7972,4 +7972,4 @@ Crash safety verified: recovery's incomplete-user-txn pass undoes `WAL_XMAX_BATC
 - Consumer offsets remain as implemented in item 29.
 - Option B is noted as a future extension, gated behind a separate design decision.
 
-**Sign-off required:** user approval before M4 implementation starts.
+**Sign-off:** Option A APPROVED 2026-07-19.
