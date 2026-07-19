@@ -63,6 +63,11 @@ pub enum UndoAction {
     /// An existing tuple whose xmax this transaction stamped (DELETE, or an
     /// UPDATE's old-version half). Undo via `Heap::undo_xmax_stamp`.
     XmaxStamp { page_id: PageId, slot: u16 },
+    /// Item 88: batched xmax stamps for bulk DELETE/UPDATE — one undo entry per
+    /// page group instead of one per row.  Undo clears xmax on all `slots` in
+    /// page order.  WAL granularity matches: `delete_many` / `update_many` /
+    /// `hot_update_many` already emit one `WAL_XMAX_BATCH` per page group.
+    XmaxStampBatch { page_id: PageId, slots: Vec<u16> },
     /// An in-place B-tree RowId patch applied by an unchanged-key UPDATE
     /// (item 47).  Undo by calling `DiskBTree::update_rowid_inplace` in
     /// reverse: replace `new_rid` back with `old_rid` so the index resolves
@@ -642,6 +647,10 @@ impl TransactionManager {
                 }
                 UndoAction::XmaxStamp { page_id, slot } => {
                     heap.undo_xmax_stamp(*page_id, *slot, pool, wal)?;
+                }
+                // Item 88: batch undo for bulk DELETE/UPDATE (one undo entry per page group).
+                UndoAction::XmaxStampBatch { page_id, slots } => {
+                    heap.undo_xmax_stamp_batch(*page_id, slots, pool, wal)?;
                 }
                 // Reverse an in-place B-tree RowId patch: restore old_rid
                 // where new_rid currently sits so the index points back to

@@ -1,5 +1,5 @@
 **Type:** Performance
-**Status:** ⏳ NOT STARTED
+**Status:** ✅ SHIPPED — perf/v3-20260719
 
 # Item 87 — Statement-scoped fill-page cursor
 

@@ -1,5 +1,5 @@
 **Type:** Performance
-**Status:** ⏳ NOT STARTED
+**Status:** ✅ SHIPPED — perf/v3-20260719
 
 # Item 89 — WAL segment seal off the append path
 

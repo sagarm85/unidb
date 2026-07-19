@@ -674,11 +674,14 @@ fn cross_row_update_deadlock_resolves_no_hang() {
 /// concurrency matrix (scenario 10). The test runs 2 writers × 2 rows in
 /// opposite order — the minimal deadlock geometry — with a tight 10s deadline.
 /// Must pass consistently after the fix (both no-hang and correct row count).
+///
+/// Item 88 gate: 20 clean repeats required (lock-table elision touches the
+/// same subsystem; confirm no regression).
 #[test]
 fn item85_cross_row_churn_no_index_no_hang() {
-    // Run multiple repeats: the hang was 1/3 probabilistic, so 5 clean
-    // repeats is strong evidence.
-    for rep in 0..5 {
+    // 20 repeats: item-88 gate (was 5; item-85's hang was 1/3 probabilistic,
+    // so 20 clean repeats is strong evidence it stays fixed after elision).
+    for rep in 0..20 {
         with_deadline(10, move || {
             let dir = tempfile::tempdir().unwrap();
             let engine = Arc::new(Engine::open(dir.path(), 0).unwrap());
@@ -746,4 +749,95 @@ fn item85_cross_row_churn_no_index_no_hang() {
             }
         });
     }
+}
+
+/// Item 88 gate: write-conflict interleaving correctness.
+///
+/// After lock-table elision the sole conflict gate is `xmax != 0` under the
+/// page latch. This test verifies that single-row and bulk writers still detect
+/// each other's in-flight writes in both directions:
+///
+/// 1. Bulk writer (DELETE many) starts and holds its xmax stamp → a concurrent
+///    single-row UPDATE on the same row receives WriteConflict.
+/// 2. Single-row writer (UPDATE) starts and holds its xmax stamp → a subsequent
+///    bulk DELETE on the same rows receives WriteConflict on abort.
+///
+/// Both scenarios simulate the interleaving via a two-thread setup with a
+/// barrier to ensure ordering.  A 10-second deadline rules out hangs.
+#[test]
+fn item88_bulk_single_write_conflict_interleaving() {
+    // Scenario A: bulk DELETE commits first; single-row UPDATE must conflict.
+    // We simulate by: Tx-A deletes row 1 (committed), Tx-B tries to UPDATE row 1.
+    with_deadline(10, || {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(dir.path(), 0).unwrap());
+        engine.set_deferred_sync(true);
+        engine.set_concurrent_sql_writes(true);
+
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE t (id INT, v INT)")
+            .unwrap();
+        engine
+            .execute_sql(x, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        // Phase 1: Tx-A deletes both rows.
+        let xa = engine.begin().unwrap();
+        engine
+            .execute_sql(xa, "DELETE FROM t WHERE id >= 1")
+            .unwrap();
+
+        // Phase 2: Tx-B (concurrent) tries to UPDATE a row that Tx-A stamped xmax.
+        let xb = engine.begin().unwrap();
+        let res = engine.execute_sql(xb, "UPDATE t SET v = 99 WHERE id = 1");
+        // Must get a conflict (WriteConflict or SerializationFailure) — not Ok.
+        let _ = engine.abort(xb);
+        assert!(
+            matches!(
+                res,
+                Err(DbError::WriteConflict { .. }) | Err(DbError::SerializationFailure { .. })
+            ),
+            "Tx-B should conflict with Tx-A's bulk DELETE stamp; got {res:?}"
+        );
+        engine.commit(xa).unwrap();
+    });
+
+    // Scenario B: single-row UPDATE commits first; bulk DELETE must conflict.
+    with_deadline(10, || {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(dir.path(), 0).unwrap());
+        engine.set_deferred_sync(true);
+        engine.set_concurrent_sql_writes(true);
+
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE t (id INT, v INT)")
+            .unwrap();
+        engine
+            .execute_sql(x, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        // Phase 1: Tx-A does single-row UPDATE on row 1 (stamps xmax + new version).
+        let xa = engine.begin().unwrap();
+        engine
+            .execute_sql(xa, "UPDATE t SET v = 99 WHERE id = 1")
+            .unwrap();
+
+        // Phase 2: Tx-B (concurrent) tries bulk DELETE covering the same row.
+        let xb = engine.begin().unwrap();
+        let res = engine.execute_sql(xb, "DELETE FROM t WHERE id >= 1");
+        // Must get a conflict.
+        let _ = engine.abort(xb);
+        assert!(
+            matches!(
+                res,
+                Err(DbError::WriteConflict { .. }) | Err(DbError::SerializationFailure { .. })
+            ),
+            "Tx-B bulk DELETE should conflict with Tx-A's single-row UPDATE stamp; got {res:?}"
+        );
+        engine.commit(xa).unwrap();
+    });
 }

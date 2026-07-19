@@ -717,17 +717,16 @@ impl Heap {
         xid: Xid,
         pool: &BufferPool,
         wal: &Wal,
-        lock_mgr: &LockManager,
+        _lock_mgr: &LockManager,
     ) -> Result<Vec<RowId>> {
         if row_ids.is_empty() {
             return Ok(Vec::new());
         }
-        // Acquire all write locks in one mutex pass (item 56 Step 3 batching).
-        let record_ids: Vec<RecordId> = row_ids
-            .iter()
-            .map(|r| RecordId::row(r.page_id, r.slot))
-            .collect();
-        lock_mgr.try_acquire_write_many(&record_ids, xid)?;
+        // Item 88: lock-table elision for bulk DML.
+        // The xmax != 0 conflict check under the page latch (below) provides
+        // first-writer-wins without the O(N) lock-table scan.  UniqueKey /
+        // FkKey phantom locks (blocking, deadlock-detected) are unaffected —
+        // they live in the executor layer and never reach delete_many.
 
         let mut deleted = Vec::with_capacity(row_ids.len());
         let mut i = 0;
@@ -804,7 +803,7 @@ impl Heap {
         xid: Xid,
         pool: &BufferPool,
         wal: &Wal,
-        lock_mgr: &LockManager,
+        _lock_mgr: &LockManager,
     ) -> Result<Vec<(RowId, RowId)>> {
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -812,15 +811,12 @@ impl Heap {
 
         // Phase A: stamp xmax on all old versions, one mini-txn per page group.
         //
+        // Item 88: lock-table elision — xmax conflict check under the page latch
+        // is the sole conflict gate (first-writer-wins, NoWait semantics).
+        //
         // Guaranteed progress: `i` advances by at least one page group per
         // outer-loop iteration (`j > i` always because partition_point
         // matches at least `rows[i]` itself).
-        let record_ids: Vec<RecordId> = rows
-            .iter()
-            .map(|(r, _)| RecordId::row(r.page_id, r.slot))
-            .collect();
-        lock_mgr.try_acquire_write_many(&record_ids, xid)?;
-
         let mut i = 0;
         while i < rows.len() {
             let page_id = rows[i].0.page_id;
@@ -992,18 +988,14 @@ impl Heap {
         xid: Xid,
         pool: &BufferPool,
         wal: &Wal,
-        lock_mgr: &LockManager,
+        _lock_mgr: &LockManager,
     ) -> Result<Vec<(RowId, RowId, PageId, u16)>> {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Acquire all write locks in one mutex pass before touching any page.
-        let record_ids: Vec<RecordId> = rows
-            .iter()
-            .map(|(r, _)| RecordId::row(r.page_id, r.slot))
-            .collect();
-        lock_mgr.try_acquire_write_many(&record_ids, xid)?;
+        // Item 88: lock-table elision for bulk HOT UPDATE — xmax conflict check
+        // under the Phase A page latch is the sole conflict gate.
 
         // ── Phase A: xmax stamp on old pages ────────────────────────────────
         //
@@ -1250,6 +1242,44 @@ impl Heap {
         pool.write_page(&page)?;
         pool.unpin(page_id);
         wal.commit_mini_txn(txn_id, lsn)?;
+        Ok(())
+    }
+
+    /// Item 88: undo a batched xmax stamp — clears xmax on all `slots` of
+    /// `page_id` in one mini-txn (matching the WAL_XMAX_BATCH redo granularity).
+    /// Called by `TransactionManager::abort` for `UndoAction::XmaxStampBatch`.
+    pub fn undo_xmax_stamp_batch(
+        &self,
+        page_id: PageId,
+        slots: &[u16],
+        pool: &BufferPool,
+        wal: &Wal,
+    ) -> Result<()> {
+        debug_assert!(!slots.is_empty());
+        let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
+        let _wg = pool.latch_exclusive(page_id);
+        let mut page = pool.fetch_page_for_write(page_id, wal)?;
+        let prev_lsn = pool
+            .maybe_log_fpi(page_id, wal, txn_id, begin_lsn)?
+            .unwrap_or(begin_lsn);
+        let mut last_lsn = prev_lsn;
+        for &slot in slots {
+            let old_xmax = page.tuple_header(slot)?.xmax;
+            let lsn = wal.log_update(
+                txn_id,
+                last_lsn,
+                page_id,
+                slot,
+                &u64_to_le(0),
+                &u64_to_le(old_xmax),
+            )?;
+            page.set_xmax(slot, 0)?;
+            last_lsn = lsn;
+        }
+        page.set_lsn(last_lsn);
+        pool.write_page(&page)?;
+        pool.unpin(page_id);
+        wal.commit_mini_txn(txn_id, last_lsn)?;
         Ok(())
     }
 

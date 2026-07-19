@@ -2785,17 +2785,29 @@ fn exec_update(
             };
 
         // Phase 3: per-pair SSI, undo, B-tree index staging, CDC.
+        //
+        // Item 88: emit one XmaxStampBatch per old-version page group (sorted by
+        // page_id, guaranteed by update_many's input requirement) instead of one
+        // XmaxStamp per row.  Batch undo is recorded first in the undo log so that
+        // on abort the reversed order clears new versions (Insert undos, LIFO) before
+        // unlocking old versions (XmaxStampBatch undos, LIFO — correct ordering).
+        {
+            let mut bi = 0;
+            while bi < update_results.len() {
+                let page_id = update_results[bi].0.page_id;
+                let bj = bi + update_results[bi..].partition_point(|(r, _)| r.page_id == page_id);
+                let slots: Vec<u16> = update_results[bi..bj].iter().map(|(r, _)| r.slot).collect();
+                ctx.txn_mgr
+                    .record_undo(ctx.xid, UndoAction::XmaxStampBatch { page_id, slots })?;
+                bi = bj;
+            }
+        }
         let mut count = 0;
         for (i, (old_rid, new_rid)) in update_results.iter().enumerate() {
             let (_, _, ref before_row, ref after_row) = collected[i];
             ctx.txn_mgr.ssi_note_write(ctx.xid, *old_rid);
-            ctx.txn_mgr.record_undo(
-                ctx.xid,
-                UndoAction::XmaxStamp {
-                    page_id: old_rid.page_id,
-                    slot: old_rid.slot,
-                },
-            )?;
+            // Insert undo recorded after batch XmaxStamp undos (above); abort
+            // processes undo log in reverse, so Insert undos run first (LIFO).
             ctx.txn_mgr.record_undo(
                 ctx.xid,
                 UndoAction::Insert {
@@ -3158,15 +3170,20 @@ fn exec_delete(
             Err(e @ DbError::WriteConflict { .. }) => return Err(classify_conflict(e, ctx)),
             other => other?,
         };
-        for rid in &deleted {
-            ctx.txn_mgr.ssi_note_write(ctx.xid, *rid);
-            ctx.txn_mgr.record_undo(
-                ctx.xid,
-                UndoAction::XmaxStamp {
-                    page_id: rid.page_id,
-                    slot: rid.slot,
-                },
-            )?;
+        // Item 88: batch undo — one XmaxStampBatch per page group.
+        {
+            let mut bi = 0;
+            while bi < deleted.len() {
+                let page_id = deleted[bi].page_id;
+                let bj = bi + deleted[bi..].partition_point(|r| r.page_id == page_id);
+                for rid in &deleted[bi..bj] {
+                    ctx.txn_mgr.ssi_note_write(ctx.xid, *rid);
+                }
+                let slots: Vec<u16> = deleted[bi..bj].iter().map(|r| r.slot).collect();
+                ctx.txn_mgr
+                    .record_undo(ctx.xid, UndoAction::XmaxStampBatch { page_id, slots })?;
+                bi = bj;
+            }
         }
         let count = deleted.len();
         persist_pages_if_changed(table, &heap, &table_def.pages, ctx)?;
@@ -3267,16 +3284,20 @@ fn exec_delete(
         other => other?,
     };
 
-    // P1.d: SSI write tracking + undo log — one entry per deleted row.
-    for rid in &deleted {
-        ctx.txn_mgr.ssi_note_write(ctx.xid, *rid);
-        ctx.txn_mgr.record_undo(
-            ctx.xid,
-            UndoAction::XmaxStamp {
-                page_id: rid.page_id,
-                slot: rid.slot,
-            },
-        )?;
+    // P1.d: SSI write tracking + item-88 batch undo — one XmaxStampBatch per page group.
+    {
+        let mut bi = 0;
+        while bi < deleted.len() {
+            let page_id = deleted[bi].page_id;
+            let bj = bi + deleted[bi..].partition_point(|r| r.page_id == page_id);
+            for rid in &deleted[bi..bj] {
+                ctx.txn_mgr.ssi_note_write(ctx.xid, *rid);
+            }
+            let slots: Vec<u16> = deleted[bi..bj].iter().map(|r| r.slot).collect();
+            ctx.txn_mgr
+                .record_undo(ctx.xid, UndoAction::XmaxStampBatch { page_id, slots })?;
+            bi = bj;
+        }
     }
     let count = deleted.len();
 

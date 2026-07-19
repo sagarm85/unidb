@@ -1,5 +1,5 @@
 **Type:** Performance
-**Status:** ⏳ NOT STARTED (sequence LAST among items 86–90 — touches the item-85 subsystem)
+**Status:** ✅ SHIPPED — perf/v3-20260719, commit pending PR
 
 # Item 88 — Bulk DML lock-table elision (xmax as the tuple lock) + batched undo
 
