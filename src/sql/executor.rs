@@ -1623,28 +1623,28 @@ fn exec_insert(
     enforce_referenced_tables_exist(&table_def, ctx.catalog.get())?;
     let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
 
-    // Item 98: two-pass batch insert.
+    // Item 98: streaming-accumulation insert.
     //
-    // Pass 1 — validate: run every per-row check (coercion, NOT NULL, CHECK,
-    // RLS policy, UNIQUE, FK) and collect the validated+encoded rows.  No heap
-    // writes happen here, so if any row fails validation the whole statement
-    // returns an error before any page is touched.
+    // The per-row loop is preserved in its original interleaved structure:
+    // validate → insert → index update → event capture.  All correctness
+    // invariants are maintained (intra-statement UNIQUE enforcement, FK checks,
+    // own-xid visibility for subsequent rows).
     //
-    // Pass 2 — batch insert: hand all encoded rows to `Heap::insert_batch`,
-    // which packs them page-by-page with ONE `WAL_INSERT_BATCH` mini-txn per
-    // page instead of one mini-txn per row.  On a single-page batch this is
-    // exactly ONE WAL begin/commit for the entire statement.
+    // The only change: `heap.insert_accumulating` defers the WAL_COMMIT bracket
+    // until the page fills or `heap.flush_insert_accum` is called at the end.
+    // Within one page, all rows share ONE WAL mini-txn bracket, reducing WAL
+    // mutex acquisitions from O(rows) to O(heap-pages).  Each row's WAL_INSERT
+    // record is still logged individually (D5 is preserved: WAL before page).
     //
-    // Pass 3 — post-process: register undo records, write index entries, and
-    // emit event captures for each row id returned by the batch insert.
-    //
-    // The snapshot for UNIQUE/FK checks is taken per-row AFTER all phantom
-    // locks for that row have been acquired — same ordering as the old single-
-    // row path, so concurrent-writer correctness (item 35 inv. 3 / item 36
-    // inv. 3) is preserved.
-    let n = values.len();
-    let mut validated: Vec<(Vec<u8>, Vec<Literal>)> = Vec::with_capacity(n);
+    // If the statement returns an error mid-loop (e.g. FK violation on row N),
+    // the open mini-txn has no WAL_COMMIT so recovery treats it as incomplete
+    // and undoes it.  The caller's `engine.abort(xid)` also applies the already-
+    // registered UndoAction records for the committed rows.
+    let mut insert_accum: Option<crate::heap::InsertAccum> = None;
 
+    // G5 (item 19): RETURNING — collect rows when requested.
+    let mut returned_rows: Vec<Vec<Literal>> = Vec::new();
+    let mut count = 0;
     for row_values in values {
         let ordered = order_values_by_columns(&table_def, &columns, row_values)?;
         // SERIAL/identity fill (P2.d): allocate the next counter value for any
@@ -1711,18 +1711,9 @@ fn exec_insert(
             ctx.catalog.get(),
         )?;
         let encoded = encode_row(&coerced);
-        validated.push((encoded, coerced));
-    }
-
-    // Pass 2: batch-insert all validated rows.  One WAL mini-txn per heap page
-    // instead of one per row (item 98).
-    let encoded_rows: Vec<Vec<u8>> = validated.iter().map(|(enc, _)| enc.clone()).collect();
-    let row_ids = heap.insert_batch(&encoded_rows, ctx.xid, ctx.pool, ctx.wal)?;
-
-    // Pass 3: post-process — undo records, index writes, event captures.
-    // G5 (item 19): RETURNING — collect rows when requested.
-    let mut returned_rows: Vec<Vec<Literal>> = Vec::new();
-    for (row_id, (_, coerced)) in row_ids.iter().zip(validated) {
+        // Item 98: accumulating insert — one WAL mini-txn per heap page.
+        let row_id =
+            heap.insert_accumulating(&encoded, ctx.xid, ctx.pool, ctx.wal, &mut insert_accum)?;
         ctx.txn_mgr.record_undo(
             ctx.xid,
             UndoAction::Insert {
@@ -1730,14 +1721,16 @@ fn exec_insert(
                 slot: row_id.slot,
             },
         )?;
-        apply_durable_index_writes(&table_def, *row_id, &coerced, ctx)?;
+        apply_durable_index_writes(&table_def, row_id, &coerced, ctx)?;
         // C1 (item 29): INSERT has after-only; no pre-image.
         send_event_capture(&table_def, "insert", None, Some(&coerced), ctx)?;
         if returning.is_some() {
             returned_rows.push(coerced);
         }
+        count += 1;
     }
-    let count = row_ids.len();
+    // Commit the final page's deferred mini-txn (item 98).
+    heap.flush_insert_accum(ctx.wal, &mut insert_accum)?;
 
     persist_pages_if_changed(table, &heap, &table_def.pages, ctx)?;
     assert_schema_stable(ctx, table, table_def.generation);
@@ -7688,13 +7681,15 @@ mod tests {
             ExecResult::Inserted { count } => assert_eq!(count, 100),
             o => panic!("expected Inserted, got {o:?}"),
         }
-        // Expected: 1 (alloc mini-txn for the new heap page) + 1 (WAL_INSERT_BATCH
-        // for all 100 rows packed on that page) = 2.
-        // Old code before item 98 would have delta = 101 (1 alloc + 100 inserts).
+        // Expected: 1 (alloc mini-txn for the new heap page) + 1 (accumulating
+        // mini-txn for all 100 rows on that page, each with its own WAL_INSERT
+        // but all sharing ONE WAL_BEGIN/WAL_COMMIT bracket) = 2.
+        // Old code before item 98 would have delta = 101 (1 alloc + 100 rows,
+        // each with its own WAL_BEGIN/WAL_COMMIT).
         let delta = after - before;
         assert!(
             delta <= 2,
-            "item 98: 100-row INSERT on one page must use ≤ 2 mini-txns (alloc + batch), got {delta}"
+            "item 98: 100-row INSERT on one page must use ≤ 2 mini-txns (alloc + accumulating), got {delta}"
         );
     }
 
