@@ -720,8 +720,15 @@ pub struct ExecCtx<'a> {
     /// Per-index vector hot cache for NEAR queries (item 73).
     /// Eliminates ~100 KB random reads per NEAR query after warm-up by caching
     /// encoded_rid → Vec<f32> for every node visited during beam search.
-    pub hnsw_vec_caches:
-        Option<&'a Mutex<std::collections::HashMap<crate::format::PageId, crate::hnsw_index::HnswVecCache>>>,
+    pub hnsw_vec_caches: Option<
+        &'a Mutex<
+            std::collections::HashMap<crate::format::PageId, crate::hnsw_index::HnswVecCache>,
+        >,
+    >,
+    /// Authorization store (item-24 Z5): supplies rows for `unidb_catalog.roles`,
+    /// `unidb_catalog.grants`. `None` in unit tests that build bare `ExecCtx`
+    /// structs and don't exercise the AuthZ catalog views.
+    pub authz: Option<&'a crate::authz::RoleStore>,
 }
 
 /// Insert `row`'s durable-index column values into their on-disk structures
@@ -1363,6 +1370,8 @@ fn exec_create_table(
         pages: Vec::new(),
         fsm_meta: None,
         rls_policy: None,
+        insert_policy: None,
+        policies: vec![],
         events_enabled: false,
         serial_next,
         constraints,
@@ -1587,6 +1596,17 @@ fn exec_insert(
         let coerced = coerce_and_validate_row(&table_def, filled)?;
         enforce_not_null(&table_def, &coerced)?;
         enforce_checks(&table_def, &coerced)?;
+        // Item-24 Z1: INSERT policy check. If a `FOR INSERT` (or `FOR ALL`)
+        // RLS policy exists, evaluate the predicate against the new row before
+        // writing — any row that would violate the predicate is rejected.
+        if let Some(ref ins_policy) = table_def.insert_policy {
+            if !check_passes(ins_policy, &table_def.columns, &coerced)? {
+                return Err(DbError::SqlPlan(format!(
+                    "new row violates policy for table \"{}\"",
+                    table_def.name
+                )));
+            }
+        }
         // UNIQUE + FK — two-step approach for concurrent-writer safety
         // (item 35 inv. 3 / item 36 inv. 3): both phantom locks must be
         // acquired BEFORE taking the snapshot so that any concurrent winner
@@ -5461,6 +5481,7 @@ mod tests {
                 event_seq_index_meta: None,
                 hnsw_l0_caches: None,
                 hnsw_vec_caches: None,
+                authz: None,
             };
             execute(plan, &mut ctx)
         }
@@ -5806,6 +5827,8 @@ mod tests {
             pages: vec![],
             fsm_meta: None,
             rls_policy: None,
+            insert_policy: None,
+            policies: vec![],
             events_enabled: false,
             serial_next: Default::default(),
             constraints: Default::default(),

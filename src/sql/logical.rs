@@ -427,6 +427,8 @@ mod tests {
             pages: vec![],
             fsm_meta: None,
             rls_policy: policy,
+            insert_policy: None,
+            policies: vec![],
             events_enabled: false,
             serial_next: Default::default(),
             constraints: Default::default(),

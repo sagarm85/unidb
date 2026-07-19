@@ -53,6 +53,12 @@ pub const RELATIONS: &[&str] = &[
     // heap, so virtual_rows cannot materialize it — query_exec.rs routes it to
     // subscription_lag_rows which has access to pool+snapshot).
     "unidb_catalog.subscription_lag",
+    // item-24 Z5: AuthZ introspection — roles, grants, named policies.
+    // Materialized from the live RoleStore (roles/grants) and Catalog (policies).
+    // These are read-only via SELECT; the write path is Z1 DDL.
+    "unidb_catalog.roles",
+    "unidb_catalog.grants",
+    "unidb_catalog.policies",
 ];
 
 /// Is `name` one of the reserved introspection relations? Case-insensitive so
@@ -131,6 +137,19 @@ pub fn virtual_schema(name: &str) -> Option<Vec<ColumnRef>> {
             ("oldest_unconsumed_ts_ms", ColumnType::Int64),
             ("lag_seconds", ColumnType::Float),
         ],
+        // item-24 Z5: AuthZ introspection (read-only; write via Z1 DDL).
+        "unidb_catalog.roles" => &[("name", ColumnType::Text)],
+        "unidb_catalog.grants" => &[
+            ("role", ColumnType::Text),
+            ("table_name", ColumnType::Text),
+            ("operation", ColumnType::Text),
+        ],
+        "unidb_catalog.policies" => &[
+            ("name", ColumnType::Text),
+            ("table_name", ColumnType::Text),
+            ("operation", ColumnType::Text),
+            ("using_expr", ColumnType::Text),
+        ],
         _ => return None,
     };
     Some(
@@ -148,7 +167,15 @@ pub fn virtual_schema(name: &str) -> Option<Vec<ColumnRef>> {
 /// same column order as [`virtual_schema`]. Tables are visited in name order for
 /// deterministic output; engine-internal `__…__` tables are hidden (they have no
 /// user-facing schema, matching `GET /tables`).
-pub fn virtual_rows(name: &str, catalog: &Catalog) -> Result<Vec<Vec<Literal>>> {
+///
+/// `authz` is required for the item-24 Z5 relations (`unidb_catalog.roles`,
+/// `unidb_catalog.grants`, `unidb_catalog.policies`). When absent, those
+/// relations return empty rows (unit-test fallback).
+pub fn virtual_rows(
+    name: &str,
+    catalog: &Catalog,
+    authz: Option<&crate::authz::RoleStore>,
+) -> Result<Vec<Vec<Literal>>> {
     let mut defs: Vec<&TableDef> = catalog
         .tables()
         .filter(|t| !t.name.starts_with("__"))
@@ -164,6 +191,10 @@ pub fn virtual_rows(name: &str, catalog: &Catalog) -> Result<Vec<Vec<Literal>>> 
             referential_constraints_rows(&defs, catalog)
         }
         "unidb_catalog.indexes" => indexes_rows(&defs),
+        // item-24 Z5: AuthZ introspection.
+        "unidb_catalog.roles" => authz.map(roles_rows).unwrap_or_default(),
+        "unidb_catalog.grants" => authz.map(grants_rows).unwrap_or_default(),
+        "unidb_catalog.policies" => policies_rows(&defs),
         // Only reached if a caller passes a non-relation name; the planner
         // guards this, so an empty set is a safe, non-panicking fallback.
         _ => Vec::new(),
@@ -556,6 +587,49 @@ fn render_decimal(unscaled: i128, scale: u8) -> String {
     } else {
         s
     }
+}
+
+// ── item-24 Z5 row builders ──────────────────────────────────────────────────
+
+/// `unidb_catalog.roles` — one row per named role (not users, not grants).
+fn roles_rows(authz: &crate::authz::RoleStore) -> Vec<Vec<Literal>> {
+    let mut roles = authz.roles();
+    roles.sort();
+    roles.into_iter().map(|name| vec![t(&name)]).collect()
+}
+
+/// `unidb_catalog.grants` — one row per (grantee, table, privilege) triple.
+fn grants_rows(authz: &crate::authz::RoleStore) -> Vec<Vec<Literal>> {
+    let mut grants = authz.grants();
+    // Stable order: (role, table, op).
+    grants.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    grants
+        .into_iter()
+        .map(|(role, table, priv_)| vec![t(&role), t(&table), t(priv_.as_str())])
+        .collect()
+}
+
+/// `unidb_catalog.policies` — one row per named policy across all tables.
+fn policies_rows(defs: &[&TableDef]) -> Vec<Vec<Literal>> {
+    let mut rows = Vec::new();
+    for def in defs {
+        for p in &def.policies {
+            rows.push(vec![
+                t(&p.name),
+                t(&p.table),
+                t(p.op.as_str()),
+                t(&p.using_expr),
+            ]);
+        }
+    }
+    // Stable order: (table, name).
+    rows.sort_by(|a, b| match (&a[1], &b[1], &a[0], &b[0]) {
+        (Literal::Text(ta), Literal::Text(tb), Literal::Text(na), Literal::Text(nb)) => {
+            ta.cmp(tb).then(na.cmp(nb))
+        }
+        _ => std::cmp::Ordering::Equal,
+    });
+    rows
 }
 
 /// Materialize `unidb_catalog.subscription_lag` rows (item 29, C3).

@@ -809,6 +809,9 @@ fn auth_stmt_audit(stmt: &crate::authz::AuthStmt) -> (&'static str, String) {
         A::RevokePrivs { table, grantee, .. } => ("revoke", format!("{table} from {grantee}")),
         A::GrantRole { role, grantee } => ("grant_role", format!("{role} to {grantee}")),
         A::RevokeRole { role, grantee } => ("revoke_role", format!("{role} from {grantee}")),
+        // item-24 Z1: policy DDL.
+        A::CreatePolicy(p) => ("create_policy", format!("{} on {}", p.name, p.table)),
+        A::DropPolicy { name, table } => ("drop_policy", format!("{name} on {table}")),
     }
 }
 
@@ -1163,10 +1166,12 @@ impl Engine {
         // Auth DDL (whole-statement) is handled here, not by the SQL executor.
         if let Some(stmt) = crate::authz::parse_auth_stmt(sql)? {
             let (action, object) = auth_stmt_audit(&stmt);
-            match self
+            // Policy DDL (Z1) mutates the catalog; other auth DDL mutates
+            // the role store. Both require superuser.
+            let result = self
                 .require_superuser(user)
-                .and_then(|()| self.authz.apply(&stmt))
-            {
+                .and_then(|()| self.exec_auth_stmt(&stmt, xid));
+            match result {
                 Ok(()) => {
                     self.audit
                         .record_admin(user, Some(xid), action, &object, true);
@@ -1206,6 +1211,32 @@ impl Engine {
         }
     }
 
+    /// Grant check for a single table + privilege (item-24 Z3). Used by REST
+    /// routes that bypass SQL (e.g. `POST /tables/{name}/bulk`) to enforce the
+    /// same per-table access control as `execute_sql_as`. A superuser / embedded
+    /// (`None`) / bootstrap-mode identity always passes.
+    ///
+    /// Returns `DbError::PermissionDenied` on failure (HTTP layer maps this to
+    /// `403 Forbidden` with `{"error": "permission denied for table <name>"}`).
+    pub fn check_table_grant(
+        &self,
+        user: Option<&str>,
+        table: &str,
+        priv_: crate::authz::Privilege,
+    ) -> Result<()> {
+        if self.is_effective_superuser(user) {
+            return Ok(());
+        }
+        let u = user.expect("effective superuser covers None");
+        if self.authz.has_privilege(u, table, priv_) {
+            Ok(())
+        } else {
+            Err(DbError::PermissionDenied(format!(
+                "permission denied for table {table}"
+            )))
+        }
+    }
+
     /// Privilege pre-check for `sql` as `user`, without executing (P6.e). Used by
     /// the server's read/param fast paths, which don't route through
     /// [`Engine::execute_sql_as`]. A superuser / embedded (`None`) always passes.
@@ -1222,6 +1253,42 @@ impl Engine {
             self.check_plan_privileges(u, &plan)?;
         }
         Ok(())
+    }
+
+    /// Dispatch an auth-DDL statement, routing policy DDL to the catalog and
+    /// role/user/grant DDL to the role store (item-24 Z1).
+    fn exec_auth_stmt(&self, stmt: &crate::authz::AuthStmt, _xid: Xid) -> Result<()> {
+        use crate::authz::AuthStmt;
+        match stmt {
+            AuthStmt::CreatePolicy(policy) => {
+                let _ws = serial_lock(&self.write_serial);
+                let page_size = self.page_size;
+                let mut ctx = crate::catalog::CatalogCtx {
+                    pool: &self.pool,
+                    wal: &self.wal,
+                    control_path: &self.control_path,
+                    control: &self.control,
+                    page_size,
+                };
+                let mut cat = cat_write(&self.catalog);
+                Self::create_policy_inner(policy.clone(), &mut cat, &mut ctx)
+            }
+            AuthStmt::DropPolicy { name, table } => {
+                let _ws = serial_lock(&self.write_serial);
+                let page_size = self.page_size;
+                let mut ctx = crate::catalog::CatalogCtx {
+                    pool: &self.pool,
+                    wal: &self.wal,
+                    control_path: &self.control_path,
+                    control: &self.control,
+                    page_size,
+                };
+                let mut cat = cat_write(&self.catalog);
+                Self::drop_policy_inner(name, table, &mut cat, &mut ctx)
+            }
+            // Role store statements (users, roles, grants).
+            other => self.authz.apply(other),
+        }
     }
 
     /// An **effective** superuser skips all privilege checks: the embedded API
@@ -1783,6 +1850,7 @@ impl Engine {
                 event_seq_index_meta: Some(self.event_seq_index_meta),
                 hnsw_l0_caches: Some(&self.hnsw_l0_caches),
                 hnsw_vec_caches: Some(&self.hnsw_vec_caches),
+                authz: Some(&self.authz),
             };
             executor::execute(plan, &mut ctx)
         } else {
@@ -1801,6 +1869,7 @@ impl Engine {
                 event_seq_index_meta: Some(self.event_seq_index_meta),
                 hnsw_l0_caches: Some(&self.hnsw_l0_caches),
                 hnsw_vec_caches: Some(&self.hnsw_vec_caches),
+                authz: Some(&self.authz),
             };
             executor::execute(plan, &mut ctx)
         }
@@ -1886,6 +1955,7 @@ impl Engine {
             event_seq_index_meta: Some(self.event_seq_index_meta),
             hnsw_l0_caches: Some(&self.hnsw_l0_caches),
             hnsw_vec_caches: Some(&self.hnsw_vec_caches),
+            authz: Some(&self.authz),
         };
         let result = graph_executor::execute(parsed, &mut ctx, self.edge_index_meta)?;
         Ok(vec![result])
@@ -1913,6 +1983,125 @@ impl Engine {
                 "an RLS policy must be a single AND-only comparison predicate".into(),
             )),
         }
+    }
+
+    /// Parse `using_expr` into an `Expr` by wrapping it in a dummy SELECT,
+    /// then returning the parsed predicate. This is the shared helper for
+    /// `create_policy` (item-24 Z1).
+    fn parse_policy_predicate(table: &str, using_expr: &str) -> Result<Expr> {
+        let sql = format!("SELECT * FROM {table} WHERE {using_expr}");
+        let plans = parse_sql(&sql)?;
+        match plans.as_slice() {
+            [LogicalPlan::Select {
+                predicate: Some(expr),
+                ..
+            }] => Ok(expr.clone()),
+            _ => Err(DbError::SqlUnsupported(
+                "a policy USING predicate must be a single AND-only comparison predicate".into(),
+            )),
+        }
+    }
+
+    /// `CREATE POLICY <name> ON <table> FOR <op> USING (<predicate>)` (Z1).
+    ///
+    /// Persists the `PolicyDef` in `TableDef.policies` (for Z5 introspection)
+    /// and merges the parsed predicate into `TableDef.rls_policy` via AND, so
+    /// the existing planner rewrite path picks it up automatically.
+    ///
+    /// Superusers (the bootstrap role or any SUPERUSER user) bypass all RLS
+    /// policies per the BYPASSRLS semantic — they are never filtered.
+    fn create_policy_inner(
+        policy: crate::authz::PolicyDef,
+        cat: &mut crate::catalog::Catalog,
+        ctx: &mut crate::catalog::CatalogCtx,
+    ) -> Result<()> {
+        use crate::authz::PolicyOp;
+        let table = policy.table.clone();
+        let op = policy.op;
+        let expr = Self::parse_policy_predicate(&table, &policy.using_expr)?;
+        cat.add_policy(policy, ctx)?;
+        // Route by operation:
+        // - INSERT-only policies → insert_policy (checked per-row in exec_insert).
+        // - ALL → both insert_policy and rls_policy.
+        // - SELECT/UPDATE/DELETE → rls_policy (AND-rewritten into the scan predicate).
+        if matches!(op, PolicyOp::Insert | PolicyOp::All) {
+            let existing = cat
+                .lookup(&table)
+                .ok()
+                .and_then(|t| t.insert_policy.clone());
+            let merged = match existing {
+                Some(old) => Expr::And(Box::new(old), Box::new(expr.clone())),
+                None => expr.clone(),
+            };
+            cat.set_insert_policy(&table, Some(merged), ctx)?;
+        }
+        if matches!(
+            op,
+            PolicyOp::Select | PolicyOp::Update | PolicyOp::Delete | PolicyOp::All
+        ) {
+            let existing = cat.lookup(&table).ok().and_then(|t| t.rls_policy.clone());
+            let merged = match existing {
+                Some(old) => Expr::And(Box::new(old), Box::new(expr)),
+                None => expr,
+            };
+            cat.set_rls_policy(&table, merged, ctx)?;
+        }
+        Ok(())
+    }
+
+    /// `DROP POLICY <name> ON <table>` (Z1).
+    ///
+    /// Removes the named policy from `TableDef.policies` and recomputes
+    /// both `rls_policy` and `insert_policy` by re-parsing and re-merging
+    /// the remaining named policies.
+    fn drop_policy_inner(
+        name: &str,
+        table: &str,
+        cat: &mut crate::catalog::Catalog,
+        ctx: &mut crate::catalog::CatalogCtx,
+    ) -> Result<()> {
+        use crate::authz::PolicyOp;
+        cat.remove_policy(name, table, ctx)?;
+        let policies: Vec<_> = cat
+            .lookup(table)
+            .ok()
+            .map(|t| t.policies.clone())
+            .unwrap_or_default();
+        // Recompute rls_policy (SELECT/UPDATE/DELETE/ALL) from remaining.
+        let rls_merged = policies
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p.op,
+                    PolicyOp::Select | PolicyOp::Update | PolicyOp::Delete | PolicyOp::All
+                )
+            })
+            .try_fold(None::<Expr>, |acc, p| {
+                let expr = Self::parse_policy_predicate(table, &p.using_expr)?;
+                Ok::<_, crate::error::DbError>(Some(match acc {
+                    Some(old) => Expr::And(Box::new(old), Box::new(expr)),
+                    None => expr,
+                }))
+            })?;
+        // Recompute insert_policy (INSERT/ALL) from remaining.
+        let ins_merged = policies
+            .iter()
+            .filter(|p| matches!(p.op, PolicyOp::Insert | PolicyOp::All))
+            .try_fold(None::<Expr>, |acc, p| {
+                let expr = Self::parse_policy_predicate(table, &p.using_expr)?;
+                Ok::<_, crate::error::DbError>(Some(match acc {
+                    Some(old) => Expr::And(Box::new(old), Box::new(expr)),
+                    None => expr,
+                }))
+            })?;
+        // Update both policies in place and persist once.
+        let t = cat
+            .tables_mut()
+            .get_mut(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
+        t.rls_policy = rls_merged;
+        t.insert_policy = ins_merged;
+        cat.persist_only(ctx)
     }
 
     /// Public superuser gate (P6.e semantics) for server-side admin routes

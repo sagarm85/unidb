@@ -50,12 +50,26 @@ const MAX_BULK_BODY_BYTES: usize = 512 << 20;
 ///
 /// Response on success: `{ "inserted": N, "errors": 0, "elapsed_ms": M }`.
 /// On any error the whole batch is rolled back atomically.
+///
+/// Authorization (item-24 Z3): requires INSERT grant on the target table
+/// for the authenticated user. Superusers / bootstrap mode pass unconditionally.
 pub async fn post_tables_bulk(
-    Extension(_current_user): Extension<CurrentUser>,
+    Extension(current_user): Extension<CurrentUser>,
     State(state): State<AppState>,
     Path(name): Path<String>,
     request: Request,
 ) -> std::result::Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    // Z3: enforce INSERT grant before touching the body.
+    state
+        .engine
+        .check_table_grant(
+            current_user.0,
+            name.clone(),
+            crate::authz::Privilege::Insert,
+        )
+        .await
+        .map_err(ApiError::from)?;
+
     let started = Instant::now();
 
     // Validate table name is a plain SQL identifier — prevents injection

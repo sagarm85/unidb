@@ -1317,6 +1317,8 @@ mod tests {
             pages: vec![],
             fsm_meta: None,
             rls_policy: None,
+            insert_policy: None,
+            policies: vec![],
             events_enabled: false,
             constraints: Default::default(),
             serial_next: Default::default(),

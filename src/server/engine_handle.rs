@@ -206,6 +206,17 @@ impl EngineHandle {
             .await
     }
 
+    /// Single-table grant check for REST routes that bypass SQL (item-24 Z3).
+    pub async fn check_table_grant(
+        &self,
+        user: Option<String>,
+        table: String,
+        priv_: crate::authz::Privilege,
+    ) -> Result<()> {
+        self.on_engine(move |e| e.check_table_grant(user.as_deref(), &table, priv_))
+            .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn create_edge(
         &self,
