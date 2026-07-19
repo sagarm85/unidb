@@ -102,6 +102,13 @@ impl Runner<'_, '_> {
         match node {
             PlanNode::Scan { table, output, .. } => self.scan(table, output),
 
+            // G8 (item 19): SELECT without FROM — emit one empty row so the
+            // projection above can evaluate pure literals / arithmetic.
+            PlanNode::Dual => Ok(Batch {
+                schema: vec![],
+                rows: vec![vec![]],
+            }),
+
             PlanNode::IndexScan {
                 table,
                 column,
@@ -861,7 +868,8 @@ impl Runner<'_, '_> {
             QExpr::Column { .. }
             | QExpr::Literal(_)
             | QExpr::IsNull { .. }
-            | QExpr::Aggregate { .. } => eval_qexpr(expr, schema, row),
+            | QExpr::Aggregate { .. }
+            | QExpr::Arith { .. } => eval_qexpr(expr, schema, row),
         }
     }
 
@@ -990,6 +998,10 @@ fn substitute_correlated(
         QExpr::Match { column, query } => {
             substitute_correlated(column, inner, outer, outer_row)?;
             substitute_correlated(query, inner, outer, outer_row)
+        }
+        QExpr::Arith { lhs, rhs, .. } => {
+            substitute_correlated(lhs, inner, outer, outer_row)?;
+            substitute_correlated(rhs, inner, outer, outer_row)
         }
     }
 }

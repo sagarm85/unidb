@@ -836,6 +836,8 @@ fn query_base_tables(spec: &QuerySpec) -> Vec<String> {
                 walk(left, ctes, out);
                 walk(right, ctes, out);
             }
+            // G8 (item 19): Dual has no base tables.
+            FromNode::Dual => {}
         }
     }
     let cte_names: std::collections::HashSet<String> =
