@@ -1496,7 +1496,43 @@ fn exec_create_index(
         // Re-enable per-commit durability and force the accumulated writes to disk.
         ctx.wal.set_deferred_sync(false);
         ctx.wal.sync()?;
-        hnsw.meta_page()
+
+        // Lever 3 (item 92): pre-warm L0 and vector caches after bulk build.
+        // Eliminates disk I/O on the first NEAR query by loading all node data
+        // into the process-lifetime caches in one sequential pass.
+        let meta_page = hnsw.meta_page();
+        if let Some(l0_mu) = ctx.hnsw_l0_caches {
+            if let Some(vec_mu) = ctx.hnsw_vec_caches {
+                let l0_guard = l0_mu.lock().unwrap();
+                let vec_guard = vec_mu.lock().unwrap();
+                let mut local_l0 = l0_guard
+                    .get(&meta_page)
+                    .cloned()
+                    .unwrap_or_else(HnswL0Cache::new);
+                let mut local_vec = vec_guard
+                    .get(&meta_page)
+                    .cloned()
+                    .unwrap_or_else(crate::hnsw_index::HnswVecCache::new);
+                // Drop guards before I/O (prefetch can take time; don't hold locks).
+                drop(l0_guard);
+                drop(vec_guard);
+
+                if let Ok(()) = hnsw.prefetch_caches(ctx.pool, &mut local_l0, &mut local_vec) {
+                    let mut l0_guard_write = l0_mu.lock().unwrap();
+                    let mut vec_guard_write = vec_mu.lock().unwrap();
+                    let l0_entry = l0_guard_write
+                        .entry(meta_page)
+                        .or_insert_with(HnswL0Cache::new);
+                    l0_entry.merge_from(local_l0);
+                    let vec_entry = vec_guard_write
+                        .entry(meta_page)
+                        .or_insert_with(crate::hnsw_index::HnswVecCache::new);
+                    vec_entry.merge_from(local_vec);
+                }
+            }
+        }
+
+        meta_page
     } else {
         // P3.a/P3.b: a durable BTree/FullText index — sort-then-bulk-load
         // (item 40). Phase 1: collect (key, row_id) pairs from the heap.
@@ -2478,30 +2514,15 @@ fn exec_select_match(
 /// Exact distance for NEAR re-ranking, matching the index's `Metric` (must agree
 /// with `disk_vector`'s internal distance so the re-rank is consistent with cell
 /// assignment).
+/// Exact distance re-ranking after ANN candidate retrieval.
+///
+/// Delegates to `hnsw_distance` which uses the Lever-2 (item 92) SIMD-friendly
+/// 8-lane Euclidean accumulator — avoids duplicating the computation here and
+/// ensures both the ANN search and the re-rank use the same vectorised path.
 fn ivf_exact_distance(metric: crate::vector::Metric, a: &[f32], b: &[f32]) -> f32 {
-    use crate::vector::Metric;
-    match metric {
-        Metric::Euclidean => a
-            .iter()
-            .zip(b)
-            .map(|(x, y)| (x - y) * (x - y))
-            .sum::<f32>()
-            .sqrt(),
-        Metric::Cosine => {
-            let mut dot = 0.0f32;
-            let mut na = 0.0f32;
-            let mut nb = 0.0f32;
-            for (x, y) in a.iter().zip(b) {
-                dot += x * y;
-                na += x * x;
-                nb += y * y;
-            }
-            if na == 0.0 || nb == 0.0 {
-                return 1.0;
-            }
-            1.0 - dot / (na.sqrt() * nb.sqrt())
-        }
-    }
+    // `hnsw_distance` increments Q_DISTANCE_CALLS; on the re-rank path this is
+    // acceptable (the counters are only read by the item-92 profiling test).
+    crate::hnsw_index::hnsw_distance(metric, a, b)
 }
 
 fn exec_update(
