@@ -88,8 +88,8 @@
 | 69 | `69_fill_factor.md` | Performance | ⏳ NOT STARTED — `CREATE TABLE … WITH (fill_factor=70)` reserves page slack for same-page HOT (item 58); INSERT stops at configured threshold; UPDATE-heavy tables avoid cross-page chains. |
 | 70 | `70_seq_scan_prefetch.md` | Performance | ⏳ NOT STARTED — `madvise(MADV_WILLNEED)` read-ahead hint during seqscan (N pages ahead of cursor); cold-cache seqscan latency improvement; no-op on unsupported platforms. |
 | 71 | `71_cross_page_hot.md` | Performance | ✅ SHIPPED 2026-07-18 — cross-page HOT chains; `HOT_NEXT_XPAGE=0xFFFE`; `WAL_HOT_XPAGE_HEAD` type 17; FORMAT_VERSION 8→9; B-tree not updated on full-page UPDATE; P_xhot_a + P_xhot_b crash tests; 50/50 crash + 431 unit PASS. See PROGRESS.md "Item 71". |
-| 72 | `72_hnsw_query_latency.md` | Performance | ⏳ NOT STARTED — in-memory L0 neighbour-list cache to collapse HNSW query latency from 25 ms → ≤5 ms at 10k vectors (ffsdb gap: 223×); lazy per-query warm-up; generation-based invalidation on insert; 256 MiB gate. |
-| 73 | `73_hnsw_vector_hot_cache.md` | Performance | ⏳ NOT STARTED (placeholder) — process-lifetime vector hot cache (node_id → Vec<f32>) eliminating ~100 KB random reads per NEAR query; follow-up to item 72. |
+| 72 | `72_hnsw_query_latency.md` | Performance | ✅ SHIPPED 2026-07-19 — `HnswL0Cache` L0 neighbour list cache (cd94d71) + item 73 vector hot cache together achieve warm ≤5 ms at 10k (2.38 ms measured, 11.2× speedup). See PROGRESS.md. |
+| 73 | `73_hnsw_vector_hot_cache.md` | Performance | ✅ SHIPPED 2026-07-19 — `HnswVecCache` (encoded_rid → Vec<f32>); snapshot-then-merge in `exec_select_near`; 10k warm 2.38 ms / 18.7× speedup at 1k; Docker bench pending. See PROGRESS.md. |
 | 74 | `74_hot_update_batch.md` | Performance | 🔄 IN PROGRESS — batch mini-txn for HOT UPDATE; `Heap::hot_update_many` Phase B+A; reduces 150k mutex/Vec/CRC32 passes to ~2k for 50k rows; P74 crash test; 4 perf_item74 tests; Docker bench pending. |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),

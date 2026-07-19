@@ -616,6 +616,12 @@ pub struct Engine {
     /// `Mutex` rather than `RwLock`: even the read path populates new entries.
     hnsw_l0_caches:
         Mutex<std::collections::HashMap<crate::format::PageId, crate::hnsw_index::HnswL0Cache>>,
+    /// Process-lifetime vector hot cache for NEAR queries (item 73).
+    /// Keyed by HNSW meta_page.  Stores encoded_rid → Vec<f32> for every node
+    /// visited during beam search.  Eliminates ~100 KB random reads per NEAR query
+    /// at 10k×dim128 after the first few warm-up queries.
+    hnsw_vec_caches:
+        Mutex<std::collections::HashMap<crate::format::PageId, crate::hnsw_index::HnswVecCache>>,
 }
 
 /// One slow-query-log entry (P6.g).
@@ -1112,6 +1118,7 @@ impl Engine {
             stats_history: Mutex::new(std::collections::VecDeque::new()),
             stats_ticker_handle: Mutex::new(None),
             hnsw_l0_caches: Mutex::new(std::collections::HashMap::new()),
+            hnsw_vec_caches: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -1773,6 +1780,7 @@ impl Engine {
                 next_event_seq: &self.next_event_seq,
                 event_seq_index_meta: Some(self.event_seq_index_meta),
                 hnsw_l0_caches: Some(&self.hnsw_l0_caches),
+                hnsw_vec_caches: Some(&self.hnsw_vec_caches),
             };
             executor::execute(plan, &mut ctx)
         } else {
@@ -1790,6 +1798,7 @@ impl Engine {
                 next_event_seq: &self.next_event_seq,
                 event_seq_index_meta: Some(self.event_seq_index_meta),
                 hnsw_l0_caches: Some(&self.hnsw_l0_caches),
+                hnsw_vec_caches: Some(&self.hnsw_vec_caches),
             };
             executor::execute(plan, &mut ctx)
         }
@@ -1874,6 +1883,7 @@ impl Engine {
             next_event_seq: &self.next_event_seq,
             event_seq_index_meta: Some(self.event_seq_index_meta),
             hnsw_l0_caches: Some(&self.hnsw_l0_caches),
+            hnsw_vec_caches: Some(&self.hnsw_vec_caches),
         };
         let result = graph_executor::execute(parsed, &mut ctx, self.edge_index_meta)?;
         Ok(vec![result])

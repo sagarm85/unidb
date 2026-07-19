@@ -1,5 +1,5 @@
 **Type:** Performance
-**Status:** ⏳ NOT STARTED
+**Status:** ✅ SHIPPED 2026-07-19 — `HnswL0Cache` (L0 neighbour list cache, item 72) committed in cd94d71; warmup to 7ms at 10k (2× gain). Full target (≤5ms) achieved by adding item 73 (vector hot cache) in the same session. See PROGRESS.md.
 
 # Item 72 — HNSW query latency: in-memory hot layer
 

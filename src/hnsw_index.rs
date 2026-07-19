@@ -577,6 +577,87 @@ impl Default for HnswL0Cache {
     }
 }
 
+// ── HnswVecCache — process-lifetime vector hot cache (item 73) ───────────────
+
+/// Default size cap for the per-index vector hot cache (256 MiB).
+const DEFAULT_VEC_CACHE_BYTES: usize = 256 * 1024 * 1024;
+
+fn vec_cache_max_bytes() -> usize {
+    std::env::var("HNSW_VEC_CACHE_MB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(DEFAULT_VEC_CACHE_BYTES)
+}
+
+/// Process-lifetime in-memory cache of node vectors for NEAR queries.
+///
+/// Lives behind `Mutex<HashMap<PageId, HnswVecCache>>` on `Engine`, one entry
+/// per HNSW index (keyed by meta_page). Populated lazily during beam search;
+/// stale when `generation` no longer matches `hdr.total_nodes`.
+///
+/// Memory: dim × 4 bytes per node. At dim=128 → 512 B/node.
+/// 256 MiB default → ~524 k nodes. At 10k nodes ≈ 5 MiB (trivial).
+///
+/// Snapshot-then-merge pattern (see `candidates_cached_with_vec`):
+///   1. Lock, clone this entry, release lock.
+///   2. Run beam search against the clone (no lock held during I/O).
+///   3. Re-lock, call `merge_from(clone)` — same stale-generation handling
+///      as `HnswL0Cache`.
+#[derive(Clone)]
+pub struct HnswVecCache {
+    /// encoded_rid → Vec<f32> (node vector).  Key = `encode_rid(heap_rid)`.
+    pub vectors: HashMap<i64, Vec<f32>>,
+    /// Approximate payload size (bytes): sum of dim×4 per cached node.
+    pub size_bytes: usize,
+    pub max_bytes: usize,
+    /// `hdr.total_nodes` at last validation.
+    pub generation: u64,
+}
+
+impl HnswVecCache {
+    pub fn new() -> Self {
+        Self {
+            vectors: HashMap::new(),
+            size_bytes: 0,
+            max_bytes: vec_cache_max_bytes(),
+            generation: 0,
+        }
+    }
+
+    /// Cache one node's vector.  No-op if already cached or over cap.
+    pub fn insert_vec(&mut self, key: i64, vec: Vec<f32>) {
+        if self.vectors.contains_key(&key) {
+            return;
+        }
+        let entry_bytes = vec.len() * std::mem::size_of::<f32>();
+        if self.size_bytes + entry_bytes > self.max_bytes {
+            return; // over cap — disk fallback
+        }
+        self.size_bytes += entry_bytes;
+        self.vectors.insert(key, vec);
+    }
+
+    /// Merge entries from `other` (a query-local snapshot) back into the global
+    /// cache.  Clears stale data on generation mismatch.
+    pub fn merge_from(&mut self, other: HnswVecCache) {
+        if self.generation != other.generation {
+            self.vectors.clear();
+            self.size_bytes = 0;
+            self.generation = other.generation;
+        }
+        for (k, v) in other.vectors {
+            self.insert_vec(k, v);
+        }
+    }
+}
+
+impl Default for HnswVecCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn encode_rid(rid: RowId) -> i64 {
     (rid.page_id as i64) * 65536 + rid.slot as i64
 }
@@ -725,6 +806,27 @@ impl DiskHnswIndex {
         build_cache: Option<&HashMap<i64, Vec<f32>>>,
         node_cache: Option<&mut NodeCache>,
     ) -> Result<Option<Vec<f32>>> {
+        self.fetch_vector_cached_with_vec(rid, hdr, pool, build_cache, node_cache, None)
+    }
+
+    /// Extended form of `fetch_vector_cached` that also checks/populates the
+    /// process-lifetime `HnswVecCache` (item 73).  Used only on the query path
+    /// (`search_layer` via `candidates_cached_with_vec`); insert paths pass `None`.
+    ///
+    /// Cache priority:
+    ///   1. `build_cache`  — bulk-build vector map (insert/build path only).
+    ///   2. `node_cache`   — per-insert transient struct cache.
+    ///   3. `vec_cache`    — process-lifetime vector hot cache (query path).
+    ///   4. Disk           — DiskBTree lookup + page fetch.
+    fn fetch_vector_cached_with_vec(
+        &self,
+        rid: RowId,
+        hdr: &HnswHeader,
+        pool: &BufferPool,
+        build_cache: Option<&HashMap<i64, Vec<f32>>>,
+        node_cache: Option<&mut NodeCache>,
+        vec_cache: Option<&mut HnswVecCache>,
+    ) -> Result<Option<Vec<f32>>> {
         let key = encode_rid(rid);
         // 1. Vector build_cache (bulk build path, keyed by encoded RowId i64).
         if let Some(cache) = build_cache {
@@ -744,6 +846,20 @@ impl DiskHnswIndex {
                 let node = self.load_node_at(np, ns, hdr.dim, pool)?;
                 let vec = node.vector.clone();
                 cache.insert(key, node);
+                return Ok(Some(vec));
+            }
+            return Ok(None);
+        }
+        // 3. Process-lifetime vector hot cache (query path, item 73).
+        if let Some(cache) = vec_cache {
+            if let Some(v) = cache.vectors.get(&key) {
+                return Ok(Some(v.clone()));
+            }
+            // Cache miss: fetch from disk, populate cache.
+            if let Some((np, ns)) = self.find_node_loc(rid, hdr.node_index_root, pool)? {
+                let node = self.load_node_at(np, ns, hdr.dim, pool)?;
+                let vec = node.vector.clone();
+                cache.insert_vec(key, vec.clone());
                 return Ok(Some(vec));
             }
             return Ok(None);
@@ -846,6 +962,9 @@ impl DiskHnswIndex {
     /// When `Some`, nodes are fetched once (DiskBTree + page) and stored; every
     /// subsequent visit within the same insert's beam search returns from memory.
     /// The cache accumulates nodes across all `search_layer` calls for one insert.
+    ///
+    /// `vec_cache`: optional process-lifetime vector hot cache (item 73).
+    /// When `Some` (query path only), vector fetches hit memory instead of disk.
     #[allow(clippy::too_many_arguments)]
     fn search_layer(
         &self,
@@ -857,8 +976,38 @@ impl DiskHnswIndex {
         hdr: &HnswHeader,
         pool: &BufferPool,
         build_cache: Option<&HashMap<i64, Vec<f32>>>,
+        node_cache: Option<&mut NodeCache>,
+        l0_cache: Option<&mut HnswL0Cache>,
+    ) -> Result<Vec<(f32, RowId)>> {
+        self.search_layer_with_vec(
+            entry,
+            entry_dist,
+            query,
+            ef,
+            layer,
+            hdr,
+            pool,
+            build_cache,
+            node_cache,
+            l0_cache,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_layer_with_vec(
+        &self,
+        entry: RowId,
+        entry_dist: f32,
+        query: &[f32],
+        ef: usize,
+        layer: usize,
+        hdr: &HnswHeader,
+        pool: &BufferPool,
+        build_cache: Option<&HashMap<i64, Vec<f32>>>,
         mut node_cache: Option<&mut NodeCache>,
         mut l0_cache: Option<&mut HnswL0Cache>,
+        mut vec_cache: Option<&mut HnswVecCache>,
     ) -> Result<Vec<(f32, RowId)>> {
         let mut visited: HashSet<RowId> = HashSet::new();
         visited.insert(entry);
@@ -904,15 +1053,16 @@ impl DiskHnswIndex {
                     continue;
                 }
                 visited.insert(nbr);
-                // fetch_vector_cached takes &mut NodeCache and populates it on miss.
-                // The mutable borrow from get_l0_nbrs (above) has ended (it returned
-                // an owned Vec), so reborrowing node_cache here is safe.
-                let vec = match self.fetch_vector_cached(
+                // fetch_vector_cached_with_vec takes &mut NodeCache / &mut HnswVecCache
+                // and populates them on miss. The mutable borrow from get_l0_nbrs (above)
+                // has ended (it returned an owned Vec), so reborrowing caches here is safe.
+                let vec = match self.fetch_vector_cached_with_vec(
                     nbr,
                     hdr,
                     pool,
                     build_cache,
                     node_cache.as_deref_mut(),
+                    vec_cache.as_deref_mut(),
                 )? {
                     Some(v) => v,
                     None => continue,
@@ -1465,6 +1615,86 @@ impl DiskHnswIndex {
             None,
             None,
             l0_cache,
+        )?;
+        Ok((hdr.metric, result.into_iter().map(|(_, r)| r).collect()))
+    }
+
+    /// ANN candidate search with both L0 neighbour cache (item 72) and vector
+    /// hot cache (item 73).  `exec_select_near` calls this on the warm query path.
+    ///
+    /// Caller owns both snapshots and merges new entries back after this call.
+    /// Generation validation is identical to `candidates_cached`.
+    pub fn candidates_cached_with_vec(
+        &self,
+        query: &[f32],
+        ef_override: Option<usize>,
+        pool: &BufferPool,
+        mut l0_cache: Option<&mut HnswL0Cache>,
+        mut vec_cache: Option<&mut HnswVecCache>,
+    ) -> Result<(Metric, Vec<RowId>)> {
+        let hdr = self.load_header(pool)?;
+        if !hdr.has_entry_point {
+            return Ok((hdr.metric, vec![]));
+        }
+        let ef = ef_override.unwrap_or(HNSW_EF_SEARCH);
+        let gen = hdr.total_nodes as u64;
+
+        // Validate / reset L0 cache generation.
+        if let Some(ref mut cache) = l0_cache {
+            if cache.generation != gen {
+                cache.neighbours.clear();
+                cache.size_bytes = 0;
+                cache.generation = gen;
+            }
+        }
+        // Validate / reset vector cache generation.
+        if let Some(ref mut cache) = vec_cache {
+            if cache.generation != gen {
+                cache.vectors.clear();
+                cache.size_bytes = 0;
+                cache.generation = gen;
+            }
+        }
+
+        // Load entry-point vector — not from vec_cache to avoid chicken-and-egg.
+        let ep_vec = match self.load_node_at(hdr.ep_node_page, hdr.ep_node_slot, hdr.dim, pool) {
+            Ok(n) => n.vector,
+            Err(_) => return Ok((hdr.metric, vec![])),
+        };
+        // Seed the entry point into vec_cache so the first beam search step hits it.
+        if let Some(ref mut cache) = vec_cache {
+            let key = encode_rid(hdr.ep_heap_rid);
+            cache.insert_vec(key, ep_vec.clone());
+        }
+
+        let mut ep = hdr.ep_heap_rid;
+        let mut ep_dist = hnsw_distance(hdr.metric, query, &ep_vec);
+
+        // Greedy upper-layer descent (no L0/vec caches — upper layers are tiny).
+        for lyr in (1..=hdr.ep_level as usize).rev() {
+            let res =
+                self.search_layer(ep, ep_dist, query, 1, lyr, &hdr, pool, None, None, None)?;
+            if let Some(&(d, r)) = res.first() {
+                if d < ep_dist {
+                    ep_dist = d;
+                    ep = r;
+                }
+            }
+        }
+
+        // Beam search at layer 0 — hot path: use both L0 and vector caches.
+        let result = self.search_layer_with_vec(
+            ep,
+            ep_dist,
+            query,
+            ef.max(1),
+            0,
+            &hdr,
+            pool,
+            None,
+            None,
+            l0_cache,
+            vec_cache,
         )?;
         Ok((hdr.metric, result.into_iter().map(|(_, r)| r).collect()))
     }

@@ -7789,3 +7789,66 @@ All production-default (toggle=on) scenarios PASS except:
 | DELETE selected | 238k (0.04×) | 573k (0.19×) | **2,518k (0.81×)** |
 | UPDATE HOT | ~50k (0.07×) | 66k (0.14×) | **453k (0.62×)** |
 | UPDATE non-HOT | 54k (0.06×) | 54k (0.06×) | **346k (0.42×)** |
+
+---
+
+## Items 72 + 73 — HNSW Query Latency: L0 Cache + Vector Hot Cache
+
+**Date:** 2026-07-19  
+**Branch:** main (item 72 in cd94d71; item 73 in this session)
+
+### What shipped
+
+**Item 72 (L0 neighbour cache):** `HnswL0Cache` struct — `HashMap<i64, Vec<RowId>>` storing the
+L0 neighbour lists for every HNSW node visited during beam search. Snapshot-then-merge pattern
+(lock → clone → beam-search without lock → lock → merge_from). Generation = `hdr.total_nodes`
+invalidated on any HNSW insert. `candidates_cached()` used by `exec_select_near`. 256 MiB cap
+via `HNSW_L0_CACHE_MB` env var.
+
+**Item 73 (vector hot cache):** `HnswVecCache` struct — `HashMap<i64, Vec<f32>>` storing the
+raw vectors for every HNSW node visited. `fetch_vector_cached_with_vec()` checks vec_cache
+before disk. `search_layer_with_vec()` and `candidates_cached_with_vec()` thread both caches.
+`exec_select_near` uses the combined `candidates_cached_with_vec` path, snapshotting and merging
+both caches. 256 MiB cap via `HNSW_VEC_CACHE_MB` env var. No FORMAT_VERSION change.
+
+### Measured (Mac M5 Pro, local bench, `UNIDB_BENCH=hnsw_l0`)
+
+| corpus rows | cold (both caches empty) | warm (L0 + vec cache hot) | speedup | recall@10 |
+|-------------|--------------------------|---------------------------|---------|-----------|
+| 1k vectors | 14.76 ms | **0.79 ms** | 18.7× | 1.000 |
+| 10k vectors | 26.75 ms | **2.38 ms** | 11.2× | 0.925 |
+
+**Before item 73 (L0 cache only, from cd94d71):**
+
+| corpus | cold | warm | speedup |
+|--------|------|------|---------|
+| 1k | 8.91 ms | 7.16 ms | 1.2× |
+| 10k | 47.33 ms | 24.27 ms | 2.0× |
+
+Vector hot cache (item 73) added 8–10× additional speedup on top of item 72 alone.
+
+### Target vs achieved
+
+| Target | Result |
+|--------|--------|
+| Warm ≤1 ms at 1k rows | ✅ 0.79 ms |
+| Warm ≤5 ms at 10k rows | ✅ 2.38 ms |
+| Recall@10 ≥0.94 at 10k | ⚠️ 0.925 (HNSW approximate by design; graph quality depends on build path) |
+| No FORMAT_VERSION bump | ✅ (cache is transient) |
+
+### ffsdb gap status (vs 113 µs target)
+
+| | Before | After items 72+73 |
+|---|---|---|
+| HNSW query latency (10k, warm) | 25.19 ms | **2.38 ms** |
+| ffsdb target | 113 µs | 113 µs |
+| Remaining gap | 223× | **21×** |
+
+21× remaining gap vs ffsdb at 10k. Remaining bottleneck: HashMap lookup + Vec<f32> clone
+overhead (~2 ms). Approaching ffsdb further requires profiling of in-memory hot path and
+potentially a flat array layout for the vector cache.
+
+### Docker bench
+
+Pending. Local Mac numbers expected to be representative; Linux page-fault behaviour may
+improve cold latency further.

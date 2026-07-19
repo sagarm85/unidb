@@ -3668,11 +3668,13 @@ fn bench_ivf_scale_validation() {
 
 // ── Item 72: HNSW L0 cache latency bench ─────────────────────────────────────
 //
-// Measures NEAR query latency before and after the process-lifetime L0 cache
-// warms up.  The cold-to-warm gap is how much disk I/O the L0 cache avoids.
+// Measures NEAR query latency before and after the process-lifetime L0 neighbour cache
+// (item 72) and vector hot cache (item 73) warm up.  Cold = all caches empty.
+// Warm = L0 neighbour lists + full vectors for all reachable L0 nodes in memory.
 //
 // Run with:
-//   MM_BULK_SIZES=1000,10000,100000 UNIDB_BENCH=hnsw_l0 cargo bench --bench decompose --release
+//   MM_BULK_SIZES=1000,10000,100000 UNIDB_BENCH=hnsw_l0 cargo bench --bench decompose
+//   (also responds to UNIDB_BENCH=hnsw_vec or item72 or item73)
 
 fn bench_hnsw_l0_cache() {
     let sizes: Vec<usize> = std::env::var("MM_BULK_SIZES")
@@ -3740,7 +3742,7 @@ fn bench_hnsw_l0_cache() {
             .collect();
         let query_sqls: Vec<String> = query_vecs.iter().map(|q| near_sql(q, K)).collect();
 
-        // Cold: first query ever (L0 cache empty)
+        // Cold: first query ever (L0 cache + vec cache both empty)
         let cold_start = Instant::now();
         {
             let w = engine.begin().unwrap();
@@ -3749,7 +3751,8 @@ fn bench_hnsw_l0_cache() {
         }
         let cold_ms = cold_start.elapsed().as_secs_f64() * 1000.0;
 
-        // Warm-up: WARM_RUNS queries populate the L0 cache
+        // Warm-up: WARM_RUNS queries populate both the L0 cache (item 72) and
+        // the vector hot cache (item 73)
         for i in 1..=WARM_RUNS.min(N_QUERIES - 1) {
             let w = engine.begin().unwrap();
             engine.execute_sql(w, &query_sqls[i]).unwrap();
@@ -3808,16 +3811,17 @@ fn bench_hnsw_l0_cache() {
 
     println!();
     println!("**Notes:**");
-    println!("- Cold = first NEAR query after index creation (L0 cache empty)");
+    println!("- Cold = first NEAR query after index creation (L0 cache + vec cache both empty)");
     println!(
-        "- Warm = avg of last {} queries after {} warm-up queries (L0 cache populated)",
+        "- Warm = avg of last {} queries after {} warm-up queries (both caches populated)",
         N_QUERIES - WARM_RUNS - 1,
         WARM_RUNS
     );
-    println!("- Speedup = cold_ms / warm_ms; shows how much disk I/O the L0 cache avoids");
-    println!("- Recall@10 must stay ≥ 0.94 — cache is correctness-transparent");
-    println!("- Target: warm ≤ 5 ms at 10k rows (from 25.19 ms baseline)");
-    println!("- HNSW_L0_CACHE_MB controls cache cap (default 256 MiB)");
+    println!("- Speedup = cold_ms / warm_ms; shows L0 neighbour + vector disk I/O saved");
+    println!("- Recall@10 must stay ≥ 0.94 — both caches are correctness-transparent");
+    println!("- Target: warm ≤ 5 ms at 10k rows (from 25.19 ms baseline — items 72+73)");
+    println!("- HNSW_L0_CACHE_MB controls L0 cache cap (default 256 MiB)");
+    println!("- HNSW_VEC_CACHE_MB controls vector cache cap (default 256 MiB)");
 }
 
 fn main() {
@@ -3867,7 +3871,7 @@ fn main() {
             bench_ivf_scale_validation();
             return;
         }
-        "hnsw_l0" => {
+        "hnsw_l0" | "hnsw_vec" | "item72" | "item73" => {
             bench_hnsw_l0_cache();
             return;
         }

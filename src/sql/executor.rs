@@ -717,6 +717,11 @@ pub struct ExecCtx<'a> {
     /// `ExecCtx` structs (those tests don't exercise NEAR queries).
     pub hnsw_l0_caches:
         Option<&'a Mutex<std::collections::HashMap<crate::format::PageId, HnswL0Cache>>>,
+    /// Per-index vector hot cache for NEAR queries (item 73).
+    /// Eliminates ~100 KB random reads per NEAR query after warm-up by caching
+    /// encoded_rid → Vec<f32> for every node visited during beam search.
+    pub hnsw_vec_caches:
+        Option<&'a Mutex<std::collections::HashMap<crate::format::PageId, crate::hnsw_index::HnswVecCache>>>,
 }
 
 /// Insert `row`'s durable-index column values into their on-disk structures
@@ -2268,28 +2273,51 @@ fn exec_select_near(
     // Use max(k * 4, HNSW_EF_SEARCH) so small k doesn't under-probe.
     let ef = (k * 4).max(HNSW_EF_SEARCH);
 
-    // Item 72: process-lifetime L0 cache — snapshot-then-merge pattern.
+    // Items 72+73: process-lifetime L0 neighbour cache + vector hot cache.
+    // Snapshot-then-merge pattern (no lock held during page I/O):
     //   1. Lock, clone (or create fresh) the per-index cache entry, release lock.
-    //   2. Run beam search against the local clone (no lock held during page I/O).
-    //   3. Re-lock, merge new entries back; stale-generation detection clears stale data.
-    let (metric, candidate_ids) = if let Some(caches_mu) = ctx.hnsw_l0_caches {
-        // Step 1: snapshot
-        let mut local = {
-            let guard = caches_mu.lock().unwrap();
+    //   2. Run beam search against the local clones (lock-free during I/O).
+    //   3. Re-lock, merge new entries back into the global cache.
+    let (metric, candidate_ids) = if let Some(l0_mu) = ctx.hnsw_l0_caches {
+        // Step 1: snapshot both caches
+        let mut local_l0 = {
+            let guard = l0_mu.lock().unwrap();
             guard
                 .get(&meta_page)
                 .cloned()
                 .unwrap_or_else(HnswL0Cache::new)
         };
+        let mut local_vec = if let Some(vec_mu) = ctx.hnsw_vec_caches {
+            let guard = vec_mu.lock().unwrap();
+            guard
+                .get(&meta_page)
+                .cloned()
+                .unwrap_or_else(crate::hnsw_index::HnswVecCache::new)
+        } else {
+            crate::hnsw_index::HnswVecCache::new()
+        };
 
-        // Step 2: beam search (candidates_cached updates local.generation + populates)
-        let result = hnsw.candidates_cached(query, Some(ef), ctx.pool, Some(&mut local))?;
+        // Step 2: beam search — both caches updated on miss (lock-free)
+        let result = hnsw.candidates_cached_with_vec(
+            query,
+            Some(ef),
+            ctx.pool,
+            Some(&mut local_l0),
+            Some(&mut local_vec),
+        )?;
 
-        // Step 3: merge back into global cache
+        // Step 3: merge back into global caches
         {
-            let mut guard = caches_mu.lock().unwrap();
+            let mut guard = l0_mu.lock().unwrap();
             let entry = guard.entry(meta_page).or_insert_with(HnswL0Cache::new);
-            entry.merge_from(local);
+            entry.merge_from(local_l0);
+        }
+        if let Some(vec_mu) = ctx.hnsw_vec_caches {
+            let mut guard = vec_mu.lock().unwrap();
+            let entry = guard
+                .entry(meta_page)
+                .or_insert_with(crate::hnsw_index::HnswVecCache::new);
+            entry.merge_from(local_vec);
         }
 
         result
@@ -5220,6 +5248,7 @@ mod tests {
                 next_event_seq: &self.next_event_seq,
                 event_seq_index_meta: None,
                 hnsw_l0_caches: None,
+                hnsw_vec_caches: None,
             };
             execute(plan, &mut ctx)
         }
