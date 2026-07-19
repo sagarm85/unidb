@@ -914,31 +914,49 @@ impl Heap {
         Ok(result)
     }
 
-    /// Batched HOT UPDATE (item 74): two-phase, one mini-txn per page group.
+    /// Batched HOT UPDATE (item 74, fixed item 85): three-phase, one mini-txn per
+    /// page group.
     ///
-    /// **Why two phases?**  Each `try_hot_insert` call today opens its own
-    /// `begin_mini_txn` → WAL record(s) → `commit_mini_txn` bracket: 3 mutex
-    /// lock/unlock cycles, 3 `Vec` allocations, and 3 CRC32 passes per row.
-    /// For 50k matched rows that is 150k such cycles. Batching reduces this to
-    /// ~O(pages_touched) — typically 50×–75× fewer mutex acquisitions.
+    /// **Why three phases (item 85 fix)?**  The original B→A ordering (new inserts
+    /// first, xmax stamp second) caused orphaned row versions on WriteConflict: if
+    /// Phase B committed new-version mini-txns and Phase A then hit a conflict on an
+    /// old slot, the transaction was aborted — but no undo entries had been recorded
+    /// yet (exec_update Phase 3 only runs on success). Aborted xids are removed from
+    /// `active` without appearing in `committed`, but MVCC (`is_committed_at_snapshot`)
+    /// treats any xid not currently active as committed if it is below snapshot.xmax.
+    /// This left Phase B tuples permanently visible as "committed" orphans — the
+    /// correctness violation observed in item 85 (3 rows instead of 2).
     ///
-    /// **Phase B first** (new versions, fill pages): pack as many new row
-    /// versions per fill page as fit, one mini-txn per fill page with one
-    /// `WAL_INSERT` per new row. Records `(old_rid, new_rid)` pairs in input
-    /// order. Fill-page latch is acquired and released before touching old pages.
+    /// The A→B→C ordering fixes this: Phase A detects conflicts and aborts its
+    /// mini-txn BEFORE Phase B inserts anything. No orphans are possible.
     ///
-    /// **Phase A second** (old versions, HOT chain): group by `old_rid.page_id`,
-    /// one mini-txn per group. Writes `xmax = xid` and `hot_next =
-    /// HOT_NEXT_XPAGE (0xFFFE)` on each old slot, logging one
-    /// `WAL_HOT_XPAGE_HEAD` per slot within the mini-txn. Reads
-    /// `saved_prev_page/slot` from the tuple header under the exclusive latch.
+    /// **Phase A** (xmax stamp on old pages, WAL_XMAX_BATCH): group by
+    /// `old_rid.page_id`, one mini-txn per group. Conflict-checks ALL old slots
+    /// (xmax == 0?) before writing any; aborts the mini-txn and returns
+    /// `WriteConflict` if any slot is already deleted. Stamps `xmax = xid` and
+    /// reads `saved_prev_page/slot` from the tuple header under the exclusive latch.
+    /// Does NOT write HOT_NEXT_XPAGE — new_rid is not yet known.
     ///
-    /// **Correctness invariants** (D1/D2/D5):
-    /// - Phase B before Phase A preserves "new-before-old" latch ordering.
-    /// - Crash between Phase B commit and Phase A: new versions have
-    ///   `xmin = uncommitted xid` → invisible via MVCC; old versions live. ✓
-    /// - WAL_HOT_XPAGE_HEAD undo restores `xmax = 0` and `hot_next = saved_prev`
-    ///   on each old slot (existing undo path).
+    /// **Phase B** (new versions on fill pages, WAL_INSERT_BATCH): pack as many
+    /// new row versions per fill page as fit, one mini-txn per fill page. Fill-page
+    /// latch is released before old pages are re-latched in Phase C.
+    ///
+    /// **Phase C** (HOT forward pointer on old pages, WAL_HOT_XPAGE_BATCH): now
+    /// that new_rids are known, latch each old page group again and call
+    /// `set_hot_xpage(old_slot, new_page_id, new_slot)` — the cross-page HOT chain
+    /// pointer (item 71) needed for B-tree HOT chain following. The WAL record also
+    /// re-stamps `xmax = xid` (idempotent after Phase A). Its undo payload restores
+    /// `prev_page/prev_slot + hot_next` and clears xmax — correct for incomplete-
+    /// user-txn crash recovery.
+    ///
+    /// **Crash safety** (D1/D2/D5):
+    /// - Crash in Phase A (before commit): nothing on disk changed. ✓
+    /// - Crash between A and B: old slots have `xmax = xid` (WAL-logged); xid is
+    ///   incomplete → recovery WAL_XMAX_BATCH undo clears them back to 0. ✓
+    /// - Crash between B and C: new versions have `xmin = xid` (incomplete) →
+    ///   recovery self-stamps them dead via WAL_INSERT_BATCH undo (Phase 2). ✓
+    /// - Crash in or after Phase C: WAL_HOT_XPAGE_BATCH undo restores chain +
+    ///   clears xmax; WAL_INSERT_BATCH undo self-stamps new versions dead. ✓
     ///
     /// `rows` MUST be sorted by `old_rid.page_id` (guaranteed by `matching_rows`).
     /// **Gate**: caller must ensure `hot_eligible` — CORRECTNESS gate, not
@@ -965,10 +983,88 @@ impl Heap {
             .collect();
         lock_mgr.try_acquire_write_many(&record_ids, xid)?;
 
-        // ── Phase B: insert new versions on fill pages ──────────────────────
-        // One mini-txn per fill page; pack as many rows as fit. Mirrors
-        // `update_many` Phase B exactly (new-before-old latch order).
+        // ── Phase A: xmax stamp on old pages ────────────────────────────────
+        //
+        // Item 85 fix: Phase A (xmax conflict check + stamp) runs BEFORE Phase B
+        // (new inserts). This prevents orphaned new-version tuples when Phase A
+        // encounters a WriteConflict: if we stamped xmax after inserting new
+        // versions (old Phase B→A ordering), a conflict on Phase A would abort
+        // the transaction but leave Phase B's committed WAL mini-txns on disk.
+        // Those tuples' xmin (= the now-aborted xid) would be misread as
+        // "committed" by future MVCC snapshots (the aborted set is not checked;
+        // physical undo is the only guarantee — see mvcc.rs header).
+        //
+        // With Phase A first: WriteConflict aborts the mini-txn before any
+        // page write; Phase B never runs; no orphans are possible.
+        //
+        // Group by old_rid.page_id (input already page-sorted). For each group:
+        // one mini-txn, one FPI check, WAL_XMAX_BATCH. Collect
+        // (saved_prev_page, saved_prev_slot) for Phase C.
+        //
+        // NOTE: We do NOT write the HOT_NEXT_XPAGE forward pointer here because
+        // new_rid is not yet known. Phase C writes it after Phase B produces new_rids.
+        // The HOT_NEXT_XPAGE pointer is needed for B-tree HOT chain following
+        // (item 71); skipping it until Phase C keeps crash behaviour sound:
+        // a crash between Phase A and Phase C leaves old slots xmax-stamped with
+        // no forward pointer — recovery undoes those xmax stamps via WAL_XMAX_BATCH
+        // undo in the incomplete-user-txn pass, and self-stamps Phase B inserts
+        // dead via WAL_INSERT_BATCH undo, leaving the table in a consistent state.
 
+        // saved_prev: parallel to `rows`, holds (saved_prev_page, saved_prev_slot)
+        // read from the old tuple header under the Phase A latch.
+        let mut saved_prev: Vec<(PageId, u16)> = Vec::with_capacity(rows.len());
+
+        let mut i = 0;
+        while i < rows.len() {
+            let page_id = rows[i].0.page_id;
+            let j = i + rows[i..].partition_point(|(r, _)| r.page_id == page_id);
+            let group = &rows[i..j];
+
+            let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
+            let _wg = pool.latch_exclusive(page_id);
+            let mut page = pool.fetch_page_for_write(page_id, wal)?;
+
+            // Conflict-check all old slots before touching anything.
+            for (old_rid, _) in group {
+                let th = page.tuple_header(old_rid.slot)?;
+                if th.xmax != 0 {
+                    pool.unpin(page_id);
+                    wal.abort_mini_txn(txn_id, begin_lsn)?;
+                    return Err(DbError::WriteConflict {
+                        holder_xid: th.xmax,
+                    });
+                }
+            }
+
+            let prev_lsn = pool
+                .maybe_log_fpi(page_id, wal, txn_id, begin_lsn)?
+                .unwrap_or(begin_lsn);
+
+            // Read saved_prev and stamp xmax on each slot.
+            let slots: Vec<u16> = group.iter().map(|(r, _)| r.slot).collect();
+            for (old_rid, _) in group {
+                let th = page.tuple_header(old_rid.slot)?;
+                saved_prev.push((th.prev_page, th.prev_slot));
+                on_write(xid, *old_rid);
+                page.set_xmax(old_rid.slot, xid)?;
+            }
+
+            let lsn = wal.log_xmax_batch(txn_id, prev_lsn, page_id, xid, &slots)?;
+            page.set_lsn(lsn);
+            pool.write_page(&page)?;
+            let new_free = page.free_space();
+            pool.unpin(page_id);
+            wal.commit_mini_txn(txn_id, lsn)?;
+            self.note_free_space(page_id, new_free);
+
+            i = j;
+        }
+
+        // ── Phase B: insert new versions on fill pages ──────────────────────
+        // One mini-txn per fill page; pack as many rows as fit. At this point
+        // Phase A has committed xmax stamps so any WriteConflict is already
+        // behind us. Phase B can only fail on I/O, which is also true of
+        // update_many's Phase B — a pre-existing gap documented in both paths.
         let mut b_pairs: Vec<(RowId, RowId)> = Vec::with_capacity(rows.len());
         let mut i = 0;
         while i < rows.len() {
@@ -1011,19 +1107,25 @@ impl Heap {
             pool.write_page(&fill_page)?;
             let free = fill_page.free_space();
             pool.unpin(fill_pid);
-            // _ng dropped here — fill-page latch released before old-page latch
+            // _ng dropped here — fill-page latch released before old-page re-latch
             self.note_free_space(fill_pid, free);
             wal.commit_mini_txn(txn_id, last_lsn)?;
         }
-        // ── Phase A: xmax + HOT_NEXT_XPAGE on old pages ────────────────────
-        // Group by old_rid.page_id (input already page-sorted). For each
-        // group: one mini-txn, one FPI check, N×WAL_HOT_XPAGE_HEAD records.
+
+        // ── Phase C: HOT_NEXT_XPAGE forward pointer on old pages ────────────
+        // Now that new_rids are known, write set_hot_xpage(old_slot,
+        // new_page_id, new_slot) on each old slot. This is the cross-page HOT
+        // chain pointer (item 71) needed so B-tree lookups can follow old_rid →
+        // new_rid without a full scan. WAL record is WAL_HOT_XPAGE_BATCH; its
+        // redo also stamps xmax = xid (idempotent after Phase A) and its undo
+        // restores prev_page/prev_slot + clears hot_next + clears xmax — all
+        // correct for crash recovery of an incomplete user transaction.
         let mut result: Vec<(RowId, RowId, PageId, u16)> = Vec::with_capacity(rows.len());
         let mut j = 0;
         while j < b_pairs.len() {
             let (old_rid0, _) = b_pairs[j];
             let page_id = old_rid0.page_id;
-            // Find the contiguous run of rows on this old page.
+            // Find the contiguous run on this old page.
             let k = j + b_pairs[j..].partition_point(|(r, _)| r.page_id == page_id);
             let group = &b_pairs[j..k];
 
@@ -1031,19 +1133,6 @@ impl Heap {
             let _wg = pool.latch_exclusive(page_id);
             let mut page = pool.fetch_page_for_write(page_id, wal)?;
 
-            // Conflict-check all old slots before touching anything.
-            for (old_rid, _) in group {
-                let th = page.tuple_header(old_rid.slot)?;
-                if th.xmax != 0 {
-                    pool.unpin(page_id);
-                    wal.abort_mini_txn(txn_id, begin_lsn)?;
-                    return Err(DbError::WriteConflict {
-                        holder_xid: th.xmax,
-                    });
-                }
-            }
-
-            // One FPI check for the whole page group.
             let prev_lsn = pool
                 .maybe_log_fpi(page_id, wal, txn_id, begin_lsn)?
                 .unwrap_or(begin_lsn);
@@ -1051,13 +1140,10 @@ impl Heap {
             // Accumulate entries for the batch WAL record.
             // (old_slot, new_page_id, new_slot, saved_prev_page, saved_prev_slot)
             let mut page_entries: Vec<(u16, u32, u16, u32, u16)> = Vec::with_capacity(group.len());
-            for (old_rid, new_rid) in group {
-                // Read saved_prev before overwriting hot_next (under latch).
-                let th = page.tuple_header(old_rid.slot)?;
-                let (saved_prev_page, saved_prev_slot) = (th.prev_page, th.prev_slot);
+            for (idx_in_group, (old_rid, new_rid)) in group.iter().enumerate() {
+                let row_idx = j + idx_in_group;
+                let (saved_prev_page, saved_prev_slot) = saved_prev[row_idx];
 
-                on_write(xid, *old_rid);
-                page.set_xmax(old_rid.slot, xid)?;
                 // set_hot_xpage stores (new_page_id, new_slot) in prev_page/prev_slot
                 // AND sets hot_next = HOT_NEXT_XPAGE (0xFFFE). The prev_page/prev_slot
                 // reuse is intentional (item 71): on a superseded slot the backward
@@ -1074,8 +1160,8 @@ impl Heap {
                 result.push((*old_rid, *new_rid, saved_prev_page, saved_prev_slot));
             }
 
-            // Item 80: one WAL_HOT_XPAGE_BATCH per old page instead of one
-            // WAL_HOT_XPAGE_HEAD per row — reduces WAL mutex passes from O(rows) to O(old_pages).
+            // Item 80: one WAL_HOT_XPAGE_BATCH per old page. Redo stamps xmax
+            // (idempotent — Phase A already did it) and writes hot_xpage pointer.
             let batch_lsn =
                 wal.log_hot_xpage_batch(txn_id, prev_lsn, page_id, xid, &page_entries)?;
 

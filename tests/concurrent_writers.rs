@@ -668,3 +668,84 @@ fn cross_row_update_deadlock_resolves_no_hang() {
         }
     });
 }
+
+/// Item 85: cross-row UPDATE churn with opposite lock order, toggle=on,
+/// NO B-tree index. This is the scenario that hung 1/3 times in the PR #150
+/// concurrency matrix (scenario 10). The test runs 2 writers × 2 rows in
+/// opposite order — the minimal deadlock geometry — with a tight 10s deadline.
+/// Must pass consistently after the fix (both no-hang and correct row count).
+#[test]
+fn item85_cross_row_churn_no_index_no_hang() {
+    // Run multiple repeats: the hang was 1/3 probabilistic, so 5 clean
+    // repeats is strong evidence.
+    for rep in 0..5 {
+        with_deadline(10, move || {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = Arc::new(Engine::open(dir.path(), 0).unwrap());
+            engine.set_deferred_sync(true);
+            engine.set_concurrent_sql_writes(true);
+
+            let x = engine.begin().unwrap();
+            // No index — this is what distinguishes scenario 10 from scenario 9.
+            engine
+                .execute_sql(x, "CREATE TABLE t (id INT, k INT)")
+                .unwrap();
+            engine
+                .execute_sql(x, "INSERT INTO t (id, k) VALUES (1, 10), (2, 20)")
+                .unwrap();
+            engine.commit(x).unwrap();
+
+            let rounds = 40;
+            let barrier = Arc::new(Barrier::new(2));
+            let mut handles = Vec::new();
+            for dir_forward in [true, false] {
+                let engine = Arc::clone(&engine);
+                let barrier = Arc::clone(&barrier);
+                handles.push(thread::spawn(move || {
+                    let (first, second) = if dir_forward { (1, 2) } else { (2, 1) };
+                    barrier.wait();
+                    let mut done = 0;
+                    while done < rounds {
+                        let v = 100 + done;
+                        let xid = engine.begin().unwrap();
+                        let a = engine.execute_sql(
+                            xid,
+                            &format!("UPDATE t SET k = {v} WHERE id = {first}"),
+                        );
+                        let b = a.and_then(|_| {
+                            engine.execute_sql(
+                                xid,
+                                &format!("UPDATE t SET k = {v} WHERE id = {second}"),
+                            )
+                        });
+                        match b.and_then(|_| engine.commit(xid)) {
+                            Ok(_) => done += 1,
+                            Err(DbError::Deadlock { .. })
+                            | Err(DbError::WriteConflict { .. })
+                            | Err(DbError::SerializationFailure { .. }) => {
+                                let _ = engine.abort(xid);
+                            }
+                            Err(e) => panic!("unexpected error in rep {rep}: {e:?}"),
+                        }
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+            // Both rows must still be present after the churn (invariant: row count = 2).
+            let x = engine.begin().unwrap();
+            let rows = engine.execute_sql(x, "SELECT id FROM t").unwrap();
+            engine.commit(x).unwrap();
+            match rows.into_iter().next().unwrap() {
+                SqlResult::Rows { rows, .. } => assert_eq!(
+                    rows.len(),
+                    2,
+                    "rep {rep}: expected exactly 2 rows after churn, got {}",
+                    rows.len()
+                ),
+                o => panic!("rep {rep}: expected Rows, got {o:?}"),
+            }
+        });
+    }
+}

@@ -7852,3 +7852,64 @@ potentially a flat array layout for the vector cache.
 
 Pending. Local Mac numbers expected to be representative; Linux page-fault behaviour may
 improve cold latency further.
+
+---
+
+## Item 85 — Production-default concurrency hang fix (2026-07-19)
+
+**Branch:** `fix/item-85-concurrency-hang` | **PR:** pending
+**Files changed:** `src/heap.rs` (hot_update_many A→B→C reorder), `tests/concurrent_writers.rs`
+(regression test), `docs/backlog/85_concurrency_hang_cross_row_churn.md`, `docs/backlog/backlog_index.md`
+
+### Root cause (confirmed by regression test)
+
+`hot_update_many` (item 74) used a **B→A** phase order: Phase B (insert new versions, commit
+WAL mini-txns per fill page) ran BEFORE Phase A (xmax stamp on old slots). When Phase A hit a
+`WriteConflict` on an old slot, `hot_update_many` returned `Err`. `exec_update`'s Phase 3 (which
+records `HotXpageUpdate` undo entries) only runs on `Ok` — so the undo log had NO entries for
+Phase B's committed tuples. `abort(xid)` removed `xid` from `active` without undoing Phase B.
+Future `is_committed_at_snapshot(xid)` returned `true` (xid not in `active_xids`, below
+`snapshot.xmax`) → Phase B tuples permanently visible as ghost rows. Confirmed: 3 rows visible
+instead of 2 after 2-writer churn. The hang followed from writers looping indefinitely in
+`txn_retry` against corrupted state.
+
+Scenario 9 (WITH B-tree index) was unaffected: `set_touches_indexed_col=true` → `hot_eligible=false`
+→ routes to `update_many`, which does Phase A (xmax) BEFORE Phase B (new inserts) — the safe order.
+
+### Fix
+
+Restructured `hot_update_many` to **A→B→C**:
+
+- **Phase A (`WAL_XMAX_BATCH`)**: per old page group — latch, conflict-check (xmax == 0?),
+  stamp xmax = xid, read + save `saved_prev_page/slot`, commit. WriteConflict aborts mini-txn
+  before any Phase B insert — no orphaned tuples possible.
+- **Phase B (`WAL_INSERT_BATCH`)**: insert new row versions on fill pages. Can only fail on I/O
+  (same pre-existing gap as `update_many`).
+- **Phase C (`WAL_HOT_XPAGE_BATCH`)**: write `set_hot_xpage(old_slot, new_rid)` forward pointer
+  needed for B-tree HOT chain following (item 71). Phase C redo also re-stamps xmax (idempotent).
+  Phase C undo restores `prev_page/slot + hot_next` and clears xmax — correct for crash recovery.
+
+Crash safety verified: recovery's incomplete-user-txn pass undoes `WAL_XMAX_BATCH` (clears xmax),
+`WAL_HOT_XPAGE_BATCH` (restores chain + clears xmax), and self-stamps `WAL_INSERT_BATCH` dead.
+
+### Test results
+
+| Test | Before fix | After fix |
+|------|-----------|-----------|
+| `item85_cross_row_churn_no_index_no_hang` (5 reps, 2w×2r, 10 s deadline) | FAIL (3 rows + timeout) | ✅ PASS |
+| Crash harness (`cargo test --test crash`) | 51/51 ✅ | 51/51 ✅ |
+| Full test suite (`cargo test`) | green | green |
+
+**Correctness:** Row count invariant holds (2 rows after any number of churn rounds).
+**Liveness:** No hang in 5/5 reps of the minimal deadlock geometry.
+**clippy:** clean (`cargo clippy -- -D warnings`).
+
+### What changed
+
+- `src/heap.rs`: `hot_update_many` restructured from Phase B→A to Phase A→B→C; doc comment
+  updated to document the ordering, crash safety invariants, and the item 85 rationale.
+- `tests/concurrent_writers.rs`: added `item85_cross_row_churn_no_index_no_hang` regression test.
+- `docs/backlog/85_concurrency_hang_cross_row_churn.md`: created (root cause + fix documented).
+- `docs/backlog/backlog_index.md`: registered item 85, updated next-ID marker to 86.
+
+**Locked-decision changes:** none. D1/D2/D5 satisfied; no FORMAT_VERSION change.
