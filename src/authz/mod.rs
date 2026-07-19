@@ -269,6 +269,20 @@ impl RoleStore {
         self.lock().roles.iter().cloned().collect()
     }
 
+    /// Snapshot of all role memberships as `(role, member)` pairs.
+    /// `member` is a user or role that has been granted membership in `role`.
+    /// (item-24 Z4: `unidb_catalog.role_members`)
+    pub fn memberships(&self) -> Vec<(String, String)> {
+        let st = self.lock();
+        let mut out = Vec::new();
+        for (member, roles) in &st.memberships {
+            for role in roles {
+                out.push((role.clone(), member.clone()));
+            }
+        }
+        out
+    }
+
     /// Snapshot of all grants as `(grantee, table, privilege)` triples
     /// (item-24 Z5: `unidb_catalog.grants`).
     pub fn grants(&self) -> Vec<(String, String, Privilege)> {

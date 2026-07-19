@@ -59,6 +59,9 @@ pub const RELATIONS: &[&str] = &[
     "unidb_catalog.roles",
     "unidb_catalog.grants",
     "unidb_catalog.policies",
+    // item-24 Z4: role membership + users catalog.
+    "unidb_catalog.role_members",
+    "unidb_catalog.users",
 ];
 
 /// Is `name` one of the reserved introspection relations? Case-insensitive so
@@ -150,6 +153,12 @@ pub fn virtual_schema(name: &str) -> Option<Vec<ColumnRef>> {
             ("operation", ColumnType::Text),
             ("using_expr", ColumnType::Text),
         ],
+        // item-24 Z4: role membership + users catalog.
+        "unidb_catalog.role_members" => &[("role", ColumnType::Text), ("member", ColumnType::Text)],
+        "unidb_catalog.users" => &[
+            ("name", ColumnType::Text),
+            ("is_superuser", ColumnType::Bool),
+        ],
         _ => return None,
     };
     Some(
@@ -195,6 +204,9 @@ pub fn virtual_rows(
         "unidb_catalog.roles" => authz.map(roles_rows).unwrap_or_default(),
         "unidb_catalog.grants" => authz.map(grants_rows).unwrap_or_default(),
         "unidb_catalog.policies" => policies_rows(&defs),
+        // item-24 Z4: role membership + users catalog.
+        "unidb_catalog.role_members" => authz.map(role_members_rows).unwrap_or_default(),
+        "unidb_catalog.users" => authz.map(users_rows).unwrap_or_default(),
         // Only reached if a caller passes a non-relation name; the planner
         // guards this, so an empty set is a safe, non-panicking fallback.
         _ => Vec::new(),
@@ -606,6 +618,29 @@ fn grants_rows(authz: &crate::authz::RoleStore) -> Vec<Vec<Literal>> {
     grants
         .into_iter()
         .map(|(role, table, priv_)| vec![t(&role), t(&table), t(priv_.as_str())])
+        .collect()
+}
+
+/// `unidb_catalog.role_members` — one row per `(role, member)` pair
+/// (item-24 Z4). `member` is the user or role granted membership in `role`.
+fn role_members_rows(authz: &crate::authz::RoleStore) -> Vec<Vec<Literal>> {
+    let mut pairs = authz.memberships();
+    // Stable order: (role, member).
+    pairs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    pairs
+        .into_iter()
+        .map(|(role, member)| vec![t(&role), t(&member)])
+        .collect()
+}
+
+/// `unidb_catalog.users` — one row per user with superuser flag (item-24 Z4).
+fn users_rows(authz: &crate::authz::RoleStore) -> Vec<Vec<Literal>> {
+    let mut users = authz.users();
+    // Stable order by username.
+    users.sort_by(|a, b| a.0.cmp(&b.0));
+    users
+        .into_iter()
+        .map(|(name, superuser)| vec![t(&name), Literal::Bool(superuser)])
         .collect()
 }
 
