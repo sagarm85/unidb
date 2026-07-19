@@ -100,6 +100,35 @@ pub struct Heap {
     fsm_tree: Option<DiskBTree>,
 }
 
+/// Open-page accumulation state for [`Heap::insert_accumulating`] (item 98).
+///
+/// Holds an exclusive latch on a heap page and the in-progress WAL mini-txn
+/// while a multi-row VALUES INSERT is packing rows onto that page one at a
+/// time.  Each row is written immediately (WAL_INSERT record + pool write),
+/// but the WAL_COMMIT bracket is deferred until the page fills or
+/// [`Heap::flush_insert_accum`] is called.  This reduces WAL mutex
+/// acquisitions for begin/commit from O(rows) to O(heap-pages) while keeping
+/// per-row visibility (each row's WAL_INSERT is logged before its page write,
+/// satisfying D5; the page stays in the pool under the exclusive latch so
+/// subsequent `enforce_unique` B-tree lookups can see the committed entries).
+pub struct InsertAccum {
+    page_id: PageId,
+    /// Exclusive latch on `page_id` — held for the full duration of this page
+    /// batch so no other writer can slip into the slot directory.
+    _wg: ExclusiveLatch,
+    txn_id: u64,
+    /// LSN of the most-recent WAL record within this mini-txn (for chaining).
+    last_lsn: crate::format::Lsn,
+}
+
+/// Commit the deferred mini-txn for the page currently held open in `acc`.
+/// Emits WAL_COMMIT, releases the WAL mini-txn bracket.  The caller is
+/// responsible for unpinning and updating the FSM after this returns.
+fn flush_insert_accum_impl(acc: &InsertAccum, wal: &Wal) -> Result<()> {
+    wal.commit_mini_txn(acc.txn_id, acc.last_lsn)?;
+    Ok(())
+}
+
 /// Result type returned by a successful `Heap::try_hot_insert` call (item 71).
 /// Distinguishes same-page HOT (no chain pointer in the WAL undo log needed)
 /// from cross-page HOT (saved `prev_page`/`prev_slot` needed for undo).
@@ -227,80 +256,110 @@ impl Heap {
         self.insert_version(data, xid, None, pool, wal)
     }
 
-    /// INSERT multiple rows using the fewest possible mini-transactions.
+    /// Streaming-accumulation insert (item 98).
     ///
-    /// All rows are packed page-by-page: when a page fills up a new one is
-    /// acquired and a fresh mini-txn is opened.  Each page's mini-txn uses a
-    /// single `WAL_INSERT_BATCH` record (the same record type used by
-    /// `update_many`'s Phase B), so the WAL mutex is acquired once per page
-    /// rather than once per row.  In the common case where all rows fit on one
-    /// page this is exactly ONE mini-txn for the entire batch.
+    /// Writes one row to the heap immediately — WAL_INSERT record logged,
+    /// page flushed to the buffer pool — and returns the `RowId` so the
+    /// caller can register its undo record and update secondary indexes before
+    /// processing the next row.  All rows on the same physical page share ONE
+    /// WAL mini-txn bracket (`WAL_BEGIN` … `WAL_COMMIT`), reducing per-row
+    /// mini-txn overhead from O(rows) to O(heap-pages).
     ///
-    /// Atomicity: within a single page's mini-txn all rows on that page are
-    /// either all committed or all rolled back on recovery.  Callers are
-    /// responsible for registering `UndoAction::Insert` for every returned
-    /// `RowId` so that an M1 user-transaction abort also reverts the inserts.
+    /// This preserves all correctness invariants:
+    /// - **D5**: each `WAL_INSERT` record is logged before its `pool.write_page`
+    ///   (the page's LSN is set from the WAL record's LSN, not from the future
+    ///   `WAL_COMMIT`).
+    /// - **UNIQUE enforcement**: because each row is written to the page and its
+    ///   index entry added by `apply_durable_index_writes` before the next row's
+    ///   `enforce_unique` runs, intra-statement duplicates are caught exactly as
+    ///   in the single-row path.
+    /// - **Crash safety**: if the statement returns an error after some rows were
+    ///   written, the open mini-txn has no `WAL_COMMIT`, so recovery treats it as
+    ///   incomplete and undoes it.  The caller must still call
+    ///   `flush_insert_accum` on success to close the final page's mini-txn.
     ///
-    /// Used by `exec_insert` (item 98) to collapse a multi-row VALUES INSERT
-    /// from one mini-txn per row down to one mini-txn per page.
-    pub fn insert_batch(
+    /// The caller is responsible for registering an `UndoAction::Insert` for
+    /// each returned `RowId` (so M1 user-txn abort can revert them) and for
+    /// calling `flush_insert_accum` after the last row.
+    pub fn insert_accumulating(
         &self,
-        rows: &[Vec<u8>],
+        data: &[u8],
         xid: Xid,
         pool: &BufferPool,
         wal: &Wal,
-    ) -> Result<Vec<RowId>> {
-        if rows.is_empty() {
-            return Ok(Vec::new());
-        }
+        state: &mut Option<InsertAccum>,
+    ) -> Result<RowId> {
+        let needed = crate::page::SLOT_SIZE + crate::page::TUPLE_HEADER_SIZE + data.len();
 
-        let mut all_row_ids: Vec<RowId> = Vec::with_capacity(rows.len());
-        let mut i = 0;
-
-        while i < rows.len() {
-            // Determine the minimum space needed for the first unplaced row so
-            // `acquire_page_for_insert` can guarantee at least one row fits.
-            let needed0 = crate::page::SLOT_SIZE + crate::page::TUPLE_HEADER_SIZE + rows[i].len();
-            let (page_id, _wg, mut page) = self.acquire_page_for_insert(needed0, pool, wal)?;
-
-            let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
-            // P1.a: full-page image before this page's first change of the interval.
-            let prev_lsn = pool
-                .maybe_log_fpi(page_id, wal, txn_id, begin_lsn)?
-                .unwrap_or(begin_lsn);
-
-            // Accumulate (slot, redo_blob) pairs for the batch WAL record.
-            let mut page_rows: Vec<(u16, Vec<u8>)> = Vec::new();
-
-            while i < rows.len() {
-                let data = &rows[i];
-                let needed = crate::page::SLOT_SIZE + crate::page::TUPLE_HEADER_SIZE + data.len();
-                if page.free_space() < needed {
-                    break; // This row goes onto the next page.
-                }
+        // Fast path: current page has room — append within the same mini-txn.
+        if let Some(acc) = state.as_mut() {
+            // Fetch the page fresh from the pool to get the post-write state.
+            // The exclusive latch (_wg) is still held so no other writer can
+            // race us here.  We do NOT call acquire_page_for_insert — the latch
+            // guarantees the page is ours.
+            let mut page = pool.fetch_page_for_write(acc.page_id, wal)?;
+            if page.free_space() >= needed {
                 let slot = page.insert_versioned(data, xid, 0, None)?;
-                let row_id = RowId { page_id, slot };
+                let row_id = RowId {
+                    page_id: acc.page_id,
+                    slot,
+                };
                 on_write(xid, row_id);
                 let redo = encode_insert_redo(xid, None, data);
-                page_rows.push((slot, redo));
-                all_row_ids.push(row_id);
-                i += 1;
+                let ins_lsn = wal.log_insert(acc.txn_id, acc.last_lsn, acc.page_id, slot, &redo)?;
+                page.set_lsn(ins_lsn);
+                pool.write_page(&page)?;
+                pool.unpin(acc.page_id); // unpin the fetch; _wg latch still held
+                acc.last_lsn = ins_lsn;
+                return Ok(row_id);
             }
-
-            // One WAL_INSERT_BATCH record for all rows on this page — same
-            // record type as update_many Phase B (item 79).  Redo replay in
-            // recovery.rs already handles WAL_INSERT_BATCH.
-            let last_lsn = wal.log_insert_batch(txn_id, prev_lsn, page_id, xid, &page_rows)?;
-
-            page.set_lsn(last_lsn);
-            pool.write_page(&page)?;
-            let free = page.free_space();
-            pool.unpin(page_id);
-            self.note_free_space(page_id, free);
-            wal.commit_mini_txn(txn_id, last_lsn)?;
+            pool.unpin(acc.page_id); // unpin the fetch; page is full
+                                     // Page full — commit this page's mini-txn then fall through.
+            flush_insert_accum_impl(acc, wal)?;
         }
+        *state = None;
 
-        Ok(all_row_ids)
+        // Acquire a fresh page and open a new mini-txn.
+        let (page_id, wg, mut page) = self.acquire_page_for_insert(needed, pool, wal)?;
+        let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
+        // P1.a: full-page image before this page's first change of the interval.
+        let prev_lsn = pool
+            .maybe_log_fpi(page_id, wal, txn_id, begin_lsn)?
+            .unwrap_or(begin_lsn);
+
+        let slot = page.insert_versioned(data, xid, 0, None)?;
+        let row_id = RowId { page_id, slot };
+        on_write(xid, row_id);
+        let redo = encode_insert_redo(xid, None, data);
+        let ins_lsn = wal.log_insert(txn_id, prev_lsn, page_id, slot, &redo)?;
+        page.set_lsn(ins_lsn);
+        pool.write_page(&page)?;
+        let free = page.free_space();
+        pool.unpin(page_id);
+        self.note_free_space(page_id, free);
+
+        *state = Some(InsertAccum {
+            page_id,
+            _wg: wg,
+            txn_id,
+            last_lsn: ins_lsn,
+        });
+        Ok(row_id)
+    }
+
+    /// Commit the deferred mini-txn for the final page opened by
+    /// [`Self::insert_accumulating`].  Must be called after the last row in
+    /// the VALUES list.  `state` is cleared to `None` on return.
+    ///
+    /// If not called (e.g. the statement returns an error), the open
+    /// mini-txn has no `WAL_COMMIT`, so recovery treats it as incomplete and
+    /// undoes all writes inside it — crash-safe by construction.
+    pub fn flush_insert_accum(&self, wal: &Wal, state: &mut Option<InsertAccum>) -> Result<()> {
+        if let Some(ref acc) = state {
+            flush_insert_accum_impl(acc, wal)?;
+        }
+        *state = None;
+        Ok(())
     }
 
     fn insert_version(
