@@ -1,5 +1,5 @@
 **Type:** Improvement
-**Status:** ⏳ NOT STARTED — **design decision required BEFORE M4 implementation starts**
+**Status:** ✅ DECISION DRAFTED — awaiting sign-off (2026-07-19)
 
 # Item 91 — M4 event-source decision: slim WAL vs before-images
 
@@ -47,3 +47,13 @@ replay path. The decision is cheap today, expensive later.
   `docs/design/engine_design.md` and this file updated to match.
 - If Option A: M4 spec explicitly states event records are the replay source
   and slim DML records are non-goals for decoding.
+
+## Decision (2026-07-19)
+
+**Selected: Option A — Executor capture is the source of truth.**
+
+See `PROGRESS.md` "Item 91" for full rationale and sign-off record.
+
+If Option A: M4 spec explicitly states event records (written by `send_event_capture`
+into the WAL as `RecordKind::Event` rows) are the replay source, and slim DML records
+(WAL_XMAX_BATCH, WAL_HOT_XPAGE_BATCH) are non-goals for external decoding.

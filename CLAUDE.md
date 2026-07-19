@@ -166,7 +166,7 @@ Current milestone is tracked in `MEMORY.md`. Each milestone is independently dem
 - **M1 — MVCC + CRUD.** Transactions, RC default / RR available (D10–D12), `on_read` seam, catalog, SQL subset. Fold in JSON columns and RLS here (they are a column-type + index-type and a planner rewrite, respectively — same machinery).
 - **M2 — Vector & Text search.** `VECTOR(n)` type, HNSW secondary index built **asynchronously** in a background worker (row write is the only synchronous cost), `NEAR` operator; full-text (inverted index) built alongside since both are over-fetch-then-filter secondary indexes.
 - **M3 — Graph.** Edge records `(from_id, to_id, edge_type, props)`, edge-list index by `from_id`, Cypher subset. Per-edge locking; batch-latch the adjacency scan on hot hubs.
-- **M4 — Event queue.** WAL-derived event stream, durable consumer offsets, replay. Resolve the slow-consumer-vs-vacuum durability contract here.
+- **M4 — Event queue.** WAL-derived event stream (via executor-capture event records in the WAL — see item 91 decision), durable consumer offsets, replay. Resolve the slow-consumer-vs-vacuum durability contract here.
 - **M5 — API / server.** Stabilize the embedded crate; optional server with REST + JWT auth + subscribe API + `/metrics`.
 
 ---
