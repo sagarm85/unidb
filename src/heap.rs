@@ -868,12 +868,31 @@ impl Heap {
         // one row per fill page because `acquire_page_for_insert` ensures the
         // first row of each batch fits, so the inner while can insert at least
         // one row before breaking.
+        //
+        // Item 87: statement-scoped fill-page cursor.  After committing a
+        // partially-full page, carry its remaining capacity forward so the next
+        // outer-loop iteration can re-latch the SAME page directly — skipping
+        // the FSM mutex lock + pages-vec scan.  Cursor holds no latch between
+        // mini-txns; the A→B phase order and per-row xmax checks are unchanged.
+        // `note_free_space` is still called so the FSM stays accurate for future
+        // statements; the cursor is purely a within-statement fast path.
+        let mut fill_cursor: Option<(PageId, usize)> = None; // (page_id, remaining_free)
         let mut result = Vec::with_capacity(rows.len());
         let mut i = 0;
         while i < rows.len() {
             let (_, first_data) = &rows[i];
             let needed = crate::page::SLOT_SIZE + crate::page::TUPLE_HEADER_SIZE + first_data.len();
-            let (fill_pid, _ng, mut fill_page) = self.acquire_page_for_insert(needed, pool, wal)?;
+
+            // Fast path: skip FSM if cursor page has enough room for the first row.
+            let (fill_pid, _ng, mut fill_page) =
+                if fill_cursor.is_some_and(|(_, free)| free >= needed) {
+                    let pid = fill_cursor.unwrap().0;
+                    let ng = pool.latch_exclusive(pid);
+                    let page = pool.fetch_page_for_write(pid, wal)?;
+                    (pid, ng, page)
+                } else {
+                    self.acquire_page_for_insert(needed, pool, wal)?
+                };
 
             let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
             let mut prev_lsn = pool
@@ -907,8 +926,11 @@ impl Heap {
             pool.write_page(&fill_page)?;
             let free = fill_page.free_space();
             pool.unpin(fill_pid);
+            // Update FSM for durability across statements; cursor is a local fast path.
             self.note_free_space(fill_pid, free);
             wal.commit_mini_txn(txn_id, last_lsn)?;
+            // Carry remaining capacity forward so next iteration can skip FSM.
+            fill_cursor = Some((fill_pid, free));
         }
 
         Ok(result)
@@ -1065,12 +1087,28 @@ impl Heap {
         // Phase A has committed xmax stamps so any WriteConflict is already
         // behind us. Phase B can only fail on I/O, which is also true of
         // update_many's Phase B — a pre-existing gap documented in both paths.
+        //
+        // Item 87: statement-scoped fill-page cursor (same as update_many Phase B).
+        // Carry remaining capacity forward to skip FSM mutex on the next fill page
+        // when the previous one still has room. No latch is held between mini-txns;
+        // the cursor is a local within-statement fast path only.
+        let mut fill_cursor: Option<(PageId, usize)> = None; // (page_id, remaining_free)
         let mut b_pairs: Vec<(RowId, RowId)> = Vec::with_capacity(rows.len());
         let mut i = 0;
         while i < rows.len() {
             let (_, first_data) = &rows[i];
             let needed = crate::page::SLOT_SIZE + crate::page::TUPLE_HEADER_SIZE + first_data.len();
-            let (fill_pid, _ng, mut fill_page) = self.acquire_page_for_insert(needed, pool, wal)?;
+
+            // Fast path: if cursor page still has room for the first row, skip FSM.
+            let (fill_pid, _ng, mut fill_page) =
+                if fill_cursor.is_some_and(|(_, free)| free >= needed) {
+                    let pid = fill_cursor.unwrap().0;
+                    let ng = pool.latch_exclusive(pid);
+                    let page = pool.fetch_page_for_write(pid, wal)?;
+                    (pid, ng, page)
+                } else {
+                    self.acquire_page_for_insert(needed, pool, wal)?
+                };
 
             let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
             let prev_lsn = pool
@@ -1107,9 +1145,12 @@ impl Heap {
             pool.write_page(&fill_page)?;
             let free = fill_page.free_space();
             pool.unpin(fill_pid);
-            // _ng dropped here — fill-page latch released before old-page re-latch
+            // _ng dropped here — fill-page latch released before old-page re-latch.
+            // note_free_space keeps FSM accurate for future statements.
             self.note_free_space(fill_pid, free);
             wal.commit_mini_txn(txn_id, last_lsn)?;
+            // Carry remaining capacity forward; skip FSM on next iteration if possible.
+            fill_cursor = Some((fill_pid, free));
         }
 
         // ── Phase C: HOT_NEXT_XPAGE forward pointer on old pages ────────────
