@@ -717,17 +717,16 @@ impl Heap {
         xid: Xid,
         pool: &BufferPool,
         wal: &Wal,
-        lock_mgr: &LockManager,
+        _lock_mgr: &LockManager,
     ) -> Result<Vec<RowId>> {
         if row_ids.is_empty() {
             return Ok(Vec::new());
         }
-        // Acquire all write locks in one mutex pass (item 56 Step 3 batching).
-        let record_ids: Vec<RecordId> = row_ids
-            .iter()
-            .map(|r| RecordId::row(r.page_id, r.slot))
-            .collect();
-        lock_mgr.try_acquire_write_many(&record_ids, xid)?;
+        // Item 88: lock-table elision for bulk DML.
+        // The xmax != 0 conflict check under the page latch (below) provides
+        // first-writer-wins without the O(N) lock-table scan.  UniqueKey /
+        // FkKey phantom locks (blocking, deadlock-detected) are unaffected —
+        // they live in the executor layer and never reach delete_many.
 
         let mut deleted = Vec::with_capacity(row_ids.len());
         let mut i = 0;
@@ -804,7 +803,7 @@ impl Heap {
         xid: Xid,
         pool: &BufferPool,
         wal: &Wal,
-        lock_mgr: &LockManager,
+        _lock_mgr: &LockManager,
     ) -> Result<Vec<(RowId, RowId)>> {
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -812,15 +811,12 @@ impl Heap {
 
         // Phase A: stamp xmax on all old versions, one mini-txn per page group.
         //
+        // Item 88: lock-table elision — xmax conflict check under the page latch
+        // is the sole conflict gate (first-writer-wins, NoWait semantics).
+        //
         // Guaranteed progress: `i` advances by at least one page group per
         // outer-loop iteration (`j > i` always because partition_point
         // matches at least `rows[i]` itself).
-        let record_ids: Vec<RecordId> = rows
-            .iter()
-            .map(|(r, _)| RecordId::row(r.page_id, r.slot))
-            .collect();
-        lock_mgr.try_acquire_write_many(&record_ids, xid)?;
-
         let mut i = 0;
         while i < rows.len() {
             let page_id = rows[i].0.page_id;
@@ -868,12 +864,31 @@ impl Heap {
         // one row per fill page because `acquire_page_for_insert` ensures the
         // first row of each batch fits, so the inner while can insert at least
         // one row before breaking.
+        //
+        // Item 87: statement-scoped fill-page cursor.  After committing a
+        // partially-full page, carry its remaining capacity forward so the next
+        // outer-loop iteration can re-latch the SAME page directly — skipping
+        // the FSM mutex lock + pages-vec scan.  Cursor holds no latch between
+        // mini-txns; the A→B phase order and per-row xmax checks are unchanged.
+        // `note_free_space` is still called so the FSM stays accurate for future
+        // statements; the cursor is purely a within-statement fast path.
+        let mut fill_cursor: Option<(PageId, usize)> = None; // (page_id, remaining_free)
         let mut result = Vec::with_capacity(rows.len());
         let mut i = 0;
         while i < rows.len() {
             let (_, first_data) = &rows[i];
             let needed = crate::page::SLOT_SIZE + crate::page::TUPLE_HEADER_SIZE + first_data.len();
-            let (fill_pid, _ng, mut fill_page) = self.acquire_page_for_insert(needed, pool, wal)?;
+
+            // Fast path: skip FSM if cursor page has enough room for the first row.
+            let (fill_pid, _ng, mut fill_page) =
+                if fill_cursor.is_some_and(|(_, free)| free >= needed) {
+                    let pid = fill_cursor.unwrap().0;
+                    let ng = pool.latch_exclusive(pid);
+                    let page = pool.fetch_page_for_write(pid, wal)?;
+                    (pid, ng, page)
+                } else {
+                    self.acquire_page_for_insert(needed, pool, wal)?
+                };
 
             let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
             let mut prev_lsn = pool
@@ -907,8 +922,11 @@ impl Heap {
             pool.write_page(&fill_page)?;
             let free = fill_page.free_space();
             pool.unpin(fill_pid);
+            // Update FSM for durability across statements; cursor is a local fast path.
             self.note_free_space(fill_pid, free);
             wal.commit_mini_txn(txn_id, last_lsn)?;
+            // Carry remaining capacity forward so next iteration can skip FSM.
+            fill_cursor = Some((fill_pid, free));
         }
 
         Ok(result)
@@ -970,18 +988,14 @@ impl Heap {
         xid: Xid,
         pool: &BufferPool,
         wal: &Wal,
-        lock_mgr: &LockManager,
+        _lock_mgr: &LockManager,
     ) -> Result<Vec<(RowId, RowId, PageId, u16)>> {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Acquire all write locks in one mutex pass before touching any page.
-        let record_ids: Vec<RecordId> = rows
-            .iter()
-            .map(|(r, _)| RecordId::row(r.page_id, r.slot))
-            .collect();
-        lock_mgr.try_acquire_write_many(&record_ids, xid)?;
+        // Item 88: lock-table elision for bulk HOT UPDATE — xmax conflict check
+        // under the Phase A page latch is the sole conflict gate.
 
         // ── Phase A: xmax stamp on old pages ────────────────────────────────
         //
@@ -1065,12 +1079,28 @@ impl Heap {
         // Phase A has committed xmax stamps so any WriteConflict is already
         // behind us. Phase B can only fail on I/O, which is also true of
         // update_many's Phase B — a pre-existing gap documented in both paths.
+        //
+        // Item 87: statement-scoped fill-page cursor (same as update_many Phase B).
+        // Carry remaining capacity forward to skip FSM mutex on the next fill page
+        // when the previous one still has room. No latch is held between mini-txns;
+        // the cursor is a local within-statement fast path only.
+        let mut fill_cursor: Option<(PageId, usize)> = None; // (page_id, remaining_free)
         let mut b_pairs: Vec<(RowId, RowId)> = Vec::with_capacity(rows.len());
         let mut i = 0;
         while i < rows.len() {
             let (_, first_data) = &rows[i];
             let needed = crate::page::SLOT_SIZE + crate::page::TUPLE_HEADER_SIZE + first_data.len();
-            let (fill_pid, _ng, mut fill_page) = self.acquire_page_for_insert(needed, pool, wal)?;
+
+            // Fast path: if cursor page still has room for the first row, skip FSM.
+            let (fill_pid, _ng, mut fill_page) =
+                if fill_cursor.is_some_and(|(_, free)| free >= needed) {
+                    let pid = fill_cursor.unwrap().0;
+                    let ng = pool.latch_exclusive(pid);
+                    let page = pool.fetch_page_for_write(pid, wal)?;
+                    (pid, ng, page)
+                } else {
+                    self.acquire_page_for_insert(needed, pool, wal)?
+                };
 
             let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
             let prev_lsn = pool
@@ -1107,9 +1137,12 @@ impl Heap {
             pool.write_page(&fill_page)?;
             let free = fill_page.free_space();
             pool.unpin(fill_pid);
-            // _ng dropped here — fill-page latch released before old-page re-latch
+            // _ng dropped here — fill-page latch released before old-page re-latch.
+            // note_free_space keeps FSM accurate for future statements.
             self.note_free_space(fill_pid, free);
             wal.commit_mini_txn(txn_id, last_lsn)?;
+            // Carry remaining capacity forward; skip FSM on next iteration if possible.
+            fill_cursor = Some((fill_pid, free));
         }
 
         // ── Phase C: HOT_NEXT_XPAGE forward pointer on old pages ────────────
@@ -1209,6 +1242,44 @@ impl Heap {
         pool.write_page(&page)?;
         pool.unpin(page_id);
         wal.commit_mini_txn(txn_id, lsn)?;
+        Ok(())
+    }
+
+    /// Item 88: undo a batched xmax stamp — clears xmax on all `slots` of
+    /// `page_id` in one mini-txn (matching the WAL_XMAX_BATCH redo granularity).
+    /// Called by `TransactionManager::abort` for `UndoAction::XmaxStampBatch`.
+    pub fn undo_xmax_stamp_batch(
+        &self,
+        page_id: PageId,
+        slots: &[u16],
+        pool: &BufferPool,
+        wal: &Wal,
+    ) -> Result<()> {
+        debug_assert!(!slots.is_empty());
+        let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
+        let _wg = pool.latch_exclusive(page_id);
+        let mut page = pool.fetch_page_for_write(page_id, wal)?;
+        let prev_lsn = pool
+            .maybe_log_fpi(page_id, wal, txn_id, begin_lsn)?
+            .unwrap_or(begin_lsn);
+        let mut last_lsn = prev_lsn;
+        for &slot in slots {
+            let old_xmax = page.tuple_header(slot)?.xmax;
+            let lsn = wal.log_update(
+                txn_id,
+                last_lsn,
+                page_id,
+                slot,
+                &u64_to_le(0),
+                &u64_to_le(old_xmax),
+            )?;
+            page.set_xmax(slot, 0)?;
+            last_lsn = lsn;
+        }
+        page.set_lsn(last_lsn);
+        pool.write_page(&page)?;
+        pool.unpin(page_id);
+        wal.commit_mini_txn(txn_id, last_lsn)?;
         Ok(())
     }
 

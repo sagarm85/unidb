@@ -1,5 +1,5 @@
 **Type:** Performance
-**Status:** ⏳ NOT STARTED
+**Status:** ✅ SHIPPED — verified pre-existing via perf/v3-20260719; no code change needed
 
 # Item 90 — Batched B-tree maintenance for non-HOT UPDATE
 

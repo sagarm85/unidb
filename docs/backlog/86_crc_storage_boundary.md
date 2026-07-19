@@ -1,5 +1,5 @@
 **Type:** Performance
-**Status:** ⏳ NOT STARTED (prototype measured 2026-07-19)
+**Status:** ✅ SHIPPED — perf/v3-20260719
 
 # Item 86 — CRC at the storage boundary
 

@@ -37,8 +37,9 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Mutex, MutexGuard,
+        Arc, Condvar, Mutex, MutexGuard,
     },
+    thread,
     time::Instant,
 };
 
@@ -228,6 +229,133 @@ fn create_segment(dir: &Path, idx: u64, base_lsn: Lsn) -> Result<BufWriter<File>
     Ok(BufWriter::new(file))
 }
 
+// ── Background segment sealer (item 89) ─────────────────────────────────────
+//
+// On rotation the active segment is fully written but fsync-ing it inline
+// blocks the append mutex for a (rare) full F_FULLFSYNC cost. The sealer moves
+// that fsync off the append path:
+//
+//   1. Rotation: flush BufWriter, try_clone the FD, hand `(clone, sealed_lsn)`
+//      to the sealer, open segment N+1, return immediately.
+//   2. Sealer thread: wakes on condvar, calls sync_all on the cloned FD,
+//      then updates `done_lsn` and broadcasts.
+//   3. sync_up_to / sync: after handling the active segment as before, if the
+//      requested LSN is covered by a segment currently being sealed by the
+//      background thread, wait on the condvar until sealer signals done.
+//
+// The sealer processes at most one segment at a time (rotation is rare — one
+// per 16 MiB of WAL); it is a simple Option<work_item> + Condvar, no queue.
+// A poisoned WAL propagates into the sealer: if sync_all fails the sealer
+// stores the error and the next `seal_done_or_wait` call re-raises it.
+
+struct SealerState {
+    /// The segment to be fsynced: (cloned FD, last LSN in that segment).
+    pending: Option<(File, Lsn)>,
+    /// The highest LSN confirmed durable by the background fsync.
+    done_lsn: Lsn,
+    /// The sealer thread should exit when this is true and pending is None.
+    shutdown: bool,
+    /// If the sealer's sync_all failed, the error message is stored here
+    /// so the next waiter can propagate it.
+    error: Option<String>,
+}
+
+struct Sealer {
+    state: Arc<(Mutex<SealerState>, Condvar)>,
+    _thread: thread::JoinHandle<()>,
+}
+
+impl Sealer {
+    /// Start the background sealer thread. Returns both the `Sealer` (owns the
+    /// thread handle) and a shared `Arc` of the sealer state that can be stored
+    /// in `WalInner` so free functions can call `submit` without a `Wal` reference.
+    fn start() -> (Self, Arc<(Mutex<SealerState>, Condvar)>) {
+        let state: Arc<(Mutex<SealerState>, Condvar)> = Arc::new((
+            Mutex::new(SealerState {
+                pending: None,
+                done_lsn: INVALID_LSN,
+                shutdown: false,
+                error: None,
+            }),
+            Condvar::new(),
+        ));
+        let state_clone = Arc::clone(&state);
+        let handle = thread::Builder::new()
+            .name("unidb-wal-sealer".into())
+            .spawn(move || {
+                let (mtx, cv) = &*state_clone;
+                loop {
+                    let work = {
+                        let mut st = mtx.lock().unwrap_or_else(|e| e.into_inner());
+                        loop {
+                            if let Some(item) = st.pending.take() {
+                                break Some(item);
+                            }
+                            if st.shutdown {
+                                break None;
+                            }
+                            st = cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                        }
+                    };
+                    match work {
+                        None => break, // shutdown and no more pending work
+                        Some((file, sealed_lsn)) => {
+                            let result = file.sync_all();
+                            let mut st = mtx.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Err(e) = result {
+                                st.error =
+                                    Some(format!("WAL background sealer sync_all failed: {e}"));
+                            } else if st.done_lsn < sealed_lsn {
+                                st.done_lsn = sealed_lsn;
+                            }
+                            cv.notify_all();
+                        }
+                    }
+                }
+            })
+            .expect("failed to spawn WAL sealer thread");
+        let state_for_inner = Arc::clone(&state);
+        (
+            Self {
+                state,
+                _thread: handle,
+            },
+            state_for_inner,
+        )
+    }
+
+    /// Wait until all segments with LSN ≤ `target` are fsynced by the sealer.
+    /// Returns `Ok(())` if already durable or the sealer confirms durability.
+    /// Returns `Err` if the sealer's sync_all failed.
+    fn wait_until_durable(&self, target: Lsn) -> Result<()> {
+        let (mtx, cv) = &*self.state;
+        let mut st = mtx.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(ref msg) = st.error {
+                return Err(DbError::DurabilityFailure(msg.clone()));
+            }
+            if st.done_lsn >= target {
+                return Ok(());
+            }
+            // If there's no pending work and done_lsn < target, the sealer hasn't
+            // been asked to seal anything covering `target`. This means `target`
+            // is in the active (not-yet-rotated) segment — caller handles that.
+            if st.pending.is_none() {
+                return Ok(()); // not a sealer-covered segment
+            }
+            st = cv.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Signal the sealer thread to exit and wait for it to drain.
+    fn shutdown(&self) {
+        let (mtx, cv) = &*self.state;
+        let mut st = mtx.lock().unwrap_or_else(|e| e.into_inner());
+        st.shutdown = true;
+        cv.notify_all();
+    }
+}
+
 /// The mutable WAL state guarded by one mutex (P5.b). LSN allocation and the
 /// physical append both happen while this is held, so concurrent appenders
 /// never interleave a partial record or hand out a duplicate/out-of-order LSN.
@@ -271,6 +399,12 @@ struct WalInner {
     poisoned: bool,
     /// Test/fault-injection hook (P1.b): the next `fsync` fails and poisons.
     fsync_fault_armed: bool,
+    /// Shared state of the background segment sealer (item 89). Stored inside
+    /// WalInner so the free functions (rotate_segment, etc.) can submit segments
+    /// without needing a reference to the Wal struct. The background thread holds
+    /// its own Arc clone; the Wal struct holds the Sealer (which contains the
+    /// JoinHandle) for lifecycle management.
+    sealer_state: Arc<(Mutex<SealerState>, Condvar)>,
 }
 
 pub struct Wal {
@@ -294,6 +428,11 @@ pub struct Wal {
     /// exposes the group-commit amortization ratio.
     fsyncs: AtomicU64,
     fsync_latency: AtomicHistogram,
+    /// Background segment sealer (item 89): moves the rotation fsync off the
+    /// append-mutex critical path. On rotation we flush + try_clone the current
+    /// segment FD, hand it to the sealer, and open N+1 immediately — the
+    /// append lock is released before sync_all runs.
+    sealer: Sealer,
 }
 
 impl Wal {
@@ -345,6 +484,7 @@ impl Wal {
         };
 
         tracing::info!(dir = %dir.display(), next_lsn, active_seg, segment_size, "WAL opened");
+        let (sealer, sealer_state_for_inner) = Sealer::start();
         Ok(Self {
             inner: Mutex::new(WalInner {
                 writer,
@@ -361,10 +501,12 @@ impl Wal {
                 deferred_sync: false,
                 poisoned: false,
                 fsync_fault_armed: false,
+                sealer_state: sealer_state_for_inner,
             }),
             flush_lock: Mutex::new(()),
             fsyncs: AtomicU64::new(0),
             fsync_latency: AtomicHistogram::new(),
+            sealer,
         })
     }
 
@@ -958,7 +1100,18 @@ impl Wal {
     /// durable frontier. In group-commit mode the caller invokes this once per
     /// drained batch, amortizing one fsync across every transaction that
     /// committed in that batch — the P5.b/M9 win.
+    ///
+    /// Item 89: also drain the background sealer before returning — any sealed
+    /// segment that was handed off during rotation must be confirmed durable.
     pub fn sync(&self) -> Result<()> {
+        // Wait for background sealer to complete any in-progress fsync first.
+        // `wait_until_durable(INVALID_LSN)` is a no-op if the sealer has no
+        // pending work; otherwise waits for the current segment to finish.
+        // We use next_lsn - 1 to mean "everything appended so far".
+        let drain_target = self.lock().next_lsn.saturating_sub(1);
+        if drain_target > 0 {
+            self.sealer.wait_until_durable(drain_target)?;
+        }
         let start = Instant::now();
         let mut inner = self.lock();
         fsync_locked(&mut inner)?;
@@ -980,11 +1133,25 @@ impl Wal {
     /// lock. Only the thread that finds itself still behind actually fsyncs, via
     /// [`Wal::group_fsync`], whose one fsync covers every commit that landed
     /// before it — including the followers now blocked on `flush_lock`.
+    ///
+    /// Item 89: after the active-segment fsync, also wait for the background
+    /// sealer to finish any sealed (rotated-away) segment whose LSN range covers
+    /// `target`. In the common case (no rotation) `wait_until_durable` returns
+    /// immediately (no pending work, no-op).
     pub fn sync_up_to(&self, target: Lsn) -> Result<()> {
         if self.durable_lsn() >= target {
+            // Also check sealer coverage — if the sealer has confirmed durability
+            // for `target` via done_lsn, the fast path above already passes.
             return Ok(());
         }
         let _leader = self.flush_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if self.durable_lsn() >= target {
+            return Ok(());
+        }
+        // If the target is in a segment that the sealer is currently fsyncing,
+        // wait for that to complete before fsyncing the active segment.
+        self.sealer.wait_until_durable(target)?;
+        // Re-check: sealer may have made it durable.
         if self.durable_lsn() >= target {
             return Ok(());
         }
@@ -1079,6 +1246,13 @@ impl Wal {
     /// few pre-`keep_from_lsn` records), which is harmless: recovery filters by
     /// `lsn >= checkpoint_lsn` anyway, and the retained records are idempotent.
     pub fn truncate_before(&self, keep_from_lsn: Lsn) -> Result<()> {
+        // Item 89: drain the background sealer before truncating — a segment
+        // being sealed by the background thread must not be removed while its
+        // fsync is in-flight.
+        let drain_target = self.lock().next_lsn.saturating_sub(1);
+        if drain_target > 0 {
+            self.sealer.wait_until_durable(drain_target)?;
+        }
         let mut inner = self.lock();
         inner.writer.flush()?;
         let dir = inner.dir.clone();
@@ -1183,6 +1357,13 @@ impl Wal {
         }
         fsync_locked(&mut inner)?;
         Ok(())
+    }
+}
+
+impl Drop for Wal {
+    /// Signal the background sealer thread to exit cleanly on WAL close.
+    fn drop(&mut self) {
+        self.sealer.shutdown();
     }
 }
 
@@ -1318,44 +1499,60 @@ fn write_framed_locked(inner: &mut WalInner, encoded: &[u8], base_lsn: Lsn) -> R
     Ok(())
 }
 
-/// Seal the active segment (flush + fsync so its records are durable) and open a
-/// fresh segment whose first record will carry `new_base_lsn`. Called from the
-/// append path when the active segment is full. Sealing fsyncs unconditionally
-/// (rotation is rare — one fsync per `segment_size` of log) so a sealed segment
-/// is always durable before the WAL moves on, even in group-commit deferred
-/// mode; the durable frontier advances to the sealed segment's last record.
+/// Seal the active segment and rotate to a fresh one. The fsync of the sealed
+/// segment is handed to the background [`Sealer`] thread (item 89) so the
+/// append mutex is released before the slow sync_all runs. The durable frontier
+/// is NOT advanced here — it advances when the sealer confirms durability via
+/// `wait_until_durable`, or when `sync_up_to` / `sync` fsyncs the active segment.
 fn rotate_segment(inner: &mut WalInner, new_base_lsn: Lsn) -> Result<()> {
     if inner.poisoned {
         return Err(DbError::DurabilityFailure(
             "WAL is poisoned by an earlier fsync failure; session is unrecoverable".into(),
         ));
     }
+    // Flush the BufWriter to push all records into the OS page cache.
     if let Err(e) = inner.writer.flush() {
         inner.poisoned = true;
         return Err(DbError::DurabilityFailure(format!(
             "WAL segment seal flush failed: {e}"
         )));
     }
-    if let Err(e) = inner.writer.get_ref().sync_all() {
-        inner.poisoned = true;
-        return Err(DbError::DurabilityFailure(format!(
-            "WAL segment seal fsync failed: {e}"
-        )));
-    }
-    // Everything written so far (up to the last appended record) is now durable.
+    // Clone the FD so the sealer thread can sync_all it independently.
+    let sealed_file = match inner.writer.get_ref().try_clone() {
+        Ok(f) => f,
+        Err(e) => {
+            inner.poisoned = true;
+            return Err(DbError::DurabilityFailure(format!(
+                "WAL segment FD clone for background seal failed: {e}"
+            )));
+        }
+    };
     let sealed_last = inner.next_lsn - 1;
-    if inner.durable_lsn < sealed_last {
-        inner.durable_lsn = sealed_last;
-    }
+    // Open the next segment BEFORE handing the sealed one to the sealer, so
+    // we continue appending immediately after this function returns.
     let next_idx = inner.active_seg + 1;
     inner.writer = create_segment(&inner.dir, next_idx, new_base_lsn)?;
     inner.active_seg = next_idx;
     inner.active_base_lsn = new_base_lsn;
     inner.active_bytes = SEG_HDR;
+    // Submit the sealed segment FD to the background thread for fsync (item 89).
+    // The append mutex will be released as soon as this function returns and
+    // write_framed_locked resumes — the sealer's sync_all runs concurrently.
+    // Wait if a prior segment is still being sealed (rare with 16 MiB segments).
+    {
+        let (mtx, cv) = &*inner.sealer_state;
+        let mut st = mtx.lock().unwrap_or_else(|e| e.into_inner());
+        while st.pending.is_some() {
+            st = cv.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+        st.pending = Some((sealed_file, sealed_last));
+        cv.notify_all();
+    }
     tracing::info!(
         segment = next_idx,
         base_lsn = new_base_lsn,
-        "WAL rotated to new segment"
+        sealed_lsn = sealed_last,
+        "WAL rotated to new segment (background seal submitted)"
     );
     Ok(())
 }

@@ -157,6 +157,50 @@ fn update_many_batch_abort_reverses_all_stamps() {
     );
 }
 
+// ── test 2b: item-88 delete_many abort reverts XmaxStampBatch ────────────────
+//
+// Verifies that the UndoAction::XmaxStampBatch path (item 88) correctly
+// restores all rows when a DELETE user transaction is aborted.
+
+#[test]
+fn delete_many_batch_abort_reverts_all_xmax_stamps() {
+    let n = 200i64;
+    let dir = tempdir().unwrap();
+    let e = open(dir.path());
+
+    let xid = e.begin().unwrap();
+    e.execute_sql(xid, "CREATE TABLE t (id INT, k INT)")
+        .unwrap();
+    e.commit(xid).unwrap();
+
+    for chunk in (0..n).collect::<Vec<_>>().chunks(50) {
+        let vals = chunk
+            .iter()
+            .map(|&i| format!("({i},{i})"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let xid = e.begin().unwrap();
+        e.execute_sql(xid, &format!("INSERT INTO t (id,k) VALUES {vals}"))
+            .unwrap();
+        e.commit(xid).unwrap();
+    }
+
+    // Begin user txn, run DELETE all (batch path with XmaxStampBatch undo), then ABORT.
+    let xid = e.begin().unwrap();
+    e.execute_sql(xid, "DELETE FROM t WHERE id >= 0").unwrap();
+    e.abort(xid).unwrap();
+
+    // All rows must still be visible after the aborted DELETE.
+    let xid = e.begin().unwrap();
+    let total = count_all(&e, xid, "t");
+    e.commit(xid).unwrap();
+
+    assert_eq!(
+        total, n,
+        "abort of batch DELETE must restore all {n} rows via XmaxStampBatch undo"
+    );
+}
+
 // ── test 3: UNIQUE table stays on per-row path and enforces constraints ───────
 
 #[test]
