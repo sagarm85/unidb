@@ -1548,6 +1548,27 @@ fn mm_ladder_point(rung: u8, size: u64, sample: u64) -> f64 {
         }
     }
     engine.commit(x).unwrap();
+    // Item 55 bench fix: normalise the WAL file size before the measurement
+    // phase so F_FULLFSYNC cost is O(small WAL), not O(pre-grow WAL).
+    //
+    // Root cause: at size=1000 the pre-grow runs as a single batch (< 2000-row
+    // threshold) so auto-checkpoint never fires; the WAL accumulates ~10-20 MB
+    // of bulk-insert records.  Each measurement commit then calls F_FULLFSYNC
+    // (macOS APFS) on that large file, costing ~1 ms regardless of how little
+    // new data was written.  At size=10000 five 2000-row commits exceed the
+    // 64 MiB WAL threshold mid-pre-grow, auto-checkpoint fires and truncates
+    // the WAL to near-zero before measurement starts — so those commits pay
+    // only ~10 µs per F_FULLFSYNC.  The resulting Δevent gap (1.29 ms at 1k
+    // vs 0.12 ms at 10k) is a bench-structure artefact, not a real engine
+    // difference: in a production workload each per-INSERT commit fsyncs only
+    // its own ~14 KB WAL tail, so the cost is size-independent (~156 µs for
+    // the CPU work inside send_event_capture).
+    //
+    // Fix: checkpoint after every pre-grow phase.  checkpoint() flushes dirty
+    // pages, writes a checkpoint record, and truncates the WAL to near-zero,
+    // making F_FULLFSYNC cost identical across all table sizes.
+    engine.sync_wal().unwrap();
+    engine.checkpoint().unwrap();
     // Measure marginal per-commit cost at this size.
     let start = Instant::now();
     for j in 0..sample {
