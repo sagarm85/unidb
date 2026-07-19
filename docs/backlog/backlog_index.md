@@ -90,11 +90,22 @@
 | 71 | `71_cross_page_hot.md` | Performance | ✅ SHIPPED 2026-07-18 — cross-page HOT chains; `HOT_NEXT_XPAGE=0xFFFE`; `WAL_HOT_XPAGE_HEAD` type 17; FORMAT_VERSION 8→9; B-tree not updated on full-page UPDATE; P_xhot_a + P_xhot_b crash tests; 50/50 crash + 431 unit PASS. See PROGRESS.md "Item 71". |
 | 72 | `72_hnsw_query_latency.md` | Performance | ⏳ NOT STARTED — in-memory L0 neighbour-list cache to collapse HNSW query latency from 25 ms → ≤5 ms at 10k vectors (ffsdb gap: 223×); lazy per-query warm-up; generation-based invalidation on insert; 256 MiB gate. |
 | 73 | `73_hnsw_vector_hot_cache.md` | Performance | ⏳ NOT STARTED (placeholder) — process-lifetime vector hot cache (node_id → Vec<f32>) eliminating ~100 KB random reads per NEAR query; follow-up to item 72. |
-| 74 | `74_hot_update_batch.md` | Performance | 🔄 IN PROGRESS — batch mini-txn for HOT UPDATE; `Heap::hot_update_many` Phase B+A; reduces 150k mutex/Vec/CRC32 passes to ~2k for 50k rows; P74 crash test; 4 perf_item74 tests; Docker bench pending. |
+| 74 | `74_hot_update_batch.md` | Performance | ✅ SHIPPED 2026-07-18 — `Heap::hot_update_many` Phase B+A; 150k→~2k mutex passes; P74 crash test. See PROGRESS.md "Item 74". |
+| 75 | _(no backlog file — shipped directly on branch)_ | Performance | ✅ SHIPPED 2026-07-19 (PR #150) — bitmap batch B-tree scan + RowId-only DELETE fast path (items 75a+b). |
+| 76 | _(no backlog file — shipped directly on branch)_ | Performance | ✅ SHIPPED 2026-07-19 (PR #150) — parallel UPDATE scan (`rayon`). |
+| 77 | _(no backlog file — shipped directly on branch)_ | Performance | ✅ SHIPPED 2026-07-19 (PR #150) — Frame LSN cache: eliminates redundant LSN reads per buffer pool frame. |
+| 78 | _(no backlog file — shipped directly on branch)_ | Performance | ✅ SHIPPED 2026-07-19 (PR #150) — O(1) pool grow: eviction no longer scans all frames. |
+| 79 | _(no backlog file — shipped directly on branch)_ | Performance | ✅ SHIPPED 2026-07-19 (PR #150) — WAL_UPDATE_BATCH slice record for HOT UPDATE. |
+| 80 | _(no backlog file — shipped directly on branch)_ | Performance | ✅ SHIPPED 2026-07-19 (PR #150) — WAL_XMAX_BATCH slice record; mutex passes 150k→789 for 50k rows. |
+| 81 | _(no backlog file — shipped directly on branch)_ | Performance | ✅ SHIPPED 2026-07-19 (PR #150) — 512 MiB auto-checkpoint gate; prevents FPI re-log on second pass. |
+| 82 | _(no backlog file — shipped directly on branch)_ | Performance | ✅ SHIPPED 2026-07-19 (PR #150) — skip FPI for blank alloc pages in Phase B. |
+| 83 | _(no backlog file — shipped directly on branch)_ | Performance | ✅ SHIPPED 2026-07-19 (PR #150) — batch non-HOT UPDATE via `update_many()` when no unique/FK. |
+| 84 | _(no backlog file — shipped directly on branch)_ | Performance | ✅ SHIPPED 2026-07-19 (PR #150) — bulk merge-split in `insert_batch_in_txn`; proactive overflow check + O(N+M) merge. |
+| 85 | `85_concurrency_hang_cross_row_churn.md` | Improvement | ⏳ NOT STARTED — cross-row-churn HANG (toggle=on, no-index, 8w×8rows, 1/3 at 120s deadline); from PR #150 concurrency matrix 2026-07-19. |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `75_…`.**
+**Next new file → `86_…`.**
 
 ## Next up — priority order (2026-07-16, calibrated on `052432` Docker baseline)
 
