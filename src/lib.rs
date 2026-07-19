@@ -2124,6 +2124,7 @@ impl Engine {
                 hnsw_vec_caches: Some(&self.hnsw_vec_caches),
                 authz: Some(&self.authz),
                 current_user: current_user.clone(),
+                hnsw_tx: self.hnsw_worker_tx.lock().unwrap().clone(),
             };
             executor::execute(plan, &mut ctx)
         } else {
@@ -2144,6 +2145,7 @@ impl Engine {
                 hnsw_vec_caches: Some(&self.hnsw_vec_caches),
                 authz: Some(&self.authz),
                 current_user,
+                hnsw_tx: self.hnsw_worker_tx.lock().unwrap().clone(),
             };
             executor::execute(plan, &mut ctx)
         }
