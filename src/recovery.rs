@@ -344,8 +344,7 @@ pub fn recover(
         // it was already handled in the loop above (we deleted the slot directly
         // instead of self-stamping, which is equivalent). No separate entry here.
         for r in relevant.iter().filter(|r| {
-            (r.rec_type == WAL_INSERT && r.slot != u16::MAX
-                || r.rec_type == WAL_INSERT_BATCH)
+            (r.rec_type == WAL_INSERT && r.slot != u16::MAX || r.rec_type == WAL_INSERT_BATCH)
                 && committed.contains(&r.mini_txn_id)
         }) {
             if r.rec_type == WAL_INSERT {
@@ -456,8 +455,7 @@ fn redo_record(r: &WalRecord, pool: &BufferPool, page_size: usize) -> Result<()>
                     }
                 };
                 if existing_lsn < r.lsn {
-                    let mut blank =
-                        SlottedPage::new(r.page_id, PAGE_TYPE_HEAP, page_size);
+                    let mut blank = SlottedPage::new(r.page_id, PAGE_TYPE_HEAP, page_size);
                     blank.set_lsn(r.lsn);
                     pool.write_page(&blank)?;
                 }
