@@ -39,7 +39,11 @@ impl Snapshot {
     }
 
     /// Was `xid` committed as of this snapshot's point in time?
-    fn is_committed_at_snapshot(&self, xid: Xid) -> bool {
+    ///
+    /// `pub(crate)` so `heap::is_visible_hinted` (item 68) can call it directly
+    /// from the hint-bit fast path without going through the full `is_visible`
+    /// wrapper.
+    pub(crate) fn is_committed_at_snapshot(&self, xid: Xid) -> bool {
         if xid == 0 {
             return false; // INVALID_XID — never a real committed transaction
         }

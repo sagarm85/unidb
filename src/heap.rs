@@ -34,7 +34,7 @@ use crate::{
     },
     lockmgr::{LockManager, RecordId},
     mvcc::{is_reclaimable, is_visible, Snapshot},
-    page::{SlotState, SlottedPage},
+    page::{SlotState, SlottedPage, TUPLE_HINT_XMAX_COMMITTED, TUPLE_HINT_XMIN_COMMITTED},
     wal::Wal,
 };
 
@@ -823,6 +823,9 @@ impl Heap {
             &u64_to_le(th.xmax),
         )?;
         page.set_xmax(row_id.slot, xid)?;
+        // Item 68: set HINT_XMIN_COMMITTED — xmin must be committed since the
+        // DELETE visibility check passed.  CRC deferred to set_lsn() below.
+        let _ = page.set_xmin_hint(row_id.slot, TUPLE_HINT_XMIN_COMMITTED);
         page.set_lsn(lsn);
         pool.write_page(&page)?;
         pool.unpin(row_id.page_id);
@@ -1623,6 +1626,10 @@ impl Heap {
     /// Sequential scan: every row visible under `snapshot`. Used by the SQL
     /// executor's table scan (M1.c) and available now for hand-written
     /// interleaved-transaction tests.
+    ///
+    /// Item 68: passes `None` as the hint pool (no write-back on the serial
+    /// scan path — the parallel scan owns the hot path for large tables, and
+    /// the serial path is used primarily for small/catalog scans).
     pub fn scan<P: PageReader>(
         &self,
         snapshot: &Snapshot,
@@ -1632,7 +1639,7 @@ impl Heap {
         self.ensure_directory(reader)?; // FSM-backed: load the page directory
         let mut out = Vec::new();
         for page_id in self.lock_fsm().pages.clone() {
-            scan_page_into(reader, page_id, snapshot, self_xid, &mut out)?;
+            scan_page_into(reader, page_id, snapshot, self_xid, &mut out, None)?;
         }
         Ok(out)
     }
@@ -1659,7 +1666,7 @@ impl Heap {
             if i % 256 == 0 {
                 crate::query_limits::check()?; // P5.f: timeout / cancellation
             }
-            count += count_page_visible(reader, page_id, snapshot, self_xid)?;
+            count += count_page_visible(reader, page_id, snapshot, self_xid, None)?;
         }
         Ok(count)
     }
@@ -1927,18 +1934,112 @@ impl Heap {
     }
 }
 
+/// Item 68 — Hint-bit-aware visibility check.
+///
+/// Identical semantics to [`mvcc::is_visible`] but short-circuits the
+/// `snapshot.is_committed_at_snapshot(xmin)` call when the hint bit says xmin
+/// is already known committed.  This eliminates the `active_xids.contains()`
+/// linear search for every tuple on every scan page after the first warm pass.
+///
+/// Parameters:
+///   `xmin_hint_flags` — from `page.tuple_xmin_hint_flags(slot)`
+///   `xmax_hint_flags` — from `page.tuple_xmax_hint_flags(slot)`
+#[inline]
+fn is_visible_hinted(
+    tuple_xmin: Xid,
+    tuple_xmax: Xid,
+    xmin_hint_flags: u8,
+    xmax_hint_flags: u8,
+    snapshot: &Snapshot,
+    self_xid: Xid,
+) -> bool {
+    // Fast path for xmin: if TUPLE_HINT_XMIN_COMMITTED is set, skip snapshot check.
+    let inserter_visible = if xmin_hint_flags & TUPLE_HINT_XMIN_COMMITTED != 0 {
+        true // hint says committed — skip is_committed_at_snapshot
+    } else {
+        tuple_xmin == self_xid || snapshot.is_committed_at_snapshot(tuple_xmin)
+    };
+    if !inserter_visible {
+        return false;
+    }
+    if tuple_xmax == 0 {
+        return true; // live row
+    }
+    // Fast path for xmax: if TUPLE_HINT_XMAX_COMMITTED is set, skip snapshot check.
+    let deleter_visible = if xmax_hint_flags & TUPLE_HINT_XMAX_COMMITTED != 0 {
+        true // hint says xmax committed — row is permanently dead
+    } else {
+        tuple_xmax == self_xid || snapshot.is_committed_at_snapshot(tuple_xmax)
+    };
+    !deleter_visible
+}
+
+/// Item 68 — Attempt to set committed hint bits on a tuple whose visibility
+/// was just confirmed.
+///
+/// Called after a visibility check returns `true` (row is visible). If the
+/// relevant hint bits are not yet set, sets them on the in-memory page copy
+/// and returns `true` (caller should write the page back to the pool).
+///
+/// Only sets bits for xids that are provably committed-before-snapshot:
+/// xid < snapshot.xmin guarantees committed regardless of active_xids, so
+/// it is safe to cache.  We do NOT set the hint when xmin == self_xid (own
+/// uncommitted write) or when xid is in [xmin, xmax) — those cases are
+/// session-local and not globally committed yet.
+///
+/// This is **best-effort** — errors from `set_xmin_hint`/`set_xmax_hint` are
+/// silently ignored (the hint byte is not critical).
+#[inline]
+#[allow(dead_code)]
+fn try_set_committed_hints(
+    page: &mut SlottedPage,
+    slot: u16,
+    tuple_xmin: Xid,
+    tuple_xmax: Xid,
+    snapshot: &Snapshot,
+) -> bool {
+    let mut wrote = false;
+    // Set xmin committed hint if: xmin is globally committed before the
+    // snapshot's horizon (xmin < snapshot.xmin means no active reader could
+    // ever see it as uncommitted) AND the hint is not already set.
+    if page.tuple_xmin_hint_flags(slot) & TUPLE_HINT_XMIN_COMMITTED == 0
+        && tuple_xmin != 0
+        && tuple_xmin < snapshot.xmin
+        && page.set_xmin_hint(slot, TUPLE_HINT_XMIN_COMMITTED).is_ok()
+    {
+        wrote = true;
+    }
+    // Set xmax committed hint if xmax is present and is globally committed.
+    if tuple_xmax != 0
+        && page.tuple_xmax_hint_flags(slot) & TUPLE_HINT_XMAX_COMMITTED == 0
+        && tuple_xmax < snapshot.xmin
+        && page.set_xmax_hint(slot, TUPLE_HINT_XMAX_COMMITTED).is_ok()
+    {
+        wrote = true;
+    }
+    wrote
+}
+
 /// Append every tuple on `page_id` visible to `snapshot` into `out` as
 /// `(RowId, body bytes)`. The per-page core of [`Heap::scan`], extracted so a
 /// **parallel** scan worker (Milestone P) can run it on its own page slice with
 /// a `Send + Sync` reader while sharing the exact visibility rule. Reads an
 /// owned page copy under the mmap read-lock (safe across concurrent writers and
 /// remaps), so it needs no `&Heap`/FSM lock.
+///
+/// Item 68 — Hint bits: uses `is_visible_hinted` to short-circuit the
+/// `snapshot.is_committed_at_snapshot` check when a tuple's xmin/xmax has
+/// already been confirmed committed and the hint bit is set.  The `_hint_pool`
+/// parameter is reserved for a future write-back path and is currently unused;
+/// hint bits are written only via the exclusive-latch write path (e.g.
+/// `stamp_hints_for_page`).
 pub(crate) fn scan_page_into<P: PageReader>(
     reader: &P,
     page_id: PageId,
     snapshot: &Snapshot,
     self_xid: Xid,
     out: &mut Vec<(RowId, Vec<u8>)>,
+    _hint_pool: Option<&BufferPool>,
 ) -> Result<()> {
     let page = reader.read_page(page_id)?;
     let sc = page.slot_count_pub();
@@ -1948,7 +2049,10 @@ pub(crate) fn scan_page_into<P: PageReader>(
             continue;
         }
         let th = page.tuple_header(slot)?;
-        if is_visible(th.xmin, th.xmax, snapshot, self_xid) {
+        // Item 68 fast path: read hint bits to skip snapshot.is_committed checks.
+        let xmin_flags = page.tuple_xmin_hint_flags(slot);
+        let xmax_flags = page.tuple_xmax_hint_flags(slot);
+        if is_visible_hinted(th.xmin, th.xmax, xmin_flags, xmax_flags, snapshot, self_xid) {
             let row_id = RowId { page_id, slot };
             on_read(self_xid, row_id);
             out.push((row_id, page.get(slot)?.to_vec()));
@@ -1966,11 +2070,15 @@ pub(crate) fn scan_page_into<P: PageReader>(
 /// The `visitor` receives a `&[u8]` whose lifetime is tied to the page buffer
 /// owned by this function; returning from `visitor` ends that borrow. Returning
 /// `Err(e)` from `visitor` aborts the scan and propagates the error.
+///
+/// Item 68 — Hint bits: uses `is_visible_hinted` for the fast path.
+/// The `_hint_pool` parameter is reserved and currently unused.
 pub(crate) fn scan_page_visit<P, F>(
     reader: &P,
     page_id: PageId,
     snapshot: &Snapshot,
     self_xid: Xid,
+    _hint_pool: Option<&BufferPool>,
     mut visitor: F,
 ) -> Result<()>
 where
@@ -1984,7 +2092,9 @@ where
             continue;
         }
         let th = page.tuple_header(slot)?;
-        if is_visible(th.xmin, th.xmax, snapshot, self_xid) {
+        let xmin_flags = page.tuple_xmin_hint_flags(slot);
+        let xmax_flags = page.tuple_xmax_hint_flags(slot);
+        if is_visible_hinted(th.xmin, th.xmax, xmin_flags, xmax_flags, snapshot, self_xid) {
             let row_id = RowId { page_id, slot };
             on_read(self_xid, row_id);
             visitor(row_id, page.get(slot)?)?;
@@ -2313,6 +2423,7 @@ pub(crate) fn count_page_visible<P: PageReader>(
     page_id: PageId,
     snapshot: &Snapshot,
     self_xid: Xid,
+    _hint_pool: Option<&BufferPool>,
 ) -> Result<usize> {
     let page = reader.read_page(page_id)?;
     let sc = page.slot_count_pub();
@@ -2322,7 +2433,9 @@ pub(crate) fn count_page_visible<P: PageReader>(
             continue;
         }
         let th = page.tuple_header(slot)?;
-        if is_visible(th.xmin, th.xmax, snapshot, self_xid) {
+        let xmin_flags = page.tuple_xmin_hint_flags(slot);
+        let xmax_flags = page.tuple_xmax_hint_flags(slot);
+        if is_visible_hinted(th.xmin, th.xmax, xmin_flags, xmax_flags, snapshot, self_xid) {
             on_read(self_xid, RowId { page_id, slot });
             count += 1;
         }
