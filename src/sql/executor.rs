@@ -1196,7 +1196,8 @@ pub fn execute(plan: LogicalPlan, ctx: &mut ExecCtx) -> Result<ExecResult> {
             name,
             columns,
             constraints,
-        } => exec_create_table(name, columns, constraints, ctx),
+            fill_factor,
+        } => exec_create_table(name, columns, constraints, fill_factor, ctx),
         LogicalPlan::Insert {
             table,
             columns,
@@ -1336,6 +1337,7 @@ fn exec_create_table(
     name: String,
     columns: Vec<ColumnDef>,
     constraints: TableConstraints,
+    fill_factor: u8,
     ctx: &mut ExecCtx,
 ) -> Result<ExecResult> {
     // Identity/SERIAL columns (P2.d) must be Int64, and start their counter
@@ -1382,6 +1384,7 @@ fn exec_create_table(
         constraints,
         generation: 0,
         row_count: 0,
+        fill_factor,
     };
     let mut cctx = catalog_ctx!(ctx);
     ctx.catalog.exclusive()?.create_table(def, &mut cctx)?;
@@ -1622,7 +1625,10 @@ fn exec_insert(
     // FK (M11): only referenced-table existence is enforced, and it's a
     // schema-level property — check it once per statement, not per row.
     enforce_referenced_tables_exist(&table_def, ctx.catalog.get())?;
-    let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
+    // Item 69: apply the table's fill-factor reservation so INSERT stops
+    // packing a page once the HOT-reserved slack threshold is reached.
+    let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone())
+        .with_fill_factor(table_def.fill_factor);
 
     // Item 98: streaming-accumulation insert.
     //
@@ -5947,6 +5953,7 @@ mod tests {
             constraints: Default::default(),
             generation: 0,
             row_count: 0,
+            fill_factor: 100,
         };
         let err = coerce_and_validate_row(&table, vec![Literal::Vector(vec![0.1, 0.2, 0.3])]);
         assert!(matches!(err, Err(DbError::SqlPlan(_))));
@@ -7726,14 +7733,17 @@ mod tests {
             o => panic!("expected Inserted, got {o:?}"),
         }
         // Expected: 1 (alloc mini-txn for the new heap page) + 1 (accumulating
-        // mini-txn for all 100 rows on that page, each with its own WAL_INSERT
-        // but all sharing ONE WAL_BEGIN/WAL_COMMIT bracket) = 2.
-        // Old code before item 98 would have delta = 101 (1 alloc + 100 rows,
-        // each with its own WAL_BEGIN/WAL_COMMIT).
+        // Expected mini-txn budget after items 97 + 98:
+        //   1 — heap-page alloc (alloc_heap_page, its own bracket)
+        //   1 — accumulating INSERT for all 100 rows sharing ONE WAL_BEGIN/WAL_COMMIT
+        //   1 — catalog row_count update (item 97: TableDef.row_count persisted to the
+        //       catalog page after every INSERT statement)
+        // Total = 3.  Before item 98 the delta was 101 (1 alloc + 100 per-row brackets).
+        // Before item 97 the delta was 2 (no catalog update).
         let delta = after - before;
         assert!(
-            delta <= 2,
-            "item 98: 100-row INSERT on one page must use ≤ 2 mini-txns (alloc + accumulating), got {delta}"
+            delta <= 3,
+            "item 98+97: 100-row INSERT on one page must use ≤ 3 mini-txns (alloc + accumulating + row_count catalog), got {delta}"
         );
     }
 

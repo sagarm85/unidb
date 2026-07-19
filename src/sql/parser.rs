@@ -6,9 +6,10 @@
 // is the actual point of this milestone, not parser plumbing.
 
 use sqlparser::ast::{
-    self, AlterTableOperation, Array as SqlArray, BinaryOperator, DataType, ExactNumberInfo,
-    Expr as SqlExpr, FromTable, IndexType, JoinConstraint, JoinOperator, ObjectType, SelectItem,
-    SetExpr, Statement, TableFactor, TableObject, TableWithJoins, UnaryOperator, Value,
+    self, AlterTableOperation, Array as SqlArray, BinaryOperator, CreateTableOptions, DataType,
+    ExactNumberInfo, Expr as SqlExpr, FromTable, IndexType, JoinConstraint, JoinOperator,
+    ObjectType, SelectItem, SetExpr, SqlOption, Statement, TableFactor, TableObject,
+    TableWithJoins, UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser as SqlParser;
@@ -161,11 +162,51 @@ fn convert_create_table(ct: ast::CreateTable) -> Result<LogicalPlan> {
             c.constraints.not_null = true;
         }
     }
+    let fill_factor = parse_fill_factor(&ct.table_options)?;
     Ok(LogicalPlan::CreateTable {
         name,
         columns,
         constraints,
+        fill_factor,
     })
+}
+
+/// Parse `WITH (fill_factor = N)` from a `CREATE TABLE` statement's options.
+/// Returns the fill_factor (10–100) if present, or 100 (the default) if the
+/// clause is absent.  Returns an error if the value is out of range or not a
+/// plain integer.
+fn parse_fill_factor(opts: &CreateTableOptions) -> Result<u8> {
+    let options: &[SqlOption] = match opts {
+        CreateTableOptions::With(v) => v,
+        CreateTableOptions::Options(v) => v,
+        _ => return Ok(100),
+    };
+    for opt in options {
+        if let SqlOption::KeyValue { key, value } = opt {
+            if key.value.eq_ignore_ascii_case("fill_factor") {
+                let n: u64 = match value {
+                    SqlExpr::Value(ast::ValueWithSpan {
+                        value: Value::Number(s, _),
+                        ..
+                    }) => s.parse::<u64>().map_err(|_| {
+                        DbError::SqlPlan(format!("fill_factor must be an integer, got '{s}'"))
+                    })?,
+                    other => {
+                        return Err(DbError::SqlPlan(format!(
+                            "fill_factor must be an integer, got {other:?}"
+                        )));
+                    }
+                };
+                if !(10..=100).contains(&n) {
+                    return Err(DbError::SqlPlan(format!(
+                        "fill_factor must be between 10 and 100, got {n}"
+                    )));
+                }
+                return Ok(n as u8);
+            }
+        }
+    }
+    Ok(100)
 }
 
 /// Map one `sqlparser` `ColumnDef` — name, data type, and the per-column

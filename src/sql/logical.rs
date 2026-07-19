@@ -262,6 +262,8 @@ pub enum LogicalPlan {
         /// (cols)`, `FOREIGN KEY (...)`, table `CHECK`. Column-level
         /// constraints ride on each [`ColumnDef`] instead.
         constraints: TableConstraints,
+        /// Item 69: fill-factor reservation (10–100, default 100).
+        fill_factor: u8,
     },
     Insert {
         table: String,
@@ -434,6 +436,7 @@ mod tests {
             constraints: Default::default(),
             generation: 0,
             row_count: 0,
+            fill_factor: 100,
         });
         catalog
     }
@@ -555,6 +558,7 @@ mod tests {
             name: "t".to_string(),
             columns: vec![],
             constraints: Default::default(),
+            fill_factor: 100,
         };
         assert!(matches!(
             apply_rls(plan, &catalog),
