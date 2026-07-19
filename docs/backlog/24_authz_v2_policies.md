@@ -1,7 +1,13 @@
 # AuthZ v2 — SQL-native roles/grants, per-operation RLS policies, WITH CHECK
 
 **Type:** Milestone
-**Status:** NOT STARTED
+**Status:** PARTIAL — Z1+Z3(JWT)+Z5 shipped in `feat/item-24-authz-z1z3z5` (2026-07-19);
+Z2/Z4/Z6 remain; Z3(WITH CHECK) is partially covered by `insert_policy` row check.
+
+<!-- Shipped: commit 6ad38db on branch feat/item-24-authz-z1z3z5 -->
+<!-- Z1: CREATE/DROP ROLE/POLICY, GRANT/REVOKE — catalog-persisted, insert_policy + rls_policy routing -->
+<!-- Z3(JWT): POST /tables/{name}/bulk enforces INSERT grant, returns 403 -->
+<!-- Z5: unidb_catalog.roles / .grants / .policies virtual catalog relations -->
 
 > Deliberately LAST of the Supabase-track items (deep semantics; every earlier
 > item — catalog, logs, metrics — is the debugging surface for hardening this).
