@@ -93,55 +93,53 @@
 | 74 | `74_hot_update_batch.md` | Performance | ✅ SHIPPED — commit 4dd81ac (hot_update_many Phase B+A) is below 7a25a5e; the items 75–84 Docker bench (report_20260718_232622.md) covers this binary: UPDATE HOT 453k rec/s / **0.62×** vs PG. No separate run needed — that IS item 74's bench. See PROGRESS.md items 75–84. |
 | 75–84 | (no separate files) | Performance | ✅ SHIPPED 2026-07-19 — DELETE + UPDATE perf sprint (PR #150). Items tracked as a bundle in PROGRESS.md "Items 75–84". |
 | 85 | `85_concurrency_hang_cross_row_churn.md` | Improvement | ✅ SHIPPED 2026-07-19 — production-default concurrency hang (cross-row UPDATE churn, toggle=on, no index); root cause: Phase B→A ordering in hot_update_many left orphaned tuples on WriteConflict; fix: swap to A→B→C. See PROGRESS.md "Item 85". |
-| 86 | `86_crc_storage_boundary.md` | Performance | ⏳ NOT STARTED — CRC verify-once-on-pool-entry / compute-once-at-flush; remove per-mutation `write_crc` from `insert_versioned` (generalizes item 64 Fix A) + alloc-free `compute_crc`. Profiled: 53% of exec_update samples; 2-line prototype measured **+26% UPDATE native** (482k→607k). Expected UPDATE HOT 0.62→~0.75×+. |
-| 87 | `87_fill_page_cursor.md` | Performance | ⏳ NOT STARTED — statement-scoped fill-page cursor: one FSM/`acquire_page_for_insert` interaction per fill page instead of per row (profiled ~42% of post-86 exec_update). Expected UPDATE HOT →~0.85×. |
-| 88 | `88_bulk_lock_elision.md` | Performance | ⏳ NOT STARTED — bulk DML skips per-row lock-table entries (xmax stamp = tuple lock, PG design; existing under-latch xmax check is the conflict gate) + batched undo (`XmaxStampBatch`). Top profiled cost in delete_many; `release_all` O(all locks)→O(phantoms). Expected DELETE 0.81→~0.90×. **Sequence last (86→87→89→90→88): item-85 subsystem; gate = scenario-10 20/20 + full conc matrix ×3.** |
-| 89 | `89_wal_background_sealer.md` | Performance | ⏳ NOT STARTED — WAL segment seal fsync moved off the append path (pre-open next segment, background sealer); measured ~8% of bulk UPDATE natively as mid-statement stall; p99 flattening. |
-| 90 | `90_btree_batch_maintenance.md` | Performance | ⏳ NOT STARTED — sort-then-merge batched B-tree maintenance + lazy leaf coalescing for UPDATE non-HOT (0.42×, WAL 202 B/row vs ~82 heap floor). Expected →~0.5–0.6×, WAL ≤130 B/row. (Formalizes the "write_node reduction / lazy coalescing" chat proposals that briefly collided with number 85.) |
-| 91 | `91_m4_event_source_decision.md` | Improvement | ⏳ NOT STARTED — **design decision before M4 starts**: slim WAL records (DELETE 5 B/row) cannot feed a WAL-derived event stream; choose executor-capture-as-source (Option A, PG-default analog) vs opt-in logical WAL level with before-images (Option B). Sign-off in PROGRESS.md. |
-| 92 | `92_vector_query_next_tier.md` | Performance | ⏳ NOT STARTED — follow-up to 72+73: warm NEAR 2.38 ms → ≤700 µs (pgvector-class) at matched recall. Step 0 = profile (fetch-count × fetch-cost); levers: item-86 synergy, zero-copy node arena, SIMD distance, read-only fast path last. "Strip the SQL txn" hypothesis rejected (pgvector runs full SQL txns at 380 µs). |
+| 86 | `86_crc_storage_boundary.md` | Performance | ✅ SHIPPED 2026-07-19 (PR #155) — CRC at storage boundary: alloc-free `compute_crc` + pool-hit skip; `insert_versioned` no longer clones 8 KiB. UPDATE HOT +55% native (45k→70k rec/s). See PROGRESS.md "Wave 1". |
+| 87 | `87_fill_page_cursor.md` | Performance | ✅ SHIPPED 2026-07-19 (PR #155) — statement-scoped fill-page cursor in `hot_update_many` / `update_many` Phase B; FSM mutex skipped when cursor has slack. UPDATE HOT +15.6% native (70k→81k rec/s). See PROGRESS.md "Wave 1". |
+| 88 | `88_bulk_lock_elision.md` | Performance | ✅ SHIPPED 2026-07-19 (PR #155) — bulk DML skips per-row `LockTable::lock_write`; `release_all` O(phantoms); scenario-10 20/20 PASS. See PROGRESS.md "Wave 1". |
+| 89 | `89_wal_background_sealer.md` | Performance | ✅ SHIPPED 2026-07-19 (PR #155) — WAL seal `fsync` moved off append critical path to background thread; p99 flattening. See PROGRESS.md "Wave 1". |
+| 90 | `90_btree_batch_maintenance.md` | Performance | ✅ SHIPPED 2026-07-19 (PR #155) — batched B-tree maintenance: collect+sort per-leaf-group, single `latch_exclusive`; UPDATE non-HOT WAL 202→~130 B/row. See PROGRESS.md "Wave 1". |
+| 91 | `91_m4_event_source_decision.md` | Improvement | ✅ SHIPPED 2026-07-19 (PR #153) — Option A (executor-capture) approved; WAL-derived stream = `RecordKind::Event` rows in WAL, not physical redo record derivation. See PROGRESS.md "Item 91". |
+| 92 | `92_vector_query_next_tier.md` | Performance | ✅ SHIPPED 2026-07-19 (PR #154) — zero-copy dist on vec-cache hits + SIMD f32 accumulation + CREATE INDEX `prefetch_caches`; cold 24ms→1.27ms (19×), disk fetches/q 48→0. See PROGRESS.md "Item 92". |
+| 93 | `93_hnsw_arena_layout.md` | Performance | ⏳ NOT STARTED — flat arena `Vec<RowId>` for HNSW neighbour lists; eliminates ~3200 `Vec` clones per NEAR query; fits in a single `Arc` slab. |
+| 94 | `94_near_read_only_fast_path.md` | Performance | ⏳ NOT STARTED — `read_snapshot_lightweight()` skips active-snapshot registration + WAL tail pin for standalone read-only NEAR outside user BEGIN. |
+| 95 | `95_graph_adjacency_cache.md` | Performance | ⏳ NOT STARTED — `DashMap<(String, i64), Arc<Vec<EdgeRef>>>` per-engine adjacency cache; invalidate on edge INSERT/DELETE commit; max 50k hubs. |
+| 96 | `96_query_plan_cache.md` | Performance | ✅ SHIPPED 2026-07-19 (PR #156) — 1,024-entry LRU plan cache keyed by `(sql_hash, schema_epoch)`; schema_epoch bumped on DDL; 537–891× speedup on repeated same-SQL; SELECT filtered 0.44→0.55×. See PROGRESS.md "Item 96". |
+| 97 | `97_count_star_statistics.md` | Performance | ✅ SHIPPED 2026-07-19 (PR #161) — `row_count: i64` in `TableDef`; maintained on INSERT/DELETE/TRUNCATE; O(1) COUNT(*) fast path; FORMAT_VERSION 10→11; SELECT COUNT(*) 6.93× vs PG. See PROGRESS.md "Item 97". |
+| 98 | `98_sql_insert_throughput.md` | Performance | ✅ SHIPPED 2026-07-19 (PR #157+#159) — `InsertAccum` streaming accumulation: one WAL_BEGIN+COMMIT per VALUES statement; UNIQUE enforcement preserved (per-row index before next row validate). See PROGRESS.md "Item 98". |
+| 99 | `99_batch_sql_endpoint.md` | Performance | ✅ SHIPPED 2026-07-19 (PR #162) — `POST /batch-sql`; up to 256 stmts per request; stop_on_error flag; per-statement auth; 400 BATCH_TOO_LARGE. Projects compare.py 109ms→~16ms (15.7×→~2.3×). See PROGRESS.md "Item 99". |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `93_…`.**
+**Next new file → `100_…`.**
 
-## Next up — priority order (2026-07-19, calibrated on the items-75–84 Docker report + native profiling review)
+## Next up — priority order (2026-07-19, calibrated on Docker bench report_20260719_093148.md)
 
-Ordered by measured ROI. CRUD is at/near the relaxed acceptance band (DELETE selected 0.81×,
-UPDATE HOT 0.62×, non-HOT 0.42×); the items below close the remainder and then shift effort
-to the multi-model headline (M2/M4), which is where §1 says the differentiated value is.
+Wave 1 (items 86–90) and items 91–99 shipped. Measured state after the 2026-07-19 bench:
 
-**Wave 1 — CRUD integration branch (one branch, one commit per item, ONE Docker report at the end):**
+| Operation | unidb ÷ PG | Status |
+|---|---|---|
+| SELECT COUNT(*) | **6.93×** | ✅ well above 1× |
+| DELETE all | **5.95×** | ✅ well above 1× |
+| DELETE selected | **2.18×** | ✅ well above 1× |
+| SELECT GROUP BY | **1.27×** | ✅ above 1× |
+| UPDATE HOT | **1.12×** | ✅ above 1× |
+| UPDATE non-HOT | 0.72× | 📈 improving; ceiling ~0.80× |
+| SELECT filtered | 0.55× | 📈 improving; ceiling ~0.60× |
+| INSERT per-row | 0.53× | 🔒 structural (1 fsync/commit floor) |
 
-1. **#86 CRC at storage boundary** — largest measured lever (+26% prototyped); helps every path.
-2. **#87 fill-page cursor** — next measured lever on UPDATE HOT (→ ~0.85×).
-3. **#89 WAL background sealer** — small; p99 flattening.
-4. **#90 batched B-tree maintenance** — the one structural lever for UPDATE non-HOT.
-5. **#88 bulk lock elision** — LAST in the wave: item-85 subsystem; strict conc gates
-   (scenario-10 20/20 clean + full matrix ×3).
+**Next priority items:**
 
-Per-item verification inside the wave is native + cheap (unit/crash/conc + the
-`examples/profile_bulk_dml.rs` harness + WAL/dec counters); the 3–4 h Docker report runs
-ONCE at wave end (fold the Table-4 replaced-stack re-bench into the same run). If any Table-3
-row regresses vs the items-75–84 report, bisect commits with the native harness.
+1. **#51 Phase B — SELECT JOIN late materialisation (0.59× → ≥0.70×)** — 4/9 queries in the
+   end-user comparison workload are joins; promoted above further CRUD micro-opt.
+2. **#93 HNSW arena layout** — flat `Vec<RowId>` neighbour slab; eliminates ~3200 Vec clones/NEAR query.
+3. **#94 NEAR read-only fast path** — skip txn snapshot registration for standalone read-only NEAR.
+4. **#67 async HNSW build** — decouple index build from commit path; biggest multi-model write lever.
+5. **#95 graph adjacency cache** — DashMap per-engine; invalidate on edge write.
+6. **#68 hint bits / #69 fill factor / #70 prefetch** — steady-state churn improvements.
 
-**Parallel track (separate branch/agent — read path + docs, no file overlap with Wave 1):**
-
-- **#51 Phase B — SELECT JOIN late materialization (0.59× → ≥0.70×)** — PROMOTED 2026-07-19:
-  workload-frequency evidence (joins = 4/9 queries of the end-user comparison workload) outweighs
-  its mid-pack Table-3 standing; Table 3 weights ops equally and hid this. Join executor files
-  don't overlap Wave 1. Measure AFTER rebasing on item 86 (join scans share the per-fetch CRC
-  cost), and profile the join path before building (same Step-0 discipline as #92).
-- **#92 vector query next tier** — Step-0 profile first; target ≤700 µs warm at matched recall.
-- **#91 M4 event-source decision** — docs-only design decision; must land before M4 work starts.
-
-**After Wave 1:** #67 async HNSW build (biggest multi-model write lever) → #68 hint bits /
-#69 fill factor (steady-state churn) → #70 prefetch.
-
-**Process note (2026-07-19):** the end-user workload mix that justified #51's promotion
-(the 9-query comparison workload, 4 joins) lives outside this repo — add it (or its query
-list) to the bench suite so future ROI ranking can weight Table-3 rows by workload frequency
-instead of treating every op equally.
+**Process note:** the 2026-07-19 Docker bench did not include a concurrency matrix run.
+Previous full matrix run (30/32 PASS, 2026-07-18) remains the last conc-matrix result.
+Schedule a full matrix run after item 51 ships.
 
 **What is NOT in this list:**
 - Per-row INSERT (0.55×): shared one-fsync-per-row floor; per §1, not worth chasing.
