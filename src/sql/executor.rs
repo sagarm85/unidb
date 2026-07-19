@@ -729,6 +729,12 @@ pub struct ExecCtx<'a> {
     /// `unidb_catalog.grants`. `None` in unit tests that build bare `ExecCtx`
     /// structs and don't exercise the AuthZ catalog views.
     pub authz: Option<&'a crate::authz::RoleStore>,
+    /// Sender end of the HNSW background worker channel (item 67).
+    /// `Some` on a fully-opened Engine that has called `spawn_hnsw_worker`;
+    /// `None` in unit tests that build bare `ExecCtx` structs (those tests
+    /// don't exercise the async HNSW path and fall back to synchronous insert).
+    /// The executor clones this cheaply per INSERT statement.
+    pub hnsw_tx: Option<std::sync::mpsc::SyncSender<crate::hnsw_index::HnswMsg>>,
 }
 
 /// Insert `row`'s durable-index column values into their on-disk structures
@@ -798,8 +804,29 @@ fn apply_durable_index_writes(
                 }
                 Some(IndexKind::Hnsw) => {
                     if let Literal::Vector(v) = &row[idx] {
-                        DiskHnswIndex::open(meta_page, ctx.page_size)
-                            .insert(row_id, v, ctx.pool, ctx.wal)?;
+                        if let Some(ref tx) = ctx.hnsw_tx {
+                            // Async path (item 67): dispatch to background worker.
+                            // The beam-search + edge-update cost (~6–18 ms) is
+                            // removed from the INSERT commit critical path.
+                            // MVCC correctness: the heap row is already durable
+                            // before this dispatch; the index insert may arrive
+                            // slightly after commit, but NEAR re-checks MVCC
+                            // visibility on every candidate so a race between
+                            // index visibility and row visibility is safe.
+                            let _ = tx.send(crate::hnsw_index::HnswMsg::Work(
+                                crate::hnsw_index::HnswWorkItem {
+                                    meta_page,
+                                    page_size: ctx.page_size,
+                                    row_id,
+                                    vector: v.clone(),
+                                },
+                            ));
+                        } else {
+                            // Sync fallback: unit tests and bare Engine::open()
+                            // paths without a background worker.
+                            DiskHnswIndex::open(meta_page, ctx.page_size)
+                                .insert(row_id, v, ctx.pool, ctx.wal)?;
+                        }
                     }
                 }
                 _ => {}
@@ -5570,6 +5597,7 @@ mod tests {
                 hnsw_l0_caches: None,
                 hnsw_vec_caches: None,
                 authz: None,
+                hnsw_tx: None,
             };
             execute(plan, &mut ctx)
         }

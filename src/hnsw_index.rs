@@ -115,6 +115,30 @@ pub fn reset_query_counters() {
     Q_DISTANCE_CALLS.store(0, AtomicOrd::Relaxed);
 }
 
+// ── Async worker types (item 67) ─────────────────────────────────────────────
+
+/// A single HNSW insert job dispatched from the query path to the background
+/// worker (item 67).  The worker receives these via a bounded
+/// `SyncSender<HnswMsg>` and performs the beam-search + edge-update off the
+/// INSERT commit critical path.
+pub struct HnswWorkItem {
+    pub meta_page: crate::format::PageId,
+    pub page_size: usize,
+    pub row_id: crate::heap::RowId,
+    pub vector: Vec<f32>,
+}
+
+/// Message sent to the HNSW background worker (item 67).
+///
+/// - `Work` — insert a new vector into the index.
+/// - `Flush(ack)` — drain all pending `Work` items, then reply on `ack` so
+///   the caller can block-wait until the worker is caught up.  Used by
+///   `Engine::wait_hnsw_idle` in tests.
+pub enum HnswMsg {
+    Work(HnswWorkItem),
+    Flush(std::sync::mpsc::SyncSender<()>),
+}
+
 // ── Algorithm constants ──────────────────────────────────────────────────────
 
 /// Max neighbours per layer > 0.
