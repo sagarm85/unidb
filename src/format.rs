@@ -88,7 +88,13 @@ pub const MAGIC: u32 = 0x556E4442; // "UnDB"
 // leaving the cross-page chain broken after crash recovery (B-tree points to
 // xmax'd old slot with hot_next=XPAGE but no restored chain → row unfindable).
 // The version bump causes older builds to produce BadVersion. No migration path.
-pub const FORMAT_VERSION: u16 = 10;
+//
+// v10 → v11 (item 97): `TableDef` gains `row_count: i64` in the catalog JSON
+// blob. No WAL format change. `#[serde(default)]` means old blobs deserialise
+// with `row_count = 0` (safe — treated as stale, recalibrated on next DML).
+// The version bump rejects v10 opens so a stale `row_count` is never surfaced
+// as a correct exact count to a new binary.
+pub const FORMAT_VERSION: u16 = 11;
 
 /// Default page size: 8 KiB (D8). Baked into the control file at DB init.
 pub const DEFAULT_PAGE_SIZE: u32 = 8192;

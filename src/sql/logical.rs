@@ -433,6 +433,7 @@ mod tests {
             serial_next: Default::default(),
             constraints: Default::default(),
             generation: 0,
+            row_count: 0,
         });
         catalog
     }

@@ -1381,6 +1381,7 @@ fn exec_create_table(
         serial_next,
         constraints,
         generation: 0,
+        row_count: 0,
     };
     let mut cctx = catalog_ctx!(ctx);
     ctx.catalog.exclusive()?.create_table(def, &mut cctx)?;
@@ -1734,6 +1735,13 @@ fn exec_insert(
 
     persist_pages_if_changed(table, &heap, &table_def.pages, ctx)?;
     assert_schema_stable(ctx, table, table_def.generation);
+
+    // Item 97: defer row-count delta to user-txn commit so aborted txns
+    // never corrupt the catalog's exact count.
+    if count > 0 {
+        ctx.txn_mgr
+            .record_row_count_delta(ctx.xid, table, count as i64)?;
+    }
 
     // G5 (item 19): emit RETURNING result if requested.
     if let Some(ret_cols) = returning {
@@ -3232,6 +3240,11 @@ fn exec_delete(
         let count = deleted.len();
         persist_pages_if_changed(table, &heap, &table_def.pages, ctx)?;
         assert_schema_stable(ctx, table, table_def.generation);
+        // Item 97: defer row-count delta to commit.
+        if count > 0 {
+            ctx.txn_mgr
+                .record_row_count_delta(ctx.xid, table, -(count as i64))?;
+        }
         return Ok(ExecResult::Deleted { count });
     }
 
@@ -3347,6 +3360,11 @@ fn exec_delete(
 
     persist_pages_if_changed(table, &heap, &table_def.pages, ctx)?;
     assert_schema_stable(ctx, table, table_def.generation);
+    // Item 97: defer row-count delta to commit.
+    if count > 0 {
+        ctx.txn_mgr
+            .record_row_count_delta(ctx.xid, table, -(count as i64))?;
+    }
     // G5 (item 19): emit RETURNING result if requested.
     if let Some(ret_cols) = returning {
         let (col_names, rows) = project_returning(&table_def, ret_cols, returned_rows)?;
@@ -5563,7 +5581,32 @@ mod tests {
         }
 
         fn commit(&mut self, xid: Xid) {
+            // Item 97: mirror Engine::commit — drain deferred deltas first,
+            // then commit, then apply them to the in-memory catalog.
+            let deltas = self.txn_mgr.take_row_count_deltas(xid);
             self.txn_mgr.commit(xid, &self.wal, &self.lock_mgr).unwrap();
+            if !deltas.is_empty() {
+                let tables = self.catalog.tables_mut();
+                for (table, delta) in &deltas {
+                    if *delta == i64::MIN {
+                        if let Some(t) = tables.get_mut(table.as_str()) {
+                            t.row_count = 0;
+                        }
+                    } else if *delta != 0 {
+                        if let Some(t) = tables.get_mut(table.as_str()) {
+                            t.row_count = t.row_count.saturating_add(*delta);
+                        }
+                    }
+                }
+                let mut ctx = crate::catalog::CatalogCtx {
+                    pool: &self.pool,
+                    wal: &self.wal,
+                    control_path: &self.control_path,
+                    control: &self.control,
+                    page_size: self.page_size,
+                };
+                self.catalog.persist_only(&mut ctx).map(|_| ()).unwrap();
+            }
         }
 
         fn abort(&mut self, xid: Xid) {
@@ -5903,6 +5946,7 @@ mod tests {
             serial_next: Default::default(),
             constraints: Default::default(),
             generation: 0,
+            row_count: 0,
         };
         let err = coerce_and_validate_row(&table, vec![Literal::Vector(vec![0.1, 0.2, 0.3])]);
         assert!(matches!(err, Err(DbError::SqlPlan(_))));
@@ -7749,5 +7793,184 @@ mod tests {
             }
             o => panic!("expected Rows, got {o:?}"),
         }
+    }
+
+    // ── item 97: exact COUNT(*) via catalog row_count ────────────────────────
+
+    /// Returns the i64 result of `SELECT COUNT(*) FROM <table>`.
+    fn count_star(h: &mut Harness, table: &str) -> i64 {
+        let xid = h.begin();
+        let sql = format!("SELECT COUNT(*) FROM {table}");
+        let result = h.exec_as(xid, &sql).unwrap();
+        h.commit(xid);
+        match result {
+            ExecResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1, "COUNT(*) must return exactly one row");
+                match &rows[0][0] {
+                    crate::sql::logical::Literal::Int(n) => *n,
+                    other => panic!("COUNT(*) returned non-Int: {other:?}"),
+                }
+            }
+            other => panic!("COUNT(*) returned non-Rows: {other:?}"),
+        }
+    }
+
+    /// AC4: INSERT 1000 → COUNT=1000; DELETE 200 → COUNT=800.
+    #[test]
+    fn test_count_star_exact() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t97 (id INT)").unwrap();
+        h.commit(xid);
+
+        // Bulk INSERT 1000 rows in one transaction.
+        let xid = h.begin();
+        for i in 0..1000_i64 {
+            h.exec_as(xid, &format!("INSERT INTO t97 (id) VALUES ({i})"))
+                .unwrap();
+        }
+        h.commit(xid);
+
+        assert_eq!(count_star(&mut h, "t97"), 1000, "after 1000 INSERTs");
+
+        // DELETE 200 rows.
+        let xid = h.begin();
+        h.exec_as(xid, "DELETE FROM t97 WHERE id < 200").unwrap();
+        h.commit(xid);
+
+        assert_eq!(count_star(&mut h, "t97"), 800, "after 200 DELETEs");
+    }
+
+    /// AC5: INSERT 500 → TRUNCATE → COUNT=0.
+    #[test]
+    fn test_count_star_truncate() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t97t (id INT)").unwrap();
+        h.commit(xid);
+
+        let xid = h.begin();
+        for i in 0..500_i64 {
+            h.exec_as(xid, &format!("INSERT INTO t97t (id) VALUES ({i})"))
+                .unwrap();
+        }
+        h.commit(xid);
+
+        assert_eq!(count_star(&mut h, "t97t"), 500, "before TRUNCATE");
+
+        let xid = h.begin();
+        h.exec_as(xid, "DELETE FROM t97t").unwrap(); // unconditional → TRUNCATE fast path
+        h.commit(xid);
+
+        assert_eq!(count_star(&mut h, "t97t"), 0, "after TRUNCATE fast path");
+    }
+
+    /// AC7: `SELECT COUNT(*) WHERE …` must NOT use the fast path (must fall
+    /// through to `count_visible` / the filtered path).
+    #[test]
+    fn test_count_star_with_filter_still_scans() {
+        let dir = tempdir().unwrap();
+        let mut h = Harness::new(dir.path());
+
+        let xid = h.begin();
+        h.exec_as(xid, "CREATE TABLE t97f (x INT)").unwrap();
+        h.commit(xid);
+
+        let xid = h.begin();
+        for i in 0..10_i64 {
+            h.exec_as(xid, &format!("INSERT INTO t97f (x) VALUES ({i})"))
+                .unwrap();
+        }
+        h.commit(xid);
+
+        // row_count == 10 but only 3 rows satisfy x < 3.
+        let xid = h.begin();
+        let result = h
+            .exec_as(xid, "SELECT COUNT(*) FROM t97f WHERE x < 3")
+            .unwrap();
+        h.commit(xid);
+        let n = match result {
+            ExecResult::Rows { rows, .. } => match &rows[0][0] {
+                crate::sql::logical::Literal::Int(n) => *n,
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(n, 3, "filtered COUNT(*) must scan, not return row_count");
+    }
+
+    /// AC6: 4 concurrent inserters + reader loop; no panic; bounds correct.
+    #[test]
+    fn test_count_star_concurrent() {
+        use std::sync::Arc;
+        let dir = tempdir().unwrap();
+        // Use Engine (which handles concurrent catalog access correctly).
+        let engine = Arc::new(crate::Engine::open(dir.path(), 0).unwrap());
+
+        // Create table.
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t97c (id INT)")
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        const WRITERS: usize = 4;
+        const ROWS_PER_WRITER: usize = 100;
+
+        let mut handles = vec![];
+        for w in 0..WRITERS {
+            let eng = Arc::clone(&engine);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..ROWS_PER_WRITER {
+                    let id = (w * ROWS_PER_WRITER + i) as i64;
+                    let xid = eng.begin().unwrap();
+                    eng.execute_sql(xid, &format!("INSERT INTO t97c (id) VALUES ({id})"))
+                        .unwrap();
+                    eng.commit(xid).unwrap();
+                }
+            }));
+        }
+
+        // Reader loop while writers run — must not panic.
+        let eng_r = Arc::clone(&engine);
+        let reader = std::thread::spawn(move || {
+            for _ in 0..200 {
+                let xid = eng_r.begin().unwrap();
+                let _ = eng_r.execute_sql(xid, "SELECT COUNT(*) FROM t97c").unwrap();
+                eng_r.commit(xid).unwrap();
+            }
+        });
+
+        for h in handles {
+            h.join().unwrap();
+        }
+        reader.join().unwrap();
+
+        // Final count must be in [0, WRITERS*ROWS_PER_WRITER].
+        let total = (WRITERS * ROWS_PER_WRITER) as i64;
+        let xid = engine.begin().unwrap();
+        let rows = match engine
+            .execute_sql(xid, "SELECT COUNT(*) FROM t97c")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+        {
+            crate::sql::executor::ExecResult::Rows { rows, .. } => rows,
+            other => panic!("{other:?}"),
+        };
+        engine.commit(xid).unwrap();
+        let n = match &rows[0][0] {
+            crate::sql::logical::Literal::Int(n) => *n,
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            (0..=total).contains(&n),
+            "COUNT={n} must be in [0, {total}]"
+        );
     }
 }
