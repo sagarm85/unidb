@@ -414,6 +414,17 @@ impl Wal {
         self.lock().total_bytes_appended
     }
 
+    /// Number of mini-transactions opened so far (measurement / testing only).
+    /// Starts at 0 immediately after `open`; increments by 1 per
+    /// `begin_mini_txn` call.  Used by item-98 tests to assert that a multi-row
+    /// VALUES INSERT collapses to ≤ one mini-txn per heap page.
+    #[cfg(test)]
+    pub fn mini_txn_count(&self) -> u64 {
+        // `next_mini_txn` begins at 1 and is incremented before use, so the
+        // number of txns opened is `next_mini_txn - 1`.
+        self.lock().next_mini_txn.saturating_sub(1)
+    }
+
     /// Arm a one-shot fsync fault (P1.b fault injection). The next `fsync`
     /// fails and poisons the WAL, without writing the real file.
     pub fn arm_fsync_fault(&self) {

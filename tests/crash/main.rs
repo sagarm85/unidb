@@ -3746,3 +3746,133 @@ fn p74_batch_hot_update_crash_between_phase_b_and_a() {
         }
     }
 }
+
+// ── P98a: batch INSERT redo — committed WAL_INSERT_BATCH durable, page not flushed
+//
+// item 98 (D7 injection point a): all 100 rows in a single VALUES INSERT share
+// ONE WAL_INSERT_BATCH mini-txn (one begin/commit bracket).  After commit the
+// WAL is fsynced but the heap page is NOT explicitly flushed.  A crash at this
+// point simulates the page still in OS cache; recovery must redo the
+// WAL_INSERT_BATCH record so all 100 rows are visible on reopen.
+#[test]
+fn p98a_batch_insert_wal_durable_page_not_flushed() {
+    use unidb::sql::logical::Literal;
+    use unidb::SqlResult;
+
+    let n = 100i64;
+    let dir = tempdir().unwrap();
+
+    // Single session: CREATE TABLE + batch INSERT committed, no explicit flush,
+    // then drop (simulates crash with WAL durable but page in OS cache only).
+    {
+        let engine = open(dir.path());
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, k INT)")
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        let vals: String = (0..n)
+            .map(|i| format!("({i}, {i})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, &format!("INSERT INTO t (id, k) VALUES {vals}"))
+            .unwrap();
+        engine.commit(xid).unwrap();
+        // Drop without flush — WAL is synced; heap page may not be on disk.
+        drop(engine);
+    }
+
+    // Recovery must redo WAL_INSERT_BATCH so all n rows are visible.
+    let engine = open(dir.path());
+    let xid = engine.begin().unwrap();
+    let result = engine.execute_sql(xid, "SELECT COUNT(*) FROM t").unwrap();
+    engine.commit(xid).unwrap();
+    drop(engine);
+
+    match &result[0] {
+        SqlResult::Rows { rows, .. } => {
+            let count = match &rows[0][0] {
+                Literal::Int(c) => *c,
+                other => panic!("P98a: expected Int count, got {other:?}"),
+            };
+            assert_eq!(
+                count, n,
+                "P98a: WAL_INSERT_BATCH redo must restore all {n} committed rows on reopen"
+            );
+        }
+        other => panic!("P98a: expected Rows, got {other:?}"),
+    }
+}
+
+// ── P98b: batch INSERT M1 undo — incomplete user txn leaves 0 rows
+//
+// item 98 (D7 injection point b): the heap mini-txns inside a batch INSERT
+// each commit durably (WAL_INSERT_BATCH records on disk), but the enclosing
+// user transaction never reaches WAL_TXN_COMMIT.  Recovery's M1
+// incomplete-user-txn undo pass must treat the inserted rows as invisible —
+// either physically undo them or leave them with an xmin belonging to an
+// aborted xid — so COUNT(*) is 0 on reopen.
+//
+// This is the "crash mid-batch = all or nothing" atomicity assertion for item 98.
+#[test]
+fn p98b_batch_insert_incomplete_user_txn_leaves_no_rows() {
+    use unidb::sql::logical::Literal;
+    use unidb::SqlResult;
+
+    let n = 100i64;
+    let dir = tempdir().unwrap();
+
+    // Single session: INSERT (committed setup) then batch INSERT inside a user
+    // txn that is never committed.  Heap pages are flushed to disk so recovery
+    // must actually undo the inserted versions, not just skip replaying them.
+    {
+        let engine = open(dir.path());
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t (id INT, k INT)")
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        // Per-statement fsync so WAL_INSERT_BATCH mini-txns are durable.
+        engine.set_deferred_sync(false);
+
+        let vals: String = (0..n)
+            .map(|i| format!("({i}, {i})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, &format!("INSERT INTO t (id, k) VALUES {vals}"))
+            .unwrap();
+        // Flush heap pages to disk — worst case: rows physically on disk but
+        // user txn WAL_TXN_COMMIT is absent.
+        engine.flush().unwrap();
+        // "Crash" — user txn never committed.
+        drop(engine);
+    }
+
+    // Recovery: M1 undo pass identifies xmin of inserted rows as belonging to
+    // an incomplete user txn and must leave them invisible.
+    let engine = open(dir.path());
+    let xid = engine.begin().unwrap();
+    let result = engine.execute_sql(xid, "SELECT COUNT(*) FROM t").unwrap();
+    engine.commit(xid).unwrap();
+    drop(engine);
+
+    match &result[0] {
+        SqlResult::Rows { rows, .. } => {
+            let count = match &rows[0][0] {
+                Literal::Int(c) => *c,
+                other => panic!("P98b: expected Int count, got {other:?}"),
+            };
+            assert_eq!(
+                count, 0,
+                "P98b: batch INSERT inside incomplete user txn must leave 0 rows on reopen, got {count}"
+            );
+        }
+        other => panic!("P98b: expected Rows, got {other:?}"),
+    }
+}
