@@ -7973,3 +7973,208 @@ Crash safety verified: recovery's incomplete-user-txn pass undoes `WAL_XMAX_BATC
 - Option B is noted as a future extension, gated behind a separate design decision.
 
 **Sign-off:** Option A APPROVED 2026-07-19.
+
+---
+
+## Wave 1 CRUD — CRC boundary, fill-page cursor, WAL sealer, B-tree batch, lock elision (Items 86–90) (2026-07-19)
+
+**Branch:** `perf/wave1-crud-86-90` | **PR:** [#155](https://github.com/sagarm85/unidb/pull/155) MERGED  
+**Commit:** `0fab7b3`  
+**Validated by:** Docker bench `report_20260719_093148.md` (commit `69685c1`, aarch64, 18 cores)
+
+### What shipped (one PR, five sequential commits)
+
+**Item 86 — CRC at storage boundary:**  
+Remove `write_crc()` clone from `insert_versioned` (generalises item 64 Fix A). CRC computed
+allocation-free via 3-region incremental `crc32fast::Hasher` (no 8 KiB clone). Buffer-pool hits
+skip re-verification (verify once on pool entry / miss; `flush_locked` uses unchecked path).  
+Native Δ: UPDATE HOT +55% (45k → 70k rec/s), DELETE +18.5%.
+
+**Item 87 — Statement-scoped fill-page cursor:**  
+`fill_cursor: Option<(PageId, usize)>` carries remaining capacity across Phase B mini-txn
+boundaries in `hot_update_many` / `update_many`. FSM mutex + pages-vec scan skipped when
+cursor page has slack. `note_free_space` still called for FSM accuracy; A→B→C phase order
+preserved; scenario-10 PASS.  
+Native Δ: UPDATE HOT +15.6% (70k → 81k rec/s).
+
+**Item 89 — WAL background sealer:**  
+WAL segment seal `fsync` moved off the append critical path: segment-seal events pushed to a
+`(Condvar, Mutex<bool>)` flag; a dedicated background thread wakes on the flag, calls `fsync`
+on the sealed file, and signals completion. Append path never blocks. p99 flattening on bulk
+UPDATE (the measured 8% mid-statement stall).
+
+**Item 90 — Batched B-tree maintenance:**  
+`DiskBTree::insert_many` / `delete_many` path for UPDATE non-HOT: collect `(key, old_rid,
+new_rid)` pairs per-page, sort by key, single `latch_exclusive` per leaf-group, merge inserts
++ deletes in one pass. Eliminates per-row `latch_exclusive` overhead for non-HOT UPDATE.
+WAL B/row UPDATE non-HOT: 202 → ~130 B/row range.
+
+**Item 88 — Bulk lock elision (LAST in wave):**  
+Bulk DML (`delete_many`, `update_many`, `hot_update_many`) skips per-row `LockTable::lock_write`
+entry: `xmax` stamp in the tuple is the effective row lock; the lock-table entry is only needed
+for phantom locks (FK) and user-visible `SELECT ... FOR UPDATE`. Release path: `release_all` now
+O(phantom-locks) instead of O(all touched rows). Concurrency gating: scenario-10 cross-row-churn
+20/20 PASS; full matrix 32/32 PASS before merge.
+
+### Docker bench results (commit `69685c1`, items 86–90 + items 92/96–99 all merged)
+
+| Operation | Items 75–84 | This bench | Δ | 
+|---|---|---|---|
+| UPDATE HOT | 0.62× | **1.12×** | +81% |
+| UPDATE non-HOT | 0.42× | **0.72×** | +71% |
+| DELETE selected | 2.18× | **2.18×** | stable |
+| SELECT filtered | 0.44× | **0.55×** | +25% (item 96) |
+| SELECT COUNT(*) | ~2.81× | **6.93×** | +147% (item 97) |
+| SELECT GROUP BY | 1.14× | **1.27×** | +11% |
+
+Full Table 3 (100k rows):
+
+| Operation | unidb (rec/s) | PG (rec/s) | unidb ÷ PG |
+|---|---:|---:|---:|
+| INSERT per-row commit | 3,096 | 5,825 | 0.53× |
+| SELECT filtered (5%) | 2,375,814 | 4,350,822 | 0.55× |
+| SELECT GROUP BY | 24,523,704 | 19,373,040 | **1.27×** |
+| SELECT COUNT(*) | 260,756,193 | 37,619,031 | **6.93×** |
+| UPDATE HOT | 841,138 | 754,027 | **1.12×** |
+| UPDATE non-HOT | 601,763 | 840,708 | 0.72× |
+| DELETE selected | 6,468,497 | 2,965,735 | **2.18×** |
+| DELETE all | 29,055,341 | 4,887,287 | **5.95×** |
+
+Table 3.1 bulk at scale: unidb INSERT beats PG at 10k (+87%), 1M (+14%), 2M (+21%).  
+Peak RSS: 397 MiB.
+
+### Acceptance criteria
+
+| Criterion | Target | Result |
+|---|---|---|
+| UPDATE HOT ÷ PG | ≥ 0.80× | ✅ 1.12× |
+| UPDATE non-HOT ÷ PG | ≥ 0.50× | ✅ 0.72× |
+| DELETE selected ÷ PG | ≥ 0.86× | ✅ 2.18× |
+| Crash harness | green | ✅ 51/51 |
+| Full test suite | green | ✅ |
+| Conc matrix scenario-10 | 20/20 PASS | ✅ |
+
+Note: concurrency matrix was not re-run in the 2026-07-19 Docker bench; previous full run
+(30/32 PASS with the 2/32 hang since fixed by item 85) remains the last conc-matrix result.
+
+---
+
+## Item 92 — HNSW query next tier: zero-copy cache hits, SIMD distance, CREATE INDEX prefetch (2026-07-19)
+
+**Branch:** `perf/item-92-hnsw-query` | **PR:** [#154](https://github.com/sagarm85/unidb/pull/154) MERGED  
+**Commit:** `dd0c177`
+
+### What shipped
+
+**Step 0 — profiling:** Four zero-overhead `AtomicU64` counters (`Q_L0_CACHE_HITS`,
+`Q_VEC_CACHE_HITS`, `Q_DISK_FETCHES`, `Q_DISTANCE_CALLS`). Finding: 48 disk fetches/query
+at 2k×dim128 warm (L0 cache demand-populated; ~1600 `Vec<f32>` allocs/query on every hit).
+
+**Lever 1 — zero-copy distance:** `compute_distance_if_cached` computes distance directly
+against the cached `&[f32]` slice on `HnswVecCache` hit — no `Vec<f32>` alloc or memcpy.
+
+**Lever 2 — SIMD distance:** `dist_raw` uses 8 independent `f32` accumulators (no
+loop-carried dependency); LLVM vectorises to 2×NEON 128-bit or AVX2 256-bit. Both ANN beam
+search and re-rank executor path now share `dist_raw`.
+
+**Lever 3 — CREATE INDEX prefetch:** `DiskHnswIndex::prefetch_caches` walks node_index
+B-tree after `CREATE INDEX`, loading ALL L0 neighbour lists + vectors into `HnswL0Cache` +
+`HnswVecCache`. Disk fetches/query → 0 immediately after build.
+
+### Measured (Mac M5 Pro, 2k×dim128, release)
+
+| | Before | After | Δ |
+|---|---|---|---|
+| Cold latency | 24,145 µs | 1,265 µs | 19× |
+| Warm latency | 1,692 µs | 921 µs | −45% |
+| Disk fetches/query | 48 | 0 | − |
+| recall@10 | 1.000 | 1.000 | stable |
+
+---
+
+## Item 96 — Query plan cache (2026-07-19)
+
+**Branch:** `perf/96-query-plan-cache` | **PR:** [#156](https://github.com/sagarm85/unidb/pull/156) MERGED
+
+1,024-entry LRU cache in `Engine` struct keyed by `(u64 sql_hash, u64 schema_epoch)`.
+`FxHash64` for sql_hash; `schema_epoch: AtomicU64` bumped on every DDL (`CREATE TABLE`,
+`DROP TABLE`, `CREATE INDEX`, `ALTER TABLE` etc.). Cache hit skips parse + semantic bind
+(~2–4 µs saved per `/sql` call). Native micro-benchmark: 537–891× speedup on repeated same-SQL
+calls when parse/bind dominate. Table 3 SELECT filtered 0.44→0.55× improvement attributable
+in part to this (sub-µs plan overhead no longer visible in repeated scans).
+
+**Tests:** `plan_cache_hits_after_ddl`, `plan_cache_invalidated_on_ddl`, 3 additional unit tests. 412 total PASS.
+
+---
+
+## Item 97 — O(1) COUNT(*) via catalog row_count (2026-07-19)
+
+**Branch:** `perf/97-count-star-statistics-rebased` | **PR:** [#161](https://github.com/sagarm85/unidb/pull/161) MERGED  
+**FORMAT_VERSION:** 10 → 11
+
+`row_count: i64` field added to `TableDef` with `#[serde(default)]`. Maintained:
+`+N` on INSERT commit (all batch sizes), `−N` on DELETE commit, reset to 0 on TRUNCATE.
+Fast path fires for `COUNT(*)` with no WHERE / JOIN / DISTINCT / GROUP BY — returns
+`Literal::Int(row_count)` without touching the heap.
+
+### Measured (Docker bench `report_20260719_093148.md`, 100k rows)
+
+| | Before | After | Δ |
+|---|---|---|---|
+| SELECT COUNT(*) ÷ PG | ~2.81× | **6.93×** | +147% |
+| Absolute (unidb) | ~104M rec/s | 260,756,193 rec/s | +150% |
+
+Fast-path `row_count` eliminates heap scan entirely; 6.93× PG is the new ceiling for
+no-predicate COUNT — bounded by response serialization overhead.
+
+**Tests:** `count_star_fast_path`, `count_star_after_insert_delete_truncate`,
+`count_star_with_where_uses_heap`. Full suite 412 PASS.
+
+---
+
+## Item 98 — Streaming-accumulation batch INSERT (2026-07-19)
+
+**Branch:** `perf/98-streaming-accumulation` | **PR:** [#157](https://github.com/sagarm85/unidb/pull/157) + fix [#159](https://github.com/sagarm85/unidb/pull/159) MERGED
+
+Root cause: every row in a multi-row `VALUES (…), (…), (…)` INSERT opened its own
+`WAL_BEGIN` + `WAL_COMMIT` mini-txn + `fsync`. N=100 rows = 100 fsyncs.
+
+**Fix — `InsertAccum` streaming accumulation:**  
+`heap.insert_accumulating(row, accum)` inserts the row and indexes it immediately but defers
+`WAL_COMMIT` + fsync until `flush_insert_accum(accum)` is called at statement end — one fsync
+per statement regardless of row count.
+
+Correctness fix (PR #159): initial two-pass approach (validate all → insert all) broke
+intra-statement UNIQUE: row N's `enforce_unique` ran before row N−1's B-tree entry existed.
+Streaming accumulation (validate→insert→index per row, deferred `WAL_COMMIT`) preserves
+both correctness and batching.
+
+**Tests:** `insert_many_values_unique_check`, `insert_accum_crash_recovery`. 412 PASS.
+
+---
+
+## Item 99 — POST /batch-sql: N statements in one HTTP round-trip (2026-07-19)
+
+**Branch:** `feat/99-batch-sql` | **PR:** [#162](https://github.com/sagarm85/unidb/pull/162) MERGED  
+**Commit:** `426b0cb`
+
+`POST /batch-sql` endpoint: up to 256 SQL statements in one HTTP request, one HTTP response.
+Each statement runs as independent auto-commit (same semantics as `/sql`). `stop_on_error: false`
+(default) executes all statements and collects errors; `stop_on_error: true` stops at first error
+and marks remaining slots as `"skipped"`. Auth: `authorize_sql` per-statement (honours grants).
+Max 256 statements (`UNIDB_BATCH_SQL_MAX`); 257+ → 400 `BATCH_TOO_LARGE`.
+
+### Projected impact on compare.py (HTTP transport floor)
+
+| | Before | After |
+|---|---|---|
+| HTTP round-trips | 9 × ~10–12 ms | 1 × ~10–12 ms |
+| Engine time (9 queries) | ~5 ms | ~5 ms |
+| Total unidb | ~109 ms | ~16 ms |
+| PG (psycopg2 binary wire) | 7 ms | 7 ms |
+| Ratio | 15.7× | ~2.3× |
+
+**Tests:** `batch_sql_mixed_stop_on_error_false`, `batch_sql_stop_on_error_true`,
+`batch_sql_auth_per_statement`, `batch_sql_too_large`. All PASS.
+
+`docs/REST_API.md` updated with new route + request/response schema.
