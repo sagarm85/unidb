@@ -425,7 +425,7 @@ pub fn parallel_count(
                         break;
                     }
                 }
-                match count_page_visible(&reader, pages[i], &snapshot, self_xid) {
+                match count_page_visible(&reader, pages[i], &snapshot, self_xid, None) {
                     Ok(c) => {
                         total.fetch_add(c, Ordering::Relaxed);
                     }
@@ -580,7 +580,7 @@ where
                 }
                 page_buf.clear();
                 if let Err(e) =
-                    scan_page_into(&reader, pages[i], &snapshot, self_xid, &mut page_buf)
+                    scan_page_into(&reader, pages[i], &snapshot, self_xid, &mut page_buf, None)
                 {
                     *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
                     stop.store(true, Ordering::Relaxed);
@@ -671,7 +671,7 @@ where
                 }
                 page_buf.clear();
                 if let Err(e) =
-                    scan_page_into(&reader, pages[i], &snapshot, self_xid, &mut page_buf)
+                    scan_page_into(&reader, pages[i], &snapshot, self_xid, &mut page_buf, None)
                 {
                     *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
                     stop.store(true, Ordering::Relaxed);
@@ -765,17 +765,21 @@ where
                 }
                 // scan_page_visit provides &[u8] slices — no per-row Vec<u8>
                 // allocation.  We push only the RowId for matching rows.
-                let result =
-                    scan_page_visit(&reader, pages[i], &snapshot, self_xid, |rid, bytes| {
-                        match matches(bytes) {
-                            Ok(true) => {
-                                local.push(rid);
-                                Ok(())
-                            }
-                            Ok(false) => Ok(()),
-                            Err(e) => Err(e),
+                let result = scan_page_visit(
+                    &reader,
+                    pages[i],
+                    &snapshot,
+                    self_xid,
+                    None,
+                    |rid, bytes| match matches(bytes) {
+                        Ok(true) => {
+                            local.push(rid);
+                            Ok(())
                         }
-                    });
+                        Ok(false) => Ok(()),
+                        Err(e) => Err(e),
+                    },
+                );
                 if let Err(e) = result {
                     *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
                     stop.store(true, Ordering::Relaxed);
@@ -853,7 +857,7 @@ where
                 }
                 page_buf.clear();
                 if let Err(e) =
-                    scan_page_into(&reader, pages[i], &snapshot, self_xid, &mut page_buf)
+                    scan_page_into(&reader, pages[i], &snapshot, self_xid, &mut page_buf, None)
                 {
                     *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
                     stop.store(true, Ordering::Relaxed);
@@ -949,19 +953,22 @@ where
                         break 'outer;
                     }
                 }
-                if let Err(e) =
-                    scan_page_visit(&reader, pages[i], &snapshot, self_xid, |rid, bytes| {
-                        match per_row(rid, bytes) {
-                            Ok(Some(row)) => {
-                                rows.push(row);
-                                ids.push(rid);
-                                Ok(())
-                            }
-                            Ok(None) => Ok(()),
-                            Err(e) => Err(e),
+                if let Err(e) = scan_page_visit(
+                    &reader,
+                    pages[i],
+                    &snapshot,
+                    self_xid,
+                    None,
+                    |rid, bytes| match per_row(rid, bytes) {
+                        Ok(Some(row)) => {
+                            rows.push(row);
+                            ids.push(rid);
+                            Ok(())
                         }
-                    })
-                {
+                        Ok(None) => Ok(()),
+                        Err(e) => Err(e),
+                    },
+                ) {
                     *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
                     stop.store(true, Ordering::Relaxed);
                     break;
