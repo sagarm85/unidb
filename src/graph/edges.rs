@@ -79,6 +79,8 @@ pub fn edges_table_def() -> TableDef {
         fsm_meta: None,
         rls_policy: None,
         insert_policy: None,
+        update_policy: None,
+        delete_policy: None,
         policies: vec![],
         events_enabled: false,
         serial_next: Default::default(),

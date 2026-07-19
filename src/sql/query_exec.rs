@@ -259,12 +259,17 @@ impl Runner<'_, '_> {
                             // Honor cancellation/timeout even on the O(1) fast path.
                             crate::query_limits::check()?;
                             let table_def = self.ctx.catalog.lookup(table)?.clone();
-                            // Item 97: O(1) exact count from the catalog.
-                            let row = vec![Literal::Int(table_def.row_count); aggs.len()];
-                            return Ok(Batch {
-                                schema: output.clone(),
-                                rows: vec![row],
-                            });
+                            // Item 97 O(1) path: must NOT be taken for RLS-protected
+                            // tables — row_count is the physical count; RLS may hide a
+                            // subset of rows (item-24 Z2). Fall through to count_visible
+                            // which respects the visibility chain.
+                            if table_def.rls_policy.is_none() {
+                                let row = vec![Literal::Int(table_def.row_count); aggs.len()];
+                                return Ok(Batch {
+                                    schema: output.clone(),
+                                    rows: vec![row],
+                                });
+                            }
                         }
                     }
 

@@ -459,6 +459,10 @@ fn qualify_policy(policy: Expr, qualifier: &str) -> QExpr {
             Box::new(qualify_policy(*lhs, qualifier)),
             Box::new(qualify_policy(*rhs, qualifier)),
         ),
+        Expr::Or(lhs, rhs) => QExpr::Or(
+            Box::new(qualify_policy(*lhs, qualifier)),
+            Box::new(qualify_policy(*rhs, qualifier)),
+        ),
         Expr::Like {
             expr,
             pattern,

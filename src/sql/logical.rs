@@ -118,7 +118,10 @@ fn bind_literal(lit: &mut Literal, params: &[Literal]) -> Result<()> {
 fn bind_expr(expr: &mut Expr, params: &[Literal]) -> Result<()> {
     match expr {
         Expr::Literal(lit) => bind_literal(lit, params),
-        Expr::BinOp { lhs, rhs, .. } | Expr::And(lhs, rhs) | Expr::Arith { lhs, rhs, .. } => {
+        Expr::BinOp { lhs, rhs, .. }
+        | Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs)
+        | Expr::Arith { lhs, rhs, .. } => {
             bind_expr(lhs, params)?;
             bind_expr(rhs, params)
         }
@@ -204,6 +207,11 @@ pub enum Expr {
         rhs: Box<Expr>,
     },
     And(Box<Expr>, Box<Expr>),
+    /// Logical OR: `lhs OR rhs`. Used by RLS to combine multiple permissive
+    /// policies for the same operation (item-24 Z2: OR semantics). Not produced
+    /// by the SQL WHERE-clause parser (which is AND-only), only constructed at
+    /// policy-materialization time in `create_policy_inner`.
+    Or(Box<Expr>, Box<Expr>),
     /// `expr -> path`: extract a JSON value (stays JSON) at `path`.
     JsonExtract {
         expr: Box<Expr>,
@@ -348,7 +356,7 @@ pub fn substitute_current_user_in_expr(expr: &mut Expr, user: &str) {
             substitute_current_user_in_expr(lhs, user);
             substitute_current_user_in_expr(rhs, user);
         }
-        Expr::And(lhs, rhs) => {
+        Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) => {
             substitute_current_user_in_expr(lhs, user);
             substitute_current_user_in_expr(rhs, user);
         }
@@ -399,7 +407,9 @@ fn expr_has_current_user(expr: &Expr) -> bool {
         Expr::BinOp { lhs, rhs, .. } | Expr::Arith { lhs, rhs, .. } => {
             expr_has_current_user(lhs) || expr_has_current_user(rhs)
         }
-        Expr::And(lhs, rhs) => expr_has_current_user(lhs) || expr_has_current_user(rhs),
+        Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) => {
+            expr_has_current_user(lhs) || expr_has_current_user(rhs)
+        }
         Expr::JsonExtract { expr, .. } | Expr::JsonExtractText { expr, .. } => {
             expr_has_current_user(expr)
         }
@@ -425,7 +435,8 @@ pub fn apply_rls_skip_current_user(plan: LogicalPlan, catalog: &Catalog) -> Logi
             projection,
             predicate,
         } => {
-            let policy = policy_for_skip_current_user(catalog, &table);
+            // SELECT context: use rls_policy (SELECT + ALL scoped).
+            let policy = select_policy_for_skip_current_user(catalog, &table);
             let predicate = and_policy(predicate, policy);
             LogicalPlan::Select {
                 table,
@@ -439,7 +450,8 @@ pub fn apply_rls_skip_current_user(plan: LogicalPlan, catalog: &Catalog) -> Logi
             predicate,
             returning,
         } => {
-            let policy = policy_for_skip_current_user(catalog, &table);
+            // UPDATE context: use update_policy (UPDATE + ALL scoped) — Z2.
+            let policy = update_policy_for_skip_current_user(catalog, &table);
             let predicate = and_policy(predicate, policy);
             LogicalPlan::Update {
                 table,
@@ -453,7 +465,8 @@ pub fn apply_rls_skip_current_user(plan: LogicalPlan, catalog: &Catalog) -> Logi
             predicate,
             returning,
         } => {
-            let policy = policy_for_skip_current_user(catalog, &table);
+            // DELETE context: use delete_policy (DELETE + ALL scoped) — Z2.
+            let policy = delete_policy_for_skip_current_user(catalog, &table);
             let predicate = and_policy(predicate, policy);
             LogicalPlan::Delete {
                 table,
@@ -462,11 +475,12 @@ pub fn apply_rls_skip_current_user(plan: LogicalPlan, catalog: &Catalog) -> Logi
             }
         }
         LogicalPlan::Query(mut spec) => {
-            spec.apply_rls_from(&|table| policy_for_skip_current_user(catalog, table));
+            // JOIN/query context is SELECT-context; use rls_policy.
+            spec.apply_rls_from(&|table| select_policy_for_skip_current_user(catalog, table));
             LogicalPlan::Query(spec)
         }
         LogicalPlan::Explain { analyze, mut spec } => {
-            spec.apply_rls_from(&|table| policy_for_skip_current_user(catalog, table));
+            spec.apply_rls_from(&|table| select_policy_for_skip_current_user(catalog, table));
             LogicalPlan::Explain { analyze, spec }
         }
         other @ (LogicalPlan::CreateTable { .. }
@@ -480,7 +494,7 @@ pub fn apply_rls_skip_current_user(plan: LogicalPlan, catalog: &Catalog) -> Logi
     }
 }
 
-fn policy_for_skip_current_user(catalog: &Catalog, table: &str) -> Option<Expr> {
+fn select_policy_for_skip_current_user(catalog: &Catalog, table: &str) -> Option<Expr> {
     catalog
         .lookup(table)
         .ok()
@@ -488,9 +502,30 @@ fn policy_for_skip_current_user(catalog: &Catalog, table: &str) -> Option<Expr> 
         .filter(|p| !expr_has_current_user(p))
 }
 
-/// AND the table's RLS policy (if any) into the plan's predicate. This is
-/// the entire RLS mechanism — everything below the logical-plan layer is
+fn update_policy_for_skip_current_user(catalog: &Catalog, table: &str) -> Option<Expr> {
+    catalog
+        .lookup(table)
+        .ok()
+        .and_then(|t| t.update_policy.clone())
+        .filter(|p| !expr_has_current_user(p))
+}
+
+fn delete_policy_for_skip_current_user(catalog: &Catalog, table: &str) -> Option<Expr> {
+    catalog
+        .lookup(table)
+        .ok()
+        .and_then(|t| t.delete_policy.clone())
+        .filter(|p| !expr_has_current_user(p))
+}
+
+/// AND the table's per-operation RLS policy (if any) into the plan's predicate.
+/// This is the entire RLS mechanism — everything below the logical-plan layer is
 /// unaware RLS exists.
+///
+/// Item-24 Z2: each plan variant applies its scoped policy field:
+/// - SELECT / JOIN → `rls_policy` (SELECT + ALL)
+/// - UPDATE        → `update_policy` (UPDATE + ALL)
+/// - DELETE        → `delete_policy` (DELETE + ALL)
 pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog) -> LogicalPlan {
     match plan {
         LogicalPlan::Select {
@@ -498,7 +533,8 @@ pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog) -> LogicalPlan {
             projection,
             predicate,
         } => {
-            let predicate = and_policy(predicate, policy_for(catalog, &table));
+            // SELECT context: use rls_policy (SELECT + ALL scoped).
+            let predicate = and_policy(predicate, select_policy_for(catalog, &table));
             LogicalPlan::Select {
                 table,
                 projection,
@@ -511,7 +547,8 @@ pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog) -> LogicalPlan {
             predicate,
             returning,
         } => {
-            let predicate = and_policy(predicate, policy_for(catalog, &table));
+            // UPDATE context: use update_policy (UPDATE + ALL scoped) — Z2.
+            let predicate = and_policy(predicate, update_policy_for(catalog, &table));
             LogicalPlan::Update {
                 table,
                 assignments,
@@ -524,7 +561,8 @@ pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog) -> LogicalPlan {
             predicate,
             returning,
         } => {
-            let predicate = and_policy(predicate, policy_for(catalog, &table));
+            // DELETE context: use delete_policy (DELETE + ALL scoped) — Z2.
+            let predicate = and_policy(predicate, delete_policy_for(catalog, &table));
             LogicalPlan::Delete {
                 table,
                 predicate,
@@ -532,15 +570,15 @@ pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog) -> LogicalPlan {
             }
         }
         LogicalPlan::Query(mut spec) => {
-            // RLS for joins is the same planner rewrite: AND each base
-            // relation's policy into the query's residual selection, qualified
+            // RLS for joins is SELECT-context: AND each base relation's
+            // SELECT policy into the query's residual selection, qualified
             // to that relation. The executor never learns RLS exists.
-            spec.apply_rls_from(&|table| policy_for(catalog, table));
+            spec.apply_rls_from(&|table| select_policy_for(catalog, table));
             LogicalPlan::Query(spec)
         }
         LogicalPlan::Explain { analyze, mut spec } => {
             // EXPLAIN shows the RLS-rewritten plan the query would actually run.
-            spec.apply_rls_from(&|table| policy_for(catalog, table));
+            spec.apply_rls_from(&|table| select_policy_for(catalog, table));
             LogicalPlan::Explain { analyze, spec }
         }
         other @ (LogicalPlan::CreateTable { .. }
@@ -554,11 +592,28 @@ pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog) -> LogicalPlan {
     }
 }
 
-fn policy_for(catalog: &Catalog, table: &str) -> Option<Expr> {
+/// SELECT-context policy: `rls_policy` (SELECT + ALL scoped).
+fn select_policy_for(catalog: &Catalog, table: &str) -> Option<Expr> {
     catalog
         .lookup(table)
         .ok()
         .and_then(|t| t.rls_policy.clone())
+}
+
+/// UPDATE-context policy: `update_policy` (UPDATE + ALL scoped) — Z2.
+fn update_policy_for(catalog: &Catalog, table: &str) -> Option<Expr> {
+    catalog
+        .lookup(table)
+        .ok()
+        .and_then(|t| t.update_policy.clone())
+}
+
+/// DELETE-context policy: `delete_policy` (DELETE + ALL scoped) — Z2.
+fn delete_policy_for(catalog: &Catalog, table: &str) -> Option<Expr> {
+    catalog
+        .lookup(table)
+        .ok()
+        .and_then(|t| t.delete_policy.clone())
 }
 
 fn and_policy(predicate: Option<Expr>, policy: Option<Expr>) -> Option<Expr> {
@@ -592,6 +647,8 @@ mod tests {
             fsm_meta: None,
             rls_policy: policy,
             insert_policy: None,
+            update_policy: None,
+            delete_policy: None,
             policies: vec![],
             events_enabled: false,
             serial_next: Default::default(),
@@ -624,6 +681,8 @@ mod tests {
 
     #[test]
     fn rls_rewrite_ands_with_existing_predicate() {
+        // Z2: rls_policy applies to SELECT; delete_policy applies to DELETE.
+        // Test SELECT path: rls_policy is AND-ed in.
         let policy = Expr::BinOp {
             op: CmpOp::Eq,
             lhs: Box::new(Expr::Column("owner".to_string())),
@@ -635,18 +694,35 @@ mod tests {
             lhs: Box::new(Expr::Column("id".to_string())),
             rhs: Box::new(Expr::Literal(Literal::Int(5))),
         };
-        let plan = LogicalPlan::Delete {
+        let plan = LogicalPlan::Select {
+            table: "t".to_string(),
+            projection: vec![],
+            predicate: Some(user_pred.clone()),
+        };
+        let rewritten = apply_rls(plan, &catalog);
+        match rewritten {
+            LogicalPlan::Select { predicate, .. } => {
+                assert_eq!(
+                    predicate,
+                    Some(Expr::And(
+                        Box::new(user_pred.clone()),
+                        Box::new(policy.clone())
+                    ))
+                );
+            }
+            _ => panic!("expected Select"),
+        }
+        // Z2: DELETE with no delete_policy → predicate unchanged.
+        let del_plan = LogicalPlan::Delete {
             table: "t".to_string(),
             predicate: Some(user_pred.clone()),
             returning: None,
         };
-        let rewritten = apply_rls(plan, &catalog);
-        match rewritten {
+        let del_rewritten = apply_rls(del_plan, &catalog);
+        match del_rewritten {
             LogicalPlan::Delete { predicate, .. } => {
-                assert_eq!(
-                    predicate,
-                    Some(Expr::And(Box::new(user_pred), Box::new(policy)))
-                );
+                // delete_policy is None — only user_pred remains.
+                assert_eq!(predicate, Some(user_pred));
             }
             _ => panic!("expected Delete"),
         }

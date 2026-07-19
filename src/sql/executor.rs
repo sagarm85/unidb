@@ -1381,6 +1381,8 @@ fn exec_create_table(
         fsm_meta: None,
         rls_policy: None,
         insert_policy: None,
+        update_policy: None,
+        delete_policy: None,
         policies: vec![],
         events_enabled: false,
         serial_next,
@@ -4585,6 +4587,11 @@ pub(crate) fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Literal]) -> 
             let r = as_bool(&eval_expr(rhs, columns, row)?)?;
             Ok(Literal::Bool(l && r))
         }
+        Expr::Or(lhs, rhs) => {
+            let l = as_bool(&eval_expr(lhs, columns, row)?)?;
+            let r = as_bool(&eval_expr(rhs, columns, row)?)?;
+            Ok(Literal::Bool(l || r))
+        }
         Expr::JsonExtract { expr, path } => {
             let json = json_of(eval_expr(expr, columns, row)?)?;
             let extracted = json.get(path).cloned().unwrap_or(JsonValue::Null);
@@ -5060,7 +5067,7 @@ fn expr_columns(expr: &Expr, table_def: &TableDef, out: &mut Vec<usize>) {
             expr_columns(lhs, table_def, out);
             expr_columns(rhs, table_def, out);
         }
-        Expr::And(l, r) => {
+        Expr::And(l, r) | Expr::Or(l, r) => {
             expr_columns(l, table_def, out);
             expr_columns(r, table_def, out);
         }
@@ -5105,7 +5112,7 @@ fn bind_predicate_columns(expr: &mut Expr, columns: &[ColumnDef]) {
             bind_predicate_columns(lhs, columns);
             bind_predicate_columns(rhs, columns);
         }
-        Expr::And(l, r) => {
+        Expr::And(l, r) | Expr::Or(l, r) => {
             bind_predicate_columns(l, columns);
             bind_predicate_columns(r, columns);
         }
@@ -5972,6 +5979,8 @@ mod tests {
             fsm_meta: None,
             rls_policy: None,
             insert_policy: None,
+            update_policy: None,
+            delete_policy: None,
             policies: vec![],
             events_enabled: false,
             serial_next: Default::default(),
