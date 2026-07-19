@@ -7683,3 +7683,109 @@ Crash between Phase B (committed) and Phase A (uncommitted): new versions have `
 ### Target
 
 UPDATE HOT: **0.05× PG → 0.20–0.40× PG** (Docker bench needed for official Table 3 number).
+
+---
+
+## Items 75–84 — DELETE + UPDATE perf sprint (2026-07-19)
+
+**Branch:** `perf/delete-update-v2` (commit `7a25a5e`) | **PR:** [#150](https://github.com/sagarm85/unidb/pull/150) — awaiting review, not merged
+**Docker bench report:** `docker/out/report_20260718_232622.md` | **Run time:** 155m 9s | **Date:** 2026-07-18 23:26:22 UTC
+**Machine:** aarch64 · 18 cores · Linux 6.12.76-linuxkit | **Peak RSS:** 410 MiB
+
+### What shipped
+
+| Item | Description | Key mechanism |
+|---|---|---|
+| 75a | Bitmap-style batch B-tree scan + RowId-only DELETE fast path | Single sorted batch scan; WAL_XMAX_BATCH coverage |
+| 75b | Zero-alloc B-tree candidate scan | No per-candidate Vec allocation |
+| 76+77+78 | Parallel UPDATE scan, Frame LSN cache, O(1) pool grow | Rayon match phase; eliminates redundant LSN reads per frame |
+| 79+80 | WAL_UPDATE_BATCH + WAL_XMAX_BATCH slice records | Mutex passes 150k→789 for 50k rows |
+| 81 | 512 MiB auto-checkpoint gate | Prevents FPI re-log on second pass |
+| 82 | Skip FPI for blank alloc pages in Phase B | Saves 8 KiB WAL per new page |
+| 83 | Batch non-HOT UPDATE via update_many() | Batch B-tree maintenance when no unique/FK |
+| 84 | Bulk merge-split in insert_batch_in_txn | Proactive overflow check + O(N+M) merge (was O(N²)) |
+
+### Table 3 — CRUD stress vs Postgres (100k rows, real fsync)
+
+| Operation | unidb rec/s | PG rec/s | unidb ÷ PG | WAL B/row |
+|---|---|---|---|---|
+| INSERT (per-row commit) | 3,493 | 6,339 | 0.55× | 556 |
+| SELECT filtered (5%) | 2,208,521 | 5,043,078 | 0.44× | 0 |
+| SELECT GROUP BY | 24,739,717 | 17,161,121 | **1.44× unidb** | 0 |
+| SELECT COUNT(*) | 316,643,578 | 46,566,230 | **6.80× unidb** | 0 |
+| UPDATE HOT | 453,795 | 731,844 | **0.62×** | 82 |
+| UPDATE non-HOT | 346,385 | 815,681 | **0.42×** | 202 |
+| DELETE selected | 2,518,064 | 3,104,746 | **0.81×** | 5 |
+| DELETE all | 27,205,636 | 3,412,338 | **7.97× unidb** | 0 |
+
+### Table 3.1 — Bulk INSERT + full scan at scale
+
+| rows | unidb insert (rec/s) | PG insert (rec/s) | winner | unidb scan (rec/s) | PG scan (rec/s) | winner |
+|---|---|---|---|---|---|---|
+| 10k | 27,435 | 26,286 | **unidb +4%** | 11,354,501 | 11,653,314 | postgres +3% |
+| 1M | 18,441 | 25,943 | postgres +41% | 16,266,577 | 42,878,811 | postgres +164% |
+| 2M | 17,628 | 26,064 | postgres +48% | 17,034,536 | 68,611,517 | postgres +303% |
+
+### Table 1 — Multi-model commit cost (ms/commit)
+
+| rows | W0 | W1 | W2 | W3 | W4 | W4−W0 | W4/W0 |
+|---|---|---|---|---|---|---|---|
+| 1k | 1.11 | 1.04 | 7.17 | 8.21 | 9.74 | 8.63 | 8.75× |
+| 10k | 0.44 | 0.50 | 15.31 | 15.44 | 6.73 | 6.29 | 15.40× |
+| 100k | 0.24 | 0.25 | 26.44 | 23.70 | 32.00 | 31.75 | 132.54× |
+
+### Table 2 — Per-model marginal cost (ms added per commit)
+
+| rows | Δ btree (W1−W0) | Δ vector (W2−W1) | Δ edge (W3−W2) | Δ event (W4−W3) |
+|---|---|---|---|---|
+| 1k | -0.08 | +6.13 | +1.04 | +1.53 |
+| 10k | +0.07 | +14.80 | +0.13 | -8.72 |
+| 100k | +0.01 | +26.18 | -2.74 | +8.30 |
+
+### Table 4 — Multi-model (4 atomic writes) vs PG relational floor (1 write)
+
+| txns | unidb txns/s | unidb ms/txn | PG txns/s | PG ms/txn | unidb ÷ PG-floor |
+|---|---|---|---|---|---|
+| 1k | 163 | 6.126 | 5,948 | 0.168 | 0.03× |
+| 10k | 142 | 7.032 | 6,953 | 0.144 | 0.02× |
+| 100k | 48 | 21.033 | 6,664 | 0.150 | 0.01× |
+
+### Table 5 — PK/FK integrity stress
+
+| Operation | unidb rec/s | PG rec/s | unidb ÷ PG |
+|---|---|---|---|
+| INSERT FK (per-row) | 3,778 | 7,413 | 0.51× |
+| UPDATE bulk (FK path) | 75,094 | 601,049 | 0.12× |
+| SELECT JOIN orders/customers | 1,201,195 | 2,018,011 | 0.60× |
+
+Correctness: INSERT invalid FK rejected ✓ | DELETE RESTRICT blocked ✓
+
+### CPU / Memory
+
+| | Peak CPU | Peak Mem |
+|---|---|---|
+| unidb | 76% | 223.2 MiB |
+| Postgres | 3% | 28.4 MiB |
+| Peak RSS | — | 410 MiB |
+
+### Concurrency matrix — 30 PASS · 2 FAIL (32 scenarios)
+
+All production-default (toggle=on) scenarios PASS except:
+- **FAIL** `cross-row-churn` toggle=off, 8w×8rows: duplicate ids — pre-existing item-16 residual (toggle=off is NOT production default)
+- **FAIL** `cross-row-churn` toggle=on, 8w×8rows: HANG 1/3 at 120s — needs investigation before merge to main
+
+### WAL reductions (confirmed)
+
+| Operation | Before | After | Change |
+|---|---|---|---|
+| DELETE selected | 39 B/row | 5 B/row | −87% |
+| UPDATE HOT | 314 B/row | 82 B/row | −74% |
+| UPDATE non-HOT | 556 B/row | 202 B/row | −64% |
+
+### Journey (48h)
+
+| Operation | 48h ago | main baseline | This branch |
+|---|---|---|---|
+| DELETE selected | 238k (0.04×) | 573k (0.19×) | **2,518k (0.81×)** |
+| UPDATE HOT | ~50k (0.07×) | 66k (0.14×) | **453k (0.62×)** |
+| UPDATE non-HOT | 54k (0.06×) | 54k (0.06×) | **346k (0.42×)** |
