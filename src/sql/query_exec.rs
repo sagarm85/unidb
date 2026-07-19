@@ -13,6 +13,16 @@
 //! into an ordinary uncorrelated query); an uncorrelated subquery produces the
 //! same bound form every row and is cached so it runs once. CTEs are
 //! materialized once up front and referenced by name in FROM.
+//!
+//! ## Item 51 Phase B — in-memory hash join for equi-joins
+//!
+//! When the inner relation of an [`PlanNode::IndexNestedLoopJoin`] fits within
+//! `HASH_JOIN_INNER_ROW_BUDGET` rows, `try_build_hash_table` scans it once and
+//! builds a `HashMap<Vec<u8>, Vec<Vec<Literal>>>` keyed on the encoded join-key
+//! column value. The outer loop then probes O(1) per row instead of doing a
+//! B-tree search per outer row. Falls back to the INLJ B-tree path when the
+//! inner relation exceeds the budget or the join key is not a comparable type.
+//! Override the budget via `UNIDB_HASH_JOIN_BUDGET` (e.g. `="1"` forces INLJ).
 
 use std::collections::HashMap;
 
@@ -25,9 +35,88 @@ use crate::sql::executor::{self, decode_row, deform_row, ExecCtx, ExecResult};
 use crate::sql::join;
 use crate::sql::logical::{CmpOp, Literal};
 use crate::sql::plan::{
-    self, eval_qexpr, plan_query, resolve_column, Batch, ColumnRef, CteSchemas, PlanNode,
+    self, eval_qexpr, join_key_bytes, plan_query, resolve_column, Batch, ColumnRef, CteSchemas,
+    PlanNode,
 };
 use crate::sql::query::{AggFunc, JoinType, QExpr, QuerySpec};
+
+/// Item 51 Phase B — maximum inner-relation row count before falling back from
+/// the in-memory hash join to the B-tree index-nested-loop join. At this scale
+/// the one-time full scan + in-memory probes beats per-row B-tree lookups.
+/// Override via `UNIDB_HASH_JOIN_BUDGET` env var (e.g. `="1"` forces INLJ in tests).
+const HASH_JOIN_INNER_ROW_BUDGET: usize = 500_000;
+
+/// Return the configured hash-join inner budget (row count cap).
+fn hash_join_inner_budget() -> usize {
+    std::env::var("UNIDB_HASH_JOIN_BUDGET")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(HASH_JOIN_INNER_ROW_BUDGET)
+}
+
+/// Item 51 Phase B — build an in-memory hash table keyed on the join column
+/// (`join_col`) for every live row in `inner_table`. Returns `None` when the
+/// inner relation has more than `budget` rows (caller falls back to INLJ).
+///
+/// The map key is the canonical byte encoding of the join key value (same
+/// encoding used by `join::hash_join`'s general path). NULL join-key rows are
+/// skipped — SQL equi-join semantics: NULL never matches.
+#[allow(clippy::type_complexity)]
+fn try_build_hash_table(
+    inner_table: &str,
+    join_col: &str,
+    snapshot: &Snapshot,
+    ctx: &mut ExecCtx,
+    budget: usize,
+) -> Result<Option<HashMap<Vec<u8>, Vec<Vec<Literal>>>>> {
+    let table_def = ctx.catalog.lookup(inner_table)?.clone();
+
+    // Fast row-count gate: if the catalog's row_count already exceeds the budget
+    // we can skip the scan entirely. row_count is maintained by INSERT/DELETE, so
+    // it is exact under normal operation (may be slightly stale after crash-
+    // recovery, but only in a conservative direction — we'll scan if unsure).
+    if table_def.row_count > budget as i64 {
+        return Ok(None);
+    }
+
+    // Find the join column index in the visible (non-dropped) column list.
+    let join_col_idx = table_def
+        .columns
+        .iter()
+        .filter(|c| !c.dropped)
+        .position(|c| c.name == join_col);
+    let Some(join_col_idx) = join_col_idx else {
+        // Column not found — fall back to INLJ.
+        return Ok(None);
+    };
+
+    let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
+
+    let mut table: HashMap<Vec<u8>, Vec<Vec<Literal>>> = HashMap::new();
+    let mut row_count = 0usize;
+
+    for (_, bytes) in heap.scan(snapshot, ctx.xid, ctx.pool)? {
+        if row_count > budget {
+            // Exceeded budget mid-scan — abort and fall back to INLJ.
+            return Ok(None);
+        }
+        let full = decode_row(&bytes, &table_def.columns)?;
+        let row = visible_row(&full, &table_def);
+        let key_lit = row[join_col_idx].clone();
+        // NULL keys never equi-match — skip them.
+        if matches!(key_lit, Literal::Null) {
+            row_count += 1;
+            continue;
+        }
+        if let Some(key_bytes) = join_key_bytes(&[key_lit]) {
+            table.entry(key_bytes).or_default().push(row);
+        }
+        row_count += 1;
+    }
+
+    Ok(Some(table))
+}
 
 pub fn exec_query(spec: &QuerySpec, ctx: &mut ExecCtx) -> Result<ExecResult> {
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
@@ -647,6 +736,55 @@ impl Runner<'_, '_> {
         let left_len = left_batch.schema.len();
         let right_len = output.len() - left_len;
 
+        // Item 51 Phase B: try to build an in-memory hash table over the inner
+        // (right) relation. When the inner fits within the budget, O(1) hash
+        // probe per outer row beats a B-tree search per outer row. Falls back to
+        // the original INLJ path when the inner is too large.
+        let budget = hash_join_inner_budget();
+        if let Some(hash_table) = try_build_hash_table(
+            right_table,
+            right_index_column,
+            &self.snapshot,
+            self.ctx,
+            budget,
+        )? {
+            let emit_unmatched_left = matches!(join_type, JoinType::Left);
+            let mut out_rows = Vec::new();
+
+            for lrow in &left_batch.rows {
+                let key_lit = eval_qexpr(left_key, &left_batch.schema, lrow)?;
+                let mut matched = false;
+                if !matches!(key_lit, Literal::Null) {
+                    if let Some(key_bytes) = join_key_bytes(&[key_lit]) {
+                        if let Some(rrows) = hash_table.get(&key_bytes) {
+                            for rrow in rrows {
+                                let mut combined = lrow.clone();
+                                combined.extend_from_slice(rrow);
+                                if let Some(res) = residual {
+                                    if !plan::eval_predicate(res, output, &combined)? {
+                                        continue;
+                                    }
+                                }
+                                out_rows.push(combined);
+                                matched = true;
+                            }
+                        }
+                    }
+                }
+                if !matched && emit_unmatched_left {
+                    let mut combined = lrow.clone();
+                    combined.extend(vec![Literal::Null; right_len]);
+                    out_rows.push(combined);
+                }
+            }
+
+            return Ok(Batch {
+                schema: output.to_vec(),
+                rows: out_rows,
+            });
+        }
+
+        // Fallback: original index-nested-loop path (B-tree probe per outer row).
         let right_def = self.ctx.catalog.lookup(right_table)?.clone();
         let meta_page = right_def
             .columns
