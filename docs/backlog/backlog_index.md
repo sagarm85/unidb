@@ -127,11 +127,21 @@ row regresses vs the items-75–84 report, bisect commits with the native harnes
 
 **Parallel track (separate branch/agent — read path + docs, no file overlap with Wave 1):**
 
+- **#51 Phase B — SELECT JOIN late materialization (0.59× → ≥0.70×)** — PROMOTED 2026-07-19:
+  workload-frequency evidence (joins = 4/9 queries of the end-user comparison workload) outweighs
+  its mid-pack Table-3 standing; Table 3 weights ops equally and hid this. Join executor files
+  don't overlap Wave 1. Measure AFTER rebasing on item 86 (join scans share the per-fetch CRC
+  cost), and profile the join path before building (same Step-0 discipline as #92).
 - **#92 vector query next tier** — Step-0 profile first; target ≤700 µs warm at matched recall.
 - **#91 M4 event-source decision** — docs-only design decision; must land before M4 work starts.
 
-**After Wave 1:** #67 async HNSW build (biggest multi-model write lever) → item 51 Phase B
-(SELECT JOIN) → #68 hint bits / #69 fill factor (steady-state churn) → #70 prefetch.
+**After Wave 1:** #67 async HNSW build (biggest multi-model write lever) → #68 hint bits /
+#69 fill factor (steady-state churn) → #70 prefetch.
+
+**Process note (2026-07-19):** the end-user workload mix that justified #51's promotion
+(the 9-query comparison workload, 4 joins) lives outside this repo — add it (or its query
+list) to the bench suite so future ROI ranking can weight Table-3 rows by workload frequency
+instead of treating every op equally.
 
 **What is NOT in this list:**
 - Per-row INSERT (0.55×): shared one-fsync-per-row floor; per §1, not worth chasing.
