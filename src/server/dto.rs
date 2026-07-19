@@ -378,6 +378,38 @@ pub fn is_internal_table(name: &str) -> bool {
     name.starts_with("__")
 }
 
+/// Body of `POST /batch-sql` (item 99): N independent one-shot statements
+/// sent in a single HTTP round-trip to amortise the per-request overhead.
+/// Each statement is auto-committed independently — there is no shared
+/// transaction across the batch.
+#[derive(Debug, Deserialize)]
+pub struct BatchSqlRequest {
+    /// Ordered list of SQL statements to execute (max 256).
+    pub statements: Vec<String>,
+    /// When `true`, stop at the first error; all remaining slots get a
+    /// `null` result and `"skipped"` error string. When `false` (default),
+    /// every statement is attempted regardless of earlier failures.
+    #[serde(default)]
+    pub stop_on_error: bool,
+}
+
+/// Response of `POST /batch-sql`: parallel arrays of results and errors,
+/// one slot per input statement (in order).
+///
+/// A slot where execution succeeded carries a non-null result JSON object
+/// (same shape as a single entry in `POST /sql`'s `"results"` array) and
+/// a `null` error.  A slot where execution failed carries a `null` result
+/// and the error string.  A slot that was skipped (because `stop_on_error`
+/// was `true` and an earlier slot failed) carries a `null` result and the
+/// fixed string `"skipped"`.
+#[derive(Debug, Serialize)]
+pub struct BatchSqlResponse {
+    /// One result JSON value per statement (null on failure / skip).
+    pub results: Vec<Option<serde_json::Value>>,
+    /// One error string per statement (null on success).
+    pub errors: Vec<Option<String>>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AckEventsRequest {
     pub consumer: String,

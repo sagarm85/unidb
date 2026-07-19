@@ -37,9 +37,10 @@ use crate::{
         dto::{
             exec_result_to_json, is_internal_table, json_to_literal, literal_to_json, slot_to_json,
             table_def_to_info, AckEventsRequest, AdvanceSlotRequest, BatchInsertRequest,
-            BeginTxnRequest, CreateEdgeRequest, CreateSlotRequest, CursorQuery, CypherRequest,
-            DeleteEdgeRequest, HistoryQuery, IsolationDto, RlsRequest, RowIdResponse,
-            SetIndexRequest, SlowQueryThresholdRequest, SqlRequest, StreamQuery, TableInfo,
+            BatchSqlRequest, BatchSqlResponse, BeginTxnRequest, CreateEdgeRequest,
+            CreateSlotRequest, CursorQuery, CypherRequest, DeleteEdgeRequest, HistoryQuery,
+            IsolationDto, RlsRequest, RowIdResponse, SetIndexRequest, SlowQueryThresholdRequest,
+            SqlRequest, StreamQuery, TableInfo,
         },
         engine_handle::EngineHandle,
         error::ApiError,
@@ -433,6 +434,124 @@ pub async fn post_sql(
         finish(&state.engine, xid, result).await?
     };
     sql_response(&state, user, results, body.cursor)
+}
+
+/// `POST /batch-sql` (item 99): execute up to 256 independent one-shot SQL
+/// statements in a single HTTP round-trip.  Each statement is auto-committed
+/// independently — there is **no** shared transaction across the batch.
+///
+/// Error handling is governed by `stop_on_error`:
+/// - `false` (default): all statements are attempted; failed slots get
+///   `null` result + error string, others get their normal result.
+/// - `true`: stop at the first error; remaining slots get `null` result +
+///   `"skipped"` error string.
+///
+/// The response is always `200 OK`; per-statement failures are reported
+/// inside the payload, not via the HTTP status code.
+pub async fn post_batch_sql(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+    Json(body): Json<BatchSqlRequest>,
+) -> std::result::Result<Json<BatchSqlResponse>, ApiError> {
+    const MAX_BATCH_STMTS: usize = 256;
+
+    let user = current_user.0;
+
+    if body.statements.len() > MAX_BATCH_STMTS {
+        return Err(ApiError::bad_request(
+            "BATCH_TOO_LARGE",
+            format!(
+                "batch of {} statements exceeds the {MAX_BATCH_STMTS}-statement limit",
+                body.statements.len()
+            ),
+        ));
+    }
+
+    let n = body.statements.len();
+    let mut results: Vec<Option<serde_json::Value>> = Vec::with_capacity(n);
+    let mut errors: Vec<Option<String>> = Vec::with_capacity(n);
+    let mut stopped = false;
+
+    for sql in body.statements {
+        if stopped {
+            results.push(None);
+            errors.push(Some("skipped".to_string()));
+            continue;
+        }
+
+        // Auth DDL (CREATE USER / GRANT / REVOKE) is routed via
+        // `execute_sql_as`, which requires superuser — same gate as `post_sql`.
+        let stmt_result: std::result::Result<Vec<crate::sql::executor::ExecResult>, ApiError> =
+            if crate::authz::parse_auth_stmt(&sql)
+                .map_err(ApiError::from)?
+                .is_some()
+            {
+                let xid = state.engine.begin(None).await?;
+                let result = state
+                    .engine
+                    .execute_sql_as(user.clone(), xid, sql.clone())
+                    .await;
+                finish(&state.engine, xid, result)
+                    .await
+                    .map_err(ApiError::from)
+            } else {
+                // Enforce per-user privileges before dispatch.
+                if let Err(e) = state.engine.authorize_sql(user.clone(), sql.clone()).await {
+                    Err(ApiError::from(e))
+                } else if crate::read_handle::is_concurrent_read_sql(&sql) {
+                    // Read-only SELECTs use the concurrent read path.
+                    state
+                        .engine
+                        .execute_sql_read(sql.clone())
+                        .await
+                        .map_err(ApiError::from)
+                } else {
+                    let xid = state.engine.begin(None).await?;
+                    let result = state.engine.execute_sql(xid, sql.clone()).await;
+                    finish(&state.engine, xid, result)
+                        .await
+                        .map_err(ApiError::from)
+                }
+            };
+
+        match stmt_result {
+            Ok(exec_results) => {
+                // Batch SQL always produces a single-statement result per
+                // slot — the engine's `execute_sql` parses the SQL and runs
+                // it, returning one `ExecResult` per parsed statement.  For
+                // the single-SQL-string-per-slot contract here, there is
+                // exactly one entry.  We flatten multiple results the same
+                // way `POST /sql`'s `sql_response` does: wrap as an array
+                // and return the first element when there is exactly one, or
+                // return the whole array for the rare multi-stmt slot.
+                let json_results: Vec<serde_json::Value> =
+                    exec_results.iter().map(exec_result_to_json).collect();
+                let slot_value = if json_results.len() == 1 {
+                    json_results
+                        .into_iter()
+                        .next()
+                        .unwrap_or(serde_json::Value::Null)
+                } else {
+                    serde_json::Value::Array(json_results)
+                };
+                results.push(Some(slot_value));
+                errors.push(None);
+            }
+            Err(e) => {
+                let msg = match &e {
+                    ApiError::Db(db_err) => db_err.to_string(),
+                    ApiError::Api { message, .. } => message.clone(),
+                };
+                results.push(None);
+                errors.push(Some(msg));
+                if body.stop_on_error {
+                    stopped = true;
+                }
+            }
+        }
+    }
+
+    Ok(Json(BatchSqlResponse { results, errors }))
 }
 
 pub async fn post_cypher(
