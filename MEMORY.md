@@ -12,6 +12,24 @@
 
 ## Current status
 
+- **Backlog items 86–92 FILED + index reconciled — 2026-07-19 (fresh-mind architecture review session).**
+  Seven new backlog files from the measured profiling review (native `sample` profiles of main +
+  the items-75–84 branch; harness `examples/profile_bulk_dml.rs`, untracked):
+  86 CRC-at-storage-boundary (53% of exec_update profiled; 2-line prototype measured +26% UPDATE
+  native — prototype lives in a scratchpad worktree, NOT committed), 87 fill-page cursor (~42% of
+  post-86 exec_update), 88 bulk lock elision + batched undo (top delete_many cost; sequence LAST —
+  item-85 subsystem, scenario-10 20/20 gate), 89 WAL background sealer (~8% mid-statement stall),
+  90 batched B-tree maintenance for non-HOT (WAL 202→~120 B/row), 91 M4 event-source design
+  decision (slim WAL can't feed WAL-derived events; decide before M4), 92 vector query next tier
+  (2.38 ms → ≤700 µs; txn-overhead hypothesis rejected — pgvector runs full SQL txns at 380 µs).
+  Index corrections (stale rows that caused bad ROI picks): 52 → SHIPPED (PR #131), 53 → SHIPPED
+  (2026-07-16), 55 → RESOLVED (bench artefact), 64 → Fix A SHIPPED / generalization = item 86;
+  both "next file" pointers → 93. "Next up" section rewritten 2026-07-19: Wave-1 order
+  86→87→89→90→88 on ONE integration branch, one commit per item, native per-item verification,
+  a SINGLE Docker report at wave end (fold Table-4 re-bench in); parallel track 92+91.
+  CRUD standing (items-75–84 Docker report): DELETE selected 0.81×, UPDATE HOT 0.62×,
+  non-HOT 0.42×, INSERT 0.55×; wins COUNT 6.8×, DELETE all 8.0×, GROUP BY 1.4×.
+
 - **Item 85 — Cross-row-churn concurrency HANG — FIXED 2026-07-19, branch `fix/item-85-concurrency-hang`.**
   Root cause: `hot_update_many` Phase B→A order. Phase B (new-version inserts, committed WAL
   mini-txns per fill page) ran before Phase A (xmax conflict check). A WriteConflict on Phase A

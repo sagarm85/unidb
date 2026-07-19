@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `58_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `93_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -67,10 +67,10 @@
 | 50 | `50_patch_many_infinite_loop.md` | Improvement | ✅ SHIPPED 2026-07-16 — **critical**: `DiskBTree::patch_many` (item 47) genuinely infinite-loops, single-threaded, 100% CPU, on an unchanged-key `UPDATE` whenever the very first patch in a leaf-group has a key outside that leaf's *current* `entries.first()/last()` (plausible after any split) — the bounds check gated the first entry too, so the loop index never advanced. Confirmed live via `gdb -p <pid> -batch -ex bt` (identical stack twice). This is why it was never caught: Table 3 (the only report section touching this path) only runs when Postgres is reachable, and this session's item 49 fix was the first time that condition was met. Fixed: bounds check now only gates *additional* (`j > i`) batching, never `j == i`. New permanent regression test confirmed to catch the bug pre-fix (30s hang deadline) and pass post-fix (~1s). See PROGRESS.md. |
 
 | 51 | `51_select_join_hash_join.md` | Performance | ⏳ PHASE A DONE 2026-07-16 — predicate pushdown into base scans + integer key hash fast path + INLJ-via-unique_index_root revert; 0.31→0.59× PG. Phase B (≥0.70×) pending. See PROGRESS.md. |
-| 52 | `52_update_delete_predicate_decode_pushdown.md` | Performance | ⏳ NOT STARTED — item 47 Phase B: cols/row=8 on UPDATE, cols/row=6 on DELETE proves full decode on predicate-scan path. Extend B2 deform_row mask to matching_rows write path. DELETE: 0.16→0.30-0.40×; UPDATE: 0.14→0.18-0.22×. |
-| 53 | `53_fk_update_skip_unchanged_recheck.md` | Improvement | ⏳ NOT STARTED — FK UPDATE 0.06× PG (17× behind); executor re-checks FK constraint on every UPDATE row unconditionally even when FK column is not in SET clause. Skip when FK col not in SET. 0.06→0.12-0.18×. |
+| 52 | `52_update_delete_predicate_decode_pushdown.md` | Performance | ✅ SHIPPED 2026-07-16 (correction 2026-07-19: this row previously said NOT STARTED — stale) — `MatchedRows` carries raw bytes; DELETE cols/row 6.00→2.00, dec/row→0.00, +10% throughput. PR #131 MERGED. UPDATE's cols/row=8 remainder is structural (new version needs the full row) and profiling (items 75–84 era) shows decode is not a material UPDATE cost. |
+| 53 | `53_fk_update_skip_unchanged_recheck.md` | Improvement | ✅ SHIPPED 2026-07-16 (correction 2026-07-19: this row previously said NOT STARTED — stale, and caused a bad ROI pick) — `has_fk_refs_in_set` gate in `exec_update` skips FK locks+checks when FK col not in SET; 40,423→62,281 rec/s (+54%). See PROGRESS.md "Item 53". |
 | 54 | `54_select_filtered_arena_alloc.md` | Performance | ✅ SHIPPED 2026-07-16 — Phase A: `scan_page_visit` + `project_row_drain` + `parallel_resolve_partitions`. SELECT filtered 0.50×→0.57× PG at 100k rows (+24%); RSS 315→296 MiB. PR #135. See PROGRESS.md. |
-| 55 | `55_event_queue_small_table_overhead.md` | Improvement | ⏳ NOT STARTED — W4/W0=3.93× at 1k rows (Δ event=1.29ms vs 0.12ms at 10k); 10× anomaly unexplained; investigate before optimising (vacuum threshold, sequence index, WAL group-commit). |
+| 55 | `55_event_queue_small_table_overhead.md` | Improvement | ✅ RESOLVED 2026-07-19 — the W4/W0 anomaly was a bench artefact (WAL measurement window not normalized); fixed by `sync_wal()`+`checkpoint()` before the window + structural WAL-byte gate (commit 92e8713). No engine change needed. |
 | 56 | `56_crud_gap_write_batching_parallel_agg.md` | Performance | ✅ SHIPPED — Step 1 (parallel GROUP BY 1.14× PG) 2026-07-16; Steps 2+3 (WAL_XMAX_BATCH DELETE) 2026-07-17 PR #137; Step 4 (logical B-tree INSERT WAL 8837→655 B/row, +25% rec/s) 2026-07-17 PR #139 |
 | 57 | `57_next_perf_improvements.md` | Performance | ⏳ NOT STARTED — D4 HOT sign-off analysis (defer: ceiling 0.08×); parallel DELETE scan (0.07→0.15–0.20×, HIGH ROI); W4/W0 overhead root-cause; ROI ranking: #1 parallel DELETE, #2 HOT. Fable-5 arch review 2026-07-17. |
 | 58 | `58_hot_update.md` | Performance | ✅ SHIPPED 2026-07-17 — HOT-equivalent UPDATE: same-page insert when no indexed col in SET; FSM pre-screen fast-path for full pages; vacuum B-tree patch for HOT chain heads; FORMAT_VERSION 7→8; P59a/P59b crash tests. Measured 0.043× PG at 100k packed rows (HOT fires only when pages have slack; no regression). PR #141 MERGED. See PROGRESS.md. |
@@ -80,7 +80,7 @@
 
 | 63 | `63_disk_hnsw_planning.md` | Performance | ✅ SHIPPED 2026-07-17 — on-disk HNSW replaces IVF-Flat. recall@10=0.964 at 1k×dim128 (≥0.95 gate PASS). src/hnsw_index.rs; 48/48 crash tests (P60a+P60b); 669 tests; clippy/fmt clean. PR pending. |
 | 62 | `62_ivf_scale_validation.md` | Performance | ✅ SHIPPED 2026-07-17 — bench: IVF recall@10/latency at 1k/10k/100k; recall=0.421 at 100k unlocks item 63 gate. PR #145 MERGED. |
-| 64 | `64_delete_lazy_xmax.md` | Performance | 🔄 INVESTIGATION COMPLETE — two bottlenecks profiled: (1) CRC-per-mutation in `set_xmax` (807 ns/row, 87.5% at 25k scale); (2) `latch_fetch` blowup 1.2→611 µs/page at 100k (mmap/OS cold-page). Lazy xmax ruled infeasible (MVCC violation). Fix A (remove `write_crc()` from `set_xmax`) ready to implement. Fix B (latch+fetch root cause) needs diagnostic first. |
+| 64 | `64_delete_lazy_xmax.md` | Performance | 🔄 INVESTIGATION COMPLETE — two bottlenecks profiled: (1) CRC-per-mutation in `set_xmax` (807 ns/row, 87.5% at 25k scale); (2) `latch_fetch` blowup 1.2→611 µs/page at 100k (mmap/OS cold-page). Lazy xmax ruled infeasible (MVCC violation). Fix A (remove `write_crc()` from `set_xmax`) **SHIPPED** (correction 2026-07-19: "ready to implement" was stale — the skip + doc comment are in `page.rs::set_xmax`; DELETE 0.04→0.06× recorded in PROGRESS). Fix B's latch+fetch blowup root cause identified by the 2026-07-19 profiling review (clock-sweep evictions + per-fetch CRC verify) — addressed by item 78 (shipped) and item 86 (filed). Generalization of Fix A to all mutations/fetches = **item 86**. |
 | 65 | `65_hnsw_insert_node_cache.md` | Performance | ✅ SHIPPED 2026-07-18 — per-insert `NodeCache` eliminates repeated DiskBTree lookups during HNSW beam search (~3200 → ~200 unique node fetches per insert). See PROGRESS.md "Item 65". |
 | 66 | `66_parallel_delete_scan.md` | Performance | ✅ SHIPPED 2026-07-18 — `parallel_collect_matching` in `parallel_scan.rs`; A3-gate-aware `'collect` block in `exec_delete`; sort before `delete_many`; 48/48 crash PASS; `parallel_delete_matches_serial` PASS. Docker bench pending. See PROGRESS.md "Item 66". |
 | 67 | `67_async_hnsw_index_build.md` | Performance | 📋 PLANNED 2026-07-18 — async HNSW: decouple index build from commit critical path (W4/W0 → ~1.1×). ef_construction reduction ruled out (recall@10=0.937 at ef=100,10k — fails gate). See PROGRESS.md "Item 67 planning". |
@@ -93,51 +93,51 @@
 | 74 | `74_hot_update_batch.md` | Performance | ✅ SHIPPED — commit 4dd81ac (hot_update_many Phase B+A) is below 7a25a5e; the items 75–84 Docker bench (report_20260718_232622.md) covers this binary: UPDATE HOT 453k rec/s / **0.62×** vs PG. No separate run needed — that IS item 74's bench. See PROGRESS.md items 75–84. |
 | 75–84 | (no separate files) | Performance | ✅ SHIPPED 2026-07-19 — DELETE + UPDATE perf sprint (PR #150). Items tracked as a bundle in PROGRESS.md "Items 75–84". |
 | 85 | `85_concurrency_hang_cross_row_churn.md` | Improvement | ✅ SHIPPED 2026-07-19 — production-default concurrency hang (cross-row UPDATE churn, toggle=on, no index); root cause: Phase B→A ordering in hot_update_many left orphaned tuples on WriteConflict; fix: swap to A→B→C. See PROGRESS.md "Item 85". |
+| 86 | `86_crc_storage_boundary.md` | Performance | ⏳ NOT STARTED — CRC verify-once-on-pool-entry / compute-once-at-flush; remove per-mutation `write_crc` from `insert_versioned` (generalizes item 64 Fix A) + alloc-free `compute_crc`. Profiled: 53% of exec_update samples; 2-line prototype measured **+26% UPDATE native** (482k→607k). Expected UPDATE HOT 0.62→~0.75×+. |
+| 87 | `87_fill_page_cursor.md` | Performance | ⏳ NOT STARTED — statement-scoped fill-page cursor: one FSM/`acquire_page_for_insert` interaction per fill page instead of per row (profiled ~42% of post-86 exec_update). Expected UPDATE HOT →~0.85×. |
+| 88 | `88_bulk_lock_elision.md` | Performance | ⏳ NOT STARTED — bulk DML skips per-row lock-table entries (xmax stamp = tuple lock, PG design; existing under-latch xmax check is the conflict gate) + batched undo (`XmaxStampBatch`). Top profiled cost in delete_many; `release_all` O(all locks)→O(phantoms). Expected DELETE 0.81→~0.90×. **Sequence last (86→87→89→90→88): item-85 subsystem; gate = scenario-10 20/20 + full conc matrix ×3.** |
+| 89 | `89_wal_background_sealer.md` | Performance | ⏳ NOT STARTED — WAL segment seal fsync moved off the append path (pre-open next segment, background sealer); measured ~8% of bulk UPDATE natively as mid-statement stall; p99 flattening. |
+| 90 | `90_btree_batch_maintenance.md` | Performance | ⏳ NOT STARTED — sort-then-merge batched B-tree maintenance + lazy leaf coalescing for UPDATE non-HOT (0.42×, WAL 202 B/row vs ~82 heap floor). Expected →~0.5–0.6×, WAL ≤130 B/row. (Formalizes the "write_node reduction / lazy coalescing" chat proposals that briefly collided with number 85.) |
+| 91 | `91_m4_event_source_decision.md` | Improvement | ⏳ NOT STARTED — **design decision before M4 starts**: slim WAL records (DELETE 5 B/row) cannot feed a WAL-derived event stream; choose executor-capture-as-source (Option A, PG-default analog) vs opt-in logical WAL level with before-images (Option B). Sign-off in PROGRESS.md. |
+| 92 | `92_vector_query_next_tier.md` | Performance | ⏳ NOT STARTED — follow-up to 72+73: warm NEAR 2.38 ms → ≤700 µs (pgvector-class) at matched recall. Step 0 = profile (fetch-count × fetch-cost); levers: item-86 synergy, zero-copy node arena, SIMD distance, read-only fast path last. "Strip the SQL txn" hypothesis rejected (pgvector runs full SQL txns at 380 µs). |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `86_…`.**
+**Next new file → `93_…`.**
 
-## Next up — priority order (2026-07-16, calibrated on `052432` Docker baseline)
+## Next up — priority order (2026-07-19, calibrated on the items-75–84 Docker report + native profiling review)
 
-Ordered by measured ROI. Each item has its own spec file (see Registry above). Reorder as new data arrives.
+Ordered by measured ROI. CRUD is at/near the relaxed acceptance band (DELETE selected 0.81×,
+UPDATE HOT 0.62×, non-HOT 0.42×); the items below close the remainder and then shift effort
+to the multi-model headline (M2/M4), which is where §1 says the differentiated value is.
 
-**#51 Phase B — SELECT JOIN ≥0.70× PG (`51_select_join_hash_join.md`) — Phase A done (0.59×).**
-Remaining gap is row-decode cost: late-materialization (only decode referenced columns) and
-scan-side decode reuse. Candidates: (a) `deform_row` mask in the join executor scan, (b)
-columnar projection pushdown. Not yet filed as a separate item — consider merging into #52 scope
-since the fix is the same decode-pushdown mechanism.
+**Wave 1 — CRUD integration branch (one branch, one commit per item, ONE Docker report at the end):**
 
-**#52 — UPDATE/DELETE predicate decode pushdown (`52_update_delete_predicate_decode_pushdown.md`).**
-cols/row=8 (UPDATE) and cols/row=6 (DELETE) measured in `030325`: we decode all columns on the
-predicate-scan path when we only need the WHERE column(s). Extends B2 (`deform_row` mask) already
-shipped for SELECT. DELETE gets the larger gain (no write-step decode needed). UPDATE gain bounded by
-insert-new-version MVCC write cost. Can develop alongside #51 (different executor sections).
+1. **#86 CRC at storage boundary** — largest measured lever (+26% prototyped); helps every path.
+2. **#87 fill-page cursor** — next measured lever on UPDATE HOT (→ ~0.85×).
+3. **#89 WAL background sealer** — small; p99 flattening.
+4. **#90 batched B-tree maintenance** — the one structural lever for UPDATE non-HOT.
+5. **#88 bulk lock elision** — LAST in the wave: item-85 subsystem; strict conc gates
+   (scenario-10 20/20 clean + full matrix ×3).
 
-**#53 — FK UPDATE: skip re-check when FK col not in SET (`53_fk_update_skip_unchanged_recheck.md`).**
-0.06× PG = 17× behind. Trivial executor fix: skip `enforce_fk_child_insert_update` when the FK
-column is not in the SET clause. Independent of #51 and #52; can run in a parallel worktree.
+Per-item verification inside the wave is native + cheap (unit/crash/conc + the
+`examples/profile_bulk_dml.rs` harness + WAL/dec counters); the 3–4 h Docker report runs
+ONCE at wave end (fold the Table-4 replaced-stack re-bench into the same run). If any Table-3
+row regresses vs the items-75–84 report, bisect commits with the native harness.
 
-**#54 — SELECT filtered arena allocation (`54_select_filtered_arena_alloc.md`).**
-0.42× PG. Phase B decode already applied (cols/row=4.00). Per-row Vec<Literal>+String allocation
-is the remaining addressable cost. Residual gap beyond ~0.55× is Postgres's parallel worker count
-at 18 cores — architectural. Independent of all other items.
+**Parallel track (separate branch/agent — read path + docs, no file overlap with Wave 1):**
 
-**#55 — Event-queue 1k-row investigation (`55_event_queue_small_table_overhead.md`).**
-W4/W0=3.93× at 1k rows (Δ event=+1.29ms vs +0.12ms at 10k). Investigation-first item: profile
-before optimising. Does not block #51–54. Run in parallel with any of the above.
+- **#92 vector query next tier** — Step-0 profile first; target ≤700 µs warm at matched recall.
+- **#91 M4 event-source decision** — docs-only design decision; must land before M4 work starts.
 
-**Parallel note:** #51 (executor join), #52 (matching_rows decode), #53 (FK check), #54 (arena
-alloc), #55 (event investigation) touch distinct code paths and can all run in separate worktrees
-simultaneously with no file-level conflicts. Recommended: start #51 + #53 in one session, #52 in
-a second, #54 in a third, #55 (investigation) in a fourth.
+**After Wave 1:** #67 async HNSW build (biggest multi-model write lever) → item 51 Phase B
+(SELECT JOIN) → #68 hint bits / #69 fill factor (steady-state churn) → #70 prefetch.
 
 **What is NOT in this list:**
-- Item 47 Phase C (HOT-equivalent chain): requires FORMAT_VERSION bump (locked decision D4).
-  Measure Phase B results first; file Phase C separately only if the gap after Phase B justifies
-  reopening a locked decision.
-- Per-row INSERT gap (0.24× PG): WAL FPI overhead, structural. Per §1, expected to lose this.
-- SQL surface gaps (item 19): non-performance; tracked separately.
+- Per-row INSERT (0.55×): shared one-fsync-per-row floor; per §1, not worth chasing.
+- Parallel DML apply: held in reserve (~×2 further headroom on bulk UPDATE/DELETE) — only if a
+  future workload needs beyond ~0.85–0.90×; not justified for the current acceptance band.
+- AuthZ v2 (item 24): milestone-sized, in flight separately on `feat/item-24-authz-z1z3z5`.
 
 ## How to update this file
 
