@@ -74,7 +74,9 @@ impl SharedPageReader {
 
 impl PageReader for SharedPageReader {
     fn read_page(&self, page_id: PageId) -> Result<SlottedPage> {
-        read_page_locked(&self.mmap, self.page_size, page_id)
+        // SharedPageReader accesses pages directly (bypasses the pool frame table),
+        // so always verify CRC on load — this is equivalent to a pool miss.
+        read_page_locked(&self.mmap, self.page_size, page_id, true)
     }
     fn page_size(&self) -> usize {
         self.page_size
@@ -211,10 +213,16 @@ fn logical_page_count(
 
 /// Read one page out of the shared mmap under its read-lock, returning an
 /// owned `SlottedPage` (a copy) so no lock is held past this call.
+///
+/// `verify` controls whether the CRC is checked:
+///   - `true`  (pool miss / first load): verify CRC — catches on-disk corruption.
+///   - `false` (pool hit): skip CRC — the page was verified when it entered the
+///     pool; re-verifying on every subsequent fetch is pure overhead (item 86).
 fn read_page_locked(
     mmap: &Arc<RwLock<PageFileMmap>>,
     page_size: usize,
     page_id: PageId,
+    verify: bool,
 ) -> Result<SlottedPage> {
     let guard = mmap.read().map_err(|_| lock_poisoned())?;
     let start = page_id as usize * page_size;
@@ -227,7 +235,11 @@ fn read_page_locked(
     if raw.iter().all(|&b| b == 0) {
         return Ok(SlottedPage::from_bytes_unchecked(raw));
     }
-    SlottedPage::from_bytes(raw)
+    if verify {
+        SlottedPage::from_bytes(raw)
+    } else {
+        Ok(SlottedPage::from_bytes_unchecked(raw))
+    }
 }
 
 struct Frame {
@@ -607,7 +619,9 @@ impl BufferPool {
                 st.frames[frame_idx].clock_ref = true;
                 drop(st);
                 self.hits.fetch_add(1, Ordering::Relaxed); // item 21: cache hit
-                return self.read_page_from_mmap(page_id);
+                // Pool hit: page was CRC-verified when it entered the pool;
+                // skip re-verification (item 86).
+                return self.read_page_from_mmap_unchecked(page_id);
             }
 
             // Page not in pool — a cache miss; find a victim frame (may flush a
@@ -626,6 +640,7 @@ impl BufferPool {
             st.frames[frame_idx].clock_ref = true;
             st.frame_index.insert(page_id, frame_idx);
         }
+        // Pool miss: verify CRC on first load (item 86).
         self.read_page_from_mmap(page_id)
     }
 
@@ -689,7 +704,9 @@ impl BufferPool {
             )));
         }
 
-        let page = self.read_page_from_mmap(page_id)?;
+        // Pool-resident page — CRC was valid when set_lsn() wrote it; skip re-check
+        // (item 86). D5 still enforced below via LSN comparison.
+        let page = self.read_page_from_mmap_unchecked(page_id)?;
 
         // D5 (the invariant that must never break): a dirty page may not reach
         // disk while its LSN is ahead of the durable WAL frontier.
@@ -765,14 +782,22 @@ impl BufferPool {
     }
 
     /// Read one page directly from the shared mmap (no frame bookkeeping).
+    /// Always verifies CRC — equivalent to a pool miss.
     pub fn read_page(&self, page_id: PageId) -> Result<SlottedPage> {
-        read_page_locked(&self.mmap, self.page_size, page_id)
+        read_page_locked(&self.mmap, self.page_size, page_id, true)
     }
 
     // ── internals ────────────────────────────────────────────────────────────
 
+    /// Pool miss / flush path: read from mmap with CRC verification (item 86).
     fn read_page_from_mmap(&self, page_id: PageId) -> Result<SlottedPage> {
-        read_page_locked(&self.mmap, self.page_size, page_id)
+        read_page_locked(&self.mmap, self.page_size, page_id, true)
+    }
+
+    /// Pool hit path: read from mmap WITHOUT CRC re-verification (item 86).
+    /// Safe because the page was verified when it first entered the pool.
+    fn read_page_from_mmap_unchecked(&self, page_id: PageId) -> Result<SlottedPage> {
+        read_page_locked(&self.mmap, self.page_size, page_id, false)
     }
 
     /// Find a victim frame, flushing a durable dirty page back first if needed.

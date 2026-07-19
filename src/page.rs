@@ -275,7 +275,11 @@ impl SlottedPage {
                 sc
             }
         };
-        self.write_crc();
+        // CRC intentionally NOT written here. Every call site follows the pattern:
+        // insert_versioned(...)* → set_lsn(...) → write_page(...), and set_lsn()
+        // always calls write_crc() as its final step (same reasoning as set_xmax).
+        // Computing CRC per-row (one 8 KiB hash per insert) is pure waste when
+        // only the last CRC from set_lsn is ever persisted (item 86).
         Ok(slot)
     }
 
@@ -629,9 +633,15 @@ impl SlottedPage {
     }
 
     fn compute_crc(&self) -> u32 {
-        let mut buf = self.data.clone();
-        buf[CRC_FIELD_OFFSET..CRC_FIELD_OFFSET + 4].fill(0);
-        crc32fast::hash(&buf)
+        // Allocation-free incremental CRC: hash the three page regions that
+        // surround the CRC field, treating the field bytes themselves as zero.
+        // Avoids the 8 KiB clone+hash that the previous implementation performed
+        // on every call (item 86).
+        let mut h = crc32fast::Hasher::new();
+        h.update(&self.data[..CRC_FIELD_OFFSET]);
+        h.update(&[0u8; 4]); // CRC field treated as zero while computing
+        h.update(&self.data[CRC_FIELD_OFFSET + 4..]);
+        h.finalize()
     }
 
     fn write_crc(&mut self) {
