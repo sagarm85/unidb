@@ -486,10 +486,14 @@ fn qualify_policy(policy: Expr, qualifier: &str) -> QExpr {
         // treat as a permissive no-op rather than inventing semantics for them.
         // ColumnSlot is an executor-internal variant (item 59 Fix 2) that can
         // never appear in an RLS policy; treat it the same way.
+        // CurrentUser (item-24 Z6): should have been substituted to a Literal
+        // by `substitute_current_user_in_plan` before this point; if it somehow
+        // reaches here, treat as a literal-true no-op (safe / permissive).
         Expr::JsonExtract { .. }
         | Expr::JsonExtractText { .. }
         | Expr::Near { .. }
         | Expr::Arith { .. }
-        | Expr::ColumnSlot(_) => QExpr::Literal(Literal::Bool(true)),
+        | Expr::ColumnSlot(_)
+        | Expr::CurrentUser => QExpr::Literal(Literal::Bool(true)),
     }
 }

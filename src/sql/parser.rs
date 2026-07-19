@@ -1384,6 +1384,18 @@ fn convert_expr(e: &SqlExpr) -> Result<Expr> {
         SqlExpr::Function(func) if func.name.to_string().eq_ignore_ascii_case("match") => {
             convert_match_expr(func)
         }
+        // `current_user()` / `CURRENT_USER` — sqlparser emits both forms as
+        // SqlExpr::Function with FunctionArguments::None (bare keyword) or an
+        // empty arg list (zero-arg call). Match both; no args are accepted.
+        SqlExpr::Function(func) if func.name.to_string().eq_ignore_ascii_case("current_user") => {
+            match &func.args {
+                ast::FunctionArguments::None => Ok(Expr::CurrentUser),
+                ast::FunctionArguments::List(list) if list.args.is_empty() => Ok(Expr::CurrentUser),
+                _ => Err(DbError::SqlUnsupported(
+                    "current_user() takes no arguments".into(),
+                )),
+            }
+        }
         SqlExpr::Like {
             negated,
             any,
@@ -2064,6 +2076,42 @@ mod tests {
                 }
                 _ => panic!("expected BinOp with JsonExtractText lhs"),
             },
+            _ => panic!("expected Select"),
+        }
+    }
+
+    /// `current_user` (bare keyword, no parens) must parse to `Expr::CurrentUser`
+    /// in a WHERE clause. The parens form `current_user()` is rejected by
+    /// sqlparser (GenericDialect treats `current_user` as a reserved identifier,
+    /// not a zero-arg function call), so the bare form is the canonical spelling.
+    #[test]
+    fn parses_current_user_bare() {
+        let plan = parse_one("SELECT * FROM posts WHERE owner = current_user");
+        match plan {
+            LogicalPlan::Select { predicate, .. } => {
+                assert!(
+                    matches!(
+                        predicate,
+                        Some(Expr::BinOp { rhs, .. }) if matches!(*rhs, Expr::CurrentUser)
+                    ),
+                    "bare current_user must produce Expr::CurrentUser"
+                );
+            }
+            _ => panic!("expected Select"),
+        }
+
+        // Uppercase alias works too.
+        let plan_upper = parse_one("SELECT * FROM posts WHERE owner = CURRENT_USER");
+        match plan_upper {
+            LogicalPlan::Select { predicate, .. } => {
+                assert!(
+                    matches!(
+                        predicate,
+                        Some(Expr::BinOp { rhs, .. }) if matches!(*rhs, Expr::CurrentUser)
+                    ),
+                    "CURRENT_USER (uppercase) must produce Expr::CurrentUser"
+                );
+            }
             _ => panic!("expected Select"),
         }
     }

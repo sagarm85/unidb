@@ -123,7 +123,10 @@ use crate::{
     queue::{consumers_table_def, events_table_def, CONSUMERS_TABLE, EVENTS_TABLE},
     sql::{
         executor::{self, ExecCtx, ExecResult},
-        logical::{apply_rls, bind_params, Expr, Literal, LogicalPlan},
+        logical::{
+            apply_rls, apply_rls_skip_current_user, bind_params, substitute_current_user_in_plan,
+            Expr, Literal, LogicalPlan,
+        },
         parser::parse_sql,
         query::{FromNode, QuerySpec},
     },
@@ -1312,7 +1315,7 @@ impl Engine {
                     }
                 }
             }
-            self.execute_sql(xid, sql)
+            self.execute_sql_inner_as(xid, sql, user)
         }
     }
 
@@ -1836,18 +1839,16 @@ impl Engine {
         let saved_catalog_root = ctrl_lock(&self.control).catalog_root;
         let mut results = Vec::with_capacity(plans.len());
         for plan in plans {
-            let plan = apply_rls(plan, &cat_read(&self.catalog));
-            // V1 (item 27): extract table name before the plan is moved into
-            // the executor. `plan_dml_table` returns `None` for non-DML
-            // statements (DDL, SELECT), so those don't touch per-table counters.
+            // Apply RLS; skip policies that contain CurrentUser (item-24 Z6)
+            // because the embedded/superuser path has no user identity to
+            // substitute — a CurrentUser policy would evaluate to Null and
+            // block all rows, which is the wrong behavior for a superuser.
+            let plan = apply_rls_skip_current_user(plan, &cat_read(&self.catalog));
             let dml_table = plan_dml_table(&plan).map(|s| s.to_owned());
-            // item 96: detect DDL before the plan is moved into execute_one_plan.
             let is_ddl = plan_is_schema_ddl(&plan);
             match self.execute_one_plan(xid, plan) {
                 Ok(result) => {
-                    self.note_dml_result(&result, dml_table.as_deref()); // A1 + V1
-                                                                         // item 96: DDL changed the schema — bump the epoch so the
-                                                                         // next cache lookup treats all existing entries as stale.
+                    self.note_dml_result(&result, dml_table.as_deref());
                     if is_ddl {
                         self.bump_schema_epoch();
                     }
@@ -1860,6 +1861,132 @@ impl Engine {
             }
         }
         Ok(results)
+    }
+
+    /// Execute SQL under a named user identity (item-24 Z6), substituting
+    /// `current_user()` expressions before execution and threading the user
+    /// identity through `ExecCtx` for INSERT policy checks. Superusers (and
+    /// the embedded path, `user = None`) skip RLS entirely — if `user` is
+    /// `None` or is an effective superuser, `apply_rls` is not called, so
+    /// policies with `CurrentUser` cannot accidentally block the admin path.
+    fn execute_sql_inner_as(
+        &self,
+        xid: Xid,
+        sql: &str,
+        user: Option<&str>,
+    ) -> Result<Vec<ExecResult>> {
+        let skip_rls = user
+            .map(|u| self.is_effective_superuser(Some(u)))
+            .unwrap_or(true); // None == embedded/superuser → skip RLS
+        let plans = Arc::unwrap_or_clone(self.parse_sql_cached(sql)?);
+        let saved_catalog_root = ctrl_lock(&self.control).catalog_root;
+        let mut results = Vec::with_capacity(plans.len());
+        for mut plan in plans {
+            // Substitute current_user() in the user-supplied SQL's predicates.
+            if let Some(u) = user {
+                substitute_current_user_in_plan(&mut plan, u);
+            }
+            // Apply RLS (which may inject policy expressions containing
+            // CurrentUser) only for non-superuser named users.
+            let mut plan = if skip_rls {
+                plan
+            } else {
+                apply_rls(plan, &cat_read(&self.catalog))
+            };
+            // Substitute again to resolve any CurrentUser nodes the RLS
+            // policy injected.
+            if let Some(u) = user {
+                substitute_current_user_in_plan(&mut plan, u);
+            }
+            let dml_table = plan_dml_table(&plan).map(|s| s.to_owned());
+            let is_ddl = plan_is_schema_ddl(&plan);
+            // Thread user identity through ExecCtx so exec_insert can
+            // substitute CurrentUser in INSERT policy checks.
+            let result = self.execute_one_plan_as(xid, plan, user);
+            match result {
+                Ok(result) => {
+                    self.note_dml_result(&result, dml_table.as_deref());
+                    if is_ddl {
+                        self.bump_schema_epoch();
+                    }
+                    results.push(result);
+                }
+                Err(e) => {
+                    self.restore_catalog_root(saved_catalog_root)?;
+                    return Err(e);
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    /// Like `execute_one_plan_inner` but threads `current_user` through the
+    /// `ExecCtx` for INSERT policy checks (item-24 Z6).
+    fn execute_one_plan_as(
+        &self,
+        xid: Xid,
+        plan: LogicalPlan,
+        user: Option<&str>,
+    ) -> Result<ExecResult> {
+        let latency_hist = self.stmt_latency_for(&plan);
+        let started = latency_hist.map(|_| std::time::Instant::now());
+        let result = self.execute_one_plan_inner_as(xid, plan, user);
+        if let (Some(hist), Some(started)) = (latency_hist, started) {
+            hist.record(started.elapsed().as_micros() as u64);
+        }
+        result
+    }
+
+    fn execute_one_plan_inner_as(
+        &self,
+        xid: Xid,
+        plan: LogicalPlan,
+        user: Option<&str>,
+    ) -> Result<ExecResult> {
+        let page_size = self.page_size;
+        let current_user = user.map(|u| u.to_owned());
+        let shared = self.stmt_uses_shared_catalog(&plan);
+        if shared {
+            let catalog = cat_read(&self.catalog);
+            let mut ctx = ExecCtx {
+                catalog: crate::sql::executor::CatalogHandle::Shared(&catalog),
+                txn_mgr: &self.txn_mgr,
+                pool: &self.pool,
+                wal: &self.wal,
+                lock_mgr: &self.lock_mgr,
+                control_path: &self.control_path,
+                control: &self.control,
+                page_size,
+                xid,
+                next_event_seq: &self.next_event_seq,
+                event_seq_index_meta: Some(self.event_seq_index_meta),
+                hnsw_l0_caches: Some(&self.hnsw_l0_caches),
+                hnsw_vec_caches: Some(&self.hnsw_vec_caches),
+                authz: Some(&self.authz),
+                current_user: current_user.clone(),
+            };
+            executor::execute(plan, &mut ctx)
+        } else {
+            let mut catalog = cat_write(&self.catalog);
+            let mut ctx = ExecCtx {
+                catalog: crate::sql::executor::CatalogHandle::Exclusive(&mut catalog),
+                txn_mgr: &self.txn_mgr,
+                pool: &self.pool,
+                wal: &self.wal,
+                lock_mgr: &self.lock_mgr,
+                control_path: &self.control_path,
+                control: &self.control,
+                page_size,
+                xid,
+                next_event_seq: &self.next_event_seq,
+                event_seq_index_meta: Some(self.event_seq_index_meta),
+                hnsw_l0_caches: Some(&self.hnsw_l0_caches),
+                hnsw_vec_caches: Some(&self.hnsw_vec_caches),
+                authz: Some(&self.authz),
+                current_user,
+            };
+            executor::execute(plan, &mut ctx)
+        }
     }
 
     /// Roll the catalog back to a previously captured root page (P2.c). Used by
@@ -2014,6 +2141,7 @@ impl Engine {
                 hnsw_l0_caches: Some(&self.hnsw_l0_caches),
                 hnsw_vec_caches: Some(&self.hnsw_vec_caches),
                 authz: Some(&self.authz),
+                current_user: None,
             };
             executor::execute(plan, &mut ctx)
         } else {
@@ -2033,6 +2161,7 @@ impl Engine {
                 hnsw_l0_caches: Some(&self.hnsw_l0_caches),
                 hnsw_vec_caches: Some(&self.hnsw_vec_caches),
                 authz: Some(&self.authz),
+                current_user: None,
             };
             executor::execute(plan, &mut ctx)
         }
@@ -2119,6 +2248,7 @@ impl Engine {
             hnsw_l0_caches: Some(&self.hnsw_l0_caches),
             hnsw_vec_caches: Some(&self.hnsw_vec_caches),
             authz: Some(&self.authz),
+            current_user: None,
         };
         let result = graph_executor::execute(parsed, &mut ctx, self.edge_index_meta)?;
         Ok(vec![result])

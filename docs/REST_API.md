@@ -1128,7 +1128,70 @@ time, regardless of which route invoked `execute_sql`. Policies persist across s
 | `POST /sql` (one-shot) | `authorize_sql(user, sql)` pre-checks privilege before execution |
 | `POST /sql` (session) | `authorize_sql(user, sql)` pre-checks privilege before execution |
 | `POST /tables/{name}/bulk` | `check_table_grant(user, table, Insert)` checked before reading body |
+| `POST /auth/preview` | `ensure_superuser(caller)` gate; then `execute_sql_as(as_role, ...)` with full RLS |
 | `GET /rows/*`, `PUT /rows/*` etc. | Intentionally unenforced — pre-SQL era routes with no table name |
+
+#### `current_user` in RLS policies (item-24 Z6)
+
+RLS policies may reference `current_user` (bare keyword) as a dynamic placeholder for the
+authenticated identity executing the query:
+
+```sql
+-- owner column must equal the calling user
+CREATE POLICY tenant_isolation ON posts FOR SELECT USING (owner = current_user);
+CREATE POLICY own_rows_only ON items FOR INSERT USING (owner = current_user);
+```
+
+At query planning time, `current_user` is substituted with the JWT `sub` claim of the caller
+before the policy predicate is AND-rewritten into the plan. The bare keyword form (`current_user`,
+no parentheses) is required — `current_user()` with parentheses is not accepted. Superusers and
+the embedded API path (`sub` absent) bypass `current_user`-containing policies entirely.
+
+#### `POST /auth/preview` — preview RLS as a named role (item-24 Z6)
+
+Execute SQL as a named role and return the result filtered by that role's RLS policies.
+Intended for administrative tooling (e.g. the Auth tab in the Studio UI) to preview exactly
+which rows a given user will see.
+
+**Auth:** requires a **superuser** JWT. Non-superusers receive `403 Forbidden`.
+
+**Request** `POST /auth/preview`:
+```json
+{
+  "as_role": "alice",
+  "sql": "SELECT id, owner FROM posts"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `as_role` | string | yes | Username to impersonate. Must be a registered user. |
+| `sql` | string | yes | Single SQL statement to execute under that identity. |
+
+**Response** `200 OK` — same shape as `POST /sql`:
+```json
+{
+  "type": "rows",
+  "columns": ["id", "owner"],
+  "rows": [[1, "alice"]]
+}
+```
+
+**Error codes:**
+
+| Status | Condition |
+|---|---|
+| `403 Forbidden` | Caller is not a superuser. |
+| `400 Bad Request` | Malformed or unsupported SQL. |
+| `500 Internal Server Error` | Engine error. |
+
+**Example curl:**
+```bash
+curl -s -X POST http://localhost:7777/auth/preview \
+  -H "Authorization: Bearer $SUPERUSER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"as_role": "alice", "sql": "SELECT id, owner FROM posts"}'
+```
 
 #### Catalog virtual relations
 
