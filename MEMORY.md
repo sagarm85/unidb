@@ -12,6 +12,14 @@
 
 ## Current status
 
+- **Item 24 Z1+Z3+Z5 — SQL authz DDL + JWT enforcement + catalog relations — SHIPPED 2026-07-19, branch `feat/item-24-authz-z1z3z5`.**
+  Z1: `CREATE/DROP ROLE`, `GRANT/REVOKE`, `CREATE/DROP POLICY` SQL DDL. Policies route INSERT→`insert_policy`
+  (per-row enforcement in exec_insert); SELECT/UPDATE/DELETE→`rls_policy` (AND-rewrite in apply_rls). Catalog-persisted.
+  Z3: `authorize_sql` on both `/sql` paths (session + one-shot); `check_table_grant` on `/bulk`;
+  `apply_rls` at both execute_sql_inner call sites. Auth DDL + schema DDL require superuser.
+  Z5: `unidb_catalog.roles/grants/policies` virtual relations; `authz` field on ExecCtx.
+  10 tests in `tests/authz_z1z3z5.rs`. Full suite green. Z2/Z4/Z6 deferred. PR #152.
+
 - **Backlog items 86–92 FILED + index reconciled — 2026-07-19 (fresh-mind architecture review session).**
   Seven new backlog files from the measured profiling review (native `sample` profiles of main +
   the items-75–84 branch; harness `examples/profile_bulk_dml.rs`, untracked):
@@ -39,7 +47,7 @@
   Fix: A→B→C order — Phase A detects conflicts before any Phase B insert; Phase C writes
   HOT_NEXT_XPAGE forward pointer after Phase B produces new_rids.
   Test: `item85_cross_row_churn_no_index_no_hang` (5 reps × 10 s deadline) PASS.
-  434 lib + 51 crash tests green. Clippy clean. PR pending.
+  434 lib + 51 crash tests green. Clippy clean. PR #151 MERGED 2026-07-19.
 
 - **Item 71 — Cross-page HOT chains — SHIPPED 2026-07-18, on `main`.**
   Extends same-page HOT (item 58) to full pages: old slot gets `HOT_NEXT_XPAGE=0xFFFE`

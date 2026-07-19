@@ -7857,7 +7857,7 @@ improve cold latency further.
 
 ## Item 85 — Production-default concurrency hang fix (2026-07-19)
 
-**Branch:** `fix/item-85-concurrency-hang` | **PR:** pending
+**Branch:** `fix/item-85-concurrency-hang` | **PR:** [#151](https://github.com/sagarm85/unidb/pull/151) MERGED
 **Files changed:** `src/heap.rs` (hot_update_many A→B→C reorder), `tests/concurrent_writers.rs`
 (regression test), `docs/backlog/85_concurrency_hang_cross_row_churn.md`, `docs/backlog/backlog_index.md`
 
@@ -7913,3 +7913,32 @@ Crash safety verified: recovery's incomplete-user-txn pass undoes `WAL_XMAX_BATC
 - `docs/backlog/backlog_index.md`: registered item 85, updated next-ID marker to 86.
 
 **Locked-decision changes:** none. D1/D2/D5 satisfied; no FORMAT_VERSION change.
+
+---
+
+## Item 24 Z1+Z3+Z5 — SQL authz DDL, JWT grant enforcement, catalog relations (2026-07-19)
+
+**Branch:** `feat/item-24-authz-z1z3z5` | **PR:** [#152](https://github.com/sagarm85/unidb/pull/152)
+
+**Z1 — SQL DDL for roles, grants, and RLS policies:**
+- `CREATE ROLE <name> [SUPERUSER]` / `DROP ROLE <name>`
+- `GRANT SELECT|INSERT|UPDATE|DELETE|ALL ON <table> TO <role>` / `REVOKE ... FROM <role>`
+- `CREATE POLICY <name> ON <table> FOR SELECT|INSERT|UPDATE|DELETE|ALL USING (<predicate>)` / `DROP POLICY <name> ON <table>`
+- INSERT policies enforced per-row in `exec_insert` via `insert_policy`; SELECT/UPDATE/DELETE via `rls_policy` AND-rewrite in `apply_rls`. ALL → both.
+- Catalog-persisted across reopen.
+
+**Z3 — JWT grant enforcement on every relevant server route:**
+- `authorize_sql(user, sql)` called in `handlers.rs` before `execute_sql` on both `/sql` paths (session + one-shot).
+- `check_table_grant(user, table, Insert)` called in `bulk.rs` before reading body on `POST /tables/{name}/bulk`.
+- `apply_rls` applied at both `execute_sql_inner` call sites (lib.rs) regardless of which route invoked `execute_sql`.
+- Auth DDL and schema DDL require superuser; raw `/rows/*` routes intentionally unenforced (no table name available).
+
+**Z5 — Catalog virtual relations:**
+- `unidb_catalog.roles`, `unidb_catalog.grants`, `unidb_catalog.policies` queryable via `SELECT * FROM unidb_catalog.roles` etc.
+- `authz: Option<&'a RoleStore>` field on `ExecCtx` threads role store into executor context.
+
+**Tests:** 10 tests in `tests/authz_z1z3z5.rs`. All pass. Full suite: 434 lib tests green.
+
+**Deferred:** Z2 (audit log enrichment), Z4 (multi-tenancy namespacing), Z6 (OAuth token exchange) — not in this PR.
+
+**Locked-decision changes:** none. No FORMAT_VERSION bump, no new WAL record type, no §3 decision reopened.

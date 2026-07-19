@@ -270,7 +270,25 @@ pub struct TableDef {
     /// a legacy catalog predating the FSM (falls back to `pages`).
     #[serde(default)]
     pub fsm_meta: Option<PageId>,
+    /// RLS predicate for SELECT / UPDATE / DELETE: merged AND of all `FOR
+    /// SELECT`, `FOR UPDATE`, `FOR DELETE`, and `FOR ALL` named policies, plus
+    /// any direct `PUT /tables/{name}/rls` predicate. Applied by `apply_rls`
+    /// in the logical planner.
     pub rls_policy: Option<Expr>,
+    /// RLS predicate for INSERT: merged AND of all `FOR INSERT` and `FOR ALL`
+    /// named policies. Evaluated row-by-row in `exec_insert` after coercion
+    /// and before the heap write. `#[serde(default)]` so pre-Z1 catalog blobs
+    /// deserialize with `None`.
+    #[serde(default)]
+    pub insert_policy: Option<Expr>,
+    /// Named RLS policies (item-24 Z1). Each entry was created via
+    /// `CREATE POLICY … ON <table> FOR <op> USING (…)`. Evaluated as an
+    /// OR-of-permissive-policies per Postgres semantics: at plan time the
+    /// engine ANDs the combined OR-result into the query's predicate, just
+    /// like the existing single `rls_policy`. `#[serde(default)]` so
+    /// pre-Z1 catalog blobs deserialize with an empty list.
+    #[serde(default)]
+    pub policies: Vec<crate::authz::PolicyDef>,
     /// Whether INSERT/UPDATE/DELETE on this table also durably capture a
     /// row in `__events__` (M4). `false` by default — event capture is
     /// always an explicit opt-in via `Engine::enable_events`, never
@@ -439,6 +457,21 @@ impl Catalog {
         self.tables.values()
     }
 
+    /// Mutable access to the tables map — used only by the policy-recompute
+    /// path in `Engine::drop_policy` which needs to clear `rls_policy` and
+    /// then call `persist_only`. Do not use this for new code; prefer dedicated
+    /// mutators.
+    pub fn tables_mut(&mut self) -> &mut std::collections::HashMap<String, TableDef> {
+        &mut self.tables
+    }
+
+    /// Persist the current catalog blob without any other mutation. Used when
+    /// `Engine::drop_policy` has already mutated a `TableDef` in place via
+    /// `tables_mut`.
+    pub fn persist_only(&mut self, ctx: &mut CatalogCtx) -> Result<()> {
+        self.persist(ctx)
+    }
+
     pub fn create_table(&mut self, mut def: TableDef, ctx: &mut CatalogCtx) -> Result<()> {
         if self.tables.contains_key(&def.name) {
             return Err(DbError::TableAlreadyExists(def.name));
@@ -466,6 +499,58 @@ impl Catalog {
             .get_mut(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
         t.rls_policy = Some(policy);
+        self.persist(ctx)
+    }
+
+    /// Set the INSERT-only policy predicate (item-24 Z1: `CREATE POLICY … FOR INSERT`).
+    pub fn set_insert_policy(
+        &mut self,
+        table: &str,
+        policy: Option<Expr>,
+        ctx: &mut CatalogCtx,
+    ) -> Result<()> {
+        let t = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
+        t.insert_policy = policy;
+        self.persist(ctx)
+    }
+
+    /// Append a named RLS policy (item-24 Z1: `CREATE POLICY`). Rejects a
+    /// duplicate policy name on the same table (case-sensitive).
+    pub fn add_policy(
+        &mut self,
+        policy: crate::authz::PolicyDef,
+        ctx: &mut CatalogCtx,
+    ) -> Result<()> {
+        let t = self
+            .tables
+            .get_mut(&policy.table)
+            .ok_or_else(|| DbError::TableNotFound(policy.table.clone()))?;
+        if t.policies.iter().any(|p| p.name == policy.name) {
+            return Err(DbError::Authz(format!(
+                "policy '{}' already exists on table '{}'",
+                policy.name, policy.table
+            )));
+        }
+        t.policies.push(policy);
+        self.persist(ctx)
+    }
+
+    /// Remove a named RLS policy (item-24 Z1: `DROP POLICY`).
+    pub fn remove_policy(&mut self, name: &str, table: &str, ctx: &mut CatalogCtx) -> Result<()> {
+        let t = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
+        let before = t.policies.len();
+        t.policies.retain(|p| p.name != name);
+        if t.policies.len() == before {
+            return Err(DbError::Authz(format!(
+                "policy '{name}' not found on table '{table}'"
+            )));
+        }
         self.persist(ctx)
     }
 
@@ -868,6 +953,8 @@ mod tests {
             pages: vec![],
             fsm_meta: None,
             rls_policy: None,
+            insert_policy: None,
+            policies: vec![],
             events_enabled: false,
             serial_next: Default::default(),
             constraints: Default::default(),
@@ -896,6 +983,8 @@ mod tests {
             pages: vec![],
             fsm_meta: None,
             rls_policy: None,
+            insert_policy: None,
+            policies: vec![],
             events_enabled: false,
             serial_next: Default::default(),
             constraints: Default::default(),
@@ -943,6 +1032,8 @@ mod tests {
             pages: vec![7],
             fsm_meta: None,
             rls_policy: None,
+            insert_policy: None,
+            policies: vec![],
             events_enabled: false,
             serial_next: Default::default(),
             constraints: Default::default(),
@@ -996,6 +1087,8 @@ mod tests {
             pages: vec![],
             fsm_meta: None,
             rls_policy: None,
+            insert_policy: None,
+            policies: vec![],
             events_enabled: false,
             serial_next: Default::default(),
             constraints: Default::default(),
@@ -1030,6 +1123,8 @@ mod tests {
             pages: vec![],
             fsm_meta: None,
             rls_policy: None,
+            insert_policy: None,
+            policies: vec![],
             events_enabled: false,
             serial_next: Default::default(),
             constraints: Default::default(),
@@ -1079,6 +1174,8 @@ mod tests {
             pages: vec![],
             fsm_meta: None,
             rls_policy: None,
+            insert_policy: None,
+            policies: vec![],
             events_enabled: false,
             serial_next: Default::default(),
             constraints: Default::default(),
@@ -1168,6 +1265,8 @@ mod tests {
                     pages: vec![],
                     fsm_meta: None,
                     rls_policy: None,
+                    insert_policy: None,
+                    policies: vec![],
                     events_enabled: false,
                     serial_next: Default::default(),
                     constraints: Default::default(),

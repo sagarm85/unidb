@@ -1,4 +1,4 @@
-// Users, roles, and privileges (P6.e).
+// Users, roles, and privileges (P6.e / item-24 Z1).
 //
 // A persisted authorization store: users (optionally superuser), roles, role
 // membership (users→roles and roles→roles, resolved transitively), and
@@ -9,8 +9,9 @@
 // **Superuser model:** the embedded API runs as an implicit superuser (identity
 // `None`) — every existing embedded call is unchanged and unrestricted. A named
 // user created `SUPERUSER` can also administer. Auth DDL (CREATE/DROP USER|ROLE,
-// GRANT, REVOKE) and schema DDL require superuser in v1; data statements
-// (SELECT/INSERT/UPDATE/DELETE) require the matching privilege on the table.
+// GRANT, REVOKE, CREATE/DROP POLICY) and schema DDL require superuser in v1;
+// data statements (SELECT/INSERT/UPDATE/DELETE) require the matching privilege
+// on the table.
 //
 // The auth DDL grammar is small and parsed here (not via `sqlparser`, whose
 // GRANT/ROLE AST is awkward) so the surface stays controlled:
@@ -21,9 +22,13 @@
 //   GRANT <role> TO <grantee>                       (role membership)
 //   REVOKE <priv,.. | ALL> ON <table> FROM <grantee>
 //   REVOKE <role> FROM <grantee>
+//   CREATE POLICY <name> ON <table> FOR <op> USING (<predicate>)
+//   DROP POLICY <name> ON <table>
 //
-// Persisted to `roles.json` (control-plane metadata, so `serde` is fine per
-// CLAUDE.md §4). `Send + Sync` for the shared `Engine`.
+// Roles/users/grants persist to `roles.json` (control-plane metadata, so
+// `serde` is fine per CLAUDE.md §4). Named policies persist in the catalog
+// blob (alongside `rls_policy`) so there is no FORMAT_VERSION bump.
+// `Send + Sync` for the shared `Engine`.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -63,6 +68,15 @@ impl Privilege {
             Privilege::Delete,
         ]
     }
+    /// String representation for catalog exposure (Z5).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Privilege::Select => "SELECT",
+            Privilege::Insert => "INSERT",
+            Privilege::Update => "UPDATE",
+            Privilege::Delete => "DELETE",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -76,8 +90,58 @@ struct AuthState {
     table_grants: BTreeMap<String, BTreeMap<String, BTreeSet<Privilege>>>,
 }
 
+/// Operation scope for a named RLS policy (item-24 Z1).
+/// `All` expands to "applies to every DML operation".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PolicyOp {
+    Select,
+    Insert,
+    Update,
+    Delete,
+    All,
+}
+
+impl PolicyOp {
+    fn parse(s: &str) -> Option<PolicyOp> {
+        match s.to_ascii_uppercase().as_str() {
+            "SELECT" => Some(PolicyOp::Select),
+            "INSERT" => Some(PolicyOp::Insert),
+            "UPDATE" => Some(PolicyOp::Update),
+            "DELETE" => Some(PolicyOp::Delete),
+            "ALL" => Some(PolicyOp::All),
+            _ => None,
+        }
+    }
+
+    /// String representation for catalog exposure (Z5).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PolicyOp::Select => "SELECT",
+            PolicyOp::Insert => "INSERT",
+            PolicyOp::Update => "UPDATE",
+            PolicyOp::Delete => "DELETE",
+            PolicyOp::All => "ALL",
+        }
+    }
+}
+
+/// A named RLS policy stored in the catalog `TableDef.policies` (item-24 Z1).
+/// Mirrors Postgres `pg_policy`: a name, an operation scope, and a USING
+/// predicate SQL string (stored verbatim; re-parsed at plan time via
+/// `set_rls_policy_sql`). `WITH CHECK` is the same predicate in this slice
+/// (full separate-check support is a Z2+ concern).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PolicyDef {
+    pub name: String,
+    pub table: String,
+    pub op: PolicyOp,
+    /// Raw SQL predicate (the `USING (…)` clause), stored verbatim for
+    /// catalog exposure (Z5). Re-parsed into `Expr` at apply time.
+    pub using_expr: String,
+}
+
 /// A parsed auth-DDL statement.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub enum AuthStmt {
     CreateUser {
         name: String,
@@ -103,6 +167,13 @@ pub enum AuthStmt {
     RevokeRole {
         role: String,
         grantee: String,
+    },
+    /// `CREATE POLICY <name> ON <table> FOR <op> USING (<predicate>)` (Z1).
+    CreatePolicy(PolicyDef),
+    /// `DROP POLICY <name> ON <table>` (Z1).
+    DropPolicy {
+        name: String,
+        table: String,
     },
 }
 
@@ -193,6 +264,26 @@ impl RoleStore {
             .collect()
     }
 
+    /// Snapshot of all role names (item-24 Z5: `unidb_catalog.roles`).
+    pub fn roles(&self) -> Vec<String> {
+        self.lock().roles.iter().cloned().collect()
+    }
+
+    /// Snapshot of all grants as `(grantee, table, privilege)` triples
+    /// (item-24 Z5: `unidb_catalog.grants`).
+    pub fn grants(&self) -> Vec<(String, String, Privilege)> {
+        let st = self.lock();
+        let mut out = Vec::new();
+        for (grantee, tables) in &st.table_grants {
+            for (table, privs) in tables {
+                for p in privs {
+                    out.push((grantee.clone(), table.clone(), *p));
+                }
+            }
+        }
+        out
+    }
+
     /// Apply a parsed auth-DDL statement. The caller must have already checked
     /// the actor is a superuser.
     pub fn apply(&self, stmt: &AuthStmt) -> Result<()> {
@@ -272,6 +363,14 @@ impl RoleStore {
                     roles.remove(role);
                 }
             }
+            // Policy DDL is routed to the catalog by `Engine::exec_auth_stmt`
+            // before it ever reaches here. If somehow called directly, return
+            // an internal error rather than panicking.
+            AuthStmt::CreatePolicy(_) | AuthStmt::DropPolicy { .. } => {
+                return Err(DbError::Authz(
+                    "CREATE/DROP POLICY must be applied via Engine::exec_auth_stmt, not RoleStore::apply".into(),
+                ));
+            }
         }
         self.persist(&st)?;
         tracing::info!(?stmt, "auth DDL applied");
@@ -319,8 +418,98 @@ pub fn parse_auth_stmt(sql: &str) -> Result<Option<AuthStmt>> {
         ("DROP", "ROLE") => Ok(Some(AuthStmt::DropRole(ident(toks.get(2))?))),
         ("GRANT", _) => parse_grant_revoke(&toks, true).map(Some),
         ("REVOKE", _) => parse_grant_revoke(&toks, false).map(Some),
+        ("CREATE", "POLICY") => parse_create_policy(trimmed).map(Some),
+        ("DROP", "POLICY") => parse_drop_policy(&toks).map(Some),
         _ => Ok(None),
     }
+}
+
+/// `CREATE POLICY <name> ON <table> FOR <op> USING (<predicate>)`
+///
+/// The USING clause may span multiple tokens (it is a SQL expression); we
+/// find `USING` case-insensitively and take everything after `(` through the
+/// final `)` as the raw predicate string.
+fn parse_create_policy(sql: &str) -> Result<AuthStmt> {
+    let upper = sql.to_ascii_uppercase();
+    // Tokenised version for the keyword positions.
+    let toks: Vec<&str> = sql.split_whitespace().collect();
+    let upper_toks: Vec<String> = toks.iter().map(|t| t.to_ascii_uppercase()).collect();
+
+    // Name is toks[2].
+    let name = ident(toks.get(2))?;
+
+    // ON position.
+    let on_pos = upper_toks
+        .iter()
+        .position(|t| t == "ON")
+        .ok_or_else(|| DbError::SqlParse("CREATE POLICY: missing ON clause".into()))?;
+    let table = ident(toks.get(on_pos + 1))?;
+
+    // FOR position (optional — defaults to ALL).
+    let op = if let Some(for_pos) = upper_toks.iter().position(|t| t == "FOR") {
+        let op_str = toks.get(for_pos + 1).ok_or_else(|| {
+            DbError::SqlParse("CREATE POLICY: missing operation after FOR".into())
+        })?;
+        PolicyOp::parse(op_str).ok_or_else(|| {
+            DbError::SqlParse(format!("CREATE POLICY: unknown operation '{op_str}'"))
+        })?
+    } else {
+        PolicyOp::All
+    };
+
+    // USING clause: everything between the outermost `(` and `)` after the
+    // USING keyword.
+    let using_kw_pos = upper
+        .find("USING")
+        .ok_or_else(|| DbError::SqlParse("CREATE POLICY: missing USING clause".into()))?;
+    let after_using = &sql[using_kw_pos + 5..]; // skip "USING"
+    let open = after_using.find('(').ok_or_else(|| {
+        DbError::SqlParse("CREATE POLICY: USING clause must be parenthesised".into())
+    })?;
+    let inner = &after_using[open + 1..];
+    // Walk to find the matching close paren (depth-aware).
+    let mut depth = 1usize;
+    let mut close = None;
+    for (i, ch) in inner.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close
+        .ok_or_else(|| DbError::SqlParse("CREATE POLICY: unclosed USING parenthesis".into()))?;
+    let using_expr = inner[..close].trim().to_string();
+    if using_expr.is_empty() {
+        return Err(DbError::SqlParse(
+            "CREATE POLICY: USING predicate cannot be empty".into(),
+        ));
+    }
+
+    Ok(AuthStmt::CreatePolicy(PolicyDef {
+        name,
+        table,
+        op,
+        using_expr,
+    }))
+}
+
+/// `DROP POLICY <name> ON <table>`
+fn parse_drop_policy(toks: &[&str]) -> Result<AuthStmt> {
+    let name = ident(toks.get(2))?;
+    let upper_toks: Vec<String> = toks.iter().map(|t| t.to_ascii_uppercase()).collect();
+    let on_pos = upper_toks
+        .iter()
+        .position(|t| t == "ON")
+        .ok_or_else(|| DbError::SqlParse("DROP POLICY: missing ON clause".into()))?;
+    let table = ident(toks.get(on_pos + 1))?;
+    Ok(AuthStmt::DropPolicy { name, table })
 }
 
 fn ident(tok: Option<&&str>) -> Result<String> {

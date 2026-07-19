@@ -533,7 +533,11 @@ impl Runner<'_, '_> {
                     self.ctx.event_seq_index_meta,
                 )?
             } else {
-                crate::sql::information_schema::virtual_rows(table, self.ctx.catalog.get())?
+                crate::sql::information_schema::virtual_rows(
+                    table,
+                    self.ctx.catalog.get(),
+                    self.ctx.authz,
+                )?
             };
             return Ok(Batch {
                 schema: output.to_vec(),
