@@ -1234,7 +1234,8 @@ pub fn execute(plan: LogicalPlan, ctx: &mut ExecCtx) -> Result<ExecResult> {
             name,
             columns,
             constraints,
-        } => exec_create_table(name, columns, constraints, ctx),
+            fill_factor,
+        } => exec_create_table(name, columns, constraints, fill_factor, ctx),
         LogicalPlan::Insert {
             table,
             columns,
@@ -1374,6 +1375,7 @@ fn exec_create_table(
     name: String,
     columns: Vec<ColumnDef>,
     constraints: TableConstraints,
+    fill_factor: u8,
     ctx: &mut ExecCtx,
 ) -> Result<ExecResult> {
     // Identity/SERIAL columns (P2.d) must be Int64, and start their counter
@@ -1423,6 +1425,7 @@ fn exec_create_table(
         constraints,
         generation: 0,
         row_count: 0,
+        fill_factor,
     };
     let mut cctx = catalog_ctx!(ctx);
     ctx.catalog.exclusive()?.create_table(def, &mut cctx)?;
@@ -1663,7 +1666,10 @@ fn exec_insert(
     // FK (M11): only referenced-table existence is enforced, and it's a
     // schema-level property — check it once per statement, not per row.
     enforce_referenced_tables_exist(&table_def, ctx.catalog.get())?;
-    let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
+    // Item 69: apply the table's fill-factor reservation so INSERT stops
+    // packing a page once the HOT-reserved slack threshold is reached.
+    let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone())
+        .with_fill_factor(table_def.fill_factor);
 
     // Item 98: streaming-accumulation insert.
     //
@@ -6110,6 +6116,7 @@ mod tests {
             constraints: Default::default(),
             generation: 0,
             row_count: 0,
+            fill_factor: 100,
         };
         let err = coerce_and_validate_row(&table, vec![Literal::Vector(vec![0.1, 0.2, 0.3])]);
         assert!(matches!(err, Err(DbError::SqlPlan(_))));

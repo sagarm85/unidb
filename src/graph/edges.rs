@@ -88,6 +88,7 @@ pub fn edges_table_def() -> TableDef {
         constraints: Default::default(),
         generation: 0,
         row_count: 0,
+        fill_factor: 100,
     }
 }
 

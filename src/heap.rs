@@ -98,6 +98,12 @@ pub struct Heap {
     /// page id + page size), so holding one costs nothing and reopening it is
     /// O(1).
     fsm_tree: Option<DiskBTree>,
+    /// Item 69: fill-factor page reservation.  INSERT stops packing a page once
+    /// its free bytes drop below `page_size * (100 - fill_factor) / 100`.  The
+    /// reserve is for HOT UPDATE rewrites (items 58/71); HOT paths bypass it
+    /// intentionally (they use real free space).  Range 10–100; default 100
+    /// (dense packing, backward-compatible; reserve = 0 bytes).
+    fill_factor: u8,
 }
 
 /// Open-page accumulation state for [`Heap::insert_accumulating`] (item 98).
@@ -150,6 +156,7 @@ impl Heap {
                 ..HeapFsm::default()
             }),
             fsm_tree: None,
+            fill_factor: 100,
         }
     }
 
@@ -165,6 +172,7 @@ impl Heap {
                 directory_loaded: true,
             }),
             fsm_tree: None,
+            fill_factor: 100,
         }
     }
 
@@ -184,9 +192,22 @@ impl Heap {
                     directory_loaded: false,
                 }),
                 fsm_tree: Some(DiskBTree::new(meta, page_size)),
+                fill_factor: 100,
             },
             None => Self::from_pages(page_size, legacy_pages),
         }
+    }
+
+    /// Item 69: set the fill-factor reservation for this heap.
+    ///
+    /// INSERT stops packing a page once its free bytes fall below
+    /// `page_size * (100 - fill_factor) / 100`, reserving that slack for
+    /// same-page HOT UPDATE rewrites.  Valid range 10–100; 100 disables the
+    /// reserve (dense packing, default).  HOT update paths bypass the reserve
+    /// intentionally — the reserve exists precisely to benefit them.
+    pub fn with_fill_factor(mut self, fill_factor: u8) -> Self {
+        self.fill_factor = fill_factor;
+        self
     }
 
     /// Lazily populate the in-memory page directory from the durable FSM tree,
@@ -292,13 +313,18 @@ impl Heap {
         let needed = crate::page::SLOT_SIZE + crate::page::TUPLE_HEADER_SIZE + data.len();
 
         // Fast path: current page has room — append within the same mini-txn.
+        // Item 69: the fill-factor reserve is applied here too, so that
+        // multi-row VALUES batches honour the reservation within a page and
+        // spill to a new page at the fill-factor threshold — not only when
+        // acquiring the very first page of a batch.
+        let reserve = (self.page_size * (100 - self.fill_factor as usize)) / 100;
         if let Some(acc) = state.as_mut() {
             // Fetch the page fresh from the pool to get the post-write state.
             // The exclusive latch (_wg) is still held so no other writer can
             // race us here.  We do NOT call acquire_page_for_insert — the latch
             // guarantees the page is ours.
             let mut page = pool.fetch_page_for_write(acc.page_id, wal)?;
-            if page.free_space() >= needed {
+            if page.free_space() >= needed + reserve {
                 let slot = page.insert_versioned(data, xid, 0, None)?;
                 let row_id = RowId {
                     page_id: acc.page_id,
@@ -403,7 +429,47 @@ impl Heap {
     /// freshly `alloc_heap_page`'d page always fits, so the loop terminates. The
     /// FSM lock is only ever taken with no page latch held, or *after* one
     /// (never the reverse), so the two lock classes form no cycle.
+    /// Acquire a page for a new INSERT, applying the fill-factor reserve
+    /// (item 69): INSERT stops packing a page once its free bytes drop below
+    /// `page_size * (100 - fill_factor) / 100`.  The reserve is for HOT UPDATE
+    /// rewrites (items 58/71); UPDATE cross-page paths use
+    /// `acquire_page_for_update` which bypasses the reserve intentionally.
+    ///
+    /// IMPORTANT: `find_or_alloc_page` is called with the full threshold
+    /// (`needed + reserve`) so the FSM pre-filter skips pages that are already
+    /// below the threshold.  Passing only `needed` would cause an infinite loop
+    /// when fill_factor < 100 (a page with `needed <= free < needed+reserve`
+    /// would be returned by the FSM, rejected here, noted at its real free
+    /// bytes — which are still >= needed — and then immediately re-picked).
     fn acquire_page_for_insert(
+        &self,
+        needed: usize,
+        pool: &BufferPool,
+        wal: &Wal,
+    ) -> Result<(PageId, ExclusiveLatch, SlottedPage)> {
+        let reserve = (self.page_size * (100 - self.fill_factor as usize)) / 100;
+        let threshold = needed + reserve;
+        loop {
+            let page_id = self.find_or_alloc_page(threshold, pool, wal)?;
+            let latch = pool.latch_exclusive(page_id);
+            let page = pool.fetch_page_for_write(page_id, wal)?;
+            if page.free_space() >= threshold {
+                return Ok((page_id, latch, page));
+            }
+            // Lost the page to a concurrent writer; correct the FSM's cached
+            // free-space so we don't immediately re-pick it, then retry.
+            let free = page.free_space();
+            pool.unpin(page_id);
+            drop(latch);
+            self.note_free_space(page_id, free);
+        }
+    }
+
+    /// Acquire a page for a new row version in an UPDATE (cross-page fallback).
+    /// Does NOT apply the fill-factor reserve: UPDATE writes into the reserved
+    /// slack — that is exactly what the reserve is for.  Uses `needed` as the
+    /// threshold so any page with sufficient real free space is eligible.
+    fn acquire_page_for_update(
         &self,
         needed: usize,
         pool: &BufferPool,
@@ -416,8 +482,6 @@ impl Heap {
             if page.free_space() >= needed {
                 return Ok((page_id, latch, page));
             }
-            // Lost the page to a concurrent writer; correct the FSM's cached
-            // free-space so we don't immediately re-pick it, then retry.
             let free = page.free_space();
             pool.unpin(page_id);
             drop(latch);
@@ -537,7 +601,9 @@ impl Heap {
         // New version's insert, under a fresh page latch acquired only after the
         // old latch was released (one physical latch at a time — never two — so
         // two concurrent updates can't deadlock on inverse page-latch order).
-        let (new_page_id, _ng, mut new_page) = self.acquire_page_for_insert(needed, pool, wal)?;
+        // Item 69: use acquire_page_for_update (no fill-factor reserve) — the
+        // update is writing INTO the reserved slack, not past it.
+        let (new_page_id, _ng, mut new_page) = self.acquire_page_for_update(needed, pool, wal)?;
         // P1.a: full-page image of the new-version page before its insert. A
         // no-op if this is the same page as the old version (already covered).
         let ins_prev = pool
@@ -717,9 +783,11 @@ impl Heap {
         // Step 1: acquire a new page and insert the new version.
         // Latch is released before we touch the old page (new-before-old order;
         // see doc comment above).
+        // Item 69: use acquire_page_for_update (no fill-factor reserve) — the
+        // cross-page fallback writes INTO the reserved slack, not past it.
         let (new_page_id, new_slot, ins_lsn) = {
             let (new_page_id, _ng, mut new_page) =
-                self.acquire_page_for_insert(needed, pool, wal)?;
+                self.acquire_page_for_update(needed, pool, wal)?;
             // P1.a: FPI for new page before its first change.
             let fpi_new = pool
                 .maybe_log_fpi(new_page_id, wal, txn_id, begin_lsn)?
@@ -999,7 +1067,7 @@ impl Heap {
         // Phase B: insert new versions, packing as many per fill page as fit.
         //
         // Guaranteed progress: the outer loop always advances `i` by at least
-        // one row per fill page because `acquire_page_for_insert` ensures the
+        // one row per fill page because `acquire_page_for_update` ensures the
         // first row of each batch fits, so the inner while can insert at least
         // one row before breaking.
         //
@@ -1010,6 +1078,10 @@ impl Heap {
         // mini-txns; the A→B phase order and per-row xmax checks are unchanged.
         // `note_free_space` is still called so the FSM stays accurate for future
         // statements; the cursor is purely a within-statement fast path.
+        //
+        // Item 69: use acquire_page_for_update (no fill-factor reserve) — new
+        // row versions from an UPDATE write INTO the reserved slack, not past
+        // it.  That is the entire point of the fill-factor reservation.
         let mut fill_cursor: Option<(PageId, usize)> = None; // (page_id, remaining_free)
         let mut result = Vec::with_capacity(rows.len());
         let mut i = 0;
@@ -1025,7 +1097,7 @@ impl Heap {
                     let page = pool.fetch_page_for_write(pid, wal)?;
                     (pid, ng, page)
                 } else {
-                    self.acquire_page_for_insert(needed, pool, wal)?
+                    self.acquire_page_for_update(needed, pool, wal)?
                 };
 
             let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
@@ -1222,6 +1294,10 @@ impl Heap {
         // Carry remaining capacity forward to skip FSM mutex on the next fill page
         // when the previous one still has room. No latch is held between mini-txns;
         // the cursor is a local within-statement fast path only.
+        //
+        // Item 69: use acquire_page_for_update (no fill-factor reserve) — new
+        // row versions from a HOT UPDATE write INTO the reserved slack, not past
+        // it.  That is the point of the fill-factor reservation.
         let mut fill_cursor: Option<(PageId, usize)> = None; // (page_id, remaining_free)
         let mut b_pairs: Vec<(RowId, RowId)> = Vec::with_capacity(rows.len());
         let mut i = 0;
@@ -1237,7 +1313,7 @@ impl Heap {
                     let page = pool.fetch_page_for_write(pid, wal)?;
                     (pid, ng, page)
                 } else {
-                    self.acquire_page_for_insert(needed, pool, wal)?
+                    self.acquire_page_for_update(needed, pool, wal)?
                 };
 
             let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
