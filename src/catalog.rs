@@ -270,17 +270,27 @@ pub struct TableDef {
     /// a legacy catalog predating the FSM (falls back to `pages`).
     #[serde(default)]
     pub fsm_meta: Option<PageId>,
-    /// RLS predicate for SELECT / UPDATE / DELETE: merged AND of all `FOR
-    /// SELECT`, `FOR UPDATE`, `FOR DELETE`, and `FOR ALL` named policies, plus
-    /// any direct `PUT /tables/{name}/rls` predicate. Applied by `apply_rls`
-    /// in the logical planner.
+    /// RLS predicate for SELECT: merged OR of all `FOR SELECT` and `FOR ALL`
+    /// named policies, plus any direct `PUT /tables/{name}/rls` predicate.
+    /// Applied by `apply_rls` in the logical planner for SELECT/JOIN contexts.
+    /// (Z2: was previously shared by SELECT/UPDATE/DELETE; now SELECT-only.)
     pub rls_policy: Option<Expr>,
-    /// RLS predicate for INSERT: merged AND of all `FOR INSERT` and `FOR ALL`
+    /// RLS predicate for INSERT: merged OR of all `FOR INSERT` and `FOR ALL`
     /// named policies. Evaluated row-by-row in `exec_insert` after coercion
     /// and before the heap write. `#[serde(default)]` so pre-Z1 catalog blobs
     /// deserialize with `None`.
     #[serde(default)]
     pub insert_policy: Option<Expr>,
+    /// RLS predicate for UPDATE: merged OR of all `FOR UPDATE` and `FOR ALL`
+    /// named policies (item-24 Z2). Applied by `apply_rls` to UPDATE scans.
+    /// `#[serde(default)]` so pre-Z2 catalog blobs deserialize with `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_policy: Option<Expr>,
+    /// RLS predicate for DELETE: merged OR of all `FOR DELETE` and `FOR ALL`
+    /// named policies (item-24 Z2). Applied by `apply_rls` to DELETE scans.
+    /// `#[serde(default)]` so pre-Z2 catalog blobs deserialize with `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_policy: Option<Expr>,
     /// Named RLS policies (item-24 Z1). Each entry was created via
     /// `CREATE POLICY … ON <table> FOR <op> USING (…)`. Evaluated as an
     /// OR-of-permissive-policies per Postgres semantics: at plan time the
@@ -542,6 +552,36 @@ impl Catalog {
             .get_mut(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
         t.insert_policy = policy;
+        self.persist(ctx).map(|_| ())
+    }
+
+    /// Set the UPDATE-scoped policy predicate (item-24 Z2: `CREATE POLICY … FOR UPDATE`).
+    pub fn set_update_policy(
+        &mut self,
+        table: &str,
+        policy: Option<Expr>,
+        ctx: &mut CatalogCtx,
+    ) -> Result<()> {
+        let t = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
+        t.update_policy = policy;
+        self.persist(ctx).map(|_| ())
+    }
+
+    /// Set the DELETE-scoped policy predicate (item-24 Z2: `CREATE POLICY … FOR DELETE`).
+    pub fn set_delete_policy(
+        &mut self,
+        table: &str,
+        policy: Option<Expr>,
+        ctx: &mut CatalogCtx,
+    ) -> Result<()> {
+        let t = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
+        t.delete_policy = policy;
         self.persist(ctx).map(|_| ())
     }
 
@@ -983,6 +1023,8 @@ mod tests {
             fsm_meta: None,
             rls_policy: None,
             insert_policy: None,
+            update_policy: None,
+            delete_policy: None,
             policies: vec![],
             events_enabled: false,
             serial_next: Default::default(),
@@ -1014,6 +1056,8 @@ mod tests {
             fsm_meta: None,
             rls_policy: None,
             insert_policy: None,
+            update_policy: None,
+            delete_policy: None,
             policies: vec![],
             events_enabled: false,
             serial_next: Default::default(),
@@ -1064,6 +1108,8 @@ mod tests {
             fsm_meta: None,
             rls_policy: None,
             insert_policy: None,
+            update_policy: None,
+            delete_policy: None,
             policies: vec![],
             events_enabled: false,
             serial_next: Default::default(),
@@ -1120,6 +1166,8 @@ mod tests {
             fsm_meta: None,
             rls_policy: None,
             insert_policy: None,
+            update_policy: None,
+            delete_policy: None,
             policies: vec![],
             events_enabled: false,
             serial_next: Default::default(),
@@ -1157,6 +1205,8 @@ mod tests {
             fsm_meta: None,
             rls_policy: None,
             insert_policy: None,
+            update_policy: None,
+            delete_policy: None,
             policies: vec![],
             events_enabled: false,
             serial_next: Default::default(),
@@ -1209,6 +1259,8 @@ mod tests {
             fsm_meta: None,
             rls_policy: None,
             insert_policy: None,
+            update_policy: None,
+            delete_policy: None,
             policies: vec![],
             events_enabled: false,
             serial_next: Default::default(),
@@ -1301,6 +1353,8 @@ mod tests {
                     fsm_meta: None,
                     rls_policy: None,
                     insert_policy: None,
+                    update_policy: None,
+                    delete_policy: None,
                     policies: vec![],
                     events_enabled: false,
                     serial_next: Default::default(),

@@ -2313,31 +2313,54 @@ impl Engine {
         let op = policy.op;
         let expr = Self::parse_policy_predicate(&table, &policy.using_expr)?;
         cat.add_policy(policy, ctx)?;
-        // Route by operation:
-        // - INSERT-only policies → insert_policy (checked per-row in exec_insert).
-        // - ALL → both insert_policy and rls_policy.
-        // - SELECT/UPDATE/DELETE → rls_policy (AND-rewritten into the scan predicate).
+        // Route by operation (item-24 Z2: per-op materialized predicates):
+        // - INSERT or ALL → insert_policy (OR semantics).
+        // - SELECT or ALL → rls_policy (SELECT-scoped, OR semantics).
+        // - UPDATE or ALL → update_policy (UPDATE-scoped, OR semantics).
+        // - DELETE or ALL → delete_policy (DELETE-scoped, OR semantics).
+        //
+        // Permissive policies use OR (any matching policy permits the row), per
+        // Postgres semantics. This replaces the prior AND-merge which was wrong.
         if matches!(op, PolicyOp::Insert | PolicyOp::All) {
             let existing = cat
                 .lookup(&table)
                 .ok()
                 .and_then(|t| t.insert_policy.clone());
             let merged = match existing {
-                Some(old) => Expr::And(Box::new(old), Box::new(expr.clone())),
+                Some(old) => Expr::Or(Box::new(old), Box::new(expr.clone())),
                 None => expr.clone(),
             };
             cat.set_insert_policy(&table, Some(merged), ctx)?;
         }
-        if matches!(
-            op,
-            PolicyOp::Select | PolicyOp::Update | PolicyOp::Delete | PolicyOp::All
-        ) {
+        if matches!(op, PolicyOp::Select | PolicyOp::All) {
             let existing = cat.lookup(&table).ok().and_then(|t| t.rls_policy.clone());
             let merged = match existing {
-                Some(old) => Expr::And(Box::new(old), Box::new(expr)),
-                None => expr,
+                Some(old) => Expr::Or(Box::new(old), Box::new(expr.clone())),
+                None => expr.clone(),
             };
             cat.set_rls_policy(&table, merged, ctx)?;
+        }
+        if matches!(op, PolicyOp::Update | PolicyOp::All) {
+            let existing = cat
+                .lookup(&table)
+                .ok()
+                .and_then(|t| t.update_policy.clone());
+            let merged = match existing {
+                Some(old) => Expr::Or(Box::new(old), Box::new(expr.clone())),
+                None => expr.clone(),
+            };
+            cat.set_update_policy(&table, Some(merged), ctx)?;
+        }
+        if matches!(op, PolicyOp::Delete | PolicyOp::All) {
+            let existing = cat
+                .lookup(&table)
+                .ok()
+                .and_then(|t| t.delete_policy.clone());
+            let merged = match existing {
+                Some(old) => Expr::Or(Box::new(old), Box::new(expr.clone())),
+                None => expr.clone(),
+            };
+            cat.set_delete_policy(&table, Some(merged), ctx)?;
         }
         Ok(())
     }
@@ -2360,19 +2383,14 @@ impl Engine {
             .ok()
             .map(|t| t.policies.clone())
             .unwrap_or_default();
-        // Recompute rls_policy (SELECT/UPDATE/DELETE/ALL) from remaining.
+        // Recompute rls_policy (SELECT/ALL) from remaining — OR semantics.
         let rls_merged = policies
             .iter()
-            .filter(|p| {
-                matches!(
-                    p.op,
-                    PolicyOp::Select | PolicyOp::Update | PolicyOp::Delete | PolicyOp::All
-                )
-            })
+            .filter(|p| matches!(p.op, PolicyOp::Select | PolicyOp::All))
             .try_fold(None::<Expr>, |acc, p| {
                 let expr = Self::parse_policy_predicate(table, &p.using_expr)?;
                 Ok::<_, crate::error::DbError>(Some(match acc {
-                    Some(old) => Expr::And(Box::new(old), Box::new(expr)),
+                    Some(old) => Expr::Or(Box::new(old), Box::new(expr)),
                     None => expr,
                 }))
             })?;
@@ -2383,17 +2401,41 @@ impl Engine {
             .try_fold(None::<Expr>, |acc, p| {
                 let expr = Self::parse_policy_predicate(table, &p.using_expr)?;
                 Ok::<_, crate::error::DbError>(Some(match acc {
-                    Some(old) => Expr::And(Box::new(old), Box::new(expr)),
+                    Some(old) => Expr::Or(Box::new(old), Box::new(expr)),
                     None => expr,
                 }))
             })?;
-        // Update both policies in place and persist once.
+        // Recompute update_policy (UPDATE/ALL) from remaining.
+        let upd_merged = policies
+            .iter()
+            .filter(|p| matches!(p.op, PolicyOp::Update | PolicyOp::All))
+            .try_fold(None::<Expr>, |acc, p| {
+                let expr = Self::parse_policy_predicate(table, &p.using_expr)?;
+                Ok::<_, crate::error::DbError>(Some(match acc {
+                    Some(old) => Expr::Or(Box::new(old), Box::new(expr)),
+                    None => expr,
+                }))
+            })?;
+        // Recompute delete_policy (DELETE/ALL) from remaining.
+        let del_merged = policies
+            .iter()
+            .filter(|p| matches!(p.op, PolicyOp::Delete | PolicyOp::All))
+            .try_fold(None::<Expr>, |acc, p| {
+                let expr = Self::parse_policy_predicate(table, &p.using_expr)?;
+                Ok::<_, crate::error::DbError>(Some(match acc {
+                    Some(old) => Expr::Or(Box::new(old), Box::new(expr)),
+                    None => expr,
+                }))
+            })?;
+        // Update all four policy fields in place and persist once.
         let t = cat
             .tables_mut()
             .get_mut(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
         t.rls_policy = rls_merged;
         t.insert_policy = ins_merged;
+        t.update_policy = upd_merged;
+        t.delete_policy = del_merged;
         cat.persist_only(ctx).map(|_| ())
     }
 
