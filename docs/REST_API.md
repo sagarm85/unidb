@@ -267,6 +267,73 @@ HTTP 404
 
 ---
 
+### `POST /batch-sql`
+
+Execute up to **256 independent one-shot SQL statements** in a single HTTP
+round-trip, amortising the per-request fsync and network overhead (~10 ms/call
+on typical setups). Each statement is auto-committed independently — there is
+**no shared transaction** across the batch.
+
+**Payload**:
+```json
+{
+  "statements": [
+    "SELECT COUNT(*) FROM t",
+    "SELECT * FROM t WHERE id = 1",
+    "INSERT INTO t (id, name) VALUES (3, 'carol')"
+  ],
+  "stop_on_error": false
+}
+```
+
+`stop_on_error` (default `false`):
+- `false` — all statements are attempted regardless of earlier failures; failed
+  slots get a `null` result and an error string.
+- `true` — stop at the first error; remaining slots get `null` result +
+  `"skipped"` error string.
+
+**Response** `200 OK` — always `200`; per-statement failures appear inside the
+payload, not as HTTP error codes:
+```json
+{
+  "results": [
+    { "type": "rows", "columns": ["count"], "rows": [[2]] },
+    { "type": "rows", "columns": ["id", "name"], "rows": [[1, "alice"]] },
+    { "type": "inserted", "count": 1 }
+  ],
+  "errors": [null, null, null]
+}
+```
+
+A failed slot:
+```json
+{
+  "results": [null],
+  "errors": ["table not found: nonexistent_table"]
+}
+```
+
+A skipped slot (after a failure when `stop_on_error: true`):
+```json
+{
+  "results": [null],
+  "errors": ["skipped"]
+}
+```
+
+**Error codes** (HTTP-level — only for malformed requests, not statement
+failures):
+
+| Code | Status | Meaning |
+|------|--------|---------|
+| `BATCH_TOO_LARGE` | `400` | More than 256 statements in one request |
+
+Auth: `authorize_sql` is called per statement (honours per-user grants). Auth
+DDL (`CREATE USER` / `GRANT` / `REVOKE`) is accepted per-slot via the same
+`execute_sql_as` path as `POST /sql`.
+
+---
+
 ### `GET /sql/cursor/{cursor_id}` · `DELETE /sql/cursor/{cursor_id}`
 
 Page (or drop) a cursor opened by `POST /sql` with `"cursor": true` (R4).

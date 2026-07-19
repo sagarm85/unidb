@@ -282,3 +282,9 @@ required-features = ["server"]
 name = "server_bulk"
 path = "tests/server_bulk.rs"
 required-features = ["server"]
+
+# Item 99: batch-sql HTTP API integration tests.
+[[test]]
+name = "server_batch_sql"
+path = "tests/server_batch_sql.rs"
+required-features = ["server"]

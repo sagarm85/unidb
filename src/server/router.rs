@@ -40,6 +40,7 @@ pub fn build_router(
         .route("/txn/{txn_id}/commit", post(handlers::post_txn_commit))
         .route("/txn/{txn_id}/rollback", post(handlers::post_txn_rollback))
         .route("/sql", post(handlers::post_sql))
+        .route("/batch-sql", post(handlers::post_batch_sql))
         .route(
             "/sql/cursor/{cursor_id}",
             get(handlers::get_sql_cursor).delete(handlers::delete_sql_cursor),
