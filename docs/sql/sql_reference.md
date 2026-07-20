@@ -82,7 +82,8 @@ paths:
 | `IN (subquery)` / `NOT IN (subquery)` / `EXISTS` / scalar subquery | ✅ Supported | P4.c shipped; RLS applies inside WHERE-clause subqueries |
 | Window functions (`ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD`, `SUM`, `AVG`, `COUNT`, `MIN`, `MAX`) `OVER (PARTITION BY … ORDER BY …)` | ✅ Supported | G7 shipped; whole-partition frame only; cumulative frames are a follow-up |
 | `LIKE` / `NOT LIKE` / `ILIKE` | ✅ Supported | delivered under item 30 |
-| CTEs (`WITH`), recursive CTEs, frame-based window functions, `FULL OUTER JOIN`, `NATURAL JOIN` | ❌ Not yet | tracked in `19_sql_surface_gaps.md` |
+| `FULL OUTER JOIN` (on equi-condition or `USING`) | ✅ Supported | G2-join shipped; `USING` columns emit `COALESCE(left.col, right.col)`; routed through sort-merge join |
+| CTEs (`WITH`), recursive CTEs, frame-based window functions, `NATURAL JOIN` | ❌ Not yet | tracked in `19_sql_surface_gaps.md` |
 
 ---
 
