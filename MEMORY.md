@@ -12,7 +12,7 @@
 
 ## Current status
 
-- **Item 104 — Catalog sync dedup — SHIPPED 2026-07-20, PR raised.**
+- **Item 104 — Catalog sync dedup — SHIPPED 2026-07-20, PR [#180](https://github.com/sagarm85/unidb/pull/180) open.**
   Removed `wal.sync_up_to(catalog_lsn)` AND `catalog.persist_only()` from `Engine::commit`.
   (Just removing the fsync while keeping `persist_only()` caused a replication regression:
   `persist_only()` flips `catalog_root` in the control file, but without the matching fsync the
