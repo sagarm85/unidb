@@ -236,6 +236,13 @@ fn build_access(
     let (access, remaining): (PlanNode, Vec<QExpr>) = match best {
         Some((idx, op, value, sel)) if sel <= INDEX_SELECTIVITY_THRESHOLD => {
             let column = simple_predicate(&preds[idx]).map(|(c, _, _)| c).unwrap();
+            // Item 102-A: index-only scan detection. When every projected
+            // column is the indexed column itself the B-tree leaf already
+            // holds the value — heap decode is skipped. An empty output means
+            // the node's projection will be resolved above (e.g. COUNT(*));
+            // do not mark as index-only in that case.
+            let index_only =
+                !output.is_empty() && output.iter().all(|c| c.name.eq_ignore_ascii_case(&column));
             let scan = PlanNode::IndexScan {
                 table: tref.table.clone(),
                 qualifier,
@@ -243,6 +250,7 @@ fn build_access(
                 op,
                 value,
                 output: output.to_vec(),
+                index_only,
             };
             let remaining = preds
                 .iter()

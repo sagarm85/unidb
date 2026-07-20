@@ -4066,6 +4066,14 @@ impl Engine {
         crate::sql::executor::DIAGNOSTICS_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Item 102-A: cumulative count of rows returned via the index-only scan
+    /// path (key value read directly from the B-tree leaf, heap fetch skipped)
+    /// since process start. Diff around a query to verify that qualifying
+    /// queries produce zero heap fetches. Process-global, not per-engine.
+    pub fn idx_only_rows_total() -> u64 {
+        crate::sql::executor::IDX_ONLY_ROWS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The database directory (parent of the control file) — used by backup and
     /// base-snapshot tooling (P6.d).
     pub fn data_dir(&self) -> &Path {

@@ -115,8 +115,9 @@ impl Runner<'_, '_> {
                 op,
                 value,
                 output,
+                index_only,
                 ..
-            } => self.index_scan(table, column, *op, value, output),
+            } => self.index_scan(table, column, *op, value, output, *index_only),
 
             PlanNode::CteScan { name, output, .. } => {
                 let base = self
@@ -591,6 +592,9 @@ impl Runner<'_, '_> {
     /// Index scan (P4.d): probe the column's durable B-Tree for `column <op>
     /// value`, fetch the matching rows under the snapshot, project to visible
     /// columns. Falls back to a full scan if the index isn't usable.
+    ///
+    /// Item 102-A: when `index_only` is true and every projected column equals
+    /// `column`, the B-tree leaf value is returned directly without a heap fetch.
     fn index_scan(
         &mut self,
         table: &str,
@@ -598,6 +602,7 @@ impl Runner<'_, '_> {
         op: CmpOp,
         value: &Literal,
         output: &[ColumnRef],
+        index_only: bool,
     ) -> Result<Batch> {
         let table_def = self.ctx.catalog.lookup(table)?.clone();
         let meta_page = table_def
@@ -611,6 +616,37 @@ impl Runner<'_, '_> {
             return self.scan(table, output);
         };
         let tree = DiskBTree::new(meta_page, self.ctx.page_size);
+
+        // Item 102-A: index-only path — when every projected column is the
+        // indexed column, use the B-tree leaf key directly.  We still call
+        // heap.get() for MVCC visibility (B-tree may hold stale dead-tuple
+        // entries not yet vacuumed), but skip the row-decode step.
+        if index_only {
+            let key_candidates = tree.search_with_keys(op, &ordered, self.ctx.pool)?;
+            let heap = Heap::open(
+                self.ctx.page_size,
+                table_def.fsm_meta,
+                table_def.pages.clone(),
+            );
+            let mut rows: Vec<Vec<Literal>> = Vec::with_capacity(key_candidates.len());
+            for (key, rid) in key_candidates {
+                match heap.get(rid, &self.snapshot, self.ctx.xid, self.ctx.pool) {
+                    Ok(_bytes) => {
+                        // Visible — return the key value, skip deform_row.
+                        rows.push(vec![key.into_literal()]);
+                    }
+                    Err(DbError::NoVisibleVersion { .. }) => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            executor::IDX_ONLY_ROWS
+                .fetch_add(rows.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            return Ok(Batch {
+                schema: output.to_vec(),
+                rows,
+            });
+        }
+
         let Some(candidate_ids) = tree.search(op, &ordered, self.ctx.pool)? else {
             return self.scan(table, output);
         };
