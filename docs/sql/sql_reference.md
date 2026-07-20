@@ -83,7 +83,8 @@ paths:
 | Window functions (`ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD`, `SUM`, `AVG`, `COUNT`, `MIN`, `MAX`) `OVER (PARTITION BY … ORDER BY …)` | ✅ Supported | G7 shipped; whole-partition frame only; cumulative frames are a follow-up |
 | `LIKE` / `NOT LIKE` / `ILIKE` | ✅ Supported | delivered under item 30 |
 | `FULL OUTER JOIN` (on equi-condition or `USING`) | ✅ Supported | G2-join shipped; `USING` columns emit `COALESCE(left.col, right.col)`; routed through sort-merge join |
-| CTEs (`WITH`), recursive CTEs, frame-based window functions, `NATURAL JOIN` | ❌ Not yet | tracked in `19_sql_surface_gaps.md` |
+| `NATURAL JOIN` / `NATURAL LEFT JOIN` | ✅ Supported | G-NATURAL shipped; desugars to `USING` over shared column names; disjoint schemas → CROSS JOIN |
+| CTEs (`WITH`), recursive CTEs, frame-based (cumulative) window functions | ❌ Not yet | tracked in `19_sql_surface_gaps.md` |
 
 ---
 
