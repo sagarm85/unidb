@@ -199,6 +199,14 @@ pub struct SlowQueryThresholdRequest {
     pub threshold_ms: u64,
 }
 
+/// Body of `PUT /config/group_commit_window_us` (item 101).
+/// `value: 0` disables the group-commit dwell window (default, each commit
+/// fsyncs immediately); a positive value enables it.
+#[derive(Debug, Deserialize)]
+pub struct GroupCommitWindowRequest {
+    pub value: u64,
+}
+
 /// Query params for `GET /stats/history` (item 34, Part B).
 #[derive(Debug, Default, Deserialize)]
 pub struct HistoryQuery {
