@@ -8659,6 +8659,8 @@ Native micro-bench not run (Docker bench deferred). Latency estimate from the im
   it evicts the oldest among the first 8 DashMap shard-order entries. Acceptable for the cache-as-
   optimization use case.
 
+**Follow-up (item 95b):** Cypher executor wired to adjacency cache; also fixes latent abort-stale-cache correctness bug via `has_self_write` guard in `resolve_candidates_batched_with_self_flag`; branch `perf/item-95b-cypher-adjacency-cache`, PR #178.
+
 **Locked-decision changes:** none.
 
 ---
