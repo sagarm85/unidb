@@ -797,9 +797,19 @@ impl Wal {
     /// Replaces a full `WAL_INDEX` page image on the non-split single-insert
     /// path. `slot` is the insertion position within the leaf's entry array;
     /// `key_bytes` is the B-tree key encoded with [`btree_index::encode_key`];
-    /// `rid_page_id`/`rid_slot` are the heap `RowId`. Redo-only — no undo
-    /// payload. The caller must have already called `maybe_log_fpi` for
-    /// `page_id` within this checkpoint interval.
+    /// `rid_page_id`/`rid_slot` are the heap `RowId`.
+    ///
+    /// item 102-B: `include_bytes` carries the encoded INCLUDE column payload
+    /// (from `encode_row` over the INCLUDE columns); pass `&[]` for non-covering
+    /// indexes.  The redo record format is:
+    ///   key_len(2B) | key_bytes | rid_page_id(4B) | rid_slot(2B)
+    ///   | include_len(4B) | include_bytes
+    /// Old readers (FORMAT_VERSION < 12) read zero include_len because the
+    /// record is truncated at `rid_slot` — they reconstruct without include bytes
+    /// (safe: they don't know about covering indexes).
+    ///
+    /// Redo-only — no undo payload. The caller must have already called
+    /// `maybe_log_fpi` for `page_id` within this checkpoint interval.
     #[allow(clippy::too_many_arguments)]
     pub fn log_index_insert(
         &self,
@@ -811,11 +821,39 @@ impl Wal {
         rid_page_id: PageId,
         rid_slot: u16,
     ) -> Result<Lsn> {
-        let mut redo = Vec::with_capacity(2 + key_bytes.len() + 6);
+        self.log_index_insert_with_include(
+            txn_id,
+            prev_lsn,
+            page_id,
+            slot,
+            key_bytes,
+            rid_page_id,
+            rid_slot,
+            &[],
+        )
+    }
+
+    /// item 102-B: like [`log_index_insert`] but carries the include-column payload.
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_index_insert_with_include(
+        &self,
+        txn_id: u64,
+        prev_lsn: Lsn,
+        page_id: PageId,
+        slot: u16,
+        key_bytes: &[u8],
+        rid_page_id: PageId,
+        rid_slot: u16,
+        include_bytes: &[u8],
+    ) -> Result<Lsn> {
+        let mut redo = Vec::with_capacity(2 + key_bytes.len() + 6 + 4 + include_bytes.len());
         redo.extend_from_slice(&u16_to_le(key_bytes.len() as u16));
         redo.extend_from_slice(key_bytes);
         redo.extend_from_slice(&u32_to_le(rid_page_id));
         redo.extend_from_slice(&u16_to_le(rid_slot));
+        // item 102-B: include payload.
+        redo.extend_from_slice(&u32_to_le(include_bytes.len() as u32));
+        redo.extend_from_slice(include_bytes);
         let mut inner = self.lock();
         let lsn = append_locked(
             &mut inner,

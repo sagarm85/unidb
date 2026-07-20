@@ -109,18 +109,16 @@
 | 99 | `99_batch_sql_endpoint.md` | Performance | ✅ SHIPPED 2026-07-19 (PR #162) — `POST /batch-sql`; up to 256 stmts per request; stop_on_error flag; per-statement auth; 400 BATCH_TOO_LARGE. Projects compare.py 109ms→~16ms (15.7×→~2.3×). See PROGRESS.md "Item 99". |
 | 100 | `100_dev_login_whoami.md` | Improvement | ✅ SHIPPED 2026-07-20 (PR #168) — GET /auth/meta + POST /auth/login (UNIDB_DEV_LOGIN=1) + GET /auth/whoami; R-a UPDATE WITH CHECK + R-b enforced column also in same PR. See PROGRESS.md "Item 100". |
 | 101 | `101_group_commit.md` | Performance | ✅ SHIPPED 2026-07-20 (PR #170) — group-commit dwell window in WAL `sync_up_to`; `PUT /config/group_commit_window_us`; `Engine::wal_fsyncs_count()`. |
-| 102 | `102_index_only_scan.md` | Performance | 🔄 Phase A SHIPPED 2026-07-20 (PR #169) — skip `deform_row` for key-col projection; `IDX_ONLY_ROWS` counter; heap.get() still needed for MVCC visibility. Phase B (covering index) pending. |
-| 103 | `103_authz_v2_studio_integration_gaps.md` | Improvement | ⏳ NOT STARTED — superuser/no-`sub` callers silently return empty rows when `current_user` RLS policies exist (bypass never fires); stale `CREATE ROLE … SUPERUSER` doc example; missing `role_members`/`users` in catalog paragraph. Re-confirmed live post PR #168. |
-
-| 103 | `103_authz_v2_studio_integration_gaps.md` | Improvement | ✅ SHIPPED 2026-07-20 — superuser/no-sub RLS bypass on concurrent-read path; `ReadHandle::execute_sql_as`; doc fixes (`CREATE ROLE SUPERUSER` → `CREATE USER SUPERUSER`, add `role_members`/`users` to catalog virtual relations). See PROGRESS.md "Item 103". |
+| 102 | `102_index_only_scan.md` | Performance | ✅ SHIPPED 2026-07-20 — Phase A (PR #169): key-col projection index-only, `IDX_ONLY_ROWS`; Phase B (PR #177): covering index `INCLUDE (cols)`, FORMAT_VERSION 12, `IDX_INCLUDE_ROWS`, HOT gate for INCLUDE cols. |
+| 103 | `103_authz_v2_studio_integration_gaps.md` | Improvement | ✅ SHIPPED 2026-07-20 (PR #173) — superuser/no-sub RLS bypass on concurrent-read path; `ReadHandle::execute_sql_as`; doc fixes (`CREATE ROLE SUPERUSER` → `CREATE USER SUPERUSER`, add `role_members`/`users` to catalog virtual relations). See PROGRESS.md "Item 103". |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
 **Next new file → `104_…`.**
 
-## Next up — priority order (2026-07-20, post PR #171 merge)
+## Next up — priority order (2026-07-20, post PR #171 merge + 102-B)
 
-State after 2026-07-20 (items 51/67/68/69/101/102-A all shipped):
+State after 2026-07-20 (items 51/67/68/69/101/102-A/102-B all shipped):
 
 | Operation | unidb ÷ PG | Status |
 |---|---|---|
@@ -129,17 +127,18 @@ State after 2026-07-20 (items 51/67/68/69/101/102-A all shipped):
 | DELETE selected | **2.73×** | ✅ well above 1× |
 | SELECT GROUP BY | **1.30×** | ✅ above 1× |
 | UPDATE HOT | **1.51×** | ✅ well above 1× |
-| UPDATE non-HOT | 0.81× | 📈 ceiling ~0.85–0.90× — item 102-B covering index next |
-| SELECT filtered | 0.74× | 📈 ceiling ~0.80–0.85× — item 102-B covering index next |
+| UPDATE non-HOT | 0.81× | 📈 ceiling ~0.85–0.90× |
+| SELECT filtered | 0.74× | 📈 ceiling ~0.80–0.85× (102-B covering reduces deform_row cost) |
 | INSERT per-row | 0.53× | 🔒 structural single-fsync floor; item 101 targets concurrent path |
 
 **Next priority items:**
 
-1. **#102-B Covering index** — `CREATE INDEX … INCLUDE (cols)`; FORMAT_VERSION bump; now main is clean.
-2. **#103 Catalog sync dedup** — remove `wal.sync_up_to(catalog_lsn)` after `catalog.persist_only()`; eliminates double-fsync-per-INSERT; catalog row-count recomputed from heap on crash.
-3. **#93 HNSW arena layout** — flat `Vec<RowId>` slab; expected W2 latency reduction.
-4. **#94 NEAR read-only fast path** — skip full HNSW beam search for exact-match NEAR queries.
-5. ~~**#95 graph adjacency cache**~~ — ✅ SHIPPED 2026-07-20.
+1. **#104 Catalog sync dedup** — remove `wal.sync_up_to(catalog_lsn)` after `catalog.persist_only()`; eliminates double-fsync-per-INSERT; catalog row-count recomputed from heap on crash.
+2. ~~**#102-B Covering index**~~ — ✅ SHIPPED 2026-07-20 (PR #177).
+3. ~~**#93 HNSW arena layout**~~ — ✅ SHIPPED 2026-07-20 (PR #175).
+4. ~~**#94 NEAR lightweight snapshot**~~ — ✅ SHIPPED 2026-07-20 (PR #176).
+5. ~~**#95 graph adjacency cache**~~ — ✅ SHIPPED 2026-07-20 (PR #174).
+6. ~~**#103 AuthZ superuser bypass fix**~~ — ✅ SHIPPED 2026-07-20 (PR #173).
 
 **What is NOT in this list:**
 - Parallel DML apply: held in reserve; not justified at current acceptance band.

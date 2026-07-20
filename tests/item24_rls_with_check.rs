@@ -114,9 +114,7 @@ fn update_ownership_transfer_rejected_by_with_check() {
     .expect_err("ownership transfer should be rejected");
     assert!(
         format!("{err}").to_ascii_lowercase().contains("policy")
-            || format!("{err}")
-                .to_ascii_lowercase()
-                .contains("with check"),
+            || format!("{err}").to_ascii_lowercase().contains("with check"),
         "unexpected error: {err}"
     );
 
@@ -183,9 +181,7 @@ fn explicit_with_check_differs_from_using() {
         .expect_err("5 should be rejected by WITH CHECK (val >= 10)");
     assert!(
         format!("{err}").to_ascii_lowercase().contains("policy")
-            || format!("{err}")
-                .to_ascii_lowercase()
-                .contains("with check"),
+            || format!("{err}").to_ascii_lowercase().contains("with check"),
         "unexpected error: {err}"
     );
 
@@ -207,7 +203,10 @@ fn all_policy_with_check_applies_everywhere() {
 
     exec_super(&engine, "CREATE TABLE items (id INT, owner TEXT, v INT)");
     exec_super(&engine, "CREATE USER alice");
-    exec_super(&engine, "GRANT SELECT, INSERT, UPDATE, DELETE ON items TO alice");
+    exec_super(
+        &engine,
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON items TO alice",
+    );
     exec_super(
         &engine,
         "CREATE POLICY own ON items FOR ALL \
@@ -252,11 +251,7 @@ fn insert_policy_unchanged_by_r_a() {
     exec_as(&engine, "alice", "INSERT INTO t VALUES (2, 'bob')")
         .expect_err("alice inserting bob's row should be rejected");
 
-    let rows = rows_as_strings(
-        exec_super(&engine, "SELECT id FROM t")
-            .first()
-            .unwrap(),
-    );
+    let rows = rows_as_strings(exec_super(&engine, "SELECT id FROM t").first().unwrap());
     assert_eq!(rows, vec![vec!["1"]], "only row 1 (alice's) should exist");
 }
 
@@ -285,7 +280,11 @@ fn bootstrap_mode_bypasses_with_check() {
             .first()
             .unwrap(),
     );
-    assert_eq!(rows, vec![vec!["bob"]], "superuser path should bypass policy");
+    assert_eq!(
+        rows,
+        vec![vec!["bob"]],
+        "superuser path should bypass policy"
+    );
 }
 
 // ── test 7: unidb_catalog.policies shows `enforced` column (Slice 2) ─────────

@@ -656,10 +656,7 @@ fn users_rows(authz: &crate::authz::RoleStore) -> Vec<Vec<Literal>> {
 /// expression doubles as the write-side check in that case).
 /// `enforced` is false when policies exist but no users have been created —
 /// bootstrap mode means RLS is silently inactive (item-24 R-b).
-fn policies_rows(
-    defs: &[&TableDef],
-    authz: Option<&crate::authz::RoleStore>,
-) -> Vec<Vec<Literal>> {
+fn policies_rows(defs: &[&TableDef], authz: Option<&crate::authz::RoleStore>) -> Vec<Vec<Literal>> {
     // Bootstrap mode: policies present, but no users → not enforced.
     let enforced = authz.map(|a| a.has_users()).unwrap_or(true);
     let mut rows = Vec::new();

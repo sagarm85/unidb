@@ -70,7 +70,10 @@ impl JwtConfig {
     /// Returns `Err` when `encoding_key` is `None` (dev-login flag is off).
     pub fn issue_token(&self, username: &str) -> Result<String, jsonwebtoken::errors::Error> {
         use std::time::{SystemTime, UNIX_EPOCH};
-        let key = self.encoding_key.as_ref().expect("issue_token called without encoding_key");
+        let key = self
+            .encoding_key
+            .as_ref()
+            .expect("issue_token called without encoding_key");
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()

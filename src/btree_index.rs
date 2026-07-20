@@ -268,6 +268,12 @@ fn rowid_key(r: RowId) -> (PageId, u16) {
 enum Node {
     Leaf {
         entries: Vec<(OrderedValue, RowId)>,
+        /// Parallel include-column payloads (item 102-B covering index).
+        /// `include_payloads[i]` is the raw encoded include-column bytes for
+        /// `entries[i]`. Empty `Vec` means no INCLUDE columns for this leaf
+        /// (all existing non-covering indexes). When non-empty it must have
+        /// the same length as `entries`.
+        include_payloads: Vec<Vec<u8>>,
         next: PageId,
     },
     Internal {
@@ -280,10 +286,19 @@ impl Node {
     /// Serialized body size (excluding the 28-byte page header).
     fn body_len(&self) -> usize {
         match self {
-            Node::Leaf { entries, .. } => {
+            Node::Leaf {
+                entries,
+                include_payloads,
+                ..
+            } => {
+                // Per-entry: key + include_len(4B) + include_bytes + RowId(6B).
                 7 + entries
                     .iter()
-                    .map(|(k, _)| encoded_key_len(k) + ROWID_LEN)
+                    .enumerate()
+                    .map(|(i, (k, _))| {
+                        let inc_len = include_payloads.get(i).map_or(0, |v| v.len());
+                        encoded_key_len(k) + 4 + inc_len + ROWID_LEN
+                    })
                     .sum::<usize>()
             }
             Node::Internal { keys, children } => {
@@ -299,13 +314,21 @@ impl Node {
         buf[4] = PAGE_TYPE_BTREE;
         let body = &mut buf[PAGE_HEADER_SIZE..];
         match self {
-            Node::Leaf { entries, next } => {
+            Node::Leaf {
+                entries,
+                include_payloads,
+                next,
+            } => {
                 body[0] = NODE_LEAF;
                 body[1..3].copy_from_slice(&u16_to_le(entries.len() as u16));
                 body[3..7].copy_from_slice(&u32_to_le(*next));
                 let mut payload = Vec::new();
-                for (k, rid) in entries {
+                for (i, (k, rid)) in entries.iter().enumerate() {
                     encode_key(k, &mut payload);
+                    // item 102-B: include_len (u32 LE) || include_bytes || RowId
+                    let inc = include_payloads.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
+                    payload.extend_from_slice(&u32_to_le(inc.len() as u32));
+                    payload.extend_from_slice(inc);
                     encode_rowid(*rid, &mut payload);
                 }
                 body[7..7 + payload.len()].copy_from_slice(&payload);
@@ -335,13 +358,39 @@ impl Node {
                 let next = u32_from_le(body[3..7].try_into().unwrap());
                 let mut pos = 7;
                 let mut entries = Vec::with_capacity(count);
+                let mut include_payloads: Vec<Vec<u8>> = Vec::with_capacity(count);
+                let mut has_includes = false;
                 for _ in 0..count {
                     let (k, np) = decode_key(body, pos)?;
-                    let rid = decode_rowid(body, np)?;
-                    pos = np + ROWID_LEN;
+                    // item 102-B: read include_len (u32 LE) + include_bytes
+                    let inc_len = u32_from_le(
+                        body.get(np..np + 4)
+                            .ok_or_else(corrupt)?
+                            .try_into()
+                            .unwrap(),
+                    ) as usize;
+                    let inc_start = np + 4;
+                    let inc_end = inc_start + inc_len;
+                    let inc_bytes = body.get(inc_start..inc_end).ok_or_else(corrupt)?.to_vec();
+                    if inc_len > 0 {
+                        has_includes = true;
+                    }
+                    include_payloads.push(inc_bytes);
+                    let rid = decode_rowid(body, inc_end)?;
+                    pos = inc_end + ROWID_LEN;
                     entries.push((k, rid));
                 }
-                Ok(Node::Leaf { entries, next })
+                // For efficiency: if no entry has include bytes, discard the all-empty vec.
+                let include_payloads = if has_includes {
+                    include_payloads
+                } else {
+                    Vec::new()
+                };
+                Ok(Node::Leaf {
+                    entries,
+                    include_payloads,
+                    next,
+                })
             }
             NODE_INTERNAL => {
                 let count = u16_from_le(body[1..3].try_into().unwrap()) as usize;
@@ -409,9 +458,21 @@ fn route_insert_child(keys: &[OrderedValue], value: &OrderedValue) -> usize {
 ///   variable-length `Text` we cannot cheaply bound it, so we conservatively
 ///   report **unsafe** (the node is retained, never released early) — always
 ///   correct, just less concurrent for text-keyed indexes.
-fn node_is_insert_safe(node: &Node, value: &OrderedValue, cap: usize) -> bool {
+///
+/// The `include_payload_len` argument carries the number of encoded include-column
+/// bytes for this entry (0 for non-covering inserts). The actual on-disk cost is
+/// `encoded_key_len(value) + 4 (include_len field) + include_payload_len + ROWID_LEN`.
+fn node_is_insert_safe(
+    node: &Node,
+    value: &OrderedValue,
+    include_payload_len: usize,
+    cap: usize,
+) -> bool {
     match node {
-        Node::Leaf { .. } => node.body_len() + encoded_key_len(value) + ROWID_LEN <= cap,
+        // item 102-B: per-entry overhead = key + include_len(4B) + include_bytes + RowId(6B).
+        Node::Leaf { .. } => {
+            node.body_len() + encoded_key_len(value) + 4 + include_payload_len + ROWID_LEN <= cap
+        }
         Node::Internal { keys, .. } => match keys.first() {
             // child pointer is 4 bytes; key is fixed-size for Int/Bool.
             Some(OrderedValue::Int(_)) => {
@@ -457,6 +518,7 @@ impl DiskBTree {
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
         let root = Node::Leaf {
             entries: Vec::new(),
+            include_payloads: Vec::new(),
             next: INVALID_PAGE_ID,
         };
         let l1 = write_node(pool, wal, txn_id, begin_lsn, root_page, &root, page_size)?;
@@ -525,6 +587,115 @@ impl DiskBTree {
         }
     }
 
+    /// item 102-B: like [`search_with_keys`] but also returns the include payload
+    /// bytes stored alongside each leaf entry. Used by the covering-index
+    /// (index-only) scan path to decode INCLUDE column values from the leaf
+    /// without touching the heap row. Returns `(key, include_bytes, row_id)`.
+    pub fn search_with_keys_and_include(
+        &self,
+        op: CmpOp,
+        value: &OrderedValue,
+        pool: &BufferPool,
+    ) -> Result<Vec<(OrderedValue, Vec<u8>, RowId)>> {
+        match op {
+            CmpOp::Eq => self.search_eq_with_keys_and_include(value, pool),
+            CmpOp::Lt => self.search_range_with_keys_and_include(RangeOp::Lt, value, pool),
+            CmpOp::Le => self.search_range_with_keys_and_include(RangeOp::Le, value, pool),
+            CmpOp::Gt => self.search_range_with_keys_and_include(RangeOp::Gt, value, pool),
+            CmpOp::Ge => self.search_range_with_keys_and_include(RangeOp::Ge, value, pool),
+            CmpOp::Ne => Ok(Vec::new()),
+        }
+    }
+
+    fn search_eq_with_keys_and_include(
+        &self,
+        value: &OrderedValue,
+        pool: &BufferPool,
+    ) -> Result<Vec<(OrderedValue, Vec<u8>, RowId)>> {
+        let mut pid = self.find_leaf(value, pool)?;
+        let mut out = Vec::new();
+        loop {
+            let page = pool.fetch_page(pid)?;
+            let node = Node::deserialize(&page)?;
+            pool.unpin(pid);
+            let Node::Leaf {
+                entries,
+                include_payloads,
+                next,
+            } = node
+            else {
+                break;
+            };
+            let mut past = false;
+            for (i, (k, rid)) in entries.iter().enumerate() {
+                match k.cmp(value) {
+                    std::cmp::Ordering::Less => {}
+                    std::cmp::Ordering::Equal => {
+                        let payload = include_payloads.get(i).cloned().unwrap_or_default();
+                        out.push((k.clone(), payload, *rid));
+                    }
+                    std::cmp::Ordering::Greater => {
+                        past = true;
+                        break;
+                    }
+                }
+            }
+            if past || next == INVALID_PAGE_ID {
+                break;
+            }
+            pid = next;
+        }
+        Ok(out)
+    }
+
+    fn search_range_with_keys_and_include(
+        &self,
+        op: RangeOp,
+        value: &OrderedValue,
+        pool: &BufferPool,
+    ) -> Result<Vec<(OrderedValue, Vec<u8>, RowId)>> {
+        let start = match op {
+            RangeOp::Lt | RangeOp::Le => self.leftmost_leaf(pool)?,
+            RangeOp::Gt | RangeOp::Ge => self.find_leaf(value, pool)?,
+        };
+        let mut pid = start;
+        let mut out = Vec::new();
+        loop {
+            let page = pool.fetch_page(pid)?;
+            let node = Node::deserialize(&page)?;
+            pool.unpin(pid);
+            let Node::Leaf {
+                entries,
+                include_payloads,
+                next,
+            } = node
+            else {
+                break;
+            };
+            let mut stop = false;
+            for (i, (k, rid)) in entries.iter().enumerate() {
+                let admit = match op {
+                    RangeOp::Lt => k < value,
+                    RangeOp::Le => k <= value,
+                    RangeOp::Gt => k > value,
+                    RangeOp::Ge => k >= value,
+                };
+                if admit {
+                    let payload = include_payloads.get(i).cloned().unwrap_or_default();
+                    out.push((k.clone(), payload, *rid));
+                } else if matches!(op, RangeOp::Lt | RangeOp::Le) && k >= value {
+                    stop = true;
+                    break;
+                }
+            }
+            if stop || next == INVALID_PAGE_ID {
+                break;
+            }
+            pid = next;
+        }
+        Ok(out)
+    }
+
     /// Exact-match: returns `(key, row_id)` pairs for all leaf entries where
     /// `key == value`. Mirrors [`search_eq`] but carries the key forward.
     fn search_eq_with_keys(
@@ -538,7 +709,7 @@ impl DiskBTree {
             let page = pool.fetch_page(pid)?;
             let node = Node::deserialize(&page)?;
             pool.unpin(pid);
-            let Node::Leaf { entries, next } = node else {
+            let Node::Leaf { entries, next, .. } = node else {
                 break;
             };
             let mut past = false;
@@ -578,7 +749,7 @@ impl DiskBTree {
             let page = pool.fetch_page(pid)?;
             let node = Node::deserialize(&page)?;
             pool.unpin(pid);
-            let Node::Leaf { entries, next } = node else {
+            let Node::Leaf { entries, next, .. } = node else {
                 break;
             };
             let mut stop = false;
@@ -650,7 +821,7 @@ impl DiskBTree {
             let page = pool.fetch_page(pid)?;
             let node = Node::deserialize(&page)?;
             pool.unpin(pid);
-            let Node::Leaf { entries, next } = node else {
+            let Node::Leaf { entries, next, .. } = node else {
                 break;
             };
             let mut past = false;
@@ -694,7 +865,7 @@ impl DiskBTree {
             let page = pool.fetch_page(pid)?;
             let node = Node::deserialize(&page)?;
             pool.unpin(pid);
-            let Node::Leaf { entries, next } = node else {
+            let Node::Leaf { entries, next, .. } = node else {
                 break;
             };
             let mut stop = false;
@@ -745,7 +916,7 @@ impl DiskBTree {
             let page = pool.fetch_page(pid)?;
             let node = Node::deserialize(&page)?;
             pool.unpin(pid);
-            let Node::Leaf { entries, next } = node else {
+            let Node::Leaf { entries, next, .. } = node else {
                 break;
             };
             for (k, rid) in &entries {
@@ -805,7 +976,7 @@ impl DiskBTree {
             let page = pool.fetch_page(pid)?;
             let node = Node::deserialize(&page)?;
             pool.unpin(pid);
-            let Node::Leaf { entries, next } = node else {
+            let Node::Leaf { entries, next, .. } = node else {
                 break;
             };
             let mut leaf_rids: Vec<RowId> = Vec::new();
@@ -944,7 +1115,7 @@ impl DiskBTree {
         let mut out = Vec::new();
         loop {
             let page = reader.read_page(pid)?;
-            let Node::Leaf { entries, next } = Node::deserialize(&page)? else {
+            let Node::Leaf { entries, next, .. } = Node::deserialize(&page)? else {
                 break;
             };
             for (k, rid) in &entries {
@@ -980,7 +1151,33 @@ impl DiskBTree {
     ) -> Result<()> {
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
         let mut prev_lsn = begin_lsn;
-        self.insert_in_txn(value, rid, pool, wal, txn_id, &mut prev_lsn)?;
+        self.insert_in_txn_with_include(value, rid, &[], pool, wal, txn_id, &mut prev_lsn)?;
+        wal.commit_mini_txn(txn_id, prev_lsn)?;
+        Ok(())
+    }
+
+    /// item 102-B: insert a single `(key, rid)` pair into the B-tree with an
+    /// optional include-column payload encoded as raw bytes (from `encode_row`).
+    /// Callers with no INCLUDE columns should pass `include_payload = &[]`.
+    pub fn insert_with_include(
+        &self,
+        value: OrderedValue,
+        rid: RowId,
+        include_payload: &[u8],
+        pool: &BufferPool,
+        wal: &Wal,
+    ) -> Result<()> {
+        let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
+        let mut prev_lsn = begin_lsn;
+        self.insert_in_txn_with_include(
+            value,
+            rid,
+            include_payload,
+            pool,
+            wal,
+            txn_id,
+            &mut prev_lsn,
+        )?;
         wal.commit_mini_txn(txn_id, prev_lsn)?;
         Ok(())
     }
@@ -1018,7 +1215,12 @@ impl DiskBTree {
             let page = pool.fetch_page(pid)?;
             let node = Node::deserialize(&page)?;
             pool.unpin(pid);
-            let Node::Leaf { mut entries, next } = node else {
+            let Node::Leaf {
+                mut entries,
+                include_payloads,
+                next,
+            } = node
+            else {
                 break;
             };
             let mut modified = false;
@@ -1040,7 +1242,11 @@ impl DiskBTree {
                     txn_id,
                     prev_lsn,
                     pid,
-                    &Node::Leaf { entries, next },
+                    &Node::Leaf {
+                        entries,
+                        include_payloads,
+                        next,
+                    },
                     self.page_size,
                 )?;
                 break;
@@ -1069,6 +1275,22 @@ impl DiskBTree {
         &self,
         value: OrderedValue,
         rid: RowId,
+        pool: &BufferPool,
+        wal: &Wal,
+        txn_id: u64,
+        prev_lsn: &mut Lsn,
+    ) -> Result<()> {
+        self.insert_in_txn_with_include(value, rid, &[], pool, wal, txn_id, prev_lsn)
+    }
+
+    /// item 102-B: inner insert with optional include payload (raw bytes from
+    /// `encode_row` over the INCLUDE columns). Pass `&[]` for no INCLUDE columns.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_in_txn_with_include(
+        &self,
+        value: OrderedValue,
+        rid: RowId,
+        include_payload: &[u8],
         pool: &BufferPool,
         wal: &Wal,
         txn_id: u64,
@@ -1112,7 +1334,7 @@ impl DiskBTree {
             retained.last_mut().unwrap().route_idx = idx;
             let child_latch = pool.latch_exclusive(child);
             let child_node = self.read_node(child, pool)?;
-            if node_is_insert_safe(&child_node, &value, cap) {
+            if node_is_insert_safe(&child_node, &value, include_payload.len(), cap) {
                 // Nothing at or above `child` can be modified by this insert →
                 // release the meta latch and every retained ancestor.
                 meta_guard = None;
@@ -1131,7 +1353,11 @@ impl DiskBTree {
         while let Some(frame) = retained.pop() {
             let _latch = frame.latch; // keep this node latched for its rewrite
             match frame.node {
-                Node::Leaf { mut entries, next } => {
+                Node::Leaf {
+                    mut entries,
+                    mut include_payloads,
+                    next,
+                } => {
                     let probe = (value.clone(), rowid_key(rid));
                     let insert_pos = match entries
                         .binary_search_by(|(k, r)| (k.clone(), rowid_key(*r)).cmp(&probe))
@@ -1140,7 +1366,31 @@ impl DiskBTree {
                         Err(pos) => pos,
                     };
                     entries.insert(insert_pos, (value.clone(), rid));
-                    let leaf = Node::Leaf { entries, next };
+                    // item 102-B: insert include payload at same position.
+                    // entries has already had the new (key,rid) inserted at insert_pos,
+                    // so entries.len() == old_len + 1.  include_payloads must reach the
+                    // same length with a payload at insert_pos.
+                    if !include_payload.is_empty() {
+                        // Covering insert. include_payloads must be length == entries.len().
+                        if include_payloads.is_empty() {
+                            // First covering insert on this leaf: resize to match entries
+                            // (all slots empty, will overwrite insert_pos below).
+                            include_payloads.resize(entries.len(), Vec::new());
+                        } else {
+                            // Leaf already had payloads (length == old_len).
+                            // Open a slot at insert_pos for the new payload.
+                            include_payloads.insert(insert_pos, Vec::new());
+                        }
+                        include_payloads[insert_pos] = include_payload.to_vec();
+                    } else if !include_payloads.is_empty() {
+                        // Non-covering insert on a covering leaf: insert placeholder.
+                        include_payloads.insert(insert_pos, Vec::new());
+                    }
+                    let leaf = Node::Leaf {
+                        entries,
+                        include_payloads,
+                        next,
+                    };
                     if leaf.body_len() <= cap {
                         // Non-split single insert: FPI + logical WAL record.
                         // frame.latch is still held (exclusive) on frame.pid —
@@ -1153,7 +1403,9 @@ impl DiskBTree {
                         }
                         let mut key_bytes = Vec::new();
                         encode_key(&value, &mut key_bytes);
-                        let lsn = wal.log_index_insert(
+                        // item 102-B: include include_payload in WAL record so recovery
+                        // can rebuild covering-index leaves with the correct payload bytes.
+                        let lsn = wal.log_index_insert_with_include(
                             txn_id,
                             *prev_lsn,
                             frame.pid,
@@ -1161,6 +1413,7 @@ impl DiskBTree {
                             &key_bytes,
                             rid.page_id,
                             rid.slot,
+                            include_payload,
                         )?;
                         let image = leaf.serialize(frame.pid, self.page_size);
                         let mut sp = SlottedPage::from_bytes_unchecked(image);
@@ -1271,7 +1524,12 @@ impl DiskBTree {
             // concurrent split's bytes are never clobbered.
             let latch = pool.latch_exclusive(leaf_pid);
             let node = self.read_node(leaf_pid, pool)?;
-            let Node::Leaf { mut entries, next } = node else {
+            let Node::Leaf {
+                mut entries,
+                include_payloads: _inc_payloads_many,
+                next,
+            } = node
+            else {
                 // A find_leaf result should always be a leaf; be defensive.
                 drop(latch);
                 self.insert_in_txn(
@@ -1306,10 +1564,15 @@ impl DiskBTree {
 
             // Compute existing leaf body once; reused by both the item-84 proactive
             // check below and the absorption loop's capacity guard.
-            let existing_body: usize = 7 + entries
-                .iter()
-                .map(|(k, _)| encoded_key_len(k) + ROWID_LEN)
-                .sum::<usize>();
+            // item 102-B: per-entry = key + include_len(4B) + include_bytes + RowId(6B).
+            // For non-covering entries include_bytes is 0, but include_len field is still 4B.
+            // Use node.body_len() to get the correct size from the actual payloads stored.
+            let existing_body: usize = Node::Leaf {
+                entries: entries.clone(),
+                include_payloads: _inc_payloads_many.clone(),
+                next,
+            }
+            .body_len();
 
             // Item 84 — Proactive batch check.
             //
@@ -1335,7 +1598,7 @@ impl DiskBTree {
                 if total_n >= 2 {
                     let new_body: usize = sorted[i..i + total_n]
                         .iter()
-                        .map(|(k, _)| encoded_key_len(k) + ROWID_LEN)
+                        .map(|(k, _)| encoded_key_len(k) + 4 + ROWID_LEN)
                         .sum::<usize>();
                     if existing_body + new_body > cap {
                         // Would overflow: batch all total_n entries in one descent.
@@ -1376,7 +1639,8 @@ impl DiskBTree {
                         continue;
                     }
                     Err(pos) => {
-                        let added = encoded_key_len(&k) + ROWID_LEN;
+                        // item 102-B: new non-covering entry overhead = key + 4 + ROWID_LEN
+                        let added = encoded_key_len(&k) + 4 + ROWID_LEN;
                         if cur_body + added > cap {
                             break; // would split — stop; the remainder falls through
                         }
@@ -1418,7 +1682,12 @@ impl DiskBTree {
             }
 
             // One WAL_INDEX image for every entry absorbed into this leaf.
-            let leaf = Node::Leaf { entries, next };
+            // Preserve existing include_payloads; new entries have no include bytes.
+            let leaf = Node::Leaf {
+                entries,
+                include_payloads: _inc_payloads_many,
+                next,
+            };
             *prev_lsn = write_node(
                 pool,
                 wal,
@@ -1447,6 +1716,38 @@ impl DiskBTree {
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
         let mut prev_lsn = begin_lsn;
         self.insert_many_in_txn(entries, pool, wal, txn_id, &mut prev_lsn)?;
+        wal.commit_mini_txn(txn_id, prev_lsn)?;
+        Ok(())
+    }
+
+    /// item 102-B — bulk build for covering indexes.
+    ///
+    /// Like [`Self::insert_many`] but each entry carries an include payload
+    /// (raw bytes from `encode_row` over INCLUDE columns). All inserts are
+    /// batched into one mini-txn. Pre-sort by key before calling for best
+    /// page-fill (matching the behaviour of `exec_create_index`'s BTree path).
+    pub fn insert_many_with_include(
+        &self,
+        entries: &[(OrderedValue, RowId, Vec<u8>)],
+        pool: &BufferPool,
+        wal: &Wal,
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
+        let mut prev_lsn = begin_lsn;
+        for (value, rid, payload) in entries {
+            self.insert_in_txn_with_include(
+                value.clone(),
+                *rid,
+                payload,
+                pool,
+                wal,
+                txn_id,
+                &mut prev_lsn,
+            )?;
+        }
         wal.commit_mini_txn(txn_id, prev_lsn)?;
         Ok(())
     }
@@ -1522,7 +1823,7 @@ impl DiskBTree {
         let (leaf_pid, old_entries, leaf_next) = {
             let frame = retained.last().unwrap();
             match &frame.node {
-                Node::Leaf { entries, next } => (frame.pid, entries.clone(), *next),
+                Node::Leaf { entries, next, .. } => (frame.pid, entries.clone(), *next),
                 _ => {
                     // Unexpected: should always be a leaf after crabbing descent.
                     drop(retained);
@@ -1606,9 +1907,11 @@ impl DiskBTree {
             combined.push((entry.0.clone(), entry.1));
         }
 
+        // item 102-B: per-entry = key + include_len(4B) + 0 bytes include + RowId(6B)
+        // for non-covering batch inserts (include_payloads is empty for these entries).
         let combined_body: usize = 7 + combined
             .iter()
-            .map(|(k, _)| encoded_key_len(k) + ROWID_LEN)
+            .map(|(k, _)| encoded_key_len(k) + 4 + ROWID_LEN)
             .sum::<usize>();
 
         // Decide: fits in one leaf, needs a 2-way split, or too large to batch.
@@ -1618,6 +1921,7 @@ impl DiskBTree {
             // The leaf latch is still held via `retained.last()`.
             let leaf = Node::Leaf {
                 entries: combined,
+                include_payloads: Vec::new(),
                 next: leaf_next,
             };
             *prev_lsn = write_node(
@@ -1642,10 +1946,12 @@ impl DiskBTree {
             let right_page = pool.alloc_page()?;
             let right = Node::Leaf {
                 entries: right_entries,
+                include_payloads: Vec::new(),
                 next: leaf_next,
             };
             let left = Node::Leaf {
                 entries: left_entries,
+                include_payloads: Vec::new(),
                 next: right_page,
             };
             *prev_lsn = write_node(
@@ -1768,7 +2074,12 @@ impl DiskBTree {
             let leaf_pid = self.find_leaf(&sorted[i].0, pool)?;
             let latch = pool.latch_exclusive(leaf_pid);
             let node = self.read_node(leaf_pid, pool)?;
-            let Node::Leaf { mut entries, next } = node else {
+            let Node::Leaf {
+                mut entries,
+                include_payloads: inc_pay_patch,
+                next,
+            } = node
+            else {
                 drop(latch);
                 let (ref k, _, new_rid) = sorted[i];
                 self.insert_in_txn(k.clone(), new_rid, pool, wal, txn_id, &mut prev_lsn)?;
@@ -1828,7 +2139,11 @@ impl DiskBTree {
                     txn_id,
                     prev_lsn,
                     leaf_pid,
-                    &Node::Leaf { entries, next },
+                    &Node::Leaf {
+                        entries,
+                        include_payloads: inc_pay_patch,
+                        next,
+                    },
                     self.page_size,
                 )?;
             }
@@ -1867,7 +2182,12 @@ impl DiskBTree {
         txn_id: u64,
         prev_lsn: &mut Lsn,
     ) -> Result<(OrderedValue, PageId)> {
-        let Node::Leaf { entries, next } = leaf else {
+        let Node::Leaf {
+            entries,
+            include_payloads,
+            next,
+        } = leaf
+        else {
             unreachable!()
         };
         let mid = entries.len() / 2;
@@ -1875,12 +2195,23 @@ impl DiskBTree {
         let left_entries = entries[..mid].to_vec();
         let sep_key = right_entries[0].0.clone();
         let right_page = pool.alloc_page()?;
+        // Split include_payloads in parallel with entries (empty if no covering index).
+        let (left_inc, right_inc) = if include_payloads.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            (
+                include_payloads[..mid].to_vec(),
+                include_payloads[mid..].to_vec(),
+            )
+        };
         let right = Node::Leaf {
             entries: right_entries,
+            include_payloads: right_inc,
             next,
         };
         let left = Node::Leaf {
             entries: left_entries,
+            include_payloads: left_inc,
             next: right_page,
         };
         *prev_lsn = write_node(
@@ -1970,14 +2301,23 @@ impl DiskBTree {
             pool.unpin(pid);
             n
         };
-        let Node::Leaf { mut entries, next } = node else {
+        let Node::Leaf {
+            mut entries,
+            include_payloads: inc_sv,
+            next,
+        } = node
+        else {
             return Ok(false);
         };
         let Some(slot) = entries.iter().position(|(k, _)| k == value) else {
             return Ok(false);
         };
         entries[slot].1 = new_rid;
-        let leaf = Node::Leaf { entries, next };
+        let leaf = Node::Leaf {
+            entries,
+            include_payloads: inc_sv,
+            next,
+        };
         let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
         let lsn = write_node(pool, wal, txn_id, begin_lsn, pid, &leaf, self.page_size)?;
         wal.commit_mini_txn(txn_id, lsn)?;
@@ -2013,14 +2353,36 @@ impl DiskBTree {
                 pool.unpin(pid);
                 n
             };
-            let Node::Leaf { mut entries, next } = node else {
+            let Node::Leaf {
+                mut entries,
+                mut include_payloads,
+                next,
+            } = node
+            else {
                 return Ok(());
             };
             let past = entries.last().map(|(k, _)| k > value).unwrap_or(true);
             let before = entries.len();
-            entries.retain(|(k, r)| !(k == value && *r == rid));
+            // Remove entry and keep include_payloads in sync.
+            let mut rm_idx = usize::MAX;
+            for (i, (k, r)) in entries.iter().enumerate() {
+                if k == value && *r == rid {
+                    rm_idx = i;
+                    break;
+                }
+            }
+            if rm_idx < entries.len() {
+                entries.remove(rm_idx);
+                if !include_payloads.is_empty() && rm_idx < include_payloads.len() {
+                    include_payloads.remove(rm_idx);
+                }
+            }
             if entries.len() != before {
-                let leaf = Node::Leaf { entries, next };
+                let leaf = Node::Leaf {
+                    entries,
+                    include_payloads,
+                    next,
+                };
                 let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
                 let lsn = write_node(pool, wal, txn_id, begin_lsn, pid, &leaf, self.page_size)?;
                 wal.commit_mini_txn(txn_id, lsn)?;
@@ -2087,7 +2449,7 @@ impl DiskBTree {
                 )));
             }
             let page = reader.read_page(pid)?;
-            let Node::Leaf { entries, next } = Node::deserialize(&page)? else {
+            let Node::Leaf { entries, next, .. } = Node::deserialize(&page)? else {
                 return Err(DbError::Recovery(
                     "validate: leaf-chain walk hit a non-leaf".into(),
                 ));
@@ -2170,6 +2532,11 @@ fn write_raw(
 /// data), inserts (key, rid) at leaf entry position `slot`, and returns the
 /// re-serialized page with the entry inserted. Caller stamps the LSN and
 /// calls `pool.write_page`. Used exclusively by `recovery::redo_record`.
+///
+/// item 102-B: `redo_bytes` is the complete redo payload from the WAL record
+/// (format: key_len(2B) | key_bytes | rid_page(4B) | rid_slot(2B) |
+/// include_len(4B) | include_bytes). The include bytes are applied to
+/// `include_payloads` to correctly recover covering-index leaves.
 pub fn redo_index_insert(
     page: &SlottedPage,
     slot: u16,
@@ -2177,9 +2544,24 @@ pub fn redo_index_insert(
     rid: RowId,
     page_size: usize,
 ) -> Result<SlottedPage> {
+    redo_index_insert_with_include(page, slot, key_bytes, rid, &[], page_size)
+}
+
+/// item 102-B: redo a `WAL_INDEX_INSERT` record that may carry include bytes.
+/// `include_bytes` is empty for non-covering indexes.
+pub fn redo_index_insert_with_include(
+    page: &SlottedPage,
+    slot: u16,
+    key_bytes: &[u8],
+    rid: RowId,
+    include_bytes: &[u8],
+    page_size: usize,
+) -> Result<SlottedPage> {
     let mut node = Node::deserialize(page)?;
     let Node::Leaf {
-        ref mut entries, ..
+        ref mut entries,
+        ref mut include_payloads,
+        ..
     } = node
     else {
         return Err(DbError::Recovery(
@@ -2195,6 +2577,18 @@ pub fn redo_index_insert(
         )));
     }
     entries.insert(pos, (key, rid));
+    // item 102-B: insert include bytes at same position.
+    if !include_bytes.is_empty() {
+        if include_payloads.is_empty() {
+            include_payloads.resize(entries.len(), Vec::new());
+        } else {
+            include_payloads.insert(pos, Vec::new());
+        }
+        include_payloads[pos] = include_bytes.to_vec();
+    } else if !include_payloads.is_empty() {
+        // Non-covering redo on a covering leaf: insert empty placeholder.
+        include_payloads.insert(pos, Vec::new());
+    }
     let image = node.serialize(page.page_id(), page_size);
     Ok(SlottedPage::from_bytes_unchecked(image))
 }

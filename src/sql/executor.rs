@@ -165,10 +165,24 @@ fn literal_display(lit: &Literal) -> String {
 fn set_touches_indexed_col(assignments: &[(String, Expr)], columns: &[ColumnDef]) -> bool {
     let set_cols: std::collections::HashSet<&str> =
         assignments.iter().map(|(col, _)| col.as_str()).collect();
-    columns.iter().any(|c| {
+    // Direct indexed column (key column of a BTree/FullText/HNSW index, or unique index).
+    let touches_key = columns.iter().any(|c| {
         !c.dropped
             && set_cols.contains(c.name.as_str())
             && (c.index_root.is_some() || c.unique_index_root.is_some())
+    });
+    if touches_key {
+        return true;
+    }
+    // item 102-B: SET touches an INCLUDE column of a covering B-tree index.
+    // The include payload in the leaf must be updated, so HOT is not safe.
+    columns.iter().any(|c| {
+        !c.dropped
+            && c.index_root.is_some()
+            && matches!(c.index, Some(IndexKind::BTree))
+            && c.include_cols
+                .iter()
+                .any(|inc| set_cols.contains(inc.as_str()))
     })
 }
 
@@ -635,6 +649,11 @@ pub static DIAGNOSTICS_ENABLED: std::sync::atomic::AtomicBool =
 /// `Relaxed` — pure statistic, no ordering obligations.
 pub static IDX_ONLY_ROWS: AtomicU64 = AtomicU64::new(0);
 
+/// item 102-B: rows served from a covering index (INCLUDE cols in B-tree leaf).
+/// Rows counted here are a subset of IDX_ONLY_ROWS where ALL projected columns
+/// (key + include cols) were satisfied from the leaf without a heap deform_row.
+pub static IDX_INCLUDE_ROWS: AtomicU64 = AtomicU64::new(0);
+
 /// How the executor holds the catalog for one statement (index-write-concurrency
 /// Item 0a). Every SQL statement that changes no schema reads the catalog only
 /// (it `lookup(table)?.clone()`s the `TableDef` and works off the owned clone),
@@ -813,8 +832,33 @@ fn apply_durable_index_writes(
             match col.index {
                 Some(IndexKind::BTree) => {
                     if let Ok(value) = OrderedValue::try_from(&row[idx]) {
-                        DiskBTree::new(meta_page, ctx.page_size)
-                            .insert(value, row_id, ctx.pool, ctx.wal)?;
+                        // item 102-B: encode INCLUDE column values as payload
+                        // when this index was created with INCLUDE (...).
+                        let include_payload: Vec<u8> = if col.include_cols.is_empty() {
+                            Vec::new()
+                        } else {
+                            let inc_vals: Vec<Literal> = col
+                                .include_cols
+                                .iter()
+                                .map(|inc_name| {
+                                    table_def
+                                        .columns
+                                        .iter()
+                                        .enumerate()
+                                        .find(|(_, c)| c.name == *inc_name)
+                                        .map(|(i, _)| row.get(i).cloned().unwrap_or(Literal::Null))
+                                        .unwrap_or(Literal::Null)
+                                })
+                                .collect();
+                            encode_row(&inc_vals)
+                        };
+                        DiskBTree::new(meta_page, ctx.page_size).insert_with_include(
+                            value,
+                            row_id,
+                            &include_payload,
+                            ctx.pool,
+                            ctx.wal,
+                        )?;
                     }
                 }
                 Some(IndexKind::FullText) => {
@@ -883,7 +927,14 @@ struct IndexColBatch {
     col_idx: usize,
     meta_page: PageId,
     is_fulltext: bool,
+    /// For non-covering BTree / FullText indexes.
     entries: Vec<(OrderedValue, RowId)>,
+    /// item 102-B: INCLUDE column names for this BTree index.
+    /// Empty means non-covering (use `entries`); non-empty means covering
+    /// (use `include_entries` which carries the encoded payloads).
+    include_cols: Vec<String>,
+    /// item 102-B: covering-index entries with include payload bytes.
+    include_entries: Vec<(OrderedValue, RowId, Vec<u8>)>,
 }
 
 /// Staged in-place B-tree RowId patches for unchanged-key UPDATE (item 47).
@@ -912,12 +963,16 @@ fn init_index_batches(table_def: &TableDef) -> Vec<IndexColBatch> {
                 meta_page,
                 is_fulltext: false,
                 entries: Vec::new(),
+                include_cols: col.include_cols.clone(),
+                include_entries: Vec::new(),
             }),
             Some(IndexKind::FullText) => batches.push(IndexColBatch {
                 col_idx,
                 meta_page,
                 is_fulltext: true,
                 entries: Vec::new(),
+                include_cols: Vec::new(),
+                include_entries: Vec::new(),
             }),
             _ => {}
         }
@@ -990,17 +1045,69 @@ fn stage_row_index_writes_update(
                 }
             }
         } else if old_val == new_val {
-            if let Ok(key) = OrderedValue::try_from(new_val) {
-                // Find the corresponding patch batch by meta_page.
-                if let Some(pb) = patch_batches
-                    .iter_mut()
-                    .find(|p| p.meta_page == ib.meta_page)
-                {
-                    pb.patches.push((key, old_row_id, new_row_id));
+            // item 102-B: even if the indexed key is unchanged, if any INCLUDE
+            // column changed we must insert a new entry (with updated payload)
+            // rather than patching the RowId — patching would leave the old
+            // include bytes on disk, making the covering scan return stale values.
+            let include_cols_changed = !ib.include_cols.is_empty()
+                && ib.include_cols.iter().any(|inc_name| {
+                    table_def
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .find(|(_, c)| c.name == *inc_name)
+                        .map(|(i, _)| before_row.get(i) != new_row.get(i))
+                        .unwrap_or(false)
+                });
+            if !include_cols_changed {
+                if let Ok(key) = OrderedValue::try_from(new_val) {
+                    // Find the corresponding patch batch by meta_page.
+                    if let Some(pb) = patch_batches
+                        .iter_mut()
+                        .find(|p| p.meta_page == ib.meta_page)
+                    {
+                        pb.patches.push((key, old_row_id, new_row_id));
+                    }
                 }
+            } else if let Ok(value) = OrderedValue::try_from(new_val) {
+                // INCLUDE column changed: insert new entry with updated payload.
+                let inc_vals: Vec<Literal> = ib
+                    .include_cols
+                    .iter()
+                    .map(|inc_name| {
+                        table_def
+                            .columns
+                            .iter()
+                            .enumerate()
+                            .find(|(_, c)| c.name == *inc_name)
+                            .map(|(i, _)| new_row.get(i).cloned().unwrap_or(Literal::Null))
+                            .unwrap_or(Literal::Null)
+                    })
+                    .collect();
+                ib.include_entries
+                    .push((value, new_row_id, encode_row(&inc_vals)));
             }
         } else if let Ok(value) = OrderedValue::try_from(new_val) {
-            ib.entries.push((value, new_row_id));
+            // item 102-B: for covering indexes, encode include payload.
+            if ib.include_cols.is_empty() {
+                ib.entries.push((value, new_row_id));
+            } else {
+                let inc_vals: Vec<Literal> = ib
+                    .include_cols
+                    .iter()
+                    .map(|inc_name| {
+                        table_def
+                            .columns
+                            .iter()
+                            .enumerate()
+                            .find(|(_, c)| c.name == *inc_name)
+                            .map(|(i, _)| new_row.get(i).cloned().unwrap_or(Literal::Null))
+                            .unwrap_or(Literal::Null)
+                    })
+                    .collect();
+                ib.include_entries
+                    .push((value, new_row_id, encode_row(&inc_vals)));
+            }
         }
     }
 
@@ -1072,10 +1179,18 @@ fn flush_patch_batches(batches: &[PatchColBatch], ctx: &mut ExecCtx) -> Result<(
 /// per column (A1). Called once after an UPDATE's row loop, on success.
 fn flush_index_batches(batches: &[IndexColBatch], ctx: &mut ExecCtx) -> Result<()> {
     for b in batches {
-        if b.entries.is_empty() {
-            continue;
+        // item 102-B: covering index entries carry include payloads.
+        if !b.include_entries.is_empty() {
+            DiskBTree::new(b.meta_page, ctx.page_size).insert_many_with_include(
+                &b.include_entries,
+                ctx.pool,
+                ctx.wal,
+            )?;
         }
-        DiskBTree::new(b.meta_page, ctx.page_size).insert_many(&b.entries, ctx.pool, ctx.wal)?;
+        if !b.entries.is_empty() {
+            DiskBTree::new(b.meta_page, ctx.page_size)
+                .insert_many(&b.entries, ctx.pool, ctx.wal)?;
+        }
     }
     Ok(())
 }
@@ -1275,7 +1390,8 @@ pub fn execute(plan: LogicalPlan, ctx: &mut ExecCtx) -> Result<ExecResult> {
             table,
             column,
             kind,
-        } => exec_create_index(&table, &column, kind, ctx),
+            include_cols,
+        } => exec_create_index(&table, &column, kind, include_cols, ctx),
         LogicalPlan::AlterTableAddColumn { table, column } => {
             exec_alter_add_column(&table, column, ctx)
         }
@@ -1477,6 +1593,7 @@ fn exec_create_index(
     table: &str,
     column: &str,
     kind: IndexKind,
+    include_cols: Vec<String>,
     ctx: &mut ExecCtx,
 ) -> Result<ExecResult> {
     let table_def = ctx.catalog.lookup(table)?.clone();
@@ -1605,14 +1722,46 @@ fn exec_create_index(
         // splits — the dominant cost in the unsorted path.
         let tree = DiskBTree::create(ctx.pool, ctx.wal)?;
         let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
-        // Phase 1: collect
+
+        // item 102-B: if INCLUDE cols are present, pre-compute the column
+        // indices for the include columns so Phase 1 can encode payloads.
+        let include_col_idxs: Vec<usize> = include_cols
+            .iter()
+            .map(|inc_name| {
+                table_def
+                    .columns
+                    .iter()
+                    .position(|c| c.name == *inc_name)
+                    .unwrap_or(usize::MAX)
+            })
+            .collect();
+        let has_include = !include_cols.is_empty();
+
+        // Phase 1: collect (key, row_id) pairs — and include payloads when applicable.
         let mut pairs: Vec<(OrderedValue, RowId)> = Vec::new();
+        // include_pairs carries the include payload bytes alongside each entry;
+        // populated only for BTree indexes with INCLUDE cols.
+        let mut include_pairs: Vec<(OrderedValue, RowId, Vec<u8>)> = Vec::new();
         for (row_id, bytes) in heap.scan(&snapshot, ctx.xid, ctx.pool)? {
             let row = decode_row(&bytes, &table_def.columns)?;
             match kind {
                 IndexKind::BTree => {
                     if let Ok(value) = OrderedValue::try_from(&row[col_idx]) {
-                        pairs.push((value, row_id));
+                        if has_include {
+                            let inc_vals: Vec<Literal> = include_col_idxs
+                                .iter()
+                                .map(|&i| {
+                                    if i < row.len() {
+                                        row[i].clone()
+                                    } else {
+                                        Literal::Null
+                                    }
+                                })
+                                .collect();
+                            include_pairs.push((value, row_id, encode_row(&inc_vals)));
+                        } else {
+                            pairs.push((value, row_id));
+                        }
                     }
                 }
                 IndexKind::FullText => {
@@ -1628,9 +1777,17 @@ fn exec_create_index(
         // Phase 2: sort by key so rightmost-leaf inserts dominate and page
         // fill approaches capacity (insert_many also sorts, but pre-sorting
         // makes the internal sort O(N) on already-sorted input).
-        pairs.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+        if has_include {
+            include_pairs.sort_unstable_by(|(a, _, _), (b, _, _)| a.cmp(b));
+        } else {
+            pairs.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+        }
         // Phase 3: bulk insert — one WAL mini-txn, one fsync for all pairs.
-        tree.insert_many(&pairs, ctx.pool, ctx.wal)?;
+        if has_include {
+            tree.insert_many_with_include(&include_pairs, ctx.pool, ctx.wal)?;
+        } else {
+            tree.insert_many(&pairs, ctx.pool, ctx.wal)?;
+        }
         tree.meta_page()
     };
 
@@ -1638,6 +1795,39 @@ fn exec_create_index(
     ctx.catalog
         .exclusive()?
         .set_column_index_root(table, column, Some(meta_page), &mut cctx)?;
+
+    // item 102-B: persist INCLUDE column list when non-empty (BTree only).
+    if !include_cols.is_empty() {
+        if !matches!(kind, IndexKind::BTree) {
+            return Err(DbError::SqlPlan(
+                "INCLUDE columns are only supported on BTree indexes".into(),
+            ));
+        }
+        // Validate that every include column exists in the table and is not dropped.
+        {
+            let tdef = ctx.catalog.lookup(table)?;
+            for inc in &include_cols {
+                if tdef
+                    .columns
+                    .iter()
+                    .find(|c| !c.dropped && c.name == *inc)
+                    .is_none()
+                {
+                    return Err(DbError::ColumnNotFound {
+                        table: table.to_string(),
+                        column: inc.clone(),
+                    });
+                }
+            }
+        }
+        let mut cctx2 = catalog_ctx!(ctx);
+        ctx.catalog.exclusive()?.set_column_include_cols(
+            table,
+            column,
+            include_cols,
+            &mut cctx2,
+        )?;
+    }
     Ok(ExecResult::CreatedIndex)
 }
 
@@ -1855,11 +2045,24 @@ fn exec_select(
         find_best_indexable_btree_predicate(e, &table_def, ctx.catalog.table_stats(&table_def.name))
     }) {
         if index_lookup_is_selective(&table_def, hit, ctx, true) {
-            // Item 102-A: detect index-only scan — projection ⊆ {indexed column}.
+            // Item 102-A/B: detect index-only scan — projection ⊆ {indexed column}
+            // (102-A) or projection ⊆ {indexed column} ∪ INCLUDE cols (102-B).
             // Empty projection means SELECT * (all columns) — NOT index-only.
             let (index_col, _, _) = hit;
+            // Look up the include_cols for this column from the catalog.
+            let btree_include_cols: &[String] = table_def
+                .columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(index_col))
+                .map(|c| c.include_cols.as_slice())
+                .unwrap_or(&[]);
             let index_only = !projection.is_empty()
-                && projection.iter().all(|p| p.eq_ignore_ascii_case(index_col));
+                && projection.iter().all(|p| {
+                    p.eq_ignore_ascii_case(index_col)
+                        || btree_include_cols
+                            .iter()
+                            .any(|ic| ic.eq_ignore_ascii_case(p))
+                });
             if let Some(result) =
                 try_exec_select_btree(&table_def, projection, predicate, hit, index_only, ctx)?
             {
@@ -2270,20 +2473,85 @@ fn try_exec_select_btree(
     let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
 
-    // Item 102-A: index-only fast path — when every projected column is the
-    // indexed column itself, the key value is already in the B-tree leaf.
-    // We still perform a lightweight heap get for MVCC visibility (the B-tree
-    // may contain stale entries for dead tuples that have not yet been
-    // vacuumed), but we skip the row-decode step (`deform_row`): on a hit we
-    // return the B-tree key directly rather than unpacking the heap bytes.
-    // This is correct because: the key value in the B-tree leaf is identical
-    // to what `deform_row` would decode for the indexed column.  Rows where
-    // the key no longer matches the heap value cannot occur — the index is
-    // always updated in the same mini-transaction as the heap mutation.
+    // Item 102-A/B: index-only fast path.
     //
-    // Phase B (future) will add a visibility map so the heap get can also be
-    // skipped for ALL_VISIBLE pages, giving a true zero-heap-fetch path.
+    // 102-A: every projected column is the indexed column itself → key from leaf.
+    // 102-B: projected columns ⊆ {key_col} ∪ INCLUDE cols → key + include payload
+    //        from leaf, decoded to Literals without touching heap bytes.
+    //
+    // Both paths still call heap.get() for MVCC visibility (the B-tree may hold
+    // stale entries for dead tuples not yet vacuumed).  The win is skipping
+    // `deform_row` (the columnar decoder) on the heap page.
     if index_only {
+        // Determine if this is 102-B (covering index with INCLUDE cols).
+        let btree_col = table_def.columns.iter().find(|c| c.name == column);
+        let include_cols_for_scan: Vec<String> = btree_col
+            .map(|c| c.include_cols.clone())
+            .unwrap_or_default();
+
+        // Build the set of include-column ColumnDefs for decoding payloads.
+        // These are in INCLUDE declaration order (matching how encode_row encoded them).
+        let include_col_defs: Vec<crate::catalog::ColumnDef> = include_cols_for_scan
+            .iter()
+            .filter_map(|inc_name| {
+                table_def
+                    .columns
+                    .iter()
+                    .find(|c| c.name == *inc_name)
+                    .cloned()
+            })
+            .collect();
+        let is_covering = !include_cols_for_scan.is_empty();
+
+        if is_covering {
+            // 102-B: fetch (key, include_bytes, rid) from leaf.
+            let key_candidates = tree.search_with_keys_and_include(op, &value, ctx.pool)?;
+            let mut rows: Vec<Vec<Literal>> = Vec::with_capacity(key_candidates.len());
+            for (key, inc_bytes, rid) in key_candidates {
+                match heap.get(rid, &snapshot, ctx.xid, ctx.pool) {
+                    Ok(_bytes) => {
+                        // Visible. Build the projected row from key + decoded include.
+                        let inc_vals: Vec<Literal> = if inc_bytes.is_empty() {
+                            vec![Literal::Null; include_col_defs.len()]
+                        } else {
+                            decode_row(&inc_bytes, &include_col_defs)
+                                .unwrap_or_else(|_| vec![Literal::Null; include_col_defs.len()])
+                        };
+                        // Project in the order of `projection` (which determines column order).
+                        let key_name = column.to_ascii_lowercase();
+                        let projected: Vec<Literal> = projection
+                            .iter()
+                            .map(|p| {
+                                let p_lc = p.to_ascii_lowercase();
+                                if p_lc == key_name {
+                                    key.clone().into_literal()
+                                } else {
+                                    // Find this column in include_cols.
+                                    include_col_defs
+                                        .iter()
+                                        .zip(inc_vals.iter())
+                                        .find(|(def, _)| def.name.eq_ignore_ascii_case(p))
+                                        .map(|(_, v)| v.clone())
+                                        .unwrap_or(Literal::Null)
+                                }
+                            })
+                            .collect();
+                        rows.push(projected);
+                    }
+                    Err(DbError::NoVisibleVersion { .. }) => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            let n = rows.len() as u64;
+            IDX_ONLY_ROWS.fetch_add(n, Ordering::Relaxed);
+            IDX_INCLUDE_ROWS.fetch_add(n, Ordering::Relaxed);
+            return Ok(Some(ExecResult::Rows {
+                columns: output_columns(projection, &table_def.columns),
+                rows,
+            }));
+        }
+
+        // 102-A: projection is just the key column — use B-tree key directly.
         let key_candidates = tree.search_with_keys(op, &value, ctx.pool)?;
         let mut rows: Vec<Vec<Literal>> = Vec::with_capacity(key_candidates.len());
         for (key, rid) in key_candidates {
@@ -6030,6 +6298,7 @@ mod tests {
                 unique_index_root: None,
                 dropped: false,
                 constraints: Default::default(),
+                include_cols: Vec::new(),
                 ty: ColumnType::Int64,
             },
             ColumnDef {
@@ -6039,6 +6308,7 @@ mod tests {
                 unique_index_root: None,
                 dropped: false,
                 constraints: Default::default(),
+                include_cols: Vec::new(),
                 ty: ColumnType::Text,
             },
             ColumnDef {
@@ -6048,6 +6318,7 @@ mod tests {
                 unique_index_root: None,
                 dropped: false,
                 constraints: Default::default(),
+                include_cols: Vec::new(),
                 ty: ColumnType::Bool,
             },
             ColumnDef {
@@ -6057,6 +6328,7 @@ mod tests {
                 unique_index_root: None,
                 dropped: false,
                 constraints: Default::default(),
+                include_cols: Vec::new(),
                 ty: ColumnType::Json,
             },
         ];
@@ -6080,6 +6352,7 @@ mod tests {
             unique_index_root: None,
             dropped: false,
             constraints: Default::default(),
+            include_cols: Vec::new(),
             ty: ColumnType::Int64,
         }];
         let encoded = encode_row(&[Literal::Null]);
@@ -6096,6 +6369,7 @@ mod tests {
             unique_index_root: None,
             dropped: false,
             constraints: Default::default(),
+            include_cols: Vec::new(),
             ty: ColumnType::Vector(4),
         }];
         let values = vec![Literal::Vector(vec![0.1, -0.2, 0.3, 0.4])];
@@ -6113,6 +6387,7 @@ mod tests {
             unique_index_root: None,
             dropped: false,
             constraints: Default::default(),
+            include_cols: Vec::new(),
             ty: ColumnType::Vector(4),
         }];
         // Encode a 3-dimension vector but declare the column as 4.
@@ -6132,6 +6407,7 @@ mod tests {
                 unique_index_root: None,
                 dropped: false,
                 constraints: Default::default(),
+                include_cols: Vec::new(),
                 ty: ColumnType::Vector(4),
             }],
             pages: vec![],
@@ -6163,6 +6439,7 @@ mod tests {
             unique_index_root: None,
             dropped: false,
             constraints: Default::default(),
+            include_cols: Vec::new(),
             ty,
         }
     }

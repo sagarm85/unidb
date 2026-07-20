@@ -3120,44 +3120,44 @@ fn bench_mm_report() {
         .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
         .unwrap_or_else(|| vec![1_000, 10_000, 100_000, 1_000_000]);
     if !skip_table4 {
-    if let Some(ref m) = pg_method {
-        println!(
+        if let Some(ref m) = pg_method {
+            println!(
             "_Durability lens: unidb `{sync_prim}`, Postgres `wal_sync_method={m}` (matched);\n\
              single writer, so no group-commit coalescing on either side._\n"
         );
-        let u = url.as_deref().unwrap();
-        if replaced_stack {
-            println!(
+            let u = url.as_deref().unwrap();
+            if replaced_stack {
+                println!(
                 "| txns | unidb txns/s | unidb ms/txn | stack (4-sys) txns/s | stack ms/txn | **unidb ÷ stack** | PG relational only txns/s |"
             );
-            println!(
+                println!(
                 "|-----:|-------------:|-------------:|---------------------:|-------------:|:-----------------:|--------------------------:|"
             );
-            for &c in &sweep {
-                eprintln!("[mmreport] Table 4 at {c} txns…");
-                let uw4 = phased(&format!("t4_unidb_{c}"), || unidb_w4_throughput(c));
-                let stack = phased(&format!("t4_stack_{c}"), || {
-                    pg_replaced_stack_throughput(u, c)
-                });
-                let pgr = phased(&format!("t4_pg_{c}"), || pg_relational_throughput(u, c));
-                let u_ms = if uw4 > 0.0 { 1000.0 / uw4 } else { 0.0 };
-                match stack {
-                    Some(s) if s > 0.0 => {
-                        let ratio = uw4 / s;
-                        let s_ms = 1000.0 / s;
-                        println!(
+                for &c in &sweep {
+                    eprintln!("[mmreport] Table 4 at {c} txns…");
+                    let uw4 = phased(&format!("t4_unidb_{c}"), || unidb_w4_throughput(c));
+                    let stack = phased(&format!("t4_stack_{c}"), || {
+                        pg_replaced_stack_throughput(u, c)
+                    });
+                    let pgr = phased(&format!("t4_pg_{c}"), || pg_relational_throughput(u, c));
+                    let u_ms = if uw4 > 0.0 { 1000.0 / uw4 } else { 0.0 };
+                    match stack {
+                        Some(s) if s > 0.0 => {
+                            let ratio = uw4 / s;
+                            let s_ms = 1000.0 / s;
+                            println!(
                             "| {c} | {uw4:.0} | {u_ms:.3} | {s:.0} | {s_ms:.3} | **{ratio:.2}×** | {pgr:.0} |"
                         );
-                    }
-                    _ => {
-                        println!(
+                        }
+                        _ => {
+                            println!(
                             "| {c} | {uw4:.0} | {u_ms:.3} | _(pgvector n/a)_ | — | — | {pgr:.0} |"
                         );
+                        }
                     }
                 }
-            }
-            println!();
-            println!(
+                println!();
+                println!(
                 "`unidb ÷ stack > 1` means unidb's single atomic commit beats the four-system\n\
                  dual-write on throughput. **The throughput edge is `fsync`-cost-dependent:**\n\
                  unidb pays 1 durable sync per record, the stack 4 — but that advantage only\n\
@@ -3169,8 +3169,8 @@ fn bench_mm_report() {
                  consistency below — one atomic commit vs four with no shared transaction —\n\
                  which no `fsync` setting changes.\n"
             );
-            // Crash-consistency face: the qualitative half no fsync tuning fixes.
-            match pg_stack_torn_record_demo(u) {
+                // Crash-consistency face: the qualitative half no fsync tuning fixes.
+                match pg_stack_torn_record_demo(u) {
                 Some(true) => println!(
                     "**Crash-consistency:** the replaced stack recovered a **torn record** — the\n\
                      relational row is durably present while its embedding/edge/event are absent\n\
@@ -3185,29 +3185,29 @@ fn bench_mm_report() {
                 ),
                 None => {}
             }
-        } else {
-            println!(
+            } else {
+                println!(
                 "| txns | model-writes/txn | unidb txns/s | unidb ms/txn | PG relational only txns/s | postgres ms/txn | unidb ÷ PG-floor |"
             );
-            println!(
+                println!(
                 "|-----:|:----------------:|-------------:|-------------:|--------------------------:|----------------:|-----------------:|"
             );
-            for &c in &sweep {
-                eprintln!("[mmreport] Table 4 at {c} txns…");
-                let uw4 = phased(&format!("t4_unidb_{c}"), || unidb_w4_throughput(c));
-                let pgr = phased(&format!("t4_pg_{c}"), || pg_relational_throughput(u, c));
-                let ratio = if pgr > 0.0 { uw4 / pgr } else { 0.0 };
-                let u_ms = if uw4 > 0.0 { 1000.0 / uw4 } else { 0.0 };
-                let p_ms = if pgr > 0.0 { 1000.0 / pgr } else { 0.0 };
-                println!(
+                for &c in &sweep {
+                    eprintln!("[mmreport] Table 4 at {c} txns…");
+                    let uw4 = phased(&format!("t4_unidb_{c}"), || unidb_w4_throughput(c));
+                    let pgr = phased(&format!("t4_pg_{c}"), || pg_relational_throughput(u, c));
+                    let ratio = if pgr > 0.0 { uw4 / pgr } else { 0.0 };
+                    let u_ms = if uw4 > 0.0 { 1000.0 / uw4 } else { 0.0 };
+                    let p_ms = if pgr > 0.0 { 1000.0 / pgr } else { 0.0 };
+                    println!(
                     "| {c} | 4 : 1 | {uw4:.0} | {u_ms:.3} | {pgr:.0} | {p_ms:.3} | {ratio:.2}× |"
                 );
+                }
+                println!();
             }
-            println!();
+        } else {
+            println!("_`PG_URL` unset → Postgres columns skipped; set it to run Table 4._\n");
         }
-    } else {
-        println!("_`PG_URL` unset → Postgres columns skipped; set it to run Table 4._\n");
-    }
     } // end if !skip_table4
 
     // ---- Table 4.1: TRUE replaced-stack — PG (row+vec+graph) + Redpanda (item 61) ----
@@ -3364,126 +3364,130 @@ fn bench_mm_report() {
          comparison (unidb only checked the *table* existed, not the *row*); now\n\
          both sides pay a real, comparable integrity-check cost.\n"
     );
-    let fk_pg_method = if skip_table5 { None } else { url.as_deref().and_then(pg_ensure_lens) };
+    let fk_pg_method = if skip_table5 {
+        None
+    } else {
+        url.as_deref().and_then(pg_ensure_lens)
+    };
     if !skip_table5 {
-    if let Some(ref m) = fk_pg_method {
-        println!(
+        if let Some(ref m) = fk_pg_method {
+            println!(
             "_Durability lens: unidb `{sync_prim}`, Postgres `wal_sync_method={m}` (matched)._\n"
         );
-        let u = url.as_deref().unwrap();
-        let fdir = tempdir().unwrap();
-        let fe = Arc::new(bench_engine_open(fdir.path()));
-        fe.set_deferred_sync(true);
-        phased("t5_build", || {
-            sql_fk_setup(&fe, FK_CUSTOMERS);
-            let _ = pg_fk_setup(u, FK_CUSTOMERS);
-        });
+            let u = url.as_deref().unwrap();
+            let fdir = tempdir().unwrap();
+            let fe = Arc::new(bench_engine_open(fdir.path()));
+            fe.set_deferred_sync(true);
+            phased("t5_build", || {
+                sql_fk_setup(&fe, FK_CUSTOMERS);
+                let _ = pg_fk_setup(u, FK_CUSTOMERS);
+            });
 
-        println!(
+            println!(
             "| operation | records | unidb (rec/s) | postgres (rec/s) | unidb ÷ PG | remark (winner · margin) |"
         );
-        println!(
+            println!(
             "|-----------|--------:|--------------:|-----------------:|-----------:|:-------------------------|"
         );
-        let (uc, us) = phased("t5_insert_unidb", || {
-            sql_fk_insert_valid(&fe, fk_orders, 0, FK_CUSTOMERS)
-        });
-        let (pc, ps) = phased("t5_insert_pg", || {
-            pg_fk_insert_valid(u, fk_orders, 0, FK_CUSTOMERS)
-        });
-        let (uu, pp) = (rps(uc, us), rps(pc, ps));
-        println!(
-            "| INSERT valid FK (per-row commit) | {} | {uu:.0} | {pp:.0} | {:.2}× | {} |",
-            uc.max(pc),
-            if pp > 0.0 { uu / pp } else { 0.0 },
-            winner_remark(uu, pp),
-        );
+            let (uc, us) = phased("t5_insert_unidb", || {
+                sql_fk_insert_valid(&fe, fk_orders, 0, FK_CUSTOMERS)
+            });
+            let (pc, ps) = phased("t5_insert_pg", || {
+                pg_fk_insert_valid(u, fk_orders, 0, FK_CUSTOMERS)
+            });
+            let (uu, pp) = (rps(uc, us), rps(pc, ps));
+            println!(
+                "| INSERT valid FK (per-row commit) | {} | {uu:.0} | {pp:.0} | {:.2}× | {} |",
+                uc.max(pc),
+                if pp > 0.0 { uu / pp } else { 0.0 },
+                winner_remark(uu, pp),
+            );
 
-        let half = (fk_orders / 2) as i64;
-        let (uc, us) = phased("t5_update_unidb", || sql_fk_update_bulk(&fe, half));
-        let (pc, ps) = phased("t5_update_pg", || pg_fk_update_bulk(u, half));
-        let (uu, pp) = (rps(uc, us), rps(pc, ps));
-        println!(
-            "| UPDATE bulk (re-checks FK path) | {} | {uu:.0} | {pp:.0} | {:.2}× | {} |",
-            uc.max(pc),
-            if pp > 0.0 { uu / pp } else { 0.0 },
-            winner_remark(uu, pp),
-        );
+            let half = (fk_orders / 2) as i64;
+            let (uc, us) = phased("t5_update_unidb", || sql_fk_update_bulk(&fe, half));
+            let (pc, ps) = phased("t5_update_pg", || pg_fk_update_bulk(u, half));
+            let (uu, pp) = (rps(uc, us), rps(pc, ps));
+            println!(
+                "| UPDATE bulk (re-checks FK path) | {} | {uu:.0} | {pp:.0} | {:.2}× | {} |",
+                uc.max(pc),
+                if pp > 0.0 { uu / pp } else { 0.0 },
+                winner_remark(uu, pp),
+            );
 
-        let (uc, us) = phased("t5_join_unidb", || sql_fk_join_select(&fe));
-        let (pc, ps) = phased("t5_join_pg", || pg_fk_join_select(u));
-        let (uu, pp) = (rps(uc, us), rps(pc, ps));
-        println!(
-            "| SELECT JOIN orders/customers | {} | {uu:.0} | {pp:.0} | {:.2}× | {} |",
-            uc.max(pc),
-            if pp > 0.0 { uu / pp } else { 0.0 },
-            winner_remark(uu, pp),
-        );
-        println!();
+            let (uc, us) = phased("t5_join_unidb", || sql_fk_join_select(&fe));
+            let (pc, ps) = phased("t5_join_pg", || pg_fk_join_select(u));
+            let (uu, pp) = (rps(uc, us), rps(pc, ps));
+            println!(
+                "| SELECT JOIN orders/customers | {} | {uu:.0} | {pp:.0} | {:.2}× | {} |",
+                uc.max(pc),
+                if pp > 0.0 { uu / pp } else { 0.0 },
+                winner_remark(uu, pp),
+            );
+            println!();
 
-        println!("**Correctness (not a speed number — a pass/fail proof both engines enforce integrity):**\n");
-        let sql_rejects = phased("t5_reject_unidb", || sql_fk_rejects_invalid(&fe));
-        let pg_rejects = phased("t5_reject_pg", || pg_fk_rejects_invalid(u));
-        println!(
-            "- INSERT referencing a non-existent customer: unidb {}, Postgres {}",
-            if sql_rejects {
-                "**rejected** ✓"
-            } else {
-                "accepted ✗"
-            },
-            if pg_rejects {
-                "**rejected** ✓"
-            } else {
-                "accepted ✗"
-            },
-        );
-        let sql_restrict = phased("t5_restrict_unidb", || {
-            sql_fk_restrict_blocks_delete(&fe, 0)
-        });
-        let pg_restrict = phased("t5_restrict_pg", || pg_fk_restrict_blocks_delete(u, 0));
-        println!(
-            "- DELETE of a still-referenced customer: unidb {}, Postgres {}\n",
-            if sql_restrict {
-                "**blocked (RESTRICT)** ✓"
-            } else {
-                "allowed ✗"
-            },
-            if pg_restrict {
-                "**blocked (RESTRICT)** ✓"
-            } else {
-                "allowed ✗"
-            },
-        );
-    } else if !skip_table5 {
-        println!("_`PG_URL` unset → Postgres columns skipped; set it to run Table 5._\n");
-        let fdir = tempdir().unwrap();
-        let fe = Arc::new(bench_engine_open(fdir.path()));
-        fe.set_deferred_sync(true);
-        phased("t5_build_unidb_only", || sql_fk_setup(&fe, FK_CUSTOMERS));
-        let (uc, us) = phased("t5_insert_unidb_only", || {
-            sql_fk_insert_valid(&fe, fk_orders, 0, FK_CUSTOMERS)
-        });
-        println!("| operation | records | unidb (rec/s) |");
-        println!("|-----------|--------:|---------------:|");
-        println!(
-            "| INSERT valid FK (per-row commit) | {uc} | {:.0} |",
-            rps(uc, us)
-        );
-        let sql_rejects = phased("t5_reject_unidb_only", || sql_fk_rejects_invalid(&fe));
-        println!(
-            "\n- INSERT referencing a non-existent customer: unidb {}\n",
-            if sql_rejects {
-                "**rejected** ✓"
-            } else {
-                "accepted ✗"
-            },
-        );
-    }
-    if fk_pg_method.is_some() {
-        if let Some(u) = url.as_deref() {
-            pg_reset_lens(u);
+            println!("**Correctness (not a speed number — a pass/fail proof both engines enforce integrity):**\n");
+            let sql_rejects = phased("t5_reject_unidb", || sql_fk_rejects_invalid(&fe));
+            let pg_rejects = phased("t5_reject_pg", || pg_fk_rejects_invalid(u));
+            println!(
+                "- INSERT referencing a non-existent customer: unidb {}, Postgres {}",
+                if sql_rejects {
+                    "**rejected** ✓"
+                } else {
+                    "accepted ✗"
+                },
+                if pg_rejects {
+                    "**rejected** ✓"
+                } else {
+                    "accepted ✗"
+                },
+            );
+            let sql_restrict = phased("t5_restrict_unidb", || {
+                sql_fk_restrict_blocks_delete(&fe, 0)
+            });
+            let pg_restrict = phased("t5_restrict_pg", || pg_fk_restrict_blocks_delete(u, 0));
+            println!(
+                "- DELETE of a still-referenced customer: unidb {}, Postgres {}\n",
+                if sql_restrict {
+                    "**blocked (RESTRICT)** ✓"
+                } else {
+                    "allowed ✗"
+                },
+                if pg_restrict {
+                    "**blocked (RESTRICT)** ✓"
+                } else {
+                    "allowed ✗"
+                },
+            );
+        } else if !skip_table5 {
+            println!("_`PG_URL` unset → Postgres columns skipped; set it to run Table 5._\n");
+            let fdir = tempdir().unwrap();
+            let fe = Arc::new(bench_engine_open(fdir.path()));
+            fe.set_deferred_sync(true);
+            phased("t5_build_unidb_only", || sql_fk_setup(&fe, FK_CUSTOMERS));
+            let (uc, us) = phased("t5_insert_unidb_only", || {
+                sql_fk_insert_valid(&fe, fk_orders, 0, FK_CUSTOMERS)
+            });
+            println!("| operation | records | unidb (rec/s) |");
+            println!("|-----------|--------:|---------------:|");
+            println!(
+                "| INSERT valid FK (per-row commit) | {uc} | {:.0} |",
+                rps(uc, us)
+            );
+            let sql_rejects = phased("t5_reject_unidb_only", || sql_fk_rejects_invalid(&fe));
+            println!(
+                "\n- INSERT referencing a non-existent customer: unidb {}\n",
+                if sql_rejects {
+                    "**rejected** ✓"
+                } else {
+                    "accepted ✗"
+                },
+            );
         }
-    }
+        if fk_pg_method.is_some() {
+            if let Some(u) = url.as_deref() {
+                pg_reset_lens(u);
+            }
+        }
     } // end if !skip_table5
 
     // ---- Caveats ----

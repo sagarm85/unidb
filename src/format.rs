@@ -94,7 +94,19 @@ pub const MAGIC: u32 = 0x556E4442; // "UnDB"
 // with `row_count = 0` (safe — treated as stale, recalibrated on next DML).
 // The version bump rejects v10 opens so a stale `row_count` is never surfaced
 // as a correct exact count to a new binary.
-pub const FORMAT_VERSION: u16 = 11;
+//
+// v11 → v12 (item 102-B — covering index INCLUDE cols): the B-tree leaf entry
+// format gains an optional inline payload for INCLUDE columns:
+//   old: key_bytes | RowId(6 B)
+//   new: key_bytes | include_len: u32 LE | include_bytes(include_len B) | RowId(6 B)
+// For indexes without INCLUDE columns `include_len = 0` so the byte sequence
+// is unchanged there — but an older binary reading a leaf that has non-zero
+// `include_len` would misread the RowId bytes as key data and corrupt results.
+// The version bump causes older builds to produce BadVersion rather than
+// silently misreading leaf entries. `ColumnDef` gains `include_cols:
+// Vec<String>` with `#[serde(default)]` so v11 catalog blobs deserialise
+// cleanly with empty include lists.
+pub const FORMAT_VERSION: u16 = 12;
 
 /// Default page size: 8 KiB (D8). Baked into the control file at DB init.
 pub const DEFAULT_PAGE_SIZE: u32 = 8192;

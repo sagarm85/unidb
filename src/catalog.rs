@@ -216,6 +216,16 @@ pub struct ColumnDef {
     /// `pg_attribute.attisdropped`) — dropping a column never rewrites the heap.
     #[serde(default)]
     pub dropped: bool,
+    /// INCLUDE columns stored inline in the B-tree leaf (item 102-B covering
+    /// index). When non-empty, the BTree leaf entry carries the encoded values
+    /// of these columns alongside the key and RowId, enabling an index-only
+    /// scan to serve all projected columns (key + include) without decoding
+    /// the heap tuple. Only valid on columns with `index == Some(IndexKind::BTree)`
+    /// and a built `index_root`. `#[serde(default)]` so v11 catalog blobs
+    /// deserialise cleanly with an empty list (no INCLUDE cols — existing
+    /// indexes keep their old leaf format with `include_len = 0`).
+    #[serde(default)]
+    pub include_cols: Vec<String>,
 }
 
 /// A table-level `FOREIGN KEY (cols) REFERENCES table(cols)` (M11). As with
@@ -758,6 +768,32 @@ impl Catalog {
         self.persist(ctx).map(|_| ())
     }
 
+    /// Persist the INCLUDE column list for a covering B-tree index (item 102-B).
+    /// Called once by `exec_create_index` when `include_cols` is non-empty.
+    pub fn set_column_include_cols(
+        &mut self,
+        table: &str,
+        column: &str,
+        include_cols: Vec<String>,
+        ctx: &mut CatalogCtx,
+    ) -> Result<()> {
+        let t = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
+        let col = t
+            .columns
+            .iter_mut()
+            .find(|c| c.name == column)
+            .ok_or_else(|| DbError::ColumnNotFound {
+                table: table.to_string(),
+                column: column.to_string(),
+            })?;
+        col.include_cols = include_cols;
+        t.generation = t.generation.wrapping_add(1);
+        self.persist(ctx).map(|_| ())
+    }
+
     /// Update a table's stored page list (called by the executor after an
     /// INSERT/UPDATE allocates a new heap page for that table's data).
     pub fn set_pages(
@@ -1053,6 +1089,7 @@ mod tests {
                 dropped: false,
                 constraints: Default::default(),
                 ty: ColumnType::Int64,
+                include_cols: Vec::new(),
             }],
             pages: vec![],
             fsm_meta: None,
@@ -1132,6 +1169,7 @@ mod tests {
                     dropped: false,
                     constraints: Default::default(),
                     ty: ColumnType::Int64,
+                    include_cols: Vec::new(),
                 },
                 ColumnDef {
                     name: "data".to_string(),
@@ -1141,6 +1179,7 @@ mod tests {
                     dropped: false,
                     constraints: Default::default(),
                     ty: ColumnType::Json,
+                    include_cols: Vec::new(),
                 },
             ],
             pages: vec![7],
@@ -1192,6 +1231,7 @@ mod tests {
                     unique_index_root: None,
                     dropped: false,
                     constraints: Default::default(),
+                    include_cols: Vec::new(),
                 },
                 ColumnDef {
                     name: "vec".to_string(),
@@ -1201,6 +1241,7 @@ mod tests {
                     unique_index_root: None,
                     dropped: false,
                     constraints: Default::default(),
+                    include_cols: Vec::new(),
                 },
             ],
             pages: vec![],
@@ -1295,6 +1336,7 @@ mod tests {
                 unique_index_root: None,
                 dropped: false,
                 constraints: Default::default(),
+                include_cols: Vec::new(),
             })
             .collect();
         TableDef {
@@ -1395,6 +1437,7 @@ mod tests {
                         unique_index_root: None,
                         dropped: false,
                         constraints: Default::default(),
+                        include_cols: Vec::new(),
                     }],
                     pages: vec![],
                     fsm_meta: None,
