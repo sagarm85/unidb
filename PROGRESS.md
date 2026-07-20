@@ -8486,7 +8486,20 @@ during the heap scan and calls `tree.insert_many_with_include` (single mini-txn 
 `tests/item102b_covering_index.rs` — 10 tests: `parse_and_build`, `idx_include_rows_counter`,
 `star_projection_heap`, `non_include_col_heap`, `update_include_col`, `delete_row`,
 `multi_include_cols`, `range_predicate`, `reopen_survives`, `perf_10k_covering`.
-All 10 pass. Crash harness 53/53 pass. Full suite 447/447 pass.
+All 10 pass (two consecutive parallel full-suite runs). Crash harness 53/53 pass. Full suite 447/447 pass.
+
+**Test hygiene note (per CLAUDE.md §0.6 item 4 / §6):** the `IDX_INCLUDE_ROWS` /
+`IDX_ONLY_ROWS` counters are process-global and tests run in parallel, so a
+`before == after` (must-NOT-increment) assertion is unsound — a concurrent test
+can bump the counter mid-window. The "does NOT use covering path" cases
+(`star_projection_heap`, `non_include_col_heap`, and 102-A's
+`star_projection_uses_heap`) therefore verify behaviour by **column count / row
+values** (a heap-served `SELECT *` returns all columns; the covering path would
+return only key+include), not by a counter delta. The "DOES use covering path"
+cases keep the monotonic-safe `after > before` / `after >= before + REPS` form.
+`perf_10k_covering` gates on the deterministic counter, not the wall-clock ratio
+(a two-engine wall-clock comparison inside a parallel run measures contention,
+not the `deform_row` saving — that is measured single-process in release/Docker).
 
 ---
 
