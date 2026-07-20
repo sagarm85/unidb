@@ -22,6 +22,15 @@
   handle errors, plus a "schema explorer in 30 lines" recipe. Start here to
   build around unidb "like Postgres." (Application-domain walkthroughs live with
   the application, e.g. `unidb-studio`, not in the engine docs.)
+- [sql/sql_reference.md](sql/sql_reference.md) — **the SQL command reference**:
+  the supported SQL surface, one command per anchored section (click the command
+  index to jump straight to it), each with syntax and a **runnable example** —
+  DDL, DML, queries, vector (`NEAR`/`VECTOR(n)`), full-text (`MATCH`), the Cypher
+  graph subset, and security/RLS (`GRANT`, `CREATE POLICY`, `current_user`).
+  Notes the correct entry point per family (`execute_sql` vs `execute_sql_as` vs
+  `execute_cypher`) and a compatibility-at-a-glance table. Every example is
+  verified against the engine by `examples/verify_sql_reference.rs`; open gaps
+  are tracked in `backlog/19_sql_surface_gaps.md`.
 - [REST_API.md](REST_API.md) — full HTTP route reference for the optional
   `unidb-server` binary (M5): every route's payload and response shape,
   auth model, error codes, and known limitations. Also documents the
