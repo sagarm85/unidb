@@ -512,8 +512,8 @@ shared-column-merged in `plan.rs::plan_using_join` since Milestone 18),
 `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`/`HAVING`, `ORDER BY`/`DISTINCT`/
 `LIMIT`/`OFFSET`, scalar/`IN`/`EXISTS` subqueries (correlated + uncorrelated),
 `IN (list)`, non-recursive `WITH` CTEs, `ANALYZE`, and `EXPLAIN [ANALYZE]`.
-Still out of scope (documented Phase-4 limits): window functions, recursive
-CTEs, `FULL OUTER`/`NATURAL` joins, and columnar/vectorized execution.
+Also supported: `CAST(expr AS type)`, `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`, derived table subqueries (`FROM (SELECT …) AS alias`), `IN (subquery)`/`EXISTS`/scalar subqueries (RLS-safe), and window functions `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`LAG`/`LEAD`/`SUM`/`AVG`/`COUNT`/`MIN`/`MAX OVER (PARTITION BY … ORDER BY …)` (whole-partition frame — item 19 G2-G7). `FULL OUTER JOIN` landed under G2-join.
+Still out of scope (documented Phase-4 limits): recursive CTEs, cumulative-frame window functions, `NATURAL JOIN`, and columnar/vectorized execution.
 
 **Constraints (M11, `sql-constraints` branch — pending merge):** `CREATE
 TABLE` column options and table constraints — `PRIMARY KEY`, `FOREIGN KEY` /
@@ -1426,9 +1426,7 @@ a new `LogicalPlan::Query`/physical operator tree (`sql/{query,plan,query_exec,
 join,aggregate,sort,optimizer,statistics,explain}.rs`). Correctness checked
 differentially against SQLite. No `FORMAT_VERSION` bump, no new crash point
 (no new storage mechanism — stats ride the existing catalog page), no locked
-decision reversed. Known limits: window functions / recursive CTEs / `FULL
-OUTER`+`NATURAL` joins unsupported (`JOIN … USING` **is** supported since
-Milestone 18 — desugared + shared-column-merged in `sql/plan.rs::plan_using_join`);
+decision reversed. Known limits: recursive CTEs / cumulative-frame window functions / `NATURAL` join unsupported; window functions (whole-partition frame), `FULL OUTER JOIN`, `CAST`, `UNION/INTERSECT/EXCEPT`, derived tables, `IN/EXISTS` subqueries, and `LIKE`/`ILIKE` **are** supported (item 19 G2–G7; `JOIN … USING` desugared + shared-column-merged in `sql/plan.rs::plan_using_join` since Milestone 18);
 the catalog (all TableDefs + stats)
 is still a single ~8 KiB page blob, so a very wide analyzed schema can overflow
 it (multi-page catalog is tracked tech debt). See `docs/backlog/
