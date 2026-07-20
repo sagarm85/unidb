@@ -35,8 +35,8 @@ use crate::sql::executor::{self, decode_row, deform_row, ExecCtx, ExecResult};
 use crate::sql::join;
 use crate::sql::logical::{CmpOp, Literal, SetOpKind};
 use crate::sql::plan::{
-    self, eval_qexpr, join_key_bytes, plan_query, resolve_column, Batch, ColumnRef, CteSchemas,
-    PlanNode,
+    self, eval_cast, eval_qexpr, join_key_bytes, plan_query, resolve_column, Batch, ColumnRef,
+    CteSchemas, PlanNode,
 };
 use crate::sql::query::{AggFunc, JoinType, QExpr, QuerySpec};
 
@@ -1323,6 +1323,12 @@ impl Runner<'_, '_> {
                     Ok(a)
                 }
             }
+            // G2 (item 19): CAST — recurse through the ctx-aware evaluator in
+            // case the inner expr contains a subquery, then apply the cast.
+            QExpr::Cast { expr, to_type } => {
+                let val = self.eval(expr, schema, row)?;
+                eval_cast(val, *to_type)
+            }
             // No subquery below here: the pure evaluator handles it.
             QExpr::Column { .. }
             | QExpr::Literal(_)
@@ -1489,6 +1495,7 @@ fn substitute_correlated(
             substitute_correlated(lhs, inner, outer, outer_row)?;
             substitute_correlated(rhs, inner, outer, outer_row)
         }
+        QExpr::Cast { expr, .. } => substitute_correlated(expr, inner, outer, outer_row),
     }
 }
 

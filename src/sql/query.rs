@@ -139,6 +139,21 @@ pub enum JoinType {
     Cross,
 }
 
+/// Target type for a `CAST(expr AS type)` expression (G2, item 19).
+/// Only the practical subset of SQL types is supported; exotic types
+/// return `SqlUnsupported` at parse time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CastTarget {
+    /// `TEXT`, `VARCHAR(n)`, `CHAR(n)` — any string representation.
+    Text,
+    /// `INT`, `INTEGER`, `BIGINT` — truncates floats toward zero.
+    Int,
+    /// `FLOAT`, `REAL`, `DOUBLE` — promotes integers, parses text.
+    Float,
+    /// `BOOLEAN` / `BOOL`.
+    Bool,
+}
+
 /// Phase-4 scalar expression (see the module doc for why this is distinct from
 /// [`Expr`]). Variants are added per checkpoint; P4.a covers the scalar set a
 /// join `WHERE`/`ON` needs.
@@ -241,6 +256,12 @@ pub enum QExpr {
     Nullif {
         lhs: Box<QExpr>,
         rhs: Box<QExpr>,
+    },
+    /// `CAST(expr AS type)` (G2, item 19): explicit type conversion.
+    /// `NULL` cast to any type is still `NULL` (SQL standard).
+    Cast {
+        expr: Box<QExpr>,
+        to_type: CastTarget,
     },
 }
 
@@ -358,6 +379,7 @@ impl QExpr {
                 lhs.bind_params(params)?;
                 rhs.bind_params(params)
             }
+            QExpr::Cast { expr, .. } => expr.bind_params(params),
         }
     }
 
@@ -392,6 +414,7 @@ impl QExpr {
             }
             QExpr::Coalesce(args) => args.iter().any(|e| e.has_aggregate()),
             QExpr::Nullif { lhs, rhs } => lhs.has_aggregate() || rhs.has_aggregate(),
+            QExpr::Cast { expr, .. } => expr.has_aggregate(),
         }
     }
 
@@ -428,6 +451,7 @@ impl QExpr {
             }
             QExpr::Coalesce(args) => args.iter().any(|e| e.has_subquery()),
             QExpr::Nullif { lhs, rhs } => lhs.has_subquery() || rhs.has_subquery(),
+            QExpr::Cast { expr, .. } => expr.has_subquery(),
         }
     }
 }
@@ -569,6 +593,8 @@ fn qualify_policy(policy: Expr, qualifier: &str) -> QExpr {
         // CurrentUser (item-24 Z6): should have been substituted to a Literal
         // by `substitute_current_user_in_plan` before this point; if it somehow
         // reaches here, treat as a literal-true no-op (safe / permissive).
+        // Cast (G2, item 19): CAST is not a valid RLS policy shape; treat as
+        // permissive no-op.
         Expr::JsonExtract { .. }
         | Expr::JsonExtractText { .. }
         | Expr::Near { .. }

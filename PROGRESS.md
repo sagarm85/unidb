@@ -8835,15 +8835,79 @@ Full suite: `cargo test` — all passing (see test run output). `cargo clippy --
 This is a pure SQL surface change — no page format, WAL record type, or storage
 layer touched. Crash harness unchanged. No new `FORMAT_VERSION` bump needed.
 
-### Remaining open gaps (G2/G6/G7/G9/G11)
+### G2-cast — CAST expressions (shipped 2026-07-20)
+
+`CAST(expr AS type)` — see Item 19 G2-cast entry below.
+
+### Remaining open gaps (G2-join/G6/G7/G9/G11)
 
 | Gap | Description | Status |
 |---|---|---|
-| G2 | FULL OUTER JOIN | Open |
+| G2-cast | CAST(expr AS type) | **SHIPPED 2026-07-20** — see Item 19 G2-cast |
+| G2-join | FULL OUTER JOIN | Open |
 | G6 | NATURAL JOIN | Open (low ROI) |
 | G7 | Window functions / recursive CTEs | Open (large; deferred) |
 | G9 | LIKE / NOT LIKE / ILIKE | Delivered under item 30 |
 | G11 | Full-text SQL predicate | Delivered under item 30 |
+
+---
+
+## Item 19 G2-cast — CAST expressions and explicit type conversion (2026-07-20)
+
+**Branch:** `feat/item-19-g2-cast` | **PR:** pending
+
+**Backlog:** `docs/backlog/19_sql_surface_gaps.md` (G2-cast section)
+
+### What shipped
+
+`CAST(expr AS type)` scalar expression support across the Phase-4 query path:
+
+- New `QExpr::Cast { expr, to_type: CastTarget }` variant and `CastTarget` enum
+  (`Text`, `Int`, `Float`, `Bool`) in `src/sql/query.rs`.
+- Parser (`src/sql/parser.rs`): `SqlExpr::Cast` → `QExpr::Cast`; `DataType`
+  mapping to `CastTarget`; `expr_has_case_expr` updated to detect CAST and force
+  Phase-4 routing. `convert_cast_target` helper covers
+  `TEXT`/`VARCHAR`/`CHAR`, `INT`/`INTEGER`/`BIGINT`, `FLOAT`/`REAL`/`DOUBLE`,
+  `BOOLEAN`/`BOOL`. Exotic types return `SqlUnsupported`.
+- Evaluator (`src/sql/plan.rs`): `eval_qexpr` arm evaluates `Cast` via new
+  `pub(crate) eval_cast(val, to_type)` function. Handles `Literal::Decimal`
+  (truncate-toward-zero for INT, true decimal division for FLOAT). `NULL` casts
+  to any type yield `NULL`. `literal_to_text` renders decimals correctly.
+- ctx-aware evaluator (`src/sql/query_exec.rs`): `Runner::eval` arm recurses
+  into inner expr (catches subqueries inside CAST), then calls `eval_cast`.
+  `substitute_correlated` handles `Cast`.
+- Optimizer (`src/sql/optimizer.rs`): `collect_qualifiers` and
+  `collect_columns` recurse into `Cast` inner expr.
+- `query.rs` util methods: `bind_params`, `has_aggregate`, `has_subquery` each
+  extended with a `Cast` arm.
+
+### Conversion table
+
+| From | To TEXT | To INT | To FLOAT | To BOOL |
+|------|---------|--------|----------|---------|
+| TEXT | identity | parse i64 (err on bad input) | parse f64 | "true"/"1"/"t"/"yes"→T, "false"/"0"/"f"/"no"→F |
+| INT | to_string | identity | n as f64 | n != 0 |
+| FLOAT | to_string | f as i64 (truncate) | identity | f != 0.0 |
+| DECIMAL | rendered string | m/10^scale (truncate) | m as f64/10^scale | m != 0 |
+| BOOL | "true"/"false" | 1 or 0 | 1.0 or 0.0 | identity |
+| NULL | NULL | NULL | NULL | NULL |
+
+### Tests
+
+18 tests in `tests/item19_cast.rs`:
+- `cast_int_to_text`, `cast_text_to_int`, `cast_text_col_to_int`
+- `cast_text_invalid_to_int_errors` — error path, no panic
+- `cast_float_to_int_truncates`, `cast_float_negative_to_int_truncates`
+- `cast_int_to_float`
+- `cast_bool_to_text`, `cast_bool_false_to_text`
+- `cast_null_is_null`, `cast_null_to_text_is_null`, `cast_null_to_float_is_null`
+- `cast_in_where_clause` — CAST in predicate filters correctly
+- `cast_in_select_and_where` — combined projection + predicate usage
+- `cast_text_to_int_arithmetic` — CAST result participates in arithmetic
+- `cast_float_col_to_int`, `cast_bool_col_to_text` — column (not literal) inputs
+- `cast_to_unsupported_type_errors` — unsupported type returns error
+
+All 18 pass. Full suite clean. Clippy clean. No storage/format impact.
 
 ---
 

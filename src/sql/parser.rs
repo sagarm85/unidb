@@ -23,7 +23,9 @@ use crate::{
 };
 
 use super::logical::{ArithOp, CmpOp, Expr, Literal, LogicalPlan, SetOpKind};
-use super::query::{AggFunc, FromNode, JoinType, OrderKey, Projection, QExpr, QuerySpec, TableRef};
+use super::query::{
+    AggFunc, CastTarget, FromNode, JoinType, OrderKey, Projection, QExpr, QuerySpec, TableRef,
+};
 
 /// Parse a SQL string (possibly multiple `;`-separated statements) into
 /// logical plans, one per statement.
@@ -980,11 +982,13 @@ fn select_item_has_case_expr(item: &SelectItem) -> bool {
     }
 }
 
-/// Whether a `sqlparser` expression contains a CASE / COALESCE / NULLIF that
-/// must be evaluated by the Phase-4 path (these are only in `QExpr`).
+/// Whether a `sqlparser` expression contains a CASE / COALESCE / NULLIF / CAST
+/// that must be evaluated by the Phase-4 path (these are only in `QExpr`).
 fn expr_has_case_expr(e: &SqlExpr) -> bool {
     match e {
         SqlExpr::Case { .. } => true,
+        // G2 (item 19): CAST is a QExpr-only variant; route to Phase-4.
+        SqlExpr::Cast { .. } => true,
         SqlExpr::Function(f) => {
             let name = f.name.to_string().to_uppercase();
             name == "COALESCE" || name == "NULLIF"
@@ -1268,6 +1272,16 @@ fn convert_qexpr(e: &SqlExpr) -> Result<QExpr> {
             }),
         },
         SqlExpr::BinaryOp { left, op, right } => convert_qbinary_op(left, op, right),
+        // G2 (item 19): CAST(expr AS type) — explicit type conversion.
+        SqlExpr::Cast {
+            expr, data_type, ..
+        } => {
+            let to_type = convert_cast_target(data_type)?;
+            Ok(QExpr::Cast {
+                expr: Box::new(convert_qexpr(expr)?),
+                to_type,
+            })
+        }
         // G1 (item 19): CASE WHEN … THEN … [ELSE …] END.
         SqlExpr::Case {
             operand,
@@ -1472,6 +1486,42 @@ fn convert_nullif_qexpr(func: &ast::Function) -> Result<QExpr> {
         lhs: Box::new(lhs),
         rhs: Box::new(rhs),
     })
+}
+
+/// Map a sqlparser [`DataType`] to a [`CastTarget`] (G2, item 19).
+/// Returns `SqlUnsupported` for exotic types (TIMESTAMP, DECIMAL, JSON, …).
+fn convert_cast_target(dt: &DataType) -> Result<CastTarget> {
+    match dt {
+        DataType::Text
+        | DataType::Varchar(_)
+        | DataType::Char(_)
+        | DataType::CharVarying(_)
+        | DataType::CharacterVarying(_)
+        | DataType::Character(_)
+        | DataType::String(_) => Ok(CastTarget::Text),
+        DataType::Int(_)
+        | DataType::Integer(_)
+        | DataType::BigInt(_)
+        | DataType::Int2(_)
+        | DataType::Int4(_)
+        | DataType::Int8(_)
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::SmallInt(_)
+        | DataType::TinyInt(_) => Ok(CastTarget::Int),
+        DataType::Float(_)
+        | DataType::Float4
+        | DataType::Float8
+        | DataType::Real
+        | DataType::Double(_)
+        | DataType::DoublePrecision => Ok(CastTarget::Float),
+        DataType::Boolean | DataType::Bool => Ok(CastTarget::Bool),
+        other => Err(DbError::SqlUnsupported(format!(
+            "CAST to {other} is not supported in v1 \
+             (supported: TEXT/VARCHAR, INT/BIGINT, FLOAT/DOUBLE, BOOL)"
+        ))),
+    }
 }
 
 /// Convert an aggregate function call (`COUNT(*)`, `SUM(x)`, `AVG(DISTINCT x)`,
