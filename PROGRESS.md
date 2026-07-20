@@ -8293,10 +8293,77 @@ feature):
 
 ---
 
+## Item 101 — Group-commit dwell window in WAL (2026-07-20)
+
+**Branch:** `feat/item-101-group-commit` | **PR:** [#170](https://github.com/sagarm85/unidb/pull/170) MERGED  
+**Commit:** see PR #170
+
+### What shipped
+
+`Wal::sync_up_to` gains a brief configurable sleep (`group_commit_window_us: AtomicU64`) between
+winning the `flush_lock` and calling `group_fsync`. Concurrent committers that append in that
+window share the single `fdatasync`. Three `durable_lsn >= target` re-checks prevent wasted sleeps
+when the leader's fsync already covered later waiters.
+
+- `src/wal.rs`: `group_commit_window_us: AtomicU64` field; dwell sleep + re-checks in `sync_up_to`.
+- `src/lib.rs`: `Engine::set_group_commit_window_us(us)` + `group_commit_window_us()` reader +
+  `wal_fsyncs_count()` counter for bench verification.
+- `src/server/dto.rs`: `GroupCommitWindowRequest { value: u64 }`.
+- `src/server/handlers.rs`: `put_config_group_commit_window_us` — superuser-gated, 204 No Content.
+- `src/server/router.rs`: `PUT /config/group_commit_window_us`.
+
+**Bench target:** concurrent INSERT 0.53×→~0.85–0.90× PG under N-writer load (Docker bench pending
+— item deferred from per-item CRUD bench; will be measured in next multi-writer concurrency run).
+
+**Tests:** `tests/item101_group_commit.rs` — 3 tests:
+1. `group_commit_window_fsyncs_reduced` — fsyncs with window < fsyncs without window
+2. `group_commit_zero_window_disabled` — window=0 disables batching
+3. `group_commit_http_endpoint_superuser_only` — non-superuser gets 403
+
+**Note on double-fsync per INSERT:** item 97 catalog row-count counter triggers a second
+`sync_up_to` after each INSERT commit (`catalog.persist_only()`). The group-commit window
+helps but does not eliminate this; the structural fix (item 103: rely on checkpoint for
+catalog durability, recompute row-count from heap on crash) is a follow-up.
+
+---
+
+## Item 102-A — Index-only scan: key-col projection (2026-07-20)
+
+**Branch:** `feat/item-102a-index-only` | **PR:** [#169](https://github.com/sagarm85/unidb/pull/169) MERGED  
+**Commit:** see PR #169
+
+### What shipped
+
+When a SELECT projects **only the indexed key column(s)**, the executor returns the key value
+directly from the B-tree leaf without calling `deform_row`. A lightweight `heap.get()` is still
+performed for MVCC visibility — B-tree leaves retain stale entries for dead tuples until vacuum
+runs, so the heap page must be touched to confirm row liveness.
+
+**Phase A savings are CPU (deform_row eliminated), not I/O (heap page fetch remains).** True
+zero-heap-fetch requires a visibility map (Phase B, tracked in `102_index_only_scan.md`).
+
+- `src/sql/plan.rs`: `index_only: bool` field on `PlanNode::IndexScan`.
+- `src/sql/optimizer.rs`: sets `index_only = !output.is_empty() && output.iter().all(|c| c.name == best_col)`.
+- `src/sql/executor.rs`: when `index_only`, calls `tree.search_with_keys()` to get `(key, rid)` pairs;
+  for each pair calls `heap.get()` for visibility, then emits `vec![key.into_literal()]` without
+  `deform_row`. `pub static IDX_ONLY_ROWS: AtomicU64` counter increments per fast-path row.
+- `src/btree_index.rs`: `OrderedValue::into_literal()`, `search_with_keys()`, `search_eq_with_keys()`,
+  `search_range_with_keys()` — return `(OrderedValue, RowId)` pairs to the caller.
+- `src/lib.rs`: `Engine::idx_only_rows_total()` exposes the counter.
+
+**Bench impact:** The current Docker bench `SELECT filtered` workload projects **all columns** — Phase A
+does not move that headline number. Phase A helps `SELECT <indexed_col> FROM t WHERE <indexed_col> = val`
+patterns (auth lookups, analytics `DISTINCT`, filtered counts).
+
+**Tests:** `tests/item102_index_only_scan.rs` — 7 tests including counter verification that
+`IDX_ONLY_ROWS` increments and `HEAP_FETCHES` does not increase beyond the visibility probe.
+
+---
+
 ## Items 67 / 51 / 68 / 69 — Async HNSW, Hash join, Hint bits, Fill-factor (2026-07-20)
 
-**Branch:** `perf/items-67-51-68-69-92` | **PR:** [#pending](https://github.com/sagarm85/unidb/pulls)  
-**Commit:** `254786e` (bench) / `83f3f99` (HEAD)  
+**Branch:** `perf/items-67-51-68-69-92` | **PR:** [#171](https://github.com/sagarm85/unidb/pull/171)  
+**Commit:** `254786e` (bench) / `e9d4d5b` (HEAD after rebase)  
 **Validated by:** Docker bench `report_20260719_234504.md` (commit `254786e`, aarch64, 18 cores)  
 **MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1** (Tables 4/5 skipped — items don't touch HNSW query or FK paths)
 
