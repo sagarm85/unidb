@@ -358,6 +358,8 @@ fn collect_qualifiers(expr: &QExpr, out: &mut std::collections::HashSet<String>)
             collect_qualifiers(lhs, out);
             collect_qualifiers(rhs, out);
         }
+        // G2 (item 19): CAST — recurse into the inner expression.
+        QExpr::Cast { expr, .. } => collect_qualifiers(expr, out),
     }
 }
 
@@ -614,6 +616,8 @@ fn collect_columns(expr: &QExpr, out: &mut Vec<(Option<String>, String)>) {
             collect_columns(lhs, out);
             collect_columns(rhs, out);
         }
+        // G2 (item 19): CAST — recurse into the inner expression.
+        QExpr::Cast { expr, .. } => collect_columns(expr, out),
     }
 }
 

@@ -14,7 +14,9 @@ use crate::catalog::{Catalog, ColumnType, IndexKind};
 use crate::error::{DbError, Result};
 use crate::sql::executor;
 use crate::sql::logical::{CmpOp, Literal};
-use crate::sql::query::{AggFunc, FromNode, JoinType, OrderKey, Projection, QExpr, QuerySpec};
+use crate::sql::query::{
+    AggFunc, CastTarget, FromNode, JoinType, OrderKey, Projection, QExpr, QuerySpec,
+};
 
 /// One output column of an operator: the relation qualifier it came from, its
 /// name, and its declared type (for EXPLAIN and future coercion).
@@ -463,6 +465,7 @@ fn collect_aggs(expr: &QExpr, out: &mut Vec<AggCall>) {
             collect_aggs(lhs, out);
             collect_aggs(rhs, out);
         }
+        QExpr::Cast { expr, .. } => collect_aggs(expr, out),
     }
 }
 
@@ -602,6 +605,10 @@ fn rewrite_over_agg(expr: &QExpr, group_exprs: &[QExpr], aggs: &[AggCall]) -> Re
         QExpr::Nullif { lhs, rhs } => Ok(QExpr::Nullif {
             lhs: Box::new(rewrite_over_agg(lhs, group_exprs, aggs)?),
             rhs: Box::new(rewrite_over_agg(rhs, group_exprs, aggs)?),
+        }),
+        QExpr::Cast { expr, to_type } => Ok(QExpr::Cast {
+            expr: Box::new(rewrite_over_agg(expr, group_exprs, aggs)?),
+            to_type: *to_type,
         }),
     }
 }
@@ -1221,6 +1228,7 @@ fn validate_expr(expr: &QExpr, schema: &[ColumnRef]) -> Result<()> {
             validate_expr(lhs, schema)?;
             validate_expr(rhs, schema)
         }
+        QExpr::Cast { expr, .. } => validate_expr(expr, schema),
     }
 }
 
@@ -1403,6 +1411,98 @@ pub fn eval_qexpr(expr: &QExpr, schema: &[ColumnRef], row: &[Literal]) -> Result
                 Ok(a)
             }
         }
+        // G2 (item 19): CAST(expr AS type) — explicit type conversion.
+        // NULL cast to any type is still NULL (SQL standard).
+        QExpr::Cast { expr, to_type } => {
+            let val = eval_qexpr(expr, schema, row)?;
+            eval_cast(val, *to_type)
+        }
+    }
+}
+
+/// Apply a [`CastTarget`] conversion to a [`Literal`]. `NULL` is preserved.
+pub(crate) fn eval_cast(val: Literal, to_type: CastTarget) -> Result<Literal> {
+    if matches!(val, Literal::Null) {
+        return Ok(Literal::Null);
+    }
+    match to_type {
+        CastTarget::Text => Ok(Literal::Text(literal_to_text(&val))),
+        CastTarget::Int => {
+            match val {
+                Literal::Int(n) => Ok(Literal::Int(n)),
+                Literal::Float(f) => Ok(Literal::Int(f as i64)),
+                // Decimal(mantissa, scale): value = mantissa / 10^scale.
+                Literal::Decimal(m, s) => {
+                    let divisor = 10_i128.pow(s as u32);
+                    Ok(Literal::Int((m / divisor) as i64))
+                }
+                Literal::Bool(b) => Ok(Literal::Int(if b { 1 } else { 0 })),
+                Literal::Text(s) => s.trim().parse::<i64>().map(Literal::Int).map_err(|_| {
+                    DbError::SqlPlan(format!("CAST: cannot convert text {s:?} to INT"))
+                }),
+                other => Err(DbError::SqlPlan(format!(
+                    "CAST: cannot convert {other:?} to INT"
+                ))),
+            }
+        }
+        CastTarget::Float => {
+            match val {
+                Literal::Float(f) => Ok(Literal::Float(f)),
+                Literal::Int(n) => Ok(Literal::Float(n as f64)),
+                // Decimal(mantissa, scale): value = mantissa / 10^scale.
+                Literal::Decimal(m, s) => {
+                    let divisor = 10_f64.powi(s as i32);
+                    Ok(Literal::Float(m as f64 / divisor))
+                }
+                Literal::Bool(b) => Ok(Literal::Float(if b { 1.0 } else { 0.0 })),
+                Literal::Text(s) => s.trim().parse::<f64>().map(Literal::Float).map_err(|_| {
+                    DbError::SqlPlan(format!("CAST: cannot convert text {s:?} to FLOAT"))
+                }),
+                other => Err(DbError::SqlPlan(format!(
+                    "CAST: cannot convert {other:?} to FLOAT"
+                ))),
+            }
+        }
+        CastTarget::Bool => match val {
+            Literal::Bool(b) => Ok(Literal::Bool(b)),
+            Literal::Int(n) => Ok(Literal::Bool(n != 0)),
+            Literal::Float(f) => Ok(Literal::Bool(f != 0.0)),
+            Literal::Decimal(m, _) => Ok(Literal::Bool(m != 0)),
+            Literal::Text(s) => match s.trim().to_lowercase().as_str() {
+                "true" | "t" | "yes" | "y" | "on" | "1" => Ok(Literal::Bool(true)),
+                "false" | "f" | "no" | "n" | "off" | "0" => Ok(Literal::Bool(false)),
+                _ => Err(DbError::SqlPlan(format!(
+                    "CAST: cannot convert text {s:?} to BOOL"
+                ))),
+            },
+            other => Err(DbError::SqlPlan(format!(
+                "CAST: cannot convert {other:?} to BOOL"
+            ))),
+        },
+    }
+}
+
+/// Format a [`Literal`] as a [`String`] for CAST-to-text. Matches the output
+/// format used throughout the rest of the engine (the test helper `lit_to_str`).
+fn literal_to_text(val: &Literal) -> String {
+    match val {
+        Literal::Text(s) => s.clone(),
+        Literal::Int(n) => n.to_string(),
+        Literal::Float(f) => f.to_string(),
+        Literal::Bool(b) => b.to_string(),
+        // Decimal(mantissa, scale): render as a decimal string.
+        Literal::Decimal(m, s) => {
+            if *s == 0 {
+                m.to_string()
+            } else {
+                let divisor = 10_i128.pow(*s as u32);
+                let int_part = m / divisor;
+                let frac_part = (m % divisor).abs();
+                format!("{int_part}.{frac_part:0>width$}", width = *s as usize)
+            }
+        }
+        Literal::Null => String::new(), // unreachable: NULL is short-circuited above
+        other => format!("{other:?}"),
     }
 }
 

@@ -1,7 +1,7 @@
 # SQL surface gaps — unsupported query features
 
 **Type:** Improvement
-**Status:** PARTIAL — G1 (CASE/COALESCE/NULLIF), G3 (UNION/INTERSECT/EXCEPT), G4 (ORDER BY non-projected col), G5 (RETURNING), G8 (SELECT without FROM), G10 (IS NULL) SHIPPED 2026-07-20 (see `PROGRESS.md` item 19). G2/G6/G7/G9/G11 remain open.
+**Status:** PARTIAL — G1 (CASE/COALESCE/NULLIF), G2-cast (CAST expressions), G3 (UNION/INTERSECT/EXCEPT), G4 (ORDER BY non-projected col), G5 (RETURNING), G8 (SELECT without FROM), G10 (IS NULL) SHIPPED (see `PROGRESS.md` item 19). G2-join (FULL OUTER JOIN)/G6/G7/G9/G11 remain open.
 
 > A single tracker for the SQL constructs unidb does **not** support yet, so
 > builders (and future us) have one honest list and each gap has a scope/ROI
@@ -29,7 +29,35 @@
 - **Scope:** add `QExpr::Case`/`Coalesce` variants + parser mapping + evaluator
   arms; no storage/format impact. Self-contained, medium.
 
-### G2 — `FULL OUTER JOIN`
+### G2-cast — `CAST(expr AS type)` explicit type conversion **(SHIPPED 2026-07-20)**
+
+- **What:** `CAST(expr AS type)` scalar expression in SELECT lists, WHERE
+  predicates, and anywhere a `QExpr` is valid.
+- **Why it matters:** required by many SQL queries, migration scripts, and
+  client ORMs (e.g. `CAST(id AS TEXT)` for string concatenation, `CAST(label
+  AS INT)` for numeric comparisons on text columns).
+- **Supported types:** `TEXT`/`VARCHAR`, `INT`/`INTEGER`/`BIGINT`,
+  `FLOAT`/`REAL`/`DOUBLE`, `BOOLEAN`/`BOOL`. Exotic types
+  (TIMESTAMP, DECIMAL, JSON, …) return `SqlUnsupported`.
+- **Conversion table:**
+  - Any → TEXT: format via `Display` (integers, floats, booleans, decimals)
+  - Text → INT: `s.parse::<i64>()`, error on failure
+  - Float/Decimal → INT: truncate toward zero (`f as i64`)
+  - Bool → INT: `true` → 1, `false` → 0
+  - Text → FLOAT: `s.parse::<f64>()`, error on failure
+  - Int → FLOAT: `n as f64`
+  - Text → BOOL: `"true"|"t"|"yes"|"y"|"on"|"1"` → true; negatives → false
+  - Int → BOOL: `n != 0`
+  - NULL → any: NULL (SQL standard)
+- **Scope:** `QExpr::Cast { expr, to_type: CastTarget }` + parser mapping
+  from `SqlExpr::Cast` + `expr_has_case_expr` detection to force Phase-4
+  routing + eval arms in both `plan::eval_qexpr` and `query_exec::Runner::eval`
+  + `collect_columns`/`collect_qualifiers` in optimizer + substitute_correlated
+  in query_exec + `bind_params`/`has_aggregate`/`has_subquery` in query.rs.
+  18 tests in `tests/item19_cast.rs`. No storage/format impact.
+- **Outcome:** see `PROGRESS.md` item 19 G2-cast entry.
+
+### G2-join — `FULL OUTER JOIN` (previously called G2)
 - **What:** the fourth join type (currently `INNER`/`LEFT`/`RIGHT`/`CROSS`).
 - **Why it matters:** completes the join set; needed by some reporting tools.
 - **Scope:** join operators (`join.rs`) gain a full-outer path (emit unmatched

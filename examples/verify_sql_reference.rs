@@ -70,8 +70,16 @@ fn main() {
     for s in auth {
         let x = e.begin().unwrap();
         match e.execute_sql_as(None, x, s) {
-            Ok(_) => { e.commit(x).unwrap(); ok += 1; println!("OK    [auth] {s}"); }
-            Err(er) => { let _ = e.abort(x); err += 1; println!("ERR   [auth] {s}\n        -> {er}"); }
+            Ok(_) => {
+                e.commit(x).unwrap();
+                ok += 1;
+                println!("OK    [auth] {s}");
+            }
+            Err(er) => {
+                let _ = e.abort(x);
+                err += 1;
+                println!("ERR   [auth] {s}\n        -> {er}");
+            }
         }
     }
 
@@ -81,8 +89,16 @@ fn main() {
     e.commit(x).unwrap();
     let x = e.begin().unwrap();
     match e.execute_cypher(x, "MATCH (a)-[:KNOWS]->(b) WHERE a = 1 RETURN b") {
-        Ok(_) => { e.commit(x).unwrap(); ok += 1; println!("OK    [cypher] MATCH (a)-[:KNOWS]->(b) WHERE a = 1 RETURN b"); }
-        Err(er) => { let _ = e.abort(x); err += 1; println!("ERR   [cypher] MATCH ... -> {er}"); }
+        Ok(_) => {
+            e.commit(x).unwrap();
+            ok += 1;
+            println!("OK    [cypher] MATCH (a)-[:KNOWS]->(b) WHERE a = 1 RETURN b");
+        }
+        Err(er) => {
+            let _ = e.abort(x);
+            err += 1;
+            println!("ERR   [cypher] MATCH ... -> {er}");
+        }
     }
 
     println!("\n=== {ok} OK, {err} ERR ===");
