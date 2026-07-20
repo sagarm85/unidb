@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `93_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `101_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -37,7 +37,7 @@
 | 21 | `21_observability_metrics.md` | Improvement | ✅ SHIPPED (PROGRESS: Observability metrics enrichment (item 21)) |
 | 22 | `22_logs_surface.md` | Improvement | ✅ SHIPPED (PROGRESS: Logs surface — JSON structured logs, correlation ids, bounded /logs tail) |
 | 23 | `23_storage_service.md` | Milestone | ✅ SHIPPED (PROGRESS: Object storage service — MinIO/S3 tiering over engine metadata (item 23)) |
-| 24 | `24_authz_v2_policies.md` | Milestone | ⏳ NOT STARTED |
+| 24 | `24_authz_v2_policies.md` | Milestone | 🔄 PARTIAL — Z1 (DDL) + Z2 (per-op policies) + Z3(JWT) + Z5 (catalog) + Z6 (`current_user` + `/auth/preview`) SHIPPED 2026-07-19. **REMAINING (2026-07-20 fresh-mind review, live-probe confirmed): Z3 write-side `WITH CHECK` on UPDATE — ESCAPE CONFIRMED (`UPDATE … SET user_id='bob'` transfers a row out of the owner's policy; probe archived in scratchpad); bootstrap-mode silent no-enforcement (policies inert until first `CREATE USER` — no warning); Z4 (role inheritance/column grants).** See item 100 for the separate login-endpoint gap. |
 | 25 | `25_multipage_catalog.md` | Improvement | ✅ SHIPPED 2026-07-13 (multi-page chain; no FORMAT_VERSION bump; P33 crash point; item-23 ceiling lifted) |
 | 26 | `26_event_queue_scale.md` | Improvement | ✅ SHIPPED 2026-07-13 (seq index, EventWake push, Q3 vacuum-correct) |
 | 27 | `27_vacuum_per_table.md` | Improvement | ✅ SHIPPED 2026-07-13 |
@@ -107,10 +107,11 @@
 | 97 | `97_count_star_statistics.md` | Performance | ✅ SHIPPED 2026-07-19 (PR #161) — `row_count: i64` in `TableDef`; maintained on INSERT/DELETE/TRUNCATE; O(1) COUNT(*) fast path; FORMAT_VERSION 10→11; SELECT COUNT(*) 6.93× vs PG. See PROGRESS.md "Item 97". |
 | 98 | `98_sql_insert_throughput.md` | Performance | ✅ SHIPPED 2026-07-19 (PR #157+#159) — `InsertAccum` streaming accumulation: one WAL_BEGIN+COMMIT per VALUES statement; UNIQUE enforcement preserved (per-row index before next row validate). See PROGRESS.md "Item 98". |
 | 99 | `99_batch_sql_endpoint.md` | Performance | ✅ SHIPPED 2026-07-19 (PR #162) — `POST /batch-sql`; up to 256 stmts per request; stop_on_error flag; per-statement auth; 400 BATCH_TOO_LARGE. Projects compare.py 109ms→~16ms (15.7×→~2.3×). See PROGRESS.md "Item 99". |
+| 100 | `100_dev_login_whoami.md` | Improvement | ⏳ NOT STARTED — `POST /auth/login {username}` (dev-only, `UNIDB_DEV_LOGIN=1` gate, issues short-lived JWT; respects the M18 verify-only locked decision) + `GET /auth/whoami` (roles + per-table privileges). Closes the "users log in by username, then RLS filters their data" gap; RLS half is item 24. Server-only, zero engine-path cost. |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `100_…`.**
+**Next new file → `101_…`.**
 
 ## Next up — priority order (2026-07-19, calibrated on Docker bench report_20260719_093148.md)
 

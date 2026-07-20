@@ -51,11 +51,55 @@ Z2/Z4 remain; Z3(WITH CHECK) is partially covered by `insert_policy` row check.
 4. `roles.json` → catalog migration without breaking existing deployments
    (`#[serde(default)]` precedent; no FORMAT_VERSION bump expected — verify).
 
+## Remaining work (2026-07-20 fresh-mind review — live-probe confirmed)
+
+Z1/Z2/Z3(JWT)/Z5/Z6 shipped. Three items remain, two of them security-critical:
+
+### R-a — Z3 write-side `WITH CHECK` on UPDATE  🔴 SHIP-BLOCKER
+
+**Confirmed by live probe** (archived: scratchpad `withcheck_escape_probe.rs`), on `main`
+at commit 196e8aa:
+
+```
+policy: user_id = current_user  (FOR SELECT and FOR UPDATE)
+alice runs: UPDATE todos SET user_id = 'bob' WHERE id = 1
+RESULT: accepted — alice updated 1 row; alice now sees 0 rows;
+        bob now sees alice's row. Ownership transferred OUTSIDE the policy.
+```
+
+Root cause: `exec_update` applies `update_policy` as a **USING** filter (which rows may be
+touched) but never validates the **NEW** row. INSERT already does the right thing
+(`insert_policy` → `check_passes(policy, coerced)` at `executor.rs:1674`). Postgres defaults
+UPDATE `WITH CHECK` to the `USING` expression when no explicit `WITH CHECK` is given.
+
+Fix (contained): after the SET is applied and the row coerced in `exec_update`, evaluate the
+UPDATE policy's WITH-CHECK expression (explicit `WITH CHECK` if the policy carries one, else
+the `USING` predicate) against the new row via the existing `check_passes`; reject with the
+same error class as the INSERT path. Must also fire on the RC re-evaluation path (landmine 2).
+Parser: accept optional `WITH CHECK (expr)` on `CREATE POLICY` and store it (new catalog
+field, `#[serde(default)]` — verify no FORMAT_VERSION bump needed).
+
+### R-b — bootstrap-mode silent non-enforcement  🟡
+
+Discovered by the same probe: with `CREATE ROLE` (not `CREATE USER`) the SELECT policy did
+**not** filter — enforcement only activates once ≥1 `CREATE USER` exists (deliberate bootstrap
+escape, landmine 3). An operator who creates roles + policies but no USER believes RLS is on
+while it is fully off, with no signal. Fix: surface the state — a startup/`whoami` warning when
+policies exist but bootstrap mode is active, and an `enforced: false` column on
+`unidb_catalog.policies` in that state. Document explicitly.
+
+### R-c — Z4 role inheritance + column-level grants (Should; scope-check first).
+
 ## Acceptance
 
-- [ ] Write-skew-style policy escape attempts covered by tests: a role can
-      neither read nor WRITE outside its predicate (Z3 proof, all four DML ops).
+- [ ] **R-a**: the archived escape probe, inverted (expect rejection), passes; WITH CHECK proven
+      on all four DML ops incl. UPDATE ownership-transfer and RC re-evaluation. 🔴
+- [ ] **R-b**: policy-exists-but-bootstrap-active is observable (warning + catalog flag); a test
+      asserts a policy is reported non-enforcing until first `CREATE USER`. 🟡
 - [ ] Concurrency matrix extended with an RLS cell (readers under policies
       during churn) — green at CONC_REPEATS=10.
 - [ ] Studio Auth tab works via catalog + SQL only (no bespoke endpoints).
 - [ ] Audit log records policy/grant changes with acting principal.
+- [ ] **Performance gates** (protect the CRUD numbers): Table 3 with no policies is
+      unchanged within noise; an RLS-on vs manual-`WHERE` comparison on an indexed policy
+      column is within ≤10%.
