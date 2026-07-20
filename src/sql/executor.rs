@@ -1406,6 +1406,12 @@ pub fn execute(plan: LogicalPlan, ctx: &mut ExecCtx) -> Result<ExecResult> {
         LogicalPlan::Explain { analyze, spec } => {
             crate::sql::query_exec::exec_explain(&spec, analyze, ctx)
         }
+        LogicalPlan::SetOp {
+            op,
+            all,
+            left,
+            right,
+        } => crate::sql::query_exec::exec_set_op(op, all, &left, &right, ctx),
     }
 }
 

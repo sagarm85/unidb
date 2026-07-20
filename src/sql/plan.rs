@@ -166,6 +166,16 @@ pub enum PlanNode {
         offset: usize,
         output: Vec<ColumnRef>,
     },
+    /// G3 (item 19): `UNION [ALL]` / `INTERSECT [ALL]` / `EXCEPT [ALL]`.
+    /// Concatenates two query results (UNION ALL), or deduplicates (UNION),
+    /// computes the intersection (INTERSECT), or the difference (EXCEPT).
+    SetOp {
+        op: crate::sql::logical::SetOpKind,
+        all: bool,
+        left: Box<PlanNode>,
+        right: Box<PlanNode>,
+        output: Vec<ColumnRef>,
+    },
 }
 
 /// One aggregate to compute (P4.b): function, argument expression (`None` for
@@ -199,7 +209,8 @@ impl PlanNode {
             | PlanNode::Aggregate { output, .. }
             | PlanNode::Distinct { output, .. }
             | PlanNode::Sort { output, .. }
-            | PlanNode::Limit { output, .. } => output,
+            | PlanNode::Limit { output, .. }
+            | PlanNode::SetOp { output, .. } => output,
             // G8: Dual has zero input columns; projection above it supplies them.
             PlanNode::Dual => &[],
         }
@@ -427,6 +438,31 @@ fn collect_aggs(expr: &QExpr, out: &mut Vec<AggCall>) {
             collect_aggs(lhs, out);
             collect_aggs(rhs, out);
         }
+        QExpr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                collect_aggs(op, out);
+            }
+            for (cond, then) in conditions {
+                collect_aggs(cond, out);
+                collect_aggs(then, out);
+            }
+            if let Some(e) = else_result {
+                collect_aggs(e, out);
+            }
+        }
+        QExpr::Coalesce(args) => {
+            for a in args {
+                collect_aggs(a, out);
+            }
+        }
+        QExpr::Nullif { lhs, rhs } => {
+            collect_aggs(lhs, out);
+            collect_aggs(rhs, out);
+        }
     }
 }
 
@@ -527,6 +563,43 @@ fn rewrite_over_agg(expr: &QExpr, group_exprs: &[QExpr], aggs: &[AggCall]) -> Re
         }),
         QExpr::Arith { op, lhs, rhs } => Ok(QExpr::Arith {
             op: *op,
+            lhs: Box::new(rewrite_over_agg(lhs, group_exprs, aggs)?),
+            rhs: Box::new(rewrite_over_agg(rhs, group_exprs, aggs)?),
+        }),
+        QExpr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            let operand = match operand {
+                Some(op) => Some(Box::new(rewrite_over_agg(op, group_exprs, aggs)?)),
+                None => None,
+            };
+            let mut new_conds = Vec::with_capacity(conditions.len());
+            for (cond, then) in conditions {
+                new_conds.push((
+                    rewrite_over_agg(cond, group_exprs, aggs)?,
+                    rewrite_over_agg(then, group_exprs, aggs)?,
+                ));
+            }
+            let else_result = match else_result {
+                Some(e) => Some(Box::new(rewrite_over_agg(e, group_exprs, aggs)?)),
+                None => None,
+            };
+            Ok(QExpr::Case {
+                operand,
+                conditions: new_conds,
+                else_result,
+            })
+        }
+        QExpr::Coalesce(args) => {
+            let new_args = args
+                .iter()
+                .map(|a| rewrite_over_agg(a, group_exprs, aggs))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(QExpr::Coalesce(new_args))
+        }
+        QExpr::Nullif { lhs, rhs } => Ok(QExpr::Nullif {
             lhs: Box::new(rewrite_over_agg(lhs, group_exprs, aggs)?),
             rhs: Box::new(rewrite_over_agg(rhs, group_exprs, aggs)?),
         }),
@@ -1121,6 +1194,33 @@ fn validate_expr(expr: &QExpr, schema: &[ColumnRef]) -> Result<()> {
             validate_expr(lhs, schema)?;
             validate_expr(rhs, schema)
         }
+        QExpr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                validate_expr(op, schema)?;
+            }
+            for (cond, then) in conditions {
+                validate_expr(cond, schema)?;
+                validate_expr(then, schema)?;
+            }
+            if let Some(e) = else_result {
+                validate_expr(e, schema)?;
+            }
+            Ok(())
+        }
+        QExpr::Coalesce(args) => {
+            for a in args {
+                validate_expr(a, schema)?;
+            }
+            Ok(())
+        }
+        QExpr::Nullif { lhs, rhs } => {
+            validate_expr(lhs, schema)?;
+            validate_expr(rhs, schema)
+        }
     }
 }
 
@@ -1251,6 +1351,57 @@ pub fn eval_qexpr(expr: &QExpr, schema: &[ColumnRef], row: &[Literal]) -> Result
             let l = eval_qexpr(lhs, schema, row)?;
             let r = eval_qexpr(rhs, schema, row)?;
             executor::eval_arith(*op, l, r)
+        }
+        // G1 (item 19): CASE WHEN … THEN … [ELSE …] END.
+        // Searched form (operand == None): each condition is a boolean predicate.
+        // Simple form (operand == Some): compare the operand to each condition for equality.
+        QExpr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            let op_val = match operand {
+                Some(op) => Some(eval_qexpr(op, schema, row)?),
+                None => None,
+            };
+            for (cond, then) in conditions {
+                let matched = match &op_val {
+                    None => executor::as_bool(&eval_qexpr(cond, schema, row)?)?,
+                    Some(v) => {
+                        // Simple CASE: compare operand == condition.
+                        let c = eval_qexpr(cond, schema, row)?;
+                        executor::compare(crate::sql::logical::CmpOp::Eq, v, &c)?
+                    }
+                };
+                if matched {
+                    return eval_qexpr(then, schema, row);
+                }
+            }
+            // No branch matched — return ELSE or NULL.
+            match else_result {
+                Some(e) => eval_qexpr(e, schema, row),
+                None => Ok(Literal::Null),
+            }
+        }
+        // G1 (item 19): COALESCE(v1, v2, …) — first non-NULL value.
+        QExpr::Coalesce(args) => {
+            for a in args {
+                let v = eval_qexpr(a, schema, row)?;
+                if !matches!(v, Literal::Null) {
+                    return Ok(v);
+                }
+            }
+            Ok(Literal::Null)
+        }
+        // G1 (item 19): NULLIF(a, b) — NULL when a = b, else a.
+        QExpr::Nullif { lhs, rhs } => {
+            let a = eval_qexpr(lhs, schema, row)?;
+            let b = eval_qexpr(rhs, schema, row)?;
+            if executor::compare(crate::sql::logical::CmpOp::Eq, &a, &b)? {
+                Ok(Literal::Null)
+            } else {
+                Ok(a)
+            }
         }
     }
 }

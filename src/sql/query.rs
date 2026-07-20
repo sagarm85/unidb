@@ -219,6 +219,29 @@ pub enum QExpr {
         lhs: Box<QExpr>,
         rhs: Box<QExpr>,
     },
+    /// `CASE [operand] WHEN cond THEN val … [ELSE else_val] END` (G1, item 19).
+    /// Searched form: `operand == None`, each `condition` is a boolean expression.
+    /// Simple form: `operand == Some(e)`, each `condition` is compared to `e` for
+    /// equality. Short-circuits at the first true branch.
+    Case {
+        /// Optional simple-form operand (`CASE expr WHEN …`). `None` for searched
+        /// form (`CASE WHEN cond THEN …`).
+        operand: Option<Box<QExpr>>,
+        /// `(condition, result)` pairs — evaluated in order.
+        conditions: Vec<(QExpr, QExpr)>,
+        /// Optional `ELSE` expression; returns `NULL` when absent and no branch
+        /// matched.
+        else_result: Option<Box<QExpr>>,
+    },
+    /// `COALESCE(v1, v2, …)` (G1, item 19): returns the first non-NULL argument.
+    /// Returns `NULL` when the list is empty or every argument is `NULL`.
+    Coalesce(Vec<QExpr>),
+    /// `NULLIF(a, b)` (G1, item 19): returns `NULL` when `a = b`, else `a`.
+    /// Desugars to `CASE WHEN a = b THEN NULL ELSE a END`.
+    Nullif {
+        lhs: Box<QExpr>,
+        rhs: Box<QExpr>,
+    },
 }
 
 impl QExpr {
@@ -308,6 +331,33 @@ impl QExpr {
                 lhs.bind_params(params)?;
                 rhs.bind_params(params)
             }
+            QExpr::Case {
+                operand,
+                conditions,
+                else_result,
+            } => {
+                if let Some(op) = operand {
+                    op.bind_params(params)?;
+                }
+                for (cond, then) in conditions {
+                    cond.bind_params(params)?;
+                    then.bind_params(params)?;
+                }
+                if let Some(e) = else_result {
+                    e.bind_params(params)?;
+                }
+                Ok(())
+            }
+            QExpr::Coalesce(args) => {
+                for a in args {
+                    a.bind_params(params)?;
+                }
+                Ok(())
+            }
+            QExpr::Nullif { lhs, rhs } => {
+                lhs.bind_params(params)?;
+                rhs.bind_params(params)
+            }
         }
     }
 
@@ -329,6 +379,19 @@ impl QExpr {
             QExpr::Like { expr, pattern, .. } => expr.has_aggregate() || pattern.has_aggregate(),
             QExpr::Match { column, query } => column.has_aggregate() || query.has_aggregate(),
             QExpr::Arith { lhs, rhs, .. } => lhs.has_aggregate() || rhs.has_aggregate(),
+            QExpr::Case {
+                operand,
+                conditions,
+                else_result,
+            } => {
+                operand.as_deref().is_some_and(|e| e.has_aggregate())
+                    || conditions
+                        .iter()
+                        .any(|(c, t)| c.has_aggregate() || t.has_aggregate())
+                    || else_result.as_deref().is_some_and(|e| e.has_aggregate())
+            }
+            QExpr::Coalesce(args) => args.iter().any(|e| e.has_aggregate()),
+            QExpr::Nullif { lhs, rhs } => lhs.has_aggregate() || rhs.has_aggregate(),
         }
     }
 
@@ -352,6 +415,19 @@ impl QExpr {
             QExpr::Like { expr, pattern, .. } => expr.has_subquery() || pattern.has_subquery(),
             QExpr::Match { column, query } => column.has_subquery() || query.has_subquery(),
             QExpr::Arith { lhs, rhs, .. } => lhs.has_subquery() || rhs.has_subquery(),
+            QExpr::Case {
+                operand,
+                conditions,
+                else_result,
+            } => {
+                operand.as_deref().is_some_and(|e| e.has_subquery())
+                    || conditions
+                        .iter()
+                        .any(|(c, t)| c.has_subquery() || t.has_subquery())
+                    || else_result.as_deref().is_some_and(|e| e.has_subquery())
+            }
+            QExpr::Coalesce(args) => args.iter().any(|e| e.has_subquery()),
+            QExpr::Nullif { lhs, rhs } => lhs.has_subquery() || rhs.has_subquery(),
         }
     }
 }
@@ -486,8 +562,8 @@ fn qualify_policy(policy: Expr, qualifier: &str) -> QExpr {
             expr: Box::new(qualify_policy(*expr, qualifier)),
             negated,
         },
-        // JSON extraction, NEAR, and arithmetic are not valid RLS policy shapes;
-        // treat as a permissive no-op rather than inventing semantics for them.
+        // JSON extraction, NEAR, arithmetic, and other non-policy shapes are
+        // treated as a permissive no-op rather than inventing semantics.
         // ColumnSlot is an executor-internal variant (item 59 Fix 2) that can
         // never appear in an RLS policy; treat it the same way.
         // CurrentUser (item-24 Z6): should have been substituted to a Literal

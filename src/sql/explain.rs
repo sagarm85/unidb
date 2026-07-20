@@ -66,6 +66,16 @@ pub fn label(node: &PlanNode) -> String {
         }
         // G8: virtual single-row source for SELECT without FROM.
         PlanNode::Dual => "Dual".to_string(),
+        // G3: set-operation node label.
+        PlanNode::SetOp { op, all, .. } => {
+            let op_str = match op {
+                crate::sql::logical::SetOpKind::Union => "Union",
+                crate::sql::logical::SetOpKind::Intersect => "Intersect",
+                crate::sql::logical::SetOpKind::Except => "Except",
+            };
+            let quantifier = if *all { "ALL" } else { "DISTINCT" };
+            format!("SetOp {op_str} {quantifier}")
+        }
     }
 }
 
@@ -85,6 +95,7 @@ fn children(node: &PlanNode) -> Vec<&PlanNode> {
         | PlanNode::Distinct { input, .. }
         | PlanNode::Sort { input, .. }
         | PlanNode::Limit { input, .. } => vec![input],
+        PlanNode::SetOp { left, right, .. } => vec![left, right],
     }
 }
 
@@ -150,6 +161,10 @@ pub fn estimate_rows(node: &PlanNode, catalog: &Catalog) -> f64 {
         }
         // G8: Dual emits exactly one row.
         PlanNode::Dual => 1.0,
+        // G3: estimate set-op output as the sum of the two sides' estimates.
+        PlanNode::SetOp { left, right, .. } => {
+            estimate_rows(left, catalog) + estimate_rows(right, catalog)
+        }
     }
 }
 

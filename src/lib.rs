@@ -955,6 +955,30 @@ fn plan_audit_action(plan: &LogicalPlan) -> &'static str {
 /// are derived relations, not base tables). Subquery-only references are not
 /// walked in v1 (a documented approximation — such a query from a non-superuser
 /// simply isn't over-granted; it may need broader grants).
+/// Collect the names of every heap-table that a `LogicalPlan` reads from
+/// (including nested `SetOp` branches). Used by privilege checking.
+fn plan_base_tables(plan: &LogicalPlan) -> Vec<String> {
+    match plan {
+        LogicalPlan::Select { table, .. }
+        | LogicalPlan::Insert { table, .. }
+        | LogicalPlan::Update { table, .. }
+        | LogicalPlan::Delete { table, .. } => vec![table.clone()],
+        LogicalPlan::Query(spec) | LogicalPlan::Explain { spec, .. } => query_base_tables(spec),
+        LogicalPlan::SetOp { left, right, .. } => {
+            let mut tables = plan_base_tables(left);
+            tables.extend(plan_base_tables(right));
+            tables
+        }
+        LogicalPlan::CreateTable { .. }
+        | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::AlterTableAddColumn { .. }
+        | LogicalPlan::AlterTableDropColumn { .. }
+        | LogicalPlan::DropTable { .. }
+        | LogicalPlan::Truncate { .. }
+        | LogicalPlan::Analyze { .. } => vec![],
+    }
+}
+
 fn query_base_tables(spec: &QuerySpec) -> Vec<String> {
     fn walk(node: &FromNode, ctes: &std::collections::HashSet<String>, out: &mut Vec<String>) {
         match node {
@@ -1588,6 +1612,13 @@ impl Engine {
                 .into_iter()
                 .map(|t| (t, P::Select))
                 .collect(),
+            // G3 (item 19): set operations require SELECT on all base tables.
+            // Branches are now `Box<LogicalPlan>` (to support nested set-ops).
+            LogicalPlan::SetOp { left, right, .. } => {
+                let mut tables = plan_base_tables(left);
+                tables.extend(plan_base_tables(right));
+                tables.into_iter().map(|t| (t, P::Select)).collect()
+            }
             // Schema DDL requires superuser in v1.
             LogicalPlan::CreateTable { .. }
             | LogicalPlan::CreateIndex { .. }
