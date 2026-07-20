@@ -1,37 +1,70 @@
-# AuthZ v2 — gaps found wiring the Studio's Auth tab against a live server
+# AuthZ v2: superuser RLS bypass fix + doc gaps (item 103)
 
 **Type:** Improvement
-**Status:** NOT STARTED
+**Status:** SHIPPED (→ PROGRESS.md "Item 103 — AuthZ v2: superuser RLS bypass")
 
 Found while building unidb-studio's Auth tab (Roles/Grants/Policies/Preview) against
 a live `unidb-server` on `main` (2026-07-20, post item-24 Z1/Z2/Z4/Z5/Z6 merge —
 PRs #152, #163, #166, #167, plus the Z6 auth/preview commits). Every read/write path
 the Studio needed was exercised end-to-end via curl against a running server; two
-correctness/doc gaps surfaced. Filed as one item per the reporting session's request
-— split into separate PRs when picked up if that's cleaner.
-
-**Update 2026-07-20, post PR #168 (item-24 R-a/R-b + item 100):** re-ran the exact
-Gap 1 repro below against the server after #168 landed — **still reproduces
-identically** (both rows still come back empty for the superuser and no-`sub`
-tokens). This is a *different* bug from what #168 fixed: #168's R-a closed a
-write-side escape (`UPDATE ... SET owner='bob'` letting a row leave its own
-policy — a regular user seeing/writing *too much*); Gap 1 here is a superuser
-seeing *too little* on plain reads, the documented bypass never firing. Gaps 2
-and 3 (doc staleness) are also both still present on `main` as of #168. Numbered
-103 — `101` (group-commit dwell window, PR #170) and `102` (index-only scan,
+correctness/doc gaps surfaced. Filed as one item per the reporting session's request.
+Numbered 103 — `101` (group-commit dwell window, PR #170) and `102` (index-only scan,
 PR #169) were both filed and shipped on `main` after this branch's fork point;
-renumbered to 103 to avoid collision. Content otherwise unchanged.
+renumbered to 103 to avoid collision.
 
-## Gap 1 — superuser / no-`sub` caller does not bypass `current_user` RLS policies
+## Problem
 
-`docs/REST_API.md` states (Row-level security section, `current_user` subsection):
+Three gaps were found during Studio integration testing:
 
-> Superusers and the embedded API path (`sub` absent) bypass `current_user`-containing
-> policies entirely.
+### Gap 1 — Superuser / no-`sub` RLS bypass (correctness bug)
 
-This is not what happens today. Reproduced directly against a live server:
+**Confirmed live against a running server:** superuser and no-`sub` (embedded API)
+callers were NOT bypassing `current_user`-referencing RLS policies on the
+concurrent read path (`ReadHandle::execute_sql`). The `ReadHandle` was calling
+`apply_rls` unconditionally with no user context, so a `CurrentUser` node in a
+policy expression was never substituted — it evaluated to `Null`, making the
+filter `owner = Null` → always false → 0 rows returned even for superusers.
 
-```
+On the writer path (`execute_sql` / `execute_sql_inner`), `apply_rls_skip_current_user`
+was already in use, which correctly skips policies containing `CurrentUser`. But
+the concurrent read handle, the session-based path, and the `post_batch_sql` handler
+all lacked user context.
+
+**Root cause paths:**
+- `ReadHandle::execute_sql` → `apply_rls` (no user context)
+- `post_sql` session path → `execute_sql(xid, sql)` → no user identity passed
+- `post_sql` one-shot path → `execute_sql(xid, sql)` same issue
+- `post_batch_sql` → `execute_sql_read` / `execute_sql` (no user context)
+
+### Gap 2 — Stale doc example
+
+`docs/REST_API.md` showed `CREATE ROLE admin SUPERUSER` which is invalid syntax —
+`SUPERUSER` is a `CREATE USER` attribute only; `CREATE ROLE` does not accept it.
+
+### Gap 3 — Missing catalog virtual relations
+
+`docs/REST_API.md` listed only `roles`, `grants`, `policies` in the "Catalog virtual
+relations" paragraph. The `role_members` and `users` virtual tables that ship as
+part of item-24 Z4/Z5 were absent.
+
+## Fix (shipped 2026-07-20, PR #173)
+
+- `ReadHandle` gained an `Arc<RoleStore>` field and a new `execute_sql_as(user, sql)`
+  method that correctly applies the same `skip_current_user_policies` gate as
+  `execute_sql_inner_as` on the writer path.
+- `Engine::read_handle()` passes `Arc::clone(&self.authz)` to `ReadHandle::new`.
+- `EngineHandle` gained `execute_sql_read_as(user, sql)` which delegates to
+  `ReadHandle::execute_sql_as`.
+- `post_sql` and `post_batch_sql` handlers updated to pass the JWT user identity
+  through to the read and write paths so superusers and the no-sub path get the
+  correct bypass.
+- `docs/REST_API.md` corrected for both doc gaps.
+- Three tests in `tests/item103_authz_bypass.rs`: named-superuser bypass,
+  no-sub bypass, regular-user still filtered.
+
+## Repro (archived)
+
+```sql
 CREATE TABLE demo_orders (id INT, owner TEXT, amount INT);
 INSERT INTO demo_orders VALUES (1, 'test_user', 100);
 INSERT INTO demo_orders VALUES (2, 'someone_else', 200);
@@ -39,86 +72,20 @@ CREATE POLICY orders_owner_only ON demo_orders FOR SELECT USING (owner = current
 
 -- as the superuser dev token (is_superuser = true):
 POST /sql {"sql": "SELECT * FROM demo_orders"}
-  -> {"rows": []}                      -- expected: both rows (bypass), got: none
+  -> {"rows": []}                      -- expected: both rows (bypass), got: none (BUG)
 
 -- as a freshly minted JWT with NO `sub` claim at all (the documented
 -- "embedded API path" / implicit-superuser case):
 POST /sql {"sql": "SELECT * FROM demo_orders"}
-  -> {"rows": []}                      -- same result, same gap
+  -> {"rows": []}                      -- same result, same gap (BUG)
+
+-- after fix: both callers return both rows
 ```
 
-Both the named-superuser path and the no-`sub` path evaluate `owner = current_user`
-as if `current_user` were present and non-matching (most likely resolving to an
-empty string or NULL) instead of skipping the policy rewrite entirely for these
-callers, as documented. Net effect: once *any* `current_user`-referencing policy
-exists on a table, superuser/no-`sub` queries against that table via plain
-`POST /sql` silently return fewer rows than they should — a correctness bug, not
-just a docs bug, since a superuser reading their own data via the SQL Editor (or
-any admin tool) gets silently filtered results with no error.
+## Acceptance (all ✅)
 
-Note this doesn't affect `POST /auth/preview` — that route always evaluates as the
-named `as_role`, never through the superuser-bypass path, so its results were
-correct in every case tested.
-
-This is exactly the milestone's own unchecked acceptance item from
-`24_authz_v2_policies.md`:
-
-```
-- [ ] Superuser/bootstrap semantics and `BYPASSRLS` equivalent — explicit, audited.
-```
-
-**Suggested fix shape:** in the RLS rewrite (`apply_rls` / wherever `current_user` is
-substituted), check `is_superuser(caller)` (and the `sub`-absent case) *before*
-substituting `current_user`, and skip the AND-rewrite for that policy entirely for
-those callers — matching the doc's stated contract — rather than substituting a
-placeholder value that happens to satisfy no row.
-
-## Gap 2 — stale `CREATE ROLE ... SUPERUSER` example in REST_API.md
-
-`docs/REST_API.md`'s per-user authorization section shows:
-
-```sql
-CREATE ROLE analyst;
-CREATE ROLE admin SUPERUSER;   -- <- does not match the real grammar
-```
-
-The actual grammar in `src/authz/mod.rs` (and its own header comment) only accepts
-`SUPERUSER` on `CREATE USER`:
-
-```
-CREATE USER <name> [SUPERUSER]        DROP USER <name>
-CREATE ROLE <name>                    DROP ROLE <name>
-```
-
-`parse_auth_stmt`'s `("CREATE", "ROLE")` arm builds `AuthStmt::CreateRole(String)` —
-no superuser field exists on that variant. Roles are pure permission groups;
-`SUPERUSER` is a user attribute only. The doc example should be
-`CREATE USER admin SUPERUSER;` (or dropped as a role example entirely). Low
-severity (docs-only) but worth fixing alongside Gap 1 since both were found the
-same way — a consumer (the Studio) building directly against the documented
-contract.
-
-## Minor — Gap 3, doc completeness
-
-`docs/REST_API.md`'s "Catalog virtual relations" paragraph (end of the per-user
-authorization section) only lists:
-
-```sql
-SELECT * FROM unidb_catalog.roles;
-SELECT * FROM unidb_catalog.grants;
-SELECT * FROM unidb_catalog.policies;
-```
-
-`unidb_catalog.role_members` and `unidb_catalog.users` (item-24 Z4, PR #166) are
-fully implemented (`information_schema.rs`'s `RELATIONS` list, confirmed via curl)
-but aren't mentioned in this specific paragraph — purely a doc omission, the code
-and its own comments are correct.
-
-## Acceptance
-
-- [ ] Superuser and no-`sub` callers see unfiltered rows on tables with
-      `current_user`-referencing policies, verified with the exact repro above
-      (2-row table, one policy, both bypass paths).
-- [ ] `docs/REST_API.md`'s `CREATE ROLE ... SUPERUSER` example corrected.
-- [ ] "Catalog virtual relations" paragraph lists all five relations
+- [x] Superuser and no-`sub` callers see unfiltered rows on tables with
+      `current_user`-referencing policies (3 tests in `tests/item103_authz_bypass.rs`).
+- [x] `docs/REST_API.md`'s `CREATE ROLE ... SUPERUSER` example corrected.
+- [x] "Catalog virtual relations" paragraph lists all five relations
       (`roles`, `grants`, `policies`, `role_members`, `users`).

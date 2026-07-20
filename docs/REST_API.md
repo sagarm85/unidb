@@ -1068,12 +1068,15 @@ non-superuser issuing auth DDL or schema DDL receives `403 PERMISSION_DENIED`.
 #### Roles
 
 ```sql
--- Create a role (regular or superuser)
+-- Create a role (roles do not carry SUPERUSER; use CREATE USER for that)
 CREATE ROLE analyst;
-CREATE ROLE admin SUPERUSER;
 
--- Drop a role
+-- Create a user (optionally a superuser)
+CREATE USER admin SUPERUSER;
+
+-- Drop a role or user
 DROP ROLE analyst;
+DROP USER admin;
 ```
 
 #### Grants
@@ -1308,12 +1311,14 @@ Authorization: Bearer <token>
 
 #### Catalog virtual relations
 
-The current roles, grants, and policies are queryable as virtual relations:
+The current roles, grants, policies, role memberships, and users are queryable as virtual relations:
 
 ```sql
 SELECT * FROM unidb_catalog.roles;
 SELECT * FROM unidb_catalog.grants;
 SELECT * FROM unidb_catalog.policies;
+SELECT * FROM unidb_catalog.role_members;
+SELECT * FROM unidb_catalog.users;
 ```
 
 These are read-only virtual tables synthesized by the executor from the in-memory `RoleStore`

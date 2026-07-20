@@ -370,8 +370,13 @@ pub async fn post_sql(
             .engine
             .authorize_sql(user.clone(), body.sql.clone())
             .await?;
+        // Use execute_sql_as to carry the user identity so the RLS bypass for
+        // superusers and the no-sub path applies correctly (item 103).
         let result = if body.params.is_empty() {
-            state.engine.execute_sql(xid, body.sql).await
+            state
+                .engine
+                .execute_sql_as(user.clone(), xid, body.sql)
+                .await
         } else {
             let params: Vec<_> = body.params.iter().map(json_to_literal).collect();
             state.engine.execute_sql_params(xid, body.sql, params).await
@@ -429,10 +434,20 @@ pub async fn post_sql(
         // begin/commit round-trips. An explicit isolation request (R2)
         // deliberately takes the transactional path instead, so the chosen
         // level actually governs the statement.
-        state.engine.execute_sql_read(body.sql).await?
+        // Pass the user identity so RLS is correctly applied / bypassed for
+        // superusers and the no-sub path (item 103).
+        state
+            .engine
+            .execute_sql_read_as(user.clone(), body.sql)
+            .await?
     } else {
+        // Use execute_sql_as so the RLS bypass logic for superusers/no-sub
+        // callers is applied correctly on the writer path (item 103).
         let xid = state.engine.begin(isolation).await?;
-        let result = state.engine.execute_sql(xid, body.sql).await;
+        let result = state
+            .engine
+            .execute_sql_as(user.clone(), xid, body.sql)
+            .await;
         finish(&state.engine, xid, result).await?
     };
     sql_response(&state, user, results, body.cursor)
@@ -502,14 +517,21 @@ pub async fn post_batch_sql(
                     Err(ApiError::from(e))
                 } else if crate::read_handle::is_concurrent_read_sql(&sql) {
                     // Read-only SELECTs use the concurrent read path.
+                    // Pass the user so RLS bypass applies correctly for
+                    // superusers and the no-sub path (item 103).
                     state
                         .engine
-                        .execute_sql_read(sql.clone())
+                        .execute_sql_read_as(user.clone(), sql.clone())
                         .await
                         .map_err(ApiError::from)
                 } else {
+                    // Use execute_sql_as to carry user identity for RLS bypass
+                    // (item 103).
                     let xid = state.engine.begin(None).await?;
-                    let result = state.engine.execute_sql(xid, sql.clone()).await;
+                    let result = state
+                        .engine
+                        .execute_sql_as(user.clone(), xid, sql.clone())
+                        .await;
                     finish(&state.engine, xid, result)
                         .await
                         .map_err(ApiError::from)

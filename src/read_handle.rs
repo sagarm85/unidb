@@ -19,13 +19,16 @@
 
 use std::sync::{Arc, RwLock};
 
+use crate::authz::RoleStore;
 use crate::bufferpool::{PageReader, SharedPageReader};
 use crate::catalog::Catalog;
 use crate::error::{DbError, Result};
 use crate::heap::RowId;
 use crate::mvcc::is_visible;
 use crate::sql::executor::{exec_select_readonly, plan_is_concurrent_read, ExecResult};
-use crate::sql::logical::{apply_rls, LogicalPlan};
+use crate::sql::logical::{
+    apply_rls, apply_rls_skip_current_user, substitute_current_user_in_plan, LogicalPlan,
+};
 use crate::sql::parser::parse_sql;
 use crate::txn::{self, SharedTxn};
 
@@ -48,6 +51,9 @@ pub struct ReadHandle {
     reader: SharedPageReader,
     txn: SharedTxn,
     catalog: Arc<RwLock<Catalog>>,
+    /// Role store for RLS bypass decisions (item 103): superusers and the
+    /// no-`sub` (embedded) path must bypass `current_user`-referencing policies.
+    authz: Arc<RoleStore>,
 }
 
 impl ReadHandle {
@@ -55,27 +61,61 @@ impl ReadHandle {
         reader: SharedPageReader,
         txn: SharedTxn,
         catalog: Arc<RwLock<Catalog>>,
+        authz: Arc<RoleStore>,
     ) -> Self {
         Self {
             reader,
             txn,
             catalog,
+            authz,
         }
     }
 
     /// Execute one or more **read-only** SQL statements on the concurrent read
-    /// path (6b): each must be a plain `SELECT` (no writes, DDL, or `NEAR` —
-    /// NEAR needs the HNSW index fast path, which stays on the writer thread).
-    /// Reuses the writer-side decode/predicate/projection logic via
-    /// [`exec_select_readonly`], sourcing pages from the shared mmap and the
-    /// snapshot from shared txn state — no xid, no WAL, no writer round-trip.
-    /// Returns [`DbError::SqlPlan`] if a statement is not concurrent-readable,
-    /// so the server can route such statements to the writer path instead.
+    /// path (6b) as the embedded/no-user superuser. Policies that reference
+    /// `current_user` are skipped (item 103); literal-value policies apply.
+    /// For user-aware RLS use [`ReadHandle::execute_sql_as`].
     pub fn execute_sql(&self, sql: &str) -> Result<Vec<ExecResult>> {
+        self.execute_sql_as(None, sql)
+    }
+
+    /// Execute one or more **read-only** SQL statements with user-aware RLS
+    /// (item 103). `user = None` is the embedded/no-sub superuser path and
+    /// bypasses all `current_user`-containing policies. A named superuser
+    /// likewise bypasses them. A regular named user has `current_user`
+    /// substituted and all applicable policies AND-rewritten into the plan.
+    pub fn execute_sql_as(&self, user: Option<&str>, sql: &str) -> Result<Vec<ExecResult>> {
+        // Determine if this caller should bypass current_user-referencing policies.
+        // None == embedded/no-sub == implicit superuser; a named SUPERUSER user
+        // also bypasses. In open/bootstrap mode (no users registered) every caller
+        // is an effective superuser.
+        let skip_current_user_policies = match user {
+            None => true,
+            Some(u) => self.authz.is_superuser(u) || !self.authz.has_users(),
+        };
         let plans = parse_sql(sql)?;
         let mut out = Vec::with_capacity(plans.len());
-        for plan in plans {
-            let plan = apply_rls(plan, &self.catalog_read());
+        for mut plan in plans {
+            // Substitute current_user() in the user-supplied SQL predicates
+            // first, then apply RLS (which may inject more CurrentUser nodes),
+            // then substitute again for the injected policy expressions.
+            if let Some(u) = user {
+                substitute_current_user_in_plan(&mut plan, u);
+            }
+            let mut plan = if skip_current_user_policies {
+                // Superuser / no-sub: skip any policy that references current_user.
+                // Literal-value policies (no CurrentUser) still apply, matching
+                // the behaviour of execute_sql_inner on the writer path.
+                apply_rls_skip_current_user(plan, &self.catalog_read())
+            } else {
+                // Regular named user: apply all applicable policies.
+                apply_rls(plan, &self.catalog_read())
+            };
+            // Second substitution resolves CurrentUser nodes injected by the
+            // RLS policy expressions (only matters for the non-skip path).
+            if let Some(u) = user {
+                substitute_current_user_in_plan(&mut plan, u);
+            }
             if !plan_is_concurrent_read(&plan) {
                 return Err(DbError::SqlPlan(
                     "read handle executes only plain read-only SELECT (no writes, DDL, or NEAR)"

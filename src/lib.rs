@@ -4070,6 +4070,7 @@ impl Engine {
             self.pool.shared_reader(),
             self.txn_mgr.shared(),
             Arc::clone(&self.catalog),
+            Arc::clone(&self.authz),
         )
     }
 

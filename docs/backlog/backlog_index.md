@@ -112,6 +112,8 @@
 | 102 | `102_index_only_scan.md` | Performance | 🔄 Phase A SHIPPED 2026-07-20 (PR #169) — skip `deform_row` for key-col projection; `IDX_ONLY_ROWS` counter; heap.get() still needed for MVCC visibility. Phase B (covering index) pending. |
 | 103 | `103_authz_v2_studio_integration_gaps.md` | Improvement | ⏳ NOT STARTED — superuser/no-`sub` callers silently return empty rows when `current_user` RLS policies exist (bypass never fires); stale `CREATE ROLE … SUPERUSER` doc example; missing `role_members`/`users` in catalog paragraph. Re-confirmed live post PR #168. |
 
+| 103 | `103_authz_v2_studio_integration_gaps.md` | Improvement | ✅ SHIPPED 2026-07-20 — superuser/no-sub RLS bypass on concurrent-read path; `ReadHandle::execute_sql_as`; doc fixes (`CREATE ROLE SUPERUSER` → `CREATE USER SUPERUSER`, add `role_members`/`users` to catalog virtual relations). See PROGRESS.md "Item 103". |
+
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
 **Next new file → `104_…`.**

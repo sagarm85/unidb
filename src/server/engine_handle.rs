@@ -122,8 +122,9 @@ impl EngineHandle {
         .map_err(|_| DbError::EngineUnavailable)?
     }
 
-    /// Execute read-only SQL (`SELECT`) on the concurrent read path (6b). The
-    /// caller must have classified the SQL as concurrent-readable (see
+    /// Execute read-only SQL (`SELECT`) on the concurrent read path (6b) as the
+    /// embedded/no-user superuser. Policies containing `current_user` are skipped.
+    /// The caller must have classified the SQL as concurrent-readable (see
     /// [`crate::read_handle::is_concurrent_read_sql`]); a non-read statement
     /// returns [`DbError::SqlPlan`].
     pub async fn execute_sql_read(&self, sql: String) -> Result<Vec<ExecResult>> {
@@ -132,6 +133,25 @@ impl EngineHandle {
         tokio::task::spawn_blocking(move || {
             let _corr = crate::observability::set_request_id(request_id);
             read.execute_sql(&sql)
+        })
+        .await
+        .map_err(|_| DbError::EngineUnavailable)?
+    }
+
+    /// Execute read-only SQL (`SELECT`) on the concurrent read path (6b) under
+    /// a named user identity (item 103). Superusers and the no-`sub` path
+    /// (`user = None`) bypass `current_user`-referencing policies. Regular users
+    /// have policies applied with `current_user` substituted.
+    pub async fn execute_sql_read_as(
+        &self,
+        user: Option<String>,
+        sql: String,
+    ) -> Result<Vec<ExecResult>> {
+        let read = self.read.clone();
+        let request_id = crate::server::correlation::current_request_id();
+        tokio::task::spawn_blocking(move || {
+            let _corr = crate::observability::set_request_id(request_id);
+            read.execute_sql_as(user.as_deref(), &sql)
         })
         .await
         .map_err(|_| DbError::EngineUnavailable)?
@@ -355,10 +375,7 @@ impl EngineHandle {
 
     /// Roles and table-level grants for a user (name, table, privileges).
     /// Used by `GET /auth/whoami`.
-    pub async fn user_grants(
-        &self,
-        user: String,
-    ) -> Vec<(String, Vec<String>)> {
+    pub async fn user_grants(&self, user: String) -> Vec<(String, Vec<String>)> {
         self.on_engine(move |e| Ok(e.authz.table_grants_for(&user)))
             .await
             .unwrap_or_default()
