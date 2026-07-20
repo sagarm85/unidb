@@ -273,9 +273,13 @@ fn range_predicate() {
     exec(&eng, "CREATE INDEX ON t (id) INCLUDE (label)");
     exec(&eng, "ANALYZE t");
 
-    let before = IDX_INCLUDE_ROWS.load(Ordering::Relaxed);
-
     // id >= 995 → rows 995,996,997,998,999,1000
+    // Correctness is verified by the row values below. The covering index carries
+    // `label`, so a correct result also proves the include bytes decode correctly
+    // whichever path (covering or full-scan) the cost model picks. We do NOT
+    // assert the global `IDX_INCLUDE_ROWS` counter here — it is process-wide and
+    // concurrent tests increment it, so a before/after delta is not sound in a
+    // parallel run.
     let rows = query(&eng, "SELECT id, label FROM t WHERE id >= 995");
     assert_eq!(rows.len(), 6, "expected 6 rows for id >= 995"); // 995..=1000
     for r in &rows {
@@ -284,24 +288,10 @@ fn range_predicate() {
             _ => panic!("expected Int"),
         };
         assert!(id >= 995, "id {id} should be >= 995");
-        // label should match
+        // label (the INCLUDE column) must match — proves include bytes decode.
         let label_expected = format!("row{id}");
         assert_eq!(r[1], text(&label_expected), "label mismatch for id={id}");
     }
-
-    let after = IDX_INCLUDE_ROWS.load(Ordering::Relaxed);
-    // With 1000 rows and high selectivity, the optimizer should use the covering
-    // index. If it does, the counter must increment.
-    if after > before {
-        // Covering path was taken — verify at least 6 increments.
-        assert!(
-            after >= before + 6,
-            "covering range scan must increment IDX_INCLUDE_ROWS by >= 6: before={before} after={after}"
-        );
-    }
-    // If the optimizer chose a full scan (after == before), that is also
-    // acceptable for correctness — the row values above already verify the query
-    // returns the right data.
 }
 
 /// 9. Covering index metadata persists across engine reopen.
@@ -398,29 +388,25 @@ fn perf_10k_covering() {
     let after_inc = IDX_INCLUDE_ROWS.load(Ordering::Relaxed);
 
     // PRIMARY ASSERTION (deterministic): the covering path must have been taken
-    // for each lookup. Per CLAUDE.md §0.6, we trust the internal counter over a
-    // noisy wall-clock ratio — the counter proves the `deform_row`-free path ran.
+    // for each lookup. Per CLAUDE.md §0.6 item 4, we trust the internal counter
+    // over a wall-clock ratio — the counter proves the `deform_row`-free path ran
+    // REPS times, which is the actual behavioural claim of item 102-B.
     assert!(
         after_inc >= before_inc + REPS as u64,
         "IDX_INCLUDE_ROWS did not increment: before={before_inc} after={after_inc}"
     );
 
-    // SOFT/INFORMATIONAL: the wall-clock ratio. The covering path eliminates
-    // `deform_row` (decoding the unprojected `extra` column from heap bytes) —
-    // a real CPU saving, but in a debug build at 10k rows the fixed per-query
-    // overhead (parse, plan, snapshot) dominates and the ratio is timing-noisy.
-    // We log it but do NOT gate on it here (a wall-clock micro-benchmark inside
-    // a parallel unit-test run flakes); release-build / Docker bench measures
-    // the real speedup. We only fail if covering is *pathologically* slower
-    // (> 2× the non-covering path), which would signal a real regression.
+    // INFORMATIONAL ONLY — no assertion. A wall-clock comparison between two
+    // separately-timed engine instances is unsound inside a *parallel* unit-test
+    // run: the `non_covering` loop and the `covering` loop execute at different
+    // wall-clock moments under different system contention (other test threads
+    // spinning up), so the ratio is not a valid measurement. The real speedup
+    // (covering eliminates `deform_row` on the unprojected `extra` column) is
+    // measured in a release build / the Docker bench, single-process, per §6.
     if covering_ms > 0 && non_covering_ms > 0 {
         let ratio = non_covering_ms as f64 / covering_ms as f64;
         println!(
-            "[perf_10k_covering] non_covering={non_covering_ms}ms covering={covering_ms}ms ratio={ratio:.2}× (informational)"
-        );
-        assert!(
-            covering_ms as f64 <= non_covering_ms as f64 * 2.0,
-            "covering path pathologically slow: covering={covering_ms}ms > 2× non_covering={non_covering_ms}ms — likely a regression"
+            "[perf_10k_covering] non_covering={non_covering_ms}ms covering={covering_ms}ms ratio={ratio:.2}× (informational; parallel-run wall-clock is NOT a valid measurement — see release/Docker bench)"
         );
     }
 }
