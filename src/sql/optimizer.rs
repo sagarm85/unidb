@@ -819,6 +819,7 @@ mod tests {
             serial_next: Default::default(),
             generation: 0,
             row_count: 0,
+            fill_factor: 100,
         });
     }
 

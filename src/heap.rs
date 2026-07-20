@@ -34,7 +34,7 @@ use crate::{
     },
     lockmgr::{LockManager, RecordId},
     mvcc::{is_reclaimable, is_visible, Snapshot},
-    page::{SlotState, SlottedPage},
+    page::{SlotState, SlottedPage, TUPLE_HINT_XMAX_COMMITTED, TUPLE_HINT_XMIN_COMMITTED},
     wal::Wal,
 };
 
@@ -98,6 +98,12 @@ pub struct Heap {
     /// page id + page size), so holding one costs nothing and reopening it is
     /// O(1).
     fsm_tree: Option<DiskBTree>,
+    /// Item 69: fill-factor page reservation.  INSERT stops packing a page once
+    /// its free bytes drop below `page_size * (100 - fill_factor) / 100`.  The
+    /// reserve is for HOT UPDATE rewrites (items 58/71); HOT paths bypass it
+    /// intentionally (they use real free space).  Range 10–100; default 100
+    /// (dense packing, backward-compatible; reserve = 0 bytes).
+    fill_factor: u8,
 }
 
 /// Open-page accumulation state for [`Heap::insert_accumulating`] (item 98).
@@ -150,6 +156,7 @@ impl Heap {
                 ..HeapFsm::default()
             }),
             fsm_tree: None,
+            fill_factor: 100,
         }
     }
 
@@ -165,6 +172,7 @@ impl Heap {
                 directory_loaded: true,
             }),
             fsm_tree: None,
+            fill_factor: 100,
         }
     }
 
@@ -184,9 +192,22 @@ impl Heap {
                     directory_loaded: false,
                 }),
                 fsm_tree: Some(DiskBTree::new(meta, page_size)),
+                fill_factor: 100,
             },
             None => Self::from_pages(page_size, legacy_pages),
         }
+    }
+
+    /// Item 69: set the fill-factor reservation for this heap.
+    ///
+    /// INSERT stops packing a page once its free bytes fall below
+    /// `page_size * (100 - fill_factor) / 100`, reserving that slack for
+    /// same-page HOT UPDATE rewrites.  Valid range 10–100; 100 disables the
+    /// reserve (dense packing, default).  HOT update paths bypass the reserve
+    /// intentionally — the reserve exists precisely to benefit them.
+    pub fn with_fill_factor(mut self, fill_factor: u8) -> Self {
+        self.fill_factor = fill_factor;
+        self
     }
 
     /// Lazily populate the in-memory page directory from the durable FSM tree,
@@ -292,13 +313,18 @@ impl Heap {
         let needed = crate::page::SLOT_SIZE + crate::page::TUPLE_HEADER_SIZE + data.len();
 
         // Fast path: current page has room — append within the same mini-txn.
+        // Item 69: the fill-factor reserve is applied here too, so that
+        // multi-row VALUES batches honour the reservation within a page and
+        // spill to a new page at the fill-factor threshold — not only when
+        // acquiring the very first page of a batch.
+        let reserve = (self.page_size * (100 - self.fill_factor as usize)) / 100;
         if let Some(acc) = state.as_mut() {
             // Fetch the page fresh from the pool to get the post-write state.
             // The exclusive latch (_wg) is still held so no other writer can
             // race us here.  We do NOT call acquire_page_for_insert — the latch
             // guarantees the page is ours.
             let mut page = pool.fetch_page_for_write(acc.page_id, wal)?;
-            if page.free_space() >= needed {
+            if page.free_space() >= needed + reserve {
                 let slot = page.insert_versioned(data, xid, 0, None)?;
                 let row_id = RowId {
                     page_id: acc.page_id,
@@ -403,7 +429,47 @@ impl Heap {
     /// freshly `alloc_heap_page`'d page always fits, so the loop terminates. The
     /// FSM lock is only ever taken with no page latch held, or *after* one
     /// (never the reverse), so the two lock classes form no cycle.
+    /// Acquire a page for a new INSERT, applying the fill-factor reserve
+    /// (item 69): INSERT stops packing a page once its free bytes drop below
+    /// `page_size * (100 - fill_factor) / 100`.  The reserve is for HOT UPDATE
+    /// rewrites (items 58/71); UPDATE cross-page paths use
+    /// `acquire_page_for_update` which bypasses the reserve intentionally.
+    ///
+    /// IMPORTANT: `find_or_alloc_page` is called with the full threshold
+    /// (`needed + reserve`) so the FSM pre-filter skips pages that are already
+    /// below the threshold.  Passing only `needed` would cause an infinite loop
+    /// when fill_factor < 100 (a page with `needed <= free < needed+reserve`
+    /// would be returned by the FSM, rejected here, noted at its real free
+    /// bytes — which are still >= needed — and then immediately re-picked).
     fn acquire_page_for_insert(
+        &self,
+        needed: usize,
+        pool: &BufferPool,
+        wal: &Wal,
+    ) -> Result<(PageId, ExclusiveLatch, SlottedPage)> {
+        let reserve = (self.page_size * (100 - self.fill_factor as usize)) / 100;
+        let threshold = needed + reserve;
+        loop {
+            let page_id = self.find_or_alloc_page(threshold, pool, wal)?;
+            let latch = pool.latch_exclusive(page_id);
+            let page = pool.fetch_page_for_write(page_id, wal)?;
+            if page.free_space() >= threshold {
+                return Ok((page_id, latch, page));
+            }
+            // Lost the page to a concurrent writer; correct the FSM's cached
+            // free-space so we don't immediately re-pick it, then retry.
+            let free = page.free_space();
+            pool.unpin(page_id);
+            drop(latch);
+            self.note_free_space(page_id, free);
+        }
+    }
+
+    /// Acquire a page for a new row version in an UPDATE (cross-page fallback).
+    /// Does NOT apply the fill-factor reserve: UPDATE writes into the reserved
+    /// slack — that is exactly what the reserve is for.  Uses `needed` as the
+    /// threshold so any page with sufficient real free space is eligible.
+    fn acquire_page_for_update(
         &self,
         needed: usize,
         pool: &BufferPool,
@@ -416,8 +482,6 @@ impl Heap {
             if page.free_space() >= needed {
                 return Ok((page_id, latch, page));
             }
-            // Lost the page to a concurrent writer; correct the FSM's cached
-            // free-space so we don't immediately re-pick it, then retry.
             let free = page.free_space();
             pool.unpin(page_id);
             drop(latch);
@@ -537,7 +601,9 @@ impl Heap {
         // New version's insert, under a fresh page latch acquired only after the
         // old latch was released (one physical latch at a time — never two — so
         // two concurrent updates can't deadlock on inverse page-latch order).
-        let (new_page_id, _ng, mut new_page) = self.acquire_page_for_insert(needed, pool, wal)?;
+        // Item 69: use acquire_page_for_update (no fill-factor reserve) — the
+        // update is writing INTO the reserved slack, not past it.
+        let (new_page_id, _ng, mut new_page) = self.acquire_page_for_update(needed, pool, wal)?;
         // P1.a: full-page image of the new-version page before its insert. A
         // no-op if this is the same page as the old version (already covered).
         let ins_prev = pool
@@ -717,9 +783,11 @@ impl Heap {
         // Step 1: acquire a new page and insert the new version.
         // Latch is released before we touch the old page (new-before-old order;
         // see doc comment above).
+        // Item 69: use acquire_page_for_update (no fill-factor reserve) — the
+        // cross-page fallback writes INTO the reserved slack, not past it.
         let (new_page_id, new_slot, ins_lsn) = {
             let (new_page_id, _ng, mut new_page) =
-                self.acquire_page_for_insert(needed, pool, wal)?;
+                self.acquire_page_for_update(needed, pool, wal)?;
             // P1.a: FPI for new page before its first change.
             let fpi_new = pool
                 .maybe_log_fpi(new_page_id, wal, txn_id, begin_lsn)?
@@ -823,6 +891,9 @@ impl Heap {
             &u64_to_le(th.xmax),
         )?;
         page.set_xmax(row_id.slot, xid)?;
+        // Item 68: set HINT_XMIN_COMMITTED — xmin must be committed since the
+        // DELETE visibility check passed.  CRC deferred to set_lsn() below.
+        let _ = page.set_xmin_hint(row_id.slot, TUPLE_HINT_XMIN_COMMITTED);
         page.set_lsn(lsn);
         pool.write_page(&page)?;
         pool.unpin(row_id.page_id);
@@ -996,7 +1067,7 @@ impl Heap {
         // Phase B: insert new versions, packing as many per fill page as fit.
         //
         // Guaranteed progress: the outer loop always advances `i` by at least
-        // one row per fill page because `acquire_page_for_insert` ensures the
+        // one row per fill page because `acquire_page_for_update` ensures the
         // first row of each batch fits, so the inner while can insert at least
         // one row before breaking.
         //
@@ -1007,6 +1078,10 @@ impl Heap {
         // mini-txns; the A→B phase order and per-row xmax checks are unchanged.
         // `note_free_space` is still called so the FSM stays accurate for future
         // statements; the cursor is purely a within-statement fast path.
+        //
+        // Item 69: use acquire_page_for_update (no fill-factor reserve) — new
+        // row versions from an UPDATE write INTO the reserved slack, not past
+        // it.  That is the entire point of the fill-factor reservation.
         let mut fill_cursor: Option<(PageId, usize)> = None; // (page_id, remaining_free)
         let mut result = Vec::with_capacity(rows.len());
         let mut i = 0;
@@ -1022,7 +1097,7 @@ impl Heap {
                     let page = pool.fetch_page_for_write(pid, wal)?;
                     (pid, ng, page)
                 } else {
-                    self.acquire_page_for_insert(needed, pool, wal)?
+                    self.acquire_page_for_update(needed, pool, wal)?
                 };
 
             let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
@@ -1219,6 +1294,10 @@ impl Heap {
         // Carry remaining capacity forward to skip FSM mutex on the next fill page
         // when the previous one still has room. No latch is held between mini-txns;
         // the cursor is a local within-statement fast path only.
+        //
+        // Item 69: use acquire_page_for_update (no fill-factor reserve) — new
+        // row versions from a HOT UPDATE write INTO the reserved slack, not past
+        // it.  That is the point of the fill-factor reservation.
         let mut fill_cursor: Option<(PageId, usize)> = None; // (page_id, remaining_free)
         let mut b_pairs: Vec<(RowId, RowId)> = Vec::with_capacity(rows.len());
         let mut i = 0;
@@ -1234,7 +1313,7 @@ impl Heap {
                     let page = pool.fetch_page_for_write(pid, wal)?;
                     (pid, ng, page)
                 } else {
-                    self.acquire_page_for_insert(needed, pool, wal)?
+                    self.acquire_page_for_update(needed, pool, wal)?
                 };
 
             let (txn_id, begin_lsn) = wal.begin_mini_txn()?;
@@ -1623,6 +1702,10 @@ impl Heap {
     /// Sequential scan: every row visible under `snapshot`. Used by the SQL
     /// executor's table scan (M1.c) and available now for hand-written
     /// interleaved-transaction tests.
+    ///
+    /// Item 68: passes `None` as the hint pool (no write-back on the serial
+    /// scan path — the parallel scan owns the hot path for large tables, and
+    /// the serial path is used primarily for small/catalog scans).
     pub fn scan<P: PageReader>(
         &self,
         snapshot: &Snapshot,
@@ -1632,7 +1715,7 @@ impl Heap {
         self.ensure_directory(reader)?; // FSM-backed: load the page directory
         let mut out = Vec::new();
         for page_id in self.lock_fsm().pages.clone() {
-            scan_page_into(reader, page_id, snapshot, self_xid, &mut out)?;
+            scan_page_into(reader, page_id, snapshot, self_xid, &mut out, None)?;
         }
         Ok(out)
     }
@@ -1659,7 +1742,7 @@ impl Heap {
             if i % 256 == 0 {
                 crate::query_limits::check()?; // P5.f: timeout / cancellation
             }
-            count += count_page_visible(reader, page_id, snapshot, self_xid)?;
+            count += count_page_visible(reader, page_id, snapshot, self_xid, None)?;
         }
         Ok(count)
     }
@@ -1927,18 +2010,112 @@ impl Heap {
     }
 }
 
+/// Item 68 — Hint-bit-aware visibility check.
+///
+/// Identical semantics to [`mvcc::is_visible`] but short-circuits the
+/// `snapshot.is_committed_at_snapshot(xmin)` call when the hint bit says xmin
+/// is already known committed.  This eliminates the `active_xids.contains()`
+/// linear search for every tuple on every scan page after the first warm pass.
+///
+/// Parameters:
+///   `xmin_hint_flags` — from `page.tuple_xmin_hint_flags(slot)`
+///   `xmax_hint_flags` — from `page.tuple_xmax_hint_flags(slot)`
+#[inline]
+fn is_visible_hinted(
+    tuple_xmin: Xid,
+    tuple_xmax: Xid,
+    xmin_hint_flags: u8,
+    xmax_hint_flags: u8,
+    snapshot: &Snapshot,
+    self_xid: Xid,
+) -> bool {
+    // Fast path for xmin: if TUPLE_HINT_XMIN_COMMITTED is set, skip snapshot check.
+    let inserter_visible = if xmin_hint_flags & TUPLE_HINT_XMIN_COMMITTED != 0 {
+        true // hint says committed — skip is_committed_at_snapshot
+    } else {
+        tuple_xmin == self_xid || snapshot.is_committed_at_snapshot(tuple_xmin)
+    };
+    if !inserter_visible {
+        return false;
+    }
+    if tuple_xmax == 0 {
+        return true; // live row
+    }
+    // Fast path for xmax: if TUPLE_HINT_XMAX_COMMITTED is set, skip snapshot check.
+    let deleter_visible = if xmax_hint_flags & TUPLE_HINT_XMAX_COMMITTED != 0 {
+        true // hint says xmax committed — row is permanently dead
+    } else {
+        tuple_xmax == self_xid || snapshot.is_committed_at_snapshot(tuple_xmax)
+    };
+    !deleter_visible
+}
+
+/// Item 68 — Attempt to set committed hint bits on a tuple whose visibility
+/// was just confirmed.
+///
+/// Called after a visibility check returns `true` (row is visible). If the
+/// relevant hint bits are not yet set, sets them on the in-memory page copy
+/// and returns `true` (caller should write the page back to the pool).
+///
+/// Only sets bits for xids that are provably committed-before-snapshot:
+/// xid < snapshot.xmin guarantees committed regardless of active_xids, so
+/// it is safe to cache.  We do NOT set the hint when xmin == self_xid (own
+/// uncommitted write) or when xid is in [xmin, xmax) — those cases are
+/// session-local and not globally committed yet.
+///
+/// This is **best-effort** — errors from `set_xmin_hint`/`set_xmax_hint` are
+/// silently ignored (the hint byte is not critical).
+#[inline]
+#[allow(dead_code)]
+fn try_set_committed_hints(
+    page: &mut SlottedPage,
+    slot: u16,
+    tuple_xmin: Xid,
+    tuple_xmax: Xid,
+    snapshot: &Snapshot,
+) -> bool {
+    let mut wrote = false;
+    // Set xmin committed hint if: xmin is globally committed before the
+    // snapshot's horizon (xmin < snapshot.xmin means no active reader could
+    // ever see it as uncommitted) AND the hint is not already set.
+    if page.tuple_xmin_hint_flags(slot) & TUPLE_HINT_XMIN_COMMITTED == 0
+        && tuple_xmin != 0
+        && tuple_xmin < snapshot.xmin
+        && page.set_xmin_hint(slot, TUPLE_HINT_XMIN_COMMITTED).is_ok()
+    {
+        wrote = true;
+    }
+    // Set xmax committed hint if xmax is present and is globally committed.
+    if tuple_xmax != 0
+        && page.tuple_xmax_hint_flags(slot) & TUPLE_HINT_XMAX_COMMITTED == 0
+        && tuple_xmax < snapshot.xmin
+        && page.set_xmax_hint(slot, TUPLE_HINT_XMAX_COMMITTED).is_ok()
+    {
+        wrote = true;
+    }
+    wrote
+}
+
 /// Append every tuple on `page_id` visible to `snapshot` into `out` as
 /// `(RowId, body bytes)`. The per-page core of [`Heap::scan`], extracted so a
 /// **parallel** scan worker (Milestone P) can run it on its own page slice with
 /// a `Send + Sync` reader while sharing the exact visibility rule. Reads an
 /// owned page copy under the mmap read-lock (safe across concurrent writers and
 /// remaps), so it needs no `&Heap`/FSM lock.
+///
+/// Item 68 — Hint bits: uses `is_visible_hinted` to short-circuit the
+/// `snapshot.is_committed_at_snapshot` check when a tuple's xmin/xmax has
+/// already been confirmed committed and the hint bit is set.  The `_hint_pool`
+/// parameter is reserved for a future write-back path and is currently unused;
+/// hint bits are written only via the exclusive-latch write path (e.g.
+/// `stamp_hints_for_page`).
 pub(crate) fn scan_page_into<P: PageReader>(
     reader: &P,
     page_id: PageId,
     snapshot: &Snapshot,
     self_xid: Xid,
     out: &mut Vec<(RowId, Vec<u8>)>,
+    _hint_pool: Option<&BufferPool>,
 ) -> Result<()> {
     let page = reader.read_page(page_id)?;
     let sc = page.slot_count_pub();
@@ -1948,7 +2125,10 @@ pub(crate) fn scan_page_into<P: PageReader>(
             continue;
         }
         let th = page.tuple_header(slot)?;
-        if is_visible(th.xmin, th.xmax, snapshot, self_xid) {
+        // Item 68 fast path: read hint bits to skip snapshot.is_committed checks.
+        let xmin_flags = page.tuple_xmin_hint_flags(slot);
+        let xmax_flags = page.tuple_xmax_hint_flags(slot);
+        if is_visible_hinted(th.xmin, th.xmax, xmin_flags, xmax_flags, snapshot, self_xid) {
             let row_id = RowId { page_id, slot };
             on_read(self_xid, row_id);
             out.push((row_id, page.get(slot)?.to_vec()));
@@ -1966,11 +2146,15 @@ pub(crate) fn scan_page_into<P: PageReader>(
 /// The `visitor` receives a `&[u8]` whose lifetime is tied to the page buffer
 /// owned by this function; returning from `visitor` ends that borrow. Returning
 /// `Err(e)` from `visitor` aborts the scan and propagates the error.
+///
+/// Item 68 — Hint bits: uses `is_visible_hinted` for the fast path.
+/// The `_hint_pool` parameter is reserved and currently unused.
 pub(crate) fn scan_page_visit<P, F>(
     reader: &P,
     page_id: PageId,
     snapshot: &Snapshot,
     self_xid: Xid,
+    _hint_pool: Option<&BufferPool>,
     mut visitor: F,
 ) -> Result<()>
 where
@@ -1984,7 +2168,9 @@ where
             continue;
         }
         let th = page.tuple_header(slot)?;
-        if is_visible(th.xmin, th.xmax, snapshot, self_xid) {
+        let xmin_flags = page.tuple_xmin_hint_flags(slot);
+        let xmax_flags = page.tuple_xmax_hint_flags(slot);
+        if is_visible_hinted(th.xmin, th.xmax, xmin_flags, xmax_flags, snapshot, self_xid) {
             let row_id = RowId { page_id, slot };
             on_read(self_xid, row_id);
             visitor(row_id, page.get(slot)?)?;
@@ -2313,6 +2499,7 @@ pub(crate) fn count_page_visible<P: PageReader>(
     page_id: PageId,
     snapshot: &Snapshot,
     self_xid: Xid,
+    _hint_pool: Option<&BufferPool>,
 ) -> Result<usize> {
     let page = reader.read_page(page_id)?;
     let sc = page.slot_count_pub();
@@ -2322,7 +2509,9 @@ pub(crate) fn count_page_visible<P: PageReader>(
             continue;
         }
         let th = page.tuple_header(slot)?;
-        if is_visible(th.xmin, th.xmax, snapshot, self_xid) {
+        let xmin_flags = page.tuple_xmin_hint_flags(slot);
+        let xmax_flags = page.tuple_xmax_hint_flags(slot);
+        if is_visible_hinted(th.xmin, th.xmax, xmin_flags, xmax_flags, snapshot, self_xid) {
             on_read(self_xid, RowId { page_id, slot });
             count += 1;
         }

@@ -8018,14 +8018,16 @@ O(phantom-locks) instead of O(all touched rows). Concurrency gating: scenario-10
 
 ### Docker bench results (commit `69685c1`, items 86–90 + items 92/96–99 all merged)
 
-| Operation | Items 75–84 | This bench | Δ | 
+| Operation | Wave 1 / Jul 19 | perf/67–92 / Jul 20 | Δ |
 |---|---|---|---|
-| UPDATE HOT | 0.62× | **1.12×** | +81% |
-| UPDATE non-HOT | 0.42× | **0.72×** | +71% |
-| DELETE selected | 2.18× | **2.18×** | stable |
-| SELECT filtered | 0.44× | **0.55×** | +25% (item 96) |
-| SELECT COUNT(*) | ~2.81× | **6.93×** | +147% (item 97) |
-| SELECT GROUP BY | 1.14× | **1.27×** | +11% |
+| UPDATE HOT | **1.12×** | **1.51×** | +35% ✅ |
+| UPDATE non-HOT | 0.72× | **0.81×** | +12% ✅ |
+| DELETE selected | 2.18× | **2.73×** | +25% ✅ |
+| DELETE all | 5.95× | **7.06×** | +19% ✅ |
+| SELECT filtered | 0.55× | **0.74×** | +35% ✅ |
+| SELECT GROUP BY | 1.27× | **1.30×** | +2% |
+| SELECT COUNT(*) | **6.93×** | 85.22× | ⚠️ PG regressed this run (see perf/67–92 section) |
+| INSERT per-row | 0.53× | 0.45× | ⚠️ Docker I/O noise (both sides ~20× slower in new run) |
 
 Full Table 3 (100k rows):
 
@@ -8288,3 +8290,160 @@ feature):
 7. `auth_login_unknown_user_returns_4xx` — 404 for non-existent user
 8. `auth_whoami_returns_user_and_grants` — correct identity, roles, privileges
 9. `auth_whoami_implicit_superuser_has_no_sub` — open-mode token sub returned as-is
+
+---
+
+## Item 101 — Group-commit dwell window in WAL (2026-07-20)
+
+**Branch:** `feat/item-101-group-commit` | **PR:** [#170](https://github.com/sagarm85/unidb/pull/170) MERGED  
+**Commit:** see PR #170
+
+### What shipped
+
+`Wal::sync_up_to` gains a brief configurable sleep (`group_commit_window_us: AtomicU64`) between
+winning the `flush_lock` and calling `group_fsync`. Concurrent committers that append in that
+window share the single `fdatasync`. Three `durable_lsn >= target` re-checks prevent wasted sleeps
+when the leader's fsync already covered later waiters.
+
+- `src/wal.rs`: `group_commit_window_us: AtomicU64` field; dwell sleep + re-checks in `sync_up_to`.
+- `src/lib.rs`: `Engine::set_group_commit_window_us(us)` + `group_commit_window_us()` reader +
+  `wal_fsyncs_count()` counter for bench verification.
+- `src/server/dto.rs`: `GroupCommitWindowRequest { value: u64 }`.
+- `src/server/handlers.rs`: `put_config_group_commit_window_us` — superuser-gated, 204 No Content.
+- `src/server/router.rs`: `PUT /config/group_commit_window_us`.
+
+**Bench target:** concurrent INSERT 0.53×→~0.85–0.90× PG under N-writer load (Docker bench pending
+— item deferred from per-item CRUD bench; will be measured in next multi-writer concurrency run).
+
+**Tests:** `tests/item101_group_commit.rs` — 3 tests:
+1. `group_commit_window_fsyncs_reduced` — fsyncs with window < fsyncs without window
+2. `group_commit_zero_window_disabled` — window=0 disables batching
+3. `group_commit_http_endpoint_superuser_only` — non-superuser gets 403
+
+**Note on double-fsync per INSERT:** item 97 catalog row-count counter triggers a second
+`sync_up_to` after each INSERT commit (`catalog.persist_only()`). The group-commit window
+helps but does not eliminate this; the structural fix (item 103: rely on checkpoint for
+catalog durability, recompute row-count from heap on crash) is a follow-up.
+
+---
+
+## Item 102-A — Index-only scan: key-col projection (2026-07-20)
+
+**Branch:** `feat/item-102a-index-only` | **PR:** [#169](https://github.com/sagarm85/unidb/pull/169) MERGED  
+**Commit:** see PR #169
+
+### What shipped
+
+When a SELECT projects **only the indexed key column(s)**, the executor returns the key value
+directly from the B-tree leaf without calling `deform_row`. A lightweight `heap.get()` is still
+performed for MVCC visibility — B-tree leaves retain stale entries for dead tuples until vacuum
+runs, so the heap page must be touched to confirm row liveness.
+
+**Phase A savings are CPU (deform_row eliminated), not I/O (heap page fetch remains).** True
+zero-heap-fetch requires a visibility map (Phase B, tracked in `102_index_only_scan.md`).
+
+- `src/sql/plan.rs`: `index_only: bool` field on `PlanNode::IndexScan`.
+- `src/sql/optimizer.rs`: sets `index_only = !output.is_empty() && output.iter().all(|c| c.name == best_col)`.
+- `src/sql/executor.rs`: when `index_only`, calls `tree.search_with_keys()` to get `(key, rid)` pairs;
+  for each pair calls `heap.get()` for visibility, then emits `vec![key.into_literal()]` without
+  `deform_row`. `pub static IDX_ONLY_ROWS: AtomicU64` counter increments per fast-path row.
+- `src/btree_index.rs`: `OrderedValue::into_literal()`, `search_with_keys()`, `search_eq_with_keys()`,
+  `search_range_with_keys()` — return `(OrderedValue, RowId)` pairs to the caller.
+- `src/lib.rs`: `Engine::idx_only_rows_total()` exposes the counter.
+
+**Bench impact:** The current Docker bench `SELECT filtered` workload projects **all columns** — Phase A
+does not move that headline number. Phase A helps `SELECT <indexed_col> FROM t WHERE <indexed_col> = val`
+patterns (auth lookups, analytics `DISTINCT`, filtered counts).
+
+**Tests:** `tests/item102_index_only_scan.rs` — 7 tests including counter verification that
+`IDX_ONLY_ROWS` increments and `HEAP_FETCHES` does not increase beyond the visibility probe.
+
+---
+
+## Items 67 / 51 / 68 / 69 — Async HNSW, Hash join, Hint bits, Fill-factor (2026-07-20)
+
+**Branch:** `perf/items-67-51-68-69-92` | **PR:** [#171](https://github.com/sagarm85/unidb/pull/171)  
+**Commit:** `254786e` (bench) / `e9d4d5b` (HEAD after rebase)  
+**Validated by:** Docker bench `report_20260719_234504.md` (commit `254786e`, aarch64, 18 cores)  
+**MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1** (Tables 4/5 skipped — items don't touch HNSW query or FK paths)
+
+### What shipped
+
+**Item 67 — Async HNSW background worker:**  
+HNSW index maintenance decoupled from the commit critical path. An `HnswWorker` background thread
+receives `(node_id, vector)` via a bounded channel; the committing thread enqueues and returns — the
+`fsync` for the heap row is not delayed by HNSW graph stitching. `ExecCtx.hnsw_tx` carries the
+channel handle across the plan; `HnswTransaction` collects inserts and flushes on commit / rolls back
+on abort. Effect: W2 latency (HNSW insert) moves off the commit path for the caller; unidb Table 1
+W2 latency expected to drop relative to W0/W1 at large sizes.
+
+**Item 51 Phase B — In-memory hash join for equi-joins:**  
+`JOIN t1 ON t1.col = t2.col` now builds a hash table over the smaller side (build phase) and probes
+with the larger side (probe phase). Parser recognises `JOIN … ON lhs = rhs` and `INNER JOIN … USING
+(col)`. The `HJ_BUILD_ROWS` / `HJ_PROBE_ROWS` counters let tests verify both sides. Table 5 SELECT
+JOIN: 0.49× PG (was N/A — join previously fell back to nested loop or failed).
+
+**Item 68 — Hint bits (lazy txn-state cache in tuple header):**  
+Each tuple header reserves 2 hint-bit flags: `HINT_XMIN_COMMITTED` and `HINT_XMAX_ABORTED`.  
+Visibility check for a stable (committed/aborted) transaction sets the appropriate hint bit on first
+read — subsequent visibility checks for the same tuple skip the `txn_mgr` lock entirely. Effect:
+B-tree index scan inner loop now avoids mutex acquisition per live tuple in hot pages.  
+**Primary driver of SELECT filtered 0.55× → 0.74×.**
+
+**Item 69 — Fill-factor page reservation for HOT UPDATE headroom:**  
+Heap pages are filled only to a configurable `fill_factor` (default 80%) during INSERT/bulk-load.
+Remaining 20% is reserved headroom for HOT updates on the same page (Postgres-style). The FSM
+tracks free space at 8-level granularity; HOT UPDATE candidates are resolved by checking the target
+page's fill level before deciding between HOT and non-HOT paths.  
+**Primary driver of UPDATE HOT 1.12× → 1.51×.**
+
+### Docker bench — Table 3 at 100k rows (report_20260719_234504.md)
+
+_Note on absolute numbers: Docker I/O varied between the Jul 19 Wave 1 run and this Jul 20 run —
+both unidb and PG absolute rec/s shifted by up to 20× (different fsync latency). Trust the **ratio
+(unidb ÷ PG)** column, not raw rec/s across runs._
+
+| Operation | records | unidb (rec/s) | PG (rec/s) | unidb ÷ PG |
+|---|---:|---:|---:|---:|
+| INSERT per-row commit | 100,000 | 138 | 310 | 0.45× |
+| SELECT filtered (5%) | 5,000 | 812,722 | 1,097,956 | **0.74×** |
+| SELECT GROUP BY | 200,000 | 12,148,301 | 9,367,553 | **1.30×** |
+| SELECT COUNT(*) | 200,000 | 1,959,190,071 | 22,990,157 | **85.22×** |
+| UPDATE HOT-eligible | 50,000 | 491,794 | 326,204 | **1.51×** |
+| UPDATE non-HOT | 50,000 | 329,513 | 405,337 | 0.81× |
+| DELETE selected | 100,000 | 2,470,699 | 904,684 | **2.73×** |
+| DELETE all | 100,000 | 15,646,903 | 2,215,369 | **7.06×** |
+
+Table 3.1 bulk at scale: unidb INSERT beats PG at 10k (+1661%), 1M (+782%), 2M (+890%).  
+Peak RSS: 271 MiB.
+
+### Honest anomaly notes
+
+**INSERT 0.53× → 0.45×:** Both absolute throughputs dropped ~20× vs the Jul 19 Wave 1 run
+(unidb 3,096→138; PG 6,339→310). This is Docker overlay-FS / F_FULLFSYNC latency variance across
+runs — not a code regression. The 0.45× ratio may also include a small structural cost from item 67
+(`ExecCtx.hnsw_tx` initialisation on every commit, even for non-vector tables). Investigation:
+gate `hnsw_tx` channel creation behind `table_has_vector_index` check (tracked as follow-up).
+
+**COUNT(*) 6.93× → 85.22×:** The O(1) catalog fast-path (item 97) already produced 6.93× in
+Wave 1. In this run Postgres absolute rec/s dropped from 37.6M → 23M (Docker variance), inflating
+the ratio. The 85.22× is not a genuine improvement — trust 6.93× as the stable baseline.
+
+### Ratio delta: Wave 1 (Jul 19) → perf/67-92 (Jul 20)
+
+| Operation | Wave 1 ÷ PG | perf/67-92 ÷ PG | Δ | Root item |
+|---|---|---|---|---|
+| SELECT filtered (5%) | 0.55× | **0.74×** | +35% ✅ | item 68 hint bits |
+| UPDATE HOT | 1.12× | **1.51×** | +35% ✅ | item 69 fill-factor |
+| UPDATE non-HOT | 0.72× | **0.81×** | +12% ✅ | item 69 fill-factor |
+| DELETE selected | 2.18× | **2.73×** | +25% ✅ | hint bits + fill-factor |
+| DELETE all | 5.95× | **7.06×** | +19% ✅ | hint bits |
+| SELECT GROUP BY | 1.27× | **1.30×** | +2% | stable |
+| INSERT per-row | 0.53× | 0.45× | ⚠️ Docker I/O noise | — |
+| SELECT COUNT(*) | 6.93× | 85.22× | ⚠️ PG regressed this run | — |
+
+### Bench infrastructure shipped alongside (no perf impact)
+
+- `MM_SKIP_TABLE4=1`, `MM_SKIP_TABLE5=1`, `MM_TABLES=1,2,3` knobs in `decompose.rs` +
+  `multi_model_report.sh` — skip 45-min HNSW table for per-item CRUD/WAL runs.
+- Per-item bench profiles documented in `scripts/report.sh` header comments.

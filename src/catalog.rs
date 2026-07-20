@@ -340,6 +340,18 @@ pub struct TableDef {
     /// as stale; recalibrated on the next DML commit that calls `persist_only`).
     #[serde(default)]
     pub row_count: i64,
+    /// Heap fill-factor (item 69): INSERT stops packing a page once its free
+    /// bytes drop below `page_size * (100 - fill_factor) / 100`, reserving
+    /// that slack exclusively for same-page HOT UPDATE rewrites (items 58/71).
+    /// Valid range 10–100; default 100 (dense packing, backward-compatible).
+    /// `#[serde(default = "...")]` so pre-item-69 catalog blobs deserialise as
+    /// 100 — identical to the previous behaviour.
+    #[serde(default = "default_fill_factor")]
+    pub fill_factor: u8,
+}
+
+fn default_fill_factor() -> u8 {
+    100
 }
 
 /// Everything `Catalog` needs to durably persist itself, bundled so
@@ -1055,6 +1067,7 @@ mod tests {
             constraints: Default::default(),
             generation: 0,
             row_count: 0,
+            fill_factor: 100,
         };
         let mut ctx = CatalogCtx {
             pool: &pool,
@@ -1089,6 +1102,7 @@ mod tests {
             constraints: Default::default(),
             generation: 0,
             row_count: 0,
+            fill_factor: 100,
         };
         let mut ctx = CatalogCtx {
             pool: &pool,
@@ -1142,6 +1156,7 @@ mod tests {
             constraints: Default::default(),
             generation: 0,
             row_count: 0,
+            fill_factor: 100,
         };
         {
             let mut ctx = CatalogCtx {
@@ -1201,6 +1216,7 @@ mod tests {
             constraints: Default::default(),
             generation: 0,
             row_count: 0,
+            fill_factor: 100,
         };
         {
             let mut ctx = CatalogCtx {
@@ -1241,6 +1257,7 @@ mod tests {
             constraints: Default::default(),
             generation: 0,
             row_count: 0,
+            fill_factor: 100,
         };
         let policy = Expr::BinOp {
             op: CmpOp::Eq,
@@ -1296,6 +1313,7 @@ mod tests {
             constraints: Default::default(),
             generation: 0,
             row_count: 0,
+            fill_factor: 100,
         }
     }
 
@@ -1391,6 +1409,7 @@ mod tests {
                     constraints: Default::default(),
                     generation: 0,
                     row_count: 0,
+                    fill_factor: 100,
                 },
             );
             m

@@ -1090,6 +1090,46 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// Table-selection helpers (item 101/102 bench-time reduction).
+///
+/// Two complementary env knobs control which tables run:
+///
+/// `MM_TABLES=1,2,3`   — allowlist: run ONLY the listed tables (empty = all).
+/// `MM_SKIP_TABLE4=1`  — denylist shorthand: skip Table 4 + 4.1 (HNSW build,
+///                        the ~45-min bottleneck at 100k rows).
+/// `MM_SKIP_TABLE5=1`  — denylist shorthand: skip Table 5 (FK stress, ~5 min).
+///
+/// Per-item profiles (use these when benching a single item):
+///
+/// | Item class              | Recommended flags                              |
+/// |-------------------------|------------------------------------------------|
+/// | WAL / commit path       | `MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1`           |
+/// | B-tree / CRUD           | `MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1`           |
+/// | HNSW / vector           | (run all — Table 4 is the signal)              |
+/// | Index-only scan (102-A) | `MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1`           |
+/// | Group commit (101)      | `MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1`           |
+/// | FK / relational (36)    | `MM_SKIP_TABLE4=1`                             |
+/// | Full baseline compare   | (no flags — run everything)                    |
+fn should_run_table(n: u8) -> bool {
+    // Allowlist takes priority: MM_TABLES=1,2,3 means ONLY those tables.
+    if let Ok(v) = std::env::var("MM_TABLES") {
+        if !v.trim().is_empty() {
+            return v.split(',').any(|t| t.trim() == n.to_string());
+        }
+    }
+    // Denylist shorthands.
+    match n {
+        4 => std::env::var("MM_SKIP_TABLE4").ok().as_deref() != Some("1"),
+        5 => std::env::var("MM_SKIP_TABLE5").ok().as_deref() != Some("1"),
+        _ => true,
+    }
+}
+
+/// Returns `true` when table `n` should be **skipped** (inverse of `should_run_table`).
+fn should_run_tables_skip(n: u8) -> bool {
+    !should_run_table(n)
+}
+
 /// Bulk-load a SQL table to `rows` rows through the SQL insert path (batched
 /// commits so undo/WAL stay bounded). `body_len` sets row width. If `indexed`,
 /// a secondary B-tree index on `k` is maintained on every insert.
@@ -3039,6 +3079,10 @@ fn bench_mm_report() {
     // model-writes run across four independent PG systems (row + pgvector + graph
     // + queue) with no shared transaction. Without it, only the PG-relational
     // reference floor is shown (back-compat).
+    //
+    // `MM_SKIP_TABLE4=1` skips the measurement entirely (HNSW build at 100k rows
+    // takes ~45 min; omit when the change does not touch W4 / HNSW code).
+    let skip_table4 = should_run_tables_skip(4);
     let replaced_stack = std::env::var("MM_REPLACED_STACK").ok().as_deref() == Some("1");
     println!("## Table 4 — unidb multi-model (1 atomic txn) vs the replaced stack, at scale\n");
     if replaced_stack {
@@ -3065,10 +3109,17 @@ fn bench_mm_report() {
              four independent systems with no shared transaction.\n"
         );
     }
+    if skip_table4 {
+        println!(
+            "_Skipped: `MM_SKIP_TABLE4=1` (HNSW build at 100k rows takes ~45 min).\n\
+             Omit that flag or set `MM_TABLES` to include 4 to run this table._\n"
+        );
+    }
     let sweep: Vec<u64> = std::env::var("MM_TX_SWEEP")
         .ok()
         .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
         .unwrap_or_else(|| vec![1_000, 10_000, 100_000, 1_000_000]);
+    if !skip_table4 {
     if let Some(ref m) = pg_method {
         println!(
             "_Durability lens: unidb `{sync_prim}`, Postgres `wal_sync_method={m}` (matched);\n\
@@ -3157,13 +3208,14 @@ fn bench_mm_report() {
     } else {
         println!("_`PG_URL` unset → Postgres columns skipped; set it to run Table 4._\n");
     }
+    } // end if !skip_table4
 
     // ---- Table 4.1: TRUE replaced-stack — PG (row+vec+graph) + Redpanda (item 61) ----
     // Gated on MM_REPLACED_STACK_REALISTIC=1.  Runs under the same matched-
     // durability lens as Tables 3+4 (pg_method already established above).
     // The lens is reset for Table 5 after this block, so no extra lens flip needed.
     let replaced_stack_realistic =
-        std::env::var("MM_REPLACED_STACK_REALISTIC").ok().as_deref() == Some("1");
+        !skip_table4 && std::env::var("MM_REPLACED_STACK_REALISTIC").ok().as_deref() == Some("1");
     let rp_addr = redpanda_addr();
     if replaced_stack_realistic {
         println!(
@@ -3290,8 +3342,16 @@ fn bench_mm_report() {
     }
 
     // ---- Table 5: PK/FK relational-integrity stress ----
+    // Skippable via MM_SKIP_TABLE5=1 or by omitting 5 from MM_TABLES.
+    let skip_table5 = should_run_tables_skip(5);
     let fk_orders = env_u64("MM_FK_ORDERS", 20_000);
     println!("## Table 5 — PK/FK relational-integrity stress: unidb vs Postgres\n");
+    if skip_table5 {
+        println!(
+            "_Skipped: `MM_SKIP_TABLE5=1` (FK stress, ~5–10 min).\n\
+             Omit that flag or include 5 in `MM_TABLES` to run this table._\n"
+        );
+    }
     println!(
         "A realistic two-table schema — `customers (id PRIMARY KEY, name)` and\n\
          `orders (id PRIMARY KEY, customer_id REFERENCES customers(id), amount,\n\
@@ -3304,7 +3364,8 @@ fn bench_mm_report() {
          comparison (unidb only checked the *table* existed, not the *row*); now\n\
          both sides pay a real, comparable integrity-check cost.\n"
     );
-    let fk_pg_method = url.as_deref().and_then(pg_ensure_lens);
+    let fk_pg_method = if skip_table5 { None } else { url.as_deref().and_then(pg_ensure_lens) };
+    if !skip_table5 {
     if let Some(ref m) = fk_pg_method {
         println!(
             "_Durability lens: unidb `{sync_prim}`, Postgres `wal_sync_method={m}` (matched)._\n"
@@ -3393,7 +3454,7 @@ fn bench_mm_report() {
                 "allowed ✗"
             },
         );
-    } else {
+    } else if !skip_table5 {
         println!("_`PG_URL` unset → Postgres columns skipped; set it to run Table 5._\n");
         let fdir = tempdir().unwrap();
         let fe = Arc::new(bench_engine_open(fdir.path()));
@@ -3423,6 +3484,7 @@ fn bench_mm_report() {
             pg_reset_lens(u);
         }
     }
+    } // end if !skip_table5
 
     // ---- Caveats ----
     println!("## Caveats\n");

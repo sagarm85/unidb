@@ -33,6 +33,37 @@
 //                               Previously unused (_pad u16, always 0 in v7 and
 //                               earlier). FORMAT_VERSION bumped to 8.)
 // Tuple header size: 24 bytes (UNCHANGED — hot_next fits in the _pad bytes)
+//
+// Item 68 — Hint bits (lazy transaction-state cache):
+//   Transaction IDs (xmin/xmax) are u64 values starting at 1 and incrementing
+//   sequentially.  The HIGHEST byte of each field (byte [7] for xmin, byte [15]
+//   for xmax in the little-endian on-disk layout, i.e. tuple-base + TH_XMIN+7
+//   and TH_XMAX+7) is always 0 in practice: it would take 2^56 ≈ 72 quadrillion
+//   committed transactions to reach it.  Item 68 repurposes these zero bytes as
+//   soft hint-bit caches:
+//
+//   xmin high byte (TH_XMIN+7):
+//     TUPLE_HINT_XMIN_COMMITTED (0x10) — xmin was confirmed committed under a
+//         past snapshot; future scans may skip the snapshot.is_committed check.
+//     TUPLE_HINT_XMIN_ABORTED   (0x40) — xmin was confirmed aborted; the row
+//         is permanently invisible (only set for safety; aborted inserts are
+//         physically undone in this engine, so the flag is informational).
+//
+//   xmax high byte (TH_XMAX+7):
+//     TUPLE_HINT_XMAX_COMMITTED (0x20) — xmax was confirmed committed; this
+//         version is permanently dead and every future snapshot will see it as
+//         deleted.
+//
+//   All hint-bit reads MUST mask the high byte to recover the clean xid:
+//     xid_clean = raw_u64 & XID_MASK
+//   The accessor `tuple_header()` applies this mask transparently.
+//
+//   Hint-bit writes are NOT WAL-logged (they are soft/recomputable derived
+//   state — logging them would negate the performance gain and is explicitly
+//   forbidden by the item 68 spec).  They are best-effort: if the page cannot
+//   be dirtied, the write is silently skipped.  On crash recovery the hint
+//   bytes read back as zero, and the engine recomputes them from xid state on
+//   the next access, which is correct.
 
 use crate::{
     error::{DbError, Result},
@@ -46,6 +77,36 @@ pub const PAGE_HEADER_SIZE: usize = 28;
 pub const SLOT_SIZE: usize = 4;
 pub const TUPLE_HEADER_SIZE: usize = 24;
 const CRC_FIELD_OFFSET: usize = 8;
+
+// ── Item 68: Hint-bit constants ───────────────────────────────────────────────
+//
+// Hint bits live in the HIGH byte of xmin and xmax (the byte at tuple-base +
+// TH_XMIN+7 and TH_XMAX+7 in the little-endian encoding).  That byte is
+// always zero under normal operation: transaction IDs start at 1 and
+// increment sequentially; exhausting the 7-byte range would require 2^56
+// (~72 quadrillion) transactions.  All callers that read an xid must apply
+// XID_MASK to strip the hint bits and recover the clean value; `tuple_header`
+// does this transparently.
+
+/// Mask to strip hint bits from a raw on-disk xid value and recover the
+/// clean transaction id.  Applied by `tuple_header()` before returning xmin/xmax.
+pub const XID_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
+
+/// Hint bit in xmin's high byte: xmin is known committed — this row version
+/// was definitively inserted by a committed transaction.  Safe to skip the
+/// MVCC snapshot check on future scans.
+pub const TUPLE_HINT_XMIN_COMMITTED: u8 = 0x10;
+
+/// Hint bit in xmax's high byte: xmax is known committed — this row version
+/// was definitively deleted/superseded by a committed transaction.  The row
+/// is permanently dead; safe to skip the xmax snapshot check.
+pub const TUPLE_HINT_XMAX_COMMITTED: u8 = 0x20;
+
+/// Hint bit in xmin's high byte: xmin is known aborted — the inserting
+/// transaction rolled back.  In this engine aborted inserts are physically
+/// undone, so on-disk rows with a committed xmin should not be aborted; this
+/// bit exists for completeness and defensive reads.
+pub const TUPLE_HINT_XMIN_ABORTED: u8 = 0x40;
 
 /// Line-pointer (slot) lifecycle for MVCC vacuum (M10), encoded in the slot's
 /// `(offset, length)` pair without any format change:
@@ -367,6 +428,11 @@ impl SlottedPage {
     }
 
     /// Read the MVCC tuple-header fields at `slot` (M1).
+    ///
+    /// Item 68: hint bits are stored in the high bytes of the on-disk xmin/xmax
+    /// fields.  This accessor applies `XID_MASK` to both, so callers always
+    /// receive clean transaction IDs, never raw bytes with hint flags embedded.
+    /// Use `tuple_hint_flags` / `tuple_xmax_hint_flags` to read the hint bits.
     pub fn tuple_header(&self, slot: u16) -> Result<TupleHeader> {
         let sc = self.slot_count();
         if slot >= sc {
@@ -383,17 +449,20 @@ impl SlottedPage {
             });
         }
         let base = offset as usize;
+        // XID_MASK strips the hint-bit high byte before returning clean xids.
+        let raw_xmin = u64_from_le(
+            self.data[base + TH_XMIN..base + TH_XMIN + 8]
+                .try_into()
+                .unwrap(),
+        );
+        let raw_xmax = u64_from_le(
+            self.data[base + TH_XMAX..base + TH_XMAX + 8]
+                .try_into()
+                .unwrap(),
+        );
         Ok(TupleHeader {
-            xmin: u64_from_le(
-                self.data[base + TH_XMIN..base + TH_XMIN + 8]
-                    .try_into()
-                    .unwrap(),
-            ),
-            xmax: u64_from_le(
-                self.data[base + TH_XMAX..base + TH_XMAX + 8]
-                    .try_into()
-                    .unwrap(),
-            ),
+            xmin: raw_xmin & XID_MASK,
+            xmax: raw_xmax & XID_MASK,
             prev_page: u32_from_le(
                 self.data[base + TH_PREV_PAGE..base + TH_PREV_PAGE + 4]
                     .try_into()
@@ -410,6 +479,100 @@ impl SlottedPage {
                     .unwrap(),
             ),
         })
+    }
+
+    /// Read the hint-bit flags stored in the high byte of `xmin` for `slot`
+    /// (item 68).  Returns 0 if the slot is out of range or deleted.  The
+    /// caller tests bits against `TUPLE_HINT_XMIN_COMMITTED` /
+    /// `TUPLE_HINT_XMIN_ABORTED`.
+    pub fn tuple_xmin_hint_flags(&self, slot: u16) -> u8 {
+        let sc = self.slot_count();
+        if slot >= sc {
+            return 0;
+        }
+        let (offset, _) = self.read_slot(slot);
+        if offset == 0 {
+            return 0;
+        }
+        // High byte of the little-endian xmin is at offset TH_XMIN+7.
+        self.data[offset as usize + TH_XMIN + 7]
+    }
+
+    /// Read the hint-bit flags stored in the high byte of `xmax` for `slot`
+    /// (item 68).  Returns 0 if the slot is out of range or deleted.  The
+    /// caller tests bits against `TUPLE_HINT_XMAX_COMMITTED`.
+    pub fn tuple_xmax_hint_flags(&self, slot: u16) -> u8 {
+        let sc = self.slot_count();
+        if slot >= sc {
+            return 0;
+        }
+        let (offset, _) = self.read_slot(slot);
+        if offset == 0 {
+            return 0;
+        }
+        // High byte of the little-endian xmax is at offset TH_XMAX+7.
+        self.data[offset as usize + TH_XMAX + 7]
+    }
+
+    /// Set one or more hint bits in the high byte of `xmin` (item 68).
+    ///
+    /// **No WAL record is emitted.**  Hint bits are soft, recomputable derived
+    /// state — logging them would cost a WAL write per scanned page, negating
+    /// the performance gain.  They are lost on crash and recomputed on the next
+    /// access, which is correct.
+    ///
+    /// CRC is NOT updated here — the caller pattern is always:
+    ///   `set_xmin_hint(...)` → `set_lsn(lsn)` → `write_page(…)`
+    /// and `set_lsn` calls `write_crc()` as its last step, covering the hint
+    /// bytes.  If called in a standalone context without a following `set_lsn`,
+    /// the caller must call `recompute_crc()` before writing the page.
+    ///
+    /// This is a best-effort operation — callers that cannot hold the page
+    /// exclusive latch skip this call silently.
+    pub fn set_xmin_hint(&mut self, slot: u16, flag: u8) -> Result<()> {
+        let sc = self.slot_count();
+        if slot >= sc {
+            return Err(DbError::SlotOutOfRange {
+                page_id: self.page_id(),
+                slot,
+            });
+        }
+        let (offset, _) = self.read_slot(slot);
+        if offset == 0 {
+            return Err(DbError::TupleDeleted {
+                page_id: self.page_id(),
+                slot,
+            });
+        }
+        let hint_byte_off = offset as usize + TH_XMIN + 7;
+        self.data[hint_byte_off] |= flag;
+        // CRC intentionally deferred to set_lsn() — same pattern as set_xmax().
+        Ok(())
+    }
+
+    /// Set one or more hint bits in the high byte of `xmax` (item 68).
+    ///
+    /// **No WAL record is emitted** — same rationale as `set_xmin_hint`.
+    /// CRC is deferred to `set_lsn()` — same pattern as `set_xmax()`.
+    pub fn set_xmax_hint(&mut self, slot: u16, flag: u8) -> Result<()> {
+        let sc = self.slot_count();
+        if slot >= sc {
+            return Err(DbError::SlotOutOfRange {
+                page_id: self.page_id(),
+                slot,
+            });
+        }
+        let (offset, _) = self.read_slot(slot);
+        if offset == 0 {
+            return Err(DbError::TupleDeleted {
+                page_id: self.page_id(),
+                slot,
+            });
+        }
+        let hint_byte_off = offset as usize + TH_XMAX + 7;
+        self.data[hint_byte_off] |= flag;
+        // CRC intentionally deferred to set_lsn() — same pattern as set_xmax().
+        Ok(())
     }
 
     /// Set the HOT forwarding pointer in the old slot's tuple header (item 58).
@@ -834,5 +997,67 @@ mod tests {
         assert_eq!(p.slot_state(s1).unwrap(), SlotState::Live);
         assert_eq!(p.get(s1).unwrap(), b"keep");
         assert_eq!(p.slot_state(s0).unwrap(), SlotState::Unused);
+    }
+
+    // ── Item 68: hint-bit unit tests ─────────────────────────────────────────
+
+    /// Hint bits survive a set_xmin_hint + CRC round-trip and do NOT corrupt
+    /// the stored xid value (tuple_header applies XID_MASK transparently).
+    #[test]
+    fn hint_xmin_set_and_cleared_by_mask() {
+        let mut p = make_page();
+        let s = p.insert_versioned(b"row", 42, 0, None).unwrap();
+        // Before setting hint: xmin reads back clean, hint flags are 0.
+        let th = p.tuple_header(s).unwrap();
+        assert_eq!(th.xmin, 42, "xmin must be clean before hint set");
+        assert_eq!(
+            p.tuple_xmin_hint_flags(s),
+            0,
+            "hint flags must be zero on fresh insert"
+        );
+        // Set HINT_XMIN_COMMITTED — simulates what the delete path does.
+        p.set_xmin_hint(s, TUPLE_HINT_XMIN_COMMITTED).unwrap();
+        // xmin must still read 42 — XID_MASK strips the hint byte.
+        let th2 = p.tuple_header(s).unwrap();
+        assert_eq!(th2.xmin, 42, "xmin must read clean after hint set");
+        assert_eq!(
+            p.tuple_xmin_hint_flags(s),
+            TUPLE_HINT_XMIN_COMMITTED,
+            "hint flag must be readable via tuple_xmin_hint_flags"
+        );
+        // Payload is untouched.
+        assert_eq!(p.get(s).unwrap(), b"row");
+    }
+
+    /// Hint bits survive a CRC round-trip: write the page bytes out and back
+    /// in; verify_crc must pass, and the hint byte is preserved.
+    #[test]
+    fn hint_bit_crc_round_trip() {
+        let mut p = make_page();
+        let s = p.insert_versioned(b"data", 7, 0, None).unwrap();
+        // Simulate set_lsn which is called after set_xmin_hint in the write path.
+        p.set_xmin_hint(s, TUPLE_HINT_XMIN_COMMITTED).unwrap();
+        // Recompute CRC as the write path would (via set_lsn or recompute_crc).
+        p.recompute_crc();
+        // Round-trip through from_bytes (verifies CRC).
+        let raw = p.as_bytes().to_vec();
+        let p2 = SlottedPage::from_bytes(raw).unwrap();
+        assert_eq!(p2.tuple_header(s).unwrap().xmin, 7);
+        assert_eq!(p2.tuple_xmin_hint_flags(s), TUPLE_HINT_XMIN_COMMITTED);
+    }
+
+    /// Setting both xmin and xmax hint bits is independent; neither corrupts
+    /// the other.
+    #[test]
+    fn hint_xmin_and_xmax_independent() {
+        let mut p = make_page();
+        let s = p.insert_versioned(b"v", 10, 3, None).unwrap();
+        p.set_xmin_hint(s, TUPLE_HINT_XMIN_COMMITTED).unwrap();
+        p.set_xmax_hint(s, TUPLE_HINT_XMAX_COMMITTED).unwrap();
+        p.recompute_crc();
+        assert_eq!(p.tuple_header(s).unwrap().xmin, 10);
+        assert_eq!(p.tuple_header(s).unwrap().xmax, 3);
+        assert_eq!(p.tuple_xmin_hint_flags(s), TUPLE_HINT_XMIN_COMMITTED);
+        assert_eq!(p.tuple_xmax_hint_flags(s), TUPLE_HINT_XMAX_COMMITTED);
     }
 }

@@ -740,6 +740,12 @@ pub struct ExecCtx<'a> {
     /// restriction). Set by `execute_sql_inner_as` before execution; `None`
     /// in all other paths (superuser/embedded always bypass RLS anyway).
     pub current_user: Option<String>,
+    /// Sender end of the HNSW background worker channel (item 67).
+    /// `Some` on a fully-opened Engine that has called `spawn_hnsw_worker`;
+    /// `None` in unit tests that build bare `ExecCtx` structs (those tests
+    /// don't exercise the async HNSW path and fall back to synchronous insert).
+    /// The executor clones this cheaply per INSERT statement.
+    pub hnsw_tx: Option<std::sync::mpsc::SyncSender<crate::hnsw_index::HnswMsg>>,
 }
 
 /// Insert `row`'s durable-index column values into their on-disk structures
@@ -809,8 +815,29 @@ fn apply_durable_index_writes(
                 }
                 Some(IndexKind::Hnsw) => {
                     if let Literal::Vector(v) = &row[idx] {
-                        DiskHnswIndex::open(meta_page, ctx.page_size)
-                            .insert(row_id, v, ctx.pool, ctx.wal)?;
+                        if let Some(ref tx) = ctx.hnsw_tx {
+                            // Async path (item 67): dispatch to background worker.
+                            // The beam-search + edge-update cost (~6–18 ms) is
+                            // removed from the INSERT commit critical path.
+                            // MVCC correctness: the heap row is already durable
+                            // before this dispatch; the index insert may arrive
+                            // slightly after commit, but NEAR re-checks MVCC
+                            // visibility on every candidate so a race between
+                            // index visibility and row visibility is safe.
+                            let _ = tx.send(crate::hnsw_index::HnswMsg::Work(
+                                crate::hnsw_index::HnswWorkItem {
+                                    meta_page,
+                                    page_size: ctx.page_size,
+                                    row_id,
+                                    vector: v.clone(),
+                                },
+                            ));
+                        } else {
+                            // Sync fallback: unit tests and bare Engine::open()
+                            // paths without a background worker.
+                            DiskHnswIndex::open(meta_page, ctx.page_size)
+                                .insert(row_id, v, ctx.pool, ctx.wal)?;
+                        }
                     }
                 }
                 _ => {}
@@ -1207,7 +1234,8 @@ pub fn execute(plan: LogicalPlan, ctx: &mut ExecCtx) -> Result<ExecResult> {
             name,
             columns,
             constraints,
-        } => exec_create_table(name, columns, constraints, ctx),
+            fill_factor,
+        } => exec_create_table(name, columns, constraints, fill_factor, ctx),
         LogicalPlan::Insert {
             table,
             columns,
@@ -1347,6 +1375,7 @@ fn exec_create_table(
     name: String,
     columns: Vec<ColumnDef>,
     constraints: TableConstraints,
+    fill_factor: u8,
     ctx: &mut ExecCtx,
 ) -> Result<ExecResult> {
     // Identity/SERIAL columns (P2.d) must be Int64, and start their counter
@@ -1396,6 +1425,7 @@ fn exec_create_table(
         constraints,
         generation: 0,
         row_count: 0,
+        fill_factor,
     };
     let mut cctx = catalog_ctx!(ctx);
     ctx.catalog.exclusive()?.create_table(def, &mut cctx)?;
@@ -1636,7 +1666,10 @@ fn exec_insert(
     // FK (M11): only referenced-table existence is enforced, and it's a
     // schema-level property — check it once per statement, not per row.
     enforce_referenced_tables_exist(&table_def, ctx.catalog.get())?;
-    let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
+    // Item 69: apply the table's fill-factor reservation so INSERT stops
+    // packing a page once the HOT-reserved slack threshold is reached.
+    let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone())
+        .with_fill_factor(table_def.fill_factor);
 
     // Item 98: streaming-accumulation insert.
     //
@@ -5702,6 +5735,7 @@ mod tests {
                 hnsw_vec_caches: None,
                 authz: None,
                 current_user: None,
+                hnsw_tx: None,
             };
             execute(plan, &mut ctx)
         }
@@ -6082,6 +6116,7 @@ mod tests {
             constraints: Default::default(),
             generation: 0,
             row_count: 0,
+            fill_factor: 100,
         };
         let err = coerce_and_validate_row(&table, vec![Literal::Vector(vec![0.1, 0.2, 0.3])]);
         assert!(matches!(err, Err(DbError::SqlPlan(_))));

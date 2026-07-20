@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `101_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `103_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -109,44 +109,41 @@
 | 99 | `99_batch_sql_endpoint.md` | Performance | ✅ SHIPPED 2026-07-19 (PR #162) — `POST /batch-sql`; up to 256 stmts per request; stop_on_error flag; per-statement auth; 400 BATCH_TOO_LARGE. Projects compare.py 109ms→~16ms (15.7×→~2.3×). See PROGRESS.md "Item 99". |
 | 100 | `100_dev_login_whoami.md` | Improvement | ⏳ NOT STARTED — `POST /auth/login {username}` (dev-only, `UNIDB_DEV_LOGIN=1` gate, issues short-lived JWT; respects the M18 verify-only locked decision) + `GET /auth/whoami` (roles + per-table privileges). Closes the "users log in by username, then RLS filters their data" gap; RLS half is item 24. Server-only, zero engine-path cost. |
 
+| 100 | `100_dev_login_whoami.md` | Improvement | ✅ SHIPPED 2026-07-20 (PR #168) — GET /auth/meta + POST /auth/login (UNIDB_DEV_LOGIN=1) + GET /auth/whoami; R-a UPDATE WITH CHECK + R-b enforced column also in same PR. See PROGRESS.md "Item 100". |
+| 101 | `101_group_commit.md` | Performance | ✅ SHIPPED 2026-07-20 (PR #170) — group-commit dwell window in WAL `sync_up_to`; `PUT /config/group_commit_window_us`; `Engine::wal_fsyncs_count()`. |
+| 102 | `102_index_only_scan.md` | Performance | 🔄 Phase A SHIPPED 2026-07-20 (PR #169) — skip `deform_row` for key-col projection; `IDX_ONLY_ROWS` counter; heap.get() still needed for MVCC visibility. Phase B (covering index) pending. |
+
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `101_…`.**
+**Next new file → `103_…`.**
 
-## Next up — priority order (2026-07-19, calibrated on Docker bench report_20260719_093148.md)
+## Next up — priority order (2026-07-20, post items 101/102-A/67-92 merge)
 
-Wave 1 (items 86–90) and items 91–99 shipped. Measured state after the 2026-07-19 bench:
+State after 2026-07-20 (items 101 + 102-A shipped; items 67/51/68/69 in PR #171):
 
 | Operation | unidb ÷ PG | Status |
 |---|---|---|
 | SELECT COUNT(*) | **6.93×** | ✅ well above 1× |
-| DELETE all | **5.95×** | ✅ well above 1× |
-| DELETE selected | **2.18×** | ✅ well above 1× |
-| SELECT GROUP BY | **1.27×** | ✅ above 1× |
-| UPDATE HOT | **1.12×** | ✅ above 1× |
-| UPDATE non-HOT | 0.72× | 📈 improving; ceiling ~0.80× |
-| SELECT filtered | 0.55× | 📈 improving; ceiling ~0.60× |
-| INSERT per-row | 0.53× | 🔒 structural (1 fsync/commit floor) |
+| DELETE all | **7.06×** | ✅ well above 1× (item 68/69 delivered) |
+| DELETE selected | **2.73×** | ✅ well above 1× |
+| SELECT GROUP BY | **1.30×** | ✅ above 1× |
+| UPDATE HOT | **1.51×** | ✅ well above 1× |
+| UPDATE non-HOT | 0.81× | 📈 item 69 delivered; ceiling ~0.85–0.90× |
+| SELECT filtered | 0.74× | 📈 item 68 delivered; next: parallel B-tree candidate |
+| INSERT per-row | 0.45× | 🔒 Docker I/O noise; item 101 group-commit unlocks concurrent-INSERT floor |
 
-**Next priority items:**
+**Next priority items (2026-07-20):**
 
-1. **#51 Phase B — SELECT JOIN late materialisation (0.59× → ≥0.70×)** — 4/9 queries in the
-   end-user comparison workload are joins; promoted above further CRUD micro-opt.
-2. **#93 HNSW arena layout** — flat `Vec<RowId>` neighbour slab; eliminates ~3200 Vec clones/NEAR query.
-3. **#94 NEAR read-only fast path** — skip txn snapshot registration for standalone read-only NEAR.
-4. **#67 async HNSW build** — decouple index build from commit path; biggest multi-model write lever.
-5. **#95 graph adjacency cache** — DashMap per-engine; invalidate on edge write.
-6. **#68 hint bits / #69 fill factor / #70 prefetch** — steady-state churn improvements.
-
-**Process note:** the 2026-07-19 Docker bench did not include a concurrency matrix run.
-Previous full matrix run (30/32 PASS, 2026-07-18) remains the last conc-matrix result.
-Schedule a full matrix run after item 51 ships.
+1. **#171 Merge PR** — merge perf/items-67-51-68-69-92 (rebased on main after 101+102-A merge).
+2. **#102-B Covering index** — `CREATE INDEX … INCLUDE (cols)`; FORMAT_VERSION bump; now 67-92 base is clean.
+3. **#103 Catalog sync dedup** — remove `wal.sync_up_to(catalog_lsn)` after `catalog.persist_only()`; eliminates double-fsync-per-INSERT; catalog row-count recomputed from heap on crash (same model as PG `pg_class.reltuples`).
+4. **#93 HNSW arena layout** — flat `Vec<RowId>` slab; post 67-92.
+5. **#94 NEAR read-only fast path** — post 67-92.
+6. **#95 graph adjacency cache** — post 67-92.
 
 **What is NOT in this list:**
-- Per-row INSERT (0.55×): shared one-fsync-per-row floor; per §1, not worth chasing.
-- Parallel DML apply: held in reserve (~×2 further headroom on bulk UPDATE/DELETE) — only if a
-  future workload needs beyond ~0.85–0.90×; not justified for the current acceptance band.
-- AuthZ v2 (item 24): milestone-sized, in flight separately on `feat/item-24-authz-z1z3z5`.
+- Parallel DML apply: held in reserve; not justified at current acceptance band.
+- AuthZ v2 (item 24): fully shipped (R-a/R-b + item 100, PR #168 2026-07-20).
 
 ## How to update this file
 
