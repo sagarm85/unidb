@@ -1,7 +1,7 @@
 # SQL surface gaps — unsupported query features
 
 **Type:** Improvement
-**Status:** PARTIAL — G1 (CASE/COALESCE/NULLIF), G2-cast (CAST expressions), G2-join (FULL OUTER JOIN), G3 (UNION/INTERSECT/EXCEPT), G4 (ORDER BY non-projected col), G5 (RETURNING), G6 (derived table subqueries), G7 (window functions, whole-partition frame), G8 (SELECT without FROM), G10 (IS NULL), P4.c IN(subquery)/EXISTS/scalar-subquery predicates SHIPPED (see `PROGRESS.md` item 19). G-NATURAL remains open. Cumulative-frame window functions (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) are a documented follow-up.
+**Status:** PARTIAL — G1 (CASE/COALESCE/NULLIF), G2-cast (CAST expressions), G2-join (FULL OUTER JOIN), G3 (UNION/INTERSECT/EXCEPT), G4 (ORDER BY non-projected col), G5 (RETURNING), G6 (derived table subqueries), G7 (window functions, whole-partition frame), G8 (SELECT without FROM), G10 (IS NULL), G-NATURAL (NATURAL JOIN), P4.c IN(subquery)/EXISTS/scalar-subquery predicates SHIPPED (see `PROGRESS.md` item 19). Recursive CTEs and cumulative-frame window functions are documented follow-ups (deferred; out of §1 practical-subset scope).
 
 > A single tracker for the SQL constructs unidb does **not** support yet, so
 > builders (and future us) have one honest list and each gap has a scope/ROI
@@ -134,13 +134,15 @@ completed the feature:
 
 See `PROGRESS.md` "Item 19 — IN(subquery)/EXISTS/scalar subquery predicates".
 
-### G-NATURAL — `NATURAL JOIN`
+### G-NATURAL — `NATURAL JOIN` **(SHIPPED 2026-07-20)**
+
 - **What:** join on all commonly-named columns implicitly.
-- **Why it matters:** low — mostly discouraged (implicit key set is fragile);
-  `USING (cols)` (supported since Milestone 18) is the explicit, safer form.
-- **Scope:** desugar to `USING` over the intersection of both sides' column
-  names — reuses `plan.rs::plan_using_join` entirely once the shared column set
-  is computed from the two schemas. Small. Low ROI.
+- **Implementation:** `FromNode::Join.natural: bool` field (serde default `false`);
+  `convert_join_operator` returns `natural = true` when `JoinConstraint::Natural`;
+  `plan_from` computes the column-name intersection at plan time and calls
+  `plan_using_join` with the shared list. Disjoint schemas → CROSS JOIN.
+- **8 tests** in `tests/item19_natural_join.rs` — all pass. Clippy+fmt clean.
+- **Outcome:** see `PROGRESS.md` item 19 G-NATURAL entry.
 
 ### G7 — Window functions & recursive CTEs **(window functions SHIPPED 2026-07-20)**
 

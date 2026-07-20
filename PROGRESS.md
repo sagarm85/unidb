@@ -2531,7 +2531,7 @@ tokio/reqwest/axum (rusqlite is a dev-dep, outside the normal graph).
 - Differential test suites vs SQLite + optimizer unit tests + EXPLAIN tests + this benchmark.
 
 **Known limitations / tech debt:**
-- No recursive CTEs; `NATURAL JOIN` is not yet supported. Window functions (whole-partition frame) and `FULL OUTER JOIN` (including `USING`) are now supported — see Item 19 G7 and G2-join entries.
+- No recursive CTEs (deferred; large scope). `NATURAL JOIN`, window functions (whole-partition frame), and `FULL OUTER JOIN` (including `USING`) are all now supported — see Item 19 G-NATURAL, G7, and G2-join entries. Cumulative window frames (`ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`) are a documented follow-up.
 - `ORDER BY` resolves an output-column name or 1-based position (not arbitrary expressions) in v1.
 - Join keys compare by exact encoding — declare matching key types for cross-type numeric joins.
 - The optimizer emits hash joins for reordered joins (index-nested-loop comes from the rule-based fallback path); cost-comparing INLJ inside the DP is a follow-up.
@@ -9064,13 +9064,80 @@ on the missing side. `FULL OUTER JOIN … USING (col)` emits the shared column a
 
 Full suite clean. Clippy clean. fmt clean. No storage/format impact.
 
-### Remaining open gaps (item 19)
+### Remaining open gaps (item 19 — as of G2-join)
 
 | Gap | Description | Status |
 |-----|-------------|--------|
-| G-NATURAL | `NATURAL JOIN` | Open |
+| G-NATURAL | `NATURAL JOIN` | **SHIPPED 2026-07-20** — see Item 19 G-NATURAL entry |
 | G7 | Recursive CTEs | Open (large; deferred) |
 | Cumulative window frames | `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` | Open (follow-up) |
+
+---
+
+## Item 19 G-NATURAL — NATURAL JOIN (2026-07-20)
+
+**Branch:** `main` (committed directly; pure parser + planner change, ≤70 lines)
+
+**Backlog:** `docs/backlog/19_sql_surface_gaps.md` (G-NATURAL section — now marked SHIPPED)
+
+### What shipped
+
+`NATURAL JOIN` and `NATURAL LEFT JOIN` — syntax sugar that computes the intersection
+of both sides' column names at plan time and desugars to `USING (shared_cols)`. No
+storage, WAL, or `FORMAT_VERSION` impact — the change is entirely in the parser + planner.
+
+**Key behaviour:**
+- Shared columns (same name on both sides, case-sensitive) identified from the left
+  plan's output schema in declaration order; intersection with the right plan's schema.
+- Desugars to `plan_using_join`, which creates an equi-`ON` from the shared columns
+  and drops one copy per shared column from the output (same as `USING`).
+- When schemas are disjoint (no shared column names) → degenerates to `CROSS JOIN`
+  (SQL standard behaviour).
+- `NATURAL LEFT JOIN` / `NATURAL RIGHT JOIN` supported; `NATURAL FULL OUTER JOIN` also
+  works (routes through `plan_using_join` then `MergeJoin` as for explicit FULL OUTER).
+
+**Changes (SQL layer only — no WAL, storage, or FORMAT_VERSION impact):**
+
+- **`src/sql/query.rs`** — `FromNode::Join` gains `#[serde(default)] natural: bool`
+  field. No existing binary state changes (default = `false`; `serde` default safe).
+- **`src/sql/parser.rs`** — `convert_join_operator` return type gains `bool` (natural
+  flag). `JoinConstraint::Natural` arm returns `(ty, None, vec![], true)` before
+  entering the `ON`/`USING` dispatch. Error message on the `_` arm updated (NATURAL JOIN
+  is no longer unsupported). Both `FromNode::Join` construction sites include `natural`.
+- **`src/sql/plan.rs`** — `FromNode::Join` arm: when `natural`, compute column-name
+  intersection from both sides' `output()` schemas (left-declaration order preserved),
+  call `plan_using_join` with the shared list. Empty intersection → `plan_join` with
+  `on = None` (CROSS JOIN). Test construction site adds `natural: false`.
+- **`src/sql/optimizer.rs`** — `flatten_inner`'s `FromNode::Join` arm: `natural: true`
+  added to the bail-out condition (alongside `!using.is_empty()`), so NATURAL JOIN
+  correctly takes the rule-based path through `plan_using_join`.
+
+### Tests
+
+8 tests in `tests/item19_natural_join.rs` — all 8/8 PASS:
+
+| Test | Covers |
+|---|---|
+| `natural_join_basic` | 3 of 4 employees match a dept; Dan (dept_id=99) excluded |
+| `natural_join_shared_col_appears_once` | `dept_id` appears exactly once in `SELECT *` output |
+| `natural_join_on_id` | 2 of 3 t1 rows match t2 on shared `id` |
+| `natural_left_join` | `NATURAL LEFT JOIN` — all 4 employees preserved; Dan gets NULL dept |
+| `natural_join_disjoint_is_cross` | No shared columns → CROSS JOIN (2×3=6 rows) |
+| `natural_join_empty_right` | Empty right table → 0 rows |
+| `natural_join_with_where` | WHERE filters after join (only Engineering employees) |
+| `natural_join_multiple_shared_cols` | Two shared columns (x, y) — both must match |
+
+Full suite clean. Clippy clean. fmt clean. No storage/format impact.
+
+### Remaining open gaps (item 19 — complete after G-NATURAL)
+
+| Gap | Description | Status |
+|-----|-------------|--------|
+| G7 | Recursive CTEs | Open (large; deferred) |
+| Cumulative window frames | `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` | Open (follow-up) |
+
+Item 19 is now fully shipped for all practical SQL gaps. Recursive CTEs and cumulative
+window frames are explicitly deferred (large scope, out of §1's practical-subset focus).
 
 ---
 

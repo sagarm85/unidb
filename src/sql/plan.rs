@@ -867,9 +867,28 @@ pub(crate) fn plan_from(node: &FromNode, catalog: &Catalog, ctes: &CteSchemas) -
             join_type,
             on,
             using,
+            natural,
         } => {
             let left = plan_from(left, catalog, ctes)?;
             let right = plan_from(right, catalog, ctes)?;
+            if *natural {
+                // Compute the shared column set from the schema intersection
+                // (preserving left-side declaration order) and desugar to USING.
+                let left_names: Vec<&str> = left.output().iter().map(|c| c.name.as_str()).collect();
+                let right_set: std::collections::HashSet<&str> =
+                    right.output().iter().map(|c| c.name.as_str()).collect();
+                let shared: Vec<String> = left_names
+                    .into_iter()
+                    .filter(|n| right_set.contains(n))
+                    .map(|n| n.to_owned())
+                    .collect();
+                // When there are no shared columns NATURAL JOIN degenerates to a
+                // CROSS JOIN (SQL standard behaviour for disjoint schemas).
+                if shared.is_empty() {
+                    return plan_join(left, right, *join_type, None, catalog);
+                }
+                return plan_using_join(left, right, *join_type, &shared, catalog);
+            }
             if !using.is_empty() {
                 return plan_using_join(left, right, *join_type, using, catalog);
             }
@@ -1805,6 +1824,7 @@ mod tests {
                     }),
                 }),
                 using: vec![],
+                natural: false,
             },
             selection: None,
             projection: vec![Projection::Wildcard],

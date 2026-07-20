@@ -151,6 +151,11 @@ pub enum FromNode {
         /// (standard `USING` semantics). Mutually exclusive with `on`.
         #[serde(default)]
         using: Vec<String>,
+        /// `NATURAL JOIN`: the shared column set is computed at plan time from the
+        /// intersection of both sides' column names, then desugared to `USING`.
+        /// When `true`, `on` and `using` are both empty at parse time.
+        #[serde(default)]
+        natural: bool,
     },
     /// G8 (item 19): `SELECT` without `FROM`. Synthesises a single empty row so
     /// `SELECT 1`, `SELECT 'hello'`, `SELECT 1+1` etc. work. Has no columns

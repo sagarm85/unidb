@@ -1130,6 +1130,7 @@ fn convert_from(items: &[TableWithJoins]) -> Result<FromNode> {
             join_type: JoinType::Cross,
             on: None,
             using: Vec::new(),
+            natural: false,
         };
     }
     Ok(node)
@@ -1139,13 +1140,14 @@ fn convert_table_with_joins(twj: &TableWithJoins) -> Result<FromNode> {
     let mut node = from_node_from_factor(&twj.relation)?;
     for join in &twj.joins {
         let right = from_node_from_factor(&join.relation)?;
-        let (join_type, on, using) = convert_join_operator(&join.join_operator)?;
+        let (join_type, on, using, natural) = convert_join_operator(&join.join_operator)?;
         node = FromNode::Join {
             left: Box::new(node),
             right: Box::new(right),
             join_type,
             on,
             using,
+            natural,
         };
     }
     Ok(node)
@@ -1185,10 +1187,15 @@ fn from_node_from_factor(rel: &TableFactor) -> Result<FromNode> {
     }
 }
 
-/// Returns `(join_type, ON expr, USING columns)`. `USING (c1, …)` yields the
-/// column names (desugared to an equi-`ON` at plan time, see `plan::plan_join`);
-/// `ON`/cross joins yield an empty `using`.
-fn convert_join_operator(op: &JoinOperator) -> Result<(JoinType, Option<QExpr>, Vec<String>)> {
+/// Returns `(join_type, ON expr, USING columns, natural)`.
+/// * `USING (c1, …)` — column names returned in the third element; desugared to
+///   an equi-`ON` at plan time (see `plan::plan_join`).
+/// * `NATURAL JOIN` — `natural = true`; `ON`/`USING` are empty; the shared
+///   column set is derived from the schema intersection at plan time.
+/// * `ON`/cross joins — `using` is empty, `natural = false`.
+fn convert_join_operator(
+    op: &JoinOperator,
+) -> Result<(JoinType, Option<QExpr>, Vec<String>, bool)> {
     let (ty, constraint) = match op {
         JoinOperator::Inner(c) | JoinOperator::Join(c) => (JoinType::Inner, Some(c)),
         JoinOperator::LeftOuter(c) | JoinOperator::Left(c) => (JoinType::Left, Some(c)),
@@ -1197,10 +1204,14 @@ fn convert_join_operator(op: &JoinOperator) -> Result<(JoinType, Option<QExpr>, 
         JoinOperator::FullOuter(c) => (JoinType::FullOuter, Some(c)),
         other => {
             return Err(DbError::SqlUnsupported(format!(
-                "unsupported join type: {other:?} (NATURAL JOIN is not yet supported)"
+                "unsupported join type: {other:?}"
             )))
         }
     };
+    // Handle NATURAL before the ON/USING constraint dispatch.
+    if matches!(constraint, Some(JoinConstraint::Natural)) {
+        return Ok((ty, None, Vec::new(), true));
+    }
     let (on, using) = match constraint {
         None => (None, Vec::new()),
         Some(JoinConstraint::On(expr)) => (Some(convert_qexpr(expr)?), Vec::new()),
@@ -1212,11 +1223,11 @@ fn convert_join_operator(op: &JoinOperator) -> Result<(JoinType, Option<QExpr>, 
         Some(JoinConstraint::None) => (None, Vec::new()),
         Some(other) => {
             return Err(DbError::SqlUnsupported(format!(
-                "unsupported join constraint: {other:?} (only ON <expr> / USING (cols))"
+                "unsupported join constraint: {other:?} (only ON <expr> / USING (cols) / NATURAL)"
             )))
         }
     };
-    Ok((ty, on, using))
+    Ok((ty, on, using, false))
 }
 
 fn convert_query_projection(items: Vec<SelectItem>) -> Result<Vec<Projection>> {
