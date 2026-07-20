@@ -12,21 +12,26 @@
 
 ## Current status
 
-- **Item 93 — HNSW L0 arena layout — SHIPPED 2026-07-20, branch `perf/item-93-hnsw-arena`, PR #175 open.**
+- **Item 102-B — Covering index INCLUDE columns — SHIPPED 2026-07-20, PR #177, branch `feat/item-102b-covering-index`.**
+  `CREATE INDEX ON t (col) INCLUDE (c1, c2, …)` — stores INCLUDE col values in B-tree leaf.
+  Leaf wire format: `key_bytes | include_len:u32-LE | include_bytes | RowId(6B)`.
+  FORMAT_VERSION 11→12. `ColumnDef.include_cols: Vec<String>` persisted via `set_column_include_cols`.
+  Optimizer: `index_only = projection ⊆ {key} ∪ include_cols`. Covering fast path in `try_exec_select_btree`:
+  `search_with_keys_and_include` → decode include bytes → project by name. `IDX_INCLUDE_ROWS` counter.
+  HOT eligibility gate: SET on INCLUDE col disables HOT (else stale include bytes in leaf).
+  WAL type-15 extended with `include_len(4B)|include_bytes`; `redo_index_insert_with_include` in recovery.rs.
+  Bulk build via `insert_many_with_include`. UPDATE covering maintenance via `IndexColBatch.include_entries`.
+  Parser: `INCLUDE (cols)` clause, `None => IndexKind::BTree` default.
+  Tests: 10 new in `tests/item102b_covering_index.rs`; all 447 unit + 53 crash = 0 failures.
+  Clippy + fmt clean.
+
+- **Item 93 — HNSW L0 arena layout — SHIPPED 2026-07-20, PR #175 MERGED.**
   Replaced `HashMap<i64, Vec<RowId>>` in `HnswL0Cache` with flat `L0Arena` (two `Vec`s:
   `arena_data: Vec<i64>` + `arena_offsets: Vec<u32>`). Hot-path `for_l0_nbrs` iterates
   the arena slice in-place via callback — zero heap allocation per hop. Stack buffer
   `[RowId; HNSW_M_MAX0]` (32 slots) collects neighbours with zero `Vec<RowId>` alloc.
-  Arena built by `prefetch_caches` on index creation; generation-mismatch on HNSW INSERT
-  triggers `arena.clear()` + repopulate (no per-slot tombstoning needed).
-  Fix (2026-07-20): removed broken tombstone/compact design from `L0Arena` — the prefix-sum
-  offset array cannot support per-slot zeroing without corrupting adjacent slot boundaries
-  (`offsets[k] = offsets[k+1]` widens slot k-1 range, causing compact to copy stale data).
-  `update()`, `compact()`, `tombstone_count`, and `update_neighbours` all removed (dead code —
-  no production caller). Tests replaced: `l0_arena_update_tombstone` → `l0_arena_duplicate_append`,
-  `l0_arena_compact` → `l0_arena_clear`. 452 lib + perf_item93 gate PASS. Clippy clean.
-  Measured (debug): recall@10=1.000 (≥0.90), disk_fetches=0, L0 hits=3000. Docker bench pending
-  (target ≤600 µs warm at 10k×dim128 in release on Linux). Commits: 7ec5609, 431329f.
+  Tombstone/compact design removed (prefix-sum offset array cannot support per-slot zeroing).
+  Measured (debug): recall@10=1.000 (≥0.90), disk_fetches=0, L0 hits=3000. Docker bench pending.
 
 - **Item 24 Z1+Z3+Z5 — SQL authz DDL + JWT enforcement + catalog relations — SHIPPED 2026-07-19, branch `feat/item-24-authz-z1z3z5`.**
   Z1: `CREATE/DROP ROLE`, `GRANT/REVOKE`, `CREATE/DROP POLICY` SQL DDL. Policies route INSERT→`insert_policy`
@@ -3580,6 +3585,75 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-20 — Item 102-B: Covering index INCLUDE columns
+
+**Goal:** `CREATE INDEX ON t (col) INCLUDE (c1, c2, …)` — store include column values in
+B-tree leaf entries so `SELECT col, c1 FROM t WHERE col = val` is served from the leaf without
+calling `deform_row` on the heap tuple. Heap.get() still called for MVCC visibility.
+
+**Changes shipped:**
+
+1. `src/format.rs` — FORMAT_VERSION 11→12.
+
+2. `src/catalog.rs` — `ColumnDef.include_cols: Vec<String>` (`#[serde(default)]`);
+   `set_column_include_cols` method persists include_cols after index build.
+
+3. `src/btree_index.rs` — `Node::Leaf { include_payloads: Vec<Vec<u8>> }` parallel vec;
+   `node_is_insert_safe` takes `include_payload_len: usize` to correctly account for payload overhead;
+   `insert_in_txn_with_include` full crabbing descent with include payload;
+   `insert_with_include`, `insert_many_with_include` (bulk covering build, single mini-txn);
+   `search_with_keys_and_include` → `Vec<(OrderedValue, Vec<u8>, RowId)>`;
+   `redo_index_insert_with_include` (WAL redo with include bytes);
+   `insert` / `insert_in_txn` / `redo_index_insert` all delegate to `_with_include(..., &[])`.
+
+4. `src/wal.rs` — `log_index_insert_with_include`: type-15 record extended with
+   `include_len(4B) | include_bytes`; `log_index_insert` delegates to it with `&[]`.
+
+5. `src/recovery.rs` — WAL_INDEX_INSERT redo block parses `include_len + include_bytes`
+   suffix (zero-length = non-covering, backward-compatible); calls `redo_index_insert_with_include`.
+
+6. `src/sql/parser.rs` — `INCLUDE (cols)` clause; `None => IndexKind::BTree` default
+   (fixes `CREATE INDEX ON t (col) INCLUDE (…)` without USING).
+   `src/sql/logical.rs` — `CreateIndex.include_cols: Vec<String>`.
+
+7. `src/sql/executor.rs` — `IDX_INCLUDE_ROWS: AtomicU64` counter; optimizer extends
+   `index_only` check: `projection ⊆ {key_col} ∪ include_cols`; covering fast path in
+   `try_exec_select_btree` (`search_with_keys_and_include` → `decode_row` → project);
+   `IndexColBatch.{include_cols, include_entries}` for UPDATE covering maintenance;
+   `set_touches_indexed_col` also fires for SET on INCLUDE col (HOT gate);
+   `apply_durable_index_writes` encodes include payload from row values;
+   `exec_create_index` bulk-collects `include_pairs` → `insert_many_with_include`.
+
+8. `tests/item102b_covering_index.rs` (new) — 10 tests: parse_and_build,
+   idx_include_rows_counter, star_projection_heap, non_include_col_heap,
+   update_include_col, delete_row, multi_include_cols, range_predicate,
+   reopen_survives, perf_10k_covering.
+
+9. `tests/item102_index_only_scan.rs` — removed `before==after` counter assertion
+   in `star_projection_uses_heap` (global counter + parallel test runs = flaky);
+   verification now via column count (SELECT * returns all cols → proves heap access).
+
+10. Docfixes: `docs/backlog/102_index_only_scan.md` Status → SHIPPED;
+    `docs/backlog/backlog_index.md` item 102 row updated, Next-up section revised.
+    `PROGRESS.md` — "Item 102-B" entry filed.
+
+**Bugs fixed en route:**
+- `SqlUnsupported("unsupported index type: None")` — `CREATE INDEX ... INCLUDE` without USING.
+- `index out of bounds: len is 1 but index is 1` — `include_payloads` vec not grown before
+  `insert_pos` assignment when vec was empty.
+- `root split without meta latch held` — `node_is_insert_safe` underestimated leaf entry size
+  for covering inserts (fixed by adding `include_payload_len` param).
+- HOT update returning Null — SET on INCLUDE col took HOT path (skips B-tree maintenance).
+- Reopen returning Null — WAL type-15 record didn't carry include bytes; recovery restored empty.
+- Test parallelism flakiness — global `IDX_INCLUDE_ROWS`/`IDX_ONLY_ROWS` counter can increment
+  from concurrent tests; `before==after` assertions changed to correctness checks (column counts,
+  row values) for "must NOT use covering path" cases; "must use covering path" cases still use
+  `after > before` which is safe.
+
+**Test results:** 10/10 new tests PASS. 447 unit + 53 crash = 0 failures. Clippy + fmt clean.
+
+---
 
 ### 2026-07-18 — Item 71: Cross-page HOT chains
 

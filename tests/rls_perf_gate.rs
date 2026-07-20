@@ -29,11 +29,7 @@ fn timed_select_no_policy(engine: &Engine) -> u64 {
     let t = Instant::now();
     let x = engine.begin().unwrap();
     engine
-        .execute_sql_as(
-            None,
-            x,
-            "SELECT id FROM t WHERE user_id = 'alice'",
-        )
+        .execute_sql_as(None, x, "SELECT id FROM t WHERE user_id = 'alice'")
         .unwrap();
     engine.commit(x).unwrap();
     t.elapsed().as_micros() as u64

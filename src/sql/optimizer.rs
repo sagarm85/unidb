@@ -798,6 +798,7 @@ mod tests {
             index_root: if indexed { Some(1) } else { None },
             unique_index_root: None,
             constraints: ColumnConstraints::default(),
+            include_cols: Vec::new(),
             dropped: false,
         }
     }

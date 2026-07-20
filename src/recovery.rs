@@ -9,7 +9,7 @@
 use std::{collections::HashSet, path::Path};
 
 use crate::{
-    btree_index::redo_index_insert,
+    btree_index::redo_index_insert_with_include,
     bufferpool::BufferPool,
     control::{self, ControlData},
     error::{DbError, Result},
@@ -654,7 +654,29 @@ fn redo_record(r: &WalRecord, pool: &BufferPool, page_size: usize) -> Result<()>
                 page_id: rid_page,
                 slot: rid_slot,
             };
-            match redo_index_insert(&page, r.slot, key_bytes, rid, page_size) {
+            // item 102-B: parse optional include bytes.
+            // Old WAL records end at rid_slot (8 + key_len bytes total), no include.
+            // New records append: include_len(4B) | include_bytes.
+            let base_len = 8 + key_len;
+            let include_bytes: &[u8] = if r.redo.len() >= base_len + 4 {
+                let inc_len =
+                    u32_from_le(r.redo[base_len..base_len + 4].try_into().unwrap()) as usize;
+                if r.redo.len() >= base_len + 4 + inc_len {
+                    &r.redo[base_len + 4..base_len + 4 + inc_len]
+                } else {
+                    &[]
+                }
+            } else {
+                &[]
+            };
+            match redo_index_insert_with_include(
+                &page,
+                r.slot,
+                key_bytes,
+                rid,
+                include_bytes,
+                page_size,
+            ) {
                 Ok(mut new_page) => {
                     new_page.set_lsn(r.lsn);
                     pool.write_page(&new_page)?;

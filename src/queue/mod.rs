@@ -68,6 +68,7 @@ pub fn events_table_def() -> TableDef {
                 unique_index_root: None,
                 dropped: false,
                 constraints: Default::default(),
+                include_cols: Vec::new(),
             },
             ColumnDef {
                 name: "xid".to_string(),
@@ -77,6 +78,7 @@ pub fn events_table_def() -> TableDef {
                 unique_index_root: None,
                 dropped: false,
                 constraints: Default::default(),
+                include_cols: Vec::new(),
             },
             ColumnDef {
                 name: "table_name".to_string(),
@@ -86,6 +88,7 @@ pub fn events_table_def() -> TableDef {
                 unique_index_root: None,
                 dropped: false,
                 constraints: Default::default(),
+                include_cols: Vec::new(),
             },
             ColumnDef {
                 name: "op".to_string(),
@@ -95,6 +98,7 @@ pub fn events_table_def() -> TableDef {
                 unique_index_root: None,
                 dropped: false,
                 constraints: Default::default(),
+                include_cols: Vec::new(),
             },
             ColumnDef {
                 name: "payload".to_string(),
@@ -104,6 +108,7 @@ pub fn events_table_def() -> TableDef {
                 unique_index_root: None,
                 dropped: false,
                 constraints: Default::default(),
+                include_cols: Vec::new(),
             },
         ],
         pages: Vec::new(),
@@ -112,7 +117,7 @@ pub fn events_table_def() -> TableDef {
         insert_policy: None,
         update_policy: None,
         delete_policy: None,
-            update_with_check: None,
+        update_with_check: None,
         policies: vec![],
         events_enabled: false,
         serial_next: Default::default(),
@@ -135,6 +140,7 @@ pub fn consumers_table_def() -> TableDef {
                 unique_index_root: None,
                 dropped: false,
                 constraints: Default::default(),
+                include_cols: Vec::new(),
             },
             ColumnDef {
                 name: "offset".to_string(),
@@ -144,6 +150,7 @@ pub fn consumers_table_def() -> TableDef {
                 unique_index_root: None,
                 dropped: false,
                 constraints: Default::default(),
+                include_cols: Vec::new(),
             },
         ],
         pages: Vec::new(),
@@ -152,7 +159,7 @@ pub fn consumers_table_def() -> TableDef {
         insert_policy: None,
         update_policy: None,
         delete_policy: None,
-            update_with_check: None,
+        update_with_check: None,
         policies: vec![],
         events_enabled: false,
         serial_next: Default::default(),

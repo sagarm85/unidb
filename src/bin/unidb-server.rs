@@ -200,8 +200,8 @@ async fn main() {
     };
 
     let state = {
-        let s = AppState::new(Arc::new(engine_handle))
-            .with_log_dir(std::path::PathBuf::from(&log_dir));
+        let s =
+            AppState::new(Arc::new(engine_handle)).with_log_dir(std::path::PathBuf::from(&log_dir));
         if dev_login {
             s.with_dev_login(jwt_config.clone())
         } else {

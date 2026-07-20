@@ -319,10 +319,16 @@ pub enum LogicalPlan {
     },
     /// `CREATE INDEX ... ON table (column) USING HNSW|FULLTEXT` (M2.c). One
     /// column only in M2 — no composite secondary indexes.
+    /// `include_cols` carries `INCLUDE (col, ...)` columns for a covering B-tree
+    /// index (item 102-B). Empty for non-covering indexes.
     CreateIndex {
         table: String,
         column: String,
         kind: IndexKind,
+        /// INCLUDE columns for covering B-tree index (item 102-B). Empty if
+        /// `INCLUDE (...)` was not specified. Only meaningful for BTree indexes.
+        #[allow(dead_code)] // used in executor
+        include_cols: Vec<String>,
     },
     /// `ALTER TABLE t ADD COLUMN c <type> [constraints]` (P2.c).
     AlterTableAddColumn { table: String, column: ColumnDef },
@@ -644,6 +650,7 @@ mod tests {
                 dropped: false,
                 ty: ColumnType::Int64,
                 constraints: Default::default(),
+                include_cols: Vec::new(),
             }],
             pages: vec![],
             fsm_meta: None,

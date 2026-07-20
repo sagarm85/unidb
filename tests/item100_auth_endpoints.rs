@@ -27,11 +27,7 @@ async fn auth_meta_returns_static_fields() {
     let server = TestServer::spawn().await;
     let client = reqwest::Client::new();
 
-    let resp = client
-        .get(server.url("/auth/meta"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(server.url("/auth/meta")).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
     let body: Value = resp.json().await.unwrap();
@@ -47,8 +43,7 @@ async fn auth_meta_returns_static_fields() {
 
     let ct = body["catalog_tables"].as_array().unwrap();
     assert!(
-        ct.iter()
-            .any(|v| v == "information_schema.tables"),
+        ct.iter().any(|v| v == "information_schema.tables"),
         "information_schema.tables missing from catalog_tables"
     );
     assert!(
@@ -64,11 +59,7 @@ async fn auth_meta_open_mode_true_when_no_users() {
     let server = TestServer::spawn().await;
     let client = reqwest::Client::new();
 
-    let resp = client
-        .get(server.url("/auth/meta"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(server.url("/auth/meta")).send().await.unwrap();
     let body: Value = resp.json().await.unwrap();
     assert_eq!(
         body["open_mode"].as_bool(),
@@ -96,11 +87,7 @@ async fn auth_meta_open_mode_false_after_user_created() {
         .error_for_status()
         .unwrap();
 
-    let resp = client
-        .get(server.url("/auth/meta"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(server.url("/auth/meta")).send().await.unwrap();
     let body: Value = resp.json().await.unwrap();
     assert_eq!(
         body["open_mode"].as_bool(),
@@ -311,7 +298,10 @@ async fn auth_whoami_implicit_superuser_has_no_sub() {
     // any user exists, the server is in open mode and we get the token's sub.
     let resp: Value = client
         .get(server.url("/auth/whoami"))
-        .header("Authorization", format!("Bearer {}", server_common::valid_token()))
+        .header(
+            "Authorization",
+            format!("Bearer {}", server_common::valid_token()),
+        )
         .send()
         .await
         .unwrap()

@@ -242,6 +242,7 @@ mod tests {
             unique_index_root: None,
             dropped: false,
             constraints: Default::default(),
+            include_cols: Vec::new(),
         }
     }
 

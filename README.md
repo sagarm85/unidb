@@ -234,7 +234,7 @@ Full route reference: [`docs/REST_API.md`](docs/REST_API.md)
 - SQL subset: SELECT (with joins, aggregates, GROUP BY, HAVING, ORDER BY, LIMIT), INSERT, UPDATE, DELETE, CREATE/ALTER/DROP TABLE, TRUNCATE
 - Column types: INT, BIGINT, FLOAT, TEXT, BOOL, DECIMAL, TIMESTAMP, DATE, UUID, BYTEA, JSON, VECTOR(n)
 - Constraints: PRIMARY KEY, FOREIGN KEY, UNIQUE, NOT NULL, CHECK, DEFAULT, SERIAL
-- B-tree secondary indexes (durable, crash-recovered, no rebuild on open)
+- B-tree secondary indexes (durable, crash-recovered, no rebuild on open); covering indexes via `CREATE INDEX … INCLUDE (cols)`
 - Cost-based optimizer with ANALYZE statistics and EXPLAIN / EXPLAIN ANALYZE
 - Joins: hash join (with grace spill-to-disk), sort-merge, index-nested-loop
 - Subqueries, CTEs, prepared statements with `$n` bind parameters

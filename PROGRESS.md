@@ -8420,6 +8420,76 @@ counter instrumentation that the fast path fires on every standalone NEAR call.
 
 ---
 
+## Item 102-B — Covering index: INCLUDE columns in B-tree leaf (2026-07-20)
+
+**Branch:** `feat/item-102b-covering-index` | **PR:** pending  
+**FORMAT_VERSION:** 11 → 12
+
+### What shipped
+
+`CREATE INDEX ON t (col) INCLUDE (c1, c2, …)` stores the INCLUDE column values inside the
+B-tree leaf entry so that `SELECT col, c1, c2 FROM t WHERE col = val` is served entirely from
+the B-tree leaf (key bytes + decoded include bytes) without calling `deform_row` on the heap
+tuple. `heap.get()` is still performed for MVCC visibility.
+
+**Leaf wire format:** `key_bytes | include_len:u32-LE | include_bytes | RowId(6B)`.
+Non-covering entries have `include_len = 0`. The new `include_payloads: Vec<Vec<u8>>` parallel
+vec in `Node::Leaf` carries the in-memory counterpart (index `i` corresponds to `entries[i]`).
+
+**WAL:** `WAL_INDEX_INSERT` (type 15) record extended with `include_len(4B) | include_bytes`
+suffix — backward-compatible (old readers see zero include_len). Recovery restored via
+`redo_index_insert_with_include`.
+
+**Catalog:** `ColumnDef.include_cols: Vec<String>` (`#[serde(default)]`). Persisted via new
+`Catalog::set_column_include_cols` method after index build.
+
+**Optimizer:** `index_only = projection ⊆ {key_col} ∪ include_cols`. Extended in `exec_select`
+by reading `btree_include_cols` from the indexed column's `ColumnDef`.
+
+**Executor:** In `try_exec_select_btree`, `is_covering = !include_cols_for_scan.is_empty()`.
+Covering path calls `tree.search_with_keys_and_include(...)` → `Vec<(OrderedValue, Vec<u8>, RowId)>`,
+decodes include bytes via `decode_row`, projects by column name, emits rows. Counter
+`IDX_INCLUDE_ROWS` (`pub static AtomicU64`) increments per covering-path row (alongside
+`IDX_ONLY_ROWS`).
+
+**HOT eligibility gate:** `set_touches_indexed_col` returns true (HOT disabled) when the SET
+clause touches an INCLUDE column of any covering B-tree index — otherwise HOT would skip
+B-tree maintenance and leave stale include bytes in the leaf.
+
+**UPDATE covering maintenance:** `IndexColBatch` extended with `include_cols` and
+`include_entries`. If the key is unchanged but an INCLUDE column changed, the old leaf entry
+is patched and a new include-payload entry is inserted. Flushed via `insert_many_with_include`.
+
+**Bulk build:** `exec_create_index` collects `include_pairs: Vec<(OrderedValue, RowId, Vec<u8>)>`
+during the heap scan and calls `tree.insert_many_with_include` (single mini-txn sort + bulk load).
+
+**Parser:** `CREATE INDEX ON t (col) INCLUDE (c1, c2)` (with or without `USING BTREE`).
+`LogicalPlan::CreateIndex` carries `include_cols: Vec<String>`.
+
+### Key changes
+
+- `src/format.rs` — `FORMAT_VERSION` 11 → 12
+- `src/catalog.rs` — `ColumnDef.include_cols`, `set_column_include_cols`
+- `src/btree_index.rs` — `Node::Leaf { include_payloads }`, `insert_in_txn_with_include`,
+  `insert_many_with_include`, `insert_with_include`, `search_with_keys_and_include`,
+  `redo_index_insert_with_include`, `node_is_insert_safe` takes `include_payload_len`
+- `src/wal.rs` — `log_index_insert_with_include` (type 15, extended record)
+- `src/recovery.rs` — parses include bytes from type-15 redo record
+- `src/sql/parser.rs` — INCLUDE clause parse + `None => IndexKind::BTree` default
+- `src/sql/logical.rs` — `CreateIndex.include_cols`
+- `src/sql/executor.rs` — `IDX_INCLUDE_ROWS`, covering path in `try_exec_select_btree`,
+  `IndexColBatch.include_entries`, `apply_durable_index_writes`, `set_touches_indexed_col`
+- `tests/item102b_covering_index.rs` — 10 new tests
+
+### Tests
+
+`tests/item102b_covering_index.rs` — 10 tests: `parse_and_build`, `idx_include_rows_counter`,
+`star_projection_heap`, `non_include_col_heap`, `update_include_col`, `delete_row`,
+`multi_include_cols`, `range_predicate`, `reopen_survives`, `perf_10k_covering`.
+All 10 pass. Crash harness 53/53 pass. Full suite 447/447 pass.
+
+---
+
 ## Items 67 / 51 / 68 / 69 — Async HNSW, Hash join, Hint bits, Fill-factor (2026-07-20)
 
 **Branch:** `perf/items-67-51-68-69-92` | **PR:** [#171](https://github.com/sagarm85/unidb/pull/171) MERGED  

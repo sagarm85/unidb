@@ -63,6 +63,7 @@ pub fn lobs_table_def() -> TableDef {
         unique_index_root: None,
         dropped: false,
         constraints: Default::default(),
+        include_cols: Vec::new(),
     };
     TableDef {
         name: LOBS_TABLE.to_string(),
@@ -77,7 +78,7 @@ pub fn lobs_table_def() -> TableDef {
         insert_policy: None,
         update_policy: None,
         delete_policy: None,
-            update_with_check: None,
+        update_with_check: None,
         policies: vec![],
         events_enabled: false,
         serial_next: Default::default(),

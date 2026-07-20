@@ -255,6 +255,7 @@ fn convert_column_def(c: ast::ColumnDef) -> Result<ColumnDef> {
         unique_index_root: None,
         dropped: false,
         constraints: cons,
+        include_cols: Vec::new(),
     })
 }
 
@@ -437,7 +438,10 @@ fn convert_create_index(ci: ast::CreateIndex) -> Result<LogicalPlan> {
         // Postgres/MySQL) — it arrives as `IndexType::BTree` directly, not
         // `IndexType::Custom`.
         Some(IndexType::BTree) => IndexKind::BTree,
-        other => {
+        // item 102-B: `CREATE INDEX ON t (col) INCLUDE (...)` without USING
+        // defaults to BTree (consistent with PostgreSQL behaviour).
+        None => IndexKind::BTree,
+        Some(other) => {
             return Err(DbError::SqlUnsupported(format!(
                 "unsupported index type: {other:?} (expected USING HNSW, FULLTEXT, or BTREE)"
             )))
@@ -456,10 +460,15 @@ fn convert_create_index(ci: ast::CreateIndex) -> Result<LogicalPlan> {
             )))
         }
     };
+    // INCLUDE (col, ...) — sqlparser already parses this into `ci.include`.
+    // Only valid for BTree indexes; other index types ignore it silently
+    // (HNSW/FullText have no covering-index concept in this engine).
+    let include_cols: Vec<String> = ci.include.iter().map(|i| i.value.clone()).collect();
     Ok(LogicalPlan::CreateIndex {
         table,
         column,
         kind,
+        include_cols,
     })
 }
 
@@ -1913,6 +1922,7 @@ mod tests {
                 table,
                 column,
                 kind,
+                ..
             } => {
                 assert_eq!(table, "t");
                 assert_eq!(column, "embedding");
