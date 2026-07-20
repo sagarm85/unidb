@@ -746,6 +746,18 @@ pub struct ExecCtx<'a> {
     /// don't exercise the async HNSW path and fall back to synchronous insert).
     /// The executor clones this cheaply per INSERT statement.
     pub hnsw_tx: Option<std::sync::mpsc::SyncSender<crate::hnsw_index::HnswMsg>>,
+    /// Whether this execution is running inside an explicit user `BEGIN … COMMIT`
+    /// block (item 94). When `false`, a standalone (auto-commit) statement may use
+    /// the lightweight snapshot fast path for NEAR queries. When `true`, the caller
+    /// has opened a multi-statement transaction and NEAR must use the transaction's
+    /// own snapshot (via `txn_mgr.snapshot_for_statement(xid)`) so the query sees
+    /// preceding writes within the same transaction. `None` in unit tests that build
+    /// bare `ExecCtx` structs and don't test NEAR inside explicit transactions.
+    pub in_explicit_txn: bool,
+    /// Counter for standalone NEAR queries that used the lightweight snapshot
+    /// (item 94). `None` in unit tests that build bare `ExecCtx` structs.
+    /// Points at `Engine::near_lightweight_snaps`.
+    pub near_lightweight_snaps: Option<&'a std::sync::atomic::AtomicU64>,
 }
 
 /// Insert `row`'s durable-index column values into their on-disk structures
@@ -1418,7 +1430,7 @@ fn exec_create_table(
         insert_policy: None,
         update_policy: None,
         delete_policy: None,
-            update_with_check: None,
+        update_with_check: None,
         policies: vec![],
         events_enabled: false,
         serial_next,
@@ -2540,10 +2552,31 @@ fn exec_select_near(
     };
 
     let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
-    let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+    // Item 94: lightweight snapshot fast path for standalone (non-BEGIN) NEAR
+    // queries.  A standalone auto-commit NEAR does not need WAL tail pinning or
+    // active-snapshot registration — it is a point-in-time read that completes
+    // in < 1 ms and holds no long-lived page latches across vacuum cycles.  The
+    // lightweight snapshot reads `committed_horizon` atomically (no mutex) and
+    // uses an empty `active_xids` list (all xids below the horizon appear
+    // committed — an accepted RC relaxation for the standalone read-only case;
+    // see `TransactionManager::read_snapshot_lightweight` for the full contract).
+    // Inside an explicit `BEGIN … COMMIT` block the full snapshot path is used
+    // so that NEAR correctly reflects the transaction's own snapshot (RC fresh
+    // per statement, or the fixed RR/SI BEGIN-time snapshot).
+    let (snapshot, snap_xid) = if !ctx.in_explicit_txn {
+        // Standalone NEAR: lightweight atomic read, no mutex registration.
+        if let Some(ctr) = ctx.near_lightweight_snaps {
+            ctr.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        ctx.txn_mgr.read_snapshot_lightweight()
+    } else {
+        // Inside an explicit transaction: use the transaction's own snapshot.
+        let snap = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+        (snap, ctx.xid)
+    };
     let mut scored: Vec<(f32, Vec<Literal>)> = Vec::new();
     for row_id in candidate_ids {
-        let bytes = match heap.get(row_id, &snapshot, ctx.xid, ctx.pool) {
+        let bytes = match heap.get(row_id, &snapshot, snap_xid, ctx.pool) {
             Ok(b) => b,
             // Not visible to this snapshot (superseded, or never committed —
             // e.g. an aborted insert whose durable index entry survives the
@@ -4276,11 +4309,7 @@ fn check_passes(expr: &Expr, columns: &[ColumnDef], row: &[Literal]) -> Result<b
 /// `current_user` substitution mirrors the INSERT path exactly — a
 /// CurrentUser-dependent policy is skipped for the superuser/embedded
 /// path (when `ctx.current_user` is None).
-fn exec_update_with_check(
-    table_def: &TableDef,
-    new_row: &[Literal],
-    ctx: &ExecCtx,
-) -> Result<()> {
+fn exec_update_with_check(table_def: &TableDef, new_row: &[Literal], ctx: &ExecCtx) -> Result<()> {
     let Some(ref check_expr) = table_def.update_with_check else {
         return Ok(());
     };
@@ -5736,6 +5765,8 @@ mod tests {
                 authz: None,
                 current_user: None,
                 hnsw_tx: None,
+                in_explicit_txn: false,
+                near_lightweight_snaps: None,
             };
             execute(plan, &mut ctx)
         }

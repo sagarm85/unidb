@@ -740,6 +740,10 @@ pub struct Engine {
     /// after any mutation.  See `graph::adjacency_cache` for the full design.
     /// The cache is disabled when `UNIDB_GRAPH_CACHE_HUBS=0`.
     adjacency_cache: AdjacencyCache,
+    /// Lifetime count of standalone `NEAR` queries that used the lightweight
+    /// snapshot fast path (item 94): no mutex registration, no WAL tail pin.
+    /// Incremented by `exec_select_near` when `ctx.in_explicit_txn == false`.
+    near_lightweight_snaps: AtomicU64,
 }
 
 /// One slow-query-log entry (P6.g).
@@ -1375,6 +1379,7 @@ impl Engine {
             hnsw_worker_tx: Mutex::new(None),
             hnsw_worker_handle: Mutex::new(None),
             adjacency_cache: AdjacencyCache::from_env(),
+            near_lightweight_snaps: AtomicU64::new(0),
         })
     }
 
@@ -1962,6 +1967,14 @@ impl Engine {
         self.plan_cache_hits.load(Ordering::Relaxed)
     }
 
+    /// Lifetime count of standalone `NEAR` queries that used the lightweight
+    /// snapshot fast path (item 94): no mutex registration, no WAL tail pin.
+    /// Increments only when `exec_select_near` fires outside an explicit
+    /// `BEGIN … COMMIT` block (`ctx.in_explicit_txn == false`).
+    pub fn near_lightweight_snaps_total(&self) -> u64 {
+        self.near_lightweight_snaps.load(Ordering::Relaxed)
+    }
+
     /// Parse `sql` using the plan cache: return cached plans on a hit,
     /// call `parse_sql` and populate the cache on a miss.
     ///
@@ -2113,6 +2126,16 @@ impl Engine {
         plan: LogicalPlan,
         user: Option<&str>,
     ) -> Result<ExecResult> {
+        self.execute_one_plan_inner_as_with_scope(xid, plan, user, false)
+    }
+
+    fn execute_one_plan_inner_as_with_scope(
+        &self,
+        xid: Xid,
+        plan: LogicalPlan,
+        user: Option<&str>,
+        in_explicit_txn: bool,
+    ) -> Result<ExecResult> {
         let page_size = self.page_size;
         let current_user = user.map(|u| u.to_owned());
         let shared = self.stmt_uses_shared_catalog(&plan);
@@ -2135,6 +2158,8 @@ impl Engine {
                 authz: Some(&self.authz),
                 current_user: current_user.clone(),
                 hnsw_tx: self.hnsw_worker_tx.lock().unwrap().clone(),
+                in_explicit_txn,
+                near_lightweight_snaps: Some(&self.near_lightweight_snaps),
             };
             executor::execute(plan, &mut ctx)
         } else {
@@ -2156,6 +2181,8 @@ impl Engine {
                 authz: Some(&self.authz),
                 current_user,
                 hnsw_tx: self.hnsw_worker_tx.lock().unwrap().clone(),
+                in_explicit_txn,
+                near_lightweight_snaps: Some(&self.near_lightweight_snaps),
             };
             executor::execute(plan, &mut ctx)
         }
@@ -2293,6 +2320,34 @@ impl Engine {
     }
 
     fn execute_one_plan_inner(&self, xid: Xid, plan: LogicalPlan) -> Result<ExecResult> {
+        self.execute_one_plan_inner_scoped(xid, plan, false)
+    }
+
+    /// Execute one plan with an explicit `in_explicit_txn` scope flag (item 94).
+    /// Used by the server's `execute_sql_scoped` path when the request carries an
+    /// `X-Txn-Id` header (a long-lived user transaction) — those calls set
+    /// `in_explicit_txn = true` so NEAR queries use the full snapshot path.
+    pub fn execute_one_plan_scoped(
+        &self,
+        xid: Xid,
+        plan: LogicalPlan,
+        in_explicit_txn: bool,
+    ) -> Result<ExecResult> {
+        let latency_hist = self.stmt_latency_for(&plan);
+        let started = latency_hist.map(|_| Instant::now());
+        let result = self.execute_one_plan_inner_scoped(xid, plan, in_explicit_txn);
+        if let (Some(hist), Some(started)) = (latency_hist, started) {
+            hist.record(started.elapsed().as_micros() as u64);
+        }
+        result
+    }
+
+    fn execute_one_plan_inner_scoped(
+        &self,
+        xid: Xid,
+        plan: LogicalPlan,
+        in_explicit_txn: bool,
+    ) -> Result<ExecResult> {
         let page_size = self.page_size;
         // Decide the lock mode under a brief read lock, then take the real guard.
         let shared = self.stmt_uses_shared_catalog(&plan);
@@ -2322,6 +2377,8 @@ impl Engine {
                 authz: Some(&self.authz),
                 current_user: None,
                 hnsw_tx,
+                in_explicit_txn,
+                near_lightweight_snaps: Some(&self.near_lightweight_snaps),
             };
             executor::execute(plan, &mut ctx)
         } else {
@@ -2343,6 +2400,8 @@ impl Engine {
                 authz: Some(&self.authz),
                 current_user: None,
                 hnsw_tx,
+                in_explicit_txn,
+                near_lightweight_snaps: Some(&self.near_lightweight_snaps),
             };
             executor::execute(plan, &mut ctx)
         }
@@ -2436,6 +2495,8 @@ impl Engine {
             authz: Some(&self.authz),
             current_user: None,
             hnsw_tx,
+            in_explicit_txn: false,
+            near_lightweight_snaps: Some(&self.near_lightweight_snaps),
         };
         let result = graph_executor::execute(parsed, &mut ctx, self.edge_index_meta)?;
         Ok(vec![result])
@@ -5822,6 +5883,147 @@ mod tests {
             }
             other => panic!("expected Rows, got {other:?}"),
         }
+    }
+
+    // ── Item 94: lightweight snapshot for standalone NEAR queries ───────────────
+
+    /// (a) Standalone `SELECT NEAR(...)` (outside explicit BEGIN) must increment
+    /// the `near_lightweight_snaps_total` counter each time it fires.
+    #[test]
+    fn near_lightweight_snap_counter_increments_for_standalone_near() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+
+        // Set up table + HNSW index.
+        let setup = engine.begin().unwrap();
+        engine
+            .execute_sql(setup, "CREATE TABLE t (id INT, v VECTOR(2))")
+            .unwrap();
+        engine
+            .execute_sql(setup, "CREATE INDEX idx ON t USING HNSW (v)")
+            .unwrap();
+        engine
+            .execute_sql(setup, "INSERT INTO t (id, v) VALUES (1, [1.0, 0.0])")
+            .unwrap();
+        engine
+            .execute_sql(setup, "INSERT INTO t (id, v) VALUES (2, [0.0, 1.0])")
+            .unwrap();
+        engine.commit(setup).unwrap();
+
+        let before = engine.near_lightweight_snaps_total();
+
+        // Each NEAR query under a new (standalone) xid should fire the fast path.
+        let xid1 = engine.begin().unwrap();
+        engine
+            .execute_sql(xid1, "SELECT id FROM t WHERE NEAR(v, [1.0, 0.0], 1)")
+            .unwrap();
+        engine.commit(xid1).unwrap();
+
+        assert_eq!(
+            engine.near_lightweight_snaps_total(),
+            before + 1,
+            "first standalone NEAR must increment the lightweight-snap counter"
+        );
+
+        let xid2 = engine.begin().unwrap();
+        engine
+            .execute_sql(xid2, "SELECT id FROM t WHERE NEAR(v, [0.0, 1.0], 1)")
+            .unwrap();
+        engine.commit(xid2).unwrap();
+
+        assert_eq!(
+            engine.near_lightweight_snaps_total(),
+            before + 2,
+            "second standalone NEAR must increment the counter again"
+        );
+    }
+
+    /// (b) `SELECT NEAR(...)` inside an explicit `BEGIN … COMMIT` block must NOT
+    /// increment the lightweight-snap counter — it uses the full snapshot path.
+    #[test]
+    fn near_lightweight_snap_counter_does_not_increment_in_explicit_txn() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+
+        let setup = engine.begin().unwrap();
+        engine
+            .execute_sql(setup, "CREATE TABLE t (id INT, v VECTOR(2))")
+            .unwrap();
+        engine
+            .execute_sql(setup, "CREATE INDEX idx ON t USING HNSW (v)")
+            .unwrap();
+        engine
+            .execute_sql(setup, "INSERT INTO t (id, v) VALUES (1, [1.0, 0.0])")
+            .unwrap();
+        engine.commit(setup).unwrap();
+
+        // Use the scoped (explicit-txn) path.  execute_one_plan_scoped exposes
+        // in_explicit_txn=true so the fast path is suppressed.
+        let before = engine.near_lightweight_snaps_total();
+
+        let xid = engine.begin().unwrap();
+        let plans =
+            crate::sql::parser::parse_sql("SELECT id FROM t WHERE NEAR(v, [1.0, 0.0], 1)").unwrap();
+        engine
+            .execute_one_plan_scoped(xid, plans.into_iter().next().unwrap(), true)
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        assert_eq!(
+            engine.near_lightweight_snaps_total(),
+            before,
+            "NEAR inside an explicit transaction must NOT use the lightweight fast path"
+        );
+    }
+
+    /// (c) Correctness: a standalone lightweight-snapshot NEAR must return the
+    /// same nearest neighbours as the full-snapshot path on a quiescent table.
+    #[test]
+    fn near_lightweight_snap_returns_correct_neighbours() {
+        let dir = tempdir().unwrap();
+        let engine = Engine::open(dir.path(), 0).unwrap();
+
+        let setup = engine.begin().unwrap();
+        engine
+            .execute_sql(setup, "CREATE TABLE t (id INT, v VECTOR(2))")
+            .unwrap();
+        engine
+            .execute_sql(setup, "CREATE INDEX idx ON t USING HNSW (v)")
+            .unwrap();
+        for (id, x, y) in [(1, 1.0_f32, 0.0), (2, 0.0, 1.0), (3, 1.0, 1.0)] {
+            engine
+                .execute_sql(
+                    setup,
+                    &format!("INSERT INTO t (id, v) VALUES ({id}, [{x}, {y}])"),
+                )
+                .unwrap();
+        }
+        engine.commit(setup).unwrap();
+
+        // Query nearest to [1.0, 0.0] — should return id=1 as closest.
+        let xid = engine.begin().unwrap();
+        let result = engine
+            .execute_sql(xid, "SELECT id FROM t WHERE NEAR(v, [1.0, 0.0], 1)")
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        match &result[0] {
+            SqlResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1, "should get exactly 1 nearest neighbour");
+                assert_eq!(
+                    rows[0][0],
+                    crate::sql::logical::Literal::Int(1),
+                    "nearest to [1.0, 0.0] must be id=1"
+                );
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+
+        // The lightweight fast path must have fired for this query.
+        assert!(
+            engine.near_lightweight_snaps_total() > 0,
+            "lightweight-snap counter must be non-zero after a standalone NEAR query"
+        );
     }
 
     #[test]

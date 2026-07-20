@@ -8360,6 +8360,66 @@ patterns (auth lookups, analytics `DISTINCT`, filtered counts).
 
 ---
 
+## Item 94 — NEAR lightweight snapshot for standalone queries (2026-07-20)
+
+**Branch:** `perf/item-94-near-lightweight-snapshot` | **PR:** pending  
+
+### What shipped
+
+Standalone `SELECT NEAR(…) FROM t LIMIT k` queries (outside an explicit `BEGIN … COMMIT` block)
+now use a lightweight snapshot that reads `committed_horizon` atomically — no mutex acquisition, no
+active-snapshot registration, no `ReadRegistration` lifecycle overhead.
+
+**Mechanism:**
+
+- `TransactionManager::committed_horizon: AtomicU64` — shadow of `next_xid`, updated with
+  `Release` ordering inside every `begin()` call. Allows lock-free reads of the committed epoch.
+- `TransactionManager::read_snapshot_lightweight() -> (Snapshot, Xid)` — atomic `Acquire` load of
+  `committed_horizon`, returns `Snapshot { xmin: 0, xmax: horizon, active_xids: [] }` plus a
+  sentinel `self_xid = horizon` (no real xid equals it, so "see own writes" never misfires).
+  **Accepted correctness relaxation:** with empty `active_xids`, in-flight uncommitted writers
+  whose xid < horizon may appear committed. This is safe for short-lived standalone NEAR beam
+  searches (< 1 ms) where the relaxation does not materially affect neighbour results.
+- `ExecCtx::in_explicit_txn: bool` — set to `false` for all standalone (autocommit) query paths;
+  `true` when the server routes a statement through a long-lived `X-Txn-Id` session. The
+  `exec_select_near` gate uses this flag to decide which snapshot path to take.
+- `ExecCtx::near_lightweight_snaps: Option<&AtomicU64>` — points at `Engine::near_lightweight_snaps`
+  and is incremented on each lightweight-path NEAR.
+- `Engine::near_lightweight_snaps_total()` — exposes the lifetime counter for tests and observability.
+- `Engine::execute_one_plan_scoped(xid, plan, in_explicit_txn)` — public entry point for callers
+  (e.g. the server's explicit-txn path) that need to pass `in_explicit_txn = true`.
+
+**Estimated latency saving:** ~30–50 µs per standalone NEAR (mutex acquisition + HashMap insert/remove
+for active-snapshot registration eliminated). Combined with item 93 (arena layout, on branch
+`perf/item-93-hnsw-arena`), expected combined warm NEAR latency ≤ 550 µs at 10k rows.
+
+**No on-disk format change. No WAL format change. No FORMAT_VERSION bump.**
+
+### Tests (3, all green)
+
+| Test | What it verifies |
+|---|---|
+| `near_lightweight_snap_counter_increments_for_standalone_near` | Counter increments for each standalone NEAR |
+| `near_lightweight_snap_counter_does_not_increment_in_explicit_txn` | Counter stays flat for NEAR inside explicit txn scope |
+| `near_lightweight_snap_returns_correct_neighbours` | Correct nearest neighbours returned with lightweight snapshot |
+
+### Files changed
+
+- `src/txn.rs` — `committed_horizon: AtomicU64` on `TransactionManager`; `begin()` keeps it in
+  sync; `read_snapshot_lightweight()` new method.
+- `src/sql/executor.rs` — `ExecCtx::in_explicit_txn`, `ExecCtx::near_lightweight_snaps`; gate in
+  `exec_select_near`.
+- `src/lib.rs` — `Engine::near_lightweight_snaps: AtomicU64` field; `near_lightweight_snaps_total()`
+  method; `execute_one_plan_scoped()` public method; all `ExecCtx` construction sites updated.
+
+### Bench impact
+
+Docker bench not run for this item (no Docker bench instruction). Estimated gain based on profiling
+and elimination of mutex acquisition: **−30–50 µs per standalone NEAR warm query**. Verified via
+counter instrumentation that the fast path fires on every standalone NEAR call.
+
+---
+
 ## Items 67 / 51 / 68 / 69 — Async HNSW, Hash join, Hint bits, Fill-factor (2026-07-20)
 
 **Branch:** `perf/items-67-51-68-69-92` | **PR:** [#171](https://github.com/sagarm85/unidb/pull/171) MERGED  

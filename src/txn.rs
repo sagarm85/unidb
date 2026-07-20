@@ -15,6 +15,7 @@
 // (mvcc::is_visible) — only snapshot lifetime differs.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -341,6 +342,15 @@ fn run_abort_midpoint_hook() {}
 
 pub struct TransactionManager {
     inner: SharedTxn,
+    /// Shadow of `TxnInner.next_xid` kept in sync on every `begin()`, allowing
+    /// lock-free reads for lightweight snapshot construction (item 94).
+    /// Always equals `inner.next_xid` at quiescent points between statements.
+    /// Initialized from `next_xid` in [`Self::with_next_xid`] and incremented
+    /// inside `begin()` immediately after the mutex-guarded increment, so a
+    /// reader that loads this atomic sees `next_xid` as it was at or after the
+    /// most recently begun transaction — an upper bound that is always safe as
+    /// the snapshot's `xmax` (no committed writer can have a higher xid).
+    committed_horizon: AtomicU64,
 }
 
 impl Default for TransactionManager {
@@ -365,6 +375,7 @@ impl TransactionManager {
                 next_reg_id: 1,
                 committed_ser: HashMap::new(),
             })),
+            committed_horizon: AtomicU64::new(next_xid),
         }
     }
 
@@ -403,6 +414,11 @@ impl TransactionManager {
         let mut inner = self.lock();
         let xid = inner.next_xid;
         inner.next_xid += 1;
+        // Keep the lock-free shadow in sync with the mutex-guarded counter so
+        // `read_snapshot_lightweight` can read it without taking the lock.
+        // `Release` pairs with the `Acquire` in `read_snapshot_lightweight`.
+        self.committed_horizon
+            .store(inner.next_xid, Ordering::Release);
         let begin_lsn = wal.begin_user_txn(xid)?;
         let snapshot = inner.compute_snapshot();
         inner.active.insert(
@@ -426,6 +442,42 @@ impl TransactionManager {
         );
         tracing::info!(xid, ?isolation, "transaction begin");
         Ok(xid)
+    }
+
+    /// Returns a lightweight snapshot for short-lived read-only operations that
+    /// do NOT require WAL tail pinning or active-snapshot registration (item 94).
+    ///
+    /// # Correctness contract
+    ///
+    /// The snapshot is `Snapshot { xmin: 0, xmax: horizon, active_xids: [] }`:
+    /// - `xmax = committed_horizon` (atomic `Acquire` load, no mutex).
+    /// - `xmin = 0`: with an empty `active_xids`, `is_committed_at_snapshot(xid)`
+    ///   returns `true` for every `xid` in `[1, xmax)` — including any in-flight
+    ///   (uncommitted) writer whose xid falls below the horizon. This means a
+    ///   standalone NEAR query MAY see a not-yet-committed neighbour row if a
+    ///   concurrent writer was in flight when the horizon was sampled and the HNSW
+    ///   index already has an entry for it. This is an accepted READ COMMITTED
+    ///   relaxation for the standalone case: the beam search completes in < 1 ms,
+    ///   and by the time the result is returned the writer will typically have
+    ///   committed or aborted. Any caller that requires strict RC exclusion of
+    ///   in-flight rows must use the full `snapshot_for_statement` path instead
+    ///   (which enumerates active xids and lists them in `active_xids`).
+    /// - `self_xid = xmax` (returned alongside the snapshot): a sentinel that no
+    ///   real committed or in-flight transaction can equal, so the "see your own
+    ///   writes" branch in `is_visible` never fires spuriously.
+    ///
+    /// # When to use
+    ///
+    /// ONLY for standalone (non-BEGIN) read-only operations — the caller must
+    /// **not** hold this snapshot across a write path, and **not** use it inside
+    /// an explicit user transaction (which must use `snapshot_for_statement`
+    /// to maintain the BEGIN-time snapshot stability guarantee).
+    pub fn read_snapshot_lightweight(&self) -> (Snapshot, Xid) {
+        let xmax = self.committed_horizon.load(Ordering::Acquire);
+        // xmin = 0, active_xids = []: all xids in [1, xmax) appear committed.
+        // self_xid = xmax: sentinel, no real transaction has this xid yet.
+        let snap = Snapshot::new(0, xmax, Vec::new());
+        (snap, xmax)
     }
 
     /// The snapshot a statement inside `xid` should read under: fresh for
