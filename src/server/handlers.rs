@@ -39,9 +39,10 @@ use crate::{
             table_def_to_info, AckEventsRequest, AdvanceSlotRequest, AuthLoginRequest,
             AuthLoginResponse, AuthMetaResponse, AuthPreviewRequest, BatchInsertRequest,
             BatchSqlRequest, BatchSqlResponse, BeginTxnRequest, CreateEdgeRequest,
-            CreateSlotRequest, CursorQuery, CypherRequest, DeleteEdgeRequest, HistoryQuery,
-            IsolationDto, RlsRequest, RowIdResponse, SetIndexRequest, SlowQueryThresholdRequest,
-            SqlRequest, StreamQuery, TableInfo, WhoamiPrivilege, WhoamiResponse,
+            CreateSlotRequest, CursorQuery, CypherRequest, DeleteEdgeRequest,
+            GroupCommitWindowRequest, HistoryQuery, IsolationDto, RlsRequest, RowIdResponse,
+            SetIndexRequest, SlowQueryThresholdRequest, SqlRequest, StreamQuery, TableInfo,
+            WhoamiPrivilege, WhoamiResponse,
         },
         engine_handle::EngineHandle,
         error::ApiError,
@@ -1273,6 +1274,29 @@ pub async fn put_config_slow_query_threshold_ms(
     state
         .engine
         .set_slow_query_threshold(body.threshold_ms)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `PUT /config/group_commit_window_us` (item 101): update the WAL group-commit
+/// dwell window at runtime without a restart. Superuser-gated. `204 No Content`.
+/// Zero disables the window (default); a positive value (e.g. 500) makes the
+/// flush-lock leader sleep that many microseconds before fsyncing, giving
+/// concurrent committers time to coalesce into one fsync.
+pub async fn put_config_group_commit_window_us(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+    Json(body): Json<GroupCommitWindowRequest>,
+) -> std::result::Result<StatusCode, ApiError> {
+    state
+        .engine
+        .ensure_superuser(current_user.0)
+        .await
+        .map_err(ApiError::from)?;
+    state
+        .engine
+        .set_group_commit_window_us(body.value)
         .await
         .map_err(ApiError::from)?;
     Ok(StatusCode::NO_CONTENT)

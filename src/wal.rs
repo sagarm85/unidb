@@ -433,6 +433,14 @@ pub struct Wal {
     /// segment FD, hand it to the sealer, and open N+1 immediately — the
     /// append lock is released before sync_all runs.
     sealer: Sealer,
+    /// Group-commit dwell window in microseconds (item 101).
+    /// When > 0, the flush-lock leader sleeps this many µs before calling
+    /// `group_fsync`, giving stragglers time to append so one fsync covers them.
+    /// Read from `UNIDB_GROUP_COMMIT_WINDOW_US` env var at open; configurable
+    /// at runtime via `PUT /config/group_commit_window_us`.
+    /// `Ordering::Relaxed` is correct — the sleep is a best-effort latency
+    /// hint, not a synchronisation point.
+    group_commit_window_us: AtomicU64,
 }
 
 impl Wal {
@@ -507,6 +515,12 @@ impl Wal {
             fsyncs: AtomicU64::new(0),
             fsync_latency: AtomicHistogram::new(),
             sealer,
+            group_commit_window_us: AtomicU64::new(
+                std::env::var("UNIDB_GROUP_COMMIT_WINDOW_US")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0),
+            ),
         })
     }
 
@@ -518,6 +532,26 @@ impl Wal {
             self.fsyncs.load(Ordering::Relaxed),
             self.fsync_latency.snapshot(),
         )
+    }
+
+    /// Raw fsync counter (item 101 tests): fsyncs that actually reached the
+    /// platter. Fast-path skips and coalesced followers are not counted.
+    pub fn fsyncs_count(&self) -> u64 {
+        self.fsyncs.load(Ordering::Relaxed)
+    }
+
+    /// Current group-commit dwell window in microseconds (item 101).
+    /// Zero means disabled (each commit fsyncs immediately).
+    pub fn group_commit_window_us(&self) -> u64 {
+        self.group_commit_window_us.load(Ordering::Relaxed)
+    }
+
+    /// Update the group-commit dwell window at runtime (item 101).
+    /// Zero disables the window; positive values give stragglers that many
+    /// microseconds to append before the single flush-lock fsync fires.
+    pub fn set_group_commit_window_us(&self, us: u64) {
+        self.group_commit_window_us.store(us, Ordering::Relaxed);
+        tracing::info!(us, "group_commit_window_us updated");
     }
 
     /// Record one durable fsync's wall-clock cost (item 21). Called only on the
@@ -1156,6 +1190,19 @@ impl Wal {
             return Ok(());
         }
         let _leader = self.flush_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if self.durable_lsn() >= target {
+            return Ok(());
+        }
+        // Item 101: group-commit dwell window — give stragglers time to append
+        // their WAL records before the single fsync covers them all.  The window
+        // is a best-effort hint: if the server is quiet the sleep fires once and
+        // adds at most `window` µs of extra latency; under load, N sessions share
+        // the one fsync that follows.  Default 0 = disabled (existing behaviour).
+        let window_us = self.group_commit_window_us.load(Ordering::Relaxed);
+        if window_us > 0 {
+            std::thread::sleep(std::time::Duration::from_micros(window_us));
+        }
+        // Re-check after the sleep: another leader may have fsynced while we slept.
         if self.durable_lsn() >= target {
             return Ok(());
         }

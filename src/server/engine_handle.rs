@@ -409,6 +409,15 @@ impl EngineHandle {
         .await
     }
 
+    /// Update the WAL group-commit dwell window at runtime (item 101). Zero disables.
+    pub async fn set_group_commit_window_us(&self, us: u64) -> Result<()> {
+        self.on_engine(move |e| {
+            e.set_group_commit_window_us(us);
+            Ok(())
+        })
+        .await
+    }
+
     /// Return up to `n` most-recent stats-history points (item 34, Part B).
     pub async fn stats_history(&self, n: usize) -> Result<Vec<crate::StatsHistoryPoint>> {
         self.on_engine(move |e| Ok(e.stats_history_snapshot(n)))

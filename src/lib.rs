@@ -1507,6 +1507,28 @@ impl Engine {
             .store(threshold.as_micros() as u64, Ordering::Relaxed);
     }
 
+    /// Update the WAL group-commit dwell window at runtime (item 101).
+    /// Zero disables the window (default, existing behaviour); a positive value
+    /// makes the flush-lock leader sleep that many microseconds before fsyncing,
+    /// giving concurrent committers time to append their records so one fsync
+    /// covers them all.
+    pub fn set_group_commit_window_us(&self, us: u64) {
+        self.wal.set_group_commit_window_us(us);
+    }
+
+    /// Current group-commit dwell window in microseconds (item 101).
+    /// Zero means disabled (default). Useful for tests and observability.
+    pub fn group_commit_window_us(&self) -> u64 {
+        self.wal.group_commit_window_us()
+    }
+
+    /// Raw WAL fsync counter (item 101 / item 21): fsyncs that actually reached
+    /// the platter. Fast-path skips and coalesced followers are not counted, so
+    /// `total_commits / fsyncs_count` measures the group-commit amortization ratio.
+    pub fn wal_fsyncs_count(&self) -> u64 {
+        self.wal.fsyncs_count()
+    }
+
     /// Record a statement's wall-clock, logging + retaining it if slow (P6.g).
     fn note_query_time(&self, sql: &str, elapsed: Duration) {
         let threshold = self.slow_query_threshold_us.load(Ordering::Relaxed);

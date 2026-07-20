@@ -94,6 +94,10 @@ pub fn build_router(
             "/config/slow_query_threshold_ms",
             put(handlers::put_config_slow_query_threshold_ms),
         )
+        .route(
+            "/config/group_commit_window_us",
+            put(handlers::put_config_group_commit_window_us),
+        )
         .route("/logs", get(handlers::get_logs))
         .route(
             "/replication/slots",
