@@ -611,8 +611,6 @@ fn decode_rid_i64(v: i64) -> RowId {
 //   arena_data:    Vec<i64>           — packed neighbour RowIds, contiguous
 //   arena_offsets: Vec<u32>           — prefix-sum offsets; node k occupies
 //                                       arena_data[offsets[k]..offsets[k+1]]
-//   tombstone_count: u32              — physical slots whose list was superseded
-//                                       (re-wired by HNSW reciprocal updates)
 //
 // **Lookup (hot path, zero copy):**
 //   `node_idx_map.get(key)` → k →
@@ -622,14 +620,14 @@ fn decode_rid_i64(v: i64) -> RowId {
 // **Insert (new node):**
 //   Append neighbour RowIds (encoded as i64) to `arena_data`.
 //   Push new offset into `arena_offsets`. Record k in `node_idx_map`.
+//   Duplicate keys are no-ops (append returns false).
 //
-// **Update (re-wire, e.g. reciprocal L0 edge added):**
-//   Mark old slot as tombstone (`arena_offsets[k] = arena_offsets[k+1]` so
-//   the range is empty), then append updated list + new offset. Update
-//   `node_idx_map[key]` to point at the new slot. Increment `tombstone_count`.
-//
-// **Compaction** (triggered when tombstone_count > num_slots / 2):
-//   Rebuild arena in a single pass — copy live entries only.
+// **Generation invalidation (HNSW INSERT rewires L0 lists):**
+//   On any HNSW INSERT, `generation` (= hdr.total_nodes) is bumped.
+//   The beam-search snapshot compares generation at merge time; a mismatch
+//   triggers `arena.clear()` which discards all entries and the next query
+//   repopulates from disk.  This avoids stale cached edges entirely without
+//   needing per-slot tombstoning.
 //
 // **Memory layout at 10k nodes, M_max0=32:**
 //   node_idx_map:   10k × (8+4) bytes ≈ 120 KB (HashMap load factor ~0.75)
@@ -649,8 +647,6 @@ struct L0Arena {
     arena_data: Vec<i64>,
     /// prefix-sum offsets; len = num_slots + 1 sentinel
     arena_offsets: Vec<u32>,
-    /// number of physical slots whose neighbour list was superseded (tombstoned)
-    tombstone_count: u32,
 }
 
 impl L0Arena {
@@ -659,7 +655,6 @@ impl L0Arena {
             node_idx_map: HashMap::new(),
             arena_data: Vec::new(),
             arena_offsets: vec![0u32], // sentinel: offsets[0] = 0
-            tombstone_count: 0,
         }
     }
 
@@ -704,70 +699,12 @@ impl L0Arena {
         true
     }
 
-    /// Update an existing node's neighbour list (re-wire on reciprocal insert).
-    /// Tombstones the old slot, appends the new list, updates the index.
-    /// If the key is not present, inserts as new.
-    fn update(&mut self, key: i64, nbrs: &[RowId]) {
-        if let Some(&k) = self.node_idx_map.get(&key) {
-            // Tombstone: collapse the old range to empty.
-            let cur_end = self.arena_offsets[k as usize + 1];
-            self.arena_offsets[k as usize] = cur_end;
-            self.tombstone_count += 1;
-            // Remove from map so append() inserts a new slot.
-            self.node_idx_map.remove(&key);
-        }
-        self.append(key, nbrs);
-
-        // Compact if fragmentation exceeds 50% of physical slots.
-        let n = self.num_slots() as u32;
-        if n > 0 && self.tombstone_count > n / 2 {
-            self.compact();
-        }
-    }
-
-    /// Rebuild the arena keeping only live (non-empty-range) entries.
-    fn compact(&mut self) {
-        let num = self.num_slots();
-        let mut new_map: HashMap<i64, u32> = HashMap::with_capacity(self.node_idx_map.len());
-        let mut new_data: Vec<i64> = Vec::with_capacity(self.arena_data.len());
-        let mut new_offsets: Vec<u32> = vec![0u32];
-
-        // Build a reverse map slot_k → key so we can iterate in slot order.
-        let mut slot_to_key: Vec<Option<i64>> = vec![None; num];
-        for (&key, &k) in &self.node_idx_map {
-            if (k as usize) < num {
-                slot_to_key[k as usize] = Some(key);
-            }
-        }
-
-        for (k, opt_key) in slot_to_key.iter().enumerate() {
-            let start = self.arena_offsets[k] as usize;
-            let end = self.arena_offsets[k + 1] as usize;
-            if start >= end {
-                // Tombstoned slot — skip.
-                continue;
-            }
-            if let Some(key) = opt_key {
-                let new_k = (new_offsets.len() - 1) as u32;
-                new_map.insert(*key, new_k);
-                new_data.extend_from_slice(&self.arena_data[start..end]);
-                new_offsets.push(new_data.len() as u32);
-            }
-        }
-
-        self.node_idx_map = new_map;
-        self.arena_data = new_data;
-        self.arena_offsets = new_offsets;
-        self.tombstone_count = 0;
-    }
-
     /// Clear all data (used on generation change).
     fn clear(&mut self) {
         self.node_idx_map.clear();
         self.arena_data.clear();
         self.arena_offsets.clear();
         self.arena_offsets.push(0); // sentinel
-        self.tombstone_count = 0;
     }
 }
 
@@ -831,16 +768,6 @@ impl HnswL0Cache {
             return; // over cap — disk fallback on the next miss
         }
         self.arena.append(key, &nbrs);
-    }
-
-    /// Update (re-wire) an existing node's L0 neighbour list in the arena.
-    /// If the key is not present, inserts as new.  Obeys the byte cap.
-    pub fn update_neighbours(&mut self, key: i64, nbrs: Vec<RowId>) {
-        let entry_bytes = nbrs.len() * std::mem::size_of::<i64>();
-        if self.arena.payload_bytes() + entry_bytes > self.max_bytes {
-            return; // over cap
-        }
-        self.arena.update(key, &nbrs);
     }
 
     /// Zero-copy iteration over the cached L0 neighbours for `key`.
@@ -2332,6 +2259,106 @@ mod tests {
             page_id: pg,
             slot: sl,
         }
+    }
+
+    // ── L0Arena unit tests (item 93) ─────────────────────────────────────────
+
+    /// encode_rid / decode_rid_i64 round-trip.
+    #[test]
+    fn l0_arena_encode_decode_roundtrip() {
+        for (pg, sl) in [(0u32, 0u16), (1, 3), (65535, 65535), (100, 7)] {
+            let r = RowId {
+                page_id: pg,
+                slot: sl,
+            };
+            let encoded = encode_rid(r);
+            let decoded = decode_rid_i64(encoded);
+            assert_eq!(decoded.page_id, pg, "page_id mismatch for ({pg},{sl})");
+            assert_eq!(decoded.slot, sl, "slot mismatch for ({pg},{sl})");
+        }
+    }
+
+    /// L0Arena: append + get_slice returns the correct RowId list.
+    #[test]
+    fn l0_arena_append_and_lookup() {
+        let mut arena = L0Arena::new();
+        let key1: i64 = 7 * 65536 + 3;
+        let nbrs1 = vec![rid(1, 0), rid(2, 1), rid(3, 2)];
+        assert!(arena.append(key1, &nbrs1));
+        // Duplicate insert is a no-op.
+        assert!(!arena.append(key1, &nbrs1));
+
+        let key2: i64 = 8 * 65536 + 0;
+        let nbrs2 = vec![rid(10, 5)];
+        assert!(arena.append(key2, &nbrs2));
+
+        let slice1 = arena.get_slice(key1).unwrap();
+        let decoded1: Vec<RowId> = slice1.iter().map(|&v| decode_rid_i64(v)).collect();
+        assert_eq!(decoded1, nbrs1);
+
+        let slice2 = arena.get_slice(key2).unwrap();
+        let decoded2: Vec<RowId> = slice2.iter().map(|&v| decode_rid_i64(v)).collect();
+        assert_eq!(decoded2, nbrs2);
+
+        assert!(arena.get_slice(999).is_none());
+        assert_eq!(arena.num_slots(), 2);
+    }
+
+    /// L0Arena: clear resets the arena and previously-cached entries are gone.
+    #[test]
+    fn l0_arena_clear() {
+        let mut arena = L0Arena::new();
+        arena.append(0, &[rid(1, 0), rid(2, 0)]);
+        arena.append(1, &[rid(3, 0)]);
+        assert_eq!(arena.num_slots(), 2);
+        assert_eq!(arena.arena_data.len(), 3);
+
+        arena.clear();
+
+        // After clear: empty, sentinel offset restored.
+        assert_eq!(arena.num_slots(), 0);
+        assert!(arena.arena_data.is_empty());
+        assert_eq!(arena.arena_offsets, vec![0u32]);
+        assert!(arena.get_slice(0).is_none());
+
+        // Can re-populate after clear.
+        arena.append(42, &[rid(5, 0)]);
+        let s = arena.get_slice(42).unwrap();
+        assert_eq!(decode_rid_i64(s[0]), rid(5, 0));
+    }
+
+    /// L0Arena: append is idempotent — duplicate keys return false and are not inserted.
+    #[test]
+    fn l0_arena_duplicate_append() {
+        let mut arena = L0Arena::new();
+        let key: i64 = 5 * 65536 + 1;
+        let v1 = vec![rid(1, 0), rid(2, 0)];
+        let v2 = vec![rid(3, 0), rid(4, 0), rid(5, 0)];
+        assert!(arena.append(key, &v1));
+        // Second append with same key is a no-op; v1 is preserved.
+        assert!(!arena.append(key, &v2));
+
+        let slice = arena.get_slice(key).unwrap();
+        let decoded: Vec<RowId> = slice.iter().map(|&v| decode_rid_i64(v)).collect();
+        assert_eq!(decoded, v1, "second append must not overwrite the first");
+        assert_eq!(arena.num_slots(), 1);
+    }
+
+    /// HnswL0Cache::for_l0_nbrs delivers the correct RowIds.
+    #[test]
+    fn l0_cache_for_l0_nbrs() {
+        let mut cache = HnswL0Cache::new();
+        let nbrs = vec![rid(1, 0), rid(2, 1), rid(3, 2)];
+        cache.insert_neighbours(100i64, nbrs.clone());
+
+        let mut got: Vec<RowId> = Vec::new();
+        let hit = cache.for_l0_nbrs(100i64, |r| got.push(r));
+        assert!(hit, "expected arena hit");
+        assert_eq!(got, nbrs);
+
+        // Miss returns false.
+        let miss = cache.for_l0_nbrs(999i64, |_| {});
+        assert!(!miss, "expected arena miss");
     }
 
     /// Level assignment should stay in [0, HNSW_MAX_LEVEL].
