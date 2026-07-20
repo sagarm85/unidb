@@ -135,6 +135,18 @@ impl TryFrom<&Literal> for OrderedValue {
     }
 }
 
+impl OrderedValue {
+    /// Item 102-A: convert an `OrderedValue` back to a `Literal` for the
+    /// index-only scan path (B-tree leaf value → output row, no heap fetch).
+    pub fn into_literal(self) -> Literal {
+        match self {
+            OrderedValue::Int(n) => Literal::Int(n),
+            OrderedValue::Text(s) => Literal::Text(s),
+            OrderedValue::Bool(b) => Literal::Bool(b),
+        }
+    }
+}
+
 /// The four range comparators a B+tree can serve via a leaf walk. `Eq` is a
 /// point lookup; `Ne` has no compact range representation and is intentionally
 /// not representable here — see [`DiskBTree::search`].
@@ -488,6 +500,108 @@ impl DiskBTree {
             CmpOp::Ge => Ok(Some(self.search_range(RangeOp::Ge, value, pool)?)),
             CmpOp::Ne => Ok(None),
         }
+    }
+
+    /// Item 102-A: like [`search`] but returns `(key, row_id)` pairs instead
+    /// of bare `RowId`s. Used by the index-only scan path in the executor:
+    /// the key value from the leaf is used directly as the output (skipping
+    /// `deform_row`), while `row_id` is still used for an MVCC visibility
+    /// check against the heap (the B-tree may contain stale dead-tuple entries
+    /// not yet vacuumed). `Ne` — which has no compact range representation —
+    /// returns an empty Vec rather than `None`.
+    pub fn search_with_keys(
+        &self,
+        op: CmpOp,
+        value: &OrderedValue,
+        pool: &BufferPool,
+    ) -> Result<Vec<(OrderedValue, RowId)>> {
+        match op {
+            CmpOp::Eq => self.search_eq_with_keys(value, pool),
+            CmpOp::Lt => self.search_range_with_keys(RangeOp::Lt, value, pool),
+            CmpOp::Le => self.search_range_with_keys(RangeOp::Le, value, pool),
+            CmpOp::Gt => self.search_range_with_keys(RangeOp::Gt, value, pool),
+            CmpOp::Ge => self.search_range_with_keys(RangeOp::Ge, value, pool),
+            CmpOp::Ne => Ok(Vec::new()),
+        }
+    }
+
+    /// Exact-match: returns `(key, row_id)` pairs for all leaf entries where
+    /// `key == value`. Mirrors [`search_eq`] but carries the key forward.
+    fn search_eq_with_keys(
+        &self,
+        value: &OrderedValue,
+        pool: &BufferPool,
+    ) -> Result<Vec<(OrderedValue, RowId)>> {
+        let mut pid = self.find_leaf(value, pool)?;
+        let mut out = Vec::new();
+        loop {
+            let page = pool.fetch_page(pid)?;
+            let node = Node::deserialize(&page)?;
+            pool.unpin(pid);
+            let Node::Leaf { entries, next } = node else {
+                break;
+            };
+            let mut past = false;
+            for (k, rid) in entries {
+                match k.cmp(value) {
+                    std::cmp::Ordering::Less => {}
+                    std::cmp::Ordering::Equal => out.push((k, rid)),
+                    std::cmp::Ordering::Greater => {
+                        past = true;
+                        break;
+                    }
+                }
+            }
+            if past || next == INVALID_PAGE_ID {
+                break;
+            }
+            pid = next;
+        }
+        Ok(out)
+    }
+
+    /// Range-match: returns `(key, row_id)` pairs for all leaf entries
+    /// admitted by `op`. Mirrors [`search_range`] but carries the key forward.
+    fn search_range_with_keys(
+        &self,
+        op: RangeOp,
+        value: &OrderedValue,
+        pool: &BufferPool,
+    ) -> Result<Vec<(OrderedValue, RowId)>> {
+        let start = match op {
+            RangeOp::Lt | RangeOp::Le => self.leftmost_leaf(pool)?,
+            RangeOp::Gt | RangeOp::Ge => self.find_leaf(value, pool)?,
+        };
+        let mut pid = start;
+        let mut out = Vec::new();
+        loop {
+            let page = pool.fetch_page(pid)?;
+            let node = Node::deserialize(&page)?;
+            pool.unpin(pid);
+            let Node::Leaf { entries, next } = node else {
+                break;
+            };
+            let mut stop = false;
+            for (k, rid) in entries {
+                let admit = match op {
+                    RangeOp::Lt => k < *value,
+                    RangeOp::Le => k <= *value,
+                    RangeOp::Gt => k > *value,
+                    RangeOp::Ge => k >= *value,
+                };
+                if admit {
+                    out.push((k, rid));
+                } else if matches!(op, RangeOp::Lt | RangeOp::Le) && k >= *value {
+                    stop = true;
+                    break;
+                }
+            }
+            if stop || next == INVALID_PAGE_ID {
+                break;
+            }
+            pid = next;
+        }
+        Ok(out)
     }
 
     /// Descend to the **leftmost** leaf that could contain `key`, following

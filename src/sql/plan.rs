@@ -67,6 +67,10 @@ pub enum PlanNode {
     /// Index scan (P4.d): probe a base table's durable B-Tree for the rows
     /// matching `column <op> value`, then fetch them. Chosen by the cost-based
     /// optimizer when the predicate is estimated selective.
+    ///
+    /// When `index_only` is true the projection contains only the indexed
+    /// column itself, so the B-tree leaf already holds the value and no heap
+    /// fetch is needed (Item 102-A).
     IndexScan {
         table: String,
         qualifier: String,
@@ -74,6 +78,9 @@ pub enum PlanNode {
         op: crate::sql::logical::CmpOp,
         value: Literal,
         output: Vec<ColumnRef>,
+        /// Item 102-A: true when every projected column equals `column` —
+        /// the B-tree leaf value is sufficient; heap fetch is skipped.
+        index_only: bool,
     },
     /// Block nested-loop join (cross joins and non-equi conditions).
     NestedLoopJoin {

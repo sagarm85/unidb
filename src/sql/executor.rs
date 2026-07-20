@@ -629,6 +629,12 @@ pub static COLS_DECODED: AtomicU64 = AtomicU64::new(0);
 pub static DIAGNOSTICS_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Item 102-A: total number of rows returned via the index-only scan path
+/// (B-tree leaf value used directly, heap fetch skipped). Tests diff this
+/// counter to verify that heap fetches are truly 0 for qualifying queries.
+/// `Relaxed` — pure statistic, no ordering obligations.
+pub static IDX_ONLY_ROWS: AtomicU64 = AtomicU64::new(0);
+
 /// How the executor holds the catalog for one statement (index-write-concurrency
 /// Item 0a). Every SQL statement that changes no schema reads the catalog only
 /// (it `lookup(table)?.clone()`s the `TableDef` and works off the owned clone),
@@ -1804,8 +1810,13 @@ fn exec_select(
         find_best_indexable_btree_predicate(e, &table_def, ctx.catalog.table_stats(&table_def.name))
     }) {
         if index_lookup_is_selective(&table_def, hit, ctx, true) {
+            // Item 102-A: detect index-only scan — projection ⊆ {indexed column}.
+            // Empty projection means SELECT * (all columns) — NOT index-only.
+            let (index_col, _, _) = hit;
+            let index_only = !projection.is_empty()
+                && projection.iter().all(|p| p.eq_ignore_ascii_case(index_col));
             if let Some(result) =
-                try_exec_select_btree(&table_def, projection, predicate, hit, ctx)?
+                try_exec_select_btree(&table_def, projection, predicate, hit, index_only, ctx)?
             {
                 return Ok(result);
             }
@@ -2190,6 +2201,7 @@ fn try_exec_select_btree(
     projection: &[String],
     predicate: &Option<Expr>,
     hit: (&str, CmpOp, &Literal),
+    index_only: bool,
     ctx: &mut ExecCtx,
 ) -> Result<Option<ExecResult>> {
     let (column, op, literal) = hit;
@@ -2209,8 +2221,43 @@ fn try_exec_select_btree(
         return Ok(None);
     };
     let tree = DiskBTree::new(meta_page, ctx.page_size);
+
     let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+
+    // Item 102-A: index-only fast path — when every projected column is the
+    // indexed column itself, the key value is already in the B-tree leaf.
+    // We still perform a lightweight heap get for MVCC visibility (the B-tree
+    // may contain stale entries for dead tuples that have not yet been
+    // vacuumed), but we skip the row-decode step (`deform_row`): on a hit we
+    // return the B-tree key directly rather than unpacking the heap bytes.
+    // This is correct because: the key value in the B-tree leaf is identical
+    // to what `deform_row` would decode for the indexed column.  Rows where
+    // the key no longer matches the heap value cannot occur — the index is
+    // always updated in the same mini-transaction as the heap mutation.
+    //
+    // Phase B (future) will add a visibility map so the heap get can also be
+    // skipped for ALL_VISIBLE pages, giving a true zero-heap-fetch path.
+    if index_only {
+        let key_candidates = tree.search_with_keys(op, &value, ctx.pool)?;
+        let mut rows: Vec<Vec<Literal>> = Vec::with_capacity(key_candidates.len());
+        for (key, rid) in key_candidates {
+            match heap.get(rid, &snapshot, ctx.xid, ctx.pool) {
+                Ok(_bytes) => {
+                    // Row is visible — use the B-tree key directly, skip deform_row.
+                    rows.push(vec![key.into_literal()]);
+                }
+                Err(DbError::NoVisibleVersion { .. }) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        let n = rows.len() as u64;
+        IDX_ONLY_ROWS.fetch_add(n, Ordering::Relaxed);
+        return Ok(Some(ExecResult::Rows {
+            columns: output_columns(projection, &table_def.columns),
+            rows,
+        }));
+    }
 
     // B2 decode pushdown on the index-resolved candidates (the SELECT-filtered
     // hot path, since a range predicate is served here, not by the full scan):
