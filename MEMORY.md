@@ -12,6 +12,22 @@
 
 ## Current status
 
+- **Item 93 — HNSW L0 arena layout — SHIPPED 2026-07-20, branch `perf/item-93-hnsw-arena`, PR #175 open.**
+  Replaced `HashMap<i64, Vec<RowId>>` in `HnswL0Cache` with flat `L0Arena` (two `Vec`s:
+  `arena_data: Vec<i64>` + `arena_offsets: Vec<u32>`). Hot-path `for_l0_nbrs` iterates
+  the arena slice in-place via callback — zero heap allocation per hop. Stack buffer
+  `[RowId; HNSW_M_MAX0]` (32 slots) collects neighbours with zero `Vec<RowId>` alloc.
+  Arena built by `prefetch_caches` on index creation; generation-mismatch on HNSW INSERT
+  triggers `arena.clear()` + repopulate (no per-slot tombstoning needed).
+  Fix (2026-07-20): removed broken tombstone/compact design from `L0Arena` — the prefix-sum
+  offset array cannot support per-slot zeroing without corrupting adjacent slot boundaries
+  (`offsets[k] = offsets[k+1]` widens slot k-1 range, causing compact to copy stale data).
+  `update()`, `compact()`, `tombstone_count`, and `update_neighbours` all removed (dead code —
+  no production caller). Tests replaced: `l0_arena_update_tombstone` → `l0_arena_duplicate_append`,
+  `l0_arena_compact` → `l0_arena_clear`. 452 lib + perf_item93 gate PASS. Clippy clean.
+  Measured (debug): recall@10=1.000 (≥0.90), disk_fetches=0, L0 hits=3000. Docker bench pending
+  (target ≤600 µs warm at 10k×dim128 in release on Linux). Commits: 7ec5609, 431329f.
+
 - **Item 24 Z1+Z3+Z5 — SQL authz DDL + JWT enforcement + catalog relations — SHIPPED 2026-07-19, branch `feat/item-24-authz-z1z3z5`.**
   Z1: `CREATE/DROP ROLE`, `GRANT/REVOKE`, `CREATE/DROP POLICY` SQL DDL. Policies route INSERT→`insert_policy`
   (per-row enforcement in exec_insert); SELECT/UPDATE/DELETE→`rls_policy` (AND-rewrite in apply_rls). Catalog-persisted.
