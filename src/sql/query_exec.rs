@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 
 use crate::btree_index::{DiskBTree, OrderedValue};
-use crate::catalog::{ColumnType, IndexKind};
+use crate::catalog::{ColumnType, IndexKind, ROW_COUNT_UNKNOWN};
 use crate::error::{DbError, Result};
 use crate::heap::Heap;
 use crate::mvcc::Snapshot;
@@ -540,8 +540,53 @@ impl Runner<'_, '_> {
                             // tables — row_count is the physical count; RLS may hide a
                             // subset of rows (item-24 Z2). Fall through to count_visible
                             // which respects the visibility chain.
-                            if table_def.rls_policy.is_none() {
+                            //
+                            // Item 104: also skip when row_count == ROW_COUNT_UNKNOWN —
+                            // after a crash, the persisted catalog may have a stale count
+                            // (catalog is only checkpointed, not fsynced on every commit).
+                            // count_visible performs an exact heap scan; the result is
+                            // cached back into row_count so subsequent COUNTs are O(1)
+                            // again (until the next crash).
+                            if table_def.rls_policy.is_none()
+                                && table_def.row_count != ROW_COUNT_UNKNOWN
+                            {
                                 let row = vec![Literal::Int(table_def.row_count); aggs.len()];
+                                return Ok(Batch {
+                                    schema: output.clone(),
+                                    rows: vec![row],
+                                });
+                            }
+                            // Item 104 calibration path: row_count is unknown after
+                            // crash recovery — scan the heap to get the exact count and
+                            // cache it back into the in-memory catalog so subsequent
+                            // COUNTs are O(1) (until the next crash or catalog reload).
+                            if table_def.rls_policy.is_none()
+                                && table_def.row_count == ROW_COUNT_UNKNOWN
+                            {
+                                tracing::debug!(
+                                    table = %table,
+                                    "item 104: row_count unknown after recovery — \
+                                     falling back to heap scan for COUNT(*)"
+                                );
+                                let heap = Heap::open(
+                                    self.ctx.page_size,
+                                    table_def.fsm_meta,
+                                    table_def.pages.clone(),
+                                );
+                                let exact = heap.count_visible(
+                                    &self.snapshot,
+                                    self.ctx.xid,
+                                    self.ctx.pool,
+                                )? as i64;
+                                // Cache the exact count back so future COUNTs are O(1).
+                                if let Ok(cat) = self.ctx.catalog.exclusive() {
+                                    if let Some(t) = cat.tables_mut().get_mut(table.as_str()) {
+                                        if t.row_count == ROW_COUNT_UNKNOWN {
+                                            t.row_count = exact;
+                                        }
+                                    }
+                                }
+                                let row = vec![Literal::Int(exact); aggs.len()];
                                 return Ok(Batch {
                                     schema: output.clone(),
                                     rows: vec![row],

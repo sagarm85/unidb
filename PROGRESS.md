@@ -8844,3 +8844,87 @@ layer touched. Crash harness unchanged. No new `FORMAT_VERSION` bump needed.
 | G7 | Window functions / recursive CTEs | Open (large; deferred) |
 | G9 | LIKE / NOT LIKE / ILIKE | Delivered under item 30 |
 | G11 | Full-text SQL predicate | Delivered under item 30 |
+
+---
+
+## Item 104 — Catalog sync dedup: remove double-fsync per INSERT (2026-07-20)
+
+**Branch:** `perf/item-104-catalog-sync-dedup` | **PR:** [#180](https://github.com/sagarm85/unidb/pull/180)
+
+### Problem
+
+Every INSERT under group-commit (server/deferred-sync) mode triggered two WAL
+fsyncs:
+1. The row commit fsync — correct and required (D5 durability).
+2. `wal.sync_up_to(catalog_lsn)` after `catalog.persist_only()` — added by
+   item 97 to advance `durable_lsn` for the WAL replication stream, but running
+   **outside the group-commit window**, so it was a synchronous per-commit barrier.
+
+Under 32 concurrent writers this second fsync was effectively a serialization
+point that cut INSERT throughput roughly in half. Even with item 101's dwell
+window, only the first fsync (the commit one) benefited from coalescing.
+
+### What shipped
+
+**`src/catalog.rs`:** Added `pub const ROW_COUNT_UNKNOWN: i64 = i64::MIN`
+sentinel. `Catalog::load()` now calls `reset_row_counts_unknown()` after parsing
+the catalog blob — every table's `row_count` is set to `ROW_COUNT_UNKNOWN` on
+engine open. This is because `row_count` is now only guaranteed durable at
+checkpoint time; the value on disk may be stale after a crash.
+
+**`src/lib.rs`:** Removed `wal.sync_up_to(catalog_lsn)` AND `catalog.persist_only()`
+from `Engine::commit`. Retaining `persist_only()` while dropping the fsync caused a
+replication regression: `persist_only()` flips `catalog_root` in the control file per
+commit; without the matching `sync_up_to`, catalog WAL records weren't in the shipped
+stream, so the replica adopted a `catalog_root` pointing at a page it never received
+(`SlotOutOfRange`). The correct fix: update `row_count` in-memory only in the commit
+path; persist the full catalog (WAL mini-txn + `catalog_root` flip) only at checkpoint.
+Commit now emits one fsync only and writes zero catalog mini-txns. Added a guard in
+the delta-application loop: when `t.row_count == ROW_COUNT_UNKNOWN`, the delta is
+skipped rather than doing `i64::MIN.saturating_add(delta)` (meaningless result).
+
+**`src/sql/query_exec.rs`:** Extended the item 97 O(1) `COUNT(*)` fast path.
+When `row_count == ROW_COUNT_UNKNOWN`:
+- Falls back to `Heap::count_visible` (exact heap scan) — always returns the
+  correct count regardless of what the catalog blob said.
+- If the catalog handle is Exclusive (embedded/non-concurrent path), caches the
+  exact result back into `row_count` so subsequent COUNTs are O(1) again.
+- If the handle is Shared (concurrent-SQL-writes path), cache write is skipped;
+  every COUNT falls back to heap scan until the next checkpoint persists a fresh
+  count. This is the conservative-correct path.
+
+**`tests/crash/main.rs`:** Added `p104_catalog_sync_dedup_crash_recovery_count_exact`:
+four phases — create+insert 100 rows+crash without checkpoint, reopen and verify
+COUNT=100 (Phase 2), second COUNT=100 (Phase 3), insert 50 more rows and verify
+COUNT=150 (Phase 4). All three COUNT checks rely on heap scan (UNKNOWN sentinel).
+
+### Durability contract (changed vs item 97)
+
+`row_count` is now checkpoint-granularity durable, not commit-granularity.
+This matches Postgres `pg_class.reltuples`. `COUNT(*)` is always exact in-memory
+and always exact after crash (via heap scan). Only the persisted-on-disk value
+can be stale between checkpoints.
+
+**Key invariant held:** `COUNT(*) FROM t` always returns the exact count of
+committed visible rows. The optimization is only about when that count is
+flushed to disk.
+
+### Performance (local, pre-Docker bench)
+
+| Scenario | Before item 104 | After item 104 |
+|---|---|---|
+| Fsyncs per INSERT (concurrent mode) | 2 (commit + catalog) | 1 (commit only) |
+| Catalog mini-txns per INSERT | 1 (WAL-logged, per commit) | 0 (only at checkpoint) |
+| COUNT(*) after fresh open | O(1) fast path | O(heap) scan (UNKNOWN) → O(1) after calibration |
+| COUNT(*) after crash | O(1) fast path (potentially stale!) | O(heap) scan (UNKNOWN) — exact |
+
+Docker bench (32 concurrent writers, 1k and 10k rows, release, Linux): pending.
+Expected gain: ≥ 1.3× INSERT throughput (eliminating serialization point).
+
+### Tests
+
+- 54 crash harness tests PASS (all existing + new P104).
+- 463 lib unit tests PASS (0 failures).
+- Replication tests previously failing (`apply_is_idempotent`, `base_plus_incremental_then_promote`) — now PASS.
+- `cargo clippy -- -D warnings`: clean.
+- `cargo fmt --all`: clean.

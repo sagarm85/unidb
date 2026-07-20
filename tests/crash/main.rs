@@ -3876,3 +3876,139 @@ fn p98b_batch_insert_incomplete_user_txn_leaves_no_rows() {
         other => panic!("P98b: expected Rows, got {other:?}"),
     }
 }
+
+// ── P104: catalog sync dedup — row_count recalibrated via heap scan after crash
+//
+// Item 104 (D7 injection point e): after each DML commit, `catalog.persist_only`
+// writes a catalog mini-txn but no longer calls `sync_up_to` on it. The catalog
+// row_count is therefore only guaranteed durable at checkpoint time. After a crash
+// (no checkpoint), the recovered catalog's row_count is set to ROW_COUNT_UNKNOWN
+// and `COUNT(*)` must fall back to an exact heap scan.
+//
+// This test verifies the two invariants:
+//   AC2: `COUNT(*) FROM t` after crash recovery returns the exact committed count.
+//   AC3: The first `COUNT(*)` after recovery triggers a heap scan (not a stale
+//        cached value) when row_count was unknown.
+#[test]
+fn p104_catalog_sync_dedup_crash_recovery_count_exact() {
+    use unidb::sql::logical::Literal;
+    use unidb::SqlResult;
+
+    let n = 100i64;
+    let dir = tempdir().unwrap();
+
+    // Phase 1: insert N rows and commit (WAL durable), but crash without a
+    // checkpoint — the catalog row_count persisted on disk comes from the
+    // catalog page written by `persist_only`, which was not fsynced (item 104
+    // removes the `sync_up_to` after it). After crash the row_count on disk
+    // may be stale (0 from CREATE TABLE, or whatever was last checkpointed).
+    {
+        let engine = open(dir.path());
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, "CREATE TABLE t104 (id INT)")
+            .unwrap();
+        engine.commit(xid).unwrap();
+
+        let vals: String = (0..n)
+            .map(|i| format!("({i})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let xid = engine.begin().unwrap();
+        engine
+            .execute_sql(xid, &format!("INSERT INTO t104 (id) VALUES {vals}"))
+            .unwrap();
+        engine.commit(xid).unwrap();
+        // Heap rows are WAL-durable (commit fsync was called). Do NOT checkpoint.
+        // "Crash": the catalog mini-txn written by persist_only may not be durable.
+        drop(engine);
+    }
+
+    // Phase 2: reopen. Catalog::load resets row_count to ROW_COUNT_UNKNOWN.
+    // COUNT(*) must fall back to count_visible, which scans the heap and returns
+    // the exact count of all committed visible rows.
+    let engine = open(dir.path());
+    let xid = engine.begin().unwrap();
+    let result = engine
+        .execute_sql(xid, "SELECT COUNT(*) FROM t104")
+        .unwrap();
+    engine.commit(xid).unwrap();
+
+    match &result[0] {
+        SqlResult::Rows { rows, .. } => {
+            let count = match &rows[0][0] {
+                Literal::Int(c) => *c,
+                other => panic!("P104: expected Int count, got {other:?}"),
+            };
+            assert_eq!(
+                count, n,
+                "P104: COUNT(*) after crash must return exact committed count ({n}), got {count}"
+            );
+        }
+        other => panic!("P104: expected Rows, got {other:?}"),
+    }
+
+    // Phase 3: a second COUNT(*) in the same session must also return N.
+    // With concurrent_sql_writes on (the default), SELECT uses a Shared catalog
+    // handle and the calibration cache write is skipped; both COUNTs fall back
+    // to count_visible.  Either path must return the same exact result.
+    let xid = engine.begin().unwrap();
+    let result2 = engine
+        .execute_sql(xid, "SELECT COUNT(*) FROM t104")
+        .unwrap();
+    engine.commit(xid).unwrap();
+
+    match &result2[0] {
+        SqlResult::Rows { rows, .. } => {
+            let count2 = match &rows[0][0] {
+                Literal::Int(c) => *c,
+                other => panic!("P104 phase3: expected Int count, got {other:?}"),
+            };
+            assert_eq!(
+                count2, n,
+                "P104: second COUNT(*) (after cache) must also return {n}, got {count2}"
+            );
+        }
+        other => panic!("P104 phase3: expected Rows, got {other:?}"),
+    }
+
+    // Phase 4: insert more rows and verify COUNT is still exact.
+    // When row_count remains UNKNOWN (concurrent mode), every COUNT falls back
+    // to count_visible, so the result is always exact regardless of whether
+    // calibration was cached.  When row_count was cached (non-concurrent mode),
+    // the UNKNOWN guard in the commit path kept it UNKNOWN until the cache was
+    // set; after caching, subsequent DML commits update the exact in-memory
+    // count.  Either way the COUNT result is exact.
+    let extra = 50i64;
+    let extra_vals: String = (n..n + extra)
+        .map(|i| format!("({i})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let xid = engine.begin().unwrap();
+    engine
+        .execute_sql(xid, &format!("INSERT INTO t104 (id) VALUES {extra_vals}"))
+        .unwrap();
+    engine.commit(xid).unwrap();
+
+    let xid = engine.begin().unwrap();
+    let result3 = engine
+        .execute_sql(xid, "SELECT COUNT(*) FROM t104")
+        .unwrap();
+    engine.commit(xid).unwrap();
+
+    match &result3[0] {
+        SqlResult::Rows { rows, .. } => {
+            let count3 = match &rows[0][0] {
+                Literal::Int(c) => *c,
+                other => panic!("P104 phase4: expected Int count, got {other:?}"),
+            };
+            assert_eq!(
+                count3,
+                n + extra,
+                "P104: COUNT(*) after post-recovery INSERT must be {}, got {count3}",
+                n + extra
+            );
+        }
+        other => panic!("P104 phase4: expected Rows, got {other:?}"),
+    }
+}
