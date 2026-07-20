@@ -76,6 +76,8 @@ pub fn label(node: &PlanNode) -> String {
             let quantifier = if *all { "ALL" } else { "DISTINCT" };
             format!("SetOp {op_str} {quantifier}")
         }
+        // G6 (item 19): derived table label.
+        PlanNode::DerivedTable { alias, .. } => format!("DerivedTable AS {alias}"),
     }
 }
 
@@ -96,6 +98,8 @@ fn children(node: &PlanNode) -> Vec<&PlanNode> {
         | PlanNode::Sort { input, .. }
         | PlanNode::Limit { input, .. } => vec![input],
         PlanNode::SetOp { left, right, .. } => vec![left, right],
+        // G6 (item 19): derived table — the subquery is the single child.
+        PlanNode::DerivedTable { subquery, .. } => vec![subquery],
     }
 }
 
@@ -165,6 +169,9 @@ pub fn estimate_rows(node: &PlanNode, catalog: &Catalog) -> f64 {
         PlanNode::SetOp { left, right, .. } => {
             estimate_rows(left, catalog) + estimate_rows(right, catalog)
         }
+        // G6 (item 19): derived table — the outer query sees as many rows as the
+        // inner subquery produces.
+        PlanNode::DerivedTable { subquery, .. } => estimate_rows(subquery, catalog),
     }
 }
 

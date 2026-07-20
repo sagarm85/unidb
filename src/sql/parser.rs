@@ -745,6 +745,18 @@ fn convert_query(q: ast::Query) -> Result<LogicalPlan> {
     // G8 (item 19): SELECT without FROM — route to the Phase-4 path which can
     // synthesize a single-row `FromNode::Dual` source. No storage access needed.
     let no_from = select.from.is_empty();
+    // G6 (item 19): a derived table (inline subquery in FROM) must take the
+    // Phase-4 path — the simple `LogicalPlan::Select` path only handles base
+    // table names and cannot plan a subquery as a FROM source.
+    let from_has_derived = select
+        .from
+        .iter()
+        .any(|twj| matches!(twj.relation, TableFactor::Derived { .. }))
+        || select.from.iter().any(|twj| {
+            twj.joins
+                .iter()
+                .any(|j| matches!(j.relation, TableFactor::Derived { .. }))
+        });
     let needs_query = no_from
         || has_join
         || group_by_present
@@ -756,7 +768,8 @@ fn convert_query(q: ast::Query) -> Result<LogicalPlan> {
         || projection_has_agg
         || has_subquery
         || from_is_introspection
-        || projection_has_case;
+        || projection_has_case
+        || from_has_derived;
     if needs_query {
         return convert_query_spec(select, with, order_by, limit_clause);
     }
@@ -1117,9 +1130,9 @@ fn convert_from(items: &[TableWithJoins]) -> Result<FromNode> {
 }
 
 fn convert_table_with_joins(twj: &TableWithJoins) -> Result<FromNode> {
-    let mut node = FromNode::Table(table_ref_from_factor(&twj.relation)?);
+    let mut node = from_node_from_factor(&twj.relation)?;
     for join in &twj.joins {
-        let right = FromNode::Table(table_ref_from_factor(&join.relation)?);
+        let right = from_node_from_factor(&join.relation)?;
         let (join_type, on, using) = convert_join_operator(&join.join_operator)?;
         node = FromNode::Join {
             left: Box::new(node),
@@ -1132,14 +1145,36 @@ fn convert_table_with_joins(twj: &TableWithJoins) -> Result<FromNode> {
     Ok(node)
 }
 
-fn table_ref_from_factor(rel: &TableFactor) -> Result<TableRef> {
+/// Convert a `sqlparser` `TableFactor` into a [`FromNode`]. Handles both a
+/// plain table reference (`TableFactor::Table`) and a derived table (inline
+/// subquery: `TableFactor::Derived`). The alias is required for derived tables —
+/// `sqlparser` validates this at parse time.
+fn from_node_from_factor(rel: &TableFactor) -> Result<FromNode> {
     match rel {
-        TableFactor::Table { name, alias, .. } => Ok(TableRef {
+        TableFactor::Table { name, alias, .. } => Ok(FromNode::Table(TableRef {
             table: name.to_string(),
             alias: alias.as_ref().map(|a| a.name.value.clone()),
-        }),
+        })),
+        // G6 (item 19): `(SELECT …) AS alias` — a derived table in FROM.
+        TableFactor::Derived {
+            subquery, alias, ..
+        } => {
+            let alias_name = alias
+                .as_ref()
+                .map(|a| a.name.value.clone())
+                .ok_or_else(|| {
+                    DbError::SqlUnsupported(
+                        "derived table (subquery in FROM) requires an alias, e.g. `(SELECT …) AS sub`".into(),
+                    )
+                })?;
+            let spec = query_to_spec(*subquery.clone())?;
+            Ok(FromNode::Derived {
+                subquery: Box::new(spec),
+                alias: alias_name,
+            })
+        }
         other => Err(DbError::SqlUnsupported(format!(
-            "unsupported table reference in join: {other:?}"
+            "unsupported table reference in FROM/JOIN: {other:?}"
         ))),
     }
 }

@@ -113,6 +113,14 @@ pub enum FromNode {
     /// `SELECT 1`, `SELECT 'hello'`, `SELECT 1+1` etc. work. Has no columns
     /// in its schema; the projection expressions are pure literals / arithmetic.
     Dual,
+    /// G6 (item 19): derived table — `(SELECT …) AS alias` in the FROM clause.
+    /// The subquery is planned and executed first; its output rows are presented
+    /// as a virtual table named `alias` to the outer query. RLS is applied to
+    /// every base table inside the subquery, not bypassed by the nesting.
+    Derived {
+        subquery: Box<QuerySpec>,
+        alias: String,
+    },
 }
 
 /// A base-table reference with an optional alias. `alias` (or the table name
@@ -475,6 +483,10 @@ impl QuerySpec {
                 None => pol,
             });
         }
+        // G6 (item 19): also apply RLS inside any derived table subqueries in
+        // FROM — each derived table's inner tables are just as subject to RLS
+        // as base tables. Recurse into them now, before the plan is built.
+        apply_rls_into_derived(&mut self.from, policy_for);
     }
 
     /// Bind `$n` parameters across the whole spec (including CTEs, HAVING,
@@ -515,6 +527,7 @@ fn bind_from(node: &mut FromNode, params: &[Literal]) -> crate::error::Result<()
             }
             Ok(())
         }
+        FromNode::Derived { subquery, .. } => subquery.bind_params(params),
     }
 }
 
@@ -535,6 +548,28 @@ fn collect_table_policies(
         }
         // Dual has no base table, so no RLS policy applies.
         FromNode::Dual => {}
+        // G6 (item 19): derived table — RLS is applied inside the subquery,
+        // not at the outer level. The subquery will have its own
+        // `apply_rls_from` call when it is planned.
+        FromNode::Derived { .. } => {}
+    }
+}
+
+/// Walk the FROM tree and, for every `FromNode::Derived`, apply RLS to its
+/// inner subquery by calling `apply_rls_from` on it. This ensures that RLS
+/// is not bypassed by wrapping a query in a derived table.
+fn apply_rls_into_derived(node: &mut FromNode, policy_for: &dyn Fn(&str) -> Option<Expr>) {
+    match node {
+        FromNode::Table(_) | FromNode::Dual => {}
+        FromNode::Join { left, right, .. } => {
+            apply_rls_into_derived(left, policy_for);
+            apply_rls_into_derived(right, policy_for);
+        }
+        // G6 (item 19): recurse into the derived table's subquery so that its
+        // base tables' policies are AND'd into the inner WHERE clause.
+        FromNode::Derived { subquery, .. } => {
+            subquery.apply_rls_from(policy_for);
+        }
     }
 }
 

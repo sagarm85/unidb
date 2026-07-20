@@ -993,6 +993,11 @@ fn query_base_tables(spec: &QuerySpec) -> Vec<String> {
             }
             // G8 (item 19): Dual has no base tables.
             FromNode::Dual => {}
+            // G6 (item 19): derived table — recurse into the subquery to collect
+            // its base tables. The alias is not a real table in the heap.
+            FromNode::Derived { subquery, .. } => {
+                out.extend(query_base_tables(subquery));
+            }
         }
     }
     let cte_names: std::collections::HashSet<String> =

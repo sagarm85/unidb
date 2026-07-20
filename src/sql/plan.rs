@@ -178,6 +178,18 @@ pub enum PlanNode {
         right: Box<PlanNode>,
         output: Vec<ColumnRef>,
     },
+    /// G6 (item 19): `(SELECT …) AS alias` — derived table in FROM.
+    /// The inner subquery is planned as its own subtree; the outer query sees the
+    /// subquery's output columns as if they were columns of a base table named
+    /// `alias`. Column references of the form `alias.col` or just `col` both
+    /// resolve against the derived table's schema. The inner subquery is
+    /// materialized in-memory at execution time (simple but correct; streaming
+    /// is a future optimization).
+    DerivedTable {
+        subquery: Box<PlanNode>,
+        alias: String,
+        output: Vec<ColumnRef>,
+    },
 }
 
 /// One aggregate to compute (P4.b): function, argument expression (`None` for
@@ -212,7 +224,8 @@ impl PlanNode {
             | PlanNode::Distinct { output, .. }
             | PlanNode::Sort { output, .. }
             | PlanNode::Limit { output, .. }
-            | PlanNode::SetOp { output, .. } => output,
+            | PlanNode::SetOp { output, .. }
+            | PlanNode::DerivedTable { output, .. } => output,
             // G8: Dual has zero input columns; projection above it supplies them.
             PlanNode::Dual => &[],
         }
@@ -854,6 +867,27 @@ pub(crate) fn plan_from(node: &FromNode, catalog: &Catalog, ctes: &CteSchemas) -
         }
         // G8 (item 19): SELECT without FROM — single empty row, no columns.
         FromNode::Dual => Ok(PlanNode::Dual),
+        // G6 (item 19): derived table — `(SELECT …) AS alias`.
+        // Plan the inner subquery as a standalone subtree; give every output
+        // column the `alias` qualifier so the outer query can reference them as
+        // `alias.col` or (via the resolver's fallback) as an unqualified `col`.
+        FromNode::Derived { subquery, alias } => {
+            let inner = plan_query(subquery, catalog, ctes)?;
+            let output = inner
+                .output()
+                .iter()
+                .map(|c| ColumnRef {
+                    qualifier: alias.clone(),
+                    name: c.name.clone(),
+                    ty: c.ty,
+                })
+                .collect();
+            Ok(PlanNode::DerivedTable {
+                subquery: Box::new(inner),
+                alias: alias.clone(),
+                output,
+            })
+        }
     }
 }
 

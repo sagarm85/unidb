@@ -1,7 +1,7 @@
 # SQL surface gaps — unsupported query features
 
 **Type:** Improvement
-**Status:** PARTIAL — G1 (CASE/COALESCE/NULLIF), G2-cast (CAST expressions), G3 (UNION/INTERSECT/EXCEPT), G4 (ORDER BY non-projected col), G5 (RETURNING), G8 (SELECT without FROM), G10 (IS NULL) SHIPPED (see `PROGRESS.md` item 19). G2-join (FULL OUTER JOIN)/G6/G7/G9/G11 remain open.
+**Status:** PARTIAL — G1 (CASE/COALESCE/NULLIF), G2-cast (CAST expressions), G3 (UNION/INTERSECT/EXCEPT), G4 (ORDER BY non-projected col), G5 (RETURNING), G6 (derived table subqueries), G8 (SELECT without FROM), G10 (IS NULL) SHIPPED (see `PROGRESS.md` item 19). G2-join (FULL OUTER JOIN)/G7/G9/G11/G-NATURAL remain open.
 
 > A single tracker for the SQL constructs unidb does **not** support yet, so
 > builders (and future us) have one honest list and each gap has a scope/ROI
@@ -90,7 +90,16 @@
   `Rows` result instead of just a count. Medium; touches the write path but no
   storage/format change.
 
-### G6 — `NATURAL JOIN`
+### G6 — Derived table subqueries — `SELECT … FROM (SELECT …) AS alias` **(SHIPPED 2026-07-20)**
+
+Implemented across all four pipeline layers: parser (`TableFactor::Derived` →
+`FromNode::Derived`), logical plan (`FromNode::Derived`), physical plan
+(`PlanNode::DerivedTable`), executor (materialise inner subquery, requalify
+columns with alias). RLS is applied inside the inner subquery via
+`apply_rls_into_derived`. 7 tests in `tests/item19_derived_tables.rs` all pass.
+See `PROGRESS.md` item 19 G6 entry.
+
+### G-NATURAL — `NATURAL JOIN`
 - **What:** join on all commonly-named columns implicitly.
 - **Why it matters:** low — mostly discouraged (implicit key set is fragile);
   `USING (cols)` (supported since Milestone 18) is the explicit, safer form.
