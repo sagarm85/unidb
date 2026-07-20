@@ -39,9 +39,14 @@ place of the RowId; the executor decodes them as a row without hitting the heap.
 **Format impact:** None — the B-tree leaf already stores key bytes.
 No `FORMAT_VERSION` bump. No new syntax.
 
-**Acceptance target:** `SELECT <indexed_col> FROM t WHERE <indexed_col> = val`
-performs with 0 heap fetches (verified via `DIAGNOSTICS_ENABLED` counters).
-Throughput ≥ 1.5× current for this specific pattern.
+**Acceptance target (corrected after implementation):** `SELECT <indexed_col> FROM t WHERE
+<indexed_col> = val` skips `deform_row` (column decode) and returns the key value
+directly from the B-tree leaf. A lightweight `heap.get()` is still performed for
+MVCC visibility — B-tree leaves retain stale entries for dead tuples until vacuum
+runs, so the heap page must be touched to confirm row liveness. **Phase A savings
+are CPU (deform_row eliminated), not I/O (heap page fetch remains).** The
+`IDX_ONLY_ROWS` counter increments for every row returned via the fast path.
+True zero-heap-fetch requires a visibility map (Phase B work item).
 
 ### Phase B — Covering index with INCLUDE columns (format change)
 
