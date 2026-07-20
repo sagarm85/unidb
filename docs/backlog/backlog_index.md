@@ -32,7 +32,7 @@
 | 16 | `16_concurrent_sql_writes_visibility_anomaly.md` | Improvement | ✅ SHIPPED (PROGRESS: MVCC visibility anomaly under concurrent SQL writes) |
 | 17 | `17_mm_replaced_stack_headline.md` | Performance | ✅ SHIPPED (PROGRESS: Cross-domain headline vs replaced stack) |
 | 18 | `18_engine_access_contract.md` | Milestone | ✅ SHIPPED (PROGRESS: Engine access & introspection contract (Milestone 18)) |
-| 19 | `19_sql_surface_gaps.md` | Improvement | ⏳ NOT STARTED |
+| 19 | `19_sql_surface_gaps.md` | Improvement | 🔄 PARTIAL — G1 (CASE/COALESCE/NULLIF), G3 (UNION/INTERSECT/EXCEPT + chained set-ops), G4 (ORDER BY non-projected), G5 (RETURNING), G8 (SELECT w/o FROM), G10 (IS NULL) SHIPPED 2026-07-20. G2/G6/G7/G9/G11 remain open. |
 | 20 | `20_events_realtime_dispatcher.md` | Milestone | ✅ SHIPPED (PROGRESS: Events / realtime dispatcher (Milestone 20)) |
 | 21 | `21_observability_metrics.md` | Improvement | ✅ SHIPPED (PROGRESS: Observability metrics enrichment (item 21)) |
 | 22 | `22_logs_surface.md` | Improvement | ✅ SHIPPED (PROGRESS: Logs surface — JSON structured logs, correlation ids, bounded /logs tail) |

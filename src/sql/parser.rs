@@ -8,8 +8,8 @@
 use sqlparser::ast::{
     self, AlterTableOperation, Array as SqlArray, BinaryOperator, CreateTableOptions, DataType,
     ExactNumberInfo, Expr as SqlExpr, FromTable, IndexType, JoinConstraint, JoinOperator,
-    ObjectType, SelectItem, SetExpr, SqlOption, Statement, TableFactor, TableObject,
-    TableWithJoins, UnaryOperator, Value,
+    ObjectType, SelectItem, SetExpr, SetOperator, SetQuantifier, SqlOption, Statement, TableFactor,
+    TableObject, TableWithJoins, UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser as SqlParser;
@@ -22,7 +22,7 @@ use crate::{
     error::{DbError, Result},
 };
 
-use super::logical::{ArithOp, CmpOp, Expr, Literal, LogicalPlan};
+use super::logical::{ArithOp, CmpOp, Expr, Literal, LogicalPlan, SetOpKind};
 use super::query::{AggFunc, FromNode, JoinType, OrderKey, Projection, QExpr, QuerySpec, TableRef};
 
 /// Parse a SQL string (possibly multiple `;`-separated statements) into
@@ -664,6 +664,44 @@ fn convert_query(q: ast::Query) -> Result<LogicalPlan> {
         limit_clause,
         ..
     } = q;
+
+    // G3 (item 19): UNION / INTERSECT / EXCEPT at the top level. An outer
+    // ORDER BY / LIMIT wrapping the set operation is not yet supported (would
+    // require sorting/limiting the combined result) — reject it clearly.
+    if let SetExpr::SetOperation {
+        op,
+        set_quantifier,
+        left,
+        right,
+    } = *body
+    {
+        if order_by.is_some() || limit_clause.is_some() {
+            return Err(DbError::SqlUnsupported(
+                "ORDER BY / LIMIT on a set operation (UNION/INTERSECT/EXCEPT) is not yet supported"
+                    .into(),
+            ));
+        }
+        if with.is_some() {
+            return Err(DbError::SqlUnsupported(
+                "WITH … UNION is not yet supported".into(),
+            ));
+        }
+        let set_op_kind = match op {
+            SetOperator::Union => SetOpKind::Union,
+            SetOperator::Intersect => SetOpKind::Intersect,
+            SetOperator::Except | SetOperator::Minus => SetOpKind::Except,
+        };
+        let all = matches!(set_quantifier, SetQuantifier::All);
+        let left_plan = set_expr_to_plan(*left)?;
+        let right_plan = set_expr_to_plan(*right)?;
+        return Ok(LogicalPlan::SetOp {
+            op: set_op_kind,
+            all,
+            left: Box::new(left_plan),
+            right: Box::new(right_plan),
+        });
+    }
+
     let select = match *body {
         SetExpr::Select(s) => *s,
         other => {
@@ -685,6 +723,12 @@ fn convert_query(q: ast::Query) -> Result<LogicalPlan> {
         ast::GroupByExpr::All(_) => true,
     };
     let projection_has_agg = select.projection.iter().any(select_item_has_aggregate);
+    // G1 (item 19): CASE / COALESCE / NULLIF expressions exist only in QExpr
+    // (the Phase-4 query path). Detect them in the projection or WHERE so we
+    // route to Phase-4 rather than falling through to the simple Select path
+    // which only knows flat column references and cannot evaluate them.
+    let projection_has_case = select.projection.iter().any(select_item_has_case_expr)
+        || select.selection.as_ref().is_some_and(expr_has_case_expr);
     let has_subquery = select.selection.as_ref().is_some_and(expr_has_subquery)
         || select.projection.iter().any(select_item_has_subquery);
     // Milestone 18, Epic C: a SELECT over an `information_schema.*` /
@@ -709,7 +753,8 @@ fn convert_query(q: ast::Query) -> Result<LogicalPlan> {
         || with.is_some()
         || projection_has_agg
         || has_subquery
-        || from_is_introspection;
+        || from_is_introspection
+        || projection_has_case;
     if needs_query {
         return convert_query_spec(select, with, order_by, limit_clause);
     }
@@ -763,6 +808,60 @@ fn query_to_spec(q: ast::Query) -> Result<QuerySpec> {
         }
     };
     build_query_spec(select, with, order_by, limit_clause)
+}
+
+/// Convert a `SetExpr` (a bare SELECT body) into a [`QuerySpec`].
+/// Used by the G3 UNION/INTERSECT/EXCEPT path to convert each branch.
+/// Only `SetExpr::Select` and nested `SetExpr::SetOperation` are supported;
+/// `Values`, `Insert`, etc. are rejected.
+/// Only `SetExpr::Select`, `SetExpr::Query`, and nested `SetExpr::SetOperation`
+/// are supported; subquery-wrapped branches (`SetExpr::Query(q)` where `q`
+/// contains a set-op at the top level) are also handled via recursion.
+fn set_expr_to_plan(body: SetExpr) -> Result<LogicalPlan> {
+    match body {
+        SetExpr::Select(s) => {
+            // A bare SELECT branch: convert as if it were a top-level statement,
+            // which gives us either a simple `LogicalPlan::Select` or a
+            // `LogicalPlan::Query` for Phase-4 constructs.
+            convert_query(ast::Query {
+                with: None,
+                body: Box::new(SetExpr::Select(s)),
+                order_by: None,
+                limit_clause: None,
+                fetch: None,
+                locks: vec![],
+                for_clause: None,
+                settings: None,
+                format_clause: None,
+                pipe_operators: vec![],
+            })
+        }
+        SetExpr::Query(q) => convert_query(*q),
+        SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } => {
+            let set_op_kind = match op {
+                SetOperator::Union => SetOpKind::Union,
+                SetOperator::Intersect => SetOpKind::Intersect,
+                SetOperator::Except | SetOperator::Minus => SetOpKind::Except,
+            };
+            let all = matches!(set_quantifier, SetQuantifier::All);
+            let left_plan = set_expr_to_plan(*left)?;
+            let right_plan = set_expr_to_plan(*right)?;
+            Ok(LogicalPlan::SetOp {
+                op: set_op_kind,
+                all,
+                left: Box::new(left_plan),
+                right: Box::new(right_plan),
+            })
+        }
+        other => Err(DbError::SqlUnsupported(format!(
+            "unsupported set-operation branch: {other:?}"
+        ))),
+    }
 }
 
 fn build_query_spec(
@@ -873,6 +972,32 @@ fn expr_has_subquery(e: &SqlExpr) -> bool {
     }
 }
 
+fn select_item_has_case_expr(item: &SelectItem) -> bool {
+    match item {
+        SelectItem::UnnamedExpr(e) => expr_has_case_expr(e),
+        SelectItem::ExprWithAlias { expr, .. } => expr_has_case_expr(expr),
+        _ => false,
+    }
+}
+
+/// Whether a `sqlparser` expression contains a CASE / COALESCE / NULLIF that
+/// must be evaluated by the Phase-4 path (these are only in `QExpr`).
+fn expr_has_case_expr(e: &SqlExpr) -> bool {
+    match e {
+        SqlExpr::Case { .. } => true,
+        SqlExpr::Function(f) => {
+            let name = f.name.to_string().to_uppercase();
+            name == "COALESCE" || name == "NULLIF"
+        }
+        SqlExpr::BinaryOp { left, right, .. } => {
+            expr_has_case_expr(left) || expr_has_case_expr(right)
+        }
+        SqlExpr::UnaryOp { expr, .. } | SqlExpr::Nested(expr) => expr_has_case_expr(expr),
+        SqlExpr::IsNull(e) | SqlExpr::IsNotNull(e) => expr_has_case_expr(e),
+        _ => false,
+    }
+}
+
 /// Whether a `sqlparser` expression contains an aggregate function call.
 fn expr_has_aggregate(e: &SqlExpr) -> bool {
     match e {
@@ -882,6 +1007,18 @@ fn expr_has_aggregate(e: &SqlExpr) -> bool {
         }
         SqlExpr::UnaryOp { expr, .. } | SqlExpr::Nested(expr) => expr_has_aggregate(expr),
         SqlExpr::IsNull(e) | SqlExpr::IsNotNull(e) => expr_has_aggregate(e),
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand.as_deref().is_some_and(expr_has_aggregate)
+                || conditions
+                    .iter()
+                    .any(|cw| expr_has_aggregate(&cw.condition) || expr_has_aggregate(&cw.result))
+                || else_result.as_deref().is_some_and(expr_has_aggregate)
+        }
         _ => false,
     }
 }
@@ -1101,9 +1238,70 @@ fn convert_qexpr(e: &SqlExpr) -> Result<QExpr> {
             op: UnaryOperator::Not,
             expr,
         } => Ok(QExpr::Not(Box::new(convert_qexpr(expr)?))),
+        // Unary minus: fold into the literal when the operand is a number literal
+        // so that `-1` in `COALESCE(x, -1)` evaluates correctly. For non-literal
+        // operands, rewrite as `0 - expr` (integer subtraction).
+        SqlExpr::UnaryOp {
+            op: UnaryOperator::Minus,
+            expr,
+        } => match expr.as_ref() {
+            SqlExpr::Value(vws) => match &vws.value {
+                Value::Number(s, _) => {
+                    if let Ok(i) = s.parse::<i64>() {
+                        Ok(QExpr::Literal(Literal::Int(-i)))
+                    } else if let Ok(f) = s.parse::<f64>() {
+                        Ok(QExpr::Literal(Literal::Float(-f)))
+                    } else {
+                        Err(DbError::SqlUnsupported(format!(
+                            "unary minus on non-numeric literal: {s}"
+                        )))
+                    }
+                }
+                other => Err(DbError::SqlUnsupported(format!(
+                    "unary minus on non-numeric value: {other:?}"
+                ))),
+            },
+            inner => Ok(QExpr::Arith {
+                op: crate::sql::logical::ArithOp::Sub,
+                lhs: Box::new(QExpr::Literal(Literal::Int(0))),
+                rhs: Box::new(convert_qexpr(inner)?),
+            }),
+        },
         SqlExpr::BinaryOp { left, op, right } => convert_qbinary_op(left, op, right),
+        // G1 (item 19): CASE WHEN … THEN … [ELSE …] END.
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            let operand = match operand {
+                Some(op) => Some(Box::new(convert_qexpr(op)?)),
+                None => None,
+            };
+            let mut branches = Vec::with_capacity(conditions.len());
+            for cw in conditions {
+                branches.push((convert_qexpr(&cw.condition)?, convert_qexpr(&cw.result)?));
+            }
+            let else_result = match else_result {
+                Some(e) => Some(Box::new(convert_qexpr(e)?)),
+                None => None,
+            };
+            Ok(QExpr::Case {
+                operand,
+                conditions: branches,
+                else_result,
+            })
+        }
         SqlExpr::Function(func) if func.name.to_string().eq_ignore_ascii_case("match") => {
             convert_match_qexpr(func)
+        }
+        // G1 (item 19): COALESCE(v1, v2, …) and NULLIF(a, b).
+        SqlExpr::Function(func) if func.name.to_string().eq_ignore_ascii_case("coalesce") => {
+            convert_coalesce_qexpr(func)
+        }
+        SqlExpr::Function(func) if func.name.to_string().eq_ignore_ascii_case("nullif") => {
+            convert_nullif_qexpr(func)
         }
         SqlExpr::Function(f) => convert_aggregate(f),
         SqlExpr::Exists { subquery, negated } => Ok(QExpr::Exists {
@@ -1209,6 +1407,70 @@ fn convert_match_qexpr(func: &ast::Function) -> Result<QExpr> {
     Ok(QExpr::Match {
         column: Box::new(column),
         query: Box::new(query),
+    })
+}
+
+/// `COALESCE(v1, v2, …)` in the planner `QExpr` representation (G1, item 19).
+fn convert_coalesce_qexpr(func: &ast::Function) -> Result<QExpr> {
+    let args = match &func.args {
+        ast::FunctionArguments::List(list) => &list.args,
+        ast::FunctionArguments::None => {
+            return Err(DbError::SqlUnsupported(
+                "COALESCE requires at least one argument".into(),
+            ))
+        }
+        other => {
+            return Err(DbError::SqlUnsupported(format!(
+                "unsupported COALESCE arguments: {other:?}"
+            )))
+        }
+    };
+    let exprs = args
+        .iter()
+        .map(|a| match a {
+            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => convert_qexpr(e),
+            other => Err(DbError::SqlUnsupported(format!(
+                "unsupported COALESCE argument: {other:?}"
+            ))),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(QExpr::Coalesce(exprs))
+}
+
+/// `NULLIF(a, b)` in the planner `QExpr` representation (G1, item 19).
+fn convert_nullif_qexpr(func: &ast::Function) -> Result<QExpr> {
+    let args = match &func.args {
+        ast::FunctionArguments::List(list) => &list.args,
+        other => {
+            return Err(DbError::SqlUnsupported(format!(
+                "unsupported NULLIF arguments: {other:?}"
+            )))
+        }
+    };
+    if args.len() != 2 {
+        return Err(DbError::SqlUnsupported(
+            "NULLIF requires exactly 2 arguments".into(),
+        ));
+    }
+    let lhs = match &args[0] {
+        ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => convert_qexpr(e)?,
+        other => {
+            return Err(DbError::SqlUnsupported(format!(
+                "unsupported NULLIF argument: {other:?}"
+            )))
+        }
+    };
+    let rhs = match &args[1] {
+        ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => convert_qexpr(e)?,
+        other => {
+            return Err(DbError::SqlUnsupported(format!(
+                "unsupported NULLIF argument: {other:?}"
+            )))
+        }
+    };
+    Ok(QExpr::Nullif {
+        lhs: Box::new(lhs),
+        rhs: Box::new(rhs),
     })
 }
 

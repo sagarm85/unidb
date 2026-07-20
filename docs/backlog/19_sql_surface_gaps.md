@@ -1,7 +1,7 @@
 # SQL surface gaps — unsupported query features
 
 **Type:** Improvement
-**Status:** NOT STARTED
+**Status:** PARTIAL — G1 (CASE/COALESCE/NULLIF), G3 (UNION/INTERSECT/EXCEPT), G4 (ORDER BY non-projected col), G5 (RETURNING), G8 (SELECT without FROM), G10 (IS NULL) SHIPPED 2026-07-20 (see `PROGRESS.md` item 19). G2/G6/G7/G9/G11 remain open.
 
 > A single tracker for the SQL constructs unidb does **not** support yet, so
 > builders (and future us) have one honest list and each gap has a scope/ROI

@@ -91,6 +91,10 @@ pub fn bind_params(plan: &mut LogicalPlan, params: &[Literal]) -> Result<()> {
         }
         LogicalPlan::Query(spec) => spec.bind_params(params)?,
         LogicalPlan::Explain { spec, .. } => spec.bind_params(params)?,
+        LogicalPlan::SetOp { left, right, .. } => {
+            bind_params(left, params)?;
+            bind_params(right, params)?;
+        }
         // DDL / CREATE INDEX carry no bind parameters.
         LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateIndex { .. }
@@ -347,6 +351,27 @@ pub enum LogicalPlan {
     /// `EXPLAIN [ANALYZE] <query>` (P4.e): show the chosen plan tree with
     /// estimated rows/cost, and (with ANALYZE) the actual rows + execution time.
     Explain { analyze: bool, spec: QuerySpec },
+    /// `SELECT … UNION [ALL] SELECT …` / `INTERSECT` / `EXCEPT` (G3, item 19).
+    /// Concatenates two query results; `all = false` deduplicates the rows.
+    SetOp {
+        op: SetOpKind,
+        /// `ALL` quantifier: when true, keep duplicates (UNION ALL). When false,
+        /// deduplicate the combined result (UNION / INTERSECT / EXCEPT distinct).
+        all: bool,
+        /// Left branch — either a `Query` spec or a nested `SetOp` (for
+        /// chained set operations like `A UNION B UNION C`).
+        left: Box<LogicalPlan>,
+        /// Right branch — same flexibility as `left`.
+        right: Box<LogicalPlan>,
+    },
+}
+
+/// Set-operation kind for [`LogicalPlan::SetOp`] (G3, item 19).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOpKind {
+    Union,
+    Intersect,
+    Except,
 }
 
 // ─── current_user() substitution (item-24 Z6) ────────────────────────────────
@@ -491,6 +516,21 @@ pub fn apply_rls_skip_current_user(plan: LogicalPlan, catalog: &Catalog) -> Logi
             spec.apply_rls_from(&|table| select_policy_for_skip_current_user(catalog, table));
             LogicalPlan::Explain { analyze, spec }
         }
+        LogicalPlan::SetOp {
+            op,
+            all,
+            left,
+            right,
+        } => {
+            let left = Box::new(apply_rls_skip_current_user(*left, catalog));
+            let right = Box::new(apply_rls_skip_current_user(*right, catalog));
+            LogicalPlan::SetOp {
+                op,
+                all,
+                left,
+                right,
+            }
+        }
         other @ (LogicalPlan::CreateTable { .. }
         | LogicalPlan::Insert { .. }
         | LogicalPlan::CreateIndex { .. }
@@ -588,6 +628,22 @@ pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog) -> LogicalPlan {
             // EXPLAIN shows the RLS-rewritten plan the query would actually run.
             spec.apply_rls_from(&|table| select_policy_for(catalog, table));
             LogicalPlan::Explain { analyze, spec }
+        }
+        LogicalPlan::SetOp {
+            op,
+            all,
+            left,
+            right,
+        } => {
+            // Apply RLS to both branches of a set operation recursively.
+            let left = Box::new(apply_rls(*left, catalog));
+            let right = Box::new(apply_rls(*right, catalog));
+            LogicalPlan::SetOp {
+                op,
+                all,
+                left,
+                right,
+            }
         }
         other @ (LogicalPlan::CreateTable { .. }
         | LogicalPlan::Insert { .. }

@@ -27,13 +27,13 @@
 use std::collections::HashMap;
 
 use crate::btree_index::{DiskBTree, OrderedValue};
-use crate::catalog::IndexKind;
+use crate::catalog::{ColumnType, IndexKind};
 use crate::error::{DbError, Result};
 use crate::heap::Heap;
 use crate::mvcc::Snapshot;
 use crate::sql::executor::{self, decode_row, deform_row, ExecCtx, ExecResult};
 use crate::sql::join;
-use crate::sql::logical::{CmpOp, Literal};
+use crate::sql::logical::{CmpOp, Literal, SetOpKind};
 use crate::sql::plan::{
     self, eval_qexpr, join_key_bytes, plan_query, resolve_column, Batch, ColumnRef, CteSchemas,
     PlanNode,
@@ -162,6 +162,193 @@ pub fn exec_explain(spec: &QuerySpec, analyze: bool, ctx: &mut ExecCtx) -> Resul
     Ok(ExecResult::Rows {
         columns: vec!["QUERY PLAN".to_string()],
         rows: lines.into_iter().map(|l| vec![Literal::Text(l)]).collect(),
+    })
+}
+
+/// Execute one branch of a set-operation (UNION / INTERSECT / EXCEPT).
+///
+/// A branch is either:
+///   - `LogicalPlan::Query(spec)` → run through `exec_query`
+///   - `LogicalPlan::SetOp { .. }` → recurse through `exec_set_op` (chained set-ops)
+///   - `LogicalPlan::Select { .. }` → run through the executor (simple single-table SELECT)
+///
+/// Any other plan variant (DML, DDL) is rejected because it cannot appear inside
+/// a set-operation.
+fn exec_plan_branch(
+    plan: &crate::sql::logical::LogicalPlan,
+    ctx: &mut ExecCtx,
+) -> Result<ExecResult> {
+    use crate::sql::logical::LogicalPlan;
+    match plan {
+        LogicalPlan::Query(spec) => exec_query(spec, ctx),
+        LogicalPlan::SetOp {
+            op,
+            all,
+            left,
+            right,
+        } => exec_set_op(*op, *all, left, right, ctx),
+        // Simple single-table SELECT that ended up as the branch of a set-op.
+        LogicalPlan::Select { .. } => crate::sql::executor::execute(plan.clone(), ctx),
+        other => Err(crate::error::DbError::SqlPlan(format!(
+            "unexpected plan variant as set-op branch: {:?}",
+            std::mem::discriminant(other)
+        ))),
+    }
+}
+
+/// G3 (item 19): `SELECT … UNION [ALL] SELECT …` / `INTERSECT` / `EXCEPT`.
+///
+/// Runs both sides as independent queries under the same engine context and
+/// combines their results:
+/// - UNION ALL: concatenate left + right (no dedup).
+/// - UNION: concatenate + dedup by row encoding.
+/// - INTERSECT ALL / DISTINCT: rows present in both sides.
+/// - EXCEPT ALL / DISTINCT: rows in left but not in right.
+pub fn exec_set_op(
+    op: SetOpKind,
+    all: bool,
+    left: &crate::sql::logical::LogicalPlan,
+    right: &crate::sql::logical::LogicalPlan,
+    ctx: &mut ExecCtx,
+) -> Result<ExecResult> {
+    // Run each branch with its own Runner (snapshot, CTE scope) so they are
+    // independent. Both share the same ExecCtx (catalog, pool, xid, txn_mgr).
+    let left_result = exec_plan_branch(left, ctx)?;
+    let right_result = exec_plan_branch(right, ctx)?;
+
+    let (l_cols, l_rows) = match left_result {
+        ExecResult::Rows { columns, rows } => (columns, rows),
+        other => {
+            return Err(DbError::SqlPlan(format!(
+                "UNION/INTERSECT/EXCEPT left side produced a non-row result: {other:?}"
+            )))
+        }
+    };
+    let (_, r_rows) = match right_result {
+        ExecResult::Rows { columns, rows } => (columns, rows),
+        other => {
+            return Err(DbError::SqlPlan(format!(
+                "UNION/INTERSECT/EXCEPT right side produced a non-row result: {other:?}"
+            )))
+        }
+    };
+
+    // Synthesise a trivial ColumnRef schema from the left-side column names;
+    // type tracking through set-ops is a v2 concern.
+    let output_schema: Vec<ColumnRef> = l_cols
+        .iter()
+        .map(|name| ColumnRef {
+            qualifier: String::new(),
+            name: name.clone(),
+            ty: ColumnType::Text,
+        })
+        .collect();
+
+    let left_batch = Batch {
+        schema: output_schema.clone(),
+        rows: l_rows,
+    };
+    let right_batch = Batch {
+        schema: output_schema.clone(),
+        rows: r_rows,
+    };
+
+    let result_batch = exec_set_op_batches(op, all, left_batch, right_batch, &output_schema)?;
+    Ok(ExecResult::Rows {
+        columns: l_cols,
+        rows: result_batch.rows,
+    })
+}
+
+/// Core batch-level set-operation implementation shared between the top-level
+/// `exec_set_op` (which runs both sides as independent queries) and `Runner::run`
+/// (which runs them recursively via the same Runner).
+fn exec_set_op_batches(
+    op: SetOpKind,
+    all: bool,
+    left: Batch,
+    right: Batch,
+    output: &[ColumnRef],
+) -> Result<Batch> {
+    use std::collections::HashSet;
+
+    let rows = match op {
+        SetOpKind::Union => {
+            let mut combined = left.rows;
+            combined.extend(right.rows);
+            if all {
+                combined
+            } else {
+                // Dedup by row encoding.
+                let mut seen = HashSet::new();
+                combined
+                    .into_iter()
+                    .filter(|row| seen.insert(executor::encode_row(row)))
+                    .collect()
+            }
+        }
+        SetOpKind::Intersect => {
+            if all {
+                // INTERSECT ALL: for each right row, consume one matching left row.
+                let mut left_remaining: Vec<Vec<Literal>> = left.rows;
+                let mut result = Vec::new();
+                for r_row in right.rows {
+                    let key = executor::encode_row(&r_row);
+                    if let Some(pos) = left_remaining
+                        .iter()
+                        .position(|l| executor::encode_row(l) == key)
+                    {
+                        result.push(left_remaining.remove(pos));
+                    }
+                }
+                result
+            } else {
+                // INTERSECT DISTINCT: rows that appear in both sides, deduped.
+                let right_keys: HashSet<Vec<u8>> =
+                    right.rows.iter().map(|r| executor::encode_row(r)).collect();
+                let mut seen = HashSet::new();
+                left.rows
+                    .into_iter()
+                    .filter(|row| {
+                        let key = executor::encode_row(row);
+                        right_keys.contains(&key) && seen.insert(key)
+                    })
+                    .collect()
+            }
+        }
+        SetOpKind::Except => {
+            if all {
+                // EXCEPT ALL: for each right row, remove one matching left row.
+                let mut left_remaining = left.rows;
+                for r_row in right.rows {
+                    let key = executor::encode_row(&r_row);
+                    if let Some(pos) = left_remaining
+                        .iter()
+                        .position(|l| executor::encode_row(l) == key)
+                    {
+                        left_remaining.remove(pos);
+                    }
+                }
+                left_remaining
+            } else {
+                // EXCEPT DISTINCT: rows in left but not in right, deduped.
+                let right_keys: HashSet<Vec<u8>> =
+                    right.rows.iter().map(|r| executor::encode_row(r)).collect();
+                let mut seen = HashSet::new();
+                left.rows
+                    .into_iter()
+                    .filter(|row| {
+                        let key = executor::encode_row(row);
+                        !right_keys.contains(&key) && seen.insert(key)
+                    })
+                    .collect()
+            }
+        }
+    };
+
+    Ok(Batch {
+        schema: output.to_vec(),
+        rows,
     })
 }
 
@@ -592,6 +779,19 @@ impl Runner<'_, '_> {
                     schema: output.clone(),
                     rows,
                 })
+            }
+
+            // G3 (item 19): UNION [ALL] / INTERSECT [ALL] / EXCEPT [ALL].
+            PlanNode::SetOp {
+                op,
+                all,
+                left,
+                right,
+                output,
+            } => {
+                let l = self.run(left)?;
+                let r = self.run(right)?;
+                exec_set_op_batches(*op, *all, l, r, output)
             }
         }
     }
@@ -1032,6 +1232,52 @@ impl Runner<'_, '_> {
                     query_tokens.iter().all(|t| text_tokens.contains(t)),
                 ))
             }
+            // G1 (item 19): CASE/COALESCE/NULLIF — recurse through the ctx-aware
+            // evaluator in case sub-expressions contain subqueries.
+            QExpr::Case {
+                operand,
+                conditions,
+                else_result,
+            } => {
+                let op_val = match operand {
+                    Some(op) => Some(self.eval(op, schema, row)?),
+                    None => None,
+                };
+                for (cond, then) in conditions {
+                    let matched = match &op_val {
+                        None => executor::as_bool(&self.eval(cond, schema, row)?)?,
+                        Some(v) => {
+                            let c = self.eval(cond, schema, row)?;
+                            executor::compare(crate::sql::logical::CmpOp::Eq, v, &c)?
+                        }
+                    };
+                    if matched {
+                        return self.eval(then, schema, row);
+                    }
+                }
+                match else_result {
+                    Some(e) => self.eval(e, schema, row),
+                    None => Ok(Literal::Null),
+                }
+            }
+            QExpr::Coalesce(args) => {
+                for a in args {
+                    let v = self.eval(a, schema, row)?;
+                    if !matches!(v, Literal::Null) {
+                        return Ok(v);
+                    }
+                }
+                Ok(Literal::Null)
+            }
+            QExpr::Nullif { lhs, rhs } => {
+                let a = self.eval(lhs, schema, row)?;
+                let b = self.eval(rhs, schema, row)?;
+                if executor::compare(crate::sql::logical::CmpOp::Eq, &a, &b)? {
+                    Ok(Literal::Null)
+                } else {
+                    Ok(a)
+                }
+            }
             // No subquery below here: the pure evaluator handles it.
             QExpr::Column { .. }
             | QExpr::Literal(_)
@@ -1168,6 +1414,33 @@ fn substitute_correlated(
             substitute_correlated(query, inner, outer, outer_row)
         }
         QExpr::Arith { lhs, rhs, .. } => {
+            substitute_correlated(lhs, inner, outer, outer_row)?;
+            substitute_correlated(rhs, inner, outer, outer_row)
+        }
+        QExpr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                substitute_correlated(op, inner, outer, outer_row)?;
+            }
+            for (cond, then) in conditions {
+                substitute_correlated(cond, inner, outer, outer_row)?;
+                substitute_correlated(then, inner, outer, outer_row)?;
+            }
+            if let Some(e) = else_result {
+                substitute_correlated(e, inner, outer, outer_row)?;
+            }
+            Ok(())
+        }
+        QExpr::Coalesce(args) => {
+            for a in args {
+                substitute_correlated(a, inner, outer, outer_row)?;
+            }
+            Ok(())
+        }
+        QExpr::Nullif { lhs, rhs } => {
             substitute_correlated(lhs, inner, outer, outer_row)?;
             substitute_correlated(rhs, inner, outer, outer_row)
         }

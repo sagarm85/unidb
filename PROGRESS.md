@@ -8762,3 +8762,83 @@ eliminating ~200 `Vec<RowId>` alloc/hop × ~100 ns per alloc on the warm path.
   zero disk fetches on warm path + recall@10 ≥ 0.90 + arena hit counters > 0.
 - `cargo clippy -- -D warnings`: clean.
 - `cargo fmt --all`: clean.
+
+---
+
+## Item 19 (partial) — SQL surface gaps: G1 + G3 + routing fixes (2026-07-20)
+
+**Backlog:** `docs/backlog/19_sql_surface_gaps.md` (G1, G3 shipped; G2/G6/G7/G9/G11 remain open)
+
+**Status:** PARTIAL — the highest-ROI gaps from the backlog have landed. G4/G5/G8/G10 were already implemented in prior work; this entry covers new work only.
+
+### What shipped
+
+**G1 — CASE / COALESCE / NULLIF scalar expressions**
+
+- Added `QExpr::Case { operand, conditions, else_result }`, `QExpr::Coalesce(Vec<QExpr>)`,
+  and `QExpr::Nullif { lhs, rhs }` variants to `src/sql/query.rs`.
+- Parser: `convert_qexpr` maps `SqlExpr::Case` → `QExpr::Case`, function calls
+  `COALESCE(…)` / `NULLIF(a, b)` → the new variants. Unary minus on number literals
+  now folds to `QExpr::Literal(Literal::Int(-n))` so `-1` works in `COALESCE(…, -1)`.
+- Routing fix: `convert_query` now detects CASE/COALESCE/NULLIF in the SELECT
+  projection and WHERE clause via `projection_has_case` / `expr_has_case_expr` and
+  forces routing to the Phase-4 query path. Without this, `SELECT CASE WHEN x > 0 …`
+  on a simple single-table SELECT would fall through to the row-at-a-time path and
+  return `SqlUnsupported`.
+- Evaluator: `eval_qexpr` (plan.rs) and `Runner::eval` (query_exec.rs) both evaluate
+  all three new variants. `Case` short-circuits on first matching branch; `Coalesce`
+  returns the first non-null; `Nullif` returns null iff `lhs = rhs`.
+- Updated: `optimizer.rs` (`collect_qualifiers`/`collect_columns`), `explain.rs`
+  (no new node needed; CASE is an expression, not a plan node),
+  `substitute_correlated` in `query_exec.rs`.
+
+**G3 — UNION / UNION ALL / INTERSECT / EXCEPT (including chained set-ops)**
+
+- `LogicalPlan::SetOp { op: SetOpKind, all: bool, left: Box<LogicalPlan>, right: Box<LogicalPlan> }`
+  in `src/sql/logical.rs` (branches changed from `Box<QuerySpec>` to `Box<LogicalPlan>`
+  to support chained set-ops like `A UNION B UNION C`).
+- `SetOpKind` enum: `Union`, `Intersect`, `Except`.
+- Parser: `convert_query` detects `SetExpr::SetOperation` at the top level.
+  `set_expr_to_plan(SetExpr)` recursively converts each branch, handling
+  `SetExpr::Select`, `SetExpr::Query`, and nested `SetExpr::SetOperation`.
+  `UNION` without `ALL` ↔ distinct; `UNION ALL` ↔ all quantifier.
+- Physical plan: `PlanNode::SetOp` in `src/sql/plan.rs`; `exec_set_op_batches`
+  in `query_exec.rs` implements UNION ALL (concat), UNION DISTINCT (concat+dedup),
+  INTERSECT [ALL] (multiset intersection), EXCEPT [ALL] (multiset difference).
+- `apply_rls` / `apply_rls_skip_current_user` recurse into both branches.
+- `check_plan_privileges` uses new `plan_base_tables(plan)` helper that handles
+  nested `SetOp` trees.
+- Executor: `LogicalPlan::SetOp` dispatches to `exec_set_op` which calls
+  `exec_plan_branch` on each side — a trampoline that handles Query specs,
+  nested set-ops, and simple Select branches.
+
+### Tests (new: `tests/item19_sql_gaps.rs` — 32/32 PASS)
+
+| Test group | Count | Result |
+|---|---|---|
+| CASE (searched, simple form, no-else, in WHERE) | 6 | PASS |
+| COALESCE (first non-null, all-null, literal fallback) | 4 | PASS |
+| NULLIF (equal/not-equal, composed with COALESCE) | 3 | PASS |
+| UNION ALL (dedup off, from tables) | 3 | PASS |
+| UNION DISTINCT (dedup on, from tables with overlap, chained) | 3 | PASS |
+| INTERSECT / EXCEPT (basic + INTERSECT ALL) | 3 | PASS |
+| ORDER BY non-projected column | 2 | PASS |
+| RETURNING (INSERT, UPDATE, DELETE) | 3 | PASS |
+| SELECT without FROM / IS NULL / IS NOT NULL | 5 | PASS |
+
+Full suite: `cargo test` — all passing (see test run output). `cargo clippy -- -D warnings` — clean.
+
+### No storage / format / crash-harness impact
+
+This is a pure SQL surface change — no page format, WAL record type, or storage
+layer touched. Crash harness unchanged. No new `FORMAT_VERSION` bump needed.
+
+### Remaining open gaps (G2/G6/G7/G9/G11)
+
+| Gap | Description | Status |
+|---|---|---|
+| G2 | FULL OUTER JOIN | Open |
+| G6 | NATURAL JOIN | Open (low ROI) |
+| G7 | Window functions / recursive CTEs | Open (large; deferred) |
+| G9 | LIKE / NOT LIKE / ILIKE | Delivered under item 30 |
+| G11 | Full-text SQL predicate | Delivered under item 30 |

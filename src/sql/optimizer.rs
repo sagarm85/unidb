@@ -332,6 +332,32 @@ fn collect_qualifiers(expr: &QExpr, out: &mut std::collections::HashSet<String>)
             out.insert(String::new()); // force residual
             out.insert("__subquery__".into());
         }
+        // G1 (item 19): CASE/COALESCE/NULLIF — recurse into sub-expressions.
+        QExpr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                collect_qualifiers(op, out);
+            }
+            for (cond, then) in conditions {
+                collect_qualifiers(cond, out);
+                collect_qualifiers(then, out);
+            }
+            if let Some(e) = else_result {
+                collect_qualifiers(e, out);
+            }
+        }
+        QExpr::Coalesce(args) => {
+            for a in args {
+                collect_qualifiers(a, out);
+            }
+        }
+        QExpr::Nullif { lhs, rhs } => {
+            collect_qualifiers(lhs, out);
+            collect_qualifiers(rhs, out);
+        }
     }
 }
 
@@ -559,6 +585,32 @@ fn collect_columns(expr: &QExpr, out: &mut Vec<(Option<String>, String)>) {
             collect_columns(query, out);
         }
         QExpr::Arith { lhs, rhs, .. } => {
+            collect_columns(lhs, out);
+            collect_columns(rhs, out);
+        }
+        // G1 (item 19): recurse into CASE/COALESCE/NULLIF sub-expressions.
+        QExpr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                collect_columns(op, out);
+            }
+            for (cond, then) in conditions {
+                collect_columns(cond, out);
+                collect_columns(then, out);
+            }
+            if let Some(e) = else_result {
+                collect_columns(e, out);
+            }
+        }
+        QExpr::Coalesce(args) => {
+            for a in args {
+                collect_columns(a, out);
+            }
+        }
+        QExpr::Nullif { lhs, rhs } => {
             collect_columns(lhs, out);
             collect_columns(rhs, out);
         }
