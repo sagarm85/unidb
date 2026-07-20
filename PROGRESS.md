@@ -8978,3 +8978,68 @@ No throughput regression observed in CI.
 
 **No `libc` dependency added:** Uses `memmap2::Advice::WillNeed` (already in
 the dependency tree via `memmap2`), not raw `libc::madvise`.
+
+---
+
+## Item 38 — Parameter type coercion   [SHIPPED]   2026-07-20
+
+**PR:** pending (branch `feat/item-38-param-coercion`)
+**Summary:** Lossless implicit coercion between Text/Int/Float/Bool in the SQL
+comparison evaluator (`executor::compare`). `WHERE int_col = $1` with a
+`Text("42")` bound parameter now works, matching PostgreSQL/SQLite behaviour.
+The write path (INSERT/UPDATE coerce_value) is deliberately unchanged — it
+stays strict, requiring the correctly-typed literal on insert.
+
+**Root cause of pre-existing bug:** The item-38 Text↔Float coercion arms were
+positioned *after* the general Float catch-all arm `(Literal::Float(_), _) |
+(_, Literal::Float(_))`. When comparing a stored `Float(3.14)` to a bound
+`Text("3.14")` param, the Float arm fired first, called `float_of(Text(…))` →
+`None`, and returned a `SqlUnsupported` error. Fix: moved all five item-38
+coercion arms *before* the Float catch-all so the pattern-matching short-circuits
+to the parse path for any `(Float, Text)` or `(Text, Float)` pair.
+
+**Coercion matrix implemented in `executor::compare`:**
+
+| Left type | Right type | Action |
+|-----------|------------|--------|
+| `Text(s)` | `Int(b)` | `s.parse::<i64>()` — error if non-numeric |
+| `Int(a)` | `Text(s)` | `s.parse::<i64>()` — error if non-numeric |
+| `Text(s)` | `Float` or `Decimal` | `s.parse::<f64>()` then float comparison |
+| `Float` or `Decimal` | `Text(s)` | `s.parse::<f64>()` then float comparison |
+| `Text(s)` | `Bool(b)` | `parse_bool_text(s)` — accept "true"/"false"/"1"/"0"/"t"/"f" |
+| `Bool(b)` | `Text(s)` | `parse_bool_text(s)` — same spelling set |
+| `Float` | `Int` | already handled by existing float arm (float_of(Int) → Some) |
+| `Int` | `Float` | same: float arm handles both directions |
+
+**Scope — write path stays strict:** `coerce_value` (INSERT/UPDATE) is unchanged.
+`Text("42")` into an INT column is rejected with a type error as before. Only
+the predicate comparison path (`compare`) performs implicit coercion.
+
+**Tests (new file `tests/item38_param_coercion.rs` — 18 tests):**
+
+| Test | Covers |
+|------|--------|
+| `text_to_int_eq_matches` | Text("42") = Int col → 1 row |
+| `text_to_int_gt_filter` | Text("15") > Int col → filtered rows |
+| `text_non_numeric_to_int_is_error` | Text("abc") vs Int → Err |
+| `text_to_int_rhs_and_lhs_symmetry` | param on RHS |
+| `text_to_float_eq_matches` | Text("3.14") = Float col → 1 row |
+| `text_non_numeric_to_float_is_error` | Text("bad") vs Float → Err |
+| `int_to_float_widening_matches` | Int(3) = Float(3.0) col → 1 row |
+| `float_exact_integer_matches_int_col` | Float(3.0) = Int(3) → 1 row |
+| `float_fractional_does_not_match_int_col` | Float(3.7) vs Int(3) → 0 rows or Err |
+| `text_true_to_bool_matches` | Text("true") = Bool(true) → 1 row |
+| `text_one_to_bool_matches_true` | Text("1") = Bool(true) → 1 row |
+| `text_false_to_bool_matches` | Text("false") = Bool(false) → 1 row |
+| `text_uppercase_true_to_bool` | Text("TRUE") case-insensitive → 1 row |
+| `text_invalid_bool_coercion_is_error` | Text("maybe") vs Bool → Err |
+| `int_to_text_col_matches` | Int(42) vs Text("42") col → 1 row |
+| `insert_text_into_int_col_is_strict` | INSERT Text("42") → INT rejects |
+| `typed_int_param_no_regression` | existing Int param still works |
+| `typed_text_param_no_regression` | existing Text param still works |
+
+**Crash harness:** no storage or WAL change — crash harness unaffected.
+**No FORMAT_VERSION bump:** pure evaluator change, zero on-disk impact.
+**`cargo clippy -- -D warnings`:** clean.
+**`cargo fmt --all`:** clean.
+**Full suite:** `cargo test` — all tests pass (no regressions).

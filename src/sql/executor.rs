@@ -5164,32 +5164,6 @@ pub(crate) fn compare(op: CmpOp, l: &Literal, r: &Literal) -> Result<bool> {
         (Literal::Text(a), Literal::Timestamp(b)) => {
             Ok(apply_cmp(op, datetime::parse_timestamp(a)?.cmp(b)))
         }
-        // Float ordering (P2.b), mixing with Int/Decimal via f64. A NaN
-        // operand makes every comparison false (IEEE-754 unordered), matching
-        // the NULL-operand convention above.
-        (Literal::Float(_), _) | (_, Literal::Float(_)) => match (float_of(l), float_of(r)) {
-            (Some(a), Some(b)) => Ok(match a.partial_cmp(&b) {
-                Some(ord) => apply_cmp(op, ord),
-                None => false,
-            }),
-            _ => Err(DbError::SqlUnsupported(format!(
-                "cannot compare {l:?} with {r:?}"
-            ))),
-        },
-        // UUID / DATE / TIME: equality + ordering by their natural key; a Text
-        // operand is parsed on demand so `WHERE d > '2024-01-01'` reads well.
-        (Literal::Uuid(a), Literal::Uuid(b)) => Ok(apply_cmp(op, a.cmp(b))),
-        (Literal::Uuid(a), Literal::Text(b)) => Ok(apply_cmp(op, a.cmp(&parse_uuid(b)?))),
-        (Literal::Text(a), Literal::Uuid(b)) => Ok(apply_cmp(op, parse_uuid(a)?.cmp(b))),
-        (Literal::Bytea(a), Literal::Bytea(b)) => Ok(apply_cmp(op, a.cmp(b))),
-        (Literal::Bytea(a), Literal::Text(b)) => Ok(apply_cmp(op, a.cmp(&parse_bytea(b)))),
-        (Literal::Text(a), Literal::Bytea(b)) => Ok(apply_cmp(op, parse_bytea(a).cmp(b))),
-        (Literal::Date(a), Literal::Date(b)) => Ok(apply_cmp(op, a.cmp(b))),
-        (Literal::Date(a), Literal::Text(b)) => Ok(apply_cmp(op, a.cmp(&datetime::parse_date(b)?))),
-        (Literal::Text(a), Literal::Date(b)) => Ok(apply_cmp(op, datetime::parse_date(a)?.cmp(b))),
-        (Literal::Time(a), Literal::Time(b)) => Ok(apply_cmp(op, a.cmp(b))),
-        (Literal::Time(a), Literal::Text(b)) => Ok(apply_cmp(op, a.cmp(&datetime::parse_time(b)?))),
-        (Literal::Text(a), Literal::Time(b)) => Ok(apply_cmp(op, datetime::parse_time(a)?.cmp(b))),
         // Item 38: implicit parameter type coercion (=, <, >, <=, >=, !=).
         // When a bind parameter arrives as Text but the column is Int/Float/Bool
         // (or vice-versa), attempt a lossless parse so `WHERE int_col = $1`
@@ -5197,8 +5171,11 @@ pub(crate) fn compare(op: CmpOp, l: &Literal, r: &Literal) -> Result<bool> {
         // implicit coercion semantics. NOT applied to LIKE/MATCH (dedicated
         // arms above).
         //
-        // Text → Int: parse i64. Text → Float: parse f64 (dispatched through
-        // the Float arm). Int/Bool → Text: to_string (safe widening).
+        // These arms must come BEFORE the general Float arm (which catches any
+        // (Float, _) pair) so that Text↔Float pairs reach the parse path
+        // rather than the float_of() → None → error path.
+        //
+        // Text → Int: parse i64.
         // Non-parseable value → clear error, never a panic.
         (Literal::Text(s), Literal::Int(b)) => {
             let a: i64 = s.parse().map_err(|_| {
@@ -5238,6 +5215,8 @@ pub(crate) fn compare(op: CmpOp, l: &Literal, r: &Literal) -> Result<bool> {
             }
         }
         // Text → Float/Decimal: parse as f64, dispatch through float path.
+        // Must precede the general Float arm so (Float, Text) and (Decimal, Text)
+        // pairs are parsed rather than reaching the float_of(Text) → None branch.
         (Literal::Text(s), _) if matches!(r, Literal::Float(_) | Literal::Decimal(_, _)) => {
             let f: f64 = s.parse().map_err(|_| {
                 DbError::SqlPlan(format!("cannot coerce text '{s}' to float for comparison"))
@@ -5250,6 +5229,34 @@ pub(crate) fn compare(op: CmpOp, l: &Literal, r: &Literal) -> Result<bool> {
             })?;
             compare(op, l, &Literal::Float(f))
         }
+        // Float ordering (P2.b), mixing with Int/Decimal via f64. A NaN
+        // operand makes every comparison false (IEEE-754 unordered), matching
+        // the NULL-operand convention above.
+        // Text operands are handled by the item-38 arms above, so this arm
+        // only sees numeric (Int/Float/Decimal) pairs on both sides.
+        (Literal::Float(_), _) | (_, Literal::Float(_)) => match (float_of(l), float_of(r)) {
+            (Some(a), Some(b)) => Ok(match a.partial_cmp(&b) {
+                Some(ord) => apply_cmp(op, ord),
+                None => false,
+            }),
+            _ => Err(DbError::SqlUnsupported(format!(
+                "cannot compare {l:?} with {r:?}"
+            ))),
+        },
+        // UUID / DATE / TIME: equality + ordering by their natural key; a Text
+        // operand is parsed on demand so `WHERE d > '2024-01-01'` reads well.
+        (Literal::Uuid(a), Literal::Uuid(b)) => Ok(apply_cmp(op, a.cmp(b))),
+        (Literal::Uuid(a), Literal::Text(b)) => Ok(apply_cmp(op, a.cmp(&parse_uuid(b)?))),
+        (Literal::Text(a), Literal::Uuid(b)) => Ok(apply_cmp(op, parse_uuid(a)?.cmp(b))),
+        (Literal::Bytea(a), Literal::Bytea(b)) => Ok(apply_cmp(op, a.cmp(b))),
+        (Literal::Bytea(a), Literal::Text(b)) => Ok(apply_cmp(op, a.cmp(&parse_bytea(b)))),
+        (Literal::Text(a), Literal::Bytea(b)) => Ok(apply_cmp(op, parse_bytea(a).cmp(b))),
+        (Literal::Date(a), Literal::Date(b)) => Ok(apply_cmp(op, a.cmp(b))),
+        (Literal::Date(a), Literal::Text(b)) => Ok(apply_cmp(op, a.cmp(&datetime::parse_date(b)?))),
+        (Literal::Text(a), Literal::Date(b)) => Ok(apply_cmp(op, datetime::parse_date(a)?.cmp(b))),
+        (Literal::Time(a), Literal::Time(b)) => Ok(apply_cmp(op, a.cmp(b))),
+        (Literal::Time(a), Literal::Text(b)) => Ok(apply_cmp(op, a.cmp(&datetime::parse_time(b)?))),
+        (Literal::Text(a), Literal::Time(b)) => Ok(apply_cmp(op, datetime::parse_time(a)?.cmp(b))),
         (a, b) => Err(DbError::SqlUnsupported(format!(
             "cannot compare {a:?} with {b:?}"
         ))),
