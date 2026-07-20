@@ -111,10 +111,11 @@
 | 101 | `101_group_commit.md` | Performance | ✅ SHIPPED 2026-07-20 (PR #170) — group-commit dwell window in WAL `sync_up_to`; `PUT /config/group_commit_window_us`; `Engine::wal_fsyncs_count()`. |
 | 102 | `102_index_only_scan.md` | Performance | ✅ SHIPPED 2026-07-20 — Phase A (PR #169): key-col projection index-only, `IDX_ONLY_ROWS`; Phase B (PR #177): covering index `INCLUDE (cols)`, FORMAT_VERSION 12, `IDX_INCLUDE_ROWS`, HOT gate for INCLUDE cols. |
 | 103 | `103_authz_v2_studio_integration_gaps.md` | Improvement | ✅ SHIPPED 2026-07-20 (PR #173) — superuser/no-sub RLS bypass on concurrent-read path; `ReadHandle::execute_sql_as`; doc fixes (`CREATE ROLE SUPERUSER` → `CREATE USER SUPERUSER`, add `role_members`/`users` to catalog virtual relations). See PROGRESS.md "Item 103". |
+| 104 | `104_catalog_sync_dedup.md` | Performance | ✅ SHIPPED 2026-07-20 — remove `wal.sync_up_to(catalog_lsn)` after `catalog.persist_only()` in commit; `ROW_COUNT_UNKNOWN` sentinel on load; COUNT(*) calibrates via heap scan after crash. See PROGRESS.md "Item 104". |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `104_…`.**
+**Next new file → `105_…`.**
 
 ## Next up — priority order (2026-07-20, post PR #171 merge + 102-B)
 
@@ -133,7 +134,7 @@ State after 2026-07-20 (items 51/67/68/69/101/102-A/102-B all shipped):
 
 **Next priority items:**
 
-1. **#104 Catalog sync dedup** — remove `wal.sync_up_to(catalog_lsn)` after `catalog.persist_only()`; eliminates double-fsync-per-INSERT; catalog row-count recomputed from heap on crash.
+1. ~~**#104 Catalog sync dedup**~~ — ✅ SHIPPED 2026-07-20 (→ PROGRESS.md "Item 104 — Catalog sync dedup"). Remove `wal.sync_up_to(catalog_lsn)` after `catalog.persist_only()`; eliminates double-fsync-per-INSERT; catalog row-count recomputed from heap on crash.
 2. ~~**#102-B Covering index**~~ — ✅ SHIPPED 2026-07-20 (PR #177).
 3. ~~**#93 HNSW arena layout**~~ — ✅ SHIPPED 2026-07-20 (PR #175).
 4. ~~**#94 NEAR lightweight snapshot**~~ — ✅ SHIPPED 2026-07-20 (PR #176).

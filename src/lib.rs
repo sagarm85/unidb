@@ -106,7 +106,7 @@ use std::time::{Duration, Instant};
 use crate::{
     btree_index::{DiskBTree, OrderedValue},
     bufferpool::BufferPool,
-    catalog::{Catalog, CatalogCtx, IndexKind, IndexStatus, TableDef},
+    catalog::{Catalog, CatalogCtx, IndexKind, IndexStatus, TableDef, ROW_COUNT_UNKNOWN},
     control::ControlData,
     error::Result,
     format::{Lsn, PageId, Xid, DEFAULT_PAGE_SIZE, HOT_NEXT_NONE, HOT_NEXT_XPAGE},
@@ -3651,47 +3651,40 @@ impl Engine {
         }
 
         // Item 97: apply row-count deltas now that the transaction is committed
-        // and WAL-durable. This writes a new catalog page (mini-txn) so the
-        // updated row_count survives restart. A failure here is non-fatal: the
-        // heap data is durable; row_count just remains stale until the next DML
-        // commit re-persists it. The delta map is always empty for DDL/read-only
-        // transactions, so there is no overhead for those paths.
+        // and WAL-durable. The delta is applied to the in-memory catalog only.
+        // Item 104: do NOT call persist_only() here. Persisting the catalog in
+        // the commit path writes a WAL mini-txn and flips catalog_root in the
+        // control file per commit. Without a matching sync_up_to(catalog_lsn),
+        // those catalog WAL records are not in the shipped replication stream
+        // even though catalog_root points at them — causing SlotOutOfRange on
+        // the replica. The correct model (matching Postgres pg_class.reltuples):
+        //   - row_count is exact in-memory across commits (deltas applied here)
+        //   - row_count is durable at checkpoint granularity (persist happens in
+        //     Engine::checkpoint, which calls sync_up_to before flush_all)
+        //   - after a crash, ROW_COUNT_UNKNOWN triggers a heap-scan recalibration
+        //     on the first COUNT(*), then subsequent commits resume exact tracking
+        // The delta map is always empty for DDL/read-only transactions, so this
+        // block has zero overhead on those paths.
         if !row_count_deltas.is_empty() {
             let mut cat = cat_write(&self.catalog);
-            {
-                let tables = cat.tables_mut();
-                for (table, delta) in &row_count_deltas {
-                    if *delta == i64::MIN {
-                        // TRUNCATE sentinel — reset to 0.
-                        if let Some(t) = tables.get_mut(table.as_str()) {
-                            t.row_count = 0;
-                        }
-                    } else if *delta != 0 {
-                        if let Some(t) = tables.get_mut(table.as_str()) {
+            let tables = cat.tables_mut();
+            for (table, delta) in &row_count_deltas {
+                if *delta == i64::MIN {
+                    // TRUNCATE sentinel — reset to exact 0 (overrides UNKNOWN).
+                    if let Some(t) = tables.get_mut(table.as_str()) {
+                        t.row_count = 0;
+                    }
+                } else if *delta != 0 {
+                    if let Some(t) = tables.get_mut(table.as_str()) {
+                        // If row_count is UNKNOWN (set on engine open after a
+                        // crash), skip the delta — the in-memory count cannot be
+                        // safely adjusted from an unknown base. The next COUNT(*)
+                        // will re-scan the heap to recalibrate, after which
+                        // deltas from subsequent commits will be exact.
+                        if t.row_count != ROW_COUNT_UNKNOWN {
                             t.row_count = t.row_count.saturating_add(*delta);
                         }
                     }
-                }
-            }
-            let mut ctx = CatalogCtx {
-                pool: &self.pool,
-                wal: &self.wal,
-                control_path: &self.control_path,
-                control: &self.control,
-                page_size: self.page_size,
-            };
-            match cat.persist_only(&mut ctx) {
-                Ok(catalog_lsn) => {
-                    // The catalog mini-txn was written under deferred-sync mode, so
-                    // `commit_mini_txn` did NOT advance `durable_lsn`. Advance it
-                    // now so `ship_wal` / `records_from` include the catalog pages
-                    // in the replication stream (item 97 fix).
-                    if let Err(e) = self.wal.sync_up_to(catalog_lsn) {
-                        tracing::warn!("item 97: WAL sync after catalog persist failed: {e}");
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("item 97: row_count catalog write failed after commit: {e}");
                 }
             }
         }

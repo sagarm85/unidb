@@ -8209,17 +8209,16 @@ mod tests {
             ExecResult::Inserted { count } => assert_eq!(count, 100),
             o => panic!("expected Inserted, got {o:?}"),
         }
-        // Expected mini-txn budget after items 97 + 98:
+        // Expected mini-txn budget after items 97 + 98 + 104:
         //   1 — heap-page alloc (alloc_heap_page, its own bracket)
         //   1 — accumulating INSERT for all 100 rows sharing ONE WAL_BEGIN/WAL_COMMIT
-        //   1 — catalog row_count update (item 97: TableDef.row_count persisted to the
-        //       catalog page after every INSERT statement)
-        // Total = 3.  Before item 98 the delta was 101 (1 alloc + 100 per-row brackets).
-        // Before item 97 the delta was 2 (no catalog update).
+        // Total = 2.  Before item 98 the delta was 101 (1 alloc + 100 per-row brackets).
+        // Item 97 added a 3rd mini-txn for catalog row_count; item 104 removed it:
+        // row_count is now in-memory exact (updated in commit), durable at checkpoint.
         let delta = after - before;
         assert!(
             delta <= 3,
-            "item 98+97: 100-row INSERT on one page must use ≤ 3 mini-txns (alloc + accumulating + row_count catalog), got {delta}"
+            "item 98+97+104: 100-row INSERT on one page must use ≤ 3 mini-txns (alloc + accumulating), got {delta}"
         );
     }
 

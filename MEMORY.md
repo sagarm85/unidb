@@ -12,6 +12,19 @@
 
 ## Current status
 
+- **Item 104 — Catalog sync dedup — SHIPPED 2026-07-20, PR [#180](https://github.com/sagarm85/unidb/pull/180) open.**
+  Removed `wal.sync_up_to(catalog_lsn)` AND `catalog.persist_only()` from `Engine::commit`.
+  (Just removing the fsync while keeping `persist_only()` caused a replication regression:
+  `persist_only()` flips `catalog_root` in the control file, but without the matching fsync the
+  catalog WAL records weren't in the shipped replication stream → `SlotOutOfRange` on replica.)
+  The correct fix: row_count is updated in-memory on every commit, persisted to disk only at
+  checkpoint. Added `ROW_COUNT_UNKNOWN = i64::MIN` sentinel; `Catalog::load` resets all
+  `row_count` to UNKNOWN on open. COUNT(*) fast path falls back to `count_visible` heap scan
+  when UNKNOWN; caches result back if catalog handle is Exclusive. Delta-apply guards UNKNOWN base.
+  New crash test `p104_catalog_sync_dedup_crash_recovery_count_exact` (4 phases).
+  54/54 crash tests, 463/463 lib tests. Clippy + fmt clean.
+  **Expected: ≥ 1.3× INSERT throughput (eliminates per-commit serialized fsync).**
+
 - **Item 102-B — Covering index INCLUDE columns — SHIPPED 2026-07-20, PR [#177](https://github.com/sagarm85/unidb/pull/177) MERGED.**
   `CREATE INDEX ON t (col) INCLUDE (c1, c2, …)` — stores INCLUDE col values in B-tree leaf.
   Leaf wire format: `key_bytes | include_len:u32-LE | include_bytes | RowId(6B)`.
@@ -3585,6 +3598,47 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-20 — Item 104: Catalog sync dedup (remove double-fsync per INSERT)
+
+**Goal:** Remove `wal.sync_up_to(catalog_lsn)` from `Engine::commit` — the second fsync added
+by item 97 that ran outside the group-commit window, halving INSERT throughput under concurrent load.
+
+**Changes shipped:**
+
+1. `src/catalog.rs` — Added `pub const ROW_COUNT_UNKNOWN: i64 = i64::MIN`. `Catalog::load`
+   calls new `reset_row_counts_unknown()` helper after parsing, resetting all table
+   `row_count` to `ROW_COUNT_UNKNOWN` so COUNT(*) falls back to heap scan after crash.
+
+2. `src/lib.rs` — Removed `wal.sync_up_to(catalog_lsn)` AND `catalog.persist_only()` from
+   `Engine::commit`. Retaining `persist_only()` caused replication regression: it flips
+   `catalog_root` in control file per commit, but without matching fsync the catalog WAL records
+   weren't in the shipped stream → replica gets `SlotOutOfRange`. Fix: in-memory only in commit;
+   checkpoint persists. Added UNKNOWN guard in delta application. Import `ROW_COUNT_UNKNOWN`.
+
+3. `src/sql/query_exec.rs` — Extended item 97 COUNT(*) fast path: when `row_count == UNKNOWN`,
+   falls back to `count_visible` heap scan; caches result via `exclusive()` if handle permits.
+   Import `ROW_COUNT_UNKNOWN`.
+
+4. `tests/crash/main.rs` — Added `p104_catalog_sync_dedup_crash_recovery_count_exact` (4 phases:
+   insert 100 rows + crash, COUNT=100, COUNT=100 again, insert 50 more + COUNT=150). All three
+   COUNT checks use heap scan (UNKNOWN sentinel). 54/54 crash tests PASS.
+
+5. `docs/backlog/104_catalog_sync_dedup.md` — created (SHIPPED status).
+
+6. `docs/backlog/backlog_index.md` — item 104 registered (SHIPPED); "Next new file → 105_…".
+
+7. `PROGRESS.md` — Item 104 entry added.
+
+**Durability contract change:** `row_count` on disk is now checkpoint-granularity (was commit-granularity).
+COUNT(*) is always exact in memory and always exact after crash (via heap scan recalibration).
+
+**Tests:** 54/54 crash PASS. 463/463 lib unit tests PASS (replication tests apply_is_idempotent +
+base_plus_incremental_then_promote now PASS — were failing with just sync_up_to removed). Clippy + fmt clean.
+
+**Performance:** Docker bench pending. Expected ≥ 1.3× INSERT throughput under 32 concurrent writers.
+
+---
 
 ### 2026-07-20 — Item 102-B: Covering index INCLUDE columns
 

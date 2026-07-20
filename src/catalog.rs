@@ -49,6 +49,22 @@ const CATALOG_CHAIN_MAGIC: u32 = 0xC0DA_7A10;
 /// Bytes used by the per-page chain header (magic u32 + next_page_id u32).
 const CHAIN_HEADER_SIZE: usize = 8;
 
+/// Sentinel value for `TableDef::row_count` meaning the count is unknown and
+/// must be recomputed via a heap scan before use.
+///
+/// Set on every table when the catalog is loaded from disk (item 104): because
+/// `row_count` is now only flushed to disk at checkpoint time (not on every
+/// commit), the value persisted on disk may be stale after a crash. Setting
+/// it to this sentinel on load causes the O(1) `COUNT(*)` fast path to detect
+/// "unknown" and fall through to `count_visible` (an exact heap scan), then
+/// cache the result in-memory. The sentinel is cleared by the first such
+/// recalibration.
+///
+/// `i64::MIN` is safe here because the delta map uses this same bit-pattern
+/// only as a *delta* sentinel (TRUNCATE → reset to 0), never as a stored
+/// `row_count` value.
+pub const ROW_COUNT_UNKNOWN: i64 = i64::MIN;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ColumnType {
     Int64,
@@ -436,12 +452,28 @@ impl Catalog {
             let magic = u32_from_le(first_payload[0..4].try_into().unwrap());
             if magic == CATALOG_CHAIN_MAGIC {
                 let json = Self::collect_chain(first_payload, pool)?;
-                return Self::parse_blob(&json);
+                let mut cat = Self::parse_blob(&json)?;
+                cat.reset_row_counts_unknown();
+                return Ok(cat);
             }
         }
 
         // Legacy single-page format (pre-item-25 blobs open unchanged).
-        Self::parse_blob(&first_payload)
+        let mut cat = Self::parse_blob(&first_payload)?;
+        cat.reset_row_counts_unknown();
+        Ok(cat)
+    }
+
+    /// Item 104: reset every table's `row_count` to `ROW_COUNT_UNKNOWN` on
+    /// load. Because `row_count` is now only flushed to disk at checkpoint
+    /// time (no longer on every commit), the value stored in the catalog blob
+    /// may be stale after a crash. Marking it unknown forces the O(1)
+    /// `COUNT(*)` fast path to fall back to a heap scan, which returns the
+    /// exact committed count regardless of what the catalog blob said.
+    fn reset_row_counts_unknown(&mut self) {
+        for t in self.tables.values_mut() {
+            t.row_count = ROW_COUNT_UNKNOWN;
+        }
     }
 
     /// Reassemble the JSON from a page chain, given the first page's payload.
