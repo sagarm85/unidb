@@ -1,7 +1,7 @@
 # Implicit parameter type coercion in SQL comparisons
 
 **Type:** Improvement
-**Status:** NOT STARTED
+**Status:** SHIPPED 2026-07-20 — see PROGRESS.md "Item 38 — Parameter type coercion"
 
 ## Problem
 
