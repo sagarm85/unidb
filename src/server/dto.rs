@@ -264,6 +264,54 @@ pub struct AuthPreviewRequest {
     pub sql: String,
 }
 
+/// Body of `POST /auth/login` (item 100, `UNIDB_DEV_LOGIN=1` only).
+/// Passwordless identification — dev/demo only.
+#[derive(Debug, Deserialize)]
+pub struct AuthLoginRequest {
+    pub username: String,
+}
+
+/// Response of `POST /auth/login`.
+#[derive(Debug, Serialize)]
+pub struct AuthLoginResponse {
+    pub token: String,
+    pub expires_in: u64,
+}
+
+/// Response of `GET /auth/meta`.
+#[derive(Debug, Serialize)]
+pub struct AuthMetaResponse {
+    /// `true` when no users are registered — all RLS is inactive and any
+    /// valid JWT (or no JWT if middleware is disabled) has full access.
+    pub open_mode: bool,
+    /// The four grantable privilege operations.
+    pub privilege_types: Vec<&'static str>,
+    /// The five policy scopes (SELECT/INSERT/UPDATE/DELETE/ALL).
+    pub policy_operations: Vec<&'static str>,
+    /// All queryable catalog relations.
+    pub catalog_tables: Vec<&'static str>,
+    /// Whether dev login (`POST /auth/login`) is enabled on this server.
+    pub dev_login_enabled: bool,
+}
+
+/// Response of `GET /auth/whoami`.
+#[derive(Debug, Serialize)]
+pub struct WhoamiResponse {
+    pub user: Option<String>,
+    pub is_superuser: bool,
+    pub roles: Vec<String>,
+    /// Per-table privileges: `[{table, ops: ["SELECT", ...]}]`.
+    pub privileges: Vec<WhoamiPrivilege>,
+    /// `true` when open/bootstrap mode (user is None or no users configured).
+    pub open_mode: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WhoamiPrivilege {
+    pub table: String,
+    pub ops: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CypherRequest {
     pub query: String,

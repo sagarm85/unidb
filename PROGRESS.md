@@ -8178,3 +8178,113 @@ Max 256 statements (`UNIDB_BATCH_SQL_MAX`); 257+ → 400 `BATCH_TOO_LARGE`.
 `batch_sql_auth_per_statement`, `batch_sql_too_large`. All PASS.
 
 `docs/REST_API.md` updated with new route + request/response schema.
+
+---
+
+## Item 24 R-a + R-b — UPDATE WITH CHECK enforcement + bootstrap observability (2026-07-20)
+
+**Branch:** `feat/item-24-rls-hardening-login` | **PR:** pending
+**Commit:** see PR
+
+### R-a — UPDATE write-side WITH CHECK (SHIP-BLOCKER fix)
+
+**Problem confirmed (live probe on main @ 196e8aa, 2026-07-20):**
+`alice` runs `UPDATE todos SET user_id = 'bob' WHERE id = 1` under a policy
+`USING (user_id = current_user)` — accepted. She transfers row ownership to bob and
+loses visibility of it. Postgres rejects this.
+
+**Root cause:** `exec_update` applied `USING` only as a scan-row filter (which rows can
+be targeted), never as a write-side check (whether the *new* row satisfies the policy).
+All three update paths (HOT batch, non-HOT batch, per-row fallback) had this gap.
+
+**Fix:**
+- `authz/mod.rs`: `PolicyDef` gains `with_check_sql: Option<String>`; `parse_create_policy`
+  detects `WITH CHECK (<expr>)` after the USING close-paren.
+- `catalog.rs`: `TableDef` gains `update_with_check: Option<Expr>` (OR-merged from all
+  UPDATE/ALL policies, same as `update_policy` for scan filtering).
+- `lib.rs` `create_policy_inner` / `drop_policy_inner`: compute and maintain `update_with_check`.
+- `sql/executor.rs`: new `exec_update_with_check(table_def, new_row, ctx)` called after
+  `enforce_checks` in all three `exec_update` paths. Superuser/embedded path (`ctx.current_user
+  = None`) always bypasses — mirrors how USING scan-filters are skipped for None user.
+- When no explicit `WITH CHECK` is specified, USING doubles as WITH CHECK (Postgres semantics).
+- `information_schema.rs`: `unidb_catalog.policies` adds `with_check_expr` column (NULL when
+  not specified) and `enforced` column.
+
+**No `FORMAT_VERSION` bump:** `with_check_sql`/`update_with_check` use `#[serde(default,
+skip_serializing_if)]` — old catalog blobs deserialize with `None`.
+
+**Tests:** `tests/item24_rls_with_check.rs` — 8 tests:
+1. `update_ownership_transfer_rejected_by_with_check` — main escape now rejected
+2. `update_within_policy_is_allowed` — legitimate non-owner-column update still passes
+3. `explicit_with_check_differs_from_using` — explicit WITH CHECK distinct from USING
+4. `all_policy_with_check_applies_everywhere` — FOR ALL WITH CHECK blocks UPDATE
+5. `insert_policy_unchanged_by_r_a` — INSERT path regression guard
+6. `bootstrap_mode_bypasses_with_check` — superuser/no-user path bypasses all WITH CHECK
+7. `policies_catalog_enforced_false_before_first_user` — Slice 2 enforced column
+8. `policies_catalog_with_check_expr_populated_when_set` — with_check_expr populated
+
+### R-b — Bootstrap-mode observability
+
+**Problem:** When policies exist but no `CREATE USER` has been run, RLS is silently inactive
+(correct design — open mode). But there was no signal visible to operators.
+
+**Fix:**
+- `unidb_catalog.policies`: `enforced` column — `false` when `!authz.has_users()`, `true` once
+  any user exists. Clients can query this to detect inactive policies.
+- Startup warning: on engine open, if policies exist but no users are registered, emits
+  `tracing::warn!("RLS policies are defined but no users exist (bootstrap mode) — all row-level
+  security is currently INACTIVE. Run CREATE USER <name> SUPERUSER to activate RLS.")`.
+
+### Performance gates
+
+| Gate | Result | Threshold |
+|------|--------|-----------|
+| Gate 1 — superuser SELECT on policy-table vs no-policy engine | **1.00×** | ≤ 1.15× ✅ |
+| Gate 2 — RLS policy SELECT vs equivalent manual WHERE (2k rows, release) | **1.02×** | ≤ 1.10× ✅ |
+
+---
+
+## Item 100 — GET /auth/meta + POST /auth/login + GET /auth/whoami (2026-07-20)
+
+**Branch:** `feat/item-24-rls-hardening-login` (same PR as R-a/R-b) | **PR:** pending
+
+> **Security note:** `POST /auth/login` is a passwordless dev/demo endpoint, gated behind
+> `UNIDB_DEV_LOGIN=1`. Milestone-18 "verify-only" JWT production contract is unchanged.
+
+### What shipped
+
+**`GET /auth/meta`** (public, no JWT):
+Discovery endpoint for client libraries and admin UIs. Returns `open_mode` (no users registered),
+`privilege_types`, `policy_operations`, `catalog_tables`, and `dev_login_enabled`. Useful as a
+pre-auth probe — clients know whether to show a login form before asking for credentials.
+
+**`POST /auth/login`** (`UNIDB_DEV_LOGIN=1` only):
+Passwordless token issuance for dev/demo use. Issues an HS256 JWT (1-hour TTL, same secret as
+`UNIDB_JWT_SECRET`) for the named user. User must exist (`CREATE USER`); unknown users → 404.
+Server logs `WARN` at startup when this flag is set.
+
+**`GET /auth/whoami`** (JWT required):
+Returns the caller's `user` (JWT `sub`), `is_superuser`, `roles`, per-table `privileges`,
+and `open_mode`. Useful for "who am I" display in UIs and for debugging grant issues.
+
+**Implementation highlights:**
+- `server/auth.rs`: `JwtConfig` extended with `encoding_key: Option<EncodingKey>` and
+  `with_dev_login(secret)` constructor; `issue_token(username)` method.
+- `server/mod.rs`: `AppState.dev_login_jwt: Option<JwtConfig>` + `with_dev_login()` builder.
+- `server/engine_handle.rs`: `has_users()`, `user_snapshot()`, `user_grants()`, `user_roles()`.
+- `server/router.rs`: `auth_public` sub-router (`GET /auth/meta` + `POST /auth/login`) merged
+  without auth middleware; `GET /auth/whoami` on protected router.
+- `src/bin/unidb-server.rs`: reads `UNIDB_DEV_LOGIN` env var, warns and sets `with_dev_login`.
+- `authz/mod.rs`: `table_grants_for(user)` and `roles_for(user)` helpers for whoami.
+
+**Tests:** `tests/item100_auth_endpoints.rs` — 9 server integration tests (requires `server`
+feature):
+1. `auth_meta_returns_static_fields` — static fields always present
+2. `auth_meta_open_mode_true_when_no_users` — open_mode before CREATE USER
+3. `auth_meta_open_mode_false_after_user_created` — open_mode flips after first user
+4. `auth_meta_dev_login_flag_reflects_config` — dev_login_enabled reflects server config
+5. `auth_login_disabled_when_flag_off` — 403 without UNIDB_DEV_LOGIN
+6. `auth_login_issues_valid_token` — issued token accepted on protected routes
+7. `auth_login_unknown_user_returns_4xx` — 404 for non-existent user
+8. `auth_whoami_returns_user_and_grants` — correct identity, roles, privileges
+9. `auth_whoami_implicit_superuser_has_no_sub` — open-mode token sub returned as-is

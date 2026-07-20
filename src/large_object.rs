@@ -77,6 +77,7 @@ pub fn lobs_table_def() -> TableDef {
         insert_policy: None,
         update_policy: None,
         delete_policy: None,
+            update_with_check: None,
         policies: vec![],
         events_enabled: false,
         serial_next: Default::default(),

@@ -338,6 +338,39 @@ impl EngineHandle {
             .await
     }
 
+    /// Whether any user exists in the role store — `false` = open/bootstrap mode
+    /// (RLS policies are inactive).  Used by `GET /auth/meta`.
+    pub async fn has_users(&self) -> bool {
+        self.on_engine(|e| Ok(e.authz.has_users()))
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Return a snapshot of all users (name, is_superuser) for `GET /auth/whoami`.
+    pub async fn user_snapshot(&self) -> Vec<(String, bool)> {
+        self.on_engine(|e| Ok(e.authz.users()))
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Roles and table-level grants for a user (name, table, privileges).
+    /// Used by `GET /auth/whoami`.
+    pub async fn user_grants(
+        &self,
+        user: String,
+    ) -> Vec<(String, Vec<String>)> {
+        self.on_engine(move |e| Ok(e.authz.table_grants_for(&user)))
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Roles a user is a member of (transitively).
+    pub async fn user_roles(&self, user: String) -> Vec<String> {
+        self.on_engine(move |e| Ok(e.authz.roles_for(&user)))
+            .await
+            .unwrap_or_default()
+    }
+
     /// Install an RLS policy from a SQL predicate string (R3).
     pub async fn set_rls_policy_sql(&self, table: String, predicate: String) -> Result<()> {
         self.on_engine(move |e| e.set_rls_policy_sql(&table, &predicate))

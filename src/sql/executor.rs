@@ -1383,6 +1383,7 @@ fn exec_create_table(
         insert_policy: None,
         update_policy: None,
         delete_policy: None,
+            update_with_check: None,
         policies: vec![],
         events_enabled: false,
         serial_next,
@@ -2755,6 +2756,9 @@ fn exec_update(
             let coerced = coerce_and_validate_row(&table_def, row)?;
             enforce_not_null(&table_def, &coerced)?;
             enforce_checks(&table_def, &coerced)?;
+            // item-24 R-a: WITH CHECK — new row must satisfy the write-side
+            // policy expression (defaults to USING when no explicit WITH CHECK).
+            exec_update_with_check(&table_def, &coerced, ctx)?;
             // No UNIQUE / FK enforcement: hot_eligible already gates those out.
             let encoded = encode_row(&coerced);
             collected.push((*row_id, encoded, before_row, coerced));
@@ -2841,6 +2845,8 @@ fn exec_update(
             let coerced = coerce_and_validate_row(&table_def, row)?;
             enforce_not_null(&table_def, &coerced)?;
             enforce_checks(&table_def, &coerced)?;
+            // item-24 R-a: WITH CHECK.
+            exec_update_with_check(&table_def, &coerced, ctx)?;
             let encoded = encode_row(&coerced);
             collected.push((*row_id, encoded, before_row, coerced));
         }
@@ -2937,6 +2943,8 @@ fn exec_update(
         let coerced = coerce_and_validate_row(&table_def, row)?;
         enforce_not_null(&table_def, &coerced)?;
         enforce_checks(&table_def, &coerced)?;
+        // item-24 R-a: WITH CHECK — reject if new row violates the policy.
+        exec_update_with_check(&table_def, &coerced, ctx)?;
         // UNIQUE + FK — acquire all phantom locks BEFORE taking a fresh
         // snapshot, then run uniqueness + FK checks with it (items 35/36/53).
         // RESTRICT on old PK also uses a fresh snapshot (after its lock).
@@ -4175,6 +4183,45 @@ fn check_passes(expr: &Expr, columns: &[ColumnDef], row: &[Literal]) -> Result<b
             "CHECK expression must be boolean, got {other:?}"
         ))),
     }
+}
+
+/// item-24 R-a: WITH CHECK enforcement for UPDATE.
+///
+/// After SET is applied and the new row is coerced, evaluate the table's
+/// `update_with_check` expression against the NEW row.  Rejects writes
+/// that would move a row outside the policy predicate (e.g. transferring
+/// ownership: `UPDATE t SET user_id = 'bob'` on a `user_id = current_user`
+/// policy is now rejected rather than silently accepted).
+///
+/// `current_user` substitution mirrors the INSERT path exactly — a
+/// CurrentUser-dependent policy is skipped for the superuser/embedded
+/// path (when `ctx.current_user` is None).
+fn exec_update_with_check(
+    table_def: &TableDef,
+    new_row: &[Literal],
+    ctx: &ExecCtx,
+) -> Result<()> {
+    let Some(ref check_expr) = table_def.update_with_check else {
+        return Ok(());
+    };
+    // Superuser / embedded path (current_user = None) bypasses ALL RLS, including
+    // WITH CHECK — mirrors how USING scan-filters are skipped for None user in
+    // execute_sql_inner_as. Only skip CurrentUser-dependent checks (has_cu) for
+    // non-superuser paths; for None, skip unconditionally.
+    if ctx.current_user.is_none() {
+        return Ok(());
+    }
+    let mut policy = check_expr.clone();
+    if let Some(ref u) = ctx.current_user {
+        crate::sql::logical::substitute_current_user_in_expr(&mut policy, u);
+    }
+    if !check_passes(&policy, &table_def.columns, new_row)? {
+        return Err(DbError::SqlPlan(format!(
+            "new row violates WITH CHECK policy for table \"{}\"",
+            table_def.name
+        )));
+    }
+    Ok(())
 }
 
 /// Foreign-key enforcement (M11): referenced-table existence only — see
@@ -5981,6 +6028,7 @@ mod tests {
             insert_policy: None,
             update_policy: None,
             delete_policy: None,
+            update_with_check: None,
             policies: vec![],
             events_enabled: false,
             serial_next: Default::default(),

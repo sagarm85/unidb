@@ -180,9 +180,34 @@ async fn main() {
     // without a crate cycle). A custom embedding binary that depends on both
     // `unidb` and `unidb-storage` can call `.with_storage(Some(Arc::new(svc)))`.
     // All /storage/* routes return 503 when state.storage is None.
-    let state =
-        AppState::new(Arc::new(engine_handle)).with_log_dir(std::path::PathBuf::from(&log_dir));
-    let jwt_config = JwtConfig::new(&jwt_secret);
+    // item 100: UNIDB_DEV_LOGIN=1 activates POST /auth/login (dev/demo only —
+    // Milestone-18 "verify-only" is unchanged when this flag is absent).
+    let dev_login = std::env::var("UNIDB_DEV_LOGIN")
+        .ok()
+        .map(|v| v == "1" || v.to_ascii_lowercase() == "true")
+        .unwrap_or(false);
+    if dev_login {
+        tracing::warn!(
+            "UNIDB_DEV_LOGIN=1: POST /auth/login is enabled (passwordless, dev/demo only — \
+             do NOT use in production)"
+        );
+    }
+
+    let jwt_config = if dev_login {
+        JwtConfig::with_dev_login(&jwt_secret)
+    } else {
+        JwtConfig::new(&jwt_secret)
+    };
+
+    let state = {
+        let s = AppState::new(Arc::new(engine_handle))
+            .with_log_dir(std::path::PathBuf::from(&log_dir));
+        if dev_login {
+            s.with_dev_login(jwt_config.clone())
+        } else {
+            s
+        }
+    };
     let (prometheus_layer, metric_handle) = PrometheusMetricLayer::pair();
 
     let router = build_router(state, jwt_config, prometheus_layer, metric_handle);

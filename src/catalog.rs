@@ -291,6 +291,14 @@ pub struct TableDef {
     /// `#[serde(default)]` so pre-Z2 catalog blobs deserialize with `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delete_policy: Option<Expr>,
+    /// Write-side WITH CHECK expression for UPDATE (item-24 R-a): merged OR of
+    /// each UPDATE/ALL policy's WITH CHECK expression (or USING when no explicit
+    /// WITH CHECK is specified, per Postgres semantics).  Evaluated against the
+    /// *new* row after SET is applied in `exec_update`; rejects the write if the
+    /// new row would violate the expression.  `None` when no UPDATE/ALL policy
+    /// exists.  `#[serde(default)]` so pre-R-a catalog blobs deserialize cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_with_check: Option<Expr>,
     /// Named RLS policies (item-24 Z1). Each entry was created via
     /// `CREATE POLICY … ON <table> FOR <op> USING (…)`. Evaluated as an
     /// OR-of-permissive-policies per Postgres semantics: at plan time the
@@ -567,6 +575,21 @@ impl Catalog {
             .get_mut(table)
             .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
         t.update_policy = policy;
+        self.persist(ctx).map(|_| ())
+    }
+
+    /// Set the UPDATE write-side WITH CHECK expression (item-24 R-a).
+    pub fn set_update_with_check(
+        &mut self,
+        table: &str,
+        expr: Option<Expr>,
+        ctx: &mut CatalogCtx,
+    ) -> Result<()> {
+        let t = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| DbError::TableNotFound(table.to_string()))?;
+        t.update_with_check = expr;
         self.persist(ctx).map(|_| ())
     }
 
@@ -1025,6 +1048,7 @@ mod tests {
             insert_policy: None,
             update_policy: None,
             delete_policy: None,
+            update_with_check: None,
             policies: vec![],
             events_enabled: false,
             serial_next: Default::default(),
@@ -1058,6 +1082,7 @@ mod tests {
             insert_policy: None,
             update_policy: None,
             delete_policy: None,
+            update_with_check: None,
             policies: vec![],
             events_enabled: false,
             serial_next: Default::default(),
@@ -1110,6 +1135,7 @@ mod tests {
             insert_policy: None,
             update_policy: None,
             delete_policy: None,
+            update_with_check: None,
             policies: vec![],
             events_enabled: false,
             serial_next: Default::default(),
@@ -1168,6 +1194,7 @@ mod tests {
             insert_policy: None,
             update_policy: None,
             delete_policy: None,
+            update_with_check: None,
             policies: vec![],
             events_enabled: false,
             serial_next: Default::default(),
@@ -1207,6 +1234,7 @@ mod tests {
             insert_policy: None,
             update_policy: None,
             delete_policy: None,
+            update_with_check: None,
             policies: vec![],
             events_enabled: false,
             serial_next: Default::default(),
@@ -1261,6 +1289,7 @@ mod tests {
             insert_policy: None,
             update_policy: None,
             delete_policy: None,
+            update_with_check: None,
             policies: vec![],
             events_enabled: false,
             serial_next: Default::default(),
@@ -1355,6 +1384,7 @@ mod tests {
                     insert_policy: None,
                     update_policy: None,
                     delete_policy: None,
+                    update_with_check: None,
                     policies: vec![],
                     events_enabled: false,
                     serial_next: Default::default(),

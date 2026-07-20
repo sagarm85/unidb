@@ -1,10 +1,11 @@
 # AuthZ v2 — SQL-native roles/grants, per-operation RLS policies, WITH CHECK
 
 **Type:** Milestone
-**Status:** PARTIAL — Z1+Z3(JWT)+Z5 shipped in `feat/item-24-authz-z1z3z5` (2026-07-19);
-Z6 (`current_user` SQL function + `POST /auth/preview`) shipped in
-`feat/item-24-z6-current-user-preview` (2026-07-19);
-Z2/Z4 remain; Z3(WITH CHECK) is partially covered by `insert_policy` row check.
+**Status:** ✅ SHIPPED (all Z-series + R-hardening) — see PROGRESS.md "Item 24"
+- Z1+Z3(JWT)+Z5: `feat/item-24-authz-z1z3z5` (2026-07-19, PR #167)
+- Z4 role_members/users catalog: PR #166 (2026-07-19)
+- Z6 current_user + POST /auth/preview: `feat/item-24-z6-current-user-preview` (2026-07-19)
+- R-a UPDATE WITH CHECK enforcement + R-b bootstrap enforced column: `feat/item-24-rls-hardening-login` (2026-07-20)
 
 <!-- Shipped: commit 6ad38db on branch feat/item-24-authz-z1z3z5 -->
 <!-- Z1: CREATE/DROP ROLE/POLICY, GRANT/REVOKE — catalog-persisted, insert_policy + rls_policy routing -->

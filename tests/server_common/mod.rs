@@ -87,6 +87,36 @@ impl TestServer {
         }
     }
 
+    /// Spawn a server with `UNIDB_DEV_LOGIN=1` semantics — `POST /auth/login`
+    /// is active and issues tokens signed with `TEST_JWT_SECRET`.
+    pub async fn spawn_with_dev_login() -> Self {
+        let tempdir = tempfile::tempdir().unwrap();
+        let data_dir = tempdir.path().to_path_buf();
+        let log_dir = data_dir.join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let engine = EngineHandle::spawn(tempdir.path(), 0).unwrap();
+        let jwt_config = JwtConfig::with_dev_login(TEST_JWT_SECRET);
+        let state = AppState::with_config(Arc::new(engine), SessionConfig::default())
+            .with_log_dir(log_dir.clone())
+            .with_dev_login(jwt_config.clone());
+        let (prometheus_layer, metric_handle) = metrics_pair().clone();
+        let router = build_router(state, jwt_config, prometheus_layer, metric_handle);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        Self {
+            addr,
+            data_dir,
+            log_dir,
+            _tempdir: tempdir,
+            _server_task: server_task,
+        }
+    }
+
     pub fn url(&self, path: &str) -> String {
         format!("http://{}{}", self.addr, path)
     }

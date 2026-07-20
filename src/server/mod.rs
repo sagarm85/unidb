@@ -102,6 +102,10 @@ pub struct AppState {
     /// is `None`. Held as `dyn StorageApi` so `unidb` need not depend on
     /// `unidb-storage` (which already depends on `unidb`) — no crate cycle.
     pub storage: Option<std::sync::Arc<dyn crate::storage_api::StorageApi>>,
+    /// Non-None when `UNIDB_DEV_LOGIN=1` — the JWT secret is stored here so
+    /// `POST /auth/login` can issue tokens.  None = login disabled (production
+    /// default; Milestone-18 "verify-only" stays intact).
+    pub dev_login_jwt: Option<auth::JwtConfig>,
 }
 
 /// Resolve the log directory the same way `src/bin/unidb-server.rs` does, so
@@ -139,7 +143,14 @@ impl AppState {
             cursors,
             log_dir: Arc::new(default_log_dir()),
             storage: None,
+            dev_login_jwt: None,
         }
+    }
+
+    /// Activate dev-only login (`UNIDB_DEV_LOGIN=1`).  See `auth::JwtConfig::with_dev_login`.
+    pub fn with_dev_login(mut self, jwt: auth::JwtConfig) -> Self {
+        self.dev_login_jwt = Some(jwt);
+        self
     }
 
     /// Point `GET /logs` at an explicit log directory (the server binary passes
