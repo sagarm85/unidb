@@ -8517,3 +8517,49 @@ Native micro-bench not run (Docker bench deferred). Latency estimate from the im
   optimization use case.
 
 **Locked-decision changes:** none.
+
+---
+
+## Item 103 — AuthZ v2: superuser RLS bypass (2026-07-20)
+
+**Branch:** `fix/item-103-superuser-rls-bypass`
+**Type:** Correctness bug fix + doc correction
+
+### Bug
+
+Superuser and no-`sub` (embedded) callers were NOT bypassing `current_user`-referencing
+RLS policies when requests routed through the concurrent read path (`ReadHandle::execute_sql`)
+or when the server handler called `execute_sql` (writer path) without passing user identity.
+The `CurrentUser` node in the policy expression was never substituted — it evaluated to `Null` —
+making `USING (owner = current_user)` always false → 0 rows returned to superusers.
+
+This did not affect the embedded API (`execute_sql` / `execute_sql_as` called directly)
+because `execute_sql_inner` already used `apply_rls_skip_current_user`. The bug was
+specific to server-path routing.
+
+### Fix
+
+- `ReadHandle` gained `Arc<RoleStore>` + `execute_sql_as(user, sql)` method with correct
+  `skip_current_user_policies` gate (same logic as `execute_sql_inner_as`).
+- `EngineHandle` gained `execute_sql_read_as(user, sql)` delegating to `ReadHandle::execute_sql_as`.
+- `post_sql` and `post_batch_sql` server handlers updated to pass JWT user identity to both
+  the concurrent read path and the transactional writer path.
+- `docs/REST_API.md` Gap 2: `CREATE ROLE admin SUPERUSER` → `CREATE USER admin SUPERUSER`.
+- `docs/REST_API.md` Gap 3: added `role_members` and `users` to catalog virtual relations list.
+
+### Tests
+
+3 new tests in `tests/item103_authz_bypass.rs`:
+- `superuser_bypasses_current_user_policy` — named SUPERUSER sees all rows.
+- `no_sub_bypasses_current_user_policy` — embedded `None` path sees all rows (both bootstrap and post-user-creation).
+- `regular_user_filtered_by_current_user_policy` — regular user sees only their rows.
+
+All 3 pass. No regressions in `authz_z6_current_user`, `item24_rls_with_check`, or `rls_perf_gate`.
+
+### Benchmark impact
+
+This is a correctness fix, not a performance change. No throughput regression: the
+`skip_current_user_policies` check is a single `bool` gate before plan traversal — unmeasurable
+overhead. RLS overhead for non-superuser callers is unchanged (same `apply_rls` path).
+
+Peak RSS: unchanged (no new heap allocations on the hot path).
