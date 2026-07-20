@@ -8868,7 +8868,8 @@ No storage / format / WAL / crash-harness impact. No `FORMAT_VERSION` bump.
 | G2-cast | CAST(expr AS type) | **SHIPPED 2026-07-20** — see Item 19 G2-cast |
 | G2-join | FULL OUTER JOIN | Open |
 | G-NATURAL | NATURAL JOIN | Open (low ROI) |
-| G7 | Window functions / recursive CTEs | Open (large; deferred) |
+| G7 | Window functions (whole-partition) | **SHIPPED 2026-07-20** — see Item 19 G7; cumulative frame = follow-up |
+| G7 | Recursive CTEs | Open (large; deferred) |
 | G9 | LIKE / NOT LIKE / ILIKE | Delivered under item 30 |
 | G11 | Full-text SQL predicate | Delivered under item 30 |
 
@@ -8930,6 +8931,88 @@ No storage / format / WAL / crash-harness impact. No `FORMAT_VERSION` bump.
 - `cast_to_unsupported_type_errors` — unsupported type returns error
 
 All 18 pass. Full suite clean. Clippy clean. No storage/format impact.
+
+---
+
+## Item 19 G7 — Window functions (whole-partition frame) (2026-07-20)
+
+**Branch:** `feat/item-19-g7-window-functions`
+
+**Backlog:** `docs/backlog/19_sql_surface_gaps.md` (G7 section)
+
+### What shipped
+
+`<window_func> OVER (PARTITION BY … ORDER BY …)` window function support across
+the Phase-4 query path. Whole-partition frame only (`ROWS BETWEEN UNBOUNDED
+PRECEDING AND UNBOUNDED FOLLOWING`); cumulative frames are a documented follow-up.
+
+**New types (`src/sql/query.rs`):**
+- `WindowFunc` enum: `RowNumber`, `Rank`, `DenseRank`, `Lag(expr, offset)`,
+  `Lead(expr, offset)`, `Sum(expr)`, `Avg(expr)`, `Count`, `Min(expr)`, `Max(expr)`.
+- `WindowSpec` struct: `partition_by: Vec<QExpr>`, `order_by: Vec<(QExpr, bool)>`.
+- `QExpr::Window { func: WindowFunc, over: WindowSpec }` variant.
+- `QExpr::is_window()` helper method.
+- `bind_params`, `has_aggregate`, `has_subquery` extended with `Window` arms.
+
+**Parser (`src/sql/parser.rs`):**
+- `convert_window_qexpr` converts `Function { over: Some(WindowType::WindowSpec(..)) }`
+  to `QExpr::Window`. Supports `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD`,
+  `SUM`, `AVG`, `COUNT`, `MIN`, `MAX` with `OVER`. Named-window references
+  (`OVER window_name`) return `SqlUnsupported`.
+- `expr_has_case_expr` extended: any function with `over.is_some()` returns `true`
+  to force Phase-4 routing (the window executor).
+- New arm `SqlExpr::Function(f) if f.over.is_some() => convert_window_qexpr(f)` inserted
+  before the generic `convert_aggregate` fallthrough.
+
+**Executor (`src/sql/query_exec.rs`):**
+- `PlanNode::Projection` handler: when any `items` expr is a window function,
+  routes to `exec_window_projection` instead of the per-row evaluator.
+- `Runner::exec_window_projection`: materialise input → `partition_rows` (HashMap
+  keyed by encoded PARTITION BY keys) → `sort_partition_indices` (per-group sort
+  with pre-evaluated ORDER BY keys) → compute per-function per-row value →
+  augment rows with `__w{n}` columns → project final output.
+- `Runner::eval`: `QExpr::Window` arm returns a planner-bug error (window values
+  must be pre-computed; should never reach per-row eval).
+- `substitute_correlated`: `QExpr::Window` arm recurses into func args and OVER exprs.
+- Free helpers: `window_add` (SUM, NULL-skipping), `window_div` (AVG), `order_keys_equal`
+  (RANK/DENSE_RANK tie detection).
+
+**Plan/optimize/validate:**
+- `src/sql/plan.rs`: `collect_aggs` — `Window` arm is a no-op (window ≠ agg);
+  `rewrite_over_agg` — pass `Window` through unchanged; `validate_expr` — recurses
+  into func args and OVER; `eval_qexpr` — returns error (same as Aggregate).
+- `src/sql/optimizer.rs`: `collect_qualifiers` and `collect_columns` — recurse into
+  `Window` sub-expressions; treated as non-pushable (force residual).
+
+### Tests
+
+14 tests in `tests/item19_window_functions.rs` — all pass:
+- `row_number_no_partition` — ROW_NUMBER() OVER (ORDER BY id) assigns 1..n
+- `row_number_with_partition` — ROW_NUMBER resets per PARTITION BY dept
+- `rank_with_ties` — tied rows get same rank, next rank has gap (1,1,3)
+- `dense_rank_no_gaps` — tied rows get same rank, no gap (1,1,2)
+- `lag_basic` — LAG(score, 1) OVER (ORDER BY id) → previous row value
+- `lag_out_of_bounds` — LAG offset beyond start → NULL
+- `lead_basic` — LEAD(score, 1) OVER (ORDER BY id) → next row value
+- `lead_out_of_bounds` — LEAD offset beyond end → NULL
+- `sum_over_partition` — SUM(salary) OVER (PARTITION BY dept) broadcasts dept total
+- `avg_over_whole_table` — AVG(score) OVER () → same value in all rows
+- `count_over_partition` — COUNT(*) OVER (PARTITION BY dept) = partition size
+- `min_max_over_partition` — MIN/MAX per partition
+- `window_with_where` — WHERE filters before window; ROW_NUMBER restarts from 1
+- `row_number_empty_over` — ROW_NUMBER() OVER () (no PARTITION BY or ORDER BY)
+
+Full suite clean. Clippy clean. No storage/format impact.
+
+### Limitations (documented)
+- **Whole-partition frame only.** Cumulative (`ROWS BETWEEN UNBOUNDED PRECEDING
+  AND CURRENT ROW`) and sliding-window frames are a follow-up.
+- **Named window references** (`OVER window_name`) return `SqlUnsupported`.
+- **Window functions in WHERE** return `SqlUnsupported` (correct per SQL standard;
+  window functions are projection-only in SQL).
+- **`LAG`/`LEAD` default offset:** defaults to 1 when omitted (`LAG(expr)` ≡
+  `LAG(expr, 1)`). Only integer literal offsets are supported; dynamic/expression
+  offsets are not supported in v1.
 
 ---
 
