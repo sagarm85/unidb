@@ -1,5 +1,5 @@
 **Type:** Performance
-**Status:** ⏳ NOT STARTED — after item 93
+**Status:** ✅ SHIPPED 2026-07-20 — see PROGRESS.md "Item 94" for implementation details and test results.
 
 # Item 94 — Read-only NEAR fast path: skip MVCC snapshot for standalone queries
 
