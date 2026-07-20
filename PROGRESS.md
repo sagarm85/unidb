@@ -9128,4 +9128,70 @@ the predicate comparison path (`compare`) performs implicit coercion.
 **No FORMAT_VERSION bump:** pure evaluator change, zero on-disk impact.
 **`cargo clippy -- -D warnings`:** clean.
 **`cargo fmt --all`:** clean.
+
+---
+
+## Item 19 — IN(subquery) / EXISTS / scalar subquery predicates (2026-07-20)
+
+**Branch:** `feat/item-19-subquery-predicates`
+
+**Backlog:** `docs/backlog/19_sql_surface_gaps.md` (P4.c subquery predicates — marked SHIPPED)
+
+### What shipped
+
+WHERE-clause subquery predicates (`IN (subquery)`, `NOT IN (subquery)`, `EXISTS`,
+`NOT EXISTS`, scalar subquery in comparison) across the Phase-4 query path.
+The `QExpr` variants `InSubquery`, `Exists`, `ScalarSubquery` were already present
+with parser arms and executor evaluation. This entry adds the **RLS fix** and the
+**required test coverage**.
+
+**RLS fix — `src/sql/query.rs`:**
+
+`apply_rls_from` previously applied RLS only to base tables in `FROM` (via
+`collect_table_policies`) and to derived-table subqueries in `FROM` (via
+`apply_rls_into_derived`). WHERE-clause subqueries (`InSubquery`, `Exists`,
+`ScalarSubquery`) embed inner `QuerySpec` values inside `QExpr` — not inside
+`FromNode::Derived` — so the old code left them unprotected: a user could bypass
+an RLS policy by wrapping the table access inside `WHERE id IN (SELECT id FROM docs)`.
+
+Fix: added `apply_rls_into_qexpr(expr, policy_for)` — a recursive walker that
+traverses the full `QExpr` tree and calls `apply_rls_from` on every nested
+`QuerySpec` it finds inside `Exists`, `ScalarSubquery`, and `InSubquery`. Called
+from `apply_rls_from` on `selection`, `projection`, and `having` of the outer spec.
+
+The fix is symmetric with the existing `apply_rls_into_derived` approach: the inner
+subquery spec has `apply_rls_from` called on it, so the same policy-collection logic
+runs recursively. No storage, format, or WAL change.
+
+**NULL handling (SQL three-valued logic):**
+
+- `x IN (set)`: if `x` is NULL → NULL. If set contains NULL and `x` is not found →
+  NULL (unknown). If `x` found → true. If set is empty or `x` not found (no NULLs) → false.
+- `NOT IN`: same logic inverted. `x NOT IN (set with NULLs)` → NULL when `x` is not
+  in the set, because "one element is unknown."
+- Scalar subquery returning 0 rows → NULL; `val > NULL` evaluates to NULL → row
+  filtered out (no match).
+
+This matches the SQL standard and the existing implementation in `query_exec.rs::eval`.
+
+### Tests (new: `tests/item19_subquery_predicates.rs` — 9/9 PASS)
+
+| Test | Covers |
+|---|---|
+| `in_subquery_basic` | `WHERE id IN (SELECT user_id FROM orders)` → correct rows |
+| `not_in_subquery` | `WHERE id NOT IN (SELECT id FROM excluded)` → complement |
+| `in_subquery_empty_set` | inner subquery returns 0 rows → 0 outer rows |
+| `in_subquery_with_filter` | inner subquery has its own WHERE clause |
+| `exists_subquery_basic` | correlated `WHERE EXISTS (SELECT 1 FROM related WHERE fk = t.id)` |
+| `not_exists_subquery` | `WHERE NOT EXISTS (…)` → complement |
+| `scalar_subquery_comparison` | `WHERE score > (SELECT AVG(score) FROM t)` → above-average |
+| `scalar_subquery_null_when_empty` | scalar on empty table → NULL → 0 rows |
+| `in_subquery_rls` | RLS policy applied inside `IN (SELECT id FROM docs)` — not bypassed |
+
+All 9 PASS. Existing `tests/subquery.rs` (9 tests) also PASS — no regression.
+
+### No storage / format / crash-harness impact
+
+Pure SQL surface / RLS-rewrite change. No page format, WAL record type, or storage
+layer touched. Crash harness unchanged. No `FORMAT_VERSION` bump.
 **Full suite:** `cargo test` — all tests pass (no regressions).
