@@ -1,7 +1,7 @@
 # SQL surface gaps — unsupported query features
 
 **Type:** Improvement
-**Status:** PARTIAL — G1 (CASE/COALESCE/NULLIF), G2-cast (CAST expressions), G3 (UNION/INTERSECT/EXCEPT), G4 (ORDER BY non-projected col), G5 (RETURNING), G6 (derived table subqueries), G7 (window functions, whole-partition frame), G8 (SELECT without FROM), G10 (IS NULL), P4.c IN(subquery)/EXISTS/scalar-subquery predicates SHIPPED (see `PROGRESS.md` item 19). G2-join (FULL OUTER JOIN)/G-NATURAL remain open. Cumulative-frame window functions (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) are a documented follow-up.
+**Status:** PARTIAL — G1 (CASE/COALESCE/NULLIF), G2-cast (CAST expressions), G2-join (FULL OUTER JOIN), G3 (UNION/INTERSECT/EXCEPT), G4 (ORDER BY non-projected col), G5 (RETURNING), G6 (derived table subqueries), G7 (window functions, whole-partition frame), G8 (SELECT without FROM), G10 (IS NULL), P4.c IN(subquery)/EXISTS/scalar-subquery predicates SHIPPED (see `PROGRESS.md` item 19). G-NATURAL remains open. Cumulative-frame window functions (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) are a documented follow-up.
 
 > A single tracker for the SQL constructs unidb does **not** support yet, so
 > builders (and future us) have one honest list and each gap has a scope/ROI
@@ -57,13 +57,29 @@
   18 tests in `tests/item19_cast.rs`. No storage/format impact.
 - **Outcome:** see `PROGRESS.md` item 19 G2-cast entry.
 
-### G2-join — `FULL OUTER JOIN` (previously called G2)
-- **What:** the fourth join type (currently `INNER`/`LEFT`/`RIGHT`/`CROSS`).
-- **Why it matters:** completes the join set; needed by some reporting tools.
-- **Scope:** join operators (`join.rs`) gain a full-outer path (emit unmatched
-  rows from **both** sides). Correctness-wise straightforward for `ON`; a
-  `USING`/`NATURAL` full-outer needs **G1** for the coalesced key column, so
-  order G1 first. Medium.
+### G2-join — `FULL OUTER JOIN` (previously called G2) **(SHIPPED 2026-07-20)**
+
+- **What:** the fourth join type — `FULL OUTER JOIN` preserves all rows from
+  both sides; unmatched rows from either side are padded with `NULL` on the
+  missing side.
+- **Changes:**
+  - `query.rs`: `JoinType::FullOuter` variant added (with doc comment).
+  - `parser.rs`: `JoinOperator::FullOuter(c)` mapped to `JoinType::FullOuter`;
+    error message for the `_` arm updated (FULL OUTER is no longer unsupported).
+  - `join.rs`: `merge_join` — `emit_unmatched_left` / `emit_unmatched_right`
+    both extended to include `JoinType::FullOuter`; `nested_loop_join` likewise
+    updated for the non-equi fallback path.
+  - `plan.rs`: `plan_join` inserts a `FULL OUTER → MergeJoin` routing guard
+    before the `HashJoin` fallback (HashJoin lacks matched-build-side tracking).
+    `plan_using_join` emits `COALESCE(left.col, right.col)` for shared columns
+    under FULL OUTER (G1 `QExpr::Coalesce` already available from item 19 G1).
+  - `explain.rs`: `join_str` extended with `"full outer"`.
+  - `query.rs` (`apply_rls_into_qexpr`): `QExpr::Window { .. }` leaf arm added
+    (pre-existing omission surfaced by this PR's full build).
+- **8 tests** in `tests/item19_full_outer_join.rs`: basic, unmatched-left,
+  unmatched-right, USING COALESCE, empty-left, empty-right, all-match, WHERE
+  after join. All pass.
+- **Outcome:** see `PROGRESS.md` item 19 G2-join entry.
 
 ### G3 — Set operations: `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT`
 - **What:** combine two query results. Parser currently rejects any non-`SELECT`

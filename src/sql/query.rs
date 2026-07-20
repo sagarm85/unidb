@@ -188,6 +188,12 @@ pub enum JoinType {
     Right,
     /// `CROSS JOIN` / comma join — Cartesian product, never carries an `on`.
     Cross,
+    /// `FULL OUTER JOIN` — preserves all rows from both sides; unmatched rows
+    /// from either side are padded with `NULL` on the missing side.
+    /// Routed to `MergeJoin` by the planner (which already tracks unmatched
+    /// rows on both sides); `HashJoin` is not used because it would require
+    /// tracking matched build-side rows.
+    FullOuter,
 }
 
 /// Target type for a `CAST(expr AS type)` expression (G2, item 19).
@@ -753,6 +759,9 @@ fn apply_rls_into_qexpr(expr: &mut QExpr, policy_for: &dyn Fn(&str) -> Option<Ex
         }
         // Leaf nodes with no subquery content.
         QExpr::Column { .. } | QExpr::Literal(_) => {}
+        // Window functions are SELECT-only; they cannot appear in a WHERE/HAVING
+        // policy predicate, so there is nothing to rewrite here.
+        QExpr::Window { .. } => {}
     }
 }
 

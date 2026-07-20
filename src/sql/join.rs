@@ -364,8 +364,8 @@ pub fn merge_join(
     sort_keyed(&mut rk);
 
     let mut out_rows = Vec::new();
-    let emit_unmatched_left = matches!(join_type, JoinType::Left);
-    let emit_unmatched_right = matches!(join_type, JoinType::Right);
+    let emit_unmatched_left = matches!(join_type, JoinType::Left | JoinType::FullOuter);
+    let emit_unmatched_right = matches!(join_type, JoinType::Right | JoinType::FullOuter);
 
     let mut i = 0;
     let mut j = 0;
@@ -517,11 +517,11 @@ pub fn nested_loop_join(
                 right_matched[rj] = true;
             }
         }
-        if !matched && matches!(join_type, JoinType::Left) {
+        if !matched && matches!(join_type, JoinType::Left | JoinType::FullOuter) {
             out_rows.push(extend(lrow, nulls(right_len)));
         }
     }
-    if matches!(join_type, JoinType::Right) {
+    if matches!(join_type, JoinType::Right | JoinType::FullOuter) {
         for (rj, rrow) in right.rows.iter().enumerate() {
             if !right_matched[rj] {
                 out_rows.push(prepend(nulls(left_len), rrow));
