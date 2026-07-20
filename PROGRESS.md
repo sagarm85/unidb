@@ -8362,8 +8362,8 @@ patterns (auth lookups, analytics `DISTINCT`, filtered counts).
 
 ## Items 67 / 51 / 68 / 69 — Async HNSW, Hash join, Hint bits, Fill-factor (2026-07-20)
 
-**Branch:** `perf/items-67-51-68-69-92` | **PR:** [#171](https://github.com/sagarm85/unidb/pull/171)  
-**Commit:** `254786e` (bench) / `e9d4d5b` (HEAD after rebase)  
+**Branch:** `perf/items-67-51-68-69-92` | **PR:** [#171](https://github.com/sagarm85/unidb/pull/171) MERGED  
+**Commit:** `51022be` (merge commit on main)  
 **Validated by:** Docker bench `report_20260719_234504.md` (commit `254786e`, aarch64, 18 cores)  
 **MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1** (Tables 4/5 skipped — items don't touch HNSW query or FK paths)
 

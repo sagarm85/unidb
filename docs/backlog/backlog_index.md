@@ -66,7 +66,7 @@
 | 49 | `49_bench_pg_connect_no_timeout_hang.md` | Improvement | ✅ SHIPPED 2026-07-16 — `benches/decompose.rs` opened every Postgres connection with no `connect_timeout`; an unreachable/unresponsive `PG_URL` (wrong host, firewalled, container still starting) blocked on the OS TCP SYN-retry ceiling (~2 min/attempt, confirmed empirically) across 24 call sites with zero output — the real cause of `scripts/report.sh` reports "hanging indefinitely". New `pg_dial()` helper sets `connect_timeout` (default 10s, `PG_CONNECT_TIMEOUT_SECS`); all call sites route through it. Verified: unreachable PG_URL now fails the whole report in 14.6s instead of hanging. See PROGRESS.md. |
 | 50 | `50_patch_many_infinite_loop.md` | Improvement | ✅ SHIPPED 2026-07-16 — **critical**: `DiskBTree::patch_many` (item 47) genuinely infinite-loops, single-threaded, 100% CPU, on an unchanged-key `UPDATE` whenever the very first patch in a leaf-group has a key outside that leaf's *current* `entries.first()/last()` (plausible after any split) — the bounds check gated the first entry too, so the loop index never advanced. Confirmed live via `gdb -p <pid> -batch -ex bt` (identical stack twice). This is why it was never caught: Table 3 (the only report section touching this path) only runs when Postgres is reachable, and this session's item 49 fix was the first time that condition was met. Fixed: bounds check now only gates *additional* (`j > i`) batching, never `j == i`. New permanent regression test confirmed to catch the bug pre-fix (30s hang deadline) and pass post-fix (~1s). See PROGRESS.md. |
 
-| 51 | `51_select_join_hash_join.md` | Performance | ⏳ PHASE A DONE 2026-07-16 — predicate pushdown into base scans + integer key hash fast path + INLJ-via-unique_index_root revert; 0.31→0.59× PG. Phase B (≥0.70×) pending. See PROGRESS.md. |
+| 51 | `51_select_join_hash_join.md` | Performance | ✅ SHIPPED Phase B 2026-07-20 (PR #171) — in-memory hash join for equi-joins; `HJ_BUILD_ROWS`/`HJ_PROBE_ROWS` counters; Table 5 SELECT JOIN 0.49× PG. Phase A shipped 2026-07-16. |
 | 52 | `52_update_delete_predicate_decode_pushdown.md` | Performance | ✅ SHIPPED 2026-07-16 (correction 2026-07-19: this row previously said NOT STARTED — stale) — `MatchedRows` carries raw bytes; DELETE cols/row 6.00→2.00, dec/row→0.00, +10% throughput. PR #131 MERGED. UPDATE's cols/row=8 remainder is structural (new version needs the full row) and profiling (items 75–84 era) shows decode is not a material UPDATE cost. |
 | 53 | `53_fk_update_skip_unchanged_recheck.md` | Improvement | ✅ SHIPPED 2026-07-16 (correction 2026-07-19: this row previously said NOT STARTED — stale, and caused a bad ROI pick) — `has_fk_refs_in_set` gate in `exec_update` skips FK locks+checks when FK col not in SET; 40,423→62,281 rec/s (+54%). See PROGRESS.md "Item 53". |
 | 54 | `54_select_filtered_arena_alloc.md` | Performance | ✅ SHIPPED 2026-07-16 — Phase A: `scan_page_visit` + `project_row_drain` + `parallel_resolve_partitions`. SELECT filtered 0.50×→0.57× PG at 100k rows (+24%); RSS 315→296 MiB. PR #135. See PROGRESS.md. |
@@ -83,9 +83,9 @@
 | 64 | `64_delete_lazy_xmax.md` | Performance | 🔄 INVESTIGATION COMPLETE — two bottlenecks profiled: (1) CRC-per-mutation in `set_xmax` (807 ns/row, 87.5% at 25k scale); (2) `latch_fetch` blowup 1.2→611 µs/page at 100k (mmap/OS cold-page). Lazy xmax ruled infeasible (MVCC violation). Fix A (remove `write_crc()` from `set_xmax`) **SHIPPED** (correction 2026-07-19: "ready to implement" was stale — the skip + doc comment are in `page.rs::set_xmax`; DELETE 0.04→0.06× recorded in PROGRESS). Fix B's latch+fetch blowup root cause identified by the 2026-07-19 profiling review (clock-sweep evictions + per-fetch CRC verify) — addressed by item 78 (shipped) and item 86 (filed). Generalization of Fix A to all mutations/fetches = **item 86**. |
 | 65 | `65_hnsw_insert_node_cache.md` | Performance | ✅ SHIPPED 2026-07-18 — per-insert `NodeCache` eliminates repeated DiskBTree lookups during HNSW beam search (~3200 → ~200 unique node fetches per insert). See PROGRESS.md "Item 65". |
 | 66 | `66_parallel_delete_scan.md` | Performance | ✅ SHIPPED 2026-07-18 — `parallel_collect_matching` in `parallel_scan.rs`; A3-gate-aware `'collect` block in `exec_delete`; sort before `delete_many`; 48/48 crash PASS; `parallel_delete_matches_serial` PASS. Docker bench pending. See PROGRESS.md "Item 66". |
-| 67 | `67_async_hnsw_index_build.md` | Performance | 📋 PLANNED 2026-07-18 — async HNSW: decouple index build from commit critical path (W4/W0 → ~1.1×). ef_construction reduction ruled out (recall@10=0.937 at ef=100,10k — fails gate). See PROGRESS.md "Item 67 planning". |
-| 68 | `68_hint_bits.md` | Performance | ⏳ NOT STARTED — lazy hint bits in tuple header to short-circuit `txn_state(xmin/xmax)` lookup on committed tuples; ~5–10% SELECT gain; no WAL write; no FORMAT_VERSION bump if reserved bytes available. |
-| 69 | `69_fill_factor.md` | Performance | ⏳ NOT STARTED — `CREATE TABLE … WITH (fill_factor=70)` reserves page slack for same-page HOT (item 58); INSERT stops at configured threshold; UPDATE-heavy tables avoid cross-page chains. |
+| 67 | `67_async_hnsw_index_build.md` | Performance | ✅ SHIPPED 2026-07-20 (PR #171) — async HNSW background worker (`HnswWorker` thread + `ExecCtx.hnsw_tx`); HNSW graph-stitching decoupled from commit critical path. See PROGRESS.md "Items 67/51/68/69". |
+| 68 | `68_hint_bits.md` | Performance | ✅ SHIPPED 2026-07-20 (PR #171) — lazy txn-state cache in tuple header flags (`HINT_XMIN_COMMITTED`/`HINT_XMAX_ABORTED`); SELECT filtered 0.55→0.74× PG (+35%). See PROGRESS.md "Items 67/51/68/69". |
+| 69 | `69_fill_factor.md` | Performance | ✅ SHIPPED 2026-07-20 (PR #171) — fill-factor page reservation (default 80%); FSM 8-level granularity; UPDATE HOT 1.12→1.51× PG (+35%). See PROGRESS.md "Items 67/51/68/69". |
 | 70 | `70_seq_scan_prefetch.md` | Performance | ⏳ NOT STARTED — `madvise(MADV_WILLNEED)` read-ahead hint during seqscan (N pages ahead of cursor); cold-cache seqscan latency improvement; no-op on unsupported platforms. |
 | 71 | `71_cross_page_hot.md` | Performance | ✅ SHIPPED 2026-07-18 — cross-page HOT chains; `HOT_NEXT_XPAGE=0xFFFE`; `WAL_HOT_XPAGE_HEAD` type 17; FORMAT_VERSION 8→9; B-tree not updated on full-page UPDATE; P_xhot_a + P_xhot_b crash tests; 50/50 crash + 431 unit PASS. See PROGRESS.md "Item 71". |
 | 72 | `72_hnsw_query_latency.md` | Performance | ✅ SHIPPED 2026-07-19 — `HnswL0Cache` L0 neighbour list cache (cd94d71) + item 73 vector hot cache together achieve warm ≤5 ms at 10k (2.38 ms measured, 11.2× speedup). See PROGRESS.md. |
@@ -117,29 +117,28 @@ Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
 **Next new file → `103_…`.**
 
-## Next up — priority order (2026-07-20, post items 101/102-A/67-92 merge)
+## Next up — priority order (2026-07-20, post PR #171 merge)
 
-State after 2026-07-20 (items 101 + 102-A shipped; items 67/51/68/69 in PR #171):
+State after 2026-07-20 (items 51/67/68/69/101/102-A all shipped):
 
 | Operation | unidb ÷ PG | Status |
 |---|---|---|
 | SELECT COUNT(*) | **6.93×** | ✅ well above 1× |
-| DELETE all | **7.06×** | ✅ well above 1× (item 68/69 delivered) |
+| DELETE all | **7.06×** | ✅ well above 1× |
 | DELETE selected | **2.73×** | ✅ well above 1× |
 | SELECT GROUP BY | **1.30×** | ✅ above 1× |
 | UPDATE HOT | **1.51×** | ✅ well above 1× |
-| UPDATE non-HOT | 0.81× | 📈 item 69 delivered; ceiling ~0.85–0.90× |
-| SELECT filtered | 0.74× | 📈 item 68 delivered; next: parallel B-tree candidate |
-| INSERT per-row | 0.45× | 🔒 Docker I/O noise; item 101 group-commit unlocks concurrent-INSERT floor |
+| UPDATE non-HOT | 0.81× | 📈 ceiling ~0.85–0.90× — item 102-B covering index next |
+| SELECT filtered | 0.74× | 📈 ceiling ~0.80–0.85× — item 102-B covering index next |
+| INSERT per-row | 0.53× | 🔒 structural single-fsync floor; item 101 targets concurrent path |
 
-**Next priority items (2026-07-20):**
+**Next priority items:**
 
-1. **#171 Merge PR** — merge perf/items-67-51-68-69-92 (rebased on main after 101+102-A merge).
-2. **#102-B Covering index** — `CREATE INDEX … INCLUDE (cols)`; FORMAT_VERSION bump; now 67-92 base is clean.
-3. **#103 Catalog sync dedup** — remove `wal.sync_up_to(catalog_lsn)` after `catalog.persist_only()`; eliminates double-fsync-per-INSERT; catalog row-count recomputed from heap on crash (same model as PG `pg_class.reltuples`).
-4. **#93 HNSW arena layout** — flat `Vec<RowId>` slab; post 67-92.
-5. **#94 NEAR read-only fast path** — post 67-92.
-6. **#95 graph adjacency cache** — post 67-92.
+1. **#102-B Covering index** — `CREATE INDEX … INCLUDE (cols)`; FORMAT_VERSION bump; now main is clean.
+2. **#103 Catalog sync dedup** — remove `wal.sync_up_to(catalog_lsn)` after `catalog.persist_only()`; eliminates double-fsync-per-INSERT; catalog row-count recomputed from heap on crash.
+3. **#93 HNSW arena layout** — flat `Vec<RowId>` slab; expected W2 latency reduction.
+4. **#94 NEAR read-only fast path** — skip full HNSW beam search for exact-match NEAR queries.
+5. **#95 graph adjacency cache** — `DashMap` per-engine hub cache for hot adjacency reads.
 
 **What is NOT in this list:**
 - Parallel DML apply: held in reserve; not justified at current acceptance band.
