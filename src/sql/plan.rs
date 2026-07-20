@@ -905,10 +905,13 @@ pub(crate) fn plan_from(node: &FromNode, catalog: &Catalog, ctes: &CteSchemas) -
 /// `left.ci = right.ci AND …` (resolving each shared column's qualifier on both
 /// sides), then — per standard SQL — each shared column is **merged** so it
 /// appears once in the output: a coalescing [`PlanNode::Projection`] drops the
-/// duplicate copy. For `INNER`/`LEFT`/`CROSS` the preserved value is the left
-/// side's; for `RIGHT` it is the right side's (the outer-preserved side), so the
-/// merged column is non-NULL on the preserved rows without needing a `COALESCE`
-/// expression. (`FULL OUTER`, which would need true `COALESCE`, is unsupported.)
+/// duplicate copy.
+///
+/// * `INNER`/`LEFT`/`CROSS`: the preserved value is the left side's copy (it is
+///   never NULL on the outer-preserved side).
+/// * `RIGHT`: the preserved value is the right side's copy.
+/// * `FULL OUTER`: **either** side can be NULL (when the other side has no
+///   match), so the merged column is emitted as `COALESCE(left.col, right.col)`.
 fn plan_using_join(
     left: PlanNode,
     right: PlanNode,
@@ -943,29 +946,124 @@ fn plan_using_join(
 
     let join = plan_join(left, right, join_type, on, catalog)?;
 
-    // Merge each shared column: keep it from the outer-preserved side (right for
-    // RIGHT joins, else left) and drop the other side's copy. `drop_right` names
-    // which side's copies of the `using` columns are dropped from the output.
+    // Merge each shared column into a single output column.
+    //
+    // For FULL OUTER JOIN the merged column is `COALESCE(left.col, right.col)`
+    // because either side can be NULL depending on which side had no matching
+    // row. For all other join types the outer-preserved side is always non-NULL,
+    // so we simply keep that side's copy and drop the other's.
+    //
+    // `drop_right` — when true, the RIGHT side's copy of a shared column is the
+    // one that is dropped (INNER / LEFT / CROSS). When false, the LEFT copy is
+    // dropped (RIGHT join). Not consulted for FULL OUTER.
+    let is_full_outer = matches!(join_type, JoinType::FullOuter);
     let drop_right = !matches!(join_type, JoinType::Right);
+
+    // For FULL OUTER USING we need both the left and right ColumnRef for each
+    // shared column so we can build COALESCE(left.col, right.col).
+    let join_output = join.output().to_vec();
+    let left_len = left_schema.len();
+
+    // Index the join output into (left-side, right-side) columns once.
+    // We'll iterate over every column; shared columns on both sides are tracked
+    // so that for FULL OUTER we can emit a COALESCE and skip the duplicate.
     let mut items = Vec::new();
     let mut output = Vec::new();
-    for (i, col) in join.output().iter().enumerate() {
+    // For FULL OUTER: collect left-side shared col refs, keyed by column name.
+    let mut left_shared: std::collections::HashMap<String, ColumnRef> =
+        std::collections::HashMap::new();
+    if is_full_outer {
+        for (i, col) in join_output.iter().enumerate() {
+            let is_shared = using.iter().any(|u| u == &col.name);
+            if is_shared && i < left_len {
+                left_shared.insert(col.name.clone(), col.clone());
+            }
+        }
+    }
+
+    let mut full_outer_shared_emitted: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
+    for (i, col) in join_output.iter().enumerate() {
         let is_shared = using.iter().any(|u| u == &col.name);
-        if is_shared {
-            let from_left = i < left_schema.len();
-            // Drop this copy if it is on the side we merge away.
+
+        if is_shared && is_full_outer {
+            let from_left = i < left_len;
+            if from_left {
+                // Left copy: emit COALESCE(left.col, right.col).
+                // Find the right-side copy's qualifier.
+                let right_col = join_output
+                    .iter()
+                    .skip(left_len)
+                    .find(|c| c.name == col.name);
+                let coalesce_expr = if let Some(rc) = right_col {
+                    QExpr::Coalesce(vec![
+                        QExpr::Column {
+                            qualifier: Some(col.qualifier.clone()),
+                            name: col.name.clone(),
+                        },
+                        QExpr::Column {
+                            qualifier: Some(rc.qualifier.clone()),
+                            name: rc.name.clone(),
+                        },
+                    ])
+                } else {
+                    // Should not happen; fall back to plain left column.
+                    QExpr::Column {
+                        qualifier: Some(col.qualifier.clone()),
+                        name: col.name.clone(),
+                    }
+                };
+                // Output type follows the left-side column (both sides are same type).
+                let mut merged_col = col.clone();
+                merged_col.qualifier = col.qualifier.clone();
+                items.push(ProjItem {
+                    expr: coalesce_expr,
+                    name: col.name.clone(),
+                });
+                output.push(merged_col);
+                full_outer_shared_emitted.insert(col.name.clone());
+            } else {
+                // Right copy: already represented by the COALESCE emitted for
+                // the left copy — skip it.
+                if full_outer_shared_emitted.contains(&col.name) {
+                    continue;
+                }
+                // Left copy not found (shouldn't happen given USING resolution).
+                // Emit a plain column reference as a safe fallback.
+                items.push(ProjItem {
+                    expr: QExpr::Column {
+                        qualifier: Some(col.qualifier.clone()),
+                        name: col.name.clone(),
+                    },
+                    name: col.name.clone(),
+                });
+                output.push(col.clone());
+            }
+        } else if is_shared {
+            let from_left = i < left_len;
+            // Non-FULL-OUTER: drop the side we merge away.
             if (drop_right && !from_left) || (!drop_right && from_left) {
                 continue;
             }
-        }
-        items.push(ProjItem {
-            expr: QExpr::Column {
-                qualifier: Some(col.qualifier.clone()),
+            items.push(ProjItem {
+                expr: QExpr::Column {
+                    qualifier: Some(col.qualifier.clone()),
+                    name: col.name.clone(),
+                },
                 name: col.name.clone(),
-            },
-            name: col.name.clone(),
-        });
-        output.push(col.clone());
+            });
+            output.push(col.clone());
+        } else {
+            items.push(ProjItem {
+                expr: QExpr::Column {
+                    qualifier: Some(col.qualifier.clone()),
+                    name: col.name.clone(),
+                },
+                name: col.name.clone(),
+            });
+            output.push(col.clone());
+        }
     }
 
     Ok(PlanNode::Projection {
@@ -1037,6 +1135,23 @@ fn plan_join(
                 }
             }
         }
+    }
+
+    // FULL OUTER JOIN: force MergeJoin — it already tracks unmatched rows on
+    // both sides natively (emit_unmatched_left + emit_unmatched_right). HashJoin
+    // would require an extra pass over the build side to emit unmatched build
+    // rows; rather than adding that complexity we route here to MergeJoin which
+    // already has exactly the right semantics.
+    if matches!(join_type, JoinType::FullOuter) {
+        return Ok(PlanNode::MergeJoin {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type,
+            left_keys,
+            right_keys,
+            residual,
+            output,
+        });
     }
 
     Ok(PlanNode::HashJoin {

@@ -1194,9 +1194,10 @@ fn convert_join_operator(op: &JoinOperator) -> Result<(JoinType, Option<QExpr>, 
         JoinOperator::LeftOuter(c) | JoinOperator::Left(c) => (JoinType::Left, Some(c)),
         JoinOperator::RightOuter(c) | JoinOperator::Right(c) => (JoinType::Right, Some(c)),
         JoinOperator::CrossJoin(_) => (JoinType::Cross, None),
+        JoinOperator::FullOuter(c) => (JoinType::FullOuter, Some(c)),
         other => {
             return Err(DbError::SqlUnsupported(format!(
-                "unsupported join type: {other:?} (FULL OUTER / NATURAL arrive later)"
+                "unsupported join type: {other:?} (NATURAL JOIN is not yet supported)"
             )))
         }
     };

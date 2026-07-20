@@ -193,5 +193,6 @@ fn join_str(j: JoinType) -> &'static str {
         JoinType::Left => "left",
         JoinType::Right => "right",
         JoinType::Cross => "cross",
+        JoinType::FullOuter => "full outer",
     }
 }

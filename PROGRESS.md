@@ -2531,7 +2531,7 @@ tokio/reqwest/axum (rusqlite is a dev-dep, outside the normal graph).
 - Differential test suites vs SQLite + optimizer unit tests + EXPLAIN tests + this benchmark.
 
 **Known limitations / tech debt:**
-- No window functions, recursive CTEs, or `FULL OUTER`/`USING`/`NATURAL` joins.
+- No recursive CTEs; `NATURAL JOIN` is not yet supported. Window functions (whole-partition frame) and `FULL OUTER JOIN` (including `USING`) are now supported — see Item 19 G7 and G2-join entries.
 - `ORDER BY` resolves an output-column name or 1-based position (not arbitrary expressions) in v1.
 - Join keys compare by exact encoding — declare matching key types for cross-type numeric joins.
 - The optimizer emits hash joins for reordered joins (index-nested-loop comes from the rule-based fallback path); cost-comparing INLJ inside the DP is a follow-up.
@@ -8861,12 +8861,12 @@ Implemented across all four pipeline layers:
 
 No storage / format / WAL / crash-harness impact. No `FORMAT_VERSION` bump.
 
-### Remaining open gaps (G2-join/G7/G9/G11/G-NATURAL)
+### Remaining open gaps (G-NATURAL/G7-recursive)
 
 | Gap | Description | Status |
 |---|---|---|
 | G2-cast | CAST(expr AS type) | **SHIPPED 2026-07-20** — see Item 19 G2-cast |
-| G2-join | FULL OUTER JOIN | Open |
+| G2-join | FULL OUTER JOIN | **SHIPPED 2026-07-20** — see Item 19 G2-join |
 | G-NATURAL | NATURAL JOIN | Open (low ROI) |
 | G7 | Window functions (whole-partition) | **SHIPPED 2026-07-20** — see Item 19 G7; cumulative frame = follow-up |
 | G7 | Recursive CTEs | Open (large; deferred) |
@@ -9013,6 +9013,64 @@ Full suite clean. Clippy clean. No storage/format impact.
 - **`LAG`/`LEAD` default offset:** defaults to 1 when omitted (`LAG(expr)` ≡
   `LAG(expr, 1)`). Only integer literal offsets are supported; dynamic/expression
   offsets are not supported in v1.
+
+---
+
+## Item 19 G2-join — FULL OUTER JOIN (2026-07-20)
+
+**Branch:** `feat/item-19-g2-full-outer-join`
+
+**Backlog:** `docs/backlog/19_sql_surface_gaps.md` (G2-join section — now marked SHIPPED)
+
+### What shipped
+
+`FULL OUTER JOIN` completes the four-way join family (`INNER`/`LEFT`/`RIGHT`/`CROSS`/`FULL OUTER`).
+All rows from *both* sides are preserved; unmatched rows from either side are padded with `NULL`
+on the missing side. `FULL OUTER JOIN … USING (col)` emits the shared column as
+`COALESCE(left.col, right.col)` so the value is always non-NULL even when one side had no match.
+
+**Changes (SQL layer only — no WAL, storage, or FORMAT_VERSION impact):**
+
+- **`src/sql/query.rs`** — `JoinType::FullOuter` variant added (with doc comment explaining
+  the MergeJoin routing rationale). Pre-existing omission also fixed: `apply_rls_into_qexpr`
+  lacked a `QExpr::Window { .. }` arm (added as a no-op leaf — window functions are
+  SELECT-only and cannot appear in RLS predicates).
+- **`src/sql/parser.rs`** — `JoinOperator::FullOuter(c)` arm added to `convert_join_operator`;
+  the `_` arm's error message updated (FULL OUTER is no longer unsupported; NATURAL JOIN
+  is the remaining open gap).
+- **`src/sql/join.rs`** — `merge_join`: `emit_unmatched_left` / `emit_unmatched_right`
+  both extended to include `JoinType::FullOuter`. `nested_loop_join`: same extension for
+  the non-equi-key fallback path.
+- **`src/sql/plan.rs`** — `plan_join`: FULL OUTER routing guard inserted before the
+  `HashJoin` fallback — forces `MergeJoin`, which natively tracks unmatched rows on both
+  sides. HashJoin is skipped because it would require an extra matched-build-side tracking
+  pass that it does not currently implement. `plan_using_join`: emits
+  `COALESCE(left.col, right.col)` for each shared column when `join_type == FullOuter`
+  (using the existing `QExpr::Coalesce` variant from G1); other join types continue to
+  use the drop-one-copy approach.
+- **`src/sql/explain.rs`** — `join_str` extended with `"full outer"`.
+
+### Tests
+
+8 tests in `tests/item19_full_outer_join.rs` — all pass:
+- `full_outer_basic` — 3-row FULL OUTER: left-only (NULL right), matched, right-only (NULL left)
+- `full_outer_unmatched_left` — 3 emp rows, 1 dept match; 2 unmatched emp appear with NULL dname
+- `full_outer_unmatched_right` — 1 order, 3 customers; 2 unmatched customers appear with NULL oid
+- `full_outer_using` — `FULL OUTER JOIN … USING (id)`: merged `id` column is never NULL (COALESCE)
+- `full_outer_no_rows_left` — empty left → only right rows appear (with NULL left columns)
+- `full_outer_no_rows_right` — empty right → only left rows appear (with NULL right columns)
+- `full_outer_all_match` — every row matches → output = INNER JOIN output (no extra NULLs)
+- `full_outer_with_where` — WHERE filters after the outer join; unmatched rows removed
+
+Full suite clean. Clippy clean. fmt clean. No storage/format impact.
+
+### Remaining open gaps (item 19)
+
+| Gap | Description | Status |
+|-----|-------------|--------|
+| G-NATURAL | `NATURAL JOIN` | Open |
+| G7 | Recursive CTEs | Open (large; deferred) |
+| Cumulative window frames | `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` | Open (follow-up) |
 
 ---
 
