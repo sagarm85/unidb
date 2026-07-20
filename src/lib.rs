@@ -114,7 +114,7 @@ use crate::{
         adjacency_cache::{AdjacencyCache, EdgeRef, PROPS_INLINE_LIMIT},
         edges::{self, Edge, EDGES_TABLE},
         executor as graph_executor,
-        index::resolve_candidates_batched,
+        index::resolve_candidates_batched_with_self_flag,
         parser::parse_cypher,
     },
     heap::Heap,
@@ -2498,7 +2498,12 @@ impl Engine {
             in_explicit_txn: false,
             near_lightweight_snaps: Some(&self.near_lightweight_snaps),
         };
-        let result = graph_executor::execute(parsed, &mut ctx, self.edge_index_meta)?;
+        let result = graph_executor::execute(
+            parsed,
+            &mut ctx,
+            self.edge_index_meta,
+            Some(&self.adjacency_cache),
+        )?;
         Ok(vec![result])
     }
 
@@ -3318,7 +3323,9 @@ impl Engine {
         let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
         let candidates = DiskBTree::new(self.edge_index_meta, page_size)
             .search_eq(&OrderedValue::Int(from_id), &self.pool)?;
-        let resolved = resolve_candidates_batched(
+        // Use the self-flag variant so we can guard the cache against caching
+        // uncommitted self-writes (see cache population guard below).
+        let (resolved, has_self_write) = resolve_candidates_batched_with_self_flag(
             &candidates,
             &snapshot,
             xid,
@@ -3376,9 +3383,28 @@ impl Engine {
             });
         }
         // Populate the cache so the next read hits the fast path.
-        self.adjacency_cache
-            .insert(EDGES_TABLE, from_id, cache_entries);
+        //
+        // Guard: skip caching when any resolved row has `xmin == xid` (i.e.,
+        // the calling transaction inserted it — self-visible uncommitted write).
+        // If we cache those rows and the transaction subsequently aborts, the
+        // cache entry persists with the aborted edge, because neither
+        // `create_edge` nor `delete_edge` fires an invalidation for aborts
+        // (aborts run undo on the heap, not a cache eviction).  A pure reader
+        // (no rows with xmin == xid) safely caches even while its transaction
+        // is still open, since it only sees committed data for other hubs.
+        if !has_self_write {
+            self.adjacency_cache
+                .insert(EDGES_TABLE, from_id, cache_entries);
+        }
         Ok(out)
+    }
+
+    /// Number of hubs currently held in the adjacency cache.
+    ///
+    /// Exposed primarily for testing and `/stats` observability (item 95b).
+    /// Returns 0 when the cache is disabled (`UNIDB_GRAPH_CACHE_HUBS=0`).
+    pub fn adjacency_cache_hub_count(&self) -> usize {
+        self.adjacency_cache.len()
     }
 
     /// Full-text search over a durable `FULLTEXT`-indexed column (P3.b): return
