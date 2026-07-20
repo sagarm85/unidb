@@ -10,17 +10,20 @@ query_exec, executor, join, aggregate, sort, explain, datetime}.rs`,
 
 ```mermaid
 flowchart LR
-    T["SQL text"] --> P["sqlparser crate<br/>(GenericDialect)"]
-    P --> TR["AST translation<br/>(parser.rs)"]
-    TR -->|trivial single-table| S["LogicalPlan::Select<br/>(fast path)"]
-    TR -->|"join / agg / sub-query / CTE /<br/>ORDER·GROUP·DISTINCT·LIMIT"| Q["LogicalPlan::Query(QuerySpec)"]
+    T["SQL text"] --> CACHE{"Plan cache\n(item 96)\nhit on hash+epoch?"}
+    CACHE -->|hit| RUN
+    CACHE -->|miss| P["sqlparser crate\n(GenericDialect)"]
+    P --> TR["AST translation\n(parser.rs)"]
+    TR -->|trivial single-table| S["LogicalPlan::Select\n(fast path)"]
+    TR -->|join / agg / subq / CTE\nORDER·GROUP·DISTINCT·LIMIT| Q["LogicalPlan::Query(QuerySpec)"]
     S --> RLS["apply_rls"]
     Q --> RLS
-    RLS --> BIND["bind $n params<br/>(before execution — injection-safe)"]
-    BIND --> OPT["optimizer<br/>(cost-based when eligible)"]
+    RLS --> BIND["bind $n params\n(before execution — injection-safe)"]
+    BIND --> OPT["optimizer\n(cost-based when eligible)"]
     OPT --> PHYS["PlanNode tree"]
-    PHYS --> RUN["Runner (query_exec)"]
-    S -.->|"plain SELECT, no NEAR"| RO["lock-free concurrent read path<br/>exec_select_readonly"]
+    PHYS --> STORE["store in plan cache"]
+    STORE --> RUN["Runner (query_exec)"]
+    S -.->|plain SELECT, no NEAR| RO["lock-free concurrent read path\nexec_select_readonly"]
 ```
 
 Deliberate choice: the parser is the **`sqlparser` crate**, not hand-rolled —
@@ -104,28 +107,97 @@ every 1,024 rows in scan loops (`QueryTimeout` / `QueryCancelled`).
 Correctness for the whole Phase-4 surface was checked **differentially against
 SQLite** (rusqlite dev-dependency) — same statements, same data, same results.
 
-## 5.4 Read-path optimizations (Phase B)
+## 5.4 Read-path and write-path optimizations
 
-These four compounding techniques are why point/filtered reads are the engine's
-strongest suit (embedded point read 6.87 µs vs Postgres 33.6 µs):
+### Plan cache (item 96)
 
-1. **Two-phase decode pushdown.** Rows are a tagged, self-describing byte
-   stream. `deform_row(bytes, cols, upto, needed)` materializes *only* the
-   referenced columns and stops entirely after the last needed index (the
-   Postgres `heap_deform_tuple` natts idea); `skip_value_at` advances past
-   unneeded values with zero allocation. The executor first deforms **predicate
-   columns only**, tests, and deforms projection columns **only on a match** — a
-   large TEXT body in a rejected row is never allocated. Measured: filtered
-   SELECT decodes/row 2.00 → 0.00, columns/row 8.00 → 5.00, +28 % absolute.
-2. **Header-only `COUNT(*)`.** `Heap::count_visible` reads only the 24-byte MVCC
-   header per slot — no body decode. Routed when the aggregate list is bare
-   `COUNT(*)` over a scan. Result: 81.4 M rows/s counted vs Postgres 29.0 M
-   (**2.81× faster**, a rare single-model win); honest ceiling documented — it's
-   an O(pages) header scan with no visibility-map shortcut.
-3. **Bitmap-style candidate ordering.** Index-produced RowId candidate lists are
-   deduplicated and sorted by `(page, slot)` before heap resolution, converting
-   random heap access into sequential-ish access on fragmented tables.
-4. **Parallel resolution & scans** for large tables — doc 10 §2 (3.8–6.6×).
+Parsing and planning are the dominant cost for short-running queries on small
+tables. The plan cache eliminates repeated work for the same SQL text:
+
+```
+struct PlanCacheEntry {
+    epoch:  u64,          // schema_epoch when plans were parsed
+    plans:  Vec<...>,     // one LogicalPlan per statement in the batch
+}
+
+PlanCache {
+    entries: HashMap<u64, PlanCacheEntry>,  // keyed by FNV hash of SQL text
+    capacity: usize,                         // 1,024 entries (PLAN_CACHE_CAPACITY)
+}
+```
+
+Lookup flow:
+
+```mermaid
+flowchart LR
+    SQL["SQL text"] --> HASH["FNV hash"]
+    HASH --> LOOKUP["cache.get(hash)"]
+    LOOKUP -->|miss| PARSE["parse + plan\nstore in cache"]
+    LOOKUP -->|hit| CHECK{"epoch matches\nschema_epoch?"}
+    CHECK -->|yes — cache hit| EXEC["execute stored plans"]
+    CHECK -->|no — DDL invalidated| EVICT["evict entry\nparse + plan fresh"]
+    PARSE --> EXEC
+```
+
+`schema_epoch` is an `AtomicU64` bumped on every DDL statement. Any DDL makes
+all existing cache entries stale, so they are lazily evicted on next access.
+Capacity is 1,024 entries with LRU eviction on overflow. **Measured: 537–891×
+speedup** on parse overhead for repeated queries.
+
+### O(1) COUNT(*) (item 97)
+
+`TableDef` gains a `row_count: i64` field in the catalog JSON. Every committed
+INSERT/DELETE updates this field atomically at commit time via
+`txn_mgr.take_row_count_deltas`. This enables a fast path for unfiltered
+`COUNT(*)`:
+
+```mermaid
+flowchart LR
+    Q["SELECT COUNT(*)\nFROM t"] --> CHECK{"no WHERE\nno JOIN\nno DISTINCT?"}
+    CHECK -->|yes| CATALOG["read t.row_count\nfrom catalog — O(1)"]
+    CHECK -->|no| SCAN["header-only heap scan\ncount_visible()"]
+    CATALOG --> RESULT["return exact count"]
+    SCAN --> RESULT
+```
+
+`row_count = 0` is treated as stale (not a real zero — a fresh table starts at
+0 but INSERT increments it on first commit). If the catalog write fails after
+commit, `row_count` resets to 0 and the next COUNT falls back to the scan.
+FORMAT_VERSION bumped to v11 to prevent old binaries from treating stale zero
+as an exact result.
+
+### Batch INSERT with InsertAccum (item 98)
+
+A `VALUES (r1), (r2), ..., (rN)` statement streams rows through `InsertAccum`
+(see doc 2 §2.4). From the SQL engine's perspective, this means the executor
+calls `heap.insert_accumulating(row, &mut accum)` for each row, then
+`heap.flush_insert_accum(&mut accum)` once at the end. UNIQUE enforcement runs
+per-row before accumulation, so uniqueness is not deferred.
+
+### GROUP BY decode pushdown (item 46)
+
+The GROUP BY hash aggregation pushes the predicate + group-key decode into the
+scan workers: each worker decodes only the needed columns and increments its
+local partial aggregate. Workers merge their partial aggregates after the scan.
+This keeps the full row body out of the aggregate phase entirely. Measured:
+GROUP BY 0.23× → **1.44× vs Postgres** (unidb faster, items 46+56 together).
+
+### Other read-path techniques
+
+1. **Two-phase decode pushdown.** `deform_row(bytes, cols, upto, needed)`
+   materializes only referenced columns, stopping after the last needed index.
+   Predicate columns decoded first; projection columns decoded only on a match.
+   Measured: filtered SELECT decodes/row 2.00 → 0.00, cols/row 8.00 → 5.00,
+   +28 % absolute.
+2. **Header-only scan for COUNT(*).** `Heap::count_visible` reads only the
+   24-byte MVCC header per slot. Measured at 316 M rows/s vs Postgres 46 M
+   (**6.80× faster**) in Docker bench (Table 3).
+3. **Bitmap-style candidate ordering.** RowId candidate lists sorted by
+   `(page, slot)` before heap resolution — sequential-ish access on fragmented
+   tables.
+4. **Arena allocator for filtered SELECT (item 54).** Filtered scan results
+   allocated from a per-query arena instead of the global allocator. Measured:
+   +24% filtered SELECT throughput, RSS −19 MiB.
 
 `ROWS_DECODED` / `COLS_DECODED` atomic counters instrument the decode work per
 query — the benches report dec/row and cols/row columns so each optimization's

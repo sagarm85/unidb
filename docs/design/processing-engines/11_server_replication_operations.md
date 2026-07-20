@@ -30,18 +30,82 @@ over a direct `Engine::insert` call.
 
 | Area | Routes |
 |---|---|
-| SQL / Cypher | `POST /sql`, `POST /cypher` |
+| SQL / Cypher | `POST /sql`, `POST /cypher`, `POST /batch-sql` (item 99) |
 | Raw rows | `POST /rows`, `GET/PUT/DELETE /rows/{page_id}/{slot}` |
+| Bulk load | `POST /tables/{name}/bulk` — NDJSON (item 32) |
 | Graph | `POST /edges`, `DELETE /edges/{page_id}/{slot}`, `GET /edges/from/{from_id}` |
 | Indexes | `POST /indexes`, `GET /indexes/{table}/{column}/status` |
-| Tables / events | `GET /tables` (system `__…__` hidden), `POST /tables/{t}/events`, `GET /events/subscribe` (SSE), `POST /events/ack` |
-| Ops | `POST /checkpoint`, `GET /stats`, `GET /metrics` (public) |
+| Tables / events | `GET /tables`, `POST /tables/{t}/events`, `GET/DELETE /tables/{t}/events` (item 33), `GET /events/subscribe` (SSE), `POST /events/ack`, `GET /events/head` |
+| Storage | `GET/POST /storage/*` — 7 routes (item 31, StorageApi trait) |
+| Config | `PUT /config/slow_query_threshold_ms` (item 34) |
+| Ops | `POST /checkpoint`, `GET /stats`, `GET /stats/history` (300-point ring, item 34), `GET /metrics` (public) |
 | Replication | `POST/GET /replication/slots`, `DELETE /replication/slots/{name}`, `POST /replication/slots/{name}/advance`, `GET /replication/stream` |
 
 `POST /sql` dispatch order: auth DDL → superuser-gated `execute_sql_as`;
 privilege pre-check (`authorize_sql`); parameterized statements bind `$n` as
 data (injection-safe); read-only SELECT → the concurrent read path; everything
 else → writer path with commit-or-abort wrapping.
+
+### POST /batch-sql (item 99)
+
+`POST /batch-sql` accepts a JSON array of up to 256 SQL statements and executes
+them in a single HTTP request, each in its own transaction:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant H as batch_sql handler
+    participant E as Engine
+    C->>H: POST /batch-sql [{sql:"INSERT..."},{sql:"SELECT..."}]
+    loop per statement (up to 256)
+        H->>E: execute_sql(stmt)
+        E-->>H: result rows or error
+    end
+    H-->>C: [{rows:[...]},{rows:[...]}]
+```
+
+Each statement is independent — a failure in statement N does not roll back
+statement N-1. This is the primary API for `compare.py`-style workloads;
+measured reduction: 109 ms → ~15 ms by eliminating per-statement HTTP
+round-trips.
+
+### POST /tables/{name}/bulk — NDJSON bulk load (item 32)
+
+Accepts newline-delimited JSON rows (NDJSON). Each line is one JSON object
+matching the table schema. The handler streams rows in chunks (default 1,000
+per chunk) through `exec_insert`, using `InsertAccum` for WAL batching.
+
+**Measured throughput: 60,000–87,000 rows/sec** (vs ~640/s per-row HTTP).
+Body buffered up to 512 MiB. JWT grant enforcement: `check_table_grant(user,
+table, Insert)` runs before reading any body bytes.
+
+### CDC management API (item 33)
+
+- `GET /tables/{name}/events` — returns CDC status (enabled/disabled, offset
+  of last event, approximate lag).
+- `DELETE /tables/{name}/events` — disables CDC for the table. Idempotent:
+  returns 200 even if already disabled.
+- `GET /events/head` — returns the current head sequence number across all
+  event-enabled tables.
+
+### Slow query log (item 34)
+
+`UNIDB_SLOW_QUERY_MS` env var (or `PUT /config/slow_query_threshold_ms`) sets
+a threshold. Queries exceeding it are emitted as `tracing::warn` events and
+stored in a 300-point ring buffer accessible via `GET /stats/history`. The
+ring holds `(timestamp, sql_fingerprint, duration_ms)` tuples.
+
+### SQL authz DDL (item 24 Z1+Z3+Z5)
+
+- **Z1 — SQL DDL for roles/grants/policies:**
+  `CREATE ROLE <name> [SUPERUSER]`, `GRANT SELECT|INSERT|UPDATE|DELETE|ALL ON
+  <table> TO <role>`, `CREATE POLICY <name> ON <table> FOR <op> USING (...)`.
+  All persisted in the catalog.
+- **Z3 — JWT grant enforcement on every relevant route:** `authorize_sql`
+  called before `execute_sql`; `check_table_grant` called in bulk handler.
+  `apply_rls` applied at both `execute_sql_inner` call sites.
+- **Z5 — Catalog virtual relations:** `SELECT * FROM unidb_catalog.roles`,
+  `unidb_catalog.grants`, `unidb_catalog.policies`.
 
 ## 11.2 Security
 

@@ -1,53 +1,116 @@
-# unidb — Processing Engines: Detailed Design Documents
+# unidb — Processing Engines: Reference Documentation
 
-> A deep-dive design reference for every processing engine in unidb: architecture,
-> data structures at each level, algorithms, border cases, performance work,
-> parallelism, metrics, and the forward roadmap. Distilled from the code as shipped
-> (see `MEMORY.md` for live state); when this collection and
-> `CLAUDE.md`/`PROGRESS.md` disagree, those win.
+> A technical reference for every processing engine in unidb. Written from the
+> shipped code; when this collection and `CLAUDE.md`/`PROGRESS.md` disagree,
+> those win.
 >
-> Diagrams are [Mermaid](https://mermaid.js.org/) — rendered natively by GitHub.
+> Mermaid diagrams are rendered natively by GitHub.
 
-**Scope snapshot:** engine as of 2026-07-11 (`FORMAT_VERSION` 5, crash harness 29
-points, Phases 1–6 + Milestone P shipped).
+**Engine state:** `FORMAT_VERSION` 11 · crash harness 51 points · all four data
+models shipped · items 71–99 incorporated.
 
 ---
 
-## Index
+## System architecture
 
-| # | Document | Engine / concern | What it covers |
-|---|----------|------------------|----------------|
-| 1 | [Architecture overview](01_architecture_overview.md) | Whole system | Layer stack, engine inventory, one-commit multi-model flow, data structures by level, trust & failure model |
-| 2 | [Storage engine](02_storage_engine.md) | Pages · buffer pool · heap | 8 KiB slotted pages, CRC+LSN, mmap-as-storage, CLOCK eviction, D5 enforcement, per-page latches, durable FSM, atomic heap grow, large objects |
-| 3 | [WAL & crash recovery](03_wal_and_recovery.md) | Durability | Record wire format, mini-transactions, segments, group commit, fsync poisoning, ARIES-style redo/undo, FPI torn-page repair, the 29-point crash matrix |
-| 4 | [Transaction engine (MVCC)](04_transaction_engine.md) | Concurrency control | Snapshots & visibility, isolation levels (RC/RR/SSI), lock manager & deadlock detection, vacuum + autovacuum, the index-aliasing gate |
-| 5 | [SQL query engine](05_sql_query_engine.md) | Query processing | Parser → logical → cost-based optimizer (Selinger DP) → executors; joins (hash/Grace, merge, index-NL), spills, decode pushdown, EXPLAIN |
-| 6 | [Indexing engines](06_indexing_engines.md) | Secondary indexes | DiskBTree node format, latch-crabbing writes, latch-free reads, WAL coalescing, duplicate-key fix, full-text inverted index, FSM-as-BTree |
-| 7 | [Vector engine](07_vector_engine.md) | Similarity search | HNSW history and why it was retired, durable IVF-Flat layout, k-means training, NEAR path, recall results |
-| 8 | [Graph engine](08_graph_engine.md) | Edges & traversal | `__edges__` system table, durable adjacency index, Cypher subset, batch-latch resolution, the CSR self-visibility bug story |
-| 9 | [Event queue engine](09_event_queue_engine.md) | Streaming | Synchronous transactional event capture, Kafka-style manual offsets, SSE subscribe, slow-consumer vs. vacuum contract |
-| 10 | [Parallelism & performance](10_parallelism_and_performance.md) | Throughput | Group commit, parallel scan workers, partial aggregates, concurrent SQL writes, read-path wins; full benchmark & metrics analysis |
-| 11 | [Server, replication & operations](11_server_replication_operations.md) | Ops surface | REST API, JWT/roles/audit, `/metrics` & `/stats`, WAL shipping, replicas & failover, backup/PITR, runbook pointers |
-| 12 | [Future roadmap](12_future_roadmap.md) | Direction | Promising development goals, proposed milestones and phases, graduation criteria, risk register |
+```mermaid
+graph TB
+    subgraph Clients
+        APP["Embedded crate (primary)"]
+        REST["REST server (optional, feature-gated)"]
+    end
+
+    subgraph QueryLayer["Query & Execution"]
+        SQL["SQL engine\nparser → logical plan → optimizer → executors\nplan cache (1,024-entry LRU, items 96)"]
+        CYP["Cypher subset\nhand-rolled parser → shared evaluator"]
+        PAR["Parallel scan workers\nstd::thread::scope — never tokio"]
+    end
+
+    subgraph Models["Four Data Models — one transaction covers all four atomically"]
+        ROW["Relational rows\nMVCC · SQL · RLS · O(1) COUNT(*) (item 97)"]
+        VEC["Vector records\nVECTOR(n) · HNSW index\nL0 + vec hot caches (items 72–73)"]
+        EDGE["Graph edges\n__edges__ system table\nadjacency DiskBTree"]
+        EVT["Queue events\n__events__ system table\nKafka-style offsets · SSE subscribe"]
+    end
+
+    subgraph TxnLayer["Transaction & Concurrency"]
+        MVCC["MVCC snapshots\nRC default · RR · SSI\nbulk lock elision for batch DML (item 88)"]
+        LOCK["Lock manager\nrow-level · wait-for graph deadlock detection"]
+        VAC["Vacuum + autovacuum\nindex-aliasing gate"]
+    end
+
+    subgraph StorageLayer["Storage — one page store, one WAL, one buffer pool"]
+        BP["Buffer pool\nCLOCK eviction · D5 gate · per-page latches\nCRC at pool boundary (item 86)"]
+        HEAP["Heap\nslotted 8 KiB pages · HOT chains (items 71, 74, 85)\nInsertAccum (item 98) · fill-page cursor (item 87)"]
+        BT["DiskBTree\nSQL indexes · FSM · postings\nbatch WAL coalescing (item 40, 44, 47, 90)"]
+        WAL["Segmented WAL (19 record types)\nredo+undo · group commit · background sealer (item 89)\n16 MiB segments · FORMAT_VERSION 11"]
+        CTL["Control file\nrecovery root (D3) · next_xid"]
+        MMAP["mmap page file — single data.db"]
+    end
+
+    APP --> SQL & CYP
+    REST --> SQL & CYP
+    SQL --> PAR
+    SQL & CYP --> ROW & VEC & EDGE & EVT
+    ROW & VEC & EDGE & EVT --> MVCC
+    MVCC --> LOCK
+    MVCC --> HEAP & BT
+    HEAP & BT --> BP
+    BP --> MMAP
+    HEAP & BT & VAC -->|"WAL before page (D5)"| WAL
+    WAL --> CTL
+```
+
+---
+
+## The competitive thesis
+
+unidb's moat is **eliminating the multi-system dual-write tax**: "save row +
+embedding + graph edge + event" is one WAL append chain and one group-committed
+fsync, versus 3–4 network round-trips with no shared transaction across
+Postgres + vector store + graph DB + Kafka.
+
+This is a workload-specific claim (`CLAUDE.md §6`). The benchmark philosophy
+compares against the *replaced stack* for cross-domain workloads, and against
+SQLite (the honest embedded analog) for single-model CRUD. Single-model
+comparisons against specialized incumbents report losses honestly.
+
+---
+
+## Document index
+
+| # | Document | What it covers |
+|---|----------|----------------|
+| 1 | [Architecture overview](01_architecture_overview.md) | Layer stack, one-commit multi-model flow, data structures by level, trust model |
+| 2 | [Storage engine](02_storage_engine.md) | Page layout, HOT chains (same-page + cross-page), InsertAccum, buffer pool, heap, checkpoint |
+| 3 | [WAL & crash recovery](03_wal_and_recovery.md) | All 19 WAL record types, FORMAT_VERSION history, mini-transactions, ARIES redo/undo, 51-point crash matrix |
+| 4 | [Transaction engine](04_transaction_engine.md) | MVCC snapshots, isolation levels (RC/RR/SSI), lock manager, vacuum, bulk lock elision |
+| 5 | [SQL query engine](05_sql_query_engine.md) | Parse → plan → execute, plan cache (item 96), O(1) COUNT(*) (item 97), batch INSERT (item 98), GROUP BY pushdown |
+| 6 | [Indexing engines](06_indexing_engines.md) | DiskBTree node format, latch-crabbing, WAL coalescing, sort-then-bulk-load (item 40) |
+| 7 | [Vector engine](07_vector_engine.md) | HNSW structure, L0/vec hot caches (items 72–73), beam search, SIMD distance (item 92), NodeCache gate (item 65) |
+| 8 | [Graph engine](08_graph_engine.md) | Edge storage, adjacency index, Cypher subset, CSR post-mortem |
+| 9 | [Event queue engine](09_event_queue_engine.md) | Synchronous transactional capture, Kafka-style offsets, SSE subscribe, slow-consumer contract |
+| 10 | [Parallelism & performance](10_parallelism_and_performance.md) | Group commit, parallel scan workers, partial aggregates, full benchmark results (Tables 1–5) |
+| 11 | [Server, replication & operations](11_server_replication_operations.md) | All REST routes, POST /batch-sql (item 99), POST /bulk (item 32), CDC management (item 33), JWT/roles, WAL shipping, PITR |
+| 12 | [Future roadmap](12_future_roadmap.md) | Filed follow-ups organized into proposed phases with exit criteria |
 
 ---
 
 ## How to read this collection
 
-- **New to the codebase?** Read doc 1, then docs 2–4 in order — everything else
+- **New to the codebase?** Read docs 1 → 2 → 3 → 4 in order. Everything else
   sits on the storage/WAL/MVCC triad.
-- **Reviewing durability claims?** Docs 2 + 3 and the crash matrix in doc 3.
-- **Evaluating the multi-model thesis?** Docs 1, 7, 8, 9 and the benchmark
-  analysis in doc 10.
-- **Planning future work?** Doc 12, cross-referenced against
+- **Auditing a durability claim?** Docs 2 + 3 and the crash matrix in doc 3.
+- **Evaluating the multi-model thesis?** Doc 1, then the benchmark tables in
+  doc 10 and `PROGRESS.md`.
+- **Planning future work?** Doc 12 cross-referenced against
   `docs/backlog/backlog_index.md`.
 
-## Conventions used throughout
+## Conventions
 
-- **Locked decisions** are cited as `D1`–`D13` (see `CLAUDE.md §3`); phases and
-  milestones as `P1.a`, `M10`, `P5.e` etc. (see `PROGRESS.md`).
+- **Locked decisions** cited as `D1`–`D13` (see `CLAUDE.md §3`).
 - Code references are `file.rs` paths relative to `src/` unless noted.
-- All on-disk integers are **little-endian** (D9). "Page" means the 8 KiB (D8)
-  unit unless a different size is explicit.
-- **Border cases** sections list the failure/edge conditions each engine handles
-  explicitly, with the mechanism that handles them.
+- All on-disk integers are little-endian (D9); "page" means the 8 KiB (D8)
+  unit unless stated otherwise.
+- Performance numbers come from `PROGRESS.md` and the shipped benchmark runs.
+  They are never invented.

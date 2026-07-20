@@ -2,9 +2,12 @@
 
 **Audience:** anyone touching unidb internals. **Prerequisites:** none.
 
+> **State as of 2026-07-19:** `FORMAT_VERSION` 11 · 19 WAL record types ·
+> crash harness 51 points · items 71–99 incorporated.
+
 unidb is a single embedded storage/transaction engine in Rust that unifies four
-data models — relational CRUD, vector search, graph edges, and a durable event
-queue — over **one page store, one WAL, one buffer pool, one transaction
+data models — relational CRUD, vector search (HNSW), graph edges, and a durable
+event queue — over **one page store, one WAL, one buffer pool, one transaction
 manager**. A single transaction can touch all four atomically because there is
 one node and one log.
 
@@ -68,16 +71,16 @@ of tokio/reqwest/axum).
 
 | Engine | Module(s) | Core data structure | Durability mechanism | Doc |
 |---|---|---|---|---|
-| Storage / heap | `page.rs`, `bufferpool.rs`, `heap.rs`, `mmap.rs` | Slotted 8 KiB pages, CLOCK frame table, DiskBTree FSM | WAL-before-page (D5) + FPI | [2](02_storage_engine.md) |
-| WAL & recovery | `wal.rs`, `recovery.rs`, `checkpoint.rs`, `control.rs` | 16 MiB segment files, 41-byte record header | fsync (group-committed), CRC32 everywhere | [3](03_wal_and_recovery.md) |
-| Transactions | `txn.rs`, `mvcc.rs`, `lockmgr.rs` | `Snapshot{xmin,xmax,active}`, wait-for graph | undo log + `WAL_TXN_*` records | [4](04_transaction_engine.md) |
-| SQL | `sql/*` | `LogicalPlan` / `QuerySpec` / `PlanNode` trees | n/a (reads); statements are mini-txns | [5](05_sql_query_engine.md) |
-| B-Tree / full-text | `btree_index.rs`, `fulltext.rs` | Right-linked B-tree over standard pages | redo-only `WAL_INDEX` full-page images | [6](06_indexing_engines.md) |
-| Vector | `disk_vector.rs` (prod), `vector.rs` (retired) | IVF-Flat: centroid pages + DiskBTree postings | same `WAL_INDEX` machinery | [7](07_vector_engine.md) |
+| Storage / heap | `page.rs`, `bufferpool.rs`, `heap.rs`, `mmap.rs` | Slotted 8 KiB pages, CLOCK frame table, DiskBTree FSM, HOT chains, InsertAccum | WAL-before-page (D5) + FPI · CRC at pool boundary (item 86) | [2](02_storage_engine.md) |
+| WAL & recovery | `wal.rs`, `recovery.rs`, `checkpoint.rs`, `control.rs` | 16 MiB segment files, 41-byte record header, 19 record types | fsync (group-committed), CRC32 everywhere, background sealer (item 89) | [3](03_wal_and_recovery.md) |
+| Transactions | `txn.rs`, `mvcc.rs`, `lockmgr.rs` | `Snapshot{xmin,xmax,active}`, wait-for graph, bulk lock elision (item 88) | undo log + `WAL_TXN_*` records | [4](04_transaction_engine.md) |
+| SQL | `sql/*`, `lib.rs` (plan cache) | `LogicalPlan` / `QuerySpec` / `PlanNode` trees, 1024-entry plan cache (item 96), O(1) COUNT(*) (item 97) | n/a (reads); statements are mini-txns | [5](05_sql_query_engine.md) |
+| B-Tree / full-text | `btree_index.rs`, `fulltext.rs` | Right-linked B-tree over standard pages, sort-then-bulk-load (item 40), batch DML maintenance (items 44/47/90) | redo-only `WAL_INDEX` + `WAL_INDEX_INSERT` | [6](06_indexing_engines.md) |
+| Vector | `hnsw_index.rs` (prod), `disk_vector.rs` (IVF baseline) | DiskHnswIndex: HNSW on standard pages + L0/vec caches (items 72–73) + NodeCache gate (item 65) + SIMD (item 92) | `WAL_INDEX` per node page | [7](07_vector_engine.md) |
 | Graph | `graph/*` | `__edges__` heap table + adjacency DiskBTree | ordinary row WAL + `WAL_INDEX` | [8](08_graph_engine.md) |
-| Event queue | `queue/*` | `__events__` + `__consumers__` heap tables | ordinary row WAL, txn-atomic | [9](09_event_queue_engine.md) |
-| Parallel scan | `sql/parallel_scan.rs` | Atomic page-cursor work stealing | read-only | [10](10_parallelism_and_performance.md) |
-| Server / HA | `server/*`, `replication/*`, `backup/*` | slot registry, framed WAL stream | WAL shipping capped at durable LSN | [11](11_server_replication_operations.md) |
+| Event queue | `queue/*`, `server/sse.rs` | `__events__` + `__consumers__` heap tables | ordinary row WAL, txn-atomic | [9](09_event_queue_engine.md) |
+| Parallel scan | `sql/parallel_scan.rs` | Atomic page-cursor work stealing, 5 primitives incl. parallel DELETE (item 66) | read-only | [10](10_parallelism_and_performance.md) |
+| Server / HA | `server/*`, `replication/*`, `backup/*`, `authz/*` | slot registry, framed WAL stream, batch-sql (item 99), bulk (item 32), CDC mgmt (item 33), authz DDL (item 24) | WAL shipping capped at durable LSN | [11](11_server_replication_operations.md) |
 
 **The recurring architectural move is durability reuse.** Vector postings, graph
 adjacency, full-text postings, LOB directories, and the heap's free-space map are
@@ -153,7 +156,7 @@ at SQLite parity (3.59 ms vs 3.64 ms at matched durability).
   full-text, adjacency) re-validates candidates against the caller's MVCC
   snapshot. Stale entries are harmless; missing entries are prevented by
   WAL-ordering; slot reuse is gated by vacuum's index scrub (the aliasing gate).
-- **Crash-injection harness (D7)** currently covers **29 kill points** plus a
+- **Crash-injection harness (D7)** currently covers **51 kill points** plus a
   randomized property test, run under both durability policies. See doc 3 §6.
 
 ## 1.6 Scope discipline (non-goals)

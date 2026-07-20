@@ -89,7 +89,45 @@ latching. The toggle (`UNIDB_CONCURRENT_SQL_WRITES`) is **default-ON since the i
 the serialized fallback, the runtime revert switch / field-safety net. Re-measured
 on the flipped default: indexed 8-writer 811 → 1,016 commits/s.
 
-## 6.4 Write amplification — per-leaf WAL coalescing (A1)
+## 6.4 Sort-then-bulk-load CREATE INDEX (item 40)
+
+Before item 40, `CREATE INDEX` called `insert_in_txn` one row at a time: O(N
+log N) B-tree insertions, each with its own mini-txn and FPI overhead. At 540k
+rows this took **134 seconds**.
+
+The fix: collect all (key, RowId) pairs from committed heap rows, sort them
+by key, then call `insert_batch_in_txn` with the sorted list. One mini-txn
+covers all insertions into the same leaf, and the sort guarantees that each
+leaf is written at most twice (once to fill, once to overflow into a split).
+
+```mermaid
+flowchart LR
+    SCAN["Heap scan\ncollect (key, RowId) pairs\nMVCC-filtered"] --> SORT["Sort by key\nO(N log N) in-memory"]
+    SORT --> BATCH["insert_batch_in_txn\none mini-txn per leaf batch"]
+    BATCH --> CRASH["P40 crash test:\nall-or-nothing"]
+```
+
+**Measured: 134.2 s → 12.0 s (11.2×) at 540k rows.** Crash point P40 covers
+the all-or-nothing invariant for the bulk build.
+
+## 6.5 B-tree batch maintenance for DML (items 44, 47, 90)
+
+Single-row DML (`delete_many`, `update_many`) previously issued one B-tree
+`remove` or `insert_in_txn` call per row. Each call traverses from the root,
+acquires the leaf latch, writes the leaf, and releases. At 50k rows this is
+50k independent root-to-leaf descents.
+
+**Batch maintenance (items 44, 47, 90):** collect all (key, RowId) changes for
+a statement, sort by key, then batch them into `insert_batch_in_txn` /
+`remove_batch`. Keys landing on the same leaf are processed in one latch
+acquisition. The sort-then-merge reduces latch acquisitions from O(N) to
+O(unique_leaves), which is typically O(N/branching_factor).
+
+This is how WAL B/row for DELETE dropped from 39 B/row to 5 B/row (87% reduction)
+and UPDATE non-HOT from 556 B/row to 202 B/row (64% reduction) — measured in
+the Docker bench (Table 3, items 75–84 sprint).
+
+## 6.6 Write amplification — per-leaf WAL coalescing (A1)
 
 `insert_many` sorts a statement's entries so same-leaf keys are contiguous,
 absorbs into each leaf every key inside its `[min, max]` span that fits without
@@ -108,7 +146,7 @@ skipped entry makes the live row unfindable by any index scan (verified: a point
 SELECT returned `[]` after a non-key UPDATE with the write skipped). What
 shipped is coalescing — same WAL win, no lost rows.
 
-## 6.5 The duplicate-key-spanning-leaves bug (found by the vector spike)
+## 6.7 The duplicate-key-spanning-leaves bug (found by the vector spike)
 
 A duplicate run straddling a leaf boundary was under-returned: `find_leaf`
 routed right on equality, landing past earlier duplicates. Fix: **search routes
@@ -119,18 +157,18 @@ so new duplicates append after existing ones. Impact radius before the fix:
 vector recall capped at 0.912, full-text tokens in many documents, graph hub
 nodes — any hot key. Regression test: a 3,000-duplicate key spanning ~7 leaves.
 
-## 6.6 Special deployments of the same tree
+## 6.8 Special deployments of the same tree
 
 | Deployment | Key → Value | Notes |
 |---|---|---|
 | SQL secondary index | column value → RowId | `CREATE INDEX … USING BTREE` |
 | Heap FSM | `page_id` → free bytes (in the RowId.slot field) | `max_entry` (one O(log n) rightmost descent) = durable append tail; `page_directory` leaf-walk = full directory for scans/vacuum |
-| Full-text postings | token → RowId (one entry per token per row) | §6.7 |
+| Full-text postings | token → RowId (one entry per token per row) | §6.9 |
 | Graph adjacency | `from_id` → edge RowId | doc 8 |
 | Vector postings | IVF `cell_id` → RowId | doc 7 |
 | LOB directory | `lob_id` → chunk RowId | doc 2 §6 |
 
-## 6.7 Full-text engine
+## 6.9 Full-text engine
 
 - **Build:** `CREATE INDEX … USING FULLTEXT` tokenizes each row (whitespace
   split → strip non-alphanumeric edges → lowercase) and inserts
@@ -144,7 +182,7 @@ nodes — any hot key. Regression test: a 3,000-duplicate key spanning ~7 leaves
   (roadmap, doc 12). Durable and crash-recovered like every other tree (P14),
   never rebuilt on open.
 
-## 6.8 Border cases
+## 6.10 Border cases
 
 | Case | Handling |
 |---|---|
@@ -152,7 +190,7 @@ nodes — any hot key. Regression test: a 3,000-duplicate key spanning ~7 leaves
 | Scan lands on just-split leaf | right-link walk finds migrated keys |
 | Aborted txn's index entry | harmless hint — filtered by MVCC re-validation |
 | Crash between index write and user commit | redo-only images replay; entries for undone rows are stale hints, filtered |
-| Duplicate run across leaves | leftmost-descent + right-walk (§6.5) |
+| Duplicate run across leaves | leftmost-descent + right-walk (§6.7) |
 | Vacuumed/reused slot behind an entry | vacuum scrubs indexes before slot reuse (doc 4 §4.4) |
 | Text keys during crabbing | conservative safe-node predicate — never under-latch |
 | Empty query (full-text) | matches nothing (documented) |

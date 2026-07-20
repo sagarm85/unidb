@@ -5,6 +5,11 @@ hooks). **Locked decisions:** D1 (steal + no-force ⇒ redo **and** undo), D2
 (statement = mini-transaction), D5 (WAL-before-page), D7 (crash harness), D9
 (little-endian, CRC).
 
+> **Note:** The WAL now defines **19 record types** (types 1–19). Every new type
+> triggered a `FORMAT_VERSION` bump, which causes older binaries to produce a
+> hard `BadVersion` error rather than silently misrecovering via the `_ => {}`
+> catch-all. See `format.rs` for the full version history.
+
 ---
 
 ## 3.1 Record wire format
@@ -28,19 +33,58 @@ hooks). **Locked decisions:** D1 (steal + no-force ⇒ redo **and** undo), D2
 Records are framed `[len:u32][record]` inside segments; the replication stream
 uses the identical framing (doc 11 §5).
 
-### Record kinds
+### Record kinds — all 19 types
 
-| Kind | # | Redo | Undo | Purpose |
+```mermaid
+graph LR
+    subgraph MiniTxn["Mini-transaction brackets (D2)"]
+        T1["1 WAL_BEGIN"]
+        T2["2 WAL_COMMIT"]
+        T3["3 WAL_ABORT"]
+    end
+    subgraph HeapDML["Heap DML"]
+        T4["4 WAL_INSERT\nredo: xmin+prev+payload\nundo: none (self-stamp on abort)"]
+        T5["5 WAL_UPDATE\nredo: new xmax (8B)\nundo: old xmax (8B)"]
+        T6["6 WAL_DELETE\nredo: empty\nundo: old tuple bytes"]
+        T14["14 WAL_XMAX_BATCH (item 56/74)\nredo: xid+n_slots+slot_list\nundo: slot_list (clear xmax)"]
+        T18["18 WAL_INSERT_BATCH (item 74)\nredo: n_rows + per-row payloads\nundo: slot_list (self-stamp dead)"]
+    end
+    subgraph HOTChains["HOT Chains"]
+        T16["16 WAL_HOT_UPDATE (item 58)\nredo: xmax+hot_next+insert payload\nundo: clear xmax+hot_next"]
+        T17["17 WAL_HOT_XPAGE_HEAD (item 71)\nredo: xmax+chain ptr\nundo: restore prev_page/slot+clear xmax"]
+        T19["19 WAL_HOT_XPAGE_BATCH (item 74)\nredo: per-slot chain ptrs\nundo: restore+clear per slot"]
+    end
+    subgraph UserTxn["User transaction brackets (M1)"]
+        T8["8 WAL_TXN_BEGIN"]
+        T9["9 WAL_TXN_COMMIT"]
+        T10["10 WAL_TXN_ABORT"]
+    end
+    subgraph Redo["Redo-only (no undo)"]
+        T7["7 WAL_CHECKPOINT\nself-fsyncs"]
+        T11["11 WAL_VACUUM\nslot: mark DEAD\nslot=MAX: full page image"]
+        T12["12 WAL_FPI\nfull clean page image\ntorn-page protection"]
+        T13["13 WAL_INDEX\nfull B-tree node image\nall DiskBTree engines"]
+        T15["15 WAL_INDEX_INSERT (item 56 step 4)\nlogical leaf insert\nLSN-gated idempotent"]
+    end
+```
+
+| Type | # | Redo | Undo | Notes |
 |---|---|---|---|---|
-| `WAL_BEGIN` / `WAL_COMMIT` / `WAL_ABORT` | 1/2/3 | – | – | mini-txn bracket (D2); commit/abort fsync unless deferred |
-| `WAL_INSERT` | 4 | `[xmin:8][prev_page:4][prev_slot:2][payload]` | – | row insert; `slot=u16::MAX` = page-allocation record |
-| `WAL_UPDATE` | 5 | new xmax (8 B) | old xmax (8 B) | post-M1 this is only ever an xmax stamp |
-| `WAL_DELETE` | 6 | empty | old tuple bytes | undo re-inserts |
-| `WAL_CHECKPOINT` | 7 | – | – | self-fsyncs |
-| `WAL_TXN_BEGIN/COMMIT/ABORT` | 8/9/10 | – | – | user transaction bracket (independent id space, distinguished purely by `rec_type`) |
-| `WAL_VACUUM` | 11 | slot≠MAX: none (mark line pointer DEAD) · slot=MAX: full compacted page image | **none — redo-only, idempotent** | M10 vacuum |
-| `WAL_FPI` | 12 | full clean page image | none | torn-page protection (P1.a) |
-| `WAL_INDEX` | 13 | full B-tree/meta node image | **none** — index entries are MVCC-revalidated hints | all DiskBTree-backed engines |
+| `WAL_BEGIN` / `WAL_COMMIT` / `WAL_ABORT` | 1/2/3 | – | – | Mini-txn bracket (D2) |
+| `WAL_INSERT` | 4 | xmin + prev + payload | – | `slot=u16::MAX` = page-allocation record |
+| `WAL_UPDATE` | 5 | new xmax (8 B) | old xmax (8 B) | Post-M1: only used for individual xmax stamps |
+| `WAL_DELETE` | 6 | empty | old tuple bytes | Undo re-inserts the deleted bytes |
+| `WAL_CHECKPOINT` | 7 | – | – | Redo-only; self-fsyncs |
+| `WAL_TXN_BEGIN/COMMIT/ABORT` | 8/9/10 | – | – | User transaction brackets (M1) |
+| `WAL_VACUUM` | 11 | slot: none · slot=MAX: page image | none | Redo-only, idempotent |
+| `WAL_FPI` | 12 | full clean page image | none | Torn-page protection (P1.a) |
+| `WAL_INDEX` | 13 | full B-tree node image | none | Redo-only; all DiskBTree engines |
+| `WAL_XMAX_BATCH` | 14 | xid + n_slots + slot_list | slot_list (clear xmax) | Batch xmax stamps (items 56/74); FORMAT_VERSION bump to v6 |
+| `WAL_INDEX_INSERT` | 15 | key + RowId at leaf slot | none | Logical B-tree insert; replaces full WAL_INDEX on non-split leaf; FORMAT_VERSION v7 |
+| `WAL_HOT_UPDATE` | 16 | xmax + hot_next + insert payload | clear xmax + hot_next | Same-page HOT (item 58); FORMAT_VERSION v8 |
+| `WAL_HOT_XPAGE_HEAD` | 17 | xmax + chain ptr (new_pid, new_slot) | restore prev_page/slot + clear xmax | Cross-page HOT old slot (item 71); FORMAT_VERSION v9 |
+| `WAL_INSERT_BATCH` | 18 | n_rows + per-row payloads | slot_list (self-stamp dead) | Batched multi-row insert (item 74) |
+| `WAL_HOT_XPAGE_BATCH` | 19 | per-slot chain pointers | restore + clear per slot | Cross-page HOT chain pointers, batch form (item 74) |
 
 ### Segments (P6.a)
 
@@ -81,6 +125,13 @@ flowchart TB
 - **fsync poisoning** (P1.b): any fsync failure — real or injected — latches
   `poisoned`; `durable_lsn` never advances on failure and every later durability
   call returns `DurabilityFailure` forever. Session-fatal by design.
+- **Background WAL sealer (item 89):** segment rotation (`sync_all` on the
+  outgoing segment) previously ran inside the append mutex, blocking all
+  concurrent appenders for the duration of the fsync. The background sealer
+  moves this `sync_all` off the append mutex: a dedicated thread pre-opens the
+  next segment file and performs the seal fsync, so the append path only needs
+  to swap the writer pointer under the mutex (a nanosecond operation vs ~3 ms
+  fsync). This eliminates the rotation stall on write-heavy workloads.
 
 ## 3.3 Mini-transactions and user transactions (D2)
 
@@ -150,7 +201,10 @@ pre-floor records; harmless because recovery filters by LSN and redo is
 idempotent. Shipping (`records_from`) is **capped at the durable frontier** so a
 replica can never get ahead of the primary (doc 11 §5).
 
-## 3.6 Crash-injection matrix (D7) — 29 points + property test
+## 3.6 Crash-injection matrix (D7) — 51 points + property test
+
+51 named crash points as of 2026-07-19. Every item that touches storage adds
+new points — crash coverage is a delivery criterion, not an afterthought.
 
 | Point | Kill site | Invariant proven |
 |---|---|---|
@@ -175,13 +229,21 @@ replica can never get ahead of the primary (doc 11 §5).
 | P27 | crash, no checkpoint, multi-page table | durable FSM directory recovered; appends land at recovered tail |
 | P28 | crash mid-heap-grow | page init + FSM entry: both or neither |
 | P29 | crash around coalesced UPDATE index maintenance | bulk/key-change/incomplete cases all resolve correctly |
+| P35 | crash after unique-index enforce on INSERT | index entry and heap row both present or neither |
+| P36 | crash mid FK constraint check | parent check + child insert: both or neither |
+| P40 | crash during sort-then-bulk-load CREATE INDEX | all-or-nothing index build (item 40) |
+| P74 | crash mid batch HOT UPDATE | committed batch survives; incomplete txn leaves originals visible |
+| P_xhot_a | WAL durable, cross-page HOT page not flushed | redo restores chain and new version (item 71) |
+| P_xhot_b | incomplete cross-page HOT txn | originals remain visible; new version invisible |
 | Pa | deferred mode, 5 unsynced statements, no commit | zero trace |
-| Pb | txn A's records flushed by txn B's commit sync | A undone, B survives (shared log ≠ shared commit) |
+| Pb | txn A's records flushed by txn B's commit sync | A undone, B survives |
 | Pc | committed prefix durable, corrupted unsynced tail | CRC stops replay; prefix survives |
 | Pd | 16-frame pool, 60 large inserts, one deferred txn | eviction-forced syncs preserve D5 |
 | prop | random ops + random crash points, **both** durability policies | recovered DB = exactly the txns that reached durable `WAL_TXN_COMMIT` |
 
-(Numbering has historical gaps — P8, P20–P25 were never assigned.)
+(Numbering has historical gaps — P8, P20–P25 were never assigned. Many newer
+items add P-numbers not listed here for brevity; the authoritative list is
+`tests/crash/main.rs`.)
 
 ## 3.7 Border cases
 
