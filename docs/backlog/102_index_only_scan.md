@@ -1,5 +1,5 @@
 **Type:** Performance
-**Status:** ✅ SHIPPED — Phase A (PR #169, 2026-07-20): key-col projection index-only scan, `IDX_ONLY_ROWS`; Phase B (PR pending, 2026-07-20): covering index `INCLUDE (cols)`, FORMAT_VERSION 12, `IDX_INCLUDE_ROWS`, HOT eligibility gate for INCLUDE cols. See PROGRESS.md "Item 102-A" and "Item 102-B".
+**Status:** ✅ SHIPPED — Phase A (PR #169, 2026-07-20): key-col projection index-only scan, `IDX_ONLY_ROWS`; Phase B (PR #177, 2026-07-20): covering index `INCLUDE (cols)`, FORMAT_VERSION 12, `IDX_INCLUDE_ROWS`, HOT eligibility gate for INCLUDE cols. See PROGRESS.md "Item 102-A" and "Item 102-B".
 
 # Item 102 — Index-only scan / covering index
 

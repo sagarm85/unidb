@@ -8422,7 +8422,7 @@ counter instrumentation that the fast path fires on every standalone NEAR call.
 
 ## Item 102-B — Covering index: INCLUDE columns in B-tree leaf (2026-07-20)
 
-**Branch:** `feat/item-102b-covering-index` | **PR:** pending  
+**Branch:** `feat/item-102b-covering-index` | **PR:** [#177](https://github.com/sagarm85/unidb/pull/177)  
 **FORMAT_VERSION:** 11 → 12
 
 ### What shipped

@@ -12,7 +12,7 @@
 
 ## Current status
 
-- **Item 102-B — Covering index INCLUDE columns — SHIPPED 2026-07-20, PR #177, branch `feat/item-102b-covering-index`.**
+- **Item 102-B — Covering index INCLUDE columns — SHIPPED 2026-07-20, PR [#177](https://github.com/sagarm85/unidb/pull/177) MERGED.**
   `CREATE INDEX ON t (col) INCLUDE (c1, c2, …)` — stores INCLUDE col values in B-tree leaf.
   Leaf wire format: `key_bytes | include_len:u32-LE | include_bytes | RowId(6B)`.
   FORMAT_VERSION 11→12. `ColumnDef.include_cols: Vec<String>` persisted via `set_column_include_cols`.
