@@ -8769,9 +8769,9 @@ eliminating ~200 `Vec<RowId>` alloc/hop × ~100 ns per alloc on the warm path.
 
 ## Item 19 (partial) — SQL surface gaps: G1 + G3 + routing fixes (2026-07-20)
 
-**Backlog:** `docs/backlog/19_sql_surface_gaps.md` (G1, G3 shipped; G2/G6/G7/G9/G11 remain open)
+**Backlog:** `docs/backlog/19_sql_surface_gaps.md` (G1, G3, G6 shipped; G2/G7/G9/G11/G-NATURAL remain open)
 
-**Status:** PARTIAL — the highest-ROI gaps from the backlog have landed. G4/G5/G8/G10 were already implemented in prior work; this entry covers new work only.
+**Status:** PARTIAL — the highest-ROI gaps from the backlog have landed. G4/G5/G8/G10 were already implemented in prior work; G6 (derived table subqueries) landed 2026-07-20; this entry covers new work only.
 
 ### What shipped
 
@@ -8839,13 +8839,35 @@ layer touched. Crash harness unchanged. No new `FORMAT_VERSION` bump needed.
 
 `CAST(expr AS type)` — see Item 19 G2-cast entry below.
 
-### Remaining open gaps (G2-join/G6/G7/G9/G11)
+### G6 — Derived table subqueries (`SELECT … FROM (SELECT …) AS alias`) — landed 2026-07-20
+
+Implemented across all four pipeline layers:
+
+- **Parser** (`src/sql/parser.rs`): `from_node_from_factor` converts
+  `TableFactor::Derived` → `FromNode::Derived { subquery, alias }`.
+  `convert_query` detects `from_has_derived` and forces routing to the Phase-4
+  path. Alias is required; missing alias returns `SqlUnsupported`.
+- **Logical plan** (`src/sql/query.rs`): new `FromNode::Derived { subquery:
+  Box<QuerySpec>, alias: String }` variant. `apply_rls_into_derived` recurses
+  into the inner subquery — RLS is not bypassed by nesting.
+- **Physical plan** (`src/sql/plan.rs`): new `PlanNode::DerivedTable { subquery,
+  alias, output }`. `plan_from` calls `plan_query` recursively and requalifies
+  output columns with the alias. `explain.rs` and `optimizer.rs` updated.
+- **Executor** (`src/sql/query_exec.rs`): materialises the inner subquery batch
+  with alias-requalified schema.
+- **`lib.rs`**: `query_base_tables` recurses into `FromNode::Derived`.
+
+7 tests in `tests/item19_derived_tables.rs` — all PASS (basic, outer filter, COUNT inner, JOIN, alias.col ref, 2-level nesting, RLS not bypassed).
+
+No storage / format / WAL / crash-harness impact. No `FORMAT_VERSION` bump.
+
+### Remaining open gaps (G2-join/G7/G9/G11/G-NATURAL)
 
 | Gap | Description | Status |
 |---|---|---|
 | G2-cast | CAST(expr AS type) | **SHIPPED 2026-07-20** — see Item 19 G2-cast |
 | G2-join | FULL OUTER JOIN | Open |
-| G6 | NATURAL JOIN | Open (low ROI) |
+| G-NATURAL | NATURAL JOIN | Open (low ROI) |
 | G7 | Window functions / recursive CTEs | Open (large; deferred) |
 | G9 | LIKE / NOT LIKE / ILIKE | Delivered under item 30 |
 | G11 | Full-text SQL predicate | Delivered under item 30 |

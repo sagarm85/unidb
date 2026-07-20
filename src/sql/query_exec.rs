@@ -838,6 +838,21 @@ impl Runner<'_, '_> {
                 let r = self.run(right)?;
                 exec_set_op_batches(*op, *all, l, r, output)
             }
+
+            // G6 (item 19): derived table — `(SELECT …) AS alias`.
+            // Execute the inner subquery to materialize its rows, then present
+            // them under the outer schema (all columns requalified to `alias`).
+            // The inner subquery already ran through RLS at plan time, so no
+            // additional filtering is needed here.
+            PlanNode::DerivedTable {
+                subquery, output, ..
+            } => {
+                let inner = self.run(subquery)?;
+                Ok(Batch {
+                    schema: output.clone(),
+                    rows: inner.rows,
+                })
+            }
         }
     }
 

@@ -171,6 +171,10 @@ fn flatten_inner(node: &FromNode, tables: &mut Vec<TableRef>, on: &mut Vec<QExpr
         // G8 (item 19): Dual has no base tables; the optimizer falls back to
         // plan_from which handles it as PlanNode::Dual.
         FromNode::Dual => false,
+        // G6 (item 19): derived tables are opaque to the cost-based optimizer —
+        // the subquery must be planned and executed independently (see plan_from).
+        // Fall back to the rule-based path, which calls plan_from.
+        FromNode::Derived { .. } => false,
         FromNode::Join {
             left,
             right,
