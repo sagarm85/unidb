@@ -578,7 +578,7 @@ impl Ord for DistRid {
 /// the graph may have changed and stale cached neighbours would be incorrect.
 type NodeCache = HashMap<i64, HnswNode>;
 
-// ── L0 query cache (item 72) ─────────────────────────────────────────────────
+// ── L0 query cache (item 72 + 93) ───────────────────────────────────────────
 
 /// Default size cap for the per-index L0 query cache (256 MiB).
 const DEFAULT_L0_CACHE_BYTES: usize = 256 * 1024 * 1024;
@@ -592,6 +592,185 @@ fn l0_cache_max_bytes() -> usize {
         .unwrap_or(DEFAULT_L0_CACHE_BYTES)
 }
 
+/// Decode a packed `i64` arena entry back to a `RowId`.
+///
+/// Encoding: `page_id as i64 * 65536 + slot as i64` (same as `encode_rid`).
+#[inline(always)]
+fn decode_rid_i64(v: i64) -> RowId {
+    RowId {
+        page_id: (v >> 16) as u32,
+        slot: (v & 0xFFFF) as u16,
+    }
+}
+
+// ── L0Arena (item 93) ────────────────────────────────────────────────────────
+//
+// Flat contiguous arena that stores all HNSW L0 neighbour lists in two `Vec`s:
+//
+//   node_idx_map:  HashMap<i64, u32>  — encoded RowId → slot index k
+//   arena_data:    Vec<i64>           — packed neighbour RowIds, contiguous
+//   arena_offsets: Vec<u32>           — prefix-sum offsets; node k occupies
+//                                       arena_data[offsets[k]..offsets[k+1]]
+//   tombstone_count: u32              — physical slots whose list was superseded
+//                                       (re-wired by HNSW reciprocal updates)
+//
+// **Lookup (hot path, zero copy):**
+//   `node_idx_map.get(key)` → k →
+//   `arena_data[arena_offsets[k] as usize .. arena_offsets[k+1] as usize]`
+//   Then iterate directly — zero heap allocation.
+//
+// **Insert (new node):**
+//   Append neighbour RowIds (encoded as i64) to `arena_data`.
+//   Push new offset into `arena_offsets`. Record k in `node_idx_map`.
+//
+// **Update (re-wire, e.g. reciprocal L0 edge added):**
+//   Mark old slot as tombstone (`arena_offsets[k] = arena_offsets[k+1]` so
+//   the range is empty), then append updated list + new offset. Update
+//   `node_idx_map[key]` to point at the new slot. Increment `tombstone_count`.
+//
+// **Compaction** (triggered when tombstone_count > num_slots / 2):
+//   Rebuild arena in a single pass — copy live entries only.
+//
+// **Memory layout at 10k nodes, M_max0=32:**
+//   node_idx_map:   10k × (8+4) bytes ≈ 120 KB (HashMap load factor ~0.75)
+//   arena_data:     10k × 32 × 8 bytes = 2.56 MB (packed i64 neighbours)
+//   arena_offsets:  (10k+1) × 4 bytes  ≈ 40 KB
+//   Total:                              ≈ 2.7 MB  (vs HashMap<i64,Vec<RowId>>:
+//   10k × (8+24+32×6) ≈ 2.4 MB + heap fragmentation from per-Vec pointers)
+//
+// The key win is cache locality: all neighbour lists live in one contiguous slab,
+// so a 200-hop beam search touches at most ~200 cache lines of `arena_data` in a
+// predictable forward pattern — vs 200 independent heap-allocated Vecs.
+#[derive(Clone, Default)]
+struct L0Arena {
+    /// encoded RowId → arena slot index
+    node_idx_map: HashMap<i64, u32>,
+    /// packed neighbour RowIds; node k at [offsets[k]..offsets[k+1]]
+    arena_data: Vec<i64>,
+    /// prefix-sum offsets; len = num_slots + 1 sentinel
+    arena_offsets: Vec<u32>,
+    /// number of physical slots whose neighbour list was superseded (tombstoned)
+    tombstone_count: u32,
+}
+
+impl L0Arena {
+    fn new() -> Self {
+        Self {
+            node_idx_map: HashMap::new(),
+            arena_data: Vec::new(),
+            arena_offsets: vec![0u32], // sentinel: offsets[0] = 0
+            tombstone_count: 0,
+        }
+    }
+
+    /// Number of physical slots (live + tombstoned).
+    fn num_slots(&self) -> usize {
+        self.arena_offsets.len().saturating_sub(1)
+    }
+
+    /// Return the neighbour slice for `key` as packed i64 values.
+    /// Returns `None` on miss.
+    #[inline(always)]
+    fn get_slice(&self, key: i64) -> Option<&[i64]> {
+        let k = *self.node_idx_map.get(&key)? as usize;
+        let start = self.arena_offsets[k] as usize;
+        let end = self.arena_offsets[k + 1] as usize;
+        Some(&self.arena_data[start..end])
+    }
+
+    /// True if `key` is present in the arena.
+    fn contains_key(&self, key: i64) -> bool {
+        self.node_idx_map.contains_key(&key)
+    }
+
+    /// Approximate payload bytes (neighbour data only).
+    fn payload_bytes(&self) -> usize {
+        self.arena_data.len() * std::mem::size_of::<i64>()
+    }
+
+    /// Append a new node's neighbour list.
+    /// No-op (returns false) if the key is already present.
+    fn append(&mut self, key: i64, nbrs: &[RowId]) -> bool {
+        if self.node_idx_map.contains_key(&key) {
+            return false;
+        }
+        let k = self.num_slots() as u32;
+        for r in nbrs {
+            self.arena_data.push(encode_rid(*r));
+        }
+        let end = *self.arena_offsets.last().unwrap_or(&0) + nbrs.len() as u32;
+        self.arena_offsets.push(end);
+        self.node_idx_map.insert(key, k);
+        true
+    }
+
+    /// Update an existing node's neighbour list (re-wire on reciprocal insert).
+    /// Tombstones the old slot, appends the new list, updates the index.
+    /// If the key is not present, inserts as new.
+    fn update(&mut self, key: i64, nbrs: &[RowId]) {
+        if let Some(&k) = self.node_idx_map.get(&key) {
+            // Tombstone: collapse the old range to empty.
+            let cur_end = self.arena_offsets[k as usize + 1];
+            self.arena_offsets[k as usize] = cur_end;
+            self.tombstone_count += 1;
+            // Remove from map so append() inserts a new slot.
+            self.node_idx_map.remove(&key);
+        }
+        self.append(key, nbrs);
+
+        // Compact if fragmentation exceeds 50% of physical slots.
+        let n = self.num_slots() as u32;
+        if n > 0 && self.tombstone_count > n / 2 {
+            self.compact();
+        }
+    }
+
+    /// Rebuild the arena keeping only live (non-empty-range) entries.
+    fn compact(&mut self) {
+        let num = self.num_slots();
+        let mut new_map: HashMap<i64, u32> = HashMap::with_capacity(self.node_idx_map.len());
+        let mut new_data: Vec<i64> = Vec::with_capacity(self.arena_data.len());
+        let mut new_offsets: Vec<u32> = vec![0u32];
+
+        // Build a reverse map slot_k → key so we can iterate in slot order.
+        let mut slot_to_key: Vec<Option<i64>> = vec![None; num];
+        for (&key, &k) in &self.node_idx_map {
+            if (k as usize) < num {
+                slot_to_key[k as usize] = Some(key);
+            }
+        }
+
+        for (k, opt_key) in slot_to_key.iter().enumerate() {
+            let start = self.arena_offsets[k] as usize;
+            let end = self.arena_offsets[k + 1] as usize;
+            if start >= end {
+                // Tombstoned slot — skip.
+                continue;
+            }
+            if let Some(key) = opt_key {
+                let new_k = (new_offsets.len() - 1) as u32;
+                new_map.insert(*key, new_k);
+                new_data.extend_from_slice(&self.arena_data[start..end]);
+                new_offsets.push(new_data.len() as u32);
+            }
+        }
+
+        self.node_idx_map = new_map;
+        self.arena_data = new_data;
+        self.arena_offsets = new_offsets;
+        self.tombstone_count = 0;
+    }
+
+    /// Clear all data (used on generation change).
+    fn clear(&mut self) {
+        self.node_idx_map.clear();
+        self.arena_data.clear();
+        self.arena_offsets.clear();
+        self.arena_offsets.push(0); // sentinel
+        self.tombstone_count = 0;
+    }
+}
+
 /// Process-lifetime in-memory cache of L0 neighbour lists for NEAR queries.
 ///
 /// Lives behind `Mutex<HashMap<PageId, HnswL0Cache>>` on `Engine`, one entry per
@@ -599,8 +778,13 @@ fn l0_cache_max_bytes() -> usize {
 /// when `generation` no longer matches `hdr.total_nodes` (any HNSW insert bumps
 /// `total_nodes`, which also rewrites some L0 neighbour lists via reciprocal edges).
 ///
-/// Memory: 32 neighbours × 6 bytes/RowId = 192 bytes/node.
-/// At 256 MiB default cap → ~1.4 M nodes; graceful disk fallback above the cap.
+/// **Item 93:** Internal storage replaced by `L0Arena` — a contiguous flat slab
+/// that stores all neighbour lists in two `Vec`s (`arena_data` + `arena_offsets`).
+/// The hot-path lookup in `search_layer_with_vec` calls `for_l0_nbrs` which
+/// iterates the arena slice in-place with **zero heap allocation** per hop.
+///
+/// Memory: 32 neighbours × 8 bytes/encoded RowId = 256 bytes/node.
+/// At 256 MiB default cap → ~1.0 M nodes; graceful disk fallback above the cap.
 ///
 /// Snapshot pattern (see `exec_select_near`):
 ///   1. Lock, clone this entry, release lock.
@@ -609,10 +793,8 @@ fn l0_cache_max_bytes() -> usize {
 ///      still matches; clears and restarts if an insert raced with us.
 #[derive(Clone)]
 pub struct HnswL0Cache {
-    /// L0 neighbour lists.  Key = `encode_rid(heap_rid)`.
-    pub neighbours: HashMap<i64, Vec<RowId>>,
-    /// Approximate payload size in bytes (neighbour payload only).
-    pub size_bytes: usize,
+    /// Flat arena storage for L0 neighbour lists (item 93).
+    arena: L0Arena,
     /// Max bytes before new entries are silently dropped (graceful fallback).
     pub max_bytes: usize,
     /// `hdr.total_nodes` at the time this cache was last validated.
@@ -623,24 +805,70 @@ pub struct HnswL0Cache {
 impl HnswL0Cache {
     pub fn new() -> Self {
         Self {
-            neighbours: HashMap::new(),
-            size_bytes: 0,
+            arena: L0Arena::new(),
             max_bytes: l0_cache_max_bytes(),
             generation: 0,
         }
     }
 
+    /// Approximate payload bytes currently held in the arena.
+    pub fn size_bytes(&self) -> usize {
+        self.arena.payload_bytes()
+    }
+
+    /// True if the arena has a cached neighbour list for `key`.
+    pub fn contains_key(&self, key: i64) -> bool {
+        self.arena.contains_key(key)
+    }
+
     /// Record one node's L0 neighbour list.  No-op if already cached or over cap.
     pub fn insert_neighbours(&mut self, key: i64, nbrs: Vec<RowId>) {
-        if self.neighbours.contains_key(&key) {
+        if self.arena.contains_key(key) {
             return;
         }
-        let entry_bytes = nbrs.len() * std::mem::size_of::<RowId>();
-        if self.size_bytes + entry_bytes > self.max_bytes {
+        let entry_bytes = nbrs.len() * std::mem::size_of::<i64>();
+        if self.arena.payload_bytes() + entry_bytes > self.max_bytes {
             return; // over cap — disk fallback on the next miss
         }
-        self.size_bytes += entry_bytes;
-        self.neighbours.insert(key, nbrs);
+        self.arena.append(key, &nbrs);
+    }
+
+    /// Update (re-wire) an existing node's L0 neighbour list in the arena.
+    /// If the key is not present, inserts as new.  Obeys the byte cap.
+    pub fn update_neighbours(&mut self, key: i64, nbrs: Vec<RowId>) {
+        let entry_bytes = nbrs.len() * std::mem::size_of::<i64>();
+        if self.arena.payload_bytes() + entry_bytes > self.max_bytes {
+            return; // over cap
+        }
+        self.arena.update(key, &nbrs);
+    }
+
+    /// Zero-copy iteration over the cached L0 neighbours for `key`.
+    ///
+    /// Calls `f(nbr_rid)` for each neighbour.  Returns `true` on a cache hit
+    /// (neighbours may still be empty for a node with no edges), `false` on a
+    /// complete miss (caller must fall back to disk).
+    ///
+    /// **Hot path**: zero heap allocation — iterates the arena slice in-place.
+    #[inline(always)]
+    pub fn for_l0_nbrs(&self, key: i64, mut f: impl FnMut(RowId)) -> bool {
+        match self.arena.get_slice(key) {
+            Some(slice) => {
+                for &v in slice {
+                    f(decode_rid_i64(v));
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Clone-based access for use outside the hot path.
+    /// Returns `Some(Vec<RowId>)` if cached, `None` on miss.
+    pub fn get_neighbours(&self, key: i64) -> Option<Vec<RowId>> {
+        self.arena
+            .get_slice(key)
+            .map(|s| s.iter().map(|&v| decode_rid_i64(v)).collect())
     }
 
     /// Merge entries from `other` (a query-local snapshot) back into the global
@@ -649,12 +877,39 @@ impl HnswL0Cache {
     pub fn merge_from(&mut self, other: HnswL0Cache) {
         if self.generation != other.generation {
             // A concurrent insert changed `total_nodes` — stale data must go.
-            self.neighbours.clear();
-            self.size_bytes = 0;
+            self.arena.clear();
             self.generation = other.generation;
         }
-        for (k, v) in other.neighbours {
-            self.insert_neighbours(k, v);
+        // Walk the other arena's live slots and insert any missing entries.
+        let num = other.arena.num_slots();
+        // Build a reverse slot→key map to iterate in slot order.
+        let mut slot_to_key: Vec<Option<i64>> = vec![None; num];
+        for (&key, &k) in &other.arena.node_idx_map {
+            if (k as usize) < num {
+                slot_to_key[k as usize] = Some(key);
+            }
+        }
+        for (k, opt_key) in slot_to_key.iter().enumerate() {
+            let start = other.arena.arena_offsets[k] as usize;
+            let end = other.arena.arena_offsets[k + 1] as usize;
+            if start >= end {
+                continue; // tombstoned
+            }
+            if let Some(key) = opt_key {
+                if !self.arena.contains_key(*key) {
+                    let entry_bytes = (end - start) * std::mem::size_of::<i64>();
+                    if self.arena.payload_bytes() + entry_bytes > self.max_bytes {
+                        break; // over cap
+                    }
+                    // Decode i64 → RowId for the append (which re-encodes).
+                    // merge_from is called once per query, not per hop.
+                    let nbrs: Vec<RowId> = other.arena.arena_data[start..end]
+                        .iter()
+                        .map(|&v| decode_rid_i64(v))
+                        .collect();
+                    self.arena.append(*key, &nbrs);
+                }
+            }
         }
     }
 }
@@ -994,9 +1249,13 @@ impl DiskHnswIndex {
     /// Get layer-0 neighbours for `rid`.
     ///
     /// Cache priority (first hit wins):
-    ///   1. `l0_cache`  — process-lifetime cross-query cache (item 72, query path).
+    ///   1. `l0_cache`  — process-lifetime arena cache (item 72+93, query path).
     ///   2. `node_cache` — per-insert transient cache (insert path only).
     ///   3. Disk — DiskBTree lookup + page fetch.
+    ///
+    /// **Hot-path note:** On the query path (`l0_cache = Some`), use
+    /// `get_l0_nbrs_inline` instead for zero-allocation arena iteration.
+    /// This function is kept for the insert path and for non-arena callers.
     fn get_l0_nbrs(
         &self,
         rid: RowId,
@@ -1007,11 +1266,12 @@ impl DiskHnswIndex {
     ) -> Result<Vec<RowId>> {
         let key = encode_rid(rid);
 
-        // 1. Process-lifetime L0 cache (query path; insert path always passes None).
+        // 1. Process-lifetime L0 arena cache (query path; insert path always passes None).
         if let Some(cache) = l0_cache {
-            if let Some(nbrs) = cache.neighbours.get(&key) {
+            // Try arena hit first (zero copy into temporary Vec).
+            if let Some(nbrs) = cache.get_neighbours(key) {
                 Q_L0_CACHE_HITS.fetch_add(1, AtomicOrd::Relaxed);
-                return Ok(nbrs.clone());
+                return Ok(nbrs);
             }
             // Cache miss: load from disk, store for future queries.
             let nbrs = match self.find_node_loc(rid, hdr.node_index_root, pool)? {
@@ -1161,20 +1421,74 @@ impl DiskHnswIndex {
                 break;
             }
 
-            // Expand cand_rid's neighbours at this layer.
-            let nbrs = if layer == 0 {
-                self.get_l0_nbrs(
-                    cand_rid,
-                    hdr,
-                    pool,
-                    node_cache.as_deref_mut(),
-                    l0_cache.as_deref_mut(),
-                )?
+            // ── Expand cand_rid's neighbours at this layer. ────────────────
+            //
+            // Item 93: on the warm query path (layer==0, l0_cache=Some), we collect
+            // neighbours into a fixed stack buffer — no heap allocation — then iterate.
+            // M_max0=32, so 32 RowIds on the stack is always sufficient.
+            // On a cache miss the disk path still populates the arena for future hops.
+            //
+            // For layer > 0 and the insert path we keep the original Vec<RowId> path.
+
+            // Stack buffer for arena-hit neighbours (avoids Vec alloc on hot path).
+            let mut nbr_buf = [RowId {
+                page_id: 0,
+                slot: 0,
+            }; HNSW_M_MAX0];
+            let mut nbr_buf_len: usize = 0;
+            // Fallback owned Vec for non-arena paths (disk fetch, upper layers).
+            let mut nbrs_owned: Vec<RowId> = Vec::new();
+
+            let use_buf = if layer == 0 {
+                if let Some(ref mut lc) = l0_cache {
+                    // Try arena hit: collect into stack buffer.
+                    let key = encode_rid(cand_rid);
+                    if lc.for_l0_nbrs(key, |nbr| {
+                        if nbr_buf_len < HNSW_M_MAX0 {
+                            nbr_buf[nbr_buf_len] = nbr;
+                            nbr_buf_len += 1;
+                        }
+                    }) {
+                        Q_L0_CACHE_HITS.fetch_add(1, AtomicOrd::Relaxed);
+                        true // use nbr_buf[..nbr_buf_len]
+                    } else {
+                        // Arena miss: fetch from disk and populate arena.
+                        let disk_nbrs =
+                            match self.find_node_loc(cand_rid, hdr.node_index_root, pool)? {
+                                Some((np, ns)) => {
+                                    Q_DISK_FETCHES.fetch_add(1, AtomicOrd::Relaxed);
+                                    self.load_node_at(np, ns, hdr.dim, pool)?.nbrs_l0
+                                }
+                                None => vec![],
+                            };
+                        lc.insert_neighbours(key, disk_nbrs.clone());
+                        nbrs_owned = disk_nbrs;
+                        false // use nbrs_owned
+                    }
+                } else {
+                    // No l0_cache: insert path — fall through to get_l0_nbrs.
+                    nbrs_owned = self.get_l0_nbrs(
+                        cand_rid,
+                        hdr,
+                        pool,
+                        node_cache.as_deref_mut(),
+                        None, // l0_cache already None
+                    )?;
+                    false
+                }
             } else {
-                self.get_upper_nbrs(cand_rid, layer, hdr.upper_layer_root, pool)?
+                nbrs_owned = self.get_upper_nbrs(cand_rid, layer, hdr.upper_layer_root, pool)?;
+                false
             };
 
-            for nbr in nbrs {
+            // Iterate whichever neighbour source is live.
+            let nbr_iter: &[RowId] = if use_buf {
+                &nbr_buf[..nbr_buf_len]
+            } else {
+                &nbrs_owned
+            };
+
+            for &nbr in nbr_iter {
                 if visited.contains(&nbr) {
                     continue;
                 }
@@ -1191,9 +1505,6 @@ impl DiskHnswIndex {
                         dist
                     } else {
                         // Cache miss: fetch from disk, populate cache, then compute.
-                        // fetch_vector_cached_with_vec takes &mut NodeCache / &mut HnswVecCache
-                        // and populates them on miss. The mutable borrow from get_l0_nbrs (above)
-                        // has ended (it returned an owned Vec), so reborrowing caches here is safe.
                         let vec = match self.fetch_vector_cached_with_vec(
                             nbr,
                             hdr,
@@ -1731,8 +2042,7 @@ impl DiskHnswIndex {
             let gen = hdr.total_nodes as u64;
             if cache.generation != gen {
                 // Stale (or fresh empty): clear and re-stamp.
-                cache.neighbours.clear();
-                cache.size_bytes = 0;
+                cache.arena.clear();
                 cache.generation = gen;
             }
         }
@@ -1796,8 +2106,7 @@ impl DiskHnswIndex {
         // Validate / reset L0 cache generation.
         if let Some(ref mut cache) = l0_cache {
             if cache.generation != gen {
-                cache.neighbours.clear();
-                cache.size_bytes = 0;
+                cache.arena.clear();
                 cache.generation = gen;
             }
         }
@@ -1923,8 +2232,7 @@ impl DiskHnswIndex {
 
         // Validate cache generation.
         if l0_cache.generation != gen {
-            l0_cache.neighbours.clear();
-            l0_cache.size_bytes = 0;
+            l0_cache.arena.clear();
             l0_cache.generation = gen;
         }
         if vec_cache.generation != gen {
@@ -1952,7 +2260,7 @@ impl DiskHnswIndex {
 
         for (key, node_page, slot_idx) in all_locs {
             // Skip if both caches already have this node.
-            let already_l0 = l0_cache.neighbours.contains_key(&key);
+            let already_l0 = l0_cache.arena.contains_key(key);
             let already_vec = vec_cache.vectors.contains_key(&key);
             if already_l0 && already_vec {
                 continue;
@@ -1975,7 +2283,7 @@ impl DiskHnswIndex {
         tracing::debug!(
             meta_page = self.meta_page,
             total_nodes = hdr.total_nodes,
-            l0_entries = l0_cache.neighbours.len(),
+            l0_entries = l0_cache.arena.node_idx_map.len(),
             vec_entries = vec_cache.vectors.len(),
             "HNSW cache prefetch complete"
         );

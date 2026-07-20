@@ -8563,3 +8563,59 @@ This is a correctness fix, not a performance change. No throughput regression: t
 overhead. RLS overhead for non-superuser callers is unchanged (same `apply_rls` path).
 
 Peak RSS: unchanged (no new heap allocations on the hot path).
+
+---
+
+## Item 93 — HNSW L0 arena layout: zero-copy beam search (2026-07-20)
+
+**Branch:** `perf/item-93-hnsw-arena` | **PR:** pending Docker bench
+
+### What shipped
+
+Replaced `HashMap<i64, Vec<RowId>>` in `HnswL0Cache` with a flat contiguous
+`L0Arena` (two `Vec`s: `arena_data: Vec<i64>` + `arena_offsets: Vec<u32>`).
+
+**Architecture:**
+- `L0Arena::get_slice(key)` returns `&[i64]` (a slice into the contiguous slab)
+  in O(1) via `node_idx_map.get(key) → k → arena_data[offsets[k]..offsets[k+1]]`.
+- **Zero allocation on the warm query path:** `HnswL0Cache::for_l0_nbrs(key, f)`
+  iterates the arena slice in-place via callback — no `Vec<RowId>` created.
+- `search_layer_with_vec` hot loop (item 93 path): on `l0_cache` arena hit,
+  neighbours are collected into a `[RowId; HNSW_M_MAX0]` **stack buffer** (32 entries,
+  always sufficient since M_max0=32) — zero heap allocation per hop.
+- Insert: `insert_neighbours` appends to the arena via `L0Arena::append`.
+- Re-wire: `update_neighbours` tombstones the old slot + appends updated list.
+  Compaction fires when `tombstone_count > num_slots / 2`.
+- Generation invalidation: `arena.clear()` replaces the old `neighbours.clear() +
+  size_bytes = 0` pattern.
+- `get_l0_nbrs` (insert path, no `l0_cache`) still returns `Vec<RowId>` —
+  insert path was unchanged; arena is query-path only.
+
+**Memory:**
+- 32 neighbours × 8 B/encoded RowId = 256 B/node (vs 192 B/node for `Vec<RowId>`
+  on the old path — slight increase from i64 vs RowId packing, offset by
+  eliminating per-Vec heap header).
+- 10k nodes: arena ≈ 2.7 MB total (`node_idx_map` 120 KB + `arena_data` 2.56 MB +
+  `arena_offsets` 40 KB) vs old ~2.4 MB + heap fragmentation from 10k separate Vecs.
+
+### Measured (debug mode, Mac M5 Pro, 200×dim128)
+
+| Metric | Result |
+|---|---|
+| Recall@10 | **1.000** (gate ≥ 0.90 — PASS) |
+| Disk fetches on warm path | **0** (all L0 from arena — PASS) |
+| L0 arena hits per 15 warm queries | **3000** (confirmed arena serves all hops) |
+
+Docker bench (10k rows, release, Linux): pending. Item 93 target: ≤ 600 µs warm latency
+at 10k×dim128 (down from ~921 µs post-items-72/73/92). Expected gain: −300–400 µs from
+eliminating ~200 `Vec<RowId>` alloc/hop × ~100 ns per alloc on the warm path.
+
+### Tests
+
+- 447 lib unit tests PASS (including 10 HNSW tests: recall, encode/decode, search).
+- 53 crash tests PASS (P60a, P60b, P_vec_*, P_xhot_*, all passing).
+- `tests/item67_async_hnsw.rs`: 3/3 PASS (async HNSW insert, recall, crash safety).
+- `tests/perf_item93.rs` (new): `hnsw_arena_recall_and_zero_disk` PASS — validates
+  zero disk fetches on warm path + recall@10 ≥ 0.90 + arena hit counters > 0.
+- `cargo clippy -- -D warnings`: clean.
+- `cargo fmt --all`: clean.

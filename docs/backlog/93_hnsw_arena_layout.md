@@ -1,5 +1,5 @@
 **Type:** Performance
-**Status:** ⏳ NOT STARTED — follow-up to items 72 + 73 + 92
+**Status:** 🔄 IN PROGRESS — branch `perf/item-93-hnsw-arena`, 2026-07-20; Docker bench pending. See PROGRESS.md "Item 93".
 
 # Item 93 — HNSW L0 arena layout: eliminate per-neighbor Vec clone
 
