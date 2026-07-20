@@ -487,6 +487,22 @@ impl QuerySpec {
         // FROM — each derived table's inner tables are just as subject to RLS
         // as base tables. Recurse into them now, before the plan is built.
         apply_rls_into_derived(&mut self.from, policy_for);
+        // P4.c (item 19): also apply RLS inside any WHERE-clause subqueries
+        // (InSubquery / Exists / ScalarSubquery). These embed inner QuerySpecs
+        // inside QExpr variants, not inside FromNode::Derived, so the above
+        // apply_rls_into_derived does not reach them. Walk the selection and
+        // projection QExpr trees to find and rewrite every nested subquery.
+        if let Some(sel) = &mut self.selection {
+            apply_rls_into_qexpr(sel, policy_for);
+        }
+        for p in &mut self.projection {
+            if let Projection::Expr { expr, .. } = p {
+                apply_rls_into_qexpr(expr, policy_for);
+            }
+        }
+        if let Some(h) = &mut self.having {
+            apply_rls_into_qexpr(h, policy_for);
+        }
     }
 
     /// Bind `$n` parameters across the whole spec (including CTEs, HAVING,
@@ -570,6 +586,87 @@ fn apply_rls_into_derived(node: &mut FromNode, policy_for: &dyn Fn(&str) -> Opti
         FromNode::Derived { subquery, .. } => {
             subquery.apply_rls_from(policy_for);
         }
+    }
+}
+
+/// Walk a [`QExpr`] tree and, for every `InSubquery`, `Exists`, or
+/// `ScalarSubquery` node, apply RLS to the nested [`QuerySpec`] by calling
+/// `apply_rls_from` on it.  This ensures that WHERE-clause subqueries are
+/// not treated as a bypass for row-level security (P4.c / item 19).
+fn apply_rls_into_qexpr(expr: &mut QExpr, policy_for: &dyn Fn(&str) -> Option<Expr>) {
+    match expr {
+        // Subquery-bearing leaves: recurse into the inner QuerySpec.
+        QExpr::Exists { subquery, .. } | QExpr::ScalarSubquery(subquery) => {
+            subquery.apply_rls_from(policy_for);
+        }
+        QExpr::InSubquery {
+            expr: needle,
+            subquery,
+            ..
+        } => {
+            apply_rls_into_qexpr(needle, policy_for);
+            subquery.apply_rls_from(policy_for);
+        }
+        // Structural nodes: recurse into children.
+        QExpr::And(lhs, rhs) | QExpr::Or(lhs, rhs) | QExpr::Compare { lhs, rhs, .. } => {
+            apply_rls_into_qexpr(lhs, policy_for);
+            apply_rls_into_qexpr(rhs, policy_for);
+        }
+        QExpr::Not(e) | QExpr::IsNull { expr: e, .. } | QExpr::Cast { expr: e, .. } => {
+            apply_rls_into_qexpr(e, policy_for);
+        }
+        QExpr::InList {
+            expr: needle, list, ..
+        } => {
+            apply_rls_into_qexpr(needle, policy_for);
+            for e in list {
+                apply_rls_into_qexpr(e, policy_for);
+            }
+        }
+        QExpr::Like { expr, pattern, .. } => {
+            apply_rls_into_qexpr(expr, policy_for);
+            apply_rls_into_qexpr(pattern, policy_for);
+        }
+        QExpr::Match { column, query } => {
+            apply_rls_into_qexpr(column, policy_for);
+            apply_rls_into_qexpr(query, policy_for);
+        }
+        QExpr::Arith { lhs, rhs, .. } => {
+            apply_rls_into_qexpr(lhs, policy_for);
+            apply_rls_into_qexpr(rhs, policy_for);
+        }
+        QExpr::Aggregate { arg, .. } => {
+            if let Some(a) = arg {
+                apply_rls_into_qexpr(a, policy_for);
+            }
+        }
+        QExpr::Coalesce(args) => {
+            for a in args {
+                apply_rls_into_qexpr(a, policy_for);
+            }
+        }
+        QExpr::Nullif { lhs, rhs } => {
+            apply_rls_into_qexpr(lhs, policy_for);
+            apply_rls_into_qexpr(rhs, policy_for);
+        }
+        QExpr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                apply_rls_into_qexpr(op, policy_for);
+            }
+            for (cond, then) in conditions {
+                apply_rls_into_qexpr(cond, policy_for);
+                apply_rls_into_qexpr(then, policy_for);
+            }
+            if let Some(e) = else_result {
+                apply_rls_into_qexpr(e, policy_for);
+            }
+        }
+        // Leaf nodes with no subquery content.
+        QExpr::Column { .. } | QExpr::Literal(_) => {}
     }
 }
 

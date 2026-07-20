@@ -1,7 +1,7 @@
 # SQL surface gaps — unsupported query features
 
 **Type:** Improvement
-**Status:** PARTIAL — G1 (CASE/COALESCE/NULLIF), G2-cast (CAST expressions), G3 (UNION/INTERSECT/EXCEPT), G4 (ORDER BY non-projected col), G5 (RETURNING), G6 (derived table subqueries), G8 (SELECT without FROM), G10 (IS NULL) SHIPPED (see `PROGRESS.md` item 19). G2-join (FULL OUTER JOIN)/G7/G9/G11/G-NATURAL remain open.
+**Status:** PARTIAL — G1 (CASE/COALESCE/NULLIF), G2-cast (CAST expressions), G3 (UNION/INTERSECT/EXCEPT), G4 (ORDER BY non-projected col), G5 (RETURNING), G6 (derived table subqueries), G8 (SELECT without FROM), G10 (IS NULL), P4.c IN(subquery)/EXISTS/scalar-subquery predicates SHIPPED (see `PROGRESS.md` item 19). G2-join (FULL OUTER JOIN)/G7/G9/G11/G-NATURAL remain open.
 
 > A single tracker for the SQL constructs unidb does **not** support yet, so
 > builders (and future us) have one honest list and each gap has a scope/ROI
@@ -98,6 +98,25 @@ Implemented across all four pipeline layers: parser (`TableFactor::Derived` →
 columns with alias). RLS is applied inside the inner subquery via
 `apply_rls_into_derived`. 7 tests in `tests/item19_derived_tables.rs` all pass.
 See `PROGRESS.md` item 19 G6 entry.
+
+### P4.c — WHERE-clause subquery predicates: `IN (subquery)` / `EXISTS` / scalar subquery **(SHIPPED 2026-07-20)**
+
+`QExpr::InSubquery`, `QExpr::Exists`, `QExpr::ScalarSubquery` variants,
+parser arms, and executor evaluation (`run_subquery`, `bind_correlated`) were
+already in place. This entry covers the **RLS fix** and test coverage that
+completed the feature:
+
+- **RLS fix** (`src/sql/query.rs`): added `apply_rls_into_qexpr` walker that
+  traverses the `QExpr` tree and calls `apply_rls_from` on every nested
+  `QuerySpec` in `Exists`, `ScalarSubquery`, and `InSubquery`. Called from
+  `apply_rls_from` on `selection`, `projection`, and `having`. Without this fix,
+  `WHERE id IN (SELECT id FROM rls_protected_table)` bypassed RLS.
+- **NULL handling**: SQL three-valued logic — `x IN (set with NULL)` when `x`
+  not found → NULL (not false); `NOT IN` similarly propagates NULL; scalar
+  subquery on empty table → NULL → comparison is NULL → row not matched.
+- **Tests**: 9 tests in `tests/item19_subquery_predicates.rs` — all PASS.
+
+See `PROGRESS.md` "Item 19 — IN(subquery)/EXISTS/scalar subquery predicates".
 
 ### G-NATURAL — `NATURAL JOIN`
 - **What:** join on all commonly-named columns implicitly.
