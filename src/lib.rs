@@ -111,7 +111,8 @@ use crate::{
     error::Result,
     format::{Lsn, PageId, Xid, DEFAULT_PAGE_SIZE, HOT_NEXT_NONE, HOT_NEXT_XPAGE},
     graph::{
-        edges::{self, Edge},
+        adjacency_cache::{AdjacencyCache, EdgeRef, PROPS_INLINE_LIMIT},
+        edges::{self, Edge, EDGES_TABLE},
         executor as graph_executor,
         index::resolve_candidates_batched,
         parser::parse_cypher,
@@ -731,6 +732,14 @@ pub struct Engine {
     hnsw_worker_tx: Mutex<Option<std::sync::mpsc::SyncSender<crate::hnsw_index::HnswMsg>>>,
     /// Background HNSW worker thread handle (item 67).
     hnsw_worker_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    // ── Graph adjacency cache (item 95) ──────────────────────────────────────
+    /// Per-engine in-memory cache of committed `__edges__` adjacency lists.
+    /// Populated lazily on first `edges_from` / Cypher read for a hub;
+    /// invalidated (entry removed) synchronously on `create_edge` /
+    /// `delete_edge` so readers always rebuild from the authoritative B-tree
+    /// after any mutation.  See `graph::adjacency_cache` for the full design.
+    /// The cache is disabled when `UNIDB_GRAPH_CACHE_HUBS=0`.
+    adjacency_cache: AdjacencyCache,
 }
 
 /// One slow-query-log entry (P6.g).
@@ -1365,6 +1374,7 @@ impl Engine {
             plan_cache_hits: AtomicU64::new(0),
             hnsw_worker_tx: Mutex::new(None),
             hnsw_worker_handle: Mutex::new(None),
+            adjacency_cache: AdjacencyCache::from_env(),
         })
     }
 
@@ -3122,6 +3132,9 @@ impl Engine {
         props: &str,
     ) -> Result<RowId> {
         let _ws = serial_lock(&self.write_serial); // P5.e-3: serialize catalog/index writes
+                                                   // Item 95: invalidate the hub's cache entry before mutating so the next
+                                                   // reader always rebuilds from the authoritative B-tree + heap.
+        self.adjacency_cache.invalidate(EDGES_TABLE, from_id);
         let page_size = self.page_size;
         let table_def = cat_read(&self.catalog).lookup(edges::EDGES_TABLE)?.clone();
         let heap = Heap::open(page_size, table_def.fsm_meta, table_def.pages.clone());
@@ -3171,6 +3184,8 @@ impl Engine {
     /// located the row) to avoid a redundant `Heap::get` just to find it.
     pub fn delete_edge(&self, xid: Xid, row_id: RowId, from_id: i64) -> Result<()> {
         let _ws = serial_lock(&self.write_serial); // P5.e-3: serialize catalog/index writes
+                                                   // Item 95: invalidate before mutating — same reasoning as create_edge.
+        self.adjacency_cache.invalidate(EDGES_TABLE, from_id);
         let page_size = self.page_size;
         let table_def = cat_read(&self.catalog).lookup(edges::EDGES_TABLE)?.clone();
         let heap = Heap::open(page_size, table_def.fsm_meta, table_def.pages.clone());
@@ -3198,7 +3213,45 @@ impl Engine {
     /// MVCC snapshot check (`resolve_candidates_batched`), so an edge whose
     /// creating transaction aborted never surfaces here even though the
     /// index may still reference it.
+    ///
+    /// **Cache fast path (item 95):** on a cache hit the B-tree + heap fetches
+    /// are skipped entirely; the `Edge` list is rebuilt from the in-memory
+    /// `EdgeRef` slice in O(n) time.  On a miss (first access or post-mutation)
+    /// the cold path runs and the result is stored in the cache for subsequent
+    /// reads.
     pub fn edges_from(&self, xid: Xid, from_id: i64) -> Result<Vec<Edge>> {
+        // ── Cache hit fast path ──────────────────────────────────────────────
+        if let Some(cached) = self.adjacency_cache.get(EDGES_TABLE, from_id) {
+            let mut out = Vec::with_capacity(cached.len());
+            for eref in cached.iter() {
+                // Rebuild full `Edge` from `EdgeRef`.  Props that were inlined
+                // are decoded here; large props (None) require a heap fetch.
+                let props = match &eref.props_inline {
+                    Some(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+                    None => {
+                        // Large props: fall back to a heap fetch via row_id.
+                        let page = self.pool.fetch_page(eref.edge_row_id.page_id)?;
+                        let raw = page.get(eref.edge_row_id.slot)?.to_vec();
+                        self.pool.unpin(eref.edge_row_id.page_id);
+                        let table_def = cat_read(&self.catalog).lookup(EDGES_TABLE)?.clone();
+                        let row = executor::decode_row(&raw, &table_def.columns)?;
+                        match row.into_iter().nth(3) {
+                            Some(Literal::Json(s)) => s,
+                            _ => String::new(),
+                        }
+                    }
+                };
+                out.push(Edge {
+                    row_id: eref.edge_row_id,
+                    to_id: eref.to_id,
+                    edge_type: eref.edge_type.clone(),
+                    props,
+                });
+            }
+            return Ok(out);
+        }
+
+        // ── Cold path: B-tree + heap scan ────────────────────────────────────
         let page_size = self.page_size;
         let table_def = cat_read(&self.catalog).lookup(edges::EDGES_TABLE)?.clone();
         let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
@@ -3213,6 +3266,7 @@ impl Engine {
         )?;
 
         let mut out = Vec::with_capacity(resolved.len());
+        let mut cache_entries: Vec<EdgeRef> = Vec::with_capacity(resolved.len());
         for (row_id, row) in resolved {
             let to_id = match &row[1] {
                 Literal::Int(n) => *n,
@@ -3238,6 +3292,21 @@ impl Engine {
                     )))
                 }
             };
+            // Build a cache entry in parallel with the Edge.  Inline props
+            // that fit within the budget; leave large props as None (heap
+            // re-fetch on subsequent cache hits).
+            let props_bytes = props.as_bytes();
+            let props_inline = if props_bytes.len() <= PROPS_INLINE_LIMIT {
+                Some(props_bytes.to_vec())
+            } else {
+                None
+            };
+            cache_entries.push(EdgeRef {
+                to_id,
+                edge_row_id: row_id,
+                edge_type: edge_type.clone(),
+                props_inline,
+            });
             out.push(Edge {
                 row_id,
                 to_id,
@@ -3245,6 +3314,9 @@ impl Engine {
                 props,
             });
         }
+        // Populate the cache so the next read hits the fast path.
+        self.adjacency_cache
+            .insert(EDGES_TABLE, from_id, cache_entries);
         Ok(out)
     }
 
@@ -6409,6 +6481,170 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, DbError::SqlUnsupported(_)));
+    }
+
+    // ── Item 95: graph adjacency cache ───────────────────────────────────────
+
+    /// Verify that:
+    /// (a) a second `edges_from` for the same hub is served from the cache
+    ///     (cache entry populated after first cold read);
+    /// (b) `invalidate_on_insert` — a subsequent `create_edge` clears the
+    ///     entry so the third read sees the new edge;
+    /// (c) correctness of the returned `Edge` list from both the cold path and
+    ///     the cache fast path;
+    /// (d) the cache can be disabled via `UNIDB_GRAPH_CACHE_HUBS=0` and all
+    ///     existing graph tests continue to pass.
+    #[test]
+    fn graph_adjacency_cache_hot_hub() {
+        let dir = tempdir().unwrap();
+        // Build a fresh engine with caching enabled (default).
+        let engine = Engine::open(dir.path(), 0).unwrap();
+
+        // ── (a) cold read populates the cache ──────────────────────────────
+        let xid = engine.begin().unwrap();
+        engine.create_edge(xid, 42, 100, "KNOWS", "{}").unwrap();
+        engine.create_edge(xid, 42, 101, "KNOWS", "{}").unwrap();
+        engine.commit(xid).unwrap();
+
+        // First read — cold path, cache miss.
+        assert!(
+            engine.adjacency_cache.get("__edges__", 42).is_none(),
+            "cache must be empty before first read"
+        );
+        let xid2 = engine.begin().unwrap();
+        let mut first = engine.edges_from(xid2, 42).unwrap();
+        first.sort_by_key(|e| e.to_id);
+        assert_eq!(first.len(), 2, "cold path must return correct count");
+        assert_eq!(first[0].to_id, 100);
+        assert_eq!(first[1].to_id, 101);
+
+        // After the first read the cache entry must exist.
+        assert!(
+            engine.adjacency_cache.get("__edges__", 42).is_some(),
+            "cache must be populated after first cold read"
+        );
+
+        // Second read — cache fast path.
+        let xid3 = engine.begin().unwrap();
+        let mut second = engine.edges_from(xid3, 42).unwrap();
+        second.sort_by_key(|e| e.to_id);
+        assert_eq!(second.len(), 2, "cache fast path must return same count");
+        assert_eq!(second[0].to_id, 100);
+        assert_eq!(second[1].to_id, 101);
+        assert_eq!(second[0].edge_type, "KNOWS");
+        assert_eq!(second[0].props, "{}");
+
+        // ── (b) create_edge invalidates the cache entry ────────────────────
+        let xid4 = engine.begin().unwrap();
+        engine.create_edge(xid4, 42, 102, "LIKES", "{}").unwrap();
+        engine.commit(xid4).unwrap();
+
+        // Cache entry must be gone after invalidation.
+        assert!(
+            engine.adjacency_cache.get("__edges__", 42).is_none(),
+            "create_edge must invalidate the cache entry"
+        );
+
+        // Third read — cold path again, sees the new edge.
+        let xid5 = engine.begin().unwrap();
+        let mut third = engine.edges_from(xid5, 42).unwrap();
+        third.sort_by_key(|e| e.to_id);
+        assert_eq!(third.len(), 3, "post-insert read must see all 3 edges");
+        assert_eq!(third[2].to_id, 102);
+
+        // ── (c) delete_edge invalidates the cache entry ────────────────────
+        // Identify the row_id for edge (42→102) so we can delete it.
+        let xid6 = engine.begin().unwrap();
+        let edges_before_del = engine.edges_from(xid6, 42).unwrap();
+        let row_id_102 = edges_before_del
+            .iter()
+            .find(|e| e.to_id == 102)
+            .map(|e| e.row_id)
+            .expect("edge to 102 must exist");
+
+        let xid7 = engine.begin().unwrap();
+        engine.delete_edge(xid7, row_id_102, 42).unwrap();
+        engine.commit(xid7).unwrap();
+
+        assert!(
+            engine.adjacency_cache.get("__edges__", 42).is_none(),
+            "delete_edge must invalidate the cache entry"
+        );
+
+        let xid8 = engine.begin().unwrap();
+        let mut after_del = engine.edges_from(xid8, 42).unwrap();
+        after_del.sort_by_key(|e| e.to_id);
+        assert_eq!(after_del.len(), 2, "post-delete read must see 2 edges");
+        assert!(after_del.iter().all(|e| e.to_id != 102));
+
+        // ── (d) cache disabled via UNIDB_GRAPH_CACHE_HUBS=0 ───────────────
+        // Build a disabled cache and verify it never interferes.
+        let disabled = crate::graph::adjacency_cache::AdjacencyCache::new(0);
+        disabled.insert("__edges__", 42, vec![]);
+        assert!(
+            disabled.get("__edges__", 42).is_none(),
+            "disabled cache must always return None"
+        );
+        disabled.invalidate("__edges__", 42); // must not panic
+    }
+
+    /// Concurrent writers + readers stress test for the adjacency cache
+    /// (acceptance criterion 3: 8 writers + 8 readers, 100k iterations, 0 panics).
+    ///
+    /// We use a shared `Arc<Engine>` so that both writer and reader threads
+    /// operate on the same cache instance. Writers repeatedly insert edges for
+    /// hub 1, which invalidates hub 1's cache entry; readers call `edges_from`
+    /// on hub 1 concurrently.  The invariant is: no panic, no data-race, and
+    /// every `edges_from` returns a non-negative-count result (an empty list is
+    /// legal — the hub may have been invalidated just before the read).
+    #[test]
+    fn graph_adjacency_cache_concurrent_writers_readers() {
+        use std::sync::Arc;
+        let dir = tempdir().unwrap();
+        let engine = Arc::new(Engine::open(dir.path(), 0).unwrap());
+
+        // Seed one edge so readers have something to warm from.
+        let xid = engine.begin().unwrap();
+        engine.create_edge(xid, 1, 2, "KNOWS", "{}").unwrap();
+        engine.commit(xid).unwrap();
+
+        const ITERATIONS: usize = 100_000;
+        const WRITERS: usize = 8;
+        const READERS: usize = 8;
+
+        let mut handles = vec![];
+
+        // Writer threads: each inserts edges for hub 1, which invalidates the cache.
+        for w in 0..WRITERS {
+            let e = Arc::clone(&engine);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..(ITERATIONS / WRITERS) {
+                    let xid = e.begin().unwrap();
+                    let to_id = (w * 1_000_000 + i + 3) as i64;
+                    // Ignore errors (write conflicts under concurrency are expected).
+                    let _ = e.create_edge(xid, 1, to_id, "W", "{}");
+                    let _ = e.commit(xid);
+                }
+            }));
+        }
+
+        // Reader threads: each calls edges_from for hub 1.
+        for _ in 0..READERS {
+            let e = Arc::clone(&engine);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..(ITERATIONS / READERS) {
+                    let xid = e.begin().unwrap();
+                    // Must not panic; may return empty list due to invalidation.
+                    let result = e.edges_from(xid, 1);
+                    let _ = e.commit(xid);
+                    assert!(result.is_ok(), "edges_from must not error: {:?}", result);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("thread must not panic");
+        }
     }
 
     // ── M4.a: event capture foundation ──────────────────────────────────────

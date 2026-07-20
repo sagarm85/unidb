@@ -3,6 +3,8 @@
 // code was needed. `parser`/`logical`/`executor` (the Cypher subset) land
 // in M3.c.
 
+// Item 95: per-engine adjacency cache (hot-hub lazy warm cache).
+pub mod adjacency_cache;
 pub mod edges;
 pub mod executor;
 pub mod index;

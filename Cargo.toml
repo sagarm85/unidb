@@ -18,6 +18,9 @@ sqlparser = "0.62.0"
 serde_json = "1.0.150"
 serde = { version = "1.0.228", features = ["derive"] }
 instant-distance = "0.6.1"
+# Item 95: per-engine graph adjacency cache (hot-hub lazy warm cache).
+# DashMap provides fine-grained sharded concurrent access without a coarse Mutex.
+dashmap = "6"
 
 # M5: optional server (src/server/, src/bin/unidb-server.rs). All gated
 # behind the `server` feature so a default `cargo build`/`cargo test` never

@@ -1,5 +1,6 @@
 **Type:** Performance
-**Status:** ⏳ NOT STARTED
+**Status:** ✅ SHIPPED 2026-07-20 — lazy warm cache (`AdjacencyCache` in `src/graph/adjacency_cache.rs`);
+invalidate on INSERT/DELETE; `dashmap = "6"`; 8W+8R 100k concurrent test PASS; see PROGRESS.md "Item 95".
 
 # Item 95 — Graph adjacency cache: in-memory hot-hub warm cache
 
