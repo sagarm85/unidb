@@ -152,6 +152,11 @@ pub fn virtual_schema(name: &str) -> Option<Vec<ColumnRef>> {
             ("table_name", ColumnType::Text),
             ("operation", ColumnType::Text),
             ("using_expr", ColumnType::Text),
+            // item-24 R-a: explicit WITH CHECK predicate (NULL when absent = USING doubles as check).
+            ("with_check_expr", ColumnType::Text),
+            // item-24 R-b: false when policy exists but no CREATE USER has been run
+            // (bootstrap mode — all RLS is silently inactive until the first user).
+            ("enforced", ColumnType::Bool),
         ],
         // item-24 Z4: role membership + users catalog.
         "unidb_catalog.role_members" => &[("role", ColumnType::Text), ("member", ColumnType::Text)],
@@ -203,7 +208,7 @@ pub fn virtual_rows(
         // item-24 Z5: AuthZ introspection.
         "unidb_catalog.roles" => authz.map(roles_rows).unwrap_or_default(),
         "unidb_catalog.grants" => authz.map(grants_rows).unwrap_or_default(),
-        "unidb_catalog.policies" => policies_rows(&defs),
+        "unidb_catalog.policies" => policies_rows(&defs, authz),
         // item-24 Z4: role membership + users catalog.
         "unidb_catalog.role_members" => authz.map(role_members_rows).unwrap_or_default(),
         "unidb_catalog.users" => authz.map(users_rows).unwrap_or_default(),
@@ -645,15 +650,33 @@ fn users_rows(authz: &crate::authz::RoleStore) -> Vec<Vec<Literal>> {
 }
 
 /// `unidb_catalog.policies` — one row per named policy across all tables.
-fn policies_rows(defs: &[&TableDef]) -> Vec<Vec<Literal>> {
+///
+/// Columns: name, table_name, operation, using_expr, with_check_expr, enforced.
+/// `with_check_expr` is NULL when no explicit WITH CHECK was supplied (the USING
+/// expression doubles as the write-side check in that case).
+/// `enforced` is false when policies exist but no users have been created —
+/// bootstrap mode means RLS is silently inactive (item-24 R-b).
+fn policies_rows(
+    defs: &[&TableDef],
+    authz: Option<&crate::authz::RoleStore>,
+) -> Vec<Vec<Literal>> {
+    // Bootstrap mode: policies present, but no users → not enforced.
+    let enforced = authz.map(|a| a.has_users()).unwrap_or(true);
     let mut rows = Vec::new();
     for def in defs {
         for p in &def.policies {
+            let with_check = p
+                .with_check_sql
+                .as_deref()
+                .map(|s| Literal::Text(s.to_string()))
+                .unwrap_or(Literal::Null);
             rows.push(vec![
                 t(&p.name),
                 t(&p.table),
                 t(p.op.as_str()),
                 t(&p.using_expr),
+                with_check,
+                Literal::Bool(enforced),
             ]);
         }
     }

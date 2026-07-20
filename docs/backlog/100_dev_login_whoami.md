@@ -1,5 +1,6 @@
 **Type:** Improvement
-**Status:** ⏳ NOT STARTED (filed 2026-07-20 from fresh-mind review)
+**Status:** ✅ SHIPPED 2026-07-20 — `feat/item-24-rls-hardening-login` (same PR as R-a/R-b).
+See PROGRESS.md "Item 100".
 
 # Item 100 — Dev login + whoami endpoints (username-only identity)
 

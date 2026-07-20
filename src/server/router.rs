@@ -80,6 +80,8 @@ pub fn build_router(
         // item-24 Z6: POST /auth/preview — run SQL as a named role, with RLS
         // applied, so an admin can preview what a specific user sees.
         .route("/auth/preview", post(handlers::post_auth_preview))
+        // item 100: GET /auth/whoami — caller's identity + grants (JWT required).
+        .route("/auth/whoami", get(handlers::get_auth_whoami))
         .route("/events/head", get(handlers::get_events_head))
         .route("/events/subscribe", get(sse::get_events_subscribe))
         .route("/events/ack", post(handlers::post_events_ack))
@@ -141,6 +143,14 @@ pub fn build_router(
     // republishes them through the Prometheus facade (`metrics` crate), so a
     // scrape never perturbs the write path. Every metric name emitted here is
     // documented with its driven widget in `docs/engine_access_guide.md`.
+    // item 100: public auth routes — no JWT middleware.
+    // GET /auth/meta   → blank-slate discovery (open_mode, privilege types, catalog tables).
+    // POST /auth/login → dev-only passwordless token issuance (UNIDB_DEV_LOGIN=1).
+    let auth_public = Router::new()
+        .route("/auth/meta", get(handlers::get_auth_meta))
+        .route("/auth/login", post(handlers::post_auth_login))
+        .with_state(state.clone());
+
     let metrics_state = state;
     let public = Router::new().route(
         "/metrics",
@@ -165,6 +175,7 @@ pub fn build_router(
     Router::new()
         .merge(protected)
         .merge(public)
+        .merge(auth_public)
         .layer(prometheus_layer)
         .layer(TraceLayer::new_for_http())
         // Outermost app layer (item 22, L2): assign a `request_id` before auth

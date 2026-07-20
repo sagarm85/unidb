@@ -36,11 +36,12 @@ use crate::{
         auth::CurrentUser,
         dto::{
             exec_result_to_json, is_internal_table, json_to_literal, literal_to_json, slot_to_json,
-            table_def_to_info, AckEventsRequest, AdvanceSlotRequest, AuthPreviewRequest,
-            BatchInsertRequest, BatchSqlRequest, BatchSqlResponse, BeginTxnRequest,
-            CreateEdgeRequest, CreateSlotRequest, CursorQuery, CypherRequest, DeleteEdgeRequest,
-            HistoryQuery, IsolationDto, RlsRequest, RowIdResponse, SetIndexRequest,
-            SlowQueryThresholdRequest, SqlRequest, StreamQuery, TableInfo,
+            table_def_to_info, AckEventsRequest, AdvanceSlotRequest, AuthLoginRequest,
+            AuthLoginResponse, AuthMetaResponse, AuthPreviewRequest, BatchInsertRequest,
+            BatchSqlRequest, BatchSqlResponse, BeginTxnRequest, CreateEdgeRequest,
+            CreateSlotRequest, CursorQuery, CypherRequest, DeleteEdgeRequest, HistoryQuery,
+            IsolationDto, RlsRequest, RowIdResponse, SetIndexRequest, SlowQueryThresholdRequest,
+            SqlRequest, StreamQuery, TableInfo, WhoamiPrivilege, WhoamiResponse,
         },
         engine_handle::EngineHandle,
         error::ApiError,
@@ -962,6 +963,109 @@ pub async fn post_auth_preview(
         rows: vec![],
     });
     Ok(Json(exec_result_to_json(&first)))
+}
+
+// ── auth: meta / login / whoami (item 100) ────────────────────────────────
+
+/// `GET /auth/meta` — public, no JWT required.
+///
+/// Returns static metadata about this server's auth configuration:
+/// - `open_mode` — whether RLS is inactive (no users registered yet).
+/// - `privilege_types` / `policy_operations` — the enumerated constants a
+///   client needs to display a permission editor without hard-coding them.
+/// - `catalog_tables` — all queryable system-catalog relations.
+/// - `dev_login_enabled` — whether `POST /auth/login` is available.
+///
+/// This endpoint is the answer to the blank-slate UX gap: a client hitting
+/// a fresh server can call this first to discover what auth features are
+/// active and how to configure them.
+pub async fn get_auth_meta(
+    State(state): State<AppState>,
+) -> std::result::Result<Json<AuthMetaResponse>, ApiError> {
+    let open_mode = !state.engine.has_users().await;
+    Ok(Json(AuthMetaResponse {
+        open_mode,
+        privilege_types: vec!["SELECT", "INSERT", "UPDATE", "DELETE"],
+        policy_operations: vec!["SELECT", "INSERT", "UPDATE", "DELETE", "ALL"],
+        catalog_tables: crate::sql::information_schema::RELATIONS.to_vec(),
+        dev_login_enabled: state.dev_login_jwt.is_some(),
+    }))
+}
+
+/// `POST /auth/login` — public, no JWT required.
+///
+/// **Dev/demo only** — only available when `UNIDB_DEV_LOGIN=1` is set at
+/// startup.  Returns 404 when the flag is off so the route is indistinguishable
+/// from non-existent (no accidental prod issuer).
+///
+/// Issues a 1 h signed JWT for an existing user identified by username only
+/// (passwordless = identification, not authentication).  The token uses the
+/// same HS256 secret as `require_jwt`, so `current_user()` and all privilege
+/// checks work immediately without any downstream change.
+pub async fn post_auth_login(
+    State(state): State<AppState>,
+    Json(body): Json<AuthLoginRequest>,
+) -> std::result::Result<Json<AuthLoginResponse>, ApiError> {
+    let jwt_cfg = state.dev_login_jwt.as_ref().ok_or_else(|| {
+        ApiError::from(crate::error::DbError::SqlPlan(
+            "POST /auth/login is disabled (set UNIDB_DEV_LOGIN=1 to enable)".into(),
+        ))
+    })?;
+    // Validate the user exists.
+    let users = state.engine.user_snapshot().await;
+    if !users.iter().any(|(name, _)| name == &body.username) {
+        return Err(ApiError::from(crate::error::DbError::SqlPlan(format!(
+            "user '{}' not found",
+            body.username
+        ))));
+    }
+    let token = jwt_cfg.issue_token(&body.username).map_err(|e| {
+        ApiError::from(crate::error::DbError::SqlPlan(format!(
+            "token issuance failed: {e}"
+        )))
+    })?;
+    Ok(Json(AuthLoginResponse {
+        token,
+        expires_in: 3600,
+    }))
+}
+
+/// `GET /auth/whoami` — protected (JWT required).
+///
+/// Returns the identity and authorisation summary for the caller:
+/// - `user` — the `sub` claim from the token, or `null` for the implicit
+///   superuser (token without `sub`).
+/// - `is_superuser` — whether the user was created `SUPERUSER`.
+/// - `roles` — direct role memberships.
+/// - `privileges` — per-table grants: `[{table, ops}]`.
+/// - `open_mode` — `true` when no users exist (all access passes anyway).
+pub async fn get_auth_whoami(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+) -> std::result::Result<Json<WhoamiResponse>, ApiError> {
+    let open_mode = !state.engine.has_users().await;
+    let user = current_user.0.clone();
+    let (is_superuser, roles, privileges) = if let Some(ref u) = user {
+        let snapshot = state.engine.user_snapshot().await;
+        let is_su = snapshot.iter().any(|(n, su)| n == u && *su);
+        let roles = state.engine.user_roles(u.clone()).await;
+        let grants = state.engine.user_grants(u.clone()).await;
+        let privileges = grants
+            .into_iter()
+            .map(|(table, ops)| WhoamiPrivilege { table, ops })
+            .collect();
+        (is_su, roles, privileges)
+    } else {
+        // Implicit superuser (token without `sub`).
+        (true, Vec::new(), Vec::new())
+    };
+    Ok(Json(WhoamiResponse {
+        user,
+        is_superuser,
+        roles,
+        privileges,
+        open_mode,
+    }))
 }
 
 // ── operational ──────────────────────────────────────────────────────────

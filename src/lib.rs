@@ -1176,6 +1176,20 @@ impl Engine {
         // (`set_deferred_sync(false)`) so the crash harness can exercise both.
         wal.set_deferred_sync(true);
         tracing::info!(dir = %dir.display(), page_size = page_size_usize, next_xid, "engine opened");
+        // item-24 R-b: warn when policies are defined but no users exist.
+        // In bootstrap/open mode all RLS is silently inactive; the operator
+        // may not realise until data leaks.
+        if !authz.has_users() {
+            let has_policies = catalog.tables().any(|t| !t.policies.is_empty());
+            if has_policies {
+                tracing::warn!(
+                    "RLS policies are defined but no users exist (bootstrap mode) — \
+                     all row-level security is currently INACTIVE. \
+                     Run `CREATE USER <name> SUPERUSER` to activate RLS. \
+                     Check `SELECT enforced FROM unidb_catalog.policies` to confirm."
+                );
+            }
+        }
         Ok(Self {
             control,
             page_size: page_size_usize,
@@ -2312,11 +2326,17 @@ impl Engine {
         let table = policy.table.clone();
         let op = policy.op;
         let expr = Self::parse_policy_predicate(&table, &policy.using_expr)?;
+        // item-24 R-a: WITH CHECK expression (defaults to USING when absent).
+        let check_sql = policy
+            .with_check_sql
+            .as_deref()
+            .unwrap_or(&policy.using_expr);
+        let check_expr = Self::parse_policy_predicate(&table, check_sql)?;
         cat.add_policy(policy, ctx)?;
         // Route by operation (item-24 Z2: per-op materialized predicates):
         // - INSERT or ALL → insert_policy (OR semantics).
         // - SELECT or ALL → rls_policy (SELECT-scoped, OR semantics).
-        // - UPDATE or ALL → update_policy (UPDATE-scoped, OR semantics).
+        // - UPDATE or ALL → update_policy (USING filter) + update_with_check (R-a).
         // - DELETE or ALL → delete_policy (DELETE-scoped, OR semantics).
         //
         // Permissive policies use OR (any matching policy permits the row), per
@@ -2350,6 +2370,16 @@ impl Engine {
                 None => expr.clone(),
             };
             cat.set_update_policy(&table, Some(merged), ctx)?;
+            // item-24 R-a: maintain update_with_check (USING if no explicit WITH CHECK).
+            let existing_check = cat
+                .lookup(&table)
+                .ok()
+                .and_then(|t| t.update_with_check.clone());
+            let merged_check = match existing_check {
+                Some(old) => Expr::Or(Box::new(old), Box::new(check_expr)),
+                None => check_expr,
+            };
+            cat.set_update_with_check(&table, Some(merged_check), ctx)?;
         }
         if matches!(op, PolicyOp::Delete | PolicyOp::All) {
             let existing = cat
@@ -2405,12 +2435,24 @@ impl Engine {
                     None => expr,
                 }))
             })?;
-        // Recompute update_policy (UPDATE/ALL) from remaining.
+        // Recompute update_policy (UPDATE/ALL USING) from remaining.
         let upd_merged = policies
             .iter()
             .filter(|p| matches!(p.op, PolicyOp::Update | PolicyOp::All))
             .try_fold(None::<Expr>, |acc, p| {
                 let expr = Self::parse_policy_predicate(table, &p.using_expr)?;
+                Ok::<_, crate::error::DbError>(Some(match acc {
+                    Some(old) => Expr::Or(Box::new(old), Box::new(expr)),
+                    None => expr,
+                }))
+            })?;
+        // Recompute update_with_check (UPDATE/ALL WITH CHECK, else USING) (R-a).
+        let upd_check_merged = policies
+            .iter()
+            .filter(|p| matches!(p.op, PolicyOp::Update | PolicyOp::All))
+            .try_fold(None::<Expr>, |acc, p| {
+                let sql = p.with_check_sql.as_deref().unwrap_or(&p.using_expr);
+                let expr = Self::parse_policy_predicate(table, sql)?;
                 Ok::<_, crate::error::DbError>(Some(match acc {
                     Some(old) => Expr::Or(Box::new(old), Box::new(expr)),
                     None => expr,
@@ -2427,7 +2469,7 @@ impl Engine {
                     None => expr,
                 }))
             })?;
-        // Update all four policy fields in place and persist once.
+        // Update all policy fields in place and persist once.
         let t = cat
             .tables_mut()
             .get_mut(table)
@@ -2435,6 +2477,7 @@ impl Engine {
         t.rls_policy = rls_merged;
         t.insert_policy = ins_merged;
         t.update_policy = upd_merged;
+        t.update_with_check = upd_check_merged;
         t.delete_policy = del_merged;
         cat.persist_only(ctx).map(|_| ())
     }

@@ -22,7 +22,7 @@
 //   GRANT <role> TO <grantee>                       (role membership)
 //   REVOKE <priv,.. | ALL> ON <table> FROM <grantee>
 //   REVOKE <role> FROM <grantee>
-//   CREATE POLICY <name> ON <table> FOR <op> USING (<predicate>)
+//   CREATE POLICY <name> ON <table> FOR <op> USING (<predicate>) [WITH CHECK (<expr>)]
 //   DROP POLICY <name> ON <table>
 //
 // Roles/users/grants persist to `roles.json` (control-plane metadata, so
@@ -126,18 +126,24 @@ impl PolicyOp {
 }
 
 /// A named RLS policy stored in the catalog `TableDef.policies` (item-24 Z1).
-/// Mirrors Postgres `pg_policy`: a name, an operation scope, and a USING
-/// predicate SQL string (stored verbatim; re-parsed at plan time via
-/// `set_rls_policy_sql`). `WITH CHECK` is the same predicate in this slice
-/// (full separate-check support is a Z2+ concern).
+/// Mirrors Postgres `pg_policy`: a name, an operation scope, a USING predicate
+/// (row-filter — which rows may be seen/affected), and an optional WITH CHECK
+/// predicate (write-side — new row must satisfy this; defaults to `using_expr`
+/// when absent, per Postgres semantics).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PolicyDef {
     pub name: String,
     pub table: String,
     pub op: PolicyOp,
     /// Raw SQL predicate (the `USING (…)` clause), stored verbatim for
-    /// catalog exposure (Z5). Re-parsed into `Expr` at apply time.
+    /// catalog exposure.  Re-parsed into `Expr` at apply time.
     pub using_expr: String,
+    /// Optional `WITH CHECK (…)` predicate (item-24 R-a).  When `None` the
+    /// USING expression doubles as the write-side check, per Postgres
+    /// semantics.  `#[serde(default)]` ensures pre-R-a catalog blobs
+    /// deserialize with `None` — no FORMAT_VERSION bump required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub with_check_sql: Option<String>,
 }
 
 /// A parsed auth-DDL statement.
@@ -168,7 +174,7 @@ pub enum AuthStmt {
         role: String,
         grantee: String,
     },
-    /// `CREATE POLICY <name> ON <table> FOR <op> USING (<predicate>)` (Z1).
+    /// `CREATE POLICY <name> ON <table> FOR <op> USING (<predicate>) [WITH CHECK (<expr>)]` (Z1/R-a).
     CreatePolicy(PolicyDef),
     /// `DROP POLICY <name> ON <table>` (Z1).
     DropPolicy {
@@ -296,6 +302,34 @@ impl RoleStore {
             }
         }
         out
+    }
+
+    /// Table-level grants for a user, collected as `(table, [privilege_names])`.
+    /// Used by `GET /auth/whoami` (item 100).
+    pub fn table_grants_for(&self, user: &str) -> Vec<(String, Vec<String>)> {
+        let st = self.lock();
+        match st.table_grants.get(user) {
+            Some(tables) => tables
+                .iter()
+                .map(|(tbl, privs)| {
+                    (
+                        tbl.clone(),
+                        privs.iter().map(|p| p.as_str().to_string()).collect(),
+                    )
+                })
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Roles a user belongs to (direct memberships only; not transitive).
+    /// Used by `GET /auth/whoami` (item 100).
+    pub fn roles_for(&self, user: &str) -> Vec<String> {
+        let st = self.lock();
+        st.memberships
+            .get(user)
+            .map(|roles| roles.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Apply a parsed auth-DDL statement. The caller must have already checked
@@ -506,11 +540,57 @@ fn parse_create_policy(sql: &str) -> Result<AuthStmt> {
         ));
     }
 
+    // Optional `WITH CHECK (expr)` after the USING clause (item-24 R-a).
+    // We look in the portion of the original SQL that comes *after* the
+    // closing `)` of the USING expression.
+    let after_using_close_offset = (using_kw_pos + 5) + (open + 1) + close + 1;
+    let remainder = if after_using_close_offset < sql.len() {
+        &sql[after_using_close_offset..]
+    } else {
+        ""
+    };
+    let upper_rem = remainder.to_ascii_uppercase();
+    let with_check_sql = if let Some(wc_pos) = upper_rem.find("WITH CHECK") {
+        let after_wc = &remainder[wc_pos + 10..]; // skip "WITH CHECK"
+        let wc_open = after_wc.find('(').ok_or_else(|| {
+            DbError::SqlParse("CREATE POLICY: WITH CHECK clause must be parenthesised".into())
+        })?;
+        let wc_inner = &after_wc[wc_open + 1..];
+        let mut depth = 1usize;
+        let mut wc_close = None;
+        for (i, ch) in wc_inner.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        wc_close = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let wc_close = wc_close.ok_or_else(|| {
+            DbError::SqlParse("CREATE POLICY: unclosed WITH CHECK parenthesis".into())
+        })?;
+        let expr = wc_inner[..wc_close].trim().to_string();
+        if expr.is_empty() {
+            return Err(DbError::SqlParse(
+                "CREATE POLICY: WITH CHECK predicate cannot be empty".into(),
+            ));
+        }
+        Some(expr)
+    } else {
+        None
+    };
+
     Ok(AuthStmt::CreatePolicy(PolicyDef {
         name,
         table,
         op,
         using_expr,
+        with_check_sql,
     }))
 }
 

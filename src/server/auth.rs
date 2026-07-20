@@ -22,7 +22,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 
 /// Loaded once at startup from `UNIDB_JWT_SECRET` (see `src/bin/
@@ -30,18 +30,57 @@ use serde::{Deserialize, Serialize};
 /// verify-with-public-key) is a straightforward `jsonwebtoken`-native
 /// extension but not required to satisfy the locked "verify-only, one
 /// shared secret" scope.
+///
+/// When `UNIDB_DEV_LOGIN=1` is set at startup, `encoding_key` is populated
+/// and `POST /auth/login` issues short-lived tokens.  This is deliberately a
+/// **dev/demo-only path** — it does not reopen Milestone-18's "verify-only"
+/// decision for production; the production posture (tokens come from an
+/// external IdP) is unchanged when the flag is absent.
 #[derive(Clone)]
 pub struct JwtConfig {
     decoding_key: DecodingKey,
     validation: Validation,
+    /// Non-None only when `UNIDB_DEV_LOGIN=1` — used by `POST /auth/login`.
+    pub encoding_key: Option<EncodingKey>,
 }
 
 impl JwtConfig {
+    /// Verify-only config (production default).
     pub fn new(secret: &str) -> Self {
         Self {
             decoding_key: DecodingKey::from_secret(secret.as_bytes()),
             validation: Validation::new(Algorithm::HS256),
+            encoding_key: None,
         }
+    }
+
+    /// Verify + issue config (`UNIDB_DEV_LOGIN=1`).  Same secret is used for
+    /// both — the token issued here will pass the existing `require_jwt`
+    /// middleware without change.
+    pub fn with_dev_login(secret: &str) -> Self {
+        Self {
+            decoding_key: DecodingKey::from_secret(secret.as_bytes()),
+            validation: Validation::new(Algorithm::HS256),
+            encoding_key: Some(EncodingKey::from_secret(secret.as_bytes())),
+        }
+    }
+
+    /// Issue a short-lived HS256 JWT for `username`.
+    ///
+    /// Returns `Err` when `encoding_key` is `None` (dev-login flag is off).
+    pub fn issue_token(&self, username: &str) -> Result<String, jsonwebtoken::errors::Error> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let key = self.encoding_key.as_ref().expect("issue_token called without encoding_key");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let claims = serde_json::json!({
+            "sub": username,
+            "iat": now,
+            "exp": now + 3600, // 1 hour
+        });
+        encode(&Header::default(), &claims, key)
     }
 }
 

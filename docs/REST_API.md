@@ -1193,6 +1193,119 @@ curl -s -X POST http://localhost:7777/auth/preview \
   -d '{"as_role": "alice", "sql": "SELECT id, owner FROM posts"}'
 ```
 
+#### WITH CHECK on UPDATE policies (item-24 R-a)
+
+When a policy is created with `FOR UPDATE` (or `FOR ALL`) and no explicit `WITH CHECK`,
+the `USING` predicate doubles as the write-side check — matching Postgres semantics. An
+explicit `WITH CHECK` clause may differ from `USING`:
+
+```sql
+-- USING filters which rows alice can target; WITH CHECK validates the NEW row.
+CREATE POLICY pos ON scores FOR UPDATE
+  USING (val >= 10) WITH CHECK (val >= 10);
+```
+
+A write whose new row violates `WITH CHECK` is rejected with a
+`new row violates WITH CHECK policy for table "<name>"` error. Superusers and the
+embedded API path bypass all write-side checks.
+
+The `with_check_expr` and `enforced` columns in `unidb_catalog.policies` surface these
+fields for introspection:
+
+| Column | Meaning |
+|--------|---------|
+| `with_check_expr` | `NULL` when no explicit `WITH CHECK`; the SQL expression otherwise |
+| `enforced` | `false` when no users have been created yet (bootstrap / open mode) |
+
+#### `GET /auth/meta` — discovery endpoint (item 100)
+
+Returns static capability metadata. **Public — no JWT required.** Intended for client
+libraries and admin UIs to discover the server's auth configuration before issuing a
+login or before prompting for credentials.
+
+```
+GET /auth/meta
+```
+
+**Response** `200 OK`:
+```json
+{
+  "open_mode": true,
+  "privilege_types": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "policy_operations": ["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"],
+  "catalog_tables": ["information_schema.tables", "unidb_catalog.roles", "unidb_catalog.grants", "unidb_catalog.policies"],
+  "dev_login_enabled": false
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `open_mode` | `true` when no users exist — RLS inactive, all callers have full access |
+| `dev_login_enabled` | `true` only when server is started with `UNIDB_DEV_LOGIN=1` |
+
+#### `POST /auth/login` — dev/demo token issuance (item 100, `UNIDB_DEV_LOGIN=1` only)
+
+> **Security notice:** This route is **disabled by default**. It is a passwordless,
+> dev/demo-only endpoint. It must **never** be enabled in production. The Milestone-18
+> decision to keep token issuance out of the production path is unchanged.
+>
+> Enable only with `UNIDB_DEV_LOGIN=1` env var. The server logs a `WARN` on startup
+> when this flag is set.
+
+Issues a short-lived HS256 JWT (1 hour, same secret as the server's `UNIDB_JWT_SECRET`)
+for the named user. The user must exist (via `CREATE USER`) in the engine — unknown users
+receive `404`.
+
+**Auth:** None (public).
+
+**Request** `POST /auth/login`:
+```json
+{ "username": "alice" }
+```
+
+**Response** `200 OK`:
+```json
+{ "token": "<jwt>", "expires_in": 3600 }
+```
+
+**Error responses:** `404` user not found; `403` when `UNIDB_DEV_LOGIN` is not set.
+
+**Example:**
+```bash
+curl -s -X POST http://localhost:7777/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username": "alice"}'
+```
+
+#### `GET /auth/whoami` — caller identity and privileges (item 100)
+
+Returns the authenticated caller's identity, role memberships, and per-table
+privilege grants. Requires a valid JWT.
+
+```
+GET /auth/whoami
+Authorization: Bearer <token>
+```
+
+**Response** `200 OK`:
+```json
+{
+  "user": "alice",
+  "is_superuser": false,
+  "roles": ["reader"],
+  "privileges": [
+    { "table": "posts", "ops": ["SELECT"] }
+  ],
+  "open_mode": false
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `user` | JWT `sub` claim; `null` in open mode with no user identity |
+| `is_superuser` | `true` when the user was created with `SUPERUSER` |
+| `open_mode` | Mirrors `GET /auth/meta` — no users registered yet |
+
 #### Catalog virtual relations
 
 The current roles, grants, and policies are queryable as virtual relations:
@@ -1207,12 +1320,20 @@ These are read-only virtual tables synthesized by the executor from the in-memor
 (which is itself loaded from the persisted catalog at engine open). They do not correspond to
 heap pages on disk.
 
+The `policies` relation now includes `with_check_expr` (the explicit write-side predicate, or
+`NULL`) and `enforced` (`false` in bootstrap/open mode before the first user is created).
+
 #### Open-mode compatibility
 
 With no roles registered, the server runs in **open mode**: all validly-authenticated users
 have full access to all tables. Open mode is the default and maintains full backward
 compatibility with deployments that do not use per-user authorization. Once any role or grant
 is registered, the engine enforces privileges on all subsequent requests.
+
+The `enforced` column in `unidb_catalog.policies` and the `open_mode` field in
+`GET /auth/meta` and `GET /auth/whoami` surface this state for client observability.
+The engine also emits a startup `WARN` log when RLS policies exist but no users have
+been created (bootstrap signal — policies are defined but currently inactive).
 
 ---
 
