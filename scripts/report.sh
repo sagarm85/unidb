@@ -42,6 +42,39 @@
 # multiplier), CONC_ONLY (scenario substring filter), CONC_STRICT=1 (nonzero
 # exit if any cell fails — for CI).
 #
+# ── Table-selection knobs (reduce bench time for per-item runs) ───────────────
+#
+# Full run (all tables) takes ~4 hours. The dominant bottleneck is Table 4
+# (HNSW vector-index build at 100k rows, ~45 min). Use these knobs to skip
+# tables that aren't relevant to the change being measured.
+#
+#   MM_SKIP_TABLE4=1   skip Table 4 + 4.1 (HNSW at-scale, ~45 min)
+#   MM_SKIP_TABLE5=1   skip Table 5 (FK relational-integrity stress, ~5–10 min)
+#   MM_TABLES=1,2,3    allowlist — run ONLY these tables (overrides skip flags)
+#
+# Per-item bench profiles — pick the right one for each item:
+#
+#   WAL / commit path (e.g. item 101 group commit):
+#     MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1 scripts/report.sh          # ~1.5 hr
+#
+#   B-tree / CRUD / index / heap (e.g. item 102 index-only scan):
+#     MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1 scripts/report.sh          # ~1.5 hr
+#
+#   HNSW / vector changes (e.g. items 67, 72, 93):
+#     scripts/report.sh                                              # ~4 hr (Table 4 IS the signal)
+#
+#   FK / relational-integrity changes (e.g. item 36):
+#     MM_SKIP_TABLE4=1 scripts/report.sh                            # ~2 hr
+#
+#   Concurrency correctness only (no throughput tables):
+#     scripts/report.sh --conc                                       # ~20 min
+#
+#   Full historical baseline comparison (explicitly requested only):
+#     scripts/report.sh                                              # ~4 hr (no flags)
+#
+# The report header records which tables ran, so every report is self-contained.
+# Do NOT run the full ~4 hr bench for items that only touch WAL/CRUD/B-tree code.
+#
 # Output:
 #   • Docker mode → docker/out/multi_model_report_<timestamp>.md
 #   • Native mode → docs/performance/multi_model_report_<timestamp>.md
