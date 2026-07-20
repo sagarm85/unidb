@@ -102,7 +102,7 @@
 | 92 | `92_vector_query_next_tier.md` | Performance | ✅ SHIPPED 2026-07-19 (PR #154) — zero-copy dist on vec-cache hits + SIMD f32 accumulation + CREATE INDEX `prefetch_caches`; cold 24ms→1.27ms (19×), disk fetches/q 48→0. See PROGRESS.md "Item 92". |
 | 93 | `93_hnsw_arena_layout.md` | Performance | ⏳ NOT STARTED — flat arena `Vec<RowId>` for HNSW neighbour lists; eliminates ~3200 `Vec` clones per NEAR query; fits in a single `Arc` slab. |
 | 94 | `94_near_read_only_fast_path.md` | Performance | ⏳ NOT STARTED — `read_snapshot_lightweight()` skips active-snapshot registration + WAL tail pin for standalone read-only NEAR outside user BEGIN. |
-| 95 | `95_graph_adjacency_cache.md` | Performance | ⏳ NOT STARTED — `DashMap<(String, i64), Arc<Vec<EdgeRef>>>` per-engine adjacency cache; invalidate on edge INSERT/DELETE commit; max 50k hubs. |
+| 95 | `95_graph_adjacency_cache.md` | Performance | ✅ SHIPPED 2026-07-20 (PR pending) — lazy warm cache (`AdjacencyCache` DashMap, EdgeRef, approx-LRU eviction); invalidate O(1) on INSERT/DELETE; 8W+8R 100k concurrent test PASS. See PROGRESS.md "Item 95". |
 | 96 | `96_query_plan_cache.md` | Performance | ✅ SHIPPED 2026-07-19 (PR #156) — 1,024-entry LRU plan cache keyed by `(sql_hash, schema_epoch)`; schema_epoch bumped on DDL; 537–891× speedup on repeated same-SQL; SELECT filtered 0.44→0.55×. See PROGRESS.md "Item 96". |
 | 97 | `97_count_star_statistics.md` | Performance | ✅ SHIPPED 2026-07-19 (PR #161) — `row_count: i64` in `TableDef`; maintained on INSERT/DELETE/TRUNCATE; O(1) COUNT(*) fast path; FORMAT_VERSION 10→11; SELECT COUNT(*) 6.93× vs PG. See PROGRESS.md "Item 97". |
 | 98 | `98_sql_insert_throughput.md` | Performance | ✅ SHIPPED 2026-07-19 (PR #157+#159) — `InsertAccum` streaming accumulation: one WAL_BEGIN+COMMIT per VALUES statement; UNIQUE enforcement preserved (per-row index before next row validate). See PROGRESS.md "Item 98". |
@@ -138,7 +138,7 @@ State after 2026-07-20 (items 51/67/68/69/101/102-A all shipped):
 2. **#103 Catalog sync dedup** — remove `wal.sync_up_to(catalog_lsn)` after `catalog.persist_only()`; eliminates double-fsync-per-INSERT; catalog row-count recomputed from heap on crash.
 3. **#93 HNSW arena layout** — flat `Vec<RowId>` slab; expected W2 latency reduction.
 4. **#94 NEAR read-only fast path** — skip full HNSW beam search for exact-match NEAR queries.
-5. **#95 graph adjacency cache** — `DashMap` per-engine hub cache for hot adjacency reads.
+5. ~~**#95 graph adjacency cache**~~ — ✅ SHIPPED 2026-07-20.
 
 **What is NOT in this list:**
 - Parallel DML apply: held in reserve; not justified at current acceptance band.
