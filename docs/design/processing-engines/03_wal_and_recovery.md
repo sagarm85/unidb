@@ -36,6 +36,7 @@ uses the identical framing (doc 11 §5).
 ### Record kinds — all 19 types
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 graph LR
     subgraph MiniTxn["Mini-transaction brackets (D2)"]
         T1["1 WAL_BEGIN"]
@@ -98,6 +99,7 @@ one per 16 MiB), so a sealed segment is always durable.
 ## 3.2 Append path & group commit
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 flowchart TB
     subgraph Wal
         I["Mutex&lt;WalInner&gt;<br/>writer · next_lsn · durable_lsn<br/>deferred_sync · poisoned · segment state"]
@@ -144,6 +146,7 @@ durable `WAL_TXN_COMMIT`, recovery undoes **all** of its effects.
 ## 3.4 Recovery flow (`recovery.rs`)
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 flowchart TB
     A["1 · Read control file (CRC, magic, version)<br/>→ checkpoint_lsn — single source of truth (D3)"]
     B["2 · Scan all WAL segments in LSN order,<br/>keep records with lsn ≥ checkpoint_lsn<br/>(CRC failure / short read = torn tail → stop cleanly)"]

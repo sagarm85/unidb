@@ -7,6 +7,23 @@ see `PROGRESS.md`. Documents here *distill* those sources into a readable
 architecture reference — when they disagree, `CLAUDE.md`/`PROGRESS.md`
 win.
 
+- [`unidb_design_architecture.pdf`](unidb_design_architecture.pdf) — **the
+  engineer-facing Design & Architecture reference (PDF)**: the internal companion
+  to the end-user guide below. A polished, diagram-led distillation of the
+  [`processing-engines/`](processing-engines/00_engines_index.md) collection —
+  the layer stack, the one-commit-four-models write path, the storage engine,
+  WAL & crash recovery, MVCC/isolation, the query/index/vector/graph/event
+  engines, a measured performance snapshot, and the trust/failure model. Carries
+  four **hand-drawn SVG hero diagrams** (system architecture, write path, MVCC
+  visibility, recovery flow) rendered inline; unlike the end-user guide it keeps
+  internal identifiers (`D1`–`D13`, WAL record names, item numbers). Generated
+  from [`unidb_design_architecture.html`](unidb_design_architecture.html) — edit
+  the HTML, then re-render:
+  `node render_pdf.mjs unidb_design_architecture.html unidb_design_architecture.pdf`.
+  Provenance & regeneration notes:
+  [`unidb_design_architecture_context.md`](unidb_design_architecture_context.md).
+  When it disagrees with `CLAUDE.md`/`PROGRESS.md`, those win.
+
 - [`unidb_engine_architecture.pdf`](unidb_engine_architecture.pdf) — **the
   shareable, end-user architecture & product guide (PDF)**: what unidb is, how
   data is stored and kept safe (incl. crash recovery), transactions &

@@ -9,6 +9,7 @@ default build carries **zero async dependencies**.
 ## 11.1 Server architecture
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 flowchart LR
     C[Clients] -->|HTTPS optional rustls| AX["axum router"]
     AX --> JWT["JWT layer (HS256, verify-only)<br/>every route except /metrics"]
@@ -52,6 +53,7 @@ else → writer path with commit-or-abort wrapping.
 them in a single HTTP request, each in its own transaction:
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 sequenceDiagram
     participant C as Client
     participant H as batch_sql handler
@@ -135,6 +137,7 @@ ring holds `(timestamp, sql_fingerprint, duration_ms)` tuples.
 ## 11.3 Replication & HA (Phase 6)
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 flowchart LR
     subgraph Primary
         W["Segmented WAL db.wal/"] --> SR["SlotRegistry slots.json<br/>restart_lsn = truncation floor"]

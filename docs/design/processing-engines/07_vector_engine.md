@@ -41,6 +41,7 @@ storage machinery** — no new WAL record kind, page type, or format bump.
 updates — behind the same interface if ever needed.)
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 flowchart LR
     subgraph OnDisk["On-disk layout (all standard CRC'd pages, WAL_INDEX-logged)"]
         META["Meta page (stable id in ColumnDef.index_root)<br/>magic 0xF1 · metric · dim · nlist · nprobe<br/>postings-tree meta id · centroid-chain head"]
@@ -87,6 +88,7 @@ the nearest neighbours at each layer, and creates bidirectional links.
 ### Query path (NEAR) with cache hierarchy
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 sequenceDiagram
     participant Ex as SQL executor
     participant HC as HnswL0Cache (item 72)

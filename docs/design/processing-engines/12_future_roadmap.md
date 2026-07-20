@@ -47,6 +47,7 @@ ffsdb at 10k warm.
 ## 12.3 Proposed phases
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 flowchart LR
     P7["Phase 7<br/>Performance parity<br/>(HOT · parallel agg ·<br/>soaks → default-on)"]
     P8["Phase 8<br/>Query & model depth<br/>(SQL MATCH/NEAR surface ·<br/>graph hops · retention)"]

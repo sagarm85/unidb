@@ -27,6 +27,7 @@ unidb keeps all four in **one file, one log, one transaction manager**. This
 document shows you the actual bytes that make that true.
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 flowchart LR
     subgraph U["unidb — one commit"]
         direction TB
@@ -73,6 +74,7 @@ definition — its column names and types — is stored durably the exact same
 way your rows are: as data, on a page, protected by the same log.
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 flowchart LR
     CF["Control file\n(44 bytes)"] -- "catalog_root" --> CP["Catalog page\nmagic + next_page_id + JSON"]
     CP -- "TableDef: orders\n(id, customer, total, status)" --> READY(("ready to\nquery"))
@@ -101,6 +103,7 @@ shared pool of numbered pages, and every table just keeps its own private
 list of which page numbers are its.
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 flowchart TB
     CAT["Catalog"] -- "points to" --> D1["orders' directory\npages: 1, 3, 5"]
     CAT -- "points to" --> D2["customers' directory\npages: 2, 4"]
@@ -203,6 +206,7 @@ to rounding. In hex, little-endian: `A7 61 00 00 00 00 00 00 00 00 00 00 00 00 0
 ### The row, placed on an 8 KiB page
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 flowchart TB
     subgraph PAGE["8 KiB page"]
         direction LR
@@ -235,6 +239,7 @@ object instead.
 ### What gets logged, in order
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 sequenceDiagram
     participant App
     participant Engine
@@ -272,6 +277,7 @@ rule for what to keep cached — and a rule that guarantees it never "forgets"
 a change before that change is safely logged.
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 flowchart TD
     Q{"Is page\nalready cached?"}
     Q -- "yes (hit)" --> HIT["return a fresh copy\nfrom the memory-mapped file"]
@@ -324,6 +330,7 @@ reading this table and someone updating it can run at the exact same
 instant without ever blocking each other.
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 flowchart LR
     subgraph V1["Version 1 (page 12, slot 3)"]
         direction TB
@@ -370,6 +377,7 @@ SELECT * FROM orders WHERE id = 1;
 at the moment my query started, and nothing newer."
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 flowchart LR
     S["take a snapshot\n(the set of already-committed\ntransactions)"] --> L["look up the row's slot(s)"]
     L --> C{"is this version's xmin\ncommitted in my snapshot,\nand xmax not?"}
@@ -397,6 +405,7 @@ needs a way to find nearby points in space without comparing your query
 against every single row. That's what a vector index is for.
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 flowchart LR
     Q["query vector"] --> CE["score against\nevery centroid"]
     CE --> PR["probe the nprobe\nnearest cells"]
@@ -454,6 +463,7 @@ maintenance you never see. The honest question is: how much, and is any of
 it running when you didn't ask for it?
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 flowchart TD
     OPEN["unidb::Engine::open()\n(plain embedded use)"] --> ZERO["0 standing\nbackground threads"]
     OPEN -.opt in.-> AV["Engine::open_arc()\n/ spawn_autovacuum()"]
@@ -501,6 +511,7 @@ multi-model commit costs one log flush instead of four, and the literal
 reason a crash leaves zero orphaned records instead of a torn one.
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 flowchart LR
     R["order row"] & V["+ embedding"] & E["+ graph edge"] & Q["+ event"] --> ONE["one WAL_BEGIN … WAL_COMMIT bracket"]
     ONE --> D["one durable flush"]

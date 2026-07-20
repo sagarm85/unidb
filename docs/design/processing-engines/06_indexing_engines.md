@@ -50,6 +50,7 @@ The `_in_txn` form also lets callers fold tree writes into a larger atomic unit
 ## 6.3 Concurrency — crabbing writes, latch-free reads
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 flowchart TB
     subgraph Write["INSERT descent (latch-coupled crabbing)"]
         M["latch META (root ptr read is atomic<br/>vs concurrent root split)"]
@@ -101,6 +102,7 @@ covers all insertions into the same leaf, and the sort guarantees that each
 leaf is written at most twice (once to fill, once to overflow into a split).
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 flowchart LR
     SCAN["Heap scan\ncollect (key, RowId) pairs\nMVCC-filtered"] --> SORT["Sort by key\nO(N log N) in-memory"]
     SORT --> BATCH["insert_batch_in_txn\none mini-txn per leaf batch"]

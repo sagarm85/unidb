@@ -9,6 +9,7 @@ query_exec, executor, join, aggregate, sort, explain, datetime}.rs`,
 ## 5.1 Pipeline
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 flowchart LR
     T["SQL text"] --> CACHE{"Plan cache\n(item 96)\nhit on hash+epoch?"}
     CACHE -->|hit| RUN
@@ -129,6 +130,7 @@ PlanCache {
 Lookup flow:
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 flowchart LR
     SQL["SQL text"] --> HASH["FNV hash"]
     HASH --> LOOKUP["cache.get(hash)"]
@@ -152,6 +154,7 @@ INSERT/DELETE updates this field atomically at commit time via
 `COUNT(*)`:
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 flowchart LR
     Q["SELECT COUNT(*)\nFROM t"] --> CHECK{"no WHERE\nno JOIN\nno DISTINCT?"}
     CHECK -->|yes| CATALOG["read t.row_count\nfrom catalog — O(1)"]

@@ -55,6 +55,7 @@ offset  field        type  meaning
 ### Slot lifecycle (M10) — encoded in the existing 4-byte slot, **no format change**
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 stateDiagram-v2
     LIVE: LIVE (offset != 0)
     DEAD: DEAD (offset=0, len=1)
@@ -94,6 +95,7 @@ Consequences that shape everything above it:
 ## 2.3 Buffer pool (`bufferpool.rs`)
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 flowchart LR
     subgraph BufferPool
         ST["Mutex&lt;PoolState&gt;<br/>frames · frame_index · clock_hand<br/>file_page_count · mapped_pages<br/>durable_wal_lsn · fpi_logged<br/>flush_poisoned"]
@@ -186,6 +188,7 @@ can never orphan a page that its directory doesn't know about.
 ### CRUD flows
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 sequenceDiagram
     participant E as Executor
     participant L as LockMgr
@@ -230,6 +233,7 @@ the new slot. Readers follow the chain; the B-tree entry remains unchanged.
 **Cross-page HOT (item 71):** When a page is full but the update is HOT-eligible:
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 flowchart LR
     subgraph OldPage["Old page (packed full)"]
         OS["Old slot\nxmax=xid · hot_next=XPAGE(0xFFFE)\nprev_page=new_page_id\nprev_slot=new_slot"]

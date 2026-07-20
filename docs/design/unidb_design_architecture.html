@@ -1,0 +1,748 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>unidb — Design &amp; Architecture (Engineering Reference)</title>
+<style>
+  @page { size: A4; margin: 14mm 12mm 16mm 12mm; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    color: #1f2a37; font-size: 10.5pt; line-height: 1.52;
+    background: #ffffff;
+  }
+  h1 { font-size: 23pt; color: #0f2c48; margin: 0 0 3pt 0; letter-spacing: -0.2px; }
+  h2 {
+    font-size: 15pt; color: #0f2c48; margin: 22pt 0 8pt 0;
+    padding-bottom: 3pt; border-bottom: 2px solid #2f6bad;
+    page-break-after: avoid;
+  }
+  h3 { font-size: 12pt; color: #1d4e79; margin: 14pt 0 5pt 0; page-break-after: avoid; }
+  p { margin: 5pt 0; }
+  code, .mono {
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    font-size: 9pt; background: #f1f5f9; border-radius: 3px; padding: 0.5pt 3pt;
+    color: #143a5c;
+  }
+  .lead { font-size: 11.5pt; color: #37485a; margin: 4pt 0 12pt 0; }
+  .meta {
+    font-size: 8.5pt; color: #5a6b7c; margin: 0 0 10pt 0;
+    font-family: "SFMono-Regular", Consolas, monospace;
+  }
+  table { border-collapse: collapse; width: 100%; margin: 8pt 0; font-size: 9pt; }
+  th { background: #eef3f9; color: #0f2c48; text-align: left; font-weight: 700; }
+  th, td { border: 1px solid #dce4ec; padding: 4pt 6pt; vertical-align: top; }
+  tr:nth-child(even) td { background: #f8fafc; }
+  .figure { margin: 12pt 0 6pt 0; page-break-inside: avoid; text-align: center; }
+  .figure svg { max-width: 100%; height: auto; }
+  .figcap { font-size: 8.5pt; color: #5a6b7c; margin-top: 4pt; font-style: italic; text-align: center; }
+  .toc { columns: 2; column-gap: 26pt; font-size: 9.5pt; margin-top: 6pt; }
+  .toc a { color: #1d4e79; text-decoration: none; display: block; margin: 2pt 0; break-inside: avoid; }
+  .toc a b { color: #0f2c48; }
+  .pageblock { page-break-before: always; }
+  .callout {
+    border-left: 3px solid #2f6bad; background: #f4f8fc;
+    padding: 7pt 11pt; margin: 10pt 0; font-size: 9.5pt; border-radius: 0 4px 4px 0;
+  }
+  .callout.warn { border-left-color: #d98b1f; background: #fdf7ec; }
+  .callout.good { border-left-color: #2f9e5f; background: #eef8f1; }
+  .small { font-size: 8.5pt; color: #5a6b7c; }
+  ul { margin: 5pt 0 5pt 0; padding-left: 18pt; }
+  li { margin: 2.5pt 0; }
+  .kicker {
+    display: inline-block; font-size: 8pt; font-weight: 700; letter-spacing: 0.6px;
+    text-transform: uppercase; color: #2f6bad; margin-bottom: 2pt;
+  }
+  .divider { height: 1px; background: #e3e8ee; border: 0; margin: 16pt 0; }
+  a { color: #1d4e79; }
+</style>
+</head>
+<body>
+
+<span class="kicker">Engineering Reference · Internal</span>
+<h1>unidb — Design &amp; Architecture</h1>
+<div class="meta">FORMAT_VERSION 11 · 19 WAL record types · 51 crash points · four data models · items 71–99 incorporated · generated 2026-07-20</div>
+<p class="lead">A single embedded storage &amp; transaction engine in Rust that unifies four data
+models — relational rows, vector search, graph edges, and a durable event queue — over
+<b>one page store, one WAL, one buffer pool, one transaction manager</b>. One transaction
+touches all four atomically, because there is one node and one log.</p>
+
+<div class="callout">
+<b>The competitive thesis.</b> unidb's moat is eliminating the multi-system dual-write
+tax: "save row + embedding + graph edge + event" is <i>one</i> WAL append chain and
+<i>one</i> group-committed <code>fsync</code>, versus 3–4 network round-trips with no
+shared transaction across Postgres + a vector store + a graph DB + Kafka. The claim is
+workload-specific and benchmarked against the <i>replaced stack</i>, not one incumbent on
+its home turf.
+</div>
+
+<h2 id="toc">Contents</h2>
+<div class="toc">
+  <a href="#arch"><b>1.</b> System architecture</a>
+  <a href="#flow"><b>2.</b> One commit, four models</a>
+  <a href="#storage"><b>3.</b> Storage engine &amp; the write path</a>
+  <a href="#wal"><b>4.</b> WAL &amp; crash recovery</a>
+  <a href="#txn"><b>5.</b> Transactions, MVCC &amp; isolation</a>
+  <a href="#engines"><b>6.</b> Query, indexing, vector, graph, events</a>
+  <a href="#perf"><b>7.</b> Performance snapshot</a>
+  <a href="#trust"><b>8.</b> Trust &amp; failure model</a>
+  <a href="#glossary"><b>9.</b> Glossary</a>
+</div>
+
+<!-- ============================== 1. ARCHITECTURE ============================== -->
+<h2 id="arch" class="pageblock">1. System architecture</h2>
+<p>The embedded crate is primary; the REST server is an optional, feature-gated layer. The
+default build has <b>zero async dependencies</b> — the engine core is fully synchronous.
+Every layer sits on the storage triad (page store · WAL · buffer pool); the query and
+Cypher engines both read and write all four data models through one MVCC transaction path.</p>
+
+<div class="figure">
+<svg viewBox="0 0 900 1240" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="unidb system architecture layer stack">
+  <defs>
+    <style>
+      .lbl { font: 700 13px "Segoe UI", Arial, sans-serif; }
+      .sub { font: 600 11px "Segoe UI", Arial, sans-serif; fill:#5a6b7c; letter-spacing:.6px; }
+      .ct { font: 700 12.5px "Segoe UI", Arial, sans-serif; fill:#1f2a37; }
+      .cd { font: 400 10.5px "Segoe UI", Arial, sans-serif; fill:#61708a; }
+      .flow { font: 600 10.5px "Segoe UI", Arial, sans-serif; fill:#5a6b7c; }
+      .card { fill:#ffffff; stroke:#e3e8ee; stroke-width:1; }
+    </style>
+    <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#9aa7b6"/>
+    </marker>
+  </defs>
+
+  <!-- outer -->
+  <rect x="4" y="4" width="892" height="1232" rx="18" fill="#fbfcfd" stroke="#e3e8ee"/>
+  <text x="34" y="46" class="lbl" font-size="17" fill="#0f2c48">Multi-Model Embedded Database — System Architecture</text>
+  <text x="34" y="68" class="cd" font-size="11.5">Relational · Vector · Graph · Queue — one atomic transaction, one file on disk</text>
+
+  <!-- CLIENTS -->
+  <rect x="34" y="90" width="832" height="118" rx="12" fill="#eef3fc"/>
+  <circle cx="52" cy="116" r="4" fill="#3b6fd4"/><text x="64" y="120" class="sub">CLIENTS</text>
+  <rect class="card" x="52" y="130" width="392" height="60" rx="8"/>
+  <rect x="52" y="130" width="4" height="60" rx="2" fill="#3b6fd4"/>
+  <text x="70" y="154" class="ct">Embedded crate</text>
+  <text x="70" y="174" class="cd">primary interface — links into the host process</text>
+  <rect class="card" x="456" y="130" width="392" height="60" rx="8"/>
+  <rect x="456" y="130" width="4" height="60" rx="2" fill="#3b6fd4"/>
+  <text x="474" y="154" class="ct">REST server</text>
+  <text x="474" y="174" class="cd">optional · feature-gated · HTTP + SSE + JWT</text>
+
+  <line x1="450" y1="208" x2="450" y2="236" stroke="#9aa7b6" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="462" y="227" class="flow">SQL · Cypher</text>
+
+  <!-- QUERY -->
+  <rect x="34" y="244" width="832" height="118" rx="12" fill="#eef7f1"/>
+  <circle cx="52" cy="270" r="4" fill="#2f9e5f"/><text x="64" y="274" class="sub">QUERY &amp; EXECUTION</text>
+  <rect class="card" x="52" y="284" width="256" height="62" rx="8"/><rect x="52" y="284" width="4" height="62" rx="2" fill="#2f9e5f"/>
+  <text x="70" y="308" class="ct">SQL engine</text>
+  <text x="70" y="326" class="cd">parser → plan → optimize → exec</text>
+  <text x="70" y="340" class="cd">plan cache · 1,024-entry LRU</text>
+  <rect class="card" x="320" y="284" width="256" height="62" rx="8"/><rect x="320" y="284" width="4" height="62" rx="2" fill="#2f9e5f"/>
+  <text x="338" y="308" class="ct">Cypher subset</text>
+  <text x="338" y="326" class="cd">hand-rolled parser</text>
+  <text x="338" y="340" class="cd">shares the SQL evaluator</text>
+  <rect class="card" x="588" y="284" width="260" height="62" rx="8"/><rect x="588" y="284" width="4" height="62" rx="2" fill="#2f9e5f"/>
+  <text x="606" y="308" class="ct">Parallel scan workers</text>
+  <text x="606" y="326" class="cd mono" style="font-family:monospace">std::thread::scope</text>
+  <text x="606" y="340" class="cd">no async runtime — never tokio</text>
+
+  <line x1="450" y1="362" x2="450" y2="390" stroke="#9aa7b6" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="462" y="381" class="flow">both engines read &amp; write all four models</text>
+
+  <!-- DATA MODELS -->
+  <rect x="34" y="398" width="832" height="150" rx="12" fill="#fdeef5"/>
+  <circle cx="52" cy="424" r="4" fill="#d6417f"/><text x="64" y="428" class="sub">DATA MODELS</text>
+  <text x="846" y="428" text-anchor="end" class="cd" font-style="italic">one transaction spans all four — atomically</text>
+  <g>
+    <rect class="card" x="52" y="440" width="192" height="94" rx="8"/><rect x="52" y="440" width="4" height="94" rx="2" fill="#d6417f"/>
+    <text x="68" y="464" class="ct">Relational rows</text>
+    <text x="68" y="486" class="cd">MVCC-versioned tables</text>
+    <text x="68" y="502" class="cd">row-level security (RLS)</text>
+    <text x="68" y="518" class="cd mono" style="font-family:monospace">O(1) COUNT(*)</text>
+  </g>
+  <g>
+    <rect class="card" x="256" y="440" width="192" height="94" rx="8"/><rect x="256" y="440" width="4" height="94" rx="2" fill="#d6417f"/>
+    <text x="272" y="464" class="ct">Vector records</text>
+    <text x="272" y="486" class="cd mono" style="font-family:monospace">VECTOR(n)</text> <text x="330" y="486" class="cd">columns</text>
+    <text x="272" y="502" class="cd">HNSW similarity index</text>
+    <text x="272" y="518" class="cd">L0 + vector hot caches</text>
+  </g>
+  <g>
+    <rect class="card" x="460" y="440" width="192" height="94" rx="8"/><rect x="460" y="440" width="4" height="94" rx="2" fill="#d6417f"/>
+    <text x="476" y="464" class="ct">Graph edges</text>
+    <text x="476" y="486" class="cd mono" style="font-family:monospace">__edges__</text> <text x="540" y="486" class="cd">table</text>
+    <text x="476" y="502" class="cd">adjacency DiskBTree</text>
+    <text x="476" y="518" class="cd">queried via Cypher</text>
+  </g>
+  <g>
+    <rect class="card" x="664" y="440" width="184" height="94" rx="8"/><rect x="664" y="440" width="4" height="94" rx="2" fill="#d6417f"/>
+    <text x="680" y="464" class="ct">Queue events</text>
+    <text x="680" y="486" class="cd mono" style="font-family:monospace">__events__</text> <text x="748" y="486" class="cd">table</text>
+    <text x="680" y="502" class="cd">Kafka-style offsets</text>
+    <text x="680" y="518" class="cd">SSE subscriptions</text>
+  </g>
+
+  <line x1="450" y1="548" x2="450" y2="576" stroke="#9aa7b6" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="462" y="567" class="flow">every statement runs inside an MVCC snapshot</text>
+
+  <!-- TXN -->
+  <rect x="34" y="584" width="832" height="120" rx="12" fill="#fdf5e8"/>
+  <circle cx="52" cy="610" r="4" fill="#d98b1f"/><text x="64" y="614" class="sub">TRANSACTION &amp; CONCURRENCY</text>
+  <rect class="card" x="52" y="626" width="256" height="62" rx="8"/><rect x="52" y="626" width="4" height="62" rx="2" fill="#d98b1f"/>
+  <text x="70" y="650" class="ct">MVCC snapshots</text>
+  <text x="70" y="668" class="cd">RC (default) · RR · SSI</text>
+  <text x="70" y="682" class="cd">bulk lock elision for batch DML</text>
+  <rect class="card" x="320" y="626" width="256" height="62" rx="8"/><rect x="320" y="626" width="4" height="62" rx="2" fill="#d98b1f"/>
+  <text x="338" y="650" class="ct">Lock manager</text>
+  <text x="338" y="668" class="cd">row-level locks</text>
+  <text x="338" y="682" class="cd">wait-for graph deadlock detection</text>
+  <rect class="card" x="588" y="626" width="260" height="62" rx="8"/><rect x="588" y="626" width="4" height="62" rx="2" fill="#d98b1f"/>
+  <text x="606" y="650" class="ct">Vacuum + autovacuum</text>
+  <text x="606" y="668" class="cd">background version cleanup</text>
+  <text x="606" y="682" class="cd">index-aliasing safety gate</text>
+
+  <line x1="450" y1="704" x2="450" y2="732" stroke="#9aa7b6" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="462" y="723" class="flow">tuple &amp; index access through the page store</text>
+
+  <!-- STORAGE -->
+  <rect x="34" y="740" width="832" height="440" rx="12" fill="#eef6f4"/>
+  <circle cx="52" cy="766" r="4" fill="#2f8f7f"/><text x="64" y="770" class="sub">STORAGE</text>
+  <text x="846" y="770" text-anchor="end" class="cd" font-style="italic">one page store · one WAL · one buffer pool — a single file on disk</text>
+
+  <rect class="card" x="52" y="784" width="256" height="88" rx="8"/><rect x="52" y="784" width="4" height="88" rx="2" fill="#2f8f7f"/>
+  <text x="70" y="808" class="ct">Heap</text>
+  <text x="70" y="828" class="cd">slotted 8 KiB pages</text>
+  <text x="70" y="844" class="cd">HOT update chains</text>
+  <text x="70" y="860" class="cd">batched inserts · fill-page cursor</text>
+
+  <rect class="card" x="320" y="784" width="256" height="88" rx="8"/><rect x="320" y="784" width="4" height="88" rx="2" fill="#2f8f7f"/>
+  <text x="338" y="808" class="ct">DiskBTree</text>
+  <text x="338" y="828" class="cd">SQL indexes · postings</text>
+  <text x="338" y="844" class="cd">free-space map</text>
+  <text x="338" y="860" class="cd">coalesced WAL writes</text>
+
+  <rect class="card" x="588" y="784" width="260" height="88" rx="8"/><rect x="588" y="784" width="4" height="88" rx="2" fill="#2f8f7f"/>
+  <text x="606" y="808" class="ct">Segmented WAL</text>
+  <text x="606" y="828" class="cd">redo + undo · group commit</text>
+  <text x="606" y="844" class="cd">16 MiB segments · background sealer</text>
+  <text x="606" y="860" class="cd">fed by heap, B-tree &amp; vacuum</text>
+
+  <!-- WAL-before-page arrow -->
+  <line x1="576" y1="828" x2="588" y2="828" stroke="#9aa7b6" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="470" y="906" text-anchor="middle" class="flow">heap &amp; B-tree → buffer pool → mmap file · WAL record durable before the page is flushed (D5)</text>
+
+  <line x1="180" y1="872" x2="180" y2="946" stroke="#9aa7b6" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="448" y1="872" x2="448" y2="946" stroke="#9aa7b6" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="718" y1="872" x2="718" y2="946" stroke="#9aa7b6" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect class="card" x="52" y="948" width="524" height="80" rx="8"/><rect x="52" y="948" width="4" height="80" rx="2" fill="#2f8f7f"/>
+  <text x="70" y="972" class="ct">Buffer pool</text>
+  <text x="70" y="992" class="cd">CLOCK eviction · per-page latches</text>
+  <text x="70" y="1010" class="cd">CRC verification at the pool boundary</text>
+
+  <rect class="card" x="588" y="948" width="260" height="80" rx="8"/><rect x="588" y="948" width="4" height="80" rx="2" fill="#2f8f7f"/>
+  <text x="606" y="972" class="ct">Control file</text>
+  <text x="606" y="992" class="cd">recovery root for WAL replay</text>
+  <text x="606" y="1010" class="cd mono" style="font-family:monospace">next_xid counter</text>
+
+  <line x1="300" y1="1028" x2="300" y2="1058" stroke="#9aa7b6" stroke-width="1.5" marker-end="url(#arr)"/>
+  <text x="312" y="1049" class="flow">read-through · write-back</text>
+  <line x1="718" y1="1028" x2="718" y2="1058" stroke="#9aa7b6" stroke-width="1.5" marker-end="url(#arr)"/>
+
+  <rect class="card" x="52" y="1060" width="524" height="60" rx="8"/><rect x="52" y="1060" width="4" height="60" rx="2" fill="#2f8f7f"/>
+  <text x="70" y="1084" class="ct">mmap page file</text>
+  <text x="70" y="1104" class="cd mono" style="font-family:monospace">single memory-mapped data.db</text>
+
+  <rect x="588" y="1060" width="260" height="60" rx="8" fill="#eaf2ef" stroke="#cfe0da" stroke-dasharray="4 3"/>
+  <text x="606" y="1082" class="cd" font-style="italic">Crash recovery: replay the WAL</text>
+  <text x="606" y="1100" class="cd" font-style="italic">from the recovery root — redo, then undo.</text>
+</svg>
+<div class="figcap">Figure 1 — The layer stack. Arrows trace the primary data path; every write follows
+write-ahead ordering (D5): the WAL record is durable before the page is flushed.</div>
+</div>
+
+<h3>1.1 The recurring architectural move — durability reuse</h3>
+<p>Vector postings, graph adjacency, full-text postings, LOB directories, and the heap's
+free-space map are <b>all the same <code>DiskBTree</code></b>; edges, events, consumer
+offsets, and LOB chunks are <b>all ordinary rows</b> in synthetic <code>__…__</code> system
+tables. Each new model therefore inherits WAL logging, crash recovery, MVCC, vacuum, and
+replication for free — <b>one crash-recovery code path covers five engines.</b></p>
+
+<table>
+<tr><th>Engine</th><th>Core data structure</th><th>Durability mechanism</th></tr>
+<tr><td>Storage / heap</td><td>Slotted 8 KiB pages, CLOCK frame table, DiskBTree FSM, HOT chains, InsertAccum</td><td>WAL-before-page (D5) + FPI · CRC at pool boundary</td></tr>
+<tr><td>WAL &amp; recovery</td><td>16 MiB segment files, 41-byte record header, 19 record types</td><td>fsync (group-committed), CRC32 everywhere, background sealer</td></tr>
+<tr><td>Transactions</td><td><code>Snapshot{xmin,xmax,active}</code>, wait-for graph, bulk lock elision</td><td>undo log + <code>WAL_TXN_*</code> records</td></tr>
+<tr><td>SQL</td><td>Logical/physical plan trees, 1,024-entry plan cache, O(1) COUNT(*)</td><td>reads: n/a; statements are mini-txns</td></tr>
+<tr><td>B-tree / full-text</td><td>Right-linked B-tree over standard pages, sort-then-bulk-load, batch DML maintenance</td><td>redo-only <code>WAL_INDEX</code> + <code>WAL_INDEX_INSERT</code></td></tr>
+<tr><td>Vector</td><td>DiskHnswIndex on standard pages + L0/vec caches + NodeCache gate + SIMD</td><td><code>WAL_INDEX</code> per node page</td></tr>
+<tr><td>Graph</td><td><code>__edges__</code> heap table + adjacency DiskBTree</td><td>ordinary row WAL + <code>WAL_INDEX</code></td></tr>
+<tr><td>Event queue</td><td><code>__events__</code> + <code>__consumers__</code> heap tables</td><td>ordinary row WAL, txn-atomic</td></tr>
+</table>
+
+<!-- ============================== 2. FLOW ============================== -->
+<h2 id="flow" class="pageblock">2. One commit, four models</h2>
+<p>The headline flow. A single transaction inserts a row, maintains its index, assigns a
+vector posting, and captures an event — then commits <b>once</b>. All statement
+mini-transactions append to the WAL without individual fsyncs; the single
+<code>sync_up_to</code> at user-commit is the one durable point, and concurrent committers
+coalesce behind one <code>fsync</code> via leader election.</p>
+
+<div class="figure">
+<svg viewBox="0 0 900 560" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="one commit four models write path">
+  <defs>
+    <style>
+      .h { font: 700 11.5px "Segoe UI",Arial,sans-serif; fill:#0f2c48; }
+      .t { font: 400 10px "Segoe UI",Arial,sans-serif; fill:#37485a; }
+      .m { font: 600 9.5px "SFMono-Regular",Consolas,monospace; fill:#8a5a12; }
+      .lane { fill:#f7fafc; stroke:#e3e8ee; }
+    </style>
+    <marker id="arr2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#3b6fd4"/>
+    </marker>
+    <marker id="arrw" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2f8f7f"/>
+    </marker>
+  </defs>
+  <rect x="4" y="4" width="892" height="552" rx="14" fill="#fbfcfd" stroke="#e3e8ee"/>
+
+  <!-- actor columns -->
+  <g class="h" text-anchor="middle">
+    <rect class="lane" x="30" y="26" width="120" height="30" rx="7"/><text x="90" y="46">App</text>
+    <rect class="lane" x="170" y="26" width="120" height="30" rx="7"/><text x="230" y="46">Heap</text>
+    <rect class="lane" x="310" y="26" width="130" height="30" rx="7"/><text x="375" y="46">DiskBTree</text>
+    <rect class="lane" x="460" y="26" width="130" height="30" rx="7"/><text x="525" y="46">Vector index</text>
+    <rect class="lane" x="610" y="26" width="120" height="30" rx="7"/><text x="670" y="46">__events__</text>
+    <rect x="750" y="26" width="120" height="30" rx="7" fill="#e7f2ee" stroke="#bcdcd2"/><text x="810" y="46" fill="#1c6b58">WAL</text>
+  </g>
+
+  <!-- steps -->
+  <g class="t">
+    <text x="30" y="92" class="h" font-size="10.5">1 · begin() → xid + snapshot</text>
+    <line x1="150" y1="106" x2="808" y2="106" stroke="#eef2f6"/>
+
+    <text x="30" y="132">2 · INSERT row</text>
+    <line x1="90" y1="140" x2="230" y2="140" stroke="#3b6fd4" stroke-width="1.4" marker-end="url(#arr2)"/>
+    <line x1="230" y1="150" x2="808" y2="150" stroke="#2f8f7f" stroke-width="1.4" marker-end="url(#arrw)"/>
+    <text x="240" y="146" class="m">WAL_INSERT — xmin + version chain</text>
+
+    <text x="30" y="192">3 · index maintenance</text>
+    <line x1="90" y1="200" x2="375" y2="200" stroke="#3b6fd4" stroke-width="1.4" marker-end="url(#arr2)"/>
+    <line x1="375" y1="210" x2="808" y2="210" stroke="#2f8f7f" stroke-width="1.4" marker-end="url(#arrw)"/>
+    <text x="385" y="206" class="m">WAL_INDEX — full node image, redo-only</text>
+
+    <text x="30" y="252">4 · assign vector cell + posting</text>
+    <line x1="90" y1="260" x2="525" y2="260" stroke="#3b6fd4" stroke-width="1.4" marker-end="url(#arr2)"/>
+    <line x1="525" y1="270" x2="808" y2="270" stroke="#2f8f7f" stroke-width="1.4" marker-end="url(#arrw)"/>
+    <text x="535" y="266" class="m">WAL_INDEX — posting-tree leaf</text>
+
+    <text x="30" y="312">5 · event captured under same xid</text>
+    <line x1="90" y1="320" x2="670" y2="320" stroke="#3b6fd4" stroke-width="1.4" marker-end="url(#arr2)"/>
+    <line x1="670" y1="330" x2="808" y2="330" stroke="#2f8f7f" stroke-width="1.4" marker-end="url(#arrw)"/>
+    <text x="680" y="326" class="m">WAL_INSERT</text>
+
+    <line x1="30" y1="356" x2="866" y2="356" stroke="#eef2f6"/>
+    <text x="30" y="386" class="h" font-size="10.5">6 · commit()</text>
+    <line x1="90" y1="398" x2="808" y2="398" stroke="#2f8f7f" stroke-width="1.6" marker-end="url(#arrw)"/>
+    <text x="240" y="392" class="m">WAL_TXN_COMMIT (append, deferred)</text>
+    <line x1="90" y1="428" x2="808" y2="428" stroke="#1c6b58" stroke-width="2.2" marker-end="url(#arrw)"/>
+    <text x="240" y="422" class="m" style="fill:#1c6b58">sync_up_to(commit LSN) — ONE group fsync</text>
+    <line x1="808" y1="450" x2="90" y2="450" stroke="#3b6fd4" stroke-width="1.4" marker-end="url(#arr2)"/>
+    <text x="500" y="444" class="m" text-anchor="middle" style="fill:#3b6fd4">durable ✓</text>
+  </g>
+
+  <rect x="30" y="478" width="840" height="56" rx="9" fill="#eef8f1" stroke="#bfe3cd"/>
+  <text x="48" y="502" class="h" fill="#1c6b58">Result</text>
+  <text x="48" y="522" class="t">Four model-writes, one atomic transaction, <tspan font-weight="700">one fsync</tspan> — vs. 4 systems, 4 fsyncs, 4 round-trips, no cross-system atomicity. Measured: full multi-model commit ~33.1 ms → ~4.40 ms.</text>
+</svg>
+<div class="figcap">Figure 2 — The write path. Blue = call; green = WAL append; heavy green = the single
+group-committed fsync that makes the whole transaction durable.</div>
+</div>
+
+<!-- ============================== 3. STORAGE ============================== -->
+<h2 id="storage" class="pageblock">3. Storage engine &amp; the write path</h2>
+<p><b>mmap-as-storage.</b> The single <code>data.db</code> is memory-mapped; it is the only
+module permitted <code>unsafe</code>. <code>write_page</code> mutates bytes directly in the
+mmap under a write lock; readers take an <b>owned copy</b> under the read lock. There is no
+separate frame buffer and therefore no "pool newer than disk" divergence — which is exactly
+what later made parallel scan trivial to make correct. The OS page cache is the read cache;
+no user-space cache duplicates it.</p>
+
+<h3>3.1 Page &amp; tuple layout</h3>
+<table>
+<tr><th>Structure</th><th>Size</th><th>Fields</th></tr>
+<tr><td>Page header</td><td>28 B</td><td><code>page_id</code>, <code>page_type</code>, <b>CRC32</b> (whole page, this field zeroed), <b>LSN</b> (last WAL record applied), <code>slot_count</code>, <code>free_start</code>, <code>free_end</code>. Slot array grows up; tuple data grows down.</td></tr>
+<tr><td>Tuple header (D4)</td><td>24 B</td><td><code>xmin</code>, <code>xmax</code> (0 = live), <code>prev_page</code>, <code>prev_slot</code> — MVCC visibility + backward version chain; no separate undo segment.</td></tr>
+</table>
+<p>CRC detects torn writes; the LSN gates redo idempotence and the D5 invariant. Fresh
+all-zero pages legitimately skip CRC.</p>
+
+<h3>3.2 Durable free-space map — the O(1)-open moat</h3>
+<p>The per-table page directory + free-space map is a <code>DiskBTree</code> keyed
+<code>page_id → free_bytes</code>. <code>Heap::open</code> is <b>O(1)</b> (a handle is just a
+meta-page id + page size); the insert path never loads the full directory — it probes cached
+pages then the durable append tail via one <code>max_entry</code> descent. The in-memory
+free-map is a hint that <b>never over-reports</b>; <code>acquire_page_for_insert</code>
+re-checks under the page latch, so a stale hint costs a retry, never a corruption. This
+removed both the old ~145k-row catalog-blob ceiling and the O(pages) per-allocation rewrite
+(insert cost went flat at ~17–28 µs/row).</p>
+
+<h3>3.3 HOT update chains &amp; batched writes</h3>
+<p>Insert-new-version MVCC normally requires a B-tree update on every UPDATE. For
+non-indexed-column updates ("HOT-eligible"), the B-tree is skipped and the new version is
+chained from the old slot: <b>same-page HOT</b> puts the new version on the same page with a
+<code>hot_next</code> forward pointer; <b>cross-page HOT</b> (page full) writes the new
+version elsewhere and marks the old slot with the <code>HOT_NEXT_XPAGE = 0xFFFE</code>
+sentinel, leaving the B-tree pointing at the old slot which resolves the live version.</p>
+<div class="callout warn">
+<b>Phase ordering is a crash-safety property.</b> Batch HOT update runs <b>A→B→C</b>:
+(A) stamp <code>xmax</code> on old versions, (B) insert new versions on fill pages, (C) write
+forward chain pointers. The original B→A order was a shipped bug: Phase A failing after
+Phase B committed left orphaned new versions with no undo record. A→B→C makes every phase
+boundary recover correctly.
+</div>
+<p><b>Fill-page cursor</b> tracks the current open page across rows in a statement, replacing
+a per-row O(log n) FSM probe. <b>InsertAccum</b> streams a multi-row <code>INSERT … VALUES</code>
+into one <code>WAL_BEGIN</code>/<code>WAL_COMMIT</code> pair per heap page instead of per row;
+UNIQUE enforcement still runs per-row before each row is written.</p>
+
+<h3>3.4 Checkpoint (strictly ordered; control mutex never held across an fsync)</h3>
+<p><code>wal.sync()</code> → <code>flush_all</code> → clear FPI tracking → log checkpoint
+(fsynced) → control-file update (<code>next_xid</code> captured <i>before</i> truncation) →
+truncate below <code>min(checkpoint_lsn, replication retain floor)</code>. Auto-checkpoint
+fires on time (60 s) or WAL size (64 MiB) but <b>only at a quiescent point</b>
+(<code>active_count() == 0</code>) so truncation can never discard an in-flight
+transaction's undo records.</p>
+
+<!-- ============================== 4. WAL ============================== -->
+<h2 id="wal" class="pageblock">4. WAL &amp; crash recovery</h2>
+<p>Steal + no-force buffering (D1) requires <b>both redo and undo</b> logging. The WAL is a
+directory of fixed 16 MiB segments; a record is <code>[len][41-byte header + redo + undo +
+CRC32]</code> and is never split across segments. 19 record types are defined; each new type
+triggered a <code>FORMAT_VERSION</code> bump so older binaries hard-fail with
+<code>BadVersion</code> rather than silently misrecovering.</p>
+
+<h3>4.1 Group commit</h3>
+<p>One mutex covers LSN allocation + physical append, so concurrent appenders never
+interleave partial records. <code>sync_up_to(target)</code> fast-paths if already durable;
+otherwise the leader runs the slow <code>sync_all</code> <b>with the append lock released</b>,
+so other committers keep appending and one fsync makes every commit before it durable — which
+is why write throughput scales with writers (8 writers → 3.55–3.82×) instead of fsyncs. The
+<b>background sealer</b> moves the 16-MiB segment-rotation fsync off the append mutex entirely.</p>
+<div class="callout warn">
+<b>fsync failure is session-fatal (fsyncgate).</b> Any <code>fsync</code>/<code>msync</code>
+failure — real or injected — poisons the WAL/buffer pool permanently; <code>durable_lsn</code>
+never advances and every later durability call returns <code>DurabilityFailure</code>. The
+remedy is restart + recovery, never an in-session retry that could falsely succeed.
+</div>
+
+<h3>4.2 Recovery flow</h3>
+<div class="figure">
+<svg viewBox="0 0 880 470" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="crash recovery flow">
+  <defs>
+    <style>
+      .rn { font: 700 11px "Segoe UI",Arial,sans-serif; fill:#0f2c48; }
+      .rd { font: 400 9.5px "Segoe UI",Arial,sans-serif; fill:#5a6b7c; }
+      .num { font: 800 13px "Segoe UI",Arial,sans-serif; fill:#ffffff; }
+    </style>
+    <marker id="arr3" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#9aa7b6"/>
+    </marker>
+  </defs>
+  <rect x="4" y="4" width="872" height="462" rx="14" fill="#fbfcfd" stroke="#e3e8ee"/>
+
+  <!-- 3 phases columns -->
+  <rect x="24" y="24" width="270" height="420" rx="10" fill="#eef3fc"/>
+  <text x="40" y="48" class="rn" fill="#3b6fd4">READ + ANALYZE</text>
+  <rect x="304" y="24" width="270" height="420" rx="10" fill="#eef7f1"/>
+  <text x="320" y="48" class="rn" fill="#2f9e5f">REDO</text>
+  <rect x="584" y="24" width="270" height="420" rx="10" fill="#fdf5e8"/>
+  <text x="600" y="48" class="rn" fill="#d98b1f">UNDO + FLUSH</text>
+
+  <g>
+    <!-- step template: circle + card -->
+    <!-- 1 -->
+    <circle cx="52" cy="82" r="13" fill="#3b6fd4"/><text x="52" y="87" class="num" text-anchor="middle">1</text>
+    <text x="74" y="80" class="rn" font-size="10.5">Read control file</text>
+    <text x="74" y="96" class="rd">CRC/magic/version → checkpoint_lsn,</text>
+    <text x="74" y="108" class="rd">the single source of truth (D3)</text>
+    <!-- 2 -->
+    <circle cx="52" cy="150" r="13" fill="#3b6fd4"/><text x="52" y="155" class="num" text-anchor="middle">2</text>
+    <text x="74" y="148" class="rn" font-size="10.5">Scan WAL segments</text>
+    <text x="74" y="164" class="rd">keep lsn ≥ checkpoint_lsn; CRC fail /</text>
+    <text x="74" y="176" class="rd">short read = torn tail → stop clean</text>
+    <!-- 3 -->
+    <circle cx="52" cy="218" r="13" fill="#3b6fd4"/><text x="52" y="223" class="num" text-anchor="middle">3</text>
+    <text x="74" y="216" class="rn" font-size="10.5">Analysis</text>
+    <text x="74" y="232" class="rd">classify mini-txns; incomplete =</text>
+    <text x="74" y="244" class="rd">started − committed − aborted</text>
+    <!-- 4 -->
+    <circle cx="52" cy="290" r="13" fill="#3b6fd4"/><text x="52" y="295" class="num" text-anchor="middle">4</text>
+    <text x="74" y="288" class="rn" font-size="10.5">Set durable frontier</text>
+    <text x="74" y="304" class="rd">durable_wal_lsn := max scanned LSN</text>
+    <text x="74" y="316" class="rd">BEFORE replay — so redo may evict</text>
+    <text x="74" y="328" class="rd">dirty pages freely (a fixed bug)</text>
+
+    <!-- 5 -->
+    <circle cx="332" cy="90" r="13" fill="#2f9e5f"/><text x="332" y="95" class="num" text-anchor="middle">5</text>
+    <text x="354" y="80" class="rn" font-size="10.5">Redo committed txns</text>
+    <text x="354" y="96" class="rd">idempotent replay:</text>
+    <text x="354" y="112" class="rd">• FPI / INDEX → full-page restore</text>
+    <text x="354" y="126" class="rd">• INSERT → slot-existence gate</text>
+    <text x="354" y="140" class="rd">• UPDATE/DELETE/VACUUM →</text>
+    <text x="354" y="152" class="rd">&#160;&#160;page-LSN gate</text>
+    <text x="354" y="182" class="rd" font-style="italic">Idempotence is load-bearing:</text>
+    <text x="354" y="196" class="rd" font-style="italic">truncation is coarse, replicas</text>
+    <text x="354" y="210" class="rd" font-style="italic">re-apply, vacuum redo repeats.</text>
+    <rect x="322" y="234" width="234" height="86" rx="8" fill="#ffffff" stroke="#cfe4d6"/>
+    <text x="336" y="256" class="rn" font-size="10" fill="#2f9e5f">Torn-page repair</text>
+    <text x="336" y="274" class="rd">first write after checkpoint logs a</text>
+    <text x="336" y="288" class="rd">full clean image (WAL_FPI); recovery</text>
+    <text x="336" y="302" class="rd">overwrites the torn page without CRC,</text>
+    <text x="336" y="316" class="rd">then higher-LSN redo replays on top.</text>
+
+    <!-- 6 -->
+    <circle cx="612" cy="90" r="13" fill="#d98b1f"/><text x="612" y="95" class="num" text-anchor="middle">6</text>
+    <text x="634" y="80" class="rn" font-size="10.5">Undo incomplete mini-txns</text>
+    <text x="634" y="96" class="rd">reverse LSN order: delete inserted</text>
+    <text x="634" y="108" class="rd">slot · restore old xmax · re-insert</text>
+    <text x="634" y="120" class="rd">deleted bytes</text>
+    <!-- 7 -->
+    <circle cx="612" cy="168" r="13" fill="#d98b1f"/><text x="612" y="173" class="num" text-anchor="middle">7</text>
+    <text x="634" y="158" class="rn" font-size="10.5">Undo incomplete USER txns</text>
+    <text x="634" y="174" class="rd">phase 1: revert xmax stamps → live</text>
+    <text x="634" y="186" class="rd">phase 2: self-stamp every inserted</text>
+    <text x="634" y="198" class="rd">row invisible (phase order matters)</text>
+    <!-- 8 -->
+    <circle cx="612" cy="248" r="13" fill="#d98b1f"/><text x="612" y="253" class="num" text-anchor="middle">8</text>
+    <text x="634" y="246" class="rn" font-size="10.5">flush_all recovered pages</text>
+
+    <rect x="602" y="286" width="234" height="140" rx="8" fill="#ffffff" stroke="#ecdcbf"/>
+    <text x="616" y="308" class="rn" font-size="10" fill="#b9791a">Guarantee</text>
+    <text x="616" y="328" class="rd">Recovered DB = exactly the txns that</text>
+    <text x="616" y="342" class="rd">reached a durable WAL_TXN_COMMIT.</text>
+    <text x="616" y="362" class="rd">A committed statement survives; an</text>
+    <text x="616" y="376" class="rd">incomplete one leaves no trace.</text>
+    <text x="616" y="400" class="rd" font-style="italic">Proven by 51 crash points +</text>
+    <text x="616" y="414" class="rd" font-style="italic">a randomized property test.</text>
+  </g>
+
+  <line x1="294" y1="234" x2="304" y2="150" stroke="#9aa7b6" stroke-width="1.4" marker-end="url(#arr3)"/>
+  <line x1="574" y1="150" x2="584" y2="130" stroke="#9aa7b6" stroke-width="1.4" marker-end="url(#arr3)"/>
+</svg>
+<div class="figcap">Figure 3 — Recovery starts at the control file (D3) and runs read → analyze → redo →
+undo → flush. Every redo record is idempotent; ownership in user-txn undo is derived from the
+tuple bytes (xmin/xmax), not a WAL field.</div>
+</div>
+
+<h3>4.3 Crash-injection matrix (D7)</h3>
+<p>51 named kill points as of the current build, plus a randomized property test run under
+both durability policies. Crash coverage is a delivery criterion, not an afterthought — every
+storage-touching change adds points. Representative invariants:</p>
+<table>
+<tr><th>Point</th><th>Kill site</th><th>Invariant proven</th></tr>
+<tr><td>P1 / P5</td><td>WAL fsynced, page not flushed</td><td>redo restores the committed row</td></tr>
+<tr><td>P11</td><td>genuine torn page on disk</td><td>FPI base + incremental redo restores both rows</td></tr>
+<tr><td>P12</td><td>fsync fault (WAL commit + data msync)</td><td>refuses success; poisons; keeps failing</td></tr>
+<tr><td>P13</td><td><code>data.db</code> wiped entirely</td><td>B-tree rebuilt from <code>WAL_INDEX</code> images alone</td></tr>
+<tr><td>P74 / P_xhot</td><td>crash mid batch / cross-page HOT update</td><td>committed batch survives; incomplete txn leaves originals visible</td></tr>
+<tr><td>prop</td><td>random ops + random crash points, both policies</td><td>recovered DB = exactly the durably-committed txns</td></tr>
+</table>
+
+<!-- ============================== 5. TXN ============================== -->
+<h2 id="txn" class="pageblock">5. Transactions, MVCC &amp; isolation</h2>
+<p>A snapshot is <code>{xmin, xmax, frozen active set}</code>. Read Committed recomputes it per
+statement; Repeatable Read and Serializable clone the BEGIN-time snapshot — the entire
+difference between isolation levels, over one visibility code path.</p>
+
+<div class="figure">
+<svg viewBox="0 0 880 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="MVCC snapshot visibility">
+  <defs>
+    <style>
+      .vh { font: 700 11px "Segoe UI",Arial,sans-serif; fill:#0f2c48; }
+      .vt { font: 400 9.5px "Segoe UI",Arial,sans-serif; fill:#5a6b7c; }
+      .vm { font: 600 9.5px "SFMono-Regular",Consolas,monospace; }
+    </style>
+  </defs>
+  <rect x="4" y="4" width="872" height="392" rx="14" fill="#fbfcfd" stroke="#e3e8ee"/>
+
+  <!-- snapshot definition card -->
+  <rect x="24" y="26" width="300" height="140" rx="10" fill="#fdf5e8" stroke="#ecdcbf"/>
+  <text x="40" y="50" class="vh" fill="#b9791a">Snapshot (frozen at construction)</text>
+  <text x="40" y="76" class="vm" fill="#8a5a12">xmin</text><text x="86" y="76" class="vt">smallest active xid</text>
+  <text x="40" y="98" class="vm" fill="#8a5a12">xmax</text><text x="86" y="98" class="vt">next_xid — the "future" fence</text>
+  <text x="40" y="120" class="vm" fill="#8a5a12">active_xids</text><text x="130" y="120" class="vt">frozen set (RR/SSI stability)</text>
+  <text x="40" y="148" class="vt" font-style="italic">RC: new per statement · RR/SSI: per txn</text>
+
+  <!-- version chain -->
+  <text x="360" y="46" class="vh">Backward version chain (one row, three versions)</text>
+  <g>
+    <rect x="360" y="60" width="140" height="66" rx="8" fill="#ffffff" stroke="#e3e8ee"/>
+    <text x="374" y="82" class="vm" fill="#143a5c">xmin=10</text>
+    <text x="374" y="102" class="vm" fill="#143a5c">xmax=25</text>
+    <text x="374" y="119" class="vt">superseded</text>
+    <rect x="530" y="60" width="140" height="66" rx="8" fill="#ffffff" stroke="#e3e8ee"/>
+    <text x="544" y="82" class="vm" fill="#143a5c">xmin=25</text>
+    <text x="544" y="102" class="vm" fill="#143a5c">xmax=40</text>
+    <text x="544" y="119" class="vt">superseded</text>
+    <rect x="700" y="60" width="150" height="66" rx="8" fill="#eef8f1" stroke="#bfe3cd"/>
+    <text x="714" y="82" class="vm" fill="#1c6b58">xmin=40</text>
+    <text x="714" y="102" class="vm" fill="#1c6b58">xmax=0</text>
+    <text x="714" y="119" class="vt" fill="#1c6b58">live tip</text>
+    <!-- prev pointers -->
+    <line x1="530" y1="93" x2="500" y2="93" stroke="#9aa7b6" stroke-width="1.4" marker-end="url(#arr3)"/>
+    <line x1="700" y1="93" x2="670" y2="93" stroke="#9aa7b6" stroke-width="1.4" marker-end="url(#arr3)"/>
+    <text x="605" y="150" class="vt" text-anchor="middle" font-style="italic">prev_page / prev_slot — heap.get never walks forward; the B-tree is the only forward resolver</text>
+  </g>
+
+  <!-- visibility rule -->
+  <rect x="24" y="188" width="826" height="94" rx="10" fill="#eef3fc" stroke="#d5e2f5"/>
+  <text x="40" y="212" class="vh" fill="#2c56a8">is_visible(tuple, snapshot, self_xid)</text>
+  <text x="40" y="236" class="vt">inserter visible = <tspan class="vm" fill="#2c56a8">xmin == self_xid</tspan> OR committed-at-snapshot(xmin) &#160;→ else invisible</text>
+  <text x="40" y="256" class="vt">if <tspan class="vm" fill="#2c56a8">xmax == 0</tspan> → visible (live tip); else deleter visible = <tspan class="vm" fill="#2c56a8">xmax == self_xid</tspan> OR committed(xmax)</text>
+  <text x="40" y="274" class="vt">visible &#8660; deleter NOT visible &#160;·&#160; there is <tspan font-weight="700">no "aborted" tuple state</tspan> — aborts are physically undone</text>
+
+  <!-- isolation table strip -->
+  <rect x="24" y="300" width="264" height="80" rx="9" fill="#ffffff" stroke="#e3e8ee"/>
+  <text x="40" y="322" class="vh">Read Committed (default)</text>
+  <text x="40" y="342" class="vt">fresh snapshot per statement</text>
+  <text x="40" y="360" class="vt">write-write → WriteConflict (no-wait)</text>
+  <rect x="308" y="300" width="264" height="80" rx="9" fill="#ffffff" stroke="#e3e8ee"/>
+  <text x="324" y="322" class="vh">Repeatable Read (SI)</text>
+  <text x="324" y="342" class="vt">snapshot fixed at BEGIN</text>
+  <text x="324" y="360" class="vt">first-committer-wins; SerializationFailure</text>
+  <rect x="592" y="300" width="258" height="80" rx="9" fill="#ffffff" stroke="#e3e8ee"/>
+  <text x="608" y="322" class="vh">Serializable (SSI)</text>
+  <text x="608" y="342" class="vt">reduced Cahill; rw-antidependency</text>
+  <text x="608" y="360" class="vt">pivot aborts before leaving active set</text>
+</svg>
+<div class="figcap">Figure 4 — MVCC visibility. A non-zero on-disk <code>xmax</code> always denotes a
+<i>committed</i> deleter (aborts are physically undone), which is what makes both visibility
+and vacuum reclaimability sound.</div>
+</div>
+
+<h3>5.1 Bulk lock elision (item 88)</h3>
+<p>For batch DML, stamping <code>xmax = xid</code> under the page latch <b>is</b> the ownership
+claim — a concurrent writer sees <code>xmax != 0</code> and raises <code>WriteConflict</code>,
+so a separate lock-table entry is redundant. Elision drops lock-table mutex acquisitions from
+O(rows) to O(1) per batch (~50,000 round-trips saved at 50k rows). Undo still runs per-row.
+The gate: valid only under a single xid with every <code>xmax == 0</code> check already done
+atomically under the latch before stamping.</p>
+
+<h3>5.2 Vacuum &amp; the index-aliasing gate</h3>
+<p>Vacuum gathers index keys <i>first</i> (tuple bytes are only readable while live), marks
+versions DEAD, then <b>scrubs every reclaimed RowId from all secondary indexes before</b>
+compacting DEAD → UNUSED. This gate is the single most important correctness step: a stale
+<code>(page, slot)</code> entry is harmless only while slots are never reused; the moment a
+slot is reused, a stale entry could resolve to a live, MVCC-visible, semantically wrong row.
+<code>WAL_VACUUM</code> is redo-only and idempotent, so a crash anywhere inside vacuum
+recovers cleanly.</p>
+
+<!-- ============================== 6. ENGINES ============================== -->
+<h2 id="engines" class="pageblock">6. Query, indexing, vector, graph &amp; events</h2>
+
+<h3>6.1 SQL query engine</h3>
+<p>Parse → <code>LogicalPlan</code> → optimizer → executors. A <b>1,024-entry plan cache</b>
+keyed by <code>(sql_hash, schema_epoch)</code> parses each unique statement once (schema DDL
+bumps the epoch to invalidate). <b>O(1) COUNT(*)</b> reads a maintained catalog
+<code>row_count</code> (bypassed for RLS-protected tables, which must count visible rows).
+GROUP BY pushes partial aggregates into parallel scan workers. Statements are mini-txns;
+<code>POST /batch-sql</code> runs up to 256 statements per round-trip.</p>
+
+<h3>6.2 Indexing — one DiskBTree, many roles</h3>
+<p>A right-linked B-tree over standard 8 KiB pages backs SQL indexes, full-text postings,
+vector postings, edge adjacency, and the heap FSM. Reads are latch-free; a stable meta-page id
+means no rebuild on open. Writes are redo-only full-node <code>WAL_INDEX</code> images, with a
+logical <code>WAL_INDEX_INSERT</code> for non-splitting leaves; <code>CREATE INDEX</code> uses
+sort-then-bulk-load (one mini-txn), and batch DML coalesces leaf writes.</p>
+
+<h3>6.3 Vector engine (HNSW)</h3>
+<p>The production index is an on-disk HNSW graph on standard pages. Query cost is dominated by
+per-hop node access, not the transaction wrapper — so the levers are caching and compute: an
+<b>L0 neighbour-list cache</b> and a <b>vector hot cache</b> (both prefetched after
+<code>CREATE INDEX</code>), zero-copy distance on cache hits, and an 8-lane SIMD-friendly
+distance accumulator. Warm NEAR latency at 10k×dim128 improved ~11× to ~2.38 ms; every index
+read still re-validates candidates against the caller's MVCC snapshot.</p>
+
+<h3>6.4 Graph engine</h3>
+<p>Edges are <code>(from_id, to_id, edge_type, props)</code> rows in the <code>__edges__</code>
+system table with an adjacency <code>DiskBTree</code> by <code>from_id</code>; a Cypher subset
+queries them. Full MVCC/SQL comes for free; the index is a hint that MVCC re-validates. Per-edge
+locking is automatic because lock keys are globally unique across the shared page pool.</p>
+
+<h3>6.5 Event queue</h3>
+<p>Events are rows in <code>__events__</code> captured <b>synchronously under the writer's
+xid</b>, so an event's fate is tied to its transaction — zero new abort-path code. Consumers
+track Kafka-style durable offsets; SSE subscriptions deliver sub-millisecond to idle
+subscribers. Because the queue is WAL-durable and executor-captured, the slim physical DML
+records (e.g. batch xmax) never need to reconstruct row content for a consumer.</p>
+
+<!-- ============================== 7. PERF ============================== -->
+<h2 id="perf" class="pageblock">7. Performance snapshot</h2>
+<p>Numbers come from shipped benchmark runs (100k rows, matched durability, real fsync on
+Linux); they are recorded, never invented. CRUD is benchmarked against Postgres for context —
+the headline claim is the multi-model one-commit path, not single-table CRUD.</p>
+<table>
+<tr><th>Operation</th><th>unidb</th><th>vs Postgres</th><th>Note</th></tr>
+<tr><td>DELETE all (truncate fast path)</td><td>27.2M rec/s</td><td><b>8.0× faster</b></td><td>O(pages) truncate vs per-row stamp</td></tr>
+<tr><td>SELECT COUNT(*)</td><td>317M rec/s</td><td><b>6.8× faster</b></td><td>maintained catalog row_count</td></tr>
+<tr><td>SELECT GROUP BY</td><td>24.7M rec/s</td><td><b>1.4× faster</b></td><td>parallel partial aggregates</td></tr>
+<tr><td>DELETE selected</td><td>2.52M rec/s</td><td>0.81× (19% behind)</td><td>within target band</td></tr>
+<tr><td>UPDATE (HOT-eligible)</td><td>453k rec/s</td><td>0.62× (38% behind)</td><td>CRC-boundary + fill-page cursor path</td></tr>
+<tr><td>UPDATE (indexed column)</td><td>346k rec/s</td><td>0.42×</td><td>B-tree maintenance bound</td></tr>
+<tr><td>Multi-model commit (4 writes)</td><td>~4.40 ms</td><td>—</td><td>one fsync vs a 4-system stack's four</td></tr>
+</table>
+<div class="callout good">
+<b>Where the architecture wins outright:</b> large scans, counts, aggregates, and bulk
+truncation (1.4–8×), plus the structural multi-model advantage no single-engine tuning can
+replicate — one WAL, one commit, cross-model atomicity.
+</div>
+
+<!-- ============================== 8. TRUST ============================== -->
+<h2 id="trust">8. Trust &amp; failure model</h2>
+<ul>
+<li><b>Every page read is CRC-checked</b> (fresh all-zero pages excepted); every WAL record is
+CRC-checked; the control file is CRC-checked and is the single source of recovery truth (D3).</li>
+<li><b>D5 — WAL-before-page</b> is <i>the</i> invariant: no dirty page may be flushed or
+evicted while <code>page.LSN &gt; durable_WAL_LSN</code>. Enforced at the eviction gate,
+re-checked at flush, guarded by a debug tripwire.</li>
+<li><b>fsync failure is fatal for the session</b> — poisons the WAL/pool permanently; recovery
+via restart, never in-session retry.</li>
+<li><b>Secondary indexes are hints, not truth.</b> Every index read re-validates candidates
+against the caller's MVCC snapshot; stale entries are harmless, missing entries are prevented
+by WAL-ordering, slot reuse is gated by vacuum's index scrub.</li>
+<li><b>Scope discipline:</b> single-primary only (no distributed consensus), a practical SQL
+subset (not full ANSI), no cloud control plane. Every generalization costs throughput a
+specialized engine wouldn't pay.</li>
+</ul>
+
+<!-- ============================== 9. GLOSSARY ============================== -->
+<h2 id="glossary">9. Glossary</h2>
+<table>
+<tr><th>Term</th><th>Meaning</th></tr>
+<tr><td>ARIES</td><td>Algorithm for Recovery and Isolation Exploiting Semantics — the redo/undo, WAL, steal + no-force recovery model unidb follows.</td></tr>
+<tr><td>CRC32</td><td>Cyclic redundancy check on every page and WAL record; detects torn writes and corruption.</td></tr>
+<tr><td>D1…D13</td><td>Locked design decisions (see <code>CLAUDE.md §3</code>). D5 = WAL-before-page; D3 = control file as recovery root.</td></tr>
+<tr><td>FPI</td><td>Full-Page Image — a whole clean page logged on its first write after a checkpoint, for torn-page repair.</td></tr>
+<tr><td>FSM</td><td>Free-Space Map — the durable <code>page_id → free_bytes</code> DiskBTree that gives O(1) heap open.</td></tr>
+<tr><td>HNSW</td><td>Hierarchical Navigable Small World — the graph index behind vector similarity search.</td></tr>
+<tr><td>HOT</td><td>Heap-Only Tuple — an UPDATE that chains a new version without touching the B-tree (no indexed column changed).</td></tr>
+<tr><td>LSN</td><td>Log Sequence Number — monotonic WAL position; gates redo idempotence and the D5 frontier.</td></tr>
+<tr><td>MVCC</td><td>Multi-Version Concurrency Control — readers see a consistent snapshot without blocking writers.</td></tr>
+<tr><td>RC / RR / SSI</td><td>Read Committed / Repeatable Read / Serializable Snapshot Isolation — the three isolation levels.</td></tr>
+<tr><td>SSE</td><td>Server-Sent Events — the push transport for event-queue subscriptions.</td></tr>
+<tr><td>WAL</td><td>Write-Ahead Log — the durable redo+undo record stream; the source of crash recovery and replication.</td></tr>
+<tr><td>xmin / xmax</td><td>Tuple header fields: the inserting and deleting/superseding transaction ids; <code>xmax = 0</code> means live.</td></tr>
+</table>
+
+<hr class="divider"/>
+<p class="small">unidb — Design &amp; Architecture (engineering reference). Distilled from the
+<code>docs/design/processing-engines/</code> collection; when this document and
+<code>CLAUDE.md</code>/<code>PROGRESS.md</code> disagree, those win. Regeneration notes:
+<code>docs/design/unidb_design_architecture_context.md</code>.</p>
+
+</body>
+</html>

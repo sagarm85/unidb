@@ -79,6 +79,7 @@ retrofit trap this architecture explicitly avoided.
 ## 4.3 Lock manager (`lockmgr.rs`)
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 flowchart LR
     A["acquire(xid, rec, mode, policy)"] --> B{grantable?}
     B -->|yes| G[grant + notify_all]
@@ -129,6 +130,7 @@ register their snapshot's xmin under a `#[must_use]` RAII `ReadRegistration`
 (deregistered on Drop). Replication slots hold the horizon back too.
 
 ```mermaid
+%%{init: {"theme":"base","themeVariables":{"primaryColor":"#eef3fc","primaryTextColor":"#1f2a37","primaryBorderColor":"#3b6fd4","lineColor":"#7f8c9b","secondaryColor":"#eef7f1","secondaryBorderColor":"#2f9e5f","tertiaryColor":"#fdf5e8","tertiaryBorderColor":"#d98b1f","fontFamily":"Segoe UI, Arial, sans-serif","fontSize":"14px","clusterBkg":"#f7fafc","clusterBorder":"#dce4ec"}}}%%
 flowchart TB
     A["1 · collect_reclaimable(horizon)<br/>physical scan; xmax committed below horizon"]
     B["2 · gather index keys FIRST<br/>(tuple bytes only readable while LIVE)"]
