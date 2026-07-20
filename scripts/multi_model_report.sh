@@ -31,6 +31,24 @@
 #               Without this flag only the conservative PG-only proxy runs.
 #   REDPANDA_ADDR  Redpanda/Kafka bootstrap address for Table 4.1
 #               (default localhost:9092)
+#
+# ── Table-selection knobs (speed up per-item bench runs) ──────────────────────
+#   MM_TABLES=1,2,3   allowlist — run ONLY these tables (empty = all tables).
+#                     Example: MM_TABLES=3 runs only Table 3 CRUD stress (~15 min).
+#   MM_SKIP_TABLE4=1  skip Table 4 + 4.1 (HNSW at-scale, ~45 min at 100k rows).
+#                     Use when the change does not touch vector/HNSW code.
+#   MM_SKIP_TABLE5=1  skip Table 5 (FK relational-integrity stress, ~5–10 min).
+#                     Use when the change does not touch FK enforcement code.
+#
+# Per-item quick profiles (combine MM_SIZES=100000 for fastest single-table run):
+#   WAL / commit / B-tree / CRUD items:
+#       MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1 scripts/report.sh --docker
+#   Vector / HNSW items:
+#       scripts/report.sh --docker                     (run everything — Table 4 is the signal)
+#   Group-commit item (101) — concurrent INSERT only:
+#       MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1 MM_SIZES=100000 scripts/report.sh --docker
+#   Full historical baseline comparison:
+#       scripts/report.sh --docker                     (no flags — run everything)
 #   UNIDB_BUFFER_POOL_PAGES  frames for every unidb engine THIS BENCH opens
 #               (default 2,000,000 -- set internally by bench_engine_open() in
 #               decompose.rs, not the library's own smaller default). Only
@@ -86,6 +104,9 @@ SIZES_SHOWN="${MM_SIZES:-1000,10000,100000}"
 SAMPLE_SHOWN="${MM_SAMPLE:-200}"
 PG_SHOWN="$([[ -n "${PG_URL:-}" ]] && echo 'set (Postgres column measured)' || echo 'unset (Postgres column skipped)')"
 REALISTIC_SHOWN="$([[ "${MM_REPLACED_STACK_REALISTIC:-}" == "1" ]] && echo 'set (Table 4.1 realistic stack measured)' || echo 'unset (Table 4.1 skipped)')"
+TABLE4_SHOWN="$([[ "${MM_SKIP_TABLE4:-}" == "1" ]] && echo 'SKIPPED (MM_SKIP_TABLE4=1)' || ( [[ -n "${MM_TABLES:-}" ]] && echo "${MM_TABLES}" | grep -q '4' && echo "included (MM_TABLES=${MM_TABLES})" || echo 'measured' ))"
+TABLE5_SHOWN="$([[ "${MM_SKIP_TABLE5:-}" == "1" ]] && echo 'SKIPPED (MM_SKIP_TABLE5=1)' || echo 'measured')"
+TABLES_SHOWN="$([[ -n "${MM_TABLES:-}" ]] && echo "allowlist: ${MM_TABLES}" || echo 'all')"
 
 BODY="$(mktemp)"; TIMEFILE="$(mktemp)"
 trap 'rm -f "$BODY" "$TIMEFILE"' EXIT
@@ -132,8 +153,11 @@ TIME_TAKEN="$(awk -v s="$ELAPSED_SECS" 'BEGIN{
   echo "| Marginal sample | $SAMPLE_SHOWN commits/point |"
   echo "| Postgres | $PG_SHOWN |"
   echo "| Realistic stack (Table 4.1) | $REALISTIC_SHOWN |"
+  echo "| Tables run | $TABLES_SHOWN |"
+  echo "| Table 4 + 4.1 (HNSW) | $TABLE4_SHOWN |"
+  echo "| Table 5 (FK stress) | $TABLE5_SHOWN |"
   echo "| Peak RSS | $RSS_MIB |"
-  echo "| Time taken | $TIME_TAKEN (build + Tables 1-5; excludes the concurrency matrix appended below, timed separately) |"
+  echo "| Time taken | $TIME_TAKEN (build + selected tables; excludes the concurrency matrix appended below, timed separately) |"
   echo
   echo "---"
   echo
