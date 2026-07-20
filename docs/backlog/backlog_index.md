@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `103_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `104_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -107,15 +107,14 @@
 | 97 | `97_count_star_statistics.md` | Performance | ✅ SHIPPED 2026-07-19 (PR #161) — `row_count: i64` in `TableDef`; maintained on INSERT/DELETE/TRUNCATE; O(1) COUNT(*) fast path; FORMAT_VERSION 10→11; SELECT COUNT(*) 6.93× vs PG. See PROGRESS.md "Item 97". |
 | 98 | `98_sql_insert_throughput.md` | Performance | ✅ SHIPPED 2026-07-19 (PR #157+#159) — `InsertAccum` streaming accumulation: one WAL_BEGIN+COMMIT per VALUES statement; UNIQUE enforcement preserved (per-row index before next row validate). See PROGRESS.md "Item 98". |
 | 99 | `99_batch_sql_endpoint.md` | Performance | ✅ SHIPPED 2026-07-19 (PR #162) — `POST /batch-sql`; up to 256 stmts per request; stop_on_error flag; per-statement auth; 400 BATCH_TOO_LARGE. Projects compare.py 109ms→~16ms (15.7×→~2.3×). See PROGRESS.md "Item 99". |
-| 100 | `100_dev_login_whoami.md` | Improvement | ⏳ NOT STARTED — `POST /auth/login {username}` (dev-only, `UNIDB_DEV_LOGIN=1` gate, issues short-lived JWT; respects the M18 verify-only locked decision) + `GET /auth/whoami` (roles + per-table privileges). Closes the "users log in by username, then RLS filters their data" gap; RLS half is item 24. Server-only, zero engine-path cost. |
-
 | 100 | `100_dev_login_whoami.md` | Improvement | ✅ SHIPPED 2026-07-20 (PR #168) — GET /auth/meta + POST /auth/login (UNIDB_DEV_LOGIN=1) + GET /auth/whoami; R-a UPDATE WITH CHECK + R-b enforced column also in same PR. See PROGRESS.md "Item 100". |
 | 101 | `101_group_commit.md` | Performance | ✅ SHIPPED 2026-07-20 (PR #170) — group-commit dwell window in WAL `sync_up_to`; `PUT /config/group_commit_window_us`; `Engine::wal_fsyncs_count()`. |
 | 102 | `102_index_only_scan.md` | Performance | 🔄 Phase A SHIPPED 2026-07-20 (PR #169) — skip `deform_row` for key-col projection; `IDX_ONLY_ROWS` counter; heap.get() still needed for MVCC visibility. Phase B (covering index) pending. |
+| 103 | `103_authz_v2_studio_integration_gaps.md` | Improvement | ⏳ NOT STARTED — superuser/no-`sub` callers silently return empty rows when `current_user` RLS policies exist (bypass never fires); stale `CREATE ROLE … SUPERUSER` doc example; missing `role_members`/`users` in catalog paragraph. Re-confirmed live post PR #168. |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `103_…`.**
+**Next new file → `104_…`.**
 
 ## Next up — priority order (2026-07-20, post PR #171 merge)
 
