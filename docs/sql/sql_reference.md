@@ -67,7 +67,7 @@ paths:
 
 | Command | Status | Notes |
 |---|---|---|
-| `SELECT` (`WHERE`, `JOIN … USING`, `GROUP BY`, `ORDER BY`, aggregates) | ✅ Supported | `ORDER BY` takes an output-column name or 1-based position (not arbitrary expressions yet) |
+| `SELECT` (`WHERE`, `JOIN … USING`, `GROUP BY`, `ORDER BY`, aggregates) | ✅ Supported | `ORDER BY` accepts output columns, 1-based positions, and non-projected expressions (G4) |
 | `INSERT` / `UPDATE` / `DELETE` (+ `RETURNING`) | ✅ Supported | multi-row `VALUES`; batched WAL |
 | `CREATE TABLE` (`PRIMARY KEY`, `UNIQUE`, `REFERENCES`, `VECTOR(n)`) | ✅ Supported | practical column-constraint subset |
 | `CREATE INDEX … USING BTREE \| HNSW \| FULLTEXT` | ✅ Supported | HNSW = vector; FULLTEXT = inverted index |
@@ -75,8 +75,14 @@ paths:
 | `NEAR(col, vec, k)` vector search · `MATCH(col, 'terms')` full-text | ✅ Supported | engine extensions |
 | `MATCH (a)-[:TYPE]->(b) … RETURN` | ✅ Supported (read-only, Cypher subset) | via `execute_cypher`; edges written via the embedded `create_edge` API |
 | `CREATE USER/ROLE`, `GRANT/REVOKE`, `CREATE POLICY` (RLS, incl. `WITH CHECK`) | ✅ Supported | via `execute_sql_as` / REST auth |
-| `IS NULL` / `LIKE` on the row path under `NEAR` | ⚠️ Partial (gap G10) | see `docs/backlog/19_sql_surface_gaps.md` |
-| Subqueries, CTEs (`WITH`), window functions, `HAVING`, full ANSI DDL | ❌ Not yet | tracked in `19_sql_surface_gaps.md` |
+| `IS NULL` / `IS NOT NULL` | ✅ Supported | G10 shipped |
+| `CAST(expr AS type)` | ✅ Supported | G2-cast shipped; handles INT/FLOAT/TEXT/BOOL, NULL propagation |
+| `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT` (+ chained set-ops) | ✅ Supported | G3 shipped |
+| `FROM (SELECT …) AS alias` derived tables | ✅ Supported | G6 shipped; RLS applies inside |
+| `IN (subquery)` / `NOT IN (subquery)` / `EXISTS` / scalar subquery | ✅ Supported | P4.c shipped; RLS applies inside WHERE-clause subqueries |
+| Window functions (`ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD`, `SUM`, `AVG`, `COUNT`, `MIN`, `MAX`) `OVER (PARTITION BY … ORDER BY …)` | ✅ Supported | G7 shipped; whole-partition frame only; cumulative frames are a follow-up |
+| `LIKE` / `NOT LIKE` / `ILIKE` | ✅ Supported | delivered under item 30 |
+| CTEs (`WITH`), recursive CTEs, frame-based window functions, `FULL OUTER JOIN`, `NATURAL JOIN` | ❌ Not yet | tracked in `19_sql_surface_gaps.md` |
 
 ---
 
