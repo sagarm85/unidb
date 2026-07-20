@@ -25,6 +25,7 @@ use crate::{
 use super::logical::{ArithOp, CmpOp, Expr, Literal, LogicalPlan, SetOpKind};
 use super::query::{
     AggFunc, CastTarget, FromNode, JoinType, OrderKey, Projection, QExpr, QuerySpec, TableRef,
+    WindowFunc, WindowSpec,
 };
 
 /// Parse a SQL string (possibly multiple `;`-separated statements) into
@@ -1003,6 +1004,11 @@ fn expr_has_case_expr(e: &SqlExpr) -> bool {
         // G2 (item 19): CAST is a QExpr-only variant; route to Phase-4.
         SqlExpr::Cast { .. } => true,
         SqlExpr::Function(f) => {
+            // G7 (item 19): any function with an OVER clause is a window function;
+            // route to Phase-4 so the materialise→partition→compute executor is used.
+            if f.over.is_some() {
+                return true;
+            }
             let name = f.name.to_string().to_uppercase();
             name == "COALESCE" || name == "NULLIF"
         }
@@ -1352,6 +1358,11 @@ fn convert_qexpr(e: &SqlExpr) -> Result<QExpr> {
         SqlExpr::Function(func) if func.name.to_string().eq_ignore_ascii_case("nullif") => {
             convert_nullif_qexpr(func)
         }
+        // G7 (item 19): window functions — any function call with an OVER clause.
+        // Must be matched before the generic `convert_aggregate` fallthrough since
+        // aggregate functions (SUM/AVG/COUNT/MIN/MAX) are also valid window functions
+        // when combined with OVER.
+        SqlExpr::Function(f) if f.over.is_some() => convert_window_qexpr(f),
         SqlExpr::Function(f) => convert_aggregate(f),
         SqlExpr::Exists { subquery, negated } => Ok(QExpr::Exists {
             subquery: Box::new(query_to_spec((**subquery).clone())?),
@@ -1521,6 +1532,172 @@ fn convert_nullif_qexpr(func: &ast::Function) -> Result<QExpr> {
         lhs: Box::new(lhs),
         rhs: Box::new(rhs),
     })
+}
+
+/// Convert a window function call (`func OVER (PARTITION BY … ORDER BY …)`) into a
+/// [`QExpr::Window`] (G7, item 19). Called when the function has `f.over.is_some()`.
+///
+/// Supported functions: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG`, `LEAD`,
+/// `SUM`, `AVG`, `COUNT`, `MIN`, `MAX`.
+///
+/// Only inline `WindowSpec` is supported (no named-window references in v1).
+fn convert_window_qexpr(f: &ast::Function) -> Result<QExpr> {
+    use sqlparser::ast::WindowType;
+
+    // Reject FILTER / WITHIN GROUP; only OVER is handled here.
+    if f.filter.is_some() || !f.within_group.is_empty() {
+        return Err(DbError::SqlUnsupported(
+            "FILTER / WITHIN GROUP on window functions is not supported".into(),
+        ));
+    }
+
+    // Extract the inline WindowSpec.
+    let wspec = match f.over.as_ref() {
+        Some(WindowType::WindowSpec(ws)) => ws,
+        Some(WindowType::NamedWindow(name)) => {
+            return Err(DbError::SqlUnsupported(format!(
+                "named window references (OVER {name}) are not supported in v1; use inline OVER (…)"
+            )))
+        }
+        None => unreachable!("called only when f.over.is_some()"),
+    };
+
+    // Convert PARTITION BY and ORDER BY.
+    let partition_by = wspec
+        .partition_by
+        .iter()
+        .map(convert_qexpr)
+        .collect::<Result<Vec<_>>>()?;
+    let order_by = wspec
+        .order_by
+        .iter()
+        .map(|ob| {
+            let expr = convert_qexpr(&ob.expr)?;
+            let asc = ob.options.asc.unwrap_or(true);
+            Ok((expr, asc))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let over = WindowSpec {
+        partition_by,
+        order_by,
+    };
+
+    let name_upper = f.name.to_string().to_uppercase();
+
+    // Map function name → WindowFunc variant.
+    let func = match name_upper.as_str() {
+        "ROW_NUMBER" => WindowFunc::RowNumber,
+        "RANK" => WindowFunc::Rank,
+        "DENSE_RANK" => WindowFunc::DenseRank,
+        "LAG" | "LEAD" => {
+            let args = match &f.args {
+                ast::FunctionArguments::List(list) => &list.args,
+                _ => {
+                    return Err(DbError::SqlUnsupported(format!(
+                        "{name_upper} requires at least one argument"
+                    )))
+                }
+            };
+            if args.is_empty() || args.len() > 2 {
+                return Err(DbError::SqlUnsupported(format!(
+                    "{name_upper} takes 1 or 2 arguments: {name_upper}(expr [, offset])"
+                )));
+            }
+            let expr = match &args[0] {
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => convert_qexpr(e)?,
+                other => {
+                    return Err(DbError::SqlUnsupported(format!(
+                        "unsupported {name_upper} argument: {other:?}"
+                    )))
+                }
+            };
+            let offset: i64 = if args.len() == 2 {
+                match &args[1] {
+                    ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(
+                        SqlExpr::Value(vws),
+                    )) => match &vws.value {
+                        Value::Number(s, _) => s.parse::<i64>().map_err(|_| {
+                            DbError::SqlUnsupported(format!(
+                                "{name_upper} offset must be a non-negative integer, got: {s}"
+                            ))
+                        })?,
+                        other => {
+                            return Err(DbError::SqlUnsupported(format!(
+                                "{name_upper} offset must be a non-negative integer literal, got: {other:?}"
+                            )))
+                        }
+                    },
+                    other => {
+                        return Err(DbError::SqlUnsupported(format!(
+                            "unsupported {name_upper} offset argument: {other:?}"
+                        )))
+                    }
+                }
+            } else {
+                1
+            };
+            if name_upper == "LAG" {
+                WindowFunc::Lag(Box::new(expr), offset)
+            } else {
+                WindowFunc::Lead(Box::new(expr), offset)
+            }
+        }
+        "SUM" | "AVG" | "COUNT" | "MIN" | "MAX" => {
+            let args = match &f.args {
+                ast::FunctionArguments::List(list) => &list.args,
+                _ => {
+                    return Err(DbError::SqlUnsupported(format!(
+                        "{name_upper} OVER requires arguments"
+                    )))
+                }
+            };
+            if name_upper == "COUNT" {
+                // COUNT(*) OVER — wildcard arg maps to WindowFunc::Count (no expr arg).
+                if args.len() == 1 {
+                    if let ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard) = &args[0] {
+                        return Ok(QExpr::Window {
+                            func: WindowFunc::Count,
+                            over,
+                        });
+                    }
+                }
+                // COUNT(expr) OVER — map to WindowFunc::Count; discard the expr (same
+                // semantics as COUNT(*) for non-NULL counting in v1).
+                return Ok(QExpr::Window {
+                    func: WindowFunc::Count,
+                    over,
+                });
+            }
+            if args.len() != 1 {
+                return Err(DbError::SqlUnsupported(format!(
+                    "{name_upper} OVER takes exactly one argument"
+                )));
+            }
+            let expr = match &args[0] {
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => convert_qexpr(e)?,
+                other => {
+                    return Err(DbError::SqlUnsupported(format!(
+                        "unsupported {name_upper} OVER argument: {other:?}"
+                    )))
+                }
+            };
+            match name_upper.as_str() {
+                "SUM" => WindowFunc::Sum(Box::new(expr)),
+                "AVG" => WindowFunc::Avg(Box::new(expr)),
+                "MIN" => WindowFunc::Min(Box::new(expr)),
+                "MAX" => WindowFunc::Max(Box::new(expr)),
+                _ => unreachable!(),
+            }
+        }
+        other => {
+            return Err(DbError::SqlUnsupported(format!(
+                "unsupported window function: {other} OVER (…) \
+                 (supported: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, SUM, AVG, COUNT, MIN, MAX)"
+            )))
+        }
+    };
+
+    Ok(QExpr::Window { func, over })
 }
 
 /// Map a sqlparser [`DataType`] to a [`CastTarget`] (G2, item 19).

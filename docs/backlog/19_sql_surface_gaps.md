@@ -1,7 +1,7 @@
 # SQL surface gaps — unsupported query features
 
 **Type:** Improvement
-**Status:** PARTIAL — G1 (CASE/COALESCE/NULLIF), G2-cast (CAST expressions), G3 (UNION/INTERSECT/EXCEPT), G4 (ORDER BY non-projected col), G5 (RETURNING), G6 (derived table subqueries), G8 (SELECT without FROM), G10 (IS NULL), P4.c IN(subquery)/EXISTS/scalar-subquery predicates SHIPPED (see `PROGRESS.md` item 19). G2-join (FULL OUTER JOIN)/G7/G9/G11/G-NATURAL remain open.
+**Status:** PARTIAL — G1 (CASE/COALESCE/NULLIF), G2-cast (CAST expressions), G3 (UNION/INTERSECT/EXCEPT), G4 (ORDER BY non-projected col), G5 (RETURNING), G6 (derived table subqueries), G7 (window functions, whole-partition frame), G8 (SELECT without FROM), G10 (IS NULL), P4.c IN(subquery)/EXISTS/scalar-subquery predicates SHIPPED (see `PROGRESS.md` item 19). G2-join (FULL OUTER JOIN)/G-NATURAL remain open. Cumulative-frame window functions (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) are a documented follow-up.
 
 > A single tracker for the SQL constructs unidb does **not** support yet, so
 > builders (and future us) have one honest list and each gap has a scope/ROI
@@ -126,15 +126,34 @@ See `PROGRESS.md` "Item 19 — IN(subquery)/EXISTS/scalar subquery predicates".
   names — reuses `plan.rs::plan_using_join` entirely once the shared column set
   is computed from the two schemas. Small. Low ROI.
 
-### G7 — Window functions & recursive CTEs
-- **What:** `OVER (PARTITION BY … ORDER BY …)` window functions; `WITH
-  RECURSIVE`.
+### G7 — Window functions & recursive CTEs **(window functions SHIPPED 2026-07-20)**
+
+**Window functions (shipped):** `OVER (PARTITION BY … ORDER BY …)` with
+whole-partition frame (`ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`).
+
+- **Supported functions:** `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LAG(expr, n)`,
+  `LEAD(expr, n)`, `SUM(expr)`, `AVG(expr)`, `COUNT(*)`, `MIN(expr)`, `MAX(expr)`.
+- **Frame semantics:** whole-partition only. Cumulative frames
+  (`ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`) are a documented follow-up.
+- **Scope:** `WindowFunc` + `WindowSpec` + `QExpr::Window` in `query.rs`;
+  parser arm `convert_window_qexpr` in `parser.rs`; window detection
+  (`expr_has_case_expr` extended); materialise→partition→sort→compute→augment
+  executor pipeline in `query_exec.rs`; `QExpr::Window` arms added to
+  `optimizer.rs`, `plan.rs` (`validate_expr`, `eval_qexpr`, `collect_aggs`,
+  `rewrite_over_agg`), `query.rs` (`bind_params`, `has_aggregate`, `has_subquery`),
+  `query_exec.rs` (`Runner::eval`, `substitute_correlated`). 14 tests in
+  `tests/item19_window_functions.rs` — all pass. No storage/format impact.
+- **Limitations:** whole-partition frame only; named window references
+  (`OVER window_name`) not supported; `LAG`/`LEAD` offset defaults to 1 when
+  omitted (`LAG(expr)` ≡ `LAG(expr, 1)`); dynamic offset expressions not supported.
+- **Outcome:** see `PROGRESS.md` item 19 G7 entry.
+
+**Recursive CTEs:** `WITH RECURSIVE` — not yet implemented.
 - **Why it matters:** real analytics power, but large and squarely in the
   "OLAP-class, out of scope" bucket CLAUDE.md §1 flags. Non-recursive CTEs and
   ordinary aggregates already cover most needs.
-- **Scope:** **large** — each is its own milestone-sized effort (a window
-  operator with framing; recursive-CTE fixpoint evaluation). File as separate
-  numbered work if/when picked up; not a single-PR improvement.
+- **Scope:** recursive-CTE fixpoint evaluation — file as separate numbered work
+  if/when picked up.
 
 ### G8 — `SELECT` without `FROM` (`SELECT 1`, `SELECT now()`)
 - **What:** a constant/expression-only select. Rejected today

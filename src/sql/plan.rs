@@ -479,6 +479,9 @@ fn collect_aggs(expr: &QExpr, out: &mut Vec<AggCall>) {
             collect_aggs(rhs, out);
         }
         QExpr::Cast { expr, .. } => collect_aggs(expr, out),
+        // G7 (item 19): window functions are not aggregate calls at this level;
+        // they are evaluated post-aggregate by the window executor.
+        QExpr::Window { .. } => {}
     }
 }
 
@@ -622,6 +625,13 @@ fn rewrite_over_agg(expr: &QExpr, group_exprs: &[QExpr], aggs: &[AggCall]) -> Re
         QExpr::Cast { expr, to_type } => Ok(QExpr::Cast {
             expr: Box::new(rewrite_over_agg(expr, group_exprs, aggs)?),
             to_type: *to_type,
+        }),
+        // G7 (item 19): window functions are processed after aggregation; pass through as-is.
+        // A query can have both GROUP BY aggregates and window functions; the window executor
+        // runs over the (already-aggregated) rows.
+        QExpr::Window { func, over } => Ok(QExpr::Window {
+            func: func.clone(),
+            over: over.clone(),
         }),
     }
 }
@@ -1263,6 +1273,29 @@ fn validate_expr(expr: &QExpr, schema: &[ColumnRef]) -> Result<()> {
             validate_expr(rhs, schema)
         }
         QExpr::Cast { expr, .. } => validate_expr(expr, schema),
+        // G7 (item 19): window functions are validated against the pre-window schema
+        // (the scan/join output). Validate the function argument(s) and OVER expressions.
+        QExpr::Window { func, over } => {
+            use crate::sql::query::WindowFunc;
+            match func {
+                WindowFunc::Lag(e, _) | WindowFunc::Lead(e, _) => validate_expr(e, schema)?,
+                WindowFunc::Sum(e)
+                | WindowFunc::Avg(e)
+                | WindowFunc::Min(e)
+                | WindowFunc::Max(e) => validate_expr(e, schema)?,
+                WindowFunc::RowNumber
+                | WindowFunc::Rank
+                | WindowFunc::DenseRank
+                | WindowFunc::Count => {}
+            }
+            for pb in &over.partition_by {
+                validate_expr(pb, schema)?;
+            }
+            for (ob, _) in &over.order_by {
+                validate_expr(ob, schema)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1451,6 +1484,14 @@ pub fn eval_qexpr(expr: &QExpr, schema: &[ColumnRef], row: &[Literal]) -> Result
             let val = eval_qexpr(expr, schema, row)?;
             eval_cast(val, *to_type)
         }
+        // G7 (item 19): window functions are pre-computed by the window executor
+        // (materialise→partition→compute) and never reach per-row scalar evaluation.
+        // If one does reach here it is a planner bug.
+        QExpr::Window { .. } => Err(DbError::SqlPlan(
+            "internal: window function reached row-level evaluation; \
+             window functions must be pre-computed by the window executor"
+                .into(),
+        )),
     }
 }
 

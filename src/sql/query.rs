@@ -80,6 +80,49 @@ pub enum AggFunc {
     Max,
 }
 
+/// The window function applied in an `OVER (…)` clause (G7, item 19).
+/// All variants implement whole-partition frame semantics
+/// (`ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`).
+/// Cumulative frames (`ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`)
+/// are a documented follow-up.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum WindowFunc {
+    /// `ROW_NUMBER()` — sequential row number within the partition, starting at 1.
+    RowNumber,
+    /// `RANK()` — rank with gaps for ties (e.g. 1, 1, 3).
+    Rank,
+    /// `DENSE_RANK()` — rank without gaps for ties (e.g. 1, 1, 2).
+    DenseRank,
+    /// `LAG(expr, n)` — value of `expr` from `n` rows before the current row.
+    /// Returns `NULL` when the offset reaches before the start of the partition.
+    Lag(Box<QExpr>, i64),
+    /// `LEAD(expr, n)` — value of `expr` from `n` rows after the current row.
+    /// Returns `NULL` when the offset reaches past the end of the partition.
+    Lead(Box<QExpr>, i64),
+    /// `SUM(expr) OVER (…)` — sum of `expr` over the whole partition.
+    Sum(Box<QExpr>),
+    /// `AVG(expr) OVER (…)` — average of `expr` over the whole partition.
+    Avg(Box<QExpr>),
+    /// `COUNT(*) OVER (…)` — row count of the whole partition.
+    Count,
+    /// `MIN(expr) OVER (…)` — minimum of `expr` over the whole partition.
+    Min(Box<QExpr>),
+    /// `MAX(expr) OVER (…)` — maximum of `expr` over the whole partition.
+    Max(Box<QExpr>),
+}
+
+/// The `OVER (…)` clause that defines the window for a window function (G7, item 19).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowSpec {
+    /// `PARTITION BY` expressions — rows with identical values form one window partition.
+    /// An empty list means the entire result set is one partition.
+    pub partition_by: Vec<QExpr>,
+    /// `ORDER BY` expressions within the window, and direction (`true` = ascending).
+    /// Determines the row ordering used by positional functions (`RANK`, `ROW_NUMBER`,
+    /// `LAG`, `LEAD`). An empty list means no ordering within the partition.
+    pub order_by: Vec<(QExpr, bool)>,
+}
+
 /// One SELECT-list item.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Projection {
@@ -271,6 +314,18 @@ pub enum QExpr {
         expr: Box<QExpr>,
         to_type: CastTarget,
     },
+    /// `<window_func> OVER (PARTITION BY … ORDER BY …)` (G7, item 19).
+    /// Window functions compute per-row values over a set of related rows
+    /// (the "window") without collapsing them into a single output row.
+    /// The whole-partition frame is the only frame supported in v1.
+    ///
+    /// Window functions may only appear in the SELECT projection — using one in
+    /// a WHERE clause returns `SqlUnsupported`. They are evaluated after the
+    /// underlying table scan and any WHERE filter.
+    Window {
+        func: WindowFunc,
+        over: WindowSpec,
+    },
 }
 
 impl QExpr {
@@ -388,6 +443,27 @@ impl QExpr {
                 rhs.bind_params(params)
             }
             QExpr::Cast { expr, .. } => expr.bind_params(params),
+            // G7 (item 19): recurse into window function arguments and OVER expressions.
+            QExpr::Window { func, over } => {
+                match func {
+                    WindowFunc::Lag(e, _) | WindowFunc::Lead(e, _) => e.bind_params(params)?,
+                    WindowFunc::Sum(e)
+                    | WindowFunc::Avg(e)
+                    | WindowFunc::Min(e)
+                    | WindowFunc::Max(e) => e.bind_params(params)?,
+                    WindowFunc::RowNumber
+                    | WindowFunc::Rank
+                    | WindowFunc::DenseRank
+                    | WindowFunc::Count => {}
+                }
+                for pb in &mut over.partition_by {
+                    pb.bind_params(params)?;
+                }
+                for (ob, _) in &mut over.order_by {
+                    ob.bind_params(params)?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -423,6 +499,8 @@ impl QExpr {
             QExpr::Coalesce(args) => args.iter().any(|e| e.has_aggregate()),
             QExpr::Nullif { lhs, rhs } => lhs.has_aggregate() || rhs.has_aggregate(),
             QExpr::Cast { expr, .. } => expr.has_aggregate(),
+            // G7 (item 19): window functions are not aggregate calls at this level.
+            QExpr::Window { .. } => false,
         }
     }
 
@@ -460,7 +538,15 @@ impl QExpr {
             QExpr::Coalesce(args) => args.iter().any(|e| e.has_subquery()),
             QExpr::Nullif { lhs, rhs } => lhs.has_subquery() || rhs.has_subquery(),
             QExpr::Cast { expr, .. } => expr.has_subquery(),
+            // G7 (item 19): window functions are evaluated from a materialized batch;
+            // they do not contain subqueries (the contained expressions reference columns).
+            QExpr::Window { .. } => false,
         }
+    }
+
+    /// Whether this expression is a window function call.
+    pub fn is_window(&self) -> bool {
+        matches!(self, QExpr::Window { .. })
     }
 }
 

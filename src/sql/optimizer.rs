@@ -364,6 +364,14 @@ fn collect_qualifiers(expr: &QExpr, out: &mut std::collections::HashSet<String>)
         }
         // G2 (item 19): CAST — recurse into the inner expression.
         QExpr::Cast { expr, .. } => collect_qualifiers(expr, out),
+        // G7 (item 19): window functions — treat as multi-table / non-pushable.
+        // Window functions are evaluated post-filter, so they never appear in a
+        // WHERE conjunct that could be pushed to a base-table scan. If they somehow
+        // reach the predicate-pushdown logic, mark them as residual.
+        QExpr::Window { .. } => {
+            out.insert(String::new());
+            out.insert("__window__".into());
+        }
     }
 }
 
@@ -622,6 +630,30 @@ fn collect_columns(expr: &QExpr, out: &mut Vec<(Option<String>, String)>) {
         }
         // G2 (item 19): CAST — recurse into the inner expression.
         QExpr::Cast { expr, .. } => collect_columns(expr, out),
+        // G7 (item 19): window functions — collect columns from the function argument(s)
+        // and from PARTITION BY / ORDER BY expressions so the optimizer knows which
+        // columns are referenced. Window functions are evaluated post-filter so they
+        // are never pushed down; their column refs are collected for informational use.
+        QExpr::Window { func, over } => {
+            use crate::sql::query::WindowFunc;
+            match func {
+                WindowFunc::Lag(e, _) | WindowFunc::Lead(e, _) => collect_columns(e, out),
+                WindowFunc::Sum(e)
+                | WindowFunc::Avg(e)
+                | WindowFunc::Min(e)
+                | WindowFunc::Max(e) => collect_columns(e, out),
+                WindowFunc::RowNumber
+                | WindowFunc::Rank
+                | WindowFunc::DenseRank
+                | WindowFunc::Count => {}
+            }
+            for pb in &over.partition_by {
+                collect_columns(pb, out);
+            }
+            for (ob, _) in &over.order_by {
+                collect_columns(ob, out);
+            }
+        }
     }
 }
 

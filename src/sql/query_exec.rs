@@ -38,7 +38,7 @@ use crate::sql::plan::{
     self, eval_cast, eval_qexpr, join_key_bytes, plan_query, resolve_column, Batch, ColumnRef,
     CteSchemas, PlanNode,
 };
-use crate::sql::query::{AggFunc, JoinType, QExpr, QuerySpec};
+use crate::sql::query::{AggFunc, JoinType, QExpr, QuerySpec, WindowFunc};
 
 /// Item 51 Phase B — maximum inner-relation row count before falling back from
 /// the in-memory hash join to the B-tree index-nested-loop join. At this scale
@@ -429,6 +429,13 @@ impl Runner<'_, '_> {
                 output,
             } => {
                 let batch = self.run(input)?;
+                // G7 (item 19): if any projection item is a window function, route to
+                // the materialise→partition→sort→compute→augment→project window pipeline
+                // instead of the plain per-row evaluator.
+                let has_window = items.iter().any(|it| it.expr.is_window());
+                if has_window {
+                    return self.exec_window_projection(&batch, items, output);
+                }
                 let mut rows = Vec::with_capacity(batch.rows.len());
                 for row in &batch.rows {
                     let mut projected = Vec::with_capacity(items.len());
@@ -1350,7 +1357,396 @@ impl Runner<'_, '_> {
             | QExpr::IsNull { .. }
             | QExpr::Aggregate { .. }
             | QExpr::Arith { .. } => eval_qexpr(expr, schema, row),
+            // G7 (item 19): window functions are pre-computed by exec_window_projection
+            // before per-row evaluation is needed; one reaching this point is a planner bug.
+            QExpr::Window { .. } => Err(DbError::SqlPlan(
+                "internal: window function reached per-row evaluation; \
+                 window functions must be pre-computed by the window executor"
+                    .into(),
+            )),
         }
+    }
+
+    /// G7 (item 19): execute the window-function projection pipeline.
+    ///
+    /// Called when at least one `items` entry has `expr.is_window() == true`.
+    ///
+    /// Pipeline (per-window-function):
+    /// 1. Identify which items are window functions and which are plain expressions.
+    /// 2. For each window function, group the input rows into partitions by
+    ///    `PARTITION BY` key(s), then sort within each partition by `ORDER BY` key(s).
+    /// 3. Compute the window function value for every row in every partition.
+    /// 4. Augment each input row with the computed values (as extra columns at the end).
+    /// 5. Project the final output using the augmented schema.
+    ///
+    /// This is a whole-partition frame (ROWS BETWEEN UNBOUNDED PRECEDING AND
+    /// UNBOUNDED FOLLOWING). Cumulative frames are a documented follow-up.
+    fn exec_window_projection(
+        &mut self,
+        input: &Batch,
+        items: &[plan::ProjItem],
+        output: &[ColumnRef],
+    ) -> Result<Batch> {
+        // The augmented schema starts with the input schema and we append one
+        // synthetic column per window function.  The synthetic column is named
+        // `__w{i}` so it never clashes with real column names.
+        let n_input_cols = input.schema.len();
+        let mut augmented_schema = input.schema.clone();
+
+        // We clone the rows so we can append window-computed values in-place.
+        let n_rows = input.rows.len();
+        // augmented_rows[r] starts as input.rows[r].clone(); we'll push values.
+        let mut augmented_rows: Vec<Vec<Literal>> = input.rows.clone();
+
+        // Process each projection item; track which items are windows so we can
+        // build a mapping from window-function index → augmented column index.
+        let mut window_col_indices: Vec<Option<usize>> = vec![None; items.len()];
+        let mut next_window_col = n_input_cols;
+
+        for (item_idx, item) in items.iter().enumerate() {
+            let (func, over) = match &item.expr {
+                QExpr::Window { func, over } => (func, over),
+                _ => continue, // plain expression — handled in the final projection loop
+            };
+
+            // Compute the window column index for this function.
+            let win_col_idx = next_window_col;
+            next_window_col += 1;
+            window_col_indices[item_idx] = Some(win_col_idx);
+
+            // Add a synthetic column to the augmented schema.
+            augmented_schema.push(ColumnRef {
+                qualifier: String::new(),
+                name: format!("__w{item_idx}"),
+                ty: crate::catalog::ColumnType::Text,
+            });
+
+            // --- Step 2: partition rows by PARTITION BY key(s). ---------------
+            // We represent each partition as a list of original row indices so we
+            // can write values back to `augmented_rows` in original row order.
+            let partition_groups: Vec<Vec<usize>> =
+                self.partition_rows(&input.rows, &input.schema, &over.partition_by)?;
+
+            // --- Step 3: for each partition, sort by ORDER BY, compute, write back. ---
+            for group in &partition_groups {
+                // Sort the indices within this partition by the ORDER BY keys.
+                let sorted_indices: Vec<usize> =
+                    self.sort_partition_indices(group, &input.rows, &input.schema, &over.order_by)?;
+
+                let part_len = sorted_indices.len();
+
+                // Pre-compute partition-wide aggregates for SUM/AVG/COUNT/MIN/MAX.
+                let partition_agg: Option<Literal> = match func {
+                    WindowFunc::Sum(expr) => {
+                        let mut acc = Literal::Null;
+                        for &row_idx in &sorted_indices {
+                            let v = eval_qexpr(expr, &input.schema, &input.rows[row_idx])?;
+                            acc = window_add(acc, v)?;
+                        }
+                        Some(acc)
+                    }
+                    WindowFunc::Avg(expr) => {
+                        let mut sum = Literal::Null;
+                        let mut cnt = 0i64;
+                        for &row_idx in &sorted_indices {
+                            let v = eval_qexpr(expr, &input.schema, &input.rows[row_idx])?;
+                            if !matches!(v, Literal::Null) {
+                                sum = window_add(sum, v)?;
+                                cnt += 1;
+                            }
+                        }
+                        Some(if cnt == 0 {
+                            Literal::Null
+                        } else {
+                            window_div(sum, cnt)?
+                        })
+                    }
+                    WindowFunc::Count => Some(Literal::Int(part_len as i64)),
+                    WindowFunc::Min(expr) => {
+                        let mut acc: Option<Literal> = None;
+                        for &row_idx in &sorted_indices {
+                            let v = eval_qexpr(expr, &input.schema, &input.rows[row_idx])?;
+                            if matches!(v, Literal::Null) {
+                                continue;
+                            }
+                            acc = Some(match acc.take() {
+                                None => v,
+                                Some(cur) => {
+                                    if executor::compare(crate::sql::logical::CmpOp::Lt, &v, &cur)?
+                                    {
+                                        v
+                                    } else {
+                                        cur
+                                    }
+                                }
+                            });
+                        }
+                        Some(acc.unwrap_or(Literal::Null))
+                    }
+                    WindowFunc::Max(expr) => {
+                        let mut acc: Option<Literal> = None;
+                        for &row_idx in &sorted_indices {
+                            let v = eval_qexpr(expr, &input.schema, &input.rows[row_idx])?;
+                            if matches!(v, Literal::Null) {
+                                continue;
+                            }
+                            acc = Some(match acc.take() {
+                                None => v,
+                                Some(cur) => {
+                                    if executor::compare(crate::sql::logical::CmpOp::Gt, &v, &cur)?
+                                    {
+                                        v
+                                    } else {
+                                        cur
+                                    }
+                                }
+                            });
+                        }
+                        Some(acc.unwrap_or(Literal::Null))
+                    }
+                    _ => None, // positional functions computed per-row below
+                };
+
+                // Compute per-row values and write them into augmented_rows.
+                for (pos_in_partition, &row_idx) in sorted_indices.iter().enumerate() {
+                    let val = match func {
+                        // --- Partition-aggregate functions: broadcast to all rows. ---
+                        WindowFunc::Sum(_)
+                        | WindowFunc::Avg(_)
+                        | WindowFunc::Count
+                        | WindowFunc::Min(_)
+                        | WindowFunc::Max(_) => partition_agg.clone().unwrap_or(Literal::Null),
+
+                        // --- Positional / ranking functions. ---
+                        WindowFunc::RowNumber => Literal::Int((pos_in_partition + 1) as i64),
+
+                        WindowFunc::Rank => {
+                            // RANK = (number of rows before the first row in the current
+                            // tie group) + 1.
+                            // Walk backwards from pos_in_partition to find the first row
+                            // with the same ORDER BY key as the current row.
+                            let mut first_same = pos_in_partition;
+                            while first_same > 0
+                                && order_keys_equal(
+                                    &input.rows[sorted_indices[first_same - 1]],
+                                    &input.rows[row_idx],
+                                    &input.schema,
+                                    &over.order_by,
+                                )?
+                            {
+                                first_same -= 1;
+                            }
+                            Literal::Int((first_same + 1) as i64)
+                        }
+
+                        WindowFunc::DenseRank => {
+                            // Count distinct ORDER BY key groups from position 0 to
+                            // pos_in_partition (inclusive). Start at 1; each time the
+                            // key differs from the immediately preceding row, increment.
+                            let mut dense_rank = 1usize;
+                            for prev_pos in 1..=pos_in_partition {
+                                let prev_row_idx = sorted_indices[prev_pos - 1];
+                                let cur_row_idx = sorted_indices[prev_pos];
+                                if !order_keys_equal(
+                                    &input.rows[prev_row_idx],
+                                    &input.rows[cur_row_idx],
+                                    &input.schema,
+                                    &over.order_by,
+                                )? {
+                                    dense_rank += 1;
+                                }
+                            }
+                            Literal::Int(dense_rank as i64)
+                        }
+
+                        WindowFunc::Lag(expr, offset) => {
+                            let offset = *offset as usize;
+                            if offset > pos_in_partition {
+                                Literal::Null
+                            } else {
+                                let src_idx = sorted_indices[pos_in_partition - offset];
+                                eval_qexpr(expr, &input.schema, &input.rows[src_idx])?
+                            }
+                        }
+
+                        WindowFunc::Lead(expr, offset) => {
+                            let offset = *offset as usize;
+                            if pos_in_partition + offset >= part_len {
+                                Literal::Null
+                            } else {
+                                let src_idx = sorted_indices[pos_in_partition + offset];
+                                eval_qexpr(expr, &input.schema, &input.rows[src_idx])?
+                            }
+                        }
+                    };
+
+                    // Write the computed window value into augmented_rows.
+                    // The augmented_rows[row_idx] was pre-filled with the input row;
+                    // we push the window column values in a fixed order.
+                    // Because multiple window functions may write to the same row,
+                    // we need to ensure index win_col_idx is filled.
+                    // Strategy: fill remaining slots with Null on first access.
+                    let target_row = &mut augmented_rows[row_idx];
+                    // Extend with Null placeholders if needed.
+                    while target_row.len() <= win_col_idx {
+                        target_row.push(Literal::Null);
+                    }
+                    target_row[win_col_idx] = val;
+                }
+            }
+        }
+
+        // --- Step 5: apply the final projection over the augmented rows. ------
+        // Non-window items are evaluated against the augmented schema as before;
+        // window items read from their pre-computed synthetic column (`__w{i}`).
+        let mut result_rows = Vec::with_capacity(n_rows);
+        for (row_idx, aug_row) in augmented_rows.iter().enumerate() {
+            // Ensure the augmented row has enough slots (may be shorter if a row
+            // belongs to an empty partition — but that can't happen given valid input).
+            let mut projected = Vec::with_capacity(items.len());
+            for (item_idx, item) in items.iter().enumerate() {
+                let val = if let Some(win_col) = window_col_indices[item_idx] {
+                    // Window function: read the pre-computed value.
+                    aug_row.get(win_col).cloned().unwrap_or(Literal::Null)
+                } else {
+                    // Plain expression: evaluate against the augmented row / schema.
+                    // Use the original input schema since plain expressions don't
+                    // reference the synthetic __w{n} columns.
+                    self.eval(&item.expr, &input.schema, &input.rows[row_idx])?
+                };
+                projected.push(val);
+            }
+            result_rows.push(projected);
+        }
+
+        Ok(Batch {
+            schema: output.to_vec(),
+            rows: result_rows,
+        })
+    }
+
+    /// Partition `rows` into groups of row indices with equal `partition_by` key values.
+    /// Returns a list of groups; each group is a `Vec<usize>` of row indices that share
+    /// the same PARTITION BY key tuple. Input order within each group is preserved.
+    fn partition_rows(
+        &mut self,
+        rows: &[Vec<Literal>],
+        schema: &[ColumnRef],
+        partition_by: &[QExpr],
+    ) -> Result<Vec<Vec<usize>>> {
+        if partition_by.is_empty() {
+            // No PARTITION BY → one partition containing all rows.
+            return Ok(vec![(0..rows.len()).collect()]);
+        }
+
+        // Use an ordered Vec to preserve insertion order (groups appear in the order
+        // their first row was seen, which matches the input row order).
+        let mut key_order: Vec<Vec<u8>> = Vec::new();
+        let mut groups: std::collections::HashMap<Vec<u8>, Vec<usize>> =
+            std::collections::HashMap::new();
+
+        for (row_idx, row) in rows.iter().enumerate() {
+            // Encode the partition key as a canonical byte string.
+            let mut key_vals = Vec::with_capacity(partition_by.len());
+            for expr in partition_by {
+                key_vals.push(eval_qexpr(expr, schema, row)?);
+            }
+            let key_bytes = executor::encode_row(&key_vals);
+            if !groups.contains_key(&key_bytes) {
+                key_order.push(key_bytes.clone());
+                groups.insert(key_bytes.clone(), Vec::new());
+            }
+            groups
+                .get_mut(&key_bytes)
+                .expect("just inserted")
+                .push(row_idx);
+        }
+
+        Ok(key_order
+            .into_iter()
+            .map(|k| groups.remove(&k).expect("inserted above"))
+            .collect())
+    }
+
+    /// Sort the indices within a partition by the given ORDER BY expressions.
+    /// Returns a new `Vec<usize>` of the same indices in sorted order.
+    fn sort_partition_indices(
+        &mut self,
+        group: &[usize],
+        rows: &[Vec<Literal>],
+        schema: &[ColumnRef],
+        order_by: &[(QExpr, bool)],
+    ) -> Result<Vec<usize>> {
+        if order_by.is_empty() {
+            return Ok(group.to_vec());
+        }
+
+        let mut indices = group.to_vec();
+
+        // Evaluate all ORDER BY keys up-front to avoid repeated evaluation
+        // during the sort comparison.
+        // Pre-evaluate ORDER BY keys for each row in the group (avoids re-evaluation
+        // during sort, which is called O(n log n) times).
+        let mut row_keys: std::collections::HashMap<usize, Vec<Literal>> =
+            std::collections::HashMap::with_capacity(group.len());
+        for &row_idx in group {
+            let mut key_vals = Vec::with_capacity(order_by.len());
+            for (expr, _asc) in order_by {
+                key_vals.push(eval_qexpr(expr, schema, &rows[row_idx])?);
+            }
+            row_keys.insert(row_idx, key_vals);
+        }
+
+        // Sort using a comparison that respects ASC/DESC.
+        let mut sort_err: Option<DbError> = None;
+        indices.sort_by(|&a, &b| {
+            if sort_err.is_some() {
+                return std::cmp::Ordering::Equal;
+            }
+            let ka = row_keys.get(&a).expect("populated above");
+            let kb = row_keys.get(&b).expect("populated above");
+            for (i, (_, asc)) in order_by.iter().enumerate() {
+                let la = &ka[i];
+                let lb = &kb[i];
+                match executor::compare(crate::sql::logical::CmpOp::Lt, la, lb) {
+                    Ok(is_lt) => {
+                        if is_lt {
+                            return if *asc {
+                                std::cmp::Ordering::Less
+                            } else {
+                                std::cmp::Ordering::Greater
+                            };
+                        }
+                    }
+                    Err(e) => {
+                        sort_err = Some(e);
+                        return std::cmp::Ordering::Equal;
+                    }
+                }
+                match executor::compare(crate::sql::logical::CmpOp::Gt, la, lb) {
+                    Ok(is_gt) => {
+                        if is_gt {
+                            return if *asc {
+                                std::cmp::Ordering::Greater
+                            } else {
+                                std::cmp::Ordering::Less
+                            };
+                        }
+                    }
+                    Err(e) => {
+                        sort_err = Some(e);
+                        return std::cmp::Ordering::Equal;
+                    }
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+
+        if let Some(e) = sort_err {
+            return Err(e);
+        }
+
+        Ok(indices)
     }
 
     /// Execute a subquery for a given outer row: substitute correlated outer
@@ -1511,6 +1907,31 @@ fn substitute_correlated(
             substitute_correlated(rhs, inner, outer, outer_row)
         }
         QExpr::Cast { expr, .. } => substitute_correlated(expr, inner, outer, outer_row),
+        // G7 (item 19): window functions carry their OVER clause columns; substitute
+        // correlations in the function argument(s) and OVER expressions.
+        QExpr::Window { func, over } => {
+            use crate::sql::query::WindowFunc;
+            match func {
+                WindowFunc::Lag(e, _) | WindowFunc::Lead(e, _) => {
+                    substitute_correlated(e, inner, outer, outer_row)?
+                }
+                WindowFunc::Sum(e)
+                | WindowFunc::Avg(e)
+                | WindowFunc::Min(e)
+                | WindowFunc::Max(e) => substitute_correlated(e, inner, outer, outer_row)?,
+                WindowFunc::RowNumber
+                | WindowFunc::Rank
+                | WindowFunc::DenseRank
+                | WindowFunc::Count => {}
+            }
+            for pb in &mut over.partition_by {
+                substitute_correlated(pb, inner, outer, outer_row)?;
+            }
+            for (ob, _) in &mut over.order_by {
+                substitute_correlated(ob, inner, outer, outer_row)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1522,4 +1943,72 @@ fn visible_row(full: &[Literal], table_def: &crate::catalog::TableDef) -> Vec<Li
         .filter(|(_, c)| !c.dropped)
         .map(|(v, _)| v.clone())
         .collect()
+}
+
+// ── Window function helpers (G7, item 19) ────────────────────────────────────
+
+/// Add two `Literal` values for a running SUM window computation.
+/// `NULL + anything = anything` (so NULL is the zero / identity here, not a
+/// propagated NULL — this matches SQL aggregate SUM semantics where NULLs are
+/// skipped, not propagated). Returns an error for non-numeric operands.
+fn window_add(acc: Literal, val: Literal) -> Result<Literal> {
+    match (&acc, &val) {
+        (Literal::Null, _) => Ok(val),
+        (_, Literal::Null) => Ok(acc),
+        (Literal::Int(a), Literal::Int(b)) => Ok(Literal::Int(a + b)),
+        (Literal::Float(a), Literal::Float(b)) => Ok(Literal::Float(a + b)),
+        (Literal::Int(a), Literal::Float(b)) => Ok(Literal::Float(*a as f64 + b)),
+        (Literal::Float(a), Literal::Int(b)) => Ok(Literal::Float(a + *b as f64)),
+        (Literal::Decimal(am, as_), Literal::Decimal(bm, bs)) => {
+            // Align decimal scales before adding.
+            if as_ == bs {
+                Ok(Literal::Decimal(am + bm, *as_))
+            } else {
+                // Promote both to float for simplicity.
+                let av = *am as f64 / 10_f64.powi(*as_ as i32);
+                let bv = *bm as f64 / 10_f64.powi(*bs as i32);
+                Ok(Literal::Float(av + bv))
+            }
+        }
+        _ => Err(DbError::SqlUnsupported(format!(
+            "SUM/AVG window function requires numeric values, got {acc:?} + {val:?}"
+        ))),
+    }
+}
+
+/// Divide a running `Literal` sum by a count to produce an AVG.
+fn window_div(sum: Literal, count: i64) -> Result<Literal> {
+    if count == 0 {
+        return Ok(Literal::Null);
+    }
+    match sum {
+        Literal::Int(n) => Ok(Literal::Float(n as f64 / count as f64)),
+        Literal::Float(f) => Ok(Literal::Float(f / count as f64)),
+        Literal::Decimal(m, s) => {
+            let val = m as f64 / 10_f64.powi(s as i32);
+            Ok(Literal::Float(val / count as f64))
+        }
+        Literal::Null => Ok(Literal::Null),
+        other => Err(DbError::SqlUnsupported(format!(
+            "AVG window function requires numeric values, got {other:?}"
+        ))),
+    }
+}
+
+/// Returns `true` if the ORDER BY keys for `row_a` and `row_b` are equal.
+/// Used by RANK / DENSE_RANK to detect tie groups.
+fn order_keys_equal(
+    row_a: &[Literal],
+    row_b: &[Literal],
+    schema: &[ColumnRef],
+    order_by: &[(QExpr, bool)],
+) -> Result<bool> {
+    for (expr, _) in order_by {
+        let va = eval_qexpr(expr, schema, row_a)?;
+        let vb = eval_qexpr(expr, schema, row_b)?;
+        if !executor::compare(crate::sql::logical::CmpOp::Eq, &va, &vb)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
