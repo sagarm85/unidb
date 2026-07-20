@@ -8928,3 +8928,53 @@ Expected gain: ≥ 1.3× INSERT throughput (eliminating serialization point).
 - Replication tests previously failing (`apply_is_idempotent`, `base_plus_incremental_then_promote`) — now PASS.
 - `cargo clippy -- -D warnings`: clean.
 - `cargo fmt --all`: clean.
+
+---
+
+## Item 70 — Sequential scan read-ahead (madvise WILLNEED)   [SHIPPED]   2026-07-20
+
+**Backlog:** `docs/backlog/70_seq_scan_prefetch.md`
+**Branch:** `perf/item-70-seq-scan-prefetch`
+
+**Summary:** Added `madvise(MADV_WILLNEED)` prefetch hints to all sequential
+scan paths. On cold-cache workloads (first full scan after DB open) the OS can
+start I/O for the next window of pages while the engine processes the current
+one, reducing mmap fault stalls. The hint is best-effort — any error is silently
+discarded and it is never on the critical path.
+
+### Implementation
+
+| Component | Change |
+|---|---|
+| `src/mmap.rs` | `PageFileMmap::prefetch_range(offset, len)` — calls `memmap2::MmapMut::advise_range(Advice::WillNeed, …)` under `#[cfg(unix)]`; bounds-checked; no-op on non-Unix |
+| `src/bufferpool.rs` | `PREFETCH_PAGES = 16` constant; `SharedPageReader::prefetch_ahead(page_id)` calls `prefetch_range`; `PageReader::prefetch_hint` default-no-op trait method; `SharedPageReader` and `BufferPool` both override with active hints |
+| `src/heap.rs` | `Heap::scan` and `Heap::count_visible` issue `prefetch_hint` at `i + PREFETCH_DISTANCE` (8 pages ahead) |
+| `src/sql/parallel_scan.rs` | All 4 parallel workers (`parallel_filter_project`, `parallel_count_matching`, `parallel_collect_matching`, `parallel_collect_row_ids`) call `reader.prefetch_ahead(pages[i + PREFETCH_DISTANCE])` |
+
+**Platforms:**
+- Linux: active (`madvise(MADV_WILLNEED)` — asynchronous OS prefetch)
+- macOS: active (`madvise(MADV_WILLNEED)` — same syscall, advisory)
+- other: no-op (`#[cfg(not(unix))]` stub)
+
+**Lookahead config:**
+- `PREFETCH_PAGES = 16` (128 KiB window at 8 KiB pages)
+- `PREFETCH_DISTANCE = 8` pages (half-window, so prefetch covers pages `[i+8, i+24)`)
+
+**Benchmarks:** This is a hint-only change — warm-cache benchmarks show no
+regression (the hint is a no-op when pages are already resident). Cold-cache
+improvement is environment-dependent (Linux Docker with slow storage sees the
+most benefit; Apple Silicon's unified memory is effectively always warm).
+No throughput regression observed in CI.
+
+**Tests:** `tests/item70_seq_scan_prefetch.rs` — 4 tests, all PASS:
+- `full_scan_returns_all_rows` — 1,000 rows, no duplicates, all ids present
+- `count_star_matches_full_scan` — COUNT(*) = 1,000
+- `filtered_scan_correct_subset` — WHERE id >= 500 returns exactly 500 rows
+- `scan_after_reopen_correct` — cold-open + scan = 1,000 rows (exercises cold-page path)
+
+**Crash harness:** No storage/WAL/format path changed — crash tests unaffected.
+
+**No format change:** No FORMAT_VERSION bump needed (read-only hint path).
+
+**No `libc` dependency added:** Uses `memmap2::Advice::WillNeed` (already in
+the dependency tree via `memmap2`), not raw `libc::madvise`.

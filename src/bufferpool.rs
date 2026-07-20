@@ -52,6 +52,11 @@ use crate::{
 pub trait PageReader {
     fn read_page(&self, page_id: PageId) -> Result<SlottedPage>;
     fn page_size(&self) -> usize;
+    /// Hint the OS to prefetch pages ahead of the current sequential scan
+    /// cursor (item 70 — read-ahead). Default is a no-op; `SharedPageReader`
+    /// and `BufferPool` override with `madvise(MADV_WILLNEED)` on Unix.
+    /// Never blocks, never errors — hint only.
+    fn prefetch_hint(&self, _page_id: PageId) {}
 }
 
 /// Shared, read-only view over the page file for concurrent readers (6b).
@@ -66,9 +71,30 @@ pub struct SharedPageReader {
     page_size: usize,
 }
 
+/// How many pages ahead to hint per `prefetch_ahead` call (item 70).
+/// 16 pages × 8 KiB = 128 KiB lookahead window.
+pub const PREFETCH_PAGES: usize = 16;
+
 impl SharedPageReader {
     pub fn new(mmap: Arc<RwLock<PageFileMmap>>, page_size: usize) -> Self {
         Self { mmap, page_size }
+    }
+
+    /// Hint the OS to prefetch `PREFETCH_PAGES` pages starting at `page_id`
+    /// (item 70 — sequential scan read-ahead). Best-effort: ignores errors and
+    /// is a no-op on non-Unix platforms. Call this just before fetching
+    /// `page_id` in a sequential scan so the kernel can start I/O while the
+    /// engine processes the previous page.
+    ///
+    /// Bounds-checked: if `page_id` is past the mapped region the hint is
+    /// silently skipped (the mmap module clamps internally).
+    pub fn prefetch_ahead(&self, page_id: PageId) {
+        let Ok(guard) = self.mmap.read() else {
+            return;
+        };
+        let offset = page_id as usize * self.page_size;
+        let len = PREFETCH_PAGES * self.page_size;
+        guard.prefetch_range(offset, len);
     }
 }
 
@@ -80,6 +106,10 @@ impl PageReader for SharedPageReader {
     }
     fn page_size(&self) -> usize {
         self.page_size
+    }
+    /// Item 70: forward the prefetch hint via the mmap layer.
+    fn prefetch_hint(&self, page_id: PageId) {
+        self.prefetch_ahead(page_id);
     }
 }
 
@@ -880,6 +910,10 @@ impl PageReader for BufferPool {
     }
     fn page_size(&self) -> usize {
         self.page_size
+    }
+    /// Item 70: issue prefetch via a short-lived shared reader.
+    fn prefetch_hint(&self, page_id: PageId) {
+        self.shared_reader().prefetch_ahead(page_id);
     }
 }
 

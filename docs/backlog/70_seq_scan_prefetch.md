@@ -1,5 +1,5 @@
 **Type:** Performance
-**Status:** ⏳ NOT STARTED
+**Status:** ✅ SHIPPED — see PROGRESS.md "Item 70" entry (2026-07-20)
 
 # Item 70 — Sequential scan prefetch (read-ahead)
 

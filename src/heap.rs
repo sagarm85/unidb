@@ -1713,8 +1713,14 @@ impl Heap {
         reader: &P,
     ) -> Result<Vec<(RowId, Vec<u8>)>> {
         self.ensure_directory(reader)?; // FSM-backed: load the page directory
+        let pages = self.lock_fsm().pages.clone();
         let mut out = Vec::new();
-        for page_id in self.lock_fsm().pages.clone() {
+        for (i, &page_id) in pages.iter().enumerate() {
+            // Item 70: hint the OS to prefetch the next window of pages while
+            // we process the current one — best-effort, never blocks.
+            if let Some(&ahead_pid) = pages.get(i + crate::bufferpool::PREFETCH_PAGES / 2) {
+                reader.prefetch_hint(ahead_pid);
+            }
             scan_page_into(reader, page_id, snapshot, self_xid, &mut out, None)?;
         }
         Ok(out)
@@ -1737,10 +1743,15 @@ impl Heap {
         reader: &P,
     ) -> Result<usize> {
         self.ensure_directory(reader)?;
+        let pages = self.lock_fsm().pages.clone();
         let mut count = 0usize;
-        for (i, page_id) in self.lock_fsm().pages.clone().into_iter().enumerate() {
+        for (i, &page_id) in pages.iter().enumerate() {
             if i % 256 == 0 {
                 crate::query_limits::check()?; // P5.f: timeout / cancellation
+            }
+            // Item 70: prefetch next window while we process the current page.
+            if let Some(&ahead_pid) = pages.get(i + crate::bufferpool::PREFETCH_PAGES / 2) {
+                reader.prefetch_hint(ahead_pid);
             }
             count += count_page_visible(reader, page_id, snapshot, self_xid, None)?;
         }

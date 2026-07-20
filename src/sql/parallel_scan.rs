@@ -47,12 +47,18 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once, OnceLock};
 
-use crate::bufferpool::SharedPageReader;
+use crate::bufferpool::{SharedPageReader, PREFETCH_PAGES};
 use crate::error::{DbError, Result};
 use crate::format::{PageId, Xid};
 use crate::heap::{count_page_visible, get_visible, scan_page_into, scan_page_visit, RowId};
 use crate::mvcc::Snapshot;
 use crate::sql::logical::Literal;
+
+/// How many page-slots ahead to look when issuing a prefetch hint (item 70).
+/// With `PREFETCH_PAGES = 16` this means the hint covers pages
+/// `[i+8, i+8+16)` in the page list — the kernel starts I/O on the lookahead
+/// window while the engine processes page `i`.
+const PREFETCH_DISTANCE: usize = PREFETCH_PAGES / 2;
 
 // ── config (runtime toggle + lazy env defaults) ──────────────────────────────
 
@@ -571,6 +577,11 @@ where
                 if i >= pages.len() {
                     break;
                 }
+                // Item 70: prefetch the next window of pages while we process
+                // the current one — hint-only, never blocks.
+                if let Some(ahead_pid) = pages.get(i + PREFETCH_DISTANCE) {
+                    reader.prefetch_ahead(*ahead_pid);
+                }
                 if i.is_multiple_of(4) {
                     if let Err(e) = deadline.check() {
                         *err.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
@@ -661,6 +672,11 @@ where
                 let i = cursor.fetch_add(1, Ordering::Relaxed);
                 if i >= pages.len() {
                     break;
+                }
+                // Item 70: prefetch the next window of pages while we process
+                // the current one — hint-only, never blocks.
+                if let Some(ahead_pid) = pages.get(i + PREFETCH_DISTANCE) {
+                    reader.prefetch_ahead(*ahead_pid);
                 }
                 if i.is_multiple_of(4) {
                     if let Err(e) = deadline.check() {
@@ -755,6 +771,11 @@ where
                 let i = cursor.fetch_add(1, Ordering::Relaxed);
                 if i >= pages.len() {
                     break;
+                }
+                // Item 70: prefetch the next window of pages while we process
+                // the current one — hint-only, never blocks.
+                if let Some(ahead_pid) = pages.get(i + PREFETCH_DISTANCE) {
+                    reader.prefetch_ahead(*ahead_pid);
                 }
                 if i.is_multiple_of(4) {
                     if let Err(e) = deadline.check() {
@@ -945,6 +966,11 @@ where
                 let i = cursor.fetch_add(1, Ordering::Relaxed);
                 if i >= pages.len() {
                     break;
+                }
+                // Item 70: prefetch the next window of pages while we process
+                // the current one — hint-only, never blocks.
+                if let Some(ahead_pid) = pages.get(i + PREFETCH_DISTANCE) {
+                    reader.prefetch_ahead(*ahead_pid);
                 }
                 if i.is_multiple_of(4) {
                     if let Err(e) = deadline.check() {

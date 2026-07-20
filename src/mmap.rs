@@ -7,7 +7,7 @@
 use std::fs::File;
 use std::ops::{Deref, DerefMut};
 
-use memmap2::MmapMut;
+use memmap2::{Advice, MmapMut};
 
 use crate::error::Result;
 
@@ -39,6 +39,38 @@ impl PageFileMmap {
         self.inner.flush_range(offset, len)?;
         Ok(())
     }
+
+    /// Hint the OS to prefetch `len` bytes starting at `offset` (item 70 —
+    /// sequential scan read-ahead).
+    ///
+    /// The call is **best-effort**: `MADV_WILLNEED` is a hint; the kernel may
+    /// ignore it or honour it asynchronously. Any error is silently discarded —
+    /// the hint never affects correctness.
+    ///
+    /// Only active on Unix (Linux + macOS) via `memmap2::Advice::WillNeed`.
+    /// On other platforms this is a no-op.
+    #[cfg(unix)]
+    pub fn prefetch_range(&self, offset: usize, len: usize) {
+        if len == 0 || offset >= self.inner.len() {
+            return;
+        }
+        // Clamp so we never hint past the mapped region.
+        let clamped_len = len.min(self.inner.len() - offset);
+        // SAFETY: `advise_range` with `Advice::WillNeed` is a pure hint — it
+        // does not modify the memory contents and cannot cause unsound reads or
+        // writes.  `offset` and `clamped_len` are bounds-checked above to stay
+        // within the mapped region.  The hint is safe to call from any thread
+        // because the mmap address and length are stable for the lifetime of
+        // `PageFileMmap` (remaps replace `self.inner` atomically under the
+        // pool's mmap write-lock, not mid-call here).
+        let _ = self
+            .inner
+            .advise_range(Advice::WillNeed, offset, clamped_len);
+    }
+
+    /// No-op on non-Unix platforms.
+    #[cfg(not(unix))]
+    pub fn prefetch_range(&self, _offset: usize, _len: usize) {}
 
     pub fn len(&self) -> usize {
         self.inner.len()
