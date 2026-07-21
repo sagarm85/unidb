@@ -108,11 +108,38 @@ async fn main() {
         .expect("engine available at startup");
     let storage = try_init_storage(engine_arc).await;
 
-    let state = AppState::new(engine_handle)
-        .with_log_dir(std::path::PathBuf::from(&log_dir))
-        .with_storage(storage);
+    // item 100: UNIDB_DEV_LOGIN=1 activates POST /auth/login (dev/demo only —
+    // mirrors src/bin/unidb-server.rs; this binary never wired it up). Two
+    // separate things both need it: the `jwt_config` passed to build_router
+    // (verify middleware) AND AppState's own dev_login_jwt field (what the
+    // /auth/meta and /auth/login handlers actually read) — missing either
+    // one leaves dev_login_enabled false even with the env var set.
+    let dev_login = std::env::var("UNIDB_DEV_LOGIN")
+        .ok()
+        .map(|v| v == "1" || v.to_ascii_lowercase() == "true")
+        .unwrap_or(false);
+    if dev_login {
+        tracing::warn!(
+            "UNIDB_DEV_LOGIN=1: POST /auth/login is enabled (passwordless, dev/demo only — \
+             do NOT use in production)"
+        );
+    }
+    let jwt_config = if dev_login {
+        JwtConfig::with_dev_login(&jwt_secret)
+    } else {
+        JwtConfig::new(&jwt_secret)
+    };
 
-    let jwt_config = JwtConfig::new(&jwt_secret);
+    let state = {
+        let s = AppState::new(engine_handle)
+            .with_log_dir(std::path::PathBuf::from(&log_dir))
+            .with_storage(storage);
+        if dev_login {
+            s.with_dev_login(jwt_config.clone())
+        } else {
+            s
+        }
+    };
     let (prometheus_layer, metric_handle) = PrometheusMetricLayer::pair();
     let router = build_router(state, jwt_config, prometheus_layer, metric_handle);
 
