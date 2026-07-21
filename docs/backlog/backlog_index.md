@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `104_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `107_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -99,7 +99,7 @@
 | 89 | `89_wal_background_sealer.md` | Performance | ✅ SHIPPED 2026-07-19 (PR #155) — WAL seal `fsync` moved off append critical path to background thread; p99 flattening. See PROGRESS.md "Wave 1". |
 | 90 | `90_btree_batch_maintenance.md` | Performance | ✅ SHIPPED 2026-07-19 (PR #155) — batched B-tree maintenance: collect+sort per-leaf-group, single `latch_exclusive`; UPDATE non-HOT WAL 202→~130 B/row. See PROGRESS.md "Wave 1". |
 | 91 | `91_m4_event_source_decision.md` | Improvement | ✅ SHIPPED 2026-07-19 (PR #153) — Option A (executor-capture) approved; WAL-derived stream = `RecordKind::Event` rows in WAL, not physical redo record derivation. See PROGRESS.md "Item 91". |
-| 92 | `92_vector_query_next_tier.md` | Performance | ✅ SHIPPED 2026-07-19 (PR #154) — zero-copy dist on vec-cache hits + SIMD f32 accumulation + CREATE INDEX `prefetch_caches`; cold 24ms→1.27ms (19×), disk fetches/q 48→0. See PROGRESS.md "Item 92". |
+| 92 | `92_vector_query_next_tier.md` | Performance | ✅ SHIPPED 2026-07-21 — levers 1+2+3 (PR #154) + levers 5 (Arc COW cache snapshots, warm 10k 2,091→895 µs) + 7 (VecArena slab, ~900 µs ±2); lever 6 rejected on A/B. Acceptance revised ≤700 µs→≤1 ms with user sign-off (PROGRESS.md); pgvector-class tier → item 106. Docker W2/NEAR check in consolidated bench. |
 | 93 | `93_hnsw_arena_layout.md` | Performance | ✅ SHIPPED 2026-07-20 (PR #175) — `L0Arena` flat slab (`arena_data: Vec<i64>` + `arena_offsets: Vec<u32>`); zero-copy beam search via stack buffer; 0 disk fetches warm path, recall@10 1.000; Docker bench pending. See PROGRESS.md "Item 93". |
 | 94 | `94_near_read_only_fast_path.md` | Performance | ✅ SHIPPED 2026-07-20 (PR #176) — `read_snapshot_lightweight()` (atomic `committed_horizon`, no mutex) + `ExecCtx::in_explicit_txn` gate; `near_lightweight_snaps_total()` counter; 3 tests (counter/gate/correctness). See PROGRESS.md "Item 94". |
 | 95 | `95_graph_adjacency_cache.md` | Performance | ✅ SHIPPED 2026-07-20 (PR #174) — lazy warm cache (`AdjacencyCache` DashMap, EdgeRef, approx-LRU eviction); invalidate O(1) on INSERT/DELETE; 8W+8R 100k concurrent test PASS. See PROGRESS.md "Item 95". |
@@ -113,10 +113,11 @@
 | 103 | `103_authz_v2_studio_integration_gaps.md` | Improvement | ✅ SHIPPED 2026-07-20 (PR #173) — superuser/no-sub RLS bypass on concurrent-read path; `ReadHandle::execute_sql_as`; doc fixes (`CREATE ROLE SUPERUSER` → `CREATE USER SUPERUSER`, add `role_members`/`users` to catalog virtual relations). See PROGRESS.md "Item 103". |
 | 104 | `104_catalog_sync_dedup.md` | Performance | ✅ SHIPPED 2026-07-20 — remove `wal.sync_up_to(catalog_lsn)` after `catalog.persist_only()` in commit; `ROW_COUNT_UNKNOWN` sentinel on load; COUNT(*) calibrates via heap scan after crash. See PROGRESS.md "Item 104". |
 | 105 | `105_bench_selective_carry_forward.md` | Improvement | ✅ SHIPPED 2026-07-21 — bench-time reduction: `MM_SKIP_LADDER` (Tables 1+2, ~2.5 h sink), `MM_TABLES` honored by ALL tables, knobs threaded through Docker (were silently ignored), `MM_BASELINE` carry-forward stitching with provenance stamps (`stitch_baseline.py`), section-aware `compare_bench.py` (also fixes Table-4-vs-W4/W0 parse collision). CRUD-item runs ~4 h → ~30–45 min. |
+| 106 | `106_vector_pgvector_class_tier.md` | Performance | ⏳ NOT STARTED — pgvector-class NEAR tier (≤400 µs at 10k, recall ≥0.90): graph-quality heuristic selection, SQ8 slab quantization, re-rank decode-pushdown; Step-0 = recall-vs-ef curve. Filed 2026-07-21 from item 92 acceptance revision. |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `106_…`.**
+**Next new file → `107_…`.**
 
 ## Next up — priority order (2026-07-20, post PR #171 merge + 102-B)
 

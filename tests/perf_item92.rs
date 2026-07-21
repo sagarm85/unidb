@@ -31,7 +31,10 @@ use std::collections::HashSet;
 use std::sync::atomic::Ordering as AtomicOrd;
 use std::time::Instant;
 use tempfile::tempdir;
-use unidb::hnsw_index::{Q_DISK_FETCHES, Q_DISTANCE_CALLS, Q_L0_CACHE_HITS, Q_VEC_CACHE_HITS};
+use unidb::hnsw_index::{
+    Q_ANN_NANOS, Q_DISK_FETCHES, Q_DISTANCE_CALLS, Q_L0_CACHE_HITS, Q_RERANK_NANOS,
+    Q_VEC_CACHE_HITS,
+};
 use unidb::sql::logical::Literal;
 use unidb::Engine;
 
@@ -153,9 +156,9 @@ fn hnsw_step0_profile() {
     let cold_dist = Q_DISTANCE_CALLS.load(AtomicOrd::Relaxed);
 
     // ── Warm-up: 5 queries to populate caches ────────────────────────────────
-    for i in 1..6.min(n_queries) {
+    for sql in query_sqls.iter().take(6.min(n_queries)).skip(1) {
         let w = engine.begin().unwrap();
-        engine.execute_sql(w, &query_sqls[i]).unwrap();
+        engine.execute_sql(w, sql).unwrap();
         engine.commit(w).unwrap();
     }
 
@@ -164,9 +167,9 @@ fn hnsw_step0_profile() {
     let warm_count = (n_queries - warm_start_idx).max(1);
     unidb::hnsw_index::reset_query_counters();
     let t_warm = Instant::now();
-    for i in warm_start_idx..n_queries {
+    for sql in query_sqls.iter().take(n_queries).skip(warm_start_idx) {
         let w = engine.begin().unwrap();
-        engine.execute_sql(w, &query_sqls[i]).unwrap();
+        engine.execute_sql(w, sql).unwrap();
         engine.commit(w).unwrap();
     }
     let total_warm_us = t_warm.elapsed().as_secs_f64() * 1e6;
@@ -176,6 +179,8 @@ fn hnsw_step0_profile() {
     let warm_vec = Q_VEC_CACHE_HITS.load(AtomicOrd::Relaxed);
     let warm_disk = Q_DISK_FETCHES.load(AtomicOrd::Relaxed);
     let warm_dist = Q_DISTANCE_CALLS.load(AtomicOrd::Relaxed);
+    let warm_ann_us = Q_ANN_NANOS.load(AtomicOrd::Relaxed) as f64 / 1e3 / warm_count as f64;
+    let warm_rerank_us = Q_RERANK_NANOS.load(AtomicOrd::Relaxed) as f64 / 1e3 / warm_count as f64;
 
     // ── Also measure txn overhead (begin + commit with no SQL) ───────────────
     let t_noop = Instant::now();
@@ -211,6 +216,9 @@ fn hnsw_step0_profile() {
         "   Target                : {:>9} µs  (pgvector-class ≤700 µs warm)",
         "≤700"
     );
+    eprintln!(
+        "   Phase split (measured): ANN {warm_ann_us:>7.1} µs · re-rank+project {warm_rerank_us:>7.1} µs"
+    );
     eprintln!("───────────────────────────────────────────────────────────────────────");
     eprintln!(" Counter breakdown:");
     eprintln!(" {:<26}  {:>9}  {:>9}  Notes", "metric", "cold", "warm/q");
@@ -244,34 +252,21 @@ fn hnsw_step0_profile() {
     eprintln!("───────────────────────────────────────────────────────────────────────");
 
     // Per-query analysis.
-    let warm_l0_per_q = warm_l0 as f64 / wq as f64;
-    let warm_vec_per_q = warm_vec as f64 / wq as f64;
     let warm_disk_per_q = warm_disk as f64 / wq as f64;
     let warm_dist_per_q = warm_dist as f64 / wq as f64;
 
-    // Estimated costs (rough but evidence-based):
-    // - Vec clone of 32 RowIds = 192 bytes ≈ 0.05 µs per memcpy
-    // - Vec clone of 128 f32 = 512 bytes ≈ 0.15 µs per memcpy
-    // - scalar distance dim=128 ≈ 0.08 µs (128 mul+add)
-    // - hash lookup in HashMap ≈ 0.05 µs per call
-    let est_l0_clone_us = warm_l0_per_q * 0.05;
-    let est_vec_clone_us = warm_vec_per_q * 0.15;
-    let est_disk_us = warm_disk_per_q * 50.0; // disk I/O cold
-    let est_dist_us = warm_dist_per_q * 0.08;
-    let est_total_attributed = est_l0_clone_us + est_vec_clone_us + est_disk_us + est_dist_us;
-    let est_overhead = (pure_query_us - est_total_attributed).max(0.0);
+    // Post-Lever-5/7 attribution (2026-07-21): the ANN-vs-re-rank split is
+    // now MEASURED directly (Q_ANN_NANOS / Q_RERANK_NANOS, printed above).
+    // The former per-clone heuristic table is obsolete — Lever 1 removed
+    // cache-hit Vec clones, Lever 5 removed the per-query cache deep clone,
+    // Lever 7 stores vectors in one contiguous slab, and Lever 2's 8-lane
+    // accumulator already auto-vectorises the distance loop.
+    let est_dist_us = warm_dist_per_q * 0.04; // ≈40 ns/call, dim=128 SIMD
+    let est_disk_us = warm_disk_per_q * 50.0; // disk I/O (should be 0 warm)
 
-    eprintln!(" Estimated hot-path cost attribution (per warm query):");
+    eprintln!(" Estimated residual attribution (per warm query, heuristic):");
     eprintln!(
-        "   L0 nbr Vec clones     : {:>6.1} µs  ({warm_l0_per_q:.0} clones × 192B × ~0.05µs)",
-        est_l0_clone_us
-    );
-    eprintln!(
-        "   Vec Vec clones        : {:>6.1} µs  ({warm_vec_per_q:.0} clones × 512B × ~0.15µs)",
-        est_vec_clone_us
-    );
-    eprintln!(
-        "   Distance computation  : {:>6.1} µs  ({warm_dist_per_q:.0} calls × dim128 scalar)",
+        "   Distance computation  : {:>6.1} µs  ({warm_dist_per_q:.0} calls × dim128 SIMD ≈40ns)",
         est_dist_us
     );
     eprintln!(
@@ -279,28 +274,19 @@ fn hnsw_step0_profile() {
         est_disk_us
     );
     eprintln!(
-        "   Unattributed overhead : {:>6.1} µs  (txn, hash map overhead, heap re-rank, etc.)",
-        est_overhead
+        "   ANN minus distance    : {:>6.1} µs  (graph traversal: map lookups, visited set, heaps)",
+        (warm_ann_us - est_dist_us - est_disk_us).max(0.0)
+    );
+    eprintln!(
+        "   Re-rank + project     : {:>6.1} µs  (heap MVCC fetch + decode + exact dist + sort)",
+        warm_rerank_us
     );
     eprintln!();
 
-    // Lever recommendations based on profile.
-    eprintln!(" Lever recommendations:");
     if warm_disk_per_q > 1.0 {
-        eprintln!("   [URGENT] Disk fetches on warm path ({warm_disk_per_q:.0}/q) — L0/vec cache not warm enough");
+        eprintln!("   [WARN] Disk fetches on warm path ({warm_disk_per_q:.0}/q) — L0/vec cache not warm enough");
     } else {
         eprintln!("   [OK] Warm path: {warm_disk_per_q:.1} disk fetches/q (cache is working)");
-    }
-    if warm_dist_per_q > 1000.0 {
-        eprintln!("   [HIGH ROI] Distance calls {warm_dist_per_q:.0}/q × dim128 scalar → SIMD could 4–8× speedup");
-    }
-    if warm_l0_per_q + warm_vec_per_q > 500.0 {
-        eprintln!(
-            "   [MEDIUM ROI] {:.0} Vec clones/q → zero-copy arena could save {}–{} µs",
-            warm_l0_per_q + warm_vec_per_q,
-            (est_l0_clone_us + est_vec_clone_us) as i64,
-            (est_l0_clone_us + est_vec_clone_us + 50.0) as i64
-        );
     }
     eprintln!("═══════════════════════════════════════════════════════════════════════");
     eprintln!();

@@ -1,5 +1,11 @@
 **Type:** Performance
-**Status:** 🚧 IN PROGRESS — Levers 1+2+3 shipped; ≤700 µs at 10k pending Docker bench
+**Status:** ✅ SHIPPED 2026-07-21 — Levers 1+2+3+5+7; native warm 10k = ~900 µs
+(from 2,091 µs at session start; 2.38 ms pre-item-72). **Acceptance revised
+≤700 µs → ≤1 ms with explicit user sign-off 2026-07-21** (recorded in
+PROGRESS.md "Item 92 — Vector query Levers 5+7"): remaining micro-levers
+floor at ~700–750 µs, and the pgvector-class 380 µs tier requires
+quantization/graph-quality work — filed as **item 106**. Lever 6 (fast
+hasher) rejected on A/B evidence; see "2026-07-21 session" below.
 
 # Item 92 — Vector query next tier: 2.38 ms → pgvector-class (≤700 µs)
 
@@ -117,16 +123,103 @@ Deferred — not in top-3 by measured ROI.
 
 ## Targets
 
-- Warm NEAR at 10k, recall@10 ≥ 0.90 (ef_search=200 unchanged):
-  **≤ 700 µs** (pgvector-class). At 2k vectors post-levers: **921 µs**
-  (CI proxy; Docker bench at 10k pending to confirm Linux result).
+- ~~Warm NEAR at 10k, recall@10 ≥ 0.90 (ef_search=200 unchanged):
+  **≤ 700 µs** (pgvector-class).~~
+  **Revision (2026-07-21, user sign-off):** target is **≤ 1 ms warm at
+  10k×dim128, recall@10 ≥ 0.90** — achieved at ~900 µs (±2 µs across runs).
+  The original ≤700 µs was set before the 10k phase split existed; measured
+  floors show the remaining micro-levers land ~700–750 µs at best, and the
+  pgvector-class 380 µs tier needs quantization/graph-quality work →
+  **item 106**. Not a silent rewrite: evidence in the 2026-07-21 session
+  section below, sign-off recorded in PROGRESS.md.
 - **Fairness rule**: pgvector/ffsdb latencies quoted at matched recall.
 
 ## Acceptance criteria
 
 - [x] Step-0 profile table committed before any lever built.
-- [x] recall@10 = 1.000 at 2k×dim128 (gate ≥ 0.90).
-- [x] All 434 unit tests + 51 crash tests pass.
+- [x] recall@10 = 1.000 at 2k×dim128 (gate ≥ 0.90); 0.900 at 10k (gate ≥ 0.90).
+- [x] All unit tests + crash tests pass (2026-07-21: 30 binaries green, 54/54 crash).
 - [x] cargo clippy -D warnings clean; cargo fmt clean.
-- [ ] Docker bench confirms ≤700 µs warm at 10k×dim128 on Linux.
-- [ ] W2 (vector-write) rung of decompose ladder shows no regression.
+- [x] Warm NEAR ≤ 1 ms at 10k×dim128 native (revised gate — ~900 µs measured).
+- [ ] Docker/Linux NEAR spot-check + W2 (vector-write) rung no-regression —
+      folded into the consolidated bench run (2026-07-21, in flight).
+
+## 2026-07-21 session — Levers 5–7 (10k-scale round)
+
+### Step-0 re-profile at 10k (levers 1–3 did not scale)
+
+Native 10k×dim128 warm NEAR on main (post levers 1+2+3, items 93/67 in):
+**2,091 µs** — the 2k gains did not carry (distance calls 1,631 → 3,748/q,
+plus 1,257 µs *unattributed*). Recall@10 = 0.900, exactly at the gate → the
+`ef_search` knob is pinned; no headroom to trade recall for speed.
+
+### Lever 5 — O(1) cache snapshots (Arc copy-on-write) ✅ SHIPPED
+
+Root cause of the unattributed block: `exec_select_near` **deep-cloned the
+entire per-index cache every query** — full L0 arena + a 10k-entry
+`HashMap<i64, Vec<f32>>` (~7 MiB + 10k allocations), then walked all 10k
+entries again in `merge_from`. O(corpus) per query: ~300 µs at 2k, ~1.3 ms at
+10k, ~15 ms at 100k (worse than no cache). The lock-free-during-I/O rationale
+predated Lever 3; after prefetch the warm path does zero I/O, so the clone
+bought nothing.
+
+Fix: `HnswVecCache.vectors` and `HnswL0Cache.arena` behind `Arc`; mutations
+via `Arc::make_mut` (copy-on-write, only on an actual cache miss); executor
+compares `storage_ptr()` before/after and **skips merge-back entirely** when
+the search inserted nothing; `merge_from` gains ptr-equal → no-op and
+empty-self → O(1) Arc-adopt fast paths.
+
+**Measured: warm 10k 2,091 → 895.5 µs (−57%); cold 2,331 → 1,499 µs;
+counters and recall identical (pure overhead removal).**
+
+### Lever 6 — fast hasher (FxHash-style) ❌ REJECTED (measured wash)
+
+Hypothesis: ~7k SipHash ops/q (vec-cache get + visited set) cost 150–300 µs.
+A/B with 3 runs each: FastHash ~996 µs vs SipHash ~992 µs — statistically
+indistinguishable. Hashing is not the bottleneck (the cost is the memory
+pointer-chase, not the hash function). Reverted entirely; do not re-attempt
+without new evidence.
+
+### Phase attribution (new, permanent): ANN vs re-rank timers
+
+`Q_ANN_NANOS` / `Q_RERANK_NANOS` atomics in `exec_select_near`, printed by
+`tests/perf_item92.rs`. Warm 10k split: **ANN 586–610 µs (66%) · re-rank +
+project 222 µs (25%) · parse/plan/snapshot ~74 µs**. Within ANN, distance
+math ≈150 µs (3,748 calls × ~40 ns SIMD); the rest is graph-traversal
+bookkeeping over a 5 MiB working set.
+
+### Lever 7 — contiguous vector slab (`VecArena`) ✅ SHIPPED
+
+Same pattern as item 93's `L0Arena`, applied to vectors: one flat `Vec<f32>`
+slab + key→slot map, replacing 10k scattered 512 B `Vec<f32>` allocations.
+Drop-in inside `HnswVecCache` thanks to Lever 5's encapsulation.
+
+**Measured: warm 10k = 897.9 / 899.7 / 902.1 µs — mean ~900 µs (~9% below
+Lever-5-alone mean ~990 µs) and variance collapsed from ±120 µs to ±2 µs.**
+The locality hypothesis mostly did not pay (ANN still ~605 µs — random access
+over 5 MiB is TLB/cache-miss-bound regardless of layout); the honest wins are
+determinism, allocator pressure (10k fewer live allocations per index), and
+single-memcpy COW clones.
+
+### Where the ~900 µs stands and what could remain
+
+| Component | µs/q | Reducible? |
+|---|---:|---|
+| ANN: distance math | ~150 | No (SIMD'd, call count pinned by recall gate) |
+| ANN: traversal bookkeeping | ~455 | Partially — visited-set/heap micro-opts, but hashing already proven a wash; realistic upside ≤100 µs |
+| Re-rank + project (200 rows) | ~222 | Partially — decode pushdown (only key+vector cols), upside ~100 µs |
+| Parse/plan/snapshot | ~74 | Plan cache already in; marginal |
+
+Realistic floor with the remaining micro-levers: **~700–750 µs native** — at
+or just above the target, for two more rounds of complexity. pgvector's 380 µs
+at this recall implies graph/quantization work (PQ, smaller ef via better
+graph quality), which is a different item.
+
+### Open question (needs sign-off — §0.6 rule 6)
+
+Either (a) revise acceptance to ≤1 ms native/Docker at 10k (achieved: ~900 µs,
+2.6× total improvement this item, 26× from the pre-item-72 2.38 ms→900 µs
+path), and file the remaining ~200 µs of micro-levers + PQ/graph-quality as a
+new item; or (b) keep ≤700 µs open and implement re-rank decode-pushdown +
+traversal micro-opts next session. Docker/Linux confirmation run pending
+either way (W2 rung no-regression check folds into the consolidated bench).

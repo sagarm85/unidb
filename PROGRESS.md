@@ -9465,3 +9465,57 @@ fk/w4w0 excluded). `cargo clippy --bench decompose -- -D warnings` clean (also
 fixed 4 pre-existing `needless_range_loop` lints only visible with the bench
 target), `cargo fmt` clean, `bash -n` + `docker compose config -q` clean.
 Expected per-item CRUD run: ~4 h → ~30–45 min.
+
+## Item 92 — Vector query Levers 5+7 (Arc snapshots + vector slab)   [SHIPPED]   2026-07-21
+
+**Branch:** `claude/session-status-check-fae1c3` | **Type:** Performance (query path only — no storage format change)
+
+### Root cause found (10k re-profile)
+
+Levers 1–3 did not scale from 2k to 10k: warm NEAR was **2,091 µs** with
+1,257 µs unattributed. The unattributed block was `exec_select_near`
+**deep-cloning the entire per-index cache on every query** (full L0 arena +
+10k-entry vector HashMap ≈ 7 MiB + 10k allocations, then a 10k-entry
+merge-back walk) — O(corpus) per query; would be ~15 ms at 100k (worse than
+no cache). Rationale predated Lever 3's prefetch; warm path does zero I/O,
+so the clone bought nothing.
+
+### What shipped
+
+- **Lever 5 — O(1) cache snapshots:** `HnswVecCache` storage and
+  `HnswL0Cache.arena` behind `Arc` with `Arc::make_mut` copy-on-write;
+  executor skips merge-back when `storage_ptr()` unchanged; `merge_from`
+  ptr-equal/empty-adopt fast paths. **Warm 10k: 2,091 → 895.5 µs (−57%)**;
+  cold 2,331 → 1,499 µs; counters + recall identical.
+- **Lever 6 — fast hasher: REJECTED on A/B evidence** (3 runs each:
+  ~996 µs vs ~992 µs — wash; hashing is not the bottleneck). Reverted.
+- **Phase attribution (permanent):** `Q_ANN_NANOS`/`Q_RERANK_NANOS` in
+  `exec_select_near`; warm split = ANN ~605 µs · re-rank ~222 µs ·
+  parse/plan ~74 µs.
+- **Lever 7 — contiguous vector slab (`VecArena`):** item 93's arena pattern
+  applied to vectors; drop-in behind Lever 5's accessors. **Warm 10k =
+  897.9/899.7/902.1 µs (mean ~900 µs, ~9% below Lever-5-alone mean ~990 µs);
+  variance ±120 µs → ±2 µs.** Locality hypothesis mostly didn't pay (5 MiB
+  random-access working set); honest wins are determinism + allocator
+  pressure + single-memcpy COW.
+
+### Status vs target
+
+≤700 µs NOT met (native macOS ~900 µs; recall pinned at 0.900 = gate).
+Realistic remaining micro-levers ≈ 700–750 µs floor; pgvector-class 380 µs
+needs graph-quality/quantization.
+**Acceptance revision SIGNED OFF by user 2026-07-21 (recorded here per §0.6
+rule 6 / §3): target revised ≤700 µs → ≤1 ms warm at 10k×dim128 native —
+achieved at ~900 µs. The pgvector-class ≤400 µs tier is filed as item 106**
+(`docs/backlog/106_vector_pgvector_class_tier.md`: Step-0 recall-vs-ef curve,
+then graph-quality heuristic selection / SQ8 slab quantization / re-rank
+decode-pushdown). Docker/Linux confirmation + W2-rung no-regression fold into
+the consolidated bench run (launched same session).
+
+### Verification
+
+Full release suite: all test binaries green (30 binaries, 0 failures).
+Crash harness 54/54. `cargo clippy -- -D warnings` + `--test perf_item92`
+clean; fmt clean. Recall@10 at 10k = 0.900 (gate ≥ 0.90) unchanged across
+all levers. Pre-existing flake (item102 global-counter race) and
+pre-existing test-binary clippy lints flagged as separate follow-up tasks.

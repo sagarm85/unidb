@@ -12,6 +12,19 @@
 
 ## Current status
 
+- **Item 92 Levers 5+7 — SHIPPED 2026-07-21; acceptance revised ≤700 µs → ≤1 ms WITH USER SIGN-OFF same day; pgvector-class tier filed as item 106.**
+  10k re-profile: warm NEAR 2,091 µs, 1,257 µs unattributed → root cause: `exec_select_near`
+  deep-cloned the ENTIRE per-index cache per query (L0 arena + 10k-entry vec HashMap ≈ 7 MiB +
+  10k allocs, plus 10k-entry merge-back walk; O(corpus)/query, ~15 ms at 100k). Lever 5: Arc
+  copy-on-write snapshots + storage_ptr merge-skip → **895.5 µs (−57%)**. Lever 6 (fast hasher)
+  REJECTED on 3×3 A/B (wash) and reverted. Lever 7: `VecArena` contiguous vector slab (item 93
+  pattern) → **~900 µs mean, variance ±120→±2 µs**. Phase timers added (permanent):
+  ANN ~605 µs · re-rank ~222 µs · parse/plan ~74 µs. Recall pinned 0.900 throughout.
+  ≤700 µs unmet; user signed off Option A same day: acceptance revised to ≤1 ms (achieved
+  ~900 µs), item 106 filed for the pgvector-class ≤400 µs tier (graph quality/SQ8/PQ).
+  All tests green (30 binaries + 54/54 crash). Docker/Linux NEAR check + W2-rung no-regression
+  fold into the pending consolidated bench run.
+
 - **Item 105 — Selective bench runs + baseline carry-forward — SHIPPED 2026-07-21, branch `claude/session-status-check-fae1c3`.**
   Root-caused the ~4 h `report.sh` wall clock (per-phase docker-stats sample counts in
   `report_20260719_234504.md`): Tables 1+2 W0→W4 ladder ≈ 2.5 h (synchronous HNSW/graph
@@ -3615,6 +3628,44 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-21 (later same session) — Item 92 Levers 5–7: NEAR warm 10k 2,091 → ~900 µs
+
+**Goal:** user said "start item 92, then plan Docker bench validation debt." Discovered item 92
+was further along than the index suggested (levers 1–3 already merged, PR #154); remaining =
+the two unchecked acceptance boxes. Native 10k probe showed levers 1–3 did NOT scale: 2,091 µs
+warm (vs 921 µs at 2k), 1,257 µs unattributed.
+
+**Lever 5 (shipped):** root cause of unattributed block = `exec_select_near` deep-cloning the
+entire per-index cache per query (L0 arena + vec HashMap ≈ 7 MiB + 10k allocations at 10k, plus
+O(n) merge-back walk). Fix: `Arc` copy-on-write storage in `HnswVecCache`/`HnswL0Cache`
+(`Arc::make_mut` on mutation), `storage_ptr()` compare to skip merge-back when nothing inserted,
+ptr-eq/empty-adopt fast paths in `merge_from`. Measured: 2,091 → 895.5 µs (−57%), cold
+2,331 → 1,499 µs, counters/recall identical.
+
+**Lever 6 (rejected honestly):** hand-rolled FxHash-style hasher for the 4 hot structures;
+3×3 A/B showed FastHash ~996 vs SipHash ~992 µs — wash. Hashing is not the bottleneck (memory
+pointer-chase is). Fully reverted; recorded in backlog 92 as do-not-reattempt-without-evidence.
+
+**Phase attribution (permanent):** `Q_ANN_NANOS`/`Q_RERANK_NANOS` atomics in `exec_select_near`,
+printed by perf_item92. Warm split: ANN ~605 µs (66%) · re-rank+project ~222 µs (25%) ·
+parse/plan/snapshot ~74 µs. Stale heuristic attribution print (claimed Vec clones + "SIMD
+could 4-8×" after SIMD had shipped) replaced with measured split.
+
+**Lever 7 (shipped):** `VecArena` — one flat `Vec<f32>` slab + key→slot map replacing 10k
+scattered 512 B Vec allocations (item 93's L0Arena pattern; drop-in behind Lever 5 accessors).
+Measured: 897.9/899.7/902.1 µs — mean ~900 µs (~9% under Lever-5-alone mean ~990), variance
+±120 → ±2 µs. Locality hypothesis mostly didn't pay (ANN still ~605 µs — 5 MiB random-access
+working set); honest wins: determinism, allocator pressure, single-memcpy COW.
+
+**Target status:** ≤700 µs not met (~900 µs native macOS, recall pinned at exactly 0.900);
+remaining micro-levers floor ≈700–750 µs. **User signed off Option A same day**: acceptance
+revised to ≤1 ms (achieved), item 106 filed for the pgvector-class ≤400 µs tier (Step-0 =
+recall-vs-ef curve, then graph-quality heuristic / SQ8 slab / decode-pushdown).
+Verification: 30 test binaries green, crash 54/54, clippy/fmt clean.
+Flagged as spawn-task chips: item102 IDX_ONLY_ROWS test race (observed flaking once),
+pre-existing clippy lints in 4 test binaries (--all-targets not in the gate).
+Committed + PR'd after sign-off; consolidated Docker bench launched same session.
 
 ### 2026-07-21 — Item 105: Selective bench runs + baseline carry-forward (bench tooling)
 
