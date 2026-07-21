@@ -36,40 +36,55 @@ def _cols(line: str):
     parts = line.strip().strip('|').split('|')
     return [p.strip() for p in parts]
 
+# Provenance stamp written by scripts/stitch_baseline.py — sections carrying it
+# hold numbers copied from an OLDER report, so they must never enter the delta
+# comparison (they would diff a baseline against itself, or worse, against a
+# different baseline, and read as a fake regression/win).
+_CARRIED_MARKER = "Carried forward — NOT re-measured in this run"
+
+_HEADING_RE = re.compile(r'^## Table ([\d.]+)\b')
+
+
 def parse_metrics(path: str) -> dict:
     """
-    Returns:
+    Section-aware parse. Returns:
       'crud':  {operation_label: ratio}   — Table 3 rows (unidb÷PG)
       'fk':    {operation_label: ratio}   — Table 5 rows (unidb÷PG)
-      'w4w0':  {row_size_str:   ratio}    — W4/W0 column from Table 1/2
+      'w4w0':  {row_size_str:   ratio}    — W4/W0 column, Table 1 ONLY
+    Sections stitched in by stitch_baseline.py (carried forward from an older
+    report) are excluded entirely. Restricting W4/W0 to Table 1 also fixes a
+    prior collision where Table 4 rows (same integer-keyed shape, ratio in the
+    last column) silently overwrote the W4/W0 entries.
     """
     crud, fk, w4w0 = {}, {}, {}
-    in_fk = False
+    table_id = None     # "1", "3.1", "4", … for the current ## Table section
+    carried = False     # current section was carried forward — ignore its rows
 
     with open(path, encoding="utf-8") as f:
         for raw in f:
             line = raw.rstrip('\n')
 
-            # Detect Table 5 section header
-            if 'Table 5' in line and 'FK' in line.replace('relational', ''):
-                in_fk = True
-            # Back out of Table 5 on next h2
-            if in_fk and line.startswith('## ') and 'Table 5' not in line:
-                in_fk = False
+            if line.startswith('## '):
+                m = _HEADING_RE.match(line)
+                table_id = m.group(1) if m else None
+                carried = False
+            if _CARRIED_MARKER in line:
+                carried = True
 
-            if not line.startswith('|'):
+            if carried or not line.startswith('|'):
                 continue
             cols = _cols(line)
             if len(cols) < 5:
                 continue
 
-            # W4/W0 row: first col is a plain integer (row size), last col has ×
-            if re.match(r'^\d+$', cols[0]) and _RATIO_RE.search(cols[-1]):
+            # Table 1 W4/W0 row: first col is a plain integer (row size),
+            # last col has the W4/W0 ratio.
+            if table_id == '1' and re.match(r'^\d+$', cols[0]) and _RATIO_RE.search(cols[-1]):
                 w4w0[cols[0]] = _ratio(cols[-1])
                 continue
 
             # Table 3 / Table 5: operation name (text), col[4] is unidb÷PG ratio
-            if len(cols) >= 5 and _ratio(cols[4]) is not None:
+            if table_id in ('3', '5') and _ratio(cols[4]) is not None:
                 op = cols[0]
                 # skip header rows and separator rows
                 if re.match(r'^[-:| ]+$', op) or op.lower() in ('operation', 'op'):
@@ -77,7 +92,7 @@ def parse_metrics(path: str) -> dict:
                 ratio = _ratio(cols[4])
                 if ratio is None:
                     continue
-                if in_fk:
+                if table_id == '5':
                     fk[op] = ratio
                 else:
                     crud[op] = ratio

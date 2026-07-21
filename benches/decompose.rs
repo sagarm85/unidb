@@ -1090,25 +1090,35 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// Table-selection helpers (item 101/102 bench-time reduction).
+/// Table-selection helpers (item 101/102 bench-time reduction; item 105
+/// selective runs + baseline carry-forward).
 ///
 /// Two complementary env knobs control which tables run:
 ///
 /// `MM_TABLES=1,2,3`   — allowlist: run ONLY the listed tables (empty = all).
+///                        Tables 1+2 are one measurement (the W0→W4 ladder):
+///                        listing either runs both. Table 3.1 is gated with 3.
+/// `MM_SKIP_LADDER=1`  — denylist shorthand: skip Tables 1+2 (the ladder
+///                        pre-grows build HNSW + graph indexes synchronously —
+///                        the single biggest time sink, ~2.5 h of a full run).
 /// `MM_SKIP_TABLE4=1`  — denylist shorthand: skip Table 4 + 4.1 (HNSW build,
 ///                        the ~45-min bottleneck at 100k rows).
 /// `MM_SKIP_TABLE5=1`  — denylist shorthand: skip Table 5 (FK stress, ~5 min).
+///
+/// A skipped table still prints its `## Table N` heading plus a `_Skipped:`
+/// marker line — `scripts/stitch_baseline.py` keys on that marker to carry the
+/// table forward from a baseline report (`MM_BASELINE`), provenance-stamped.
 ///
 /// Per-item profiles (use these when benching a single item):
 ///
 /// | Item class              | Recommended flags                              |
 /// |-------------------------|------------------------------------------------|
-/// | WAL / commit path       | `MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1`           |
-/// | B-tree / CRUD           | `MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1`           |
-/// | HNSW / vector           | (run all — Table 4 is the signal)              |
-/// | Index-only scan (102-A) | `MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1`           |
-/// | Group commit (101)      | `MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1`           |
-/// | FK / relational (36)    | `MM_SKIP_TABLE4=1`                             |
+/// | WAL / commit path       | `MM_SKIP_LADDER=1 MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1` |
+/// | B-tree / CRUD           | `MM_SKIP_LADDER=1 MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1` |
+/// | HNSW / vector           | (run all — Tables 1/2/4 are the signal)        |
+/// | Index-only scan (102-A) | `MM_SKIP_LADDER=1 MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1` |
+/// | Group commit (101)      | `MM_SKIP_LADDER=1 MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1` |
+/// | FK / relational (36)    | `MM_SKIP_LADDER=1 MM_SKIP_TABLE4=1`            |
 /// | Full baseline compare   | (no flags — run everything)                    |
 fn should_run_table(n: u8) -> bool {
     // Allowlist takes priority: MM_TABLES=1,2,3 means ONLY those tables.
@@ -1119,6 +1129,7 @@ fn should_run_table(n: u8) -> bool {
     }
     // Denylist shorthands.
     match n {
+        1 | 2 => std::env::var("MM_SKIP_LADDER").ok().as_deref() != Some("1"),
         4 => std::env::var("MM_SKIP_TABLE4").ok().as_deref() != Some("1"),
         5 => std::env::var("MM_SKIP_TABLE5").ok().as_deref() != Some("1"),
         _ => true,
@@ -2812,58 +2823,86 @@ fn bench_mm_report() {
     );
 
     // ---- Table 1: cost vs size, and collect for Table 2 ----
+    // Tables 1+2 are ONE measurement (the W0→W4 ladder); listing either in
+    // MM_TABLES runs both. The ladder pre-grows W2–W4 with synchronous HNSW +
+    // graph index builds, making it the single biggest time sink of a full run.
+    let skip_ladder = should_run_tables_skip(1) && should_run_tables_skip(2);
     println!("## Table 1 — Multi-model commit cost vs table size (ms/commit)\n");
-    println!("| rows | W0 | W1 | W2 | W3 | W4 | W4−W0 | W4/W0 |");
-    println!("|-----:|---:|---:|---:|---:|---:|------:|------:|");
     let mut all: Vec<(u64, [f64; 5])> = Vec::new();
-    for &size in &sizes {
-        eprintln!("[mmreport] ladder at {size} rows…");
-        let mut w = [0.0f64; 5];
-        for (r, wr) in w.iter_mut().enumerate() {
-            *wr = mm_ladder_point(r as u8, size, sample);
-        }
+    if skip_ladder {
         println!(
-            "| {} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2}× |",
-            size,
-            w[0],
-            w[1],
-            w[2],
-            w[3],
-            w[4],
-            w[4] - w[0],
-            w[4] / w[0]
+            "_Skipped: `MM_SKIP_LADDER=1` (the W0→W4 ladder pre-grows build the HNSW vector\n\
+             and graph indexes synchronously — the biggest time sink of a full run, ~2.5 h\n\
+             at default sizes). Omit that flag or include 1 or 2 in `MM_TABLES` to run it._\n"
         );
-        all.push((size, w));
+    } else {
+        println!("| rows | W0 | W1 | W2 | W3 | W4 | W4−W0 | W4/W0 |");
+        println!("|-----:|---:|---:|---:|---:|---:|------:|------:|");
+        for &size in &sizes {
+            eprintln!("[mmreport] ladder at {size} rows…");
+            let mut w = [0.0f64; 5];
+            for (r, wr) in w.iter_mut().enumerate() {
+                *wr = mm_ladder_point(r as u8, size, sample);
+            }
+            println!(
+                "| {} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2}× |",
+                size,
+                w[0],
+                w[1],
+                w[2],
+                w[3],
+                w[4],
+                w[4] - w[0],
+                w[4] / w[0]
+            );
+            all.push((size, w));
+        }
     }
 
     // ---- Table 2: per-model marginal deltas ----
     println!("\n## Table 2 — Per-model marginal maintenance vs size (ms added per commit)\n");
-    println!("| rows | Δ btree (W1−W0) | Δ vector (W2−W1) | Δ edge (W3−W2) | Δ event (W4−W3) |");
-    println!("|-----:|----------------:|-----------------:|---------------:|----------------:|");
-    for (size, w) in &all {
+    if skip_ladder {
+        println!("_Skipped: `MM_SKIP_LADDER=1` — one measurement with Table 1; see there._\n");
+    } else {
         println!(
-            "| {} | {:+.2} | {:+.2} | {:+.2} | {:+.2} |",
-            size,
-            w[1] - w[0],
-            w[2] - w[1],
-            w[3] - w[2],
-            w[4] - w[3]
+            "| rows | Δ btree (W1−W0) | Δ vector (W2−W1) | Δ edge (W3−W2) | Δ event (W4−W3) |"
+        );
+        println!(
+            "|-----:|----------------:|-----------------:|---------------:|----------------:|"
+        );
+        for (size, w) in &all {
+            println!(
+                "| {} | {:+.2} | {:+.2} | {:+.2} | {:+.2} |",
+                size,
+                w[1] - w[0],
+                w[2] - w[1],
+                w[3] - w[2],
+                w[4] - w[3]
+            );
+        }
+        println!(
+            "\n*(small-size deltas are near-noise — every rung sits within a few hundred µs\n\
+             of the fsync floor; the vector column is the one expected to separate as rows\n\
+             grow, since HNSW insert is O(log n) distance computations.)*\n"
         );
     }
-    println!(
-        "\n*(small-size deltas are near-noise — every rung sits within a few hundred µs\n\
-         of the fsync floor; the vector column is the one expected to separate as rows\n\
-         grow, since HNSW insert is O(log n) distance computations.)*\n"
-    );
 
     // ---- Postgres durability lens (shared by Tables 3 & 4) ----
     let pg_method = url.as_deref().and_then(pg_ensure_lens);
 
     // ---- Table 3: CRUD stress, unidb vs Postgres (relational, matched fsync) ----
+    // Gated by the MM_TABLES allowlist (Table 3.1 is gated together with 3).
+    let skip_table3 = should_run_tables_skip(3);
     let crud_rows = env_u64("MM_CRUD_ROWS", 100_000);
     println!("## Table 3 — CRUD stress: unidb (SQL) vs Postgres (relational)\n");
-    println!(
-        "Full CRUD at matched durability — not just INSERT: bulk insert, filtered and\n\
+    if skip_table3 {
+        println!(
+            "_Skipped: excluded by `MM_TABLES` (Table 3 runs unless the allowlist omits 3).\n\
+             Include 3 in `MM_TABLES` — or unset it — to run this table._\n"
+        );
+    } else {
+        println!(
+            "Full CRUD at matched durability — not just INSERT: bulk insert, filtered and\n\
          grouped SELECT, bulk UPDATE, selected and full DELETE. Each row shows how many\n\
          records the operation touched and its throughput (records/sec). Table pre-loaded\n\
          to **{crud_rows} rows** (`MM_CRUD_ROWS` to change).\n\
@@ -2871,25 +2910,25 @@ fn bench_mm_report() {
          **Note on INSERT:** here each row is its **own durable commit** (one fsync/row —\n\
          the per-row latency floor, ~hundreds/sec), which is why it is far below the\n\
          batched bulk-load path in Table 3.1 (one commit per {BULK_COMMIT_BATCH} rows).\n"
-    );
-    if let Some(ref m) = pg_method {
-        println!(
+        );
+        if let Some(ref m) = pg_method {
+            println!(
             "_Durability lens: unidb `{sync_prim}`, Postgres `wal_sync_method={m}` (matched)._\n"
         );
-        let sdir = tempdir().unwrap();
-        let se = Arc::new(bench_engine_open(sdir.path()));
-        se.set_deferred_sync(true);
-        let u = url.as_deref().unwrap();
-        phased("t3_build", || {
-            sql_build_crud(&se, crud_rows);
-            let _ = pg_build_crud(u, crud_rows);
-        });
+            let sdir = tempdir().unwrap();
+            let se = Arc::new(bench_engine_open(sdir.path()));
+            se.set_deferred_sync(true);
+            let u = url.as_deref().unwrap();
+            phased("t3_build", || {
+                sql_build_crud(&se, crud_rows);
+                let _ = pg_build_crud(u, crud_rows);
+            });
 
-        let n = crud_rows;
-        let half = (n / 2) as i64;
-        let base = n as i64;
-        println!(
-            "Extra columns (C1, unidb only): **WAL B/row** = cumulative WAL bytes the op\n\
+            let n = crud_rows;
+            let half = (n / 2) as i64;
+            let base = n as i64;
+            println!(
+                "Extra columns (C1, unidb only): **WAL B/row** = cumulative WAL bytes the op\n\
              appended ÷ records touched (the index-maintenance proof — a `body`-only UPDATE\n\
              should append ~0 index bytes once unchanged indexed columns are skipped);\n\
              **dec/row** = full-row heap decodes ÷ records touched (exposes full-scan waste\n\
@@ -2897,97 +2936,97 @@ fn bench_mm_report() {
              **cols/row** = column *values* materialized into a Literal ÷ records touched\n\
              (Phase B decode-pushdown proof — falls as unreferenced columns, esp. TEXT,\n\
              stop being materialized).\n"
-        );
-        println!("| operation | records | unidb (rec/s) | postgres (rec/s) | unidb ÷ PG | remark (winner · margin) | WAL B/row | dec/row | cols/row |");
-        println!("|-----------|--------:|--------------:|-----------------:|-----------:|:-------------------------|----------:|--------:|---------:|");
-        crud_row_c1(
-            "INSERT (per-row commit)",
-            phased("t3_insert_unidb", || {
-                measured_unidb(&se, || sql_crud_insert(&se, n, base))
-            }),
-            phased("t3_insert_pg", || pg_crud_insert(u, n, base)),
-        );
-        // Refresh statistics on both engines now the table is at full size, so
-        // each planner makes a stats-informed choice for the UPDATE/DELETE below
-        // — unidb's A3 index-vs-scan gate (a selective range takes the B-tree, a
-        // non-selective one the sequential scan) and Postgres's planner alike.
-        // This is the realistic production state and fairer than comparing an
-        // analyzed engine against an un-analyzed one. Untimed setup, like the
-        // pre-grow.
-        phased("t3_analyze", || {
-            let ax = se.begin().unwrap();
-            let _ = se.execute_sql(ax, "ANALYZE t");
-            se.commit(ax).unwrap();
-            if let Ok(mut c) = pg_dial(u) {
-                let _ = c.batch_execute("ANALYZE t");
-            }
-        });
-        // Selectivity fixed at 5% (k < N/20) — matches realistic filtered-SELECT usage.
-        // The previous k < N (100% match) was the worst case for filtering optimisations
-        // and hid the real gap: at 100% selectivity every row materialises regardless.
-        // Verified 2026-07-17 by Fable architectural analysis (cost breakdown in PROGRESS.md).
-        let sel_hi = (n / 20) as i64; // 5 % of rows
-        crud_row_c1(
-            "SELECT filtered (k<N/20, 5%)",
-            phased("t3_selfilt_unidb", || {
-                measured_unidb(&se, || sql_crud_select_filtered(&se, 0, sel_hi))
-            }),
-            phased("t3_selfilt_pg", || pg_crud_select_filtered(u, 0, sel_hi)),
-        );
-        crud_row_c1(
-            "SELECT grouped (GROUP BY g)",
-            phased("t3_selgrp_unidb", || {
-                measured_unidb(&se, || sql_crud_select_grouped(&se, 2 * n))
-            }),
-            phased("t3_selgrp_pg", || pg_crud_select_grouped(u, 2 * n)),
-        );
-        crud_row_c1(
-            "SELECT COUNT(*) (all)",
-            phased("t3_countall_unidb", || {
-                measured_unidb(&se, || sql_crud_count_all(&se, 2 * n))
-            }),
-            phased("t3_countall_pg", || pg_crud_count_all(u, 2 * n)),
-        );
-        crud_row_c1(
-            // HOT-eligible: SET body (not indexed) — cross-page HOT fires on full pages
-            // (item 71). B-tree NOT updated. WAL B/row drops vs non-HOT.
-            "UPDATE HOT-eligible (SET body, k<N/2)",
-            phased("t3_update_unidb", || {
-                measured_unidb(&se, || sql_crud_update_bulk(&se, half))
-            }),
-            phased("t3_update_pg", || pg_crud_update_bulk(u, half)),
-        );
-        crud_row_c1(
-            // Non-HOT: SET k (indexed) — B-tree MUST be patched, HOT never fires.
-            // Targets INSERT-bench rows (k in [N, 3N/2)) so it doesn't disturb
-            // the pre-build range used by filtered SELECT / DELETE.
-            // k+1 keeps these rows in range [N+1, 3N/2+1), still caught by DELETE (k>=N).
-            "UPDATE non-HOT (SET k, k>=N AND k<3N/2)",
-            phased("t3_update_nonhot_unidb", || {
-                measured_unidb(&se, || {
-                    sql_crud_update_nonhot(&se, n as i64, n as i64 + half)
-                })
-            }),
-            phased("t3_update_nonhot_pg", || {
-                pg_crud_update_nonhot(u, n as i64, n as i64 + half)
-            }),
-        );
-        crud_row_c1(
-            "DELETE selected (k>=N)",
-            phased("t3_delsel_unidb", || {
-                measured_unidb(&se, || sql_crud_delete_selected(&se, n as i64))
-            }),
-            phased("t3_delsel_pg", || pg_crud_delete_selected(u, n as i64)),
-        );
-        crud_row_c1(
-            "DELETE all",
-            phased("t3_delall_unidb", || {
-                measured_unidb(&se, || sql_crud_delete_all(&se))
-            }),
-            phased("t3_delall_pg", || pg_crud_delete_all(u)),
-        );
-        println!();
-        println!(
+            );
+            println!("| operation | records | unidb (rec/s) | postgres (rec/s) | unidb ÷ PG | remark (winner · margin) | WAL B/row | dec/row | cols/row |");
+            println!("|-----------|--------:|--------------:|-----------------:|-----------:|:-------------------------|----------:|--------:|---------:|");
+            crud_row_c1(
+                "INSERT (per-row commit)",
+                phased("t3_insert_unidb", || {
+                    measured_unidb(&se, || sql_crud_insert(&se, n, base))
+                }),
+                phased("t3_insert_pg", || pg_crud_insert(u, n, base)),
+            );
+            // Refresh statistics on both engines now the table is at full size, so
+            // each planner makes a stats-informed choice for the UPDATE/DELETE below
+            // — unidb's A3 index-vs-scan gate (a selective range takes the B-tree, a
+            // non-selective one the sequential scan) and Postgres's planner alike.
+            // This is the realistic production state and fairer than comparing an
+            // analyzed engine against an un-analyzed one. Untimed setup, like the
+            // pre-grow.
+            phased("t3_analyze", || {
+                let ax = se.begin().unwrap();
+                let _ = se.execute_sql(ax, "ANALYZE t");
+                se.commit(ax).unwrap();
+                if let Ok(mut c) = pg_dial(u) {
+                    let _ = c.batch_execute("ANALYZE t");
+                }
+            });
+            // Selectivity fixed at 5% (k < N/20) — matches realistic filtered-SELECT usage.
+            // The previous k < N (100% match) was the worst case for filtering optimisations
+            // and hid the real gap: at 100% selectivity every row materialises regardless.
+            // Verified 2026-07-17 by Fable architectural analysis (cost breakdown in PROGRESS.md).
+            let sel_hi = (n / 20) as i64; // 5 % of rows
+            crud_row_c1(
+                "SELECT filtered (k<N/20, 5%)",
+                phased("t3_selfilt_unidb", || {
+                    measured_unidb(&se, || sql_crud_select_filtered(&se, 0, sel_hi))
+                }),
+                phased("t3_selfilt_pg", || pg_crud_select_filtered(u, 0, sel_hi)),
+            );
+            crud_row_c1(
+                "SELECT grouped (GROUP BY g)",
+                phased("t3_selgrp_unidb", || {
+                    measured_unidb(&se, || sql_crud_select_grouped(&se, 2 * n))
+                }),
+                phased("t3_selgrp_pg", || pg_crud_select_grouped(u, 2 * n)),
+            );
+            crud_row_c1(
+                "SELECT COUNT(*) (all)",
+                phased("t3_countall_unidb", || {
+                    measured_unidb(&se, || sql_crud_count_all(&se, 2 * n))
+                }),
+                phased("t3_countall_pg", || pg_crud_count_all(u, 2 * n)),
+            );
+            crud_row_c1(
+                // HOT-eligible: SET body (not indexed) — cross-page HOT fires on full pages
+                // (item 71). B-tree NOT updated. WAL B/row drops vs non-HOT.
+                "UPDATE HOT-eligible (SET body, k<N/2)",
+                phased("t3_update_unidb", || {
+                    measured_unidb(&se, || sql_crud_update_bulk(&se, half))
+                }),
+                phased("t3_update_pg", || pg_crud_update_bulk(u, half)),
+            );
+            crud_row_c1(
+                // Non-HOT: SET k (indexed) — B-tree MUST be patched, HOT never fires.
+                // Targets INSERT-bench rows (k in [N, 3N/2)) so it doesn't disturb
+                // the pre-build range used by filtered SELECT / DELETE.
+                // k+1 keeps these rows in range [N+1, 3N/2+1), still caught by DELETE (k>=N).
+                "UPDATE non-HOT (SET k, k>=N AND k<3N/2)",
+                phased("t3_update_nonhot_unidb", || {
+                    measured_unidb(&se, || {
+                        sql_crud_update_nonhot(&se, n as i64, n as i64 + half)
+                    })
+                }),
+                phased("t3_update_nonhot_pg", || {
+                    pg_crud_update_nonhot(u, n as i64, n as i64 + half)
+                }),
+            );
+            crud_row_c1(
+                "DELETE selected (k>=N)",
+                phased("t3_delsel_unidb", || {
+                    measured_unidb(&se, || sql_crud_delete_selected(&se, n as i64))
+                }),
+                phased("t3_delsel_pg", || pg_crud_delete_selected(u, n as i64)),
+            );
+            crud_row_c1(
+                "DELETE all",
+                phased("t3_delall_unidb", || {
+                    measured_unidb(&se, || sql_crud_delete_all(&se))
+                }),
+                phased("t3_delall_pg", || pg_crud_delete_all(u)),
+            );
+            println!();
+            println!(
             "### Table 3 — Known honest ceilings (verified; do not re-investigate without new evidence)\n\
              \n\
              | operation | current ratio | ceiling | root cause | revisit when |\n\
@@ -3000,19 +3039,24 @@ fn bench_mm_report() {
              \n\
              _Correction (2026-07-19): prior ceilings (DELETE ~0.07×, UPDATE HOT ~0.40×, UPDATE non-HOT ~0.07× structural) were set before items 75–84 and have been superseded by measured results. Old ceilings are preserved in git history (commit ff3f7af). Do not use them as targets._\n"
         );
-    } else {
-        println!(
+        } else {
+            println!(
             "_`PG_URL` unset → Postgres columns skipped. Set it (superuser conn) to fill this table._\n"
         );
+        }
     }
 
     // ---- Table 3.1: bulk stress — insert + full-scan select at scale ----
+    // Gated together with Table 3 (same MM_TABLES entry).
     let bulk_sizes: Vec<u64> = std::env::var("MM_BULK_SIZES")
         .ok()
         .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
         .unwrap_or_else(|| vec![10_000, 1_000_000, 2_000_000]);
     println!("## Table 3.1 — Bulk stress: insert + full-scan select at scale\n");
-    println!(
+    if skip_table3 {
+        println!("_Skipped: excluded by `MM_TABLES` — gated together with Table 3._\n");
+    } else {
+        println!(
         "Scaling behaviour of a single-table load and a full-table scan as the row count\n\
          climbs. For each size a **fresh** table is built, `n` rows are bulk-inserted\n\
          (batched prepared single-row inserts, one durable commit per {BULK_COMMIT_BATCH}\n\
@@ -3029,49 +3073,50 @@ fn bench_mm_report() {
          default, so a large scan-side lead here reflects PG's parallel degree, not per-row\n\
          storage speed).\n"
     );
-    if let Some(ref m) = pg_method {
-        println!(
+        if let Some(ref m) = pg_method {
+            println!(
             "_Durability lens: unidb `{sync_prim}`, Postgres `wal_sync_method={m}` (matched)._\n"
         );
-        println!(
+            println!(
             "| rows | unidb insert (rec/s) | postgres insert (rec/s) | insert winner · margin | unidb scan (rec/s) | postgres scan (rec/s) | scan winner · margin |"
         );
-        println!(
+            println!(
             "|-----:|---------------------:|------------------------:|:-----------------------|-------------------:|----------------------:|:---------------------|"
         );
-        let u = url.as_deref().unwrap();
-        for &n in &bulk_sizes {
-            eprintln!("[mmreport] Table 3.1 bulk at {n} rows…");
-            let bdir = tempdir().unwrap();
-            let be = Arc::new(bench_engine_open(bdir.path()));
-            be.set_deferred_sync(true);
-            let ui = phased(&format!("t31_insert_unidb_{n}"), || sql_bulk_insert(&be, n));
-            let pi = phased(&format!("t31_insert_pg_{n}"), || pg_bulk_insert(u, n));
-            let us = phased(&format!("t31_select_unidb_{n}"), || sql_bulk_select(&be, n));
-            let ps = phased(&format!("t31_select_pg_{n}"), || pg_bulk_select(u, n));
-            let (ui_r, pi_r) = (rps(ui.0, ui.1), rps(pi.0, pi.1));
-            let (us_r, ps_r) = (rps(us.0, us.1), rps(ps.0, ps.1));
-            println!(
-                "| {n} | {ui_r:.0} | {pi_r:.0} | {} | {us_r:.0} | {ps_r:.0} | {} |",
-                winner_remark(ui_r, pi_r),
-                winner_remark(us_r, ps_r),
-            );
+            let u = url.as_deref().unwrap();
+            for &n in &bulk_sizes {
+                eprintln!("[mmreport] Table 3.1 bulk at {n} rows…");
+                let bdir = tempdir().unwrap();
+                let be = Arc::new(bench_engine_open(bdir.path()));
+                be.set_deferred_sync(true);
+                let ui = phased(&format!("t31_insert_unidb_{n}"), || sql_bulk_insert(&be, n));
+                let pi = phased(&format!("t31_insert_pg_{n}"), || pg_bulk_insert(u, n));
+                let us = phased(&format!("t31_select_unidb_{n}"), || sql_bulk_select(&be, n));
+                let ps = phased(&format!("t31_select_pg_{n}"), || pg_bulk_select(u, n));
+                let (ui_r, pi_r) = (rps(ui.0, ui.1), rps(pi.0, pi.1));
+                let (us_r, ps_r) = (rps(us.0, us.1), rps(ps.0, ps.1));
+                println!(
+                    "| {n} | {ui_r:.0} | {pi_r:.0} | {} | {us_r:.0} | {ps_r:.0} | {} |",
+                    winner_remark(ui_r, pi_r),
+                    winner_remark(us_r, ps_r),
+                );
+            }
+            println!();
+        } else {
+            println!("_`PG_URL` unset → unidb-only bulk numbers (no Postgres comparison)._\n");
+            println!("| rows | unidb insert (rec/s) | unidb scan (rec/s) |");
+            println!("|-----:|---------------------:|-------------------:|");
+            for &n in &bulk_sizes {
+                eprintln!("[mmreport] Table 3.1 bulk at {n} rows…");
+                let bdir = tempdir().unwrap();
+                let be = Arc::new(bench_engine_open(bdir.path()));
+                be.set_deferred_sync(true);
+                let ui = phased(&format!("t31_insert_unidb_{n}"), || sql_bulk_insert(&be, n));
+                let us = phased(&format!("t31_select_unidb_{n}"), || sql_bulk_select(&be, n));
+                println!("| {n} | {:.0} | {:.0} |", rps(ui.0, ui.1), rps(us.0, us.1));
+            }
+            println!();
         }
-        println!();
-    } else {
-        println!("_`PG_URL` unset → unidb-only bulk numbers (no Postgres comparison)._\n");
-        println!("| rows | unidb insert (rec/s) | unidb scan (rec/s) |");
-        println!("|-----:|---------------------:|-------------------:|");
-        for &n in &bulk_sizes {
-            eprintln!("[mmreport] Table 3.1 bulk at {n} rows…");
-            let bdir = tempdir().unwrap();
-            let be = Arc::new(bench_engine_open(bdir.path()));
-            be.set_deferred_sync(true);
-            let ui = phased(&format!("t31_insert_unidb_{n}"), || sql_bulk_insert(&be, n));
-            let us = phased(&format!("t31_select_unidb_{n}"), || sql_bulk_select(&be, n));
-            println!("| {n} | {:.0} | {:.0} |", rps(ui.0, ui.1), rps(us.0, us.1));
-        }
-        println!();
     }
 
     // ---- Table 4: unidb multi-model (1 txn) vs the replaced stack, tx-count sweep ----
@@ -3678,16 +3723,16 @@ fn bench_ivf_scale_validation() {
         let cold_ms = cold_start.elapsed().as_secs_f64() * 1000.0;
 
         // ---- warm-cache latency: after 50 warm-up queries, measure 50 more ----
-        for i in 1..50.min(N_QUERIES) {
+        for sql in query_sqls.iter().take(50.min(N_QUERIES)).skip(1) {
             let w = engine.begin().unwrap();
-            engine.execute_sql(w, &query_sqls[i]).unwrap();
+            engine.execute_sql(w, sql).unwrap();
             engine.commit(w).unwrap();
         }
         let warm_n = N_QUERIES.saturating_sub(50).max(1);
         let warm_start = std::time::Instant::now();
-        for i in 50..N_QUERIES {
+        for sql in query_sqls.iter().take(N_QUERIES).skip(50) {
             let w = engine.begin().unwrap();
-            engine.execute_sql(w, &query_sqls[i]).unwrap();
+            engine.execute_sql(w, sql).unwrap();
             engine.commit(w).unwrap();
         }
         let warm_ms = warm_start.elapsed().as_secs_f64() * 1000.0 / warm_n as f64;
@@ -3840,18 +3885,22 @@ fn bench_hnsw_l0_cache() {
 
         // Warm-up: WARM_RUNS queries populate both the L0 cache (item 72) and
         // the vector hot cache (item 73)
-        for i in 1..=WARM_RUNS.min(N_QUERIES - 1) {
+        for sql in query_sqls
+            .iter()
+            .take(WARM_RUNS.min(N_QUERIES - 1) + 1)
+            .skip(1)
+        {
             let w = engine.begin().unwrap();
-            engine.execute_sql(w, &query_sqls[i]).unwrap();
+            engine.execute_sql(w, sql).unwrap();
             engine.commit(w).unwrap();
         }
 
         // Warm: measure remaining queries (L0 cache hot)
         let warm_n = (N_QUERIES - WARM_RUNS - 1).max(1);
         let warm_start = Instant::now();
-        for i in (WARM_RUNS + 1)..N_QUERIES {
+        for sql in query_sqls.iter().take(N_QUERIES).skip(WARM_RUNS + 1) {
             let w = engine.begin().unwrap();
-            engine.execute_sql(w, &query_sqls[i]).unwrap();
+            engine.execute_sql(w, sql).unwrap();
             engine.commit(w).unwrap();
         }
         let warm_ms = warm_start.elapsed().as_secs_f64() * 1000.0 / warm_n as f64;

@@ -44,33 +44,50 @@
 #
 # ── Table-selection knobs (reduce bench time for per-item runs) ───────────────
 #
-# Full run (all tables) takes ~4 hours. The dominant bottleneck is Table 4
-# (HNSW vector-index build at 100k rows, ~45 min). Use these knobs to skip
-# tables that aren't relevant to the change being measured.
+# Full run (all tables) takes ~4 hours. Where the time actually goes (measured
+# via the per-phase docker-stats samples of report_20260719_234504): Tables 1+2
+# — the W0→W4 ladder, whose W2–W4 pre-grows build the HNSW + graph indexes
+# synchronously — are the single biggest sink (~2.5 h); Table 4's 100k point is
+# ~45 min; everything else is minutes. Use these knobs to skip tables that
+# aren't relevant to the change being measured (item 105; they work in BOTH
+# native and Docker modes):
 #
+#   MM_SKIP_LADDER=1   skip Tables 1+2 (W0→W4 ladder, ~2.5 h — the biggest sink)
 #   MM_SKIP_TABLE4=1   skip Table 4 + 4.1 (HNSW at-scale, ~45 min)
 #   MM_SKIP_TABLE5=1   skip Table 5 (FK relational-integrity stress, ~5–10 min)
-#   MM_TABLES=1,2,3    allowlist — run ONLY these tables (overrides skip flags)
+#   MM_TABLES=1,2,3    allowlist — run ONLY these tables (overrides skip flags;
+#                      1+2 are one measurement, 3.1 is gated with 3)
+#
+#   MM_BASELINE=<path-to-full-report.md>
+#       Carry every skipped table forward from that baseline report instead of
+#       leaving holes: the table is copied in with an explicit provenance stamp
+#       ("Carried forward — NOT re-measured in this run", source file, commit,
+#       date). compare_bench.py ignores carried-forward tables. Only valid when
+#       the change provably does not touch shared layers (WAL, commit path,
+#       buffer pool, heap, page format) — those affect EVERY table, so re-run
+#       the full bench for such changes, and keep taking a fresh full baseline
+#       per major release.
 #
 # Per-item bench profiles — pick the right one for each item:
 #
-#   WAL / commit path (e.g. item 101 group commit):
-#     MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1 scripts/report.sh          # ~1.5 hr
-#
-#   B-tree / CRUD / index / heap (e.g. item 102 index-only scan):
-#     MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1 scripts/report.sh          # ~1.5 hr
+#   WAL / commit path / B-tree / CRUD / index / heap (SHARED layers — the skips
+#   above are about time, not relevance; do NOT carry Table 4/5 forward for a
+#   commit-path change without thinking):
+#     MM_SKIP_LADDER=1 MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1 \
+#       MM_BASELINE=docs/performance/report_<last_full>.md scripts/report.sh   # ~30–45 min
 #
 #   HNSW / vector changes (e.g. items 67, 72, 93):
-#     scripts/report.sh                                              # ~4 hr (Table 4 IS the signal)
+#     scripts/report.sh                                    # ~4 hr (Tables 1/2/4 ARE the signal)
 #
 #   FK / relational-integrity changes (e.g. item 36):
-#     MM_SKIP_TABLE4=1 scripts/report.sh                            # ~2 hr
+#     MM_SKIP_LADDER=1 MM_SKIP_TABLE4=1 scripts/report.sh              # ~30 min
 #
 #   Concurrency correctness only (no throughput tables):
-#     scripts/report.sh --conc                                       # ~20 min
+#     scripts/report.sh --conc                                          # ~20 min
 #
-#   Full historical baseline comparison (explicitly requested only):
-#     scripts/report.sh                                              # ~4 hr (no flags)
+#   Full historical baseline comparison (per major release, or after any
+#   shared-layer change):
+#     scripts/report.sh                                                 # ~4 hr (no flags)
 #
 # The report header records which tables ran, so every report is self-contained.
 # Do NOT run the full ~4 hr bench for items that only touch WAL/CRUD/B-tree code.
@@ -106,7 +123,7 @@ case "${1:-}" in
   --native) MODE="native"; shift ;;
   --docker) MODE="docker"; shift ;;
   --conc)   MODE="conc";   shift ;;
-  -h|--help) sed -n '2,47p' "$0"; exit 0 ;;
+  -h|--help) awk 'NR==1{next} /^set -euo pipefail/{exit} {print}' "$0"; exit 0 ;;
 esac
 
 docker_ok() { command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; }
@@ -242,6 +259,15 @@ fi
 if [[ -z "${REPORT:-}" || ! -f "$REPORT" ]]; then
   echo "[report] FATAL: no report file was produced." >&2
   exit 1
+fi
+
+# ── carry skipped tables forward from a baseline report (MM_BASELINE) ───────
+# Post-processing on the host, so it works identically for native and Docker
+# runs. Each stitched table gets a provenance stamp; compare_bench.py skips
+# carried-forward sections.
+if [[ -n "${MM_BASELINE:-}" ]]; then
+  python3 "$REPO_ROOT/scripts/stitch_baseline.py" "$REPORT" "$MM_BASELINE" || \
+    echo "[report] WARNING: baseline stitching failed (report still valid, holes remain)." >&2
 fi
 
 # ── append the concurrency correctness matrix (native, both modes) ──────────

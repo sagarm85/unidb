@@ -48,6 +48,11 @@ CONC_REPEATS=10 scripts/report.sh --conc   # tighten the intermittency net
 | `MM_BULK_SIZES` | `10000,1000000,2000000` | Row counts for the bulk insert+scan stress sweep (Table 3.1). Default tops out at 2M; push to `5000000`/`10000000` for a heavier run (5M ≈ 2.7 min insert/engine). |
 | `MM_TX_SWEEP` | `1000,10000,100000,1000000` | Tx counts for the multi-model-vs-Postgres sweep (Table 4). |
 | `MM_REPLACED_STACK` | _(unset)_ | `1` → Table 4 adds the §6 replaced-stack column (row + pgvector + graph + queue as four independent commits, no shared txn) + a crash-consistency verdict. Needs a pgvector-enabled Postgres (`CREATE EXTENSION vector`); the Docker image already has it. |
+| `MM_TABLES` | _(unset)_ | Allowlist — run ONLY these tables (e.g. `3`). Tables 1+2 are one measurement (either runs both); 3.1 is gated with 3. |
+| `MM_SKIP_LADDER` | _(unset)_ | `1` skips Tables 1+2 (the W0→W4 ladder — its synchronous HNSW/graph pre-grows are ~2.5 h of a full run, the biggest sink). |
+| `MM_SKIP_TABLE4` | _(unset)_ | `1` skips Table 4 + 4.1 (HNSW at-scale, ~45 min at 100k). |
+| `MM_SKIP_TABLE5` | _(unset)_ | `1` skips Table 5 (FK stress, ~5–10 min). |
+| `MM_BASELINE` | _(unset)_ | Path to a previous full report — every skipped table is carried forward from it with a provenance stamp (`stitch_baseline.py`) instead of leaving a hole. Only for changes that don't touch shared layers (WAL/commit/buffer pool/heap/page format); take a fresh full baseline per major release. |
 | `CONC_REPEATS` | `3` | Repeats per concurrency-matrix cell (a cell FAILs if any repeat violates its oracle). |
 | `CONC_SPIN` | `= cores` | CPU-contention spinner threads during the matrix (`0` disables). |
 | `CONC_ROUNDS` | `1` | Concurrency-matrix workload-size multiplier. |
@@ -61,6 +66,11 @@ MM_TX_SWEEP=10000,100000,1000000 scripts/report.sh
 
 # Quick smoke:
 MM_SIZES=1000 MM_SAMPLE=30 MM_CRUD_ROWS=5000 MM_BULK_SIZES=10000,100000 MM_TX_SWEEP=1000,10000 scripts/report.sh
+
+# Per-item CRUD run (~30–45 min instead of ~4 h): skip the vector-heavy tables,
+# carry them forward from the last full report with a provenance stamp:
+MM_SKIP_LADDER=1 MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1 \
+  MM_BASELINE=docs/performance/report_<last_full>.md scripts/report.sh
 ```
 
 ### Where the output lands
@@ -114,6 +124,8 @@ The fair-fsync rationale and its caveats live in [`../docker/fair_fsync_benchmar
 | `multi_model_report.sh` | The **native** report engine: builds the `decompose` bench, runs its `mmreport` mode, captures peak RSS, assembles the markdown. Invoked by `report.sh --native`. |
 | `docker_report.sh` | The **Docker** report runner: builds the image, brings up Postgres + the bench on Linux, samples `docker stats` for CPU/mem, and post-processes. Invoked by `report.sh --docker`. |
 | `mm_resource_report.py` | Correlates the bench's phase windows (`phases.csv`) with `docker stats` samples (`stats.csv`) into the per-phase CPU/memory table. Called by `docker_report.sh`. |
+| `stitch_baseline.py` | Carries skipped tables forward from the `MM_BASELINE` report into the fresh one, provenance-stamped ("Carried forward — NOT re-measured"). Called by `report.sh` when `MM_BASELINE` is set. |
+| `compare_bench.py` | Prints the informational delta table vs the promoted benchmark at the end of every run. Section-aware: carried-forward tables are excluded from the comparison. |
 
 ---
 

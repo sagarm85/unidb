@@ -73,6 +73,14 @@ services:
       MM_CRUD_ROWS: "${MM_CRUD_ROWS:-100000}"
       MM_BULK_SIZES: "${MM_BULK_SIZES:-10000,1000000,2000000}"
       MM_TX_SWEEP: "${MM_TX_SWEEP:-1000,10000,100000,1000000}"
+      # Table-selection knobs (item 105). Without these pass-throughs the
+      # documented per-item profiles (MM_SKIP_TABLE4=1 … scripts/report.sh
+      # --docker) silently ran the FULL ~4 h bench in Docker mode.
+      MM_TABLES: "${MM_TABLES:-}"
+      MM_SKIP_LADDER: "${MM_SKIP_LADDER:-}"
+      MM_SKIP_TABLE4: "${MM_SKIP_TABLE4:-}"
+      MM_SKIP_TABLE5: "${MM_SKIP_TABLE5:-}"
+      MM_FK_ORDERS: "${MM_FK_ORDERS:-}"
       # Table 4 headline: add the §6 replaced-stack column (row + pgvector + graph
       # + queue, four independent commits) when set to 1. Needs the pgvector image.
       MM_REPLACED_STACK: "${MM_REPLACED_STACK:-}"
