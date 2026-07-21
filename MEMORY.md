@@ -12,6 +12,17 @@
 
 ## Current status
 
+- **Item 108 — RESOLVED 2026-07-21 (same day): CRUD drift was ENVIRONMENTAL, no unidb regression.**
+  Absolutes (§0.6 rule 4): PG's code-identical absolutes moved 2.1–28× between the 07-19/07-21
+  runs (VM fsync ~30×, CPU ~2.15× — why the 07-19 run took 229 min); unidb improved on EVERY row
+  in absolutes (INSERT 138→4,128 rec/s; filtered 812k→2.72M) and WAL-B/row (INSERT 6,366→584 —
+  item 104's signature; HOT 154→88; DELETE sel 39→5). No bisection needed. Shipped: PG-absolute
+  environment canary in compare_bench.py (median drift >25% → warning; fires at 173% on this
+  pair), decompose.rs ceilings table refreshed to 07-21 values, inline correction of the
+  item-104 COUNT claim in PROGRESS.md (real evidence = WAL-B/row + W0, not the COUNT ratio).
+  Rule: cross-run ratio deltas are evidence only when the canary is quiet; else judge by
+  absolutes + WAL-B/row.
+
 - **Consolidated Docker bench — RUN + RECORDED 2026-07-21** (`docs/performance/report_20260721_035629.md`,
   94m 54s total — bench got 2.4× faster since 07-19 because HNSW insert improvements shrank the ladder;
   promoted as canonical benchmark + standing `MM_BASELINE`). Verdicts: **item 104 VALIDATED**
@@ -3640,6 +3651,15 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-21 (same session) — Item 108 resolved same-day: drift = environment
+
+Absolutes-first comparison closed it in one step, no bisection: PG code-identical absolutes
+moved 2.1–28× across the two runs; unidb improved everywhere (absolutes + WAL-B/row). Shipped
+compare_bench.py env canary (>25% PG-absolute median drift → warning), refreshed the stale
+decompose.rs ceilings table (now 07-21 values + absolutes-first protocol note), corrected the
+item-104 COUNT-baseline claim in PROGRESS.md inline. Item 107 (async HNSW) is now the sole
+open finding from the bench.
 
 ### 2026-07-21 (same session, after item 92) — Consolidated Docker bench + items 107/108 filed
 
