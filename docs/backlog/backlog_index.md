@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `107_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `109_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -114,10 +114,12 @@
 | 104 | `104_catalog_sync_dedup.md` | Performance | ✅ SHIPPED 2026-07-20 — remove `wal.sync_up_to(catalog_lsn)` after `catalog.persist_only()` in commit; `ROW_COUNT_UNKNOWN` sentinel on load; COUNT(*) calibrates via heap scan after crash. See PROGRESS.md "Item 104". |
 | 105 | `105_bench_selective_carry_forward.md` | Improvement | ✅ SHIPPED 2026-07-21 — bench-time reduction: `MM_SKIP_LADDER` (Tables 1+2, ~2.5 h sink), `MM_TABLES` honored by ALL tables, knobs threaded through Docker (were silently ignored), `MM_BASELINE` carry-forward stitching with provenance stamps (`stitch_baseline.py`), section-aware `compare_bench.py` (also fixes Table-4-vs-W4/W0 parse collision). CRUD-item runs ~4 h → ~30–45 min. |
 | 106 | `106_vector_pgvector_class_tier.md` | Performance | ⏳ NOT STARTED — pgvector-class NEAR tier (≤400 µs at 10k, recall ≥0.90): graph-quality heuristic selection, SQ8 slab quantization, re-rank decode-pushdown; Step-0 = recall-vs-ef curve. Filed 2026-07-21 from item 92 acceptance revision. |
+| 107 | `107_async_hnsw_commit_path.md` | Performance | ⏳ NOT STARTED — synchronous HNSW insert breaks the W4≈W0 thesis (Δvector +6.6→+17.6 ms/commit, W4/W0 96× at 100k, Table 4 0.01×; 2026-07-21 bench); implement M2's locked design: async HNSW maintenance in a background worker; Step-0 = audit item 67 coverage + freshness contract. |
+| 108 | `108_crud_ratio_regression_check.md` | Performance | ⏳ NOT STARTED — CRUD ratio drift vs 2026-07-19 report (SELECT filtered 0.74→0.45×, UPDATE HOT 1.51→1.06×, others −11–39%; COUNT(*) 6.93→41.25× ✓); classify via absolute rec/s, bisect real regressions with item-105 selective runs; refresh stale ceilings table in decompose.rs. |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `107_…`.**
+**Next new file → `109_…`.**
 
 ## Next up — priority order (2026-07-20, post PR #171 merge + 102-B)
 

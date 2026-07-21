@@ -9519,3 +9519,46 @@ Crash harness 54/54. `cargo clippy -- -D warnings` + `--test perf_item92`
 clean; fmt clean. Recall@10 at 10k = 0.900 (gate ≥ 0.90) unchanged across
 all levers. Pre-existing flake (item102 global-counter race) and
 pre-existing test-binary clippy lints flagged as separate follow-up tasks.
+
+## Consolidated Docker bench — validation-debt run   [RECORDED]   2026-07-21
+
+**Report:** `docs/performance/report_20260721_035629.md` (Docker fair-fsync,
+main+item 92 @ `b6d6e5f`, all tables, sizes 1k/10k/100k, sample 200).
+Promoted as canonical benchmark (`docker/out/benchmark_20260721_133227.md`)
+and designated the standing `MM_BASELINE` for item-105 selective runs.
+**Total 94m 54s** — down from ~230 min two days ago; the ladder pre-grows
+got cheap because the HNSW insert path improved (items 65/67/93), which
+itself validates item 105's timing analysis.
+
+### Verdicts on the debt items
+
+- **Item 104 (fsync dedup): VALIDATED.** W0 ladder rung 0.23 ms/commit at
+  100k; `SELECT COUNT(*)` **6.93× → 41.25×** vs PG (the O(1) count now
+  survives via checkpoint-persisted row_count). Serial per-row INSERT ratio
+  unchanged (0.47× vs 0.53× — within drift; the dedup's win is the removed
+  serialization point, visible in W0, not the single-writer fsync floor).
+- **Items 72/73/93 + NodeCache gate: VALIDATED at 100k.** Table 4 multi-model
+  txn cost at 100k **81.8 → 13.4 ms/txn (6.1×)** vs the 2026-07-19 report;
+  no NodeCache-style blowup at scale.
+- **Item 92 W2-rung check: no query-side regression** (W2 rung is
+  insert-dominated; see item 107). Linux NEAR latency spot-check still open
+  (mmreport does not measure NEAR; run `perf_item92` in-container when
+  needed).
+- **Item 85 / concurrency: 32 PASS · 0 FAIL** including cross-row-churn.
+
+### Findings → new items
+
+- **Item 107 (filed): synchronous HNSW insert breaks the W4≈W0 thesis** —
+  Δvector +6.6→+17.6 ms/commit (1k→100k), W4/W0 19.5×/17.6×/96.0×, Table 4
+  0.03×/0.02×/0.01× vs PG floor. Root cause is architectural, not a
+  regression: item 63's IVF→HNSW switch made per-commit vector maintenance
+  a beam search (the old W4/W0≈1.5 baseline was IVF-era), and item 104
+  made W0 faster, widening the ratio. CLAUDE.md M2 already prescribes the
+  fix (async HNSW maintenance in a background worker) — item 107 implements
+  the locked design.
+- **Item 108 (filed): CRUD ratio drift vs 2026-07-19** — SELECT filtered
+  0.74→0.45×, UPDATE HOT 1.51→1.06×, UPDATE non-HOT 0.81→0.65×, DELETEs
+  down 26–39%, GROUP BY stable. ~15 items merged between runs; classify via
+  absolute rec/s (ratios conflate PG-side variance), then bisect with
+  item-105 selective runs. The in-bench "known honest ceilings" table is
+  also stale (still quotes items-75-84-era numbers) — refresh under 108.
