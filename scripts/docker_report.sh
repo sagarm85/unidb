@@ -34,6 +34,14 @@ export MM_SAMPLE="${MM_SAMPLE:-200}"
 # The compose default includes 1M, which takes 50+ min for unidb alone.
 # Override to 1M+ with: MM_TX_SWEEP=1000,10000,100000,1000000 scripts/docker_report.sh
 export MM_TX_SWEEP="${MM_TX_SWEEP:-1000,10000,100000}"
+# Table-selection knobs (item 105) — forwarded into the bench container via
+# docker-compose. Empty means "run it"; see scripts/report.sh header for the
+# per-item profiles that combine them.
+export MM_TABLES="${MM_TABLES:-}"
+export MM_SKIP_LADDER="${MM_SKIP_LADDER:-}"
+export MM_SKIP_TABLE4="${MM_SKIP_TABLE4:-}"
+export MM_SKIP_TABLE5="${MM_SKIP_TABLE5:-}"
+export MM_FK_ORDERS="${MM_FK_ORDERS:-}"
 # MM_REPLACED_STACK=1 → Table 4 adds the §6 replaced-stack column (row + pgvector
 # + graph + queue as four independent commits) + a crash-consistency verdict.
 # The compose file uses the pgvector image so the vector role can run.

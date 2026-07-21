@@ -37,7 +37,7 @@
 | 21 | `21_observability_metrics.md` | Improvement | ✅ SHIPPED (PROGRESS: Observability metrics enrichment (item 21)) |
 | 22 | `22_logs_surface.md` | Improvement | ✅ SHIPPED (PROGRESS: Logs surface — JSON structured logs, correlation ids, bounded /logs tail) |
 | 23 | `23_storage_service.md` | Milestone | ✅ SHIPPED (PROGRESS: Object storage service — MinIO/S3 tiering over engine metadata (item 23)) |
-| 24 | `24_authz_v2_policies.md` | Milestone | 🔄 PARTIAL — Z1 (DDL) + Z2 (per-op policies) + Z3(JWT) + Z5 (catalog) + Z6 (`current_user` + `/auth/preview`) SHIPPED 2026-07-19. **REMAINING (2026-07-20 fresh-mind review, live-probe confirmed): Z3 write-side `WITH CHECK` on UPDATE — ESCAPE CONFIRMED (`UPDATE … SET user_id='bob'` transfers a row out of the owner's policy; probe archived in scratchpad); bootstrap-mode silent no-enforcement (policies inert until first `CREATE USER` — no warning); Z4 (role inheritance/column grants).** See item 100 for the separate login-endpoint gap. |
+| 24 | `24_authz_v2_policies.md` | Milestone | 🔄 PARTIAL — Z1 (DDL) + Z2 (per-op policies) + Z3(JWT) + Z5 (catalog) + Z6 (`current_user` + `/auth/preview`) SHIPPED 2026-07-19. _Correction (2026-07-21): the previous "REMAINING" list here went stale the same day it was written — the R-a `WITH CHECK` UPDATE escape and R-b bootstrap silent-no-enforcement were both FIXED later on 2026-07-20 in PR #168 (with item 100), as the "Next up" section below already records._ **Genuinely remaining: Z4 (role inheritance / column grants) — deferred.** |
 | 25 | `25_multipage_catalog.md` | Improvement | ✅ SHIPPED 2026-07-13 (multi-page chain; no FORMAT_VERSION bump; P33 crash point; item-23 ceiling lifted) |
 | 26 | `26_event_queue_scale.md` | Improvement | ✅ SHIPPED 2026-07-13 (seq index, EventWake push, Q3 vacuum-correct) |
 | 27 | `27_vacuum_per_table.md` | Improvement | ✅ SHIPPED 2026-07-13 |
@@ -112,10 +112,11 @@
 | 102 | `102_index_only_scan.md` | Performance | ✅ SHIPPED 2026-07-20 — Phase A (PR #169): key-col projection index-only, `IDX_ONLY_ROWS`; Phase B (PR #177): covering index `INCLUDE (cols)`, FORMAT_VERSION 12, `IDX_INCLUDE_ROWS`, HOT gate for INCLUDE cols. |
 | 103 | `103_authz_v2_studio_integration_gaps.md` | Improvement | ✅ SHIPPED 2026-07-20 (PR #173) — superuser/no-sub RLS bypass on concurrent-read path; `ReadHandle::execute_sql_as`; doc fixes (`CREATE ROLE SUPERUSER` → `CREATE USER SUPERUSER`, add `role_members`/`users` to catalog virtual relations). See PROGRESS.md "Item 103". |
 | 104 | `104_catalog_sync_dedup.md` | Performance | ✅ SHIPPED 2026-07-20 — remove `wal.sync_up_to(catalog_lsn)` after `catalog.persist_only()` in commit; `ROW_COUNT_UNKNOWN` sentinel on load; COUNT(*) calibrates via heap scan after crash. See PROGRESS.md "Item 104". |
+| 105 | `105_bench_selective_carry_forward.md` | Improvement | ✅ SHIPPED 2026-07-21 — bench-time reduction: `MM_SKIP_LADDER` (Tables 1+2, ~2.5 h sink), `MM_TABLES` honored by ALL tables, knobs threaded through Docker (were silently ignored), `MM_BASELINE` carry-forward stitching with provenance stamps (`stitch_baseline.py`), section-aware `compare_bench.py` (also fixes Table-4-vs-W4/W0 parse collision). CRUD-item runs ~4 h → ~30–45 min. |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `105_…`.**
+**Next new file → `106_…`.**
 
 ## Next up — priority order (2026-07-20, post PR #171 merge + 102-B)
 

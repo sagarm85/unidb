@@ -9403,3 +9403,65 @@ All 9 PASS. Existing `tests/subquery.rs` (9 tests) also PASS — no regression.
 Pure SQL surface / RLS-rewrite change. No page format, WAL record type, or storage
 layer touched. Crash harness unchanged. No `FORMAT_VERSION` bump.
 **Full suite:** `cargo test` — all tests pass (no regressions).
+
+## Item 105 — Selective bench runs + baseline carry-forward   [SHIPPED]   2026-07-21
+
+**Branch:** `claude/session-status-check-fae1c3` | **Type:** Improvement (bench tooling — no engine code touched)
+
+### Problem
+
+A full `scripts/report.sh` run takes ~4 h — unjustifiable for per-item
+validation when most tables are unaffected. Measured breakdown (per-phase
+`docker stats` sample counts in `report_20260719_234504.md`, 230 min total):
+Tables 1+2 (W0→W4 ladder, synchronous HNSW/graph pre-grows) ~2.5 h; Table 4 at
+100k ~45 min; everything else minutes. ~85 % of wall clock is the slow
+incremental HNSW insert path (items 63/65/92) — the bench time is itself a
+benchmark finding.
+
+### Bugs found & fixed en route
+
+1. **Docker mode ignored every table-selection knob** — `MM_TABLES` /
+   `MM_SKIP_TABLE4` / `MM_SKIP_TABLE5` were never passed through
+   `docker-compose.yml`; the documented per-item profiles silently ran the
+   full ~4 h bench in the recommended (Docker) mode.
+2. **`MM_TABLES` allowlist only honored by Tables 4 and 5** — Tables 1/2/3/3.1
+   always ran regardless.
+3. **`compare_bench.py` parse collision** — Table 4 rows (integer first col,
+   `×` last col) silently overwrote Table 1's W4/W0 delta entries.
+
+### What shipped
+
+- `benches/decompose.rs`: all tables gated; new `MM_SKIP_LADDER=1` skips
+  Tables 1+2 (one measurement; `MM_TABLES` listing either runs both; 3.1 gated
+  with 3). Skipped tables emit a `_Skipped:` marker under their heading.
+- `docker/docker-compose.yml` + `scripts/docker_report.sh`: knobs threaded
+  into the bench container (fixes bug 1).
+- `scripts/stitch_baseline.py` (new) + `MM_BASELINE=<report.md>` hook in
+  `report.sh`: skipped tables are carried forward from a named baseline with a
+  provenance stamp — "**Carried forward — NOT re-measured in this run**"
+  (source file, commit, date). Baseline holes are never copied; chained
+  carry-forwards keep their original stamp and warn.
+- `scripts/compare_bench.py`: section-aware parsing; carried-forward sections
+  excluded from the delta table (fixes bug 3).
+- Docs: `scripts/report.sh` header profiles, `scripts/scripts_guide.md`,
+  report header row "Tables 1+2 (W0→W4 ladder): measured/SKIPPED".
+
+### Honesty guardrails (§6)
+
+Carry-forward is only valid when the change provably does not touch shared
+layers (WAL, commit path, buffer pool, heap, page format) — those affect every
+table. Full bench still mandatory per major release and after any shared-layer
+change. The in-report stamp makes a stale number impossible to mistake for a
+fresh measurement.
+
+### Verification
+
+Debug-bench smoke runs: denylist (`MM_SKIP_LADDER=1 MM_SKIP_TABLE4=1
+MM_SKIP_TABLE5=1`) → 4 `_Skipped:` markers, Tables 3/3.1 measured; allowlist
+(`MM_TABLES=3`) → only 3/3.1 measured. Stitch verified against real reports
+(`report_20260719_234504.md` as baseline): Tables 1/2/4/5 carried with stamps;
+`compare_bench.py` confirmed excluding stitched sections (crud=8 fresh kept,
+fk/w4w0 excluded). `cargo clippy --bench decompose -- -D warnings` clean (also
+fixed 4 pre-existing `needless_range_loop` lints only visible with the bench
+target), `cargo fmt` clean, `bash -n` + `docker compose config -q` clean.
+Expected per-item CRUD run: ~4 h → ~30–45 min.

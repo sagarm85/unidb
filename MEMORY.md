@@ -12,6 +12,23 @@
 
 ## Current status
 
+- **Item 105 — Selective bench runs + baseline carry-forward — SHIPPED 2026-07-21, branch `claude/session-status-check-fae1c3`.**
+  Root-caused the ~4 h `report.sh` wall clock (per-phase docker-stats sample counts in
+  `report_20260719_234504.md`): Tables 1+2 W0→W4 ladder ≈ 2.5 h (synchronous HNSW/graph
+  pre-grows — items 63/65/92 bottleneck), Table 4 @100k ≈ 45 min, rest minutes.
+  Three bugs fixed: (1) `MM_TABLES`/`MM_SKIP_TABLE4`/`MM_SKIP_TABLE5` were NOT threaded
+  through `docker-compose.yml` — Docker-mode selective profiles silently ran the full bench;
+  (2) allowlist only honored by Tables 4/5 — 1/2/3/3.1 always ran; (3) `compare_bench.py`
+  Table-4 rows clobbered W4/W0 entries (same integer+ratio row shape).
+  Shipped: `MM_SKIP_LADDER=1` (Tables 1+2 gate, `_Skipped:` markers), knobs threaded through
+  Docker, `scripts/stitch_baseline.py` + `MM_BASELINE=<report.md>` carry-forward with
+  provenance stamp ("Carried forward — NOT re-measured in this run", source/commit/date),
+  section-aware `compare_bench.py` excluding stitched tables. CRUD-item run ~4 h → ~30–45 min.
+  Guardrail: carry-forward invalid for shared-layer changes (WAL/commit/pool/heap/format);
+  full baseline still mandatory per major release. Smoke-verified (denylist + allowlist +
+  stitch on real reports); clippy `--bench decompose` clean (4 pre-existing lints fixed),
+  fmt clean. Docs: backlog `105_…`, PROGRESS.md, scripts_guide.md, report.sh header.
+
 - **Item 104 — Catalog sync dedup — SHIPPED 2026-07-20, PR [#180](https://github.com/sagarm85/unidb/pull/180) open.**
   Removed `wal.sync_up_to(catalog_lsn)` AND `catalog.persist_only()` from `Engine::commit`.
   (Just removing the fsync while keeping `persist_only()` caused a replication regression:
@@ -3598,6 +3615,41 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-21 — Item 105: Selective bench runs + baseline carry-forward (bench tooling)
+
+**Goal:** User asked why `report.sh` takes 3–4 h per validation and proposed reusing prior
+bench tables for unaffected areas. Root-caused the time, fixed the knob plumbing, shipped
+carry-forward stitching.
+
+**Root cause of the 4 h:** per-phase docker-stats sample counts (`n` ≈ seconds) in
+`report_20260719_234504.md` (230 min): Tables 1+2 W0→W4 ladder ≈ 2.5 h (W2–W4 pre-grows
+build HNSW + graph indexes synchronously — the item 63/65/92 incremental-HNSW bottleneck);
+`t4_unidb_100000` n=2595 ≈ 43 min; everything else minutes. ~85 % of bench wall clock IS
+the slow HNSW insert path — fixing item 92 shrinks the report for free.
+
+**Bugs found:** (1) `MM_TABLES`/`MM_SKIP_TABLE4`/`MM_SKIP_TABLE5` never passed through
+`docker-compose.yml` → Docker-mode per-item profiles silently ran the full ~4 h bench
+(this is why the user's run took 4 h despite documented ~1.5 h profiles). (2) Allowlist
+only honored by Tables 4/5; 1/2/3/3.1 always ran. (3) `compare_bench.py`: Table 4 rows
+(integer first col + `×` last col) clobbered Table 1's W4/W0 entries.
+
+**Shipped:** `MM_SKIP_LADDER=1` + full `MM_TABLES` gating in `benches/decompose.rs`
+(`_Skipped:` markers under skipped `## Table N` headings; 1+2 one unit, 3.1 gated with 3);
+knobs threaded through `docker_report.sh` + compose; new `scripts/stitch_baseline.py` +
+`MM_BASELINE=<report.md>` hook in `report.sh` (host-side post-processing, both modes) —
+skipped tables carried forward with provenance stamp ("Carried forward — NOT re-measured
+in this run", source file/commit/date; holes never copied; chained stamps preserved +
+warned); section-aware `compare_bench.py` excludes stitched tables. Fixed 4 pre-existing
+`needless_range_loop` clippy lints in the bench (only visible with `--bench decompose`).
+
+**Verification:** debug-bench smoke (denylist → 4 markers, Tables 3/3.1 measured;
+`MM_TABLES=3` → only 3/3.1); stitch tested against real reports; parser confirmed
+excluding carried tables. clippy/fmt/bash -n/compose config all clean. New CRUD-item
+profile: `MM_SKIP_LADDER=1 MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1 MM_BASELINE=… scripts/report.sh`
+→ ~30–45 min. Guardrail: carry-forward invalid for shared-layer changes; full baseline per
+major release. Docs: backlog `105_bench_selective_carry_forward.md` (+index, next→106),
+PROGRESS.md entry, scripts_guide.md, report.sh/multi_model_report.sh headers.
 
 ### 2026-07-20 — Item 104: Catalog sync dedup (remove double-fsync per INSERT)
 

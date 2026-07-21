@@ -34,20 +34,31 @@
 #
 # ── Table-selection knobs (speed up per-item bench runs) ──────────────────────
 #   MM_TABLES=1,2,3   allowlist — run ONLY these tables (empty = all tables).
-#                     Example: MM_TABLES=3 runs only Table 3 CRUD stress (~15 min).
+#                     Tables 1+2 are one measurement (the W0→W4 ladder): listing
+#                     either runs both. Table 3.1 is gated together with 3.
+#                     Example: MM_TABLES=3 runs only Table 3 + 3.1 CRUD stress.
+#   MM_SKIP_LADDER=1  skip Tables 1+2 (the W0→W4 ladder). Its W2–W4 pre-grows
+#                     build the HNSW + graph indexes synchronously — the single
+#                     biggest time sink of a full run (~2.5 h at default sizes).
 #   MM_SKIP_TABLE4=1  skip Table 4 + 4.1 (HNSW at-scale, ~45 min at 100k rows).
 #                     Use when the change does not touch vector/HNSW code.
 #   MM_SKIP_TABLE5=1  skip Table 5 (FK relational-integrity stress, ~5–10 min).
 #                     Use when the change does not touch FK enforcement code.
 #
+# Skipped tables print a `_Skipped:` marker under their heading. To fill them
+# from a previous full run instead of leaving holes, pass MM_BASELINE to
+# scripts/report.sh — it stitches those tables in from the baseline report with
+# an explicit provenance stamp (never confusable with a fresh measurement).
+#
 # Per-item quick profiles (combine MM_SIZES=100000 for fastest single-table run):
-#   WAL / commit / B-tree / CRUD items:
-#       MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1 scripts/report.sh --docker
+#   WAL / commit / B-tree / CRUD items (~30–45 min; add MM_BASELINE to fill the
+#   skipped tables from the last full report, provenance-stamped):
+#       MM_SKIP_LADDER=1 MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1 scripts/report.sh --docker
 #   Vector / HNSW items:
-#       scripts/report.sh --docker                     (run everything — Table 4 is the signal)
+#       scripts/report.sh --docker                     (run everything — Tables 1/2/4 are the signal)
 #   Group-commit item (101) — concurrent INSERT only:
-#       MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1 MM_SIZES=100000 scripts/report.sh --docker
-#   Full historical baseline comparison:
+#       MM_SKIP_LADDER=1 MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1 MM_SIZES=100000 scripts/report.sh --docker
+#   Full historical baseline comparison (per major release / shared-layer change):
 #       scripts/report.sh --docker                     (no flags — run everything)
 #   UNIDB_BUFFER_POOL_PAGES  frames for every unidb engine THIS BENCH opens
 #               (default 2,000,000 -- set internally by bench_engine_open() in
@@ -104,6 +115,7 @@ SIZES_SHOWN="${MM_SIZES:-1000,10000,100000}"
 SAMPLE_SHOWN="${MM_SAMPLE:-200}"
 PG_SHOWN="$([[ -n "${PG_URL:-}" ]] && echo 'set (Postgres column measured)' || echo 'unset (Postgres column skipped)')"
 REALISTIC_SHOWN="$([[ "${MM_REPLACED_STACK_REALISTIC:-}" == "1" ]] && echo 'set (Table 4.1 realistic stack measured)' || echo 'unset (Table 4.1 skipped)')"
+LADDER_SHOWN="$([[ "${MM_SKIP_LADDER:-}" == "1" ]] && echo 'SKIPPED (MM_SKIP_LADDER=1)' || echo 'measured')"
 TABLE4_SHOWN="$([[ "${MM_SKIP_TABLE4:-}" == "1" ]] && echo 'SKIPPED (MM_SKIP_TABLE4=1)' || ( [[ -n "${MM_TABLES:-}" ]] && echo "${MM_TABLES}" | grep -q '4' && echo "included (MM_TABLES=${MM_TABLES})" || echo 'measured' ))"
 TABLE5_SHOWN="$([[ "${MM_SKIP_TABLE5:-}" == "1" ]] && echo 'SKIPPED (MM_SKIP_TABLE5=1)' || echo 'measured')"
 TABLES_SHOWN="$([[ -n "${MM_TABLES:-}" ]] && echo "allowlist: ${MM_TABLES}" || echo 'all')"
@@ -154,6 +166,7 @@ TIME_TAKEN="$(awk -v s="$ELAPSED_SECS" 'BEGIN{
   echo "| Postgres | $PG_SHOWN |"
   echo "| Realistic stack (Table 4.1) | $REALISTIC_SHOWN |"
   echo "| Tables run | $TABLES_SHOWN |"
+  echo "| Tables 1+2 (W0→W4 ladder) | $LADDER_SHOWN |"
   echo "| Table 4 + 4.1 (HNSW) | $TABLE4_SHOWN |"
   echo "| Table 5 (FK stress) | $TABLE5_SHOWN |"
   echo "| Peak RSS | $RSS_MIB |"
