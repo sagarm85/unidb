@@ -76,6 +76,7 @@
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrd};
+use std::sync::Arc;
 
 use crate::{
     btree_index::{DiskBTree, OrderedValue},
@@ -106,6 +107,12 @@ pub static Q_L0_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 pub static Q_VEC_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 pub static Q_DISK_FETCHES: AtomicU64 = AtomicU64::new(0);
 pub static Q_DISTANCE_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Nanoseconds spent in the ANN beam-search phase of `exec_select_near`
+/// (item 92 phase attribution — splits query time into ANN vs re-rank).
+pub static Q_ANN_NANOS: AtomicU64 = AtomicU64::new(0);
+/// Nanoseconds spent after the ANN phase in `exec_select_near` (heap
+/// re-rank: MVCC visibility, row decode, exact distances, sort, projection).
+pub static Q_RERANK_NANOS: AtomicU64 = AtomicU64::new(0);
 
 /// Reset all item-92 query counters to zero.  Call before a profiled query sequence.
 pub fn reset_query_counters() {
@@ -113,6 +120,8 @@ pub fn reset_query_counters() {
     Q_VEC_CACHE_HITS.store(0, AtomicOrd::Relaxed);
     Q_DISK_FETCHES.store(0, AtomicOrd::Relaxed);
     Q_DISTANCE_CALLS.store(0, AtomicOrd::Relaxed);
+    Q_ANN_NANOS.store(0, AtomicOrd::Relaxed);
+    Q_RERANK_NANOS.store(0, AtomicOrd::Relaxed);
 }
 
 // ── Async worker types (item 67) ─────────────────────────────────────────────
@@ -731,7 +740,11 @@ impl L0Arena {
 #[derive(Clone)]
 pub struct HnswL0Cache {
     /// Flat arena storage for L0 neighbour lists (item 93).
-    arena: L0Arena,
+    ///
+    /// Item 92 Lever 5: behind `Arc` — the per-query snapshot is an O(1)
+    /// refcount bump; `Arc::make_mut` copies-on-write only when a query
+    /// inserts a missing entry (never on the fully-warm path).
+    arena: Arc<L0Arena>,
     /// Max bytes before new entries are silently dropped (graceful fallback).
     pub max_bytes: usize,
     /// `hdr.total_nodes` at the time this cache was last validated.
@@ -742,10 +755,22 @@ pub struct HnswL0Cache {
 impl HnswL0Cache {
     pub fn new() -> Self {
         Self {
-            arena: L0Arena::new(),
+            arena: Arc::new(L0Arena::new()),
             max_bytes: l0_cache_max_bytes(),
             generation: 0,
         }
+    }
+
+    /// Opaque storage identity: changes iff a mutation copied-on-write.
+    /// `exec_select_near` compares before/after to skip merge-back on the
+    /// fully-warm path (Lever 5).
+    pub fn storage_ptr(&self) -> usize {
+        Arc::as_ptr(&self.arena) as usize
+    }
+
+    /// Drop all cached neighbour lists (generation change).
+    pub fn clear(&mut self) {
+        Arc::make_mut(&mut self.arena).clear();
     }
 
     /// Approximate payload bytes currently held in the arena.
@@ -767,7 +792,7 @@ impl HnswL0Cache {
         if self.arena.payload_bytes() + entry_bytes > self.max_bytes {
             return; // over cap — disk fallback on the next miss
         }
-        self.arena.append(key, &nbrs);
+        Arc::make_mut(&mut self.arena).append(key, &nbrs);
     }
 
     /// Zero-copy iteration over the cached L0 neighbours for `key`.
@@ -804,8 +829,17 @@ impl HnswL0Cache {
     pub fn merge_from(&mut self, other: HnswL0Cache) {
         if self.generation != other.generation {
             // A concurrent insert changed `total_nodes` — stale data must go.
-            self.arena.clear();
+            self.clear();
             self.generation = other.generation;
+        }
+        // Lever 5 fast paths: same storage → nothing new; empty self → adopt
+        // the other's storage wholesale (O(1) Arc move, no per-entry copy).
+        if Arc::ptr_eq(&self.arena, &other.arena) {
+            return;
+        }
+        if self.arena.num_slots() == 0 {
+            self.arena = other.arena;
+            return;
         }
         // Walk the other arena's live slots and insert any missing entries.
         let num = other.arena.num_slots();
@@ -834,7 +868,7 @@ impl HnswL0Cache {
                         .iter()
                         .map(|&v| decode_rid_i64(v))
                         .collect();
-                    self.arena.append(*key, &nbrs);
+                    Arc::make_mut(&mut self.arena).append(*key, &nbrs);
                 }
             }
         }
@@ -860,6 +894,52 @@ fn vec_cache_max_bytes() -> usize {
         .unwrap_or(DEFAULT_VEC_CACHE_BYTES)
 }
 
+/// Contiguous slab storage for cached node vectors (item 92 Lever 7).
+///
+/// Same pattern as `L0Arena` (item 93), applied to vectors: all vectors live
+/// in ONE flat `Vec<f32>` (`data`), each occupying a fixed `dim`-length slot.
+/// The beam search's ~3.7k distance computations per warm query then read
+/// from one large allocation instead of pointer-chasing ~3.7k scattered
+/// 512-byte `Vec<f32>` heap allocations (one cache/TLB-missing deref each).
+#[derive(Clone, Default)]
+struct VecArena {
+    /// encoded_rid → slot index.
+    idx: HashMap<i64, u32>,
+    /// Flat storage; slot k occupies `data[k*dim .. (k+1)*dim]`.
+    data: Vec<f32>,
+    /// Vector dimension; fixed by the first insert (0 = unset).
+    dim: u32,
+}
+
+impl VecArena {
+    #[inline(always)]
+    fn get(&self, key: i64) -> Option<&[f32]> {
+        let k = *self.idx.get(&key)? as usize;
+        let d = self.dim as usize;
+        Some(&self.data[k * d..(k + 1) * d])
+    }
+
+    fn insert(&mut self, key: i64, vec: &[f32]) {
+        if self.idx.contains_key(&key) {
+            return;
+        }
+        if self.dim == 0 {
+            self.dim = vec.len() as u32;
+        } else if self.dim as usize != vec.len() {
+            return; // dim mismatch — refuse silently (disk fallback)
+        }
+        let slot = (self.data.len() / self.dim as usize) as u32;
+        self.data.extend_from_slice(vec);
+        self.idx.insert(key, slot);
+    }
+
+    fn clear(&mut self) {
+        self.idx.clear();
+        self.data.clear();
+        self.dim = 0;
+    }
+}
+
 /// Process-lifetime in-memory cache of node vectors for NEAR queries.
 ///
 /// Lives behind `Mutex<HashMap<PageId, HnswVecCache>>` on `Engine`, one entry
@@ -870,14 +950,22 @@ fn vec_cache_max_bytes() -> usize {
 /// 256 MiB default → ~524 k nodes. At 10k nodes ≈ 5 MiB (trivial).
 ///
 /// Snapshot-then-merge pattern (see `candidates_cached_with_vec`):
-///   1. Lock, clone this entry, release lock.
-///   2. Run beam search against the clone (no lock held during I/O).
-///   3. Re-lock, call `merge_from(clone)` — same stale-generation handling
-///      as `HnswL0Cache`.
+///   1. Lock, snapshot this entry (O(1) Arc bump, Lever 5), release lock.
+///   2. Run beam search against the snapshot (no lock held during I/O).
+///   3. Re-lock and `merge_from(snapshot)` — only if the search inserted
+///      anything; same stale-generation handling as `HnswL0Cache`.
 #[derive(Clone)]
 pub struct HnswVecCache {
-    /// encoded_rid → Vec<f32> (node vector).  Key = `encode_rid(heap_rid)`.
-    pub vectors: HashMap<i64, Vec<f32>>,
+    /// Vector slab, keyed by `encode_rid(heap_rid)`.
+    ///
+    /// Item 92 Lever 5: behind `Arc` so the per-query snapshot in
+    /// `exec_select_near` is an O(1) refcount bump instead of an O(corpus)
+    /// deep clone (10k entries ≈ 5 MiB + 10k allocations per query — the
+    /// dominant warm-query cost at 10k). Mutations go through
+    /// `Arc::make_mut`, which copies-on-write only when a query actually
+    /// inserts a missing entry; the fully-warm path never clones.
+    /// Item 92 Lever 7: the storage itself is a contiguous `VecArena` slab.
+    vectors: Arc<VecArena>,
     /// Approximate payload size (bytes): sum of dim×4 per cached node.
     pub size_bytes: usize,
     pub max_bytes: usize,
@@ -888,16 +976,49 @@ pub struct HnswVecCache {
 impl HnswVecCache {
     pub fn new() -> Self {
         Self {
-            vectors: HashMap::new(),
+            vectors: Arc::new(VecArena::default()),
             size_bytes: 0,
             max_bytes: vec_cache_max_bytes(),
             generation: 0,
         }
     }
 
+    /// Number of cached vectors (observability / tests).
+    pub fn len(&self) -> usize {
+        self.vectors.idx.len()
+    }
+
+    /// True if no vectors are cached.
+    pub fn is_empty(&self) -> bool {
+        self.vectors.idx.is_empty()
+    }
+
+    /// True if `key`'s vector is cached.
+    pub fn contains_key(&self, key: i64) -> bool {
+        self.vectors.idx.contains_key(&key)
+    }
+
+    /// Read a cached vector (shared slab slice — no clone).
+    pub fn get(&self, key: i64) -> Option<&[f32]> {
+        self.vectors.get(key)
+    }
+
+    /// Opaque storage identity: changes iff a mutation copied-on-write.
+    /// `exec_select_near` compares before/after to skip merge-back on the
+    /// fully-warm path (Lever 5).
+    pub fn storage_ptr(&self) -> usize {
+        Arc::as_ptr(&self.vectors) as usize
+    }
+
+    /// Drop all cached vectors (generation change).
+    pub fn clear(&mut self) {
+        Arc::make_mut(&mut self.vectors).clear();
+        self.size_bytes = 0;
+    }
+
     /// Cache one node's vector.  No-op if already cached or over cap.
     pub fn insert_vec(&mut self, key: i64, vec: Vec<f32>) {
-        if self.vectors.contains_key(&key) {
+        if self.vectors.idx.contains_key(&key) {
             return;
         }
         let entry_bytes = vec.len() * std::mem::size_of::<f32>();
@@ -905,19 +1026,41 @@ impl HnswVecCache {
             return; // over cap — disk fallback
         }
         self.size_bytes += entry_bytes;
-        self.vectors.insert(key, vec);
+        Arc::make_mut(&mut self.vectors).insert(key, &vec);
     }
 
     /// Merge entries from `other` (a query-local snapshot) back into the global
     /// cache.  Clears stale data on generation mismatch.
     pub fn merge_from(&mut self, other: HnswVecCache) {
         if self.generation != other.generation {
-            self.vectors.clear();
-            self.size_bytes = 0;
+            self.clear();
             self.generation = other.generation;
         }
-        for (k, v) in other.vectors {
-            self.insert_vec(k, v);
+        // Lever 5 fast paths: same storage → nothing new; empty self → adopt
+        // the other's storage wholesale (O(1) Arc move, no per-entry copy).
+        if Arc::ptr_eq(&self.vectors, &other.vectors) {
+            return;
+        }
+        if self.vectors.idx.is_empty() {
+            self.size_bytes = other.size_bytes;
+            self.vectors = other.vectors;
+            return;
+        }
+        let d = other.vectors.dim as usize;
+        if d == 0 {
+            return;
+        }
+        for (&k, &slot) in other.vectors.idx.iter() {
+            let s = slot as usize;
+            let v = &other.vectors.data[s * d..(s + 1) * d];
+            if !self.vectors.idx.contains_key(&k) {
+                let entry_bytes = d * std::mem::size_of::<f32>();
+                if self.size_bytes + entry_bytes > self.max_bytes {
+                    break;
+                }
+                self.size_bytes += entry_bytes;
+                Arc::make_mut(&mut self.vectors).insert(k, v);
+            }
         }
     }
 }
@@ -1122,9 +1265,9 @@ impl DiskHnswIndex {
         }
         // 3. Process-lifetime vector hot cache (query path, item 73).
         if let Some(cache) = vec_cache {
-            if let Some(v) = cache.vectors.get(&key) {
+            if let Some(v) = cache.get(key) {
                 Q_VEC_CACHE_HITS.fetch_add(1, AtomicOrd::Relaxed);
-                return Ok(Some(v.clone()));
+                return Ok(Some(v.to_vec()));
             }
             // Cache miss: fetch from disk, populate cache.
             if let Some((np, ns)) = self.find_node_loc(rid, hdr.node_index_root, pool)? {
@@ -1162,7 +1305,7 @@ impl DiskHnswIndex {
         vec_cache: &mut HnswVecCache,
     ) -> Option<f32> {
         let key = encode_rid(rid);
-        if let Some(v) = vec_cache.vectors.get(&key) {
+        if let Some(v) = vec_cache.get(key) {
             Q_VEC_CACHE_HITS.fetch_add(1, AtomicOrd::Relaxed);
             Q_DISTANCE_CALLS.fetch_add(1, AtomicOrd::Relaxed);
             let d = dist_raw(metric, query, v);
@@ -1969,7 +2112,7 @@ impl DiskHnswIndex {
             let gen = hdr.total_nodes as u64;
             if cache.generation != gen {
                 // Stale (or fresh empty): clear and re-stamp.
-                cache.arena.clear();
+                cache.clear();
                 cache.generation = gen;
             }
         }
@@ -2033,14 +2176,14 @@ impl DiskHnswIndex {
         // Validate / reset L0 cache generation.
         if let Some(ref mut cache) = l0_cache {
             if cache.generation != gen {
-                cache.arena.clear();
+                cache.clear();
                 cache.generation = gen;
             }
         }
         // Validate / reset vector cache generation.
         if let Some(ref mut cache) = vec_cache {
             if cache.generation != gen {
-                cache.vectors.clear();
+                cache.clear();
                 cache.size_bytes = 0;
                 cache.generation = gen;
             }
@@ -2159,11 +2302,11 @@ impl DiskHnswIndex {
 
         // Validate cache generation.
         if l0_cache.generation != gen {
-            l0_cache.arena.clear();
+            l0_cache.clear();
             l0_cache.generation = gen;
         }
         if vec_cache.generation != gen {
-            vec_cache.vectors.clear();
+            vec_cache.clear();
             vec_cache.size_bytes = 0;
             vec_cache.generation = gen;
         }
@@ -2188,7 +2331,7 @@ impl DiskHnswIndex {
         for (key, node_page, slot_idx) in all_locs {
             // Skip if both caches already have this node.
             let already_l0 = l0_cache.arena.contains_key(key);
-            let already_vec = vec_cache.vectors.contains_key(&key);
+            let already_vec = vec_cache.contains_key(key);
             if already_l0 && already_vec {
                 continue;
             }
@@ -2211,7 +2354,7 @@ impl DiskHnswIndex {
             meta_page = self.meta_page,
             total_nodes = hdr.total_nodes,
             l0_entries = l0_cache.arena.node_idx_map.len(),
-            vec_entries = vec_cache.vectors.len(),
+            vec_entries = vec_cache.len(),
             "HNSW cache prefetch complete"
         );
         Ok(())

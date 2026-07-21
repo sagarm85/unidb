@@ -2775,11 +2775,18 @@ fn exec_select_near(
 
     // Items 72+73: process-lifetime L0 neighbour cache + vector hot cache.
     // Snapshot-then-merge pattern (no lock held during page I/O):
-    //   1. Lock, clone (or create fresh) the per-index cache entry, release lock.
-    //   2. Run beam search against the local clones (lock-free during I/O).
-    //   3. Re-lock, merge new entries back into the global cache.
+    //   1. Lock, snapshot the per-index cache entry, release lock. Item 92
+    //      Lever 5: the snapshot is an O(1) Arc refcount bump, NOT a deep
+    //      clone — the previous per-query deep clone was O(corpus) (~5 MiB +
+    //      10k allocations at 10k rows) and dominated warm NEAR latency.
+    //   2. Run beam search against the local snapshots (lock-free during I/O);
+    //      a cache miss copies-on-write via Arc::make_mut.
+    //   3. Re-lock and merge back ONLY if the search actually inserted
+    //      something (storage_ptr changed). The fully-warm path skips both
+    //      merges entirely.
+    let ann_start = std::time::Instant::now();
     let (metric, candidate_ids) = if let Some(l0_mu) = ctx.hnsw_l0_caches {
-        // Step 1: snapshot both caches
+        // Step 1: snapshot both caches (O(1) per Lever 5)
         let mut local_l0 = {
             let guard = l0_mu.lock().unwrap();
             guard
@@ -2796,6 +2803,8 @@ fn exec_select_near(
         } else {
             crate::hnsw_index::HnswVecCache::new()
         };
+        let l0_snap = local_l0.storage_ptr();
+        let vec_snap = local_vec.storage_ptr();
 
         // Step 2: beam search — both caches updated on miss (lock-free)
         let result = hnsw.candidates_cached_with_vec(
@@ -2806,24 +2815,32 @@ fn exec_select_near(
             Some(&mut local_vec),
         )?;
 
-        // Step 3: merge back into global caches
-        {
+        // Step 3: merge back into global caches only on copy-on-write
+        if local_l0.storage_ptr() != l0_snap {
             let mut guard = l0_mu.lock().unwrap();
             let entry = guard.entry(meta_page).or_insert_with(HnswL0Cache::new);
             entry.merge_from(local_l0);
         }
-        if let Some(vec_mu) = ctx.hnsw_vec_caches {
-            let mut guard = vec_mu.lock().unwrap();
-            let entry = guard
-                .entry(meta_page)
-                .or_insert_with(crate::hnsw_index::HnswVecCache::new);
-            entry.merge_from(local_vec);
+        if local_vec.storage_ptr() != vec_snap {
+            if let Some(vec_mu) = ctx.hnsw_vec_caches {
+                let mut guard = vec_mu.lock().unwrap();
+                let entry = guard
+                    .entry(meta_page)
+                    .or_insert_with(crate::hnsw_index::HnswVecCache::new);
+                entry.merge_from(local_vec);
+            }
         }
 
         result
     } else {
         hnsw.candidates(query, Some(ef), ctx.pool)?
     };
+    // Item 92 phase attribution: ANN beam search vs everything after it.
+    crate::hnsw_index::Q_ANN_NANOS.fetch_add(
+        ann_start.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let rerank_start = std::time::Instant::now();
 
     let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     // Item 94: lightweight snapshot fast path for standalone (non-BEGIN) NEAR
@@ -2874,6 +2891,10 @@ fn exec_select_near(
     }
     scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(k);
+    crate::hnsw_index::Q_RERANK_NANOS.fetch_add(
+        rerank_start.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     Ok(ExecResult::Rows {
         columns: output_columns(projection, &table_def.columns),
         rows: scored.into_iter().map(|(_, r)| r).collect(),
