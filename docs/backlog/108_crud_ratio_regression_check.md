@@ -1,8 +1,14 @@
 # 108 — CRUD ratio drift vs 2026-07-19 report: verify or explain
 
 **Type:** Performance
-**Status:** ⏳ NOT STARTED — filed 2026-07-21 from the consolidated bench
-(`docs/performance/report_20260721_035629.md`)
+**Status:** ✅ RESOLVED 2026-07-21 (same day) — **no unidb regression; the
+drift was environmental.** Absolute-numbers comparison (§0.6 rule 4) showed
+Postgres's own code-identical absolutes moved 2.1–28× between the runs while
+unidb improved on every row (absolutes AND WAL-B/row). Shipped: environment
+canary in `compare_bench.py` (PG-absolute median drift > 25% → warning),
+ceilings-table refresh in `decompose.rs`, inline correction of the item-104
+COUNT claim in PROGRESS.md. See PROGRESS.md "Item 108". No bisection was
+run — none was needed.
 
 ## Problem
 

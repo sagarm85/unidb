@@ -9533,10 +9533,15 @@ itself validates item 105's timing analysis.
 ### Verdicts on the debt items
 
 - **Item 104 (fsync dedup): VALIDATED.** W0 ladder rung 0.23 ms/commit at
-  100k; `SELECT COUNT(*)` **6.93× → 41.25×** vs PG (the O(1) count now
-  survives via checkpoint-persisted row_count). Serial per-row INSERT ratio
-  unchanged (0.47× vs 0.53× — within drift; the dedup's win is the removed
-  serialization point, visible in W0, not the single-writer fsync floor).
+  100k; INSERT WAL **6,366 → 584 B/row** (the removed per-commit catalog WAL
+  records — the direct signature of the fix); unidb INSERT absolute
+  138 → 4,128 rec/s.
+  _Correction (2026-07-21, item 108): this entry originally claimed
+  "COUNT(*) 6.93× → 41.25× validates item 104" — wrong baseline. The direct
+  predecessor report (07-19) already showed 85.22× (item 97's O(1) count);
+  the 85→41× move is Postgres-side environment. unidb's COUNT absolute was
+  ~2.0e9 rec/s in both runs. The WAL-B/row and W0 numbers above are the
+  honest item-104 evidence._
 - **Items 72/73/93 + NodeCache gate: VALIDATED at 100k.** Table 4 multi-model
   txn cost at 100k **81.8 → 13.4 ms/txn (6.1×)** vs the 2026-07-19 report;
   no NodeCache-style blowup at scale.
@@ -9562,3 +9567,31 @@ itself validates item 105's timing analysis.
   absolute rec/s (ratios conflate PG-side variance), then bisect with
   item-105 selective runs. The in-bench "known honest ceilings" table is
   also stale (still quotes items-75-84-era numbers) — refresh under 108.
+
+## Item 108 — CRUD ratio drift: RESOLVED as environment, no unidb regression   [SHIPPED]   2026-07-21
+
+**Method (§0.6 rule 4 — absolutes over noisy ratios):** compared absolute
+unidb and Postgres rec/s per Table-3 row across `report_20260719_234504.md`
+and `report_20260721_035629.md`. Postgres is code-identical between runs,
+yet its own absolutes moved **2.1×–28×** per op (fsync ~30× faster, CPU
+~2.15× faster on 07-21 — also why the 07-19 run took 229 min). Meanwhile
+**unidb improved on every row in absolutes** (INSERT 138→4,128 rec/s,
+filtered SELECT 812k→2.72M, UPDATE HOT 492k→942k) **and in WAL-B/row**
+(INSERT 6,366→584, HOT 154→88, DELETE sel 39→5). Every apparent ratio
+"regression" (filtered 0.74→0.45×, HOT 1.51→1.06×) is PG gaining more from
+the healthy environment than unidb — not a unidb regression. **No bisection
+needed; zero code regressions found.**
+
+**Shipped hardening so this class of false alarm can't recur:**
+- `compare_bench.py` environment canary: parses Postgres absolute rec/s
+  (Table 3) from both reports and prints a prominent "ENVIRONMENT CHANGED"
+  warning when median drift > 25% (fires at 173% on the 07-19/07-21 pair).
+- `benches/decompose.rs` "known honest ceilings" table refreshed to
+  2026-07-21 measured values (was stale at items-75-84-era numbers), plus a
+  standing note on the absolutes-first protocol.
+- Inline correction to the Item-104 bench verdict above (COUNT baseline was
+  wrong; WAL-B/row + W0 are the honest evidence).
+
+**Ratio-hygiene rule going forward:** a cross-run ratio delta is evidence
+only if the canary is quiet; otherwise judge unidb by absolute rec/s and
+WAL-B/row. Within-run ratios remain fair by construction (same VM mood).
