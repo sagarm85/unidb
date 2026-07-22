@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `112_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `113_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -37,7 +37,7 @@
 | 21 | `21_observability_metrics.md` | Improvement | ✅ SHIPPED (PROGRESS: Observability metrics enrichment (item 21)) |
 | 22 | `22_logs_surface.md` | Improvement | ✅ SHIPPED (PROGRESS: Logs surface — JSON structured logs, correlation ids, bounded /logs tail) |
 | 23 | `23_storage_service.md` | Milestone | ✅ SHIPPED (PROGRESS: Object storage service — MinIO/S3 tiering over engine metadata (item 23)) |
-| 24 | `24_authz_v2_policies.md` | Milestone | 🔄 PARTIAL — Z1 (DDL) + Z2 (per-op policies) + Z3(JWT) + Z5 (catalog) + Z6 (`current_user` + `/auth/preview`) SHIPPED 2026-07-19. _Correction (2026-07-21): the previous "REMAINING" list here went stale the same day it was written — the R-a `WITH CHECK` UPDATE escape and R-b bootstrap silent-no-enforcement were both FIXED later on 2026-07-20 in PR #168 (with item 100), as the "Next up" section below already records._ **Genuinely remaining: Z4 (role inheritance / column grants) — deferred.** |
+| 24 | `24_authz_v2_policies.md` | Milestone | ✅ SHIPPED — Z1 (DDL) + Z2 (per-op policies) + Z3 (JWT) + Z5 (catalog) + Z6 (`current_user`/preview) + R-a/R-b hardening (PR #168) + **Z4's role-inheritance half** (transitive `has_privilege` + `role_members`/`users` catalogs, PR #166). _Correction (2026-07-22): earlier rows said "Z4 remaining" wholesale — audit showed inheritance shipped and works (nested chains included); only **column-level grants** (Z4's explicitly defer-allowed half) were never built → split out as **item 112**._ |
 | 25 | `25_multipage_catalog.md` | Improvement | ✅ SHIPPED 2026-07-13 (multi-page chain; no FORMAT_VERSION bump; P33 crash point; item-23 ceiling lifted) |
 | 26 | `26_event_queue_scale.md` | Improvement | ✅ SHIPPED 2026-07-13 (seq index, EventWake push, Q3 vacuum-correct) |
 | 27 | `27_vacuum_per_table.md` | Improvement | ✅ SHIPPED 2026-07-13 |
@@ -119,10 +119,11 @@
 | 109 | `109_parallel_btree_candidate_resolution.md` | Performance | ⏳ NOT STARTED — SELECT filtered 0.45–0.51× → ≥0.70×: parallelise per-candidate heap fetch/visibility/project over page-grouped chunks (Milestone-P workers + item-70 prefetch); B-tree leaf walk stays serial; candidate-count gate; Step-0 = phase-split the serial path first. Filed 2026-07-22. |
 | 110 | `110_rls_limit_boolean_coercion_crash.md` | Improvement | ⏳ NOT STARTED — **high severity:** any non-superuser querying an RLS-protected table with `LIMIT` gets `SQL_PLAN_ERROR: cannot coerce text '<user>' to boolean for comparison`, every time — breaks every paginated view (Table Editor included) for RLS-restricted users. Clean minimal repro; root-caused to the item-38 Text↔Bool coercion arms in `executor.rs::compare()`, likely triggered via the `LogicalPlan::Query(QuerySpec)` / `query_exec.rs` RLS path that plain `LIMIT` queries route through (the simple-Select fast path item 103 fixed has no `limit` field at all). _(Filed as 107/108 in PR #195 before those IDs were taken on main; renumbered 110/111 at merge per the stable-ID rule.)_ |
 | 111 | `111_information_schema_follow_table_grants.md` | Improvement | ⏳ NOT STARTED — a user with full CRUD grants on a table still can't read its own row in `information_schema.tables`/`.columns` without a separate blanket grant (which, since those views are unfiltered, would also reveal every other table's existence). Postgres filters these views per-row by existing table privilege; unidb should too. |
+| 112 | `112_column_level_grants.md` | Improvement | ⏳ NOT STARTED (deliberately parked) — column-level GRANT/REVOKE (Postgres narrowing semantics, error-not-mask); the deferred half of item-24 Z4. Wide touch: grant vocab/persistence, DDL, read+write+RETURNING enforcement incl. QuerySpec shapes, policy-column exemption decision, item-111 columns-view filter, fast-path audit. Un-park when a concrete user need appears. |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `112_…`.**
+**Next new file → `113_…`.**
 
 ## Next up — priority order (2026-07-20, post PR #171 merge + 102-B)
 
