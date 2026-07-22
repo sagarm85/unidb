@@ -53,3 +53,28 @@ the first discriminator (§0.6 rule 4: trust absolutes over noisy ratios).
       ceiling-documented with sign-off.
 - [ ] `decompose.rs` ceilings table refreshed to current measured values.
 - [ ] Confirming selective bench run recorded in PROGRESS.md.
+
+## Addendum (2026-07-22) — user-requested controlled A/B: conclusion CONFIRMED
+
+The environmental conclusion was re-tested the strong way after review: the
+**exact old code** (`51022be`, PR #171 — the code that produced the
+0.74×/0.81× report) was re-run on **today's healthy environment**
+(`docs/performance/report_20260722_002217_ab_oldcode_51022be.md`; Table 3
+full at 100k, other tables shrunk via size knobs). Pairing validity: PG absolutes match the
+same-day current-main run within ~3% (7,937 vs 8,140 inserts/s; 5.50M vs
+5.51M filtered rows/s).
+
+| Operation | old code @ 19 Jul env | old code @ today's env | current main @ today |
+|---|---:|---:|---:|
+| SELECT filtered | 0.74× | **0.50×** | 0.45–0.51× |
+| UPDATE non-HOT | 0.81× | **0.64×** | 0.65–0.68× |
+| UPDATE HOT | 1.51× | **1.16×** | 1.06–1.16× |
+| DELETE selected | 2.73× | **1.89×** | 2.01–2.02× |
+| INSERT per-row | 0.45× | **0.17×** | 0.45–0.47× |
+
+The old code cannot reproduce its own 0.74×/0.81× on a healthy environment —
+those ratios were produced by the degraded VM handicapping Postgres, not by
+the engine. **Zero regression from the ~15 merges confirmed by direct A/B.**
+Bonus finding: same-environment INSERT shows item 104 as a **~3× real gain**
+(0.17× → 0.47×, WAL 6,363 → 584 B/row) — the sick 19-Jul environment had
+been hiding how far behind the old INSERT path was.

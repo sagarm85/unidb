@@ -9595,3 +9595,12 @@ needed; zero code regressions found.**
 **Ratio-hygiene rule going forward:** a cross-run ratio delta is evidence
 only if the canary is quiet; otherwise judge unidb by absolute rec/s and
 WAL-B/row. Within-run ratios remain fair by construction (same VM mood).
+
+**Addendum (2026-07-22) — controlled A/B on user request:** old code
+(`51022be`) re-run on today's environment scored filtered **0.50×**, non-HOT
+**0.64×**, HOT 1.16×, INSERT **0.17×** — indistinguishable from current main
+(0.45–0.51× / 0.65–0.68× / 1.06–1.16×) except INSERT, where current main is
+**~3× better** (item 104). PG absolutes matched within ~3% across the pair.
+The 0.74×/0.81× ratios are not reproducible by the code that produced them:
+environment artifact confirmed by direct experiment, zero merge regressions.
+Evidence: `docs/performance/report_20260722_002217_ab_oldcode_51022be.md`.
