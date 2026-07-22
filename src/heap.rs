@@ -2208,7 +2208,61 @@ pub(crate) fn get_visible<P: PageReader>(
     snapshot: &Snapshot,
     self_xid: Xid,
 ) -> Result<Option<Vec<u8>>> {
-    let page = reader.read_page(row_id.page_id)?;
+    let mut no_cache = None;
+    get_visible_cached(reader, row_id, snapshot, self_xid, &mut no_cache)
+}
+
+/// Return a reference to `page_id`'s page, reading (and CRC-verifying) it
+/// only when the caller's single-page cache does not already hold it.
+#[inline]
+fn cached_page<'c, P: PageReader>(
+    reader: &P,
+    page_id: PageId,
+    cache: &'c mut Option<(PageId, SlottedPage)>,
+) -> Result<&'c SlottedPage> {
+    let hit = matches!(cache, Some((pid, _)) if *pid == page_id);
+    if !hit {
+        let page = reader.read_page(page_id)?;
+        return Ok(&cache.insert((page_id, page)).1);
+    }
+    match cache {
+        Some((_, page)) => Ok(page),
+        // Unreachable (hit implies Some) — kept panic-free per the no-unwrap
+        // convention: fall back to a fresh read.
+        None => {
+            let page = reader.read_page(page_id)?;
+            Ok(&cache.insert((page_id, page)).1)
+        }
+    }
+}
+
+/// `get_visible` with a caller-held single-page cache (item 109).
+///
+/// `SharedPageReader::read_page` copies the whole page out of the mmap and
+/// CRC-verifies it on every call ("equivalent to a pool miss"). The B-tree
+/// range path resolves thousands of key-sorted candidates that cluster on a
+/// few dozen heap pages, so the per-candidate re-copy + re-CRC of the same
+/// page dominated filtered SELECT (measured 683 µs of a 973 µs query at
+/// 100k×5%, ~1 µs/candidate — Step-0 in
+/// `docs/backlog/109_parallel_btree_candidate_resolution.md`). Callers that
+/// iterate sorted candidates keep `cache` across calls; a run of same-page
+/// candidates then reads and verifies the page once.
+///
+/// MVCC note: the cached copy freezes the page at one instant for the whole
+/// run. Visibility is decided by `is_visible(xmin, xmax, snapshot)` against
+/// the statement's fixed snapshot, so a concurrent writer stamping xmax (or
+/// a HOT pointer) between candidates cannot change any outcome — the stamp
+/// belongs to a transaction outside the snapshot either way. Chain hops
+/// (same-page HOT, cross-page item-71) read through the same cache when the
+/// hop lands on the cached page, else fetch fresh.
+pub(crate) fn get_visible_cached<P: PageReader>(
+    reader: &P,
+    row_id: RowId,
+    snapshot: &Snapshot,
+    self_xid: Xid,
+    cache: &mut Option<(PageId, SlottedPage)>,
+) -> Result<Option<Vec<u8>>> {
+    let page = cached_page(reader, row_id.page_id, cache)?;
     // A slot a vacuum reclaimed (DEAD/UNUSED, M10) resolves to "no visible
     // version" under any snapshot, exactly like a superseded version.
     if !matches!(page.slot_state(row_id.slot), Ok(SlotState::Live)) {

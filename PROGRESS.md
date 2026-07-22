@@ -9605,6 +9605,65 @@ The 0.74×/0.81× ratios are not reproducible by the code that produced them:
 environment artifact confirmed by direct experiment, zero merge regressions.
 Evidence: `docs/performance/report_20260722_002217_ab_oldcode_51022be.md`.
 
+## Item 107 — Async HNSW on the commit path: wiring + freshness gauge   [SHIPPED]   2026-07-22
+
+**Branch:** `perf/item-107-async-hnsw-wiring` | **Type:** Performance (activation + observability — no format change)
+
+### Step-0 finding
+
+Item 67 (PR #171) had already built the per-commit async worker end to end
+(bounded 4,096-slot channel with blocking-send backpressure, executor
+dispatch, `wait_hnsw_idle`, crash contract) — but only `Engine::open_arc`
+spawns it, and **both the production server (`EngineHandle::spawn` → bare
+`Engine::open`) and the bench took the synchronous fallback**. The 21-Jul
+W4/W0 = 96× measured a path production was never meant to run.
+
+### What shipped
+
+- `EngineHandle::spawn` activates the worker — served engines now take the
+  async path (INSERT commit no longer pays the 6–18 ms beam search).
+- **Freshness contract (a)** (user sign-off 2026-07-22): NEAR may lag
+  committed rows by the queue depth (~8–18 ms idle; worst ~30–70 s at a
+  saturated queue, then backpressure caps it). Lag exposed:
+  `HNSW_QUEUE_DEPTH` / `HNSW_WORKER_APPLIED` statics,
+  `Engine::hnsw_queue_depth()`, `unidb_hnsw_queue_depth` gauge on `/metrics`.
+- Enqueue failure at teardown now falls back to the sync insert (was:
+  silently unindexed row).
+- Bench honesty: `bench_engine_open_arc` for ladder W-rungs + Table 4;
+  ladder reports a separate per-commit **drain** table; Table 4's timed
+  window ends after `wait_hnsw_idle` (deferred work is not eliminated work —
+  sustained throughput stays worker-bound at saturation, stated in-report).
+- Test `item107_queue_depth_gauge_drains_to_zero` (written parallel-safe
+  against the process-global gauge — poll-to-quiescence, the item-102 lesson).
+
+### Verification
+
+Full suite 69 binaries green; crash harness 54/54; clippy/fmt clean. One
+timing-gate flake (`perf_item93` warm-latency ≤800 µs) during a concurrent
+Docker bench run — passes in isolation, CPU contention, not a regression.
+W4/W0 + Table 4 re-measure lands with the next full Docker report.
+## Item 109 — Page-cached B-tree candidate resolution   [SHIPPED]   2026-07-22
+
+**Branch:** `perf/item-109-parallel-btree` | **Type:** Performance (read path only)
+
+Step-0 refuted the filed design — the parallel candidate resolution already
+existed (items 45/54, engaged 20/20 in the probe). The measured lever:
+`SharedPageReader::read_page` copies + CRC-verifies the full 8 KiB page PER
+CANDIDATE (~1 µs each), and key-sorted candidates hit the same ~25–50 pages
+100–200× per query. Fix: `heap::get_visible_cached` — caller-held single-page
+cache, one copy+CRC per same-page run; identical MVCC semantics (fixed
+statement snapshot; chain hops unchanged); workers hold one cache per
+contiguous partition.
+
+**Measured:** warm native 973 → 323 µs (3.0×; fetch 683 → 98 µs); warm
+in-container 460 µs/q (≈10.9M rec/s). Docker Table-3 certification:
+0.45 → **0.50× one-shot** — the bench times ONE cold execution whose split
+(leaf 58 µs · resolve 901 µs · ~700 µs one-shot fixed cost) structurally
+hides warm-path wins; both numbers recorded in the in-bench ceilings table,
+follow-ups filed in the backlog file (one-shot fixed cost; warm-median
+methodology question). Verification: 36 binaries + crash 54/54 + conc matrix
+32/32; clippy/fmt clean. Also ships the `Q109_*` phase-attribution counters
+and `tests/perf_item109.rs` (probe with fetch-only mode).
 ## Item 110 — RLS + LIMIT crash: current_user destroyed in QuerySpec path   [SHIPPED]   2026-07-22
 
 **Branch:** `fix/item-110-rls-limit` | **Type:** Improvement (correctness/security — no format change)

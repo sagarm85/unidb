@@ -324,3 +324,68 @@ fn async_hnsw_crash_safety() {
         }
     }
 }
+
+/// Item 107 (freshness contract "a"): the queue-depth gauge tracks rows
+/// committed but not yet indexed, and returns to 0 once the worker drains —
+/// the observable NEAR freshness lag the contract exposes.
+#[test]
+fn item107_queue_depth_gauge_drains_to_zero() {
+    let dir = tempdir().unwrap();
+    let engine = Engine::open_arc(dir.path(), 0).unwrap();
+    let xid = engine.begin().unwrap();
+    engine
+        .execute_sql(
+            xid,
+            &format!("CREATE TABLE qd (id INT, embedding VECTOR({DIM}))"),
+        )
+        .unwrap();
+    engine
+        .execute_sql(xid, "CREATE INDEX qv ON qd USING HNSW (embedding)")
+        .unwrap();
+    engine.commit(xid).unwrap();
+
+    let applied_before =
+        unidb::hnsw_index::HNSW_WORKER_APPLIED.load(std::sync::atomic::Ordering::Relaxed);
+    let n = 50usize;
+    for i in 0..n {
+        let x = engine.begin().unwrap();
+        let vec_sql: Vec<String> = pseudo_rand_vec(i as u32, DIM)
+            .iter()
+            .map(|f| format!("{f:.6}"))
+            .collect();
+        engine
+            .execute_sql(
+                x,
+                &format!(
+                    "INSERT INTO qd (id, embedding) VALUES ({i}, [{}])",
+                    vec_sql.join(", ")
+                ),
+            )
+            .unwrap();
+        engine.commit(x).unwrap();
+    }
+
+    // Drain and verify the gauge's contract. The gauge is process-global
+    // (documented in hnsw_index.rs), and this binary's sibling tests run
+    // their own engines in parallel — so "== 0 right now" would be the same
+    // cross-test global-counter race as the item-102 flake. Instead: poll
+    // until the whole process quiesces (every test engine drains once its
+    // inserts stop), bounded by a generous deadline.
+    engine.wait_hnsw_idle();
+    let deadline = Instant::now() + std::time::Duration::from_secs(30);
+    while engine.hnsw_queue_depth() > 0 && Instant::now() < deadline {
+        engine.wait_hnsw_idle();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(
+        engine.hnsw_queue_depth(),
+        0,
+        "queue depth must reach 0 once all in-process workers drain"
+    );
+    let applied_after =
+        unidb::hnsw_index::HNSW_WORKER_APPLIED.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        applied_after >= applied_before + n as u64,
+        "worker must have applied the {n} async inserts (before={applied_before}, after={applied_after})"
+    );
+}

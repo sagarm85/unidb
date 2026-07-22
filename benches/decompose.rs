@@ -1543,9 +1543,22 @@ fn bench_hiconc() {
 /// commit** measured over `sample` further single-row transactions AT that size.
 /// Every commit is one group-coalesced fsync (deferred-sync), so the number is the
 /// per-commit cost the async-derivation design targets — not a bulk-load average.
-fn mm_ladder_point(rung: u8, size: u64, sample: u64) -> f64 {
+/// Arc-wrapped bench engine WITH the async HNSW worker running (item 107) —
+/// the production-server path (`EngineHandle::spawn` does the same). Plain
+/// `bench_engine_open` measures the synchronous fallback that only bare
+/// embedded `Engine::open` users hit. W2–W4 ladder rungs and Table 4 use
+/// this so the report reflects the shipping configuration; each timed
+/// section then drains via `wait_hnsw_idle()` and reports the drain
+/// separately — async hides commit latency, not index work (contract "a").
+fn bench_engine_open_arc(dir: &std::path::Path) -> Arc<Engine> {
+    let engine = Arc::new(bench_engine_open(dir));
+    engine.spawn_hnsw_worker();
+    engine
+}
+
+fn mm_ladder_point(rung: u8, size: u64, sample: u64) -> (f64, f64) {
     let dir = tempdir().unwrap();
-    let engine = bench_engine_open(dir.path());
+    let engine = bench_engine_open_arc(dir.path());
     engine.set_deferred_sync(true); // group commit: one fsync per commit
     let setup = engine.begin().unwrap();
     let create = if rung >= 2 {
@@ -1620,6 +1633,9 @@ fn mm_ladder_point(rung: u8, size: u64, sample: u64) -> f64 {
     // making F_FULLFSYNC cost identical across all table sizes.
     engine.sync_wal().unwrap();
     engine.checkpoint().unwrap();
+    // Item 107: pre-grow enqueued async HNSW work — drain it so the timed
+    // window measures marginal commit cost, not pre-grow backlog.
+    engine.wait_hnsw_idle();
     // Measure marginal per-commit cost at this size.
     let start = Instant::now();
     for j in 0..sample {
@@ -1627,7 +1643,14 @@ fn mm_ladder_point(rung: u8, size: u64, sample: u64) -> f64 {
         do_row(xid, size + j);
         engine.commit(xid).unwrap();
     }
-    start.elapsed().as_secs_f64() * 1000.0 / sample as f64
+    let commit_ms = start.elapsed().as_secs_f64() * 1000.0 / sample as f64;
+    // Item 107 honest accounting: the async worker still has to index the
+    // sampled vectors; report that drain as ms per commit alongside the
+    // commit latency (it is deferred work, not eliminated work).
+    let drain_start = Instant::now();
+    engine.wait_hnsw_idle();
+    let drain_ms = drain_start.elapsed().as_secs_f64() * 1000.0 / sample as f64;
+    (commit_ms, drain_ms)
 }
 
 // ============ Table 3 CRUD + Table 4 at-scale helpers (mmreport) ============
@@ -2128,7 +2151,10 @@ fn pg_bulk_select(url: &str, n: u64) -> (u64, f64) {
 /// VECTOR(128) + graph edge + event, one durable group-commit each.
 fn unidb_w4_throughput(n: u64) -> f64 {
     let dir = tempdir().unwrap();
-    let engine = bench_engine_open(dir.path());
+    // Item 107: production path (async HNSW worker). The timed window ends
+    // AFTER wait_hnsw_idle(): sustained multi-model throughput must include
+    // the index work the worker deferred — async hides latency, not work.
+    let engine = bench_engine_open_arc(dir.path());
     engine.set_deferred_sync(true);
     let sx = engine.begin().unwrap();
     engine
@@ -2167,6 +2193,7 @@ fn unidb_w4_throughput(n: u64) -> f64 {
             .unwrap();
         engine.commit(xid).unwrap();
     }
+    engine.wait_hnsw_idle();
     rps(n, start.elapsed().as_secs_f64())
 }
 
@@ -2829,6 +2856,7 @@ fn bench_mm_report() {
     let skip_ladder = should_run_tables_skip(1) && should_run_tables_skip(2);
     println!("## Table 1 — Multi-model commit cost vs table size (ms/commit)\n");
     let mut all: Vec<(u64, [f64; 5])> = Vec::new();
+    let mut all_drains: Vec<(u64, [f64; 5])> = Vec::new();
     if skip_ladder {
         println!(
             "_Skipped: `MM_SKIP_LADDER=1` (the W0→W4 ladder pre-grows build the HNSW vector\n\
@@ -2841,8 +2869,11 @@ fn bench_mm_report() {
         for &size in &sizes {
             eprintln!("[mmreport] ladder at {size} rows…");
             let mut w = [0.0f64; 5];
-            for (r, wr) in w.iter_mut().enumerate() {
-                *wr = mm_ladder_point(r as u8, size, sample);
+            let mut drains = [0.0f64; 5];
+            for r in 0..5usize {
+                let (commit_ms, drain_ms) = mm_ladder_point(r as u8, size, sample);
+                w[r] = commit_ms;
+                drains[r] = drain_ms;
             }
             println!(
                 "| {} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2} | {:.2}× |",
@@ -2856,6 +2887,7 @@ fn bench_mm_report() {
                 w[4] / w[0]
             );
             all.push((size, w));
+            all_drains.push((size, drains));
         }
     }
 
@@ -2885,6 +2917,22 @@ fn bench_mm_report() {
              of the fsync floor; the vector column is the one expected to separate as rows\n\
              grow, since HNSW insert is O(log n) distance computations.)*\n"
         );
+        // Item 107: deferred-work accounting. Commit latency above excludes
+        // the async HNSW graph insert; this table shows what the background
+        // worker still paid per sampled commit (freshness contract "a").
+        println!(
+            "**Async HNSW drain (item 107)** — background index work per commit, off the\n\
+             commit path (worker drain time ÷ sample; W2–W4 rungs write a vector):\n"
+        );
+        println!("| rows | W2 drain | W3 drain | W4 drain |");
+        println!("|-----:|---------:|---------:|---------:|");
+        for (size, d) in &all_drains {
+            println!(
+                "| {} | {:.2} ms | {:.2} ms | {:.2} ms |",
+                size, d[2], d[3], d[4]
+            );
+        }
+        println!();
     }
 
     // ---- Postgres durability lens (shared by Tables 3 & 4) ----
@@ -3031,7 +3079,7 @@ fn bench_mm_report() {
              \n\
              | operation | current ratio | ceiling | root cause | revisit when |\n\
              |---|---|---|---|---|\n\
-             | SELECT filtered | 0.45× at 5% selectivity (2026-07-21 bench; unidb absolute 2.7M rec/s) | ~0.50–0.60× | B-tree index path dominates at 5% selectivity; PG's parallel index scan sets the gap and its effectiveness varies with VM health (ratio env-sensitive — see canary note below). SIMD NO-GO (scatter layout, nightly-only API). | Parallel B-tree candidate resolution. |\n\
+             | SELECT filtered | 0.50× one-shot (2026-07-22, item 109; 3.0M rec/s) — **warm path 3.0× faster than pre-109** (per-candidate page-copy+CRC removed; warm in-container 460 µs/q ≈ 10.9M rec/s, probe `perf_item109`) | ~0.55× one-shot / warm ≈ parity+ | This table times ONE cold execution: ~700 µs fixed one-shot cost (plan-cache miss, first-touch faults, counters) + cold resolve dominate; the item-109 page cache pays off from the second same-page run onward. Ratio is honest for cold single-shot analytics; repeated/paginated workloads run the warm path. | One-shot: plan/first-touch cost work. Warm: already delivered (item 109). |\n\
              | UPDATE HOT-eligible | **1.06×** (2026-07-21 bench; WAL 88 B/row) | ~1.0–1.2× (parity band) | Items 79/80/86-90 delivered; remaining: heap write + 1 fsync/commit floor on both engines. | Further WAL compression or group-commit. |\n\
              | UPDATE non-HOT | **0.65×** (2026-07-21 bench; WAL 226 B/row) | ~0.70× | B-tree `write_node` calls (226 B/row vs 88 B/row HOT floor). | Deferred B-tree leaf coalescing (item 86 generalisation). |\n\
              | INSERT per-row | **0.47×** (2026-07-21 bench; WAL 584 B/row post-item-104) | ~0.55–0.60× | Per-row fsync floor, structural (1 fsync/commit); item 104 removed the per-commit catalog WAL (6,366→584 B/row). | Batch-commit / concurrent group-commit path (item 101). |\n\
