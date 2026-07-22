@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `107_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `109_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -114,10 +114,12 @@
 | 104 | `104_catalog_sync_dedup.md` | Performance | ✅ SHIPPED 2026-07-20 — remove `wal.sync_up_to(catalog_lsn)` after `catalog.persist_only()` in commit; `ROW_COUNT_UNKNOWN` sentinel on load; COUNT(*) calibrates via heap scan after crash. See PROGRESS.md "Item 104". |
 | 105 | `105_bench_selective_carry_forward.md` | Improvement | ✅ SHIPPED 2026-07-21 — bench-time reduction: `MM_SKIP_LADDER` (Tables 1+2, ~2.5 h sink), `MM_TABLES` honored by ALL tables, knobs threaded through Docker (were silently ignored), `MM_BASELINE` carry-forward stitching with provenance stamps (`stitch_baseline.py`), section-aware `compare_bench.py` (also fixes Table-4-vs-W4/W0 parse collision). CRUD-item runs ~4 h → ~30–45 min. |
 | 106 | `106_vector_pgvector_class_tier.md` | Performance | ⏳ NOT STARTED — pgvector-class NEAR tier (≤400 µs at 10k, recall ≥0.90): graph-quality heuristic selection, SQ8 slab quantization, re-rank decode-pushdown; Step-0 = recall-vs-ef curve. Filed 2026-07-21 from item 92 acceptance revision. |
+| 107 | `107_rls_limit_boolean_coercion_crash.md` | Improvement | ⏳ NOT STARTED — **high severity:** any non-superuser querying an RLS-protected table with `LIMIT` gets `SQL_PLAN_ERROR: cannot coerce text '<user>' to boolean for comparison`, every time — breaks every paginated view (Table Editor included) for RLS-restricted users. Clean minimal repro; root-caused to the item-38 Text↔Bool coercion arms in `executor.rs::compare()`, likely triggered via the `LogicalPlan::Query(QuerySpec)` / `query_exec.rs` RLS path that plain `LIMIT` queries route through (the simple-Select fast path item 103 fixed has no `limit` field at all). |
+| 108 | `108_information_schema_follow_table_grants.md` | Improvement | ⏳ NOT STARTED — a user with full CRUD grants on a table still can't read its own row in `information_schema.tables`/`.columns` without a separate blanket grant (which, since those views are unfiltered, would also reveal every other table's existence). Postgres filters these views per-row by existing table privilege; unidb should too. |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `107_…`.**
+**Next new file → `109_…`.**
 
 ## Next up — priority order (2026-07-20, post PR #171 merge + 102-B)
 
