@@ -222,6 +222,9 @@ fn publish_engine_metrics(stats: &crate::EngineStats) {
     gauge!("unidb_checkpoints_total").set(stats.checkpoints as f64);
     gauge!("unidb_wal_bytes").set(stats.wal_bytes as f64);
     gauge!("unidb_wal_fsyncs_total").set(stats.wal_fsyncs as f64);
+    // Item 107: NEAR freshness lag (rows committed but not yet HNSW-indexed).
+    gauge!("unidb_hnsw_queue_depth")
+        .set(crate::hnsw_index::HNSW_QUEUE_DEPTH.load(std::sync::atomic::Ordering::Relaxed) as f64);
     gauge!("unidb_wal_fsync_p50_us").set(stats.wal_fsync_latency.p50_us as f64);
     gauge!("unidb_wal_fsync_p99_us").set(stats.wal_fsync_latency.p99_us as f64);
 

@@ -59,6 +59,14 @@ impl EngineHandle {
         // `set_deferred_sync` call is needed here anymore.
         let read = engine.read_handle();
         let engine = Arc::new(engine);
+        // Item 107: activate the async HNSW worker (item 67) for the served
+        // engine — without this every INSERT into an HNSW-indexed table pays
+        // the synchronous beam search (~6–18 ms) on the commit path (the
+        // W4/W0 96× finding, 21 Jul bench). Freshness contract "a" (user
+        // sign-off 2026-07-22): NEAR may lag committed rows by the queue
+        // depth; the lag is exposed as `unidb_hnsw_queue_depth` and bounded
+        // by the 4096-slot channel's backpressure.
+        engine.spawn_hnsw_worker();
         // A3: start the background autovacuum launcher for the served instance
         // (default-on, policy-gated). The worker holds a `Weak<Engine>`, so this
         // Arc's eventual drop still tears the engine down cleanly.
