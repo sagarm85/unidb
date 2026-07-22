@@ -59,9 +59,8 @@ the first discriminator (§0.6 rule 4: trust absolutes over noisy ratios).
 The environmental conclusion was re-tested the strong way after review: the
 **exact old code** (`51022be`, PR #171 — the code that produced the
 0.74×/0.81× report) was re-run on **today's healthy environment**
-(`docs/performance/report_20260722_002217_ab_oldcode_51062be…` — file
-`report_20260722_002217_ab_oldcode_51022be.md`; Table 3 full at 100k, other
-tables shrunk via size knobs). Pairing validity: PG absolutes match the
+(`docs/performance/report_20260722_002217_ab_oldcode_51022be.md`; Table 3
+full at 100k, other tables shrunk via size knobs). Pairing validity: PG absolutes match the
 same-day current-main run within ~3% (7,937 vs 8,140 inserts/s; 5.50M vs
 5.51M filtered rows/s).
 
