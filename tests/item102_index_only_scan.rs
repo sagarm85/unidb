@@ -24,6 +24,14 @@ use unidb::{Engine, SqlResult};
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
+/// The IDX_ONLY_ROWS counter is process-global, but Rust runs this binary's
+/// tests in parallel — a "must NOT increment" delta assertion can observe a
+/// sibling test's increments (seen flaking 2026-07-21 under CPU load). Every
+/// test that reads the counter serializes on this guard; assertions stay
+/// strict. Lock poisoning is ignored (a panicked holder already failed its
+/// own test).
+static COUNTER_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn open(dir: &tempfile::TempDir) -> Engine {
     Engine::open(dir.path(), 0).unwrap()
 }
@@ -96,6 +104,7 @@ fn query_count(engine: &Engine, sql: &str) -> i64 {
 /// the correct row.
 #[test]
 fn basic_index_only_scan() {
+    let _guard = COUNTER_GUARD.lock().unwrap_or_else(|p| p.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let engine = open(&dir);
 
@@ -142,6 +151,7 @@ fn basic_index_only_scan() {
 /// it still needs the heap to fetch `val`.
 #[test]
 fn non_index_col_uses_heap() {
+    let _guard = COUNTER_GUARD.lock().unwrap_or_else(|p| p.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let engine = open(&dir);
 
@@ -180,6 +190,7 @@ fn non_index_col_uses_heap() {
 /// the index-only path.
 #[test]
 fn star_projection_uses_heap() {
+    let _guard = COUNTER_GUARD.lock().unwrap_or_else(|p| p.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let engine = open(&dir);
 
@@ -224,6 +235,7 @@ fn star_projection_uses_heap() {
 /// know `page_count`), we insert enough rows and call ANALYZE first.
 #[test]
 fn range_ops_index_only() {
+    let _guard = COUNTER_GUARD.lock().unwrap_or_else(|p| p.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let engine = open(&dir);
 
@@ -297,6 +309,7 @@ fn range_ops_index_only() {
 /// not an index-only scan. Verify it still produces the correct count.
 #[test]
 fn count_star_not_index_only() {
+    let _guard = COUNTER_GUARD.lock().unwrap_or_else(|p| p.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let engine = open(&dir);
 
@@ -335,6 +348,7 @@ fn count_star_not_index_only() {
 /// Index-only scan works for TEXT-typed indexed columns, not just INT.
 #[test]
 fn index_only_text_column() {
+    let _guard = COUNTER_GUARD.lock().unwrap_or_else(|p| p.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let engine = open(&dir);
 
@@ -382,6 +396,7 @@ fn index_only_text_column() {
 /// and the index-only scan cannot see it — this test guards that invariant.
 #[test]
 fn deleted_rows_not_returned() {
+    let _guard = COUNTER_GUARD.lock().unwrap_or_else(|p| p.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let engine = open(&dir);
 

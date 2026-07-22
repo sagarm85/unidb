@@ -59,7 +59,7 @@ fn role_members_catalog_shows_grants() {
     )
     .unwrap();
     let found = rows.iter().any(|r| {
-        r.get(0).map(|s| s == "analyst").unwrap_or(false)
+        r.first().map(|s| s == "analyst").unwrap_or(false)
             && r.get(1).map(|s| s == "bob").unwrap_or(false)
     });
     assert!(
@@ -167,10 +167,12 @@ fn role_members_multiple_grants() {
     .unwrap();
 
     let has_u1 = rows.iter().any(|r| {
-        r.get(0).map(|s| s == "r1").unwrap_or(false) && r.get(1).map(|s| s == "u1").unwrap_or(false)
+        r.first().map(|s| s == "r1").unwrap_or(false)
+            && r.get(1).map(|s| s == "u1").unwrap_or(false)
     });
     let has_u2 = rows.iter().any(|r| {
-        r.get(0).map(|s| s == "r1").unwrap_or(false) && r.get(1).map(|s| s == "u2").unwrap_or(false)
+        r.first().map(|s| s == "r1").unwrap_or(false)
+            && r.get(1).map(|s| s == "u2").unwrap_or(false)
     });
 
     assert!(

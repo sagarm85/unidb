@@ -4,7 +4,6 @@
 /// vs UPDATE to see if the page-allocation cost dominates.
 use std::time::Instant;
 use tempfile::tempdir;
-use unidb::sql::executor::ExecResult;
 use unidb::sql::logical::Literal;
 use unidb::Engine;
 
@@ -15,17 +14,6 @@ fn open_engine(dir: &std::path::Path) -> Engine {
     let e = Engine::open(dir, 0).unwrap();
     e.set_deferred_sync(true);
     e
-}
-
-fn count_result(res: Vec<ExecResult>) -> usize {
-    res.into_iter()
-        .map(|r| match r {
-            ExecResult::Rows { rows, .. } => rows.len(),
-            ExecResult::Updated { count } => count,
-            ExecResult::Deleted { count } => count,
-            _ => 0,
-        })
-        .sum()
 }
 
 /// INSERT with the same number of rows as UPDATE Phase B needs.
