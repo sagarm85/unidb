@@ -574,7 +574,25 @@ fn delete_policy_for_skip_current_user(catalog: &Catalog, table: &str) -> Option
 /// - SELECT / JOIN → `rls_policy` (SELECT + ALL)
 /// - UPDATE        → `update_policy` (UPDATE + ALL)
 /// - DELETE        → `delete_policy` (DELETE + ALL)
-pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog) -> LogicalPlan {
+///
+/// `user` is the caller's identity (item 110): policy expressions can
+/// reference `current_user`, and for `LogicalPlan::Query` (any SELECT with
+/// LIMIT/JOIN/GROUP BY/…) the policy `Expr` is eagerly converted to `QExpr`
+/// at injection — so `current_user` must be substituted HERE, before that
+/// conversion, or it is destroyed (the pre-item-110 bug: the conversion's
+/// fallback turned it into `Bool(true)`, making `owner = current_user` into
+/// `owner = TRUE` → a coercion error on every RLS+LIMIT query, and a silent
+/// policy weakening in shapes where `Bool` type-checks).
+pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog, user: Option<&str>) -> LogicalPlan {
+    // Policy fetcher with current_user resolved at fetch time (see doc above).
+    let policy_sub = |pol: Option<Expr>| -> Option<Expr> {
+        pol.map(|mut e| {
+            if let Some(u) = user {
+                substitute_current_user_in_expr(&mut e, u);
+            }
+            e
+        })
+    };
     match plan {
         LogicalPlan::Select {
             table,
@@ -621,12 +639,14 @@ pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog) -> LogicalPlan {
             // RLS for joins is SELECT-context: AND each base relation's
             // SELECT policy into the query's residual selection, qualified
             // to that relation. The executor never learns RLS exists.
-            spec.apply_rls_from(&|table| select_policy_for(catalog, table));
+            // Item 110: substitute current_user BEFORE the Expr→QExpr
+            // conversion inside apply_rls_from destroys it.
+            spec.apply_rls_from(&|table| policy_sub(select_policy_for(catalog, table)));
             LogicalPlan::Query(spec)
         }
         LogicalPlan::Explain { analyze, mut spec } => {
             // EXPLAIN shows the RLS-rewritten plan the query would actually run.
-            spec.apply_rls_from(&|table| select_policy_for(catalog, table));
+            spec.apply_rls_from(&|table| policy_sub(select_policy_for(catalog, table)));
             LogicalPlan::Explain { analyze, spec }
         }
         LogicalPlan::SetOp {
@@ -636,8 +656,8 @@ pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog) -> LogicalPlan {
             right,
         } => {
             // Apply RLS to both branches of a set operation recursively.
-            let left = Box::new(apply_rls(*left, catalog));
-            let right = Box::new(apply_rls(*right, catalog));
+            let left = Box::new(apply_rls(*left, catalog, user));
+            let right = Box::new(apply_rls(*right, catalog, user));
             LogicalPlan::SetOp {
                 op,
                 all,
@@ -739,7 +759,7 @@ mod tests {
             projection: vec![],
             predicate: None,
         };
-        let rewritten = apply_rls(plan, &catalog);
+        let rewritten = apply_rls(plan, &catalog, Some("test_user"));
         match rewritten {
             LogicalPlan::Select { predicate, .. } => assert_eq!(predicate, Some(policy)),
             _ => panic!("expected Select"),
@@ -766,7 +786,7 @@ mod tests {
             projection: vec![],
             predicate: Some(user_pred.clone()),
         };
-        let rewritten = apply_rls(plan, &catalog);
+        let rewritten = apply_rls(plan, &catalog, Some("test_user"));
         match rewritten {
             LogicalPlan::Select { predicate, .. } => {
                 assert_eq!(
@@ -785,7 +805,7 @@ mod tests {
             predicate: Some(user_pred.clone()),
             returning: None,
         };
-        let del_rewritten = apply_rls(del_plan, &catalog);
+        let del_rewritten = apply_rls(del_plan, &catalog, Some("test_user"));
         match del_rewritten {
             LogicalPlan::Delete { predicate, .. } => {
                 // delete_policy is None — only user_pred remains.
@@ -803,7 +823,7 @@ mod tests {
             projection: vec![],
             predicate: None,
         };
-        let rewritten = apply_rls(plan, &catalog);
+        let rewritten = apply_rls(plan, &catalog, Some("test_user"));
         match rewritten {
             LogicalPlan::Select { predicate, .. } => assert_eq!(predicate, None),
             _ => panic!("expected Select"),
@@ -865,7 +885,7 @@ mod tests {
             fill_factor: 100,
         };
         assert!(matches!(
-            apply_rls(plan, &catalog),
+            apply_rls(plan, &catalog, Some("test_user")),
             LogicalPlan::CreateTable { .. }
         ));
     }

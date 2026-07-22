@@ -109,7 +109,7 @@ impl ReadHandle {
                 apply_rls_skip_current_user(plan, &self.catalog_read())
             } else {
                 // Regular named user: apply all applicable policies.
-                apply_rls(plan, &self.catalog_read())
+                apply_rls(plan, &self.catalog_read(), user)
             };
             // Second substitution resolves CurrentUser nodes injected by the
             // RLS policy expressions (only matters for the non-skip path).

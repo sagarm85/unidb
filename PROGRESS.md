@@ -9604,3 +9604,22 @@ WAL-B/row. Within-run ratios remain fair by construction (same VM mood).
 The 0.74×/0.81× ratios are not reproducible by the code that produced them:
 environment artifact confirmed by direct experiment, zero merge regressions.
 Evidence: `docs/performance/report_20260722_002217_ab_oldcode_51022be.md`.
+
+## Item 110 — RLS + LIMIT crash: current_user destroyed in QuerySpec path   [SHIPPED]   2026-07-22
+
+**Branch:** `fix/item-110-rls-limit` | **Type:** Improvement (correctness/security — no format change)
+
+Filed by the user from unidb-studio integration (PR #195; every paginated
+view broken for RLS-restricted users). Root cause: `LIMIT` routes to
+`LogicalPlan::Query(QuerySpec)`; `substitute_current_user_in_plan` had no
+arm for that shape, and RLS injection eagerly converts the policy Expr →
+QExpr whose fallback rewrote unresolved `current_user` to `Bool(true)` —
+`owner = current_user` became `owner = TRUE` → Text↔Bool coercion error.
+Worse than the crash: in shapes where Bool type-checks the old fallback
+silently WEAKENED policies (leak hazard).
+
+Fix: `apply_rls` takes the caller identity and substitutes `current_user`
+into the policy at injection time (before conversion); the fallback now
+fails CLOSED (`Null` + warn). 5 regression tests incl. count-asserted
+silent-bypass guard and two-user isolation. Full suite 70 binaries green,
+crash 54/54, clippy/fmt clean.
