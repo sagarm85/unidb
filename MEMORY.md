@@ -12,6 +12,29 @@
 
 ## Current status
 
+- **Item 108 — RESOLVED 2026-07-21 (same day): CRUD drift was ENVIRONMENTAL, no unidb regression.**
+  Absolutes (§0.6 rule 4): PG's code-identical absolutes moved 2.1–28× between the 07-19/07-21
+  runs (VM fsync ~30×, CPU ~2.15× — why the 07-19 run took 229 min); unidb improved on EVERY row
+  in absolutes (INSERT 138→4,128 rec/s; filtered 812k→2.72M) and WAL-B/row (INSERT 6,366→584 —
+  item 104's signature; HOT 154→88; DELETE sel 39→5). No bisection needed. Shipped: PG-absolute
+  environment canary in compare_bench.py (median drift >25% → warning; fires at 173% on this
+  pair), decompose.rs ceilings table refreshed to 07-21 values, inline correction of the
+  item-104 COUNT claim in PROGRESS.md (real evidence = WAL-B/row + W0, not the COUNT ratio).
+  Rule: cross-run ratio deltas are evidence only when the canary is quiet; else judge by
+  absolutes + WAL-B/row.
+
+- **Consolidated Docker bench — RUN + RECORDED 2026-07-21** (`docs/performance/report_20260721_035629.md`,
+  94m 54s total — bench got 2.4× faster since 07-19 because HNSW insert improvements shrank the ladder;
+  promoted as canonical benchmark + standing `MM_BASELINE`). Verdicts: **item 104 VALIDATED**
+  (W0 0.23 ms/commit at 100k; COUNT(*) 6.93→**41.25×**); **items 72/73/93+NodeCache VALIDATED**
+  (Table 4 at 100k 81.8→13.4 ms/txn, 6.1×); **conc matrix 32/32 PASS**. Two findings filed:
+  **item 107** — synchronous HNSW insert breaks W4≈W0 (Δvector +17.6 ms/commit at 100k, W4/W0 96×,
+  Table 4 0.01×; M2's locked design = async worker; Step-0 audits item 67 coverage + freshness
+  contract); **item 108** — CRUD ratio drift vs 07-19 (SELECT filtered 0.74→0.45×, UPDATE HOT
+  1.51→1.06×; classify via absolute rec/s then bisect with item-105 selective runs; also refresh
+  the stale ceilings table in decompose.rs). Linux NEAR spot-check still open (mmreport doesn't
+  measure NEAR; run perf_item92 in-container).
+
 - **Item 92 Levers 5+7 — SHIPPED 2026-07-21; acceptance revised ≤700 µs → ≤1 ms WITH USER SIGN-OFF same day; pgvector-class tier filed as item 106.**
   10k re-profile: warm NEAR 2,091 µs, 1,257 µs unattributed → root cause: `exec_select_near`
   deep-cloned the ENTIRE per-index cache per query (L0 arena + 10k-entry vec HashMap ≈ 7 MiB +
@@ -3628,6 +3651,26 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-21 (same session) — Item 108 resolved same-day: drift = environment
+
+Absolutes-first comparison closed it in one step, no bisection: PG code-identical absolutes
+moved 2.1–28× across the two runs; unidb improved everywhere (absolutes + WAL-B/row). Shipped
+compare_bench.py env canary (>25% PG-absolute median drift → warning), refreshed the stale
+decompose.rs ceilings table (now 07-21 values + absolutes-first protocol note), corrected the
+item-104 COUNT-baseline claim in PROGRESS.md inline. Item 107 (async HNSW) is now the sole
+open finding from the bench.
+
+### 2026-07-21 (same session, after item 92) — Consolidated Docker bench + items 107/108 filed
+
+Full run on main+92 (`b6d6e5f`): 94m 54s (vs ~230 min on 07-19 — ladder now cheap since HNSW
+insert improvements; validates item 105's timing analysis). Debt verdicts: item 104 ✓ (W0
+0.23 ms at 100k, COUNT 41.25×), items 72/73/93+gate ✓ (Table 4 100k 81.8→13.4 ms/txn), conc
+32/32 PASS. Findings: W4/W0 blown to 19–96× — synchronous HNSW insert (Δvector +6.6→+17.6
+ms/commit); old ≈1.5× baseline was IVF-era; fix = M2's prescribed async worker → **item 107**.
+CRUD drift vs 07-19 (filtered 0.74→0.45×, HOT 1.51→1.06×) → **item 108** (absolute-first
+classification, then item-105 selective bisect; refresh stale decompose.rs ceilings table).
+Report promoted (benchmark_20260721_133227.md) + copied to docs/performance as MM_BASELINE.
 
 ### 2026-07-21 (later same session) — Item 92 Levers 5–7: NEAR warm 10k 2,091 → ~900 µs
 

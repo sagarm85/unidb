@@ -48,15 +48,19 @@ _HEADING_RE = re.compile(r'^## Table ([\d.]+)\b')
 def parse_metrics(path: str) -> dict:
     """
     Section-aware parse. Returns:
-      'crud':  {operation_label: ratio}   — Table 3 rows (unidb÷PG)
-      'fk':    {operation_label: ratio}   — Table 5 rows (unidb÷PG)
-      'w4w0':  {row_size_str:   ratio}    — W4/W0 column, Table 1 ONLY
+      'crud':   {operation_label: ratio}   — Table 3 rows (unidb÷PG)
+      'fk':     {operation_label: ratio}   — Table 5 rows (unidb÷PG)
+      'w4w0':   {row_size_str:   ratio}    — W4/W0 column, Table 1 ONLY
+      'pg_abs': {operation_label: rec/s}   — Table 3 POSTGRES absolute rec/s
+                (environment canary — Postgres code never changes between our
+                runs, so a large move in ITS absolutes means the environment
+                changed, and cross-run RATIO deltas are not evidence; item 108)
     Sections stitched in by stitch_baseline.py (carried forward from an older
     report) are excluded entirely. Restricting W4/W0 to Table 1 also fixes a
     prior collision where Table 4 rows (same integer-keyed shape, ratio in the
     last column) silently overwrote the W4/W0 entries.
     """
-    crud, fk, w4w0 = {}, {}, {}
+    crud, fk, w4w0, pg_abs = {}, {}, {}, {}
     table_id = None     # "1", "3.1", "4", … for the current ## Table section
     carried = False     # current section was carried forward — ignore its rows
 
@@ -96,8 +100,13 @@ def parse_metrics(path: str) -> dict:
                     fk[op] = ratio
                 else:
                     crud[op] = ratio
+                    # Environment canary: Postgres absolute rec/s (col 3).
+                    try:
+                        pg_abs[op] = float(cols[3])
+                    except (ValueError, IndexError):
+                        pass
 
-    return {'crud': crud, 'fk': fk, 'w4w0': w4w0}
+    return {'crud': crud, 'fk': fk, 'w4w0': w4w0, 'pg_abs': pg_abs}
 
 
 # ── formatting ────────────────────────────────────────────────────────────────
@@ -183,6 +192,27 @@ def main():
     print(f"\n{BOLD}{'─' * 72}{RESET}")
     print(f"{BOLD}  vs {bench_name}{RESET}  (benchmark → this run)")
     print(f"{BOLD}{'─' * 72}{RESET}")
+
+    # ── Environment canary (item 108) ────────────────────────────────────────
+    # Postgres is code-identical across our runs; if its own absolute rec/s
+    # moved a lot, the ENVIRONMENT changed (VM fsync mood, CPU contention) and
+    # the ratio deltas below mostly measure that, not unidb. The 2026-07-19 vs
+    # 2026-07-21 reports are the canonical example: PG absolutes moved 2.1–28×
+    # per op and every apparent unidb "regression" dissolved under absolutes.
+    drifts = []
+    for op, new_v in new.get('pg_abs', {}).items():
+        old_v = old.get('pg_abs', {}).get(op)
+        if old_v and old_v > 0:
+            drifts.append(abs(new_v - old_v) / old_v)
+    if drifts:
+        drifts.sort()
+        median = drifts[len(drifts) // 2]
+        if median > 0.25:
+            print(f"\n{BOLD}{YELLOW}  ⚠ ENVIRONMENT CHANGED between these runs:{RESET}")
+            print(f"{YELLOW}  Postgres's own absolute throughput moved {median * 100:.0f}% (median across "
+                  f"{len(drifts)} CRUD ops) with identical PG code.{RESET}")
+            print(f"{YELLOW}  Treat the ratio deltas below as environment noise unless a row's "
+                  f"unidb ABSOLUTE rec/s also regressed (check the reports directly).{RESET}")
 
     out = []
     out += _section("Table 3 — CRUD (unidb ÷ PG, higher = unidb closer to PG)",

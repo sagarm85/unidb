@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `107_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `109_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -114,10 +114,12 @@
 | 104 | `104_catalog_sync_dedup.md` | Performance | ✅ SHIPPED 2026-07-20 — remove `wal.sync_up_to(catalog_lsn)` after `catalog.persist_only()` in commit; `ROW_COUNT_UNKNOWN` sentinel on load; COUNT(*) calibrates via heap scan after crash. See PROGRESS.md "Item 104". |
 | 105 | `105_bench_selective_carry_forward.md` | Improvement | ✅ SHIPPED 2026-07-21 — bench-time reduction: `MM_SKIP_LADDER` (Tables 1+2, ~2.5 h sink), `MM_TABLES` honored by ALL tables, knobs threaded through Docker (were silently ignored), `MM_BASELINE` carry-forward stitching with provenance stamps (`stitch_baseline.py`), section-aware `compare_bench.py` (also fixes Table-4-vs-W4/W0 parse collision). CRUD-item runs ~4 h → ~30–45 min. |
 | 106 | `106_vector_pgvector_class_tier.md` | Performance | ⏳ NOT STARTED — pgvector-class NEAR tier (≤400 µs at 10k, recall ≥0.90): graph-quality heuristic selection, SQ8 slab quantization, re-rank decode-pushdown; Step-0 = recall-vs-ef curve. Filed 2026-07-21 from item 92 acceptance revision. |
+| 107 | `107_async_hnsw_commit_path.md` | Performance | ⏳ NOT STARTED — synchronous HNSW insert breaks the W4≈W0 thesis (Δvector +6.6→+17.6 ms/commit, W4/W0 96× at 100k, Table 4 0.01×; 2026-07-21 bench); implement M2's locked design: async HNSW maintenance in a background worker; Step-0 = audit item 67 coverage + freshness contract. |
+| 108 | `108_crud_ratio_regression_check.md` | Performance | ✅ RESOLVED 2026-07-21 — drift was ENVIRONMENTAL, no unidb regression (PG's code-identical absolutes moved 2.1–28× between runs; unidb improved on every row in absolutes + WAL-B/row). Shipped: PG-absolute env canary in compare_bench.py, decompose.rs ceilings refresh, item-104 COUNT-claim correction. See PROGRESS.md "Item 108". |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `107_…`.**
+**Next new file → `109_…`.**
 
 ## Next up — priority order (2026-07-20, post PR #171 merge + 102-B)
 
