@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `110_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `112_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -117,10 +117,12 @@
 | 107 | `107_async_hnsw_commit_path.md` | Performance | ⏳ NOT STARTED — synchronous HNSW insert breaks the W4≈W0 thesis (Δvector +6.6→+17.6 ms/commit, W4/W0 96× at 100k, Table 4 0.01×; 2026-07-21 bench); implement M2's locked design: async HNSW maintenance in a background worker; Step-0 = audit item 67 coverage + freshness contract. |
 | 108 | `108_crud_ratio_regression_check.md` | Performance | ✅ RESOLVED 2026-07-21 — drift was ENVIRONMENTAL, no unidb regression (PG's code-identical absolutes moved 2.1–28× between runs; unidb improved on every row in absolutes + WAL-B/row). Shipped: PG-absolute env canary in compare_bench.py, decompose.rs ceilings refresh, item-104 COUNT-claim correction. See PROGRESS.md "Item 108". |
 | 109 | `109_parallel_btree_candidate_resolution.md` | Performance | ⏳ NOT STARTED — SELECT filtered 0.45–0.51× → ≥0.70×: parallelise per-candidate heap fetch/visibility/project over page-grouped chunks (Milestone-P workers + item-70 prefetch); B-tree leaf walk stays serial; candidate-count gate; Step-0 = phase-split the serial path first. Filed 2026-07-22. |
+| 110 | `110_rls_limit_boolean_coercion_crash.md` | Improvement | ⏳ NOT STARTED — **high severity:** any non-superuser querying an RLS-protected table with `LIMIT` gets `SQL_PLAN_ERROR: cannot coerce text '<user>' to boolean for comparison`, every time — breaks every paginated view (Table Editor included) for RLS-restricted users. Clean minimal repro; root-caused to the item-38 Text↔Bool coercion arms in `executor.rs::compare()`, likely triggered via the `LogicalPlan::Query(QuerySpec)` / `query_exec.rs` RLS path that plain `LIMIT` queries route through (the simple-Select fast path item 103 fixed has no `limit` field at all). _(Filed as 107/108 in PR #195 before those IDs were taken on main; renumbered 110/111 at merge per the stable-ID rule.)_ |
+| 111 | `111_information_schema_follow_table_grants.md` | Improvement | ⏳ NOT STARTED — a user with full CRUD grants on a table still can't read its own row in `information_schema.tables`/`.columns` without a separate blanket grant (which, since those views are unfiltered, would also reveal every other table's existence). Postgres filters these views per-row by existing table privilege; unidb should too. |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `110_…`.**
+**Next new file → `112_…`.**
 
 ## Next up — priority order (2026-07-20, post PR #171 merge + 102-B)
 
