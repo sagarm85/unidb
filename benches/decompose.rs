@@ -3031,13 +3031,15 @@ fn bench_mm_report() {
              \n\
              | operation | current ratio | ceiling | root cause | revisit when |\n\
              |---|---|---|---|---|\n\
-             | SELECT filtered | 0.44× at 5% selectivity (items 75-84 Docker bench, 2026-07-19) | ~0.50× | B-tree index path dominates at 5% selectivity. Remaining gap: PG parallel index scan. cols/row stable at 4.00. SIMD NO-GO (scatter layout, nightly-only API). | Parallel B-tree candidate resolution. |\n\
-             | UPDATE HOT-eligible | **0.62×** (items 75-84 Docker bench, 2026-07-19) | ~0.70–0.80× | WAL batch records (items 79+80) cut mutex passes 150k→789; WAL 314→82 B/row (−74%). Remaining gap: heap write cost + 1 fsync/commit floor. | Further WAL compression or group-commit. |\n\
-             | UPDATE non-HOT | **0.42×** (items 75-84 Docker bench, 2026-07-19) | ~0.50× | Batch `update_many` (item 83) + bulk B-tree merge-split (item 84); WAL 556→202 B/row (−64%). Remaining gap: B-tree `write_node` calls (202 B/row vs 82 B/row heap-only floor). | Deferred B-tree leaf coalescing (item 86). |\n\
-             | INSERT per-row | **0.55×** (items 75-84 Docker bench, 2026-07-19) | ~0.55–0.60× | Per-row fsync floor. WAL 8837→556 B/row delivered; remaining gap is structural (1 fsync/commit). | Batch-commit or group-commit mode. |\n\
-             | DELETE selected | **0.81×** (items 75-84 Docker bench, 2026-07-19) | ~0.85–0.90× | Bitmap batch B-tree scan + RowId-only fast path (items 75a+b); WAL 39→5 B/row (−87%). Gap closed from 0.04× to 0.81×. Remaining: fsync + page-write floor. | Further WAL compression. |\n\
+             | SELECT filtered | 0.45× at 5% selectivity (2026-07-21 bench; unidb absolute 2.7M rec/s) | ~0.50–0.60× | B-tree index path dominates at 5% selectivity; PG's parallel index scan sets the gap and its effectiveness varies with VM health (ratio env-sensitive — see canary note below). SIMD NO-GO (scatter layout, nightly-only API). | Parallel B-tree candidate resolution. |\n\
+             | UPDATE HOT-eligible | **1.06×** (2026-07-21 bench; WAL 88 B/row) | ~1.0–1.2× (parity band) | Items 79/80/86-90 delivered; remaining: heap write + 1 fsync/commit floor on both engines. | Further WAL compression or group-commit. |\n\
+             | UPDATE non-HOT | **0.65×** (2026-07-21 bench; WAL 226 B/row) | ~0.70× | B-tree `write_node` calls (226 B/row vs 88 B/row HOT floor). | Deferred B-tree leaf coalescing (item 86 generalisation). |\n\
+             | INSERT per-row | **0.47×** (2026-07-21 bench; WAL 584 B/row post-item-104) | ~0.55–0.60× | Per-row fsync floor, structural (1 fsync/commit); item 104 removed the per-commit catalog WAL (6,366→584 B/row). | Batch-commit / concurrent group-commit path (item 101). |\n\
+             | DELETE selected | **2.01×** (2026-07-21 bench; WAL 5 B/row) | above 1× — hold | Bitmap batch B-tree scan + RowId-only fast path (items 75a+b). | — |\n\
              \n\
-             _Correction (2026-07-19): prior ceilings (DELETE ~0.07×, UPDATE HOT ~0.40×, UPDATE non-HOT ~0.07× structural) were set before items 75–84 and have been superseded by measured results. Old ceilings are preserved in git history (commit ff3f7af). Do not use them as targets._\n"
+             _Correction (2026-07-19): prior ceilings (DELETE ~0.07×, UPDATE HOT ~0.40×, UPDATE non-HOT ~0.07× structural) were set before items 75–84 and have been superseded by measured results. Old ceilings are preserved in git history (commit ff3f7af). Do not use them as targets._\n\
+             \n\
+             _Refreshed 2026-07-21 (item 108): the previous rows quoted items-75-84-era ratios that later runs had superseded. **Cross-run ratio deltas are only evidence if the environment held still** — Postgres is code-identical across our runs, so if PG's own absolute rec/s moved (compare_bench.py now prints an environment-canary warning above 25% median drift), judge unidb by its ABSOLUTE rec/s and WAL-B/row, not the ratio. The 07-19→07-21 'regressions' (filtered 0.74→0.45×, HOT 1.51→1.06×) dissolved exactly this way: unidb absolutes improved on every row while PG absolutes moved 2.1–28× with the VM._\n"
         );
         } else {
             println!(

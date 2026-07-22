@@ -9519,3 +9519,88 @@ Crash harness 54/54. `cargo clippy -- -D warnings` + `--test perf_item92`
 clean; fmt clean. Recall@10 at 10k = 0.900 (gate ≥ 0.90) unchanged across
 all levers. Pre-existing flake (item102 global-counter race) and
 pre-existing test-binary clippy lints flagged as separate follow-up tasks.
+
+## Consolidated Docker bench — validation-debt run   [RECORDED]   2026-07-21
+
+**Report:** `docs/performance/report_20260721_035629.md` (Docker fair-fsync,
+main+item 92 @ `b6d6e5f`, all tables, sizes 1k/10k/100k, sample 200).
+Promoted as canonical benchmark (`docker/out/benchmark_20260721_133227.md`)
+and designated the standing `MM_BASELINE` for item-105 selective runs.
+**Total 94m 54s** — down from ~230 min two days ago; the ladder pre-grows
+got cheap because the HNSW insert path improved (items 65/67/93), which
+itself validates item 105's timing analysis.
+
+### Verdicts on the debt items
+
+- **Item 104 (fsync dedup): VALIDATED.** W0 ladder rung 0.23 ms/commit at
+  100k; INSERT WAL **6,366 → 584 B/row** (the removed per-commit catalog WAL
+  records — the direct signature of the fix); unidb INSERT absolute
+  138 → 4,128 rec/s.
+  _Correction (2026-07-21, item 108): this entry originally claimed
+  "COUNT(*) 6.93× → 41.25× validates item 104" — wrong baseline. The direct
+  predecessor report (07-19) already showed 85.22× (item 97's O(1) count);
+  the 85→41× move is Postgres-side environment. unidb's COUNT absolute was
+  ~2.0e9 rec/s in both runs. The WAL-B/row and W0 numbers above are the
+  honest item-104 evidence._
+- **Items 72/73/93 + NodeCache gate: VALIDATED at 100k.** Table 4 multi-model
+  txn cost at 100k **81.8 → 13.4 ms/txn (6.1×)** vs the 2026-07-19 report;
+  no NodeCache-style blowup at scale.
+- **Item 92 W2-rung check: no query-side regression** (W2 rung is
+  insert-dominated; see item 107). Linux NEAR latency spot-check still open
+  (mmreport does not measure NEAR; run `perf_item92` in-container when
+  needed).
+- **Item 85 / concurrency: 32 PASS · 0 FAIL** including cross-row-churn.
+
+### Findings → new items
+
+- **Item 107 (filed): synchronous HNSW insert breaks the W4≈W0 thesis** —
+  Δvector +6.6→+17.6 ms/commit (1k→100k), W4/W0 19.5×/17.6×/96.0×, Table 4
+  0.03×/0.02×/0.01× vs PG floor. Root cause is architectural, not a
+  regression: item 63's IVF→HNSW switch made per-commit vector maintenance
+  a beam search (the old W4/W0≈1.5 baseline was IVF-era), and item 104
+  made W0 faster, widening the ratio. CLAUDE.md M2 already prescribes the
+  fix (async HNSW maintenance in a background worker) — item 107 implements
+  the locked design.
+- **Item 108 (filed): CRUD ratio drift vs 2026-07-19** — SELECT filtered
+  0.74→0.45×, UPDATE HOT 1.51→1.06×, UPDATE non-HOT 0.81→0.65×, DELETEs
+  down 26–39%, GROUP BY stable. ~15 items merged between runs; classify via
+  absolute rec/s (ratios conflate PG-side variance), then bisect with
+  item-105 selective runs. The in-bench "known honest ceilings" table is
+  also stale (still quotes items-75-84-era numbers) — refresh under 108.
+
+## Item 108 — CRUD ratio drift: RESOLVED as environment, no unidb regression   [SHIPPED]   2026-07-21
+
+**Method (§0.6 rule 4 — absolutes over noisy ratios):** compared absolute
+unidb and Postgres rec/s per Table-3 row across `report_20260719_234504.md`
+and `report_20260721_035629.md`. Postgres is code-identical between runs,
+yet its own absolutes moved **2.1×–28×** per op (fsync ~30× faster, CPU
+~2.15× faster on 07-21 — also why the 07-19 run took 229 min). Meanwhile
+**unidb improved on every row in absolutes** (INSERT 138→4,128 rec/s,
+filtered SELECT 812k→2.72M, UPDATE HOT 492k→942k) **and in WAL-B/row**
+(INSERT 6,366→584, HOT 154→88, DELETE sel 39→5). Every apparent ratio
+"regression" (filtered 0.74→0.45×, HOT 1.51→1.06×) is PG gaining more from
+the healthy environment than unidb — not a unidb regression. **No bisection
+needed; zero code regressions found.**
+
+**Shipped hardening so this class of false alarm can't recur:**
+- `compare_bench.py` environment canary: parses Postgres absolute rec/s
+  (Table 3) from both reports and prints a prominent "ENVIRONMENT CHANGED"
+  warning when median drift > 25% (fires at 173% on the 07-19/07-21 pair).
+- `benches/decompose.rs` "known honest ceilings" table refreshed to
+  2026-07-21 measured values (was stale at items-75-84-era numbers), plus a
+  standing note on the absolutes-first protocol.
+- Inline correction to the Item-104 bench verdict above (COUNT baseline was
+  wrong; WAL-B/row + W0 are the honest evidence).
+
+**Ratio-hygiene rule going forward:** a cross-run ratio delta is evidence
+only if the canary is quiet; otherwise judge unidb by absolute rec/s and
+WAL-B/row. Within-run ratios remain fair by construction (same VM mood).
+
+**Addendum (2026-07-22) — controlled A/B on user request:** old code
+(`51022be`) re-run on today's environment scored filtered **0.50×**, non-HOT
+**0.64×**, HOT 1.16×, INSERT **0.17×** — indistinguishable from current main
+(0.45–0.51× / 0.65–0.68× / 1.06–1.16×) except INSERT, where current main is
+**~3× better** (item 104). PG absolutes matched within ~3% across the pair.
+The 0.74×/0.81× ratios are not reproducible by the code that produced them:
+environment artifact confirmed by direct experiment, zero merge regressions.
+Evidence: `docs/performance/report_20260722_002217_ab_oldcode_51022be.md`.
