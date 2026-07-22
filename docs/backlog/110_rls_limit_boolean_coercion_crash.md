@@ -1,7 +1,10 @@
 # RLS + LIMIT crashes for every non-superuser caller (Text→Bool coercion bug)
 
 **Type:** Improvement
-**Status:** NOT STARTED
+**Status:** ✅ FIXED 2026-07-22 (branch `fix/item-110-rls-limit`) — root cause
+below was one layer deeper than the filing's (excellent) analysis suggested:
+not the item-38 coercion arms themselves, but **`current_user` being
+destroyed before they ever ran.** See "Root cause & fix" at the end.
 
 Found integrating unidb-studio's Table Editor with per-user login: a non-superuser
 querying an RLS-protected table with `LIMIT` gets a `400 SQL_PLAN_ERROR` on every
@@ -102,3 +105,46 @@ interaction should get a hard look for correctness, not just the crash fixed.
       regression, not just the crash).
 - [ ] Existing `tests/item103_authz_bypass.rs` extended to cover a LIMIT
       variant of each existing case.
+
+
+## Root cause & fix (2026-07-22)
+
+The filing's structural clue was exactly right: `LIMIT` forces
+`LogicalPlan::Query(QuerySpec)`. The chain:
+
+1. `substitute_current_user_in_plan` had **no arm for
+   `LogicalPlan::Query`** (`_ => {}`) — both substitution passes no-op'd.
+2. `apply_rls` injects the policy into the QuerySpec, which **eagerly
+   converts** the policy `Expr` → `QExpr` (`qualify_policy`)…
+3. …whose fallback rewrote an unsubstituted `Expr::CurrentUser` into
+   **`Literal::Bool(true)`**. The policy became `owner = TRUE` →
+   `compare(Text("alice"), Bool(true))` → the item-38 arm's
+   `parse_bool_text("alice")` → the exact reported error.
+
+Everything in the repro matrix follows: superusers skip policy injection
+(fine); no-LIMIT routes to `LogicalPlan::Select` which keeps `Expr` form
+until exec (fine); LIMIT-no-policy has no `CurrentUser` anywhere (fine).
+
+**The "hard look for correctness" the filing asked for found a real leak
+shape:** in any policy position where `Bool(true)` type-checks, the old
+fallback silently WEAKENED the policy instead of erroring. It fail-crashed
+here only by the luck of a Text column.
+
+### Fix
+
+- `apply_rls(plan, catalog, user)`: the caller's identity is now a
+  parameter, and for the QuerySpec path `current_user` is substituted into
+  the policy `Expr` **at injection time**, before the conversion can
+  destroy it (Select/Update/Delete arms unchanged — their later plan-level
+  substitution already worked). Prepared/bound path passes `None`.
+- The conversion fallback **fails closed**: an unresolved `current_user`
+  becomes `Literal::Null` (policy not-true for every row) + a warning log —
+  never `Bool(true)`. Other permissive no-op shapes unchanged.
+- Regression tests (`tests/item110_rls_limit.rs`, 5): the filed repro
+  (RLS+LIMIT returns the filtered rows, count-asserted per the acceptance's
+  silent-bypass guard), LIMIT-clamp, superuser+LIMIT, no-policy+LIMIT,
+  ORDER BY/GROUP BY routing shapes, and two-user isolation through the
+  same cached SQL.
+
+Verification: full suite 70 binaries green · crash harness 54/54 ·
+clippy/fmt clean.

@@ -9664,3 +9664,21 @@ follow-ups filed in the backlog file (one-shot fixed cost; warm-median
 methodology question). Verification: 36 binaries + crash 54/54 + conc matrix
 32/32; clippy/fmt clean. Also ships the `Q109_*` phase-attribution counters
 and `tests/perf_item109.rs` (probe with fetch-only mode).
+## Item 110 — RLS + LIMIT crash: current_user destroyed in QuerySpec path   [SHIPPED]   2026-07-22
+
+**Branch:** `fix/item-110-rls-limit` | **Type:** Improvement (correctness/security — no format change)
+
+Filed by the user from unidb-studio integration (PR #195; every paginated
+view broken for RLS-restricted users). Root cause: `LIMIT` routes to
+`LogicalPlan::Query(QuerySpec)`; `substitute_current_user_in_plan` had no
+arm for that shape, and RLS injection eagerly converts the policy Expr →
+QExpr whose fallback rewrote unresolved `current_user` to `Bool(true)` —
+`owner = current_user` became `owner = TRUE` → Text↔Bool coercion error.
+Worse than the crash: in shapes where Bool type-checks the old fallback
+silently WEAKENED policies (leak hazard).
+
+Fix: `apply_rls` takes the caller identity and substitutes `current_user`
+into the policy at injection time (before conversion); the fallback now
+fails CLOSED (`Null` + warn). 5 regression tests incl. count-asserted
+silent-bypass guard and two-user isolation. Full suite 70 binaries green,
+crash 54/54, clippy/fmt clean.

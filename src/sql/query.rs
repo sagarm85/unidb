@@ -822,16 +822,23 @@ fn qualify_policy(policy: Expr, qualifier: &str) -> QExpr {
         // treated as a permissive no-op rather than inventing semantics.
         // ColumnSlot is an executor-internal variant (item 59 Fix 2) that can
         // never appear in an RLS policy; treat it the same way.
-        // CurrentUser (item-24 Z6): should have been substituted to a Literal
-        // by `substitute_current_user_in_plan` before this point; if it somehow
-        // reaches here, treat as a literal-true no-op (safe / permissive).
-        // Cast (G2, item 19): CAST is not a valid RLS policy shape; treat as
-        // permissive no-op.
         Expr::JsonExtract { .. }
         | Expr::JsonExtractText { .. }
         | Expr::Near { .. }
         | Expr::Arith { .. }
-        | Expr::ColumnSlot(_)
-        | Expr::CurrentUser => QExpr::Literal(Literal::Bool(true)),
+        | Expr::ColumnSlot(_) => QExpr::Literal(Literal::Bool(true)),
+        // Item 110: an unresolved current_user reaching this conversion means
+        // a substitution pass was missed (apply_rls now substitutes at policy
+        // injection). The old fallback was `Bool(true)` — which WEAKENED the
+        // policy (`owner = current_user` became `owner = TRUE`: a coercion
+        // error at best, a silent row leak in shapes where Bool type-checks).
+        // Fail CLOSED instead: NULL makes the policy not-true for every row.
+        Expr::CurrentUser => {
+            tracing::warn!(
+                "unresolved current_user in policy lowering — failing closed (NULL); \
+                 indicates a missed substitution pass (item 110)"
+            );
+            QExpr::Literal(Literal::Null)
+        }
     }
 }

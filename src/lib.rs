@@ -2123,7 +2123,7 @@ impl Engine {
             let mut plan = if skip_rls {
                 plan
             } else {
-                apply_rls(plan, &cat_read(&self.catalog))
+                apply_rls(plan, &cat_read(&self.catalog), user)
             };
             // Substitute again to resolve any CurrentUser nodes the RLS
             // policy injected.
@@ -2315,7 +2315,10 @@ impl Engine {
             // Bind before RLS/execute so a placeholder value can never be
             // interpreted as SQL structure.
             bind_params(&mut plan, params)?;
-            let plan = apply_rls(plan, &cat_read(&self.catalog));
+            // Prepared/bound path runs as the embedded superuser (no user
+            // identity, item 110): pass None — a current_user policy that
+            // somehow applies here now fails CLOSED (Null) instead of open.
+            let plan = apply_rls(plan, &cat_read(&self.catalog), None);
             let dml_table = plan_dml_table(&plan).map(|s| s.to_owned()); // V1
             match self.execute_one_plan(xid, plan) {
                 Ok(result) => {
