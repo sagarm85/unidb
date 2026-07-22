@@ -2441,7 +2441,7 @@ mod tests {
         // Duplicate insert is a no-op.
         assert!(!arena.append(key1, &nbrs1));
 
-        let key2: i64 = 8 * 65536 + 0;
+        let key2: i64 = 8 * 65536;
         let nbrs2 = vec![rid(10, 5)];
         assert!(arena.append(key2, &nbrs2));
 

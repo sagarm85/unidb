@@ -129,9 +129,9 @@ fn hnsw_arena_recall_and_zero_disk() {
     let n_queries = query_sqls.len();
 
     // Warm-up: 5 queries to ensure caches are fully populated.
-    for i in 0..5.min(n_queries) {
+    for sql in query_sqls.iter().take(5.min(n_queries)) {
         let w = engine.begin().unwrap();
-        engine.execute_sql(w, &query_sqls[i]).unwrap();
+        engine.execute_sql(w, sql).unwrap();
         engine.commit(w).unwrap();
     }
 
@@ -141,9 +141,9 @@ fn hnsw_arena_recall_and_zero_disk() {
 
     unidb::hnsw_index::reset_query_counters();
     let t_warm = Instant::now();
-    for i in warm_start..n_queries {
+    for sql in query_sqls.iter().take(n_queries).skip(warm_start) {
         let w = engine.begin().unwrap();
-        engine.execute_sql(w, &query_sqls[i]).unwrap();
+        engine.execute_sql(w, sql).unwrap();
         engine.commit(w).unwrap();
     }
     let total_warm_us = t_warm.elapsed().as_secs_f64() * 1e6;

@@ -95,7 +95,7 @@ fn z1_create_role_persists_across_reopen() {
         .map(|s| s.as_str())
         .collect();
     assert!(
-        names.iter().any(|n| *n == "analyst"),
+        names.contains(&"analyst"),
         "role 'analyst' not found in unidb_catalog.roles after reopen: {names:?}"
     );
 
@@ -136,7 +136,7 @@ fn z1_drop_role_removes_from_catalog() {
         .map(|s| s.trim_matches('"'))
         .collect();
     assert!(
-        !names.iter().any(|n| *n == "temp_role"),
+        !names.contains(&"temp_role"),
         "dropped role 'temp_role' still in unidb_catalog.roles: {names:?}"
     );
 }
@@ -391,7 +391,7 @@ fn z5_grants_catalog_relation() {
     let rows = exec(&engine, "SELECT * FROM unidb_catalog.grants").unwrap();
     // Each row has: role, table_name, operation.
     let found = rows.iter().any(|r| {
-        r.get(0).map(|s| s.contains("g_reader")).unwrap_or(false)
+        r.first().map(|s| s.contains("g_reader")).unwrap_or(false)
             && r.get(1).map(|s| s.contains("metrics")).unwrap_or(false)
     });
     assert!(
@@ -424,9 +424,11 @@ fn z5_policies_catalog_relation() {
 
     let rows = exec(&engine, "SELECT * FROM unidb_catalog.policies").unwrap();
     // Each row: name, table_name, operation, using_expr.
-    let found = rows
-        .iter()
-        .any(|r| r.get(0).map(|s| s.contains("open_orders")).unwrap_or(false));
+    let found = rows.iter().any(|r| {
+        r.first()
+            .map(|s| s.contains("open_orders"))
+            .unwrap_or(false)
+    });
     assert!(
         found,
         "policy 'open_orders' not found in unidb_catalog.policies: {rows:?}"
