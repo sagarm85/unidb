@@ -103,6 +103,16 @@ use crate::{
 //   Q_VEC_CACHE_HITS — fetch_vector_cached_with_vec returned from vec cache
 //   Q_DISK_FETCHES   — load_node_at (DiskBTree lookup + page fetch) on query path
 //   Q_DISTANCE_CALLS — hnsw_distance called (each = dim f32 ops)
+/// Item 107 (freshness contract "a"): number of vector inserts accepted by
+/// committed transactions but not yet applied to the HNSW graph by the
+/// background worker. This IS the NEAR freshness lag, in rows — exposed via
+/// `Engine::hnsw_queue_depth()` and the `unidb_hnsw_queue_depth` gauge.
+/// Process-global (one gauge across engines in one process; in-process
+/// multi-engine tests share it — observability, not control flow).
+pub static HNSW_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
+/// Total vector inserts applied by the background worker (monotonic).
+pub static HNSW_WORKER_APPLIED: AtomicU64 = AtomicU64::new(0);
+
 pub static Q_L0_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 pub static Q_VEC_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 pub static Q_DISK_FETCHES: AtomicU64 = AtomicU64::new(0);

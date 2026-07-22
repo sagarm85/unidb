@@ -9605,6 +9605,43 @@ The 0.74×/0.81× ratios are not reproducible by the code that produced them:
 environment artifact confirmed by direct experiment, zero merge regressions.
 Evidence: `docs/performance/report_20260722_002217_ab_oldcode_51022be.md`.
 
+## Item 107 — Async HNSW on the commit path: wiring + freshness gauge   [SHIPPED]   2026-07-22
+
+**Branch:** `perf/item-107-async-hnsw-wiring` | **Type:** Performance (activation + observability — no format change)
+
+### Step-0 finding
+
+Item 67 (PR #171) had already built the per-commit async worker end to end
+(bounded 4,096-slot channel with blocking-send backpressure, executor
+dispatch, `wait_hnsw_idle`, crash contract) — but only `Engine::open_arc`
+spawns it, and **both the production server (`EngineHandle::spawn` → bare
+`Engine::open`) and the bench took the synchronous fallback**. The 21-Jul
+W4/W0 = 96× measured a path production was never meant to run.
+
+### What shipped
+
+- `EngineHandle::spawn` activates the worker — served engines now take the
+  async path (INSERT commit no longer pays the 6–18 ms beam search).
+- **Freshness contract (a)** (user sign-off 2026-07-22): NEAR may lag
+  committed rows by the queue depth (~8–18 ms idle; worst ~30–70 s at a
+  saturated queue, then backpressure caps it). Lag exposed:
+  `HNSW_QUEUE_DEPTH` / `HNSW_WORKER_APPLIED` statics,
+  `Engine::hnsw_queue_depth()`, `unidb_hnsw_queue_depth` gauge on `/metrics`.
+- Enqueue failure at teardown now falls back to the sync insert (was:
+  silently unindexed row).
+- Bench honesty: `bench_engine_open_arc` for ladder W-rungs + Table 4;
+  ladder reports a separate per-commit **drain** table; Table 4's timed
+  window ends after `wait_hnsw_idle` (deferred work is not eliminated work —
+  sustained throughput stays worker-bound at saturation, stated in-report).
+- Test `item107_queue_depth_gauge_drains_to_zero` (written parallel-safe
+  against the process-global gauge — poll-to-quiescence, the item-102 lesson).
+
+### Verification
+
+Full suite 69 binaries green; crash harness 54/54; clippy/fmt clean. One
+timing-gate flake (`perf_item93` warm-latency ≤800 µs) during a concurrent
+Docker bench run — passes in isolation, CPU contention, not a regression.
+W4/W0 + Table 4 re-measure lands with the next full Docker report.
 ## Item 109 — Page-cached B-tree candidate resolution   [SHIPPED]   2026-07-22
 
 **Branch:** `perf/item-109-parallel-btree` | **Type:** Performance (read path only)

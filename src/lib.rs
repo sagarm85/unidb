@@ -1158,6 +1158,12 @@ impl Engine {
                                     "HNSW background worker: insert failed"
                                 );
                             }
+                            // Item 107: applied (or failed-and-logged) — this
+                            // row no longer counts toward the freshness lag.
+                            crate::hnsw_index::HNSW_QUEUE_DEPTH
+                                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                            crate::hnsw_index::HNSW_WORKER_APPLIED
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                         Ok(HnswMsg::Flush(ack)) => {
                             // The queue is now drained up to this point.
@@ -1186,6 +1192,13 @@ impl Engine {
     /// issuing a `NEAR` query.
     ///
     /// If the worker is not running (`hnsw_worker_tx == None`) this is a no-op.
+    /// Item 107 (freshness contract "a"): rows committed but not yet
+    /// HNSW-indexed — the current NEAR freshness lag, in rows. 0 means the
+    /// vector index is fully caught up with the heap.
+    pub fn hnsw_queue_depth(&self) -> u64 {
+        crate::hnsw_index::HNSW_QUEUE_DEPTH.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn wait_hnsw_idle(&self) {
         let tx = {
             let slot = self

@@ -880,14 +880,29 @@ fn apply_durable_index_writes(
                             // slightly after commit, but NEAR re-checks MVCC
                             // visibility on every candidate so a race between
                             // index visibility and row visibility is safe.
-                            let _ = tx.send(crate::hnsw_index::HnswMsg::Work(
-                                crate::hnsw_index::HnswWorkItem {
-                                    meta_page,
-                                    page_size: ctx.page_size,
-                                    row_id,
-                                    vector: v.clone(),
-                                },
-                            ));
+                            // Item 107: depth gauge counts rows committed
+                            // but not yet HNSW-indexed (the NEAR freshness
+                            // lag, contract "a"). Incremented only on a
+                            // successful enqueue; the worker decrements.
+                            if tx
+                                .send(crate::hnsw_index::HnswMsg::Work(
+                                    crate::hnsw_index::HnswWorkItem {
+                                        meta_page,
+                                        page_size: ctx.page_size,
+                                        row_id,
+                                        vector: v.clone(),
+                                    },
+                                ))
+                                .is_ok()
+                            {
+                                crate::hnsw_index::HNSW_QUEUE_DEPTH.fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                // Worker gone (engine teardown mid-statement):
+                                // fall back to the synchronous insert so the
+                                // committed row is never silently unindexed.
+                                DiskHnswIndex::open(meta_page, ctx.page_size)
+                                    .insert(row_id, v, ctx.pool, ctx.wal)?;
+                            }
                         } else {
                             // Sync fallback: unit tests and bare Engine::open()
                             // paths without a background worker.
