@@ -1,7 +1,10 @@
 # information_schema visibility should follow existing table grants
 
 **Type:** Improvement
-**Status:** NOT STARTED
+**Status:** ✅ SHIPPED 2026-07-22 (branch `fix/item-111-infoschema-grants`) —
+implemented exactly as the "Suggested shape" below proposed, plus the same
+filter on the constraint-shaped views (same leak shape). See resolution note
+at the end.
 
 Raised while wiring unidb-studio's Table Editor sidebar up to per-user login: a
 user with full CRUD grants on a table (`SELECT`/`INSERT`/`UPDATE`) still gets
@@ -55,3 +58,26 @@ columns").
 - [ ] A user with zero grants on table `t` does not see `t` in either view
       (today they'd need a blanket grant that reveals every table).
 - [ ] Superuser / open-mode behavior unchanged (sees everything).
+
+
+## Resolution (2026-07-22)
+
+Implemented per the suggested shape:
+
+- **No view grant needed:** `check_plan_privileges` exempts
+  `information_schema.*` (helper `is_information_schema`); the 403 is gone.
+  `unidb_catalog.*` deliberately keeps its item-24 Z5 grant-gated model
+  (pinned by a test).
+- **Per-row filtering:** `virtual_rows` now takes the caller identity
+  (threaded from `ExecCtx::current_user`); a table's rows appear iff the
+  caller holds ANY privilege on it (`Select|Insert|Update|Delete`), across
+  all five views — `tables`, `columns`, `table_constraints`,
+  `key_column_usage`, `referential_constraints`. Superuser / embedded /
+  bootstrap-open-mode see everything (mirrors `is_effective_superuser`).
+- Edge noted: a `referential_constraints` row on a visible child names its
+  parent constraint; the parent's own rows stay hidden without a grant.
+
+Tests (`tests/item111_infoschema_grants.rs`, 5): the filed repro, zero-grant
+→ zero rows (not error), superuser + open-mode unchanged, constraint views
+filtered, `unidb_catalog` still gated. Full suite 72 binaries green, crash
+54/54, clippy/fmt clean — no existing test relied on the old behavior.

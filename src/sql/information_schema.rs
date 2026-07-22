@@ -185,10 +185,27 @@ pub fn virtual_schema(name: &str) -> Option<Vec<ColumnRef>> {
 /// `authz` is required for the item-24 Z5 relations (`unidb_catalog.roles`,
 /// `unidb_catalog.grants`, `unidb_catalog.policies`). When absent, those
 /// relations return empty rows (unit-test fallback).
+/// Item 111: `information_schema.*` views require no grant of their own —
+/// instead each row is visible only if the caller holds ANY privilege on the
+/// row's table (Postgres semantics: having a privilege is what makes a table
+/// discoverable; a blanket view grant would reveal every table's existence).
+pub fn is_information_schema(name: &str) -> bool {
+    name.len() >= 19 && name[..19].eq_ignore_ascii_case("information_schema.")
+}
+
+/// Any-privilege visibility test for one table (item 111).
+fn caller_can_see(authz: &crate::authz::RoleStore, user: &str, table: &str) -> bool {
+    use crate::authz::Privilege as P;
+    [P::Select, P::Insert, P::Update, P::Delete]
+        .into_iter()
+        .any(|p| authz.has_privilege(user, table, p))
+}
+
 pub fn virtual_rows(
     name: &str,
     catalog: &Catalog,
     authz: Option<&crate::authz::RoleStore>,
+    user: Option<&str>,
 ) -> Result<Vec<Vec<Literal>>> {
     let mut defs: Vec<&TableDef> = catalog
         .tables()
@@ -196,13 +213,27 @@ pub fn virtual_rows(
         .collect();
     defs.sort_by(|a, b| a.name.cmp(&b.name));
 
+    // Item 111: per-caller visibility for the information_schema views.
+    // Superuser, embedded (`None` user), no-RoleStore (unit tests), and
+    // bootstrap/open mode (no registered users) all see everything —
+    // mirroring `Engine::is_effective_superuser`. `unidb_catalog.*` keeps
+    // its item-24 Z5 access model (grant-gated view, unfiltered rows).
+    let visible: Vec<&TableDef> = match (user, authz) {
+        (Some(u), Some(az)) if az.has_users() && !az.is_superuser(u) => defs
+            .iter()
+            .copied()
+            .filter(|d| caller_can_see(az, u, &d.name))
+            .collect(),
+        _ => defs.clone(),
+    };
+
     let rows = match name.to_ascii_lowercase().as_str() {
-        "information_schema.tables" => tables_rows(&defs),
-        "information_schema.columns" => columns_rows(&defs),
-        "information_schema.table_constraints" => table_constraints_rows(&defs, catalog),
-        "information_schema.key_column_usage" => key_column_usage_rows(&defs, catalog),
+        "information_schema.tables" => tables_rows(&visible),
+        "information_schema.columns" => columns_rows(&visible),
+        "information_schema.table_constraints" => table_constraints_rows(&visible, catalog),
+        "information_schema.key_column_usage" => key_column_usage_rows(&visible, catalog),
         "information_schema.referential_constraints" => {
-            referential_constraints_rows(&defs, catalog)
+            referential_constraints_rows(&visible, catalog)
         }
         "unidb_catalog.indexes" => indexes_rows(&defs),
         // item-24 Z5: AuthZ introspection.

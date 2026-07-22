@@ -1651,6 +1651,12 @@ impl Engine {
             }
         };
         for (table, priv_) in reqs {
+            // Item 111: information_schema.* views require no grant — their
+            // rows are filtered per-caller privilege inside `virtual_rows`
+            // (Postgres semantics). unidb_catalog.* stays grant-gated (Z5).
+            if crate::sql::information_schema::is_information_schema(&table) {
+                continue;
+            }
             if !self.authz.has_privilege(user, &table, priv_) {
                 return Err(DbError::PermissionDenied(format!(
                     "{priv_:?} on '{table}' for user '{user}'"
