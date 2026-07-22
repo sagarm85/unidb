@@ -884,6 +884,7 @@ impl Runner<'_, '_> {
                     table,
                     self.ctx.catalog.get(),
                     self.ctx.authz,
+                    self.ctx.current_user.as_deref(),
                 )?
             };
             return Ok(Batch {

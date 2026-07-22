@@ -9682,3 +9682,18 @@ into the policy at injection time (before conversion); the fallback now
 fails CLOSED (`Null` + warn). 5 regression tests incl. count-asserted
 silent-bypass guard and two-user isolation. Full suite 70 binaries green,
 crash 54/54, clippy/fmt clean.
+
+## Item 111 — information_schema visibility follows table grants   [SHIPPED]   2026-07-22
+
+**Branch:** `fix/item-111-infoschema-grants` | **Type:** Improvement (authz/discoverability)
+
+Filed by the user from unidb-studio integration: full-CRUD grantees got 403
+on `information_schema.tables`/`.columns` without a separate blanket grant —
+which would in turn have revealed every table's existence (the old rows were
+unfiltered). Now Postgres semantics: the `information_schema.*` views need
+no grant of their own (`check_plan_privileges` exemption), and each row is
+visible iff the caller holds ANY privilege on the row's table — across all
+five views including the constraint-shaped ones. Superuser/embedded/open
+mode unchanged (mirrors `is_effective_superuser`); `unidb_catalog.*` keeps
+its Z5 grant-gated model (test-pinned). 5 tests; full suite 72 binaries
+green, crash 54/54, clippy/fmt clean.
