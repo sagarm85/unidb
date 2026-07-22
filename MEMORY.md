@@ -12,6 +12,22 @@
 
 ## Current status
 
+- **Item 109 — SHIPPED 2026-07-22; item 107 — SHIPPED + MERGED (#196) same day.**
+  109: Step-0 refuted filed design (parallel resolution existed since items 45/54); real lever =
+  per-candidate 8 KiB page-copy+CRC in get_visible (~1 µs × 5k candidates on ~25-50 pages). Fix:
+  `get_visible_cached` single-page cache → **warm 3.0×** (973→323 µs native; 460 µs in-container).
+  Docker Table-3 cert honest: 0.45→**0.50× one-shot** — bench times ONE cold execution (split:
+  leaf 58 + resolve 901 + ~700 µs one-shot fixed cost) so warm wins can't appear there; both
+  numbers in ceilings table; follow-ups: one-shot fixed cost, warm-median methodology question.
+  107: item-67 worker existed but nothing spawned it (server + bench both took sync fallback —
+  the W4/W0 96× measured that); EngineHandle::spawn now activates it; freshness contract (a)
+  signed off (queue-depth gauge `unidb_hnsw_queue_depth`); bench drain-accounting added.
+  Session hygiene lessons: NEVER run suites concurrently with a bench (self-inflicted the
+  item-108 effect twice); compose runs can hang on leftover PG state — `docker compose down -v`
+  before bench reruns. Item 110 (RLS+LIMIT, from user's PR #195 renumbered): fix + 5 tests
+  AUTHORED in /tmp/unidb-110 (apply_rls injection-time substitution + fail-closed Null fallback),
+  build/test/PR next.
+
 - **Item 108 — RESOLVED 2026-07-21 (same day): CRUD drift was ENVIRONMENTAL, no unidb regression.**
   Absolutes (§0.6 rule 4): PG's code-identical absolutes moved 2.1–28× between the 07-19/07-21
   runs (VM fsync ~30×, CPU ~2.15× — why the 07-19 run took 229 min); unidb improved on EVERY row
