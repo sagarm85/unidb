@@ -2653,11 +2653,16 @@ fn try_exec_select_btree(
         let maybe_lease = crate::sql::parallel_scan::acquire(usize::MAX);
         if let Some(lease) = maybe_lease {
             let degree = lease.degree();
+            // Item 109 Step-0: leaf-walk vs resolve phase attribution.
+            let leaf_start = std::time::Instant::now();
             let partitions = tree.search_range_partition(rop, &value, degree, ctx.pool)?;
+            crate::sql::parallel_scan::Q109_LEAF_NANOS
+                .fetch_add(leaf_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
             let total: usize = partitions.iter().map(|p| p.len()).sum();
 
             if total >= crate::sql::parallel_scan::PARALLEL_CANDIDATE_MIN {
                 let reader = ctx.pool.shared_reader();
+                let resolve_start = std::time::Instant::now();
                 let rows = crate::sql::parallel_scan::parallel_resolve_partitions(
                     &partitions,
                     &reader,
@@ -2666,6 +2671,12 @@ fn try_exec_select_btree(
                     degree,
                     &|_rid, bytes| per_candidate(bytes),
                 )?;
+                crate::sql::parallel_scan::Q109_RESOLVE_NANOS
+                    .fetch_add(resolve_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                crate::sql::parallel_scan::Q109_CANDIDATES
+                    .fetch_add(total as u64, Ordering::Relaxed);
+                crate::sql::parallel_scan::Q109_PAR_QUERIES.fetch_add(1, Ordering::Relaxed);
+                crate::sql::parallel_scan::Q109_LAST_DEGREE.store(degree as u64, Ordering::Relaxed);
                 return Ok(Some(ExecResult::Rows {
                     columns: output_columns(projection, &table_def.columns),
                     rows,

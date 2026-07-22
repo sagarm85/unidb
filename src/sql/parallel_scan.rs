@@ -80,6 +80,27 @@ static PARALLEL_SCANS: AtomicU64 = AtomicU64::new(0);
 static WORKERS_GRANTED: AtomicU64 = AtomicU64::new(0);
 static SERIAL_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
+// ── Item 109 Step-0 phase attribution for the B-tree range path ──────────────
+// Splits a filtered SELECT into: B-tree leaf walk (`Q109_LEAF_NANOS`, timed in
+// `try_exec_select_btree`) vs candidate resolution (`Q109_RESOLVE_NANOS`, the
+// parallel heap-fetch/visibility/decode/project phase). `Q109_FETCH_ONLY`
+// makes workers skip `per_candidate` so a paired probe run isolates the
+// fetch+visibility share by subtraction (probe-only; never set in production).
+pub static Q109_LEAF_NANOS: AtomicU64 = AtomicU64::new(0);
+pub static Q109_RESOLVE_NANOS: AtomicU64 = AtomicU64::new(0);
+pub static Q109_CANDIDATES: AtomicU64 = AtomicU64::new(0);
+pub static Q109_PAR_QUERIES: AtomicU64 = AtomicU64::new(0);
+pub static Q109_LAST_DEGREE: AtomicU64 = AtomicU64::new(0);
+pub static Q109_FETCH_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// Reset the item-109 probe counters (test harness).
+pub fn item109_reset() {
+    Q109_LEAF_NANOS.store(0, Ordering::Relaxed);
+    Q109_RESOLVE_NANOS.store(0, Ordering::Relaxed);
+    Q109_CANDIDATES.store(0, Ordering::Relaxed);
+    Q109_PAR_QUERIES.store(0, Ordering::Relaxed);
+}
+
 /// Worker-governance snapshot (item 21).
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct WorkerStats {
@@ -1057,6 +1078,10 @@ where
         let partitions = Arc::clone(&partitions);
         move || {
             let mut rows: Vec<Vec<Literal>> = Vec::new();
+            // Item 109: candidates arrive key-sorted, so same-page runs are
+            // contiguous — one page copy + CRC per run instead of per
+            // candidate (the measured 70% of filtered-SELECT time).
+            let mut page_cache = None;
             loop {
                 if stop.load(Ordering::Relaxed) {
                     break;
@@ -1076,7 +1101,13 @@ where
                             break 'part;
                         }
                     }
-                    let bytes = match get_visible(&reader, rid, &snapshot, self_xid) {
+                    let bytes = match crate::heap::get_visible_cached(
+                        &reader,
+                        rid,
+                        &snapshot,
+                        self_xid,
+                        &mut page_cache,
+                    ) {
                         Ok(Some(b)) => b,
                         Ok(None) => continue,
                         Err(e) => {
@@ -1085,6 +1116,11 @@ where
                             break 'part;
                         }
                     };
+                    // Item 109 Step-0 probe: fetch-only mode isolates the
+                    // heap-fetch+visibility share (skips decode/project).
+                    if Q109_FETCH_ONLY.load(Ordering::Relaxed) {
+                        continue;
+                    }
                     match per_candidate(rid, &bytes) {
                         Ok(Some(row)) => rows.push(row),
                         Ok(None) => {}

@@ -9642,3 +9642,25 @@ Full suite 69 binaries green; crash harness 54/54; clippy/fmt clean. One
 timing-gate flake (`perf_item93` warm-latency ≤800 µs) during a concurrent
 Docker bench run — passes in isolation, CPU contention, not a regression.
 W4/W0 + Table 4 re-measure lands with the next full Docker report.
+## Item 109 — Page-cached B-tree candidate resolution   [SHIPPED]   2026-07-22
+
+**Branch:** `perf/item-109-parallel-btree` | **Type:** Performance (read path only)
+
+Step-0 refuted the filed design — the parallel candidate resolution already
+existed (items 45/54, engaged 20/20 in the probe). The measured lever:
+`SharedPageReader::read_page` copies + CRC-verifies the full 8 KiB page PER
+CANDIDATE (~1 µs each), and key-sorted candidates hit the same ~25–50 pages
+100–200× per query. Fix: `heap::get_visible_cached` — caller-held single-page
+cache, one copy+CRC per same-page run; identical MVCC semantics (fixed
+statement snapshot; chain hops unchanged); workers hold one cache per
+contiguous partition.
+
+**Measured:** warm native 973 → 323 µs (3.0×; fetch 683 → 98 µs); warm
+in-container 460 µs/q (≈10.9M rec/s). Docker Table-3 certification:
+0.45 → **0.50× one-shot** — the bench times ONE cold execution whose split
+(leaf 58 µs · resolve 901 µs · ~700 µs one-shot fixed cost) structurally
+hides warm-path wins; both numbers recorded in the in-bench ceilings table,
+follow-ups filed in the backlog file (one-shot fixed cost; warm-median
+methodology question). Verification: 36 binaries + crash 54/54 + conc matrix
+32/32; clippy/fmt clean. Also ships the `Q109_*` phase-attribution counters
+and `tests/perf_item109.rs` (probe with fetch-only mode).
