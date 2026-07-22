@@ -12,6 +12,24 @@
 
 ## Current status
 
+- **2026-07-22 session complete — items 110, 111 shipped + merged; item 112 filed (parked).**
+  110 (#198): RLS+LIMIT crash — `current_user` was destroyed by the QuerySpec policy
+  conversion's `Bool(true)` fallback (leak hazard in Bool-typechecking shapes, crash here);
+  fixed by substituting at policy-injection time (`apply_rls(plan, catalog, user)`) + fallback
+  now fails CLOSED (Null + warn); 5 count-asserted regression tests.
+  111 (#199): information_schema.* needs no view grant; rows filtered per-caller ANY-privilege
+  across all five views (Postgres semantics); unidb_catalog.* stays Z5 grant-gated; 5 tests.
+  112 (#200): column-level grants scoped + deliberately parked; item-24 registry corrected —
+  Z4's role-inheritance half had SHIPPED (transitive has_privilege, PR #166), only column
+  grants were never built.
+  Earlier same session: 105 (#190 selective bench + carry-forward), 92 (#191 NEAR ~900 µs),
+  108 (#192/#193 env-drift proof + canary), 107 (#196 async HNSW activation + freshness gauge),
+  109 (#197 page-cached resolution, warm filtered 3.0×).
+  **Next up:** fresh full Docker bench on current main (first official record of item 107's
+  ladder collapse; becomes new MM_BASELINE) · item 106 (vector ≤400 µs tier) · 109 follow-ups
+  (one-shot fixed cost ~700 µs; Table-3 warm-median methodology decision) · chips (item-103
+  LIMIT test variant, test-binary clippy cleanup). Parked: 112, item-19 CTE/window residue.
+
 - **Item 109 — SHIPPED 2026-07-22; item 107 — SHIPPED + MERGED (#196) same day.**
   109: Step-0 refuted filed design (parallel resolution existed since items 45/54); real lever =
   per-candidate 8 KiB page-copy+CRC in get_visible (~1 µs × 5k candidates on ~25-50 pages). Fix:
@@ -3667,6 +3685,20 @@ plain reporting.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-22 (session close) — items 110 + 111 shipped, 112 filed, Z4 status corrected
+
+110: root cause one layer under the filing's analysis — no `LogicalPlan::Query` arm in
+`substitute_current_user_in_plan` + eager Expr→QExpr conversion whose fallback rewrote
+CurrentUser→Bool(true) (policy weakening hazard). Fix at injection time + fail-closed Null.
+111: `is_information_schema` exemption in check_plan_privileges + per-caller ANY-privilege row
+filter in `virtual_rows` (now takes user); constraint views included; open/superuser mirror
+`is_effective_superuser`. 112: Z4 audit — inheritance transitive & shipped; column grants
+scoped into their own parked item with full touch-point map. All suites green each time
+(70-72 binaries, crash 54/54). Eight PRs merged this session: #190-#193, #196-#200 (#195
+rescued/renumbered). Hygiene rules that stuck: one PR per unit (squash-merge orphan race),
+benches get exclusive machine time, `docker compose down -v` before bench reruns, verify main
+by ls-tree not PR state.
 
 ### 2026-07-21 (same session) — Item 108 resolved same-day: drift = environment
 
