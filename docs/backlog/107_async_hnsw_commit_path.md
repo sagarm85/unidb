@@ -1,8 +1,10 @@
 # 107 — Async HNSW maintenance on the commit path (restore W4 ≈ W0)
 
 **Type:** Performance
-**Status:** ⏳ NOT STARTED — filed 2026-07-21 from the consolidated bench
-(`docs/performance/report_20260721_035629.md`)
+**Status:** 🚧 IN PROGRESS 2026-07-22 — Step-0 audit complete (see below);
+wiring implemented on `perf/item-107-async-hnsw-wiring`; freshness contract
+**(a)** signed off by user 2026-07-22 (documented bounded lag + queue-depth
+metric; hybrid tail-scan rejected for now). Docker re-measure pending.
 
 ## Problem — the headline multi-model thesis is currently broken
 
@@ -68,3 +70,52 @@ pick the mechanism.
 - [ ] W4/W0 and Table 4 targets met in a full Docker bench.
 - [ ] Crash harness green including the new reconciliation point.
 - [ ] No NEAR latency/recall regression (perf_item92 10k gates).
+
+
+## Step-0 audit result (2026-07-22) — the worker already existed
+
+Item 67 (PR #171) already implemented the per-commit async worker end to end:
+`spawn_hnsw_worker` (bounded 4,096-slot `sync_channel`, natural backpressure
+via blocking `send`), executor dispatch in `exec_insert`, `wait_hnsw_idle`,
+crash contract tested (heap survives; index may lag). **But nothing spawned
+it**: activation happens only in `Engine::open_arc`, while BOTH the
+production server (`EngineHandle::spawn` → bare `Engine::open`) and the bench
+(`bench_engine_open` → `Engine::open_with_pool_capacity`, sometimes
+`Arc::new`-wrapped after the fact) took the synchronous fallback. The 96×
+W4/W0 measured the fallback path.
+
+## Freshness contract — signed off (a)
+
+NEAR may miss rows committed in the last instants; the lag is the queue
+depth: ~8–18 ms per row when idle (one background insert), worst case
+~30–70 s at a saturated 4,096 queue, then backpressure blocks inserters so
+it cannot grow further. Every non-NEAR read sees committed rows immediately
+(MVCC untouched). The lag is observable: `Engine::hnsw_queue_depth()` +
+`unidb_hnsw_queue_depth` gauge on `/metrics`. The hybrid tail-scan
+(read-your-writes, ~150–300 µs worst-case per NEAR) was presented and
+declined — re-open only with a user request.
+
+## Implemented (this branch)
+
+- `EngineHandle::spawn` now calls `engine.spawn_hnsw_worker()` — the served
+  engine takes the async path (the point of the item).
+- Queue-depth gauge: `HNSW_QUEUE_DEPTH` (inc on successful enqueue, dec on
+  worker apply) + `HNSW_WORKER_APPLIED` counter; `Engine::hnsw_queue_depth()`;
+  `unidb_hnsw_queue_depth` on `/metrics`. Enqueue failure (worker gone at
+  teardown) now falls back to the synchronous insert instead of silently
+  skipping the index.
+- Bench honesty: `bench_engine_open_arc` (worker on) used by the W-ladder
+  and Table 4; ladder reports commit latency AND a separate per-commit
+  **drain** table (deferred work is not eliminated work); Table 4's timed
+  window ends after `wait_hnsw_idle` so sustained throughput includes the
+  worker's cost.
+- Test: `item107_queue_depth_gauge_drains_to_zero`.
+
+## Expected shape of the next report (honest prediction)
+
+Ladder W2–W4 *commit* rows collapse toward W0 (target W4/W0 ≤ 3×), with the
+deferred cost visible in the new drain table instead of hidden. Table 4
+sustained throughput improves only modestly (backpressure bounds it by
+worker speed — single worker ≈ the old sync rate at saturation); the honest
+sustained-ingest lever remains faster HNSW insert (item 65 residue / item
+106 adjacency).
