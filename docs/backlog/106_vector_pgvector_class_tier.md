@@ -1,7 +1,7 @@
 # 106 — Vector query pgvector-class tier (≤400 µs): quantization / graph quality
 
 **Type:** Performance
-**Status:** 🚧 STEP-0 COMPLETE 2026-07-22 (branch `perf/item-106-step0`) —
+**Status:** 🔄 IN PROGRESS — Step-0 complete 2026-07-22 (PR #204) —
 recall-vs-ef curve measured AND a new dominant lever found: the upper-layer
 descent is fully uncached (~290 µs ef-independent, invisible to the old
 counters). Lever ordering revised — see the Step-0 section at the end.
