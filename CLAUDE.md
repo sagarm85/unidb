@@ -8,10 +8,10 @@
 
 ## 0. Session protocol (do this every time)
 
-1. **Read `MEMORY.md` first.** It holds the current implementation state and the ordered next tasks. Never start work without it.
-2. Read this file for the rules and locked decisions below.
+1. **Read `MEMORY.md` first.** It holds the current implementation state and the ordered next tasks. Never start work without it. It is a **working set**, deliberately small: entries older than the recent sessions live verbatim in `docs/history/MEMORY_ARCHIVE_*.md` (same for `PROGRESS.md` → `PROGRESS_ARCHIVE_*.md`) — grep the archives when a specific item's history matters; never read them linearly.
+2. Read this file for the rules and locked decisions below, and **`LESSONS.md`** for the standing operational lessons (bench hygiene, evidence rules, engine-specific traps) that back §0.6.
 3. Do the work for the **current milestone only** (see §5). Do not pull features forward from the backlog.
-4. **At session end, update `MEMORY.md`** (current state + session log entry) and, if a milestone shipped, `PROGRESS.md`. **Before pushing or raising a PR, also check `README.md` and `docs/` for staleness** (see §9) — these do not update themselves the way `PROGRESS.md` does as part of the per-milestone habit.
+4. **At session end, update `MEMORY.md`** (current state + session log entry) and, if a milestone shipped, `PROGRESS.md`. **Before pushing or raising a PR, also check `README.md` and `docs/` for staleness** (see §9) — these do not update themselves the way `PROGRESS.md` does as part of the per-milestone habit. **Roll-up policy:** when `MEMORY.md` exceeds ~50 KB or `PROGRESS.md` ~120 KB, move entries older than the last ~5 sessions into the `docs/history/` archives — verbatim, headings intact (cross-references must keep resolving by grep), newest-first order preserved — and refresh `PROGRESS.md`'s entry index. New lessons that would change future behavior go to `LESSONS.md`, not just the session log. `scripts/lint_docs.sh` enforces the size thresholds and cross-reference integrity; run it (plus `scripts/lint_backlog.sh`) before any docs push.
 5. **Dates:** always stamp entries with the *actual current system date*. Never copy a date from an earlier session or from this file. If unsure of the date, get it from the system, not from context.
 6. **Work under the expert lens below (§0.6) for EVERY action** — plans, code changes, performance work, benchmarks, and reviews alike. It is not reserved for "big" designs, and it includes **initiating stress tests and benchmarks yourself** (§0.6 item 0) — the user should never have to ask for them.
 

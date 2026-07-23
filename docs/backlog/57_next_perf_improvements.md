@@ -19,7 +19,7 @@
 ### Finding
 
 UPDATE bulk is at 0.04× PG and has been confirmed as an **architectural ceiling**
-by direct benchmarking (PROGRESS.md "Item 56 Step 3 — Step 2 investigation").
+by direct benchmarking (PROGRESS.md "Item 56 Step 3 — WAL_XMAX_BATCH DELETE WAL framing" (Step 2 investigation)).
 Batching heap writes did not help because:
 
 1. **B-tree per-row insert dominates** (`src/btree_index.rs` via
