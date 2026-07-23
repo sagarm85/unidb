@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `113_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `114_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -83,9 +83,9 @@
 | 64 | `64_delete_lazy_xmax.md` | Performance | 🔄 INVESTIGATION COMPLETE — two bottlenecks profiled: (1) CRC-per-mutation in `set_xmax` (807 ns/row, 87.5% at 25k scale); (2) `latch_fetch` blowup 1.2→611 µs/page at 100k (mmap/OS cold-page). Lazy xmax ruled infeasible (MVCC violation). Fix A (remove `write_crc()` from `set_xmax`) **SHIPPED** (correction 2026-07-19: "ready to implement" was stale — the skip + doc comment are in `page.rs::set_xmax`; DELETE 0.04→0.06× recorded in PROGRESS). Fix B's latch+fetch blowup root cause identified by the 2026-07-19 profiling review (clock-sweep evictions + per-fetch CRC verify) — addressed by item 78 (shipped) and item 86 (filed). Generalization of Fix A to all mutations/fetches = **item 86**. |
 | 65 | `65_hnsw_insert_node_cache.md` | Performance | ✅ SHIPPED 2026-07-18 — per-insert `NodeCache` eliminates repeated DiskBTree lookups during HNSW beam search (~3200 → ~200 unique node fetches per insert). See PROGRESS.md "Item 65". |
 | 66 | `66_parallel_delete_scan.md` | Performance | ✅ SHIPPED 2026-07-18 — `parallel_collect_matching` in `parallel_scan.rs`; A3-gate-aware `'collect` block in `exec_delete`; sort before `delete_many`; 48/48 crash PASS; `parallel_delete_matches_serial` PASS. Docker bench pending. See PROGRESS.md "Item 66". |
-| 67 | `67_async_hnsw_index_build.md` | Performance | ✅ SHIPPED 2026-07-20 (PR #171) — async HNSW background worker (`HnswWorker` thread + `ExecCtx.hnsw_tx`); HNSW graph-stitching decoupled from commit critical path. See PROGRESS.md "Items 67/51/68/69". |
-| 68 | `68_hint_bits.md` | Performance | ✅ SHIPPED 2026-07-20 (PR #171) — lazy txn-state cache in tuple header flags (`HINT_XMIN_COMMITTED`/`HINT_XMAX_ABORTED`); SELECT filtered 0.55→0.74× PG (+35%). See PROGRESS.md "Items 67/51/68/69". |
-| 69 | `69_fill_factor.md` | Performance | ✅ SHIPPED 2026-07-20 (PR #171) — fill-factor page reservation (default 80%); FSM 8-level granularity; UPDATE HOT 1.12→1.51× PG (+35%). See PROGRESS.md "Items 67/51/68/69". |
+| 67 | `67_async_hnsw_index_build.md` | Performance | ✅ SHIPPED 2026-07-20 (PR #171) — async HNSW background worker (`HnswWorker` thread + `ExecCtx.hnsw_tx`); HNSW graph-stitching decoupled from commit critical path. See PROGRESS.md "Items 67 / 51 / 68 / 69". |
+| 68 | `68_hint_bits.md` | Performance | ✅ SHIPPED 2026-07-20 (PR #171) — lazy txn-state cache in tuple header flags (`HINT_XMIN_COMMITTED`/`HINT_XMAX_ABORTED`); SELECT filtered 0.55→0.74× PG (+35%). See PROGRESS.md "Items 67 / 51 / 68 / 69". |
+| 69 | `69_fill_factor.md` | Performance | ✅ SHIPPED 2026-07-20 (PR #171) — fill-factor page reservation (default 80%); FSM 8-level granularity; UPDATE HOT 1.12→1.51× PG (+35%). See PROGRESS.md "Items 67 / 51 / 68 / 69". |
 | 70 | `70_seq_scan_prefetch.md` | Performance | ✅ SHIPPED 2026-07-20 — `madvise(MADV_WILLNEED)` via `memmap2::advise_range` in `PageFileMmap::prefetch_range`; `PageReader::prefetch_hint` default-no-op trait method; wired into `Heap::scan`, `Heap::count_visible`, and all 4 parallel-scan workers (`parallel_filter_project`, `parallel_count_matching`, `parallel_collect_matching`, `parallel_collect_row_ids`); PREFETCH_PAGES=16 pages / PREFETCH_DISTANCE=8; 4 integration tests; Linux active, macOS active (same API), non-Unix no-op. See PROGRESS.md. |
 | 71 | `71_cross_page_hot.md` | Performance | ✅ SHIPPED 2026-07-18 — cross-page HOT chains; `HOT_NEXT_XPAGE=0xFFFE`; `WAL_HOT_XPAGE_HEAD` type 17; FORMAT_VERSION 8→9; B-tree not updated on full-page UPDATE; P_xhot_a + P_xhot_b crash tests; 50/50 crash + 431 unit PASS. See PROGRESS.md "Item 71". |
 | 72 | `72_hnsw_query_latency.md` | Performance | ✅ SHIPPED 2026-07-19 — `HnswL0Cache` L0 neighbour list cache (cd94d71) + item 73 vector hot cache together achieve warm ≤5 ms at 10k (2.38 ms measured, 11.2× speedup). See PROGRESS.md. |
@@ -124,7 +124,7 @@
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `113_…`.**
+**Next new file → `114_…`.**
 
 ## Next up — priority order (2026-07-22, post items 105/92/108/107/109/110/111)
 

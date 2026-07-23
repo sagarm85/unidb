@@ -132,7 +132,7 @@ completed the feature:
   subquery on empty table → NULL → comparison is NULL → row not matched.
 - **Tests**: 9 tests in `tests/item19_subquery_predicates.rs` — all PASS.
 
-See `PROGRESS.md` "Item 19 — IN(subquery)/EXISTS/scalar subquery predicates".
+See `PROGRESS.md` "Item 19 — IN(subquery) / EXISTS / scalar subquery predicates".
 
 ### G-NATURAL — `NATURAL JOIN` **(SHIPPED 2026-07-20)**
 
