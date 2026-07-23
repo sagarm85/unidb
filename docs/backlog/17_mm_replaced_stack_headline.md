@@ -1,7 +1,7 @@
 # Cross-domain headline — unidb (1 atomic commit) vs the replaced stack
 
 **Type:** Performance
-**Status:** SHIPPED (→ PROGRESS.md "Cross-domain headline … (item 17)") — native
+**Status:** SHIPPED (→ PROGRESS.md "Cross-domain headline — unidb (1 atomic commit) vs the replaced stack (item 17)") — native
 real-fsync **3.61×** vs the replaced stack; ~parity under Docker's cheap VM fsync;
 crash-consistency 0 orphans vs torn record (crash harness 29 → 31).
 

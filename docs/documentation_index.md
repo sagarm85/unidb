@@ -80,6 +80,11 @@
     (per-item decisions now live in the item files + `PROGRESS.md`).
   - [`backlog/CONVENTIONS.md`](backlog/CONVENTIONS.md) — naming/lifecycle
     rules for backlog files.
+- [history/](history/) — verbatim archives of older `MEMORY.md` /
+  `PROGRESS.md` entries (rolled out 2026-07-22 to keep the per-session working
+  set small; policy in `CLAUDE.md` §0.4). Headings are preserved exactly, so
+  any `see PROGRESS.md "…"` reference resolves here by grep;
+  `scripts/lint_docs.sh` enforces that. Grep these — never read them linearly.
 
 ## Positioning
 

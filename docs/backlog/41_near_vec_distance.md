@@ -1,7 +1,7 @@
 # NEAR(): expose vec_distance as a computed output column
 
 **Type:** Improvement
-**Status:** SHIPPED (→ PROGRESS.md "NEAR() vec_distance virtual column (item 41)")
+**Status:** SHIPPED (→ PROGRESS.md "Item 41 — NEAR() vec_distance virtual column")
 
 ## Problem
 

@@ -1,7 +1,7 @@
 # Replication — time-based PITR + logical replication
 
 **Type:** Milestone
-**Status:** SHIPPED 2026-07-13 — see PROGRESS.md "Replication time-PITR + logical (item 28)"
+**Status:** SHIPPED 2026-07-13 — see PROGRESS.md "Replication time-PITR + logical replication (item 28)"
 
 > Limitation from the architecture guide + Phase-6 follow-ups: "point-in-time
 > restore is by log position, not wall-clock time; no logical replication yet."
