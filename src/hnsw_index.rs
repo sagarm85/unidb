@@ -117,6 +117,9 @@ pub static Q_L0_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 pub static Q_VEC_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 pub static Q_DISK_FETCHES: AtomicU64 = AtomicU64::new(0);
 pub static Q_DISTANCE_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Item 106 L0′: upper-layer (>0) neighbour lists served from the arena
+/// cache instead of a DiskBTree walk per hop.
+pub static Q_UPPER_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 /// Nanoseconds spent in the ANN beam-search phase of `exec_select_near`
 /// (item 92 phase attribution — splits query time into ANN vs re-rank).
 pub static Q_ANN_NANOS: AtomicU64 = AtomicU64::new(0);
@@ -132,6 +135,7 @@ pub fn reset_query_counters() {
     Q_DISTANCE_CALLS.store(0, AtomicOrd::Relaxed);
     Q_ANN_NANOS.store(0, AtomicOrd::Relaxed);
     Q_RERANK_NANOS.store(0, AtomicOrd::Relaxed);
+    Q_UPPER_CACHE_HITS.store(0, AtomicOrd::Relaxed);
 }
 
 // ── Async worker types (item 67) ─────────────────────────────────────────────
@@ -463,6 +467,15 @@ fn encode_rid_key(rid: RowId) -> OrderedValue {
 }
 
 /// Encode (layer, heap RowId) as an i64 key for upper_layer DiskBTree.
+/// Cache key for an upper-layer neighbour list in the shared arena
+/// (item 106 L0′). Same packing as the DiskBTree key: for `layer >= 1` the
+/// value is >= 2^48, disjoint from layer-0 arena keys (`encode_rid` =
+/// page<<16 | slot < 2^48) — so upper lists share `HnswL0Cache`'s arena,
+/// COW snapshots, generation invalidation, and merge machinery for free.
+fn encode_upper_cache_key(layer: usize, rid: RowId) -> i64 {
+    (layer as i64) << 48 | (rid.page_id as i64) << 16 | rid.slot as i64
+}
+
 fn encode_layer_rid_key(layer: usize, rid: RowId) -> OrderedValue {
     // layer (0..20) in bits [48..63], rid.page_id in bits [16..47], rid.slot in bits [0..15]
     OrderedValue::Int((layer as i64) << 48 | (rid.page_id as i64) << 16 | rid.slot as i64)
@@ -1581,6 +1594,27 @@ impl DiskHnswIndex {
                     )?;
                     false
                 }
+            } else if let Some(ref mut lc) = l0_cache {
+                // Item 106 L0′: upper-layer lists from the shared arena
+                // (disjoint key space, see encode_upper_cache_key). Before
+                // this, EVERY upper hop paid a DiskBTree walk — ~290 µs of
+                // ef-independent cost per warm query (Step-0 finding).
+                let ukey = encode_upper_cache_key(layer, cand_rid);
+                if lc.for_l0_nbrs(ukey, |nbr| {
+                    if nbr_buf_len < HNSW_M_MAX0 {
+                        nbr_buf[nbr_buf_len] = nbr;
+                        nbr_buf_len += 1;
+                    }
+                }) {
+                    Q_UPPER_CACHE_HITS.fetch_add(1, AtomicOrd::Relaxed);
+                    true
+                } else {
+                    let disk_nbrs =
+                        self.get_upper_nbrs(cand_rid, layer, hdr.upper_layer_root, pool)?;
+                    lc.insert_neighbours(ukey, disk_nbrs.clone());
+                    nbrs_owned = disk_nbrs;
+                    false
+                }
             } else {
                 nbrs_owned = self.get_upper_nbrs(cand_rid, layer, hdr.upper_layer_root, pool)?;
                 false
@@ -2238,10 +2272,24 @@ impl DiskHnswIndex {
         let mut ep = hdr.ep_heap_rid;
         let mut ep_dist = hnsw_distance(hdr.metric, query, &ep_vec);
 
-        // Greedy upper-layer descent (no L0/vec caches — upper layers are tiny).
+        // Greedy upper-layer descent. Item 106 L0′: the caches now flow into
+        // the upper layers too — neighbour lists from the shared arena
+        // (upper-key space) and vectors from the vec cache (a node's vector
+        // is layer-independent, and prefetch loads every node's vector).
         for lyr in (1..=hdr.ep_level as usize).rev() {
-            let res =
-                self.search_layer(ep, ep_dist, query, 1, lyr, &hdr, pool, None, None, None)?;
+            let res = self.search_layer_with_vec(
+                ep,
+                ep_dist,
+                query,
+                1,
+                lyr,
+                &hdr,
+                pool,
+                None,
+                None,
+                l0_cache.as_deref_mut(),
+                vec_cache.as_deref_mut(),
+            )?;
             if let Some(&(d, r)) = res.first() {
                 if d < ep_dist {
                     ep_dist = d;
@@ -2383,6 +2431,31 @@ impl DiskHnswIndex {
             if !already_vec {
                 vec_cache.insert_vec(key, node.vector);
             }
+        }
+
+        // Item 106 L0′: pre-load every upper-layer neighbour list into the
+        // shared arena (upper-key space). The upper tree is tiny (~n·(1−1/e)
+        // fraction above layer 0 is small); validate() scans leaves in key
+        // order so duplicate keys (multi-value posting lists) arrive
+        // adjacent — group and insert.
+        let upper_tree = DiskBTree::new(hdr.upper_layer_root, self.page_size);
+        let mut cur_key: Option<i64> = None;
+        let mut cur_nbrs: Vec<RowId> = Vec::new();
+        for (key, nbr) in upper_tree.validate(pool)? {
+            let k = match key {
+                OrderedValue::Int(k) => k,
+                _ => continue,
+            };
+            if cur_key != Some(k) {
+                if let Some(pk) = cur_key.take() {
+                    l0_cache.insert_neighbours(pk, std::mem::take(&mut cur_nbrs));
+                }
+                cur_key = Some(k);
+            }
+            cur_nbrs.push(nbr);
+        }
+        if let Some(pk) = cur_key {
+            l0_cache.insert_neighbours(pk, cur_nbrs);
         }
 
         tracing::debug!(

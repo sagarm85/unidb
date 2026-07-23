@@ -116,3 +116,35 @@ margin, possibly without quantization at all.**
 `set_ef_search()`, default unchanged at 200) — needed for the sweep, doubles
 as the ops knob the eventual retune requires. Probe test
 `tests/perf_item106.rs` (curve is re-runnable after every lever).
+
+
+## Unit 1 result (2026-07-22) — shipped, and the model corrected
+
+**Measured: uniform −55–60 µs at every ef** (ef=120 gate point 601 → **549 µs
+@ 0.910**; ef=200 820 → 774; **cold 2,331 → 1,042 µs** from the upper-list
+prefetch). Implementation: upper lists share `HnswL0Cache`'s arena via the
+naturally-disjoint layer-key space (`encode_upper_cache_key`, layer≥1 ⇒
+≥2^48) — zero new structures, COW/generation/merge inherited; descent now
+threads both caches; prefetch pre-loads the upper tree; `Q_UPPER_CACHE_HITS`
+counter added.
+
+**Attribution correction (honest):** Step-0 projected −250–290 µs here; the
+true upper-layer cost was ~60 µs. The error: distance calls scale SUBLINEARLY
+with ef (1,193 at ef=40 vs 3,748 at ef=200 — not ef-proportional), so the
+ef=40 "floor" I attributed to upper layers was mostly **per-neighbour
+bookkeeping: ~140 ns/call** (VecArena HashMap get + `visited` HashSet +
+BinaryHeap) on top of ~40 ns of SIMD distance. That bookkeeping is the real
+remaining ANN wall (~180 ns × calls fits both ef points). Corollary: item
+92's "hasher is a wash" A/B ran in the ±120 µs clone-variance era and only
+tested a hasher swap — the structural fix (below) is different and now
+evidence-motivated.
+
+### Revised units (post-Unit-1 model: warm ≈ 180 ns×calls + re-rank + 74 µs)
+
+- **Unit 2a — dense-slot bookkeeping:** resolve rid→arena-slot ONCE per
+  neighbour; `visited` becomes a slot bitset (no SipHash), vector access a
+  direct slab index (no HashMap get). Est. −150–200 µs at ef=120.
+- **Unit 2b — L1 graph quality** (unchanged): 0.90+ at ef≤80 for margin.
+- **Unit 3 — L3 decode-pushdown + ef retune + certification.**
+  Projection at ef=120 after 2a+3: **~285–330 µs @ 0.910** — under target
+  even before 2b's margin.
