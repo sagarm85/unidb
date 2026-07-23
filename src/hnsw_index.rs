@@ -1553,15 +1553,20 @@ impl DiskHnswIndex {
         // slot (cache miss; slots appended mid-search land past the bitset)
         // spill to the HashSet, which is also the insert-path bookkeeping.
         let mut visited: HashSet<RowId> = HashSet::new();
-        let mut visited_bits: Vec<u64> = match vec_cache.as_deref() {
-            Some(vc) => vec![0u64; vc.num_slots().div_ceil(64)],
-            None => Vec::new(),
-        };
+        // `bits_cap` is the slot count at search start, at SLOT granularity.
+        // Slots appended mid-search (cache fills during this search) are
+        // >= bits_cap and must stay on the HashSet path: a rid first seen
+        // slot-less is recorded in the HashSet, and if its later-assigned
+        // slot were accepted by the bitset (word-granular slack of the
+        // rounded-up allocation), it would pass both checks and be visited
+        // twice — duplicate rids in the result set.
+        let bits_cap: usize = vec_cache.as_deref().map_or(0, |vc| vc.num_slots());
+        let mut visited_bits: Vec<u64> = vec![0u64; bits_cap.div_ceil(64)];
         match vec_cache
             .as_deref()
             .and_then(|vc| vc.slot_of(encode_rid(entry)))
         {
-            Some(slot) if (slot as usize) < visited_bits.len() * 64 => {
+            Some(slot) if (slot as usize) < bits_cap => {
                 visited_bits[slot as usize >> 6] |= 1u64 << (slot as usize & 63);
             }
             _ => {
@@ -1687,8 +1692,11 @@ impl DiskHnswIndex {
                 let mut nbr_slot: Option<u32> = None;
                 if let Some(vc) = vec_cache.as_deref() {
                     if let Some(slot) = vc.slot_of(encode_rid(nbr)) {
-                        let w = slot as usize >> 6;
-                        if w < visited_bits.len() {
+                        // Slot-granular bound (bits_cap, not the rounded-up
+                        // word capacity): slots appended mid-search must use
+                        // the HashSet, matching their pre-append encounters.
+                        if (slot as usize) < bits_cap {
+                            let w = slot as usize >> 6;
                             let b = slot as usize & 63;
                             if visited_bits[w] >> b & 1 == 1 {
                                 continue;
