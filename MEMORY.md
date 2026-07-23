@@ -12,6 +12,22 @@
 
 ## Current status
 
+- **2026-07-24 — fix(hnsw): item 106 Unit 2a cold-path duplicate-rid bug (visited-bitset slack).**
+  Three deterministic macOS failures on unmodified main `4c56740` (crash p17 NEAR top-5
+  `[49,50,50,51,51]` after crash-reopen; `index_rebuild::near_on_index_built_over_empty_table`;
+  `vec_distance::…ascending`). Root cause in PR #208's dense visited bitset: bounded at *word*
+  granularity (`w < visited_bits.len()`), so the ≤63 slack bits of the `div_ceil(64)` allocation
+  counted as in-range. A rid first seen slot-less went to the HashSet spill; a mid-search vec-cache
+  fill could assign it a slack slot, and the re-encounter passed the unset bitset bit without
+  consulting the HashSet → double-visit → duplicate rid in top-k. Fix (`search_layer_with_vec`):
+  capture `bits_cap = num_slots()` at search start and bound at *slot* granularity — mid-search
+  appends always get slots ≥ `bits_cap`, staying on the HashSet path they started on. Warm path
+  unchanged by construction. Evidence: 3/3 failing tests → green; full suite + crash 54/54 green;
+  fmt+clippy clean. Perf A/B same-machine back-to-back at ef=120: pre-fix 510.5/512.8 µs,
+  with-fix 503.5/507.4 µs (neutral; recall 0.910 identical). NOTE: the 466 µs Unit 2a baseline
+  did NOT reproduce today even pre-fix (~511 µs on unmodified code) — environment drift, tracked
+  as a caveat, not a regression from this fix. Item 106 doc got a resolved known-issue banner.
+
 - **2026-07-23 — Fresh full Docker bench RUN + PROMOTED as new MM_BASELINE; item 114 filed.**
   `docs/performance/report_20260723_124415.md` (main `0324dc5`, 84m 58s, canary quiet vs 07-21,
   conc matrix 32/32). **Item 107 validated in-record:** W4/W0 at 100k 96→**34.21×**, Δvector

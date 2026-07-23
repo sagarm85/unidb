@@ -6,6 +6,23 @@ recall-vs-ef curve measured AND a new dominant lever found: the upper-layer
 descent is fully uncached (~290 µs ef-independent, invisible to the old
 counters). Lever ordering revised — see the Step-0 section at the end.
 
+> **Known issue (2026-07-24) — RESOLVED same day.** Unit 2a (PR #208)
+> introduced a cold-path correctness bug: NEAR could return **duplicate row
+> ids** in top-k (e.g. `[49,50,50,51,51]` on a 120-point corpus after
+> crash-reopen). Root cause: the dense visited bitset was bounded at *word*
+> granularity (`w < visited_bits.len()`), so the up-to-63 slack bits of the
+> rounded-up allocation were "in range". A rid first seen slot-less went into
+> the HashSet spill; when the vec cache filled mid-search its new slot could
+> land in that slack, and a re-encounter then passed the (unset) bitset check
+> without consulting the HashSet — double-visit → duplicate in the result
+> heap. Fix: bound the bitset at **slot** granularity, captured at search
+> start (`bits_cap = num_slots()`); mid-search appends always get slots
+> ≥ `bits_cap` and stay on the HashSet path. Caught by
+> `crash::p17_durable_vector_index_survives_crash_recall_intact`,
+> `index_rebuild::near_on_index_built_over_empty_table_returns_exact_topk`,
+> `vec_distance::vec_distance_returned_ascending_for_known_corpus` (all
+> deterministic on macOS cold paths).
+
 ## Problem
 
 After item 92 (levers 1–3, 5, 7), warm NEAR at 10k×dim128 is **~900 µs**
