@@ -54,6 +54,9 @@ export MM_REPLACED_STACK="${MM_REPLACED_STACK:-}"
 # service (always started in compose regardless of this flag).
 export MM_REPLACED_STACK_REALISTIC="${MM_REPLACED_STACK_REALISTIC:-}"
 
+# Worktree-unique compose project (session isolation — see docker-compose.yml).
+export COMPOSE_PROJECT_NAME="unidb-fair-bench-$(basename "$REPO_ROOT" | tr -cs 'a-zA-Z0-9' '-' | tr '[:upper:]' '[:lower:]' | sed 's/-$//')"
+
 mkdir -p "$REPO_ROOT/docker/out"
 cd "$REPO_ROOT/docker"
 
@@ -80,11 +83,11 @@ sample_stats() {
   local seen=0 guard=0
   while [[ $guard -lt 7200 ]]; do
     guard=$((guard + 1))
-    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q 'unidb-fair-bench-bench'; then
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "${COMPOSE_PROJECT_NAME}-bench"; then
       seen=1
       ts="$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || echo 0)"
       docker stats --no-stream --format '{{.Name}},{{.CPUPerc}},{{.MemUsage}}' 2>/dev/null \
-        | grep 'unidb-fair-bench' | sed "s/^/${ts},/" >> "$STATS" || true
+        | grep "${COMPOSE_PROJECT_NAME}" | sed "s/^/${ts},/" >> "$STATS" || true
     elif [[ $seen -eq 1 ]]; then
       break
     fi
