@@ -2891,7 +2891,25 @@ fn exec_select_near(
         let snap = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
         (snap, ctx.xid)
     };
-    let mut scored: Vec<(f32, Vec<Literal>)> = Vec::new();
+    // Item 106 Unit 3 — re-rank decode-pushdown. Two savings over the old
+    // full-decode-then-project-everything loop:
+    //   1. Phase 1 decodes ONLY the vector column + predicate columns per
+    //      candidate (the B2 machinery `try_exec_select_btree` already uses)
+    //      — projection columns (esp. TEXT) stay unmaterialized.
+    //   2. Only the k winners (after sort+truncate) are decoded for
+    //      projection — previously all ~ef survivors paid project_row_near
+    //      to have (ef − k) of them thrown away.
+    let cols = &table_def.columns;
+    let ncols = cols.len();
+    let mut p1_cols = vec![col_idx];
+    if let Some(pred) = predicate.as_ref() {
+        expr_columns(pred, table_def, &mut p1_cols);
+    }
+    let (p1_needed, p1_upto) = needed_mask(&p1_cols, ncols);
+    let proj_cols = projection_columns(table_def, projection);
+    let (pw_needed, pw_upto) = needed_mask(&proj_cols, ncols);
+
+    let mut scored: Vec<(f32, Vec<u8>)> = Vec::new();
     for row_id in candidate_ids {
         let bytes = match heap.get(row_id, &snapshot, snap_xid, ctx.pool) {
             Ok(b) => b,
@@ -2901,29 +2919,32 @@ fn exec_select_near(
             Err(DbError::NoVisibleVersion { .. }) => continue,
             Err(e) => return Err(e),
         };
-        let row = decode_row(&bytes, &table_def.columns)?;
-        if !predicate_matches(predicate, &table_def.columns, &row)? {
+        let prow = deform_row(&bytes, cols, p1_upto, &p1_needed)?;
+        if !predicate_matches(predicate, cols, &prow)? {
             continue;
         }
         // Exact re-rank distance from the heap's stored vector.
-        let dist = match &row[col_idx] {
+        let dist = match &prow[col_idx] {
             Literal::Vector(v) => ivf_exact_distance(metric, query, v),
             _ => continue,
         };
-        scored.push((
-            dist,
-            project_row_near(projection, &table_def.columns, &row, dist)?,
-        ));
+        scored.push((dist, bytes));
     }
     scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(k);
+    // Winners only: materialize the projection columns and build output rows.
+    let mut out_rows: Vec<Vec<Literal>> = Vec::with_capacity(scored.len());
+    for (dist, bytes) in &scored {
+        let row = deform_row(bytes, cols, pw_upto, &pw_needed)?;
+        out_rows.push(project_row_near(projection, cols, &row, *dist)?);
+    }
     crate::hnsw_index::Q_RERANK_NANOS.fetch_add(
         rerank_start.elapsed().as_nanos() as u64,
         std::sync::atomic::Ordering::Relaxed,
     );
     Ok(ExecResult::Rows {
         columns: output_columns(projection, &table_def.columns),
-        rows: scored.into_iter().map(|(_, r)| r).collect(),
+        rows: out_rows,
     })
 }
 
