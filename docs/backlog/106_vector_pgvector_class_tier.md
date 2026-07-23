@@ -1,8 +1,10 @@
 # 106 — Vector query pgvector-class tier (≤400 µs): quantization / graph quality
 
 **Type:** Performance
-**Status:** ⏳ NOT STARTED — filed 2026-07-21 when item 92's acceptance was
-revised to ≤1 ms with user sign-off (see `92_vector_query_next_tier.md`)
+**Status:** 🚧 STEP-0 COMPLETE 2026-07-22 (branch `perf/item-106-step0`) —
+recall-vs-ef curve measured AND a new dominant lever found: the upper-layer
+descent is fully uncached (~290 µs ef-independent, invisible to the old
+counters). Lever ordering revised — see the Step-0 section at the end.
 
 ## Problem
 
@@ -57,3 +59,60 @@ computations at equal recall** — an algorithmic change, not tuning.
 - [ ] Warm NEAR ≤ 400 µs at 10k native, confirmed on Linux/Docker.
 - [ ] Crash harness green (index build path touched ⇒ P60-series re-run).
 - [ ] Full suite + clippy + fmt clean; PROGRESS.md metrics recorded.
+
+
+## Step-0 results (2026-07-22) — curve + a lever nobody priced
+
+### Recall-vs-ef curve, current graph, 10k×dim128 (`tests/perf_item106.rs`)
+
+| ef | recall@10 | warm µs/q |
+|---:|---:|---:|
+| 40 | 0.640 | 425 |
+| 60 | 0.715 | 410 |
+| 80 | 0.805 | 494 |
+| **120** | **0.910** | **601** |
+| 160 | 0.925 | 701 |
+| 200 (default) | 0.945 | 820 |
+| 300 | 0.960 | 1074 |
+
+The curve is **steep** — 0.90 needs ef≈120 on the current graph → L1 (build-
+time heuristic neighbour selection) is justified, target 0.90+ at ef≤80 with
+real margin (today's 0.910@120 is one wobble from the gate).
+
+### The floor: ~410 µs at ef=40 — and where it lives
+
+Phase split at ef=40 (`UNIDB_HNSW_EF_SEARCH=40`, perf_item92 timers):
+**ANN 321 µs** · re-rank 47 µs · other ~67 µs. Re-rank scales with ef as
+modeled; **ANN has a ~290 µs ef-independent component.**
+
+Code-confirmed root cause: the **upper-layer descent is completely
+uncached** — `get_upper_nbrs` runs a `DiskBTree::search_eq` per hop, and the
+upper `search_layer` calls pass ALL caches as `None`, so every neighbour
+evaluation pays `find_node_loc` (another B-tree walk) + an uncached node
+load. ~4 layers × ~16 neighbours ≈ the measured ~290 µs. These fetches don't
+increment `Q_DISK_FETCHES` (which counts only the layer-0 miss branch) —
+which is why the "0 disk fetches, cache is working" line was true-but-
+incomplete since item 72.
+
+### Revised lever ordering (replaces the filed 1–4)
+
+1. **L0′ — upper-layer cache** (NEW, first): items-72/73 pattern applied to
+   layers >0 — hundreds of nodes, trivial memory, prefetchable at CREATE
+   INDEX/open. Expected −250–290 µs at every ef. Cheapest, biggest.
+2. **L1 — graph-quality heuristic selection** at build: target 0.90+ at
+   ef≤80 (halves distance calls + traversal). Interacts with item 107
+   (heavier insert → worker throughput/drain must be measured, not hidden).
+3. **L3 — re-rank decode-pushdown**: smaller once ef drops (47 µs at ef=40)
+   but still worth ~50–100 µs at ef≈80.
+4. **L2 — SQ8 slab quantization: demoted to reserve** — only if 1–3 land
+   short of 400 µs.
+
+**Projection with 1+2(+3): ~280–330 µs — under the 400 µs target with
+margin, possibly without quantization at all.**
+
+### Shipped in Step-0
+
+`ef_search` is now runtime-tunable (`UNIDB_HNSW_EF_SEARCH` env +
+`set_ef_search()`, default unchanged at 200) — needed for the sweep, doubles
+as the ops knob the eventual retune requires. Probe test
+`tests/perf_item106.rs` (curve is re-runnable after every lever).

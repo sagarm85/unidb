@@ -32,7 +32,7 @@ use crate::{
     error::{DbError, Result},
     format::{PageId, Xid},
     heap::{get_visible, Heap, RowId},
-    hnsw_index::{DiskHnswIndex, HnswL0Cache, HNSW_EF_SEARCH},
+    hnsw_index::{DiskHnswIndex, HnswL0Cache},
     lockmgr::{LockManager, RecordId},
     mvcc::Snapshot,
     queue::{self, EVENTS_TABLE},
@@ -2797,7 +2797,7 @@ fn exec_select_near(
     // stored vectors — identical contract to the IVF-Flat path it replaces.
     let hnsw = DiskHnswIndex::open(meta_page, ctx.page_size);
     // Use max(k * 4, HNSW_EF_SEARCH) so small k doesn't under-probe.
-    let ef = (k * 4).max(HNSW_EF_SEARCH);
+    let ef = (k * 4).max(crate::hnsw_index::ef_search());
 
     // Items 72+73: process-lifetime L0 neighbour cache + vector hot cache.
     // Snapshot-then-merge pattern (no lock held during page I/O):
