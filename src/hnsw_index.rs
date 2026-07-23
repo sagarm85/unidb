@@ -1553,15 +1553,19 @@ impl DiskHnswIndex {
         // slot (cache miss; slots appended mid-search land past the bitset)
         // spill to the HashSet, which is also the insert-path bookkeeping.
         let mut visited: HashSet<RowId> = HashSet::new();
-        let mut visited_bits: Vec<u64> = match vec_cache.as_deref() {
-            Some(vc) => vec![0u64; vc.num_slots().div_ceil(64)],
-            None => Vec::new(),
-        };
+        // `bits_slots` is the EXACT slot count at sizing time: slots assigned
+        // to rids mid-search (fallback inserts) land at >= bits_slots and MUST
+        // keep using the spill HashSet — a word-granular bound (bits.len()*64)
+        // would hand them fresh zero bits after the HashSet already saw them,
+        // double-evaluating the node (caught by crash test P17: duplicate
+        // NEAR results).
+        let bits_slots: usize = vec_cache.as_deref().map_or(0, |vc| vc.num_slots());
+        let mut visited_bits: Vec<u64> = vec![0u64; bits_slots.div_ceil(64)];
         match vec_cache
             .as_deref()
             .and_then(|vc| vc.slot_of(encode_rid(entry)))
         {
-            Some(slot) if (slot as usize) < visited_bits.len() * 64 => {
+            Some(slot) if (slot as usize) < bits_slots => {
                 visited_bits[slot as usize >> 6] |= 1u64 << (slot as usize & 63);
             }
             _ => {
@@ -1687,8 +1691,8 @@ impl DiskHnswIndex {
                 let mut nbr_slot: Option<u32> = None;
                 if let Some(vc) = vec_cache.as_deref() {
                     if let Some(slot) = vc.slot_of(encode_rid(nbr)) {
-                        let w = slot as usize >> 6;
-                        if w < visited_bits.len() {
+                        if (slot as usize) < bits_slots {
+                            let w = slot as usize >> 6;
                             let b = slot as usize & 63;
                             if visited_bits[w] >> b & 1 == 1 {
                                 continue;

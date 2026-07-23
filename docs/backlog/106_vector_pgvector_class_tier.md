@@ -152,9 +152,16 @@ evidence-motivated.
 
 ## Unit 2a result (2026-07-22) — dense-slot bookkeeping, measured
 
-**Gate point ef=120: 549 → 465.8 µs @ 0.910** (ef=200: 774 → 643 µs;
-ef=40: 369 → 330 µs). Recall bit-identical at every ef — same candidates,
-same set semantics. Implementation: one `slot_of` map resolve per neighbour
+**Gate point ef=120: 549 → 487.8 µs @ 0.910 (certified post-fix)**
+(ef=200: 774 → 664 µs; ef=40: 369 → 360 µs).
+_Correction: the first measurement (465.8) carried a dedupe bug — the
+bitset guard used the word boundary (bits.len()×64) instead of the exact
+slot count at sizing time, so slots assigned mid-search to already-
+HashSet-visited rids got fresh zero bits → double evaluation → duplicate
+NEAR candidates. Invisible on fully-warm probes; caught by crash test
+P17's cold-after-crash pattern (returned `[49,50,50,51,51]`). Fixed with
+an exact `bits_slots` bound; ~20 µs of the apparent win was the bug
+skipping legitimate spill-path work. The crash harness earning its keep._ Implementation: one `slot_of` map resolve per neighbour
 now drives BOTH a dense visited bitset (two bit ops, no SipHash) and a
 direct `slice_by_slot` slab read (no second map get); slot-less rids
 (cache miss / mid-search appends past the bitset) spill to the old HashSet
