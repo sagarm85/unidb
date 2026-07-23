@@ -1059,6 +1059,13 @@ impl Catalog {
             prev_lsn = lsn;
         }
         let commit_lsn = ctx.wal.commit_mini_txn(txn_id, prev_lsn)?;
+        // Item 116 (durability hardening): under the commit-time-fsync
+        // DEFAULT (deferred_sync=true, set at engine open), a mini-txn commit
+        // does not fsync inline — so without this explicit sync the control
+        // file below would start pointing at a catalog chain whose WAL is not
+        // yet durable and could vanish in a crash. Force it durable first.
+        // No-op cost in the legacy per-statement mode (already durable).
+        ctx.wal.sync_up_to(commit_lsn)?;
 
         // Atomic commit point: flip catalog_root to the head of the new chain.
         {

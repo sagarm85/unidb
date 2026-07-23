@@ -388,6 +388,11 @@ struct WalInner {
     total_bytes_appended: u64,
     /// LSN of the last fsync'd record (the durable WAL frontier).
     durable_lsn: Lsn,
+    /// Item 116: cached duplicate FD of the active segment for `group_fsync`.
+    /// Avoids a `try_clone` (dup syscall + File alloc) on EVERY commit — the
+    /// clone happens once per segment and is invalidated by rotation (the
+    /// cached `u64` is the segment index it was cloned from).
+    fsync_fd_cache: Option<(u64, std::sync::Arc<File>)>,
     /// Group-commit mode (M9). When `true`, commit/abort records are appended
     /// without a per-call fsync; durability is forced explicitly by a later
     /// [`Wal::sync`]. Off by default so the embedded API and the crash harness
@@ -505,6 +510,7 @@ impl Wal {
                 next_mini_txn: 1,
                 wal_bytes,
                 total_bytes_appended: 0,
+                fsync_fd_cache: None,
                 durable_lsn: INVALID_LSN,
                 deferred_sync: false,
                 poisoned: false,
@@ -1288,10 +1294,24 @@ impl Wal {
                     "WAL buffer flush failed: {e}"
                 )));
             }
-            let file = inner.writer.get_ref().try_clone().map_err(|e| {
-                inner.poisoned = true;
-                DbError::DurabilityFailure(format!("WAL fd clone for group fsync failed: {e}"))
-            })?;
+            // Item 116: reuse a cached duplicate FD of the active segment
+            // instead of paying a `try_clone` (dup syscall) per commit. The
+            // cache is keyed by segment index; rotation invalidates it.
+            let active_seg = inner.active_seg;
+            let file = match &inner.fsync_fd_cache {
+                Some((seg, fd)) if *seg == active_seg => std::sync::Arc::clone(fd),
+                _ => {
+                    let fd = inner.writer.get_ref().try_clone().map_err(|e| {
+                        inner.poisoned = true;
+                        DbError::DurabilityFailure(format!(
+                            "WAL fd clone for group fsync failed: {e}"
+                        ))
+                    })?;
+                    let fd = std::sync::Arc::new(fd);
+                    inner.fsync_fd_cache = Some((active_seg, std::sync::Arc::clone(&fd)));
+                    fd
+                }
+            };
             (inner.next_lsn - 1, file)
         };
         // The slow part, with the append lock RELEASED so appends coalesce.

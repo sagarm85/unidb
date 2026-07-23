@@ -1788,7 +1788,7 @@ impl Heap {
         // 1. Known pages that fit — pure integer comparison under the FSM lock,
         //    no page fetch; the lock is released the moment we have an answer or
         //    the list of pages still needing a probe.
-        let unknown: Vec<PageId> = {
+        let unknown: Option<PageId> = {
             let fsm = self.lock_fsm();
             // Item 78b: scan newest→oldest (reverse).  Fill pages are always
             // appended at the end of `fsm.pages` (largest page_id), so the
@@ -1800,25 +1800,30 @@ impl Heap {
                     return Ok(pid);
                 }
             }
-            // Unknown pages, newest first (append locality). Collected here, but
-            // probed below with the FSM lock RELEASED — a fetch takes a page
-            // latch, which must never nest under the FSM lock (P5.e invariant).
+            // Newest unknown page (append locality), found here but probed
+            // below with the FSM lock RELEASED — a fetch takes a page latch,
+            // which must never nest under the FSM lock (P5.e invariant).
+            // Item 116: only the single newest unknown is ever probed (see
+            // below), so find just that one — the previous full
+            // `filter().collect()` allocated and copied the entire page list
+            // on every per-statement first insert (free_map starts empty for
+            // a fresh statement heap: ~11 KB of pure waste per row at 100k).
             fsm.pages
                 .iter()
                 .rev()
-                .filter(|pid| !fsm.free_map.contains_key(pid))
+                .find(|pid| !fsm.free_map.contains_key(pid))
                 .copied()
-                .collect()
         };
         // 2. Probe at most one unknown page (newest first): after the
         // ensure_directory fix (item 77) the page list is fully populated but
-        // free_map is empty, so `unknown` is the entire heap.  Probing all of
-        // it would be O(n) cold fetches.  We only probe the single newest page
-        // because (a) insert-append locality means the tail is the only one
-        // that could have slack, and (b) step 2b below covers the tail via an
-        // O(log n) B-tree descent for the common case where even the tail is
-        // already in-memory from a prior iteration's note_free_space.
-        if let Some(&newest) = unknown.first() {
+        // free_map is empty, so the unknown set is the entire heap.  Probing
+        // all of it would be O(n) cold fetches.  We only probe the single
+        // newest page because (a) insert-append locality means the tail is the
+        // only one that could have slack, and (b) step 2b below covers the
+        // tail via an O(log n) B-tree descent for the common case where even
+        // the tail is already in-memory from a prior iteration's
+        // note_free_space.
+        if let Some(newest) = unknown {
             let page = pool.fetch_page_for_write(newest, wal)?;
             let free = page.free_space();
             pool.unpin(newest);

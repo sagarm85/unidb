@@ -5,6 +5,94 @@
 
 ## Current status (archived entries)
 
+- **Item 108 — RESOLVED 2026-07-21 (same day): CRUD drift was ENVIRONMENTAL, no unidb regression.**
+  Absolutes (§0.6 rule 4): PG's code-identical absolutes moved 2.1–28× between the 07-19/07-21
+  runs (VM fsync ~30×, CPU ~2.15× — why the 07-19 run took 229 min); unidb improved on EVERY row
+  in absolutes (INSERT 138→4,128 rec/s; filtered 812k→2.72M) and WAL-B/row (INSERT 6,366→584 —
+  item 104's signature; HOT 154→88; DELETE sel 39→5). No bisection needed. Shipped: PG-absolute
+  environment canary in compare_bench.py (median drift >25% → warning; fires at 173% on this
+  pair), decompose.rs ceilings table refreshed to 07-21 values, inline correction of the
+  item-104 COUNT claim in PROGRESS.md (real evidence = WAL-B/row + W0, not the COUNT ratio).
+  Rule: cross-run ratio deltas are evidence only when the canary is quiet; else judge by
+  absolutes + WAL-B/row.
+
+- **Consolidated Docker bench — RUN + RECORDED 2026-07-21** (`docs/performance/report_20260721_035629.md`,
+  94m 54s total — bench got 2.4× faster since 07-19 because HNSW insert improvements shrank the ladder;
+  promoted as canonical benchmark + standing `MM_BASELINE`). Verdicts: **item 104 VALIDATED**
+  (W0 0.23 ms/commit at 100k; COUNT(*) 6.93→**41.25×**); **items 72/73/93+NodeCache VALIDATED**
+  (Table 4 at 100k 81.8→13.4 ms/txn, 6.1×); **conc matrix 32/32 PASS**. Two findings filed:
+  **item 107** — synchronous HNSW insert breaks W4≈W0 (Δvector +17.6 ms/commit at 100k, W4/W0 96×,
+  Table 4 0.01×; M2's locked design = async worker; Step-0 audits item 67 coverage + freshness
+  contract); **item 108** — CRUD ratio drift vs 07-19 (SELECT filtered 0.74→0.45×, UPDATE HOT
+  1.51→1.06×; classify via absolute rec/s then bisect with item-105 selective runs; also refresh
+  the stale ceilings table in decompose.rs). Linux NEAR spot-check still open (mmreport doesn't
+  measure NEAR; run perf_item92 in-container).
+
+- **Item 92 Levers 5+7 — SHIPPED 2026-07-21; acceptance revised ≤700 µs → ≤1 ms WITH USER SIGN-OFF same day; pgvector-class tier filed as item 106.**
+  10k re-profile: warm NEAR 2,091 µs, 1,257 µs unattributed → root cause: `exec_select_near`
+  deep-cloned the ENTIRE per-index cache per query (L0 arena + 10k-entry vec HashMap ≈ 7 MiB +
+  10k allocs, plus 10k-entry merge-back walk; O(corpus)/query, ~15 ms at 100k). Lever 5: Arc
+  copy-on-write snapshots + storage_ptr merge-skip → **895.5 µs (−57%)**. Lever 6 (fast hasher)
+  REJECTED on 3×3 A/B (wash) and reverted. Lever 7: `VecArena` contiguous vector slab (item 93
+  pattern) → **~900 µs mean, variance ±120→±2 µs**. Phase timers added (permanent):
+  ANN ~605 µs · re-rank ~222 µs · parse/plan ~74 µs. Recall pinned 0.900 throughout.
+  ≤700 µs unmet; user signed off Option A same day: acceptance revised to ≤1 ms (achieved
+  ~900 µs), item 106 filed for the pgvector-class ≤400 µs tier (graph quality/SQ8/PQ).
+  All tests green (30 binaries + 54/54 crash). Docker/Linux NEAR check + W2-rung no-regression
+  fold into the pending consolidated bench run.
+
+- **Item 105 — Selective bench runs + baseline carry-forward — SHIPPED 2026-07-21, branch `claude/session-status-check-fae1c3`.**
+  Root-caused the ~4 h `report.sh` wall clock (per-phase docker-stats sample counts in
+  `report_20260719_234504.md`): Tables 1+2 W0→W4 ladder ≈ 2.5 h (synchronous HNSW/graph
+  pre-grows — items 63/65/92 bottleneck), Table 4 @100k ≈ 45 min, rest minutes.
+  Three bugs fixed: (1) `MM_TABLES`/`MM_SKIP_TABLE4`/`MM_SKIP_TABLE5` were NOT threaded
+  through `docker-compose.yml` — Docker-mode selective profiles silently ran the full bench;
+  (2) allowlist only honored by Tables 4/5 — 1/2/3/3.1 always ran; (3) `compare_bench.py`
+  Table-4 rows clobbered W4/W0 entries (same integer+ratio row shape).
+  Shipped: `MM_SKIP_LADDER=1` (Tables 1+2 gate, `_Skipped:` markers), knobs threaded through
+  Docker, `scripts/stitch_baseline.py` + `MM_BASELINE=<report.md>` carry-forward with
+  provenance stamp ("Carried forward — NOT re-measured in this run", source/commit/date),
+  section-aware `compare_bench.py` excluding stitched tables. CRUD-item run ~4 h → ~30–45 min.
+  Guardrail: carry-forward invalid for shared-layer changes (WAL/commit/pool/heap/format);
+  full baseline still mandatory per major release. Smoke-verified (denylist + allowlist +
+  stitch on real reports); clippy `--bench decompose` clean (4 pre-existing lints fixed),
+  fmt clean. Docs: backlog `105_…`, PROGRESS.md, scripts_guide.md, report.sh header.
+
+- **Item 104 — Catalog sync dedup — SHIPPED 2026-07-20, PR [#180](https://github.com/sagarm85/unidb/pull/180) open.**
+  Removed `wal.sync_up_to(catalog_lsn)` AND `catalog.persist_only()` from `Engine::commit`.
+  (Just removing the fsync while keeping `persist_only()` caused a replication regression:
+  `persist_only()` flips `catalog_root` in the control file, but without the matching fsync the
+  catalog WAL records weren't in the shipped replication stream → `SlotOutOfRange` on replica.)
+  The correct fix: row_count is updated in-memory on every commit, persisted to disk only at
+  checkpoint. Added `ROW_COUNT_UNKNOWN = i64::MIN` sentinel; `Catalog::load` resets all
+  `row_count` to UNKNOWN on open. COUNT(*) fast path falls back to `count_visible` heap scan
+  when UNKNOWN; caches result back if catalog handle is Exclusive. Delta-apply guards UNKNOWN base.
+  New crash test `p104_catalog_sync_dedup_crash_recovery_count_exact` (4 phases).
+  54/54 crash tests, 463/463 lib tests. Clippy + fmt clean.
+  **Expected: ≥ 1.3× INSERT throughput (eliminates per-commit serialized fsync).**
+
+- **Item 102-B — Covering index INCLUDE columns — SHIPPED 2026-07-20, PR [#177](https://github.com/sagarm85/unidb/pull/177) MERGED.**
+  `CREATE INDEX ON t (col) INCLUDE (c1, c2, …)` — stores INCLUDE col values in B-tree leaf.
+  Leaf wire format: `key_bytes | include_len:u32-LE | include_bytes | RowId(6B)`.
+  FORMAT_VERSION 11→12. `ColumnDef.include_cols: Vec<String>` persisted via `set_column_include_cols`.
+  Optimizer: `index_only = projection ⊆ {key} ∪ include_cols`. Covering fast path in `try_exec_select_btree`:
+  `search_with_keys_and_include` → decode include bytes → project by name. `IDX_INCLUDE_ROWS` counter.
+  HOT eligibility gate: SET on INCLUDE col disables HOT (else stale include bytes in leaf).
+  WAL type-15 extended with `include_len(4B)|include_bytes`; `redo_index_insert_with_include` in recovery.rs.
+  Bulk build via `insert_many_with_include`. UPDATE covering maintenance via `IndexColBatch.include_entries`.
+  Parser: `INCLUDE (cols)` clause, `None => IndexKind::BTree` default.
+  Tests: 10 new in `tests/item102b_covering_index.rs`; all 447 unit + 53 crash = 0 failures.
+  Clippy + fmt clean.
+
+- **Item 93 — HNSW L0 arena layout — SHIPPED 2026-07-20, PR #175 MERGED.**
+  Replaced `HashMap<i64, Vec<RowId>>` in `HnswL0Cache` with flat `L0Arena` (two `Vec`s:
+  `arena_data: Vec<i64>` + `arena_offsets: Vec<u32>`). Hot-path `for_l0_nbrs` iterates
+  the arena slice in-place via callback — zero heap allocation per hop. Stack buffer
+  `[RowId; HNSW_M_MAX0]` (32 slots) collects neighbours with zero `Vec<RowId>` alloc.
+  Tombstone/compact design removed (prefix-sum offset array cannot support per-slot zeroing).
+  Measured (debug): recall@10=1.000 (≥0.90), disk_fetches=0, L0 hits=3000. Docker bench pending.
+
+
 - **Item 24 Z1+Z3+Z5 — SQL authz DDL + JWT enforcement + catalog relations — SHIPPED 2026-07-19, branch `feat/item-24-authz-z1z3z5`.**
   Z1: `CREATE/DROP ROLE`, `GRANT/REVOKE`, `CREATE/DROP POLICY` SQL DDL. Policies route INSERT→`insert_policy`
   (per-row enforcement in exec_insert); SELECT/UPDATE/DELETE→`rls_policy` (AND-rewrite in apply_rls). Catalog-persisted.
@@ -3255,6 +3343,210 @@ plain reporting.
 
 
 ## Session log (archived entries)
+
+### 2026-07-21 (same session) — Item 108 resolved same-day: drift = environment
+
+Absolutes-first comparison closed it in one step, no bisection: PG code-identical absolutes
+moved 2.1–28× across the two runs; unidb improved everywhere (absolutes + WAL-B/row). Shipped
+compare_bench.py env canary (>25% PG-absolute median drift → warning), refreshed the stale
+decompose.rs ceilings table (now 07-21 values + absolutes-first protocol note), corrected the
+item-104 COUNT-baseline claim in PROGRESS.md inline. Item 107 (async HNSW) is now the sole
+open finding from the bench.
+
+### 2026-07-21 (same session, after item 92) — Consolidated Docker bench + items 107/108 filed
+
+Full run on main+92 (`b6d6e5f`): 94m 54s (vs ~230 min on 07-19 — ladder now cheap since HNSW
+insert improvements; validates item 105's timing analysis). Debt verdicts: item 104 ✓ (W0
+0.23 ms at 100k, COUNT 41.25×), items 72/73/93+gate ✓ (Table 4 100k 81.8→13.4 ms/txn), conc
+32/32 PASS. Findings: W4/W0 blown to 19–96× — synchronous HNSW insert (Δvector +6.6→+17.6
+ms/commit); old ≈1.5× baseline was IVF-era; fix = M2's prescribed async worker → **item 107**.
+CRUD drift vs 07-19 (filtered 0.74→0.45×, HOT 1.51→1.06×) → **item 108** (absolute-first
+classification, then item-105 selective bisect; refresh stale decompose.rs ceilings table).
+Report promoted (benchmark_20260721_133227.md) + copied to docs/performance as MM_BASELINE.
+
+### 2026-07-21 (later same session) — Item 92 Levers 5–7: NEAR warm 10k 2,091 → ~900 µs
+
+**Goal:** user said "start item 92, then plan Docker bench validation debt." Discovered item 92
+was further along than the index suggested (levers 1–3 already merged, PR #154); remaining =
+the two unchecked acceptance boxes. Native 10k probe showed levers 1–3 did NOT scale: 2,091 µs
+warm (vs 921 µs at 2k), 1,257 µs unattributed.
+
+**Lever 5 (shipped):** root cause of unattributed block = `exec_select_near` deep-cloning the
+entire per-index cache per query (L0 arena + vec HashMap ≈ 7 MiB + 10k allocations at 10k, plus
+O(n) merge-back walk). Fix: `Arc` copy-on-write storage in `HnswVecCache`/`HnswL0Cache`
+(`Arc::make_mut` on mutation), `storage_ptr()` compare to skip merge-back when nothing inserted,
+ptr-eq/empty-adopt fast paths in `merge_from`. Measured: 2,091 → 895.5 µs (−57%), cold
+2,331 → 1,499 µs, counters/recall identical.
+
+**Lever 6 (rejected honestly):** hand-rolled FxHash-style hasher for the 4 hot structures;
+3×3 A/B showed FastHash ~996 vs SipHash ~992 µs — wash. Hashing is not the bottleneck (memory
+pointer-chase is). Fully reverted; recorded in backlog 92 as do-not-reattempt-without-evidence.
+
+**Phase attribution (permanent):** `Q_ANN_NANOS`/`Q_RERANK_NANOS` atomics in `exec_select_near`,
+printed by perf_item92. Warm split: ANN ~605 µs (66%) · re-rank+project ~222 µs (25%) ·
+parse/plan/snapshot ~74 µs. Stale heuristic attribution print (claimed Vec clones + "SIMD
+could 4-8×" after SIMD had shipped) replaced with measured split.
+
+**Lever 7 (shipped):** `VecArena` — one flat `Vec<f32>` slab + key→slot map replacing 10k
+scattered 512 B Vec allocations (item 93's L0Arena pattern; drop-in behind Lever 5 accessors).
+Measured: 897.9/899.7/902.1 µs — mean ~900 µs (~9% under Lever-5-alone mean ~990), variance
+±120 → ±2 µs. Locality hypothesis mostly didn't pay (ANN still ~605 µs — 5 MiB random-access
+working set); honest wins: determinism, allocator pressure, single-memcpy COW.
+
+**Target status:** ≤700 µs not met (~900 µs native macOS, recall pinned at exactly 0.900);
+remaining micro-levers floor ≈700–750 µs. **User signed off Option A same day**: acceptance
+revised to ≤1 ms (achieved), item 106 filed for the pgvector-class ≤400 µs tier (Step-0 =
+recall-vs-ef curve, then graph-quality heuristic / SQ8 slab / decode-pushdown).
+Verification: 30 test binaries green, crash 54/54, clippy/fmt clean.
+Flagged as spawn-task chips: item102 IDX_ONLY_ROWS test race (observed flaking once),
+pre-existing clippy lints in 4 test binaries (--all-targets not in the gate).
+Committed + PR'd after sign-off; consolidated Docker bench launched same session.
+
+### 2026-07-21 — Item 105: Selective bench runs + baseline carry-forward (bench tooling)
+
+**Goal:** User asked why `report.sh` takes 3–4 h per validation and proposed reusing prior
+bench tables for unaffected areas. Root-caused the time, fixed the knob plumbing, shipped
+carry-forward stitching.
+
+**Root cause of the 4 h:** per-phase docker-stats sample counts (`n` ≈ seconds) in
+`report_20260719_234504.md` (230 min): Tables 1+2 W0→W4 ladder ≈ 2.5 h (W2–W4 pre-grows
+build HNSW + graph indexes synchronously — the item 63/65/92 incremental-HNSW bottleneck);
+`t4_unidb_100000` n=2595 ≈ 43 min; everything else minutes. ~85 % of bench wall clock IS
+the slow HNSW insert path — fixing item 92 shrinks the report for free.
+
+**Bugs found:** (1) `MM_TABLES`/`MM_SKIP_TABLE4`/`MM_SKIP_TABLE5` never passed through
+`docker-compose.yml` → Docker-mode per-item profiles silently ran the full ~4 h bench
+(this is why the user's run took 4 h despite documented ~1.5 h profiles). (2) Allowlist
+only honored by Tables 4/5; 1/2/3/3.1 always ran. (3) `compare_bench.py`: Table 4 rows
+(integer first col + `×` last col) clobbered Table 1's W4/W0 entries.
+
+**Shipped:** `MM_SKIP_LADDER=1` + full `MM_TABLES` gating in `benches/decompose.rs`
+(`_Skipped:` markers under skipped `## Table N` headings; 1+2 one unit, 3.1 gated with 3);
+knobs threaded through `docker_report.sh` + compose; new `scripts/stitch_baseline.py` +
+`MM_BASELINE=<report.md>` hook in `report.sh` (host-side post-processing, both modes) —
+skipped tables carried forward with provenance stamp ("Carried forward — NOT re-measured
+in this run", source file/commit/date; holes never copied; chained stamps preserved +
+warned); section-aware `compare_bench.py` excludes stitched tables. Fixed 4 pre-existing
+`needless_range_loop` clippy lints in the bench (only visible with `--bench decompose`).
+
+**Verification:** debug-bench smoke (denylist → 4 markers, Tables 3/3.1 measured;
+`MM_TABLES=3` → only 3/3.1); stitch tested against real reports; parser confirmed
+excluding carried tables. clippy/fmt/bash -n/compose config all clean. New CRUD-item
+profile: `MM_SKIP_LADDER=1 MM_SKIP_TABLE4=1 MM_SKIP_TABLE5=1 MM_BASELINE=… scripts/report.sh`
+→ ~30–45 min. Guardrail: carry-forward invalid for shared-layer changes; full baseline per
+major release. Docs: backlog `105_bench_selective_carry_forward.md` (+index, next→106),
+PROGRESS.md entry, scripts_guide.md, report.sh/multi_model_report.sh headers.
+
+### 2026-07-20 — Item 104: Catalog sync dedup (remove double-fsync per INSERT)
+
+**Goal:** Remove `wal.sync_up_to(catalog_lsn)` from `Engine::commit` — the second fsync added
+by item 97 that ran outside the group-commit window, halving INSERT throughput under concurrent load.
+
+**Changes shipped:**
+
+1. `src/catalog.rs` — Added `pub const ROW_COUNT_UNKNOWN: i64 = i64::MIN`. `Catalog::load`
+   calls new `reset_row_counts_unknown()` helper after parsing, resetting all table
+   `row_count` to `ROW_COUNT_UNKNOWN` so COUNT(*) falls back to heap scan after crash.
+
+2. `src/lib.rs` — Removed `wal.sync_up_to(catalog_lsn)` AND `catalog.persist_only()` from
+   `Engine::commit`. Retaining `persist_only()` caused replication regression: it flips
+   `catalog_root` in control file per commit, but without matching fsync the catalog WAL records
+   weren't in the shipped stream → replica gets `SlotOutOfRange`. Fix: in-memory only in commit;
+   checkpoint persists. Added UNKNOWN guard in delta application. Import `ROW_COUNT_UNKNOWN`.
+
+3. `src/sql/query_exec.rs` — Extended item 97 COUNT(*) fast path: when `row_count == UNKNOWN`,
+   falls back to `count_visible` heap scan; caches result via `exclusive()` if handle permits.
+   Import `ROW_COUNT_UNKNOWN`.
+
+4. `tests/crash/main.rs` — Added `p104_catalog_sync_dedup_crash_recovery_count_exact` (4 phases:
+   insert 100 rows + crash, COUNT=100, COUNT=100 again, insert 50 more + COUNT=150). All three
+   COUNT checks use heap scan (UNKNOWN sentinel). 54/54 crash tests PASS.
+
+5. `docs/backlog/104_catalog_sync_dedup.md` — created (SHIPPED status).
+
+6. `docs/backlog/backlog_index.md` — item 104 registered (SHIPPED); "Next new file → 105_…".
+
+7. `PROGRESS.md` — Item 104 entry added.
+
+**Durability contract change:** `row_count` on disk is now checkpoint-granularity (was commit-granularity).
+COUNT(*) is always exact in memory and always exact after crash (via heap scan recalibration).
+
+**Tests:** 54/54 crash PASS. 463/463 lib unit tests PASS (replication tests apply_is_idempotent +
+base_plus_incremental_then_promote now PASS — were failing with just sync_up_to removed). Clippy + fmt clean.
+
+**Performance:** Docker bench pending. Expected ≥ 1.3× INSERT throughput under 32 concurrent writers.
+
+---
+
+### 2026-07-20 — Item 102-B: Covering index INCLUDE columns
+
+**Goal:** `CREATE INDEX ON t (col) INCLUDE (c1, c2, …)` — store include column values in
+B-tree leaf entries so `SELECT col, c1 FROM t WHERE col = val` is served from the leaf without
+calling `deform_row` on the heap tuple. Heap.get() still called for MVCC visibility.
+
+**Changes shipped:**
+
+1. `src/format.rs` — FORMAT_VERSION 11→12.
+
+2. `src/catalog.rs` — `ColumnDef.include_cols: Vec<String>` (`#[serde(default)]`);
+   `set_column_include_cols` method persists include_cols after index build.
+
+3. `src/btree_index.rs` — `Node::Leaf { include_payloads: Vec<Vec<u8>> }` parallel vec;
+   `node_is_insert_safe` takes `include_payload_len: usize` to correctly account for payload overhead;
+   `insert_in_txn_with_include` full crabbing descent with include payload;
+   `insert_with_include`, `insert_many_with_include` (bulk covering build, single mini-txn);
+   `search_with_keys_and_include` → `Vec<(OrderedValue, Vec<u8>, RowId)>`;
+   `redo_index_insert_with_include` (WAL redo with include bytes);
+   `insert` / `insert_in_txn` / `redo_index_insert` all delegate to `_with_include(..., &[])`.
+
+4. `src/wal.rs` — `log_index_insert_with_include`: type-15 record extended with
+   `include_len(4B) | include_bytes`; `log_index_insert` delegates to it with `&[]`.
+
+5. `src/recovery.rs` — WAL_INDEX_INSERT redo block parses `include_len + include_bytes`
+   suffix (zero-length = non-covering, backward-compatible); calls `redo_index_insert_with_include`.
+
+6. `src/sql/parser.rs` — `INCLUDE (cols)` clause; `None => IndexKind::BTree` default
+   (fixes `CREATE INDEX ON t (col) INCLUDE (…)` without USING).
+   `src/sql/logical.rs` — `CreateIndex.include_cols: Vec<String>`.
+
+7. `src/sql/executor.rs` — `IDX_INCLUDE_ROWS: AtomicU64` counter; optimizer extends
+   `index_only` check: `projection ⊆ {key_col} ∪ include_cols`; covering fast path in
+   `try_exec_select_btree` (`search_with_keys_and_include` → `decode_row` → project);
+   `IndexColBatch.{include_cols, include_entries}` for UPDATE covering maintenance;
+   `set_touches_indexed_col` also fires for SET on INCLUDE col (HOT gate);
+   `apply_durable_index_writes` encodes include payload from row values;
+   `exec_create_index` bulk-collects `include_pairs` → `insert_many_with_include`.
+
+8. `tests/item102b_covering_index.rs` (new) — 10 tests: parse_and_build,
+   idx_include_rows_counter, star_projection_heap, non_include_col_heap,
+   update_include_col, delete_row, multi_include_cols, range_predicate,
+   reopen_survives, perf_10k_covering.
+
+9. `tests/item102_index_only_scan.rs` — removed `before==after` counter assertion
+   in `star_projection_uses_heap` (global counter + parallel test runs = flaky);
+   verification now via column count (SELECT * returns all cols → proves heap access).
+
+10. Docfixes: `docs/backlog/102_index_only_scan.md` Status → SHIPPED;
+    `docs/backlog/backlog_index.md` item 102 row updated, Next-up section revised.
+    `PROGRESS.md` — "Item 102-B" entry filed.
+
+**Bugs fixed en route:**
+- `SqlUnsupported("unsupported index type: None")` — `CREATE INDEX ... INCLUDE` without USING.
+- `index out of bounds: len is 1 but index is 1` — `include_payloads` vec not grown before
+  `insert_pos` assignment when vec was empty.
+- `root split without meta latch held` — `node_is_insert_safe` underestimated leaf entry size
+  for covering inserts (fixed by adding `include_payload_len` param).
+- HOT update returning Null — SET on INCLUDE col took HOT path (skips B-tree maintenance).
+- Reopen returning Null — WAL type-15 record didn't carry include bytes; recovery restored empty.
+- Test parallelism flakiness — global `IDX_INCLUDE_ROWS`/`IDX_ONLY_ROWS` counter can increment
+  from concurrent tests; `before==after` assertions changed to correctness checks (column counts,
+  row values) for "must NOT use covering path" cases; "must use covering path" cases still use
+  `after > before` which is safe.
+
+**Test results:** 10/10 new tests PASS. 447 unit + 53 crash = 0 failures. Clippy + fmt clean.
+
+---
+
 
 ### 2026-07-18 — Item 71: Cross-page HOT chains
 

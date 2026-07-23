@@ -79,6 +79,20 @@ here — this file holds the rules that back and extend them.
   durability-cost-dependent. Docker ratios are fair; absolutes are not
   publishable — use native Linux for publishable numbers.
 
+- **Attribute against the SHIPPING default mode — check which mode a knob is actually in before concluding anything.**
+  Item 116 (2026-07-24): a probe flipped `set_deferred_sync(false)` believing
+  it was "bench-identical" and measured THREE fsyncs per INSERT; the engine
+  default (set at open) is commit-time fsync with exactly one — the legacy
+  per-statement mode exists only for the crash harness. Half a night's lever
+  design targeted a mode nothing ships with.
+
+- **`cargo test` is fail-fast per test binary: a green-looking tail is NOT a green suite.**
+  2026-07-24: `cargo test --release | tail` showed the last suites green and
+  exit 0 (the pipe masks cargo's code) while the run had STOPPED at the 11th
+  binary's failure; only `--no-fail-fast` swept all 72 binaries and surfaced
+  two more pre-existing failures. Sweeps must use `--no-fail-fast` and count
+  `test result:` lines against the expected binary count.
+
 ## Process & planning
 
 - **Run Step-0 (audit what already exists, then measure) before implementing any filed design — a backlog file's analysis is a hypothesis, not a work order.**

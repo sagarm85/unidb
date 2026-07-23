@@ -1367,7 +1367,7 @@ impl Engine {
                 );
             }
         }
-        Ok(Self {
+        let engine = Self {
             control,
             page_size: page_size_usize,
             concurrent_sql_writes: std::sync::atomic::AtomicBool::new(env_flag_default_on(
@@ -1422,7 +1422,26 @@ impl Engine {
             hnsw_worker_handle: Mutex::new(None),
             adjacency_cache: AdjacencyCache::from_env(),
             near_lightweight_snaps: AtomicU64::new(0),
-        })
+        };
+        engine.warm_query_path();
+        Ok(engine)
+    }
+
+    /// Item 115: pay the query path's one-time lazy costs at `open`, not
+    /// inside the first user query's timed window. Two cost centers, both
+    /// measured by `tests/perf_item115.rs`: the first SELECT ever planned in
+    /// a process (~230 µs vs ~11 µs steady — sqlparser + logical-plan
+    /// machinery) and the first parallel job dispatch (worker wake +
+    /// per-thread allocator growth). Read-only: no transaction, no WAL
+    /// append, no storage access — safe for replicas and read-only media.
+    /// `UNIDB_WARM_QUERY_PATH=0` disables.
+    fn warm_query_path(&self) {
+        if std::env::var("UNIDB_WARM_QUERY_PATH").as_deref() == Ok("0") {
+            return;
+        }
+        let _ =
+            self.parse_sql_cached("SELECT id, body FROM __unidb_warm__ WHERE k >= 0 AND k < 1000");
+        crate::sql::parallel_scan::warm_pool();
     }
 
     /// Like [`Engine::execute_sql`], but under per-query resource limits (P5.f):
@@ -2068,7 +2087,12 @@ impl Engine {
     // ─────────────────────────────────────────────────────────────────────────
 
     fn execute_sql_inner(&self, xid: Xid, sql: &str) -> Result<Vec<ExecResult>> {
+        use crate::sql::parallel_scan::{
+            Q115_EXEC_NANOS, Q115_PARSE_NANOS, Q115_RLS_NANOS, Q115_STMTS,
+        };
+        let t0 = Instant::now();
         let plans = Arc::unwrap_or_clone(self.parse_sql_cached(sql)?);
+        Q115_PARSE_NANOS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         // Snapshot the catalog root so DDL (which the catalog persists
         // immediately, not on user-txn commit) from earlier statements of a
         // multi-statement request can be rolled back if a later one fails
@@ -2081,10 +2105,16 @@ impl Engine {
             // because the embedded/superuser path has no user identity to
             // substitute — a CurrentUser policy would evaluate to Null and
             // block all rows, which is the wrong behavior for a superuser.
+            let t1 = Instant::now();
             let plan = apply_rls_skip_current_user(plan, &cat_read(&self.catalog));
+            Q115_RLS_NANOS.fetch_add(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
             let dml_table = plan_dml_table(&plan).map(|s| s.to_owned());
             let is_ddl = plan_is_schema_ddl(&plan);
-            match self.execute_one_plan(xid, plan) {
+            Q115_STMTS.fetch_add(1, Ordering::Relaxed);
+            let t2 = Instant::now();
+            let one = self.execute_one_plan(xid, plan);
+            Q115_EXEC_NANOS.fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            match one {
                 Ok(result) => {
                     self.note_dml_result(&result, dml_table.as_deref());
                     if is_ddl {
@@ -3648,11 +3678,16 @@ impl Engine {
     /// the error — so the caller just sees `SerializationFailure` on a fully
     /// cleaned-up transaction, and should retry.
     pub fn commit(&self, xid: Xid) -> Result<()> {
+        use crate::sql::parallel_scan::{
+            Q116_COMMITS, Q116_POST_NANOS, Q116_SYNC_NANOS, Q116_TXNMGR_NANOS,
+        };
         // Item 97: drain deferred row-count deltas BEFORE committing (commit
         // removes `xid` from the active-transaction map). Empty for read-only
         // or DDL-only transactions.
         let row_count_deltas = self.txn_mgr.take_row_count_deltas(xid);
 
+        Q116_COMMITS.fetch_add(1, Ordering::Relaxed);
+        let t0 = Instant::now();
         let commit_lsn = match self.txn_mgr.commit(xid, &self.wal, &self.lock_mgr) {
             Err(DbError::SerializationFailure { xid }) => {
                 self.abort(xid)?;
@@ -3661,6 +3696,8 @@ impl Engine {
             Err(e) => return Err(e),
             Ok(lsn) => lsn,
         };
+        Q116_TXNMGR_NANOS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let t1 = Instant::now();
         // Group commit (P5.e-3): force this transaction's commit record durable
         // before returning, coalescing with any concurrent committers behind a
         // single fsync. In the default (non-deferred) mode `commit_user_txn`
@@ -3670,12 +3707,16 @@ impl Engine {
         // A read-only transaction (`None`) wrote no commit record and skips it.
         if let Some(lsn) = commit_lsn {
             self.wal.sync_up_to(lsn)?;
+            Q116_SYNC_NANOS.fetch_add(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
             // R1 (item 28): record a (timestamp, LSN) mark for time-based PITR.
             // Done after WAL sync so the LSN is durable before the mark is written.
             // Time is advisory; a write failure is logged but never blocks a commit.
             self.timeline
                 .record(crate::backup::timeline::now_micros(), lsn);
+        } else {
+            Q116_SYNC_NANOS.fetch_add(t1.elapsed().as_nanos() as u64, Ordering::Relaxed);
         }
+        let t2 = Instant::now();
 
         // Item 97: apply row-count deltas now that the transaction is committed
         // and WAL-durable. The delta is applied to the in-memory catalog only.
@@ -3723,6 +3764,7 @@ impl Engine {
         // auto-checkpoint if a trigger has fired.
         self.maybe_auto_checkpoint()?;
         self.commits.fetch_add(1, Ordering::Relaxed); // P6.g stat
+        Q116_POST_NANOS.fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
         Ok(())
     }
 

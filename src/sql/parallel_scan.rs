@@ -93,6 +93,42 @@ pub static Q109_PAR_QUERIES: AtomicU64 = AtomicU64::new(0);
 pub static Q109_LAST_DEGREE: AtomicU64 = AtomicU64::new(0);
 pub static Q109_FETCH_ONLY: AtomicBool = AtomicBool::new(false);
 
+// Item 115 phase timers — the statement-level split above the executor:
+// parse+plan (`parse_sql_cached`, cache miss = full sqlparser + plan build),
+// RLS rewrite (`apply_rls_skip_current_user`, pays a catalog read-clone), and
+// plan execution (`execute_one_plan`, whose interior the Q109 counters split
+// further). Permanent, same rationale as the item-92 NEAR phase timers: the
+// two `Instant` reads per phase are ~40 ns against a µs-scale statement.
+pub static Q115_PARSE_NANOS: AtomicU64 = AtomicU64::new(0);
+pub static Q115_RLS_NANOS: AtomicU64 = AtomicU64::new(0);
+pub static Q115_EXEC_NANOS: AtomicU64 = AtomicU64::new(0);
+pub static Q115_STMTS: AtomicU64 = AtomicU64::new(0);
+
+/// Reset the item-115 statement-phase counters (test harness).
+pub fn item115_reset() {
+    Q115_PARSE_NANOS.store(0, Ordering::Relaxed);
+    Q115_RLS_NANOS.store(0, Ordering::Relaxed);
+    Q115_EXEC_NANOS.store(0, Ordering::Relaxed);
+    Q115_STMTS.store(0, Ordering::Relaxed);
+}
+
+// Item 116 commit-phase timers — the split inside `Engine::commit`:
+// txn-manager commit (undo drop + WAL_TXN_COMMIT append + lock release),
+// the group-commit `sync_up_to` (fsync wait + leader coordination), and the
+// post-commit bookkeeping (timeline mark, row-count deltas, event wake).
+pub static Q116_TXNMGR_NANOS: AtomicU64 = AtomicU64::new(0);
+pub static Q116_SYNC_NANOS: AtomicU64 = AtomicU64::new(0);
+pub static Q116_POST_NANOS: AtomicU64 = AtomicU64::new(0);
+pub static Q116_COMMITS: AtomicU64 = AtomicU64::new(0);
+
+/// Reset the item-116 commit-phase counters (test harness).
+pub fn item116_reset() {
+    Q116_TXNMGR_NANOS.store(0, Ordering::Relaxed);
+    Q116_SYNC_NANOS.store(0, Ordering::Relaxed);
+    Q116_POST_NANOS.store(0, Ordering::Relaxed);
+    Q116_COMMITS.store(0, Ordering::Relaxed);
+}
+
 /// Reset the item-109 probe counters (test harness).
 pub fn item109_reset() {
     Q109_LEAF_NANOS.store(0, Ordering::Relaxed);
@@ -383,6 +419,35 @@ pub fn acquire(n_units: usize) -> Option<WorkerLease> {
         SERIAL_FALLBACKS.fetch_add(1, Ordering::Relaxed);
         None
     }
+}
+
+/// Item 115: warm the parallel dispatch path at engine open.
+///
+/// The first parallel job an engine ever dispatches pays one-time costs that
+/// otherwise land inside the first user query's timed window: the first
+/// cond-var wake of each parked worker and each worker thread's first
+/// allocator-arena growth. This dispatches one no-op job (with a small
+/// per-worker allocation to warm the arena) and returns; read-only, no WAL,
+/// no storage access. Skipped when the pool is disabled or single-core.
+pub(crate) fn warm_pool() {
+    init_from_env();
+    // Bypass the page threshold — ask for a modest degree directly.
+    let want = cores().min(8);
+    if want < 2 || !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let granted = take_from_pool(want);
+    if granted < 2 {
+        if granted > 0 {
+            AVAILABLE.fetch_add(granted, Ordering::Relaxed);
+        }
+        return;
+    }
+    run_in_pool(granted, || {
+        let buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+        std::hint::black_box(&buf);
+    });
+    AVAILABLE.fetch_add(granted, Ordering::Relaxed);
 }
 
 pub fn set_enabled(on: bool) {
