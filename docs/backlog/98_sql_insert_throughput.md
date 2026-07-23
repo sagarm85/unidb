@@ -1,5 +1,5 @@
 **Type:** Performance
-**Status:** ⏳ NOT STARTED
+**Status:** ✅ SHIPPED 2026-07-19 (PRs #157+#159) — `InsertAccum` streaming accumulation: one WAL_BEGIN+COMMIT per VALUES statement, UNIQUE enforcement preserved. See `backlog_index.md` row 98 / PROGRESS.md "Item 98". _(Header corrected 2026-07-22 — was never flipped at ship time.)_
 
 # Item 98 — /sql INSERT throughput: 127 rows/sec → competitive via statement batching
 

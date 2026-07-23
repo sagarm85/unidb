@@ -1,10 +1,15 @@
 # 107 — Async HNSW maintenance on the commit path (restore W4 ≈ W0)
 
 **Type:** Performance
-**Status:** 🚧 IN PROGRESS 2026-07-22 — Step-0 audit complete (see below);
-wiring implemented on `perf/item-107-async-hnsw-wiring`; freshness contract
+**Status:** ✅ SHIPPED 2026-07-22 (PR #196, merged) — Step-0 audit found the
+item-67 async worker existed but nothing spawned it (server and bench both
+took the sync fallback — the source of the measured W4/W0 96×);
+`EngineHandle::spawn` now activates it on served engines. Freshness contract
 **(a)** signed off by user 2026-07-22 (documented bounded lag + queue-depth
-metric; hybrid tail-scan rejected for now). Docker re-measure pending.
+gauge `unidb_hnsw_queue_depth`; hybrid tail-scan rejected for now); bench
+drain-accounting added. Remaining follow-up: fresh full Docker bench on main
+to officially record the W4/W0 ladder collapse (tracked in `backlog_index.md`
+"Next up"). See PROGRESS.md "Item 107".
 
 ## Problem — the headline multi-model thesis is currently broken
 

@@ -1,5 +1,5 @@
 **Type:** Performance
-**Status:** 🔄 IN PROGRESS (branch `62-ivf-scale-validation`) — bench run complete; PR pending
+**Status:** ✅ SHIPPED 2026-07-17 (PR #145 MERGED) — IVF recall@10/latency bench at 1k/10k/100k; recall=0.421 at 100k unlocks item 63 gate. See `backlog_index.md` row 62 / PROGRESS.md. _(Header corrected 2026-07-22 — was never flipped at ship time.)_
 
 ## Summary
 

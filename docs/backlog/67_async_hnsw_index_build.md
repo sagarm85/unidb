@@ -1,5 +1,5 @@
 **Type:** Performance
-**Status:** 📋 PLANNED 2026-07-18
+**Status:** ✅ SHIPPED 2026-07-20 (PR #171) — `HnswWorker` background thread + `ExecCtx.hnsw_tx`; graph-stitching decoupled from the commit critical path. Note: nothing spawned the worker on served engines until item 107 (2026-07-22, PR #196) activated it. See `backlog_index.md` row 67 / PROGRESS.md. _(Header corrected 2026-07-22 — was never flipped at ship time.)_
 
 # Item 67 — Async HNSW index build (decouple from commit critical path)
 

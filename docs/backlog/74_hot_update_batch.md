@@ -1,7 +1,7 @@
 # Batch mini-txn for HOT UPDATE
 
 **Type:** Performance
-**Status:** IN PROGRESS
+**Status:** ✅ SHIPPED (commit 4dd81ac) — hot_update_many Phase B+A; covered by the items 75–84 Docker bench (UPDATE HOT 453k rec/s / 0.62× vs PG). See `backlog_index.md` row 74 / PROGRESS.md items 75–84. _(Header corrected 2026-07-22 — was never flipped at ship time.)_
 
 ## Problem
 

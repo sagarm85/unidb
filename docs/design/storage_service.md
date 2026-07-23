@@ -2,8 +2,10 @@
 
 **Backlog item:** [`23_storage_service.md`](../backlog/23_storage_service.md)
 **Depends on:** item 20 (dispatcher/outbox — `unidb-dispatch`), P3.d LOBs.
-**Status:** committed first (2026-07-13), ahead of implementation, per the item-23
-task brief ("justify the crate choice … in a short design note committed first").
+**Status:** SHIPPED — committed first (2026-07-13) ahead of implementation, per
+the item-23 task brief ("justify the crate choice … in a short design note
+committed first"); implementation then landed as item 23 (engine/MinIO tiering,
+2026-07-13) + item 31 (`/storage/*` HTTP routes, 2026-07-14). See `PROGRESS.md`.
 
 This note records the two decisions the brief calls "landmines to decide up
 front": the **S3 client crate**, and **how the outbox uploader/reconciler is

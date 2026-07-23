@@ -980,6 +980,31 @@ environment variable (absent or `0` = disabled, the default).
 
 ---
 
+### `PUT /config/group_commit_window_us` (item 101)
+
+**Superuser-gated** (same gate as `PUT /config/slow_query_threshold_ms`).
+Updates the WAL group-commit dwell window at runtime without a server restart.
+
+**Request body:**
+```json
+{ "value": 500 }
+```
+
+`value: 0` disables the window (the default — every commit fsyncs
+immediately). A positive value (microseconds, e.g. `500`) makes the
+flush-lock leader sleep that long before fsyncing, giving concurrent
+committers time to coalesce into a single fsync. This trades a small
+per-commit latency floor for higher commit throughput under concurrency;
+leave it at `0` for single-connection or latency-sensitive workloads.
+
+The window can also be set at engine open via the
+`UNIDB_GROUP_COMMIT_WINDOW_US` environment variable (absent or `0` =
+disabled, the default).
+
+**Response** `204 No Content`.
+
+---
+
 ### `GET /logs` (item 22)
 
 **Superuser-gated.** A bounded, cursor-paged tail over the rotated JSON log

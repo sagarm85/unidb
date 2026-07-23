@@ -12,6 +12,20 @@
 
 ## Current status
 
+- **2026-07-22 docs audit session — full `docs/` + README staleness sweep and repair (no code changes).**
+  Root cause found: content sections got patched at ship time but cross-cutting scaffolding didn't —
+  23 backlog status corrections (index rows 107/109/110/111 were behind their files; 19 file headers
+  behind their index rows), `engine_design.md` FORMAT_VERSION 8→12 + IVF/HNSW contradictions + module
+  map + §12 gap registry, ops_runbook log-pruning claim (server DOES prune, `UNIDB_LOG_RETAIN_DAYS`=7)
+  + new autovacuum section, access-guide/sql-reference "not supported" lists corrected (6 shipped
+  features; CTEs and JOIN ON were wrongly denied; INCLUDE documented; verifier 33/33), README perf
+  tables refreshed to the official 07-21 report, positioning.md brought to post-Phase-6 reality,
+  documentation_index rebuilt by audience, `docs/performance/README.md` added (authoritative report =
+  `report_20260721_035629.md`), orphan duplicate-ID backlog file renumbered → **item 113** (FK error
+  direction, still live), empty `engine_internals_doc_prompt.md` given honest content.
+  **New guard: `scripts/lint_backlog.sh`** — cross-checks every numbered file's Status header vs its
+  registry row + orphan/duplicate-ID detection; clean pass (89 files). Run it before any docs push.
+
 - **2026-07-22 session complete — items 110, 111 shipped + merged; item 112 filed (parked).**
   110 (#198): RLS+LIMIT crash — `current_user` was destroyed by the QuerySpec policy
   conversion's `Bool(true)` fallback (leak hazard in Bool-typechecking shapes, crash here);

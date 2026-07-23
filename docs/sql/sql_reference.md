@@ -6,10 +6,11 @@
 > unidb speaks a **practical subset** of SQL (not full ANSI) plus a few
 > engine-specific extensions — vector search (`NEAR`, `VECTOR(n)`),
 > full-text (`MATCH`), a Cypher subset for graph, and Supabase-style
-> row-level security. Every example on this page is executed against the engine
-> by `examples/verify_sql_reference.rs` before release, so the syntax here is
-> what the parser actually accepts. When this page and the code disagree, the
-> code wins — please file it.
+> row-level security. Representative examples from each command family are
+> executed against the engine by `examples/verify_sql_reference.rs` before
+> release (one statement per family — not every literal example on the page),
+> so the core syntax here is what the parser actually accepts. When this page
+> and the code disagree, the code wins — please file it.
 
 **Entry points (important):** most statements run through the embedded
 `Engine::execute_sql(xid, sql)` or `POST /sql`. Two families use different
@@ -45,6 +46,7 @@ paths:
 [JOIN](#join) ·
 [GROUP BY](#group-by) ·
 [ORDER BY](#order-by) ·
+[WITH (CTEs)](#with-common-table-expressions) ·
 [EXPLAIN](#explain)
 
 **Search &amp; graph** ·
@@ -67,10 +69,10 @@ paths:
 
 | Command | Status | Notes |
 |---|---|---|
-| `SELECT` (`WHERE`, `JOIN … USING`, `GROUP BY`, `ORDER BY`, aggregates) | ✅ Supported | `ORDER BY` accepts output columns, 1-based positions, and non-projected expressions (G4) |
+| `SELECT` (`WHERE`, `JOIN … USING`/`ON`, `GROUP BY`, `ORDER BY`, aggregates) | ✅ Supported | `ORDER BY` accepts output columns, 1-based positions, and non-projected expressions (G4) |
 | `INSERT` / `UPDATE` / `DELETE` (+ `RETURNING`) | ✅ Supported | multi-row `VALUES`; batched WAL |
 | `CREATE TABLE` (`PRIMARY KEY`, `UNIQUE`, `REFERENCES`, `VECTOR(n)`) | ✅ Supported | practical column-constraint subset |
-| `CREATE INDEX … USING BTREE \| HNSW \| FULLTEXT` | ✅ Supported | HNSW = vector; FULLTEXT = inverted index |
+| `CREATE INDEX … USING BTREE \| HNSW \| FULLTEXT` (+ `INCLUDE (cols)` on BTREE) | ✅ Supported | HNSW = vector; FULLTEXT = inverted index; `INCLUDE` = covering B-tree (item 102-B) |
 | `ALTER TABLE ADD/DROP COLUMN`, `DROP TABLE`, `TRUNCATE`, `ANALYZE`, `EXPLAIN` | ✅ Supported | |
 | `NEAR(col, vec, k)` vector search · `MATCH(col, 'terms')` full-text | ✅ Supported | engine extensions |
 | `MATCH (a)-[:TYPE]->(b) … RETURN` | ✅ Supported (read-only, Cypher subset) | via `execute_cypher`; edges written via the embedded `create_edge` API |
@@ -84,7 +86,8 @@ paths:
 | `LIKE` / `NOT LIKE` / `ILIKE` | ✅ Supported | delivered under item 30 |
 | `FULL OUTER JOIN` (on equi-condition or `USING`) | ✅ Supported | G2-join shipped; `USING` columns emit `COALESCE(left.col, right.col)`; routed through sort-merge join |
 | `NATURAL JOIN` / `NATURAL LEFT JOIN` | ✅ Supported | G-NATURAL shipped; desugars to `USING` over shared column names; disjoint schemas → CROSS JOIN |
-| CTEs (`WITH`), recursive CTEs, frame-based (cumulative) window functions | ❌ Not yet | tracked in `19_sql_surface_gaps.md` |
+| Plain (non-recursive) CTEs (`WITH <name> AS (…)`) | ✅ Supported | materialized once, may be referenced multiple times _(corrected 2026-07-22: previously mislisted as not-yet)_ |
+| Recursive CTEs (`WITH RECURSIVE`), frame-based (cumulative) window functions | ❌ Not yet | tracked in `19_sql_surface_gaps.md` |
 
 ---
 
@@ -127,7 +130,8 @@ CREATE TABLE docs (id INT, body TEXT, embedding VECTOR(4));
 Create a secondary index. The `USING` clause selects the index engine.
 
 ```sql
-CREATE INDEX [<name>] ON <table> USING BTREE    (<col>);   -- range / equality
+CREATE INDEX [<name>] ON <table> USING BTREE    (<col>)    -- range / equality
+                                 [INCLUDE (<col> [, ...])]; -- covering B-tree
 CREATE INDEX [<name>] ON <table> USING HNSW     (<col>);   -- vector similarity
 CREATE INDEX [<name>] ON <table> USING FULLTEXT (<col>);   -- full-text (inverted)
 ```
@@ -135,6 +139,7 @@ CREATE INDEX [<name>] ON <table> USING FULLTEXT (<col>);   -- full-text (inverte
 **Example**
 ```sql
 CREATE INDEX idx_status ON orders USING BTREE (status);
+CREATE INDEX idx_cover  ON orders USING BTREE (status) INCLUDE (amount);
 CREATE INDEX idx_body   ON docs   USING FULLTEXT (body);
 CREATE INDEX idx_emb    ON docs   USING HNSW (embedding);
 ```
@@ -142,6 +147,13 @@ CREATE INDEX idx_emb    ON docs   USING HNSW (embedding);
 > `USING HNSW` builds the vector similarity index that powers [`NEAR`](#near-vector-search);
 > `USING FULLTEXT` builds the inverted index that powers [`MATCH`](#match-full-text-search).
 > Index build uses sort-then-bulk-load (one durable transaction).
+>
+> `INCLUDE (<cols>)` (item 102-B) makes a **covering** B-tree: the listed
+> columns are stored inline in the index leaf, so a query that projects only
+> the key column plus INCLUDE columns is answered index-only, with no heap
+> fetch. Omitting `USING` with an `INCLUDE` clause defaults to BTREE
+> (PostgreSQL behaviour); `INCLUDE` is meaningful for BTREE only — HNSW and
+> FULLTEXT ignore it. Indexes take exactly one key column.
 
 ## ALTER TABLE
 
@@ -253,7 +265,7 @@ DELETE FROM orders WHERE id = 10 RETURNING id, status;
 ```sql
 SELECT <col> [, ...] | * | COUNT(*) | <agg>(<col>)
 FROM <table>
-[JOIN <table> USING (<col> [, ...])]
+[JOIN <table> USING (<col> [, ...]) | ON <condition>]
 [WHERE <predicate>]
 [GROUP BY <col> [, ...]]
 [ORDER BY <col | position>]
@@ -284,33 +296,40 @@ SELECT * FROM customers WHERE id = 1 AND active = true;
 
 ## JOIN
 
-Equi-join on shared column name(s) with `USING`.
+Equi-join on shared column name(s) with `USING`, or on an explicit `ON`
+condition.
 
 ```sql
 SELECT <cols> FROM <left> JOIN <right> USING (<col> [, ...]);
+SELECT <cols> FROM <left> JOIN <right> ON <condition>;
 ```
 
 **Example**
 ```sql
 SELECT * FROM orders JOIN customers USING (id);
+SELECT * FROM orders JOIN customers ON orders.customer_id = customers.id;
 ```
 
 > The planner picks a hash join, merge join, or index-nested-loop join based on
-> statistics. (`ON <expr>` join syntax is not part of the v1 subset — use `USING`.)
+> statistics. _(Corrected 2026-07-22: an earlier revision claimed `ON <expr>`
+> join syntax was not part of the v1 subset — `JOIN … ON` is supported.)_
 
 ## GROUP BY
 
 ```sql
-SELECT <col>, <agg>(*) FROM <table> GROUP BY <col> [, ...];
+SELECT <col>, <agg>(*) FROM <table> GROUP BY <col> [, ...] [HAVING <predicate>];
 ```
 
 **Example**
 ```sql
 SELECT status, COUNT(*) FROM orders GROUP BY status;
+SELECT status, COUNT(*) FROM orders GROUP BY status HAVING COUNT(*) > 1;
 ```
 
 > Grouped aggregation is pushed into parallel scan workers (partial aggregates).
-> `GROUP BY ALL` and `HAVING` are not in the v1 subset.
+> `GROUP BY ALL` is not in the v1 subset. _(Corrected 2026-07-22: an earlier
+> revision also listed `HAVING` as unsupported — `HAVING`, including aggregate
+> predicates, is supported.)_
 
 ## ORDER BY
 
@@ -326,6 +345,28 @@ SELECT <cols> FROM <table> ORDER BY <output-col | position>;
 SELECT name FROM customers ORDER BY id;
 SELECT name, id FROM customers ORDER BY 2;
 ```
+
+## WITH (common table expressions)
+
+Plain (non-recursive) CTEs: name a subquery once, then reference it — possibly
+more than once — from the main query.
+
+```sql
+WITH <name> AS (<select>) [, ...]
+SELECT <cols> FROM <name> [JOIN ...] ...;
+```
+
+**Example**
+```sql
+WITH open_orders AS (SELECT id, customer_id FROM orders WHERE status = 'open')
+SELECT customers.name FROM customers
+JOIN open_orders ON customers.id = open_orders.customer_id;
+```
+
+> Each CTE is materialized once and may be referenced under multiple aliases
+> (e.g. a self-join on the CTE). `WITH RECURSIVE` is **not** supported —
+> tracked in `19_sql_surface_gaps.md`. _(Added 2026-07-22: plain CTEs were
+> previously mislisted as unsupported.)_
 
 ## EXPLAIN
 

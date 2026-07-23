@@ -26,7 +26,8 @@ UNIDB_TLS_KEY=/etc/unidb/server.key \
 - `UNIDB_JWT_SECRET` is **required** (verify-only JWT; no default).
 - Stop with `SIGINT`/`Ctrl-C` — graceful drain of in-flight requests (HTTP mode).
 - The data directory holds `control`, `data.db`, `db.wal/` (segment dir),
-  `slots.json`, `roles.json`, `audit.log`.
+  `slots.json`, `roles.json`, `audit.log`, and `timeline.bin` (the PITR time
+  index — see §9).
 
 ## 2. WAL & checkpoints (P6.a)
 
@@ -36,6 +37,17 @@ UNIDB_TLS_KEY=/etc/unidb/server.key \
   `UNIDB_CHECKPOINT_TIMEOUT_SECS`, `UNIDB_MAX_WAL_SIZE_BYTES`), or force one:
   `POST /checkpoint`.
 - Truncation deletes whole consumed segments, held back by replication slots.
+- **Slot retention cap:** a stale/abandoned slot cannot pin the WAL without
+  bound — retention is capped at **10 GiB** by default
+  (`UNIDB_MAX_WAL_RETAIN_BYTES`). A slot lagging beyond the cap is clamped
+  (WARN logged) and the WAL truncates past it; drop and recreate the slot to
+  resume streaming from the new floor.
+- **Group-commit dwell window** (item 101): `UNIDB_GROUP_COMMIT_WINDOW_US`
+  (default `0` = off) makes the flush-lock leader wait that many µs before
+  fsync so concurrent committers share one fsync — trades a little per-commit
+  latency for higher concurrent-commit throughput. Tunable at runtime via
+  `PUT /config/group_commit_window_us`; leave at 0 for latency-sensitive,
+  low-concurrency workloads.
 
 ## 3. Backups + PITR (P6.d)
 
@@ -49,8 +61,10 @@ unidb::backup::restore(base, archive, dest, Some(lsn))?;   // PITR by LSN
 ```
 
 - **Drill:** `base_backup` → keep archiving the WAL → to restore, `restore(...)`
-  into a fresh dir, then `Engine::open` it. PITR is **by LSN** in v1 (time-based
-  PITR is a follow-up — commit timestamps aren't in the WAL yet).
+  into a fresh dir, then `Engine::open` it. PITR targets an **LSN** (above) or a
+  **wall-clock time** via `Engine::restore_to_time` — see §9. _(Corrected
+  2026-07-22: this line used to call time-based PITR a follow-up; it shipped as
+  item 28 via the side timeline index, no WAL-format change.)_
 - Take base backups regularly (roll-forward reconstructs pages present in the
   base; see the P6.c/P6.d fresh-page note).
 
@@ -98,6 +112,10 @@ REVOKE reader FROM analyst;
   superuser (backward compatible). Auth DDL + schema DDL require superuser.
 - All auth DDL and named-user access decisions are written to `audit.log`
   (one JSON line each).
+- **Dev-only login (item 100):** `UNIDB_DEV_LOGIN=1` enables
+  `POST /auth/login` — **passwordless** token issuance for local dev/demo
+  only. It logs a WARN at startup for a reason: **never set it in
+  production.** Absent (the default), the server stays verify-only.
 
 ## 6. Security (P6.f)
 
@@ -115,7 +133,9 @@ REVOKE reader FROM analyst;
   `max_replication_lag`, `data_pages`, `recent_slow_queries`.
 - **Slow-query log:** `Engine::set_slow_query_threshold(Duration)`; slower
   statements are `tracing::warn`ed (tagged with `txn_id`/`request_id`) and kept
-  in the bounded ring shown by `/stats`.
+  in the bounded ring shown by `/stats`. On the server, set it at startup with
+  `UNIDB_SLOW_QUERY_MS=<ms>` (item 34; `0`/absent = disabled) or at runtime via
+  `PUT /config/slow_query_threshold_ms`.
 - `EXPLAIN` / `EXPLAIN ANALYZE <query>` for plan diagnosis (P4.e).
 
 ## 8. Logs — JSON lines, correlation ids, shipping (item 22)
@@ -167,8 +187,17 @@ scrape_configs:
     pipeline_stages: [{ json: { expressions: { level: level, request_id: request_id, txn_id: txn_id } } }]
 ```
 
-- **Rotation & retention** are `tracing-appender`'s daily files; unidb does not
-  prune them — let the log agent (or logrotate) own deletion after shipping.
+- **Rotation & retention:** rotation is `tracing-appender`'s daily files;
+  **the server prunes them itself at startup** — `unidb.log.*` files older
+  than `UNIDB_LOG_RETAIN_DAYS` (default **7**) are deleted before the new
+  appender starts; set `0` to disable pruning entirely. _(Corrected
+  2026-07-22: this bullet used to say unidb never prunes and to let the
+  agent/logrotate own deletion — false since the retention cleanup landed in
+  `unidb-server` startup.)_ **Operator risk:** if your shipping agent lags
+  more than the retain window (agent down for a week, backlog on a slow
+  link), day-7 files are deleted **before being shipped**. Either raise
+  `UNIDB_LOG_RETAIN_DAYS`, or set it to `0` and let logrotate/the agent own
+  deletion as before.
 - Put `UNIDB_LOG_DIR` on its own volume if log volume competes with data I/O.
 - Both stdout and the files are JSON, so a `docker logs`/journald → agent path
   works identically to tailing the files.
@@ -256,3 +285,40 @@ logical-replication subscriber setup. The key invariants are:
 - Offset is durably stored in `__consumers__` on the primary — the subscriber
   resumes from the correct position after a primary restart.
 - Target schema must be pre-created; the logical replicator applies DML only.
+
+---
+
+## 10. Vacuum & autovacuum (bloat management)
+
+UPDATE/DELETE never overwrite in place — MVCC inserts new versions, so churn
+leaves dead versions behind. Unreclaimed bloat degrades point reads (measured
+6.8 → 35 µs under 30× update churn pre-autovacuum). Vacuum reclaims dead
+versions; **autovacuum** (a background thread, default **on**) auto-triggers it
+per table with Postgres's policy: vacuum when
+`dead > threshold + scale_factor × live`.
+
+**Knobs (env, read at `Engine::open`):**
+
+| Var | Default | Meaning |
+|---|---|---|
+| `UNIDB_AUTOVACUUM_ENABLED` | on (`0` disables) | Master switch for the background launcher. |
+| `UNIDB_AUTOVACUUM_NAPTIME_SECS` | `60` | Sleep between policy checks. |
+| `UNIDB_AUTOVACUUM_THRESHOLD` | `50` | Minimum dead tuples before a vacuum is considered. |
+| `UNIDB_AUTOVACUUM_SCALE_FACTOR` | `0.2` | Fraction of live tuples added to the threshold (bigger tables tolerate more churn). |
+| `UNIDB_VACUUM_COST_ENABLED` | on (`0` disables) | Cost budget (item 27 V3, mirrors Postgres `vacuum_cost_*`): background passes nap 2 ms every 200 cost units (page read = 1, page compacted = 20), bounding vacuum I/O on a busy system. |
+
+**What to watch (`GET /metrics`):**
+
+- `unidb_dead_tuple_estimate` climbing while `unidb_autovacuum_runs_total`
+  stays flat → the trigger is too lax for your churn: lower
+  `UNIDB_AUTOVACUUM_SCALE_FACTOR` (e.g. 0.05) or the naptime.
+- `unidb_horizon_age_seconds` — **the bloat-risk gauge; alert on it.** Vacuum
+  cannot reclaim behind the visibility horizon, which is pinned by long-lived
+  transactions/`ReadHandle`s and lagging replication slots. If it grows, no
+  autovacuum tuning helps — find and end the pinner (see §4 stuck slots).
+- Autovacuum runs slowing foreground work → keep `UNIDB_VACUUM_COST_ENABLED`
+  on (throttles I/O); it defaults on.
+
+**Manual escape hatches:** `Engine::vacuum()` (whole DB) and
+`Engine::vacuum_table(name)` (one table, item 27) — same reclamation the
+launcher fires, safe to run any time.

@@ -1,5 +1,5 @@
 **Type:** Performance
-**Status:** ⏳ NOT STARTED
+**Status:** ✅ SHIPPED 2026-07-19 (PR #156) — 1,024-entry LRU plan cache keyed by `(sql_hash, schema_epoch)`; 537–891× speedup on repeated same-SQL. See `backlog_index.md` row 96 / PROGRESS.md "Item 96". _(Header corrected 2026-07-22 — was never flipped at ship time.)_
 
 # Item 96 — Query plan cache: parse + compile once per unique SQL
 

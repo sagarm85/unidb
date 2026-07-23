@@ -1,7 +1,7 @@
 # True replaced-stack benchmark (Postgres + Redpanda, two separate processes)
 
 **Type:** Performance
-**Status:** IN PROGRESS
+**Status:** ✅ SHIPPED 2026-07-17 (PR #144 MERGED) — true replaced-stack benchmark vs Postgres (row + pgvector + graph adjacency) + Redpanda in Docker; Table 4.1 gated on `MM_REPLACED_STACK_REALISTIC=1`. See `backlog_index.md` row 61 / PROGRESS.md. _(Header corrected 2026-07-22 — was never flipped at ship time.)_
 
 ## Context
 

@@ -1,7 +1,14 @@
-# FK constraint error message uses wrong direction on parent DELETE
+# 113 — FK constraint error message uses wrong direction on parent DELETE
 
-**Type:** Bug (UX / error messaging)
-**Status:** OPEN
+**Type:** Improvement
+**Status:** ⏳ NOT STARTED
+
+> _Housekeeping note (2026-07-22): this file was originally committed as
+> `42_fk_error_message_direction.md` — an unregistered duplicate of ID 42
+> (`42_bench_harness_buffer_pool.md`) with a non-standard Type/Status header.
+> Renumbered to the next free stable ID (113) and registered in
+> `backlog_index.md`; content unchanged below. The bug is still live:
+> `src/error.rs::fk_violation_msg` has only the child-direction message shape._
 
 ## Problem
 

@@ -6,8 +6,15 @@
 >
 > Mermaid diagrams are rendered natively by GitHub.
 
-**Engine state:** `FORMAT_VERSION` 11 · crash harness 51 points · all four data
-models shipped · items 71–99 incorporated.
+**Engine state (as written):** `FORMAT_VERSION` 11 · crash harness 51 points ·
+all four data models shipped · items 71–99 incorporated.
+**Staleness notice (2026-07-22):** the engine has moved on since this
+collection was written — `FORMAT_VERSION` is now **12** (item 102-B covering
+`INCLUDE` indexes; `src/format.rs`), and items **100–111** (JWT dev login,
+group commit, index-only/covering scans, catalog fsync dedup, async-HNSW
+activation, page-cached B-tree resolution, RLS+LIMIT fix, information_schema
+grant filtering, …) are **not yet folded in**. Statuses in `PROGRESS.md` /
+`docs/backlog/backlog_index.md` win where they disagree with these pages.
 
 ---
 

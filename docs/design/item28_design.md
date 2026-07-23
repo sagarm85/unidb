@@ -1,6 +1,7 @@
 # Item 28 — Design Decisions: Time-based PITR (R1) + Logical Replication (R2)
 
-> Committed before code. Last updated 2026-07-13.
+> Committed before code. Last updated 2026-07-13 (shipped 2026-07-13 — R1 + R2;
+> see `PROGRESS.md`).
 
 ---
 

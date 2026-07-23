@@ -1,5 +1,5 @@
 **Type:** Performance
-**Status:** ⏳ NOT STARTED
+**Status:** ✅ SHIPPED 2026-07-20 (PR #171) — lazy txn-state cache in tuple header flags; SELECT filtered 0.55→0.74× PG (+35%). See `backlog_index.md` row 68 / PROGRESS.md. _(Header corrected 2026-07-22 — was never flipped at ship time.)_
 
 # Item 68 — Hint bits
 

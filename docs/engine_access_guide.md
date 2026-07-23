@@ -57,6 +57,25 @@ engine.commit(xid)?;
 The embedded crate is the primary interface; there is no auth — you hold the
 `Engine`, you have access. One `Engine` owns one data directory (one database).
 
+Beyond `execute_sql`, three sibling entry points cover the other access tasks:
+
+- **`engine.execute_sql_as(user, xid, sql)`** — run SQL **as** a named user
+  (`user: Option<&str>`; `None` = the implicit superuser, so `execute_sql` is
+  exactly `execute_sql_as(None, ..)`). Enforces per-table privileges and RLS
+  for the named user, and is the **required** entry point for auth DDL
+  (`CREATE USER`/`ROLE`, `GRANT`/`REVOKE`, `CREATE POLICY`) — those statements
+  are intercepted here, not by the plain SQL executor.
+- **`engine.execute_cypher(xid, query)`** — graph reads
+  (`MATCH (a)-[:TYPE]->(b) WHERE … RETURN …`). The Cypher subset has its own
+  entry point; it does not go through `execute_sql`.
+- **`engine.read_handle()` → `ReadHandle::execute_sql(sql)` /
+  `ReadHandle::execute_sql_as(user, sql)`** (item 103) — a cloneable,
+  `Send + Sync` handle for **read-only** statements that run concurrently with
+  the writer and with each other, coordinating only through MVCC snapshots
+  (no `begin()`/`commit()` bracket needed). `execute_sql_as` applies the same
+  user-aware RLS on this path; plain `execute_sql` is the embedded-superuser
+  form.
+
 ### Server (access-token URL)
 
 Start `unidb-server` (see `docs/REST_API.md` for the full route reference). The
@@ -121,16 +140,29 @@ any access path; the same parser/planner/executor runs underneath all three.
 
 - **DDL**: `CREATE TABLE` (with `PRIMARY KEY`, `UNIQUE`, `NOT NULL`, `CHECK`,
   `DEFAULT`, `FOREIGN KEY … REFERENCES`, `SERIAL`/identity), `CREATE INDEX …
-  USING {BTREE|HNSW|FULLTEXT}`, `ALTER TABLE ADD/DROP COLUMN`, `DROP TABLE`,
+  USING {BTREE|HNSW|FULLTEXT}` (BTREE also takes `INCLUDE (cols)` for a
+  covering index — item 102-B), `ALTER TABLE ADD/DROP COLUMN`, `DROP TABLE`,
   `TRUNCATE`, `ANALYZE`.
 - **DML**: `INSERT` (multi-row), `UPDATE`, `DELETE`, all `WHERE`-filtered.
 - **SELECT**: projections, `WHERE` (including `LIKE` / `NOT LIKE` / `ILIKE`
   pattern matching and `MATCH(col, 'text')` full-text boolean predicate — item 30,
-  G9 + G11), `INNER`/`LEFT`/`RIGHT`/`CROSS JOIN` with `ON <expr>` **or `USING
-  (cols)`** (shared columns merged per standard SQL), `GROUP BY` / `HAVING`,
-  aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`), `DISTINCT`, `ORDER BY`,
-  `LIMIT`/`OFFSET`, subqueries (`IN`, `EXISTS`, scalar, correlated), and CTEs
+  G9 + G11), `INNER`/`LEFT`/`RIGHT`/`FULL OUTER`/`CROSS`/`NATURAL JOIN` with
+  `ON <expr>` **or `USING (cols)`** (shared columns merged per standard SQL;
+  `NATURAL` desugars to `USING` over shared column names), `GROUP BY` /
+  `HAVING`, aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`), `DISTINCT`,
+  `ORDER BY` (output columns, 1-based positions, or a non-projected column —
+  G4), `LIMIT`/`OFFSET`, subqueries (`IN`, `EXISTS`, scalar, correlated),
+  derived tables (`FROM (SELECT …) AS alias`), and non-recursive CTEs
   (`WITH`).
+- **Set operations**: `UNION` / `UNION ALL` / `INTERSECT` / `EXCEPT`,
+  including chained set-ops (G3).
+- **Window functions** (G7): `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`LAG`/`LEAD` and
+  aggregate windows `OVER (PARTITION BY … ORDER BY …)` — whole-partition frame
+  only (cumulative frames are a follow-up).
+- **`RETURNING`** on `INSERT`/`UPDATE`/`DELETE` (G5).
+- **Scalar expressions**: `CASE` / `COALESCE` / `NULLIF` (G1),
+  `CAST(expr AS type)` (G2-cast), `IS NULL` / `IS NOT NULL` (G10).
+- **`SELECT` without `FROM`** (`SELECT 1` health probes — G8).
 - **Transactions**: `READ COMMITTED` (default), `REPEATABLE READ`,
   `SERIALIZABLE` (SSI).
 - **`EXPLAIN [ANALYZE]`**: renders the chosen plan (and, with `ANALYZE`, actual
@@ -150,16 +182,19 @@ any access path; the same parser/planner/executor runs underneath all three.
 
 **Not supported yet** — so you don't guess:
 
-- `NATURAL JOIN` — use explicit `JOIN … USING (cols)` or `ON`.
-- `FULL OUTER JOIN` (needed for a true `COALESCE`-merged `USING` column on both
-  outer sides; `INNER`/`LEFT`/`RIGHT` `USING` are supported).
-- `ORDER BY` on an expression that is **not** in the SELECT output list (order by
-  a projected column name/alias or ordinal position).
-- Set operations (`UNION`/`INTERSECT`/`EXCEPT`), window functions, `RETURNING`.
+- Recursive CTEs (`WITH RECURSIVE`) — tracked in
+  `docs/backlog/19_sql_surface_gaps.md`.
+- Frame-based (cumulative) window frames (`ROWS BETWEEN …`) — window functions
+  run over the whole partition only.
 - `ON DELETE CASCADE / SET NULL / NO ACTION` and `ON UPDATE` FK actions — only
   `RESTRICT` (the default) is enforced today. `CASCADE`/`SET NULL` are parsed
   but not yet acted on.
-- `SELECT` without `FROM` (`SELECT 1` alone) over the row-at-a-time path.
+
+_(Corrected 2026-07-22: `NATURAL JOIN`, `FULL OUTER JOIN`, `ORDER BY` on a
+non-projected column, set operations, window functions, `RETURNING`, and
+`SELECT` without `FROM` previously appeared in this list; all have since
+shipped under item 19 — see the compatibility table in
+`docs/sql/sql_reference.md`.)_
 
 For the exhaustive, always-current truth, the parser (`src/sql/parser.rs`)
 returns a `SQL_UNSUPPORTED` error naming what it rejected.
@@ -202,6 +237,24 @@ extensions live under `unidb_catalog`.
 Engine-internal `__…__` tables are hidden. Every `*_schema` column reports the
 constant `'public'` and every `*_catalog` column reports `'unidb'` — unidb has
 no schema namespacing, and saying so plainly beats inventing one.
+
+### Per-caller visibility (item 111, 2026-07-22, PR #199)
+
+`information_schema.*` rows are filtered **per caller**: a table's rows (in
+`tables`, `columns`, `table_constraints`, `key_column_usage`,
+`referential_constraints`) are visible only if the caller holds **any**
+privilege (`SELECT`/`INSERT`/`UPDATE`/`DELETE`) on that table — Postgres
+semantics: holding a privilege is what makes a table discoverable, and the
+views themselves need no grant of their own. Superusers see everything, as do
+the embedded no-user path and open/bootstrap mode (no registered users).
+`unidb_catalog.*` keeps its **separate** grant-gated access model (item 24 Z5):
+access to the view itself is granted, and rows are not privilege-filtered.
+
+**Client-author warning:** a table that appears to be "missing" from
+`information_schema` output usually means the querying user holds no grants on
+it, not that the table does not exist. Schema tools (ERD, admin consoles)
+should either connect as a superuser or expect a privilege-scoped view of the
+schema.
 
 ### Relations
 
@@ -621,8 +674,10 @@ unidb_subscription_lag_seconds{consumer="billing"} 3.7
   in `unidb_catalog.indexes` (only explicit `CREATE INDEX` indexes appear there).
 - **One schema, one database per server.** `'public'` / `'unidb'` are constants;
   there is no schema namespacing and no multi-db addressing.
-- **No `NATURAL JOIN` / `FULL OUTER JOIN`** (`JOIN … USING` *is* supported —
-  `INNER`/`LEFT`/`RIGHT`; see [§2](#2-query-the-sql-surface)).
+- **Correction (item 19, supersedes the limitation formerly stated here,
+  2026-07-22):** `NATURAL JOIN` and `FULL OUTER JOIN` **are** supported
+  (G-NATURAL, G2-join); see [§2](#2-query-the-sql-surface) for the current
+  join surface.
 
 - **Correction (item 27, supersedes the item-21-era limitation formerly stated
   here):** dead/live-tuple pressure **is now per table** —
