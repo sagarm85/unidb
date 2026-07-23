@@ -148,3 +148,19 @@ evidence-motivated.
 - **Unit 3 — L3 decode-pushdown + ef retune + certification.**
   Projection at ef=120 after 2a+3: **~285–330 µs @ 0.910** — under target
   even before 2b's margin.
+
+
+## Unit 2a result (2026-07-22) — dense-slot bookkeeping, measured
+
+**Gate point ef=120: 549 → 465.8 µs @ 0.910** (ef=200: 774 → 643 µs;
+ef=40: 369 → 330 µs). Recall bit-identical at every ef — same candidates,
+same set semantics. Implementation: one `slot_of` map resolve per neighbour
+now drives BOTH a dense visited bitset (two bit ops, no SipHash) and a
+direct `slice_by_slot` slab read (no second map get); slot-less rids
+(cache miss / mid-search appends past the bitset) spill to the old HashSet
+path; insert path untouched.
+
+Remaining to ≤400 at the gate point: **66 µs** → Unit 3 (re-rank
+decode-pushdown, ~−65 µs at ef=120) lands on target; Unit 2b (graph
+quality, 0.90+ at ef≤80 → base ~365 µs before pushdown) then converts to
+margin.

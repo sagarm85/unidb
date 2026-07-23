@@ -967,6 +967,22 @@ impl VecArena {
         Some(&self.data[k * d..(k + 1) * d])
     }
 
+    /// Dense slot for `key`, if cached (item 106 Unit 2a: slot-indexed
+    /// bookkeeping — resolve the map ONCE per neighbour, then use the slot
+    /// for both the visited bitset and the vector slab read).
+    #[inline(always)]
+    fn slot_of(&self, key: i64) -> Option<u32> {
+        self.idx.get(&key).copied()
+    }
+
+    /// Vector slice by dense slot (caller got the slot from `slot_of`).
+    #[inline(always)]
+    fn slice_by_slot(&self, slot: u32) -> &[f32] {
+        let d = self.dim as usize;
+        let k = slot as usize;
+        &self.data[k * d..(k + 1) * d]
+    }
+
     fn insert(&mut self, key: i64, vec: &[f32]) {
         if self.idx.contains_key(&key) {
             return;
@@ -1049,6 +1065,23 @@ impl HnswVecCache {
     /// Read a cached vector (shared slab slice — no clone).
     pub fn get(&self, key: i64) -> Option<&[f32]> {
         self.vectors.get(key)
+    }
+
+    /// Dense slot for `key` (item 106 Unit 2a).
+    #[inline(always)]
+    pub fn slot_of(&self, key: i64) -> Option<u32> {
+        self.vectors.slot_of(key)
+    }
+
+    /// Vector slice by dense slot (item 106 Unit 2a).
+    #[inline(always)]
+    pub fn slice_by_slot(&self, slot: u32) -> &[f32] {
+        self.vectors.slice_by_slot(slot)
+    }
+
+    /// Number of dense slots currently in the slab (item 106 Unit 2a).
+    pub fn num_slots(&self) -> usize {
+        self.vectors.idx.len()
     }
 
     /// Opaque storage identity: changes iff a mutation copied-on-write.
@@ -1513,8 +1546,28 @@ impl DiskHnswIndex {
         mut l0_cache: Option<&mut HnswL0Cache>,
         mut vec_cache: Option<&mut HnswVecCache>,
     ) -> Result<Vec<(f32, RowId)>> {
+        // Item 106 Unit 2a: on the query path (vec_cache present) the visited
+        // set is a dense bitset over vector-slab slots — one map resolve per
+        // neighbour replaces {visited-SipHash + vec-map get} (~140 ns/call of
+        // bookkeeping measured vs ~40 ns of distance math). Rids without a
+        // slot (cache miss; slots appended mid-search land past the bitset)
+        // spill to the HashSet, which is also the insert-path bookkeeping.
         let mut visited: HashSet<RowId> = HashSet::new();
-        visited.insert(entry);
+        let mut visited_bits: Vec<u64> = match vec_cache.as_deref() {
+            Some(vc) => vec![0u64; vc.num_slots().div_ceil(64)],
+            None => Vec::new(),
+        };
+        match vec_cache
+            .as_deref()
+            .and_then(|vc| vc.slot_of(encode_rid(entry)))
+        {
+            Some(slot) if (slot as usize) < visited_bits.len() * 64 => {
+                visited_bits[slot as usize >> 6] |= 1u64 << (slot as usize & 63);
+            }
+            _ => {
+                visited.insert(entry);
+            }
+        }
 
         // Candidates to expand (min-heap: nearest first).
         let mut candidates: BinaryHeap<std::cmp::Reverse<DistRid>> = BinaryHeap::new();
@@ -1628,10 +1681,47 @@ impl DiskHnswIndex {
             };
 
             for &nbr in nbr_iter {
-                if visited.contains(&nbr) {
-                    continue;
+                // Item 106 Unit 2a: one map resolve; slot drives the visited
+                // bitset AND the direct slab distance. Slot-less rids (cache
+                // miss / mid-search append) use the HashSet + fallback path.
+                let mut nbr_slot: Option<u32> = None;
+                if let Some(vc) = vec_cache.as_deref() {
+                    if let Some(slot) = vc.slot_of(encode_rid(nbr)) {
+                        let w = slot as usize >> 6;
+                        if w < visited_bits.len() {
+                            let b = slot as usize & 63;
+                            if visited_bits[w] >> b & 1 == 1 {
+                                continue;
+                            }
+                            visited_bits[w] |= 1u64 << b;
+                            nbr_slot = Some(slot);
+                        }
+                    }
                 }
-                visited.insert(nbr);
+                if nbr_slot.is_none() {
+                    if visited.contains(&nbr) {
+                        continue;
+                    }
+                    visited.insert(nbr);
+                }
+
+                if let Some(slot) = nbr_slot {
+                    if let Some(vc) = vec_cache.as_deref() {
+                        Q_VEC_CACHE_HITS.fetch_add(1, AtomicOrd::Relaxed);
+                        Q_DISTANCE_CALLS.fetch_add(1, AtomicOrd::Relaxed);
+                        let d = dist_raw(hdr.metric, query, vc.slice_by_slot(slot));
+                        let worst = result.peek().map(|dr| dr.dist).unwrap_or(f32::INFINITY);
+                        if result.len() < ef || d < worst {
+                            let dr = DistRid { dist: d, rid: nbr };
+                            candidates.push(std::cmp::Reverse(dr));
+                            result.push(dr);
+                            if result.len() > ef {
+                                result.pop();
+                            }
+                        }
+                        continue;
+                    }
+                }
 
                 // Lever 1 (item 92): zero-copy fast path.
                 // When vec_cache is Some and the vector is already cached, compute
