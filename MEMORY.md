@@ -12,6 +12,18 @@
 
 ## Current status
 
+- **2026-07-23 — Fresh full Docker bench RUN + PROMOTED as new MM_BASELINE; item 114 filed.**
+  `docs/performance/report_20260723_124415.md` (main `0324dc5`, 84m 58s, canary quiet vs 07-21,
+  conc matrix 32/32). **Item 107 validated in-record:** W4/W0 at 100k 96→**34.21×**, Δvector
+  +17.55→**+3.31 ms/commit**, drain reported off-path (new table). CRUD wins: filtered 0.45→0.58×
+  (beat item 109's ~0.50 prediction), non-HOT 0.65→0.85×, HOT 1.06→1.18×, COUNT 41→56×; Table 4
+  at 100k 13.4→10.05 ms/txn. **New finding → item 114:** Δevent at 100k doubled (+4.08→+9.93
+  ms/commit, now the dominant W4 rung) + the +3.31 Δvector commit-path residue — Step-0 =
+  attribution A/B (worker CPU contention vs real event-path regression) before any lever.
+  Note: item 106's NEAR gains are NOT in this report (mmreport doesn't measure NEAR — the
+  standing Linux NEAR spot-check gap). **Next up:** item 106 Unit 3 (re-rank decode-pushdown,
+  466→≤400 µs at ef=120) then Unit 2b; item 114 Step-0; 109 follow-ups; chips.
+
 - **2026-07-22 (same session, after the docs audit) — MEMORY/PROGRESS roll-up + LESSONS.md.**
   Both files had grown past useful context size (MEMORY ~103k tokens, PROGRESS ~141k — together
   more than a full context window). Split into working set + verbatim archive:
@@ -472,6 +484,20 @@ be raised with the user directly, not assumed.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-07-23 — Fresh full Docker bench on main `0324dc5` → new MM_BASELINE; item 114 filed
+
+User asked to verify the branch matched main, then run backlog Next-up #1. Branch
+`claude/pending-items-bce650` == `origin/main` (`0324dc5`), tree clean. Pre-flight per
+LESSONS: no stray bench processes, `docker compose down -v`, unrelated idle containers
+(pg-demo on :5433, minio) verified non-conflicting and left running. Full
+`scripts/report.sh --docker` (no skip knobs, no stitch): 84m 58s. compare_bench.py arg
+order is `<run> <baseline>` (first attempt reversed produced mirror-image deltas — check
+the "vs <file>" header line). Auto-compare at end of report.sh used the stale 07-17
+`benchmark_*` file (docker/out is gitignored, so a fresh worktree only had old promoted
+copies) — always re-compare manually against the intended baseline. Recorded: PROGRESS
+entry + index row, performance README pointer, backlog index (Next-up refreshed, 114
+registered, next→115), `114_w4_event_rung_tax.md` filed. Docs lints green before push.
 
 ### 2026-07-22 (session close) — items 110 + 111 shipped, 112 filed, Z4 status corrected
 

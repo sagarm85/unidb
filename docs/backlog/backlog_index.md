@@ -121,12 +121,13 @@
 | 111 | `111_information_schema_follow_table_grants.md` | Improvement | ✅ SHIPPED 2026-07-22 (PR #199) — `information_schema.*` no longer needs its own view grant; rows are filtered per-caller by ANY-privilege on the underlying table across all five views (Postgres semantics), so a user sees exactly the tables they hold grants on and nothing else. `unidb_catalog.*` stays Z5 grant-gated. 5 tests. See PROGRESS.md "Item 111". |
 | 112 | `112_column_level_grants.md` | Improvement | ⏳ NOT STARTED (deliberately parked) — column-level GRANT/REVOKE (Postgres narrowing semantics, error-not-mask); the deferred half of item-24 Z4. Wide touch: grant vocab/persistence, DDL, read+write+RETURNING enforcement incl. QuerySpec shapes, policy-column exemption decision, item-111 columns-view filter, fast-path audit. Un-park when a concrete user need appears. |
 | 113 | `113_fk_error_message_direction.md` | Improvement | ⏳ NOT STARTED — parent-DELETE FK RESTRICT reuses the child-INSERT message shape ("value X has no matching row in 'parent'"), the exact opposite of what happened; should name the parent row + blocking child table/column. Registered 2026-07-22 (file predates as unregistered `42_…` duplicate; renumbered per stable-ID rule). |
+| 114 | `114_w4_event_rung_tax.md` | Performance | ⏳ NOT STARTED — filed 2026-07-23 from the first official post-107 ladder record: W4/W0 at 100k collapsed 96→34× (item 107 validated) but Δevent doubled to +9.93 ms/commit (was +4.08) and is now the dominant rung; Δvector keeps a +3.31 ms commit-path residue despite the async worker. Step-0 = attribution A/B (worker CPU contention vs real event-path regression) before any lever. |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `114_…`.**
+**Next new file → `115_…`.**
 
-## Next up — priority order (2026-07-22, post items 105/92/108/107/109/110/111)
+## Next up — priority order (2026-07-23, post fresh-baseline bench)
 
 CRUD ratio snapshot: the 2026-07-20 table previously shown here is retired —
 item 108 proved cross-run ÷PG ratios are evidence only when the PG-absolute
@@ -136,14 +137,19 @@ environment canary is quiet. Current per-operation state lives in the
 
 **Next priority items:**
 
-1. **Fresh full Docker bench on current main** — first official record of item
-   107's W4/W0 ladder collapse; becomes the new `MM_BASELINE` carry-forward
-   anchor (item 105 machinery).
-2. **#106 vector pgvector-class tier** — NEAR ≤400 µs at 10k, recall ≥0.90;
-   Step-0 = recall-vs-ef curve.
+1. **#106 vector pgvector-class tier** — Units 1+2a shipped (466 µs at
+   ef=120, 66 µs to target); remaining: Unit 3 (re-rank decode-pushdown +
+   ef retune + certification), then Unit 2b (graph quality → margin).
+2. **#114 W4 residual multi-model tax** — Step-0 attribution A/B (Δevent
+   doubled to +9.93 ms at 100k; Δvector +3.31 ms commit-path residue).
 3. **#109 follow-ups** — one-shot fixed cost (~700 µs) and the Table-3
    warm-median methodology decision.
 4. **Chips** — item-103 `LIMIT` test variant.
+
+_Done 2026-07-23: fresh full Docker bench on main `0324dc5` →
+`docs/performance/report_20260723_124415.md` promoted as the new
+`MM_BASELINE` (canary quiet; 32/32 conc matrix; item 107 validated
+in-record; finding filed as #114)._
 
 **What is NOT in this list:**
 - Parallel DML apply: held in reserve; not justified at current acceptance band.
