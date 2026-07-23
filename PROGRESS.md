@@ -176,6 +176,7 @@ memory (see `CLAUDE.md` §6).
 | Item 109 — Page-cached B-tree candidate resolution   [SHIPPED]   2026-07-22 | 2026-07-22 | live |
 | Item 110 — RLS + LIMIT crash: current_user destroyed in QuerySpec path   [SHIPPED]   2026-07-22 | 2026-07-22 | live |
 | Item 111 — information_schema visibility follows table grants   [SHIPPED]   2026-07-22 | 2026-07-22 | live |
+| Fresh full Docker bench — new MM_BASELINE (post-107, main `0324dc5`)   [RECORDED]   2026-07-23 | 2026-07-23 | live |
 
 ## Item 24 R-a + R-b — UPDATE WITH CHECK enforcement + bootstrap observability (2026-07-20)
 
@@ -1691,3 +1692,40 @@ five views including the constraint-shaped ones. Superuser/embedded/open
 mode unchanged (mirrors `is_effective_superuser`); `unidb_catalog.*` keeps
 its Z5 grant-gated model (test-pinned). 5 tests; full suite 72 binaries
 green, crash 54/54, clippy/fmt clean.
+
+## Fresh full Docker bench — new MM_BASELINE (post-107, main `0324dc5`)   [RECORDED]   2026-07-23
+
+**Report:** `docs/performance/report_20260723_124415.md` (Docker fair-fsync,
+main @ `0324dc5` = item 106 Unit 2a merge; all tables, sizes 1k/10k/100k,
+sample 200). Promoted (`docker/out/benchmark_20260723_221018.md`) and
+designated the new standing `MM_BASELINE`, superseding
+`report_20260721_035629.md`. **Total 84m 58s.** Environment canary QUIET vs
+07-21 (no >25% PG-absolute median drift), so cross-run ratios are evidence.
+**Concurrency matrix: 32 PASS · 0 FAIL.**
+
+### Verdicts
+
+- **Item 107 (async HNSW): VALIDATED in-record — first official capture of
+  the ladder collapse.** W4/W0 at 100k **96.01× → 34.21×**; Δvector (W2−W1)
+  at 100k **+17.55 → +3.31 ms/commit**, with the worker's background cost
+  honestly reported in the new drain table (8.75–17.86 ms/commit at 100k,
+  off the commit path).
+- **Items 109/106-era CRUD movement, canary-clean:** SELECT filtered
+  0.45→**0.58×** (item 109's one-shot Docker prediction was ~0.50 — beat
+  it), UPDATE non-HOT 0.65→**0.85×**, UPDATE HOT 1.06→**1.18×**, INSERT
+  0.47→0.50×, COUNT(*) 41.25→**56.20×**. Losses within/near noise: GROUP BY
+  1.29→1.02×, DELETE all 4.29→4.01×, FK INSERT 0.54→0.40×.
+- **Table 4 (multi-model txn vs PG floor) at 100k: 13.4 → 10.05 ms/txn.**
+- Table 3.1 bulk at 2M rows: insert ≈ parity with PG (27.6k vs 29.1k rec/s);
+  scan gap unchanged (PG parallel degree, documented).
+
+### Findings → new items
+
+- **Item 114 (filed): the event rung is now the dominant W4 tax.** Δevent
+  (W4−W3) at 100k **+4.08 → +9.93 ms/commit** (2.4×), and Δvector keeps an
+  unexplained +3.31 ms commit-path residue despite the active worker.
+  Prime suspect: worker CPU contention with the foreground during drain
+  (the M2.d "off the blocking path ≠ free" lesson); could also be a real
+  event-append regression. Step-0 = attribution A/B before any lever.
+- W4/W0 at 10k regressed slightly (17.61→20.55×) while 1k and 100k
+  improved — folded into item 114's attribution rather than filed separately.

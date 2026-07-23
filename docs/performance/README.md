@@ -8,15 +8,18 @@
 
 ## Which report is current?
 
-- **Authoritative full baseline:** `report_20260721_035629.md` — the
-  consolidated Docker bench of 2026-07-21 (the current `MM_BASELINE`
-  carry-forward anchor, item 105).
+- **Authoritative full baseline:** `report_20260723_124415.md` — the full
+  Docker bench of 2026-07-23 on main `0324dc5` (the current `MM_BASELINE`
+  carry-forward anchor, item 105). First official record of item 107's
+  W4/W0 ladder collapse (96→34× at 100k; Δvector +17.55→+3.31 ms/commit,
+  drain accounted off-path) — and of the finding it exposed: the event
+  rung is now the dominant W4 tax (Δevent +4.08→+9.93 ms at 100k, filed
+  as item 114). Environment canary quiet vs 07-21, so ratios comparable.
+- Superseded baseline: `report_20260721_035629.md` (2026-07-21 consolidated
+  bench).
 - `report_20260722_002217_ab_oldcode_51022be.md` is **not** a baseline — it is
   the item-108 controlled A/B evidence run (old code at `51022be`) proving the
   07-19→07-21 ratio drift was environmental.
-- The next full Docker bench on current main (queued in
-  `docs/backlog/backlog_index.md` "Next up") will supersede the 07-21 baseline
-  and become the first official record of item 107's W4/W0 ladder collapse.
 
 ## File families
 
