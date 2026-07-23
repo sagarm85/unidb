@@ -170,6 +170,31 @@ pub const HNSW_EF_CONSTRUCTION: usize = 200;
 /// 200 balances recall@10 ≥ 0.90 at 10k×dim128 against latency.
 /// The executor also uses max(k*4, HNSW_EF_SEARCH) so small k doesn't under-probe.
 pub const HNSW_EF_SEARCH: usize = 200;
+
+/// Item 106 Step-0: runtime-tunable ef_search. Initialized from
+/// `UNIDB_HNSW_EF_SEARCH` (default [`HNSW_EF_SEARCH`]) on first read;
+/// settable in-process for sweeps and ops tuning. 0 is clamped to 1.
+static EF_SEARCH: AtomicU64 = AtomicU64::new(0);
+
+/// Current effective ef_search (env-initialized, runtime-settable).
+pub fn ef_search() -> usize {
+    let v = EF_SEARCH.load(AtomicOrd::Relaxed);
+    if v != 0 {
+        return v as usize;
+    }
+    let init = std::env::var("UNIDB_HNSW_EF_SEARCH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(HNSW_EF_SEARCH);
+    EF_SEARCH.store(init as u64, AtomicOrd::Relaxed);
+    init
+}
+
+/// Set ef_search at runtime (sweeps / config). Clamps 0 → 1.
+pub fn set_ef_search(ef: usize) {
+    EF_SEARCH.store(ef.max(1) as u64, AtomicOrd::Relaxed);
+}
 /// Level-multiplier 1/ln(M) ≈ 0.3607.
 const HNSW_ML: f64 = 0.360_673_76;
 /// Max layer index (defensive cap; log_{16}(10^9) < 8).
