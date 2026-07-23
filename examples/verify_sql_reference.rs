@@ -17,6 +17,7 @@ fn main() {
         "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT REFERENCES customers(id), amount INT, status TEXT)",
         "CREATE TABLE docs (id INT, body TEXT, embedding VECTOR(4))",
         "CREATE INDEX idx_status ON orders USING BTREE (status)",
+        "CREATE INDEX idx_cover ON orders USING BTREE (status) INCLUDE (amount)",
         "CREATE INDEX idx_body ON docs USING FULLTEXT (body)",
         "CREATE INDEX idx_emb ON docs USING HNSW (embedding)",
         "ALTER TABLE customers ADD COLUMN tier INT DEFAULT 1",
@@ -32,8 +33,13 @@ fn main() {
         "SELECT id, name FROM customers WHERE active = true",
         "SELECT COUNT(*) FROM customers",
         "SELECT status, COUNT(*) FROM orders GROUP BY status",
+        "SELECT status, COUNT(*) FROM orders GROUP BY status HAVING COUNT(*) > 1",
         "SELECT name FROM customers ORDER BY id",
         "SELECT * FROM orders JOIN customers USING (id)",
+        "SELECT * FROM orders JOIN customers ON orders.customer_id = customers.id",
+        "WITH open_orders AS (SELECT id, customer_id FROM orders WHERE status = 'open') \
+         SELECT customers.name FROM customers \
+         JOIN open_orders ON customers.id = open_orders.customer_id",
         "SELECT id FROM docs WHERE MATCH(body, 'invoice')",
         "SELECT * FROM docs WHERE NEAR(embedding, [0.0, 0.0, 0.0, 0.0], 3)",
         "EXPLAIN SELECT name FROM customers WHERE id = 1",

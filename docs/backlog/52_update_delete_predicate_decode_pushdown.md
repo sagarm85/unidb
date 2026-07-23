@@ -1,7 +1,7 @@
 # UPDATE/DELETE: predicate-column decode pushdown on matching_rows (item 47 Phase B)
 
 **Type:** Performance
-**Status:** STEP 1 DONE (DELETE), STEP 2 NO-OP (UPDATE) — see correction note below
+**Status:** ✅ SHIPPED 2026-07-16 (PR #131) — Step 1 (DELETE decode pushdown) shipped; Step 2 found NO-OP for UPDATE (structural, see correction note below). See `backlog_index.md` row 52 / PROGRESS.md. _(Header normalized 2026-07-22.)_
 
 _This is the official tracking item for item 47 Phase B, which was specified as an open follow-on in `47_update_delete_write_throughput.md` after Phase A shipped (PR #119, 2026-07-16)._
 

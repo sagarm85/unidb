@@ -1,5 +1,5 @@
 **Type:** Performance
-**Status:** ⏳ NOT STARTED
+**Status:** ✅ SHIPPED 2026-07-20 (PR #171) — fill-factor page reservation (default 80%) + FSM 8-level granularity; UPDATE HOT 1.12→1.51× PG (+35%). See `backlog_index.md` row 69 / PROGRESS.md. _(Header corrected 2026-07-22 — was never flipped at ship time.)_
 
 # Item 69 — Fill factor / page reservation for HOT
 

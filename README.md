@@ -75,32 +75,31 @@ engine.execute_cypher(txn,
 
 Benchmarks run on Docker Linux aarch64 (ARM), release build, `fsync` durability matched between unidb and Postgres.
 
-### Single-model CRUD vs Postgres (100k rows)
+### Single-model CRUD vs Postgres (Docker Linux, 2026-07-21 consolidated run)
 
-> Note: unidb is an embedded general-purpose engine competing against a specialized server. Losses on single-model CRUD are expected and documented honestly here.
+> Note: unidb is an embedded general-purpose engine competing against a specialized server. Losses on single-model CRUD are expected and documented honestly here. Source: [`docs/performance/report_20260721_035629.md`](docs/performance/report_20260721_035629.md) (cross-run ratios are environment-sensitive — see that folder's README).
 
 | Operation | unidb | Postgres | Ratio |
 |-----------|-------|----------|-------|
-| SELECT COUNT(*) | 272M rec/s | 45M rec/s | **unidb 5.98×** |
-| DELETE all (fast path) | 30M rec/s | 5M rec/s | **unidb 5.99×** |
-| SELECT GROUP BY | 25M rec/s | 22M rec/s | **unidb 1.13×** |
-| INSERT per-row | 3,576 rec/s | 7,439 rec/s | postgres 2.1× (fsync floor) |
-| SELECT filtered 5% | 502k rec/s | 4.9M rec/s | postgres 9× (parallel index scan) |
-| UPDATE bulk | 32k rec/s | 462k rec/s | postgres 14× (HOT chains improve this) |
+| SELECT COUNT(*) | 2.0B rec/s | 48.6M rec/s | **unidb 41.3×** (O(1) statistics fast path) |
+| DELETE all | 22.5M rec/s | 5.2M rec/s | **unidb 4.29×** |
+| DELETE selected | 6.9M rec/s | 3.4M rec/s | **unidb 2.01×** |
+| SELECT GROUP BY | 26.2M rec/s | 20.4M rec/s | **unidb 1.29×** |
+| UPDATE HOT-eligible | 942k rec/s | 889k rec/s | **unidb 1.06×** |
+| UPDATE non-HOT | 633k rec/s | 978k rec/s | postgres 1.5× |
+| INSERT per-row | 4,128 rec/s | 8,783 rec/s | postgres 2.1× (fsync floor) |
+| SELECT filtered 5% | 2.7M rec/s | 6.0M rec/s | postgres 2.2× (parallel index scan) |
 
-The INSERT and filtered-SELECT gaps are structural: per-row INSERT hits the fsync floor (one `fsync` per commit is durability, not a bug), and Postgres's parallel index scan infrastructure outpaces unidb's current B-tree path on selective queries. These are known and tracked.
+The INSERT and filtered-SELECT gaps are structural: per-row INSERT hits the fsync floor (one `fsync` per commit is durability, not a bug), and Postgres's parallel index scan infrastructure outpaces unidb's current B-tree path on selective queries. These are known and tracked (a warm-path page cache landed 2026-07-22 — item 109 — measuring 3.0× faster warm filtered SELECTs; the one-shot cold number above is the honest official record).
 
-### Multi-model commit cost (10k rows, Docker Linux)
+### Multi-model commit cost (Docker Linux, 2026-07-21 run)
 
-| Commit type | Latency |
-|-------------|---------|
-| Plain relational INSERT | 0.46 ms |
-| + B-tree index | 0.54 ms |
-| + VECTOR(128) + HNSW | 15.4 ms |
-| + graph edge | 16.2 ms |
-| + event queue | **16.7 ms** (full four-model atomic commit) |
+| rows | Plain INSERT (W0) | Full four-model commit (W4) |
+|-----:|------------------:|----------------------------:|
+| 10k | 0.44 ms | 7.66 ms |
+| 100k | 0.23 ms | 21.79 ms |
 
-HNSW insert dominates the multi-model path — this is the cost of maintaining a navigable small-world graph on each write.
+Synchronous HNSW insert dominated the multi-model path in this run — the cost of maintaining a navigable small-world graph on each write. As of 2026-07-22 (item 107) HNSW maintenance runs **asynchronously in a background worker** on served engines (bounded lag, queue-depth gauge); the first official benchmark of the collapsed W4/W0 ladder is queued.
 
 ### Bulk insert throughput
 
@@ -228,18 +227,20 @@ Full route reference: [`docs/REST_API.md`](docs/REST_API.md)
 - Group commit — one `fsync` per transaction
 - Auto-checkpoint and autovacuum (background, Postgres-style policy)
 - Full-page writes + CRC32 checksums on every page
-- Crash-injection harness (44 defined injection points)
+- Crash-injection harness (54 crash/recovery tests as of 2026-07-22)
 
 **SQL and relational**
-- SQL subset: SELECT (with joins, aggregates, GROUP BY, HAVING, ORDER BY, LIMIT), INSERT, UPDATE, DELETE, CREATE/ALTER/DROP TABLE, TRUNCATE
+- SQL subset: SELECT (with joins, aggregates, GROUP BY, HAVING, ORDER BY, LIMIT), INSERT, UPDATE, DELETE, CREATE/ALTER/DROP TABLE, TRUNCATE, RETURNING
+- Window functions (ROW_NUMBER/RANK/DENSE_RANK/LAG/LEAD/SUM/AVG/COUNT/MIN/MAX OVER) and set operations (UNION/INTERSECT/EXCEPT)
 - Column types: INT, BIGINT, FLOAT, TEXT, BOOL, DECIMAL, TIMESTAMP, DATE, UUID, BYTEA, JSON, VECTOR(n)
 - Constraints: PRIMARY KEY, FOREIGN KEY, UNIQUE, NOT NULL, CHECK, DEFAULT, SERIAL
-- B-tree secondary indexes (durable, crash-recovered, no rebuild on open); covering indexes via `CREATE INDEX … INCLUDE (cols)`
-- Cost-based optimizer with ANALYZE statistics and EXPLAIN / EXPLAIN ANALYZE
-- Joins: hash join (with grace spill-to-disk), sort-merge, index-nested-loop
-- Subqueries, CTEs, prepared statements with `$n` bind parameters
-- Row-level security (RLS)
-- `information_schema` introspection
+- B-tree secondary indexes (durable, crash-recovered, no rebuild on open); covering indexes via `CREATE INDEX … INCLUDE (cols)`; index-only scans
+- Cost-based optimizer with ANALYZE statistics and EXPLAIN / EXPLAIN ANALYZE; LRU plan cache
+- Joins: hash join (with grace spill-to-disk), sort-merge, index-nested-loop; INNER/LEFT/RIGHT/FULL OUTER/NATURAL, `ON` and `USING`
+- Subqueries, CTEs, derived tables, prepared statements with `$n` bind parameters
+- Text matching: `LIKE`/`ILIKE`, and full-text `MATCH` over an inverted index
+- Row-level security (RLS) with per-op policies and `current_user`
+- `information_schema` introspection (rows filtered by the caller's table grants)
 
 **Vector search**
 - `VECTOR(n)` column type, up to arbitrary dimensions
@@ -385,7 +386,7 @@ src/
   authz/              Users, roles, GRANT
   server/             Optional REST/JWT/SSE/metrics (feature = "server")
 tests/
-  crash/              Crash-injection harness (44 injection points)
+  crash/              Crash-injection harness (54 crash/recovery tests)
 benches/              Throughput and latency benchmarks
 scripts/
   pg_compare.sh       Postgres baseline comparison

@@ -1,7 +1,9 @@
-# unidb Engine Design — M0 through M8
+# unidb Engine Design — M0 through M8 + backlog items through 111
 
-> Consolidated design document for the engine as shipped through M8
-> (2026-07-08). Distilled from `CLAUDE.md` (locked decisions D1–D13),
+> Consolidated design document for the engine as shipped through
+> 2026-07-22 — M0–M8 plus the numbered backlog items through 111 (item
+> 112, column-level grants, is deliberately parked). Distilled from
+> `CLAUDE.md` (locked decisions D1–D13),
 > `MEMORY.md` (per-checkpoint design notes), `PROGRESS.md` (milestone
 > entries + measured benchmarks), and the module doc comments in `src/`.
 > M8 (attach client, §9) is included; see that section's note on how it
@@ -43,7 +45,7 @@ stack (§11 below records what has actually been measured so far).
 ## 2. Architecture layer stack
 
 ```
-API layer (M5)                REST + JWT(verify-only) + SSE + /metrics; embedded crate is primary
+API layer (M5)                REST + JWT auth (per-user authz + login, items 24/100) + SSE + /metrics; embedded crate is primary
 Query & execution (M1+)       SQL parser -> logical plan -> executor; Cypher subset (M3);
                               joins/aggregates/subqueries/CTEs + cost-based optimizer + EXPLAIN (Phase 4)
 Logical record layer (M1+)    rows / vector records / graph edges / queue events
@@ -58,17 +60,26 @@ Module map (what each layer became in code):
 |---|---|
 | Storage core (M0) | `format.rs`, `control.rs`, `mmap.rs`, `page.rs`, `bufferpool.rs`, `wal.rs`, `heap.rs`, `checkpoint.rs`, `recovery.rs` |
 | Transactions (M1; concurrent since Phase 5) | `mvcc.rs`, `txn.rs`, `lockmgr.rs`, `concurrency_hooks.rs`, `query_limits.rs` (P5.f timeouts/cancel/`work_mem`) |
-| Catalog & SQL (M1) | `catalog.rs`, `sql/{parser,logical,executor}.rs` |
+| Catalog & SQL (M1) | `catalog.rs`, `sql/{parser,logical,executor}.rs`, `sql/datetime.rs` (P2.a/P2.b — dependency-light temporal parsing/formatting for the DATE/TIME/TIMESTAMP encodings) |
 | Query power (Phase 4) | `sql/{query,plan,query_exec,join,aggregate,sort,optimizer,statistics,explain}.rs` — joins (hash+Grace-spill / sort-merge / index-nested-loop), aggregation + sort, subqueries/CTEs, `ANALYZE` + cost-based optimizer, `EXPLAIN` |
 | System catalog introspection (Milestone 18) | `sql/information_schema.rs` — `information_schema.*` / `unidb_catalog.*` as synthesized virtual relations SELECTable over the query surface (resolved at plan time in `sql/plan.rs`, rows materialized in `sql/query_exec.rs::Runner::scan`); read-only projection of `catalog.rs` metadata, no storage. See `docs/engine_access_guide.md` |
 | Secondary indexes (M2, M6, M7; all durable since Phase 3) | `btree_index.rs` (durable `DiskBTree`, also backs full-text + edge, and the per-table durable **free-space map / page directory** since the durable-FSM milestone), `hnsw_index.rs` (durable on-disk HNSW graph index `DiskHnswIndex`, item 63; replaces `disk_vector.rs`'s IVF-Flat), `disk_vector.rs` (retired IVF-Flat `DiskIvfIndex`), `fulltext.rs` (tokenizer), `vector.rs` (retired in-RAM HNSW baseline), `csr_index.rs` (retired) |
-| Graph (M3, M7) | `graph/{edges,index,logical,parser,executor}.rs` |
+| Graph (M3, M7) | `graph/{edges,index,logical,parser,executor}.rs`, `graph/adjacency_cache.rs` (item 95 — lazy warm per-hub 1-hop cache, O(1) invalidation) |
 | Event queue (M4; downstream consumption M20) | `queue/{mod,payload}.rs` (incl. `poll_events_after` live-tail cursor, M20 E1) |
 | Event dispatcher (M20 E2, separate workspace crate) | `unidb-dispatch/src/{lib,sink,filter,dlq}.rs` (`Dispatcher`, `WebhookSink`/`RoomSink`, embeds `Arc<Engine>`, no engine surface) |
-| Server (M5, feature-gated; REST enrichment item 12; logs surface item 22) | `server/{engine_handle,error,dto,handlers,router,auth,sse,tls,txn_session,cursor,correlation,logs}.rs`, `bin/unidb-server.rs` |
+| Server (M5, feature-gated; REST enrichment item 12; logs surface item 22) | `server/{engine_handle,error,dto,handlers,router,auth,sse,tls,txn_session,cursor,correlation,logs}.rs`, `server/bulk.rs` (item 32 — streaming NDJSON bulk insert), `server/event_format.rs` (item 29 — CDC envelope format adapters), `server/storage.rs` (item 31 — `/storage/*` routes), `bin/unidb-server.rs` |
 | Logs surface (item 22) | `server/correlation.rs` (request_id middleware + task-local), `server/logs.rs` (bounded reverse-seek `GET /logs`), `observability.rs` (default-build request_id thread-local read by `audit.rs`/slow-query) |
 | Autovacuum (A1–A4 + item 27) | `autovacuum.rs` (background `std::thread` launcher: `Weak<Engine>`, per-table threshold policy, clean-shutdown handle); per-table dead/live estimates + `vacuum_table` + `VacuumCostConfig` cost throttle in `lib.rs` |
 | Observability metrics (item 21) | `metrics.rs` (lock-free `AtomicHistogram` + counter snapshots); capture points in `bufferpool.rs`/`wal.rs`/`lockmgr.rs`/`txn.rs`/`sql/parallel_scan.rs`/`lib.rs::execute_one_plan`; surfaced via `lib.rs::stats()` + `server/router.rs::publish_engine_metrics`. See `docs/engine_access_guide.md` §10 |
+| Parallel scan (Milestone P; governance item 15) | `sql/parallel_scan.rs` — page-partitioned scan/count/collect workers over the shared mmap; process-wide `WorkerLease` admission budget |
+| Concurrent reads (6b) | `read_handle.rs` — `Send + Sync` `ReadHandle` (frame-free `SharedPageReader` + shared snapshot state); read-only point reads + SQL `SELECT` off the writer path |
+| Large objects (P3.d) | `large_object.rs` — out-of-line chunked + streamed `__lobs__` rows |
+| Authorization (P6.e; authz v2 item 24) | `authz/mod.rs` — users/roles/GRANT (`roles.json`), transitive membership, per-operation RLS policies, `current_user`; enforced via `Engine::execute_sql_as` |
+| Audit log (P6.f) | `audit/mod.rs` — append-only JSON-lines `audit.log` of auth DDL + per-user access decisions |
+| Backup & PITR (P6.d; time-PITR item 28 R1) | `backup/mod.rs` — base backup + WAL archive + `restore(…, target_lsn)`; `backup/timeline.rs` — `timeline.bin` commit-timestamp side index behind `restore_to_time` |
+| Replication (P6.b/P6.c; logical item 28 R2) | `replication/{mod,replica}.rs` — slot registry + WAL shipping, `Replica` incremental apply + `promote()`; the `unidb-logical` crate decodes the same stream |
+| Object storage (items 23/31) | `storage_api.rs` — async `StorageApi` trait at crate root (concrete impl in the `unidb-storage` crate); consumed by `server/storage.rs` |
+| Stats history (item 34) | `stats_ticker.rs` — background 5 s `StatsPoint` ticker into a 300-point ring buffer behind `GET /stats/history` |
 | Engine facade | `lib.rs` (`Engine` — the sole entry point) |
 | Attach client (M8, separate workspace crate) | `unidb-attach/src/lib.rs` (`AttachClient`, `AttachError`) |
 
@@ -107,14 +118,20 @@ Two invariants shape everything above the storage layer:
   checksum and an LSN. No `serde` on the page/WAL hot path — page and WAL
   records are hand-rolled / `zerocopy`-style byte encodings for exact byte
   control (`serde_json` is used only for control-plane data; see §4.6).
-- `FORMAT_VERSION` is currently **8**: v1→v2 for M1's tuple-header extension,
+- `FORMAT_VERSION` is currently **12**: v1→v2 for M1's tuple-header extension,
   v2→v3 for `next_xid` control-file field (§4.7), v3→v4 for `WAL_FPI`
   (P1.a torn-page protection, §3.3), v4→v5 for durable B-Tree `WAL_INDEX` +
   `PAGE_TYPE_BTREE` (P3.a, §5.2), v5→v6 for `WAL_XMAX_BATCH` (item 56 Step 3),
   v6→v7 for `WAL_INDEX_INSERT` logical leaf-insert (item 56 Step 4),
   v7→v8 for `WAL_HOT_UPDATE` + `hot_next` tuple-header forwarding pointer
-  (item 58 HOT-equivalent UPDATE, D4 sign-off 2026-07-17). No migration paths —
-  no earlier version ever shipped externally.
+  (item 58 HOT-equivalent UPDATE, D4 sign-off 2026-07-17), v8→v9 for
+  `WAL_HOT_XPAGE_HEAD` cross-page HOT chains (item 71, 2026-07-18), v9→v10
+  for the batched `WAL_INSERT_BATCH`/`WAL_HOT_XPAGE_BATCH` records
+  (items 79/80, the `hot_update_many` phases), v10→v11 for `TableDef`
+  gaining a maintained `row_count` — the O(1) `COUNT(*)` counter (item 97),
+  and v11→v12 for the covering-index `INCLUDE` inline payload in B-tree
+  leaf entries (item 102-B). No migration paths — no earlier version ever
+  shipped externally.
 - Pages use a **slotted-page** layout; tuples carry a 24-byte header with
   `xmin`/`xmax`/`prev_page`/`prev_slot`/`hot_next` (D4, forward-compatible —
   `hot_next` repurposes the `_pad u16` bytes; v8+ only; 0xFFFF in earlier rows).
@@ -320,7 +337,10 @@ P12 (P1.b: WAL/data-file fsync failure refuses to report success and latches
 poisoned), plus a property test running random `BEGIN`/`INSERT`/`COMMIT`/
 `ROLLBACK` sequences with random crash points — recovered state must be exactly
 the set of transactions that reached `WAL_TXN_COMMIT`. **14 crash tests as of
-P1.b.**
+P1.b; 54 `#[test]` functions in the harness as of 2026-07-22** — the suite has
+grown with every durability mechanism since (P13–P17 Phase 3, P18/P19 Phase 6,
+Pa–Pd commit-time fsync, and the item-35/40/58/71/63 points, among others;
+the footer's per-milestone entries track the growth).
 Deliberately *not* a deterministic simulator (no TigerBeetle/FoundationDB-grade
 sim).
 
@@ -515,15 +535,23 @@ shared-column-merged in `plan.rs::plan_using_join` since Milestone 18),
 Also supported: `CAST(expr AS type)`, `UNION`/`UNION ALL`/`INTERSECT`/`EXCEPT`, derived table subqueries (`FROM (SELECT …) AS alias`), `IN (subquery)`/`EXISTS`/scalar subqueries (RLS-safe), window functions `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`LAG`/`LEAD`/`SUM`/`AVG`/`COUNT`/`MIN`/`MAX OVER (PARTITION BY … ORDER BY …)` (whole-partition frame — item 19 G7), `FULL OUTER JOIN` (item 19 G2-join), `NATURAL JOIN` / `NATURAL LEFT JOIN` (item 19 G-NATURAL — desugars to `USING` at plan time).
 Still out of scope (documented Phase-4 limits): recursive CTEs, cumulative-frame window functions (`ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`), and columnar/vectorized execution.
 
-**Constraints (M11, `sql-constraints` branch — pending merge):** `CREATE
-TABLE` column options and table constraints — `PRIMARY KEY`, `FOREIGN KEY` /
-`REFERENCES`, `UNIQUE`, `NOT NULL`, `CHECK`, `DEFAULT` — are parsed into
-`ColumnConstraints`/`TableConstraints` on the catalog and enforced on
-INSERT/UPDATE. DEFAULT fills a NULL at INSERT; NOT NULL / CHECK are per-row
-checks (CHECK reuses `eval_expr`, so it inherits two-valued NULL semantics);
-UNIQUE is a **synchronous heap scan** under the writer's snapshot (not the
-async B-Tree index, which can be stale — the M7 lesson); FK enforces
-referenced-table existence only. See `PROGRESS.md`'s M11 entry.
+**Constraints (M11):** `CREATE TABLE` column options and table constraints —
+`PRIMARY KEY`, `FOREIGN KEY` / `REFERENCES`, `UNIQUE`, `NOT NULL`, `CHECK`,
+`DEFAULT` — are parsed into `ColumnConstraints`/`TableConstraints` on the
+catalog and enforced on INSERT/UPDATE. DEFAULT fills a NULL at INSERT; NOT
+NULL / CHECK are per-row checks (CHECK reuses `eval_expr`, so it inherits
+two-valued NULL semantics). _(Correction 2026-07-22: this paragraph
+previously said "`sql-constraints` branch — pending merge", UNIQUE as a
+"synchronous heap scan", and FK enforcing "referenced-table existence only" —
+all three are superseded. M11 merged; item 35 (2026-07-14) gave every
+PK/UNIQUE column an implicit unique-enforcement B-tree, so `enforce_unique()`
+is now an O(1) point lookup + MVCC re-check instead of a heap scan; item 36
+(2026-07-14) shipped full row-level FK enforcement — child INSERT/UPDATE
+verifies the parent key via `unique_index_root`, parent DELETE/UPDATE is
+RESTRICT-rejected while a visible child references the key, and a
+`RecordKind::FkKey` phantom lock closes the concurrent
+parent-delete/child-insert race. See `PROGRESS.md`'s M11 + items 35/36
+entries.)_
 
 **RLS is a planner rewrite**: `apply_rls` ANDs the stored policy predicate
 onto `Select.predicate`. That one function is the whole mechanism; it
@@ -534,8 +562,12 @@ REST enrichment R3 (item 12) closed that by adding
 `Engine::set_rls_policy_sql` — the policy arrives as a **SQL predicate
 string**, parsed by the ordinary parser (plan `SELECT * FROM t WHERE
 <pred>`, extract the predicate), so there is still no `Expr` wire format —
-and a superuser-gated `PUT /tables/{t}/rls` route over it. There is still
-no `CREATE POLICY` SQL statement.
+and a superuser-gated `PUT /tables/{t}/rls` route over it. _(Correction
+2026-07-22: "there is still no `CREATE POLICY` SQL statement" no longer
+holds — authz v2 (item 24 Z1/Z2) added `CREATE POLICY <name> ON <table> FOR
+<op> USING (<predicate>)` with per-operation policies and `WITH CHECK`; the
+predicate still arrives as a SQL string parsed by the ordinary parser, so
+there is still no `Expr` wire format.)_
 
 Row encoding is hand-rolled tag+value per column (that *is* the hot path):
 tags 0=`Null`, 1=`Int64`, 2=`Text`, 3=`Bool`, 4=`Json`, 5=`Vector`
@@ -557,9 +589,11 @@ guarding a different failure mode.
 > index is now **durable, synchronous, WAL-logged, and crash-recovered — never
 > rebuilt on open.** The B-Tree (P3.a), full-text/inverted (P3.b), and
 > edge-adjacency (P3.b) indexes are on-disk B+trees (`DiskBTree`); the vector
-> index (P3.c) is an on-disk IVF-Flat (`DiskIvfIndex`) whose cell posting lists
-> are themselves a `DiskBTree` and whose centroids live in a WAL-logged meta
-> page. All are updated inline on the write path
+> index (P3.c) was an on-disk IVF-Flat (`DiskIvfIndex`) whose cell posting lists
+> were themselves a `DiskBTree` and whose centroids lived in a WAL-logged meta
+> page — since replaced by the on-disk HNSW graph `DiskHnswIndex` (item 63,
+> 2026-07-17; §5.5), which keeps the same durable/WAL-logged/crash-recovered
+> contract. All are updated inline on the write path
 > (`apply_durable_index_writes`, `graph/edges::ensure_edge_index`) and read from
 > their stable meta pages. The graph/LOB write paths are serialized by
 > `Engine::write_serial`. The SQL write path was, through Phase 5, serialized by
@@ -608,7 +642,10 @@ terms + RLS apply identically to a full scan).
 - **`NEAR` (M2.d)**: over-fetch `max(4k, k+20)` candidates, then filter.
   Requires an HNSW index (clear `SqlPlan` error otherwise — no silent
   full-scan fallback, because approximate top-k has no correct fallback).
-  Served by the durable IVF-Flat index (`DiskIvfIndex`, P3.c) — no `Ready`
+  Served by the durable on-disk HNSW graph index (`DiskHnswIndex`, item 63 —
+  §5.5) _(correction 2026-07-22: this bullet still said "durable IVF-Flat
+  index (`DiskIvfIndex`, P3.c)"; item 63 (2026-07-17) replaced IVF-Flat with
+  the true HNSW graph)_ — no `Ready`
   status any more (the index is always crash-consistent with committed data); a
   column flagged `Hnsw` but never built (no `index_root`) yields zero candidates.
 - **B-Tree (M6.b; durable since P3.a)**: `find_indexable_btree_predicate`
@@ -1016,7 +1053,9 @@ Three rules repeat across every milestone and are worth stating once:
 1. **Secondary indexes are non-transactional derived state whose entries
    are hints, re-validated against MVCC.** Since Phase 3 **every** index kind is
    durable and WAL-logged — B-Tree/full-text/edge as `DiskBTree` (P3.a/P3.b), the
-   vector index as `DiskIvfIndex` (P3.c) — yet all still have *no undo*: their
+   vector index as the on-disk HNSW `DiskHnswIndex` _(correction 2026-07-22:
+   previously written as "`DiskIvfIndex` (P3.c)"; item 63 replaced IVF-Flat
+   with the HNSW graph — §5.5)_ — yet all still have *no undo*: their
    entries remain hints, not transactional state (a redo-only `WAL_INDEX` entry
    from an aborted txn is a harmless stale hint). What every kind shares is the
    load-bearing invariant: *every candidate an index produces is re-checked
@@ -1056,12 +1095,13 @@ Three rules repeat across every milestone and are worth stating once:
    promised*, which is a distinct, contract-specific question rule 3 must
    answer for each reader individually.
 
-Test inventory (post-M8, `-p unidb` default features): 225 unit tests, 11
-crash-harness tests, plus per-domain integration suites (`graph_locking`
-4, `graph_rebuild` 3, `graph_mvcc` 2, `index_rebuild` 5, `vector_mvcc` 1,
-`btree_mvcc` 1, `queue_vacuum` 4, `queue_mvcc` 2) = 258 total; add 25
-`server_*` integration tests with `--features server` (228 unit tests, 3
-of them feature-gated). `unidb-attach` adds 19 integration tests (3 CRUD +
+Test inventory (updated 2026-07-22; the post-M8 snapshot was 225 unit + 11
+crash = 258): approximately **~489 unit tests** in `src/`, **54
+crash-harness tests** (`tests/crash/main.rs`), and ~450 integration tests
+across the per-domain `tests/*.rs` suites — ≈996 `#[test]` functions in
+total by grep (`-p unidb`, default features) — plus ~98 `#[tokio::test]`
+`server_*`/storage-route integration tests with `--features server`.
+`unidb-attach` adds 19 integration tests (3 CRUD +
 6 extras + 4 graph + 6 SQL) + 1 doctest. Clippy `-D warnings` and fmt
 clean across the whole workspace. `graph_rebuild`/`graph_mvcc` counts
 dropped from M7's peak (5/3) back to their pre-M7 levels (3/2) when the
@@ -1151,9 +1191,14 @@ the single writer thread).
 
 - **~~HNSW rebuild-per-upsert~~ (resolved in P3.c)**: the in-RAM HNSW's
   full-graph-rebuild-per-upsert (no incremental insert in `instant-distance`) is
-  gone — the vector index is now the durable IVF-Flat `DiskIvfIndex`, whose
-  per-insert cost is a single posting-list `DiskBTree` insert (O(log n)) and whose
-  open cost is O(1). CSR (also non-incremental, debounced) is likewise retired.
+  gone. _(Correction 2026-07-22: this bullet credited the fix to "the durable
+  IVF-Flat `DiskIvfIndex`" with an O(log n) posting-list insert; item 63
+  (2026-07-17) replaced IVF-Flat with the on-disk HNSW graph `DiskHnswIndex`
+  (§5.5), whose per-insert cost was a synchronous beam search on the write
+  path — until item 107 (2026-07-22) activated the item-67 async background
+  HNSW worker on served engines, taking graph stitching off the commit
+  critical path. Open cost remains O(1).)_ CSR (also non-incremental,
+  debounced) is likewise retired.
 - **SSE subscriber scaling** ~~(O(total events) × N pollers)~~: **resolved by item 26** — Q1 gives O(log n + returned) index-based poll; Q2 replaces per-subscriber polling timers with a commit-side `EventWake` condvar so idle subscribers do zero work. The serialization through the writer thread is unchanged, but the per-wake cost is now O(log n + new events) per subscriber.
 - **`NEAR` latency (~4–5 ms)** is transactional overhead, not vector
   search — the raw structures answer in microseconds (fulltext search
@@ -1241,7 +1286,8 @@ durable_fsm_catalog_pagelist.md`); ~~256-frame buffer pool + `BufferPoolFull` at
 (**fixed** — configurable 4096-frame default + chunked file growth, P1.c);
 ~~`alloc_page` remaps the whole file per page~~ (**fixed P1.c**: chunked
 growth); ~~HNSW full rebuild per upsert~~ (**fixed P3.c**: durable IVF-Flat, O(1)
-open); ~~CSR full rebuild per debounce pass~~ (retired in P3.b); `poll_events`
+open — the IVF-Flat itself later replaced by the on-disk HNSW `DiskHnswIndex`,
+item 63, §5.5); ~~CSR full rebuild per debounce pass~~ (retired in P3.b); `poll_events`
 full-scan (needs a `seq` index); SSE poll-per-subscriber; ~~UPDATE re-indexed
 every row with a full-page `WAL_INDEX` image *per row*~~ (**fixed by
 crud-perf Phase A, 2026-07-10**: `exec_update` now accumulates every touched
@@ -1303,23 +1349,44 @@ Functional gaps (deliberate scope, tracked): ~~RC re-evaluation
 (EvalPlanQual) unimplemented~~ and ~~SSI is a no-op seam~~ (**both fixed P1.d**
 — RR/SERIALIZABLE conflicts are now `SerializationFailure`, RC re-reads via its
 fresh snapshot, and SSI pivot detection prevents write-skew; reduced form:
-row-granularity, no phantom protection); no wait queue/deadlock detection (by
-design, D12 — blocking-then-EvalPlanQual for an *active*-writer conflict is
-Phase 5); catalog DDL not transactional; SQL grammar gaps (no OR/ORDER
-BY/LIMIT/aggregates/joins/subqueries/`IN` — parked as Phase 2); no
-full-text SQL operator; single-column indexes only; no cost-based index
-selection; Cypher is single-hop read-only, nodes are opaque i64s; no CSR
-reverse (`to_id`) traversal; RLS is Rust-API-only; ~~manual heap vacuum only
+row-granularity, no phantom protection); ~~no wait queue/deadlock detection~~
+(**fixed Phase 5** — the real lock manager has blocking `Condvar` waits +
+wait-for-graph deadlock detection); catalog DDL not transactional; ~~SQL
+grammar gaps (no OR/ORDER BY/LIMIT/aggregates/joins/subqueries/`IN` — parked
+as Phase 2)~~ (**shipped** — Phase 4 delivered OR/ORDER BY/LIMIT/aggregates/
+joins/subqueries/`IN`/CTEs (§4.7), and items 19/30 added window functions,
+`CASE`, `CAST`, set ops, `RETURNING`, derived tables, `LIKE`/`ILIKE`/`MATCH`;
+still open per item 19: recursive CTEs + cumulative window frames); ~~no
+full-text SQL operator~~ (**shipped item 30** — `MATCH`); single-column index
+keys only (covering `INCLUDE` payload columns since item 102-B); ~~no
+cost-based index selection~~ (**shipped** — P4.d cost-based optimizer plus
+the item-43 size-aware selectivity gate with best-arm predicate selection);
+Cypher is single-hop read-only, nodes are opaque i64s; no reverse (`to_id`)
+adjacency traversal; ~~RLS is Rust-API-only~~ _(correction 2026-07-22:
+superseded — RLS-over-REST shipped with item 12 R3 (`set_rls_policy_sql` +
+`PUT /tables/{t}/rls`) and SQL `CREATE POLICY` DDL with per-operation
+policies shipped with authz v2, item 24 — §4.7)_; ~~manual heap vacuum only
 (`Engine::vacuum()`, M10) — no *automatic*/threshold-driven autovacuum~~
 (**fixed by Autovacuum A1–A4** — a background `std::thread` launcher
 threshold-triggers `Engine::vacuum`; ~~per-table granularity + a cost throttle
 remain future work~~ **RESOLVED (item 27, 2026-07-13):** per-table
 estimates + `vacuum_table` + `VacuumCostConfig` throttle shipped).
+Still genuinely open as of 2026-07-22 (statuses in
+`docs/backlog/backlog_index.md`): **item 112** column-level grants
+(deliberately parked — the deferred half of item-24 Z4), **item 19**'s
+recursive-CTE + cumulative-window-frame remainder (deferred), **item 106**
+pgvector-class `NEAR` latency tier (≤400 µs at 10k), and **item 57**'s
+next-perf ROI list.
 
-Server gaps: no multi-request transaction sessions; no TLS (reverse-proxy
-assumption); verify-only JWT with no scopes (any valid token can hit
-`/checkpoint`); no gRPC; no writer-thread self-healing (process restart is
-the recovery model); ~~read routes inherit the read-only fsync~~ (fixed
+Server gaps: ~~no multi-request transaction sessions~~ (**shipped item 12
+R1** — `X-Txn-Id` sessions with per-session isolation, §8); ~~no TLS
+(reverse-proxy assumption)~~ (**shipped P6.f** — native rustls TLS,
+`server/tls.rs`); ~~verify-only JWT with no scopes (any valid token can hit
+`/checkpoint`)~~ _(correction 2026-07-22: superseded — the JWT `sub` claim
+maps to a user whose per-table privileges are enforced by authz (P6.e +
+item 24), and item 100 added `POST /auth/login` (dev mode) +
+`GET /auth/whoami`)_; no gRPC; no writer-thread self-healing (process
+restart is the recovery model); ~~read routes inherit the read-only fsync~~ (fixed
 2026-07-08 — read-only commits no longer fsync). **Concurrent reads (6b,
 2026-07-08):** point reads (`GET /rows/:id`) now run off the single writer
 thread on a `Send + Sync` `ReadHandle` — a frame-free `SharedPageReader` over
@@ -1352,7 +1419,7 @@ bound). `NEAR`/graph/queue reads remain writer-side for now (additive).
 | D6 | Single-file storage (WAL separate) | unchanged; revisit was gated post-M4, not yet re-opened |
 | D7 | Crash-injection harness, simple by design | `tests/crash/main.rs` P1–P12 (P10 = mid-vacuum M10, P11 = torn-page/`WAL_FPI` P1.a, P12 = fsync-failure poison P1.b) + property test |
 | D8 | 8 KiB pages, init-time config, immutable after | `format.rs`; baked into control file |
-| D9 | Little-endian, CRC32+LSN per page, magic+version | `format.rs`/`page.rs`/`wal.rs`; `FORMAT_VERSION = 8` (v7→v8 for `WAL_HOT_UPDATE` + `hot_next` tuple-header field, item 58, 2026-07-17) |
+| D9 | Little-endian, CRC32+LSN per page, magic+version | `format.rs`/`page.rs`/`wal.rs`; `FORMAT_VERSION = 12` (latest bump v11→v12 for the covering-index `INCLUDE` leaf payload, item 102-B; full v1→v12 history in §3.1 / `src/format.rs`) |
 | D10 | RC default, RR available, same snapshots | `txn.rs` snapshot lifetime |
 | D11 | `on_read`/`on_write` seam; SSI is an addition | seam in `concurrency_hooks.rs`; SSI landed at the executor + `txn.rs::SsiState` (P1.d) |
 | D12 | SI abort-on-conflict; RC re-eval; SSI | `lockmgr.rs` (no wait queue); RC re-reads via fresh snapshot + RR/SER `SerializationFailure` + SSI pivot abort (P1.d) |
@@ -1470,7 +1537,9 @@ optional synchronous-commit gate. (Documented limit: a page first allocated
 pages present in the base — re-base regularly.) **P6.d backups + PITR:**
 `Engine::base_backup` (checkpoint + copy) + `archive_wal`, and
 `backup::restore(base, archive, dest, target_lsn)` for point-in-time recovery
-**by LSN** (time-based needs commit timestamps — a follow-up). **P6.e
+**by LSN** (time-based needs commit timestamps — a follow-up; _that follow-up
+shipped: item 28 R1, 2026-07-13 — `restore_to_time` over the `timeline.bin`
+commit-timestamp side index, `src/backup/timeline.rs`_). **P6.e
 users/roles/GRANT:** `authz::RoleStore` (`roles.json`) with transitive role
 membership + per-table privileges; `Engine::execute_sql_as(user, ..)` enforces
 them and intercepts the auth-DDL grammar (parsed in `authz`, not `sqlparser`);
@@ -1605,3 +1674,29 @@ instead of a single page. Each chain page begins with `CATALOG_CHAIN_MAGIC`
 unchanged. No `FORMAT_VERSION` bump; no §3 decision reopened. Crash point P33
 added to the harness (35/35). Removes the ~8 KiB `HeapFull` ceiling that
 item 23 had to work around. See §4.6 and `PROGRESS.md` entry for metrics.
+
+**Closeout 2026-07-22 — backlog items through 111 (item 112 parked):** since
+the item-25 entry above, the sprint shipped: **item 24 authz v2** (`CREATE
+POLICY` DDL, per-operation RLS policies with `WITH CHECK`, JWT user mapping,
+catalog views, transitive role inheritance — the column-level-grants half
+split out as parked **item 112**); **items 23/31 object storage** (MinIO/S3
+tiering over engine metadata + the `StorageApi` trait + 7 `/storage/*`
+routes) and **item 32 bulk NDJSON load**; **item 28 time-based PITR**
+(`restore_to_time` via the `timeline.bin` side index) **+ logical
+replication** (`unidb-logical`); **item 29 CDC envelope** (before/after
+images, canonical envelope + format adapters, lag observability); **items
+35/36 real constraint enforcement** (implicit unique-enforcement B-tree per
+PK/UNIQUE column; full row-level FK with parent RESTRICT + `FkKey` phantom
+locks — §4.7 correction); and the **items 40–109 performance sprint**,
+highlights: item 63 on-disk HNSW replacing IVF-Flat (with `FORMAT_VERSION`
+bumps 8→12 across items 58/71/79-80/97/102-B — §3.1), item 96 plan cache,
+item 97 O(1) `COUNT(*)`, item 98 `InsertAccum` streaming INSERT, item 101
+group-commit dwell window, item 102 index-only + covering (`INCLUDE`) scans,
+item 104 catalog fsync dedup, item 107 async-HNSW worker activation on
+served engines, item 109 page-cached candidate resolution (warm filtered
+SELECT 3.0×). Closing fixes: **item 110** (RLS + `LIMIT` crash —
+`current_user` substituted before QuerySpec policy conversion; the fallback
+now fails closed) and **item 111** (`information_schema.*` visibility
+follows existing table grants, Postgres semantics). Crash harness now 54
+tests; ~996 `#[test]` functions across `src/` + `tests/` (§10). Per-item
+metrics in `PROGRESS.md`; statuses in `docs/backlog/backlog_index.md`.

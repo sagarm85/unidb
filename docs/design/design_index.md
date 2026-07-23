@@ -65,6 +65,17 @@ win.
   proposed future roadmap — each with architecture/flow diagrams, exact data
   structures, border cases, and measured numbers. Start at its
   [index](processing-engines/00_engines_index.md).
+- [`item28_design.md`](item28_design.md) — **time-based PITR + logical
+  replication (item 28)**: the committed-before-code design note — R1's side
+  timeline index (`timeline.bin`, no WAL-format change) behind
+  `Engine::restore_to_time`, and R2's `unidb-logical` subscriber crate
+  (at-least-once, durable `__consumers__` offsets). Shipped 2026-07-13 (R1 +
+  R2; see `PROGRESS.md`).
+- [`p3c_vector_spike.md`](p3c_vector_spike.md) — **SUPERSEDED** — the P3.c
+  on-disk vector spike (IVF-Flat selection + recall validation, 2026-07-08).
+  Item 62's scale validation failed the recall gate at 100k rows and item 63
+  replaced IVF-Flat with the on-disk HNSW graph (2026-07-17); kept as history,
+  per its own header — read `engine_design.md` §5.5 for current state.
 - [`storage_service.md`](storage_service.md) — **object storage service
   (`unidb-storage`, backlog item 23)**: the design note for the Supabase-Storage
   analog — S3 client choice (`aws-sdk-s3`, one wire impl for MinIO+S3), hybrid

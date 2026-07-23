@@ -1,5 +1,5 @@
 **Type:** Performance
-**Status:** ⏳ NOT STARTED (filed 2026-07-20)
+**Status:** ✅ SHIPPED 2026-07-20 (PR #170) — group-commit dwell window in WAL `sync_up_to`; `PUT /config/group_commit_window_us`; `Engine::wal_fsyncs_count()`. See `backlog_index.md` row 101 / PROGRESS.md. _(Header corrected 2026-07-22 — was never flipped at ship time.)_
 
 # Item 101 — Group commit (WAL flush batching)
 

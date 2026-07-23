@@ -1,7 +1,7 @@
 # SELECT JOIN: hash join for equi-joins
 
 **Type:** Performance
-**Status:** PHASE A DONE (2026-07-16) — Phase B pending
+**Status:** ✅ SHIPPED — Phase A 2026-07-16; Phase B 2026-07-20 (PR #171, in-memory hash join for equi-joins). See `backlog_index.md` row 51 / PROGRESS.md. _(Header corrected 2026-07-22 — was never flipped when Phase B shipped.)_
 
 ## Measured gap (`030325`, Docker Linux fsync, 2026-07-16)
 

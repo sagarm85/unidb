@@ -1,7 +1,7 @@
 # SELECT filtered remaining gap: serial B-tree range scan + per-query thread spawn + row materialisation
 
 **Type:** Performance
-**Status:** NOT STARTED
+**Status:** ✅ SHIPPED 2026-07-16 (PRs #125, #123) — Lever 1 (search_range_partition) + Lever 2 (pre-spawned worker pool); Lever 3 (arena alloc) deferred. See `backlog_index.md` row 45 / PROGRESS.md. _(Header corrected 2026-07-22 — was never flipped at ship time.)_
 **Priority:** High — SELECT filtered (k<N) is the flagship filtered-read benchmark; after item 43 the gap narrowed from PG +564% to PG +182% but a 2.8× deficit at 40 k rows remains.
 
 ---

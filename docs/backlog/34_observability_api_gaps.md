@@ -1,7 +1,7 @@
 # Item 34 — Observability API gaps
 
 **Type:** Improvement  
-**Status:** 🚀 IN PROGRESS (branch `34-observability-api-gaps`)  
+**Status:** ✅ SHIPPED 2026-07-14 — `UNIDB_SLOW_QUERY_MS` env var, `PUT /config/slow_query_threshold_ms`, `GET /stats/history` 300-point ring buffer. See `backlog_index.md` row 34 / PROGRESS.md. _(Header corrected 2026-07-22 — was never flipped at ship time.)_  
 **Priority:** High — Studio Observability tab charts reset on reload; slow-query panel is always blank
 
 ---

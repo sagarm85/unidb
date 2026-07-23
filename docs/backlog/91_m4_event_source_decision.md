@@ -1,5 +1,5 @@
 **Type:** Improvement
-**Status:** ✅ DECISION DRAFTED — awaiting sign-off (2026-07-19)
+**Status:** ✅ SHIPPED 2026-07-19 (PR #153) — Option A (executor-capture) approved and recorded: the WAL-derived stream = `RecordKind::Event` rows in the WAL, not physical redo-record derivation. See `backlog_index.md` row 91 / PROGRESS.md. _(Header corrected 2026-07-22 — sign-off landed but the header was never flipped.)_
 
 # Item 91 — M4 event-source decision: slim WAL vs before-images
 

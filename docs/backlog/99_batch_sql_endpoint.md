@@ -1,5 +1,5 @@
 **Type:** Performance
-**Status:** ⏳ NOT STARTED
+**Status:** ✅ SHIPPED 2026-07-19 (PR #162) — `POST /batch-sql` (up to 256 stmts, stop_on_error, per-statement auth); Projects compare.py 109ms→~16ms. See `backlog_index.md` row 99 / PROGRESS.md "Item 99". _(Header corrected 2026-07-22 — was never flipped at ship time.)_
 
 # Item 99 — `/batch-sql` endpoint: amortise HTTP overhead over N queries
 

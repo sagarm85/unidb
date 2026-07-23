@@ -1,7 +1,7 @@
 # Vacuum — per-table accounting, cost throttle, whole-table compaction
 
 **Type:** Improvement
-**Status:** IN PROGRESS → SHIPPED 2026-07-13 (branch `27-vacuum-per-table`, PR pending)
+**Status:** ✅ SHIPPED 2026-07-13 — per-table vacuum accounting, cost throttle, and whole-table compaction. See `backlog_index.md` row 27 / PROGRESS.md. _(Header corrected 2026-07-22 — was never flipped at ship time.)_
 
 > Limitation from the architecture guide + `autovacuum.md` known-limits:
 > "engine-global (not per-table) accounting; no cost-based throttle; no

@@ -114,49 +114,52 @@
 | 104 | `104_catalog_sync_dedup.md` | Performance | ✅ SHIPPED 2026-07-20 — remove `wal.sync_up_to(catalog_lsn)` after `catalog.persist_only()` in commit; `ROW_COUNT_UNKNOWN` sentinel on load; COUNT(*) calibrates via heap scan after crash. See PROGRESS.md "Item 104". |
 | 105 | `105_bench_selective_carry_forward.md` | Improvement | ✅ SHIPPED 2026-07-21 — bench-time reduction: `MM_SKIP_LADDER` (Tables 1+2, ~2.5 h sink), `MM_TABLES` honored by ALL tables, knobs threaded through Docker (were silently ignored), `MM_BASELINE` carry-forward stitching with provenance stamps (`stitch_baseline.py`), section-aware `compare_bench.py` (also fixes Table-4-vs-W4/W0 parse collision). CRUD-item runs ~4 h → ~30–45 min. |
 | 106 | `106_vector_pgvector_class_tier.md` | Performance | ⏳ NOT STARTED — pgvector-class NEAR tier (≤400 µs at 10k, recall ≥0.90): graph-quality heuristic selection, SQ8 slab quantization, re-rank decode-pushdown; Step-0 = recall-vs-ef curve. Filed 2026-07-21 from item 92 acceptance revision. |
-| 107 | `107_async_hnsw_commit_path.md` | Performance | ⏳ NOT STARTED — synchronous HNSW insert breaks the W4≈W0 thesis (Δvector +6.6→+17.6 ms/commit, W4/W0 96× at 100k, Table 4 0.01×; 2026-07-21 bench); implement M2's locked design: async HNSW maintenance in a background worker; Step-0 = audit item 67 coverage + freshness contract. |
+| 107 | `107_async_hnsw_commit_path.md` | Performance | ✅ SHIPPED 2026-07-22 (PR #196) — Step-0 audit found the item-67 async worker existed but nothing spawned it (server + bench both took the sync fallback — the source of the W4/W0 96×); `EngineHandle::spawn` now activates it on served engines; freshness contract (a) signed off with `unidb_hnsw_queue_depth` gauge; bench drain-accounting added. See PROGRESS.md "Item 107". |
 | 108 | `108_crud_ratio_regression_check.md` | Performance | ✅ RESOLVED 2026-07-21 — drift was ENVIRONMENTAL, no unidb regression (PG's code-identical absolutes moved 2.1–28× between runs; unidb improved on every row in absolutes + WAL-B/row). Shipped: PG-absolute env canary in compare_bench.py, decompose.rs ceilings refresh, item-104 COUNT-claim correction. See PROGRESS.md "Item 108". |
-| 109 | `109_parallel_btree_candidate_resolution.md` | Performance | ⏳ NOT STARTED — SELECT filtered 0.45–0.51× → ≥0.70×: parallelise per-candidate heap fetch/visibility/project over page-grouped chunks (Milestone-P workers + item-70 prefetch); B-tree leaf walk stays serial; candidate-count gate; Step-0 = phase-split the serial path first. Filed 2026-07-22. |
-| 110 | `110_rls_limit_boolean_coercion_crash.md` | Improvement | ⏳ NOT STARTED — **high severity:** any non-superuser querying an RLS-protected table with `LIMIT` gets `SQL_PLAN_ERROR: cannot coerce text '<user>' to boolean for comparison`, every time — breaks every paginated view (Table Editor included) for RLS-restricted users. Clean minimal repro; root-caused to the item-38 Text↔Bool coercion arms in `executor.rs::compare()`, likely triggered via the `LogicalPlan::Query(QuerySpec)` / `query_exec.rs` RLS path that plain `LIMIT` queries route through (the simple-Select fast path item 103 fixed has no `limit` field at all). _(Filed as 107/108 in PR #195 before those IDs were taken on main; renumbered 110/111 at merge per the stable-ID rule.)_ |
-| 111 | `111_information_schema_follow_table_grants.md` | Improvement | ⏳ NOT STARTED — a user with full CRUD grants on a table still can't read its own row in `information_schema.tables`/`.columns` without a separate blanket grant (which, since those views are unfiltered, would also reveal every other table's existence). Postgres filters these views per-row by existing table privilege; unidb should too. |
+| 109 | `109_parallel_btree_candidate_resolution.md` | Performance | ✅ SHIPPED 2026-07-22 (PR #197) — Step-0 refuted the filed design (parallel resolution already existed via items 45/54); the real lever was the per-candidate 8 KiB page-copy+CRC in `get_visible`. Fixed with `get_visible_cached` single-page cache: warm filtered SELECT **3.0×** (973→323 µs native); Docker one-shot 0.45→0.50×. Follow-ups open: one-shot fixed cost (~700 µs), warm-median bench methodology. See PROGRESS.md "Item 109". |
+| 110 | `110_rls_limit_boolean_coercion_crash.md` | Improvement | ✅ SHIPPED 2026-07-22 (PR #198) — **was high severity:** any non-superuser querying an RLS-protected table with `LIMIT` crashed with `SQL_PLAN_ERROR: cannot coerce text '<user>' to boolean`, breaking every paginated view for RLS-restricted users. Root cause: `current_user` was destroyed by the QuerySpec policy conversion's `Bool(true)` fallback. Fixed by substituting at policy-injection time (`apply_rls(plan, catalog, user)`); the fallback now fails CLOSED (Null + warn). 5 count-asserted regression tests. _(Filed as 107/108 in PR #195 before those IDs were taken on main; renumbered 110/111 at merge per the stable-ID rule.)_ |
+| 111 | `111_information_schema_follow_table_grants.md` | Improvement | ✅ SHIPPED 2026-07-22 (PR #199) — `information_schema.*` no longer needs its own view grant; rows are filtered per-caller by ANY-privilege on the underlying table across all five views (Postgres semantics), so a user sees exactly the tables they hold grants on and nothing else. `unidb_catalog.*` stays Z5 grant-gated. 5 tests. See PROGRESS.md "Item 111". |
 | 112 | `112_column_level_grants.md` | Improvement | ⏳ NOT STARTED (deliberately parked) — column-level GRANT/REVOKE (Postgres narrowing semantics, error-not-mask); the deferred half of item-24 Z4. Wide touch: grant vocab/persistence, DDL, read+write+RETURNING enforcement incl. QuerySpec shapes, policy-column exemption decision, item-111 columns-view filter, fast-path audit. Un-park when a concrete user need appears. |
+| 113 | `113_fk_error_message_direction.md` | Improvement | ⏳ NOT STARTED — parent-DELETE FK RESTRICT reuses the child-INSERT message shape ("value X has no matching row in 'parent'"), the exact opposite of what happened; should name the parent row + blocking child table/column. Registered 2026-07-22 (file predates as unregistered `42_…` duplicate; renumbered per stable-ID rule). |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
 **Next new file → `113_…`.**
 
-## Next up — priority order (2026-07-20, post PR #171 merge + 102-B)
+## Next up — priority order (2026-07-22, post items 105/92/108/107/109/110/111)
 
-State after 2026-07-20 (items 51/67/68/69/101/102-A/102-B all shipped):
-
-| Operation | unidb ÷ PG | Status |
-|---|---|---|
-| SELECT COUNT(*) | **6.93×** | ✅ well above 1× |
-| DELETE all | **7.06×** | ✅ well above 1× |
-| DELETE selected | **2.73×** | ✅ well above 1× |
-| SELECT GROUP BY | **1.30×** | ✅ above 1× |
-| UPDATE HOT | **1.51×** | ✅ well above 1× |
-| UPDATE non-HOT | 0.81× | 📈 ceiling ~0.85–0.90× |
-| SELECT filtered | 0.74× | 📈 ceiling ~0.80–0.85× (102-B covering reduces deform_row cost) |
-| INSERT per-row | 0.53× | 🔒 structural single-fsync floor; item 101 targets concurrent path |
+CRUD ratio snapshot: the 2026-07-20 table previously shown here is retired —
+item 108 proved cross-run ÷PG ratios are evidence only when the PG-absolute
+environment canary is quiet. Current per-operation state lives in the
+`decompose.rs` ceilings table (refreshed to the 2026-07-21 run) and
+`docs/performance/` (see its README for the authoritative report).
 
 **Next priority items:**
 
-1. ~~**#104 Catalog sync dedup**~~ — ✅ SHIPPED 2026-07-20 (→ PROGRESS.md "Item 104 — Catalog sync dedup"). Remove `wal.sync_up_to(catalog_lsn)` after `catalog.persist_only()`; eliminates double-fsync-per-INSERT; catalog row-count recomputed from heap on crash.
-2. ~~**#102-B Covering index**~~ — ✅ SHIPPED 2026-07-20 (PR #177).
-3. ~~**#93 HNSW arena layout**~~ — ✅ SHIPPED 2026-07-20 (PR #175).
-4. ~~**#94 NEAR lightweight snapshot**~~ — ✅ SHIPPED 2026-07-20 (PR #176).
-5. ~~**#95 graph adjacency cache**~~ — ✅ SHIPPED 2026-07-20 (PR #174).
-6. ~~**#103 AuthZ superuser bypass fix**~~ — ✅ SHIPPED 2026-07-20 (PR #173).
+1. **Fresh full Docker bench on current main** — first official record of item
+   107's W4/W0 ladder collapse; becomes the new `MM_BASELINE` carry-forward
+   anchor (item 105 machinery).
+2. **#106 vector pgvector-class tier** — NEAR ≤400 µs at 10k, recall ≥0.90;
+   Step-0 = recall-vs-ef curve.
+3. **#109 follow-ups** — one-shot fixed cost (~700 µs) and the Table-3
+   warm-median methodology decision.
+4. **Chips** — item-103 `LIMIT` test variant.
 
 **What is NOT in this list:**
 - Parallel DML apply: held in reserve; not justified at current acceptance band.
-- AuthZ v2 (item 24): fully shipped (R-a/R-b + item 100, PR #168 2026-07-20).
+- Parked: #112 column-level grants (awaiting a concrete user need), item-19
+  recursive-CTE/cumulative-window-frame residue.
 
 ## How to update this file
 
 - **Start** an item → set status to 🔄 IN PROGRESS; if it's a "Next up"
   candidate, create its `NN_<slug>.md` (next free number) and add a Registry row.
-- **Ship** it → status → ✅ SHIPPED with the `PROGRESS.md` entry name.
+- **Ship** it → status → ✅ SHIPPED with the `PROGRESS.md` entry name — **in
+  BOTH places**: the Registry row here AND the item file's own `**Status:**`
+  header. (The 2026-07-22 audit found both one-sided drifts: 4 rows behind
+  their files, 15 files behind their rows.)
+- **Verify** with `./scripts/lint_backlog.sh` (repo root) — it cross-checks
+  every numbered file's Status header against its Registry row and flags
+  orphans/duplicate IDs. Run it before any docs push.
 - Keep this the source of truth for *what exists and where it stands*; keep
   metrics in `PROGRESS.md` and running state in `MEMORY.md`.

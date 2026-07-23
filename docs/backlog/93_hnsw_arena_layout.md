@@ -1,5 +1,5 @@
 **Type:** Performance
-**Status:** 🔄 IN PROGRESS — branch `perf/item-93-hnsw-arena`, 2026-07-20; Docker bench pending. See PROGRESS.md "Item 93".
+**Status:** ✅ SHIPPED 2026-07-20 (PR #175) — `L0Arena` flat slab with zero-copy beam search; 0 disk fetches warm path, recall@10 1.000; Docker bench pending. See `backlog_index.md` row 93 / PROGRESS.md "Item 93". _(Header corrected 2026-07-22 — was never flipped at ship time.)_
 
 # Item 93 — HNSW L0 arena layout: eliminate per-neighbor Vec clone
 

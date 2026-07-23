@@ -4,7 +4,9 @@
 > gap to a real database, and the phased path to close it. Correctness and
 > performance are gates, not features. Distills `CLAUDE.md` / `MEMORY.md` /
 > `PROGRESS.md` — when it disagrees with them, they win.
-> **Last updated: 2026-07-11.** Supersedes the earlier per-milestone backlog
+> **Last updated: 2026-07-22** (refresh: §4.1's stale "next up" list replaced
+> with a pointer to `backlog_index.md`'s live Next-up section; §8 bridging note
+> on where post-item-15 decisions are recorded). Supersedes the earlier per-milestone backlog
 > docs (now shipped and recorded in `PROGRESS.md`, or folded into a phase below).
 > **Backlog file naming + lifecycle:** see `CONVENTIONS.md`. The `phase<N>_`
 > prefix is reserved for the numbered phases *in this file*; other efforts
@@ -119,26 +121,17 @@ commit-time-fsync default (PR #24) and the Postgres baseline comparison (PR #25)
 The §2/§3 tables below predate the Phase 4–6 completions and are kept for
 historical shape — `MEMORY.md` is authoritative for current state.
 
-### 4.1 Next up — hardening items filed post-Phase-6
+### 4.1 Next up — how the queue is tracked
 
-Two engine (Core-lane) items filed from the **Postgres baseline comparison**
-(`pg_baseline_comparison.md`, PR #25) — the two honest gaps it surfaced. Both are
-`src/` work, each its own PR; neither reopens a §3 locked decision.
-
-| Item | Why (evidence) | Severity | Spec |
-|---|---|---|---|
-| **Durable FSM + O(1) table-page representation** | SQL bulk-load hits `HeapFull` at ~145k rows — the catalog stores `TableDef.pages` as an unbounded `Vec<PageId>` in a single-page JSON blob (O(heap-pages) cap). Raw insert is immune (builds 5M linearly). | **Correctness/scale** (a real ceiling, not perf) | [`durable_fsm_catalog_pagelist.md`](durable_fsm_catalog_pagelist.md) |
-| **Autovacuum** | Under 30× update churn, point reads degrade 6.8→35 µs with no autovacuum; a manual `Engine::vacuum()` restores 5.85 µs. Automation gap, not capability (M10 reclamation already exists). | **Perf/ops** (steady-state bloat) | [`autovacuum.md`](autovacuum.md) |
-| **CRUD perf — Phase A (write) + Phase B (scan)** *(filed 2026-07-10, NOT STARTED)* | Multi-model CRUD stress vs matched-durability PG: **UPDATE 0.11×** (re-indexes unchanged columns, 1 full-page `WAL_INDEX`/row — `apply_durable_index_writes`), DELETE 0.20× / filtered SELECT 0.15× (UPDATE/DELETE full-scan, never use the index; whole-row decode; per-row re-snapshot), COUNT scan ~8×. All CPU/WAL-volume, not fsync. | **Perf** (single-model CRUD) | [`crud_performance.md`](crud_performance.md) |
-
-Sequencing: the **durable FSM** is the higher-severity item (removes a hard cap
-and, done right, also kills the SQL path's per-statement FSM rebuild — it subsumes
-the cheap "cache the Heap" stopgap); ship it as a Core-lane checkpoint (F1 extents
-first → F2 durable FSM). **Autovacuum** is smaller (AV1 copies the existing
-`maybe_auto_checkpoint` trigger pattern, no new thread; AV2 promotes it to a
-background worker for the server) and can land in parallel — it touches
-vacuum/commit, disjoint from the FSM's catalog/page work, though both share
-free-space accounting and should not drift.
+_(Refreshed 2026-07-22: this section used to carry its own ranked table of
+post-Phase-6 items — durable FSM, autovacuum, CRUD perf — all long since
+shipped, see `backlog_index.md` rows 09/10/13. The list is not duplicated here
+anymore.)_ The **live ranked "Next up" list lives in
+[`backlog_index.md`](backlog_index.md)** — its registry is the at-a-glance
+pending/completed tracker, and its Next-up section is reordered freely as
+priorities shift (priority is not the ID). Items are filed one-per-file as
+`NN_<slug>.md` per [`CONVENTIONS.md`](CONVENTIONS.md); this roadmap stays the
+strategic frame (positioning, phases, lanes, parked list), not the queue.
 
 ---
 
@@ -210,6 +203,13 @@ status, same discipline as M10.
 ---
 
 ## 8. Decision & session log (newest first)
+
+### 2026-07-22 — where the log moved (bridging note)
+From item 15 onward, decisions and session outcomes are recorded **per-item in
+the numbered backlog files** (`docs/backlog/NN_<slug>.md`, indexed in
+`backlog_index.md`) **and in `PROGRESS.md`**, not appended here. The entries
+below are the pre-numbered-backlog record (through 2026-07-10) and are kept
+as-is for history.
 
 ### 2026-07-10 — CRUD-perf Phase A + Phase B filed (write + scan path)
 - Multi-model CRUD-stress report (`benches/decompose.rs` Table 3/3.1) vs

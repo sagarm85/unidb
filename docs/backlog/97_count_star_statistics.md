@@ -1,5 +1,5 @@
 **Type:** Performance
-**Status:** ⏳ NOT STARTED
+**Status:** ✅ SHIPPED 2026-07-19 (PR #161) — `row_count` in `TableDef` maintained on INSERT/DELETE/TRUNCATE; O(1) COUNT(*) fast path, 6.93× vs PG. See `backlog_index.md` row 97 / PROGRESS.md "Item 97". _(Header corrected 2026-07-22 — was never flipped at ship time.)_
 
 # Item 97 — Exact COUNT(*) statistics: O(1) row count from catalog
 

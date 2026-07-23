@@ -1,7 +1,7 @@
 # Parallel full-scan for DELETE selected (item 66)
 
 **Type:** Performance
-**Status:** 🔄 IN PROGRESS 2026-07-18
+**Status:** ✅ SHIPPED 2026-07-18 — `parallel_collect_matching` in `parallel_scan.rs` with A3-gate-aware collect in `exec_delete`; 48/48 crash PASS; Docker bench pending. See `backlog_index.md` row 66 / PROGRESS.md "Item 66". _(Header corrected 2026-07-22 — was never flipped at ship time.)_
 
 > Design from item 57 §B, calibrated on `report_20260717_151029.md` (100k rows,
 > DELETE selected 238,747 rec/s = 0.04× PG; CRC fix item 64 not yet in that bench).
