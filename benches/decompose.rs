@@ -1974,12 +1974,27 @@ fn pg_crud_insert(url: &str, n: u64, base: i64) -> (u64, f64) {
     (n, start.elapsed().as_secs_f64())
 }
 
+/// Session-level PG parallelism for the SELECT rows. `workers = 2` is
+/// PostgreSQL's factory default for `max_parallel_workers_per_gather` — the
+/// main Table 3 rows pin it so ratios don't drift with container config.
+/// The sensitivity sub-table re-measures with `workers = 32` (bounded by the
+/// server's `max_worker_processes`, raised in docker-compose) so the report
+/// carries the uncapped truth alongside the default — the cap is an
+/// asymmetry (unidb's pool = host cores) and must be visible, not buried.
+fn pg_set_parallel(c: &mut postgres::Client, workers: u32) {
+    c.batch_execute(&format!(
+        "SET max_parallel_workers_per_gather = {workers}; SET max_parallel_workers = {workers}"
+    ))
+    .unwrap();
+}
+
 fn pg_crud_select_filtered(url: &str, lo: i64, hi: i64) -> (u64, f64) {
+    pg_crud_select_filtered_with(url, lo, hi, 2)
+}
+
+fn pg_crud_select_filtered_with(url: &str, lo: i64, hi: i64, workers: u32) -> (u64, f64) {
     let mut c = pg_dial(url).unwrap();
-    // Cap to 2 workers so SELECT ratios don't vary with core count across environments
-    // (on an 18-core machine PG would otherwise use far more workers than on a 4-core).
-    c.batch_execute("SET max_parallel_workers_per_gather = 2")
-        .unwrap();
+    pg_set_parallel(&mut c, workers);
     let start = Instant::now();
     let rows = c
         .query(
@@ -1991,9 +2006,12 @@ fn pg_crud_select_filtered(url: &str, lo: i64, hi: i64) -> (u64, f64) {
 }
 
 fn pg_crud_select_grouped(url: &str, scanned: u64) -> (u64, f64) {
+    pg_crud_select_grouped_with(url, scanned, 2)
+}
+
+fn pg_crud_select_grouped_with(url: &str, scanned: u64, workers: u32) -> (u64, f64) {
     let mut c = pg_dial(url).unwrap();
-    c.batch_execute("SET max_parallel_workers_per_gather = 2")
-        .unwrap();
+    pg_set_parallel(&mut c, workers);
     let start = Instant::now();
     let _rows = c
         .query("SELECT g, COUNT(*) FROM t GROUP BY g", &[])
@@ -2002,9 +2020,12 @@ fn pg_crud_select_grouped(url: &str, scanned: u64) -> (u64, f64) {
 }
 
 fn pg_crud_count_all(url: &str, scanned: u64) -> (u64, f64) {
+    pg_crud_count_all_with(url, scanned, 2)
+}
+
+fn pg_crud_count_all_with(url: &str, scanned: u64, workers: u32) -> (u64, f64) {
     let mut c = pg_dial(url).unwrap();
-    c.batch_execute("SET max_parallel_workers_per_gather = 2")
-        .unwrap();
+    pg_set_parallel(&mut c, workers);
     let start = Instant::now();
     let _rows = c.query("SELECT COUNT(*) FROM t", &[]).unwrap();
     (scanned, start.elapsed().as_secs_f64())
@@ -2957,7 +2978,13 @@ fn bench_mm_report() {
          \n\
          **Note on INSERT:** here each row is its **own durable commit** (one fsync/row —\n\
          the per-row latency floor, ~hundreds/sec), which is why it is far below the\n\
-         batched bulk-load path in Table 3.1 (one commit per {BULK_COMMIT_BATCH} rows).\n"
+         batched bulk-load path in Table 3.1 (one commit per {BULK_COMMIT_BATCH} rows).\n\
+         \n\
+         **Parallelism semantics (read before comparing SELECT rows):** the three\n\
+         SELECT rows pin Postgres at its factory default (2 parallel workers) while\n\
+         unidb's pool uses the host's cores — see the *PG parallelism sensitivity*\n\
+         sub-table below for the same queries with PG uncapped. PG never\n\
+         parallelizes DML, so INSERT/UPDATE/DELETE rows are setting-independent.\n"
         );
         if let Some(ref m) = pg_method {
             println!(
@@ -3014,27 +3041,45 @@ fn bench_mm_report() {
             // and hid the real gap: at 100% selectivity every row materialises regardless.
             // Verified 2026-07-17 by Fable architectural analysis (cost breakdown in PROGRESS.md).
             let sel_hi = (n / 20) as i64; // 5 % of rows
+            let u_filt = phased("t3_selfilt_unidb", || {
+                measured_unidb(&se, || sql_crud_select_filtered(&se, 0, sel_hi))
+            });
             crud_row_c1(
                 "SELECT filtered (k<N/20, 5%)",
-                phased("t3_selfilt_unidb", || {
-                    measured_unidb(&se, || sql_crud_select_filtered(&se, 0, sel_hi))
-                }),
+                u_filt,
                 phased("t3_selfilt_pg", || pg_crud_select_filtered(u, 0, sel_hi)),
             );
+            let u_grp = phased("t3_selgrp_unidb", || {
+                measured_unidb(&se, || sql_crud_select_grouped(&se, 2 * n))
+            });
             crud_row_c1(
                 "SELECT grouped (GROUP BY g)",
-                phased("t3_selgrp_unidb", || {
-                    measured_unidb(&se, || sql_crud_select_grouped(&se, 2 * n))
-                }),
+                u_grp,
                 phased("t3_selgrp_pg", || pg_crud_select_grouped(u, 2 * n)),
             );
+            let u_cnt = phased("t3_countall_unidb", || {
+                measured_unidb(&se, || sql_crud_count_all(&se, 2 * n))
+            });
             crud_row_c1(
                 "SELECT COUNT(*) (all)",
-                phased("t3_countall_unidb", || {
-                    measured_unidb(&se, || sql_crud_count_all(&se, 2 * n))
-                }),
+                u_cnt,
                 phased("t3_countall_pg", || pg_crud_count_all(u, 2 * n)),
             );
+            // PG parallelism sensitivity: re-measure the three parallel-
+            // eligible SELECTs with PG uncapped (32 workers requested;
+            // bounded by the server's max_worker_processes, raised in
+            // docker-compose). Must run HERE — before the UPDATE/DELETE
+            // phases mutate the table. Printed as a sub-table further down,
+            // after the main table closes.
+            let pg_filt_max = phased("t3_selfilt_pg_max", || {
+                pg_crud_select_filtered_with(u, 0, sel_hi, 32)
+            });
+            let pg_grp_max = phased("t3_selgrp_pg_max", || {
+                pg_crud_select_grouped_with(u, 2 * n, 32)
+            });
+            let pg_cnt_max = phased("t3_countall_pg_max", || {
+                pg_crud_count_all_with(u, 2 * n, 32)
+            });
             crud_row_c1(
                 // HOT-eligible: SET body (not indexed) — cross-page HOT fires on full pages
                 // (item 71). B-tree NOT updated. WAL B/row drops vs non-HOT.
@@ -3073,6 +3118,32 @@ fn bench_mm_report() {
                 }),
                 phased("t3_delall_pg", || pg_crud_delete_all(u)),
             );
+            println!();
+            println!(
+                "### PG parallelism sensitivity — the 3 parallel-eligible SELECTs\n\
+                 \n\
+                 The main table pins Postgres at its **factory default**\n\
+                 `max_parallel_workers_per_gather = 2`; unidb's worker pool uses the host's\n\
+                 cores. That is an asymmetry on parallel-eligible SELECTs, so this table\n\
+                 re-measures the same three queries with **PG uncapped** (32 workers\n\
+                 requested; the server's `max_worker_processes` is raised in docker-compose).\n\
+                 PG DML (INSERT/UPDATE/DELETE) is architecturally never parallel in\n\
+                 Postgres, so no other row is affected by either setting. The uncapped PG\n\
+                 pass runs immediately after the capped one (buffers warm — PG's best\n\
+                 case); the unidb column is the SAME single measurement as the main table.\n"
+            );
+            println!("| operation | unidb (rec/s) | PG uncapped (rec/s) | unidb ÷ PG-uncapped |");
+            println!("|-----------|--------------:|--------------------:|--------------------:|");
+            for (label, urow, pgmax) in [
+                ("SELECT filtered — PG-parallel sweep", u_filt, pg_filt_max),
+                ("SELECT grouped — PG-parallel sweep", u_grp, pg_grp_max),
+                ("SELECT COUNT(*) — PG-parallel sweep", u_cnt, pg_cnt_max),
+            ] {
+                let uu = rps(urow.0, urow.1);
+                let pm = rps(pgmax.0, pgmax.1);
+                let ratio = if pm > 0.0 { uu / pm } else { 0.0 };
+                println!("| {label} | {uu:.0} | {pm:.0} | {ratio:.2}× |");
+            }
             println!();
             println!(
             "### Table 3 — Known honest ceilings (verified; do not re-investigate without new evidence)\n\

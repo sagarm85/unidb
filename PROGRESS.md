@@ -1729,3 +1729,30 @@ designated the new standing `MM_BASELINE`, superseding
   event-append regression. Step-0 = attribution A/B before any lever.
 - W4/W0 at 10k regressed slightly (17.61→20.55×) while 1k and 100k
   improved — folded into item 114's attribution rather than filed separately.
+
+## Bench: PG parallelism sensitivity + session isolation   [SHIPPED]   2026-07-23
+
+**Branch:** `bench/pg-parallel-sensitivity` | **Type:** Performance-methodology (bench + compose only)
+
+User challenged the Table-3 fairness asymmetry: PG SELECTs pinned at its
+factory default (`max_parallel_workers_per_gather = 2`, introduced PR #128
+for cross-environment ratio stability) while unidb's pool uses all host
+cores. The challenge was upheld: the report now measures BOTH.
+
+- **New "PG parallelism sensitivity" sub-table** after Table 3: the three
+  parallel-eligible SELECTs re-measured with PG uncapped (32 workers
+  requested; compose raises `max_worker_processes`/`max_parallel_workers`
+  to 32). PG DML is architecturally never parallel, so no other row is
+  affected — stated in the new Table-3 intro paragraph.
+- **First measured uncapped truth (report_20260723_215525, canary quiet):**
+  filtered 0.65× → **0.55×** uncapped; **GROUP BY 1.29× → 0.98×** (the
+  headline "win" is parity against uncapped PG — the user's prediction,
+  confirmed); COUNT(*) 46.4× → **45.7×** (genuine O(1) win, not a
+  parallelism artifact).
+- **Session isolation (real collision 2026-07-23):** compose project name
+  is now worktree-unique (`COMPOSE_PROJECT_NAME=unidb-fair-bench-<worktree>`
+  set by docker_report.sh; stats sampler keyed to it) after another
+  session's `docker compose down -v` attached to this worktree's stack.
+
+Verification: clippy/fmt/bash -n/compose-config clean; validation run
+rendered all tables; canary quiet vs the 07-23 baseline.

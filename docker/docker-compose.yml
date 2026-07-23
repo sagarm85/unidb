@@ -7,7 +7,12 @@
 # containers share one Linux VM disk, so the unidb÷PG *ratio* is fair (uniform
 # fsync for both), but absolute "flushed to physical platter" is VM-bound. Run
 # this same compose on a native Linux host for publishable absolute durability.
-name: unidb-fair-bench
+# Project name is worktree-unique (set by docker_report.sh via
+# COMPOSE_PROJECT_NAME) so concurrent sessions in different worktrees can
+# NEVER attach to / tear down each other's containers — a real collision on
+# 2026-07-23: another session's `docker compose down -v` and cert run hit
+# this worktree's stack because every worktree shared this literal name.
+name: ${COMPOSE_PROJECT_NAME:-unidb-fair-bench}
 
 services:
   postgres:
@@ -15,6 +20,11 @@ services:
     # (`MM_REPLACED_STACK=1` → `CREATE EXTENSION vector` + an HNSW index) can run.
     # Drop-in for stock `postgres:18` — same server, plus the `vector` extension.
     image: pgvector/pgvector:pg18
+    # Raise the worker ceilings so the Table-3 "PG parallelism sensitivity"
+    # sub-table's uncapped pass is genuinely uncapped (PG defaults cap
+    # max_worker_processes/max_parallel_workers at 8; the bench requests 32
+    # per session, bounded by these server-level settings).
+    command: -c max_worker_processes=32 -c max_parallel_workers=32
     environment:
       POSTGRES_PASSWORD: bench
       POSTGRES_DB: postgres
