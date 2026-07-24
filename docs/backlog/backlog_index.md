@@ -122,10 +122,12 @@
 | 112 | `112_column_level_grants.md` | Improvement | ⏳ NOT STARTED (deliberately parked) — column-level GRANT/REVOKE (Postgres narrowing semantics, error-not-mask); the deferred half of item-24 Z4. Wide touch: grant vocab/persistence, DDL, read+write+RETURNING enforcement incl. QuerySpec shapes, policy-column exemption decision, item-111 columns-view filter, fast-path audit. Un-park when a concrete user need appears. |
 | 113 | `113_fk_error_message_direction.md` | Improvement | ⏳ NOT STARTED — parent-DELETE FK RESTRICT reuses the child-INSERT message shape ("value X has no matching row in 'parent'"), the exact opposite of what happened; should name the parent row + blocking child table/column. Registered 2026-07-22 (file predates as unregistered `42_…` duplicate; renumbered per stable-ID rule). |
 | 114 | `114_w4_event_rung_tax.md` | Performance | ⏳ NOT STARTED — filed 2026-07-23 from the first official post-107 ladder record: W4/W0 at 100k collapsed 96→34× (item 107 validated) but Δevent doubled to +9.93 ms/commit (was +4.08) and is now the dominant rung; Δvector keeps a +3.31 ms commit-path residue despite the async worker. Step-0 = attribution A/B (worker CPU contention vs real event-path regression) before any lever. |
+| 115 | `115_oneshot_filtered_select_fixed_cost.md` | Performance | ✅ SHIPPED 2026-07-24 (PR #210) — target met: — one-shot filtered SELECT **0.58→0.77×** (target ≥0.75; unidb absolute +48%) via `Engine::warm_query_path()` open-time warmup (no txn/WAL; native one-shot 1,089→744 µs). Step-0 decomposed the 852 µs premium (global ~590 / per-table ~180 / per-page ~90; plan-cache miss only ~22 µs). Units 2/3 parked as optional margin. Cert `report_20260724_000942.md`, canary quiet. |
+| 116 | `116_insert_per_row_commit_path.md` | Performance | 🔄 IN PROGRESS — target per-row INSERT ≥0.75× (0.50× at 07-23 AND after PR #210's hygiene levers — cert flat, no regression). Step-0: default mode = 1 fsync/commit; software 117 µs/row split via permanent Q116 timers. Shipped in #210: find_or_alloc_page Vec-waste removal, group_fsync FD cache, **catalog-persist explicit sync before catalog_root flip (durability hole closed)**. Remaining: the designed statement-scoped mini-txn bracket merge unit (crash-harness-gated own PR). |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `115_…`.**
+**Next new file → `117_…`.**
 
 ## Next up — priority order (2026-07-23, post fresh-baseline bench)
 
@@ -137,14 +139,22 @@ environment canary is quiet. Current per-operation state lives in the
 
 **Next priority items:**
 
-1. **#106 vector pgvector-class tier** — Units 1+2a shipped (466 µs at
+1. **p17 crash-test regression on main (chip filed 2026-07-24)** — NEAR
+   returns duplicate rids after crash-reopen (macOS-deterministic; likely
+   item-106 Unit 1/2a query-cache fallout — see the known-issue banner in
+   `106_…md`). Correctness — blocks item 106 Unit 3 certification.
+2. **#106 vector pgvector-class tier** — Units 1+2a shipped (466 µs at
    ef=120, 66 µs to target); remaining: Unit 3 (re-rank decode-pushdown +
    ef retune + certification), then Unit 2b (graph quality → margin).
-2. **#114 W4 residual multi-model tax** — Step-0 attribution A/B (Δevent
+3. **#115 one-shot filtered SELECT** — Unit 2 (per-table resolve first-use
+   ~180 µs), then per-page madvise if the cert demands.
+4. **#116 INSERT commit path** — the designed statement-scoped mini-txn
+   bracket merge unit (crash-harness-gated).
+5. **#114 W4 residual multi-model tax** — Step-0 attribution A/B (Δevent
    doubled to +9.93 ms at 100k; Δvector +3.31 ms commit-path residue).
-3. **#109 follow-ups** — one-shot fixed cost (~700 µs) and the Table-3
-   warm-median methodology decision.
-4. **Chips** — item-103 `LIMIT` test variant.
+6. **#109 follow-ups** — the Table-3 warm-median methodology decision
+   (the one-shot fixed-cost follow-up graduated into item 115).
+7. **Chips** — item-103 `LIMIT` test variant.
 
 _Done 2026-07-23: fresh full Docker bench on main `0324dc5` →
 `docs/performance/report_20260723_124415.md` promoted as the new

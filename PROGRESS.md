@@ -177,6 +177,8 @@ memory (see `CLAUDE.md` §6).
 | Item 110 — RLS + LIMIT crash: current_user destroyed in QuerySpec path   [SHIPPED]   2026-07-22 | 2026-07-22 | live |
 | Item 111 — information_schema visibility follows table grants   [SHIPPED]   2026-07-22 | 2026-07-22 | live |
 | Fresh full Docker bench — new MM_BASELINE (post-107, main `0324dc5`)   [RECORDED]   2026-07-23 | 2026-07-23 | live |
+| Bench: PG parallelism sensitivity + session isolation   [SHIPPED]   2026-07-23 | 2026-07-23 | live |
+| Items 115 + 116 — behind-metrics attribution + first levers   [IN PROGRESS]   2026-07-24 | 2026-07-24 | live |
 
 ## Item 24 R-a + R-b — UPDATE WITH CHECK enforcement + bootstrap observability (2026-07-20)
 
@@ -1756,3 +1758,54 @@ cores. The challenge was upheld: the report now measures BOTH.
 
 Verification: clippy/fmt/bash -n/compose-config clean; validation run
 rendered all tables; canary quiet vs the 07-23 baseline.
+
+## Items 115 + 116 — behind-metrics attribution + first levers   [SHIPPED — 115 target met; 116 partial]   2026-07-24
+
+**Branch:** `perf/item-115-oneshot-fixed-cost` | **Type:** Performance ×2 + durability hardening
+**Targets (user-set):** Table 3 filtered SELECT one-shot ≥0.75× (from 0.58×) and
+per-row INSERT ≥0.75× (from 0.50×) vs PG.
+
+**Item 115 (one-shot filtered SELECT):** Step-0 probe (`tests/perf_item115.rs`)
+decomposed the 852 µs one-shot premium: ~590 µs GLOBAL SELECT-path first-use
+(parse/plan lazy init ~230, executor first-use ~180, resolve global ~140) +
+~180 µs per-table resolve first-use + ~90 µs per-page first-touch; the
+plan-cache-miss premium is only ~22 µs. Shipped `Engine::warm_query_path()` —
+open-time warmup (parse/plan + `warm_pool()` no-op parallel dispatch), zero
+WAL/txn/storage: **native one-shot 1,089 → 744 µs** (premium −42%); warm path
+unchanged. Permanent `Q115_*` statement-phase timers.
+
+**Item 116 (per-row INSERT):** probe (`tests/perf_item116.rs`) + permanent
+`Q116_*` commit-phase timers. Findings: the DEFAULT commit-time-fsync mode
+pays exactly **1 fsync/commit** (a draft measured the harness-only legacy mode
+and wrongly found 3 — recorded in LESSONS.md); software = **117 µs/row**
+(begin 1.5 · execute ~70 · txn_mgr 1.3 · sync-leader ~24-45 · post 0.8).
+Shipped: `find_or_alloc_page` full-page-list Vec waste removal (~11 KB
+alloc+copy per first-insert-of-statement), `group_fsync` per-segment FD cache
+(dup-syscall per commit → once per segment), and **catalog-persist explicit
+`sync_up_to` before the `catalog_root` control flip** — under the default mode
+the persist mini-txn was NOT durable at flip time (control could reference
+pages whose log could vanish); real hole, closed. Native µs-levers were within
+noise on macOS (F_FULLFSYNC floor); the structural next unit
+(statement-scoped mini-txn bracket merge, 2 brackets → 1, est. −10-15 µs +
+2 WAL records/row) is designed in `116_insert_per_row_commit_path.md`,
+deliberately not shipped in the same pass as its design.
+
+**Verification:** 72 test binaries green (`--no-fail-fast` sweep); clippy
+`--all-targets` + fmt clean. Crash harness was 53/54 with three NEAR failures
+stash-verified PRE-EXISTING on main (filed as the NEAR chip → fixed same night
+by PR #211); after rebasing past #211/#213: **crash 54/54 clean**.
+
+**Docker Table-3 cert (`report_20260724_000942.md`, canary quiet vs 07-23):**
+
+| operation | 07-23 | this PR | verdict |
+|---|---:|---:|---|
+| SELECT filtered (one-shot) | 0.58× | **0.77×** | item 115 target (≥0.75) MET; +48% unidb absolute; 0.70× vs PG-uncapped |
+| INSERT (per-row commit) | 0.50× | 0.50× | flat as predicted — 116's target rides on the designed bracket-merge unit |
+| UPDATE HOT | 1.18× | 1.25× | no regression from commit-path levers |
+| others | — | — | within historical noise bands (non-HOT 0.61× is inside its 0.61–0.85 cross-run spread) |
+
+First cert attempt DISCARDED (INSERT 0.16× + FPI-shaped WAL inflation):
+disclosed cross-session CPU overlap + freshly-restarted Docker daemon; the
+clean rerun restored all bands — the exclusive-machine-time lesson, again.
+Peak RSS: per-phase docker-stats table in the report; no allocation-profile
+change beyond removals.
