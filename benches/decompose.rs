@@ -1557,9 +1557,38 @@ fn bench_engine_open_arc(dir: &std::path::Path) -> Arc<Engine> {
 }
 
 fn mm_ladder_point(rung: u8, size: u64, sample: u64) -> (f64, f64) {
+    mm_ladder_point_cfg(rung, size, sample, true)
+}
+
+/// `mm_ladder_point` with the async HNSW worker selectable (item 114 Step-0).
+/// `async_worker=false` opens the same engine WITHOUT `spawn_hnsw_worker()`,
+/// so vector index maintenance runs synchronously in-commit (the bare
+/// `Engine::open` fallback) — the exact configuration the 07-21 pre-item-107
+/// ladder measured. Comparing Δevent (W4−W3) across the two configs on one
+/// commit attributes the 07-23 Δevent doubling: worker CPU contention (delta
+/// collapses when the worker is absent) vs a real event-path regression
+/// (delta persists).
+fn mm_ladder_point_cfg(rung: u8, size: u64, sample: u64, async_worker: bool) -> (f64, f64) {
     let dir = tempdir().unwrap();
-    let engine = bench_engine_open_arc(dir.path());
+    let engine = if async_worker {
+        bench_engine_open_arc(dir.path())
+    } else {
+        Arc::new(bench_engine_open(dir.path()))
+    };
     engine.set_deferred_sync(true); // group commit: one fsync per commit
+                                    // Item 117: auto-checkpoint OFF for the ladder point. The default 60 s
+                                    // time trigger fires repeatedly inside any 100k pre-grow and races the
+                                    // async HNSW worker's concurrent WAL appends — checkpoint's flush then
+                                    // hard-errors with "D5 violation on flush" (observed in the wild; see
+                                    // docs/backlog/117_checkpoint_async_worker_d5_race.md). Until the engine
+                                    // fix lands, this bench checkpoints manually at drained boundaries only
+                                    // (every 50k pre-grow rows + before the timed window). The timed window
+                                    // is unaffected: the 512 MiB size trigger could never fire within a
+                                    // 200-commit sample anyway.
+    engine.set_auto_checkpoint_config(AutoCheckpointConfig {
+        enabled: false,
+        ..AutoCheckpointConfig::default()
+    });
     let setup = engine.begin().unwrap();
     let create = if rung >= 2 {
         "CREATE TABLE t (id INT, body TEXT, embedding VECTOR(128))"
@@ -1608,6 +1637,14 @@ fn mm_ladder_point(rung: u8, size: u64, sample: u64) -> (f64, f64) {
         do_row(x, i);
         if (i + 1) % 2_000 == 0 {
             engine.commit(x).unwrap();
+            // Item 117: manual WAL-bounding checkpoint at a *drained* boundary
+            // (auto-checkpoint is off — see above). Untimed setup phase, so
+            // the drain only costs wall clock, never measurement fidelity.
+            if (i + 1) % 50_000 == 0 {
+                engine.wait_hnsw_idle();
+                engine.sync_wal().unwrap();
+                engine.checkpoint().unwrap();
+            }
             x = engine.begin().unwrap();
         }
     }
@@ -1631,11 +1668,19 @@ fn mm_ladder_point(rung: u8, size: u64, sample: u64) -> (f64, f64) {
     // Fix: checkpoint after every pre-grow phase.  checkpoint() flushes dirty
     // pages, writes a checkpoint record, and truncates the WAL to near-zero,
     // making F_FULLFSYNC cost identical across all table sizes.
-    engine.sync_wal().unwrap();
-    engine.checkpoint().unwrap();
     // Item 107: pre-grow enqueued async HNSW work — drain it so the timed
     // window measures marginal commit cost, not pre-grow backlog.
+    //
+    // Item 117: the drain must come BEFORE the checkpoint. The worker appends
+    // WAL and dirties index pages concurrently; checkpoint snapshots the
+    // durable frontier once and flush_page hard-errors on any page dirtied
+    // past it ("D5 violation on flush", off-by-one LSN) — a real engine race
+    // (auto-checkpoint inside a user commit can hit it too; see
+    // docs/backlog/117_checkpoint_async_worker_d5_race.md). Draining first
+    // removes the bench's exposure; the engine-side fix is item 117.
     engine.wait_hnsw_idle();
+    engine.sync_wal().unwrap();
+    engine.checkpoint().unwrap();
     // Measure marginal per-commit cost at this size.
     let start = Instant::now();
     for j in 0..sample {
@@ -3674,6 +3719,76 @@ fn bench_mm_report() {
     );
 }
 
+// ============ Item 114 Step-0 attribution A/B (UNIDB_BENCH=item114_step0) ====
+//
+// Question (docs/backlog/114_w4_event_rung_tax.md): the 07-23 post-item-107
+// bench showed Δevent (W4−W3) at 100k at +9.93 ms/commit, 2.4× its 07-21
+// (sync-HNSW) cost of +4.08 — and Δvector (W2−W1) still at +3.31 ms despite
+// the async worker. Attribution BEFORE optimization (§0.6): is the doubling
+// worker CPU contention (the drain runs on the same cores as the timed
+// foreground commits) or a real event/commit-path regression?
+//
+// Method: run ladder rungs W1–W4 at each MM_SIZES point in BOTH configs on
+// the same commit — `async` (spawn_hnsw_worker, the shipping/07-23 config)
+// and `sync` (no worker, in-commit HNSW: the 07-21 config). Same
+// mm_ladder_point measurement (pre-grow → checkpoint → drain → timed sample).
+//   Δevent(sync)  ≈ +4  and Δevent(async) ≈ +10  → contention: pick a worker
+//     throttle/priority lever.
+//   Δevent(sync)  ≈ +10 too                      → real event-path regression:
+//     bisect the event append path.
+// Δvector across configs answers question 1 (commit-path residue) the same way.
+//
+// Run: MM_SIZES=100000 MM_SAMPLE=200 UNIDB_BENCH=item114_step0 <bench-bin>
+fn bench_item114_step0() {
+    let sizes: Vec<u64> = std::env::var("MM_SIZES")
+        .ok()
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![100_000]);
+    let sample = env_u64("MM_SAMPLE", 200);
+
+    println!(
+        "## Item 114 Step-0 — Δevent / Δvector attribution A/B (async worker vs sync fallback)\n"
+    );
+    println!("Sample = {sample} timed commits per point; pre-grow drained + checkpointed before timing.\n");
+    for &size in &sizes {
+        let mut commit = [[0.0f64; 5]; 2]; // [config][rung]; rung 0 unused
+        let mut drain = [[0.0f64; 5]; 2];
+        for (ci, async_worker) in [(0usize, true), (1usize, false)] {
+            for rung in 1..=4u8 {
+                let label = if async_worker { "async" } else { "sync" };
+                eprintln!("[item114] size={size} config={label} W{rung}…");
+                let (c, d) = mm_ladder_point_cfg(rung, size, sample, async_worker);
+                commit[ci][rung as usize] = c;
+                drain[ci][rung as usize] = d;
+            }
+        }
+        println!("### size = {size}\n");
+        println!("| rung | async ms/commit | async drain ms/commit | sync ms/commit |");
+        println!("|---|---:|---:|---:|");
+        for rung in 1..=4usize {
+            println!(
+                "| W{rung} | {:.2} | {:.2} | {:.2} |",
+                commit[0][rung], drain[0][rung], commit[1][rung]
+            );
+        }
+        println!();
+        println!("| Δ per commit | async (07-23 config) | sync (07-21 config) |");
+        println!("|---|---:|---:|");
+        for (name, hi, lo) in [
+            ("Δvector (W2−W1)", 2usize, 1usize),
+            ("Δedge (W3−W2)", 3, 2),
+            ("Δevent (W4−W3)", 4, 3),
+        ] {
+            println!(
+                "| {name} | {:+.2} ms | {:+.2} ms |",
+                commit[0][hi] - commit[0][lo],
+                commit[1][hi] - commit[1][lo]
+            );
+        }
+        println!();
+    }
+}
+
 // ============ IVF-Flat scale validation (UNIDB_BENCH=ivf_validate) ===========
 //
 // Item 62: empirically measure where IVF-Flat breaks down by tracking NEAR
@@ -4126,6 +4241,10 @@ fn main() {
         }
         "ivf_validate" => {
             bench_ivf_scale_validation();
+            return;
+        }
+        "item114_step0" | "item114" => {
+            bench_item114_step0();
             return;
         }
         "hnsw_l0" | "hnsw_vec" | "item72" | "item73" => {
