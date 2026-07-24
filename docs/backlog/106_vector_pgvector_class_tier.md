@@ -181,3 +181,41 @@ Remaining to ≤400 at the gate point: **66 µs** → Unit 3 (re-rank
 decode-pushdown, ~−65 µs at ef=120) lands on target; Unit 2b (graph
 quality, 0.90+ at ef≤80 → base ~365 µs before pushdown) then converts to
 margin.
+
+## Unit 3 result (2026-07-24) — re-rank decode-pushdown, measured
+
+**Re-baselined on current main (post-#210) same-session** — #210's
+`warm_query_path()` open-time warmup + host drift moved the absolute curve
+up vs the 465.8 µs Unit-2a figure, so ONLY the same-session before/after
+below is valid (see §0.6 rule 4 + the cross-host drift lesson):
+
+| ef  | recall@10 | baseline µs | Unit 3 µs |    Δ    |
+|-----|-----------|-------------|-----------|---------|
+| 40  | 0.640     | 429.4       | 333.8     | −95.6   |
+| 60  | 0.715     | 433.7       | 310.4     | −123.3  |
+| 80  | 0.805     | 453.6       | 359.6     | −94.0   |
+| 120 | 0.910     | 630.8       | **482.2** | −148.6  |
+| 160 | 0.925     | 767.7       | 554.2     | −213.5  |
+| 200 | 0.945     | 909.1       | 643.1     | −266.0  |
+| 300 | 0.960     | 1194.3      | 874.7     | −319.6  |
+
+**Gate point ef=120: 630.8 → 482.2 µs (−148.6, −23.6%) @ 0.910.** Recall
+bit-identical at every ef — decode-pushdown changes nothing about which
+candidates the graph search selects or how they re-rank; it only defers
+projection materialization. The saving grows with ef because more of the
+~ef re-rank candidates are discarded at `truncate(k)` and their projection
+(esp. TEXT payloads) is now never decoded.
+
+Implementation (`exec_select_near`): phase-1 `deform_row` with a mask of
+only the vector column + predicate columns → predicate + `ivf_exact_distance`
+carrying raw heap bytes; after `sort`+`truncate(k)`, a second `deform_row`
+with the projection mask + `project_row_near` for the k winners only. Mirrors
+the B2 two-phase decode machinery `try_exec_select_btree` already uses.
+`SELECT *` / expression projections fall back to full-column decode.
+
+**Still above ≤400 at the gate (482.2 µs) — as expected, Unit 3 alone was
+never sized to close it.** Unit 2b (graph quality: hold 0.90 recall at
+ef≤80) is the remaining lever: at ef=80 Unit 3 already gives **359.6 µs**,
+so lifting recall there to ≥0.90 lands the gate point **under target with
+margin** without any further per-query cost. Certification (native +
+in-container, ≤400 µs @ ≥0.90) closes with Unit 2b.

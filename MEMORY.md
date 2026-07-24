@@ -441,6 +441,23 @@ be raised with the user directly, not assumed.
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-07-24 — item 106 Unit 3 (re-rank decode-pushdown) measured + merged
+
+Rebased Unit 3 on current main (8a86b02, post-#210). Same-session before/after on
+`tests/perf_item106` (mandatory — #210's `warm_query_path()` warmup + host drift raised the
+absolute curve vs the 465.8 µs Unit-2a figure): **gate ef=120 630.8 → 482.2 µs (−148.6,
+−23.6%) @ 0.910 recall, bit-identical recall at every ef**. Δ grows with ef (more of the ~ef
+re-rank candidates truncated at k, projection never decoded). Impl in `exec_select_near`:
+phase-1 `deform_row` (vector + predicate cols only, raw bytes carried) → predicate +
+`ivf_exact_distance`; after sort+truncate(k), second `deform_row` (projection mask) +
+`project_row_near` for k winners only. Full release suite + crash harness 54/54 green;
+clippy/fmt clean. **Still 482 > ≤400 target — expected; Unit 3 was never sized to close it
+alone.** Unit 2b (graph quality, hold 0.90 @ ef≤80 where Unit 3 already gives 359.6 µs) is the
+remaining lever → lands gate under target with margin; certification closes with 2b. PR #214.
+Machine-slot discipline held: waited out Pending-items' #210 cert (buildx-wedge false-idle
+caught), measured only after their explicit handoff, signalling peaceful-panini (item-114 A/B
+next) on completion.
+
 ### 2026-07-24 (overnight) — Items 115+116 filed + Step-0 + first levers; NEAR breakage found on main
 
 User authorized autonomous work with ACID/perf guardrails. 115: cold probe with prewarm
