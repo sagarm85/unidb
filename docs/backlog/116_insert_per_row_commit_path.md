@@ -1,9 +1,11 @@
 # Item 116 — Per-row INSERT commit path: attribution + software-cost reduction
 
 **Type:** Performance
-**Status:** 🔄 IN PROGRESS — Step-0 attribution + small levers shipped 2026-07-24;
-the structural unit (statement-scoped mini-txn bracket merge) is designed below,
-deliberately NOT shipped in the same overnight pass as its design.
+**Status:** 🔄 IN PROGRESS — Step-0 + small levers + durability hardening shipped
+2026-07-24 (PR #210); Docker cert: **0.50× unchanged** (4,093 rec/s, WAL 584 B/row,
+canary quiet — the µs-levers were hygiene as measured natively, and the durability
+fix cost nothing). Target ≥0.75× rides on the structural unit below (statement-
+scoped mini-txn bracket merge), designed and NOT yet implemented.
 
 **Target:** Table 3 `INSERT (per-row commit)` ratio ≥ **0.75×** vs PG (user-set
 2026-07-24; 0.50× in the 07-23 baseline, unidb ~230 µs/row vs PG ~114). Honest

@@ -1,8 +1,11 @@
 # Item 115 — One-shot filtered SELECT: kill the first-query fixed cost
 
 **Type:** Performance
-**Status:** 🔄 IN PROGRESS — Step-0 + Unit 1 (open-time warmup) shipped 2026-07-24;
-Docker cert pending in this PR; per-table resolve first-use is the remaining unit.
+**Status:** ✅ SHIPPED 2026-07-24 (PR #210) — target met — Unit 1 (open-time warmup) certified:
+Docker one-shot **0.77×** (target ≥0.75, was 0.58×), unidb absolute 3.14M→4.65M rec/s
+(`docs/performance/report_20260724_000942.md`, canary quiet). Units 2/3 (per-table
+resolve first-use ~180 µs, per-page madvise) remain OPTIONAL margin work — un-park
+if a future run dips below target.
 
 **Target:** Table 3 `SELECT filtered` one-shot ratio ≥ **0.75×** vs PG (user-set
 2026-07-24; was 0.58× in the 07-23 baseline). The bench times ONE cold
@@ -48,7 +51,12 @@ plan-miss paths unchanged. Permanent `Q115_*` statement-phase timers added
   `madvise WILLNEED` on the candidate page set before resolve (item 70
   precedent for seq scans).
 
-## Cert
+## Cert (2026-07-24, PR #210)
 
-Docker Table-3 selective run (`MM_TABLES=3`, no stitch — this PR also touches
-heap/WAL via item 116, so carry-forward is invalid per item 105's guardrail).
+`MM_TABLES=3` fresh run (no stitch — shared layers touched), canary quiet vs the
+07-23 baseline: **SELECT filtered one-shot 0.58× → 0.77×** (+33% ratio, +48%
+unidb absolute); 0.70× vs PG-uncapped (the #213 sensitivity rows). First cert
+attempt was discarded: a disclosed 2-3 min cross-session CPU overlap plus a
+freshly-restarted Docker daemon produced INSERT 0.16× + FPI-shaped WAL
+anomalies; the clean rerun restored all rows to normal bands — recorded here
+as evidence for the exclusive-machine-time rule.

@@ -1759,7 +1759,7 @@ cores. The challenge was upheld: the report now measures BOTH.
 Verification: clippy/fmt/bash -n/compose-config clean; validation run
 rendered all tables; canary quiet vs the 07-23 baseline.
 
-## Items 115 + 116 — behind-metrics attribution + first levers   [IN PROGRESS]   2026-07-24
+## Items 115 + 116 — behind-metrics attribution + first levers   [SHIPPED — 115 target met; 116 partial]   2026-07-24
 
 **Branch:** `perf/item-115-oneshot-fixed-cost` | **Type:** Performance ×2 + durability hardening
 **Targets (user-set):** Table 3 filtered SELECT one-shot ≥0.75× (from 0.58×) and
@@ -1791,11 +1791,21 @@ noise on macOS (F_FULLFSYNC floor); the structural next unit
 deliberately not shipped in the same pass as its design.
 
 **Verification:** 72 test binaries green (`--no-fail-fast` sweep); clippy
-`--all-targets` + fmt clean; crash harness **53/54 — the 1 failure (p17) plus
-two NEAR tests (`index_rebuild`, `vec_distance`) fail identically on
-UNMODIFIED main** (stash-verified, deterministic): duplicate rids after
-crash-reopen / wrong empty-table top-k / non-ascending distances — filed as
-the NEAR-correctness chip (item-106 Unit 1/2a suspect; banner in the 106
-backlog file; blocks 106 Unit 3 cert). **Docker Table-3 cert pending** — first
-attempt orphaned; machine handed to the NEAR-fix session; rerun when quiet and
-record the ratios here + in the PR before merge.
+`--all-targets` + fmt clean. Crash harness was 53/54 with three NEAR failures
+stash-verified PRE-EXISTING on main (filed as the NEAR chip → fixed same night
+by PR #211); after rebasing past #211/#213: **crash 54/54 clean**.
+
+**Docker Table-3 cert (`report_20260724_000942.md`, canary quiet vs 07-23):**
+
+| operation | 07-23 | this PR | verdict |
+|---|---:|---:|---|
+| SELECT filtered (one-shot) | 0.58× | **0.77×** | item 115 target (≥0.75) MET; +48% unidb absolute; 0.70× vs PG-uncapped |
+| INSERT (per-row commit) | 0.50× | 0.50× | flat as predicted — 116's target rides on the designed bracket-merge unit |
+| UPDATE HOT | 1.18× | 1.25× | no regression from commit-path levers |
+| others | — | — | within historical noise bands (non-HOT 0.61× is inside its 0.61–0.85 cross-run spread) |
+
+First cert attempt DISCARDED (INSERT 0.16× + FPI-shaped WAL inflation):
+disclosed cross-session CPU overlap + freshly-restarted Docker daemon; the
+clean rerun restored all bands — the exclusive-machine-time lesson, again.
+Peak RSS: per-phase docker-stats table in the report; no allocation-profile
+change beyond removals.

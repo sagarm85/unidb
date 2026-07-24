@@ -45,9 +45,16 @@
   stash): crash p17 duplicate rids post-recovery, index_rebuild empty-table top-k,
   vec_distance ascending order — item-106 Unit 1/2a suspect (visited bitset/HashSet
   split-brain); chip filed AND user started the fix session — **all three FIXED same night by
-  PR #211 (see the entry above); this branch rebased onto it, crash 54/54 expected**. Docker
-  Table-3 cert runs post-rebase with exclusive machine time. Lesson: `cargo test` is
-  fail-fast per binary — a green tail is NOT a green suite; use `--no-fail-fast` for sweeps.
+  PR #211; branch rebased past #211+#213, crash 54/54 clean**. **Cert
+  (`report_20260724_000942.md`, canary quiet): filtered one-shot 0.58→0.77× — item 115 TARGET
+  MET (+48% unidb absolute; 0.70× vs PG-uncapped); INSERT 0.50× flat as predicted — 116's
+  target rides on the designed bracket-merge unit.** First cert attempt DISCARDED (INSERT
+  0.16× + FPI-shaped WAL inflation: disclosed cross-session CPU overlap + freshly-restarted
+  Docker daemon; clean rerun restored all bands). Machine-slot protocol tightened across the
+  3 concurrent sessions: slot transfers ONLY on explicit message, never `docker ps` inference
+  (two sessions attached to one compose stack before #213's per-worktree naming). Lessons:
+  `cargo test` is fail-fast per binary — use `--no-fail-fast` for sweeps; a wedged Docker
+  daemon (trivial `FROM alpine` build hanging) needs a daemon restart, not builder prunes.
 
 - **2026-07-23 — Fresh full Docker bench RUN + PROMOTED as new MM_BASELINE; item 114 filed.**
   `docs/performance/report_20260723_124415.md` (main `0324dc5`, 84m 58s, canary quiet vs 07-21,
