@@ -1,8 +1,12 @@
 # Item 114 — W4 residual multi-model tax: event rung + commit-path vector residue
 
 **Type:** Performance
-**Status:** ⏳ NOT STARTED — filed 2026-07-23 from the first official post-107
-ladder record (`docs/performance/report_20260723_124415.md`).
+**Status:** 🔄 IN PROGRESS — Step-0 attribution A/B running 2026-07-24
+(`UNIDB_BENCH=item114_step0` mode added to `benches/decompose.rs`: ladder
+rungs W1–W4 at 100k in both configs — async worker [07-23/shipping] vs sync
+fallback [07-21] — on one commit; Δevent and Δvector compared across configs).
+Filed 2026-07-23 from the first official post-107 ladder record
+(`docs/performance/report_20260723_124415.md`).
 
 ## Evidence (2026-07-23 bench, main `0324dc5`, canary quiet vs 07-21)
 

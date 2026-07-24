@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `114_…`.**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `118_…`.**
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -121,7 +121,8 @@
 | 111 | `111_information_schema_follow_table_grants.md` | Improvement | ✅ SHIPPED 2026-07-22 (PR #199) — `information_schema.*` no longer needs its own view grant; rows are filtered per-caller by ANY-privilege on the underlying table across all five views (Postgres semantics), so a user sees exactly the tables they hold grants on and nothing else. `unidb_catalog.*` stays Z5 grant-gated. 5 tests. See PROGRESS.md "Item 111". |
 | 112 | `112_column_level_grants.md` | Improvement | ⏳ NOT STARTED (deliberately parked) — column-level GRANT/REVOKE (Postgres narrowing semantics, error-not-mask); the deferred half of item-24 Z4. Wide touch: grant vocab/persistence, DDL, read+write+RETURNING enforcement incl. QuerySpec shapes, policy-column exemption decision, item-111 columns-view filter, fast-path audit. Un-park when a concrete user need appears. |
 | 113 | `113_fk_error_message_direction.md` | Improvement | ⏳ NOT STARTED — parent-DELETE FK RESTRICT reuses the child-INSERT message shape ("value X has no matching row in 'parent'"), the exact opposite of what happened; should name the parent row + blocking child table/column. Registered 2026-07-22 (file predates as unregistered `42_…` duplicate; renumbered per stable-ID rule). |
-| 114 | `114_w4_event_rung_tax.md` | Performance | ⏳ NOT STARTED — filed 2026-07-23 from the first official post-107 ladder record: W4/W0 at 100k collapsed 96→34× (item 107 validated) but Δevent doubled to +9.93 ms/commit (was +4.08) and is now the dominant rung; Δvector keeps a +3.31 ms commit-path residue despite the async worker. Step-0 = attribution A/B (worker CPU contention vs real event-path regression) before any lever. |
+| 114 | `114_w4_event_rung_tax.md` | Performance | 🔄 IN PROGRESS — Step-0 attribution A/B running 2026-07-24 (`UNIDB_BENCH=item114_step0` ladder mode, async-worker vs sync-fallback configs on one commit). Filed 2026-07-23: W4/W0 at 100k collapsed 96→34× (item 107 validated) but Δevent doubled to +9.93 ms/commit (was +4.08) and is now the dominant rung; Δvector keeps a +3.31 ms commit-path residue despite the async worker. |
+| 117 | `117_checkpoint_async_worker_d5_race.md` | Improvement | ⏳ NOT STARTED — filed 2026-07-24 from direct evidence (item114_step0 smoke run): checkpoint snapshots the durable WAL frontier once, so the item-107 async HNSW worker dirtying a page one LSN past it makes `flush_page` hard-error ("D5 violation on flush") and the auto-checkpoint FAILS THE USER'S COMMIT. Availability bug, not durability (WAL intact, retry succeeds); `active_count` guard predates the worker. Bench-side drain-before-checkpoint mitigation shipped with the 114 probe; engine fix (Postgres-style sync-up-to-pageLSN in the flusher) pending. |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
