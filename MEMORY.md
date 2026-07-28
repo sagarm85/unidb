@@ -12,6 +12,18 @@
 
 ## Current status
 
+- **2026-07-28 — Fresh FULL Docker bench on current main `7c064f1` → new authoritative baseline.**
+  `docs/performance/report_20260728_102745.md` (all tables, 83m 38s, RSS 521 MiB, environment
+  canary quiet — trustworthy). First full-report capture of items 115/116: **SELECT filtered
+  0.58→0.77×** (the #210 one-shot warm-path fix landing in the full CRUD table exactly as its
+  cert predicted). Other CRUD vs PG: INSERT per-row 0.57×, UPDATE HOT 1.19×, UPDATE non-HOT
+  0.64×, GROUP BY 1.01×, COUNT(*) 49.6×, DELETE selected 1.91×, DELETE all 4.12×. Unified-commit
+  moat intact: W4/W0 13.56× at 100k; Table 4 four-model atomic txn vs replaced stack's four
+  round-trips. **NOT in this report:** item 106 Unit 3 NEAR win (gate 630→482 µs) — report.sh
+  never measures NEAR (standing Linux NEAR-spot-check gap); certified only by native
+  `perf_item106`. Promoted as authoritative in `docs/performance/README.md`; supersedes the
+  07-23 `0324dc5` baseline.
+
 - **2026-07-24 — fix(hnsw): item 106 Unit 2a cold-path duplicate-rid bug (visited-bitset slack).**
   Three deterministic macOS failures on unmodified main `4c56740` (crash p17 NEAR top-5
   `[49,50,50,51,51]` after crash-reopen; `index_rebuild::near_on_index_built_over_empty_table`;

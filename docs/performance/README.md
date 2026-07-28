@@ -8,15 +8,23 @@
 
 ## Which report is current?
 
-- **Authoritative full baseline:** `report_20260723_124415.md` — the full
-  Docker bench of 2026-07-23 on main `0324dc5` (the current `MM_BASELINE`
-  carry-forward anchor, item 105). First official record of item 107's
-  W4/W0 ladder collapse (96→34× at 100k; Δvector +17.55→+3.31 ms/commit,
-  drain accounted off-path) — and of the finding it exposed: the event
-  rung is now the dominant W4 tax (Δevent +4.08→+9.93 ms at 100k, filed
-  as item 114). Environment canary quiet vs 07-21, so ratios comparable.
-- Superseded baseline: `report_20260721_035629.md` (2026-07-21 consolidated
-  bench).
+- **Authoritative full baseline:** `report_20260728_102745.md` — the full
+  Docker bench of 2026-07-28 on main `7c064f1` (all tables, 83m 38s, RSS
+  521 MiB, environment canary quiet). First full-report capture of the
+  items-115/116 SELECT/INSERT work: **SELECT filtered 0.58→0.77×** (one-shot
+  warm-path fix landing exactly as the #210 cert predicted), UPDATE HOT
+  1.19×, COUNT(*) 49.6×, DELETE all 4.12×, DELETE selected 1.91×. Unified
+  multi-model commit moat intact (W4/W0 13.6× at 100k; four model-writes in
+  one atomic txn vs the replaced stack's four round-trips).
+  **Known gap:** item 106 Unit 3's NEAR latency win (gate 630→482 µs) is
+  NOT in this report — `report.sh` does not measure NEAR; that result is
+  certified only by the native `perf_item106` harness (standing Linux
+  NEAR-spot-check gap).
+- Superseded baseline: `report_20260723_124415.md` — full Docker bench of
+  2026-07-23 on main `0324dc5` (was the `MM_BASELINE` carry-forward anchor;
+  first record of item 107's W4/W0 ladder collapse 96→34× at 100k and the
+  event-rung finding filed as item 114).
+- Older: `report_20260721_035629.md` (2026-07-21 consolidated bench).
 - `report_20260722_002217_ab_oldcode_51022be.md` is **not** a baseline — it is
   the item-108 controlled A/B evidence run (old code at `51022be`) proving the
   07-19→07-21 ratio drift was environmental.
