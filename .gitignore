@@ -27,6 +27,10 @@ __pycache__/
 # Dated benchmark reports under docs/performance/ ARE committed (kept as the
 # measurement record). Only Docker-run output stays ignored (docker/out/ below).
 
+# Styled HTML views of the reports are DERIVED from the committed .md by
+# scripts/render_report.py (regenerable any time) — keep them out of the tree.
+/docs/performance/*.html
+
 # Generated Docker report output (reports, logs, phase/stats CSVs from
 # scripts/report.sh --docker). The docker/ image + compose files ARE committed;
 # only their run output under docker/out/ is not.

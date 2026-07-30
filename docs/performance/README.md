@@ -38,6 +38,9 @@
 | `conc_matrix_*.md` | Concurrency matrix (writers × readers) pass/fail + throughput grid | concurrency harness |
 | `benchmark_*.md` | Older naming of the dated bench reports (2026-07-16/17 era), superseded by `report_*` naming | pre-rename `report.sh` |
 | `stats_YYYYMMDD.csv` | Phase/stats CSV snapshot accompanying a run | `report.sh` tooling |
+| `report_YYYYMMDD_HHMMSS.html` | Styled, self-contained HTML view of the same-named `.md` (winner pills, ratio coloring, light+dark). **Derived + git-ignored** — the `.md` is authoritative | `scripts/render_report.py` (auto, per run) |
+
+Regenerate an HTML view at any time: `python3 scripts/render_report.py docs/performance/report_<ts>.md`.
 
 Cross-run ratio caveat (item 108): unidb÷PG ratios are comparable across runs
 **only when the PG-absolute environment canary in `compare_bench.py` is
