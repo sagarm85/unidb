@@ -1,9 +1,13 @@
 # Item 117 — HOT UPDATE on PK/UNIQUE tables when the key column is unchanged
 
 **Type:** Performance
-**Status:** 🔄 IN PROGRESS — code implemented, native tests + crash harness green
-2026-07-30; Docker bench (Table 5) pending to certify the ratio. Branch
-`feat/hot-update-unique-key-gate`.
+**Status:** ✅ SHIPPED 2026-07-30 (branch `feat/hot-update-unique-key-gate`, commit
+`a5403b1`) — Docker Table-5 cert `docker/out/report_20260730_124355.md`: **UPDATE
+bulk 0.19×→3.04×**; the defensible number is unidb's absolute **138,840→1,130,955
+rec/s (+8.1×)** (item-108 hygiene: PG absolute drifted 747,068→372,123 this run —
+canary — so 3.04× overstates; vs baseline PG unidb is ~1.5×, in the Table-3 HOT
+band). Correctness intact (bad-FK INSERT rejected, referenced-parent DELETE
+blocked). Native suite 220/0, crash 54/54, clippy+fmt clean.
 
 **Target:** Table 5 `UPDATE bulk (re-checks FK path)` — `UPDATE orders SET status =
 'shipped' WHERE id < N` on `orders (id PRIMARY KEY, customer_id REFERENCES …,
@@ -67,4 +71,23 @@ same case.
 - Crash harness 54/54 green (p74 batch HOT, cross-page HOT, p58b index, p17/p60
   vector). fmt + clippy clean.
 
-Metrics land in `PROGRESS.md` once the Docker bench runs.
+## Cert (Docker, Table-5-only, 2026-07-30, commit `a5403b1`)
+
+`docker/out/report_20260730_124355.md` (aarch64 · 18 cores · Linux 6.12 linuxkit):
+
+| operation | unidb rec/s | postgres rec/s | ÷ PG | note |
+|---|---:|---:|---:|---|
+| UPDATE bulk (SET status) | **1,130,955** | 372,123 | **3.04×** | was 0.19× (138,840 rec/s) — **+8.1× unidb absolute** |
+| INSERT valid FK (per-row) | 2,180 | 6,427 | 0.34× | untouched by 117 (INSERT path); VM-noisy (PG also down from 8,052) |
+| SELECT JOIN | 1,170,903 | 2,125,436 | 0.55× | untouched by 117; ~flat vs 0.48× baseline |
+
+**Honest ratio caveat (item 108 canary):** PG is code-identical across runs but its
+absolute halved this run (747,068→372,123 rec/s), so the 3.04× ratio overstates the
+gain. The trustworthy figure is unidb's **absolute** UPDATE throughput: 138,840 →
+1,130,955 rec/s (**+8.1×**). Against the baseline PG number unidb would be ~1.5× —
+still a decisive move from the report's worst CRUD row (a 5× loss) to a win, and
+consistent with the PK-less Table-3 UPDATE-HOT band (1.19×), exactly as predicted
+since both now take the same HOT path.
+
+Correctness (unchanged): INSERT with bad FK → unidb rejected ✓ / PG rejected ✓;
+DELETE of referenced parent → unidb blocked (RESTRICT) ✓ / PG blocked ✓.
