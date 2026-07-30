@@ -198,6 +198,81 @@ fn update_into_existing_unique_value_is_rejected_but_self_update_is_ok() {
     run(&mut engine, "UPDATE t SET email = 'c@x' WHERE id = 2").unwrap();
 }
 
+// Item 117 (2026-07-30): updating a NON-key column on a table that has a
+// PK/UNIQUE index now takes the HOT fast path (unique re-check skipped, since an
+// unchanged key can't introduce a duplicate). This proves that relaxation is
+// correct: the unchanged unique/PK index entries still resolve to the live
+// (HOT-updated) version, so PK lookups and duplicate detection keep working, and
+// changing the key itself is still fully re-checked.
+#[test]
+fn item117_hot_update_of_nonkey_col_keeps_unique_indexes_correct() {
+    let (mut engine, _dir) = fresh();
+    run(
+        &mut engine,
+        "CREATE TABLE t (id INT PRIMARY KEY, email TEXT UNIQUE, note TEXT)",
+    )
+    .unwrap();
+    run(
+        &mut engine,
+        "INSERT INTO t (id, email, note) VALUES (1, 'a@x', 'n1')",
+    )
+    .unwrap();
+    run(
+        &mut engine,
+        "INSERT INTO t (id, email, note) VALUES (2, 'b@x', 'n2')",
+    )
+    .unwrap();
+
+    // HOT-path update: `note` is neither PK nor UNIQUE, so the unique re-check is
+    // skipped and no B-tree entry changes.
+    run(&mut engine, "UPDATE t SET note = 'n2b' WHERE id = 2").unwrap();
+
+    // 1. The PK index still resolves to the live (HOT-updated) version.
+    assert_eq!(
+        select_texts(&mut engine, "SELECT note FROM t WHERE id = 2"),
+        vec!["n2b".to_string()],
+    );
+    // 2. The UNIQUE(email) index still resolves the HOT-updated row: a duplicate
+    //    email INSERT is still rejected (proves the stale index entry → live
+    //    version via the HOT chain).
+    let err = run(
+        &mut engine,
+        "INSERT INTO t (id, email, note) VALUES (3, 'b@x', 'n3')",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, DbError::UniqueViolation { ref columns, .. } if columns == "email"),
+        "duplicate email after HOT update should still be rejected, got {err:?}",
+    );
+    // 3. A duplicate PK INSERT is still rejected.
+    let err = run(
+        &mut engine,
+        "INSERT INTO t (id, email, note) VALUES (2, 'z@x', 'n')",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, DbError::UniqueViolation { .. }),
+        "duplicate PK after HOT update should still be rejected, got {err:?}",
+    );
+    // 4. Changing the key itself is still fully re-checked (has_unique_in_set):
+    //    moving row 2's email onto row 1's must collide.
+    let err = run(&mut engine, "UPDATE t SET email = 'a@x' WHERE id = 2").unwrap_err();
+    assert!(
+        matches!(err, DbError::UniqueViolation { .. }),
+        "changing UNIQUE column into an existing value must still be rejected, got {err:?}",
+    );
+
+    // Full row set is intact and correctly readable by PK after all of the above.
+    assert_eq!(
+        select_ints(&mut engine, "SELECT id FROM t ORDER BY id"),
+        vec![1, 2]
+    );
+    assert_eq!(
+        select_texts(&mut engine, "SELECT note FROM t ORDER BY id"),
+        vec!["n1".to_string(), "n2b".to_string()],
+    );
+}
+
 // ── PRIMARY KEY (implies NOT NULL + UNIQUE) ───────────────────────────────────
 
 #[test]
