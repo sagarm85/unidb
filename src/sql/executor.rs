@@ -103,7 +103,13 @@ fn fk_key_record_id(parent_table: &str, ref_col: &str, key: &OrderedValue) -> Re
 /// explicitly named `ref_col`, or the single PK column inferred from
 /// `parent_def` when no column name was stored (SQL allows `REFERENCES t`
 /// with no column list, defaulting to `t`'s PK).
-fn resolve_fk_ref_col<'a>(
+///
+/// `pub(crate)` (not just `fn`) so `server::rest_resource`'s C2 embedded-FK
+/// relationship resolver can reuse the exact same "no explicit column ->
+/// infer the single-column PK" rule the engine's own FK enforcement uses,
+/// rather than re-deriving it — one definition of "what a bare `REFERENCES
+/// t` resolves to" for the whole codebase.
+pub(crate) fn resolve_fk_ref_col<'a>(
     parent_def: &'a TableDef,
     ref_col: Option<&str>,
 ) -> Result<&'a ColumnDef> {

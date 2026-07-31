@@ -47,6 +47,43 @@
 //! At most one `in.(...)` filter is accepted per `PATCH`/`DELETE` request
 //! (more would require a combinatorial cross-product of per-value
 //! statements); a second one is a 400.
+//!
+//! **C2 — embedded resource expansion** (`GET` only): `select=id,total,
+//! customer(id,name)` nests the related row(s) into each base row, e.g.
+//! `{"id":1,"total":10,"customer":{"id":7,"name":"acme"}}`. The relationship
+//! is resolved purely from catalog FK metadata
+//! ([`resolve_relation`]) — never hand-written per-table logic:
+//! - **Forward (many-to-one):** the embed name matches one of the base
+//!   table's own FK columns — either the referenced table's name, the FK
+//!   column's own name, or the FK column with a trailing `_id` stripped
+//!   (`customer_id` -> `customer`, [`strip_id_suffix`]). Embeds a single
+//!   object, or `null` when the FK value is `NULL` or the referenced row is
+//!   not visible to the caller (RLS/grants — see below).
+//! - **Reverse (one-to-many):** the embed name matches some other table's
+//!   name, where that table carries an FK column targeting the base table.
+//!   Embeds an array (possibly empty).
+//! - **Ambiguity is a 400**, not a silent first-match: a name that matches
+//!   more than one FK relationship (e.g. two FK columns on the same table
+//!   both referencing the target) is rejected as `AMBIGUOUS_RELATIONSHIP`,
+//!   matching this module's existing posture of preferring an explicit error
+//!   over guessing (mirrors [`extract_single_in`]'s multi-`in.()` rejection).
+//! - **Enforcement:** the embedded table's data is fetched via a *second*
+//!   parameterized query run through the exact same [`run_stmt`] path as the
+//!   base query — same `authorize_sql_as_principal` table/column-grant
+//!   pre-check, same RLS-applying `execute_sql_params_as_principal`, same
+//!   caller [`AuthPrincipal`]. A restricted caller who can `SELECT` the base
+//!   row but not (all of) the embedded table simply gets `null`/`[]`/a
+//!   grant-denied error exactly as a direct `GET` on the embedded table
+//!   would — this module never reaches past the enforcement layer to fetch
+//!   a row the caller couldn't otherwise read. Stitching (join-key value ->
+//!   embedded JSON) happens entirely in Rust after both enforced queries
+//!   return; no unenforced executor path is ever used.
+//! - Composite (multi-column) FKs are out of scope for v1 embedding (single-
+//!   column FKs only, both column-level `REFERENCES` and single-column
+//!   table-level `FOREIGN KEY`) — a modest, catalog-derived addition rather
+//!   than a general multi-column join planner.
+
+use std::collections::{HashMap, HashSet};
 
 use axum::{
     body::Bytes,
@@ -63,7 +100,7 @@ use crate::{
 };
 
 use super::{
-    dto::{exec_result_to_json, is_internal_table, json_to_literal},
+    dto::{self, exec_result_to_json, is_internal_table, json_to_literal},
     error::ApiError,
     handlers::finish,
     AppState,
@@ -542,12 +579,334 @@ fn merge_counts(results: Vec<ExecResult>) -> Result<ExecResult, ApiError> {
     }
 }
 
+// ── C2: embedded resource expansion (`select=...,name(cols)`) ──────────────
+
+/// One parsed `select=` entry: a plain column, or an embedded-resource spec
+/// `name(col,col,...)` (`name(*)`/`name()` request every column of the
+/// embedded resource).
+#[derive(Clone, Debug)]
+enum SelectItem {
+    Column(String),
+    Embed { name: String, columns: Vec<String> },
+}
+
+fn bad_select(msg: impl Into<String>) -> ApiError {
+    ApiError::bad_request("INVALID_SELECT", msg.into())
+}
+
+/// Split a `select=` value on **top-level** commas only — a comma inside an
+/// embed's `(...)` doesn't end the outer entry (`select=id,customer(id,name)`
+/// is two entries, not three).
+fn parse_select_list(raw: &str) -> Result<Vec<SelectItem>, ApiError> {
+    let mut items = Vec::new();
+    let mut depth = 0i32;
+    let mut current = String::new();
+    for ch in raw.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err(bad_select("unbalanced ')' in `select`"));
+                }
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                push_select_item(&mut items, &current)?;
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    if depth != 0 {
+        return Err(bad_select("unbalanced '(' in `select`"));
+    }
+    push_select_item(&mut items, &current)?;
+    Ok(items)
+}
+
+fn push_select_item(items: &mut Vec<SelectItem>, raw: &str) -> Result<(), ApiError> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(());
+    }
+    match raw.find('(') {
+        Some(open) => {
+            if !raw.ends_with(')') {
+                return Err(bad_select(format!("malformed embed spec '{raw}'")));
+            }
+            let name = raw[..open].trim().to_string();
+            if name.is_empty() {
+                return Err(bad_select(format!("malformed embed spec '{raw}'")));
+            }
+            let inner = raw[open + 1..raw.len() - 1].trim();
+            let columns = if inner.is_empty() || inner == "*" {
+                Vec::new()
+            } else {
+                inner
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            };
+            items.push(SelectItem::Embed { name, columns });
+        }
+        None => items.push(SelectItem::Column(raw.to_string())),
+    }
+    Ok(())
+}
+
+/// A resolved embeddable relationship between the base table and a related
+/// one, derived purely from catalog FK metadata — see this module's doc
+/// comment.
+#[derive(Clone, Debug)]
+enum Relation {
+    /// Many-to-one: `base.fk_column` -> `ref_table.ref_column`.
+    Forward {
+        fk_column: String,
+        ref_table: String,
+        ref_column: String,
+    },
+    /// One-to-many: `child_table.fk_column` -> `base.ref_column`.
+    Reverse {
+        child_table: String,
+        fk_column: String,
+        ref_column: String,
+    },
+}
+
+/// Strip a case-insensitive `_id` suffix — the conventional relationship
+/// alias for a FK column (`customer_id` -> `customer`). A naming
+/// convenience only: the join itself always comes from the catalog FK, this
+/// just widens what embed name matches it.
+fn strip_id_suffix(column: &str) -> Option<&str> {
+    if column.len() > 3 && column[column.len() - 3..].eq_ignore_ascii_case("_id") {
+        Some(&column[..column.len() - 3])
+    } else {
+        None
+    }
+}
+
+/// Resolve a `select=...,<name>(...)` embed `name` against `base`'s catalog
+/// FK metadata. Zero matches is `UNKNOWN_RELATIONSHIP` (400); more than one
+/// is `AMBIGUOUS_RELATIONSHIP` (400) — e.g. two FK columns on `base` both
+/// targeting the same table under the same derived alias, or two FK columns
+/// on the same child table both targeting `base`. Composite (multi-column)
+/// FKs are skipped (out of scope for v1 embedding).
+fn resolve_relation(
+    all_defs: &[TableDef],
+    base: &TableDef,
+    name: &str,
+) -> Result<Relation, ApiError> {
+    let mut candidates: Vec<Relation> = Vec::new();
+
+    // Forward: base's own FK columns (column-level `REFERENCES` and
+    // single-column table-level `FOREIGN KEY`) matched by referenced table
+    // name, the FK column's own name, or its `_id`-stripped alias.
+    for col in base.columns.iter().filter(|c| !c.dropped) {
+        if let Some(fk) = &col.constraints.references {
+            let alias = strip_id_suffix(&col.name);
+            if fk.table == name || col.name == name || alias == Some(name) {
+                if let Some(ref_def) = all_defs.iter().find(|d| d.name == fk.table) {
+                    if let Ok(ref_col) =
+                        crate::sql::executor::resolve_fk_ref_col(ref_def, fk.column.as_deref())
+                    {
+                        candidates.push(Relation::Forward {
+                            fk_column: col.name.clone(),
+                            ref_table: fk.table.clone(),
+                            ref_column: ref_col.name.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    for fk in &base.constraints.foreign_keys {
+        if fk.columns.len() != 1 {
+            continue;
+        }
+        let col_name = &fk.columns[0];
+        let alias = strip_id_suffix(col_name);
+        if fk.ref_table == name || col_name == name || alias == Some(name) {
+            if let Some(ref_col) = fk.ref_columns.first() {
+                candidates.push(Relation::Forward {
+                    fk_column: col_name.clone(),
+                    ref_table: fk.ref_table.clone(),
+                    ref_column: ref_col.clone(),
+                });
+            }
+        }
+    }
+
+    // Reverse: every other table whose name matches `name` and that carries
+    // a (single-column) FK targeting `base`.
+    for child in all_defs.iter().filter(|d| !is_internal_table(&d.name)) {
+        if child.name != name {
+            continue;
+        }
+        for col in child.columns.iter().filter(|c| !c.dropped) {
+            if let Some(fk) = &col.constraints.references {
+                if fk.table == base.name {
+                    if let Ok(ref_col) =
+                        crate::sql::executor::resolve_fk_ref_col(base, fk.column.as_deref())
+                    {
+                        candidates.push(Relation::Reverse {
+                            child_table: child.name.clone(),
+                            fk_column: col.name.clone(),
+                            ref_column: ref_col.name.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        for fk in &child.constraints.foreign_keys {
+            if fk.columns.len() != 1 || fk.ref_table != base.name {
+                continue;
+            }
+            if let Some(ref_col) = fk.ref_columns.first() {
+                candidates.push(Relation::Reverse {
+                    child_table: child.name.clone(),
+                    fk_column: fk.columns[0].clone(),
+                    ref_column: ref_col.clone(),
+                });
+            }
+        }
+    }
+
+    match candidates.len() {
+        0 => Err(ApiError::bad_request(
+            "UNKNOWN_RELATIONSHIP",
+            format!(
+                "no foreign-key relationship named '{name}' on '{}'",
+                base.name
+            ),
+        )),
+        1 => candidates
+            .into_iter()
+            .next()
+            .ok_or_else(|| ApiError::internal("INTERNAL_ERROR", "relation candidate vanished")),
+        _ => Err(ApiError::bad_request(
+            "AMBIGUOUS_RELATIONSHIP",
+            format!(
+                "'{name}' matches more than one foreign-key relationship on '{}'; \
+                 disambiguate by column name",
+                base.name
+            ),
+        )),
+    }
+}
+
+/// One embed spec resolved from `select=`: its output alias (the key it's
+/// nested under), the relationship, and the requested sub-columns (empty =
+/// all columns of the embedded resource).
+struct EmbedSpec {
+    alias: String,
+    relation: Relation,
+    sub_cols: Vec<String>,
+}
+
+/// Canonical string key for grouping/joining `Literal` values across the two
+/// enforced queries (base + embed) — reuses [`dto::literal_to_json`]'s exact
+/// per-variant mapping so a value round-trips to the same key regardless of
+/// which query produced it (same column type on both sides of a FK).
+fn literal_key(lit: &Literal) -> String {
+    dto::literal_to_json(lit).to_string()
+}
+
+/// Fetch the related rows for one embed, keyed by `join_col`'s value — a
+/// **second parameterized query**, run through the exact same [`run_stmt`]
+/// enforced path (RLS + table/column grants) as everything else in this
+/// module. `keys` are the distinct non-NULL join values collected from the
+/// base result; empty `keys` short-circuits without a query.
+async fn fetch_embedded(
+    state: &AppState,
+    principal: &AuthPrincipal,
+    target_def: &TableDef,
+    sub_cols: &[String],
+    join_col: &str,
+    keys: &[Literal],
+) -> Result<Vec<(String, JsonMap<String, JsonValue>)>, ApiError> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let wildcard = sub_cols.is_empty();
+    let mut projection_cols = sub_cols.to_vec();
+    if !wildcard && !projection_cols.iter().any(|c| c == join_col) {
+        projection_cols.push(join_col.to_string());
+    }
+    let projection_sql = if wildcard {
+        "*".to_string()
+    } else {
+        projection_cols
+            .iter()
+            .map(|c| quote_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    let mut binds: Vec<Literal> = Vec::new();
+    let placeholders: Vec<String> = keys
+        .iter()
+        .map(|k| {
+            binds.push(k.clone());
+            format!("${}", binds.len())
+        })
+        .collect();
+    let sql = format!(
+        "SELECT {projection_sql} FROM {} WHERE {} IN ({})",
+        table_ident(&target_def.name),
+        quote_ident(join_col),
+        placeholders.join(", ")
+    );
+
+    let result = run_stmt(state, principal, sql, binds).await?;
+    let (result_cols, rows) = match result {
+        ExecResult::Rows { columns, rows } => (columns, rows),
+        other => {
+            return Err(ApiError::internal(
+                "INTERNAL_ERROR",
+                format!("expected rows from an embed query, got {other:?}"),
+            ))
+        }
+    };
+    let join_idx = result_cols
+        .iter()
+        .position(|c| c == join_col)
+        .ok_or_else(|| {
+            ApiError::internal(
+                "INTERNAL_ERROR",
+                "join column missing from embed query result",
+            )
+        })?;
+
+    let wanted: Option<HashSet<&str>> =
+        (!wildcard).then(|| sub_cols.iter().map(String::as_str).collect());
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let key = literal_key(&row[join_idx]);
+        let mut obj = JsonMap::new();
+        for (i, cname) in result_cols.iter().enumerate() {
+            if wanted.as_ref().is_none_or(|w| w.contains(cname.as_str())) {
+                obj.insert(cname.clone(), dto::literal_to_json(&row[i]));
+            }
+        }
+        out.push((key, obj));
+    }
+    Ok(out)
+}
+
 // ── route handlers ──────────────────────────────────────────────────────────
 
 /// `GET /rest/v1/<table>?select=...&<filters>&order=...&limit=...&offset=...`
-/// -> `SELECT`. Always exactly one statement — a native SQL `IN (...)`
-/// promotes to the `Query` plan (see this module's doc comment), so no
-/// multi-statement expansion is needed here.
+/// -> `SELECT`, plus (C2) embedded resource expansion for any `select=`
+/// entries of the form `name(cols)`. Always exactly one base statement (plus
+/// one follow-up statement per distinct embed, see [`fetch_embedded`]) — a
+/// native SQL `IN (...)` promotes to the `Query` plan (see this module's doc
+/// comment), so no multi-statement expansion is needed for filters.
 pub async fn get_collection(
     Extension(principal): Extension<AuthPrincipal>,
     State(state): State<AppState>,
@@ -557,7 +916,8 @@ pub async fn get_collection(
     let def = lookup_table(&state, &table).await?;
     let pairs = parse_query_pairs(raw.as_deref());
 
-    let mut select_cols: Vec<String> = Vec::new();
+    let mut select_items: Vec<SelectItem> = Vec::new();
+    let mut select_param_present = false;
     let mut order_keys: Vec<(String, bool)> = Vec::new();
     let mut limit: Option<i64> = None;
     let mut offset: Option<i64> = None;
@@ -566,7 +926,8 @@ pub async fn get_collection(
     for (k, v) in &pairs {
         match k.as_str() {
             "select" => {
-                select_cols.extend(v.split(',').filter(|s| !s.is_empty()).map(String::from))
+                select_param_present = true;
+                select_items.extend(parse_select_list(v)?);
             }
             "order" => order_keys.extend(parse_order_value(v)),
             "limit" => limit = Some(parse_nonneg_int(v, "limit")?),
@@ -575,7 +936,18 @@ pub async fn get_collection(
         }
     }
 
-    for c in &select_cols {
+    let mut scalar_cols: Vec<String> = Vec::new();
+    let mut embed_requests: Vec<(String, Vec<String>)> = Vec::new();
+    for item in &select_items {
+        match item {
+            SelectItem::Column(c) => scalar_cols.push(c.clone()),
+            SelectItem::Embed { name, columns } => {
+                embed_requests.push((name.clone(), columns.clone()))
+            }
+        }
+    }
+
+    for c in &scalar_cols {
         validate_column(&def, c)?;
     }
     for (c, _) in &order_keys {
@@ -583,14 +955,59 @@ pub async fn get_collection(
     }
     let filters = parse_filters(&def, &filter_pairs)?;
 
-    let projection_sql = if select_cols.is_empty() {
-        "*".to_string()
+    // Resolve every embed against the full catalog (needed to find the
+    // relationship's target/child table and validate its sub-columns).
+    let mut embed_specs: Vec<EmbedSpec> = Vec::new();
+    let all_defs = if embed_requests.is_empty() {
+        Vec::new()
     } else {
-        select_cols
+        state.engine.table_defs().await?
+    };
+    for (name, columns) in &embed_requests {
+        let relation = resolve_relation(&all_defs, &def, name)?;
+        let target_name = match &relation {
+            Relation::Forward { ref_table, .. } => ref_table,
+            Relation::Reverse { child_table, .. } => child_table,
+        };
+        let target_def = all_defs
             .iter()
+            .find(|d| &d.name == target_name)
+            .ok_or_else(|| {
+                ApiError::internal("INTERNAL_ERROR", "embedded table vanished from catalog")
+            })?;
+        for c in columns {
+            validate_column(target_def, c)?;
+        }
+        embed_specs.push(EmbedSpec {
+            alias: name.clone(),
+            relation,
+            sub_cols: columns.clone(),
+        });
+    }
+
+    // The base query must also fetch each embed's join-key column, even if
+    // the caller didn't select it explicitly (it's needed to stitch the
+    // embed in afterwards; stripped from the output unless also requested).
+    let mut hidden_needed: Vec<String> = Vec::new();
+    for spec in &embed_specs {
+        let needed = match &spec.relation {
+            Relation::Forward { fk_column, .. } => fk_column.clone(),
+            Relation::Reverse { ref_column, .. } => ref_column.clone(),
+        };
+        if !scalar_cols.contains(&needed) && !hidden_needed.contains(&needed) {
+            hidden_needed.push(needed);
+        }
+    }
+
+    let projection_sql = if select_param_present && !select_items.is_empty() {
+        let mut cols = scalar_cols.clone();
+        cols.extend(hidden_needed.iter().cloned());
+        cols.iter()
             .map(|c| quote_ident(c))
             .collect::<Vec<_>>()
             .join(", ")
+    } else {
+        "*".to_string()
     };
 
     let mut binds: Vec<Literal> = Vec::new();
@@ -618,7 +1035,170 @@ pub async fn get_collection(
     }
 
     let result = run_stmt(&state, &principal, sql, binds).await?;
-    Ok(Json(exec_result_to_json(&result)))
+
+    if embed_specs.is_empty() {
+        return Ok(Json(exec_result_to_json(&result)));
+    }
+
+    let (result_cols, rows) = match result {
+        ExecResult::Rows { columns, rows } => (columns, rows),
+        // A well-formed SELECT always yields `Rows`; fail safe rather than
+        // silently dropping the requested embeds.
+        other => return Ok(Json(exec_result_to_json(&other))),
+    };
+
+    /// One embed's fetched-and-grouped related rows, keyed by the base
+    /// row's join-key value (canonical string key, see [`literal_key`]).
+    struct Resolved {
+        alias: String,
+        is_forward: bool,
+        base_key_idx: usize,
+        grouped: HashMap<String, Vec<JsonMap<String, JsonValue>>>,
+    }
+
+    let mut resolved: Vec<Resolved> = Vec::with_capacity(embed_specs.len());
+    for spec in &embed_specs {
+        let (join_col_on_base, target_table_name, target_join_col, is_forward) =
+            match &spec.relation {
+                Relation::Forward {
+                    fk_column,
+                    ref_table,
+                    ref_column,
+                } => (
+                    fk_column.clone(),
+                    ref_table.clone(),
+                    ref_column.clone(),
+                    true,
+                ),
+                Relation::Reverse {
+                    child_table,
+                    fk_column,
+                    ref_column,
+                } => (
+                    ref_column.clone(),
+                    child_table.clone(),
+                    fk_column.clone(),
+                    false,
+                ),
+            };
+        let base_key_idx = result_cols
+            .iter()
+            .position(|c| c == &join_col_on_base)
+            .ok_or_else(|| {
+                ApiError::internal("INTERNAL_ERROR", "join column missing from base result")
+            })?;
+
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut keys: Vec<Literal> = Vec::new();
+        for row in &rows {
+            let v = &row[base_key_idx];
+            if matches!(v, Literal::Null) {
+                continue;
+            }
+            if seen.insert(literal_key(v)) {
+                keys.push(v.clone());
+            }
+        }
+
+        let target_def = all_defs
+            .iter()
+            .find(|d| d.name == target_table_name)
+            .ok_or_else(|| {
+                ApiError::internal("INTERNAL_ERROR", "embedded table vanished from catalog")
+            })?;
+        let fetched = fetch_embedded(
+            &state,
+            &principal,
+            target_def,
+            &spec.sub_cols,
+            &target_join_col,
+            &keys,
+        )
+        .await?;
+
+        let mut grouped: HashMap<String, Vec<JsonMap<String, JsonValue>>> = HashMap::new();
+        for (k, obj) in fetched {
+            grouped.entry(k).or_default().push(obj);
+        }
+
+        resolved.push(Resolved {
+            alias: spec.alias.clone(),
+            is_forward,
+            base_key_idx,
+            grouped,
+        });
+    }
+
+    enum OutCol<'a> {
+        Scalar(usize),
+        Embed(&'a Resolved),
+    }
+    let mut out_plan: Vec<OutCol> = Vec::with_capacity(select_items.len());
+    for item in &select_items {
+        match item {
+            SelectItem::Column(c) => {
+                let idx = result_cols.iter().position(|rc| rc == c).ok_or_else(|| {
+                    ApiError::internal("INTERNAL_ERROR", "selected column missing from result")
+                })?;
+                out_plan.push(OutCol::Scalar(idx));
+            }
+            SelectItem::Embed { name, .. } => {
+                let r = resolved.iter().find(|r| &r.alias == name).ok_or_else(|| {
+                    ApiError::internal("INTERNAL_ERROR", "embed alias missing from resolved set")
+                })?;
+                out_plan.push(OutCol::Embed(r));
+            }
+        }
+    }
+
+    let out_columns: Vec<String> = select_items
+        .iter()
+        .map(|item| match item {
+            SelectItem::Column(c) => c.clone(),
+            SelectItem::Embed { name, .. } => name.clone(),
+        })
+        .collect();
+
+    let mut out_rows: Vec<JsonValue> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let mut out_row: Vec<JsonValue> = Vec::with_capacity(out_plan.len());
+        for col in &out_plan {
+            let value = match col {
+                OutCol::Scalar(idx) => dto::literal_to_json(&row[*idx]),
+                OutCol::Embed(r) => {
+                    let key_val = &row[r.base_key_idx];
+                    if matches!(key_val, Literal::Null) {
+                        if r.is_forward {
+                            JsonValue::Null
+                        } else {
+                            JsonValue::Array(Vec::new())
+                        }
+                    } else {
+                        match r.grouped.get(&literal_key(key_val)) {
+                            Some(list) if r.is_forward => list
+                                .first()
+                                .cloned()
+                                .map(JsonValue::Object)
+                                .unwrap_or(JsonValue::Null),
+                            Some(list) => JsonValue::Array(
+                                list.iter().cloned().map(JsonValue::Object).collect(),
+                            ),
+                            None if r.is_forward => JsonValue::Null,
+                            None => JsonValue::Array(Vec::new()),
+                        }
+                    }
+                }
+            };
+            out_row.push(value);
+        }
+        out_rows.push(JsonValue::Array(out_row));
+    }
+
+    Ok(Json(serde_json::json!({
+        "type": "rows",
+        "columns": out_columns,
+        "rows": out_rows,
+    })))
 }
 
 /// `POST /rest/v1/<table>` (JSON object or array of objects) -> `INSERT`.
