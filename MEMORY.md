@@ -485,6 +485,24 @@ be raised with the user directly, not assumed.
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-07-31 — autonomous overnight: E1 merged (#224) + studio-unblocker batch shipped
+
+Overnight autonomous run (user asleep, auto-merge of verified PRs). **E1** (PR #224, `5b07420`):
+per-subscriber RLS on SSE — tenants get only their own events (delivery-side, reuses
+`predicate_matches`, service_role audited, fail-closed; crash 54/54, e1 4/4). **Studio-unblocker
+batch** (`4008249`, item 124) — 4 gaps the parallel studio session flagged: (1) `unidb-server-full`
+now reads `UNIDB_ALLOW_SIGNUP` (was plain-binary-only — real A3 bug); (2) `unidb_catalog.policies`
+exposes `target_roles` (role-scoped policy display); (3) `ALTER USER <name> PASSWORD '<pw>'` DDL
+(superuser-gated, argon2id, password redacted from Debug/audit) — password reset over /sql;
+(4) session listing + revoke-by-id via `unidb_catalog.sessions` (opaque `session_id` independent
+of the token hash; view never exposes token/hash; per-caller filtered like item 111) +
+revoke-a-specific-session. Verified from clean: both binaries build, crash 54/54,
+studio_g1_g2_fixes 7/7, authz/clippy/fmt/lint clean. Filed backlog `124_…`. Disk hit 100% during
+the agent build — `cargo clean` (frees ~30G) between every from-clean gate is mandatory now.
+**Merged tonight:** #222 auth loop, #223 A5/A6+I1+B5+C1, #224 E1. **Queue:** studio-unblocker PR
+(this) → F1 storage per-object RLS → C2 /rest/v1 FK-embed → maybe I4. Deferred-for-user: D
+OAuth/email/MFA, H SDK, C4 GraphQL, I2/I3/I5/I7, I6 per-project (user excluded it).
+
 ### 2026-07-31 — C1 auto /rest/v1 API + OpenAPI shipped (Wave 2 begun); autonomous overnight run
 
 User went to sleep, authorized autonomous completion of well-defined items + auto-merge of

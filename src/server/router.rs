@@ -119,6 +119,9 @@ pub fn build_router_with_rate_limiter(
         .route("/auth/preview", post(handlers::post_auth_preview))
         // item 100: GET /auth/whoami — caller's identity + grants (JWT required).
         .route("/auth/whoami", get(handlers::get_auth_whoami))
+        // item 4: DELETE /auth/sessions/{id} — revoke a specific session by
+        // its opaque id (superuser/self gated; see the handler's doc comment).
+        .route("/auth/sessions/{id}", delete(handlers::delete_auth_session))
         .route("/events/head", get(handlers::get_events_head))
         .route("/events/subscribe", get(sse::get_events_subscribe))
         .route("/events/ack", post(handlers::post_events_ack))
