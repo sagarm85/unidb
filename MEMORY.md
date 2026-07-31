@@ -12,6 +12,38 @@
 
 ## Current status
 
+- **2026-07-31 — Architecture-review session: items 117 + report-HTML renderer shipped; item 118 (async-HNSW crash hole) planned next.**
+  Fresh senior-architect review of `report_20260728_102745.md` + the async-HNSW/CRUD/scan
+  code surfaced a ranked findings list. Two units shipped to main:
+  - **Item 117 (PR #218, `c134889`) — HOT UPDATE on PK/UNIQUE tables when the key is unchanged.**
+    Root cause: `hot_eligible` gated on `!has_unique`, so the mere existence of a PK/UNIQUE
+    index forced every PK'd-table UPDATE onto the slow per-row loop + a redundant per-row PK
+    B-tree re-check. Fix mirrors item-53's FK gate: `has_unique_in_set` (HOT/enforce_unique/
+    phantom-lock only when a unique/PK col is actually in SET). Safety verified — unchanged
+    unique entry resolves via the same `get_visible` HOT-chain walk as secondary indexes.
+    **Docker Table-5 cert `report_20260730_124355.md`: UPDATE bulk 0.19×→3.04×, unidb absolute
+    138,840→1,130,955 rec/s (+8.1×)** (item-108 caveat: PG absolute drifted, so ~1.5× vs
+    baseline PG — still a win, in the Table-3 HOT band). Correctness intact. `can_batch_non_hot`
+    left conservative (`!has_unique`) as a follow-up.
+  - **Report HTML renderer (PR #217, `71e74b1`).** `scripts/render_report.py` — content-agnostic
+    Markdown→styled-HTML; `report.sh` auto-drops a `report_<ts>.html` sibling (git-ignored,
+    derived; `.md` stays authoritative). Non-fatal.
+  - **Next: item 118 — async-HNSW crash-durability hole (plan approved).** On the served/
+    `open_arc` path a committed vector row whose HNSW insert is still in the in-memory
+    `sync_channel(4096)` at crash time is lost from the index forever (WAL redo restores only
+    what the worker durably applied; no reconciliation). Approved approach: **background,
+    crash-gated reconciliation** — an `hnsw_dirty` clean-shutdown flag keeps clean reopens O(1);
+    after an unclean shutdown a background thread diffs each index's `node_index` (via
+    `validate()`) against the committed heap and re-enqueues only the missing tail through the
+    worker. Add `DiskHnswIndex::contains(rid)` (insert is NOT idempotent) + a real crash-
+    convergence test. Also folds in the worker's swallowed-insert-error leak.
+
+  Other review findings still queued: report-honesty edits (label the O(1) COUNT(*) row; add
+  `W_total`/replaced-stack columns — the moat is unmeasured in the baseline), scan-at-scale
+  ceiling (~17M rec/s = per-row TEXT `String` alloc + serial result concat), UPDATE decode-
+  pushdown (`cols/row`=8 on HOT UPDATE), and HNSW parallelism (single worker; 16.69 ms drain at
+  100k = the Table-4 moat collapse to 0.01×).
+
 - **2026-07-28 — Fresh FULL Docker bench on current main `7c064f1` → new authoritative baseline.**
   `docs/performance/report_20260728_102745.md` (all tables, 83m 38s, RSS 521 MiB, environment
   canary quiet — trustworthy). First full-report capture of items 115/116: **SELECT filtered

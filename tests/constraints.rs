@@ -514,6 +514,71 @@ fn fk_restrict_blocks_parent_delete_with_children() {
     assert_eq!(select_ints(&mut engine, "SELECT id FROM orders"), vec![1]);
 }
 
+// Item 119 (2026-07-31): updating a NON-referenced column of a parent row that
+// HAS children must SUCCEED — the parent-side RESTRICT check must only fire when
+// a child-referenced key actually changes, not on every parent edit. This is the
+// false-positive direction the pre-119 tests never covered (they only asserted
+// parent DELETE is blocked). Mirrors the real Studio bug: editing
+// `purchase_orders.shipping_address` while `po_line_items.order_id` references it.
+#[test]
+fn fk_restrict_allows_parent_update_of_non_referenced_column() {
+    let (mut engine, _dir) = fresh();
+    run(
+        &mut engine,
+        "CREATE TABLE purchase_orders (id INT PRIMARY KEY, order_number TEXT, shipping_address TEXT)",
+    )
+    .unwrap();
+    run(
+        &mut engine,
+        "CREATE TABLE po_line_items (id INT PRIMARY KEY, order_id INT REFERENCES purchase_orders(id), qty INT)",
+    )
+    .unwrap();
+    run(
+        &mut engine,
+        "INSERT INTO purchase_orders (id, order_number, shipping_address) VALUES (1, 'PO-100', '(As above)')",
+    )
+    .unwrap();
+    run(
+        &mut engine,
+        "INSERT INTO po_line_items (id, order_id, qty) VALUES (10, 1, 5)",
+    )
+    .unwrap();
+
+    // (A) Editing a non-referenced column of the parent must succeed — the child
+    // still validly references id=1.
+    run(
+        &mut engine,
+        "UPDATE purchase_orders SET shipping_address = '1 Fairfax Blvd' WHERE id = 1",
+    )
+    .expect("editing a non-key column of a parent with children must be allowed");
+    assert_eq!(
+        select_texts(
+            &mut engine,
+            "SELECT shipping_address FROM purchase_orders WHERE id = 1"
+        ),
+        vec!["1 Fairfax Blvd".to_string()],
+    );
+
+    // (B) But changing the referenced key (id) so it orphans the child must STILL
+    // be blocked — RESTRICT is intact, only narrowed.
+    let err = run(
+        &mut engine,
+        "UPDATE purchase_orders SET id = 99 WHERE id = 1",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, DbError::ForeignKeyViolation { .. }),
+        "changing a referenced parent key that orphans a child must still be blocked, got {err:?}",
+    );
+
+    // (C) DELETE of a still-referenced parent must STILL be blocked.
+    let err = run(&mut engine, "DELETE FROM purchase_orders WHERE id = 1").unwrap_err();
+    assert!(
+        matches!(err, DbError::ForeignKeyViolation { .. }),
+        "deleting a still-referenced parent must still be blocked, got {err:?}",
+    );
+}
+
 #[test]
 fn fk_restrict_allows_parent_delete_no_children() {
     let (mut engine, _dir) = fresh();
