@@ -149,6 +149,19 @@ here — this file holds the rules that back and extend them.
   `USING` before the column list (M2.c/M6) — each caught by reading the
   vendored source, or breaking immediately when not.
 
+- **Every constraint/enforcement gate needs a test in BOTH directions — "enforces when it should" AND "does NOT over-enforce when it shouldn't."**
+  Item 119 (2026-07-31): the parent-side FK RESTRICT check fired on *every*
+  parent UPDATE, so editing a non-key column of a parent row that had children
+  (`purchase_orders.shipping_address`) was wrongly rejected — a false positive
+  that reached a live Studio user. The FK suite had covered RESTRICT only on
+  DELETE and only the "it blocks" direction; nobody had written "a benign parent
+  edit succeeds." The enforcement (true-positive) direction is the one you
+  naturally test; the over-enforcement (false-positive) direction is the one that
+  silently ships. Item 117's test got this right (asserts the skip AND that a
+  real key-change still blocks) — make that the pattern for every gate. Same
+  family as items 53 / 117: whenever a check is *narrowed* to "only when column X
+  is in SET," add the test proving the narrowed-out case now passes.
+
 ## Engine-specific invariants
 
 - **Vacuum's aliasing gate: scrub every reclaimed RowId from ALL secondary indexes BEFORE any slot becomes reusable.**

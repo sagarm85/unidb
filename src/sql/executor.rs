@@ -205,6 +205,41 @@ fn table_has_fk_children(catalog: &Catalog, parent_table: &str) -> bool {
     })
 }
 
+/// Item 119: the set of `parent_def`'s column names that some child table
+/// references via a FOREIGN KEY (column-level `REFERENCES` or table-level FK).
+/// Drives the parent-side RESTRICT gate on UPDATE — if an UPDATE assigns none of
+/// these columns, no child-referenced key value changes, so no child can be
+/// orphaned and the RESTRICT check (which would otherwise wrongly block a benign
+/// non-key edit) is skipped.
+fn fk_referenced_parent_columns(
+    catalog: &Catalog,
+    parent_def: &TableDef,
+) -> std::collections::HashSet<String> {
+    let mut cols = std::collections::HashSet::new();
+    for child in catalog.tables() {
+        for c in &child.columns {
+            if c.dropped {
+                continue;
+            }
+            if let Some(r) = &c.constraints.references {
+                if r.table == parent_def.name {
+                    if let Ok(pc) = resolve_fk_ref_col(parent_def, r.column.as_deref()) {
+                        cols.insert(pc.name.clone());
+                    }
+                }
+            }
+        }
+        for fk in &child.constraints.foreign_keys {
+            if fk.ref_table == parent_def.name {
+                for rc in &fk.ref_columns {
+                    cols.insert(rc.clone());
+                }
+            }
+        }
+    }
+    cols
+}
+
 /// Acquire exclusive `FkKey` phantom locks for every non-NULL FK column value
 /// in `row`. Must be called BEFORE `snapshot_for_statement` so the lock is held
 /// when the snapshot is taken, preventing the parent-delete / child-insert race.
@@ -3109,6 +3144,26 @@ fn exec_update(
             .flatten()
             .any(|&ci| set_col_names.contains(table_def.columns[ci].name.as_str()))
     };
+    // Item 119 (2026-07-31): gate the parent-side FK RESTRICT the same way item
+    // 53 gates the child-side check and item 117 gates UNIQUE — only when a
+    // column that some CHILD references actually appears in the SET clause. An
+    // UPDATE that leaves every child-referenced key value unchanged cannot orphan
+    // any child, so RESTRICT (which reads the OLD key and asks "is it still
+    // referenced?") would always find it referenced and wrongly BLOCK a benign
+    // edit — e.g. `UPDATE purchase_orders SET shipping_address = ... WHERE id=1`
+    // when `po_line_items.order_id` references `purchase_orders.id`. RESTRICT must
+    // only fire when a referenced key is actually being changed (which then
+    // correctly blocks orphaning a child); a plain DELETE still always enforces it
+    // (that path does not use this gate). `has_fk_children` stays as the broad
+    // "does anyone reference us?" fact; this narrows it to "…and are we touching
+    // the referenced key?".
+    let has_fk_children_ref_in_set = has_fk_children && {
+        let set_col_names: std::collections::HashSet<&str> =
+            assignments.iter().map(|(col, _)| col.as_str()).collect();
+        fk_referenced_parent_columns(ctx.catalog.get(), &table_def)
+            .iter()
+            .any(|c| set_col_names.contains(c.as_str()))
+    };
 
     // Item 58 HOT eligibility: try same-page HOT update (no B-tree update)
     // when all of the following hold:
@@ -3429,7 +3484,7 @@ fn exec_update(
         // UNIQUE + FK — acquire all phantom locks BEFORE taking a fresh
         // snapshot, then run uniqueness + FK checks with it (items 35/36/53).
         // RESTRICT on old PK also uses a fresh snapshot (after its lock).
-        if has_unique_in_set || has_fk_refs_in_set || has_fk_children {
+        if has_unique_in_set || has_fk_refs_in_set || has_fk_children_ref_in_set {
             // Step 1: acquire UniqueKey + FkKey (child-side) phantom locks.
             // Item 117: only when a unique/PK column is actually in SET — an
             // unchanged key needs no phantom lock (a concurrent inserter of the
@@ -3456,7 +3511,10 @@ fn exec_update(
                 )?;
             }
             // Step 1b: FkKey parent lock for RESTRICT (old PK value).
-            if has_fk_children {
+            // Item 119: only when a child-referenced key is actually in SET —
+            // an unchanged referenced key cannot orphan a child, so no parent
+            // RESTRICT (and thus no parent phantom lock) is needed.
+            if has_fk_children_ref_in_set {
                 acquire_fk_key_locks_parent(&table_def, &before_row, ctx.xid, ctx.lock_mgr)?;
             }
             // Step 2: fresh snapshot AFTER all phantom locks.
@@ -3489,8 +3547,13 @@ fn exec_update(
                     ctx.catalog.get(),
                 )?;
             }
-            // FK parent-side RESTRICT: old PK value must not be referenced.
-            if has_fk_children {
+            // FK parent-side RESTRICT: a child-referenced key that is CHANGING
+            // must not orphan an existing child. Item 119: gated on
+            // has_fk_children_ref_in_set — if the referenced key is unchanged the
+            // children stay valid, so skipping the check lets benign parent edits
+            // (e.g. shipping_address) through. DELETE still enforces it always
+            // (that path does not consult this gate).
+            if has_fk_children_ref_in_set {
                 enforce_fk_restrict(
                     &table_def,
                     &before_row,
