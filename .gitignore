@@ -35,3 +35,6 @@ __pycache__/
 # scripts/report.sh --docker). The docker/ image + compose files ARE committed;
 # only their run output under docker/out/ is not.
 /docker/out/
+
+# Ephemeral background-agent git worktrees (never commit these)
+.claude/worktrees/
