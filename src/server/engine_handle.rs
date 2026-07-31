@@ -151,6 +151,10 @@ impl EngineHandle {
     /// a named user identity (item 103). Superusers and the no-`sub` path
     /// (`user = None`) bypass `current_user`-referencing policies. Regular users
     /// have policies applied with `current_user` substituted.
+    ///
+    /// Carries no verified claims — prefer
+    /// [`Self::execute_sql_read_as_principal`] when `auth.jwt()`-referencing
+    /// policies (item 122) must resolve correctly.
     pub async fn execute_sql_read_as(
         &self,
         user: Option<String>,
@@ -161,6 +165,25 @@ impl EngineHandle {
         tokio::task::spawn_blocking(move || {
             let _corr = crate::observability::set_request_id(request_id);
             read.execute_sql_as(user.as_deref(), &sql)
+        })
+        .await
+        .map_err(|_| DbError::EngineUnavailable)?
+    }
+
+    /// Like [`Self::execute_sql_read_as`] but forwards a full [`AuthPrincipal`]
+    /// (item 122, B1/B2) so `auth.uid()`/`auth.jwt() ->> '...'` RLS policies
+    /// resolve correctly on the concurrent read path too — the same claims
+    /// carried into `execute_sql_as_principal` on the writer path.
+    pub async fn execute_sql_read_as_principal(
+        &self,
+        principal: AuthPrincipal,
+        sql: String,
+    ) -> Result<Vec<ExecResult>> {
+        let read = self.read.clone();
+        let request_id = crate::server::correlation::current_request_id();
+        tokio::task::spawn_blocking(move || {
+            let _corr = crate::observability::set_request_id(request_id);
+            read.execute_sql_as_principal(&principal, &sql)
         })
         .await
         .map_err(|_| DbError::EngineUnavailable)?

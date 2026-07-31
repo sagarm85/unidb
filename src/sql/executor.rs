@@ -795,8 +795,9 @@ pub struct ExecCtx<'a> {
     /// in all other paths (superuser/embedded always bypass RLS anyway).
     pub current_user: Option<String>,
     /// Full flattened JWT claim set for the executing principal (auth seam).
-    /// Carried alongside `current_user` for forward-compat with later
-    /// claim-aware policy work; **not consumed by any executor logic yet**.
+    /// Carried alongside `current_user`; backs `auth.jwt() ->> '...'`
+    /// RLS-policy substitution (item 122, Workstream B2) in the INSERT-policy
+    /// and `WITH CHECK` checks below — see `substitute_auth_context_in_expr`.
     /// Empty in all paths that don't build an [`crate::AuthPrincipal`]
     /// (embedded/superuser paths, unit tests building bare `ExecCtx`).
     pub auth_claims: std::collections::BTreeMap<String, serde_json::Value>,
@@ -1975,19 +1976,26 @@ fn exec_insert(
         // Item-24 Z1: INSERT policy check. If a `FOR INSERT` (or `FOR ALL`)
         // RLS policy exists, evaluate the predicate against the new row before
         // writing — any row that would violate the predicate is rejected.
-        // Item-24 Z6: substitute `current_user` in the policy clone before
-        // evaluating, so per-user row isolation works on the INSERT path too.
-        // When `current_user` is None (embedded/superuser path), skip any
-        // policy that contains CurrentUser (same reasoning as `apply_rls_skip_current_user`).
+        // Item-24 Z6 / item 122 (B1/B2): substitute `current_user`/`auth.uid()`/
+        // `auth.jwt()` in the policy clone before evaluating, so per-user and
+        // per-claim row isolation works on the INSERT path too. When
+        // `current_user` is None (embedded/superuser path), skip any policy
+        // that requires a verified identity (same reasoning as
+        // `apply_rls_skip_current_user`).
         if let Some(ref ins_policy) = table_def.insert_policy {
-            let has_cu = crate::sql::logical::expr_has_current_user_pub(ins_policy);
-            if has_cu && ctx.current_user.is_none() {
-                // Superuser/embedded path — bypass CurrentUser-dependent INSERT policies.
+            let requires_identity = crate::sql::logical::expr_requires_auth_context_pub(ins_policy);
+            if requires_identity && ctx.current_user.is_none() {
+                // Superuser/embedded path — bypass identity-dependent INSERT policies.
             } else {
                 let mut policy = ins_policy.clone();
                 if let Some(ref u) = ctx.current_user {
                     crate::sql::logical::substitute_current_user_in_expr(&mut policy, u);
                 }
+                crate::sql::logical::substitute_auth_context_in_expr(
+                    &mut policy,
+                    ctx.current_user.as_deref(),
+                    &ctx.auth_claims,
+                );
                 if !check_passes(&policy, &table_def.columns, &coerced)? {
                     return Err(DbError::SqlPlan(format!(
                         "new row violates policy for table \"{}\"",
@@ -4771,6 +4779,14 @@ fn exec_update_with_check(table_def: &TableDef, new_row: &[Literal], ctx: &ExecC
     if let Some(ref u) = ctx.current_user {
         crate::sql::logical::substitute_current_user_in_expr(&mut policy, u);
     }
+    // Item 122 (B1/B2): `auth.uid()`/`auth.jwt()` substitution, same as the
+    // INSERT-policy path above. `ctx.current_user` is guaranteed `Some` here
+    // (the unconditional early-return above already handled `None`).
+    crate::sql::logical::substitute_auth_context_in_expr(
+        &mut policy,
+        ctx.current_user.as_deref(),
+        &ctx.auth_claims,
+    );
     if !check_passes(&policy, &table_def.columns, new_row)? {
         return Err(DbError::SqlPlan(format!(
             "new row violates WITH CHECK policy for table \"{}\"",
@@ -5255,6 +5271,11 @@ pub(crate) fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Literal]) -> 
         // correct safe-fallback for the embedded / superuser path, which
         // bypasses RLS before `eval_expr` is ever called.
         Expr::CurrentUser => Ok(Literal::Null),
+        // `auth.uid()` / `auth.jwt() ->> '...'` (item 122, B1/B2): should have
+        // been substituted by `substitute_auth_context_in_plan` before
+        // execution reaches here. Same fail-closed fallback as `CurrentUser`
+        // above — never `Bool(true)`.
+        Expr::AuthUid | Expr::AuthClaim(_) => Ok(Literal::Null),
     }
 }
 
@@ -5695,8 +5716,9 @@ fn expr_columns(expr: &Expr, table_def: &TableDef, out: &mut Vec<usize>) {
         }
         // G10 (item 19): IS [NOT] NULL.
         Expr::IsNull { expr, .. } => expr_columns(expr, table_def, out),
-        // item-24 Z6: CurrentUser has no column (it's a runtime constant).
-        Expr::CurrentUser => {}
+        // item-24 Z6 / item 122: CurrentUser/AuthUid/AuthClaim have no column
+        // (they're runtime constants resolved before execution).
+        Expr::CurrentUser | Expr::AuthUid | Expr::AuthClaim(_) => {}
     }
 }
 
@@ -5740,9 +5762,10 @@ fn bind_predicate_columns(expr: &mut Expr, columns: &[ColumnDef]) {
         Expr::Near { .. } => {}
         // G10 (item 19): IS [NOT] NULL.
         Expr::IsNull { expr, .. } => bind_predicate_columns(expr, columns),
-        // item-24 Z6: CurrentUser has no column slot — it is a runtime
-        // constant resolved before execution by `substitute_current_user_in_plan`.
-        Expr::CurrentUser => {}
+        // item-24 Z6 / item 122: CurrentUser/AuthUid/AuthClaim have no column
+        // slot — they are runtime constants resolved before execution by
+        // `substitute_current_user_in_plan`/`substitute_auth_context_in_plan`.
+        Expr::CurrentUser | Expr::AuthUid | Expr::AuthClaim(_) => {}
     }
 }
 

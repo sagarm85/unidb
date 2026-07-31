@@ -126,8 +126,8 @@ use crate::{
     sql::{
         executor::{self, ExecCtx, ExecResult},
         logical::{
-            apply_rls, apply_rls_skip_current_user, bind_params, substitute_current_user_in_plan,
-            Expr, Literal, LogicalPlan,
+            apply_rls, apply_rls_skip_current_user, bind_params, substitute_auth_context_in_plan,
+            substitute_current_user_in_plan, Expr, Literal, LogicalPlan,
         },
         parser::parse_sql,
         query::{FromNode, QuerySpec},
@@ -1704,12 +1704,15 @@ impl Engine {
     }
 
     /// Like [`Engine::execute_sql_as`], but takes a full [`AuthPrincipal`]
-    /// (auth seam) instead of a bare subject string. `principal.claims` and
-    /// `principal.roles` are carried down into the `ExecCtx` used for
-    /// execution but are **not consumed** by any policy logic yet — RLS and
-    /// privilege checks still key off `principal.subject` exactly as
-    /// `execute_sql_as` always has. Behavior is identical to
-    /// `execute_sql_as(principal.subject.as_deref(), xid, sql)`.
+    /// (auth seam) instead of a bare subject string. `principal.subject` and
+    /// `principal.claims` are carried down into the `ExecCtx` used for
+    /// execution and now (item 122, B1/B2) back `auth.uid()`/`auth.jwt() ->>
+    /// '...'` RLS-policy substitution, in addition to `current_user()`/RLS
+    /// privilege checks which still key off `principal.subject` exactly as
+    /// `execute_sql_as` always has. `principal.roles` remains carried but
+    /// unconsumed (later role-scoped-policy work, B3/B4). Behavior is
+    /// identical to `execute_sql_as(principal.subject.as_deref(), xid, sql)`
+    /// for any policy that doesn't reference `auth.uid()`/`auth.jwt()`.
     pub fn execute_sql_as_principal(
         &self,
         principal: &AuthPrincipal,
@@ -2398,18 +2401,25 @@ impl Engine {
             if let Some(u) = user {
                 substitute_current_user_in_plan(&mut plan, u);
             }
+            // Item 122 (B1/B2): substitute auth.uid()/auth.jwt() in the
+            // user-supplied SQL's predicates too. Called unconditionally
+            // (regardless of `user`/claims presence) — a missing subject or
+            // claim must resolve to a typed Null (fail closed), not be left
+            // unsubstituted.
+            substitute_auth_context_in_plan(&mut plan, user, &principal.claims);
             // Apply RLS (which may inject policy expressions containing
-            // CurrentUser) only for non-superuser named users.
+            // CurrentUser/AuthUid/AuthClaim) only for non-superuser named users.
             let mut plan = if skip_rls {
                 plan
             } else {
                 apply_rls(plan, &cat_read(&self.catalog), user)
             };
-            // Substitute again to resolve any CurrentUser nodes the RLS
-            // policy injected.
+            // Substitute again to resolve any CurrentUser/AuthUid/AuthClaim
+            // nodes the RLS policy injected.
             if let Some(u) = user {
                 substitute_current_user_in_plan(&mut plan, u);
             }
+            substitute_auth_context_in_plan(&mut plan, user, &principal.claims);
             let dml_table = plan_dml_table(&plan).map(|s| s.to_owned());
             let is_ddl = plan_is_schema_ddl(&plan);
             // Thread the principal through ExecCtx so exec_insert can

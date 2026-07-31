@@ -440,11 +440,13 @@ pub async fn post_sql(
         // begin/commit round-trips. An explicit isolation request (R2)
         // deliberately takes the transactional path instead, so the chosen
         // level actually governs the statement.
-        // Pass the user identity so RLS is correctly applied / bypassed for
-        // superusers and the no-sub path (item 103).
+        // Pass the full principal (not just the user identity) so RLS is
+        // correctly applied / bypassed for superusers and the no-sub path
+        // (item 103), and so auth.uid()/auth.jwt() policies (item 122) see
+        // the same verified claims here as on the writer path.
         state
             .engine
-            .execute_sql_read_as(user.clone(), body.sql)
+            .execute_sql_read_as_principal(principal.clone(), body.sql)
             .await?
     } else {
         // Use execute_sql_as_principal so the RLS bypass logic for
@@ -474,6 +476,7 @@ pub async fn post_sql(
 /// inside the payload, not via the HTTP status code.
 pub async fn post_batch_sql(
     Extension(current_user): Extension<CurrentUser>,
+    Extension(principal): Extension<crate::AuthPrincipal>,
     State(state): State<AppState>,
     Json(body): Json<BatchSqlRequest>,
 ) -> std::result::Result<Json<BatchSqlResponse>, ApiError> {
@@ -523,12 +526,14 @@ pub async fn post_batch_sql(
                 if let Err(e) = state.engine.authorize_sql(user.clone(), sql.clone()).await {
                     Err(ApiError::from(e))
                 } else if crate::read_handle::is_concurrent_read_sql(&sql) {
-                    // Read-only SELECTs use the concurrent read path.
-                    // Pass the user so RLS bypass applies correctly for
-                    // superusers and the no-sub path (item 103).
+                    // Read-only SELECTs use the concurrent read path. Pass the
+                    // full principal so RLS bypass applies correctly for
+                    // superusers and the no-sub path (item 103), and so
+                    // auth.uid()/auth.jwt() policies (item 122) see the same
+                    // verified claims here as on the writer path.
                     state
                         .engine
-                        .execute_sql_read_as(user.clone(), sql.clone())
+                        .execute_sql_read_as_principal(principal.clone(), sql.clone())
                         .await
                         .map_err(ApiError::from)
                 } else {

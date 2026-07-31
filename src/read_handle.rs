@@ -17,8 +17,10 @@
 //! layered on a shared catalog + a read-only executor path (tracked in
 //! `docs/backlog/group_commit_and_read_concurrency.md`).
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
+use crate::auth_principal::AuthPrincipal;
 use crate::authz::RoleStore;
 use crate::bufferpool::{PageReader, SharedPageReader};
 use crate::catalog::Catalog;
@@ -27,7 +29,8 @@ use crate::heap::RowId;
 use crate::mvcc::is_visible;
 use crate::sql::executor::{exec_select_readonly, plan_is_concurrent_read, ExecResult};
 use crate::sql::logical::{
-    apply_rls, apply_rls_skip_current_user, substitute_current_user_in_plan, LogicalPlan,
+    apply_rls, apply_rls_skip_current_user, substitute_auth_context_in_plan,
+    substitute_current_user_in_plan, LogicalPlan,
 };
 use crate::sql::parser::parse_sql;
 use crate::txn::{self, SharedTxn};
@@ -84,7 +87,34 @@ impl ReadHandle {
     /// bypasses all `current_user`-containing policies. A named superuser
     /// likewise bypasses them. A regular named user has `current_user`
     /// substituted and all applicable policies AND-rewritten into the plan.
+    ///
+    /// Carries no verified claims — `auth.jwt()`-referencing policies fail
+    /// closed here exactly as they would for an authenticated caller with no
+    /// matching claim. Use [`ReadHandle::execute_sql_as_principal`] to carry
+    /// claims through (item 122, B1/B2).
     pub fn execute_sql_as(&self, user: Option<&str>, sql: &str) -> Result<Vec<ExecResult>> {
+        self.execute_sql_inner(user, &BTreeMap::new(), sql)
+    }
+
+    /// Like [`ReadHandle::execute_sql_as`] but threads the full
+    /// [`AuthPrincipal`] through — so `auth.uid()`/`auth.jwt() ->> '...'`
+    /// policies (item 122, B1/B2) resolve correctly on the concurrent read
+    /// path too, not just the writer path. `principal.subject` plays the same
+    /// role as `execute_sql_as`'s `user` argument.
+    pub fn execute_sql_as_principal(
+        &self,
+        principal: &AuthPrincipal,
+        sql: &str,
+    ) -> Result<Vec<ExecResult>> {
+        self.execute_sql_inner(principal.subject.as_deref(), &principal.claims, sql)
+    }
+
+    fn execute_sql_inner(
+        &self,
+        user: Option<&str>,
+        claims: &BTreeMap<String, serde_json::Value>,
+        sql: &str,
+    ) -> Result<Vec<ExecResult>> {
         // Determine if this caller should bypass current_user-referencing policies.
         // None == embedded/no-sub == implicit superuser; a named SUPERUSER user
         // also bypasses. In open/bootstrap mode (no users registered) every caller
@@ -102,20 +132,27 @@ impl ReadHandle {
             if let Some(u) = user {
                 substitute_current_user_in_plan(&mut plan, u);
             }
+            // Item 122 (B1/B2): substitute auth.uid()/auth.jwt() too, same
+            // unconditional-call/fail-closed contract as the writer path
+            // (`execute_sql_inner_as_principal` in lib.rs).
+            substitute_auth_context_in_plan(&mut plan, user, claims);
             let mut plan = if skip_current_user_policies {
-                // Superuser / no-sub: skip any policy that references current_user.
-                // Literal-value policies (no CurrentUser) still apply, matching
-                // the behaviour of execute_sql_inner on the writer path.
+                // Superuser / no-sub: skip any policy that references current_user
+                // (or, item 122, auth.uid()/auth.jwt()). Literal-value policies
+                // still apply, matching the behaviour of execute_sql_inner on the
+                // writer path.
                 apply_rls_skip_current_user(plan, &self.catalog_read())
             } else {
                 // Regular named user: apply all applicable policies.
                 apply_rls(plan, &self.catalog_read(), user)
             };
-            // Second substitution resolves CurrentUser nodes injected by the
-            // RLS policy expressions (only matters for the non-skip path).
+            // Second substitution resolves CurrentUser/AuthUid/AuthClaim nodes
+            // injected by the RLS policy expressions (only matters for the
+            // non-skip path).
             if let Some(u) = user {
                 substitute_current_user_in_plan(&mut plan, u);
             }
+            substitute_auth_context_in_plan(&mut plan, user, claims);
             if !plan_is_concurrent_read(&plan) {
                 return Err(DbError::SqlPlan(
                     "read handle executes only plain read-only SELECT (no writes, DDL, or NEAR)"

@@ -840,5 +840,24 @@ fn qualify_policy(policy: Expr, qualifier: &str) -> QExpr {
             );
             QExpr::Literal(Literal::Null)
         }
+        // Item 122 (B1/B2): same reasoning as `CurrentUser` above — an
+        // unresolved `auth.uid()`/`auth.jwt()` reaching this conversion means
+        // `substitute_auth_context_in_plan` was missed. Fail CLOSED (NULL),
+        // never `Bool(true)`.
+        Expr::AuthUid => {
+            tracing::warn!(
+                "unresolved auth.uid() in policy lowering — failing closed (NULL); \
+                 indicates a missed substitution pass (item 122)"
+            );
+            QExpr::Literal(Literal::Null)
+        }
+        Expr::AuthClaim(key) => {
+            tracing::warn!(
+                claim = %key,
+                "unresolved auth.jwt() claim in policy lowering — failing closed \
+                 (NULL); indicates a missed substitution pass (item 122)"
+            );
+            QExpr::Literal(Literal::Null)
+        }
     }
 }
