@@ -55,7 +55,7 @@ platform; **P2** = ecosystem.
 | A | Auth core (credentials & sessions) | `unidb` | **P0** | — | [`121`](121_auth_core.md) |
 | B | RLS ↔ token binding (claims/roles) | `unidb` | **P0** | — | [`122`](122_rls_token_binding.md) |
 | C | Auto-generated data API (PostgREST-style) | `unidb` | **P0** (C1) | — | [`123`](123_auto_rest_api.md) |
-| D | External identity (OAuth, OTP, MFA, email) | `unidb` | P1 | A | file when started |
+| D | External identity (OAuth, OTP, MFA, email) | `unidb` | P1 | A | [`127`](127_totp_mfa.md) (D4 only; D1/D2/D3/D5 file when started) |
 | E | Realtime authorization (per-subscriber RLS) | `unidb` | **P0** (E1) | B | file when started |
 | F | Storage authorization (per-object RLS) | `unidb-storage` | P1 | B | file when started |
 | G | Studio panels (auth/policies/roles/API-docs) | `unidb-studio` | P1 | A,B,C | studio `docs/` |
@@ -74,7 +74,11 @@ platform; **P2** = ecosystem.
 - **C — Auto API:** C1 `/rest/v1/<table>?col=eq.val` (P0) · C2 embedded FK
   expansion · C3 OpenAPI/API-docs · C4 GraphQL (P2). See 123.
 - **D — External identity:** D1 OAuth/social · D2 magic-link/email-OTP · D3
-  phone-OTP · D4 MFA/TOTP · D5 email flows (confirm/reset/invite).
+  phone-OTP · **D4 MFA/TOTP — SHIPPED 2026-07-31** (self-contained RFC 6238
+  TOTP: enroll → confirm (mints recovery codes) → login gate (`mfa_required`
+  + single-use challenge) → challenge redeem (reuses the existing
+  session-issuance path) → disable (code or superuser bypass); see
+  `127_totp_mfa.md`) · D5 email flows (confirm/reset/invite).
 - **E — Realtime auth:** E1 per-subscriber RLS filtering on SSE (P0) · E2
   broadcast + presence · E3 channel authz by token. SSE + events inspector already
   ship — only the authorization layer is new.

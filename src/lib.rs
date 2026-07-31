@@ -1823,6 +1823,53 @@ impl Engine {
         self.authz.revoke_session_by_id(session_id)
     }
 
+    /// Start a TOTP MFA enrollment (item 127, Workstream D4 — `POST
+    /// /auth/mfa/enroll`'s embedded-API entry point). See
+    /// [`crate::authz::RoleStore::mfa_enroll`].
+    pub fn mfa_enroll(&self, user: &str) -> Result<(String, String)> {
+        self.authz.mfa_enroll(user)
+    }
+
+    /// Confirm a pending TOTP enrollment with a live code, enabling MFA and
+    /// minting recovery codes (item 127 — `POST /auth/mfa/verify`'s
+    /// embedded-API entry point). See
+    /// [`crate::authz::RoleStore::mfa_confirm`].
+    pub fn mfa_confirm(&self, user: &str, code: &str) -> Result<Option<Vec<String>>> {
+        self.authz.mfa_confirm(user, code)
+    }
+
+    /// Whether `user` has MFA enabled (item 127). See
+    /// [`crate::authz::RoleStore::mfa_enabled`].
+    pub fn mfa_enabled(&self, user: &str) -> bool {
+        self.authz.mfa_enabled(user)
+    }
+
+    /// Disable MFA for `user` (item 127 — `POST /auth/mfa/disable`'s
+    /// embedded-API entry point). See
+    /// [`crate::authz::RoleStore::mfa_disable`].
+    pub fn mfa_disable(
+        &self,
+        user: &str,
+        code: Option<&str>,
+        skip_code_check: bool,
+    ) -> Result<bool> {
+        self.authz.mfa_disable(user, code, skip_code_check)
+    }
+
+    /// Issue a single-use MFA login challenge for `user` (item 127 —
+    /// `POST /auth/login`'s MFA gate). See
+    /// [`crate::authz::RoleStore::create_mfa_challenge`].
+    pub fn create_mfa_challenge(&self, user: &str) -> Result<(String, u64)> {
+        self.authz.create_mfa_challenge(user)
+    }
+
+    /// Redeem an MFA login challenge + code for the owning username (item
+    /// 127 — `POST /auth/mfa/challenge`'s embedded-API entry point). See
+    /// [`crate::authz::RoleStore::verify_mfa_challenge`].
+    pub fn verify_mfa_challenge(&self, raw_challenge: &str, code: &str) -> Result<Option<String>> {
+        self.authz.verify_mfa_challenge(raw_challenge, code)
+    }
+
     /// Execute SQL **as** a named user (P6.e), enforcing per-table privileges.
     /// `user == None` is the implicit **superuser** (the embedded API), so
     /// `execute_sql` is exactly `execute_sql_as(None, ..)` and is unrestricted.

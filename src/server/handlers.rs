@@ -36,13 +36,14 @@ use crate::{
         auth::CurrentUser,
         dto::{
             exec_result_to_json, is_internal_table, json_to_literal, literal_to_json, slot_to_json,
-            table_def_to_info, AckEventsRequest, AdvanceSlotRequest, AuthLoginRequest,
-            AuthLoginResponse, AuthMetaResponse, AuthPreviewRequest, BatchInsertRequest,
-            BatchSqlRequest, BatchSqlResponse, BeginTxnRequest, CreateEdgeRequest,
-            CreateSlotRequest, CursorQuery, CypherRequest, DeleteEdgeRequest,
-            GroupCommitWindowRequest, HistoryQuery, IsolationDto, RlsRequest, RowIdResponse,
-            SetIndexRequest, SlowQueryThresholdRequest, SqlRequest, StreamQuery, TableInfo,
-            WhoamiPrivilege, WhoamiResponse,
+            table_def_to_info, AckEventsRequest, AdvanceSlotRequest, AuthLoginOutcome,
+            AuthLoginRequest, AuthLoginResponse, AuthMetaResponse, AuthPreviewRequest,
+            BatchInsertRequest, BatchSqlRequest, BatchSqlResponse, BeginTxnRequest,
+            CreateEdgeRequest, CreateSlotRequest, CursorQuery, CypherRequest, DeleteEdgeRequest,
+            GroupCommitWindowRequest, HistoryQuery, IsolationDto, MfaChallengeRequest,
+            MfaDisableRequest, MfaEnrollResponse, MfaVerifyRequest, MfaVerifyResponse, RlsRequest,
+            RowIdResponse, SetIndexRequest, SlowQueryThresholdRequest, SqlRequest, StreamQuery,
+            TableInfo, WhoamiPrivilege, WhoamiResponse,
         },
         engine_handle::EngineHandle,
         error::ApiError,
@@ -1094,10 +1095,19 @@ async fn issue_token_pair(
 /// **Item 121 A4** — the response now also carries a long-lived opaque
 /// refresh token (a new session, [`EngineHandle::create_session`]); `token`
 /// is kept as a deprecated alias of `access_token` for pre-A4 clients.
+///
+/// **Item 127 (Workstream D4) — MFA gate.** When the authenticating user has
+/// TOTP MFA enabled ([`EngineHandle::mfa_enabled`]), a correct password does
+/// **not** issue a session: instead the response is `{"mfa_required": true,
+/// "challenge": "...", "expires_in": ...}` — a short-lived, single-use
+/// challenge token (never a real access/refresh token) that must be redeemed
+/// with a valid TOTP/recovery code at `POST /auth/mfa/challenge` before a
+/// session is minted. A user *without* MFA enabled logs in exactly as
+/// before (this branch is a no-op for them) — back-compat is unconditional.
 pub async fn post_auth_login(
     State(state): State<AppState>,
     Json(body): Json<AuthLoginRequest>,
-) -> std::result::Result<Json<AuthLoginResponse>, ApiError> {
+) -> std::result::Result<Json<AuthLoginOutcome>, ApiError> {
     let jwt_cfg = state.dev_login_jwt.as_ref().ok_or_else(|| {
         ApiError::from(crate::error::DbError::SqlPlan(
             "POST /auth/login is disabled (set UNIDB_JWT_SIGNING_KEY or UNIDB_DEV_LOGIN=1 to enable)".into(),
@@ -1119,8 +1129,169 @@ pub async fn post_auth_login(
             message: "invalid username or password".into(),
         });
     }
+    if state.engine.mfa_enabled(body.username.clone()).await {
+        let (challenge, _expires_at) = state
+            .engine
+            .create_mfa_challenge(body.username.clone())
+            .await
+            .map_err(ApiError::from)?;
+        return Ok(Json(AuthLoginOutcome::MfaRequired {
+            challenge,
+            expires_in: crate::authz::MFA_CHALLENGE_TTL_SECS,
+        }));
+    }
     let resp = issue_token_pair(&state.engine, jwt_cfg, &body.username).await?;
+    Ok(Json(AuthLoginOutcome::Session(resp)))
+}
+
+/// `POST /auth/mfa/challenge` — public, no JWT required (the challenge token
+/// itself is the pre-session credential, exactly like `POST /auth/refresh`'s
+/// refresh token). Rate-limited alongside `/auth/login`/`/auth/signup`/
+/// `/auth/refresh` (item 121 I1) — see `router.rs`.
+///
+/// Redeems the MFA challenge issued by `POST /auth/login` plus a live
+/// 6-digit TOTP code (or a one-time recovery code) for a full session —
+/// reuses the identical [`issue_token_pair`] helper every other login path
+/// uses, so the minted session is indistinguishable from a non-MFA login's.
+/// Wrong code, expired/used/unknown challenge, and MFA having been disabled
+/// out from under the challenge all return the identical
+/// `401 MFA_CHALLENGE_INVALID` — no oracle on *why* it failed.
+pub async fn post_mfa_challenge(
+    State(state): State<AppState>,
+    Json(body): Json<MfaChallengeRequest>,
+) -> std::result::Result<Json<AuthLoginResponse>, ApiError> {
+    let jwt_cfg = state.dev_login_jwt.as_ref().ok_or_else(|| {
+        ApiError::from(crate::error::DbError::SqlPlan(
+            "POST /auth/mfa/challenge cannot issue tokens (set UNIDB_JWT_SIGNING_KEY or UNIDB_DEV_LOGIN=1 to enable a signing key)"
+                .into(),
+        ))
+    })?;
+    let username = state
+        .engine
+        .verify_mfa_challenge(body.challenge.clone(), body.code.clone())
+        .await
+        .map_err(ApiError::from)?;
+    let Some(username) = username else {
+        return Err(ApiError::Api {
+            status: StatusCode::UNAUTHORIZED,
+            code: "MFA_CHALLENGE_INVALID",
+            message: "invalid, expired, used, or wrong-code MFA challenge".into(),
+        });
+    };
+    let resp = issue_token_pair(&state.engine, jwt_cfg, &username).await?;
     Ok(Json(resp))
+}
+
+// ── item 127 (Workstream D4): TOTP MFA enroll/verify/disable ───────────────
+
+/// The implicit superuser (a bearer token without a `sub` claim) has no
+/// named-user identity for MFA state to attach to — shared guard for every
+/// `/auth/mfa/*` handler below.
+fn require_named_user(current_user: &CurrentUser) -> std::result::Result<String, ApiError> {
+    current_user.0.clone().ok_or_else(|| ApiError::Api {
+        status: StatusCode::BAD_REQUEST,
+        code: "MFA_REQUIRES_NAMED_USER",
+        message:
+            "MFA requires a named user (a token with a `sub` claim), not the implicit superuser"
+                .into(),
+    })
+}
+
+/// `POST /auth/mfa/enroll` — protected (JWT required).
+///
+/// Generates a fresh, per-user TOTP secret and stores it **pending** — MFA
+/// is not enabled yet. Returns the base32 secret plus an `otpauth://` URI
+/// for the client to render as a QR code. Confirm with `POST
+/// /auth/mfa/verify` to actually enable MFA on the account.
+pub async fn post_mfa_enroll(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+) -> std::result::Result<Json<MfaEnrollResponse>, ApiError> {
+    let user = require_named_user(&current_user)?;
+    let (secret, otpauth_url) = state
+        .engine
+        .mfa_enroll(user)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(MfaEnrollResponse {
+        secret,
+        otpauth_url,
+    }))
+}
+
+/// `POST /auth/mfa/verify` — protected (JWT required).
+///
+/// Confirms a pending enrollment with a live 6-digit code. On success, MFA
+/// flips to enabled and a batch of one-time recovery codes is returned —
+/// **shown exactly once**; only their hashes are ever persisted (item
+/// 127, mirroring how refresh-token sessions store only a hash — see
+/// `authz::RoleStore::mfa_confirm`). A wrong/malformed/replayed code returns
+/// a uniform `401 MFA_INVALID_CODE`.
+pub async fn post_mfa_verify(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+    Json(body): Json<MfaVerifyRequest>,
+) -> std::result::Result<Json<MfaVerifyResponse>, ApiError> {
+    let user = require_named_user(&current_user)?;
+    let recovery_codes = state
+        .engine
+        .mfa_confirm(user, body.code)
+        .await
+        .map_err(ApiError::from)?;
+    let Some(recovery_codes) = recovery_codes else {
+        return Err(ApiError::Api {
+            status: StatusCode::UNAUTHORIZED,
+            code: "MFA_INVALID_CODE",
+            message: "invalid MFA code".into(),
+        });
+    };
+    Ok(Json(MfaVerifyResponse {
+        enabled: true,
+        recovery_codes,
+    }))
+}
+
+/// `POST /auth/mfa/disable` — protected (JWT required).
+///
+/// Disables MFA (clears the secret + recovery codes) for the caller's own
+/// account. Requires a currently-valid TOTP/recovery `code` in the body,
+/// **unless** the caller is a superuser — the same effective-superuser rule
+/// as every other admin gate ([`EngineHandle::ensure_superuser`]) — in which
+/// case no code is needed (emergency account-recovery path, e.g. a user who
+/// lost both their authenticator and their recovery codes). A missing code
+/// (non-superuser) is a clear `400`; a present-but-wrong code is a uniform
+/// `401` — no oracle on *why* a wrong code was rejected.
+pub async fn post_mfa_disable(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+    Json(body): Json<MfaDisableRequest>,
+) -> std::result::Result<StatusCode, ApiError> {
+    let user = require_named_user(&current_user)?;
+    let is_superuser = state
+        .engine
+        .ensure_superuser(current_user.0.clone())
+        .await
+        .is_ok();
+    if !is_superuser && body.code.is_none() {
+        return Err(ApiError::Api {
+            status: StatusCode::BAD_REQUEST,
+            code: "MFA_CODE_REQUIRED",
+            message: "a current TOTP or recovery code is required to disable MFA".into(),
+        });
+    }
+    let disabled = state
+        .engine
+        .mfa_disable(user, body.code, is_superuser)
+        .await
+        .map_err(ApiError::from)?;
+    if !disabled {
+        return Err(ApiError::Api {
+            status: StatusCode::UNAUTHORIZED,
+            code: "MFA_INVALID_CODE",
+            message: "invalid MFA code".into(),
+        });
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /auth/signup` (item 121, A3) — public, no JWT required.
@@ -1254,13 +1425,15 @@ pub async fn post_auth_logout(
 /// - `roles` — direct role memberships.
 /// - `privileges` — per-table grants: `[{table, ops}]`.
 /// - `open_mode` — `true` when no users exist (all access passes anyway).
+/// - `mfa_enabled` — item 127 (Workstream D4): whether the caller has TOTP
+///   MFA enabled. Never the secret or recovery codes.
 pub async fn get_auth_whoami(
     Extension(current_user): Extension<CurrentUser>,
     State(state): State<AppState>,
 ) -> std::result::Result<Json<WhoamiResponse>, ApiError> {
     let open_mode = !state.engine.has_users().await;
     let user = current_user.0.clone();
-    let (is_superuser, roles, privileges) = if let Some(ref u) = user {
+    let (is_superuser, roles, privileges, mfa_enabled) = if let Some(ref u) = user {
         let snapshot = state.engine.user_snapshot().await;
         let is_su = snapshot.iter().any(|(n, su)| n == u && *su);
         let roles = state.engine.user_roles(u.clone()).await;
@@ -1269,10 +1442,11 @@ pub async fn get_auth_whoami(
             .into_iter()
             .map(|(table, ops)| WhoamiPrivilege { table, ops })
             .collect();
-        (is_su, roles, privileges)
+        let mfa_enabled = state.engine.mfa_enabled(u.clone()).await;
+        (is_su, roles, privileges, mfa_enabled)
     } else {
-        // Implicit superuser (token without `sub`).
-        (true, Vec::new(), Vec::new())
+        // Implicit superuser (token without `sub`) — no named-user MFA state.
+        (true, Vec::new(), Vec::new(), false)
     };
     Ok(Json(WhoamiResponse {
         user,
@@ -1280,6 +1454,7 @@ pub async fn get_auth_whoami(
         roles,
         privileges,
         open_mode,
+        mfa_enabled,
     }))
 }
 

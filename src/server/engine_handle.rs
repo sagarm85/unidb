@@ -596,6 +596,62 @@ impl EngineHandle {
             .await
     }
 
+    /// Start a TOTP MFA enrollment (item 127 — `POST /auth/mfa/enroll`).
+    /// Returns `(secret_base32, otpauth_uri)`.
+    pub async fn mfa_enroll(&self, user: String) -> Result<(String, String)> {
+        self.on_engine(move |e| e.mfa_enroll(&user)).await
+    }
+
+    /// Confirm a pending TOTP enrollment (item 127 — `POST
+    /// /auth/mfa/verify`). `Ok(Some(recovery_codes))` on success (MFA is now
+    /// enabled); `Ok(None)` for a wrong/malformed code.
+    pub async fn mfa_confirm(&self, user: String, code: String) -> Result<Option<Vec<String>>> {
+        self.on_engine(move |e| e.mfa_confirm(&user, &code)).await
+    }
+
+    /// Whether `user` currently has MFA enabled (item 127). `false` on any
+    /// engine error (unknown/misconfigured), mirroring `verify_password`'s
+    /// "an error here just means don't trust it" posture.
+    pub async fn mfa_enabled(&self, user: String) -> bool {
+        self.on_engine(move |e| Ok(e.mfa_enabled(&user)))
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Disable MFA for `user` (item 127 — `POST /auth/mfa/disable`).
+    /// `skip_code_check == true` is the superuser-bypass path. Returns
+    /// `Ok(true)` on success, `Ok(false)` for a present-but-wrong/missing
+    /// code; `Err` when MFA isn't enabled for `user` at all.
+    pub async fn mfa_disable(
+        &self,
+        user: String,
+        code: Option<String>,
+        skip_code_check: bool,
+    ) -> Result<bool> {
+        self.on_engine(move |e| e.mfa_disable(&user, code.as_deref(), skip_code_check))
+            .await
+    }
+
+    /// Issue a single-use MFA login challenge for `user` (item 127 — the
+    /// `POST /auth/login` MFA gate). Returns `(raw_challenge_token,
+    /// expires_at_unix_secs)`.
+    pub async fn create_mfa_challenge(&self, user: String) -> Result<(String, u64)> {
+        self.on_engine(move |e| e.create_mfa_challenge(&user)).await
+    }
+
+    /// Redeem an MFA login challenge + code for the owning username (item
+    /// 127 — `POST /auth/mfa/challenge`). `Ok(None)` uniformly covers every
+    /// failure case (unknown/expired/used challenge, wrong/replayed code) —
+    /// see [`crate::authz::RoleStore::verify_mfa_challenge`].
+    pub async fn verify_mfa_challenge(
+        &self,
+        raw_challenge: String,
+        code: String,
+    ) -> Result<Option<String>> {
+        self.on_engine(move |e| e.verify_mfa_challenge(&raw_challenge, &code))
+            .await
+    }
+
     /// Install an RLS policy from a SQL predicate string (R3).
     pub async fn set_rls_policy_sql(&self, table: String, predicate: String) -> Result<()> {
         self.on_engine(move |e| e.set_rls_policy_sql(&table, &predicate))

@@ -68,7 +68,12 @@ password login, signup, and refresh-token sessions — see
 bring tokens from an external issuer instead; the two modes coexist. Local
 issuance is HS256-only and is **disabled outright** when `UNIDB_JWT_PUBLIC_KEY`
 is set (an HS256-signed local token could never verify against a configured
-asymmetric public key).
+asymmetric public key). A user may additionally enroll **TOTP-based MFA**
+(item 127) — see
+[TOTP-based MFA](#totp-based-multi-factor-authentication-mfa-item-127) — once
+enabled, `POST /auth/login` no longer issues a session directly and instead
+returns a short-lived challenge that must be redeemed at
+`POST /auth/mfa/challenge`.
 
 > **Correction (2026-07-31):** earlier versions of this section stated "there
 > is no login endpoint, no user database, and no session state." That is no
@@ -1411,12 +1416,17 @@ for a symmetric key, and this route only ever serializes a public key.
 
 #### Auth rate limiting (item 121 I1)
 
-`POST /auth/login`, `/auth/signup`, and `/auth/refresh` — the only routes
-reachable with no bearer token at all — are brute-force targets, so all three
-sit behind a shared, in-memory, per-key rate limiter (a hand-rolled fixed
-window; no external rate-limit crate). **Read/data routes, `/sql`,
-`/metrics`, `/.well-known/jwks.json`, `/auth/meta`, and `/auth/logout` are
-never rate-limited.**
+`POST /auth/login`, `/auth/signup`, `/auth/refresh`, and (item 127)
+`/auth/mfa/challenge` — the routes reachable with no bearer token at all —
+are brute-force targets, so all four sit behind a shared, in-memory, per-key
+rate limiter (a hand-rolled fixed window; no external rate-limit crate).
+`/auth/mfa/challenge` gets its own independent bucket (keyed by IP+path,
+same as `/auth/refresh` — its body has no `username` field to additionally
+key on) — guessing a 6-digit TOTP code is exactly the kind of brute-force
+target this limiter exists for. **Read/data routes, `/sql`, `/metrics`,
+`/.well-known/jwks.json`, `/auth/meta`, `/auth/logout`, and the authenticated
+`/auth/mfa/enroll` · `/verify` · `/disable` routes (already
+gated by requiring a valid JWT) are never rate-limited.**
 
 - **Key:** the client's TCP peer IP address (`X-Forwarded-For` is
   deliberately **not** trusted — it is client-supplied and this server has no
@@ -1457,13 +1467,26 @@ the miss paths, so there is no user-enumeration or timing oracle. `open_mode`
 { "username": "alice", "password": "correct horse battery staple" }
 ```
 
-**Response** `200 OK`:
+**Response** `200 OK` (no MFA enabled for this user — the pre-item-127 shape,
+byte-for-byte unchanged):
 ```json
 { "token": "<access-jwt>", "access_token": "<access-jwt>", "refresh_token": "<opaque-256bit-hex>", "expires_in": 3600 }
 ```
 > `token` is a deprecated alias for `access_token`, kept for backward compat.
 > The `refresh_token` is an opaque high-entropy string (NOT a JWT); the server
 > stores only its SHA-256 hash, never the raw token.
+
+**Response** `200 OK` (item 127 — this user has TOTP MFA enabled): **no
+session is issued.** Instead:
+```json
+{ "mfa_required": true, "challenge": "<opaque-hex>", "expires_in": 300 }
+```
+Redeem `challenge` plus a live TOTP/recovery code at
+[`POST /auth/mfa/challenge`](#totp-based-multi-factor-authentication-mfa-item-127)
+to receive the real `{access_token, refresh_token, expires_in}` session. The
+two response shapes are unambiguous (`mfa_required` is present in one and
+absent, along with every token field, in the other) — a client checks for
+`mfa_required` to decide which flow it's in.
 
 **Error responses:** `401 INVALID_CREDENTIALS` (unknown user / wrong password /
 no credential — uniform); issuance-disabled error when no signing key is set;
@@ -1549,7 +1572,8 @@ Authorization: Bearer <token>
   "privileges": [
     { "table": "posts", "ops": ["SELECT"] }
   ],
-  "open_mode": false
+  "open_mode": false,
+  "mfa_enabled": false
 }
 ```
 
@@ -1558,6 +1582,121 @@ Authorization: Bearer <token>
 | `user` | JWT `sub` claim; `null` in open mode with no user identity |
 | `is_superuser` | `true` when the user was created with `SUPERUSER` |
 | `open_mode` | Mirrors `GET /auth/meta` — no users registered yet |
+| `mfa_enabled` | Item 127: `true` when the caller has TOTP MFA enabled. Never the secret or recovery codes — just the boolean. `false` for the implicit superuser (token with no `sub`). |
+
+### TOTP-based multi-factor authentication (MFA) (item 127)
+
+A user can enroll a TOTP authenticator (Google Authenticator, 1Password,
+Authy, …) and, once enrolled, login requires a valid 6-digit code as a
+second factor. Entirely self-contained — no external provider, no secrets
+beyond what this server generates and stores itself.
+
+**Crypto:** HMAC-SHA1 over the 30 s time counter (RFC 6238 / Google
+Authenticator defaults), dynamic truncation, 6 digits. ±1 step (±30 s) of
+clock-skew tolerance. Codes are compared in constant time. **Replay
+protection** is a forward-only ratchet: the most recently *successfully
+verified* TOTP step is remembered per user, and any step at or before it is
+rejected outright — the exact code just consumed (or any earlier-window
+code) can never authenticate a second time, even replayed instantly. This
+also means at most 3 fresh TOTP verifications are possible within one
+static 30 s window (the ±1-step tolerance is only 3 steps wide); one-time
+**recovery codes** are a separate credential space unaffected by this budget.
+
+**Storage:** the base32 TOTP secret and recovery-code SHA-256 hashes live on
+the user in `roles.json` (the same control-plane store as credentials/
+sessions), covered by the same manual `Debug` redaction — never logged,
+`Debug`-printed, returned by `whoami`, or exposed in any catalog view.
+Recovery-code plaintext is shown to the client **exactly once**, at
+confirmation time; only the hash is ever persisted.
+
+#### `POST /auth/mfa/enroll` — start enrollment
+
+**Auth:** JWT required (named user — not the implicit superuser).
+
+Generates a fresh, per-user 160-bit TOTP secret and stores it **pending**
+— MFA is **not** enabled yet. Re-enrolling while already enabled is
+rejected (disable first); re-enrolling while still pending simply replaces
+the secret.
+
+```
+POST /auth/mfa/enroll
+Authorization: Bearer <token>
+```
+
+**Response** `200 OK`:
+```json
+{
+  "secret": "JBSWY3DPEHPK3PXP",
+  "otpauth_url": "otpauth://totp/unidb:alice?secret=JBSWY3DPEHPK3PXP&issuer=unidb"
+}
+```
+Render `otpauth_url` as a QR code, or let the user type `secret` in
+manually. **Errors:** `400` if the caller has no named identity (implicit
+superuser); `400 AUTHZ_ERROR` if MFA is already enabled.
+
+#### `POST /auth/mfa/verify` — confirm enrollment
+
+**Auth:** JWT required (same named user that enrolled).
+
+Confirms a pending enrollment with a live 6-digit code. On success, MFA
+flips to **enabled** and a batch of 8 one-time recovery codes is returned.
+
+**Request** `POST /auth/mfa/verify`:
+```json
+{ "code": "123456" }
+```
+**Response** `200 OK`:
+```json
+{
+  "enabled": true,
+  "recovery_codes": ["a1b2c3-d4e5f6", "..."]
+}
+```
+**Errors:** `401 MFA_INVALID_CODE` (wrong/malformed/replayed code — uniform,
+no oracle); `400 AUTHZ_ERROR` if there is no pending enrollment, or MFA is
+already enabled.
+
+#### `POST /auth/mfa/challenge` — redeem an MFA login challenge
+
+**Auth:** None (public — the challenge token itself is the pre-session
+credential, same posture as `POST /auth/refresh`'s refresh token).
+Rate-limited (item I1, see above).
+
+Redeems the `challenge` issued by `POST /auth/login` (see that route's docs
+above) plus a live TOTP code **or** a one-time recovery code for a real
+session — reuses the exact same session-issuance path every other login
+does, so the minted session is indistinguishable from a non-MFA login's.
+
+**Request** `POST /auth/mfa/challenge`:
+```json
+{ "challenge": "<opaque-hex-from-login>", "code": "123456" }
+```
+**Response** `200 OK`: same shape as `POST /auth/login`'s non-MFA response
+(`{token, access_token, refresh_token, expires_in}`).
+
+**Errors:** `401 MFA_CHALLENGE_INVALID` — uniform for every failure case:
+unknown/garbage challenge, expired challenge (5 minute TTL), already-used
+(single-use) challenge, wrong/replayed code, or MFA having been disabled
+between issuing the challenge and redeeming it. `429 RATE_LIMITED` (item I1).
+
+#### `POST /auth/mfa/disable` — turn MFA off
+
+**Auth:** JWT required. Acts on the caller's own account.
+
+Requires a currently-valid TOTP or recovery `code` in the body, **unless**
+the caller is a superuser (the same effective-superuser rule as every other
+admin gate) — in which case no code is needed (emergency account-recovery
+path for a user who lost both their authenticator and recovery codes).
+
+**Request** `POST /auth/mfa/disable`:
+```json
+{ "code": "123456" }
+```
+**Response** `204 No Content`.
+
+**Errors:** `400 MFA_CODE_REQUIRED` (non-superuser, no code supplied);
+`401 MFA_INVALID_CODE` (present-but-wrong code — uniform, no oracle on
+*why*); `400 AUTHZ_ERROR` if MFA isn't currently enabled.
 
 #### Catalog virtual relations
 

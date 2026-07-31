@@ -431,6 +431,192 @@ pub struct WhoamiResponse {
     pub privileges: Vec<WhoamiPrivilege>,
     /// `true` when open/bootstrap mode (user is None or no users configured).
     pub open_mode: bool,
+    /// Item 127 (Workstream D4): whether the caller has TOTP MFA enabled.
+    /// Never the secret or recovery codes — just the boolean a client UI
+    /// needs to show "MFA: on/off". `false` for the implicit superuser
+    /// (token without `sub`), which has no named-user MFA state to carry.
+    pub mfa_enabled: bool,
+}
+
+// ── item 127 (Workstream D4): TOTP-based MFA ───────────────────────────────
+
+/// Response of `POST /auth/mfa/enroll` (authenticated): a fresh, still
+/// **pending** TOTP secret plus the `otpauth://` URI a client renders as a
+/// QR code. MFA is not yet enabled — the caller must confirm with a live
+/// code via `POST /auth/mfa/verify`.
+pub struct MfaEnrollResponse {
+    /// Base32-encoded 160-bit TOTP secret. Shown to the user exactly once —
+    /// never persisted in the clear anywhere the client can re-fetch it.
+    pub secret: String,
+    /// `otpauth://totp/unidb:<user>?secret=<base32>&issuer=unidb` — feed
+    /// directly to a QR-code renderer.
+    pub otpauth_url: String,
+}
+
+impl Serialize for MfaEnrollResponse {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("MfaEnrollResponse", 2)?;
+        s.serialize_field("secret", &self.secret)?;
+        s.serialize_field("otpauth_url", &self.otpauth_url)?;
+        s.end()
+    }
+}
+
+/// Manual `Debug`: redacts `secret` — a TOTP seed is exactly as sensitive as
+/// a password (whoever holds it can mint valid codes forever), same posture
+/// as [`AuthLoginResponse`]'s bearer-token redaction.
+impl std::fmt::Debug for MfaEnrollResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MfaEnrollResponse")
+            .field("secret", &"<redacted>")
+            .field("otpauth_url", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Body of `POST /auth/mfa/verify` (authenticated): confirm a pending
+/// enrollment with a live 6-digit TOTP code.
+#[derive(Deserialize)]
+pub struct MfaVerifyRequest {
+    pub code: String,
+}
+
+/// Manual `Debug`: redacts `code` — a live TOTP code is a bearer credential
+/// for a ~90 s window, same posture as every other auth-secret DTO here.
+impl std::fmt::Debug for MfaVerifyRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MfaVerifyRequest")
+            .field("code", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Response of `POST /auth/mfa/verify` on success: MFA is now enabled, and
+/// `recovery_codes` are the plaintext one-time codes — shown **exactly
+/// once**; only their hashes are ever persisted (see `authz::RoleStore::
+/// mfa_confirm`).
+#[derive(Serialize)]
+pub struct MfaVerifyResponse {
+    pub enabled: bool,
+    pub recovery_codes: Vec<String>,
+}
+
+/// Manual `Debug`: redacts `recovery_codes` to a count — each one is a live,
+/// still-unused bearer credential.
+impl std::fmt::Debug for MfaVerifyResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MfaVerifyResponse")
+            .field("enabled", &self.enabled)
+            .field(
+                "recovery_codes",
+                &format!("<{} redacted>", self.recovery_codes.len()),
+            )
+            .finish()
+    }
+}
+
+/// Body of `POST /auth/mfa/disable` (authenticated). `code` is required
+/// unless the caller is a superuser (checked server-side, not by this DTO) —
+/// see the handler's doc comment.
+#[derive(Deserialize)]
+pub struct MfaDisableRequest {
+    #[serde(default)]
+    pub code: Option<String>,
+}
+
+/// Manual `Debug`: redacts `code`, same posture as [`MfaVerifyRequest`].
+impl std::fmt::Debug for MfaDisableRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MfaDisableRequest")
+            .field("code", &self.code.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// Body of `POST /auth/mfa/challenge` (public, no JWT — the challenge itself
+/// is the pre-session credential): redeem an MFA login challenge issued by
+/// `POST /auth/login` with a TOTP code (or a one-time recovery code) to
+/// receive the real session.
+#[derive(Deserialize)]
+pub struct MfaChallengeRequest {
+    pub challenge: String,
+    pub code: String,
+}
+
+/// Manual `Debug`: redacts both fields — the challenge token is a bearer
+/// credential (narrow-window, but still live) and `code` is a TOTP/recovery
+/// secret, same posture as every other auth-secret DTO here.
+impl std::fmt::Debug for MfaChallengeRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MfaChallengeRequest")
+            .field("challenge", &"<redacted>")
+            .field("code", &"<redacted>")
+            .finish()
+    }
+}
+
+/// `POST /auth/login`'s response when the authenticating user has MFA
+/// enabled: instead of a real session, the caller gets a short-lived,
+/// single-use challenge to redeem at `POST /auth/mfa/challenge`. Wraps
+/// [`AuthLoginResponse`] so a non-MFA login's wire shape is completely
+/// unchanged (back-compat contract) — only an MFA-enabled login's response
+/// shape differs, and it differs in an unambiguous way (`mfa_required: true`,
+/// no token fields at all).
+pub enum AuthLoginOutcome {
+    /// A non-MFA login (or a redeemed MFA challenge): the normal
+    /// access+refresh token pair, byte-identical wire shape to pre-127.
+    Session(AuthLoginResponse),
+    /// An MFA-enabled login after a correct password: no tokens yet.
+    MfaRequired {
+        /// Opaque, single-use challenge token — pass to `POST
+        /// /auth/mfa/challenge` alongside the TOTP/recovery code.
+        challenge: String,
+        /// Seconds until the challenge expires.
+        expires_in: u64,
+    },
+}
+
+impl Serialize for AuthLoginOutcome {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            AuthLoginOutcome::Session(resp) => resp.serialize(serializer),
+            AuthLoginOutcome::MfaRequired {
+                challenge,
+                expires_in,
+            } => {
+                use serde::ser::SerializeStruct;
+                let mut s = serializer.serialize_struct("AuthLoginOutcome", 3)?;
+                s.serialize_field("mfa_required", &true)?;
+                s.serialize_field("challenge", challenge)?;
+                s.serialize_field("expires_in", expires_in)?;
+                s.end()
+            }
+        }
+    }
+}
+
+/// Manual `Debug`: delegates to [`AuthLoginResponse`]'s own redacted `Debug`
+/// for the `Session` case; redacts `challenge` for the `MfaRequired` case —
+/// same "no live credential in a `{:?}`" posture as everywhere else in this
+/// module.
+impl std::fmt::Debug for AuthLoginOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthLoginOutcome::Session(resp) => resp.fmt(f),
+            AuthLoginOutcome::MfaRequired { expires_in, .. } => f
+                .debug_struct("AuthLoginOutcome::MfaRequired")
+                .field("challenge", &"<redacted>")
+                .field("expires_in", expires_in)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]

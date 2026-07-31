@@ -35,6 +35,16 @@ argon2 = "0.5"
 # (same rationale most API-key/session-token stores use, e.g. hashing a PAT).
 sha2 = "0.10"
 
+# Workstream D4 (item 127): TOTP-based MFA (RFC 6238) — HMAC-SHA1 + a small
+# hand-rolled base32/HOTP layer in `src/authz/mod.rs`. Not server-feature-
+# gated, same rationale as `argon2`/`sha2` above: MFA state (secret, recovery
+# codes) is core `authz::RoleStore` state, independent of the optional HTTP
+# server. Both crates already resolve in `Cargo.lock` (transitive deps of the
+# existing `jsonwebtoken`/`ring` dependency chain via `rfc6979`), so this adds
+# no new supply-chain surface beyond making them direct dependencies.
+hmac = "0.13"
+sha1 = "0.11"
+
 # M5: optional server (src/server/, src/bin/unidb-server.rs). All gated
 # behind the `server` feature so a default `cargo build`/`cargo test` never
 # pulls in an async runtime — "the engine stays sync" (CLAUDE.md) is
