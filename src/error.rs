@@ -140,6 +140,14 @@ pub enum DbError {
     /// Permission denied (P6.e): the current user lacks the required privilege.
     #[error("permission denied: {0}")]
     PermissionDenied(String),
+
+    /// Schema-migrations tooling error (item 126, Workstream I4):
+    /// unreadable/malformed migration files, a checksum-drift on an
+    /// already-applied migration (someone edited a shipped file), or a
+    /// migration statement failure. See `src/migrations.rs`'s module doc for
+    /// the full contract, including the non-transactional-DDL caveat.
+    #[error("migration error: {0}")]
+    Migration(String),
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;

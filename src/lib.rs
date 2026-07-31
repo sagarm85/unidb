@@ -73,6 +73,11 @@ pub mod lockmgr;
 /// Lock-free observability capture (backlog item 21): the atomic latency
 /// histogram + counter snapshot types surfaced via `Engine::stats()`.
 pub mod metrics;
+/// Item 126 (Workstream I4) — SQL schema-migrations tooling:
+/// `Engine::apply_migrations`, forward-only `.sql` files tracked in a
+/// `schema_migrations` table. See the module doc for the non-transactional-
+/// DDL caveat.
+pub mod migrations;
 pub mod mmap;
 pub mod mvcc;
 pub mod observability;
@@ -140,6 +145,7 @@ use crate::{
 pub use crate::auth_principal::AuthPrincipal;
 pub use crate::error::DbError;
 pub use crate::heap::RowId;
+pub use crate::migrations::{MigrationFile, MigrationReport};
 pub use crate::read_handle::ReadHandle;
 pub use crate::sql::executor::ExecResult as SqlResult;
 pub use crate::txn::IsolationLevel as Isolation;
