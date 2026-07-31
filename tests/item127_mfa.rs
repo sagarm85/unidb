@@ -485,7 +485,7 @@ async fn disable_clears_mfa_and_login_reverts_to_unchanged() {
         .await
         .unwrap();
     assert!(login_after.get("mfa_required").is_none());
-    assert!(login_after["access_token"].as_str().unwrap().len() > 0);
+    assert!(!login_after["access_token"].as_str().unwrap().is_empty());
 }
 
 // ── (f) a non-MFA user logs in exactly as before ────────────────────────────
