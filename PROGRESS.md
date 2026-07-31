@@ -179,6 +179,8 @@ memory (see `CLAUDE.md` §6).
 | Fresh full Docker bench — new MM_BASELINE (post-107, main `0324dc5`)   [RECORDED]   2026-07-23 | 2026-07-23 | live |
 | Bench: PG parallelism sensitivity + session isolation   [SHIPPED]   2026-07-23 | 2026-07-23 | live |
 | Items 115 + 116 — behind-metrics attribution + first levers   [IN PROGRESS]   2026-07-24 | 2026-07-24 | live |
+| Report HTML renderer (auto `.html` sibling)   [SHIPPED]   2026-07-31 | 2026-07-31 | live |
+| Item 117 — HOT UPDATE on PK/UNIQUE tables when key unchanged   [SHIPPED]   2026-07-31 | 2026-07-31 | live |
 
 ## Item 24 R-a + R-b — UPDATE WITH CHECK enforcement + bootstrap observability (2026-07-20)
 
@@ -1809,3 +1811,66 @@ disclosed cross-session CPU overlap + freshly-restarted Docker daemon; the
 clean rerun restored all bands — the exclusive-machine-time lesson, again.
 Peak RSS: per-phase docker-stats table in the report; no allocation-profile
 change beyond removals.
+
+## Report HTML renderer — auto `.html` sibling for every report   [SHIPPED]   2026-07-31
+
+**PR:** #217 — https://github.com/sagarm85/unidb/pull/217 (merged, `71e74b1`)
+**Summary:** `scripts/report.sh` now auto-renders a styled, self-contained
+`report_<ts>.html` next to every generated `.md`, via a new content-agnostic
+`scripts/render_report.py` (pure stdlib). The Markdown stays the source of
+truth (git-tracked, consumed by `compare_bench.py`); the HTML is derived +
+git-ignored + regenerable. Non-fatal (a render failure only warns).
+
+**What changed:** `render_report.py` (GFM subset → styled HTML; emphasis is
+pattern-matched on cell *content* — ratios ending in `×`, unidb/postgres
+winner remarks, PASS/FAIL — never on fixed column indices, so relabelled/new
+columns render with no code change); `report.sh` wire-in after the report is
+finalized; `.gitignore` ignores `docs/performance/*.html`; docs updated.
+**Verification:** full report (11 tables, 17 winner pills, escaping) + a
+conc_matrix (32 PASS pills) render clean; `bash -n` OK; doc linters green.
+**Known limitations:** none functional; presentation layer only.
+
+## Item 117 — HOT UPDATE on PK/UNIQUE tables when the key is unchanged   [SHIPPED]   2026-07-31
+
+**PR:** #218 — https://github.com/sagarm85/unidb/pull/218 (merged, `c134889`)
+**Summary:** `hot_eligible` was gated on `!has_unique`, so the mere existence
+of a PK/UNIQUE index disabled the HOT fast path — forcing the common "update a
+non-indexed column on a PK'd table" case onto the slow per-row loop plus a
+redundant O(log n) PK B-tree re-check per row (the key never changes). This was
+the root cause of the report's worst CRUD row, Table 5
+`UPDATE orders SET status=… WHERE id<N` at **0.19×** vs Postgres. Fix mirrors
+item-53's FK gate: `has_unique_in_set` (HOT / `enforce_unique` / phantom lock
+only when a unique/PK column is actually in the SET clause);
+`set_touches_indexed_col` (already checks `unique_index_root`) remains the
+backstop for the PK-in-SET case. `can_batch_non_hot` left conservative on
+`!has_unique` as a follow-up.
+
+**Safety (verified):** unique/PK index lookups follow HOT chains via the
+identical `DiskBTree::search_eq` → per-candidate `get_visible` path as
+secondary indexes, so the unchanged unique entry still resolves to the live
+HOT-updated version (SELECT-by-PK, duplicate detection, secondary lookups all
+correct). Same pattern already ran for secondary btrees on non-indexed-column
+updates.
+
+**Benchmarks** (Docker Table-5 cert `report_20260730_124355.md`, aarch64 · 18
+cores · Linux 6.12 linuxkit):
+
+| Workload                          | unidb (rec/s) | postgres (rec/s) | ÷ PG   | Baseline (07-28) |
+|-----------------------------------|--------------:|-----------------:|-------:|------------------|
+| UPDATE bulk (SET status, PK'd)    | **1,130,955** | 372,123          | 3.04×  | 0.19× (138,840 rec/s) |
+| INSERT valid FK (per-row)         | 2,180         | 6,427            | 0.34×  | untouched by 117; VM-noisy |
+| SELECT JOIN                       | 1,170,903     | 2,125,436        | 0.55×  | untouched by 117 |
+
+**Trustworthy figure (item-108 hygiene):** unidb's **absolute** UPDATE
+throughput **138,840 → 1,130,955 rec/s (+8.1×)**. PG's absolute drifted down
+this run (canary), so the 3.04× ratio overstates; vs the baseline PG number
+unidb is ~1.5×, in the PK-less Table-3 UPDATE-HOT band (1.19×) — exactly as
+predicted since both now take the same HOT path.
+
+**Crash harness:** 54/54 green (incl. p74 batch HOT, cross-page HOT, p58b
+index). Full suite 220 passed / 0 failed; clippy + fmt + doc linters clean.
+**Correctness:** bad-FK INSERT rejected ✓; referenced-parent DELETE blocked ✓.
+**Known limitations / tech debt:** non-HOT *batch* path (`can_batch_non_hot`)
+still gated on `!has_unique` — relaxing it needs `Heap::update_many` to
+re-point the unique B-tree (separate follow-up).
+**Locked-decision changes:** none.
