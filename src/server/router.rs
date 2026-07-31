@@ -219,9 +219,27 @@ pub fn build_router_with_rate_limiter(
     // POST /auth/login → real password login (item 121 A1/A2: argon2id credential
     //   verification); issuance is now a first-class production capability
     //   (item 121 A5, UNIDB_JWT_SIGNING_KEY) as well as UNIDB_DEV_LOGIN=1.
+    // item 128 (Workstream D1): OAuth 2.0 Authorization Code + PKCE social
+    // login. Both routes are public (no JWT — they establish identity, they
+    // don't presuppose it) and return 404 for a provider with no
+    // UNIDB_OAUTH_<PROVIDER>_CLIENT_ID/_CLIENT_SECRET/_REDIRECT_URI
+    // configured (`AppState::oauth`), same posture as dev-login/signup being
+    // off by default. Not folded into `auth_rate_limited` below: unlike
+    // login/signup/refresh, neither route accepts a guessable credential —
+    // `authorize` takes no input at all, and `callback`'s `state`/`code` are
+    // both high-entropy, single-use, server-validated tokens with no
+    // meaningful guess surface for a fixed-window IP limiter to protect.
     let auth_public = Router::new()
         .route("/auth/meta", get(handlers::get_auth_meta))
         .route("/auth/logout", post(handlers::post_auth_logout))
+        .route(
+            "/auth/oauth/{provider}/authorize",
+            get(handlers::get_oauth_authorize),
+        )
+        .route(
+            "/auth/oauth/{provider}/callback",
+            get(handlers::get_oauth_callback),
+        )
         .with_state(state.clone());
 
     // item 121 I1: brute-force protection over exactly the three password-auth

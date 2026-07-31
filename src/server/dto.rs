@@ -619,6 +619,38 @@ impl std::fmt::Debug for AuthLoginOutcome {
     }
 }
 
+// ── item 128 (Workstream D1): OAuth 2.0 social login ───────────────────────
+
+/// Query params for `GET /auth/oauth/{provider}/callback` (item 128). `code`
+/// is present on a successful provider redirect; `error` is present instead
+/// when the user denied consent or the provider otherwise refused
+/// (`?error=access_denied&state=...`). `state` should always be present —
+/// its absence is treated as an invalid/garbage callback, same posture as
+/// an unknown state value.
+#[derive(Deserialize)]
+pub struct OAuthCallbackQuery {
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Manual `Debug`: redacts `code` (a single-use bearer credential for the
+/// token exchange) and `state` (matches a server-side PKCE verifier record),
+/// same "no live credential in `{:?}`" posture as every other auth DTO here.
+/// `error` is provider-supplied diagnostic text, not a secret — shown as-is.
+impl std::fmt::Debug for OAuthCallbackQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthCallbackQuery")
+            .field("code", &self.code.as_ref().map(|_| "<redacted>"))
+            .field("state", &self.state.as_ref().map(|_| "<redacted>"))
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct WhoamiPrivilege {
     pub table: String,

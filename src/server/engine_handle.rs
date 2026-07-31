@@ -652,6 +652,42 @@ impl EngineHandle {
             .await
     }
 
+    /// Mint a fresh OAuth CSRF `state` + PKCE `code_verifier` pair (item 128
+    /// — `GET /auth/oauth/<provider>/authorize`). Returns `(raw_state,
+    /// raw_code_verifier, expires_at_unix_secs)`.
+    pub async fn create_oauth_state(&self, provider: String) -> Result<(String, String, u64)> {
+        self.on_engine(move |e| e.create_oauth_state(&provider))
+            .await
+    }
+
+    /// Validate + single-use-consume an OAuth CSRF `state` token (item 128 —
+    /// `GET /auth/oauth/<provider>/callback`). `Ok(None)` uniformly covers
+    /// every failure case — see [`crate::authz::RoleStore::
+    /// verify_oauth_state`].
+    pub async fn verify_oauth_state(
+        &self,
+        raw_state: String,
+        provider: String,
+    ) -> Result<Option<String>> {
+        self.on_engine(move |e| e.verify_oauth_state(&raw_state, &provider))
+            .await
+    }
+
+    /// Resolve an OAuth `(provider, provider_user_id)` identity to a unidb
+    /// username, creating a fresh non-superuser account on first login (item
+    /// 128 — the callback handler's "link or create" step).
+    pub async fn oauth_link_or_create(
+        &self,
+        provider: String,
+        provider_user_id: String,
+        username_hint: String,
+    ) -> Result<String> {
+        self.on_engine(move |e| {
+            e.oauth_link_or_create(&provider, &provider_user_id, &username_hint)
+        })
+        .await
+    }
+
     /// Install an RLS policy from a SQL predicate string (R3).
     pub async fn set_rls_policy_sql(&self, table: String, predicate: String) -> Result<()> {
         self.on_engine(move |e| e.set_rls_policy_sql(&table, &predicate))

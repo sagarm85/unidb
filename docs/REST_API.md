@@ -73,7 +73,10 @@ asymmetric public key). A user may additionally enroll **TOTP-based MFA**
 [TOTP-based MFA](#totp-based-multi-factor-authentication-mfa-item-127) — once
 enabled, `POST /auth/login` no longer issues a session directly and instead
 returns a short-lived challenge that must be redeemed at
-`POST /auth/mfa/challenge`.
+`POST /auth/mfa/challenge`. A user may also sign in via **OAuth 2.0 social
+login** (item 128, Google/GitHub) — see
+[OAuth 2.0 social login](#oauth-20-social-login-item-128-workstream-d1) —
+which resolves to the same kind of session through the same issuance path.
 
 > **Correction (2026-07-31):** earlier versions of this section stated "there
 > is no login endpoint, no user database, and no session state." That is no
@@ -1698,6 +1701,120 @@ path for a user who lost both their authenticator and recovery codes).
 `401 MFA_INVALID_CODE` (present-but-wrong code — uniform, no oracle on
 *why*); `400 AUTHZ_ERROR` if MFA isn't currently enabled.
 
+### OAuth 2.0 social login (item 128, Workstream D1)
+
+A user can "Sign in with Google/GitHub": the app redirects to the provider,
+the provider redirects back with a code, unidb exchanges it for a provider
+access token, links/creates a unidb identity, and issues a normal unidb
+session — via the exact same [`issue_token_pair` helper](#post-authlogin--password-login)
+every other login path (password, signup, MFA challenge) uses. Standard
+**Authorization Code + PKCE** (RFC 7636), provider-agnostic: Google and
+GitHub are the two recognized provider names, but nothing in the flow itself
+is provider-specific beyond three URLs and a scope string.
+
+**Config** (per provider — `<PROVIDER>` is `GOOGLE` or `GITHUB`):
+- `UNIDB_OAUTH_<PROVIDER>_CLIENT_ID` / `_CLIENT_SECRET` / `_REDIRECT_URI`
+  (all three **required**) — a provider missing any of these is simply not
+  configured: both its routes return `404`, indistinguishable from a
+  non-existent route, same posture as `UNIDB_DEV_LOGIN`/`UNIDB_ALLOW_SIGNUP`
+  being unset. **The server works safely with zero providers configured.**
+- `UNIDB_OAUTH_<PROVIDER>_AUTHORIZE_URL` / `_TOKEN_URL` / `_USERINFO_URL` /
+  `_SCOPE` (optional) — override the real Google/GitHub endpoint defaults,
+  mainly for pointing a provider at a local mock in tests.
+- OAuth login still needs a signing key configured (`UNIDB_JWT_SIGNING_KEY`
+  or `UNIDB_DEV_LOGIN=1`) to hand back a session — same requirement as
+  signup/refresh.
+
+**Secret handling:** the client secret is read from config/env behind a
+small accessor (`OAuthProviderConfig::client_secret()` /
+`ClientSecret::expose()` in `src/server/oauth.rs`) — never logged, never
+`Debug`-printed, never returned in any response. That accessor is the
+intended seam for the next item (I3, secrets vault) to route through
+vault-backed decryption without touching any call site.
+
+**Identity store:** `(provider, provider_user_id) -> unidb username` is
+persisted in `roles.json` (the same control-plane store as
+credentials/sessions/MFA), serde-default so an existing `roles.json` loads
+unchanged. No secret material lives there (just ids and the resolved
+username) — it is not redacted from the store's internal `Debug`, unlike
+credentials/sessions/MFA state. No provider access token is ever persisted
+(only used in-flight to fetch userinfo, then discarded).
+
+**Identity linking rule (create, never auto-link by email):** a returning
+identity always resolves via the `(provider, provider_user_id)` map, never
+by matching a claimed `email` against an existing local account.
+Auto-linking by email would let anyone who controls *any* OAuth identity
+sharing an email string silently take over an existing password-protected
+unidb account — a real account-takeover surface. First login for a new
+identity creates a fresh **non-superuser, no-password** account named
+`oauth_<provider>_<provider_user_id>`. A future D5 (email flows) may offer
+an explicit, user-initiated "link this OAuth identity to my account" action
+once verified email exists.
+
+#### `GET /auth/oauth/{provider}/authorize` — start the OAuth flow
+
+**Auth:** None (public — this route *establishes* identity).
+
+`{provider}` is `google` or `github` (or any name configured via
+`OAuthConfig::from_providers`). Mints a fresh CSRF `state` token and a PKCE
+`code_verifier`, persists them server-side (single-use, 10-minute TTL — the
+same "hash-only, short-lived, single-use" posture as the MFA
+challenge/refresh-token session stores), derives the PKCE `code_challenge`
+(`S256` — base64url-no-pad of the SHA-256 digest of the verifier), and
+redirects:
+
+```
+GET /auth/oauth/google/authorize
+
+302 Found
+Location: https://accounts.google.com/o/oauth2/v2/auth?client_id=...&redirect_uri=...&scope=...&state=...&code_challenge=...&code_challenge_method=S256&response_type=code
+```
+
+The PKCE `code_verifier` itself is never sent to the client — only the
+derived `code_challenge` is, per RFC 7636. **Errors:** `404 NOT_FOUND` for
+an unconfigured provider.
+
+#### `GET /auth/oauth/{provider}/callback` — finish the OAuth flow
+
+**Auth:** None (public — the provider's redirect *is* the credential, same
+posture as `POST /auth/refresh`'s refresh token).
+
+```
+GET /auth/oauth/google/callback?code=<from-provider>&state=<from-authorize>
+```
+
+1. If the provider reports `?error=...` (user denied consent, etc.), fails
+   immediately with `400 OAUTH_PROVIDER_DENIED`.
+2. Validates + single-use-consumes `state` — unknown, expired, replayed, or
+   issued-for-a-different-provider all return the identical `401
+   OAUTH_STATE_INVALID` (no oracle on *why*).
+3. Exchanges `code` for a provider access token (server-to-server `POST`
+   with the PKCE `code_verifier`) — an unreachable/erroring provider maps to
+   `502 OAUTH_PROVIDER_UNAVAILABLE`; an explicit provider rejection (bad
+   code/verifier/redirect_uri) maps to `401 OAUTH_TOKEN_EXCHANGE_FAILED`.
+4. Fetches the provider's userinfo (id + email) with that access token —
+   same `502`/`401` split on failure.
+5. Resolves `(provider, provider_user_id)` to a unidb user (see "Identity
+   linking rule" above).
+6. Issues a real session via the same path every other login uses.
+
+**Response** `200 OK` — same shape as `POST /auth/login`'s non-MFA response:
+```json
+{ "token": "...", "access_token": "...", "refresh_token": "...", "expires_in": 3600 }
+```
+
+**Errors:** `404 NOT_FOUND` (unconfigured provider); `400
+OAUTH_PROVIDER_DENIED` (provider-reported `error`); `400 OAUTH_MISSING_CODE`
+(no `code` param and no `error` either); `401 OAUTH_STATE_INVALID`; `401
+OAUTH_TOKEN_EXCHANGE_FAILED`; `502 OAUTH_PROVIDER_UNAVAILABLE`.
+
+**No rate limiting on these two routes** (deliberately — see
+`router.rs`'s comment): unlike login/signup/refresh, neither accepts a
+guessable credential — `authorize` takes no input at all, and
+`callback`'s `state`/`code` are both high-entropy, server-validated,
+single-use tokens with no meaningful brute-force surface for a
+fixed-window IP limiter to protect.
+
 #### Catalog virtual relations
 
 The current roles, grants, policies, role memberships, users, and sessions are queryable as
@@ -1840,6 +1957,11 @@ by `server/error.rs`'s `ApiError` directly, not by a `DbError` variant.
 | 400 | `MULTIPLE_IN_FILTERS` | More than one `in.(...)` filter on a `/rest/v1` `PATCH`/`DELETE` (item 123 C1) |
 | 400 | `UNKNOWN_RELATIONSHIP` | `/rest/v1` embed name matches no FK relationship (item 123 C2) |
 | 400 | `AMBIGUOUS_RELATIONSHIP` | `/rest/v1` embed name matches more than one FK relationship (item 123 C2) |
+| 400 | `OAUTH_PROVIDER_DENIED` | Provider returned `?error=...` on the OAuth callback (item 128) |
+| 400 | `OAUTH_MISSING_CODE` | OAuth callback missing both `code` and `error` (item 128) |
+| 401 | `OAUTH_STATE_INVALID` | Unknown/expired/replayed/wrong-provider OAuth `state` (item 128) |
+| 401 | `OAUTH_TOKEN_EXCHANGE_FAILED` | Provider explicitly rejected the code/PKCE exchange (item 128) |
+| 502 | `OAUTH_PROVIDER_UNAVAILABLE` | OAuth provider unreachable, erroring, or unparseable (item 128) |
 | 401 | `UNAUTHORIZED` | Missing/malformed/wrong-signature/expired JWT |
 | 503 | `DURABILITY_FAILURE` | An `fsync`/`msync` failed (P1.b, fsyncgate); the engine can no longer guarantee durability and must be restarted (session is poisoned) |
 | 500 | `INTERNAL_ERROR` | I/O, checksum, WAL corruption, control-file corruption, catalog corruption, buffer pool exhaustion, or an unavailable engine (`EngineUnavailable`) |
