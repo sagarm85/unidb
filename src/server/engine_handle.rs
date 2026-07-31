@@ -272,6 +272,20 @@ impl EngineHandle {
             .await
     }
 
+    /// Like [`Self::authorize_sql`] but principal-aware (item 122, B3) — a
+    /// `service_role` claim skips the pre-check, mirroring
+    /// `execute_sql_as_principal`'s bypass, so the fast-path pre-check can't
+    /// reject a service_role token before the engine's own audited bypass
+    /// ever runs.
+    pub async fn authorize_sql_as_principal(
+        &self,
+        principal: AuthPrincipal,
+        sql: String,
+    ) -> Result<()> {
+        self.on_engine(move |e| e.authorize_sql_as_principal(&principal, &sql))
+            .await
+    }
+
     /// Single-table grant check for REST routes that bypass SQL (item-24 Z3).
     pub async fn check_table_grant(
         &self,

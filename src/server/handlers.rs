@@ -371,9 +371,11 @@ pub async fn post_sql(
         // Everything up to execution is a pre-check: a rejection here has
         // touched nothing, so the session stays open.
         ensure_session_sql_allowed(&body.sql)?;
+        // item 122, B3: principal-aware pre-check so a service_role token
+        // isn't rejected here before the engine's own audited bypass runs.
         state
             .engine
-            .authorize_sql(user.clone(), body.sql.clone())
+            .authorize_sql_as_principal(principal.clone(), body.sql.clone())
             .await?;
         // Use execute_sql_as_principal (auth seam) to carry the full
         // principal so the RLS bypass for superusers and the no-sub path
@@ -419,11 +421,12 @@ pub async fn post_sql(
         return sql_response(&state, user, results, body.cursor);
     }
 
-    // Enforce per-user privileges (a no-op for the superuser / `None`)
-    // before the fast-path dispatch below runs the statement.
+    // Enforce per-user privileges (a no-op for the superuser / `None`, and
+    // for a service_role token — item 122, B3) before the fast-path
+    // dispatch below runs the statement.
     state
         .engine
-        .authorize_sql(user.clone(), body.sql.clone())
+        .authorize_sql_as_principal(principal.clone(), body.sql.clone())
         .await
         .map_err(ApiError::from)?;
 

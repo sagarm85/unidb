@@ -22,13 +22,33 @@
 //   GRANT <role> TO <grantee>                       (role membership)
 //   REVOKE <priv,.. | ALL> ON <table> FROM <grantee>
 //   REVOKE <role> FROM <grantee>
-//   CREATE POLICY <name> ON <table> FOR <op> USING (<predicate>) [WITH CHECK (<expr>)]
+//   CREATE POLICY <name> ON <table> FOR <op> [TO <role,...>] USING (<predicate>) [WITH CHECK (<expr>)]
 //   DROP POLICY <name> ON <table>
 //
 // Roles/users/grants persist to `roles.json` (control-plane metadata, so
 // `serde` is fine per CLAUDE.md §4). Named policies persist in the catalog
 // blob (alongside `rls_policy`) so there is no FORMAT_VERSION bump.
 // `Send + Sync` for the shared `Engine`.
+//
+// **Built-in roles (item 122, B3):** `anon`, `authenticated`, and
+// `service_role` are reserved — `CREATE ROLE`/`DROP ROLE` reject these three
+// names (see `is_reserved_role`). They are never persisted as ordinary roles;
+// [`RoleStore::effective_roles`] resolves them for a caller on the fly from
+// their subject/verified claims (Supabase convention — see that method's doc
+// comment for the exact mapping). `service_role` bypasses RLS like a
+// superuser, on the audited path (item-103 lesson): see `Engine::
+// execute_sql_inner_as_principal` / `ReadHandle::execute_sql_inner`.
+//
+// **Role-scoped policies (item 122, B4):** the optional `TO <role,...>`
+// clause above persists as `PolicyDef::target_roles`. A policy with no `TO`
+// clause has an empty `target_roles` and applies to every caller exactly as
+// before B4 (back-compat) via the merged `rls_policy`/`update_policy`/
+// `delete_policy`/`insert_policy` catalog fields; a `TO`-scoped policy is
+// instead re-evaluated, role-gated, at plan/injection time by
+// `crate::sql::logical::apply_rls_with_auth` — see that function's doc
+// comment for the exact semantics, including the Postgres-style
+// deny-by-default when a `TO`-scoped policy exists but none of its target
+// roles match the caller.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -155,6 +175,31 @@ struct SessionRec {
     issued_at: u64,
     expires_at: u64,
     revoked: bool,
+}
+
+/// Reserved built-in role: an unauthenticated / no-subject caller (item 122,
+/// B3 — Supabase convention). Never created/dropped by `CREATE`/`DROP ROLE`;
+/// assigned automatically by [`RoleStore::effective_roles`].
+pub const ANON_ROLE: &str = "anon";
+/// Reserved built-in role: any caller with a verified subject (item 122, B3).
+/// Assigned automatically alongside the user's own transitively-granted
+/// roles; never created/dropped by `CREATE`/`DROP ROLE`.
+pub const AUTHENTICATED_ROLE: &str = "authenticated";
+/// Reserved built-in role: a token whose verified claims carry
+/// `"role": "service_role"` (item 122, B3 — Supabase convention). Bypasses
+/// RLS like a superuser, but stays on the audited path (item-103 lesson) —
+/// see `Engine::execute_sql_inner_as_principal`'s `is_service_role` gate and
+/// `ReadHandle::execute_sql_inner`'s mirror of it. Never created/dropped by
+/// `CREATE`/`DROP ROLE`.
+pub const SERVICE_ROLE: &str = "service_role";
+
+const RESERVED_ROLES: [&str; 3] = [ANON_ROLE, AUTHENTICATED_ROLE, SERVICE_ROLE];
+
+/// Whether `name` is one of the three built-in roles (item 122, B3) — these
+/// are assigned automatically by [`RoleStore::effective_roles`], never via
+/// `CREATE ROLE`/`DROP ROLE` (rejected in [`RoleStore::apply`]).
+pub fn is_reserved_role(name: &str) -> bool {
+    RESERVED_ROLES.contains(&name)
 }
 
 /// A table-level privilege.
@@ -301,6 +346,18 @@ pub struct PolicyDef {
     /// deserialize with `None` — no FORMAT_VERSION bump required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub with_check_sql: Option<String>,
+    /// Target-role list for `CREATE POLICY … TO <role,...>` (item 122, B4).
+    /// Empty means "no TO clause" — the policy applies to every caller,
+    /// exactly like every pre-B4 policy (back-compat contract). Matched
+    /// against the caller's *effective* roles (see [`RoleStore::
+    /// effective_roles`]) by `apply_rls_with_auth`'s role gate in
+    /// `sql/logical.rs`: a policy is only AND-injected for a caller whose
+    /// effective roles intersect this set (or when this set is empty).
+    /// `#[serde(default)]` so a pre-B4 catalog blob (this field absent)
+    /// deserializes as an empty list — identical behavior, no
+    /// FORMAT_VERSION bump.
+    #[serde(default)]
+    pub target_roles: Vec<String>,
 }
 
 /// A parsed auth-DDL statement.
@@ -618,6 +675,87 @@ impl RoleStore {
         })
     }
 
+    /// Resolve the caller's **effective** roles (item 122, B3) — the
+    /// Supabase-parity mapping consumed by [`crate::sql::logical::
+    /// apply_rls_with_auth`]'s role gate (B4). Engine-side only (needs
+    /// `self`/authz access, unlike `require_jwt` which only verifies the
+    /// token) — called from `Engine::execute_sql_inner_as_principal` and
+    /// `ReadHandle::execute_sql_inner`, never from the HTTP auth layer:
+    ///
+    /// - a verified token carrying `claims["role"] == "service_role"` →
+    ///   `["service_role"]` only (Supabase convention) — this bypasses RLS
+    ///   like a superuser at the call site, but that bypass decision is made
+    ///   by the caller (audited distinctly, item-103 lesson), not here.
+    /// - `user` is `Some` (a verified subject) → `"authenticated"` plus every
+    ///   role transitively granted to that user (`GRANT <role> TO <user>`,
+    ///   resolved through role-of-role membership, mirroring
+    ///   [`Self::has_privilege`]'s transitive closure).
+    /// - `user` is `None` (no verified subject) → `["anon"]` only.
+    ///
+    /// Fails closed by construction: an unknown/ungranted role never
+    /// appears, and a caller who resolves to no roles at all cannot happen
+    /// (every branch returns at least one role) — a role-scoped policy with
+    /// a `TO` clause a caller doesn't match on simply never widens access.
+    pub fn effective_roles(
+        &self,
+        user: Option<&str>,
+        claims: &BTreeMap<String, serde_json::Value>,
+    ) -> Vec<String> {
+        // A `role` claim explicitly naming `service_role` or `anon` wins
+        // outright, regardless of `user` — this is the real Supabase JWT
+        // convention (both the anon key and the service-role key carry a
+        // `role` claim; it is not inferred from `sub`'s presence). The
+        // literal B3 spec ties `anon`/`authenticated` to subject presence as
+        // the *default* mapping (handled below), which this claim-based
+        // check does not change for a token with no `role` claim at all —
+        // it only adds an explicit, disclosed override for a token that
+        // *does* assert one, and is the only way an `anon`-labeled caller
+        // can reach the RLS role gate without also tripping the pre-existing,
+        // protected "`user == None` is the implicit/embedded superuser"
+        // bypass (item 103) that a bare no-subject token always hits first.
+        if let Some(role_claim) = claims.get("role").and_then(|v| v.as_str()) {
+            if role_claim == SERVICE_ROLE {
+                return vec![SERVICE_ROLE.to_string()];
+            }
+            if role_claim == ANON_ROLE {
+                return vec![ANON_ROLE.to_string()];
+            }
+        }
+        match user {
+            Some(u) => {
+                let st = self.lock();
+                let mut roles = vec![AUTHENTICATED_ROLE.to_string()];
+                roles.extend(Self::transitive_roles_for(&st, u));
+                roles
+            }
+            None => vec![ANON_ROLE.to_string()],
+        }
+    }
+
+    /// Every role reachable from `grantee` by transitive membership
+    /// (`GRANT <role> TO <grantee>`, then role-of-role), NOT including
+    /// `grantee` itself. Factored out of [`Self::has_privilege`]'s inline
+    /// BFS (which additionally needs the grantee itself in its closure, for
+    /// the direct-grant check) so [`Self::effective_roles`] (item 122, B3)
+    /// can reuse the identical traversal without duplicating it.
+    fn transitive_roles_for(st: &AuthState, grantee: &str) -> Vec<String> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut stack = vec![grantee.to_string()];
+        let mut roles: HashSet<String> = HashSet::new();
+        while let Some(g) = stack.pop() {
+            if !seen.insert(g.clone()) {
+                continue;
+            }
+            if let Some(rs) = st.memberships.get(&g) {
+                for r in rs {
+                    roles.insert(r.clone());
+                    stack.push(r.clone());
+                }
+            }
+        }
+        roles.into_iter().collect()
+    }
+
     /// Snapshot of the users (name, superuser).
     pub fn users(&self) -> Vec<(String, bool)> {
         self.lock()
@@ -724,11 +862,21 @@ impl RoleStore {
                 st.credentials.remove(name);
             }
             AuthStmt::CreateRole(name) => {
+                if is_reserved_role(name) {
+                    return Err(DbError::Authz(format!(
+                        "role '{name}' is reserved (built-in) and cannot be created"
+                    )));
+                }
                 if !st.roles.insert(name.clone()) {
                     return Err(DbError::Authz(format!("role '{name}' already exists")));
                 }
             }
             AuthStmt::DropRole(name) => {
+                if is_reserved_role(name) {
+                    return Err(DbError::Authz(format!(
+                        "role '{name}' is reserved (built-in) and cannot be dropped"
+                    )));
+                }
                 if !st.roles.remove(name) {
                     return Err(DbError::Authz(format!("role '{name}' not found")));
                 }
@@ -902,11 +1050,16 @@ fn parse_quoted_password(s: &str) -> Result<String> {
     Ok(out)
 }
 
-/// `CREATE POLICY <name> ON <table> FOR <op> USING (<predicate>)`
+/// `CREATE POLICY <name> ON <table> FOR <op> [TO <role,...>] USING (<predicate>) [WITH CHECK (<expr>)]`
 ///
 /// The USING clause may span multiple tokens (it is a SQL expression); we
 /// find `USING` case-insensitively and take everything after `(` through the
-/// final `)` as the raw predicate string.
+/// final `)` as the raw predicate string. The optional `TO <role,...>`
+/// clause (item 122, B4) is detected as an exact `TO` token strictly between
+/// the operation (or the table name, if `FOR` was omitted) and `USING` — so
+/// it can never be confused with a `TO` that might appear inside the
+/// predicate text itself, which lives after `USING` and is never tokenised
+/// this way.
 fn parse_create_policy(sql: &str) -> Result<AuthStmt> {
     let upper = sql.to_ascii_uppercase();
     // Tokenised version for the keyword positions.
@@ -924,7 +1077,8 @@ fn parse_create_policy(sql: &str) -> Result<AuthStmt> {
     let table = ident(toks.get(on_pos + 1))?;
 
     // FOR position (optional — defaults to ALL).
-    let op = if let Some(for_pos) = upper_toks.iter().position(|t| t == "FOR") {
+    let for_pos = upper_toks.iter().position(|t| t == "FOR");
+    let op = if let Some(for_pos) = for_pos {
         let op_str = toks.get(for_pos + 1).ok_or_else(|| {
             DbError::SqlParse("CREATE POLICY: missing operation after FOR".into())
         })?;
@@ -933,6 +1087,42 @@ fn parse_create_policy(sql: &str) -> Result<AuthStmt> {
         })?
     } else {
         PolicyOp::All
+    };
+
+    // Optional `TO <role,...>` clause (item 122, B4): an exact `TO` token
+    // somewhere between the operation (or table, if `FOR` absent) and the
+    // token that opens the `USING` clause. `toks[i]`/`upper_toks[i]` share
+    // indices and every `toks[i]` borrows from `sql`, so pointer arithmetic
+    // recovers the exact (non-uppercased) byte range of the role list
+    // without re-scanning — no `unsafe` needed, this is plain integer math
+    // over already-safe `as_ptr()` values.
+    let using_tok_idx = upper_toks
+        .iter()
+        .position(|t| t.starts_with("USING"))
+        .ok_or_else(|| DbError::SqlParse("CREATE POLICY: missing USING clause".into()))?;
+    let to_search_start = match for_pos {
+        Some(for_pos) => for_pos + 2, // token right after the operation
+        None => on_pos + 2,           // token right after the table name
+    };
+    let target_roles = match (to_search_start..using_tok_idx)
+        .find(|&i| upper_toks.get(i).map(String::as_str) == Some("TO"))
+    {
+        Some(to_idx) => {
+            let role_start = tok_offset(sql, toks[to_idx]) + toks[to_idx].len();
+            let role_end = tok_offset(sql, toks[using_tok_idx]);
+            let roles: Vec<String> = sql[role_start..role_end]
+                .split(',')
+                .map(|r| r.trim().trim_matches('"').to_string())
+                .filter(|r| !r.is_empty())
+                .collect();
+            if roles.is_empty() {
+                return Err(DbError::SqlParse(
+                    "CREATE POLICY: TO clause requires at least one role".into(),
+                ));
+            }
+            roles
+        }
+        None => Vec::new(),
     };
 
     // USING clause: everything between the outermost `(` and `)` after the
@@ -1021,7 +1211,17 @@ fn parse_create_policy(sql: &str) -> Result<AuthStmt> {
         op,
         using_expr,
         with_check_sql,
+        target_roles,
     }))
+}
+
+/// Byte offset of `tok` within `sql`, given `tok` is itself a substring of
+/// `sql` (true for every element of `sql.split_whitespace().collect()`).
+/// Plain pointer-to-integer arithmetic — safe, no dereference — used to
+/// recover exact (non-uppercased) source ranges from token positions found
+/// via an uppercased token list.
+fn tok_offset(sql: &str, tok: &str) -> usize {
+    tok.as_ptr() as usize - sql.as_ptr() as usize
 }
 
 /// `DROP POLICY <name> ON <table>`
@@ -1481,5 +1681,218 @@ mod tests {
         // `sessions` field specifically prints a redacted count.
         assert!(debug_str.contains("sessions"));
         assert!(debug_str.contains("redacted"));
+    }
+
+    // ── item 122, B3/B4: built-in roles + role-scoped policies ────────────
+
+    #[test]
+    fn reserved_roles_cannot_be_created_or_dropped() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        for name in ["anon", "authenticated", "service_role"] {
+            assert!(
+                store.apply(&AuthStmt::CreateRole(name.into())).is_err(),
+                "CREATE ROLE {name} must be rejected (reserved)"
+            );
+            assert!(
+                store.apply(&AuthStmt::DropRole(name.into())).is_err(),
+                "DROP ROLE {name} must be rejected (reserved)"
+            );
+        }
+        // A non-reserved role still works normally.
+        assert!(store.apply(&AuthStmt::CreateRole("analyst".into())).is_ok());
+    }
+
+    #[test]
+    fn parse_create_policy_with_to_clause() {
+        let stmt = parse_auth_stmt(
+            "CREATE POLICY p1 ON accounts FOR SELECT TO authenticated USING (owner = current_user())",
+        )
+        .unwrap()
+        .unwrap();
+        match stmt {
+            AuthStmt::CreatePolicy(p) => {
+                assert_eq!(p.target_roles, vec!["authenticated".to_string()]);
+                assert_eq!(p.using_expr, "owner = current_user()");
+                assert_eq!(p.op, PolicyOp::Select);
+            }
+            _ => panic!("expected CreatePolicy"),
+        }
+    }
+
+    #[test]
+    fn parse_create_policy_with_multi_role_to_clause() {
+        let stmt =
+            parse_auth_stmt("CREATE POLICY p2 ON accounts FOR ALL TO admin, analyst USING (true)")
+                .unwrap()
+                .unwrap();
+        match stmt {
+            AuthStmt::CreatePolicy(p) => {
+                assert_eq!(
+                    p.target_roles,
+                    vec!["admin".to_string(), "analyst".to_string()]
+                );
+            }
+            _ => panic!("expected CreatePolicy"),
+        }
+    }
+
+    #[test]
+    fn parse_create_policy_to_clause_with_with_check() {
+        // TO clause + WITH CHECK together (both new/optional clauses at once).
+        let stmt = parse_auth_stmt(
+            "CREATE POLICY p4 ON accounts FOR UPDATE TO authenticated USING (owner = current_user()) WITH CHECK (owner = current_user())",
+        )
+        .unwrap()
+        .unwrap();
+        match stmt {
+            AuthStmt::CreatePolicy(p) => {
+                assert_eq!(p.target_roles, vec!["authenticated".to_string()]);
+                assert_eq!(p.with_check_sql.as_deref(), Some("owner = current_user()"));
+            }
+            _ => panic!("expected CreatePolicy"),
+        }
+    }
+
+    #[test]
+    fn parse_create_policy_without_to_clause_is_unscoped() {
+        let stmt = parse_auth_stmt("CREATE POLICY p3 ON accounts FOR SELECT USING (true)")
+            .unwrap()
+            .unwrap();
+        match stmt {
+            AuthStmt::CreatePolicy(p) => assert!(p.target_roles.is_empty()),
+            _ => panic!("expected CreatePolicy"),
+        }
+    }
+
+    #[test]
+    fn parse_create_policy_to_clause_requires_a_role() {
+        // "TO USING" with nothing in between is a malformed TO clause — must
+        // error, not silently produce an empty (i.e. unscoped/all-callers)
+        // target-role list, which would be a fail-OPEN widening.
+        assert!(
+            parse_auth_stmt("CREATE POLICY p5 ON accounts FOR SELECT TO USING (true)").is_err()
+        );
+    }
+
+    #[test]
+    fn effective_roles_no_subject_is_anon() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        assert_eq!(
+            store.effective_roles(None, &BTreeMap::new()),
+            vec![ANON_ROLE.to_string()]
+        );
+    }
+
+    #[test]
+    fn effective_roles_subject_is_authenticated_plus_transitive_grants() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        store
+            .apply(&AuthStmt::CreateUser {
+                name: "bob".into(),
+                superuser: false,
+                password: None,
+            })
+            .unwrap();
+        store
+            .apply(&AuthStmt::CreateRole("analyst".into()))
+            .unwrap();
+        store
+            .apply(&AuthStmt::CreateRole("senior_analyst".into()))
+            .unwrap();
+        store
+            .apply(&AuthStmt::GrantRole {
+                role: "analyst".into(),
+                grantee: "bob".into(),
+            })
+            .unwrap();
+        // Role-of-role: bob -> analyst -> senior_analyst, resolved transitively.
+        store
+            .apply(&AuthStmt::GrantRole {
+                role: "senior_analyst".into(),
+                grantee: "analyst".into(),
+            })
+            .unwrap();
+        let mut roles = store.effective_roles(Some("bob"), &BTreeMap::new());
+        roles.sort();
+        assert_eq!(
+            roles,
+            vec![
+                "analyst".to_string(),
+                AUTHENTICATED_ROLE.to_string(),
+                "senior_analyst".to_string(),
+            ]
+        );
+
+        // A subject with no granted roles is still "authenticated", nothing more.
+        store
+            .apply(&AuthStmt::CreateUser {
+                name: "carol".into(),
+                superuser: false,
+                password: None,
+            })
+            .unwrap();
+        assert_eq!(
+            store.effective_roles(Some("carol"), &BTreeMap::new()),
+            vec![AUTHENTICATED_ROLE.to_string()]
+        );
+    }
+
+    #[test]
+    fn effective_roles_service_role_claim_wins_regardless_of_subject() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        let mut claims = BTreeMap::new();
+        claims.insert(
+            "role".to_string(),
+            serde_json::Value::String(SERVICE_ROLE.to_string()),
+        );
+        assert_eq!(
+            store.effective_roles(Some("bob"), &claims),
+            vec![SERVICE_ROLE.to_string()]
+        );
+        assert_eq!(
+            store.effective_roles(None, &claims),
+            vec![SERVICE_ROLE.to_string()]
+        );
+        // A non-matching "role" claim doesn't trigger the bypass.
+        let mut other_claims = BTreeMap::new();
+        other_claims.insert(
+            "role".to_string(),
+            serde_json::Value::String("something_else".to_string()),
+        );
+        assert_eq!(
+            store.effective_roles(Some("bob"), &other_claims),
+            vec![AUTHENTICATED_ROLE.to_string()]
+        );
+    }
+
+    #[test]
+    fn effective_roles_explicit_anon_role_claim_overrides_subject() {
+        // A `role: anon` claim (the real Supabase anon-key convention) is a
+        // genuinely reachable way to get an `anon`-labeled caller that does
+        // NOT trip the `user == None` superuser-bypass invariant (item 103) —
+        // unlike a bare no-subject token, this carries a real `Some(subject)`
+        // so it reaches the ordinary (non-bypass) RLS path in
+        // `Engine::execute_sql_inner_as_principal`.
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        let mut claims = BTreeMap::new();
+        claims.insert(
+            "role".to_string(),
+            serde_json::Value::String(ANON_ROLE.to_string()),
+        );
+        assert_eq!(
+            store.effective_roles(Some("some_subject"), &claims),
+            vec![ANON_ROLE.to_string()]
+        );
+        // The default (no `role` claim at all) mapping is unaffected: a bare
+        // no-subject caller still resolves to anon too.
+        assert_eq!(
+            store.effective_roles(None, &BTreeMap::new()),
+            vec![ANON_ROLE.to_string()]
+        );
     }
 }

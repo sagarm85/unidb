@@ -55,8 +55,15 @@ pub struct ReadHandle {
     txn: SharedTxn,
     catalog: Arc<RwLock<Catalog>>,
     /// Role store for RLS bypass decisions (item 103): superusers and the
-    /// no-`sub` (embedded) path must bypass `current_user`-referencing policies.
+    /// no-`sub` (embedded) path must bypass `current_user`-referencing
+    /// policies; also resolves effective roles (item 122, B3) for the
+    /// role-scoped policy gate and the `service_role` bypass.
     authz: Arc<RoleStore>,
+    /// Audit trail (item-103 lesson, item 122 B3): a `service_role` RLS
+    /// bypass on this read path is logged distinctly from the unaudited
+    /// implicit-superuser bypass, exactly like the writer path
+    /// (`Engine::execute_sql_inner_as_principal`).
+    audit: Arc<crate::audit::AuditLog>,
 }
 
 impl ReadHandle {
@@ -65,12 +72,14 @@ impl ReadHandle {
         txn: SharedTxn,
         catalog: Arc<RwLock<Catalog>>,
         authz: Arc<RoleStore>,
+        audit: Arc<crate::audit::AuditLog>,
     ) -> Self {
         Self {
             reader,
             txn,
             catalog,
             authz,
+            audit,
         }
     }
 
@@ -119,10 +128,18 @@ impl ReadHandle {
         // None == embedded/no-sub == implicit superuser; a named SUPERUSER user
         // also bypasses. In open/bootstrap mode (no users registered) every caller
         // is an effective superuser.
+        //
+        // item 122, B3: also resolve the caller's effective roles (engine-side,
+        // via `self.authz`) — a `service_role` claim bypasses RLS the same way a
+        // superuser does, but stays on the audited path (item-103 lesson).
+        let effective_roles = self.authz.effective_roles(user, claims);
+        let is_service_role = effective_roles
+            .iter()
+            .any(|r| r == crate::authz::SERVICE_ROLE);
         let skip_current_user_policies = match user {
             None => true,
             Some(u) => self.authz.is_superuser(u) || !self.authz.has_users(),
-        };
+        } || is_service_role;
         let plans = parse_sql(sql)?;
         let mut out = Vec::with_capacity(plans.len());
         for mut plan in plans {
@@ -137,14 +154,19 @@ impl ReadHandle {
             // (`execute_sql_inner_as_principal` in lib.rs).
             substitute_auth_context_in_plan(&mut plan, user, claims);
             let mut plan = if skip_current_user_policies {
-                // Superuser / no-sub: skip any policy that references current_user
-                // (or, item 122, auth.uid()/auth.jwt()). Literal-value policies
-                // still apply, matching the behaviour of execute_sql_inner on the
-                // writer path.
+                // Superuser / no-sub / service_role: skip any policy that
+                // references current_user (or, item 122, auth.uid()/
+                // auth.jwt()). Literal-value policies still apply, matching
+                // the behaviour of execute_sql_inner on the writer path.
+                if is_service_role {
+                    self.audit
+                        .record_admin(user, None, "service_role_rls_bypass", "", true);
+                }
                 apply_rls_skip_current_user(plan, &self.catalog_read())
             } else {
-                // Regular named user: apply all applicable policies.
-                apply_rls_with_auth(plan, &self.catalog_read(), user, claims)
+                // Regular named user: apply all applicable policies, role-gated
+                // (item 122, B4) by the caller's effective roles.
+                apply_rls_with_auth(plan, &self.catalog_read(), user, claims, &effective_roles)
             };
             // Second substitution resolves CurrentUser/AuthUid/AuthClaim nodes
             // injected by the RLS policy expressions (only matters for the

@@ -803,12 +803,29 @@ fn delete_policy_for_skip_current_user(catalog: &Catalog, table: &str) -> Option
 /// fallback turned it into `Bool(true)`, making `owner = current_user` into
 /// `owner = TRUE` → a coercion error on every RLS+LIMIT query, and a silent
 /// policy weakening in shapes where `Bool` type-checks).
+///
+/// `roles` is the caller's *effective* roles (item 122, B3/B4 — see
+/// [`crate::authz::RoleStore::effective_roles`]), used to gate **role-scoped**
+/// named policies (`CREATE POLICY … TO <role,...>`): such a policy is only
+/// OR-combined into the applicable predicate when `roles` intersects its
+/// target-role set (checked by [`role_scoped_policy_for`]). A named policy
+/// with no `TO` clause has an empty target-role set and is folded into the
+/// unfiltered `rls_policy`/`update_policy`/`delete_policy` catalog field at
+/// `CREATE POLICY` time (`Engine::create_policy_inner`) exactly as before B4
+/// shipped — **back-compat**: every no-`TO` policy still applies to every
+/// caller, unconditionally, regardless of `roles`. An empty `roles` slice
+/// (the back-compat shim [`apply_rls`] passes, and what a caller who somehow
+/// resolves to no roles would carry) matches no `TO`-scoped policy at all —
+/// "no role filtering" here means exactly "only the always-on no-`TO`
+/// policies apply," never a widening.
 pub fn apply_rls_with_auth(
     plan: LogicalPlan,
     catalog: &Catalog,
     user: Option<&str>,
     claims: &BTreeMap<String, JsonValue>,
+    roles: &[String],
 ) -> LogicalPlan {
+    use crate::authz::PolicyOp;
     // Policy fetcher with current_user AND auth.uid()/auth.jwt() resolved at
     // fetch time — BEFORE the Expr→QExpr conversion (the Query/Explain path)
     // destroys them. Item 110 established this for current_user; item 122
@@ -825,6 +842,40 @@ pub fn apply_rls_with_auth(
             e
         })
     };
+    // The applicable predicate for `op_matches` is the OR of: (a) the
+    // unfiltered merged field (no-`TO` policies, applies to everyone —
+    // untouched by B4), and (b) whichever `TO`-scoped named policies match
+    // `roles` (item 122, B4). If NEITHER contributes anything AND at least
+    // one `TO`-scoped policy exists for this table+operation (it just didn't
+    // match `roles`), the result is a hard deny (`Bool(false)`), not "no
+    // restriction" — mirroring Postgres RLS semantics ("some permissive
+    // policy exists for this command; a caller matching none of them sees
+    // nothing"). See `combine_role_gate`'s doc comment for why this matters
+    // and why it can't regress a table with zero named policies.
+    let select_for = |table: &str| {
+        combine_role_gate(
+            select_policy_for(catalog, table),
+            role_scoped_policy_for(catalog, table, roles, |op| {
+                matches!(op, PolicyOp::Select | PolicyOp::All)
+            }),
+        )
+    };
+    let update_for = |table: &str| {
+        combine_role_gate(
+            update_policy_for(catalog, table),
+            role_scoped_policy_for(catalog, table, roles, |op| {
+                matches!(op, PolicyOp::Update | PolicyOp::All)
+            }),
+        )
+    };
+    let delete_for = |table: &str| {
+        combine_role_gate(
+            delete_policy_for(catalog, table),
+            role_scoped_policy_for(catalog, table, roles, |op| {
+                matches!(op, PolicyOp::Delete | PolicyOp::All)
+            }),
+        )
+    };
     match plan {
         LogicalPlan::Select {
             table,
@@ -832,7 +883,7 @@ pub fn apply_rls_with_auth(
             predicate,
         } => {
             // SELECT context: use rls_policy (SELECT + ALL scoped).
-            let predicate = and_policy(predicate, select_policy_for(catalog, &table));
+            let predicate = and_policy(predicate, select_for(&table));
             LogicalPlan::Select {
                 table,
                 projection,
@@ -846,7 +897,7 @@ pub fn apply_rls_with_auth(
             returning,
         } => {
             // UPDATE context: use update_policy (UPDATE + ALL scoped) — Z2.
-            let predicate = and_policy(predicate, update_policy_for(catalog, &table));
+            let predicate = and_policy(predicate, update_for(&table));
             LogicalPlan::Update {
                 table,
                 assignments,
@@ -860,7 +911,7 @@ pub fn apply_rls_with_auth(
             returning,
         } => {
             // DELETE context: use delete_policy (DELETE + ALL scoped) — Z2.
-            let predicate = and_policy(predicate, delete_policy_for(catalog, &table));
+            let predicate = and_policy(predicate, delete_for(&table));
             LogicalPlan::Delete {
                 table,
                 predicate,
@@ -873,12 +924,12 @@ pub fn apply_rls_with_auth(
             // to that relation. The executor never learns RLS exists.
             // Item 110: substitute current_user BEFORE the Expr→QExpr
             // conversion inside apply_rls_from destroys it.
-            spec.apply_rls_from(&|table| policy_sub(select_policy_for(catalog, table)));
+            spec.apply_rls_from(&|table| policy_sub(select_for(table)));
             LogicalPlan::Query(spec)
         }
         LogicalPlan::Explain { analyze, mut spec } => {
             // EXPLAIN shows the RLS-rewritten plan the query would actually run.
-            spec.apply_rls_from(&|table| policy_sub(select_policy_for(catalog, table)));
+            spec.apply_rls_from(&|table| policy_sub(select_for(table)));
             LogicalPlan::Explain { analyze, spec }
         }
         LogicalPlan::SetOp {
@@ -888,8 +939,8 @@ pub fn apply_rls_with_auth(
             right,
         } => {
             // Apply RLS to both branches of a set operation recursively.
-            let left = Box::new(apply_rls_with_auth(*left, catalog, user, claims));
-            let right = Box::new(apply_rls_with_auth(*right, catalog, user, claims));
+            let left = Box::new(apply_rls_with_auth(*left, catalog, user, claims, roles));
+            let right = Box::new(apply_rls_with_auth(*right, catalog, user, claims, roles));
             LogicalPlan::SetOp {
                 op,
                 all,
@@ -908,12 +959,121 @@ pub fn apply_rls_with_auth(
     }
 }
 
-/// Back-compat shim for callers with no verified auth claims (the embedded /
-/// params path and unit tests that don't exercise `auth.jwt()`): applies RLS
-/// with an empty claim set, so any `auth.jwt()`/`auth.uid()` in a policy fails
-/// closed to NULL exactly as it would for an unauthenticated caller.
+/// Back-compat shim for callers with no verified auth claims and no resolved
+/// roles (the embedded/params path and unit tests that don't exercise
+/// `auth.jwt()`/role-scoped policies): applies RLS with an empty claim set
+/// and an empty role list, so any `auth.jwt()`/`auth.uid()` in a policy fails
+/// closed to NULL exactly as it would for an unauthenticated caller, and any
+/// `TO`-scoped named policy is skipped (only no-`TO` policies apply) — see
+/// [`apply_rls_with_auth`]'s doc comment for the exact empty-`roles`
+/// semantics.
 pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog, user: Option<&str>) -> LogicalPlan {
-    apply_rls_with_auth(plan, catalog, user, &BTreeMap::new())
+    apply_rls_with_auth(plan, catalog, user, &BTreeMap::new(), &[])
+}
+
+/// OR-merge the USING predicates of every **role-scoped** (`TO`-having)
+/// named policy on `table` whose operation matches `op_matches` and whose
+/// target-role set intersects `roles` (item 122, B4), returning `(merged
+/// predicate, whether at least one TO-scoped policy exists for this op at
+/// all)`. The second value is what lets [`combine_role_gate`] distinguish
+/// "no TO-scoped policy was ever defined for this operation" (leave
+/// unrestricted — back-compat) from "TO-scoped policies exist, but none
+/// matched this caller's roles" (deny — see that function's doc comment).
+///
+/// No-`TO` policies are deliberately excluded from the merge here — they
+/// were already folded into the unfiltered `rls_policy`/`update_policy`/
+/// `delete_policy` catalog field by `Engine::create_policy_inner`, and are
+/// picked up by `select_policy_for`/`update_policy_for`/`delete_policy_for`
+/// exactly as they were before B4 shipped. An empty `roles` slice can never
+/// match any TO-scoped policy's target set (by construction — see
+/// `apply_rls`'s doc comment on the empty-roles back-compat contract), but
+/// still needs to report `any_defined` correctly so a table that *does* have
+/// TO-scoped policies denies an empty-roles caller rather than silently
+/// leaving it unrestricted.
+fn role_scoped_policy_for(
+    catalog: &Catalog,
+    table: &str,
+    roles: &[String],
+    op_matches: impl Fn(crate::authz::PolicyOp) -> bool,
+) -> (Option<Expr>, bool) {
+    let Ok(t) = catalog.lookup(table) else {
+        return (None, false);
+    };
+    let mut merged: Option<Expr> = None;
+    let mut any_defined = false;
+    for p in &t.policies {
+        if p.target_roles.is_empty() || !op_matches(p.op) {
+            continue;
+        }
+        any_defined = true;
+        if !p.target_roles.iter().any(|r| roles.contains(r)) {
+            continue;
+        }
+        let Ok(expr) = parse_policy_predicate(table, &p.using_expr) else {
+            // A stored named policy that fails to re-parse is an impossible
+            // state in practice (`CREATE POLICY` validates it up front by
+            // parsing it the same way) — fail closed by skipping just this
+            // policy rather than trusting on-disk data blindly or panicking
+            // in a read path.
+            continue;
+        };
+        merged = Some(match merged {
+            Some(old) => Expr::Or(Box::new(old), Box::new(expr)),
+            None => expr,
+        });
+    }
+    (merged, any_defined)
+}
+
+/// Combine the unfiltered (no-`TO`) merged predicate `base` with the
+/// role-gated result of [`role_scoped_policy_for`] (`(scoped, any_defined)`)
+/// into the final applicable predicate for one operation (item 122, B4).
+///
+/// - Either or both present → OR them (a row is visible if it satisfies any
+///   applicable permissive policy — Postgres semantics, unchanged from
+///   pre-B4).
+/// - Neither present, and `any_defined` is `false` (no `TO`-scoped policy
+///   was ever created for this table+operation) → `None`, i.e. no
+///   restriction at all. This is the **back-compat** case: a table with only
+///   no-`TO` policies (or none at all) behaves bit-for-bit as it did before
+///   B4 shipped.
+/// - Neither present, but `any_defined` is `true` (one or more `TO`-scoped
+///   policies exist for this operation, none matched the caller's roles) →
+///   `Some(Bool(false))`, a hard deny. This mirrors Postgres: once a
+///   permissive policy exists for a command, a caller satisfying none of
+///   them sees zero rows, not every row — the deny-by-default is what makes
+///   `TO authenticated`/`TO <role>` actually *restrictive* (test case: an
+///   `anon`/no-matching-role caller must see 0 rows under a `TO
+///   authenticated`-only policy, not all of them).
+fn combine_role_gate(base: Option<Expr>, scoped: (Option<Expr>, bool)) -> Option<Expr> {
+    let (scoped, any_defined) = scoped;
+    match (base, scoped) {
+        (Some(x), Some(y)) => Some(Expr::Or(Box::new(x), Box::new(y))),
+        (Some(x), None) => Some(x),
+        (None, Some(y)) => Some(y),
+        (None, None) if any_defined => Some(Expr::Literal(Literal::Bool(false))),
+        (None, None) => None,
+    }
+}
+
+/// Parse a bare predicate string into an [`Expr`] by wrapping it in a dummy
+/// `SELECT * FROM <table> WHERE <predicate>` and reusing the ordinary SQL
+/// parser — the one-grammar policy language (item-24 Z1, item 122 B4).
+/// Shared by `Engine::create_policy_inner`/`drop_policy_inner` (lib.rs) and
+/// [`role_scoped_policy_for`] above, so there is exactly one place that
+/// re-parses a stored policy's `using_expr` back into an `Expr`.
+pub(crate) fn parse_policy_predicate(table: &str, using_expr: &str) -> Result<Expr> {
+    let sql = format!("SELECT * FROM {table} WHERE {using_expr}");
+    let plans = crate::sql::parser::parse_sql(&sql)?;
+    match plans.as_slice() {
+        [LogicalPlan::Select {
+            predicate: Some(expr),
+            ..
+        }] => Ok(expr.clone()),
+        _ => Err(DbError::SqlUnsupported(
+            "a policy USING predicate must be a single AND-only comparison predicate".into(),
+        )),
+    }
 }
 
 /// SELECT-context policy: `rls_policy` (SELECT + ALL scoped).

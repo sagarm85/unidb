@@ -801,9 +801,17 @@ pub struct ExecCtx<'a> {
     /// Empty in all paths that don't build an [`crate::AuthPrincipal`]
     /// (embedded/superuser paths, unit tests building bare `ExecCtx`).
     pub auth_claims: std::collections::BTreeMap<String, serde_json::Value>,
-    /// Roles associated with the executing principal (auth seam). Carried
-    /// alongside `current_user`/`auth_claims`; **not consumed yet** — no
-    /// role-based grant/policy logic exists. Empty everywhere today.
+    /// Effective roles for the executing principal (item 122, B3), resolved
+    /// engine-side by `crate::authz::RoleStore::effective_roles` (never
+    /// trusted verbatim from an externally-supplied `AuthPrincipal.roles`,
+    /// which is always empty coming from the HTTP layer — see
+    /// `crate::auth_principal`'s module doc). Consumed by [`is_service_role`]
+    /// for the per-row INSERT-policy/WITH-CHECK bypass (a `service_role`
+    /// caller "bypasses RLS like a superuser"); the plan-level SELECT/UPDATE/
+    /// DELETE role gate lives in `crate::sql::logical::apply_rls_with_auth`,
+    /// upstream of `ExecCtx` entirely. Empty in every path that doesn't build
+    /// a real `AuthPrincipal` (embedded/superuser paths, unit tests building
+    /// bare `ExecCtx`).
     pub auth_roles: Vec<String>,
     /// Sender end of the HNSW background worker channel (item 67).
     /// `Some` on a fully-opened Engine that has called `spawn_hnsw_worker`;
@@ -1981,11 +1989,15 @@ fn exec_insert(
         // per-claim row isolation works on the INSERT path too. When
         // `current_user` is None (embedded/superuser path), skip any policy
         // that requires a verified identity (same reasoning as
-        // `apply_rls_skip_current_user`).
+        // `apply_rls_skip_current_user`). item 122 B3: a `service_role`
+        // caller bypasses this row-level check too — it "bypasses RLS like a
+        // superuser" (this per-row INSERT/WITH-CHECK path is evaluated
+        // regardless of the plan-level `apply_rls` skip, so it needs its own
+        // explicit bypass check).
         if let Some(ref ins_policy) = table_def.insert_policy {
             let requires_identity = crate::sql::logical::expr_requires_auth_context_pub(ins_policy);
-            if requires_identity && ctx.current_user.is_none() {
-                // Superuser/embedded path — bypass identity-dependent INSERT policies.
+            if requires_identity && (ctx.current_user.is_none() || is_service_role(ctx)) {
+                // Superuser/embedded/service_role path — bypass identity-dependent INSERT policies.
             } else {
                 let mut policy = ins_policy.clone();
                 if let Some(ref u) = ctx.current_user {
@@ -4753,6 +4765,20 @@ fn check_passes(expr: &Expr, columns: &[ColumnDef], row: &[Literal]) -> Result<b
     }
 }
 
+/// Whether `ctx`'s resolved effective roles (item 122, B3) include
+/// `service_role` — the Supabase-convention bypass-RLS-like-a-superuser
+/// role, resolved engine-side from the caller's verified claims (see
+/// `crate::authz::RoleStore::effective_roles`) and carried down via
+/// `ExecCtx::auth_roles`. Used by the per-row INSERT-policy/WITH-CHECK
+/// bypass checks, which run regardless of whether the plan-level `apply_rls`
+/// injection was skipped (they are evaluated independently, inside
+/// `exec_insert`/`exec_update_with_check`).
+fn is_service_role(ctx: &ExecCtx) -> bool {
+    ctx.auth_roles
+        .iter()
+        .any(|r| r == crate::authz::SERVICE_ROLE)
+}
+
 /// item-24 R-a: WITH CHECK enforcement for UPDATE.
 ///
 /// After SET is applied and the new row is coerced, evaluate the table's
@@ -4763,7 +4789,8 @@ fn check_passes(expr: &Expr, columns: &[ColumnDef], row: &[Literal]) -> Result<b
 ///
 /// `current_user` substitution mirrors the INSERT path exactly — a
 /// CurrentUser-dependent policy is skipped for the superuser/embedded
-/// path (when `ctx.current_user` is None).
+/// path (when `ctx.current_user` is None), and (item 122, B3) for a
+/// `service_role` caller, which bypasses RLS like a superuser.
 fn exec_update_with_check(table_def: &TableDef, new_row: &[Literal], ctx: &ExecCtx) -> Result<()> {
     let Some(ref check_expr) = table_def.update_with_check else {
         return Ok(());
@@ -4771,8 +4798,9 @@ fn exec_update_with_check(table_def: &TableDef, new_row: &[Literal], ctx: &ExecC
     // Superuser / embedded path (current_user = None) bypasses ALL RLS, including
     // WITH CHECK — mirrors how USING scan-filters are skipped for None user in
     // execute_sql_inner_as. Only skip CurrentUser-dependent checks (has_cu) for
-    // non-superuser paths; for None, skip unconditionally.
-    if ctx.current_user.is_none() {
+    // non-superuser paths; for None, skip unconditionally. item 122 B3:
+    // service_role bypasses unconditionally too.
+    if ctx.current_user.is_none() || is_service_role(ctx) {
         return Ok(());
     }
     let mut policy = check_expr.clone();
