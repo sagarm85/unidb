@@ -92,6 +92,14 @@ impl From<crate::storage_api::StorageApiError> for ApiError {
                 code: "OBJECT_STORE_ERROR",
                 message: msg,
             },
+            // F1 (item 120, Workstream F): per-object authorization denial —
+            // not the owner, the bucket isn't public, and the caller doesn't
+            // bypass like a superuser/service_role.
+            SE::Forbidden(msg) => ApiError::Api {
+                status: StatusCode::FORBIDDEN,
+                code: "STORAGE_FORBIDDEN",
+                message: msg,
+            },
             SE::Join => ApiError::internal("INTERNAL_ERROR", "storage task join failure"),
         }
     }

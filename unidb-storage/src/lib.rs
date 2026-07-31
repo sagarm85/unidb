@@ -55,6 +55,11 @@ pub enum StorageError {
     BucketNotEmpty(String),
     #[error("configuration error: {0}")]
     Config(String),
+    /// F1 (item 120, Workstream F — per-object storage authorization): the
+    /// caller is neither the object's owner nor a bypass caller
+    /// (superuser/`service_role`), and the bucket isn't public.
+    #[error("forbidden: {0}")]
+    Forbidden(String),
     #[error("blocking engine task failed to join")]
     Join,
 }

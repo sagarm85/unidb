@@ -3,13 +3,15 @@
 
 mod common;
 
+use unidb::storage_api::StorageCaller;
 use unidb::Engine;
 use unidb_storage::metadata::{self, status, tier, ObjectRow};
 
 #[tokio::test]
 async fn inline_object_round_trips_and_stays_out_of_the_store() {
     let h = common::harness(1024).await;
-    h.svc.create_bucket("b", Some("alice")).await.unwrap();
+    let alice = StorageCaller::user("alice");
+    h.svc.create_bucket("b", &alice, false).await.unwrap();
 
     let out = h
         .svc
@@ -18,7 +20,7 @@ async fn inline_object_round_trips_and_stays_out_of_the_store() {
             "hello.txt",
             b"hello world".to_vec(),
             Some("text/plain"),
-            Some("alice"),
+            &alice,
         )
         .await
         .unwrap();
@@ -27,12 +29,12 @@ async fn inline_object_round_trips_and_stays_out_of_the_store() {
     // Inline bytes live as an engine LOB — nothing goes to the object store.
     assert!(h.store.is_empty(), "inline object must not touch the store");
 
-    let got = h.svc.get_object("b", "hello.txt").await.unwrap();
+    let got = h.svc.get_object("b", "hello.txt", &alice).await.unwrap();
     assert_eq!(got, b"hello world");
 
-    h.svc.delete_object("b", "hello.txt").await.unwrap();
+    h.svc.delete_object("b", "hello.txt", &alice).await.unwrap();
     assert!(
-        h.svc.get_object("b", "hello.txt").await.is_err(),
+        h.svc.get_object("b", "hello.txt", &alice).await.is_err(),
         "deleted object must not be retrievable"
     );
 }
@@ -40,12 +42,13 @@ async fn inline_object_round_trips_and_stays_out_of_the_store() {
 #[tokio::test]
 async fn large_object_round_trips_via_store_with_presigned_urls() {
     let h = common::harness(4).await; // 4-byte threshold → the payload is "large"
-    h.svc.create_bucket("b", None).await.unwrap();
+    let su = StorageCaller::superuser();
+    h.svc.create_bucket("b", &su, false).await.unwrap();
 
     // 1. begin_upload: pending row (atomic outbox event) + presigned PUT URL.
     let ticket = h
         .svc
-        .begin_upload("b", "big.bin", Some("application/octet-stream"), None)
+        .begin_upload("b", "big.bin", Some("application/octet-stream"), &su)
         .await
         .unwrap();
     assert!(ticket.presigned_put_url.contains("stub-presign=put"));
@@ -63,31 +66,35 @@ async fn large_object_round_trips_via_store_with_presigned_urls() {
 
     // Download (server-side) and via a presigned GET URL.
     assert_eq!(
-        h.svc.get_object("b", "big.bin").await.unwrap(),
+        h.svc.get_object("b", "big.bin", &su).await.unwrap(),
         b"a big payload"
     );
-    let get_url = h.svc.presign_get("b", "big.bin").await.unwrap();
+    let get_url = h.svc.presign_get("b", "big.bin", &su).await.unwrap();
     assert!(get_url.contains("stub-presign=get"));
 
     // Delete removes both metadata and bytes.
-    h.svc.delete_object("b", "big.bin").await.unwrap();
+    h.svc.delete_object("b", "big.bin", &su).await.unwrap();
     assert!(!h.store.contains(&ticket.storage_key), "bytes must be gone");
-    assert!(h.svc.get_object("b", "big.bin").await.is_err());
+    assert!(h.svc.get_object("b", "big.bin", &su).await.is_err());
 }
 
 #[tokio::test]
 async fn put_object_routes_large_payloads_to_the_store() {
     let h = common::harness(4).await;
-    h.svc.create_bucket("b", None).await.unwrap();
+    let su = StorageCaller::superuser();
+    h.svc.create_bucket("b", &su, false).await.unwrap();
 
     let out = h
         .svc
-        .put_object("b", "k", b"0123456789".to_vec(), None, None)
+        .put_object("b", "k", b"0123456789".to_vec(), None, &su)
         .await
         .unwrap();
     assert_eq!(out.tier, "s3");
     assert_eq!(h.store.len(), 1, "large bytes go to the store");
-    assert_eq!(h.svc.get_object("b", "k").await.unwrap(), b"0123456789");
+    assert_eq!(
+        h.svc.get_object("b", "k", &su).await.unwrap(),
+        b"0123456789"
+    );
 }
 
 /// The sub-threshold ACID guarantee: composing the inline object write (LOB +

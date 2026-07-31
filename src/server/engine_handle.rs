@@ -454,6 +454,50 @@ impl EngineHandle {
             .await
     }
 
+    /// Resolve a caller's storage authorization context (item 120, Workstream
+    /// F1 — per-object storage authz): effective roles plus the exact same
+    /// bypass decision the SQL RLS path uses (`is_effective_superuser(user)
+    /// || is_service_role`, see `Engine::is_effective_superuser` /
+    /// `ReadHandle::execute_sql_inner`), reusing `authz::RoleStore` — no
+    /// parallel identity/role system for `/storage/*`. A bypass is audited
+    /// exactly like `service_role_rls_bypass` (item-103 lesson):
+    /// `AuditLog::record_admin` no-ops for the implicit embedded caller
+    /// (`subject == None`) and only logs named callers, so this call is
+    /// cheap and safe to make on every storage request.
+    pub async fn storage_caller(
+        &self,
+        principal: AuthPrincipal,
+    ) -> Result<crate::storage_api::StorageCaller> {
+        self.on_engine(move |e| {
+            let effective_roles = e
+                .authz
+                .effective_roles(principal.subject.as_deref(), &principal.claims);
+            let is_service_role = effective_roles
+                .iter()
+                .any(|r| r == crate::authz::SERVICE_ROLE);
+            let is_superuser = match principal.subject.as_deref() {
+                None => true,
+                Some(u) => e.authz.is_superuser(u) || !e.authz.has_users(),
+            };
+            let bypass = is_superuser || is_service_role;
+            if bypass {
+                let action = if is_service_role {
+                    "service_role_storage_bypass"
+                } else {
+                    "superuser_storage_bypass"
+                };
+                e.audit
+                    .record_admin(principal.subject.as_deref(), None, action, "", true);
+            }
+            Ok(crate::storage_api::StorageCaller {
+                subject: principal.subject,
+                roles: effective_roles,
+                is_superuser: bypass,
+            })
+        })
+        .await
+    }
+
     /// Whether any user exists in the role store — `false` = open/bootstrap mode
     /// (RLS policies are inactive).  Used by `GET /auth/meta`.
     pub async fn has_users(&self) -> bool {
