@@ -25,6 +25,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::{
+    auth_principal::AuthPrincipal,
     catalog::{IndexKind, IndexStatus},
     error::{DbError, Result},
     format::Xid,
@@ -225,6 +226,20 @@ impl EngineHandle {
         sql: String,
     ) -> Result<Vec<ExecResult>> {
         self.on_engine(move |e| e.execute_sql_as(user.as_deref(), xid, &sql))
+            .await
+    }
+
+    /// Like [`Self::execute_sql_as`] but forwards a full [`AuthPrincipal`]
+    /// (auth seam) instead of a bare subject string. `principal.claims`/
+    /// `principal.roles` are carried down into the engine but are not yet
+    /// consumed by any policy logic.
+    pub async fn execute_sql_as_principal(
+        &self,
+        principal: AuthPrincipal,
+        xid: Xid,
+        sql: String,
+    ) -> Result<Vec<ExecResult>> {
+        self.on_engine(move |e| e.execute_sql_as_principal(&principal, xid, &sql))
             .await
     }
 

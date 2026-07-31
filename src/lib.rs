@@ -38,6 +38,7 @@
 #![deny(unsafe_code)]
 
 pub mod audit;
+pub mod auth_principal;
 pub mod authz;
 /// Autovacuum (A3) — the background launcher thread that auto-triggers the
 /// existing M10 `Engine::vacuum`. See the module doc for why concurrent
@@ -135,6 +136,7 @@ use crate::{
     wal::Wal,
 };
 
+pub use crate::auth_principal::AuthPrincipal;
 pub use crate::error::DbError;
 pub use crate::heap::RowId;
 pub use crate::read_handle::ReadHandle;
@@ -1670,12 +1672,32 @@ impl Engine {
     /// Also the entry point for auth DDL (`CREATE USER`/`ROLE`, `GRANT`,
     /// `REVOKE`) — those are intercepted here (they aren't `sqlparser` grammar),
     /// require superuser, and mutate the role store rather than the catalog.
+    ///
+    /// A thin delegate to [`Engine::execute_sql_as_principal`] (auth seam) —
+    /// there is exactly one code path underneath both entry points.
     pub fn execute_sql_as(
         &self,
         user: Option<&str>,
         xid: Xid,
         sql: &str,
     ) -> Result<Vec<ExecResult>> {
+        self.execute_sql_as_principal(&AuthPrincipal::user(user.map(str::to_owned)), xid, sql)
+    }
+
+    /// Like [`Engine::execute_sql_as`], but takes a full [`AuthPrincipal`]
+    /// (auth seam) instead of a bare subject string. `principal.claims` and
+    /// `principal.roles` are carried down into the `ExecCtx` used for
+    /// execution but are **not consumed** by any policy logic yet — RLS and
+    /// privilege checks still key off `principal.subject` exactly as
+    /// `execute_sql_as` always has. Behavior is identical to
+    /// `execute_sql_as(principal.subject.as_deref(), xid, sql)`.
+    pub fn execute_sql_as_principal(
+        &self,
+        principal: &AuthPrincipal,
+        xid: Xid,
+        sql: &str,
+    ) -> Result<Vec<ExecResult>> {
+        let user = principal.subject.as_deref();
         // Auth DDL (whole-statement) is handled here, not by the SQL executor.
         if let Some(stmt) = crate::authz::parse_auth_stmt(sql)? {
             let (action, object) = auth_stmt_audit(&stmt);
@@ -1725,7 +1747,7 @@ impl Engine {
                     }
                 }
             }
-            self.execute_sql_inner_as(xid, sql, user)
+            self.execute_sql_inner_as_principal(xid, sql, principal)
         }
     }
 
@@ -2333,12 +2355,19 @@ impl Engine {
     /// the embedded path, `user = None`) skip RLS entirely — if `user` is
     /// `None` or is an effective superuser, `apply_rls` is not called, so
     /// policies with `CurrentUser` cannot accidentally block the admin path.
-    fn execute_sql_inner_as(
+    ///
+    /// Auth seam: mirrors the pre-seam `execute_sql_inner_as(xid, sql, user)`
+    /// exactly, additionally threading `principal.claims`/`principal.roles`
+    /// into the `ExecCtx` used for execution. Those two fields are inert here
+    /// — RLS and `current_user()` substitution still key off
+    /// `principal.subject` alone, so behavior is unchanged.
+    fn execute_sql_inner_as_principal(
         &self,
         xid: Xid,
         sql: &str,
-        user: Option<&str>,
+        principal: &AuthPrincipal,
     ) -> Result<Vec<ExecResult>> {
+        let user = principal.subject.as_deref();
         let skip_rls = user
             .map(|u| self.is_effective_superuser(Some(u)))
             .unwrap_or(true); // None == embedded/superuser → skip RLS
@@ -2364,9 +2393,10 @@ impl Engine {
             }
             let dml_table = plan_dml_table(&plan).map(|s| s.to_owned());
             let is_ddl = plan_is_schema_ddl(&plan);
-            // Thread user identity through ExecCtx so exec_insert can
-            // substitute CurrentUser in INSERT policy checks.
-            let result = self.execute_one_plan_as(xid, plan, user);
+            // Thread the principal through ExecCtx so exec_insert can
+            // substitute CurrentUser in INSERT policy checks (and so
+            // auth_claims/auth_roles ride along, inert, for later work).
+            let result = self.execute_one_plan_as(xid, plan, principal);
             match result {
                 Ok(result) => {
                     self.note_dml_result(&result, dml_table.as_deref());
@@ -2384,17 +2414,18 @@ impl Engine {
         Ok(results)
     }
 
-    /// Like `execute_one_plan_inner` but threads `current_user` through the
-    /// `ExecCtx` for INSERT policy checks (item-24 Z6).
+    /// Like `execute_one_plan_inner` but threads the auth principal through
+    /// the `ExecCtx` for INSERT policy checks (item-24 Z6) and, inertly, for
+    /// later claim/role-aware policy work (auth seam).
     fn execute_one_plan_as(
         &self,
         xid: Xid,
         plan: LogicalPlan,
-        user: Option<&str>,
+        principal: &AuthPrincipal,
     ) -> Result<ExecResult> {
         let latency_hist = self.stmt_latency_for(&plan);
         let started = latency_hist.map(|_| std::time::Instant::now());
-        let result = self.execute_one_plan_inner_as(xid, plan, user);
+        let result = self.execute_one_plan_inner_as(xid, plan, principal);
         if let (Some(hist), Some(started)) = (latency_hist, started) {
             hist.record(started.elapsed().as_micros() as u64);
         }
@@ -2405,20 +2436,20 @@ impl Engine {
         &self,
         xid: Xid,
         plan: LogicalPlan,
-        user: Option<&str>,
+        principal: &AuthPrincipal,
     ) -> Result<ExecResult> {
-        self.execute_one_plan_inner_as_with_scope(xid, plan, user, false)
+        self.execute_one_plan_inner_as_with_scope(xid, plan, principal, false)
     }
 
     fn execute_one_plan_inner_as_with_scope(
         &self,
         xid: Xid,
         plan: LogicalPlan,
-        user: Option<&str>,
+        principal: &AuthPrincipal,
         in_explicit_txn: bool,
     ) -> Result<ExecResult> {
         let page_size = self.page_size;
-        let current_user = user.map(|u| u.to_owned());
+        let current_user = principal.subject.clone();
         let shared = self.stmt_uses_shared_catalog(&plan);
         if shared {
             let catalog = cat_read(&self.catalog);
@@ -2438,6 +2469,8 @@ impl Engine {
                 hnsw_vec_caches: Some(&self.hnsw_vec_caches),
                 authz: Some(&self.authz),
                 current_user: current_user.clone(),
+                auth_claims: principal.claims.clone(),
+                auth_roles: principal.roles.clone(),
                 hnsw_tx: self.hnsw_worker_tx.lock().unwrap().clone(),
                 in_explicit_txn,
                 near_lightweight_snaps: Some(&self.near_lightweight_snaps),
@@ -2461,6 +2494,8 @@ impl Engine {
                 hnsw_vec_caches: Some(&self.hnsw_vec_caches),
                 authz: Some(&self.authz),
                 current_user,
+                auth_claims: principal.claims.clone(),
+                auth_roles: principal.roles.clone(),
                 hnsw_tx: self.hnsw_worker_tx.lock().unwrap().clone(),
                 in_explicit_txn,
                 near_lightweight_snaps: Some(&self.near_lightweight_snaps),
@@ -2660,6 +2695,8 @@ impl Engine {
                 hnsw_vec_caches: Some(&self.hnsw_vec_caches),
                 authz: Some(&self.authz),
                 current_user: None,
+                auth_claims: Default::default(),
+                auth_roles: Vec::new(),
                 hnsw_tx,
                 in_explicit_txn,
                 near_lightweight_snaps: Some(&self.near_lightweight_snaps),
@@ -2683,6 +2720,8 @@ impl Engine {
                 hnsw_vec_caches: Some(&self.hnsw_vec_caches),
                 authz: Some(&self.authz),
                 current_user: None,
+                auth_claims: Default::default(),
+                auth_roles: Vec::new(),
                 hnsw_tx,
                 in_explicit_txn,
                 near_lightweight_snaps: Some(&self.near_lightweight_snaps),
@@ -2778,6 +2817,8 @@ impl Engine {
             hnsw_vec_caches: Some(&self.hnsw_vec_caches),
             authz: Some(&self.authz),
             current_user: None,
+            auth_claims: Default::default(),
+            auth_roles: Vec::new(),
             hnsw_tx,
             in_explicit_txn: false,
             near_lightweight_snaps: Some(&self.near_lightweight_snaps),

@@ -794,6 +794,16 @@ pub struct ExecCtx<'a> {
     /// restriction). Set by `execute_sql_inner_as` before execution; `None`
     /// in all other paths (superuser/embedded always bypass RLS anyway).
     pub current_user: Option<String>,
+    /// Full flattened JWT claim set for the executing principal (auth seam).
+    /// Carried alongside `current_user` for forward-compat with later
+    /// claim-aware policy work; **not consumed by any executor logic yet**.
+    /// Empty in all paths that don't build an [`crate::AuthPrincipal`]
+    /// (embedded/superuser paths, unit tests building bare `ExecCtx`).
+    pub auth_claims: std::collections::BTreeMap<String, serde_json::Value>,
+    /// Roles associated with the executing principal (auth seam). Carried
+    /// alongside `current_user`/`auth_claims`; **not consumed yet** — no
+    /// role-based grant/policy logic exists. Empty everywhere today.
+    pub auth_roles: Vec<String>,
     /// Sender end of the HNSW background worker channel (item 67).
     /// `Some` on a fully-opened Engine that has called `spawn_hnsw_worker`;
     /// `None` in unit tests that build bare `ExecCtx` structs (those tests
@@ -6208,6 +6218,8 @@ mod tests {
                 hnsw_vec_caches: None,
                 authz: None,
                 current_user: None,
+                auth_claims: Default::default(),
+                auth_roles: Vec::new(),
                 hnsw_tx: None,
                 in_explicit_txn: false,
                 near_lightweight_snaps: None,

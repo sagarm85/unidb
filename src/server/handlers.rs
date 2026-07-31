@@ -342,11 +342,16 @@ fn sql_response(
 
 pub async fn post_sql(
     Extension(current_user): Extension<CurrentUser>,
+    Extension(principal): Extension<crate::AuthPrincipal>,
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<SqlRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, ApiError> {
     let user = current_user.0;
+    debug_assert_eq!(
+        principal.subject, user,
+        "CurrentUser and AuthPrincipal must carry the same subject (both come from require_jwt)"
+    );
 
     // Cursor mode is validated before anything executes (R4).
     if body.cursor {
@@ -370,12 +375,13 @@ pub async fn post_sql(
             .engine
             .authorize_sql(user.clone(), body.sql.clone())
             .await?;
-        // Use execute_sql_as to carry the user identity so the RLS bypass for
-        // superusers and the no-sub path applies correctly (item 103).
+        // Use execute_sql_as_principal (auth seam) to carry the full
+        // principal so the RLS bypass for superusers and the no-sub path
+        // applies correctly (item 103); claims/roles ride along inert.
         let result = if body.params.is_empty() {
             state
                 .engine
-                .execute_sql_as(user.clone(), xid, body.sql)
+                .execute_sql_as_principal(principal.clone(), xid, body.sql)
                 .await
         } else {
             let params: Vec<_> = body.params.iter().map(json_to_literal).collect();
@@ -398,8 +404,8 @@ pub async fn post_sql(
 
     // ── one-shot statement ──
     // Auth DDL (CREATE USER / GRANT / REVOKE, P6.e) isn't `sqlparser`
-    // grammar — route it through `execute_sql_as`, which intercepts it and
-    // requires superuser.
+    // grammar — route it through `execute_sql_as_principal`, which
+    // intercepts it and requires superuser.
     if crate::authz::parse_auth_stmt(&body.sql)
         .map_err(ApiError::from)?
         .is_some()
@@ -407,7 +413,7 @@ pub async fn post_sql(
         let xid = state.engine.begin(None).await?;
         let result = state
             .engine
-            .execute_sql_as(user.clone(), xid, body.sql.clone())
+            .execute_sql_as_principal(principal.clone(), xid, body.sql.clone())
             .await;
         let results = finish(&state.engine, xid, result).await?;
         return sql_response(&state, user, results, body.cursor);
@@ -441,12 +447,13 @@ pub async fn post_sql(
             .execute_sql_read_as(user.clone(), body.sql)
             .await?
     } else {
-        // Use execute_sql_as so the RLS bypass logic for superusers/no-sub
-        // callers is applied correctly on the writer path (item 103).
+        // Use execute_sql_as_principal so the RLS bypass logic for
+        // superusers/no-sub callers is applied correctly on the writer path
+        // (item 103); claims/roles ride along inert (auth seam).
         let xid = state.engine.begin(isolation).await?;
         let result = state
             .engine
-            .execute_sql_as(user.clone(), xid, body.sql)
+            .execute_sql_as_principal(principal.clone(), xid, body.sql)
             .await;
         finish(&state.engine, xid, result).await?
     };

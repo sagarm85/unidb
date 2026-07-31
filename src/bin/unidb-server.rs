@@ -184,7 +184,7 @@ async fn main() {
     // Milestone-18 "verify-only" is unchanged when this flag is absent).
     let dev_login = std::env::var("UNIDB_DEV_LOGIN")
         .ok()
-        .map(|v| v == "1" || v.to_ascii_lowercase() == "true")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     if dev_login {
         tracing::warn!(

@@ -99,8 +99,11 @@ struct Claims {
     /// authenticated client, treated as the implicit superuser (backward
     /// compatible with pre-P6.e tokens that carry no `sub`).
     sub: Option<String>,
+    /// Every other claim the token carries (auth seam). Retained — no longer
+    /// discarded — so `AuthPrincipal::claims` can carry the full flattened
+    /// claim set down into the engine. Still unconsumed by any policy logic.
     #[serde(flatten)]
-    _extra: std::collections::HashMap<String, serde_json::Value>,
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 /// The authenticated user carried through request extensions (P6.e). `None`
@@ -154,9 +157,15 @@ pub async fn require_jwt(
             // Carry the authenticated username to handlers for per-user
             // privilege checks (P6.e).
             let mut request = request;
+            let principal = crate::AuthPrincipal {
+                subject: data.claims.sub.clone(),
+                claims: data.claims.extra.into_iter().collect(),
+                roles: Vec::new(),
+            };
             request
                 .extensions_mut()
                 .insert(CurrentUser(data.claims.sub));
+            request.extensions_mut().insert(principal);
             next.run(request).await
         }
         Err(e) => unauthorized(format!("invalid token: {e}")),
