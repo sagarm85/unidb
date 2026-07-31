@@ -485,6 +485,26 @@ be raised with the user directly, not assumed.
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-07-31 — Supabase-parity backlog filed (items 120–123) + studio G-panels plan
+
+Planning/docs-only session (no engine code). User asked, via a WhatsApp-thread
+screenshot, what unidb still lacks to be "like Supabase" and to file the pending
+work as parallelizable specs. Audited the actual surface across BOTH repos
+(`sagarm85/unidb` + newly-attached `sagarm85/unidb-studio`) rather than trusting
+the README: verified token→RLS IS wired (`sub`→`CurrentUser`→`apply_rls`), that
+`post_auth_login` is passwordless *identification* (no credential verify), that
+storage already ships presign URLs + public/private buckets, and that unidb-studio
+already ships every panel EXCEPT auth/policies/roles/API-docs (their backends don't
+exist). Framing: unidb has the Postgres *security core*; "Supabase" is the BaaS
+layer above it (auth service, `auth.uid()`/`auth.jwt()`/role-in-RLS, auto REST API).
+Filed: **120** umbrella roadmap (workstreams A–I, P0 = auth core + RLS↔token +
+auto-API, 3-wave parallel plan), **121** auth core (A), **122** RLS↔token binding
+(B, folds parked item 112), **123** auto REST API (C). Registered in
+`backlog_index.md` (next→124), added a "Supabase parity" note to Next-up. Matching
+studio plan `docs/AUTH_POLICY_PANELS_PLAN.md` on the studio's mirror branch. Both
+lints green (backlog OK 99 files; docs OK). Nothing implemented — awaiting the
+user's go on which Wave-1 track(s) to build first (P0 critical path = 121 + 122).
+
 ### 2026-07-24 — item 106 Unit 3 (re-rank decode-pushdown) measured + merged
 
 Rebased Unit 3 on current main (8a86b02, post-#210). Same-session before/after on
