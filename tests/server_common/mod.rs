@@ -21,7 +21,11 @@ use jsonwebtoken::{encode, EncodingKey, Header};
 use serde::Serialize;
 use tempfile::TempDir;
 use unidb::server::{
-    auth::JwtConfig, engine_handle::EngineHandle, router::build_router, AppState, SessionConfig,
+    auth::JwtConfig,
+    engine_handle::EngineHandle,
+    rate_limit::AuthRateLimiter,
+    router::{build_router, build_router_with_rate_limiter},
+    AppState, SessionConfig,
 };
 
 pub const TEST_JWT_SECRET: &str = "test-secret-for-unidb-server-integration-tests";
@@ -75,7 +79,11 @@ impl TestServer {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server_task = tokio::spawn(async move {
-            let _ = axum::serve(listener, router).await;
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
         });
 
         Self {
@@ -105,7 +113,56 @@ impl TestServer {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server_task = tokio::spawn(async move {
-            let _ = axum::serve(listener, router).await;
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
+        });
+
+        Self {
+            addr,
+            data_dir,
+            log_dir,
+            _tempdir: tempdir,
+            _server_task: server_task,
+        }
+    }
+
+    /// [`TestServer::spawn_with_dev_login`] plus an explicit
+    /// [`AuthRateLimiter`] (item 121 I1) — used by the rate-limit test
+    /// matrix so windows can be milliseconds-short and deterministic instead
+    /// of racing real `UNIDB_AUTH_RATE_LIMIT`/`_WINDOW_SECS` env-var defaults
+    /// (which are process-global and would otherwise race concurrently
+    /// running tests in the same test binary).
+    pub async fn spawn_with_dev_login_and_rate_limit(limiter: AuthRateLimiter) -> Self {
+        let tempdir = tempfile::tempdir().unwrap();
+        let data_dir = tempdir.path().to_path_buf();
+        let log_dir = data_dir.join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let engine = EngineHandle::spawn(tempdir.path(), 0).unwrap();
+        let jwt_config = JwtConfig::with_dev_login(TEST_JWT_SECRET);
+        let state = AppState::with_config(Arc::new(engine), SessionConfig::default())
+            .with_log_dir(log_dir.clone())
+            .with_dev_login(jwt_config.clone())
+            .with_allow_signup(true);
+        let (prometheus_layer, metric_handle) = metrics_pair().clone();
+        let router = build_router_with_rate_limiter(
+            state,
+            jwt_config,
+            prometheus_layer,
+            metric_handle,
+            limiter,
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
         });
 
         Self {
@@ -136,7 +193,11 @@ impl TestServer {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server_task = tokio::spawn(async move {
-            let _ = axum::serve(listener, router).await;
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
         });
 
         Self {
@@ -167,7 +228,11 @@ impl TestServer {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server_task = tokio::spawn(async move {
-            let _ = axum::serve(listener, router).await;
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
         });
 
         Self {
@@ -199,7 +264,11 @@ impl TestServer {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server_task = tokio::spawn(async move {
-            let _ = axum::serve(listener, router).await;
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
         });
 
         Self {

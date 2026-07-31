@@ -44,6 +44,14 @@
 //!   `UNIDB_DEV_LOGIN` are ignored (with a warning logged) if also set. The
 //!   configured public key is served, JWK-encoded, at `GET
 //!   /.well-known/jwks.json`.
+//! - `UNIDB_AUTH_RATE_LIMIT` (item 121 I1, default `10`): max attempts per
+//!   window for `POST /auth/login`/`signup`/`refresh` (the passwordless
+//!   brute-force targets — see `server::rate_limit`'s module doc), keyed by
+//!   client IP (peer address; `X-Forwarded-For` is deliberately not
+//!   trusted — no reverse-proxy config exists to validate it). Set to `0`
+//!   to disable rate limiting entirely.
+//! - `UNIDB_AUTH_RATE_WINDOW_SECS` (default `60`): the window length backing
+//!   `UNIDB_AUTH_RATE_LIMIT`.
 //!
 //! Logging goes to **both** stdout (so `docker logs`/interactive/systemd
 //! journal capture still works unchanged) and a rolling daily file under
@@ -311,8 +319,12 @@ async fn main() {
             .parse()
             .unwrap_or_else(|e| panic!("invalid UNIDB_BIND_ADDR {bind_addr}: {e}"));
         tracing::info!(addr = %bind_addr, data_dir = %data_dir, log_dir = %log_dir, tls = true, "unidb-server listening (HTTPS)");
+        // `into_make_service_with_connect_info` (rather than plain
+        // `into_make_service`) so `ConnectInfo<SocketAddr>` resolves inside
+        // `server::rate_limit::rate_limit_auth` (item 121 I1) — the peer
+        // address is the rate limiter's client-IP key.
         axum_server::bind_rustls(addr, config)
-            .serve(router.into_make_service())
+            .serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
             .expect("server error");
     } else {
@@ -320,10 +332,14 @@ async fn main() {
             .await
             .unwrap_or_else(|e| panic!("failed to bind {bind_addr}: {e}"));
         tracing::info!(addr = %bind_addr, data_dir = %data_dir, log_dir = %log_dir, tls = false, "unidb-server listening (HTTP)");
-        axum::serve(listener, router)
-            .with_graceful_shutdown(shutdown_signal())
-            .await
-            .expect("server error");
+        // Same connect-info wiring as the TLS branch above.
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .expect("server error");
     }
 
     tracing::info!("unidb-server shut down cleanly");

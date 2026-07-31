@@ -77,9 +77,13 @@ platform; **P2** = ecosystem.
 - **G — Studio panels:** G1 Authentication panel (users CRUD/invite/ban/reset) ·
   G2 Policies editor · G3 Roles/grants UI · G4 API-docs panel.
 - **H — SDK:** H1 JS/TS SDK (auth+data+realtime) · H2 session persistence + auto-refresh.
-- **I — Hardening/ops:** I1 auth rate-limit/brute-force (P0, ships with A) · I2
-  CAPTCHA · I3 secrets vault · I4 migrations tooling · I5 connection pooling · I6
-  management API · I7 edge functions.
+- **I — Hardening/ops:** I1 auth rate-limit/brute-force — **SHIPPED** (in-memory
+  fixed-window limiter, `src/server/rate_limit.rs`, over `POST /auth/login`,
+  `/auth/signup`, `/auth/refresh`; keyed by client IP + route + optional
+  username; `UNIDB_AUTH_RATE_LIMIT`/`UNIDB_AUTH_RATE_WINDOW_SECS`; see
+  `docs/REST_API.md`'s "Auth rate limiting" section) · I2 CAPTCHA · I3 secrets
+  vault · I4 migrations tooling · I5 connection pooling · I6 management API ·
+  I7 edge functions.
 
 ## Parallel execution plan
 

@@ -1362,13 +1362,36 @@ When the server verifies HS256 only (no `UNIDB_JWT_PUBLIC_KEY` configured):
 The HS256 shared secret is never published here — there is nothing to publish
 for a symmetric key, and this route only ever serializes a public key.
 
+#### Auth rate limiting (item 121 I1)
+
+`POST /auth/login`, `/auth/signup`, and `/auth/refresh` — the only routes
+reachable with no bearer token at all — are brute-force targets, so all three
+sit behind a shared, in-memory, per-key rate limiter (a hand-rolled fixed
+window; no external rate-limit crate). **Read/data routes, `/sql`,
+`/metrics`, `/.well-known/jwks.json`, `/auth/meta`, and `/auth/logout` are
+never rate-limited.**
+
+- **Key:** the client's TCP peer IP address (`X-Forwarded-For` is
+  deliberately **not** trusted — it is client-supplied and this server has no
+  trusted-proxy configuration to validate it; see `src/server/rate_limit.rs`'s
+  module doc), plus the route path, plus — when the JSON body carries a
+  `username` field (login/signup) — the username itself, so two accounts
+  behind the same NAT/proxy IP don't share one bucket. A rejected (401/403)
+  attempt counts toward the limit exactly like an accepted one.
+- **Config:** `UNIDB_AUTH_RATE_LIMIT` (max attempts per window, default `10`)
+  and `UNIDB_AUTH_RATE_WINDOW_SECS` (window length in seconds, default `60`).
+  Set `UNIDB_AUTH_RATE_LIMIT=0` to disable rate limiting entirely.
+- **Response when exceeded:** `429 Too Many Requests`, body
+  `{ "error": "...", "code": "RATE_LIMITED" }`, plus a `Retry-After: <seconds>`
+  header (time left in the current window, rounded up to at least 1).
+
 #### `POST /auth/login` — password login
 
 > Requires a signing key: `UNIDB_JWT_SIGNING_KEY` (item 121 A5, the
 > first-class production path) or `UNIDB_DEV_LOGIN=1` (pre-A5, still
 > supported). When neither is configured — or `UNIDB_JWT_PUBLIC_KEY`
 > (asymmetric verify mode, item 121 A6) is set instead — the route returns
-> the "issuance disabled" error. Pair with rate-limiting (item I1) before
+> the "issuance disabled" error. Rate-limited (item I1, see above) before
 > production exposure.
 
 Verifies the supplied password against the user's stored **argon2id** credential
@@ -1396,7 +1419,8 @@ the miss paths, so there is no user-enumeration or timing oracle. `open_mode`
 > stores only its SHA-256 hash, never the raw token.
 
 **Error responses:** `401 INVALID_CREDENTIALS` (unknown user / wrong password /
-no credential — uniform); issuance-disabled error when no signing key is set.
+no credential — uniform); issuance-disabled error when no signing key is set;
+`429 RATE_LIMITED` (item I1, see above) once the per-key attempt limit is hit.
 
 #### `POST /auth/signup` — self-service signup
 
@@ -1413,7 +1437,7 @@ after the signing-key check, so a disabled issuer never leaves an orphaned accou
 { "username": "bob", "password": "…" }
 ```
 **Response** `200 OK`: same shape as `POST /auth/login`. **Errors:** `404` when
-signup disabled; `409`/error on duplicate username.
+signup disabled; `409`/error on duplicate username; `429 RATE_LIMITED` (item I1).
 
 #### `POST /auth/refresh` — exchange a refresh token
 
@@ -1426,7 +1450,7 @@ access token **and a rotated refresh token** (the old one is revoked). Item 121 
 { "refresh_token": "<opaque-hex>" }
 ```
 **Response** `200 OK`: same shape as `POST /auth/login` (new access + new refresh).
-**Error:** `401 INVALID_REFRESH_TOKEN`.
+**Errors:** `401 INVALID_REFRESH_TOKEN`; `429 RATE_LIMITED` (item I1).
 
 #### `POST /auth/logout` — revoke a session
 

@@ -29,13 +29,41 @@ use axum::{
 use axum_prometheus::{metrics_exporter_prometheus::PrometheusHandle, PrometheusMetricLayer};
 use tower_http::{cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer};
 
-use crate::server::{auth::JwtConfig, bulk, handlers, sse, storage, AppState};
+use crate::server::{
+    auth::JwtConfig, bulk, handlers, rate_limit::AuthRateLimiter, sse, storage, AppState,
+};
 
+/// Production entry point: reads `UNIDB_AUTH_RATE_LIMIT` /
+/// `UNIDB_AUTH_RATE_WINDOW_SECS` for the auth-mutation rate limiter (item
+/// 121 I1), mirroring how [`router_timeout`] reads its own env var
+/// internally rather than taking it as a parameter. Tests that need a fast,
+/// deterministic limiter (instead of racing real env-var defaults) use
+/// [`build_router_with_rate_limiter`] directly.
 pub fn build_router(
     state: AppState,
     jwt_config: JwtConfig,
     prometheus_layer: PrometheusMetricLayer<'static>,
     metric_handle: PrometheusHandle,
+) -> Router {
+    build_router_with_rate_limiter(
+        state,
+        jwt_config,
+        prometheus_layer,
+        metric_handle,
+        AuthRateLimiter::from_env(),
+    )
+}
+
+/// [`build_router`] with an explicit [`AuthRateLimiter`] — the real
+/// implementation. Kept separate so integration tests can inject a
+/// short-window limiter without mutating process-global environment
+/// variables (which would race other tests in the same test binary).
+pub fn build_router_with_rate_limiter(
+    state: AppState,
+    jwt_config: JwtConfig,
+    prometheus_layer: PrometheusMetricLayer<'static>,
+    metric_handle: PrometheusHandle,
+    auth_rate_limiter: AuthRateLimiter,
 ) -> Router {
     // Item 121 A6: computed once, before `jwt_config` is moved into the
     // `require_jwt` middleware below — the JWKS document never changes at
@@ -162,12 +190,27 @@ pub fn build_router(
     //   (item 121 A5, UNIDB_JWT_SIGNING_KEY) as well as UNIDB_DEV_LOGIN=1.
     let auth_public = Router::new()
         .route("/auth/meta", get(handlers::get_auth_meta))
+        .route("/auth/logout", post(handlers::post_auth_logout))
+        .with_state(state.clone());
+
+    // item 121 I1: brute-force protection over exactly the three password-auth
+    // mutation routes — never /sql, /metrics, /.well-known/jwks.json,
+    // /auth/meta, or any read route (see `rate_limit.rs`'s module doc). The
+    // limiter is its own `from_fn_with_state` layer (same shape as `require_jwt`
+    // above), keyed by client IP via `ConnectInfo<SocketAddr>` — both
+    // `unidb-server.rs` and the test harness serve this router through
+    // `into_make_service_with_connect_info::<SocketAddr>()` so that extractor
+    // resolves.
+    let auth_rate_limited = Router::new()
         .route("/auth/login", post(handlers::post_auth_login))
         // item 121 A3: POST /auth/signup — 404s unless UNIDB_ALLOW_SIGNUP=1.
         .route("/auth/signup", post(handlers::post_auth_signup))
         // item 121 A4: refresh tokens + sessions + logout.
         .route("/auth/refresh", post(handlers::post_auth_refresh))
-        .route("/auth/logout", post(handlers::post_auth_logout))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_rate_limiter,
+            crate::server::rate_limit::rate_limit_auth,
+        ))
         .with_state(state.clone());
 
     let metrics_state = state;
@@ -209,6 +252,7 @@ pub fn build_router(
         .merge(protected)
         .merge(public)
         .merge(auth_public)
+        .merge(auth_rate_limited)
         .layer(prometheus_layer)
         .layer(TraceLayer::new_for_http())
         // Outermost app layer (item 22, L2): assign a `request_id` before auth

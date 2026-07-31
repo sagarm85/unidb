@@ -31,6 +31,7 @@ pub mod error;
 pub mod event_format;
 pub mod handlers;
 pub mod logs;
+pub mod rate_limit;
 pub mod router;
 pub mod sse;
 pub mod storage;
