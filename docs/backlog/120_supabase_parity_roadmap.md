@@ -64,7 +64,8 @@ platform; **P2** = ecosystem.
   dev-only) · A6 asymmetric JWT (RS256/ES256) + JWKS + rotation. See 121.
 - **B — RLS↔token:** B1 `auth.uid()` · B2 `auth.jwt()->>'claim'` · B3 built-in
   `anon`/`authenticated`/`service_role` · B4 role-scoped policies (`... TO <role>`)
-  · B5 column-level security (item 112, parked). See 122.
+  · B5 column-level security (item 112, shipped 2026-07-31). See 122. Workstream
+  B is now fully shipped.
 - **C — Auto API:** C1 `/rest/v1/<table>?col=eq.val` (P0) · C2 embedded FK
   expansion · C3 OpenAPI/API-docs · C4 GraphQL (P2). See 123.
 - **D — External identity:** D1 OAuth/social · D2 magic-link/email-OTP · D3
@@ -77,9 +78,13 @@ platform; **P2** = ecosystem.
 - **G — Studio panels:** G1 Authentication panel (users CRUD/invite/ban/reset) ·
   G2 Policies editor · G3 Roles/grants UI · G4 API-docs panel.
 - **H — SDK:** H1 JS/TS SDK (auth+data+realtime) · H2 session persistence + auto-refresh.
-- **I — Hardening/ops:** I1 auth rate-limit/brute-force (P0, ships with A) · I2
-  CAPTCHA · I3 secrets vault · I4 migrations tooling · I5 connection pooling · I6
-  management API · I7 edge functions.
+- **I — Hardening/ops:** I1 auth rate-limit/brute-force — **SHIPPED** (in-memory
+  fixed-window limiter, `src/server/rate_limit.rs`, over `POST /auth/login`,
+  `/auth/signup`, `/auth/refresh`; keyed by client IP + route + optional
+  username; `UNIDB_AUTH_RATE_LIMIT`/`UNIDB_AUTH_RATE_WINDOW_SECS`; see
+  `docs/REST_API.md`'s "Auth rate limiting" section) · I2 CAPTCHA · I3 secrets
+  vault · I4 migrations tooling · I5 connection pooling · I6 management API ·
+  I7 edge functions.
 
 ## Parallel execution plan
 

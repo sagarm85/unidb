@@ -146,6 +146,9 @@ pub fn virtual_schema(name: &str) -> Option<Vec<ColumnRef>> {
             ("role", ColumnType::Text),
             ("table_name", ColumnType::Text),
             ("operation", ColumnType::Text),
+            // item 112: "ALL" for a whole-table grant, else a comma-joined
+            // list of exactly the granted columns.
+            ("columns", ColumnType::Text),
         ],
         "unidb_catalog.policies" => &[
             ("name", ColumnType::Text),
@@ -229,7 +232,7 @@ pub fn virtual_rows(
 
     let rows = match name.to_ascii_lowercase().as_str() {
         "information_schema.tables" => tables_rows(&visible),
-        "information_schema.columns" => columns_rows(&visible),
+        "information_schema.columns" => columns_rows(&visible, authz, user),
         "information_schema.table_constraints" => table_constraints_rows(&visible, catalog),
         "information_schema.key_column_usage" => key_column_usage_rows(&visible, catalog),
         "information_schema.referential_constraints" => {
@@ -409,15 +412,48 @@ fn tables_rows(defs: &[&TableDef]) -> Vec<Vec<Literal>> {
         .collect()
 }
 
-fn columns_rows(defs: &[&TableDef]) -> Vec<Vec<Literal>> {
+/// `information_schema.columns` (item 111, extended by item 112). `authz`/
+/// `user` mirror `virtual_rows`'s own per-caller visibility gate: a named
+/// non-superuser whose `SELECT` grant on a given table is column-scoped sees
+/// only the columns in that grant (item 112 scope item 5) — a whole-table
+/// grant, superuser, embedded (`None`), or bootstrap/open mode all see every
+/// column, exactly as before item 112. `ordinal_position` always reflects the
+/// column's real position in the table (every non-dropped column, whether or
+/// not it is visible to this caller) — hiding a column for privilege reasons
+/// never renumbers the columns that remain visible, matching Postgres (a
+/// column's `attnum` doesn't change because you lack privilege on it).
+fn columns_rows(
+    defs: &[&TableDef],
+    authz: Option<&crate::authz::RoleStore>,
+    user: Option<&str>,
+) -> Vec<Vec<Literal>> {
     let mut rows = Vec::new();
     for d in defs {
+        // Item 112: the set of columns this caller may see for `d`, or
+        // `None` when unrestricted (every non-superuser/bootstrap case where
+        // the SELECT grant is whole-table — the overwhelmingly common case,
+        // and the only one pre-112 callers can ever hit, so behavior there
+        // is byte-for-byte unchanged).
+        let allowed: Option<std::collections::BTreeSet<String>> = match (user, authz) {
+            (Some(u), Some(az)) if az.has_users() && !az.is_superuser(u) => {
+                match az.column_grant(u, &d.name, crate::authz::Privilege::Select) {
+                    crate::authz::ColumnGrant::Columns(set) => Some(set),
+                    crate::authz::ColumnGrant::All | crate::authz::ColumnGrant::None => None,
+                }
+            }
+            _ => None,
+        };
         let mut ordinal = 0i64;
         for c in &d.columns {
             if c.dropped {
                 continue;
             }
             ordinal += 1;
+            if let Some(set) = &allowed {
+                if !set.contains(&c.name) {
+                    continue;
+                }
+            }
             let default = match &c.constraints.default {
                 Some(lit) => t(&render_default(lit)),
                 None => Literal::Null,
@@ -647,13 +683,21 @@ fn roles_rows(authz: &crate::authz::RoleStore) -> Vec<Vec<Literal>> {
 }
 
 /// `unidb_catalog.grants` — one row per (grantee, table, privilege) triple.
+/// `columns` (item 112) is `"ALL"` for a whole-table grant, else a
+/// comma-joined list of exactly the granted columns.
 fn grants_rows(authz: &crate::authz::RoleStore) -> Vec<Vec<Literal>> {
     let mut grants = authz.grants();
     // Stable order: (role, table, op).
     grants.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
     grants
         .into_iter()
-        .map(|(role, table, priv_)| vec![t(&role), t(&table), t(priv_.as_str())])
+        .map(|(role, table, priv_, cols)| {
+            let cols_str = match cols {
+                None => "ALL".to_string(),
+                Some(list) => list.join(","),
+            };
+            vec![t(&role), t(&table), t(priv_.as_str()), t(&cols_str)]
+        })
         .collect()
 }
 

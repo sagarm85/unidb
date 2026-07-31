@@ -112,10 +112,23 @@ REVOKE reader FROM analyst;
   superuser (backward compatible). Auth DDL + schema DDL require superuser.
 - All auth DDL and named-user access decisions are written to `audit.log`
   (one JSON line each).
-- **Dev-only login (item 100):** `UNIDB_DEV_LOGIN=1` enables
-  `POST /auth/login` — **passwordless** token issuance for local dev/demo
-  only. It logs a WARN at startup for a reason: **never set it in
-  production.** Absent (the default), the server stays verify-only.
+- **Token issuance (items 100/121):** `POST /auth/login` verifies a real
+  argon2id password credential (item 121 A1/A2 — no longer passwordless) and
+  needs a signing key configured to hand back a token:
+  - `UNIDB_JWT_SIGNING_KEY` (item 121 A5) — the **production** path: an
+    explicit HS256 signing secret, independent of the dev flag below. Logs an
+    INFO at startup.
+  - `UNIDB_DEV_LOGIN=1` (pre-A5, still supported) — uses `UNIDB_JWT_SECRET` as
+    the signing secret. Logs a WARN at startup as a reminder this predates the
+    first-class production path.
+  - Absent both (the default), the server stays verify-only — no issuance.
+- **Asymmetric verification (item 121 A6):** `UNIDB_JWT_PUBLIC_KEY` (PEM, RSA
+  or EC/P-256, auto-detected) switches verification to RS256/ES256 for tokens
+  minted by an external IdP, and **disables local issuance outright** (a
+  locally HS256-signed token could never verify against a configured
+  asymmetric public key) — `UNIDB_JWT_SIGNING_KEY`/`UNIDB_DEV_LOGIN` are
+  ignored (with a warning logged) if also set. The public key is served at
+  `GET /.well-known/jwks.json` for external verifiers/SDKs.
 
 ## 6. Security (P6.f)
 

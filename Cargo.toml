@@ -44,7 +44,10 @@ tokio = { version = "1.52", optional = true, features = ["sync", "rt", "rt-multi
 axum = { version = "0.8", optional = true }
 tower = { version = "0.5", optional = true }
 tower-http = { version = "0.7", optional = true, features = ["trace", "cors", "timeout"] }
-jsonwebtoken = { version = "10", optional = true, default-features = false, features = ["aws_lc_rs"] }
+# item 121, A6: "use_pem" enables DecodingKey::from_rsa_pem/from_ec_pem and
+# EncodingKey::from_rsa_pem/from_ec_pem (RS256/ES256 asymmetric JWT), in
+# addition to the existing HS256 "aws_lc_rs" shared-secret path.
+jsonwebtoken = { version = "10", optional = true, default-features = false, features = ["aws_lc_rs", "use_pem"] }
 metrics = { version = "0.24", optional = true }
 metrics-exporter-prometheus = { version = "0.18", optional = true, default-features = false }
 axum-prometheus = { version = "0.10", optional = true }
@@ -56,6 +59,13 @@ axum-server = { version = "0.7", optional = true, features = ["tls-rustls"] }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["aws_lc_rs"] }
 # R4: `POST /rows/batch` carries opaque row bytes as base64 in JSON. Server-only.
 base64 = { version = "0.22", optional = true }
+# Item 123 (Workstream C1): parses `/rest/v1/<table>` query strings
+# (`col=eq.val&select=...&order=...`) preserving repeated keys, which axum's
+# `Query<HashMap<_,_>>`/`serde` extractors can't (a `HashMap` collapses
+# duplicate keys). Already a transitive dependency of `axum`/`serde_urlencoded`
+# (see `Cargo.lock`), so this adds no new supply-chain surface — just exposes
+# it directly to `server::rest_resource`. Server-only.
+form_urlencoded = { version = "1", optional = true }
 
 [features]
 server = [
@@ -63,6 +73,7 @@ server = [
     "dep:jsonwebtoken", "dep:metrics", "dep:metrics-exporter-prometheus",
     "dep:axum-prometheus", "dep:async-stream", "dep:futures-util",
     "dep:tracing-appender", "dep:axum-server", "dep:rustls", "dep:base64",
+    "dep:form_urlencoded",
     # Item 22, L1: JSON-lines log formatting. Enabled only under `server` so the
     # default embedded build's `tracing-subscriber` stays minimal (the `json`
     # feature just pulls serde_json — already present — into the subscriber).
@@ -78,7 +89,7 @@ unidb-storage = { path = "unidb-storage" }
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
-jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 futures-util = "0.3"
 # Phase 4 differential correctness: join/aggregate/subquery results are checked
 # against SQLite on the same data. `bundled` compiles its own SQLite C library
@@ -309,4 +320,10 @@ required-features = ["server"]
 [[test]]
 name = "server_batch_sql"
 path = "tests/server_batch_sql.rs"
+required-features = ["server"]
+
+# Item 123 (Workstream C1): auto REST API (`/rest/v1/*`) integration tests.
+[[test]]
+name = "server_rest"
+path = "tests/server_rest.rs"
 required-features = ["server"]

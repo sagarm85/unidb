@@ -485,6 +485,65 @@ be raised with the user directly, not assumed.
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-07-31 — C1 auto /rest/v1 API + OpenAPI shipped (Wave 2 begun); autonomous overnight run
+
+User went to sleep, authorized autonomous completion of well-defined items + auto-merge of
+verified PRs, with per-merge status reports. **C1 / item 123** (`742b355`): PostgREST-style
+`/rest/v1/<table>` — GET/POST/PATCH/DELETE with eq/neq/gt/gte/lt/lte/like/ilike/in/is filters,
+`select=`/`order=`/`limit`/`offset`. Injection-safe by construction: every value is a `$n`
+bind through the existing `execute_sql_params_as_principal` path (RLS + table/column grants +
+current_user/auth.uid/auth.jwt inherited, NOT re-implemented); identifiers catalog-validated +
+quoted; operators from a fixed allow-list. **C3 OpenAPI also shipped** (`GET /rest/v1/` lists
+tables → unblocks studio G4). Verified by me from clean: crash 54/54, server_rest **23/23**
+incl. injection-treated-as-data, rls_parity_with_sql, column_grant_parity_with_sql,
+no-privilege→403, unknown table/column→404, openapi-lists-tables; clippy/fmt clean. **Autonomous
+plan:** complete + merge the well-defined engine/server items (this batch PR, then E1 realtime
+auth, F1 storage per-object RLS, C2 FK-embed, maybe I4 migrations) — each a verified merged PR.
+DEFER (need user decisions/secrets or too large, leave flagged): D OAuth/OTP/MFA/email, I6
+per-project control plane, I7 edge functions, H SDK, C4 GraphQL, I2/I3/I5, G studio panels
+(studio session's job). Verify-before-merge always (crash 54/54 + suites); anything ambiguous →
+PR left open, not merged.
+
+### 2026-07-31 — batch-2 tail: I1 rate-limiting + B5 column-level grants shipped (Workstream B complete)
+
+Continued the post-#222 sequential run. **I1** (`5f7917d`): in-memory fixed-window auth
+rate limiter (`src/server/rate_limit.rs`, `Instant`-based, `Arc<Mutex<HashMap>>`) over
+`POST /auth/{login,signup,refresh}` only (keyed by IP+route+optional user); (max+1)th in a
+window → `429 RATE_LIMITED` + `Retry-After`; both 200s and 401s count; `UNIDB_AUTH_RATE_LIMIT`
+/`UNIDB_AUTH_RATE_WINDOW_SECS`. rate-limit tests 5/5, crash 54/54, auth suites unbroken.
+**B5 / item 112** (`df62290`): column-level grants — `GRANT/REVOKE <priv> (cols) ON t`,
+`GrantScope::All|Columns` (legacy grants deserialize as `All` — back-compat), enforced in
+`check_plan_privileges` at PLAN time (pre-execution, zero per-row cost, so no fast path can
+materialize an ungranted column): projection incl. `SELECT *` (requires-all), predicate/
+GROUP BY/ORDER BY/HAVING, QuerySpec join/aggregate, UPDATE targets, INSERT lists, RETURNING;
+**error-not-mask** (ungranted col → PERMISSION_DENIED, never NULL-filled); **policy-column
+exemption** (columns only in RLS-injected predicates need no caller grant); `information_schema.
+columns` filtered per grant; ambiguous unqualified join columns fail closed. item112 11/11,
+item111 5/5, authz 33/33, crash 54/54. **Workstream B (122) is now fully shipped.** Verified
+each by me from clean (`cargo clean` between builds; disk hit 97%). Remaining: **C1 — Wave 2
+auto `/rest/v1` API** (the last queued item; unblocks studio G4), then a fresh PR to main.
+Process: raise Bash `timeout` to 10 min for from-clean gate compiles; kill each agent's stray
+background full-suite run (target-lock) before verifying.
+
+### 2026-07-31 — PR #222 (items 121 A1–A4 + 122 B1–B4) MERGED to main; A5/A6 shipped to fresh branch
+
+Merged the Supabase-parity auth PR #222 (squash `333f3d1`) into main — main now has the
+full auth loop (password login/signup/refresh + `auth.uid()`/`auth.jwt()` + roles/role-scoped
+policies). Reset the designated branch onto merged main and started the batch-2 tail + Wave 2
+**sequentially** (disk-forced: usable ~38 GiB can't hold two concurrent ~30 GiB Rust builds —
+the ENOSPC that thrashed batch 1; `cargo clean` between builds; raise the Bash `timeout` to
+10 min for from-clean gate compiles rather than fighting the 2-min reaping). **121 A5/A6**
+(`68332cf`): production JWT issuer (`UNIDB_JWT_SIGNING_KEY` — issuance no longer dev-login-only);
+asymmetric verify (`UNIDB_JWT_PUBLIC_KEY` PEM, RS256/ES256 auto-detected) + public
+`GET /.well-known/jwks.json` (empty `{"keys":[]}` in HS256-only mode; a test asserts the HS256
+secret never leaks); asymmetric mode disables local HS256 issuance (documented); asymmetric
+*issuance* deferred (verify-side only — key-management story out of scope). Verified by me:
+crash 54/54, new item121_a5_a6_issuer_jwks 9/9, item121 16/16, item122 7/7, item100 9/9,
+clippy/fmt clean; docs (REST_API/README/ops_runbook/backlog) updated by the agent. Studio told
+it can now complete G1/G2/G3 against main's stable contract (G4 still waits on Wave-2 C1).
+**Sequential queue remaining:** I1 rate-limiting → B5 column grants → C1 auto `/rest/v1` API,
+then a fresh PR to main.
+
 ### 2026-07-31 — item 122 B3/B4 (built-in roles + role-scoped policies) shipped, second slice of Workstream B
 
 Sequential batch-2 continuation (Sonnet on the main tree, verified by me). **122 B3/B4**

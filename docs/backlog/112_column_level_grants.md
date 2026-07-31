@@ -1,10 +1,14 @@
 # 112 — Column-level grants (the deferred half of item 24 Z4)
 
 **Type:** Improvement
-**Status:** ⏳ NOT STARTED — filed 2026-07-22, parked until a concrete user
-need appears (RLS policies already cover row/ownership shaping; nothing in
-the Studio integration has hit a column-granularity wall). Filed now so the
-scope is decided deliberately, not rediscovered.
+**Status:** ✅ SHIPPED (2026-07-31) — implemented as item-122 Workstream B5.
+Grant vocabulary + persistence, DDL, read/write/RETURNING enforcement
+(incl. `SELECT *`/QuerySpec join shapes), the policy-column exemption,
+`information_schema.columns` filtering, and the fast-path audit are all
+done — see the session log in this repo's history for the commit(s) and the
+gate results (`cargo test --features server`, crash 54/54). Filed 2026-07-22
+so the scope was decided deliberately, not rediscovered; un-parked and
+implemented 2026-07-31.
 
 ## Status clarification (what Z4 actually was)
 
@@ -54,13 +58,30 @@ denied, not silent masking — Postgres errors, it does not NULL-fill).
    O(1) — each must be audited for a route that materializes an ungranted
    column (same class of hazard as item 24's landmine 1).
 
-## Acceptance (draft — refine at Step 0)
+## Acceptance
 
-- [ ] Step-0: enumerate every plan shape's column-reference extraction and
-      decide the policy-column exemption rule BEFORE coding.
-- [ ] Grant/revoke DDL + persistence + catalog view field.
-- [ ] Read/write/RETURNING enforcement incl. `SELECT *` and QuerySpec
+- [x] Step-0: enumerate every plan shape's column-reference extraction and
+      decide the policy-column exemption rule BEFORE coding. **Decision:**
+      `check_plan_privileges`/`check_column_privileges` run on the plan as
+      parsed from the caller's own SQL — `parse_sql_cached`'s result —
+      strictly *before* `apply_rls_with_auth` ever injects a policy
+      predicate (that happens later, inside `execute_sql_inner_as_principal`,
+      over a value this check never sees). So the policy-column exemption
+      falls out of call ordering, with no special-casing needed inside the
+      extraction code itself. Column-reference extraction: `Expr`
+      (single-table `Select`/`Update`/`Delete`/`Insert…RETURNING`) via
+      `sql::logical::collect_expr_columns`; `QExpr`/`QuerySpec` (joins,
+      aggregates, subqueries, CTEs) via `sql::query::collect_query_column_reads`,
+      which resolves qualifiers against the FROM tree and fails closed
+      (charges every candidate real table) on an unqualified/ambiguous
+      reference across ≥2 joined tables.
+- [x] Grant/revoke DDL + persistence + catalog view field.
+- [x] Read/write/RETURNING enforcement incl. `SELECT *` and QuerySpec
       shapes; error (not mask) on ungranted columns.
-- [ ] `information_schema.columns` filtered per column grants (item 111
+- [x] `information_schema.columns` filtered per column grants (item 111
       extension).
-- [ ] Fast-path audit recorded; conc matrix + full suite + crash green.
+- [x] Fast-path audit recorded (see `check_column_privileges`'s doc comment
+      in `lib.rs`): the check runs on the `LogicalPlan` before any physical
+      planning begins, so parallel scan / index-only (covering) / O(1)
+      `COUNT(*)` — all chosen later, from an already-checked plan — cannot
+      bypass it. `cargo test --test crash` stays 54/54.

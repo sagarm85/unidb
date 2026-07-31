@@ -1,8 +1,10 @@
 //! `build_router` assembles every route onto one `axum::Router`. Data-plane
-//! routes live in a `protected` sub-router wrapped with the verify-only JWT
-//! middleware (`auth::require_jwt`); `GET /metrics` lives in a separate
-//! `public` sub-router that never sees that layer — Prometheus scrapers
-//! don't carry app-level bearer tokens (see `auth.rs`'s module doc). Both
+//! routes live in a `protected` sub-router wrapped with the JWT middleware
+//! (`auth::require_jwt`, HS256 or item 121 A6's RS256/ES256 depending on
+//! config); `GET /metrics` and `GET /.well-known/jwks.json` (item 121 A6)
+//! live in a separate `public` sub-router that never sees that layer —
+//! neither a Prometheus scraper nor an external JWKS-fetching verifier
+//! carries an app-level bearer token (see `auth.rs`'s module doc). Both
 //! merge under one top-level `PrometheusMetricLayer` (so `/metrics`
 //! requests themselves are counted too) plus `tower-http`'s trace/CORS/
 //! timeout middleware.
@@ -27,14 +29,49 @@ use axum::{
 use axum_prometheus::{metrics_exporter_prometheus::PrometheusHandle, PrometheusMetricLayer};
 use tower_http::{cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer};
 
-use crate::server::{auth::JwtConfig, bulk, handlers, sse, storage, AppState};
+use crate::server::{
+    auth::JwtConfig, bulk, handlers, rate_limit::AuthRateLimiter, rest_resource, sse, storage,
+    AppState,
+};
 
+/// Production entry point: reads `UNIDB_AUTH_RATE_LIMIT` /
+/// `UNIDB_AUTH_RATE_WINDOW_SECS` for the auth-mutation rate limiter (item
+/// 121 I1), mirroring how [`router_timeout`] reads its own env var
+/// internally rather than taking it as a parameter. Tests that need a fast,
+/// deterministic limiter (instead of racing real env-var defaults) use
+/// [`build_router_with_rate_limiter`] directly.
 pub fn build_router(
     state: AppState,
     jwt_config: JwtConfig,
     prometheus_layer: PrometheusMetricLayer<'static>,
     metric_handle: PrometheusHandle,
 ) -> Router {
+    build_router_with_rate_limiter(
+        state,
+        jwt_config,
+        prometheus_layer,
+        metric_handle,
+        AuthRateLimiter::from_env(),
+    )
+}
+
+/// [`build_router`] with an explicit [`AuthRateLimiter`] — the real
+/// implementation. Kept separate so integration tests can inject a
+/// short-window limiter without mutating process-global environment
+/// variables (which would race other tests in the same test binary).
+pub fn build_router_with_rate_limiter(
+    state: AppState,
+    jwt_config: JwtConfig,
+    prometheus_layer: PrometheusMetricLayer<'static>,
+    metric_handle: PrometheusHandle,
+    auth_rate_limiter: AuthRateLimiter,
+) -> Router {
+    // Item 121 A6: computed once, before `jwt_config` is moved into the
+    // `require_jwt` middleware below — the JWKS document never changes at
+    // runtime (it mirrors whatever key material startup configured), so
+    // there is nothing to recompute per-request.
+    let jwks_document = jwt_config.jwks_document();
+
     let protected = Router::new()
         .route("/txn/begin", post(handlers::post_txn_begin))
         .route("/txn/{txn_id}/commit", post(handlers::post_txn_commit))
@@ -112,6 +149,24 @@ pub fn build_router(
             post(handlers::post_replication_slot_advance),
         )
         .route("/replication/stream", get(handlers::get_replication_stream))
+        // ── Item 123 (Workstream C1): schema-derived auto REST API ────────
+        // Same `require_jwt` layer as every other data-plane route below —
+        // RLS/table/column-grant enforcement is inherited from the engine's
+        // existing `POST /sql` enforcement path (see `rest_resource.rs`'s
+        // module doc), not re-implemented here.
+        .route(
+            "/rest/v1/{table}",
+            get(rest_resource::get_collection)
+                .post(rest_resource::post_collection)
+                .patch(rest_resource::patch_collection)
+                .delete(rest_resource::delete_collection),
+        )
+        // C3: catalog-derived OpenAPI 3 document (feeds unidb-studio's
+        // API-docs panel, G4). Mounted at both `/rest/v1` and `/rest/v1/` so
+        // neither form 404s depending on whether the client includes the
+        // trailing slash.
+        .route("/rest/v1", get(rest_resource::get_openapi))
+        .route("/rest/v1/", get(rest_resource::get_openapi))
         // ── Item 31: storage service routes (/storage/*) ──────────────────
         // All 7 routes return 503 when AppState::storage is None (unconfigured).
         // C1 list / C2 create buckets
@@ -150,43 +205,73 @@ pub fn build_router(
     // item 100: public auth routes — no JWT middleware.
     // GET /auth/meta   → blank-slate discovery (open_mode, privilege types, catalog tables).
     // POST /auth/login → real password login (item 121 A1/A2: argon2id credential
-    //   verification), still gated behind UNIDB_DEV_LOGIN=1 pending a first-class
-    //   production issuer configuration (item 121 A5).
+    //   verification); issuance is now a first-class production capability
+    //   (item 121 A5, UNIDB_JWT_SIGNING_KEY) as well as UNIDB_DEV_LOGIN=1.
     let auth_public = Router::new()
         .route("/auth/meta", get(handlers::get_auth_meta))
+        .route("/auth/logout", post(handlers::post_auth_logout))
+        .with_state(state.clone());
+
+    // item 121 I1: brute-force protection over exactly the three password-auth
+    // mutation routes — never /sql, /metrics, /.well-known/jwks.json,
+    // /auth/meta, or any read route (see `rate_limit.rs`'s module doc). The
+    // limiter is its own `from_fn_with_state` layer (same shape as `require_jwt`
+    // above), keyed by client IP via `ConnectInfo<SocketAddr>` — both
+    // `unidb-server.rs` and the test harness serve this router through
+    // `into_make_service_with_connect_info::<SocketAddr>()` so that extractor
+    // resolves.
+    let auth_rate_limited = Router::new()
         .route("/auth/login", post(handlers::post_auth_login))
         // item 121 A3: POST /auth/signup — 404s unless UNIDB_ALLOW_SIGNUP=1.
         .route("/auth/signup", post(handlers::post_auth_signup))
         // item 121 A4: refresh tokens + sessions + logout.
         .route("/auth/refresh", post(handlers::post_auth_refresh))
-        .route("/auth/logout", post(handlers::post_auth_logout))
+        .route_layer(axum::middleware::from_fn_with_state(
+            auth_rate_limiter,
+            crate::server::rate_limit::rate_limit_auth,
+        ))
         .with_state(state.clone());
 
     let metrics_state = state;
-    let public = Router::new().route(
-        "/metrics",
-        get(move || {
-            let handle = metric_handle.clone();
-            let state = metrics_state.clone();
-            async move {
-                if let Ok(stats) = state.engine.stats().await {
-                    publish_engine_metrics(&stats);
-                    // Server-session panel (item 12/21) — reads AppState, not
-                    // the engine, so it lives here rather than in `stats()`.
-                    metrics::gauge!("unidb_open_txn_sessions").set(state.sessions.len() as f64);
-                    metrics::gauge!("unidb_open_cursors").set(state.cursors.len() as f64);
-                    metrics::gauge!("unidb_idle_reaper_aborts_total")
-                        .set(state.sessions.reaper_aborts() as f64);
+    let public = Router::new()
+        .route(
+            "/metrics",
+            get(move || {
+                let handle = metric_handle.clone();
+                let state = metrics_state.clone();
+                async move {
+                    if let Ok(stats) = state.engine.stats().await {
+                        publish_engine_metrics(&stats);
+                        // Server-session panel (item 12/21) — reads AppState, not
+                        // the engine, so it lives here rather than in `stats()`.
+                        metrics::gauge!("unidb_open_txn_sessions").set(state.sessions.len() as f64);
+                        metrics::gauge!("unidb_open_cursors").set(state.cursors.len() as f64);
+                        metrics::gauge!("unidb_idle_reaper_aborts_total")
+                            .set(state.sessions.reaper_aborts() as f64);
+                    }
+                    handle.render()
                 }
-                handle.render()
-            }
-        }),
-    );
+            }),
+        )
+        // item 121 A6: GET /.well-known/jwks.json — public, no JWT required
+        // (a verifier fetching keys can't present one yet). Returns the
+        // configured asymmetric public key as a JWK Set, or `{"keys":[]}`
+        // when this server verifies HS256 only — see `JwtConfig::
+        // jwks_document`'s doc comment for why the HS256 secret can never
+        // leak through this route.
+        .route(
+            "/.well-known/jwks.json",
+            get(move || {
+                let doc = jwks_document.clone();
+                async move { axum::Json(doc) }
+            }),
+        );
 
     Router::new()
         .merge(protected)
         .merge(public)
         .merge(auth_public)
+        .merge(auth_rate_limited)
         .layer(prometheus_layer)
         .layer(TraceLayer::new_for_http())
         // Outermost app layer (item 22, L2): assign a `request_id` before auth

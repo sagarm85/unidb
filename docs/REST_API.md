@@ -47,26 +47,42 @@ resource-oriented, auto-generated API in the PostgREST sense — `/sql` and
 
 ## Authentication
 
-JWT bearer auth (HS256). The server validates a token signed with a shared
-secret (`UNIDB_JWT_SECRET`) on every data-plane route.
+JWT bearer auth. One server verifies with exactly one algorithm at a time:
+
+- **HS256** (default) — a shared secret (`UNIDB_JWT_SECRET`).
+- **RS256 / ES256** (item 121 A6, optional) — an asymmetric **public** key
+  (`UNIDB_JWT_PUBLIC_KEY`, PEM), for verifying tokens minted by an external
+  IdP without this server ever holding a shared secret. The algorithm (RSA
+  vs EC/P-256) is auto-detected from the key; see
+  [`GET /.well-known/jwks.json`](#get-well-knownjwksjson--public-key-discovery-item-121-a6).
 
 Token **verification** is always on. Token **issuance** is an optional
-built-in auth service (items 121/122): with a signing key configured
-(`UNIDB_DEV_LOGIN=1` today), the server offers real password login, signup,
-and refresh-token sessions — see [`POST /auth/login`](#post-authlogin--password-login),
+built-in auth service (items 121/122): with a signing key configured —
+`UNIDB_JWT_SIGNING_KEY` (item 121 A5, the first-class production path) or
+`UNIDB_DEV_LOGIN=1` (pre-A5, still supported) — the server offers real
+password login, signup, and refresh-token sessions — see
+[`POST /auth/login`](#post-authlogin--password-login),
 [`POST /auth/signup`](#post-authsignup--self-service-signup),
 [`POST /auth/refresh`](#post-authrefresh--exchange-a-refresh-token), and
 [`POST /auth/logout`](#post-authlogout--revoke-a-session). You may still
-bring tokens from an external issuer instead; the two modes coexist.
+bring tokens from an external issuer instead; the two modes coexist. Local
+issuance is HS256-only and is **disabled outright** when `UNIDB_JWT_PUBLIC_KEY`
+is set (an HS256-signed local token could never verify against a configured
+asymmetric public key).
 
 > **Correction (2026-07-31):** earlier versions of this section stated "there
 > is no login endpoint, no user database, and no session state." That is no
 > longer true — items 121/122 added an argon2id credential store, password
 > login/signup, and hash-only refresh-token sessions. Verify-only remains the
-> *default posture* when no signing key is configured.
+> *default posture* when no signing key is configured. **Update (2026-07-31,
+> item 121 A5/A6):** issuance now has a first-class production path
+> (`UNIDB_JWT_SIGNING_KEY`, independent of `UNIDB_DEV_LOGIN`), and verification
+> supports asymmetric RS256/ES256 via `UNIDB_JWT_PUBLIC_KEY` plus a
+> `GET /.well-known/jwks.json` discovery route.
 
 ```
-Authorization: Bearer <jwt signed with UNIDB_JWT_SECRET, HS256>
+Authorization: Bearer <jwt signed with UNIDB_JWT_SECRET (HS256), or with the
+private key matching UNIDB_JWT_PUBLIC_KEY (RS256/ES256)>
 ```
 
 For local testing, generate a token with `scripts/gen_jwt.sh` (pure bash +
@@ -1136,6 +1152,47 @@ REVOKE ALL ON orders FROM analyst;
 A non-superuser executing a SQL statement on a table for which they lack the corresponding
 privilege receives `403 PERMISSION_DENIED`.
 
+#### Column-level grants (item 112)
+
+A column list **narrows** a table-level grant to exactly those columns —
+holding table-level `SELECT` (the forms above) still implies every column,
+including columns added later by `ALTER TABLE ADD COLUMN`; this is
+unaffected by column-level grants and needs no migration.
+
+```sql
+-- Grant SELECT on only two columns (e.g. hide password_hash from support)
+GRANT SELECT (email, name) ON users TO support;
+
+-- Grant UPDATE on only one column
+GRANT UPDATE (status) ON tickets TO agent;
+
+-- A single column list applies to every privilege named alongside it
+GRANT SELECT, UPDATE (a, b) ON t TO r;
+
+-- Column-scoped REVOKE narrows the existing grant (removes just these
+-- columns); a table-level REVOKE (no column list) still clears the
+-- privilege entirely, regardless of column scope.
+REVOKE SELECT (email) ON users FROM support;
+```
+
+Once a grantee's privilege on a table is column-scoped, every reference to a
+column of that kind — `SELECT` list, `WHERE`/`JOIN ON`/`GROUP BY`/`HAVING`/
+`ORDER BY` predicates (checked as reads), `UPDATE` `SET` targets (checked as
+writes) and their right-hand-side expressions (checked as reads), `INSERT`
+column lists (writes), and `RETURNING` columns (reads) — is checked against
+the granted column set. **`SELECT *` (and `RETURNING *`) requires holding
+every column** — a column-scoped grantee who doesn't gets `403
+PERMISSION_DENIED` naming the missing column, never a silently NULL-filled or
+dropped column. A column referenced only inside an RLS policy predicate
+(never in the caller's own SQL) is exempt, matching Postgres — policy
+evaluation is not subject to the caller's own column grants.
+
+`information_schema.columns` reflects a column-scoped grantee's `SELECT`
+grant: only the granted columns are listed (with `ordinal_position` still
+reflecting the column's real position in the table, not a renumbering).
+`unidb_catalog.grants` gains a `columns` column: `"ALL"` for a whole-table
+grant, else a comma-joined list of exactly the granted columns.
+
 #### Row-level security (RLS) policies
 
 ```sql
@@ -1320,11 +1377,62 @@ GET /auth/meta
 | `dev_login_enabled` | `true` only when server is started with `UNIDB_DEV_LOGIN=1` |
 | `signup_enabled` | `true` only when started with `UNIDB_ALLOW_SIGNUP=1` (item 121 A3) |
 
+#### `GET /.well-known/jwks.json` — public key discovery (item 121 A6)
+
+Returns the server's configured asymmetric public key as a [JWK
+Set](https://www.rfc-editor.org/rfc/rfc7517), so an external verifier (or a
+client SDK) can fetch it instead of hard-coding key material. **Public — no
+JWT required.**
+
+```
+GET /.well-known/jwks.json
+```
+
+**Response** `200 OK` — RSA example (`UNIDB_JWT_PUBLIC_KEY` is an RSA key):
+```json
+{ "keys": [ { "kty": "RSA", "use": "sig", "alg": "RS256", "n": "<base64url modulus>", "e": "<base64url exponent>" } ] }
+```
+EC example (`UNIDB_JWT_PUBLIC_KEY` is a P-256 key):
+```json
+{ "keys": [ { "kty": "EC", "use": "sig", "alg": "ES256", "crv": "P-256", "x": "<base64url>", "y": "<base64url>" } ] }
+```
+When the server verifies HS256 only (no `UNIDB_JWT_PUBLIC_KEY` configured):
+```json
+{ "keys": [] }
+```
+The HS256 shared secret is never published here — there is nothing to publish
+for a symmetric key, and this route only ever serializes a public key.
+
+#### Auth rate limiting (item 121 I1)
+
+`POST /auth/login`, `/auth/signup`, and `/auth/refresh` — the only routes
+reachable with no bearer token at all — are brute-force targets, so all three
+sit behind a shared, in-memory, per-key rate limiter (a hand-rolled fixed
+window; no external rate-limit crate). **Read/data routes, `/sql`,
+`/metrics`, `/.well-known/jwks.json`, `/auth/meta`, and `/auth/logout` are
+never rate-limited.**
+
+- **Key:** the client's TCP peer IP address (`X-Forwarded-For` is
+  deliberately **not** trusted — it is client-supplied and this server has no
+  trusted-proxy configuration to validate it; see `src/server/rate_limit.rs`'s
+  module doc), plus the route path, plus — when the JSON body carries a
+  `username` field (login/signup) — the username itself, so two accounts
+  behind the same NAT/proxy IP don't share one bucket. A rejected (401/403)
+  attempt counts toward the limit exactly like an accepted one.
+- **Config:** `UNIDB_AUTH_RATE_LIMIT` (max attempts per window, default `10`)
+  and `UNIDB_AUTH_RATE_WINDOW_SECS` (window length in seconds, default `60`).
+  Set `UNIDB_AUTH_RATE_LIMIT=0` to disable rate limiting entirely.
+- **Response when exceeded:** `429 Too Many Requests`, body
+  `{ "error": "...", "code": "RATE_LIMITED" }`, plus a `Retry-After: <seconds>`
+  header (time left in the current window, rounded up to at least 1).
+
 #### `POST /auth/login` — password login
 
-> Requires a signing key (`UNIDB_DEV_LOGIN=1` today; a first-class production
-> issuer is item 121 A5). When no signing key is configured the route returns
-> the "issuance disabled" error. Pair with rate-limiting (item I1) before
+> Requires a signing key: `UNIDB_JWT_SIGNING_KEY` (item 121 A5, the
+> first-class production path) or `UNIDB_DEV_LOGIN=1` (pre-A5, still
+> supported). When neither is configured — or `UNIDB_JWT_PUBLIC_KEY`
+> (asymmetric verify mode, item 121 A6) is set instead — the route returns
+> the "issuance disabled" error. Rate-limited (item I1, see above) before
 > production exposure.
 
 Verifies the supplied password against the user's stored **argon2id** credential
@@ -1352,13 +1460,14 @@ the miss paths, so there is no user-enumeration or timing oracle. `open_mode`
 > stores only its SHA-256 hash, never the raw token.
 
 **Error responses:** `401 INVALID_CREDENTIALS` (unknown user / wrong password /
-no credential — uniform); issuance-disabled error when no signing key is set.
+no credential — uniform); issuance-disabled error when no signing key is set;
+`429 RATE_LIMITED` (item I1, see above) once the per-key attempt limit is hit.
 
 #### `POST /auth/signup` — self-service signup
 
 > **Disabled by default.** Enable with `UNIDB_ALLOW_SIGNUP=1` **and** a configured
-> signing key. When disabled the route returns `404` (indistinguishable from a
-> non-existent route). Item 121 A3.
+> signing key (`UNIDB_JWT_SIGNING_KEY` or `UNIDB_DEV_LOGIN=1`). When disabled the
+> route returns `404` (indistinguishable from a non-existent route). Item 121 A3.
 
 Creates a **non-superuser** with an argon2id credential and returns the same
 token pair as login. Duplicate usernames are rejected; the user is only created
@@ -1369,7 +1478,7 @@ after the signing-key check, so a disabled issuer never leaves an orphaned accou
 { "username": "bob", "password": "…" }
 ```
 **Response** `200 OK`: same shape as `POST /auth/login`. **Errors:** `404` when
-signup disabled; `409`/error on duplicate username.
+signup disabled; `409`/error on duplicate username; `429 RATE_LIMITED` (item I1).
 
 #### `POST /auth/refresh` — exchange a refresh token
 
@@ -1382,7 +1491,7 @@ access token **and a rotated refresh token** (the old one is revoked). Item 121 
 { "refresh_token": "<opaque-hex>" }
 ```
 **Response** `200 OK`: same shape as `POST /auth/login` (new access + new refresh).
-**Error:** `401 INVALID_REFRESH_TOKEN`.
+**Errors:** `401 INVALID_REFRESH_TOKEN`; `429 RATE_LIMITED` (item I1).
 
 #### `POST /auth/logout` — revoke a session
 
