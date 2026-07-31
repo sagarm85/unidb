@@ -485,6 +485,25 @@ be raised with the user directly, not assumed.
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-07-31 — C1 auto /rest/v1 API + OpenAPI shipped (Wave 2 begun); autonomous overnight run
+
+User went to sleep, authorized autonomous completion of well-defined items + auto-merge of
+verified PRs, with per-merge status reports. **C1 / item 123** (`742b355`): PostgREST-style
+`/rest/v1/<table>` — GET/POST/PATCH/DELETE with eq/neq/gt/gte/lt/lte/like/ilike/in/is filters,
+`select=`/`order=`/`limit`/`offset`. Injection-safe by construction: every value is a `$n`
+bind through the existing `execute_sql_params_as_principal` path (RLS + table/column grants +
+current_user/auth.uid/auth.jwt inherited, NOT re-implemented); identifiers catalog-validated +
+quoted; operators from a fixed allow-list. **C3 OpenAPI also shipped** (`GET /rest/v1/` lists
+tables → unblocks studio G4). Verified by me from clean: crash 54/54, server_rest **23/23**
+incl. injection-treated-as-data, rls_parity_with_sql, column_grant_parity_with_sql,
+no-privilege→403, unknown table/column→404, openapi-lists-tables; clippy/fmt clean. **Autonomous
+plan:** complete + merge the well-defined engine/server items (this batch PR, then E1 realtime
+auth, F1 storage per-object RLS, C2 FK-embed, maybe I4 migrations) — each a verified merged PR.
+DEFER (need user decisions/secrets or too large, leave flagged): D OAuth/OTP/MFA/email, I6
+per-project control plane, I7 edge functions, H SDK, C4 GraphQL, I2/I3/I5, G studio panels
+(studio session's job). Verify-before-merge always (crash 54/54 + suites); anything ambiguous →
+PR left open, not merged.
+
 ### 2026-07-31 — batch-2 tail: I1 rate-limiting + B5 column-level grants shipped (Workstream B complete)
 
 Continued the post-#222 sequential run. **I1** (`5f7917d`): in-memory fixed-window auth
