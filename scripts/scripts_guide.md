@@ -84,6 +84,14 @@ Docker-run output (`docker/out/`) is **git-ignored** (run artifact). The dated
 **native** reports under `docs/performance/` **are committed** — the durable
 measurement record alongside `PROGRESS.md`.
 
+Every run also drops a **styled HTML sibling** next to the `.md`
+(`report_<timestamp>.html`) via `scripts/render_report.py` — a nicer-to-read /
+shareable view (winner pills, ratio coloring, light+dark theme). It is a pure
+presentation layer: the `.md` stays the source of truth, so the `.html` is
+**git-ignored** and regenerable at any time with
+`python3 scripts/render_report.py <report.md>`. HTML rendering never fails the
+run (a render error just logs a warning).
+
 ### What the report contains
 
 - **Table 1–2** — W0→W4 decomposition ladder: the per-commit cost of adding each
@@ -126,6 +134,7 @@ The fair-fsync rationale and its caveats live in [`../docker/fair_fsync_benchmar
 | `mm_resource_report.py` | Correlates the bench's phase windows (`phases.csv`) with `docker stats` samples (`stats.csv`) into the per-phase CPU/memory table. Called by `docker_report.sh`. |
 | `stitch_baseline.py` | Carries skipped tables forward from the `MM_BASELINE` report into the fresh one, provenance-stamped ("Carried forward — NOT re-measured"). Called by `report.sh` when `MM_BASELINE` is set. |
 | `compare_bench.py` | Prints the informational delta table vs the promoted benchmark at the end of every run. Section-aware: carried-forward tables are excluded from the comparison. |
+| `render_report.py` | Renders the finished report `.md` into a styled, self-contained `.html` sibling (winner pills, ratio coloring, light+dark theme). Presentation only — the `.md` stays authoritative. Called by `report.sh` after the report is finalized; also runnable standalone: `python3 scripts/render_report.py <report.md> [out.html]`. |
 
 ---
 

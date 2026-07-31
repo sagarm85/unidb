@@ -290,6 +290,16 @@ TOTAL_TAKEN="$(fmt_duration "$TOTAL_ELAPSED")"
 
 echo "[report] report: $REPORT (total: $TOTAL_TAKEN)" >&2
 
+# ── render a styled, self-contained HTML sibling (presentation only) ─────────
+# The Markdown stays the source of truth (git-tracked, diffable, consumed by
+# compare_bench.py); this is a nicer-to-read/share view next to it. Non-fatal:
+# a render failure never fails the run.
+if REPORT_HTML="$(python3 "$REPO_ROOT/scripts/render_report.py" "$REPORT" 2>/dev/null)"; then
+  echo "[report] html:   $REPORT_HTML" >&2
+else
+  echo "[report] WARNING: HTML render failed (Markdown report still valid)." >&2
+fi
+
 # Compare against latest benchmark and print delta (informational only).
 python3 "$REPO_ROOT/scripts/compare_bench.py" "$REPORT" || true
 
