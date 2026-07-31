@@ -6,6 +6,8 @@
 //! embedded-engine tenant-isolation acceptance test in
 //! `tests/item122_auth_uid_jwt.rs::auth_jwt_tenant_isolation_two_tokens`.
 
+#![cfg(feature = "server")]
+
 #[path = "server_common/mod.rs"]
 mod server_common;
 
