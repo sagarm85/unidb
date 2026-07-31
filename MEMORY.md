@@ -485,6 +485,25 @@ be raised with the user directly, not assumed.
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-07-31 — PR #222 (items 121 A1–A4 + 122 B1–B4) MERGED to main; A5/A6 shipped to fresh branch
+
+Merged the Supabase-parity auth PR #222 (squash `333f3d1`) into main — main now has the
+full auth loop (password login/signup/refresh + `auth.uid()`/`auth.jwt()` + roles/role-scoped
+policies). Reset the designated branch onto merged main and started the batch-2 tail + Wave 2
+**sequentially** (disk-forced: usable ~38 GiB can't hold two concurrent ~30 GiB Rust builds —
+the ENOSPC that thrashed batch 1; `cargo clean` between builds; raise the Bash `timeout` to
+10 min for from-clean gate compiles rather than fighting the 2-min reaping). **121 A5/A6**
+(`68332cf`): production JWT issuer (`UNIDB_JWT_SIGNING_KEY` — issuance no longer dev-login-only);
+asymmetric verify (`UNIDB_JWT_PUBLIC_KEY` PEM, RS256/ES256 auto-detected) + public
+`GET /.well-known/jwks.json` (empty `{"keys":[]}` in HS256-only mode; a test asserts the HS256
+secret never leaks); asymmetric mode disables local HS256 issuance (documented); asymmetric
+*issuance* deferred (verify-side only — key-management story out of scope). Verified by me:
+crash 54/54, new item121_a5_a6_issuer_jwks 9/9, item121 16/16, item122 7/7, item100 9/9,
+clippy/fmt clean; docs (REST_API/README/ops_runbook/backlog) updated by the agent. Studio told
+it can now complete G1/G2/G3 against main's stable contract (G4 still waits on Wave-2 C1).
+**Sequential queue remaining:** I1 rate-limiting → B5 column grants → C1 auto `/rest/v1` API,
+then a fresh PR to main.
+
 ### 2026-07-31 — item 122 B3/B4 (built-in roles + role-scoped policies) shipped, second slice of Workstream B
 
 Sequential batch-2 continuation (Sonnet on the main tree, verified by me). **122 B3/B4**
