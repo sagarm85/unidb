@@ -21,6 +21,12 @@ instant-distance = "0.6.1"
 # Item 95: per-engine graph adjacency cache (hot-hub lazy warm cache).
 # DashMap provides fine-grained sharded concurrent access without a coarse Mutex.
 dashmap = "6"
+# Item 121 (Workstream A, A1): argon2id password hashing for the credential
+# store in `src/authz/mod.rs`. Not server-feature-gated — `CREATE USER ...
+# PASSWORD` DDL is parsed by the core (embedded) authz module, independent of
+# the optional HTTP server. Re-exports the `password_hash` crate (PHC string
+# format, `SaltString`, `OsRng`) so no separate dependency is needed.
+argon2 = "0.5"
 
 # M5: optional server (src/server/, src/bin/unidb-server.rs). All gated
 # behind the `server` feature so a default `cargo build`/`cargo test` never
@@ -205,6 +211,12 @@ required-features = ["server"]
 [[test]]
 name = "server_auth"
 path = "tests/server_auth.rs"
+required-features = ["server"]
+
+# Item 121 (Workstream A, A1+A2): credential store + real password login.
+[[test]]
+name = "item121_auth_core"
+path = "tests/item121_auth_core.rs"
 required-features = ["server"]
 
 [[test]]

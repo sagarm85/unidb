@@ -1665,6 +1665,25 @@ impl Engine {
         &self.authz
     }
 
+    /// Set (or replace) `user`'s password credential (item 121, A1). Hashed
+    /// with argon2id before it ever leaves [`crate::authz`]; the caller must
+    /// already have verified `user` is authorized to change this (there is
+    /// no built-in superuser gate here — this is the raw embedded-API entry
+    /// point, mirroring [`Engine::authz`] being unrestricted for the
+    /// implicit-superuser embedded caller).
+    pub fn set_password(&self, user: &str, password: &str) -> Result<()> {
+        self.authz.set_password(user, password)
+    }
+
+    /// Verify `password` against `user`'s stored credential (item 121, A2).
+    /// `false` uniformly covers "unknown user", "user has no stored
+    /// credential", and "wrong password" — see
+    /// [`crate::authz::RoleStore::verify_password`] for the no-enumeration-
+    /// oracle guarantee.
+    pub fn verify_password(&self, user: &str, password: &str) -> bool {
+        self.authz.verify_password(user, password)
+    }
+
     /// Execute SQL **as** a named user (P6.e), enforcing per-table privileges.
     /// `user == None` is the implicit **superuser** (the embedded API), so
     /// `execute_sql` is exactly `execute_sql_as(None, ..)` and is unrestricted.

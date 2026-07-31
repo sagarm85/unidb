@@ -411,6 +411,19 @@ impl EngineHandle {
             .unwrap_or_default()
     }
 
+    /// Verify a login password (item 121, A2). `false` covers unknown user,
+    /// no stored credential, and wrong password alike (no user-enumeration
+    /// oracle) — see [`crate::authz::RoleStore::verify_password`]. A
+    /// bottom-of-the-stack engine error (should not happen for this
+    /// read-only check) also maps to `false`, so a caller never has to
+    /// distinguish "verify failed" from "verify errored" — both mean "don't
+    /// log this request in."
+    pub async fn verify_password(&self, user: String, password: String) -> bool {
+        self.on_engine(move |e| Ok(e.verify_password(&user, &password)))
+            .await
+            .unwrap_or(false)
+    }
+
     /// Install an RLS policy from a SQL predicate string (R3).
     pub async fn set_rls_policy_sql(&self, table: String, predicate: String) -> Result<()> {
         self.on_engine(move |e| e.set_rls_policy_sql(&table, &predicate))

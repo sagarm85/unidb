@@ -272,11 +272,27 @@ pub struct AuthPreviewRequest {
     pub sql: String,
 }
 
-/// Body of `POST /auth/login` (item 100, `UNIDB_DEV_LOGIN=1` only).
-/// Passwordless identification — dev/demo only.
-#[derive(Debug, Deserialize)]
+/// Body of `POST /auth/login` (item 100 issuer; item 121 A2 real
+/// authentication). Still gated by `UNIDB_DEV_LOGIN=1` (production issuer
+/// configuration is item 121 A5, not yet implemented), but the password is
+/// now verified against the stored argon2id credential — this is real
+/// authentication, not mere identification.
+#[derive(Deserialize)]
 pub struct AuthLoginRequest {
     pub username: String,
+    pub password: String,
+}
+
+/// Manual `Debug`: redacts `password` so this request body can never leak
+/// the plaintext via `{:?}` (e.g. request-body logging middleware, an
+/// `unwrap_err` printing the value it failed on).
+impl std::fmt::Debug for AuthLoginRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthLoginRequest")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Response of `POST /auth/login`.

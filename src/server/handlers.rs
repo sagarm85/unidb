@@ -1024,14 +1024,21 @@ pub async fn get_auth_meta(
 
 /// `POST /auth/login` — public, no JWT required.
 ///
-/// **Dev/demo only** — only available when `UNIDB_DEV_LOGIN=1` is set at
-/// startup.  Returns 404 when the flag is off so the route is indistinguishable
-/// from non-existent (no accidental prod issuer).
+/// Gated behind `UNIDB_DEV_LOGIN=1` at startup (unchanged from item 100;
+/// un-gating this into a first-class production issuer is item 121 A5, out
+/// of scope here). Returns 404 (via the same disabled error) when the flag
+/// is off so the route is indistinguishable from non-existent.
 ///
-/// Issues a 1 h signed JWT for an existing user identified by username only
-/// (passwordless = identification, not authentication).  The token uses the
-/// same HS256 secret as `require_jwt`, so `current_user()` and all privilege
-/// checks work immediately without any downstream change.
+/// **Item 121 A2 — real authentication.** The supplied password is verified
+/// against the user's stored argon2id credential
+/// ([`crate::authz::RoleStore::verify_password`]). Wrong password, an
+/// unknown username, and a known username with no stored credential all
+/// return the identical 401 response — there is no way for a caller to
+/// distinguish "no such user" from "wrong password" from timing, status
+/// code, or body shape (no user-enumeration oracle). On success, issues a
+/// 1 h signed JWT using the same HS256 secret as `require_jwt`, so
+/// `current_user()` and all privilege checks work immediately without any
+/// downstream change.
 pub async fn post_auth_login(
     State(state): State<AppState>,
     Json(body): Json<AuthLoginRequest>,
@@ -1041,13 +1048,21 @@ pub async fn post_auth_login(
             "POST /auth/login is disabled (set UNIDB_DEV_LOGIN=1 to enable)".into(),
         ))
     })?;
-    // Validate the user exists.
-    let users = state.engine.user_snapshot().await;
-    if !users.iter().any(|(name, _)| name == &body.username) {
-        return Err(ApiError::from(crate::error::DbError::SqlPlan(format!(
-            "user '{}' not found",
-            body.username
-        ))));
+    // Real credential verification (item 121 A2): unknown user, no stored
+    // credential, and a genuine mismatch all take this same branch and
+    // return this same 401 — see `RoleStore::verify_password`'s doc comment
+    // for the constant-shape guarantee that makes this a real defense
+    // against user enumeration, not just a same-looking error string.
+    if !state
+        .engine
+        .verify_password(body.username.clone(), body.password.clone())
+        .await
+    {
+        return Err(ApiError::Api {
+            status: StatusCode::UNAUTHORIZED,
+            code: "INVALID_CREDENTIALS",
+            message: "invalid username or password".into(),
+        });
     }
     let token = jwt_cfg.issue_token(&body.username).map_err(|e| {
         ApiError::from(crate::error::DbError::SqlPlan(format!(

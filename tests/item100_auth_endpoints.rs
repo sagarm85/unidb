@@ -143,7 +143,7 @@ async fn auth_login_disabled_when_flag_off() {
 
     let resp = client
         .post(server.url("/auth/login"))
-        .json(&serde_json::json!({"username": "alice"}))
+        .json(&serde_json::json!({"username": "alice", "password": "whatever"}))
         .send()
         .await
         .unwrap();
@@ -155,6 +155,10 @@ async fn auth_login_disabled_when_flag_off() {
 }
 
 // ── test 6: POST /auth/login issues a token the server accepts ────────────────
+//
+// Item 121 A2 — login now performs real password verification, so the user
+// must be created with a `PASSWORD` credential and the login request must
+// supply the matching password.
 
 #[tokio::test]
 async fn auth_login_issues_valid_token() {
@@ -162,21 +166,21 @@ async fn auth_login_issues_valid_token() {
     let client = reqwest::Client::new();
     let tok = server_common::valid_token();
 
-    // Create the user first.
+    // Create the user with a password credential first.
     client
         .post(server.url("/sql"))
         .header("Authorization", format!("Bearer {tok}"))
-        .json(&serde_json::json!({"sql": "CREATE USER alice"}))
+        .json(&serde_json::json!({"sql": "CREATE USER alice PASSWORD 'correct-horse-battery-staple'"}))
         .send()
         .await
         .unwrap()
         .error_for_status()
         .unwrap();
 
-    // Login.
+    // Login with the correct password.
     let resp: Value = client
         .post(server.url("/auth/login"))
-        .json(&serde_json::json!({"username": "alice"}))
+        .json(&serde_json::json!({"username": "alice", "password": "correct-horse-battery-staple"}))
         .send()
         .await
         .unwrap()
@@ -219,7 +223,7 @@ async fn auth_login_unknown_user_returns_4xx() {
 
     let resp = client
         .post(server.url("/auth/login"))
-        .json(&serde_json::json!({"username": "nobody"}))
+        .json(&serde_json::json!({"username": "nobody", "password": "whatever"}))
         .send()
         .await
         .unwrap();
@@ -227,6 +231,11 @@ async fn auth_login_unknown_user_returns_4xx() {
         resp.status().is_client_error(),
         "login with unknown user should be 4xx, got {}",
         resp.status()
+    );
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "unknown user should be 401, not some other 4xx"
     );
 }
 

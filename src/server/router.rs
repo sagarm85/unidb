@@ -149,7 +149,9 @@ pub fn build_router(
     // documented with its driven widget in `docs/engine_access_guide.md`.
     // item 100: public auth routes — no JWT middleware.
     // GET /auth/meta   → blank-slate discovery (open_mode, privilege types, catalog tables).
-    // POST /auth/login → dev-only passwordless token issuance (UNIDB_DEV_LOGIN=1).
+    // POST /auth/login → real password login (item 121 A1/A2: argon2id credential
+    //   verification), still gated behind UNIDB_DEV_LOGIN=1 pending a first-class
+    //   production issuer configuration (item 121 A5).
     let auth_public = Router::new()
         .route("/auth/meta", get(handlers::get_auth_meta))
         .route("/auth/login", post(handlers::post_auth_login))
