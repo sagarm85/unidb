@@ -27,6 +27,13 @@ dashmap = "6"
 # the optional HTTP server. Re-exports the `password_hash` crate (PHC string
 # format, `SaltString`, `OsRng`) so no separate dependency is needed.
 argon2 = "0.5"
+# Item 121 (Workstream A, A4): fast one-way hashing for opaque refresh-token
+# sessions in `src/authz/mod.rs`. Refresh tokens are already 256-bit CSPRNG
+# output (see `generate_refresh_token`), so a slow KDF like argon2id buys no
+# extra brute-force resistance here and would needlessly cost every refresh
+# call — SHA-256 is the right tool for hashing an already-high-entropy secret
+# (same rationale most API-key/session-token stores use, e.g. hashing a PAT).
+sha2 = "0.10"
 
 # M5: optional server (src/server/, src/bin/unidb-server.rs). All gated
 # behind the `server` feature so a default `cargo build`/`cargo test` never

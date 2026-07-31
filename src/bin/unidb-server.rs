@@ -199,14 +199,29 @@ async fn main() {
         JwtConfig::new(&jwt_secret)
     };
 
+    // item 121, A3: UNIDB_ALLOW_SIGNUP=1 activates POST /auth/signup
+    // (default off — opt-in, not open by default). Signup still needs a
+    // token-issuing key to hand back access/refresh tokens, so it is only
+    // useful paired with UNIDB_DEV_LOGIN=1 until A5 ships a first-class
+    // production issuer configuration.
+    let allow_signup = std::env::var("UNIDB_ALLOW_SIGNUP")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if allow_signup {
+        tracing::warn!(
+            "UNIDB_ALLOW_SIGNUP=1: POST /auth/signup is enabled (self-service account \
+             creation — make sure this is the posture you want in production)"
+        );
+    }
+
     let state = {
-        let s =
+        let mut s =
             AppState::new(Arc::new(engine_handle)).with_log_dir(std::path::PathBuf::from(&log_dir));
         if dev_login {
-            s.with_dev_login(jwt_config.clone())
-        } else {
-            s
+            s = s.with_dev_login(jwt_config.clone());
         }
+        s.with_allow_signup(allow_signup)
     };
     let (prometheus_layer, metric_handle) = PrometheusMetricLayer::pair();
 

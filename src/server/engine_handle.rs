@@ -447,6 +447,43 @@ impl EngineHandle {
             .unwrap_or(false)
     }
 
+    /// Create a new non-superuser user with a password credential (item 121,
+    /// A3 — `POST /auth/signup`). Errors (e.g. duplicate username) propagate
+    /// as-is; the caller maps them to an HTTP status via [`ApiError`](
+    /// crate::server::error::ApiError).
+    pub async fn create_user_with_password(&self, user: String, password: String) -> Result<()> {
+        self.on_engine(move |e| e.create_user_with_password(&user, &password))
+            .await
+    }
+
+    /// Issue a fresh refresh-token session for `user` (item 121, A4). Returns
+    /// `(raw_refresh_token, expires_at_unix_secs)`.
+    pub async fn create_session(&self, user: String) -> Result<(String, u64)> {
+        self.on_engine(move |e| e.create_session(&user)).await
+    }
+
+    /// Verify a raw refresh token (item 121, A4). `None` uniformly covers
+    /// unknown/expired/revoked — see [`crate::authz::RoleStore::
+    /// verify_session`].
+    pub async fn verify_session(&self, raw_token: String) -> Option<String> {
+        self.on_engine(move |e| Ok(e.verify_session(&raw_token)))
+            .await
+            .unwrap_or(None)
+    }
+
+    /// Verify + rotate a refresh token (item 121, A4 — `POST /auth/refresh`).
+    /// `Ok(None)` covers unknown/expired/revoked uniformly; `Err` only for a
+    /// genuine persistence failure.
+    pub async fn rotate_session(&self, raw_token: String) -> Result<Option<(String, String, u64)>> {
+        self.on_engine(move |e| e.rotate_session(&raw_token)).await
+    }
+
+    /// Revoke a refresh-token session, idempotently (item 121, A4 —
+    /// `POST /auth/logout`).
+    pub async fn revoke_session(&self, raw_token: String) -> Result<()> {
+        self.on_engine(move |e| e.revoke_session(&raw_token)).await
+    }
+
     /// Install an RLS policy from a SQL predicate string (R3).
     pub async fn set_rls_policy_sql(&self, table: String, predicate: String) -> Result<()> {
         self.on_engine(move |e| e.set_rls_policy_sql(&table, &predicate))

@@ -1685,6 +1685,48 @@ impl Engine {
         self.authz.verify_password(user, password)
     }
 
+    /// Create a new, non-superuser user with a password credential (item
+    /// 121, A3 — `POST /auth/signup`'s embedded-API entry point). Thin
+    /// delegate to [`crate::authz::RoleStore::apply`]'s `CreateUser` branch,
+    /// which already errors on a duplicate username and hashes the password
+    /// with argon2id before it is ever stored. There is no privilege gate
+    /// here — the caller (the signup handler) is responsible for the
+    /// `UNIDB_ALLOW_SIGNUP` policy gate; this method just performs the
+    /// (already-authorized) creation, mirroring `set_password`'s unrestricted
+    /// embedded-API posture.
+    pub fn create_user_with_password(&self, user: &str, password: &str) -> Result<()> {
+        self.authz.apply(&crate::authz::AuthStmt::CreateUser {
+            name: user.to_string(),
+            superuser: false,
+            password: Some(password.to_string()),
+        })
+    }
+
+    /// Issue a fresh refresh-token session for `user` (item 121, A4). See
+    /// [`crate::authz::RoleStore::create_session`].
+    pub fn create_session(&self, user: &str) -> Result<(String, u64)> {
+        self.authz.create_session(user)
+    }
+
+    /// Verify a raw refresh token, returning its owning username on success
+    /// (item 121, A4). See [`crate::authz::RoleStore::verify_session`] for
+    /// the uniform-failure-shape guarantee.
+    pub fn verify_session(&self, raw_token: &str) -> Option<String> {
+        self.authz.verify_session(raw_token)
+    }
+
+    /// Verify + rotate a refresh token (item 121, A4). See
+    /// [`crate::authz::RoleStore::rotate_session`].
+    pub fn rotate_session(&self, raw_token: &str) -> Result<Option<(String, String, u64)>> {
+        self.authz.rotate_session(raw_token)
+    }
+
+    /// Revoke a refresh-token session, idempotently (item 121, A4 —
+    /// `POST /auth/logout`). See [`crate::authz::RoleStore::revoke_session`].
+    pub fn revoke_session(&self, raw_token: &str) -> Result<()> {
+        self.authz.revoke_session(raw_token)
+    }
+
     /// Execute SQL **as** a named user (P6.e), enforcing per-table privileges.
     /// `user == None` is the implicit **superuser** (the embedded API), so
     /// `execute_sql` is exactly `execute_sql_as(None, ..)` and is unrestricted.

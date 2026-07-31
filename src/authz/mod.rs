@@ -37,10 +37,14 @@ use std::{
 };
 
 use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    password_hash::{
+        rand_core::{OsRng, RngCore},
+        PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
+    },
     Argon2,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::error::{DbError, Result};
 
@@ -90,6 +94,67 @@ fn dummy_hash() -> &'static str {
             })
         })
         .as_str()
+}
+
+/// Refresh-token session lifetime (item 121, A4): 30 days. Not yet
+/// configurable — a fixed, documented default is preferable to silently
+/// picking a value; revisit alongside A5 (production issuer config) if a
+/// real deployment needs this tunable.
+const REFRESH_TOKEN_TTL_SECS: u64 = 30 * 24 * 3600;
+
+/// Current wall-clock time as Unix seconds. Saturates to 0 rather than
+/// panicking if the clock is somehow before the epoch (recovery/control-plane
+/// code must never panic on an unusual but non-corrupt environment).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Hex-encoded SHA-256 digest of `input`. Used to turn a raw opaque refresh
+/// token into the value actually persisted (item 121, A4) — the raw token
+/// itself is *never* written to `roles.json`, mirroring the "only the hash
+/// is stored" posture [`hash_password`] already gives credentials. Because
+/// verification always compares hashes (never the raw secret), there is no
+/// direct-comparison code path over the raw token for a timing side channel
+/// to attach to in the first place.
+fn sha256_hex(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// Generate a new high-entropy opaque refresh token (item 121, A4): 256 bits
+/// from the OS CSPRNG (the same `OsRng` [`hash_password`] uses for salts),
+/// hex-encoded. Deliberately **not** a JWT — it carries no claims and is
+/// meaningless outside a `sessions` lookup, so it cannot be inspected,
+/// forged, or replayed without the server's own persisted state agreeing.
+fn generate_refresh_token() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// A persisted refresh-token session (item 121, A4). Keyed in [`AuthState::
+/// sessions`] by the SHA-256 hash of the raw opaque refresh token — the raw
+/// token is never stored, only ever handed to the client once, at issuance
+/// or rotation time.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SessionRec {
+    username: String,
+    issued_at: u64,
+    expires_at: u64,
+    revoked: bool,
 }
 
 /// A table-level privilege.
@@ -148,12 +213,24 @@ struct AuthState {
     /// never leaks into `tracing::debug!`/`{:?}` logging.
     #[serde(default)]
     credentials: BTreeMap<String, String>,
+    /// token_hash (SHA-256 hex of the raw refresh token) → session record
+    /// (item 121, A4). Never the raw token itself — see [`sha256_hex`] /
+    /// [`generate_refresh_token`]. `#[serde(default)]` so a pre-A4
+    /// `roles.json` (no `sessions` key) deserializes with an empty map — no
+    /// FORMAT_VERSION bump. Persisted (sessions must survive a restart);
+    /// kept out of `Debug` (see the manual impl below), same posture as
+    /// `credentials` — the hash is one-way, but the username/timestamps in
+    /// each record are still control-plane detail that shouldn't leak into
+    /// `tracing::debug!`/`{:?}` logging.
+    #[serde(default)]
+    sessions: BTreeMap<String, SessionRec>,
 }
 
-/// Manual `Debug`: every field except `credentials`, which is redacted to a
-/// count. Prevents an argon2id hash (a secret the CLAUDE.md rules for this
-/// milestone say must never appear in logs) from leaking via `{:?}` if
-/// `AuthState`/`RoleStore` internals are ever debug-printed.
+/// Manual `Debug`: every field except `credentials`/`sessions`, which are
+/// each redacted to a count. Prevents an argon2id hash (a secret the
+/// CLAUDE.md rules for this milestone say must never appear in logs) — and,
+/// as of item 121 A4, refresh-token session detail — from leaking via
+/// `{:?}` if `AuthState`/`RoleStore` internals are ever debug-printed.
 impl std::fmt::Debug for AuthState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthState")
@@ -165,6 +242,7 @@ impl std::fmt::Debug for AuthState {
                 "credentials",
                 &format!("<{} redacted>", self.credentials.len()),
             )
+            .field("sessions", &format!("<{} redacted>", self.sessions.len()))
             .finish()
     }
 }
@@ -412,6 +490,103 @@ impl RoleStore {
                 false
             }
         }
+    }
+
+    /// Issue a fresh refresh-token session for `user` (item 121, A4): a new
+    /// high-entropy opaque token ([`generate_refresh_token`]) is generated,
+    /// its SHA-256 hash is persisted as a [`SessionRec`] (never the raw
+    /// token), and the raw token + its absolute expiry (Unix seconds) are
+    /// returned for the caller to hand to the client exactly once.
+    pub fn create_session(&self, user: &str) -> Result<(String, u64)> {
+        let raw = generate_refresh_token();
+        let hash = sha256_hex(&raw);
+        let now = now_secs();
+        let expires_at = now + REFRESH_TOKEN_TTL_SECS;
+        let mut st = self.lock();
+        st.sessions.insert(
+            hash,
+            SessionRec {
+                username: user.to_string(),
+                issued_at: now,
+                expires_at,
+                revoked: false,
+            },
+        );
+        self.persist(&st)?;
+        Ok((raw, expires_at))
+    }
+
+    /// Verify a raw refresh token (item 121, A4): hashes it and looks up the
+    /// session record. Returns the session's username only when the record
+    /// exists, is not revoked, and has not expired — every other case
+    /// (unknown hash, expired, revoked) returns `None` uniformly, so a
+    /// caller building a 401 response can't distinguish *why* verification
+    /// failed. The raw token is never compared directly (only its hash is
+    /// looked up), which is what forecloses a timing oracle on the secret
+    /// itself — see [`sha256_hex`]'s doc comment.
+    pub fn verify_session(&self, raw_token: &str) -> Option<String> {
+        let hash = sha256_hex(raw_token);
+        let st = self.lock();
+        st.sessions.get(&hash).and_then(|rec| {
+            if !rec.revoked && rec.expires_at > now_secs() {
+                Some(rec.username.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Verify + rotate a refresh token in one call (item 121, A4): if
+    /// `raw_token` is a valid (unexpired, unrevoked, known) session, revoke
+    /// it and issue a brand-new one for the same user, persisting both
+    /// changes together. Returns `Ok(None)` — never an error — for the
+    /// unknown/expired/revoked cases, so `POST /auth/refresh` can map all
+    /// three to the identical uniform 401 exactly like [`Self::
+    /// verify_session`]. `Ok(Some((username, new_raw_token, expires_at)))`
+    /// on success.
+    pub fn rotate_session(&self, raw_token: &str) -> Result<Option<(String, String, u64)>> {
+        let old_hash = sha256_hex(raw_token);
+        let mut st = self.lock();
+        let username = match st.sessions.get(&old_hash) {
+            Some(rec) if !rec.revoked && rec.expires_at > now_secs() => rec.username.clone(),
+            _ => return Ok(None),
+        };
+        if let Some(rec) = st.sessions.get_mut(&old_hash) {
+            rec.revoked = true;
+        }
+        let new_raw = generate_refresh_token();
+        let new_hash = sha256_hex(&new_raw);
+        let now = now_secs();
+        let expires_at = now + REFRESH_TOKEN_TTL_SECS;
+        st.sessions.insert(
+            new_hash,
+            SessionRec {
+                username: username.clone(),
+                issued_at: now,
+                expires_at,
+                revoked: false,
+            },
+        );
+        self.persist(&st)?;
+        Ok(Some((username, new_raw, expires_at)))
+    }
+
+    /// Revoke a refresh-token session (item 121, A4: `POST /auth/logout`).
+    /// Idempotent by design: an unknown hash (already revoked, already
+    /// expired and pruned, or simply never issued) is a silent no-op, not an
+    /// error — logging out twice, or logging out with a stale/garbage token,
+    /// must never surface a distinguishable error to the caller. Returns
+    /// `Err` only for a genuine persistence (disk I/O) failure.
+    pub fn revoke_session(&self, raw_token: &str) -> Result<()> {
+        let hash = sha256_hex(raw_token);
+        let mut st = self.lock();
+        if let Some(rec) = st.sessions.get_mut(&hash) {
+            if !rec.revoked {
+                rec.revoked = true;
+                self.persist(&st)?;
+            }
+        }
+        Ok(())
     }
 
     /// Whether `user` holds `priv` on `table`, resolving role membership
@@ -1142,5 +1317,169 @@ mod tests {
         let stmt_debug = format!("{stmt:?}");
         assert!(!stmt_debug.contains("another-secret"));
         assert!(stmt_debug.contains("redacted"));
+    }
+
+    // ── item 121, A4: refresh-token sessions ───────────────────────────────
+
+    #[test]
+    fn create_session_returns_high_entropy_token_and_verifies() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        store
+            .apply(&AuthStmt::CreateUser {
+                name: "hank".into(),
+                superuser: false,
+                password: None,
+            })
+            .unwrap();
+
+        let (raw, expires_at) = store.create_session("hank").unwrap();
+        // 32 bytes hex-encoded = 64 hex chars.
+        assert_eq!(raw.len(), 64);
+        assert!(expires_at > now_secs());
+        assert_eq!(store.verify_session(&raw), Some("hank".to_string()));
+
+        // Two sessions for the same user never collide.
+        let (raw2, _) = store.create_session("hank").unwrap();
+        assert_ne!(raw, raw2);
+        assert_eq!(store.verify_session(&raw2), Some("hank".to_string()));
+
+        // The raw token never appears in the persisted file — only its hash.
+        let on_disk = std::fs::read_to_string(dir.path().join("roles.json")).unwrap();
+        assert!(!on_disk.contains(&raw));
+        assert!(on_disk.contains(&sha256_hex(&raw)));
+    }
+
+    #[test]
+    fn verify_session_rejects_unknown_and_garbage_tokens() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        assert_eq!(store.verify_session("not-a-real-token"), None);
+        assert_eq!(store.verify_session(""), None);
+    }
+
+    #[test]
+    fn rotate_session_revokes_old_and_issues_new_for_same_user() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        store
+            .apply(&AuthStmt::CreateUser {
+                name: "iris".into(),
+                superuser: false,
+                password: None,
+            })
+            .unwrap();
+        let (raw, _) = store.create_session("iris").unwrap();
+
+        let (username, new_raw, _expires_at) = store
+            .rotate_session(&raw)
+            .unwrap()
+            .expect("valid session must rotate");
+        assert_eq!(username, "iris");
+        assert_ne!(new_raw, raw);
+
+        // The old token no longer verifies (revoked); the new one does.
+        assert_eq!(store.verify_session(&raw), None);
+        assert_eq!(store.verify_session(&new_raw), Some("iris".to_string()));
+
+        // Rotating the now-revoked old token again fails uniformly (None,
+        // not an error) — same shape as an unknown token.
+        assert!(store.rotate_session(&raw).unwrap().is_none());
+    }
+
+    #[test]
+    fn rotate_session_rejects_unknown_token() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        assert!(store.rotate_session("garbage").unwrap().is_none());
+    }
+
+    #[test]
+    fn revoke_session_is_idempotent_and_blocks_further_use() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        store
+            .apply(&AuthStmt::CreateUser {
+                name: "jack".into(),
+                superuser: false,
+                password: None,
+            })
+            .unwrap();
+        let (raw, _) = store.create_session("jack").unwrap();
+        assert_eq!(store.verify_session(&raw), Some("jack".to_string()));
+
+        store.revoke_session(&raw).unwrap();
+        assert_eq!(store.verify_session(&raw), None);
+
+        // Revoking again (already revoked) and revoking an unknown token are
+        // both silent no-ops, never an error.
+        assert!(store.revoke_session(&raw).is_ok());
+        assert!(store.revoke_session("never-issued").is_ok());
+    }
+
+    #[test]
+    fn expired_session_fails_verification() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        store
+            .apply(&AuthStmt::CreateUser {
+                name: "karen".into(),
+                superuser: false,
+                password: None,
+            })
+            .unwrap();
+        let (raw, _) = store.create_session("karen").unwrap();
+        // Reach into the persisted state and force the expiry into the past
+        // (avoids a real-time sleep in a unit test).
+        {
+            let mut st = store.lock();
+            for rec in st.sessions.values_mut() {
+                rec.expires_at = now_secs().saturating_sub(1);
+            }
+            store.persist(&st).unwrap();
+        }
+        assert_eq!(store.verify_session(&raw), None);
+        assert!(store.rotate_session(&raw).unwrap().is_none());
+    }
+
+    #[test]
+    fn sessions_survive_reopen() {
+        let dir = tempdir().unwrap();
+        let raw = {
+            let store = RoleStore::open(dir.path()).unwrap();
+            store
+                .apply(&AuthStmt::CreateUser {
+                    name: "laura".into(),
+                    superuser: false,
+                    password: None,
+                })
+                .unwrap();
+            store.create_session("laura").unwrap().0
+        };
+        let store = RoleStore::open(dir.path()).unwrap();
+        assert_eq!(store.verify_session(&raw), Some("laura".to_string()));
+    }
+
+    #[test]
+    fn auth_state_debug_never_prints_session_detail() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        store
+            .apply(&AuthStmt::CreateUser {
+                name: "mallory".into(),
+                superuser: false,
+                password: None,
+            })
+            .unwrap();
+        let (raw, _) = store.create_session("mallory").unwrap();
+        let debug_str = format!("{:?}", store.lock());
+        // The raw refresh token (the actual secret) must never appear.
+        assert!(!debug_str.contains(&raw));
+        // The session's hash-keyed detail is redacted to a count — note
+        // "mallory" itself legitimately still appears via the unrelated
+        // `users` field (usernames aren't secret), so this only checks the
+        // `sessions` field specifically prints a redacted count.
+        assert!(debug_str.contains("sessions"));
+        assert!(debug_str.contains("redacted"));
     }
 }

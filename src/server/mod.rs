@@ -106,6 +106,11 @@ pub struct AppState {
     /// `POST /auth/login` can issue tokens.  None = login disabled (production
     /// default; Milestone-18 "verify-only" stays intact).
     pub dev_login_jwt: Option<auth::JwtConfig>,
+    /// `UNIDB_ALLOW_SIGNUP=1` (item 121, A3) — activates `POST /auth/signup`.
+    /// `false` by default (opt-in, not open by default); when `false` the
+    /// route returns 404, indistinguishable from a non-existent route, same
+    /// posture as `dev_login_jwt` being `None`.
+    pub allow_signup: bool,
 }
 
 /// Resolve the log directory the same way `src/bin/unidb-server.rs` does, so
@@ -144,12 +149,19 @@ impl AppState {
             log_dir: Arc::new(default_log_dir()),
             storage: None,
             dev_login_jwt: None,
+            allow_signup: false,
         }
     }
 
     /// Activate dev-only login (`UNIDB_DEV_LOGIN=1`).  See `auth::JwtConfig::with_dev_login`.
     pub fn with_dev_login(mut self, jwt: auth::JwtConfig) -> Self {
         self.dev_login_jwt = Some(jwt);
+        self
+    }
+
+    /// Activate `POST /auth/signup` (`UNIDB_ALLOW_SIGNUP=1`, item 121, A3).
+    pub fn with_allow_signup(mut self, allow: bool) -> Self {
+        self.allow_signup = allow;
         self
     }
 

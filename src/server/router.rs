@@ -155,6 +155,11 @@ pub fn build_router(
     let auth_public = Router::new()
         .route("/auth/meta", get(handlers::get_auth_meta))
         .route("/auth/login", post(handlers::post_auth_login))
+        // item 121 A3: POST /auth/signup — 404s unless UNIDB_ALLOW_SIGNUP=1.
+        .route("/auth/signup", post(handlers::post_auth_signup))
+        // item 121 A4: refresh tokens + sessions + logout.
+        .route("/auth/refresh", post(handlers::post_auth_refresh))
+        .route("/auth/logout", post(handlers::post_auth_logout))
         .with_state(state.clone());
 
     let metrics_state = state;
