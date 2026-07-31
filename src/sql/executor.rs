@@ -3088,21 +3088,47 @@ fn exec_update(
     };
     // Item 36: gate FK parent-side RESTRICT (does any child table reference us?).
     let has_fk_children = table_has_fk_children(ctx.catalog.get(), table);
+    // Item 117 (2026-07-30): gate the UNIQUE/PK re-check the same way item 53
+    // gates the FK check — only when a unique/PK column actually appears in the
+    // SET clause. If no unique column changes, the new row's key equals the old
+    // row's key, so `enforce_unique` can only ever match this row's own excluded
+    // old version — the check (plus its phantom lock and fresh snapshot) is pure
+    // overhead. This is also what lets a PK'd table take the HOT fast path when it
+    // updates a NON-indexed column (the common case, e.g. `orders SET status`),
+    // instead of being forced onto the slow per-row loop by the mere existence of
+    // a PK. Safety: the unchanged unique-index entry still resolves to the live
+    // version via the same `get_visible` HOT-chain walk every secondary-index
+    // lookup uses (verified), and `set_touches_indexed_col` (which already checks
+    // `unique_index_root`) remains the backstop that forbids HOT when the unique/PK
+    // column itself is assigned.
+    let has_unique_in_set = has_unique && {
+        let set_col_names: std::collections::HashSet<&str> =
+            assignments.iter().map(|(col, _)| col.as_str()).collect();
+        unique_column_sets(&table_def)?
+            .iter()
+            .flatten()
+            .any(|&ci| set_col_names.contains(table_def.columns[ci].name.as_str()))
+    };
 
     // Item 58 HOT eligibility: try same-page HOT update (no B-tree update)
     // when all of the following hold:
-    //   1. No UNIQUE/PK index on this table (unique enforcement inserts new
-    //      B-tree entries pointing at the new slot — HOT would leave them
-    //      dangling at the old slot).
+    //   1. No UNIQUE/PK column *in the SET clause* (item 117). A unique/PK key
+    //      that actually changes must insert a new B-tree entry, which HOT would
+    //      leave dangling at the old slot — but that case is already caught by
+    //      condition (4), since `set_touches_indexed_col` checks
+    //      `unique_index_root`. So this reduces to `!has_unique_in_set`: a table
+    //      with a PK is HOT-eligible as long as the PK column isn't being changed
+    //      (the unchanged unique entry resolves via the HOT chain like any
+    //      secondary index — see the `has_unique_in_set` note above).
     //   2. No FK columns in SET (FK key enforcement likewise inserts new
     //      B-tree entries for the new value).
     //   3. No FK children referencing this table (RESTRICT check reads the
     //      old PK value, which must remain visible; HOT xmax-stamps it first,
     //      but the check runs before any mutation, so this is fine — but if
-    //      the parent changes its PK value in SET, (1) above would fire).
-    //   4. No indexed column in SET (secondary B-tree must be updated to the
-    //      new RowId; skipping it makes the row unfindable — see §0.6.2).
-    let hot_eligible = !has_unique
+    //      the parent changes its PK value in SET, (4) below would fire).
+    //   4. No indexed column in SET (secondary/unique B-tree must be updated to
+    //      the new RowId; skipping it makes the row unfindable — see §0.6.2).
+    let hot_eligible = !has_unique_in_set
         && !has_fk_refs_in_set
         && !has_fk_children
         && !set_touches_indexed_col(assignments, &table_def.columns);
@@ -3403,9 +3429,12 @@ fn exec_update(
         // UNIQUE + FK — acquire all phantom locks BEFORE taking a fresh
         // snapshot, then run uniqueness + FK checks with it (items 35/36/53).
         // RESTRICT on old PK also uses a fresh snapshot (after its lock).
-        if has_unique || has_fk_refs_in_set || has_fk_children {
+        if has_unique_in_set || has_fk_refs_in_set || has_fk_children {
             // Step 1: acquire UniqueKey + FkKey (child-side) phantom locks.
-            if has_unique {
+            // Item 117: only when a unique/PK column is actually in SET — an
+            // unchanged key needs no phantom lock (a concurrent inserter of the
+            // same key collides with this row's still-live version regardless).
+            if has_unique_in_set {
                 for (col_idx, col) in table_def.columns.iter().enumerate() {
                     if col.dropped || col.unique_index_root.is_none() {
                         continue;
@@ -3434,7 +3463,10 @@ fn exec_update(
             let usnap = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
             // UNIQUE: exclude the row's current version (old tuple still visible
             // to this snapshot until heap.update supersedes it).
-            if has_unique {
+            // Item 117: gated on has_unique_in_set — an unchanged key can only
+            // ever match this row's own excluded old version, so the check is a
+            // no-op that we skip.
+            if has_unique_in_set {
                 enforce_unique(
                     &table_def,
                     &coerced,
