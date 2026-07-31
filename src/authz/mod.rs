@@ -181,6 +181,241 @@ fn generate_session_id() -> String {
     out
 }
 
+/// Generate a new single-use MFA challenge token (item 127, Workstream D4):
+/// 256 bits from the OS CSPRNG, hex-encoded — same shape and construction as
+/// [`generate_refresh_token`], but a **separate token space**: an MFA
+/// challenge is never accepted where a refresh token is expected or vice
+/// versa (they key distinct maps, [`AuthState::sessions`] vs
+/// [`AuthState::mfa_challenges`]). Only its SHA-256 hash is ever persisted —
+/// see [`RoleStore::create_mfa_challenge`].
+fn generate_mfa_challenge_token() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+// ── item 127 (Workstream D4): TOTP-based MFA (RFC 6238) ────────────────────
+//
+// A small, self-contained HOTP/TOTP + base32 implementation on top of the
+// `hmac`/`sha1` crates (both already resolve in `Cargo.lock` as transitive
+// deps of the existing `jsonwebtoken`/`ring` chain — see `Cargo.toml`'s
+// comment). No external TOTP/base32 crate: base32 (RFC 4648) is ~20 lines
+// each way and keeps the dependency surface exactly what CLAUDE.md's coding
+// conventions ask for (the same "hand-roll the small thing" call the DER/JWK
+// reader in `server/auth.rs` already makes).
+
+/// RFC 6238 default time-step size: 30 seconds.
+const TOTP_STEP_SECS: u64 = 30;
+/// Clock-skew tolerance either side of "now", in whole steps (±1 step =
+/// ±30 s, so a code is accepted for a 90 s window centered on issuance —
+/// the standard Google-Authenticator-compatible tolerance).
+const TOTP_SKEW_STEPS: i64 = 1;
+/// MFA challenge token lifetime (item 127): long enough to read a 6-digit
+/// code off an authenticator app and type it in, short enough that a leaked
+/// challenge (e.g. captured in a proxy access log) is a narrow window, never
+/// a standing credential the way a refresh token is. `pub` so the server
+/// layer (`handlers.rs`) can echo the real TTL in `POST /auth/login`'s
+/// `mfa_required` response instead of duplicating the literal.
+pub const MFA_CHALLENGE_TTL_SECS: u64 = 5 * 60;
+/// Number of one-time recovery codes issued when MFA enrollment is confirmed
+/// (item 127). Matches the common industry default (GitHub/Google issue a
+/// similar-sized batch) — enough to cover several device-loss recoveries
+/// without becoming an unwieldy list to save.
+const RECOVERY_CODE_COUNT: usize = 8;
+
+const BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+/// RFC 4648 base32 encode, no padding (`=`) — the conventional shape for a
+/// TOTP `otpauth://` secret parameter (every mainstream authenticator app
+/// accepts unpadded base32 there).
+fn base32_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(5) * 8);
+    let mut buffer: u32 = 0;
+    let mut bits_left: u32 = 0;
+    for &byte in data {
+        buffer = (buffer << 8) | byte as u32;
+        bits_left += 8;
+        while bits_left >= 5 {
+            bits_left -= 5;
+            let idx = ((buffer >> bits_left) & 0x1f) as usize;
+            out.push(BASE32_ALPHABET[idx] as char);
+        }
+    }
+    if bits_left > 0 {
+        let idx = ((buffer << (5 - bits_left)) & 0x1f) as usize;
+        out.push(BASE32_ALPHABET[idx] as char);
+    }
+    out
+}
+
+/// Inverse of [`base32_encode`]. Case-insensitive, tolerates (and strips)
+/// trailing `=` padding a client might send back. `None` on any character
+/// outside the RFC 4648 alphabet — a corrupt/foreign secret must never panic
+/// recovery code, only fail closed (mirrors [`verify_password_hash`]'s "bad
+/// stored data ⇒ `false`/`None`, never panic" posture).
+fn base32_decode(s: &str) -> Option<Vec<u8>> {
+    let mut buffer: u32 = 0;
+    let mut bits_left: u32 = 0;
+    let mut out = Vec::with_capacity(s.len() * 5 / 8);
+    for c in s.trim().trim_end_matches('=').chars() {
+        let upper = c.to_ascii_uppercase();
+        let val = BASE32_ALPHABET.iter().position(|&b| b as char == upper)? as u32;
+        buffer = (buffer << 5) | val;
+        bits_left += 5;
+        if bits_left >= 8 {
+            bits_left -= 8;
+            out.push(((buffer >> bits_left) & 0xff) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Generate a fresh 160-bit TOTP secret (RFC 6238's recommended key length
+/// for HMAC-SHA1) from the OS CSPRNG.
+fn generate_totp_secret() -> Vec<u8> {
+    let mut bytes = [0u8; 20];
+    OsRng.fill_bytes(&mut bytes);
+    bytes.to_vec()
+}
+
+/// Generate one one-time recovery code (item 127): 48 bits from the OS
+/// CSPRNG, rendered as two 6-hex-digit groups (`xxxxxx-xxxxxx`) for
+/// readability. Only its SHA-256 hash is ever persisted — see
+/// [`RoleStore::mfa_confirm`] — the plaintext is returned to the caller
+/// exactly once.
+fn generate_recovery_code() -> String {
+    let mut bytes = [0u8; 6];
+    OsRng.fill_bytes(&mut bytes);
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!("{}-{}", &hex[0..6], &hex[6..12])
+}
+
+/// Constant-time string comparison (equal-length inputs; unequal lengths
+/// short-circuit — length is not the secret here, the *content* is). Used
+/// for both the 6-digit TOTP code compare and the recovery-code hash
+/// compare, so neither leaks timing information about how many leading
+/// digits/hex-chars matched.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (ab, bb) = (a.as_bytes(), b.as_bytes());
+    if ab.len() != bb.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in ab.iter().zip(bb.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// RFC 4226 HOTP: HMAC-SHA1 over the big-endian 8-byte `counter`, dynamic
+/// truncation, mod 10^6 for a 6-digit code. `None` only if `hmac` rejects
+/// the key outright (it never does for HMAC — any key length is valid — but
+/// the crate's API is fallible, and this module never panics on it per
+/// CLAUDE.md's "no `unwrap`/`expect` outside tests" rule).
+fn hotp(secret: &[u8], counter: u64) -> Option<u32> {
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha1::Sha1;
+    let mut mac = Hmac::<Sha1>::new_from_slice(secret).ok()?;
+    mac.update(&counter.to_be_bytes());
+    let result = mac.finalize().into_bytes();
+    let offset = (result[result.len() - 1] & 0x0f) as usize;
+    let bytes = result.get(offset..offset + 4)?;
+    let code = ((bytes[0] as u32 & 0x7f) << 24)
+        | ((bytes[1] as u32) << 16)
+        | ((bytes[2] as u32) << 8)
+        | (bytes[3] as u32);
+    Some(code % 1_000_000)
+}
+
+/// RFC 6238 TOTP at a given step counter: [`hotp`] with `counter = step`.
+fn totp_at_step(secret: &[u8], step: u64) -> Option<String> {
+    hotp(secret, step).map(|code| format!("{code:06}"))
+}
+
+/// Verify a caller-supplied 6-digit `code` against `secret`'s current TOTP
+/// window (±[`TOTP_SKEW_STEPS`] steps of clock skew either side of "now"),
+/// with **replay protection**: `last_used_step`, if `Some`, is the most
+/// recent step this secret has already been used to authenticate — any
+/// step `<= last_used_step` is rejected outright, so the exact code (or any
+/// earlier-window code) just consumed can never authenticate a second time,
+/// even if an attacker captures and instantly replays it. Constant-time code
+/// compare via [`constant_time_eq`]. Returns `Some(step)` (the step that
+/// matched — the caller persists it as the new `last_used_step`) on success,
+/// `None` uniformly for a malformed code, no match in the window, or a
+/// replayed step.
+fn verify_totp_code(secret: &[u8], code: &str, last_used_step: Option<i64>) -> Option<i64> {
+    let code = code.trim();
+    if code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let now = now_secs();
+    let current_step = (now / TOTP_STEP_SECS) as i64;
+    for delta in -TOTP_SKEW_STEPS..=TOTP_SKEW_STEPS {
+        let step = current_step + delta;
+        if step < 0 {
+            continue;
+        }
+        if let Some(last) = last_used_step {
+            if step <= last {
+                continue;
+            }
+        }
+        let Some(expected) = totp_at_step(secret, step as u64) else {
+            continue;
+        };
+        if constant_time_eq(&expected, code) {
+            return Some(step);
+        }
+    }
+    None
+}
+
+/// A user's TOTP enrollment (item 127, Workstream D4). `enabled == false` is
+/// the **pending** state after `POST /auth/mfa/enroll` — a secret exists but
+/// login does not yet require it, and no recovery codes have been minted.
+/// `enabled == true` (set by [`RoleStore::mfa_confirm`]) is the live,
+/// login-gating state. Never `Debug`-printed directly by any call site in
+/// this crate; [`AuthState`]'s manual `Debug` (below) redacts the whole
+/// `mfa` map to a count, the same posture as `credentials`/`sessions`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MfaRecord {
+    /// Base32-encoded 160-bit TOTP secret. Never logged, never returned by
+    /// `whoami`, only ever handed to the client once at enrollment time.
+    secret_base32: String,
+    enabled: bool,
+    /// SHA-256 hashes of the still-unused one-time recovery codes (never the
+    /// plaintext — same posture as [`AuthState::credentials`]). A used code
+    /// is removed from this list (single-use), never merely flagged.
+    #[serde(default)]
+    recovery_code_hashes: Vec<String>,
+    /// The most recent TOTP step successfully consumed for this secret
+    /// (replay protection — see [`verify_totp_code`]). `None` until the
+    /// first successful verification.
+    #[serde(default)]
+    last_used_step: Option<i64>,
+}
+
+/// A pending, single-use MFA login challenge (item 127): issued by `POST
+/// /auth/login` when the authenticating user has MFA enabled, in place of a
+/// full session. Keyed in [`AuthState::mfa_challenges`] by the SHA-256 hash
+/// of the raw opaque challenge token — the raw token itself is never
+/// persisted, mirroring [`SessionRec`]'s "only the hash is stored" posture.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MfaChallengeRec {
+    username: String,
+    issued_at: u64,
+    expires_at: u64,
+    /// Single-use: set the moment a challenge is successfully redeemed via
+    /// [`RoleStore::verify_mfa_challenge`] so the same challenge (even
+    /// re-presented with a still-fresh TOTP code before it expires) can
+    /// never mint a second session.
+    used: bool,
+}
+
 /// A persisted refresh-token session (item 121, A4). Keyed in [`AuthState::
 /// sessions`] by the SHA-256 hash of the raw opaque refresh token — the raw
 /// token is never stored, only ever handed to the client once, at issuance
@@ -397,13 +632,29 @@ struct AuthState {
     /// `tracing::debug!`/`{:?}` logging.
     #[serde(default)]
     sessions: BTreeMap<String, SessionRec>,
+    /// username → TOTP MFA enrollment (item 127, Workstream D4). Never the
+    /// secret/recovery-code plaintext. `#[serde(default)]` so a pre-127
+    /// `roles.json` (no `mfa` key) deserializes with an empty map — no
+    /// FORMAT_VERSION bump. Kept out of `Debug` (see the manual impl below),
+    /// same posture as `credentials`/`sessions`.
+    #[serde(default)]
+    mfa: BTreeMap<String, MfaRecord>,
+    /// challenge_hash (SHA-256 hex of the raw MFA challenge token) → pending
+    /// login-challenge record (item 127). Never the raw challenge token
+    /// itself. `#[serde(default)]` so a pre-127 `roles.json` deserializes
+    /// with an empty map — no FORMAT_VERSION bump. Kept out of `Debug` (see
+    /// the manual impl below), same posture as `sessions`.
+    #[serde(default)]
+    mfa_challenges: BTreeMap<String, MfaChallengeRec>,
 }
 
-/// Manual `Debug`: every field except `credentials`/`sessions`, which are
-/// each redacted to a count. Prevents an argon2id hash (a secret the
-/// CLAUDE.md rules for this milestone say must never appear in logs) — and,
-/// as of item 121 A4, refresh-token session detail — from leaking via
-/// `{:?}` if `AuthState`/`RoleStore` internals are ever debug-printed.
+/// Manual `Debug`: every field except `credentials`/`sessions`/`mfa`/
+/// `mfa_challenges`, which are each redacted to a count. Prevents an
+/// argon2id hash (a secret the CLAUDE.md rules for this milestone say must
+/// never appear in logs) — and, as of item 121 A4, refresh-token session
+/// detail, and as of item 127, TOTP secrets/recovery-code hashes — from
+/// leaking via `{:?}` if `AuthState`/`RoleStore` internals are ever
+/// debug-printed.
 impl std::fmt::Debug for AuthState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthState")
@@ -416,6 +667,11 @@ impl std::fmt::Debug for AuthState {
                 &format!("<{} redacted>", self.credentials.len()),
             )
             .field("sessions", &format!("<{} redacted>", self.sessions.len()))
+            .field("mfa", &format!("<{} redacted>", self.mfa.len()))
+            .field(
+                "mfa_challenges",
+                &format!("<{} redacted>", self.mfa_challenges.len()),
+            )
             .finish()
     }
 }
@@ -885,6 +1141,244 @@ impl RoleStore {
         Ok(())
     }
 
+    // ── item 127 (Workstream D4): TOTP MFA ──────────────────────────────
+
+    /// `POST /auth/mfa/enroll`'s embedded-API entry point: generate a fresh
+    /// per-user TOTP secret, store it as **pending** (MFA is not enabled
+    /// yet — see [`Self::mfa_confirm`]), and return `(base32_secret,
+    /// otpauth_uri)` for the caller to render as a QR code / hand to an
+    /// authenticator app. Errors if `user` doesn't exist, or if MFA is
+    /// already enabled (re-enrolling over a live enrollment must go through
+    /// `POST /auth/mfa/disable` first — this prevents silently invalidating
+    /// a user's already-working authenticator without their confirmation).
+    /// Re-calling while a *pending* (unconfirmed) enrollment exists is
+    /// allowed and simply replaces it with a fresh secret — a user who lost
+    /// the QR code before confirming can just re-enroll.
+    pub fn mfa_enroll(&self, user: &str) -> Result<(String, String)> {
+        let mut st = self.lock();
+        if !st.users.contains_key(user) {
+            return Err(DbError::Authz(format!("user '{user}' not found")));
+        }
+        if st.mfa.get(user).map(|r| r.enabled).unwrap_or(false) {
+            return Err(DbError::Authz(
+                "MFA is already enabled for this user — disable it before re-enrolling".into(),
+            ));
+        }
+        let secret_base32 = base32_encode(&generate_totp_secret());
+        st.mfa.insert(
+            user.to_string(),
+            MfaRecord {
+                secret_base32: secret_base32.clone(),
+                enabled: false,
+                recovery_code_hashes: Vec::new(),
+                last_used_step: None,
+            },
+        );
+        self.persist(&st)?;
+        let otpauth_uri =
+            format!("otpauth://totp/unidb:{user}?secret={secret_base32}&issuer=unidb");
+        tracing::info!(user = %user, "MFA enrollment started (pending confirmation)");
+        Ok((secret_base32, otpauth_uri))
+    }
+
+    /// `POST /auth/mfa/verify`'s embedded-API entry point: confirm a pending
+    /// enrollment ([`Self::mfa_enroll`]) with a live 6-digit TOTP `code`.
+    /// On success, MFA flips to **enabled**, a fresh batch of one-time
+    /// recovery codes is minted (only their SHA-256 hashes are persisted —
+    /// see [`RECOVERY_CODE_COUNT`]), and the plaintext codes are returned
+    /// for the caller to show exactly once. `Ok(None)` uniformly covers a
+    /// wrong/malformed/replayed code (no distinguishing oracle); `Err` only
+    /// for a real precondition failure — no pending enrollment, or MFA
+    /// already enabled.
+    pub fn mfa_confirm(&self, user: &str, code: &str) -> Result<Option<Vec<String>>> {
+        let mut st = self.lock();
+        let Some(rec) = st.mfa.get(user).cloned() else {
+            return Err(DbError::Authz(
+                "no pending MFA enrollment for this user — call POST /auth/mfa/enroll first".into(),
+            ));
+        };
+        if rec.enabled {
+            return Err(DbError::Authz(
+                "MFA is already enabled for this user".into(),
+            ));
+        }
+        let Some(secret_bytes) = base32_decode(&rec.secret_base32) else {
+            return Err(DbError::Authz("corrupt MFA secret".into()));
+        };
+        let Some(step) = verify_totp_code(&secret_bytes, code, rec.last_used_step) else {
+            return Ok(None);
+        };
+        let mut plaintext_codes = Vec::with_capacity(RECOVERY_CODE_COUNT);
+        let mut hashes = Vec::with_capacity(RECOVERY_CODE_COUNT);
+        for _ in 0..RECOVERY_CODE_COUNT {
+            let plain = generate_recovery_code();
+            hashes.push(sha256_hex(&plain));
+            plaintext_codes.push(plain);
+        }
+        st.mfa.insert(
+            user.to_string(),
+            MfaRecord {
+                secret_base32: rec.secret_base32,
+                enabled: true,
+                recovery_code_hashes: hashes,
+                last_used_step: Some(step),
+            },
+        );
+        self.persist(&st)?;
+        tracing::info!(user = %user, "MFA enabled");
+        Ok(Some(plaintext_codes))
+    }
+
+    /// Whether `user` currently has MFA **enabled** (not merely pending) —
+    /// used by the login gate (`POST /auth/login`) and `GET /auth/whoami`.
+    /// `false` for an unknown user (same fail-closed posture as every other
+    /// lookup on a name that isn't in the store).
+    pub fn mfa_enabled(&self, user: &str) -> bool {
+        self.lock()
+            .mfa
+            .get(user)
+            .map(|r| r.enabled)
+            .unwrap_or(false)
+    }
+
+    /// `POST /auth/mfa/disable`'s embedded-API entry point. `skip_code_check
+    /// == true` is the superuser-bypass path (the caller/handler has already
+    /// established the actor is a superuser); otherwise `code` must be
+    /// `Some` and must verify (TOTP or a recovery code) or the call fails.
+    /// Errors if MFA isn't currently enabled for `user`. Returns `Ok(true)`
+    /// on success, `Ok(false)` for a present-but-wrong code (maps to a
+    /// uniform 401 at the HTTP layer — no oracle on *why* the code was
+    /// rejected).
+    pub fn mfa_disable(
+        &self,
+        user: &str,
+        code: Option<&str>,
+        skip_code_check: bool,
+    ) -> Result<bool> {
+        let mut st = self.lock();
+        let Some(rec) = st.mfa.get(user).cloned() else {
+            return Err(DbError::Authz("MFA is not enabled for this user".into()));
+        };
+        if !rec.enabled {
+            return Err(DbError::Authz("MFA is not enabled for this user".into()));
+        }
+        if !skip_code_check {
+            let Some(code) = code else {
+                return Ok(false);
+            };
+            let verified = match base32_decode(&rec.secret_base32) {
+                Some(secret_bytes) => {
+                    verify_totp_code(&secret_bytes, code, rec.last_used_step).is_some()
+                }
+                None => false,
+            } || st
+                .mfa
+                .get(user)
+                .map(|r| {
+                    r.recovery_code_hashes
+                        .iter()
+                        .any(|h| constant_time_eq(h, &sha256_hex(code.trim())))
+                })
+                .unwrap_or(false);
+            if !verified {
+                return Ok(false);
+            }
+        }
+        st.mfa.remove(user);
+        self.persist(&st)?;
+        tracing::info!(user = %user, superuser_bypass = skip_code_check, "MFA disabled");
+        Ok(true)
+    }
+
+    /// `POST /auth/login`'s MFA gate: when [`Self::mfa_enabled`] is true for
+    /// the (already password-verified) `user`, this issues a short-lived,
+    /// single-use MFA challenge **instead of** a full session — see
+    /// [`Self::verify_mfa_challenge`] for the redeem side. Returns
+    /// `(raw_challenge_token, expires_at_unix_secs)`; only the token's
+    /// SHA-256 hash is persisted, mirroring [`Self::create_session`].
+    pub fn create_mfa_challenge(&self, user: &str) -> Result<(String, u64)> {
+        let raw = generate_mfa_challenge_token();
+        let hash = sha256_hex(&raw);
+        let now = now_secs();
+        let expires_at = now + MFA_CHALLENGE_TTL_SECS;
+        let mut st = self.lock();
+        st.mfa_challenges.insert(
+            hash,
+            MfaChallengeRec {
+                username: user.to_string(),
+                issued_at: now,
+                expires_at,
+                used: false,
+            },
+        );
+        self.persist(&st)?;
+        Ok((raw, expires_at))
+    }
+
+    /// `POST /auth/mfa/challenge`'s embedded-API entry point: redeem a raw
+    /// MFA challenge token plus a 6-digit TOTP code (or a one-time recovery
+    /// code) for the username that owns it. `Ok(Some(username))` on success
+    /// — the caller (the HTTP handler) then mints a real session via the
+    /// normal [`Self::create_session`] path, exactly like a non-MFA login.
+    /// `Ok(None)` uniformly covers every failure case: unknown/garbage
+    /// challenge, expired challenge, already-used (single-use) challenge,
+    /// MFA no longer enabled for the owning user (fail-closed if it was
+    /// disabled between issuing the challenge and redeeming it), or a
+    /// wrong/replayed code — no oracle distinguishing *why* it failed. A
+    /// successfully-verified TOTP step or consumed recovery code is
+    /// persisted atomically with marking the challenge used, so a retried
+    /// request after a successful-but-uncommitted attempt can never replay.
+    pub fn verify_mfa_challenge(&self, raw_challenge: &str, code: &str) -> Result<Option<String>> {
+        let hash = sha256_hex(raw_challenge);
+        let mut st = self.lock();
+        let Some(chal) = st.mfa_challenges.get(&hash).cloned() else {
+            return Ok(None);
+        };
+        if chal.used || chal.expires_at <= now_secs() {
+            return Ok(None);
+        }
+        let Some(rec) = st.mfa.get(&chal.username).cloned() else {
+            return Ok(None);
+        };
+        if !rec.enabled {
+            return Ok(None);
+        }
+        let totp_step = base32_decode(&rec.secret_base32)
+            .and_then(|secret_bytes| verify_totp_code(&secret_bytes, code, rec.last_used_step));
+        let verified = if let Some(step) = totp_step {
+            if let Some(r) = st.mfa.get_mut(&chal.username) {
+                r.last_used_step = Some(step);
+            }
+            true
+        } else {
+            let candidate_hash = sha256_hex(code.trim());
+            match st.mfa.get_mut(&chal.username) {
+                Some(r) => {
+                    match r
+                        .recovery_code_hashes
+                        .iter()
+                        .position(|h| constant_time_eq(h, &candidate_hash))
+                    {
+                        Some(pos) => {
+                            r.recovery_code_hashes.remove(pos);
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                None => false,
+            }
+        };
+        if !verified {
+            return Ok(None);
+        }
+        if let Some(c) = st.mfa_challenges.get_mut(&hash) {
+            c.used = true;
+        }
+        self.persist(&st)?;
+        Ok(Some(chal.username))
+    }
+
     /// Whether `user` holds `priv` on `table` **at all** — `true` for both a
     /// whole-table grant and a column-scoped grant with at least one column
     /// (item 112: this existence check is deliberately coarser than column
@@ -1196,6 +1690,10 @@ impl RoleStore {
                 st.memberships.remove(name);
                 st.table_grants.remove(name);
                 st.credentials.remove(name);
+                // item 127: a dropped user's MFA enrollment (secret +
+                // recovery-code hashes) must not linger — mirrors dropping
+                // `credentials` above.
+                st.mfa.remove(name);
             }
             AuthStmt::AlterUserPassword { name, password } => {
                 if !st.users.contains_key(name) {
@@ -2656,5 +3154,291 @@ mod tests {
         let store2 = RoleStore::open(dir.path()).unwrap();
         assert!(store2.has_privilege("bob", "accounts", Privilege::Select));
         assert!(store2.has_privilege("bob", "accounts", Privilege::Delete));
+    }
+
+    // ── item 127 (Workstream D4): TOTP MFA ─────────────────────────────────
+
+    /// RFC 4226 Appendix D's official HOTP test vectors (secret =
+    /// `"12345678901234567890"`, ASCII, 20 bytes) — proves [`hotp`] against a
+    /// reference implementation, not just self-consistency.
+    #[test]
+    fn hotp_matches_rfc4226_test_vectors() {
+        let secret = b"12345678901234567890";
+        let expected: [u32; 10] = [
+            755224, 287082, 359152, 969429, 338314, 254676, 287922, 162583, 399871, 520489,
+        ];
+        for (counter, &want) in expected.iter().enumerate() {
+            assert_eq!(
+                hotp(secret, counter as u64),
+                Some(want),
+                "counter={counter}"
+            );
+        }
+    }
+
+    #[test]
+    fn base32_round_trips_arbitrary_bytes() {
+        for len in [0usize, 1, 5, 10, 20, 33] {
+            let mut bytes = vec![0u8; len];
+            OsRng.fill_bytes(&mut bytes);
+            let encoded = base32_encode(&bytes);
+            // No padding characters, uppercase RFC 4648 alphabet only.
+            assert!(!encoded.contains('='));
+            let decoded = base32_decode(&encoded).expect("round-trip decode must succeed");
+            assert_eq!(decoded, bytes, "len={len}");
+        }
+    }
+
+    #[test]
+    fn base32_decode_is_case_insensitive_and_rejects_garbage() {
+        let bytes = b"hello unidb!";
+        let encoded = base32_encode(bytes);
+        assert_eq!(base32_decode(&encoded.to_ascii_lowercase()).unwrap(), bytes);
+        assert!(base32_decode("not valid base32!!!").is_none());
+    }
+
+    /// Compute the *current* valid TOTP code straight from a base32 secret —
+    /// the deterministic "derive the expected code" approach the task spec
+    /// asks for, rather than sleeping across a 30 s step boundary.
+    fn current_totp_code(secret_base32: &str) -> String {
+        let secret = base32_decode(secret_base32).unwrap();
+        let step = now_secs() / TOTP_STEP_SECS;
+        totp_at_step(&secret, step).unwrap()
+    }
+
+    fn setup_user_for_mfa(store: &RoleStore, name: &str) {
+        store
+            .apply(&AuthStmt::CreateUser {
+                name: name.into(),
+                superuser: false,
+                password: Some(format!("{name}-pw")),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn mfa_enroll_then_confirm_enables_and_returns_recovery_codes() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        setup_user_for_mfa(&store, "alice");
+
+        assert!(!store.mfa_enabled("alice"));
+        let (secret_b32, uri) = store.mfa_enroll("alice").unwrap();
+        assert!(uri.starts_with("otpauth://totp/unidb:alice?secret="));
+        assert!(uri.contains(&secret_b32));
+        assert!(uri.contains("issuer=unidb"));
+        // Still not enabled — enrollment is pending until confirmed.
+        assert!(!store.mfa_enabled("alice"));
+
+        let code = current_totp_code(&secret_b32);
+        let recovery_codes = store
+            .mfa_confirm("alice", &code)
+            .unwrap()
+            .expect("a valid current code must confirm enrollment");
+        assert_eq!(recovery_codes.len(), RECOVERY_CODE_COUNT);
+        // Every recovery code is unique.
+        let unique: BTreeSet<_> = recovery_codes.iter().collect();
+        assert_eq!(unique.len(), RECOVERY_CODE_COUNT);
+        assert!(store.mfa_enabled("alice"));
+
+        // Persists across reopen.
+        let store2 = RoleStore::open(dir.path()).unwrap();
+        assert!(store2.mfa_enabled("alice"));
+
+        // The plaintext secret and recovery codes never land in roles.json.
+        let raw = std::fs::read_to_string(dir.path().join("roles.json")).unwrap();
+        for rc in &recovery_codes {
+            assert!(!raw.contains(rc));
+        }
+    }
+
+    #[test]
+    fn mfa_confirm_wrong_code_returns_none_and_stays_pending() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        setup_user_for_mfa(&store, "bob");
+        store.mfa_enroll("bob").unwrap();
+
+        assert_eq!(store.mfa_confirm("bob", "000000").unwrap(), None);
+        assert!(!store.mfa_enabled("bob"));
+    }
+
+    #[test]
+    fn mfa_confirm_without_enrollment_is_an_error() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        setup_user_for_mfa(&store, "carol");
+        assert!(store.mfa_confirm("carol", "123456").is_err());
+    }
+
+    #[test]
+    fn mfa_replay_of_same_code_is_rejected() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        setup_user_for_mfa(&store, "dave");
+        let (secret_b32, _) = store.mfa_enroll("dave").unwrap();
+        let code = current_totp_code(&secret_b32);
+        store.mfa_confirm("dave", &code).unwrap().unwrap();
+
+        // The exact same code/step, presented again via a fresh challenge,
+        // must be rejected — replay protection via `last_used_step`.
+        let (challenge, _) = store.create_mfa_challenge("dave").unwrap();
+        assert_eq!(store.verify_mfa_challenge(&challenge, &code).unwrap(), None);
+    }
+
+    #[test]
+    fn mfa_login_challenge_succeeds_with_valid_code_and_is_single_use() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        setup_user_for_mfa(&store, "erin");
+        let (secret_b32, _) = store.mfa_enroll("erin").unwrap();
+        let enroll_code = current_totp_code(&secret_b32);
+        store.mfa_confirm("erin", &enroll_code).unwrap().unwrap();
+
+        let (challenge, expires_at) = store.create_mfa_challenge("erin").unwrap();
+        assert!(expires_at > now_secs());
+
+        // Wrong code fails, challenge remains usable.
+        assert_eq!(
+            store.verify_mfa_challenge(&challenge, "000000").unwrap(),
+            None
+        );
+
+        // A fresh valid code (next un-replayed step) succeeds.
+        let secret_bytes = base32_decode(&secret_b32).unwrap();
+        let next_step = (now_secs() / TOTP_STEP_SECS) as i64 + 1;
+        let fresh_code = totp_at_step(&secret_bytes, next_step as u64).unwrap();
+        let owner = store.verify_mfa_challenge(&challenge, &fresh_code).unwrap();
+        assert_eq!(owner, Some("erin".to_string()));
+
+        // The same challenge cannot be redeemed a second time even with a
+        // fresh, still-valid code (single-use).
+        let next_step2 = next_step + 1;
+        let fresh_code2 = totp_at_step(&secret_bytes, next_step2 as u64).unwrap();
+        assert_eq!(
+            store
+                .verify_mfa_challenge(&challenge, &fresh_code2)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn mfa_challenge_unknown_or_garbage_token_returns_none() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        assert_eq!(
+            store
+                .verify_mfa_challenge("not-a-real-challenge", "123456")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn mfa_recovery_code_works_once_then_is_consumed() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        setup_user_for_mfa(&store, "frank");
+        let (secret_b32, _) = store.mfa_enroll("frank").unwrap();
+        let enroll_code = current_totp_code(&secret_b32);
+        let recovery_codes = store.mfa_confirm("frank", &enroll_code).unwrap().unwrap();
+        let rc = recovery_codes[0].clone();
+
+        let (challenge1, _) = store.create_mfa_challenge("frank").unwrap();
+        let owner = store.verify_mfa_challenge(&challenge1, &rc).unwrap();
+        assert_eq!(owner, Some("frank".to_string()));
+
+        // The same recovery code cannot be used again, even against a brand
+        // new challenge.
+        let (challenge2, _) = store.create_mfa_challenge("frank").unwrap();
+        assert_eq!(store.verify_mfa_challenge(&challenge2, &rc).unwrap(), None);
+
+        // The remaining, unused recovery codes still work.
+        let (challenge3, _) = store.create_mfa_challenge("frank").unwrap();
+        let owner2 = store
+            .verify_mfa_challenge(&challenge3, &recovery_codes[1])
+            .unwrap();
+        assert_eq!(owner2, Some("frank".to_string()));
+    }
+
+    #[test]
+    fn mfa_disable_requires_valid_code_unless_superuser_bypass() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        setup_user_for_mfa(&store, "gina");
+        let (secret_b32, _) = store.mfa_enroll("gina").unwrap();
+        let enroll_code = current_totp_code(&secret_b32);
+        store.mfa_confirm("gina", &enroll_code).unwrap().unwrap();
+        assert!(store.mfa_enabled("gina"));
+
+        // Wrong code, no bypass: rejected, MFA stays enabled.
+        assert!(!store.mfa_disable("gina", Some("000000"), false).unwrap());
+        assert!(store.mfa_enabled("gina"));
+
+        // No code at all, no bypass: rejected.
+        assert!(!store.mfa_disable("gina", None, false).unwrap());
+        assert!(store.mfa_enabled("gina"));
+
+        // Superuser bypass disables unconditionally, no code needed.
+        assert!(store.mfa_disable("gina", None, true).unwrap());
+        assert!(!store.mfa_enabled("gina"));
+    }
+
+    #[test]
+    fn mfa_disable_with_valid_totp_code_succeeds() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        setup_user_for_mfa(&store, "henry");
+        let (secret_b32, _) = store.mfa_enroll("henry").unwrap();
+        let enroll_code = current_totp_code(&secret_b32);
+        store.mfa_confirm("henry", &enroll_code).unwrap().unwrap();
+
+        let secret_bytes = base32_decode(&secret_b32).unwrap();
+        let next_step = (now_secs() / TOTP_STEP_SECS) as i64 + 1;
+        let fresh_code = totp_at_step(&secret_bytes, next_step as u64).unwrap();
+        assert!(store
+            .mfa_disable("henry", Some(&fresh_code), false)
+            .unwrap());
+        assert!(!store.mfa_enabled("henry"));
+    }
+
+    #[test]
+    fn mfa_disable_without_enrollment_is_an_error() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        setup_user_for_mfa(&store, "iris");
+        assert!(store.mfa_disable("iris", None, true).is_err());
+    }
+
+    #[test]
+    fn drop_user_clears_mfa_enrollment() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        setup_user_for_mfa(&store, "jack");
+        let (secret_b32, _) = store.mfa_enroll("jack").unwrap();
+        let enroll_code = current_totp_code(&secret_b32);
+        store.mfa_confirm("jack", &enroll_code).unwrap().unwrap();
+        assert!(store.mfa_enabled("jack"));
+
+        store.apply(&AuthStmt::DropUser("jack".into())).unwrap();
+        assert!(!store.mfa_enabled("jack"));
+    }
+
+    #[test]
+    fn auth_state_debug_never_leaks_mfa_secret_or_recovery_codes() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        setup_user_for_mfa(&store, "kate");
+        let (secret_b32, _) = store.mfa_enroll("kate").unwrap();
+        let enroll_code = current_totp_code(&secret_b32);
+        let recovery_codes = store.mfa_confirm("kate", &enroll_code).unwrap().unwrap();
+
+        let debug_str = format!("{:?}", store.lock());
+        assert!(!debug_str.contains(&secret_b32));
+        for rc in &recovery_codes {
+            assert!(!debug_str.contains(rc));
+        }
+        assert!(debug_str.contains("redacted"));
     }
 }

@@ -122,6 +122,15 @@ pub fn build_router_with_rate_limiter(
         // item 4: DELETE /auth/sessions/{id} — revoke a specific session by
         // its opaque id (superuser/self gated; see the handler's doc comment).
         .route("/auth/sessions/{id}", delete(handlers::delete_auth_session))
+        // item 127 (Workstream D4): TOTP MFA enroll/verify/disable — all
+        // three act on the caller's own account and so require the same JWT
+        // this whole `protected` sub-router already enforces. The MFA login
+        // gate itself (`POST /auth/mfa/challenge`) is deliberately NOT here —
+        // it runs *before* a session exists, alongside `/auth/login`, in the
+        // rate-limited public router below.
+        .route("/auth/mfa/enroll", post(handlers::post_mfa_enroll))
+        .route("/auth/mfa/verify", post(handlers::post_mfa_verify))
+        .route("/auth/mfa/disable", post(handlers::post_mfa_disable))
         .route("/events/head", get(handlers::get_events_head))
         .route("/events/subscribe", get(sse::get_events_subscribe))
         .route("/events/ack", post(handlers::post_events_ack))
@@ -229,6 +238,13 @@ pub fn build_router_with_rate_limiter(
         .route("/auth/signup", post(handlers::post_auth_signup))
         // item 121 A4: refresh tokens + sessions + logout.
         .route("/auth/refresh", post(handlers::post_auth_refresh))
+        // item 127 (Workstream D4): redeem an MFA login challenge for a real
+        // session. Reachable with no bearer token (same as login/signup/
+        // refresh) and guesses a 6-digit code, so it shares the exact same
+        // brute-force protection — its own independent rate-limit bucket,
+        // keyed by IP+path (see `rate_limit.rs`'s module doc; the body has
+        // no `username` field to additionally key on, same as `/auth/refresh`).
+        .route("/auth/mfa/challenge", post(handlers::post_mfa_challenge))
         .route_layer(axum::middleware::from_fn_with_state(
             auth_rate_limiter,
             crate::server::rate_limit::rate_limit_auth,
