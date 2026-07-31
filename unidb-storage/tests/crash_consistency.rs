@@ -12,6 +12,7 @@ mod common;
 
 use std::time::Duration;
 
+use unidb::storage_api::StorageCaller;
 use unidb_storage::Reconciler;
 
 /// Direction 1: killed before/at the client PUT — pending metadata, no bytes.
@@ -20,12 +21,13 @@ use unidb_storage::Reconciler;
 #[tokio::test]
 async fn pending_without_bytes_is_compensated_and_dead_lettered() {
     let h = common::harness(4).await;
-    h.svc.create_bucket("b", None).await.unwrap();
+    let su = StorageCaller::superuser();
+    h.svc.create_bucket("b", &su, false).await.unwrap();
 
     // Outbox row written; the upload never happened.
     let _ticket = h
         .svc
-        .begin_upload("b", "lost.bin", None, None)
+        .begin_upload("b", "lost.bin", None, &su)
         .await
         .unwrap();
     assert!(h.store.is_empty(), "no bytes were uploaded");
@@ -75,9 +77,10 @@ async fn orphan_bytes_without_metadata_are_swept() {
 #[tokio::test]
 async fn pending_with_bytes_is_confirmed_not_compensated_or_swept() {
     let h = common::harness(4).await;
-    h.svc.create_bucket("b", None).await.unwrap();
+    let su = StorageCaller::superuser();
+    h.svc.create_bucket("b", &su, false).await.unwrap();
 
-    let ticket = h.svc.begin_upload("b", "ok.bin", None, None).await.unwrap();
+    let ticket = h.svc.begin_upload("b", "ok.bin", None, &su).await.unwrap();
     h.store.seed(&ticket.storage_key, b"the bytes"); // upload landed
 
     let mut cfg = h.svc.config().clone();

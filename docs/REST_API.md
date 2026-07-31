@@ -1705,13 +1705,47 @@ by `server/error.rs`'s `ApiError` directly, not by a `DbError` variant.
 
 ---
 
-## Storage service routes (item 31)
+## Storage service routes (item 31; per-object authorization item 120 F1)
 
 Seven routes surface the `unidb-storage` app-layer crate as protected REST
 endpoints. All require a JWT bearer token. All return
 `503 {"error":"…","code":"STORAGE_NOT_AVAILABLE"}` when storage is not
 configured (`STORAGE_BACKEND` env var absent or init failed at startup) — the
 server boots cleanly without storage.
+
+### Per-object authorization (item 120, Workstream F1)
+
+Every object route (list/put/delete/presign) resolves the caller's identity
+from the same JWT the rest of the server trusts (`AuthPrincipal` → `EngineHandle::
+storage_caller`, reusing `authz::RoleStore`) and gates as follows:
+
+- **Ownership.** The `objects` table's existing `created_by` column doubles as
+  the object's owner: `put_object` stamps it from the caller's JWT `sub` claim.
+  The owner may always read/write/delete their own objects.
+- **Public buckets (read-only exemption).** `POST /storage/buckets` accepts
+  `"is_public": true` (default `false` — private). Every object in a public
+  bucket is readable (list / presign-GET) by **any** authenticated caller,
+  regardless of ownership. Public status does **not** exempt writes or
+  deletes — those are always owner-or-bypass-only.
+- **Superuser / `service_role` bypass.** A named `SUPERUSER`, the implicit
+  embedded/no-`sub` caller, open/bootstrap mode (no users registered), or a
+  JWT carrying `"role": "service_role"` bypasses every rule — audited to
+  `audit.log` as `superuser_storage_bypass` / `service_role_storage_bypass`
+  (item-103 lesson: a bypass is provable, not just silent).
+- **Fail closed.** A private bucket with no matching rule denies with
+  `403 {"code":"STORAGE_FORBIDDEN"}`. `GET /storage/{bucket}/objects` never
+  errors this way — it **filters** the listing to only the caller's readable
+  objects.
+- **Presign issuance is gated on the read rule.** `GET
+  /storage/{bucket}/presign/{*key}` denies (403) for an object the caller
+  could not otherwise read — a presigned URL grants bearer access to anyone
+  holding it, so minting one for an unreadable object would be a bypass in
+  itself.
+
+This is a Rust-level owner/public-bucket/bypass gate over the existing
+identity/role machinery, not a second policy-DDL evaluator; see
+`docs/backlog/125_storage_per_object_authz.md` for the design note and the
+policy-DDL follow-up it defers.
 
 ### 503-when-unconfigured contract
 
@@ -1731,7 +1765,7 @@ No 500, no panic, regardless of the request body or path params.
 GET /storage/buckets
 Authorization: Bearer <token>
 
-→ 200 { "buckets": [ { "name": "…", "created_by": "…"|null, "created_at_ms": N } ] }
+→ 200 { "buckets": [ { "name": "…", "created_by": "…"|null, "created_at_ms": N, "is_public": bool } ] }
 → 503 STORAGE_NOT_AVAILABLE
 ```
 
@@ -1741,11 +1775,15 @@ Authorization: Bearer <token>
 POST /storage/buckets
 Authorization: Bearer <token>
 Content-Type: application/json
-{ "name": "my-bucket" }
+{ "name": "my-bucket", "is_public": false }   // is_public optional, defaults false
 
 → 201 (empty body)
 → 503 STORAGE_NOT_AVAILABLE
 ```
+
+`is_public` (item 120, F1) governs the bucket's read-authorization exemption —
+see "Per-object authorization" above. Repeating `create_bucket` for an
+existing bucket is a no-op and does **not** update its `is_public` flag.
 
 ### C3 — Delete bucket
 
@@ -1769,7 +1807,7 @@ Authorization: Bearer <token>
 → 200 {
     "objects":  [ { "object_key":"…", "size":N, "etag":"…"|null, "content_type":"…"|null,
                     "status":"ready"|"pending", "tier":"inline"|"s3",
-                    "created_at_ms":N } ],
+                    "created_at_ms":N, "owner":"…"|null } ],
     "prefixes": [ "photos/vacation/" ]   // virtual folders
   }
 → 503 STORAGE_NOT_AVAILABLE
@@ -1778,6 +1816,10 @@ Authorization: Bearer <token>
 With `prefix` + `delimiter`, objects whose key suffix (after the prefix) contains
 the delimiter are folded into `prefixes` (virtual folders); the rest appear in
 `objects`. Standard S3-style listing semantics.
+
+**F1 (item 120):** the `objects` array is filtered to only the objects the
+caller may read (public bucket, own objects, or a superuser/`service_role`
+bypass) — this route never 403s, an unreadable object is simply absent.
 
 ### C5 — Put object (inline or presigned)
 
@@ -1789,6 +1831,7 @@ Content-Type: <mime-type>           (optional)
 
 → 201 { "tier":"inline", "size":N, "etag":"…"|null }   // body.len() < inline_threshold
 → 200 { "presigned_put_url":"https://…", "storage_key":"…" }  // body.len() >= threshold
+→ 403 STORAGE_FORBIDDEN   // overwriting another caller's object (F1)
 → 503 STORAGE_NOT_AVAILABLE
 ```
 
@@ -1798,6 +1841,11 @@ body is below threshold, bytes are stored as an engine LOB in one transaction
 a presigned PUT URL is returned (response 200); the client must PUT the bytes
 directly to that URL.
 
+**F1 (item 120):** creating a brand-new key is allowed for any authenticated
+caller, who becomes its owner. Overwriting an **existing** key is gated to its
+owner or a superuser/`service_role` bypass — public-bucket status does not
+exempt writes.
+
 ### C6 — Delete object
 
 ```
@@ -1805,6 +1853,7 @@ DELETE /storage/{bucket}/objects/{*key}
 Authorization: Bearer <token>
 
 → 204 (empty body)
+→ 403 STORAGE_FORBIDDEN   // not the owner and no bypass (F1)
 → 404 STORAGE_NOT_FOUND
 → 503 STORAGE_NOT_AVAILABLE
 ```
@@ -1816,12 +1865,15 @@ GET /storage/{bucket}/presign/{*key}
 Authorization: Bearer <token>
 
 → 200 { "presigned_get_url": "https://…" }
+→ 403 STORAGE_FORBIDDEN   // caller cannot read this object (F1)
 → 404 STORAGE_NOT_FOUND
 → 503 STORAGE_NOT_AVAILABLE
 ```
 
 Returns a time-limited URL for direct browser/client download without exposing
-app credentials.
+app credentials. **F1 (item 120):** issuance is gated on the same read rule as
+a direct read — a caller cannot mint a presigned URL for an object they could
+not otherwise read (public bucket, ownership, or a bypass).
 
 ### Storage error codes
 
@@ -1829,6 +1881,7 @@ app credentials.
 |------|------|---------|
 | 503 | `STORAGE_NOT_AVAILABLE` | storage service not configured |
 | 404 | `STORAGE_NOT_FOUND` | bucket or object does not exist |
+| 403 | `STORAGE_FORBIDDEN` | per-object authorization denial (item 120, F1) — not the owner, the bucket isn't public, and no superuser/`service_role` bypass |
 | 409 | `BUCKET_NOT_EMPTY` | delete-bucket blocked by existing objects |
 | 503 | `STORAGE_CONFIG_ERROR` | backend config error (bad env vars) |
 | 502 | `OBJECT_STORE_ERROR` | upstream S3/MinIO error |

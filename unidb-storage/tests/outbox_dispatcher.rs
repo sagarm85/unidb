@@ -7,16 +7,18 @@ mod common;
 
 use std::sync::Arc;
 
+use unidb::storage_api::StorageCaller;
 use unidb_dispatch::{Dispatcher, Filter};
 use unidb_storage::outbox::ConfirmSink;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn confirm_sink_confirms_pending_upload_via_dispatcher() {
     let h = common::harness(4).await;
-    h.svc.create_bucket("b", None).await.unwrap();
+    let su = StorageCaller::superuser();
+    h.svc.create_bucket("b", &su, false).await.unwrap();
 
     // Outbox: pending row + atomic insert event.
-    let ticket = h.svc.begin_upload("b", "x.bin", None, None).await.unwrap();
+    let ticket = h.svc.begin_upload("b", "x.bin", None, &su).await.unwrap();
     // Bytes land in the store (client PUT to the presigned URL).
     h.store.seed(&ticket.storage_key, b"payload");
 

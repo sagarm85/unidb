@@ -79,7 +79,7 @@ pub fn ensure_schema(engine: &Engine, xid: Xid) -> Result<(), DbError> {
         xid,
         &format!(
             "CREATE TABLE {BUCKETS_TABLE} \
-             (name TEXT, created_by TEXT, created_at_ms INT)"
+             (name TEXT, created_by TEXT, created_at_ms INT, is_public INT)"
         ),
     )?;
     ddl(
@@ -139,14 +139,22 @@ fn ddl(engine: &Engine, xid: Xid, sql: &str) -> Result<(), DbError> {
 
 /// Insert a bucket. Duplicate names are the caller's concern (kept simple —
 /// no unique index yet); the service checks existence first.
+///
+/// `is_public` is the F1 (item 120, Workstream F) read-gate exemption: an
+/// object in a public bucket is readable by any caller regardless of
+/// ownership; a private bucket (the default) requires the caller to own the
+/// object or bypass like a superuser/`service_role` — see
+/// `service::can_read`.
 pub fn insert_bucket(
     engine: &Engine,
     xid: Xid,
     name: &str,
     created_by: Option<&str>,
+    is_public: bool,
 ) -> Result<(), DbError> {
     let sql = format!(
-        "INSERT INTO {BUCKETS_TABLE} (name, created_by, created_at_ms) VALUES ($1, $2, $3)"
+        "INSERT INTO {BUCKETS_TABLE} (name, created_by, created_at_ms, is_public) \
+         VALUES ($1, $2, $3, $4)"
     );
     engine.execute_sql_params(
         xid,
@@ -155,6 +163,7 @@ pub fn insert_bucket(
             Literal::Text(name.to_string()),
             opt_text(created_by),
             Literal::Int(now_ms()),
+            Literal::Int(is_public as i64),
         ],
     )?;
     Ok(())
@@ -172,20 +181,36 @@ pub struct BucketRow {
     pub name: String,
     pub created_by: Option<String>,
     pub created_at_ms: i64,
+    /// F1 (item 120, Workstream F): a public bucket's objects are readable by
+    /// any caller regardless of ownership. Defaults to `false` (private) —
+    /// fail closed.
+    pub is_public: bool,
+}
+
+const BUCKET_SELECT_COLS: &str = "SELECT name, created_by, created_at_ms, is_public FROM buckets";
+
+fn decode_bucket(r: Vec<Literal>) -> BucketRow {
+    BucketRow {
+        name: as_text(&r[0]),
+        created_by: as_opt_text(&r[1]),
+        created_at_ms: as_int(&r[2]),
+        is_public: as_bool(&r[3]),
+    }
 }
 
 /// List all buckets.
 pub fn list_buckets(engine: &Engine, xid: Xid) -> Result<Vec<BucketRow>, DbError> {
-    let sql = format!("SELECT name, created_by, created_at_ms FROM {BUCKETS_TABLE}");
-    let rows = rows_of(engine.execute_sql(xid, &sql)?);
-    Ok(rows
-        .into_iter()
-        .map(|r| BucketRow {
-            name: as_text(&r[0]),
-            created_by: as_opt_text(&r[1]),
-            created_at_ms: as_int(&r[2]),
-        })
-        .collect())
+    let rows = rows_of(engine.execute_sql(xid, BUCKET_SELECT_COLS)?);
+    Ok(rows.into_iter().map(decode_bucket).collect())
+}
+
+/// Look up one bucket by name (F1: used to read the `is_public` flag for the
+/// read-authorization gate). `None` if the bucket doesn't exist — callers
+/// treat a missing bucket as private (fail closed).
+pub fn get_bucket(engine: &Engine, xid: Xid, name: &str) -> Result<Option<BucketRow>, DbError> {
+    let sql = format!("{BUCKET_SELECT_COLS} WHERE name = $1");
+    let rows = rows_of(engine.execute_sql_params(xid, &sql, &[Literal::Text(name.to_string())])?);
+    Ok(rows.into_iter().next().map(decode_bucket))
 }
 
 /// All objects in `bucket` (used by list_objects and the non-empty guard).
@@ -410,4 +435,8 @@ fn as_opt_int(l: &Literal) -> Option<i64> {
         Literal::Int(i) => Some(*i),
         _ => None,
     }
+}
+
+fn as_bool(l: &Literal) -> bool {
+    matches!(l, Literal::Int(i) if *i != 0)
 }

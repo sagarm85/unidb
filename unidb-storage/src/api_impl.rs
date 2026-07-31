@@ -9,7 +9,7 @@
 
 use unidb::storage_api::{
     BoxFuture, BucketInfo, ListObjectsResult, ObjectInfo, PutObjectResult, StorageApi,
-    StorageApiError, UploadTicket,
+    StorageApiError, StorageCaller, UploadTicket,
 };
 
 use crate::{StorageError, StorageService};
@@ -24,6 +24,7 @@ impl From<StorageError> for StorageApiError {
             StorageError::NotFound(s) => StorageApiError::NotFound(s),
             StorageError::BucketNotEmpty(s) => StorageApiError::BucketNotEmpty(s),
             StorageError::Config(s) => StorageApiError::Config(s),
+            StorageError::Forbidden(s) => StorageApiError::Forbidden(s),
             StorageError::Join => StorageApiError::Join,
         }
     }
@@ -41,6 +42,7 @@ impl StorageApi for StorageService {
                     name: r.name,
                     created_by: r.created_by,
                     created_at_ms: r.created_at_ms,
+                    is_public: r.is_public,
                 })
                 .collect())
         })
@@ -49,10 +51,11 @@ impl StorageApi for StorageService {
     fn create_bucket<'a>(
         &'a self,
         name: &'a str,
-        created_by: Option<&'a str>,
+        caller: &'a StorageCaller,
+        is_public: bool,
     ) -> BoxFuture<'a, Result<(), StorageApiError>> {
         Box::pin(async move {
-            self.create_bucket(name, created_by)
+            self.create_bucket(name, caller, is_public)
                 .await
                 .map_err(StorageApiError::from)
         })
@@ -71,10 +74,11 @@ impl StorageApi for StorageService {
         bucket: &'a str,
         prefix: Option<&'a str>,
         delimiter: Option<&'a str>,
+        caller: &'a StorageCaller,
     ) -> BoxFuture<'a, Result<ListObjectsResult, StorageApiError>> {
         Box::pin(async move {
             let r = self
-                .list_objects(bucket, prefix, delimiter)
+                .list_objects(bucket, prefix, delimiter, caller)
                 .await
                 .map_err(StorageApiError::from)?;
             Ok(ListObjectsResult {
@@ -89,6 +93,7 @@ impl StorageApi for StorageService {
                         status: o.status,
                         tier: o.tier,
                         created_at_ms: o.created_at_ms,
+                        owner: o.created_by,
                     })
                     .collect(),
                 prefixes: r.prefixes,
@@ -102,11 +107,11 @@ impl StorageApi for StorageService {
         key: &'a str,
         bytes: Vec<u8>,
         content_type: Option<&'a str>,
-        created_by: Option<&'a str>,
+        caller: &'a StorageCaller,
     ) -> BoxFuture<'a, Result<PutObjectResult, StorageApiError>> {
         Box::pin(async move {
             let o = self
-                .put_object(bucket, key, bytes, content_type, created_by)
+                .put_object(bucket, key, bytes, content_type, caller)
                 .await
                 .map_err(StorageApiError::from)?;
             Ok(PutObjectResult {
@@ -122,11 +127,11 @@ impl StorageApi for StorageService {
         bucket: &'a str,
         key: &'a str,
         content_type: Option<&'a str>,
-        created_by: Option<&'a str>,
+        caller: &'a StorageCaller,
     ) -> BoxFuture<'a, Result<UploadTicket, StorageApiError>> {
         Box::pin(async move {
             let t = self
-                .begin_upload(bucket, key, content_type, created_by)
+                .begin_upload(bucket, key, content_type, caller)
                 .await
                 .map_err(StorageApiError::from)?;
             Ok(UploadTicket {
@@ -140,9 +145,10 @@ impl StorageApi for StorageService {
         &'a self,
         bucket: &'a str,
         key: &'a str,
+        caller: &'a StorageCaller,
     ) -> BoxFuture<'a, Result<(), StorageApiError>> {
         Box::pin(async move {
-            self.delete_object(bucket, key)
+            self.delete_object(bucket, key, caller)
                 .await
                 .map_err(StorageApiError::from)
         })
@@ -152,9 +158,10 @@ impl StorageApi for StorageService {
         &'a self,
         bucket: &'a str,
         key: &'a str,
+        caller: &'a StorageCaller,
     ) -> BoxFuture<'a, Result<String, StorageApiError>> {
         Box::pin(async move {
-            self.presign_get(bucket, key)
+            self.presign_get(bucket, key, caller)
                 .await
                 .map_err(StorageApiError::from)
         })

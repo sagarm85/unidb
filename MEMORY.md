@@ -485,6 +485,22 @@ be raised with the user directly, not assumed.
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-07-31 — F1 storage per-object authz (item 125) — salvaged from a stalled agent, verified
+
+The F1 implementing agent went **idle ~5h** (output frozen, no cargo/monitor process, no
+completion notification — it hung on its background-test wait). It had left 18 files of complete,
+uncommitted work. I took over: dropped its stray `disk_check.txt`, `cargo clean`, and verified the
+tree myself — it compiled and passed. **Item 125 / F1** (`8840cdb`): per-object storage authz.
+Step-0 caught that bucket public/private never actually shipped and NO caller identity reached
+`/storage/*` (every bucket was public to any authed caller). Built: principal threaded into the
+storage service; object metadata gains owner (serde-default) + bucket `is_public`; reads gated
+(public open, private→owner, superuser/service_role bypass audited, list filtered, presign gated
+on the read rule); writes/deletes owner-or-bypass; fail closed. Reuses existing auth machinery.
+Verified: crash 54/54, storage_authz_f1 5/5, unidb-storage crate green, clippy/fmt clean. Richer
+storage policy-DDL = documented follow-up. **Lesson:** an agent that "waits for a background test
+monitor" can hang indefinitely and never notify — check agent output-file mtime vs now; if idle
+>~30min with no process, take over and verify the tree directly rather than waiting.
+
 ### 2026-07-31 — autonomous overnight: E1 merged (#224) + studio-unblocker batch shipped
 
 Overnight autonomous run (user asleep, auto-merge of verified PRs). **E1** (PR #224, `5b07420`):

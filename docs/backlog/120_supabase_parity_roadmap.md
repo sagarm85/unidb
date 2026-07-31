@@ -33,9 +33,14 @@ authorization, storage authorization, SDK) stacks on those.
 - **Login surface exists but is dev-only + passwordless** — `POST /auth/login`
   (`UNIDB_DEV_LOGIN=1`), `/auth/whoami`, `/auth/meta`, user store, `open_mode`
   (items 100, 103). `post_auth_login` only checks the user *exists* — no credential.
-- **Storage authorization, partial** — presigned GET/PUT URLs with TTL and
-  public/private buckets already ship (`unidb-storage`, item 23/31). Only
-  per-object RLS policies remain (see Workstream F).
+- **Storage authorization, partial** — presigned GET/PUT URLs with TTL
+  already ship (`unidb-storage`, item 23/31). ~~public/private buckets
+  already ship~~ **Correction (2026-07-31, item 125 Step-0 audit):** this was
+  false — no `is_public` column existed and no caller identity reached
+  `/storage/*` at all (every bucket behaved as public to any authenticated
+  caller). F1 (item 125) built both the public/private flag and per-object
+  ownership/bypass enforcement; only a richer storage policy-DDL surface
+  remains as a documented follow-up (see `125_storage_per_object_authz.md`).
 - **unidb-studio** — SQL editor, table editor, schema/ERD, CSV, storage browser,
   events/realtime inspector, observability, logs, compare all ship. Missing only
   the panels whose backend does not exist yet (auth users, policies, roles, API docs).
@@ -73,8 +78,12 @@ platform; **P2** = ecosystem.
 - **E — Realtime auth:** E1 per-subscriber RLS filtering on SSE (P0) · E2
   broadcast + presence · E3 channel authz by token. SSE + events inspector already
   ship — only the authorization layer is new.
-- **F — Storage auth:** F1 per-object RLS policies (P1). F2 signed URLs and F3
-  bucket public/private already ship — do not rebuild.
+- **F — Storage auth:** F1 per-object authorization — **SHIPPED 2026-07-31**
+  (owner + public-bucket read exemption + superuser/`service_role` bypass,
+  audited; see `125_storage_per_object_authz.md`, correction above — F3
+  "bucket public/private" did **not** already ship as this row originally
+  claimed; F1 built it). F2 signed URLs already shipped (item 23/31) — do not
+  rebuild. A richer storage policy-DDL surface remains a follow-up.
 - **G — Studio panels:** G1 Authentication panel (users CRUD/invite/ban/reset) ·
   G2 Policies editor · G3 Roles/grants UI · G4 API-docs panel.
 - **H — SDK:** H1 JS/TS SDK (auth+data+realtime) · H2 session persistence + auto-refresh.

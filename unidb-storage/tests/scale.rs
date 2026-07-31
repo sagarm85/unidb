@@ -10,6 +10,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
+use unidb::storage_api::StorageCaller;
 use unidb::Engine;
 use unidb_storage::{MemoryObjectStore, Reconciler, StorageConfig, StorageService};
 
@@ -27,12 +28,13 @@ async fn many_objects_reconcile_without_catalog_overflow() {
     let svc = StorageService::new(engine.clone(), store.clone(), cfg.clone())
         .await
         .unwrap();
-    svc.create_bucket("b", None).await.unwrap();
+    let su = StorageCaller::superuser();
+    svc.create_bucket("b", &su, false).await.unwrap();
 
     // N pending uploads; the even half actually lands its bytes.
     for i in 0..N {
         let ticket = svc
-            .begin_upload("b", &format!("obj{i}"), None, None)
+            .begin_upload("b", &format!("obj{i}"), None, &su)
             .await
             .unwrap();
         if i % 2 == 0 {
