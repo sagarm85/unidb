@@ -363,3 +363,27 @@ pub fn expired_token() -> String {
     )
     .unwrap()
 }
+
+/// A validly-signed, unexpired token carrying `sub` (optional) plus every
+/// `(key, value)` in `extra` — item 122 (B2/B3/B4: `auth.jwt()`/`role`
+/// claims) and item 124 (E1: realtime per-subscriber RLS) tests need custom
+/// claims (`tenant`, `role: "service_role"`, …) beyond the plain `sub`/`exp`
+/// shape [`Claims`] covers. Encodes a raw `serde_json::Value` object rather
+/// than a fixed struct so any claim shape a test needs is expressible.
+pub fn token_with_claims(sub: Option<&str>, extra: &[(&str, serde_json::Value)]) -> String {
+    let mut map = serde_json::Map::new();
+    if let Some(s) = sub {
+        map.insert("sub".to_string(), serde_json::Value::String(s.to_string()));
+    }
+    map.insert("exp".to_string(), serde_json::json!(now_secs() + 3600));
+    for (k, v) in extra {
+        map.insert((*k).to_string(), v.clone());
+    }
+    let claims = serde_json::Value::Object(map);
+    encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(TEST_JWT_SECRET.as_bytes()),
+    )
+    .unwrap()
+}

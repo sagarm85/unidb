@@ -376,6 +376,23 @@ impl EngineHandle {
             .await
     }
 
+    /// item E1 (Workstream E, per-subscriber realtime authorization):
+    /// filter + column-project one poll's events for delivery to `principal`
+    /// over `/events/subscribe` — see [`Engine::filter_realtime_events`]'s
+    /// doc comment for exactly what this reuses (RLS substitution + grants)
+    /// and its fail-closed guarantees. Infallible on the `Engine` side (a
+    /// per-event ambiguity just drops that event); the `Result` here is only
+    /// for `EngineHandle`'s post-shutdown/blocking-pool-join failure mode,
+    /// matching every other wrapper in this file.
+    pub async fn filter_realtime_events(
+        &self,
+        principal: AuthPrincipal,
+        events: Vec<Event>,
+    ) -> Result<Vec<Event>> {
+        self.on_engine(move |e| Ok(e.filter_realtime_events(&principal, events)))
+            .await
+    }
+
     /// Q2 (item 26): current commit generation — callers snapshot this before
     /// processing a batch so they can detect the NEXT commit even if it fires
     /// before the `wait_event_commit` call.
