@@ -921,6 +921,77 @@ fn cat_write(c: &RwLock<Catalog>) -> RwLockWriteGuard<'_, Catalog> {
     c.write().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Turn a captured event's row-image JSON object back into a `Vec<Literal>`
+/// positioned to match `columns` — the inverse of `queue::payload::
+/// write_row_json`/`row_to_json`, used only by [`Engine::
+/// realtime_event_for_subscriber`] (item E1) so a per-subscriber RLS policy
+/// can be evaluated against the row via [`crate::sql::executor::
+/// predicate_matches`] exactly as it would against a freshly-scanned heap
+/// row. `None` if `image` isn't a JSON object at all (fail closed — the
+/// caller drops the event rather than guess). A column present in `columns`
+/// but missing from `image` (e.g. `ALTER TABLE ADD COLUMN` ran after the
+/// event was captured) becomes `Literal::Null`.
+///
+/// Deliberately self-contained rather than reusing `server::dto::
+/// json_to_literal`: `server` is feature-gated (`#[cfg(feature = "server")]`)
+/// and this is a core `Engine` method that must build unconditionally. The
+/// per-variant mapping is identical to `json_to_literal`'s.
+fn realtime_row_image_to_literals(
+    image: &serde_json::Value,
+    columns: &[crate::catalog::ColumnDef],
+) -> Option<Vec<Literal>> {
+    let obj = image.as_object()?;
+    Some(
+        columns
+            .iter()
+            .map(|c| {
+                obj.get(&c.name)
+                    .map(realtime_json_scalar_to_literal)
+                    .unwrap_or(Literal::Null)
+            })
+            .collect(),
+    )
+}
+
+fn realtime_json_scalar_to_literal(v: &serde_json::Value) -> Literal {
+    use serde_json::Value as J;
+    match v {
+        J::Null => Literal::Null,
+        J::Bool(b) => Literal::Bool(*b),
+        J::String(s) => Literal::Text(s.clone()),
+        J::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Literal::Int(i)
+            } else {
+                Literal::Float(n.as_f64().unwrap_or(0.0))
+            }
+        }
+        J::Array(items) if items.iter().all(|x| x.is_number()) => Literal::Vector(
+            items
+                .iter()
+                .map(|x| x.as_f64().unwrap_or(0.0) as f32)
+                .collect(),
+        ),
+        other => Literal::Json(other.to_string()),
+    }
+}
+
+/// Project a captured row-image JSON object down to only `cols` (item E1
+/// item 4 / item 112 B5 on the realtime path) — drop any key the
+/// subscriber's column-scoped SELECT grant doesn't cover. Non-object values
+/// (`Null`, e.g. the `before` image of an INSERT) pass through unchanged.
+fn project_json_columns(
+    value: serde_json::Value,
+    cols: &std::collections::BTreeSet<String>,
+) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            serde_json::Value::Object(map.into_iter().filter(|(k, _)| cols.contains(k)).collect())
+        }
+        other => other,
+    }
+}
+
 /// Map an auth-DDL statement to an `(action, object)` pair for the audit log
 /// (P6.f).
 fn auth_stmt_audit(stmt: &crate::authz::AuthStmt) -> (&'static str, String) {
@@ -3919,6 +3990,157 @@ impl Engine {
             xid,
             limit,
         )
+    }
+
+    /// item E1 (Workstream E, per-subscriber realtime authorization): filter
+    /// and column-project a batch of already-fetched events for delivery to
+    /// ONE `GET /events/subscribe` subscriber, so the SSE stream never
+    /// forwards a row change that subscriber couldn't `SELECT` under their
+    /// own token. **Delivery-side only** — called after `poll_events`/
+    /// `poll_events_after` already read the shared `__events__` heap; it
+    /// changes nothing about what gets captured to the WAL/queue, and every
+    /// other subscriber calls this independently over its own copy of the
+    /// same `Vec<Event>`, so one subscriber's grants/policies never leak
+    /// into another's stream.
+    ///
+    /// Reuses the exact machinery a real `SELECT` uses for RLS/grants — no
+    /// parallel policy evaluator:
+    /// - table-level SELECT existence: [`crate::authz::RoleStore::
+    ///   has_privilege`] (the same check [`Engine::check_table_grant`]
+    ///   exposes for REST routes).
+    /// - superuser / `service_role` bypass: mirrors
+    ///   [`Engine::execute_sql_inner_as_principal`]/[`crate::read_handle::
+    ///   ReadHandle::execute_sql_inner`] exactly, including the audited
+    ///   `service_role_rls_bypass` trail (item-103 lesson) — a service_role
+    ///   subscriber receives every event, on the same audited bypass path.
+    /// - the SELECT policy predicate: [`crate::sql::logical::
+    ///   resolve_select_policy_for_subscriber`] (the same substitution +
+    ///   role-gate helpers [`crate::sql::logical::apply_rls_with_auth`] uses
+    ///   to rewrite a real `SELECT`'s WHERE clause).
+    /// - per-row evaluation: [`crate::sql::executor::predicate_matches`], the
+    ///   identical scan-filter primitive every WHERE clause (including every
+    ///   RLS-injected predicate) already runs through — `NULL`/an evaluation
+    ///   error both read as "does not match" there (fail closed).
+    /// - column-level SELECT grant (item 112/B5): [`crate::authz::RoleStore::
+    ///   column_grant`] projects `before`/`after`/the back-compat `payload`
+    ///   down to the granted columns when the caller holds only a
+    ///   column-scoped grant.
+    ///
+    /// Fails closed in every ambiguous case: an unresolvable table, a policy
+    /// that needs a row image the event doesn't carry (an INSERT event has no
+    /// `before` — this never substitutes `after` for a DELETE's check or vice
+    /// versa), or a predicate-evaluation error all drop the event rather than
+    /// deliver it.
+    ///
+    /// Cost note (honest, per the project's benchmark-philosophy rule): this
+    /// runs once per non-empty SSE poll tick per subscriber, entirely off the
+    /// write/commit path — an O(events-in-this-tick) catalog-read-locked pass
+    /// with one `predicate_matches` call per event needing a policy check.
+    /// It adds no latency to `INSERT`/`UPDATE`/`DELETE` or to event capture.
+    pub fn filter_realtime_events(
+        &self,
+        principal: &AuthPrincipal,
+        events: Vec<queue::Event>,
+    ) -> Vec<queue::Event> {
+        let user = principal.subject.as_deref();
+        let effective_roles = self.authz.effective_roles(user, &principal.claims);
+        let is_service_role = effective_roles
+            .iter()
+            .any(|r| r == crate::authz::SERVICE_ROLE);
+        // Superuser / embedded (`None`) / bootstrap-mode (no registered
+        // users) / service_role: bypass exactly like every other RLS entry
+        // point in this engine.
+        if self.is_effective_superuser(user) || is_service_role {
+            if is_service_role {
+                self.audit.record_admin(
+                    user,
+                    None,
+                    "service_role_rls_bypass",
+                    "events/subscribe",
+                    true,
+                );
+            }
+            return events;
+        }
+        // `is_effective_superuser(None)` is always true, so `user` is always
+        // `Some` beyond this point — but never trust that silently: fail
+        // closed (drop everything) rather than panic if it doesn't hold.
+        let Some(user) = user else {
+            return Vec::new();
+        };
+        let catalog = cat_read(&self.catalog);
+        events
+            .into_iter()
+            .filter_map(|event| {
+                self.realtime_event_for_subscriber(
+                    user,
+                    &effective_roles,
+                    principal,
+                    &catalog,
+                    event,
+                )
+            })
+            .collect()
+    }
+
+    /// One event's fail-closed subscriber check + column projection — see
+    /// [`Engine::filter_realtime_events`]'s doc comment for what each step
+    /// reuses. `None` means "drop this event for this subscriber."
+    fn realtime_event_for_subscriber(
+        &self,
+        user: &str,
+        roles: &[String],
+        principal: &AuthPrincipal,
+        catalog: &Catalog,
+        mut event: queue::Event,
+    ) -> Option<queue::Event> {
+        // E1 item 1 (table-grant gate), re-checked per event — not only at
+        // subscribe time — so a grant revoked mid-subscription takes effect
+        // on the very next event rather than waiting for a reconnect.
+        if !self
+            .authz
+            .has_privilege(user, &event.table_name, crate::authz::Privilege::Select)
+        {
+            return None;
+        }
+        let table_def = catalog.lookup(&event.table_name).ok()?;
+        let policy = crate::sql::logical::resolve_select_policy_for_subscriber(
+            catalog,
+            &event.table_name,
+            Some(user),
+            &principal.claims,
+            roles,
+        );
+        if let Some(policy) = policy {
+            // E1 item 2: AFTER image for INSERT/UPDATE, BEFORE image for
+            // DELETE — never the other one, and never a fallback between them.
+            let image = if event.op == "delete" {
+                event.before.as_ref()
+            } else {
+                event.after.as_ref()
+            };
+            let row = image.and_then(|img| realtime_row_image_to_literals(img, &table_def.columns));
+            let Some(row) = row else {
+                return None; // fail closed: row image unavailable/unusable
+            };
+            match executor::predicate_matches(&Some(policy), &table_def.columns, &row) {
+                Ok(true) => {}
+                _ => return None, // false or evaluation error: fail closed
+            }
+        }
+        // E1 item 4 (SHOULD): project before/after/payload down to a
+        // column-scoped SELECT grant. A whole-table (`All`) or absent
+        // (`None`, already excluded by the `has_privilege` gate above) grant
+        // needs no projection.
+        if let crate::authz::ColumnGrant::Columns(cols) =
+            self.authz
+                .column_grant(user, &event.table_name, crate::authz::Privilege::Select)
+        {
+            event.before = event.before.map(|v| project_json_columns(v, &cols));
+            event.after = event.after.map(|v| project_json_columns(v, &cols));
+            event.payload = project_json_columns(event.payload, &cols);
+        }
+        Some(event)
     }
 
     /// Durably advance `consumer`'s offset to `up_to_seq` — the only

@@ -1022,6 +1022,53 @@ pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog, user: Option<&str>) -> Lo
     apply_rls_with_auth(plan, catalog, user, &BTreeMap::new(), &[])
 }
 
+/// Resolve the fully-substituted SELECT-context RLS predicate for `table`
+/// under one caller identity, ready to evaluate directly against a
+/// materialized row via [`crate::sql::executor::predicate_matches`]/
+/// [`crate::sql::executor::eval_expr`] — item E1 (Workstream E): per-
+/// subscriber realtime filtering on `GET /events/subscribe` needs "would this
+/// caller's SELECT policy admit this row" without running a query at all
+/// (the row already came from the event queue, not a scan).
+///
+/// This is **not** a second policy engine: it composes exactly the same
+/// `select_policy_for`/`role_scoped_policy_for`/`combine_role_gate`/
+/// `substitute_current_user_in_expr`/`substitute_auth_context_in_expr`
+/// helpers [`apply_rls_with_auth`]'s `select_for`/`policy_sub` closures use
+/// for a real `SELECT`'s WHERE-clause injection — just packaged as a
+/// standalone entry point, since those closures are private to
+/// `apply_rls_with_auth` and there is no `LogicalPlan` here to inject into.
+/// The substitution is applied eagerly (mirroring how the `Query`/`Explain`
+/// branches above substitute before the `Expr`→`QExpr` conversion) since
+/// there is no second pass over a plan to catch it later.
+///
+/// `None` means "no policy restricts this table's SELECT visibility for this
+/// caller" (deliver unconditionally, exactly as an unrestricted `SELECT`
+/// would); `Some(expr)` may itself resolve to a hard `Bool(false)` (item 122
+/// B4's deny-by-default when `TO`-scoped policies exist but none match the
+/// caller's roles) — evaluating it is the caller's job, not this function's.
+pub(crate) fn resolve_select_policy_for_subscriber(
+    catalog: &Catalog,
+    table: &str,
+    user: Option<&str>,
+    claims: &BTreeMap<String, JsonValue>,
+    roles: &[String],
+) -> Option<Expr> {
+    use crate::authz::PolicyOp;
+    let policy = combine_role_gate(
+        select_policy_for(catalog, table),
+        role_scoped_policy_for(catalog, table, roles, |op| {
+            matches!(op, PolicyOp::Select | PolicyOp::All)
+        }),
+    );
+    policy.map(|mut e| {
+        if let Some(u) = user {
+            substitute_current_user_in_expr(&mut e, u);
+        }
+        substitute_auth_context_in_expr(&mut e, user, claims);
+        e
+    })
+}
+
 /// OR-merge the USING predicates of every **role-scoped** (`TO`-having)
 /// named policy on `table` whose operation matches `op_matches` and whose
 /// target-role set intersects `roles` (item 122, B4), returning `(merged
@@ -1498,5 +1545,98 @@ mod tests {
             }
             _ => panic!("expected Select"),
         }
+    }
+
+    // ── resolve_select_policy_for_subscriber (item E1) ──────────────────────
+
+    #[test]
+    fn resolve_select_policy_for_subscriber_no_policy_is_unrestricted() {
+        let catalog = catalog_with_policy("t", None);
+        assert_eq!(
+            resolve_select_policy_for_subscriber(
+                &catalog,
+                "t",
+                Some("alice"),
+                &BTreeMap::new(),
+                &[]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_select_policy_for_subscriber_substitutes_current_user() {
+        let policy = Expr::BinOp {
+            op: CmpOp::Eq,
+            lhs: Box::new(Expr::Column("owner".to_string())),
+            rhs: Box::new(Expr::CurrentUser),
+        };
+        let catalog = catalog_with_policy("t", Some(policy));
+        let resolved = resolve_select_policy_for_subscriber(
+            &catalog,
+            "t",
+            Some("alice"),
+            &BTreeMap::new(),
+            &[],
+        )
+        .expect("policy expected");
+        assert_eq!(
+            resolved,
+            Expr::BinOp {
+                op: CmpOp::Eq,
+                lhs: Box::new(Expr::Column("owner".to_string())),
+                rhs: Box::new(Expr::Literal(Literal::Text("alice".to_string()))),
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_select_policy_for_subscriber_substitutes_auth_jwt_claim() {
+        let policy = Expr::BinOp {
+            op: CmpOp::Eq,
+            lhs: Box::new(Expr::Column("tenant_id".to_string())),
+            rhs: Box::new(Expr::AuthClaim("tenant".to_string())),
+        };
+        let catalog = catalog_with_policy("t", Some(policy));
+        let mut claims = BTreeMap::new();
+        claims.insert("tenant".to_string(), serde_json::json!("acme"));
+        let resolved =
+            resolve_select_policy_for_subscriber(&catalog, "t", Some("alice"), &claims, &[])
+                .expect("policy expected");
+        assert_eq!(
+            resolved,
+            Expr::BinOp {
+                op: CmpOp::Eq,
+                lhs: Box::new(Expr::Column("tenant_id".to_string())),
+                rhs: Box::new(Expr::Literal(Literal::Text("acme".to_string()))),
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_select_policy_for_subscriber_missing_claim_fails_closed_to_null() {
+        let policy = Expr::BinOp {
+            op: CmpOp::Eq,
+            lhs: Box::new(Expr::Column("tenant_id".to_string())),
+            rhs: Box::new(Expr::AuthClaim("tenant".to_string())),
+        };
+        let catalog = catalog_with_policy("t", Some(policy));
+        // No "tenant" claim present — must resolve to a typed Null, not `true`.
+        let resolved = resolve_select_policy_for_subscriber(
+            &catalog,
+            "t",
+            Some("alice"),
+            &BTreeMap::new(),
+            &[],
+        )
+        .expect("policy expected");
+        assert_eq!(
+            resolved,
+            Expr::BinOp {
+                op: CmpOp::Eq,
+                lhs: Box::new(Expr::Column("tenant_id".to_string())),
+                rhs: Box::new(Expr::Literal(Literal::Null)),
+            }
+        );
     }
 }
