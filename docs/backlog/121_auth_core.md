@@ -4,7 +4,13 @@
 **Status:** IN PROGRESS — A1 (argon2id credential store) + A2 (real password login,
 enumeration/timing-oracle closed) SHIPPED on branch
 `claude/permissions-security-supabase-comparison-ixho2w` (commit `fcd320a`; item121
-tests 7/7, crash 54/54). Remaining: A3 signup, A4 refresh/sessions, A5 prod issuer,
+tests 7/7, crash 54/54). **A3 (signup) + A4 (refresh tokens/sessions/logout) SHIPPED**
+same branch (commit `77fab4a`): `POST /auth/signup` (gated `UNIDB_ALLOW_SIGNUP`,
+default off, 404 when disabled), `POST /auth/refresh` (verify + rotate opaque
+256-bit refresh tokens, sessions persisted in `roles.json` keyed by SHA-256 hash —
+never the raw token), `POST /auth/logout` (idempotent revoke). Login/signup now
+return `{token, access_token, refresh_token, expires_in}` (`token` kept as a
+deprecated alias). item121 tests 16/16, crash 54/54. Remaining: A5 prod issuer,
 A6 asymmetric JWT.
 
 > Turns the existing dev-only, passwordless identification surface into a real

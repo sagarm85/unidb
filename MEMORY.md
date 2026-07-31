@@ -485,6 +485,43 @@ be raised with the user directly, not assumed.
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-07-31 — item 121 A3/A4 (signup + refresh tokens/sessions/logout) shipped, second slice of Workstream A
+
+Built directly on branch (no worktree) on top of A1/A2 (`fcd320a`). **A3:**
+`POST /auth/signup` creates a non-superuser with an argon2id credential via
+`Engine::create_user_with_password` (thin wrapper over `RoleStore::apply`'s
+existing `CreateUser` branch — no new DDL path needed); gated behind
+`UNIDB_ALLOW_SIGNUP` (default off, 404 when disabled, mirroring the dev-login
+posture); duplicate usernames reject with a clear `AUTHZ_ERROR`. **A4:**
+`AuthState` gains a `sessions: BTreeMap<token_hash, SessionRec>` field
+(`roles.json`, same control-plane store as credentials) — refresh tokens are
+256-bit OS-CSPRNG opaque strings (NOT JWTs, via `argon2`'s already-vendored
+`OsRng`/`RngCore`), and only their SHA-256 hash (new `sha2` dependency — fast
+one-way hash is the right tool for an already-high-entropy secret, unlike
+argon2id for passwords) is ever persisted. `POST /auth/refresh` verifies +
+rotates (revoke-old + issue-new in one persisted step) — checks the JWT
+signing key is available *before* touching session state, so a disabled
+issuer can never revoke a still-good refresh token without handing back its
+replacement. `POST /auth/logout` revokes idempotently. Unknown/expired/
+revoked refresh tokens all collapse to one `401 INVALID_REFRESH_TOKEN`.
+Login/signup responses gained `access_token`/`refresh_token`; `token` kept as
+a deprecated alias of `access_token` (zero breakage to existing item100/
+item121 tests). Manual `Debug` redaction extended to the new DTOs and
+`AuthState::sessions` (mirroring A1's `credentials` redaction pattern).
+**Evidence:** 15 new authz unit tests + 9 new item121 integration tests, all
+green (16/16 total in that file); item100 9/9 unchanged; item122 7/7 +
+server_authz 3/3 unaffected (checked as a courtesy, out of this workstream's
+touch-points); crash 54/54; fmt/clippy clean (`--all-features --all-targets`).
+Commit `77fab4a`. Stayed entirely off `logical.rs`/`executor.rs`/`parser.rs`
+per the hard boundary with Workstream B. **Process note:** hit a host-level
+disk-full condition mid-session (real usable capacity on this box is ~38 GiB
+despite `df` reporting 252G nominal — the gap is pre-existing platform
+overhead, not something this session's build caused alone, though the
+`target/` dir's ~30 GiB of accumulated per-test-binary debug artifacts *was*
+the proximate trigger); `cargo clean` recovered ~30 GiB and every gate was
+rerun clean afterward. Remaining for Workstream A: A5 (production issuer,
+explicit signing-key config) + A6 (RS256/JWKS).
+
 ### 2026-07-31 — Supabase-parity P0 pair (items 121+122 first slices) built via Sonnet agents + shipped to branch
 
 User directed: implement the Supabase-parity P0 pair using Sonnet for implementation,
