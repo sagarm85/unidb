@@ -9,7 +9,10 @@
 // logical-plan layer (physical plan, executor) needs to know RLS exists —
 // it just evaluates whatever predicate the logical plan handed it.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 
 use crate::catalog::{Catalog, ColumnDef, IndexKind, TableConstraints};
 use crate::error::{DbError, Result};
@@ -138,7 +141,12 @@ fn bind_expr(expr: &mut Expr, params: &[Literal]) -> Result<()> {
         }
         Expr::Match { query, .. } => bind_expr(query, params),
         Expr::IsNull { expr, .. } => bind_expr(expr, params),
-        Expr::Column(_) | Expr::ColumnSlot(_) | Expr::Near { .. } | Expr::CurrentUser => Ok(()),
+        Expr::Column(_)
+        | Expr::ColumnSlot(_)
+        | Expr::Near { .. }
+        | Expr::CurrentUser
+        | Expr::AuthUid
+        | Expr::AuthClaim(_) => Ok(()),
     }
 }
 
@@ -272,6 +280,30 @@ pub enum Expr {
     /// in `eval_expr` (the substitution should always run first; `Null` means
     /// the embedded/superuser path correctly omits RLS when user is `None`).
     CurrentUser,
+    /// `auth.uid()` (item 122, Workstream B1) — the authenticated principal's
+    /// `sub` claim (a stable subject id, distinct from the display username
+    /// `current_user()` resolves to, though both source from the same JWT
+    /// `sub` today). Stored in catalog policies as-is; substituted with the
+    /// principal's subject by `substitute_auth_context_in_plan`/`_in_expr` at
+    /// policy-injection time, exactly like `CurrentUser`. **Fails closed**:
+    /// when no subject is available the substitution replaces this with
+    /// `Literal::Null` (never `Literal::Bool(true)` — item-110 lesson) and
+    /// logs a `tracing::warn!`. Falls back to `Literal::Null` in `eval_expr`
+    /// if somehow unsubstituted (should never happen — substitution always
+    /// runs first).
+    AuthUid,
+    /// `auth.jwt() ->> '<claim>'` (item 122, Workstream B2) — the literal text
+    /// value of the verified token's `<claim>` (e.g. `tenant_id`), letting
+    /// policies key on arbitrary JWT claims: `USING (tenant_id = (auth.jwt()
+    /// ->> 'tenant'))`. Claims *only* ever originate from `ExecCtx.auth_claims`,
+    /// itself only ever populated from a verified token (never from user SQL) —
+    /// see `AuthPrincipal`. Substituted with the claim's text value by
+    /// `substitute_auth_context_in_plan`/`_in_expr` at policy-injection time.
+    /// **Fails closed**: a missing claim (or no principal at all) substitutes
+    /// `Literal::Null` (never `Literal::Bool(true)`) and logs a
+    /// `tracing::warn!`. Falls back to `Literal::Null` in `eval_expr` if
+    /// somehow unsubstituted.
+    AuthClaim(String),
 }
 
 #[derive(Debug, Clone)]
@@ -402,8 +434,15 @@ pub fn substitute_current_user_in_expr(expr: &mut Expr, user: &str) {
         }
         Expr::Match { query, .. } => substitute_current_user_in_expr(query, user),
         Expr::IsNull { expr, .. } => substitute_current_user_in_expr(expr, user),
-        // Leaves with no sub-expressions — nothing to recurse into.
-        Expr::Column(_) | Expr::ColumnSlot(_) | Expr::Literal(_) | Expr::Near { .. } => {}
+        // Leaves with no sub-expressions — nothing to recurse into. AuthUid /
+        // AuthClaim are also leaves this pass doesn't touch — they are
+        // substituted separately by `substitute_auth_context_in_expr` (item 122).
+        Expr::Column(_)
+        | Expr::ColumnSlot(_)
+        | Expr::Literal(_)
+        | Expr::Near { .. }
+        | Expr::AuthUid
+        | Expr::AuthClaim(_) => {}
     }
 }
 
@@ -451,13 +490,194 @@ fn expr_has_current_user(expr: &Expr) -> bool {
         }
         Expr::Match { query, .. } => expr_has_current_user(query),
         Expr::IsNull { expr, .. } => expr_has_current_user(expr),
-        Expr::Column(_) | Expr::ColumnSlot(_) | Expr::Literal(_) | Expr::Near { .. } => false,
+        Expr::Column(_)
+        | Expr::ColumnSlot(_)
+        | Expr::Literal(_)
+        | Expr::Near { .. }
+        | Expr::AuthUid
+        | Expr::AuthClaim(_) => false,
     }
 }
 
-/// Like [`apply_rls`] but skips any policy that contains [`Expr::CurrentUser`].
-/// Used by the embedded/superuser path (`execute_sql_inner`) which has no user
-/// identity to substitute — a `CurrentUser` policy would evaluate to `Null`
+// ─── auth.uid() / auth.jwt() ->> 'claim' substitution (item 122, B1/B2) ───────
+
+/// Whether `expr` contains an [`Expr::AuthUid`] node at any depth.
+fn expr_has_auth_uid(expr: &Expr) -> bool {
+    match expr {
+        Expr::AuthUid => true,
+        Expr::BinOp { lhs, rhs, .. } | Expr::Arith { lhs, rhs, .. } => {
+            expr_has_auth_uid(lhs) || expr_has_auth_uid(rhs)
+        }
+        Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) => {
+            expr_has_auth_uid(lhs) || expr_has_auth_uid(rhs)
+        }
+        Expr::JsonExtract { expr, .. } | Expr::JsonExtractText { expr, .. } => {
+            expr_has_auth_uid(expr)
+        }
+        Expr::Like { expr, pattern, .. } => expr_has_auth_uid(expr) || expr_has_auth_uid(pattern),
+        Expr::Match { query, .. } => expr_has_auth_uid(query),
+        Expr::IsNull { expr, .. } => expr_has_auth_uid(expr),
+        Expr::Column(_)
+        | Expr::ColumnSlot(_)
+        | Expr::Literal(_)
+        | Expr::Near { .. }
+        | Expr::CurrentUser
+        | Expr::AuthClaim(_) => false,
+    }
+}
+
+/// Whether `expr` contains an [`Expr::AuthClaim`] node at any depth.
+fn expr_has_auth_claim(expr: &Expr) -> bool {
+    match expr {
+        Expr::AuthClaim(_) => true,
+        Expr::BinOp { lhs, rhs, .. } | Expr::Arith { lhs, rhs, .. } => {
+            expr_has_auth_claim(lhs) || expr_has_auth_claim(rhs)
+        }
+        Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) => {
+            expr_has_auth_claim(lhs) || expr_has_auth_claim(rhs)
+        }
+        Expr::JsonExtract { expr, .. } | Expr::JsonExtractText { expr, .. } => {
+            expr_has_auth_claim(expr)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            expr_has_auth_claim(expr) || expr_has_auth_claim(pattern)
+        }
+        Expr::Match { query, .. } => expr_has_auth_claim(query),
+        Expr::IsNull { expr, .. } => expr_has_auth_claim(expr),
+        Expr::Column(_)
+        | Expr::ColumnSlot(_)
+        | Expr::Literal(_)
+        | Expr::Near { .. }
+        | Expr::CurrentUser
+        | Expr::AuthUid => false,
+    }
+}
+
+/// Whether `expr` requires *some* verified-identity substitution
+/// (`current_user()`, `auth.uid()`, or `auth.jwt() ->> '...'`) to evaluate
+/// correctly. Used by the embedded/superuser bypass paths
+/// (`apply_rls_skip_current_user` and the INSERT-policy check in
+/// `exec_insert`) to decide whether a policy containing any of these must be
+/// skipped rather than evaluated (an unresolvable identity reference would
+/// otherwise fail closed to `Null`/false and silently block the superuser —
+/// the same item-103/item-110 reasoning `expr_has_current_user_pub` already
+/// documents, now widened to cover B1/B2).
+pub fn expr_requires_auth_context_pub(expr: &Expr) -> bool {
+    expr_has_current_user(expr) || expr_has_auth_uid(expr) || expr_has_auth_claim(expr)
+}
+
+/// Render a JSON claim value as `->>`-style text: a JSON string contributes
+/// its bare contents (no surrounding quotes); every other JSON shape
+/// (number/bool/object/array/null) is rendered via its compact JSON text —
+/// mirrors Postgres's `->>` "always text" contract.
+fn claim_value_as_text(v: &JsonValue) -> String {
+    match v {
+        JsonValue::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Recursively replace every [`Expr::AuthUid`]/[`Expr::AuthClaim`] leaf in
+/// `expr` with its resolved literal value — `subject` for `AuthUid`, the
+/// matching entry of `claims` (rendered as text) for `AuthClaim`. **Fails
+/// closed**: a missing subject or claim substitutes `Expr::Literal(Literal::
+/// Null)` — never `Literal::Bool(true)` (the item-110 regression this
+/// mirrors) — and logs a `tracing::warn!` so a silently-over-restrictive
+/// policy is at least visible in logs. `claims` only ever originates from
+/// [`crate::AuthPrincipal`], itself only ever populated from a verified
+/// token — never from user-supplied SQL.
+pub fn substitute_auth_context_in_expr(
+    expr: &mut Expr,
+    subject: Option<&str>,
+    claims: &BTreeMap<String, JsonValue>,
+) {
+    match expr {
+        Expr::AuthUid => {
+            *expr = match subject {
+                Some(s) => Expr::Literal(Literal::Text(s.to_string())),
+                None => {
+                    tracing::warn!(
+                        "auth.uid() evaluated with no authenticated subject — \
+                         failing closed (NULL), never Bool(true)"
+                    );
+                    Expr::Literal(Literal::Null)
+                }
+            };
+        }
+        Expr::AuthClaim(key) => {
+            *expr = match claims.get(key) {
+                Some(v) => Expr::Literal(Literal::Text(claim_value_as_text(v))),
+                None => {
+                    tracing::warn!(
+                        claim = %key,
+                        "auth.jwt() claim missing from verified token — failing \
+                         closed (NULL), never Bool(true)"
+                    );
+                    Expr::Literal(Literal::Null)
+                }
+            };
+        }
+        Expr::BinOp { lhs, rhs, .. } | Expr::Arith { lhs, rhs, .. } => {
+            substitute_auth_context_in_expr(lhs, subject, claims);
+            substitute_auth_context_in_expr(rhs, subject, claims);
+        }
+        Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) => {
+            substitute_auth_context_in_expr(lhs, subject, claims);
+            substitute_auth_context_in_expr(rhs, subject, claims);
+        }
+        Expr::JsonExtract { expr, .. } | Expr::JsonExtractText { expr, .. } => {
+            substitute_auth_context_in_expr(expr, subject, claims);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            substitute_auth_context_in_expr(expr, subject, claims);
+            substitute_auth_context_in_expr(pattern, subject, claims);
+        }
+        Expr::Match { query, .. } => substitute_auth_context_in_expr(query, subject, claims),
+        Expr::IsNull { expr, .. } => substitute_auth_context_in_expr(expr, subject, claims),
+        // Leaves with no sub-expressions — nothing to recurse into. CurrentUser
+        // is a leaf this pass doesn't touch — it is substituted separately by
+        // `substitute_current_user_in_expr`.
+        Expr::Column(_)
+        | Expr::ColumnSlot(_)
+        | Expr::Literal(_)
+        | Expr::Near { .. }
+        | Expr::CurrentUser => {}
+    }
+}
+
+/// Walk the [`LogicalPlan`] and substitute every [`Expr::AuthUid`]/
+/// [`Expr::AuthClaim`] in predicates via [`substitute_auth_context_in_expr`].
+/// Called unconditionally (regardless of whether `subject`/`claims` are
+/// present) — a missing subject/claim must still resolve to a typed `Null`
+/// (fail closed), not be left unsubstituted. Called twice in
+/// `execute_sql_inner_as_principal`: once before `apply_rls` (for
+/// user-supplied SQL) and once after (for injected RLS policy expressions
+/// that also reference `auth.uid()`/`auth.jwt()`).
+pub fn substitute_auth_context_in_plan(
+    plan: &mut LogicalPlan,
+    subject: Option<&str>,
+    claims: &BTreeMap<String, JsonValue>,
+) {
+    let sub = |e: &mut Option<Expr>| {
+        if let Some(expr) = e {
+            substitute_auth_context_in_expr(expr, subject, claims);
+        }
+    };
+    match plan {
+        LogicalPlan::Select { predicate, .. } => sub(predicate),
+        LogicalPlan::Update { predicate, .. } => sub(predicate),
+        LogicalPlan::Delete { predicate, .. } => sub(predicate),
+        // INSERT carries no predicate (its policy is handled inline in
+        // exec_insert via ExecCtx::auth_claims/current_user). DDL has no
+        // predicates.
+        _ => {}
+    }
+}
+
+/// Like [`apply_rls`] but skips any policy that contains [`Expr::CurrentUser`]
+/// (or, item 122, `Expr::AuthUid`/`Expr::AuthClaim`). Used by the
+/// embedded/superuser path (`execute_sql_inner`) which has no user identity or
+/// verified claims to substitute — such a policy would evaluate to `Null`
 /// (false) and silently hide all rows from the superuser, which is wrong.
 /// Literal-value policies (no `CurrentUser`) are applied normally, preserving
 /// the existing embedded-path RLS behavior.
@@ -547,7 +767,7 @@ fn select_policy_for_skip_current_user(catalog: &Catalog, table: &str) -> Option
         .lookup(table)
         .ok()
         .and_then(|t| t.rls_policy.clone())
-        .filter(|p| !expr_has_current_user(p))
+        .filter(|p| !expr_requires_auth_context_pub(p))
 }
 
 fn update_policy_for_skip_current_user(catalog: &Catalog, table: &str) -> Option<Expr> {
@@ -555,7 +775,7 @@ fn update_policy_for_skip_current_user(catalog: &Catalog, table: &str) -> Option
         .lookup(table)
         .ok()
         .and_then(|t| t.update_policy.clone())
-        .filter(|p| !expr_has_current_user(p))
+        .filter(|p| !expr_requires_auth_context_pub(p))
 }
 
 fn delete_policy_for_skip_current_user(catalog: &Catalog, table: &str) -> Option<Expr> {
@@ -563,7 +783,7 @@ fn delete_policy_for_skip_current_user(catalog: &Catalog, table: &str) -> Option
         .lookup(table)
         .ok()
         .and_then(|t| t.delete_policy.clone())
-        .filter(|p| !expr_has_current_user(p))
+        .filter(|p| !expr_requires_auth_context_pub(p))
 }
 
 /// AND the table's per-operation RLS policy (if any) into the plan's predicate.
@@ -583,15 +803,78 @@ fn delete_policy_for_skip_current_user(catalog: &Catalog, table: &str) -> Option
 /// fallback turned it into `Bool(true)`, making `owner = current_user` into
 /// `owner = TRUE` → a coercion error on every RLS+LIMIT query, and a silent
 /// policy weakening in shapes where `Bool` type-checks).
-pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog, user: Option<&str>) -> LogicalPlan {
-    // Policy fetcher with current_user resolved at fetch time (see doc above).
+///
+/// `roles` is the caller's *effective* roles (item 122, B3/B4 — see
+/// [`crate::authz::RoleStore::effective_roles`]), used to gate **role-scoped**
+/// named policies (`CREATE POLICY … TO <role,...>`): such a policy is only
+/// OR-combined into the applicable predicate when `roles` intersects its
+/// target-role set (checked by [`role_scoped_policy_for`]). A named policy
+/// with no `TO` clause has an empty target-role set and is folded into the
+/// unfiltered `rls_policy`/`update_policy`/`delete_policy` catalog field at
+/// `CREATE POLICY` time (`Engine::create_policy_inner`) exactly as before B4
+/// shipped — **back-compat**: every no-`TO` policy still applies to every
+/// caller, unconditionally, regardless of `roles`. An empty `roles` slice
+/// (the back-compat shim [`apply_rls`] passes, and what a caller who somehow
+/// resolves to no roles would carry) matches no `TO`-scoped policy at all —
+/// "no role filtering" here means exactly "only the always-on no-`TO`
+/// policies apply," never a widening.
+pub fn apply_rls_with_auth(
+    plan: LogicalPlan,
+    catalog: &Catalog,
+    user: Option<&str>,
+    claims: &BTreeMap<String, JsonValue>,
+    roles: &[String],
+) -> LogicalPlan {
+    use crate::authz::PolicyOp;
+    // Policy fetcher with current_user AND auth.uid()/auth.jwt() resolved at
+    // fetch time — BEFORE the Expr→QExpr conversion (the Query/Explain path)
+    // destroys them. Item 110 established this for current_user; item 122
+    // extends it to the auth context, or a policy like
+    // `tenant_id = (auth.jwt() ->> 'tenant')` reaches QExpr unsubstituted and
+    // fails closed to NULL → 0 rows on the happy (LIMIT/JOIN/GROUP BY) path.
     let policy_sub = |pol: Option<Expr>| -> Option<Expr> {
         pol.map(|mut e| {
             if let Some(u) = user {
                 substitute_current_user_in_expr(&mut e, u);
             }
+            // Fail closed on a missing subject/claim (Null), never Bool(true).
+            substitute_auth_context_in_expr(&mut e, user, claims);
             e
         })
+    };
+    // The applicable predicate for `op_matches` is the OR of: (a) the
+    // unfiltered merged field (no-`TO` policies, applies to everyone —
+    // untouched by B4), and (b) whichever `TO`-scoped named policies match
+    // `roles` (item 122, B4). If NEITHER contributes anything AND at least
+    // one `TO`-scoped policy exists for this table+operation (it just didn't
+    // match `roles`), the result is a hard deny (`Bool(false)`), not "no
+    // restriction" — mirroring Postgres RLS semantics ("some permissive
+    // policy exists for this command; a caller matching none of them sees
+    // nothing"). See `combine_role_gate`'s doc comment for why this matters
+    // and why it can't regress a table with zero named policies.
+    let select_for = |table: &str| {
+        combine_role_gate(
+            select_policy_for(catalog, table),
+            role_scoped_policy_for(catalog, table, roles, |op| {
+                matches!(op, PolicyOp::Select | PolicyOp::All)
+            }),
+        )
+    };
+    let update_for = |table: &str| {
+        combine_role_gate(
+            update_policy_for(catalog, table),
+            role_scoped_policy_for(catalog, table, roles, |op| {
+                matches!(op, PolicyOp::Update | PolicyOp::All)
+            }),
+        )
+    };
+    let delete_for = |table: &str| {
+        combine_role_gate(
+            delete_policy_for(catalog, table),
+            role_scoped_policy_for(catalog, table, roles, |op| {
+                matches!(op, PolicyOp::Delete | PolicyOp::All)
+            }),
+        )
     };
     match plan {
         LogicalPlan::Select {
@@ -600,7 +883,7 @@ pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog, user: Option<&str>) -> Lo
             predicate,
         } => {
             // SELECT context: use rls_policy (SELECT + ALL scoped).
-            let predicate = and_policy(predicate, select_policy_for(catalog, &table));
+            let predicate = and_policy(predicate, select_for(&table));
             LogicalPlan::Select {
                 table,
                 projection,
@@ -614,7 +897,7 @@ pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog, user: Option<&str>) -> Lo
             returning,
         } => {
             // UPDATE context: use update_policy (UPDATE + ALL scoped) — Z2.
-            let predicate = and_policy(predicate, update_policy_for(catalog, &table));
+            let predicate = and_policy(predicate, update_for(&table));
             LogicalPlan::Update {
                 table,
                 assignments,
@@ -628,7 +911,7 @@ pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog, user: Option<&str>) -> Lo
             returning,
         } => {
             // DELETE context: use delete_policy (DELETE + ALL scoped) — Z2.
-            let predicate = and_policy(predicate, delete_policy_for(catalog, &table));
+            let predicate = and_policy(predicate, delete_for(&table));
             LogicalPlan::Delete {
                 table,
                 predicate,
@@ -641,12 +924,12 @@ pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog, user: Option<&str>) -> Lo
             // to that relation. The executor never learns RLS exists.
             // Item 110: substitute current_user BEFORE the Expr→QExpr
             // conversion inside apply_rls_from destroys it.
-            spec.apply_rls_from(&|table| policy_sub(select_policy_for(catalog, table)));
+            spec.apply_rls_from(&|table| policy_sub(select_for(table)));
             LogicalPlan::Query(spec)
         }
         LogicalPlan::Explain { analyze, mut spec } => {
             // EXPLAIN shows the RLS-rewritten plan the query would actually run.
-            spec.apply_rls_from(&|table| policy_sub(select_policy_for(catalog, table)));
+            spec.apply_rls_from(&|table| policy_sub(select_for(table)));
             LogicalPlan::Explain { analyze, spec }
         }
         LogicalPlan::SetOp {
@@ -656,8 +939,8 @@ pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog, user: Option<&str>) -> Lo
             right,
         } => {
             // Apply RLS to both branches of a set operation recursively.
-            let left = Box::new(apply_rls(*left, catalog, user));
-            let right = Box::new(apply_rls(*right, catalog, user));
+            let left = Box::new(apply_rls_with_auth(*left, catalog, user, claims, roles));
+            let right = Box::new(apply_rls_with_auth(*right, catalog, user, claims, roles));
             LogicalPlan::SetOp {
                 op,
                 all,
@@ -673,6 +956,123 @@ pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog, user: Option<&str>) -> Lo
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::Truncate { .. }
         | LogicalPlan::Analyze { .. }) => other,
+    }
+}
+
+/// Back-compat shim for callers with no verified auth claims and no resolved
+/// roles (the embedded/params path and unit tests that don't exercise
+/// `auth.jwt()`/role-scoped policies): applies RLS with an empty claim set
+/// and an empty role list, so any `auth.jwt()`/`auth.uid()` in a policy fails
+/// closed to NULL exactly as it would for an unauthenticated caller, and any
+/// `TO`-scoped named policy is skipped (only no-`TO` policies apply) — see
+/// [`apply_rls_with_auth`]'s doc comment for the exact empty-`roles`
+/// semantics.
+pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog, user: Option<&str>) -> LogicalPlan {
+    apply_rls_with_auth(plan, catalog, user, &BTreeMap::new(), &[])
+}
+
+/// OR-merge the USING predicates of every **role-scoped** (`TO`-having)
+/// named policy on `table` whose operation matches `op_matches` and whose
+/// target-role set intersects `roles` (item 122, B4), returning `(merged
+/// predicate, whether at least one TO-scoped policy exists for this op at
+/// all)`. The second value is what lets [`combine_role_gate`] distinguish
+/// "no TO-scoped policy was ever defined for this operation" (leave
+/// unrestricted — back-compat) from "TO-scoped policies exist, but none
+/// matched this caller's roles" (deny — see that function's doc comment).
+///
+/// No-`TO` policies are deliberately excluded from the merge here — they
+/// were already folded into the unfiltered `rls_policy`/`update_policy`/
+/// `delete_policy` catalog field by `Engine::create_policy_inner`, and are
+/// picked up by `select_policy_for`/`update_policy_for`/`delete_policy_for`
+/// exactly as they were before B4 shipped. An empty `roles` slice can never
+/// match any TO-scoped policy's target set (by construction — see
+/// `apply_rls`'s doc comment on the empty-roles back-compat contract), but
+/// still needs to report `any_defined` correctly so a table that *does* have
+/// TO-scoped policies denies an empty-roles caller rather than silently
+/// leaving it unrestricted.
+fn role_scoped_policy_for(
+    catalog: &Catalog,
+    table: &str,
+    roles: &[String],
+    op_matches: impl Fn(crate::authz::PolicyOp) -> bool,
+) -> (Option<Expr>, bool) {
+    let Ok(t) = catalog.lookup(table) else {
+        return (None, false);
+    };
+    let mut merged: Option<Expr> = None;
+    let mut any_defined = false;
+    for p in &t.policies {
+        if p.target_roles.is_empty() || !op_matches(p.op) {
+            continue;
+        }
+        any_defined = true;
+        if !p.target_roles.iter().any(|r| roles.contains(r)) {
+            continue;
+        }
+        let Ok(expr) = parse_policy_predicate(table, &p.using_expr) else {
+            // A stored named policy that fails to re-parse is an impossible
+            // state in practice (`CREATE POLICY` validates it up front by
+            // parsing it the same way) — fail closed by skipping just this
+            // policy rather than trusting on-disk data blindly or panicking
+            // in a read path.
+            continue;
+        };
+        merged = Some(match merged {
+            Some(old) => Expr::Or(Box::new(old), Box::new(expr)),
+            None => expr,
+        });
+    }
+    (merged, any_defined)
+}
+
+/// Combine the unfiltered (no-`TO`) merged predicate `base` with the
+/// role-gated result of [`role_scoped_policy_for`] (`(scoped, any_defined)`)
+/// into the final applicable predicate for one operation (item 122, B4).
+///
+/// - Either or both present → OR them (a row is visible if it satisfies any
+///   applicable permissive policy — Postgres semantics, unchanged from
+///   pre-B4).
+/// - Neither present, and `any_defined` is `false` (no `TO`-scoped policy
+///   was ever created for this table+operation) → `None`, i.e. no
+///   restriction at all. This is the **back-compat** case: a table with only
+///   no-`TO` policies (or none at all) behaves bit-for-bit as it did before
+///   B4 shipped.
+/// - Neither present, but `any_defined` is `true` (one or more `TO`-scoped
+///   policies exist for this operation, none matched the caller's roles) →
+///   `Some(Bool(false))`, a hard deny. This mirrors Postgres: once a
+///   permissive policy exists for a command, a caller satisfying none of
+///   them sees zero rows, not every row — the deny-by-default is what makes
+///   `TO authenticated`/`TO <role>` actually *restrictive* (test case: an
+///   `anon`/no-matching-role caller must see 0 rows under a `TO
+///   authenticated`-only policy, not all of them).
+fn combine_role_gate(base: Option<Expr>, scoped: (Option<Expr>, bool)) -> Option<Expr> {
+    let (scoped, any_defined) = scoped;
+    match (base, scoped) {
+        (Some(x), Some(y)) => Some(Expr::Or(Box::new(x), Box::new(y))),
+        (Some(x), None) => Some(x),
+        (None, Some(y)) => Some(y),
+        (None, None) if any_defined => Some(Expr::Literal(Literal::Bool(false))),
+        (None, None) => None,
+    }
+}
+
+/// Parse a bare predicate string into an [`Expr`] by wrapping it in a dummy
+/// `SELECT * FROM <table> WHERE <predicate>` and reusing the ordinary SQL
+/// parser — the one-grammar policy language (item-24 Z1, item 122 B4).
+/// Shared by `Engine::create_policy_inner`/`drop_policy_inner` (lib.rs) and
+/// [`role_scoped_policy_for`] above, so there is exactly one place that
+/// re-parses a stored policy's `using_expr` back into an `Expr`.
+pub(crate) fn parse_policy_predicate(table: &str, using_expr: &str) -> Result<Expr> {
+    let sql = format!("SELECT * FROM {table} WHERE {using_expr}");
+    let plans = crate::sql::parser::parse_sql(&sql)?;
+    match plans.as_slice() {
+        [LogicalPlan::Select {
+            predicate: Some(expr),
+            ..
+        }] => Ok(expr.clone()),
+        _ => Err(DbError::SqlUnsupported(
+            "a policy USING predicate must be a single AND-only comparison predicate".into(),
+        )),
     }
 }
 
@@ -888,5 +1288,164 @@ mod tests {
             apply_rls(plan, &catalog, Some("test_user")),
             LogicalPlan::CreateTable { .. }
         ));
+    }
+
+    // ─── item 122 (B1/B2): auth.uid() / auth.jwt() substitution ────────────────
+
+    #[test]
+    fn auth_uid_substitutes_subject_when_present() {
+        let mut expr = Expr::AuthUid;
+        substitute_auth_context_in_expr(&mut expr, Some("alice"), &BTreeMap::new());
+        assert_eq!(expr, Expr::Literal(Literal::Text("alice".to_string())));
+    }
+
+    /// The literal B1 acceptance requirement: "when subject is absent ->
+    /// substitute a typed Null and warn — FAIL CLOSED", never `Bool(true)`.
+    #[test]
+    fn auth_uid_fails_closed_to_null_when_subject_absent() {
+        let mut expr = Expr::AuthUid;
+        substitute_auth_context_in_expr(&mut expr, None, &BTreeMap::new());
+        assert_eq!(
+            expr,
+            Expr::Literal(Literal::Null),
+            "absent subject must substitute typed Null, never Bool(true)"
+        );
+    }
+
+    #[test]
+    fn auth_claim_substitutes_text_value_when_present() {
+        let mut claims = BTreeMap::new();
+        claims.insert("tenant".to_string(), JsonValue::String("acme".to_string()));
+        let mut expr = Expr::AuthClaim("tenant".to_string());
+        substitute_auth_context_in_expr(&mut expr, Some("svc"), &claims);
+        assert_eq!(expr, Expr::Literal(Literal::Text("acme".to_string())));
+    }
+
+    /// Non-string JSON claim values render as their compact JSON text (the
+    /// Postgres `->>` "always text" contract) rather than erroring.
+    #[test]
+    fn auth_claim_renders_non_string_json_as_text() {
+        let mut claims = BTreeMap::new();
+        claims.insert("level".to_string(), JsonValue::Number(42.into()));
+        let mut expr = Expr::AuthClaim("level".to_string());
+        substitute_auth_context_in_expr(&mut expr, Some("svc"), &claims);
+        assert_eq!(expr, Expr::Literal(Literal::Text("42".to_string())));
+    }
+
+    /// The literal B2 acceptance requirement: a missing claim key fails
+    /// CLOSED to typed Null, never `Bool(true)` — even with a present subject
+    /// and a non-empty (but non-matching) claim set.
+    #[test]
+    fn auth_claim_fails_closed_to_null_when_claim_missing() {
+        let mut claims = BTreeMap::new();
+        claims.insert("other".to_string(), JsonValue::String("x".to_string()));
+        let mut expr = Expr::AuthClaim("tenant".to_string());
+        substitute_auth_context_in_expr(&mut expr, Some("svc"), &claims);
+        assert_eq!(
+            expr,
+            Expr::Literal(Literal::Null),
+            "missing claim must substitute typed Null, never Bool(true)"
+        );
+    }
+
+    /// No principal at all (subject absent AND claims empty — the pure
+    /// embedded path calling the substitution unconditionally) fails closed
+    /// for both leaves simultaneously inside one predicate.
+    #[test]
+    fn auth_context_fails_closed_with_no_principal_at_all() {
+        let mut expr = Expr::And(
+            Box::new(Expr::BinOp {
+                op: CmpOp::Eq,
+                lhs: Box::new(Expr::Column("owner".to_string())),
+                rhs: Box::new(Expr::AuthUid),
+            }),
+            Box::new(Expr::BinOp {
+                op: CmpOp::Eq,
+                lhs: Box::new(Expr::Column("tenant_id".to_string())),
+                rhs: Box::new(Expr::AuthClaim("tenant".to_string())),
+            }),
+        );
+        substitute_auth_context_in_expr(&mut expr, None, &BTreeMap::new());
+        assert!(
+            !expr_has_auth_uid(&expr) && !expr_has_auth_claim(&expr),
+            "both leaves must be substituted away"
+        );
+        let expected = Expr::And(
+            Box::new(Expr::BinOp {
+                op: CmpOp::Eq,
+                lhs: Box::new(Expr::Column("owner".to_string())),
+                rhs: Box::new(Expr::Literal(Literal::Null)),
+            }),
+            Box::new(Expr::BinOp {
+                op: CmpOp::Eq,
+                lhs: Box::new(Expr::Column("tenant_id".to_string())),
+                rhs: Box::new(Expr::Literal(Literal::Null)),
+            }),
+        );
+        assert_eq!(expr, expected, "both must fail closed to Literal::Null");
+    }
+
+    #[test]
+    fn expr_requires_auth_context_pub_detects_all_three_leaves() {
+        assert!(expr_requires_auth_context_pub(&Expr::CurrentUser));
+        assert!(expr_requires_auth_context_pub(&Expr::AuthUid));
+        assert!(expr_requires_auth_context_pub(&Expr::AuthClaim(
+            "x".to_string()
+        )));
+        assert!(!expr_requires_auth_context_pub(&Expr::Literal(
+            Literal::Bool(true)
+        )));
+    }
+
+    /// `apply_rls_skip_current_user` (the embedded/superuser bypass) must
+    /// widen its skip to cover `AuthUid`/`AuthClaim`-referencing policies too
+    /// — not just `CurrentUser` — for the same item-103 reasoning: an
+    /// unresolvable identity reference must never silently block the
+    /// superuser by evaluating to Null.
+    #[test]
+    fn apply_rls_skip_current_user_also_skips_auth_uid_and_auth_claim_policies() {
+        let uid_policy = Expr::BinOp {
+            op: CmpOp::Eq,
+            lhs: Box::new(Expr::Column("owner".to_string())),
+            rhs: Box::new(Expr::AuthUid),
+        };
+        let catalog = catalog_with_policy("t", Some(uid_policy));
+        let plan = LogicalPlan::Select {
+            table: "t".to_string(),
+            projection: vec![],
+            predicate: None,
+        };
+        let rewritten = apply_rls_skip_current_user(plan, &catalog);
+        match rewritten {
+            LogicalPlan::Select { predicate, .. } => {
+                assert_eq!(
+                    predicate, None,
+                    "an AuthUid policy must be skipped for the superuser bypass, not injected"
+                );
+            }
+            _ => panic!("expected Select"),
+        }
+
+        let claim_policy = Expr::BinOp {
+            op: CmpOp::Eq,
+            lhs: Box::new(Expr::Column("tenant_id".to_string())),
+            rhs: Box::new(Expr::AuthClaim("tenant".to_string())),
+        };
+        let catalog2 = catalog_with_policy("t2", Some(claim_policy));
+        let plan2 = LogicalPlan::Select {
+            table: "t2".to_string(),
+            projection: vec![],
+            predicate: None,
+        };
+        let rewritten2 = apply_rls_skip_current_user(plan2, &catalog2);
+        match rewritten2 {
+            LogicalPlan::Select { predicate, .. } => {
+                assert_eq!(
+                    predicate, None,
+                    "an AuthClaim policy must be skipped for the superuser bypass, not injected"
+                );
+            }
+            _ => panic!("expected Select"),
+        }
     }
 }

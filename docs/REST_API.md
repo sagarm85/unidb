@@ -47,11 +47,23 @@ resource-oriented, auto-generated API in the PostgREST sense — `/sql` and
 
 ## Authentication
 
-Verify-only, stateless JWT (HS256). The server validates a bearer token
-signed with a shared secret (`UNIDB_JWT_SECRET`) — there is no login
-endpoint, no user database, and no session state. Anything that issues
-tokens (an external auth service, a secret shared out-of-band) is outside
-this project's scope.
+JWT bearer auth (HS256). The server validates a token signed with a shared
+secret (`UNIDB_JWT_SECRET`) on every data-plane route.
+
+Token **verification** is always on. Token **issuance** is an optional
+built-in auth service (items 121/122): with a signing key configured
+(`UNIDB_DEV_LOGIN=1` today), the server offers real password login, signup,
+and refresh-token sessions — see [`POST /auth/login`](#post-authlogin--password-login),
+[`POST /auth/signup`](#post-authsignup--self-service-signup),
+[`POST /auth/refresh`](#post-authrefresh--exchange-a-refresh-token), and
+[`POST /auth/logout`](#post-authlogout--revoke-a-session). You may still
+bring tokens from an external issuer instead; the two modes coexist.
+
+> **Correction (2026-07-31):** earlier versions of this section stated "there
+> is no login endpoint, no user database, and no session state." That is no
+> longer true — items 121/122 added an argon2id credential store, password
+> login/signup, and hash-only refresh-token sessions. Verify-only remains the
+> *default posture* when no signing key is configured.
 
 ```
 Authorization: Bearer <jwt signed with UNIDB_JWT_SECRET, HS256>
@@ -1149,6 +1161,41 @@ and DELETE policies are applied as a predicate AND-rewrite via `apply_rls` at qu
 time, regardless of which route invoked `execute_sql`. Policies persist across server restart
 (catalog-stored). Multiple policies on the same table and operation are combined with AND.
 
+#### Token-bound RLS — `auth.uid()`, `auth.jwt()`, and roles (item 122)
+
+Policies can reference the caller's verified token, so a single policy scopes data
+per-user and per-tenant without app-side filtering:
+
+```sql
+-- The token subject (sub claim). Fails closed to NULL when absent.
+CREATE POLICY own_rows ON docs FOR ALL USING (owner = auth.uid());
+
+-- Any verified JWT claim by key. Parenthesise: ->> binds looser than =.
+CREATE POLICY tenant_iso ON docs FOR SELECT USING (tenant_id = (auth.jwt() ->> 'tenant'));
+```
+
+Both `auth.uid()` and `auth.jwt() ->> 'claim'` are substituted at policy-injection time
+(before the Query/QExpr conversion) and **fail closed** — a missing subject or claim
+resolves to `NULL` (never `TRUE`), so a policy never widens access.
+
+**Built-in roles.** Every caller resolves to effective roles: `anon` (no verified
+subject), `authenticated` (a verified subject) plus the user's granted roles, or
+`service_role` (a token whose verified claims carry `"role": "service_role"`).
+`anon`/`authenticated`/`service_role` are reserved — `CREATE ROLE`/`DROP ROLE` reject
+them. `service_role` **bypasses RLS** like a superuser, but the bypass is written to
+`audit.log` (distinct from the implicit-superuser bypass).
+
+**Role-scoped policies.** A policy may target roles with `TO`:
+
+```sql
+CREATE POLICY only_auth ON docs FOR SELECT TO authenticated USING (published = true);
+```
+
+A policy with **no `TO`** applies to every caller (unchanged behavior). A `TO`-scoped
+policy is only applied when the caller's effective roles intersect its target set. If a
+table has *only* `TO`-scoped policies and the caller matches none, all rows are denied
+(fail closed). Claims/roles come **only** from a verified token — never from the SQL text.
+
 #### Enforcement on server routes
 
 | Route | Enforcement |
@@ -1262,7 +1309,8 @@ GET /auth/meta
   "privilege_types": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "policy_operations": ["ALL", "SELECT", "INSERT", "UPDATE", "DELETE"],
   "catalog_tables": ["information_schema.tables", "unidb_catalog.roles", "unidb_catalog.grants", "unidb_catalog.policies"],
-  "dev_login_enabled": false
+  "dev_login_enabled": false,
+  "signup_enabled": false
 }
 ```
 
@@ -1270,40 +1318,82 @@ GET /auth/meta
 |-------|---------|
 | `open_mode` | `true` when no users exist — RLS inactive, all callers have full access |
 | `dev_login_enabled` | `true` only when server is started with `UNIDB_DEV_LOGIN=1` |
+| `signup_enabled` | `true` only when started with `UNIDB_ALLOW_SIGNUP=1` (item 121 A3) |
 
-#### `POST /auth/login` — dev/demo token issuance (item 100, `UNIDB_DEV_LOGIN=1` only)
+#### `POST /auth/login` — password login
 
-> **Security notice:** This route is **disabled by default**. It is a passwordless,
-> dev/demo-only endpoint. It must **never** be enabled in production. The Milestone-18
-> decision to keep token issuance out of the production path is unchanged.
->
-> Enable only with `UNIDB_DEV_LOGIN=1` env var. The server logs a `WARN` on startup
-> when this flag is set.
+> Requires a signing key (`UNIDB_DEV_LOGIN=1` today; a first-class production
+> issuer is item 121 A5). When no signing key is configured the route returns
+> the "issuance disabled" error. Pair with rate-limiting (item I1) before
+> production exposure.
 
-Issues a short-lived HS256 JWT (1 hour, same secret as the server's `UNIDB_JWT_SECRET`)
-for the named user. The user must exist (via `CREATE USER`) in the engine — unknown users
-receive `404`.
+Verifies the supplied password against the user's stored **argon2id** credential
+(item 121 A1/A2) and, on success, issues an access token + a refresh token.
+The user must have a password set (`CREATE USER … PASSWORD '…'` or signup).
+
+**Security:** unknown user, wrong password, and a user with no credential all
+return the **same** `401 INVALID_CREDENTIALS` — a same-cost dummy verify runs on
+the miss paths, so there is no user-enumeration or timing oracle. `open_mode`
+(no users registered) is unchanged.
 
 **Auth:** None (public).
 
 **Request** `POST /auth/login`:
 ```json
-{ "username": "alice" }
+{ "username": "alice", "password": "correct horse battery staple" }
 ```
 
 **Response** `200 OK`:
 ```json
-{ "token": "<jwt>", "expires_in": 3600 }
+{ "token": "<access-jwt>", "access_token": "<access-jwt>", "refresh_token": "<opaque-256bit-hex>", "expires_in": 3600 }
 ```
+> `token` is a deprecated alias for `access_token`, kept for backward compat.
+> The `refresh_token` is an opaque high-entropy string (NOT a JWT); the server
+> stores only its SHA-256 hash, never the raw token.
 
-**Error responses:** `404` user not found; `403` when `UNIDB_DEV_LOGIN` is not set.
+**Error responses:** `401 INVALID_CREDENTIALS` (unknown user / wrong password /
+no credential — uniform); issuance-disabled error when no signing key is set.
 
-**Example:**
-```bash
-curl -s -X POST http://localhost:7777/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"username": "alice"}'
+#### `POST /auth/signup` — self-service signup
+
+> **Disabled by default.** Enable with `UNIDB_ALLOW_SIGNUP=1` **and** a configured
+> signing key. When disabled the route returns `404` (indistinguishable from a
+> non-existent route). Item 121 A3.
+
+Creates a **non-superuser** with an argon2id credential and returns the same
+token pair as login. Duplicate usernames are rejected; the user is only created
+after the signing-key check, so a disabled issuer never leaves an orphaned account.
+
+**Request** `POST /auth/signup`:
+```json
+{ "username": "bob", "password": "…" }
 ```
+**Response** `200 OK`: same shape as `POST /auth/login`. **Errors:** `404` when
+signup disabled; `409`/error on duplicate username.
+
+#### `POST /auth/refresh` — exchange a refresh token
+
+Verifies a refresh token (hashes it, looks up the session; unknown / expired /
+revoked all return a uniform `401 INVALID_REFRESH_TOKEN`) and issues a fresh
+access token **and a rotated refresh token** (the old one is revoked). Item 121 A4.
+
+**Request** `POST /auth/refresh`:
+```json
+{ "refresh_token": "<opaque-hex>" }
+```
+**Response** `200 OK`: same shape as `POST /auth/login` (new access + new refresh).
+**Error:** `401 INVALID_REFRESH_TOKEN`.
+
+#### `POST /auth/logout` — revoke a session
+
+Revokes the session behind a refresh token. **Idempotent** — unknown, garbage, or
+already-revoked tokens all return `204 No Content` (no state disclosure). Item 121 A4.
+
+**Request** `POST /auth/logout`:
+```json
+{ "refresh_token": "<opaque-hex>" }
+```
+**Response** `204 No Content`.
 
 #### `GET /auth/whoami` — caller identity and privileges (item 100)
 

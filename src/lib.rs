@@ -38,6 +38,7 @@
 #![deny(unsafe_code)]
 
 pub mod audit;
+pub mod auth_principal;
 pub mod authz;
 /// Autovacuum (A3) — the background launcher thread that auto-triggers the
 /// existing M10 `Engine::vacuum`. See the module doc for why concurrent
@@ -125,8 +126,9 @@ use crate::{
     sql::{
         executor::{self, ExecCtx, ExecResult},
         logical::{
-            apply_rls, apply_rls_skip_current_user, bind_params, substitute_current_user_in_plan,
-            Expr, Literal, LogicalPlan,
+            apply_rls, apply_rls_skip_current_user, apply_rls_with_auth, bind_params,
+            substitute_auth_context_in_plan, substitute_current_user_in_plan, Expr, Literal,
+            LogicalPlan,
         },
         parser::parse_sql,
         query::{FromNode, QuerySpec},
@@ -135,6 +137,7 @@ use crate::{
     wal::Wal,
 };
 
+pub use crate::auth_principal::AuthPrincipal;
 pub use crate::error::DbError;
 pub use crate::heap::RowId;
 pub use crate::read_handle::ReadHandle;
@@ -1663,6 +1666,67 @@ impl Engine {
         &self.authz
     }
 
+    /// Set (or replace) `user`'s password credential (item 121, A1). Hashed
+    /// with argon2id before it ever leaves [`crate::authz`]; the caller must
+    /// already have verified `user` is authorized to change this (there is
+    /// no built-in superuser gate here — this is the raw embedded-API entry
+    /// point, mirroring [`Engine::authz`] being unrestricted for the
+    /// implicit-superuser embedded caller).
+    pub fn set_password(&self, user: &str, password: &str) -> Result<()> {
+        self.authz.set_password(user, password)
+    }
+
+    /// Verify `password` against `user`'s stored credential (item 121, A2).
+    /// `false` uniformly covers "unknown user", "user has no stored
+    /// credential", and "wrong password" — see
+    /// [`crate::authz::RoleStore::verify_password`] for the no-enumeration-
+    /// oracle guarantee.
+    pub fn verify_password(&self, user: &str, password: &str) -> bool {
+        self.authz.verify_password(user, password)
+    }
+
+    /// Create a new, non-superuser user with a password credential (item
+    /// 121, A3 — `POST /auth/signup`'s embedded-API entry point). Thin
+    /// delegate to [`crate::authz::RoleStore::apply`]'s `CreateUser` branch,
+    /// which already errors on a duplicate username and hashes the password
+    /// with argon2id before it is ever stored. There is no privilege gate
+    /// here — the caller (the signup handler) is responsible for the
+    /// `UNIDB_ALLOW_SIGNUP` policy gate; this method just performs the
+    /// (already-authorized) creation, mirroring `set_password`'s unrestricted
+    /// embedded-API posture.
+    pub fn create_user_with_password(&self, user: &str, password: &str) -> Result<()> {
+        self.authz.apply(&crate::authz::AuthStmt::CreateUser {
+            name: user.to_string(),
+            superuser: false,
+            password: Some(password.to_string()),
+        })
+    }
+
+    /// Issue a fresh refresh-token session for `user` (item 121, A4). See
+    /// [`crate::authz::RoleStore::create_session`].
+    pub fn create_session(&self, user: &str) -> Result<(String, u64)> {
+        self.authz.create_session(user)
+    }
+
+    /// Verify a raw refresh token, returning its owning username on success
+    /// (item 121, A4). See [`crate::authz::RoleStore::verify_session`] for
+    /// the uniform-failure-shape guarantee.
+    pub fn verify_session(&self, raw_token: &str) -> Option<String> {
+        self.authz.verify_session(raw_token)
+    }
+
+    /// Verify + rotate a refresh token (item 121, A4). See
+    /// [`crate::authz::RoleStore::rotate_session`].
+    pub fn rotate_session(&self, raw_token: &str) -> Result<Option<(String, String, u64)>> {
+        self.authz.rotate_session(raw_token)
+    }
+
+    /// Revoke a refresh-token session, idempotently (item 121, A4 —
+    /// `POST /auth/logout`). See [`crate::authz::RoleStore::revoke_session`].
+    pub fn revoke_session(&self, raw_token: &str) -> Result<()> {
+        self.authz.revoke_session(raw_token)
+    }
+
     /// Execute SQL **as** a named user (P6.e), enforcing per-table privileges.
     /// `user == None` is the implicit **superuser** (the embedded API), so
     /// `execute_sql` is exactly `execute_sql_as(None, ..)` and is unrestricted.
@@ -1670,12 +1734,35 @@ impl Engine {
     /// Also the entry point for auth DDL (`CREATE USER`/`ROLE`, `GRANT`,
     /// `REVOKE`) — those are intercepted here (they aren't `sqlparser` grammar),
     /// require superuser, and mutate the role store rather than the catalog.
+    ///
+    /// A thin delegate to [`Engine::execute_sql_as_principal`] (auth seam) —
+    /// there is exactly one code path underneath both entry points.
     pub fn execute_sql_as(
         &self,
         user: Option<&str>,
         xid: Xid,
         sql: &str,
     ) -> Result<Vec<ExecResult>> {
+        self.execute_sql_as_principal(&AuthPrincipal::user(user.map(str::to_owned)), xid, sql)
+    }
+
+    /// Like [`Engine::execute_sql_as`], but takes a full [`AuthPrincipal`]
+    /// (auth seam) instead of a bare subject string. `principal.subject` and
+    /// `principal.claims` are carried down into the `ExecCtx` used for
+    /// execution and now (item 122, B1/B2) back `auth.uid()`/`auth.jwt() ->>
+    /// '...'` RLS-policy substitution, in addition to `current_user()`/RLS
+    /// privilege checks which still key off `principal.subject` exactly as
+    /// `execute_sql_as` always has. `principal.roles` remains carried but
+    /// unconsumed (later role-scoped-policy work, B3/B4). Behavior is
+    /// identical to `execute_sql_as(principal.subject.as_deref(), xid, sql)`
+    /// for any policy that doesn't reference `auth.uid()`/`auth.jwt()`.
+    pub fn execute_sql_as_principal(
+        &self,
+        principal: &AuthPrincipal,
+        xid: Xid,
+        sql: &str,
+    ) -> Result<Vec<ExecResult>> {
+        let user = principal.subject.as_deref();
         // Auth DDL (whole-statement) is handled here, not by the SQL executor.
         if let Some(stmt) = crate::authz::parse_auth_stmt(sql)? {
             let (action, object) = auth_stmt_audit(&stmt);
@@ -1705,8 +1792,18 @@ impl Engine {
         } else {
             // A named non-superuser must hold the matching privilege on every
             // table each statement touches (an effective superuser skips checks).
+            // item 122, B3: `service_role` also skips this gate — it
+            // "bypasses RLS like a superuser," which in practice (this is the
+            // key used for full backend/admin access, mirroring Supabase)
+            // means table-grant privilege checks too, not only the RLS
+            // predicate injection in `execute_sql_inner_as_principal`.
+            let is_service_role = self
+                .authz
+                .effective_roles(user, &principal.claims)
+                .iter()
+                .any(|r| r == crate::authz::SERVICE_ROLE);
             if let Some(u) = user {
-                if !self.is_effective_superuser(Some(u)) {
+                if !self.is_effective_superuser(Some(u)) && !is_service_role {
                     // item 96: use the plan cache; the same SQL will hit the
                     // cache again when execute_sql is called a moment later.
                     for plan in self.parse_sql_cached(sql)?.iter() {
@@ -1725,7 +1822,7 @@ impl Engine {
                     }
                 }
             }
-            self.execute_sql_inner_as(xid, sql, user)
+            self.execute_sql_inner_as_principal(xid, sql, principal)
         }
     }
 
@@ -1759,6 +1856,10 @@ impl Engine {
     /// the server's read/param fast paths, which don't route through
     /// [`Engine::execute_sql_as`]. A superuser / embedded (`None`) always passes.
     /// Auth DDL requires superuser here too.
+    ///
+    /// Carries no verified claims, so a `service_role` caller does NOT bypass
+    /// here — use [`Self::authorize_sql_as_principal`] wherever the caller has
+    /// a full [`AuthPrincipal`] available (item 122, B3).
     pub fn authorize_sql(&self, user: Option<&str>, sql: &str) -> Result<()> {
         if crate::authz::parse_auth_stmt(sql)?.is_some() {
             return self.require_superuser(user);
@@ -1769,6 +1870,37 @@ impl Engine {
         let u = user.expect("effective superuser covers None");
         // item 96: reuse the plan cache for the privilege pre-check; the same
         // SQL string about to be executed will hit the cache again immediately.
+        for plan in self.parse_sql_cached(sql)?.iter() {
+            self.check_plan_privileges(u, plan)?;
+        }
+        Ok(())
+    }
+
+    /// Like [`Self::authorize_sql`] but principal-aware (item 122, B3): a
+    /// `service_role` claim skips the privilege pre-check too, mirroring
+    /// [`Self::execute_sql_as_principal`]'s bypass — service_role "bypasses
+    /// RLS like a superuser," which in practice means the table-grant
+    /// privilege gate as well, not only RLS predicate injection. Without
+    /// this, a server fast path that pre-checks with the claims-blind
+    /// [`Self::authorize_sql`] would reject a service_role token before it
+    /// ever reached the engine's own (audited) bypass logic.
+    pub fn authorize_sql_as_principal(&self, principal: &AuthPrincipal, sql: &str) -> Result<()> {
+        let user = principal.subject.as_deref();
+        if crate::authz::parse_auth_stmt(sql)?.is_some() {
+            return self.require_superuser(user);
+        }
+        if self.is_effective_superuser(user) {
+            return Ok(());
+        }
+        let is_service_role = self
+            .authz
+            .effective_roles(user, &principal.claims)
+            .iter()
+            .any(|r| r == crate::authz::SERVICE_ROLE);
+        if is_service_role {
+            return Ok(());
+        }
+        let u = user.expect("effective superuser covers None");
         for plan in self.parse_sql_cached(sql)?.iter() {
             self.check_plan_privileges(u, plan)?;
         }
@@ -2333,15 +2465,45 @@ impl Engine {
     /// the embedded path, `user = None`) skip RLS entirely — if `user` is
     /// `None` or is an effective superuser, `apply_rls` is not called, so
     /// policies with `CurrentUser` cannot accidentally block the admin path.
-    fn execute_sql_inner_as(
+    ///
+    /// Auth seam: mirrors the pre-seam `execute_sql_inner_as(xid, sql, user)`
+    /// exactly, additionally threading `principal.claims` into the `ExecCtx`
+    /// used for execution.
+    ///
+    /// **item 122, B3:** the caller's *effective* roles are resolved HERE,
+    /// engine-side (`self.authz.effective_roles`, which needs authz access
+    /// `require_jwt` doesn't have) — from `principal.subject`/`principal.
+    /// claims`, NOT from `principal.roles` (which the HTTP auth layer never
+    /// populates; role resolution is deliberately not the token-verification
+    /// layer's job). A `claims["role"] == "service_role"` token resolves to
+    /// `["service_role"]` and additionally bypasses RLS here exactly like a
+    /// superuser (`skip_rls`), but on the **audited** path (item-103 lesson —
+    /// distinct from the unaudited embedded/superuser bypass): logged via
+    /// `self.audit` below. The resolved roles are carried into a fresh
+    /// `AuthPrincipal` (`principal_r`) used for every downstream call in this
+    /// function instead of the original `principal` — `ExecCtx::auth_roles`
+    /// picks them up for free through the existing `principal.roles.clone()`
+    /// wiring in `execute_one_plan_inner_as_with_scope`.
+    fn execute_sql_inner_as_principal(
         &self,
         xid: Xid,
         sql: &str,
-        user: Option<&str>,
+        principal: &AuthPrincipal,
     ) -> Result<Vec<ExecResult>> {
+        let user = principal.subject.as_deref();
+        let effective_roles = self.authz.effective_roles(user, &principal.claims);
+        let is_service_role = effective_roles
+            .iter()
+            .any(|r| r == crate::authz::SERVICE_ROLE);
         let skip_rls = user
             .map(|u| self.is_effective_superuser(Some(u)))
-            .unwrap_or(true); // None == embedded/superuser → skip RLS
+            .unwrap_or(true) // None == embedded/superuser → skip RLS
+            || is_service_role;
+        let principal_r = AuthPrincipal {
+            subject: principal.subject.clone(),
+            claims: principal.claims.clone(),
+            roles: effective_roles.clone(),
+        };
         let plans = Arc::unwrap_or_clone(self.parse_sql_cached(sql)?);
         let saved_catalog_root = ctrl_lock(&self.control).catalog_root;
         let mut results = Vec::with_capacity(plans.len());
@@ -2350,23 +2512,54 @@ impl Engine {
             if let Some(u) = user {
                 substitute_current_user_in_plan(&mut plan, u);
             }
+            // Item 122 (B1/B2): substitute auth.uid()/auth.jwt() in the
+            // user-supplied SQL's predicates too. Called unconditionally
+            // (regardless of `user`/claims presence) — a missing subject or
+            // claim must resolve to a typed Null (fail closed), not be left
+            // unsubstituted.
+            substitute_auth_context_in_plan(&mut plan, user, &principal.claims);
             // Apply RLS (which may inject policy expressions containing
-            // CurrentUser) only for non-superuser named users.
+            // CurrentUser/AuthUid/AuthClaim) only for non-superuser named
+            // users and non-service_role callers.
             let mut plan = if skip_rls {
                 plan
             } else {
-                apply_rls(plan, &cat_read(&self.catalog), user)
+                apply_rls_with_auth(
+                    plan,
+                    &cat_read(&self.catalog),
+                    user,
+                    &principal.claims,
+                    &effective_roles,
+                )
             };
-            // Substitute again to resolve any CurrentUser nodes the RLS
-            // policy injected.
+            // Substitute again to resolve any CurrentUser/AuthUid/AuthClaim
+            // nodes the RLS policy injected.
             if let Some(u) = user {
                 substitute_current_user_in_plan(&mut plan, u);
             }
+            substitute_auth_context_in_plan(&mut plan, user, &principal.claims);
             let dml_table = plan_dml_table(&plan).map(|s| s.to_owned());
             let is_ddl = plan_is_schema_ddl(&plan);
-            // Thread user identity through ExecCtx so exec_insert can
-            // substitute CurrentUser in INSERT policy checks.
-            let result = self.execute_one_plan_as(xid, plan, user);
+            // item-103 lesson: a service_role bypass is audited distinctly
+            // from the unaudited implicit-superuser path — `self.audit.
+            // record_admin` always logs (unlike `record`, which no-ops for
+            // `user == None`), so a subject-less service_role token (no
+            // `sub` claim, only `claims["role"] == "service_role"`) still
+            // leaves a trail.
+            if is_service_role {
+                self.audit.record_admin(
+                    user,
+                    Some(xid),
+                    "service_role_rls_bypass",
+                    dml_table.as_deref().unwrap_or(""),
+                    true,
+                );
+            }
+            // Thread the roles-resolved principal through ExecCtx so
+            // exec_insert can substitute CurrentUser in INSERT policy checks
+            // and so `auth_roles` (service_role INSERT/WITH-CHECK bypass,
+            // item 122 B3) rides along correctly.
+            let result = self.execute_one_plan_as(xid, plan, &principal_r);
             match result {
                 Ok(result) => {
                     self.note_dml_result(&result, dml_table.as_deref());
@@ -2384,17 +2577,18 @@ impl Engine {
         Ok(results)
     }
 
-    /// Like `execute_one_plan_inner` but threads `current_user` through the
-    /// `ExecCtx` for INSERT policy checks (item-24 Z6).
+    /// Like `execute_one_plan_inner` but threads the auth principal through
+    /// the `ExecCtx` for INSERT policy checks (item-24 Z6) and, inertly, for
+    /// later claim/role-aware policy work (auth seam).
     fn execute_one_plan_as(
         &self,
         xid: Xid,
         plan: LogicalPlan,
-        user: Option<&str>,
+        principal: &AuthPrincipal,
     ) -> Result<ExecResult> {
         let latency_hist = self.stmt_latency_for(&plan);
         let started = latency_hist.map(|_| std::time::Instant::now());
-        let result = self.execute_one_plan_inner_as(xid, plan, user);
+        let result = self.execute_one_plan_inner_as(xid, plan, principal);
         if let (Some(hist), Some(started)) = (latency_hist, started) {
             hist.record(started.elapsed().as_micros() as u64);
         }
@@ -2405,20 +2599,20 @@ impl Engine {
         &self,
         xid: Xid,
         plan: LogicalPlan,
-        user: Option<&str>,
+        principal: &AuthPrincipal,
     ) -> Result<ExecResult> {
-        self.execute_one_plan_inner_as_with_scope(xid, plan, user, false)
+        self.execute_one_plan_inner_as_with_scope(xid, plan, principal, false)
     }
 
     fn execute_one_plan_inner_as_with_scope(
         &self,
         xid: Xid,
         plan: LogicalPlan,
-        user: Option<&str>,
+        principal: &AuthPrincipal,
         in_explicit_txn: bool,
     ) -> Result<ExecResult> {
         let page_size = self.page_size;
-        let current_user = user.map(|u| u.to_owned());
+        let current_user = principal.subject.clone();
         let shared = self.stmt_uses_shared_catalog(&plan);
         if shared {
             let catalog = cat_read(&self.catalog);
@@ -2438,6 +2632,8 @@ impl Engine {
                 hnsw_vec_caches: Some(&self.hnsw_vec_caches),
                 authz: Some(&self.authz),
                 current_user: current_user.clone(),
+                auth_claims: principal.claims.clone(),
+                auth_roles: principal.roles.clone(),
                 hnsw_tx: self.hnsw_worker_tx.lock().unwrap().clone(),
                 in_explicit_txn,
                 near_lightweight_snaps: Some(&self.near_lightweight_snaps),
@@ -2461,6 +2657,8 @@ impl Engine {
                 hnsw_vec_caches: Some(&self.hnsw_vec_caches),
                 authz: Some(&self.authz),
                 current_user,
+                auth_claims: principal.claims.clone(),
+                auth_roles: principal.roles.clone(),
                 hnsw_tx: self.hnsw_worker_tx.lock().unwrap().clone(),
                 in_explicit_txn,
                 near_lightweight_snaps: Some(&self.near_lightweight_snaps),
@@ -2660,6 +2858,8 @@ impl Engine {
                 hnsw_vec_caches: Some(&self.hnsw_vec_caches),
                 authz: Some(&self.authz),
                 current_user: None,
+                auth_claims: Default::default(),
+                auth_roles: Vec::new(),
                 hnsw_tx,
                 in_explicit_txn,
                 near_lightweight_snaps: Some(&self.near_lightweight_snaps),
@@ -2683,6 +2883,8 @@ impl Engine {
                 hnsw_vec_caches: Some(&self.hnsw_vec_caches),
                 authz: Some(&self.authz),
                 current_user: None,
+                auth_claims: Default::default(),
+                auth_roles: Vec::new(),
                 hnsw_tx,
                 in_explicit_txn,
                 near_lightweight_snaps: Some(&self.near_lightweight_snaps),
@@ -2778,6 +2980,8 @@ impl Engine {
             hnsw_vec_caches: Some(&self.hnsw_vec_caches),
             authz: Some(&self.authz),
             current_user: None,
+            auth_claims: Default::default(),
+            auth_roles: Vec::new(),
             hnsw_tx,
             in_explicit_txn: false,
             near_lightweight_snaps: Some(&self.near_lightweight_snaps),
@@ -2817,29 +3021,41 @@ impl Engine {
 
     /// Parse `using_expr` into an `Expr` by wrapping it in a dummy SELECT,
     /// then returning the parsed predicate. This is the shared helper for
-    /// `create_policy` (item-24 Z1).
+    /// `create_policy` (item-24 Z1). Moved to
+    /// `crate::sql::logical::parse_policy_predicate` (item 122, B4) so the
+    /// role-scoped policy gate in `apply_rls_with_auth` can reuse the exact
+    /// same re-parse logic without duplicating it; kept here as a thin
+    /// delegate so every existing call site in this file is unchanged.
     fn parse_policy_predicate(table: &str, using_expr: &str) -> Result<Expr> {
-        let sql = format!("SELECT * FROM {table} WHERE {using_expr}");
-        let plans = parse_sql(&sql)?;
-        match plans.as_slice() {
-            [LogicalPlan::Select {
-                predicate: Some(expr),
-                ..
-            }] => Ok(expr.clone()),
-            _ => Err(DbError::SqlUnsupported(
-                "a policy USING predicate must be a single AND-only comparison predicate".into(),
-            )),
-        }
+        crate::sql::logical::parse_policy_predicate(table, using_expr)
     }
 
-    /// `CREATE POLICY <name> ON <table> FOR <op> USING (<predicate>)` (Z1).
+    /// `CREATE POLICY <name> ON <table> FOR <op> [TO <role,...>] USING (<predicate>)` (Z1, item 122 B4).
     ///
-    /// Persists the `PolicyDef` in `TableDef.policies` (for Z5 introspection)
-    /// and merges the parsed predicate into `TableDef.rls_policy` via AND, so
+    /// Persists the `PolicyDef` in `TableDef.policies` (for Z5 introspection
+    /// and, since B4, for `apply_rls_with_auth`'s role-scoped re-evaluation)
+    /// and merges the parsed predicate into `TableDef.rls_policy` via OR, so
     /// the existing planner rewrite path picks it up automatically.
     ///
     /// Superusers (the bootstrap role or any SUPERUSER user) bypass all RLS
     /// policies per the BYPASSRLS semantic — they are never filtered.
+    ///
+    /// **Role-scoped (`TO`) policies, item 122 B4:** a policy with a non-empty
+    /// `target_roles` is deliberately **not** merged into `rls_policy`/
+    /// `update_policy`/`delete_policy` here — those three fields stay exactly
+    /// "the OR of every no-`TO` policy," so a no-`TO` policy applies to every
+    /// caller unchanged (back-compat). `apply_rls_with_auth` (`sql/logical.rs`)
+    /// instead re-derives the `TO`-scoped contribution at plan/injection time
+    /// from `TableDef.policies` directly, gated by the caller's effective
+    /// roles — see [`crate::sql::logical::role_scoped_policy_for`] (private to
+    /// that module; called from `apply_rls_with_auth`). **Known scope limit:**
+    /// `insert_policy`/`update_with_check` (evaluated per-row in
+    /// `exec_insert`/`exec_update_with_check`, not via `apply_rls`) are still
+    /// merged **unconditionally** below regardless of `target_roles` — a
+    /// `TO`-scoped `FOR INSERT`/`FOR ALL` policy's write-side check still
+    /// applies to every inserter/updater, not just the target roles. This is
+    /// the safe (fail-closed / extra-restrictive, never fail-open) direction
+    /// and is tracked as a documented follow-up, not silently dropped.
     fn create_policy_inner(
         policy: crate::authz::PolicyDef,
         cat: &mut crate::catalog::Catalog,
@@ -2848,6 +3064,7 @@ impl Engine {
         use crate::authz::PolicyOp;
         let table = policy.table.clone();
         let op = policy.op;
+        let role_scoped = !policy.target_roles.is_empty();
         let expr = Self::parse_policy_predicate(&table, &policy.using_expr)?;
         // item-24 R-a: WITH CHECK expression (defaults to USING when absent).
         let check_sql = policy
@@ -2864,6 +3081,11 @@ impl Engine {
         //
         // Permissive policies use OR (any matching policy permits the row), per
         // Postgres semantics. This replaces the prior AND-merge which was wrong.
+        //
+        // item 122 B4: SELECT/UPDATE/DELETE skip the unfiltered merge for a
+        // role-scoped policy (`apply_rls_with_auth` re-derives it, role-gated,
+        // at plan time instead); INSERT/WITH-CHECK stay unconditional (see the
+        // doc comment above — documented scope limit, safe direction).
         if matches!(op, PolicyOp::Insert | PolicyOp::All) {
             let existing = cat
                 .lookup(&table)
@@ -2875,7 +3097,7 @@ impl Engine {
             };
             cat.set_insert_policy(&table, Some(merged), ctx)?;
         }
-        if matches!(op, PolicyOp::Select | PolicyOp::All) {
+        if matches!(op, PolicyOp::Select | PolicyOp::All) && !role_scoped {
             let existing = cat.lookup(&table).ok().and_then(|t| t.rls_policy.clone());
             let merged = match existing {
                 Some(old) => Expr::Or(Box::new(old), Box::new(expr.clone())),
@@ -2884,15 +3106,17 @@ impl Engine {
             cat.set_rls_policy(&table, merged, ctx)?;
         }
         if matches!(op, PolicyOp::Update | PolicyOp::All) {
-            let existing = cat
-                .lookup(&table)
-                .ok()
-                .and_then(|t| t.update_policy.clone());
-            let merged = match existing {
-                Some(old) => Expr::Or(Box::new(old), Box::new(expr.clone())),
-                None => expr.clone(),
-            };
-            cat.set_update_policy(&table, Some(merged), ctx)?;
+            if !role_scoped {
+                let existing = cat
+                    .lookup(&table)
+                    .ok()
+                    .and_then(|t| t.update_policy.clone());
+                let merged = match existing {
+                    Some(old) => Expr::Or(Box::new(old), Box::new(expr.clone())),
+                    None => expr.clone(),
+                };
+                cat.set_update_policy(&table, Some(merged), ctx)?;
+            }
             // item-24 R-a: maintain update_with_check (USING if no explicit WITH CHECK).
             let existing_check = cat
                 .lookup(&table)
@@ -2904,7 +3128,7 @@ impl Engine {
             };
             cat.set_update_with_check(&table, Some(merged_check), ctx)?;
         }
-        if matches!(op, PolicyOp::Delete | PolicyOp::All) {
+        if matches!(op, PolicyOp::Delete | PolicyOp::All) && !role_scoped {
             let existing = cat
                 .lookup(&table)
                 .ok()
@@ -2921,8 +3145,17 @@ impl Engine {
     /// `DROP POLICY <name> ON <table>` (Z1).
     ///
     /// Removes the named policy from `TableDef.policies` and recomputes
-    /// both `rls_policy` and `insert_policy` by re-parsing and re-merging
-    /// the remaining named policies.
+    /// `rls_policy`/`insert_policy`/`update_policy`/`update_with_check`/
+    /// `delete_policy` by re-parsing and re-merging the remaining named
+    /// policies. item 122 B4: `rls_policy`/`update_policy`/`delete_policy`
+    /// only re-fold **no-`TO`** remaining policies (`target_roles.is_empty()`)
+    /// — a `TO`-scoped policy's contribution to those three fields was never
+    /// merged in by `create_policy_inner` in the first place (it lives solely
+    /// in `TableDef.policies`, re-derived role-gated by `apply_rls_with_auth`
+    /// at plan time), so dropping it changes nothing about them. `insert_policy`/
+    /// `update_with_check` keep re-folding every remaining policy
+    /// unconditionally, symmetric with `create_policy_inner`'s documented
+    /// scope limit for those two fields.
     fn drop_policy_inner(
         name: &str,
         table: &str,
@@ -2936,10 +3169,12 @@ impl Engine {
             .ok()
             .map(|t| t.policies.clone())
             .unwrap_or_default();
-        // Recompute rls_policy (SELECT/ALL) from remaining — OR semantics.
+        // Recompute rls_policy (SELECT/ALL, no-TO only) from remaining — OR semantics.
         let rls_merged = policies
             .iter()
-            .filter(|p| matches!(p.op, PolicyOp::Select | PolicyOp::All))
+            .filter(|p| {
+                matches!(p.op, PolicyOp::Select | PolicyOp::All) && p.target_roles.is_empty()
+            })
             .try_fold(None::<Expr>, |acc, p| {
                 let expr = Self::parse_policy_predicate(table, &p.using_expr)?;
                 Ok::<_, crate::error::DbError>(Some(match acc {
@@ -2958,10 +3193,12 @@ impl Engine {
                     None => expr,
                 }))
             })?;
-        // Recompute update_policy (UPDATE/ALL USING) from remaining.
+        // Recompute update_policy (UPDATE/ALL USING, no-TO only) from remaining.
         let upd_merged = policies
             .iter()
-            .filter(|p| matches!(p.op, PolicyOp::Update | PolicyOp::All))
+            .filter(|p| {
+                matches!(p.op, PolicyOp::Update | PolicyOp::All) && p.target_roles.is_empty()
+            })
             .try_fold(None::<Expr>, |acc, p| {
                 let expr = Self::parse_policy_predicate(table, &p.using_expr)?;
                 Ok::<_, crate::error::DbError>(Some(match acc {
@@ -2981,10 +3218,12 @@ impl Engine {
                     None => expr,
                 }))
             })?;
-        // Recompute delete_policy (DELETE/ALL) from remaining.
+        // Recompute delete_policy (DELETE/ALL, no-TO only) from remaining.
         let del_merged = policies
             .iter()
-            .filter(|p| matches!(p.op, PolicyOp::Delete | PolicyOp::All))
+            .filter(|p| {
+                matches!(p.op, PolicyOp::Delete | PolicyOp::All) && p.target_roles.is_empty()
+            })
             .try_fold(None::<Expr>, |acc, p| {
                 let expr = Self::parse_policy_predicate(table, &p.using_expr)?;
                 Ok::<_, crate::error::DbError>(Some(match acc {
@@ -4447,6 +4686,7 @@ impl Engine {
             self.txn_mgr.shared(),
             Arc::clone(&self.catalog),
             Arc::clone(&self.authz),
+            Arc::clone(&self.audit),
         )
     }
 

@@ -342,11 +342,16 @@ fn sql_response(
 
 pub async fn post_sql(
     Extension(current_user): Extension<CurrentUser>,
+    Extension(principal): Extension<crate::AuthPrincipal>,
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<SqlRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, ApiError> {
     let user = current_user.0;
+    debug_assert_eq!(
+        principal.subject, user,
+        "CurrentUser and AuthPrincipal must carry the same subject (both come from require_jwt)"
+    );
 
     // Cursor mode is validated before anything executes (R4).
     if body.cursor {
@@ -366,16 +371,19 @@ pub async fn post_sql(
         // Everything up to execution is a pre-check: a rejection here has
         // touched nothing, so the session stays open.
         ensure_session_sql_allowed(&body.sql)?;
+        // item 122, B3: principal-aware pre-check so a service_role token
+        // isn't rejected here before the engine's own audited bypass runs.
         state
             .engine
-            .authorize_sql(user.clone(), body.sql.clone())
+            .authorize_sql_as_principal(principal.clone(), body.sql.clone())
             .await?;
-        // Use execute_sql_as to carry the user identity so the RLS bypass for
-        // superusers and the no-sub path applies correctly (item 103).
+        // Use execute_sql_as_principal (auth seam) to carry the full
+        // principal so the RLS bypass for superusers and the no-sub path
+        // applies correctly (item 103); claims/roles ride along inert.
         let result = if body.params.is_empty() {
             state
                 .engine
-                .execute_sql_as(user.clone(), xid, body.sql)
+                .execute_sql_as_principal(principal.clone(), xid, body.sql)
                 .await
         } else {
             let params: Vec<_> = body.params.iter().map(json_to_literal).collect();
@@ -398,8 +406,8 @@ pub async fn post_sql(
 
     // ── one-shot statement ──
     // Auth DDL (CREATE USER / GRANT / REVOKE, P6.e) isn't `sqlparser`
-    // grammar — route it through `execute_sql_as`, which intercepts it and
-    // requires superuser.
+    // grammar — route it through `execute_sql_as_principal`, which
+    // intercepts it and requires superuser.
     if crate::authz::parse_auth_stmt(&body.sql)
         .map_err(ApiError::from)?
         .is_some()
@@ -407,17 +415,18 @@ pub async fn post_sql(
         let xid = state.engine.begin(None).await?;
         let result = state
             .engine
-            .execute_sql_as(user.clone(), xid, body.sql.clone())
+            .execute_sql_as_principal(principal.clone(), xid, body.sql.clone())
             .await;
         let results = finish(&state.engine, xid, result).await?;
         return sql_response(&state, user, results, body.cursor);
     }
 
-    // Enforce per-user privileges (a no-op for the superuser / `None`)
-    // before the fast-path dispatch below runs the statement.
+    // Enforce per-user privileges (a no-op for the superuser / `None`, and
+    // for a service_role token — item 122, B3) before the fast-path
+    // dispatch below runs the statement.
     state
         .engine
-        .authorize_sql(user.clone(), body.sql.clone())
+        .authorize_sql_as_principal(principal.clone(), body.sql.clone())
         .await
         .map_err(ApiError::from)?;
 
@@ -434,19 +443,22 @@ pub async fn post_sql(
         // begin/commit round-trips. An explicit isolation request (R2)
         // deliberately takes the transactional path instead, so the chosen
         // level actually governs the statement.
-        // Pass the user identity so RLS is correctly applied / bypassed for
-        // superusers and the no-sub path (item 103).
+        // Pass the full principal (not just the user identity) so RLS is
+        // correctly applied / bypassed for superusers and the no-sub path
+        // (item 103), and so auth.uid()/auth.jwt() policies (item 122) see
+        // the same verified claims here as on the writer path.
         state
             .engine
-            .execute_sql_read_as(user.clone(), body.sql)
+            .execute_sql_read_as_principal(principal.clone(), body.sql)
             .await?
     } else {
-        // Use execute_sql_as so the RLS bypass logic for superusers/no-sub
-        // callers is applied correctly on the writer path (item 103).
+        // Use execute_sql_as_principal so the RLS bypass logic for
+        // superusers/no-sub callers is applied correctly on the writer path
+        // (item 103); claims/roles ride along inert (auth seam).
         let xid = state.engine.begin(isolation).await?;
         let result = state
             .engine
-            .execute_sql_as(user.clone(), xid, body.sql)
+            .execute_sql_as_principal(principal.clone(), xid, body.sql)
             .await;
         finish(&state.engine, xid, result).await?
     };
@@ -467,6 +479,7 @@ pub async fn post_sql(
 /// inside the payload, not via the HTTP status code.
 pub async fn post_batch_sql(
     Extension(current_user): Extension<CurrentUser>,
+    Extension(principal): Extension<crate::AuthPrincipal>,
     State(state): State<AppState>,
     Json(body): Json<BatchSqlRequest>,
 ) -> std::result::Result<Json<BatchSqlResponse>, ApiError> {
@@ -516,12 +529,14 @@ pub async fn post_batch_sql(
                 if let Err(e) = state.engine.authorize_sql(user.clone(), sql.clone()).await {
                     Err(ApiError::from(e))
                 } else if crate::read_handle::is_concurrent_read_sql(&sql) {
-                    // Read-only SELECTs use the concurrent read path.
-                    // Pass the user so RLS bypass applies correctly for
-                    // superusers and the no-sub path (item 103).
+                    // Read-only SELECTs use the concurrent read path. Pass the
+                    // full principal so RLS bypass applies correctly for
+                    // superusers and the no-sub path (item 103), and so
+                    // auth.uid()/auth.jwt() policies (item 122) see the same
+                    // verified claims here as on the writer path.
                     state
                         .engine
-                        .execute_sql_read_as(user.clone(), sql.clone())
+                        .execute_sql_read_as_principal(principal.clone(), sql.clone())
                         .await
                         .map_err(ApiError::from)
                 } else {
@@ -998,6 +1013,7 @@ pub async fn post_auth_preview(
 ///   client needs to display a permission editor without hard-coding them.
 /// - `catalog_tables` — all queryable system-catalog relations.
 /// - `dev_login_enabled` — whether `POST /auth/login` is available.
+/// - `signup_enabled` — whether `POST /auth/signup` is available (item 121 A3).
 ///
 /// This endpoint is the answer to the blank-slate UX gap: a client hitting
 /// a fresh server can call this first to discover what auth features are
@@ -1012,19 +1028,70 @@ pub async fn get_auth_meta(
         policy_operations: vec!["SELECT", "INSERT", "UPDATE", "DELETE", "ALL"],
         catalog_tables: crate::sql::information_schema::RELATIONS.to_vec(),
         dev_login_enabled: state.dev_login_jwt.is_some(),
+        signup_enabled: state.allow_signup,
     }))
+}
+
+/// A route disabled behind a policy flag (dev-login, signup) returns 404 —
+/// indistinguishable from a non-existent route — rather than a 4xx that
+/// hints the route exists but is merely gated. Shared by `POST /auth/signup`
+/// (item 121 A3); `POST /auth/login`'s pre-existing disabled path predates
+/// this helper and keeps its own historical (400) error, documented there.
+fn route_disabled(message: impl Into<String>) -> ApiError {
+    ApiError::Api {
+        status: StatusCode::NOT_FOUND,
+        code: "NOT_FOUND",
+        message: message.into(),
+    }
+}
+
+/// Issue a fresh access+refresh token pair for `username` (item 121, A2/A3/
+/// A4 shared helper): the 1 h HS256 access token via `jwt_cfg`, plus a new
+/// refresh-token session via [`EngineHandle::create_session`]. Used by
+/// login, signup, and (for the access-token half only) refresh.
+async fn issue_token_pair(
+    engine: &EngineHandle,
+    jwt_cfg: &crate::server::auth::JwtConfig,
+    username: &str,
+) -> std::result::Result<AuthLoginResponse, ApiError> {
+    let access_token = jwt_cfg.issue_token(username).map_err(|e| {
+        ApiError::from(crate::error::DbError::SqlPlan(format!(
+            "token issuance failed: {e}"
+        )))
+    })?;
+    let (refresh_token, _expires_at) = engine
+        .create_session(username.to_string())
+        .await
+        .map_err(ApiError::from)?;
+    Ok(AuthLoginResponse {
+        token: access_token.clone(),
+        access_token,
+        refresh_token,
+        expires_in: 3600,
+    })
 }
 
 /// `POST /auth/login` — public, no JWT required.
 ///
-/// **Dev/demo only** — only available when `UNIDB_DEV_LOGIN=1` is set at
-/// startup.  Returns 404 when the flag is off so the route is indistinguishable
-/// from non-existent (no accidental prod issuer).
+/// Gated behind `UNIDB_DEV_LOGIN=1` at startup (unchanged from item 100;
+/// un-gating this into a first-class production issuer is item 121 A5, out
+/// of scope here). Returns 404 (via the same disabled error) when the flag
+/// is off so the route is indistinguishable from non-existent.
 ///
-/// Issues a 1 h signed JWT for an existing user identified by username only
-/// (passwordless = identification, not authentication).  The token uses the
-/// same HS256 secret as `require_jwt`, so `current_user()` and all privilege
-/// checks work immediately without any downstream change.
+/// **Item 121 A2 — real authentication.** The supplied password is verified
+/// against the user's stored argon2id credential
+/// ([`crate::authz::RoleStore::verify_password`]). Wrong password, an
+/// unknown username, and a known username with no stored credential all
+/// return the identical 401 response — there is no way for a caller to
+/// distinguish "no such user" from "wrong password" from timing, status
+/// code, or body shape (no user-enumeration oracle). On success, issues a
+/// 1 h signed JWT using the same HS256 secret as `require_jwt`, so
+/// `current_user()` and all privilege checks work immediately without any
+/// downstream change.
+///
+/// **Item 121 A4** — the response now also carries a long-lived opaque
+/// refresh token (a new session, [`EngineHandle::create_session`]); `token`
+/// is kept as a deprecated alias of `access_token` for pre-A4 clients.
 pub async fn post_auth_login(
     State(state): State<AppState>,
     Json(body): Json<AuthLoginRequest>,
@@ -1034,23 +1101,140 @@ pub async fn post_auth_login(
             "POST /auth/login is disabled (set UNIDB_DEV_LOGIN=1 to enable)".into(),
         ))
     })?;
-    // Validate the user exists.
-    let users = state.engine.user_snapshot().await;
-    if !users.iter().any(|(name, _)| name == &body.username) {
-        return Err(ApiError::from(crate::error::DbError::SqlPlan(format!(
-            "user '{}' not found",
-            body.username
-        ))));
+    // Real credential verification (item 121 A2): unknown user, no stored
+    // credential, and a genuine mismatch all take this same branch and
+    // return this same 401 — see `RoleStore::verify_password`'s doc comment
+    // for the constant-shape guarantee that makes this a real defense
+    // against user enumeration, not just a same-looking error string.
+    if !state
+        .engine
+        .verify_password(body.username.clone(), body.password.clone())
+        .await
+    {
+        return Err(ApiError::Api {
+            status: StatusCode::UNAUTHORIZED,
+            code: "INVALID_CREDENTIALS",
+            message: "invalid username or password".into(),
+        });
     }
-    let token = jwt_cfg.issue_token(&body.username).map_err(|e| {
+    let resp = issue_token_pair(&state.engine, jwt_cfg, &body.username).await?;
+    Ok(Json(resp))
+}
+
+/// `POST /auth/signup` (item 121, A3) — public, no JWT required.
+///
+/// Gated behind `UNIDB_ALLOW_SIGNUP=1` (default off — opt-in, never open by
+/// default); returns `404 NOT_FOUND` when disabled, indistinguishable from a
+/// non-existent route, same posture as `POST /auth/login`'s dev-login gate.
+///
+/// Creates a **non-superuser** user with an argon2id password credential
+/// ([`crate::authz::RoleStore::apply`]'s `CreateUser` branch, via
+/// [`EngineHandle::create_user_with_password`]) and immediately returns an
+/// access+refresh token pair — the same shape `POST /auth/login` returns —
+/// so a client never has to make a second round-trip to log in right after
+/// signing up. A duplicate username is rejected with a clear
+/// `400 AUTHZ_ERROR` (not a generic 500, and not silently overwriting the
+/// existing account); the password is never stored or logged in plaintext
+/// (argon2id, same as `CREATE USER ... PASSWORD`).
+///
+/// Token issuance still requires a signing key (`UNIDB_DEV_LOGIN=1` today,
+/// pending item 121 A5's first-class production issuer) — if
+/// `UNIDB_ALLOW_SIGNUP=1` is set without a signing key configured, this
+/// returns the same "disabled" error `POST /auth/login` does, *before*
+/// creating the user, so a signup attempt that can't hand back a usable
+/// token never leaves an orphaned account behind.
+pub async fn post_auth_signup(
+    State(state): State<AppState>,
+    Json(body): Json<crate::server::dto::AuthSignupRequest>,
+) -> std::result::Result<Json<AuthLoginResponse>, ApiError> {
+    if !state.allow_signup {
+        return Err(route_disabled(
+            "POST /auth/signup is disabled (set UNIDB_ALLOW_SIGNUP=1 to enable)",
+        ));
+    }
+    let jwt_cfg = state.dev_login_jwt.as_ref().ok_or_else(|| {
+        ApiError::from(crate::error::DbError::SqlPlan(
+            "POST /auth/signup cannot issue tokens (set UNIDB_DEV_LOGIN=1 to enable a signing key)"
+                .into(),
+        ))
+    })?;
+    state
+        .engine
+        .create_user_with_password(body.username.clone(), body.password.clone())
+        .await
+        .map_err(ApiError::from)?;
+    let resp = issue_token_pair(&state.engine, jwt_cfg, &body.username).await?;
+    Ok(Json(resp))
+}
+
+/// `POST /auth/refresh` (item 121, A4) — public, no JWT required (the
+/// refresh token itself *is* the credential).
+///
+/// Verifies the supplied refresh token (exists, unexpired, unrevoked —
+/// [`EngineHandle::rotate_session`]) and, on success, **rotates** it: the
+/// old refresh token is revoked and a brand-new one issued alongside a
+/// fresh access token, so a leaked-and-later-replayed old refresh token is
+/// a one-shot window, not a standing valid credential. Unknown, expired, and
+/// revoked tokens all return the identical `401 INVALID_REFRESH_TOKEN` — no
+/// way to distinguish *why* refresh failed.
+///
+/// The signing-key check happens **before** touching session state
+/// (verify/rotate), so a server temporarily unable to issue tokens
+/// (`UNIDB_DEV_LOGIN` off) never revokes a still-good refresh token only to
+/// fail handing back its replacement.
+pub async fn post_auth_refresh(
+    State(state): State<AppState>,
+    Json(body): Json<crate::server::dto::AuthRefreshRequest>,
+) -> std::result::Result<Json<AuthLoginResponse>, ApiError> {
+    let jwt_cfg = state.dev_login_jwt.as_ref().ok_or_else(|| {
+        ApiError::from(crate::error::DbError::SqlPlan(
+            "POST /auth/refresh cannot issue tokens (set UNIDB_DEV_LOGIN=1 to enable a signing key)"
+                .into(),
+        ))
+    })?;
+    let rotated = state
+        .engine
+        .rotate_session(body.refresh_token.clone())
+        .await
+        .map_err(ApiError::from)?;
+    let Some((username, new_refresh_token, _expires_at)) = rotated else {
+        return Err(ApiError::Api {
+            status: StatusCode::UNAUTHORIZED,
+            code: "INVALID_REFRESH_TOKEN",
+            message: "invalid, expired, or revoked refresh token".into(),
+        });
+    };
+    let access_token = jwt_cfg.issue_token(&username).map_err(|e| {
         ApiError::from(crate::error::DbError::SqlPlan(format!(
             "token issuance failed: {e}"
         )))
     })?;
     Ok(Json(AuthLoginResponse {
-        token,
+        token: access_token.clone(),
+        access_token,
+        refresh_token: new_refresh_token,
         expires_in: 3600,
     }))
+}
+
+/// `POST /auth/logout` (item 121, A4) — public, no JWT required (the
+/// refresh token itself is the credential being revoked).
+///
+/// Marks the refresh-token session revoked ([`EngineHandle::
+/// revoke_session`]); after this call the token can no longer mint access
+/// tokens via `POST /auth/refresh`. Idempotent — logging out twice, or with
+/// an unknown/garbage token, always returns `204 NO_CONTENT` rather than
+/// leaking whether the token was ever valid.
+pub async fn post_auth_logout(
+    State(state): State<AppState>,
+    Json(body): Json<crate::server::dto::AuthLogoutRequest>,
+) -> std::result::Result<StatusCode, ApiError> {
+    state
+        .engine
+        .revoke_session(body.refresh_token)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `GET /auth/whoami` — protected (JWT required).

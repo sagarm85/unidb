@@ -272,18 +272,134 @@ pub struct AuthPreviewRequest {
     pub sql: String,
 }
 
-/// Body of `POST /auth/login` (item 100, `UNIDB_DEV_LOGIN=1` only).
-/// Passwordless identification — dev/demo only.
-#[derive(Debug, Deserialize)]
+/// Body of `POST /auth/login` (item 100 issuer; item 121 A2 real
+/// authentication). Still gated by `UNIDB_DEV_LOGIN=1` (production issuer
+/// configuration is item 121 A5, not yet implemented), but the password is
+/// now verified against the stored argon2id credential — this is real
+/// authentication, not mere identification.
+#[derive(Deserialize)]
 pub struct AuthLoginRequest {
     pub username: String,
+    pub password: String,
 }
 
-/// Response of `POST /auth/login`.
-#[derive(Debug, Serialize)]
+/// Manual `Debug`: redacts `password` so this request body can never leak
+/// the plaintext via `{:?}` (e.g. request-body logging middleware, an
+/// `unwrap_err` printing the value it failed on).
+impl std::fmt::Debug for AuthLoginRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthLoginRequest")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Response of `POST /auth/login`, `POST /auth/signup` (item 121, A3), and
+/// `POST /auth/refresh` (item 121, A4) — all three hand back the same
+/// access+refresh token pair shape.
+///
+/// `token` is kept as a **deprecated alias for `access_token`** (identical
+/// value) so pre-A4 clients that only read `body.token` keep working
+/// unchanged; new clients should read `access_token`/`refresh_token`.
 pub struct AuthLoginResponse {
+    /// Deprecated alias for `access_token` — kept for backward compatibility
+    /// with pre-A4 clients (item 121 A1/A2 shipped `{token, expires_in}`).
     pub token: String,
+    /// Short-lived (1 h) HS256 JWT — identical value to `token`.
+    pub access_token: String,
+    /// Long-lived opaque high-entropy refresh token (NOT a JWT). Exchange it
+    /// at `POST /auth/refresh` for a new access token; `POST /auth/logout`
+    /// revokes it.
+    pub refresh_token: String,
+    /// Access-token lifetime in seconds (always 3600 today).
     pub expires_in: u64,
+}
+
+impl Serialize for AuthLoginResponse {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("AuthLoginResponse", 4)?;
+        s.serialize_field("token", &self.token)?;
+        s.serialize_field("access_token", &self.access_token)?;
+        s.serialize_field("refresh_token", &self.refresh_token)?;
+        s.serialize_field("expires_in", &self.expires_in)?;
+        s.end()
+    }
+}
+
+/// Manual `Debug`: redacts `token`/`access_token`/`refresh_token` — this
+/// response body carries live bearer credentials (the refresh token in
+/// particular is long-lived), and CLAUDE.md's "nothing secret in logs/
+/// Debug" rule for this milestone applies to responses just as much as
+/// requests (a `{:?}` of a handler's return value, or a test failure
+/// message that debug-prints the body, must not leak a usable credential).
+impl std::fmt::Debug for AuthLoginResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthLoginResponse")
+            .field("token", &"<redacted>")
+            .field("access_token", &"<redacted>")
+            .field("refresh_token", &"<redacted>")
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
+}
+
+/// Body of `POST /auth/signup` (item 121, A3): create a non-superuser
+/// account with a password credential. Gated behind `UNIDB_ALLOW_SIGNUP=1`
+/// (default off); returns 404 when disabled, same posture as dev-login.
+#[derive(Deserialize)]
+pub struct AuthSignupRequest {
+    pub username: String,
+    pub password: String,
+}
+
+/// Manual `Debug`: redacts `password`, mirroring [`AuthLoginRequest`].
+impl std::fmt::Debug for AuthSignupRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthSignupRequest")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Body of `POST /auth/refresh` (item 121, A4): exchange a valid refresh
+/// token for a fresh access token (and a rotated refresh token).
+#[derive(Deserialize)]
+pub struct AuthRefreshRequest {
+    pub refresh_token: String,
+}
+
+/// Manual `Debug`: redacts `refresh_token` — it is a live bearer credential,
+/// same posture as a password.
+impl std::fmt::Debug for AuthRefreshRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthRefreshRequest")
+            .field("refresh_token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Body of `POST /auth/logout` (item 121, A4): revoke a refresh-token
+/// session. Idempotent — logging out twice, or with an already-invalid
+/// token, still succeeds.
+#[derive(Deserialize)]
+pub struct AuthLogoutRequest {
+    pub refresh_token: String,
+}
+
+/// Manual `Debug`: redacts `refresh_token`, same posture as
+/// [`AuthRefreshRequest`].
+impl std::fmt::Debug for AuthLogoutRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthLogoutRequest")
+            .field("refresh_token", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Response of `GET /auth/meta`.
@@ -300,6 +416,9 @@ pub struct AuthMetaResponse {
     pub catalog_tables: Vec<&'static str>,
     /// Whether dev login (`POST /auth/login`) is enabled on this server.
     pub dev_login_enabled: bool,
+    /// Whether self-service signup (`POST /auth/signup`, item 121 A3) is
+    /// enabled on this server (`UNIDB_ALLOW_SIGNUP=1`).
+    pub signup_enabled: bool,
 }
 
 /// Response of `GET /auth/whoami`.

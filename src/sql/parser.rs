@@ -1982,6 +1982,20 @@ fn convert_expr(e: &SqlExpr) -> Result<Expr> {
                 )),
             }
         }
+        // `auth.uid()` (item 122, B1) — sqlparser parses the dotted name as a
+        // two-part `ObjectName`/`Function`, no grammar changes needed (same
+        // zero-grammar-change trick `NEAR(...)` and `current_user()` above
+        // use). Resolves to the authenticated principal's `sub` claim at
+        // policy-injection time via `substitute_auth_context_in_expr`.
+        SqlExpr::Function(func) if func.name.to_string().eq_ignore_ascii_case("auth.uid") => {
+            if function_args_empty(&func.args) {
+                Ok(Expr::AuthUid)
+            } else {
+                Err(DbError::SqlUnsupported(
+                    "auth.uid() takes no arguments".into(),
+                ))
+            }
+        }
         SqlExpr::Like {
             negated,
             any,
@@ -2142,7 +2156,51 @@ fn convert_near(func: &ast::Function) -> Result<Expr> {
     Ok(Expr::Near { column, query, k })
 }
 
+/// Whether a parsed function's argument list is empty — `f()` or the bare
+/// `FunctionArguments::None` shape sqlparser uses for a few reserved-keyword
+/// zero-arg calls (e.g. `current_user`). Shared by `auth.uid()`'s and
+/// `auth.jwt()`'s arg validation (item 122).
+fn function_args_empty(args: &ast::FunctionArguments) -> bool {
+    matches!(args, ast::FunctionArguments::None)
+        || matches!(args, ast::FunctionArguments::List(list) if list.args.is_empty())
+}
+
 fn convert_binary_op(left: &SqlExpr, op: &BinaryOperator, right: &SqlExpr) -> Result<Expr> {
+    // `auth.jwt() ->> 'claim'` (item 122, B2): intercepted before the generic
+    // JSON `->>` handling below, since there is no underlying JSON column —
+    // the claim value comes from the verified token's claim set
+    // (`ExecCtx::auth_claims`), substituted at RLS-injection time by
+    // `substitute_auth_context_in_expr`. Preferred SQL surface per the item-122
+    // spec; no deviation needed — `sqlparser` parses the dotted function name
+    // and the `->>` operator cleanly (verified against sqlparser 0.62).
+    //
+    // Same operator-precedence caveat as the existing JSON `->>` (see below):
+    // `->>` binds looser than `=`, so `tenant_id = auth.jwt() ->> 'tenant'`
+    // groups wrong without parens — write `tenant_id = (auth.jwt() ->> 'tenant')`.
+    if let SqlExpr::Function(func) = left {
+        if func.name.to_string().eq_ignore_ascii_case("auth.jwt") {
+            if !function_args_empty(&func.args) {
+                return Err(DbError::SqlUnsupported(
+                    "auth.jwt() takes no arguments".into(),
+                ));
+            }
+            return match op {
+                BinaryOperator::LongArrow => match convert_expr(right)? {
+                    Expr::Literal(Literal::Text(key)) => Ok(Expr::AuthClaim(key)),
+                    _ => Err(DbError::SqlUnsupported(
+                        "auth.jwt() ->> requires a string literal claim key".into(),
+                    )),
+                },
+                BinaryOperator::Arrow => Err(DbError::SqlUnsupported(
+                    "auth.jwt() only supports ->> (text extraction) — claims are always scalar"
+                        .into(),
+                )),
+                other => Err(DbError::SqlUnsupported(format!(
+                    "unsupported operator on auth.jwt(): {other:?}"
+                ))),
+            };
+        }
+    }
     if matches!(op, BinaryOperator::Arrow | BinaryOperator::LongArrow) {
         let expr = Box::new(convert_expr(left)?);
         let path = match convert_expr(right)? {
@@ -2701,5 +2759,80 @@ mod tests {
             }
             _ => panic!("expected Select"),
         }
+    }
+
+    /// `auth.uid()` (item 122, B1) parses cleanly as-is — `sqlparser` accepts
+    /// the dotted function name with no grammar changes (verified against
+    /// sqlparser 0.62), matching the item-122 spec's preferred SQL surface.
+    #[test]
+    fn parses_auth_uid() {
+        let plan = parse_one("SELECT * FROM posts WHERE owner = auth.uid()");
+        match plan {
+            LogicalPlan::Select { predicate, .. } => {
+                assert!(
+                    matches!(
+                        predicate,
+                        Some(Expr::BinOp { rhs, .. }) if matches!(*rhs, Expr::AuthUid)
+                    ),
+                    "auth.uid() must produce Expr::AuthUid"
+                );
+            }
+            _ => panic!("expected Select"),
+        }
+        // Case-insensitive, like current_user.
+        let plan_upper = parse_one("SELECT * FROM posts WHERE owner = AUTH.UID()");
+        match plan_upper {
+            LogicalPlan::Select { predicate, .. } => {
+                assert!(matches!(
+                    predicate,
+                    Some(Expr::BinOp { rhs, .. }) if matches!(*rhs, Expr::AuthUid)
+                ));
+            }
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn auth_uid_rejects_arguments() {
+        let err = parse_sql("SELECT * FROM posts WHERE owner = auth.uid(1)");
+        assert!(err.is_err(), "auth.uid(1) must be rejected");
+    }
+
+    /// `auth.jwt() ->> 'claim'` (item 122, B2) parses cleanly — same
+    /// zero-grammar-change trick as `NEAR(...)`/`current_user()`, no deviation
+    /// from the preferred SQL surface needed. `->>` binds looser than `=`
+    /// under GenericDialect's precedence table (same caveat as the existing
+    /// JSON `->>` test above), so the whole extraction must be parenthesised.
+    #[test]
+    fn parses_auth_jwt_claim() {
+        let plan = parse_one("SELECT * FROM t WHERE (auth.jwt() ->> 'tenant') = tenant_id");
+        match plan {
+            LogicalPlan::Select { predicate, .. } => match predicate {
+                Some(Expr::BinOp { lhs, .. }) => {
+                    assert!(
+                        matches!(*lhs, Expr::AuthClaim(ref k) if k == "tenant"),
+                        "expected Expr::AuthClaim(\"tenant\"), got {lhs:?}"
+                    );
+                }
+                other => panic!("expected BinOp with AuthClaim lhs, got {other:?}"),
+            },
+            _ => panic!("expected Select"),
+        }
+    }
+
+    #[test]
+    fn auth_jwt_arrow_rejected() {
+        // Only `->>` (text) is supported for auth.jwt(); `->` is rejected.
+        let err = parse_sql("SELECT * FROM t WHERE (auth.jwt() -> 'tenant') = tenant_id");
+        assert!(
+            err.is_err(),
+            "auth.jwt() -> must be rejected (only ->> is supported)"
+        );
+    }
+
+    #[test]
+    fn auth_jwt_rejects_arguments() {
+        let err = parse_sql("SELECT * FROM t WHERE (auth.jwt(1) ->> 'tenant') = tenant_id");
+        assert!(err.is_err(), "auth.jwt(1) must be rejected");
     }
 }

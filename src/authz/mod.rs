@@ -22,23 +22,185 @@
 //   GRANT <role> TO <grantee>                       (role membership)
 //   REVOKE <priv,.. | ALL> ON <table> FROM <grantee>
 //   REVOKE <role> FROM <grantee>
-//   CREATE POLICY <name> ON <table> FOR <op> USING (<predicate>) [WITH CHECK (<expr>)]
+//   CREATE POLICY <name> ON <table> FOR <op> [TO <role,...>] USING (<predicate>) [WITH CHECK (<expr>)]
 //   DROP POLICY <name> ON <table>
 //
 // Roles/users/grants persist to `roles.json` (control-plane metadata, so
 // `serde` is fine per CLAUDE.md §4). Named policies persist in the catalog
 // blob (alongside `rls_policy`) so there is no FORMAT_VERSION bump.
 // `Send + Sync` for the shared `Engine`.
+//
+// **Built-in roles (item 122, B3):** `anon`, `authenticated`, and
+// `service_role` are reserved — `CREATE ROLE`/`DROP ROLE` reject these three
+// names (see `is_reserved_role`). They are never persisted as ordinary roles;
+// [`RoleStore::effective_roles`] resolves them for a caller on the fly from
+// their subject/verified claims (Supabase convention — see that method's doc
+// comment for the exact mapping). `service_role` bypasses RLS like a
+// superuser, on the audited path (item-103 lesson): see `Engine::
+// execute_sql_inner_as_principal` / `ReadHandle::execute_sql_inner`.
+//
+// **Role-scoped policies (item 122, B4):** the optional `TO <role,...>`
+// clause above persists as `PolicyDef::target_roles`. A policy with no `TO`
+// clause has an empty `target_roles` and applies to every caller exactly as
+// before B4 (back-compat) via the merged `rls_policy`/`update_policy`/
+// `delete_policy`/`insert_policy` catalog fields; a `TO`-scoped policy is
+// instead re-evaluated, role-gated, at plan/injection time by
+// `crate::sql::logical::apply_rls_with_auth` — see that function's doc
+// comment for the exact semantics, including the Postgres-style
+// deny-by-default when a `TO`-scoped policy exists but none of its target
+// roles match the caller.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
 };
 
+use argon2::{
+    password_hash::{
+        rand_core::{OsRng, RngCore},
+        PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
+    },
+    Argon2,
+};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::error::{DbError, Result};
+
+/// Hash `password` with argon2id (library defaults: m=19 MiB, t=2, p=1),
+/// returning the self-describing PHC string (algorithm + params + salt +
+/// hash) that [`verify_password_hash`] can verify against later. Never
+/// returns or logs the plaintext.
+fn hash_password(password: &str) -> Result<String> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| DbError::Authz(format!("password hash: {e}")))
+}
+
+/// Constant-shape verify: parses the PHC `hash` string and checks `password`
+/// against it. Returns `false` (never an error) on a malformed stored hash —
+/// recovery code must not panic on bad control-plane metadata, and a corrupt
+/// hash should simply fail closed.
+fn verify_password_hash(hash: &str, password: &str) -> bool {
+    match PasswordHash::new(hash) {
+        Ok(parsed) => Argon2::default()
+            .verify_password(password.as_bytes(), &parsed)
+            .is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// A fixed, process-lifetime-stable argon2id hash used to run a same-cost
+/// "verify" when the target user doesn't exist or has no stored credential,
+/// so `RoleStore::verify_password` does the same amount of work (and takes
+/// the same code path) regardless of *why* login should fail — no
+/// user-enumeration timing/shape oracle. Computed once per process (not a
+/// hash of any real credential) and cached; the exact bytes are irrelevant,
+/// only that a real argon2id verify runs against them.
+fn dummy_hash() -> &'static str {
+    static DUMMY: OnceLock<String> = OnceLock::new();
+    DUMMY
+        .get_or_init(|| {
+            hash_password("unidb-dummy-password-for-timing-parity").unwrap_or_else(|_| {
+                // Fallback fixed PHC string in the vanishingly unlikely case
+                // hashing itself fails (e.g. RNG unavailable) — still a valid
+                // argon2id hash shape, just not freshly salted.
+                "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$\
+                 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                    .to_string()
+            })
+        })
+        .as_str()
+}
+
+/// Refresh-token session lifetime (item 121, A4): 30 days. Not yet
+/// configurable — a fixed, documented default is preferable to silently
+/// picking a value; revisit alongside A5 (production issuer config) if a
+/// real deployment needs this tunable.
+const REFRESH_TOKEN_TTL_SECS: u64 = 30 * 24 * 3600;
+
+/// Current wall-clock time as Unix seconds. Saturates to 0 rather than
+/// panicking if the clock is somehow before the epoch (recovery/control-plane
+/// code must never panic on an unusual but non-corrupt environment).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Hex-encoded SHA-256 digest of `input`. Used to turn a raw opaque refresh
+/// token into the value actually persisted (item 121, A4) — the raw token
+/// itself is *never* written to `roles.json`, mirroring the "only the hash
+/// is stored" posture [`hash_password`] already gives credentials. Because
+/// verification always compares hashes (never the raw secret), there is no
+/// direct-comparison code path over the raw token for a timing side channel
+/// to attach to in the first place.
+fn sha256_hex(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// Generate a new high-entropy opaque refresh token (item 121, A4): 256 bits
+/// from the OS CSPRNG (the same `OsRng` [`hash_password`] uses for salts),
+/// hex-encoded. Deliberately **not** a JWT — it carries no claims and is
+/// meaningless outside a `sessions` lookup, so it cannot be inspected,
+/// forged, or replayed without the server's own persisted state agreeing.
+fn generate_refresh_token() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// A persisted refresh-token session (item 121, A4). Keyed in [`AuthState::
+/// sessions`] by the SHA-256 hash of the raw opaque refresh token — the raw
+/// token is never stored, only ever handed to the client once, at issuance
+/// or rotation time.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SessionRec {
+    username: String,
+    issued_at: u64,
+    expires_at: u64,
+    revoked: bool,
+}
+
+/// Reserved built-in role: an unauthenticated / no-subject caller (item 122,
+/// B3 — Supabase convention). Never created/dropped by `CREATE`/`DROP ROLE`;
+/// assigned automatically by [`RoleStore::effective_roles`].
+pub const ANON_ROLE: &str = "anon";
+/// Reserved built-in role: any caller with a verified subject (item 122, B3).
+/// Assigned automatically alongside the user's own transitively-granted
+/// roles; never created/dropped by `CREATE`/`DROP ROLE`.
+pub const AUTHENTICATED_ROLE: &str = "authenticated";
+/// Reserved built-in role: a token whose verified claims carry
+/// `"role": "service_role"` (item 122, B3 — Supabase convention). Bypasses
+/// RLS like a superuser, but stays on the audited path (item-103 lesson) —
+/// see `Engine::execute_sql_inner_as_principal`'s `is_service_role` gate and
+/// `ReadHandle::execute_sql_inner`'s mirror of it. Never created/dropped by
+/// `CREATE`/`DROP ROLE`.
+pub const SERVICE_ROLE: &str = "service_role";
+
+const RESERVED_ROLES: [&str; 3] = [ANON_ROLE, AUTHENTICATED_ROLE, SERVICE_ROLE];
+
+/// Whether `name` is one of the three built-in roles (item 122, B3) — these
+/// are assigned automatically by [`RoleStore::effective_roles`], never via
+/// `CREATE ROLE`/`DROP ROLE` (rejected in [`RoleStore::apply`]).
+pub fn is_reserved_role(name: &str) -> bool {
+    RESERVED_ROLES.contains(&name)
+}
 
 /// A table-level privilege.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -79,7 +241,7 @@ impl Privilege {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct AuthState {
     /// username → superuser?
     users: BTreeMap<String, bool>,
@@ -88,6 +250,46 @@ struct AuthState {
     memberships: BTreeMap<String, BTreeSet<String>>,
     /// grantee → table → privileges.
     table_grants: BTreeMap<String, BTreeMap<String, BTreeSet<Privilege>>>,
+    /// username → argon2id PHC hash string (item 121, A1). Never the
+    /// plaintext. `#[serde(default)]` so a pre-A1 `roles.json` (no
+    /// `credentials` key) deserializes with an empty map — no
+    /// FORMAT_VERSION bump. Persisted (it must be, to survive a restart);
+    /// deliberately kept out of `Debug` (see the manual impl below) so it
+    /// never leaks into `tracing::debug!`/`{:?}` logging.
+    #[serde(default)]
+    credentials: BTreeMap<String, String>,
+    /// token_hash (SHA-256 hex of the raw refresh token) → session record
+    /// (item 121, A4). Never the raw token itself — see [`sha256_hex`] /
+    /// [`generate_refresh_token`]. `#[serde(default)]` so a pre-A4
+    /// `roles.json` (no `sessions` key) deserializes with an empty map — no
+    /// FORMAT_VERSION bump. Persisted (sessions must survive a restart);
+    /// kept out of `Debug` (see the manual impl below), same posture as
+    /// `credentials` — the hash is one-way, but the username/timestamps in
+    /// each record are still control-plane detail that shouldn't leak into
+    /// `tracing::debug!`/`{:?}` logging.
+    #[serde(default)]
+    sessions: BTreeMap<String, SessionRec>,
+}
+
+/// Manual `Debug`: every field except `credentials`/`sessions`, which are
+/// each redacted to a count. Prevents an argon2id hash (a secret the
+/// CLAUDE.md rules for this milestone say must never appear in logs) — and,
+/// as of item 121 A4, refresh-token session detail — from leaking via
+/// `{:?}` if `AuthState`/`RoleStore` internals are ever debug-printed.
+impl std::fmt::Debug for AuthState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthState")
+            .field("users", &self.users)
+            .field("roles", &self.roles)
+            .field("memberships", &self.memberships)
+            .field("table_grants", &self.table_grants)
+            .field(
+                "credentials",
+                &format!("<{} redacted>", self.credentials.len()),
+            )
+            .field("sessions", &format!("<{} redacted>", self.sessions.len()))
+            .finish()
+    }
 }
 
 /// Operation scope for a named RLS policy (item-24 Z1).
@@ -144,14 +346,32 @@ pub struct PolicyDef {
     /// deserialize with `None` — no FORMAT_VERSION bump required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub with_check_sql: Option<String>,
+    /// Target-role list for `CREATE POLICY … TO <role,...>` (item 122, B4).
+    /// Empty means "no TO clause" — the policy applies to every caller,
+    /// exactly like every pre-B4 policy (back-compat contract). Matched
+    /// against the caller's *effective* roles (see [`RoleStore::
+    /// effective_roles`]) by `apply_rls_with_auth`'s role gate in
+    /// `sql/logical.rs`: a policy is only AND-injected for a caller whose
+    /// effective roles intersect this set (or when this set is empty).
+    /// `#[serde(default)]` so a pre-B4 catalog blob (this field absent)
+    /// deserializes as an empty list — identical behavior, no
+    /// FORMAT_VERSION bump.
+    #[serde(default)]
+    pub target_roles: Vec<String>,
 }
 
 /// A parsed auth-DDL statement.
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 pub enum AuthStmt {
     CreateUser {
         name: String,
         superuser: bool,
+        /// Plaintext from the optional `PASSWORD '<pw>'` clause (item 121,
+        /// A1) — hashed with argon2id before it ever reaches `AuthState`.
+        /// Never stored or logged as-is; kept out of `Debug` (see the manual
+        /// impl below) so a `{:?}` of a pending statement can't leak it
+        /// either.
+        password: Option<String>,
     },
     DropUser(String),
     CreateRole(String),
@@ -181,6 +401,66 @@ pub enum AuthStmt {
         name: String,
         table: String,
     },
+}
+
+/// Manual `Debug`: redacts `CreateUser`'s `password` field to `Some("<redacted>")`/
+/// `None` instead of the plaintext, so `tracing::info!(?stmt, ..)` in
+/// [`RoleStore::apply`] (and any other `{:?}`/audit-log use of a pending
+/// statement) can never print a password.
+impl std::fmt::Debug for AuthStmt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthStmt::CreateUser {
+                name,
+                superuser,
+                password,
+            } => f
+                .debug_struct("CreateUser")
+                .field("name", name)
+                .field("superuser", superuser)
+                .field("password", &password.as_ref().map(|_| "<redacted>"))
+                .finish(),
+            AuthStmt::DropUser(name) => f.debug_tuple("DropUser").field(name).finish(),
+            AuthStmt::CreateRole(name) => f.debug_tuple("CreateRole").field(name).finish(),
+            AuthStmt::DropRole(name) => f.debug_tuple("DropRole").field(name).finish(),
+            AuthStmt::GrantPrivs {
+                privs,
+                table,
+                grantee,
+            } => f
+                .debug_struct("GrantPrivs")
+                .field("privs", privs)
+                .field("table", table)
+                .field("grantee", grantee)
+                .finish(),
+            AuthStmt::RevokePrivs {
+                privs,
+                table,
+                grantee,
+            } => f
+                .debug_struct("RevokePrivs")
+                .field("privs", privs)
+                .field("table", table)
+                .field("grantee", grantee)
+                .finish(),
+            AuthStmt::GrantRole { role, grantee } => f
+                .debug_struct("GrantRole")
+                .field("role", role)
+                .field("grantee", grantee)
+                .finish(),
+            AuthStmt::RevokeRole { role, grantee } => f
+                .debug_struct("RevokeRole")
+                .field("role", role)
+                .field("grantee", grantee)
+                .finish(),
+            AuthStmt::CreatePolicy(policy) => f.debug_tuple("CreatePolicy").field(policy).finish(),
+            AuthStmt::DropPolicy { name, table } => f
+                .debug_struct("DropPolicy")
+                .field("name", name)
+                .field("table", table)
+                .finish(),
+        }
+    }
 }
 
 /// Persisted authorization store.
@@ -232,6 +512,140 @@ impl RoleStore {
         !self.lock().users.is_empty()
     }
 
+    /// Set (or replace) `user`'s password credential, hashed with argon2id
+    /// (item 121, A1). Errors if `user` doesn't exist. This is the Rust-API
+    /// path (`Engine::set_password`); `CREATE USER ... PASSWORD '<pw>'`
+    /// hashes inline in [`Self::apply`] instead.
+    pub fn set_password(&self, user: &str, password: &str) -> Result<()> {
+        let hash = hash_password(password)?;
+        let mut st = self.lock();
+        if !st.users.contains_key(user) {
+            return Err(DbError::Authz(format!("user '{user}' not found")));
+        }
+        st.credentials.insert(user.to_string(), hash);
+        self.persist(&st)?;
+        tracing::info!(user = %user, "password credential set");
+        Ok(())
+    }
+
+    /// Verify `password` against `user`'s stored credential (item 121, A2).
+    ///
+    /// Returns `false` uniformly for every failure case — unknown user, user
+    /// with no stored credential, or a genuine mismatch — and always runs a
+    /// real argon2id verify (against [`dummy_hash`] in the first two cases)
+    /// so the cost and code path are identical regardless of *why* it fails.
+    /// This is the login authentication check: no user-enumeration
+    /// timing/shape oracle.
+    pub fn verify_password(&self, user: &str, password: &str) -> bool {
+        let hash = self.lock().credentials.get(user).cloned();
+        match hash {
+            Some(h) => verify_password_hash(&h, password),
+            None => {
+                // Constant-shape dummy verify: burns the same argon2id cost,
+                // discards the result, and always reports failure.
+                let _ = verify_password_hash(dummy_hash(), password);
+                false
+            }
+        }
+    }
+
+    /// Issue a fresh refresh-token session for `user` (item 121, A4): a new
+    /// high-entropy opaque token ([`generate_refresh_token`]) is generated,
+    /// its SHA-256 hash is persisted as a [`SessionRec`] (never the raw
+    /// token), and the raw token + its absolute expiry (Unix seconds) are
+    /// returned for the caller to hand to the client exactly once.
+    pub fn create_session(&self, user: &str) -> Result<(String, u64)> {
+        let raw = generate_refresh_token();
+        let hash = sha256_hex(&raw);
+        let now = now_secs();
+        let expires_at = now + REFRESH_TOKEN_TTL_SECS;
+        let mut st = self.lock();
+        st.sessions.insert(
+            hash,
+            SessionRec {
+                username: user.to_string(),
+                issued_at: now,
+                expires_at,
+                revoked: false,
+            },
+        );
+        self.persist(&st)?;
+        Ok((raw, expires_at))
+    }
+
+    /// Verify a raw refresh token (item 121, A4): hashes it and looks up the
+    /// session record. Returns the session's username only when the record
+    /// exists, is not revoked, and has not expired — every other case
+    /// (unknown hash, expired, revoked) returns `None` uniformly, so a
+    /// caller building a 401 response can't distinguish *why* verification
+    /// failed. The raw token is never compared directly (only its hash is
+    /// looked up), which is what forecloses a timing oracle on the secret
+    /// itself — see [`sha256_hex`]'s doc comment.
+    pub fn verify_session(&self, raw_token: &str) -> Option<String> {
+        let hash = sha256_hex(raw_token);
+        let st = self.lock();
+        st.sessions.get(&hash).and_then(|rec| {
+            if !rec.revoked && rec.expires_at > now_secs() {
+                Some(rec.username.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Verify + rotate a refresh token in one call (item 121, A4): if
+    /// `raw_token` is a valid (unexpired, unrevoked, known) session, revoke
+    /// it and issue a brand-new one for the same user, persisting both
+    /// changes together. Returns `Ok(None)` — never an error — for the
+    /// unknown/expired/revoked cases, so `POST /auth/refresh` can map all
+    /// three to the identical uniform 401 exactly like [`Self::
+    /// verify_session`]. `Ok(Some((username, new_raw_token, expires_at)))`
+    /// on success.
+    pub fn rotate_session(&self, raw_token: &str) -> Result<Option<(String, String, u64)>> {
+        let old_hash = sha256_hex(raw_token);
+        let mut st = self.lock();
+        let username = match st.sessions.get(&old_hash) {
+            Some(rec) if !rec.revoked && rec.expires_at > now_secs() => rec.username.clone(),
+            _ => return Ok(None),
+        };
+        if let Some(rec) = st.sessions.get_mut(&old_hash) {
+            rec.revoked = true;
+        }
+        let new_raw = generate_refresh_token();
+        let new_hash = sha256_hex(&new_raw);
+        let now = now_secs();
+        let expires_at = now + REFRESH_TOKEN_TTL_SECS;
+        st.sessions.insert(
+            new_hash,
+            SessionRec {
+                username: username.clone(),
+                issued_at: now,
+                expires_at,
+                revoked: false,
+            },
+        );
+        self.persist(&st)?;
+        Ok(Some((username, new_raw, expires_at)))
+    }
+
+    /// Revoke a refresh-token session (item 121, A4: `POST /auth/logout`).
+    /// Idempotent by design: an unknown hash (already revoked, already
+    /// expired and pruned, or simply never issued) is a silent no-op, not an
+    /// error — logging out twice, or logging out with a stale/garbage token,
+    /// must never surface a distinguishable error to the caller. Returns
+    /// `Err` only for a genuine persistence (disk I/O) failure.
+    pub fn revoke_session(&self, raw_token: &str) -> Result<()> {
+        let hash = sha256_hex(raw_token);
+        let mut st = self.lock();
+        if let Some(rec) = st.sessions.get_mut(&hash) {
+            if !rec.revoked {
+                rec.revoked = true;
+                self.persist(&st)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Whether `user` holds `priv` on `table`, resolving role membership
     /// transitively. Superusers hold every privilege.
     pub fn has_privilege(&self, user: &str, table: &str, priv_: Privilege) -> bool {
@@ -259,6 +673,87 @@ impl RoleStore {
                 .map(|p| p.contains(&priv_))
                 .unwrap_or(false)
         })
+    }
+
+    /// Resolve the caller's **effective** roles (item 122, B3) — the
+    /// Supabase-parity mapping consumed by [`crate::sql::logical::
+    /// apply_rls_with_auth`]'s role gate (B4). Engine-side only (needs
+    /// `self`/authz access, unlike `require_jwt` which only verifies the
+    /// token) — called from `Engine::execute_sql_inner_as_principal` and
+    /// `ReadHandle::execute_sql_inner`, never from the HTTP auth layer:
+    ///
+    /// - a verified token carrying `claims["role"] == "service_role"` →
+    ///   `["service_role"]` only (Supabase convention) — this bypasses RLS
+    ///   like a superuser at the call site, but that bypass decision is made
+    ///   by the caller (audited distinctly, item-103 lesson), not here.
+    /// - `user` is `Some` (a verified subject) → `"authenticated"` plus every
+    ///   role transitively granted to that user (`GRANT <role> TO <user>`,
+    ///   resolved through role-of-role membership, mirroring
+    ///   [`Self::has_privilege`]'s transitive closure).
+    /// - `user` is `None` (no verified subject) → `["anon"]` only.
+    ///
+    /// Fails closed by construction: an unknown/ungranted role never
+    /// appears, and a caller who resolves to no roles at all cannot happen
+    /// (every branch returns at least one role) — a role-scoped policy with
+    /// a `TO` clause a caller doesn't match on simply never widens access.
+    pub fn effective_roles(
+        &self,
+        user: Option<&str>,
+        claims: &BTreeMap<String, serde_json::Value>,
+    ) -> Vec<String> {
+        // A `role` claim explicitly naming `service_role` or `anon` wins
+        // outright, regardless of `user` — this is the real Supabase JWT
+        // convention (both the anon key and the service-role key carry a
+        // `role` claim; it is not inferred from `sub`'s presence). The
+        // literal B3 spec ties `anon`/`authenticated` to subject presence as
+        // the *default* mapping (handled below), which this claim-based
+        // check does not change for a token with no `role` claim at all —
+        // it only adds an explicit, disclosed override for a token that
+        // *does* assert one, and is the only way an `anon`-labeled caller
+        // can reach the RLS role gate without also tripping the pre-existing,
+        // protected "`user == None` is the implicit/embedded superuser"
+        // bypass (item 103) that a bare no-subject token always hits first.
+        if let Some(role_claim) = claims.get("role").and_then(|v| v.as_str()) {
+            if role_claim == SERVICE_ROLE {
+                return vec![SERVICE_ROLE.to_string()];
+            }
+            if role_claim == ANON_ROLE {
+                return vec![ANON_ROLE.to_string()];
+            }
+        }
+        match user {
+            Some(u) => {
+                let st = self.lock();
+                let mut roles = vec![AUTHENTICATED_ROLE.to_string()];
+                roles.extend(Self::transitive_roles_for(&st, u));
+                roles
+            }
+            None => vec![ANON_ROLE.to_string()],
+        }
+    }
+
+    /// Every role reachable from `grantee` by transitive membership
+    /// (`GRANT <role> TO <grantee>`, then role-of-role), NOT including
+    /// `grantee` itself. Factored out of [`Self::has_privilege`]'s inline
+    /// BFS (which additionally needs the grantee itself in its closure, for
+    /// the direct-grant check) so [`Self::effective_roles`] (item 122, B3)
+    /// can reuse the identical traversal without duplicating it.
+    fn transitive_roles_for(st: &AuthState, grantee: &str) -> Vec<String> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut stack = vec![grantee.to_string()];
+        let mut roles: HashSet<String> = HashSet::new();
+        while let Some(g) = stack.pop() {
+            if !seen.insert(g.clone()) {
+                continue;
+            }
+            if let Some(rs) = st.memberships.get(&g) {
+                for r in rs {
+                    roles.insert(r.clone());
+                    stack.push(r.clone());
+                }
+            }
+        }
+        roles.into_iter().collect()
     }
 
     /// Snapshot of the users (name, superuser).
@@ -337,11 +832,26 @@ impl RoleStore {
     pub fn apply(&self, stmt: &AuthStmt) -> Result<()> {
         let mut st = self.lock();
         match stmt {
-            AuthStmt::CreateUser { name, superuser } => {
+            AuthStmt::CreateUser {
+                name,
+                superuser,
+                password,
+            } => {
                 if st.users.contains_key(name) {
                     return Err(DbError::Authz(format!("user '{name}' already exists")));
                 }
+                // Hash before inserting the user, so a hashing failure (e.g.
+                // the password is somehow rejected) leaves no partial state —
+                // either both the user and its credential land together, or
+                // neither does.
+                let hash = match password {
+                    Some(pw) => Some(hash_password(pw)?),
+                    None => None,
+                };
                 st.users.insert(name.clone(), *superuser);
+                if let Some(hash) = hash {
+                    st.credentials.insert(name.clone(), hash);
+                }
             }
             AuthStmt::DropUser(name) => {
                 if st.users.remove(name).is_none() {
@@ -349,13 +859,24 @@ impl RoleStore {
                 }
                 st.memberships.remove(name);
                 st.table_grants.remove(name);
+                st.credentials.remove(name);
             }
             AuthStmt::CreateRole(name) => {
+                if is_reserved_role(name) {
+                    return Err(DbError::Authz(format!(
+                        "role '{name}' is reserved (built-in) and cannot be created"
+                    )));
+                }
                 if !st.roles.insert(name.clone()) {
                     return Err(DbError::Authz(format!("role '{name}' already exists")));
                 }
             }
             AuthStmt::DropRole(name) => {
+                if is_reserved_role(name) {
+                    return Err(DbError::Authz(format!(
+                        "role '{name}' is reserved (built-in) and cannot be dropped"
+                    )));
+                }
                 if !st.roles.remove(name) {
                     return Err(DbError::Authz(format!("role '{name}' not found")));
                 }
@@ -453,14 +974,7 @@ pub fn parse_auth_stmt(sql: &str) -> Result<Option<AuthStmt>> {
     let kw = toks[0].to_ascii_uppercase();
     let kw2 = toks[1].to_ascii_uppercase();
     match (kw.as_str(), kw2.as_str()) {
-        ("CREATE", "USER") => {
-            let name = ident(toks.get(2))?;
-            let superuser = toks
-                .get(3)
-                .map(|s| s.eq_ignore_ascii_case("SUPERUSER"))
-                .unwrap_or(false);
-            Ok(Some(AuthStmt::CreateUser { name, superuser }))
-        }
+        ("CREATE", "USER") => parse_create_user(trimmed, &toks).map(Some),
         ("DROP", "USER") => Ok(Some(AuthStmt::DropUser(ident(toks.get(2))?))),
         ("CREATE", "ROLE") => Ok(Some(AuthStmt::CreateRole(ident(toks.get(2))?))),
         ("DROP", "ROLE") => Ok(Some(AuthStmt::DropRole(ident(toks.get(2))?))),
@@ -472,11 +986,80 @@ pub fn parse_auth_stmt(sql: &str) -> Result<Option<AuthStmt>> {
     }
 }
 
-/// `CREATE POLICY <name> ON <table> FOR <op> USING (<predicate>)`
+/// `CREATE USER <name> [SUPERUSER] [PASSWORD '<pw>']` (item 121, A1).
+///
+/// `name`/`SUPERUSER` come from the whitespace-tokenised `toks` (as before);
+/// the optional `PASSWORD` clause is scanned out of the raw `sql` string
+/// instead, so a password containing spaces (or an escaped `''` literal
+/// quote) parses correctly — unlike the rest of this token-based grammar, a
+/// password is free-form text, not an identifier.
+fn parse_create_user(sql: &str, toks: &[&str]) -> Result<AuthStmt> {
+    let name = ident(toks.get(2))?;
+    let superuser = toks
+        .get(3)
+        .map(|s| s.eq_ignore_ascii_case("SUPERUSER"))
+        .unwrap_or(false);
+
+    let upper = sql.to_ascii_uppercase();
+    let password = match upper.find("PASSWORD") {
+        Some(pw_pos) => Some(parse_quoted_password(&sql[pw_pos + "PASSWORD".len()..])?),
+        None => None,
+    };
+
+    Ok(AuthStmt::CreateUser {
+        name,
+        superuser,
+        password,
+    })
+}
+
+/// Parse a single-quoted string literal starting somewhere in `s` (the first
+/// `'` found), supporting a doubled `''` as an escaped literal quote
+/// (SQL-standard string-literal escaping). Returns the unescaped contents.
+fn parse_quoted_password(s: &str) -> Result<String> {
+    let quote_start = s.find('\'').ok_or_else(|| {
+        DbError::SqlParse("CREATE USER: PASSWORD clause must be a quoted string".into())
+    })?;
+    let rest = &s[quote_start + 1..];
+    let mut out = String::new();
+    let mut chars = rest.char_indices();
+    let mut closed = false;
+    while let Some((i, c)) = chars.next() {
+        if c == '\'' {
+            if rest[i + 1..].starts_with('\'') {
+                out.push('\'');
+                chars.next(); // consume the second quote of the doubled escape
+            } else {
+                closed = true;
+                break;
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    if !closed {
+        return Err(DbError::SqlParse(
+            "CREATE USER: unterminated PASSWORD string".into(),
+        ));
+    }
+    if out.is_empty() {
+        return Err(DbError::SqlParse(
+            "CREATE USER: PASSWORD cannot be empty".into(),
+        ));
+    }
+    Ok(out)
+}
+
+/// `CREATE POLICY <name> ON <table> FOR <op> [TO <role,...>] USING (<predicate>) [WITH CHECK (<expr>)]`
 ///
 /// The USING clause may span multiple tokens (it is a SQL expression); we
 /// find `USING` case-insensitively and take everything after `(` through the
-/// final `)` as the raw predicate string.
+/// final `)` as the raw predicate string. The optional `TO <role,...>`
+/// clause (item 122, B4) is detected as an exact `TO` token strictly between
+/// the operation (or the table name, if `FOR` was omitted) and `USING` — so
+/// it can never be confused with a `TO` that might appear inside the
+/// predicate text itself, which lives after `USING` and is never tokenised
+/// this way.
 fn parse_create_policy(sql: &str) -> Result<AuthStmt> {
     let upper = sql.to_ascii_uppercase();
     // Tokenised version for the keyword positions.
@@ -494,7 +1077,8 @@ fn parse_create_policy(sql: &str) -> Result<AuthStmt> {
     let table = ident(toks.get(on_pos + 1))?;
 
     // FOR position (optional — defaults to ALL).
-    let op = if let Some(for_pos) = upper_toks.iter().position(|t| t == "FOR") {
+    let for_pos = upper_toks.iter().position(|t| t == "FOR");
+    let op = if let Some(for_pos) = for_pos {
         let op_str = toks.get(for_pos + 1).ok_or_else(|| {
             DbError::SqlParse("CREATE POLICY: missing operation after FOR".into())
         })?;
@@ -503,6 +1087,42 @@ fn parse_create_policy(sql: &str) -> Result<AuthStmt> {
         })?
     } else {
         PolicyOp::All
+    };
+
+    // Optional `TO <role,...>` clause (item 122, B4): an exact `TO` token
+    // somewhere between the operation (or table, if `FOR` absent) and the
+    // token that opens the `USING` clause. `toks[i]`/`upper_toks[i]` share
+    // indices and every `toks[i]` borrows from `sql`, so pointer arithmetic
+    // recovers the exact (non-uppercased) byte range of the role list
+    // without re-scanning — no `unsafe` needed, this is plain integer math
+    // over already-safe `as_ptr()` values.
+    let using_tok_idx = upper_toks
+        .iter()
+        .position(|t| t.starts_with("USING"))
+        .ok_or_else(|| DbError::SqlParse("CREATE POLICY: missing USING clause".into()))?;
+    let to_search_start = match for_pos {
+        Some(for_pos) => for_pos + 2, // token right after the operation
+        None => on_pos + 2,           // token right after the table name
+    };
+    let target_roles = match (to_search_start..using_tok_idx)
+        .find(|&i| upper_toks.get(i).map(String::as_str) == Some("TO"))
+    {
+        Some(to_idx) => {
+            let role_start = tok_offset(sql, toks[to_idx]) + toks[to_idx].len();
+            let role_end = tok_offset(sql, toks[using_tok_idx]);
+            let roles: Vec<String> = sql[role_start..role_end]
+                .split(',')
+                .map(|r| r.trim().trim_matches('"').to_string())
+                .filter(|r| !r.is_empty())
+                .collect();
+            if roles.is_empty() {
+                return Err(DbError::SqlParse(
+                    "CREATE POLICY: TO clause requires at least one role".into(),
+                ));
+            }
+            roles
+        }
+        None => Vec::new(),
     };
 
     // USING clause: everything between the outermost `(` and `)` after the
@@ -591,7 +1211,17 @@ fn parse_create_policy(sql: &str) -> Result<AuthStmt> {
         op,
         using_expr,
         with_check_sql,
+        target_roles,
     }))
+}
+
+/// Byte offset of `tok` within `sql`, given `tok` is itself a substring of
+/// `sql` (true for every element of `sql.split_whitespace().collect()`).
+/// Plain pointer-to-integer arithmetic — safe, no dereference — used to
+/// recover exact (non-uppercased) source ranges from token positions found
+/// via an uppercased token list.
+fn tok_offset(sql: &str, tok: &str) -> usize {
+    tok.as_ptr() as usize - sql.as_ptr() as usize
 }
 
 /// `DROP POLICY <name> ON <table>`
@@ -682,7 +1312,8 @@ mod tests {
             parse_auth_stmt("CREATE USER alice SUPERUSER").unwrap(),
             Some(AuthStmt::CreateUser {
                 name: "alice".into(),
-                superuser: true
+                superuser: true,
+                password: None,
             })
         );
         assert_eq!(
@@ -719,6 +1350,7 @@ mod tests {
             .apply(&AuthStmt::CreateUser {
                 name: "bob".into(),
                 superuser: false,
+                password: None,
             })
             .unwrap();
         store
@@ -753,6 +1385,7 @@ mod tests {
                 .apply(&AuthStmt::CreateUser {
                     name: "root".into(),
                     superuser: true,
+                    password: None,
                 })
                 .unwrap();
             assert!(store.has_privilege("root", "anything", Privilege::Delete));
@@ -760,5 +1393,506 @@ mod tests {
         // Reopen: the user persists.
         let store = RoleStore::open(dir.path()).unwrap();
         assert!(store.is_superuser("root"));
+    }
+
+    #[test]
+    fn parse_create_user_with_password() {
+        assert_eq!(
+            parse_auth_stmt("CREATE USER alice PASSWORD 'hunter2'").unwrap(),
+            Some(AuthStmt::CreateUser {
+                name: "alice".into(),
+                superuser: false,
+                password: Some("hunter2".into()),
+            })
+        );
+        // SUPERUSER + PASSWORD together, in that order.
+        assert_eq!(
+            parse_auth_stmt("CREATE USER root SUPERUSER PASSWORD 's3cret'").unwrap(),
+            Some(AuthStmt::CreateUser {
+                name: "root".into(),
+                superuser: true,
+                password: Some("s3cret".into()),
+            })
+        );
+        // A password containing spaces and an escaped quote.
+        assert_eq!(
+            parse_auth_stmt("CREATE USER bob PASSWORD 'a b ''c'' d'").unwrap(),
+            Some(AuthStmt::CreateUser {
+                name: "bob".into(),
+                superuser: false,
+                password: Some("a b 'c' d".into()),
+            })
+        );
+        // Malformed clauses are rejected rather than silently ignored.
+        assert!(parse_auth_stmt("CREATE USER alice PASSWORD").is_err());
+        assert!(parse_auth_stmt("CREATE USER alice PASSWORD ''").is_err());
+        assert!(parse_auth_stmt("CREATE USER alice PASSWORD 'unterminated").is_err());
+    }
+
+    #[test]
+    fn credential_store_hash_verify_and_persist() {
+        let dir = tempdir().unwrap();
+        {
+            let store = RoleStore::open(dir.path()).unwrap();
+            store
+                .apply(&AuthStmt::CreateUser {
+                    name: "carol".into(),
+                    superuser: false,
+                    password: Some("correct horse".into()),
+                })
+                .unwrap();
+            // Correct password verifies.
+            assert!(store.verify_password("carol", "correct horse"));
+            // Wrong password fails.
+            assert!(!store.verify_password("carol", "wrong password"));
+            // Unknown user fails the same way (no panic, no special-case).
+            assert!(!store.verify_password("nobody", "correct horse"));
+            // A user with no stored credential (created without PASSWORD)
+            // cannot log in via password at all.
+            store
+                .apply(&AuthStmt::CreateUser {
+                    name: "dave".into(),
+                    superuser: false,
+                    password: None,
+                })
+                .unwrap();
+            assert!(!store.verify_password("dave", ""));
+            assert!(!store.verify_password("dave", "anything"));
+        }
+        // The credential survives a reopen (it's persisted control-plane
+        // metadata, same file as users/roles/grants).
+        let store = RoleStore::open(dir.path()).unwrap();
+        assert!(store.verify_password("carol", "correct horse"));
+
+        // The persisted roles.json is never plaintext: the raw file bytes
+        // must not contain the password, only a PHC-formatted argon2id hash.
+        let raw = std::fs::read_to_string(dir.path().join("roles.json")).unwrap();
+        assert!(!raw.contains("correct horse"));
+        assert!(raw.contains("$argon2id$"));
+    }
+
+    #[test]
+    fn set_password_rust_api() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        store
+            .apply(&AuthStmt::CreateUser {
+                name: "erin".into(),
+                superuser: false,
+                password: None,
+            })
+            .unwrap();
+        assert!(!store.verify_password("erin", "new-pw"));
+        store.set_password("erin", "new-pw").unwrap();
+        assert!(store.verify_password("erin", "new-pw"));
+        assert!(!store.verify_password("erin", "wrong"));
+
+        // Setting a password for a nonexistent user is an error.
+        assert!(store.set_password("ghost", "x").is_err());
+    }
+
+    #[test]
+    fn auth_state_debug_never_prints_password_hash() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        store
+            .apply(&AuthStmt::CreateUser {
+                name: "frank".into(),
+                superuser: false,
+                password: Some("super-secret-value".into()),
+            })
+            .unwrap();
+        let debug_str = format!("{:?}", store.lock());
+        assert!(!debug_str.contains("super-secret-value"));
+        assert!(!debug_str.contains("$argon2id$"));
+        assert!(debug_str.contains("redacted"));
+
+        // The AuthStmt itself must also never Debug-print the plaintext
+        // (e.g. via `tracing::info!(?stmt, ..)` in `apply`).
+        let stmt = AuthStmt::CreateUser {
+            name: "gina".into(),
+            superuser: false,
+            password: Some("another-secret".into()),
+        };
+        let stmt_debug = format!("{stmt:?}");
+        assert!(!stmt_debug.contains("another-secret"));
+        assert!(stmt_debug.contains("redacted"));
+    }
+
+    // ── item 121, A4: refresh-token sessions ───────────────────────────────
+
+    #[test]
+    fn create_session_returns_high_entropy_token_and_verifies() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        store
+            .apply(&AuthStmt::CreateUser {
+                name: "hank".into(),
+                superuser: false,
+                password: None,
+            })
+            .unwrap();
+
+        let (raw, expires_at) = store.create_session("hank").unwrap();
+        // 32 bytes hex-encoded = 64 hex chars.
+        assert_eq!(raw.len(), 64);
+        assert!(expires_at > now_secs());
+        assert_eq!(store.verify_session(&raw), Some("hank".to_string()));
+
+        // Two sessions for the same user never collide.
+        let (raw2, _) = store.create_session("hank").unwrap();
+        assert_ne!(raw, raw2);
+        assert_eq!(store.verify_session(&raw2), Some("hank".to_string()));
+
+        // The raw token never appears in the persisted file — only its hash.
+        let on_disk = std::fs::read_to_string(dir.path().join("roles.json")).unwrap();
+        assert!(!on_disk.contains(&raw));
+        assert!(on_disk.contains(&sha256_hex(&raw)));
+    }
+
+    #[test]
+    fn verify_session_rejects_unknown_and_garbage_tokens() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        assert_eq!(store.verify_session("not-a-real-token"), None);
+        assert_eq!(store.verify_session(""), None);
+    }
+
+    #[test]
+    fn rotate_session_revokes_old_and_issues_new_for_same_user() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        store
+            .apply(&AuthStmt::CreateUser {
+                name: "iris".into(),
+                superuser: false,
+                password: None,
+            })
+            .unwrap();
+        let (raw, _) = store.create_session("iris").unwrap();
+
+        let (username, new_raw, _expires_at) = store
+            .rotate_session(&raw)
+            .unwrap()
+            .expect("valid session must rotate");
+        assert_eq!(username, "iris");
+        assert_ne!(new_raw, raw);
+
+        // The old token no longer verifies (revoked); the new one does.
+        assert_eq!(store.verify_session(&raw), None);
+        assert_eq!(store.verify_session(&new_raw), Some("iris".to_string()));
+
+        // Rotating the now-revoked old token again fails uniformly (None,
+        // not an error) — same shape as an unknown token.
+        assert!(store.rotate_session(&raw).unwrap().is_none());
+    }
+
+    #[test]
+    fn rotate_session_rejects_unknown_token() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        assert!(store.rotate_session("garbage").unwrap().is_none());
+    }
+
+    #[test]
+    fn revoke_session_is_idempotent_and_blocks_further_use() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        store
+            .apply(&AuthStmt::CreateUser {
+                name: "jack".into(),
+                superuser: false,
+                password: None,
+            })
+            .unwrap();
+        let (raw, _) = store.create_session("jack").unwrap();
+        assert_eq!(store.verify_session(&raw), Some("jack".to_string()));
+
+        store.revoke_session(&raw).unwrap();
+        assert_eq!(store.verify_session(&raw), None);
+
+        // Revoking again (already revoked) and revoking an unknown token are
+        // both silent no-ops, never an error.
+        assert!(store.revoke_session(&raw).is_ok());
+        assert!(store.revoke_session("never-issued").is_ok());
+    }
+
+    #[test]
+    fn expired_session_fails_verification() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        store
+            .apply(&AuthStmt::CreateUser {
+                name: "karen".into(),
+                superuser: false,
+                password: None,
+            })
+            .unwrap();
+        let (raw, _) = store.create_session("karen").unwrap();
+        // Reach into the persisted state and force the expiry into the past
+        // (avoids a real-time sleep in a unit test).
+        {
+            let mut st = store.lock();
+            for rec in st.sessions.values_mut() {
+                rec.expires_at = now_secs().saturating_sub(1);
+            }
+            store.persist(&st).unwrap();
+        }
+        assert_eq!(store.verify_session(&raw), None);
+        assert!(store.rotate_session(&raw).unwrap().is_none());
+    }
+
+    #[test]
+    fn sessions_survive_reopen() {
+        let dir = tempdir().unwrap();
+        let raw = {
+            let store = RoleStore::open(dir.path()).unwrap();
+            store
+                .apply(&AuthStmt::CreateUser {
+                    name: "laura".into(),
+                    superuser: false,
+                    password: None,
+                })
+                .unwrap();
+            store.create_session("laura").unwrap().0
+        };
+        let store = RoleStore::open(dir.path()).unwrap();
+        assert_eq!(store.verify_session(&raw), Some("laura".to_string()));
+    }
+
+    #[test]
+    fn auth_state_debug_never_prints_session_detail() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        store
+            .apply(&AuthStmt::CreateUser {
+                name: "mallory".into(),
+                superuser: false,
+                password: None,
+            })
+            .unwrap();
+        let (raw, _) = store.create_session("mallory").unwrap();
+        let debug_str = format!("{:?}", store.lock());
+        // The raw refresh token (the actual secret) must never appear.
+        assert!(!debug_str.contains(&raw));
+        // The session's hash-keyed detail is redacted to a count — note
+        // "mallory" itself legitimately still appears via the unrelated
+        // `users` field (usernames aren't secret), so this only checks the
+        // `sessions` field specifically prints a redacted count.
+        assert!(debug_str.contains("sessions"));
+        assert!(debug_str.contains("redacted"));
+    }
+
+    // ── item 122, B3/B4: built-in roles + role-scoped policies ────────────
+
+    #[test]
+    fn reserved_roles_cannot_be_created_or_dropped() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        for name in ["anon", "authenticated", "service_role"] {
+            assert!(
+                store.apply(&AuthStmt::CreateRole(name.into())).is_err(),
+                "CREATE ROLE {name} must be rejected (reserved)"
+            );
+            assert!(
+                store.apply(&AuthStmt::DropRole(name.into())).is_err(),
+                "DROP ROLE {name} must be rejected (reserved)"
+            );
+        }
+        // A non-reserved role still works normally.
+        assert!(store.apply(&AuthStmt::CreateRole("analyst".into())).is_ok());
+    }
+
+    #[test]
+    fn parse_create_policy_with_to_clause() {
+        let stmt = parse_auth_stmt(
+            "CREATE POLICY p1 ON accounts FOR SELECT TO authenticated USING (owner = current_user())",
+        )
+        .unwrap()
+        .unwrap();
+        match stmt {
+            AuthStmt::CreatePolicy(p) => {
+                assert_eq!(p.target_roles, vec!["authenticated".to_string()]);
+                assert_eq!(p.using_expr, "owner = current_user()");
+                assert_eq!(p.op, PolicyOp::Select);
+            }
+            _ => panic!("expected CreatePolicy"),
+        }
+    }
+
+    #[test]
+    fn parse_create_policy_with_multi_role_to_clause() {
+        let stmt =
+            parse_auth_stmt("CREATE POLICY p2 ON accounts FOR ALL TO admin, analyst USING (true)")
+                .unwrap()
+                .unwrap();
+        match stmt {
+            AuthStmt::CreatePolicy(p) => {
+                assert_eq!(
+                    p.target_roles,
+                    vec!["admin".to_string(), "analyst".to_string()]
+                );
+            }
+            _ => panic!("expected CreatePolicy"),
+        }
+    }
+
+    #[test]
+    fn parse_create_policy_to_clause_with_with_check() {
+        // TO clause + WITH CHECK together (both new/optional clauses at once).
+        let stmt = parse_auth_stmt(
+            "CREATE POLICY p4 ON accounts FOR UPDATE TO authenticated USING (owner = current_user()) WITH CHECK (owner = current_user())",
+        )
+        .unwrap()
+        .unwrap();
+        match stmt {
+            AuthStmt::CreatePolicy(p) => {
+                assert_eq!(p.target_roles, vec!["authenticated".to_string()]);
+                assert_eq!(p.with_check_sql.as_deref(), Some("owner = current_user()"));
+            }
+            _ => panic!("expected CreatePolicy"),
+        }
+    }
+
+    #[test]
+    fn parse_create_policy_without_to_clause_is_unscoped() {
+        let stmt = parse_auth_stmt("CREATE POLICY p3 ON accounts FOR SELECT USING (true)")
+            .unwrap()
+            .unwrap();
+        match stmt {
+            AuthStmt::CreatePolicy(p) => assert!(p.target_roles.is_empty()),
+            _ => panic!("expected CreatePolicy"),
+        }
+    }
+
+    #[test]
+    fn parse_create_policy_to_clause_requires_a_role() {
+        // "TO USING" with nothing in between is a malformed TO clause — must
+        // error, not silently produce an empty (i.e. unscoped/all-callers)
+        // target-role list, which would be a fail-OPEN widening.
+        assert!(
+            parse_auth_stmt("CREATE POLICY p5 ON accounts FOR SELECT TO USING (true)").is_err()
+        );
+    }
+
+    #[test]
+    fn effective_roles_no_subject_is_anon() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        assert_eq!(
+            store.effective_roles(None, &BTreeMap::new()),
+            vec![ANON_ROLE.to_string()]
+        );
+    }
+
+    #[test]
+    fn effective_roles_subject_is_authenticated_plus_transitive_grants() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        store
+            .apply(&AuthStmt::CreateUser {
+                name: "bob".into(),
+                superuser: false,
+                password: None,
+            })
+            .unwrap();
+        store
+            .apply(&AuthStmt::CreateRole("analyst".into()))
+            .unwrap();
+        store
+            .apply(&AuthStmt::CreateRole("senior_analyst".into()))
+            .unwrap();
+        store
+            .apply(&AuthStmt::GrantRole {
+                role: "analyst".into(),
+                grantee: "bob".into(),
+            })
+            .unwrap();
+        // Role-of-role: bob -> analyst -> senior_analyst, resolved transitively.
+        store
+            .apply(&AuthStmt::GrantRole {
+                role: "senior_analyst".into(),
+                grantee: "analyst".into(),
+            })
+            .unwrap();
+        let mut roles = store.effective_roles(Some("bob"), &BTreeMap::new());
+        roles.sort();
+        assert_eq!(
+            roles,
+            vec![
+                "analyst".to_string(),
+                AUTHENTICATED_ROLE.to_string(),
+                "senior_analyst".to_string(),
+            ]
+        );
+
+        // A subject with no granted roles is still "authenticated", nothing more.
+        store
+            .apply(&AuthStmt::CreateUser {
+                name: "carol".into(),
+                superuser: false,
+                password: None,
+            })
+            .unwrap();
+        assert_eq!(
+            store.effective_roles(Some("carol"), &BTreeMap::new()),
+            vec![AUTHENTICATED_ROLE.to_string()]
+        );
+    }
+
+    #[test]
+    fn effective_roles_service_role_claim_wins_regardless_of_subject() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        let mut claims = BTreeMap::new();
+        claims.insert(
+            "role".to_string(),
+            serde_json::Value::String(SERVICE_ROLE.to_string()),
+        );
+        assert_eq!(
+            store.effective_roles(Some("bob"), &claims),
+            vec![SERVICE_ROLE.to_string()]
+        );
+        assert_eq!(
+            store.effective_roles(None, &claims),
+            vec![SERVICE_ROLE.to_string()]
+        );
+        // A non-matching "role" claim doesn't trigger the bypass.
+        let mut other_claims = BTreeMap::new();
+        other_claims.insert(
+            "role".to_string(),
+            serde_json::Value::String("something_else".to_string()),
+        );
+        assert_eq!(
+            store.effective_roles(Some("bob"), &other_claims),
+            vec![AUTHENTICATED_ROLE.to_string()]
+        );
+    }
+
+    #[test]
+    fn effective_roles_explicit_anon_role_claim_overrides_subject() {
+        // A `role: anon` claim (the real Supabase anon-key convention) is a
+        // genuinely reachable way to get an `anon`-labeled caller that does
+        // NOT trip the `user == None` superuser-bypass invariant (item 103) —
+        // unlike a bare no-subject token, this carries a real `Some(subject)`
+        // so it reaches the ordinary (non-bypass) RLS path in
+        // `Engine::execute_sql_inner_as_principal`.
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        let mut claims = BTreeMap::new();
+        claims.insert(
+            "role".to_string(),
+            serde_json::Value::String(ANON_ROLE.to_string()),
+        );
+        assert_eq!(
+            store.effective_roles(Some("some_subject"), &claims),
+            vec![ANON_ROLE.to_string()]
+        );
+        // The default (no `role` claim at all) mapping is unaffected: a bare
+        // no-subject caller still resolves to anon too.
+        assert_eq!(
+            store.effective_roles(None, &BTreeMap::new()),
+            vec![ANON_ROLE.to_string()]
+        );
     }
 }

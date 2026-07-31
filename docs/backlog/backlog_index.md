@@ -127,10 +127,14 @@
 | 117 | `117_hot_update_unique_key_gate.md` | Performance | ✅ SHIPPED 2026-07-30 (branch `feat/hot-update-unique-key-gate`, commit `a5403b1`) — from the 2026-07-30 architecture review: HOT UPDATE was disabled by the mere *existence* of a PK/UNIQUE index (`!has_unique`), forcing the common "update a non-indexed column on a PK'd table" case (Table 5 = **0.19×**, worst CRUD row) onto the slow per-row loop + redundant per-row PK re-check. Fix mirrors item-53's FK gate: `has_unique_in_set` — HOT/enforce_unique only when a unique/PK column is actually in `SET`. Safety verified: unchanged unique index resolves via the same `get_visible` HOT-chain walk as secondary indexes. **Cert** (Docker Table 5, `report_20260730_124355.md`): UPDATE bulk **0.19×→3.04×**, unidb absolute **138,840→1,130,955 rec/s (+8.1×)** (item-108 caveat: PG absolute drifted, so ~1.5× vs baseline PG — still a win, in the HOT band); correctness intact. |
 | 118 | `118_hnsw_crash_reconcile.md` | Improvement | ✅ SHIPPED 2026-07-31 (branch `feat/hnsw-crash-reconcile`) — async-HNSW crash-durability hole: a committed vector row whose HNSW insert was still in the in-memory worker channel at crash (or graceful-exit-without-drain) time was lost from the index forever (WAL redo restores only durably-applied inserts; no reconciliation; no `Drop` drain). Fix: `hnsw.dirty` sidecar marker gates a **background** reconcile-on-open (diff `node_index` vs committed heap, re-enqueue only the missing tail through the worker) → open stays O(1); `DiskHnswIndex::contains` makes worker inserts idempotent (race + swallowed-error safe); `flush_hnsw_for_shutdown` drains + clears the marker on clean shutdown. Real crash-convergence test (34/60 → 60/60). |
 | 119 | `119_fk_parent_update_restrict_gate.md` | Improvement | ✅ SHIPPED 2026-07-31 (branch `fix/fk-parent-update-restrict-gate`) — found live in unidb-studio: editing a parent row's non-key column (`purchase_orders.shipping_address`) was wrongly rejected with `FOREIGN_KEY_VIOLATION` because the parent-side RESTRICT check fired on *every* parent UPDATE, not only when a child-referenced key changes. Fix mirrors item-53/117: `has_fk_children_ref_in_set` gates RESTRICT + parent phantom lock on referenced-column-in-SET. Benign edits pass; key-change / delete-with-children still blocked. Both-direction regression test + testing-gap lesson (LESSONS.md). |
+| 120 | `120_supabase_parity_roadmap.md` | Milestone | ⏳ NOT STARTED — umbrella map for reaching Supabase-class BaaS: workstreams A–I, priority (P0=auth core + RLS↔token + auto-API), dependency graph, and the 3-wave parallel execution plan. Accounts for what already ships (RLS/RBAC, token→`current_user` wiring, dev-login surface, storage presign+public/private buckets, all non-auth studio panels). Wave-1 tracks spun out as 121/122/123; Wave-2/3 get their own `NN_…` when started. |
+| 121 | `121_auth_core.md` | Milestone | 🔄 IN PROGRESS — Workstream A (P0). **A1+A2 SHIPPED** on branch `claude/permissions-security-supabase-comparison-ixho2w` (`fcd320a`): argon2id credential store + `CREATE USER … PASSWORD` + real password login with the enumeration/timing oracle closed (dummy-hash on miss) and no credential leakage. **A3+A4 SHIPPED** same branch (`77fab4a`): `POST /auth/signup` (gated `UNIDB_ALLOW_SIGNUP`, 404 when off), `POST /auth/refresh` (verify+rotate opaque 256-bit refresh tokens, hash-only session store in `roles.json`), `POST /auth/logout` (idempotent revoke); login/signup return `{token, access_token, refresh_token, expires_in}`. item121 16/16, crash 54/54. Remaining: A5 prod issuer, A6 RS256/JWKS. |
+| 122 | `122_rls_token_binding.md` | Milestone | 🔄 IN PROGRESS — Workstream B (P0). **B1+B2 SHIPPED** on branch (`3fb0e04` + QExpr-path fix `2a5fe85`): `auth.uid()` + real `auth.jwt() ->> 'claim'`, substituted at policy-injection time, **fail-closed** (Null, never Bool(true) — item-110); item122 7/7 incl. two-tenant isolation + LIMIT/QExpr path; crash 54/54. **B3+B4 SHIPPED** (`838d91d`): built-in `anon`/`authenticated`/`service_role` roles (service_role RLS bypass audited, item-103), role-scoped policies (`… TO <role>`) with no-`TO` back-compat + fail-closed deny; item122_b3_b4 6/6, crash 54/54. Remaining: B5 column grants (item 112). |
+| 123 | `123_auto_rest_api.md` | Milestone | ⏳ NOT STARTED — Workstream C (C1 P0): PostgREST-style `/rest/v1/<table>?col=eq.val` resource routes built as `LogicalPlan` (not string SQL), enforcing existing RLS/grants; embedded FK expansion; OpenAPI/API-docs; GraphQL deferred to Wave 3. |
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `120_…`.**
+**Next new file → `124_…`.**
 
 ## Next up — priority order (2026-07-23, post fresh-baseline bench)
 
@@ -140,7 +144,14 @@ environment canary is quiet. Current per-operation state lives in the
 `decompose.rs` ceilings table (refreshed to the 2026-07-21 run) and
 `docs/performance/` (see its README for the authoritative report).
 
-**Next priority items:**
+**New track (2026-07-31): Supabase parity.** Items 120–123 open the BaaS-parity
+roadmap (auth core, RLS↔token binding, auto REST API) as parallelizable
+workstreams — see [`120_supabase_parity_roadmap.md`](120_supabase_parity_roadmap.md)
+for priority and the 3-wave plan. P0 critical path = 121 (A) + 122 (B), with I1
+(rate-limit) alongside. This is a product-direction track, separate from the
+performance items below; sequence with the user.
+
+**Next priority items (performance):**
 
 1. **p17 crash-test regression on main (chip filed 2026-07-24)** — NEAR
    returns duplicate rids after crash-reopen (macOS-deterministic; likely

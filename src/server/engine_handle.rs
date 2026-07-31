@@ -25,6 +25,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::{
+    auth_principal::AuthPrincipal,
     catalog::{IndexKind, IndexStatus},
     error::{DbError, Result},
     format::Xid,
@@ -150,6 +151,10 @@ impl EngineHandle {
     /// a named user identity (item 103). Superusers and the no-`sub` path
     /// (`user = None`) bypass `current_user`-referencing policies. Regular users
     /// have policies applied with `current_user` substituted.
+    ///
+    /// Carries no verified claims — prefer
+    /// [`Self::execute_sql_read_as_principal`] when `auth.jwt()`-referencing
+    /// policies (item 122) must resolve correctly.
     pub async fn execute_sql_read_as(
         &self,
         user: Option<String>,
@@ -160,6 +165,25 @@ impl EngineHandle {
         tokio::task::spawn_blocking(move || {
             let _corr = crate::observability::set_request_id(request_id);
             read.execute_sql_as(user.as_deref(), &sql)
+        })
+        .await
+        .map_err(|_| DbError::EngineUnavailable)?
+    }
+
+    /// Like [`Self::execute_sql_read_as`] but forwards a full [`AuthPrincipal`]
+    /// (item 122, B1/B2) so `auth.uid()`/`auth.jwt() ->> '...'` RLS policies
+    /// resolve correctly on the concurrent read path too — the same claims
+    /// carried into `execute_sql_as_principal` on the writer path.
+    pub async fn execute_sql_read_as_principal(
+        &self,
+        principal: AuthPrincipal,
+        sql: String,
+    ) -> Result<Vec<ExecResult>> {
+        let read = self.read.clone();
+        let request_id = crate::server::correlation::current_request_id();
+        tokio::task::spawn_blocking(move || {
+            let _corr = crate::observability::set_request_id(request_id);
+            read.execute_sql_as_principal(&principal, &sql)
         })
         .await
         .map_err(|_| DbError::EngineUnavailable)?
@@ -228,9 +252,37 @@ impl EngineHandle {
             .await
     }
 
+    /// Like [`Self::execute_sql_as`] but forwards a full [`AuthPrincipal`]
+    /// (auth seam) instead of a bare subject string. `principal.claims`/
+    /// `principal.roles` are carried down into the engine but are not yet
+    /// consumed by any policy logic.
+    pub async fn execute_sql_as_principal(
+        &self,
+        principal: AuthPrincipal,
+        xid: Xid,
+        sql: String,
+    ) -> Result<Vec<ExecResult>> {
+        self.on_engine(move |e| e.execute_sql_as_principal(&principal, xid, &sql))
+            .await
+    }
+
     /// Privilege pre-check for the read/param fast paths (P6.e).
     pub async fn authorize_sql(&self, user: Option<String>, sql: String) -> Result<()> {
         self.on_engine(move |e| e.authorize_sql(user.as_deref(), &sql))
+            .await
+    }
+
+    /// Like [`Self::authorize_sql`] but principal-aware (item 122, B3) — a
+    /// `service_role` claim skips the pre-check, mirroring
+    /// `execute_sql_as_principal`'s bypass, so the fast-path pre-check can't
+    /// reject a service_role token before the engine's own audited bypass
+    /// ever runs.
+    pub async fn authorize_sql_as_principal(
+        &self,
+        principal: AuthPrincipal,
+        sql: String,
+    ) -> Result<()> {
+        self.on_engine(move |e| e.authorize_sql_as_principal(&principal, &sql))
             .await
     }
 
@@ -394,6 +446,56 @@ impl EngineHandle {
         self.on_engine(move |e| Ok(e.authz.roles_for(&user)))
             .await
             .unwrap_or_default()
+    }
+
+    /// Verify a login password (item 121, A2). `false` covers unknown user,
+    /// no stored credential, and wrong password alike (no user-enumeration
+    /// oracle) — see [`crate::authz::RoleStore::verify_password`]. A
+    /// bottom-of-the-stack engine error (should not happen for this
+    /// read-only check) also maps to `false`, so a caller never has to
+    /// distinguish "verify failed" from "verify errored" — both mean "don't
+    /// log this request in."
+    pub async fn verify_password(&self, user: String, password: String) -> bool {
+        self.on_engine(move |e| Ok(e.verify_password(&user, &password)))
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Create a new non-superuser user with a password credential (item 121,
+    /// A3 — `POST /auth/signup`). Errors (e.g. duplicate username) propagate
+    /// as-is; the caller maps them to an HTTP status via [`ApiError`](
+    /// crate::server::error::ApiError).
+    pub async fn create_user_with_password(&self, user: String, password: String) -> Result<()> {
+        self.on_engine(move |e| e.create_user_with_password(&user, &password))
+            .await
+    }
+
+    /// Issue a fresh refresh-token session for `user` (item 121, A4). Returns
+    /// `(raw_refresh_token, expires_at_unix_secs)`.
+    pub async fn create_session(&self, user: String) -> Result<(String, u64)> {
+        self.on_engine(move |e| e.create_session(&user)).await
+    }
+
+    /// Verify a raw refresh token (item 121, A4). `None` uniformly covers
+    /// unknown/expired/revoked — see [`crate::authz::RoleStore::
+    /// verify_session`].
+    pub async fn verify_session(&self, raw_token: String) -> Option<String> {
+        self.on_engine(move |e| Ok(e.verify_session(&raw_token)))
+            .await
+            .unwrap_or(None)
+    }
+
+    /// Verify + rotate a refresh token (item 121, A4 — `POST /auth/refresh`).
+    /// `Ok(None)` covers unknown/expired/revoked uniformly; `Err` only for a
+    /// genuine persistence failure.
+    pub async fn rotate_session(&self, raw_token: String) -> Result<Option<(String, String, u64)>> {
+        self.on_engine(move |e| e.rotate_session(&raw_token)).await
+    }
+
+    /// Revoke a refresh-token session, idempotently (item 121, A4 —
+    /// `POST /auth/logout`).
+    pub async fn revoke_session(&self, raw_token: String) -> Result<()> {
+        self.on_engine(move |e| e.revoke_session(&raw_token)).await
     }
 
     /// Install an RLS policy from a SQL predicate string (R3).

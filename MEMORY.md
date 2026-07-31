@@ -485,6 +485,104 @@ be raised with the user directly, not assumed.
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-07-31 — item 122 B3/B4 (built-in roles + role-scoped policies) shipped, second slice of Workstream B
+
+Sequential batch-2 continuation (Sonnet on the main tree, verified by me). **122 B3/B4**
+(`838d91d`): reserved `anon`/`authenticated`/`service_role` roles (CREATE/DROP reject them);
+effective roles resolved engine-side via `RoleStore::effective_roles` — no subject→[anon],
+verified subject→[authenticated]+transitive granted roles, `claims["role"]=="service_role"`→
+[service_role] which BYPASSES RLS on the **audited** path (item-103) on BOTH writer and
+concurrent-read. `CREATE POLICY … FOR <op> [TO <role,…>]`, target roles persisted
+(serde-default, no FORMAT_VERSION bump). `apply_rls_with_auth` gains `roles`: **no-`TO`
+policies still apply to everyone (back-compat)**, `TO`-scoped OR-combined only on role
+intersection, table-with-only-scoped-policies-and-no-match denies all rows (fail closed).
+Verified by me: crash 54/54, item122 7/7 (back-compat) + item122_b3_b4 6/6, rls/policy +
+item121 16/16, clippy/fmt clean. Plan-time only, ACID/perf intact. Remaining on branch:
+A5 prod issuer, A6 RS256/JWKS, B5 column grants; then `docs/REST_API.md` refresh + PR-on-request.
+
+### 2026-07-31 — item 121 A3/A4 (signup + refresh tokens/sessions/logout) shipped, second slice of Workstream A
+
+Built directly on branch (no worktree) on top of A1/A2 (`fcd320a`). **A3:**
+`POST /auth/signup` creates a non-superuser with an argon2id credential via
+`Engine::create_user_with_password` (thin wrapper over `RoleStore::apply`'s
+existing `CreateUser` branch — no new DDL path needed); gated behind
+`UNIDB_ALLOW_SIGNUP` (default off, 404 when disabled, mirroring the dev-login
+posture); duplicate usernames reject with a clear `AUTHZ_ERROR`. **A4:**
+`AuthState` gains a `sessions: BTreeMap<token_hash, SessionRec>` field
+(`roles.json`, same control-plane store as credentials) — refresh tokens are
+256-bit OS-CSPRNG opaque strings (NOT JWTs, via `argon2`'s already-vendored
+`OsRng`/`RngCore`), and only their SHA-256 hash (new `sha2` dependency — fast
+one-way hash is the right tool for an already-high-entropy secret, unlike
+argon2id for passwords) is ever persisted. `POST /auth/refresh` verifies +
+rotates (revoke-old + issue-new in one persisted step) — checks the JWT
+signing key is available *before* touching session state, so a disabled
+issuer can never revoke a still-good refresh token without handing back its
+replacement. `POST /auth/logout` revokes idempotently. Unknown/expired/
+revoked refresh tokens all collapse to one `401 INVALID_REFRESH_TOKEN`.
+Login/signup responses gained `access_token`/`refresh_token`; `token` kept as
+a deprecated alias of `access_token` (zero breakage to existing item100/
+item121 tests). Manual `Debug` redaction extended to the new DTOs and
+`AuthState::sessions` (mirroring A1's `credentials` redaction pattern).
+**Evidence:** 15 new authz unit tests + 9 new item121 integration tests, all
+green (16/16 total in that file); item100 9/9 unchanged; item122 7/7 +
+server_authz 3/3 unaffected (checked as a courtesy, out of this workstream's
+touch-points); crash 54/54; fmt/clippy clean (`--all-features --all-targets`).
+Commit `77fab4a`. Stayed entirely off `logical.rs`/`executor.rs`/`parser.rs`
+per the hard boundary with Workstream B. **Process note:** hit a host-level
+disk-full condition mid-session (real usable capacity on this box is ~38 GiB
+despite `df` reporting 252G nominal — the gap is pre-existing platform
+overhead, not something this session's build caused alone, though the
+`target/` dir's ~30 GiB of accumulated per-test-binary debug artifacts *was*
+the proximate trigger); `cargo clean` recovered ~30 GiB and every gate was
+rerun clean afterward. Remaining for Workstream A: A5 (production issuer,
+explicit signing-key config) + A6 (RS256/JWKS).
+
+### 2026-07-31 — Supabase-parity P0 pair (items 121+122 first slices) built via Sonnet agents + shipped to branch
+
+User directed: implement the Supabase-parity P0 pair using Sonnet for implementation,
+Opus orchestrating/reviewing, no ACID/perf compromises. Approach: **seam-first, then
+parallel fan-out.** Step 0 (Sonnet, verified by me): `AuthPrincipal` seam widening the
+RLS identity from `sub`-only to subject+claims+roles, carried to `ExecCtx` but inert —
+crash 54/54, behavior-preserving (`58efa75`). Then two Sonnet worktree agents in
+parallel: **A (item 121 A1/A2)** argon2id credential store + real password login
+(passwordless→verified; unknown/wrong/no-credential all return one 401 with a dummy-hash
+timing-parity verify; manual Debug redacts creds) — `fcd320a`; **B (item 122 B1/B2)**
+`auth.uid()` + real `auth.jwt() ->> 'claim'` in RLS, substituted at injection time,
+fail-closed. Integration review (me) caught a real bug in B: policies with `auth.jwt()`
+returned 0 rows on the LIMIT/**QExpr** path because `apply_rls`'s `policy_sub` substituted
+only `current_user` before the Expr→QExpr conversion — same shape as item-110. Fixed
+(`2a5fe85`): `apply_rls_with_auth(plan,catalog,user,claims)` core + thin `apply_rls` shim;
+`policy_sub` now substitutes auth context too. **All green: item121 7/7, item122 7/7
+(incl. two-tenant isolation + LIMIT/QExpr + fail-closed), item100 9/9, crash 54/54,
+clippy/fmt clean.** Pushed A+B+fix to the branch. Remaining slices (batch 2): A3/A4/A5/A6,
+B3/B4/B5. Studio G-panels spun off to a separate session (`sagarm85/unidb-studio`).
+**Process lessons (logged): run ONE main-tree cargo build at a time (concurrent gate
+builds + agent worktree builds thrashed the target lock and a 25G worktree target filled
+the disk to 98%); reclaim each agent worktree's `target/` immediately after integrating;
+worktree agents share the object store so integrate by committing-in-worktree +
+cherry-pick.** Auth/RLS work stayed off the storage hot path (plan-time substitution,
+control-plane credentials) — ACID/perf intact by construction and by crash-harness proof.
+
+### 2026-07-31 — Supabase-parity backlog filed (items 120–123) + studio G-panels plan
+
+Planning/docs-only session (no engine code). User asked, via a WhatsApp-thread
+screenshot, what unidb still lacks to be "like Supabase" and to file the pending
+work as parallelizable specs. Audited the actual surface across BOTH repos
+(`sagarm85/unidb` + newly-attached `sagarm85/unidb-studio`) rather than trusting
+the README: verified token→RLS IS wired (`sub`→`CurrentUser`→`apply_rls`), that
+`post_auth_login` is passwordless *identification* (no credential verify), that
+storage already ships presign URLs + public/private buckets, and that unidb-studio
+already ships every panel EXCEPT auth/policies/roles/API-docs (their backends don't
+exist). Framing: unidb has the Postgres *security core*; "Supabase" is the BaaS
+layer above it (auth service, `auth.uid()`/`auth.jwt()`/role-in-RLS, auto REST API).
+Filed: **120** umbrella roadmap (workstreams A–I, P0 = auth core + RLS↔token +
+auto-API, 3-wave parallel plan), **121** auth core (A), **122** RLS↔token binding
+(B, folds parked item 112), **123** auto REST API (C). Registered in
+`backlog_index.md` (next→124), added a "Supabase parity" note to Next-up. Matching
+studio plan `docs/AUTH_POLICY_PANELS_PLAN.md` on the studio's mirror branch. Both
+lints green (backlog OK 99 files; docs OK). Nothing implemented — awaiting the
+user's go on which Wave-1 track(s) to build first (P0 critical path = 121 + 122).
+
 ### 2026-07-24 — item 106 Unit 3 (re-rank decode-pushdown) measured + merged
 
 Rebased Unit 3 on current main (8a86b02, post-#210). Same-session before/after on
