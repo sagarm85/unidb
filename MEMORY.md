@@ -485,6 +485,27 @@ be raised with the user directly, not assumed.
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-07-31 — batch-2 tail: I1 rate-limiting + B5 column-level grants shipped (Workstream B complete)
+
+Continued the post-#222 sequential run. **I1** (`5f7917d`): in-memory fixed-window auth
+rate limiter (`src/server/rate_limit.rs`, `Instant`-based, `Arc<Mutex<HashMap>>`) over
+`POST /auth/{login,signup,refresh}` only (keyed by IP+route+optional user); (max+1)th in a
+window → `429 RATE_LIMITED` + `Retry-After`; both 200s and 401s count; `UNIDB_AUTH_RATE_LIMIT`
+/`UNIDB_AUTH_RATE_WINDOW_SECS`. rate-limit tests 5/5, crash 54/54, auth suites unbroken.
+**B5 / item 112** (`df62290`): column-level grants — `GRANT/REVOKE <priv> (cols) ON t`,
+`GrantScope::All|Columns` (legacy grants deserialize as `All` — back-compat), enforced in
+`check_plan_privileges` at PLAN time (pre-execution, zero per-row cost, so no fast path can
+materialize an ungranted column): projection incl. `SELECT *` (requires-all), predicate/
+GROUP BY/ORDER BY/HAVING, QuerySpec join/aggregate, UPDATE targets, INSERT lists, RETURNING;
+**error-not-mask** (ungranted col → PERMISSION_DENIED, never NULL-filled); **policy-column
+exemption** (columns only in RLS-injected predicates need no caller grant); `information_schema.
+columns` filtered per grant; ambiguous unqualified join columns fail closed. item112 11/11,
+item111 5/5, authz 33/33, crash 54/54. **Workstream B (122) is now fully shipped.** Verified
+each by me from clean (`cargo clean` between builds; disk hit 97%). Remaining: **C1 — Wave 2
+auto `/rest/v1` API** (the last queued item; unblocks studio G4), then a fresh PR to main.
+Process: raise Bash `timeout` to 10 min for from-clean gate compiles; kill each agent's stray
+background full-suite run (target-lock) before verifying.
+
 ### 2026-07-31 — PR #222 (items 121 A1–A4 + 122 B1–B4) MERGED to main; A5/A6 shipped to fresh branch
 
 Merged the Supabase-parity auth PR #222 (squash `333f3d1`) into main — main now has the
