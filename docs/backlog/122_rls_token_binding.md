@@ -1,7 +1,7 @@
 # RLS ↔ token binding — auth.uid() / auth.jwt() / roles (Workstream B)
 
 **Type:** Milestone
-**Status:** IN PROGRESS — B1 (`auth.uid()`) + B2 (`auth.jwt() ->> 'claim'`) SHIPPED on
+**Status:** SHIPPED (2026-07-31) — B1 (`auth.uid()`) + B2 (`auth.jwt() ->> 'claim'`) SHIPPED on
 branch `claude/permissions-security-supabase-comparison-ixho2w` (commits `3fb0e04` +
 QExpr-path fix `2a5fe85`; item122 tests 7/7 incl. two-tenant isolation, fail-closed,
 and the LIMIT/QExpr path; crash 54/54). Both fail closed (Null, never Bool(true) —
@@ -10,7 +10,11 @@ item-110 lesson). **B3 (built-in `anon`/`authenticated`/`service_role` roles) + 
 resolved engine-side; `service_role` bypasses RLS on the audited path (item-103); no-`TO`
 policies still apply to all callers (back-compat), `TO`-scoped gated on role intersection,
 exclusively-scoped-and-no-match fails closed; reserved role names rejected. item122 7/7 +
-item122_b3_b4 6/6, crash 54/54. Remaining: B5 column grants (item 112).
+item122_b3_b4 6/6, crash 54/54. **B5 (column-level grants) SHIPPED** (2026-07-31, same
+branch): see item 112 for the full detail — grant model + DDL + `check_plan_privileges`
+column enforcement (incl. QuerySpec join/aggregate shapes, fail-closed on ambiguity) +
+`information_schema.columns` filtering + fast-path audit; item112_column_grants 11/11,
+crash 54/54. Workstream B is now fully shipped.
 
 > Makes the token's *identity, claims, and role* usable inside RLS policies — the
 > Supabase model — instead of only the username. Part of the

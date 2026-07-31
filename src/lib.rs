@@ -1939,6 +1939,35 @@ impl Engine {
                 Self::drop_policy_inner(name, table, &mut cat, &mut ctx)
             }
             // Role store statements (users, roles, grants).
+            AuthStmt::RevokePrivs {
+                privs,
+                table,
+                grantee,
+                columns: Some(_),
+            } => {
+                // Item 112: a column-scoped REVOKE narrowing a grantee who
+                // currently holds the whole table needs the table's full
+                // column list to compute "every column except these" —
+                // `RoleStore` is catalog-agnostic control-plane state (it
+                // never touches `Catalog`), so this Engine method (which
+                // does have catalog access) materializes `All` down to an
+                // explicit `Columns(all)` first. A no-op for a grantee who
+                // is already column-scoped or holds nothing at all — see
+                // `RoleStore::materialize_all_to_columns`.
+                if let Ok(def) = cat_read(&self.catalog).lookup(table) {
+                    let all_cols: Vec<String> = def
+                        .columns
+                        .iter()
+                        .filter(|c| !c.dropped)
+                        .map(|c| c.name.clone())
+                        .collect();
+                    for p in privs {
+                        self.authz
+                            .materialize_all_to_columns(grantee, table, *p, &all_cols)?;
+                    }
+                }
+                self.authz.apply(stmt)
+            }
             other => self.authz.apply(other),
         }
     }
@@ -2008,6 +2037,227 @@ impl Engine {
                 return Err(DbError::PermissionDenied(format!(
                     "{priv_:?} on '{table}' for user '{user}'"
                 )));
+            }
+        }
+        // Item 112: column-level narrowing, layered on top of the table-level
+        // pass above. Runs on the exact same `plan` (parsed from the caller's
+        // own SQL, before RLS injection — see `execute_sql_as_principal`,
+        // whose `parse_sql_cached` result this is) — this is what makes the
+        // policy-column exemption (Step 0) automatic: an RLS-injected policy
+        // predicate is added to a plan *after* this check has already run, so
+        // it is never visited here at all, needing no special-casing.
+        self.check_column_privileges(user, plan)
+    }
+
+    /// Column-level narrowing pass (item 112), run after
+    /// [`Self::check_plan_privileges`]'s table-level loop. Only ever
+    /// **narrows**: when a caller's grant for a given privilege on a table is
+    /// whole-table (`ColumnGrant::All`) or absent (`ColumnGrant::None` — the
+    /// table-level loop above already rejected that case for the privilege
+    /// the *plan itself* requires, e.g. table-level SELECT/UPDATE/INSERT/
+    /// DELETE; a *different* privilege's grant simply being absent, e.g. no
+    /// SELECT at all while running an UPDATE, imposes no NEW restriction
+    /// here either — this engine required no SELECT for UPDATE's WHERE
+    /// clause before item 112 and still doesn't), this pass does nothing —
+    /// so a pre-112 whole-table grantee is unaffected byte-for-byte (the
+    /// item-112 hard constraint: "Whole-table grants ... must be 100%
+    /// back-compat"). A column-scoped grant (`ColumnGrant::Columns`)
+    /// restricts every column reference of that privilege's kind to exactly
+    /// the granted set: assignment/insert targets need column-scoped
+    /// `Update`/`Insert`; every other column reference (WHERE/JOIN ON/GROUP
+    /// BY/HAVING/ORDER BY/projection/RETURNING/UPDATE-SET-RHS) is a *read*
+    /// and is checked against column-scoped `Select` only. `SELECT *` and
+    /// `RETURNING *` are expanded against the catalog first, so a
+    /// column-scoped SELECT grantee must hold every column to use either —
+    /// this is the error-not-mask contract (never silently drops/NULLs a
+    /// column; always a hard `PermissionDenied`).
+    fn check_column_privileges(&self, user: &str, plan: &LogicalPlan) -> Result<()> {
+        use crate::authz::Privilege as P;
+        let cat = cat_read(&self.catalog);
+        match plan {
+            LogicalPlan::Select {
+                table,
+                projection,
+                predicate,
+            } => {
+                if projection.is_empty() {
+                    self.check_all_columns(&cat, user, table, P::Select)?;
+                } else {
+                    for c in projection {
+                        self.check_one_column(user, table, c, P::Select)?;
+                    }
+                }
+                if let Some(pred) = predicate {
+                    let mut cols = std::collections::BTreeSet::new();
+                    crate::sql::logical::collect_expr_columns(pred, &mut cols);
+                    for c in &cols {
+                        self.check_one_column(user, table, c, P::Select)?;
+                    }
+                }
+                Ok(())
+            }
+            LogicalPlan::Insert {
+                table,
+                columns,
+                returning,
+                ..
+            } => {
+                match columns {
+                    Some(cols) => {
+                        for c in cols {
+                            self.check_one_column(user, table, c, P::Insert)?;
+                        }
+                    }
+                    None => self.check_all_columns(&cat, user, table, P::Insert)?,
+                }
+                self.check_returning(&cat, user, table, returning)
+            }
+            LogicalPlan::Update {
+                table,
+                assignments,
+                predicate,
+                returning,
+            } => {
+                for (target, rhs) in assignments {
+                    self.check_one_column(user, table, target, P::Update)?;
+                    let mut cols = std::collections::BTreeSet::new();
+                    crate::sql::logical::collect_expr_columns(rhs, &mut cols);
+                    for c in &cols {
+                        self.check_one_column(user, table, c, P::Select)?;
+                    }
+                }
+                if let Some(pred) = predicate {
+                    let mut cols = std::collections::BTreeSet::new();
+                    crate::sql::logical::collect_expr_columns(pred, &mut cols);
+                    for c in &cols {
+                        self.check_one_column(user, table, c, P::Select)?;
+                    }
+                }
+                self.check_returning(&cat, user, table, returning)
+            }
+            LogicalPlan::Delete {
+                table,
+                predicate,
+                returning,
+            } => {
+                if let Some(pred) = predicate {
+                    let mut cols = std::collections::BTreeSet::new();
+                    crate::sql::logical::collect_expr_columns(pred, &mut cols);
+                    for c in &cols {
+                        self.check_one_column(user, table, c, P::Select)?;
+                    }
+                }
+                self.check_returning(&cat, user, table, returning)
+            }
+            LogicalPlan::Query(spec) | LogicalPlan::Explain { spec, .. } => {
+                for req in crate::sql::query::collect_query_column_reads(spec) {
+                    match req {
+                        crate::sql::query::ColRequirement::Column(t, c) => {
+                            self.check_one_column(user, &t, &c, P::Select)?;
+                        }
+                        crate::sql::query::ColRequirement::AllColumns(t) => {
+                            self.check_all_columns(&cat, user, &t, P::Select)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            LogicalPlan::SetOp { left, right, .. } => {
+                drop(cat); // recursive calls take their own read lock
+                self.check_column_privileges(user, left)?;
+                self.check_column_privileges(user, right)
+            }
+            // Schema DDL is superuser-only (rejected earlier, in
+            // `check_plan_privileges`, before this function is ever reached
+            // for these variants) — no column concept applies.
+            LogicalPlan::CreateTable { .. }
+            | LogicalPlan::CreateIndex { .. }
+            | LogicalPlan::AlterTableAddColumn { .. }
+            | LogicalPlan::AlterTableDropColumn { .. }
+            | LogicalPlan::DropTable { .. }
+            | LogicalPlan::Truncate { .. }
+            | LogicalPlan::Analyze { .. } => Ok(()),
+        }
+    }
+
+    /// `RETURNING` columns are reads (item 112): `None` = no `RETURNING`
+    /// clause (nothing to check); `Some(&[])` = `RETURNING *` (expand
+    /// against the catalog); `Some(cols)` = the named columns.
+    fn check_returning(
+        &self,
+        cat: &Catalog,
+        user: &str,
+        table: &str,
+        returning: &Option<Vec<String>>,
+    ) -> Result<()> {
+        use crate::authz::Privilege as P;
+        match returning {
+            None => Ok(()),
+            Some(cols) if cols.is_empty() => self.check_all_columns(cat, user, table, P::Select),
+            Some(cols) => {
+                for c in cols {
+                    self.check_one_column(user, table, c, P::Select)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Check one named column against `priv_`'s column grant, when (and only
+    /// when) that grant is column-scoped — see
+    /// [`Self::check_column_privileges`]'s doc comment for why an `All`/
+    /// absent grant imposes no restriction here. `information_schema.*` is
+    /// exempt (item 111 filters those rows itself; no grant is required).
+    fn check_one_column(
+        &self,
+        user: &str,
+        table: &str,
+        column: &str,
+        priv_: crate::authz::Privilege,
+    ) -> Result<()> {
+        if crate::sql::information_schema::is_information_schema(table) {
+            return Ok(());
+        }
+        if let crate::authz::ColumnGrant::Columns(set) = self.authz.column_grant(user, table, priv_)
+        {
+            if !set.contains(column) {
+                return Err(DbError::PermissionDenied(format!(
+                    "{priv_:?} on column '{table}.{column}' for user '{user}'"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Check every (non-dropped) column of `table` against `priv_`'s column
+    /// grant — used for `SELECT *`, `RETURNING *`, and an `INSERT` with no
+    /// explicit column list (this engine's `columns: None` means "every
+    /// column, in table-definition order" — see `LogicalPlan::Insert`'s doc
+    /// comment — so a column-scoped INSERT grantee must hold every column to
+    /// omit the list, exactly like `SELECT *`).
+    fn check_all_columns(
+        &self,
+        cat: &Catalog,
+        user: &str,
+        table: &str,
+        priv_: crate::authz::Privilege,
+    ) -> Result<()> {
+        if crate::sql::information_schema::is_information_schema(table) {
+            return Ok(());
+        }
+        if let crate::authz::ColumnGrant::Columns(set) = self.authz.column_grant(user, table, priv_)
+        {
+            let def = cat.lookup(table)?;
+            for c in &def.columns {
+                if c.dropped {
+                    continue;
+                }
+                if !set.contains(&c.name) {
+                    return Err(DbError::PermissionDenied(format!(
+                        "{priv_:?} on column '{table}.{}' for user '{user}'",
+                        c.name
+                    )));
+                }
             }
         }
         Ok(())

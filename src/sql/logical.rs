@@ -150,6 +150,57 @@ fn bind_expr(expr: &mut Expr, params: &[Literal]) -> Result<()> {
     }
 }
 
+/// Collect every unqualified column name `expr` references (item 112) into
+/// `out`, for the single-table `Select`/`Update`/`Delete`/`Insert…RETURNING`
+/// plan shapes — every reference is against the plan's one `table`, so no
+/// qualifier/attribution logic is needed here (contrast the multi-relation
+/// [`crate::sql::query::collect_query_column_reads`], which must resolve
+/// qualifiers against a join tree).
+///
+/// Called on the plan **as parsed from the caller's own SQL** (before RLS
+/// injection — see `check_plan_privileges`'s doc comment), so a column
+/// referenced only inside an RLS-injected policy predicate is never visited
+/// here: the policy-column exemption (item 112 Step 0) falls out of *when*
+/// this is called, not from any special-casing inside it.
+///
+/// `Expr::ColumnSlot` never appears in a plan this function is called on —
+/// it is only ever created by `bind_predicate_columns` in the executor,
+/// which runs strictly after privilege checking.
+pub fn collect_expr_columns(expr: &Expr, out: &mut std::collections::BTreeSet<String>) {
+    match expr {
+        Expr::Column(name) => {
+            out.insert(name.clone());
+        }
+        Expr::Near { column, .. } => {
+            out.insert(column.clone());
+        }
+        Expr::Match { column, query } => {
+            out.insert(column.clone());
+            collect_expr_columns(query, out);
+        }
+        Expr::BinOp { lhs, rhs, .. }
+        | Expr::Arith { lhs, rhs, .. }
+        | Expr::And(lhs, rhs)
+        | Expr::Or(lhs, rhs) => {
+            collect_expr_columns(lhs, out);
+            collect_expr_columns(rhs, out);
+        }
+        Expr::JsonExtract { expr, .. } | Expr::JsonExtractText { expr, .. } => {
+            collect_expr_columns(expr, out);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            collect_expr_columns(expr, out);
+            collect_expr_columns(pattern, out);
+        }
+        Expr::IsNull { expr, .. } => collect_expr_columns(expr, out),
+        Expr::ColumnSlot(_)
+        | Expr::Literal(_)
+        | Expr::CurrentUser
+        | Expr::AuthUid
+        | Expr::AuthClaim(_) => {}
+    }
+}
+
 /// Render an exact decimal `(unscaled_value, scale)` as canonical decimal
 /// text (`(990, 2)` -> `"9.90"`, `(-5, 0)` -> `"-5"`). Used by the JSON/DTO
 /// boundary layers so a `DECIMAL` crosses into JSON as a string, never an

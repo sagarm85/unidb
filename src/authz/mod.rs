@@ -241,6 +241,94 @@ impl Privilege {
     }
 }
 
+/// Column scope of one granted privilege (item 112). `All` is the pre-112
+/// whole-table grant (every column, including columns added later by
+/// `ALTER TABLE ADD COLUMN` — matches Postgres and this engine's own
+/// pre-112 behavior); `Columns` narrows to exactly the listed set.
+///
+/// **Semantics (must match Postgres exactly — see the item-112 backlog
+/// doc):** holding table-level (`All`) grants every column; a column-scoped
+/// grant admits only its listed columns and everything else is a hard
+/// `PERMISSION_DENIED`, never a silently NULL-filled/omitted column.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GrantScope {
+    /// Whole-table — every column, present and future.
+    All,
+    /// Only these columns.
+    Columns(BTreeSet<String>),
+}
+
+/// The resolved column-level access a caller has for one `(table, privilege)`
+/// pair (item 112), after transitively resolving role membership exactly
+/// like [`RoleStore::has_privilege`] — returned by [`RoleStore::column_grant`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ColumnGrant {
+    /// No grant of this privilege at all (through any role).
+    None,
+    /// Whole-table — every column. Also returned for a superuser.
+    All,
+    /// Only these columns (the union across every grantee path that resolved
+    /// to a column-scoped — never whole-table — grant).
+    Columns(BTreeSet<String>),
+}
+
+/// One grantee's per-privilege grants on one table:
+/// `Privilege -> GrantScope`. A thin newtype (rather than a bare
+/// `BTreeMap<Privilege, GrantScope>`) purely so it can carry a custom
+/// [`Deserialize`] impl (below) that also accepts the **pre-112 on-disk
+/// shape** — a bare JSON array of privilege names, e.g. `["Select",
+/// "Insert"]` — reading every entry as `GrantScope::All`. This is the
+/// back-compat contract: an existing `roles.json` written before item 112
+/// deserializes unchanged, with every existing grant behaving exactly as
+/// before (whole-table). No `FORMAT_VERSION`/data migration needed — see
+/// the module doc's "no data migration should be needed" note.
+#[derive(Clone, Debug, Default, Serialize)]
+struct TablePrivs(BTreeMap<Privilege, GrantScope>);
+
+impl std::ops::Deref for TablePrivs {
+    type Target = BTreeMap<Privilege, GrantScope>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for TablePrivs {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for TablePrivs {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // `roles.json` is always JSON (see `RoleStore::open`/`persist`), so
+        // shelling out to `serde_json::Value` to distinguish the legacy
+        // array shape from the item-112 object shape is exact, not a
+        // best-effort sniff — unlike the page/WAL format (D9), this is
+        // control-plane metadata where `serde_json` is already the module's
+        // documented choice (see the module doc).
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match &value {
+            serde_json::Value::Array(_) => {
+                let privs: BTreeSet<Privilege> =
+                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                Ok(TablePrivs(
+                    privs.into_iter().map(|p| (p, GrantScope::All)).collect(),
+                ))
+            }
+            serde_json::Value::Object(_) => {
+                let map: BTreeMap<Privilege, GrantScope> =
+                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                Ok(TablePrivs(map))
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "invalid table-grant shape (expected a privilege array or object): {other}"
+            ))),
+        }
+    }
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct AuthState {
     /// username → superuser?
@@ -248,8 +336,11 @@ struct AuthState {
     roles: BTreeSet<String>,
     /// grantee (user or role) → roles it is a member of.
     memberships: BTreeMap<String, BTreeSet<String>>,
-    /// grantee → table → privileges.
-    table_grants: BTreeMap<String, BTreeMap<String, BTreeSet<Privilege>>>,
+    /// grantee → table → privilege → column scope (item 112). Was `grantee →
+    /// table → {priv}` pre-112; [`TablePrivs`]'s custom `Deserialize` reads
+    /// that legacy shape as every privilege scoped `GrantScope::All` — see
+    /// its doc comment.
+    table_grants: BTreeMap<String, BTreeMap<String, TablePrivs>>,
     /// username → argon2id PHC hash string (item 121, A1). Never the
     /// plaintext. `#[serde(default)]` so a pre-A1 `roles.json` (no
     /// `credentials` key) deserializes with an empty map — no
@@ -380,11 +471,25 @@ pub enum AuthStmt {
         privs: Vec<Privilege>,
         table: String,
         grantee: String,
+        /// `GRANT <priv,..> (col, ...) ON t TO r` (item 112): `None` is the
+        /// pre-112 whole-table grammar (implies every column, unchanged
+        /// behavior); `Some(cols)` narrows every privilege in `privs` to
+        /// exactly these columns. A repeated `GRANT` only ever widens (never
+        /// narrows) an existing grant — see `RoleStore::apply`.
+        columns: Option<Vec<String>>,
     },
     RevokePrivs {
         privs: Vec<Privilege>,
         table: String,
         grantee: String,
+        /// `REVOKE <priv,..> (col, ...) ON t FROM r` (item 112): `None` is a
+        /// table-level revoke — clears the privilege entirely (pre-112
+        /// behavior, unchanged). `Some(cols)` narrows: removes exactly these
+        /// columns from the grantee's existing column-scoped grant (or from
+        /// an existing whole-table grant, via `Engine::exec_auth_stmt`
+        /// materializing it to an explicit column set first — see
+        /// `RoleStore::materialize_all_to_columns`).
+        columns: Option<Vec<String>>,
     },
     GrantRole {
         role: String,
@@ -427,21 +532,25 @@ impl std::fmt::Debug for AuthStmt {
                 privs,
                 table,
                 grantee,
+                columns,
             } => f
                 .debug_struct("GrantPrivs")
                 .field("privs", privs)
                 .field("table", table)
                 .field("grantee", grantee)
+                .field("columns", columns)
                 .finish(),
             AuthStmt::RevokePrivs {
                 privs,
                 table,
                 grantee,
+                columns,
             } => f
                 .debug_struct("RevokePrivs")
                 .field("privs", privs)
                 .field("table", table)
                 .field("grantee", grantee)
+                .field("columns", columns)
                 .finish(),
             AuthStmt::GrantRole { role, grantee } => f
                 .debug_struct("GrantRole")
@@ -646,13 +755,54 @@ impl RoleStore {
         Ok(())
     }
 
-    /// Whether `user` holds `priv` on `table`, resolving role membership
-    /// transitively. Superusers hold every privilege.
+    /// Whether `user` holds `priv` on `table` **at all** — `true` for both a
+    /// whole-table grant and a column-scoped grant with at least one column
+    /// (item 112: this existence check is deliberately coarser than column
+    /// enforcement, matching Postgres's own `has_table_privilege` and this
+    /// engine's pre-112 callers — `information_schema`'s item-111 ANY-privilege
+    /// table visibility, `check_table_grant`'s REST bulk-route gate, and
+    /// `check_plan_privileges`'s existing table-level pass all keep their
+    /// exact pre-112 meaning: "does this caller have some access", not "does
+    /// this caller have unrestricted access"). Column-level narrowing is a
+    /// separate, additive check — see [`Self::column_grant`]. Resolves role
+    /// membership transitively. Superusers hold every privilege.
     pub fn has_privilege(&self, user: &str, table: &str, priv_: Privilege) -> bool {
         let st = self.lock();
         if st.users.get(user).copied().unwrap_or(false) {
             return true;
         }
+        !matches!(
+            Self::resolve_column_grant(&st, user, table, priv_),
+            ColumnGrant::None
+        )
+    }
+
+    /// The resolved column-level grant `user` holds for `priv_` on `table`
+    /// (item 112), transitively through role membership exactly like
+    /// [`Self::has_privilege`]. A superuser resolves to `ColumnGrant::All`
+    /// unconditionally (mirrors `has_privilege`'s superuser short-circuit).
+    ///
+    /// Multiple grantee paths (the user's own direct grant, plus every role
+    /// reachable transitively) are **unioned**, matching Postgres: if any
+    /// path grants the whole table, the result is `All` (a table-level grant
+    /// through one role is never narrowed by a column-scoped grant through
+    /// another); otherwise every column-scoped path's columns are unioned.
+    pub fn column_grant(&self, user: &str, table: &str, priv_: Privilege) -> ColumnGrant {
+        let st = self.lock();
+        if st.users.get(user).copied().unwrap_or(false) {
+            return ColumnGrant::All;
+        }
+        Self::resolve_column_grant(&st, user, table, priv_)
+    }
+
+    /// Shared resolution behind [`Self::has_privilege`]/[`Self::column_grant`]
+    /// (not superuser-aware — callers check that first).
+    fn resolve_column_grant(
+        st: &AuthState,
+        user: &str,
+        table: &str,
+        priv_: Privilege,
+    ) -> ColumnGrant {
         // Collect the user + every role reachable through membership.
         let mut grantees: HashSet<String> = HashSet::new();
         let mut stack = vec![user.to_string()];
@@ -666,13 +816,27 @@ impl RoleStore {
                 }
             }
         }
-        grantees.iter().any(|g| {
-            st.table_grants
+        let mut saw_any = false;
+        let mut cols: BTreeSet<String> = BTreeSet::new();
+        for g in &grantees {
+            if let Some(scope) = st
+                .table_grants
                 .get(g)
                 .and_then(|t| t.get(table))
-                .map(|p| p.contains(&priv_))
-                .unwrap_or(false)
-        })
+                .and_then(|p| p.get(&priv_))
+            {
+                saw_any = true;
+                match scope {
+                    GrantScope::All => return ColumnGrant::All,
+                    GrantScope::Columns(set) => cols.extend(set.iter().cloned()),
+                }
+            }
+        }
+        if saw_any {
+            ColumnGrant::Columns(cols)
+        } else {
+            ColumnGrant::None
+        }
     }
 
     /// Resolve the caller's **effective** roles (item 122, B3) — the
@@ -784,15 +948,21 @@ impl RoleStore {
         out
     }
 
-    /// Snapshot of all grants as `(grantee, table, privilege)` triples
-    /// (item-24 Z5: `unidb_catalog.grants`).
-    pub fn grants(&self) -> Vec<(String, String, Privilege)> {
+    /// Snapshot of all grants as `(grantee, table, privilege, columns)`
+    /// tuples (item-24 Z5 + item 112: `unidb_catalog.grants`). `columns` is
+    /// `None` for a whole-table grant, `Some(sorted columns)` for a
+    /// column-scoped one.
+    pub fn grants(&self) -> Vec<(String, String, Privilege, Option<Vec<String>>)> {
         let st = self.lock();
         let mut out = Vec::new();
         for (grantee, tables) in &st.table_grants {
-            for (table, privs) in tables {
-                for p in privs {
-                    out.push((grantee.clone(), table.clone(), *p));
+            for (table, privs) in tables.iter() {
+                for (p, scope) in privs.iter() {
+                    let cols = match scope {
+                        GrantScope::All => None,
+                        GrantScope::Columns(set) => Some(set.iter().cloned().collect()),
+                    };
+                    out.push((grantee.clone(), table.clone(), *p, cols));
                 }
             }
         }
@@ -800,7 +970,11 @@ impl RoleStore {
     }
 
     /// Table-level grants for a user, collected as `(table, [privilege_names])`.
-    /// Used by `GET /auth/whoami` (item 100).
+    /// Used by `GET /auth/whoami` (item 100). Lists a privilege the user
+    /// holds on the table regardless of column scope (item 112) — same
+    /// "holds it at all" semantics as [`Self::has_privilege`]; whoami is not
+    /// the place callers learn *which* columns (see `unidb_catalog.grants`
+    /// or `information_schema.columns` for that).
     pub fn table_grants_for(&self, user: &str) -> Vec<(String, Vec<String>)> {
         let st = self.lock();
         match st.table_grants.get(user) {
@@ -809,12 +983,44 @@ impl RoleStore {
                 .map(|(tbl, privs)| {
                     (
                         tbl.clone(),
-                        privs.iter().map(|p| p.as_str().to_string()).collect(),
+                        privs.keys().map(|p| p.as_str().to_string()).collect(),
                     )
                 })
                 .collect(),
             None => Vec::new(),
         }
+    }
+
+    /// Item 112: if `grantee`'s grant of `priv_` on `table` is currently
+    /// whole-table (`GrantScope::All`), replace it with an explicit
+    /// `Columns(all_columns)` — a no-op if the grant is already column-scoped
+    /// or absent. Used by `Engine::exec_auth_stmt` (which has catalog access,
+    /// unlike this control-plane-only store) immediately before applying a
+    /// column-scoped `REVOKE` against a grantee who currently holds the
+    /// whole table, so the revoke has an explicit column set to narrow —
+    /// `RoleStore::apply`'s `RevokePrivs` handling only ever narrows an
+    /// existing `Columns` scope, it never has catalog access to compute
+    /// "every column except these" on its own.
+    pub fn materialize_all_to_columns(
+        &self,
+        grantee: &str,
+        table: &str,
+        priv_: Privilege,
+        all_columns: &[String],
+    ) -> Result<()> {
+        let mut st = self.lock();
+        if let Some(scope) = st
+            .table_grants
+            .get_mut(grantee)
+            .and_then(|t| t.get_mut(table))
+            .and_then(|p| p.get_mut(&priv_))
+        {
+            if matches!(scope, GrantScope::All) {
+                *scope = GrantScope::Columns(all_columns.iter().cloned().collect());
+                return self.persist(&st);
+            }
+        }
+        Ok(())
     }
 
     /// Roles a user belongs to (direct memberships only; not transitive).
@@ -890,6 +1096,7 @@ impl RoleStore {
                 privs,
                 table,
                 grantee,
+                columns,
             } => {
                 Self::require_grantee(&st, grantee)?;
                 let entry = st
@@ -899,13 +1106,37 @@ impl RoleStore {
                     .entry(table.clone())
                     .or_default();
                 for p in privs {
-                    entry.insert(*p);
+                    // item 112: GRANT only ever widens, never narrows, an
+                    // existing grant (Postgres semantics — REVOKE is the
+                    // only narrowing operation). A bare (whole-table)
+                    // `GRANT` always sets/keeps `All`; a column-scoped
+                    // `GRANT` unions its columns into an existing
+                    // column-scoped grant, or is a no-op widen-preserving
+                    // step against an existing `All` grant.
+                    match columns {
+                        None => {
+                            entry.insert(*p, GrantScope::All);
+                        }
+                        Some(cols) => match entry.get_mut(p) {
+                            Some(GrantScope::All) => {} // already every column — leave it
+                            Some(GrantScope::Columns(set)) => {
+                                set.extend(cols.iter().cloned());
+                            }
+                            None => {
+                                entry.insert(
+                                    *p,
+                                    GrantScope::Columns(cols.iter().cloned().collect()),
+                                );
+                            }
+                        },
+                    }
                 }
             }
             AuthStmt::RevokePrivs {
                 privs,
                 table,
                 grantee,
+                columns,
             } => {
                 if let Some(t) = st
                     .table_grants
@@ -913,7 +1144,35 @@ impl RoleStore {
                     .and_then(|g| g.get_mut(table))
                 {
                     for p in privs {
-                        t.remove(p);
+                        match columns {
+                            // Table-level revoke clears the privilege
+                            // entirely, regardless of column scope (item 112
+                            // spec: "table-level revoke clears") — pre-112
+                            // behavior, unchanged.
+                            None => {
+                                t.remove(p);
+                            }
+                            Some(cols) => match t.get_mut(p) {
+                                // A whole-table grant cannot be narrowed here
+                                // (this store has no catalog access to
+                                // compute "every column except these") — the
+                                // caller (`Engine::exec_auth_stmt`) must call
+                                // `materialize_all_to_columns` first so this
+                                // arm never actually observes `All` in
+                                // practice; left as a safe (access-preserving,
+                                // not access-widening) no-op if it ever does.
+                                Some(GrantScope::All) => {}
+                                Some(GrantScope::Columns(set)) => {
+                                    for c in cols {
+                                        set.remove(c);
+                                    }
+                                    if set.is_empty() {
+                                        t.remove(p);
+                                    }
+                                }
+                                None => {} // nothing granted — silent no-op, matches table-level revoke-of-nothing
+                            },
+                        }
                     }
                 }
             }
@@ -1255,21 +1514,25 @@ fn parse_grant_revoke(toks: &[&str], grant: bool) -> Result<AuthStmt> {
     let grantee = ident(toks.get(conn_pos + 1))?;
 
     if let Some(on_pos) = upper.iter().position(|t| t == "ON") {
-        // Table privileges: tokens[1..on_pos] are the privilege list.
+        // Table privileges: tokens[1..on_pos] are the privilege list, plus
+        // (item 112) an optional parenthesised column list, e.g.
+        // `SELECT (email, name)` or `SELECT, UPDATE (a, b)`.
         let table = ident(toks.get(on_pos + 1))?;
         let priv_str: String = toks[1..on_pos].join(" ");
-        let privs = parse_priv_list(&priv_str)?;
+        let (privs, columns) = parse_priv_section(&priv_str)?;
         Ok(if grant {
             AuthStmt::GrantPrivs {
                 privs,
                 table,
                 grantee,
+                columns,
             }
         } else {
             AuthStmt::RevokePrivs {
                 privs,
                 table,
                 grantee,
+                columns,
             }
         })
     } else {
@@ -1280,6 +1543,47 @@ fn parse_grant_revoke(toks: &[&str], grant: bool) -> Result<AuthStmt> {
         } else {
             AuthStmt::RevokeRole { role, grantee }
         })
+    }
+}
+
+/// Parse the privilege-list segment between the leading `GRANT`/`REVOKE`
+/// keyword and the `ON` keyword: `<priv,..|ALL> [(<col>, ...)]` (item 112).
+/// The optional parenthesised column list narrows (or, for a GRANT, is the
+/// scope of) every privilege in the list identically — Postgres allows a
+/// distinct column list per privilege via repeated grant clauses (`GRANT
+/// SELECT (a), UPDATE (b) ON ...`); unidb's hand-rolled grammar instead
+/// covers the single-privilege-group case the backlog spec and every
+/// acceptance scenario actually exercise (`GRANT SELECT (a, b) ON ...`,
+/// `GRANT UPDATE (c) ON ...`). Returns `columns: None` when no parenthesised
+/// list is present (the pre-112 whole-table grammar, unchanged).
+fn parse_priv_section(s: &str) -> Result<(Vec<Privilege>, Option<Vec<String>>)> {
+    let s = s.trim();
+    match s.find('(') {
+        None => Ok((parse_priv_list(s)?, None)),
+        Some(open) => {
+            let priv_part = s[..open].trim();
+            let rest = &s[open + 1..];
+            let close = rest
+                .find(')')
+                .ok_or_else(|| DbError::SqlParse("GRANT/REVOKE: unclosed column list".into()))?;
+            let trailing = rest[close + 1..].trim();
+            if !trailing.is_empty() {
+                return Err(DbError::SqlParse(
+                    "GRANT/REVOKE: unexpected tokens after column list".into(),
+                ));
+            }
+            let cols: Vec<String> = rest[..close]
+                .split(',')
+                .map(|c| c.trim().trim_matches('"').to_string())
+                .filter(|c| !c.is_empty())
+                .collect();
+            if cols.is_empty() {
+                return Err(DbError::SqlParse(
+                    "GRANT/REVOKE: column list cannot be empty".into(),
+                ));
+            }
+            Ok((parse_priv_list(priv_part)?, Some(cols)))
+        }
     }
 }
 
@@ -1321,7 +1625,8 @@ mod tests {
             Some(AuthStmt::GrantPrivs {
                 privs: vec![Privilege::Select, Privilege::Insert],
                 table: "accounts".into(),
-                grantee: "bob".into()
+                grantee: "bob".into(),
+                columns: None,
             })
         );
         assert_eq!(
@@ -1336,7 +1641,8 @@ mod tests {
             Some(AuthStmt::RevokePrivs {
                 privs: Privilege::all().to_vec(),
                 table: "accounts".into(),
-                grantee: "bob".into()
+                grantee: "bob".into(),
+                columns: None,
             })
         );
         assert!(parse_auth_stmt("SELECT * FROM t").unwrap().is_none());
@@ -1361,6 +1667,7 @@ mod tests {
                 privs: vec![Privilege::Select],
                 table: "accounts".into(),
                 grantee: "analyst".into(),
+                columns: None,
             })
             .unwrap();
         // Bob has nothing yet.
@@ -1894,5 +2201,303 @@ mod tests {
             store.effective_roles(None, &BTreeMap::new()),
             vec![ANON_ROLE.to_string()]
         );
+    }
+
+    // ── item 112: column-level grants ──────────────────────────────────────
+
+    #[test]
+    fn parse_grant_with_column_list() {
+        let stmt = parse_auth_stmt("GRANT SELECT (email, name) ON users TO support")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stmt,
+            AuthStmt::GrantPrivs {
+                privs: vec![Privilege::Select],
+                table: "users".into(),
+                grantee: "support".into(),
+                columns: Some(vec!["email".into(), "name".into()]),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_revoke_with_column_list() {
+        let stmt = parse_auth_stmt("REVOKE SELECT (email) ON users FROM support")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stmt,
+            AuthStmt::RevokePrivs {
+                privs: vec![Privilege::Select],
+                table: "users".into(),
+                grantee: "support".into(),
+                columns: Some(vec!["email".into()]),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_grant_column_list_multi_privilege() {
+        // A single column list applies uniformly to every privilege in the
+        // list (documented grammar simplification — see `parse_priv_section`).
+        let stmt = parse_auth_stmt("GRANT SELECT, UPDATE (a, b) ON t TO r")
+            .unwrap()
+            .unwrap();
+        match stmt {
+            AuthStmt::GrantPrivs { privs, columns, .. } => {
+                assert_eq!(privs, vec![Privilege::Select, Privilege::Update]);
+                assert_eq!(columns, Some(vec!["a".into(), "b".into()]));
+            }
+            _ => panic!("expected GrantPrivs"),
+        }
+    }
+
+    #[test]
+    fn parse_grant_column_list_rejects_empty_and_unclosed() {
+        assert!(parse_auth_stmt("GRANT SELECT () ON t TO r").is_err());
+        assert!(parse_auth_stmt("GRANT SELECT (a, b ON t TO r").is_err());
+    }
+
+    #[test]
+    fn column_grant_narrows_and_widens_correctly() {
+        use ColumnGrant as CG;
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        store
+            .apply(&AuthStmt::CreateUser {
+                name: "u".into(),
+                superuser: false,
+                password: None,
+            })
+            .unwrap();
+
+        // No grant at all yet.
+        assert_eq!(store.column_grant("u", "t", Privilege::Select), CG::None);
+        assert!(!store.has_privilege("u", "t", Privilege::Select));
+
+        // Column-scoped GRANT.
+        store
+            .apply(&AuthStmt::GrantPrivs {
+                privs: vec![Privilege::Select],
+                table: "t".into(),
+                grantee: "u".into(),
+                columns: Some(vec!["a".into(), "b".into()]),
+            })
+            .unwrap();
+        assert_eq!(
+            store.column_grant("u", "t", Privilege::Select),
+            CG::Columns(["a".to_string(), "b".to_string()].into_iter().collect())
+        );
+        // Existence check still true (item 112: coarser than column check).
+        assert!(store.has_privilege("u", "t", Privilege::Select));
+
+        // A second column-scoped GRANT unions (never narrows).
+        store
+            .apply(&AuthStmt::GrantPrivs {
+                privs: vec![Privilege::Select],
+                table: "t".into(),
+                grantee: "u".into(),
+                columns: Some(vec!["c".into()]),
+            })
+            .unwrap();
+        assert_eq!(
+            store.column_grant("u", "t", Privilege::Select),
+            CG::Columns(
+                ["a".to_string(), "b".to_string(), "c".to_string()]
+                    .into_iter()
+                    .collect()
+            )
+        );
+
+        // A whole-table GRANT explicitly widens to All.
+        store
+            .apply(&AuthStmt::GrantPrivs {
+                privs: vec![Privilege::Select],
+                table: "t".into(),
+                grantee: "u".into(),
+                columns: None,
+            })
+            .unwrap();
+        assert_eq!(store.column_grant("u", "t", Privilege::Select), CG::All);
+
+        // A column-scoped GRANT on top of an existing All grant is a no-op
+        // (GRANT never narrows).
+        store
+            .apply(&AuthStmt::GrantPrivs {
+                privs: vec![Privilege::Select],
+                table: "t".into(),
+                grantee: "u".into(),
+                columns: Some(vec!["a".into()]),
+            })
+            .unwrap();
+        assert_eq!(store.column_grant("u", "t", Privilege::Select), CG::All);
+
+        // Column-scoped REVOKE narrows a column-scoped grant.
+        store
+            .apply(&AuthStmt::RevokePrivs {
+                privs: vec![Privilege::Select],
+                table: "t".into(),
+                grantee: "u".into(),
+                columns: None,
+            })
+            .unwrap();
+        store
+            .apply(&AuthStmt::GrantPrivs {
+                privs: vec![Privilege::Select],
+                table: "t".into(),
+                grantee: "u".into(),
+                columns: Some(vec!["a".into(), "b".into()]),
+            })
+            .unwrap();
+        store
+            .apply(&AuthStmt::RevokePrivs {
+                privs: vec![Privilege::Select],
+                table: "t".into(),
+                grantee: "u".into(),
+                columns: Some(vec!["a".into()]),
+            })
+            .unwrap();
+        assert_eq!(
+            store.column_grant("u", "t", Privilege::Select),
+            CG::Columns(["b".to_string()].into_iter().collect())
+        );
+
+        // Revoking the last remaining column clears the privilege entirely
+        // (no dangling "granted but zero columns" state).
+        store
+            .apply(&AuthStmt::RevokePrivs {
+                privs: vec![Privilege::Select],
+                table: "t".into(),
+                grantee: "u".into(),
+                columns: Some(vec!["b".into()]),
+            })
+            .unwrap();
+        assert_eq!(store.column_grant("u", "t", Privilege::Select), CG::None);
+        assert!(!store.has_privilege("u", "t", Privilege::Select));
+
+        // Table-level revoke clears regardless of scope.
+        store
+            .apply(&AuthStmt::GrantPrivs {
+                privs: vec![Privilege::Select],
+                table: "t".into(),
+                grantee: "u".into(),
+                columns: Some(vec!["a".into()]),
+            })
+            .unwrap();
+        store
+            .apply(&AuthStmt::RevokePrivs {
+                privs: vec![Privilege::Select],
+                table: "t".into(),
+                grantee: "u".into(),
+                columns: None,
+            })
+            .unwrap();
+        assert_eq!(store.column_grant("u", "t", Privilege::Select), CG::None);
+    }
+
+    #[test]
+    fn column_grant_resolves_transitively_through_roles() {
+        use ColumnGrant as CG;
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        store
+            .apply(&AuthStmt::CreateUser {
+                name: "bob".into(),
+                superuser: false,
+                password: None,
+            })
+            .unwrap();
+        store
+            .apply(&AuthStmt::CreateRole("support".into()))
+            .unwrap();
+        store
+            .apply(&AuthStmt::GrantPrivs {
+                privs: vec![Privilege::Select],
+                table: "users".into(),
+                grantee: "support".into(),
+                columns: Some(vec!["email".into(), "name".into()]),
+            })
+            .unwrap();
+        store
+            .apply(&AuthStmt::GrantRole {
+                role: "support".into(),
+                grantee: "bob".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            store.column_grant("bob", "users", Privilege::Select),
+            CG::Columns(
+                ["email".to_string(), "name".to_string()]
+                    .into_iter()
+                    .collect()
+            )
+        );
+    }
+
+    #[test]
+    fn superuser_column_grant_is_all() {
+        use ColumnGrant as CG;
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        store
+            .apply(&AuthStmt::CreateUser {
+                name: "root".into(),
+                superuser: true,
+                password: None,
+            })
+            .unwrap();
+        assert_eq!(
+            store.column_grant("root", "anything", Privilege::Select),
+            CG::All
+        );
+    }
+
+    #[test]
+    fn legacy_whole_table_grant_json_deserializes_as_all() {
+        // Simulates a pre-112 `roles.json`: `table_grants` values are a bare
+        // JSON array of privilege names, e.g. `["Select","Insert"]`, not the
+        // item-112 `{priv: scope}` object. Back-compat contract: this must
+        // deserialize as if every listed privilege were `GrantScope::All`,
+        // with no data migration.
+        let dir = tempdir().unwrap();
+        let legacy = serde_json::json!({
+            "users": {"bob": false},
+            "roles": [],
+            "memberships": {},
+            "table_grants": {
+                "bob": {
+                    "accounts": ["Select", "Insert"]
+                }
+            }
+        });
+        std::fs::write(
+            dir.path().join("roles.json"),
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        assert!(store.has_privilege("bob", "accounts", Privilege::Select));
+        assert!(store.has_privilege("bob", "accounts", Privilege::Insert));
+        assert!(!store.has_privilege("bob", "accounts", Privilege::Update));
+        assert_eq!(
+            store.column_grant("bob", "accounts", Privilege::Select),
+            ColumnGrant::All
+        );
+
+        // A round-trip (re-persist under item-112 logic, then reopen) upgrades
+        // the on-disk shape but preserves behavior — no explicit migration
+        // step required by an operator.
+        store
+            .apply(&AuthStmt::GrantPrivs {
+                privs: vec![Privilege::Delete],
+                table: "accounts".into(),
+                grantee: "bob".into(),
+                columns: None,
+            })
+            .unwrap();
+        let store2 = RoleStore::open(dir.path()).unwrap();
+        assert!(store2.has_privilege("bob", "accounts", Privilege::Select));
+        assert!(store2.has_privilege("bob", "accounts", Privilege::Delete));
     }
 }

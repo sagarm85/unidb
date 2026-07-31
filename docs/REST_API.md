@@ -1152,6 +1152,47 @@ REVOKE ALL ON orders FROM analyst;
 A non-superuser executing a SQL statement on a table for which they lack the corresponding
 privilege receives `403 PERMISSION_DENIED`.
 
+#### Column-level grants (item 112)
+
+A column list **narrows** a table-level grant to exactly those columns —
+holding table-level `SELECT` (the forms above) still implies every column,
+including columns added later by `ALTER TABLE ADD COLUMN`; this is
+unaffected by column-level grants and needs no migration.
+
+```sql
+-- Grant SELECT on only two columns (e.g. hide password_hash from support)
+GRANT SELECT (email, name) ON users TO support;
+
+-- Grant UPDATE on only one column
+GRANT UPDATE (status) ON tickets TO agent;
+
+-- A single column list applies to every privilege named alongside it
+GRANT SELECT, UPDATE (a, b) ON t TO r;
+
+-- Column-scoped REVOKE narrows the existing grant (removes just these
+-- columns); a table-level REVOKE (no column list) still clears the
+-- privilege entirely, regardless of column scope.
+REVOKE SELECT (email) ON users FROM support;
+```
+
+Once a grantee's privilege on a table is column-scoped, every reference to a
+column of that kind — `SELECT` list, `WHERE`/`JOIN ON`/`GROUP BY`/`HAVING`/
+`ORDER BY` predicates (checked as reads), `UPDATE` `SET` targets (checked as
+writes) and their right-hand-side expressions (checked as reads), `INSERT`
+column lists (writes), and `RETURNING` columns (reads) — is checked against
+the granted column set. **`SELECT *` (and `RETURNING *`) requires holding
+every column** — a column-scoped grantee who doesn't gets `403
+PERMISSION_DENIED` naming the missing column, never a silently NULL-filled or
+dropped column. A column referenced only inside an RLS policy predicate
+(never in the caller's own SQL) is exempt, matching Postgres — policy
+evaluation is not subject to the caller's own column grants.
+
+`information_schema.columns` reflects a column-scoped grantee's `SELECT`
+grant: only the granted columns are listed (with `ordinal_position` still
+reflecting the column's real position in the table, not a renumbering).
+`unidb_catalog.grants` gains a `columns` column: `"ALL"` for a whole-table
+grant, else a comma-joined list of exactly the granted columns.
+
 #### Row-level security (RLS) policies
 
 ```sql

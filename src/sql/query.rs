@@ -18,6 +18,8 @@
 //! matches only — the single-table path is untouched, so the 258 pre-P4 tests
 //! and the merge boundary stay clean.
 
+use std::collections::{BTreeMap, HashSet};
+
 use serde::{Deserialize, Serialize};
 
 use crate::sql::logical::{CmpOp, Expr, Literal};
@@ -860,4 +862,312 @@ fn qualify_policy(policy: Expr, qualifier: &str) -> QExpr {
             QExpr::Literal(Literal::Null)
         }
     }
+}
+
+// ─── item 112: column-reference extraction for privilege enforcement ───────
+//
+// `check_plan_privileges` (`lib.rs`) needs, for every `LogicalPlan::Query` /
+// `Explain` shape, the set of `(table, column)` pairs the caller's *own* SQL
+// reads — projection (incl. `*`/`t.*` wildcards), WHERE, JOIN `ON`, GROUP BY,
+// HAVING, ORDER BY, and every nested subquery (CTEs, derived tables,
+// `EXISTS`/`IN (subquery)`/scalar subqueries, each recursed into
+// independently since a subquery's own base tables need their own grant
+// check). Called on the plan as parsed from the caller's SQL, before RLS
+// injection (`apply_rls_with_auth` runs later, over a value this function
+// never sees) — so a column referenced only inside an RLS-injected policy
+// predicate is naturally exempt, matching Postgres's "policy evaluation is
+// exempt from the caller's own column grants" rule (item 112 Step 0).
+
+/// One privilege-relevant column read produced while walking a [`QuerySpec`]
+/// (item 112). `Query`/`Explain` are always read-only shapes (INSERT/UPDATE/
+/// DELETE never carry a `QuerySpec`), so every requirement here is a SELECT
+/// read — the caller (`lib.rs`) checks each against the caller's column-scoped
+/// SELECT grant, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColRequirement {
+    /// A specific named column of `table` was referenced.
+    Column(String, String),
+    /// Every column of `table` was referenced (`SELECT *` / `t.*`). Query.rs
+    /// has no catalog access, so the caller must expand this against the
+    /// catalog before checking column grants.
+    AllColumns(String),
+}
+
+/// Fail-closed scope state threaded through nested-subquery walks (item 112).
+/// Real SQL scoping would let an inner query's *own* FROM shadow an outer
+/// correlated reference and resolve an unqualified name only against tables
+/// that actually declare it; this module has no catalog access to do that
+/// precisely, so it deliberately over-approximates by **accumulating**
+/// (never discarding) ancestor tables into the ambiguity fallback — a
+/// superset of the true visible set only ever makes the check *more*
+/// conservative, never less safe (the item-112 hard constraint: "any
+/// ambiguity resolves to deny, never widen access").
+#[derive(Default, Clone)]
+struct ColScope {
+    /// alias/table-name -> `Some(real table)` for a real base table it
+    /// resolves to, `None` for a known CTE/derived-table alias (its own
+    /// definition is walked independently — never attributed again here).
+    qualifiers: BTreeMap<String, Option<String>>,
+    /// Every real base table reachable unqualified at this nesting level —
+    /// this level's own FROM tables plus every ancestor's. Used only as the
+    /// fail-closed fallback for an unqualified or unrecognised-qualifier
+    /// reference; `SELECT *` expansion uses this spec's own tables only (see
+    /// `collect_scoped`), never this accumulated set.
+    candidates: Vec<String>,
+}
+
+/// Walk `node`'s immediate FROM shape (no recursion into a `Derived`
+/// subquery's own body — that is a separate nesting level, walked by the
+/// caller) collecting real base tables into `qualifiers`/`tables`. Mirrors
+/// `lib.rs::query_base_tables`'s CTE-name filtering.
+fn collect_from_scope(
+    node: &FromNode,
+    ctes: &HashSet<String>,
+    qualifiers: &mut BTreeMap<String, Option<String>>,
+    tables: &mut Vec<String>,
+) {
+    match node {
+        FromNode::Table(tref) => {
+            if ctes.contains(&tref.table) {
+                // References a CTE, not a real table — the CTE's own
+                // `QuerySpec` is walked independently by `collect_scoped`'s
+                // `spec.with` loop; no attribution here.
+                qualifiers.insert(tref.qualifier().to_string(), None);
+            } else {
+                qualifiers.insert(tref.qualifier().to_string(), Some(tref.table.clone()));
+                tables.push(tref.table.clone());
+            }
+        }
+        FromNode::Join { left, right, .. } => {
+            collect_from_scope(left, ctes, qualifiers, tables);
+            collect_from_scope(right, ctes, qualifiers, tables);
+        }
+        FromNode::Dual => {}
+        FromNode::Derived { alias, .. } => {
+            // Not a real table: its own subquery is walked independently
+            // (`collect_from_exprs`) — no attribution for the alias itself.
+            qualifiers.insert(alias.clone(), None);
+        }
+    }
+}
+
+/// Attribute one column reference to the real base table(s) it can bind to,
+/// pushing a `ColRequirement::Column` for each. See [`ColScope`]'s doc
+/// comment for the ambiguity/ fail-closed policy.
+fn attribute_column(
+    qualifier: Option<&str>,
+    name: &str,
+    scope: &ColScope,
+    out: &mut Vec<ColRequirement>,
+) {
+    match qualifier {
+        Some(q) => match scope.qualifiers.get(q) {
+            Some(Some(table)) => out.push(ColRequirement::Column(table.clone(), name.to_string())),
+            Some(None) => {} // CTE/derived alias — checked at its own definition site
+            None => {
+                // Unrecognised qualifier (should not happen once the plan
+                // reaches execution, but fail closed): charge every real
+                // candidate in scope.
+                for t in &scope.candidates {
+                    out.push(ColRequirement::Column(t.clone(), name.to_string()));
+                }
+            }
+        },
+        None => match scope.candidates.as_slice() {
+            [] => {} // no real base table in scope (Dual, or FROM only CTEs/derived tables)
+            [one] => out.push(ColRequirement::Column(one.clone(), name.to_string())),
+            many => {
+                for t in many {
+                    out.push(ColRequirement::Column(t.clone(), name.to_string()));
+                }
+            }
+        },
+    }
+}
+
+/// Recurse into every `Derived` subquery reachable from `node` and every
+/// JOIN `ON` condition, using `scope` (this level's own FROM plus every
+/// ancestor's — see [`ColScope`]).
+fn collect_from_exprs(node: &FromNode, scope: &ColScope, out: &mut Vec<ColRequirement>) {
+    match node {
+        FromNode::Table(_) | FromNode::Dual => {}
+        FromNode::Join {
+            left, right, on, ..
+        } => {
+            collect_from_exprs(left, scope, out);
+            collect_from_exprs(right, scope, out);
+            if let Some(on) = on {
+                collect_qexpr(on, scope, out);
+            }
+        }
+        FromNode::Derived { subquery, .. } => {
+            out.extend(collect_scoped(subquery, scope));
+        }
+    }
+}
+
+/// Walk `expr` collecting every column-read requirement, resolving each
+/// `QExpr::Column` against `scope` and recursing into any nested subquery
+/// (correlated to `scope`, per [`ColScope`]'s conservative-accumulation
+/// policy).
+fn collect_qexpr(expr: &QExpr, scope: &ColScope, out: &mut Vec<ColRequirement>) {
+    match expr {
+        QExpr::Column { qualifier, name } => {
+            attribute_column(qualifier.as_deref(), name, scope, out)
+        }
+        QExpr::Literal(_) => {}
+        QExpr::Compare { lhs, rhs, .. } => {
+            collect_qexpr(lhs, scope, out);
+            collect_qexpr(rhs, scope, out);
+        }
+        QExpr::And(l, r) | QExpr::Or(l, r) => {
+            collect_qexpr(l, scope, out);
+            collect_qexpr(r, scope, out);
+        }
+        QExpr::Not(e) => collect_qexpr(e, scope, out),
+        QExpr::IsNull { expr, .. } => collect_qexpr(expr, scope, out),
+        QExpr::Aggregate { arg, .. } => {
+            if let Some(a) = arg {
+                collect_qexpr(a, scope, out);
+            }
+        }
+        QExpr::Exists { subquery, .. } => out.extend(collect_scoped(subquery, scope)),
+        QExpr::InSubquery { expr, subquery, .. } => {
+            collect_qexpr(expr, scope, out);
+            out.extend(collect_scoped(subquery, scope));
+        }
+        QExpr::InList { expr, list, .. } => {
+            collect_qexpr(expr, scope, out);
+            for e in list {
+                collect_qexpr(e, scope, out);
+            }
+        }
+        QExpr::ScalarSubquery(subquery) => out.extend(collect_scoped(subquery, scope)),
+        QExpr::Like { expr, pattern, .. } => {
+            collect_qexpr(expr, scope, out);
+            collect_qexpr(pattern, scope, out);
+        }
+        QExpr::Match { column, query } => {
+            collect_qexpr(column, scope, out);
+            collect_qexpr(query, scope, out);
+        }
+        QExpr::Arith { lhs, rhs, .. } => {
+            collect_qexpr(lhs, scope, out);
+            collect_qexpr(rhs, scope, out);
+        }
+        QExpr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                collect_qexpr(op, scope, out);
+            }
+            for (cond, then) in conditions {
+                collect_qexpr(cond, scope, out);
+                collect_qexpr(then, scope, out);
+            }
+            if let Some(e) = else_result {
+                collect_qexpr(e, scope, out);
+            }
+        }
+        QExpr::Coalesce(args) => {
+            for a in args {
+                collect_qexpr(a, scope, out);
+            }
+        }
+        QExpr::Nullif { lhs, rhs } => {
+            collect_qexpr(lhs, scope, out);
+            collect_qexpr(rhs, scope, out);
+        }
+        QExpr::Cast { expr, .. } => collect_qexpr(expr, scope, out),
+        QExpr::Window { func, over } => {
+            match func {
+                WindowFunc::Lag(e, _)
+                | WindowFunc::Lead(e, _)
+                | WindowFunc::Sum(e)
+                | WindowFunc::Avg(e)
+                | WindowFunc::Min(e)
+                | WindowFunc::Max(e) => collect_qexpr(e, scope, out),
+                WindowFunc::RowNumber
+                | WindowFunc::Rank
+                | WindowFunc::DenseRank
+                | WindowFunc::Count => {}
+            }
+            for p in &over.partition_by {
+                collect_qexpr(p, scope, out);
+            }
+            for (o, _) in &over.order_by {
+                collect_qexpr(o, scope, out);
+            }
+        }
+    }
+}
+
+/// One `QuerySpec` nesting level: extends `parent`'s scope with this level's
+/// own FROM tables/aliases (shadowing an outer alias of the same name — SQL
+/// scoping), then collects every column-read requirement from CTEs, FROM
+/// (derived subqueries + JOIN ON), WHERE, the projection (incl. wildcards),
+/// GROUP BY, HAVING, and ORDER BY.
+fn collect_scoped(spec: &QuerySpec, parent: &ColScope) -> Vec<ColRequirement> {
+    let cte_names: HashSet<String> = spec.with.iter().map(|(n, _)| n.clone()).collect();
+
+    // This level's own real FROM tables (for `SELECT *` expansion — must
+    // never include an ancestor's tables) and qualifier map.
+    let mut own_qualifiers: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let mut own_tables: Vec<String> = Vec::new();
+    collect_from_scope(&spec.from, &cte_names, &mut own_qualifiers, &mut own_tables);
+
+    let mut scope = parent.clone();
+    scope.qualifiers.extend(own_qualifiers);
+    scope.candidates.extend(own_tables.iter().cloned());
+
+    let mut out = Vec::new();
+
+    for (_, cte) in &spec.with {
+        out.extend(collect_scoped(cte, &scope));
+    }
+    collect_from_exprs(&spec.from, &scope, &mut out);
+
+    if let Some(sel) = &spec.selection {
+        collect_qexpr(sel, &scope, &mut out);
+    }
+    for p in &spec.projection {
+        match p {
+            Projection::Wildcard => {
+                for t in &own_tables {
+                    out.push(ColRequirement::AllColumns(t.clone()));
+                }
+            }
+            Projection::QualifiedWildcard(q) => match scope.qualifiers.get(q) {
+                Some(Some(table)) => out.push(ColRequirement::AllColumns(table.clone())),
+                Some(None) => {} // CTE/derived alias — covered at its own definition
+                None => {
+                    for t in &scope.candidates {
+                        out.push(ColRequirement::AllColumns(t.clone()));
+                    }
+                }
+            },
+            Projection::Expr { expr, .. } => collect_qexpr(expr, &scope, &mut out),
+        }
+    }
+    for g in &spec.group_by {
+        collect_qexpr(g, &scope, &mut out);
+    }
+    if let Some(h) = &spec.having {
+        collect_qexpr(h, &scope, &mut out);
+    }
+    for ord in &spec.order_by {
+        collect_qexpr(&ord.expr, &scope, &mut out);
+    }
+    out
+}
+
+/// Collect every column-read requirement in `spec` (item 112) — the entry
+/// point `lib.rs::check_plan_privileges` calls for `LogicalPlan::Query`/
+/// `Explain`. See the module section doc comment above for the full
+/// contract (ambiguity/fail-closed policy, RLS-injection exemption, nested
+/// subquery handling).
+pub fn collect_query_column_reads(spec: &QuerySpec) -> Vec<ColRequirement> {
+    collect_scoped(spec, &ColScope::default())
 }
