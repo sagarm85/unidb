@@ -540,6 +540,12 @@ impl EngineHandle {
         // still holds a clone. Belt-and-suspenders: force any deferred WAL bytes
         // durable first, in case a non-commit write path deferred a flush.
         if let Some(engine) = self.engine.take() {
+            // Item 118: drain the async HNSW worker and clear the crash-recovery
+            // dirty marker BEFORE releasing the engine, so a graceful restart
+            // skips reconciliation (O(1) open). Must run here, not in Engine's
+            // Drop — the worker's Weak<Engine> can no longer upgrade once the
+            // Arc is gone, so it could not drain the queue tail during Drop.
+            engine.flush_hnsw_for_shutdown();
             let _ = engine.sync_wal();
         }
     }

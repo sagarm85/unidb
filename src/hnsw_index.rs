@@ -1268,6 +1268,20 @@ impl DiskHnswIndex {
         Ok(results.into_iter().next().map(rid_to_node_loc))
     }
 
+    /// Item 118: is this heap RowId already present in the index? O(log n) point
+    /// lookup into the `node_index` DiskBTree. Used by (a) crash-recovery
+    /// reconciliation, to enqueue only the un-indexed tail, and (b) the async
+    /// worker, to make `insert` idempotent — a RowId enqueued twice (e.g. by
+    /// reconciliation racing a concurrent normal insert) is inserted once, which
+    /// matters because `insert_inner` has no presence guard and would otherwise
+    /// write a duplicate node + double `node_index` entry.
+    pub fn contains(&self, rid: RowId, pool: &BufferPool) -> Result<bool> {
+        let hdr = self.load_header(pool)?;
+        Ok(self
+            .find_node_loc(rid, hdr.node_index_root, pool)?
+            .is_some())
+    }
+
     /// Load the vector for `rid` from its node page. Returns None if the node
     /// is not in node_index (possible after a P60a partial crash).
     fn fetch_vector_via_index(

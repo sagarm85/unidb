@@ -1149,14 +1149,31 @@ impl Engine {
                             // Upgrade the weak ref to access pool + wal.
                             // If the engine is gone, stop the worker.
                             let Some(eng) = weak.upgrade() else { break };
-                            if let Err(err) = DiskHnswIndex::open(item.meta_page, item.page_size)
-                                .insert(item.row_id, &item.vector, &eng.pool, &eng.wal)
-                            {
-                                tracing::warn!(
-                                    error = %err,
-                                    meta_page = item.meta_page,
-                                    "HNSW background worker: insert failed"
-                                );
+                            let index = DiskHnswIndex::open(item.meta_page, item.page_size);
+                            // Item 118: idempotency guard. `insert` has no presence
+                            // check, so a RowId enqueued twice (crash reconciliation
+                            // racing a concurrent normal insert of the same row)
+                            // would duplicate the node. Skip if already indexed.
+                            match index.contains(item.row_id, &eng.pool) {
+                                Ok(true) => { /* already indexed — nothing to do */ }
+                                Ok(false) => {
+                                    if let Err(err) =
+                                        index.insert(item.row_id, &item.vector, &eng.pool, &eng.wal)
+                                    {
+                                        tracing::warn!(
+                                            error = %err,
+                                            meta_page = item.meta_page,
+                                            "HNSW background worker: insert failed"
+                                        );
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        error = %err,
+                                        meta_page = item.meta_page,
+                                        "HNSW background worker: membership check failed"
+                                    );
+                                }
                             }
                             // Item 107: applied (or failed-and-logged) — this
                             // row no longer counts toward the freshness lag.
@@ -1185,6 +1202,185 @@ impl Engine {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(handle);
         *tx_slot = Some(tx);
+        drop(tx_slot); // release before reconcile (which re-locks hnsw_worker_tx)
+
+        // Item 118: async-HNSW crash durability. A leftover `hnsw.dirty` marker
+        // means a previous async session did NOT cleanly drain its queue (a
+        // crash, or an exit that skipped `flush_hnsw_for_shutdown`), so some
+        // committed vector rows may be missing from the index (their enqueued
+        // inserts were still in the in-memory channel — never WAL'd — when the
+        // process died). Detect that BEFORE (re)marking this session dirty, then
+        // repair in the background so open stays O(1). Covers both the server
+        // (`EngineHandle::spawn`) and `Engine::open_arc`, since both land here.
+        let needs_reconcile = self.hnsw_marker_present();
+        self.hnsw_mark_dirty();
+        if needs_reconcile {
+            let weak = Arc::downgrade(self);
+            let _ = std::thread::Builder::new()
+                .name("unidb-hnsw-reconcile".into())
+                .spawn(move || {
+                    let Some(eng) = weak.upgrade() else { return };
+                    match eng.reconcile_hnsw_indexes() {
+                        Ok(n) if n > 0 => tracing::info!(
+                            reconciled = n,
+                            "HNSW crash reconciliation: re-enqueued committed-but-unindexed rows"
+                        ),
+                        Ok(_) => {
+                            tracing::debug!("HNSW crash reconciliation: index already complete")
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "HNSW crash reconciliation failed")
+                        }
+                    }
+                });
+        }
+    }
+
+    // ── Item 118: async-HNSW crash-durability marker + reconciliation ────────
+
+    /// Path of the `hnsw.dirty` presence marker — a sibling of the
+    /// control/data/WAL files. Its existence means an async HNSW session is (or
+    /// was) open and has not cleanly drained; the next open reconciles.
+    fn hnsw_dirty_marker_path(&self) -> std::path::PathBuf {
+        self.control_path
+            .parent()
+            .map(|d| d.join("hnsw.dirty"))
+            .unwrap_or_else(|| std::path::PathBuf::from("hnsw.dirty"))
+    }
+
+    fn hnsw_marker_present(&self) -> bool {
+        self.hnsw_dirty_marker_path().exists()
+    }
+
+    fn hnsw_mark_dirty(&self) {
+        let p = self.hnsw_dirty_marker_path();
+        if !p.exists() {
+            if let Err(err) = std::fs::write(&p, b"") {
+                tracing::warn!(error = %err, path = %p.display(), "could not write HNSW dirty marker");
+            }
+        }
+    }
+
+    fn hnsw_clear_dirty(&self) {
+        let p = self.hnsw_dirty_marker_path();
+        match std::fs::remove_file(&p) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::warn!(error = %err, path = %p.display(), "could not remove HNSW dirty marker")
+            }
+        }
+    }
+
+    /// Drain the async HNSW worker, then clear the dirty marker — the clean-
+    /// shutdown path. Call this while the engine is still alive (`Drop` is too
+    /// late: the worker accesses engine state through a `Weak<Engine>` that can
+    /// no longer upgrade once the strong count hits 0, so it cannot process the
+    /// queue tail during `Drop`). After this returns, the next open sees no
+    /// marker and skips reconciliation, preserving O(1) open. No-op if no worker
+    /// is running. Idempotent.
+    pub fn flush_hnsw_for_shutdown(&self) {
+        let has_worker = self
+            .hnsw_worker_tx
+            .lock()
+            .map(|g| g.is_some())
+            .unwrap_or(false);
+        if has_worker {
+            self.wait_hnsw_idle();
+            self.hnsw_clear_dirty();
+        }
+    }
+
+    /// Re-enqueue every committed vector row that is missing from its HNSW index
+    /// — the un-WAL'd channel tail lost to a crash or an undrained exit. Runs
+    /// after recovery, on a background thread, feeding the normal worker so each
+    /// repaired insert is WAL'd (and the worker's `contains` guard makes it safe
+    /// against a race with a concurrent live insert of the same row). Returns the
+    /// number of rows re-enqueued. This is the correctness guarantee: it catches
+    /// both crashes and any exit that skipped `flush_hnsw_for_shutdown`.
+    fn reconcile_hnsw_indexes(&self) -> Result<usize> {
+        // Snapshot the (heap-open args, vector column, index meta page) set under
+        // the catalog lock, then release it before the scan.
+        struct HnswTarget {
+            fsm_meta: Option<PageId>,
+            pages: Vec<PageId>,
+            columns: Vec<crate::catalog::ColumnDef>,
+            col_idx: usize,
+            meta_page: PageId,
+        }
+        let targets: Vec<HnswTarget> = {
+            let cat = cat_read(&self.catalog);
+            let mut out = Vec::new();
+            for t in cat.tables() {
+                for (i, c) in t.columns.iter().enumerate() {
+                    if !c.dropped && c.index == Some(IndexKind::Hnsw) {
+                        if let Some(meta_page) = c.index_root {
+                            out.push(HnswTarget {
+                                fsm_meta: t.fsm_meta,
+                                pages: t.pages.clone(),
+                                columns: t.columns.clone(),
+                                col_idx: i,
+                                meta_page,
+                            });
+                        }
+                    }
+                }
+            }
+            out
+        };
+        if targets.is_empty() {
+            return Ok(0);
+        }
+
+        // A clone of the worker sender (the reconcile inserts flow through the
+        // normal worker so they are WAL'd like any other index maintenance).
+        let tx = match self
+            .hnsw_worker_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            Some(t) => t.clone(),
+            None => return Ok(0),
+        };
+
+        let page_size = self.page_size;
+        let xid = self.begin()?;
+        let scan = (|| -> Result<usize> {
+            let snapshot = self.txn_mgr.snapshot_for_statement(xid)?;
+            let mut count = 0usize;
+            for t in &targets {
+                let index = crate::hnsw_index::DiskHnswIndex::open(t.meta_page, page_size);
+                let heap = Heap::open(page_size, t.fsm_meta, t.pages.clone());
+                for (row_id, bytes) in heap.scan(&snapshot, xid, &self.pool)? {
+                    let row = crate::sql::executor::decode_row(&bytes, &t.columns)?;
+                    let Some(crate::sql::logical::Literal::Vector(v)) = row.get(t.col_idx) else {
+                        continue;
+                    };
+                    if index.contains(row_id, &self.pool)? {
+                        continue;
+                    }
+                    if tx
+                        .send(crate::hnsw_index::HnswMsg::Work(
+                            crate::hnsw_index::HnswWorkItem {
+                                meta_page: t.meta_page,
+                                page_size,
+                                row_id,
+                                vector: v.clone(),
+                            },
+                        ))
+                        .is_ok()
+                    {
+                        crate::hnsw_index::HNSW_QUEUE_DEPTH
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        count += 1;
+                    }
+                }
+            }
+            Ok(count)
+        })();
+        let _ = self.abort(xid);
+        scan
     }
 
     /// Block until the HNSW background worker has processed all pending inserts
