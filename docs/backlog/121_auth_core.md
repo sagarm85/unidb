@@ -1,7 +1,11 @@
 # Auth core — credentials, real login, sessions (Workstream A)
 
 **Type:** Milestone
-**Status:** NOT STARTED
+**Status:** IN PROGRESS — A1 (argon2id credential store) + A2 (real password login,
+enumeration/timing-oracle closed) SHIPPED on branch
+`claude/permissions-security-supabase-comparison-ixho2w` (commit `fcd320a`; item121
+tests 7/7, crash 54/54). Remaining: A3 signup, A4 refresh/sessions, A5 prod issuer,
+A6 asymmetric JWT.
 
 > Turns the existing dev-only, passwordless identification surface into a real
 > authentication service: stored credentials, password login, signup, refresh

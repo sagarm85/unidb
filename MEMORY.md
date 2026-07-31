@@ -485,6 +485,32 @@ be raised with the user directly, not assumed.
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-07-31 — Supabase-parity P0 pair (items 121+122 first slices) built via Sonnet agents + shipped to branch
+
+User directed: implement the Supabase-parity P0 pair using Sonnet for implementation,
+Opus orchestrating/reviewing, no ACID/perf compromises. Approach: **seam-first, then
+parallel fan-out.** Step 0 (Sonnet, verified by me): `AuthPrincipal` seam widening the
+RLS identity from `sub`-only to subject+claims+roles, carried to `ExecCtx` but inert —
+crash 54/54, behavior-preserving (`58efa75`). Then two Sonnet worktree agents in
+parallel: **A (item 121 A1/A2)** argon2id credential store + real password login
+(passwordless→verified; unknown/wrong/no-credential all return one 401 with a dummy-hash
+timing-parity verify; manual Debug redacts creds) — `fcd320a`; **B (item 122 B1/B2)**
+`auth.uid()` + real `auth.jwt() ->> 'claim'` in RLS, substituted at injection time,
+fail-closed. Integration review (me) caught a real bug in B: policies with `auth.jwt()`
+returned 0 rows on the LIMIT/**QExpr** path because `apply_rls`'s `policy_sub` substituted
+only `current_user` before the Expr→QExpr conversion — same shape as item-110. Fixed
+(`2a5fe85`): `apply_rls_with_auth(plan,catalog,user,claims)` core + thin `apply_rls` shim;
+`policy_sub` now substitutes auth context too. **All green: item121 7/7, item122 7/7
+(incl. two-tenant isolation + LIMIT/QExpr + fail-closed), item100 9/9, crash 54/54,
+clippy/fmt clean.** Pushed A+B+fix to the branch. Remaining slices (batch 2): A3/A4/A5/A6,
+B3/B4/B5. Studio G-panels spun off to a separate session (`sagarm85/unidb-studio`).
+**Process lessons (logged): run ONE main-tree cargo build at a time (concurrent gate
+builds + agent worktree builds thrashed the target lock and a 25G worktree target filled
+the disk to 98%); reclaim each agent worktree's `target/` immediately after integrating;
+worktree agents share the object store so integrate by committing-in-worktree +
+cherry-pick.** Auth/RLS work stayed off the storage hot path (plan-time substitution,
+control-plane credentials) — ACID/perf intact by construction and by crash-harness proof.
+
 ### 2026-07-31 — Supabase-parity backlog filed (items 120–123) + studio G-panels plan
 
 Planning/docs-only session (no engine code). User asked, via a WhatsApp-thread

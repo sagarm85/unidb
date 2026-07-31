@@ -1,7 +1,12 @@
 # RLS ↔ token binding — auth.uid() / auth.jwt() / roles (Workstream B)
 
 **Type:** Milestone
-**Status:** NOT STARTED
+**Status:** IN PROGRESS — B1 (`auth.uid()`) + B2 (`auth.jwt() ->> 'claim'`) SHIPPED on
+branch `claude/permissions-security-supabase-comparison-ixho2w` (commits `3fb0e04` +
+QExpr-path fix `2a5fe85`; item122 tests 7/7 incl. two-tenant isolation, fail-closed,
+and the LIMIT/QExpr path; crash 54/54). Both fail closed (Null, never Bool(true) —
+item-110 lesson). Remaining: B3 built-in roles, B4 role-scoped policies, B5 column
+grants (item 112).
 
 > Makes the token's *identity, claims, and role* usable inside RLS policies — the
 > Supabase model — instead of only the username. Part of the
