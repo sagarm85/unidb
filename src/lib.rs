@@ -1870,6 +1870,35 @@ impl Engine {
         self.authz.verify_mfa_challenge(raw_challenge, code)
     }
 
+    /// Mint a fresh OAuth CSRF `state` + PKCE `code_verifier` pair (item 128,
+    /// Workstream D1 — `GET /auth/oauth/<provider>/authorize`'s embedded-API
+    /// entry point). See [`crate::authz::RoleStore::create_oauth_state`].
+    pub fn create_oauth_state(&self, provider: &str) -> Result<(String, String, u64)> {
+        self.authz.create_oauth_state(provider)
+    }
+
+    /// Validate + single-use-consume an OAuth CSRF `state` token, returning
+    /// its PKCE `code_verifier` on success (item 128 — `GET
+    /// /auth/oauth/<provider>/callback`'s state-validation step). See
+    /// [`crate::authz::RoleStore::verify_oauth_state`].
+    pub fn verify_oauth_state(&self, raw_state: &str, provider: &str) -> Result<Option<String>> {
+        self.authz.verify_oauth_state(raw_state, provider)
+    }
+
+    /// Resolve an OAuth `(provider, provider_user_id)` identity to a unidb
+    /// username, creating a fresh non-superuser account on first login (item
+    /// 128). See [`crate::authz::RoleStore::oauth_link_or_create`] for the
+    /// create-vs-link-by-email design note.
+    pub fn oauth_link_or_create(
+        &self,
+        provider: &str,
+        provider_user_id: &str,
+        username_hint: &str,
+    ) -> Result<String> {
+        self.authz
+            .oauth_link_or_create(provider, provider_user_id, username_hint)
+    }
+
     /// Execute SQL **as** a named user (P6.e), enforcing per-table privileges.
     /// `user == None` is the implicit **superuser** (the embedded API), so
     /// `execute_sql` is exactly `execute_sql_as(None, ..)` and is unrestricted.

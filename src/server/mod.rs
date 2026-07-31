@@ -17,7 +17,9 @@
 //! route), [`rest_resource`] (item 123: the schema-derived `/rest/v1/*`
 //! auto REST API — translates query params into parameterized SQL run
 //! through the same enforced path as `POST /sql`), [`router`]
-//! (`build_router`), [`auth`] (verify-only JWT middleware), [`sse`]
+//! (`build_router`), [`auth`] (verify-only JWT middleware), [`oauth`] (item
+//! 128: OAuth 2.0 Authorization Code + PKCE provider config/HTTP calls for
+//! `GET /auth/oauth/<provider>/authorize`/`callback`), [`sse`]
 //! (`GET /events/subscribe`), [`txn_session`] (multi-request transaction
 //! sessions, R1), [`cursor`] (large-result pagination, R4). `/metrics`
 //! (Prometheus, via `axum-prometheus`) is wired directly in `router.rs`
@@ -34,6 +36,7 @@ pub mod error;
 pub mod event_format;
 pub mod handlers;
 pub mod logs;
+pub mod oauth;
 pub mod rate_limit;
 pub mod rest_resource;
 pub mod router;
@@ -116,6 +119,11 @@ pub struct AppState {
     /// route returns 404, indistinguishable from a non-existent route, same
     /// posture as `dev_login_jwt` being `None`.
     pub allow_signup: bool,
+    /// OAuth 2.0 social-login provider config (item 128, Workstream D1).
+    /// Empty by default — every `/auth/oauth/<provider>/*` route 404s for a
+    /// provider not present here, same "off by default, safe with zero
+    /// config" posture as `dev_login_jwt`/`allow_signup`.
+    pub oauth: oauth::OAuthConfig,
 }
 
 /// Resolve the log directory the same way `src/bin/unidb-server.rs` does, so
@@ -155,6 +163,7 @@ impl AppState {
             storage: None,
             dev_login_jwt: None,
             allow_signup: false,
+            oauth: oauth::OAuthConfig::empty(),
         }
     }
 
@@ -167,6 +176,14 @@ impl AppState {
     /// Activate `POST /auth/signup` (`UNIDB_ALLOW_SIGNUP=1`, item 121, A3).
     pub fn with_allow_signup(mut self, allow: bool) -> Self {
         self.allow_signup = allow;
+        self
+    }
+
+    /// Configure OAuth social-login providers (item 128, Workstream D1).
+    /// An empty [`oauth::OAuthConfig`] (the default) means every
+    /// `/auth/oauth/*` route 404s.
+    pub fn with_oauth(mut self, oauth: oauth::OAuthConfig) -> Self {
+        self.oauth = oauth;
         self
     }
 

@@ -198,6 +198,42 @@ fn generate_mfa_challenge_token() -> String {
     out
 }
 
+/// Generate a new single-use OAuth CSRF `state` token (item 128, Workstream
+/// D1): 256 bits from the OS CSPRNG, hex-encoded — same shape/construction
+/// as [`generate_mfa_challenge_token`], but its own token space (keys
+/// [`AuthState::oauth_states`], never accepted where a refresh/MFA-challenge
+/// token is expected or vice versa). Only its SHA-256 hash is ever
+/// persisted — see [`RoleStore::create_oauth_state`].
+fn generate_oauth_state_token() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// Generate a new PKCE (RFC 7636) `code_verifier` (item 128): 256 bits from
+/// the OS CSPRNG, hex-encoded to a 64-character string. Hex digits are all
+/// within RFC 7636's `code_verifier` charset (`ALPHA / DIGIT / "-" / "." /
+/// "_" / "~"`) and 64 characters sits comfortably inside the mandated
+/// 43-128 length range, so no separate base64url step is needed here —
+/// unlike the PKCE `code_challenge` (a SHA-256 digest, which genuinely does
+/// need base64url encoding), which `src/server/oauth.rs` computes at
+/// authorize time using the `base64`/`sha2` crates already available there.
+/// Persisted server-side only (never sent to the client) — see
+/// [`OAuthStateRec::code_verifier`].
+fn generate_oauth_code_verifier() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
 // ── item 127 (Workstream D4): TOTP-based MFA (RFC 6238) ────────────────────
 //
 // A small, self-contained HOTP/TOTP + base32 implementation on top of the
@@ -226,6 +262,14 @@ pub const MFA_CHALLENGE_TTL_SECS: u64 = 5 * 60;
 /// similar-sized batch) — enough to cover several device-loss recoveries
 /// without becoming an unwieldy list to save.
 const RECOVERY_CODE_COUNT: usize = 8;
+
+/// OAuth authorize-flow CSRF-state / PKCE-verifier lifetime (item 128,
+/// Workstream D1): long enough for a user to complete the provider's own
+/// login+consent UI (which can involve their own MFA, an account picker,
+/// etc.), short enough that a captured-but-never-redeemed authorize URL
+/// isn't a standing liability. `pub` so `src/server/oauth.rs` can echo the
+/// real TTL without duplicating the literal (mirrors `MFA_CHALLENGE_TTL_SECS`).
+pub const OAUTH_STATE_TTL_SECS: u64 = 10 * 60;
 
 const BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
@@ -413,6 +457,33 @@ struct MfaChallengeRec {
     /// [`RoleStore::verify_mfa_challenge`] so the same challenge (even
     /// re-presented with a still-fresh TOTP code before it expires) can
     /// never mint a second session.
+    used: bool,
+}
+
+/// A pending, single-use OAuth authorize-flow record (item 128, Workstream
+/// D1): issued by `GET /auth/oauth/<provider>/authorize`, redeemed by `GET
+/// /auth/oauth/<provider>/callback`. Keyed in [`AuthState::oauth_states`] by
+/// the SHA-256 hash of the raw opaque CSRF `state` token — the raw token is
+/// never persisted, mirroring [`SessionRec`]/[`MfaChallengeRec`]'s
+/// "hash-only" posture.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct OAuthStateRec {
+    /// Which provider this state was minted for ("google"/"github") — the
+    /// callback route re-checks this so a `state` issued for one provider
+    /// can never be redeemed against a different provider's callback.
+    provider: String,
+    /// PKCE (RFC 7636) code verifier generated alongside `state` — never
+    /// sent to the client, only ever used server-side at token-exchange
+    /// time (`src/server/oauth.rs`). Kept out of `Debug` (see
+    /// [`AuthState`]'s manual impl) — the whole point of PKCE is that this
+    /// value stays a server-only secret for the life of the flow.
+    code_verifier: String,
+    issued_at: u64,
+    expires_at: u64,
+    /// Single-use: set the moment the state is redeemed
+    /// ([`RoleStore::verify_oauth_state`]) so a captured/replayed callback
+    /// URL (e.g. from a proxy access log or shared browser history) can
+    /// never be redeemed a second time.
     used: bool,
 }
 
@@ -646,6 +717,26 @@ struct AuthState {
     /// the manual impl below), same posture as `sessions`.
     #[serde(default)]
     mfa_challenges: BTreeMap<String, MfaChallengeRec>,
+    /// `(provider, provider_user_id) -> unidb username` (item 128, Workstream
+    /// D1: OAuth social login). Outer key is the provider name
+    /// ("google"/"github"); inner key is that provider's own opaque user id
+    /// (never a unidb row id). `#[serde(default)]` so a pre-128 `roles.json`
+    /// (no `oauth_identities` key) deserializes with an empty map — no
+    /// FORMAT_VERSION bump. No secret material lives here (just ids), so
+    /// unlike `credentials`/`sessions`/`mfa`/`mfa_challenges` this map is
+    /// **not** redacted from `Debug` below — see the item-128 backlog doc's
+    /// "redact nothing secret here" note.
+    #[serde(default)]
+    oauth_identities: BTreeMap<String, BTreeMap<String, String>>,
+    /// state_hash (SHA-256 hex of the raw OAuth CSRF `state` token) -> pending
+    /// authorize-flow record (item 128). Never the raw state token itself —
+    /// same posture as `sessions`/`mfa_challenges`. `#[serde(default)]` so a
+    /// pre-128 `roles.json` deserializes with an empty map — no
+    /// FORMAT_VERSION bump. Kept out of `Debug` (see the manual impl below):
+    /// the record also carries the PKCE `code_verifier`, which must stay a
+    /// server-only secret for the whole point of PKCE to hold.
+    #[serde(default)]
+    oauth_states: BTreeMap<String, OAuthStateRec>,
 }
 
 /// Manual `Debug`: every field except `credentials`/`sessions`/`mfa`/
@@ -671,6 +762,14 @@ impl std::fmt::Debug for AuthState {
             .field(
                 "mfa_challenges",
                 &format!("<{} redacted>", self.mfa_challenges.len()),
+            )
+            // item 128: identity links carry no secret (just provider/user
+            // ids and the unidb username they resolve to) — shown in full,
+            // same posture as `users`/`roles`/`table_grants` above.
+            .field("oauth_identities", &self.oauth_identities)
+            .field(
+                "oauth_states",
+                &format!("<{} redacted>", self.oauth_states.len()),
             )
             .finish()
     }
@@ -1379,6 +1478,136 @@ impl RoleStore {
         Ok(Some(chal.username))
     }
 
+    // ── item 128 (Workstream D1): OAuth 2.0 social login ────────────────
+
+    /// `GET /auth/oauth/<provider>/authorize`'s embedded-API entry point
+    /// (item 128): mint a fresh CSRF `state` token + PKCE `code_verifier`,
+    /// persist them (hash-only for `state` — same posture as every other
+    /// single-use token in this module) as a pending, single-use
+    /// [`OAuthStateRec`], and return `(raw_state, raw_code_verifier,
+    /// expires_at_unix_secs)`. The caller (`src/server/oauth.rs`) derives
+    /// the PKCE `code_challenge` from `raw_code_verifier` (a pure hash, no
+    /// stored state needed for that half) and builds the provider's
+    /// authorize URL; `raw_code_verifier` itself is never sent to the
+    /// client — only `code_challenge` is, embedded in the redirect to the
+    /// provider.
+    pub fn create_oauth_state(&self, provider: &str) -> Result<(String, String, u64)> {
+        let raw_state = generate_oauth_state_token();
+        let raw_verifier = generate_oauth_code_verifier();
+        let hash = sha256_hex(&raw_state);
+        let now = now_secs();
+        let expires_at = now + OAUTH_STATE_TTL_SECS;
+        let mut st = self.lock();
+        st.oauth_states.insert(
+            hash,
+            OAuthStateRec {
+                provider: provider.to_string(),
+                code_verifier: raw_verifier.clone(),
+                issued_at: now,
+                expires_at,
+                used: false,
+            },
+        );
+        self.persist(&st)?;
+        Ok((raw_state, raw_verifier, expires_at))
+    }
+
+    /// `GET /auth/oauth/<provider>/callback`'s state-validation step (item
+    /// 128): hashes `raw_state`, looks up the pending record, and — only if
+    /// it exists, is unexpired, is not already used, and was issued for
+    /// exactly `provider` — marks it used and returns the PKCE
+    /// `code_verifier` needed to complete the token exchange.
+    /// `Ok(None)` uniformly covers every failure case (unknown/garbage
+    /// state, expired, already-used/replayed, or a provider mismatch — e.g.
+    /// a `google` state replayed against the `github` callback route) — no
+    /// oracle on *why* validation failed, same posture as [`Self::
+    /// verify_mfa_challenge`]. `Err` only for a genuine persistence failure.
+    pub fn verify_oauth_state(&self, raw_state: &str, provider: &str) -> Result<Option<String>> {
+        let hash = sha256_hex(raw_state);
+        let mut st = self.lock();
+        let Some(rec) = st.oauth_states.get(&hash).cloned() else {
+            return Ok(None);
+        };
+        if rec.used || rec.expires_at <= now_secs() || rec.provider != provider {
+            return Ok(None);
+        }
+        if let Some(r) = st.oauth_states.get_mut(&hash) {
+            r.used = true;
+        }
+        self.persist(&st)?;
+        Ok(Some(rec.code_verifier))
+    }
+
+    /// Username already linked to `(provider, provider_user_id)`, if any
+    /// (item 128). `None` for a never-seen identity.
+    pub fn oauth_identity_username(
+        &self,
+        provider: &str,
+        provider_user_id: &str,
+    ) -> Option<String> {
+        self.lock()
+            .oauth_identities
+            .get(provider)
+            .and_then(|m| m.get(provider_user_id))
+            .cloned()
+    }
+
+    /// Resolve `(provider, provider_user_id)` to a unidb username in one
+    /// atomic step (item 128, the callback handler's "link or create"):
+    /// if the identity is already linked, returns the existing username
+    /// unchanged (the repeat-login path — requirement (b), "a second login
+    /// with the same provider identity reuses the same unidb user, no
+    /// duplicate"). Otherwise creates a fresh **non-superuser, no-password**
+    /// account (`username_hint`, disambiguated with a short random suffix on
+    /// the vanishingly unlikely case that exact name is already taken by an
+    /// unrelated user) and links it. A single lock acquisition covers the
+    /// whole check-then-create sequence, closing the check-then-act race a
+    /// two-call version would have between two concurrent first-time logins
+    /// for the same brand-new identity (the item-122 TOCTOU lesson).
+    ///
+    /// **Design choice — create, never auto-link by email** (documented in
+    /// the item-128 backlog doc): a returning identity always resolves via
+    /// the `(provider, provider_user_id)` map, never by matching a claimed
+    /// `email` against an existing local account. Auto-linking by email
+    /// would let anyone who controls *any* OAuth identity sharing an email
+    /// string (a provider that allows a self-set/unverified email, or a
+    /// simply spoofed claim) silently take over an existing
+    /// password-protected unidb account — a real account-takeover surface.
+    /// A future D5 (email flows) can offer an explicit, user-initiated "link
+    /// this OAuth identity to my existing account" action once verified
+    /// email exists; auto-linking on the claim alone never will.
+    pub fn oauth_link_or_create(
+        &self,
+        provider: &str,
+        provider_user_id: &str,
+        username_hint: &str,
+    ) -> Result<String> {
+        let mut st = self.lock();
+        if let Some(existing) = st
+            .oauth_identities
+            .get(provider)
+            .and_then(|m| m.get(provider_user_id))
+        {
+            return Ok(existing.clone());
+        }
+        let mut username = username_hint.to_string();
+        if st.users.contains_key(&username) {
+            // Extremely unlikely: the deterministic hint collides with an
+            // unrelated existing user. Disambiguate with a short random
+            // suffix rather than failing the whole login.
+            let suffix = &generate_oauth_state_token()[..8];
+            username = format!("{username_hint}_{suffix}");
+        }
+        st.users.insert(username.clone(), false);
+        st.oauth_identities
+            .entry(provider.to_string())
+            .or_default()
+            .insert(provider_user_id.to_string(), username.clone());
+        self.persist(&st)?;
+        tracing::info!(provider = %provider, user = %username, "OAuth identity linked (new account created)");
+        Ok(username)
+    }
+
     /// Whether `user` holds `priv` on `table` **at all** — `true` for both a
     /// whole-table grant and a column-scoped grant with at least one column
     /// (item 112: this existence check is deliberately coarser than column
@@ -1694,6 +1923,12 @@ impl RoleStore {
                 // recovery-code hashes) must not linger — mirrors dropping
                 // `credentials` above.
                 st.mfa.remove(name);
+                // item 128: drop any OAuth identity link(s) pointing at this
+                // user too, so a later `CREATE USER` reusing the same name
+                // never silently inherits a stranger's OAuth login.
+                for m in st.oauth_identities.values_mut() {
+                    m.retain(|_, u| u != name);
+                }
             }
             AuthStmt::AlterUserPassword { name, password } => {
                 if !st.users.contains_key(name) {
@@ -3440,5 +3675,136 @@ mod tests {
             assert!(!debug_str.contains(rc));
         }
         assert!(debug_str.contains("redacted"));
+    }
+
+    // ── item 128 (Workstream D1): OAuth 2.0 social login ────────────────
+
+    #[test]
+    fn oauth_state_round_trips_and_returns_the_verifier() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        let (state, verifier, _expires_at) = store.create_oauth_state("google").unwrap();
+        assert_eq!(verifier.len(), 64); // 32 random bytes, hex-encoded
+        let got = store.verify_oauth_state(&state, "google").unwrap();
+        assert_eq!(got, Some(verifier));
+    }
+
+    #[test]
+    fn oauth_state_is_single_use() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        let (state, _verifier, _expires_at) = store.create_oauth_state("google").unwrap();
+        assert!(store
+            .verify_oauth_state(&state, "google")
+            .unwrap()
+            .is_some());
+        // Replay of the exact same state must fail — single-use.
+        assert!(store
+            .verify_oauth_state(&state, "google")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn oauth_state_rejects_wrong_provider_and_garbage() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        let (state, _verifier, _expires_at) = store.create_oauth_state("google").unwrap();
+        // Right state, wrong provider — must not verify.
+        assert!(store
+            .verify_oauth_state(&state, "github")
+            .unwrap()
+            .is_none());
+        // Unknown/garbage state.
+        assert!(store
+            .verify_oauth_state("not-a-real-state-token", "google")
+            .unwrap()
+            .is_none());
+        // The genuine state for the correct provider still works (proves
+        // the wrong-provider attempt above didn't consume it).
+        assert!(store
+            .verify_oauth_state(&state, "google")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn oauth_link_or_create_first_login_creates_a_new_user() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        let username = store
+            .oauth_link_or_create("google", "provider-uid-1", "oauth_google_provider-uid-1")
+            .unwrap();
+        assert_eq!(username, "oauth_google_provider-uid-1");
+        assert!(store.users().iter().any(|(n, su)| n == &username && !su));
+        assert_eq!(
+            store.oauth_identity_username("google", "provider-uid-1"),
+            Some(username)
+        );
+    }
+
+    #[test]
+    fn oauth_link_or_create_second_login_reuses_the_same_user() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        let first = store
+            .oauth_link_or_create("google", "provider-uid-2", "oauth_google_provider-uid-2")
+            .unwrap();
+        let second = store
+            .oauth_link_or_create("google", "provider-uid-2", "oauth_google_provider-uid-2")
+            .unwrap();
+        assert_eq!(first, second);
+        // Only one user was created, not two.
+        assert_eq!(store.users().iter().filter(|(n, _)| n == &first).count(), 1);
+    }
+
+    #[test]
+    fn oauth_link_or_create_distinct_providers_are_independent_identities() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        let google_user = store
+            .oauth_link_or_create("google", "same-id", "oauth_google_same-id")
+            .unwrap();
+        let github_user = store
+            .oauth_link_or_create("github", "same-id", "oauth_github_same-id")
+            .unwrap();
+        // Same provider_user_id string under two different providers must
+        // resolve to two distinct unidb accounts — the identity key is
+        // (provider, provider_user_id), not provider_user_id alone.
+        assert_ne!(google_user, github_user);
+    }
+
+    #[test]
+    fn drop_user_clears_oauth_identity_link() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        let username = store
+            .oauth_link_or_create("google", "provider-uid-3", "oauth_google_provider-uid-3")
+            .unwrap();
+        assert!(store
+            .oauth_identity_username("google", "provider-uid-3")
+            .is_some());
+        store.apply(&AuthStmt::DropUser(username)).unwrap();
+        assert!(store
+            .oauth_identity_username("google", "provider-uid-3")
+            .is_none());
+    }
+
+    #[test]
+    fn auth_state_debug_redacts_oauth_state_but_not_identities() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        let (state, verifier, _expires_at) = store.create_oauth_state("google").unwrap();
+        let username = store
+            .oauth_link_or_create("google", "provider-uid-4", "oauth_google_provider-uid-4")
+            .unwrap();
+
+        let debug_str = format!("{:?}", store.lock());
+        // The PKCE verifier is a secret — must never appear in Debug output.
+        assert!(!debug_str.contains(&verifier));
+        assert!(!debug_str.contains(&state));
+        // Identity links carry no secret — the username IS expected to
+        // appear (it's not redacted, per the item-128 design note).
+        assert!(debug_str.contains(&username));
     }
 }

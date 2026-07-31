@@ -76,6 +76,15 @@ base64 = { version = "0.22", optional = true }
 # (see `Cargo.lock`), so this adds no new supply-chain surface — just exposes
 # it directly to `server::rest_resource`. Server-only.
 form_urlencoded = { version = "1", optional = true }
+# Item 128 (Workstream D1): OAuth 2.0 social login — outbound HTTPS calls
+# (token exchange, userinfo fetch) to Google/GitHub (or, in tests, a local
+# mock provider). Previously a dev-dependency only (Postgres-baseline/
+# bench-support HTTP calls); promoted to an optional, server-feature-gated
+# *runtime* dependency here — same version/feature set as the existing
+# dev-dependency entry below (rustls-tls, no native-tls/OpenSSL), so the two
+# declarations resolve identically rather than pulling in two configurations
+# of the same crate.
+reqwest = { version = "0.12", optional = true, features = ["json", "stream", "rustls-tls"] }
 
 [features]
 server = [
@@ -83,7 +92,7 @@ server = [
     "dep:jsonwebtoken", "dep:metrics", "dep:metrics-exporter-prometheus",
     "dep:axum-prometheus", "dep:async-stream", "dep:futures-util",
     "dep:tracing-appender", "dep:axum-server", "dep:rustls", "dep:base64",
-    "dep:form_urlencoded",
+    "dep:form_urlencoded", "dep:reqwest",
     # Item 22, L1: JSON-lines log formatting. Enabled only under `server` so the
     # default embedded build's `tracing-subscriber` stays minimal (the `json`
     # feature just pulls serde_json — already present — into the subscriber).
@@ -98,6 +107,10 @@ server = [
 unidb-storage = { path = "unidb-storage" }
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
+# Also declared above as an optional, server-feature-gated *runtime*
+# dependency (item 128, OAuth). Kept here too (unconditional) so bench/test
+# code that isn't built with `--features server` (e.g. `benches/decompose.rs`'s
+# Postgres-baseline HTTP calls) still gets it without needing the feature on.
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
 jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 futures-util = "0.3"

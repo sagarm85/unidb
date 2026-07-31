@@ -23,7 +23,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     Extension, Json,
 };
 use serde_json::json;
@@ -41,12 +42,14 @@ use crate::{
             BatchInsertRequest, BatchSqlRequest, BatchSqlResponse, BeginTxnRequest,
             CreateEdgeRequest, CreateSlotRequest, CursorQuery, CypherRequest, DeleteEdgeRequest,
             GroupCommitWindowRequest, HistoryQuery, IsolationDto, MfaChallengeRequest,
-            MfaDisableRequest, MfaEnrollResponse, MfaVerifyRequest, MfaVerifyResponse, RlsRequest,
-            RowIdResponse, SetIndexRequest, SlowQueryThresholdRequest, SqlRequest, StreamQuery,
-            TableInfo, WhoamiPrivilege, WhoamiResponse,
+            MfaDisableRequest, MfaEnrollResponse, MfaVerifyRequest, MfaVerifyResponse,
+            OAuthCallbackQuery, RlsRequest, RowIdResponse, SetIndexRequest,
+            SlowQueryThresholdRequest, SqlRequest, StreamQuery, TableInfo, WhoamiPrivilege,
+            WhoamiResponse,
         },
         engine_handle::EngineHandle,
         error::ApiError,
+        oauth::OAuthError,
         txn_session::SessionGuard,
         AppState,
     },
@@ -1414,6 +1417,169 @@ pub async fn post_auth_logout(
         .await
         .map_err(ApiError::from)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ── item 128 (Workstream D1): OAuth 2.0 social login ────────────────────
+
+/// Map an [`OAuthError`] (from a provider HTTP call) to its HTTP status:
+/// `502` when the provider was unreachable/erroring/unparseable, `401` when
+/// it was reached and explicitly rejected the request. See
+/// `crate::server::oauth::OAuthError`'s doc comment for the exact split.
+fn oauth_error_to_api(err: OAuthError) -> ApiError {
+    match err {
+        OAuthError::ProviderUnavailable(msg) => ApiError::Api {
+            status: StatusCode::BAD_GATEWAY,
+            code: "OAUTH_PROVIDER_UNAVAILABLE",
+            message: msg,
+        },
+        OAuthError::ProviderRejected(msg) => ApiError::Api {
+            status: StatusCode::UNAUTHORIZED,
+            code: "OAUTH_TOKEN_EXCHANGE_FAILED",
+            message: msg,
+        },
+    }
+}
+
+/// `GET /auth/oauth/{provider}/authorize` (item 128) — public, no JWT
+/// required (this route *is* the entry point to establishing identity).
+///
+/// A `provider` with no `UNIDB_OAUTH_<PROVIDER>_CLIENT_ID`/`_CLIENT_SECRET`/
+/// `_REDIRECT_URI` configured (i.e. absent from [`crate::server::oauth::
+/// OAuthConfig`]) returns `404 NOT_FOUND` — indistinguishable from a
+/// non-existent route, same posture as dev-login/signup being disabled.
+///
+/// Mints a fresh CSRF `state` + PKCE `code_verifier`
+/// ([`EngineHandle::create_oauth_state`]), persisted server-side
+/// (single-use, [`crate::authz::OAUTH_STATE_TTL_SECS`]-second TTL), derives
+/// the PKCE `code_challenge` ([`crate::server::oauth::code_challenge_s256`]),
+/// and redirects (`302 Found`) to the provider's authorize URL with
+/// `client_id`/`redirect_uri`/`scope`/`state`/`code_challenge`/
+/// `code_challenge_method=S256`/`response_type=code`. The PKCE
+/// `code_verifier` itself is never sent to the client — only the derived
+/// `code_challenge` is, per RFC 7636. A JSON body carrying the same URL is
+/// deliberately not offered — the redirect is the one documented contract,
+/// simplest for a browser-driven flow and for the mock-provider tests here.
+pub async fn get_oauth_authorize(
+    Path(provider): Path<String>,
+    State(state): State<AppState>,
+) -> std::result::Result<Response, ApiError> {
+    let Some(cfg) = state.oauth.get(&provider).cloned() else {
+        return Err(route_disabled(format!(
+            "OAuth provider '{provider}' is not configured"
+        )));
+    };
+    let (oauth_state, code_verifier, _expires_at) = state
+        .engine
+        .create_oauth_state(provider)
+        .await
+        .map_err(ApiError::from)?;
+    let code_challenge = crate::server::oauth::code_challenge_s256(&code_verifier);
+    let url = crate::server::oauth::build_authorize_url(&cfg, &oauth_state, &code_challenge);
+    Ok((StatusCode::FOUND, [(header::LOCATION, url)]).into_response())
+}
+
+/// `GET /auth/oauth/{provider}/callback?code=&state=` (item 128) — public,
+/// no JWT required (the provider's redirect *is* the credential, same
+/// posture as `POST /auth/refresh`'s refresh token).
+///
+/// Same `404` posture as [`get_oauth_authorize`] for an unconfigured
+/// `provider`. Steps, in order:
+/// 1. If the provider reports `?error=...` (user denied consent, etc.),
+///    fails immediately with `400 OAUTH_PROVIDER_DENIED` — no state/token
+///    work attempted.
+/// 2. Validates + single-use-consumes `state`
+///    ([`EngineHandle::verify_oauth_state`]) — unknown, expired, replayed,
+///    or provider-mismatched state all return the identical `401
+///    OAUTH_STATE_INVALID` (no oracle on *why*).
+/// 3. Exchanges `code` for a provider access token, with the PKCE
+///    `code_verifier` recovered from step 2
+///    ([`crate::server::oauth::exchange_code_for_token`]) — provider
+///    unreachable/erroring maps to `502`, an explicit provider rejection to
+///    `401` (see [`oauth_error_to_api`]).
+/// 4. Fetches the provider's userinfo (id + email) with that access token
+///    ([`crate::server::oauth::fetch_userinfo`]) — same 502/401 split.
+/// 5. Resolves `(provider, provider_user_id)` to a unidb user
+///    ([`EngineHandle::oauth_link_or_create`]) — reuses the existing account
+///    on a repeat login for the same identity, creates a fresh
+///    non-superuser account on first login (see that method's doc comment
+///    for the create-vs-link-by-email design note: this engine never
+///    auto-links by email).
+/// 6. Issues a real unidb session via the exact same [`issue_token_pair`]
+///    helper every other login path (password, signup, MFA challenge)
+///    uses, and returns it as the response body — the same
+///    `{token, access_token, refresh_token, expires_in}` shape as `POST
+///    /auth/login`.
+pub async fn get_oauth_callback(
+    Path(provider): Path<String>,
+    State(state): State<AppState>,
+    Query(params): Query<OAuthCallbackQuery>,
+) -> std::result::Result<Json<AuthLoginResponse>, ApiError> {
+    let Some(cfg) = state.oauth.get(&provider).cloned() else {
+        return Err(route_disabled(format!(
+            "OAuth provider '{provider}' is not configured"
+        )));
+    };
+    if let Some(err) = params.error {
+        return Err(ApiError::Api {
+            status: StatusCode::BAD_REQUEST,
+            code: "OAUTH_PROVIDER_DENIED",
+            message: format!("provider returned an error: {err}"),
+        });
+    }
+    let Some(code) = params.code else {
+        return Err(ApiError::bad_request(
+            "OAUTH_MISSING_CODE",
+            "missing 'code' query parameter",
+        ));
+    };
+    let Some(raw_state) = params.state else {
+        return Err(ApiError::Api {
+            status: StatusCode::UNAUTHORIZED,
+            code: "OAUTH_STATE_INVALID",
+            message: "missing 'state' query parameter".into(),
+        });
+    };
+    let jwt_cfg = state.dev_login_jwt.as_ref().ok_or_else(|| {
+        ApiError::from(crate::error::DbError::SqlPlan(
+            "OAuth callback cannot issue tokens (set UNIDB_JWT_SIGNING_KEY or UNIDB_DEV_LOGIN=1 to enable a signing key)"
+                .into(),
+        ))
+    })?;
+
+    let code_verifier = state
+        .engine
+        .verify_oauth_state(raw_state, provider.clone())
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::Api {
+            status: StatusCode::UNAUTHORIZED,
+            code: "OAUTH_STATE_INVALID",
+            message: "invalid, expired, replayed, or provider-mismatched OAuth state".into(),
+        })?;
+
+    let access_token = crate::server::oauth::exchange_code_for_token(
+        state.oauth.http(),
+        &cfg,
+        &code,
+        &code_verifier,
+    )
+    .await
+    .map_err(oauth_error_to_api)?;
+
+    let (provider_user_id, _email) =
+        crate::server::oauth::fetch_userinfo(state.oauth.http(), &cfg, &access_token)
+            .await
+            .map_err(oauth_error_to_api)?;
+
+    let username_hint = format!("oauth_{provider}_{provider_user_id}");
+    let username = state
+        .engine
+        .oauth_link_or_create(provider, provider_user_id, username_hint)
+        .await
+        .map_err(ApiError::from)?;
+
+    let resp = issue_token_pair(&state.engine, jwt_cfg, &username).await?;
+    Ok(Json(resp))
 }
 
 /// `GET /auth/whoami` — protected (JWT required).

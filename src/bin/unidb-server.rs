@@ -52,6 +52,16 @@
 //!   to disable rate limiting entirely.
 //! - `UNIDB_AUTH_RATE_WINDOW_SECS` (default `60`): the window length backing
 //!   `UNIDB_AUTH_RATE_LIMIT`.
+//! - `UNIDB_OAUTH_<PROVIDER>_CLIENT_ID` / `_CLIENT_SECRET` / `_REDIRECT_URI`
+//!   (item 128, Workstream D1, optional, per provider — `<PROVIDER>` is
+//!   `GOOGLE` or `GITHUB`): activates `GET /auth/oauth/<provider>/authorize`
+//!   and `.../callback`. A provider missing any of these three is simply not
+//!   configured — its routes 404, same posture as `UNIDB_DEV_LOGIN`/
+//!   `UNIDB_ALLOW_SIGNUP` being unset. Optional per-provider overrides
+//!   `_AUTHORIZE_URL` / `_TOKEN_URL` / `_USERINFO_URL` / `_SCOPE` replace the
+//!   real Google/GitHub endpoint defaults — mainly for pointing a test at a
+//!   local mock provider. OAuth login still needs a signing key (see above)
+//!   to hand back a session, same as signup/refresh.
 //!
 //! Logging goes to **both** stdout (so `docker logs`/interactive/systemd
 //! journal capture still works unchanged) and a rolling daily file under
@@ -83,7 +93,10 @@ use std::sync::Arc;
 
 use axum_prometheus::PrometheusMetricLayer;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
-use unidb::server::{auth::JwtConfig, engine_handle::EngineHandle, router::build_router, AppState};
+use unidb::server::{
+    auth::JwtConfig, engine_handle::EngineHandle, oauth::OAuthConfig, router::build_router,
+    AppState,
+};
 
 /// Delete `unidb.log.*` files in `log_dir` whose mtime is older than
 /// `retain_days`. Called before the appender starts so we never delete the
@@ -291,6 +304,16 @@ async fn main() {
         );
     }
 
+    // item 128: OAuth social-login providers, read from
+    // UNIDB_OAUTH_<PROVIDER>_* — see this file's module doc. Logged (without
+    // secrets) so a deployment can see at a glance which providers are live.
+    let oauth_config = OAuthConfig::from_env();
+    for name in ["google", "github"] {
+        if oauth_config.get(name).is_some() {
+            tracing::info!(provider = name, "OAuth social login provider configured");
+        }
+    }
+
     let state = {
         let mut s =
             AppState::new(Arc::new(engine_handle)).with_log_dir(std::path::PathBuf::from(&log_dir));
@@ -303,7 +326,7 @@ async fn main() {
         if jwt_config.encoding_key.is_some() {
             s = s.with_dev_login(jwt_config.clone());
         }
-        s.with_allow_signup(allow_signup)
+        s.with_allow_signup(allow_signup).with_oauth(oauth_config)
     };
     let (prometheus_layer, metric_handle) = PrometheusMetricLayer::pair();
 
