@@ -53,8 +53,10 @@ use crate::{
 };
 
 /// Commit `xid` on `Ok`, abort it on `Err` — the one piece of boilerplate
-/// every one-shot mutating handler shares.
-async fn finish<T>(engine: &EngineHandle, xid: Xid, result: Result<T>) -> Result<T> {
+/// every one-shot mutating handler shares. `pub(crate)` so `rest_resource.rs`
+/// (item 123, C1) reuses the exact same commit-or-abort contract instead of
+/// re-implementing it.
+pub(crate) async fn finish<T>(engine: &EngineHandle, xid: Xid, result: Result<T>) -> Result<T> {
     match result {
         Ok(value) => {
             engine.commit(xid).await?;

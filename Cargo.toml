@@ -59,6 +59,13 @@ axum-server = { version = "0.7", optional = true, features = ["tls-rustls"] }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["aws_lc_rs"] }
 # R4: `POST /rows/batch` carries opaque row bytes as base64 in JSON. Server-only.
 base64 = { version = "0.22", optional = true }
+# Item 123 (Workstream C1): parses `/rest/v1/<table>` query strings
+# (`col=eq.val&select=...&order=...`) preserving repeated keys, which axum's
+# `Query<HashMap<_,_>>`/`serde` extractors can't (a `HashMap` collapses
+# duplicate keys). Already a transitive dependency of `axum`/`serde_urlencoded`
+# (see `Cargo.lock`), so this adds no new supply-chain surface — just exposes
+# it directly to `server::rest_resource`. Server-only.
+form_urlencoded = { version = "1", optional = true }
 
 [features]
 server = [
@@ -66,6 +73,7 @@ server = [
     "dep:jsonwebtoken", "dep:metrics", "dep:metrics-exporter-prometheus",
     "dep:axum-prometheus", "dep:async-stream", "dep:futures-util",
     "dep:tracing-appender", "dep:axum-server", "dep:rustls", "dep:base64",
+    "dep:form_urlencoded",
     # Item 22, L1: JSON-lines log formatting. Enabled only under `server` so the
     # default embedded build's `tracing-subscriber` stays minimal (the `json`
     # feature just pulls serde_json — already present — into the subscriber).
@@ -312,4 +320,10 @@ required-features = ["server"]
 [[test]]
 name = "server_batch_sql"
 path = "tests/server_batch_sql.rs"
+required-features = ["server"]
+
+# Item 123 (Workstream C1): auto REST API (`/rest/v1/*`) integration tests.
+[[test]]
+name = "server_rest"
+path = "tests/server_rest.rs"
 required-features = ["server"]

@@ -2957,6 +2957,103 @@ impl Engine {
         self.run_bound_plans(xid, plans, params)
     }
 
+    /// Like [`Engine::execute_sql_params`], but threads a full [`AuthPrincipal`]
+    /// through so RLS/`current_user()`/`auth.uid()`/`auth.jwt()` resolve
+    /// exactly as they do on the unparameterized principal-aware path
+    /// ([`Engine::execute_sql_as_principal`]) instead of the params path's
+    /// existing embedded-superuser semantics (item 112/122's item-24 Z6 caller
+    /// context — [`Engine::run_bound_plans`] binds `$n` placeholders but was
+    /// never given a caller identity to substitute, so a `current_user`-
+    /// referencing policy fails closed there regardless of who is actually
+    /// calling).
+    ///
+    /// **Item 123 (Workstream C1):** this is the entry point the auto-REST
+    /// layer (`server::rest_resource`) uses for every translated request —
+    /// values are always bound here as data (never re-parsed as SQL), and
+    /// table/column privilege checks are the caller's job via
+    /// [`Engine::authorize_sql_as_principal`] beforehand (mirroring
+    /// `POST /sql`'s own pre-check + execute sequence) so the exact same
+    /// enforcement pipeline applies to both surfaces. Mirrors
+    /// [`Engine::execute_sql_inner_as_principal`]'s substitute/apply-RLS/
+    /// substitute-again sequence, with `bind_params` inserted first (binding
+    /// must happen before RLS injection so a placeholder value can never be
+    /// interpreted as SQL structure — see [`Engine::run_bound_plans`]).
+    pub fn execute_sql_params_as_principal(
+        &self,
+        principal: &AuthPrincipal,
+        xid: Xid,
+        sql: &str,
+        params: &[Literal],
+    ) -> Result<Vec<ExecResult>> {
+        let user = principal.subject.as_deref();
+        let effective_roles = self.authz.effective_roles(user, &principal.claims);
+        let is_service_role = effective_roles
+            .iter()
+            .any(|r| r == crate::authz::SERVICE_ROLE);
+        let skip_rls = user
+            .map(|u| self.is_effective_superuser(Some(u)))
+            .unwrap_or(true) // None == embedded/superuser → skip RLS
+            || is_service_role;
+        let principal_r = AuthPrincipal {
+            subject: principal.subject.clone(),
+            claims: principal.claims.clone(),
+            roles: effective_roles.clone(),
+        };
+        // item 96: use the plan cache; params are bound after the cache lookup
+        // so the same SQL template with different param values shares one entry.
+        let plans = Arc::unwrap_or_clone(self.parse_sql_cached(sql)?);
+        let saved_catalog_root = ctrl_lock(&self.control).catalog_root;
+        let mut results = Vec::with_capacity(plans.len());
+        for mut plan in plans {
+            // Bind before RLS/substitution so a placeholder value can never be
+            // interpreted as SQL structure (same contract as `run_bound_plans`).
+            bind_params(&mut plan, params)?;
+            if let Some(u) = user {
+                substitute_current_user_in_plan(&mut plan, u);
+            }
+            substitute_auth_context_in_plan(&mut plan, user, &principal.claims);
+            let mut plan = if skip_rls {
+                plan
+            } else {
+                apply_rls_with_auth(
+                    plan,
+                    &cat_read(&self.catalog),
+                    user,
+                    &principal.claims,
+                    &effective_roles,
+                )
+            };
+            // Resolve any CurrentUser/AuthUid/AuthClaim nodes the RLS policy
+            // injected.
+            if let Some(u) = user {
+                substitute_current_user_in_plan(&mut plan, u);
+            }
+            substitute_auth_context_in_plan(&mut plan, user, &principal.claims);
+            let dml_table = plan_dml_table(&plan).map(|s| s.to_owned());
+            if is_service_role {
+                self.audit.record_admin(
+                    user,
+                    Some(xid),
+                    "service_role_rls_bypass",
+                    dml_table.as_deref().unwrap_or(""),
+                    true,
+                );
+            }
+            let result = self.execute_one_plan_as(xid, plan, &principal_r);
+            match result {
+                Ok(result) => {
+                    self.note_dml_result(&result, dml_table.as_deref());
+                    results.push(result);
+                }
+                Err(e) => {
+                    self.restore_catalog_root(saved_catalog_root)?;
+                    return Err(e);
+                }
+            }
+        }
+        Ok(results)
+    }
+
     /// Parse a statement once into a reusable [`Prepared`] plan (P2.e). Parsing
     /// is separated from binding so the same plan can be executed many times
     /// with different `params` via [`Engine::execute_prepared`] — parse once,

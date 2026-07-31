@@ -30,7 +30,8 @@ use axum_prometheus::{metrics_exporter_prometheus::PrometheusHandle, PrometheusM
 use tower_http::{cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer};
 
 use crate::server::{
-    auth::JwtConfig, bulk, handlers, rate_limit::AuthRateLimiter, sse, storage, AppState,
+    auth::JwtConfig, bulk, handlers, rate_limit::AuthRateLimiter, rest_resource, sse, storage,
+    AppState,
 };
 
 /// Production entry point: reads `UNIDB_AUTH_RATE_LIMIT` /
@@ -148,6 +149,24 @@ pub fn build_router_with_rate_limiter(
             post(handlers::post_replication_slot_advance),
         )
         .route("/replication/stream", get(handlers::get_replication_stream))
+        // ── Item 123 (Workstream C1): schema-derived auto REST API ────────
+        // Same `require_jwt` layer as every other data-plane route below —
+        // RLS/table/column-grant enforcement is inherited from the engine's
+        // existing `POST /sql` enforcement path (see `rest_resource.rs`'s
+        // module doc), not re-implemented here.
+        .route(
+            "/rest/v1/{table}",
+            get(rest_resource::get_collection)
+                .post(rest_resource::post_collection)
+                .patch(rest_resource::patch_collection)
+                .delete(rest_resource::delete_collection),
+        )
+        // C3: catalog-derived OpenAPI 3 document (feeds unidb-studio's
+        // API-docs panel, G4). Mounted at both `/rest/v1` and `/rest/v1/` so
+        // neither form 404s depending on whether the client includes the
+        // trailing slash.
+        .route("/rest/v1", get(rest_resource::get_openapi))
+        .route("/rest/v1/", get(rest_resource::get_openapi))
         // ── Item 31: storage service routes (/storage/*) ──────────────────
         // All 7 routes return 503 when AppState::storage is None (unconfigured).
         // C1 list / C2 create buckets

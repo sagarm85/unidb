@@ -236,6 +236,25 @@ impl EngineHandle {
             .await
     }
 
+    /// Like [`Self::execute_sql_params`] but threads a full [`AuthPrincipal`]
+    /// through so RLS/`current_user()`/`auth.uid()`/`auth.jwt()` resolve under
+    /// the caller's identity (item 123, Workstream C1) — see
+    /// [`Engine::execute_sql_params_as_principal`] for why the bare params
+    /// path can't be reused for this (it runs with no caller identity, so a
+    /// `current_user`-referencing RLS policy fails closed regardless of who
+    /// is actually calling). Used by the auto-REST layer
+    /// (`server::rest_resource`) for every translated request.
+    pub async fn execute_sql_params_as_principal(
+        &self,
+        principal: AuthPrincipal,
+        xid: Xid,
+        sql: String,
+        params: Vec<crate::sql::logical::Literal>,
+    ) -> Result<Vec<ExecResult>> {
+        self.on_engine(move |e| e.execute_sql_params_as_principal(&principal, xid, &sql, &params))
+            .await
+    }
+
     pub async fn execute_cypher(&self, xid: Xid, query: String) -> Result<Vec<ExecResult>> {
         self.on_engine(move |e| e.execute_cypher(xid, &query)).await
     }

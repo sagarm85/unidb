@@ -14,12 +14,15 @@
 //! Submodules: [`engine_handle`] (the `Arc<Engine>`/`spawn_blocking`
 //! bridge), [`error`] (`DbError` → HTTP status mapping), [`dto`]
 //! (wire-format request/response shapes), [`handlers`] (one `async fn` per
-//! route), [`router`] (`build_router`), [`auth`] (verify-only JWT
-//! middleware), [`sse`] (`GET /events/subscribe`), [`txn_session`]
-//! (multi-request transaction sessions, R1), [`cursor`] (large-result
-//! pagination, R4). `/metrics` (Prometheus, via `axum-prometheus`) is wired
-//! directly in `router.rs` rather than its own module — there's no reusable
-//! logic beyond one `PrometheusMetricLayer::pair()` call.
+//! route), [`rest_resource`] (item 123: the schema-derived `/rest/v1/*`
+//! auto REST API — translates query params into parameterized SQL run
+//! through the same enforced path as `POST /sql`), [`router`]
+//! (`build_router`), [`auth`] (verify-only JWT middleware), [`sse`]
+//! (`GET /events/subscribe`), [`txn_session`] (multi-request transaction
+//! sessions, R1), [`cursor`] (large-result pagination, R4). `/metrics`
+//! (Prometheus, via `axum-prometheus`) is wired directly in `router.rs`
+//! rather than its own module — there's no reusable logic beyond one
+//! `PrometheusMetricLayer::pair()` call.
 
 pub mod auth;
 pub mod bulk;
@@ -32,6 +35,7 @@ pub mod event_format;
 pub mod handlers;
 pub mod logs;
 pub mod rate_limit;
+pub mod rest_resource;
 pub mod router;
 pub mod sse;
 pub mod storage;
