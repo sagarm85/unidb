@@ -40,6 +40,12 @@
   directory layout, WAL/checkpoint/log configuration env vars, users/roles,
   backups and PITR (LSN- and time-based), vacuum/bloat management, log
   rotation and retention, and metrics to watch.
+- [SCHEMA_MIGRATIONS.md](SCHEMA_MIGRATIONS.md) — item 126 (Workstream I4):
+  the Supabase-style forward-only SQL migrations tool (`unidb-migrate` CLI +
+  `Engine::apply_migrations`) — file naming, the `schema_migrations`
+  tracking table, apply/idempotency/drift-detection algorithm, and the
+  non-transactional-DDL caveat (precisely what is, and isn't, rolled back on
+  a failing migration).
 - [performance/](performance/) — the **committed measurement record**: dated
   benchmark reports written by `scripts/report.sh` (CRUD decompose vs
   Postgres, the multi-model W0→W4 ladder, concurrency matrices) plus durable

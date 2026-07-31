@@ -210,6 +210,13 @@ fn map_status(err: &DbError) -> (StatusCode, &'static str) {
         DbError::Authz(_) => (StatusCode::BAD_REQUEST, "AUTHZ_ERROR"),
         DbError::PermissionDenied(_) => (StatusCode::FORBIDDEN, "PERMISSION_DENIED"),
 
+        // Item 126 (Workstream I4): no HTTP route drives `apply_migrations`
+        // today (it's a CLI/embedded-API-only surface) — mapped for match
+        // exhaustiveness against a future migrations route. A bad migration
+        // file / checksum drift / failing statement is a request-shaped
+        // problem, not a server fault.
+        DbError::Migration(_) => (StatusCode::BAD_REQUEST, "MIGRATION_ERROR"),
+
         // Durability failure (P1.b, fsyncgate) is fatal for the session — the
         // engine can no longer guarantee writes reach disk and must be
         // restarted. 503 signals the service is (temporarily) unable to handle

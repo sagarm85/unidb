@@ -126,6 +126,14 @@ name = "unidb-server"
 path = "src/bin/unidb-server.rs"
 required-features = ["server"]
 
+# Item 126 (Workstream I4): schema-migrations CLI. Deliberately NOT gated on
+# the "server" feature — it only opens the (sync) embedded `Engine` and calls
+# `Engine::apply_migrations`, no async runtime/HTTP needed, so `cargo build`
+# with default features already builds it.
+[[bin]]
+name = "unidb-migrate"
+path = "src/bin/unidb-migrate.rs"
+
 [[bench]]
 name = "bulk_build"
 harness = false

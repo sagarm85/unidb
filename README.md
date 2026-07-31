@@ -221,6 +221,30 @@ Full route reference: [`docs/REST_API.md`](docs/REST_API.md)
 
 ---
 
+## Schema migrations
+
+unidb ships a Supabase-style, forward-only SQL migration tool: plain `.sql` files applied in ascending version order, tracked in a `schema_migrations` table the tool creates and maintains itself.
+
+```bash
+mkdir -p migrations
+cat > migrations/0001_init.sql <<'EOF'
+CREATE TABLE users (id INT PRIMARY KEY, email TEXT NOT NULL);
+EOF
+
+UNIDB_DATA_DIR=/var/lib/unidb cargo run --bin unidb-migrate -- migrations
+# unidb-migrate: applying migrations from 'migrations'...
+# unidb-migrate: applied 1, skipped 0 (0001)
+```
+
+- **File naming:** `<version>_<name>.sql`, sorted **lexicographically** — zero-padded sequence numbers (`0001_init.sql`) or a sortable timestamp prefix both work.
+- **Idempotent:** re-running skips already-applied versions (checksum-verified).
+- **Drift-checked:** editing an already-applied migration's file is rejected (checksum mismatch) rather than silently re-applied.
+- **Stops on first error**, leaving the failing migration unrecorded; earlier migrations in the run stay applied.
+- Also available as a Rust API: `Engine::apply_migrations(dir: &Path) -> Result<MigrationReport>`.
+- **Read [`docs/SCHEMA_MIGRATIONS.md`](docs/SCHEMA_MIGRATIONS.md) before writing a migration** — it documents exactly which failures are (and are not) rolled back, since unidb's catalog DDL is not fully transactional across separate SQL calls.
+
+---
+
 ## What's included
 
 **Storage and transactions**
@@ -386,7 +410,10 @@ src/
   replication/        WAL shipping, read replicas, failover
   backup/             Base backup, WAL archiving, PITR
   authz/              Users, roles, GRANT
+  migrations.rs       SQL schema-migrations tooling (Engine::apply_migrations)
   server/             Optional REST/JWT/SSE/metrics (feature = "server")
+  bin/
+    unidb-migrate.rs  Schema-migrations CLI
 tests/
   crash/              Crash-injection harness (54 crash/recovery tests)
 benches/              Throughput and latency benchmarks
@@ -396,6 +423,7 @@ scripts/
   bench_server.sh     HTTP performance smoke test
 docs/
   REST_API.md         Full HTTP route reference
+  SCHEMA_MIGRATIONS.md  Migrations tool: naming, algorithm, non-transactional-DDL caveat
   engine_access_guide.md  Application builder's guide
   ops_runbook.md      Production operations guide
 unidb-attach/         Rust blocking REST client
