@@ -611,3 +611,341 @@ async fn openapi_document_lists_tables() {
     assert!(body["paths"]["/rest/v1/items"].is_object());
     assert!(body["components"]["schemas"]["items"].is_object());
 }
+
+// ── (g) C2: embedded resource expansion ─────────────────────────────────────
+//
+// `orders.customer_id -> customers.id` is the acceptance example from item
+// 123 C2: forward (many-to-one) embedding via `customer(...)`, and reverse
+// (one-to-many) embedding of `orders` off `customers`.
+
+async fn setup_customers_orders(server: &TestServer) -> String {
+    let admin = valid_token();
+    assert_eq!(
+        sql(server, &admin, "CREATE USER root SUPERUSER").await.0,
+        200
+    );
+    let root = token_for("root");
+    assert_eq!(
+        sql(
+            server,
+            &root,
+            "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT)"
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        sql(
+            server,
+            &root,
+            "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT REFERENCES customers(id), \
+             total INT)"
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        sql(
+            server,
+            &root,
+            "INSERT INTO customers (id, name) VALUES (1, 'acme'), (2, 'globex')"
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        sql(
+            server,
+            &root,
+            "INSERT INTO orders (id, customer_id, total) VALUES \
+             (100, 1, 10), (101, 1, 20), (102, 2, 30), (103, NULL, 40)"
+        )
+        .await
+        .0,
+        200
+    );
+    root
+}
+
+/// (a) forward embed: each order gets its `customer` nested object, resolved
+/// via the `orders.customer_id -> customers.id` FK — the exact scenario from
+/// item 123 C2's acceptance example. A `NULL` FK value embeds as `null`,
+/// never an error or a spurious match.
+#[tokio::test]
+async fn forward_embed_returns_nested_parent_object() {
+    let server = TestServer::spawn().await;
+    let root = setup_customers_orders(&server).await;
+
+    let (status, body) = rest_get(
+        &server,
+        &root,
+        "orders?select=id,total,customer(id,name)&order=id.asc",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["columns"], json!(["id", "total", "customer"]));
+    let r = rows(&body);
+    assert_eq!(r.len(), 4, "{body}");
+    assert_eq!(r[0], json!([100, 10, {"id": 1, "name": "acme"}]));
+    assert_eq!(r[1], json!([101, 20, {"id": 1, "name": "acme"}]));
+    assert_eq!(r[2], json!([102, 30, {"id": 2, "name": "globex"}]));
+    assert_eq!(r[3], json!([103, 40, null]));
+}
+
+/// (b) a filter on the base table still applies with an embed present — the
+/// embed's hidden join-key column doesn't disturb `WHERE`/`ORDER BY` on the
+/// base query, and filtered-out base rows never trigger an embed fetch for
+/// them.
+#[tokio::test]
+async fn filter_on_base_table_works_with_embed() {
+    let server = TestServer::spawn().await;
+    let root = setup_customers_orders(&server).await;
+
+    let (status, body) = rest_get(
+        &server,
+        &root,
+        "orders?select=id,total,customer(id,name)&total=gt.15&order=id.asc",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let r = rows(&body);
+    assert_eq!(r.len(), 3, "{body}");
+    assert_eq!(r[0], json!([101, 20, {"id": 1, "name": "acme"}]));
+    assert_eq!(r[1], json!([102, 30, {"id": 2, "name": "globex"}]));
+    // Order 103 (total 40, NULL customer_id) passes the base filter too —
+    // its embed is `null`, not an error, and it isn't dropped by the embed
+    // machinery.
+    assert_eq!(r[2], json!([103, 40, null]));
+}
+
+/// Reverse (one-to-many) embed: a customer's `orders` come back as a nested
+/// array (empty when it has none).
+#[tokio::test]
+async fn reverse_embed_returns_nested_array() {
+    let server = TestServer::spawn().await;
+    let root = setup_customers_orders(&server).await;
+
+    let (status, body) = rest_get(
+        &server,
+        &root,
+        "customers?select=id,name,orders(id,total)&order=id.asc",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let r = rows(&body);
+    assert_eq!(r.len(), 2, "{body}");
+    assert_eq!(
+        r[0],
+        json!([1, "acme", [{"id": 100, "total": 10}, {"id": 101, "total": 20}]])
+    );
+    assert_eq!(r[1], json!([2, "globex", [{"id": 102, "total": 30}]]));
+}
+
+/// (d) an embed name that matches no FK relationship is a 400, not a silent
+/// no-op, a 404, or a 500.
+#[tokio::test]
+async fn unknown_relationship_is_400() {
+    let server = TestServer::spawn().await;
+    let root = setup_customers_orders(&server).await;
+
+    let (status, body) = rest_get(&server, &root, "orders?select=id,nope(id)").await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["code"], "UNKNOWN_RELATIONSHIP");
+}
+
+/// (d) an embed name that matches more than one FK relationship must be
+/// rejected rather than silently picking one — two FK columns on the same
+/// table both targeting `customers` make the bare table name ambiguous; the
+/// individually-disambiguating `_id`-stripped aliases still work.
+#[tokio::test]
+async fn ambiguous_relationship_is_400() {
+    let server = TestServer::spawn().await;
+    let admin = valid_token();
+    sql(&server, &admin, "CREATE USER root SUPERUSER").await;
+    let root = token_for("root");
+    assert_eq!(
+        sql(
+            &server,
+            &root,
+            "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT)"
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        sql(
+            &server,
+            &root,
+            "CREATE TABLE orders (id INT PRIMARY KEY, buyer_id INT REFERENCES customers(id), \
+             seller_id INT REFERENCES customers(id))"
+        )
+        .await
+        .0,
+        200
+    );
+
+    let (status, body) = rest_get(&server, &root, "orders?select=id,customers(id)").await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["code"], "AMBIGUOUS_RELATIONSHIP");
+
+    // The unambiguous `_id`-stripped aliases still resolve individually.
+    let (status, body) = rest_get(&server, &root, "orders?select=id,buyer(id)").await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = rest_get(&server, &root, "orders?select=id,seller(id)").await;
+    assert_eq!(status, 200, "{body}");
+}
+
+/// (c) RLS + column-grant parity on the EMBEDDED table: a restricted caller
+/// only sees embedded parent rows they could `SELECT` directly (RLS-hidden
+/// rows nest as `null`, never leak), and requesting an embedded column
+/// they aren't granted is denied exactly like a direct `/rest/v1` request
+/// for that column would be — fail closed, not partial data.
+#[tokio::test]
+async fn embed_honors_rls_and_column_grants_on_embedded_table() {
+    let server = TestServer::spawn().await;
+    let admin = valid_token();
+    sql(&server, &admin, "CREATE USER root SUPERUSER").await;
+    let root = token_for("root");
+
+    assert_eq!(
+        sql(
+            &server,
+            &root,
+            "CREATE TABLE customers (id INT PRIMARY KEY, name TEXT, owner TEXT)"
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        sql(
+            &server,
+            &root,
+            "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT REFERENCES customers(id), \
+             total INT)"
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        sql(
+            &server,
+            &root,
+            "INSERT INTO customers (id, name, owner) VALUES \
+             (1, 'acme', 'alice'), (2, 'globex', 'root')"
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        sql(
+            &server,
+            &root,
+            "INSERT INTO orders (id, customer_id, total) VALUES (100, 1, 10), (101, 2, 20)"
+        )
+        .await
+        .0,
+        200
+    );
+
+    sql(&server, &root, "CREATE USER alice").await;
+    sql(&server, &root, "GRANT SELECT ON orders TO alice").await;
+    sql(
+        &server,
+        &root,
+        "GRANT SELECT (id, name) ON customers TO alice",
+    )
+    .await;
+    let policy = sql(
+        &server,
+        &root,
+        "CREATE POLICY p ON customers FOR SELECT USING (owner = current_user)",
+    )
+    .await;
+    assert_eq!(policy.0, 200, "{:?}", policy.1);
+
+    let alice = token_for("alice");
+
+    // RLS: alice can see order 100's customer (hers) but not order 101's
+    // (root's) — the latter must come back `null`, never leak the row or
+    // error the whole request.
+    let (status, body) = rest_get(
+        &server,
+        &alice,
+        "orders?select=id,customer(id,name)&order=id.asc",
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let r = rows(&body);
+    assert_eq!(r.len(), 2, "{body}");
+    assert_eq!(r[0], json!([100, {"id": 1, "name": "acme"}]));
+    assert_eq!(
+        r[1],
+        json!([101, null]),
+        "alice's RLS policy must hide the other customer's row, even nested: {body}"
+    );
+
+    // Column grant: alice is not granted `owner` on customers, so an embed
+    // asking for it is denied exactly like a top-level `/rest/v1` request
+    // for that column would be.
+    let (status, body) = rest_get(&server, &alice, "orders?select=id,customer(id,owner)").await;
+    assert_eq!(status, 403, "{body}");
+
+    // Same comparison, requested directly on `/rest/v1/customers`: identical
+    // denial.
+    let (direct_status, direct_body) = rest_get(&server, &alice, "customers?select=id,owner").await;
+    assert_eq!(direct_status, status, "{direct_body}");
+}
+
+/// (e) a malicious value combined with a `select=...,name(cols)` embed is
+/// still bound purely as data, and a malicious *relationship name* is only
+/// ever matched against catalog FK metadata — never built into SQL text —
+/// so it just fails to resolve rather than reaching the database.
+#[tokio::test]
+async fn injection_attempt_with_embed_present_is_treated_as_data() {
+    let server = TestServer::spawn().await;
+    let root = setup_customers_orders(&server).await;
+
+    // TEXT-column filter value (comparable against any text, unlike an INT
+    // column where a non-numeric malicious string would fail type coercion
+    // rather than testing the injection-safety property).
+    let malicious = "1) OR (1=1";
+    let path = format!(
+        "customers?select=id,name,orders(id,total)&name=eq.{}",
+        urlencoding_percent(malicious)
+    );
+    let (status, body) = rest_get(&server, &root, &path).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        rows(&body).len(),
+        0,
+        "malicious filter value must match no row, not leak the table: {body}"
+    );
+
+    // A DROP-TABLE-shaped string as the relationship *name* itself: matched
+    // against catalog FK metadata only, so it's simply unresolved (400) —
+    // never string-built into SQL.
+    let malicious_name = "customers'; DROP TABLE customers; --";
+    let path = format!(
+        "orders?select=id,{}(id)",
+        urlencoding_percent(malicious_name)
+    );
+    let (status, body) = rest_get(&server, &root, &path).await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["code"], "UNKNOWN_RELATIONSHIP");
+
+    // Both tables must still exist and hold their original rows — no DROP
+    // TABLE ever executed.
+    let (status, body) = rest_get(&server, &root, "orders?select=id").await;
+    assert_eq!(status, 200, "orders must survive: {body}");
+    assert_eq!(rows(&body).len(), 4);
+    let (status, body) = rest_get(&server, &root, "customers?select=id").await;
+    assert_eq!(status, 200, "customers must survive: {body}");
+    assert_eq!(rows(&body).len(), 2);
+}

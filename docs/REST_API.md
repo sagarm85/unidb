@@ -1697,11 +1697,124 @@ by `server/error.rs`'s `ApiError` directly, not by a `DbError` variant.
 | 400 | `EMPTY_BATCH` / `BAD_BASE64` / `BATCH_TOO_LARGE` | Invalid `POST /rows/batch` payload (R4) |
 | 400 | `REPLICATION_ERROR` | Bad slot request — duplicate/unknown name (P6.b) |
 | 400 | `AUTHZ_ERROR` | Malformed users/roles/GRANT statement (P6.e) |
+| 400 | `INVALID_FILTER` / `INVALID_QUERY_PARAM` / `INVALID_SELECT` | Malformed `/rest/v1` filter, `limit`/`offset`, or `select=` syntax (item 123 C1/C2) |
+| 400 | `MULTIPLE_IN_FILTERS` | More than one `in.(...)` filter on a `/rest/v1` `PATCH`/`DELETE` (item 123 C1) |
+| 400 | `UNKNOWN_RELATIONSHIP` | `/rest/v1` embed name matches no FK relationship (item 123 C2) |
+| 400 | `AMBIGUOUS_RELATIONSHIP` | `/rest/v1` embed name matches more than one FK relationship (item 123 C2) |
 | 401 | `UNAUTHORIZED` | Missing/malformed/wrong-signature/expired JWT |
 | 503 | `DURABILITY_FAILURE` | An `fsync`/`msync` failed (P1.b, fsyncgate); the engine can no longer guarantee durability and must be restarted (session is poisoned) |
 | 500 | `INTERNAL_ERROR` | I/O, checksum, WAL corruption, control-file corruption, catalog corruption, buffer pool exhaustion, or an unavailable engine (`EngineUnavailable`) |
 
 ---
+
+---
+
+## Auto-generated data API (`/rest/v1`, item 123)
+
+> **Docs correction:** this section was missing entirely until the C2 pass —
+> `/rest/v1` (C1: resource routes + filter operators) had shipped without a
+> doc update. Documented here in full, not just the new C2 embedding syntax,
+> per CLAUDE.md §9's "no design decision left claiming *not started*" rule.
+
+A PostgREST-style, schema-derived REST API layered over the same enforced
+path `POST /sql` uses — every request is translated to a **parameterized SQL
+statement** (never string-concatenated) and executed through
+`execute_sql_params_as_principal` under the caller's JWT, so RLS and
+table/column grants apply exactly as they do for `/sql`. Source of truth:
+`src/server/rest_resource.rs`.
+
+### C1 — Resource routes + filter operators
+
+```
+GET    /rest/v1/{table}?select=...&<col>=<op>.<value>&order=...&limit=&offset=
+POST   /rest/v1/{table}          -- JSON object or array of objects -> INSERT
+PATCH  /rest/v1/{table}?<filters> -- JSON object of assignments -> UPDATE
+DELETE /rest/v1/{table}?<filters> -- DELETE
+```
+
+- **`select=col,col,...`** — column projection; omit for all (non-dropped)
+  columns.
+- **Filter operators** (`<col>=<op>.<value>`): `eq`, `neq`, `gt`, `gte`,
+  `lt`, `lte`, `like`, `ilike`, `in.(v1,v2,...)`, `is.null` / `is.true` /
+  `is.false`. Every value is a `$n` bind parameter — never SQL text.
+  `id=eq.7&id=gte.3` (repeated keys) ANDs together, same as `&`-separated
+  distinct columns.
+- **`order=col.asc,col2.desc`** — no suffix defaults to ascending.
+- **`limit=`/`offset=`** — plain non-negative integers (not bindable in this
+  engine's grammar; validated as clean ASCII digits before ever reaching SQL
+  text).
+- Unknown table -> `404 TABLE_NOT_FOUND`; unknown column -> `404
+  COLUMN_NOT_FOUND`; unsupported operator -> `400 INVALID_FILTER`. Internal
+  `__…__` tables (events/edges/lobs/consumers) are hidden as 404, same as
+  `GET /tables`.
+- `PATCH`/`DELETE` with an `in.(...)` filter is expanded server-side into one
+  statement per value (this engine's `UPDATE`/`DELETE` grammar has no native
+  `IN`), all inside one transaction with their counts summed; at most one
+  `in.(...)` filter per request (`400 MULTIPLE_IN_FILTERS` otherwise). `GET`
+  uses native SQL `IN (...)` and has no such limit.
+
+### C2 — Embedded resource expansion (`GET` only, item 123 C2)
+
+`select=` accepts embed entries of the form `name(col,col,...)` alongside
+plain columns — PostgREST-style resource embedding, derived purely from the
+catalog's foreign-key metadata (never per-table logic):
+
+```
+GET /rest/v1/orders?select=id,total,customer(id,name)
+-> [{"id":1,"total":10,"customer":{"id":7,"name":"acme"}}, ...]
+
+GET /rest/v1/customers?select=id,name,orders(id,total)
+-> [{"id":7,"name":"acme","orders":[{"id":1,"total":10}, ...]}, ...]
+```
+
+(Responses are shown here PostgREST-style for readability; the actual wire
+shape follows this API's existing tabular convention —
+`{"type":"rows","columns":[...],"rows":[[...]]}` — with the embed's column
+holding a nested JSON object/array instead of a scalar.)
+
+- **Forward (many-to-one), MUST:** `name` matches one of the base table's own
+  FK columns — the referenced table's name, the FK column's own name, or the
+  FK column with a trailing `_id` stripped (`customer_id` -> `customer`).
+  Embeds a single object, or `null` when the FK value is `NULL` or the
+  referenced row isn't visible to the caller.
+- **Reverse (one-to-many), SHOULD — shipped:** `name` matches another
+  table's name, where that table carries an FK column targeting the base
+  table. Embeds an array (empty when there are no matching children).
+- **`name(*)` or `name()`** embeds every column of the related resource;
+  `name(col,...)` embeds only the listed (catalog-validated) columns.
+- **Ambiguity is `400 AMBIGUOUS_RELATIONSHIP`**, not a silent first match —
+  e.g. two FK columns on the same table both targeting the same referenced
+  table under the same derived alias. An unresolvable name is `400
+  UNKNOWN_RELATIONSHIP`. Malformed `select=` syntax (unbalanced parens) is
+  `400 INVALID_SELECT`.
+- **Enforcement:** the embedded table is fetched via a *second*
+  parameterized query through the identical enforced path as the base query
+  — same table/column-grant pre-check, same RLS, same caller principal. A
+  restricted caller sees only the embedded rows/columns they could `SELECT`
+  directly; a row hidden by RLS nests as `null`/is omitted from the array
+  rather than leaking, and requesting an embedded column the caller isn't
+  granted denies the **whole request** (`403 PERMISSION_DENIED`), matching a
+  direct `/rest/v1` request for that column.
+- Base-table filters/order/limit/offset are unaffected by an embed (they
+  only ever apply to the base table); filtering/ordering *on* an embedded
+  resource is not yet supported (a natural C2 follow-up, not required by
+  this pass).
+- Composite (multi-column) FKs are out of scope for v1 embedding — single-
+  column FKs only (column-level `REFERENCES` and single-column table-level
+  `FOREIGN KEY`).
+
+### C3 — OpenAPI document
+
+```
+GET /rest/v1
+GET /rest/v1/
+```
+
+Returns a minimal OpenAPI 3 document generated from the catalog (tables,
+columns, types, PK/FK) — `{"openapi":"3.0.3","info":{...},"paths":{...},
+"components":{"schemas":{...}}}`, one `paths["/rest/v1/{table}"]` entry per
+user table with `get`/`post`/`patch`/`delete` operations. No auth required
+beyond the standard JWT bearer.
 
 ---
 

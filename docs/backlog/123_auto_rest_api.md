@@ -1,7 +1,8 @@
 # Auto-generated data API — PostgREST-style resource routes (Workstream C)
 
 **Type:** Milestone
-**Status:** NOT STARTED
+**Status:** C1 + C3 SHIPPED (`742b355`, 2026-07-31); C2 SHIPPED 2026-07-31 (forward + reverse
+embedding); C4 GraphQL not started (deferred, P2/Wave 3)
 
 > Gives clients a schema-derived, resource-oriented REST API
 > (`/rest/v1/<table>?col=eq.val`) instead of only the raw `POST /sql` surface —
@@ -32,9 +33,38 @@ build this on.
   `apply_rls` + grant checks as `/sql`, under the caller's token. RLS/grants are the
   single source of truth — this route is only a plan builder.
 
-### C2 — Embedded resource expansion (SHOULD)
+### C2 — Embedded resource expansion (SHOULD) — SHIPPED 2026-07-31
 - `select=id,name,orders(id,total)` → resolve the FK from the catalog and emit a
-  nested result via the existing join executor. Read-only in v1.
+  nested result. Read-only in v1 (`GET` only).
+- Shipped **both** forward (many-to-one, MUST) and reverse (one-to-many, SHOULD) —
+  reverse turned out to be a modest addition once forward's relation-resolution
+  and stitching machinery existed, so both landed together rather than deferring
+  reverse to a follow-up.
+- Implementation: **stitch, not JOIN** — the base query runs as before, then one
+  additional parameterized `SELECT ... WHERE <join_col> IN ($1,...)` per embed
+  (keyed by the distinct non-NULL join values collected from the base result),
+  through the identical `run_stmt` enforced path (`authorize_sql_as_principal` +
+  `execute_sql_params_as_principal`) as everything else in `rest_resource.rs`.
+  Nesting happens in Rust after both enforced queries return. Chosen over a
+  generated JOIN because it keeps RLS/grant enforcement on the embedded table
+  trivially correct (it's the exact same enforced single-table query path,
+  never a new join-aware enforcement surface) — the explicit tradeoff the C2
+  scope note called out, resolved in the "usually simpler, keeps enforcement
+  trivially correct" direction.
+- Relationship resolution (`resolve_relation` in `rest_resource.rs`) is purely
+  catalog-derived: matches the embed name against the base table's FK columns
+  (forward) or another table's FK columns targeting the base table (reverse),
+  including a `_id`-suffix-stripped alias (`customer_id` → `customer`).
+  Zero matches → `400 UNKNOWN_RELATIONSHIP`; more than one → `400
+  AMBIGUOUS_RELATIONSHIP` (never a silent first-match). Composite (multi-column)
+  FKs are out of scope for v1 embedding.
+- Tests: `tests/server_rest.rs` — forward embed, filter+embed combo, reverse
+  array, unknown/ambiguous relationship (400), RLS+column-grant parity on the
+  embedded table (a restricted caller's disallowed nested row comes back
+  `null`/omitted, never leaked; an ungranted embedded column denies the whole
+  request exactly like a direct request for that column would), and injection
+  safety (a malicious filter value and a malicious relationship name are both
+  proven to be treated as data/never matched, never built into SQL text).
 
 ### C3 — OpenAPI / API-docs generation (SHOULD)
 - `GET /rest/v1/` returns an OpenAPI 3 document generated from the catalog
@@ -62,8 +92,13 @@ build this on.
 ## Acceptance
 - CRUD over `/rest/v1/<t>` with the full operator matrix, proven against a
   differential SQL equivalent; RLS/grant enforcement identical to `/sql` (a
-  restricted user sees the same rows both ways) — integration tests.
+  restricted user sees the same rows both ways) — integration tests. ✅ (C1)
 - Injection safety proven: params never string-concatenated into SQL; a malicious
-  `col`/value cannot escape the plan builder.
-- OpenAPI doc validates and round-trips the catalog schema.
+  `col`/value cannot escape the plan builder. ✅ (C1); extended to embed names and
+  embed-query values (C2) — a malicious relationship name is matched against
+  catalog metadata only (never reaches SQL text) and simply fails to resolve.
+- OpenAPI doc validates and round-trips the catalog schema. ✅ (C3)
+- Embedded resources (C2): FK relationship resolved from catalog metadata only
+  (no per-table logic); RLS/grants enforced identically on the embedded table;
+  ambiguous/unknown relationships rejected with a clear 400. ✅ (C2)
 - Metrics/outcomes in `PROGRESS.md` per §6.
