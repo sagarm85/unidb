@@ -47,26 +47,42 @@ resource-oriented, auto-generated API in the PostgREST sense — `/sql` and
 
 ## Authentication
 
-JWT bearer auth (HS256). The server validates a token signed with a shared
-secret (`UNIDB_JWT_SECRET`) on every data-plane route.
+JWT bearer auth. One server verifies with exactly one algorithm at a time:
+
+- **HS256** (default) — a shared secret (`UNIDB_JWT_SECRET`).
+- **RS256 / ES256** (item 121 A6, optional) — an asymmetric **public** key
+  (`UNIDB_JWT_PUBLIC_KEY`, PEM), for verifying tokens minted by an external
+  IdP without this server ever holding a shared secret. The algorithm (RSA
+  vs EC/P-256) is auto-detected from the key; see
+  [`GET /.well-known/jwks.json`](#get-well-knownjwksjson--public-key-discovery-item-121-a6).
 
 Token **verification** is always on. Token **issuance** is an optional
-built-in auth service (items 121/122): with a signing key configured
-(`UNIDB_DEV_LOGIN=1` today), the server offers real password login, signup,
-and refresh-token sessions — see [`POST /auth/login`](#post-authlogin--password-login),
+built-in auth service (items 121/122): with a signing key configured —
+`UNIDB_JWT_SIGNING_KEY` (item 121 A5, the first-class production path) or
+`UNIDB_DEV_LOGIN=1` (pre-A5, still supported) — the server offers real
+password login, signup, and refresh-token sessions — see
+[`POST /auth/login`](#post-authlogin--password-login),
 [`POST /auth/signup`](#post-authsignup--self-service-signup),
 [`POST /auth/refresh`](#post-authrefresh--exchange-a-refresh-token), and
 [`POST /auth/logout`](#post-authlogout--revoke-a-session). You may still
-bring tokens from an external issuer instead; the two modes coexist.
+bring tokens from an external issuer instead; the two modes coexist. Local
+issuance is HS256-only and is **disabled outright** when `UNIDB_JWT_PUBLIC_KEY`
+is set (an HS256-signed local token could never verify against a configured
+asymmetric public key).
 
 > **Correction (2026-07-31):** earlier versions of this section stated "there
 > is no login endpoint, no user database, and no session state." That is no
 > longer true — items 121/122 added an argon2id credential store, password
 > login/signup, and hash-only refresh-token sessions. Verify-only remains the
-> *default posture* when no signing key is configured.
+> *default posture* when no signing key is configured. **Update (2026-07-31,
+> item 121 A5/A6):** issuance now has a first-class production path
+> (`UNIDB_JWT_SIGNING_KEY`, independent of `UNIDB_DEV_LOGIN`), and verification
+> supports asymmetric RS256/ES256 via `UNIDB_JWT_PUBLIC_KEY` plus a
+> `GET /.well-known/jwks.json` discovery route.
 
 ```
-Authorization: Bearer <jwt signed with UNIDB_JWT_SECRET, HS256>
+Authorization: Bearer <jwt signed with UNIDB_JWT_SECRET (HS256), or with the
+private key matching UNIDB_JWT_PUBLIC_KEY (RS256/ES256)>
 ```
 
 For local testing, generate a token with `scripts/gen_jwt.sh` (pure bash +
@@ -1320,10 +1336,38 @@ GET /auth/meta
 | `dev_login_enabled` | `true` only when server is started with `UNIDB_DEV_LOGIN=1` |
 | `signup_enabled` | `true` only when started with `UNIDB_ALLOW_SIGNUP=1` (item 121 A3) |
 
+#### `GET /.well-known/jwks.json` — public key discovery (item 121 A6)
+
+Returns the server's configured asymmetric public key as a [JWK
+Set](https://www.rfc-editor.org/rfc/rfc7517), so an external verifier (or a
+client SDK) can fetch it instead of hard-coding key material. **Public — no
+JWT required.**
+
+```
+GET /.well-known/jwks.json
+```
+
+**Response** `200 OK` — RSA example (`UNIDB_JWT_PUBLIC_KEY` is an RSA key):
+```json
+{ "keys": [ { "kty": "RSA", "use": "sig", "alg": "RS256", "n": "<base64url modulus>", "e": "<base64url exponent>" } ] }
+```
+EC example (`UNIDB_JWT_PUBLIC_KEY` is a P-256 key):
+```json
+{ "keys": [ { "kty": "EC", "use": "sig", "alg": "ES256", "crv": "P-256", "x": "<base64url>", "y": "<base64url>" } ] }
+```
+When the server verifies HS256 only (no `UNIDB_JWT_PUBLIC_KEY` configured):
+```json
+{ "keys": [] }
+```
+The HS256 shared secret is never published here — there is nothing to publish
+for a symmetric key, and this route only ever serializes a public key.
+
 #### `POST /auth/login` — password login
 
-> Requires a signing key (`UNIDB_DEV_LOGIN=1` today; a first-class production
-> issuer is item 121 A5). When no signing key is configured the route returns
+> Requires a signing key: `UNIDB_JWT_SIGNING_KEY` (item 121 A5, the
+> first-class production path) or `UNIDB_DEV_LOGIN=1` (pre-A5, still
+> supported). When neither is configured — or `UNIDB_JWT_PUBLIC_KEY`
+> (asymmetric verify mode, item 121 A6) is set instead — the route returns
 > the "issuance disabled" error. Pair with rate-limiting (item I1) before
 > production exposure.
 
@@ -1357,8 +1401,8 @@ no credential — uniform); issuance-disabled error when no signing key is set.
 #### `POST /auth/signup` — self-service signup
 
 > **Disabled by default.** Enable with `UNIDB_ALLOW_SIGNUP=1` **and** a configured
-> signing key. When disabled the route returns `404` (indistinguishable from a
-> non-existent route). Item 121 A3.
+> signing key (`UNIDB_JWT_SIGNING_KEY` or `UNIDB_DEV_LOGIN=1`). When disabled the
+> route returns `404` (indistinguishable from a non-existent route). Item 121 A3.
 
 Creates a **non-superuser** with an argon2id credential and returns the same
 token pair as login. Duplicate usernames are rejected; the user is only created

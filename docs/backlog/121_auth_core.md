@@ -1,7 +1,7 @@
 # Auth core — credentials, real login, sessions (Workstream A)
 
 **Type:** Milestone
-**Status:** IN PROGRESS — A1 (argon2id credential store) + A2 (real password login,
+**Status:** SHIPPED (all of A1–A6) — A1 (argon2id credential store) + A2 (real password login,
 enumeration/timing-oracle closed) SHIPPED on branch
 `claude/permissions-security-supabase-comparison-ixho2w` (commit `fcd320a`; item121
 tests 7/7, crash 54/54). **A3 (signup) + A4 (refresh tokens/sessions/logout) SHIPPED**
@@ -10,8 +10,17 @@ default off, 404 when disabled), `POST /auth/refresh` (verify + rotate opaque
 256-bit refresh tokens, sessions persisted in `roles.json` keyed by SHA-256 hash —
 never the raw token), `POST /auth/logout` (idempotent revoke). Login/signup now
 return `{token, access_token, refresh_token, expires_in}` (`token` kept as a
-deprecated alias). item121 tests 16/16, crash 54/54. Remaining: A5 prod issuer,
-A6 asymmetric JWT.
+deprecated alias). item121 tests 16/16, crash 54/54. **A5 (production issuer) + A6
+(asymmetric JWT + JWKS) SHIPPED** same branch (commit `68332cf`):
+`UNIDB_JWT_SIGNING_KEY` makes issuance a first-class production capability
+independent of `UNIDB_DEV_LOGIN` (kept, back-compat); `UNIDB_JWT_PUBLIC_KEY` (PEM)
+switches verification to RS256/ES256 (RSA vs EC/P-256 auto-detected), disabling
+local issuance in that mode; new `GET /.well-known/jwks.json` (public) serves the
+configured public key as a JWK Set, `{"keys":[]}` for HS256-only servers — the
+shared secret is never published. Asymmetric (private-key) issuance deliberately
+deferred — verify-side asymmetric + HS256 issuance covers the stated use case; see
+`src/server/auth.rs`'s module doc. 9 new integration tests + 6 new unit tests, all
+green; existing item100/item121/item122/server_auth tests unchanged; crash 54/54.
 
 > Turns the existing dev-only, passwordless identification surface into a real
 > authentication service: stored credentials, password login, signup, refresh

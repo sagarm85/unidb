@@ -209,7 +209,9 @@ Key environment variables:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `UNIDB_JWT_SECRET` | required | HMAC secret for JWT auth |
+| `UNIDB_JWT_SECRET` | required | HMAC secret for HS256 JWT verification |
+| `UNIDB_JWT_SIGNING_KEY` | unset | Item 121 A5: enables token issuance (`/auth/login`/`signup`/`refresh`) as a first-class production capability, independent of `UNIDB_DEV_LOGIN` |
+| `UNIDB_JWT_PUBLIC_KEY` | unset | Item 121 A6: PEM public key (RSA or EC/P-256, auto-detected) — switches verification to asymmetric RS256/ES256 and disables local issuance; published at `GET /.well-known/jwks.json` |
 | `UNIDB_DATA_DIR` | `/tmp/unidb` | Storage directory |
 | `UNIDB_BIND_ADDR` | `127.0.0.1:8080` | Listen address |
 | `UNIDB_TXN_IDLE_TIMEOUT_SECS` | `60` | Timeout for idle HTTP transaction sessions |
