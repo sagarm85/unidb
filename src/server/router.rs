@@ -1,8 +1,10 @@
 //! `build_router` assembles every route onto one `axum::Router`. Data-plane
-//! routes live in a `protected` sub-router wrapped with the verify-only JWT
-//! middleware (`auth::require_jwt`); `GET /metrics` lives in a separate
-//! `public` sub-router that never sees that layer — Prometheus scrapers
-//! don't carry app-level bearer tokens (see `auth.rs`'s module doc). Both
+//! routes live in a `protected` sub-router wrapped with the JWT middleware
+//! (`auth::require_jwt`, HS256 or item 121 A6's RS256/ES256 depending on
+//! config); `GET /metrics` and `GET /.well-known/jwks.json` (item 121 A6)
+//! live in a separate `public` sub-router that never sees that layer —
+//! neither a Prometheus scraper nor an external JWKS-fetching verifier
+//! carries an app-level bearer token (see `auth.rs`'s module doc). Both
 //! merge under one top-level `PrometheusMetricLayer` (so `/metrics`
 //! requests themselves are counted too) plus `tower-http`'s trace/CORS/
 //! timeout middleware.
@@ -35,6 +37,12 @@ pub fn build_router(
     prometheus_layer: PrometheusMetricLayer<'static>,
     metric_handle: PrometheusHandle,
 ) -> Router {
+    // Item 121 A6: computed once, before `jwt_config` is moved into the
+    // `require_jwt` middleware below — the JWKS document never changes at
+    // runtime (it mirrors whatever key material startup configured), so
+    // there is nothing to recompute per-request.
+    let jwks_document = jwt_config.jwks_document();
+
     let protected = Router::new()
         .route("/txn/begin", post(handlers::post_txn_begin))
         .route("/txn/{txn_id}/commit", post(handlers::post_txn_commit))
@@ -150,8 +158,8 @@ pub fn build_router(
     // item 100: public auth routes — no JWT middleware.
     // GET /auth/meta   → blank-slate discovery (open_mode, privilege types, catalog tables).
     // POST /auth/login → real password login (item 121 A1/A2: argon2id credential
-    //   verification), still gated behind UNIDB_DEV_LOGIN=1 pending a first-class
-    //   production issuer configuration (item 121 A5).
+    //   verification); issuance is now a first-class production capability
+    //   (item 121 A5, UNIDB_JWT_SIGNING_KEY) as well as UNIDB_DEV_LOGIN=1.
     let auth_public = Router::new()
         .route("/auth/meta", get(handlers::get_auth_meta))
         .route("/auth/login", post(handlers::post_auth_login))
@@ -163,25 +171,39 @@ pub fn build_router(
         .with_state(state.clone());
 
     let metrics_state = state;
-    let public = Router::new().route(
-        "/metrics",
-        get(move || {
-            let handle = metric_handle.clone();
-            let state = metrics_state.clone();
-            async move {
-                if let Ok(stats) = state.engine.stats().await {
-                    publish_engine_metrics(&stats);
-                    // Server-session panel (item 12/21) — reads AppState, not
-                    // the engine, so it lives here rather than in `stats()`.
-                    metrics::gauge!("unidb_open_txn_sessions").set(state.sessions.len() as f64);
-                    metrics::gauge!("unidb_open_cursors").set(state.cursors.len() as f64);
-                    metrics::gauge!("unidb_idle_reaper_aborts_total")
-                        .set(state.sessions.reaper_aborts() as f64);
+    let public = Router::new()
+        .route(
+            "/metrics",
+            get(move || {
+                let handle = metric_handle.clone();
+                let state = metrics_state.clone();
+                async move {
+                    if let Ok(stats) = state.engine.stats().await {
+                        publish_engine_metrics(&stats);
+                        // Server-session panel (item 12/21) — reads AppState, not
+                        // the engine, so it lives here rather than in `stats()`.
+                        metrics::gauge!("unidb_open_txn_sessions").set(state.sessions.len() as f64);
+                        metrics::gauge!("unidb_open_cursors").set(state.cursors.len() as f64);
+                        metrics::gauge!("unidb_idle_reaper_aborts_total")
+                            .set(state.sessions.reaper_aborts() as f64);
+                    }
+                    handle.render()
                 }
-                handle.render()
-            }
-        }),
-    );
+            }),
+        )
+        // item 121 A6: GET /.well-known/jwks.json — public, no JWT required
+        // (a verifier fetching keys can't present one yet). Returns the
+        // configured asymmetric public key as a JWK Set, or `{"keys":[]}`
+        // when this server verifies HS256 only — see `JwtConfig::
+        // jwks_document`'s doc comment for why the HS256 secret can never
+        // leak through this route.
+        .route(
+            "/.well-known/jwks.json",
+            get(move || {
+                let doc = jwks_document.clone();
+                async move { axum::Json(doc) }
+            }),
+        );
 
     Router::new()
         .merge(protected)

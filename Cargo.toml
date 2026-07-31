@@ -44,7 +44,10 @@ tokio = { version = "1.52", optional = true, features = ["sync", "rt", "rt-multi
 axum = { version = "0.8", optional = true }
 tower = { version = "0.5", optional = true }
 tower-http = { version = "0.7", optional = true, features = ["trace", "cors", "timeout"] }
-jsonwebtoken = { version = "10", optional = true, default-features = false, features = ["aws_lc_rs"] }
+# item 121, A6: "use_pem" enables DecodingKey::from_rsa_pem/from_ec_pem and
+# EncodingKey::from_rsa_pem/from_ec_pem (RS256/ES256 asymmetric JWT), in
+# addition to the existing HS256 "aws_lc_rs" shared-secret path.
+jsonwebtoken = { version = "10", optional = true, default-features = false, features = ["aws_lc_rs", "use_pem"] }
 metrics = { version = "0.24", optional = true }
 metrics-exporter-prometheus = { version = "0.18", optional = true, default-features = false }
 axum-prometheus = { version = "0.10", optional = true }
@@ -78,7 +81,7 @@ unidb-storage = { path = "unidb-storage" }
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
-jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 futures-util = "0.3"
 # Phase 4 differential correctness: join/aggregate/subquery results are checked
 # against SQLite on the same data. `bundled` compiles its own SQLite C library

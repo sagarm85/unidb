@@ -17,9 +17,33 @@
 //!   cleanup entirely.
 //! - `UNIDB_PAGE_SIZE` (default `0`, meaning `Engine::open`'s own default).
 //! - `UNIDB_BIND_ADDR` (default `127.0.0.1:8080`).
-//! - `UNIDB_JWT_SECRET` (**required**): HMAC secret for verify-only JWT
-//!   auth (`server::auth`). No default — refusing to start without an
-//!   explicit secret is safer than silently running unauthenticated.
+//! - `UNIDB_JWT_SECRET` (**required**): HMAC secret for HS256 JWT
+//!   verification (`server::auth`). No default — refusing to start without
+//!   an explicit secret is safer than silently running unauthenticated.
+//!   Superseded for verification by `UNIDB_JWT_PUBLIC_KEY` when that is set
+//!   (still required either way; see below).
+//! - `UNIDB_JWT_SIGNING_KEY` (item 121 A5, optional): an explicit HS256
+//!   signing secret that makes token issuance (`POST /auth/login`/`signup`/
+//!   `refresh`) a first-class **production** capability, independent of the
+//!   dev-only flag below. When set, this secret is used for BOTH verifying
+//!   and issuing tokens (HS256 requires the same secret both ways) —
+//!   superseding `UNIDB_JWT_SECRET` for that purpose. Takes precedence over
+//!   `UNIDB_DEV_LOGIN` if both are set. Not compatible with
+//!   `UNIDB_JWT_PUBLIC_KEY` (asymmetric verify mode disables local issuance
+//!   entirely — see below).
+//! - `UNIDB_DEV_LOGIN` (`1`/`true`, optional, pre-A5): back-compat alias for
+//!   "enable issuance using `UNIDB_JWT_SECRET` as the signing secret." Kept
+//!   working unchanged; `UNIDB_JWT_SIGNING_KEY` is the documented production
+//!   path going forward.
+//! - `UNIDB_JWT_PUBLIC_KEY` (item 121 A6, optional, PEM text): switches JWT
+//!   verification to asymmetric RS256/ES256 — accepts tokens signed by an
+//!   external IdP's matching private key. The concrete algorithm (RSA vs
+//!   EC/P-256) is auto-detected from the key itself. Local token issuance is
+//!   disabled outright in this mode (an HS256-signed local token could never
+//!   verify against an asymmetric public key) — `UNIDB_JWT_SIGNING_KEY` and
+//!   `UNIDB_DEV_LOGIN` are ignored (with a warning logged) if also set. The
+//!   configured public key is served, JWK-encoded, at `GET
+//!   /.well-known/jwks.json`.
 //!
 //! Logging goes to **both** stdout (so `docker logs`/interactive/systemd
 //! journal capture still works unchanged) and a rolling daily file under
@@ -180,20 +204,65 @@ async fn main() {
     // without a crate cycle). A custom embedding binary that depends on both
     // `unidb` and `unidb-storage` can call `.with_storage(Some(Arc::new(svc)))`.
     // All /storage/* routes return 503 when state.storage is None.
-    // item 100: UNIDB_DEV_LOGIN=1 activates POST /auth/login (dev/demo only —
-    // Milestone-18 "verify-only" is unchanged when this flag is absent).
+    // item 100 / item 121 A2: UNIDB_DEV_LOGIN=1 activates POST /auth/login
+    // (real argon2id password verification since A2 — the flag now only
+    // controls whether a signing key is available to issue tokens, not
+    // whether the login is "real"). Milestone-18 "verify-only" is unchanged
+    // when neither this flag nor UNIDB_JWT_SIGNING_KEY (below) is set.
     let dev_login = std::env::var("UNIDB_DEV_LOGIN")
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     if dev_login {
         tracing::warn!(
-            "UNIDB_DEV_LOGIN=1: POST /auth/login is enabled (passwordless, dev/demo only — \
-             do NOT use in production)"
+            "UNIDB_DEV_LOGIN=1: POST /auth/login/signup/refresh can issue tokens using \
+             UNIDB_JWT_SECRET as the signing key (pre-A5 back-compat path — prefer \
+             UNIDB_JWT_SIGNING_KEY for production)"
         );
     }
 
-    let jwt_config = if dev_login {
+    // item 121 A5: UNIDB_JWT_SIGNING_KEY makes issuance a first-class,
+    // explicitly-configured production capability — independent of the
+    // dev-only flag above (which stays working for back-compat). HS256
+    // requires the same secret to sign and verify, so when this is set it
+    // is used for BOTH: it supersedes UNIDB_JWT_SECRET as the effective
+    // HS256 secret for tokens this server itself mints and verifies.
+    let jwt_signing_key = std::env::var("UNIDB_JWT_SIGNING_KEY")
+        .ok()
+        .filter(|s| !s.is_empty());
+    if let Some(ref _key) = jwt_signing_key {
+        tracing::info!(
+            "UNIDB_JWT_SIGNING_KEY is set: POST /auth/login/signup/refresh issuance is enabled \
+             (item 121 A5 production issuer) using it as the effective HS256 secret for both \
+             signing and verification, superseding UNIDB_JWT_SECRET for that purpose"
+        );
+    }
+
+    // item 121 A6: UNIDB_JWT_PUBLIC_KEY switches verification to asymmetric
+    // RS256/ES256 (accepts tokens signed by an external IdP's private key).
+    // Local issuance is disabled outright in this mode — see the module doc.
+    let jwt_public_key_pem = std::env::var("UNIDB_JWT_PUBLIC_KEY")
+        .ok()
+        .filter(|s| !s.is_empty());
+
+    let jwt_config = if let Some(pem) = jwt_public_key_pem {
+        if jwt_signing_key.is_some() || dev_login {
+            tracing::warn!(
+                "UNIDB_JWT_PUBLIC_KEY is set: asymmetric verify-only mode is active, so \
+                 UNIDB_JWT_SIGNING_KEY / UNIDB_DEV_LOGIN are ignored — POST /auth/login, \
+                 /auth/signup, and /auth/refresh cannot issue tokens (a locally HS256-signed \
+                 token could never verify against a configured asymmetric public key)"
+            );
+        }
+        tracing::info!(
+            "UNIDB_JWT_PUBLIC_KEY is set: JWT verification is asymmetric (RS256/ES256, \
+             auto-detected); the public key is served at GET /.well-known/jwks.json"
+        );
+        JwtConfig::from_asymmetric_public_pem(pem.as_bytes())
+            .unwrap_or_else(|e| panic!("invalid UNIDB_JWT_PUBLIC_KEY: {e}"))
+    } else if let Some(ref signing_key) = jwt_signing_key {
+        JwtConfig::with_signing_key(signing_key)
+    } else if dev_login {
         JwtConfig::with_dev_login(&jwt_secret)
     } else {
         JwtConfig::new(&jwt_secret)
@@ -202,8 +271,7 @@ async fn main() {
     // item 121, A3: UNIDB_ALLOW_SIGNUP=1 activates POST /auth/signup
     // (default off — opt-in, not open by default). Signup still needs a
     // token-issuing key to hand back access/refresh tokens, so it is only
-    // useful paired with UNIDB_DEV_LOGIN=1 until A5 ships a first-class
-    // production issuer configuration.
+    // useful paired with UNIDB_JWT_SIGNING_KEY (A5) or UNIDB_DEV_LOGIN=1.
     let allow_signup = std::env::var("UNIDB_ALLOW_SIGNUP")
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -218,7 +286,13 @@ async fn main() {
     let state = {
         let mut s =
             AppState::new(Arc::new(engine_handle)).with_log_dir(std::path::PathBuf::from(&log_dir));
-        if dev_login {
+        // `AppState::with_dev_login` just stores "the config that can mint
+        // tokens" — checking `encoding_key.is_some()` (rather than
+        // re-deriving the dev_login/signing_key/public_key branching here)
+        // is the single source of truth: it's `None` in every disabled case,
+        // including asymmetric-verify mode, where issuance is unconditionally
+        // off regardless of what UNIDB_DEV_LOGIN/UNIDB_JWT_SIGNING_KEY say.
+        if jwt_config.encoding_key.is_some() {
             s = s.with_dev_login(jwt_config.clone());
         }
         s.with_allow_signup(allow_signup)

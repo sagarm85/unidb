@@ -148,6 +148,69 @@ impl TestServer {
         }
     }
 
+    /// Item 121 A5 — spawn a server with a production signing-key config
+    /// (`UNIDB_JWT_SIGNING_KEY` semantics): issuance is enabled via
+    /// `JwtConfig::with_signing_key`, independent of `UNIDB_DEV_LOGIN`.
+    pub async fn spawn_with_signing_key(secret: &str) -> Self {
+        let tempdir = tempfile::tempdir().unwrap();
+        let data_dir = tempdir.path().to_path_buf();
+        let log_dir = data_dir.join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let engine = EngineHandle::spawn(tempdir.path(), 0).unwrap();
+        let jwt_config = JwtConfig::with_signing_key(secret);
+        let state = AppState::with_config(Arc::new(engine), SessionConfig::default())
+            .with_log_dir(log_dir.clone())
+            .with_dev_login(jwt_config.clone());
+        let (prometheus_layer, metric_handle) = metrics_pair().clone();
+        let router = build_router(state, jwt_config, prometheus_layer, metric_handle);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        Self {
+            addr,
+            data_dir,
+            log_dir,
+            _tempdir: tempdir,
+            _server_task: server_task,
+        }
+    }
+
+    /// Item 121 A6 — spawn a server in asymmetric verify-only mode
+    /// (`UNIDB_JWT_PUBLIC_KEY` semantics): verification uses the supplied PEM
+    /// public key (RSA or EC/P-256, auto-detected); local issuance stays
+    /// disabled, matching `unidb-server.rs`'s startup wiring.
+    pub async fn spawn_with_asymmetric_public_pem(pem: &[u8]) -> Self {
+        let tempdir = tempfile::tempdir().unwrap();
+        let data_dir = tempdir.path().to_path_buf();
+        let log_dir = data_dir.join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let engine = EngineHandle::spawn(tempdir.path(), 0).unwrap();
+        let jwt_config = JwtConfig::from_asymmetric_public_pem(pem)
+            .expect("test PEM must parse as a supported RSA or EC public key");
+        let state = AppState::with_config(Arc::new(engine), SessionConfig::default())
+            .with_log_dir(log_dir.clone());
+        let (prometheus_layer, metric_handle) = metrics_pair().clone();
+        let router = build_router(state, jwt_config, prometheus_layer, metric_handle);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        Self {
+            addr,
+            data_dir,
+            log_dir,
+            _tempdir: tempdir,
+            _server_task: server_task,
+        }
+    }
+
     pub fn url(&self, path: &str) -> String {
         format!("http://{}{}", self.addr, path)
     }

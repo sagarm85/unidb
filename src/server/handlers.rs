@@ -1073,10 +1073,10 @@ async fn issue_token_pair(
 
 /// `POST /auth/login` — public, no JWT required.
 ///
-/// Gated behind `UNIDB_DEV_LOGIN=1` at startup (unchanged from item 100;
-/// un-gating this into a first-class production issuer is item 121 A5, out
-/// of scope here). Returns 404 (via the same disabled error) when the flag
-/// is off so the route is indistinguishable from non-existent.
+/// Requires a signing key to be configured at startup — `UNIDB_JWT_SIGNING_KEY`
+/// (item 121 A5, the first-class production issuer path) or `UNIDB_DEV_LOGIN=1`
+/// (pre-A5, kept for back-compat); see `src/server/auth.rs`'s module doc for
+/// the exact precedence. Neither configured ⇒ the existing disabled error.
 ///
 /// **Item 121 A2 — real authentication.** The supplied password is verified
 /// against the user's stored argon2id credential
@@ -1098,7 +1098,7 @@ pub async fn post_auth_login(
 ) -> std::result::Result<Json<AuthLoginResponse>, ApiError> {
     let jwt_cfg = state.dev_login_jwt.as_ref().ok_or_else(|| {
         ApiError::from(crate::error::DbError::SqlPlan(
-            "POST /auth/login is disabled (set UNIDB_DEV_LOGIN=1 to enable)".into(),
+            "POST /auth/login is disabled (set UNIDB_JWT_SIGNING_KEY or UNIDB_DEV_LOGIN=1 to enable)".into(),
         ))
     })?;
     // Real credential verification (item 121 A2): unknown user, no stored
@@ -1137,12 +1137,12 @@ pub async fn post_auth_login(
 /// existing account); the password is never stored or logged in plaintext
 /// (argon2id, same as `CREATE USER ... PASSWORD`).
 ///
-/// Token issuance still requires a signing key (`UNIDB_DEV_LOGIN=1` today,
-/// pending item 121 A5's first-class production issuer) — if
-/// `UNIDB_ALLOW_SIGNUP=1` is set without a signing key configured, this
-/// returns the same "disabled" error `POST /auth/login` does, *before*
-/// creating the user, so a signup attempt that can't hand back a usable
-/// token never leaves an orphaned account behind.
+/// Token issuance still requires a signing key — `UNIDB_JWT_SIGNING_KEY`
+/// (item 121 A5, production) or `UNIDB_DEV_LOGIN=1` (back-compat) — if
+/// `UNIDB_ALLOW_SIGNUP=1` is set without either, this returns the same
+/// "disabled" error `POST /auth/login` does, *before* creating the user, so
+/// a signup attempt that can't hand back a usable token never leaves an
+/// orphaned account behind.
 pub async fn post_auth_signup(
     State(state): State<AppState>,
     Json(body): Json<crate::server::dto::AuthSignupRequest>,
@@ -1152,9 +1152,15 @@ pub async fn post_auth_signup(
             "POST /auth/signup is disabled (set UNIDB_ALLOW_SIGNUP=1 to enable)",
         ));
     }
+    // `state.dev_login_jwt` holds the issuing `JwtConfig` whenever issuance
+    // is enabled at all — via `UNIDB_DEV_LOGIN=1` (its original name/purpose)
+    // or item 121 A5's `UNIDB_JWT_SIGNING_KEY` production path; both wire
+    // through the same `AppState::with_dev_login` setter (see
+    // `src/bin/unidb-server.rs`), so this field name predates but still
+    // accurately describes "the config that can mint tokens."
     let jwt_cfg = state.dev_login_jwt.as_ref().ok_or_else(|| {
         ApiError::from(crate::error::DbError::SqlPlan(
-            "POST /auth/signup cannot issue tokens (set UNIDB_DEV_LOGIN=1 to enable a signing key)"
+            "POST /auth/signup cannot issue tokens (set UNIDB_JWT_SIGNING_KEY or UNIDB_DEV_LOGIN=1 to enable a signing key)"
                 .into(),
         ))
     })?;
@@ -1179,16 +1185,16 @@ pub async fn post_auth_signup(
 /// way to distinguish *why* refresh failed.
 ///
 /// The signing-key check happens **before** touching session state
-/// (verify/rotate), so a server temporarily unable to issue tokens
-/// (`UNIDB_DEV_LOGIN` off) never revokes a still-good refresh token only to
-/// fail handing back its replacement.
+/// (verify/rotate), so a server temporarily unable to issue tokens (neither
+/// `UNIDB_JWT_SIGNING_KEY` nor `UNIDB_DEV_LOGIN` configured) never revokes a
+/// still-good refresh token only to fail handing back its replacement.
 pub async fn post_auth_refresh(
     State(state): State<AppState>,
     Json(body): Json<crate::server::dto::AuthRefreshRequest>,
 ) -> std::result::Result<Json<AuthLoginResponse>, ApiError> {
     let jwt_cfg = state.dev_login_jwt.as_ref().ok_or_else(|| {
         ApiError::from(crate::error::DbError::SqlPlan(
-            "POST /auth/refresh cannot issue tokens (set UNIDB_DEV_LOGIN=1 to enable a signing key)"
+            "POST /auth/refresh cannot issue tokens (set UNIDB_JWT_SIGNING_KEY or UNIDB_DEV_LOGIN=1 to enable a signing key)"
                 .into(),
         ))
     })?;
