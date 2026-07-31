@@ -126,8 +126,9 @@ use crate::{
     sql::{
         executor::{self, ExecCtx, ExecResult},
         logical::{
-            apply_rls, apply_rls_skip_current_user, bind_params, substitute_auth_context_in_plan,
-            substitute_current_user_in_plan, Expr, Literal, LogicalPlan,
+            apply_rls, apply_rls_skip_current_user, apply_rls_with_auth, bind_params,
+            substitute_auth_context_in_plan, substitute_current_user_in_plan, Expr, Literal,
+            LogicalPlan,
         },
         parser::parse_sql,
         query::{FromNode, QuerySpec},
@@ -2412,7 +2413,7 @@ impl Engine {
             let mut plan = if skip_rls {
                 plan
             } else {
-                apply_rls(plan, &cat_read(&self.catalog), user)
+                apply_rls_with_auth(plan, &cat_read(&self.catalog), user, &principal.claims)
             };
             // Substitute again to resolve any CurrentUser/AuthUid/AuthClaim
             // nodes the RLS policy injected.

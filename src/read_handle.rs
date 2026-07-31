@@ -29,7 +29,7 @@ use crate::heap::RowId;
 use crate::mvcc::is_visible;
 use crate::sql::executor::{exec_select_readonly, plan_is_concurrent_read, ExecResult};
 use crate::sql::logical::{
-    apply_rls, apply_rls_skip_current_user, substitute_auth_context_in_plan,
+    apply_rls_skip_current_user, apply_rls_with_auth, substitute_auth_context_in_plan,
     substitute_current_user_in_plan, LogicalPlan,
 };
 use crate::sql::parser::parse_sql;
@@ -144,7 +144,7 @@ impl ReadHandle {
                 apply_rls_skip_current_user(plan, &self.catalog_read())
             } else {
                 // Regular named user: apply all applicable policies.
-                apply_rls(plan, &self.catalog_read(), user)
+                apply_rls_with_auth(plan, &self.catalog_read(), user, claims)
             };
             // Second substitution resolves CurrentUser/AuthUid/AuthClaim nodes
             // injected by the RLS policy expressions (only matters for the

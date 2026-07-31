@@ -803,13 +803,25 @@ fn delete_policy_for_skip_current_user(catalog: &Catalog, table: &str) -> Option
 /// fallback turned it into `Bool(true)`, making `owner = current_user` into
 /// `owner = TRUE` → a coercion error on every RLS+LIMIT query, and a silent
 /// policy weakening in shapes where `Bool` type-checks).
-pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog, user: Option<&str>) -> LogicalPlan {
-    // Policy fetcher with current_user resolved at fetch time (see doc above).
+pub fn apply_rls_with_auth(
+    plan: LogicalPlan,
+    catalog: &Catalog,
+    user: Option<&str>,
+    claims: &BTreeMap<String, JsonValue>,
+) -> LogicalPlan {
+    // Policy fetcher with current_user AND auth.uid()/auth.jwt() resolved at
+    // fetch time — BEFORE the Expr→QExpr conversion (the Query/Explain path)
+    // destroys them. Item 110 established this for current_user; item 122
+    // extends it to the auth context, or a policy like
+    // `tenant_id = (auth.jwt() ->> 'tenant')` reaches QExpr unsubstituted and
+    // fails closed to NULL → 0 rows on the happy (LIMIT/JOIN/GROUP BY) path.
     let policy_sub = |pol: Option<Expr>| -> Option<Expr> {
         pol.map(|mut e| {
             if let Some(u) = user {
                 substitute_current_user_in_expr(&mut e, u);
             }
+            // Fail closed on a missing subject/claim (Null), never Bool(true).
+            substitute_auth_context_in_expr(&mut e, user, claims);
             e
         })
     };
@@ -876,8 +888,8 @@ pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog, user: Option<&str>) -> Lo
             right,
         } => {
             // Apply RLS to both branches of a set operation recursively.
-            let left = Box::new(apply_rls(*left, catalog, user));
-            let right = Box::new(apply_rls(*right, catalog, user));
+            let left = Box::new(apply_rls_with_auth(*left, catalog, user, claims));
+            let right = Box::new(apply_rls_with_auth(*right, catalog, user, claims));
             LogicalPlan::SetOp {
                 op,
                 all,
@@ -894,6 +906,14 @@ pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog, user: Option<&str>) -> Lo
         | LogicalPlan::Truncate { .. }
         | LogicalPlan::Analyze { .. }) => other,
     }
+}
+
+/// Back-compat shim for callers with no verified auth claims (the embedded /
+/// params path and unit tests that don't exercise `auth.jwt()`): applies RLS
+/// with an empty claim set, so any `auth.jwt()`/`auth.uid()` in a policy fails
+/// closed to NULL exactly as it would for an unauthenticated caller.
+pub fn apply_rls(plan: LogicalPlan, catalog: &Catalog, user: Option<&str>) -> LogicalPlan {
+    apply_rls_with_auth(plan, catalog, user, &BTreeMap::new())
 }
 
 /// SELECT-context policy: `rls_policy` (SELECT + ALL scoped).
