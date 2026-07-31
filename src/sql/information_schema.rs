@@ -62,6 +62,9 @@ pub const RELATIONS: &[&str] = &[
     // item-24 Z4: role membership + users catalog.
     "unidb_catalog.role_members",
     "unidb_catalog.users",
+    // item 4 (Studio session listing): refresh-token sessions, stripped to
+    // non-secret fields — never the raw token or its SHA-256 hash.
+    "unidb_catalog.sessions",
 ];
 
 /// Is `name` one of the reserved introspection relations? Case-insensitive so
@@ -160,12 +163,27 @@ pub fn virtual_schema(name: &str) -> Option<Vec<ColumnRef>> {
             // item-24 R-b: false when policy exists but no CREATE USER has been run
             // (bootstrap mode — all RLS is silently inactive until the first user).
             ("enforced", ColumnType::Bool),
+            // item 122 B4 / item-24-follow-up: `PolicyDef::target_roles` rendered
+            // as a comma-joined, alphabetically-sorted list of role names for a
+            // `CREATE POLICY … TO <roles>` policy; `*` marks a no-`TO` policy
+            // (applies to every caller — see `policies_rows`'s doc comment).
+            // Appended at the end to keep existing column order stable.
+            ("target_roles", ColumnType::Text),
         ],
         // item-24 Z4: role membership + users catalog.
         "unidb_catalog.role_members" => &[("role", ColumnType::Text), ("member", ColumnType::Text)],
         "unidb_catalog.users" => &[
             ("name", ColumnType::Text),
             ("is_superuser", ColumnType::Bool),
+        ],
+        // item 4: session listing (Studio "active sessions" panel). Never a
+        // token or its hash — see `sessions_rows`'s doc comment.
+        "unidb_catalog.sessions" => &[
+            ("session_id", ColumnType::Text),
+            ("username", ColumnType::Text),
+            ("created_at", ColumnType::Int64),
+            ("expires_at", ColumnType::Int64),
+            ("revoked", ColumnType::Bool),
         ],
         _ => return None,
     };
@@ -246,6 +264,8 @@ pub fn virtual_rows(
         // item-24 Z4: role membership + users catalog.
         "unidb_catalog.role_members" => authz.map(role_members_rows).unwrap_or_default(),
         "unidb_catalog.users" => authz.map(users_rows).unwrap_or_default(),
+        // item 4: per-caller filtered session listing (mirrors item 111).
+        "unidb_catalog.sessions" => sessions_rows(authz, user),
         // Only reached if a caller passes a non-relation name; the planner
         // guards this, so an empty set is a safe, non-panicking fallback.
         _ => Vec::new(),
@@ -726,11 +746,17 @@ fn users_rows(authz: &crate::authz::RoleStore) -> Vec<Vec<Literal>> {
 
 /// `unidb_catalog.policies` — one row per named policy across all tables.
 ///
-/// Columns: name, table_name, operation, using_expr, with_check_expr, enforced.
+/// Columns: name, table_name, operation, using_expr, with_check_expr, enforced,
+/// target_roles.
 /// `with_check_expr` is NULL when no explicit WITH CHECK was supplied (the USING
 /// expression doubles as the write-side check in that case).
 /// `enforced` is false when policies exist but no users have been created —
 /// bootstrap mode means RLS is silently inactive (item-24 R-b).
+/// `target_roles` (item 122 B4) renders `PolicyDef::target_roles` as a
+/// comma-joined, alphabetically-sorted list of role names for a `CREATE
+/// POLICY … TO <roles>` policy, or the literal `*` when the list is empty
+/// (no `TO` clause — the policy applies to every caller, per the field's
+/// back-compat contract documented on `PolicyDef::target_roles`).
 fn policies_rows(defs: &[&TableDef], authz: Option<&crate::authz::RoleStore>) -> Vec<Vec<Literal>> {
     // Bootstrap mode: policies present, but no users → not enforced.
     let enforced = authz.map(|a| a.has_users()).unwrap_or(true);
@@ -742,6 +768,13 @@ fn policies_rows(defs: &[&TableDef], authz: Option<&crate::authz::RoleStore>) ->
                 .as_deref()
                 .map(|s| Literal::Text(s.to_string()))
                 .unwrap_or(Literal::Null);
+            let target_roles = if p.target_roles.is_empty() {
+                "*".to_string()
+            } else {
+                let mut roles = p.target_roles.clone();
+                roles.sort();
+                roles.join(",")
+            };
             rows.push(vec![
                 t(&p.name),
                 t(&p.table),
@@ -749,6 +782,7 @@ fn policies_rows(defs: &[&TableDef], authz: Option<&crate::authz::RoleStore>) ->
                 t(&p.using_expr),
                 with_check,
                 Literal::Bool(enforced),
+                t(&target_roles),
             ]);
         }
     }
@@ -760,6 +794,47 @@ fn policies_rows(defs: &[&TableDef], authz: Option<&crate::authz::RoleStore>) ->
         _ => std::cmp::Ordering::Equal,
     });
     rows
+}
+
+/// `unidb_catalog.sessions` — one row per refresh-token session (item 4:
+/// Studio "active sessions" panel + revoke-by-id). Sourced from
+/// `RoleStore::list_sessions`, which already strips the raw token and its
+/// SHA-256 hash — only the opaque `session_id` (independently random, never
+/// derived from the token/hash; see `authz::SessionRec::session_id`'s doc
+/// comment) plus non-secret metadata is ever surfaced here.
+///
+/// Columns: session_id, username, created_at, expires_at, revoked.
+///
+/// Per-caller visibility mirrors item 111's `information_schema.*` model:
+/// the embedded API (`user = None`), a superuser, and bootstrap/open mode
+/// (no registered users yet) all see every session; a named non-superuser
+/// sees only sessions whose `username` matches their own subject — they can
+/// neither see nor (via the paired revoke route) act on another user's
+/// sessions.
+fn sessions_rows(authz: Option<&crate::authz::RoleStore>, user: Option<&str>) -> Vec<Vec<Literal>> {
+    let Some(az) = authz else {
+        return Vec::new();
+    };
+    let mut sessions = az.list_sessions();
+    if let Some(u) = user {
+        if az.has_users() && !az.is_superuser(u) {
+            sessions.retain(|s| s.username == u);
+        }
+    }
+    // Stable order by session_id.
+    sessions.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    sessions
+        .into_iter()
+        .map(|s| {
+            vec![
+                t(&s.session_id),
+                t(&s.username),
+                Literal::Int(s.issued_at as i64),
+                Literal::Int(s.expires_at as i64),
+                Literal::Bool(s.revoked),
+            ]
+        })
+        .collect()
 }
 
 /// Materialize `unidb_catalog.subscription_lag` rows (item 29, C3).

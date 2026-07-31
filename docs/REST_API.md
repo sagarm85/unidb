@@ -1127,6 +1127,12 @@ CREATE ROLE analyst;
 -- Create a user (optionally a superuser)
 CREATE USER admin SUPERUSER;
 
+-- Reset an existing user's password (Studio "reset password" action).
+-- Superuser-gated exactly like CREATE USER ... PASSWORD; errors if the user
+-- doesn't exist. Sets the same argon2id credential set_password()/CREATE
+-- USER ... PASSWORD use — no separate credential storage.
+ALTER USER admin PASSWORD 'new-password-here';
+
 -- Drop a role or user
 DROP ROLE analyst;
 DROP USER admin;
@@ -1504,6 +1510,26 @@ already-revoked tokens all return `204 No Content` (no state disclosure). Item 1
 ```
 **Response** `204 No Content`.
 
+#### `DELETE /auth/sessions/{id}` — revoke a specific session
+
+Revokes one refresh-token session by its opaque `session_id` (as surfaced by
+`unidb_catalog.sessions`, below — never the raw refresh token or its hash).
+Self/superuser gated: a superuser (a token with no `sub`, a named
+`SUPERUSER`, or open/bootstrap mode) may revoke any session; a named
+non-superuser may only revoke a session they own. **Idempotent and
+shape-uniform** — an unknown id and a session that belongs to someone else
+both return `204 No Content` without the foreign session being touched, so a
+non-superuser caller can never distinguish "no such session" from "that
+session isn't yours" (the same posture as `POST /auth/logout`).
+
+```
+DELETE /auth/sessions/{id}
+Authorization: Bearer <token>
+```
+
+**Response** `204 No Content` in every case (success, unknown id, or a
+foreign session left untouched).
+
 #### `GET /auth/whoami` — caller identity and privileges (item 100)
 
 Returns the authenticated caller's identity, role memberships, and per-table
@@ -1535,7 +1561,8 @@ Authorization: Bearer <token>
 
 #### Catalog virtual relations
 
-The current roles, grants, policies, role memberships, and users are queryable as virtual relations:
+The current roles, grants, policies, role memberships, users, and sessions are queryable as
+virtual relations:
 
 ```sql
 SELECT * FROM unidb_catalog.roles;
@@ -1543,14 +1570,31 @@ SELECT * FROM unidb_catalog.grants;
 SELECT * FROM unidb_catalog.policies;
 SELECT * FROM unidb_catalog.role_members;
 SELECT * FROM unidb_catalog.users;
+SELECT * FROM unidb_catalog.sessions;
 ```
 
 These are read-only virtual tables synthesized by the executor from the in-memory `RoleStore`
 (which is itself loaded from the persisted catalog at engine open). They do not correspond to
-heap pages on disk.
+heap pages on disk. Like every `unidb_catalog.*` relation, each requires its own `GRANT SELECT`
+for a non-superuser caller (item-24 Z5 — unchanged by any of the below); `information_schema.*`
+is the one that needs no grant of its own (item 111).
 
-The `policies` relation now includes `with_check_expr` (the explicit write-side predicate, or
-`NULL`) and `enforced` (`false` in bootstrap/open mode before the first user is created).
+The `policies` relation includes `with_check_expr` (the explicit write-side predicate, or
+`NULL`), `enforced` (`false` in bootstrap/open mode before the first user is created), and
+`target_roles`: the `CREATE POLICY … TO <role,...>` role scope (item 122, B4), rendered as a
+comma-joined, alphabetically-sorted list of role names (e.g. `"ops,support"`), or `*` when the
+policy has no `TO` clause (applies to every caller — the pre-B4, back-compat default). This
+column is appended after `enforced`, so existing column-position assumptions are unaffected.
+
+The `sessions` relation (Studio "active sessions" panel) lists refresh-token sessions —
+`session_id, username, created_at, expires_at, revoked` — **never** the raw refresh token or its
+SHA-256 hash. `session_id` is an independently-random opaque id (a separate 128-bit CSPRNG draw
+from the token itself, not a hash prefix or any other derivation of it), stable for the life of
+the session and usable with `DELETE /auth/sessions/{id}` above. Visibility mirrors item 111: a
+superuser (or open/bootstrap mode) sees every session; a named non-superuser sees only their own.
+A session record is retained (with `revoked = true`) after `POST /auth/refresh` rotates it or
+`DELETE /auth/sessions/{id}` revokes it — the relation is a full history of a caller's sessions,
+not just the currently-live one.
 
 #### Open-mode compatibility
 

@@ -130,10 +130,25 @@ async fn main() {
         JwtConfig::new(&jwt_secret)
     };
 
+    // item 121, A3: mirrors src/bin/unidb-server.rs — UNIDB_ALLOW_SIGNUP=1
+    // activates POST /auth/signup (default off). This binary previously never
+    // read the env var at all, so signup could never be enabled here.
+    let allow_signup = std::env::var("UNIDB_ALLOW_SIGNUP")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if allow_signup {
+        tracing::warn!(
+            "UNIDB_ALLOW_SIGNUP=1: POST /auth/signup is enabled (self-service account \
+             creation — make sure this is the posture you want in production)"
+        );
+    }
+
     let state = {
         let s = AppState::new(engine_handle)
             .with_log_dir(std::path::PathBuf::from(&log_dir))
-            .with_storage(storage);
+            .with_storage(storage)
+            .with_allow_signup(allow_signup);
         if dev_login {
             s.with_dev_login(jwt_config.clone())
         } else {

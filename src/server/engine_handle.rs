@@ -534,6 +534,24 @@ impl EngineHandle {
         self.on_engine(move |e| e.revoke_session(&raw_token)).await
     }
 
+    /// Username owning `session_id`, if any (item 4 — `DELETE
+    /// /auth/sessions/{id}`'s self/superuser ownership gate).
+    pub async fn session_owner(&self, session_id: String) -> Option<String> {
+        self.on_engine(move |e| Ok(e.session_owner(&session_id)))
+            .await
+            .unwrap_or(None)
+    }
+
+    /// Revoke a session by its opaque id, idempotently (item 4 —
+    /// `DELETE /auth/sessions/{id}`). Callers must already have checked the
+    /// caller may act on this session (superuser, or `session_owner` ==
+    /// caller) — this is the unrestricted mutation, mirroring
+    /// `revoke_session`'s own no-op-on-unknown-id posture.
+    pub async fn revoke_session_by_id(&self, session_id: String) -> Result<()> {
+        self.on_engine(move |e| e.revoke_session_by_id(&session_id))
+            .await
+    }
+
     /// Install an RLS policy from a SQL predicate string (R3).
     pub async fn set_rls_policy_sql(&self, table: String, predicate: String) -> Result<()> {
         self.on_engine(move |e| e.set_rls_policy_sql(&table, &predicate))

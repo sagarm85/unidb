@@ -1283,6 +1283,44 @@ pub async fn get_auth_whoami(
     }))
 }
 
+/// `DELETE /auth/sessions/{id}` — protected (JWT required).
+///
+/// Revoke one refresh-token session by its opaque `session_id` (item 4 —
+/// Studio "revoke a specific session" action; the id comes from
+/// `unidb_catalog.sessions`, never the raw token or its hash). Superuser/
+/// self gated, reusing the same effective-superuser rule as every other
+/// admin gate ([`EngineHandle::ensure_superuser`]): a superuser (the
+/// implicit embedded caller, a named `SUPERUSER`, or open/bootstrap mode)
+/// may revoke any session; a named non-superuser may only revoke a session
+/// they own.
+///
+/// Idempotent and deliberately shape-uniform: an unknown id and a foreign
+/// session (one that isn't the caller's) both resolve to `204 NO_CONTENT`
+/// without the foreign session being touched — this endpoint never lets a
+/// non-superuser caller distinguish "no such session" from "that session
+/// isn't yours" (the same no-oracle posture as `POST /auth/logout`).
+pub async fn delete_auth_session(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> std::result::Result<StatusCode, ApiError> {
+    let user = current_user.0.clone();
+    let is_superuser = state.engine.ensure_superuser(user.clone()).await.is_ok();
+    if !is_superuser {
+        let owner = state.engine.session_owner(session_id.clone()).await;
+        if owner.as_deref() != user.as_deref() {
+            // Unknown id or someone else's session: no-op, 204 either way.
+            return Ok(StatusCode::NO_CONTENT);
+        }
+    }
+    state
+        .engine
+        .revoke_session_by_id(session_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ── operational ──────────────────────────────────────────────────────────
 
 pub async fn post_checkpoint(

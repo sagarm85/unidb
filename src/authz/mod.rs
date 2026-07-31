@@ -165,16 +165,53 @@ fn generate_refresh_token() -> String {
     out
 }
 
+/// Generate a new opaque session id (item 4 — Studio session listing /
+/// revoke-by-id): 128 bits from the OS CSPRNG, hex-encoded. A **separate,
+/// independent** random draw from [`generate_refresh_token`] — never derived
+/// from the raw token or its SHA-256 hash (not a prefix, not a
+/// transformation) — so surfacing it via `unidb_catalog.sessions` can never
+/// leak any bit of the token or the hash keyed in [`AuthState::sessions`].
+fn generate_session_id() -> String {
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
 /// A persisted refresh-token session (item 121, A4). Keyed in [`AuthState::
 /// sessions`] by the SHA-256 hash of the raw opaque refresh token — the raw
 /// token is never stored, only ever handed to the client once, at issuance
 /// or rotation time.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SessionRec {
+    /// Opaque session id (item 4), independent of the token/hash map key —
+    /// see [`generate_session_id`]. `#[serde(default)]` (empty string) so a
+    /// pre-item-4 `roles.json` deserializes without a FORMAT_VERSION bump;
+    /// [`RoleStore::open`] backfills any empty id with a freshly generated
+    /// one immediately after load, so every in-memory `SessionRec` always
+    /// has a non-empty id once the store is open.
+    #[serde(default)]
+    session_id: String,
     username: String,
     issued_at: u64,
     expires_at: u64,
     revoked: bool,
+}
+
+/// Non-secret session summary for `unidb_catalog.sessions` (item 4 — Studio
+/// session listing). Deliberately excludes the raw refresh token and its
+/// SHA-256 hash; carries only what's safe to show a caller viewing their own
+/// (or, for a superuser, anyone's) active sessions.
+#[derive(Clone, Debug)]
+pub struct SessionView {
+    pub session_id: String,
+    pub username: String,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub revoked: bool,
 }
 
 /// Reserved built-in role: an unauthenticated / no-subject caller (item 122,
@@ -506,6 +543,18 @@ pub enum AuthStmt {
         name: String,
         table: String,
     },
+    /// `ALTER USER <name> PASSWORD '<pw>'` (Studio password reset). Superuser
+    /// gated exactly like `CREATE USER ... PASSWORD` (auth DDL already
+    /// requires superuser — see `Engine::execute_sql_as_principal`). Errors
+    /// if `name` doesn't exist. Sets the same argon2id credential as
+    /// `RoleStore::set_password`, via the same `hash_password` helper.
+    AlterUserPassword {
+        name: String,
+        /// Plaintext from the `PASSWORD '<pw>'` clause — hashed with
+        /// argon2id before it ever reaches `AuthState`. Never stored or
+        /// logged as-is; kept out of `Debug` (see the manual impl below).
+        password: String,
+    },
 }
 
 /// Manual `Debug`: redacts `CreateUser`'s `password` field to `Some("<redacted>")`/
@@ -568,6 +617,11 @@ impl std::fmt::Debug for AuthStmt {
                 .field("name", name)
                 .field("table", table)
                 .finish(),
+            AuthStmt::AlterUserPassword { name, .. } => f
+                .debug_struct("AlterUserPassword")
+                .field("name", name)
+                .field("password", &"<redacted>")
+                .finish(),
         }
     }
 }
@@ -581,7 +635,7 @@ pub struct RoleStore {
 impl RoleStore {
     pub fn open(dir: &Path) -> Result<Self> {
         let path = dir.join("roles.json");
-        let inner = match std::fs::read(&path) {
+        let mut inner: AuthState = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "roles.json unreadable — starting with no roles");
                 AuthState::default()
@@ -589,10 +643,28 @@ impl RoleStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => AuthState::default(),
             Err(e) => return Err(e.into()),
         };
-        Ok(Self {
+        // item 4: `session_id` is new (`#[serde(default)]` = empty string for
+        // a pre-item-4 `roles.json`). Backfill any empty id here so every
+        // in-memory session has a stable, independently-random opaque id
+        // from the moment the store opens — persisted once below so the
+        // backfilled ids survive a restart too, rather than being
+        // regenerated (and thus churning) on every open.
+        let mut backfilled = false;
+        for rec in inner.sessions.values_mut() {
+            if rec.session_id.is_empty() {
+                rec.session_id = generate_session_id();
+                backfilled = true;
+            }
+        }
+        let store = Self {
             path,
             inner: Mutex::new(inner),
-        })
+        };
+        if backfilled {
+            let st = store.lock();
+            store.persist(&st)?;
+        }
+        Ok(store)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, AuthState> {
@@ -672,6 +744,7 @@ impl RoleStore {
         st.sessions.insert(
             hash,
             SessionRec {
+                session_id: generate_session_id(),
                 username: user.to_string(),
                 issued_at: now,
                 expires_at,
@@ -727,6 +800,7 @@ impl RoleStore {
         st.sessions.insert(
             new_hash,
             SessionRec {
+                session_id: generate_session_id(),
                 username: username.clone(),
                 issued_at: now,
                 expires_at,
@@ -747,6 +821,62 @@ impl RoleStore {
         let hash = sha256_hex(raw_token);
         let mut st = self.lock();
         if let Some(rec) = st.sessions.get_mut(&hash) {
+            if !rec.revoked {
+                rec.revoked = true;
+                self.persist(&st)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every session, stripped down to non-secret fields (item 4 — Studio
+    /// session listing). Never the raw token or its SHA-256 hash — see
+    /// [`SessionView`]. Per-caller filtering (superuser sees all, a named
+    /// user sees only their own) is applied by the call site
+    /// (`information_schema::sessions_rows`), mirroring item 111 — this
+    /// method itself is identity-agnostic, matching `roles`/`grants`/`users`.
+    pub fn list_sessions(&self) -> Vec<SessionView> {
+        let st = self.lock();
+        st.sessions
+            .values()
+            .map(|rec| SessionView {
+                session_id: rec.session_id.clone(),
+                username: rec.username.clone(),
+                issued_at: rec.issued_at,
+                expires_at: rec.expires_at,
+                revoked: rec.revoked,
+            })
+            .collect()
+    }
+
+    /// Username owning `session_id`, if any session (revoked or not, expired
+    /// or not) currently has that id. Used by the self/superuser gate on the
+    /// revoke-by-id route before calling [`Self::revoke_session_by_id`], so
+    /// a non-superuser caller can be confirmed to own the session before
+    /// their revoke request is allowed to take effect.
+    pub fn session_owner(&self, session_id: &str) -> Option<String> {
+        let st = self.lock();
+        st.sessions
+            .values()
+            .find(|rec| rec.session_id == session_id)
+            .map(|rec| rec.username.clone())
+    }
+
+    /// Revoke a session by its opaque id (item 4), rather than by raw token —
+    /// backs `DELETE /auth/sessions/{id}`. Idempotent, same posture as
+    /// [`Self::revoke_session`]: an unknown id (already revoked, or never
+    /// issued) is a silent `Ok(())`, not an error. Callers that need an
+    /// ownership check (a non-superuser may only revoke their own sessions)
+    /// must call [`Self::session_owner`] first — this method itself performs
+    /// no identity check, matching the identity-agnostic posture of
+    /// [`Self::list_sessions`].
+    pub fn revoke_session_by_id(&self, session_id: &str) -> Result<()> {
+        let mut st = self.lock();
+        if let Some(rec) = st
+            .sessions
+            .values_mut()
+            .find(|rec| rec.session_id == session_id)
+        {
             if !rec.revoked {
                 rec.revoked = true;
                 self.persist(&st)?;
@@ -1067,6 +1197,18 @@ impl RoleStore {
                 st.table_grants.remove(name);
                 st.credentials.remove(name);
             }
+            AuthStmt::AlterUserPassword { name, password } => {
+                if !st.users.contains_key(name) {
+                    return Err(DbError::Authz(format!("user '{name}' not found")));
+                }
+                // Same argon2id hashing helper as `CreateUser`'s inline path
+                // and the Rust-API `RoleStore::set_password` — reused here
+                // rather than calling `set_password` directly because it
+                // would re-lock `self.inner` (already held as `st` above)
+                // and deadlock.
+                let hash = hash_password(password)?;
+                st.credentials.insert(name.clone(), hash);
+            }
             AuthStmt::CreateRole(name) => {
                 if is_reserved_role(name) {
                     return Err(DbError::Authz(format!(
@@ -1234,6 +1376,7 @@ pub fn parse_auth_stmt(sql: &str) -> Result<Option<AuthStmt>> {
     let kw2 = toks[1].to_ascii_uppercase();
     match (kw.as_str(), kw2.as_str()) {
         ("CREATE", "USER") => parse_create_user(trimmed, &toks).map(Some),
+        ("ALTER", "USER") => parse_alter_user_password(trimmed, &toks).map(Some),
         ("DROP", "USER") => Ok(Some(AuthStmt::DropUser(ident(toks.get(2))?))),
         ("CREATE", "ROLE") => Ok(Some(AuthStmt::CreateRole(ident(toks.get(2))?))),
         ("DROP", "ROLE") => Ok(Some(AuthStmt::DropRole(ident(toks.get(2))?))),
@@ -1270,6 +1413,20 @@ fn parse_create_user(sql: &str, toks: &[&str]) -> Result<AuthStmt> {
         superuser,
         password,
     })
+}
+
+/// `ALTER USER <name> PASSWORD '<pw>'` (Studio password reset). Mirrors
+/// `parse_create_user`'s `PASSWORD` handling — the clause is scanned out of
+/// the raw `sql` string (not the whitespace-tokenised `toks`) so a password
+/// containing spaces or an escaped `''` literal quote parses correctly.
+fn parse_alter_user_password(sql: &str, toks: &[&str]) -> Result<AuthStmt> {
+    let name = ident(toks.get(2))?;
+    let upper = sql.to_ascii_uppercase();
+    let pw_pos = upper
+        .find("PASSWORD")
+        .ok_or_else(|| DbError::SqlParse("ALTER USER: expected a PASSWORD '<pw>' clause".into()))?;
+    let password = parse_quoted_password(&sql[pw_pos + "PASSWORD".len()..])?;
+    Ok(AuthStmt::AlterUserPassword { name, password })
 }
 
 /// Parse a single-quoted string literal starting somewhere in `s` (the first

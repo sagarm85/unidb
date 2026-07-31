@@ -998,6 +998,7 @@ fn auth_stmt_audit(stmt: &crate::authz::AuthStmt) -> (&'static str, String) {
     use crate::authz::AuthStmt as A;
     match stmt {
         A::CreateUser { name, .. } => ("create_user", name.clone()),
+        A::AlterUserPassword { name, .. } => ("alter_user_password", name.clone()),
         A::DropUser(name) => ("drop_user", name.clone()),
         A::CreateRole(name) => ("create_role", name.clone()),
         A::DropRole(name) => ("drop_role", name.clone()),
@@ -1796,6 +1797,24 @@ impl Engine {
     /// `POST /auth/logout`). See [`crate::authz::RoleStore::revoke_session`].
     pub fn revoke_session(&self, raw_token: &str) -> Result<()> {
         self.authz.revoke_session(raw_token)
+    }
+
+    /// Username owning `session_id`, if any (item 4 — Studio session
+    /// revoke-by-id ownership gate). See [`crate::authz::RoleStore::
+    /// session_owner`].
+    pub fn session_owner(&self, session_id: &str) -> Option<String> {
+        self.authz.session_owner(session_id)
+    }
+
+    /// Revoke a session by its opaque id, idempotently (item 4 — `DELETE
+    /// /auth/sessions/{id}`). No identity/ownership check here — the caller
+    /// (the REST handler) is responsible for the self/superuser gate via
+    /// [`Self::session_owner`] first, mirroring `create_user_with_password`'s
+    /// "caller pre-authorizes, this method just performs the (already
+    /// authorized) mutation" posture. See [`crate::authz::RoleStore::
+    /// revoke_session_by_id`].
+    pub fn revoke_session_by_id(&self, session_id: &str) -> Result<()> {
+        self.authz.revoke_session_by_id(session_id)
     }
 
     /// Execute SQL **as** a named user (P6.e), enforcing per-table privileges.
