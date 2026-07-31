@@ -5,8 +5,12 @@
 branch `claude/permissions-security-supabase-comparison-ixho2w` (commits `3fb0e04` +
 QExpr-path fix `2a5fe85`; item122 tests 7/7 incl. two-tenant isolation, fail-closed,
 and the LIMIT/QExpr path; crash 54/54). Both fail closed (Null, never Bool(true) —
-item-110 lesson). Remaining: B3 built-in roles, B4 role-scoped policies, B5 column
-grants (item 112).
+item-110 lesson). **B3 (built-in `anon`/`authenticated`/`service_role` roles) + B4
+(role-scoped policies `… TO <role>`) SHIPPED** same branch (`838d91d`): effective roles
+resolved engine-side; `service_role` bypasses RLS on the audited path (item-103); no-`TO`
+policies still apply to all callers (back-compat), `TO`-scoped gated on role intersection,
+exclusively-scoped-and-no-match fails closed; reserved role names rejected. item122 7/7 +
+item122_b3_b4 6/6, crash 54/54. Remaining: B5 column grants (item 112).
 
 > Makes the token's *identity, claims, and role* usable inside RLS policies — the
 > Supabase model — instead of only the username. Part of the

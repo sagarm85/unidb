@@ -485,6 +485,21 @@ be raised with the user directly, not assumed.
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-07-31 — item 122 B3/B4 (built-in roles + role-scoped policies) shipped, second slice of Workstream B
+
+Sequential batch-2 continuation (Sonnet on the main tree, verified by me). **122 B3/B4**
+(`838d91d`): reserved `anon`/`authenticated`/`service_role` roles (CREATE/DROP reject them);
+effective roles resolved engine-side via `RoleStore::effective_roles` — no subject→[anon],
+verified subject→[authenticated]+transitive granted roles, `claims["role"]=="service_role"`→
+[service_role] which BYPASSES RLS on the **audited** path (item-103) on BOTH writer and
+concurrent-read. `CREATE POLICY … FOR <op> [TO <role,…>]`, target roles persisted
+(serde-default, no FORMAT_VERSION bump). `apply_rls_with_auth` gains `roles`: **no-`TO`
+policies still apply to everyone (back-compat)**, `TO`-scoped OR-combined only on role
+intersection, table-with-only-scoped-policies-and-no-match denies all rows (fail closed).
+Verified by me: crash 54/54, item122 7/7 (back-compat) + item122_b3_b4 6/6, rls/policy +
+item121 16/16, clippy/fmt clean. Plan-time only, ACID/perf intact. Remaining on branch:
+A5 prod issuer, A6 RS256/JWKS, B5 column grants; then `docs/REST_API.md` refresh + PR-on-request.
+
 ### 2026-07-31 — item 121 A3/A4 (signup + refresh tokens/sessions/logout) shipped, second slice of Workstream A
 
 Built directly on branch (no worktree) on top of A1/A2 (`fcd320a`). **A3:**
