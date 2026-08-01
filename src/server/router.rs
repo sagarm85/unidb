@@ -223,6 +223,15 @@ pub fn build_router_with_rate_limiter(
             get(handlers::get_webhooks).post(handlers::post_webhook),
         )
         .route("/webhooks/{id}", delete(handlers::delete_webhook))
+        // ── Item 144: scheduled jobs (cron) ────────────────────────────────
+        // Superuser-only admin surface, same posture as `/webhooks` above;
+        // execution itself happens off this router entirely (the
+        // background worker in `server::cron`).
+        .route(
+            "/cron/jobs",
+            get(handlers::get_cron_jobs).post(handlers::post_cron_job),
+        )
+        .route("/cron/jobs/{name}", delete(handlers::delete_cron_job))
         // ── Item 142: Auth admin API (user management) ─────────────────────
         // Superuser-only admin surface, same posture as `/realtime/policies`/
         // `/webhooks` above — consolidated user management (list/get/create/

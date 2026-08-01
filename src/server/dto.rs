@@ -261,6 +261,47 @@ pub struct WebhookDto {
     pub headers: std::collections::BTreeMap<String, String>,
 }
 
+// ── item 144: scheduled jobs (cron) ─────────────────────────────────────────
+
+/// Body of `POST /cron/jobs` (item 144 admin surface): create/upsert a
+/// scheduled job. `schedule` is a standard 5-field cron expression (`minute
+/// hour day-of-month month day-of-week`), validated server-side —
+/// `400 INVALID_CRON_SCHEDULE` on anything malformed. `run_as` (optional)
+/// names the user/role the job's `sql` runs as; omit it (or send `null`)
+/// for the default embedded/superuser identity.
+#[derive(Debug, Deserialize)]
+pub struct CronJobUpsertRequest {
+    pub name: String,
+    pub schedule: String,
+    pub sql: String,
+    #[serde(default = "default_cron_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub run_as: Option<String>,
+}
+
+fn default_cron_enabled() -> bool {
+    true
+}
+
+/// One row of `GET /cron/jobs`'s response (item 144 admin surface): the
+/// registration merged with the scheduler worker's in-memory last-run
+/// status. `last_run_at` is Unix milliseconds; every `last_*`/`run_count`
+/// field is `null`/`0` until the job has run at least once **in this server
+/// process** (status is not persisted — see `server::cron`'s module doc).
+#[derive(Debug, Serialize)]
+pub struct CronJobDto {
+    pub name: String,
+    pub schedule: String,
+    pub sql: String,
+    pub enabled: bool,
+    pub run_as: Option<String>,
+    pub last_run_at: Option<i64>,
+    pub last_status: Option<String>,
+    pub last_error: Option<String>,
+    pub run_count: u64,
+}
+
 // ── item 142: Auth admin API (user management) ─────────────────────────────
 
 /// Query params for `GET /auth/admin/users?limit=&offset=` (item 142).

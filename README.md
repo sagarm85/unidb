@@ -213,6 +213,11 @@ curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8080/webhooks \
 # logins/refreshes get 403 USER_BANNED and every session is revoked
 curl -H "Authorization: Bearer $TOKEN" -X PATCH http://127.0.0.1:8080/auth/admin/users/alice \
   -d '{"banned":true}'
+
+# Scheduled jobs / cron (item 144): run SQL nightly at 3am server-local
+# time, superuser-only — pg_cron parity, no storage-engine change
+curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8080/cron/jobs \
+  -d '{"name":"nightly-cleanup","schedule":"0 3 * * *","sql":"DELETE FROM sessions WHERE expires_at < now()"}'
 ```
 
 Key environment variables:
@@ -327,6 +332,12 @@ UNIDB_DATA_DIR=/var/lib/unidb cargo run --bin unidb-migrate -- migrations
   an `X-Unidb-Signature: sha256=<HMAC>` header; bounded exponential-backoff
   retry (a dead endpoint never wedges the stream or blocks another webhook),
   at-least-once, background delivery worker downstream of commit only
+- Scheduled jobs / cron (item 144) — Supabase/`pg_cron` parity: superuser-
+  registered SQL (`/cron/jobs`) run on a standard 5-field cron schedule,
+  server-local time, optionally `run_as` a scoped role so RLS/grants apply;
+  control-plane only, the scheduler is strictly a caller of the same
+  `execute_sql` path every statement uses, no overlap/no backfill, per-job
+  status + `unidb_cron_runs_total`/`unidb_cron_failures_total` metrics
 
 **Operations and HA**
 - Segmented WAL (16 MiB segments) enabling replication slots

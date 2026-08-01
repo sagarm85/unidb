@@ -148,6 +148,13 @@ pub enum DbError {
     /// the full contract, including the non-transactional-DDL caveat.
     #[error("migration error: {0}")]
     Migration(String),
+
+    /// A malformed 5-field cron expression rejected at scheduled-job
+    /// registration time (item 144: `POST /cron/jobs` / `Engine::
+    /// upsert_cron_job`). See `src/cron.rs::CronSchedule::parse` for the
+    /// exact grammar accepted.
+    #[error("invalid cron schedule: {0}")]
+    InvalidCronSchedule(String),
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;

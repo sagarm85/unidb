@@ -240,6 +240,10 @@ pub(crate) fn map_status(err: &DbError) -> (StatusCode, &'static str) {
         // problem, not a server fault.
         DbError::Migration(_) => (StatusCode::BAD_REQUEST, "MIGRATION_ERROR"),
 
+        // Item 144: a malformed cron expression is a client-supplied
+        // registration error, not a server fault.
+        DbError::InvalidCronSchedule(_) => (StatusCode::BAD_REQUEST, "INVALID_CRON_SCHEDULE"),
+
         // Durability failure (P1.b, fsyncgate) is fatal for the session — the
         // engine can no longer guarantee writes reach disk and must be
         // restarted. 503 signals the service is (temporarily) unable to handle

@@ -1188,6 +1188,126 @@ other webhook, the poll loop, or the engine.
 
 ---
 
+## Scheduled jobs — cron (item 144)
+
+Supabase-parity `pg_cron`: register SQL to run on a schedule. **Control-plane
+only** — the background scheduler is strictly a *caller* of the same
+`execute_sql` path every other statement uses (one `begin`/`execute_sql`/
+`commit` per run); no storage-engine change, no new write path, crash
+harness stays 54/54.
+
+**Registration model.** A job is `(name, schedule, sql, enabled, run_as?)`,
+control-plane persisted (`roles.json`-style, no FORMAT_VERSION bump):
+- `schedule` is a standard 5-field cron expression: `minute hour
+  day-of-month month day-of-week`. Each field accepts `*`, a bare number, a
+  comma-separated list, a range (`a-b`), and a step (`*/n` or `a-b/n`).
+  Day-of-week is `0`-`7` (both `0` and `7` mean Sunday); if both
+  day-of-month and day-of-week are restricted (neither is a literal `*`),
+  the day matches when **either** one matches (standard cron OR semantics).
+  Validated at registration — `400 INVALID_CRON_SCHEDULE` on anything
+  malformed (wrong field count, out-of-range value, zero step, inverted
+  range, etc.), before anything is stored.
+- **Evaluated in the server's local time** (`chrono::Local`), minute
+  granularity. A tick that the process wasn't running for is **not**
+  backfilled — this is a scheduler, not a durable job queue; only in-memory
+  last-run status is kept (reset on restart), not a run history.
+- `sql` is the statement run on every matching tick, via the exact same
+  `execute_sql` path `POST /sql` uses.
+- `run_as` (optional) names the user/role the job's `sql` runs as, resolved
+  through the existing principal machinery
+  (`Engine::execute_sql_as_principal`) — exactly as if
+  `Engine::execute_sql_as(Some(run_as), ..)` had been called directly, so
+  the job is subject to that principal's own table grants and RLS policies.
+  **Default (omitted/`null`): the embedded/superuser identity** — unrestricted,
+  bypassing RLS like any other superuser call, mirroring `execute_sql_as`'s
+  existing "no subject" meaning.
+- `enabled` (default `true`) toggles scheduling without deleting the
+  registration.
+
+**Scheduler worker.** A single background task wakes once a minute (aligned
+to the minute boundary) and finds every enabled job whose schedule matches
+that minute. Each due job's run is `tokio::spawn`ed independently and
+**not** awaited by the scheduler tick itself — this is deliberate: a slow
+job never delays any other job or the next tick. Per-job in-memory state
+(`last_run_at`, `last_status`: `"ok"`/`"error"`, `last_error`, `run_count`)
+is updated when the run completes, plus `unidb_cron_runs_total` /
+`unidb_cron_failures_total` (`GET /metrics`).
+
+**No overlap.** If a job's previous run is still in flight when its next
+tick fires, that tick is skipped for that job (logged, `unidb_cron_
+skipped_overlap_total` incremented) — runs are never stacked. Every other
+due job still runs on schedule regardless.
+
+**Isolation.** A failing job's error is captured into its own `last_error`
+and never affects any other job, the scheduler loop, or the engine — never a
+panic, never a block.
+
+### `POST /cron/jobs`
+
+Create or upsert (by `name`) a scheduled job. **Superuser-only**
+(`403 PERMISSION_DENIED` otherwise).
+
+**Payload**:
+```json
+{
+  "name": "nightly-cleanup",
+  "schedule": "0 3 * * *",
+  "sql": "DELETE FROM sessions WHERE expires_at < now()",
+  "enabled": true,
+  "run_as": "cleanup_role"
+}
+```
+`name` and `sql` must be non-empty (`400 INVALID_CRON_JOB_NAME` /
+`400 INVALID_CRON_SQL`); `schedule` must be a valid 5-field cron expression
+(`400 INVALID_CRON_SCHEDULE`). `enabled` (default `true`) and `run_as`
+(default `null` — embedded/superuser) are optional. **Response**:
+`204 No Content`.
+
+### `GET /cron/jobs`
+
+List every registered job, merged with its in-memory last-run status.
+**Superuser-only.**
+
+**Response** `200 OK`:
+```json
+[
+  {
+    "name": "nightly-cleanup",
+    "schedule": "0 3 * * *",
+    "sql": "DELETE FROM sessions WHERE expires_at < now()",
+    "enabled": true,
+    "run_as": "cleanup_role",
+    "last_run_at": 1735689600000,
+    "last_status": "ok",
+    "last_error": null,
+    "run_count": 12
+  }
+]
+```
+`last_run_at`/`last_status`/`last_error` are `null` and `run_count` is `0`
+until the job has completed at least one run **in this server process**
+(status is not persisted).
+
+### `DELETE /cron/jobs/{name}`
+
+Remove a scheduled job. **Superuser-only.** Idempotent — deleting an unknown
+`name` is a no-op, not an error. **Response**: `204 No Content`.
+
+The embedded crate exposes the same three operations directly:
+`Engine::upsert_cron_job` / `remove_cron_job` / `list_cron_jobs` (and their
+`EngineHandle` async wrappers for the server), plus the injectable
+`unidb::server::cron::run_due(&engine, &cron_state, now)` the scheduler
+worker itself calls once a minute — useful for tests or an operator-driven
+"run due jobs now" trigger, since it needs no real wall-clock wait.
+
+**Security notes.** `sql` is superuser-authored at registration time, not
+end-user input. `run_as` only ever *narrows* access (it resolves through the
+same grant/RLS machinery every other named-principal call uses) — there is
+no way for a job to gain privileges beyond what its `run_as` principal
+already holds.
+
+---
+
 ## Auth admin API — user management (item 142)
 
 Supabase-parity `auth.admin`: a consolidated REST surface under

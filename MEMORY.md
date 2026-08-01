@@ -12,6 +12,14 @@
 
 ## Current status
 
+- **2026-08-01 — item 144 (scheduled jobs / cron) implemented, committed to branch (Status left IN PROGRESS — orchestrator flips on merge).**
+  Wave-3 roadmap item (137, though 144's own doc mislabels itself Wave-2 — flagged, not silently
+  fixed either way). Control-plane only: new dependency-free `src/cron.rs` (5-field parser/matcher,
+  no `cron`/`saffron` crate), `src/server/cron.rs` worker (webhooks.rs-shaped `Weak<EngineHandle>`
+  `tokio::spawn`, non-blocking `run_due(engine, state, now)` test seam), superuser `/cron/jobs`
+  admin API. `run_as` reuses `execute_sql_as_principal` for RLS/grant parity. 9 new
+  `tests/item144_cron.rs` + 4 unit tests, all 7 gates green incl. crash 54/54.
+
 - **2026-08-01 — item 143 (auth hardening: HIBP leaked-password + 5 more OAuth presets) implemented, committed to branch (Status left IN PROGRESS — orchestrator flips on merge).**
   Wave-2 (137), control-plane only. New `src/server/hibp.rs` (opt-in `UNIDB_PASSWORD_HIBP_CHECK`,
   k-anonymity SHA-1-prefix range lookup, fail-open+warn on outage) gated before password storage at

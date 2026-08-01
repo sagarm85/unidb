@@ -109,8 +109,22 @@ queue** · unidb-js SDK v0.1. *(The last three are beyond Supabase.)*
 
 ## Wave 3 — breadth & polish
 
-- Scheduled jobs (cron-analog) · user-defined & materialized views ·
-  enums/domains/custom types · JWT signing-key rotation.
+- **Scheduled jobs (cron-analog)** (IN PROGRESS — item 144 implemented,
+  status flips to DONE on merge): Supabase/`pg_cron` parity — superuser
+  `/cron/jobs` admin API (upsert/list/delete), a standard 5-field cron
+  expression validated at registration (`400 INVALID_CRON_SCHEDULE`,
+  hand-rolled parser, no heavy dep), a background scheduler that runs due
+  jobs' SQL via the existing `execute_sql` path under an optional `run_as`
+  principal (RLS/grants apply exactly as if called directly), no overlap
+  (skips a tick if the previous run is still in flight, never stacks), no
+  missed-tick backfill, per-job in-memory status +
+  `unidb_cron_runs_total`/`unidb_cron_failures_total` metrics. Control-plane
+  only, crash 54/54 — see `docs/backlog/144_scheduled_jobs.md`. **Note:**
+  144's own doc labels itself a "Wave-2" item, but it is filed here under
+  Wave 3 in this roadmap — flagged rather than silently reconciled either
+  way; the classification doesn't change what shipped.
+  User-defined & materialized views · enums/domains/custom types · JWT
+  signing-key rotation remain unstarted.
 - Storage: resumable **TUS uploads** · **image transformations** (local lib) ·
   full storage policy language · S3-compatible API surface.
 - **SAML / enterprise SSO** (no paid dependency our side; large).
