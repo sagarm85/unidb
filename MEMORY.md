@@ -12,6 +12,39 @@
 
 ## Current status
 
+- **2026-08-01 — Supabase-parity BaaS layer COMPLETE (items 120–131) — 12 PRs merged (#222–#233); unidb-js SDK v0.1.0 shipped.**
+  A full Backend-as-a-Service layer now sits on the engine, built entirely at plan-time /
+  control-plane (no WAL/MVCC/heap/on-disk-format change) so **ACID + perf are intact by
+  construction — crash harness 54/54 on every merge.** Shipped:
+  - **Auth core (121, A):** argon2id password login/signup (`UNIDB_ALLOW_SIGNUP`), refresh-token
+    sessions (256-bit opaque, only SHA-256 hash persisted, rotate-on-refresh, logout revoke),
+    production JWT issuer (`UNIDB_JWT_SIGNING_KEY`), asymmetric verify RS256/ES256 +
+    `GET /.well-known/jwks.json`. TOTP MFA (D4/127, RFC 6238/4226) + OAuth 2.0 Google/GitHub
+    (D1/128, Auth-Code + PKCE).
+  - **RLS ↔ token (122, B):** `auth.uid()`, `auth.jwt() ->> 'claim'` in policies (substituted at
+    injection time, fail-closed); built-in `anon`/`authenticated`/`service_role` roles;
+    `CREATE POLICY … FOR <op> TO <role>`; column-level grants (B5/112, error-not-mask, plan-time
+    enforced, policy-column exemption).
+  - **Auto API (123, C):** PostgREST-style `/rest/v1/<table>` CRUD+filters (C1, injection-safe
+    `$n` binds through the existing RLS/grant path), embedded FK expansion (C2,
+    `select=id,customer(name)`), `GET /rest/v1/` OpenAPI (C3), and a schema-derived GraphQL
+    endpoint with FK + graph-edge + vector-`near` fields (C4/130, per-field grant correctness).
+  - **Realtime (E1):** per-subscriber RLS-filtered SSE on `/events/subscribe` (service_role
+    bypass audited, DELETE filters on the before-image, fail-closed).
+  - **Storage (F1/125):** per-object authorization on `/storage/*` (public/private buckets,
+    owner/superuser/service_role rules, presign gated, fail-closed).
+  - **Ops/hardening:** auth rate-limiting (I1, `429 RATE_LIMITED` + `Retry-After`), encrypt-at-
+    rest secrets vault (I3/129, AES-256-GCM, key from `UNIDB_MASTER_KEY`), CAPTCHA/Turnstile on
+    auth endpoints (I2/131), forward-only SQL schema migrations + `unidb-migrate` bin with
+    checksum drift detection (I4/126), studio-unblocker DDL (124: `ALTER USER … PASSWORD`,
+    session list/revoke, policy `target_roles`, signup-binary fix).
+  - **unidb-js SDK v0.1.0** (`sagarm85/unidb-js`, separate repo): supabase-js-shaped
+    `createClient()` with auth / data (`/rest/v1`) / realtime (SSE); `tsc` strict, 30/30 unit
+    tests; ships its own `CLAUDE.md`/`MEMORY.md` for a future session.
+  Held per user decision: email/magic-link (D2/D5), SMS (D3). Parked: I5, I7, I6 (per-project
+  control plane). Needs the user at deploy time: provider secrets (Google/GitHub/Turnstile/SMTP);
+  drive the studio session (build G4 + wire live G1/G2); npm-publish the SDK.
+
 - **2026-07-31 — Architecture-review session: items 117 + report-HTML renderer shipped; item 118 (async-HNSW crash hole) planned next.**
   Fresh senior-architect review of `report_20260728_102745.md` + the async-HNSW/CRUD/scan
   code surfaced a ranked findings list. Two units shipped to main:
@@ -56,126 +89,10 @@
   `perf_item106`. Promoted as authoritative in `docs/performance/README.md`; supersedes the
   07-23 `0324dc5` baseline.
 
-- **2026-07-24 — fix(hnsw): item 106 Unit 2a cold-path duplicate-rid bug (visited-bitset slack).**
-  Three deterministic macOS failures on unmodified main `4c56740` (crash p17 NEAR top-5
-  `[49,50,50,51,51]` after crash-reopen; `index_rebuild::near_on_index_built_over_empty_table`;
-  `vec_distance::…ascending`). Root cause in PR #208's dense visited bitset: bounded at *word*
-  granularity (`w < visited_bits.len()`), so the ≤63 slack bits of the `div_ceil(64)` allocation
-  counted as in-range. A rid first seen slot-less went to the HashSet spill; a mid-search vec-cache
-  fill could assign it a slack slot, and the re-encounter passed the unset bitset bit without
-  consulting the HashSet → double-visit → duplicate rid in top-k. Fix (`search_layer_with_vec`):
-  capture `bits_cap = num_slots()` at search start and bound at *slot* granularity — mid-search
-  appends always get slots ≥ `bits_cap`, staying on the HashSet path they started on. Warm path
-  unchanged by construction. Evidence: 3/3 failing tests → green; full suite + crash 54/54 green;
-  fmt+clippy clean. Perf A/B same-machine back-to-back at ef=120: pre-fix 510.5/512.8 µs,
-  with-fix 503.5/507.4 µs (neutral; recall 0.910 identical). NOTE: the 466 µs Unit 2a baseline
-  did NOT reproduce today even pre-fix (~511 µs on unmodified code) — environment drift, tracked
-  as a caveat, not a regression from this fix. Item 106 doc got a resolved known-issue banner.
-
-- **2026-07-24 (overnight, user-authorized autonomous session) — items 115+116 Step-0 + first levers; 3 pre-existing NEAR correctness failures found on main.**
-  User set targets: filtered SELECT one-shot and per-row INSERT ≥0.75× vs PG (from 0.58/0.50).
-  **115:** one-shot premium decomposed (852 µs = ~590 global first-use + ~180 per-table + ~90
-  per-page; plan-cache-miss premium only ~22 µs — the cache was never the problem). Shipped
-  `Engine::warm_query_path()` open-time warmup (parse/plan + worker-pool warm; NO txn/WAL —
-  `begin()` would append WAL_TXN_BEGIN, deliberately avoided): native one-shot 1,089→744 µs.
-  Remaining: per-table resolve first-use (~180 µs). **116:** DEFAULT mode confirmed 1
-  fsync/commit (an earlier draft measured the legacy per-statement mode and wrongly "found" 3
-  fsyncs — that mode is harness-only); software 117 µs/row split via permanent Q116 timers
-  (execute ~70, sync-leader ~24-45). Shipped: find_or_alloc_page full-Vec waste removal,
-  group_fsync per-segment FD cache, **catalog-persist explicit sync before catalog_root flip
-  (real durability hole in default mode — closed)**. Next unit designed NOT shipped:
-  statement-scoped mini-txn bracket merge (2 brackets → 1, −2 WAL records/row).
-  **Suites: 72 binaries green; 3 pre-existing NEAR failures on unmodified main** (verified by
-  stash): crash p17 duplicate rids post-recovery, index_rebuild empty-table top-k,
-  vec_distance ascending order — item-106 Unit 1/2a suspect (visited bitset/HashSet
-  split-brain); chip filed AND user started the fix session — **all three FIXED same night by
-  PR #211; branch rebased past #211+#213, crash 54/54 clean**. **Cert
-  (`report_20260724_000942.md`, canary quiet): filtered one-shot 0.58→0.77× — item 115 TARGET
-  MET (+48% unidb absolute; 0.70× vs PG-uncapped); INSERT 0.50× flat as predicted — 116's
-  target rides on the designed bracket-merge unit.** First cert attempt DISCARDED (INSERT
-  0.16× + FPI-shaped WAL inflation: disclosed cross-session CPU overlap + freshly-restarted
-  Docker daemon; clean rerun restored all bands). Machine-slot protocol tightened across the
-  3 concurrent sessions: slot transfers ONLY on explicit message, never `docker ps` inference
-  (two sessions attached to one compose stack before #213's per-worktree naming). Lessons:
-  `cargo test` is fail-fast per binary — use `--no-fail-fast` for sweeps; a wedged Docker
-  daemon (trivial `FROM alpine` build hanging) needs a daemon restart, not builder prunes.
-
-- **2026-07-23 — Fresh full Docker bench RUN + PROMOTED as new MM_BASELINE; item 114 filed.**
-  `docs/performance/report_20260723_124415.md` (main `0324dc5`, 84m 58s, canary quiet vs 07-21,
-  conc matrix 32/32). **Item 107 validated in-record:** W4/W0 at 100k 96→**34.21×**, Δvector
-  +17.55→**+3.31 ms/commit**, drain reported off-path (new table). CRUD wins: filtered 0.45→0.58×
-  (beat item 109's ~0.50 prediction), non-HOT 0.65→0.85×, HOT 1.06→1.18×, COUNT 41→56×; Table 4
-  at 100k 13.4→10.05 ms/txn. **New finding → item 114:** Δevent at 100k doubled (+4.08→+9.93
-  ms/commit, now the dominant W4 rung) + the +3.31 Δvector commit-path residue — Step-0 =
-  attribution A/B (worker CPU contention vs real event-path regression) before any lever.
-  Note: item 106's NEAR gains are NOT in this report (mmreport doesn't measure NEAR — the
-  standing Linux NEAR spot-check gap). **Next up:** item 106 Unit 3 (re-rank decode-pushdown,
-  466→≤400 µs at ef=120) then Unit 2b; item 114 Step-0; 109 follow-ups; chips.
-
-- **2026-07-22 (same session, after the docs audit) — MEMORY/PROGRESS roll-up + LESSONS.md.**
-  Both files had grown past useful context size (MEMORY ~103k tokens, PROGRESS ~141k — together
-  more than a full context window). Split into working set + verbatim archive:
-  entries older than 2026-07-20 → `docs/history/MEMORY_ARCHIVE_2026-07.md` /
-  `PROGRESS_ARCHIVE_2026-07.md` (headings intact, newest-first preserved; nothing deleted);
-  PROGRESS gained an all-entries index table (127 entries, live/archive column). MEMORY now
-  ~45 KB, PROGRESS ~96 KB. **New `LESSONS.md`** (35 standing rules swept from 500+ session
-  entries: bench hygiene, evidence rules, engine invariants, tooling) — read every session per
-  CLAUDE.md §0 step 2. Roll-up policy + thresholds added to §0.4; **new `scripts/lint_docs.sh`**
-  (size thresholds, PROGRESS-reference resolution — caught and fixed 8 pre-existing paraphrased
-  refs — archive pointers). Both lints green. Also fixed: `backlog_index.md` "next file" pointer
-  113→114 (missed when item 113 was registered).
-
-- **2026-07-22 docs audit session — full `docs/` + README staleness sweep and repair (no code changes).**
-  Root cause found: content sections got patched at ship time but cross-cutting scaffolding didn't —
-  23 backlog status corrections (index rows 107/109/110/111 were behind their files; 19 file headers
-  behind their index rows), `engine_design.md` FORMAT_VERSION 8→12 + IVF/HNSW contradictions + module
-  map + §12 gap registry, ops_runbook log-pruning claim (server DOES prune, `UNIDB_LOG_RETAIN_DAYS`=7)
-  + new autovacuum section, access-guide/sql-reference "not supported" lists corrected (6 shipped
-  features; CTEs and JOIN ON were wrongly denied; INCLUDE documented; verifier 33/33), README perf
-  tables refreshed to the official 07-21 report, positioning.md brought to post-Phase-6 reality,
-  documentation_index rebuilt by audience, `docs/performance/README.md` added (authoritative report =
-  `report_20260721_035629.md`), orphan duplicate-ID backlog file renumbered → **item 113** (FK error
-  direction, still live), empty `engine_internals_doc_prompt.md` given honest content.
-  **New guard: `scripts/lint_backlog.sh`** — cross-checks every numbered file's Status header vs its
-  registry row + orphan/duplicate-ID detection; clean pass (89 files). Run it before any docs push.
-
-- **2026-07-22 session complete — items 110, 111 shipped + merged; item 112 filed (parked).**
-  110 (#198): RLS+LIMIT crash — `current_user` was destroyed by the QuerySpec policy
-  conversion's `Bool(true)` fallback (leak hazard in Bool-typechecking shapes, crash here);
-  fixed by substituting at policy-injection time (`apply_rls(plan, catalog, user)`) + fallback
-  now fails CLOSED (Null + warn); 5 count-asserted regression tests.
-  111 (#199): information_schema.* needs no view grant; rows filtered per-caller ANY-privilege
-  across all five views (Postgres semantics); unidb_catalog.* stays Z5 grant-gated; 5 tests.
-  112 (#200): column-level grants scoped + deliberately parked; item-24 registry corrected —
-  Z4's role-inheritance half had SHIPPED (transitive has_privilege, PR #166), only column
-  grants were never built.
-  Earlier same session: 105 (#190 selective bench + carry-forward), 92 (#191 NEAR ~900 µs),
-  108 (#192/#193 env-drift proof + canary), 107 (#196 async HNSW activation + freshness gauge),
-  109 (#197 page-cached resolution, warm filtered 3.0×).
-  **Next up:** fresh full Docker bench on current main (first official record of item 107's
-  ladder collapse; becomes new MM_BASELINE) · item 106 (vector ≤400 µs tier) · 109 follow-ups
-  (one-shot fixed cost ~700 µs; Table-3 warm-median methodology decision) · chips (item-103
-  LIMIT test variant, test-binary clippy cleanup). Parked: 112, item-19 CTE/window residue.
-
-- **Item 109 — SHIPPED 2026-07-22; item 107 — SHIPPED + MERGED (#196) same day.**
-  109: Step-0 refuted filed design (parallel resolution existed since items 45/54); real lever =
-  per-candidate 8 KiB page-copy+CRC in get_visible (~1 µs × 5k candidates on ~25-50 pages). Fix:
-  `get_visible_cached` single-page cache → **warm 3.0×** (973→323 µs native; 460 µs in-container).
-  Docker Table-3 cert honest: 0.45→**0.50× one-shot** — bench times ONE cold execution (split:
-  leaf 58 + resolve 901 + ~700 µs one-shot fixed cost) so warm wins can't appear there; both
-  numbers in ceilings table; follow-ups: one-shot fixed cost, warm-median methodology question.
-  107: item-67 worker existed but nothing spawned it (server + bench both took sync fallback —
-  the W4/W0 96× measured that); EngineHandle::spawn now activates it; freshness contract (a)
-  signed off (queue-depth gauge `unidb_hnsw_queue_depth`); bench drain-accounting added.
-  Session hygiene lessons: NEVER run suites concurrently with a bench (self-inflicted the
-  item-108 effect twice); compose runs can hang on leftover PG state — `docker compose down -v`
-  before bench reruns. Item 110 (RLS+LIMIT, from user's PR #195 renumbered): fix + 5 tests
-  AUTHORED in /tmp/unidb-110 (apply_rls injection-time substitution + fail-closed Null fallback),
-  build/test/PR next.
-
-> **Older Current-status entries (before 2026-07-22) were rolled into
+> **Older Current-status entries (2026-07-24 and earlier) were rolled into
 > [`docs/history/MEMORY_ARCHIVE_2026-07.md`](docs/history/MEMORY_ARCHIVE_2026-07.md)
-> on 2026-07-22. Grep there for any dated entry; nothing was deleted.**
+> across the 2026-07-22 and 2026-08-01 roll-ups. Grep there for any dated
+> entry; nothing was deleted.**
 
 ## What exists now
 
@@ -485,6 +402,26 @@ be raised with the user directly, not assumed.
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-08-01 — Supabase-parity build drained: 12 PRs merged (#222–#233), autonomous overnight
+
+User authorized autonomous overnight completion + auto-merge of verified PRs, with a
+per-merge status report. Drove the entire approved queue to `main`, each PR self-verified
+before merge (crash 54/54 + targeted suites + `cargo test --no-run` no-features +
+`clippy --all-targets` + fmt): **#222** auth loop (121 A1–A4 + 122 B1–B4), **#223** (121
+A5/A6 + I1 + 112/B5 + 123/C1), **#224** E1 realtime RLS, **#225** studio-unblocker (124),
+**#226** F1 storage authz (125, salvaged from a stalled agent), **#227** C2 FK-embed (123),
+**#228** I4 migrations (126) + a plain-`cargo test` fix, **#229** D4 MFA (127), **#230** D1
+OAuth (128), **#231** I3 vault (129), **#232** C4 GraphQL (130), **#233** I2 CAPTCHA (131).
+All work is plan-time / control-plane only → ACID + perf untouched by construction (the
+crash harness stayed 54/54 through every merge). Separately authored + pushed **unidb-js**
+SDK v0.1.0 to its own repo (TS/ESM; auth/data/realtime; 30/30 unit tests) with its own
+`CLAUDE.md`/`MEMORY.md`. **Process lessons:** strictly sequential engine builds (usable disk
+~38 GiB can't hold two concurrent ~30 GiB `--all-features` Rust builds — `cargo clean`
+between every from-clean gate); every new server test needs `#![cfg(feature = "server")]`
+or it breaks plain `cargo test`; check a delegated agent's output-file mtime and take over if
+it is idle >30 min with no live process (the F1 salvage). Held: email/magic-link (D2/D5), SMS
+(D3). Parked: I5/I7/I6. See the 2026-08-01 Current-status entry for the full feature map.
+
 ### 2026-07-31 — F1 storage per-object authz (item 125) — salvaged from a stalled agent, verified
 
 The F1 implementing agent went **idle ~5h** (output frozen, no cargo/monitor process, no
@@ -676,65 +613,5 @@ studio plan `docs/AUTH_POLICY_PANELS_PLAN.md` on the studio's mirror branch. Bot
 lints green (backlog OK 99 files; docs OK). Nothing implemented — awaiting the
 user's go on which Wave-1 track(s) to build first (P0 critical path = 121 + 122).
 
-### 2026-07-24 — item 106 Unit 3 (re-rank decode-pushdown) measured + merged
-
-Rebased Unit 3 on current main (8a86b02, post-#210). Same-session before/after on
-`tests/perf_item106` (mandatory — #210's `warm_query_path()` warmup + host drift raised the
-absolute curve vs the 465.8 µs Unit-2a figure): **gate ef=120 630.8 → 482.2 µs (−148.6,
-−23.6%) @ 0.910 recall, bit-identical recall at every ef**. Δ grows with ef (more of the ~ef
-re-rank candidates truncated at k, projection never decoded). Impl in `exec_select_near`:
-phase-1 `deform_row` (vector + predicate cols only, raw bytes carried) → predicate +
-`ivf_exact_distance`; after sort+truncate(k), second `deform_row` (projection mask) +
-`project_row_near` for k winners only. Full release suite + crash harness 54/54 green;
-clippy/fmt clean. **Still 482 > ≤400 target — expected; Unit 3 was never sized to close it
-alone.** Unit 2b (graph quality, hold 0.90 @ ef≤80 where Unit 3 already gives 359.6 µs) is the
-remaining lever → lands gate under target with margin; certification closes with 2b. PR #214.
-Machine-slot discipline held: waited out Pending-items' #210 cert (buildx-wedge false-idle
-caught), measured only after their explicit handoff, signalling peaceful-panini (item-114 A/B
-next) on completion.
-
-### 2026-07-24 (overnight) — Items 115+116 filed + Step-0 + first levers; NEAR breakage found on main
-
-User authorized autonomous work with ACID/perf guardrails. 115: cold probe with prewarm
-bisection (`ITEM115_PREWARM=1|2`) cleanly separated global/per-table/per-page first-use;
-warmup at open must NOT `begin()` a txn (WAL_TXN_BEGIN append — replica/read-only hazard);
-warmed via `parse_sql_cached` + no-op pool dispatch instead. 116: first probe draft flipped
-deferred_sync and measured the WRONG mode (3 fsyncs — harness-only legacy); default = 1
-fsync/commit via `Engine::commit`→`sync_up_to`, which ALSO revealed commit_mini_txn+control
-flip hole in catalog persist → explicit sync added (kept even after reverting the broader
-wal.rs mini-txn change that broke 8 legacy-semantics crash tests — reverted by design, not
-failure). Full sweep needs `--no-fail-fast` (fail-fast masked 2 extra pre-existing NEAR
-failures beyond p17; all 3 stash-verified on clean main; chip filed → user started the fix
-session same night). Docker Table-3 cert deferred to a quiet machine. Two lessons appended
-to LESSONS.md (shipping-default attribution; cargo fail-fast sweeps).
-
-### 2026-07-23 — Fresh full Docker bench on main `0324dc5` → new MM_BASELINE; item 114 filed
-
-User asked to verify the branch matched main, then run backlog Next-up #1. Branch
-`claude/pending-items-bce650` == `origin/main` (`0324dc5`), tree clean. Pre-flight per
-LESSONS: no stray bench processes, `docker compose down -v`, unrelated idle containers
-(pg-demo on :5433, minio) verified non-conflicting and left running. Full
-`scripts/report.sh --docker` (no skip knobs, no stitch): 84m 58s. compare_bench.py arg
-order is `<run> <baseline>` (first attempt reversed produced mirror-image deltas — check
-the "vs <file>" header line). Auto-compare at end of report.sh used the stale 07-17
-`benchmark_*` file (docker/out is gitignored, so a fresh worktree only had old promoted
-copies) — always re-compare manually against the intended baseline. Recorded: PROGRESS
-entry + index row, performance README pointer, backlog index (Next-up refreshed, 114
-registered, next→115), `114_w4_event_rung_tax.md` filed. Docs lints green before push.
-
-### 2026-07-22 (session close) — items 110 + 111 shipped, 112 filed, Z4 status corrected
-
-110: root cause one layer under the filing's analysis — no `LogicalPlan::Query` arm in
-`substitute_current_user_in_plan` + eager Expr→QExpr conversion whose fallback rewrote
-CurrentUser→Bool(true) (policy weakening hazard). Fix at injection time + fail-closed Null.
-111: `is_information_schema` exemption in check_plan_privileges + per-caller ANY-privilege row
-filter in `virtual_rows` (now takes user); constraint views included; open/superuser mirror
-`is_effective_superuser`. 112: Z4 audit — inheritance transitive & shipped; column grants
-scoped into their own parked item with full touch-point map. All suites green each time
-(70-72 binaries, crash 54/54). Eight PRs merged this session: #190-#193, #196-#200 (#195
-rescued/renumbered). Hygiene rules that stuck: one PR per unit (squash-merge orphan race),
-benches get exclusive machine time, `docker compose down -v` before bench reruns, verify main
-by ls-tree not PR state.
-
-> **Older session-log entries (before 2026-07-22) live in
+> **Older session-log entries (2026-07-24 and earlier) live in
 > [`docs/history/MEMORY_ARCHIVE_2026-07.md`](docs/history/MEMORY_ARCHIVE_2026-07.md).**

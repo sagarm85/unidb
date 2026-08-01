@@ -1,14 +1,20 @@
 # Supabase parity roadmap — auth, auto-API, and authorization surfaces
 
 **Type:** Milestone
-**Status:** NOT STARTED
+**Status:** SHIPPED (core + Waves 1–3 landed 2026-07-31 → 2026-08-01; 12 PRs #222–#233).
+Remaining scope is deliberately deferred, not pending: email/magic-link (D2/D5) and SMS (D3)
+held per user; I5/I7 parked; I6 per-project control plane excluded by user; G-studio panels
+belong to the `sagarm85/unidb-studio` session. See the per-workstream specs (121–131) for
+detail and the 2026-08-01 `MEMORY.md`/`PROGRESS.md` entries for the shipped record.
 
 > Umbrella plan for the work that turns unidb from "a database with the Postgres
 > *security primitives*" into a Supabase-class **backend-as-a-service**. It is a
-> map + priority + parallelization plan; each workstream that starts gets its own
-> numbered spec (Wave-1 tracks already spun out: **121** auth core, **122** RLS↔token
-> binding, **123** auto REST API). Wave-2/3 workstreams get their own `NN_…` files
-> when they start, per `CONVENTIONS.md`.
+> map + priority + parallelization plan; each workstream got its own numbered spec:
+> **121** auth core (A), **122** RLS↔token binding (B), **123** auto REST/GraphQL API
+> (C1–C4 → **130** GraphQL), **124** studio-unblocker, **125** storage authz (F1),
+> **126** migrations (I4), **127** MFA (D4), **128** OAuth (D1), **129** vault (I3),
+> **131** CAPTCHA (I2); realtime authz (E1) and rate-limiting (I1) landed inside
+> 122/123's PRs. All SHIPPED to `main`.
 
 ## Framing (why this exists)
 
