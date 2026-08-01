@@ -1047,6 +1047,145 @@ server).
 
 ---
 
+## Database webhooks (item 141)
+
+Supabase-parity "Database Webhooks": register an HTTP endpoint to receive a
+POST on every matching row change. Built entirely on top of the existing
+WAL-derived, durable, ordered event stream (M4/item-29 CDC envelope,
+`poll_events`/`ack_events`) — **no storage-engine change**: the delivery
+worker is strictly downstream of commit (reads only already-committed
+events, writes only its own consumer offset), so ACID and the crash harness
+(54/54) are unaffected by construction.
+
+**Registration model.** A webhook is `(id, target_url, table_pattern,
+events, signing_secret?, enabled, headers?)`, control-plane persisted
+(`roles.json`-style, no FORMAT_VERSION bump):
+- `table_pattern` is an exact table name or `"*"` for every table — simpler
+  than the item-140 channel policy's `*`-suffix glob, per the locked v1
+  design.
+- `events` is a non-empty subset of `["insert","update","delete"]`
+  (case-insensitive on the wire).
+- `signing_secret` (optional) is the HMAC key used to sign every delivery
+  (see below). Resolution is **vault-first**: `webhook.<id>.secret` in the
+  encrypt-at-rest vault (`unidb-vault set webhook.<id>.secret …`, item 129)
+  takes precedence when present; otherwise the plaintext captured at
+  registration time (this field) is used — the same vault-then-fallback
+  order `POST /auth/oauth/<provider>/callback`'s client-secret resolver
+  uses. A webhook with no secret anywhere sends no `X-Unidb-Signature`
+  header.
+- `enabled` (default `true`) toggles delivery without deleting the
+  registration; `headers` (optional) are extra static headers sent with
+  every delivery.
+
+**Delivery worker.** A single background worker owns a **durable consumer**
+(`__webhooks__`) on the event queue, on the same commit-condvar push /
+idle-fallback rhythm `GET /events/subscribe`'s durable-consumer mode uses.
+Each polled batch is matched against every **enabled** webhook by
+`table_pattern` + `events`; a match is POSTed as the native CDC envelope
+JSON (`{seq, xid, table_name, op, payload, before, after, ts_ms}` — the same
+shape `GET /events/subscribe?format=native` emits) to `target_url`, with:
+
+```
+X-Unidb-Signature: sha256=<hex HMAC-SHA256(secret, raw request body)>
+```
+
+sent only when a secret is configured (vault-first, see above). Verify a
+delivery by recomputing the same HMAC over the exact raw request body and
+comparing hex strings.
+
+**Retry / failure isolation.** Each delivery gets bounded exponential-
+backoff retry (≤5 attempts) with a per-attempt timeout. On final exhaustion
+the failure is logged and `unidb_webhook_delivery_failures_total` (`GET
+/metrics`) increments — the event is **not** retried further and the
+durable offset still advances past it: a dead endpoint can never wedge the
+stream or block a second, healthy webhook (every delivery in a poll batch
+runs concurrently). Delivery is **at-least-once**: a crash between a
+delivery's successful POST and the batch's ack can redeliver that event to
+that endpoint on restart — a receiver that needs idempotency should dedupe
+on the envelope's `(table_name, xid, seq)` triple. A webhook's durable
+consumer offset only starts advancing once that webhook is registered
+(`__webhooks__` never appears in `__consumers__` while zero webhooks are
+registered), so a server with this feature unused pays no cost and doesn't
+affect `POST /events/vacuum`'s "reclaim once every registered consumer has
+acked" contract (R3).
+
+**Caveat (honest, undocumented-elsewhere default):** like any other named
+consumer, a newly-registered webhook starts from the beginning of the
+retained `__events__` history (offset 0) rather than "now" — if the target
+table already has a large backlog of un-vacuumed captured events, the new
+webhook will receive all of them on activation, not just future ones.
+
+**Relationship to `unidb-dispatch` (item 20/Epic E2).** The separate
+`unidb-dispatch` crate's `WebhookSink` is a different, older mechanism: an
+app-embedded Rust library (`Arc<Engine>` + programmatic `Filter`/`Sink`
+wiring, its own dead-letter table) for a *custom app process* to build a
+webhook fan-out pipeline. This item is the built-in, REST-admin-managed
+feature — register/list/delete over HTTP, delivery happens inside the
+`unidb-server` process itself, no separate app process required. The two do
+not share code or state and can be used independently or together.
+
+### `POST /webhooks`
+
+Create or upsert (by `id`) a database webhook. **Superuser-only**
+(`403 PERMISSION_DENIED` otherwise).
+
+**Payload**:
+```json
+{
+  "id": "orders-hook",
+  "target_url": "https://example.com/hooks/orders",
+  "table_pattern": "orders",
+  "events": ["insert", "update", "delete"],
+  "signing_secret": "optional-shared-secret",
+  "enabled": true,
+  "headers": { "X-Api-Key": "optional-static-header" }
+}
+```
+`id`, `target_url`, `table_pattern` must be non-empty; `events` must contain
+at least one of `insert|update|delete` (`400 INVALID_EVENT` otherwise).
+`signing_secret`, `enabled` (default `true`), and `headers` (default `{}`)
+are optional. **Response**: `204 No Content`.
+
+### `GET /webhooks`
+
+List every registered webhook. **Superuser-only.** Secrets are always
+redacted — `has_signing_secret` reports only whether one is configured,
+never the value itself.
+
+**Response** `200 OK`:
+```json
+[
+  {
+    "id": "orders-hook",
+    "target_url": "https://example.com/hooks/orders",
+    "table_pattern": "orders",
+    "events": ["insert", "update", "delete"],
+    "enabled": true,
+    "has_signing_secret": true,
+    "headers": {}
+  }
+]
+```
+
+### `DELETE /webhooks/{id}`
+
+Remove a webhook registration. **Superuser-only.** Idempotent — deleting an
+unknown `id` is a no-op, not an error. **Response**: `204 No Content`.
+
+The embedded crate exposes the same three operations directly:
+`Engine::upsert_webhook` / `remove_webhook` / `list_webhooks` (and their
+`EngineHandle` async wrappers for the server).
+
+**Security notes.** The target URL is superuser-configured, not end-user
+input — SSRF is out of the v1 trust model (documented follow-up: an
+allowlist, if this ever accepts non-admin input). Secrets are redacted from
+`Debug`/audit/`GET /webhooks` and never logged. A delivery error (transport
+failure, non-2xx response, exhausted retries) is isolated to that one
+delivery — it is logged and counted, never a panic, and never affects any
+other webhook, the poll loop, or the engine.
+
+---
+
 ### `PUT /tables/{table}/rls`
 
 Attach a row-level-security policy to a table (R3), as a **SQL predicate

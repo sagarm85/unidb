@@ -214,6 +214,15 @@ pub fn build_router_with_rate_limiter(
                 .put(handlers::put_realtime_policy)
                 .delete(handlers::delete_realtime_policy),
         )
+        // ── Item 141: database webhooks (outbound HTTP on row change) ─────
+        // Superuser-only admin surface, same posture as `/realtime/policies`
+        // above; delivery itself happens off this router entirely (the
+        // background worker in `server::webhooks`).
+        .route(
+            "/webhooks",
+            get(handlers::get_webhooks).post(handlers::post_webhook),
+        )
+        .route("/webhooks/{id}", delete(handlers::delete_webhook))
         // ── Item 31: storage service routes (/storage/*) ──────────────────
         // All 7 routes return 503 when AppState::storage is None (unconfigured).
         // C1 list / C2 create buckets

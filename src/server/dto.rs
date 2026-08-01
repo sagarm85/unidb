@@ -219,6 +219,48 @@ pub struct ChannelPolicyDto {
     pub roles: Vec<String>,
 }
 
+/// Body of `POST /webhooks` (item 141 admin surface): create/upsert a
+/// database webhook. `events` is any non-empty subset of
+/// `["insert","update","delete"]` (case-insensitive); `table_pattern` is an
+/// exact table name or `"*"` for every table. `signing_secret` is optional —
+/// when present it becomes the webhook's registration-time fallback secret
+/// (see [`crate::authz::WebhookDef::signing_secret`]'s doc comment for the
+/// vault-first resolution order); omit it (or send `null`) to leave
+/// deliveries unsigned, or to keep whatever secret is already stored in the
+/// vault under `webhook.<id>.secret` when upserting an existing webhook.
+#[derive(Debug, Deserialize)]
+pub struct WebhookUpsertRequest {
+    pub id: String,
+    pub target_url: String,
+    pub table_pattern: String,
+    pub events: Vec<String>,
+    #[serde(default)]
+    pub signing_secret: Option<String>,
+    #[serde(default = "default_webhook_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+}
+
+fn default_webhook_enabled() -> bool {
+    true
+}
+
+/// One row of `GET /webhooks`'s response (item 141 admin surface).
+/// `has_signing_secret` reports only whether a secret is configured —
+/// never the secret itself (redacted, per the item-141 security contract:
+/// "secrets never appear in `GET /webhooks`").
+#[derive(Debug, Serialize)]
+pub struct WebhookDto {
+    pub id: String,
+    pub target_url: String,
+    pub table_pattern: String,
+    pub events: Vec<String>,
+    pub enabled: bool,
+    pub has_signing_secret: bool,
+    pub headers: std::collections::BTreeMap<String, String>,
+}
+
 /// Body of `PUT /config/slow_query_threshold_ms` (item 34, Part A).
 /// `threshold_ms: 0` disables slow-query logging; positive values enable it.
 #[derive(Debug, Deserialize)]

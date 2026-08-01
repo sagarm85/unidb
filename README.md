@@ -203,6 +203,11 @@ curl http://127.0.0.1:8080/metrics
 # Subscribe to live events over SSE
 curl -H "Authorization: Bearer $TOKEN" \
   "http://127.0.0.1:8080/events/subscribe?table=users"
+
+# Register a database webhook (item 141): POST the CDC envelope to an
+# operator endpoint on every insert to `orders`, superuser-only
+curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8080/webhooks \
+  -d '{"id":"orders-hook","target_url":"https://example.com/hooks/orders","table_pattern":"orders","events":["insert"],"signing_secret":"shh"}'
 ```
 
 Key environment variables:
@@ -312,6 +317,11 @@ UNIDB_DATA_DIR=/var/lib/unidb cargo run --bin unidb-migrate -- migrations
   allow/deny policies in front of all four routes above (superuser-managed
   via `/realtime/policies`), with an audited `service_role`/superuser
   bypass and a fail-closed `UNIDB_REALTIME_REQUIRE_AUTHZ` enforce mode
+- Database webhooks (item 141) — superuser-registered outbound HTTP POST on
+  `INSERT`/`UPDATE`/`DELETE` (`/webhooks`), delivering the CDC envelope with
+  an `X-Unidb-Signature: sha256=<HMAC>` header; bounded exponential-backoff
+  retry (a dead endpoint never wedges the stream or blocks another webhook),
+  at-least-once, background delivery worker downstream of commit only
 
 **Operations and HA**
 - Segmented WAL (16 MiB segments) enabling replication slots

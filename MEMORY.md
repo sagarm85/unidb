@@ -12,6 +12,58 @@
 
 ## Current status
 
+- **2026-08-01 — item 141 (database webhooks — outbound HTTP on row change) implemented, committed to branch (Status left IN PROGRESS — orchestrator flips on merge).**
+  Wave-2 free-roadmap item (137). Superuser `POST/GET/DELETE /webhooks` admin API
+  (`src/server/handlers.rs`, `src/server/dto.rs`) over a new control-plane store
+  (`crate::authz::{WebhookDef, WebhookEvent, WebhookSecret}` in `src/authz/mod.rs`,
+  `roles.json`-persisted, `#[serde(default)]`, no FORMAT_VERSION bump, secret
+  redacted via a `ClientSecret`-style manual `Debug`). Delivery worker
+  (`src/server/webhooks.rs`) is a `tokio::spawn` task (not a `std::thread` —
+  `reqwest` is async-only in this crate's feature set) spawned from
+  `AppState::with_config` alongside `spawn_reaper`, holding only a
+  `Weak<EngineHandle>`. It owns a durable consumer (`__webhooks__`) on the
+  existing M4/item-29 event queue (`poll_events`/`ack_events` — exactly the
+  mechanism `sse.rs` uses), matches events against enabled webhooks by
+  `table_pattern` (exact/`*`) + `events`, and POSTs the native CDC envelope
+  with `X-Unidb-Signature: sha256=<hex HMAC-SHA256>` when a secret is
+  configured (vault-first: `webhook.<id>.secret`, falling back to the
+  registration-time secret — mirrors `oauth::resolve_client_secret`'s order).
+  Each delivery runs on its own tokio task (so a dead endpoint's retries never
+  block a healthy webhook) with bounded exponential backoff (≤5 attempts,
+  20/40/80/160ms) and a 5s per-attempt timeout; on exhaustion it logs +
+  increments `unidb_webhook_delivery_failures_total` and the batch's durable
+  offset still advances (dead endpoint can't wedge the stream). **Correctness
+  finding caught before shipping:** acking unconditionally regardless of
+  whether any webhook was registered would have created a permanent
+  `__webhooks__` row in `__consumers__` that participates in
+  `vacuum_events`'s "reclaim once every registered consumer has acked"
+  horizon — this would have broken `tests/server_enrich.rs::events_vacuum_
+  reclaims_fully_acked_events` (asserts `reclaimed == 0` before any consumer
+  acks). Fixed by gating the whole poll/ack cycle on `list_webhooks()` being
+  non-empty, so a server with the feature unused never touches
+  `__events__`/`__consumers__` at all. HMAC-SHA256 is hand-rolled (RFC 2104,
+  RFC-4231-vector-tested) rather than routed through the crate's vendored
+  `hmac`/`sha2` — `hmac = "0.13"` requires `digest` 0.11-shaped hashes but the
+  vendored `sha2 = "0.10"` only implements `digest` 0.10's traits (two
+  semver-incompatible `digest` copies coexist in the dependency graph; only
+  the `sha1`+`hmac` pairing already used by MFA's HOTP happens to line up).
+  10 new tests (`tests/item141_webhooks.rs`, local mock axum receiver, no real
+  network) + `server_events` 10/10 unchanged + crash 54/54 + clippy/fmt clean
+  + plain `cargo test --no-run` unaffected (module is `server`-feature-gated).
+  Noted but out of scope: a pre-existing, unrelated flaky test
+  (`server_enrich.rs::cursor_expires_on_idle_and_can_be_dropped_early`, a
+  tight 300ms-idle/1200ms-sleep timing assertion) reproduces under parallel
+  `cargo test` on this sandbox's 4 cores with or without this change
+  (confirmed via `git stash`) — not a regression, not touched. Docs:
+  `docs/REST_API.md` new "Database webhooks" section (routes, envelope,
+  signature header, vault secret resolution, retry/failure-isolation
+  contract, the vacuum-horizon caveat, and an explicit note distinguishing
+  this from the separate pre-existing `unidb-dispatch` crate's `WebhookSink`
+  — same feature name, different mechanism: that one is an app-embedded Rust
+  library, this one is the REST-admin-managed, in-server feature), `README.md`
+  bullet + curl example, `137`'s Wave-2 line marked in-progress. `141`'s own
+  Status left `IN PROGRESS` (orchestrator flips on merge, per convention).
+
 - **2026-08-01 — item 139 (`/rest/v1` count + `Prefer` response controls) implemented, committed to branch (Status left IN PROGRESS — orchestrator flips on merge).**
   Wave-1 free-roadmap item (137). `Prefer: count=exact` on `GET /rest/v1/<table>` runs a
   second `SELECT COUNT(*) … [WHERE <same filters/binds>]` through the identical enforced
