@@ -6,8 +6,8 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `144_…`**
-> (143 assigned 2026-08-01 to the auth-hardening (HIBP+OAuth presets) item below).
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `145_…`**
+> (144 assigned 2026-08-01 to the scheduled-jobs (cron) item below).
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -164,7 +164,9 @@ Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 
 | 143 | `143_auth_hardening_hibp_oauth_presets.md` | Improvement | ✅ SHIPPED (2026-08-01, PR #246) — Wave-2 auth-hardening batch (2 small free items): (1) leaked-password protection via HaveIBeenPwned Pwned-Passwords range API (free, no key, k-anonymity — only the SHA-1 prefix leaves the server) enforced at signup/admin-create/patch/password-reset, opt-in `UNIDB_PASSWORD_HIBP_CHECK` (default off, fail-open on outage), `422 PASSWORD_COMPROMISED`; (2) recognized OAuth provider presets (Apple/Azure/GitLab/Discord/Facebook) added to item-128's already-agnostic flow — config-only, no new extraction code. Control-plane only — crash 54/54. |
 
-**Next new file → `144_…`.
+| 144 | `144_scheduled_jobs.md` | Improvement | 🔄 IN PROGRESS — Wave-2: cron scheduler (pg_cron parity). Background tokio worker runs registered SQL on a 5-field cron schedule via the existing `execute_sql` path under a `run_as` principal (default admin, or a named role so RLS/grants apply). Superuser `POST/GET/DELETE /cron/jobs`; in-memory last-run status + metrics; no-overlap, no-backfill (v1); injectable `run_due(now)` for deterministic tests. Control-plane only — crash 54/54. |
+
+**Next new file → `145_…`.
 
 ## Next up — priority order (2026-07-23, post fresh-baseline bench)
 
