@@ -6,8 +6,8 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `145_…`**
-> (144 assigned 2026-08-01 to the scheduled-jobs (cron) item below).
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `147_…`**
+> (146 assigned 2026-08-01 to the scheduled-jobs (cron) item below).
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -166,7 +166,10 @@ Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 
 | 144 | `144_scheduled_jobs.md` | Improvement | ✅ SHIPPED (2026-08-01, PR #247) — Wave-2: cron scheduler (pg_cron parity). Background tokio worker runs registered SQL on a 5-field cron schedule via the existing `execute_sql` path under a `run_as` principal (default admin, or a named role so RLS/grants apply). Superuser `POST/GET/DELETE /cron/jobs`; in-memory last-run status + metrics; no-overlap, no-backfill (v1); injectable `run_due(now)` for deterministic tests. Control-plane only — crash 54/54. |
 
-**Next new file → `145_…`.
+| 145 | `145_dev_inbox_route.md` | Improvement | 🔄 IN PROGRESS — studio-flagged item-138 gap: `GET/DELETE /auth/dev-inbox` to read/clear the `LogTransport` dev-inbox JSONL (reset/magic-link email preview, Inbucket-style). Superuser-only + dev-transport-ONLY (404 when real SMTP configured — never expose real mail). Control-plane, crash 54/54. |
+| 146 | `146_jwt_key_rotation.md` | Improvement | 🔄 IN PROGRESS — Wave-3: JWT signing-key rotation grace window. `kid` in issued token header; `UNIDB_JWT_SIGNING_KEY_PREVIOUS` (HS256) accepted for verify-only so rotating the primary doesn't mass-invalidate live tokens; asymmetric multi-key JWKS via `_PUBLIC_KEY_PREVIOUS`. Issuance stays current-key HS256. Auth-layer only, crash 54/54. |
+
+**Next new file → `147_…`.
 
 ## Next up — priority order (2026-07-23, post fresh-baseline bench)
 
