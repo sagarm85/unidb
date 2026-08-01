@@ -382,6 +382,50 @@ impl TestServer {
         )
     }
 
+    /// Item 144 (scheduled jobs / cron) test harness: spawns a normal server
+    /// (same shape as [`TestServer::spawn`]) but also returns the shared
+    /// `Arc<EngineHandle>` and the `CronState` `AppState::with_config`
+    /// constructed for it — the exact pair `tests/item144_cron.rs` needs to
+    /// drive the injectable `server::cron::run_due(&engine, &cron, now)`
+    /// directly instead of waiting on the real once-a-minute background
+    /// loop. Mirrors [`TestServer::spawn_with_dev_login_oauth_and_engine`]'s
+    /// "also return the shared handle" precedent.
+    pub async fn spawn_with_cron() -> (Self, Arc<EngineHandle>, unidb::server::cron::CronState) {
+        let tempdir = tempfile::tempdir().unwrap();
+        let data_dir = tempdir.path().to_path_buf();
+        let log_dir = data_dir.join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let engine = Arc::new(EngineHandle::spawn(tempdir.path(), 0).unwrap());
+        let state = AppState::with_config(engine.clone(), SessionConfig::default())
+            .with_log_dir(log_dir.clone());
+        let cron_state = state.cron.clone();
+        let jwt_config = JwtConfig::new(TEST_JWT_SECRET);
+        let (prometheus_layer, metric_handle) = metrics_pair().clone();
+        let router = build_router(state, jwt_config, prometheus_layer, metric_handle);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
+        });
+
+        (
+            Self {
+                addr,
+                data_dir,
+                log_dir,
+                _tempdir: tempdir,
+                _server_task: server_task,
+            },
+            engine,
+            cron_state,
+        )
+    }
+
     /// [`TestServer::spawn_with_dev_login_and_signup`] plus an explicit
     /// [`unidb::server::captcha::CaptchaConfig`] (item 131, Workstream I2) —
     /// used by the CAPTCHA integration test matrix. Also returns the shared

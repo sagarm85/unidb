@@ -111,6 +111,18 @@ async-graphql = { version = "7.2.1", default-features = false, features = ["dyna
 # `smtp-transport` for the SMTP client, `builder` for the `Message`-building
 # API used to assemble the multipart (text+HTML) email.
 lettre = { version = "0.11", default-features = false, features = ["tokio1", "tokio1-rustls-tls", "smtp-transport", "builder"], optional = true }
+# Item 144: scheduled jobs (cron). `server::cron`'s background scheduler
+# needs the server's *local* wall-clock calendar fields (minute/hour/day/
+# month/weekday) to evaluate a stored cron expression each tick — no
+# built-in std API does local-time decomposition. Already resolved
+# elsewhere in this workspace (dev-dependency for `benches/decompose.rs`'s
+# Redpanda timestamps) so this adds no new supply-chain surface, just
+# promotes it to an optional, server-feature-gated *runtime* dependency
+# here (same "already a dev-dep, promoted for real use" precedent as
+# `reqwest`/`jsonwebtoken` above). Cron-expression *parsing/matching*
+# itself (`src/cron.rs`) stays dependency-free and non-server-gated — only
+# the timestamp-to-calendar-fields conversion in `server::cron` uses this.
+chrono = { version = "0.4", optional = true }
 
 [features]
 server = [
@@ -119,6 +131,7 @@ server = [
     "dep:axum-prometheus", "dep:async-stream", "dep:futures-util",
     "dep:tracing-appender", "dep:axum-server", "dep:rustls", "dep:base64",
     "dep:form_urlencoded", "dep:reqwest", "dep:async-graphql", "dep:lettre",
+    "dep:chrono",
     # Item 22, L1: JSON-lines log formatting. Enabled only under `server` so the
     # default embedded build's `tracing-subscriber` stays minimal (the `json`
     # feature just pulls serde_json — already present — into the subscriber).
@@ -404,4 +417,10 @@ required-features = ["server"]
 [[test]]
 name = "item129_vault"
 path = "tests/item129_vault.rs"
+required-features = ["server"]
+
+# Item 144: scheduled jobs (cron) integration tests.
+[[test]]
+name = "item144_cron"
+path = "tests/item144_cron.rs"
 required-features = ["server"]

@@ -51,6 +51,7 @@ pub mod catalog;
 pub mod checkpoint;
 pub mod concurrency_hooks;
 pub mod control;
+pub mod cron;
 pub mod csr_index;
 /// P3.c — durable on-disk IVF-Flat vector index (production). Wired into
 /// `CREATE INDEX ... USING HNSW|IVF` and `NEAR`. See the module doc and
@@ -4457,6 +4458,34 @@ impl Engine {
     /// `server::webhooks` uses the full record to sign outbound payloads).
     pub fn list_webhooks(&self) -> Vec<crate::authz::WebhookDef> {
         self.authz.list_webhooks()
+    }
+
+    // ── item 144: scheduled jobs (cron) ──────────────────────────────────
+
+    /// item 144 (admin surface): upsert a scheduled-job registration (`POST
+    /// /cron/jobs`). Superuser gating is the HTTP handler's job (mirrors
+    /// [`Engine::upsert_webhook`]). Validates `def.schedule` as a standard
+    /// 5-field cron expression before storing anything —
+    /// [`DbError::InvalidCronSchedule`] on anything malformed (`400` at the
+    /// HTTP layer), so a bad registration never reaches the role store, let
+    /// alone the scheduler worker.
+    pub fn upsert_cron_job(&self, def: crate::authz::CronJobDef) -> Result<()> {
+        crate::cron::CronSchedule::parse(&def.schedule).map_err(DbError::InvalidCronSchedule)?;
+        self.authz.upsert_cron_job(def)
+    }
+
+    /// item 144 (admin surface): remove a scheduled-job registration by name
+    /// (`DELETE /cron/jobs/{name}`). Idempotent.
+    pub fn remove_cron_job(&self, name: &str) -> Result<()> {
+        self.authz.remove_cron_job(name)
+    }
+
+    /// item 144 (admin surface + scheduler worker): list every registered
+    /// scheduled job (`GET /cron/jobs` merges this with the worker's
+    /// in-memory last-run status; `server::cron::run_due` uses this list
+    /// every tick to find due jobs).
+    pub fn list_cron_jobs(&self) -> Vec<crate::authz::CronJobDef> {
+        self.authz.list_cron_jobs()
     }
 
     // ── item 142: Auth admin API (user management) ──────────────────────

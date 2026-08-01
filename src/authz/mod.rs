@@ -920,6 +920,14 @@ struct AuthState {
     /// `table_grants`/`webhooks`).
     #[serde(default)]
     user_extra: BTreeMap<String, UserExtra>,
+    /// Scheduled-job (cron) registrations (item 144): one entry per `name`.
+    /// `sql` is admin-authored (superuser-gated registration), the same
+    /// "not user input" posture the item-141 backlog doc documents for a
+    /// webhook's `target_url` — shown in full below, no secret material.
+    /// `#[serde(default)]` so a pre-144 `roles.json` (no `cron_jobs` key)
+    /// deserializes with an empty list — no FORMAT_VERSION bump.
+    #[serde(default)]
+    cron_jobs: Vec<CronJobDef>,
 }
 
 /// Manual `Debug`: every field except `credentials`/`sessions`/`mfa`/
@@ -979,6 +987,10 @@ impl std::fmt::Debug for AuthState {
             // item 142: ban flag + metadata — no secret material, shown in
             // full, same posture as `webhooks`/`table_grants` above.
             .field("user_extra", &self.user_extra)
+            // item 144: scheduled-job registrations — admin-authored SQL,
+            // no secret material, shown in full, same posture as
+            // `webhooks`/`channel_policies` above.
+            .field("cron_jobs", &self.cron_jobs)
             .finish()
     }
 }
@@ -1216,6 +1228,47 @@ fn default_webhook_enabled() -> bool {
 /// can call it without needing a whole `WebhookDef` in scope for a unit test.
 pub fn webhook_table_matches(pattern: &str, table: &str) -> bool {
     pattern == "*" || pattern == table
+}
+
+/// A scheduled-job (cron) registration (item 144, backlog doc's locked v1
+/// design): `(name, schedule, sql, enabled, run_as?)`. Persisted in
+/// `roles.json` alongside every other control-plane object (no separate
+/// store, no FORMAT_VERSION bump — see [`AuthState::cron_jobs`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CronJobDef {
+    /// Unique job name — the upsert key (`POST /cron/jobs` replaces any
+    /// existing job of the same name, mirroring [`WebhookDef::id`]).
+    pub name: String,
+    /// A standard 5-field cron expression (`minute hour day-of-month month
+    /// day-of-week`), validated at registration time by
+    /// [`crate::cron::CronSchedule::parse`] — see that type's doc comment
+    /// for the exact grammar. Evaluated against the server's **local**
+    /// time (documented in `docs/REST_API.md`), minute granularity, no
+    /// missed-tick backfill.
+    pub schedule: String,
+    /// The statement(s) run under [`Self::run_as`] on every matching tick,
+    /// via the exact same `execute_sql` path any other caller uses — see
+    /// `server::cron`'s module doc. Admin-authored (superuser-gated
+    /// registration), not end-user input, same posture
+    /// [`WebhookDef::target_url`]'s doc comment documents for a webhook's
+    /// URL.
+    pub sql: String,
+    #[serde(default = "default_cron_enabled")]
+    pub enabled: bool,
+    /// The principal the job's `sql` runs as. `None` (the default) is the
+    /// embedded/superuser identity — `execute_sql_as`'s existing "no
+    /// subject" meaning — so a job with no `run_as` runs unrestricted,
+    /// bypassing RLS like any other superuser call. `Some(name)` runs the
+    /// job exactly as [`crate::Engine::execute_sql_as`]`(Some(name), ..)`
+    /// would: that user/role's own table grants and RLS policies apply,
+    /// letting a job be scoped down rather than always running as an
+    /// implicit superuser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_as: Option<String>,
+}
+
+fn default_cron_enabled() -> bool {
+    true
 }
 
 /// A parsed auth-DDL statement.
@@ -2339,6 +2392,49 @@ impl RoleStore {
     /// payloads.
     pub fn list_webhooks(&self) -> Vec<WebhookDef> {
         self.lock().webhooks.clone()
+    }
+
+    // ── item 144: scheduled jobs (cron) ─────────────────────────────────
+
+    /// Upsert a scheduled-job registration (item 144 admin surface):
+    /// replaces an existing entry sharing the same `name`, or inserts a new
+    /// one. Superuser gating and cron-syntax validation are the caller's
+    /// job (mirrors [`Self::upsert_webhook`] — `Engine::upsert_cron_job`
+    /// validates the schedule before calling this; this method itself is
+    /// unrestricted, matching every other direct `RoleStore` mutator).
+    pub fn upsert_cron_job(&self, def: CronJobDef) -> Result<()> {
+        let mut st = self.lock();
+        let name = def.name.clone();
+        match st.cron_jobs.iter_mut().find(|j| j.name == def.name) {
+            Some(existing) => *existing = def,
+            None => st.cron_jobs.push(def),
+        }
+        self.persist(&st)?;
+        tracing::debug!(job = %name, "cron job registration upserted");
+        Ok(())
+    }
+
+    /// Remove a scheduled-job registration by `name` (item 144 admin
+    /// surface). Idempotent — removing a `name` that doesn't exist is a
+    /// silent no-op, mirroring [`Self::remove_webhook`]'s posture.
+    pub fn remove_cron_job(&self, name: &str) -> Result<()> {
+        let mut st = self.lock();
+        let before = st.cron_jobs.len();
+        st.cron_jobs.retain(|j| j.name != name);
+        if st.cron_jobs.len() != before {
+            self.persist(&st)?;
+            tracing::debug!(job = %name, "cron job registration removed");
+        }
+        Ok(())
+    }
+
+    /// Every registered scheduled job (item 144), `sql` included — `GET
+    /// /cron/jobs` (`server::handlers::get_cron_jobs`) merges this with the
+    /// scheduler worker's in-memory last-run status
+    /// ([`crate::server::cron::CronState`]); the scheduler worker itself
+    /// (`server::cron::run_due`) uses this list every tick to find due jobs.
+    pub fn list_cron_jobs(&self) -> Vec<CronJobDef> {
+        self.lock().cron_jobs.clone()
     }
 
     /// Whether `user` holds `priv` on `table` **at all** — `true` for both a

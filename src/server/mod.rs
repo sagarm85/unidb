@@ -36,6 +36,7 @@ pub mod auth;
 pub mod bulk;
 pub mod captcha;
 pub mod correlation;
+pub mod cron;
 pub mod cursor;
 pub mod dto;
 pub mod email;
@@ -162,6 +163,13 @@ pub struct AppState {
     /// (`false`, no outbound request) unless `UNIDB_PASSWORD_HIBP_CHECK`
     /// opts in.
     pub hibp: hibp::HibpConfig,
+    /// Scheduled-jobs (cron) worker state (item 144): in-memory last-run
+    /// status per registered job, shared with the background scheduler
+    /// (`server::cron::spawn_cron_worker`) and read by `GET /cron/jobs`.
+    /// Always present (no config gate — a server with zero cron jobs
+    /// registered pays only a per-minute idle wake-up, same posture as
+    /// `webhooks::spawn_webhook_worker`'s zero-webhooks case).
+    pub cron: cron::CronState,
 }
 
 /// Resolve the log directory the same way `src/bin/unidb-server.rs` does, so
@@ -200,6 +208,13 @@ impl AppState {
         // idle tick, zero `__consumers__`/`__events__` reads) whenever no
         // webhook is registered.
         webhooks::spawn_webhook_worker(Arc::downgrade(&engine));
+        // Item 144: the scheduled-jobs (cron) worker. `Weak`-handle,
+        // tokio-spawned, same lifecycle shape as `spawn_reaper`/
+        // `spawn_webhook_worker` above. Always started (no config gate); a
+        // server with zero jobs registered pays only a once-a-minute
+        // no-op wake-up (`run_due` lists zero jobs and returns immediately).
+        let cron_state = cron::CronState::new();
+        cron::spawn_cron_worker(Arc::downgrade(&engine), cron_state.clone());
         Self {
             engine,
             sessions,
@@ -213,6 +228,7 @@ impl AppState {
             realtime: Arc::new(realtime::RealtimeState::new()),
             email: email::EmailConfig::default(),
             hibp: hibp::HibpConfig::disabled(),
+            cron: cron_state,
         }
     }
 

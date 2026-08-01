@@ -448,6 +448,23 @@ impl EngineHandle {
         self.on_engine(|e| Ok(e.list_webhooks())).await
     }
 
+    /// item 144 (admin surface): `POST /cron/jobs`.
+    pub async fn upsert_cron_job(&self, def: crate::authz::CronJobDef) -> Result<()> {
+        self.on_engine(move |e| e.upsert_cron_job(def)).await
+    }
+
+    /// item 144 (admin surface): `DELETE /cron/jobs/{name}`.
+    pub async fn remove_cron_job(&self, name: String) -> Result<()> {
+        self.on_engine(move |e| e.remove_cron_job(&name)).await
+    }
+
+    /// item 144 (admin surface + scheduler worker): `GET /cron/jobs`, and
+    /// the scheduler worker's own per-tick registration snapshot
+    /// ([`crate::server::cron::run_due`]).
+    pub async fn list_cron_jobs(&self) -> Result<Vec<crate::authz::CronJobDef>> {
+        self.on_engine(|e| Ok(e.list_cron_jobs())).await
+    }
+
     // ── item 142: Auth admin API (user management) ──────────────────────
 
     /// Whether `user` is banned (item 142) — the ban-enforcement check at

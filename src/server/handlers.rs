@@ -44,10 +44,11 @@ use crate::{
             AuthMagicLinkRequest, AuthMagicLinkVerifyRequest, AuthMetaResponse, AuthPreviewRequest,
             AuthRecoverRequest, AuthVerifyRequest, BatchInsertRequest, BatchSqlRequest,
             BatchSqlResponse, BeginTxnRequest, ChannelPolicyDeleteRequest, ChannelPolicyDto,
-            ChannelPolicyUpsertRequest, CreateEdgeRequest, CreateSlotRequest, CursorQuery,
-            CypherRequest, DeleteEdgeRequest, GroupCommitWindowRequest, HistoryQuery, IsolationDto,
-            MfaChallengeRequest, MfaDisableRequest, MfaEnrollResponse, MfaVerifyRequest,
-            MfaVerifyResponse, OAuthCallbackQuery, RlsRequest, RowIdResponse, SetIndexRequest,
+            ChannelPolicyUpsertRequest, CreateEdgeRequest, CreateSlotRequest, CronJobDto,
+            CronJobUpsertRequest, CursorQuery, CypherRequest, DeleteEdgeRequest,
+            GroupCommitWindowRequest, HistoryQuery, IsolationDto, MfaChallengeRequest,
+            MfaDisableRequest, MfaEnrollResponse, MfaVerifyRequest, MfaVerifyResponse,
+            OAuthCallbackQuery, RlsRequest, RowIdResponse, SetIndexRequest,
             SlowQueryThresholdRequest, SqlRequest, StreamQuery, TableInfo, WebhookDto,
             WebhookUpsertRequest, WhoamiPrivilege, WhoamiResponse,
         },
@@ -1187,6 +1188,113 @@ pub async fn delete_webhook(
     state
         .engine
         .remove_webhook(id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ── Scheduled jobs / cron (item 144) ────────────────────────────────────
+
+/// `POST /cron/jobs` (item 144 admin surface): create/upsert a scheduled
+/// job. Superuser-gated, same posture as [`post_webhook`] — a cron job runs
+/// admin-authored SQL unattended on a schedule, not something every
+/// authenticated caller should be able to register.
+pub async fn post_cron_job(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+    Json(body): Json<CronJobUpsertRequest>,
+) -> std::result::Result<StatusCode, ApiError> {
+    state
+        .engine
+        .ensure_superuser(current_user.0.clone())
+        .await
+        .map_err(ApiError::from)?;
+    if body.name.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "INVALID_CRON_JOB_NAME",
+            "name must not be empty",
+        ));
+    }
+    if body.sql.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "INVALID_CRON_SQL",
+            "sql must not be empty",
+        ));
+    }
+    let def = crate::authz::CronJobDef {
+        name: body.name,
+        schedule: body.schedule,
+        sql: body.sql,
+        enabled: body.enabled,
+        run_as: body.run_as,
+    };
+    // `Engine::upsert_cron_job` validates the cron expression itself
+    // (`DbError::InvalidCronSchedule` -> `400 INVALID_CRON_SCHEDULE`) before
+    // storing anything — see that method's doc comment.
+    state
+        .engine
+        .upsert_cron_job(def)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /cron/jobs` (item 144 admin surface): list every registered job,
+/// merged with the scheduler worker's in-memory last-run status
+/// ([`crate::server::cron::CronState`]). Superuser-gated (same as the write
+/// routes above).
+pub async fn get_cron_jobs(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+) -> std::result::Result<Json<Vec<CronJobDto>>, ApiError> {
+    state
+        .engine
+        .ensure_superuser(current_user.0.clone())
+        .await
+        .map_err(ApiError::from)?;
+    let jobs = state
+        .engine
+        .list_cron_jobs()
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(
+        jobs.into_iter()
+            .map(|j| {
+                let status = state.cron.status(&j.name);
+                CronJobDto {
+                    name: j.name,
+                    schedule: j.schedule,
+                    sql: j.sql,
+                    enabled: j.enabled,
+                    run_as: j.run_as,
+                    last_run_at: status.last_run_at,
+                    last_status: status.last_status,
+                    last_error: status.last_error,
+                    run_count: status.run_count,
+                }
+            })
+            .collect(),
+    ))
+}
+
+/// `DELETE /cron/jobs/{name}` (item 144 admin surface). Idempotent —
+/// deleting an unknown `name` is a no-op, not an error (mirrors
+/// [`delete_webhook`]'s posture). Does **not** clear the job's in-memory
+/// last-run status (harmless: `GET /cron/jobs` no longer lists the job at
+/// all once deleted, so the stale status is never surfaced again).
+pub async fn delete_cron_job(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> std::result::Result<StatusCode, ApiError> {
+    state
+        .engine
+        .ensure_superuser(current_user.0.clone())
+        .await
+        .map_err(ApiError::from)?;
+    state
+        .engine
+        .remove_cron_job(name)
         .await
         .map_err(ApiError::from)?;
     Ok(StatusCode::NO_CONTENT)
