@@ -1,7 +1,7 @@
 # Auth hardening: leaked-password check + more OAuth provider presets
 
 **Type:** Improvement
-**Status:** IN PROGRESS
+**Status:** SHIPPED (2026-08-01, PR #246) — HIBP k-anonymity leaked-password check (opt-in `UNIDB_PASSWORD_HIBP_CHECK`, fail-open on outage, `422 PASSWORD_COMPROMISED`) at signup/admin-create/patch/reset; +5 OAuth presets (apple/azure/gitlab/discord/facebook — Apple userinfo via id_token documented as a gap). item143 6/6, crash 54/54.
 
 > Wave-2 free-roadmap item (`137`) — two small, self-contained, **free**
 > auth-hardening additions bundled into one PR. Control-plane only, no
