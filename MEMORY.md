@@ -12,6 +12,21 @@
 
 ## Current status
 
+- **2026-08-01 (session close) — items 132 (realtime broadcast/presence) + 133 (GraphQL mutations) SHIPPED; all remaining Supabase-parity work consolidated in backlog item 134 for a fresh session.**
+  Two follow-ups to the 120–131 core shipped + merged this session: **133** (PR #235) — a GraphQL
+  `Mutation` root (`insert_/update_/delete_<t>`) routed through the same enforced
+  `execute_sql_params_as_principal` path as `/rest/v1`/`/sql` (RLS + `WITH CHECK` + column grants
+  inherited, parity-tested, requested-projection-only); **132** (PR #236) — in-memory Broadcast +
+  Presence over four JWT-gated SSE/POST routes, zero engine/WAL/heap/catalog touch. Both verified
+  independently: **crash 54/54**, clippy `--all-targets`, plain `cargo test --no-run`, targeted +
+  regression suites all green. **NEXT SESSION START HERE:** everything still open toward Supabase
+  parity is in [`docs/backlog/134_supabase_parity_followups.md`](docs/backlog/134_supabase_parity_followups.md)
+  — (A) quick correctness follow-ups (named-superuser `WITH CHECK` INSERT quirk, GraphQL bulk
+  insert, presence `track` orphan gap), (B) realtime channel-authz + GraphQL subscriptions,
+  (C) email transport → magic-link/reset/confirm, more OAuth, storage transforms, DB webhooks,
+  scheduled jobs, SDK breadth, (D) cross-repo: unidb-studio panels + unidb-js SDK. Out of scope:
+  I6 per-project, I7 edge functions, distributed.
+
 - **2026-08-01 — Supabase-parity BaaS layer COMPLETE (items 120–131) — 12 PRs merged (#222–#233); unidb-js SDK v0.1.0 shipped.**
   A full Backend-as-a-Service layer now sits on the engine, built entirely at plan-time /
   control-plane (no WAL/MVCC/heap/on-disk-format change) so **ACID + perf are intact by
