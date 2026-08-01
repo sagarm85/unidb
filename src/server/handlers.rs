@@ -38,13 +38,14 @@ use crate::{
         auth::CurrentUser,
         dto::{
             exec_result_to_json, is_internal_table, json_to_literal, literal_to_json, slot_to_json,
-            table_def_to_info, AckEventsRequest, AdvanceSlotRequest, AuthLoginOutcome,
-            AuthLoginRequest, AuthLoginResponse, AuthMetaResponse, AuthPreviewRequest,
-            BatchInsertRequest, BatchSqlRequest, BatchSqlResponse, BeginTxnRequest,
-            CreateEdgeRequest, CreateSlotRequest, CursorQuery, CypherRequest, DeleteEdgeRequest,
-            GroupCommitWindowRequest, HistoryQuery, IsolationDto, MfaChallengeRequest,
-            MfaDisableRequest, MfaEnrollResponse, MfaVerifyRequest, MfaVerifyResponse,
-            OAuthCallbackQuery, RlsRequest, RowIdResponse, SetIndexRequest,
+            table_def_to_info, AckEventsRequest, AdvanceSlotRequest, AuthEmailFlowAck,
+            AuthLoginOutcome, AuthLoginRequest, AuthLoginResponse, AuthMagicLinkRequest,
+            AuthMagicLinkVerifyRequest, AuthMetaResponse, AuthPreviewRequest, AuthRecoverRequest,
+            AuthVerifyRequest, BatchInsertRequest, BatchSqlRequest, BatchSqlResponse,
+            BeginTxnRequest, CreateEdgeRequest, CreateSlotRequest, CursorQuery, CypherRequest,
+            DeleteEdgeRequest, GroupCommitWindowRequest, HistoryQuery, IsolationDto,
+            MfaChallengeRequest, MfaDisableRequest, MfaEnrollResponse, MfaVerifyRequest,
+            MfaVerifyResponse, OAuthCallbackQuery, RlsRequest, RowIdResponse, SetIndexRequest,
             SlowQueryThresholdRequest, SqlRequest, StreamQuery, TableInfo, WhoamiPrivilege,
             WhoamiResponse,
         },
@@ -1194,6 +1195,204 @@ pub async fn post_mfa_challenge(
             status: StatusCode::UNAUTHORIZED,
             code: "MFA_CHALLENGE_INVALID",
             message: "invalid, expired, used, or wrong-code MFA challenge".into(),
+        });
+    };
+    let resp = issue_token_pair(&state.engine, jwt_cfg, &username).await?;
+    Ok(Json(resp))
+}
+
+// ── item 138: email transport + password-reset / magic-link flows ─────────
+
+/// `POST /auth/recover` — public, no JWT required (item 138).
+///
+/// Request a password-reset email for `email`. **Always returns `200`**
+/// (`{"ok": true}`, [`AuthEmailFlowAck`]) regardless of whether `email`
+/// matches a registered account — this is the entire no-account-
+/// enumeration contract for this route: `email` is the only signal a
+/// caller ever gets, never the HTTP status, body shape, or timing.
+///
+/// **Note on `email`:** this milestone has no separate `users.email`
+/// column — `email` is looked up directly as a username (see
+/// `server::email`'s module doc for the full design-decision writeup and
+/// the tracked follow-up). When it matches a registered account
+/// ([`EngineHandle::user_exists`]), a single-use,
+/// [`crate::authz::RECOVERY_TOKEN_TTL_SECS`]-second-TTL recovery token is
+/// minted ([`EngineHandle::create_recovery_token`]) and emailed via the
+/// configured [`crate::server::email::EmailConfig`]
+/// ([`crate::server::email::EmailConfig::send_recovery_email`]). Both the
+/// mint step and the send step are best-effort from the caller's point of
+/// view — a persistence hiccup or a transport failure is logged
+/// server-side (`tracing::warn!`) but never changes this route's `200`
+/// response, so a delivery failure can never become a distinguishable
+/// oracle either.
+///
+/// Rate-limited (item 121 I1) + CAPTCHA-eligible (item 131 I2, endpoint
+/// name `"recover"`) exactly like `POST /auth/login`/`/auth/signup`.
+pub async fn post_auth_recover(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(body): Json<AuthRecoverRequest>,
+) -> std::result::Result<Json<AuthEmailFlowAck>, ApiError> {
+    state
+        .captcha
+        .enforce(
+            &state.engine,
+            "recover",
+            body.captcha_token.as_deref(),
+            Some(&addr.ip().to_string()),
+        )
+        .await?;
+    if state.engine.user_exists(body.email.clone()).await {
+        match state.engine.create_recovery_token(body.email.clone()).await {
+            Ok((raw_token, _expires_at)) => {
+                if let Err(e) = state
+                    .email
+                    .send_recovery_email(&state.engine, &body.email, &body.email, &raw_token)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "POST /auth/recover: failed to send the recovery email (still \
+                         returning 200 — no account-enumeration oracle)"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "POST /auth/recover: failed to mint a recovery token (still returning 200)"
+                );
+            }
+        }
+    }
+    Ok(Json(AuthEmailFlowAck { ok: true }))
+}
+
+/// `POST /auth/verify` — public, no JWT required (item 138; the recovery
+/// token itself is the pre-session credential, same posture as `POST
+/// /auth/mfa/challenge`'s challenge token).
+///
+/// Redeem a password-recovery token (from the emailed link) for a new
+/// password: validates + single-use-consumes `token`
+/// ([`EngineHandle::verify_recovery_token`]), sets the new argon2id
+/// credential via the existing `set_password` path
+/// ([`EngineHandle::set_password`] — item 121 A1, the same machinery
+/// `ALTER USER ... PASSWORD` uses), and revokes every existing session for
+/// that user ([`EngineHandle::revoke_all_sessions_for_user`]) so a session
+/// obtained with the *old* password stops working immediately. Unknown/
+/// expired/already-used token maps to a uniform `401
+/// RECOVERY_TOKEN_INVALID` — no oracle on *why* it failed, same posture as
+/// the OAuth callback's state validation / `POST /auth/mfa/challenge`.
+pub async fn post_auth_verify(
+    State(state): State<AppState>,
+    Json(body): Json<AuthVerifyRequest>,
+) -> std::result::Result<Json<AuthEmailFlowAck>, ApiError> {
+    let username = state
+        .engine
+        .verify_recovery_token(body.token.clone())
+        .await
+        .map_err(ApiError::from)?;
+    let Some(username) = username else {
+        return Err(ApiError::Api {
+            status: StatusCode::UNAUTHORIZED,
+            code: "RECOVERY_TOKEN_INVALID",
+            message: "invalid, expired, or already-used recovery token".into(),
+        });
+    };
+    state
+        .engine
+        .set_password(username.clone(), body.new_password.clone())
+        .await
+        .map_err(ApiError::from)?;
+    state
+        .engine
+        .revoke_all_sessions_for_user(username)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(AuthEmailFlowAck { ok: true }))
+}
+
+/// `POST /auth/magiclink` — public, no JWT required (item 138).
+///
+/// Request a magic sign-in link email for `email`. Same always-`200`,
+/// no-account-enumeration contract as [`post_auth_recover`] (see that
+/// handler's doc comment, including the "`email` is looked up as a
+/// username" note) — the only differences are the token's shorter TTL
+/// ([`crate::authz::MAGICLINK_TOKEN_TTL_SECS`]) and its own independent
+/// token space ([`EngineHandle::create_magiclink_token`]).
+pub async fn post_auth_magiclink(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(body): Json<AuthMagicLinkRequest>,
+) -> std::result::Result<Json<AuthEmailFlowAck>, ApiError> {
+    state
+        .captcha
+        .enforce(
+            &state.engine,
+            "magiclink",
+            body.captcha_token.as_deref(),
+            Some(&addr.ip().to_string()),
+        )
+        .await?;
+    if state.engine.user_exists(body.email.clone()).await {
+        match state
+            .engine
+            .create_magiclink_token(body.email.clone())
+            .await
+        {
+            Ok((raw_token, _expires_at)) => {
+                if let Err(e) = state
+                    .email
+                    .send_magiclink_email(&state.engine, &body.email, &body.email, &raw_token)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "POST /auth/magiclink: failed to send the magic-link email (still \
+                         returning 200 — no account-enumeration oracle)"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "POST /auth/magiclink: failed to mint a magic-link token (still returning 200)"
+                );
+            }
+        }
+    }
+    Ok(Json(AuthEmailFlowAck { ok: true }))
+}
+
+/// `POST /auth/magiclink/verify` — public, no JWT required (item 138; the
+/// magic-link token itself is the pre-session credential, same posture as
+/// `POST /auth/mfa/challenge`'s challenge token / the OAuth callback's
+/// `code`).
+///
+/// Redeems a magic-link login token for a real session via the exact same
+/// [`issue_token_pair`] helper every other login path (password, signup,
+/// MFA challenge, OAuth callback) uses. Unknown/expired/already-used token
+/// maps to a uniform `401 MAGICLINK_TOKEN_INVALID`.
+pub async fn post_auth_magiclink_verify(
+    State(state): State<AppState>,
+    Json(body): Json<AuthMagicLinkVerifyRequest>,
+) -> std::result::Result<Json<AuthLoginResponse>, ApiError> {
+    let jwt_cfg = state.dev_login_jwt.as_ref().ok_or_else(|| {
+        ApiError::from(crate::error::DbError::SqlPlan(
+            "POST /auth/magiclink/verify cannot issue tokens (set UNIDB_JWT_SIGNING_KEY or UNIDB_DEV_LOGIN=1 to enable a signing key)"
+                .into(),
+        ))
+    })?;
+    let username = state
+        .engine
+        .verify_magiclink_token(body.token.clone())
+        .await
+        .map_err(ApiError::from)?;
+    let Some(username) = username else {
+        return Err(ApiError::Api {
+            status: StatusCode::UNAUTHORIZED,
+            code: "MAGICLINK_TOKEN_INVALID",
+            message: "invalid, expired, or already-used magic-link token".into(),
         });
     };
     let resp = issue_token_pair(&state.engine, jwt_cfg, &username).await?;

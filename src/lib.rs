@@ -1951,6 +1951,49 @@ impl Engine {
             .oauth_link_or_create(provider, provider_user_id, username_hint)
     }
 
+    /// Whether `user` is a registered account (item 138 — `POST
+    /// /auth/recover`/`POST /auth/magiclink`'s existence check). See
+    /// [`crate::authz::RoleStore::user_exists`].
+    pub fn user_exists(&self, user: &str) -> bool {
+        self.authz.user_exists(user)
+    }
+
+    /// Mint a fresh, single-use password-recovery token for `user` (item 138
+    /// — `POST /auth/recover`'s embedded-API entry point). See
+    /// [`crate::authz::RoleStore::create_recovery_token`].
+    pub fn create_recovery_token(&self, user: &str) -> Result<(String, u64)> {
+        self.authz.create_recovery_token(user)
+    }
+
+    /// Validate + single-use-consume a password-recovery token, returning
+    /// its owning username on success (item 138 — `POST /auth/verify`). See
+    /// [`crate::authz::RoleStore::verify_recovery_token`].
+    pub fn verify_recovery_token(&self, raw_token: &str) -> Result<Option<String>> {
+        self.authz.verify_recovery_token(raw_token)
+    }
+
+    /// Mint a fresh, single-use magic-link login token for `user` (item 138
+    /// — `POST /auth/magiclink`'s embedded-API entry point). See
+    /// [`crate::authz::RoleStore::create_magiclink_token`].
+    pub fn create_magiclink_token(&self, user: &str) -> Result<(String, u64)> {
+        self.authz.create_magiclink_token(user)
+    }
+
+    /// Validate + single-use-consume a magic-link login token, returning its
+    /// owning username on success (item 138 — `POST
+    /// /auth/magiclink/verify`). See [`crate::authz::RoleStore::
+    /// verify_magiclink_token`].
+    pub fn verify_magiclink_token(&self, raw_token: &str) -> Result<Option<String>> {
+        self.authz.verify_magiclink_token(raw_token)
+    }
+
+    /// Revoke every currently-active refresh-token session belonging to
+    /// `user` (item 138 — `POST /auth/verify`'s post-reset session-revoke
+    /// step). See [`crate::authz::RoleStore::revoke_all_sessions_for_user`].
+    pub fn revoke_all_sessions_for_user(&self, user: &str) -> Result<()> {
+        self.authz.revoke_all_sessions_for_user(user)
+    }
+
     /// Execute SQL **as** a named user (P6.e), enforcing per-table privileges.
     /// `user == None` is the implicit **superuser** (the embedded API), so
     /// `execute_sql` is exactly `execute_sql_as(None, ..)` and is unrestricted.

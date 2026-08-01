@@ -103,6 +103,14 @@ reqwest = { version = "0.12", optional = true, features = ["json", "stream", "ru
 # HTML-serving and email-validator extras (server-only, no new attack
 # surface). Server-feature-gated like every other HTTP-layer dependency.
 async-graphql = { version = "7.2.1", default-features = false, features = ["dynamic-schema"], optional = true }
+# Item 138: async SMTP transport for outbound auth email (password reset,
+# magic link — `src/server/email.rs`). `default-features = false` drops the
+# sync-only transport and the unused `pool`/`hostname` extras; `tokio1` +
+# `tokio1-rustls-tls` mirror this crate's existing rustls-only TLS posture
+# (no native-tls/OpenSSL — same call as `reqwest`/`axum-server` above),
+# `smtp-transport` for the SMTP client, `builder` for the `Message`-building
+# API used to assemble the multipart (text+HTML) email.
+lettre = { version = "0.11", default-features = false, features = ["tokio1", "tokio1-rustls-tls", "smtp-transport", "builder"], optional = true }
 
 [features]
 server = [
@@ -110,7 +118,7 @@ server = [
     "dep:jsonwebtoken", "dep:metrics", "dep:metrics-exporter-prometheus",
     "dep:axum-prometheus", "dep:async-stream", "dep:futures-util",
     "dep:tracing-appender", "dep:axum-server", "dep:rustls", "dep:base64",
-    "dep:form_urlencoded", "dep:reqwest", "dep:async-graphql",
+    "dep:form_urlencoded", "dep:reqwest", "dep:async-graphql", "dep:lettre",
     # Item 22, L1: JSON-lines log formatting. Enabled only under `server` so the
     # default embedded build's `tracing-subscriber` stays minimal (the `json`
     # feature just pulls serde_json — already present — into the subscriber).

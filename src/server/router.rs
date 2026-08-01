@@ -289,6 +289,19 @@ pub fn build_router_with_rate_limiter(
         // keyed by IP+path (see `rate_limit.rs`'s module doc; the body has
         // no `username` field to additionally key on, same as `/auth/refresh`).
         .route("/auth/mfa/challenge", post(handlers::post_mfa_challenge))
+        // item 138: password-reset (recover/verify) + magic-link
+        // (magiclink/magiclink/verify) email flows. `recover`/`magiclink`
+        // guess nothing (they always 200, no-account-enumeration), but the
+        // *verify* routes redeem a guessable-shaped opaque token, so all
+        // four share the same brute-force protection as login/signup/
+        // refresh/mfa-challenge above — same rationale as those routes.
+        .route("/auth/recover", post(handlers::post_auth_recover))
+        .route("/auth/verify", post(handlers::post_auth_verify))
+        .route("/auth/magiclink", post(handlers::post_auth_magiclink))
+        .route(
+            "/auth/magiclink/verify",
+            post(handlers::post_auth_magiclink_verify),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             auth_rate_limiter,
             crate::server::rate_limit::rate_limit_auth,

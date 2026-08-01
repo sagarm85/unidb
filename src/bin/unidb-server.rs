@@ -103,8 +103,8 @@ use std::sync::Arc;
 use axum_prometheus::PrometheusMetricLayer;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use unidb::server::{
-    auth::JwtConfig, captcha::CaptchaConfig, engine_handle::EngineHandle, oauth::OAuthConfig,
-    router::build_router, AppState,
+    auth::JwtConfig, captcha::CaptchaConfig, email::EmailConfig, engine_handle::EngineHandle,
+    oauth::OAuthConfig, router::build_router, AppState,
 };
 
 /// Delete `unidb.log.*` files in `log_dir` whose mtime is older than
@@ -330,9 +330,29 @@ async fn main() {
         tracing::info!("CAPTCHA verification enabled (UNIDB_CAPTCHA_PROTECT set)");
     }
 
+    // item 138: outbound email transport for the auth email flows
+    // (password reset, magic link). Defaults to the dev-inbox log
+    // transport (no config needed); `UNIDB_EMAIL_TRANSPORT=smtp` with
+    // missing required config fails clearly here at startup, same posture
+    // as a malformed `UNIDB_MASTER_KEY`.
+    let email_config =
+        EmailConfig::from_env().unwrap_or_else(|e| panic!("invalid email transport config: {e}"));
+    tracing::info!(
+        transport = if matches!(
+            std::env::var("UNIDB_EMAIL_TRANSPORT").as_deref(),
+            Ok("smtp")
+        ) {
+            "smtp"
+        } else {
+            "log"
+        },
+        "email transport configured"
+    );
+
     let state = {
-        let mut s =
-            AppState::new(Arc::new(engine_handle)).with_log_dir(std::path::PathBuf::from(&log_dir));
+        let mut s = AppState::new(Arc::new(engine_handle))
+            .with_log_dir(std::path::PathBuf::from(&log_dir))
+            .with_email(email_config);
         // `AppState::with_dev_login` just stores "the config that can mint
         // tokens" — checking `encoding_key.is_some()` (rather than
         // re-deriving the dev_login/signing_key/public_key branching here)

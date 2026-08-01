@@ -541,6 +541,14 @@ impl EngineHandle {
             .unwrap_or(false)
     }
 
+    /// Set (or replace) `user`'s password credential (item 121, A1; item
+    /// 138 — `POST /auth/verify`'s redeem step). Errors if `user` doesn't
+    /// exist.
+    pub async fn set_password(&self, user: String, password: String) -> Result<()> {
+        self.on_engine(move |e| e.set_password(&user, &password))
+            .await
+    }
+
     /// Create a new non-superuser user with a password credential (item 121,
     /// A3 — `POST /auth/signup`). Errors (e.g. duplicate username) propagate
     /// as-is; the caller maps them to an HTTP status via [`ApiError`](
@@ -686,6 +694,54 @@ impl EngineHandle {
             e.oauth_link_or_create(&provider, &provider_user_id, &username_hint)
         })
         .await
+    }
+
+    /// Whether `user` is a registered account (item 138 — `POST
+    /// /auth/recover`/`POST /auth/magiclink`'s existence check). `false` on
+    /// any engine error, mirroring `verify_password`'s "an error here just
+    /// means don't trust it" posture.
+    pub async fn user_exists(&self, user: String) -> bool {
+        self.on_engine(move |e| Ok(e.user_exists(&user)))
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Mint a fresh, single-use password-recovery token for `user` (item 138
+    /// — `POST /auth/recover`). Returns `(raw_token, expires_at_unix_secs)`.
+    pub async fn create_recovery_token(&self, user: String) -> Result<(String, u64)> {
+        self.on_engine(move |e| e.create_recovery_token(&user))
+            .await
+    }
+
+    /// Validate + single-use-consume a password-recovery token (item 138 —
+    /// `POST /auth/verify`). `Ok(None)` uniformly covers unknown/expired/
+    /// used — see [`crate::authz::RoleStore::verify_recovery_token`].
+    pub async fn verify_recovery_token(&self, raw_token: String) -> Result<Option<String>> {
+        self.on_engine(move |e| e.verify_recovery_token(&raw_token))
+            .await
+    }
+
+    /// Mint a fresh, single-use magic-link login token for `user` (item 138
+    /// — `POST /auth/magiclink`). Returns `(raw_token,
+    /// expires_at_unix_secs)`.
+    pub async fn create_magiclink_token(&self, user: String) -> Result<(String, u64)> {
+        self.on_engine(move |e| e.create_magiclink_token(&user))
+            .await
+    }
+
+    /// Validate + single-use-consume a magic-link login token (item 138 —
+    /// `POST /auth/magiclink/verify`). `Ok(None)` uniformly covers unknown/
+    /// expired/used.
+    pub async fn verify_magiclink_token(&self, raw_token: String) -> Result<Option<String>> {
+        self.on_engine(move |e| e.verify_magiclink_token(&raw_token))
+            .await
+    }
+
+    /// Revoke every currently-active refresh-token session belonging to
+    /// `user` (item 138 — `POST /auth/verify`'s post-reset revoke step).
+    pub async fn revoke_all_sessions_for_user(&self, user: String) -> Result<()> {
+        self.on_engine(move |e| e.revoke_all_sessions_for_user(&user))
+            .await
     }
 
     /// Decrypt and return the secret stored under `name` (item 129,

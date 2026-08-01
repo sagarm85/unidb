@@ -1,7 +1,7 @@
 # Email transport + templates (auth email flows foundation)
 
 **Type:** Improvement
-**Status:** IN PROGRESS
+**Status:** SHIPPED (2026-08-01, PR #241) — pluggable EmailTransport (SMTP via lettre + dev/log default) + template system; password-reset (/auth/recover + /auth/verify) and magic-link (/auth/magiclink + verify) flows, no account-enumeration, single-use hash-only short-TTL tokens. Free/self-hostable. NOTE: no users.email column yet — email is looked up as username (documented follow-up). Crash 54/54.
 
 > Wave-1 lead item of the free roadmap (`137_supabase_parity_free_roadmap.md`).
 > unidb currently has **no way to send email at all**, which blocks the whole
