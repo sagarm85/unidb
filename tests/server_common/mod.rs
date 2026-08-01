@@ -317,6 +317,71 @@ impl TestServer {
         }
     }
 
+    /// [`TestServer::spawn_with_dev_login_and_oauth`], but also (a) returns
+    /// the shared `EngineHandle` so a test can seed a vault secret
+    /// (`engine.set_secret(...)`) before driving the OAuth flow, and (b)
+    /// takes an explicit `master_key` instead of relying on the caller to
+    /// twiddle `UNIDB_MASTER_KEY` itself (item 129, Workstream I3).
+    ///
+    /// `UNIDB_MASTER_KEY` is process-global and read exactly once,
+    /// synchronously, inside `EngineHandle::spawn` (`Engine::open` →
+    /// `Vault::from_env`) — so the set/open/unset sequence below is guarded
+    /// by a static mutex **never held across an `.await`**, keeping it
+    /// race-free against any other test in the same `cargo test` binary
+    /// that also touches the var (there are none today, but this is the
+    /// correct pattern regardless of what else lands in this file later).
+    pub async fn spawn_with_dev_login_oauth_and_engine(
+        oauth: unidb::server::oauth::OAuthConfig,
+        master_key: Option<&str>,
+    ) -> (Self, Arc<EngineHandle>) {
+        let tempdir = tempfile::tempdir().unwrap();
+        let data_dir = tempdir.path().to_path_buf();
+        let log_dir = data_dir.join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+
+        static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let engine = {
+            let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            match master_key {
+                Some(key) => std::env::set_var("UNIDB_MASTER_KEY", key),
+                None => std::env::remove_var("UNIDB_MASTER_KEY"),
+            }
+            let engine = EngineHandle::spawn(tempdir.path(), 0).unwrap();
+            std::env::remove_var("UNIDB_MASTER_KEY");
+            engine
+        };
+        let engine = Arc::new(engine);
+
+        let jwt_config = JwtConfig::with_dev_login(TEST_JWT_SECRET);
+        let state = AppState::with_config(engine.clone(), SessionConfig::default())
+            .with_log_dir(log_dir.clone())
+            .with_dev_login(jwt_config.clone())
+            .with_oauth(oauth);
+        let (prometheus_layer, metric_handle) = metrics_pair().clone();
+        let router = build_router(state, jwt_config, prometheus_layer, metric_handle);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
+        });
+
+        (
+            Self {
+                addr,
+                data_dir,
+                log_dir,
+                _tempdir: tempdir,
+                _server_task: server_task,
+            },
+            engine,
+        )
+    }
+
     pub fn url(&self, path: &str) -> String {
         format!("http://{}{}", self.addr, path)
     }

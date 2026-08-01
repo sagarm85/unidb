@@ -1725,12 +1725,21 @@ is provider-specific beyond three URLs and a scope string.
   or `UNIDB_DEV_LOGIN=1`) to hand back a session — same requirement as
   signup/refresh.
 
-**Secret handling:** the client secret is read from config/env behind a
-small accessor (`OAuthProviderConfig::client_secret()` /
-`ClientSecret::expose()` in `src/server/oauth.rs`) — never logged, never
-`Debug`-printed, never returned in any response. That accessor is the
-intended seam for the next item (I3, secrets vault) to route through
-vault-backed decryption without touching any call site.
+**Secret handling (item 129, Workstream I3 — shipped):** the *effective*
+client secret is resolved by `oauth::resolve_client_secret` at
+token-exchange time: it checks the [secrets vault](#secrets-vault-item-129-workstream-i3)
+first, under the name `oauth.<provider>.client_secret`, and falls back to
+the `UNIDB_OAUTH_<PROVIDER>_CLIENT_SECRET` env value (via
+`OAuthProviderConfig::client_secret()` / `ClientSecret::expose()` in
+`src/server/oauth.rs`) when no vault secret is stored. `_CLIENT_SECRET` is
+therefore now **optional** in the environment — a provider can be
+configured vault-only (`_CLIENT_ID`/`_REDIRECT_URI` in env, the secret
+stored via `unidb-vault set oauth.<provider>.client_secret`). Whichever
+source is used, the value is never logged, never `Debug`-printed, never
+returned in any response; a vault secret that WAS stored but can't be
+decrypted (vault disabled, wrong/rotated key, tampered blob) is a hard
+`502 OAUTH_PROVIDER_UNAVAILABLE` at callback time — never a silent
+plaintext fallback.
 
 **Identity store:** `(provider, provider_user_id) -> unidb username` is
 persisted in `roles.json` (the same control-plane store as
@@ -1814,6 +1823,70 @@ guessable credential — `authorize` takes no input at all, and
 `callback`'s `state`/`code` are both high-entropy, server-validated,
 single-use tokens with no meaningful brute-force surface for a
 fixed-window IP limiter to protect.
+
+### Secrets vault (item 129, Workstream I3)
+
+Config secrets — today, OAuth client secrets (above); later, SMTP
+credentials — can be stored **encrypted at rest** in `roles.json` instead
+of sitting in plaintext env vars. This is not an HTTP feature (no new
+routes): it's a CLI + an internal resolution order that the OAuth flow
+already uses.
+
+**Master key — `UNIDB_MASTER_KEY`:** a 32-byte AES-256 key, encoded as
+either base64 (standard alphabet, padded or unpadded — 44 or 43 characters)
+or hex (64 hex digits). Generate one with `openssl rand -base64 32` (or
+`-hex 32`). Three states:
+- **Unset** — the vault is **disabled**: a startup `warn!` is logged, and
+  every secret-backed config value falls back to its plaintext env var
+  exactly as before this item shipped. Never a hard crash. A secret that
+  was genuinely stored while the vault WAS enabled cannot be read back
+  without the original key.
+- **Set but malformed** (wrong length, not valid base64/hex) — the server
+  (and `unidb-vault`) refuse to start, with a clear error naming the exact
+  problem — same posture as a missing `UNIDB_JWT_SECRET`.
+- **Set and valid** — the vault is enabled. Encryption is AES-256-GCM with
+  a fresh random 96-bit nonce per secret; decryption verifies the GCM
+  authentication tag, so a wrong/rotated key or a tampered stored blob both
+  fail closed (an error, never a silent plaintext fallback).
+
+**`unidb-vault` CLI** (`cargo run --bin unidb-vault`, or the built binary —
+not `server`-feature-gated, same as `unidb-migrate`). Config:
+`UNIDB_DATA_DIR` (default `/tmp/unidb`), `UNIDB_PAGE_SIZE`,
+`UNIDB_MASTER_KEY` (required for `set`).
+
+```text
+unidb-vault set <name>     Encrypt+store a secret. Reads the plaintext from
+                            stdin if piped/redirected, otherwise from
+                            UNIDB_VAULT_SECRET_VALUE — NEVER a CLI argument
+                            (shell history / `ps`). Prints only
+                            "<name>: stored".
+unidb-vault has <name>     Print "stored" / "not stored". Never decrypts.
+unidb-vault list           List stored secret names, one per line.
+```
+
+```text
+# store an OAuth client secret encrypted at rest
+echo -n 'real-google-client-secret' | UNIDB_MASTER_KEY=<key> \
+  unidb-vault set oauth.google.client_secret
+```
+
+**OAuth resolution order** (`src/server/oauth.rs::resolve_client_secret`,
+called from `GET /auth/oauth/{provider}/callback` at token-exchange time):
+1. Vault secret named `oauth.<provider>.client_secret` — if stored, its
+   decrypted value is used. A stored-but-undecryptable secret (vault
+   disabled, wrong key, tampered blob) is a hard `502
+   OAUTH_PROVIDER_UNAVAILABLE` — never a fallback to step 2.
+2. Otherwise, the `UNIDB_OAUTH_<PROVIDER>_CLIENT_SECRET` env value (now
+   optional at provider-config time — a provider needs only `_CLIENT_ID`/
+   `_REDIRECT_URI` to be considered configured, so it can be vault-only).
+3. If neither is set, the callback fails with `502
+   OAUTH_PROVIDER_UNAVAILABLE` naming the missing secret.
+
+With no `UNIDB_MASTER_KEY` and no secret ever stored, resolution always
+takes step 2 — OAuth behaves exactly as it did before item 129.
+
+See `docs/backlog/129_secrets_vault.md` for the full design note and
+`src/vault.rs`'s module doc for the crypto detail.
 
 #### Catalog virtual relations
 

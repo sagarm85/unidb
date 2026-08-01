@@ -37,6 +37,29 @@
 //! the exact seam: the next item (I3, secrets vault) can make
 //! [`ClientSecret::expose`] decrypt-on-read from a real vault without
 //! touching any call site in this module or `handlers.rs`.
+//!
+//! **I3 update (item 129 — shipped):** [`resolve_client_secret`] is that
+//! seam realized. At token-exchange time (`GET /auth/oauth/<provider>/
+//! callback`, in `handlers.rs`), the resolver looks up the vault secret
+//! named `oauth.<provider>.client_secret`
+//! ([`crate::authz::RoleStore::get_secret`], via
+//! [`crate::server::engine_handle::EngineHandle::get_secret`]): if one is
+//! stored, its decrypted value is used; otherwise the
+//! `UNIDB_OAUTH_<PROVIDER>_CLIENT_SECRET` env value captured in
+//! [`OAuthProviderConfig`] at startup is used, exactly as before this item
+//! shipped. A vault secret that WAS stored but can't be decrypted (vault
+//! disabled/wrong key, tampered blob) is a hard error — never a silent
+//! plaintext fallback to a possibly-stale/absent env value. With no
+//! `UNIDB_MASTER_KEY` configured (vault disabled) and no vault secret ever
+//! stored, resolution always takes the env branch — D1's original behavior
+//! is unchanged byte-for-byte.
+//!
+//! Because `UNIDB_OAUTH_<PROVIDER>_CLIENT_SECRET` is optional as of item 129
+//! (see [`OAuthConfig::from_env`]), an operator can configure a provider
+//! **vault-only**: set `_CLIENT_ID`/`_REDIRECT_URI` in the environment (not
+//! secret — fine to keep there) and store only the client secret via
+//! `unidb-vault set oauth.<provider>.client_secret`. [`resolve_client_secret`]
+//! errors clearly if resolution finds the secret in neither place.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -58,7 +81,12 @@ impl ClientSecret {
         Self(raw)
     }
 
-    /// I3: route through the vault when available.
+    /// The plaintext env-sourced value, or `""` when
+    /// `UNIDB_OAUTH_<PROVIDER>_CLIENT_SECRET` was unset at startup (item
+    /// 129: the env var is now optional — see [`OAuthConfig::from_env`]).
+    /// Callers resolving the *effective* client secret should go through
+    /// [`resolve_client_secret`] (vault-first, this as the fallback), not
+    /// this accessor directly.
     pub fn expose(&self) -> &str {
         &self.0
     }
@@ -99,10 +127,10 @@ impl std::fmt::Debug for OAuthProviderConfig {
 }
 
 impl OAuthProviderConfig {
-    /// Never logged, never returned in any HTTP response — used only to
-    /// build the outbound token-exchange request in [`exchange_code_for_token`].
-    ///
-    /// I3: route through the vault when available.
+    /// The env-sourced client secret only (may be `""` — see
+    /// [`ClientSecret::expose`]). Never logged, never returned in any HTTP
+    /// response. Prefer [`resolve_client_secret`] at token-exchange time,
+    /// which additionally checks the vault first (item 129, I3).
     pub fn client_secret(&self) -> &str {
         self.client_secret.expose()
     }
@@ -198,8 +226,20 @@ impl OAuthConfig {
     /// Build from `UNIDB_OAUTH_<PROVIDER>_CLIENT_ID` / `_CLIENT_SECRET` /
     /// `_REDIRECT_URI` (+ optional `_AUTHORIZE_URL` / `_TOKEN_URL` /
     /// `_USERINFO_URL` / `_SCOPE` overrides) for "google" and "github". A
-    /// provider missing `_CLIENT_ID`, `_CLIENT_SECRET`, or `_REDIRECT_URI`
-    /// is simply absent from the resulting config (its routes then 404).
+    /// provider missing `_CLIENT_ID` or `_REDIRECT_URI` is simply absent
+    /// from the resulting config (its routes then 404) — unchanged from
+    /// before item 129.
+    ///
+    /// **Item 129 (I3) change:** `_CLIENT_SECRET` is now *optional* at this
+    /// layer — a provider with `_CLIENT_ID`/`_REDIRECT_URI` set but no
+    /// `_CLIENT_SECRET` is still configured (its routes are live), so an
+    /// operator can supply the secret exclusively via the vault
+    /// (`unidb-vault set oauth.<provider>.client_secret`) instead of the
+    /// environment. If the secret ends up in *neither* place,
+    /// [`resolve_client_secret`] fails clearly at token-exchange time
+    /// (`GET /auth/oauth/<provider>/callback`) rather than at startup —
+    /// exactly mirroring how a bad/expired secret already only surfaces at
+    /// exchange time (the provider rejects it), not at config-build time.
     pub fn from_env() -> Self {
         let mut providers = HashMap::new();
         for name in ["google", "github"] {
@@ -232,8 +272,12 @@ fn env_var(provider_upper: &str, suffix: &str) -> Option<String> {
 fn provider_from_env(provider: &str) -> Option<OAuthProviderConfig> {
     let upper = provider.to_ascii_uppercase();
     let client_id = env_var(&upper, "CLIENT_ID")?;
-    let client_secret = env_var(&upper, "CLIENT_SECRET")?;
     let redirect_uri = env_var(&upper, "REDIRECT_URI")?;
+    // Item 129 (I3): optional — `resolve_client_secret` falls back to the
+    // vault when this is absent/empty. `unwrap_or_default` gives `""`,
+    // which `resolve_client_secret` treats identically to "not configured
+    // in env" (see its doc comment).
+    let client_secret = env_var(&upper, "CLIENT_SECRET").unwrap_or_default();
     // Only "google"/"github" are ever passed in here (see `from_env`'s
     // fixed loop), so this always resolves.
     let (def_authorize, def_token, def_userinfo, def_scope) = default_urls(provider)?;
@@ -289,6 +333,48 @@ pub fn build_authorize_url(cfg: &OAuthProviderConfig, state: &str, code_challeng
     format!("{}?{}", cfg.authorize_url, qs.finish())
 }
 
+/// Vault secret name for `provider`'s OAuth client secret (item 129, I3):
+/// `oauth.<provider>.client_secret`. `pub` so both this module and callers
+/// wiring `unidb-vault set` know the exact convention without duplicating
+/// the literal.
+pub fn oauth_secret_name(provider: &str) -> String {
+    format!("oauth.{provider}.client_secret")
+}
+
+/// Resolve the *effective* client secret for `provider` (item 129, I3):
+/// vault first ([`oauth_secret_name`]), falling back to the
+/// `UNIDB_OAUTH_<PROVIDER>_CLIENT_SECRET` env value already captured in
+/// `cfg` when no vault secret is stored — see the module doc's "I3 update"
+/// section for the exact order. `Err` (never a silent empty/placeholder
+/// secret) when the vault lookup itself fails (disabled vault holding a
+/// stored secret, wrong/rotated key, tampered blob) or when the secret is
+/// in neither place.
+pub async fn resolve_client_secret(
+    engine: &crate::server::engine_handle::EngineHandle,
+    provider: &str,
+    cfg: &OAuthProviderConfig,
+) -> Result<String, OAuthError> {
+    let name = oauth_secret_name(provider);
+    match engine.get_secret(name.clone()).await {
+        Ok(Some(secret)) => Ok(secret),
+        Ok(None) => {
+            let env_secret = cfg.client_secret();
+            if env_secret.is_empty() {
+                Err(OAuthError::ProviderUnavailable(format!(
+                    "no client secret configured for OAuth provider '{provider}' — set it via \
+                     `unidb-vault set {name}` or UNIDB_OAUTH_{}_CLIENT_SECRET",
+                    provider.to_ascii_uppercase()
+                )))
+            } else {
+                Ok(env_secret.to_string())
+            }
+        }
+        Err(e) => Err(OAuthError::ProviderUnavailable(format!(
+            "vault error resolving client secret for OAuth provider '{provider}': {e}"
+        ))),
+    }
+}
+
 /// A failure talking to the provider (network/HTTP layer), distinguished
 /// from a provider-side rejection so `handlers.rs` can map each to the
 /// right status code: unreachable/erroring provider → `502`; provider
@@ -316,16 +402,22 @@ struct TokenResponse {
 /// time. Sends `Accept: application/json` explicitly — GitHub's token
 /// endpoint replies form-encoded by default unless asked for JSON; Google
 /// already replies JSON regardless, so the header is harmless there.
+///
+/// `client_secret` is the already-*resolved* value (item 129: vault-or-env
+/// — see [`resolve_client_secret`]), not read from `cfg` here, so this
+/// function itself stays vault-agnostic and synchronous-signature-shaped
+/// (no `EngineHandle` dependency).
 pub async fn exchange_code_for_token(
     client: &reqwest::Client,
     cfg: &OAuthProviderConfig,
+    client_secret: &str,
     code: &str,
     code_verifier: &str,
 ) -> Result<String, OAuthError> {
     let params = [
         ("grant_type", "authorization_code"),
         ("client_id", cfg.client_id.as_str()),
-        ("client_secret", cfg.client_secret()),
+        ("client_secret", client_secret),
         ("code", code),
         ("redirect_uri", cfg.redirect_uri.as_str()),
         ("code_verifier", code_verifier),

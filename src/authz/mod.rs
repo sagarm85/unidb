@@ -737,6 +737,19 @@ struct AuthState {
     /// server-only secret for the whole point of PKCE to hold.
     #[serde(default)]
     oauth_states: BTreeMap<String, OAuthStateRec>,
+    /// name → encrypted blob (item 129, Workstream I3: secrets vault). The
+    /// blob is `base64(nonce || ciphertext || tag)` from
+    /// [`crate::vault::Vault::encrypt`] — **never** the plaintext secret.
+    /// `#[serde(default)]` so a pre-129 `roles.json` (no `secrets` key)
+    /// deserializes with an empty map — no FORMAT_VERSION bump. Kept out of
+    /// `Debug` (see the manual impl below), same posture as `credentials`/
+    /// `sessions`/`mfa` — even though the value is already ciphertext (not
+    /// plaintext), it is still control-plane detail that shouldn't leak via
+    /// `{:?}`/`tracing::debug!`, and redacting it uniformly means a future
+    /// reader never has to reason about "is this field safe to print" on a
+    /// case-by-case basis.
+    #[serde(default)]
+    secrets: BTreeMap<String, String>,
 }
 
 /// Manual `Debug`: every field except `credentials`/`sessions`/`mfa`/
@@ -771,6 +784,9 @@ impl std::fmt::Debug for AuthState {
                 "oauth_states",
                 &format!("<{} redacted>", self.oauth_states.len()),
             )
+            // item 129: never show even the ciphertext blob — a count only,
+            // same posture as `credentials`/`sessions`/`mfa` above.
+            .field("secrets", &format!("<{} redacted>", self.secrets.len()))
             .finish()
     }
 }
@@ -1606,6 +1622,60 @@ impl RoleStore {
         self.persist(&st)?;
         tracing::info!(provider = %provider, user = %username, "OAuth identity linked (new account created)");
         Ok(username)
+    }
+
+    // ── item 129 (Workstream I3): encrypt-at-rest secrets vault ─────────
+
+    /// Encrypt `plaintext` with `vault` and persist it under `name`,
+    /// replacing any existing secret of the same name. Errors (never
+    /// stores plaintext) if `vault` is disabled ([`crate::vault::Vault::
+    /// is_enabled`] `== false` — no `UNIDB_MASTER_KEY`) — there is no code
+    /// path in this store that can persist a secret unencrypted. Never
+    /// logs `plaintext`; only the name is logged.
+    pub fn set_secret(
+        &self,
+        name: &str,
+        plaintext: &str,
+        vault: &crate::vault::Vault,
+    ) -> Result<()> {
+        let blob = vault.encrypt(plaintext)?;
+        let mut st = self.lock();
+        st.secrets.insert(name.to_string(), blob);
+        self.persist(&st)?;
+        tracing::info!(secret = %name, "secret stored in vault");
+        Ok(())
+    }
+
+    /// Decrypt and return the secret stored under `name`, or `Ok(None)` if
+    /// no secret with that name has ever been stored — callers (e.g. the
+    /// OAuth client-secret resolver) treat `None` as "fall back to another
+    /// source", never as an error. **Fails closed** (`Err`, never a
+    /// plaintext-fallback `Ok`) when a secret WAS stored under `name` but
+    /// cannot be decrypted — vault disabled/wrong master key, or a
+    /// tampered/corrupt ciphertext blob (GCM tag mismatch) — see
+    /// [`crate::vault::Vault::decrypt`]. Never logs the plaintext.
+    pub fn get_secret(&self, name: &str, vault: &crate::vault::Vault) -> Result<Option<String>> {
+        let blob = {
+            let st = self.lock();
+            st.secrets.get(name).cloned()
+        };
+        match blob {
+            Some(blob) => vault.decrypt(&blob).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Whether a secret is currently stored under `name` (item 129) —
+    /// never decrypts, never touches the vault; used by `unidb-vault has`
+    /// and the OAuth resolver's "is anything stored at all" check.
+    pub fn has_secret(&self, name: &str) -> bool {
+        self.lock().secrets.contains_key(name)
+    }
+
+    /// Every currently-stored secret name (item 129) — names only, never
+    /// ciphertext or plaintext; backs `unidb-vault list`.
+    pub fn secret_names(&self) -> Vec<String> {
+        self.lock().secrets.keys().cloned().collect()
     }
 
     /// Whether `user` holds `priv` on `table` **at all** — `true` for both a
@@ -3806,5 +3876,130 @@ mod tests {
         // Identity links carry no secret — the username IS expected to
         // appear (it's not redacted, per the item-128 design note).
         assert!(debug_str.contains(&username));
+    }
+
+    // ── item 129 (Workstream I3): encrypt-at-rest secrets vault ─────────
+
+    /// A fixed, deterministic test key (never a real deployment key) — via
+    /// [`crate::vault::Vault::for_test`], not `UNIDB_MASTER_KEY` env-var
+    /// plumbing, so these tests never race other tests' process-global env
+    /// state under parallel `cargo test`.
+    fn test_vault() -> crate::vault::Vault {
+        let vault = crate::vault::Vault::for_test([42u8; 32]);
+        assert!(vault.is_enabled());
+        vault
+    }
+
+    #[test]
+    fn set_secret_then_get_secret_roundtrips_the_plaintext() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        let vault = test_vault();
+        store
+            .set_secret("oauth.google.client_secret", "hunter2-oauth-secret", &vault)
+            .unwrap();
+        let got = store
+            .get_secret("oauth.google.client_secret", &vault)
+            .unwrap();
+        assert_eq!(got, Some("hunter2-oauth-secret".to_string()));
+    }
+
+    #[test]
+    fn get_secret_returns_none_when_never_stored() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        let vault = test_vault();
+        assert_eq!(store.get_secret("never.stored", &vault).unwrap(), None);
+    }
+
+    #[test]
+    fn has_secret_and_secret_names_never_expose_the_value() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        let vault = test_vault();
+        assert!(!store.has_secret("oauth.github.client_secret"));
+        store
+            .set_secret("oauth.github.client_secret", "top-secret", &vault)
+            .unwrap();
+        assert!(store.has_secret("oauth.github.client_secret"));
+        let names = store.secret_names();
+        assert_eq!(names, vec!["oauth.github.client_secret".to_string()]);
+        assert!(!names.iter().any(|n| n.contains("top-secret")));
+    }
+
+    #[test]
+    fn set_secret_fails_closed_when_vault_disabled() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        let disabled = crate::vault::Vault::disabled();
+        assert!(store
+            .set_secret("oauth.google.client_secret", "plaintext", &disabled)
+            .is_err());
+        // Nothing was persisted — a disabled vault must never fall back to
+        // storing a secret unencrypted.
+        assert!(!store.has_secret("oauth.google.client_secret"));
+    }
+
+    #[test]
+    fn get_secret_fails_closed_when_vault_key_changes() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        let vault_a = test_vault();
+        store
+            .set_secret("oauth.google.client_secret", "hunter2", &vault_a)
+            .unwrap();
+
+        // A different master key (simulating a rotated/wrong key at a later
+        // startup) must fail to decrypt — never silently return plaintext,
+        // never silently fall back to `None`.
+        let vault_b = crate::vault::Vault::for_test([7u8; 32]);
+        let err = store
+            .get_secret("oauth.google.client_secret", &vault_b)
+            .unwrap_err();
+        assert!(format!("{err}").contains("decrypt"));
+    }
+
+    #[test]
+    fn stored_secret_ciphertext_never_appears_in_persisted_roles_json_or_debug() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        let vault = test_vault();
+        store
+            .set_secret(
+                "oauth.google.client_secret",
+                "extremely-sensitive-plaintext-value",
+                &vault,
+            )
+            .unwrap();
+
+        // Debug of the in-memory store must redact to a count, never the
+        // ciphertext blob (which itself would aid an attacker even though
+        // it isn't the plaintext).
+        let debug_str = format!("{:?}", store.lock());
+        assert!(!debug_str.contains("extremely-sensitive-plaintext-value"));
+        assert!(debug_str.contains("secrets"));
+        assert!(debug_str.contains("redacted"));
+
+        // The persisted roles.json must never contain the plaintext either.
+        let on_disk = std::fs::read_to_string(dir.path().join("roles.json")).unwrap();
+        assert!(!on_disk.contains("extremely-sensitive-plaintext-value"));
+        assert!(on_disk.contains("oauth.google.client_secret"));
+    }
+
+    #[test]
+    fn pre_129_roles_json_without_secrets_key_still_loads() {
+        // Back-compat: a `roles.json` written before item 129 has no
+        // `secrets` key at all. `#[serde(default)]` must make it load as an
+        // empty map, not fail to open.
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("roles.json"),
+            r#"{"users":{"alice":true},"roles":[],"memberships":{},"table_grants":{}}"#,
+        )
+        .unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        assert!(store.is_superuser("alice"));
+        assert!(store.secret_names().is_empty());
+        assert!(!store.has_secret("anything"));
     }
 }

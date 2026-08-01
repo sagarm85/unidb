@@ -688,6 +688,23 @@ impl EngineHandle {
         .await
     }
 
+    /// Decrypt and return the secret stored under `name` (item 129,
+    /// Workstream I3), or `Ok(None)` if nothing is stored under that name.
+    /// See [`crate::authz::RoleStore::get_secret`] for the fail-closed
+    /// contract (a secret that WAS stored but can't be decrypted is `Err`,
+    /// never a silent `Ok(None)`/plaintext fallback). Used by
+    /// `src/server/oauth.rs`'s vault-vs-env client-secret resolver.
+    pub async fn get_secret(&self, name: String) -> Result<Option<String>> {
+        self.on_engine(move |e| e.get_secret(&name)).await
+    }
+
+    /// Encrypt `plaintext` and store it under `name` (item 129, I3). Never
+    /// logs or returns the plaintext.
+    pub async fn set_secret(&self, name: String, plaintext: String) -> Result<()> {
+        self.on_engine(move |e| e.set_secret(&name, &plaintext))
+            .await
+    }
+
     /// Install an RLS policy from a SQL predicate string (R3).
     pub async fn set_rls_policy_sql(&self, table: String, predicate: String) -> Result<()> {
         self.on_engine(move |e| e.set_rls_policy_sql(&table, &predicate))

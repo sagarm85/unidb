@@ -101,8 +101,13 @@ platform; **P2** = ecosystem.
   fixed-window limiter, `src/server/rate_limit.rs`, over `POST /auth/login`,
   `/auth/signup`, `/auth/refresh`; keyed by client IP + route + optional
   username; `UNIDB_AUTH_RATE_LIMIT`/`UNIDB_AUTH_RATE_WINDOW_SECS`; see
-  `docs/REST_API.md`'s "Auth rate limiting" section) · I2 CAPTCHA · I3 secrets
-  vault · **I4 migrations tooling — SHIPPED 2026-07-31** (Supabase-style
+  `docs/REST_API.md`'s "Auth rate limiting" section) · I2 CAPTCHA · **I3
+  secrets vault — SHIPPED 2026-08-01** (encrypt-at-rest config secrets:
+  AES-256-GCM `src/vault.rs` keyed by `UNIDB_MASTER_KEY`, a `SecretStore`
+  persisted alongside `roles.json`'s credentials/sessions/MFA, the
+  `unidb-vault` CLI, and the OAuth client-secret seam item 128 left wired
+  through it — vault-first, env-fallback; see `129_secrets_vault.md`) · **I4
+  migrations tooling — SHIPPED 2026-07-31** (Supabase-style
   forward-only `.sql` migrations, `Engine::apply_migrations` + `unidb-migrate`
   CLI, `schema_migrations` tracking table with checksum drift detection; see
   `126_sql_schema_migrations.md` and `docs/SCHEMA_MIGRATIONS.md`) · I5
