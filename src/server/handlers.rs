@@ -1557,9 +1557,19 @@ pub async fn get_oauth_callback(
             message: "invalid, expired, replayed, or provider-mismatched OAuth state".into(),
         })?;
 
+    // Item 129 (I3): resolve the effective client secret — a vault-stored
+    // secret named `oauth.<provider>.client_secret` takes precedence over
+    // the `UNIDB_OAUTH_<PROVIDER>_CLIENT_SECRET` env value baked into `cfg`
+    // at startup. See `oauth::resolve_client_secret`'s doc comment for the
+    // exact order and fail-closed behavior.
+    let client_secret = crate::server::oauth::resolve_client_secret(&state.engine, &provider, &cfg)
+        .await
+        .map_err(oauth_error_to_api)?;
+
     let access_token = crate::server::oauth::exchange_code_for_token(
         state.oauth.http(),
         &cfg,
+        &client_secret,
         &code,
         &code_verifier,
     )

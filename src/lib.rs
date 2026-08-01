@@ -101,6 +101,7 @@ pub mod storage_api;
 pub mod server;
 pub mod sql;
 pub mod txn;
+pub mod vault;
 pub mod vector;
 pub mod wal;
 
@@ -673,6 +674,14 @@ pub struct Engine {
     /// superuser (identity `None`); named users go through `execute_sql_as` with
     /// per-table privilege checks. Persisted in `roles.json`.
     authz: Arc<crate::authz::RoleStore>,
+    /// Encrypt-at-rest secrets vault (item 129, Workstream I3). Loaded once
+    /// from `UNIDB_MASTER_KEY` at open (see [`crate::vault::Vault::
+    /// from_env`]): disabled (with a startup `warn!`) when the env var is
+    /// unset, `Err`s `Engine::open` itself when set but malformed. Named
+    /// ciphertext blobs live in `authz`'s `roles.json` (a sibling map next
+    /// to `credentials`/`sessions`); this field only ever holds the key
+    /// material, never persisted.
+    vault: crate::vault::Vault,
     /// Security audit trail (P6.f) — auth DDL + named-user access decisions,
     /// appended to `audit.log`.
     audit: Arc<crate::audit::AuditLog>,
@@ -1604,6 +1613,11 @@ impl Engine {
         let replication = Arc::new(crate::replication::SlotRegistry::open(dir)?);
         // Users / roles / privileges (P6.e), loaded from `roles.json`.
         let authz = Arc::new(crate::authz::RoleStore::open(dir)?);
+        // Encrypt-at-rest secrets vault (item 129, I3): disabled+warn if
+        // UNIDB_MASTER_KEY is unset, `Err`s this whole `open` call if set
+        // but malformed (fail clearly at startup, same posture as a bad
+        // page size or a corrupt control file).
+        let vault = crate::vault::Vault::from_env()?;
         // Security audit trail (P6.f).
         let audit = Arc::new(crate::audit::AuditLog::open(dir)?);
 
@@ -1678,6 +1692,7 @@ impl Engine {
             write_serial: Mutex::new(()),
             replication,
             authz,
+            vault,
             audit,
             commits: AtomicU64::new(0),
             aborts: AtomicU64::new(0),
@@ -1742,6 +1757,43 @@ impl Engine {
     /// The authorization store (P6.e) — users/roles/privileges.
     pub fn authz(&self) -> &crate::authz::RoleStore {
         &self.authz
+    }
+
+    /// The encrypt-at-rest secrets vault (item 129, Workstream I3). Exposed
+    /// mainly so callers outside this crate (e.g. `src/server/oauth.rs`'s
+    /// vault-vs-env resolver) can check [`crate::vault::Vault::is_enabled`]
+    /// without going through a round-trip `set_secret`/`get_secret` call.
+    pub fn vault(&self) -> &crate::vault::Vault {
+        &self.vault
+    }
+
+    /// Encrypt `plaintext` and store it under `name` (item 129, I3's
+    /// `unidb-vault set` / `POST`-less embedded-API entry point). See
+    /// [`crate::authz::RoleStore::set_secret`] for the fail-closed-on-
+    /// disabled-vault contract. Never logs or returns the plaintext.
+    pub fn set_secret(&self, name: &str, plaintext: &str) -> Result<()> {
+        self.authz.set_secret(name, plaintext, &self.vault)
+    }
+
+    /// Decrypt and return the secret stored under `name`, or `Ok(None)` if
+    /// nothing is stored under that name (item 129, I3). See
+    /// [`crate::authz::RoleStore::get_secret`] for the fail-closed contract
+    /// when a secret WAS stored but cannot be decrypted. Never logs the
+    /// plaintext.
+    pub fn get_secret(&self, name: &str) -> Result<Option<String>> {
+        self.authz.get_secret(name, &self.vault)
+    }
+
+    /// Whether a secret is currently stored under `name` (item 129) —
+    /// never decrypts. Backs `unidb-vault has`.
+    pub fn has_secret(&self, name: &str) -> bool {
+        self.authz.has_secret(name)
+    }
+
+    /// Every currently-stored secret name (item 129) — names only, never
+    /// values. Backs `unidb-vault list`.
+    pub fn secret_names(&self) -> Vec<String> {
+        self.authz.secret_names()
     }
 
     /// Set (or replace) `user`'s password credential (item 121, A1). Hashed

@@ -45,6 +45,15 @@ sha2 = "0.10"
 hmac = "0.13"
 sha1 = "0.11"
 
+# Item 129 (Workstream I3): AES-256-GCM authenticated encryption for the
+# encrypt-at-rest secrets vault (`src/vault.rs`). Not server-feature-gated,
+# same rationale as `argon2`/`sha2`/`hmac`/`sha1` above: the vault is core
+# control-plane state (a sibling of `src/authz/mod.rs`'s `roles.json` store),
+# independent of the optional HTTP server — the `unidb-vault` CLI and the
+# embedded `Engine::set_secret`/`get_secret` API both need it with no
+# `server` feature required.
+aes-gcm = "0.11"
+
 # M5: optional server (src/server/, src/bin/unidb-server.rs). All gated
 # behind the `server` feature so a default `cargo build`/`cargo test` never
 # pulls in an async runtime — "the engine stays sync" (CLAUDE.md) is
@@ -156,6 +165,14 @@ required-features = ["server"]
 [[bin]]
 name = "unidb-migrate"
 path = "src/bin/unidb-migrate.rs"
+
+# Item 129 (Workstream I3): secrets-vault CLI. Deliberately NOT gated on the
+# "server" feature — same rationale as `unidb-migrate` above: it only opens
+# the (sync) embedded `Engine` and calls `Engine::set_secret`/`has_secret`/
+# `secret_names`, no async runtime/HTTP needed.
+[[bin]]
+name = "unidb-vault"
+path = "src/bin/unidb-vault.rs"
 
 [[bench]]
 name = "bulk_build"
@@ -357,4 +374,10 @@ required-features = ["server"]
 [[test]]
 name = "server_rest"
 path = "tests/server_rest.rs"
+required-features = ["server"]
+
+# Item 129 (Workstream I3): encrypt-at-rest secrets vault, OAuth wiring.
+[[test]]
+name = "item129_vault"
+path = "tests/item129_vault.rs"
 required-features = ["server"]
