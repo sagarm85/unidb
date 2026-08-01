@@ -1,7 +1,7 @@
 # Auth admin API (user management)
 
 **Type:** Improvement
-**Status:** IN PROGRESS
+**Status:** SHIPPED (2026-08-01, PR #245) — superuser `/auth/admin/users` (list+pagination/get/create/patch/delete) + per-user `banned` (enforced at login/refresh/verify/magiclink-verify, sessions revoked; access JWT rides expiry) + `app_metadata`/`user_metadata`. Last-superuser + demotion lockout guards on the shared DROP USER path. item142 12/12, crash 54/54.
 
 > Wave-2 free-roadmap item (`137`). Supabase's `auth.admin` gives a REST surface
 > for managing users — list (paginated), get, create, update, delete, **ban**,
