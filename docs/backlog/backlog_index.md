@@ -6,8 +6,8 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `142_…`**
-> (141 assigned 2026-08-01 to the database-webhooks item below).
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `143_…`**
+> (142 assigned 2026-08-01 to the auth-admin-API item below).
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -160,7 +160,9 @@ Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 
 | 141 | `141_database_webhooks.md` | Improvement | ✅ SHIPPED (2026-08-01, PR #244) — Wave-2: outbound HTTP POST to an operator endpoint on INSERT/UPDATE/DELETE, built on the existing WAL-derived durable event stream (M4/item-29 CDC). Background delivery worker owns a durable consumer; matches webhooks by table_pattern+events; POSTs the CDC envelope with an HMAC `X-Unidb-Signature`; bounded-retry then skip (dead endpoint can't wedge the stream). Superuser `POST/GET/DELETE /webhooks`, vault-first secret. Strictly downstream of commit → no storage change, crash 54/54. Free (operator's own endpoint). |
 
-**Next new file → `142_…`.
+| 142 | `142_auth_admin_api.md` | Improvement | 🔄 IN PROGRESS — Wave-2: consolidated superuser `/auth/admin/users` REST surface (list+pagination, get, create, update, delete) + new per-user `banned` flag (rejected at login/refresh/email-flows, sessions revoked; short-TTL access JWT valid until expiry — documented) + `app_metadata`/`user_metadata` store. Reuses existing user/session/password machinery (items 121/124/138). Control-plane only — crash 54/54. |
+
+**Next new file → `143_…`.
 
 ## Next up — priority order (2026-07-23, post fresh-baseline bench)
 
