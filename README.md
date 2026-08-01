@@ -334,9 +334,14 @@ UNIDB_DATA_DIR=/var/lib/unidb cargo run --bin unidb-migrate -- migrations
 - Online base backup + WAL archiving + point-in-time recovery (by timestamp or LSN)
 - Users, roles, GRANT — per-table privileges with transitive role membership
 - Password auth (argon2id), refresh-token sessions, TOTP MFA, OAuth 2.0
-  social login (Google/GitHub), and self-service password-reset +
-  magic-link sign-in over a pluggable email transport (SMTP or a
-  no-network dev-inbox log transport, item 138)
+  social login (Google, GitHub, Apple, Microsoft/Azure AD, GitLab, Discord,
+  Facebook — item 143 extended the original Google/GitHub preset table),
+  and self-service password-reset + magic-link sign-in over a pluggable
+  email transport (SMTP or a no-network dev-inbox log transport, item 138)
+- Leaked-password protection (item 143) — opt-in (`UNIDB_PASSWORD_HIBP_CHECK=1`)
+  HaveIBeenPwned "Pwned Passwords" k-anonymity check at every password-set
+  point (signup, admin create/patch, password reset); fails open with a
+  warning on an HIBP outage
 - Auth admin API (item 142) — consolidated, superuser-only user management
   (`/auth/admin/users`: paginated list/get/create/update/delete) plus
   per-user **ban** (rejected at login/refresh/email-verify with `403
