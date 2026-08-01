@@ -1,7 +1,7 @@
 # /rest/v1 count + Prefer response controls
 
 **Type:** Improvement
-**Status:** IN PROGRESS
+**Status:** SHIPPED (2026-08-01, PR #242) — `Prefer: count=exact` → RLS-respecting `Content-Range`; `Prefer: return=representation|minimal` on POST/PATCH/DELETE (RETURNING *); unknown prefs ignored, `Preference-Applied` echoed. REST-layer only, no-Prefer responses byte-identical. Crash 54/54.
 
 > Wave-1 free-roadmap item (`137`). PostgREST-parity response controls that
 > clients (incl. supabase-js / unidb-js) expect: **exact-count** on collection
