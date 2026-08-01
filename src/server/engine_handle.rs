@@ -393,6 +393,45 @@ impl EngineHandle {
             .await
     }
 
+    /// item 140: channel-authorization gate for the four item-132 realtime
+    /// routes — see [`crate::Engine::check_channel_authz`]'s doc comment.
+    pub async fn check_channel_authz(
+        &self,
+        principal: AuthPrincipal,
+        topic: String,
+        operation: crate::authz::ChannelOp,
+        route: &'static str,
+    ) -> Result<()> {
+        self.on_engine(move |e| e.check_channel_authz(&principal, &topic, operation, route))
+            .await
+    }
+
+    /// item 140 (admin surface): `PUT /realtime/policies`.
+    pub async fn set_channel_policy(
+        &self,
+        topic_pattern: String,
+        operation: crate::authz::ChannelOp,
+        roles: std::collections::BTreeSet<String>,
+    ) -> Result<()> {
+        self.on_engine(move |e| e.set_channel_policy(&topic_pattern, operation, roles))
+            .await
+    }
+
+    /// item 140 (admin surface): `DELETE /realtime/policies`.
+    pub async fn remove_channel_policy(
+        &self,
+        topic_pattern: String,
+        operation: crate::authz::ChannelOp,
+    ) -> Result<()> {
+        self.on_engine(move |e| e.remove_channel_policy(&topic_pattern, operation))
+            .await
+    }
+
+    /// item 140 (admin surface): `GET /realtime/policies`.
+    pub async fn list_channel_policies(&self) -> Result<Vec<crate::authz::ChannelPolicyDef>> {
+        self.on_engine(|e| Ok(e.list_channel_policies())).await
+    }
+
     /// Q2 (item 26): current commit generation — callers snapshot this before
     /// processing a batch so they can detect the NEXT commit even if it fires
     /// before the `wait_event_commit` call.

@@ -832,6 +832,13 @@ struct AuthState {
     /// `recovery_tokens`.
     #[serde(default)]
     magiclink_tokens: BTreeMap<String, EmailTokenRec>,
+    /// Realtime channel-authorization policies (item 140): one entry per
+    /// `(topic_pattern, operation)` pair. No secret material — shown in full
+    /// in `Debug` below, same posture as `oauth_identities`/`table_grants`.
+    /// `#[serde(default)]` so a pre-140 `roles.json` (no `channel_policies`
+    /// key) deserializes with an empty list — no FORMAT_VERSION bump.
+    #[serde(default)]
+    channel_policies: Vec<ChannelPolicyDef>,
 }
 
 /// Manual `Debug`: every field except `credentials`/`sessions`/`mfa`/
@@ -879,6 +886,10 @@ impl std::fmt::Debug for AuthState {
                 "magiclink_tokens",
                 &format!("<{} redacted>", self.magiclink_tokens.len()),
             )
+            // item 140: channel policies carry no secret (topic patterns +
+            // role names only) — shown in full, same posture as
+            // `oauth_identities`/`table_grants` above.
+            .field("channel_policies", &self.channel_policies)
             .finish()
     }
 }
@@ -949,6 +960,64 @@ pub struct PolicyDef {
     /// FORMAT_VERSION bump.
     #[serde(default)]
     pub target_roles: Vec<String>,
+}
+
+/// Operation scope for a realtime channel-authorization policy (item 140).
+/// `All` matches every one of the other three when checking whether a stored
+/// policy governs a caller's requested operation — see [`ChannelOp::governs`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChannelOp {
+    Publish,
+    Subscribe,
+    /// Covers both `GET /realtime/presence/subscribe` and `POST /realtime/
+    /// presence/track` — the two presence routes share one operation kind
+    /// (item-140 backlog doc's enforcement-points table), distinct from
+    /// broadcast's `Publish`/`Subscribe`.
+    Presence,
+    All,
+}
+
+impl ChannelOp {
+    pub fn parse(s: &str) -> Option<ChannelOp> {
+        match s.to_ascii_lowercase().as_str() {
+            "publish" => Some(ChannelOp::Publish),
+            "subscribe" => Some(ChannelOp::Subscribe),
+            "presence" => Some(ChannelOp::Presence),
+            "all" => Some(ChannelOp::All),
+            _ => None,
+        }
+    }
+
+    /// String representation for the admin surface (`GET /realtime/policies`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChannelOp::Publish => "publish",
+            ChannelOp::Subscribe => "subscribe",
+            ChannelOp::Presence => "presence",
+            ChannelOp::All => "all",
+        }
+    }
+
+    /// Whether a policy scoped to `self` governs a caller's `requested`
+    /// operation — exact match, or `self == All` (a catch-all policy governs
+    /// every operation on a topic it matches).
+    fn governs(self, requested: ChannelOp) -> bool {
+        self == ChannelOp::All || self == requested
+    }
+}
+
+/// A realtime channel-authorization policy (item 140, backlog doc's locked
+/// v1 design): `(topic_pattern, operation) -> allowed_roles`. `topic_pattern`
+/// is an exact topic or a `*`-suffix glob (`"room:*"`); `roles` reuses the
+/// existing role system (including the built-in `anon`/`authenticated`/
+/// `service_role` — see [`RoleStore::effective_roles`]). Persisted in
+/// `roles.json` alongside every other control-plane object (no separate
+/// store, no FORMAT_VERSION bump — see [`AuthState::channel_policies`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChannelPolicyDef {
+    pub topic_pattern: String,
+    pub operation: ChannelOp,
+    pub roles: BTreeSet<String>,
 }
 
 /// A parsed auth-DDL statement.
@@ -1897,6 +1966,138 @@ impl RoleStore {
     /// ciphertext or plaintext; backs `unidb-vault list`.
     pub fn secret_names(&self) -> Vec<String> {
         self.lock().secrets.keys().cloned().collect()
+    }
+
+    // ── item 140: realtime channel-authorization policies ──────────────
+
+    /// Whether `topic` matches `pattern`: exact equality, or `pattern` is a
+    /// `*`-suffix glob (the only glob shape the locked v1 design supports)
+    /// and `topic` starts with the prefix before the `*`.
+    fn channel_topic_matches(pattern: &str, topic: &str) -> bool {
+        match pattern.strip_suffix('*') {
+            Some(prefix) => topic.starts_with(prefix),
+            None => pattern == topic,
+        }
+    }
+
+    /// Specificity score backing "most-specific match wins (longest
+    /// non-wildcard prefix)" (item-140 backlog doc): the length of the
+    /// pattern's fixed, non-wildcard prefix. An exact pattern counts its
+    /// whole length (nothing to strip), so an exact match always outranks
+    /// any glob that is merely a prefix of it.
+    fn channel_pattern_specificity(pattern: &str) -> usize {
+        pattern.strip_suffix('*').unwrap_or(pattern).len()
+    }
+
+    /// Find the single most-specific policy governing `operation` on `topic`.
+    /// Ties in specificity (two policies sharing the identical
+    /// `topic_pattern` string, one scoped to the exact `operation` and one
+    /// scoped `All`) favor the exact-operation policy — a deliberate,
+    /// documented tie-break the backlog spec leaves unstated, chosen so an
+    /// explicit per-operation rule always overrides a same-pattern catch-all.
+    /// Never ambiguous: at most one policy is returned.
+    fn match_channel_policy<'a>(
+        policies: &'a [ChannelPolicyDef],
+        topic: &str,
+        operation: ChannelOp,
+    ) -> Option<&'a ChannelPolicyDef> {
+        policies
+            .iter()
+            .filter(|p| {
+                p.operation.governs(operation)
+                    && Self::channel_topic_matches(&p.topic_pattern, topic)
+            })
+            .max_by_key(|p| {
+                (
+                    Self::channel_pattern_specificity(&p.topic_pattern),
+                    p.operation != ChannelOp::All,
+                )
+            })
+    }
+
+    /// The channel-authorization decision for `(topic, operation)`, given the
+    /// caller's already-resolved effective roles. **Deliberately has no
+    /// superuser/`service_role` bypass and no audit side effect** — that
+    /// decision (and its audited trail, item-103 lesson) is the caller's job;
+    /// see `Engine::check_channel_authz`. Fail-closed: a topic matching no
+    /// policy is allowed only when `require_authz` is false (item-132
+    /// back-compat default); a topic matching a policy is *always* enforced
+    /// regardless of `require_authz` — allowed only if `roles` intersects the
+    /// policy's `roles`.
+    pub fn check_channel_policy(
+        &self,
+        topic: &str,
+        operation: ChannelOp,
+        roles: &[String],
+        require_authz: bool,
+    ) -> bool {
+        let st = self.lock();
+        match Self::match_channel_policy(&st.channel_policies, topic, operation) {
+            Some(policy) => roles.iter().any(|r| policy.roles.contains(r)),
+            None => !require_authz,
+        }
+    }
+
+    /// Upsert a channel-authorization policy (item 140 admin surface):
+    /// replaces the role set of an existing `(topic_pattern, operation)`
+    /// policy, or inserts a new one. Superuser gating is the HTTP handler's
+    /// job (mirrors `set_rls_policy_sql`/`Engine::set_rls_policy`) — this
+    /// method itself is unrestricted, matching every other direct
+    /// `RoleStore` mutator (the embedded API is the trusted caller).
+    pub fn set_channel_policy(
+        &self,
+        topic_pattern: &str,
+        operation: ChannelOp,
+        roles: BTreeSet<String>,
+    ) -> Result<()> {
+        let mut st = self.lock();
+        match st
+            .channel_policies
+            .iter_mut()
+            .find(|p| p.topic_pattern == topic_pattern && p.operation == operation)
+        {
+            Some(existing) => existing.roles = roles,
+            None => st.channel_policies.push(ChannelPolicyDef {
+                topic_pattern: topic_pattern.to_string(),
+                operation,
+                roles,
+            }),
+        }
+        self.persist(&st)?;
+        // Never log the role set (or anything policy-shaped) at info — only
+        // the pattern/operation "coordinates", no roles/tokens, at debug.
+        tracing::debug!(
+            topic_pattern = %topic_pattern,
+            operation = %operation.as_str(),
+            "realtime channel policy upserted"
+        );
+        Ok(())
+    }
+
+    /// Remove a channel-authorization policy (item 140 admin surface).
+    /// Idempotent: removing a `(topic_pattern, operation)` pair that doesn't
+    /// exist is a silent no-op, not an error (mirrors `revoke_session`'s
+    /// idempotency posture).
+    pub fn remove_channel_policy(&self, topic_pattern: &str, operation: ChannelOp) -> Result<()> {
+        let mut st = self.lock();
+        let before = st.channel_policies.len();
+        st.channel_policies
+            .retain(|p| !(p.topic_pattern == topic_pattern && p.operation == operation));
+        if st.channel_policies.len() != before {
+            self.persist(&st)?;
+            tracing::debug!(
+                topic_pattern = %topic_pattern,
+                operation = %operation.as_str(),
+                "realtime channel policy removed"
+            );
+        }
+        Ok(())
+    }
+
+    /// Every stored channel-authorization policy (item 140, `GET /realtime/
+    /// policies`).
+    pub fn list_channel_policies(&self) -> Vec<ChannelPolicyDef> {
+        self.lock().channel_policies.clone()
     }
 
     /// Whether `user` holds `priv` on `table` **at all** — `true` for both a
@@ -4346,5 +4547,180 @@ mod tests {
         assert!(store.is_superuser("alice"));
         assert!(store.secret_names().is_empty());
         assert!(!store.has_secret("anything"));
+    }
+
+    // ── item 140: realtime channel-authorization policies ──────────────
+
+    #[test]
+    fn channel_policy_no_match_allows_off_denies_on() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        // No policy stored at all.
+        assert!(store.check_channel_policy(
+            "room:1",
+            ChannelOp::Subscribe,
+            &["authenticated".into()],
+            false
+        ));
+        assert!(!store.check_channel_policy(
+            "room:1",
+            ChannelOp::Subscribe,
+            &["authenticated".into()],
+            true
+        ));
+    }
+
+    #[test]
+    fn channel_policy_matched_topic_enforces_regardless_of_require_authz() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        store
+            .set_channel_policy(
+                "room:*",
+                ChannelOp::Subscribe,
+                BTreeSet::from(["member".to_string()]),
+            )
+            .unwrap();
+        // A caller with the role is allowed whether or not enforce mode is on.
+        assert!(store.check_channel_policy(
+            "room:42",
+            ChannelOp::Subscribe,
+            &["member".into()],
+            false
+        ));
+        assert!(store.check_channel_policy(
+            "room:42",
+            ChannelOp::Subscribe,
+            &["member".into()],
+            true
+        ));
+        // A caller without it is denied either way (a matched policy is
+        // always enforced).
+        assert!(!store.check_channel_policy(
+            "room:42",
+            ChannelOp::Subscribe,
+            &["authenticated".into()],
+            false
+        ));
+        assert!(!store.check_channel_policy(
+            "room:42",
+            ChannelOp::Subscribe,
+            &["authenticated".into()],
+            true
+        ));
+    }
+
+    #[test]
+    fn channel_policy_most_specific_pattern_wins() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        store
+            .set_channel_policy(
+                "room:*",
+                ChannelOp::Subscribe,
+                BTreeSet::from(["member".to_string()]),
+            )
+            .unwrap();
+        store
+            .set_channel_policy(
+                "room:42",
+                ChannelOp::Subscribe,
+                BTreeSet::from(["vip".to_string()]),
+            )
+            .unwrap();
+        // The exact "room:42" policy overrides the "room:*" glob for that topic.
+        assert!(store.check_channel_policy(
+            "room:42",
+            ChannelOp::Subscribe,
+            &["vip".into()],
+            false
+        ));
+        assert!(!store.check_channel_policy(
+            "room:42",
+            ChannelOp::Subscribe,
+            &["member".into()],
+            false
+        ));
+        // A different topic under the glob still uses the less-specific policy.
+        assert!(store.check_channel_policy(
+            "room:7",
+            ChannelOp::Subscribe,
+            &["member".into()],
+            false
+        ));
+    }
+
+    #[test]
+    fn channel_policy_all_op_governs_every_operation_but_specific_op_wins_tie() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        store
+            .set_channel_policy("t", ChannelOp::All, BTreeSet::from(["anyrole".to_string()]))
+            .unwrap();
+        // `All` governs publish/subscribe/presence alike.
+        assert!(store.check_channel_policy("t", ChannelOp::Publish, &["anyrole".into()], false));
+        assert!(store.check_channel_policy("t", ChannelOp::Presence, &["anyrole".into()], false));
+
+        // An explicit same-pattern `Subscribe` policy overrides the `All`
+        // catch-all for `Subscribe` specifically (documented tie-break).
+        store
+            .set_channel_policy(
+                "t",
+                ChannelOp::Subscribe,
+                BTreeSet::from(["subrole".to_string()]),
+            )
+            .unwrap();
+        assert!(!store.check_channel_policy("t", ChannelOp::Subscribe, &["anyrole".into()], false));
+        assert!(store.check_channel_policy("t", ChannelOp::Subscribe, &["subrole".into()], false));
+        // Publish is untouched — still governed by the `All` policy.
+        assert!(store.check_channel_policy("t", ChannelOp::Publish, &["anyrole".into()], false));
+    }
+
+    #[test]
+    fn channel_policy_upsert_replaces_remove_is_idempotent_and_persists() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        store
+            .set_channel_policy("t", ChannelOp::Publish, BTreeSet::from(["a".to_string()]))
+            .unwrap();
+        store
+            .set_channel_policy("t", ChannelOp::Publish, BTreeSet::from(["b".to_string()]))
+            .unwrap();
+        let policies = store.list_channel_policies();
+        assert_eq!(policies.len(), 1, "upsert must replace, not duplicate");
+        assert_eq!(policies[0].roles, BTreeSet::from(["b".to_string()]));
+
+        // Removing an unknown pair is a no-op, not an error.
+        store
+            .remove_channel_policy("does-not-exist", ChannelOp::Publish)
+            .unwrap();
+        assert_eq!(store.list_channel_policies().len(), 1);
+
+        store
+            .remove_channel_policy("t", ChannelOp::Publish)
+            .unwrap();
+        assert!(store.list_channel_policies().is_empty());
+
+        // Reopening the store from disk must see the same (empty) state —
+        // proves persistence round-trips, not just the in-memory map.
+        drop(store);
+        let reopened = RoleStore::open(dir.path()).unwrap();
+        assert!(reopened.list_channel_policies().is_empty());
+    }
+
+    #[test]
+    fn pre_140_roles_json_without_channel_policies_key_still_loads() {
+        // Back-compat: a `roles.json` written before item 140 has no
+        // `channel_policies` key. `#[serde(default)]` must make it load as
+        // an empty list, not fail to open.
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("roles.json"),
+            r#"{"users":{"alice":true},"roles":[],"memberships":{},"table_grants":{}}"#,
+        )
+        .unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        assert!(store.is_superuser("alice"));
+        assert!(store.list_channel_policies().is_empty());
     }
 }

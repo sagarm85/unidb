@@ -42,8 +42,9 @@ use crate::{
             AuthLoginOutcome, AuthLoginRequest, AuthLoginResponse, AuthMagicLinkRequest,
             AuthMagicLinkVerifyRequest, AuthMetaResponse, AuthPreviewRequest, AuthRecoverRequest,
             AuthVerifyRequest, BatchInsertRequest, BatchSqlRequest, BatchSqlResponse,
-            BeginTxnRequest, CreateEdgeRequest, CreateSlotRequest, CursorQuery, CypherRequest,
-            DeleteEdgeRequest, GroupCommitWindowRequest, HistoryQuery, IsolationDto,
+            BeginTxnRequest, ChannelPolicyDeleteRequest, ChannelPolicyDto,
+            ChannelPolicyUpsertRequest, CreateEdgeRequest, CreateSlotRequest, CursorQuery,
+            CypherRequest, DeleteEdgeRequest, GroupCommitWindowRequest, HistoryQuery, IsolationDto,
             MfaChallengeRequest, MfaDisableRequest, MfaEnrollResponse, MfaVerifyRequest,
             MfaVerifyResponse, OAuthCallbackQuery, RlsRequest, RowIdResponse, SetIndexRequest,
             SlowQueryThresholdRequest, SqlRequest, StreamQuery, TableInfo, WhoamiPrivilege,
@@ -975,6 +976,94 @@ pub async fn put_table_rls(
         .await
         .map_err(ApiError::from)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ── Realtime channel authorization (item 140) ──────────────────────────────
+
+fn parse_channel_op(raw: &str) -> std::result::Result<crate::authz::ChannelOp, ApiError> {
+    crate::authz::ChannelOp::parse(raw).ok_or_else(|| {
+        ApiError::bad_request(
+            "INVALID_OPERATION",
+            format!("operation must be one of publish|subscribe|presence|all, got '{raw}'"),
+        )
+    })
+}
+
+/// `PUT /realtime/policies` (item 140 admin surface): upsert a
+/// channel-authorization policy `{topic_pattern, operation, roles}`.
+/// Superuser-gated, the same posture as [`put_table_rls`] — topics aren't
+/// SQL objects, but the access-control stakes are the same.
+pub async fn put_realtime_policy(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+    Json(body): Json<ChannelPolicyUpsertRequest>,
+) -> std::result::Result<StatusCode, ApiError> {
+    state
+        .engine
+        .ensure_superuser(current_user.0.clone())
+        .await
+        .map_err(ApiError::from)?;
+    let operation = parse_channel_op(&body.operation)?;
+    let roles: std::collections::BTreeSet<String> = body.roles.into_iter().collect();
+    state
+        .engine
+        .set_channel_policy(body.topic_pattern, operation, roles)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /realtime/policies` (item 140 admin surface): remove a
+/// channel-authorization policy `{topic_pattern, operation}`. Idempotent —
+/// removing an unknown `(topic_pattern, operation)` pair is a no-op, not an
+/// error (mirrors `RoleStore::remove_channel_policy`'s posture).
+pub async fn delete_realtime_policy(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+    Json(body): Json<ChannelPolicyDeleteRequest>,
+) -> std::result::Result<StatusCode, ApiError> {
+    state
+        .engine
+        .ensure_superuser(current_user.0.clone())
+        .await
+        .map_err(ApiError::from)?;
+    let operation = parse_channel_op(&body.operation)?;
+    state
+        .engine
+        .remove_channel_policy(body.topic_pattern, operation)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /realtime/policies` (item 140 admin surface): list every stored
+/// channel-authorization policy. Superuser-gated (same as the write routes
+/// above) — the policy set is access-control configuration, not something
+/// every authenticated caller should be able to enumerate.
+pub async fn get_realtime_policies(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+) -> std::result::Result<Json<Vec<ChannelPolicyDto>>, ApiError> {
+    state
+        .engine
+        .ensure_superuser(current_user.0.clone())
+        .await
+        .map_err(ApiError::from)?;
+    let policies = state
+        .engine
+        .list_channel_policies()
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(
+        policies
+            .into_iter()
+            .map(|p| ChannelPolicyDto {
+                topic_pattern: p.topic_pattern,
+                operation: p.operation.as_str().to_string(),
+                roles: p.roles.into_iter().collect(),
+            })
+            .collect(),
+    ))
 }
 
 /// `POST /auth/preview` (item-24 Z6): run `sql` as `as_role` and return the

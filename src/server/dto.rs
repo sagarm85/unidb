@@ -192,6 +192,33 @@ pub struct RlsRequest {
     pub predicate: String,
 }
 
+/// Body of `PUT /realtime/policies` (item 140 admin surface): upsert a
+/// realtime channel-authorization policy. `operation` is one of
+/// `publish|subscribe|presence|all` (case-insensitive); `roles` reuses the
+/// existing role system, including the built-in `anon`/`authenticated`/
+/// `service_role`.
+#[derive(Debug, Deserialize)]
+pub struct ChannelPolicyUpsertRequest {
+    pub topic_pattern: String,
+    pub operation: String,
+    pub roles: Vec<String>,
+}
+
+/// Body of `DELETE /realtime/policies` (item 140 admin surface).
+#[derive(Debug, Deserialize)]
+pub struct ChannelPolicyDeleteRequest {
+    pub topic_pattern: String,
+    pub operation: String,
+}
+
+/// One row of `GET /realtime/policies`'s response (item 140 admin surface).
+#[derive(Debug, Serialize)]
+pub struct ChannelPolicyDto {
+    pub topic_pattern: String,
+    pub operation: String,
+    pub roles: Vec<String>,
+}
+
 /// Body of `PUT /config/slow_query_threshold_ms` (item 34, Part A).
 /// `threshold_ms: 0` disables slow-query logging; positive values enable it.
 #[derive(Debug, Deserialize)]

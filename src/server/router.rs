@@ -186,9 +186,11 @@ pub fn build_router_with_rate_limiter(
         .route("/graphql", post(graphql::post_graphql))
         // ── Item 132: Realtime Broadcast + Presence ────────────────────────
         // Same `require_jwt` layer as every other data-plane route below.
-        // v1 authorization: any authenticated principal may use any topic
-        // (no channel-authorization policy engine — see `realtime.rs`'s
-        // module doc and `docs/REST_API.md`).
+        // Item 140 adds an opt-in, role-based channel-authorization policy
+        // gate ahead of each of these four routes (see `realtime.rs`'s
+        // module doc and `docs/REST_API.md`) — a topic with no matching
+        // policy still stays open to any authenticated principal unless
+        // `UNIDB_REALTIME_REQUIRE_AUTHZ=1`.
         .route(
             "/realtime/broadcast/publish",
             post(realtime::post_broadcast_publish),
@@ -204,6 +206,13 @@ pub fn build_router_with_rate_limiter(
         .route(
             "/realtime/presence/track",
             post(realtime::post_presence_track),
+        )
+        // item 140 admin surface: superuser-only channel-policy management.
+        .route(
+            "/realtime/policies",
+            get(handlers::get_realtime_policies)
+                .put(handlers::put_realtime_policy)
+                .delete(handlers::delete_realtime_policy),
         )
         // ── Item 31: storage service routes (/storage/*) ──────────────────
         // All 7 routes return 503 when AppState::storage is None (unconfigured).
