@@ -95,10 +95,17 @@ queue** · unidb-js SDK v0.1. *(The last three are beyond Supabase.)*
   `docs/backlog/142_auth_admin_api.md`. **Still open:** identity linking
   (attach OAuth to an existing user by verified email); **anonymous
   sign-in** — both out of scope for 142, tracked here as follow-ups.
-- **More OAuth providers** — generalize item-128's core (Apple, Azure, GitLab,
-  Discord, …); registering apps is free.
-- **Leaked-password protection** — HaveIBeenPwned Pwned-Passwords range API (free,
-  no key, k-anonymity).
+- **More OAuth providers + leaked-password protection** (IN PROGRESS — item
+  143): generalized item-128's preset table with five more built-in
+  providers (Apple, Azure/Microsoft, GitLab, Discord, Facebook — all
+  `sub`/`id`, no flow change; Apple's lack of a REST userinfo endpoint is a
+  documented known gap, not silently claimed working), plus an opt-in
+  (`UNIDB_PASSWORD_HIBP_CHECK`) HaveIBeenPwned Pwned-Passwords range-API
+  leaked-password check (free, no key, k-anonymity — only a SHA-1 prefix
+  ever leaves the server) enforced at signup / admin create-patch /
+  password-reset, fail-open with a warning on an HIBP outage. Control-plane
+  only, crash 54/54 — see
+  `docs/backlog/143_auth_hardening_hibp_oauth_presets.md`.
 
 ## Wave 3 — breadth & polish
 

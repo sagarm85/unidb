@@ -12,6 +12,16 @@
 
 ## Current status
 
+- **2026-08-01 — item 143 (auth hardening: HIBP leaked-password + 5 more OAuth presets) implemented, committed to branch (Status left IN PROGRESS — orchestrator flips on merge).**
+  Wave-2 (137), control-plane only. New `src/server/hibp.rs` (opt-in `UNIDB_PASSWORD_HIBP_CHECK`,
+  k-anonymity SHA-1-prefix range lookup, fail-open+warn on outage) gated before password storage at
+  signup / admin create+patch / `/auth/verify` → `422 PASSWORD_COMPROMISED`. `oauth.rs::default_urls`
+  + `from_env` preset loop extended with apple/azure/gitlab/discord/facebook (all `sub`/`id`, no flow
+  change; Apple's missing REST userinfo endpoint documented as a known gap). New
+  `tests/item143_auth_hardening.rs` (6/6, local mocks only). All 7 gates green incl. crash 54/54;
+  item121/128/131/138/142 unchanged. Docs: REST_API (HIBP section + `PASSWORD_COMPROMISED` code +
+  7-provider OAuth table), README, 137 Wave-2 line.
+
 - **2026-08-01 — item 142 (Auth admin API — user management) SHIPPED to branch (flips on merge).**
   Wave-2 (137). Superuser `/auth/admin/users` REST surface (list+pagination+total / get / create /
   patch / delete), mirroring the `/realtime/policies`(140) & `/webhooks`(141) admin pattern. New

@@ -1283,6 +1283,13 @@ pub async fn post_admin_user(
             "username must not be empty",
         ));
     }
+    // Item 143, part 1 — HIBP leaked-password check, only when an initial
+    // password was supplied (it's optional here — see `AdminCreateUserRequest`).
+    if let Some(password) = body.password.as_deref() {
+        if state.hibp.is_compromised(password).await {
+            return Err(password_compromised_error());
+        }
+    }
     let user = state
         .engine
         .admin_create_user(
@@ -1331,6 +1338,13 @@ pub async fn patch_admin_user(
             code: "USER_NOT_FOUND",
             message: format!("user '{username}' not found"),
         });
+    }
+    // Item 143, part 1 — HIBP leaked-password check, only when a new
+    // password is part of this partial update.
+    if let Some(password) = body.password.as_deref() {
+        if state.hibp.is_compromised(password).await {
+            return Err(password_compromised_error());
+        }
     }
     let user = state
         .engine
@@ -1480,6 +1494,22 @@ fn user_banned_error() -> ApiError {
         status: StatusCode::FORBIDDEN,
         code: "USER_BANNED",
         message: "this account has been banned".into(),
+    }
+}
+
+/// Uniform `422 PASSWORD_COMPROMISED` — the leaked-password rejection at
+/// every password-set point (item 143, part 1: `POST /auth/signup`, admin
+/// `POST`/`PATCH /auth/admin/users`, `POST /auth/verify`). `422`, not `400`,
+/// because the request is well-formed; the *value* is what's rejected, on a
+/// third-party breach-corpus match (via `state.hibp.is_compromised`) — same
+/// "distinguishable, not generic" posture as `user_banned_error` above.
+fn password_compromised_error() -> ApiError {
+    ApiError::Api {
+        status: StatusCode::UNPROCESSABLE_ENTITY,
+        code: "PASSWORD_COMPROMISED",
+        message: "this password has appeared in a known data breach (haveibeenpwned.com) — \
+                   choose a different password"
+            .into(),
     }
 }
 
@@ -1743,6 +1773,14 @@ pub async fn post_auth_verify(
     // unbanned and request a fresh recovery email).
     if state.engine.is_banned(username.clone()).await {
         return Err(user_banned_error());
+    }
+    // Item 143, part 1 — HIBP leaked-password check, before storing the new
+    // credential. The recovery token was already single-use-consumed above
+    // (see the doc comment), so a rejected password here requires the user
+    // to request a fresh recovery email — same posture as any other
+    // recovery-token-invalid failure past this point.
+    if state.hibp.is_compromised(&body.new_password).await {
+        return Err(password_compromised_error());
     }
     state
         .engine
@@ -2018,6 +2056,11 @@ pub async fn post_auth_signup(
             Some(&addr.ip().to_string()),
         )
         .await?;
+    // Item 143, part 1 — HIBP leaked-password check, before creating the
+    // user. A no-op unless `UNIDB_PASSWORD_HIBP_CHECK` is set.
+    if state.hibp.is_compromised(&body.password).await {
+        return Err(password_compromised_error());
+    }
     state
         .engine
         .create_user_with_password(body.username.clone(), body.password.clone())

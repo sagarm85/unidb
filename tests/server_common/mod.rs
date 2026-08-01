@@ -483,6 +483,51 @@ impl TestServer {
         }
     }
 
+    /// [`TestServer::spawn_with_dev_login_signup_and_email`] plus an explicit
+    /// [`unidb::server::hibp::HibpConfig`] (item 143, part 1) — used by the
+    /// leaked-password integration test matrix. Signup + email are both on
+    /// so a single server instance covers signup, admin-create/patch
+    /// (superuser bootstrap via `/sql`, same as `item142_auth_admin.rs`),
+    /// and password-reset (`POST /auth/verify`) all gated by the same HIBP
+    /// config.
+    pub async fn spawn_with_signup_email_and_hibp(
+        email: unidb::server::email::EmailConfig,
+        hibp: unidb::server::hibp::HibpConfig,
+    ) -> Self {
+        let tempdir = tempfile::tempdir().unwrap();
+        let data_dir = tempdir.path().to_path_buf();
+        let log_dir = data_dir.join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let engine = EngineHandle::spawn(tempdir.path(), 0).unwrap();
+        let jwt_config = JwtConfig::with_dev_login(TEST_JWT_SECRET);
+        let state = AppState::with_config(Arc::new(engine), SessionConfig::default())
+            .with_log_dir(log_dir.clone())
+            .with_dev_login(jwt_config.clone())
+            .with_allow_signup(true)
+            .with_email(email)
+            .with_hibp(hibp);
+        let (prometheus_layer, metric_handle) = metrics_pair().clone();
+        let router = build_router(state, jwt_config, prometheus_layer, metric_handle);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
+        });
+
+        Self {
+            addr,
+            data_dir,
+            log_dir,
+            _tempdir: tempdir,
+            _server_task: server_task,
+        }
+    }
+
     pub fn url(&self, path: &str) -> String {
         format!("http://{}{}", self.addr, path)
     }

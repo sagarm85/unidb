@@ -80,6 +80,8 @@ which resolves to the same kind of session through the same issuance path.
 Self-service **password reset** and **magic-link (passwordless) login**
 (item 138) are also available — see
 [Email transport + password reset / magic link](#email-transport--password-reset--magic-link-item-138).
+Optionally, every password-set point can reject a leaked/breached password
+via HaveIBeenPwned (item 143, part 1) — see [Leaked-password protection](#leaked-password-protection-haveibeenpwned-item-143-part-1).
 
 > **Correction (2026-07-31):** earlier versions of this section stated "there
 > is no login endpoint, no user database, and no session state." That is no
@@ -1300,7 +1302,9 @@ USER` with no `PASSWORD` clause); `superuser`/`banned` default `false`;
 with `400 AUTHZ_ERROR`.
 
 **Response**: `201 Created` with the same user shape as `GET
-/auth/admin/users/{id}`.
+/auth/admin/users/{id}`. **Errors:** `422 PASSWORD_COMPROMISED` when
+`UNIDB_PASSWORD_HIBP_CHECK=1`, a `password` was supplied, and it's in HIBP's
+breach corpus (item 143, part 1).
 
 ### `PATCH /auth/admin/users/{id}`
 
@@ -1319,7 +1323,9 @@ username.
   "superuser": false
 }
 ```
-- `password` → `set_password` (argon2id) + revokes every session.
+- `password` → `set_password` (argon2id) + revokes every session; rejected
+  with `422 PASSWORD_COMPROMISED` when `UNIDB_PASSWORD_HIBP_CHECK=1` and it's
+  in HIBP's breach corpus (item 143, part 1), before storage.
 - `banned: true` → bans + revokes every session; `banned: false` → unbans
   (no session effect — sessions already ended by the earlier ban stay
   ended).
@@ -2006,6 +2012,41 @@ all.
   of an explicit `{"success": true}` from the provider lets the request
   through once the route is protected.
 
+#### Leaked-password protection (HaveIBeenPwned) (item 143, part 1)
+
+Every password-set point — `POST /auth/signup`, admin `POST`/`PATCH
+/auth/admin/users` (item 142), and `POST /auth/verify` (password reset, item
+138) — can reject a password already known to appear in a public breach
+corpus, via [HIBP's free "Pwned Passwords" range
+API](https://haveibeenpwned.com/API/v3#PwnedPasswords). **k-anonymity by
+construction:** the server computes the **SHA-1** of the password, sends
+only the first 5 hex characters (the "prefix", one of 2^20 buckets) to the
+range endpoint, and matches the remaining 35 characters against the
+returned `SUFFIX:count` lines **locally** — the full password, its hash, and
+even the full SHA-1 digest never leave the server. This SHA-1 is HIBP's
+bucketing key **only**; password storage is unaffected — still argon2id via
+the same `set_password`/`create_user_with_password` machinery every other
+auth path uses.
+
+- **Config:** `UNIDB_PASSWORD_HIBP_CHECK` (default **off**) — opt-in, since
+  it needs an outbound call and some deployments are offline/air-gapped.
+  `UNIDB_PASSWORD_HIBP_URL` (default `https://api.pwnedpasswords.com`) —
+  override the base URL, for pointing a deployment (or a test) at a local
+  mock range server.
+- **Where it runs:** in each handler, after that route's own gates
+  (signup's signing-key check, CAPTCHA, admin's superuser check, the
+  recovery token's single-use validation) but **before the password is
+  stored**.
+- **Failure contract:** a confirmed breach match is `422
+  PASSWORD_COMPROMISED` — a well-formed request whose *value* is rejected,
+  distinguished from a `400`-shaped body problem.
+- **Fail OPEN, with a warning.** Unlike CAPTCHA (which fails *closed*), an
+  unreachable/erroring HIBP endpoint or an unparseable response does **not**
+  block the password-set operation — it logs a `tracing::warn!` and lets the
+  request through unchanged. The rationale: an external outage must never
+  lock a legitimate user out of signup or password reset. A fail-closed
+  toggle is a documented possible follow-up, not built in v1.
+
 #### `POST /auth/login` — password login
 
 > Requires a signing key: `UNIDB_JWT_SIGNING_KEY` (item 121 A5, the
@@ -2071,7 +2112,9 @@ after the signing-key check, so a disabled issuer never leaves an orphaned accou
 { "username": "bob", "password": "…" }
 ```
 **Response** `200 OK`: same shape as `POST /auth/login`. **Errors:** `404` when
-signup disabled; `409`/error on duplicate username; `429 RATE_LIMITED` (item I1).
+signup disabled; `409`/error on duplicate username; `429 RATE_LIMITED` (item I1);
+`422 PASSWORD_COMPROMISED` when `UNIDB_PASSWORD_HIBP_CHECK=1` and the password
+is in HIBP's breach corpus (item 143, part 1).
 
 #### `POST /auth/refresh` — exchange a refresh token
 
@@ -2264,16 +2307,39 @@ path for a user who lost both their authenticator and recovery codes).
 
 ### OAuth 2.0 social login (item 128, Workstream D1)
 
-A user can "Sign in with Google/GitHub": the app redirects to the provider,
+**Preset table extended by item 143, part 2** (five more presets — see
+below). A user can "Sign in with Google/GitHub/…": the app redirects to the provider,
 the provider redirects back with a code, unidb exchanges it for a provider
 access token, links/creates a unidb identity, and issues a normal unidb
 session — via the exact same [`issue_token_pair` helper](#post-authlogin--password-login)
 every other login path (password, signup, MFA challenge) uses. Standard
-**Authorization Code + PKCE** (RFC 7636), provider-agnostic: Google and
-GitHub are the two recognized provider names, but nothing in the flow itself
-is provider-specific beyond three URLs and a scope string.
+**Authorization Code + PKCE** (RFC 7636), provider-agnostic: **seven**
+recognized preset provider names ship built in — `google`, `github`, and
+(item 143, part 2) `apple`, `azure`, `gitlab`, `discord`, `facebook` — but
+nothing in the flow itself is provider-specific beyond three URLs and a
+scope string, so any *other* provider name works too via the
+`_AUTHORIZE_URL`/`_TOKEN_URL`/`_USERINFO_URL`/`_SCOPE` overrides below (no
+code change required).
 
-**Config** (per provider — `<PROVIDER>` is `GOOGLE` or `GITHUB`):
+| Preset | `<PROVIDER>` | Userinfo id field | Notes |
+|--------|--------------|--------------------|-------|
+| Google | `GOOGLE` | `sub` | OIDC |
+| GitHub | `GITHUB` | `id` | |
+| Apple ("Sign in with Apple") | `APPLE` | `sub` (intended) | **Known gap, documented, not silently claimed working:** Apple has no REST userinfo endpoint — identity claims arrive in the token response's `id_token` (a JWT), not via a bearer-token `GET`. The built-in `userinfo_url` default is a best-effort placeholder; activating Apple for real requires overriding `UNIDB_OAUTH_APPLE_USERINFO_URL` to point at an operator-run shim that decodes `id_token` and re-exposes `{"sub": ...}`. Tracked in `docs/backlog/143_auth_hardening_hibp_oauth_presets.md`. |
+| Microsoft / Azure AD | `AZURE` | `sub` | Multi-tenant `common` endpoint; Microsoft Graph OIDC userinfo |
+| GitLab | `GITLAB` | `sub` | OIDC userinfo |
+| Discord | `DISCORD` | `id` | `/users/@me` |
+| Facebook | `FACEBOOK` | `id` | Graph API `/me` |
+
+All seven use `sub` or `id`, already normalized by the same
+`UserInfo::provider_user_id` used since item 128 — no extraction code
+changed for item 143. Any provider whose userinfo genuinely needs a
+non-`sub`/`id` field is out of scope for the built-in preset table
+(documented) — the env-override path still lets an operator wire it by
+pointing a custom `_USERINFO_URL` at a translating shim.
+
+**Config** (per provider — `<PROVIDER>` is one of the seven preset names
+above, or any other name of the operator's choosing):
 - `UNIDB_OAUTH_<PROVIDER>_CLIENT_ID` / `_CLIENT_SECRET` / `_REDIRECT_URI`
   (all three **required**) — a provider missing any of these is simply not
   configured: both its routes return `404`, indistinguishable from a
@@ -2325,8 +2391,9 @@ once verified email exists.
 
 **Auth:** None (public — this route *establishes* identity).
 
-`{provider}` is `google` or `github` (or any name configured via
-`OAuthConfig::from_providers`). Mints a fresh CSRF `state` token and a PKCE
+`{provider}` is one of the seven presets (`google`, `github`, `apple`,
+`azure`, `gitlab`, `discord`, `facebook`) or any name configured via
+`OAuthConfig::from_providers`. Mints a fresh CSRF `state` token and a PKCE
 `code_verifier`, persists them server-side (single-use, 10-minute TTL — the
 same "hash-only, short-lived, single-use" posture as the MFA
 challenge/refresh-token session stores), derives the PKCE `code_challenge`
@@ -2467,7 +2534,10 @@ stops working immediately).
 **Response** `200 OK`: `{ "ok": true }`.
 
 **Errors:** `401 RECOVERY_TOKEN_INVALID` — uniform for unknown/expired/
-already-used token (no oracle on *why*).
+already-used token (no oracle on *why*); `422 PASSWORD_COMPROMISED` when
+`UNIDB_PASSWORD_HIBP_CHECK=1` and `new_password` is in HIBP's breach corpus
+(item 143, part 1) — note the recovery token is already single-use-consumed
+by this point, so a rejected reset needs a fresh `POST /auth/recover`.
 
 #### `POST /auth/magiclink` — request a magic sign-in link email
 
@@ -2707,6 +2777,7 @@ by `server/error.rs`'s `ApiError` directly, not by a `DbError` variant.
 | 401 | `UNAUTHORIZED` | Missing/malformed/wrong-signature/expired JWT |
 | 403 | `USER_BANNED` | Otherwise-valid login/refresh/email-verify by a banned account (item 142) |
 | 404 | `USER_NOT_FOUND` | `GET`/`PATCH`/`DELETE /auth/admin/users/{id}` on an unknown username (item 142) |
+| 422 | `PASSWORD_COMPROMISED` | `UNIDB_PASSWORD_HIBP_CHECK=1` and the password appears in HIBP's breach corpus — `POST /auth/signup`, admin `POST`/`PATCH /auth/admin/users`, `POST /auth/verify` (item 143, part 1) |
 | 503 | `DURABILITY_FAILURE` | An `fsync`/`msync` failed (P1.b, fsyncgate); the engine can no longer guarantee durability and must be restarted (session is poisoned) |
 | 500 | `INTERNAL_ERROR` | I/O, checksum, WAL corruption, control-file corruption, catalog corruption, buffer pool exhaustion, or an unavailable engine (`EngineUnavailable`) |
 

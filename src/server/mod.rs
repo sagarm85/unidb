@@ -44,6 +44,7 @@ pub mod error;
 pub mod event_format;
 pub mod graphql;
 pub mod handlers;
+pub mod hibp;
 pub mod logs;
 pub mod oauth;
 pub mod rate_limit;
@@ -155,6 +156,12 @@ pub struct AppState {
     /// setup, mirroring how `UNIDB_ALLOW_SIGNUP`-gated routes still 404
     /// safely but this flow has no reason to be off by default.
     pub email: email::EmailConfig,
+    /// HaveIBeenPwned leaked-password check (item 143, part 1). Disabled by
+    /// default ([`hibp::HibpConfig::disabled`]) — every password-set
+    /// handler's [`hibp::HibpConfig::is_compromised`] call is a no-op
+    /// (`false`, no outbound request) unless `UNIDB_PASSWORD_HIBP_CHECK`
+    /// opts in.
+    pub hibp: hibp::HibpConfig,
 }
 
 /// Resolve the log directory the same way `src/bin/unidb-server.rs` does, so
@@ -205,6 +212,7 @@ impl AppState {
             captcha: captcha::CaptchaConfig::disabled(),
             realtime: Arc::new(realtime::RealtimeState::new()),
             email: email::EmailConfig::default(),
+            hibp: hibp::HibpConfig::disabled(),
         }
     }
 
@@ -258,6 +266,14 @@ impl AppState {
     /// dev-inbox log transport — see that type's doc comment.
     pub fn with_email(mut self, email: email::EmailConfig) -> Self {
         self.email = email;
+        self
+    }
+
+    /// Configure the HaveIBeenPwned leaked-password check (item 143, part
+    /// 1). The default ([`hibp::HibpConfig::disabled`]) checks nothing —
+    /// see that type's doc comment.
+    pub fn with_hibp(mut self, hibp: hibp::HibpConfig) -> Self {
+        self.hibp = hibp;
         self
     }
 }

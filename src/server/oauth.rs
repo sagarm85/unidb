@@ -1,9 +1,11 @@
 //! OAuth 2.0 Authorization Code + PKCE, provider-agnostic social login (item
 //! 128, Workstream D1 of the [Supabase parity
 //! roadmap](../../../docs/backlog/120_supabase_parity_roadmap.md)). Google
-//! and GitHub ship as the two recognized providers; the flow itself has
+//! and GitHub shipped as the first two recognized providers; item 143 (part
+//! 2) added five more presets — Apple, Microsoft/Azure AD, GitLab, Discord,
+//! Facebook — bringing the recognized total to seven. The flow itself has
 //! nothing provider-specific baked into it beyond three URLs + a scope
-//! string, so a third provider is a config addition, not a code change.
+//! string, so any other provider is a config addition, not a code change.
 //!
 //! **Flow** (see `handlers.rs::get_oauth_authorize`/`get_oauth_callback` for
 //! the HTTP-level detail):
@@ -168,9 +170,58 @@ const GITHUB_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 const GITHUB_USERINFO_URL: &str = "https://api.github.com/user";
 const GITHUB_DEFAULT_SCOPE: &str = "read:user user:email";
 
-/// The two recognized provider names and their real-world default endpoint
+// Item 143, part 2 — five more recognized presets. Same posture as Google/
+// GitHub above: real-world default endpoints + scope, pure config, no flow
+// change (every provider here surfaces `sub` or `id` in its userinfo
+// response, which [`UserInfo::provider_user_id`] already normalizes).
+//
+// **Apple caveat** (documented, not a "bug" — see CLAUDE.md's evidence-based
+// docs policy): Sign in with Apple has no traditional bearer-token REST
+// userinfo endpoint — identity claims (`sub`, `email`) are delivered in the
+// token response's `id_token` (a JWT), not via a follow-up `GET`. This
+// preset's `userinfo_url` is therefore a best-effort placeholder that will
+// **not** work out of the box against the real Apple flow with this
+// module's [`fetch_userinfo`] (a plain bearer-token `GET`); an operator
+// activating Apple must override `UNIDB_OAUTH_APPLE_USERINFO_URL` to point
+// at their own small shim that decodes `id_token` and re-exposes `{"sub":
+// ...}`. Tracked as a known gap in `docs/backlog/
+// 143_auth_hardening_hibp_oauth_presets.md` rather than silently claiming
+// full support.
+const APPLE_AUTHORIZE_URL: &str = "https://appleid.apple.com/auth/authorize";
+const APPLE_TOKEN_URL: &str = "https://appleid.apple.com/auth/token";
+const APPLE_USERINFO_URL: &str = "https://appleid.apple.com/auth/userinfo";
+const APPLE_DEFAULT_SCOPE: &str = "name email";
+
+/// Microsoft/Azure AD, multi-tenant "common" endpoint (works for both
+/// personal Microsoft accounts and any Azure AD tenant); Microsoft Graph's
+/// OIDC userinfo endpoint returns `sub`.
+const AZURE_AUTHORIZE_URL: &str = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize";
+const AZURE_TOKEN_URL: &str = "https://login.microsoftonline.com/common/oauth2/v2.0/token";
+const AZURE_USERINFO_URL: &str = "https://graph.microsoft.com/oidc/userinfo";
+const AZURE_DEFAULT_SCOPE: &str = "openid email profile";
+
+const GITLAB_AUTHORIZE_URL: &str = "https://gitlab.com/oauth/authorize";
+const GITLAB_TOKEN_URL: &str = "https://gitlab.com/oauth/token";
+const GITLAB_USERINFO_URL: &str = "https://gitlab.com/oauth/userinfo";
+const GITLAB_DEFAULT_SCOPE: &str = "openid email profile";
+
+/// Discord's userinfo-equivalent (`/users/@me`) returns `id`, not `sub` —
+/// already covered by [`UserInfo::provider_user_id`]'s `id` fallback.
+const DISCORD_AUTHORIZE_URL: &str = "https://discord.com/api/oauth2/authorize";
+const DISCORD_TOKEN_URL: &str = "https://discord.com/api/oauth2/token";
+const DISCORD_USERINFO_URL: &str = "https://discord.com/api/users/@me";
+const DISCORD_DEFAULT_SCOPE: &str = "identify email";
+
+/// Facebook's Graph API `/me` also returns `id`, not `sub`.
+const FACEBOOK_AUTHORIZE_URL: &str = "https://www.facebook.com/v19.0/dialog/oauth";
+const FACEBOOK_TOKEN_URL: &str = "https://graph.facebook.com/v19.0/oauth/access_token";
+const FACEBOOK_USERINFO_URL: &str = "https://graph.facebook.com/me?fields=id,name,email";
+const FACEBOOK_DEFAULT_SCOPE: &str = "email public_profile";
+
+/// The recognized provider names and their real-world default endpoint
 /// URLs + scope. `None` for anything else — `OAuthConfig::from_env` only
-/// ever looks these two up.
+/// ever looks these up, one per name in [`OAuthConfig::from_env`]'s fixed
+/// list.
 fn default_urls(
     provider: &str,
 ) -> Option<(&'static str, &'static str, &'static str, &'static str)> {
@@ -186,6 +237,36 @@ fn default_urls(
             GITHUB_TOKEN_URL,
             GITHUB_USERINFO_URL,
             GITHUB_DEFAULT_SCOPE,
+        )),
+        "apple" => Some((
+            APPLE_AUTHORIZE_URL,
+            APPLE_TOKEN_URL,
+            APPLE_USERINFO_URL,
+            APPLE_DEFAULT_SCOPE,
+        )),
+        "azure" => Some((
+            AZURE_AUTHORIZE_URL,
+            AZURE_TOKEN_URL,
+            AZURE_USERINFO_URL,
+            AZURE_DEFAULT_SCOPE,
+        )),
+        "gitlab" => Some((
+            GITLAB_AUTHORIZE_URL,
+            GITLAB_TOKEN_URL,
+            GITLAB_USERINFO_URL,
+            GITLAB_DEFAULT_SCOPE,
+        )),
+        "discord" => Some((
+            DISCORD_AUTHORIZE_URL,
+            DISCORD_TOKEN_URL,
+            DISCORD_USERINFO_URL,
+            DISCORD_DEFAULT_SCOPE,
+        )),
+        "facebook" => Some((
+            FACEBOOK_AUTHORIZE_URL,
+            FACEBOOK_TOKEN_URL,
+            FACEBOOK_USERINFO_URL,
+            FACEBOOK_DEFAULT_SCOPE,
         )),
         _ => None,
     }
@@ -225,10 +306,11 @@ impl OAuthConfig {
 
     /// Build from `UNIDB_OAUTH_<PROVIDER>_CLIENT_ID` / `_CLIENT_SECRET` /
     /// `_REDIRECT_URI` (+ optional `_AUTHORIZE_URL` / `_TOKEN_URL` /
-    /// `_USERINFO_URL` / `_SCOPE` overrides) for "google" and "github". A
-    /// provider missing `_CLIENT_ID` or `_REDIRECT_URI` is simply absent
-    /// from the resulting config (its routes then 404) — unchanged from
-    /// before item 129.
+    /// `_USERINFO_URL` / `_SCOPE` overrides) for each recognized preset name
+    /// (`google`, `github`, and — item 143, part 2 — `apple`, `azure`,
+    /// `gitlab`, `discord`, `facebook`). A provider missing `_CLIENT_ID` or
+    /// `_REDIRECT_URI` is simply absent from the resulting config (its
+    /// routes then 404) — unchanged from before item 129.
     ///
     /// **Item 129 (I3) change:** `_CLIENT_SECRET` is now *optional* at this
     /// layer — a provider with `_CLIENT_ID`/`_REDIRECT_URI` set but no
@@ -242,7 +324,9 @@ impl OAuthConfig {
     /// exchange time (the provider rejects it), not at config-build time.
     pub fn from_env() -> Self {
         let mut providers = HashMap::new();
-        for name in ["google", "github"] {
+        for name in [
+            "google", "github", "apple", "azure", "gitlab", "discord", "facebook",
+        ] {
             if let Some(cfg) = provider_from_env(name) {
                 providers.insert(name.to_string(), cfg);
             }
@@ -278,8 +362,8 @@ fn provider_from_env(provider: &str) -> Option<OAuthProviderConfig> {
     // which `resolve_client_secret` treats identically to "not configured
     // in env" (see its doc comment).
     let client_secret = env_var(&upper, "CLIENT_SECRET").unwrap_or_default();
-    // Only "google"/"github" are ever passed in here (see `from_env`'s
-    // fixed loop), so this always resolves.
+    // Only the fixed preset names in `from_env`'s loop are ever passed in
+    // here, so this always resolves.
     let (def_authorize, def_token, def_userinfo, def_scope) = default_urls(provider)?;
     let authorize_url =
         env_var(&upper, "AUTHORIZE_URL").unwrap_or_else(|| def_authorize.to_string());
