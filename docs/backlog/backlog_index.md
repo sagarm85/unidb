@@ -6,8 +6,8 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `132_…`**
-> (131 assigned 2026-08-01 to the CAPTCHA/bot-protection item below).
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `134_…`**
+> (133 assigned 2026-08-01 to the GraphQL-mutations item below).
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -143,7 +143,10 @@
 
 Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 `CONVENTIONS.md` (this standard), `engine_internals_doc_prompt.md` (tooling).
-**Next new file → `132_…`.**
+| 132 | `132_realtime_broadcast_presence.md` | Improvement | 🔄 IN PROGRESS — Supabase-parity realtime gap (item 120 follow-up): add **Broadcast** (ephemeral client↔client pub/sub) + **Presence** (who's on a channel + per-client state) alongside the existing E1 Postgres-Changes SSE stream. Purely in-memory, server-side, ephemeral (no WAL/heap/catalog touch → ACID safe by construction, crash harness untouched). SSE transport reused (no WebSockets). JWT-gated; channel-authorization policies = documented follow-up. |
+| 133 | `133_graphql_mutations.md` | Improvement | 🔄 IN PROGRESS — Supabase-parity GraphQL gap (item 130 follow-up): add a `Mutation` root (`insert_/update_/delete_<table>`) to the read-only C4 GraphQL API. Every resolver routes through the same `run_stmt`/`execute_sql_params_as_principal` path REST/`/sql` use → ACID + RLS + `WITH CHECK` + column grants inherited, no new write path, no engine change (crash 54/54 untouched). Requested-projection-only (avoids the item-130 over-grant bug). |
+
+**Next new file → `134_…`.**
 
 ## Next up — priority order (2026-07-23, post fresh-baseline bench)
 
