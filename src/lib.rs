@@ -1007,6 +1007,20 @@ fn project_json_columns(
     }
 }
 
+/// item 140: `UNIDB_REALTIME_REQUIRE_AUTHZ` — default **off** (item-132
+/// back-compat: a realtime topic with no matching channel policy stays open
+/// to any authenticated principal). `"1"`/`"true"` (case-insensitive) turns
+/// on enforce mode: a topic with no matching policy is denied — see
+/// [`Engine::check_channel_authz`]'s doc comment. Mirrors the
+/// `UNIDB_ALLOW_SIGNUP`/`UNIDB_AUTOVACUUM_ENABLED`-style boolean-env-var
+/// convention already used elsewhere in this crate.
+fn realtime_require_authz() -> bool {
+    std::env::var("UNIDB_REALTIME_REQUIRE_AUTHZ")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Map an auth-DDL statement to an `(action, object)` pair for the audit log
 /// (P6.f).
 fn auth_stmt_audit(stmt: &crate::authz::AuthStmt) -> (&'static str, String) {
@@ -4337,6 +4351,91 @@ impl Engine {
             event.payload = project_json_columns(event.payload, &cols);
         }
         Some(event)
+    }
+
+    /// item 140 (Realtime channel authorization): the authorization decision
+    /// for `principal` performing `operation` on `topic`, for one of the four
+    /// item-132 realtime routes. `route` is used only as the audit `object`
+    /// (e.g. `"realtime/broadcast/publish"`) — never the topic itself or any
+    /// policy content, matching the "never log policy internals" rule.
+    ///
+    /// Reuses the exact same superuser/`service_role` bypass decision and
+    /// audited-bypass trail as [`Engine::filter_realtime_events`]/
+    /// [`Engine::execute_sql_inner_as_principal`] — no second, unaudited
+    /// bypass (item-103 lesson): only the `service_role` case is logged via
+    /// `AuditLog::record_admin`, exactly mirroring `filter_realtime_events`'s
+    /// own bypass (the embedded/named-superuser bypass is not separately
+    /// audited there either).
+    ///
+    /// Beyond the bypass, the decision is [`crate::authz::RoleStore::
+    /// check_channel_policy`]'s: a topic matching a stored policy is
+    /// enforced regardless of `UNIDB_REALTIME_REQUIRE_AUTHZ` (allowed only if
+    /// the caller's effective roles intersect the policy's `roles`); a topic
+    /// matching no policy falls back to the env var — item-132's original
+    /// "any authenticated principal" behavior when unset/off, fail-closed
+    /// `PermissionDenied` when set (enforce mode). Fails closed in every
+    /// case, never in-line "allow on ambiguity."
+    pub fn check_channel_authz(
+        &self,
+        principal: &AuthPrincipal,
+        topic: &str,
+        operation: crate::authz::ChannelOp,
+        route: &str,
+    ) -> Result<()> {
+        let user = principal.subject.as_deref();
+        let effective_roles = self.authz.effective_roles(user, &principal.claims);
+        let is_service_role = effective_roles
+            .iter()
+            .any(|r| r == crate::authz::SERVICE_ROLE);
+        if self.is_effective_superuser(user) || is_service_role {
+            if is_service_role {
+                self.audit
+                    .record_admin(user, None, "service_role_rls_bypass", route, true);
+            }
+            return Ok(());
+        }
+        let require_authz = realtime_require_authz();
+        let allowed =
+            self.authz
+                .check_channel_policy(topic, operation, &effective_roles, require_authz);
+        if allowed {
+            Ok(())
+        } else {
+            Err(DbError::PermissionDenied(format!(
+                "caller is not authorized for '{}' on this realtime topic",
+                operation.as_str()
+            )))
+        }
+    }
+
+    /// item 140 (admin surface): upsert a channel-authorization policy.
+    /// Superuser gating is the HTTP handler's job (mirrors
+    /// [`Engine::set_rls_policy_sql`]) — this method itself is unrestricted,
+    /// matching every other direct `RoleStore` mutator (the embedded API is
+    /// the trusted caller).
+    pub fn set_channel_policy(
+        &self,
+        topic_pattern: &str,
+        operation: crate::authz::ChannelOp,
+        roles: std::collections::BTreeSet<String>,
+    ) -> Result<()> {
+        self.authz
+            .set_channel_policy(topic_pattern, operation, roles)
+    }
+
+    /// item 140 (admin surface): remove a channel-authorization policy.
+    pub fn remove_channel_policy(
+        &self,
+        topic_pattern: &str,
+        operation: crate::authz::ChannelOp,
+    ) -> Result<()> {
+        self.authz.remove_channel_policy(topic_pattern, operation)
+    }
+
+    /// item 140 (admin surface): list every stored channel-authorization
+    /// policy (`GET /realtime/policies`).
+    pub fn list_channel_policies(&self) -> Vec<crate::authz::ChannelPolicyDef> {
+        self.authz.list_channel_policies()
     }
 
     /// Durably advance `consumer`'s offset to `up_to_seq` — the only

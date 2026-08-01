@@ -46,11 +46,30 @@
 //! still wiped on restart) but not auto-reaped either. Flagged here rather
 //! than silently accepted.
 //!
-//! ## v1 authorization (spec-mandated scope cut)
-//! Every authenticated principal (any JWT that passes `require_jwt`) may
-//! publish/subscribe/track on any topic. There is no channel-authorization
-//! policy engine (an RLS-style per-topic allow/deny) — that is an explicit,
-//! documented **follow-up**, not built here. See `docs/REST_API.md`.
+//! ## Channel authorization (item 140)
+//! Every route below now runs a **connect-time / publish-time** gate through
+//! [`crate::server::engine_handle::EngineHandle::check_channel_authz`] before
+//! doing anything else: `POST /realtime/broadcast/publish` and `POST
+//! /realtime/presence/track` are gated before the message is fanned out /
+//! the key is tracked; `GET /realtime/broadcast/subscribe` and `GET
+//! /realtime/presence/subscribe` are gated before the SSE stream is opened
+//! (mirrors `src/server/sse.rs`'s E1 subscribe-time grant gate — a clean
+//! `403 PERMISSION_DENIED` beats a silently-empty stream). A denial never
+//! reaches the in-memory hub at all.
+//!
+//! The decision itself — role-based, topic-glob channel policies,
+//! `UNIDB_REALTIME_REQUIRE_AUTHZ`'s opt-in fail-closed posture, and the
+//! audited `service_role`/superuser bypass — lives in [`crate::Engine::
+//! check_channel_authz`] and [`crate::authz::RoleStore::
+//! check_channel_policy`]; see those doc comments and `docs/REST_API.md` for
+//! the full contract. **Not re-litigated here**: this module only calls the
+//! gate and maps a denial to `403`.
+//!
+//! **Connect-time only, not retroactive (locked v1 design):** a policy
+//! change takes effect on the next `subscribe`/`publish`/`track` call, but
+//! never tears down a stream that already passed its gate — identical to
+//! `sse.rs`'s E1 contract, and explicitly a v1 non-goal per the item-140
+//! backlog doc.
 //!
 //! ## Never log payloads or presence state
 //! Every `tracing` call in this module logs topic names/counts only, never
@@ -79,7 +98,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::broadcast::{self, error::RecvError};
 
-use crate::{server::AppState, AuthPrincipal};
+use crate::{authz::ChannelOp, server::error::ApiError, server::AppState, AuthPrincipal};
 
 /// Per-topic channel capacity for both broadcast and presence-delta
 /// channels. A slow subscriber whose receiver falls this many frames behind
@@ -421,14 +440,23 @@ impl Drop for PresenceConnGuard {
 /// `POST /realtime/broadcast/publish`.
 pub async fn post_broadcast_publish(
     State(state): State<AppState>,
-    Extension(_principal): Extension<AuthPrincipal>,
+    Extension(principal): Extension<AuthPrincipal>,
     Json(body): Json<BroadcastPublishRequest>,
-) -> Json<BroadcastPublishResponse> {
+) -> Result<Json<BroadcastPublishResponse>, ApiError> {
+    state
+        .engine
+        .check_channel_authz(
+            principal,
+            body.topic.clone(),
+            ChannelOp::Publish,
+            "realtime/broadcast/publish",
+        )
+        .await?;
     tracing::debug!(topic = %body.topic, event = %body.event, "realtime broadcast publish");
     let receivers = state
         .realtime
         .publish_broadcast(&body.topic, body.event, body.payload);
-    Json(BroadcastPublishResponse { receivers })
+    Ok(Json(BroadcastPublishResponse { receivers }))
 }
 
 /// `GET /realtime/broadcast/subscribe?topic=<t>`.
@@ -440,10 +468,21 @@ pub async fn post_broadcast_publish(
 /// register-before-headers guarantee `get_presence_subscribe` relies on).
 pub async fn get_broadcast_subscribe(
     State(state): State<AppState>,
-    Extension(_principal): Extension<AuthPrincipal>,
+    Extension(principal): Extension<AuthPrincipal>,
     Query(params): Query<TopicParams>,
-) -> Response {
+) -> Result<Response, ApiError> {
     let topic = params.topic;
+    // item 140: connect-time gate, before the subscription is ever
+    // registered — a denial must never reach the in-memory hub.
+    state
+        .engine
+        .check_channel_authz(
+            principal,
+            topic.clone(),
+            ChannelOp::Subscribe,
+            "realtime/broadcast/subscribe",
+        )
+        .await?;
     let realtime = state.realtime.clone();
     tracing::debug!(topic = %topic, "realtime broadcast subscribe");
     let mut rx = realtime.subscribe_broadcast(&topic);
@@ -467,9 +506,9 @@ pub async fn get_broadcast_subscribe(
         }
     };
 
-    Sse::new(stream)
+    Ok(Sse::new(stream)
         .keep_alive(KeepAlive::default())
-        .into_response()
+        .into_response())
 }
 
 /// `GET /realtime/presence/subscribe?topic=<t>`.
@@ -477,8 +516,20 @@ pub async fn get_presence_subscribe(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthPrincipal>,
     Query(params): Query<TopicParams>,
-) -> Response {
+) -> Result<Response, ApiError> {
     let topic = params.topic;
+    // item 140: connect-time gate, before the connection is registered. Both
+    // presence routes (this one and `POST .../track`) share `ChannelOp::
+    // Presence` — see the module doc's `ChannelOp` note.
+    state
+        .engine
+        .check_channel_authz(
+            principal.clone(),
+            topic.clone(),
+            ChannelOp::Presence,
+            "realtime/presence/subscribe",
+        )
+        .await?;
     let identity = principal.subject.clone().unwrap_or_default();
     let realtime = state.realtime.clone();
     tracing::debug!(topic = %topic, "realtime presence subscribe");
@@ -523,9 +574,9 @@ pub async fn get_presence_subscribe(
         }
     };
 
-    Sse::new(stream)
+    Ok(Sse::new(stream)
         .keep_alive(KeepAlive::default())
-        .into_response()
+        .into_response())
 }
 
 /// `POST /realtime/presence/track`.
@@ -533,11 +584,20 @@ pub async fn post_presence_track(
     State(state): State<AppState>,
     Extension(principal): Extension<AuthPrincipal>,
     Json(body): Json<PresenceTrackRequest>,
-) -> StatusCode {
+) -> Result<StatusCode, ApiError> {
+    state
+        .engine
+        .check_channel_authz(
+            principal.clone(),
+            body.topic.clone(),
+            ChannelOp::Presence,
+            "realtime/presence/track",
+        )
+        .await?;
     let identity = principal.subject.clone().unwrap_or_default();
     tracing::debug!(topic = %body.topic, key = %body.key, "realtime presence track");
     state
         .realtime
         .track(&body.topic, &identity, &body.key, body.state);
-    StatusCode::NO_CONTENT
+    Ok(StatusCode::NO_CONTENT)
 }

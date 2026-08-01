@@ -58,8 +58,15 @@ queue** · unidb-js SDK v0.1. *(The last three are beyond Supabase.)*
   `on_conflict`/`resolution=merge-duplicates` needs `INSERT … ON CONFLICT`,
   which the SQL engine doesn't support; filed as a separate future engine
   feature (see `docs/backlog/139_rest_count_prefer.md`'s note).
-- **Realtime channel authorization** — RLS-style per-topic allow/deny for
-  broadcast/presence (the item-132 follow-up).
+- **140 — Realtime channel authorization** (IN PROGRESS — implemented,
+  status flips to DONE on merge): RLS-style per-topic allow/deny for
+  broadcast/presence (the item-132 follow-up). Role-based, topic-glob
+  `(topic_pattern, operation, roles)` policies in the control-plane store,
+  enforced at connect/publish time on all four routes; audited
+  `service_role`/superuser bypass; opt-in fail-closed via
+  `UNIDB_REALTIME_REQUIRE_AUTHZ`; superuser-only `/realtime/policies` admin
+  surface. Control-plane only, crash 54/54 — see
+  `docs/backlog/140_realtime_channel_authorization.md`.
 - **unidb-js SDK completion** — storage client module, GraphQL client (queries +
   mutations), broadcast/presence helpers, npm publish + CI. *(Separate repo,
   parallelizable — no engine build contention.)*

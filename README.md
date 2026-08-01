@@ -308,6 +308,10 @@ UNIDB_DATA_DIR=/var/lib/unidb cargo run --bin unidb-migrate -- migrations
   (`/realtime/presence/*`), Supabase-Realtime-parity on top of the same DB
   change stream above; never touches the WAL/heap (server restart drops it,
   by design)
+- Realtime channel authorization (item 140) — opt-in, role-based, topic-glob
+  allow/deny policies in front of all four routes above (superuser-managed
+  via `/realtime/policies`), with an audited `service_role`/superuser
+  bypass and a fail-closed `UNIDB_REALTIME_REQUIRE_AUTHZ` enforce mode
 
 **Operations and HA**
 - Segmented WAL (16 MiB segments) enabling replication slots

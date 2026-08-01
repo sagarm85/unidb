@@ -854,13 +854,15 @@ and a server restart drops all state (same semantics as Supabase's
 Broadcast/Presence). A named **topic** is an opaque caller-chosen string; no
 topic needs to be created ahead of time.
 
-**v1 authorization:** every authenticated principal (any JWT that passes
-`require_jwt`, the same gate as every other data-plane route) may
-publish/subscribe/track on **any** topic — there is no per-topic
-allow/deny policy. A `realtime.channels`-style **channel-authorization
-policy engine is an explicit, documented follow-up**, not built in v1;
-treat every topic as world-readable/writable to any authenticated caller
-until that lands.
+**Channel authorization (item 140).** Every authenticated principal (any JWT
+that passes `require_jwt`) may still publish/subscribe/track on any topic
+that has **no matching channel policy** — this is the item-132 back-compat
+default. Operators can now additionally attach role-based, topic-glob
+**channel policies** (`realtime.channels`-style allow/deny) via the
+superuser-only `/realtime/policies` admin surface below; a topic matching a
+policy is *always* enforced, and `UNIDB_REALTIME_REQUIRE_AUTHZ=1` flips the
+no-policy default from "open" to "deny" (fail-closed). See "Channel
+authorization policies" below for the full contract.
 
 Transport is SSE (same as `GET /events/subscribe`) — no WebSocket route.
 
@@ -951,6 +953,97 @@ for that (topic, caller) creates an entry with no holder, which persists
 until a matching connection later opens and closes (a documented, bounded
 v1 gap — not indefinitely dangerous, still wiped on restart, just not
 auto-reaped by a disconnect that never happens).
+
+---
+
+## Channel authorization policies (item 140)
+
+An opt-in, RLS-style allow/deny layer in front of the four routes above.
+Control-plane only (an in-memory/`roles.json`-persisted policy store — no
+storage-engine change, crash harness stays 54/54).
+
+**Policy model.** A channel policy is `(topic_pattern, operation,
+allowed_roles)`:
+- `topic_pattern` is an exact topic or a `*`-suffix glob (`"room:*"`) —
+  **most-specific match wins** (longest non-wildcard prefix; an exact
+  `"room:42"` policy overrides a `"room:*"` glob for that one topic). Two
+  policies sharing the identical pattern string, one scoped to a specific
+  operation and one scoped `all`, break the tie in favor of the specific
+  operation.
+- `operation` is one of `publish | subscribe | presence | all` (case
+  insensitive on the wire; `all` matches every operation). `presence` covers
+  **both** `GET /realtime/presence/subscribe` and `POST /realtime/presence/
+  track` — they share one operation kind, distinct from broadcast's
+  `publish`/`subscribe`.
+- `allowed_roles` reuses the existing role system (`GRANT <role> TO <user>`),
+  including the built-in `anon`/`authenticated`/`service_role` roles.
+
+**Enforcement.** Each of the four routes resolves the caller's effective
+roles once (the same `effective_roles` the SQL/RLS path uses) and checks
+before doing anything else — a denial returns `403 PERMISSION_DENIED` at
+request time, **before** the SSE stream opens or the message is fanned
+out/tracked (mirrors `GET /events/subscribe`'s item-124/E1 subscribe-time
+grant gate: a clean 403 beats a silently-empty stream). The check is
+**connect-time only**: a policy change takes effect on the next
+subscribe/publish/track call, but never retroactively tears down a stream
+that already passed its gate (same contract as E1).
+
+**Default posture — `UNIDB_REALTIME_REQUIRE_AUTHZ`** (default **off**):
+- **Off** (default): a topic with **no matching policy** stays open to any
+  authenticated principal — exact item-132 behavior, unchanged.
+- **On** (`"1"`/`"true"`, case-insensitive): a topic with no matching policy
+  is **denied**, fail-closed — the same posture as RLS-enabled-with-no-policy.
+- Either way, a topic that **does** match a policy is always enforced,
+  regardless of the env var: allowed only if the caller holds one of the
+  policy's `allowed_roles`, `403` otherwise.
+- `service_role` and superuser callers **bypass every channel policy
+  entirely**, on the same audited path as every other RLS bypass in this
+  engine (item-103 lesson: `service_role_rls_bypass` in `audit.log`, object
+  = the route path, e.g. `"realtime/broadcast/subscribe"`) — there is no
+  second, unaudited bypass.
+- Fail-closed everywhere: a policy-store lookup ambiguity or enforce-mode
+  no-match denies, never allows. Policy internals (topic patterns, role
+  sets) are never logged at `info` level.
+
+### `PUT /realtime/policies`
+
+Upsert a channel policy. **Superuser-only** (`403` for a non-superuser
+caller).
+
+**Payload**:
+```json
+{ "topic_pattern": "room:*", "operation": "subscribe", "roles": ["member"] }
+```
+**Response**: `204 No Content`. Upserting an existing `(topic_pattern,
+operation)` pair replaces its role set; `operation` must be one of
+`publish|subscribe|presence|all` (`400 INVALID_OPERATION` otherwise).
+
+### `DELETE /realtime/policies`
+
+Remove a channel policy. **Superuser-only.** Idempotent — removing an
+unknown `(topic_pattern, operation)` pair is a no-op, not an error.
+
+**Payload**:
+```json
+{ "topic_pattern": "room:*", "operation": "subscribe" }
+```
+**Response**: `204 No Content`.
+
+### `GET /realtime/policies`
+
+List every stored channel policy. **Superuser-only.**
+
+**Response** `200 OK`:
+```json
+[
+  { "topic_pattern": "room:*", "operation": "subscribe", "roles": ["member"] }
+]
+```
+
+The embedded crate exposes the same three operations directly:
+`Engine::set_channel_policy` / `remove_channel_policy` /
+`list_channel_policies` (and their `EngineHandle` async wrappers for the
+server).
 
 ---
 
