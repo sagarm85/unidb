@@ -1,7 +1,7 @@
 # Scheduled jobs (cron)
 
 **Type:** Improvement
-**Status:** IN PROGRESS
+**Status:** SHIPPED (2026-08-01, PR #247) — background cron worker (dependency-free 5-field parser, injectable `run_due(now)`) runs registered SQL via `execute_sql_as_principal` under a `run_as` principal (default admin, or a named role → that role's RLS/grants); superuser `POST/GET/DELETE /cron/jobs`; in-memory status + metrics, no-overlap, no-backfill. Control-plane only — crash 54/54.
 
 > Wave-2 free-roadmap item (`137`). Supabase's `pg_cron`: run SQL on a schedule.
 > unidb has no scheduler. This adds a background worker that runs registered SQL

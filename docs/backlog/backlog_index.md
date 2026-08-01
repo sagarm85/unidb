@@ -164,7 +164,7 @@ Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 
 | 143 | `143_auth_hardening_hibp_oauth_presets.md` | Improvement | ✅ SHIPPED (2026-08-01, PR #246) — Wave-2 auth-hardening batch (2 small free items): (1) leaked-password protection via HaveIBeenPwned Pwned-Passwords range API (free, no key, k-anonymity — only the SHA-1 prefix leaves the server) enforced at signup/admin-create/patch/password-reset, opt-in `UNIDB_PASSWORD_HIBP_CHECK` (default off, fail-open on outage), `422 PASSWORD_COMPROMISED`; (2) recognized OAuth provider presets (Apple/Azure/GitLab/Discord/Facebook) added to item-128's already-agnostic flow — config-only, no new extraction code. Control-plane only — crash 54/54. |
 
-| 144 | `144_scheduled_jobs.md` | Improvement | 🔄 IN PROGRESS — Wave-2: cron scheduler (pg_cron parity). Background tokio worker runs registered SQL on a 5-field cron schedule via the existing `execute_sql` path under a `run_as` principal (default admin, or a named role so RLS/grants apply). Superuser `POST/GET/DELETE /cron/jobs`; in-memory last-run status + metrics; no-overlap, no-backfill (v1); injectable `run_due(now)` for deterministic tests. Control-plane only — crash 54/54. |
+| 144 | `144_scheduled_jobs.md` | Improvement | ✅ SHIPPED (2026-08-01, PR #247) — Wave-2: cron scheduler (pg_cron parity). Background tokio worker runs registered SQL on a 5-field cron schedule via the existing `execute_sql` path under a `run_as` principal (default admin, or a named role so RLS/grants apply). Superuser `POST/GET/DELETE /cron/jobs`; in-memory last-run status + metrics; no-overlap, no-backfill (v1); injectable `run_due(now)` for deterministic tests. Control-plane only — crash 54/54. |
 
 **Next new file → `145_…`.
 
