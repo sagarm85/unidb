@@ -448,6 +448,98 @@ impl EngineHandle {
         self.on_engine(|e| Ok(e.list_webhooks())).await
     }
 
+    // ── item 142: Auth admin API (user management) ──────────────────────
+
+    /// Whether `user` is banned (item 142) — the ban-enforcement check at
+    /// every auth-decision point (`POST /auth/login`, `/auth/refresh`, the
+    /// email-flow redemption routes). `false` (never an error) on any
+    /// engine failure, same "an error here just means don't trust it"
+    /// posture as [`Self::verify_password`]/[`Self::mfa_enabled`].
+    pub async fn is_banned(&self, user: String) -> bool {
+        self.on_engine(move |e| Ok(e.is_banned(&user)))
+            .await
+            .unwrap_or(false)
+    }
+
+    /// `GET /auth/admin/users?limit=&offset=` (item 142 admin surface).
+    pub async fn admin_list_users(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<crate::authz::AdminUserView>, usize)> {
+        self.on_engine(move |e| Ok(e.admin_list_users(limit, offset)))
+            .await
+    }
+
+    /// `GET /auth/admin/users/{id}` (item 142). `Ok(None)` if `user`
+    /// doesn't exist — the handler maps that to a `404`.
+    pub async fn admin_get_user(
+        &self,
+        user: String,
+    ) -> Result<Option<crate::authz::AdminUserView>> {
+        self.on_engine(move |e| Ok(e.admin_get_user(&user))).await
+    }
+
+    /// `POST /auth/admin/users` (item 142 admin surface).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn admin_create_user(
+        &self,
+        actor: Option<String>,
+        username: String,
+        password: Option<String>,
+        superuser: bool,
+        banned: bool,
+        app_metadata: Option<serde_json::Value>,
+        user_metadata: Option<serde_json::Value>,
+    ) -> Result<crate::authz::AdminUserView> {
+        self.on_engine(move |e| {
+            e.admin_create_user(
+                actor.as_deref(),
+                &username,
+                password.as_deref(),
+                superuser,
+                banned,
+                app_metadata,
+                user_metadata,
+            )
+        })
+        .await
+    }
+
+    /// `PATCH /auth/admin/users/{id}` (item 142 admin surface).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn admin_update_user(
+        &self,
+        actor: Option<String>,
+        username: String,
+        password: Option<String>,
+        banned: Option<bool>,
+        app_metadata: Option<serde_json::Value>,
+        user_metadata: Option<serde_json::Value>,
+        superuser: Option<bool>,
+    ) -> Result<crate::authz::AdminUserView> {
+        self.on_engine(move |e| {
+            e.admin_update_user(
+                actor.as_deref(),
+                &username,
+                password.as_deref(),
+                banned,
+                app_metadata,
+                user_metadata,
+                superuser,
+            )
+        })
+        .await
+    }
+
+    /// `DELETE /auth/admin/users/{id}` (item 142 admin surface): reuses
+    /// `DROP USER`'s machinery, including the last-superuser self-lockout
+    /// guard — see [`crate::Engine::admin_delete_user`].
+    pub async fn admin_delete_user(&self, actor: Option<String>, username: String) -> Result<()> {
+        self.on_engine(move |e| e.admin_delete_user(actor.as_deref(), &username))
+            .await
+    }
+
     /// Q2 (item 26): current commit generation — callers snapshot this before
     /// processing a batch so they can detect the NEXT commit even if it fires
     /// before the `wait_event_commit` call.

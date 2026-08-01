@@ -586,6 +586,70 @@ pub struct SessionView {
     pub revoked: bool,
 }
 
+/// Per-user admin-surface state (item 142 — `auth.admin` user management):
+/// a ban flag plus Supabase-style split metadata (`app_metadata` is
+/// admin-only; `user_metadata` is admin-writable in v1, see the item-142
+/// backlog doc's non-goals for the deferred self-service case). Every
+/// field is `#[serde(default)]` (and so is [`AuthState::user_extra`]
+/// itself) so a pre-142 `roles.json` deserializes unchanged — no
+/// FORMAT_VERSION bump. A user gets an entry the moment it's created (see
+/// [`RoleStore::apply`]'s `CreateUser` branch) whether via `CREATE USER`
+/// SQL or `POST /auth/admin/users`; a **missing** entry (only possible for
+/// a `roles.json` written before this item shipped) reads as
+/// `Default::default()` via [`RoleStore::admin_view_locked`] — unbanned,
+/// empty metadata, `created_at: 0` (meaning "unknown," never treated as a
+/// real Unix timestamp).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct UserExtra {
+    #[serde(default)]
+    banned: bool,
+    #[serde(default)]
+    created_at: u64,
+    /// Admin-only — never settable through any non-admin route (item 142's
+    /// security contract). Empty object, not null, by default so a caller
+    /// can always index into it without a null check.
+    #[serde(default = "default_metadata_object")]
+    app_metadata: serde_json::Value,
+    /// User-facing metadata; admin-writable in v1 (see the item-142 backlog
+    /// doc's non-goals for self-service writes).
+    #[serde(default = "default_metadata_object")]
+    user_metadata: serde_json::Value,
+}
+
+impl Default for UserExtra {
+    fn default() -> Self {
+        Self {
+            banned: false,
+            created_at: 0,
+            app_metadata: default_metadata_object(),
+            user_metadata: default_metadata_object(),
+        }
+    }
+}
+
+fn default_metadata_object() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
+/// Admin-surface view of one user (item 142): everything `GET
+/// /auth/admin/users` / `GET /auth/admin/users/{id}` return — **never** a
+/// password hash, refresh token, or session detail (see [`RoleStore::
+/// users_admin_page`]/[`RoleStore::user_admin_view`]).
+#[derive(Clone, Debug)]
+pub struct AdminUserView {
+    pub username: String,
+    pub is_superuser: bool,
+    pub banned: bool,
+    /// Direct role memberships (not transitive) — same scope as
+    /// [`RoleStore::roles_for`], reused by `GET /auth/whoami`.
+    pub roles: Vec<String>,
+    /// Unix seconds, or `0` for "unknown" (a user created before item 142
+    /// shipped — see [`UserExtra`]'s doc comment).
+    pub created_at: u64,
+    pub app_metadata: serde_json::Value,
+    pub user_metadata: serde_json::Value,
+}
+
 /// Reserved built-in role: an unauthenticated / no-subject caller (item 122,
 /// B3 — Supabase convention). Never created/dropped by `CREATE`/`DROP ROLE`;
 /// assigned automatically by [`RoleStore::effective_roles`].
@@ -849,6 +913,13 @@ struct AuthState {
     /// deserializes with an empty list — no FORMAT_VERSION bump.
     #[serde(default)]
     webhooks: Vec<WebhookDef>,
+    /// Per-user ban flag + app/user metadata (item 142). `#[serde(default)]`
+    /// so a pre-142 `roles.json` (no `user_extra` key) deserializes with an
+    /// empty map — no FORMAT_VERSION bump. Shown in full in `Debug` below —
+    /// no secret material (same posture as `oauth_identities`/
+    /// `table_grants`/`webhooks`).
+    #[serde(default)]
+    user_extra: BTreeMap<String, UserExtra>,
 }
 
 /// Manual `Debug`: every field except `credentials`/`sessions`/`mfa`/
@@ -905,6 +976,9 @@ impl std::fmt::Debug for AuthState {
             // manual impl, so this can safely reuse the derived struct
             // debug instead of collapsing to a bare count.
             .field("webhooks", &self.webhooks)
+            // item 142: ban flag + metadata — no secret material, shown in
+            // full, same posture as `webhooks`/`table_grants` above.
+            .field("user_extra", &self.user_extra)
             .finish()
     }
 }
@@ -2441,6 +2515,147 @@ impl RoleStore {
             .collect()
     }
 
+    // ── item 142: Auth admin API (user management) ──────────────────────
+
+    /// Build one [`AdminUserView`] from an already-locked `st` — shared by
+    /// [`Self::user_admin_view`] and [`Self::users_admin_page`] so both read
+    /// the exact same fields the exact same way.
+    fn admin_view_locked(st: &AuthState, name: &str, is_superuser: bool) -> AdminUserView {
+        let extra = st.user_extra.get(name).cloned().unwrap_or_default();
+        let roles = st
+            .memberships
+            .get(name)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        AdminUserView {
+            username: name.to_string(),
+            is_superuser,
+            banned: extra.banned,
+            roles,
+            created_at: extra.created_at,
+            app_metadata: extra.app_metadata,
+            user_metadata: extra.user_metadata,
+        }
+    }
+
+    /// `GET /auth/admin/users/{id}` (item 142): `None` if `user` doesn't
+    /// exist — the handler maps that to a `404`.
+    pub fn user_admin_view(&self, user: &str) -> Option<AdminUserView> {
+        let st = self.lock();
+        let is_superuser = *st.users.get(user)?;
+        Some(Self::admin_view_locked(&st, user, is_superuser))
+    }
+
+    /// `GET /auth/admin/users?limit=&offset=` (item 142): a page of users in
+    /// stable (username-sorted, since `AuthState::users` is a `BTreeMap`)
+    /// order, plus the total user count (item 139's `Content-Range`-style
+    /// posture: the total is always the *unpaginated* count, not the page
+    /// length).
+    pub fn users_admin_page(&self, limit: usize, offset: usize) -> (Vec<AdminUserView>, usize) {
+        let st = self.lock();
+        let total = st.users.len();
+        let rows = st
+            .users
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(|(name, is_superuser)| Self::admin_view_locked(&st, name, *is_superuser))
+            .collect();
+        (rows, total)
+    }
+
+    /// Whether `user` is currently banned (item 142). `false` for an
+    /// unknown user or a user with no `user_extra` entry (pre-142
+    /// `roles.json`) — see [`UserExtra`]'s doc comment. Checked at every
+    /// auth-decision point: `POST /auth/login`, `POST /auth/refresh`, and
+    /// the email-flow redemption routes (`POST /auth/verify`, `POST
+    /// /auth/magiclink/verify`) — see `server::handlers`.
+    pub fn is_banned(&self, user: &str) -> bool {
+        self.lock()
+            .user_extra
+            .get(user)
+            .map(|e| e.banned)
+            .unwrap_or(false)
+    }
+
+    /// Set (or clear) `user`'s ban flag (item 142 — `PATCH
+    /// /auth/admin/users/{id}`'s `banned` field, and `POST
+    /// /auth/admin/users`'s `banned: true` at creation time). Errors if
+    /// `user` doesn't exist. Does **not** revoke sessions itself — the
+    /// caller (`Engine::admin_update_user`/`admin_create_user`) does that
+    /// as a separate, explicitly-audited step, mirroring how `POST
+    /// /auth/verify` composes `set_password` + `revoke_all_sessions_for_user`
+    /// today rather than folding session revocation into the credential
+    /// setter.
+    pub fn set_banned(&self, user: &str, banned: bool) -> Result<()> {
+        let mut st = self.lock();
+        if !st.users.contains_key(user) {
+            return Err(DbError::Authz(format!("user '{user}' not found")));
+        }
+        st.user_extra.entry(user.to_string()).or_default().banned = banned;
+        self.persist(&st)?;
+        tracing::info!(user = %user, banned, "user ban state changed");
+        Ok(())
+    }
+
+    /// Set `user`'s admin-only `app_metadata` (item 142 — `PATCH
+    /// /auth/admin/users/{id}`'s `app_metadata` field). Replaces the whole
+    /// value (not a merge — same "last write wins on the whole field"
+    /// posture as every other admin-surface setter in this module). Errors
+    /// if `user` doesn't exist.
+    pub fn set_app_metadata(&self, user: &str, value: serde_json::Value) -> Result<()> {
+        let mut st = self.lock();
+        if !st.users.contains_key(user) {
+            return Err(DbError::Authz(format!("user '{user}' not found")));
+        }
+        st.user_extra
+            .entry(user.to_string())
+            .or_default()
+            .app_metadata = value;
+        self.persist(&st)
+    }
+
+    /// Set `user`'s `user_metadata` (item 142). Same replace-whole-value and
+    /// existence-check posture as [`Self::set_app_metadata`].
+    pub fn set_user_metadata(&self, user: &str, value: serde_json::Value) -> Result<()> {
+        let mut st = self.lock();
+        if !st.users.contains_key(user) {
+            return Err(DbError::Authz(format!("user '{user}' not found")));
+        }
+        st.user_extra
+            .entry(user.to_string())
+            .or_default()
+            .user_metadata = value;
+        self.persist(&st)
+    }
+
+    /// Set `user`'s superuser flag (item 142 — `PATCH
+    /// /auth/admin/users/{id}`'s `superuser` field). Demoting (`superuser:
+    /// false`) a currently-superuser account shares the exact same
+    /// last-superuser guard as `DROP USER`/`DELETE /auth/admin/users/{id}`
+    /// (see [`Self::apply`]'s `DropUser` branch) — removing the last
+    /// remaining superuser's status is the identical self-lockout risk as
+    /// deleting them outright. A no-op call (already at the requested
+    /// value) skips the persist entirely.
+    pub fn set_superuser(&self, user: &str, superuser: bool) -> Result<()> {
+        let mut st = self.lock();
+        let Some(&current) = st.users.get(user) else {
+            return Err(DbError::Authz(format!("user '{user}' not found")));
+        };
+        if current == superuser {
+            return Ok(());
+        }
+        if current && !superuser && st.users.values().filter(|&&s| s).count() <= 1 {
+            return Err(DbError::PermissionDenied(format!(
+                "cannot remove superuser status from '{user}': it is the last remaining superuser"
+            )));
+        }
+        st.users.insert(user.to_string(), superuser);
+        self.persist(&st)
+    }
+
     /// Snapshot of all role names (item-24 Z5: `unidb_catalog.roles`).
     pub fn roles(&self) -> Vec<String> {
         self.lock().roles.iter().cloned().collect()
@@ -2570,11 +2785,39 @@ impl RoleStore {
                 if let Some(hash) = hash {
                     st.credentials.insert(name.clone(), hash);
                 }
+                // item 142: seed a fresh admin-surface record (unbanned,
+                // empty metadata) stamped with the creation time. Every user
+                // gets one from the moment it exists, whether created via
+                // this SQL DDL path or `Engine::admin_create_user`'s `POST
+                // /auth/admin/users` — a plain `insert` (not `entry(..)
+                // .or_default()`) is deliberate: a name reused after a prior
+                // `DropUser` (which already clears `user_extra` below) must
+                // never inherit a stale ban/metadata record.
+                st.user_extra.insert(
+                    name.clone(),
+                    UserExtra {
+                        created_at: now_secs(),
+                        ..Default::default()
+                    },
+                );
             }
             AuthStmt::DropUser(name) => {
-                if st.users.remove(name).is_none() {
+                let Some(&is_super) = st.users.get(name) else {
                     return Err(DbError::Authz(format!("user '{name}' not found")));
+                };
+                // item 142: last-superuser self-lockout guard. Applies
+                // uniformly to `DROP USER` (SQL) and `DELETE
+                // /auth/admin/users/{id}` (both route through this one
+                // branch) — dropping the only remaining superuser would
+                // leave no account able to administer the server at all
+                // (short of restarting into open/bootstrap mode by
+                // deleting every user, a much bigger footgun).
+                if is_super && st.users.values().filter(|&&s| s).count() <= 1 {
+                    return Err(DbError::PermissionDenied(format!(
+                        "cannot drop user '{name}': it is the last remaining superuser"
+                    )));
                 }
+                st.users.remove(name);
                 st.memberships.remove(name);
                 st.table_grants.remove(name);
                 st.credentials.remove(name);
@@ -2582,6 +2825,9 @@ impl RoleStore {
                 // recovery-code hashes) must not linger — mirrors dropping
                 // `credentials` above.
                 st.mfa.remove(name);
+                // item 142: ban flag + metadata must not linger either —
+                // same "no orphaned per-user state" posture as `mfa` above.
+                st.user_extra.remove(name);
                 // item 128: drop any OAuth identity link(s) pointing at this
                 // user too, so a later `CREATE USER` reusing the same name
                 // never silently inherits a stranger's OAuth login.

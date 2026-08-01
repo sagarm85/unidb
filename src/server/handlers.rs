@@ -38,11 +38,12 @@ use crate::{
         auth::CurrentUser,
         dto::{
             exec_result_to_json, is_internal_table, json_to_literal, literal_to_json, slot_to_json,
-            table_def_to_info, AckEventsRequest, AdvanceSlotRequest, AuthEmailFlowAck,
-            AuthLoginOutcome, AuthLoginRequest, AuthLoginResponse, AuthMagicLinkRequest,
-            AuthMagicLinkVerifyRequest, AuthMetaResponse, AuthPreviewRequest, AuthRecoverRequest,
-            AuthVerifyRequest, BatchInsertRequest, BatchSqlRequest, BatchSqlResponse,
-            BeginTxnRequest, ChannelPolicyDeleteRequest, ChannelPolicyDto,
+            table_def_to_info, AckEventsRequest, AdminCreateUserRequest, AdminUpdateUserRequest,
+            AdminUserDto, AdminUserListQuery, AdminUserListResponse, AdvanceSlotRequest,
+            AuthEmailFlowAck, AuthLoginOutcome, AuthLoginRequest, AuthLoginResponse,
+            AuthMagicLinkRequest, AuthMagicLinkVerifyRequest, AuthMetaResponse, AuthPreviewRequest,
+            AuthRecoverRequest, AuthVerifyRequest, BatchInsertRequest, BatchSqlRequest,
+            BatchSqlResponse, BeginTxnRequest, ChannelPolicyDeleteRequest, ChannelPolicyDto,
             ChannelPolicyUpsertRequest, CreateEdgeRequest, CreateSlotRequest, CursorQuery,
             CypherRequest, DeleteEdgeRequest, GroupCommitWindowRequest, HistoryQuery, IsolationDto,
             MfaChallengeRequest, MfaDisableRequest, MfaEnrollResponse, MfaVerifyRequest,
@@ -1191,6 +1192,206 @@ pub async fn delete_webhook(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ── item 142: Auth admin API (user management) ─────────────────────────────
+//
+// A consolidated, superuser-only REST surface for user management —
+// Supabase's `auth.admin`. Every route below is gated identically to
+// `/realtime/policies`/`/webhooks` ([`EngineHandle::ensure_superuser`], a
+// named non-superuser gets `403`); `GET` routes never return a password
+// hash, refresh token, or session detail (see `crate::authz::AdminUserView`).
+
+/// Default page size for `GET /auth/admin/users` when `limit` is omitted;
+/// also the hard cap on a caller-supplied `limit` — a superuser-only route
+/// still shouldn't be able to force an unbounded response.
+const ADMIN_USERS_DEFAULT_LIMIT: usize = 50;
+const ADMIN_USERS_MAX_LIMIT: usize = 500;
+
+/// `GET /auth/admin/users?limit=&offset=` (item 142 admin surface):
+/// paginated list of every user, plus the total (unpaginated) count.
+pub async fn get_admin_users(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+    Query(params): Query<AdminUserListQuery>,
+) -> std::result::Result<Json<AdminUserListResponse>, ApiError> {
+    state
+        .engine
+        .ensure_superuser(current_user.0.clone())
+        .await
+        .map_err(ApiError::from)?;
+    let limit = params
+        .limit
+        .unwrap_or(ADMIN_USERS_DEFAULT_LIMIT)
+        .min(ADMIN_USERS_MAX_LIMIT);
+    let offset = params.offset.unwrap_or(0);
+    let (users, total) = state
+        .engine
+        .admin_list_users(limit, offset)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(AdminUserListResponse {
+        users: users.into_iter().map(AdminUserDto::from).collect(),
+        total,
+    }))
+}
+
+/// `GET /auth/admin/users/{id}` (item 142 admin surface): `{id}` is the
+/// username (unidb has no separate synthetic user-id column — same
+/// "username is the identifier" posture as `DELETE /auth/sessions/{id}`'s
+/// `{id}` being a session id, not a user one). `404 USER_NOT_FOUND` if
+/// absent.
+pub async fn get_admin_user(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+    Path(username): Path<String>,
+) -> std::result::Result<Json<AdminUserDto>, ApiError> {
+    state
+        .engine
+        .ensure_superuser(current_user.0.clone())
+        .await
+        .map_err(ApiError::from)?;
+    let user = state
+        .engine
+        .admin_get_user(username.clone())
+        .await
+        .map_err(ApiError::from)?;
+    let Some(user) = user else {
+        return Err(ApiError::Api {
+            status: StatusCode::NOT_FOUND,
+            code: "USER_NOT_FOUND",
+            message: format!("user '{username}' not found"),
+        });
+    };
+    Ok(Json(AdminUserDto::from(user)))
+}
+
+/// `POST /auth/admin/users` (item 142 admin surface): create a user,
+/// reusing the exact same `CreateUser` machinery `CREATE USER ... PASSWORD`
+/// / `POST /auth/signup` already share.
+pub async fn post_admin_user(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+    Json(body): Json<AdminCreateUserRequest>,
+) -> std::result::Result<(StatusCode, Json<AdminUserDto>), ApiError> {
+    state
+        .engine
+        .ensure_superuser(current_user.0.clone())
+        .await
+        .map_err(ApiError::from)?;
+    if body.username.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "INVALID_USERNAME",
+            "username must not be empty",
+        ));
+    }
+    let user = state
+        .engine
+        .admin_create_user(
+            current_user.0.clone(),
+            body.username,
+            body.password,
+            body.superuser,
+            body.banned,
+            body.app_metadata,
+            body.user_metadata,
+        )
+        .await
+        .map_err(ApiError::from)?;
+    Ok((StatusCode::CREATED, Json(AdminUserDto::from(user))))
+}
+
+/// `PATCH /auth/admin/users/{id}` (item 142 admin surface): partial update.
+/// `password` → [`crate::authz::RoleStore::set_password`] + revoke every
+/// session; `banned` → ban/unban (banning also revokes every session);
+/// `app_metadata`/`user_metadata` → replace whole value; `superuser` →
+/// promote/demote, guarded against demoting the last remaining superuser
+/// (`403`, same posture as the last-superuser guard on `DELETE
+/// /auth/admin/users/{id}` below).
+pub async fn patch_admin_user(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+    Path(username): Path<String>,
+    Json(body): Json<AdminUpdateUserRequest>,
+) -> std::result::Result<Json<AdminUserDto>, ApiError> {
+    state
+        .engine
+        .ensure_superuser(current_user.0.clone())
+        .await
+        .map_err(ApiError::from)?;
+    // 404, not the engine's generic 400 `AUTHZ_ERROR`, for an unknown
+    // username — same "GET-shaped" not-found posture as `get_admin_user`.
+    if state
+        .engine
+        .admin_get_user(username.clone())
+        .await
+        .map_err(ApiError::from)?
+        .is_none()
+    {
+        return Err(ApiError::Api {
+            status: StatusCode::NOT_FOUND,
+            code: "USER_NOT_FOUND",
+            message: format!("user '{username}' not found"),
+        });
+    }
+    let user = state
+        .engine
+        .admin_update_user(
+            current_user.0.clone(),
+            username,
+            body.password,
+            body.banned,
+            body.app_metadata,
+            body.user_metadata,
+            body.superuser,
+        )
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(AdminUserDto::from(user)))
+}
+
+/// `DELETE /auth/admin/users/{id}` (item 142 admin surface): reuses `DROP
+/// USER`'s machinery, including cleanup of memberships/grants/credentials/
+/// MFA/OAuth links/admin-extra state. Guarded against dropping the last
+/// remaining superuser (`403 PERMISSION_DENIED`). Unlike `DELETE
+/// /webhooks/{id}`/`DELETE /realtime/policies`, this is **not** idempotent
+/// on "delete an unknown/already-absent username" — that returns `404
+/// USER_NOT_FOUND`, not a silent `204`, so a superuser attempting to delete
+/// a specific account always knows whether it existed.
+pub async fn delete_admin_user(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+    Path(username): Path<String>,
+) -> std::result::Result<StatusCode, ApiError> {
+    state
+        .engine
+        .ensure_superuser(current_user.0.clone())
+        .await
+        .map_err(ApiError::from)?;
+    // 404, not the engine's generic 400 `AUTHZ_ERROR`, for an unknown
+    // username — same posture as `patch_admin_user` above. Checked before
+    // the delete itself so the last-superuser guard (which fires from
+    // inside `admin_delete_user`) is only ever reached for a username that
+    // actually exists.
+    if state
+        .engine
+        .admin_get_user(username.clone())
+        .await
+        .map_err(ApiError::from)?
+        .is_none()
+    {
+        return Err(ApiError::Api {
+            status: StatusCode::NOT_FOUND,
+            code: "USER_NOT_FOUND",
+            message: format!("user '{username}' not found"),
+        });
+    }
+    state
+        .engine
+        .admin_delete_user(current_user.0.clone(), username)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// `POST /auth/preview` (item-24 Z6): run `sql` as `as_role` and return the
 /// row-filtered result, including RLS policies that reference `current_user()`.
 /// This is the "preview as user" surface: an admin can verify exactly what a
@@ -1264,6 +1465,21 @@ fn route_disabled(message: impl Into<String>) -> ApiError {
         status: StatusCode::NOT_FOUND,
         code: "NOT_FOUND",
         message: message.into(),
+    }
+}
+
+/// Uniform `403 USER_BANNED` — the ban-enforcement response at every
+/// auth-decision point (item 142). Deliberately a *distinguishable* error
+/// from `401 INVALID_CREDENTIALS`/`401 INVALID_REFRESH_TOKEN`/etc.: unlike
+/// the no-user-enumeration contract elsewhere in this module, a ban is not
+/// a secret the account holder needs kept from them — Supabase's own
+/// `auth.admin` API takes the same posture (a banned user's login attempt
+/// gets a distinct, explicit error, not a generic failure).
+fn user_banned_error() -> ApiError {
+    ApiError::Api {
+        status: StatusCode::FORBIDDEN,
+        code: "USER_BANNED",
+        message: "this account has been banned".into(),
     }
 }
 
@@ -1361,6 +1577,14 @@ pub async fn post_auth_login(
             code: "INVALID_CREDENTIALS",
             message: "invalid username or password".into(),
         });
+    }
+    // Item 142: ban enforcement. Checked *after* password verification (so
+    // this stays a distinguishable-from-`INVALID_CREDENTIALS` signal, same
+    // as real Supabase behavior — see `user_banned_error`'s doc comment),
+    // *before* the MFA branch (so a banned user is rejected outright and
+    // never even receives an MFA challenge).
+    if state.engine.is_banned(body.username.clone()).await {
+        return Err(user_banned_error());
     }
     if state.engine.mfa_enabled(body.username.clone()).await {
         let (challenge, _expires_at) = state
@@ -1513,6 +1737,13 @@ pub async fn post_auth_verify(
             message: "invalid, expired, or already-used recovery token".into(),
         });
     };
+    // Item 142: ban enforcement, fail-safe — a banned account may not
+    // self-service a password reset either (the token is already consumed
+    // by `verify_recovery_token` above by this point; the account must be
+    // unbanned and request a fresh recovery email).
+    if state.engine.is_banned(username.clone()).await {
+        return Err(user_banned_error());
+    }
     state
         .engine
         .set_password(username.clone(), body.new_password.clone())
@@ -1609,6 +1840,12 @@ pub async fn post_auth_magiclink_verify(
             message: "invalid, expired, or already-used magic-link token".into(),
         });
     };
+    // Item 142: ban enforcement — this route mints a real session, the
+    // magic-link flow's functional equivalent of `POST /auth/login`, so it
+    // gets the identical banned-account rejection.
+    if state.engine.is_banned(username.clone()).await {
+        return Err(user_banned_error());
+    }
     let resp = issue_token_pair(&state.engine, jwt_cfg, &username).await?;
     Ok(Json(resp))
 }
@@ -1815,6 +2052,23 @@ pub async fn post_auth_refresh(
                 .into(),
         ))
     })?;
+    // Item 142: ban enforcement — a **non-consuming peek** (`verify_session`,
+    // not `rotate_session`) so a banned caller's still-live session is never
+    // rotated/consumed by a rejected refresh attempt. In practice banning
+    // already revokes every session ([`EngineHandle::admin_update_user`]),
+    // so this mostly matters as defense-in-depth for the race window between
+    // a ban taking effect and this request's own session lookup; an unknown/
+    // already-expired/-revoked token is left for `rotate_session` below to
+    // reject with its own uniform `401`, unchanged from pre-142 behavior.
+    if let Some(username) = state
+        .engine
+        .verify_session(body.refresh_token.clone())
+        .await
+    {
+        if state.engine.is_banned(username).await {
+            return Err(user_banned_error());
+        }
+    }
     let rotated = state
         .engine
         .rotate_session(body.refresh_token.clone())

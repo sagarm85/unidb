@@ -4459,6 +4459,182 @@ impl Engine {
         self.authz.list_webhooks()
     }
 
+    // ── item 142: Auth admin API (user management) ──────────────────────
+
+    /// Whether `user` is currently banned (item 142). Checked at every
+    /// auth-decision point — `POST /auth/login` (after a correct password,
+    /// before MFA/session issuance), `POST /auth/refresh` (a non-consuming
+    /// peek via `verify_session` before `rotate_session`, so a banned
+    /// caller's still-valid session is never rotated/consumed by a rejected
+    /// attempt), and the email-flow redemption routes `POST /auth/verify`/
+    /// `POST /auth/magiclink/verify` — see those handlers in
+    /// `server::handlers`. **Documented limitation:** an already-issued
+    /// short-TTL access JWT is a stateless bearer credential and stays
+    /// valid until its own expiry regardless of a ban issued after it was
+    /// minted; banning immediately revokes every refresh-token session
+    /// (see [`Self::admin_update_user`]), so the *next* refresh/login is
+    /// where the ban actually bites.
+    pub fn is_banned(&self, user: &str) -> bool {
+        self.authz.is_banned(user)
+    }
+
+    /// `GET /auth/admin/users?limit=&offset=` (item 142 admin surface):
+    /// paginated list + total count. Superuser gating is the HTTP handler's
+    /// job (mirrors every other `/*/admin` surface in this crate, e.g.
+    /// [`Self::list_webhooks`]).
+    pub fn admin_list_users(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> (Vec<crate::authz::AdminUserView>, usize) {
+        self.authz.users_admin_page(limit, offset)
+    }
+
+    /// `GET /auth/admin/users/{id}` (item 142): `None` if `user` doesn't
+    /// exist — the handler maps that to a `404`.
+    pub fn admin_get_user(&self, user: &str) -> Option<crate::authz::AdminUserView> {
+        self.authz.user_admin_view(user)
+    }
+
+    /// `POST /auth/admin/users` (item 142): create a user with optional
+    /// `superuser`/`banned`/`app_metadata`/`user_metadata`, reusing the
+    /// exact same `CreateUser` auth-DDL machinery `CREATE USER ...
+    /// PASSWORD` and `POST /auth/signup`
+    /// ([`Self::create_user_with_password`]) already share. Audited under
+    /// the same `"create_user"` action [`auth_stmt_audit`] gives `CREATE
+    /// USER`, plus one more audit line per non-default banned/metadata
+    /// field actually applied. `actor` is the caller's own identity (for
+    /// the audit trail), never the identity being created.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admin_create_user(
+        &self,
+        actor: Option<&str>,
+        username: &str,
+        password: Option<&str>,
+        superuser: bool,
+        banned: bool,
+        app_metadata: Option<serde_json::Value>,
+        user_metadata: Option<serde_json::Value>,
+    ) -> Result<crate::authz::AdminUserView> {
+        let stmt = crate::authz::AuthStmt::CreateUser {
+            name: username.to_string(),
+            superuser,
+            password: password.map(str::to_owned),
+        };
+        let result = self.authz.apply(&stmt);
+        self.audit
+            .record_admin(actor, None, "create_user", username, result.is_ok());
+        result?;
+        self.bump_schema_epoch();
+        if banned {
+            self.authz.set_banned(username, true)?;
+            self.audit
+                .record_admin(actor, None, "admin_set_banned", username, true);
+        }
+        if let Some(meta) = app_metadata {
+            self.authz.set_app_metadata(username, meta)?;
+            self.audit
+                .record_admin(actor, None, "admin_set_app_metadata", username, true);
+        }
+        if let Some(meta) = user_metadata {
+            self.authz.set_user_metadata(username, meta)?;
+            self.audit
+                .record_admin(actor, None, "admin_set_user_metadata", username, true);
+        }
+        Ok(self
+            .authz
+            .user_admin_view(username)
+            .expect("user_admin_view: just created"))
+    }
+
+    /// `PATCH /auth/admin/users/{id}` (item 142): apply any subset of
+    /// `password`/`banned`/`app_metadata`/`user_metadata`/`superuser` —
+    /// fields left `None` are left untouched. `password` and `banned:
+    /// true` both revoke every existing refresh-token session for the user
+    /// ([`Self::revoke_all_sessions_for_user`], item 138's mechanism) so an
+    /// already-issued refresh token can never outlive the change that
+    /// should have invalidated it — the short-TTL *access* JWT still rides
+    /// out its own expiry regardless (see [`Self::is_banned`]'s doc
+    /// comment). A `superuser: Some(false)` demoting the account away from
+    /// superuser status shares the exact same last-superuser guard as
+    /// `DELETE /auth/admin/users/{id}` ([`crate::authz::RoleStore::
+    /// set_superuser`]). Every changed field is audited individually so the
+    /// audit trail says exactly what changed, not just "the user record was
+    /// touched."
+    #[allow(clippy::too_many_arguments)]
+    pub fn admin_update_user(
+        &self,
+        actor: Option<&str>,
+        username: &str,
+        password: Option<&str>,
+        banned: Option<bool>,
+        app_metadata: Option<serde_json::Value>,
+        user_metadata: Option<serde_json::Value>,
+        superuser: Option<bool>,
+    ) -> Result<crate::authz::AdminUserView> {
+        if !self.authz.user_exists(username) {
+            return Err(DbError::Authz(format!("user '{username}' not found")));
+        }
+        if let Some(pw) = password {
+            let r = self.authz.set_password(username, pw);
+            self.audit
+                .record_admin(actor, None, "admin_set_password", username, r.is_ok());
+            r?;
+            self.authz.revoke_all_sessions_for_user(username)?;
+        }
+        if let Some(b) = banned {
+            let r = self.authz.set_banned(username, b);
+            self.audit
+                .record_admin(actor, None, "admin_set_banned", username, r.is_ok());
+            r?;
+            if b {
+                self.authz.revoke_all_sessions_for_user(username)?;
+            }
+        }
+        if let Some(meta) = app_metadata {
+            let r = self.authz.set_app_metadata(username, meta);
+            self.audit
+                .record_admin(actor, None, "admin_set_app_metadata", username, r.is_ok());
+            r?;
+        }
+        if let Some(meta) = user_metadata {
+            let r = self.authz.set_user_metadata(username, meta);
+            self.audit
+                .record_admin(actor, None, "admin_set_user_metadata", username, r.is_ok());
+            r?;
+        }
+        if let Some(su) = superuser {
+            let r = self.authz.set_superuser(username, su);
+            self.audit
+                .record_admin(actor, None, "admin_set_superuser", username, r.is_ok());
+            r?;
+        }
+        self.bump_schema_epoch();
+        Ok(self
+            .authz
+            .user_admin_view(username)
+            .expect("user_admin_view: just updated"))
+    }
+
+    /// `DELETE /auth/admin/users/{id}` (item 142): reuses `DROP USER`'s
+    /// exact machinery ([`crate::authz::RoleStore::apply`]'s `DropUser`
+    /// branch, which now also carries the last-superuser self-lockout guard
+    /// — see its doc comment) so behavior (cleanup of memberships/grants/
+    /// credentials/MFA/OAuth links/admin-extra state) is identical whether
+    /// a superuser drops a user via `DROP USER` SQL or via this REST route.
+    /// Audited under the same `"drop_user"` action [`auth_stmt_audit`]
+    /// gives the SQL path.
+    pub fn admin_delete_user(&self, actor: Option<&str>, username: &str) -> Result<()> {
+        let stmt = crate::authz::AuthStmt::DropUser(username.to_string());
+        let result = self.authz.apply(&stmt);
+        self.audit
+            .record_admin(actor, None, "drop_user", username, result.is_ok());
+        if result.is_ok() {
+            self.bump_schema_epoch();
+        }
+        result
+    }
+
     /// Durably advance `consumer`'s offset to `up_to_seq` — the only
     /// operation in M4.b that writes to `__consumers__`. If the consumer
     /// has never acked before, this is where its row is created
