@@ -2586,9 +2586,12 @@ real `users.email` column is tracked as a fast follow-up in
 **Transport config** — `UNIDB_EMAIL_TRANSPORT` (default `log`):
 - `log` (default) — writes the fully-rendered email to a dev-inbox file
   (`UNIDB_EMAIL_DEV_FILE`, default `<UNIDB_DATA_DIR>/email-dev-inbox.jsonl`,
-  one JSON line per send: `{to, from, subject, text_body, html_body}`) and
-  to `tracing`, instead of actually sending — no mail server needed for
-  local dev/tests (mirrors Supabase's Inbucket/Mailpit).
+  one JSON line per send: `{to, from, subject, text_body, html_body, ts}`,
+  `ts` = unix seconds the line was appended, item 145) and to `tracing`,
+  instead of actually sending — no mail server needed for local dev/tests
+  (mirrors Supabase's Inbucket/Mailpit). `GET`/`DELETE /auth/dev-inbox`
+  (below) reads/clears this file over HTTP instead of requiring filesystem
+  access to the server.
 - `smtp` — real delivery via `lettre`. Requires `UNIDB_SMTP_HOST` and
   `UNIDB_SMTP_FROM` (the server refuses to start otherwise, with a clear
   error naming which is missing); also reads `UNIDB_SMTP_PORT` (default
@@ -2680,6 +2683,58 @@ response: `{ "token": "...", "access_token": "...", "refresh_token": "...", "exp
 
 **Errors:** `401 MAGICLINK_TOKEN_INVALID` — uniform for unknown/expired/
 already-used token.
+
+### Dev-inbox read route (item 145)
+
+**Dev/testing aid — never for production.** Studio's Inbucket/Mailpit-
+equivalent live email preview: reads (and clears) the exact same dev-inbox
+JSONL the `log` transport above already writes — no new state, no
+storage-engine change. Every entry can carry a live, single-use password-
+reset/magic-link **token**, so this surface is as sensitive as those links.
+
+**Double-gated, in this order:**
+1. **Dev-transport-only availability gate.** Both routes return **`404 NOT_FOUND`**
+   (the same `route_disabled` posture as a disabled `POST /auth/signup` or
+   an unconfigured OAuth provider — indistinguishable from a non-existent
+   route) whenever the active transport is real SMTP
+   (`UNIDB_EMAIL_TRANSPORT=smtp`). Checked *first*, before the superuser
+   gate below, so a real-delivery deployment never leaks (via a
+   403-vs-404 distinction) that this admin surface exists at all —
+   every caller gets the identical 404, superuser or not.
+2. **Superuser gate.** `403 PERMISSION_DENIED` for anyone else, once the
+   dev transport is confirmed active — same posture as `/auth/admin/users`/
+   `/webhooks`/`/realtime/policies`.
+
+#### `GET /auth/dev-inbox?limit=` — read captured emails
+
+**Auth:** Bearer JWT, superuser-only (see gates above).
+
+**Query params**: `limit` (default 50, capped at 500).
+
+**Response** `200 OK`: a JSON array, **newest first**:
+```json
+[
+  {
+    "to": "alice@example.com",
+    "subject": "Reset your unidb password",
+    "text_body": "Hi alice@example.com,\n\n...\n\nhttp://localhost:8080/auth/verify?token=...\n",
+    "html_body": "<p>Hi alice@example.com,</p>...",
+    "ts": 1732900000
+  }
+]
+```
+A malformed line in the underlying JSONL (a partial write mid-append, or
+hand-edited garbage) is skipped, not fatal — one bad line never hides every
+other captured email.
+
+#### `DELETE /auth/dev-inbox` — clear the dev inbox
+
+**Auth:** Bearer JWT, superuser-only (see gates above).
+
+Truncates the dev-inbox file in place (the file itself is not removed, so
+the very next `log`-transport send keeps working with no special-casing).
+
+**Response**: `204 No Content`.
 
 ### Secrets vault (item 129, Workstream I3)
 

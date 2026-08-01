@@ -246,6 +246,15 @@ pub fn build_router_with_rate_limiter(
                 .patch(handlers::patch_admin_user)
                 .delete(handlers::delete_admin_user),
         )
+        // ── Item 145: dev-inbox read route ──────────────────────────────────
+        // Dev/testing aid, never for production — double-gated: 404 unless
+        // the active email transport is the dev-inbox log transport, then
+        // superuser-only (403 otherwise). See `handlers.rs`'s item-145
+        // section doc for the full posture.
+        .route(
+            "/auth/dev-inbox",
+            get(handlers::get_dev_inbox).delete(handlers::delete_dev_inbox),
+        )
         // ── Item 31: storage service routes (/storage/*) ──────────────────
         // All 7 routes return 503 when AppState::storage is None (unconfigured).
         // C1 list / C2 create buckets

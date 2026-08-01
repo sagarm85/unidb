@@ -12,104 +12,24 @@
 
 ## Current status
 
-- **2026-08-01 — item 144 (scheduled jobs / cron) implemented, committed to branch (Status left IN PROGRESS — orchestrator flips on merge).**
-  Wave-3 roadmap item (137, though 144's own doc mislabels itself Wave-2 — flagged, not silently
-  fixed either way). Control-plane only: new dependency-free `src/cron.rs` (5-field parser/matcher,
-  no `cron`/`saffron` crate), `src/server/cron.rs` worker (webhooks.rs-shaped `Weak<EngineHandle>`
-  `tokio::spawn`, non-blocking `run_due(engine, state, now)` test seam), superuser `/cron/jobs`
-  admin API. `run_as` reuses `execute_sql_as_principal` for RLS/grant parity. 9 new
-  `tests/item144_cron.rs` + 4 unit tests, all 7 gates green incl. crash 54/54.
-
-- **2026-08-01 — item 143 (auth hardening: HIBP leaked-password + 5 more OAuth presets) implemented, committed to branch (Status left IN PROGRESS — orchestrator flips on merge).**
-  Wave-2 (137), control-plane only. New `src/server/hibp.rs` (opt-in `UNIDB_PASSWORD_HIBP_CHECK`,
-  k-anonymity SHA-1-prefix range lookup, fail-open+warn on outage) gated before password storage at
-  signup / admin create+patch / `/auth/verify` → `422 PASSWORD_COMPROMISED`. `oauth.rs::default_urls`
-  + `from_env` preset loop extended with apple/azure/gitlab/discord/facebook (all `sub`/`id`, no flow
-  change; Apple's missing REST userinfo endpoint documented as a known gap). New
-  `tests/item143_auth_hardening.rs` (6/6, local mocks only). All 7 gates green incl. crash 54/54;
-  item121/128/131/138/142 unchanged. Docs: REST_API (HIBP section + `PASSWORD_COMPROMISED` code +
-  7-provider OAuth table), README, 137 Wave-2 line.
-
-- **2026-08-01 — item 142 (Auth admin API — user management) SHIPPED to branch (flips on merge).**
-  Wave-2 (137). Superuser `/auth/admin/users` REST surface (list+pagination+total / get / create /
-  patch / delete), mirroring the `/realtime/policies`(140) & `/webhooks`(141) admin pattern. New
-  control-plane per-user state (`AuthState.user_extra`: `banned` + `created_at` + `app_metadata`/
-  `user_metadata`, `#[serde(default)]`, no format bump, seeded fresh per `CreateUser`). Ban enforced at
-  login (post-verify, pre-MFA), refresh (non-consuming peek before rotate), and `/auth/verify` +
-  `/auth/magiclink/verify` → uniform `403 USER_BANNED` (recover/magiclink request step still 200, no
-  enumeration); banning revokes sessions (item-138); short-TTL access JWT rides its own expiry (stateless,
-  documented). Last-superuser self-lockout guard + PATCH-demotion guard placed in the shared `DropUser`/
-  `set_superuser` path (so `DROP USER` SQL is protected too). Per-mutation audited; responses never carry
-  a hash/token (grep-asserted). `Engine`/`EngineHandle` methods for embedded parity. item142 12/12 +
-  item121 16/16 + crash 54/54 + clippy/fmt/no-feature-compile clean. Out of 142: identity linking,
-  anonymous sign-in. Docs: REST_API `/auth/admin/*` section + `USER_BANNED`/`USER_NOT_FOUND` codes,
-  README, 137 Wave-2 line.
-
-- **2026-08-01 — item 141 (database webhooks — outbound HTTP on row change) implemented, committed to branch (Status left IN PROGRESS — orchestrator flips on merge).**
-  Wave-2 free-roadmap item (137). Superuser `POST/GET/DELETE /webhooks` admin API
-  (`src/server/handlers.rs`, `src/server/dto.rs`) over a new control-plane store
-  (`crate::authz::{WebhookDef, WebhookEvent, WebhookSecret}` in `src/authz/mod.rs`,
-  `roles.json`-persisted, `#[serde(default)]`, no FORMAT_VERSION bump, secret
-  redacted via a `ClientSecret`-style manual `Debug`). Delivery worker
-  (`src/server/webhooks.rs`) is a `tokio::spawn` task (not a `std::thread` —
-  `reqwest` is async-only in this crate's feature set) spawned from
-  `AppState::with_config` alongside `spawn_reaper`, holding only a
-  `Weak<EngineHandle>`. It owns a durable consumer (`__webhooks__`) on the
-  existing M4/item-29 event queue (`poll_events`/`ack_events` — exactly the
-  mechanism `sse.rs` uses), matches events against enabled webhooks by
-  `table_pattern` (exact/`*`) + `events`, and POSTs the native CDC envelope
-  with `X-Unidb-Signature: sha256=<hex HMAC-SHA256>` when a secret is
-  configured (vault-first: `webhook.<id>.secret`, falling back to the
-  registration-time secret — mirrors `oauth::resolve_client_secret`'s order).
-  Each delivery runs on its own tokio task (so a dead endpoint's retries never
-  block a healthy webhook) with bounded exponential backoff (≤5 attempts,
-  20/40/80/160ms) and a 5s per-attempt timeout; on exhaustion it logs +
-  increments `unidb_webhook_delivery_failures_total` and the batch's durable
-  offset still advances (dead endpoint can't wedge the stream). **Correctness
-  finding caught before shipping:** acking unconditionally regardless of
-  whether any webhook was registered would have created a permanent
-  `__webhooks__` row in `__consumers__` that participates in
-  `vacuum_events`'s "reclaim once every registered consumer has acked"
-  horizon — this would have broken `tests/server_enrich.rs::events_vacuum_
-  reclaims_fully_acked_events` (asserts `reclaimed == 0` before any consumer
-  acks). Fixed by gating the whole poll/ack cycle on `list_webhooks()` being
-  non-empty, so a server with the feature unused never touches
-  `__events__`/`__consumers__` at all. HMAC-SHA256 is hand-rolled (RFC 2104,
-  RFC-4231-vector-tested) rather than routed through the crate's vendored
-  `hmac`/`sha2` — `hmac = "0.13"` requires `digest` 0.11-shaped hashes but the
-  vendored `sha2 = "0.10"` only implements `digest` 0.10's traits (two
-  semver-incompatible `digest` copies coexist in the dependency graph; only
-  the `sha1`+`hmac` pairing already used by MFA's HOTP happens to line up).
-  10 new tests (`tests/item141_webhooks.rs`, local mock axum receiver, no real
-  network) + `server_events` 10/10 unchanged + crash 54/54 + clippy/fmt clean
-  + plain `cargo test --no-run` unaffected (module is `server`-feature-gated).
-  Noted but out of scope: a pre-existing, unrelated flaky test
-  (`server_enrich.rs::cursor_expires_on_idle_and_can_be_dropped_early`, a
-  tight 300ms-idle/1200ms-sleep timing assertion) reproduces under parallel
-  `cargo test` on this sandbox's 4 cores with or without this change
-  (confirmed via `git stash`) — not a regression, not touched. Docs:
-  `docs/REST_API.md` new "Database webhooks" section (routes, envelope,
-  signature header, vault secret resolution, retry/failure-isolation
-  contract, the vacuum-horizon caveat, and an explicit note distinguishing
-  this from the separate pre-existing `unidb-dispatch` crate's `WebhookSink`
-  — same feature name, different mechanism: that one is an app-embedded Rust
-  library, this one is the REST-admin-managed, in-server feature), `README.md`
-  bullet + curl example, `137`'s Wave-2 line marked in-progress. `141`'s own
-  Status left `IN PROGRESS` (orchestrator flips on merge, per convention).
-
-- **2026-08-01 — item 139 (`/rest/v1` count + `Prefer` response controls) implemented, committed to branch (Status left IN PROGRESS — orchestrator flips on merge).**
-  Wave-1 free-roadmap item (137). `Prefer: count=exact` on `GET /rest/v1/<table>` runs a
-  second `SELECT COUNT(*) … [WHERE <same filters/binds>]` through the identical enforced
-  `run_stmt` path (RLS/grants apply — a caller seeing 3/10 rows gets `/3`) and reports
-  `Content-Range: <from>-<to>/<total>`; omitting the header costs nothing extra (byte-identical
-  to pre-139). `Prefer: return=representation|minimal` on `POST`/`PATCH`/`DELETE` appends
-  `RETURNING *` (representation, merged across the `in.(...)` multi-statement expansion via a
-  new `merge_rows`) or returns an empty `201`/`204` (minimal); no `Prefer` keeps the exact
-  pre-139 count-body response. REST-layer only — no SQL-engine change (RETURNING already
-  existed, item 19). 16 new tests (`tests/item139_rest_count_prefer.rs`) + `server_rest` 30/30
-  unchanged + crash 54/54 + clippy/fmt clean. Docs: `docs/REST_API.md` new "Response controls"
-  section, `README.md` bullet, `137`'s Wave-1 line split (upsert stays separate/out of scope —
-  no `ON CONFLICT` in the engine).
+- **2026-08-01 — Supabase free-parity continuation (items 132–145) SHIPPED; 15 PRs #235–#247 + dev-inbox (145) pending merge.**
+  Everything on the free/self-hostable roadmap (`docs/backlog/137`) that needs no paid third-party,
+  built as verified per-PR merges, all **plan-time/control-plane → crash 54/54 by construction**:
+  132 realtime broadcast+presence · 133 GraphQL mutations · 135 server-full fixes · 136 /rest/v1
+  embed filter/order · 138 email transport (SMTP+dev-log) + password-reset + magic-link · 139 REST
+  count=exact/`Prefer` · 140 realtime channel-authz (role/topic-glob, opt-in `UNIDB_REALTIME_REQUIRE_AUTHZ`,
+  audited bypass) · 141 database webhooks (durable consumer, HMAC-signed, retry-then-skip) · 142 auth
+  admin API (`/auth/admin/users`, ban, app/user metadata, last-superuser guards) · 143 HIBP
+  leaked-password (opt-in, fail-open) + 5 OAuth presets · 144 cron scheduled jobs (`/cron/jobs`,
+  `run_as` RLS parity) · 145 `GET/DELETE /auth/dev-inbox` (superuser + dev-transport-only). Plus
+  **unidb-js SDK completion** (storage/GraphQL/broadcast/presence, 55/55) + npm CI/publish workflows
+  pushed to `sagarm85/unidb-js`. Pattern: file `NN_` spec → Sonnet agent → independent verify (build +
+  clippy --all-targets + `cargo test --no-run` no-features + crash 54/54 + targeted/regression) →
+  reset-author, force-with-lease push, squash-merge. **Held for design/user go-ahead:** GraphQL
+  subscriptions (WebSocket-vs-SSE call), the engine-core cluster (stored functions → RPC/triggers/
+  upsert — ACID write-path), storage TUS/image-transforms, SAML. **Next filed:** 146 JWT key rotation.
+  (The transient per-item "committed to branch" working notes were consolidated here on merge; the
+  durable per-item detail lives in each `docs/backlog/NN_*.md` file's SHIPPED status + `PROGRESS`.)
 
 - **2026-08-01 (session close) — items 132 (realtime broadcast/presence) + 133 (GraphQL mutations) SHIPPED; all remaining Supabase-parity work consolidated in backlog item 134 for a fresh session.**
   Two follow-ups to the 120–131 core shipped + merged this session: **133** (PR #235) — a GraphQL

@@ -1207,6 +1207,34 @@ pub fn slot_to_json(info: &crate::replication::SlotInfo) -> serde_json::Value {
     })
 }
 
+// ── item 145: dev-inbox read route ──────────────────────────────────────
+
+/// Query params for `GET /auth/dev-inbox?limit=` (item 145). `limit`
+/// defaults to 50 (capped at 500), same posture as
+/// [`AdminUserListQuery`]/`handlers::DEV_INBOX_DEFAULT_LIMIT`.
+#[derive(Debug, Default, Deserialize)]
+pub struct DevInboxQuery {
+    pub limit: Option<usize>,
+}
+
+/// One line of the dev-inbox JSONL (item 145), returned by
+/// `GET /auth/dev-inbox` newest-first. Field-for-field the shape
+/// `email::LogTransport::send` writes (`to`/`subject`/`text_body`/
+/// `html_body`/`ts`) — `ts` is unix seconds the line was appended.
+/// `#[serde(default)]` on `html_body`/`ts` so a line captured before item
+/// 145 added `ts` (or any hand-edited/older line) still parses rather than
+/// being skipped as malformed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DevInboxEntry {
+    pub to: String,
+    pub subject: String,
+    pub text_body: String,
+    #[serde(default)]
+    pub html_body: Option<String>,
+    #[serde(default)]
+    pub ts: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1237,6 +1265,36 @@ mod tests {
         let req2: SqlRequest =
             serde_json::from_value(json!({"sql": "SELECT $1", "params": [7]})).unwrap();
         assert_eq!(req2.params.len(), 1);
+    }
+
+    #[test]
+    fn dev_inbox_entry_parses_full_and_missing_ts_lines() {
+        // A full line as `LogTransport::send` writes it (item 145's `ts`
+        // field plus the pre-existing `from`, which the DTO doesn't need
+        // and serde silently ignores).
+        let full: DevInboxEntry = serde_json::from_value(json!({
+            "to": "user@example.test",
+            "from": "unidb@localhost",
+            "subject": "Reset your password",
+            "text_body": "token=abc123",
+            "html_body": "<p>token=abc123</p>",
+            "ts": 1_700_000_000u64,
+        }))
+        .unwrap();
+        assert_eq!(full.to, "user@example.test");
+        assert_eq!(full.ts, 1_700_000_000);
+        assert_eq!(full.html_body.as_deref(), Some("<p>token=abc123</p>"));
+
+        // A line missing `ts`/`html_body` (older format, or hand-written)
+        // still parses rather than being treated as malformed.
+        let partial: DevInboxEntry = serde_json::from_value(json!({
+            "to": "user@example.test",
+            "subject": "Subject",
+            "text_body": "Body",
+        }))
+        .unwrap();
+        assert_eq!(partial.ts, 0);
+        assert!(partial.html_body.is_none());
     }
 
     #[test]
