@@ -70,13 +70,26 @@
 //! there is no code path from a client-supplied string into this SQL text).
 //! A non-finite float (`NaN`/`Infinity`) is rejected before formatting.
 //!
-//! **Deferred (v1 scope, noted per the C4 backlog spec):** mutations,
-//! subscriptions, aggregations, cursor-based pagination, and combining
-//! `near`/`edges` traversal with the root field's filter/order/limit
-//! machinery. Per-field resolution can also N+1 (one enforced statement per
-//! resolved field/row) — acceptable for a v1 whose correctness anchor is
-//! "every field goes through the real enforced path," per this
-//! workstream's explicit scope note.
+//! **Deferred (v1 scope, noted per the C4 backlog spec):** subscriptions,
+//! aggregations, cursor-based pagination, and combining `near`/`edges`
+//! traversal with the root field's filter/order/limit machinery. Per-field
+//! resolution can also N+1 (one enforced statement per resolved field/row) —
+//! acceptable for a v1 whose correctness anchor is "every field goes through
+//! the real enforced path," per this workstream's explicit scope note.
+//!
+//! **Item 133 — mutations:** a `Mutation` root (`insert_<t>`/`update_<t>`/
+//! `delete_<t>` per eligible table) was added on top of the read-only v1
+//! above, following the exact same one rule: every mutation resolver builds
+//! a parameterized `INSERT`/`UPDATE`/`DELETE ... RETURNING <requested
+//! sub-fields>` statement and runs it through [`run_stmt`]/[`run_stmts`] —
+//! the identical `authorize_sql_as_principal` + `execute_sql_params_as_principal`
+//! path the read side and `/rest/v1`/`/sql` already use. `RETURNING`'s
+//! column list is authorized exactly like a `SELECT` projection
+//! (`Engine::check_returning` in `lib.rs`), so an ungranted column in a
+//! mutation's selection set is denied identically to requesting it via
+//! `/sql`'s own `RETURNING` clause — no new enforcement logic, no new write
+//! path. See [`build_insert_field`]/[`build_update_field`]/
+//! [`build_delete_field`] and their doc comments.
 
 use std::collections::{HashMap, HashSet};
 
@@ -88,7 +101,7 @@ use async_graphql::{
     Value as GqlValue,
 };
 use axum::{extract::State, Extension, Json};
-use serde_json::Value as JsonValue;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::{
     catalog::{ColumnDef, ColumnType, TableDef},
@@ -101,8 +114,9 @@ use super::{
     dto,
     error::{map_status, ApiError},
     rest_resource::{
-        append_where, parse_order_value, quote_ident, run_stmt, strip_id_suffix, table_ident,
-        validate_column, Filter, ParsedOp, Relation,
+        append_where, build_assignments, extract_single_in, parse_order_value, quote_ident,
+        run_stmt, run_stmts, strip_id_suffix, table_ident, validate_column, Filter, InFilter,
+        ParsedOp, Relation,
     },
     AppState,
 };
@@ -230,7 +244,13 @@ async fn build_schema(state: &AppState, principal: &AuthPrincipal) -> Result<Sch
 
     let mut relations_by_table: HashMap<String, Vec<(String, Relation)>> = HashMap::new();
     let mut query = Object::new("Query");
-    let mut builder = Schema::build("Query", None, None)
+    // Item 133: a `Mutation` root is only registered when at least one table
+    // is eligible — an empty `Object` (zero fields) is an invalid GraphQL
+    // type, so a schema with no eligible tables stays query-only, exactly as
+    // it was pre-133.
+    let mut mutation = Object::new("Mutation");
+    let has_mutation_fields = !eligible_defs.is_empty();
+    let mut builder = Schema::build("Query", has_mutation_fields.then_some("Mutation"), None)
         .register(Scalar::new("JSON"))
         .register(build_edge_type())
         .register(build_edge_direction_enum())
@@ -244,9 +264,16 @@ async fn build_schema(state: &AppState, principal: &AuthPrincipal) -> Result<Sch
         for (field_name, column) in near_field_names(def) {
             query = query.field(build_near_field(&field_name, &def.name, &def.name, &column));
         }
+        mutation = mutation
+            .field(build_insert_field(def))
+            .field(build_update_field(def))
+            .field(build_delete_field(def));
         relations_by_table.insert(def.name.clone(), relations);
     }
     builder = builder.register(query);
+    if has_mutation_fields {
+        builder = builder.register(mutation);
+    }
     builder = builder.data(std::sync::Arc::new(SchemaCatalog {
         defs: eligible,
         relations: relations_by_table,
@@ -727,7 +754,15 @@ const FILTER_SUFFIXES: [(&str, ParsedOpCtor); 7] = [
     ("_ilike", ParsedOp::Ilike),
 ];
 
-fn add_filter_arguments(mut field: Field, def: &TableDef) -> Field {
+/// The per-column filter-argument matrix (`<col>`/`_neq`/`_gt`/.../`_in`/
+/// `_is_null`) only — factored out of [`add_filter_arguments`] so item 133's
+/// `update_<t>`/`delete_<t>` mutation fields can take the same filter
+/// arguments as the root query field *without* also inheriting `orderBy`/
+/// `limit`/`offset`, which this engine's `UPDATE`/`DELETE` grammar has no
+/// concept of (see `rest_resource.rs`'s module doc on `UPDATE`/`DELETE`'s
+/// "simple WHERE" grammar) — accepting them here would silently be a no-op
+/// rather than the 400 an unrecognized argument should be.
+fn add_column_filter_arguments(mut field: Field, def: &TableDef) -> Field {
     for col in def.columns.iter().filter(|c| !c.dropped) {
         if !filterable(&col.ty) {
             continue;
@@ -750,6 +785,10 @@ fn add_filter_arguments(mut field: Field, def: &TableDef) -> Field {
         ));
     }
     field
+}
+
+fn add_filter_arguments(field: Field, def: &TableDef) -> Field {
+    add_column_filter_arguments(field, def)
         .argument(InputValue::new("orderBy", TypeRef::named(TypeRef::STRING)))
         .argument(InputValue::new("limit", TypeRef::named(TypeRef::INT)))
         .argument(InputValue::new("offset", TypeRef::named(TypeRef::INT)))
@@ -910,6 +949,303 @@ fn build_query_field(def: &TableDef) -> Field {
         },
     );
     add_filter_arguments(field, def)
+}
+
+// ── mutation field builders (item 133) ──────────────────────────────────────
+
+/// A `values`/`set` `JSON!` argument -> its JSON object body. Reuses
+/// `async_graphql::Value::into_json` to convert the already-parsed GraphQL
+/// argument (never re-parses text, unlike REST's [`super::rest_resource`]
+/// handlers which parse a raw request body) — the
+/// resulting `serde_json::Value` then flows through exactly the same
+/// [`dto::json_to_literal`] mapping REST's JSON bodies use, so a string,
+/// number, bool, object, or array value binds identically either way. An
+/// argument that isn't a JSON object (e.g. `values: 5` or `values: [1,2]`) is
+/// rejected the same way REST rejects a non-object `PATCH`/`POST` body.
+fn json_object_arg(
+    args: &async_graphql::dynamic::ObjectAccessor,
+    name: &str,
+) -> async_graphql::Result<JsonMap<String, JsonValue>> {
+    let json = args
+        .try_get(name)?
+        .as_value()
+        .clone()
+        .into_json()
+        .map_err(|e| async_graphql::Error::new(format!("invalid JSON for `{name}`: {e}")))?;
+    match json {
+        JsonValue::Object(m) => Ok(m),
+        other => Err(async_graphql::Error::new(format!(
+            "`{name}` must be a JSON object, got {other}"
+        ))),
+    }
+}
+
+/// Concatenate the `Rows` results of a (possibly multi-statement, see
+/// [`build_update_stmts`]/[`build_delete_stmts`]) `run_stmts` call into one
+/// flat list of resolver-ready [`FieldValue`]s — the `update_<t>`/
+/// `delete_<t>` mutations return one logical list, exactly like
+/// `rest_resource::merge_counts` sums one logical count, just concatenating
+/// rows instead of summing counts (a mutation's caller wants back *what*
+/// changed, where `PATCH`/`DELETE`'s count-based REST response only needs
+/// *how many*). A non-`Rows` result (shouldn't happen — every statement built
+/// here always carries `RETURNING`) is skipped rather than erroring the
+/// whole mutation.
+fn merge_returned_rows(results: Vec<ExecResult>) -> Vec<FieldValue<'static>> {
+    let mut out = Vec::new();
+    for r in results {
+        if let ExecResult::Rows { columns, rows } = r {
+            out.extend(rows_to_field_values(&columns, rows));
+        }
+    }
+    out
+}
+
+/// `insert_<t>(values: JSON!): <T>` — the GraphQL analog of `POST
+/// /rest/v1/<t>`. Builds and runs exactly one `INSERT ... RETURNING
+/// <requested sub-fields>` through the same enforced [`run_stmt`] path as
+/// every other field in this module: `values`' JSON keys are catalog-
+/// validated + quoted column names (via [`validate_column`]/[`table_ident`],
+/// an unknown column is the same `COLUMN_NOT_FOUND` REST returns), its
+/// values are `$n` binds (never interpolated), and the RETURNING projection
+/// is exactly the mutation's requested sub-fields (never a blanket `*`) so a
+/// caller only needs a `SELECT` grant on what it reads back — this is
+/// `Engine::check_returning` (`lib.rs`), the identical machinery `/sql`'s own
+/// `RETURNING` clause is authorized through. Single-row only in v1 (a bulk
+/// `[JSON!]` variant is a documented non-goal, see the backlog spec) —
+/// unlike REST's `POST`, which also accepts a JSON array.
+fn build_insert_field(def: &TableDef) -> Field {
+    let closure_def = def.clone();
+    Field::new(
+        format!("insert_{}", def.name),
+        TypeRef::named(def.name.clone()),
+        move |ctx| {
+            let def = closure_def.clone();
+            FieldFuture::new(async move {
+                let state = ctx.data::<AppState>()?;
+                let principal = ctx.data::<AuthPrincipal>()?;
+                let catalog = ctx.data::<std::sync::Arc<SchemaCatalog>>()?;
+                let relations = catalog
+                    .relations
+                    .get(&def.name)
+                    .cloned()
+                    .unwrap_or_default();
+
+                let values = json_object_arg(&ctx.args, "values")?;
+                if values.is_empty() {
+                    return Err(async_graphql::Error::new(
+                        "`values` must have at least one column",
+                    ));
+                }
+                let columns: Vec<String> = values.keys().cloned().collect();
+                for c in &columns {
+                    validate_column(&def, c).map_err(api_err_to_gql)?;
+                }
+                let mut binds: Vec<Literal> = Vec::with_capacity(columns.len());
+                let placeholders: Vec<String> = columns
+                    .iter()
+                    .map(|c| {
+                        binds.push(dto::json_to_literal(&values[c]));
+                        format!("${}", binds.len())
+                    })
+                    .collect();
+
+                let projection =
+                    requested_projection(ctx.field().selection_set(), &def, &relations);
+                // Column list deliberately unquoted — same `sql/parser.rs`
+                // stringification quirk `rest_resource::build_insert`
+                // documents (`convert_insert` re-includes quote characters
+                // instead of stripping them); `columns` is already
+                // catalog-validated above, so this stays injection-safe.
+                let sql = format!(
+                    "INSERT INTO {} ({}) VALUES ({}) RETURNING {projection}",
+                    table_ident(&def.name),
+                    columns.join(", "),
+                    placeholders.join(", "),
+                );
+
+                let result = run_stmt(state, principal, sql, binds)
+                    .await
+                    .map_err(api_err_to_gql)?;
+                let row = match result {
+                    ExecResult::Rows { columns, rows } => rows
+                        .into_iter()
+                        .next()
+                        .map(|r| FieldValue::owned_any(row_from(&columns, r))),
+                    _ => None,
+                };
+                Ok(row)
+            })
+        },
+    )
+    .argument(InputValue::new("values", TypeRef::named_nn("JSON")))
+}
+
+/// Build the `UPDATE ... RETURNING <projection>` statement(s) for
+/// `update_<t>`, mirroring `rest_resource::patch_collection`'s `IN`-list
+/// expansion (this engine's `UPDATE` grammar has no native `IN` support —
+/// see `rest_resource.rs`'s module doc) but adding a `RETURNING` clause to
+/// every generated statement so each expanded statement contributes its
+/// updated rows, not just a count.
+fn build_update_stmts(
+    def: &TableDef,
+    assignments: &JsonMap<String, JsonValue>,
+    scalar_filters: &[Filter],
+    in_filter: Option<InFilter>,
+    projection: &str,
+) -> Result<Vec<(String, Vec<Literal>)>, ApiError> {
+    let one_stmt = |filters: &[Filter]| -> Result<(String, Vec<Literal>), ApiError> {
+        let mut binds = Vec::new();
+        let assign_sql = build_assignments(def, assignments, &mut binds)?;
+        let where_sql = append_where(filters, &mut binds);
+        let mut sql = format!("UPDATE {} SET {assign_sql}", table_ident(&def.name));
+        if let Some(w) = where_sql {
+            sql.push_str(" WHERE ");
+            sql.push_str(&w);
+        }
+        sql.push_str(" RETURNING ");
+        sql.push_str(projection);
+        Ok((sql, binds))
+    };
+    match in_filter {
+        None => Ok(vec![one_stmt(scalar_filters)?]),
+        Some((col, values)) => values
+            .into_iter()
+            .map(|v| {
+                let mut filters = scalar_filters.to_vec();
+                filters.push(Filter {
+                    column: col.clone(),
+                    op: ParsedOp::Eq(v),
+                });
+                one_stmt(&filters)
+            })
+            .collect(),
+    }
+}
+
+/// `update_<t>(<filter args>, set: JSON!): [<T>!]` — the GraphQL analog of
+/// `PATCH /rest/v1/<t>?<filters>`. Filter arguments are the exact same typed
+/// matrix [`build_query_field`] exposes ([`collect_filters`]/
+/// [`add_column_filter_arguments`]); `set`'s JSON keys/values follow
+/// [`build_insert_field`]'s column-validated / bind-parameterized rule
+/// exactly. Returns every updated row's requested sub-fields via
+/// `RETURNING` — see [`build_update_stmts`] for the `IN`-filter multi-
+/// statement expansion, run as one atomic call to [`run_stmts`] (one
+/// transaction, same as `PATCH`).
+fn build_update_field(def: &TableDef) -> Field {
+    let closure_def = def.clone();
+    let field = Field::new(
+        format!("update_{}", def.name),
+        TypeRef::named_nn_list(def.name.clone()),
+        move |ctx| {
+            let def = closure_def.clone();
+            FieldFuture::new(async move {
+                let state = ctx.data::<AppState>()?;
+                let principal = ctx.data::<AuthPrincipal>()?;
+                let catalog = ctx.data::<std::sync::Arc<SchemaCatalog>>()?;
+                let relations = catalog
+                    .relations
+                    .get(&def.name)
+                    .cloned()
+                    .unwrap_or_default();
+
+                let assignments = json_object_arg(&ctx.args, "set")?;
+                if assignments.is_empty() {
+                    return Err(async_graphql::Error::new(
+                        "`set` must contain at least one column assignment",
+                    ));
+                }
+
+                let filters = collect_filters(&def, &ctx.args)?;
+                let (scalar_filters, in_filter) =
+                    extract_single_in(filters).map_err(api_err_to_gql)?;
+                let projection =
+                    requested_projection(ctx.field().selection_set(), &def, &relations);
+                let stmts =
+                    build_update_stmts(&def, &assignments, &scalar_filters, in_filter, &projection)
+                        .map_err(api_err_to_gql)?;
+
+                let results = run_stmts(state, principal, stmts)
+                    .await
+                    .map_err(api_err_to_gql)?;
+                Ok(Some(FieldValue::list(merge_returned_rows(results))))
+            })
+        },
+    );
+    add_column_filter_arguments(field, def)
+        .argument(InputValue::new("set", TypeRef::named_nn("JSON")))
+}
+
+/// [`build_update_stmts`]'s `DELETE` analog — same `IN`-expansion shape,
+/// with `RETURNING <projection>` in place of `SET <assignments>`.
+fn build_delete_stmts(
+    def: &TableDef,
+    scalar_filters: &[Filter],
+    in_filter: Option<InFilter>,
+    projection: &str,
+) -> Vec<(String, Vec<Literal>)> {
+    let one_stmt = |filters: &[Filter]| -> (String, Vec<Literal>) {
+        let mut binds = Vec::new();
+        let where_sql = append_where(filters, &mut binds);
+        let mut sql = format!("DELETE FROM {}", table_ident(&def.name));
+        if let Some(w) = where_sql {
+            sql.push_str(" WHERE ");
+            sql.push_str(&w);
+        }
+        sql.push_str(" RETURNING ");
+        sql.push_str(projection);
+        (sql, binds)
+    };
+    match in_filter {
+        None => vec![one_stmt(scalar_filters)],
+        Some((col, values)) => values
+            .into_iter()
+            .map(|v| {
+                let mut filters = scalar_filters.to_vec();
+                filters.push(Filter {
+                    column: col.clone(),
+                    op: ParsedOp::Eq(v),
+                });
+                one_stmt(&filters)
+            })
+            .collect(),
+    }
+}
+
+/// `delete_<t>(<filter args>): [<T>!]` — the GraphQL analog of `DELETE
+/// /rest/v1/<t>?<filters>`. Same filter-argument matrix and `RETURNING`-
+/// projection rule as [`build_update_field`], minus the `set` argument.
+fn build_delete_field(def: &TableDef) -> Field {
+    let closure_def = def.clone();
+    let field = Field::new(
+        format!("delete_{}", def.name),
+        TypeRef::named_nn_list(def.name.clone()),
+        move |ctx| {
+            let def = closure_def.clone();
+            FieldFuture::new(async move {
+                let state = ctx.data::<AppState>()?;
+                let principal = ctx.data::<AuthPrincipal>()?;
+                let catalog = ctx.data::<std::sync::Arc<SchemaCatalog>>()?;
+                let relations = catalog
+                    .relations
+                    .get(&def.name)
+                    .cloned()
+                    .unwrap_or_default();
+
+                let filters = collect_filters(&def, &ctx.args)?;
+                let (scalar_filters, in_filter) =
+                    extract_single_in(filters).map_err(api_err_to_gql)?;
+                let projection =
+                    requested_projection(ctx.field().selection_set(), &def, &relations);
+                let stmts = build_delete_stmts(&def, &scalar_filters, in_filter, &projection);
+
+                let results = run_stmts(state, principal, stmts)
+                    .await
+                    .map_err(api_err_to_gql)?;
+                Ok(Some(FieldValue::list(merge_returned_rows(results))))
+            })
+        },
+    );
+    add_column_filter_arguments(field, def)
 }
 
 /// Many-to-one FK field: `alias: RefType` (nullable — `NULL` FK value, or an

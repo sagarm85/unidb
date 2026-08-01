@@ -380,9 +380,11 @@ pub(super) fn append_where(filters: &[Filter], binds: &mut Vec<Literal>) -> Opti
 /// only the first, since the combinatorial expansion isn't implemented.
 /// A single `in.(...)` filter pulled off a filter list: its column name and
 /// the parenthesized value list.
-type InFilter = (String, Vec<String>);
+pub(super) type InFilter = (String, Vec<String>);
 
-fn extract_single_in(filters: Vec<Filter>) -> Result<(Vec<Filter>, Option<InFilter>), ApiError> {
+pub(super) fn extract_single_in(
+    filters: Vec<Filter>,
+) -> Result<(Vec<Filter>, Option<InFilter>), ApiError> {
     let mut scalar = Vec::with_capacity(filters.len());
     let mut found: Option<(String, Vec<String>)> = None;
     for f in filters {
@@ -415,7 +417,7 @@ fn extract_single_in(filters: Vec<Filter>) -> Result<(Vec<Filter>, Option<InFilt
 /// quote characters instead of stripping them, so a quoted target fails to
 /// resolve. `col` is still catalog-validated first, so this carries no
 /// injection surface.
-fn build_assignments(
+pub(super) fn build_assignments(
     def: &TableDef,
     body: &JsonMap<String, JsonValue>,
     binds: &mut Vec<Literal>,
@@ -490,7 +492,7 @@ fn build_insert(
 /// `current_user()`/`auth.uid()`/`auth.jwt()` substitution, and table/column
 /// grants all apply here exactly as they do for `/sql` — nothing in this
 /// module re-implements or bypasses any of it.
-async fn run_stmts(
+pub(super) async fn run_stmts(
     state: &AppState,
     principal: &AuthPrincipal,
     stmts: Vec<(String, Vec<Literal>)>,

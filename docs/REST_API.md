@@ -2193,9 +2193,9 @@ columns, types, PK/FK) — `{"openapi":"3.0.3","info":{...},"paths":{...},
 user table with `get`/`post`/`patch`/`delete` operations. No auth required
 beyond the standard JWT bearer.
 
-### C4 — GraphQL (`POST /graphql`, item 123 C4)
+### C4 — GraphQL (`POST /graphql`, item 123 C4; mutations item 133)
 
-A schema-derived, **read-only (v1)** GraphQL endpoint — the `pg_graphql`
+A schema-derived, **read + write** GraphQL endpoint — the `pg_graphql`
 analog, except this one also exposes **graph edge traversal** and **vector
 similarity** as first-class fields, not just FK relationships (unidb's
 differentiator over a relational-only Supabase/PostgREST stack). Mounted
@@ -2279,11 +2279,63 @@ Identifiers (table/column/field names) come only from the catalog-derived
 schema — an unrecognized `orderBy` column is rejected via the same
 `validate_column` catalog check `/rest/v1` uses, never built into SQL text.
 
-**Deferred (v1 scope, not built):** mutations, subscriptions, aggregations,
-cursor-based pagination, and combining `near`/`edges` with the root field's
-filter/order/limit machinery. Per-field resolution can N+1 (one enforced
-statement per resolved field/row) — acceptable for a v1 whose correctness
-anchor is that every field goes through the real enforced path.
+**Mutations (item 133) — a `Mutation` root alongside `Query`, one field set
+per eligible table** (same eligibility filter as the query side; a schema
+with zero eligible tables has no `Mutation` root at all, since a GraphQL
+object type must have at least one field):
+
+- **`insert_<table>(values: JSON!): <Table>`** — single-row insert, the
+  analog of `POST /rest/v1/<table>`. `values`' JSON object keys are
+  catalog-validated + quoted column names (an unknown key is the same
+  `COLUMN_NOT_FOUND` REST returns); its values bind as `$n` parameters. Only
+  a single JSON object is accepted in v1 (unlike REST's `POST`, which also
+  takes a JSON array for a batch insert).
+- **`update_<table>(<filter args>, set: JSON!): [<Table>!]`** — the analog of
+  `PATCH /rest/v1/<table>?<filters>`. `<filter args>` is the exact same typed
+  matrix the root query field exposes (`<col>`/`_neq`/`_gt`/`_gte`/`_lt`/
+  `_lte`/`_like`/`_ilike`/`_in`/`_is_null`) minus `orderBy`/`limit`/`offset`
+  (this engine's `UPDATE` grammar has no such concept). `set`'s JSON object
+  follows the same column-validated / bind-parameterized rule as `values`.
+  Returns every updated row.
+- **`delete_<table>(<filter args>): [<Table>!]`** — the analog of `DELETE
+  /rest/v1/<table>?<filters>`. Same filter-argument matrix as `update_<t>`.
+  Returns every deleted row.
+
+```graphql
+mutation {
+  insert_items(values: { id: 3, name: "cherry", price: 30 }) {
+    id name price
+  }
+}
+mutation {
+  update_items(price_gt: 10, set: { price: 0 }) { id price }
+}
+mutation {
+  delete_items(id: 2) { id name }
+}
+```
+
+**Enforcement — identical to the query side, no new write path:** each
+mutation resolver builds one `INSERT`/`UPDATE`/`DELETE ... RETURNING
+<requested sub-fields>` statement and runs it through the exact same
+`run_stmt`/`run_stmts` -> `authorize_sql_as_principal` +
+`execute_sql_params_as_principal` path the query side, `/rest/v1`, and
+`/sql` all share. `RETURNING`'s column list is authorized exactly like a
+`SELECT` projection (`Engine::check_returning`) — a mutation's selection set
+asking for a column the caller lacks a `SELECT` grant on is denied
+identically to requesting that column via `/sql`'s own `RETURNING` clause,
+even when the caller *does* hold the `INSERT`/`UPDATE` grant needed to write
+it. `WITH CHECK`/RLS `FOR INSERT`/`FOR UPDATE`/`FOR ALL` policies apply on
+the write path exactly as they do over `/sql` — a violating mutation is
+rejected with the same `SQL_PLAN_ERROR` either way. See
+`tests/item133_graphql_mutations.rs` for the parity proofs.
+
+**Deferred (v1 scope, not built):** subscriptions, aggregations,
+cursor-based pagination, combining `near`/`edges` with the root field's
+filter/order/limit machinery, and mutation-side upsert/`on conflict` sugar.
+Per-field resolution can N+1 (one enforced statement per resolved
+field/row) — acceptable for a v1 whose correctness anchor is that every
+field goes through the real enforced path.
 
 ---
 

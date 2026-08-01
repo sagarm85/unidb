@@ -28,7 +28,9 @@
   - **Auto API (123, C):** PostgREST-style `/rest/v1/<table>` CRUD+filters (C1, injection-safe
     `$n` binds through the existing RLS/grant path), embedded FK expansion (C2,
     `select=id,customer(name)`), `GET /rest/v1/` OpenAPI (C3), and a schema-derived GraphQL
-    endpoint with FK + graph-edge + vector-`near` fields (C4/130, per-field grant correctness).
+    endpoint with FK + graph-edge + vector-`near` fields (C4/130, per-field grant correctness),
+    now read+write via a `Mutation` root (`insert_/update_/delete_<t>`, item 133, same
+    enforced-SQL-path/RETURNING-projection-grant correctness).
   - **Realtime (E1):** per-subscriber RLS-filtered SSE on `/events/subscribe` (service_role
     bypass audited, DELETE filters on the before-image, fail-closed).
   - **Storage (F1/125):** per-object authorization on `/storage/*` (public/private buckets,
@@ -401,6 +403,45 @@ be raised with the user directly, not assumed.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-08-01 — item 133 (GraphQL mutations) implemented, committed to branch
+
+Added a `Mutation` root to the C4 GraphQL schema (`src/server/graphql.rs`):
+`insert_<t>(values: JSON!): <T>` / `update_<t>(<filter args>, set: JSON!):
+[<T>!]` / `delete_<t>(<filter args>): [<T>!]` per eligible table (same
+eligibility filter as the query side; a schema with zero eligible tables
+stays query-only — an empty GraphQL `Object` type is invalid, so `Mutation`
+is only registered when there's at least one field for it). Every resolver
+builds one `INSERT`/`UPDATE`/`DELETE ... RETURNING <requested sub-fields>`
+statement and runs it through the exact same `run_stmt`/`run_stmts` ->
+`authorize_sql_as_principal` + `execute_sql_params_as_principal` path the
+query side, `/rest/v1`, and `/sql` already share — no new write path, no
+engine change. `RETURNING`'s column list turned out to already be
+authorized exactly like a `SELECT` projection (`Engine::check_returning` in
+`lib.rs`, pre-existing item-19 machinery) — the RETURNING-parity property
+came for free, not something this item had to build. Widened three more
+`rest_resource.rs` helpers to `pub(super)` for reuse: `build_assignments`,
+`extract_single_in`/`InFilter`, `run_stmts`. New `tests/
+item133_graphql_mutations.rs` (7 tests): insert/update/delete end-to-end
+returning the requested projection, `WITH CHECK`/RLS rejection parity with
+`/sql` (insert + update), and column-grant (RETURNING projection) denial
+parity with `/sql`, including a same-statement `/sql` comparison in each
+parity test. **Trap found while writing the WITH CHECK test:** a named
+`SUPERUSER` principal (e.g. `root` over the HTTP server) is *not* exempted
+from a table's own RLS `WITH CHECK` policy by the per-row INSERT check in
+`sql/executor.rs::exec_insert` — that check only bypasses for the embedded
+(`current_user: None`) caller or an explicit `service_role` claim, not for
+`is_effective_superuser` generally (unlike the plan-level `apply_rls` skip,
+which does cover named superusers). Not a bug introduced by this item and
+out of scope to fix here — noted as a possible pre-existing RLS-superuser
+inconsistency worth a future look; the test was adjusted to have the
+policy's own owner insert the seed row instead of `root`. All 7 verification
+gates green (crash 54/54, server_graphql/server_rest/server_authz all still
+pass unchanged). Docs updated: `docs/REST_API.md` C4 section (mutations
+documented in full), `README.md` GraphQL bullet, `docs/backlog/
+130_graphql_api.md` deferred-note + non-goals pointer to 133. Committed to
+the branch (not merged/PR'd — orchestrator flips `133_graphql_mutations.md`
+Status to SHIPPED on merge).
 
 ### 2026-08-01 — Supabase-parity build drained: 12 PRs merged (#222–#233), autonomous overnight
 
