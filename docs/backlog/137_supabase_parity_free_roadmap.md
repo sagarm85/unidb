@@ -123,8 +123,18 @@ queue** · unidb-js SDK v0.1. *(The last three are beyond Supabase.)*
   144's own doc labels itself a "Wave-2" item, but it is filed here under
   Wave 3 in this roadmap — flagged rather than silently reconciled either
   way; the classification doesn't change what shipped.
-  User-defined & materialized views · enums/domains/custom types · JWT
-  signing-key rotation remain unstarted.
+  User-defined & materialized views · enums/domains/custom types remain
+  unstarted.
+- **JWT signing-key rotation** (IN PROGRESS — item 146 implemented, status
+  flips to DONE on merge): a `kid` header (one-way truncated hash of the
+  signing key, never the key itself) on every issued token;
+  `UNIDB_JWT_SIGNING_KEY_PREVIOUS` (HS256) accepted verify-only so rotating
+  `UNIDB_JWT_SIGNING_KEY` doesn't mass-invalidate outstanding tokens — old
+  tokens verify during the grace window, new tokens sign under the current
+  key only; `UNIDB_JWT_PUBLIC_KEY_PREVIOUS` is the asymmetric analog,
+  listing every configured public key in the JWKS document under its own
+  `kid`. Control-plane only (`JwtConfig`), crash 54/54 — see
+  `docs/backlog/146_jwt_key_rotation.md`.
 - Storage: resumable **TUS uploads** · **image transformations** (local lib) ·
   full storage policy language · S3-compatible API surface.
 - **SAML / enterprise SSO** (no paid dependency our side; large).

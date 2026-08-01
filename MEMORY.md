@@ -438,6 +438,17 @@ be raised with the user directly, not assumed.
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-08-01 — item 146: JWT signing-key rotation grace window implemented
+
+`JwtConfig` (`src/server/auth.rs`) now holds an ordered key list (current,
+then optional previous) instead of a single key: issued tokens carry a `kid`
+(one-way truncated SHA-256 of the key, never the key itself);
+`UNIDB_JWT_SIGNING_KEY_PREVIOUS` (HS256) / `UNIDB_JWT_PUBLIC_KEY_PREVIOUS`
+(asymmetric, both keys listed in JWKS) are accepted verify-only so rotating
+the current key doesn't mass-invalidate outstanding tokens. All 7 gates
+green (crash 54/54, new `item146_jwt_rotation` 8/8, `item121_a5_a6`/
+`item121_auth_core` unchanged). Committed to branch, not merged.
+
 ### 2026-08-01 — item 142: Auth admin API (user management) implemented
 
 See the Current-status entry above for the full design writeup. Summary: consolidated

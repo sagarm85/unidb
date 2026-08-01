@@ -424,3 +424,9 @@ required-features = ["server"]
 name = "item144_cron"
 path = "tests/item144_cron.rs"
 required-features = ["server"]
+
+# Item 146: JWT signing-key rotation (kid + previous-key grace window).
+[[test]]
+name = "item146_jwt_rotation"
+path = "tests/item146_jwt_rotation.rs"
+required-features = ["server"]
