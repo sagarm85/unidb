@@ -1,7 +1,7 @@
 # Database webhooks (outbound HTTP on row change)
 
 **Type:** Improvement
-**Status:** IN PROGRESS
+**Status:** SHIPPED (2026-08-01, PR #244) — outbound HTTP on INSERT/UPDATE/DELETE via a background delivery worker (durable `__webhooks__` consumer over poll_events; only active while ≥1 webhook registered, so vacuum_events horizon is unaffected); CDC envelope + hand-rolled RFC-4231-tested HMAC-SHA256 `X-Unidb-Signature`; bounded-retry-then-skip (dead endpoint can't wedge the stream); superuser admin routes, vault-first secret, redacted. Strictly downstream of commit — crash 54/54.
 
 > Wave-2 free-roadmap item (`137`). Supabase "Database Webhooks" POST a change
 > event to an operator-configured HTTP endpoint on INSERT/UPDATE/DELETE. unidb
