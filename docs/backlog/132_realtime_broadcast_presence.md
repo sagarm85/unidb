@@ -1,7 +1,10 @@
 # Realtime Broadcast + Presence
 
 **Type:** Improvement
-**Status:** IN PROGRESS
+**Status:** SHIPPED (2026-08-01, PR #236) — in-memory Broadcast (per-topic
+`tokio::sync::broadcast`) + Presence (topic→key→state registry, connection-lifetime
+membership) over four JWT-gated SSE/POST routes; no engine/WAL/heap/catalog touch,
+crash 54/54. Channel-authorization policies = documented follow-up. See the file for detail.
 
 > Supabase-parity gap (item 120 follow-up). unidb's realtime today is
 > **Postgres-Changes-equivalent only**: `GET /events/subscribe` (SSE) streams

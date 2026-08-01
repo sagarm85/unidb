@@ -300,6 +300,11 @@ UNIDB_DATA_DIR=/var/lib/unidb cargo run --bin unidb-migrate -- migrations
 - Before/after row images on every change
 - Debezium and Supabase format adapters
 - Per-consumer lag observability via `/stats` and Prometheus gauges
+- Realtime Broadcast + Presence (item 132) — ephemeral, in-memory SSE
+  pub/sub (`/realtime/broadcast/*`) and per-topic presence tracking
+  (`/realtime/presence/*`), Supabase-Realtime-parity on top of the same DB
+  change stream above; never touches the WAL/heap (server restart drops it,
+  by design)
 
 **Operations and HA**
 - Segmented WAL (16 MiB segments) enabling replication slots

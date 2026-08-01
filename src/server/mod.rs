@@ -43,6 +43,7 @@ pub mod handlers;
 pub mod logs;
 pub mod oauth;
 pub mod rate_limit;
+pub mod realtime;
 pub mod rest_resource;
 pub mod router;
 pub mod sse;
@@ -135,6 +136,12 @@ pub struct AppState {
     /// `/auth/signup` behaves exactly as before this item shipped unless
     /// `UNIDB_CAPTCHA_PROTECT` explicitly names the endpoint.
     pub captcha: captcha::CaptchaConfig,
+    /// Realtime Broadcast + Presence hub (item 132). Purely in-memory and
+    /// ephemeral — never touches the engine/WAL/heap/catalog; see
+    /// `realtime.rs`'s module doc. Always present (no config gate — unlike
+    /// `storage`/`dev_login_jwt`/`oauth`, this has no external
+    /// configuration to be absent).
+    pub realtime: Arc<realtime::RealtimeState>,
 }
 
 /// Resolve the log directory the same way `src/bin/unidb-server.rs` does, so
@@ -176,6 +183,7 @@ impl AppState {
             allow_signup: false,
             oauth: oauth::OAuthConfig::empty(),
             captcha: captcha::CaptchaConfig::disabled(),
+            realtime: Arc::new(realtime::RealtimeState::new()),
         }
     }
 

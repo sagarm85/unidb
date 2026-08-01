@@ -30,8 +30,8 @@ use axum_prometheus::{metrics_exporter_prometheus::PrometheusHandle, PrometheusM
 use tower_http::{cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer};
 
 use crate::server::{
-    auth::JwtConfig, bulk, graphql, handlers, rate_limit::AuthRateLimiter, rest_resource, sse,
-    storage, AppState,
+    auth::JwtConfig, bulk, graphql, handlers, rate_limit::AuthRateLimiter, realtime, rest_resource,
+    sse, storage, AppState,
 };
 
 /// Production entry point: reads `UNIDB_AUTH_RATE_LIMIT` /
@@ -184,6 +184,27 @@ pub fn build_router_with_rate_limiter(
         // resolved field runs through the exact same enforced query path
         // `rest_resource`/`POST /sql` use (see `graphql.rs`'s module doc).
         .route("/graphql", post(graphql::post_graphql))
+        // ── Item 132: Realtime Broadcast + Presence ────────────────────────
+        // Same `require_jwt` layer as every other data-plane route below.
+        // v1 authorization: any authenticated principal may use any topic
+        // (no channel-authorization policy engine — see `realtime.rs`'s
+        // module doc and `docs/REST_API.md`).
+        .route(
+            "/realtime/broadcast/publish",
+            post(realtime::post_broadcast_publish),
+        )
+        .route(
+            "/realtime/broadcast/subscribe",
+            get(realtime::get_broadcast_subscribe),
+        )
+        .route(
+            "/realtime/presence/subscribe",
+            get(realtime::get_presence_subscribe),
+        )
+        .route(
+            "/realtime/presence/track",
+            post(realtime::post_presence_track),
+        )
         // ── Item 31: storage service routes (/storage/*) ──────────────────
         // All 7 routes return 503 when AppState::storage is None (unconfigured).
         // C1 list / C2 create buckets
