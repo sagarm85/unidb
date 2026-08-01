@@ -6,8 +6,8 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `143_…`**
-> (142 assigned 2026-08-01 to the auth-admin-API item below).
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `144_…`**
+> (143 assigned 2026-08-01 to the auth-hardening (HIBP+OAuth presets) item below).
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -162,7 +162,9 @@ Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 
 | 142 | `142_auth_admin_api.md` | Improvement | ✅ SHIPPED (2026-08-01, PR #245) — Wave-2: consolidated superuser `/auth/admin/users` REST surface (list+pagination, get, create, update, delete) + new per-user `banned` flag (rejected at login/refresh/email-flows, sessions revoked; short-TTL access JWT valid until expiry — documented) + `app_metadata`/`user_metadata` store. Reuses existing user/session/password machinery (items 121/124/138). Control-plane only — crash 54/54. |
 
-**Next new file → `143_…`.
+| 143 | `143_auth_hardening_hibp_oauth_presets.md` | Improvement | 🔄 IN PROGRESS — Wave-2 auth-hardening batch (2 small free items): (1) leaked-password protection via HaveIBeenPwned Pwned-Passwords range API (free, no key, k-anonymity — only the SHA-1 prefix leaves the server) enforced at signup/admin-create/patch/password-reset, opt-in `UNIDB_PASSWORD_HIBP_CHECK` (default off, fail-open on outage), `422 PASSWORD_COMPROMISED`; (2) recognized OAuth provider presets (Apple/Azure/GitLab/Discord/Facebook) added to item-128's already-agnostic flow — config-only, no new extraction code. Control-plane only — crash 54/54. |
+
+**Next new file → `144_…`.
 
 ## Next up — priority order (2026-07-23, post fresh-baseline bench)
 
