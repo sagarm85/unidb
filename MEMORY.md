@@ -12,6 +12,20 @@
 
 ## Current status
 
+- **2026-08-01 — item 139 (`/rest/v1` count + `Prefer` response controls) implemented, committed to branch (Status left IN PROGRESS — orchestrator flips on merge).**
+  Wave-1 free-roadmap item (137). `Prefer: count=exact` on `GET /rest/v1/<table>` runs a
+  second `SELECT COUNT(*) … [WHERE <same filters/binds>]` through the identical enforced
+  `run_stmt` path (RLS/grants apply — a caller seeing 3/10 rows gets `/3`) and reports
+  `Content-Range: <from>-<to>/<total>`; omitting the header costs nothing extra (byte-identical
+  to pre-139). `Prefer: return=representation|minimal` on `POST`/`PATCH`/`DELETE` appends
+  `RETURNING *` (representation, merged across the `in.(...)` multi-statement expansion via a
+  new `merge_rows`) or returns an empty `201`/`204` (minimal); no `Prefer` keeps the exact
+  pre-139 count-body response. REST-layer only — no SQL-engine change (RETURNING already
+  existed, item 19). 16 new tests (`tests/item139_rest_count_prefer.rs`) + `server_rest` 30/30
+  unchanged + crash 54/54 + clippy/fmt clean. Docs: `docs/REST_API.md` new "Response controls"
+  section, `README.md` bullet, `137`'s Wave-1 line split (upsert stays separate/out of scope —
+  no `ON CONFLICT` in the engine).
+
 - **2026-08-01 (session close) — items 132 (realtime broadcast/presence) + 133 (GraphQL mutations) SHIPPED; all remaining Supabase-parity work consolidated in backlog item 134 for a fresh session.**
   Two follow-ups to the 120–131 core shipped + merged this session: **133** (PR #235) — a GraphQL
   `Mutation` root (`insert_/update_/delete_<t>`) routed through the same enforced
@@ -419,6 +433,34 @@ be raised with the user directly, not assumed.
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-08-01 — item 139: `/rest/v1` count + `Prefer` response controls implemented
+
+Built on `src/server/rest_resource.rs` (item 123/C1's home). Added `parse_prefer` (case-
+insensitive, comma-separated, repeatable-header `Prefer` parsing; unknown tokens ignored per
+PostgREST posture) and `with_prefer_headers`/`build_content_range` for the response side. **GET**:
+when `count=exact` is present, a second `SELECT COUNT(*) FROM <table> [WHERE …]` reuses the exact
+same `filters`/`append_where` as the main query and runs through the same `run_stmt` (RLS/grants
+apply); `Content-Range` is computed from `offset`/returned-row-count/total and attached via
+`Response` (handler return type changed `Json<JsonValue>` -> `Response`, using
+`axum::response::IntoResponse`; router.rs needed no change — axum's method-router combinators
+don't require matching signatures across verbs). **POST/PATCH/DELETE**: `return=representation`
+appends `RETURNING *` to the generated statement(s) (same technique `graphql.rs`'s
+`insert_/update_/delete_<t>` mutations already use) and a new `merge_rows` helper (mirrors the
+existing `merge_counts`) folds the `in.(...)`-expansion's per-statement `RETURNING` rows into one
+result; `return=minimal` short-circuits to an empty `201`(POST)/`204`(PATCH,DELETE). No `Prefer`
+header takes every pre-139 code path unchanged — verified by dedicated regression tests plus the
+full untouched `server_rest` 30/30. New `tests/item139_rest_count_prefer.rs` (16 tests): exact
+`Content-Range` math (incl. `offset`, zero-row `*/0`), **RLS parity** (alice sees 3/10 rows,
+`/rest/v1` count matches a direct `SELECT COUNT(*)` as alice — not the unfiltered 10), unknown-
+`Prefer`-token tolerance, `return=` on all three mutation verbs incl. the `in.(...)`-expansion
+merge case. All 7 gates green: build/clippy/fmt clean, `cargo test --no-run` (no features) clean,
+item139 16/16, server_rest 30/30 unchanged, crash 54/54. Docs: `docs/REST_API.md` new "Response
+controls — `Prefer` header" section (documents the *pre-existing* no-`Prefer` default explicitly,
+since it differs from real PostgREST's 201/Location default — a deliberate "don't silently
+change it" call per the backlog spec), `README.md` bullet, `137`'s Wave-1 line split into 139
+(done) + upsert (still separately out of scope — no `ON CONFLICT` in the SQL engine). Left `139`'s
+Status as IN PROGRESS per orchestrator convention (flips to SHIPPED on merge).
+
 ### 2026-08-01 — item 135: `unidb-server-full` wiring fixes (memory storage + ConnectInfo), studio-reported
 
 The studio session, doing live verification, reported two real binary-specific bugs in
@@ -513,180 +555,6 @@ storage policy-DDL = documented follow-up. **Lesson:** an agent that "waits for 
 monitor" can hang indefinitely and never notify — check agent output-file mtime vs now; if idle
 >~30min with no process, take over and verify the tree directly rather than waiting.
 
-### 2026-07-31 — autonomous overnight: E1 merged (#224) + studio-unblocker batch shipped
-
-Overnight autonomous run (user asleep, auto-merge of verified PRs). **E1** (PR #224, `5b07420`):
-per-subscriber RLS on SSE — tenants get only their own events (delivery-side, reuses
-`predicate_matches`, service_role audited, fail-closed; crash 54/54, e1 4/4). **Studio-unblocker
-batch** (`4008249`, item 124) — 4 gaps the parallel studio session flagged: (1) `unidb-server-full`
-now reads `UNIDB_ALLOW_SIGNUP` (was plain-binary-only — real A3 bug); (2) `unidb_catalog.policies`
-exposes `target_roles` (role-scoped policy display); (3) `ALTER USER <name> PASSWORD '<pw>'` DDL
-(superuser-gated, argon2id, password redacted from Debug/audit) — password reset over /sql;
-(4) session listing + revoke-by-id via `unidb_catalog.sessions` (opaque `session_id` independent
-of the token hash; view never exposes token/hash; per-caller filtered like item 111) +
-revoke-a-specific-session. Verified from clean: both binaries build, crash 54/54,
-studio_g1_g2_fixes 7/7, authz/clippy/fmt/lint clean. Filed backlog `124_…`. Disk hit 100% during
-the agent build — `cargo clean` (frees ~30G) between every from-clean gate is mandatory now.
-**Merged tonight:** #222 auth loop, #223 A5/A6+I1+B5+C1, #224 E1. **Queue:** studio-unblocker PR
-(this) → F1 storage per-object RLS → C2 /rest/v1 FK-embed → maybe I4. Deferred-for-user: D
-OAuth/email/MFA, H SDK, C4 GraphQL, I2/I3/I5/I7, I6 per-project (user excluded it).
-
-### 2026-07-31 — C1 auto /rest/v1 API + OpenAPI shipped (Wave 2 begun); autonomous overnight run
-
-User went to sleep, authorized autonomous completion of well-defined items + auto-merge of
-verified PRs, with per-merge status reports. **C1 / item 123** (`742b355`): PostgREST-style
-`/rest/v1/<table>` — GET/POST/PATCH/DELETE with eq/neq/gt/gte/lt/lte/like/ilike/in/is filters,
-`select=`/`order=`/`limit`/`offset`. Injection-safe by construction: every value is a `$n`
-bind through the existing `execute_sql_params_as_principal` path (RLS + table/column grants +
-current_user/auth.uid/auth.jwt inherited, NOT re-implemented); identifiers catalog-validated +
-quoted; operators from a fixed allow-list. **C3 OpenAPI also shipped** (`GET /rest/v1/` lists
-tables → unblocks studio G4). Verified by me from clean: crash 54/54, server_rest **23/23**
-incl. injection-treated-as-data, rls_parity_with_sql, column_grant_parity_with_sql,
-no-privilege→403, unknown table/column→404, openapi-lists-tables; clippy/fmt clean. **Autonomous
-plan:** complete + merge the well-defined engine/server items (this batch PR, then E1 realtime
-auth, F1 storage per-object RLS, C2 FK-embed, maybe I4 migrations) — each a verified merged PR.
-DEFER (need user decisions/secrets or too large, leave flagged): D OAuth/OTP/MFA/email, I6
-per-project control plane, I7 edge functions, H SDK, C4 GraphQL, I2/I3/I5, G studio panels
-(studio session's job). Verify-before-merge always (crash 54/54 + suites); anything ambiguous →
-PR left open, not merged.
-
-### 2026-07-31 — batch-2 tail: I1 rate-limiting + B5 column-level grants shipped (Workstream B complete)
-
-Continued the post-#222 sequential run. **I1** (`5f7917d`): in-memory fixed-window auth
-rate limiter (`src/server/rate_limit.rs`, `Instant`-based, `Arc<Mutex<HashMap>>`) over
-`POST /auth/{login,signup,refresh}` only (keyed by IP+route+optional user); (max+1)th in a
-window → `429 RATE_LIMITED` + `Retry-After`; both 200s and 401s count; `UNIDB_AUTH_RATE_LIMIT`
-/`UNIDB_AUTH_RATE_WINDOW_SECS`. rate-limit tests 5/5, crash 54/54, auth suites unbroken.
-**B5 / item 112** (`df62290`): column-level grants — `GRANT/REVOKE <priv> (cols) ON t`,
-`GrantScope::All|Columns` (legacy grants deserialize as `All` — back-compat), enforced in
-`check_plan_privileges` at PLAN time (pre-execution, zero per-row cost, so no fast path can
-materialize an ungranted column): projection incl. `SELECT *` (requires-all), predicate/
-GROUP BY/ORDER BY/HAVING, QuerySpec join/aggregate, UPDATE targets, INSERT lists, RETURNING;
-**error-not-mask** (ungranted col → PERMISSION_DENIED, never NULL-filled); **policy-column
-exemption** (columns only in RLS-injected predicates need no caller grant); `information_schema.
-columns` filtered per grant; ambiguous unqualified join columns fail closed. item112 11/11,
-item111 5/5, authz 33/33, crash 54/54. **Workstream B (122) is now fully shipped.** Verified
-each by me from clean (`cargo clean` between builds; disk hit 97%). Remaining: **C1 — Wave 2
-auto `/rest/v1` API** (the last queued item; unblocks studio G4), then a fresh PR to main.
-Process: raise Bash `timeout` to 10 min for from-clean gate compiles; kill each agent's stray
-background full-suite run (target-lock) before verifying.
-
-### 2026-07-31 — PR #222 (items 121 A1–A4 + 122 B1–B4) MERGED to main; A5/A6 shipped to fresh branch
-
-Merged the Supabase-parity auth PR #222 (squash `333f3d1`) into main — main now has the
-full auth loop (password login/signup/refresh + `auth.uid()`/`auth.jwt()` + roles/role-scoped
-policies). Reset the designated branch onto merged main and started the batch-2 tail + Wave 2
-**sequentially** (disk-forced: usable ~38 GiB can't hold two concurrent ~30 GiB Rust builds —
-the ENOSPC that thrashed batch 1; `cargo clean` between builds; raise the Bash `timeout` to
-10 min for from-clean gate compiles rather than fighting the 2-min reaping). **121 A5/A6**
-(`68332cf`): production JWT issuer (`UNIDB_JWT_SIGNING_KEY` — issuance no longer dev-login-only);
-asymmetric verify (`UNIDB_JWT_PUBLIC_KEY` PEM, RS256/ES256 auto-detected) + public
-`GET /.well-known/jwks.json` (empty `{"keys":[]}` in HS256-only mode; a test asserts the HS256
-secret never leaks); asymmetric mode disables local HS256 issuance (documented); asymmetric
-*issuance* deferred (verify-side only — key-management story out of scope). Verified by me:
-crash 54/54, new item121_a5_a6_issuer_jwks 9/9, item121 16/16, item122 7/7, item100 9/9,
-clippy/fmt clean; docs (REST_API/README/ops_runbook/backlog) updated by the agent. Studio told
-it can now complete G1/G2/G3 against main's stable contract (G4 still waits on Wave-2 C1).
-**Sequential queue remaining:** I1 rate-limiting → B5 column grants → C1 auto `/rest/v1` API,
-then a fresh PR to main.
-
-### 2026-07-31 — item 122 B3/B4 (built-in roles + role-scoped policies) shipped, second slice of Workstream B
-
-Sequential batch-2 continuation (Sonnet on the main tree, verified by me). **122 B3/B4**
-(`838d91d`): reserved `anon`/`authenticated`/`service_role` roles (CREATE/DROP reject them);
-effective roles resolved engine-side via `RoleStore::effective_roles` — no subject→[anon],
-verified subject→[authenticated]+transitive granted roles, `claims["role"]=="service_role"`→
-[service_role] which BYPASSES RLS on the **audited** path (item-103) on BOTH writer and
-concurrent-read. `CREATE POLICY … FOR <op> [TO <role,…>]`, target roles persisted
-(serde-default, no FORMAT_VERSION bump). `apply_rls_with_auth` gains `roles`: **no-`TO`
-policies still apply to everyone (back-compat)**, `TO`-scoped OR-combined only on role
-intersection, table-with-only-scoped-policies-and-no-match denies all rows (fail closed).
-Verified by me: crash 54/54, item122 7/7 (back-compat) + item122_b3_b4 6/6, rls/policy +
-item121 16/16, clippy/fmt clean. Plan-time only, ACID/perf intact. Remaining on branch:
-A5 prod issuer, A6 RS256/JWKS, B5 column grants; then `docs/REST_API.md` refresh + PR-on-request.
-
-### 2026-07-31 — item 121 A3/A4 (signup + refresh tokens/sessions/logout) shipped, second slice of Workstream A
-
-Built directly on branch (no worktree) on top of A1/A2 (`fcd320a`). **A3:**
-`POST /auth/signup` creates a non-superuser with an argon2id credential via
-`Engine::create_user_with_password` (thin wrapper over `RoleStore::apply`'s
-existing `CreateUser` branch — no new DDL path needed); gated behind
-`UNIDB_ALLOW_SIGNUP` (default off, 404 when disabled, mirroring the dev-login
-posture); duplicate usernames reject with a clear `AUTHZ_ERROR`. **A4:**
-`AuthState` gains a `sessions: BTreeMap<token_hash, SessionRec>` field
-(`roles.json`, same control-plane store as credentials) — refresh tokens are
-256-bit OS-CSPRNG opaque strings (NOT JWTs, via `argon2`'s already-vendored
-`OsRng`/`RngCore`), and only their SHA-256 hash (new `sha2` dependency — fast
-one-way hash is the right tool for an already-high-entropy secret, unlike
-argon2id for passwords) is ever persisted. `POST /auth/refresh` verifies +
-rotates (revoke-old + issue-new in one persisted step) — checks the JWT
-signing key is available *before* touching session state, so a disabled
-issuer can never revoke a still-good refresh token without handing back its
-replacement. `POST /auth/logout` revokes idempotently. Unknown/expired/
-revoked refresh tokens all collapse to one `401 INVALID_REFRESH_TOKEN`.
-Login/signup responses gained `access_token`/`refresh_token`; `token` kept as
-a deprecated alias of `access_token` (zero breakage to existing item100/
-item121 tests). Manual `Debug` redaction extended to the new DTOs and
-`AuthState::sessions` (mirroring A1's `credentials` redaction pattern).
-**Evidence:** 15 new authz unit tests + 9 new item121 integration tests, all
-green (16/16 total in that file); item100 9/9 unchanged; item122 7/7 +
-server_authz 3/3 unaffected (checked as a courtesy, out of this workstream's
-touch-points); crash 54/54; fmt/clippy clean (`--all-features --all-targets`).
-Commit `77fab4a`. Stayed entirely off `logical.rs`/`executor.rs`/`parser.rs`
-per the hard boundary with Workstream B. **Process note:** hit a host-level
-disk-full condition mid-session (real usable capacity on this box is ~38 GiB
-despite `df` reporting 252G nominal — the gap is pre-existing platform
-overhead, not something this session's build caused alone, though the
-`target/` dir's ~30 GiB of accumulated per-test-binary debug artifacts *was*
-the proximate trigger); `cargo clean` recovered ~30 GiB and every gate was
-rerun clean afterward. Remaining for Workstream A: A5 (production issuer,
-explicit signing-key config) + A6 (RS256/JWKS).
-
-### 2026-07-31 — Supabase-parity P0 pair (items 121+122 first slices) built via Sonnet agents + shipped to branch
-
-User directed: implement the Supabase-parity P0 pair using Sonnet for implementation,
-Opus orchestrating/reviewing, no ACID/perf compromises. Approach: **seam-first, then
-parallel fan-out.** Step 0 (Sonnet, verified by me): `AuthPrincipal` seam widening the
-RLS identity from `sub`-only to subject+claims+roles, carried to `ExecCtx` but inert —
-crash 54/54, behavior-preserving (`58efa75`). Then two Sonnet worktree agents in
-parallel: **A (item 121 A1/A2)** argon2id credential store + real password login
-(passwordless→verified; unknown/wrong/no-credential all return one 401 with a dummy-hash
-timing-parity verify; manual Debug redacts creds) — `fcd320a`; **B (item 122 B1/B2)**
-`auth.uid()` + real `auth.jwt() ->> 'claim'` in RLS, substituted at injection time,
-fail-closed. Integration review (me) caught a real bug in B: policies with `auth.jwt()`
-returned 0 rows on the LIMIT/**QExpr** path because `apply_rls`'s `policy_sub` substituted
-only `current_user` before the Expr→QExpr conversion — same shape as item-110. Fixed
-(`2a5fe85`): `apply_rls_with_auth(plan,catalog,user,claims)` core + thin `apply_rls` shim;
-`policy_sub` now substitutes auth context too. **All green: item121 7/7, item122 7/7
-(incl. two-tenant isolation + LIMIT/QExpr + fail-closed), item100 9/9, crash 54/54,
-clippy/fmt clean.** Pushed A+B+fix to the branch. Remaining slices (batch 2): A3/A4/A5/A6,
-B3/B4/B5. Studio G-panels spun off to a separate session (`sagarm85/unidb-studio`).
-**Process lessons (logged): run ONE main-tree cargo build at a time (concurrent gate
-builds + agent worktree builds thrashed the target lock and a 25G worktree target filled
-the disk to 98%); reclaim each agent worktree's `target/` immediately after integrating;
-worktree agents share the object store so integrate by committing-in-worktree +
-cherry-pick.** Auth/RLS work stayed off the storage hot path (plan-time substitution,
-control-plane credentials) — ACID/perf intact by construction and by crash-harness proof.
-
-### 2026-07-31 — Supabase-parity backlog filed (items 120–123) + studio G-panels plan
-
-Planning/docs-only session (no engine code). User asked, via a WhatsApp-thread
-screenshot, what unidb still lacks to be "like Supabase" and to file the pending
-work as parallelizable specs. Audited the actual surface across BOTH repos
-(`sagarm85/unidb` + newly-attached `sagarm85/unidb-studio`) rather than trusting
-the README: verified token→RLS IS wired (`sub`→`CurrentUser`→`apply_rls`), that
-`post_auth_login` is passwordless *identification* (no credential verify), that
-storage already ships presign URLs + public/private buckets, and that unidb-studio
-already ships every panel EXCEPT auth/policies/roles/API-docs (their backends don't
-exist). Framing: unidb has the Postgres *security core*; "Supabase" is the BaaS
-layer above it (auth service, `auth.uid()`/`auth.jwt()`/role-in-RLS, auto REST API).
-Filed: **120** umbrella roadmap (workstreams A–I, P0 = auth core + RLS↔token +
-auto-API, 3-wave parallel plan), **121** auth core (A), **122** RLS↔token binding
-(B, folds parked item 112), **123** auto REST API (C). Registered in
-`backlog_index.md` (next→124), added a "Supabase parity" note to Next-up. Matching
-studio plan `docs/AUTH_POLICY_PANELS_PLAN.md` on the studio's mirror branch. Both
-lints green (backlog OK 99 files; docs OK). Nothing implemented — awaiting the
-user's go on which Wave-1 track(s) to build first (P0 critical path = 121 + 122).
-
-> **Older session-log entries (2026-07-24 and earlier) live in
-> [`docs/history/MEMORY_ARCHIVE_2026-07.md`](docs/history/MEMORY_ARCHIVE_2026-07.md).**
+> **Older session-log entries (the rest of 2026-07-31 and earlier) were rolled
+> into [`docs/history/MEMORY_ARCHIVE_2026-07.md`](docs/history/MEMORY_ARCHIVE_2026-07.md)
+> on 2026-08-01. Grep there for any dated entry; nothing was deleted.**

@@ -50,9 +50,14 @@ queue** · unidb-js SDK v0.1. *(The last three are beyond Supabase.)*
   column exists yet — `email` is currently looked up as a username directly,
   see `src/server/email.rs`'s module doc — a real column is part of that
   follow-up).
-- **REST upsert + count + `Prefer` headers** — `on_conflict`/`resolution=
-  merge-duplicates`, `count=exact` + `Content-Range`, `return=representation/
-  minimal`. PostgREST-parity clients expect these.
+- **139 — `/rest/v1` count + `Prefer` response controls** (IN PROGRESS —
+  implemented, status flips to DONE on merge): `Prefer: count=exact` ->
+  `Content-Range` (RLS-scoped exact count, zero extra cost when unused),
+  `Prefer: return=representation|minimal` on `POST`/`PATCH`/`DELETE`. REST-
+  layer only, no SQL-engine change. **Upsert is explicitly NOT included** —
+  `on_conflict`/`resolution=merge-duplicates` needs `INSERT … ON CONFLICT`,
+  which the SQL engine doesn't support; filed as a separate future engine
+  feature (see `docs/backlog/139_rest_count_prefer.md`'s note).
 - **Realtime channel authorization** — RLS-style per-topic allow/deny for
   broadcast/presence (the item-132 follow-up).
 - **unidb-js SDK completion** — storage client module, GraphQL client (queries +

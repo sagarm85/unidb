@@ -6,8 +6,8 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `139_…`**
-> (138 assigned 2026-08-01 to the email-transport item below).
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `140_…`**
+> (139 assigned 2026-08-01 to the REST count/Prefer item below).
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -154,8 +154,9 @@ Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 
 | 137 | `137_supabase_parity_free_roadmap.md` | Milestone | 🔄 IN PROGRESS — authoritative roadmap for 100% of the Supabase feature set needing NO paid third-party (self-hostable / own-infra only). Excludes SMS/phone/voice (paid gateway), AI embedding *generation* (paid API), CDN delivery. Wave 1: email transport (138) + REST upsert/count/Prefer + realtime channel-authz + unidb-js completion. Wave 2: stored functions→RPC/triggers/auth-hooks, DB webhooks, GraphQL subscriptions, auth admin API, more OAuth, HIBP leaked-password. Wave 3: cron, views, storage TUS/image-transform, SAML, SDKs. Supersedes 134. Each feature gets its own `NN_` when started. |
 | 138 | `138_email_transport.md` | Improvement | ✅ SHIPPED (2026-08-01, PR #241) — Wave-1 lead: pluggable `EmailTransport` (SMTP via lettre + dev/log transport, vault-first SMTP password) + template system, then first flow(s): password reset (`POST /auth/recover` + `/auth/verify`, no enumeration, single-use hash-only short-TTL token) and magic link if clean. Free/self-hostable (SMTP or dev-log; engine never forces a paid provider). Control-plane only — crash 54/54. Unlocks the email-auth cluster (email OTP/confirm/change follow-ups). |
+| 139 | `139_rest_count_prefer.md` | Improvement | ✅ SHIPPED (2026-08-01, PR #242) — Wave-1 REST-layer response controls: `Prefer: count=exact` → `Content-Range` exact count (through the same RLS/grant-enforced path, so it never over-counts), and `Prefer: return=representation\|minimal` on mutations. NO engine change. Upsert (`ON CONFLICT`) is NOT here — the SQL engine has no ON CONFLICT support, so upsert is a separate Wave-2 engine item. |
 
-**Next new file → `139_…`.
+**Next new file → `140_…`.
 
 ## Next up — priority order (2026-07-23, post fresh-baseline bench)
 

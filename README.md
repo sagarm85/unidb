@@ -223,7 +223,10 @@ Full route reference: [`docs/REST_API.md`](docs/REST_API.md)
 the same RLS/grant engine as `/sql` (no separate authorization surface):
 - `GET/POST/PATCH/DELETE /rest/v1/<table>` — a PostgREST-style resource API
   (filter operators, `select=`/embedded FK expansion, `order=`/`limit`/`offset`)
-  plus a generated `GET /rest/v1` OpenAPI 3 document.
+  plus a generated `GET /rest/v1` OpenAPI 3 document. `Prefer` header response
+  controls (item 139): `count=exact` -> `Content-Range` (RLS-scoped, exact,
+  zero extra cost when unused); `return=representation|minimal` on
+  `POST`/`PATCH`/`DELETE`.
 - `POST /graphql` — a schema-derived GraphQL API (`pg_graphql` analog) that,
   unlike a relational-only equivalent, also exposes **graph edge traversal**
   and **vector similarity** as first-class fields alongside FK relationships.

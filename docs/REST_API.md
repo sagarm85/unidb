@@ -2359,6 +2359,59 @@ DELETE /rest/v1/{table}?<filters> -- DELETE
   `in.(...)` filter per request (`400 MULTIPLE_IN_FILTERS` otherwise). `GET`
   uses native SQL `IN (...)` and has no such limit.
 
+### Response controls — `Prefer` header (item 139)
+
+PostgREST-style response-shape controls via the `Prefer` request header —
+pure REST-layer response shaping, no SQL-engine change. Parsed
+case-insensitively; the value may be a comma-separated list
+(`Prefer: return=representation, count=exact`), and the header may itself be
+repeated. **Unrecognized preferences are ignored, never an error** (e.g.
+`count=planned`/`count=estimated` — not supported, no planner row estimate
+exists to expose — and `resolution=merge-duplicates`/upsert, explicitly out
+of scope, see `docs/backlog/139_rest_count_prefer.md`). When at least one
+preference was recognized, the response echoes it back verbatim in a
+`Preference-Applied` header (comma-joined if more than one).
+
+- **`Prefer: count=exact` on `GET /rest/v1/{table}`** — after the normal
+  (possibly `limit`/`offset`-paginated) `SELECT`, runs a **second**
+  `SELECT COUNT(*) FROM {table} [WHERE <same filters, same $n binds>]`
+  through the identical enforced path (`run_stmt` ->
+  `execute_sql_params_as_principal`) as the main query, so **RLS and grants
+  apply to the count** — a caller who can see 3 of 10 rows gets a count of 3,
+  never 10. The result is reported as a `Content-Range` response header:
+  `Content-Range: <from>-<to>/<total>`, where `<from>-<to>` is the returned
+  row window (`offset..offset+returned-1`), or `*` when the query returned
+  zero rows. Body is unchanged either way.
+  - **Without the header, there is no extra query and no `Content-Range`
+    header at all** — byte-identical to a plain `GET`.
+  ```
+  GET /rest/v1/items?limit=2
+  Prefer: count=exact
+  -> 200, body = first 2 rows, Content-Range: 0-1/5
+  ```
+- **`Prefer: return=representation` on `POST`/`PATCH`/`DELETE`** — the
+  generated statement gains a `RETURNING *` clause (same mechanism
+  `graphql.rs`'s `insert_/update_/delete_<t>` mutations already use) and the
+  response body becomes the affected rows, in the same
+  `{"type":"rows","columns":[...],"rows":[[...]]}` shape `/sql`'s own
+  `RETURNING` produces. For `PATCH`/`DELETE` with an `in.(...)` filter (which
+  server-side-expands into one statement per value, see C1 above), every
+  expanded statement's `RETURNING` rows are merged into one result — the
+  caller issued one request, so gets back one combined row set, not N.
+- **`Prefer: return=minimal` on `POST`/`PATCH`/`DELETE`** — returns an empty
+  body: `201 Created` for `POST`, `204 No Content` for `PATCH`/`DELETE`. The
+  mutation still runs exactly as it would with no `Prefer` header; only the
+  response shape changes.
+- **No `Prefer` header (default) — unchanged from before item 139:**
+  - `GET` returns the row body with no `Content-Range` header (as above).
+  - `POST` returns `200` with `{"type":"inserted","count":N}`.
+  - `PATCH` returns `200` with `{"type":"updated","count":N}`.
+  - `DELETE` returns `200` with `{"type":"deleted","count":N}`.
+
+  (Note this default shape — a plain count body at `200`, not PostgREST's own
+  default of `201`/`204` with a `Location` header — is this API's pre-existing
+  behavior, kept as-is per item 139's explicit non-goal of changing it.)
+
 ### C2 — Embedded resource expansion (`GET` only, item 123 C2)
 
 `select=` accepts embed entries of the form `name(col,col,...)` alongside
