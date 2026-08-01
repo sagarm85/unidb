@@ -175,12 +175,22 @@ impl EmailTransport for LogTransport {
             from = %msg.from,
             "email captured by the dev-inbox log transport (UNIDB_EMAIL_TRANSPORT=log — not actually sent)"
         );
+        // `ts` (unix seconds this line was appended) — added for item 145's
+        // `GET /auth/dev-inbox`, which sorts/returns entries newest-first.
+        // Additive-only: `tests/item138_email_auth.rs` and this module's own
+        // unit tests below only ever assert on `to`/`subject`/`text_body`, so
+        // an extra field is backward compatible.
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let record = serde_json::json!({
             "to": msg.to,
             "from": msg.from,
             "subject": msg.subject,
             "text_body": msg.text_body,
             "html_body": msg.html_body,
+            "ts": ts,
         });
         let mut line = serde_json::to_string(&record)
             .map_err(|e| DbError::Authz(format!("email dev-inbox: serialize failed: {e}")))?;
@@ -655,6 +665,38 @@ impl EmailConfig {
         }
     }
 
+    /// Explicit SMTP-transport construction — used by tests to exercise the
+    /// "real transport is active" code paths (item 145's dev-inbox-route
+    /// 404 gate, in particular) without touching process-global env vars,
+    /// mirroring [`Self::with_log_transport`]'s role for the log side. Never
+    /// actually connects — `cfg`'s password is only resolved
+    /// ([`resolve_smtp_password`]) at send time, and these tests never call
+    /// `dispatch`/`send`.
+    pub fn with_smtp_transport(
+        cfg: SmtpConfig,
+        from: impl Into<String>,
+        site_url: impl Into<String>,
+    ) -> Self {
+        Self {
+            selection: EmailTransportSelection::Smtp(cfg),
+            from: from.into(),
+            site_url: site_url.into(),
+        }
+    }
+
+    /// The dev-inbox JSONL path (item 145: `GET`/`DELETE /auth/dev-inbox`) —
+    /// `Some` only while the active transport is [`LogTransport`], `None`
+    /// when real SMTP is configured. This is the exact gate those two routes
+    /// use to 404 whenever real delivery is active — the dev inbox must
+    /// never be reachable in a real-delivery deployment (see
+    /// `docs/backlog/145_dev_inbox_route.md`).
+    pub fn dev_inbox_path(&self) -> Option<&std::path::Path> {
+        match &self.selection {
+            EmailTransportSelection::Log(log) => Some(log.path()),
+            EmailTransportSelection::Smtp(_) => None,
+        }
+    }
+
     /// `UNIDB_EMAIL_TRANSPORT` (default `log`) / `UNIDB_EMAIL_SITE_URL` /
     /// the `UNIDB_SMTP_*` family — see the module doc for each. `Err` with a
     /// human-readable message for `UNIDB_EMAIL_TRANSPORT=smtp` missing
@@ -943,6 +985,40 @@ mod tests {
         std::env::remove_var("UNIDB_EMAIL_TRANSPORT");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("UNIDB_SMTP_HOST"));
+    }
+
+    #[test]
+    fn dev_inbox_path_is_some_for_log_transport_and_none_for_smtp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inbox.jsonl");
+        let log_cfg = EmailConfig::with_log_transport(&path, "unidb@localhost", "http://x");
+        assert_eq!(log_cfg.dev_inbox_path(), Some(path.as_path()));
+
+        let smtp_cfg = EmailConfig::with_smtp_transport(
+            SmtpConfig::new("smtp.example.test", 587, "user", "pass", SmtpTlsMode::Tls),
+            "unidb@localhost",
+            "http://x",
+        );
+        assert_eq!(smtp_cfg.dev_inbox_path(), None);
+    }
+
+    #[tokio::test]
+    async fn log_transport_send_writes_a_ts_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inbox.jsonl");
+        let transport = LogTransport::new(&path);
+        let msg = EmailMessage {
+            to: "user@example.test".to_string(),
+            from: "unidb@localhost".to_string(),
+            subject: "Subject".to_string(),
+            text_body: "Body".to_string(),
+            html_body: None,
+        };
+        transport.send(&msg).await.unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let line: serde_json::Value =
+            serde_json::from_str(contents.lines().next().unwrap()).unwrap();
+        assert!(line["ts"].as_u64().unwrap() > 0);
     }
 
     #[test]

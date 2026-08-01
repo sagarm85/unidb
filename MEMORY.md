@@ -12,6 +12,13 @@
 
 ## Current status
 
+- **2026-08-01 — item 145 (dev-inbox read route) implemented, committed to branch (Status left IN PROGRESS — orchestrator flips on merge).**
+  Studio-flagged item-138 gap. `GET/DELETE /auth/dev-inbox` reads/clears `LogTransport`'s dev-inbox
+  JSONL; double-gated (404 unless log transport active, checked before 403 non-superuser). Added
+  `ts` field to the JSONL line + `EmailConfig::{dev_inbox_path, with_smtp_transport}`. New
+  `tests/item145_dev_inbox.rs` (5/5); all 7 gates green incl. crash 54/54, item138 unchanged.
+  **MEMORY.md is at the 50 KB roll-up threshold — archive due next session.**
+
 - **2026-08-01 — item 144 (scheduled jobs / cron) implemented, committed to branch (Status left IN PROGRESS — orchestrator flips on merge).**
   Wave-3 roadmap item (137, though 144's own doc mislabels itself Wave-2 — flagged, not silently
   fixed either way). Control-plane only: new dependency-free `src/cron.rs` (5-field parser/matcher,

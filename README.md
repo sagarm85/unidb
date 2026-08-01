@@ -218,6 +218,11 @@ curl -H "Authorization: Bearer $TOKEN" -X PATCH http://127.0.0.1:8080/auth/admin
 # time, superuser-only — pg_cron parity, no storage-engine change
 curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8080/cron/jobs \
   -d '{"name":"nightly-cleanup","schedule":"0 3 * * *","sql":"DELETE FROM sessions WHERE expires_at < now()"}'
+
+# Dev-inbox read route (item 145): read captured reset/magic-link emails —
+# dev/testing aid, superuser-only, 404 unless UNIDB_EMAIL_TRANSPORT=log (the
+# default; never reachable when real SMTP is configured)
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/auth/dev-inbox?limit=10
 ```
 
 Key environment variables:
@@ -359,6 +364,12 @@ UNIDB_DATA_DIR=/var/lib/unidb cargo run --bin unidb-migrate -- migrations
   USER_BANNED`, revokes sessions) and split `app_metadata`/`user_metadata`
   — Supabase's `auth.admin`, built entirely on existing user/credential/
   session machinery
+- Dev-inbox read route (item 145) — `GET`/`DELETE /auth/dev-inbox`, a
+  Studio-facing Inbucket/Mailpit-equivalent live preview of the item-138
+  dev-inbox JSONL; dev/testing aid only — 404 unless the active email
+  transport is the log transport (never reachable with real SMTP
+  configured), and superuser-gated otherwise (the inbox carries live
+  reset/magic-link tokens)
 - Native TLS (rustls), audit log
 - Prometheus `/metrics` endpoint, slow-query log, per-chokepoint latency histograms
 - Object storage service (`unidb-storage`) — metadata in unidb tables, bytes tiered to S3/MinIO

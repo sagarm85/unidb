@@ -1514,6 +1514,110 @@ pub async fn delete_admin_user(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ── item 145: dev-inbox read route ──────────────────────────────────────
+//
+// **Dev/testing aid — never for production.** `GET`/`DELETE /auth/dev-inbox`
+// read/clear the exact same dev-inbox JSONL `email::LogTransport::send`
+// already writes (Studio's Inbucket/Mailpit-equivalent live email preview,
+// item 145). Every entry it returns can carry a live, single-use
+// password-reset/magic-link token — as sensitive as those links — so this
+// route is double-gated, in this order:
+//
+// 1. **Dev-transport-only availability gate.** `404` (the `route_disabled`
+//    posture, indistinguishable from a non-existent route) whenever the
+//    active email transport is real SMTP ([`crate::server::email::
+//    EmailConfig::dev_inbox_path`] returns `None`). Checked *first*, before
+//    the superuser check below, so a real-delivery deployment never even
+//    reveals (via a 403-vs-404 distinction) that this admin surface exists.
+// 2. **Superuser gate.** `403` for anyone else, same posture as
+//    `/auth/admin/users`/`/webhooks`/`/realtime/policies`.
+
+/// Default/hard-cap `limit` for `GET /auth/dev-inbox` — same "superuser-only
+/// still isn't unbounded" posture as `ADMIN_USERS_DEFAULT_LIMIT`/`_MAX_LIMIT`.
+const DEV_INBOX_DEFAULT_LIMIT: usize = 50;
+const DEV_INBOX_MAX_LIMIT: usize = 500;
+
+/// Gate 1 (see the module section doc above): `Ok(path)` only while the
+/// active email transport is the dev-inbox log transport, `Err(404)`
+/// otherwise. Shared by [`get_dev_inbox`]/[`delete_dev_inbox`].
+fn dev_inbox_path(state: &AppState) -> std::result::Result<std::path::PathBuf, ApiError> {
+    state.email.dev_inbox_path().map(Into::into).ok_or_else(|| {
+        route_disabled(
+            "GET/DELETE /auth/dev-inbox is only available when the active email transport is \
+             the dev-inbox log transport (UNIDB_EMAIL_TRANSPORT=log, the default) — a real SMTP \
+             transport must never expose the dev inbox",
+        )
+    })
+}
+
+/// Parse the dev-inbox JSONL at `path` into entries, **newest first**
+/// (the file itself is append-only oldest-first, so this just reverses it).
+/// A missing file means nothing has been sent yet — an empty inbox, not an
+/// error. A malformed line (partial write mid-append, hand-edited garbage)
+/// is skipped, not fatal — one bad line must never hide every other
+/// captured email.
+fn read_dev_inbox(path: &std::path::Path) -> Vec<crate::server::dto::DevInboxEntry> {
+    let contents = std::fs::read_to_string(path).unwrap_or_default();
+    let mut entries: Vec<crate::server::dto::DevInboxEntry> = contents
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    entries.reverse();
+    entries
+}
+
+/// `GET /auth/dev-inbox?limit=` (item 145) — see the module section doc
+/// above for the double gate. Returns up to `limit` (default
+/// [`DEV_INBOX_DEFAULT_LIMIT`], capped at [`DEV_INBOX_MAX_LIMIT`]) captured
+/// emails, newest first.
+pub async fn get_dev_inbox(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+    Query(params): Query<crate::server::dto::DevInboxQuery>,
+) -> std::result::Result<Json<Vec<crate::server::dto::DevInboxEntry>>, ApiError> {
+    let path = dev_inbox_path(&state)?;
+    state
+        .engine
+        .ensure_superuser(current_user.0.clone())
+        .await
+        .map_err(ApiError::from)?;
+    let limit = params
+        .limit
+        .unwrap_or(DEV_INBOX_DEFAULT_LIMIT)
+        .min(DEV_INBOX_MAX_LIMIT);
+    let mut entries = read_dev_inbox(&path);
+    entries.truncate(limit);
+    Ok(Json(entries))
+}
+
+/// `DELETE /auth/dev-inbox` (item 145) — same double gate as
+/// [`get_dev_inbox`]. Truncates the dev-inbox file in place (creating it if
+/// absent) rather than removing it, so `LogTransport::send`'s own
+/// `OpenOptions::append` call on the very next send keeps working with no
+/// special-casing for "the file briefly didn't exist."
+pub async fn delete_dev_inbox(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+) -> std::result::Result<StatusCode, ApiError> {
+    let path = dev_inbox_path(&state)?;
+    state
+        .engine
+        .ensure_superuser(current_user.0.clone())
+        .await
+        .map_err(ApiError::from)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(crate::error::DbError::from)?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .map_err(crate::error::DbError::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// `POST /auth/preview` (item-24 Z6): run `sql` as `as_role` and return the
 /// row-filtered result, including RLS policies that reference `current_user()`.
 /// This is the "preview as user" surface: an admin can verify exactly what a
