@@ -6,8 +6,8 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `136_…`**
-> (135 assigned 2026-08-01 to the server-full wiring-fixes item below).
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `137_…`**
+> (136 assigned 2026-08-01 to the /rest/v1 embed filter/order item below).
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -150,7 +150,9 @@ Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 
 | 135 | `135_server_full_wiring_fixes.md` | Improvement | ✅ SHIPPED (2026-08-01, PR #238) — two binary-specific bugs in `unidb-server-full` (reported by the studio session): (1) `try_init_storage` ignored `STORAGE_BACKEND=memory` (always built `S3ObjectStore`) → now selects `MemoryObjectStore` by `cfg.backend`; (2) served without `into_make_service_with_connect_info` so the item-121 rate-limiter's `ConnectInfo<SocketAddr>` extractor 500'd every `POST /auth/{login,signup,refresh}` → now wired like the plain binary. Plus a pre-existing `clippy::manual_ignore_case_cmp` fix (the workspace-member binaries aren't in the main clippy gate — follow-up filed). Live-smoke-verified; crash 54/54. |
 
-**Next new file → `136_…`.**
+| 136 | `136_rest_embed_filter_order.md` | Improvement | ✅ SHIPPED (2026-08-01, PR #239) — Supabase/PostgREST-parity gap (item 123 C2 follow-up, confirmed by the studio session): `/rest/v1` embedded expansion is projection-only (`SELECT <cols> FROM <embed> WHERE <join_col> IN (...)`) — no per-embed filter/order/limit. Add dotted params `<embed>.<col>=<op>.<val>` (filter), `<embed>.order=...`, `<embed>.limit`/`.offset` (per-parent, lateral semantics). Enforcement inherited (embed query already runs through `execute_sql_params_as_principal` — ungranted filter/order column denied like a direct GET). |
+
+**Next new file → `137_…`.**
 
 ## Next up — priority order (2026-07-23, post fresh-baseline bench)
 

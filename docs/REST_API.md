@@ -2180,6 +2180,7 @@ by `server/error.rs`'s `ApiError` directly, not by a `DbError` variant.
 | 400 | `MULTIPLE_IN_FILTERS` | More than one `in.(...)` filter on a `/rest/v1` `PATCH`/`DELETE` (item 123 C1) |
 | 400 | `UNKNOWN_RELATIONSHIP` | `/rest/v1` embed name matches no FK relationship (item 123 C2) |
 | 400 | `AMBIGUOUS_RELATIONSHIP` | `/rest/v1` embed name matches more than one FK relationship (item 123 C2) |
+| 400 | `UNKNOWN_EMBED_PARAM` | `/rest/v1` dotted param (`<embed>.<col>=…`) whose prefix names no embed in `select=` (item 136) |
 | 400 | `OAUTH_PROVIDER_DENIED` | Provider returned `?error=...` on the OAuth callback (item 128) |
 | 400 | `OAUTH_MISSING_CODE` | OAuth callback missing both `code` and `error` (item 128) |
 | 401 | `OAUTH_STATE_INVALID` | Unknown/expired/replayed/wrong-provider OAuth `state` (item 128) |
@@ -2285,10 +2286,28 @@ holding a nested JSON object/array instead of a scalar.)
   rather than leaking, and requesting an embedded column the caller isn't
   granted denies the **whole request** (`403 PERMISSION_DENIED`), matching a
   direct `/rest/v1` request for that column.
-- Base-table filters/order/limit/offset are unaffected by an embed (they
-  only ever apply to the base table); filtering/ordering *on* an embedded
-  resource is not yet supported (a natural C2 follow-up, not required by
-  this pass).
+- Base-table filters/order/limit/offset apply only to the base table.
+- **Filtering / ordering / paginating an embedded resource (item 136)** —
+  dotted per-embed params, PostgREST-style, where the prefix names an embed
+  present in `select=`:
+  - **Filter:** `<embed>.<col>=<op>.<val>` — same operator grammar as base
+    filters (`eq/neq/gt/gte/lt/lte/like/ilike/in/is`), AND-combined with the
+    embed's join.
+  - **Order:** `<embed>.order=<col>.<asc|desc>[,<col2>...]` — same grammar as
+    the base `order`.
+  - **Pagination:** `<embed>.limit=<n>` / `<embed>.offset=<n>`, applied
+    **per parent row** (lateral semantics — each parent's embedded array is
+    sliced independently, *not* a single global cap across all parents).
+  ```
+  GET /rest/v1/customers?select=id,orders(id,total)&orders.total=gt.100&orders.order=total.desc&orders.limit=3
+  -> each customer's `orders` = only their orders with total>100, newest-value
+     first, at most 3 per customer.
+  ```
+  Enforcement is inherited: the embed's filter/order columns run through the
+  same second parameterized query, so filtering/ordering on a column the caller
+  isn't granted denies the request exactly as a direct embed of that column
+  would (values are bind params, names catalog-validated). A dotted param whose
+  prefix doesn't name an embed in `select=` is `400 UNKNOWN_EMBED_PARAM`.
 - Composite (multi-column) FKs are out of scope for v1 embedding — single-
   column FKs only (column-level `REFERENCES` and single-column table-level
   `FOREIGN KEY`).
