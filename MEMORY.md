@@ -39,8 +39,10 @@
   inherited, parity-tested, requested-projection-only); **132** (PR #236) — in-memory Broadcast +
   Presence over four JWT-gated SSE/POST routes, zero engine/WAL/heap/catalog touch. Both verified
   independently: **crash 54/54**, clippy `--all-targets`, plain `cargo test --no-run`, targeted +
-  regression suites all green. **NEXT SESSION START HERE:** everything still open toward Supabase
-  parity is in [`docs/backlog/134_supabase_parity_followups.md`](docs/backlog/134_supabase_parity_followups.md)
+  regression suites all green. **(Superseded pointer — item 134 is now SUPERSEDED by
+  [`docs/backlog/137_supabase_parity_free_roadmap.md`](docs/backlog/137_supabase_parity_free_roadmap.md);
+  see the top current-status entry for what shipped since and what remains.)** Original note read:
+  everything still open toward Supabase parity is in `134_supabase_parity_followups.md`
   — (A) quick correctness follow-ups (named-superuser `WITH CHECK` INSERT quirk, GraphQL bulk
   insert, presence `track` orphan gap), (B) realtime channel-authz + GraphQL subscriptions,
   (C) email transport → magic-link/reset/confirm, more OAuth, storage transforms, DB webhooks,
