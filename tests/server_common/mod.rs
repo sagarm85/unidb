@@ -382,6 +382,67 @@ impl TestServer {
         )
     }
 
+    /// [`TestServer::spawn_with_dev_login_and_signup`] plus an explicit
+    /// [`unidb::server::captcha::CaptchaConfig`] (item 131, Workstream I2) —
+    /// used by the CAPTCHA integration test matrix. Also returns the shared
+    /// `EngineHandle` (mirroring
+    /// [`TestServer::spawn_with_dev_login_oauth_and_engine`]) so a test can
+    /// seed a vault secret before driving login/signup, with an explicit
+    /// `master_key` (see that method's doc comment for the env-guard
+    /// rationale).
+    pub async fn spawn_with_signup_and_captcha(
+        captcha: unidb::server::captcha::CaptchaConfig,
+        master_key: Option<&str>,
+    ) -> (Self, Arc<EngineHandle>) {
+        let tempdir = tempfile::tempdir().unwrap();
+        let data_dir = tempdir.path().to_path_buf();
+        let log_dir = data_dir.join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+
+        static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let engine = {
+            let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+            match master_key {
+                Some(key) => std::env::set_var("UNIDB_MASTER_KEY", key),
+                None => std::env::remove_var("UNIDB_MASTER_KEY"),
+            }
+            let engine = EngineHandle::spawn(tempdir.path(), 0).unwrap();
+            std::env::remove_var("UNIDB_MASTER_KEY");
+            engine
+        };
+        let engine = Arc::new(engine);
+
+        let jwt_config = JwtConfig::with_dev_login(TEST_JWT_SECRET);
+        let state = AppState::with_config(engine.clone(), SessionConfig::default())
+            .with_log_dir(log_dir.clone())
+            .with_dev_login(jwt_config.clone())
+            .with_allow_signup(true)
+            .with_captcha(captcha);
+        let (prometheus_layer, metric_handle) = metrics_pair().clone();
+        let router = build_router(state, jwt_config, prometheus_layer, metric_handle);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
+        });
+
+        (
+            Self {
+                addr,
+                data_dir,
+                log_dir,
+                _tempdir: tempdir,
+                _server_task: server_task,
+            },
+            engine,
+        )
+    }
+
     pub fn url(&self, path: &str) -> String {
         format!("http://{}{}", self.addr, path)
     }

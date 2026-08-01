@@ -31,6 +31,7 @@
 
 pub mod auth;
 pub mod bulk;
+pub mod captcha;
 pub mod correlation;
 pub mod cursor;
 pub mod dto;
@@ -128,6 +129,12 @@ pub struct AppState {
     /// provider not present here, same "off by default, safe with zero
     /// config" posture as `dev_login_jwt`/`allow_signup`.
     pub oauth: oauth::OAuthConfig,
+    /// CAPTCHA / bot-protection gate for the credential auth mutation
+    /// routes (item 131, Workstream I2). Disabled by default
+    /// ([`captcha::CaptchaConfig::disabled`]) — every `POST /auth/login`/
+    /// `/auth/signup` behaves exactly as before this item shipped unless
+    /// `UNIDB_CAPTCHA_PROTECT` explicitly names the endpoint.
+    pub captcha: captcha::CaptchaConfig,
 }
 
 /// Resolve the log directory the same way `src/bin/unidb-server.rs` does, so
@@ -168,6 +175,7 @@ impl AppState {
             dev_login_jwt: None,
             allow_signup: false,
             oauth: oauth::OAuthConfig::empty(),
+            captcha: captcha::CaptchaConfig::disabled(),
         }
     }
 
@@ -188,6 +196,14 @@ impl AppState {
     /// `/auth/oauth/*` route 404s.
     pub fn with_oauth(mut self, oauth: oauth::OAuthConfig) -> Self {
         self.oauth = oauth;
+        self
+    }
+
+    /// Configure the CAPTCHA/bot-protection gate (item 131, Workstream I2).
+    /// The default ([`captcha::CaptchaConfig::disabled`]) protects nothing —
+    /// see that type's doc comment.
+    pub fn with_captcha(mut self, captcha: captcha::CaptchaConfig) -> Self {
+        self.captcha = captcha;
         self
     }
 

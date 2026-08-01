@@ -138,6 +138,29 @@ impl From<SessionError> for ApiError {
     }
 }
 
+/// Item 131 (Workstream I2): CAPTCHA gate failure -> HTTP. `TokenRequired`
+/// is a client-request-shape problem (`400`); `Failed` deliberately covers
+/// both "wrong/expired token" and "verifier misconfigured/unreachable" with
+/// one uniform outward status/code — see `captcha.rs`'s module doc for why
+/// that's the correct fail-closed, no-oracle posture.
+impl From<crate::server::captcha::CaptchaError> for ApiError {
+    fn from(err: crate::server::captcha::CaptchaError) -> Self {
+        use crate::server::captcha::CaptchaError as CE;
+        match err {
+            CE::TokenRequired => ApiError::Api {
+                status: StatusCode::BAD_REQUEST,
+                code: "CAPTCHA_TOKEN_REQUIRED",
+                message: "captcha_token is required".into(),
+            },
+            CE::Failed => ApiError::Api {
+                status: StatusCode::FORBIDDEN,
+                code: "CAPTCHA_FAILED",
+                message: "captcha verification failed".into(),
+            },
+        }
+    }
+}
+
 impl From<CursorError> for ApiError {
     fn from(err: CursorError) -> Self {
         let (status, code, message) = match err {
