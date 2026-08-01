@@ -46,9 +46,12 @@
 - **Introspection:** always enabled (`__schema`/`__type`), for tooling/G4.
 
 **Deferred / SHOULD-LATER (not built, per the original spec's own scope
-note):** mutations, subscriptions, aggregations, cursor-based pagination,
-GraphQL over the auto-OpenAPI, and combining `near`/`edges` with the root
-field's filter/order/limit machinery.
+note):** subscriptions, aggregations, cursor-based pagination, GraphQL over
+the auto-OpenAPI, and combining `near`/`edges` with the root field's
+filter/order/limit machinery. **Mutations shipped as a follow-up** — see
+[`133_graphql_mutations.md`](133_graphql_mutations.md) (a `Mutation` root:
+`insert_<t>`/`update_<t>`/`delete_<t>` per eligible table, same
+enforcement path).
 
 ## The critical requirement — per-field authorization
 
@@ -126,7 +129,9 @@ into SQL text.
 
 Generic catalog-derived schema only — no per-table business logic. No
 engine/storage change; server-layer over the existing enforced query/NEAR/
-edge execution. Read-only (no mutations in v1).
+edge execution. Read-only in this v1 milestone — mutations followed as item
+133 ([`133_graphql_mutations.md`](133_graphql_mutations.md)), on the same
+generic-schema-only / no-engine-change boundary.
 
 ## Acceptance
 

@@ -227,6 +227,10 @@ the same RLS/grant engine as `/sql` (no separate authorization surface):
 - `POST /graphql` — a schema-derived GraphQL API (`pg_graphql` analog) that,
   unlike a relational-only equivalent, also exposes **graph edge traversal**
   and **vector similarity** as first-class fields alongside FK relationships.
+  Read **and write**: a `Query` root plus a `Mutation` root
+  (`insert_<t>`/`update_<t>`/`delete_<t>` per table, item 133) — every
+  mutation resolves through the same enforced SQL path as `/rest/v1`/`/sql`,
+  so RLS/`WITH CHECK`/column grants apply identically.
 
 ---
 
