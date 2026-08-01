@@ -1,7 +1,7 @@
 # Dev-inbox read route (GET /auth/dev-inbox)
 
 **Type:** Improvement
-**Status:** IN PROGRESS
+**Status:** SHIPPED (2026-08-01, PR #248) — `GET/DELETE /auth/dev-inbox` reads/clears the LogTransport dev-inbox JSONL; double-gated (404 unless log transport active, checked before 403 non-superuser, so route existence isn't leaked). Unblocks the studio email-preview panel. item145 5/5, crash 54/54.
 
 > Studio-flagged gap on item 138. The `LogTransport` (dev email transport) writes
 > every "sent" email to a dev-inbox JSONL file (`UNIDB_EMAIL_DEV_FILE`, default
