@@ -1,7 +1,9 @@
 # Supabase parity — remaining follow-ups
 
 **Type:** Milestone
-**Status:** NOT STARTED
+**Status:** SUPERSEDED (2026-08-01) by [`137_supabase_parity_free_roadmap.md`](137_supabase_parity_free_roadmap.md)
+— the authoritative, free/self-hostable-filtered roadmap (excludes paid-service items
+per the user). This file is kept for history; use 137 for planning.
 
 > Living checklist of everything still open toward Supabase-class parity **after**
 > the 120–133 build (auth, RLS↔token, auto REST + GraphQL read *and write*,

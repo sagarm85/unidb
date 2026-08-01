@@ -10,7 +10,7 @@
 #      (the unregistered second `42_…` file, renumbered to 113).
 #
 # Status vocab equivalences accepted: SHIPPED≈RESOLVED≈FIXED (done),
-# NOT STARTED, IN PROGRESS, PARTIAL.
+# NOT STARTED, IN PROGRESS, PARTIAL, SUPERSEDED (closed — replaced by another item).
 #
 # Run from repo root:  ./scripts/lint_backlog.sh   (exit 1 on any finding)
 
@@ -46,8 +46,8 @@ for f in [0-9]*_*.md; do
   fi
 
   # Status header: standard `**Status:**` line, or a `| **Status** | … |` table row (e.g. item 32).
-  fs=$(grep -m1 -E "^(\*\*Status|\| \*\*Status\*\*)" "$f" | grep -oE "SHIPPED|NOT STARTED|IN PROGRESS|RESOLVED|FIXED|PARTIAL|INVESTIGATION COMPLETE" | head -1 || true)
-  is=$(echo "$row" | grep -oE "SHIPPED|NOT STARTED|IN PROGRESS|RESOLVED|FIXED|PARTIAL|INVESTIGATION COMPLETE" | head -1 || true)
+  fs=$(grep -m1 -E "^(\*\*Status|\| \*\*Status\*\*)" "$f" | grep -oE "SHIPPED|NOT STARTED|IN PROGRESS|RESOLVED|FIXED|PARTIAL|INVESTIGATION COMPLETE|SUPERSEDED" | head -1 || true)
+  is=$(echo "$row" | grep -oE "SHIPPED|NOT STARTED|IN PROGRESS|RESOLVED|FIXED|PARTIAL|INVESTIGATION COMPLETE|SUPERSEDED" | head -1 || true)
   [ -z "$fs" ] && { echo "NO-STATUS-HEADER: $f (add a **Status:** line per CONVENTIONS.md)"; fail=1; continue; }
   [ -z "$is" ] && continue  # row with unusual wording — human judgment
 
