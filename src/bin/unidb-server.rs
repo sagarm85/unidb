@@ -62,6 +62,15 @@
 //!   real Google/GitHub endpoint defaults — mainly for pointing a test at a
 //!   local mock provider. OAuth login still needs a signing key (see above)
 //!   to hand back a session, same as signup/refresh.
+//! - `UNIDB_CAPTCHA_PROTECT` (item 131, Workstream I2, default **empty =
+//!   disabled**): comma-separated list of `POST /auth/login`/`/auth/signup`
+//!   requiring a verified CAPTCHA `captcha_token` in the body. `UNIDB_
+//!   CAPTCHA_PROVIDER` (default `turnstile`; also `hcaptcha`/`recaptcha`),
+//!   `UNIDB_CAPTCHA_SECRET` (env fallback — resolved vault-first via the
+//!   `captcha.secret` vault entry, item 129, exactly like OAuth's client
+//!   secret), and `UNIDB_CAPTCHA_VERIFY_URL` (override the siteverify
+//!   endpoint, mainly for pointing a test at a local mock) round out the
+//!   config — see `server::captcha`'s module doc.
 //!
 //! Logging goes to **both** stdout (so `docker logs`/interactive/systemd
 //! journal capture still works unchanged) and a rolling daily file under
@@ -94,8 +103,8 @@ use std::sync::Arc;
 use axum_prometheus::PrometheusMetricLayer;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use unidb::server::{
-    auth::JwtConfig, engine_handle::EngineHandle, oauth::OAuthConfig, router::build_router,
-    AppState,
+    auth::JwtConfig, captcha::CaptchaConfig, engine_handle::EngineHandle, oauth::OAuthConfig,
+    router::build_router, AppState,
 };
 
 /// Delete `unidb.log.*` files in `log_dir` whose mtime is older than
@@ -314,6 +323,13 @@ async fn main() {
         }
     }
 
+    // item 131 (Workstream I2): CAPTCHA/bot-protection gate, disabled by
+    // default (UNIDB_CAPTCHA_PROTECT unset = empty = protects nothing).
+    let captcha_config = CaptchaConfig::from_env();
+    if captcha_config.is_enabled() {
+        tracing::info!("CAPTCHA verification enabled (UNIDB_CAPTCHA_PROTECT set)");
+    }
+
     let state = {
         let mut s =
             AppState::new(Arc::new(engine_handle)).with_log_dir(std::path::PathBuf::from(&log_dir));
@@ -326,7 +342,9 @@ async fn main() {
         if jwt_config.encoding_key.is_some() {
             s = s.with_dev_login(jwt_config.clone());
         }
-        s.with_allow_signup(allow_signup).with_oauth(oauth_config)
+        s.with_allow_signup(allow_signup)
+            .with_oauth(oauth_config)
+            .with_captcha(captcha_config)
     };
     let (prometheus_layer, metric_handle) = PrometheusMetricLayer::pair();
 

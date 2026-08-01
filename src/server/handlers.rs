@@ -18,11 +18,12 @@
 //! session, authorization failure) never touch the transaction and leave
 //! the session open.
 
+use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Extension, Json,
@@ -1109,6 +1110,7 @@ async fn issue_token_pair(
 /// before (this branch is a no-op for them) — back-compat is unconditional.
 pub async fn post_auth_login(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<AuthLoginRequest>,
 ) -> std::result::Result<Json<AuthLoginOutcome>, ApiError> {
     let jwt_cfg = state.dev_login_jwt.as_ref().ok_or_else(|| {
@@ -1116,6 +1118,19 @@ pub async fn post_auth_login(
             "POST /auth/login is disabled (set UNIDB_JWT_SIGNING_KEY or UNIDB_DEV_LOGIN=1 to enable)".into(),
         ))
     })?;
+    // Item 131 (Workstream I2) — CAPTCHA gate, before any credential work
+    // (see `server::captcha`'s module doc). A no-op unless
+    // `UNIDB_CAPTCHA_PROTECT` includes "login"; the client's peer IP is
+    // passed through as informational context for the provider.
+    state
+        .captcha
+        .enforce(
+            &state.engine,
+            "login",
+            body.captcha_token.as_deref(),
+            Some(&addr.ip().to_string()),
+        )
+        .await?;
     // Real credential verification (item 121 A2): unknown user, no stored
     // credential, and a genuine mismatch all take this same branch and
     // return this same 401 — see `RoleStore::verify_password`'s doc comment
@@ -1321,6 +1336,7 @@ pub async fn post_mfa_disable(
 /// orphaned account behind.
 pub async fn post_auth_signup(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<crate::server::dto::AuthSignupRequest>,
 ) -> std::result::Result<Json<AuthLoginResponse>, ApiError> {
     if !state.allow_signup {
@@ -1340,6 +1356,18 @@ pub async fn post_auth_signup(
                 .into(),
         ))
     })?;
+    // Item 131 (Workstream I2) — CAPTCHA gate, before creating the user
+    // (see `server::captcha`'s module doc). A no-op unless
+    // `UNIDB_CAPTCHA_PROTECT` includes "signup".
+    state
+        .captcha
+        .enforce(
+            &state.engine,
+            "signup",
+            body.captcha_token.as_deref(),
+            Some(&addr.ip().to_string()),
+        )
+        .await?;
     state
         .engine
         .create_user_with_password(body.username.clone(), body.password.clone())

@@ -105,7 +105,14 @@ platform; **P2** = ecosystem.
   fixed-window limiter, `src/server/rate_limit.rs`, over `POST /auth/login`,
   `/auth/signup`, `/auth/refresh`; keyed by client IP + route + optional
   username; `UNIDB_AUTH_RATE_LIMIT`/`UNIDB_AUTH_RATE_WINDOW_SECS`; see
-  `docs/REST_API.md`'s "Auth rate limiting" section) · I2 CAPTCHA · **I3
+  `docs/REST_API.md`'s "Auth rate limiting" section) · **I2 CAPTCHA —
+  SHIPPED 2026-08-01** (provider-agnostic CAPTCHA/bot-protection verification
+  on `POST /auth/login`/`/auth/signup`, `src/server/captcha.rs`; Turnstile
+  default, hCaptcha/reCAPTCHA select the same siteverify-shaped code path;
+  disabled by default (`UNIDB_CAPTCHA_PROTECT` empty); vault-first secret
+  resolution (`captcha.secret`, item 129) then env; gate runs in-handler
+  before any credential work, fail-closed, uniform `403 CAPTCHA_FAILED`;
+  see `131_captcha_bot_protection.md`) · **I3
   secrets vault — SHIPPED 2026-08-01** (encrypt-at-rest config secrets:
   AES-256-GCM `src/vault.rs` keyed by `UNIDB_MASTER_KEY`, a `SecretStore`
   persisted alongside `roles.json`'s credentials/sessions/MFA, the

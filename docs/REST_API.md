@@ -1445,6 +1445,43 @@ gated by requiring a valid JWT) are never rate-limited.**
   `{ "error": "...", "code": "RATE_LIMITED" }`, plus a `Retry-After: <seconds>`
   header (time left in the current window, rounded up to at least 1).
 
+#### CAPTCHA / bot protection (item 131, Workstream I2)
+
+Complements the rate limiter above: instead of throttling by request volume,
+`POST /auth/login`/`/auth/signup` can require a verified CAPTCHA token per
+request (provider-agnostic; [Cloudflare
+Turnstile](https://developers.cloudflare.com/turnstile/) ships as the
+default). **Disabled by default** — with no config set, both routes behave
+exactly as documented below with no `captcha_token` involved at all.
+
+- **Config:** `UNIDB_CAPTCHA_PROTECT` (default **empty = disabled**) —
+  comma-separated list of `login`/`signup` naming which routes require a
+  token. `UNIDB_CAPTCHA_PROVIDER` (default `turnstile`; also `hcaptcha` /
+  `recaptcha` — all three speak the same siteverify wire shape, so only the
+  default verify URL differs). `UNIDB_CAPTCHA_SECRET` — the provider's
+  server-side secret key; resolved **vault-first** (secret name
+  `captcha.secret`, `unidb-vault set captcha.secret`, item 129) and falling
+  back to this env value, exactly like OAuth's client secret. `UNIDB_
+  CAPTCHA_VERIFY_URL` — override the siteverify endpoint (for pointing a
+  deployment at a self-hosted/mocked verifier).
+- **Request field:** both `POST /auth/login` and `POST /auth/signup` accept
+  an optional `captcha_token` field — the token the client-side CAPTCHA
+  widget produced. Required only when the route is named in
+  `UNIDB_CAPTCHA_PROTECT`; otherwise ignored (safe to omit).
+- **Where it runs:** inside the handler, after the I1 rate limiter and after
+  the route's own enable/signing-key gates, but **before any credential
+  work** (password verification on login; user creation on signup) — a
+  failed CAPTCHA check never touches the password path or creates an
+  account.
+- **Failure contract:** a required-but-missing (or empty-string) token is
+  `400 CAPTCHA_TOKEN_REQUIRED`. An invalid/expired token, a provider
+  rejection, or the verifier itself being unreachable/misconfigured are all
+  `403 CAPTCHA_FAILED` — deliberately uniform (no oracle on *why*
+  verification failed), mirroring `POST /auth/login`'s existing
+  `401 INVALID_CREDENTIALS` uniformity. Both are fail-closed: nothing short
+  of an explicit `{"success": true}` from the provider lets the request
+  through once the route is protected.
+
 #### `POST /auth/login` — password login
 
 > Requires a signing key: `UNIDB_JWT_SIGNING_KEY` (item 121 A5, the

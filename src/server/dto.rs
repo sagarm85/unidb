@@ -281,16 +281,27 @@ pub struct AuthPreviewRequest {
 pub struct AuthLoginRequest {
     pub username: String,
     pub password: String,
+    /// Item 131 (Workstream I2): optional CAPTCHA token from the client-side
+    /// widget (Cloudflare Turnstile by default). Only required when
+    /// `UNIDB_CAPTCHA_PROTECT` includes `login` — see
+    /// `server::captcha`'s module doc; ignored (and safe to omit) otherwise,
+    /// so back-compat is unconditional. Never logged.
+    #[serde(default)]
+    pub captcha_token: Option<String>,
 }
 
-/// Manual `Debug`: redacts `password` so this request body can never leak
-/// the plaintext via `{:?}` (e.g. request-body logging middleware, an
-/// `unwrap_err` printing the value it failed on).
+/// Manual `Debug`: redacts `password`/`captcha_token` so this request body
+/// can never leak either secret via `{:?}` (e.g. request-body logging
+/// middleware, an `unwrap_err` printing the value it failed on).
 impl std::fmt::Debug for AuthLoginRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthLoginRequest")
             .field("username", &self.username)
             .field("password", &"<redacted>")
+            .field(
+                "captcha_token",
+                &self.captcha_token.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -355,14 +366,24 @@ impl std::fmt::Debug for AuthLoginResponse {
 pub struct AuthSignupRequest {
     pub username: String,
     pub password: String,
+    /// Item 131 (Workstream I2): optional CAPTCHA token, required only when
+    /// `UNIDB_CAPTCHA_PROTECT` includes `signup` — see
+    /// [`AuthLoginRequest::captcha_token`].
+    #[serde(default)]
+    pub captcha_token: Option<String>,
 }
 
-/// Manual `Debug`: redacts `password`, mirroring [`AuthLoginRequest`].
+/// Manual `Debug`: redacts `password`/`captcha_token`, mirroring
+/// [`AuthLoginRequest`].
 impl std::fmt::Debug for AuthSignupRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthSignupRequest")
             .field("username", &self.username)
             .field("password", &"<redacted>")
+            .field(
+                "captcha_token",
+                &self.captcha_token.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
