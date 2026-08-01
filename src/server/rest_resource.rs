@@ -82,12 +82,28 @@
 //!   column FKs only, both column-level `REFERENCES` and single-column
 //!   table-level `FOREIGN KEY`) — a modest, catalog-derived addition rather
 //!   than a general multi-column join planner.
+//!
+//! **Item 139 — `Prefer: count=exact` / `return=representation|minimal`**
+//! (PostgREST parity, response controls only, no engine change):
+//! - `GET … Prefer: count=exact` runs a **second** `SELECT COUNT(*) …` with
+//!   the identical `WHERE`/binds as the main query, through the same
+//!   [`run_stmt`] enforced path, and reports it as a `Content-Range` response
+//!   header ([`build_content_range`]). Omitting the header costs nothing
+//!   extra — the count query only ever runs when explicitly requested.
+//! - `POST`/`PATCH`/`DELETE … Prefer: return=representation` appends
+//!   `RETURNING *` to the generated statement(s) (same pattern
+//!   `graphql.rs`'s mutation fields already use) and returns the affected
+//!   rows as the body; `return=minimal` returns an empty `201`/`204` with no
+//!   body. No `Prefer` header keeps every handler's exact pre-item-139
+//!   response (status, body, headers) — see [`parse_prefer`].
 
 use std::collections::{HashMap, HashSet};
 
 use axum::{
     body::Bytes,
     extract::{Path, RawQuery, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
     Extension, Json,
 };
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -581,6 +597,125 @@ fn merge_counts(results: Vec<ExecResult>) -> Result<ExecResult, ApiError> {
     }
 }
 
+/// Merge a batch of `Rows` results (the `in.(...)` multi-statement
+/// expansion, see this module's doc comment) produced by `RETURNING *` under
+/// `Prefer: return=representation` — every statement targets the same table
+/// with the same `RETURNING *`, so the column list is identical across all
+/// of them; only the row lists are concatenated, in statement order (the
+/// same shape as [`merge_counts`], for `Rows` instead of counts).
+fn merge_rows(results: Vec<ExecResult>) -> Result<ExecResult, ApiError> {
+    let mut columns: Option<Vec<String>> = None;
+    let mut all_rows = Vec::new();
+    for r in results {
+        match r {
+            ExecResult::Rows { columns: c, rows } => {
+                if columns.is_none() {
+                    columns = Some(c);
+                }
+                all_rows.extend(rows);
+            }
+            other => {
+                return Err(ApiError::internal(
+                    "INTERNAL_ERROR",
+                    format!("unexpected result merging rows: {other:?}"),
+                ))
+            }
+        }
+    }
+    Ok(ExecResult::Rows {
+        columns: columns.unwrap_or_default(),
+        rows: all_rows,
+    })
+}
+
+// ── item 139: `Prefer` header (count + return-shape controls) ──────────────
+
+/// Parsed `Prefer` request-header preferences this module understands.
+/// `Default` (`count_exact: false`, `return_pref: None`) is exactly
+/// "no `Prefer` header" — every handler's behavior at that default must stay
+/// byte-identical to its pre-item-139 behavior (see [`parse_prefer`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Prefer {
+    pub(super) count_exact: bool,
+    pub(super) return_pref: Option<ReturnPref>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReturnPref {
+    Representation,
+    Minimal,
+}
+
+/// Parse every `Prefer` header on the request (a client may repeat the
+/// header; each occurrence's value may itself be a comma-separated list —
+/// both forms are folded together) case-insensitively into a [`Prefer`].
+/// Unrecognized tokens (`count=planned`, a typo, a future PostgREST
+/// preference this module doesn't implement, …) are silently ignored rather
+/// than rejected — the PostgREST posture the backlog spec calls for. Also
+/// returns the list of tokens actually recognized, verbatim, for an
+/// (optional) `Preference-Applied` echo header.
+pub(super) fn parse_prefer(headers: &HeaderMap) -> (Prefer, Vec<&'static str>) {
+    let mut prefer = Prefer::default();
+    let mut applied = Vec::new();
+    for value in headers.get_all("prefer") {
+        let Ok(s) = value.to_str() else { continue };
+        for token in s.split(',') {
+            match token.trim().to_ascii_lowercase().as_str() {
+                "count=exact" => {
+                    prefer.count_exact = true;
+                    applied.push("count=exact");
+                }
+                "return=representation" => {
+                    prefer.return_pref = Some(ReturnPref::Representation);
+                    applied.push("return=representation");
+                }
+                "return=minimal" => {
+                    prefer.return_pref = Some(ReturnPref::Minimal);
+                    applied.push("return=minimal");
+                }
+                _ => {} // unrecognized preference: ignored, not an error
+            }
+        }
+    }
+    (prefer, applied)
+}
+
+/// `Content-Range: <from>-<to>/<total>` (item 139 §1) — `<from>-<to>` is the
+/// returned row window (`offset..offset+returned-1`), or `*` when the query
+/// returned zero rows (PostgREST's convention — there is no meaningful
+/// window to report).
+fn build_content_range(offset: i64, returned: usize, total: i64) -> String {
+    if returned == 0 {
+        format!("*/{total}")
+    } else {
+        format!("{offset}-{}/{total}", offset + returned as i64 - 1)
+    }
+}
+
+/// Attach the item-139 response headers (`Content-Range` when a count was
+/// computed, `Preference-Applied` when at least one recognized preference
+/// was echoed) to an already-built response, without disturbing its status
+/// or body. A no-`Prefer` request passes `content_range: None` and an empty
+/// `applied` list, so this is a no-op — the byte-identical-response
+/// guarantee holds structurally, not by a special-cased branch.
+fn with_prefer_headers(
+    mut resp: Response,
+    content_range: Option<String>,
+    applied: &[&'static str],
+) -> Response {
+    if let Some(cr) = content_range {
+        if let Ok(hv) = HeaderValue::from_str(&cr) {
+            resp.headers_mut().insert(header::CONTENT_RANGE, hv);
+        }
+    }
+    if !applied.is_empty() {
+        if let Ok(hv) = HeaderValue::from_str(&applied.join(", ")) {
+            resp.headers_mut().insert("preference-applied", hv);
+        }
+    }
+    resp
+}
+
 // ── C2: embedded resource expansion (`select=...,name(cols)`) ──────────────
 
 /// One parsed `select=` entry: a plain column, or an embedded-resource spec
@@ -985,7 +1120,9 @@ pub async fn get_collection(
     State(state): State<AppState>,
     Path(table): Path<String>,
     RawQuery(raw): RawQuery,
-) -> Result<Json<JsonValue>, ApiError> {
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let (prefer, applied) = parse_prefer(&headers);
     let def = lookup_table(&state, &table).await?;
     let pairs = parse_query_pairs(raw.as_deref());
 
@@ -1142,15 +1279,62 @@ pub async fn get_collection(
 
     let result = run_stmt(&state, &principal, sql, binds).await?;
 
+    // item 139 §1: the returned-row window is the base query's own row
+    // count, computed before `result` is consumed below — embeds never
+    // affect `Content-Range` (it describes the base resource, matching
+    // PostgREST). Borrowed, not moved, so `result` is still usable after.
+    let returned = match &result {
+        ExecResult::Rows { rows, .. } => rows.len(),
+        _ => 0,
+    };
+    let content_range_header = if prefer.count_exact {
+        // Same `WHERE`/binds as the main query, rebuilt fresh (`binds` above
+        // was already moved into `run_stmt`) — reuses `append_where` on the
+        // same `filters`, so no new interpolation of user values. Runs
+        // through the identical enforced `run_stmt` path (RLS/grants apply).
+        let mut count_binds: Vec<Literal> = Vec::new();
+        let count_where = append_where(&filters, &mut count_binds);
+        let mut count_sql = format!("SELECT COUNT(*) FROM {}", table_ident(&def.name));
+        if let Some(w) = count_where {
+            count_sql.push_str(" WHERE ");
+            count_sql.push_str(&w);
+        }
+        let count_result = run_stmt(&state, &principal, count_sql, count_binds).await?;
+        let total = match &count_result {
+            ExecResult::Rows { rows, .. } => match rows.first().and_then(|r| r.first()) {
+                Some(Literal::Int(n)) => *n,
+                _ => {
+                    return Err(ApiError::internal(
+                        "INTERNAL_ERROR",
+                        "COUNT(*) did not return an integer",
+                    ))
+                }
+            },
+            other => {
+                return Err(ApiError::internal(
+                    "INTERNAL_ERROR",
+                    format!("expected rows from a COUNT(*) query, got {other:?}"),
+                ))
+            }
+        };
+        Some(build_content_range(offset.unwrap_or(0), returned, total))
+    } else {
+        None
+    };
+
     if embed_specs.is_empty() {
-        return Ok(Json(exec_result_to_json(&result)));
+        let resp = Json(exec_result_to_json(&result)).into_response();
+        return Ok(with_prefer_headers(resp, content_range_header, &applied));
     }
 
     let (result_cols, rows) = match result {
         ExecResult::Rows { columns, rows } => (columns, rows),
         // A well-formed SELECT always yields `Rows`; fail safe rather than
         // silently dropping the requested embeds.
-        other => return Ok(Json(exec_result_to_json(&other))),
+        other => {
+            let resp = Json(exec_result_to_json(&other)).into_response();
+            return Ok(with_prefer_headers(resp, content_range_header, &applied));
+        }
     };
 
     /// One embed's fetched-and-grouped related rows, keyed by the base
@@ -1315,20 +1499,31 @@ pub async fn get_collection(
         out_rows.push(JsonValue::Array(out_row));
     }
 
-    Ok(Json(serde_json::json!({
+    let resp = Json(serde_json::json!({
         "type": "rows",
         "columns": out_columns,
         "rows": out_rows,
-    })))
+    }))
+    .into_response();
+    Ok(with_prefer_headers(resp, content_range_header, &applied))
 }
 
 /// `POST /rest/v1/<table>` (JSON object or array of objects) -> `INSERT`.
+///
+/// Item 139 §2: with no `Prefer` header this is exactly the pre-item-139
+/// response (`200`, `{"type":"inserted","count":N}`) — unchanged.
+/// `Prefer: return=representation` appends `RETURNING *` to the generated
+/// `INSERT` (same enforced [`run_stmt`] path, same `Engine::check_returning`
+/// grant check `/sql`'s own `RETURNING` uses) and returns the inserted rows.
+/// `Prefer: return=minimal` returns `201 Created` with an empty body.
 pub async fn post_collection(
     Extension(principal): Extension<AuthPrincipal>,
     State(state): State<AppState>,
     Path(table): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<JsonValue>, ApiError> {
+) -> Result<Response, ApiError> {
+    let (prefer, applied) = parse_prefer(&headers);
     let def = lookup_table(&state, &table).await?;
     let value: JsonValue = serde_json::from_slice(&body)
         .map_err(|e| ApiError::bad_request("INVALID_JSON", format!("invalid JSON body: {e}")))?;
@@ -1358,9 +1553,19 @@ pub async fn post_collection(
         ));
     }
 
-    let (sql, binds) = build_insert(&def, &rows)?;
+    let (mut sql, binds) = build_insert(&def, &rows)?;
+    let representation = prefer.return_pref == Some(ReturnPref::Representation);
+    if representation {
+        sql.push_str(" RETURNING *");
+    }
     let result = run_stmt(&state, &principal, sql, binds).await?;
-    Ok(Json(exec_result_to_json(&result)))
+
+    let resp = if prefer.return_pref == Some(ReturnPref::Minimal) {
+        StatusCode::CREATED.into_response()
+    } else {
+        Json(exec_result_to_json(&result)).into_response()
+    };
+    Ok(with_prefer_headers(resp, None, &applied))
 }
 
 fn parse_json_object_body(body: &Bytes) -> Result<JsonMap<String, JsonValue>, ApiError> {
@@ -1377,13 +1582,22 @@ fn parse_json_object_body(body: &Bytes) -> Result<JsonMap<String, JsonValue>, Ap
 
 /// `PATCH /rest/v1/<table>?<filters>` (JSON object of assignments) ->
 /// `UPDATE`.
+///
+/// Item 139 §2: no `Prefer` header is the exact pre-item-139 response
+/// (`200`, `{"type":"updated","count":N}`). `return=representation` adds
+/// `RETURNING *` to every generated statement (incl. each `in.(...)`
+/// expansion, see this module's doc comment) and merges their rows via
+/// [`merge_rows`] instead of [`merge_counts`]. `return=minimal` returns
+/// `204 No Content` with an empty body.
 pub async fn patch_collection(
     Extension(principal): Extension<AuthPrincipal>,
     State(state): State<AppState>,
     Path(table): Path<String>,
     RawQuery(raw): RawQuery,
+    headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<JsonValue>, ApiError> {
+) -> Result<Response, ApiError> {
+    let (prefer, applied) = parse_prefer(&headers);
     let def = lookup_table(&state, &table).await?;
     let assignments_map = parse_json_object_body(&body)?;
     if assignments_map.is_empty() {
@@ -1401,6 +1615,7 @@ pub async fn patch_collection(
     let filters = parse_filters(&def, &filter_pairs)?;
     let (scalar_filters, in_filter) = extract_single_in(filters)?;
 
+    let representation = prefer.return_pref == Some(ReturnPref::Representation);
     let stmts = match in_filter {
         None => {
             let mut binds = Vec::new();
@@ -1410,6 +1625,9 @@ pub async fn patch_collection(
             if let Some(w) = where_sql {
                 sql.push_str(" WHERE ");
                 sql.push_str(&w);
+            }
+            if representation {
+                sql.push_str(" RETURNING *");
             }
             vec![(sql, binds)]
         }
@@ -1429,23 +1647,44 @@ pub async fn patch_collection(
                     sql.push_str(" WHERE ");
                     sql.push_str(&w);
                 }
+                if representation {
+                    sql.push_str(" RETURNING *");
+                }
                 Ok::<_, ApiError>((sql, binds))
             })
             .collect::<Result<Vec<_>, _>>()?,
     };
 
     let results = run_stmts(&state, &principal, stmts).await?;
-    let merged = merge_counts(results)?;
-    Ok(Json(exec_result_to_json(&merged)))
+
+    let resp = match prefer.return_pref {
+        Some(ReturnPref::Minimal) => StatusCode::NO_CONTENT.into_response(),
+        Some(ReturnPref::Representation) => {
+            let merged = merge_rows(results)?;
+            Json(exec_result_to_json(&merged)).into_response()
+        }
+        None => {
+            let merged = merge_counts(results)?;
+            Json(exec_result_to_json(&merged)).into_response()
+        }
+    };
+    Ok(with_prefer_headers(resp, None, &applied))
 }
 
 /// `DELETE /rest/v1/<table>?<filters>` -> `DELETE`.
+///
+/// Item 139 §2: same three-way `Prefer: return=` behavior as
+/// [`patch_collection`] — no header keeps the pre-item-139 `200`
+/// count-body response, `representation` adds `RETURNING *` + [`merge_rows`],
+/// `minimal` returns `204 No Content` with an empty body.
 pub async fn delete_collection(
     Extension(principal): Extension<AuthPrincipal>,
     State(state): State<AppState>,
     Path(table): Path<String>,
     RawQuery(raw): RawQuery,
-) -> Result<Json<JsonValue>, ApiError> {
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let (prefer, applied) = parse_prefer(&headers);
     let def = lookup_table(&state, &table).await?;
     let pairs = parse_query_pairs(raw.as_deref());
     let filter_pairs: Vec<(String, String)> = pairs
@@ -1455,6 +1694,7 @@ pub async fn delete_collection(
     let filters = parse_filters(&def, &filter_pairs)?;
     let (scalar_filters, in_filter) = extract_single_in(filters)?;
 
+    let representation = prefer.return_pref == Some(ReturnPref::Representation);
     let stmts = match in_filter {
         None => {
             let mut binds = Vec::new();
@@ -1463,6 +1703,9 @@ pub async fn delete_collection(
             if let Some(w) = where_sql {
                 sql.push_str(" WHERE ");
                 sql.push_str(&w);
+            }
+            if representation {
+                sql.push_str(" RETURNING *");
             }
             vec![(sql, binds)]
         }
@@ -1481,14 +1724,28 @@ pub async fn delete_collection(
                     sql.push_str(" WHERE ");
                     sql.push_str(&w);
                 }
+                if representation {
+                    sql.push_str(" RETURNING *");
+                }
                 (sql, binds)
             })
             .collect::<Vec<_>>(),
     };
 
     let results = run_stmts(&state, &principal, stmts).await?;
-    let merged = merge_counts(results)?;
-    Ok(Json(exec_result_to_json(&merged)))
+
+    let resp = match prefer.return_pref {
+        Some(ReturnPref::Minimal) => StatusCode::NO_CONTENT.into_response(),
+        Some(ReturnPref::Representation) => {
+            let merged = merge_rows(results)?;
+            Json(exec_result_to_json(&merged)).into_response()
+        }
+        None => {
+            let merged = merge_counts(results)?;
+            Json(exec_result_to_json(&merged)).into_response()
+        }
+    };
+    Ok(with_prefer_headers(resp, None, &applied))
 }
 
 // ── C3: minimal OpenAPI 3 document ──────────────────────────────────────────
