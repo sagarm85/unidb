@@ -208,6 +208,11 @@ curl -H "Authorization: Bearer $TOKEN" \
 # operator endpoint on every insert to `orders`, superuser-only
 curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8080/webhooks \
   -d '{"id":"orders-hook","target_url":"https://example.com/hooks/orders","table_pattern":"orders","events":["insert"],"signing_secret":"shh"}'
+
+# Auth admin API (item 142): ban a user (superuser-only) — subsequent
+# logins/refreshes get 403 USER_BANNED and every session is revoked
+curl -H "Authorization: Bearer $TOKEN" -X PATCH http://127.0.0.1:8080/auth/admin/users/alice \
+  -d '{"banned":true}'
 ```
 
 Key environment variables:
@@ -332,6 +337,12 @@ UNIDB_DATA_DIR=/var/lib/unidb cargo run --bin unidb-migrate -- migrations
   social login (Google/GitHub), and self-service password-reset +
   magic-link sign-in over a pluggable email transport (SMTP or a
   no-network dev-inbox log transport, item 138)
+- Auth admin API (item 142) — consolidated, superuser-only user management
+  (`/auth/admin/users`: paginated list/get/create/update/delete) plus
+  per-user **ban** (rejected at login/refresh/email-verify with `403
+  USER_BANNED`, revokes sessions) and split `app_metadata`/`user_metadata`
+  — Supabase's `auth.admin`, built entirely on existing user/credential/
+  session machinery
 - Native TLS (rustls), audit log
 - Prometheus `/metrics` endpoint, slow-query log, per-chokepoint latency histograms
 - Object storage service (`unidb-storage`) — metadata in unidb tables, bytes tiered to S3/MinIO

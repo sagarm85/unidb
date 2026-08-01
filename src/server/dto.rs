@@ -261,6 +261,124 @@ pub struct WebhookDto {
     pub headers: std::collections::BTreeMap<String, String>,
 }
 
+// ── item 142: Auth admin API (user management) ─────────────────────────────
+
+/// Query params for `GET /auth/admin/users?limit=&offset=` (item 142).
+/// `limit` defaults to 50 (capped at 500); `offset` defaults to 0 — see
+/// `handlers::get_admin_users`.
+#[derive(Debug, Default, Deserialize)]
+pub struct AdminUserListQuery {
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+/// Body of `POST /auth/admin/users` (item 142 admin surface): create a
+/// user. `password` is optional (a passwordless account can still be
+/// reached via OAuth/magic-link, mirroring `CREATE USER` with no `PASSWORD`
+/// clause); every other field defaults to Postgres/Supabase-shaped
+/// conventions (`superuser`/`banned: false`, metadata `{}`).
+#[derive(Deserialize)]
+pub struct AdminCreateUserRequest {
+    pub username: String,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub superuser: bool,
+    #[serde(default)]
+    pub banned: bool,
+    #[serde(default)]
+    pub app_metadata: Option<serde_json::Value>,
+    #[serde(default)]
+    pub user_metadata: Option<serde_json::Value>,
+}
+
+/// Manual `Debug`: redacts `password` — same posture as
+/// [`AuthSignupRequest`].
+impl std::fmt::Debug for AdminCreateUserRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminCreateUserRequest")
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("superuser", &self.superuser)
+            .field("banned", &self.banned)
+            .field("app_metadata", &self.app_metadata)
+            .field("user_metadata", &self.user_metadata)
+            .finish()
+    }
+}
+
+/// Body of `PATCH /auth/admin/users/{id}` (item 142 admin surface): a
+/// partial update — every field is optional, and only supplied fields are
+/// changed (`null`/omitted stays untouched, it is never interpreted as
+/// "clear this field"; to clear metadata, send `{}` explicitly).
+#[derive(Deserialize)]
+pub struct AdminUpdateUserRequest {
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub banned: Option<bool>,
+    #[serde(default)]
+    pub app_metadata: Option<serde_json::Value>,
+    #[serde(default)]
+    pub user_metadata: Option<serde_json::Value>,
+    #[serde(default)]
+    pub superuser: Option<bool>,
+}
+
+/// Manual `Debug`: redacts `password`, same posture as
+/// [`AdminCreateUserRequest`].
+impl std::fmt::Debug for AdminUpdateUserRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminUpdateUserRequest")
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("banned", &self.banned)
+            .field("app_metadata", &self.app_metadata)
+            .field("user_metadata", &self.user_metadata)
+            .field("superuser", &self.superuser)
+            .finish()
+    }
+}
+
+/// One user row (item 142): the shape `GET/POST/PATCH /auth/admin/users*`
+/// all return. **Never** a password hash, refresh token, or session
+/// detail — see the item-142 backlog doc's security section.
+#[derive(Debug, Serialize)]
+pub struct AdminUserDto {
+    pub username: String,
+    pub is_superuser: bool,
+    pub banned: bool,
+    pub roles: Vec<String>,
+    /// Unix seconds, or `0` for "unknown" (a user created before item 142
+    /// shipped — see `crate::authz::AdminUserView`'s doc comment).
+    pub created_at: u64,
+    pub app_metadata: serde_json::Value,
+    pub user_metadata: serde_json::Value,
+}
+
+impl From<crate::authz::AdminUserView> for AdminUserDto {
+    fn from(v: crate::authz::AdminUserView) -> Self {
+        Self {
+            username: v.username,
+            is_superuser: v.is_superuser,
+            banned: v.banned,
+            roles: v.roles,
+            created_at: v.created_at,
+            app_metadata: v.app_metadata,
+            user_metadata: v.user_metadata,
+        }
+    }
+}
+
+/// Response of `GET /auth/admin/users?limit=&offset=` (item 142): a page of
+/// users plus the total (unpaginated) count — mirrors item 139's
+/// `Content-Range` posture, as a body field rather than a header since this
+/// route was never a bare row-set response to begin with.
+#[derive(Debug, Serialize)]
+pub struct AdminUserListResponse {
+    pub users: Vec<AdminUserDto>,
+    pub total: usize,
+}
+
 /// Body of `PUT /config/slow_query_threshold_ms` (item 34, Part A).
 /// `threshold_ms: 0` disables slow-query logging; positive values enable it.
 #[derive(Debug, Deserialize)]

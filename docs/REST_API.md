@@ -1186,6 +1186,177 @@ other webhook, the poll loop, or the engine.
 
 ---
 
+## Auth admin API — user management (item 142)
+
+Supabase-parity `auth.admin`: a consolidated REST surface under
+`/auth/admin/` for listing, inspecting, creating, updating, and deleting
+users — plus two pieces of new per-user state, **ban** and split
+**metadata** — without hand-rolling `CREATE/DROP USER`/`ALTER USER …
+PASSWORD` SQL for every admin action. Reuses the existing user/credential/
+session machinery end to end (`create_user_with_password`, `set_password`,
+`revoke_all_sessions_for_user`, `DROP USER`'s cleanup) — **no
+storage-engine change**, control-plane only (`roles.json`-persisted,
+`#[serde(default)]`, no `FORMAT_VERSION` bump); crash harness stays 54/54.
+
+**Every route below is superuser-only** — the same `403 PERMISSION_DENIED`
+gate as `/realtime/policies`/`/webhooks` (`EngineHandle::ensure_superuser`:
+a named non-superuser is rejected, the implicit embedded caller and
+open/bootstrap mode pass).
+
+**New per-user state:**
+- **`banned` (bool, default `false`).** A banned user is rejected at `POST
+  /auth/login`, `POST /auth/refresh`, `POST /auth/verify` (password-recovery
+  redemption), and `POST /auth/magiclink/verify` (magic-link session
+  issuance) with a uniform `403 USER_BANNED` — this is a *distinguishable*
+  error (unlike the no-enumeration `401`s elsewhere in the auth surface): a
+  ban is not a secret that needs hiding from the account holder. `POST
+  /auth/recover`/`POST /auth/magiclink` (the *request*-an-email step, not
+  the redemption step) are **unaffected** — they keep returning `200`
+  regardless of ban status, preserving the item-138 no-account-enumeration
+  contract. Setting `banned: true` (at creation, or via `PATCH`) also
+  revokes every one of the user's refresh-token sessions
+  (`revoke_all_sessions_for_user`, item 138's mechanism).
+  **Documented limitation:** an already-issued short-TTL **access** JWT is a
+  stateless bearer credential and rides out its own expiry (default 1 h)
+  regardless of a ban issued after it was minted — a ban's *session*-level
+  effect (refresh revoked, login/refresh/email-verify rejected) is
+  immediate, but full lockout is only guaranteed once that access token
+  naturally expires. Deploy a short access-token TTL if immediate hard
+  lockout is a requirement.
+- **`app_metadata` / `user_metadata` (JSON objects, default `{}`).**
+  Supabase's split: `app_metadata` is admin-only (never settable through any
+  non-admin route in this milestone); `user_metadata` is admin-writable here
+  too (self-service end-user writes are a documented follow-up, not v1
+  scope). Both round-trip whole-value on `PATCH` (replace, not a deep
+  merge) and are returned by every `GET`/`POST`/`PATCH` response below.
+
+**Security.** Every route is superuser-gated; `GET` responses **never**
+include a password hash, refresh token, or session detail. Ban/metadata/
+superuser/password changes are audited via the same `audit.log` path auth
+DDL already uses (`create_user`, `drop_user`, `admin_set_banned`,
+`admin_set_app_metadata`, `admin_set_user_metadata`, `admin_set_superuser`,
+`admin_set_password` actions). No new SQL string-building over user input —
+every mutation reuses the existing `RoleStore`/`CreateUser`/`DropUser`
+machinery.
+
+### `GET /auth/admin/users?limit=&offset=`
+
+Paginated list of every user. **Superuser-only.**
+
+**Query params**: `limit` (default 50, capped at 500), `offset` (default 0).
+
+**Response** `200 OK`:
+```json
+{
+  "users": [
+    {
+      "username": "alice",
+      "is_superuser": false,
+      "banned": false,
+      "roles": ["authenticated"],
+      "created_at": 1732900000,
+      "app_metadata": {},
+      "user_metadata": {"nickname": "al"}
+    }
+  ],
+  "total": 4
+}
+```
+`total` is always the **unpaginated** count (mirrors item 139's
+`Content-Range` posture — the total is never just the returned page
+length). `created_at` is Unix seconds, or `0` for "unknown" (a user created
+before item 142 shipped, from an already-existing `roles.json`).
+
+### `GET /auth/admin/users/{id}`
+
+One user by username (`{id}` is the username — unidb has no separate
+synthetic user-id column, same posture as `DELETE /auth/sessions/{id}`'s
+`{id}` being a session id rather than a user one). **Superuser-only.**
+`404 USER_NOT_FOUND` if absent.
+
+**Response** `200 OK`: same shape as one entry of `GET /auth/admin/users`'s
+`users` array.
+
+### `POST /auth/admin/users`
+
+Create a user, reusing the exact `CreateUser` auth-DDL machinery `CREATE
+USER ... PASSWORD` and `POST /auth/signup` already share. **Superuser-only.**
+
+**Payload**:
+```json
+{
+  "username": "bob",
+  "password": "optional-initial-password",
+  "superuser": false,
+  "banned": false,
+  "app_metadata": {"plan": "pro"},
+  "user_metadata": {"nickname": "bobby"}
+}
+```
+Only `username` is required — `password` is optional (a passwordless
+account can still be reached via OAuth/magic-link later, mirroring `CREATE
+USER` with no `PASSWORD` clause); `superuser`/`banned` default `false`;
+`app_metadata`/`user_metadata` default `{}`. A duplicate username fails
+with `400 AUTHZ_ERROR`.
+
+**Response**: `201 Created` with the same user shape as `GET
+/auth/admin/users/{id}`.
+
+### `PATCH /auth/admin/users/{id}`
+
+Partial update — every field is optional, and only supplied fields change
+(omitted/`null` fields are left untouched; to clear metadata, send `{}`
+explicitly). **Superuser-only.** `404 USER_NOT_FOUND` for an unknown
+username.
+
+**Payload** (any subset):
+```json
+{
+  "password": "new-password",
+  "banned": true,
+  "app_metadata": {"plan": "enterprise"},
+  "user_metadata": {"nickname": "robert"},
+  "superuser": false
+}
+```
+- `password` → `set_password` (argon2id) + revokes every session.
+- `banned: true` → bans + revokes every session; `banned: false` → unbans
+  (no session effect — sessions already ended by the earlier ban stay
+  ended).
+- `app_metadata`/`user_metadata` → replace the whole value.
+- `superuser: false` demoting a currently-superuser account is guarded by
+  the **same last-superuser self-lockout check** as `DELETE
+  /auth/admin/users/{id}` below (`403 PERMISSION_DENIED` if it's the last
+  remaining superuser) — removing superuser status is the identical
+  lockout risk as deleting the account outright.
+
+**Response** `200 OK`: the updated user, same shape as `GET
+/auth/admin/users/{id}`.
+
+### `DELETE /auth/admin/users/{id}`
+
+Delete a user, reusing `DROP USER`'s exact machinery (memberships, grants,
+credentials, MFA enrollment, OAuth identity links, and the new admin-extra
+ban/metadata state are all cleaned up — identical whether a superuser drops
+a user via `DROP USER` SQL or via this REST route). **Superuser-only.**
+
+**Last-superuser self-lockout guard**: dropping the only remaining
+superuser account is rejected with `403 PERMISSION_DENIED` — this guard
+lives in the shared `DROP USER` code path itself, so it also protects the
+`DROP USER` SQL statement, not just this REST route. `404 USER_NOT_FOUND`
+for an unknown/already-absent username (not a silent `204` — a superuser
+deleting a specific account should always know whether it existed).
+
+**Response**: `204 No Content`.
+
+The embedded crate exposes the same five operations directly:
+`Engine::admin_list_users` / `admin_get_user` / `admin_create_user` /
+`admin_update_user` / `admin_delete_user` (and their `EngineHandle` async
+wrappers for the server), plus `Engine::is_banned` for the ban-enforcement
+check itself.
+
+---
+
 ### `PUT /tables/{table}/rls`
 
 Attach a row-level-security policy to a table (R3), as a **SQL predicate
@@ -2534,6 +2705,8 @@ by `server/error.rs`'s `ApiError` directly, not by a `DbError` variant.
 | 401 | `RECOVERY_TOKEN_INVALID` | Unknown/expired/already-used password-recovery token (item 138) |
 | 401 | `MAGICLINK_TOKEN_INVALID` | Unknown/expired/already-used magic-link login token (item 138) |
 | 401 | `UNAUTHORIZED` | Missing/malformed/wrong-signature/expired JWT |
+| 403 | `USER_BANNED` | Otherwise-valid login/refresh/email-verify by a banned account (item 142) |
+| 404 | `USER_NOT_FOUND` | `GET`/`PATCH`/`DELETE /auth/admin/users/{id}` on an unknown username (item 142) |
 | 503 | `DURABILITY_FAILURE` | An `fsync`/`msync` failed (P1.b, fsyncgate); the engine can no longer guarantee durability and must be restarted (session is poisoned) |
 | 500 | `INTERNAL_ERROR` | I/O, checksum, WAL corruption, control-file corruption, catalog corruption, buffer pool exhaustion, or an unavailable engine (`EngineUnavailable`) |
 

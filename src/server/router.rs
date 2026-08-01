@@ -223,6 +223,20 @@ pub fn build_router_with_rate_limiter(
             get(handlers::get_webhooks).post(handlers::post_webhook),
         )
         .route("/webhooks/{id}", delete(handlers::delete_webhook))
+        // ── Item 142: Auth admin API (user management) ─────────────────────
+        // Superuser-only admin surface, same posture as `/realtime/policies`/
+        // `/webhooks` above — consolidated user management (list/get/create/
+        // update/delete + ban + metadata), Supabase's `auth.admin`.
+        .route(
+            "/auth/admin/users",
+            get(handlers::get_admin_users).post(handlers::post_admin_user),
+        )
+        .route(
+            "/auth/admin/users/{id}",
+            get(handlers::get_admin_user)
+                .patch(handlers::patch_admin_user)
+                .delete(handlers::delete_admin_user),
+        )
         // ── Item 31: storage service routes (/storage/*) ──────────────────
         // All 7 routes return 503 when AppState::storage is None (unconfigured).
         // C1 list / C2 create buckets

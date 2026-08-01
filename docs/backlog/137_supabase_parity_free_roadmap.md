@@ -84,8 +84,17 @@ queue** · unidb-js SDK v0.1. *(The last three are beyond Supabase.)*
   `X-Unidb-Signature` HMAC, bounded exponential-backoff retry with per-delivery
   failure isolation — see `docs/backlog/141_database_webhooks.md`.
 - **GraphQL subscriptions** — over the realtime layer; inherit per-subscriber RLS.
-- **Auth admin API** — full user CRUD/list/ban/pagination; **identity linking**
-  (attach OAuth to an existing user by verified email); **anonymous sign-in**.
+- **Auth admin API** (IN PROGRESS — item 142 implemented, status flips to
+  DONE on merge): full user CRUD/list/ban/pagination shipped —
+  `GET/POST/PATCH/DELETE /auth/admin/users*`, superuser-only, reusing the
+  existing `CreateUser`/`DropUser`/`set_password`/`revoke_all_sessions_for_user`
+  machinery; new per-user `banned` (enforced at login/refresh/email-verify
+  with `403 USER_BANNED`, revokes sessions) and split
+  `app_metadata`/`user_metadata`; last-superuser self-lockout guard on
+  delete/demote. Control-plane only, crash 54/54 — see
+  `docs/backlog/142_auth_admin_api.md`. **Still open:** identity linking
+  (attach OAuth to an existing user by verified email); **anonymous
+  sign-in** — both out of scope for 142, tracked here as follow-ups.
 - **More OAuth providers** — generalize item-128's core (Apple, Azure, GitLab,
   Discord, …); registering apps is free.
 - **Leaked-password protection** — HaveIBeenPwned Pwned-Passwords range API (free,

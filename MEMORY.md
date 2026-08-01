@@ -12,6 +12,55 @@
 
 ## Current status
 
+- **2026-08-01 — item 142 (Auth admin API — user management) implemented, committed to branch (Status left IN PROGRESS — orchestrator flips on merge).**
+  Wave-2 free-roadmap item (137), Supabase's `auth.admin`. Consolidated superuser-only
+  REST surface under `/auth/admin/users` (`src/server/handlers.rs`/`dto.rs`/`router.rs`) —
+  `GET` paginated list (+ total, mirrors item 139's `Content-Range` posture) / `GET {id}`
+  (404 if absent) / `POST` create / `PATCH` partial update / `DELETE` — mirroring the
+  `/realtime/policies` (140) / `/webhooks` (141) admin-route pattern exactly
+  (`EngineHandle::ensure_superuser`). New control-plane per-user state in `src/authz/
+  mod.rs` (`AuthState.user_extra: BTreeMap<String, UserExtra>` — `banned: bool` +
+  `created_at: u64` + `app_metadata`/`user_metadata: serde_json::Value`, all
+  `#[serde(default)]`, no FORMAT_VERSION bump; seeded fresh on every `CreateUser`, whether
+  via `CREATE USER` SQL or the new `POST /auth/admin/users`, so a reused username never
+  inherits a stale ban/metadata record). Ban enforcement (`Engine::is_banned`) is checked
+  at `POST /auth/login` (after password verify, before the MFA branch — a banned user
+  never even gets an MFA challenge), `POST /auth/refresh` (a **non-consuming peek** via
+  `verify_session` before `rotate_session`, so a banned caller's still-live session is
+  never rotated/consumed by the rejected attempt), and the two session/credential-
+  granting email-flow redemption routes `POST /auth/verify` and `POST
+  /auth/magiclink/verify` — all four return uniform `403 USER_BANNED`, deliberately
+  *distinguishable* from the no-enumeration `401`s elsewhere (a ban isn't a secret from
+  the account holder). `POST /auth/recover`/`POST /auth/magiclink` (the *request-an-email*
+  step) are untouched — still always `200`, preserving item 138's no-enumeration contract.
+  Banning (at creation or via `PATCH banned:true`) also calls `revoke_all_sessions_for_user`
+  (item 138's mechanism); documented limitation: an already-issued short-TTL access JWT is
+  a stateless bearer credential and rides out its own expiry regardless. **Two safety-net
+  decisions beyond the literal spec, both applied at the shared `RoleStore::apply`
+  `DropUser` branch (not just the new REST route) so `DROP USER` SQL gets the same
+  protection**: (1) the last-superuser self-lockout guard (`DELETE
+  /auth/admin/users/{id}` on the sole remaining superuser → `403 PERMISSION_DENIED`); (2)
+  `RoleStore::set_superuser`'s `PATCH superuser:false` demotion shares the identical guard,
+  since demoting the last superuser is the same lockout as deleting them. `Engine`/
+  `EngineHandle` methods added for embedded-crate parity (`admin_list_users`/
+  `admin_get_user`/`admin_create_user`/`admin_update_user`/`admin_delete_user`/
+  `is_banned`); every mutation audited individually via the existing `audit.record_admin`
+  path (`create_user`/`drop_user` reuse `CREATE`/`DROP USER`'s existing action names;
+  `admin_set_banned`/`admin_set_app_metadata`/`admin_set_user_metadata`/
+  `admin_set_superuser`/`admin_set_password` are new). `GET`/`POST`/`PATCH` responses never
+  include a password hash, refresh token, or session detail — verified by a dedicated test
+  that greps the full response body for the plaintext password and `$argon2`. New
+  `tests/item142_auth_admin.rs` (12 tests, `#![cfg(feature = "server")]` first line,
+  unregistered in `Cargo.toml` per the items-138–141 precedent) + `item121_auth_core`
+  16/16 unchanged + crash 54/54 + clippy/fmt clean + plain `cargo test --no-run` (no
+  features) unaffected. Docs: `docs/REST_API.md` new "Auth admin API — user management
+  (item 142)" section (all 5 routes, ban/metadata semantics, the JWT-still-valid-until-
+  expiry note) + two new `error-codes` table rows (`USER_BANNED`/`USER_NOT_FOUND`),
+  `README.md` bullet + curl example, `137`'s Wave-2 "Auth admin API" line updated to
+  IN PROGRESS with what shipped vs. what's still open (identity linking, anonymous
+  sign-in — both explicitly out of scope for 142). `142`'s own Status left `IN PROGRESS`
+  (orchestrator flips on merge, per convention).
+
 - **2026-08-01 — item 141 (database webhooks — outbound HTTP on row change) implemented, committed to branch (Status left IN PROGRESS — orchestrator flips on merge).**
   Wave-2 free-roadmap item (137). Superuser `POST/GET/DELETE /webhooks` admin API
   (`src/server/handlers.rs`, `src/server/dto.rs`) over a new control-plane store
@@ -484,6 +533,31 @@ be raised with the user directly, not assumed.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-08-01 — item 142: Auth admin API (user management) implemented
+
+See the Current-status entry above for the full design writeup. Summary: consolidated
+superuser-only `/auth/admin/users*` REST surface (list+pagination/get/create/update/
+delete), reusing existing `CreateUser`/`DropUser`/`set_password`/
+`revoke_all_sessions_for_user` machinery end to end — no new SQL-input string building.
+New per-user control-plane state (`banned` + `app_metadata`/`user_metadata`) lives in
+`src/authz/mod.rs`'s `AuthState.user_extra` map, `#[serde(default)]`, no FORMAT_VERSION
+bump. Ban enforcement lands at `POST /auth/login`/`/auth/refresh`/`/auth/verify`/
+`/auth/magiclink/verify` (`403 USER_BANNED`), leaving `/auth/recover`/`/auth/magiclink`'s
+no-enumeration `200` contract untouched. Went beyond the literal spec in one place, on
+purpose: the last-superuser self-lockout guard lives inside `RoleStore::apply`'s shared
+`DropUser` branch (not duplicated into the REST handler), so plain `DROP USER` SQL is
+protected too, not just the new `DELETE` route; the same reasoning extended the guard to
+`PATCH superuser:false` (demotion is the identical lockout risk as deletion) — an addition
+beyond the backlog doc's literal ask, flagged here rather than silently shipped. All 7
+gates green: build/clippy(`--all-features --all-targets -D warnings`)/fmt clean, plain
+`cargo test --no-run` (no features) unaffected, new `tests/item142_auth_admin.rs` 12/12,
+pre-existing `item121_auth_core` 16/16 unchanged, crash 54/54. `scripts/lint_backlog.sh`
+and `scripts/lint_docs.sh` both clean. Docs updated: `docs/REST_API.md` (new section +
+2 error-code table rows), `README.md` (bullet + curl example), `137`'s Wave-2 "Auth admin
+API" line (marked IN PROGRESS, what shipped vs. still-open identity-linking/anonymous-
+sign-in follow-ups). `142`'s own Status left IN PROGRESS per orchestrator convention.
+Committed to the current branch, not merged/PR'd.
 
 ### 2026-08-01 — item 139: `/rest/v1` count + `Prefer` response controls implemented
 
