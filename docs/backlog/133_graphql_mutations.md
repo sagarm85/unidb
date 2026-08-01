@@ -1,7 +1,10 @@
 # GraphQL mutations
 
 **Type:** Improvement
-**Status:** IN PROGRESS
+**Status:** SHIPPED (2026-08-01, PR #235) — `Mutation` root (`insert_/update_/delete_<t>`)
+routed through the same `run_stmt`/`run_stmts` → `execute_sql_params_as_principal` path
+`/rest/v1`/`/sql` use; RLS + `WITH CHECK` + column grants inherited (parity-tested),
+`RETURNING` projects requested sub-fields only. Crash 54/54. See the file for detail.
 
 > Supabase-parity gap (item 120 / 130 follow-up). unidb's GraphQL API (C4, item
 > 130, `POST /graphql`) shipped **read-only v1** — a `Query` root only. Supabase's
