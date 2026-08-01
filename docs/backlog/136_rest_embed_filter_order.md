@@ -1,7 +1,7 @@
 # /rest/v1 embedded-resource filtering + ordering
 
 **Type:** Improvement
-**Status:** IN PROGRESS
+**Status:** SHIPPED (2026-08-01, PR #239) — dotted per-embed filter/order/limit(per-parent); enforcement inherited via the embed's existing execute_sql_params_as_principal path (grant-parity tested); unknown prefix → 400. Crash 54/54.
 
 > Supabase/PostgREST-parity gap (item 123 C2 follow-up), confirmed 2026-08-01 by
 > the unidb-studio session. `/rest/v1` embedded expansion (`select=id,orders(id,

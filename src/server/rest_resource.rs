@@ -801,13 +801,62 @@ fn resolve_relation(
     }
 }
 
+/// Item 136: per-embed `{filter, order, limit, offset}` parsed from
+/// `<embed>.<col>=<op>.<val>` / `<embed>.order=col.asc,...` /
+/// `<embed>.limit=n` / `<embed>.offset=n` query params — reserved sub-keys
+/// are `order`/`limit`/`offset`; everything else under the prefix is a
+/// filter on that column of the embedded resource. `limit`/`offset` are
+/// applied **per-parent** (lateral semantics) after the embedded rows are
+/// stitched to their parent by join key — see [`get_collection`]'s slicing
+/// step — never as a single combined SQL `LIMIT` on the `IN (...)` query,
+/// which would wrongly cap across all parents.
+#[derive(Clone, Debug, Default)]
+struct EmbedQuery {
+    filters: Vec<Filter>,
+    order: Vec<(String, bool)>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+/// Parse one embed's dotted param group (prefix already stripped) against
+/// the embedded resource's own catalog (`target_def`) — reuses the exact
+/// same operator/order/int grammar as the top-level path
+/// ([`parse_op`]/[`parse_order_value`]/[`parse_nonneg_int`]), just scoped to
+/// a different table's columns.
+fn parse_embed_query(
+    target_def: &TableDef,
+    pairs: &[(String, String)],
+) -> Result<EmbedQuery, ApiError> {
+    let mut q = EmbedQuery::default();
+    for (sub, v) in pairs {
+        match sub.as_str() {
+            "order" => q.order.extend(parse_order_value(v)),
+            "limit" => q.limit = Some(parse_nonneg_int(v, "limit")?),
+            "offset" => q.offset = Some(parse_nonneg_int(v, "offset")?),
+            _ => {
+                validate_column(target_def, sub)?;
+                q.filters.push(Filter {
+                    column: sub.clone(),
+                    op: parse_op(v)?,
+                });
+            }
+        }
+    }
+    for (c, _) in &q.order {
+        validate_column(target_def, c)?;
+    }
+    Ok(q)
+}
+
 /// One embed spec resolved from `select=`: its output alias (the key it's
-/// nested under), the relationship, and the requested sub-columns (empty =
-/// all columns of the embedded resource).
+/// nested under), the relationship, the requested sub-columns (empty = all
+/// columns of the embedded resource), and (item 136) any dotted-param
+/// filter/order/limit/offset scoped to it.
 struct EmbedSpec {
     alias: String,
     relation: Relation,
     sub_cols: Vec<String>,
+    query: EmbedQuery,
 }
 
 /// Canonical string key for grouping/joining `Literal` values across the two
@@ -823,6 +872,16 @@ fn literal_key(lit: &Literal) -> String {
 /// enforced path (RLS + table/column grants) as everything else in this
 /// module. `keys` are the distinct non-NULL join values collected from the
 /// base result; empty `keys` short-circuits without a query.
+///
+/// Item 136: `query`'s filters are AND-combined with the `join_col IN
+/// (...)` clause (same `append_where` fragment builder + `$n` binds as the
+/// top-level path — no new enforcement or injection surface), and its
+/// requested order is appended **after** `join_col` in `ORDER BY` so a
+/// caller's per-embed ordering is stable within each parent's group.
+/// Deliberately **no SQL `LIMIT`/`OFFSET` here** — per-parent pagination is
+/// sliced in Rust by the caller after grouping by join key (a single SQL
+/// `LIMIT` would wrongly cap rows across all parents combined, not per
+/// parent).
 async fn fetch_embedded(
     state: &AppState,
     principal: &AuthPrincipal,
@@ -830,6 +889,7 @@ async fn fetch_embedded(
     sub_cols: &[String],
     join_col: &str,
     keys: &[Literal],
+    query: &EmbedQuery,
 ) -> Result<Vec<(String, JsonMap<String, JsonValue>)>, ApiError> {
     if keys.is_empty() {
         return Ok(Vec::new());
@@ -857,11 +917,22 @@ async fn fetch_embedded(
             format!("${}", binds.len())
         })
         .collect();
+    let in_clause = format!("{} IN ({})", quote_ident(join_col), placeholders.join(", "));
+    let where_sql = match append_where(&query.filters, &mut binds) {
+        Some(f) => format!("{in_clause} AND {f}"),
+        None => in_clause,
+    };
+    let mut order_parts = vec![quote_ident(join_col)];
+    order_parts.extend(
+        query
+            .order
+            .iter()
+            .map(|(c, desc)| format!("{} {}", quote_ident(c), if *desc { "DESC" } else { "ASC" })),
+    );
     let sql = format!(
-        "SELECT {projection_sql} FROM {} WHERE {} IN ({})",
+        "SELECT {projection_sql} FROM {} WHERE {where_sql} ORDER BY {}",
         table_ident(&target_def.name),
-        quote_ident(join_col),
-        placeholders.join(", ")
+        order_parts.join(", "),
     );
 
     let result = run_stmt(state, principal, sql, binds).await?;
@@ -918,6 +989,24 @@ pub async fn get_collection(
     let def = lookup_table(&state, &table).await?;
     let pairs = parse_query_pairs(raw.as_deref());
 
+    // item 136: split into top-level params and `<embed>.<rest>` groups on
+    // the FIRST dot — safe because no top-level column/param identifier in
+    // this module ever contains a dot (see this module's doc comment).
+    // Reserved sub-keys (`order`/`limit`/`offset`) and filter columns are
+    // disambiguated per-group below, once the embed's target table (and
+    // thus its catalog) is known.
+    let mut top_pairs: Vec<(String, String)> = Vec::new();
+    let mut embed_param_groups: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for (k, v) in pairs {
+        match k.split_once('.') {
+            Some((prefix, sub)) => embed_param_groups
+                .entry(prefix.to_string())
+                .or_default()
+                .push((sub.to_string(), v)),
+            None => top_pairs.push((k, v)),
+        }
+    }
+
     let mut select_items: Vec<SelectItem> = Vec::new();
     let mut select_param_present = false;
     let mut order_keys: Vec<(String, bool)> = Vec::new();
@@ -925,7 +1014,7 @@ pub async fn get_collection(
     let mut offset: Option<i64> = None;
     let mut filter_pairs: Vec<(String, String)> = Vec::new();
 
-    for (k, v) in &pairs {
+    for (k, v) in &top_pairs {
         match k.as_str() {
             "select" => {
                 select_param_present = true;
@@ -980,11 +1069,26 @@ pub async fn get_collection(
         for c in columns {
             validate_column(target_def, c)?;
         }
+        let query = match embed_param_groups.remove(name) {
+            Some(group) => parse_embed_query(target_def, &group)?,
+            None => EmbedQuery::default(),
+        };
         embed_specs.push(EmbedSpec {
             alias: name.clone(),
             relation,
             sub_cols: columns.clone(),
+            query,
         });
+    }
+
+    // item 136: any dotted param group whose prefix never matched an
+    // embedded relation from `select=` is a clear 400, not a silently
+    // ignored no-op.
+    if let Some((unknown_prefix, _)) = embed_param_groups.into_iter().next() {
+        return Err(ApiError::bad_request(
+            "UNKNOWN_EMBED_PARAM",
+            format!("`{unknown_prefix}.*` does not name an embedded relation in `select=`"),
+        ));
     }
 
     // The base query must also fetch each embed's join-key column, even if
@@ -1115,12 +1219,27 @@ pub async fn get_collection(
             &spec.sub_cols,
             &target_join_col,
             &keys,
+            &spec.query,
         )
         .await?;
 
         let mut grouped: HashMap<String, Vec<JsonMap<String, JsonValue>>> = HashMap::new();
         for (k, obj) in fetched {
             grouped.entry(k).or_default().push(obj);
+        }
+
+        // item 136: per-parent (lateral) limit/offset — slice EACH parent's
+        // group in the already-applied SQL order, never a single combined
+        // cap across all parents. Rows already arrived pre-sorted by
+        // `join_col, <requested order>` (see `fetch_embedded`), and
+        // `HashMap::entry(...).or_default().push` above preserves that
+        // per-group arrival order.
+        if spec.query.limit.is_some() || spec.query.offset.is_some() {
+            let offset = spec.query.offset.unwrap_or(0) as usize;
+            let limit = spec.query.limit.map(|l| l as usize).unwrap_or(usize::MAX);
+            for v in grouped.values_mut() {
+                *v = v.drain(..).skip(offset).take(limit).collect();
+            }
         }
 
         resolved.push(Resolved {
