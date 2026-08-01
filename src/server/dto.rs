@@ -423,6 +423,110 @@ impl std::fmt::Debug for AuthLogoutRequest {
     }
 }
 
+// ── item 138: email transport + password-reset / magic-link flows ─────────
+
+/// Body of `POST /auth/recover` (item 138): request a password-reset email
+/// for `email`. Always responds `200` (via [`AuthEmailFlowAck`]) regardless
+/// of whether `email` matches a registered account — see `handlers.rs::
+/// post_auth_recover`'s doc comment for the no-account-enumeration contract.
+#[derive(Deserialize)]
+pub struct AuthRecoverRequest {
+    pub email: String,
+    /// Item 131 (Workstream I2): optional CAPTCHA token, required only when
+    /// `UNIDB_CAPTCHA_PROTECT` includes `recover` — see
+    /// [`AuthLoginRequest::captcha_token`].
+    #[serde(default)]
+    pub captcha_token: Option<String>,
+}
+
+/// Manual `Debug`: redacts `captcha_token`, same posture as
+/// [`AuthLoginRequest`]. `email` is not a secret (same non-secret-identifier
+/// posture as `username` elsewhere in this file) — shown as-is.
+impl std::fmt::Debug for AuthRecoverRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthRecoverRequest")
+            .field("email", &self.email)
+            .field(
+                "captcha_token",
+                &self.captcha_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// Body of `POST /auth/magiclink` (item 138): request a magic sign-in link
+/// email for `email`. Same always-`200`, no-account-enumeration contract as
+/// [`AuthRecoverRequest`].
+#[derive(Deserialize)]
+pub struct AuthMagicLinkRequest {
+    pub email: String,
+    /// Required only when `UNIDB_CAPTCHA_PROTECT` includes `magiclink`.
+    #[serde(default)]
+    pub captcha_token: Option<String>,
+}
+
+/// Manual `Debug`: redacts `captcha_token`, mirrors [`AuthRecoverRequest`].
+impl std::fmt::Debug for AuthMagicLinkRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthMagicLinkRequest")
+            .field("email", &self.email)
+            .field(
+                "captcha_token",
+                &self.captcha_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// Response of `POST /auth/recover`/`POST /auth/magiclink` (item 138):
+/// deliberately content-free beyond a fixed `ok: true` — the whole point of
+/// the no-account-enumeration contract is that a known vs. unknown `email`
+/// produces a byte-identical response, so this type carries nothing that
+/// could vary between the two cases.
+#[derive(Debug, Serialize)]
+pub struct AuthEmailFlowAck {
+    pub ok: bool,
+}
+
+/// Body of `POST /auth/verify` (item 138): redeem a password-recovery token
+/// (from the emailed link) for a new password. Unknown/expired/used token
+/// maps to a uniform `401` (see the handler's doc comment) — no oracle on
+/// *why* it failed.
+#[derive(Deserialize)]
+pub struct AuthVerifyRequest {
+    pub token: String,
+    pub new_password: String,
+}
+
+/// Manual `Debug`: redacts both fields — `token` is a live single-use bearer
+/// credential and `new_password` is, well, a password; same posture as
+/// every other auth-secret DTO in this file.
+impl std::fmt::Debug for AuthVerifyRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthVerifyRequest")
+            .field("token", &"<redacted>")
+            .field("new_password", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Body of `POST /auth/magiclink/verify` (item 138): redeem a magic-link
+/// login token (from the emailed link) for a real session — response is a
+/// plain [`AuthLoginResponse`], the same shape every other login path uses.
+#[derive(Deserialize)]
+pub struct AuthMagicLinkVerifyRequest {
+    pub token: String,
+}
+
+/// Manual `Debug`: redacts `token` — a live single-use bearer credential.
+impl std::fmt::Debug for AuthMagicLinkVerifyRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthMagicLinkVerifyRequest")
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Response of `GET /auth/meta`.
 #[derive(Debug, Serialize)]
 pub struct AuthMetaResponse {

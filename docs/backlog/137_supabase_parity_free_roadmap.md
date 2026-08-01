@@ -37,10 +37,19 @@ queue** · unidb-js SDK v0.1. *(The last three are beyond Supabase.)*
 
 ## Wave 1 — highest ROI, unblock clusters
 
-- **138 — Email transport + templates** (IN PROGRESS). Pluggable `EmailTransport`
-  (SMTP + dev/log), template system. Provider-agnostic — self-host SMTP / free
-  tier / dev-log; engine never forces a paid provider. **Unlocks 5 flows:**
-  password reset, magic link, email OTP, email confirmation, email change.
+- **138 — Email transport + templates** (IN PROGRESS — transport + templates +
+  password reset + magic link shipped; status flips to DONE on merge). Pluggable
+  `EmailTransport` (SMTP via `lettre` + a dev/log transport), template system
+  with `{{link}}`/`{{code}}`/`{{user}}`/`{{site_url}}` substitution.
+  Provider-agnostic — self-host SMTP / free tier / dev-log; engine never
+  forces a paid provider. **Unlocks 5 flows — 2 landed this PR:**
+  password reset (`POST /auth/recover`/`/auth/verify`) and magic link
+  (`POST /auth/magiclink`/`/auth/magiclink/verify`), both no-account-
+  enumeration by design. Email OTP, email confirmation, and email change are
+  the same machinery and remain fast follow-ups (also: no `users.email`
+  column exists yet — `email` is currently looked up as a username directly,
+  see `src/server/email.rs`'s module doc — a real column is part of that
+  follow-up).
 - **REST upsert + count + `Prefer` headers** — `on_conflict`/`resolution=
   merge-duplicates`, `count=exact` + `Content-Range`, `return=representation/
   minimal`. PostgREST-parity clients expect these.

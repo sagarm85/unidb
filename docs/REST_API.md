@@ -77,6 +77,9 @@ returns a short-lived challenge that must be redeemed at
 login** (item 128, Google/GitHub) — see
 [OAuth 2.0 social login](#oauth-20-social-login-item-128-workstream-d1) —
 which resolves to the same kind of session through the same issuance path.
+Self-service **password reset** and **magic-link (passwordless) login**
+(item 138) are also available — see
+[Email transport + password reset / magic link](#email-transport--password-reset--magic-link-item-138).
 
 > **Correction (2026-07-31):** earlier versions of this section stated "there
 > is no login endpoint, no user database, and no session state." That is no
@@ -1532,16 +1535,18 @@ for a symmetric key, and this route only ever serializes a public key.
 
 #### Auth rate limiting (item 121 I1)
 
-`POST /auth/login`, `/auth/signup`, `/auth/refresh`, and (item 127)
-`/auth/mfa/challenge` — the routes reachable with no bearer token at all —
-are brute-force targets, so all four sit behind a shared, in-memory, per-key
-rate limiter (a hand-rolled fixed window; no external rate-limit crate).
-`/auth/mfa/challenge` gets its own independent bucket (keyed by IP+path,
-same as `/auth/refresh` — its body has no `username` field to additionally
-key on) — guessing a 6-digit TOTP code is exactly the kind of brute-force
-target this limiter exists for. **Read/data routes, `/sql`, `/metrics`,
-`/.well-known/jwks.json`, `/auth/meta`, `/auth/logout`, and the authenticated
-`/auth/mfa/enroll` · `/verify` · `/disable` routes (already
+`POST /auth/login`, `/auth/signup`, `/auth/refresh`, (item 127)
+`/auth/mfa/challenge`, and (item 138) `/auth/recover`, `/auth/verify`,
+`/auth/magiclink`, `/auth/magiclink/verify` — the routes reachable with no
+bearer token at all — are brute-force targets, so all eight sit behind a
+shared, in-memory, per-key rate limiter (a hand-rolled fixed window; no
+external rate-limit crate). `/auth/mfa/challenge`/the item-138 verify routes
+each get their own independent bucket (keyed by IP+path, same as
+`/auth/refresh` — their bodies have no `username` field to additionally key
+on) — guessing an opaque token or a 6-digit TOTP code is exactly the kind of
+brute-force target this limiter exists for. **Read/data routes, `/sql`,
+`/metrics`, `/.well-known/jwks.json`, `/auth/meta`, `/auth/logout`, and the
+authenticated `/auth/mfa/enroll` · `/verify` · `/disable` routes (already
 gated by requiring a valid JWT) are never rate-limited.**
 
 - **Key:** the client's TCP peer IP address (`X-Forwarded-For` is
@@ -1561,25 +1566,28 @@ gated by requiring a valid JWT) are never rate-limited.**
 #### CAPTCHA / bot protection (item 131, Workstream I2)
 
 Complements the rate limiter above: instead of throttling by request volume,
-`POST /auth/login`/`/auth/signup` can require a verified CAPTCHA token per
-request (provider-agnostic; [Cloudflare
-Turnstile](https://developers.cloudflare.com/turnstile/) ships as the
-default). **Disabled by default** — with no config set, both routes behave
-exactly as documented below with no `captcha_token` involved at all.
+`POST /auth/login`/`/auth/signup`/(item 138) `/auth/recover`/`/auth/magiclink`
+can each require a verified CAPTCHA token per request (provider-agnostic;
+[Cloudflare Turnstile](https://developers.cloudflare.com/turnstile/) ships
+as the default). **Disabled by default** — with no config set, every route
+behaves exactly as documented below with no `captcha_token` involved at
+all.
 
 - **Config:** `UNIDB_CAPTCHA_PROTECT` (default **empty = disabled**) —
-  comma-separated list of `login`/`signup` naming which routes require a
-  token. `UNIDB_CAPTCHA_PROVIDER` (default `turnstile`; also `hcaptcha` /
-  `recaptcha` — all three speak the same siteverify wire shape, so only the
-  default verify URL differs). `UNIDB_CAPTCHA_SECRET` — the provider's
-  server-side secret key; resolved **vault-first** (secret name
-  `captcha.secret`, `unidb-vault set captcha.secret`, item 129) and falling
-  back to this env value, exactly like OAuth's client secret. `UNIDB_
+  comma-separated list of `login`/`signup`/`recover`/`magiclink` naming
+  which routes require a token. `UNIDB_CAPTCHA_PROVIDER` (default
+  `turnstile`; also `hcaptcha` / `recaptcha` — all three speak the same
+  siteverify wire shape, so only the default verify URL differs).
+  `UNIDB_CAPTCHA_SECRET` — the provider's server-side secret key; resolved
+  **vault-first** (secret name `captcha.secret`, `unidb-vault set
+  captcha.secret`, item 129) and falling back to this env value, exactly
+  like OAuth's client secret. `UNIDB_
   CAPTCHA_VERIFY_URL` — override the siteverify endpoint (for pointing a
   deployment at a self-hosted/mocked verifier).
-- **Request field:** both `POST /auth/login` and `POST /auth/signup` accept
-  an optional `captcha_token` field — the token the client-side CAPTCHA
-  widget produced. Required only when the route is named in
+- **Request field:** `POST /auth/login`, `POST /auth/signup`, `POST
+  /auth/recover`, and `POST /auth/magiclink` each accept an optional
+  `captcha_token` field — the token the client-side CAPTCHA widget
+  produced. Required only when the route is named in
   `UNIDB_CAPTCHA_PROTECT`; otherwise ignored (safe to omit).
 - **Where it runs:** inside the handler, after the I1 rate limiter and after
   the route's own enable/signing-key gates, but **before any credential
@@ -1974,13 +1982,118 @@ guessable credential — `authorize` takes no input at all, and
 single-use tokens with no meaningful brute-force surface for a
 fixed-window IP limiter to protect.
 
+### Email transport + password reset / magic link (item 138)
+
+unidb can send outbound email for two self-service auth flows: password
+reset and magic-link (passwordless) login. **No `users.email` column
+exists yet** — `email` in the requests below is looked up **directly as a
+username**, i.e. this milestone assumes an account's username *is* its
+email address (a supported convention today via `POST /auth/signup`). A
+real `users.email` column is tracked as a fast follow-up in
+`docs/backlog/137_supabase_parity_free_roadmap.md`; the request shape
+(`{"email": "..."}`) will not need to change when it lands.
+
+**Transport config** — `UNIDB_EMAIL_TRANSPORT` (default `log`):
+- `log` (default) — writes the fully-rendered email to a dev-inbox file
+  (`UNIDB_EMAIL_DEV_FILE`, default `<UNIDB_DATA_DIR>/email-dev-inbox.jsonl`,
+  one JSON line per send: `{to, from, subject, text_body, html_body}`) and
+  to `tracing`, instead of actually sending — no mail server needed for
+  local dev/tests (mirrors Supabase's Inbucket/Mailpit).
+- `smtp` — real delivery via `lettre`. Requires `UNIDB_SMTP_HOST` and
+  `UNIDB_SMTP_FROM` (the server refuses to start otherwise, with a clear
+  error naming which is missing); also reads `UNIDB_SMTP_PORT` (default
+  `587`), `UNIDB_SMTP_USERNAME`, and `UNIDB_SMTP_TLS_MODE` (`tls` — the
+  default, implicit TLS/SMTPS — | `starttls` | `none`, only for a trusted
+  local relay). The password is resolved **vault-first**: a vault secret
+  named `smtp.password` (`unidb-vault set smtp.password`) wins over
+  `UNIDB_SMTP_PASSWORD` — the exact same order/fail-closed contract as
+  OAuth's client-secret resolution above.
+- `UNIDB_EMAIL_SITE_URL` (default `http://localhost:8080`) — the base URL
+  used to build the `{{link}}` in both templates:
+  `{site_url}/auth/verify?token=...` (recovery) /
+  `{site_url}/auth/magiclink/verify?token=...` (magic link).
+
+**Templates** — built-in defaults for `"recovery"` and `"magiclink"`
+(subject + text + HTML body), each with `{{link}}`/`{{user}}`/
+`{{site_url}}`/`{{code}}` substitution; substituted values are HTML-escaped
+in the HTML body. Override either (or both) via `UNIDB_EMAIL_TEMPLATES_DIR`
+— a directory containing `<name>.txt` (first line = subject, the rest =
+the text body) and an optional `<name>.html`.
+
+**No account enumeration:** both `POST /auth/recover` and `POST
+/auth/magiclink` **always return `200`** — a registered vs. unregistered
+`email` is byte-identical in status, body, and (best-effort) timing. A
+token-mint or email-send failure for a *registered* account is logged
+server-side (`tracing::warn!`) but still returns `200` — delivery failures
+must not become a distinguishable oracle either. Both routes are
+rate-limited (item I1) and CAPTCHA-eligible (item I2, endpoint names
+`recover`/`magiclink`) exactly like `POST /auth/login`/`/auth/signup`.
+
+**Tokens:** single-use, hash-only persisted (SHA-256, same posture as every
+other token in this server — refresh tokens, MFA challenges, OAuth state).
+Recovery tokens are valid 1 hour; magic-link tokens 15 minutes (the same
+narrow window as an MFA login challenge, since redeeming one mints a full
+session with no second factor).
+
+#### `POST /auth/recover` — request a password-reset email
+
+**Auth:** None (public).
+
+**Request:**
+```json
+{ "email": "alice@example.com" }
+```
+**Response** `200 OK` (always, regardless of whether `email` is known):
+```json
+{ "ok": true }
+```
+
+#### `POST /auth/verify` — redeem a recovery token for a new password
+
+**Auth:** None (public — the token itself is the pre-session credential).
+
+Validates + single-use-consumes `token`, sets the new argon2id credential
+via the same path `ALTER USER ... PASSWORD` uses, and revokes every
+existing session for that user (a session obtained with the old password
+stops working immediately).
+
+**Request:**
+```json
+{ "token": "<opaque-hex-from-email>", "new_password": "a-new-password" }
+```
+**Response** `200 OK`: `{ "ok": true }`.
+
+**Errors:** `401 RECOVERY_TOKEN_INVALID` — uniform for unknown/expired/
+already-used token (no oracle on *why*).
+
+#### `POST /auth/magiclink` — request a magic sign-in link email
+
+**Auth:** None (public). Same shape/contract as `POST /auth/recover` above.
+
+**Request:** `{ "email": "alice@example.com" }`. **Response** `200 OK`
+(always): `{ "ok": true }`.
+
+#### `POST /auth/magiclink/verify` — redeem a magic-link token for a session
+
+**Auth:** None (public — the token itself is the pre-session credential,
+same posture as `POST /auth/mfa/challenge`).
+
+**Request:**
+```json
+{ "token": "<opaque-hex-from-email>" }
+```
+**Response** `200 OK` — same shape as `POST /auth/login`'s non-MFA
+response: `{ "token": "...", "access_token": "...", "refresh_token": "...", "expires_in": 3600 }`.
+
+**Errors:** `401 MAGICLINK_TOKEN_INVALID` — uniform for unknown/expired/
+already-used token.
+
 ### Secrets vault (item 129, Workstream I3)
 
-Config secrets — today, OAuth client secrets (above); later, SMTP
-credentials — can be stored **encrypted at rest** in `roles.json` instead
-of sitting in plaintext env vars. This is not an HTTP feature (no new
-routes): it's a CLI + an internal resolution order that the OAuth flow
-already uses.
+Config secrets — OAuth client secrets and the SMTP password (above) — can
+be stored **encrypted at rest** in `roles.json` instead of sitting in
+plaintext env vars. This is not an HTTP feature (no new routes): it's a CLI
++ an internal resolution order that the OAuth and email flows already use.
 
 **Master key — `UNIDB_MASTER_KEY`:** a 32-byte AES-256 key, encoded as
 either base64 (standard alphabet, padded or unpadded — 44 or 43 characters)
@@ -2186,6 +2299,8 @@ by `server/error.rs`'s `ApiError` directly, not by a `DbError` variant.
 | 401 | `OAUTH_STATE_INVALID` | Unknown/expired/replayed/wrong-provider OAuth `state` (item 128) |
 | 401 | `OAUTH_TOKEN_EXCHANGE_FAILED` | Provider explicitly rejected the code/PKCE exchange (item 128) |
 | 502 | `OAUTH_PROVIDER_UNAVAILABLE` | OAuth provider unreachable, erroring, or unparseable (item 128) |
+| 401 | `RECOVERY_TOKEN_INVALID` | Unknown/expired/already-used password-recovery token (item 138) |
+| 401 | `MAGICLINK_TOKEN_INVALID` | Unknown/expired/already-used magic-link login token (item 138) |
 | 401 | `UNAUTHORIZED` | Missing/malformed/wrong-signature/expired JWT |
 | 503 | `DURABILITY_FAILURE` | An `fsync`/`msync` failed (P1.b, fsyncgate); the engine can no longer guarantee durability and must be restarted (session is poisoned) |
 | 500 | `INTERNAL_ERROR` | I/O, checksum, WAL corruption, control-file corruption, catalog corruption, buffer pool exhaustion, or an unavailable engine (`EngineUnavailable`) |

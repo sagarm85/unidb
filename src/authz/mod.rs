@@ -214,6 +214,36 @@ fn generate_oauth_state_token() -> String {
     out
 }
 
+/// Generate a new single-use password-recovery token (item 138): 256 bits
+/// from the OS CSPRNG, hex-encoded — same shape/construction as
+/// [`generate_oauth_state_token`], but its own token space (keys
+/// [`AuthState::recovery_tokens`], never accepted where a refresh/MFA/OAuth
+/// token is expected or vice versa). Only its SHA-256 hash is ever
+/// persisted — see [`RoleStore::create_recovery_token`].
+fn generate_recovery_token() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// Generate a new single-use magic-link login token (item 138): 256 bits
+/// from the OS CSPRNG, hex-encoded — its own token space (keys
+/// [`AuthState::magiclink_tokens`]), same construction/posture as
+/// [`generate_recovery_token`].
+fn generate_magiclink_token() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
 /// Generate a new PKCE (RFC 7636) `code_verifier` (item 128): 256 bits from
 /// the OS CSPRNG, hex-encoded to a 64-character string. Hex digits are all
 /// within RFC 7636's `code_verifier` charset (`ALPHA / DIGIT / "-" / "." /
@@ -270,6 +300,21 @@ const RECOVERY_CODE_COUNT: usize = 8;
 /// isn't a standing liability. `pub` so `src/server/oauth.rs` can echo the
 /// real TTL without duplicating the literal (mirrors `MFA_CHALLENGE_TTL_SECS`).
 pub const OAUTH_STATE_TTL_SECS: u64 = 10 * 60;
+
+/// Password-recovery token lifetime (item 138 — `POST /auth/recover`): long
+/// enough to receive and act on an email, short enough that a leaked/unused
+/// link isn't a standing liability — matches the spec's "~1h" guidance and
+/// common industry practice (GitHub/Google use a similar order of
+/// magnitude). `pub` so `src/server/email.rs`/`handlers.rs` can echo the
+/// real TTL without duplicating the literal.
+pub const RECOVERY_TOKEN_TTL_SECS: u64 = 60 * 60;
+
+/// Magic-link login token lifetime (item 138 — `POST /auth/magiclink`):
+/// deliberately much shorter than [`RECOVERY_TOKEN_TTL_SECS`] — a magic link
+/// mints a full session on redemption (no second factor like a password),
+/// so it gets the same narrow window as an MFA login challenge
+/// ([`MFA_CHALLENGE_TTL_SECS`]) rather than the recovery flow's longer one.
+pub const MAGICLINK_TOKEN_TTL_SECS: u64 = 15 * 60;
 
 const BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
@@ -484,6 +529,27 @@ struct OAuthStateRec {
     /// ([`RoleStore::verify_oauth_state`]) so a captured/replayed callback
     /// URL (e.g. from a proxy access log or shared browser history) can
     /// never be redeemed a second time.
+    used: bool,
+}
+
+/// A pending, single-use auth-email token (item 138 — password recovery /
+/// magic-link login). Keyed in [`AuthState::recovery_tokens`]/
+/// [`AuthState::magiclink_tokens`] (two independent token spaces, never
+/// cross-accepted — a recovery token can never redeem a magic-link login and
+/// vice versa) by the SHA-256 hash of the raw opaque token — the raw token
+/// itself is never persisted, mirroring [`OAuthStateRec`]/[`MfaChallengeRec`]/
+/// [`SessionRec`]'s "hash-only" posture. Shared shape for both flows (both
+/// are "a username plus an issue/expiry/used-once envelope") — see
+/// [`RoleStore::create_recovery_token`]/[`RoleStore::create_magiclink_token`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct EmailTokenRec {
+    username: String,
+    issued_at: u64,
+    expires_at: u64,
+    /// Single-use: set the moment the token is redeemed (`verify_*_token`)
+    /// so a captured/replayed link (e.g. from an email-forwarding service's
+    /// link-prefetch, or a shared inbox) can never be redeemed a second
+    /// time.
     used: bool,
 }
 
@@ -750,6 +816,22 @@ struct AuthState {
     /// case-by-case basis.
     #[serde(default)]
     secrets: BTreeMap<String, String>,
+    /// token_hash (SHA-256 hex of the raw recovery token) → pending
+    /// password-recovery record (item 138 — `POST /auth/recover`/`POST
+    /// /auth/verify`). Never the raw token itself — same posture as
+    /// `sessions`/`oauth_states`. `#[serde(default)]` so a pre-138
+    /// `roles.json` deserializes with an empty map — no FORMAT_VERSION bump.
+    /// Kept out of `Debug` (see the manual impl below).
+    #[serde(default)]
+    recovery_tokens: BTreeMap<String, EmailTokenRec>,
+    /// token_hash (SHA-256 hex of the raw magic-link token) → pending
+    /// magic-link login record (item 138 — `POST /auth/magiclink`/`POST
+    /// /auth/magiclink/verify`). Independent token space from
+    /// `recovery_tokens` — see [`EmailTokenRec`]'s doc comment.
+    /// `#[serde(default)]`, kept out of `Debug`, same posture as
+    /// `recovery_tokens`.
+    #[serde(default)]
+    magiclink_tokens: BTreeMap<String, EmailTokenRec>,
 }
 
 /// Manual `Debug`: every field except `credentials`/`sessions`/`mfa`/
@@ -787,6 +869,16 @@ impl std::fmt::Debug for AuthState {
             // item 129: never show even the ciphertext blob — a count only,
             // same posture as `credentials`/`sessions`/`mfa` above.
             .field("secrets", &format!("<{} redacted>", self.secrets.len()))
+            // item 138: pending recovery/magic-link tokens — counts only,
+            // same posture as `sessions`/`oauth_states` above.
+            .field(
+                "recovery_tokens",
+                &format!("<{} redacted>", self.recovery_tokens.len()),
+            )
+            .field(
+                "magiclink_tokens",
+                &format!("<{} redacted>", self.magiclink_tokens.len()),
+            )
             .finish()
     }
 }
@@ -1622,6 +1714,135 @@ impl RoleStore {
         self.persist(&st)?;
         tracing::info!(provider = %provider, user = %username, "OAuth identity linked (new account created)");
         Ok(username)
+    }
+
+    // ── item 138: email transport + password-reset / magic-link flows ───
+
+    /// Whether `user` is a registered account (item 138 — the existence
+    /// check `POST /auth/recover`/`POST /auth/magiclink` make *before*
+    /// deciding whether to mint a token/send an email). The caller must
+    /// still return the identical `200` regardless of this result — see
+    /// `handlers.rs::post_auth_recover`/`post_auth_magiclink`'s doc comments
+    /// for the no-account-enumeration contract this check feeds into.
+    pub fn user_exists(&self, user: &str) -> bool {
+        self.lock().users.contains_key(user)
+    }
+
+    /// Mint a fresh, single-use password-recovery token for `user` (item 138
+    /// — `POST /auth/recover`'s embedded-API entry point), valid for
+    /// [`RECOVERY_TOKEN_TTL_SECS`]. Returns `(raw_token,
+    /// expires_at_unix_secs)`. Callers must already have confirmed `user`
+    /// exists (see [`Self::user_exists`]) — this method itself performs no
+    /// existence check and always succeeds, mirroring [`Self::
+    /// create_oauth_state`]'s unconditional-mint posture (the no-enumeration
+    /// gate lives in the caller, not here).
+    pub fn create_recovery_token(&self, user: &str) -> Result<(String, u64)> {
+        let raw = generate_recovery_token();
+        let hash = sha256_hex(&raw);
+        let now = now_secs();
+        let expires_at = now + RECOVERY_TOKEN_TTL_SECS;
+        let mut st = self.lock();
+        st.recovery_tokens.insert(
+            hash,
+            EmailTokenRec {
+                username: user.to_string(),
+                issued_at: now,
+                expires_at,
+                used: false,
+            },
+        );
+        self.persist(&st)?;
+        Ok((raw, expires_at))
+    }
+
+    /// Validate + single-use-consume a password-recovery token (item 138 —
+    /// `POST /auth/verify`'s embedded-API entry point). `Ok(None)`
+    /// uniformly covers every failure case (unknown/garbage token, expired,
+    /// already-used/replayed) — no oracle on *why* validation failed, same
+    /// posture as [`Self::verify_oauth_state`]/[`Self::
+    /// verify_mfa_challenge`]. `Ok(Some(username))` on success; `Err` only
+    /// for a genuine persistence failure.
+    pub fn verify_recovery_token(&self, raw_token: &str) -> Result<Option<String>> {
+        let hash = sha256_hex(raw_token);
+        let mut st = self.lock();
+        let Some(rec) = st.recovery_tokens.get(&hash).cloned() else {
+            return Ok(None);
+        };
+        if rec.used || rec.expires_at <= now_secs() {
+            return Ok(None);
+        }
+        if let Some(r) = st.recovery_tokens.get_mut(&hash) {
+            r.used = true;
+        }
+        self.persist(&st)?;
+        Ok(Some(rec.username))
+    }
+
+    /// Mint a fresh, single-use magic-link login token for `user` (item 138
+    /// — `POST /auth/magiclink`'s embedded-API entry point), valid for
+    /// [`MAGICLINK_TOKEN_TTL_SECS`]. Same unconditional-mint posture as
+    /// [`Self::create_recovery_token`] — the caller has already confirmed
+    /// `user` exists.
+    pub fn create_magiclink_token(&self, user: &str) -> Result<(String, u64)> {
+        let raw = generate_magiclink_token();
+        let hash = sha256_hex(&raw);
+        let now = now_secs();
+        let expires_at = now + MAGICLINK_TOKEN_TTL_SECS;
+        let mut st = self.lock();
+        st.magiclink_tokens.insert(
+            hash,
+            EmailTokenRec {
+                username: user.to_string(),
+                issued_at: now,
+                expires_at,
+                used: false,
+            },
+        );
+        self.persist(&st)?;
+        Ok((raw, expires_at))
+    }
+
+    /// Validate + single-use-consume a magic-link login token (item 138 —
+    /// `POST /auth/magiclink/verify`'s embedded-API entry point). Same
+    /// uniform-`Ok(None)`-on-any-failure contract as [`Self::
+    /// verify_recovery_token`], over the independent `magiclink_tokens`
+    /// token space.
+    pub fn verify_magiclink_token(&self, raw_token: &str) -> Result<Option<String>> {
+        let hash = sha256_hex(raw_token);
+        let mut st = self.lock();
+        let Some(rec) = st.magiclink_tokens.get(&hash).cloned() else {
+            return Ok(None);
+        };
+        if rec.used || rec.expires_at <= now_secs() {
+            return Ok(None);
+        }
+        if let Some(r) = st.magiclink_tokens.get_mut(&hash) {
+            r.used = true;
+        }
+        self.persist(&st)?;
+        Ok(Some(rec.username))
+    }
+
+    /// Revoke every currently-active refresh-token session belonging to
+    /// `user` (item 138 — `POST /auth/verify`'s "revoke existing sessions"
+    /// step, so a password reset immediately invalidates any session an
+    /// attacker who had the *old* password may already hold). Idempotent —
+    /// a user with no sessions (or all already revoked) is a silent no-op,
+    /// same posture as [`Self::revoke_session`]. Persists once regardless of
+    /// how many sessions were revoked.
+    pub fn revoke_all_sessions_for_user(&self, user: &str) -> Result<()> {
+        let mut st = self.lock();
+        let mut changed = false;
+        for rec in st.sessions.values_mut() {
+            if rec.username == user && !rec.revoked {
+                rec.revoked = true;
+                changed = true;
+            }
+        }
+        if changed {
+            self.persist(&st)?;
+        }
+        Ok(())
     }
 
     // ── item 129 (Workstream I3): encrypt-at-rest secrets vault ─────────
@@ -3876,6 +4097,130 @@ mod tests {
         // Identity links carry no secret — the username IS expected to
         // appear (it's not redacted, per the item-128 design note).
         assert!(debug_str.contains(&username));
+    }
+
+    // ── item 138: email transport + password-reset / magic-link flows ───
+
+    #[test]
+    fn recovery_token_round_trips_and_is_single_use() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        store
+            .apply(&AuthStmt::CreateUser {
+                name: "liam".to_string(),
+                superuser: false,
+                password: Some("old-password".to_string()),
+            })
+            .unwrap();
+        let (token, _expires_at) = store.create_recovery_token("liam").unwrap();
+        assert_eq!(
+            store.verify_recovery_token(&token).unwrap(),
+            Some("liam".to_string())
+        );
+        // Replay of the exact same token must fail — single-use.
+        assert_eq!(store.verify_recovery_token(&token).unwrap(), None);
+    }
+
+    #[test]
+    fn recovery_token_rejects_garbage_and_expired() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        assert_eq!(
+            store.verify_recovery_token("not-a-real-token").unwrap(),
+            None
+        );
+        // A genuine token, but already past its expiry — simulate by
+        // constructing the record directly with an expiry in the past
+        // (round-tripping through `create_recovery_token`'s real TTL would
+        // require sleeping past an hour in a unit test).
+        let (token, _expires_at) = store.create_recovery_token("nobody-yet").unwrap();
+        {
+            let mut st = store.lock();
+            for rec in st.recovery_tokens.values_mut() {
+                rec.expires_at = 0;
+            }
+        }
+        assert_eq!(store.verify_recovery_token(&token).unwrap(), None);
+    }
+
+    #[test]
+    fn magiclink_token_round_trips_and_is_single_use() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        store
+            .apply(&AuthStmt::CreateUser {
+                name: "noor".to_string(),
+                superuser: false,
+                password: None,
+            })
+            .unwrap();
+        let (token, _expires_at) = store.create_magiclink_token("noor").unwrap();
+        assert_eq!(
+            store.verify_magiclink_token(&token).unwrap(),
+            Some("noor".to_string())
+        );
+        assert_eq!(store.verify_magiclink_token(&token).unwrap(), None);
+    }
+
+    #[test]
+    fn recovery_and_magiclink_token_spaces_are_independent() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        let (recovery_token, _) = store.create_recovery_token("iris").unwrap();
+        // A recovery token must never redeem as a magic-link token, even
+        // though both are 256-bit hex strings from the same construction.
+        assert_eq!(store.verify_magiclink_token(&recovery_token).unwrap(), None);
+        // ...and the genuine recovery redemption still works afterward,
+        // proving the cross-space attempt didn't consume it.
+        assert_eq!(
+            store.verify_recovery_token(&recovery_token).unwrap(),
+            Some("iris".to_string())
+        );
+    }
+
+    #[test]
+    fn revoke_all_sessions_for_user_is_idempotent_and_scoped() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        store
+            .apply(&AuthStmt::CreateUser {
+                name: "omar".to_string(),
+                superuser: false,
+                password: Some("pw".to_string()),
+            })
+            .unwrap();
+        store
+            .apply(&AuthStmt::CreateUser {
+                name: "priya".to_string(),
+                superuser: false,
+                password: Some("pw".to_string()),
+            })
+            .unwrap();
+        let (omar_raw1, _) = store.create_session("omar").unwrap();
+        let (omar_raw2, _) = store.create_session("omar").unwrap();
+        let (priya_raw, _) = store.create_session("priya").unwrap();
+
+        store.revoke_all_sessions_for_user("omar").unwrap();
+        assert!(store.verify_session(&omar_raw1).is_none());
+        assert!(store.verify_session(&omar_raw2).is_none());
+        // priya's session is untouched — the revoke is scoped to "omar" only.
+        assert_eq!(store.verify_session(&priya_raw), Some("priya".to_string()));
+
+        // Idempotent: calling again with nothing left to revoke is a no-op,
+        // not an error.
+        assert!(store.revoke_all_sessions_for_user("omar").is_ok());
+    }
+
+    #[test]
+    fn auth_state_debug_redacts_recovery_and_magiclink_tokens() {
+        let dir = tempdir().unwrap();
+        let store = RoleStore::open(dir.path()).unwrap();
+        let (recovery_token, _) = store.create_recovery_token("quinn").unwrap();
+        let (magiclink_token, _) = store.create_magiclink_token("quinn").unwrap();
+        let debug_str = format!("{:?}", store.lock());
+        assert!(!debug_str.contains(&recovery_token));
+        assert!(!debug_str.contains(&magiclink_token));
+        assert!(debug_str.contains("redacted"));
     }
 
     // ── item 129 (Workstream I3): encrypt-at-rest secrets vault ─────────

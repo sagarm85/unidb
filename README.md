@@ -311,6 +311,10 @@ UNIDB_DATA_DIR=/var/lib/unidb cargo run --bin unidb-migrate -- migrations
 - Read replicas with WAL streaming and `promote()` failover
 - Online base backup + WAL archiving + point-in-time recovery (by timestamp or LSN)
 - Users, roles, GRANT — per-table privileges with transitive role membership
+- Password auth (argon2id), refresh-token sessions, TOTP MFA, OAuth 2.0
+  social login (Google/GitHub), and self-service password-reset +
+  magic-link sign-in over a pluggable email transport (SMTP or a
+  no-network dev-inbox log transport, item 138)
 - Native TLS (rustls), audit log
 - Prometheus `/metrics` endpoint, slow-query log, per-chokepoint latency histograms
 - Object storage service (`unidb-storage`) — metadata in unidb tables, bytes tiered to S3/MinIO

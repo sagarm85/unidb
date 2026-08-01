@@ -35,6 +35,7 @@ pub mod captcha;
 pub mod correlation;
 pub mod cursor;
 pub mod dto;
+pub mod email;
 pub mod engine_handle;
 pub mod error;
 pub mod event_format;
@@ -142,6 +143,14 @@ pub struct AppState {
     /// `storage`/`dev_login_jwt`/`oauth`, this has no external
     /// configuration to be absent).
     pub realtime: Arc<realtime::RealtimeState>,
+    /// Outbound email transport for the auth email flows — password reset,
+    /// magic link (item 138). Defaults to [`email::EmailConfig::default`]
+    /// (the dev-inbox log transport, no network) — `POST /auth/recover`/
+    /// `/auth/magiclink` are always live (no config gate, unlike `oauth`/
+    /// `dev_login_jwt`), since the default transport needs no external
+    /// setup, mirroring how `UNIDB_ALLOW_SIGNUP`-gated routes still 404
+    /// safely but this flow has no reason to be off by default.
+    pub email: email::EmailConfig,
 }
 
 /// Resolve the log directory the same way `src/bin/unidb-server.rs` does, so
@@ -184,6 +193,7 @@ impl AppState {
             oauth: oauth::OAuthConfig::empty(),
             captcha: captcha::CaptchaConfig::disabled(),
             realtime: Arc::new(realtime::RealtimeState::new()),
+            email: email::EmailConfig::default(),
         }
     }
 
@@ -229,6 +239,14 @@ impl AppState {
         svc: Option<std::sync::Arc<dyn crate::storage_api::StorageApi>>,
     ) -> Self {
         self.storage = svc;
+        self
+    }
+
+    /// Configure the outbound email transport for the auth email flows
+    /// (item 138). The default ([`email::EmailConfig::default`]) is the
+    /// dev-inbox log transport — see that type's doc comment.
+    pub fn with_email(mut self, email: email::EmailConfig) -> Self {
+        self.email = email;
         self
     }
 }
