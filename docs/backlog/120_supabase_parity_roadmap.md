@@ -72,7 +72,11 @@ platform; **P2** = ecosystem.
   · B5 column-level security (item 112, shipped 2026-07-31). See 122. Workstream
   B is now fully shipped.
 - **C — Auto API:** C1 `/rest/v1/<table>?col=eq.val` (P0) · C2 embedded FK
-  expansion · C3 OpenAPI/API-docs · C4 GraphQL (P2). See 123.
+  expansion · C3 OpenAPI/API-docs · **C4 GraphQL — SHIPPED 2026-08-01**
+  (`POST /graphql`, `async_graphql::dynamic`, catalog-rebuilt per request;
+  scalar/FK-forward/FK-reverse/`edges`/`near` fields all resolve through the
+  identical enforced `/sql` path; see 130). Workstream C is now fully shipped.
+  See 123.
 - **D — External identity:** **D1 OAuth/social — SHIPPED 2026-07-31**
   (provider-agnostic OAuth 2.0 Authorization Code + PKCE, Google + GitHub:
   `GET /auth/oauth/<provider>/authorize` → `.../callback` resolves
@@ -121,7 +125,7 @@ A · B · C · I1 · G1/G2 UI scaffolding against the A/B contracts.
 **Wave 2 — unlocks once A + B land:** D (needs A) · E1 (needs B) · F1 (needs B) ·
 H (needs A+C) · G full wiring.
 
-**Wave 3 — polish:** C4 (GraphQL) · G3/G4 · I2–I7.
+**Wave 3 — polish:** ~~C4 (GraphQL)~~ SHIPPED 2026-08-01 (see 130) · G3/G4 · I2–I7.
 
 **File-contention note for parallel work.** A and B both touch `handlers.rs` and
 `logical.rs` lightly. Assign **A** the login/session routes + `authz` credential

@@ -219,6 +219,15 @@ Key environment variables:
 
 Full route reference: [`docs/REST_API.md`](docs/REST_API.md)
 
+**Auto-generated data APIs**, both derived from the live catalog and enforcing
+the same RLS/grant engine as `/sql` (no separate authorization surface):
+- `GET/POST/PATCH/DELETE /rest/v1/<table>` — a PostgREST-style resource API
+  (filter operators, `select=`/embedded FK expansion, `order=`/`limit`/`offset`)
+  plus a generated `GET /rest/v1` OpenAPI 3 document.
+- `POST /graphql` — a schema-derived GraphQL API (`pg_graphql` analog) that,
+  unlike a relational-only equivalent, also exposes **graph edge traversal**
+  and **vector similarity** as first-class fields alongside FK relationships.
+
 ---
 
 ## Schema migrations

@@ -94,6 +94,15 @@ form_urlencoded = { version = "1", optional = true }
 # declarations resolve identically rather than pulling in two configurations
 # of the same crate.
 reqwest = { version = "0.12", optional = true, features = ["json", "stream", "rustls-tls"] }
+# Item 123 (Workstream C4): schema-derived GraphQL endpoint (`POST /graphql`,
+# `src/server/graphql.rs`). `dynamic-schema` builds the catalog-derived
+# `async_graphql::dynamic::Schema` at request time (types/fields/resolvers
+# assembled from `TableDef`, not compile-time macros) — the only shape that
+# fits a schema that must reflect the *live* (runtime-mutable-by-DDL)
+# catalog. `default-features = false` drops the unused GraphiQL/Playground
+# HTML-serving and email-validator extras (server-only, no new attack
+# surface). Server-feature-gated like every other HTTP-layer dependency.
+async-graphql = { version = "7.2.1", default-features = false, features = ["dynamic-schema"], optional = true }
 
 [features]
 server = [
@@ -101,7 +110,7 @@ server = [
     "dep:jsonwebtoken", "dep:metrics", "dep:metrics-exporter-prometheus",
     "dep:axum-prometheus", "dep:async-stream", "dep:futures-util",
     "dep:tracing-appender", "dep:axum-server", "dep:rustls", "dep:base64",
-    "dep:form_urlencoded", "dep:reqwest",
+    "dep:form_urlencoded", "dep:reqwest", "dep:async-graphql",
     # Item 22, L1: JSON-lines log formatting. Enabled only under `server` so the
     # default embedded build's `tracing-subscriber` stays minimal (the `json`
     # feature just pulls serde_json — already present — into the subscriber).
@@ -374,6 +383,13 @@ required-features = ["server"]
 [[test]]
 name = "server_rest"
 path = "tests/server_rest.rs"
+required-features = ["server"]
+
+# Item 123 (Workstream C4): schema-derived GraphQL API (`POST /graphql`)
+# integration tests.
+[[test]]
+name = "server_graphql"
+path = "tests/server_graphql.rs"
 required-features = ["server"]
 
 # Item 129 (Workstream I3): encrypt-at-rest secrets vault, OAuth wiring.

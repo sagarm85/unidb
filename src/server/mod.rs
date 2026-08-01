@@ -21,7 +21,10 @@
 //! 128: OAuth 2.0 Authorization Code + PKCE provider config/HTTP calls for
 //! `GET /auth/oauth/<provider>/authorize`/`callback`), [`sse`]
 //! (`GET /events/subscribe`), [`txn_session`] (multi-request transaction
-//! sessions, R1), [`cursor`] (large-result pagination, R4). `/metrics`
+//! sessions, R1), [`cursor`] (large-result pagination, R4), [`graphql`]
+//! (item 123, Workstream C4: `POST /graphql` — a catalog-derived
+//! `async_graphql::dynamic::Schema`, resolved through the exact same
+//! enforced query path `rest_resource`/`/sql` use). `/metrics`
 //! (Prometheus, via `axum-prometheus`) is wired directly in `router.rs`
 //! rather than its own module — there's no reusable logic beyond one
 //! `PrometheusMetricLayer::pair()` call.
@@ -34,6 +37,7 @@ pub mod dto;
 pub mod engine_handle;
 pub mod error;
 pub mod event_format;
+pub mod graphql;
 pub mod handlers;
 pub mod logs;
 pub mod oauth;
