@@ -838,6 +838,119 @@ consumer registered, nothing is reclaimable).
 
 ---
 
+## Realtime Broadcast & Presence (item 132)
+
+Supabase-parity gap fill: `GET /events/subscribe` above is
+Postgres-Changes-equivalent (WAL-derived row changes). These four routes add
+**Broadcast** (ephemeral client↔client pub/sub, not tied to the database) and
+**Presence** (who is currently subscribed to a topic, with per-client state).
+
+**Purely in-memory and ephemeral.** Neither broadcast messages nor presence
+state touch the WAL, buffer pool, heap, or catalog — nothing is persisted,
+and a server restart drops all state (same semantics as Supabase's
+Broadcast/Presence). A named **topic** is an opaque caller-chosen string; no
+topic needs to be created ahead of time.
+
+**v1 authorization:** every authenticated principal (any JWT that passes
+`require_jwt`, the same gate as every other data-plane route) may
+publish/subscribe/track on **any** topic — there is no per-topic
+allow/deny policy. A `realtime.channels`-style **channel-authorization
+policy engine is an explicit, documented follow-up**, not built in v1;
+treat every topic as world-readable/writable to any authenticated caller
+until that lands.
+
+Transport is SSE (same as `GET /events/subscribe`) — no WebSocket route.
+
+### `POST /realtime/broadcast/publish`
+
+Fan a message out to every current subscriber of `topic`. Best-effort,
+at-most-once: a topic with no current subscriber silently drops the
+message (the response's `receivers` count reflects that).
+
+**Payload**:
+```json
+{ "topic": "room:42", "event": "cursor-move", "payload": {"x": 10, "y": 20} }
+```
+
+**Response** `200 OK`:
+```json
+{ "receivers": 2 }
+```
+
+---
+
+### `GET /realtime/broadcast/subscribe?topic=<t>`
+
+SSE stream of every message published to `topic` from the moment this
+subscription is registered (registration completes **before** the response
+headers are sent, so a publish immediately after a successful subscribe is
+never lost to a connect race).
+
+**Response**: `200 OK`, `Content-Type: text/event-stream`, one frame per
+publish:
+```
+event: cursor-move
+data: {"topic":"room:42","event":"cursor-move","payload":{"x":10,"y":20},"ts":1755000000000}
+
+```
+`ts` is milliseconds since the Unix epoch. A subscriber that falls too far
+behind the publish rate (channel capacity 256) has older frames silently
+dropped for it — documented backpressure onto that one slow subscriber,
+never onto the publisher or onto other subscribers.
+
+---
+
+### `GET /realtime/presence/subscribe?topic=<t>`
+
+SSE stream that first emits a `sync` frame (the full current presence map
+for `topic`) and then `join`/`leave`/`update` deltas as they happen. **This
+connection's own lifetime is its own presence membership contribution** —
+see `POST /realtime/presence/track` below for exactly how a tracked key is
+tied to it, and what happens on disconnect.
+
+**Response**: `200 OK`, `Content-Type: text/event-stream`:
+```
+event: sync
+data: {"topic":"room:42","event":"sync","payload":{"alice":{"status":"online"}},"ts":1755000000000}
+
+event: join
+data: {"topic":"room:42","event":"join","payload":{"key":"bob","state":{"status":"online"}},"ts":1755000000100}
+
+event: leave
+data: {"topic":"room:42","event":"leave","payload":{"key":"alice"},"ts":1755000000200}
+
+```
+`update` frames use the same shape as `join` (`{"key": ..., "state": ...}`).
+
+---
+
+### `POST /realtime/presence/track`
+
+Associate/update the caller's presence state under `key` on `topic`, and
+push a `join` (new key) or `update` (existing key) delta to the topic's
+presence subscribers.
+
+**Payload**:
+```json
+{ "topic": "room:42", "key": "alice", "state": {"status": "online"} }
+```
+
+**Response**: `204 No Content`.
+
+**v1 connection-binding model:** the wire format above (matching the spec
+exactly) carries no connection id, so a tracked key is attributed to
+**every currently-open `GET /realtime/presence/subscribe` connection for
+that topic from the same caller (JWT `sub`)** — i.e. "this identity is
+present on this topic for as long as at least one of its presence/subscribe
+connections stays open." `leave` fires once the *last* such connection
+closes. Calling `track` with no live presence/subscribe connection open yet
+for that (topic, caller) creates an entry with no holder, which persists
+until a matching connection later opens and closes (a documented, bounded
+v1 gap — not indefinitely dangerous, still wiped on restart, just not
+auto-reaped by a disconnect that never happens).
+
+---
+
 ### `PUT /tables/{table}/rls`
 
 Attach a row-level-security policy to a table (R3), as a **SQL predicate
