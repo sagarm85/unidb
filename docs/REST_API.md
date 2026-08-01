@@ -82,6 +82,10 @@ Self-service **password reset** and **magic-link (passwordless) login**
 [Email transport + password reset / magic link](#email-transport--password-reset--magic-link-item-138).
 Optionally, every password-set point can reject a leaked/breached password
 via HaveIBeenPwned (item 143, part 1) — see [Leaked-password protection](#leaked-password-protection-haveibeenpwned-item-143-part-1).
+The signing/verification key can be **rotated with a grace window** (item
+146, `UNIDB_JWT_SIGNING_KEY_PREVIOUS` / `UNIDB_JWT_PUBLIC_KEY_PREVIOUS`) so
+outstanding tokens don't all invalidate at once — see
+[Key rotation with a grace window](#key-rotation-with-a-grace-window-item-146).
 
 > **Correction (2026-07-31):** earlier versions of this section stated "there
 > is no login endpoint, no user database, and no session state." That is no
@@ -2036,9 +2040,9 @@ GET /auth/meta
 | `dev_login_enabled` | `true` only when server is started with `UNIDB_DEV_LOGIN=1` |
 | `signup_enabled` | `true` only when started with `UNIDB_ALLOW_SIGNUP=1` (item 121 A3) |
 
-#### `GET /.well-known/jwks.json` — public key discovery (item 121 A6)
+#### `GET /.well-known/jwks.json` — public key discovery (item 121 A6, multi-key since item 146)
 
-Returns the server's configured asymmetric public key as a [JWK
+Returns the server's configured asymmetric public key(s) as a [JWK
 Set](https://www.rfc-editor.org/rfc/rfc7517), so an external verifier (or a
 client SDK) can fetch it instead of hard-coding key material. **Public — no
 JWT required.**
@@ -2049,18 +2053,66 @@ GET /.well-known/jwks.json
 
 **Response** `200 OK` — RSA example (`UNIDB_JWT_PUBLIC_KEY` is an RSA key):
 ```json
-{ "keys": [ { "kty": "RSA", "use": "sig", "alg": "RS256", "n": "<base64url modulus>", "e": "<base64url exponent>" } ] }
+{ "keys": [ { "kty": "RSA", "use": "sig", "alg": "RS256", "kid": "<hex>", "n": "<base64url modulus>", "e": "<base64url exponent>" } ] }
 ```
 EC example (`UNIDB_JWT_PUBLIC_KEY` is a P-256 key):
 ```json
-{ "keys": [ { "kty": "EC", "use": "sig", "alg": "ES256", "crv": "P-256", "x": "<base64url>", "y": "<base64url>" } ] }
+{ "keys": [ { "kty": "EC", "use": "sig", "alg": "ES256", "crv": "P-256", "kid": "<hex>", "x": "<base64url>", "y": "<base64url>" } ] }
 ```
 When the server verifies HS256 only (no `UNIDB_JWT_PUBLIC_KEY` configured):
 ```json
 { "keys": [] }
 ```
 The HS256 shared secret is never published here — there is nothing to publish
-for a symmetric key, and this route only ever serializes a public key.
+for a symmetric key, and this route only ever serializes public keys.
+
+**Item 146:** when `UNIDB_JWT_PUBLIC_KEY_PREVIOUS` is also set (asymmetric
+rotation grace window), the response lists **both** keys, each under its own
+`kid`:
+```json
+{ "keys": [
+  { "kty": "RSA", "alg": "RS256", "kid": "3f9a2b1c8d7e6f50", "n": "...", "e": "..." },
+  { "kty": "RSA", "alg": "RS256", "kid": "a1b2c3d4e5f60718", "n": "...", "e": "..." }
+] }
+```
+See [Key rotation with a grace window (item 146)](#key-rotation-with-a-grace-window-item-146)
+below.
+
+#### Key rotation with a grace window (item 146)
+
+Rotating the JWT signing key used to invalidate every outstanding access
+token at once (they no longer verify). Item 146 adds a **previous-key**
+grace window plus a `kid` header, so an operator can rotate the signing key
+without a mass logout.
+
+- **`kid` in every issued token.** Every token minted by
+  `POST /auth/login`/`/auth/signup`/`/auth/refresh` now carries a `kid`
+  header — a short, stable id derived via a **one-way truncated SHA-256
+  hash of the signing key** (16 hex characters). It never contains or
+  reveals the key itself, and it is purely a verification *hint*:
+  verification always tries every configured key in order regardless of
+  whether the token's `kid` is present, recognized, or wrong — a
+  missing/stale/forged `kid` can never weaken the check.
+- **HS256 grace key — `UNIDB_JWT_SIGNING_KEY_PREVIOUS`.** Verification tries
+  the **current** key (`UNIDB_JWT_SIGNING_KEY`) first, then this previous
+  key. Issuance always uses the current key only. Rotation procedure:
+  1. Set `UNIDB_JWT_SIGNING_KEY_PREVIOUS` to the **old** signing secret.
+  2. Set `UNIDB_JWT_SIGNING_KEY` to the **new** signing secret.
+  3. Restart the server. Tokens signed under the old secret keep verifying
+     (the grace window) while new tokens are signed under the new secret.
+  4. Once the longest-lived outstanding token has expired (>= the access
+     token TTL, currently 1 hour), drop `UNIDB_JWT_SIGNING_KEY_PREVIOUS` and
+     restart again — the grace window ends and old-key tokens are rejected
+     with the same `401` as any other invalid token.
+- **Asymmetric grace key — `UNIDB_JWT_PUBLIC_KEY_PREVIOUS`.** Same idea for
+  verify-only asymmetric mode: verification accepts a token signed by
+  either the current or the previous public key's matching private key, and
+  both keys are published at `GET /.well-known/jwks.json`, each under its
+  own `kid`. Local (HS256) issuance and asymmetric issuance are unaffected —
+  asymmetric issuance stays out of scope entirely, as before item 146.
+- **A token matching neither key still gets the same `401`** as an
+  unrelated/garbage token always has — rotation never weakens verification,
+  it only widens the set of currently-accepted keys by one.
 
 #### Auth rate limiting (item 121 I1)
 

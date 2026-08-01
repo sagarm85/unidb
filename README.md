@@ -231,7 +231,9 @@ Key environment variables:
 |----------|---------|---------|
 | `UNIDB_JWT_SECRET` | required | HMAC secret for HS256 JWT verification |
 | `UNIDB_JWT_SIGNING_KEY` | unset | Item 121 A5: enables token issuance (`/auth/login`/`signup`/`refresh`) as a first-class production capability, independent of `UNIDB_DEV_LOGIN` |
+| `UNIDB_JWT_SIGNING_KEY_PREVIOUS` | unset | Item 146: previous HS256 signing key, verify-only — a rotation grace window so tokens signed under the old key keep verifying until they expire; drop once the grace period has elapsed |
 | `UNIDB_JWT_PUBLIC_KEY` | unset | Item 121 A6: PEM public key (RSA or EC/P-256, auto-detected) — switches verification to asymmetric RS256/ES256 and disables local issuance; published at `GET /.well-known/jwks.json` |
+| `UNIDB_JWT_PUBLIC_KEY_PREVIOUS` | unset | Item 146: previous asymmetric public key (PEM) — same grace-window idea as above, for asymmetric verify mode; both keys are published in the JWKS document |
 | `UNIDB_DATA_DIR` | `/tmp/unidb` | Storage directory |
 | `UNIDB_BIND_ADDR` | `127.0.0.1:8080` | Listen address |
 | `UNIDB_TXN_IDLE_TIMEOUT_SECS` | `60` | Timeout for idle HTTP transaction sessions |
@@ -370,6 +372,13 @@ UNIDB_DATA_DIR=/var/lib/unidb cargo run --bin unidb-migrate -- migrations
   transport is the log transport (never reachable with real SMTP
   configured), and superuser-gated otherwise (the inbox carries live
   reset/magic-link tokens)
+- JWT signing-key rotation (item 146) — every issued token carries a `kid`
+  (a one-way truncated hash of the signing key, never the key itself);
+  `UNIDB_JWT_SIGNING_KEY_PREVIOUS` (HS256) / `UNIDB_JWT_PUBLIC_KEY_PREVIOUS`
+  (asymmetric) accept a previous key **verify-only**, so rotating the
+  signing key doesn't mass-invalidate every outstanding token — old-key
+  tokens keep working until they expire, then the operator drops the
+  previous-key var
 - Native TLS (rustls), audit log
 - Prometheus `/metrics` endpoint, slow-query log, per-chokepoint latency histograms
 - Object storage service (`unidb-storage`) — metadata in unidb tables, bytes tiered to S3/MinIO

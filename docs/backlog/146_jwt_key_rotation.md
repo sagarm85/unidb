@@ -1,7 +1,7 @@
 # JWT signing-key rotation
 
 **Type:** Improvement
-**Status:** IN PROGRESS
+**Status:** SHIPPED (2026-08-01, PR #249) — `kid` header (one-way truncated SHA-256) + HS256 previous-key verify-only grace window (`UNIDB_JWT_SIGNING_KEY_PREVIOUS`, verify current→previous, issue current-only) + asymmetric multi-key JWKS (`UNIDB_JWT_PUBLIC_KEY_PREVIOUS`). Rotate without mass-logout. kid is a hint not a trust boundary (full fallback). item146 8/8, crash 54/54.
 
 > Wave-3 free-roadmap item (`137`). Rotating the JWT signing key today
 > invalidates every outstanding access token at once (they no longer verify).

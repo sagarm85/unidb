@@ -12,7 +12,7 @@
 
 ## Current status
 
-- **2026-08-01 — Supabase free-parity continuation (items 132–145) SHIPPED; 15 PRs #235–#247 + dev-inbox (145) pending merge.**
+- **2026-08-01 — Supabase free-parity continuation (items 132–146) SHIPPED; 17 PRs #235–#248 + JWT rotation (146) pending merge.**
   Everything on the free/self-hostable roadmap (`docs/backlog/137`) that needs no paid third-party,
   built as verified per-PR merges, all **plan-time/control-plane → crash 54/54 by construction**:
   132 realtime broadcast+presence · 133 GraphQL mutations · 135 server-full fixes · 136 /rest/v1
@@ -21,13 +21,14 @@
   audited bypass) · 141 database webhooks (durable consumer, HMAC-signed, retry-then-skip) · 142 auth
   admin API (`/auth/admin/users`, ban, app/user metadata, last-superuser guards) · 143 HIBP
   leaked-password (opt-in, fail-open) + 5 OAuth presets · 144 cron scheduled jobs (`/cron/jobs`,
-  `run_as` RLS parity) · 145 `GET/DELETE /auth/dev-inbox` (superuser + dev-transport-only). Plus
+  `run_as` RLS parity) · 145 `GET/DELETE /auth/dev-inbox` (superuser + dev-transport-only) · 146 JWT
+  signing-key rotation (`kid` header + verify-only previous-key grace window + multi-key JWKS). Plus
   **unidb-js SDK completion** (storage/GraphQL/broadcast/presence, 55/55) + npm CI/publish workflows
   pushed to `sagarm85/unidb-js`. Pattern: file `NN_` spec → Sonnet agent → independent verify (build +
   clippy --all-targets + `cargo test --no-run` no-features + crash 54/54 + targeted/regression) →
   reset-author, force-with-lease push, squash-merge. **Held for design/user go-ahead:** GraphQL
   subscriptions (WebSocket-vs-SSE call), the engine-core cluster (stored functions → RPC/triggers/
-  upsert — ACID write-path), storage TUS/image-transforms, SAML. **Next filed:** 146 JWT key rotation.
+  upsert — ACID write-path), storage TUS/image-transforms, SAML.
   (The transient per-item "committed to branch" working notes were consolidated here on merge; the
   durable per-item detail lives in each `docs/backlog/NN_*.md` file's SHIPPED status + `PROGRESS`.)
 
@@ -437,6 +438,17 @@ be raised with the user directly, not assumed.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-08-01 — item 146: JWT signing-key rotation grace window implemented
+
+`JwtConfig` (`src/server/auth.rs`) now holds an ordered key list (current,
+then optional previous) instead of a single key: issued tokens carry a `kid`
+(one-way truncated SHA-256 of the key, never the key itself);
+`UNIDB_JWT_SIGNING_KEY_PREVIOUS` (HS256) / `UNIDB_JWT_PUBLIC_KEY_PREVIOUS`
+(asymmetric, both keys listed in JWKS) are accepted verify-only so rotating
+the current key doesn't mass-invalidate outstanding tokens. All 7 gates
+green (crash 54/54, new `item146_jwt_rotation` 8/8, `item121_a5_a6`/
+`item121_auth_core` unchanged). Committed to branch, not merged.
 
 ### 2026-08-01 — item 142: Auth admin API (user management) implemented
 

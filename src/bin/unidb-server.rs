@@ -44,6 +44,21 @@
 //!   `UNIDB_DEV_LOGIN` are ignored (with a warning logged) if also set. The
 //!   configured public key is served, JWK-encoded, at `GET
 //!   /.well-known/jwks.json`.
+//! - `UNIDB_JWT_SIGNING_KEY_PREVIOUS` (item 146, optional, HS256): a rotation
+//!   grace-window key — a token signed with this secret still verifies
+//!   (never issues) alongside `UNIDB_JWT_SIGNING_KEY`/`UNIDB_JWT_SECRET`'s
+//!   current key. Rotation procedure: set this to the *old* signing secret,
+//!   set `UNIDB_JWT_SIGNING_KEY` to the *new* one, restart — outstanding
+//!   tokens keep working until they expire; drop this var afterward to end
+//!   the grace window. Every issued token now also carries a `kid` header (a
+//!   one-way truncated hash of the signing key, never the key itself) purely
+//!   as a verification hint — an absent or unrecognized `kid` never weakens
+//!   the check, since every configured key is tried in order regardless.
+//! - `UNIDB_JWT_PUBLIC_KEY_PREVIOUS` (item 146, optional, PEM text): the
+//!   asymmetric analog — only meaningful alongside `UNIDB_JWT_PUBLIC_KEY`.
+//!   Verification accepts either public key; both are served (each under its
+//!   own `kid`) at `GET /.well-known/jwks.json`. Asymmetric issuance stays
+//!   out of scope either way (verify-only, as always).
 //! - `UNIDB_AUTH_RATE_LIMIT` (item 121 I1, default `10`): max attempts per
 //!   window for `POST /auth/login`/`signup`/`refresh` (the passwordless
 //!   brute-force targets — see `server::rate_limit`'s module doc), keyed by
@@ -275,6 +290,31 @@ async fn main() {
         .ok()
         .filter(|s| !s.is_empty());
 
+    // item 146: rotation grace-window keys — verify-only, never used to
+    // issue. UNIDB_JWT_SIGNING_KEY_PREVIOUS pairs with the HS256 branches
+    // above (whichever supplied the *current* secret); UNIDB_JWT_PUBLIC_KEY_PREVIOUS
+    // pairs with the asymmetric branch below. Absent = no rotation in
+    // progress, identical behavior to before this item.
+    let jwt_signing_key_previous = std::env::var("UNIDB_JWT_SIGNING_KEY_PREVIOUS")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let jwt_public_key_previous_pem = std::env::var("UNIDB_JWT_PUBLIC_KEY_PREVIOUS")
+        .ok()
+        .filter(|s| !s.is_empty());
+    if jwt_signing_key_previous.is_some() {
+        tracing::info!(
+            "UNIDB_JWT_SIGNING_KEY_PREVIOUS is set: a token signed with the previous HS256 key \
+             still verifies (item 146 rotation grace window) — drop this var once the previous \
+             key's outstanding tokens have all expired"
+        );
+    }
+    if jwt_public_key_previous_pem.is_some() && jwt_public_key_pem.is_none() {
+        tracing::warn!(
+            "UNIDB_JWT_PUBLIC_KEY_PREVIOUS is set without UNIDB_JWT_PUBLIC_KEY: ignored — the \
+             asymmetric previous-key grace window only applies in asymmetric verify mode"
+        );
+    }
+
     let jwt_config = if let Some(pem) = jwt_public_key_pem {
         if jwt_signing_key.is_some() || dev_login {
             tracing::warn!(
@@ -288,14 +328,38 @@ async fn main() {
             "UNIDB_JWT_PUBLIC_KEY is set: JWT verification is asymmetric (RS256/ES256, \
              auto-detected); the public key is served at GET /.well-known/jwks.json"
         );
-        JwtConfig::from_asymmetric_public_pem(pem.as_bytes())
-            .unwrap_or_else(|e| panic!("invalid UNIDB_JWT_PUBLIC_KEY: {e}"))
+        if let Some(ref prev) = jwt_public_key_previous_pem {
+            tracing::info!(
+                "UNIDB_JWT_PUBLIC_KEY_PREVIOUS is set: a token signed by either public key \
+                 verifies (item 146 rotation grace window); both are served at GET \
+                 /.well-known/jwks.json"
+            );
+            JwtConfig::from_asymmetric_public_pems(pem.as_bytes(), Some(prev.as_bytes()))
+                .unwrap_or_else(|e| {
+                    panic!("invalid UNIDB_JWT_PUBLIC_KEY / UNIDB_JWT_PUBLIC_KEY_PREVIOUS: {e}")
+                })
+        } else {
+            JwtConfig::from_asymmetric_public_pem(pem.as_bytes())
+                .unwrap_or_else(|e| panic!("invalid UNIDB_JWT_PUBLIC_KEY: {e}"))
+        }
     } else if let Some(ref signing_key) = jwt_signing_key {
-        JwtConfig::with_signing_key(signing_key)
+        let cfg = JwtConfig::with_signing_key(signing_key);
+        match jwt_signing_key_previous {
+            Some(ref prev) => cfg.with_previous_hs256_key(prev),
+            None => cfg,
+        }
     } else if dev_login {
-        JwtConfig::with_dev_login(&jwt_secret)
+        let cfg = JwtConfig::with_dev_login(&jwt_secret);
+        match jwt_signing_key_previous {
+            Some(ref prev) => cfg.with_previous_hs256_key(prev),
+            None => cfg,
+        }
     } else {
-        JwtConfig::new(&jwt_secret)
+        let cfg = JwtConfig::new(&jwt_secret);
+        match jwt_signing_key_previous {
+            Some(ref prev) => cfg.with_previous_hs256_key(prev),
+            None => cfg,
+        }
     };
 
     // item 121, A3: UNIDB_ALLOW_SIGNUP=1 activates POST /auth/signup

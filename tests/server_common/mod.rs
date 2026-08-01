@@ -280,6 +280,88 @@ impl TestServer {
         }
     }
 
+    /// Item 146 — spawn a server with a production HS256 signing-key config
+    /// (`UNIDB_JWT_SIGNING_KEY` semantics, like [`TestServer::spawn_with_signing_key`])
+    /// plus an optional previous ("grace") HS256 key
+    /// (`UNIDB_JWT_SIGNING_KEY_PREVIOUS` semantics): verification tries
+    /// `secret` first, then `previous_secret` when given.
+    pub async fn spawn_with_signing_key_and_previous(
+        secret: &str,
+        previous_secret: Option<&str>,
+    ) -> Self {
+        let tempdir = tempfile::tempdir().unwrap();
+        let data_dir = tempdir.path().to_path_buf();
+        let log_dir = data_dir.join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let engine = EngineHandle::spawn(tempdir.path(), 0).unwrap();
+        let mut jwt_config = JwtConfig::with_signing_key(secret);
+        if let Some(prev) = previous_secret {
+            jwt_config = jwt_config.with_previous_hs256_key(prev);
+        }
+        let state = AppState::with_config(Arc::new(engine), SessionConfig::default())
+            .with_log_dir(log_dir.clone())
+            .with_dev_login(jwt_config.clone());
+        let (prometheus_layer, metric_handle) = metrics_pair().clone();
+        let router = build_router(state, jwt_config, prometheus_layer, metric_handle);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
+        });
+
+        Self {
+            addr,
+            data_dir,
+            log_dir,
+            _tempdir: tempdir,
+            _server_task: server_task,
+        }
+    }
+
+    /// Item 146 — spawn a server in asymmetric verify-only mode
+    /// (like [`TestServer::spawn_with_asymmetric_public_pem`]) but accepting
+    /// either `pem` or `previous_pem`'s matching private key
+    /// (`UNIDB_JWT_PUBLIC_KEY_PREVIOUS` semantics).
+    pub async fn spawn_with_asymmetric_public_pems(
+        pem: &[u8],
+        previous_pem: Option<&[u8]>,
+    ) -> Self {
+        let tempdir = tempfile::tempdir().unwrap();
+        let data_dir = tempdir.path().to_path_buf();
+        let log_dir = data_dir.join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let engine = EngineHandle::spawn(tempdir.path(), 0).unwrap();
+        let jwt_config = JwtConfig::from_asymmetric_public_pems(pem, previous_pem)
+            .expect("test PEMs must parse as supported RSA or EC public keys");
+        let state = AppState::with_config(Arc::new(engine), SessionConfig::default())
+            .with_log_dir(log_dir.clone());
+        let (prometheus_layer, metric_handle) = metrics_pair().clone();
+        let router = build_router(state, jwt_config, prometheus_layer, metric_handle);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
+        });
+
+        Self {
+            addr,
+            data_dir,
+            log_dir,
+            _tempdir: tempdir,
+            _server_task: server_task,
+        }
+    }
+
     /// [`TestServer::spawn_with_dev_login`] plus OAuth social-login provider
     /// config (item 128, Workstream D1) — used by the mock-provider OAuth
     /// integration tests to exercise the full authorize→callback flow with
