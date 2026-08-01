@@ -1,7 +1,7 @@
 # Realtime channel authorization
 
 **Type:** Improvement
-**Status:** IN PROGRESS
+**Status:** SHIPPED (2026-08-01, PR #243) — role-based topic-glob channel policies in the control-plane store; enforced at all four realtime routes at connect/publish time (403 before stream opens); service_role/superuser bypass audited; fail-closed. Opt-in `UNIDB_REALTIME_REQUIRE_AUTHZ` (default OFF = item-132 open; ON = no-policy denied). Superuser `PUT/DELETE/GET /realtime/policies` + Engine methods. Crash 54/54.
 
 > Wave-1 free-roadmap item (`137`), the item-132 follow-up. Today any
 > authenticated principal (any JWT passing `require_jwt`) may publish/subscribe/
