@@ -115,7 +115,7 @@ const RESERVED_PARAMS: [&str; 4] = ["select", "order", "limit", "offset"];
 /// `POST /sql` gets for `SELECT * FROM nonexistent`. Never used to build SQL
 /// itself: only the already-validated [`TableDef::name`] and its columns are
 /// interpolated (always quoted) from here on.
-async fn lookup_table(state: &AppState, table: &str) -> Result<TableDef, ApiError> {
+pub(super) async fn lookup_table(state: &AppState, table: &str) -> Result<TableDef, ApiError> {
     if is_internal_table(table) {
         return Err(DbError::TableNotFound(table.to_string()).into());
     }
@@ -129,7 +129,7 @@ async fn lookup_table(state: &AppState, table: &str) -> Result<TableDef, ApiErro
 /// COLUMN_NOT_FOUND` otherwise. Every column name this module ever formats
 /// into SQL text passes through here (or through `lookup_table` for the
 /// table name) first.
-fn validate_column(def: &TableDef, column: &str) -> Result<(), ApiError> {
+pub(super) fn validate_column(def: &TableDef, column: &str) -> Result<(), ApiError> {
     if def.columns.iter().any(|c| c.name == column && !c.dropped) {
         Ok(())
     } else {
@@ -150,7 +150,7 @@ fn validate_column(def: &TableDef, column: &str) -> Result<(), ApiError> {
 /// `SqlExpr::Identifier(ident) => Expr::Column(ident.value.clone())`, and
 /// `convert_projection`/`column_name_from_parts` likewise), so quoting is
 /// safe here.
-fn quote_ident(name: &str) -> String {
+pub(super) fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
@@ -167,7 +167,7 @@ fn quote_ident(name: &str) -> String {
 /// quoting here anyway: `table` is always [`TableDef::name`] from
 /// [`lookup_table`]'s exact catalog match — never raw URL input — so an
 /// un-quoted but catalog-validated name carries no injection surface.
-fn table_ident(name: &str) -> &str {
+pub(super) fn table_ident(name: &str) -> &str {
     name
 }
 
@@ -187,7 +187,7 @@ fn parse_query_pairs(raw: Option<&str>) -> Vec<(String, String)> {
 /// `order=col.asc,col2.desc` (or repeated `order=` keys, each itself
 /// comma-separated) -> `[(col, desc)]`. No suffix defaults to ascending,
 /// matching PostgREST.
-fn parse_order_value(raw: &str) -> Vec<(String, bool)> {
+pub(super) fn parse_order_value(raw: &str) -> Vec<(String, bool)> {
     raw.split(',')
         .filter(|s| !s.is_empty())
         .map(|part| {
@@ -226,7 +226,7 @@ fn parse_nonneg_int(raw: &str, field: &'static str) -> Result<i64, ApiError> {
 // ── filter operators (fixed allow-list) ─────────────────────────────────────
 
 #[derive(Clone, Debug)]
-enum ParsedOp {
+pub(super) enum ParsedOp {
     Eq(String),
     Neq(String),
     Gt(String),
@@ -242,9 +242,9 @@ enum ParsedOp {
 }
 
 #[derive(Clone, Debug)]
-struct Filter {
-    column: String,
-    op: ParsedOp,
+pub(super) struct Filter {
+    pub(super) column: String,
+    pub(super) op: ParsedOp,
 }
 
 fn bad_filter(raw: &str) -> ApiError {
@@ -363,7 +363,7 @@ fn render_filter(binds: &mut Vec<Literal>, col_sql: &str, op: &ParsedOp) -> Stri
 
 /// AND every filter's fragment together (`None` when `filters` is empty —
 /// no `WHERE` clause at all).
-fn append_where(filters: &[Filter], binds: &mut Vec<Literal>) -> Option<String> {
+pub(super) fn append_where(filters: &[Filter], binds: &mut Vec<Literal>) -> Option<String> {
     if filters.is_empty() {
         return None;
     }
@@ -525,7 +525,7 @@ async fn run_stmts(
 }
 
 /// [`run_stmts`] for exactly one statement, unwrapping its single result.
-async fn run_stmt(
+pub(super) async fn run_stmt(
     state: &AppState,
     principal: &AuthPrincipal,
     sql: String,
@@ -663,7 +663,7 @@ fn push_select_item(items: &mut Vec<SelectItem>, raw: &str) -> Result<(), ApiErr
 /// one, derived purely from catalog FK metadata — see this module's doc
 /// comment.
 #[derive(Clone, Debug)]
-enum Relation {
+pub(super) enum Relation {
     /// Many-to-one: `base.fk_column` -> `ref_table.ref_column`.
     Forward {
         fk_column: String,
@@ -682,7 +682,7 @@ enum Relation {
 /// alias for a FK column (`customer_id` -> `customer`). A naming
 /// convenience only: the join itself always comes from the catalog FK, this
 /// just widens what embed name matches it.
-fn strip_id_suffix(column: &str) -> Option<&str> {
+pub(super) fn strip_id_suffix(column: &str) -> Option<&str> {
     if column.len() > 3 && column[column.len() - 3..].eq_ignore_ascii_case("_id") {
         Some(&column[..column.len() - 3])
     } else {

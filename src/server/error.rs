@@ -172,7 +172,7 @@ struct ErrorBody {
 /// trigger) falls into one grouped `_` catch-all mapped to 500 — documented
 /// here explicitly so a future `DbError` addition that *should* get its own
 /// 4xx status doesn't silently default to 500 unnoticed.
-fn map_status(err: &DbError) -> (StatusCode, &'static str) {
+pub(crate) fn map_status(err: &DbError) -> (StatusCode, &'static str) {
     match err {
         DbError::TableNotFound(_) => (StatusCode::NOT_FOUND, "TABLE_NOT_FOUND"),
         DbError::ColumnNotFound { .. } => (StatusCode::NOT_FOUND, "COLUMN_NOT_FOUND"),

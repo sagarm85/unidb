@@ -30,8 +30,8 @@ use axum_prometheus::{metrics_exporter_prometheus::PrometheusHandle, PrometheusM
 use tower_http::{cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer};
 
 use crate::server::{
-    auth::JwtConfig, bulk, handlers, rate_limit::AuthRateLimiter, rest_resource, sse, storage,
-    AppState,
+    auth::JwtConfig, bulk, graphql, handlers, rate_limit::AuthRateLimiter, rest_resource, sse,
+    storage, AppState,
 };
 
 /// Production entry point: reads `UNIDB_AUTH_RATE_LIMIT` /
@@ -179,6 +179,11 @@ pub fn build_router_with_rate_limiter(
         // trailing slash.
         .route("/rest/v1", get(rest_resource::get_openapi))
         .route("/rest/v1/", get(rest_resource::get_openapi))
+        // ── Item 123 (Workstream C4): schema-derived GraphQL endpoint ─────
+        // Same `require_jwt` layer as every other data-plane route — every
+        // resolved field runs through the exact same enforced query path
+        // `rest_resource`/`POST /sql` use (see `graphql.rs`'s module doc).
+        .route("/graphql", post(graphql::post_graphql))
         // ── Item 31: storage service routes (/storage/*) ──────────────────
         // All 7 routes return 503 when AppState::storage is None (unconfigured).
         // C1 list / C2 create buckets

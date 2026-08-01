@@ -2,7 +2,7 @@
 
 **Type:** Milestone
 **Status:** C1 + C3 SHIPPED (`742b355`, 2026-07-31); C2 SHIPPED 2026-07-31 (forward + reverse
-embedding); C4 GraphQL not started (deferred, P2/Wave 3)
+embedding); C4 GraphQL SHIPPED 2026-08-01 (read-only v1 — see [`130_graphql_api.md`](130_graphql_api.md))
 
 > Gives clients a schema-derived, resource-oriented REST API
 > (`/rest/v1/<table>?col=eq.val`) instead of only the raw `POST /sql` surface —
@@ -71,9 +71,13 @@ build this on.
   (tables, columns, types, PK/FK). Feeds unidb-studio's API-docs panel (G4) and any
   codegen.
 
-### C4 — GraphQL (COULD, P2, Wave 3)
-- A schema-derived GraphQL endpoint (`pg_graphql` analog). Separate effort; listed
-  here for completeness, spun out to its own `NN_…` file when started.
+### C4 — GraphQL (COULD, P2, Wave 3) — SHIPPED 2026-08-01
+- A schema-derived, read-only-v1 GraphQL endpoint (`POST /graphql`, `pg_graphql`
+  analog) — plus, unlike `pg_graphql`, first-class **graph edge traversal**
+  (`edges(type, direction)`) and **vector similarity** (`near`) fields, since
+  those are unidb's actual differentiator. Spun out to
+  [`130_graphql_api.md`](130_graphql_api.md); see `docs/REST_API.md`'s "C4 —
+  GraphQL" section for the wire contract.
 
 ## Touch-points
 - `src/server/router.rs` — mount the `/rest/v1` sub-router under the same
@@ -101,4 +105,10 @@ build this on.
 - Embedded resources (C2): FK relationship resolved from catalog metadata only
   (no per-table logic); RLS/grants enforced identically on the embedded table;
   ambiguous/unknown relationships rejected with a clear 400. ✅ (C2)
-- Metrics/outcomes in `PROGRESS.md` per §6.
+- GraphQL (C4): scalar/FK/edge/`near` fields all resolve through the identical
+  enforced `/sql` path (no parallel policy engine); RLS+column-grant parity
+  proven against `/sql`; introspection works; injection-safe (filter values are
+  bind params, identifiers are catalog-validated only). ✅ (C4, see
+  [`130_graphql_api.md`](130_graphql_api.md) for the full acceptance detail).
+- Metrics/outcomes in `PROGRESS.md` per §6 (C4: task scope excluded a
+  `PROGRESS.md` entry, matching items 124–129's precedent — see `130_…md`).

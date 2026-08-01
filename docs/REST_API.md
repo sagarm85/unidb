@@ -2039,6 +2039,12 @@ by `server/error.rs`'s `ApiError` directly, not by a `DbError` variant.
 | 503 | `DURABILITY_FAILURE` | An `fsync`/`msync` failed (P1.b, fsyncgate); the engine can no longer guarantee durability and must be restarted (session is poisoned) |
 | 500 | `INTERNAL_ERROR` | I/O, checksum, WAL corruption, control-file corruption, catalog corruption, buffer pool exhaustion, or an unavailable engine (`EngineUnavailable`) |
 
+**`POST /graphql` is the one exception to this table:** per the GraphQL-over-HTTP
+convention it always returns `200`, even on a denied field or a malformed
+query — the same `CODE: message` strings above appear as a `"<CODE>:
+<message>"` prefix inside the response body's `errors[].message`, not as an
+HTTP status. See the C4 section below.
+
 ---
 
 ---
@@ -2149,6 +2155,98 @@ columns, types, PK/FK) — `{"openapi":"3.0.3","info":{...},"paths":{...},
 "components":{"schemas":{...}}}`, one `paths["/rest/v1/{table}"]` entry per
 user table with `get`/`post`/`patch`/`delete` operations. No auth required
 beyond the standard JWT bearer.
+
+### C4 — GraphQL (`POST /graphql`, item 123 C4)
+
+A schema-derived, **read-only (v1)** GraphQL endpoint — the `pg_graphql`
+analog, except this one also exposes **graph edge traversal** and **vector
+similarity** as first-class fields, not just FK relationships (unidb's
+differentiator over a relational-only Supabase/PostgREST stack). Mounted
+under the same `require_jwt` layer as every other data-plane route. Source
+of truth: `src/server/graphql.rs`.
+
+```
+POST /graphql
+{"query": "{ ... }", "variables": {...}, "operationName": "..."}
+-> {"data": {...}, "errors": [...]}   -- standard GraphQL-over-HTTP; always 200
+```
+
+**Schema-generation rules** (rebuilt from the live catalog on every request,
+so a table created/dropped mid-session is visible on the next call):
+
+- **One GraphQL `Object` type per table** (name = table name), skipping
+  internal `__…__` tables and any table whose name isn't a valid GraphQL
+  identifier (`/[_A-Za-z][_0-9A-Za-z]*/`) or collides with a reserved schema
+  name (`Query`/`JSON`/`Edge`/`EdgeDirection`/the built-in scalar names).
+- **One scalar field per column.** Type mapping: `INT` -> `Int`, `FLOAT` ->
+  `Float`, `BOOL` -> `Boolean`, `TEXT`/`UUID`/`BYTEA`/`DATE`/`TIME`/
+  `DECIMAL`/`TIMESTAMP` -> `String` (canonical rendering, same as `/rest/v1`'s
+  JSON encoding), `JSON` -> a custom no-validator `JSON` scalar (arbitrary
+  nested JSON passes through), `VECTOR(n)` -> `[Float!]`.
+- **Root query field per table:** `<table>(<col>, <col>_neq, <col>_gt,
+  <col>_gte, <col>_lt, <col>_lte, <col>_like, <col>_ilike, <col>_in,
+  <col>_is_null, orderBy: String, limit: Int, offset: Int): [<Table>!]!` —
+  the exact filter-operator matrix `/rest/v1` exposes as `<col>=<op>.<value>`
+  (C1), spelled as distinct typed arguments. `orderBy` uses the same
+  `"col.asc,col2.desc"` syntax as `/rest/v1`'s `order=`.
+- **FK relationship fields**, resolved purely from catalog FK metadata (same
+  pattern as C2's `resolve_relation`, generalized to enumerate every
+  relationship up front): a **forward** (many-to-one) field aliased from the
+  FK column (`customer_id` -> `customer`, nullable — `null` on a `NULL` FK
+  value or an RLS/grant-hidden parent row) and a **reverse** (one-to-many)
+  field aliased from the child table's name (non-null list, empty when the
+  base key is `NULL` or no visible children exist). A name collision (rare —
+  two FK columns/children resolving to the same alias) is disambiguated with
+  an `_<fk_column>`/`_by_<fk_column>` suffix rather than dropped.
+- **Graph edge traversal:** any table with a single `Int64` primary key gets
+  an `edges(type: String, direction: EdgeDirection = OUT): [Edge!]!` field —
+  `Edge { fromId: Int, toId: Int, edgeType: String, props: JSON }`, sourced
+  from `__edges__` (the same storage `POST /edges`/`GET /edges/from/:id`
+  use). `direction: IN` traverses edges where this row is `to_id` instead of
+  `from_id`.
+- **Vector similarity:** any table with a `VECTOR` column gets a **root**
+  query field — `near_<table>(vector: [Float!]!, k: Int!): [<Table>!]!`, or
+  `near_<table>_<col>` per column when a table has more than one `VECTOR`
+  column. Root-level (not nested under a row) because a similarity search
+  has no row to be relative to, unlike `edges`. Runs the identical `WHERE
+  NEAR(column, [...], k)` predicate the SQL surface already supports —
+  requires a `CREATE INDEX ... USING HNSW (col)` on the column first, same
+  as `SELECT ... WHERE NEAR(...)` over `/sql`.
+- **Introspection** (`__schema`/`__type`) is always enabled — point any
+  standard GraphQL client/tool at `/graphql` to explore the live schema.
+
+**Per-field authorization — the hard requirement:** every resolved field
+(root query, FK forward/reverse, `edges`, `near`) runs a parameterized SQL
+statement through the *exact same* enforced path `POST /sql`/`/rest/v1` use
+(`authorize_sql_as_principal` + `execute_sql_params_as_principal` under the
+caller's `AuthPrincipal`) — this module adds no parallel policy engine. A
+row RLS hides comes back `null`/omitted, never leaked; requesting a column
+the caller isn't granted denies that field with a `PERMISSION_DENIED`
+GraphQL error (which — because every generated field type is non-null —
+null-propagates up to `"data": null`, exactly like a denied column fails the
+*whole* request over `/rest/v1`). `edges` traverses `__edges__` through this
+same enforced path too, which is *stronger* than the lower-level `GET
+/edges/from/:id` route (that route has no grant/RLS check at all — a bare
+valid JWT is enough); a caller needs an explicit `GRANT SELECT ON
+__edges__` to traverse edges via GraphQL. The query/`SELECT` a resolver
+builds projects only the GraphQL sub-fields actually requested (mirroring
+`/rest/v1`'s `select=`), not a blanket `SELECT *` — otherwise a
+column-restricted caller's request for only their granted columns would be
+denied by columns they never asked for.
+
+**Injection safety:** filter/`vector`/`k` argument *values* are always typed
+GraphQL arguments bound as `$n` parameters (or, for `NEAR`'s vector/`k` —
+which must be SQL literals per this engine's grammar, not bind params —
+formatted from already-parsed `f32`/`i64` values, never raw client text).
+Identifiers (table/column/field names) come only from the catalog-derived
+schema — an unrecognized `orderBy` column is rejected via the same
+`validate_column` catalog check `/rest/v1` uses, never built into SQL text.
+
+**Deferred (v1 scope, not built):** mutations, subscriptions, aggregations,
+cursor-based pagination, and combining `near`/`edges` with the root field's
+filter/order/limit machinery. Per-field resolution can N+1 (one enforced
+statement per resolved field/row) — acceptable for a v1 whose correctness
+anchor is that every field goes through the real enforced path.
 
 ---
 
