@@ -146,7 +146,9 @@ Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 | 132 | `132_realtime_broadcast_presence.md` | Improvement | ✅ SHIPPED (2026-08-01, PR #236) — Supabase-parity realtime gap (item 120 follow-up): add **Broadcast** (ephemeral client↔client pub/sub) + **Presence** (who's on a channel + per-client state) alongside the existing E1 Postgres-Changes SSE stream. Purely in-memory, server-side, ephemeral (no WAL/heap/catalog touch → ACID safe by construction, crash harness untouched). SSE transport reused (no WebSockets). JWT-gated; channel-authorization policies = documented follow-up. |
 | 133 | `133_graphql_mutations.md` | Improvement | ✅ SHIPPED (2026-08-01, PR #235) — Supabase-parity GraphQL gap (item 130 follow-up): add a `Mutation` root (`insert_/update_/delete_<table>`) to the read-only C4 GraphQL API. Every resolver routes through the same `run_stmt`/`execute_sql_params_as_principal` path REST/`/sql` use → ACID + RLS + `WITH CHECK` + column grants inherited, no new write path, no engine change (crash 54/54 untouched). Requested-projection-only (avoids the item-130 over-grant bug). |
 
-**Next new file → `134_…`.**
+| 134 | `134_supabase_parity_followups.md` | Milestone | ⏳ NOT STARTED — living checklist of everything still open toward Supabase parity **after** the 120–133 build. (A) small/correctness follow-ups from 132/133 (named-superuser `WITH CHECK` INSERT quirk, GraphQL bulk insert, presence `track` orphan gap); (B) realtime channel-authorization policies + GraphQL subscriptions; (C) larger gaps (email transport → magic-link/reset/confirm, SMS, more OAuth providers/SAML, storage transforms/TUS, DB webhooks, scheduled jobs, backup/PITR polish, SDK breadth); (D) cross-repo pending (unidb-studio panels, unidb-js SDK). Each gets its own `NN_…` when started. Out of scope: I6 per-project, I7 edge functions, distributed. |
+
+**Next new file → `135_…`.**
 
 ## Next up — priority order (2026-07-23, post fresh-baseline bench)
 
@@ -156,12 +158,15 @@ environment canary is quiet. Current per-operation state lives in the
 `decompose.rs` ceilings table (refreshed to the 2026-07-21 run) and
 `docs/performance/` (see its README for the authoritative report).
 
-**New track (2026-07-31): Supabase parity.** Items 120–123 open the BaaS-parity
-roadmap (auth core, RLS↔token binding, auto REST API) as parallelizable
-workstreams — see [`120_supabase_parity_roadmap.md`](120_supabase_parity_roadmap.md)
-for priority and the 3-wave plan. P0 critical path = 121 (A) + 122 (B), with I1
-(rate-limit) alongside. This is a product-direction track, separate from the
-performance items below; sequence with the user.
+**Supabase parity track — core SHIPPED (2026-07-31 → 2026-08-01).** Items 120–133
+delivered the BaaS-parity core: auth (121), RLS↔token (122), auto REST + GraphQL
+read & write (123/130/133), realtime changes + broadcast + presence (E1/132),
+storage authz (125), MFA (127), OAuth (128), vault (129), CAPTCHA (131), migrations
+(126), rate-limiting (I1); plus the `unidb-js` SDK. **Everything still open is now
+consolidated in [`134_supabase_parity_followups.md`](134_supabase_parity_followups.md)**
+— start there for the next Supabase-direction session (A = quick correctness
+follow-ups, B = realtime channel-authz + GraphQL subscriptions, C = email/OAuth/
+storage/webhooks/etc., D = studio + SDK cross-repo). Sequence with the user.
 
 **Next priority items (performance):**
 
