@@ -432,6 +432,22 @@ impl EngineHandle {
         self.on_engine(|e| Ok(e.list_channel_policies())).await
     }
 
+    /// item 141 (admin surface): `POST /webhooks`.
+    pub async fn upsert_webhook(&self, def: crate::authz::WebhookDef) -> Result<()> {
+        self.on_engine(move |e| e.upsert_webhook(def)).await
+    }
+
+    /// item 141 (admin surface): `DELETE /webhooks/{id}`.
+    pub async fn remove_webhook(&self, id: String) -> Result<()> {
+        self.on_engine(move |e| e.remove_webhook(&id)).await
+    }
+
+    /// item 141 (admin surface + delivery worker): `GET /webhooks`, and the
+    /// webhook delivery worker's own per-tick registration snapshot.
+    pub async fn list_webhooks(&self) -> Result<Vec<crate::authz::WebhookDef>> {
+        self.on_engine(|e| Ok(e.list_webhooks())).await
+    }
+
     /// Q2 (item 26): current commit generation — callers snapshot this before
     /// processing a batch so they can detect the NEXT commit even if it fires
     /// before the `wait_event_commit` call.

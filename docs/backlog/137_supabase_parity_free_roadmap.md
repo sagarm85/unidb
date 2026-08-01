@@ -79,6 +79,10 @@ queue** · unidb-js SDK v0.1. *(The last three are beyond Supabase.)*
   - **Auth hooks** (custom access-token / before-user-created / MFA hooks)
 - **Database webhooks** — outbound HTTP POST to the operator's endpoint on row
   change, built on the existing event stream (retries, signing secret from vault).
+  **In progress** (item 141): superuser `/webhooks` admin API (create/list/delete),
+  background delivery worker over the existing durable-consumer event stream,
+  `X-Unidb-Signature` HMAC, bounded exponential-backoff retry with per-delivery
+  failure isolation — see `docs/backlog/141_database_webhooks.md`.
 - **GraphQL subscriptions** — over the realtime layer; inherit per-subscriber RLS.
 - **Auth admin API** — full user CRUD/list/ban/pagination; **identity linking**
   (attach OAuth to an existing user by verified email); **anonymous sign-in**.

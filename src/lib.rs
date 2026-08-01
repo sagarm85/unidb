@@ -4438,6 +4438,27 @@ impl Engine {
         self.authz.list_channel_policies()
     }
 
+    /// item 141 (admin surface): upsert a database webhook registration
+    /// (`POST /webhooks`). Superuser gating is the HTTP handler's job
+    /// (mirrors [`Engine::set_channel_policy`]).
+    pub fn upsert_webhook(&self, def: crate::authz::WebhookDef) -> Result<()> {
+        self.authz.upsert_webhook(def)
+    }
+
+    /// item 141 (admin surface): remove a webhook registration by id
+    /// (`DELETE /webhooks/{id}`). Idempotent.
+    pub fn remove_webhook(&self, id: &str) -> Result<()> {
+        self.authz.remove_webhook(id)
+    }
+
+    /// item 141 (admin surface + delivery worker): list every registered
+    /// webhook (`GET /webhooks` redacts the secret before serializing — see
+    /// `server::handlers::get_webhooks`; the delivery worker in
+    /// `server::webhooks` uses the full record to sign outbound payloads).
+    pub fn list_webhooks(&self) -> Vec<crate::authz::WebhookDef> {
+        self.authz.list_webhooks()
+    }
+
     /// Durably advance `consumer`'s offset to `up_to_seq` — the only
     /// operation in M4.b that writes to `__consumers__`. If the consumer
     /// has never acked before, this is where its row is created

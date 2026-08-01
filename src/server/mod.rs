@@ -24,7 +24,10 @@
 //! sessions, R1), [`cursor`] (large-result pagination, R4), [`graphql`]
 //! (item 123, Workstream C4: `POST /graphql` — a catalog-derived
 //! `async_graphql::dynamic::Schema`, resolved through the exact same
-//! enforced query path `rest_resource`/`/sql` use). `/metrics`
+//! enforced query path `rest_resource`/`/sql` use). [`webhooks`] (item 141:
+//! the outbound-HTTP delivery worker for `POST /webhooks`-registered
+//! database webhooks — a durable-consumer background task over the same
+//! event queue [`sse`] reads). `/metrics`
 //! (Prometheus, via `axum-prometheus`) is wired directly in `router.rs`
 //! rather than its own module — there's no reusable logic beyond one
 //! `PrometheusMetricLayer::pair()` call.
@@ -51,6 +54,7 @@ pub mod sse;
 pub mod storage;
 pub mod tls;
 pub mod txn_session;
+pub mod webhooks;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
@@ -182,6 +186,13 @@ impl AppState {
             Arc::downgrade(&sessions),
             Arc::downgrade(&cursors),
         );
+        // Item 141: the outbound webhook delivery worker. `Weak`-handle,
+        // tokio-spawned, same lifecycle shape as `spawn_reaper` above — see
+        // `webhooks::spawn_webhook_worker`'s doc comment. Always started
+        // (no config gate); it is a no-op cost (one commit-condvar wait per
+        // idle tick, zero `__consumers__`/`__events__` reads) whenever no
+        // webhook is registered.
+        webhooks::spawn_webhook_worker(Arc::downgrade(&engine));
         Self {
             engine,
             sessions,

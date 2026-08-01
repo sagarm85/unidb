@@ -47,8 +47,8 @@ use crate::{
             CypherRequest, DeleteEdgeRequest, GroupCommitWindowRequest, HistoryQuery, IsolationDto,
             MfaChallengeRequest, MfaDisableRequest, MfaEnrollResponse, MfaVerifyRequest,
             MfaVerifyResponse, OAuthCallbackQuery, RlsRequest, RowIdResponse, SetIndexRequest,
-            SlowQueryThresholdRequest, SqlRequest, StreamQuery, TableInfo, WhoamiPrivilege,
-            WhoamiResponse,
+            SlowQueryThresholdRequest, SqlRequest, StreamQuery, TableInfo, WebhookDto,
+            WebhookUpsertRequest, WhoamiPrivilege, WhoamiResponse,
         },
         engine_handle::EngineHandle,
         error::ApiError,
@@ -1064,6 +1064,131 @@ pub async fn get_realtime_policies(
             })
             .collect(),
     ))
+}
+
+// ── Database webhooks (item 141) ────────────────────────────────────────
+
+/// `POST /webhooks` (item 141 admin surface): create/upsert a database
+/// webhook. Superuser-gated, the same posture as [`put_table_rls`]/
+/// [`put_realtime_policy`] — a webhook is an egress-control object (it fires
+/// an outbound HTTP call, to an operator-chosen URL, on every matching row
+/// change), not something every authenticated caller should be able to
+/// register. See `crate::authz::WebhookDef`'s doc comment for the
+/// `signing_secret` vault-vs-registration-body resolution order.
+pub async fn post_webhook(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+    Json(body): Json<WebhookUpsertRequest>,
+) -> std::result::Result<StatusCode, ApiError> {
+    state
+        .engine
+        .ensure_superuser(current_user.0.clone())
+        .await
+        .map_err(ApiError::from)?;
+    if body.id.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "INVALID_WEBHOOK_ID",
+            "id must not be empty",
+        ));
+    }
+    if body.target_url.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "INVALID_TARGET_URL",
+            "target_url must not be empty",
+        ));
+    }
+    if body.table_pattern.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "INVALID_TABLE_PATTERN",
+            "table_pattern must not be empty",
+        ));
+    }
+    let mut events = std::collections::BTreeSet::new();
+    for raw in &body.events {
+        let ev = crate::authz::WebhookEvent::parse(raw).ok_or_else(|| {
+            ApiError::bad_request(
+                "INVALID_EVENT",
+                format!("event must be one of insert|update|delete, got '{raw}'"),
+            )
+        })?;
+        events.insert(ev);
+    }
+    if events.is_empty() {
+        return Err(ApiError::bad_request(
+            "INVALID_EVENT",
+            "events must contain at least one of insert|update|delete",
+        ));
+    }
+    let def = crate::authz::WebhookDef {
+        id: body.id,
+        target_url: body.target_url,
+        table_pattern: body.table_pattern,
+        events,
+        signing_secret: body.signing_secret.map(crate::authz::WebhookSecret::new),
+        enabled: body.enabled,
+        headers: body.headers,
+    };
+    state
+        .engine
+        .upsert_webhook(def)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /webhooks` (item 141 admin surface): list every registered webhook.
+/// Superuser-gated (same as the write routes above). Signing secrets are
+/// always redacted to a boolean presence flag — see [`WebhookDto::
+/// has_signing_secret`].
+pub async fn get_webhooks(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+) -> std::result::Result<Json<Vec<WebhookDto>>, ApiError> {
+    state
+        .engine
+        .ensure_superuser(current_user.0.clone())
+        .await
+        .map_err(ApiError::from)?;
+    let webhooks = state.engine.list_webhooks().await.map_err(ApiError::from)?;
+    Ok(Json(
+        webhooks
+            .into_iter()
+            .map(|w| WebhookDto {
+                id: w.id,
+                target_url: w.target_url,
+                table_pattern: w.table_pattern,
+                events: w
+                    .events
+                    .into_iter()
+                    .map(|e| e.as_str().to_string())
+                    .collect(),
+                enabled: w.enabled,
+                has_signing_secret: w.signing_secret.is_some(),
+                headers: w.headers,
+            })
+            .collect(),
+    ))
+}
+
+/// `DELETE /webhooks/{id}` (item 141 admin surface). Idempotent — deleting an
+/// unknown `id` is a no-op, not an error (mirrors [`delete_realtime_policy`]'s
+/// posture).
+pub async fn delete_webhook(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> std::result::Result<StatusCode, ApiError> {
+    state
+        .engine
+        .ensure_superuser(current_user.0.clone())
+        .await
+        .map_err(ApiError::from)?;
+    state
+        .engine
+        .remove_webhook(id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /auth/preview` (item-24 Z6): run `sql` as `as_role` and return the

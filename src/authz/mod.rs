@@ -839,6 +839,16 @@ struct AuthState {
     /// key) deserializes with an empty list — no FORMAT_VERSION bump.
     #[serde(default)]
     channel_policies: Vec<ChannelPolicyDef>,
+    /// Database webhook registrations (item 141): one entry per `id`. May
+    /// carry a plaintext fallback signing secret (see [`WebhookDef::
+    /// signing_secret`]) — kept out of the default `Debug` derive path via
+    /// [`WebhookSecret`]'s own redacting `Debug` impl, not by hiding this
+    /// field entirely (unlike `credentials`/`sessions` below), so `GET
+    /// /webhooks`/`list_webhooks` callers still see every other field.
+    /// `#[serde(default)]` so a pre-141 `roles.json` (no `webhooks` key)
+    /// deserializes with an empty list — no FORMAT_VERSION bump.
+    #[serde(default)]
+    webhooks: Vec<WebhookDef>,
 }
 
 /// Manual `Debug`: every field except `credentials`/`sessions`/`mfa`/
@@ -890,6 +900,11 @@ impl std::fmt::Debug for AuthState {
             // role names only) — shown in full, same posture as
             // `oauth_identities`/`table_grants` above.
             .field("channel_policies", &self.channel_policies)
+            // item 141: shown in full — each `WebhookDef`'s own `Debug`
+            // redacts its `signing_secret` field via `WebhookSecret`'s
+            // manual impl, so this can safely reuse the derived struct
+            // debug instead of collapsing to a bare count.
+            .field("webhooks", &self.webhooks)
             .finish()
     }
 }
@@ -1018,6 +1033,115 @@ pub struct ChannelPolicyDef {
     pub topic_pattern: String,
     pub operation: ChannelOp,
     pub roles: BTreeSet<String>,
+}
+
+/// The three CDC operations a database webhook (item 141) can subscribe to.
+/// Deliberately no `All` variant (unlike [`ChannelOp`]) — the backlog spec's
+/// locked v1 design has `events` as an explicit list the caller enumerates
+/// (`["insert","update","delete"]` for "all"), not a catch-all sentinel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum WebhookEvent {
+    Insert,
+    Update,
+    Delete,
+}
+
+impl WebhookEvent {
+    pub fn parse(s: &str) -> Option<WebhookEvent> {
+        match s.to_ascii_lowercase().as_str() {
+            "insert" => Some(WebhookEvent::Insert),
+            "update" => Some(WebhookEvent::Update),
+            "delete" => Some(WebhookEvent::Delete),
+            _ => None,
+        }
+    }
+
+    /// String representation for the admin surface (`GET /webhooks`) and for
+    /// matching against a captured [`crate::queue::Event::op`] string, which
+    /// already speaks this exact vocabulary (see `event_format.rs`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WebhookEvent::Insert => "insert",
+            WebhookEvent::Update => "update",
+            WebhookEvent::Delete => "delete",
+        }
+    }
+}
+
+/// A webhook signing secret (item 141). Never `Debug`-printed — mirrors
+/// [`crate::server::oauth::ClientSecret`]'s exact posture: a small accessor
+/// wrapper around the raw string so a `{:?}` of a [`WebhookDef`] (or a
+/// `tracing::*!(?def, ..)` call) can never leak it, while `Serialize`/
+/// `Deserialize` still round-trip it through `roles.json` like every other
+/// control-plane field (the file itself is operator-trusted local storage,
+/// same posture as `credentials`/`sessions` — see `AuthState`'s doc comment).
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+pub struct WebhookSecret(String);
+
+impl WebhookSecret {
+    pub fn new(raw: impl Into<String>) -> Self {
+        Self(raw.into())
+    }
+
+    /// The raw secret. Callers use this only to compute an HMAC signature
+    /// (the delivery worker) — never to log it or return it in an HTTP
+    /// response.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for WebhookSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<redacted>")
+    }
+}
+
+/// A database webhook registration (item 141, backlog doc's locked v1
+/// design): `(id, target_url, table_pattern, events, signing_secret?,
+/// enabled, headers?)`. `table_pattern` is an exact table name or `"*"` for
+/// every table — deliberately simpler than [`ChannelPolicyDef`]'s
+/// `*`-suffix glob (the backlog spec states "exact or `*`", nothing
+/// in-between). Persisted in `roles.json` alongside every other
+/// control-plane object (no separate store, no FORMAT_VERSION bump — see
+/// [`AuthState::webhooks`]). `#[derive(Debug)]` is safe here because
+/// [`WebhookSecret`]'s own `Debug` redacts the one sensitive field.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WebhookDef {
+    pub id: String,
+    pub target_url: String,
+    pub table_pattern: String,
+    pub events: BTreeSet<WebhookEvent>,
+    /// The registration-time fallback secret (item 141's "vault-first, then
+    /// the registration body" posture — mirrors [`crate::server::oauth::
+    /// resolve_client_secret`]'s vault-then-env order exactly, with this
+    /// field standing in for OAuth's env value since a webhook has no static
+    /// env var to read). `None` when the webhook was registered with no
+    /// `signing_secret` and no `webhook.<id>.secret` vault entry exists
+    /// either — such a webhook's deliveries carry no `X-Unidb-Signature`
+    /// header. `#[serde(default)]` so a pre-141 `roles.json` (impossible
+    /// today, future-proofing) would still deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_secret: Option<WebhookSecret>,
+    #[serde(default = "default_webhook_enabled")]
+    pub enabled: bool,
+    /// Extra static headers sent with every delivery (e.g. a caller-side API
+    /// key the receiver expects). Never used for authentication of unidb
+    /// itself — only `X-Unidb-Signature` is unidb's own trust signal.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+}
+
+fn default_webhook_enabled() -> bool {
+    true
+}
+
+/// Whether `table` matches `pattern` for webhook delivery (item 141): exact
+/// equality, or `pattern == "*"` (every table). Free function (not a
+/// `WebhookDef` method) so the delivery worker in `src/server/webhooks.rs`
+/// can call it without needing a whole `WebhookDef` in scope for a unit test.
+pub fn webhook_table_matches(pattern: &str, table: &str) -> bool {
+    pattern == "*" || pattern == table
 }
 
 /// A parsed auth-DDL statement.
@@ -2098,6 +2222,49 @@ impl RoleStore {
     /// policies`).
     pub fn list_channel_policies(&self) -> Vec<ChannelPolicyDef> {
         self.lock().channel_policies.clone()
+    }
+
+    // ── item 141: database webhooks (outbound HTTP on row change) ──────
+
+    /// Upsert a webhook registration (item 141 admin surface): replaces an
+    /// existing entry sharing the same `id`, or inserts a new one. Superuser
+    /// gating is the HTTP handler's job (mirrors [`Self::set_channel_policy`])
+    /// — this method itself is unrestricted, matching every other direct
+    /// `RoleStore` mutator (the embedded API is the trusted caller). Never
+    /// logs the secret — only the `id`.
+    pub fn upsert_webhook(&self, def: WebhookDef) -> Result<()> {
+        let mut st = self.lock();
+        let id = def.id.clone();
+        match st.webhooks.iter_mut().find(|w| w.id == def.id) {
+            Some(existing) => *existing = def,
+            None => st.webhooks.push(def),
+        }
+        self.persist(&st)?;
+        tracing::debug!(webhook = %id, "webhook registration upserted");
+        Ok(())
+    }
+
+    /// Remove a webhook registration by `id` (item 141 admin surface).
+    /// Idempotent — removing an `id` that doesn't exist is a silent no-op,
+    /// mirroring [`Self::remove_channel_policy`]'s posture.
+    pub fn remove_webhook(&self, id: &str) -> Result<()> {
+        let mut st = self.lock();
+        let before = st.webhooks.len();
+        st.webhooks.retain(|w| w.id != id);
+        if st.webhooks.len() != before {
+            self.persist(&st)?;
+            tracing::debug!(webhook = %id, "webhook registration removed");
+        }
+        Ok(())
+    }
+
+    /// Every registered webhook (item 141), secret included — `GET
+    /// /webhooks` (`server::handlers::get_webhooks`) redacts before
+    /// serializing; the delivery worker (`server::webhooks`) uses the full
+    /// record, including the fallback plaintext secret, to sign outbound
+    /// payloads.
+    pub fn list_webhooks(&self) -> Vec<WebhookDef> {
+        self.lock().webhooks.clone()
     }
 
     /// Whether `user` holds `priv` on `table` **at all** — `true` for both a
