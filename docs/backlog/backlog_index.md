@@ -6,8 +6,8 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `134_…`**
-> (133 assigned 2026-08-01 to the GraphQL-mutations item below).
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `136_…`**
+> (135 assigned 2026-08-01 to the server-full wiring-fixes item below).
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -148,7 +148,9 @@ Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 
 | 134 | `134_supabase_parity_followups.md` | Milestone | ⏳ NOT STARTED — living checklist of everything still open toward Supabase parity **after** the 120–133 build. (A) small/correctness follow-ups from 132/133 (named-superuser `WITH CHECK` INSERT quirk, GraphQL bulk insert, presence `track` orphan gap); (B) realtime channel-authorization policies + GraphQL subscriptions; (C) larger gaps (email transport → magic-link/reset/confirm, SMS, more OAuth providers/SAML, storage transforms/TUS, DB webhooks, scheduled jobs, backup/PITR polish, SDK breadth); (D) cross-repo pending (unidb-studio panels, unidb-js SDK). Each gets its own `NN_…` when started. Out of scope: I6 per-project, I7 edge functions, distributed. |
 
-**Next new file → `135_…`.**
+| 135 | `135_server_full_wiring_fixes.md` | Improvement | ✅ SHIPPED (2026-08-01, PR #238) — two binary-specific bugs in `unidb-server-full` (reported by the studio session): (1) `try_init_storage` ignored `STORAGE_BACKEND=memory` (always built `S3ObjectStore`) → now selects `MemoryObjectStore` by `cfg.backend`; (2) served without `into_make_service_with_connect_info` so the item-121 rate-limiter's `ConnectInfo<SocketAddr>` extractor 500'd every `POST /auth/{login,signup,refresh}` → now wired like the plain binary. Plus a pre-existing `clippy::manual_ignore_case_cmp` fix (the workspace-member binaries aren't in the main clippy gate — follow-up filed). Live-smoke-verified; crash 54/54. |
+
+**Next new file → `136_…`.**
 
 ## Next up — priority order (2026-07-23, post fresh-baseline bench)
 

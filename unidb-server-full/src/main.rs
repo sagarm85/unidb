@@ -11,7 +11,9 @@ use axum_prometheus::PrometheusMetricLayer;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use unidb::server::{auth::JwtConfig, engine_handle::EngineHandle, router::build_router, AppState};
 use unidb::storage_api::StorageApi;
-use unidb_storage::{ObjectStore, S3ObjectStore, StorageConfig, StorageService};
+use unidb_storage::{
+    Backend, MemoryObjectStore, ObjectStore, S3ObjectStore, StorageConfig, StorageService,
+};
 
 fn init_logging(log_dir: &str) -> tracing_appender::non_blocking::WorkerGuard {
     std::fs::create_dir_all(log_dir)
@@ -62,12 +64,19 @@ async fn try_init_storage(engine_arc: Arc<unidb::Engine>) -> Option<Arc<dyn Stor
         }
     };
 
-    let store: Arc<dyn ObjectStore> = match S3ObjectStore::from_config(&cfg) {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            tracing::warn!("storage store init failed ({e}); /storage/* returns 503");
-            return None;
-        }
+    // Select the object store by backend. `STORAGE_BACKEND=memory` must reach
+    // the in-process `MemoryObjectStore` (the Docker-free test double) — the
+    // previous code unconditionally built `S3ObjectStore`, so `memory` still
+    // demanded S3 credentials and could never activate from this binary.
+    let store: Arc<dyn ObjectStore> = match cfg.backend {
+        Backend::Memory => Arc::new(MemoryObjectStore::new(cfg.bucket.clone())),
+        Backend::Minio | Backend::S3 => match S3ObjectStore::from_config(&cfg) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                tracing::warn!("storage store init failed ({e}); /storage/* returns 503");
+                return None;
+            }
+        },
     };
 
     match StorageService::new(engine_arc, store, cfg).await {
@@ -116,7 +125,7 @@ async fn main() {
     // one leaves dev_login_enabled false even with the env var set.
     let dev_login = std::env::var("UNIDB_DEV_LOGIN")
         .ok()
-        .map(|v| v == "1" || v.to_ascii_lowercase() == "true")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     if dev_login {
         tracing::warn!(
@@ -162,11 +171,18 @@ async fn main() {
         .await
         .unwrap_or_else(|e| panic!("failed to bind {bind_addr}: {e}"));
     tracing::info!(addr = %bind_addr, data_dir = %data_dir, "unidb-server-full listening");
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async {
-            tokio::signal::ctrl_c().await.ok();
-            tracing::info!("shutdown signal; draining requests");
-        })
-        .await
-        .expect("server error");
+    // `into_make_service_with_connect_info` (not plain `into_make_service`) so
+    // `ConnectInfo<SocketAddr>` resolves inside the item-121 auth rate limiter —
+    // mirrors `src/bin/unidb-server.rs`. Without it, every rate-limited auth
+    // route (POST /auth/login|signup|refresh) 500s on this binary.
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        tokio::signal::ctrl_c().await.ok();
+        tracing::info!("shutdown signal; draining requests");
+    })
+    .await
+    .expect("server error");
 }

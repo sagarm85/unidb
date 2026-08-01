@@ -419,6 +419,25 @@ be raised with the user directly, not assumed.
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-08-01 — item 135: `unidb-server-full` wiring fixes (memory storage + ConnectInfo), studio-reported
+
+The studio session, doing live verification, reported two real binary-specific bugs in
+`unidb-server-full` (the plain `unidb-server` was already correct). Verified both in source,
+fixed both (item 135, PR #238): (1) `try_init_storage` unconditionally built `S3ObjectStore`,
+so `STORAGE_BACKEND=memory` demanded S3 creds and never activated → now selects the store by
+`cfg.backend` (`Memory` → `MemoryObjectStore`); (2) served with `axum::serve(listener, router)`
+instead of `into_make_service_with_connect_info::<SocketAddr>()`, so the item-121 rate-limiter's
+`ConnectInfo` extractor 500'd every `POST /auth/{login,signup,refresh}` → now wired like the
+plain binary. Also fixed a pre-existing `clippy::manual_ignore_case_cmp` in the `UNIDB_DEV_LOGIN`
+parse — **caught because the main-crate `clippy --all-features --all-targets` gate does NOT cover
+the separate workspace-member binaries** (follow-up filed to add them to the gate). **Empirically
+proven on the live binary** (no committed subprocess harness — not the repo's pattern): booted with
+`STORAGE_BACKEND=memory` → log `"storage service ready","backend":"memory"`; `POST /auth/login`
+returned 422 (Json body validation), not 500 (past the `ConnectInfo` extractor). Crash 54/54.
+**Lesson:** workspace-member binaries (`unidb-server-full`, etc.) escape the main clippy gate —
+run `clippy -p <bin>` on them; binary-only wiring (serve/connect-info, env-var reads) isn't
+exercised by the library-level `TestServer` and needs a live/binary check.
+
 ### 2026-08-01 — item 133 (GraphQL mutations) implemented, committed to branch
 
 Added a `Mutation` root to the C4 GraphQL schema (`src/server/graphql.rs`):
