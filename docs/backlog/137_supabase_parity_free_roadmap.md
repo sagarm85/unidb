@@ -1,7 +1,14 @@
 # Supabase parity — free / self-hostable roadmap
 
 **Type:** Milestone
-**Status:** IN PROGRESS (roadmap; individual items get their own `NN_` when started)
+**Status:** IN PROGRESS (roadmap; individual items get their own `NN_` when started).
+**2026-08-02 checkpoint:** every numbered item filed from this roadmap (138–146)
+is SHIPPED & merged to `main` (PRs #241–#249; ledger: PROGRESS.md
+"Supabase-parity BaaS layer — items 120–133 + free-parity continuation
+135–146"). Still open below: the HELD engine-core compute cluster (stored
+functions → RPC/triggers/upsert), GraphQL subscriptions (HELD), storage
+TUS/image transforms (HELD), SAML (HELD), views/enums, identity linking,
+anonymous sign-in, backups/PITR UX, other-language SDKs, studio panels.
 
 > Authoritative roadmap for reaching **100% of the Supabase feature set that needs
 > NO paid third-party subscription** — everything self-hostable or talking only to
@@ -37,8 +44,9 @@ queue** · unidb-js SDK v0.1. *(The last three are beyond Supabase.)*
 
 ## Wave 1 — highest ROI, unblock clusters
 
-- **138 — Email transport + templates** (IN PROGRESS — transport + templates +
-  password reset + magic link shipped; status flips to DONE on merge). Pluggable
+- **138 — Email transport + templates** (DONE — PR #241 merged 2026-08-01;
+  email OTP / email confirmation / email change + a real `users.email` column
+  remain fast follow-ups). Pluggable
   `EmailTransport` (SMTP via `lettre` + a dev/log transport), template system
   with `{{link}}`/`{{code}}`/`{{user}}`/`{{site_url}}` substitution.
   Provider-agnostic — self-host SMTP / free tier / dev-log; engine never
@@ -50,16 +58,16 @@ queue** · unidb-js SDK v0.1. *(The last three are beyond Supabase.)*
   column exists yet — `email` is currently looked up as a username directly,
   see `src/server/email.rs`'s module doc — a real column is part of that
   follow-up).
-- **139 — `/rest/v1` count + `Prefer` response controls** (IN PROGRESS —
-  implemented, status flips to DONE on merge): `Prefer: count=exact` ->
+- **139 — `/rest/v1` count + `Prefer` response controls** (DONE — PR #242
+  merged 2026-08-01): `Prefer: count=exact` ->
   `Content-Range` (RLS-scoped exact count, zero extra cost when unused),
   `Prefer: return=representation|minimal` on `POST`/`PATCH`/`DELETE`. REST-
   layer only, no SQL-engine change. **Upsert is explicitly NOT included** —
   `on_conflict`/`resolution=merge-duplicates` needs `INSERT … ON CONFLICT`,
   which the SQL engine doesn't support; filed as a separate future engine
   feature (see `docs/backlog/139_rest_count_prefer.md`'s note).
-- **140 — Realtime channel authorization** (IN PROGRESS — implemented,
-  status flips to DONE on merge): RLS-style per-topic allow/deny for
+- **140 — Realtime channel authorization** (DONE — PR #243 merged
+  2026-08-01): RLS-style per-topic allow/deny for
   broadcast/presence (the item-132 follow-up). Role-based, topic-glob
   `(topic_pattern, operation, roles)` policies in the control-plane store,
   enforced at connect/publish time on all four routes; audited
@@ -67,25 +75,29 @@ queue** · unidb-js SDK v0.1. *(The last three are beyond Supabase.)*
   `UNIDB_REALTIME_REQUIRE_AUTHZ`; superuser-only `/realtime/policies` admin
   surface. Control-plane only, crash 54/54 — see
   `docs/backlog/140_realtime_channel_authorization.md`.
-- **unidb-js SDK completion** — storage client module, GraphQL client (queries +
-  mutations), broadcast/presence helpers, npm publish + CI. *(Separate repo,
-  parallelizable — no engine build contention.)*
+- **unidb-js SDK completion** (DONE 2026-08-01) — storage client module,
+  GraphQL client (queries + mutations), broadcast/presence helpers, npm
+  publish + CI workflows — all shipped to `sagarm85/unidb-js` (55/55 tests).
+  *(Separate repo; actual npm publish needs the user's npm credentials.)*
 
 ## Wave 2 — the compute layer (one foundation unlocks four)
 
-- **Stored functions / procedures** (SQL-body v1; a plpgsql-analog later) → then:
+- **Stored functions / procedures** (HELD — awaiting explicit user/design
+  go-ahead; this is the one cluster that touches the ACID write path, unlike
+  everything shipped so far) (SQL-body v1; a plpgsql-analog later) → then:
   - **RPC** (`POST /rest/v1/rpc/<fn>`)
   - **Triggers** (BEFORE/AFTER row)
   - **Auth hooks** (custom access-token / before-user-created / MFA hooks)
 - **Database webhooks** — outbound HTTP POST to the operator's endpoint on row
   change, built on the existing event stream (retries, signing secret from vault).
-  **In progress** (item 141): superuser `/webhooks` admin API (create/list/delete),
+  **DONE** (item 141, PR #244 merged 2026-08-01): superuser `/webhooks` admin API (create/list/delete),
   background delivery worker over the existing durable-consumer event stream,
   `X-Unidb-Signature` HMAC, bounded exponential-backoff retry with per-delivery
   failure isolation — see `docs/backlog/141_database_webhooks.md`.
-- **GraphQL subscriptions** — over the realtime layer; inherit per-subscriber RLS.
-- **Auth admin API** (IN PROGRESS — item 142 implemented, status flips to
-  DONE on merge): full user CRUD/list/ban/pagination shipped —
+- **GraphQL subscriptions** (HELD — WebSocket-vs-SSE design call pending with
+  the user) — over the realtime layer; inherit per-subscriber RLS.
+- **Auth admin API** (DONE — item 142, PR #245 merged 2026-08-01): full
+  user CRUD/list/ban/pagination shipped —
   `GET/POST/PATCH/DELETE /auth/admin/users*`, superuser-only, reusing the
   existing `CreateUser`/`DropUser`/`set_password`/`revoke_all_sessions_for_user`
   machinery; new per-user `banned` (enforced at login/refresh/email-verify
@@ -95,8 +107,8 @@ queue** · unidb-js SDK v0.1. *(The last three are beyond Supabase.)*
   `docs/backlog/142_auth_admin_api.md`. **Still open:** identity linking
   (attach OAuth to an existing user by verified email); **anonymous
   sign-in** — both out of scope for 142, tracked here as follow-ups.
-- **More OAuth providers + leaked-password protection** (IN PROGRESS — item
-  143): generalized item-128's preset table with five more built-in
+- **More OAuth providers + leaked-password protection** (DONE — item 143,
+  PR #246 merged 2026-08-01): generalized item-128's preset table with five more built-in
   providers (Apple, Azure/Microsoft, GitLab, Discord, Facebook — all
   `sub`/`id`, no flow change; Apple's lack of a REST userinfo endpoint is a
   documented known gap, not silently claimed working), plus an opt-in
@@ -109,8 +121,8 @@ queue** · unidb-js SDK v0.1. *(The last three are beyond Supabase.)*
 
 ## Wave 3 — breadth & polish
 
-- **Scheduled jobs (cron-analog)** (IN PROGRESS — item 144 implemented,
-  status flips to DONE on merge): Supabase/`pg_cron` parity — superuser
+- **Scheduled jobs (cron-analog)** (DONE — item 144, PR #247 merged
+  2026-08-01): Supabase/`pg_cron` parity — superuser
   `/cron/jobs` admin API (upsert/list/delete), a standard 5-field cron
   expression validated at registration (`400 INVALID_CRON_SCHEDULE`,
   hand-rolled parser, no heavy dep), a background scheduler that runs due
@@ -125,8 +137,9 @@ queue** · unidb-js SDK v0.1. *(The last three are beyond Supabase.)*
   way; the classification doesn't change what shipped.
   User-defined & materialized views · enums/domains/custom types remain
   unstarted.
-- **JWT signing-key rotation** (IN PROGRESS — item 146 implemented, status
-  flips to DONE on merge): a `kid` header (one-way truncated hash of the
+- **JWT signing-key rotation** (DONE — item 146, PR #249 merged 2026-08-01;
+  the studio-flagged dev-inbox read route also shipped as item 145, PR #248):
+  a `kid` header (one-way truncated hash of the
   signing key, never the key itself) on every issued token;
   `UNIDB_JWT_SIGNING_KEY_PREVIOUS` (HS256) accepted verify-only so rotating
   `UNIDB_JWT_SIGNING_KEY` doesn't mass-invalidate outstanding tokens — old
@@ -136,8 +149,10 @@ queue** · unidb-js SDK v0.1. *(The last three are beyond Supabase.)*
   `kid`. Control-plane only (`JwtConfig`), crash 54/54 — see
   `docs/backlog/146_jwt_key_rotation.md`.
 - Storage: resumable **TUS uploads** · **image transformations** (local lib) ·
-  full storage policy language · S3-compatible API surface.
-- **SAML / enterprise SSO** (no paid dependency our side; large).
+  full storage policy language · S3-compatible API surface. (HELD — awaiting
+  user go-ahead.)
+- **SAML / enterprise SSO** (no paid dependency our side; large). (HELD —
+  awaiting user go-ahead.)
 - Backups/PITR user-facing UX (engine has `restore_to_time`).
 - Other-language SDKs (Python/Dart/Swift/Kotlin/Go) · studio advisors ·
   studio panels for the new surfaces (studio repo).

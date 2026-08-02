@@ -33,6 +33,11 @@
   `unidb-server` binary (M5): every route's payload and response shape, auth
   model, error codes, and known limitations. Also documents the Rust attach
   client (M8).
+- [`unidb-js`](https://github.com/sagarm85/unidb-js) *(separate repo)* — the
+  official TypeScript/JavaScript client SDK over the REST server:
+  supabase-js-shaped `createClient()` (auth / data / realtime /
+  storage / GraphQL). It ships its own docs; the engine-side HTTP contract
+  it targets is `REST_API.md`.
 
 ## For operators
 

@@ -152,7 +152,7 @@ Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 
 | 136 | `136_rest_embed_filter_order.md` | Improvement | ✅ SHIPPED (2026-08-01, PR #239) — Supabase/PostgREST-parity gap (item 123 C2 follow-up, confirmed by the studio session): `/rest/v1` embedded expansion is projection-only (`SELECT <cols> FROM <embed> WHERE <join_col> IN (...)`) — no per-embed filter/order/limit. Add dotted params `<embed>.<col>=<op>.<val>` (filter), `<embed>.order=...`, `<embed>.limit`/`.offset` (per-parent, lateral semantics). Enforcement inherited (embed query already runs through `execute_sql_params_as_principal` — ungranted filter/order column denied like a direct GET). |
 
-| 137 | `137_supabase_parity_free_roadmap.md` | Milestone | 🔄 IN PROGRESS — authoritative roadmap for 100% of the Supabase feature set needing NO paid third-party (self-hostable / own-infra only). Excludes SMS/phone/voice (paid gateway), AI embedding *generation* (paid API), CDN delivery. Wave 1: email transport (138) + REST upsert/count/Prefer + realtime channel-authz + unidb-js completion. Wave 2: stored functions→RPC/triggers/auth-hooks, DB webhooks, GraphQL subscriptions, auth admin API, more OAuth, HIBP leaked-password. Wave 3: cron, views, storage TUS/image-transform, SAML, SDKs. Supersedes 134. Each feature gets its own `NN_` when started. |
+| 137 | `137_supabase_parity_free_roadmap.md` | Milestone | 🔄 IN PROGRESS — authoritative roadmap for 100% of the Supabase feature set needing NO paid third-party (self-hostable / own-infra only). Excludes SMS/phone/voice (paid gateway), AI embedding *generation* (paid API), CDN delivery. **2026-08-02 state: every item filed from it (138–146 + unidb-js completion) is ✅ SHIPPED & merged (PRs #241–#249; ledger: PROGRESS.md "Supabase-parity BaaS layer").** Still open in-doc: HELD engine-core compute cluster (stored functions→RPC/triggers/upsert `ON CONFLICT`), GraphQL subscriptions (HELD, WS-vs-SSE), storage TUS/image-transform (HELD), SAML (HELD), views/enums, identity linking, anonymous sign-in, backups UX, other-language SDKs, studio panels. Supersedes 134. Each feature gets its own `NN_` when started. |
 | 138 | `138_email_transport.md` | Improvement | ✅ SHIPPED (2026-08-01, PR #241) — Wave-1 lead: pluggable `EmailTransport` (SMTP via lettre + dev/log transport, vault-first SMTP password) + template system, then first flow(s): password reset (`POST /auth/recover` + `/auth/verify`, no enumeration, single-use hash-only short-TTL token) and magic link if clean. Free/self-hostable (SMTP or dev-log; engine never forces a paid provider). Control-plane only — crash 54/54. Unlocks the email-auth cluster (email OTP/confirm/change follow-ups). |
 | 139 | `139_rest_count_prefer.md` | Improvement | ✅ SHIPPED (2026-08-01, PR #242) — Wave-1 REST-layer response controls: `Prefer: count=exact` → `Content-Range` exact count (through the same RLS/grant-enforced path, so it never over-counts), and `Prefer: return=representation\|minimal` on mutations. NO engine change. Upsert (`ON CONFLICT`) is NOT here — the SQL engine has no ON CONFLICT support, so upsert is a separate Wave-2 engine item. |
 
@@ -179,15 +179,21 @@ environment canary is quiet. Current per-operation state lives in the
 `decompose.rs` ceilings table (refreshed to the 2026-07-21 run) and
 `docs/performance/` (see its README for the authoritative report).
 
-**Supabase parity track — core SHIPPED (2026-07-31 → 2026-08-01).** Items 120–133
-delivered the BaaS-parity core: auth (121), RLS↔token (122), auto REST + GraphQL
-read & write (123/130/133), realtime changes + broadcast + presence (E1/132),
-storage authz (125), MFA (127), OAuth (128), vault (129), CAPTCHA (131), migrations
-(126), rate-limiting (I1); plus the `unidb-js` SDK. **Everything still open is now
-consolidated in [`134_supabase_parity_followups.md`](134_supabase_parity_followups.md)**
-— start there for the next Supabase-direction session (A = quick correctness
-follow-ups, B = realtime channel-authz + GraphQL subscriptions, C = email/OAuth/
-storage/webhooks/etc., D = studio + SDK cross-repo). Sequence with the user.
+**Supabase parity track — SHIPPED & fully MERGED (2026-07-31 → 2026-08-01;
+confirmed on `main` 2026-08-02).** Items 120–133 delivered the BaaS-parity core:
+auth (121), RLS↔token (122), auto REST + GraphQL read & write (123/130/133),
+realtime changes + broadcast + presence (E1/132), storage authz (125), MFA (127),
+OAuth (128), vault (129), CAPTCHA (131), migrations (126), rate-limiting (I1).
+The free-parity continuation (135–146) added email transport + reset/magic-link,
+REST count/`Prefer` + embed filter/order, realtime channel authz, DB webhooks,
+auth admin API + ban, HIBP + 5 OAuth presets, cron jobs, dev-inbox, JWT key
+rotation, and completed the `unidb-js` SDK (separate repo). Ledger:
+PROGRESS.md "Supabase-parity BaaS layer". **Everything still open lives in
+[`137_supabase_parity_free_roadmap.md`](137_supabase_parity_free_roadmap.md)**
+(134 is superseded) — chiefly the HELD engine-core compute cluster (stored
+functions → RPC/triggers/upsert), GraphQL subscriptions, storage TUS/image
+transforms, SAML, views/enums, identity linking, anonymous sign-in.
+All HELD items need explicit user go-ahead — sequence with the user.
 
 **Next priority items (performance):**
 
