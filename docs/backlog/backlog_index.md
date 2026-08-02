@@ -168,8 +168,9 @@ Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 
 | 145 | `145_dev_inbox_route.md` | Improvement | ✅ SHIPPED (2026-08-01, PR #248) — studio-flagged item-138 gap: `GET/DELETE /auth/dev-inbox` to read/clear the `LogTransport` dev-inbox JSONL (reset/magic-link email preview, Inbucket-style). Superuser-only + dev-transport-ONLY (404 when real SMTP configured — never expose real mail). Control-plane, crash 54/54. |
 | 146 | `146_jwt_key_rotation.md` | Improvement | ✅ SHIPPED (2026-08-01, PR #249) — Wave-3: JWT signing-key rotation grace window. `kid` in issued token header; `UNIDB_JWT_SIGNING_KEY_PREVIOUS` (HS256) accepted for verify-only so rotating the primary doesn't mass-invalidate live tokens; asymmetric multi-key JWKS via `_PUBLIC_KEY_PREVIOUS`. Issuance stays current-key HS256. Auth-layer only, crash 54/54. |
+| 147 | `147_bind_param_text_to_int_coercion.md` | Improvement | 🆕 NOT STARTED — studio-flagged (2026-08-02, v2 checklist pass): `POST /sql`'s documented bind-param coercion ("a JSON string binds as text, later coerced to the column's type — UUID, TIMESTAMP, etc.") does not cover `INT`/`BIGINT` — a string param into a numeric column hard-fails `SQL_PLAN_ERROR` even though a JSON number param works fine. Reproduced with plain `curl`, no Studio code involved. Breaks unidb-studio's CSV import for any table with a numeric PK (its own coercion assumption). Two legitimate closes: implement the coercion, or narrow the docs — file doesn't presume which; find the actual UUID/TIMESTAMP coercion code path first. |
 
-**Next new file → `147_…`.
+**Next new file → `148_…`.
 
 ## Next up — priority order (2026-07-23, post fresh-baseline bench)
 
