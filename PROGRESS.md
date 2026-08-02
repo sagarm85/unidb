@@ -181,6 +181,7 @@ memory (see `CLAUDE.md` §6).
 | Items 115 + 116 — behind-metrics attribution + first levers   [IN PROGRESS]   2026-07-24 | 2026-07-24 | live |
 | Report HTML renderer (auto `.html` sibling)   [SHIPPED]   2026-07-31 | 2026-07-31 | live |
 | Item 117 — HOT UPDATE on PK/UNIQUE tables when key unchanged   [SHIPPED]   2026-07-31 | 2026-07-31 | live |
+| Supabase-parity BaaS layer — items 120–133 + 135–146 (PRs #222–#249)   [SHIPPED]   2026-08-01 | 2026-08-01 | live |
 
 ## Item 24 R-a + R-b — UPDATE WITH CHECK enforcement + bootstrap observability (2026-07-20)
 
@@ -1873,4 +1874,55 @@ index). Full suite 220 passed / 0 failed; clippy + fmt + doc linters clean.
 **Known limitations / tech debt:** non-HOT *batch* path (`can_batch_non_hot`)
 still gated on `!has_unique` — relaxing it needs `Heap::update_many` to
 re-point the unique B-tree (separate follow-up).
+**Locked-decision changes:** none.
+
+## Supabase-parity BaaS layer — items 120–133 + free-parity continuation 135–146   [SHIPPED]   2026-08-01 (entry backfilled 2026-08-02)
+
+**PRs:** #222–#233 (core items 120–131), #235/#236 (items 133/132), #238–#249
+(items 135, 136, 138–146), plus docs-only PRs #234/#237/#240/#250 — **all
+merged to `main`** (verified against `origin/main` `a3cd132` on 2026-08-02).
+This entry is a backfill: the merges landed 2026-08-01 across two sessions,
+but the per-milestone PROGRESS habit was missed — the per-item detail went
+only to `MEMORY.md` and the `docs/backlog/NN_*.md` SHIPPED headers. Caught by
+the 2026-08-02 docs-staleness sweep. **Process note:** flipping a backlog
+file's Status on merge is not a substitute for the ledger entry here.
+
+**Summary:** a Supabase-class Backend-as-a-Service layer over the engine,
+built entirely at plan-time / control-plane — no WAL/MVCC/heap/on-disk-format
+change, so ACID and engine performance are intact **by construction**. Shipped
+across the track: auth core (argon2id login/signup, refresh-token sessions,
+JWT + JWKS + key rotation w/ verify-only grace window, TOTP MFA, OAuth
+Google/GitHub + Apple/Azure/GitLab/Discord/Facebook presets, magic link +
+password reset over pluggable SMTP/dev-log email transport, HIBP
+leaked-password check, CAPTCHA, rate limiting, admin user API w/ ban +
+app/user metadata, secrets vault) · RLS↔token binding (`auth.uid()`/
+`auth.jwt()`, anon/authenticated/service_role, column grants) · auto APIs
+(PostgREST-style `/rest/v1` with filters/FK-embed/embed-filter-order/
+count=exact/`Prefer`, OpenAPI, GraphQL read + mutations) · realtime
+(RLS-filtered SSE changes, broadcast + presence, channel-authz policies) ·
+storage per-object authz (buckets, owner rules, presign) · database webhooks
+(HMAC-signed, durable consumer, retry-then-skip) · scheduled cron jobs
+(`run_as` RLS parity) · forward-only SQL migrations (`unidb-migrate`) ·
+dev-inbox route · `unidb-server-full` wiring fixes · **unidb-js SDK**
+(separate repo `sagarm85/unidb-js`: auth/data/realtime/storage/GraphQL,
+55/55 tests, npm CI/publish workflows).
+
+**Benchmarks:** none recorded for this track, deliberately — every item is
+control-plane-only (guardrail: no ACID/perf regression, storage engine
+untouched), verified per-PR by **crash harness 54/54** + clippy
+`--all-features --all-targets -D warnings` + plain `cargo test --no-run`
+(no-features) + fmt + targeted/regression suites. Honest §6 caveats: the
+BaaS/HTTP layer itself has had **no load benchmark** (auth throughput, SSE
+fan-out, webhook delivery under churn are unmeasured), and the §6
+replaced-stack headline column (Table 4.1, `MM_REPLACED_STACK=1`) remains
+**unmeasured** — both tracked as follow-ups.
+
+**Known limitations / held work:** engine-core compute cluster HELD for
+explicit user/design sign-off (stored functions → RPC / triggers / upsert
+`INSERT … ON CONFLICT` — ACID write-path) · GraphQL subscriptions (HELD,
+WebSocket-vs-SSE call) · storage TUS uploads + image transforms (HELD) ·
+SAML (HELD) · identity linking, anonymous sign-in, views/materialized views,
+enums/custom types (unstarted) · no `users.email` column yet (email is
+looked up as username — item-138 note) · named-superuser `WITH CHECK` INSERT
+quirk (item-133 finding, possible pre-existing RLS-superuser inconsistency).
 **Locked-decision changes:** none.

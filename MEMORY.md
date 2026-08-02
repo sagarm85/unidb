@@ -12,7 +12,9 @@
 
 ## Current status
 
-- **2026-08-01 — Supabase free-parity continuation (items 132–146) SHIPPED; 17 PRs #235–#248 + JWT rotation (146) pending merge.**
+- **2026-08-02 — Parity track confirmed fully MERGED: PRs #235–#249 (+ docs #250) are all on `main` (verified against `origin/main` `a3cd132`).** The entry below originally said "pending merge" — that went stale the moment the merges landed; corrected inline rather than silently rewritten. The missing consolidated ledger entry was backfilled the same day: see PROGRESS.md "Supabase-parity BaaS layer — items 120–133 + free-parity continuation 135–146".
+
+- **2026-08-01 — Supabase free-parity continuation (items 132–146) SHIPPED; ~~17 PRs #235–#248 + JWT rotation (146) pending merge~~ (all merged — see the 2026-08-02 correction above).**
   Everything on the free/self-hostable roadmap (`docs/backlog/137`) that needs no paid third-party,
   built as verified per-PR merges, all **plan-time/control-plane → crash 54/54 by construction**:
   132 realtime broadcast+presence · 133 GraphQL mutations · 135 server-full fixes · 136 /rest/v1
@@ -236,12 +238,23 @@ Key design decisions confirmed in implementation (M0 + M1.a + M1.b + M1.c):
 
 ## In progress
 
-Nothing — M5 milestone fully closed out (all four checkpoints verified,
-benchmarked, committed). M0-M5 are all DONE — every milestone on
-CLAUDE.md's original roadmap has shipped. The only remaining known-and-
-deferred work is the cross-domain "replaced stack" benchmark follow-up
-(see Current status above); anything beyond that is unplanned and should
-be raised with the user directly, not assumed.
+Nothing in flight. M0–M5 (original roadmap) and the Supabase-parity BaaS
+track (items 120–146, PRs #222–#250) are all merged to `main` — see
+PROGRESS.md "Supabase-parity BaaS layer — items 120–133 + free-parity
+continuation 135–146". What remains, and its gating:
+
+- **HELD for explicit user/design go-ahead** (do not start unprompted):
+  engine-core compute cluster (stored functions → RPC / triggers / upsert
+  `ON CONFLICT` — ACID write-path), GraphQL subscriptions (WebSocket-vs-SSE
+  call), storage TUS uploads + image transforms, SAML. See
+  `docs/backlog/137_supabase_parity_free_roadmap.md` for the full open list
+  (also: views/enums, identity linking, anonymous sign-in, SDK breadth).
+- **Approved-but-unbuilt:** item 118 (async-HNSW crash reconciliation —
+  plan approved 2026-07-31).
+- **Standing §6 debt:** the replaced-stack headline column (Table 4.1,
+  `MM_REPLACED_STACK=1`) has never been measured, and the BaaS/HTTP layer
+  has had no load benchmark of its own — both are the honest gaps in the
+  current evidence base.
 
 ---
 
@@ -440,6 +453,31 @@ be raised with the user directly, not assumed.
 ---
 
 ## Session log (append newest at top; use the real current date)
+
+### 2026-08-02 — Docs-staleness sweep: parity track confirmed merged; PROGRESS ledger backfilled; unidb-js linked
+
+Q&A session (Supabase-service comparison, branch
+`claude/supabase-service-comparison-10ssl8`) turned up doc drift; user asked
+for a full reference-doc refresh so future sessions don't inherit wrong
+assumptions. Verified against `origin/main` (`a3cd132`): **PRs #222–#250 are
+ALL merged** — the top Current-status "pending merge" claim was stale. Fixed:
+(1) Current-status corrected inline + **In progress** section rewritten (was
+still M5-era text) to list the real remaining work with its gating
+(HELD-for-sign-off compute cluster / GraphQL subs / TUS / SAML; approved item
+118; unmeasured Table 4.1 + no BaaS-layer load bench); (2) **PROGRESS.md got
+the missing consolidated ledger entry** for items 120–146 — the per-milestone
+PROGRESS habit was skipped during the overnight merge run (process lesson:
+flipping a backlog file's Status on merge is NOT the ledger entry); (3)
+`137_supabase_parity_free_roadmap.md` per-item "IN PROGRESS — flips on merge"
+lines flipped to DONE with PR numbers, held items labeled HELD; (4)
+`backlog_index.md`: 137 row refreshed + the "Next up" pointer un-staled
+(134 → 137); (5) **README.md + docs/documentation_index.md now link the
+`unidb-js` SDK** — it was previously unmentioned in every user-facing doc
+(found while answering "should the repo reference unidb-js?"). Also noted
+during the session (report-honesty, no doc change yet): MEMORY's 07-28 entry
+calls the moat "intact" citing W4/W0 13.56×, but W4/W0 is the internal tax
+ladder — the actual moat column (replaced stack, Table 4.1) was skipped in
+that report; the queued report-honesty item covers it. No code change.
 
 ### 2026-08-01 — item 146: JWT signing-key rotation grace window implemented
 

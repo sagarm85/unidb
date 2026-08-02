@@ -387,6 +387,11 @@ UNIDB_DATA_DIR=/var/lib/unidb cargo run --bin unidb-migrate -- migrations
 - Embed directly as a Rust library (no `tokio` in the engine core)
 - Optional REST server (tokio-based, JWT auth, SSE)
 - `unidb-attach` — Rust blocking client over the REST API
+- [`unidb-js`](https://github.com/sagarm85/unidb-js) — official
+  TypeScript/JavaScript SDK (separate repo): supabase-js-shaped
+  `createClient()` covering auth (login/signup/refresh/OAuth/MFA), data
+  (`/rest/v1` with filters and FK embedding), realtime (SSE change streams +
+  broadcast/presence), storage, and GraphQL
 
 ---
 
