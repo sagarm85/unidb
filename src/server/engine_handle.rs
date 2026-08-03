@@ -465,6 +465,30 @@ impl EngineHandle {
         self.on_engine(|e| Ok(e.list_cron_jobs())).await
     }
 
+    // ── item 147: stored SQL functions ───────────────────────────────────
+
+    /// item 147 (admin surface): `POST /functions`.
+    pub async fn upsert_function(&self, def: crate::authz::FunctionDef) -> Result<()> {
+        self.on_engine(move |e| e.upsert_function(def)).await
+    }
+
+    /// item 147 (admin surface): `DELETE /functions/{name}`.
+    pub async fn remove_function(&self, name: String) -> Result<()> {
+        self.on_engine(move |e| e.remove_function(&name)).await
+    }
+
+    /// item 147 (admin surface): `GET /functions`.
+    pub async fn list_functions(&self) -> Result<Vec<crate::authz::FunctionDef>> {
+        self.on_engine(|e| Ok(e.list_functions())).await
+    }
+
+    /// item 147 (RPC route): resolve a stored function by name — `Ok(None)`
+    /// (not an error) when unregistered, so `rpc_call` can turn that into
+    /// its own `404 FUNCTION_NOT_FOUND` rather than a generic engine error.
+    pub async fn get_function(&self, name: String) -> Result<Option<crate::authz::FunctionDef>> {
+        self.on_engine(move |e| Ok(e.get_function(&name))).await
+    }
+
     // ── item 142: Auth admin API (user management) ──────────────────────
 
     /// Whether `user` is banned (item 142) — the ban-enforcement check at

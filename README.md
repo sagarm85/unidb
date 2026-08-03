@@ -223,6 +223,14 @@ curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8080/cron/jobs \
 # dev/testing aid, superuser-only, 404 unless UNIDB_EMAIL_TRANSPORT=log (the
 # default; never reachable when real SMTP is configured)
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/auth/dev-inbox?limit=10
+
+# Stored functions & RPC (item 147): register a function (superuser-only),
+# then call it as any authenticated caller — invoker semantics by default
+# (run_as omitted), so the caller's own RLS/grants apply
+curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8080/functions \
+  -d '{"name":"posts_by_owner","params":["owner"],"body":["SELECT id, title FROM posts WHERE owner = $1"]}'
+curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8080/rest/v1/rpc/posts_by_owner \
+  -d '{"owner":"alice"}'
 ```
 
 Key environment variables:
@@ -345,6 +353,14 @@ UNIDB_DATA_DIR=/var/lib/unidb cargo run --bin unidb-migrate -- migrations
   control-plane only, the scheduler is strictly a caller of the same
   `execute_sql` path every statement uses, no overlap/no backfill, per-job
   status + `unidb_cron_runs_total`/`unidb_cron_failures_total` metrics
+- Stored functions + RPC (item 147) — Supabase/`pg_proc`/`rpc()` parity
+  phase 1: superuser-registered, parameterized SQL functions
+  (`/functions`) callable by any authenticated principal via `POST
+  /rest/v1/rpc/{fn}`; **invoker** semantics by default (the caller's own
+  RLS/grants apply — the opposite default from cron's admin-run jobs, since
+  RPC is callable by anyone), `run_as` opts a function into definer
+  semantics explicitly; every call's statements run atomically in one
+  transaction; control-plane only, no engine/WAL/heap/catalog change
 
 **Operations and HA**
 - Segmented WAL (16 MiB segments) enabling replication slots
