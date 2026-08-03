@@ -454,6 +454,28 @@ continuation 135–146". What remains, and its gating:
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-08-03 — item 147 (stored functions v1 + RPC) implemented via Sonnet agent, verified, committed to branch; item 148 queued
+
+User go-ahead (2026-08-02) lifted the compute-cluster HELD; two branches
+started (per explicit user instruction, and the user chose Sonnet for
+implementation): **147** `feat/147-stored-functions-rpc` — spec written by
+orchestrator, implemented by a Sonnet subagent, **all 7 gates re-run
+independently by the orchestrator** (clippy/fmt/no-features compile, item147
+8/8, item144 9/9, crash 54/54), committed `b5c0156` + main merged in +
+SUPABASE_PARITY/PROGRESS/MEMORY updated in the same push. Design's one
+security-critical call: RPC is invoker-by-default (`run_as: None` = caller,
+NOT admin — deliberately diverges from cron's default; spec documents why).
+**148** `feat/148-enums-domains` — spec committed (`1b1ea2b`, written in a
+side worktree at the scratchpad so the 147 agent's tree stayed untouched);
+implementation queued strictly behind 147's builds per LESSONS.md's
+no-concurrent-cargo-builds rule. PR #252 (SUPABASE_PARITY.md tracker)
+merged this session; tracker rows for 147/148 updated on the 147 branch in
+the same PR as the code, per the tracker's §9 protocol. Studio-side asks
+(favicon, timestamp display) were explicitly dropped by the user as
+wrong-session; the favicon SVG was delivered in-chat for the studio session
+to pick up. Pre-existing named-superuser `WITH CHECK` quirk (item-133
+finding) re-surfaced by 147's parity test — still untouched, still tracked.
+
 ### 2026-08-02 — Docs-staleness sweep: parity track confirmed merged; PROGRESS ledger backfilled; unidb-js linked
 
 Q&A session (Supabase-service comparison, branch
