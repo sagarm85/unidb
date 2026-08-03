@@ -122,7 +122,7 @@ use super::{
     AppState,
 };
 
-const RESERVED_PARAMS: [&str; 4] = ["select", "order", "limit", "offset"];
+const RESERVED_PARAMS: [&str; 5] = ["select", "order", "limit", "offset", "on_conflict"];
 
 // ── catalog lookups (identifier validation) ─────────────────────────────────
 
@@ -638,12 +638,29 @@ fn merge_rows(results: Vec<ExecResult>) -> Result<ExecResult, ApiError> {
 pub(super) struct Prefer {
     pub(super) count_exact: bool,
     pub(super) return_pref: Option<ReturnPref>,
+    /// Item 150: `Prefer: resolution=merge-duplicates|ignore-duplicates` —
+    /// `POST /rest/v1/<table>` upsert mode. `None` (no `resolution=` token)
+    /// means the pre-150 behavior: a conflicting row is a plain
+    /// `UniqueViolation` error, exactly as before this item shipped.
+    pub(super) resolution: Option<Resolution>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReturnPref {
     Representation,
     Minimal,
+}
+
+/// Item 150: PostgREST's two `Prefer: resolution=` upsert modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Resolution {
+    /// `resolution=merge-duplicates` — `ON CONFLICT (<on_conflict>) DO UPDATE
+    /// SET <col> = EXCLUDED.<col>, ...` for every payload column other than
+    /// the conflict target itself.
+    MergeDuplicates,
+    /// `resolution=ignore-duplicates` — `ON CONFLICT [(<on_conflict>)] DO
+    /// NOTHING`.
+    IgnoreDuplicates,
 }
 
 /// Parse every `Prefer` header on the request (a client may repeat the
@@ -672,6 +689,18 @@ pub(super) fn parse_prefer(headers: &HeaderMap) -> (Prefer, Vec<&'static str>) {
                 "return=minimal" => {
                     prefer.return_pref = Some(ReturnPref::Minimal);
                     applied.push("return=minimal");
+                }
+                // Item 150: upsert resolution mode (`POST` only — a `PATCH`/
+                // `DELETE`/`GET` request naming one simply has no effect,
+                // same "recognized but not applicable here" posture as any
+                // other `Prefer` token that handler doesn't consult).
+                "resolution=merge-duplicates" => {
+                    prefer.resolution = Some(Resolution::MergeDuplicates);
+                    applied.push("resolution=merge-duplicates");
+                }
+                "resolution=ignore-duplicates" => {
+                    prefer.resolution = Some(Resolution::IgnoreDuplicates);
+                    applied.push("resolution=ignore-duplicates");
                 }
                 _ => {} // unrecognized preference: ignored, not an error
             }
@@ -1508,6 +1537,76 @@ pub async fn get_collection(
     Ok(with_prefer_headers(resp, content_range_header, &applied))
 }
 
+/// Item 150: build the ` ON CONFLICT ...` clause text for `POST /rest/v1`'s
+/// upsert modes. `target` is the (already-validated) `on_conflict=<col>`
+/// query param; `payload_columns` is the insert row's own column set (the
+/// same list [`build_insert`] derives its column list from — every row in
+/// the batch shares it, already checked there).
+///
+/// `MergeDuplicates` sets every payload column **except** the conflict
+/// target itself (setting the target to its own `EXCLUDED` value is both
+/// redundant — it's exactly the value that just matched — and pure overhead
+/// on the engine side, since a target-column `SET` forces the non-HOT/
+/// unique-recheck path per `has_unique_in_set`, item 117). A payload with no
+/// non-target column errors clearly rather than emitting invalid empty-SET
+/// SQL. `target: None` is rejected here (mirrors the engine grammar: DO
+/// UPDATE requires an explicit conflict target) — `on_conflict=<col>` is
+/// required whenever `resolution=merge-duplicates` is requested.
+///
+/// Column names here are deliberately **not** `quote_ident`-wrapped, unlike
+/// `render_filter`/embed ORDER BY elsewhere in this module — matching
+/// `build_insert`'s / `build_assignments`'s existing convention for the
+/// exact same reason: an assignment target parses via `sqlparser`'s
+/// `AssignmentTarget::ColumnName` -> `ObjectName::to_string()`, which
+/// (like `table_ident`'s documented quirk) re-includes quote characters
+/// instead of stripping them, so a quoted `SET "col" = ...` here would
+/// literally name a column called `"col"` (quotes and all) and 404.
+/// Already catalog-validated (`validate_column`) either way, so safety
+/// doesn't depend on quoting here.
+fn append_on_conflict(
+    sql: &mut String,
+    def: &TableDef,
+    target: Option<&str>,
+    resolution: Resolution,
+    payload_columns: &[String],
+) -> Result<(), ApiError> {
+    match resolution {
+        Resolution::IgnoreDuplicates => {
+            sql.push_str(" ON CONFLICT");
+            if let Some(col) = target {
+                validate_column(def, col)?;
+                sql.push_str(&format!(" ({col})"));
+            }
+            sql.push_str(" DO NOTHING");
+        }
+        Resolution::MergeDuplicates => {
+            let Some(col) = target else {
+                return Err(ApiError::bad_request(
+                    "MISSING_ON_CONFLICT",
+                    "Prefer: resolution=merge-duplicates requires an on_conflict=<column> \
+                     query parameter naming the PRIMARY KEY or a UNIQUE column",
+                ));
+            };
+            validate_column(def, col)?;
+            let set_cols: Vec<&String> = payload_columns.iter().filter(|c| *c != col).collect();
+            if set_cols.is_empty() {
+                return Err(ApiError::bad_request(
+                    "EMPTY_MERGE",
+                    "resolution=merge-duplicates has no column to merge — the payload \
+                     only carries the on_conflict target column",
+                ));
+            }
+            let assignments = set_cols
+                .iter()
+                .map(|c| format!("{c} = EXCLUDED.{c}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            sql.push_str(&format!(" ON CONFLICT ({col}) DO UPDATE SET {assignments}"));
+        }
+    }
+    Ok(())
+}
+
 /// `POST /rest/v1/<table>` (JSON object or array of objects) -> `INSERT`.
 ///
 /// Item 139 §2: with no `Prefer` header this is exactly the pre-item-139
@@ -1516,10 +1615,21 @@ pub async fn get_collection(
 /// `INSERT` (same enforced [`run_stmt`] path, same `Engine::check_returning`
 /// grant check `/sql`'s own `RETURNING` uses) and returns the inserted rows.
 /// `Prefer: return=minimal` returns `201 Created` with an empty body.
+///
+/// Item 150 — upsert: `on_conflict=<col>` + `Prefer: resolution=
+/// merge-duplicates|ignore-duplicates` appends an `ON CONFLICT` clause (see
+/// [`append_on_conflict`]). No `resolution=` token → byte-identical
+/// pre-150 behavior (a conflicting row is a plain `UniqueViolation` 4xx),
+/// regardless of whether `on_conflict=` is present — mirrors real
+/// PostgREST, where the target param alone does nothing without the
+/// `Prefer` token driving the actual mode. Composes with `return=` exactly
+/// as a plain insert does (`RETURNING *` on either arm — G5/item 19's
+/// existing INSERT+UPDATE RETURNING support).
 pub async fn post_collection(
     Extension(principal): Extension<AuthPrincipal>,
     State(state): State<AppState>,
     Path(table): Path<String>,
+    RawQuery(raw): RawQuery,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
@@ -1554,6 +1664,21 @@ pub async fn post_collection(
     }
 
     let (mut sql, binds) = build_insert(&def, &rows)?;
+    if let Some(resolution) = prefer.resolution {
+        let pairs = parse_query_pairs(raw.as_deref());
+        let on_conflict_target = pairs
+            .iter()
+            .find(|(k, _)| k == "on_conflict")
+            .map(|(_, v)| v.as_str());
+        let payload_columns: Vec<String> = rows[0].keys().cloned().collect();
+        append_on_conflict(
+            &mut sql,
+            &def,
+            on_conflict_target,
+            resolution,
+            &payload_columns,
+        )?;
+    }
     let representation = prefer.return_pref == Some(ReturnPref::Representation);
     if representation {
         sql.push_str(" RETURNING *");

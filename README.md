@@ -260,7 +260,9 @@ the same RLS/grant engine as `/sql` (no separate authorization surface):
   plus a generated `GET /rest/v1` OpenAPI 3 document. `Prefer` header response
   controls (item 139): `count=exact` -> `Content-Range` (RLS-scoped, exact,
   zero extra cost when unused); `return=representation|minimal` on
-  `POST`/`PATCH`/`DELETE`.
+  `POST`/`PATCH`/`DELETE`. Upsert (item 150): `on_conflict=<col>` +
+  `Prefer: resolution=merge-duplicates|ignore-duplicates` on `POST` maps to
+  the SQL engine's `INSERT ... ON CONFLICT (col) DO UPDATE|DO NOTHING`.
 - `POST /graphql` — a schema-derived GraphQL API (`pg_graphql` analog) that,
   unlike a relational-only equivalent, also exposes **graph edge traversal**
   and **vector similarity** as first-class fields alongside FK relationships.
@@ -303,10 +305,10 @@ UNIDB_DATA_DIR=/var/lib/unidb cargo run --bin unidb-migrate -- migrations
 - Group commit — one `fsync` per transaction
 - Auto-checkpoint and autovacuum (background, Postgres-style policy)
 - Full-page writes + CRC32 checksums on every page
-- Crash-injection harness (54 crash/recovery tests as of 2026-07-22)
+- Crash-injection harness (56 crash/recovery tests as of 2026-08-03)
 
 **SQL and relational**
-- SQL subset: SELECT (with joins, aggregates, GROUP BY, HAVING, ORDER BY, LIMIT), INSERT, UPDATE, DELETE, CREATE/ALTER/DROP TABLE, TRUNCATE, RETURNING
+- SQL subset: SELECT (with joins, aggregates, GROUP BY, HAVING, ORDER BY, LIMIT), INSERT (incl. `ON CONFLICT ... DO NOTHING | DO UPDATE` upsert), UPDATE, DELETE, CREATE/ALTER/DROP TABLE, TRUNCATE, RETURNING
 - Window functions (ROW_NUMBER/RANK/DENSE_RANK/LAG/LEAD/SUM/AVG/COUNT/MIN/MAX OVER) and set operations (UNION/INTERSECT/EXCEPT)
 - Column types: INT, BIGINT, FLOAT, TEXT, BOOL, DECIMAL, TIMESTAMP, DATE, UUID, BYTEA, JSON, VECTOR(n)
 - Constraints: PRIMARY KEY, FOREIGN KEY, UNIQUE, NOT NULL, CHECK, DEFAULT, SERIAL

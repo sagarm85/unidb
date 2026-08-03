@@ -861,6 +861,20 @@ fn qualify_policy(policy: Expr, qualifier: &str) -> QExpr {
             );
             QExpr::Literal(Literal::Null)
         }
+        // item 150: `EXCLUDED.<col>` never legitimately reaches a *stored*
+        // RLS policy — it only exists transiently inside an `INSERT ...
+        // ON CONFLICT ... DO UPDATE`'s SET/WHERE, and `exec_insert`
+        // substitutes it away with a `Literal` before that predicate is
+        // ever evaluated (never lowered into a `QuerySpec`/`QExpr`). Same
+        // fail-closed reasoning as `CurrentUser`/`AuthUid` above.
+        Expr::Excluded(col) => {
+            tracing::warn!(
+                column = %col,
+                "unresolved EXCLUDED.{col} in policy lowering — failing closed \
+                 (NULL); EXCLUDED should never reach RLS policy lowering"
+            );
+            QExpr::Literal(Literal::Null)
+        }
     }
 }
 

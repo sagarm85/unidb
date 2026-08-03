@@ -68,10 +68,30 @@ pub enum Literal {
 /// executor only ever sees concrete values.
 pub fn bind_params(plan: &mut LogicalPlan, params: &[Literal]) -> Result<()> {
     match plan {
-        LogicalPlan::Insert { values, .. } => {
+        LogicalPlan::Insert {
+            values,
+            on_conflict,
+            ..
+        } => {
             for row in values {
                 for lit in row {
                     bind_literal(lit, params)?;
+                }
+            }
+            // item 150: `$n` placeholders may also appear in the DO UPDATE
+            // arm's SET exprs / WHERE (e.g. `... DO UPDATE SET n = $3`).
+            if let Some(oc) = on_conflict {
+                if let OnConflictAction::DoUpdate {
+                    assignments,
+                    predicate,
+                } = &mut oc.action
+                {
+                    for (_, expr) in assignments {
+                        bind_expr(expr, params)?;
+                    }
+                    if let Some(expr) = predicate {
+                        bind_expr(expr, params)?;
+                    }
                 }
             }
         }
@@ -148,7 +168,8 @@ fn bind_expr(expr: &mut Expr, params: &[Literal]) -> Result<()> {
         | Expr::Near { .. }
         | Expr::CurrentUser
         | Expr::AuthUid
-        | Expr::AuthClaim(_) => Ok(()),
+        | Expr::AuthClaim(_)
+        | Expr::Excluded(_) => Ok(()),
     }
 }
 
@@ -195,11 +216,16 @@ pub fn collect_expr_columns(expr: &Expr, out: &mut std::collections::BTreeSet<St
             collect_expr_columns(pattern, out);
         }
         Expr::IsNull { expr, .. } => collect_expr_columns(expr, out),
+        // item 150: `EXCLUDED.<col>` is a reference to the *proposed* row,
+        // not a read of the existing table row — it must not be conflated
+        // with a real column read (grant-checking would otherwise demand a
+        // SELECT grant that INSERT's own column-grant check already covers).
         Expr::ColumnSlot(_)
         | Expr::Literal(_)
         | Expr::CurrentUser
         | Expr::AuthUid
-        | Expr::AuthClaim(_) => {}
+        | Expr::AuthClaim(_)
+        | Expr::Excluded(_) => {}
     }
 }
 
@@ -357,6 +383,45 @@ pub enum Expr {
     /// `tracing::warn!`. Falls back to `Literal::Null` in `eval_expr` if
     /// somehow unsubstituted.
     AuthClaim(String),
+    /// `EXCLUDED.<col>` (item 150): only valid inside an `INSERT ... ON
+    /// CONFLICT ... DO UPDATE`'s `SET`/`WHERE` exprs — refers to the value
+    /// the proposed (would-have-been-inserted) row carries for `<col>`.
+    /// Never appears anywhere else in a stored/parsed plan; `exec_insert`
+    /// substitutes it with a `Literal` (the conflicting row's proposed
+    /// value) before handing the assignments/predicate to the same
+    /// single-row UPDATE machinery `exec_update` uses — see
+    /// `docs/backlog/150_upsert_on_conflict.md`.
+    Excluded(String),
+}
+
+/// `INSERT ... ON CONFLICT [(col)] DO NOTHING | DO UPDATE SET ...` (item
+/// 150). Locked v1 grammar: at most one conflict-target column (composite
+/// targets and `ON CONSTRAINT <name>` are non-goals — see
+/// `docs/backlog/150_upsert_on_conflict.md`); the target is optional for
+/// `DoNothing` (then any unique/PK violation on the row is absorbed) and
+/// required for `DoUpdate` (validated at parse time, not the executor).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OnConflict {
+    /// The single named conflict-target column, when specified. Must name
+    /// the table's PRIMARY KEY or a UNIQUE column — validated by the
+    /// executor against the live catalog (`InvalidConflictTarget` on
+    /// mismatch), not here (this layer has no catalog access).
+    pub target: Option<String>,
+    pub action: OnConflictAction,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum OnConflictAction {
+    /// Conflicting rows are silently skipped; the statement's row count
+    /// reflects only rows actually inserted (Postgres semantics).
+    DoNothing,
+    /// Conflicting rows are updated instead, through the same single-row
+    /// UPDATE machinery `exec_update` uses. `assignments`' RHS and
+    /// `predicate` may reference `Expr::Excluded(col)` (the proposed row).
+    DoUpdate {
+        assignments: Vec<(String, Expr)>,
+        predicate: Option<Expr>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -380,6 +445,9 @@ pub enum LogicalPlan {
         /// result; `Some(cols)` → `ExecResult::Rows` with the inserted rows.
         /// An empty list means `RETURNING *` (all columns).
         returning: Option<Vec<String>>,
+        /// `ON CONFLICT ...` (item 150). `None` → byte-identical pre-150
+        /// behavior (a unique violation always errors).
+        on_conflict: Option<OnConflict>,
     },
     Select {
         table: String,
@@ -507,7 +575,8 @@ pub fn substitute_current_user_in_expr(expr: &mut Expr, user: &str) {
         | Expr::Literal(_)
         | Expr::Near { .. }
         | Expr::AuthUid
-        | Expr::AuthClaim(_) => {}
+        | Expr::AuthClaim(_)
+        | Expr::Excluded(_) => {}
     }
 }
 
@@ -526,8 +595,29 @@ pub fn substitute_current_user_in_plan(plan: &mut LogicalPlan, user: &str) {
         LogicalPlan::Select { predicate, .. } => sub(predicate),
         LogicalPlan::Update { predicate, .. } => sub(predicate),
         LogicalPlan::Delete { predicate, .. } => sub(predicate),
-        // INSERT carries no predicate (its policy is handled inline in
-        // exec_insert via ExecCtx::current_user). DDL has no predicates.
+        // item 150: an `ON CONFLICT ... DO UPDATE` arm's SET/WHERE is
+        // user-authored SQL exactly like a plain UPDATE's — a caller writing
+        // `DO UPDATE SET owner = current_user()` needs the same substitution
+        // a plain `UPDATE ... SET owner = current_user()` gets, or it would
+        // silently fall back to `Literal::Null` in `eval_expr`.
+        LogicalPlan::Insert {
+            on_conflict: Some(oc),
+            ..
+        } => {
+            if let OnConflictAction::DoUpdate {
+                assignments,
+                predicate,
+            } = &mut oc.action
+            {
+                for (_, expr) in assignments {
+                    substitute_current_user_in_expr(expr, user);
+                }
+                sub(predicate);
+            }
+        }
+        // Bare INSERT (no ON CONFLICT) carries no predicate (its policy is
+        // handled inline in exec_insert via ExecCtx::current_user). DDL has
+        // no predicates.
         _ => {}
     }
 }
@@ -560,7 +650,8 @@ fn expr_has_current_user(expr: &Expr) -> bool {
         | Expr::Literal(_)
         | Expr::Near { .. }
         | Expr::AuthUid
-        | Expr::AuthClaim(_) => false,
+        | Expr::AuthClaim(_)
+        | Expr::Excluded(_) => false,
     }
 }
 
@@ -587,7 +678,8 @@ fn expr_has_auth_uid(expr: &Expr) -> bool {
         | Expr::Literal(_)
         | Expr::Near { .. }
         | Expr::CurrentUser
-        | Expr::AuthClaim(_) => false,
+        | Expr::AuthClaim(_)
+        | Expr::Excluded(_) => false,
     }
 }
 
@@ -614,7 +706,8 @@ fn expr_has_auth_claim(expr: &Expr) -> bool {
         | Expr::Literal(_)
         | Expr::Near { .. }
         | Expr::CurrentUser
-        | Expr::AuthUid => false,
+        | Expr::AuthUid
+        | Expr::Excluded(_) => false,
     }
 }
 
@@ -706,7 +799,8 @@ pub fn substitute_auth_context_in_expr(
         | Expr::ColumnSlot(_)
         | Expr::Literal(_)
         | Expr::Near { .. }
-        | Expr::CurrentUser => {}
+        | Expr::CurrentUser
+        | Expr::Excluded(_) => {}
     }
 }
 
@@ -732,9 +826,26 @@ pub fn substitute_auth_context_in_plan(
         LogicalPlan::Select { predicate, .. } => sub(predicate),
         LogicalPlan::Update { predicate, .. } => sub(predicate),
         LogicalPlan::Delete { predicate, .. } => sub(predicate),
-        // INSERT carries no predicate (its policy is handled inline in
-        // exec_insert via ExecCtx::auth_claims/current_user). DDL has no
-        // predicates.
+        // item 150: see the identical rationale in
+        // `substitute_current_user_in_plan` just above.
+        LogicalPlan::Insert {
+            on_conflict: Some(oc),
+            ..
+        } => {
+            if let OnConflictAction::DoUpdate {
+                assignments,
+                predicate,
+            } = &mut oc.action
+            {
+                for (_, expr) in assignments {
+                    substitute_auth_context_in_expr(expr, subject, claims);
+                }
+                sub(predicate);
+            }
+        }
+        // Bare INSERT (no ON CONFLICT) carries no predicate (its policy is
+        // handled inline in exec_insert via ExecCtx::auth_claims/
+        // current_user). DDL has no predicates.
         _ => {}
     }
 }
@@ -1377,6 +1488,7 @@ mod tests {
             columns: None,
             values: vec![vec![Literal::Param(2)]],
             returning: None,
+            on_conflict: None,
         };
         assert!(bind_params(&mut plan, &[Literal::Int(1)]).is_err());
     }

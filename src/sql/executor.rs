@@ -1450,7 +1450,15 @@ pub fn execute(plan: LogicalPlan, ctx: &mut ExecCtx) -> Result<ExecResult> {
             columns,
             values,
             returning,
-        } => exec_insert(&table, columns, values, returning.as_deref(), ctx),
+            on_conflict,
+        } => exec_insert(
+            &table,
+            columns,
+            values,
+            returning.as_deref(),
+            on_conflict.as_ref(),
+            ctx,
+        ),
         LogicalPlan::Select {
             table,
             projection,
@@ -2090,11 +2098,336 @@ fn persist_pages_if_changed(
     Ok(())
 }
 
+/// The plain-INSERT body for one already-validated (defaults/coercion/NOT
+/// NULL/CHECK done) row: INSERT `WITH CHECK`, UNIQUE+FK phantom locks +
+/// enforcement (item 35/36's two-step "lock before snapshot" dance), the
+/// heap write, index maintenance, CDC capture. Returns the row as written.
+///
+/// Extracted out of `exec_insert`'s per-row loop by item 150 so the `ON
+/// CONFLICT` arm can reuse it unchanged for two cases: (a) an explicit
+/// conflict target that did NOT match (falls through to a plain insert —
+/// same call, same function, see below), and (b) `DO NOTHING` with NO
+/// explicit target, where the caller simply matches
+/// `Err(DbError::UniqueViolation { .. })` and skips the row (spec step 3 —
+/// "optional for DO NOTHING; then any unique violation is ignored") instead
+/// of propagating the error — everything up to and including the phantom
+/// locks has already run identically to a plain INSERT attempt, so no
+/// heap/index state is left dangling on that path (the violation is
+/// detected in `enforce_unique`, strictly before the heap write).
+fn try_insert_one_row(
+    table_def: &TableDef,
+    heap: &Heap,
+    coerced: Vec<Literal>,
+    ctx: &mut ExecCtx,
+    insert_accum: &mut Option<crate::heap::InsertAccum>,
+) -> Result<Vec<Literal>> {
+    // Item-24 Z1: INSERT policy check. If a `FOR INSERT` (or `FOR ALL`)
+    // RLS policy exists, evaluate the predicate against the new row before
+    // writing — any row that would violate the predicate is rejected.
+    // Item-24 Z6 / item 122 (B1/B2): substitute `current_user`/`auth.uid()`/
+    // `auth.jwt()` in the policy clone before evaluating, so per-user and
+    // per-claim row isolation works on the INSERT path too. When
+    // `current_user` is None (embedded/superuser path), skip any policy
+    // that requires a verified identity (same reasoning as
+    // `apply_rls_skip_current_user`). item 122 B3: a `service_role`
+    // caller bypasses this row-level check too — it "bypasses RLS like a
+    // superuser" (this per-row INSERT/WITH-CHECK path is evaluated
+    // regardless of the plan-level `apply_rls` skip, so it needs its own
+    // explicit bypass check).
+    if let Some(ref ins_policy) = table_def.insert_policy {
+        let requires_identity = crate::sql::logical::expr_requires_auth_context_pub(ins_policy);
+        if requires_identity && (ctx.current_user.is_none() || is_service_role(ctx)) {
+            // Superuser/embedded/service_role path — bypass identity-dependent INSERT policies.
+        } else {
+            let mut policy = ins_policy.clone();
+            if let Some(ref u) = ctx.current_user {
+                crate::sql::logical::substitute_current_user_in_expr(&mut policy, u);
+            }
+            crate::sql::logical::substitute_auth_context_in_expr(
+                &mut policy,
+                ctx.current_user.as_deref(),
+                &ctx.auth_claims,
+            );
+            if !check_passes(&policy, &table_def.columns, &coerced)? {
+                return Err(DbError::SqlPlan(format!(
+                    "new row violates policy for table \"{}\"",
+                    table_def.name
+                )));
+            }
+        }
+    }
+    // UNIQUE + FK — two-step approach for concurrent-writer safety
+    // (item 35 inv. 3 / item 36 inv. 3): both phantom locks must be
+    // acquired BEFORE taking the snapshot so that any concurrent winner
+    // (another inserter racing the same unique key, or a parent deleter
+    // racing this child insert) is already committed and visible when the
+    // snapshot is taken.
+    //
+    // Step 1a: UniqueKey phantom locks (item 35).
+    for (col_idx, col) in table_def.columns.iter().enumerate() {
+        if col.dropped || col.unique_index_root.is_none() {
+            continue;
+        }
+        if let Ok(key) = OrderedValue::try_from(&coerced[col_idx]) {
+            let lock_id = unique_key_record_id(&table_def.name, &col.name, &key);
+            ctx.lock_mgr.acquire_blocking(lock_id, ctx.xid)?;
+        }
+    }
+    // Step 1b: FkKey phantom locks (item 36) — before snapshot so a
+    // concurrent parent deleter either already committed (FK violation
+    // follows) or blocks here and sees the committed child after we commit.
+    acquire_fk_key_locks(
+        table_def,
+        &coerced,
+        ctx.xid,
+        ctx.lock_mgr,
+        ctx.catalog.get(),
+    )?;
+    // Step 2: take snapshot AFTER all phantom locks — every concurrent
+    // winner is now visible.
+    let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+    enforce_unique(
+        table_def, &coerced, heap, &snapshot, ctx.xid, ctx.pool, None,
+    )?;
+    // Step 3: FK row-existence check (item 36). NULL columns are
+    // skipped; own-xid rows (same-txn parent) are visible via get_visible.
+    enforce_fk_rows_exist(
+        table_def,
+        &coerced,
+        &snapshot,
+        ctx.xid,
+        ctx.pool,
+        ctx.catalog.get(),
+    )?;
+    let encoded = encode_row(&coerced);
+    // Item 98: accumulating insert — one WAL mini-txn per heap page.
+    let row_id = heap.insert_accumulating(&encoded, ctx.xid, ctx.pool, ctx.wal, insert_accum)?;
+    ctx.txn_mgr.record_undo(
+        ctx.xid,
+        UndoAction::Insert {
+            page_id: row_id.page_id,
+            slot: row_id.slot,
+        },
+    )?;
+    apply_durable_index_writes(table_def, row_id, &coerced, ctx)?;
+    // C1 (item 29): INSERT has after-only; no pre-image.
+    send_event_capture(table_def, "insert", None, Some(&coerced), ctx)?;
+    Ok(coerced)
+}
+
+/// item 150 — probe `target_col`'s unique index for a live, visible
+/// conflicting row before attempting a plain insert. Mirrors
+/// `enforce_unique`'s single-column fast path (item 35), including the
+/// phantom-lock-before-snapshot ordering (spec step 1), so concurrent
+/// same-key upserts serialize exactly like concurrent plain INSERTs do
+/// today: the lock is acquired unconditionally (whether or not a
+/// conflict is ultimately found), and only then is the snapshot taken.
+///
+/// NULL never conflicts (spec step 5): a NULL target value short-circuits
+/// to `Ok(None)` before any lock/probe. Returns the *live* RowId (following
+/// any HOT chain via `get_visible_with_rid`, item 58/71 — the conflicting
+/// row may not be at the B-tree candidate's own slot) plus its decoded
+/// current value, ready to feed straight into `apply_single_row_update`.
+fn probe_conflict_target(
+    table_def: &TableDef,
+    coerced: &[Literal],
+    target_col: &str,
+    ctx: &mut ExecCtx,
+) -> Result<Option<(RowId, Vec<Literal>)>> {
+    let col_idx = column_index(table_def, target_col)?;
+    let col = &table_def.columns[col_idx];
+    let uiq_meta = col
+        .unique_index_root
+        .ok_or_else(|| DbError::InvalidConflictTarget {
+            table: table_def.name.clone(),
+            reason: format!("column \"{target_col}\" is not the PRIMARY KEY or a UNIQUE column"),
+        })?;
+    if matches!(coerced[col_idx], Literal::Null) {
+        return Ok(None);
+    }
+    let key =
+        OrderedValue::try_from(&coerced[col_idx]).map_err(|_| DbError::InvalidConflictTarget {
+            table: table_def.name.clone(),
+            reason: format!("column \"{target_col}\" has a non-indexable value type"),
+        })?;
+    // Phantom lock BEFORE snapshot (item 35 concurrency invariant, spec step 1).
+    let lock_id = unique_key_record_id(&table_def.name, &col.name, &key);
+    ctx.lock_mgr.acquire_blocking(lock_id, ctx.xid)?;
+    let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+    let page_size = ctx.pool.page_size();
+    let candidates = DiskBTree::new(uiq_meta, page_size).search_eq(&key, ctx.pool)?;
+    for rid in candidates {
+        if let Some((live_rid, bytes)) =
+            crate::heap::get_visible_with_rid(ctx.pool, rid, &snapshot, ctx.xid)?
+        {
+            let row = decode_row(&bytes, &table_def.columns)?;
+            return Ok(Some((live_rid, row)));
+        }
+    }
+    Ok(None)
+}
+
+/// item 150 — the DO UPDATE arm's USING check. Unlike a normal UPDATE
+/// (which silently filters non-matching rows out of its scan via
+/// `apply_rls`'s plan-level AND-rewrite before `exec_update` ever sees
+/// them), a targeted upsert already knows exactly which row it's about to
+/// touch — found via the conflict-target unique-index probe — so "the row
+/// exists but USING doesn't match" must be a hard, fail-closed ERROR
+/// (spec's documented divergence-from-skip): silently skipping would let a
+/// caller probe for the existence/attributes of a row they have no
+/// read/update rights to (an existence oracle), exactly what RLS exists to
+/// prevent. This checks the EXISTING (pre-mutation) row; `WITH CHECK`
+/// against the POST-image is a separate, later check via the same
+/// `exec_update_with_check` a normal UPDATE uses (reused verbatim through
+/// `apply_single_row_update`).
+fn exec_upsert_update_using(
+    table_def: &TableDef,
+    existing_row: &[Literal],
+    ctx: &ExecCtx,
+) -> Result<()> {
+    let Some(ref using_expr) = table_def.update_policy else {
+        return Ok(());
+    };
+    // Superuser / embedded path (current_user = None) bypasses ALL RLS,
+    // mirroring `exec_update_with_check`'s identical bypass. service_role
+    // bypasses unconditionally too (item 122 B3).
+    if ctx.current_user.is_none() || is_service_role(ctx) {
+        return Ok(());
+    }
+    let mut policy = using_expr.clone();
+    if let Some(ref u) = ctx.current_user {
+        crate::sql::logical::substitute_current_user_in_expr(&mut policy, u);
+    }
+    crate::sql::logical::substitute_auth_context_in_expr(
+        &mut policy,
+        ctx.current_user.as_deref(),
+        &ctx.auth_claims,
+    );
+    if !check_passes(&policy, &table_def.columns, existing_row)? {
+        return Err(DbError::SqlPlan(format!(
+            "ON CONFLICT DO UPDATE: target row on table \"{}\" does not satisfy \
+             the caller's UPDATE policy",
+            table_def.name
+        )));
+    }
+    Ok(())
+}
+
+/// item 150 — replace every `Expr::Excluded(col)` leaf in `expr` with
+/// `Expr::Literal` of `proposed_row`'s value for `col` (the row that WOULD
+/// have been inserted). Mirrors the shape of `substitute_current_user_in_expr`.
+/// An unresolvable `col` name is a hard error (`ColumnNotFound`) rather than
+/// a silent no-op — `EXCLUDED.<col>` naming a real, non-dropped column is
+/// the only legal shape (grammar-checked nowhere earlier, since the parser
+/// has no catalog access), so this is where it is finally validated.
+fn substitute_excluded_in_expr(
+    expr: &mut Expr,
+    proposed_row: &[Literal],
+    columns: &[ColumnDef],
+) -> Result<()> {
+    match expr {
+        Expr::Excluded(name) => {
+            let idx = columns
+                .iter()
+                .position(|c| &c.name == name && !c.dropped)
+                .ok_or_else(|| DbError::ColumnNotFound {
+                    table: String::new(),
+                    column: name.clone(),
+                })?;
+            *expr = Expr::Literal(proposed_row[idx].clone());
+            Ok(())
+        }
+        Expr::BinOp { lhs, rhs, .. } | Expr::Arith { lhs, rhs, .. } => {
+            substitute_excluded_in_expr(lhs, proposed_row, columns)?;
+            substitute_excluded_in_expr(rhs, proposed_row, columns)
+        }
+        Expr::And(lhs, rhs) | Expr::Or(lhs, rhs) => {
+            substitute_excluded_in_expr(lhs, proposed_row, columns)?;
+            substitute_excluded_in_expr(rhs, proposed_row, columns)
+        }
+        Expr::JsonExtract { expr, .. } | Expr::JsonExtractText { expr, .. } => {
+            substitute_excluded_in_expr(expr, proposed_row, columns)
+        }
+        Expr::Like { expr, pattern, .. } => {
+            substitute_excluded_in_expr(expr, proposed_row, columns)?;
+            substitute_excluded_in_expr(pattern, proposed_row, columns)
+        }
+        Expr::Match { query, .. } => substitute_excluded_in_expr(query, proposed_row, columns),
+        Expr::IsNull { expr, .. } => substitute_excluded_in_expr(expr, proposed_row, columns),
+        Expr::Column(_)
+        | Expr::ColumnSlot(_)
+        | Expr::Literal(_)
+        | Expr::Near { .. }
+        | Expr::CurrentUser
+        | Expr::AuthUid
+        | Expr::AuthClaim(_) => Ok(()),
+    }
+}
+
+/// item 150 — the `ON CONFLICT ... DO UPDATE` arm for one conflicting row.
+/// Binds `EXCLUDED.*` to `proposed_row`, enforces the caller's UPDATE
+/// policies (USING against the existing row = hard error on mismatch, see
+/// `exec_upsert_update_using`'s doc; `WITH CHECK` against the post-image via
+/// the shared `apply_single_row_update` -> `exec_update_with_check`),
+/// evaluates the (now EXCLUDED-free) `WHERE` against the existing row —
+/// Postgres semantics: false skips the row, not an error (spec step 4) —
+/// then routes into `apply_single_row_update`, the EXACT function
+/// `exec_update`'s own per-row loop uses. Returns `Ok(None)` for a
+/// WHERE-guarded skip, `Ok(Some(after_row))` when the row was updated.
+#[allow(clippy::too_many_arguments)]
+fn apply_conflict_update(
+    table_def: &TableDef,
+    heap: &Heap,
+    row_id: RowId,
+    before_row: Vec<Literal>,
+    proposed_row: &[Literal],
+    assignments: &[(String, Expr)],
+    predicate: Option<&Expr>,
+    gates: &UpdateGates,
+    index_batches: &mut [IndexColBatch],
+    patch_batches: &mut [PatchColBatch],
+    ctx: &mut ExecCtx,
+) -> Result<Option<Vec<Literal>>> {
+    exec_upsert_update_using(table_def, &before_row, ctx)?;
+
+    let mut bound_assignments = assignments.to_vec();
+    for (_, expr) in &mut bound_assignments {
+        substitute_excluded_in_expr(expr, proposed_row, &table_def.columns)?;
+    }
+    let bound_predicate = match predicate {
+        None => None,
+        Some(p) => {
+            let mut p = p.clone();
+            substitute_excluded_in_expr(&mut p, proposed_row, &table_def.columns)?;
+            Some(p)
+        }
+    };
+    if let Some(pred) = &bound_predicate {
+        if !as_bool(&eval_expr(pred, &table_def.columns, &before_row)?)? {
+            return Ok(None); // DO UPDATE WHERE false — skip, not an error (spec step 4).
+        }
+    }
+
+    let after = apply_single_row_update(
+        table_def,
+        heap,
+        row_id,
+        before_row,
+        &bound_assignments,
+        gates,
+        index_batches,
+        patch_batches,
+        ctx,
+    )?;
+    Ok(Some(after))
+}
+
 fn exec_insert(
     table: &str,
     columns: Option<Vec<String>>,
     values: Vec<Vec<Literal>>,
     returning: Option<&[String]>,
+    on_conflict: Option<&crate::sql::logical::OnConflict>,
     ctx: &mut ExecCtx,
 ) -> Result<ExecResult> {
     let table_def = ctx.catalog.lookup(table)?.clone();
@@ -2105,6 +2438,21 @@ fn exec_insert(
     // packing a page once the HOT-reserved slack threshold is reached.
     let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone())
         .with_fill_factor(table_def.fill_factor);
+
+    // Item 150: precompute the DO UPDATE arm's gating once per statement
+    // (never per row) — the exact same `UpdateGates` a plain `UPDATE`
+    // naming this SET clause would compute (`compute_update_gates`).
+    // Index/patch batches accumulate across every conflicting row in this
+    // one INSERT statement, flushed once at the end (A1 coalescing, same
+    // as `exec_update`).
+    let oc_gates: Option<UpdateGates> = match on_conflict.map(|oc| &oc.action) {
+        Some(crate::sql::logical::OnConflictAction::DoUpdate { assignments, .. }) => Some(
+            compute_update_gates(&table_def, assignments, ctx.catalog.get())?,
+        ),
+        _ => None,
+    };
+    let mut oc_index_batches = init_index_batches(&table_def);
+    let mut oc_patch_batches = init_patch_batches(&table_def);
 
     // Item 98: streaming-accumulation insert.
     //
@@ -2127,7 +2475,14 @@ fn exec_insert(
 
     // G5 (item 19): RETURNING — collect rows when requested.
     let mut returned_rows: Vec<Vec<Literal>> = Vec::new();
+    // `count`: total statement-affected rows (Postgres's "INSERT 0 N" tag for
+    // an upsert counts inserted AND DO-UPDATE-resolved rows together).
     let mut count = 0;
+    // `inserted_delta`: NET NEW heap rows only — feeds the catalog's exact
+    // row-count tracking (item 97). A DO UPDATE-resolved row does not change
+    // the table's row count (same logical row, new MVCC version), so it must
+    // NOT be added here, unlike `count`.
+    let mut inserted_delta: i64 = 0;
     for row_values in values {
         let ordered = order_values_by_columns(&table_def, &columns, row_values)?;
         // SERIAL/identity fill (P2.d): allocate the next counter value for any
@@ -2139,114 +2494,93 @@ fn exec_insert(
         let coerced = coerce_and_validate_row(&table_def, filled)?;
         enforce_not_null(&table_def, &coerced)?;
         enforce_checks(&table_def, &coerced)?;
-        // Item-24 Z1: INSERT policy check. If a `FOR INSERT` (or `FOR ALL`)
-        // RLS policy exists, evaluate the predicate against the new row before
-        // writing — any row that would violate the predicate is rejected.
-        // Item-24 Z6 / item 122 (B1/B2): substitute `current_user`/`auth.uid()`/
-        // `auth.jwt()` in the policy clone before evaluating, so per-user and
-        // per-claim row isolation works on the INSERT path too. When
-        // `current_user` is None (embedded/superuser path), skip any policy
-        // that requires a verified identity (same reasoning as
-        // `apply_rls_skip_current_user`). item 122 B3: a `service_role`
-        // caller bypasses this row-level check too — it "bypasses RLS like a
-        // superuser" (this per-row INSERT/WITH-CHECK path is evaluated
-        // regardless of the plan-level `apply_rls` skip, so it needs its own
-        // explicit bypass check).
-        if let Some(ref ins_policy) = table_def.insert_policy {
-            let requires_identity = crate::sql::logical::expr_requires_auth_context_pub(ins_policy);
-            if requires_identity && (ctx.current_user.is_none() || is_service_role(ctx)) {
-                // Superuser/embedded/service_role path — bypass identity-dependent INSERT policies.
+
+        // Item 150: ON CONFLICT routing.
+        if let Some(oc) = on_conflict {
+            if let Some(target_col) = &oc.target {
+                if let Some((conflict_rid, before_row)) =
+                    probe_conflict_target(&table_def, &coerced, target_col, ctx)?
+                {
+                    match &oc.action {
+                        crate::sql::logical::OnConflictAction::DoNothing => continue, // skipped, uncounted
+                        crate::sql::logical::OnConflictAction::DoUpdate {
+                            assignments,
+                            predicate,
+                        } => {
+                            let gates = oc_gates
+                                .as_ref()
+                                .expect("DoUpdate always computes oc_gates above");
+                            if let Some(after_row) = apply_conflict_update(
+                                &table_def,
+                                &heap,
+                                conflict_rid,
+                                before_row,
+                                &coerced,
+                                assignments,
+                                predicate.as_ref(),
+                                gates,
+                                &mut oc_index_batches,
+                                &mut oc_patch_batches,
+                                ctx,
+                            )? {
+                                if returning.is_some() {
+                                    returned_rows.push(after_row);
+                                }
+                                count += 1;
+                            }
+                            continue;
+                        }
+                    }
+                }
+                // No conflict on the named target — fall through to a plain
+                // insert below. A DIFFERENT unique/PK column colliding still
+                // raises `UniqueViolation` normally (`ON CONFLICT` only
+                // absorbs conflicts on its own named target, matching
+                // Postgres: naming one constraint doesn't silence others).
             } else {
-                let mut policy = ins_policy.clone();
-                if let Some(ref u) = ctx.current_user {
-                    crate::sql::logical::substitute_current_user_in_expr(&mut policy, u);
+                // No explicit target — grammar-valid only for DO NOTHING
+                // (parser-enforced): absorb ANY unique violation the plain
+                // insert attempt raises (spec step 3).
+                match try_insert_one_row(&table_def, &heap, coerced, ctx, &mut insert_accum) {
+                    Ok(row) => {
+                        if returning.is_some() {
+                            returned_rows.push(row);
+                        }
+                        count += 1;
+                        inserted_delta += 1;
+                    }
+                    Err(DbError::UniqueViolation { .. }) => {} // absorbed, row skipped
+                    Err(e) => return Err(e),
                 }
-                crate::sql::logical::substitute_auth_context_in_expr(
-                    &mut policy,
-                    ctx.current_user.as_deref(),
-                    &ctx.auth_claims,
-                );
-                if !check_passes(&policy, &table_def.columns, &coerced)? {
-                    return Err(DbError::SqlPlan(format!(
-                        "new row violates policy for table \"{}\"",
-                        table_def.name
-                    )));
-                }
-            }
-        }
-        // UNIQUE + FK — two-step approach for concurrent-writer safety
-        // (item 35 inv. 3 / item 36 inv. 3): both phantom locks must be
-        // acquired BEFORE taking the snapshot so that any concurrent winner
-        // (another inserter racing the same unique key, or a parent deleter
-        // racing this child insert) is already committed and visible when the
-        // snapshot is taken.
-        //
-        // Step 1a: UniqueKey phantom locks (item 35).
-        for (col_idx, col) in table_def.columns.iter().enumerate() {
-            if col.dropped || col.unique_index_root.is_none() {
                 continue;
             }
-            if let Ok(key) = OrderedValue::try_from(&coerced[col_idx]) {
-                let lock_id = unique_key_record_id(&table_def.name, &col.name, &key);
-                ctx.lock_mgr.acquire_blocking(lock_id, ctx.xid)?;
-            }
         }
-        // Step 1b: FkKey phantom locks (item 36) — before snapshot so a
-        // concurrent parent deleter either already committed (FK violation
-        // follows) or blocks here and sees the committed child after we commit.
-        acquire_fk_key_locks(
-            &table_def,
-            &coerced,
-            ctx.xid,
-            ctx.lock_mgr,
-            ctx.catalog.get(),
-        )?;
-        // Step 2: take snapshot AFTER all phantom locks — every concurrent
-        // winner is now visible.
-        let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
-        enforce_unique(
-            &table_def, &coerced, &heap, &snapshot, ctx.xid, ctx.pool, None,
-        )?;
-        // Step 3: FK row-existence check (item 36). NULL columns are
-        // skipped; own-xid rows (same-txn parent) are visible via get_visible.
-        enforce_fk_rows_exist(
-            &table_def,
-            &coerced,
-            &snapshot,
-            ctx.xid,
-            ctx.pool,
-            ctx.catalog.get(),
-        )?;
-        let encoded = encode_row(&coerced);
-        // Item 98: accumulating insert — one WAL mini-txn per heap page.
-        let row_id =
-            heap.insert_accumulating(&encoded, ctx.xid, ctx.pool, ctx.wal, &mut insert_accum)?;
-        ctx.txn_mgr.record_undo(
-            ctx.xid,
-            UndoAction::Insert {
-                page_id: row_id.page_id,
-                slot: row_id.slot,
-            },
-        )?;
-        apply_durable_index_writes(&table_def, row_id, &coerced, ctx)?;
-        // C1 (item 29): INSERT has after-only; no pre-image.
-        send_event_capture(&table_def, "insert", None, Some(&coerced), ctx)?;
+
+        // Plain insert: no ON CONFLICT, or an explicit target with no
+        // conflict found on it.
+        let row = try_insert_one_row(&table_def, &heap, coerced, ctx, &mut insert_accum)?;
         if returning.is_some() {
-            returned_rows.push(coerced);
+            returned_rows.push(row);
         }
         count += 1;
+        inserted_delta += 1;
     }
     // Commit the final page's deferred mini-txn (item 98).
     heap.flush_insert_accum(ctx.wal, &mut insert_accum)?;
+    // Item 150: coalesced index maintenance for the DO UPDATE arm (A1),
+    // same flush path `exec_update` uses.
+    flush_patch_batches(&oc_patch_batches, ctx)?;
+    flush_index_batches(&oc_index_batches, ctx)?;
 
     persist_pages_if_changed(table, &heap, &table_def.pages, ctx)?;
     assert_schema_stable(ctx, table, table_def.generation);
 
     // Item 97: defer row-count delta to user-txn commit so aborted txns
-    // never corrupt the catalog's exact count.
-    if count > 0 {
+    // never corrupt the catalog's exact count. Item 150: only NET NEW rows
+    // count here — see `inserted_delta`'s doc above.
+    if inserted_delta > 0 {
         ctx.txn_mgr
-            .record_row_count_delta(ctx.xid, table, count as i64)?;
+            .record_row_count_delta(ctx.xid, table, inserted_delta)?;
     }
 
     // G5 (item 19): emit RETURNING result if requested.
@@ -3260,30 +3594,36 @@ fn ivf_exact_distance(metric: crate::vector::Metric, a: &[f32], b: &[f32]) -> f3
     crate::hnsw_index::hnsw_distance(metric, a, b)
 }
 
-fn exec_update(
-    table: &str,
-    assignments: &[(String, Expr)],
-    predicate: &Option<Expr>,
-    returning: Option<&[String]>,
-    ctx: &mut ExecCtx,
-) -> Result<ExecResult> {
-    let table_def = ctx.catalog.lookup(table)?.clone();
-    enforce_referenced_tables_exist(&table_def, ctx.catalog.get())?;
-    let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
-    let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+/// Per-statement UPDATE eligibility/gating flags (items 53/58/71/76/117/119),
+/// derived purely from `table_def` + the target assignment list — never
+/// per-row, and never dependent on which rows actually match a WHERE clause.
+/// Extracted by item 150 out of `exec_update`'s own pre-loop computation
+/// (unchanged logic, verbatim) so the `ON CONFLICT ... DO UPDATE` arm in
+/// `exec_insert` computes byte-identical gating for the exact same reasons —
+/// the whole point of "route into the existing UPDATE machinery" is that a
+/// conflict-resolving UPDATE gets the same HOT-eligibility / UNIQUE-recheck
+/// / FK-recheck rules a normal UPDATE naming the same SET clause would get.
+#[derive(Clone, Copy)]
+struct UpdateGates {
+    has_unique: bool,
+    has_fk_children: bool,
+    hot_eligible: bool,
+    has_unique_in_set: bool,
+    has_fk_refs_in_set: bool,
+    has_fk_children_ref_in_set: bool,
+}
 
-    // ── Item 76: early HOT eligibility gate + parallel matching ──────────────
-    // Compute hot_eligible *before* the scan: all four conditions are purely
-    // metadata-derived (table_def + assignments, no I/O).  Moving this up lets
-    // us choose the parallel collection path for HOT-eligible tables instead
-    // of always paying the serial heap.scan() cost.
-    //
+fn compute_update_gates(
+    table_def: &TableDef,
+    assignments: &[(String, Expr)],
+    catalog: &Catalog,
+) -> Result<UpdateGates> {
     // A4: whether any UNIQUE/PRIMARY KEY set exists at all — computed once, not
-    // per row. When there are none, the loop skips both the per-row
+    // per row. When there are none, the per-row loop skips both the per-row
     // `snapshot_for_statement` allocation *and* `enforce_unique`'s full-heap
     // scan (which would otherwise fire per row → RC5's O(N²)); the check is a
     // no-op in that case (`enforce_unique` early-returns on empty active sets).
-    let has_unique = !unique_column_sets(&table_def)?.is_empty();
+    let has_unique = !unique_column_sets(table_def)?.is_empty();
     // Item 36: gate FK child-side check (new values reference valid parents).
     let has_fk_refs = table_def
         .columns
@@ -3310,71 +3650,311 @@ fn exec_update(
         })
     };
     // Item 36: gate FK parent-side RESTRICT (does any child table reference us?).
-    let has_fk_children = table_has_fk_children(ctx.catalog.get(), table);
+    let has_fk_children = table_has_fk_children(catalog, &table_def.name);
     // Item 117 (2026-07-30): gate the UNIQUE/PK re-check the same way item 53
     // gates the FK check — only when a unique/PK column actually appears in the
-    // SET clause. If no unique column changes, the new row's key equals the old
-    // row's key, so `enforce_unique` can only ever match this row's own excluded
-    // old version — the check (plus its phantom lock and fresh snapshot) is pure
-    // overhead. This is also what lets a PK'd table take the HOT fast path when it
-    // updates a NON-indexed column (the common case, e.g. `orders SET status`),
-    // instead of being forced onto the slow per-row loop by the mere existence of
-    // a PK. Safety: the unchanged unique-index entry still resolves to the live
-    // version via the same `get_visible` HOT-chain walk every secondary-index
-    // lookup uses (verified), and `set_touches_indexed_col` (which already checks
-    // `unique_index_root`) remains the backstop that forbids HOT when the unique/PK
-    // column itself is assigned.
+    // SET clause.
     let has_unique_in_set = has_unique && {
         let set_col_names: std::collections::HashSet<&str> =
             assignments.iter().map(|(col, _)| col.as_str()).collect();
-        unique_column_sets(&table_def)?
+        unique_column_sets(table_def)?
             .iter()
             .flatten()
             .any(|&ci| set_col_names.contains(table_def.columns[ci].name.as_str()))
     };
     // Item 119 (2026-07-31): gate the parent-side FK RESTRICT the same way item
     // 53 gates the child-side check and item 117 gates UNIQUE — only when a
-    // column that some CHILD references actually appears in the SET clause. An
-    // UPDATE that leaves every child-referenced key value unchanged cannot orphan
-    // any child, so RESTRICT (which reads the OLD key and asks "is it still
-    // referenced?") would always find it referenced and wrongly BLOCK a benign
-    // edit — e.g. `UPDATE purchase_orders SET shipping_address = ... WHERE id=1`
-    // when `po_line_items.order_id` references `purchase_orders.id`. RESTRICT must
-    // only fire when a referenced key is actually being changed (which then
-    // correctly blocks orphaning a child); a plain DELETE still always enforces it
-    // (that path does not use this gate). `has_fk_children` stays as the broad
-    // "does anyone reference us?" fact; this narrows it to "…and are we touching
-    // the referenced key?".
+    // column that some CHILD references actually appears in the SET clause.
     let has_fk_children_ref_in_set = has_fk_children && {
         let set_col_names: std::collections::HashSet<&str> =
             assignments.iter().map(|(col, _)| col.as_str()).collect();
-        fk_referenced_parent_columns(ctx.catalog.get(), &table_def)
+        fk_referenced_parent_columns(catalog, table_def)
             .iter()
             .any(|c| set_col_names.contains(c.as_str()))
     };
-
-    // Item 58 HOT eligibility: try same-page HOT update (no B-tree update)
-    // when all of the following hold:
-    //   1. No UNIQUE/PK column *in the SET clause* (item 117). A unique/PK key
-    //      that actually changes must insert a new B-tree entry, which HOT would
-    //      leave dangling at the old slot — but that case is already caught by
-    //      condition (4), since `set_touches_indexed_col` checks
-    //      `unique_index_root`. So this reduces to `!has_unique_in_set`: a table
-    //      with a PK is HOT-eligible as long as the PK column isn't being changed
-    //      (the unchanged unique entry resolves via the HOT chain like any
-    //      secondary index — see the `has_unique_in_set` note above).
-    //   2. No FK columns in SET (FK key enforcement likewise inserts new
-    //      B-tree entries for the new value).
-    //   3. No FK children referencing this table (RESTRICT check reads the
-    //      old PK value, which must remain visible; HOT xmax-stamps it first,
-    //      but the check runs before any mutation, so this is fine — but if
-    //      the parent changes its PK value in SET, (4) below would fire).
-    //   4. No indexed column in SET (secondary/unique B-tree must be updated to
-    //      the new RowId; skipping it makes the row unfindable — see §0.6.2).
+    // Item 58 HOT eligibility — see exec_update's own doc comment (unchanged
+    // logic here, this is purely the extraction) for the full 4-condition
+    // rationale.
     let hot_eligible = !has_unique_in_set
         && !has_fk_refs_in_set
         && !has_fk_children
         && !set_touches_indexed_col(assignments, &table_def.columns);
+    Ok(UpdateGates {
+        has_unique,
+        has_fk_children,
+        hot_eligible,
+        has_unique_in_set,
+        has_fk_refs_in_set,
+        has_fk_children_ref_in_set,
+    })
+}
+
+/// Apply a single-row UPDATE to `row_id`, given its already-decoded current
+/// value `row` (the pre-mutation image): evaluate `assignments` (RHS may
+/// reference the row being updated — `SET k = k + 1` — or, for item 150's
+/// `ON CONFLICT` arm, an already-substituted `Literal` in place of
+/// `EXCLUDED.col`), coerce/validate, WITH CHECK, UNIQUE+FK phantom-lock-
+/// then-recheck (gated by `gates`), the HOT/non-HOT heap write, undo
+/// recording, B-tree index maintenance, CDC event capture. Returns the
+/// coerced new row (the post-image) — same shape `RETURNING` already wants.
+///
+/// Extracted by item 150 out of `exec_update`'s per-row loop tail
+/// (unchanged logic — a pure extraction, not a rewrite) specifically so
+/// `exec_insert`'s `ON CONFLICT ... DO UPDATE` arm can call the exact same
+/// function: the backlog spec's locked design rule is "the update arm is
+/// executed by the EXISTING update machinery ... this item adds routing,
+/// not a new write path" — this is that shared call site. Every one of
+/// items 35/36/47/53/58/71/117/119's UPDATE-path invariants therefore apply
+/// to an upsert's DO UPDATE arm for free, with no separate test surface
+/// needed to prove it.
+#[allow(clippy::too_many_arguments)]
+fn apply_single_row_update(
+    table_def: &TableDef,
+    heap: &Heap,
+    row_id: RowId,
+    row: Vec<Literal>,
+    assignments: &[(String, Expr)],
+    gates: &UpdateGates,
+    index_batches: &mut [IndexColBatch],
+    patch_batches: &mut [PatchColBatch],
+    ctx: &mut ExecCtx,
+) -> Result<Vec<Literal>> {
+    let &UpdateGates {
+        hot_eligible,
+        has_unique_in_set,
+        has_fk_refs_in_set,
+        has_fk_children_ref_in_set,
+        ..
+    } = gates;
+    let mut row = row;
+    // C1 (item 29): snapshot the pre-mutation image before set_column overwrites it.
+    let before_row = row.clone();
+    for (col, expr) in assignments {
+        let new_val = eval_expr(expr, &table_def.columns, &row)?;
+        set_column(&table_def.columns, &mut row, col, new_val)?;
+    }
+    let coerced = coerce_and_validate_row(table_def, row)?;
+    enforce_not_null(table_def, &coerced)?;
+    enforce_checks(table_def, &coerced)?;
+    // item-24 R-a: WITH CHECK — reject if new row violates the policy.
+    exec_update_with_check(table_def, &coerced, ctx)?;
+    // UNIQUE + FK — acquire all phantom locks BEFORE taking a fresh
+    // snapshot, then run uniqueness + FK checks with it (items 35/36/53).
+    // RESTRICT on old PK also uses a fresh snapshot (after its lock).
+    if has_unique_in_set || has_fk_refs_in_set || has_fk_children_ref_in_set {
+        // Step 1: acquire UniqueKey + FkKey (child-side) phantom locks.
+        // Item 117: only when a unique/PK column is actually in SET — an
+        // unchanged key needs no phantom lock (a concurrent inserter of the
+        // same key collides with this row's still-live version regardless).
+        if has_unique_in_set {
+            for (col_idx, col) in table_def.columns.iter().enumerate() {
+                if col.dropped || col.unique_index_root.is_none() {
+                    continue;
+                }
+                if let Ok(key) = OrderedValue::try_from(&coerced[col_idx]) {
+                    let lock_id = unique_key_record_id(&table_def.name, &col.name, &key);
+                    ctx.lock_mgr.acquire_blocking(lock_id, ctx.xid)?;
+                }
+            }
+        }
+        // Item 53: skip FkKey phantom lock + enforce when FK col not in SET.
+        if has_fk_refs_in_set {
+            acquire_fk_key_locks(
+                table_def,
+                &coerced,
+                ctx.xid,
+                ctx.lock_mgr,
+                ctx.catalog.get(),
+            )?;
+        }
+        // Step 1b: FkKey parent lock for RESTRICT (old PK value).
+        // Item 119: only when a child-referenced key is actually in SET —
+        // an unchanged referenced key cannot orphan a child, so no parent
+        // RESTRICT (and thus no parent phantom lock) is needed.
+        if has_fk_children_ref_in_set {
+            acquire_fk_key_locks_parent(table_def, &before_row, ctx.xid, ctx.lock_mgr)?;
+        }
+        // Step 2: fresh snapshot AFTER all phantom locks.
+        let usnap = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+        // UNIQUE: exclude the row's current version (old tuple still visible
+        // to this snapshot until heap.update supersedes it).
+        // Item 117: gated on has_unique_in_set — an unchanged key can only
+        // ever match this row's own excluded old version, so the check is a
+        // no-op that we skip.
+        if has_unique_in_set {
+            enforce_unique(
+                table_def,
+                &coerced,
+                heap,
+                &usnap,
+                ctx.xid,
+                ctx.pool,
+                Some(row_id),
+            )?;
+        }
+        // FK child-side: new values must reference a visible parent row.
+        // Item 53: skipped when FK column not in SET (value unchanged).
+        if has_fk_refs_in_set {
+            enforce_fk_rows_exist(
+                table_def,
+                &coerced,
+                &usnap,
+                ctx.xid,
+                ctx.pool,
+                ctx.catalog.get(),
+            )?;
+        }
+        // FK parent-side RESTRICT: a child-referenced key that is CHANGING
+        // must not orphan an existing child. Item 119: gated on
+        // has_fk_children_ref_in_set — if the referenced key is unchanged the
+        // children stay valid, so skipping the check lets benign parent edits
+        // (e.g. shipping_address) through. DELETE still enforces it always
+        // (that path does not consult this gate).
+        if has_fk_children_ref_in_set {
+            enforce_fk_restrict(
+                table_def,
+                &before_row,
+                &usnap,
+                ctx.xid,
+                ctx.pool,
+                ctx.catalog.get(),
+            )?;
+        }
+    }
+    let encoded = encode_row(&coerced);
+
+    // Items 58/71: try HOT update (same-page first, cross-page fallback)
+    // when eligible — no B-tree cost in either HOT case.
+    // Falls back to the standard cross-page update + B-tree maintenance
+    // only when try_hot_insert returns Ok(None) (write conflict, which
+    // is unreachable here because the write lock was already acquired, or
+    // an internal error).
+    let (new_row_id, used_hot, hot_saved_prev) = if hot_eligible {
+        match heap.try_hot_insert(row_id, &encoded, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr) {
+            Err(e @ DbError::WriteConflict { .. }) => return Err(classify_conflict(e, ctx)),
+            Err(e) => return Err(e),
+            Ok(Some(result)) => (result.new_rid, true, result.saved_prev),
+            Ok(None) => {
+                // Conflict detected by try_hot_insert — fall back to full update.
+                let nrid =
+                    match heap.update(row_id, &encoded, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr) {
+                        Err(e @ DbError::WriteConflict { .. }) => {
+                            return Err(classify_conflict(e, ctx))
+                        }
+                        other => other?,
+                    };
+                (nrid, false, None)
+            }
+        }
+    } else {
+        let nrid = match heap.update(row_id, &encoded, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr) {
+            Err(e @ DbError::WriteConflict { .. }) => return Err(classify_conflict(e, ctx)),
+            other => other?,
+        };
+        (nrid, false, None)
+    };
+
+    // P1.d: writing supersedes the version at `row_id` — an SSI write of the
+    // exact version a concurrent reader would have read.
+    ctx.txn_mgr.ssi_note_write(ctx.xid, row_id);
+    if used_hot {
+        // HOT update — undo both mutations atomically with one action.
+        // Same-page (item 58): ordering (new-slot-first, then old-slot) is
+        //   enforced inside `undo_hot_update`.
+        // Cross-page (item 71): two separate pages; new page first, then old.
+        match hot_saved_prev {
+            None => {
+                // Same-page HOT: new and old versions share the same page.
+                ctx.txn_mgr.record_undo(
+                    ctx.xid,
+                    UndoAction::HotUpdate {
+                        page_id: row_id.page_id,
+                        old_slot: row_id.slot,
+                        new_slot: new_row_id.slot,
+                    },
+                )?;
+            }
+            Some((saved_prev_page, saved_prev_slot)) => {
+                // Cross-page HOT: new version is on a different page.
+                ctx.txn_mgr.record_undo(
+                    ctx.xid,
+                    UndoAction::HotXpageUpdate {
+                        old_page_id: row_id.page_id,
+                        old_slot: row_id.slot,
+                        new_page_id: new_row_id.page_id,
+                        new_slot: new_row_id.slot,
+                        saved_prev_page,
+                        saved_prev_slot,
+                    },
+                )?;
+            }
+        }
+    } else {
+        ctx.txn_mgr.record_undo(
+            ctx.xid,
+            UndoAction::XmaxStamp {
+                page_id: row_id.page_id,
+                slot: row_id.slot,
+            },
+        )?;
+        ctx.txn_mgr.record_undo(
+            ctx.xid,
+            UndoAction::Insert {
+                page_id: new_row_id.page_id,
+                slot: new_row_id.slot,
+            },
+        )?;
+    }
+    // Item 47: unchanged-key columns use in-place RowId patch (no splits, 1
+    // WAL page-image); changed-key columns fall through to the batch insert.
+    // HOT path: B-tree NOT updated (no index cost, no patch needed) because
+    // no indexed column was in SET (guard: `hot_eligible`).
+    if !used_hot {
+        stage_row_index_writes_update(
+            table_def,
+            row_id,
+            new_row_id,
+            &before_row,
+            &coerced,
+            index_batches,
+            patch_batches,
+            ctx,
+        )?;
+    }
+    // C1 (item 29): UPDATE carries both before (pre-mutation) and after (post-mutation).
+    send_event_capture(table_def, "update", Some(&before_row), Some(&coerced), ctx)?;
+    Ok(coerced)
+}
+
+fn exec_update(
+    table: &str,
+    assignments: &[(String, Expr)],
+    predicate: &Option<Expr>,
+    returning: Option<&[String]>,
+    ctx: &mut ExecCtx,
+) -> Result<ExecResult> {
+    let table_def = ctx.catalog.lookup(table)?.clone();
+    enforce_referenced_tables_exist(&table_def, ctx.catalog.get())?;
+    let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
+    let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
+
+    // ── Item 76: early HOT eligibility gate + parallel matching ──────────────
+    // Compute hot_eligible *before* the scan: all four conditions are purely
+    // metadata-derived (table_def + assignments, no I/O).  Moving this up lets
+    // us choose the parallel collection path for HOT-eligible tables instead
+    // of always paying the serial heap.scan() cost.
+    //
+    // Item 150: this whole gating block is `compute_update_gates` (extracted
+    // verbatim, no logic change) so the `ON CONFLICT ... DO UPDATE` arm in
+    // `exec_insert` computes byte-identical gates for the same SET clause.
+    let UpdateGates {
+        has_unique,
+        has_fk_children,
+        hot_eligible,
+        has_unique_in_set,
+        has_fk_refs_in_set,
+        has_fk_children_ref_in_set,
+    } = compute_update_gates(&table_def, assignments, ctx.catalog.get())?;
 
     // Predicate closure for the parallel scan path (same pattern as exec_delete).
     // Evaluates just predicate-referenced columns; the full row body comes back
@@ -3652,215 +4232,34 @@ fn exec_update(
         return Ok(ExecResult::Updated { count });
     }
 
-    // ── Non-HOT / constrained path: per-row loop (unchanged) ────────────────
+    // ── Non-HOT / constrained path: per-row loop ────────────────────────────
+    // Item 150: the per-row body is `apply_single_row_update` (extracted,
+    // unchanged logic) — the same function `exec_insert`'s `ON CONFLICT ...
+    // DO UPDATE` arm calls.
+    let gates = UpdateGates {
+        has_unique,
+        has_fk_children,
+        hot_eligible,
+        has_unique_in_set,
+        has_fk_refs_in_set,
+        has_fk_children_ref_in_set,
+    };
     // G5 (item 19): collect updated rows for RETURNING when requested.
     let mut returned_rows: Vec<Vec<Literal>> = Vec::new();
     let mut count = 0;
     for (row_id, bytes) in matching {
-        let mut row = decode_row(&bytes, &table_def.columns)?;
-        // C1 (item 29): snapshot the pre-mutation image before set_column overwrites it.
-        let before_row = row.clone();
-        for (col, expr) in assignments {
-            let new_val = eval_expr(expr, &table_def.columns, &row)?;
-            set_column(&table_def.columns, &mut row, col, new_val)?;
-        }
-        let coerced = coerce_and_validate_row(&table_def, row)?;
-        enforce_not_null(&table_def, &coerced)?;
-        enforce_checks(&table_def, &coerced)?;
-        // item-24 R-a: WITH CHECK — reject if new row violates the policy.
-        exec_update_with_check(&table_def, &coerced, ctx)?;
-        // UNIQUE + FK — acquire all phantom locks BEFORE taking a fresh
-        // snapshot, then run uniqueness + FK checks with it (items 35/36/53).
-        // RESTRICT on old PK also uses a fresh snapshot (after its lock).
-        if has_unique_in_set || has_fk_refs_in_set || has_fk_children_ref_in_set {
-            // Step 1: acquire UniqueKey + FkKey (child-side) phantom locks.
-            // Item 117: only when a unique/PK column is actually in SET — an
-            // unchanged key needs no phantom lock (a concurrent inserter of the
-            // same key collides with this row's still-live version regardless).
-            if has_unique_in_set {
-                for (col_idx, col) in table_def.columns.iter().enumerate() {
-                    if col.dropped || col.unique_index_root.is_none() {
-                        continue;
-                    }
-                    if let Ok(key) = OrderedValue::try_from(&coerced[col_idx]) {
-                        let lock_id = unique_key_record_id(&table_def.name, &col.name, &key);
-                        ctx.lock_mgr.acquire_blocking(lock_id, ctx.xid)?;
-                    }
-                }
-            }
-            // Item 53: skip FkKey phantom lock + enforce when FK col not in SET.
-            if has_fk_refs_in_set {
-                acquire_fk_key_locks(
-                    &table_def,
-                    &coerced,
-                    ctx.xid,
-                    ctx.lock_mgr,
-                    ctx.catalog.get(),
-                )?;
-            }
-            // Step 1b: FkKey parent lock for RESTRICT (old PK value).
-            // Item 119: only when a child-referenced key is actually in SET —
-            // an unchanged referenced key cannot orphan a child, so no parent
-            // RESTRICT (and thus no parent phantom lock) is needed.
-            if has_fk_children_ref_in_set {
-                acquire_fk_key_locks_parent(&table_def, &before_row, ctx.xid, ctx.lock_mgr)?;
-            }
-            // Step 2: fresh snapshot AFTER all phantom locks.
-            let usnap = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
-            // UNIQUE: exclude the row's current version (old tuple still visible
-            // to this snapshot until heap.update supersedes it).
-            // Item 117: gated on has_unique_in_set — an unchanged key can only
-            // ever match this row's own excluded old version, so the check is a
-            // no-op that we skip.
-            if has_unique_in_set {
-                enforce_unique(
-                    &table_def,
-                    &coerced,
-                    &heap,
-                    &usnap,
-                    ctx.xid,
-                    ctx.pool,
-                    Some(row_id),
-                )?;
-            }
-            // FK child-side: new values must reference a visible parent row.
-            // Item 53: skipped when FK column not in SET (value unchanged).
-            if has_fk_refs_in_set {
-                enforce_fk_rows_exist(
-                    &table_def,
-                    &coerced,
-                    &usnap,
-                    ctx.xid,
-                    ctx.pool,
-                    ctx.catalog.get(),
-                )?;
-            }
-            // FK parent-side RESTRICT: a child-referenced key that is CHANGING
-            // must not orphan an existing child. Item 119: gated on
-            // has_fk_children_ref_in_set — if the referenced key is unchanged the
-            // children stay valid, so skipping the check lets benign parent edits
-            // (e.g. shipping_address) through. DELETE still enforces it always
-            // (that path does not consult this gate).
-            if has_fk_children_ref_in_set {
-                enforce_fk_restrict(
-                    &table_def,
-                    &before_row,
-                    &usnap,
-                    ctx.xid,
-                    ctx.pool,
-                    ctx.catalog.get(),
-                )?;
-            }
-        }
-        let encoded = encode_row(&coerced);
-
-        // Items 58/71: try HOT update (same-page first, cross-page fallback)
-        // when eligible — no B-tree cost in either HOT case.
-        // Falls back to the standard cross-page update + B-tree maintenance
-        // only when try_hot_insert returns Ok(None) (write conflict, which
-        // is unreachable here because the write lock was already acquired, or
-        // an internal error).
-        let (new_row_id, used_hot, hot_saved_prev) = if hot_eligible {
-            match heap.try_hot_insert(row_id, &encoded, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr) {
-                Err(e @ DbError::WriteConflict { .. }) => return Err(classify_conflict(e, ctx)),
-                Err(e) => return Err(e),
-                Ok(Some(result)) => (result.new_rid, true, result.saved_prev),
-                Ok(None) => {
-                    // Conflict detected by try_hot_insert — fall back to full update.
-                    let nrid = match heap.update(
-                        row_id,
-                        &encoded,
-                        ctx.xid,
-                        ctx.pool,
-                        ctx.wal,
-                        ctx.lock_mgr,
-                    ) {
-                        Err(e @ DbError::WriteConflict { .. }) => {
-                            return Err(classify_conflict(e, ctx))
-                        }
-                        other => other?,
-                    };
-                    (nrid, false, None)
-                }
-            }
-        } else {
-            let nrid = match heap.update(row_id, &encoded, ctx.xid, ctx.pool, ctx.wal, ctx.lock_mgr)
-            {
-                Err(e @ DbError::WriteConflict { .. }) => return Err(classify_conflict(e, ctx)),
-                other => other?,
-            };
-            (nrid, false, None)
-        };
-
-        // P1.d: writing supersedes the version at `row_id` — an SSI write of the
-        // exact version a concurrent reader would have read.
-        ctx.txn_mgr.ssi_note_write(ctx.xid, row_id);
-        if used_hot {
-            // HOT update — undo both mutations atomically with one action.
-            // Same-page (item 58): ordering (new-slot-first, then old-slot) is
-            //   enforced inside `undo_hot_update`.
-            // Cross-page (item 71): two separate pages; new page first, then old.
-            match hot_saved_prev {
-                None => {
-                    // Same-page HOT: new and old versions share the same page.
-                    ctx.txn_mgr.record_undo(
-                        ctx.xid,
-                        UndoAction::HotUpdate {
-                            page_id: row_id.page_id,
-                            old_slot: row_id.slot,
-                            new_slot: new_row_id.slot,
-                        },
-                    )?;
-                }
-                Some((saved_prev_page, saved_prev_slot)) => {
-                    // Cross-page HOT: new version is on a different page.
-                    ctx.txn_mgr.record_undo(
-                        ctx.xid,
-                        UndoAction::HotXpageUpdate {
-                            old_page_id: row_id.page_id,
-                            old_slot: row_id.slot,
-                            new_page_id: new_row_id.page_id,
-                            new_slot: new_row_id.slot,
-                            saved_prev_page,
-                            saved_prev_slot,
-                        },
-                    )?;
-                }
-            }
-        } else {
-            ctx.txn_mgr.record_undo(
-                ctx.xid,
-                UndoAction::XmaxStamp {
-                    page_id: row_id.page_id,
-                    slot: row_id.slot,
-                },
-            )?;
-            ctx.txn_mgr.record_undo(
-                ctx.xid,
-                UndoAction::Insert {
-                    page_id: new_row_id.page_id,
-                    slot: new_row_id.slot,
-                },
-            )?;
-        }
-        // Item 47: unchanged-key columns use in-place RowId patch (no splits, 1
-        // WAL page-image); changed-key columns fall through to the batch insert.
-        // HOT path: B-tree NOT updated (no index cost, no patch needed) because
-        // no indexed column was in SET (guard: `hot_eligible`).
-        if !used_hot {
-            stage_row_index_writes_update(
-                &table_def,
-                row_id,
-                new_row_id,
-                &before_row,
-                &coerced,
-                &mut index_batches,
-                &mut patch_batches,
-                ctx,
-            )?;
-        }
-        // C1 (item 29): UPDATE carries both before (pre-mutation) and after (post-mutation).
-        send_event_capture(&table_def, "update", Some(&before_row), Some(&coerced), ctx)?;
+        let row = decode_row(&bytes, &table_def.columns)?;
+        let coerced = apply_single_row_update(
+            &table_def,
+            &heap,
+            row_id,
+            row,
+            assignments,
+            &gates,
+            &mut index_batches,
+            &mut patch_batches,
+            ctx,
+        )?;
         if returning.is_some() {
             returned_rows.push(coerced);
         }
@@ -5462,6 +5861,14 @@ pub(crate) fn eval_expr(expr: &Expr, columns: &[ColumnDef], row: &[Literal]) -> 
         // execution reaches here. Same fail-closed fallback as `CurrentUser`
         // above — never `Bool(true)`.
         Expr::AuthUid | Expr::AuthClaim(_) => Ok(Literal::Null),
+        // `EXCLUDED.<col>` (item 150) must always be substituted with a
+        // `Literal` by `exec_insert`'s `ON CONFLICT ... DO UPDATE` arm
+        // (`substitute_excluded_in_expr`) before the assignments/WHERE ever
+        // reach `eval_expr` — arriving here means a substitution bug, not a
+        // user error, so this fails loudly instead of fabricating NULL/true.
+        Expr::Excluded(name) => Err(DbError::SqlPlan(format!(
+            "internal error: EXCLUDED.{name} was not substituted before evaluation"
+        ))),
     }
 }
 
@@ -5903,8 +6310,11 @@ fn expr_columns(expr: &Expr, table_def: &TableDef, out: &mut Vec<usize>) {
         // G10 (item 19): IS [NOT] NULL.
         Expr::IsNull { expr, .. } => expr_columns(expr, table_def, out),
         // item-24 Z6 / item 122: CurrentUser/AuthUid/AuthClaim have no column
-        // (they're runtime constants resolved before execution).
-        Expr::CurrentUser | Expr::AuthUid | Expr::AuthClaim(_) => {}
+        // (they're runtime constants resolved before execution). item 150:
+        // `Excluded` is always substituted away by `exec_insert`'s ON
+        // CONFLICT arm before any predicate reaches this decode-pushdown
+        // pass, so it likewise contributes no column.
+        Expr::CurrentUser | Expr::AuthUid | Expr::AuthClaim(_) | Expr::Excluded(_) => {}
     }
 }
 
@@ -5951,7 +6361,8 @@ fn bind_predicate_columns(expr: &mut Expr, columns: &[ColumnDef]) {
         // item-24 Z6 / item 122: CurrentUser/AuthUid/AuthClaim have no column
         // slot — they are runtime constants resolved before execution by
         // `substitute_current_user_in_plan`/`substitute_auth_context_in_plan`.
-        Expr::CurrentUser | Expr::AuthUid | Expr::AuthClaim(_) => {}
+        // item 150: `Excluded` is substituted away before this pass ever runs.
+        Expr::CurrentUser | Expr::AuthUid | Expr::AuthClaim(_) | Expr::Excluded(_) => {}
     }
 }
 

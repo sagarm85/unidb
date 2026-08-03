@@ -258,6 +258,12 @@ pub(crate) fn map_status(err: &DbError) -> (StatusCode, &'static str) {
         // client-supplied error, not a server fault.
         DbError::InvalidFunctionDef(_) => (StatusCode::BAD_REQUEST, "INVALID_FUNCTION_DEF"),
 
+        // Item 150: an `ON CONFLICT (col)` naming a non-PK/non-UNIQUE column
+        // is a client-supplied error, same class as SqlPlan/SqlUnsupported.
+        DbError::InvalidConflictTarget { .. } => {
+            (StatusCode::BAD_REQUEST, "INVALID_CONFLICT_TARGET")
+        }
+
         // Durability failure (P1.b, fsyncgate) is fatal for the session — the
         // engine can no longer guarantee writes reach disk and must be
         // restarted. 503 signals the service is (temporarily) unable to handle

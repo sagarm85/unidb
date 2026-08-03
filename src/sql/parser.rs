@@ -6,9 +6,10 @@
 // is the actual point of this milestone, not parser plumbing.
 
 use sqlparser::ast::{
-    self, AlterTableOperation, Array as SqlArray, BinaryOperator, CreateTableOptions, DataType,
-    ExactNumberInfo, Expr as SqlExpr, FromTable, IndexType, JoinConstraint, JoinOperator,
-    ObjectType, SelectItem, SetExpr, SetOperator, SetQuantifier, SqlOption, Statement, TableFactor,
+    self, AlterTableOperation, Array as SqlArray, BinaryOperator, ConflictTarget,
+    CreateTableOptions, DataType, ExactNumberInfo, Expr as SqlExpr, FromTable, IndexType,
+    JoinConstraint, JoinOperator, ObjectType, OnConflictAction as SqlOnConflictAction, OnInsert,
+    SelectItem, SetExpr, SetOperator, SetQuantifier, SqlOption, Statement, TableFactor,
     TableObject, TableWithJoins, UnaryOperator, Value,
 };
 use sqlparser::dialect::GenericDialect;
@@ -22,7 +23,9 @@ use crate::{
     error::{DbError, Result},
 };
 
-use super::logical::{ArithOp, CmpOp, Expr, Literal, LogicalPlan, SetOpKind};
+use super::logical::{
+    ArithOp, CmpOp, Expr, Literal, LogicalPlan, OnConflict, OnConflictAction, SetOpKind,
+};
 use super::query::{
     AggFunc, CastTarget, FromNode, JoinType, OrderKey, Projection, QExpr, QuerySpec, TableRef,
     WindowFunc, WindowSpec,
@@ -717,12 +720,100 @@ fn convert_insert(ins: ast::Insert) -> Result<LogicalPlan> {
     };
     // G5 (item 19): RETURNING clause.
     let returning = convert_returning(ins.returning)?;
+    // item 150: `ON CONFLICT [(col)] DO NOTHING | DO UPDATE SET ... [WHERE ...]`.
+    let on_conflict = convert_on_conflict(ins.on)?;
     Ok(LogicalPlan::Insert {
         table,
         columns,
         values: rows,
         returning,
+        on_conflict,
     })
+}
+
+/// `ON CONFLICT` (item 150). Verified empirically against sqlparser 0.62
+/// (`OnInsert::OnConflict`/`ConflictTarget`/`OnConflictAction`/`DoUpdate` are
+/// all dialect-unconditional — no `GenericDialect` gating needed, same
+/// verify-the-AST-first discipline item 148 used for `CreateType`/
+/// `CreateDomain`), so this uses the AST route directly rather than a
+/// pre-parse fallback.
+fn convert_on_conflict(on: Option<OnInsert>) -> Result<Option<OnConflict>> {
+    let on = match on {
+        None => return Ok(None),
+        Some(o) => o,
+    };
+    let oc = match on {
+        OnInsert::OnConflict(oc) => oc,
+        // MySQL's `ON DUPLICATE KEY UPDATE` is a non-goal (locked v1 grammar
+        // is the Postgres/SQLite `ON CONFLICT` form only).
+        OnInsert::DuplicateKeyUpdate(_) => {
+            return Err(DbError::SqlUnsupported(
+                "ON DUPLICATE KEY UPDATE is not supported; use ON CONFLICT (col) DO ...".into(),
+            ))
+        }
+        // `OnInsert` is `#[non_exhaustive]` upstream; no third variant exists
+        // in sqlparser 0.62, but the wildcard keeps a future crate bump from
+        // silently mis-parsing an unrecognized `ON ...` form.
+        other => {
+            return Err(DbError::SqlUnsupported(format!(
+                "unsupported INSERT ON ... clause: {other:?}"
+            )))
+        }
+    };
+    // Locked v1 grammar: at most one conflict-target column. Composite
+    // targets and `ON CONSTRAINT <name>` are documented non-goals.
+    let target = match oc.conflict_target {
+        None => None,
+        Some(ConflictTarget::Columns(cols)) if cols.len() == 1 => Some(cols[0].value.clone()),
+        Some(ConflictTarget::Columns(_)) => {
+            return Err(DbError::SqlUnsupported(
+                "ON CONFLICT supports exactly one conflict-target column in v1 \
+                 (composite conflict targets are not supported)"
+                    .into(),
+            ))
+        }
+        Some(ConflictTarget::OnConstraint(_)) => {
+            return Err(DbError::SqlUnsupported(
+                "ON CONFLICT ON CONSTRAINT is not supported in v1; name the column directly: \
+                 ON CONFLICT (col)"
+                    .into(),
+            ))
+        }
+    };
+    let action = match oc.action {
+        SqlOnConflictAction::DoNothing => OnConflictAction::DoNothing,
+        SqlOnConflictAction::DoUpdate(du) => {
+            // Locked v1 grammar: DO UPDATE requires an explicit target.
+            if target.is_none() {
+                return Err(DbError::SqlUnsupported(
+                    "ON CONFLICT DO UPDATE requires an explicit conflict target column: \
+                     ON CONFLICT (col) DO UPDATE SET ..."
+                        .into(),
+                ));
+            }
+            let assignments = du
+                .assignments
+                .into_iter()
+                .map(|a| {
+                    let name = match a.target {
+                        ast::AssignmentTarget::ColumnName(name) => name.to_string(),
+                        ast::AssignmentTarget::Tuple(_) => {
+                            return Err(DbError::SqlUnsupported(
+                                "tuple assignment targets are not supported".into(),
+                            ))
+                        }
+                    };
+                    Ok((name, convert_expr(&a.value)?))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let predicate = du.selection.as_ref().map(convert_expr).transpose()?;
+            OnConflictAction::DoUpdate {
+                assignments,
+                predicate,
+            }
+        }
+    };
+    Ok(Some(OnConflict { target, action }))
 }
 
 /// INSERT VALUES entries must be literals (no sub-expressions) in M1.
@@ -2166,6 +2257,22 @@ fn column_name_from_parts(parts: &[ast::Ident]) -> String {
 fn convert_expr(e: &SqlExpr) -> Result<Expr> {
     match e {
         SqlExpr::Identifier(ident) => Ok(Expr::Column(ident.value.clone())),
+        // item 150: `EXCLUDED.<col>` inside an `ON CONFLICT ... DO UPDATE`'s
+        // SET/WHERE refers to the proposed (would-have-been-inserted) row,
+        // not a read of the existing table row. Scoped to exactly this
+        // two-part-identifier shape (case-insensitive on the qualifier, per
+        // SQL identifier folding) so it composes for free through every
+        // other `convert_expr` case that recurses into sub-expressions
+        // (`BinaryOp`, `Like`, `IsNull`, JSON `->`/`->>`, ...) with no
+        // separate AST-rewrite pass needed. `EXCLUDED` is not a real table,
+        // so this never collides with a legitimate INSERT/UPDATE/SELECT
+        // column read in practice — the same scoping Postgres itself gives
+        // the pseudo-relation.
+        SqlExpr::CompoundIdentifier(parts)
+            if parts.len() == 2 && parts[0].value.eq_ignore_ascii_case("excluded") =>
+        {
+            Ok(Expr::Excluded(parts[1].value.clone()))
+        }
         SqlExpr::CompoundIdentifier(parts) => Ok(Expr::Column(column_name_from_parts(parts))),
         SqlExpr::Value(vws) => convert_value(&vws.value).map(Expr::Literal),
         SqlExpr::BinaryOp { left, op, right } => convert_binary_op(left, op, right),
