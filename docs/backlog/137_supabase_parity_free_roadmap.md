@@ -19,6 +19,9 @@ anonymous sign-in, backups/PITR UX, other-language SDKs, studio panels.
 >
 > **The number is a stable ID; each feature below gets its own numbered `NN_`
 > spec when work starts.** Metrics live in `PROGRESS.md`; status flips here.
+> The at-a-glance status matrix vs Supabase's public feature list is
+> [`SUPABASE_PARITY.md`](../../SUPABASE_PARITY.md) (repo root) — update it in
+> the same PR as any status flip here (CLAUDE.md §9).
 
 ## Explicitly EXCLUDED — requires a paid / third-party service (do NOT build)
 - **SMS / phone OTP · phone MFA · voice-call validation** — needs an SMS/voice

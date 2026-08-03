@@ -26,6 +26,10 @@ unidb replaces that entire stack with a single embedded engine:
 | Distributed saga for crash recovery | 0 orphans — WAL is the event stream |
 | 4 operational surfaces to run | 1 file |
 
+**Coming from Supabase?** [`SUPABASE_PARITY.md`](SUPABASE_PARITY.md) tracks
+feature-by-feature parity with Supabase's public feature list — what's done,
+partial, achieved differently, and not done (with the reason).
+
 ---
 
 ## Four models, one commit
