@@ -478,6 +478,14 @@ during the session (report-honesty, no doc change yet): MEMORY's 07-28 entry
 calls the moat "intact" citing W4/W0 13.56×, but W4/W0 is the internal tax
 ladder — the actual moat column (replaced stack, Table 4.1) was skipped in
 that report; the queued report-honesty item covers it. No code change.
+**Same-day follow-up (after the sweep merged as PR #251; branch restarted
+from `main` per the merged-PR rule):** added root **`SUPABASE_PARITY.md`** —
+a living four-table feature-parity matrix vs supabase.com/features (done /
+partial / done-differently / not-done, per-row scope + item numbers, summary
+counts, "Last verified" stamp) — linked from `README.md`,
+`docs/documentation_index.md`, and `137`'s header, and registered in
+`CLAUDE.md` §9's pre-push checklist so every future parity ship updates it
+in the same PR.
 
 ### 2026-08-01 — item 146: JWT signing-key rotation grace window implemented
 

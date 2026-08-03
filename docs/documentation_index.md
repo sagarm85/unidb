@@ -102,3 +102,9 @@
 - [positioning.md](positioning.md) — the honest competitive positioning: what
   unidb is (one engine, four models, one commit), what it deliberately is not,
   and where it stands against the replaced multi-system stack.
+- [../SUPABASE_PARITY.md](../SUPABASE_PARITY.md) *(repo root)* — the **living
+  Supabase feature-parity tracker**: four status tables (done / partial /
+  done-differently / not-done) with per-row scope detail, plus the
+  beyond-Supabase list. Updated in the same PR whenever a parity item ships
+  (registered in `CLAUDE.md` §9's pre-push checklist); the per-item plan
+  behind it is [`backlog/137_supabase_parity_free_roadmap.md`](backlog/137_supabase_parity_free_roadmap.md).

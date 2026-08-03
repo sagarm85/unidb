@@ -214,6 +214,7 @@ cargo fmt --all             # format gate
   - `docs/design/engine_design.md` (if it exists): the section covering the affected area, the module map, the tech-debt registry, and the document-version footer.
   - `docs/REST_API.md`: any new/changed/removed route or error code.
   - `docs/backlog/*.md`: flip a plan's status line to done/shipped (pointing at its `PROGRESS.md` entry) once the work it describes lands, rather than leaving it claiming "not started."
+  - `SUPABASE_PARITY.md` (repo root): the living Supabase feature-parity matrix — when a parity-relevant item ships (or a HELD decision is made/changed), move or edit the affected rows, refresh the summary counts, and re-stamp its "Last verified" line in the same PR.
   - If a design decision documented in one of these files is found to be wrong (a bug, not a tradeoff), correct it explicitly with an inline correction note, not a silent rewrite — the same evidence-based ethos §0.5 and §6 already apply to `PROGRESS.md` extends to every doc.
 
 ### Definition of done (per milestone)
