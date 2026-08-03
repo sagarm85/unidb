@@ -6,8 +6,8 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `147_…`**
-> (146 assigned 2026-08-01 to the scheduled-jobs (cron) item below).
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `148_…`**
+> (147 assigned 2026-08-02 to stored functions + RPC below).
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
 
@@ -168,8 +168,9 @@ Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 
 | 145 | `145_dev_inbox_route.md` | Improvement | ✅ SHIPPED (2026-08-01, PR #248) — studio-flagged item-138 gap: `GET/DELETE /auth/dev-inbox` to read/clear the `LogTransport` dev-inbox JSONL (reset/magic-link email preview, Inbucket-style). Superuser-only + dev-transport-ONLY (404 when real SMTP configured — never expose real mail). Control-plane, crash 54/54. |
 | 146 | `146_jwt_key_rotation.md` | Improvement | ✅ SHIPPED (2026-08-01, PR #249) — Wave-3: JWT signing-key rotation grace window. `kid` in issued token header; `UNIDB_JWT_SIGNING_KEY_PREVIOUS` (HS256) accepted for verify-only so rotating the primary doesn't mass-invalidate live tokens; asymmetric multi-key JWKS via `_PUBLIC_KEY_PREVIOUS`. Issuance stays current-key HS256. Auth-layer only, crash 54/54. |
+| 147 | `147_stored_functions_rpc.md` | Improvement | 🔄 IN PROGRESS (user go-ahead 2026-08-02 lifts the compute-cluster HELD) — stored SQL functions v1 as a control-plane object (`FunctionDef` in `AuthState`, cron/webhook pattern, superuser `/functions` admin API) + `POST /rest/v1/rpc/{fn}`: named/positional JSON args → `$n` binds, all body statements in ONE transaction (atomic, abort-on-error), **invoker semantics by default** (`run_as: None` = the calling principal, NOT admin — deliberate divergence from cron's default, documented in the spec) with explicit `run_as` definer-analog. No engine change; triggers/upsert/auth-hooks are follow-up items. |
 
-**Next new file → `147_…`.
+**Next new file → `148_…`.
 
 ## Next up — priority order (2026-07-23, post fresh-baseline bench)
 

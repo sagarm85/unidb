@@ -82,12 +82,15 @@ queue** · unidb-js SDK v0.1. *(The last three are beyond Supabase.)*
 
 ## Wave 2 — the compute layer (one foundation unlocks four)
 
-- **Stored functions / procedures** (HELD — awaiting explicit user/design
-  go-ahead; this is the one cluster that touches the ACID write path, unlike
-  everything shipped so far) (SQL-body v1; a plpgsql-analog later) → then:
-  - **RPC** (`POST /rest/v1/rpc/<fn>`)
-  - **Triggers** (BEFORE/AFTER row)
+- **Stored functions / procedures** (IN PROGRESS — user go-ahead 2026-08-02
+  lifted the HELD; item 147, `147_stored_functions_rpc.md`, covers the
+  SQL-body v1 control-plane functions **and** the RPC route in one item —
+  no engine change; a plpgsql-analog later) → then:
+  - **RPC** (`POST /rest/v1/rpc/<fn>`) — IN PROGRESS, folded into item 147
+  - **Triggers** (BEFORE/AFTER row) — next phase, own item (engine write path)
+  - **Upsert** (`INSERT … ON CONFLICT`) — next phase, own item (engine)
   - **Auth hooks** (custom access-token / before-user-created / MFA hooks)
+    — after 147 (consumes its functions)
 - **Database webhooks** — outbound HTTP POST to the operator's endpoint on row
   change, built on the existing event stream (retries, signing secret from vault).
   **DONE** (item 141, PR #244 merged 2026-08-01): superuser `/webhooks` admin API (create/list/delete),
