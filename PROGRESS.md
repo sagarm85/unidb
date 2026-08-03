@@ -184,6 +184,7 @@ memory (see `CLAUDE.md` §6).
 | Supabase-parity BaaS layer — items 120–133 + 135–146 (PRs #222–#249)   [SHIPPED]   2026-08-01 | 2026-08-01 | live |
 | Item 147 — Stored SQL functions v1 + RPC   [SHIPPED — merged PR #253]   2026-08-03 | 2026-08-03 | live |
 | Item 148 — Enums + domains (named types v1)   [SHIPPED]   2026-08-03 | 2026-08-03 | live |
+| Item 150 — Upsert ON CONFLICT + REST resolution (+ HOT-chain MVCC fix)   [SHIPPED]   2026-08-03 | 2026-08-03 | live |
 
 ## Item 24 R-a + R-b — UPDATE WITH CHECK enforcement + bootstrap observability (2026-07-20)
 
@@ -1992,4 +1993,53 @@ clippy `--all-features --all-targets -D warnings` · fmt · plain `cargo test
 VALUE`; no composite/custom record types (row-encoding decision, own spec);
 `DROP TYPE`/`DROP DOMAIN` interchangeable (shared namespace);
 `information_schema`/REST/GraphQL type surfacing = follow-ups.
+**Locked-decision changes:** none.
+
+## Item 150 — Upsert `INSERT … ON CONFLICT` + PostgREST resolution wiring   [SHIPPED — on `feat/150-upsert-on-conflict`, PR raised on push]   2026-08-03
+
+**Branch:** `feat/150-upsert-on-conflict` | **Type:** Improvement
+**Summary:** `ON CONFLICT [(col)] DO NOTHING | DO UPDATE SET … [WHERE …]`
+with `EXCLUDED.*` on a single PK/UNIQUE conflict target
+(`docs/backlog/150_upsert_on_conflict.md`). The first deliberate ACID-
+write-path extension since M1, built as **routing, not a new write path**:
+the conflict probe reuses `enforce_unique`'s phantom-lock-then-snapshot
+pattern, and the `DO UPDATE` arm calls `apply_single_row_update` —
+extracted verbatim from `exec_update`'s per-row loop — so upsert shares
+HOT/non-HOT writes, undo, index maintenance, and FK/UNIQUE re-checks with
+plain UPDATE. RLS fail-closed on both arms (update-arm `USING` mismatch =
+error, not skip; post-image `WITH CHECK`); column grants = INSERT on
+inserted cols + UPDATE on SET targets + SELECT on RHS/WHERE; NULL never
+conflicts. REST: `on_conflict=<col>` + `Prefer: resolution=
+merge-duplicates|ignore-duplicates` on `POST /rest/v1` — removes item
+139's documented exclusion. sqlparser 0.62 native `OnConflict` AST.
+Implemented by a Sonnet subagent; orchestrator re-ran every gate.
+
+**Latent MVCC bug found & fixed (the item's biggest yield):** the spec's
+required concurrency test exposed a pre-existing, severe read-path bug —
+`heap::get_visible_cached`/`get_visible_with_rid` followed at most **one**
+HOT-chain hop (a documented-but-false "chains are length 1" assumption).
+After ≥2 sequential HOT updates on a PK/UNIQUE-indexed row, the unique
+index's candidate under-resolved to "no visible version", letting a
+duplicate-key INSERT slip past `enforce_unique` — **two live rows with the
+same key, empirically reproduced.** Fix: walk the chain (bounded
+`MAX_HOT_CHAIN_HOPS` defensive cap); pure read-path change, no
+format/WAL/bufferpool touch, D5 untouched; dedicated regression test
+independent of upsert. **Plausibly related to the open item-16 concurrent-
+visibility anomaly** (same under/over-resolution family on B-tree-indexed
+churn) — a retest of that repro is flagged in MEMORY, not assumed fixed.
+
+**Benchmarks:** none — no new hot-path work for non-upsert statements
+(probe only runs when `ON CONFLICT` is present); the HOT-chain walk adds
+O(chain-length) page reads where the old code gave up (wrong) after 1 —
+correctness over the previous under-read, flagged for the next full bench
+report per §0.6.
+**Verification (orchestrator-rerun):** clippy `--all-features
+--all-targets -D warnings` · fmt · plain `cargo test --no-run` · item150
+**20/20** · item150_rest **7/7** · **crash 56/56** (54 pre-existing + 2 new
+upsert injection points) · constraints **30/30** · item148 **16/16** ·
+item147 **8/8** · item24_rls_with_check **8/8** · server_rest **30/30**.
+**Known limitations:** composite conflict targets, `ON CONSTRAINT`, MERGE,
+GraphQL upsert = documented non-goals; `EXCLUDED` recognized as a
+pseudo-qualifier anywhere in expression context (a real table named
+`excluded` would be shadowed — documented in parser.rs).
 **Locked-decision changes:** none.
