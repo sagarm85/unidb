@@ -1,7 +1,8 @@
 # 148 — Enums + domains (named types v1; composite types deferred)
 
 **Type:** Improvement
-**Status:** IN PROGRESS (user go-ahead 2026-08-02; branch `feat/148-enums-domains`)
+**Status:** SHIPPED (2026-08-03, PR #254 merged — see PROGRESS.md "Item 148 —
+Enums + domains (named types v1)")
 
 > Supabase-parity Wave-3 item: `CREATE TYPE … AS ENUM` and `CREATE DOMAIN`,
 > the two named-type features that are pure **plan-time desugars over
