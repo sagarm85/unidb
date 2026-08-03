@@ -91,9 +91,9 @@ queue** · unidb-js SDK v0.1. *(The last three are beyond Supabase.)*
   - **RPC** (`POST /rest/v1/rpc/<fn>`) — DONE, shipped in item 147 (PR #253)
   - **Triggers** (BEFORE/AFTER row) — IN PROGRESS, item 149
     (`149_row_triggers.md`; implemented after 150)
-  - **Upsert** (`INSERT … ON CONFLICT`) — IN PROGRESS, item 150
-    (`150_upsert_on_conflict.md`; includes the PostgREST
-    `resolution=merge-duplicates` wiring 139 excluded)
+  - **Upsert** (`INSERT … ON CONFLICT`) — DONE, item 150 (PR #257 merged
+    2026-08-03; includes the PostgREST `resolution=merge-duplicates` wiring
+    139 excluded, and the latent HOT-chain MVCC fix)
   - **Auth hooks** (custom access-token / before-user-created / MFA hooks)
     — after 147 (consumes its functions)
 - **Database webhooks** — outbound HTTP POST to the operator's endpoint on row

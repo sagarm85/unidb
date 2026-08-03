@@ -1,7 +1,9 @@
 # 150 — Upsert: `INSERT … ON CONFLICT` (+ PostgREST upsert wiring)
 
 **Type:** Improvement
-**Status:** IN PROGRESS (user go-ahead 2026-08-03; branch `feat/150-upsert-on-conflict`)
+**Status:** SHIPPED (2026-08-03, PR #257 merged — see PROGRESS.md "Item 150 —
+Upsert `INSERT … ON CONFLICT` + PostgREST resolution wiring"; includes the
+latent HOT-chain MVCC fix found by this item's concurrency test)
 
 > Compute-cluster next phase, and the FIRST item since M1 to deliberately
 > extend the ACID write path. Removes item-139's documented exclusion:
