@@ -6,7 +6,7 @@
 >
 > **The number is a stable ID** (assigned once, never renumbered — links stay
 > valid). **Existing files keep their names**; every **new** backlog file is named
-> `NN_<slug>.md` where `NN` is its number here. **Next new file → `149_…`**
+> `NN_<slug>.md` where `NN` is its number here. **Next new file → `151_…`**
 > (148 assigned 2026-08-02 to enums + domains below).
 > "What to do next" is the **Next up** section below (reorder freely — priority is
 > not the ID).
@@ -170,8 +170,10 @@ Meta docs (not numbered work items): `roadmap.md` (the numbered-phase plan),
 | 146 | `146_jwt_key_rotation.md` | Improvement | ✅ SHIPPED (2026-08-01, PR #249) — Wave-3: JWT signing-key rotation grace window. `kid` in issued token header; `UNIDB_JWT_SIGNING_KEY_PREVIOUS` (HS256) accepted for verify-only so rotating the primary doesn't mass-invalidate live tokens; asymmetric multi-key JWKS via `_PUBLIC_KEY_PREVIOUS`. Issuance stays current-key HS256. Auth-layer only, crash 54/54. |
 | 147 | `147_stored_functions_rpc.md` | Improvement | ✅ SHIPPED (2026-08-03, PR #253) — stored SQL functions v1 as a control-plane object (`FunctionDef` in `AuthState`, cron/webhook pattern, superuser `/functions` admin API) + `POST /rest/v1/rpc/{fn}`: named/positional JSON args → `$n` binds, all body statements in ONE transaction (atomic, abort-on-error), **invoker semantics by default** (`run_as: None` = the calling principal, NOT admin — deliberate divergence from cron's default, documented in the spec) with explicit `run_as` definer-analog. No engine change; triggers/upsert/auth-hooks are follow-up items. |
 | 148 | `148_enums_domains.md` | Improvement | ✅ SHIPPED (2026-08-03, PR #254) — `CREATE TYPE … AS ENUM` + `CREATE DOMAIN … AS <base> [CHECK (VALUE …)]` as catalog-registered named types that **desugar at CREATE TABLE time to base type + the existing CHECK machinery** (zero new enforcement code, no on-disk tuple change; enum stored as TEXT — ordinal encoding + declaration-order comparison + `ALTER TYPE ADD VALUE` are documented v1 non-goals). `DROP TYPE/DOMAIN` rejected while referenced. **Composite types explicitly excluded** (row-encoding format decision, own spec if prioritized). |
+| 149 | `149_rls_update_with_check_role_superuser.md` | Improvement | 🔲 NOT STARTED — bug: a `FOR UPDATE TO <role>` RLS policy's `WITH CHECK` is enforced against callers who aren't members of `<role>` **and** against superusers (both should be bypassed, exactly as the `SELECT`/`USING` path already is). Planner-only fix. Studio-flagged (2026-08-03); blocks superuser order-status UPDATEs while such a policy exists. |
+| 150 | `150_round_and_decimal_cast.md` | Improvement | 🔲 NOT STARTED — numeric precision control gaps: no `ROUND(x[,n])`, no `CAST … AS DECIMAL(p,s)`, and **`SUM`/aggregates over `DECIMAL` columns accumulate in f64** (3000×`0.01` → `30.00000000000189`) so exact-money reporting isn't possible in-query even with DECIMAL columns. Executor additions. Studio-flagged (2026-08-03). |
 
-**Next new file → `149_…`.
+**Next new file → `151_…`.
 
 ## Next up — priority order (2026-07-23, post fresh-baseline bench)
 
