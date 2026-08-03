@@ -244,6 +244,10 @@ pub(crate) fn map_status(err: &DbError) -> (StatusCode, &'static str) {
         // registration error, not a server fault.
         DbError::InvalidCronSchedule(_) => (StatusCode::BAD_REQUEST, "INVALID_CRON_SCHEDULE"),
 
+        // Item 147: a malformed stored-function registration is a
+        // client-supplied error, not a server fault.
+        DbError::InvalidFunctionDef(_) => (StatusCode::BAD_REQUEST, "INVALID_FUNCTION_DEF"),
+
         // Durability failure (P1.b, fsyncgate) is fatal for the session — the
         // engine can no longer guarantee writes reach disk and must be
         // restarted. 503 signals the service is (temporarily) unable to handle

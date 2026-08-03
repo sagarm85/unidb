@@ -232,6 +232,18 @@ pub fn build_router_with_rate_limiter(
             get(handlers::get_cron_jobs).post(handlers::post_cron_job),
         )
         .route("/cron/jobs/{name}", delete(handlers::delete_cron_job))
+        // ── Item 147: stored SQL functions + RPC ───────────────────────────
+        // `/functions*` is a superuser-only admin surface, same posture as
+        // `/cron/jobs` above. `/rest/v1/rpc/{fn}` is deliberately placed
+        // alongside `/rest/v1/{table}` above (same `require_jwt` layer, same
+        // sub-router) — any authenticated principal may call it; invoker
+        // vs `run_as` is enforced inside the handler, not by routing.
+        .route(
+            "/functions",
+            get(handlers::get_functions).post(handlers::post_function),
+        )
+        .route("/functions/{name}", delete(handlers::delete_function))
+        .route("/rest/v1/rpc/{fn_name}", post(handlers::rpc_call))
         // ── Item 142: Auth admin API (user management) ─────────────────────
         // Superuser-only admin surface, same posture as `/realtime/policies`/
         // `/webhooks` above — consolidated user management (list/get/create/

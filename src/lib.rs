@@ -4488,6 +4488,37 @@ impl Engine {
         self.authz.list_cron_jobs()
     }
 
+    // ── item 147: stored SQL functions ───────────────────────────────────
+
+    /// item 147 (admin surface): upsert a stored-function registration
+    /// (`POST /functions`). Superuser gating is the HTTP handler's job
+    /// (mirrors [`Engine::upsert_cron_job`]). Full validation (name/param
+    /// patterns, unique params, non-empty body/statements, `$k` references
+    /// in range) happens in [`crate::authz::RoleStore::upsert_function`] —
+    /// [`DbError::InvalidFunctionDef`] on anything malformed (`400` at the
+    /// HTTP layer), so a bad registration never reaches storage.
+    pub fn upsert_function(&self, def: crate::authz::FunctionDef) -> Result<()> {
+        self.authz.upsert_function(def)
+    }
+
+    /// item 147 (admin surface): remove a stored-function registration by
+    /// name (`DELETE /functions/{name}`). Idempotent.
+    pub fn remove_function(&self, name: &str) -> Result<()> {
+        self.authz.remove_function(name)
+    }
+
+    /// item 147 (admin surface): list every registered stored function
+    /// (`GET /functions`).
+    pub fn list_functions(&self) -> Vec<crate::authz::FunctionDef> {
+        self.authz.list_functions()
+    }
+
+    /// item 147 (RPC route): resolve a stored function by name
+    /// (`POST /rest/v1/rpc/{fn}` — `server::handlers::rpc_call`).
+    pub fn get_function(&self, name: &str) -> Option<crate::authz::FunctionDef> {
+        self.authz.get_function(name)
+    }
+
     // ── item 142: Auth admin API (user management) ──────────────────────
 
     /// Whether `user` is currently banned (item 142). Checked at every

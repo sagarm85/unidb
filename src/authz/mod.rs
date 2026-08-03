@@ -928,6 +928,14 @@ struct AuthState {
     /// deserializes with an empty list — no FORMAT_VERSION bump.
     #[serde(default)]
     cron_jobs: Vec<CronJobDef>,
+    /// Stored SQL functions (item 147): one entry per `name`. `body` is
+    /// admin-authored (superuser-gated registration), the same "not user
+    /// input" posture `cron_jobs`'s doc comment documents for a job's
+    /// `sql` — shown in full below, no secret material. `#[serde(default)]`
+    /// so a pre-147 `roles.json` (no `functions` key) deserializes with an
+    /// empty list — no FORMAT_VERSION bump.
+    #[serde(default)]
+    functions: Vec<FunctionDef>,
 }
 
 /// Manual `Debug`: every field except `credentials`/`sessions`/`mfa`/
@@ -991,6 +999,9 @@ impl std::fmt::Debug for AuthState {
             // no secret material, shown in full, same posture as
             // `webhooks`/`channel_policies` above.
             .field("cron_jobs", &self.cron_jobs)
+            // item 147: stored-function bodies — admin-authored SQL, no
+            // secret material, shown in full, same posture as `cron_jobs`.
+            .field("functions", &self.functions)
             .finish()
     }
 }
@@ -1269,6 +1280,131 @@ pub struct CronJobDef {
 
 fn default_cron_enabled() -> bool {
     true
+}
+
+/// A stored SQL function (item 147, backlog doc's locked v1 design): a
+/// named, parameterized list of SQL statements, persisted in `roles.json`
+/// alongside every other control-plane object (no separate store, no
+/// FORMAT_VERSION bump — see [`AuthState::functions`]).
+///
+/// **Security — the one place this deliberately differs from
+/// [`CronJobDef`]:** `run_as: None` means **the calling principal**
+/// (invoker semantics — the RPC caller's own RLS/grants apply, PostgREST's
+/// default posture), NOT the embedded superuser. Cron's `None = admin`
+/// default is safe because only a superuser can register *and* only the
+/// scheduler can fire a job; a stored function is callable via `POST
+/// /rest/v1/rpc/{fn}` by **any authenticated principal**, so an
+/// implicit-admin default here would be a privilege-escalation hole. A
+/// definer-style function must say so explicitly (`run_as: Some(role)`).
+/// Registration itself stays superuser-only, so `run_as` remains
+/// admin-granted — same trust model as cron's `run_as`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FunctionDef {
+    /// Unique function name — the upsert key (`POST /functions` replaces any
+    /// existing function of the same name, mirroring [`CronJobDef::name`]).
+    /// Validated against [`FUNCTION_NAME_PATTERN`] at registration.
+    pub name: String,
+    /// Declared parameter names, in `$1..$n` positional order. Validated:
+    /// each name matches [`FUNCTION_NAME_PATTERN`] and every name is unique
+    /// within this function.
+    #[serde(default)]
+    pub params: Vec<String>,
+    /// One or more SQL statements run in order, in one transaction, by
+    /// `POST /rest/v1/rpc/{fn}` — see `server::handlers::rpc_call`. Each
+    /// statement's `$1..$n` placeholders are bound from the RPC call's
+    /// argument vector (named-object or positional-array form). Validated
+    /// non-empty (both the list and every individual statement) and every
+    /// `$k` reference resolves within `1..=params.len()` at registration.
+    pub body: Vec<String>,
+    /// The principal `body` runs as. `None` (the default) is **invoker**
+    /// semantics — the RPC caller's own principal, table grants, and RLS
+    /// policies apply (see this struct's doc comment for why this differs
+    /// from [`CronJobDef::run_as`]'s admin default). `Some(role)` runs
+    /// exactly as [`crate::Engine::execute_sql_as`]`(Some(role), ..)`
+    /// would, regardless of who calls the RPC route — a definer-style
+    /// function, admin-granted at registration time (superuser-only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_as: Option<String>,
+}
+
+/// `^[a-zA-Z_][a-zA-Z0-9_]{0,62}$` — the identifier pattern shared by
+/// [`FunctionDef::name`] and every entry of [`FunctionDef::params`] (item
+/// 147). Hand-rolled (no `regex` dependency in this crate) rather than a
+/// compiled pattern object.
+pub const FUNCTION_NAME_PATTERN: &str = "^[a-zA-Z_][a-zA-Z0-9_]{0,62}$";
+
+fn is_valid_function_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+    s.len() <= 63
+}
+
+/// Scan `stmt` for `$k` placeholder references that appear **outside**
+/// single-quoted string literals, returning every `k` found (duplicates
+/// included). Used at registration time ([`RoleStore::upsert_function`]) to
+/// reject a body statement that references a parameter index outside
+/// `1..=params.len()`.
+///
+/// **This is a simple lexical scan, not a SQL tokenizer — documented
+/// limits:** it tracks only single-quote string-literal state (including
+/// the standard `''` doubled-quote escape) so a `$3` written inside a
+/// string literal (e.g. `'cost is $3 dollars'`) is correctly *not* counted
+/// as a placeholder reference. It does **not** understand `--`/`/* */` SQL
+/// comments, dollar-quoted string bodies, or double-quoted identifiers — a
+/// `$k`-shaped token inside one of those constructs is still counted here.
+/// This is a deliberate false-positive-tolerant (never false-negative on
+/// real placeholders) posture for a reject-at-registration validation gate:
+/// it is fine to occasionally over-reject an unusual statement (the admin
+/// can rephrase it) but it must never silently accept a statement whose
+/// real `$k` references are out of range.
+fn scan_param_refs(stmt: &str) -> Vec<usize> {
+    let mut refs = Vec::new();
+    let bytes = stmt.as_bytes();
+    let mut i = 0;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            if c == b'\'' {
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2;
+                    continue;
+                }
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'\'' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        if c == b'$' {
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > start {
+                if let Ok(k) = stmt[start..j].parse::<usize>() {
+                    refs.push(k);
+                }
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    refs
 }
 
 /// A parsed auth-DDL statement.
@@ -2435,6 +2571,115 @@ impl RoleStore {
     /// (`server::cron::run_due`) uses this list every tick to find due jobs.
     pub fn list_cron_jobs(&self) -> Vec<CronJobDef> {
         self.lock().cron_jobs.clone()
+    }
+
+    // ── item 147: stored SQL functions ──────────────────────────────────
+
+    /// Upsert a stored-function registration (item 147 admin surface):
+    /// replaces an existing entry sharing the same `name`, or inserts a new
+    /// one. Full registration-time validation lives here (unlike
+    /// [`Self::upsert_cron_job`]'s schedule check, which lives one layer up
+    /// in `Engine::upsert_cron_job` — there is no engine-level parse step
+    /// for a function body, so it is simplest and most complete to validate
+    /// everything before this method ever touches storage):
+    /// - `name` and every entry of `params` must match
+    ///   [`FUNCTION_NAME_PATTERN`].
+    /// - `params` entries must be unique.
+    /// - `body` must be non-empty, and every statement in it must be
+    ///   non-empty (after trimming).
+    /// - every `$k` reference found by [`scan_param_refs`] in any `body`
+    ///   statement must resolve within `1..=params.len()` — see that
+    ///   function's doc comment for the scan's documented limits.
+    ///
+    /// Superuser gating (`POST /functions` is superuser-only) is the HTTP
+    /// handler's job, mirroring every other admin-surface mutator in this
+    /// module.
+    pub fn upsert_function(&self, def: FunctionDef) -> Result<()> {
+        if !is_valid_function_identifier(&def.name) {
+            return Err(DbError::InvalidFunctionDef(format!(
+                "function name '{}' must match {FUNCTION_NAME_PATTERN}",
+                def.name
+            )));
+        }
+        for p in &def.params {
+            if !is_valid_function_identifier(p) {
+                return Err(DbError::InvalidFunctionDef(format!(
+                    "parameter name '{p}' must match {FUNCTION_NAME_PATTERN}"
+                )));
+            }
+        }
+        {
+            let mut seen = std::collections::HashSet::with_capacity(def.params.len());
+            for p in &def.params {
+                if !seen.insert(p.as_str()) {
+                    return Err(DbError::InvalidFunctionDef(format!(
+                        "duplicate parameter name '{p}'"
+                    )));
+                }
+            }
+        }
+        if def.body.is_empty() {
+            return Err(DbError::InvalidFunctionDef(
+                "body must contain at least one SQL statement".to_string(),
+            ));
+        }
+        for stmt in &def.body {
+            if stmt.trim().is_empty() {
+                return Err(DbError::InvalidFunctionDef(
+                    "body statements must not be empty".to_string(),
+                ));
+            }
+            for k in scan_param_refs(stmt) {
+                if k < 1 || k > def.params.len() {
+                    return Err(DbError::InvalidFunctionDef(format!(
+                        "statement references ${k}, but only {} parameter(s) are declared",
+                        def.params.len()
+                    )));
+                }
+            }
+        }
+
+        let mut st = self.lock();
+        let name = def.name.clone();
+        match st.functions.iter_mut().find(|f| f.name == def.name) {
+            Some(existing) => *existing = def,
+            None => st.functions.push(def),
+        }
+        self.persist(&st)?;
+        tracing::debug!(function = %name, "stored function registration upserted");
+        Ok(())
+    }
+
+    /// Remove a stored-function registration by `name` (item 147 admin
+    /// surface). Idempotent — removing a `name` that doesn't exist is a
+    /// silent no-op, mirroring [`Self::remove_cron_job`]'s posture.
+    pub fn remove_function(&self, name: &str) -> Result<()> {
+        let mut st = self.lock();
+        let before = st.functions.len();
+        st.functions.retain(|f| f.name != name);
+        if st.functions.len() != before {
+            self.persist(&st)?;
+            tracing::debug!(function = %name, "stored function registration removed");
+        }
+        Ok(())
+    }
+
+    /// Every registered stored function (item 147), `body` included — `GET
+    /// /functions` (`server::handlers::get_functions`) is superuser-only so
+    /// body exposure is fine (mirrors [`Self::list_cron_jobs`]'s posture for
+    /// `sql`).
+    pub fn list_functions(&self) -> Vec<FunctionDef> {
+        self.lock().functions.clone()
+    }
+
+    /// The stored function named `name`, if registered — the RPC route
+    /// (`server::handlers::rpc_call`) resolution lookup.
+    pub fn get_function(&self, name: &str) -> Option<FunctionDef> {
+        self.lock()
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .cloned()
     }
 
     /// Whether `user` holds `priv` on `table` **at all** — `true` for both a
