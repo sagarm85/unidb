@@ -1413,6 +1413,9 @@ List every registered function, `body` included. **Superuser-only.**
 
 Remove a stored function. **Superuser-only.** Idempotent — deleting an
 unknown `name` is a no-op, not an error. **Response**: `204 No Content`.
+**Item 149 addition:** rejected with `409 FUNCTION_IN_USE_BY_TRIGGER` while
+any [row trigger](#row-triggers-item-149) still references the function —
+drop the trigger(s) first.
 
 ### `POST /rest/v1/rpc/{fn}`
 
@@ -1455,18 +1458,74 @@ array (see [`POST /sql`](#post-sql)):
 **Non-goals (v1, explicitly out of scope):** no SQL-callable `SELECT
 my_fn(...)` surface (the plpgsql-analog future step); no `GET /rest/v1/rpc/
 {fn}`; no declared parameter types; no return-type contract beyond "last
-statement's rows"; no triggers; no auth hooks. These are tracked as this
-item's follow-ups (`docs/backlog/147_stored_functions_rpc.md`), not silently
-dropped. (Correction: this list originally also named `INSERT … ON CONFLICT`
-as a non-goal — that was accurate before item 150 shipped `ON CONFLICT`
-support into the SQL engine itself; a stored function's statement body runs
-through the exact same executor as any other statement, so `ON CONFLICT` now
-works inside RPC bodies too, with no RPC-layer change needed.)
+statement's rows"; no auth hooks. These are tracked as this item's
+follow-ups (`docs/backlog/147_stored_functions_rpc.md`), not silently
+dropped. (Corrections, inline rather than silent rewrites: this list
+originally also named `INSERT … ON CONFLICT` as a non-goal — that was
+accurate before item 150 shipped `ON CONFLICT` support into the SQL engine
+itself, so `ON CONFLICT` now works inside RPC bodies too, with no RPC-layer
+change needed. It also originally named "no triggers" as a non-goal — item
+149 shipped [row triggers](#row-triggers-item-149) as a separate SQL-DDL
+surface, `CREATE TRIGGER`/`DROP TRIGGER`, that fires these same zero-param
+stored functions per row; RPC itself still has no trigger-like hook of its
+own.)
 
 The embedded crate exposes the same three admin operations directly:
 `Engine::upsert_function` / `remove_function` / `list_functions` (and their
 `EngineHandle` async wrappers for the server), plus `Engine::get_function`
 for the single-name resolution `rpc_call` itself uses.
+
+---
+
+## Row triggers (item 149)
+
+`CREATE TRIGGER`/`DROP TRIGGER` are **pure SQL DDL** — there is no separate
+REST admin surface for triggers themselves (unlike stored functions, which
+also get `POST`/`GET`/`DELETE /functions`). They run through the same `POST
+/sql` (or embedded `execute_sql`/`execute_sql_as`) route every other
+statement uses, and are **superuser-only** exactly like `CREATE TABLE`/
+`CREATE TYPE` — a named non-superuser gets `403 PERMISSION_DENIED`.
+
+```sql
+CREATE TRIGGER <name> {BEFORE|AFTER} {INSERT|UPDATE|DELETE}
+  ON <table> [FOR EACH ROW] EXECUTE FUNCTION <fn_name>;
+DROP TRIGGER [IF EXISTS] <name> ON <table>;
+```
+
+Full syntax, the `NEW`/`OLD` binding rules, and worked examples (including
+the audit-log `AFTER` pattern and the `updated_at`-stamp `BEFORE` workaround)
+are in the [SQL reference](sql/sql_reference.md#create-trigger--drop-trigger).
+
+**Privilege model — read this before writing a trigger.** `<fn_name>` must
+already be a registered [stored function](#stored-functions--rpc-item-147)
+with **zero** declared params. Unlike RPC's invoker-by-default posture, a
+trigger's function body **always runs unrestricted, as the embedded/
+superuser identity**, regardless of which principal's statement fired it,
+and regardless of that function's own `run_as`. This is deliberate — the
+same trust posture a scheduled cron job's default (`run_as: None =>
+embedded superuser`) already has, and for the identical reason: a caller
+with only `INSERT` on `orders` and no grant at all on `orders_audit` must
+still be able to fire an audit trigger that writes to `orders_audit`
+(Postgres solves this with `SECURITY DEFINER`; here it's simply always on).
+An invoker-mode option is a documented v1 follow-up, not currently
+supported. **Also unlike Postgres: no cascading.** A statement issued from
+*inside* a trigger body fires zero triggers of its own — v1's entire
+recursion story, and what makes the `updated_at`-stamp pattern's own nested
+`UPDATE` terminate instead of looping forever.
+
+**Errors** (in addition to standard engine codes — see
+[Error codes](#error-codes)):
+
+| Code | Status | Meaning |
+|---|---|---|
+| `TRIGGER_ALREADY_EXISTS` | `409` | `CREATE TRIGGER` named a trigger name that already exists (whole-catalog namespace, not per-table) |
+| `UNKNOWN_TRIGGER` | `404` | `DROP TRIGGER` named a trigger that doesn't exist on that table |
+| `FUNCTION_IN_USE_BY_TRIGGER` | `409` | `DELETE /functions/{name}` (or `remove_function`) while a trigger still references it |
+| `INVALID_TRIGGER_DEF` | `400` | `CREATE TRIGGER`'s function doesn't exist, declares nonzero params, or a `NEW`/`OLD` column reference is unknown or unavailable for the event (e.g. `OLD` on `INSERT`) |
+
+The embedded crate has no separate trigger-specific API — triggers are
+created/dropped exclusively via `Engine::execute_sql`/`execute_sql_as`, like
+any other DDL statement.
 
 ---
 
@@ -3159,6 +3218,10 @@ by `server/error.rs`'s `ApiError` directly, not by a `DbError` variant.
 | 404 | `FUNCTION_NOT_FOUND` | `POST /rest/v1/rpc/{fn}` names no registered stored function (item 147) |
 | 400 | `INVALID_FUNCTION_ARGS` | RPC body's named/positional args don't match the function's declared `params` (item 147) |
 | 400 | `INVALID_FUNCTION_DEF` | `POST /functions` registration failed validation — bad name/param pattern, duplicate params, empty body/statement, or an out-of-range `$k` reference (item 147) |
+| 409 | `TRIGGER_ALREADY_EXISTS` | `CREATE TRIGGER` on an existing trigger name (item 149; whole-catalog namespace) |
+| 404 | `UNKNOWN_TRIGGER` | `DROP TRIGGER` named a trigger that doesn't exist on that table (item 149) |
+| 409 | `FUNCTION_IN_USE_BY_TRIGGER` | `DELETE /functions/{name}` while a trigger still references the function (item 149) |
+| 400 | `INVALID_TRIGGER_DEF` | `CREATE TRIGGER`'s function doesn't exist / declares nonzero params / references an unknown or event-unavailable `NEW`/`OLD` column (item 149) |
 | 400 | `OAUTH_PROVIDER_DENIED` | Provider returned `?error=...` on the OAuth callback (item 128) |
 | 400 | `OAUTH_MISSING_CODE` | OAuth callback missing both `code` and `error` (item 128) |
 | 401 | `OAUTH_STATE_INVALID` | Unknown/expired/replayed/wrong-provider OAuth `state` (item 128) |

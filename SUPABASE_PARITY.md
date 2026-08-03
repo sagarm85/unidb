@@ -12,16 +12,16 @@
 > Ledger entry: `PROGRESS.md` "Supabase-parity BaaS layer — items 120–133 +
 > free-parity continuation 135–146".
 >
-> **Last verified:** 2026-08-03, on branch `feat/150-upsert-on-conflict`
-> (item 150 shipping in this PR; 147 = PR #253, 148 = PR #254; previous
-> stamps 2026-08-02/03). Feature list source: the
+> **Last verified:** 2026-08-03, on branch `feat/149-row-triggers`
+> (item 149 shipping in this PR; 150 = upsert, 147 = PR #253, 148 = PR #254;
+> previous stamps 2026-08-02/03). Feature list source: the
 > supabase.com/features catalog as of early 2026 (page not re-fetchable from
 > every environment — re-check it when updating).
 
-**Summary:** ~40 catalog features → **21 done · 9 partial · 4 achieved
-differently · 15 not done** (compute cluster: stored functions v1 + RPC =
-item 147, enums + domains = item 148, upsert = item 150; triggers = item
-149 in progress; auth hooks next; the remaining ❌ bulk is the deliberate
+**Summary:** ~40 catalog features → **22 done · 9 partial · 4 achieved
+differently · 14 not done** (compute cluster: stored functions v1 + RPC =
+item 147, enums + domains = item 148, upsert = item 150, row triggers =
+item 149; auth hooks next; the remaining ❌ bulk is the deliberate
 paid-third-party exclusions).
 
 Legend: ✅ done · 🟡 partial · 🔁 done differently · ❌ not done
@@ -50,6 +50,7 @@ non-goal, see the exclusions list in `docs/backlog/137_…`).
 | Cron / scheduled jobs (pg_cron) | `/cron/jobs` with 5-field cron expressions; SQL runs through the normal executor under a `run_as` principal so RLS/grants apply; no-overlap, no-backfill (item 144) |
 | RPC (`/rest/v1/rpc/<fn>`) | `POST /rest/v1/rpc/{fn}` calling registered stored functions: named or positional JSON args → `$n` binds, all body statements in ONE atomic transaction, **invoker semantics by default** (caller's RLS/grants apply; explicit `run_as` definer-analog) (item 147). PostgREST's `GET` variant not offered (v1 non-goal) |
 | Upsert (`INSERT … ON CONFLICT`) | `DO NOTHING` / `DO UPDATE SET … [WHERE …]` with `EXCLUDED.*` on a PK/UNIQUE conflict target; update arm routes through the existing UPDATE machinery (HOT/index/FK shared); RLS fail-closed both arms; REST `on_conflict=` + `Prefer: resolution=merge-duplicates\|ignore-duplicates` (item 150). Composite targets/`ON CONSTRAINT`/MERGE = non-goals |
+| Database triggers | `CREATE TRIGGER … {BEFORE\|AFTER} {INSERT\|UPDATE\|DELETE} … EXECUTE FUNCTION` — fires an item-147 zero-param stored function per row, in the SAME transaction as the write (an `AFTER` trigger's audit row commits atomically, no outbox); name-order firing; errors veto; **no cascading** (a statement fired from inside a trigger body fires no triggers of its own — a deliberate v1 divergence from Postgres); trigger body always runs as the embedded/superuser identity (the `SECURITY DEFINER` problem, solved by always being on) (item 149). `FOR EACH STATEMENT`/`WHEN`/`INSTEAD OF`/`NEW`-modification-in-`BEFORE` = non-goals |
 | Migrations | `unidb-migrate` CLI — forward-only SQL files, `schema_migrations` tracking table, checksum drift detection (item 126) |
 | Secrets (Vault) | Encrypt-at-rest AES-256-GCM store keyed from `UNIDB_MASTER_KEY` (item 129) |
 | Vector storage + search (pgvector) | Native on-disk HNSW, `NEAR` operator inside SQL `WHERE` — crash-recovered, MVCC/RLS-consistent; recall@10 0.90, ~482 µs vs pgvector's ~380 µs at 10k×dim128 (items 63/106) |
@@ -67,7 +68,7 @@ non-goal, see the exclusions list in `docs/backlog/137_…`).
 | Backups / PITR | Engine has online base backup + WAL archiving + restore by timestamp/LSN (PITR is a paid add-on at Supabase) — user-facing UX/tooling polish still open |
 | Dashboard (Studio) | `unidb-studio` exists as a separate repo; panels for the newest surfaces (webhooks, cron, admin API, dev-inbox) pending |
 | Client libraries | JS/TS done ([`unidb-js`](https://github.com/sagarm85/unidb-js), supabase-js-shaped) + Rust (`unidb-attach`); Python/Dart/Swift/Kotlin open |
-| Database functions / stored procedures | SQL-body v1 done (item 147): superuser-registered control-plane functions (`/functions`), callable via RPC with atomic multi-statement execution — but no SQL-callable `SELECT fn()`, no plpgsql-analog, not usable by triggers yet (those are the next-phase items) |
+| Database functions / stored procedures | SQL-body v1 done (item 147): superuser-registered control-plane functions (`/functions`), callable via RPC with atomic multi-statement execution — but no SQL-callable `SELECT fn()`, no plpgsql-analog. (Now also usable by triggers — item 149, see the Done table.) |
 | Enums / domains / custom types | Enums + domains done (item 148): `CREATE TYPE … AS ENUM` / `CREATE DOMAIN … [CHECK (VALUE …)]` as catalog named types desugaring to the existing CHECK machinery (NULL-correct, drop-protected while referenced); v1 stores enums as TEXT (text-collation ordering, no `ALTER TYPE ADD VALUE`); composite/custom record types still deferred |
 
 ## Table 3 — 🔁 Achieved in a different way
@@ -83,7 +84,6 @@ non-goal, see the exclusions list in `docs/backlog/137_…`).
 
 | Supabase feature | Status / reason |
 |---|---|
-| Database triggers | IN PROGRESS — item 149 (`149_row_triggers.md`, spec locked): BEFORE/AFTER row triggers executing item-147 functions in the same transaction; implementing immediately after item 150 |
 | Auth hooks | Open — unblocked by item 147's functions; next phase (control-plane) |
 | GraphQL subscriptions | HELD — WebSocket-vs-SSE decision pending |
 | SAML / enterprise SSO | HELD — large item, no paid dependency, awaiting go-ahead |

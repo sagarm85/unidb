@@ -29,7 +29,7 @@ use crate::{
     bufferpool::{BufferPool, PageReader},
     catalog::{
         Catalog, CatalogCtx, ColumnDef, ColumnType, IndexKind, NamedTypeDef, NamedTypeKind,
-        TableConstraints, TableDef,
+        TableConstraints, TableDef, TriggerDef, TriggerEvent, TriggerTiming,
     },
     control::ControlData,
     error::{DbError, Result},
@@ -840,6 +840,16 @@ pub struct ExecCtx<'a> {
     /// (item 94). `None` in unit tests that build bare `ExecCtx` structs.
     /// Points at `Engine::near_lightweight_snaps`.
     pub near_lightweight_snaps: Option<&'a std::sync::atomic::AtomicU64>,
+    /// Item 149's locked no-cascading rule: `true` while executing a
+    /// statement nested inside a trigger function body (via
+    /// `exec_trigger_stmt`), `false` otherwise. Every trigger-firing call
+    /// site (`prepare_triggers`/`fire_prepared_triggers`) checks this FIRST
+    /// and is a no-op when it's `true` — a statement issued from within a
+    /// trigger body fires no triggers of its own, full stop. This is a
+    /// per-`ExecCtx` flag (never a global), exactly as the backlog spec
+    /// requires, so it can never leak across concurrent statements on
+    /// other threads.
+    pub in_trigger: bool,
 }
 
 /// Insert `row`'s durable-index column values into their on-disk structures
@@ -1420,6 +1430,10 @@ pub enum ExecResult {
     CreatedType,
     /// `DROP TYPE` / `DROP DOMAIN` succeeded (item 148).
     DroppedType,
+    /// `CREATE TRIGGER` succeeded (item 149).
+    CreatedTrigger,
+    /// `DROP TRIGGER` succeeded (item 149).
+    DroppedTrigger,
 }
 
 /// Build a `CatalogCtx` from `ExecCtx`'s individual fields (not from `&mut
@@ -1506,6 +1520,18 @@ pub fn execute(plan: LogicalPlan, ctx: &mut ExecCtx) -> Result<ExecResult> {
         LogicalPlan::DropNamedType { name, if_exists } => {
             exec_drop_named_type(&name, if_exists, ctx)
         }
+        LogicalPlan::CreateTrigger {
+            name,
+            table,
+            timing,
+            event,
+            function,
+        } => exec_create_trigger(name, table, timing, event, function, ctx),
+        LogicalPlan::DropTrigger {
+            name,
+            table,
+            if_exists,
+        } => exec_drop_trigger(&name, &table, if_exists, ctx),
     }
 }
 
@@ -1824,6 +1850,366 @@ fn exec_drop_named_type(name: &str, if_exists: bool, ctx: &mut ExecCtx) -> Resul
     }
 }
 
+// ─── Row triggers (item 149) ───────────────────────────────────────────────
+//
+// `CREATE TRIGGER`/`DROP TRIGGER` DDL, plus the firing machinery every DML
+// path (`try_insert_one_row`, `apply_single_row_update`, `exec_delete`)
+// hooks into. See the module doc at the top of this file for the general
+// shape and `docs/backlog/149_row_triggers.md` for the locked v1 semantics
+// (same transaction, name-order firing, errors veto, no cascading, BEFORE
+// cannot modify NEW, unrestricted/embedded trigger-body identity).
+
+/// `CREATE TRIGGER <name> {BEFORE|AFTER} {INSERT|UPDATE|DELETE} ON <table>
+/// [FOR EACH ROW] EXECUTE FUNCTION <fn_name>` (item 149). Registration-time
+/// validation (all locked v1 rules, checked in full HERE so a bad
+/// registration never reaches the catalog):
+/// - `table` must exist (and not be an engine-managed system table).
+/// - `function` must name an existing item-147 `FunctionDef` with **zero**
+///   declared params (`run_as` is irrelevant — see `exec_trigger_stmt`'s
+///   doc comment for why the trigger body always runs unrestricted
+///   regardless of the function's own `run_as`).
+/// - every `NEW`/`OLD` column reference in every one of the function's body
+///   statements must resolve against `table`'s live columns and be
+///   available for `event` (`rewrite_new_old_refs`, called here purely for
+///   its validation side effect — the rewritten text/refs themselves are
+///   discarded and re-derived fresh at every firing; see `TriggerDef`'s doc
+///   comment on why re-validating at fire time too is deliberate, not
+///   redundant).
+fn exec_create_trigger(
+    name: String,
+    table: String,
+    timing: TriggerTiming,
+    event: TriggerEvent,
+    function: String,
+    ctx: &mut ExecCtx,
+) -> Result<ExecResult> {
+    reject_system_table(&table)?;
+    let table_def = ctx.catalog.lookup(&table)?.clone();
+    let func = ctx
+        .authz
+        .and_then(|a| a.get_function(&function))
+        .ok_or_else(|| {
+            DbError::InvalidTriggerDef(format!("no stored function named '{function}'"))
+        })?;
+    if !func.params.is_empty() {
+        return Err(DbError::InvalidTriggerDef(format!(
+            "function '{function}' declares {} parameter(s); a trigger function must declare zero",
+            func.params.len()
+        )));
+    }
+    for stmt in &func.body {
+        rewrite_new_old_refs(stmt, &table_def, event)?;
+    }
+    let mut cctx = catalog_ctx!(ctx);
+    ctx.catalog.exclusive()?.create_trigger(
+        TriggerDef {
+            name,
+            table,
+            timing,
+            event,
+            function,
+        },
+        &mut cctx,
+    )?;
+    Ok(ExecResult::CreatedTrigger)
+}
+
+/// `DROP TRIGGER [IF EXISTS] <name> ON <table>` (item 149). Mirrors
+/// `exec_drop_named_type`'s `IF EXISTS` posture exactly.
+fn exec_drop_trigger(
+    name: &str,
+    table: &str,
+    if_exists: bool,
+    ctx: &mut ExecCtx,
+) -> Result<ExecResult> {
+    let mut cctx = catalog_ctx!(ctx);
+    match ctx
+        .catalog
+        .exclusive()?
+        .drop_trigger(name, table, &mut cctx)
+    {
+        Ok(()) => Ok(ExecResult::DroppedTrigger),
+        Err(DbError::UnknownTrigger { .. }) if if_exists => Ok(ExecResult::DroppedTrigger),
+        Err(e) => Err(e),
+    }
+}
+
+/// One `NEW.<col>`/`OLD.<col>` reference inside a trigger function body
+/// statement (item 149), resolved to the table's column index, in the
+/// order its synthesized `$n` placeholder appears in the rewritten
+/// statement text (`$1` binds `refs[0]`, `$2` binds `refs[1]`, ...).
+#[derive(Clone, Copy)]
+struct NewOldRef {
+    is_new: bool,
+    col_idx: usize,
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Scan `stmt` for `NEW.<col>`/`OLD.<col>` compound-identifier references
+/// outside single-quoted string literals (same lexical-scan discipline as
+/// `authz::scan_param_refs` — tracks only single-quote string state,
+/// including the doubled-quote `''` escape; does not understand `--`/`/*
+/// */` comments or dollar-quoted bodies, a deliberate false-positive-
+/// tolerant posture for a reject-at-registration validation gate),
+/// replacing each with a synthesized `$n` placeholder (1-based, in source
+/// order). Returns the rewritten SQL text plus the ordered column refs each
+/// placeholder binds — `$n` -> `refs[n-1]` — ready to feed straight into
+/// [`crate::sql::logical::bind_params`] after `parse_sql`.
+///
+/// Ordinary `$k` placeholders already present in `stmt` are never touched —
+/// item 147's `upsert_function` already guarantees a trigger-eligible
+/// (zero-param) function body contains none (any `$k` reference is rejected
+/// there when `params.is_empty()`), so there is no collision to worry
+/// about, but the scan simply never matches `$`-shaped tokens in the first
+/// place regardless.
+///
+/// `event` gates which image is legal to reference: `INSERT` -> `NEW` only,
+/// `DELETE` -> `OLD` only, `UPDATE` -> both. A reference to an unavailable
+/// image, or to a column that doesn't exist (or is dropped), is a hard
+/// error — this is the CREATE-TRIGGER-time validation the backlog spec
+/// requires ("BEFORE-INSERT referencing OLD = error at CREATE time"); the
+/// same call also runs at every firing (`prepare_triggers`), as defense in
+/// depth against a function body redefined via `POST /functions` after the
+/// trigger was created (see `TriggerDef`'s doc comment — a known, deliberate
+/// v1 limitation: staleness is caught at the next fire, not proactively).
+fn rewrite_new_old_refs(
+    stmt: &str,
+    table_def: &TableDef,
+    event: TriggerEvent,
+) -> Result<(String, Vec<NewOldRef>)> {
+    let bytes = stmt.as_bytes();
+    let mut out = String::with_capacity(stmt.len());
+    let mut refs: Vec<NewOldRef> = Vec::new();
+    let mut i = 0usize;
+    let mut last_copied = 0usize;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            if c == b'\'' {
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2;
+                    continue;
+                }
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'\'' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        let prev_is_word = i > 0 && is_ident_byte(bytes[i - 1]);
+        if !prev_is_word && c.is_ascii_alphabetic() {
+            let word_start = i;
+            let mut j = i;
+            while j < bytes.len() && is_ident_byte(bytes[j]) {
+                j += 1;
+            }
+            let word = &stmt[word_start..j];
+            let is_new = word.eq_ignore_ascii_case("new");
+            let is_old = word.eq_ignore_ascii_case("old");
+            if (is_new || is_old) && bytes.get(j) == Some(&b'.') {
+                let col_start = j + 1;
+                let mut k = col_start;
+                while k < bytes.len() && is_ident_byte(bytes[k]) {
+                    k += 1;
+                }
+                if k > col_start {
+                    let col_name = &stmt[col_start..k];
+                    if is_new && matches!(event, TriggerEvent::Delete) {
+                        return Err(DbError::InvalidTriggerDef(format!(
+                            "NEW is not available on a DELETE trigger (referenced NEW.{col_name})"
+                        )));
+                    }
+                    if is_old && matches!(event, TriggerEvent::Insert) {
+                        return Err(DbError::InvalidTriggerDef(format!(
+                            "OLD is not available on an INSERT trigger (referenced OLD.{col_name})"
+                        )));
+                    }
+                    let col_idx = table_def
+                        .columns
+                        .iter()
+                        .position(|c| c.name == col_name && !c.dropped)
+                        .ok_or_else(|| {
+                            DbError::InvalidTriggerDef(format!(
+                                "{}.{col_name} references unknown column '{col_name}' on table '{}'",
+                                if is_new { "NEW" } else { "OLD" },
+                                table_def.name
+                            ))
+                        })?;
+                    out.push_str(&stmt[last_copied..word_start]);
+                    refs.push(NewOldRef { is_new, col_idx });
+                    out.push('$');
+                    out.push_str(&refs.len().to_string());
+                    last_copied = k;
+                    i = k;
+                    continue;
+                }
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    out.push_str(&stmt[last_copied..]);
+    Ok((out, refs))
+}
+
+/// One trigger's function body, parsed once per firing statement — never
+/// once per row (the backlog spec's explicit performance requirement).
+/// Each body statement's `LogicalPlan` has its `NEW.col`/`OLD.col`
+/// references already rewritten to `$1..$n` placeholders, paired with the
+/// ordered column refs those placeholders bind. Cloning the plan template
+/// and rebinding fresh literal values is the only per-row cost.
+struct PreparedTrigger {
+    name: String,
+    body: Vec<(LogicalPlan, Vec<NewOldRef>)>,
+}
+
+/// Prepare every registered `(table, timing, event)` trigger once for the
+/// current statement (item 149's "parsed once per firing statement, not
+/// once per row" requirement + the "zero cost for tables without triggers"
+/// fast-path requirement). Returns an empty `Vec` — after exactly one
+/// catalog lookup, no parsing, no allocation beyond the empty `Vec` itself
+/// — for the common case (a table with no triggers for this timing/event),
+/// and unconditionally empty when already inside a trigger body
+/// (`ctx.in_trigger`: the no-cascading rule means a nested statement never
+/// needs to prepare anything, so this is checked FIRST, before the catalog
+/// lookup even runs).
+fn prepare_triggers(
+    table_def: &TableDef,
+    timing: TriggerTiming,
+    event: TriggerEvent,
+    ctx: &ExecCtx,
+) -> Result<Vec<PreparedTrigger>> {
+    if ctx.in_trigger {
+        return Ok(Vec::new());
+    }
+    let defs: Vec<TriggerDef> = ctx
+        .catalog
+        .get()
+        .triggers_for(&table_def.name, timing, event)
+        .into_iter()
+        .cloned()
+        .collect();
+    if defs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::with_capacity(defs.len());
+    for def in defs {
+        let func = ctx
+            .authz
+            .and_then(|a| a.get_function(&def.function))
+            .ok_or_else(|| {
+                DbError::InvalidTriggerDef(format!(
+                    "trigger '{}' references unknown function '{}'",
+                    def.name, def.function
+                ))
+            })?;
+        let mut body = Vec::with_capacity(func.body.len());
+        for stmt in &func.body {
+            let (rewritten, refs) = rewrite_new_old_refs(stmt, table_def, event)?;
+            let mut plans = crate::sql::parser::parse_sql(&rewritten)?;
+            if plans.len() != 1 {
+                return Err(DbError::InvalidTriggerDef(format!(
+                    "trigger function '{}' body statement must parse to exactly one SQL \
+                     statement (got {})",
+                    def.function,
+                    plans.len()
+                )));
+            }
+            body.push((plans.remove(0), refs));
+        }
+        out.push(PreparedTrigger {
+            name: def.name,
+            body,
+        });
+    }
+    Ok(out)
+}
+
+/// Execute one trigger-body statement plan nested inside the firing
+/// statement's own transaction (same `ctx`/`xid` — the unified-commit
+/// thesis: the trigger's write is an ordinary same-txn WAL-logged
+/// statement, no outbox, by construction). Two things are overridden for
+/// the duration of the nested call, both unconditionally restored after
+/// regardless of `Ok`/`Err`:
+/// - `ctx.in_trigger = true` — item 149's locked no-cascading rule.
+/// - `current_user`/`auth_claims`/`auth_roles` cleared to the
+///   embedded/superuser identity — the trigger body "runs unrestricted
+///   (embedded identity)" regardless of which principal's statement fired
+///   it (locked v1 privilege model; see the backlog spec's rationale: an
+///   invoking caller may have no grants on an audit table the trigger
+///   writes to, exactly the case `SECURITY DEFINER` solves in Postgres).
+///   This mirrors cron's `run_as: None` trust posture — the opposite of
+///   item 147's RPC-invoker default.
+///
+/// Calling `execute()` directly (bypassing `execute_sql_as`/`apply_rls`
+/// entirely) is what makes this "unrestricted": RLS predicate injection and
+/// column-grant checks both live one layer up, in `lib.rs`, and are simply
+/// never reached for a nested call — there is no bypass flag to get wrong.
+fn exec_trigger_stmt(plan: LogicalPlan, ctx: &mut ExecCtx) -> Result<ExecResult> {
+    let saved_user = ctx.current_user.take();
+    let saved_claims = std::mem::take(&mut ctx.auth_claims);
+    let saved_roles = std::mem::take(&mut ctx.auth_roles);
+    ctx.in_trigger = true;
+    let result = execute(plan, ctx);
+    ctx.current_user = saved_user;
+    ctx.auth_claims = saved_claims;
+    ctx.auth_roles = saved_roles;
+    ctx.in_trigger = false;
+    result
+}
+
+/// Fire every prepared trigger, in **name order** (item 149's locked
+/// deterministic multi-trigger firing rule — `prepare_triggers` already
+/// sorted `defs` by name before building `prepared`), against one row's
+/// `new_row`/`old_row` images. No-op when `prepared` is empty (the common
+/// case) or when already inside a trigger body (no cascading — checked
+/// again here, not just in `prepare_triggers`, so a caller that reuses a
+/// `Vec<PreparedTrigger>` across multiple nested contexts stays safe).
+/// **Errors veto**: any error — from binding, from parsing (should never
+/// happen post-`prepare_triggers`, but the plan is still cloned+rebound
+/// per row), or from the nested statement's own execution — propagates
+/// immediately, aborting the whole calling statement via the existing
+/// txn/abort machinery (nothing new).
+fn fire_prepared_triggers(
+    prepared: &[PreparedTrigger],
+    new_row: Option<&[Literal]>,
+    old_row: Option<&[Literal]>,
+    ctx: &mut ExecCtx,
+) -> Result<()> {
+    if ctx.in_trigger || prepared.is_empty() {
+        return Ok(());
+    }
+    for trig in prepared {
+        for (plan_template, refs) in &trig.body {
+            let mut params = Vec::with_capacity(refs.len());
+            for r in refs {
+                let row = if r.is_new { new_row } else { old_row };
+                let row = row.ok_or_else(|| {
+                    DbError::SqlPlan(format!(
+                        "trigger '{}': {} is not available for this firing",
+                        trig.name,
+                        if r.is_new { "NEW" } else { "OLD" }
+                    ))
+                })?;
+                params.push(row[r.col_idx].clone());
+            }
+            let mut plan = plan_template.clone();
+            crate::sql::logical::bind_params(&mut plan, &params)?;
+            exec_trigger_stmt(plan, ctx)?;
+        }
+    }
+    Ok(())
+}
+
 /// `CREATE INDEX ... ON table USING HNSW|IVF|FULLTEXT|BTREE (column)`: validate
 /// the column's type is compatible with the requested index kind, persist the
 /// catalog flag, then build a **durable** on-disk index synchronously from every
@@ -2114,13 +2500,22 @@ fn persist_pages_if_changed(
 /// locks has already run identically to a plain INSERT attempt, so no
 /// heap/index state is left dangling on that path (the violation is
 /// detected in `enforce_unique`, strictly before the heap write).
+#[allow(clippy::too_many_arguments)]
 fn try_insert_one_row(
     table_def: &TableDef,
     heap: &Heap,
     coerced: Vec<Literal>,
     ctx: &mut ExecCtx,
     insert_accum: &mut Option<crate::heap::InsertAccum>,
+    before_triggers: &[PreparedTrigger],
+    after_triggers: &[PreparedTrigger],
 ) -> Result<Vec<Literal>> {
+    // Item 149: BEFORE INSERT is the validation hook — fired first, before
+    // any RLS/UNIQUE/FK check, with NEW bound to the fully coerced/
+    // defaulted/NOT-NULL/CHECK-validated row. A trigger error vetoes the
+    // whole statement via the same error-propagation path every other
+    // per-row check already uses (no new abort machinery).
+    fire_prepared_triggers(before_triggers, Some(&coerced), None, ctx)?;
     // Item-24 Z1: INSERT policy check. If a `FOR INSERT` (or `FOR ALL`)
     // RLS policy exists, evaluate the predicate against the new row before
     // writing — any row that would violate the predicate is rejected.
@@ -2212,6 +2607,11 @@ fn try_insert_one_row(
     apply_durable_index_writes(table_def, row_id, &coerced, ctx)?;
     // C1 (item 29): INSERT has after-only; no pre-image.
     send_event_capture(table_def, "insert", None, Some(&coerced), ctx)?;
+    // Item 149: AFTER INSERT fires after the row (and its index/CDC
+    // writes) are durably in place — the post-image is final. Same-txn:
+    // an AFTER trigger's own write (e.g. an audit-table INSERT) commits
+    // atomically with this row, by construction (no outbox).
+    fire_prepared_triggers(after_triggers, Some(&coerced), None, ctx)?;
     Ok(coerced)
 }
 
@@ -2386,6 +2786,8 @@ fn apply_conflict_update(
     gates: &UpdateGates,
     index_batches: &mut [IndexColBatch],
     patch_batches: &mut [PatchColBatch],
+    before_triggers: &[PreparedTrigger],
+    after_triggers: &[PreparedTrigger],
     ctx: &mut ExecCtx,
 ) -> Result<Option<Vec<Literal>>> {
     exec_upsert_update_using(table_def, &before_row, ctx)?;
@@ -2408,6 +2810,9 @@ fn apply_conflict_update(
         }
     }
 
+    // Item 149, spec test 9: the DO UPDATE arm routes through the EXACT
+    // same `apply_single_row_update` a plain UPDATE naming this SET clause
+    // uses, so it fires UPDATE triggers for free — no separate firing path.
     let after = apply_single_row_update(
         table_def,
         heap,
@@ -2417,6 +2822,8 @@ fn apply_conflict_update(
         gates,
         index_batches,
         patch_batches,
+        before_triggers,
+        after_triggers,
         ctx,
     )?;
     Ok(Some(after))
@@ -2453,6 +2860,27 @@ fn exec_insert(
     };
     let mut oc_index_batches = init_index_batches(&table_def);
     let mut oc_patch_batches = init_patch_batches(&table_def);
+
+    // Item 149: prepare every INSERT trigger once per statement (never per
+    // row — the "zero cost for tables without triggers" fast path is this
+    // one `prepare_triggers` call returning an empty `Vec` after a single
+    // cheap catalog lookup). The DO UPDATE arm above needs UPDATE-timed
+    // triggers instead (it routes through `apply_single_row_update`, the
+    // same function a plain UPDATE's per-row loop uses).
+    let before_ins_triggers =
+        prepare_triggers(&table_def, TriggerTiming::Before, TriggerEvent::Insert, ctx)?;
+    let after_ins_triggers =
+        prepare_triggers(&table_def, TriggerTiming::After, TriggerEvent::Insert, ctx)?;
+    let before_upd_triggers: Vec<PreparedTrigger> = if oc_gates.is_some() {
+        prepare_triggers(&table_def, TriggerTiming::Before, TriggerEvent::Update, ctx)?
+    } else {
+        Vec::new()
+    };
+    let after_upd_triggers: Vec<PreparedTrigger> = if oc_gates.is_some() {
+        prepare_triggers(&table_def, TriggerTiming::After, TriggerEvent::Update, ctx)?
+    } else {
+        Vec::new()
+    };
 
     // Item 98: streaming-accumulation insert.
     //
@@ -2521,6 +2949,8 @@ fn exec_insert(
                                 gates,
                                 &mut oc_index_batches,
                                 &mut oc_patch_batches,
+                                &before_upd_triggers,
+                                &after_upd_triggers,
                                 ctx,
                             )? {
                                 if returning.is_some() {
@@ -2541,7 +2971,15 @@ fn exec_insert(
                 // No explicit target — grammar-valid only for DO NOTHING
                 // (parser-enforced): absorb ANY unique violation the plain
                 // insert attempt raises (spec step 3).
-                match try_insert_one_row(&table_def, &heap, coerced, ctx, &mut insert_accum) {
+                match try_insert_one_row(
+                    &table_def,
+                    &heap,
+                    coerced,
+                    ctx,
+                    &mut insert_accum,
+                    &before_ins_triggers,
+                    &after_ins_triggers,
+                ) {
                     Ok(row) => {
                         if returning.is_some() {
                             returned_rows.push(row);
@@ -2558,7 +2996,15 @@ fn exec_insert(
 
         // Plain insert: no ON CONFLICT, or an explicit target with no
         // conflict found on it.
-        let row = try_insert_one_row(&table_def, &heap, coerced, ctx, &mut insert_accum)?;
+        let row = try_insert_one_row(
+            &table_def,
+            &heap,
+            coerced,
+            ctx,
+            &mut insert_accum,
+            &before_ins_triggers,
+            &after_ins_triggers,
+        )?;
         if returning.is_some() {
             returned_rows.push(row);
         }
@@ -3717,6 +4163,8 @@ fn apply_single_row_update(
     gates: &UpdateGates,
     index_batches: &mut [IndexColBatch],
     patch_batches: &mut [PatchColBatch],
+    before_triggers: &[PreparedTrigger],
+    after_triggers: &[PreparedTrigger],
     ctx: &mut ExecCtx,
 ) -> Result<Vec<Literal>> {
     let &UpdateGates {
@@ -3738,6 +4186,11 @@ fn apply_single_row_update(
     enforce_checks(table_def, &coerced)?;
     // item-24 R-a: WITH CHECK — reject if new row violates the policy.
     exec_update_with_check(table_def, &coerced, ctx)?;
+    // Item 149: BEFORE UPDATE is the validation hook — NEW bound to the
+    // fully coerced/validated post-assignment row, OLD to the pre-
+    // assignment image. v1 non-goal: BEFORE cannot modify NEW (a trigger
+    // error still vetoes the whole statement).
+    fire_prepared_triggers(before_triggers, Some(&coerced), Some(&before_row), ctx)?;
     // UNIQUE + FK — acquire all phantom locks BEFORE taking a fresh
     // snapshot, then run uniqueness + FK checks with it (items 35/36/53).
     // RESTRICT on old PK also uses a fresh snapshot (after its lock).
@@ -3923,6 +4376,13 @@ fn apply_single_row_update(
     }
     // C1 (item 29): UPDATE carries both before (pre-mutation) and after (post-mutation).
     send_event_capture(table_def, "update", Some(&before_row), Some(&coerced), ctx)?;
+    // Item 149: AFTER UPDATE fires last, with the final post-image as NEW.
+    // The canonical "stamp pattern" (AFTER UPDATE ON t -> fn body `UPDATE t
+    // SET updated_at = ... WHERE pk = NEW.pk`) terminates here because the
+    // nested UPDATE this fires runs with `ctx.in_trigger = true`
+    // (`exec_trigger_stmt`) and therefore fires no triggers of its own —
+    // v1's entire recursion story (no cascading).
+    fire_prepared_triggers(after_triggers, Some(&coerced), Some(&before_row), ctx)?;
     Ok(coerced)
 }
 
@@ -3955,6 +4415,23 @@ fn exec_update(
         has_fk_refs_in_set,
         has_fk_children_ref_in_set,
     } = compute_update_gates(&table_def, assignments, ctx.catalog.get())?;
+
+    // Item 149: prepare every UPDATE trigger once per statement (never per
+    // row — same "zero cost without triggers" fast path as `exec_insert`).
+    // `has_update_triggers` additionally forces BOTH batch paths below
+    // (Item 74's HOT batch, Item 83's non-HOT batch) off — a table with
+    // any UPDATE trigger always takes the per-row loop at the bottom of
+    // this function, the one call site that can fire BEFORE/AFTER per row.
+    // This does NOT touch `hot_eligible`/`can_batch_non_hot` themselves —
+    // the per-row loop's own `apply_single_row_update` still uses the real
+    // gate to choose HOT vs non-HOT per row, so a triggered table keeps
+    // the HOT optimization row-by-row; it only loses the *batched*
+    // fast path, which is where the per-row trigger hook has to live.
+    let before_upd_triggers =
+        prepare_triggers(&table_def, TriggerTiming::Before, TriggerEvent::Update, ctx)?;
+    let after_upd_triggers =
+        prepare_triggers(&table_def, TriggerTiming::After, TriggerEvent::Update, ctx)?;
+    let has_update_triggers = !before_upd_triggers.is_empty() || !after_upd_triggers.is_empty();
 
     // Predicate closure for the parallel scan path (same pattern as exec_delete).
     // Evaluates just predicate-referenced columns; the full row body comes back
@@ -4044,7 +4521,9 @@ fn exec_update(
     //
     // Non-HOT rows (has_unique, fk, indexed col in SET) fall through to the
     // existing per-row loop below, which is correctness-critical for those cases.
-    if hot_eligible && !matching.is_empty() {
+    // Item 149: also skipped whenever the table has an UPDATE trigger — see
+    // `has_update_triggers`'s doc comment above.
+    if hot_eligible && !has_update_triggers && !matching.is_empty() {
         // Phase 1: collect SQL logic for all matched rows.
         // (before_row, after_row columns are Vec<Literal>; type alias avoids clippy::type_complexity)
         type HotRow = (RowId, Vec<u8>, Vec<Literal>, Vec<Literal>);
@@ -4132,7 +4611,13 @@ fn exec_update(
     // doc comment) — no UNIQUE indexes, no FK child-side refs in SET, no FK
     // parent-side children. CDC (events_enabled) is handled below via
     // send_event_capture() after update_many() returns, so no gate needed.
-    let can_batch_non_hot = !hot_eligible && !has_unique && !has_fk_refs_in_set && !has_fk_children;
+    // Item 149: also gated off by `has_update_triggers` — same reasoning as
+    // the HOT batch path above.
+    let can_batch_non_hot = !hot_eligible
+        && !has_unique
+        && !has_fk_refs_in_set
+        && !has_fk_children
+        && !has_update_triggers;
 
     if can_batch_non_hot && !matching.is_empty() {
         // Phase 1: decode / eval SET / encode for all matching rows.
@@ -4258,6 +4743,8 @@ fn exec_update(
             &gates,
             &mut index_batches,
             &mut patch_batches,
+            &before_upd_triggers,
+            &after_upd_triggers,
             ctx,
         )?;
         if returning.is_some() {
@@ -4294,6 +4781,18 @@ fn exec_delete(
     let heap = Heap::open(ctx.page_size, table_def.fsm_meta, table_def.pages.clone());
     let snapshot = ctx.txn_mgr.snapshot_for_statement(ctx.xid)?;
 
+    // Item 149: prepare every DELETE trigger once per statement (never per
+    // row — same "zero cost without triggers" fast path as
+    // `exec_insert`/`exec_update`). A table with any DELETE trigger needs
+    // OLD's row bytes for every deleted row, so `has_delete_triggers`
+    // forces both the truncate fast path (below) and the RowId-only fast
+    // path (item 75, below) off, same treatment as `events_enabled`.
+    let before_del_triggers =
+        prepare_triggers(&table_def, TriggerTiming::Before, TriggerEvent::Delete, ctx)?;
+    let after_del_triggers =
+        prepare_triggers(&table_def, TriggerTiming::After, TriggerEvent::Delete, ctx)?;
+    let has_delete_triggers = !before_del_triggers.is_empty() || !after_del_triggers.is_empty();
+
     // Item 48: fast path for unconditional DELETE with no FK children and no CDC.
     // Routes through the O(pages) truncate instead of xmax-stamping every row.
     // CDC is skipped intentionally — TRUNCATE has never emitted per-row events.
@@ -4302,6 +4801,7 @@ fn exec_delete(
         && predicate.is_none()
         && !table_has_fk_children(ctx.catalog.get(), table)
         && !table_def.events_enabled
+        && !has_delete_triggers
     {
         let count = heap.count_visible(&snapshot, ctx.xid, ctx.pool)?;
         let mut cctx = catalog_ctx!(ctx);
@@ -4313,7 +4813,8 @@ fn exec_delete(
     // phase can skip row bytes when they are not needed (item 75 fast path).
     // G5 (item 19): RETURNING also needs row bytes.
     let has_fk_children = table_has_fk_children(ctx.catalog.get(), table);
-    let needs_per_row_checks = has_fk_children || table_def.events_enabled || returning.is_some();
+    let needs_per_row_checks =
+        has_fk_children || table_def.events_enabled || returning.is_some() || has_delete_triggers;
 
     // Item 75: When there are no per-row side-effects (no FK children, no CDC)
     // we only need RowIds, not row-body bytes.  Separate fast and slow paths
@@ -4471,10 +4972,23 @@ fn exec_delete(
     // inside `delete_many`, which runs after the pre-checks.
     // G5 (item 19): also collect rows for RETURNING when requested.
     let mut returned_rows: Vec<Vec<Literal>> = Vec::new();
+    // Item 149: OLD images for the AFTER-DELETE firing pass below, kept
+    // only when an AFTER DELETE trigger actually exists (no allocation for
+    // the far more common no-trigger case).
+    let mut after_trigger_rows: Vec<Vec<Literal>> = Vec::new();
     let row_ids: Vec<RowId> = {
         let mut ids = Vec::with_capacity(matching.len());
         for (row_id, bytes) in &matching {
             let row = decode_row(bytes, &table_def.columns)?;
+            // Item 149: BEFORE DELETE is the validation hook — OLD bound to
+            // the row about to be deleted, fired before the FK RESTRICT
+            // check and before any heap mutation for the WHOLE statement
+            // (delete_many below is a single batched call over every
+            // matched row, so every BEFORE fires before ANY row is
+            // actually deleted — a documented, harmless v1 ordering detail:
+            // a trigger error still vetoes the whole statement exactly as
+            // any other pre-mutation error would).
+            fire_prepared_triggers(&before_del_triggers, None, Some(&row), ctx)?;
             if has_fk_children {
                 // Protocol (closes the parent-delete / child-insert race):
                 //   1. Acquire FkKey phantom lock on parent PK value BEFORE snapshot.
@@ -4493,8 +5007,14 @@ fn exec_delete(
             }
             // C1 (item 29): before-only; captured before heap mutation.
             send_event_capture(&table_def, "delete", Some(&row), None, ctx)?;
-            if returning.is_some() {
+            let need_after = !after_del_triggers.is_empty();
+            if returning.is_some() && need_after {
+                returned_rows.push(row.clone());
+                after_trigger_rows.push(row);
+            } else if returning.is_some() {
                 returned_rows.push(row);
+            } else if need_after {
+                after_trigger_rows.push(row);
             }
             ids.push(*row_id);
         }
@@ -4505,6 +5025,13 @@ fn exec_delete(
         Err(e @ DbError::WriteConflict { .. }) => return Err(classify_conflict(e, ctx)),
         other => other?,
     };
+    // Item 149: AFTER DELETE fires once every matched row is durably gone
+    // (post-image final — there is none, so OLD is the only image DELETE
+    // ever binds). Same transaction, same-txn WAL-logged writes, per the
+    // unified-commit thesis.
+    for row in &after_trigger_rows {
+        fire_prepared_triggers(&after_del_triggers, None, Some(row), ctx)?;
+    }
 
     // P1.d: SSI write tracking + item-88 batch undo — one XmaxStampBatch per page group.
     {
@@ -6843,6 +7370,7 @@ mod tests {
                 hnsw_tx: None,
                 in_explicit_txn: false,
                 near_lightweight_snaps: None,
+                in_trigger: false,
             };
             execute(plan, &mut ctx)
         }

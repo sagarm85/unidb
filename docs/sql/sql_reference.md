@@ -33,7 +33,8 @@ paths:
 [DROP TABLE](#drop-table) ·
 [TRUNCATE](#truncate) ·
 [ANALYZE](#analyze) ·
-[CREATE TYPE / CREATE DOMAIN](#create-type--create-domain)
+[CREATE TYPE / CREATE DOMAIN](#create-type--create-domain) ·
+[CREATE TRIGGER / DROP TRIGGER](#create-trigger--drop-trigger)
 
 **Data (DML)** ·
 [INSERT](#insert) ·
@@ -77,6 +78,7 @@ paths:
 | `CREATE INDEX … USING BTREE \| HNSW \| FULLTEXT` (+ `INCLUDE (cols)` on BTREE) | ✅ Supported | HNSW = vector; FULLTEXT = inverted index; `INCLUDE` = covering B-tree (item 102-B) |
 | `ALTER TABLE ADD/DROP COLUMN`, `DROP TABLE`, `TRUNCATE`, `ANALYZE`, `EXPLAIN` | ✅ Supported | |
 | `CREATE TYPE … AS ENUM`, `CREATE DOMAIN … [CHECK]`, `DROP TYPE`, `DROP DOMAIN` | ✅ Supported | item 148; desugars to base type + synthesized CHECK, zero new enforcement |
+| `CREATE TRIGGER … {BEFORE\|AFTER} {INSERT\|UPDATE\|DELETE} … EXECUTE FUNCTION`, `DROP TRIGGER` | ✅ Supported | item 149; same-txn row triggers over item-147 functions; no cascading (v1 divergence from Postgres); superuser-only DDL, unrestricted trigger-body identity |
 | `NEAR(col, vec, k)` vector search · `MATCH(col, 'terms')` full-text | ✅ Supported | engine extensions |
 | `MATCH (a)-[:TYPE]->(b) … RETURN` | ✅ Supported (read-only, Cypher subset) | via `execute_cypher`; edges written via the embedded `create_edge` API |
 | `CREATE USER/ROLE`, `GRANT/REVOKE`, `CREATE POLICY` (RLS, incl. `WITH CHECK`) | ✅ Supported | via `execute_sql_as` / REST auth |
@@ -240,6 +242,81 @@ INSERT INTO tickets (id, status, contact) VALUES (1, 'pending', 'alice@example.c
 > supported in v1 (the synthesized CHECK is fixed at `CREATE TABLE` time);
 > create a new type + column instead. Catalog DDL (like every other DDL
 > statement) is non-transactional.
+
+## CREATE TRIGGER / DROP TRIGGER
+
+Row triggers (item 149): a `BEFORE`/`AFTER` `INSERT`/`UPDATE`/`DELETE` hook
+that runs a registered zero-param [stored function](#insert) (item 147) once
+per affected row, **in the same transaction** as the row write — an `AFTER`
+trigger's own write (e.g. an audit row) commits atomically with the
+triggering row, no outbox, by construction.
+
+```sql
+CREATE TRIGGER <name> {BEFORE|AFTER} {INSERT|UPDATE|DELETE}
+  ON <table> [FOR EACH ROW] EXECUTE FUNCTION <fn_name>;
+DROP TRIGGER [IF EXISTS] <name> ON <table>;
+```
+
+`<fn_name>` must already be registered (`POST /functions` / `Engine::
+upsert_function`) with **zero** declared params. Inside the function body,
+`NEW.<col>`/`OLD.<col>` are bound per fired row like ordinary `$n` bind
+parameters: `INSERT` → `NEW` only, `UPDATE` → `NEW` + `OLD`, `DELETE` → `OLD`
+only — referencing an unavailable image, or an unknown column, is rejected
+at `CREATE TRIGGER` time.
+
+**Example — audit log (the canonical `AFTER` pattern)**
+```sql
+CREATE TABLE orders (id INT PRIMARY KEY, status TEXT);
+CREATE TABLE orders_audit (order_id INT, note TEXT);
+-- Registered separately via POST /functions (superuser-only):
+--   {"name": "log_order_insert", "params": [],
+--    "body": ["INSERT INTO orders_audit (order_id, note) VALUES (NEW.id, 'created')"]}
+CREATE TRIGGER orders_audit_trig AFTER INSERT ON orders
+  FOR EACH ROW EXECUTE FUNCTION log_order_insert;
+
+INSERT INTO orders VALUES (1, 'pending');
+-- orders_audit now has exactly one row: (1, 'created'), same transaction.
+```
+
+**Example — the `updated_at` stamp pattern (the documented `BEFORE` workaround)**
+
+v1 triggers **cannot modify `NEW`** (no function-returns-row mechanism), so
+"set a column on the row being written" is NOT a `BEFORE` trigger's job.
+Instead, use an `AFTER UPDATE` trigger whose body issues its own `UPDATE …
+WHERE pk = NEW.pk` — this **terminates** because nested statements fired
+from inside a trigger body fire **no triggers of their own** (v1's entire,
+deliberate recursion story — see the note below):
+
+```sql
+-- fn body: ["UPDATE orders SET touched = touched + 1 WHERE id = NEW.id"]
+CREATE TRIGGER stamp_trig AFTER UPDATE ON orders
+  FOR EACH ROW EXECUTE FUNCTION touch_stamp;
+```
+
+> **Locked v1 semantics (do not assume Postgres behavior here):**
+> - **Errors veto.** Any error inside a trigger body aborts the whole
+>   statement, exactly like any other statement error.
+> - **Name order.** Multiple triggers on the same `(table, timing, event)`
+>   fire in ascending name order — deterministic, not registration order.
+> - **No cascading — the opposite of PostgreSQL.** A statement executed from
+>   *within* a trigger body fires **zero** triggers of its own. This is the
+>   entire v1 recursion story: simple, safe, and it's what makes the stamp
+>   pattern above terminate instead of recursing forever.
+> - **`CREATE TRIGGER`/`DROP TRIGGER` are superuser-only DDL.** The trigger
+>   **body itself runs unrestricted, as the embedded/superuser identity**,
+>   regardless of which principal's statement fired it or the function's own
+>   `run_as` — the same trust posture as a scheduled cron job's default. This
+>   is deliberate: a caller with only `INSERT` on `orders` and no grant at
+>   all on `orders_audit` can still fire `orders_audit_trig` above and have
+>   it succeed (Postgres solves the identical problem with `SECURITY
+>   DEFINER`; here it's simply always on). An invoker-mode (caller-identity)
+>   option is a documented follow-up, not v1 scope.
+> - **`DROP TABLE`** drops that table's triggers too; **removing a stored
+>   function** (`DELETE /functions/{name}`) that a trigger still references
+>   is rejected until the trigger is dropped first.
+> - Non-goals (v1): `FOR EACH STATEMENT`, `WHEN (...)` conditions, `UPDATE
+>   OF (cols)`, `INSTEAD OF`, modifying `NEW` in `BEFORE`, and — as covered
+>   above — cascading/recursive triggers.
 
 ---
 

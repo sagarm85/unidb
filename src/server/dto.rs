@@ -117,6 +117,12 @@ pub fn exec_result_to_json(result: &ExecResult) -> Json {
         ExecResult::DroppedType => {
             obj.insert("type".into(), Json::String("dropped_type".into()));
         }
+        ExecResult::CreatedTrigger => {
+            obj.insert("type".into(), Json::String("created_trigger".into()));
+        }
+        ExecResult::DroppedTrigger => {
+            obj.insert("type".into(), Json::String("dropped_trigger".into()));
+        }
     }
     Json::Object(obj)
 }
