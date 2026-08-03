@@ -47,6 +47,7 @@ pub fn edges_table_def() -> TableDef {
                 dropped: false,
                 constraints: Default::default(),
                 include_cols: Vec::new(),
+                type_name: None,
             },
             ColumnDef {
                 name: "to_id".to_string(),
@@ -57,6 +58,7 @@ pub fn edges_table_def() -> TableDef {
                 dropped: false,
                 constraints: Default::default(),
                 include_cols: Vec::new(),
+                type_name: None,
             },
             ColumnDef {
                 name: "edge_type".to_string(),
@@ -67,6 +69,7 @@ pub fn edges_table_def() -> TableDef {
                 dropped: false,
                 constraints: Default::default(),
                 include_cols: Vec::new(),
+                type_name: None,
             },
             ColumnDef {
                 name: "props".to_string(),
@@ -77,6 +80,7 @@ pub fn edges_table_def() -> TableDef {
                 dropped: false,
                 constraints: Default::default(),
                 include_cols: Vec::new(),
+                type_name: None,
             },
         ],
         pages: Vec::new(),

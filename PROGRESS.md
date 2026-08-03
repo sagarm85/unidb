@@ -182,7 +182,8 @@ memory (see `CLAUDE.md` §6).
 | Report HTML renderer (auto `.html` sibling)   [SHIPPED]   2026-07-31 | 2026-07-31 | live |
 | Item 117 — HOT UPDATE on PK/UNIQUE tables when key unchanged   [SHIPPED]   2026-07-31 | 2026-07-31 | live |
 | Supabase-parity BaaS layer — items 120–133 + 135–146 (PRs #222–#249)   [SHIPPED]   2026-08-01 | 2026-08-01 | live |
-| Item 147 — Stored SQL functions v1 + RPC   [SHIPPED — branch, PR pending]   2026-08-03 | 2026-08-03 | live |
+| Item 147 — Stored SQL functions v1 + RPC   [SHIPPED — merged PR #253]   2026-08-03 | 2026-08-03 | live |
+| Item 148 — Enums + domains (named types v1)   [SHIPPED]   2026-08-03 | 2026-08-03 | live |
 
 ## Item 24 R-a + R-b — UPDATE WITH CHECK enforcement + bootstrap observability (2026-07-20)
 
@@ -1928,9 +1929,9 @@ looked up as username — item-138 note) · named-superuser `WITH CHECK` INSERT
 quirk (item-133 finding, possible pre-existing RLS-superuser inconsistency).
 **Locked-decision changes:** none.
 
-## Item 147 — Stored SQL functions v1 + RPC   [SHIPPED — on `feat/147-stored-functions-rpc`, PR pending]   2026-08-03
+## Item 147 — Stored SQL functions v1 + RPC   [SHIPPED — merged via PR #253]   2026-08-03
 
-**Branch:** `feat/147-stored-functions-rpc` (`b5c0156`) | **Type:** Improvement
+**PR:** #253 — https://github.com/sagarm85/unidb/pull/253 (merged, `4355ba9`) | **Type:** Improvement
 **Summary:** compute-cluster phase 1 (user go-ahead 2026-08-02 lifted the
 HELD). Control-plane `FunctionDef` in `AuthState` (serde-default, no
 FORMAT_VERSION bump; cron/webhook persistence pattern) with registration-time
@@ -1959,4 +1960,36 @@ Pre-existing behavior surfaced, not changed: a **named** superuser doesn't
 bypass per-row INSERT `WITH CHECK` (item-24 Z1 bypasses only the embedded
 `None` identity and `service_role`) — identical via `/sql` and RPC,
 documented in the test (first flagged in the item-133 session).
+**Locked-decision changes:** none.
+
+## Item 148 — Enums + domains (named types v1)   [SHIPPED — on `feat/148-enums-domains`, PR raised on push]   2026-08-03
+
+**Branch:** `feat/148-enums-domains` | **Type:** Improvement
+**Summary:** `CREATE TYPE <name> AS ENUM (…)` and `CREATE DOMAIN <name> AS
+<base> [CHECK (VALUE …)]` as catalog-registered named types
+(`docs/backlog/148_enums_domains.md`). Design: **desugar at `CREATE TABLE`/
+`ALTER TABLE ADD COLUMN` time** into base type + a synthesized CHECK through
+the existing constraint machinery — zero new enforcement code on the write
+path; catalog blob gains a serde-default `types` map and `ColumnDef` a
+serde-default `type_name` (no FORMAT_VERSION bump, no on-disk tuple change).
+Enum CHECK = OR-chain of equalities wrapped `col IS NULL OR (…)` (the
+executor's two-valued compare would otherwise reject NULL — caught by the
+required NULL test); domain CHECK = whole-word `VALUE`→column substitution
+re-parsed through sqlparser; `DROP TYPE/DOMAIN` rejected while referenced
+with a deterministic table.column error. sqlparser 0.62.0 AST route
+(CreateType/CreateDomain/DropDomain are dialect-unconditional — no pre-parse
+hack). Implemented by a Sonnet subagent; orchestrator re-verified all gates.
+
+**Benchmarks:** none — plan-time desugar over existing CHECK enforcement;
+no new per-row work beyond what an equivalent hand-written CHECK already
+costs (§6 posture as items 120–147).
+**Verification (orchestrator-rerun, incl. post-merge with item 147):**
+clippy `--all-features --all-targets -D warnings` · fmt · plain `cargo test
+--no-run` · item148 **16/16** · item147 **8/8** (post-merge) · constraints
+**30/30** · item24_rls_with_check **8/8** · **crash harness 54/54**.
+**Known limitations (documented v1 non-goals):** enums stored as TEXT
+(text-collation ordering, not declaration order); no `ALTER TYPE … ADD
+VALUE`; no composite/custom record types (row-encoding decision, own spec);
+`DROP TYPE`/`DROP DOMAIN` interchangeable (shared namespace);
+`information_schema`/REST/GraphQL type surfacing = follow-ups.
 **Locked-decision changes:** none.

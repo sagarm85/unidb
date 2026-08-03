@@ -12,17 +12,17 @@
 > Ledger entry: `PROGRESS.md` "Supabase-parity BaaS layer — items 120–133 +
 > free-parity continuation 135–146".
 >
-> **Last verified:** 2026-08-03, on branch `feat/147-stored-functions-rpc`
-> (item 147 shipping in this PR; previous stamp 2026-08-02 against `main`
-> `a3cd132`, PRs #222–#252 merged). Feature list source: the
+> **Last verified:** 2026-08-03, on branch `feat/148-enums-domains` (item
+> 148 shipping in this PR; item 147 merged via PR #253; previous stamps
+> 2026-08-02/03). Feature list source: the
 > supabase.com/features catalog as of early 2026 (page not re-fetchable from
 > every environment — re-check it when updating).
 
-**Summary:** ~40 catalog features → **20 done · 8 partial · 4 achieved
-differently · 17 not done** (the compute-cluster HELD was lifted 2026-08-02:
-stored functions v1 + RPC shipped as item 147; triggers/upsert/auth-hooks
-are next-phase items; the remaining ❌ bulk is the deliberate
-paid-third-party exclusions).
+**Summary:** ~40 catalog features → **20 done · 9 partial · 4 achieved
+differently · 16 not done** (compute-cluster HELD lifted 2026-08-02: stored
+functions v1 + RPC shipped as item 147, enums + domains as item 148;
+triggers/upsert/auth-hooks are next-phase items; the remaining ❌ bulk is
+the deliberate paid-third-party exclusions).
 
 Legend: ✅ done · 🟡 partial · 🔁 done differently · ❌ not done
 (HELD = awaiting explicit user/design go-ahead; Excluded = deliberate
@@ -67,6 +67,7 @@ non-goal, see the exclusions list in `docs/backlog/137_…`).
 | Dashboard (Studio) | `unidb-studio` exists as a separate repo; panels for the newest surfaces (webhooks, cron, admin API, dev-inbox) pending |
 | Client libraries | JS/TS done ([`unidb-js`](https://github.com/sagarm85/unidb-js), supabase-js-shaped) + Rust (`unidb-attach`); Python/Dart/Swift/Kotlin open |
 | Database functions / stored procedures | SQL-body v1 done (item 147): superuser-registered control-plane functions (`/functions`), callable via RPC with atomic multi-statement execution — but no SQL-callable `SELECT fn()`, no plpgsql-analog, not usable by triggers yet (those are the next-phase items) |
+| Enums / domains / custom types | Enums + domains done (item 148): `CREATE TYPE … AS ENUM` / `CREATE DOMAIN … [CHECK (VALUE …)]` as catalog named types desugaring to the existing CHECK machinery (NULL-correct, drop-protected while referenced); v1 stores enums as TEXT (text-collation ordering, no `ALTER TYPE ADD VALUE`); composite/custom record types still deferred |
 
 ## Table 3 — 🔁 Achieved in a different way
 
@@ -92,7 +93,7 @@ non-goal, see the exclusions list in `docs/backlog/137_…`).
 | Anonymous sign-in | Open, unstarted |
 | Identity linking | Open, unstarted |
 | Views / materialized views | Open, unstarted |
-| Enums / domains / custom types | IN PROGRESS — item 148 (`feat/148-enums-domains`): enums + domains as catalog named types desugaring to the existing CHECK machinery; composite/custom types stay deferred (row-encoding decision) |
+| Composite / custom record types | Deferred — a row-encoding format decision needing its own spec; enums + domains shipped separately (item 148, see Partial table) |
 | Phone/SMS login + voice OTP | Excluded by decision — needs a paid SMS gateway |
 | Automatic embeddings | Excluded — needs an embedding model/API; composable via webhooks + an operator-run worker |
 | Edge Functions (Deno) | Locked non-goal (I7); partially substituted by cron + webhooks + future RPC |

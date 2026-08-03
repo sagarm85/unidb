@@ -3113,10 +3113,13 @@ by `server/error.rs`'s `ApiError` directly, not by a `DbError` variant.
 |---|---|---|
 | 404 | `TABLE_NOT_FOUND` | Referenced table doesn't exist |
 | 404 | `COLUMN_NOT_FOUND` | Referenced column doesn't exist |
+| 404 | `UNKNOWN_TYPE` | `CREATE TABLE`/`DROP TYPE`/`DROP DOMAIN` referenced an undeclared named type (item 148) |
 | 404 | `NOT_FOUND` | Row has no MVCC-visible version (deleted/never existed) |
 | 404 | `TXN_NOT_FOUND` | Unknown/finished/reaped transaction session id (R1) |
 | 404 | `CURSOR_NOT_FOUND` | Unknown/exhausted/expired cursor id (R4) |
 | 409 | `TABLE_ALREADY_EXISTS` | `CREATE TABLE` on an existing name |
+| 409 | `TYPE_ALREADY_EXISTS` | `CREATE TYPE`/`CREATE DOMAIN` on an existing name (item 148; enums + domains share one namespace) |
+| 409 | `TYPE_IN_USE` | `DROP TYPE`/`DROP DOMAIN` while a table column still references it (item 148) |
 | 409 | `WRITE_CONFLICT` | Concurrent write conflict (lock manager) |
 | 409 | `SERIALIZATION_FAILURE` | Snapshot-isolation / SSI abort-on-conflict |
 | 409 | `DEADLOCK` | Wait-for-graph deadlock victim (P5.d) |
@@ -3132,6 +3135,7 @@ by `server/error.rs`'s `ApiError` directly, not by a `DbError` variant.
 | 400 | `NOT_NULL_VIOLATION` | Write left a `NOT NULL`/PK column NULL (M11) |
 | 400 | `CHECK_VIOLATION` | Write failed a `CHECK` constraint (M11) |
 | 400 | `FOREIGN_KEY_VIOLATION` | `FOREIGN KEY` references a table that doesn't exist (M11) |
+| 400 | `INVALID_NAMED_TYPE` | Malformed `CREATE TYPE`/`CREATE DOMAIN` definition — bad name, shadowed builtin, empty/duplicate enum labels, bad domain base type (item 148) |
 | 400 | `TXN_NOT_ACTIVE` | Operation on a transaction that isn't active |
 | 400 | `TXN_ALREADY_FINISHED` | Operation on an already committed/aborted txn |
 | 400 | `BAD_PAGE_SIZE` | Invalid page size at open |

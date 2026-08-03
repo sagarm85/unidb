@@ -27,7 +27,10 @@ use serde_json::Value as JsonValue;
 use crate::{
     btree_index::{DiskBTree, OrderedValue, RangeOp},
     bufferpool::{BufferPool, PageReader},
-    catalog::{Catalog, CatalogCtx, ColumnDef, ColumnType, IndexKind, TableConstraints, TableDef},
+    catalog::{
+        Catalog, CatalogCtx, ColumnDef, ColumnType, IndexKind, NamedTypeDef, NamedTypeKind,
+        TableConstraints, TableDef,
+    },
     control::ControlData,
     error::{DbError, Result},
     format::{PageId, Xid},
@@ -1413,6 +1416,10 @@ pub enum ExecResult {
     Truncated {
         count: usize,
     },
+    /// `CREATE TYPE ... AS ENUM` / `CREATE DOMAIN` succeeded (item 148).
+    CreatedType,
+    /// `DROP TYPE` / `DROP DOMAIN` succeeded (item 148).
+    DroppedType,
 }
 
 /// Build a `CatalogCtx` from `ExecCtx`'s individual fields (not from `&mut
@@ -1487,6 +1494,10 @@ pub fn execute(plan: LogicalPlan, ctx: &mut ExecCtx) -> Result<ExecResult> {
             left,
             right,
         } => crate::sql::query_exec::exec_set_op(op, all, &left, &right, ctx),
+        LogicalPlan::CreateNamedType { def } => exec_create_named_type(def, ctx),
+        LogicalPlan::DropNamedType { name, if_exists } => {
+            exec_drop_named_type(&name, if_exists, ctx)
+        }
     }
 }
 
@@ -1501,8 +1512,20 @@ fn reject_system_table(table: &str) -> Result<()> {
     Ok(())
 }
 
-fn exec_alter_add_column(table: &str, column: ColumnDef, ctx: &mut ExecCtx) -> Result<ExecResult> {
+fn exec_alter_add_column(
+    table: &str,
+    mut column: ColumnDef,
+    ctx: &mut ExecCtx,
+) -> Result<ExecResult> {
     reject_system_table(table)?;
+    // Item 148: `ADD COLUMN` can also declare a named type — resolve it the
+    // same way `CREATE TABLE` does (not in the item-148 spec's required
+    // tests, but leaving it unresolved would silently persist a `type_name`
+    // marker with no enforcement behind it, which is worse than not
+    // supporting the syntax at all).
+    if let Some(raw_name) = column.type_name.clone() {
+        resolve_named_type_column(&mut column, &raw_name, ctx.catalog.get())?;
+    }
     let mut cctx = catalog_ctx!(ctx);
     ctx.catalog
         .exclusive()?
@@ -1582,11 +1605,25 @@ fn exec_truncate(table: &str, ctx: &mut ExecCtx) -> Result<ExecResult> {
 
 fn exec_create_table(
     name: String,
-    columns: Vec<ColumnDef>,
+    mut columns: Vec<ColumnDef>,
     constraints: TableConstraints,
     fill_factor: u8,
     ctx: &mut ExecCtx,
 ) -> Result<ExecResult> {
+    // Item 148: resolve any named-type column first, before any per-column
+    // logic below inspects `col.ty`. The parser has no catalog access, so a
+    // bare identifier type it can't map to a built-in (VECTOR/SERIAL are
+    // handled directly in the parser) is left as `type_name: Some(raw)` with
+    // a placeholder `ty` — here is the one and only place that gets resolved
+    // against `Catalog.types`, using the base type + synthesized CHECK. The
+    // resolved `type_name` then persists unchanged, purely for introspection
+    // (e.g. `DROP TYPE`'s in-use scan) — it is never re-resolved.
+    for col in &mut columns {
+        if let Some(raw_name) = col.type_name.clone() {
+            resolve_named_type_column(col, &raw_name, ctx.catalog.get())?;
+        }
+    }
+
     // Identity/SERIAL columns (P2.d) must be Int64, and start their counter
     // at 1. Validate + seed here so `create_table` stays a pure catalog op.
     let mut serial_next = std::collections::HashMap::new();
@@ -1662,6 +1699,121 @@ fn exec_create_table(
     }
 
     Ok(ExecResult::CreatedTable)
+}
+
+/// Item 148: resolve one column's named type against the catalog, mutating
+/// `col.ty` to the type's base `ColumnType` and folding the synthesized CHECK
+/// into `col.constraints.check` (ANDed with any explicit column CHECK the
+/// user also wrote alongside the named type, e.g. `status order_status CHECK
+/// (status <> 'archived')`). Returns [`DbError::UnknownType`] if `raw_name`
+/// isn't a registered enum or domain.
+fn resolve_named_type_column(col: &mut ColumnDef, raw_name: &str, catalog: &Catalog) -> Result<()> {
+    let def = catalog.lookup_named_type(raw_name).ok_or_else(|| {
+        DbError::UnknownType(format!(
+            "unknown type '{raw_name}' for column '{}' (if this is meant to be a named type, \
+             create it first with CREATE TYPE ... AS ENUM or CREATE DOMAIN)",
+            col.name
+        ))
+    })?;
+    let raw_check: Option<Expr> = match &def.kind {
+        NamedTypeKind::Enum { labels } => {
+            col.ty = ColumnType::Text;
+            Some(build_enum_membership_expr(&col.name, labels))
+        }
+        NamedTypeKind::Domain { base, check } => {
+            col.ty = *base;
+            match check {
+                Some(raw) => Some(crate::sql::parser::resolve_domain_check(raw, &col.name)?),
+                None => None,
+            }
+        }
+    };
+    if let Some(check_expr) = raw_check {
+        // NULL must pass a CHECK (SQL semantics) — this engine's comparison
+        // evaluator is documented two-valued, not three-valued (see
+        // `enforce_checks`'s doc comment: "a comparison with a NULL operand
+        // evaluates to a non-true result and so fails the check"), so a bare
+        // `status = 'a' OR status = 'b'` would incorrectly reject NULL on a
+        // nullable enum/domain column. Guard explicitly rather than relying
+        // on NULL propagation the evaluator doesn't do.
+        let guarded = Expr::Or(
+            Box::new(Expr::IsNull {
+                expr: Box::new(Expr::Column(col.name.clone())),
+                negated: false,
+            }),
+            Box::new(check_expr),
+        );
+        col.constraints.check = Some(match col.constraints.check.take() {
+            Some(existing) => Expr::And(Box::new(existing), Box::new(guarded)),
+            None => guarded,
+        });
+    }
+    Ok(())
+}
+
+/// Build `col = label[0] OR col = label[1] OR ...` for an enum's synthesized
+/// CHECK (item 148) — semantically `col IN (label[0], label[1], ...)`, built
+/// from `Or`/`BinOp` because this engine's `Expr` has no `IN` variant.
+fn build_enum_membership_expr(col: &str, labels: &[String]) -> Expr {
+    let mut iter = labels.iter().rev();
+    let last = iter
+        .next()
+        .expect("enum labels are non-empty (validated at CREATE TYPE time)");
+    let mut chain = enum_eq_expr(col, last);
+    for label in iter {
+        chain = Expr::Or(Box::new(enum_eq_expr(col, label)), Box::new(chain));
+    }
+    chain
+}
+
+fn enum_eq_expr(col: &str, label: &str) -> Expr {
+    Expr::BinOp {
+        op: CmpOp::Eq,
+        lhs: Box::new(Expr::Column(col.to_string())),
+        rhs: Box::new(Expr::Literal(Literal::Text(label.to_string()))),
+    }
+}
+
+/// `CREATE TYPE name AS ENUM (...)` / `CREATE DOMAIN name AS base [CHECK
+/// (...)]` (item 148): validate the definition, then persist it. Name-rule
+/// and built-in-shadow validation already happened at parse time
+/// ([`crate::catalog::validate_named_type_name`]); enum-label non-emptiness
+/// and uniqueness is checked here (the parser only builds the `Vec<String>`
+/// from the AST — it has no reason to reject a bad list before the executor
+/// gets a chance to, so this is the one and only place that validates it).
+fn exec_create_named_type(def: NamedTypeDef, ctx: &mut ExecCtx) -> Result<ExecResult> {
+    if let NamedTypeKind::Enum { labels } = &def.kind {
+        if labels.is_empty() {
+            return Err(DbError::InvalidNamedType(format!(
+                "enum type '{}' must have at least one label",
+                def.name
+            )));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for label in labels {
+            if !seen.insert(label) {
+                return Err(DbError::InvalidNamedType(format!(
+                    "enum type '{}' has duplicate label '{label}'",
+                    def.name
+                )));
+            }
+        }
+    }
+    let mut cctx = catalog_ctx!(ctx);
+    ctx.catalog.exclusive()?.create_named_type(def, &mut cctx)?;
+    Ok(ExecResult::CreatedType)
+}
+
+/// `DROP TYPE [IF EXISTS] name` / `DROP DOMAIN [IF EXISTS] name` (item 148).
+/// Mirrors `exec_drop_table`'s `IF EXISTS` posture exactly: an absent name is
+/// an error unless `if_exists`, in which case it is a no-op success.
+fn exec_drop_named_type(name: &str, if_exists: bool, ctx: &mut ExecCtx) -> Result<ExecResult> {
+    let mut cctx = catalog_ctx!(ctx);
+    match ctx.catalog.exclusive()?.drop_named_type(name, &mut cctx) {
+        Ok(()) => Ok(ExecResult::DroppedType),
+        Err(DbError::UnknownType(_)) if if_exists => Ok(ExecResult::DroppedType),
+        Err(e) => Err(e),
+    }
 }
 
 /// `CREATE INDEX ... ON table USING HNSW|IVF|FULLTEXT|BTREE (column)`: validate
@@ -6544,6 +6696,7 @@ mod tests {
                 dropped: false,
                 constraints: Default::default(),
                 include_cols: Vec::new(),
+                type_name: None,
                 ty: ColumnType::Int64,
             },
             ColumnDef {
@@ -6554,6 +6707,7 @@ mod tests {
                 dropped: false,
                 constraints: Default::default(),
                 include_cols: Vec::new(),
+                type_name: None,
                 ty: ColumnType::Text,
             },
             ColumnDef {
@@ -6564,6 +6718,7 @@ mod tests {
                 dropped: false,
                 constraints: Default::default(),
                 include_cols: Vec::new(),
+                type_name: None,
                 ty: ColumnType::Bool,
             },
             ColumnDef {
@@ -6574,6 +6729,7 @@ mod tests {
                 dropped: false,
                 constraints: Default::default(),
                 include_cols: Vec::new(),
+                type_name: None,
                 ty: ColumnType::Json,
             },
         ];
@@ -6598,6 +6754,7 @@ mod tests {
             dropped: false,
             constraints: Default::default(),
             include_cols: Vec::new(),
+            type_name: None,
             ty: ColumnType::Int64,
         }];
         let encoded = encode_row(&[Literal::Null]);
@@ -6615,6 +6772,7 @@ mod tests {
             dropped: false,
             constraints: Default::default(),
             include_cols: Vec::new(),
+            type_name: None,
             ty: ColumnType::Vector(4),
         }];
         let values = vec![Literal::Vector(vec![0.1, -0.2, 0.3, 0.4])];
@@ -6633,6 +6791,7 @@ mod tests {
             dropped: false,
             constraints: Default::default(),
             include_cols: Vec::new(),
+            type_name: None,
             ty: ColumnType::Vector(4),
         }];
         // Encode a 3-dimension vector but declare the column as 4.
@@ -6653,6 +6812,7 @@ mod tests {
                 dropped: false,
                 constraints: Default::default(),
                 include_cols: Vec::new(),
+                type_name: None,
                 ty: ColumnType::Vector(4),
             }],
             pages: vec![],
@@ -6685,6 +6845,7 @@ mod tests {
             dropped: false,
             constraints: Default::default(),
             include_cols: Vec::new(),
+            type_name: None,
             ty,
         }
     }

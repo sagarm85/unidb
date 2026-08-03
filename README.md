@@ -310,6 +310,7 @@ UNIDB_DATA_DIR=/var/lib/unidb cargo run --bin unidb-migrate -- migrations
 - Window functions (ROW_NUMBER/RANK/DENSE_RANK/LAG/LEAD/SUM/AVG/COUNT/MIN/MAX OVER) and set operations (UNION/INTERSECT/EXCEPT)
 - Column types: INT, BIGINT, FLOAT, TEXT, BOOL, DECIMAL, TIMESTAMP, DATE, UUID, BYTEA, JSON, VECTOR(n)
 - Constraints: PRIMARY KEY, FOREIGN KEY, UNIQUE, NOT NULL, CHECK, DEFAULT, SERIAL
+- Named types: `CREATE TYPE … AS ENUM`, `CREATE DOMAIN … [CHECK]` — desugar to a base column type + synthesized CHECK at `CREATE TABLE` time, zero new enforcement code
 - B-tree secondary indexes (durable, crash-recovered, no rebuild on open); covering indexes via `CREATE INDEX … INCLUDE (cols)`; index-only scans
 - Cost-based optimizer with ANALYZE statistics and EXPLAIN / EXPLAIN ANALYZE; LRU plan cache
 - Joins: hash join (with grace spill-to-disk), sort-merge, index-nested-loop; INNER/LEFT/RIGHT/FULL OUTER/NATURAL, `ON` and `USING`

@@ -243,6 +243,7 @@ mod tests {
             dropped: false,
             constraints: Default::default(),
             include_cols: Vec::new(),
+            type_name: None,
         }
     }
 

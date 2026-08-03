@@ -1,8 +1,9 @@
 # 147 — Stored SQL functions (v1) + RPC (`POST /rest/v1/rpc/<fn>`)
 
 **Type:** Improvement
-**Status:** IN PROGRESS (user go-ahead 2026-08-02 — the compute-cluster HELD
-status is lifted; this item is the cluster's foundation)
+**Status:** SHIPPED (2026-08-03, PR #253 merged — see PROGRESS.md "Item 147 —
+Stored SQL functions v1 + RPC"; the compute-cluster HELD was lifted by user
+go-ahead 2026-08-02, and this item was the cluster's foundation)
 
 > Supabase-parity Wave-2 compute cluster, phase 1 of N. This item ships
 > **stored SQL functions as a control-plane object + the RPC route** — the

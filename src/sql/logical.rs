@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::catalog::{Catalog, ColumnDef, IndexKind, TableConstraints};
+use crate::catalog::{Catalog, ColumnDef, IndexKind, NamedTypeDef, TableConstraints};
 use crate::error::{DbError, Result};
 use crate::sql::query::QuerySpec;
 
@@ -105,7 +105,9 @@ pub fn bind_params(plan: &mut LogicalPlan, params: &[Literal]) -> Result<()> {
         | LogicalPlan::AlterTableDropColumn { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::Truncate { .. }
-        | LogicalPlan::Analyze { .. } => {}
+        | LogicalPlan::Analyze { .. }
+        | LogicalPlan::CreateNamedType { .. }
+        | LogicalPlan::DropNamedType { .. } => {}
     }
     Ok(())
 }
@@ -447,6 +449,18 @@ pub enum LogicalPlan {
         /// Right branch — same flexibility as `left`.
         right: Box<LogicalPlan>,
     },
+    /// `CREATE TYPE name AS ENUM (...)` / `CREATE DOMAIN name AS base [CHECK
+    /// (...)]` (item 148). One variant covers both — `def.kind` distinguishes
+    /// Enum vs Domain. Name-rule and built-in-shadow validation already
+    /// happened at parse time; label/base-type validity is checked by the
+    /// executor before persisting.
+    CreateNamedType { def: NamedTypeDef },
+    /// `DROP TYPE [IF EXISTS] name` / `DROP DOMAIN [IF EXISTS] name` (item
+    /// 148). Both keywords resolve to this same variant — enums and domains
+    /// share one namespace, so either drops whichever kind `name` actually
+    /// is; there is no PostgreSQL-style "DROP TYPE can't drop a domain"
+    /// restriction in this engine (a deliberate v1 simplification).
+    DropNamedType { name: String, if_exists: bool },
 }
 
 /// Set-operation kind for [`LogicalPlan::SetOp`] (G3, item 19).
@@ -809,7 +823,9 @@ pub fn apply_rls_skip_current_user(plan: LogicalPlan, catalog: &Catalog) -> Logi
         | LogicalPlan::AlterTableDropColumn { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::Truncate { .. }
-        | LogicalPlan::Analyze { .. }) => other,
+        | LogicalPlan::Analyze { .. }
+        | LogicalPlan::CreateNamedType { .. }
+        | LogicalPlan::DropNamedType { .. }) => other,
     }
 }
 
@@ -1006,7 +1022,9 @@ pub fn apply_rls_with_auth(
         | LogicalPlan::AlterTableDropColumn { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::Truncate { .. }
-        | LogicalPlan::Analyze { .. }) => other,
+        | LogicalPlan::Analyze { .. }
+        | LogicalPlan::CreateNamedType { .. }
+        | LogicalPlan::DropNamedType { .. }) => other,
     }
 }
 
@@ -1225,6 +1243,7 @@ mod tests {
                 ty: ColumnType::Int64,
                 constraints: Default::default(),
                 include_cols: Vec::new(),
+                type_name: None,
             }],
             pages: vec![],
             fsm_meta: None,

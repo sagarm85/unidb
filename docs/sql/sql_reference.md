@@ -32,7 +32,8 @@ paths:
 [ALTER TABLE](#alter-table) ·
 [DROP TABLE](#drop-table) ·
 [TRUNCATE](#truncate) ·
-[ANALYZE](#analyze)
+[ANALYZE](#analyze) ·
+[CREATE TYPE / CREATE DOMAIN](#create-type--create-domain)
 
 **Data (DML)** ·
 [INSERT](#insert) ·
@@ -74,6 +75,7 @@ paths:
 | `CREATE TABLE` (`PRIMARY KEY`, `UNIQUE`, `REFERENCES`, `VECTOR(n)`) | ✅ Supported | practical column-constraint subset |
 | `CREATE INDEX … USING BTREE \| HNSW \| FULLTEXT` (+ `INCLUDE (cols)` on BTREE) | ✅ Supported | HNSW = vector; FULLTEXT = inverted index; `INCLUDE` = covering B-tree (item 102-B) |
 | `ALTER TABLE ADD/DROP COLUMN`, `DROP TABLE`, `TRUNCATE`, `ANALYZE`, `EXPLAIN` | ✅ Supported | |
+| `CREATE TYPE … AS ENUM`, `CREATE DOMAIN … [CHECK]`, `DROP TYPE`, `DROP DOMAIN` | ✅ Supported | item 148; desugars to base type + synthesized CHECK, zero new enforcement |
 | `NEAR(col, vec, k)` vector search · `MATCH(col, 'terms')` full-text | ✅ Supported | engine extensions |
 | `MATCH (a)-[:TYPE]->(b) … RETURN` | ✅ Supported (read-only, Cypher subset) | via `execute_cypher`; edges written via the embedded `create_edge` API |
 | `CREATE USER/ROLE`, `GRANT/REVOKE`, `CREATE POLICY` (RLS, incl. `WITH CHECK`) | ✅ Supported | via `execute_sql_as` / REST auth |
@@ -192,6 +194,51 @@ Run it after a large load or churn.
 ```sql
 ANALYZE <table>;
 ```
+
+## CREATE TYPE / CREATE DOMAIN
+
+Named types (item 148): a catalog-registered enum or domain that a `CREATE
+TABLE` column list resolves by name. Both are **pure desugars, resolved once
+at `CREATE TABLE` time** — an enum column becomes `TEXT` plus a synthesized
+`CHECK (<col> IN (...))`; a domain column becomes its base type plus the
+domain's own `CHECK` (with `VALUE` substituted for the concrete column name).
+There is zero new enforcement code: the existing CHECK machinery does all the
+work, so a named-type column composes with everything a `CHECK`ed column
+already does (indexes, `WHERE`, RLS, NULL handling — NULL passes the
+synthesized CHECK, matching standard SQL `CHECK` semantics).
+
+```sql
+CREATE TYPE <name> AS ENUM ('<label>' [, ...]);
+CREATE DOMAIN <name> AS <base-type> [CHECK (<expr using VALUE>)];
+DROP TYPE   [IF EXISTS] <name>;
+DROP DOMAIN [IF EXISTS] <name>;
+```
+
+**Example**
+```sql
+CREATE TYPE order_status AS ENUM ('pending', 'paid', 'shipped');
+CREATE DOMAIN email AS TEXT CHECK (VALUE LIKE '%@%');
+
+CREATE TABLE tickets (
+  id      INT PRIMARY KEY,
+  status  order_status,
+  contact email
+);
+
+INSERT INTO tickets (id, status, contact) VALUES (1, 'pending', 'alice@example.com');
+-- INSERT INTO tickets (id, status, contact) VALUES (2, 'bogus', 'x')  -- rejected: CHECK violation
+```
+
+> Enums and domains share **one namespace** (a name can't be both) and may
+> not shadow a built-in type name. `DROP TYPE`/`DROP DOMAIN` is rejected with
+> a clear error naming the referencing `table.column` while any column still
+> uses the type; drop or retype the column first. Enum comparison/ordering is
+> **TEXT collation**, not declaration order (a documented divergence from
+> PostgreSQL, which orders by declaration — the compact-ordinal encoding that
+> would preserve it is a v1 non-goal). `ALTER TYPE ... ADD VALUE` is not
+> supported in v1 (the synthesized CHECK is fixed at `CREATE TABLE` time);
+> create a new type + column instead. Catalog DDL (like every other DDL
+> statement) is non-transactional.
 
 ---
 

@@ -22,6 +22,11 @@ fn main() {
         "CREATE INDEX idx_emb ON docs USING HNSW (embedding)",
         "ALTER TABLE customers ADD COLUMN tier INT DEFAULT 1",
         "ANALYZE customers",
+        // Item 148: named types (enum + domain).
+        "CREATE TYPE order_status AS ENUM ('pending', 'paid', 'shipped')",
+        "CREATE DOMAIN email AS TEXT CHECK (VALUE LIKE '%@%')",
+        "CREATE TABLE tickets (id INT PRIMARY KEY, status order_status, contact email)",
+        "INSERT INTO tickets (id, status, contact) VALUES (1, 'pending', 'alice@example.com')",
         // DML
         "INSERT INTO customers (id, name, active) VALUES (1, 'alice', true)",
         "INSERT INTO customers (id, name, active) VALUES (2, 'bob', false)",

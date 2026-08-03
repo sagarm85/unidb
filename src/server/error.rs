@@ -200,11 +200,21 @@ pub(crate) fn map_status(err: &DbError) -> (StatusCode, &'static str) {
         DbError::TableNotFound(_) => (StatusCode::NOT_FOUND, "TABLE_NOT_FOUND"),
         DbError::ColumnNotFound { .. } => (StatusCode::NOT_FOUND, "COLUMN_NOT_FOUND"),
         DbError::NoVisibleVersion { .. } => (StatusCode::NOT_FOUND, "NOT_FOUND"),
+        // Item 148: named types (CREATE TYPE/CREATE DOMAIN) mirror the
+        // TableNotFound/TableAlreadyExists status mapping exactly.
+        DbError::UnknownType(_) => (StatusCode::NOT_FOUND, "UNKNOWN_TYPE"),
 
         DbError::TableAlreadyExists(_) => (StatusCode::CONFLICT, "TABLE_ALREADY_EXISTS"),
+        DbError::TypeAlreadyExists(_) => (StatusCode::CONFLICT, "TYPE_ALREADY_EXISTS"),
+        DbError::TypeInUse { .. } => (StatusCode::CONFLICT, "TYPE_IN_USE"),
         DbError::WriteConflict { .. } => (StatusCode::CONFLICT, "WRITE_CONFLICT"),
         DbError::SerializationFailure { .. } => (StatusCode::CONFLICT, "SERIALIZATION_FAILURE"),
         DbError::Deadlock { .. } => (StatusCode::CONFLICT, "DEADLOCK"),
+
+        // A malformed named-type definition (bad name, shadowed builtin,
+        // empty/duplicate enum labels, bad domain base type) is a client
+        // request error, same class as SqlPlan/SqlUnsupported above.
+        DbError::InvalidNamedType(_) => (StatusCode::BAD_REQUEST, "INVALID_NAMED_TYPE"),
 
         // Resource control (P5.f): the query hit its time budget or was
         // cancelled — both are request-scoped, not server faults.

@@ -1080,7 +1080,9 @@ fn plan_base_tables(plan: &LogicalPlan) -> Vec<String> {
         | LogicalPlan::AlterTableDropColumn { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::Truncate { .. }
-        | LogicalPlan::Analyze { .. } => vec![],
+        | LogicalPlan::Analyze { .. }
+        | LogicalPlan::CreateNamedType { .. }
+        | LogicalPlan::DropNamedType { .. } => vec![],
     }
 }
 
@@ -2302,7 +2304,9 @@ impl Engine {
             | LogicalPlan::AlterTableDropColumn { .. }
             | LogicalPlan::DropTable { .. }
             | LogicalPlan::Truncate { .. }
-            | LogicalPlan::Analyze { .. } => {
+            | LogicalPlan::Analyze { .. }
+            | LogicalPlan::CreateNamedType { .. }
+            | LogicalPlan::DropNamedType { .. } => {
                 return Err(DbError::PermissionDenied(
                     "schema DDL requires a superuser".into(),
                 ));
@@ -2458,7 +2462,9 @@ impl Engine {
             | LogicalPlan::AlterTableDropColumn { .. }
             | LogicalPlan::DropTable { .. }
             | LogicalPlan::Truncate { .. }
-            | LogicalPlan::Analyze { .. } => Ok(()),
+            | LogicalPlan::Analyze { .. }
+            | LogicalPlan::CreateNamedType { .. }
+            | LogicalPlan::DropNamedType { .. } => Ok(()),
         }
     }
 

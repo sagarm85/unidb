@@ -107,6 +107,131 @@ pub enum ColumnType {
     Time,
 }
 
+// ─── Named types: enums + domains (item 148) ──────────────────────────────
+//
+// A named type is a catalog-registered macro, resolved once at `CREATE
+// TABLE` time (see `sql/executor.rs::resolve_named_type_columns`) into a
+// base `ColumnType` plus a synthesized CHECK constraint — enforcement then
+// rides the pre-existing CHECK machinery unchanged. No new WAL/tuple format,
+// no FORMAT_VERSION bump: `NamedTypeDef` lives in the same serde_json
+// catalog blob as everything else in this file. Composite types are
+// explicitly out of scope (see the item-148 backlog doc) — they would
+// require a real row-encoding format decision.
+
+/// The two named-type shapes (item 148).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum NamedTypeKind {
+    /// `CREATE TYPE name AS ENUM (labels)`. `labels` is non-empty with no
+    /// duplicates; declaration order is preserved for introspection but is
+    /// **not** the comparison/sort order — the desugared column is plain
+    /// `TEXT`, so ordering is TEXT collation. This is a documented, honest
+    /// divergence from PostgreSQL (which orders enums by declaration);
+    /// getting declaration-order comparison would need the compact-ordinal
+    /// encoding PG uses, deferred with composite types (v1 non-goal).
+    Enum { labels: Vec<String> },
+    /// `CREATE DOMAIN name AS base [CHECK (<expr using VALUE>)]`. `base` is
+    /// the underlying `ColumnType` every column declared with this domain
+    /// resolves to. `check`, when present, stores the **raw SQL text** of
+    /// the CHECK expression with the `VALUE` keyword left as a literal
+    /// placeholder — not a parsed `Expr`, because at `CREATE DOMAIN` time
+    /// there is no concrete column to bind `VALUE` to yet. `CREATE TABLE`
+    /// textually substitutes the real column name for `VALUE` and re-parses
+    /// the result into an `Expr` (see `sql/parser.rs::resolve_named_type`).
+    Domain {
+        base: ColumnType,
+        check: Option<String>,
+    },
+}
+
+/// A catalog-registered named type (item 148): the target of `CREATE TYPE
+/// ... AS ENUM` / `CREATE DOMAIN`, removed by `DROP TYPE` / `DROP DOMAIN`.
+/// Enums and domains share one namespace — a `CREATE DOMAIN` cannot reuse an
+/// existing enum's name and vice versa — and neither may shadow a built-in
+/// type name (see `validate_named_type_name`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NamedTypeDef {
+    pub name: String,
+    pub kind: NamedTypeKind,
+}
+
+/// Built-in type-name keywords a named type may not shadow (item 148),
+/// checked case-insensitively. This is every single-token spelling
+/// `sql/parser.rs::convert_data_type` / `is_serial_type` accept, so `CREATE
+/// TYPE int AS ENUM (...)` is rejected the same way `CREATE TYPE TEXT ...`
+/// would be. Multi-word spellings (`DOUBLE PRECISION`) can't collide with a
+/// single-identifier type name and are omitted.
+const BUILTIN_TYPE_NAMES: &[&str] = &[
+    "int",
+    "integer",
+    "smallint",
+    "bigint",
+    "text",
+    "varchar",
+    "char",
+    "string",
+    "bool",
+    "boolean",
+    "json",
+    "vector",
+    "decimal",
+    "numeric",
+    "dec",
+    "bigdecimal",
+    "bignumeric",
+    "timestamp",
+    "timestamptz",
+    "float",
+    "real",
+    "double",
+    "float4",
+    "float8",
+    "float32",
+    "float64",
+    "uuid",
+    "bytea",
+    "blob",
+    "tinyblob",
+    "mediumblob",
+    "longblob",
+    "binary",
+    "varbinary",
+    "date",
+    "time",
+    "serial",
+    "bigserial",
+    "smallserial",
+    "serial2",
+    "serial4",
+    "serial8",
+];
+
+/// Name-validity check shared by `CREATE TYPE`/`CREATE DOMAIN` (item 148):
+/// `^[a-zA-Z_][a-zA-Z0-9_]{0,62}$` (max 63 bytes, same shape as an ordinary
+/// SQL identifier) and not a built-in type keyword (case-insensitive).
+pub fn validate_named_type_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 63 {
+        return Err(DbError::InvalidNamedType(format!(
+            "invalid type name '{name}': must be 1-63 characters"
+        )));
+    }
+    let mut chars = name.chars();
+    // Non-empty is already guaranteed by the length check above.
+    let first = chars.next().expect("length checked non-empty above");
+    let ok_start = first.is_ascii_alphabetic() || first == '_';
+    let ok_rest = chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !ok_start || !ok_rest {
+        return Err(DbError::InvalidNamedType(format!(
+            "invalid type name '{name}': must match ^[a-zA-Z_][a-zA-Z0-9_]{{0,62}}$"
+        )));
+    }
+    if BUILTIN_TYPE_NAMES.contains(&name.to_ascii_lowercase().as_str()) {
+        return Err(DbError::InvalidNamedType(format!(
+            "type name '{name}' shadows a built-in type"
+        )));
+    }
+    Ok(())
+}
+
 /// Which secondary index (if any) a column has. `None` by default — indexing
 /// is always an explicit `CREATE INDEX` opt-in, never automatic, since
 /// indexing every column by default would silently impose background-worker
@@ -242,6 +367,16 @@ pub struct ColumnDef {
     /// indexes keep their old leaf format with `include_len = 0`).
     #[serde(default)]
     pub include_cols: Vec<String>,
+    /// Item 148: the named type (`CREATE TYPE ... AS ENUM` / `CREATE DOMAIN`)
+    /// this column was declared with, if any. `CREATE TABLE` desugars a named
+    /// type into `ty` (the type's base `ColumnType`) plus a synthesized CHECK
+    /// folded into `constraints.check` — this field carries no enforcement
+    /// weight of its own, it exists purely for introspection/error messages
+    /// (e.g. `DROP TYPE` naming the referencing column) after that desugar has
+    /// already happened. `None` for every built-in-typed column.
+    /// `#[serde(default)]` so pre-item-148 catalog blobs deserialize with `None`.
+    #[serde(default)]
+    pub type_name: Option<String>,
 }
 
 /// A table-level `FOREIGN KEY (cols) REFERENCES table(cols)` (M11). As with
@@ -396,6 +531,10 @@ pub struct Catalog {
     /// rather than on [`TableDef`] so adding it touched only this file — no
     /// storage-core or other-lane `TableDef` constructor needed a new field.
     stats: HashMap<String, crate::sql::statistics::TableStats>,
+    /// Named types (item 148): `CREATE TYPE ... AS ENUM` / `CREATE DOMAIN`.
+    /// Same control-plane-shaped side map as `stats` — riding the existing
+    /// serde_json catalog blob needs no FORMAT_VERSION bump.
+    types: HashMap<String, NamedTypeDef>,
 }
 
 impl Default for Catalog {
@@ -404,13 +543,16 @@ impl Default for Catalog {
     }
 }
 
-/// Owned catalog blob for deserialization (P4.d format: `{tables, stats}`).
+/// Owned catalog blob for deserialization (item 148 format: `{tables, stats,
+/// types}`).
 #[derive(serde::Deserialize)]
 struct PersistedCatalog {
     #[serde(default)]
     tables: HashMap<String, TableDef>,
     #[serde(default)]
     stats: HashMap<String, crate::sql::statistics::TableStats>,
+    #[serde(default)]
+    types: HashMap<String, NamedTypeDef>,
 }
 
 /// Borrowed catalog blob for serialization.
@@ -418,6 +560,7 @@ struct PersistedCatalog {
 struct PersistedCatalogRef<'a> {
     tables: &'a HashMap<String, TableDef>,
     stats: &'a HashMap<String, crate::sql::statistics::TableStats>,
+    types: &'a HashMap<String, NamedTypeDef>,
 }
 
 impl Catalog {
@@ -425,6 +568,7 @@ impl Catalog {
         Self {
             tables: HashMap::new(),
             stats: HashMap::new(),
+            types: HashMap::new(),
         }
     }
 
@@ -514,6 +658,7 @@ impl Catalog {
             return Ok(Self {
                 tables,
                 stats: HashMap::new(),
+                types: HashMap::new(),
             });
         }
         let p: PersistedCatalog =
@@ -521,6 +666,7 @@ impl Catalog {
         Ok(Self {
             tables: p.tables,
             stats: p.stats,
+            types: p.types,
         })
     }
 
@@ -553,6 +699,67 @@ impl Catalog {
     /// `wal.sync_up_to(lsn)` after this returns.
     pub fn persist_only(&mut self, ctx: &mut CatalogCtx) -> Result<Lsn> {
         self.persist(ctx)
+    }
+
+    /// Look up a named type by exact name (item 148). Case-sensitive, same
+    /// convention as [`Catalog::lookup`] for table names.
+    pub fn lookup_named_type(&self, name: &str) -> Option<&NamedTypeDef> {
+        self.types.get(name)
+    }
+
+    /// All named types, in no particular order — used by the in-use scan and
+    /// by introspection surfaces.
+    pub fn named_types(&self) -> impl Iterator<Item = &NamedTypeDef> {
+        self.types.values()
+    }
+
+    /// `CREATE TYPE ... AS ENUM` / `CREATE DOMAIN` (item 148). Rejects a
+    /// duplicate name (enums and domains share one namespace) — name-rule and
+    /// built-in-shadow validation already happened at parse time via
+    /// [`validate_named_type_name`], and label/base-type validity in the
+    /// caller (`sql/executor.rs::exec_create_named_type`), so this is purely
+    /// the persistence primitive, mirroring `create_table`'s shape.
+    pub fn create_named_type(&mut self, def: NamedTypeDef, ctx: &mut CatalogCtx) -> Result<()> {
+        if self.types.contains_key(&def.name) {
+            return Err(DbError::TypeAlreadyExists(def.name));
+        }
+        self.types.insert(def.name.clone(), def);
+        self.persist(ctx).map(|_| ())
+    }
+
+    /// `DROP TYPE` / `DROP DOMAIN` (item 148). Rejected with
+    /// [`DbError::TypeInUse`] if any non-dropped column of any table still
+    /// references this type name via `ColumnDef.type_name` — naming the first
+    /// referencing `table.column` found. Absent-name behavior mirrors
+    /// [`Catalog::drop_table`]'s posture: a plain `Err(DbError::UnknownType)`,
+    /// left to the executor to turn into a no-op for `IF EXISTS` (same
+    /// pattern `exec_drop_table` already uses for `DbError::TableNotFound`).
+    pub fn drop_named_type(&mut self, name: &str, ctx: &mut CatalogCtx) -> Result<()> {
+        if !self.types.contains_key(name) {
+            return Err(DbError::UnknownType(name.to_string()));
+        }
+        // Sort table names for a deterministic "first" referencing column
+        // across runs (HashMap iteration order is not stable) — matters for
+        // reproducible error messages/tests, not correctness.
+        let mut table_names: Vec<&String> = self.tables.keys().collect();
+        table_names.sort();
+        for table_name in table_names {
+            let t = &self.tables[table_name];
+            for col in &t.columns {
+                if col.dropped {
+                    continue;
+                }
+                if col.type_name.as_deref() == Some(name) {
+                    return Err(DbError::TypeInUse {
+                        name: name.to_string(),
+                        table: t.name.clone(),
+                        column: col.name.clone(),
+                    });
+                }
+            }
+        }
+        self.types.remove(name);
+        self.persist(ctx).map(|_| ())
     }
 
     /// Apply a signed `delta` to `table.row_count` and durably persist the
@@ -1000,6 +1207,7 @@ impl Catalog {
         let blob = PersistedCatalogRef {
             tables: &self.tables,
             stats: &self.stats,
+            types: &self.types,
         };
         let encoded =
             serde_json::to_vec(&blob).map_err(|e| DbError::CatalogCorrupt(e.to_string()))?;
@@ -1129,6 +1337,7 @@ mod tests {
                 constraints: Default::default(),
                 ty: ColumnType::Int64,
                 include_cols: Vec::new(),
+                type_name: None,
             }],
             pages: vec![],
             fsm_meta: None,
@@ -1209,6 +1418,7 @@ mod tests {
                     constraints: Default::default(),
                     ty: ColumnType::Int64,
                     include_cols: Vec::new(),
+                    type_name: None,
                 },
                 ColumnDef {
                     name: "data".to_string(),
@@ -1219,6 +1429,7 @@ mod tests {
                     constraints: Default::default(),
                     ty: ColumnType::Json,
                     include_cols: Vec::new(),
+                    type_name: None,
                 },
             ],
             pages: vec![7],
@@ -1271,6 +1482,7 @@ mod tests {
                     dropped: false,
                     constraints: Default::default(),
                     include_cols: Vec::new(),
+                    type_name: None,
                 },
                 ColumnDef {
                     name: "vec".to_string(),
@@ -1281,6 +1493,7 @@ mod tests {
                     dropped: false,
                     constraints: Default::default(),
                     include_cols: Vec::new(),
+                    type_name: None,
                 },
             ],
             pages: vec![],
@@ -1376,6 +1589,7 @@ mod tests {
                 dropped: false,
                 constraints: Default::default(),
                 include_cols: Vec::new(),
+                type_name: None,
             })
             .collect();
         TableDef {
@@ -1477,6 +1691,7 @@ mod tests {
                         dropped: false,
                         constraints: Default::default(),
                         include_cols: Vec::new(),
+                        type_name: None,
                     }],
                     pages: vec![],
                     fsm_meta: None,
