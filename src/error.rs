@@ -155,6 +155,36 @@ pub enum DbError {
     /// exact grammar accepted.
     #[error("invalid cron schedule: {0}")]
     InvalidCronSchedule(String),
+
+    /// Named-type resolution failure (item 148): `CREATE TABLE`/`DROP TYPE`/
+    /// `DROP DOMAIN` referenced a name with no matching `NamedTypeDef` in the
+    /// catalog. For the `CREATE TABLE` column-type case the message is
+    /// extended to note it may be an undeclared named type (the same
+    /// unrecognized-identifier shape previously always meant "unsupported
+    /// column type" before named types existed).
+    #[error("unknown type: {0}")]
+    UnknownType(String),
+
+    /// `CREATE TYPE`/`CREATE DOMAIN` named a type that already exists (item
+    /// 148). Enums and domains share one namespace, so this fires whether the
+    /// collision is with another enum or another domain.
+    #[error("type '{0}' already exists")]
+    TypeAlreadyExists(String),
+
+    /// `DROP TYPE`/`DROP DOMAIN` was rejected because a live (non-dropped)
+    /// column still references the type (item 148).
+    #[error("cannot drop type '{name}': in use by column '{column}' on table '{table}'")]
+    TypeInUse {
+        name: String,
+        table: String,
+        column: String,
+    },
+
+    /// `CREATE TYPE`/`CREATE DOMAIN` definition itself is invalid (item 148):
+    /// a malformed name, a name shadowing a built-in type, empty/duplicate
+    /// enum labels, or a domain over a non-existent base type.
+    #[error("invalid named type definition: {0}")]
+    InvalidNamedType(String),
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;

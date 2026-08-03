@@ -16,8 +16,8 @@ use sqlparser::parser::Parser as SqlParser;
 
 use crate::{
     catalog::{
-        ColumnConstraints, ColumnDef, ColumnType, ForeignKey, ForeignKeyRef, IndexKind,
-        TableConstraints,
+        validate_named_type_name, ColumnConstraints, ColumnDef, ColumnType, ForeignKey,
+        ForeignKeyRef, IndexKind, NamedTypeDef, NamedTypeKind, TableConstraints,
     },
     error::{DbError, Result},
 };
@@ -73,10 +73,163 @@ fn convert_statement(stmt: Statement) -> Result<LogicalPlan> {
                 .to_string();
             Ok(LogicalPlan::Analyze { table })
         }
+        // Item 148: `CREATE TYPE name AS ENUM (...)`. sqlparser 0.62 parses
+        // this natively under GenericDialect (confirmed against its own AST/
+        // parser source — no pre-parse hack needed, unlike M2.c's `USING
+        // HNSW`, which isn't a real sqlparser index-type keyword).
+        Statement::CreateType {
+            name,
+            representation,
+        } => convert_create_type(name, representation),
+        // Item 148: `CREATE DOMAIN name AS base [CHECK (...)]` — also parses
+        // natively under GenericDialect.
+        Statement::CreateDomain(cd) => convert_create_domain(cd),
+        // Item 148: `DROP DOMAIN [IF EXISTS] name` has its own dedicated
+        // `Statement` variant in sqlparser (unlike `DROP TYPE`, which reuses
+        // the generic `Statement::Drop { object_type: ObjectType::Type, .. }`
+        // shape handled above).
+        Statement::DropDomain(dd) => Ok(LogicalPlan::DropNamedType {
+            name: dd.name.to_string(),
+            if_exists: dd.if_exists,
+        }),
         other => Err(DbError::SqlUnsupported(format!(
             "unsupported statement: {other}"
         ))),
     }
+}
+
+/// `CREATE TYPE name AS ENUM (labels)` (item 148). Only the ENUM
+/// representation is supported in v1 — composite (`AS (attrs)`) and range
+/// (`AS RANGE`) types, and the bare `CREATE TYPE name` shell-type form, are
+/// all out of scope (composite types need a real row-encoding format
+/// decision; see the item-148 backlog doc's "Follow-ups").
+fn convert_create_type(
+    name: ast::ObjectName,
+    representation: Option<ast::UserDefinedTypeRepresentation>,
+) -> Result<LogicalPlan> {
+    let name = name.to_string();
+    validate_named_type_name(&name)?;
+    match representation {
+        Some(ast::UserDefinedTypeRepresentation::Enum { labels }) => {
+            let labels: Vec<String> = labels.into_iter().map(|ident| ident.value).collect();
+            Ok(LogicalPlan::CreateNamedType {
+                def: NamedTypeDef {
+                    name,
+                    kind: NamedTypeKind::Enum { labels },
+                },
+            })
+        }
+        other => Err(DbError::SqlUnsupported(format!(
+            "CREATE TYPE only supports 'AS ENUM (...)' in v1, got: {other:?}"
+        ))),
+    }
+}
+
+/// `CREATE DOMAIN name AS base [CHECK (<expr using VALUE>)]` (item 148). At
+/// most one CHECK clause; `DEFAULT`/`COLLATE` are unsupported (rejected
+/// explicitly rather than silently dropped).
+fn convert_create_domain(cd: ast::CreateDomain) -> Result<LogicalPlan> {
+    let name = cd.name.to_string();
+    validate_named_type_name(&name)?;
+    if cd.default.is_some() {
+        return Err(DbError::SqlUnsupported(
+            "CREATE DOMAIN ... DEFAULT is not supported in v1".into(),
+        ));
+    }
+    if cd.collation.is_some() {
+        return Err(DbError::SqlUnsupported(
+            "CREATE DOMAIN ... COLLATE is not supported in v1".into(),
+        ));
+    }
+    let base = convert_data_type(&cd.data_type)?;
+    if cd.constraints.len() > 1 {
+        return Err(DbError::SqlUnsupported(
+            "CREATE DOMAIN supports at most one CHECK constraint in v1".into(),
+        ));
+    }
+    let check = match cd.constraints.first() {
+        Some(ast::TableConstraint::Check(cc)) => Some(cc.expr.to_string()),
+        Some(other) => {
+            return Err(DbError::SqlUnsupported(format!(
+                "unsupported DOMAIN constraint: {other:?}"
+            )))
+        }
+        None => None,
+    };
+    Ok(LogicalPlan::CreateNamedType {
+        def: NamedTypeDef {
+            name,
+            kind: NamedTypeKind::Domain { base, check },
+        },
+    })
+}
+
+/// Re-resolve a domain's stored CHECK text (item 148) into a concrete
+/// [`Expr`], for the column that is being declared with this domain.
+///
+/// `raw` is the raw SQL text the domain's CHECK expression was captured as
+/// at `CREATE DOMAIN` time (`SqlExpr::to_string()`), with the `VALUE`
+/// keyword left as a literal placeholder — **not** a parsed `Expr`, per the
+/// locked item-148 design (`NamedTypeKind::Domain.check: Option<String>`):
+/// at `CREATE DOMAIN` time there is no column to bind `VALUE` to, so the
+/// bind is deferred to here, once the concrete column name is known. This
+/// textually substitutes every whole-word, case-insensitive occurrence of
+/// `VALUE` with `column`, then re-parses the result as a standalone SQL
+/// expression through the same `convert_expr` path a column-level `CHECK
+/// (...)` uses — so the returned `Expr` is shape-identical to what writing
+/// that CHECK directly on the column would have produced.
+///
+/// Known limitation of the textual (rather than parsed-tree) substitution:
+/// the substring "VALUE" occurring as its own word *anywhere* in the text —
+/// including inside a string literal, e.g. `VALUE LIKE 'the VALUE is x'` —
+/// is also replaced. Acceptable for v1: `VALUE` is otherwise a reserved
+/// keyword in a domain CHECK, so a legitimate use inside a string literal is
+/// an unlikely collision, and the documented workaround (escape/avoid the
+/// word) is cheap.
+pub(crate) fn resolve_domain_check(raw: &str, column: &str) -> Result<Expr> {
+    let substituted = substitute_value_word(raw, column);
+    let dialect = GenericDialect {};
+    let mut parser = SqlParser::new(&dialect)
+        .try_with_sql(&substituted)
+        .map_err(|e| DbError::SqlParse(format!("invalid DOMAIN CHECK expression: {e}")))?;
+    let expr = parser
+        .parse_expr()
+        .map_err(|e| DbError::SqlParse(format!("invalid DOMAIN CHECK expression: {e}")))?;
+    convert_expr(&expr)
+}
+
+/// Whole-word, case-insensitive replacement of `VALUE` with `column` (item
+/// 148). Word boundary = not immediately preceded/followed by an ASCII
+/// alphanumeric or `_`, so `VALUE` inside a longer identifier (`MYVALUE`,
+/// `VALUES`) is left untouched. UTF-8 safe: advances by whole characters.
+fn substitute_value_word(text: &str, column: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &text[i..];
+        if rest.len() >= 5 && rest.as_bytes()[..5].eq_ignore_ascii_case(b"VALUE") {
+            let before_ok = i == 0 || !is_ident_byte(bytes[i - 1]);
+            let after_ok = rest
+                .as_bytes()
+                .get(5)
+                .map(|&b| !is_ident_byte(b))
+                .unwrap_or(true);
+            if before_ok && after_ok {
+                out.push_str(column);
+                i += 5;
+                continue;
+            }
+        }
+        let ch = rest.chars().next().expect("i < bytes.len()");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 /// `ALTER TABLE t <op>` (P2.c). Exactly one operation per statement in v1;
@@ -121,20 +274,38 @@ fn convert_drop(
     names: Vec<ast::ObjectName>,
     if_exists: bool,
 ) -> Result<LogicalPlan> {
-    if object_type != ObjectType::Table {
-        return Err(DbError::SqlUnsupported(format!(
-            "DROP {object_type:?} is not supported (only DROP TABLE)"
-        )));
+    match object_type {
+        ObjectType::Table => {
+            if names.len() != 1 {
+                return Err(DbError::SqlUnsupported(
+                    "DROP TABLE supports exactly one table per statement".into(),
+                ));
+            }
+            Ok(LogicalPlan::DropTable {
+                table: names[0].to_string(),
+                if_exists,
+            })
+        }
+        // Item 148: `DROP TYPE [IF EXISTS] name`. sqlparser routes this
+        // through the generic `Statement::Drop { object_type: Type, .. }`
+        // shape rather than a dedicated variant (contrast `DROP DOMAIN`,
+        // which gets its own `Statement::DropDomain` — handled directly in
+        // `convert_statement`).
+        ObjectType::Type => {
+            if names.len() != 1 {
+                return Err(DbError::SqlUnsupported(
+                    "DROP TYPE supports exactly one name per statement".into(),
+                ));
+            }
+            Ok(LogicalPlan::DropNamedType {
+                name: names[0].to_string(),
+                if_exists,
+            })
+        }
+        other => Err(DbError::SqlUnsupported(format!(
+            "DROP {other:?} is not supported (only DROP TABLE / DROP TYPE / DROP DOMAIN)"
+        ))),
     }
-    if names.len() != 1 {
-        return Err(DbError::SqlUnsupported(
-            "DROP TABLE supports exactly one table per statement".into(),
-        ));
-    }
-    Ok(LogicalPlan::DropTable {
-        table: names[0].to_string(),
-        if_exists,
-    })
 }
 
 /// `TRUNCATE [TABLE] t` (P2.c). Exactly one table.
@@ -244,11 +415,23 @@ fn convert_column_def(c: ast::ColumnDef) -> Result<ColumnDef> {
     }
     // `SERIAL`/`BIGSERIAL`/`SMALLSERIAL` (P2.d) parse as a custom type name; map
     // them to an `Int64` identity column (auto-filled from the table counter).
-    let ty = if is_serial_type(&c.data_type) {
+    let (ty, type_name) = if is_serial_type(&c.data_type) {
         cons.identity = true;
-        ColumnType::Int64
+        (ColumnType::Int64, None)
+    } else if let Some(raw) = possible_named_type_name(&c.data_type) {
+        // Item 148: a bare identifier type that isn't a recognized built-in
+        // (SERIAL is handled above, VECTOR(n) is excluded by
+        // `possible_named_type_name` and falls to `convert_data_type` below)
+        // might name a `CREATE TYPE ... AS ENUM` / `CREATE DOMAIN`. The
+        // parser has no catalog access to resolve it here — that happens in
+        // `sql/executor.rs::exec_create_table`/`exec_alter_add_column`,
+        // which do. `ty` is a placeholder, always overwritten there on
+        // successful resolution; if resolution fails (the name really is
+        // unknown), the executor returns `DbError::UnknownType` and this
+        // placeholder never reaches disk.
+        (ColumnType::Text, Some(raw))
     } else {
-        convert_data_type(&c.data_type)?
+        (convert_data_type(&c.data_type)?, None)
     };
     Ok(ColumnDef {
         name: c.name.value,
@@ -259,7 +442,30 @@ fn convert_column_def(c: ast::ColumnDef) -> Result<ColumnDef> {
         dropped: false,
         constraints: cons,
         include_cols: Vec::new(),
+        type_name,
     })
+}
+
+/// Whether `dt` is a bare custom identifier `CREATE TABLE`'s column list
+/// can't resolve without catalog access (item 148) — i.e. a possible named-
+/// type reference. `VECTOR(n)` is excluded (it has its own dedicated,
+/// modifier-bearing match in `convert_data_type` and is never a named
+/// type); a parenthesized/modifier-bearing custom type that isn't `VECTOR`
+/// falls through to `convert_data_type`'s existing "unsupported column
+/// type" error, since a named-type reference is always a single bare
+/// identifier.
+fn possible_named_type_name(dt: &DataType) -> Option<String> {
+    match dt {
+        DataType::Custom(name, modifiers) if modifiers.is_empty() => {
+            let raw = name.to_string();
+            if raw.eq_ignore_ascii_case("vector") {
+                None
+            } else {
+                Some(raw)
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Whether a data type is a `SERIAL` pseudo-type (P2.d). These have no

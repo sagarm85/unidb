@@ -894,6 +894,7 @@ mod tests {
             unique_index_root: None,
             constraints: ColumnConstraints::default(),
             include_cols: Vec::new(),
+            type_name: None,
             dropped: false,
         }
     }

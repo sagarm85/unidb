@@ -69,6 +69,7 @@ pub fn events_table_def() -> TableDef {
                 dropped: false,
                 constraints: Default::default(),
                 include_cols: Vec::new(),
+                type_name: None,
             },
             ColumnDef {
                 name: "xid".to_string(),
@@ -79,6 +80,7 @@ pub fn events_table_def() -> TableDef {
                 dropped: false,
                 constraints: Default::default(),
                 include_cols: Vec::new(),
+                type_name: None,
             },
             ColumnDef {
                 name: "table_name".to_string(),
@@ -89,6 +91,7 @@ pub fn events_table_def() -> TableDef {
                 dropped: false,
                 constraints: Default::default(),
                 include_cols: Vec::new(),
+                type_name: None,
             },
             ColumnDef {
                 name: "op".to_string(),
@@ -99,6 +102,7 @@ pub fn events_table_def() -> TableDef {
                 dropped: false,
                 constraints: Default::default(),
                 include_cols: Vec::new(),
+                type_name: None,
             },
             ColumnDef {
                 name: "payload".to_string(),
@@ -109,6 +113,7 @@ pub fn events_table_def() -> TableDef {
                 dropped: false,
                 constraints: Default::default(),
                 include_cols: Vec::new(),
+                type_name: None,
             },
         ],
         pages: Vec::new(),
@@ -141,6 +146,7 @@ pub fn consumers_table_def() -> TableDef {
                 dropped: false,
                 constraints: Default::default(),
                 include_cols: Vec::new(),
+                type_name: None,
             },
             ColumnDef {
                 name: "offset".to_string(),
@@ -151,6 +157,7 @@ pub fn consumers_table_def() -> TableDef {
                 dropped: false,
                 constraints: Default::default(),
                 include_cols: Vec::new(),
+                type_name: None,
             },
         ],
         pages: Vec::new(),

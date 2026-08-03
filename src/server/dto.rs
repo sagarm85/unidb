@@ -111,6 +111,12 @@ pub fn exec_result_to_json(result: &ExecResult) -> Json {
             obj.insert("type".into(), Json::String("truncated".into()));
             obj.insert("count".into(), Json::Number(Number::from(*count)));
         }
+        ExecResult::CreatedType => {
+            obj.insert("type".into(), Json::String("created_type".into()));
+        }
+        ExecResult::DroppedType => {
+            obj.insert("type".into(), Json::String("dropped_type".into()));
+        }
     }
     Json::Object(obj)
 }

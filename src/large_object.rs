@@ -64,6 +64,7 @@ pub fn lobs_table_def() -> TableDef {
         dropped: false,
         constraints: Default::default(),
         include_cols: Vec::new(),
+        type_name: None,
     };
     TableDef {
         name: LOBS_TABLE.to_string(),
