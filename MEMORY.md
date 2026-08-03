@@ -454,6 +454,25 @@ continuation 135–146". What remains, and its gating:
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-08-03 (later) — item 148 (enums + domains) shipped the same way; 147 merged (PR #253)
+
+Same pattern, second item: the 148 Sonnet agent implemented the locked spec
+(sqlparser-0.62 AST route — CreateType/CreateDomain are dialect-unconditional,
+no pre-parse hack needed; the one real correctness catch was that the
+executor's two-valued `compare` would reject NULL through a bare enum CHECK,
+fixed by wrapping every synthesized CHECK in `col IS NULL OR (…)`).
+Orchestrator re-verified independently, including post-merge with 147's
+implementation after `origin/main` (PR #253 merged mid-run) was merged in:
+item148 16/16 · item147 8/8 · constraints 30/30 · RLS 8/8 · crash 54/54.
+Two union-merge conflicts (error.rs variants, backlog_index) resolved by
+keeping both items' content. Ship records: PROGRESS entries for both items
+(147 flipped to merged-PR-#253, 148 added), SUPABASE_PARITY counts now
+20/9/4/16 (enums+domains → Partial table; composite types stay deferred),
+147 spec + index row → SHIPPED, 137 lines → DONE. PR for 148 raised on push
+per the user's standing no-go-prompt instruction (2026-08-03). Engine-core
+next phases still open: triggers, upsert `ON CONFLICT`, auth hooks (specs
+not yet written — next session's decision with the user).
+
 ### 2026-08-03 — item 147 (stored functions v1 + RPC) implemented via Sonnet agent, verified, committed to branch; item 148 queued
 
 User go-ahead (2026-08-02) lifted the compute-cluster HELD; two branches

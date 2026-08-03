@@ -85,11 +85,10 @@ queue** · unidb-js SDK v0.1. *(The last three are beyond Supabase.)*
 
 ## Wave 2 — the compute layer (one foundation unlocks four)
 
-- **Stored functions / procedures** (IN PROGRESS — user go-ahead 2026-08-02
-  lifted the HELD; item 147, `147_stored_functions_rpc.md`, covers the
-  SQL-body v1 control-plane functions **and** the RPC route in one item —
-  no engine change; a plpgsql-analog later) → then:
-  - **RPC** (`POST /rest/v1/rpc/<fn>`) — IN PROGRESS, folded into item 147
+- **Stored functions / procedures** (DONE — item 147, PR #253 merged
+  2026-08-03: SQL-body v1 control-plane functions + the RPC route in one
+  item, no engine change; a plpgsql-analog later) → then:
+  - **RPC** (`POST /rest/v1/rpc/<fn>`) — DONE, shipped in item 147 (PR #253)
   - **Triggers** (BEFORE/AFTER row) — next phase, own item (engine write path)
   - **Upsert** (`INSERT … ON CONFLICT`) — next phase, own item (engine)
   - **Auth hooks** (custom access-token / before-user-created / MFA hooks)
