@@ -95,6 +95,16 @@ fn convert_statement(stmt: Statement) -> Result<LogicalPlan> {
             name: dd.name.to_string(),
             if_exists: dd.if_exists,
         }),
+        // Item 149: `CREATE TRIGGER <name> {BEFORE|AFTER}
+        // {INSERT|UPDATE|DELETE} ON <table> [FOR EACH ROW] EXECUTE FUNCTION
+        // <fn>`. sqlparser 0.62 parses this natively under GenericDialect
+        // (confirmed against the vendored source, 148-style empirical
+        // check: `Parser::parse_create_trigger`'s dialect gate explicitly
+        // lists `GenericDialect`) — no pre-parse fallback needed.
+        Statement::CreateTrigger(ct) => convert_create_trigger(ct),
+        // Item 149: `DROP TRIGGER [IF EXISTS] <name> ON <table>` — same
+        // dialect gate as `CREATE TRIGGER` (`Parser::parse_drop_trigger`).
+        Statement::DropTrigger(dt) => convert_drop_trigger(dt),
         other => Err(DbError::SqlUnsupported(format!(
             "unsupported statement: {other}"
         ))),
@@ -164,6 +174,125 @@ fn convert_create_domain(cd: ast::CreateDomain) -> Result<LogicalPlan> {
             name,
             kind: NamedTypeKind::Domain { base, check },
         },
+    })
+}
+
+/// `CREATE TRIGGER <name> {BEFORE|AFTER} {INSERT|UPDATE|DELETE} ON <table>
+/// [FOR EACH ROW] EXECUTE FUNCTION <fn_name>` (item 149's locked v1
+/// grammar). Every optional sqlparser construct the v1 grammar doesn't cover
+/// (`OR ALTER`/`OR REPLACE`/`TEMPORARY`/`CONSTRAINT`, `WHEN (...)`,
+/// `REFERENCING`/`FROM`, `AS <statements>` bodies, `UPDATE OF (cols)`,
+/// `TRUNCATE`, `FOR EACH STATEMENT`, call-time `EXECUTE FUNCTION fn(args)`)
+/// is rejected explicitly with `SqlUnsupported`, never silently dropped.
+fn convert_create_trigger(ct: ast::CreateTrigger) -> Result<LogicalPlan> {
+    if ct.or_alter || ct.or_replace || ct.temporary || ct.is_constraint {
+        return Err(DbError::SqlUnsupported(
+            "CREATE TRIGGER supports only the plain v1 grammar (no OR ALTER / OR REPLACE / \
+             TEMPORARY / CONSTRAINT)"
+                .into(),
+        ));
+    }
+    if ct.condition.is_some() {
+        return Err(DbError::SqlUnsupported(
+            "CREATE TRIGGER ... WHEN (...) is not supported in v1".into(),
+        ));
+    }
+    if !ct.referencing.is_empty() || ct.referenced_table_name.is_some() {
+        return Err(DbError::SqlUnsupported(
+            "CREATE TRIGGER ... REFERENCING / FROM is not supported in v1".into(),
+        ));
+    }
+    if ct.statements.is_some() {
+        return Err(DbError::SqlUnsupported(
+            "CREATE TRIGGER ... AS <statements> is not supported in v1 (use EXECUTE FUNCTION)"
+                .into(),
+        ));
+    }
+    let timing = match ct.period {
+        Some(ast::TriggerPeriod::Before) => crate::catalog::TriggerTiming::Before,
+        Some(ast::TriggerPeriod::After) => crate::catalog::TriggerTiming::After,
+        Some(other) => {
+            return Err(DbError::SqlUnsupported(format!(
+                "CREATE TRIGGER only supports BEFORE/AFTER in v1, got: {other}"
+            )))
+        }
+        None => {
+            return Err(DbError::SqlUnsupported(
+                "CREATE TRIGGER requires an explicit BEFORE/AFTER".into(),
+            ))
+        }
+    };
+    if ct.events.len() != 1 {
+        return Err(DbError::SqlUnsupported(
+            "CREATE TRIGGER supports exactly one event (INSERT/UPDATE/DELETE) in v1 — \
+             no OR event lists"
+                .into(),
+        ));
+    }
+    let event = match &ct.events[0] {
+        ast::TriggerEvent::Insert => crate::catalog::TriggerEvent::Insert,
+        ast::TriggerEvent::Update(cols) if cols.is_empty() => crate::catalog::TriggerEvent::Update,
+        ast::TriggerEvent::Update(_) => {
+            return Err(DbError::SqlUnsupported(
+                "CREATE TRIGGER ... UPDATE OF (columns) is not supported in v1".into(),
+            ))
+        }
+        ast::TriggerEvent::Delete => crate::catalog::TriggerEvent::Delete,
+        ast::TriggerEvent::Truncate => {
+            return Err(DbError::SqlUnsupported(
+                "CREATE TRIGGER ... TRUNCATE is not supported in v1".into(),
+            ))
+        }
+    };
+    // `FOR EACH ROW` is optional and implied (v1 has no `FOR EACH
+    // STATEMENT`) — reject only an explicit statement-level trigger.
+    if let Some(obj) = &ct.trigger_object {
+        let stmt_level = matches!(
+            obj,
+            ast::TriggerObjectKind::For(ast::TriggerObject::Statement)
+                | ast::TriggerObjectKind::ForEach(ast::TriggerObject::Statement)
+        );
+        if stmt_level {
+            return Err(DbError::SqlUnsupported(
+                "CREATE TRIGGER ... FOR EACH STATEMENT is not supported in v1 (row triggers only)"
+                    .into(),
+            ));
+        }
+    }
+    let exec_body = ct.exec_body.ok_or_else(|| {
+        DbError::SqlUnsupported("CREATE TRIGGER requires EXECUTE FUNCTION <fn_name>".into())
+    })?;
+    if !matches!(exec_body.exec_type, ast::TriggerExecBodyType::Function) {
+        return Err(DbError::SqlUnsupported(
+            "CREATE TRIGGER only supports EXECUTE FUNCTION in v1 (not PROCEDURE)".into(),
+        ));
+    }
+    if matches!(&exec_body.func_desc.args, Some(a) if !a.is_empty()) {
+        return Err(DbError::SqlUnsupported(
+            "CREATE TRIGGER ... EXECUTE FUNCTION does not take call-time arguments in v1".into(),
+        ));
+    }
+    Ok(LogicalPlan::CreateTrigger {
+        name: ct.name.to_string(),
+        table: ct.table_name.to_string(),
+        timing,
+        event,
+        function: exec_body.func_desc.name.to_string(),
+    })
+}
+
+/// `DROP TRIGGER [IF EXISTS] <name> ON <table>` (item 149). The locked v1
+/// grammar always names the table (`ON <table>` is required, not optional,
+/// unlike sqlparser's more permissive `DROP TRIGGER <name>` shape) — an
+/// omitted `ON <table>` is rejected explicitly.
+fn convert_drop_trigger(dt: ast::DropTrigger) -> Result<LogicalPlan> {
+    let table = dt.table_name.ok_or_else(|| {
+        DbError::SqlUnsupported("DROP TRIGGER requires 'ON <table>' in v1".into())
+    })?;
+    Ok(LogicalPlan::DropTrigger {
+        name: dt.trigger_name.to_string(),
+        table: table.to_string(),
+        if_exists: dt.if_exists,
     })
 }
 

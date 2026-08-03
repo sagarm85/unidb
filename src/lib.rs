@@ -1082,7 +1082,9 @@ fn plan_base_tables(plan: &LogicalPlan) -> Vec<String> {
         | LogicalPlan::Truncate { .. }
         | LogicalPlan::Analyze { .. }
         | LogicalPlan::CreateNamedType { .. }
-        | LogicalPlan::DropNamedType { .. } => vec![],
+        | LogicalPlan::DropNamedType { .. }
+        | LogicalPlan::CreateTrigger { .. }
+        | LogicalPlan::DropTrigger { .. } => vec![],
     }
 }
 
@@ -2320,7 +2322,9 @@ impl Engine {
             | LogicalPlan::Truncate { .. }
             | LogicalPlan::Analyze { .. }
             | LogicalPlan::CreateNamedType { .. }
-            | LogicalPlan::DropNamedType { .. } => {
+            | LogicalPlan::DropNamedType { .. }
+            | LogicalPlan::CreateTrigger { .. }
+            | LogicalPlan::DropTrigger { .. } => {
                 return Err(DbError::PermissionDenied(
                     "schema DDL requires a superuser".into(),
                 ));
@@ -2509,7 +2513,9 @@ impl Engine {
             | LogicalPlan::Truncate { .. }
             | LogicalPlan::Analyze { .. }
             | LogicalPlan::CreateNamedType { .. }
-            | LogicalPlan::DropNamedType { .. } => Ok(()),
+            | LogicalPlan::DropNamedType { .. }
+            | LogicalPlan::CreateTrigger { .. }
+            | LogicalPlan::DropTrigger { .. } => Ok(()),
         }
     }
 
@@ -3220,6 +3226,7 @@ impl Engine {
                 hnsw_tx: self.hnsw_worker_tx.lock().unwrap().clone(),
                 in_explicit_txn,
                 near_lightweight_snaps: Some(&self.near_lightweight_snaps),
+                in_trigger: false,
             };
             executor::execute(plan, &mut ctx)
         } else {
@@ -3245,6 +3252,7 @@ impl Engine {
                 hnsw_tx: self.hnsw_worker_tx.lock().unwrap().clone(),
                 in_explicit_txn,
                 near_lightweight_snaps: Some(&self.near_lightweight_snaps),
+                in_trigger: false,
             };
             executor::execute(plan, &mut ctx)
         }
@@ -3543,6 +3551,7 @@ impl Engine {
                 hnsw_tx,
                 in_explicit_txn,
                 near_lightweight_snaps: Some(&self.near_lightweight_snaps),
+                in_trigger: false,
             };
             executor::execute(plan, &mut ctx)
         } else {
@@ -3568,6 +3577,7 @@ impl Engine {
                 hnsw_tx,
                 in_explicit_txn,
                 near_lightweight_snaps: Some(&self.near_lightweight_snaps),
+                in_trigger: false,
             };
             executor::execute(plan, &mut ctx)
         }
@@ -3595,23 +3605,35 @@ impl Engine {
                 true
             }
             // An INSERT mutates the catalog only for a SERIAL bump (identity
-            // column) or a legacy non-FSM page-list persist.
-            LogicalPlan::Insert { table, .. } => catalog
-                .lookup(table)
-                .map(|t| {
-                    t.fsm_meta.is_some()
-                        && !t
-                            .columns
-                            .iter()
-                            .any(|c| c.constraints.identity && !c.dropped)
-                })
-                .unwrap_or(false),
+            // column) or a legacy non-FSM page-list persist. Item 149: a
+            // triggered table always escalates to exclusive — a trigger
+            // body's own nested statement reuses THIS SAME `CatalogHandle`
+            // (never acquires its own), so it must already be exclusive on
+            // the off chance the body itself needs catalog-mutating access
+            // (see `Catalog::has_triggers_for_table`'s doc comment).
+            LogicalPlan::Insert { table, .. } => {
+                !catalog.has_triggers_for_table(table)
+                    && catalog
+                        .lookup(table)
+                        .map(|t| {
+                            t.fsm_meta.is_some()
+                                && !t
+                                    .columns
+                                    .iter()
+                                    .any(|c| c.constraints.identity && !c.dropped)
+                        })
+                        .unwrap_or(false)
+            }
             // UPDATE mutates the catalog only via the legacy non-FSM
             // page-list persist; FSM-backed tables self-persist the directory.
-            LogicalPlan::Update { table, .. } => catalog
-                .lookup(table)
-                .map(|t| t.fsm_meta.is_some())
-                .unwrap_or(false),
+            // Item 149: same trigger-table escalation as INSERT above.
+            LogicalPlan::Update { table, .. } => {
+                !catalog.has_triggers_for_table(table)
+                    && catalog
+                        .lookup(table)
+                        .map(|t| t.fsm_meta.is_some())
+                        .unwrap_or(false)
+            }
             // DELETE with no predicate may route through the item-48 truncate
             // fast path (catalog.exclusive().truncate()), which requires the
             // exclusive catalog lock — force it here regardless of FSM status.
@@ -3620,10 +3642,14 @@ impl Engine {
             } => false,
             // Predicated DELETE: same as UPDATE — shared lock is fine unless
             // the table is a legacy non-FSM table needing a page-list persist.
-            LogicalPlan::Delete { table, .. } => catalog
-                .lookup(table)
-                .map(|t| t.fsm_meta.is_some())
-                .unwrap_or(false),
+            // Item 149: same trigger-table escalation as INSERT/UPDATE above.
+            LogicalPlan::Delete { table, .. } => {
+                !catalog.has_triggers_for_table(table)
+                    && catalog
+                        .lookup(table)
+                        .map(|t| t.fsm_meta.is_some())
+                        .unwrap_or(false)
+            }
             // DDL (CREATE/ALTER/DROP/TRUNCATE/CREATE INDEX) always mutates the
             // catalog → exclusive.
             _ => false,
@@ -3665,6 +3691,7 @@ impl Engine {
             hnsw_tx,
             in_explicit_txn: false,
             near_lightweight_snaps: Some(&self.near_lightweight_snaps),
+            in_trigger: false,
         };
         let result = graph_executor::execute(
             parsed,
@@ -4553,8 +4580,22 @@ impl Engine {
     }
 
     /// item 147 (admin surface): remove a stored-function registration by
-    /// name (`DELETE /functions/{name}`). Idempotent.
+    /// name (`DELETE /functions/{name}`). Idempotent — UNLESS a trigger
+    /// still references the function (item 149), in which case it is
+    /// **rejected** with [`DbError::FunctionInUseByTrigger`] (mirrors item
+    /// 148's `TypeInUse` guard on `DROP TYPE`). Checked HERE, not inside
+    /// `RoleStore::remove_function`, because the trigger→function reference
+    /// lives in the catalog (`Catalog::function_in_use_by_trigger`) while
+    /// the function itself lives in `AuthState` — `Engine` is the one place
+    /// both stores are reachable together.
     pub fn remove_function(&self, name: &str) -> Result<()> {
+        if let Some(trig) = cat_read(&self.catalog).function_in_use_by_trigger(name) {
+            return Err(DbError::FunctionInUseByTrigger {
+                name: name.to_string(),
+                trigger: trig.name.clone(),
+                table: trig.table.clone(),
+            });
+        }
         self.authz.remove_function(name)
     }
 

@@ -4178,3 +4178,169 @@ fn p150b_upsert_do_update_incomplete_user_txn_reverts() {
 
     drop(engine);
 }
+
+// ── P149: AFTER INSERT trigger audit-row atomicity (item 149) ──────────────
+//
+// An AFTER INSERT trigger's own write (the audit row) is an ordinary
+// same-txn WAL-logged statement — no outbox, by construction (the whole
+// unified-commit thesis). The triggering row's INSERT and the trigger
+// body's audit-row INSERT are TWO separate mini-txns (each statement's own
+// `heap.insert_accumulating`/`flush_insert_accum` bracket — see
+// `sql/executor.rs::fire_prepared_triggers`/`exec_trigger_stmt`) nested
+// inside ONE surrounding user transaction. Recovery's incomplete-user-txn
+// undo pass (M1, keyed by xid decoded from the WAL redo bytes, not by
+// mini-txn commit order) makes the two mini-txns atomic as a pair
+// regardless of which one's WAL_COMMIT lands first:
+//   P149a — the whole statement's user txn commits (both mini-txns'
+//           WAL_COMMIT durable via commit fsync), then "crash" (drop, no
+//           checkpoint, pages maybe not flushed). On reopen: BOTH the
+//           triggering row and the audit row must be visible.
+//   P149b — the statement runs (both mini-txns WAL-durable) but the
+//           enclosing user txn is never committed (simulates a crash
+//           mid-txn). On reopen: M1 undo reverts BOTH inserts — NEITHER
+//           row may be visible (proving "both rows or neither, never one").
+
+/// Shared Phase-1 setup for P149a/P149b: table + audit table + a zero-param
+/// item-147 stored function that inserts one audit row from `NEW.id`/
+/// `NEW.body` + an item-149 `AFTER INSERT` trigger wired to it.
+fn p149_setup(engine: &Engine) {
+    let x = engine.begin().unwrap();
+    engine
+        .execute_sql(x, "CREATE TABLE p149 (id INT PRIMARY KEY, body TEXT)")
+        .unwrap();
+    engine
+        .execute_sql(x, "CREATE TABLE p149_audit (id INT, note TEXT)")
+        .unwrap();
+    engine.commit(x).unwrap();
+
+    engine
+        .upsert_function(unidb::authz::FunctionDef {
+            name: "p149_audit_fn".to_string(),
+            params: vec![],
+            body: vec!["INSERT INTO p149_audit (id, note) VALUES (NEW.id, 'audited')".to_string()],
+            run_as: None,
+        })
+        .unwrap();
+
+    let x = engine.begin().unwrap();
+    engine
+        .execute_sql(
+            x,
+            "CREATE TRIGGER p149_trig AFTER INSERT ON p149 FOR EACH ROW \
+             EXECUTE FUNCTION p149_audit_fn",
+        )
+        .unwrap();
+    engine.commit(x).unwrap();
+}
+
+#[test]
+fn p149a_after_insert_trigger_audit_row_wal_durable_both_visible() {
+    let dir = tempdir().unwrap();
+
+    {
+        let engine = open(dir.path());
+        p149_setup(&engine);
+
+        // Per-stmt fsync ON so WAL records are durable before we drop.
+        engine.set_deferred_sync(false);
+
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "INSERT INTO p149 VALUES (1, 'hello')")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        // "Crash": drop without checkpoint. WAL is durable; heap pages may not be.
+        drop(engine);
+    }
+
+    let engine = open(dir.path());
+    let x = engine.begin().unwrap();
+    let result = engine
+        .execute_sql(x, "SELECT body FROM p149 WHERE id = 1")
+        .unwrap();
+    let audit = engine
+        .execute_sql(x, "SELECT note FROM p149_audit WHERE id = 1")
+        .unwrap();
+    engine.commit(x).unwrap();
+
+    match &result[0] {
+        unidb::SqlResult::Rows { rows, .. } => {
+            assert_eq!(
+                rows.len(),
+                1,
+                "P149a: triggering row must survive the crash"
+            );
+        }
+        other => panic!("P149a: expected Rows, got {other:?}"),
+    }
+    match &audit[0] {
+        unidb::SqlResult::Rows { rows, .. } => {
+            assert_eq!(
+                rows.len(),
+                1,
+                "P149a: AFTER INSERT trigger's audit row must survive the crash \
+                 atomically with the triggering row"
+            );
+        }
+        other => panic!("P149a: expected Rows, got {other:?}"),
+    }
+
+    drop(engine);
+}
+
+#[test]
+fn p149b_after_insert_trigger_audit_row_incomplete_user_txn_neither_visible() {
+    let dir = tempdir().unwrap();
+
+    {
+        let engine = open(dir.path());
+        p149_setup(&engine);
+
+        engine.set_deferred_sync(false);
+
+        // Incomplete user txn: both mini-txns (triggering row + audit row)
+        // are individually WAL-durable, but the enclosing user txn never
+        // reaches WAL_TXN_COMMIT.
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "INSERT INTO p149 VALUES (2, 'should_be_invisible')")
+            .unwrap();
+        // No commit — "crash" with this user txn open.
+        drop(engine);
+    }
+
+    let engine = open(dir.path());
+    let x = engine.begin().unwrap();
+    let result = engine
+        .execute_sql(x, "SELECT body FROM p149 WHERE id = 2")
+        .unwrap();
+    let audit = engine
+        .execute_sql(x, "SELECT note FROM p149_audit WHERE id = 2")
+        .unwrap();
+    engine.commit(x).unwrap();
+
+    match &result[0] {
+        unidb::SqlResult::Rows { rows, .. } => {
+            assert_eq!(
+                rows.len(),
+                0,
+                "P149b: triggering row from an incomplete user txn must be invisible"
+            );
+        }
+        other => panic!("P149b: expected Rows, got {other:?}"),
+    }
+    match &audit[0] {
+        unidb::SqlResult::Rows { rows, .. } => {
+            assert_eq!(
+                rows.len(),
+                0,
+                "P149b: the AFTER trigger's audit row must ALSO be invisible — \
+                 both rows or neither, never one"
+            );
+        }
+        other => panic!("P149b: expected Rows, got {other:?}"),
+    }
+
+    drop(engine);
+}

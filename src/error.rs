@@ -203,6 +203,36 @@ pub enum DbError {
     /// determine (an unindexed / non-unique named column).
     #[error("invalid ON CONFLICT target on table '{table}': {reason}")]
     InvalidConflictTarget { table: String, reason: String },
+
+    /// `CREATE TRIGGER` named a trigger that already exists (item 149) —
+    /// trigger names are unique across the whole catalog, not scoped per
+    /// table (mirrors [`DbError::TypeAlreadyExists`]'s posture).
+    #[error("trigger '{0}' already exists")]
+    TriggerAlreadyExists(String),
+
+    /// `DROP TRIGGER <name> ON <table>` named a trigger that doesn't exist
+    /// on that table (either the name is unregistered, or it exists on a
+    /// different table) (item 149).
+    #[error("unknown trigger '{name}' on table '{table}'")]
+    UnknownTrigger { name: String, table: String },
+
+    /// `DELETE /functions/{name}` (or any function-removal path) was
+    /// rejected because a live trigger still references the function (item
+    /// 149) — mirrors [`DbError::TypeInUse`]'s posture.
+    #[error("cannot remove function '{name}': in use by trigger '{trigger}' on table '{table}'")]
+    FunctionInUseByTrigger {
+        name: String,
+        trigger: String,
+        table: String,
+    },
+
+    /// `CREATE TRIGGER` definition itself is invalid (item 149): the named
+    /// function doesn't exist, declares one or more params (a trigger
+    /// function must declare zero), or a `NEW`/`OLD` column reference in
+    /// its body doesn't exist on the table or isn't available for the
+    /// trigger's event (e.g. `OLD` on an `INSERT` trigger).
+    #[error("invalid trigger definition: {0}")]
+    InvalidTriggerDef(String),
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;

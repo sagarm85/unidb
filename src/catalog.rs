@@ -232,6 +232,59 @@ pub fn validate_named_type_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+// ─── Row triggers (item 149) ───────────────────────────────────────────────
+//
+// A row trigger is a catalog-registered `(table, timing, event) ->
+// function` binding, fired per-row by the executor's DML paths
+// (`sql/executor.rs`'s `prepare_triggers`/`fire_prepared_triggers`) in the
+// SAME transaction as the row write — no new WAL/tuple format, no
+// FORMAT_VERSION bump: `TriggerDef` lives in the same serde_json catalog
+// blob as everything else in this file, exactly like item 148's
+// `NamedTypeDef`.
+
+/// `BEFORE`/`AFTER` (item 149) — whether a trigger fires before or after
+/// the row write. v1 has no `INSTEAD OF` (that needs a view/rule system
+/// this engine doesn't have).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TriggerTiming {
+    Before,
+    After,
+}
+
+/// `INSERT`/`UPDATE`/`DELETE` (item 149) — one event per trigger; v1 has no
+/// `INSERT OR UPDATE` event lists (the locked grammar's non-goal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TriggerEvent {
+    Insert,
+    Update,
+    Delete,
+}
+
+/// A row trigger (item 149): `CREATE TRIGGER <name> {BEFORE|AFTER}
+/// {INSERT|UPDATE|DELETE} ON <table> [FOR EACH ROW] EXECUTE FUNCTION <fn>`.
+///
+/// `function` names a zero-param item-147 [`crate::authz::FunctionDef`],
+/// validated to exist (with zero params, and with every `NEW`/`OLD` column
+/// reference in its body resolvable and available for `event`) at
+/// registration time — see `sql/executor.rs::exec_create_trigger`. This
+/// struct carries no cached copy of the function body: a later `POST
+/// /functions` redefinition of the same name is picked up transparently
+/// the next time the trigger fires (re-validated then too, defense in
+/// depth — see `sql/executor.rs::prepare_triggers`'s doc comment).
+///
+/// Trigger names are unique across the **whole catalog**, not scoped per
+/// table — simpler than Postgres's per-table trigger namespace, and
+/// sufficient for v1's "duplicate name" validation requirement (the
+/// backlog spec's required test group 1).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TriggerDef {
+    pub name: String,
+    pub table: String,
+    pub timing: TriggerTiming,
+    pub event: TriggerEvent,
+    pub function: String,
+}
+
 /// Which secondary index (if any) a column has. `None` by default — indexing
 /// is always an explicit `CREATE INDEX` opt-in, never automatic, since
 /// indexing every column by default would silently impose background-worker
@@ -535,6 +588,11 @@ pub struct Catalog {
     /// Same control-plane-shaped side map as `stats` — riding the existing
     /// serde_json catalog blob needs no FORMAT_VERSION bump.
     types: HashMap<String, NamedTypeDef>,
+    /// Row triggers (item 149): `CREATE TRIGGER` / `DROP TRIGGER`, keyed by
+    /// trigger name (the whole-catalog unique namespace — see
+    /// [`TriggerDef`]'s doc comment). Same control-plane-shaped side map as
+    /// `stats`/`types`.
+    triggers: HashMap<String, TriggerDef>,
 }
 
 impl Default for Catalog {
@@ -543,8 +601,8 @@ impl Default for Catalog {
     }
 }
 
-/// Owned catalog blob for deserialization (item 148 format: `{tables, stats,
-/// types}`).
+/// Owned catalog blob for deserialization (item 149 format: `{tables,
+/// stats, types, triggers}`).
 #[derive(serde::Deserialize)]
 struct PersistedCatalog {
     #[serde(default)]
@@ -553,6 +611,8 @@ struct PersistedCatalog {
     stats: HashMap<String, crate::sql::statistics::TableStats>,
     #[serde(default)]
     types: HashMap<String, NamedTypeDef>,
+    #[serde(default)]
+    triggers: HashMap<String, TriggerDef>,
 }
 
 /// Borrowed catalog blob for serialization.
@@ -561,6 +621,7 @@ struct PersistedCatalogRef<'a> {
     tables: &'a HashMap<String, TableDef>,
     stats: &'a HashMap<String, crate::sql::statistics::TableStats>,
     types: &'a HashMap<String, NamedTypeDef>,
+    triggers: &'a HashMap<String, TriggerDef>,
 }
 
 impl Catalog {
@@ -569,6 +630,7 @@ impl Catalog {
             tables: HashMap::new(),
             stats: HashMap::new(),
             types: HashMap::new(),
+            triggers: HashMap::new(),
         }
     }
 
@@ -659,6 +721,7 @@ impl Catalog {
                 tables,
                 stats: HashMap::new(),
                 types: HashMap::new(),
+                triggers: HashMap::new(),
             });
         }
         let p: PersistedCatalog =
@@ -667,6 +730,7 @@ impl Catalog {
             tables: p.tables,
             stats: p.stats,
             types: p.types,
+            triggers: p.triggers,
         })
     }
 
@@ -760,6 +824,95 @@ impl Catalog {
         }
         self.types.remove(name);
         self.persist(ctx).map(|_| ())
+    }
+
+    // ─── Row triggers (item 149) ───────────────────────────────────────
+
+    /// `CREATE TRIGGER` (item 149). Rejects an unknown target table and a
+    /// duplicate trigger name (whole-catalog namespace — see [`TriggerDef`]'s
+    /// doc comment). Function-existence/params/column/image validation
+    /// happens in the executor (`exec_create_trigger`, which has `AuthZ`
+    /// access this layer doesn't) — this is purely the persistence
+    /// primitive, mirroring [`Self::create_named_type`]'s shape.
+    pub fn create_trigger(&mut self, def: TriggerDef, ctx: &mut CatalogCtx) -> Result<()> {
+        if !self.tables.contains_key(&def.table) {
+            return Err(DbError::TableNotFound(def.table.clone()));
+        }
+        if self.triggers.contains_key(&def.name) {
+            return Err(DbError::TriggerAlreadyExists(def.name));
+        }
+        self.triggers.insert(def.name.clone(), def);
+        self.persist(ctx).map(|_| ())
+    }
+
+    /// `DROP TRIGGER <name> ON <table>` (item 149). Errors when `name`
+    /// doesn't exist at all, or exists but is registered on a different
+    /// table (the grammar's `ON <table>` clause implies "not found on THIS
+    /// table" — the executor's `IF EXISTS` handling treats either shape the
+    /// same way `DbError::TableNotFound`/`ColumnNotFound` already do
+    /// elsewhere).
+    pub fn drop_trigger(&mut self, name: &str, table: &str, ctx: &mut CatalogCtx) -> Result<()> {
+        match self.triggers.get(name) {
+            Some(t) if t.table == table => {}
+            _ => {
+                return Err(DbError::UnknownTrigger {
+                    name: name.to_string(),
+                    table: table.to_string(),
+                })
+            }
+        }
+        self.triggers.remove(name);
+        self.persist(ctx).map(|_| ())
+    }
+
+    /// Every trigger registered for `(table, timing, event)`, in **name
+    /// order** (item 149's locked deterministic multi-trigger firing rule).
+    /// Empty for a table with no matching triggers — the common case, and
+    /// the cheap per-statement check `sql/executor.rs::prepare_triggers`
+    /// calls once (never per row).
+    pub fn triggers_for(
+        &self,
+        table: &str,
+        timing: TriggerTiming,
+        event: TriggerEvent,
+    ) -> Vec<&TriggerDef> {
+        let mut out: Vec<&TriggerDef> = self
+            .triggers
+            .values()
+            .filter(|t| t.table == table && t.timing == timing && t.event == event)
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// Whether `table` has **any** registered trigger, of any timing/event
+    /// (item 149). Used by `Engine::stmt_uses_shared_catalog` to force the
+    /// exclusive catalog lock for DML against a triggered table — a
+    /// conservative, correctness-preserving choice: a trigger's function
+    /// body may itself need catalog-mutating access (a SERIAL bump, a
+    /// legacy non-FSM page-list persist), which is only ever available
+    /// through the SAME `CatalogHandle` the outer statement already holds
+    /// (nested trigger-body statements reuse it, never acquire their own).
+    pub fn has_triggers_for_table(&self, table: &str) -> bool {
+        self.triggers.values().any(|t| t.table == table)
+    }
+
+    /// The first trigger (by name, for determinism) referencing `function`,
+    /// if any (item 149) — backs the `DELETE /functions/{name}` in-use
+    /// guard (`Engine::remove_function`), mirroring
+    /// [`Self::drop_named_type`]'s `TypeInUse` scan.
+    pub fn function_in_use_by_trigger(&self, function: &str) -> Option<&TriggerDef> {
+        let mut names: Vec<&String> = self.triggers.keys().collect();
+        names.sort();
+        names
+            .into_iter()
+            .map(|n| &self.triggers[n])
+            .find(|t| t.function == function)
+    }
+
+    /// All triggers, in no particular order — introspection / test support.
+    pub fn triggers(&self) -> impl Iterator<Item = &TriggerDef> {
+        self.triggers.values()
     }
 
     /// Apply a signed `delta` to `table.row_count` and durably persist the
@@ -1168,6 +1321,10 @@ impl Catalog {
             return Err(DbError::TableNotFound(table.to_string()));
         }
         self.stats.remove(table);
+        // item 149: DROP TABLE drops its triggers too — a trigger on a
+        // dropped table is unreachable garbage, and a NEW table later
+        // recreated under the same name must not inherit stale triggers.
+        self.triggers.retain(|_, t| t.table != table);
         self.persist(ctx).map(|_| ())
     }
 
@@ -1208,6 +1365,7 @@ impl Catalog {
             tables: &self.tables,
             stats: &self.stats,
             types: &self.types,
+            triggers: &self.triggers,
         };
         let encoded =
             serde_json::to_vec(&blob).map_err(|e| DbError::CatalogCorrupt(e.to_string()))?;

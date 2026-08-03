@@ -14,7 +14,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::catalog::{Catalog, ColumnDef, IndexKind, NamedTypeDef, TableConstraints};
+use crate::catalog::{
+    Catalog, ColumnDef, IndexKind, NamedTypeDef, TableConstraints, TriggerEvent, TriggerTiming,
+};
 use crate::error::{DbError, Result};
 use crate::sql::query::QuerySpec;
 
@@ -127,7 +129,9 @@ pub fn bind_params(plan: &mut LogicalPlan, params: &[Literal]) -> Result<()> {
         | LogicalPlan::Truncate { .. }
         | LogicalPlan::Analyze { .. }
         | LogicalPlan::CreateNamedType { .. }
-        | LogicalPlan::DropNamedType { .. } => {}
+        | LogicalPlan::DropNamedType { .. }
+        | LogicalPlan::CreateTrigger { .. }
+        | LogicalPlan::DropTrigger { .. } => {}
     }
     Ok(())
 }
@@ -529,6 +533,23 @@ pub enum LogicalPlan {
     /// is; there is no PostgreSQL-style "DROP TYPE can't drop a domain"
     /// restriction in this engine (a deliberate v1 simplification).
     DropNamedType { name: String, if_exists: bool },
+    /// `CREATE TRIGGER <name> {BEFORE|AFTER} {INSERT|UPDATE|DELETE} ON
+    /// <table> [FOR EACH ROW] EXECUTE FUNCTION <fn_name>` (item 149).
+    /// `FOR EACH ROW` is optional and implied (v1 has no `FOR EACH
+    /// STATEMENT`) — parsed and validated, not carried here.
+    CreateTrigger {
+        name: String,
+        table: String,
+        timing: TriggerTiming,
+        event: TriggerEvent,
+        function: String,
+    },
+    /// `DROP TRIGGER [IF EXISTS] <name> ON <table>` (item 149).
+    DropTrigger {
+        name: String,
+        table: String,
+        if_exists: bool,
+    },
 }
 
 /// Set-operation kind for [`LogicalPlan::SetOp`] (G3, item 19).
@@ -936,7 +957,9 @@ pub fn apply_rls_skip_current_user(plan: LogicalPlan, catalog: &Catalog) -> Logi
         | LogicalPlan::Truncate { .. }
         | LogicalPlan::Analyze { .. }
         | LogicalPlan::CreateNamedType { .. }
-        | LogicalPlan::DropNamedType { .. }) => other,
+        | LogicalPlan::DropNamedType { .. }
+        | LogicalPlan::CreateTrigger { .. }
+        | LogicalPlan::DropTrigger { .. }) => other,
     }
 }
 
@@ -1135,7 +1158,9 @@ pub fn apply_rls_with_auth(
         | LogicalPlan::Truncate { .. }
         | LogicalPlan::Analyze { .. }
         | LogicalPlan::CreateNamedType { .. }
-        | LogicalPlan::DropNamedType { .. }) => other,
+        | LogicalPlan::DropNamedType { .. }
+        | LogicalPlan::CreateTrigger { .. }
+        | LogicalPlan::DropTrigger { .. }) => other,
     }
 }
 

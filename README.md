@@ -235,6 +235,15 @@ curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8080/functions \
   -d '{"name":"posts_by_owner","params":["owner"],"body":["SELECT id, title FROM posts WHERE owner = $1"]}'
 curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8080/rest/v1/rpc/posts_by_owner \
   -d '{"owner":"alice"}'
+
+# Row triggers (item 149): CREATE TRIGGER is pure SQL DDL (superuser-only,
+# no separate REST route) — fires a zero-param stored function per row, in
+# the SAME transaction as the write (an AFTER trigger's audit row commits
+# atomically with the triggering row, no outbox). No cascading (v1
+# diverges from Postgres): a statement run from inside a trigger body fires
+# no triggers of its own.
+curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8080/sql \
+  -d '{"sql":"CREATE TRIGGER orders_audit AFTER INSERT ON orders FOR EACH ROW EXECUTE FUNCTION log_order_insert"}'
 ```
 
 Key environment variables:
@@ -305,7 +314,7 @@ UNIDB_DATA_DIR=/var/lib/unidb cargo run --bin unidb-migrate -- migrations
 - Group commit — one `fsync` per transaction
 - Auto-checkpoint and autovacuum (background, Postgres-style policy)
 - Full-page writes + CRC32 checksums on every page
-- Crash-injection harness (56 crash/recovery tests as of 2026-08-03)
+- Crash-injection harness (58 crash/recovery tests as of 2026-08-03)
 
 **SQL and relational**
 - SQL subset: SELECT (with joins, aggregates, GROUP BY, HAVING, ORDER BY, LIMIT), INSERT (incl. `ON CONFLICT ... DO NOTHING | DO UPDATE` upsert), UPDATE, DELETE, CREATE/ALTER/DROP TABLE, TRUNCATE, RETURNING
@@ -313,6 +322,7 @@ UNIDB_DATA_DIR=/var/lib/unidb cargo run --bin unidb-migrate -- migrations
 - Column types: INT, BIGINT, FLOAT, TEXT, BOOL, DECIMAL, TIMESTAMP, DATE, UUID, BYTEA, JSON, VECTOR(n)
 - Constraints: PRIMARY KEY, FOREIGN KEY, UNIQUE, NOT NULL, CHECK, DEFAULT, SERIAL
 - Named types: `CREATE TYPE … AS ENUM`, `CREATE DOMAIN … [CHECK]` — desugar to a base column type + synthesized CHECK at `CREATE TABLE` time, zero new enforcement code
+- Row triggers (item 149): `CREATE TRIGGER … {BEFORE|AFTER} {INSERT|UPDATE|DELETE} … EXECUTE FUNCTION` fires a zero-param item-147 stored function per row, in the SAME transaction as the write — no cascading (v1 diverges from Postgres on purpose), superuser-only DDL, trigger body always runs as the embedded/superuser identity
 - B-tree secondary indexes (durable, crash-recovered, no rebuild on open); covering indexes via `CREATE INDEX … INCLUDE (cols)`; index-only scans
 - Cost-based optimizer with ANALYZE statistics and EXPLAIN / EXPLAIN ANALYZE; LRU plan cache
 - Joins: hash join (with grace spill-to-disk), sort-merge, index-nested-loop; INNER/LEFT/RIGHT/FULL OUTER/NATURAL, `ON` and `USING`
@@ -368,6 +378,17 @@ UNIDB_DATA_DIR=/var/lib/unidb cargo run --bin unidb-migrate -- migrations
   RPC is callable by anyone), `run_as` opts a function into definer
   semantics explicitly; every call's statements run atomically in one
   transaction; control-plane only, no engine/WAL/heap/catalog change
+- Row triggers (item 149) — `CREATE TRIGGER`/`DROP TRIGGER` (pure SQL DDL,
+  superuser-only, no separate REST route): fires an item-147 zero-param
+  stored function per affected row, **in the same transaction** as the row
+  write — an `AFTER` trigger's audit-row write commits atomically with the
+  triggering row, no outbox. `NEW`/`OLD` bind like ordinary `$n` params;
+  name-order firing across multiple triggers; errors veto the statement; **no
+  cascading** (a statement fired from inside a trigger body fires no
+  triggers of its own — v1's entire, deliberate recursion story, the
+  opposite of Postgres); trigger body always runs as the embedded/superuser
+  identity regardless of caller or the function's own `run_as` (the
+  `SECURITY DEFINER` problem, solved by always being on)
 
 **Operations and HA**
 - Segmented WAL (16 MiB segments) enabling replication slots

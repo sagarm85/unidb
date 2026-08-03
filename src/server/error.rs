@@ -207,6 +207,15 @@ pub(crate) fn map_status(err: &DbError) -> (StatusCode, &'static str) {
         DbError::TableAlreadyExists(_) => (StatusCode::CONFLICT, "TABLE_ALREADY_EXISTS"),
         DbError::TypeAlreadyExists(_) => (StatusCode::CONFLICT, "TYPE_ALREADY_EXISTS"),
         DbError::TypeInUse { .. } => (StatusCode::CONFLICT, "TYPE_IN_USE"),
+        // Item 149: row triggers mirror the item-148 named-type status
+        // mapping exactly — unknown/already-exists/in-use are the same
+        // request-error shapes, just a different resource kind.
+        DbError::TriggerAlreadyExists(_) => (StatusCode::CONFLICT, "TRIGGER_ALREADY_EXISTS"),
+        DbError::UnknownTrigger { .. } => (StatusCode::NOT_FOUND, "UNKNOWN_TRIGGER"),
+        DbError::FunctionInUseByTrigger { .. } => {
+            (StatusCode::CONFLICT, "FUNCTION_IN_USE_BY_TRIGGER")
+        }
+        DbError::InvalidTriggerDef(_) => (StatusCode::BAD_REQUEST, "INVALID_TRIGGER_DEF"),
         DbError::WriteConflict { .. } => (StatusCode::CONFLICT, "WRITE_CONFLICT"),
         DbError::SerializationFailure { .. } => (StatusCode::CONFLICT, "SERIALIZATION_FAILURE"),
         DbError::Deadlock { .. } => (StatusCode::CONFLICT, "DEADLOCK"),
