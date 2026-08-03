@@ -4012,3 +4012,169 @@ fn p104_catalog_sync_dedup_crash_recovery_count_exact() {
         other => panic!("P104 phase4: expected Rows, got {other:?}"),
     }
 }
+
+// ── P150: `INSERT ... ON CONFLICT DO UPDATE` crash durability (item 150) ────
+//
+// The upsert DO UPDATE arm is an ordinary WAL-logged heap update inside the
+// statement's mini-txn/user-txn (same durability contract as a plain
+// UPDATE — item 150 adds routing, not a new write path). Two sub-cases,
+// mirroring P59a/P59b's HOT-update pattern exactly:
+//   P150a — the upsert-update's mini-txn AND user-txn both commit (WAL
+//           durable via commit fsync), then "crash" (drop with no
+//           checkpoint, page maybe not flushed). On reopen: the row must be
+//           entirely the NEW value, and the unique index must resolve to
+//           exactly one live row (a duplicate-key INSERT is still rejected).
+//   P150b — the upsert-update's mini-txn commits (WAL durable) but the
+//           enclosing user txn is never committed (simulates a crash
+//           mid-txn). On reopen: M1 undo reverts to the OLD value, and the
+//           unique index still resolves to exactly one live row (the
+//           original).
+
+#[test]
+fn p150a_upsert_do_update_wal_durable_page_not_flushed() {
+    use unidb::sql::logical::Literal;
+
+    let dir = tempdir().unwrap();
+
+    // Phase 1: insert a row, then upsert-update it via ON CONFLICT DO UPDATE.
+    {
+        let engine = open(dir.path());
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE p150 (id INT PRIMARY KEY, body TEXT)")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        // Per-stmt fsync ON so WAL records are durable before we drop.
+        engine.set_deferred_sync(false);
+
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "INSERT INTO p150 VALUES (42, 'original')")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(
+                x,
+                "INSERT INTO p150 (id, body) VALUES (42, 'updated') \
+                 ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body",
+            )
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        // "Crash": drop without checkpoint. WAL is durable; heap pages may not be.
+        drop(engine);
+    }
+
+    // Phase 2: reopen. Recovery replays the update's WAL record(s) (HOT or
+    // full update, whichever the statement took).
+    let engine = open(dir.path());
+    let x = engine.begin().unwrap();
+    let result = engine
+        .execute_sql(x, "SELECT body FROM p150 WHERE id = 42")
+        .unwrap();
+    engine.commit(x).unwrap();
+
+    match &result[0] {
+        unidb::SqlResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1, "P150a: expected exactly one row");
+            assert_eq!(
+                rows[0][0],
+                Literal::Text("updated".to_owned()),
+                "P150a: the upsert-updated value must survive the crash (WAL durable)"
+            );
+        }
+        other => panic!("P150a: expected Rows, got {other:?}"),
+    }
+
+    // The unique index must resolve to exactly one live row: a duplicate-key
+    // plain INSERT is still rejected after recovery.
+    let x2 = engine.begin().unwrap();
+    let dup = engine.execute_sql(x2, "INSERT INTO p150 VALUES (42, 'dup')");
+    let _ = engine.abort(x2);
+    assert!(
+        matches!(dup, Err(unidb::error::DbError::UniqueViolation { .. })),
+        "P150a: duplicate PK insert must be rejected after crash-recovery; got {dup:?}"
+    );
+
+    drop(engine);
+}
+
+#[test]
+fn p150b_upsert_do_update_incomplete_user_txn_reverts() {
+    use unidb::sql::logical::Literal;
+
+    let dir = tempdir().unwrap();
+
+    // Phase 1: insert a committed row, then upsert-update it inside a user
+    // txn that is never committed.
+    {
+        let engine = open(dir.path());
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "CREATE TABLE p150b (id INT PRIMARY KEY, body TEXT)")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        engine.set_deferred_sync(false);
+
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(x, "INSERT INTO p150b VALUES (7, 'original')")
+            .unwrap();
+        engine.commit(x).unwrap();
+
+        // Incomplete user txn: the upsert-update's mini-txn is WAL-durable,
+        // but the enclosing user txn is never committed.
+        let x = engine.begin().unwrap();
+        engine
+            .execute_sql(
+                x,
+                "INSERT INTO p150b (id, body) VALUES (7, 'should_be_invisible') \
+                 ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body",
+            )
+            .unwrap();
+        // No commit — "crash" with this user txn open.
+        drop(engine);
+    }
+
+    // Phase 2: reopen. Recovery's M1 undo reverts the incomplete upsert-
+    // update: the original value must be visible; the updated value must not.
+    let engine = open(dir.path());
+    let x = engine.begin().unwrap();
+    let result = engine
+        .execute_sql(x, "SELECT body FROM p150b WHERE id = 7")
+        .unwrap();
+    engine.commit(x).unwrap();
+
+    match &result[0] {
+        unidb::SqlResult::Rows { rows, .. } => {
+            assert_eq!(
+                rows.len(),
+                1,
+                "P150b: expected exactly one row (the original)"
+            );
+            assert_eq!(
+                rows[0][0],
+                Literal::Text("original".to_owned()),
+                "P150b: original value must be restored after undo; updated value must be invisible"
+            );
+        }
+        other => panic!("P150b: expected Rows, got {other:?}"),
+    }
+
+    // The unique index must still resolve to exactly one live row (the
+    // original) — a duplicate-key insert is rejected, and the reverted slot
+    // is correctly the one found.
+    let x2 = engine.begin().unwrap();
+    let dup = engine.execute_sql(x2, "INSERT INTO p150b VALUES (7, 'dup')");
+    let _ = engine.abort(x2);
+    assert!(
+        matches!(dup, Err(unidb::error::DbError::UniqueViolation { .. })),
+        "P150b: duplicate PK insert must be rejected after crash-recovery; got {dup:?}"
+    );
+
+    drop(engine);
+}

@@ -2283,7 +2283,21 @@ impl Engine {
         use crate::authz::Privilege as P;
         let reqs: Vec<(String, P)> = match plan {
             LogicalPlan::Select { table, .. } => vec![(table.clone(), P::Select)],
-            LogicalPlan::Insert { table, .. } => vec![(table.clone(), P::Insert)],
+            // item 150: an `ON CONFLICT ... DO UPDATE` arm also needs UPDATE
+            // on the table, on top of the INSERT arm's own requirement —
+            // mirrors a plain UPDATE naming the same SET clause.
+            LogicalPlan::Insert {
+                table, on_conflict, ..
+            } => {
+                let mut reqs = vec![(table.clone(), P::Insert)];
+                if matches!(
+                    on_conflict.as_ref().map(|oc| &oc.action),
+                    Some(crate::sql::logical::OnConflictAction::DoUpdate { .. })
+                ) {
+                    reqs.push((table.clone(), P::Update));
+                }
+                reqs
+            }
             LogicalPlan::Update { table, .. } => vec![(table.clone(), P::Update)],
             LogicalPlan::Delete { table, .. } => vec![(table.clone(), P::Delete)],
             LogicalPlan::Query(spec) | LogicalPlan::Explain { spec, .. } => query_base_tables(spec)
@@ -2386,6 +2400,7 @@ impl Engine {
                 table,
                 columns,
                 returning,
+                on_conflict,
                 ..
             } => {
                 match columns {
@@ -2395,6 +2410,36 @@ impl Engine {
                         }
                     }
                     None => self.check_all_columns(&cat, user, table, P::Insert)?,
+                }
+                // item 150: `ON CONFLICT ... DO UPDATE` — same shape as the
+                // `Update` arm below: SET targets need column-scoped UPDATE,
+                // SET RHS / WHERE need column-scoped SELECT. `EXCLUDED.<col>`
+                // reads the *proposed* row, already covered by the INSERT
+                // column check above (`collect_expr_columns` treats it as a
+                // leaf that contributes no column — see item 150's doc on
+                // `Expr::Excluded`), so it never needs a SELECT grant.
+                if let Some(oc) = on_conflict {
+                    if let crate::sql::logical::OnConflictAction::DoUpdate {
+                        assignments,
+                        predicate,
+                    } = &oc.action
+                    {
+                        for (target, rhs) in assignments {
+                            self.check_one_column(user, table, target, P::Update)?;
+                            let mut cols = std::collections::BTreeSet::new();
+                            crate::sql::logical::collect_expr_columns(rhs, &mut cols);
+                            for c in &cols {
+                                self.check_one_column(user, table, c, P::Select)?;
+                            }
+                        }
+                        if let Some(pred) = predicate {
+                            let mut cols = std::collections::BTreeSet::new();
+                            crate::sql::logical::collect_expr_columns(pred, &mut cols);
+                            for c in &cols {
+                                self.check_one_column(user, table, c, P::Select)?;
+                            }
+                        }
+                    }
                 }
                 self.check_returning(&cat, user, table, returning)
             }

@@ -72,6 +72,7 @@ paths:
 |---|---|---|
 | `SELECT` (`WHERE`, `JOIN … USING`/`ON`, `GROUP BY`, `ORDER BY`, aggregates) | ✅ Supported | `ORDER BY` accepts output columns, 1-based positions, and non-projected expressions (G4) |
 | `INSERT` / `UPDATE` / `DELETE` (+ `RETURNING`) | ✅ Supported | multi-row `VALUES`; batched WAL |
+| `INSERT ... ON CONFLICT (col) DO NOTHING \| DO UPDATE SET ...` (upsert) | ✅ Supported | item 150; single-column target only; `DO UPDATE` routes through the existing UPDATE machinery |
 | `CREATE TABLE` (`PRIMARY KEY`, `UNIQUE`, `REFERENCES`, `VECTOR(n)`) | ✅ Supported | practical column-constraint subset |
 | `CREATE INDEX … USING BTREE \| HNSW \| FULLTEXT` (+ `INCLUDE (cols)` on BTREE) | ✅ Supported | HNSW = vector; FULLTEXT = inverted index; `INCLUDE` = covering B-tree (item 102-B) |
 | `ALTER TABLE ADD/DROP COLUMN`, `DROP TABLE`, `TRUNCATE`, `ANALYZE`, `EXPLAIN` | ✅ Supported | |
@@ -260,6 +261,45 @@ INSERT INTO docs (id, body, embedding) VALUES (1, 'invoice overdue', [0.1, 0.2, 
 > Multi-row `VALUES` is batched into one WAL bracket per heap page (fast bulk
 > insert); `UNIQUE` constraints are still enforced per row. Vector literals use
 > `[..]` bracket syntax and must match the column's `VECTOR(n)` arity.
+
+### `ON CONFLICT` (upsert)
+
+```sql
+INSERT INTO <table> (<col>, ...) VALUES (<v>, ...)
+  ON CONFLICT [(<col>)] DO NOTHING
+| ON CONFLICT (<col>)   DO UPDATE SET <col> = <expr> [, ...] [WHERE <predicate>];
+```
+
+**Example**
+```sql
+-- Skip a duplicate key silently.
+INSERT INTO customers (id, name, active) VALUES (1, 'alice', true)
+  ON CONFLICT (id) DO NOTHING;
+
+-- Merge into the existing row, referencing the proposed row via EXCLUDED.
+INSERT INTO customers (id, name, active) VALUES (1, 'alice-v2', true)
+  ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name
+  WHERE customers.active;
+```
+
+> The conflict target is **at most one column**, which must be the table's
+> `PRIMARY KEY` or carry a `UNIQUE` index. It is optional for `DO NOTHING`
+> (then a conflict on **any** unique constraint is silently absorbed); it is
+> **required** for `DO UPDATE`. `EXCLUDED.<col>` refers to the row that
+> would have been inserted, usable in the `SET` list and the `DO UPDATE
+> WHERE`. `NULL` never conflicts (standard SQL unique semantics — same as a
+> plain `INSERT`). The `DO UPDATE` arm runs through the exact same UPDATE
+> machinery a plain `UPDATE` on that row would use: `WITH CHECK`, `UNIQUE`/
+> foreign-key re-validation, and secondary-index maintenance all apply
+> identically. Under RLS the update arm enforces the caller's **UPDATE**
+> policies: a `USING` mismatch on the target row is a **hard error**, not a
+> silent skip (silently skipping would let a caller probe for the existence
+> of a row they cannot otherwise see); the `DO UPDATE WHERE` clause, by
+> contrast, evaluates against the row and a false result skips it quietly
+> (matching Postgres). `RETURNING` reports the affected row on either arm.
+> Non-goals (v1): composite conflict targets, `ON CONSTRAINT <name>`,
+> `MERGE`, referencing another table from `DO UPDATE`, and conflict targets
+> on expressions/partial indexes.
 
 ## UPDATE
 

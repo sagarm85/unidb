@@ -454,6 +454,29 @@ continuation 135–146". What remains, and its gating:
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-08-03 (cont.) — item 150 (upsert ON CONFLICT) shipped; LATENT HOT-CHAIN MVCC BUG FOUND & FIXED; 149 next
+
+Item 150 implemented by its Sonnet agent and orchestrator-verified (item150
+20/20 · REST 7/7 · **crash 56/56** — 2 new upsert injection points ·
+constraints/148/147/RLS/server_rest all green). The headline is NOT the
+feature: the spec's required concurrency test exposed a **pre-existing
+severe MVCC read-path bug** — `heap::get_visible_cached`/`_with_rid`
+followed at most one HOT-chain hop, so after ≥2 sequential HOT updates on a
+PK/UNIQUE-indexed row the index candidate under-resolved to "no visible
+version" and a duplicate-key INSERT could slip past `enforce_unique` (two
+live rows, same key, empirically reproduced). Fixed by a bounded chain walk
+(`MAX_HOT_CHAIN_HOPS`), read-path only, regression test added. **Flag: the
+open item-16 concurrent-visibility anomaly (3-visible-rows churn repro,
+default-OFF toggle blocker) is in the same under/over-resolution family —
+RETEST that repro on top of this fix before assuming anything; do not
+silently close item 16.** Upsert itself: routing through existing machinery
+(probe = enforce_unique pattern; DO UPDATE arm = `apply_single_row_update`
+extracted from exec_update), RLS fail-closed both arms, REST
+`on_conflict=`/`Prefer: resolution=` wiring (139's exclusion removed).
+Next: item 149 (triggers) branch stacks on 150's exec_insert restructuring
+(`try_insert_one_row`) — its agent prompt must point at the refactored
+shape, not the spec's original exec_insert assumptions.
+
 ### 2026-08-03 (later) — item 148 (enums + domains) shipped the same way; 147 merged (PR #253)
 
 Same pattern, second item: the 148 Sonnet agent implemented the locked spec

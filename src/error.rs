@@ -193,6 +193,16 @@ pub enum DbError {
     /// `src/authz/mod.rs::RoleStore::upsert_function` for the exact checks.
     #[error("invalid function definition: {0}")]
     InvalidFunctionDef(String),
+
+    /// `INSERT ... ON CONFLICT (col) ...` named a conflict target that isn't
+    /// the table's PRIMARY KEY or a UNIQUE column (item 150) — composite
+    /// targets, `ON CONSTRAINT`, and expression/partial-index targets are
+    /// v1 non-goals, rejected at parse time
+    /// (`src/sql/parser.rs::convert_on_conflict`) with `SqlUnsupported`
+    /// instead; this variant covers the cases only the catalog can
+    /// determine (an unindexed / non-unique named column).
+    #[error("invalid ON CONFLICT target on table '{table}': {reason}")]
+    InvalidConflictTarget { table: String, reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;

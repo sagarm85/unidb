@@ -12,17 +12,17 @@
 > Ledger entry: `PROGRESS.md` "Supabase-parity BaaS layer — items 120–133 +
 > free-parity continuation 135–146".
 >
-> **Last verified:** 2026-08-03, on branch `feat/148-enums-domains` (item
-> 148 shipping in this PR; item 147 merged via PR #253; previous stamps
-> 2026-08-02/03). Feature list source: the
+> **Last verified:** 2026-08-03, on branch `feat/150-upsert-on-conflict`
+> (item 150 shipping in this PR; 147 = PR #253, 148 = PR #254; previous
+> stamps 2026-08-02/03). Feature list source: the
 > supabase.com/features catalog as of early 2026 (page not re-fetchable from
 > every environment — re-check it when updating).
 
-**Summary:** ~40 catalog features → **20 done · 9 partial · 4 achieved
-differently · 16 not done** (compute-cluster HELD lifted 2026-08-02: stored
-functions v1 + RPC shipped as item 147, enums + domains as item 148;
-triggers/upsert/auth-hooks are next-phase items; the remaining ❌ bulk is
-the deliberate paid-third-party exclusions).
+**Summary:** ~40 catalog features → **21 done · 9 partial · 4 achieved
+differently · 15 not done** (compute cluster: stored functions v1 + RPC =
+item 147, enums + domains = item 148, upsert = item 150; triggers = item
+149 in progress; auth hooks next; the remaining ❌ bulk is the deliberate
+paid-third-party exclusions).
 
 Legend: ✅ done · 🟡 partial · 🔁 done differently · ❌ not done
 (HELD = awaiting explicit user/design go-ahead; Excluded = deliberate
@@ -49,6 +49,7 @@ non-goal, see the exclusions list in `docs/backlog/137_…`).
 | Realtime authorization | Role-based topic-glob allow/deny policies, audited `service_role` bypass, opt-in fail-closed mode (item 140) |
 | Cron / scheduled jobs (pg_cron) | `/cron/jobs` with 5-field cron expressions; SQL runs through the normal executor under a `run_as` principal so RLS/grants apply; no-overlap, no-backfill (item 144) |
 | RPC (`/rest/v1/rpc/<fn>`) | `POST /rest/v1/rpc/{fn}` calling registered stored functions: named or positional JSON args → `$n` binds, all body statements in ONE atomic transaction, **invoker semantics by default** (caller's RLS/grants apply; explicit `run_as` definer-analog) (item 147). PostgREST's `GET` variant not offered (v1 non-goal) |
+| Upsert (`INSERT … ON CONFLICT`) | `DO NOTHING` / `DO UPDATE SET … [WHERE …]` with `EXCLUDED.*` on a PK/UNIQUE conflict target; update arm routes through the existing UPDATE machinery (HOT/index/FK shared); RLS fail-closed both arms; REST `on_conflict=` + `Prefer: resolution=merge-duplicates\|ignore-duplicates` (item 150). Composite targets/`ON CONSTRAINT`/MERGE = non-goals |
 | Migrations | `unidb-migrate` CLI — forward-only SQL files, `schema_migrations` tracking table, checksum drift detection (item 126) |
 | Secrets (Vault) | Encrypt-at-rest AES-256-GCM store keyed from `UNIDB_MASTER_KEY` (item 129) |
 | Vector storage + search (pgvector) | Native on-disk HNSW, `NEAR` operator inside SQL `WHERE` — crash-recovered, MVCC/RLS-consistent; recall@10 0.90, ~482 µs vs pgvector's ~380 µs at 10k×dim128 (items 63/106) |
@@ -82,8 +83,7 @@ non-goal, see the exclusions list in `docs/backlog/137_…`).
 
 | Supabase feature | Status / reason |
 |---|---|
-| Database triggers | Next phase — cluster go-ahead given 2026-08-02; own spec pending (engine write path) |
-| Upsert (`INSERT … ON CONFLICT`) | Next phase — own spec pending (engine; blocks PostgREST `merge-duplicates`) |
+| Database triggers | IN PROGRESS — item 149 (`149_row_triggers.md`, spec locked): BEFORE/AFTER row triggers executing item-147 functions in the same transaction; implementing immediately after item 150 |
 | Auth hooks | Open — unblocked by item 147's functions; next phase (control-plane) |
 | GraphQL subscriptions | HELD — WebSocket-vs-SSE decision pending |
 | SAML / enterprise SSO | HELD — large item, no paid dependency, awaiting go-ahead |

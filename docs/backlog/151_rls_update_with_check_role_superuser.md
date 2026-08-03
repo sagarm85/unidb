@@ -1,7 +1,14 @@
-# RLS `UPDATE` WITH CHECK ignores policy `TO <role>` scoping and superuser bypass
+# 151 — RLS `UPDATE` WITH CHECK ignores policy `TO <role>` scoping and superuser bypass
 
 **Type:** Improvement
 **Status:** NOT STARTED
+**Numbering note:** filed by the studio session as `149` concurrently with the
+triggers item; renumbered to 151 in the item-150 merge (149/150 were already
+baked into shipped code/tests/PRs — see `backlog_index.md`'s header note).
+**Related:** the item-133/147 finding that a *named* superuser is not exempt
+from per-row INSERT `WITH CHECK` (`sql/executor.rs::exec_insert`, item-24 Z1
+path) is the same enforcement family on the INSERT side — fix both ops in one
+considered pass rather than patching UPDATE alone.
 
 > Filed 2026-08-03 from a unidb-studio walkthrough session. A row-level-security
 > policy scoped `FOR UPDATE TO <role>` has its `WITH CHECK` predicate enforced

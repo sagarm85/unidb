@@ -2241,6 +2241,16 @@ fn cached_page<'c, P: PageReader>(
     }
 }
 
+/// Bound on how many HOT-chain hops [`get_visible_cached`]/
+/// [`get_visible_with_rid`] will follow before giving up (item 150 fix —
+/// see their doc comments for why an unbounded caller can need more than
+/// one hop). Purely a defensive cap against a corrupt/cyclic on-disk chain
+/// (never-hang-on-malformed-page convention, same spirit as D7/recovery's
+/// "detect and report, never panic") — a real chain is bounded by the
+/// number of updates a single logical row can receive, orders of magnitude
+/// below this.
+const MAX_HOT_CHAIN_HOPS: u32 = 1_000_000;
+
 /// `get_visible` with a caller-held single-page cache (item 109).
 ///
 /// `SharedPageReader::read_page` copies the whole page out of the mmap and
@@ -2267,59 +2277,56 @@ pub(crate) fn get_visible_cached<P: PageReader>(
     self_xid: Xid,
     cache: &mut Option<(PageId, SlottedPage)>,
 ) -> Result<Option<Vec<u8>>> {
-    let page = cached_page(reader, row_id.page_id, cache)?;
-    // A slot a vacuum reclaimed (DEAD/UNUSED, M10) resolves to "no visible
-    // version" under any snapshot, exactly like a superseded version.
-    if !matches!(page.slot_state(row_id.slot), Ok(SlotState::Live)) {
-        return Ok(None);
-    }
-    let th = page.tuple_header(row_id.slot)?;
-    if is_visible(th.xmin, th.xmax, snapshot, self_xid) {
-        on_read(self_xid, row_id);
-        Ok(Some(page.get(row_id.slot)?.to_vec()))
-    } else if th.hot_next == HOT_NEXT_XPAGE {
-        // Cross-page HOT chain (item 71): target page_id/slot are stored in
-        // the old slot's prev_page/prev_slot (repurposed fields — see format.rs).
-        let xpage_rid = RowId {
-            page_id: th.prev_page,
-            slot: th.prev_slot,
-        };
-        let xpage = reader.read_page(xpage_rid.page_id)?;
-        if !matches!(xpage.slot_state(xpage_rid.slot), Ok(SlotState::Live)) {
+    let mut cur = row_id;
+    for _ in 0..MAX_HOT_CHAIN_HOPS {
+        let page = cached_page(reader, cur.page_id, cache)?;
+        // A slot a vacuum reclaimed (DEAD/UNUSED, M10) resolves to "no
+        // visible version" under any snapshot, exactly like a superseded
+        // version.
+        if !matches!(page.slot_state(cur.slot), Ok(SlotState::Live)) {
             return Ok(None);
         }
-        let xpage_th = xpage.tuple_header(xpage_rid.slot)?;
-        if is_visible(xpage_th.xmin, xpage_th.xmax, snapshot, self_xid) {
-            on_read(self_xid, xpage_rid);
-            Ok(Some(xpage.get(xpage_rid.slot)?.to_vec()))
+        let th = page.tuple_header(cur.slot)?;
+        if is_visible(th.xmin, th.xmax, snapshot, self_xid) {
+            on_read(self_xid, cur);
+            return Ok(Some(page.get(cur.slot)?.to_vec()));
+        } else if th.hot_next == HOT_NEXT_XPAGE {
+            // Cross-page HOT chain (item 71): target page_id/slot are stored
+            // in the old slot's prev_page/prev_slot (repurposed fields — see
+            // format.rs).
+            cur = RowId {
+                page_id: th.prev_page,
+                slot: th.prev_slot,
+            };
+        } else if th.hot_next != HOT_NEXT_NONE {
+            // Same-page HOT chain (item 58): the B-tree still points at this
+            // old (xmax-stamped) slot; follow hot_next to the new version on
+            // the same page. A single hop resolves the common case (one HOT
+            // update since the index candidate was minted), but item 150
+            // found a real multi-hop case: repeated sequential HOT updates
+            // on the same unique/PK-indexed row (the implicit unique index
+            // is never repatched on the HOT path — by design, that's the
+            // whole point of HOT) leave a candidate that needs N hops to
+            // reach the current live version. Looping here (rather than the
+            // previous "exactly one hop, else give up") is a pure
+            // correctness fix: an under-resolution here previously let a
+            // duplicate-key INSERT slip past `enforce_unique`'s fast path
+            // after ≥2 sequential HOT updates on the same row — confirmed
+            // empirically, not theoretical (see `docs/backlog/
+            // 150_upsert_on_conflict.md`'s deviation note).
+            cur = RowId {
+                page_id: cur.page_id,
+                slot: th.hot_next,
+            };
         } else {
-            Ok(None)
-        }
-    } else if th.hot_next != HOT_NEXT_NONE {
-        // Same-page HOT chain (item 58): the B-tree still points at this old
-        // (xmax-stamped) slot; follow hot_next to the new version on the
-        // same page. We follow at most one hop — HOT chains in unidb are
-        // always length 1 (a second HOT update on the same row would go
-        // through the new slot, not this old one, because the B-tree patch
-        // would have been updated or a new HOT head created).
-        let new_slot = th.hot_next;
-        if !matches!(page.slot_state(new_slot), Ok(SlotState::Live)) {
             return Ok(None);
         }
-        let new_th = page.tuple_header(new_slot)?;
-        let new_rid = RowId {
-            page_id: row_id.page_id,
-            slot: new_slot,
-        };
-        if is_visible(new_th.xmin, new_th.xmax, snapshot, self_xid) {
-            on_read(self_xid, new_rid);
-            Ok(Some(page.get(new_slot)?.to_vec()))
-        } else {
-            Ok(None)
-        }
-    } else {
-        Ok(None)
     }
+    // Chain longer than the defensive bound — treat as "no visible version"
+    // rather than hang; this can only ever be reached by a corrupt/cyclic
+    // on-disk chain, since a real chain this long is not physically
+    // reachable within the bound above.
+    Ok(None)
 }
 
 /// Like `get_visible` but returns the **resolved** `(RowId, Vec<u8>)` pair —
@@ -2339,49 +2346,33 @@ pub(crate) fn get_visible_with_rid<P: PageReader>(
     snapshot: &Snapshot,
     self_xid: Xid,
 ) -> Result<Option<(RowId, Vec<u8>)>> {
-    let page = reader.read_page(row_id.page_id)?;
-    if !matches!(page.slot_state(row_id.slot), Ok(SlotState::Live)) {
-        return Ok(None);
-    }
-    let th = page.tuple_header(row_id.slot)?;
-    if is_visible(th.xmin, th.xmax, snapshot, self_xid) {
-        on_read(self_xid, row_id);
-        Ok(Some((row_id, page.get(row_id.slot)?.to_vec())))
-    } else if th.hot_next == HOT_NEXT_XPAGE {
-        let xpage_rid = RowId {
-            page_id: th.prev_page,
-            slot: th.prev_slot,
-        };
-        let xpage = reader.read_page(xpage_rid.page_id)?;
-        if !matches!(xpage.slot_state(xpage_rid.slot), Ok(SlotState::Live)) {
+    let mut cur = row_id;
+    for _ in 0..MAX_HOT_CHAIN_HOPS {
+        let page = reader.read_page(cur.page_id)?;
+        if !matches!(page.slot_state(cur.slot), Ok(SlotState::Live)) {
             return Ok(None);
         }
-        let xpage_th = xpage.tuple_header(xpage_rid.slot)?;
-        if is_visible(xpage_th.xmin, xpage_th.xmax, snapshot, self_xid) {
-            on_read(self_xid, xpage_rid);
-            Ok(Some((xpage_rid, xpage.get(xpage_rid.slot)?.to_vec())))
+        let th = page.tuple_header(cur.slot)?;
+        if is_visible(th.xmin, th.xmax, snapshot, self_xid) {
+            on_read(self_xid, cur);
+            return Ok(Some((cur, page.get(cur.slot)?.to_vec())));
+        } else if th.hot_next == HOT_NEXT_XPAGE {
+            cur = RowId {
+                page_id: th.prev_page,
+                slot: th.prev_slot,
+            };
+        } else if th.hot_next != HOT_NEXT_NONE {
+            // See `get_visible_cached`'s doc comment (item 150) for why this
+            // loops rather than following a single hop.
+            cur = RowId {
+                page_id: cur.page_id,
+                slot: th.hot_next,
+            };
         } else {
-            Ok(None)
-        }
-    } else if th.hot_next != HOT_NEXT_NONE {
-        let new_slot = th.hot_next;
-        if !matches!(page.slot_state(new_slot), Ok(SlotState::Live)) {
             return Ok(None);
         }
-        let new_th = page.tuple_header(new_slot)?;
-        let new_rid = RowId {
-            page_id: row_id.page_id,
-            slot: new_slot,
-        };
-        if is_visible(new_th.xmin, new_th.xmax, snapshot, self_xid) {
-            on_read(self_xid, new_rid);
-            Ok(Some((new_rid, page.get(new_slot)?.to_vec())))
-        } else {
-            Ok(None)
-        }
-    } else {
-        Ok(None)
     }
+    Ok(None)
 }
 
 /// Batch-resolve a sorted slice of B-tree candidate RowIds to visible

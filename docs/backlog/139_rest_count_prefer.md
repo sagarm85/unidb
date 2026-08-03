@@ -8,12 +8,17 @@
 > GETs and the **`Prefer`** header for mutation return shape. Pure REST-layer —
 > no SQL-engine change, no ACID/perf impact, crash harness untouched.
 >
-> **NOTE — upsert is NOT in this item.** PostgREST upsert (`Prefer:
+> **NOTE — upsert was NOT in this item.** PostgREST upsert (`Prefer:
 > resolution=merge-duplicates` / `on_conflict=`) maps to `INSERT … ON CONFLICT
-> DO UPDATE`, which the SQL engine does **not** support (verified: no
-> `ON CONFLICT` in parser/logical/executor). That is a genuine **engine** feature
-> — filed separately (see 137 Wave-2); doing a read-then-write "upsert" at the
-> REST layer would be racy / non-atomic and is explicitly rejected.
+> DO UPDATE`, which the SQL engine did **not** support at the time this item
+> shipped (verified: no `ON CONFLICT` in parser/logical/executor). Doing a
+> read-then-write "upsert" at the REST layer would have been racy /
+> non-atomic and was explicitly rejected. **Resolved by item 150** (`docs/
+> backlog/150_upsert_on_conflict.md`), which added real `ON CONFLICT` support
+> to the SQL engine and wired `on_conflict=` + `Prefer: resolution=
+> merge-duplicates|ignore-duplicates` into `POST /rest/v1/<table>` — see that
+> item's spec and `docs/REST_API.md`'s `Prefer` section for the shipped
+> behavior.
 
 ## Scope
 
@@ -73,6 +78,7 @@
   line, this Status flipped on merge.
 
 ## Non-goals
-- Upsert / `ON CONFLICT` (engine feature — separate item).
+- Upsert / `ON CONFLICT` — was out of scope for this item; shipped separately
+  by item 150 (see the NOTE above).
 - `count=planned/estimated`; `Range` request header pagination (offset/limit
   already cover it).

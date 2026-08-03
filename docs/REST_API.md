@@ -1455,9 +1455,13 @@ array (see [`POST /sql`](#post-sql)):
 **Non-goals (v1, explicitly out of scope):** no SQL-callable `SELECT
 my_fn(...)` surface (the plpgsql-analog future step); no `GET /rest/v1/rpc/
 {fn}`; no declared parameter types; no return-type contract beyond "last
-statement's rows"; no triggers; no `INSERT … ON CONFLICT` (upsert); no auth
-hooks. These are tracked as this item's follow-ups
-(`docs/backlog/147_stored_functions_rpc.md`), not silently dropped.
+statement's rows"; no triggers; no auth hooks. These are tracked as this
+item's follow-ups (`docs/backlog/147_stored_functions_rpc.md`), not silently
+dropped. (Correction: this list originally also named `INSERT … ON CONFLICT`
+as a non-goal — that was accurate before item 150 shipped `ON CONFLICT`
+support into the SQL engine itself; a stored function's statement body runs
+through the exact same executor as any other statement, so `ON CONFLICT` now
+works inside RPC bodies too, with no RPC-layer change needed.)
 
 The embedded crate exposes the same three admin operations directly:
 `Engine::upsert_function` / `remove_function` / `list_functions` (and their
@@ -3226,15 +3230,17 @@ DELETE /rest/v1/{table}?<filters> -- DELETE
 ### Response controls — `Prefer` header (item 139)
 
 PostgREST-style response-shape controls via the `Prefer` request header —
-pure REST-layer response shaping, no SQL-engine change. Parsed
+pure REST-layer response shaping, no SQL-engine change (item 139) except for
+the upsert `resolution=` tokens (item 150), which do generate a different
+SQL statement (an `ON CONFLICT` clause) but stay on the exact same enforced
+`run_stmt` path as every other statement this module builds. Parsed
 case-insensitively; the value may be a comma-separated list
 (`Prefer: return=representation, count=exact`), and the header may itself be
 repeated. **Unrecognized preferences are ignored, never an error** (e.g.
 `count=planned`/`count=estimated` — not supported, no planner row estimate
-exists to expose — and `resolution=merge-duplicates`/upsert, explicitly out
-of scope, see `docs/backlog/139_rest_count_prefer.md`). When at least one
-preference was recognized, the response echoes it back verbatim in a
-`Preference-Applied` header (comma-joined if more than one).
+exists to expose). When at least one preference was recognized, the response
+echoes it back verbatim in a `Preference-Applied` header (comma-joined if
+more than one).
 
 - **`Prefer: count=exact` on `GET /rest/v1/{table}`** — after the normal
   (possibly `limit`/`offset`-paginated) `SELECT`, runs a **second**
@@ -3266,7 +3272,37 @@ preference was recognized, the response echoes it back verbatim in a
   body: `201 Created` for `POST`, `204 No Content` for `PATCH`/`DELETE`. The
   mutation still runs exactly as it would with no `Prefer` header; only the
   response shape changes.
-- **No `Prefer` header (default) — unchanged from before item 139:**
+- **`Prefer: resolution=merge-duplicates` / `resolution=ignore-duplicates` on
+  `POST` (item 150 — upsert)** — combined with an `on_conflict=<column>`
+  query parameter, appends an `ON CONFLICT` clause to the generated
+  `INSERT`:
+  - `resolution=merge-duplicates` → `ON CONFLICT (<on_conflict>) DO UPDATE
+    SET <col> = EXCLUDED.<col>, ...` for every column in the request body
+    **other than** the conflict target itself. Requires `on_conflict=` — a
+    request with `resolution=merge-duplicates` and no target is
+    `400 MISSING_ON_CONFLICT`. A body containing only the target column
+    (nothing left to merge) is `400 EMPTY_MERGE`.
+  - `resolution=ignore-duplicates` → `ON CONFLICT [(<on_conflict>)] DO
+    NOTHING`. `on_conflict=` is optional here: with it, only a conflict on
+    that named column is absorbed (`409 UNIQUE_VIOLATION` if a *different*
+    unique constraint is violated); without it, **any** unique/PK conflict
+    on the row is silently absorbed.
+  - Composes with `return=representation`/`return=minimal` exactly like a
+    plain `POST` — the affected row (inserted or merged) comes back under
+    `return=representation`. RLS applies to the `DO UPDATE` arm exactly as
+    it would to an equivalent `UPDATE` (`USING` mismatch on the existing row
+    is a hard error, not a silent skip — see `docs/sql/sql_reference.md`'s
+    `ON CONFLICT` section for the full RLS contract).
+  - `on_conflict=<column>` naming a column that isn't the table's
+    `PRIMARY KEY`/`UNIQUE` is `400 INVALID_CONFLICT_TARGET`.
+  ```
+  POST /rest/v1/items?on_conflict=id
+  Prefer: resolution=merge-duplicates, return=representation
+  { "id": 1, "name": "updated" }
+  -> 200, body = the merged row (or the newly-inserted row if id=1 didn't exist)
+  ```
+- **No `Prefer` header (default) — unchanged from before items 139/150,**
+  **regardless of whether `on_conflict=` is present:**
   - `GET` returns the row body with no `Content-Range` header (as above).
   - `POST` returns `200` with `{"type":"inserted","count":N}`.
   - `PATCH` returns `200` with `{"type":"updated","count":N}`.
