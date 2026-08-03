@@ -454,6 +454,28 @@ continuation 135–146". What remains, and its gating:
 
 ## Session log (append newest at top; use the real current date)
 
+### 2026-08-03 — item 147 (stored functions v1 + RPC) implemented via Sonnet agent, verified, committed to branch; item 148 queued
+
+User go-ahead (2026-08-02) lifted the compute-cluster HELD; two branches
+started (per explicit user instruction, and the user chose Sonnet for
+implementation): **147** `feat/147-stored-functions-rpc` — spec written by
+orchestrator, implemented by a Sonnet subagent, **all 7 gates re-run
+independently by the orchestrator** (clippy/fmt/no-features compile, item147
+8/8, item144 9/9, crash 54/54), committed `b5c0156` + main merged in +
+SUPABASE_PARITY/PROGRESS/MEMORY updated in the same push. Design's one
+security-critical call: RPC is invoker-by-default (`run_as: None` = caller,
+NOT admin — deliberately diverges from cron's default; spec documents why).
+**148** `feat/148-enums-domains` — spec committed (`1b1ea2b`, written in a
+side worktree at the scratchpad so the 147 agent's tree stayed untouched);
+implementation queued strictly behind 147's builds per LESSONS.md's
+no-concurrent-cargo-builds rule. PR #252 (SUPABASE_PARITY.md tracker)
+merged this session; tracker rows for 147/148 updated on the 147 branch in
+the same PR as the code, per the tracker's §9 protocol. Studio-side asks
+(favicon, timestamp display) were explicitly dropped by the user as
+wrong-session; the favicon SVG was delivered in-chat for the studio session
+to pick up. Pre-existing named-superuser `WITH CHECK` quirk (item-133
+finding) re-surfaced by 147's parity test — still untouched, still tracked.
+
 ### 2026-08-02 — Docs-staleness sweep: parity track confirmed merged; PROGRESS ledger backfilled; unidb-js linked
 
 Q&A session (Supabase-service comparison, branch
@@ -478,6 +500,14 @@ during the session (report-honesty, no doc change yet): MEMORY's 07-28 entry
 calls the moat "intact" citing W4/W0 13.56×, but W4/W0 is the internal tax
 ladder — the actual moat column (replaced stack, Table 4.1) was skipped in
 that report; the queued report-honesty item covers it. No code change.
+**Same-day follow-up (after the sweep merged as PR #251; branch restarted
+from `main` per the merged-PR rule):** added root **`SUPABASE_PARITY.md`** —
+a living four-table feature-parity matrix vs supabase.com/features (done /
+partial / done-differently / not-done, per-row scope + item numbers, summary
+counts, "Last verified" stamp) — linked from `README.md`,
+`docs/documentation_index.md`, and `137`'s header, and registered in
+`CLAUDE.md` §9's pre-push checklist so every future parity ship updates it
+in the same PR.
 
 ### 2026-08-01 — item 146: JWT signing-key rotation grace window implemented
 

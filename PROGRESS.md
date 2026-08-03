@@ -182,6 +182,7 @@ memory (see `CLAUDE.md` §6).
 | Report HTML renderer (auto `.html` sibling)   [SHIPPED]   2026-07-31 | 2026-07-31 | live |
 | Item 117 — HOT UPDATE on PK/UNIQUE tables when key unchanged   [SHIPPED]   2026-07-31 | 2026-07-31 | live |
 | Supabase-parity BaaS layer — items 120–133 + 135–146 (PRs #222–#249)   [SHIPPED]   2026-08-01 | 2026-08-01 | live |
+| Item 147 — Stored SQL functions v1 + RPC   [SHIPPED — branch, PR pending]   2026-08-03 | 2026-08-03 | live |
 
 ## Item 24 R-a + R-b — UPDATE WITH CHECK enforcement + bootstrap observability (2026-07-20)
 
@@ -1925,4 +1926,37 @@ SAML (HELD) · identity linking, anonymous sign-in, views/materialized views,
 enums/custom types (unstarted) · no `users.email` column yet (email is
 looked up as username — item-138 note) · named-superuser `WITH CHECK` INSERT
 quirk (item-133 finding, possible pre-existing RLS-superuser inconsistency).
+**Locked-decision changes:** none.
+
+## Item 147 — Stored SQL functions v1 + RPC   [SHIPPED — on `feat/147-stored-functions-rpc`, PR pending]   2026-08-03
+
+**Branch:** `feat/147-stored-functions-rpc` (`b5c0156`) | **Type:** Improvement
+**Summary:** compute-cluster phase 1 (user go-ahead 2026-08-02 lifted the
+HELD). Control-plane `FunctionDef` in `AuthState` (serde-default, no
+FORMAT_VERSION bump; cron/webhook persistence pattern) with registration-time
+validation; superuser `/functions` admin API (upsert/list/delete); `POST
+/rest/v1/rpc/{fn}` — named or positional JSON args → `$n` binds through the
+item-38 coercion layer, every body statement executed in **one transaction**
+(abort-on-error, atomic), response = last statement's rows in `/sql`'s shape.
+**Security:** invoker by default — `run_as: None` means the *calling*
+principal (their RLS/grants apply), a deliberate documented divergence from
+cron's None-means-admin, because RPC is callable by any authenticated
+principal; `run_as: Some(role)` is the explicit definer-analog (registration
+is superuser-only, so definer grants are admin-controlled). Implemented by a
+Sonnet subagent against the locked spec (`docs/backlog/147_…`); orchestrator
+re-ran every gate independently.
+
+**Benchmarks:** none — control-plane only, zero engine/WAL/heap/catalog
+change (same §6 posture as the items 120–146 entry above); the standing
+BaaS-layer load-bench debt covers this surface too.
+**Verification (orchestrator-rerun):** build `--features server` · clippy
+`--all-features --all-targets -D warnings` · fmt · plain `cargo test
+--no-run` (test file feature-gated) · item147 **8/8** · item144 regression
+**9/9** · **crash harness 54/54**.
+**Known limitations:** no SQL-callable `SELECT fn()` (plpgsql-analog later);
+no `GET /rest/v1/rpc`; no declared param types; not usable by triggers yet.
+Pre-existing behavior surfaced, not changed: a **named** superuser doesn't
+bypass per-row INSERT `WITH CHECK` (item-24 Z1 bypasses only the embedded
+`None` identity and `service_role`) — identical via `/sql` and RPC,
+documented in the test (first flagged in the item-133 session).
 **Locked-decision changes:** none.

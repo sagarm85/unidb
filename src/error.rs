@@ -185,6 +185,14 @@ pub enum DbError {
     /// enum labels, or a domain over a non-existent base type.
     #[error("invalid named type definition: {0}")]
     InvalidNamedType(String),
+
+    /// A malformed stored-function definition rejected at registration time
+    /// (item 147: `POST /functions` / `RoleStore::upsert_function`) — bad
+    /// name/param pattern, duplicate params, empty body/statement, or a
+    /// `$k` reference outside `1..=params.len()`. See
+    /// `src/authz/mod.rs::RoleStore::upsert_function` for the exact checks.
+    #[error("invalid function definition: {0}")]
+    InvalidFunctionDef(String),
 }
 
 pub type Result<T> = std::result::Result<T, DbError>;

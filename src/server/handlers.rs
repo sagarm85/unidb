@@ -45,10 +45,10 @@ use crate::{
             AuthRecoverRequest, AuthVerifyRequest, BatchInsertRequest, BatchSqlRequest,
             BatchSqlResponse, BeginTxnRequest, ChannelPolicyDeleteRequest, ChannelPolicyDto,
             ChannelPolicyUpsertRequest, CreateEdgeRequest, CreateSlotRequest, CronJobDto,
-            CronJobUpsertRequest, CursorQuery, CypherRequest, DeleteEdgeRequest,
-            GroupCommitWindowRequest, HistoryQuery, IsolationDto, MfaChallengeRequest,
-            MfaDisableRequest, MfaEnrollResponse, MfaVerifyRequest, MfaVerifyResponse,
-            OAuthCallbackQuery, RlsRequest, RowIdResponse, SetIndexRequest,
+            CronJobUpsertRequest, CursorQuery, CypherRequest, DeleteEdgeRequest, FunctionDto,
+            FunctionUpsertRequest, GroupCommitWindowRequest, HistoryQuery, IsolationDto,
+            MfaChallengeRequest, MfaDisableRequest, MfaEnrollResponse, MfaVerifyRequest,
+            MfaVerifyResponse, OAuthCallbackQuery, RlsRequest, RowIdResponse, SetIndexRequest,
             SlowQueryThresholdRequest, SqlRequest, StreamQuery, TableInfo, WebhookDto,
             WebhookUpsertRequest, WhoamiPrivilege, WhoamiResponse,
         },
@@ -1298,6 +1298,244 @@ pub async fn delete_cron_job(
         .await
         .map_err(ApiError::from)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ── Stored SQL functions + RPC (item 147) ───────────────────────────────────
+//
+// A stored function is a named, parameterized list of SQL statements —
+// registration mirrors `/cron/jobs`'s admin-surface shape exactly
+// (superuser-gated upsert/list/delete). `POST /rest/v1/rpc/{fn}` is the new
+// piece: it lives in the same `require_jwt`-gated router as every other
+// `/rest/v1` route (any authenticated principal may call it), and defaults
+// to **invoker** semantics (`run_as: None` => the calling principal) —
+// deliberately the opposite default from cron's `run_as: None => embedded
+// superuser`. See `crate::authz::FunctionDef`'s doc comment for the full
+// security-model rationale.
+
+/// `POST /functions` (item 147 admin surface): create/upsert a stored SQL
+/// function. Superuser-gated, same posture as [`post_cron_job`]. Full
+/// validation (name/param patterns, unique params, non-empty body/
+/// statements, `$k` references within `1..=params.len()`) happens in
+/// `Engine::upsert_function` -> `RoleStore::upsert_function`
+/// (`DbError::InvalidFunctionDef` -> `400 INVALID_FUNCTION_DEF`), so a bad
+/// registration never reaches storage.
+pub async fn post_function(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+    Json(body): Json<FunctionUpsertRequest>,
+) -> std::result::Result<StatusCode, ApiError> {
+    state
+        .engine
+        .ensure_superuser(current_user.0.clone())
+        .await
+        .map_err(ApiError::from)?;
+    let def = crate::authz::FunctionDef {
+        name: body.name,
+        params: body.params,
+        body: body.body,
+        run_as: body.run_as,
+    };
+    state
+        .engine
+        .upsert_function(def)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /functions` (item 147 admin surface): list every registered stored
+/// function, `body` included — superuser-only, so body exposure is fine
+/// (mirrors [`get_cron_jobs`]'s posture for `sql`).
+pub async fn get_functions(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+) -> std::result::Result<Json<Vec<FunctionDto>>, ApiError> {
+    state
+        .engine
+        .ensure_superuser(current_user.0.clone())
+        .await
+        .map_err(ApiError::from)?;
+    let functions = state
+        .engine
+        .list_functions()
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(
+        functions
+            .into_iter()
+            .map(|f| FunctionDto {
+                name: f.name,
+                params: f.params,
+                body: f.body,
+                run_as: f.run_as,
+            })
+            .collect(),
+    ))
+}
+
+/// `DELETE /functions/{name}` (item 147 admin surface). Idempotent —
+/// deleting an unknown `name` is a no-op, not an error (mirrors
+/// [`delete_cron_job`]'s posture).
+pub async fn delete_function(
+    Extension(current_user): Extension<CurrentUser>,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> std::result::Result<StatusCode, ApiError> {
+    state
+        .engine
+        .ensure_superuser(current_user.0.clone())
+        .await
+        .map_err(ApiError::from)?;
+    state
+        .engine
+        .remove_function(name)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Bind an RPC call's JSON body to `def`'s declared parameters, in
+/// `$1..$n` positional order. Accepts either a JSON object of named
+/// arguments (every declared param name must be present, and no extra
+/// names — `400 INVALID_FUNCTION_ARGS` otherwise) or a JSON array of
+/// positional arguments (length must equal `def.params.len()`). Values are
+/// always bound as data via [`json_to_literal`] — the same injection-safe
+/// path `POST /sql`'s `params` field uses (P2.e).
+fn bind_function_args(
+    def: &crate::authz::FunctionDef,
+    body: serde_json::Value,
+) -> std::result::Result<Vec<crate::sql::logical::Literal>, ApiError> {
+    match body {
+        serde_json::Value::Object(map) => {
+            if map.len() != def.params.len() {
+                return Err(ApiError::bad_request(
+                    "INVALID_FUNCTION_ARGS",
+                    format!(
+                        "expected exactly {} named argument(s) ({}), got {}",
+                        def.params.len(),
+                        def.params.join(", "),
+                        map.len()
+                    ),
+                ));
+            }
+            def.params
+                .iter()
+                .map(|p| {
+                    map.get(p).map(json_to_literal).ok_or_else(|| {
+                        ApiError::bad_request(
+                            "INVALID_FUNCTION_ARGS",
+                            format!("missing named argument '{p}'"),
+                        )
+                    })
+                })
+                .collect()
+        }
+        serde_json::Value::Array(items) => {
+            if items.len() != def.params.len() {
+                return Err(ApiError::bad_request(
+                    "INVALID_FUNCTION_ARGS",
+                    format!(
+                        "expected exactly {} positional argument(s), got {}",
+                        def.params.len(),
+                        items.len()
+                    ),
+                ));
+            }
+            Ok(items.iter().map(json_to_literal).collect())
+        }
+        other => Err(ApiError::bad_request(
+            "INVALID_FUNCTION_ARGS",
+            format!(
+                "RPC body must be a JSON object (named args) or array (positional args), got {other}"
+            ),
+        )),
+    }
+}
+
+/// `POST /rest/v1/rpc/{fn}` (item 147): call a registered stored function.
+/// Resolves `fn` (`404 FUNCTION_NOT_FOUND` if unregistered), binds the JSON
+/// body to its declared params (`400 INVALID_FUNCTION_ARGS` on a
+/// name/count mismatch — see [`bind_function_args`]), then runs every body
+/// statement in **one transaction**: `begin`, then `authorize_sql_as_principal`
+/// together with `execute_sql_params_as_principal` per statement (the same
+/// pre-check-then-execute sequence [`post_sql`] uses), then `commit`. Any
+/// statement error aborts the whole call and maps exactly as `POST /sql`
+/// maps it (reusing `ApiError::from(DbError)` — no separate mapping
+/// layer). Response: `200` with the **last** statement's result in the
+/// same per-statement JSON shape `POST /sql` produces
+/// (`exec_result_to_json`).
+///
+/// **Invoker vs `run_as` (the security-critical branch):** `def.run_as ==
+/// None` runs every statement as `principal` — the caller's own identity,
+/// exactly as extracted by [`post_sql`] (this handler lives in the same
+/// `require_jwt`-gated router). `def.run_as == Some(role)` substitutes a
+/// fixed principal for that role instead, **regardless of caller** — but
+/// only ever after the caller has already passed this router's normal JWT
+/// auth, so `run_as` never grants access to an unauthenticated request; it
+/// only ever changes which authenticated principal's grants/RLS apply. See
+/// `crate::authz::FunctionDef`'s doc comment for why this default is the
+/// opposite of cron's `run_as: None => embedded superuser`.
+pub async fn rpc_call(
+    Extension(principal): Extension<crate::AuthPrincipal>,
+    State(state): State<AppState>,
+    Path(fn_name): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> std::result::Result<Json<serde_json::Value>, ApiError> {
+    let def = state
+        .engine
+        .get_function(fn_name.clone())
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::Api {
+            status: StatusCode::NOT_FOUND,
+            code: "FUNCTION_NOT_FOUND",
+            message: format!("no stored function named '{fn_name}'"),
+        })?;
+
+    let params = bind_function_args(&def, body)?;
+
+    let exec_principal = match &def.run_as {
+        None => principal,
+        Some(role) => crate::AuthPrincipal::user(Some(role.clone())),
+    };
+
+    let xid = state.engine.begin(None).await.map_err(ApiError::from)?;
+    let mut last_results: Vec<ExecResult> = Vec::new();
+    for stmt in &def.body {
+        if let Err(e) = state
+            .engine
+            .authorize_sql_as_principal(exec_principal.clone(), stmt.clone())
+            .await
+        {
+            let _ = state.engine.abort(xid).await;
+            return Err(e.into());
+        }
+        match state
+            .engine
+            .execute_sql_params_as_principal(
+                exec_principal.clone(),
+                xid,
+                stmt.clone(),
+                params.clone(),
+            )
+            .await
+        {
+            Ok(results) => last_results = results,
+            Err(e) => {
+                let _ = state.engine.abort(xid).await;
+                return Err(e.into());
+            }
+        }
+    }
+    state.engine.commit(xid).await.map_err(ApiError::from)?;
+
+    let last = last_results.last().ok_or_else(|| {
+        ApiError::internal(
+            "FUNCTION_NO_RESULT",
+            "stored function body produced no result (should never happen for a non-empty statement)",
+        )
+    })?;
+    Ok(Json(exec_result_to_json(last)))
 }
 
 // ── item 142: Auth admin API (user management) ─────────────────────────────

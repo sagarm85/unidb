@@ -308,6 +308,36 @@ pub struct CronJobDto {
     pub run_count: u64,
 }
 
+// ── item 147: stored SQL functions ──────────────────────────────────────────
+
+/// Body of `POST /functions` (item 147 admin surface): create/upsert a
+/// stored SQL function. `params` (optional, default empty) declares
+/// parameter names in `$1..$n` order; `body` is one or more SQL statements.
+/// `run_as` (optional) names the definer-analog role the function's `body`
+/// runs as; omit it (or send `null`) for **invoker** semantics — the RPC
+/// caller's own principal (see [`crate::authz::FunctionDef`]'s doc comment
+/// for why this default differs from cron's).
+#[derive(Debug, Deserialize)]
+pub struct FunctionUpsertRequest {
+    pub name: String,
+    #[serde(default)]
+    pub params: Vec<String>,
+    pub body: Vec<String>,
+    #[serde(default)]
+    pub run_as: Option<String>,
+}
+
+/// One row of `GET /functions`'s response (item 147 admin surface): the
+/// full registration, `body` included — superuser-only, so body exposure is
+/// fine (mirrors [`CronJobDto::sql`]'s posture).
+#[derive(Debug, Serialize)]
+pub struct FunctionDto {
+    pub name: String,
+    pub params: Vec<String>,
+    pub body: Vec<String>,
+    pub run_as: Option<String>,
+}
+
 // ── item 142: Auth admin API (user management) ─────────────────────────────
 
 /// Query params for `GET /auth/admin/users?limit=&offset=` (item 142).

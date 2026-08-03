@@ -1312,6 +1312,160 @@ already holds.
 
 ---
 
+## Stored functions & RPC (item 147)
+
+Supabase-parity `pg_proc`/`rpc()` — v1 phase 1: a stored SQL function as a
+control-plane object plus the `POST /rest/v1/rpc/{fn}` call route. **No
+engine/WAL/heap/catalog change of any kind** — exactly like scheduled jobs
+(item 144), a stored function is a named, parameterized list of SQL
+statements, persisted control-plane-side (`roles.json`-style, no
+FORMAT_VERSION bump), and RPC is strictly a *caller* of the existing
+`execute_sql_params_as_principal` path every other statement uses (one
+`begin`/execute-per-statement/`commit`); crash harness stays 54/54.
+
+**Registration model.** A function is `(name, params?, body, run_as?)`:
+- `name` and every entry of `params` must match `^[a-zA-Z_][a-zA-Z0-9_]{0,62}$`.
+- `params` (optional, default `[]`) declares parameter **names**, in
+  `$1..$n` positional order; names must be unique within the function.
+- `body` is one or more SQL statements, run in order inside one
+  transaction on every RPC call. Each must be non-empty, and every `$k`
+  placeholder referenced in any statement must resolve within
+  `1..=params.len()`.
+- All of the above is validated **at registration**, before anything is
+  stored — `400 INVALID_FUNCTION_DEF` on any violation (bad name/param
+  pattern, duplicate params, empty body/statement, out-of-range `$k`).
+  The `$k` scan is a simple lexical pass, not a full SQL tokenizer: it
+  correctly ignores a `$k`-shaped token inside a `'...'` string literal
+  (including the `''` doubled-quote escape), but does **not** understand
+  SQL comments, dollar-quoted strings, or double-quoted identifiers — a
+  `$k` inside one of those is still counted, which can only cause an
+  occasional false-reject (an unusual statement gets asked to rephrase),
+  never a false-accept of an out-of-range reference.
+
+**Security — the one place this deliberately differs from cron's
+`run_as`:** `run_as: None` (the default) means **the calling principal** —
+**invoker** semantics, PostgREST's default posture: the RPC caller's own
+table grants and RLS policies apply. This is the *opposite* of cron's
+`run_as: None => embedded superuser` default, and deliberately so — a cron
+job's `sql` can only ever be registered and fired by a superuser (the
+scheduler), so an implicit-admin default is safe there. A stored function
+is callable via RPC by **any authenticated principal**, so an
+implicit-admin default here would be a privilege-escalation hole: since
+*any* authenticated caller can invoke *any* registered function, an
+admin-default would let a low-privilege caller run admin-authored SQL with
+superuser power merely by calling it. `run_as: Some(role)` opts a function
+into **definer**
+semantics explicitly — it always runs as that role, regardless of caller,
+exactly as `Engine::execute_sql_as(Some(role), ..)` would. Registration
+itself stays superuser-only either way, so choosing `run_as` is still an
+admin-granted decision — same trust model as cron's `run_as`, just a
+different default.
+
+**Atomicity.** All of a function's `body` statements run in **one**
+transaction: `begin` -> (`authorize_sql_as_principal` +
+`execute_sql_params_as_principal` per statement, in order, same bind
+vector) -> `commit`. Any statement error aborts the whole call — every
+earlier statement's effects in that call are rolled back, nothing is
+partially visible. SQL execution errors map exactly as `POST /sql` maps
+them (the same `DbError` -> `ApiError` conversion, no separate mapping
+layer).
+
+**Params flow through the existing coercion layer** — the same
+injection-safe `json_to_literal` binding `POST /sql`'s `params` field uses
+(P2.e): a JSON string binds as text (later coerced to the target column's
+type — UUID, TIMESTAMP, etc.), a number as int/float, a numeric array as a
+vector. No declared parameter types in v1 (documented simplification).
+
+### `POST /functions`
+
+Create or upsert (by `name`) a stored function. **Superuser-only**
+(`403 PERMISSION_DENIED` otherwise).
+
+**Payload**:
+```json
+{
+  "name": "posts_by_owner",
+  "params": ["owner"],
+  "body": ["SELECT id, title FROM posts WHERE owner = $1"]
+}
+```
+`params` defaults to `[]`; `run_as` defaults to `null` (invoker). **Response**:
+`204 No Content`. `400 INVALID_FUNCTION_DEF` on any registration-validation
+failure (see above).
+
+### `GET /functions`
+
+List every registered function, `body` included. **Superuser-only.**
+
+**Response** `200 OK`:
+```json
+[
+  {
+    "name": "posts_by_owner",
+    "params": ["owner"],
+    "body": ["SELECT id, title FROM posts WHERE owner = $1"],
+    "run_as": null
+  }
+]
+```
+
+### `DELETE /functions/{name}`
+
+Remove a stored function. **Superuser-only.** Idempotent — deleting an
+unknown `name` is a no-op, not an error. **Response**: `204 No Content`.
+
+### `POST /rest/v1/rpc/{fn}`
+
+Call a registered stored function. Requires the same JWT auth as every
+other `/rest/v1` route (**not** superuser-gated — any authenticated
+principal may call a registered function; what it's allowed to *do* is
+governed by invoker/`run_as` above).
+
+**Arguments** — the body is either a JSON object of named args (must match
+`params` exactly: every declared name present, no extra names, else `400
+INVALID_FUNCTION_ARGS`) or a JSON array of positional args (length must
+equal `params.len()`, else the same `400`):
+```json
+{ "owner": "alice" }
+```
+```json
+["alice"]
+```
+Both forms are equivalent and bind identically to the function's `$1..$n`
+placeholders in declared-`params` order.
+
+**Response** `200 OK` — the **last** statement's result, in the same
+per-statement shape `POST /sql` returns for one entry of its `results`
+array (see [`POST /sql`](#post-sql)):
+```json
+{
+  "type": "rows",
+  "columns": ["id", "title"],
+  "rows": [[1, "hello"]]
+}
+```
+
+**Errors**:
+- `404 FUNCTION_NOT_FOUND` — `fn` names no registered function.
+- `400 INVALID_FUNCTION_ARGS` — missing/extra named arg, or wrong
+  positional-array length.
+- Any SQL execution error (constraint violation, RLS `WITH CHECK` denial,
+  privilege denial, …) maps exactly as `POST /sql` maps it.
+
+**Non-goals (v1, explicitly out of scope):** no SQL-callable `SELECT
+my_fn(...)` surface (the plpgsql-analog future step); no `GET /rest/v1/rpc/
+{fn}`; no declared parameter types; no return-type contract beyond "last
+statement's rows"; no triggers; no `INSERT … ON CONFLICT` (upsert); no auth
+hooks. These are tracked as this item's follow-ups
+(`docs/backlog/147_stored_functions_rpc.md`), not silently dropped.
+
+The embedded crate exposes the same three admin operations directly:
+`Engine::upsert_function` / `remove_function` / `list_functions` (and their
+`EngineHandle` async wrappers for the server), plus `Engine::get_function`
+for the single-name resolution `rpc_call` itself uses.
+
+---
+
 ## Auth admin API — user management (item 142)
 
 Supabase-parity `auth.admin`: a consolidated REST surface under
@@ -2998,6 +3152,9 @@ by `server/error.rs`'s `ApiError` directly, not by a `DbError` variant.
 | 400 | `UNKNOWN_RELATIONSHIP` | `/rest/v1` embed name matches no FK relationship (item 123 C2) |
 | 400 | `AMBIGUOUS_RELATIONSHIP` | `/rest/v1` embed name matches more than one FK relationship (item 123 C2) |
 | 400 | `UNKNOWN_EMBED_PARAM` | `/rest/v1` dotted param (`<embed>.<col>=…`) whose prefix names no embed in `select=` (item 136) |
+| 404 | `FUNCTION_NOT_FOUND` | `POST /rest/v1/rpc/{fn}` names no registered stored function (item 147) |
+| 400 | `INVALID_FUNCTION_ARGS` | RPC body's named/positional args don't match the function's declared `params` (item 147) |
+| 400 | `INVALID_FUNCTION_DEF` | `POST /functions` registration failed validation — bad name/param pattern, duplicate params, empty body/statement, or an out-of-range `$k` reference (item 147) |
 | 400 | `OAUTH_PROVIDER_DENIED` | Provider returned `?error=...` on the OAuth callback (item 128) |
 | 400 | `OAUTH_MISSING_CODE` | OAuth callback missing both `code` and `error` (item 128) |
 | 401 | `OAUTH_STATE_INVALID` | Unknown/expired/replayed/wrong-provider OAuth `state` (item 128) |
