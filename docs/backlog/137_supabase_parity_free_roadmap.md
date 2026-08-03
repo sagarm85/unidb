@@ -138,8 +138,10 @@ queue** · unidb-js SDK v0.1. *(The last three are beyond Supabase.)*
   144's own doc labels itself a "Wave-2" item, but it is filed here under
   Wave 3 in this roadmap — flagged rather than silently reconciled either
   way; the classification doesn't change what shipped.
-  User-defined & materialized views · enums/domains/custom types remain
-  unstarted.
+  User-defined & materialized views remain unstarted. **Enums/domains: IN
+  PROGRESS** (item 148, `148_enums_domains.md`, user go-ahead 2026-08-02 —
+  catalog-registered named types desugaring to the existing CHECK machinery;
+  composite/custom types stay deferred with the row-encoding decision).
 - **JWT signing-key rotation** (DONE — item 146, PR #249 merged 2026-08-01;
   the studio-flagged dev-inbox read route also shipped as item 145, PR #248):
   a `kid` header (one-way truncated hash of the
