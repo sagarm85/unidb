@@ -1,8 +1,8 @@
 # 149 — Row triggers v1 (BEFORE/AFTER INSERT/UPDATE/DELETE)
 
 **Type:** Improvement
-**Status:** IN PROGRESS (user go-ahead 2026-08-03; branch `feat/149-row-triggers`,
-implemented after item 150 — both touch `exec_insert`, sequential by design)
+**Status:** SHIPPED (2026-08-03, PR #258 merged — see PROGRESS.md "Item 149 —
+Row triggers v1 (BEFORE/AFTER, same-transaction)")
 
 > Compute-cluster next phase: row-level triggers executing item-147 stored
 > functions **inside the same transaction** as the row write. This is where

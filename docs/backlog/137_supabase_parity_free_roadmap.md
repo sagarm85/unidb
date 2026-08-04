@@ -89,8 +89,8 @@ queue** · unidb-js SDK v0.1. *(The last three are beyond Supabase.)*
   2026-08-03: SQL-body v1 control-plane functions + the RPC route in one
   item, no engine change; a plpgsql-analog later) → then:
   - **RPC** (`POST /rest/v1/rpc/<fn>`) — DONE, shipped in item 147 (PR #253)
-  - **Triggers** (BEFORE/AFTER row) — IN PROGRESS, item 149
-    (`149_row_triggers.md`; implemented after 150)
+  - **Triggers** (BEFORE/AFTER row) — DONE, item 149 (PR #258 merged
+    2026-08-03: same-transaction row triggers over item-147 functions)
   - **Upsert** (`INSERT … ON CONFLICT`) — DONE, item 150 (PR #257 merged
     2026-08-03; includes the PostgREST `resolution=merge-duplicates` wiring
     139 excluded, and the latent HOT-chain MVCC fix)
